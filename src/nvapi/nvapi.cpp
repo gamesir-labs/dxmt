@@ -727,6 +727,74 @@ NvAPI_DRS_LoadSettings(NvDRSSessionHandle hSession) {
   return NVAPI_NOT_SUPPORTED;
 }
 
+LUID
+GetAdapterLuid(WMT::Device device) {
+  /**
+  TODO: duplicated impl in `dxgi_adapter.cpp`
+  */
+  return std::bit_cast<LUID>(__builtin_bswap64(device.registryID()));
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetAdapterIdFromPhysicalGpu(NvPhysicalGpuHandle hPhysicalGpu, void *pOSAdapterId) {
+  if (!pOSAdapterId)
+    return NVAPI_INVALID_ARGUMENT;
+
+  auto registry_id = uint64_t(hPhysicalGpu);
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_INVALID_ARGUMENT;
+
+  WMT::Device target_device{};
+  for (unsigned i = 0; i < adapter_count; i++) {
+    if (registry_id == devices.object(i).registryID()) {
+      target_device = devices.object(i);
+      break;
+    }
+  }
+  if (!target_device)
+    return NVAPI_INVALID_ARGUMENT;
+
+  *reinterpret_cast<LUID *>(pOSAdapterId) = GetAdapterLuid(target_device);
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetLogicalGpuInfo(NvLogicalGpuHandle hLogicalGpu, NV_LOGICAL_GPU_DATA *pLogicalGpuData) {
+  if (!pLogicalGpuData)
+    return NVAPI_INVALID_ARGUMENT;
+
+  auto registry_id = uint64_t(hLogicalGpu);
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  WMT::Device target_device{};
+  for (unsigned i = 0; i < adapter_count; i++) {
+    if (registry_id == devices.object(i).registryID()) {
+      target_device = devices.object(i);
+      break;
+    }
+  }
+  if (!target_device)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  switch (pLogicalGpuData->version) {
+  case NV_LOGICAL_GPU_DATA_VER1:
+    pLogicalGpuData->physicalGpuCount = 1;
+    memset(pLogicalGpuData->physicalGpuHandles, 0, sizeof(pLogicalGpuData->physicalGpuHandles));
+    pLogicalGpuData->physicalGpuHandles[0] = (NvPhysicalGpuHandle)registry_id;
+    *reinterpret_cast<LUID *>(pLogicalGpuData->pOSAdapterId) = GetAdapterLuid(target_device);
+    break;
+  default:
+    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+  }
+
+  return NVAPI_OK;
+}
+
 extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   switch (id) {
   case 0x0150e828:
@@ -827,6 +895,10 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_DRS_CreateSession;
   case 0x375dbd6b:
     return (void *)&NvAPI_DRS_LoadSettings;
+  case 0x0ff07fde:
+    return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
+  case 0x842b066e:
+    return (void *)&NvAPI_GPU_GetLogicalGpuInfo;
   default:
     break;
   }
