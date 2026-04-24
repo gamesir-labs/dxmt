@@ -600,10 +600,56 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static id<MTLFunction>
+DXMTGetNullFragmentFunction(id<MTLDevice> device) {
+  static NSMutableDictionary *functions_by_device = nil;
+
+  @synchronized([MTLMeshRenderPipelineDescriptor class]) {
+    if (!functions_by_device)
+      functions_by_device = [[NSMutableDictionary alloc] init];
+
+    NSValue *key = [[NSValue alloc] initWithBytes:&device objCType:@encode(void *)];
+    id<MTLFunction> function = [functions_by_device objectForKey:key];
+    if (function) {
+      [key release];
+      return function;
+    }
+
+    NSString *source = @"using namespace metal;\n"
+                       "fragment void dxmt_null_fragment() {}\n";
+    NSError *err = NULL;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&err];
+    if (!library) {
+      fprintf(stderr,
+              "err:   DXMT failed to create null fragment library: %s\n",
+              [[err localizedDescription] UTF8String]);
+      [key release];
+      return nil;
+    }
+
+    function = [library newFunctionWithName:@"dxmt_null_fragment"];
+    if (!function) {
+      fprintf(stderr,
+              "err:   DXMT failed to create null fragment function\n");
+      [library release];
+      [key release];
+      return nil;
+    }
+
+    [functions_by_device setObject:function forKey:key];
+    [function release];
+    [library release];
+    function = [functions_by_device objectForKey:key];
+    [key release];
+    return function;
+  }
+}
+
 static NTSTATUS
 _MTLDevice_newMeshRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newmeshrenderpso *params = obj;
   const struct WMTMeshRenderPipelineInfo *info = params->info.ptr;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
   MTLMeshRenderPipelineDescriptor *descriptor = [[MTLMeshRenderPipelineDescriptor alloc] init];
 
   for (unsigned i = 0; i < 8; i++) {
@@ -641,8 +687,33 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
 
   descriptor.objectFunction = (id<MTLFunction>)info->object_function;
   descriptor.meshFunction = (id<MTLFunction>)info->mesh_function;
-  descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
+  id<MTLFunction> fragment_function = (id<MTLFunction>)info->fragment_function;
+  if (info->rasterization_enabled && !fragment_function)
+    fragment_function = DXMTGetNullFragmentFunction(device);
+  descriptor.fragmentFunction = fragment_function;
   descriptor.payloadMemoryLength = info->payload_memory_length;
+
+  if (info->rasterization_enabled && !info->fragment_function) {
+    fprintf(stderr,
+            "warn:  DXMT diagnostic: Metal mesh render descriptor has rasterization enabled but no D3D pixel shader; "
+            "using_null_fragment=%u; "
+            "object=0x%llx mesh=0x%llx depth=%u stencil=%u samples=%u payload=%u rt=[%u,%u,%u,%u,%u,%u,%u,%u]\n",
+            fragment_function ? 1 : 0,
+            (unsigned long long)info->object_function,
+            (unsigned long long)info->mesh_function,
+            info->depth_pixel_format,
+            info->stencil_pixel_format,
+            info->raster_sample_count,
+            info->payload_memory_length,
+            info->colors[0].pixel_format,
+            info->colors[1].pixel_format,
+            info->colors[2].pixel_format,
+            info->colors[3].pixel_format,
+            info->colors[4].pixel_format,
+            info->colors[5].pixel_format,
+            info->colors[6].pixel_format,
+            info->colors[7].pixel_format);
+  }
 
   descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->mesh_tgsize_is_multiple_of_sgwidth;
   descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->object_tgsize_is_multiple_of_sgwidth;
@@ -657,10 +728,10 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   }
 #endif
   NSError *err = NULL;
-  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithMeshDescriptor:descriptor
-                                                                                                  options:options
-                                                                                               reflection:nil
-                                                                                                    error:&err];
+  params->ret_pso = (obj_handle_t)[device newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                                           options:options
+                                                                        reflection:nil
+                                                                             error:&err];
   params->ret_error = (obj_handle_t)err;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
