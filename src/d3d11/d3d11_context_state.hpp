@@ -49,6 +49,7 @@ template <> struct redundant_binding_trait<CONSTANT_BUFFER_B> {
 struct SAMPLER_B {
   IUnknown *RawPointer = 0;
   D3D11SamplerState* Sampler;
+  dxmt::Sampler *NativeSampler = nullptr;
 };
 
 typedef BindingSet<SAMPLER_B, 16> SamplerBindingSet;
@@ -62,6 +63,10 @@ template <> struct redundant_binding_trait<SAMPLER_B> {
 struct SRV_B {
   IUnknown *RawPointer = 0;
   Com<D3D11ShaderResourceView, false> SRV;
+  Rc<Buffer> Buffer;
+  Rc<Texture> Texture;
+  BufferSlice Slice;
+  uint64_t ViewId = 0;
 };
 
 typedef BindingSet<SRV_B, 128> SRVBindingSet;

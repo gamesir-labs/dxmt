@@ -72,6 +72,11 @@ struct ResourceViewBinding {
   BufferSlice slice;
 };
 
+struct ShaderResourceBindingSnapshot {
+  Sampler *sampler = nullptr;
+  ResourceViewBinding srv;
+};
+
 struct UnorderedAccessViewBinding {
   uint64_t viewId;
   Rc<Buffer> buffer;
@@ -84,6 +89,7 @@ struct DummyTextureBinding {
   WMT::Reference<WMT::Texture> texture;
   uint64_t gpu_resource_id = 0;
   uint32_t array_length = 1;
+  DXMT_RESOURCE_RESIDENCY_STATE residency;
 };
 
 enum class EncoderType {
@@ -482,9 +488,15 @@ public:
       uint64_t argument_buffer_offset
   );
   template <PipelineStage stage, PipelineKind kind>
+  void encodeConstantBuffers(
+      const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+      uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+  );
+  template <PipelineStage stage, PipelineKind kind>
   void encodeShaderResources(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments,
       uint64_t argument_buffer_offset, const std::string &shader_hash,
+      const ShaderResourceBindingSnapshot *bindings,
       uint64_t demote_msaa_srv_mask_lo = 0, uint64_t demote_msaa_srv_mask_hi = 0
   );
 

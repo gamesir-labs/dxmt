@@ -3247,14 +3247,44 @@ public:
     bool dirty_sampler = ShaderStage.Samplers.any_dirty_masked(reflection->SamplerSlotMask);
     bool dirty_srv = ShaderStage.SRVs.any_dirty_masked(reflection->SRVSlotMaskHi, reflection->SRVSlotMaskLo);
     bool uav_bound = UAVBindingSet.any_bound_masked(reflection->UAVSlotMask);
+    bool dirty_uav = UAVBindingSet.any_dirty_masked(reflection->UAVSlotMask);
     if (!dirty_cbuffer && !dirty_sampler && !dirty_srv && !uav_bound)
       return;
+
+    auto &statistics = ctx_state.cmd_queue.CurrentFrameStatistics();
+    statistics.shader_binding_upload_count++;
+    if (dirty_cbuffer)
+      statistics.shader_binding_dirty_cbuffer_count++;
+    if (dirty_sampler)
+      statistics.shader_binding_dirty_sampler_count++;
+    if (dirty_srv)
+      statistics.shader_binding_dirty_srv_count++;
+    if (dirty_uav)
+      statistics.shader_binding_dirty_uav_count++;
+    if (uav_bound && !dirty_uav)
+      statistics.shader_binding_clean_uav_count++;
 
     if (reflection->NumConstantBuffers && dirty_cbuffer) {
       auto ConstantBufferCount = reflection->NumConstantBuffers;
       auto offset = PreAllocateArgumentBuffer(ConstantBufferCount << 3, 32);
-      EmitST([=, cb = managed_shader->constant_buffers_info()](ArgumentEncodingContext &enc) {
-        enc.encodeConstantBuffers<stage, kind>(reflection, cb, offset);
+      auto cbuffer_bindings = AllocateCommandData<ConstantBufferBinding>(ConstantBufferCount);
+      auto cbuffer_info = managed_shader->constant_buffers_info();
+      for (unsigned i = 0; i < ConstantBufferCount; i++) {
+        auto &arg = cbuffer_info[i];
+        if (arg.Type != SM50BindingType::ConstantBuffer)
+          continue;
+        auto slot = arg.SM50BindingSlot;
+        if (!ShaderStage.ConstantBuffers.test_bound(slot))
+          continue;
+
+        auto &entry = ShaderStage.ConstantBuffers.at(slot);
+        cbuffer_bindings[i].buffer = entry.Buffer->buffer();
+        cbuffer_bindings[i].offset = entry.FirstConstant << 4;
+      }
+      EmitST([=, cb = cbuffer_info, cbuffer_bindings = std::move(cbuffer_bindings)](
+                 ArgumentEncodingContext &enc
+             ) {
+        enc.encodeConstantBuffers<stage, kind>(reflection, cb, offset, cbuffer_bindings.data());
       });
       ShaderStage.ConstantBuffers.clear_dirty();
     }
@@ -3263,7 +3293,31 @@ public:
       auto ArgumentTableQwords = reflection->ArgumentTableQwords;
       auto offset = PreAllocateArgumentBuffer(ArgumentTableQwords << 3, 32);
       auto shader_hash = managed_shader->sha1().string();
-      EmitST([=, arg = managed_shader->arguments_info(), shader_hash = std::move(shader_hash)](ArgumentEncodingContext &enc) {
+      auto resource_bindings = AllocateCommandData<ShaderResourceBindingSnapshot>(reflection->NumArguments);
+      for (unsigned i = 0; i < reflection->NumArguments; i++) {
+        auto &arg = managed_shader->arguments_info()[i];
+        switch (arg.Type) {
+        case SM50BindingType::Sampler: {
+          if (ShaderStage.Samplers.test_bound(arg.SM50BindingSlot))
+            resource_bindings[i].sampler = ShaderStage.Samplers.at(arg.SM50BindingSlot).NativeSampler;
+          break;
+        }
+        case SM50BindingType::SRV: {
+          if (ShaderStage.SRVs.test_bound(arg.SM50BindingSlot)) {
+            auto &entry = ShaderStage.SRVs.at(arg.SM50BindingSlot);
+            resource_bindings[i].srv.buffer = entry.Buffer;
+            resource_bindings[i].srv.texture = entry.Texture;
+            resource_bindings[i].srv.viewId = entry.ViewId;
+            resource_bindings[i].srv.slice = entry.Slice;
+          }
+          break;
+        }
+        default:
+          break;
+        }
+      }
+      EmitST([=, arg = managed_shader->arguments_info(), shader_hash = std::move(shader_hash),
+              resource_bindings = std::move(resource_bindings)](ArgumentEncodingContext &enc) {
         uint64_t demote_msaa_srv_mask_lo = 0;
         uint64_t demote_msaa_srv_mask_hi = 0;
         if constexpr (stage == PipelineStage::Pixel) {
@@ -3272,7 +3326,7 @@ public:
           demote_msaa_srv_mask_hi = render_encoder->pixel_shader_demote_msaa_srv_mask_hi;
         }
         enc.encodeShaderResources<stage, kind>(
-            reflection, arg, offset, shader_hash,
+            reflection, arg, offset, shader_hash, resource_bindings.data(),
             demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi
         );
       });
@@ -3420,10 +3474,6 @@ public:
               pFirstConstant[slot - StartSlot] != entry.FirstConstant) {
             ShaderStage.ConstantBuffers.set_dirty(slot);
             entry.FirstConstant = pFirstConstant[slot - StartSlot];
-            EmitST([=, offset = entry.FirstConstant
-                                << 4](ArgumentEncodingContext &enc) mutable {
-              enc.bindConstantBufferOffset<Stage>(slot, offset);
-            });
           }
           if (pNumConstants && pNumConstants[slot - StartSlot] != entry.NumConstants) {
             ShaderStage.ConstantBuffers.set_dirty(slot);
@@ -3440,13 +3490,9 @@ public:
           entry.NumConstants = desc.ByteWidth >> 4;
         }
         entry.Buffer = GetResourceCommon(pConstantBuffer);
-        EmitST([=, buffer = entry.Buffer->buffer(), offset = entry.FirstConstant << 4](ArgumentEncodingContext &enc
-             ) mutable { enc.bindConstantBuffer<Stage>(slot, offset, forward_rc(buffer)); });
       } else {
         // BIND NULL
-        if (ShaderStage.ConstantBuffers.unbind(slot)) {
-          EmitST([=](ArgumentEncodingContext &enc) { enc.bindConstantBuffer<Stage>(slot, 0, {}); });
-        }
+        ShaderStage.ConstantBuffers.unbind(slot);
       }
     }
   }
@@ -3546,23 +3592,19 @@ public:
           continue;
         changed = true;
         entry.SRV = pView;
+        entry.Buffer = {};
+        entry.Texture = {};
+        entry.ViewId = pView->viewId();
+        entry.Slice = pView->bufferSlice();
         if (auto buffer = entry.SRV->buffer()) {
-          EmitST([=, buffer = std::move(buffer), viewId = pView->viewId(),
-                slice = pView->bufferSlice()](ArgumentEncodingContext &enc) mutable {
-            enc.bindBuffer<Stage>(slot, forward_rc(buffer), viewId, slice);
-          });
+          entry.Buffer = std::move(buffer);
         } else {
-          EmitST([=, texture = pView->texture(), viewId = pView->viewId()](ArgumentEncodingContext &enc) mutable {
-            enc.bindTexture<Stage>(slot, forward_rc(texture), viewId);
-          });
+          entry.Texture = pView->texture();
         }
       } else {
         // BIND NULL
         if (ShaderStage.SRVs.unbind(slot)) {
           changed = true;
-          EmitST([=](ArgumentEncodingContext& enc) {
-            enc.bindBuffer<Stage>(slot, {}, 0, {});
-          });
         }
       }
     }
@@ -3604,16 +3646,10 @@ public:
         if (!replaced)
           continue;
         entry.Sampler = pSampler;
-        EmitST([=, sampler = pSampler->sampler()](ArgumentEncodingContext &enc) mutable {
-          enc.bindSampler<Stage>(Slot, forward_rc(sampler));
-        });
+        entry.NativeSampler = pSampler->samplerPtr();
       } else {
         // BIND NULL
-        if (ShaderStage.Samplers.unbind(Slot)) {
-          EmitST([=](ArgumentEncodingContext& enc) {
-            enc.bindSampler<Stage>(Slot, {});
-          });
-        }
+        ShaderStage.Samplers.unbind(Slot);
       }
     }
   }
@@ -5153,14 +5189,13 @@ public:
         });
       }
       for (const auto &[slot, entry] : ShaderStage.SRVs) {
-        auto pView = entry.SRV.ptr();
-        if (auto buffer = pView->buffer()) {
-          EmitST([=, buffer = std::move(buffer), viewId = pView->viewId(),
-                slice = pView->bufferSlice()](ArgumentEncodingContext &enc) mutable {
+        if (entry.Buffer) {
+          EmitST([=, buffer = entry.Buffer, viewId = entry.ViewId,
+                slice = entry.Slice](ArgumentEncodingContext &enc) mutable {
             enc.bindBuffer<Stage>(slot, forward_rc(buffer), viewId, slice);
           });
         } else {
-          EmitST([=, texture = pView->texture(), viewId = pView->viewId()](ArgumentEncodingContext &enc) mutable {
+          EmitST([=, texture = entry.Texture, viewId = entry.ViewId](ArgumentEncodingContext &enc) mutable {
             enc.bindTexture<Stage>(slot, forward_rc(texture), viewId);
           });
         }
