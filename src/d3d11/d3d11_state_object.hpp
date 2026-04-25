@@ -154,6 +154,7 @@ namespace dxmt {
 class D3D11SamplerState : public ID3D11SamplerState {
 public:
   virtual Rc<Sampler> sampler() = 0;
+  virtual Sampler *samplerPtr() = 0;
 };
 
 template <typename DESC, typename Object> class StateObjectCache {

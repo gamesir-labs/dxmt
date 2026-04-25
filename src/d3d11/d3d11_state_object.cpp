@@ -222,6 +222,7 @@ public:
   }
 
   virtual Rc<Sampler> sampler() { return sampler_; }
+  virtual Sampler *samplerPtr() { return sampler_.ptr(); }
 
 private:
   Rc<Sampler> sampler_;

@@ -198,6 +198,47 @@ template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixe
     uint64_t argument_buffer_offset
 );
 
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Hull, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Domain, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Compute, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Geometry, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const ConstantBufferBinding *bindings
+);
+
 template <PipelineStage stage, PipelineKind kind>
 void
 ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset) {
@@ -259,34 +300,34 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
 };
 
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Ordinary>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Pixel, PipelineKind::Ordinary>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Pixel, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Hull, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Domain, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Compute, PipelineKind::Ordinary>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Geometry>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Geometry, PipelineKind::Geometry>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Pixel, PipelineKind::Geometry>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 
 inline uint64_t
@@ -396,6 +437,11 @@ DebugEnabledEnv(const char *name) {
   return value == "1" || value == "true" || value == "yes" || value == "trace";
 }
 
+static double
+DebugMillis(clock::duration duration) {
+  return duration.count() / 1000000.0;
+}
+
 static bool
 DebugShaderHashSelected(const std::string &shader_hash) {
   auto filters = env::getEnvVar("DXMT_DIAG_SHADER_HASHES");
@@ -416,21 +462,25 @@ DebugShaderHashSelected(const std::string &shader_hash) {
 
 static bool
 DebugShouldLogBinding(const std::string &shader_hash) {
-  return DebugEnabledEnv("DXMT_DIAG_BINDINGS") && DebugShaderHashSelected(shader_hash);
+  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_BINDINGS");
+  return enabled && DebugShaderHashSelected(shader_hash);
 }
 
 static uint32_t
 DebugBindingLogLimit() {
-  auto value = env::getEnvVar("DXMT_DIAG_BINDING_LIMIT");
-  if (value.empty())
-    return 4096;
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_BINDING_LIMIT");
+    if (value.empty())
+      return uint32_t(4096);
 
-  char *end = nullptr;
-  auto parsed = std::strtoul(value.c_str(), &end, 10);
-  if (!end || *end != '\0' || parsed == 0)
-    return 4096;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed == 0)
+      return uint32_t(4096);
 
-  return uint32_t(std::min<unsigned long>(parsed, 100000));
+    return uint32_t(std::min<unsigned long>(parsed, 100000));
+  }();
+  return limit;
 }
 
 static const char *
@@ -490,6 +540,68 @@ DebugTextureTypeName(WMTTextureType type) {
     return "TextureBuffer";
   default:
     return "Unknown";
+  }
+}
+
+template <PipelineStage stage, PipelineKind kind>
+void
+ArgumentEncodingContext::encodeConstantBuffers(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers, uint64_t offset,
+    const ConstantBufferBinding *bindings
+) {
+  uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
+
+  for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
+    auto &arg = constant_buffers[i];
+    switch (arg.Type) {
+    case SM50BindingType::ConstantBuffer: {
+      auto &cbuf = bindings[i];
+      if (!cbuf.buffer.ptr()) {
+        encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
+        makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
+        continue;
+      }
+      auto argbuf = cbuf.buffer;
+      auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
+      auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
+      encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+      makeResident<stage, kind>(argbuf.ptr());
+      break;
+    }
+    default:
+      DXMT_UNREACHABLE
+    }
+  }
+
+  /* kConstantBufferTableBinding = 29 */
+  if constexpr (stage == PipelineStage::Compute) {
+    auto &cmd = encodeComputeCommand<wmtcmd_compute_setbufferoffset>();
+    cmd.type = WMTComputeCommandSetBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.index = 29;
+  } else {
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setbufferoffset>();
+    cmd.offset = getFinalArgumentBufferOffset(offset);
+    cmd.index = 29;
+    if constexpr (stage == PipelineStage::Vertex) {
+      if constexpr (kind == PipelineKind::Geometry)
+        cmd.type = WMTRenderCommandSetObjectBufferOffset;
+      else if constexpr (kind == PipelineKind::Tessellation) {
+        cmd.type = WMTRenderCommandSetObjectBufferOffset;
+        cmd.index = 27;
+      } else
+        cmd.type = WMTRenderCommandSetVertexBufferOffset;
+    } else if constexpr (stage == PipelineStage::Pixel) {
+      cmd.type = WMTRenderCommandSetFragmentBufferOffset;
+    } else if constexpr (stage == PipelineStage::Hull) {
+      cmd.type = WMTRenderCommandSetObjectBufferOffset;
+    } else if constexpr (stage == PipelineStage::Domain) {
+      cmd.type = WMTRenderCommandSetMeshBufferOffset;
+    } else if constexpr (stage == PipelineStage::Geometry) {
+      cmd.type = WMTRenderCommandSetMeshBufferOffset;
+    } else {
+      assert(0 && "Not implemented or unreachable");
+    }
   }
 }
 
@@ -628,7 +740,8 @@ template <PipelineStage stage, PipelineKind kind>
 void
 ArgumentEncodingContext::encodeShaderResources(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t offset,
-    const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
+    const std::string &shader_hash, const ShaderResourceBindingSnapshot *bindings,
+    uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 ) {
   auto BindingCount = reflection->NumArguments;
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
@@ -657,7 +770,7 @@ ArgumentEncodingContext::encodeShaderResources(
     }
     case SM50BindingType::Sampler: {
       auto slot = 16 * unsigned(stage) + arg.SM50BindingSlot;
-      auto &sampler = sampler_[slot].sampler;
+      auto sampler = bindings ? bindings[i].sampler : sampler_[slot].sampler.ptr();
       if (!sampler) {
         encoded_buffer[arg.StructurePtrOffset] = dummy_sampler_info_.gpu_resource_id;
         encoded_buffer[arg.StructurePtrOffset + 1] = dummy_sampler_info_.gpu_resource_id;
@@ -671,7 +784,7 @@ ArgumentEncodingContext::encodeShaderResources(
     }
     case SM50BindingType::SRV: {
       auto slot = 128 * unsigned(stage) + arg.SM50BindingSlot;
-      auto &srv = resview_[slot];
+      auto &srv = bindings ? bindings[i].srv : resview_[slot];
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (srv.buffer.ptr()) {
@@ -711,7 +824,9 @@ ArgumentEncodingContext::encodeShaderResources(
           if (dummy_texture.texture) {
             encoded_buffer[arg.StructurePtrOffset] = dummy_texture.gpu_resource_id;
             encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(dummy_texture.array_length, 0);
-            makeResident<stage, kind>(dummy_texture.texture, GetResidencyMask<kind>(stage, true, false));
+            DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, true, false);
+            if (CheckResourceResidency(dummy_texture.residency, currentEncoderId(), requested))
+              makeResident<stage, kind>(dummy_texture.texture, requested);
           } else {
             encoded_buffer[arg.StructurePtrOffset] = 0;
             encoded_buffer[arg.StructurePtrOffset + 1] = 0;
@@ -1469,7 +1584,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           }
       );
       auto t1 = clock::now();
-      currentFrameStatistics().drawable_blocking_interval += (t1 - t0);
+      auto present_encode_interval = t1 - t0;
+      currentFrameStatistics().drawable_blocking_interval += present_encode_interval;
+      if (DebugEnabledEnv("DXMT_DIAG_SWAPCHAIN") || DebugMillis(present_encode_interval) > 250.0) {
+        static std::atomic<uint64_t> present_diag_count = 0;
+        auto index = present_diag_count.fetch_add(1, std::memory_order_relaxed);
+        if (index < 64 || (index % 120) == 0 || DebugMillis(present_encode_interval) > 250.0) {
+          INFO("DXMT: Present encode frame=", currentFrameId(), " backbuffer=", data->backbuffer.width(), "x",
+               data->backbuffer.height(), " elapsedMs=", DebugMillis(present_encode_interval),
+               " presentAfter=", data->after);
+        }
+      }
       if (data->after > 0)
         cmdbuf.presentDrawableAfterMinimumDuration(drawable, data->after);
       else
