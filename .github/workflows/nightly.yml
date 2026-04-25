@@ -17,19 +17,20 @@ env:
   LLVM_VERSION: llvmorg-15.0.7
   WINE_VERSION: v8.16-3shain
   WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
 jobs:
   setup-wine:
     runs-on: macos-15
     steps:
-      - name: Cache Wine
+      - name: Restore Wine Cache
         id: cache-wine
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           key: wine-x86_64-${{ env.WINE_VERSION }}-macos
           restore-keys: |
             wine-x86_64-${{ env.WINE_VERSION }}-
-          lookup-only: true
           path: ./toolchains/wine
 
       - name: Install Wine
@@ -47,56 +48,27 @@ jobs:
           key: wine-x86_64-${{ env.WINE_VERSION }}-macos
           path: ./toolchains/wine
 
-  setup-llvm-project:
-    runs-on: macos-15
-    steps:
-      - name: Cache LLVM Project
-        id: cache-llvm-project
-        uses: actions/cache@v5
-        with:
-          key: llvm-project-${{ env.LLVM_VERSION }}-macos
-          restore-keys: |
-            llvm-project-${{ env.LLVM_VERSION }}-
-          lookup-only: true
-          path: ./toolchains/llvm-project
-
-      - name: Clone LLVM Project
-        if: steps.cache-llvm-project.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ./toolchains
-          git clone --depth 1 --branch "${{ env.LLVM_VERSION }}" https://github.com/llvm/llvm-project.git toolchains/llvm-project
-
-      - name: Save LLVM Project Cache
-        if: steps.cache-llvm-project.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          key: llvm-project-${{ env.LLVM_VERSION }}-macos
-          path: ./toolchains/llvm-project
-
   setup-llvm-darwin:
     runs-on: macos-15
-    needs: setup-llvm-project
     steps:
-      - name: Cache LLVM Darwin Build
+      - name: Restore LLVM Darwin Cache
         id: cache-llvm-darwin
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
           restore-keys: |
             llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-
-          lookup-only: true
           path: ./toolchains/llvm-darwin
 
-      - name: Restore LLVM Project Cache
+      - name: Select Xcode Version
         if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v5
-        with:
-          key: llvm-project-${{ env.LLVM_VERSION }}-macos
-          path: ./toolchains/llvm-project
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
 
       - name: Build LLVM for Darwin x86_64
         if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
         run: |
+          mkdir -p ./toolchains
+          git clone --depth 1 --branch "${{ env.LLVM_VERSION }}" https://github.com/llvm/llvm-project.git toolchains/llvm-project
           mkdir -p ./toolchains/llvm-darwin-build
           cmake -B ./toolchains/llvm-darwin-build -S ./toolchains/llvm-project/llvm \
             -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
@@ -113,6 +85,7 @@ jobs:
             -G Ninja
           cmake --build ./toolchains/llvm-darwin-build
           cmake --install ./toolchains/llvm-darwin-build
+          rm -rf ./toolchains/llvm-project ./toolchains/llvm-darwin-build
 
       - name: Save LLVM Darwin Cache
         if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
@@ -124,6 +97,8 @@ jobs:
   build-x86_64-windows:
     runs-on: macos-15
     needs: [setup-wine, setup-llvm-darwin]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -142,10 +117,31 @@ jobs:
           key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
           path: ./toolchains/llvm-darwin
 
-      - name: Install Build Tools
-        uses: tecolicom/actions-use-homebrew-tools@v1
+      - name: Restore Ccache
+        uses: actions/cache/restore@v5
         with:
-          tools: mingw-w64
+          key: ccache-macos-nightly-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-macos-nightly-x86_64-
+          path: ${{ env.CCACHE_DIR }}
+
+      - name: Install Build Tools
+        run: brew install mingw-w64 ccache
+
+      - name: Prepare Ccache
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ccache-bin" "$CCACHE_DIR"
+          for compiler in x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++; do
+            real_compiler="$(command -v "$compiler")"
+            cat > "$GITHUB_WORKSPACE/.ccache-bin/$compiler" <<WRAPPER
+          #!/bin/sh
+          exec ccache "$real_compiler" "\$@"
+          WRAPPER
+            chmod +x "$GITHUB_WORKSPACE/.ccache-bin/$compiler"
+          done
+          echo "$GITHUB_WORKSPACE/.ccache-bin" >> "$GITHUB_PATH"
+          ccache --set-config=max_size=2G
+          ccache --zero-stats
 
       - name: Select Xcode Version
         run: sudo xcode-select -s /Applications/Xcode_16.1.app
@@ -167,6 +163,14 @@ jobs:
           meson compile -C build
           meson install -C build
           find install -name '*.a' -delete
+          ccache --show-stats
+
+      - name: Save Ccache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          key: ccache-macos-nightly-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CCACHE_DIR }}
 
       - name: Upload x86_64 Runtime
         uses: actions/upload-artifact@v6
@@ -177,6 +181,8 @@ jobs:
   build-x86-windows:
     runs-on: macos-15
     needs: setup-wine
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -189,10 +195,31 @@ jobs:
           key: wine-x86_64-${{ env.WINE_VERSION }}-macos
           path: ./toolchains/wine
 
-      - name: Install Build Tools
-        uses: tecolicom/actions-use-homebrew-tools@v1
+      - name: Restore Ccache
+        uses: actions/cache/restore@v5
         with:
-          tools: mingw-w64
+          key: ccache-macos-nightly-x86-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-macos-nightly-x86-
+          path: ${{ env.CCACHE_DIR }}
+
+      - name: Install Build Tools
+        run: brew install mingw-w64 ccache
+
+      - name: Prepare Ccache
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ccache-bin" "$CCACHE_DIR"
+          for compiler in i686-w64-mingw32-gcc i686-w64-mingw32-g++; do
+            real_compiler="$(command -v "$compiler")"
+            cat > "$GITHUB_WORKSPACE/.ccache-bin/$compiler" <<WRAPPER
+          #!/bin/sh
+          exec ccache "$real_compiler" "\$@"
+          WRAPPER
+            chmod +x "$GITHUB_WORKSPACE/.ccache-bin/$compiler"
+          done
+          echo "$GITHUB_WORKSPACE/.ccache-bin" >> "$GITHUB_PATH"
+          ccache --set-config=max_size=2G
+          ccache --zero-stats
 
       - name: Select Xcode Version
         run: sudo xcode-select -s /Applications/Xcode_16.1.app
@@ -211,6 +238,14 @@ jobs:
           meson compile -C build
           meson install -C build
           find install -name '*.a' -delete
+          ccache --show-stats
+
+      - name: Save Ccache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          key: ccache-macos-nightly-x86-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CCACHE_DIR }}
 
       - name: Upload x86 Runtime
         uses: actions/upload-artifact@v6
