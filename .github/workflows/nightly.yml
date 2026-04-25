@@ -1,0 +1,281 @@
+name: Nightly Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: llvmorg-15.0.7
+  WINE_VERSION: v8.16-3shain
+  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+
+jobs:
+  setup-wine:
+    runs-on: macos-15
+    steps:
+      - name: Cache Wine
+        id: cache-wine
+        uses: actions/cache@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          restore-keys: |
+            wine-x86_64-${{ env.WINE_VERSION }}-
+          lookup-only: true
+          path: ./toolchains/wine
+
+      - name: Install Wine
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains/wine
+          curl -SL "${{ env.WINE_URL }}" > ./wine.tar.gz
+          tar -zxf ./wine.tar.gz -C ./toolchains/wine
+          rm ./wine.tar.gz
+
+      - name: Save Wine Cache
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+  setup-llvm-project:
+    runs-on: macos-15
+    steps:
+      - name: Cache LLVM Project
+        id: cache-llvm-project
+        uses: actions/cache@v5
+        with:
+          key: llvm-project-${{ env.LLVM_VERSION }}-macos
+          restore-keys: |
+            llvm-project-${{ env.LLVM_VERSION }}-
+          lookup-only: true
+          path: ./toolchains/llvm-project
+
+      - name: Clone LLVM Project
+        if: steps.cache-llvm-project.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains
+          git clone --depth 1 --branch "${{ env.LLVM_VERSION }}" https://github.com/llvm/llvm-project.git toolchains/llvm-project
+
+      - name: Save LLVM Project Cache
+        if: steps.cache-llvm-project.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: llvm-project-${{ env.LLVM_VERSION }}-macos
+          path: ./toolchains/llvm-project
+
+  setup-llvm-darwin:
+    runs-on: macos-15
+    needs: setup-llvm-project
+    steps:
+      - name: Cache LLVM Darwin Build
+        id: cache-llvm-darwin
+        uses: actions/cache@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          restore-keys: |
+            llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-
+          lookup-only: true
+          path: ./toolchains/llvm-darwin
+
+      - name: Restore LLVM Project Cache
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-project-${{ env.LLVM_VERSION }}-macos
+          path: ./toolchains/llvm-project
+
+      - name: Build LLVM for Darwin x86_64
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains/llvm-darwin-build
+          cmake -B ./toolchains/llvm-darwin-build -S ./toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
+            -DLLVM_ENABLE_ASSERTIONS=On \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DBUG_REPORT_URL="https://github.com/gamesir-labs/dxmt" \
+            -DPACKAGE_VENDOR="DXMT" \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
+            -G Ninja
+          cmake --build ./toolchains/llvm-darwin-build
+          cmake --install ./toolchains/llvm-darwin-build
+
+      - name: Save LLVM Darwin Cache
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+  build-x86_64-windows:
+    runs-on: macos-15
+    needs: [setup-wine, setup-llvm-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Restore Wine Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+      - name: Restore LLVM Darwin Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+      - name: Install Build Tools
+        uses: tecolicom/actions-use-homebrew-tools@v1
+        with:
+          tools: mingw-w64
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      - name: Build x86_64 Wine Builtin Runtime
+        run: |
+          meson setup --cross-file build-win64.txt \
+            -Denable_nvapi=true \
+            -Denable_nvngx=true \
+            -Dnative_llvm_path=toolchains/llvm-darwin \
+            -Dwine_install_path=toolchains/wine \
+            --buildtype release \
+            --prefix "$(pwd)/install" \
+            --strip \
+            build
+          meson compile -C build
+          meson install -C build
+          find install -name '*.a' -delete
+
+      - name: Upload x86_64 Runtime
+        uses: actions/upload-artifact@v6
+        with:
+          name: nightly-x86_64-runtime
+          path: install
+
+  build-x86-windows:
+    runs-on: macos-15
+    needs: setup-wine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Restore Wine Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+      - name: Install Build Tools
+        uses: tecolicom/actions-use-homebrew-tools@v1
+        with:
+          tools: mingw-w64
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      - name: Build x86 Wine Builtin Runtime
+        run: |
+          meson setup --cross-file build-win32.txt \
+            -Dwine_install_path=toolchains/wine \
+            --buildtype release \
+            --prefix "$(pwd)/install" \
+            --strip \
+            build
+          meson compile -C build
+          meson install -C build
+          find install -name '*.a' -delete
+
+      - name: Upload x86 Runtime
+        uses: actions/upload-artifact@v6
+        with:
+          name: nightly-x86-runtime
+          path: install
+
+  package:
+    runs-on: macos-15
+    needs: [build-x86_64-windows, build-x86-windows]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute Nightly Version
+        id: version
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          package_name="dxmt-nightly-${short_sha}"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Download x86_64 Runtime
+        uses: actions/download-artifact@v8
+        with:
+          name: nightly-x86_64-runtime
+          path: ./combined/${{ steps.version.outputs.package_name }}
+
+      - name: Download x86 Runtime
+        uses: actions/download-artifact@v8
+        with:
+          name: nightly-x86-runtime
+          path: ./combined/${{ steps.version.outputs.package_name }}
+
+      - name: Add License Notices
+        run: |
+          cp LICENSE COPYING.LIB ./combined/${{ steps.version.outputs.package_name }}/
+          find ./combined/${{ steps.version.outputs.package_name }} -name '*.a' -delete
+          test ! -d ./combined/${{ steps.version.outputs.package_name }}/system32
+
+      - name: Verify Builtin Package Layout
+        run: |
+          package_dir="./combined/${{ steps.version.outputs.package_name }}"
+          test -d "${package_dir}/i386-windows"
+          test -d "${package_dir}/x86_64-windows"
+          test -d "${package_dir}/x86_64-unix"
+          test -f "${package_dir}/LICENSE"
+          test -f "${package_dir}/COPYING.LIB"
+          find "${package_dir}" -maxdepth 1 -mindepth 1 \
+            ! -name i386-windows \
+            ! -name x86_64-windows \
+            ! -name x86_64-unix \
+            ! -name LICENSE \
+            ! -name COPYING.LIB \
+            -exec sh -c 'echo "unexpected package entry: $1" >&2; exit 1' sh {} \;
+
+      - name: Create Nightly Tarball
+        run: |
+          tar -czf "${{ steps.version.outputs.package_name }}.tar.gz" -C ./combined "${{ steps.version.outputs.package_name }}"
+          shasum -a 256 "${{ steps.version.outputs.package_name }}.tar.gz" > "${{ steps.version.outputs.package_name }}.tar.gz.sha256"
+
+      - name: Upload Nightly Package
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.version.outputs.package_name }}
+          path: |
+            ${{ steps.version.outputs.package_name }}.tar.gz
+            ${{ steps.version.outputs.package_name }}.tar.gz.sha256
