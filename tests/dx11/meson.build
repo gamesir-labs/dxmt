@@ -29,3 +29,7 @@ executable('dx11_hdr_linear', ['dx11_hdr_linear.cpp'],
 executable('dx11_hdr_pq', ['dx11_hdr_pq.cpp'],
   dependencies: [ lib_d3d11, lib_dxgi, lib_d3dcompiler]
 )
+
+executable('dx11_binding_bench', ['dx11_binding_bench.cpp'],
+  dependencies: [ lib_d3d11, lib_dxgi, lib_d3dcompiler]
+)
