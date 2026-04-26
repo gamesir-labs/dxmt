@@ -2937,9 +2937,20 @@ Converter::CreateBufferLoadInt32(BufferResourceHandle &Buffer, llvm::Value *Inde
   using namespace llvm::air;
 
   if (!Buffer.ThreadgroupMemory) {
-    auto Ptr = CreateGEPInt32WithBoundCheck(Buffer, Index);
-    return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                 : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    if (!Buffer.Metadata) {
+      auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer.Pointer, {Index});
+      return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+                                   : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    }
+
+    auto ByteLength = DecodeRawBufferByteLength(Buffer.Metadata);
+    auto InBounds = ir.CreateICmpULT(Index, ir.CreateLShr(ByteLength, 2));
+    auto SafeIndex = ir.CreateSelect(InBounds, Index, ir.getInt32(0));
+    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer.Pointer, {SafeIndex});
+    auto Value = Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+                                       : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+
+    return ir.CreateSelect(InBounds, Value, ir.getInt32(0));
   }
 
   if (!Buffer.ElementCount)
