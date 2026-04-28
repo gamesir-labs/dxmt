@@ -105,7 +105,7 @@ public:
     } else {
       flags.set(BufferAllocationFlag::SuballocateFromOnePage);
 #ifdef __i386__
-      flags.set(BufferAllocationFlag::CpuPlaced);
+      flags.set(BufferAllocationFlag::CpuShadow);
 #endif
     }
     auto allocation = buffer_->allocate(flags);

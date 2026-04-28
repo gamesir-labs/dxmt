@@ -23,13 +23,16 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     info_.length = DXMT_PAGE_SIZE;
   }
   fenceTrackers.resize(suballocation_count_);
-  if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
+  if (flags_.test(BufferAllocationFlag::CpuPlaced) || flags_.test(BufferAllocationFlag::CpuShadow)) {
     placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
-    info_.memory.set(placed_buffer);
+    if (flags_.test(BufferAllocationFlag::CpuPlaced))
+      info_.memory.set(placed_buffer);
   }
   obj_ = device.newBuffer(info_);
   gpuAddress_ = info_.gpu_address;
-  mappedMemory_ = info_.memory.get_accessible_or_null();
+  mappedMemory_ = flags_.test(BufferAllocationFlag::CpuShadow)
+                    ? placed_buffer
+                    : info_.memory.get_accessible_or_null();
 };
 
 BufferAllocation::~BufferAllocation() {
@@ -37,6 +40,23 @@ BufferAllocation::~BufferAllocation() {
     wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;
   }
+}
+
+void
+BufferAllocation::flushCpuShadow(uint64_t offset, uint64_t length, uint32_t suballocation) noexcept {
+  if (!flags_.test(BufferAllocationFlag::CpuShadow) || !mappedMemory_ || !length)
+    return;
+  if (unlikely(suballocation >= suballocation_count_ || offset >= suballocation_size_))
+    return;
+  auto max_length = suballocation_size_ - offset;
+  if (length > max_length)
+    length = max_length;
+  auto absolute_offset = suballocation * suballocation_size_ + offset;
+  obj_.updateContents(
+      absolute_offset,
+      reinterpret_cast<const char *>(mappedMemory_) + absolute_offset,
+      length
+  );
 }
 
 WMT::Texture

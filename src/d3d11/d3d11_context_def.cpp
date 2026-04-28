@@ -270,7 +270,24 @@ public:
   Unmap(ID3D11Resource *pResource, UINT Subresource) override {
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
+    if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
+      auto ret = ctx_state.current_dynamic_buffer_allocations.find(dynamic.ptr());
+      if (ret != ctx_state.current_dynamic_buffer_allocations.end()) {
+        auto &allocation_state = ret->second;
+        allocation_state.allocation->flushCpuShadow(0, buffer_length, allocation_state.suballocation);
+      }
+      return;
+    }
     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
+      auto ret = ctx_state.current_dynamic_buffer_allocations.find(dynamic.ptr());
+      if (ret != ctx_state.current_dynamic_buffer_allocations.end()) {
+        auto &allocation_state = ret->second;
+        allocation_state.allocation->flushCpuShadow(
+            0,
+            dynamic->buffer->length(),
+            allocation_state.suballocation
+        );
+      }
       BlitObject texture(device, pResource);
       UpdateTexture(TextureUpdateCommand(texture, Subresource, nullptr),
                     dynamic->buffer, row_pitch, depth_pitch);

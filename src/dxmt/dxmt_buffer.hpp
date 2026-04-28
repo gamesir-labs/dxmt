@@ -22,6 +22,8 @@ enum class BufferAllocationFlag : uint32_t {
   /* will allocate at least one page of memory and try to suballocate from that */
   SuballocateFromOnePage = 5,
   CpuPlaced = 6,
+  /* low-address CPU mapping with a separate Metal-owned backing buffer */
+  CpuShadow = 7,
 };
 
 typedef uint64_t BufferViewKey;
@@ -99,12 +101,20 @@ public:
 
   void
   updateContents(uint64_t offset, const void *data, uint64_t length, uint32_t suballocation = 0) noexcept {
+    if (unlikely(!length))
+      return;
+    auto absolute_offset = suballocation * suballocation_size_ + offset;
     if (likely(mappedMemory_ != nullptr && !flags_.test(BufferAllocationFlag::GpuManaged))) {
-      memcpy(reinterpret_cast<char *>(mappedMemory_) + suballocation * suballocation_size_ + offset, data, length);
+      memcpy(reinterpret_cast<char *>(mappedMemory_) + absolute_offset, data, length);
+      if (flags_.test(BufferAllocationFlag::CpuShadow))
+        obj_.updateContents(absolute_offset, data, length);
       return;
     }
-    obj_.updateContents(suballocation * suballocation_size_ + offset, data, length);
+    obj_.updateContents(absolute_offset, data, length);
   }
+
+  void
+  flushCpuShadow(uint64_t offset, uint64_t length, uint32_t suballocation = 0) noexcept;
 
   DXMT_RESOURCE_RESIDENCY_STATE residencyState;
   small_vector<GenericAccessTracker, 1> fenceTrackers;

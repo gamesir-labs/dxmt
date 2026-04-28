@@ -296,7 +296,18 @@ public:
     if (auto staging = GetStagingResource(pResource, Subresource)) {
       staging->unmap();
     };
+    UINT buffer_length = 0;
+    UINT bind_flag = 0;
+    if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
+      dynamic->immediateName()->flushCpuShadow(0, buffer_length, dynamic->immediateSuballocation());
+      return;
+    }
     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
+      dynamic->immediateName()->flushCpuShadow(
+          0,
+          dynamic->buffer->length(),
+          dynamic->immediateSuballocation()
+      );
       BlitObject texture(device, pResource);
       UpdateTexture(TextureUpdateCommand(texture, Subresource, nullptr),
                     dynamic->buffer, row_pitch, depth_pitch);

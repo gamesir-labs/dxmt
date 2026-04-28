@@ -119,7 +119,7 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
     Flags<BufferAllocationFlag> buffer_flags;
     buffer_flags.set(BufferAllocationFlag::CpuWriteCombined, BufferAllocationFlag::SuballocateFromOnePage);
 #ifdef __i386__
-    buffer_flags.set(BufferAllocationFlag::CpuPlaced);
+    buffer_flags.set(BufferAllocationFlag::CpuShadow);
 #endif
     Subresource subresource;
     subresource.buffer = new Buffer(buf_len, pDevice->GetMTLDevice());
