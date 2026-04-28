@@ -1,10 +1,13 @@
 #pragma once
 #include "Metal.hpp"
 #include "thread.hpp"
+#include <string>
 
 namespace dxmt {
 
 constexpr int kDXMTShaderCacheVersion = 18;
+
+std::string GetDXMTShaderCacheDirectory();
 
 class ShaderCache {
 public:
