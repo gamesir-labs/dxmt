@@ -114,8 +114,9 @@ The following environment variables can be used for **debugging** purposes.
 - `DXMT_CAPTURE_FRAME=n` Automatically capture n-th frame. Useful for debugging a replay.
 - `DXMT_LOG_LEVEL=none|error|warn|info|debug` Controls message logging.
 - `DXMT_LOG_PATH=/some/directory` Changes path where log files are stored. Set to `none` to disable log file creation entirely, without disabling logging.
-- `DXMT_SHADER_CACHE=0`: Disables the internal shader cache.
-- `DXMT_SHADER_CACHE_PATH=/some/absolute/darwin/directory`: Path to internal shader cache files. Default to `$(getconf DARWIN_USER_CACHE_DIR)/dxmt/<executable name with extension>`.
+- `DXMT_SHADER_CACHE=0`: Disables DXMT-managed shader cache files. The Metal framework PSO cache is still controlled by Metal itself.
+- `DXMT_SHADER_CACHE_PATH=/some/absolute/darwin/directory`: Path to DXMT-managed shader cache files and the per-executable Metal framework cache directory. Defaults to `$(getconf DARWIN_USER_CACHE_DIR)/dxmt/<executable name with extension>_<executable path hash>`.
+- `DXMT_USE_DEFAULT_METAL_CACHE=1`: Leaves Metal's framework cache path at the system default instead of placing it under `DXMT_SHADER_CACHE_PATH`.
 - `DXMT_DUMP_PATH=/some/directory`: Changes path where shader and pipeline dump files are stored. Falls back to `DXMT_LOG_PATH` when unset.
 - `DXMT_DUMP_PIPELINES=0|problem|all`: Controls pipeline dumping. `problem` dumps known problematic pipelines, currently including mesh pipelines with rasterization enabled and no pixel shader; `all` dumps every graphics pipeline.
 - `DXMT_DUMP_PIPELINE_KEY=hex-key`: Restricts pipeline dumping to one logged pipeline key. This key is intended for the current process only and is not stable across runs.
