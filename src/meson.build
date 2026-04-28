@@ -9,6 +9,7 @@ endif
 
 subdir('dxmt')
 subdir('dxgi')
+subdir('d3d12')
 subdir('d3d11')
 subdir('d3d10')
 
