@@ -9,6 +9,7 @@
 #include "util_string.hpp"
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -204,12 +205,18 @@ public:
     if (!state)
       return E_INVALIDARG;
 
-    HRESULT hr = state->SignalFromQueue(value);
-    if (SUCCEEDED(hr)) {
+    auto event = state->GetSharedEvent();
+    {
+      std::lock_guard lock(mutex_);
+      auto &queue = device_->GetDXMTDevice().queue();
+      queue.CurrentChunk()->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
+        enc.signalEvent(std::move(event), value);
+      });
+      queue.CommitCurrentChunk();
       signal_count_++;
       last_signal_value_ = value;
     }
-    return hr;
+    return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence *fence, UINT64 value) override {
@@ -220,10 +227,16 @@ public:
     if (!state)
       return E_INVALIDARG;
 
-    wait_values_.push_back(value);
-    if (!state->HasReached(value))
-      Logger::info(str::format("D3D12CommandQueue: queued CPU-side wait placeholder for fence value ", value));
-
+    auto event = state->GetSharedEvent();
+    {
+      std::lock_guard lock(mutex_);
+      auto &queue = device_->GetDXMTDevice().queue();
+      queue.CurrentChunk()->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
+        enc.waitEvent(std::move(event), value);
+      });
+      queue.CommitCurrentChunk();
+      wait_values_.push_back(value);
+    }
     return S_OK;
   }
 
@@ -336,6 +349,7 @@ private:
   UINT64 signal_count_ = 0;
   UINT64 last_signal_value_ = 0;
   std::vector<UINT64> wait_values_;
+  std::mutex mutex_;
   std::string name_;
 };
 

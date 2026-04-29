@@ -182,6 +182,10 @@ public:
     return adapter_->GetMTLDevice();
   }
 
+  dxmt::Device &GetDXMTDevice() override {
+    return *device_;
+  }
+
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() override {
     return local_kmt_;
   }

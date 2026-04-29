@@ -5,31 +5,16 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
-#include <atomic>
-#include <mutex>
-#include <vector>
 
 namespace dxmt::d3d12 {
 namespace {
 
-struct PendingEvent {
-  UINT64 value;
-  HANDLE event;
-};
-
-static void
-SignalWin32Event(HANDLE event) {
-#ifdef _WIN32
-  ::SetEvent(event);
-#else
-  (void)event;
-#endif
-}
-
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
-      : device_(device), value_(initial_value), flags_(flags) {}
+      : device_(device), event_(device->GetMTLDevice().newSharedEvent()), flags_(flags) {
+    event_.signalValue(initial_value);
+  }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
     if (!ppvObject)
@@ -72,59 +57,34 @@ public:
   }
 
   UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
-    return value_.load(std::memory_order_acquire);
+    return event_.signaledValue();
   }
 
   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
     if (!event)
       return E_INVALIDARG;
 
-    std::lock_guard lock(mutex_);
-    if (GetCompletedValue() >= value) {
-      SignalWin32Event(event);
-      return S_OK;
-    }
-
-    pending_events_.push_back({value, event});
-
+    auto shared_event_listener = device_->GetDXMTDevice().queue().GetSharedEventListener();
+    MTLSharedEvent_setWin32EventAtValue(event_.handle, shared_event_listener, event, value);
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
-    return SignalFromQueue(value);
-  }
-
-  HRESULT SignalFromQueue(UINT64 value) override {
-    value_.store(value, std::memory_order_release);
-    FlushPendingEvents();
+    event_.signalValue(value);
     return S_OK;
   }
 
+  WMT::Reference<WMT::SharedEvent> GetSharedEvent() const override { return event_; }
+
   bool HasReached(UINT64 value) const override {
-    return value_.load(std::memory_order_acquire) >= value;
+    return MTLSharedEvent_signaledValue(event_.handle) >= value;
   }
 
 private:
-  void FlushPendingEvents() {
-    std::lock_guard lock(mutex_);
-    const auto completed = GetCompletedValue();
-
-    for (auto it = pending_events_.begin(); it != pending_events_.end();) {
-      if (completed >= it->value) {
-        SignalWin32Event(it->event);
-        it = pending_events_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
-  std::atomic<UINT64> value_;
+  WMT::Reference<WMT::SharedEvent> event_;
   D3D12_FENCE_FLAGS flags_;
-  std::mutex mutex_;
-  std::vector<PendingEvent> pending_events_;
   std::string name_;
 };
 

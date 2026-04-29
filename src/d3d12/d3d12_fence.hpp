@@ -10,7 +10,7 @@ class Fence {
 public:
   virtual ~Fence() = default;
 
-  virtual HRESULT SignalFromQueue(UINT64 value) = 0;
+  virtual WMT::Reference<WMT::SharedEvent> GetSharedEvent() const = 0;
   virtual bool HasReached(UINT64 value) const = 0;
 };
 
