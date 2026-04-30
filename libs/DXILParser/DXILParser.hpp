@@ -664,6 +664,17 @@ struct PsvResourceBindInfo {
   uint32_t resource_flags = 0;
 };
 
+struct PsvComponentMaskInfo {
+  uint32_t vector_count = 0;
+  std::vector<uint32_t> mask_words;
+};
+
+struct PsvDependencyTableInfo {
+  uint32_t input_vectors = 0;
+  uint32_t output_vectors = 0;
+  std::vector<uint32_t> mask_words;
+};
+
 struct PipelineStateValidationInfo {
   uint32_t runtime_info_size = 0;
   std::span<const uint8_t> runtime_info;
@@ -696,6 +707,11 @@ struct PipelineStateValidationInfo {
   std::vector<PsvSignatureElement> input_signature_elements;
   std::vector<PsvSignatureElement> output_signature_elements;
   std::vector<PsvSignatureElement> patch_constant_or_primitive_signature_elements;
+  std::array<PsvComponentMaskInfo, 4> view_id_output_masks;
+  PsvComponentMaskInfo view_id_patch_constant_or_primitive_output_mask;
+  std::array<PsvDependencyTableInfo, 4> input_to_output_tables;
+  PsvDependencyTableInfo input_to_patch_constant_output_table;
+  PsvDependencyTableInfo patch_constant_input_to_output_table;
   std::span<const uint8_t> dependency_payload;
 };
 
