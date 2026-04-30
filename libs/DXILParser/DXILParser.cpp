@@ -3747,6 +3747,24 @@ AppendReflectionResourceDef(ShaderReflectionInfo &info,
 }
 
 void
+AppendReflectionMetadataResource(ShaderReflectionInfo &info,
+                                 const DxilMetadataResourceInfo &resource) {
+  ShaderReflectionResourceInfo reflected = {};
+  reflected.name = resource.name;
+  reflected.resource_kind = resource.kind;
+  reflected.id = resource.id;
+  reflected.space = resource.space;
+  reflected.lower_bound = resource.lower_bound;
+  reflected.upper_bound = resource.upper_bound;
+  reflected.bind_point = resource.lower_bound;
+  reflected.bind_count =
+      ShaderBindingCount(resource.lower_bound, resource.upper_bound);
+  reflected.flags = resource.flags;
+  reflected.from_metadata = true;
+  info.resources.push_back(std::move(reflected));
+}
+
+void
 AppendReflectionPsvResource(ShaderReflectionInfo &info,
                             const PsvResourceBindInfo &resource,
                             uint32_t index) {
@@ -3775,6 +3793,33 @@ CopyRdatSignature(const RuntimeDataInfo &runtime_data,
     if (index < runtime_data.signature_elements.size())
       out.push_back(runtime_data.signature_elements[index]);
   }
+}
+
+RdatSignatureElementInfo
+ConvertMetadataSignatureElement(const DxilMetadataSignatureElementInfo &element) {
+  RdatSignatureElementInfo out = {};
+  out.semantic_name = element.semantic_name;
+  out.semantic_indices = element.semantic_indices;
+  out.semantic_kind = uint8_t(element.semantic_kind);
+  out.component_type = uint8_t(element.component_type);
+  out.interpolation_mode = uint8_t(element.interpolation_mode);
+  out.start_row = element.start_row > 0xffu ? 0xffu : uint8_t(element.start_row);
+  out.cols = element.cols > 0xffu ? 0xffu : uint8_t(element.cols);
+  out.start_col = element.start_col > 0xffu ? 0xffu : uint8_t(element.start_col);
+  out.output_stream = element.stream > 0xffu ? 0xffu : uint8_t(element.stream);
+  out.dynamic_index_mask = element.dynamic_index_mask > 0xffu
+                               ? 0xffu
+                               : uint8_t(element.dynamic_index_mask);
+  return out;
+}
+
+void
+CopyMetadataSignature(const std::vector<DxilMetadataSignatureElementInfo> &in,
+                      std::vector<RdatSignatureElementInfo> &out) {
+  out.clear();
+  out.reserve(in.size());
+  for (const auto &element : in)
+    out.push_back(ConvertMetadataSignatureElement(element));
 }
 
 void
@@ -4145,6 +4190,61 @@ ValidateModuleMetadata(const Parser &parser, DxilValidationInfo &info) {
 }
 
 void
+ValidateLlvmFlow(const Parser &parser, DxilValidationInfo &info) {
+  const auto &module = parser.llvmModule();
+  if (!module)
+    return;
+
+  if (module->call_graph.has_indirect_calls) {
+    AddWarning(info, DxilValidationCategory::Instruction,
+               "indirect-call",
+               "LLVM module contains indirect calls; DXIL validation is limited");
+  }
+
+  for (const auto &function : module->call_graph.recursive_functions) {
+    AddError(info, DxilValidationCategory::Instruction, "recursive-call",
+             "DXIL function '" + function + "' participates in recursion");
+  }
+
+  for (const auto &function : module->functions) {
+    if (!function.is_declaration && !function.is_dx_intrinsic &&
+        !function.is_entry_reachable) {
+      AddWarning(info, DxilValidationCategory::Instruction,
+                 "unreachable-function",
+                 "DXIL function '" + function.name +
+                     "' is not reachable from an entry point");
+    }
+  }
+}
+
+bool
+HasMetadataSignatureElementId(const LlvmModuleInfo &module, uint32_t id) {
+  return std::any_of(
+      module.signature_elements.begin(), module.signature_elements.end(),
+      [id](const DxilMetadataSignatureElementInfo &element) {
+        return element.id == id;
+      });
+}
+
+bool
+HasMetadataResourceId(const LlvmModuleInfo &module, uint32_t id) {
+  return std::any_of(
+      module.resources.begin(), module.resources.end(),
+      [id](const DxilMetadataResourceInfo &resource) {
+        return resource.id == id;
+      });
+}
+
+bool
+HasRuntimeDataResourceId(const RuntimeDataInfo &runtime_data, uint32_t id) {
+  return std::any_of(
+      runtime_data.resources.begin(), runtime_data.resources.end(),
+      [id](const RdatResourceInfo &resource) {
+        return resource.id == id;
+      });
+}
+
+void
 ValidateDxilOperations(const Parser &parser, DxilValidationInfo &info) {
   const auto &module = parser.llvmModule();
   if (!module)
@@ -4225,6 +4325,44 @@ ValidateDxilOperations(const Parser &parser, DxilValidationInfo &info) {
                      std::string(opcode_info->name) + " class " +
                      std::string(opcode_info->opcode_class),
                  function.name, i, opcode);
+      }
+
+      const auto operation = std::find_if(
+          function.dxil_operations.begin(), function.dxil_operations.end(),
+          [i](const LlvmDxilOperationInfo &op) {
+            return op.instruction_index == i;
+          });
+      if (operation == function.dxil_operations.end())
+        continue;
+
+      if (operation->has_signature_element_id &&
+          !module->signature_elements.empty() &&
+          !HasMetadataSignatureElementId(*module,
+                                         operation->signature_element_id)) {
+        AddError(info, DxilValidationCategory::Instruction,
+                 "invalid-signature-reference",
+                 "dx.op references missing signature element " +
+                     std::to_string(operation->signature_element_id),
+                 function.name, i, opcode);
+      }
+
+      if (operation->has_resource_id) {
+        const bool has_metadata_resources = !module->resources.empty();
+        const bool metadata_match =
+            has_metadata_resources &&
+            HasMetadataResourceId(*module, operation->resource_id);
+        const bool rdat_match =
+            parser.runtimeData() &&
+            HasRuntimeDataResourceId(*parser.runtimeData(),
+                                     operation->resource_id);
+        if ((has_metadata_resources || parser.runtimeData()) &&
+            !metadata_match && !rdat_match) {
+          AddError(info, DxilValidationCategory::Instruction,
+                   "invalid-resource-reference",
+                   "dx.op references missing resource id " +
+                       std::to_string(operation->resource_id),
+                   function.name, i, opcode);
+        }
       }
     }
   }
@@ -4359,7 +4497,66 @@ SameResourceBinding(const ShaderReflectionResourceInfo &lhs,
          (!lhs.resource_kind || !rhs.resource_kind ||
           lhs.resource_kind == rhs.resource_kind) &&
          (!lhs.resource_type || !rhs.resource_type ||
-          lhs.resource_type == rhs.resource_type);
+         lhs.resource_type == rhs.resource_type);
+}
+
+bool
+ResourceRangesEqual(uint32_t lhs_space, uint32_t lhs_lower, uint32_t lhs_upper,
+                    uint32_t rhs_space, uint32_t rhs_lower, uint32_t rhs_upper) {
+  return lhs_space == rhs_space &&
+         lhs_lower == rhs_lower &&
+         lhs_upper == rhs_upper;
+}
+
+void
+ValidateCrossSourceResources(const Parser &parser, DxilValidationInfo &info) {
+  const auto &module = parser.llvmModule();
+  if (!module)
+    return;
+
+  if (const auto &runtime_data = parser.runtimeData()) {
+    for (const auto &metadata_resource : module->resources) {
+      auto match = std::find_if(
+          runtime_data->resources.begin(), runtime_data->resources.end(),
+          [&](const RdatResourceInfo &resource) {
+            return resource.id == metadata_resource.id;
+          });
+      if (match == runtime_data->resources.end())
+        continue;
+      if (!ResourceRangesEqual(metadata_resource.space,
+                               metadata_resource.lower_bound,
+                               metadata_resource.upper_bound,
+                               match->space, match->lower_bound,
+                               match->upper_bound)) {
+        AddWarning(info, DxilValidationCategory::Reflection,
+                   "metadata-rdat-resource-mismatch",
+                   "DXIL metadata resource '" + metadata_resource.name +
+                       "' has a different binding range than RDAT");
+      }
+    }
+  }
+
+  if (const auto &resource_def = parser.resourceDef()) {
+    for (const auto &metadata_resource : module->resources) {
+      auto match = std::find_if(
+          resource_def->resources.begin(), resource_def->resources.end(),
+          [&](const ResourceBindingInfo &resource) {
+            return resource.space == metadata_resource.space &&
+                   resource.bind_point == metadata_resource.lower_bound;
+          });
+      if (match == resource_def->resources.end())
+        continue;
+      const auto upper_bound = match->bind_count
+                                   ? match->bind_point + match->bind_count - 1
+                                   : match->bind_point;
+      if (upper_bound != metadata_resource.upper_bound) {
+        AddWarning(info, DxilValidationCategory::Reflection,
+                   "metadata-rdef-resource-mismatch",
+                   "DXIL metadata resource '" + metadata_resource.name +
+                       "' has a different binding range than RDEF");
+      }
+    }
+  }
 }
 
 void
@@ -4378,6 +4575,8 @@ ValidateReflectionConsistency(const Parser &parser, DxilValidationInfo &info) {
                "missing-psv",
                "PSV0 is missing; pipeline-state validation data is unavailable");
   }
+
+  ValidateCrossSourceResources(parser, info);
 
   if (const auto &runtime_data = parser.runtimeData()) {
     if (const auto *rdat_function = FindReflectionRdatFunction(
@@ -4463,6 +4662,7 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
     info.feature_flags = feature_info->feature_flags;
 
   const LlvmFunctionInfo *llvm_function = nullptr;
+  const DxilEntryPointInfo *metadata_entry = nullptr;
   if (const auto &module = parser.llvmModule()) {
     if (module->shader_model) {
       info.shader_model_kind = module->shader_model->kind;
@@ -4474,6 +4674,7 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
       info.dxil_minor = module->dxil_version[1];
     }
     if (const auto *entry = FindReflectionEntryPoint(*module)) {
+      metadata_entry = entry;
       info.entry_point_name = entry->name;
       info.function_name = entry->function_name;
     }
@@ -4485,6 +4686,8 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
   }
 
   const RdatFunctionInfo *rdat_function = nullptr;
+  bool has_reflected_resources = false;
+  bool has_reflected_signatures = false;
   if (const auto &runtime_data = parser.runtimeData()) {
     rdat_function = FindReflectionRdatFunction(
         *runtime_data, info.entry_point_name, info.function_name);
@@ -4502,23 +4705,56 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
       info.shader_flags = rdat_function->shader_flags;
       if (const auto *shader_info = runtime_data->findShaderInfo(
               rdat_function->shader_info_table_type,
-              rdat_function->shader_info_index))
+              rdat_function->shader_info_index)) {
         ApplyRdatShaderInfo(info, *runtime_data, *shader_info);
+        has_reflected_signatures =
+            !info.input_signature.empty() || !info.output_signature.empty() ||
+            !info.patch_constant_signature.empty() ||
+            !info.primitive_signature.empty();
+      }
     }
 
     if (rdat_function && !rdat_function->resource_indices.empty()) {
       for (const auto resource_index : rdat_function->resource_indices)
         AppendReflectionRdatResource(
             info, runtime_data->resources[resource_index]);
+      has_reflected_resources = true;
     } else {
-      for (const auto &resource : runtime_data->resources)
+      for (const auto &resource : runtime_data->resources) {
         AppendReflectionRdatResource(info, resource);
+        has_reflected_resources = true;
+      }
     }
   }
 
-  if (const auto &resource_def = parser.resourceDef()) {
+  if (!has_reflected_signatures && metadata_entry) {
+    CopyMetadataSignature(metadata_entry->input_signature, info.input_signature);
+    CopyMetadataSignature(metadata_entry->output_signature, info.output_signature);
+    CopyMetadataSignature(metadata_entry->patch_constant_signature,
+                          info.patch_constant_signature);
+  }
+
+  if (!has_reflected_resources && metadata_entry &&
+      !metadata_entry->resources.empty()) {
+    for (const auto &resource : metadata_entry->resources)
+      AppendReflectionMetadataResource(info, resource);
+    has_reflected_resources = true;
+  }
+
+  if (!has_reflected_resources) {
+    if (const auto &module = parser.llvmModule()) {
+      for (const auto &resource : module->resources) {
+        AppendReflectionMetadataResource(info, resource);
+        has_reflected_resources = true;
+      }
+    }
+  }
+
+  if (!has_reflected_resources && parser.resourceDef()) {
+    const auto &resource_def = parser.resourceDef();
     for (const auto &resource : resource_def->resources)
       AppendReflectionResourceDef(info, resource);
+    has_reflected_resources = !resource_def->resources.empty();
   }
 
   if (const auto &psv = parser.pipelineStateValidation()) {
@@ -4538,8 +4774,10 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
     if (psv->has_runtime_info_4)
       info.group_shared_bytes_used = psv->num_bytes_group_shared_memory;
 
-    for (uint32_t i = 0; i < psv->resources.size(); i++)
-      AppendReflectionPsvResource(info, psv->resources[i], i);
+    if (!has_reflected_resources) {
+      for (uint32_t i = 0; i < psv->resources.size(); i++)
+        AppendReflectionPsvResource(info, psv->resources[i], i);
+    }
     info.psv_input_signature = psv->input_signature_elements;
     info.psv_output_signature = psv->output_signature_elements;
     info.psv_patch_constant_or_primitive_signature =
@@ -4555,6 +4793,7 @@ ValidateDxil(const Parser &parser, DxilValidationInfo &info) {
   ValidateContainerInfo(parser, info);
   ValidateProgramInfo(parser, info);
   ValidateModuleMetadata(parser, info);
+  ValidateLlvmFlow(parser, info);
   ValidateDxilOperations(parser, info);
   ValidateRuntimeDataInfo(parser, info);
   ValidatePipelineStateValidationInfo(parser, info);
