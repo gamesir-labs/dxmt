@@ -769,6 +769,55 @@ ReadRdatNumThreads(const RuntimeDataInfo &info, uint32_t offset,
   return true;
 }
 
+uint32_t
+PsvMaskDwordCount(uint32_t vectors) {
+  return ((vectors * 4u) + 31u) / 32u;
+}
+
+uint32_t
+PsvInputOutputTableDwordCount(uint32_t input_vectors,
+                              uint32_t output_vectors) {
+  return PsvMaskDwordCount(output_vectors) * input_vectors * 4u;
+}
+
+bool
+ReadU32Words(std::span<const uint8_t> data, size_t &offset,
+             uint32_t word_count, std::vector<uint32_t> &out) {
+  size_t end = 0;
+  if (!CheckedEnd(offset, size_t(word_count) * sizeof(uint32_t),
+                  data.size(), end))
+    return false;
+
+  out.clear();
+  out.reserve(word_count);
+  for (uint32_t i = 0; i < word_count; i++)
+    out.push_back(ReadU32(data, offset + size_t(i) * sizeof(uint32_t)));
+  offset = end;
+  return true;
+}
+
+bool
+ReadPsvComponentMask(std::span<const uint8_t> data, size_t &offset,
+                     uint32_t vectors, PsvComponentMaskInfo &out) {
+  out = {};
+  out.vector_count = vectors;
+  return ReadU32Words(data, offset, PsvMaskDwordCount(vectors),
+                      out.mask_words);
+}
+
+bool
+ReadPsvDependencyTable(std::span<const uint8_t> data, size_t &offset,
+                       uint32_t input_vectors, uint32_t output_vectors,
+                       PsvDependencyTableInfo &out) {
+  out = {};
+  out.input_vectors = input_vectors;
+  out.output_vectors = output_vectors;
+  return ReadU32Words(data, offset,
+                      PsvInputOutputTableDwordCount(input_vectors,
+                                                    output_vectors),
+                      out.mask_words);
+}
+
 bool
 IsRdatTablePart(uint32_t type) {
   switch (type) {
@@ -3264,10 +3313,56 @@ ParsePipelineStateValidation(const BlobPart &part,
       return ParseStatus::InvalidPipelineStateValidation;
   }
 
-  // Dependency masks/tables are PSV-version and shader-stage dependent. Keep
-  // them available as an opaque slice until the PSO validator consumes them.
-  info.dependency_payload = std::span<const uint8_t>(data.data() + offset,
-                                                    data.size() - offset);
+  const auto dependency_offset = offset;
+  if (info.has_runtime_info_1) {
+    if (info.uses_view_id) {
+      for (uint32_t i = 0; i < info.view_id_output_masks.size(); i++) {
+        if (!info.output_vectors[i])
+          continue;
+        if (!ReadPsvComponentMask(data, offset, info.output_vectors[i],
+                                  info.view_id_output_masks[i]))
+          return ParseStatus::InvalidPipelineStateValidation;
+      }
+
+      if ((info.shader_stage == 3 || info.shader_stage == 13) &&
+          info.patch_constant_or_primitive_vectors) {
+        if (!ReadPsvComponentMask(
+                data, offset, info.patch_constant_or_primitive_vectors,
+                info.view_id_patch_constant_or_primitive_output_mask))
+          return ParseStatus::InvalidPipelineStateValidation;
+      }
+    }
+
+    for (uint32_t i = 0; i < info.input_to_output_tables.size(); i++) {
+      if (info.shader_stage == 13 || !info.output_vectors[i] ||
+          !info.input_vectors)
+        continue;
+      if (!ReadPsvDependencyTable(data, offset, info.input_vectors,
+                                  info.output_vectors[i],
+                                  info.input_to_output_tables[i]))
+        return ParseStatus::InvalidPipelineStateValidation;
+    }
+
+    if (info.shader_stage == 3 && info.patch_constant_or_primitive_vectors &&
+        info.input_vectors) {
+      if (!ReadPsvDependencyTable(data, offset, info.input_vectors,
+                                  info.patch_constant_or_primitive_vectors,
+                                  info.input_to_patch_constant_output_table))
+        return ParseStatus::InvalidPipelineStateValidation;
+    }
+
+    if (info.shader_stage == 4 && info.output_vectors[0] &&
+        info.patch_constant_or_primitive_vectors) {
+      if (!ReadPsvDependencyTable(data, offset,
+                                  info.patch_constant_or_primitive_vectors,
+                                  info.output_vectors[0],
+                                  info.patch_constant_input_to_output_table))
+        return ParseStatus::InvalidPipelineStateValidation;
+    }
+  }
+
+  info.dependency_payload = std::span<const uint8_t>(
+      data.data() + dependency_offset, data.size() - dependency_offset);
   return ParseStatus::Ok;
 }
 
