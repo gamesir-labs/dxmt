@@ -790,6 +790,7 @@ struct ShaderReflectionResourceInfo {
   uint32_t bind_count = 0;
   uint32_t flags = 0;
   bool from_runtime_data = false;
+  bool from_metadata = false;
   bool from_resource_def = false;
   bool from_psv = false;
 };
