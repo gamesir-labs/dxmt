@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <optional>
 #include <span>
 #include <string>
@@ -58,6 +59,14 @@ enum class ParseStatus {
   InvalidFeatureInfo,
   InvalidRuntimeData,
   InvalidPipelineStateValidation,
+  InvalidShaderHash,
+  InvalidCompilerVersion,
+  InvalidShaderDebugName,
+  InvalidSourceInfo,
+  InvalidShaderPdbInfo,
+  InvalidShaderStatistics,
+  InvalidResourceDef,
+  InvalidBitcode,
 };
 
 const char *StatusName(ParseStatus status);
@@ -81,6 +90,33 @@ struct DxilProgramInfo {
   uint32_t minor_version() const { return program_version & 0xf; }
 };
 
+struct BitcodeRecordInfo {
+  uint32_t block_id = 0;
+  uint32_t code = 0;
+  uint32_t operand_count = 0;
+  bool abbreviated = false;
+};
+
+struct BitcodeBlockInfo {
+  uint32_t id = 0;
+  uint32_t abbreviation_id_width = 0;
+  uint32_t depth = 0;
+  uint64_t start_bit = 0;
+  uint64_t end_bit = 0;
+  uint32_t record_count = 0;
+};
+
+struct BitcodeInfo {
+  uint32_t magic = 0;
+  bool has_wrapper = false;
+  uint32_t wrapper_version = 0;
+  uint32_t wrapper_offset = 0;
+  uint32_t wrapper_size = 0;
+  uint32_t wrapper_cpu_type = 0;
+  std::vector<BitcodeBlockInfo> blocks;
+  std::vector<BitcodeRecordInfo> records;
+};
+
 struct SignatureElement {
   std::string semantic_name;
   uint32_t stream = 0;
@@ -100,6 +136,90 @@ struct SignatureInfo {
 
 struct FeatureInfo {
   uint64_t feature_flags = 0;
+};
+
+struct ShaderHashInfo {
+  uint32_t flags = 0;
+  std::array<uint8_t, 16> digest = {};
+
+  bool includes_source() const { return (flags & 1u) != 0; }
+  bool is_populated() const;
+};
+
+struct CompilerVersionInfo {
+  uint16_t major = 0;
+  uint16_t minor = 0;
+  uint32_t version_flags = 0;
+  uint32_t commit_count = 0;
+  uint32_t string_list_size = 0;
+  std::string commit_sha;
+  std::string custom_version_string;
+  std::vector<std::string> strings;
+};
+
+struct ShaderDebugNameInfo {
+  uint16_t flags = 0;
+  std::string name;
+};
+
+struct SourceInfoSection {
+  uint32_t aligned_size = 0;
+  uint16_t flags = 0;
+  uint16_t type = 0;
+  std::span<const uint8_t> data;
+};
+
+struct SourceInfo {
+  uint32_t aligned_size = 0;
+  uint16_t flags = 0;
+  uint16_t section_count = 0;
+  std::vector<SourceInfoSection> sections;
+};
+
+struct ShaderPdbInfo {
+  uint16_t version = 0;
+  uint16_t compression_type = 0;
+  uint32_t size_in_bytes = 0;
+  uint32_t uncompressed_size_in_bytes = 0;
+  std::span<const uint8_t> payload;
+};
+
+struct ShaderStatisticsInfo {
+  std::vector<uint32_t> values;
+};
+
+struct ResourceBindingInfo {
+  std::string name;
+  uint32_t type = 0;
+  uint32_t return_type = 0;
+  uint32_t dimension = 0;
+  uint32_t num_samples = 0;
+  uint32_t bind_point = 0;
+  uint32_t bind_count = 0;
+  uint32_t flags = 0;
+  uint32_t space = 0;
+  uint32_t id = 0;
+};
+
+struct ConstantBufferInfo {
+  std::string name;
+  uint32_t variable_count = 0;
+  uint32_t variable_offset = 0;
+  uint32_t size = 0;
+  uint32_t flags = 0;
+  uint32_t type = 0;
+};
+
+struct ResourceDefInfo {
+  uint32_t constant_buffer_count = 0;
+  uint32_t constant_buffer_offset = 0;
+  uint32_t bound_resource_count = 0;
+  uint32_t bound_resource_offset = 0;
+  uint32_t target = 0;
+  uint32_t flags = 0;
+  std::string creator;
+  std::vector<ResourceBindingInfo> resources;
+  std::vector<ConstantBufferInfo> constant_buffers;
 };
 
 struct RuntimeDataPartInfo {
@@ -178,6 +298,7 @@ struct PipelineStateValidationInfo {
 };
 
 struct ContainerInfo {
+  std::array<uint8_t, 16> hash = {};
   uint16_t major_version = 0;
   uint16_t minor_version = 0;
   uint32_t container_size = 0;
@@ -202,8 +323,22 @@ public:
 
   const ContainerInfo &container() const { return container_; }
   const std::optional<DxilProgramInfo> &dxilProgram() const { return dxil_program_; }
+  const std::optional<BitcodeInfo> &bitcode() const { return bitcode_; }
   const std::vector<SignatureInfo> &signatures() const { return signatures_; }
   const std::optional<FeatureInfo> &featureInfo() const { return feature_info_; }
+  const std::optional<ShaderHashInfo> &shaderHash() const { return shader_hash_; }
+  const std::optional<CompilerVersionInfo> &compilerVersion() const {
+    return compiler_version_;
+  }
+  const std::optional<ShaderDebugNameInfo> &shaderDebugName() const {
+    return shader_debug_name_;
+  }
+  const std::optional<SourceInfo> &sourceInfo() const { return source_info_; }
+  const std::optional<ShaderPdbInfo> &shaderPdbInfo() const { return shader_pdb_info_; }
+  const std::optional<ShaderStatisticsInfo> &shaderStatistics() const {
+    return shader_statistics_;
+  }
+  const std::optional<ResourceDefInfo> &resourceDef() const { return resource_def_; }
   const std::optional<RuntimeDataInfo> &runtimeData() const { return runtime_data_; }
   const std::optional<PipelineStateValidationInfo> &pipelineStateValidation() const {
     return psv_info_;
@@ -215,20 +350,37 @@ public:
 private:
   ParseStatus parseContainer(std::span<const uint8_t> data);
   ParseStatus parseDxilProgram();
+  ParseStatus parseBitcode();
   ParseStatus parseKnownParts();
 
   ContainerInfo container_;
   std::optional<DxilProgramInfo> dxil_program_;
+  std::optional<BitcodeInfo> bitcode_;
   std::vector<SignatureInfo> signatures_;
   std::optional<FeatureInfo> feature_info_;
+  std::optional<ShaderHashInfo> shader_hash_;
+  std::optional<CompilerVersionInfo> compiler_version_;
+  std::optional<ShaderDebugNameInfo> shader_debug_name_;
+  std::optional<SourceInfo> source_info_;
+  std::optional<ShaderPdbInfo> shader_pdb_info_;
+  std::optional<ShaderStatisticsInfo> shader_statistics_;
+  std::optional<ResourceDefInfo> resource_def_;
   std::optional<RuntimeDataInfo> runtime_data_;
   std::optional<PipelineStateValidationInfo> psv_info_;
 };
 
 ParseStatus ParseContainer(const void *data, size_t size, ContainerInfo &info);
 ParseStatus ParseDxilProgram(const BlobPart &part, DxilProgramInfo &info);
+ParseStatus ParseBitcode(std::span<const uint8_t> data, BitcodeInfo &info);
 ParseStatus ParseSignature(const BlobPart &part, SignatureInfo &info);
 ParseStatus ParseFeatureInfo(const BlobPart &part, FeatureInfo &info);
+ParseStatus ParseShaderHash(const BlobPart &part, ShaderHashInfo &info);
+ParseStatus ParseCompilerVersion(const BlobPart &part, CompilerVersionInfo &info);
+ParseStatus ParseShaderDebugName(const BlobPart &part, ShaderDebugNameInfo &info);
+ParseStatus ParseSourceInfo(const BlobPart &part, SourceInfo &info);
+ParseStatus ParseShaderPdbInfo(const BlobPart &part, ShaderPdbInfo &info);
+ParseStatus ParseShaderStatistics(const BlobPart &part, ShaderStatisticsInfo &info);
+ParseStatus ParseResourceDef(const BlobPart &part, ResourceDefInfo &info);
 ParseStatus ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info);
 ParseStatus ParsePipelineStateValidation(const BlobPart &part,
                                          PipelineStateValidationInfo &info);
