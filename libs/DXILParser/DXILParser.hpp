@@ -296,10 +296,61 @@ struct RuntimeDataPartInfo {
   std::span<const uint8_t> table_data;
 };
 
+struct RdatResourceInfo {
+  std::string name;
+  uint32_t resource_class = 0;
+  uint32_t kind = 0;
+  uint32_t id = 0;
+  uint32_t space = 0;
+  uint32_t lower_bound = 0;
+  uint32_t upper_bound = 0;
+  uint32_t flags = 0;
+};
+
+struct RdatFunctionInfo {
+  std::string name;
+  std::string unmangled_name;
+  std::vector<uint32_t> resource_indices;
+  std::vector<std::string> function_dependencies;
+  uint32_t shader_kind = 0;
+  uint32_t payload_size_in_bytes = 0;
+  uint32_t attribute_size_in_bytes = 0;
+  uint32_t feature_info1 = 0;
+  uint32_t feature_info2 = 0;
+  uint32_t shader_stage_flag = 0;
+  uint32_t min_shader_target = 0;
+
+  uint64_t feature_flags() const {
+    return (uint64_t(feature_info2) << 32) | feature_info1;
+  }
+};
+
+struct RdatSignatureElementInfo {
+  std::string semantic_name;
+  std::vector<uint32_t> semantic_indices;
+  uint8_t semantic_kind = 0;
+  uint8_t component_type = 0;
+  uint8_t interpolation_mode = 0;
+  uint8_t start_row = 0xff;
+  uint8_t cols = 0;
+  uint8_t start_col = 0;
+  uint8_t output_stream = 0;
+  uint8_t usage_mask = 0;
+  uint8_t dynamic_index_mask = 0;
+};
+
 struct RuntimeDataInfo {
   uint32_t version = 0;
   uint32_t part_count = 0;
   std::vector<RuntimeDataPartInfo> parts;
+  std::vector<RdatResourceInfo> resources;
+  std::vector<RdatFunctionInfo> functions;
+  std::vector<RdatSignatureElementInfo> signature_elements;
+
+  const RuntimeDataPartInfo *findPart(uint32_t type,
+                                      size_t start_index = 0) const;
+  bool readString(uint32_t offset, std::string &out) const;
+  bool readIndexArray(uint32_t offset, std::vector<uint32_t> &out) const;
 };
 
 struct PsvSignatureElement {

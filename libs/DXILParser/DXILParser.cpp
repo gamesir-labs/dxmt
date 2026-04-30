@@ -46,6 +46,10 @@ constexpr size_t kResourceDefResourceBindingExtendedSize = 40;
 constexpr size_t kRuntimeDataHeaderSize = 8;
 constexpr size_t kRuntimeDataPartHeaderSize = 8;
 constexpr size_t kRuntimeDataTableHeaderSize = 8;
+constexpr uint32_t kRdatNullRef = 0xffffffffu;
+constexpr size_t kRdatResourceRecordSize = 32;
+constexpr size_t kRdatFunctionRecordSize = 44;
+constexpr size_t kRdatSignatureElementRecordPayloadSize = 14;
 constexpr size_t kPsvRuntimeInfo1Size = 36;
 constexpr size_t kPsvRuntimeInfo2Size = 48;
 constexpr size_t kPsvRuntimeInfo3Size = 52;
@@ -69,6 +73,14 @@ constexpr uint32_t FirstApplicationAbbrev = 4;
 constexpr uint32_t BlockInfoBlockId = 0;
 constexpr uint32_t BlockInfoSetBid = 1;
 } // namespace bitc
+
+namespace rdat {
+constexpr uint32_t StringBuffer = 1;
+constexpr uint32_t IndexArrays = 2;
+constexpr uint32_t ResourceTable = 3;
+constexpr uint32_t FunctionTable = 4;
+constexpr uint32_t SignatureElementTable = 13;
+} // namespace rdat
 
 uint16_t
 ReadU16(std::span<const uint8_t> data, size_t offset) {
@@ -256,6 +268,20 @@ ReadU32Array(std::span<const uint8_t> data, uint32_t offset, uint32_t count,
   for (uint32_t i = 0; i < count; i++)
     out.push_back(ReadU32(data, byte_offset + size_t(i) * sizeof(uint32_t)));
   return true;
+}
+
+bool
+ReadNullableRdatString(const RuntimeDataInfo &info, uint32_t offset,
+                       std::string &out) {
+  out.clear();
+  return offset == kRdatNullRef || info.readString(offset, out);
+}
+
+bool
+ReadNullableRdatIndexArray(const RuntimeDataInfo &info, uint32_t offset,
+                           std::vector<uint32_t> &out) {
+  out.clear();
+  return offset == kRdatNullRef || info.readIndexArray(offset, out);
 }
 
 bool
@@ -762,6 +788,46 @@ LlvmModuleInfo::hasNamedMetadata(std::string_view name) const {
                      [name](const NamedMetadataInfo &metadata) {
                        return metadata.name == name;
                      });
+}
+
+const RuntimeDataPartInfo *
+RuntimeDataInfo::findPart(uint32_t type, size_t start_index) const {
+  for (size_t i = start_index; i < parts.size(); i++) {
+    if (parts[i].type == type)
+      return &parts[i];
+  }
+  return nullptr;
+}
+
+bool
+RuntimeDataInfo::readString(uint32_t offset, std::string &out) const {
+  const auto *strings = findPart(rdat::StringBuffer);
+  return strings && ReadString(strings->data, offset, out);
+}
+
+bool
+RuntimeDataInfo::readIndexArray(uint32_t offset, std::vector<uint32_t> &out) const {
+  const auto *indices = findPart(rdat::IndexArrays);
+  if (!indices)
+    return false;
+
+  if (offset == kRdatNullRef)
+    return false;
+
+  const auto count = indices->data.size() / sizeof(uint32_t);
+  if (count < 1 || offset >= count - 1)
+    return false;
+
+  const auto byte_offset = size_t(offset) * sizeof(uint32_t);
+  const auto element_count = ReadU32(indices->data, byte_offset);
+  if (element_count > count - offset - 1)
+    return false;
+
+  out.clear();
+  out.reserve(element_count);
+  for (uint32_t i = 0; i < element_count; i++)
+    out.push_back(ReadU32(indices->data, byte_offset + sizeof(uint32_t) * (i + 1)));
+  return true;
 }
 
 const char *
@@ -1546,6 +1612,162 @@ ParseResourceDef(const BlobPart &part, ResourceDefInfo &info) {
 }
 
 ParseStatus
+ParseRuntimeDataResourceTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::ResourceTable);
+  if (!table)
+    return ParseStatus::Ok;
+  if (!table->record_count) {
+    info.resources.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatResourceRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.resources.clear();
+  info.resources.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatResourceRecordSize);
+
+    RdatResourceInfo resource = {};
+    resource.resource_class = ReadU32(record, 0);
+    resource.kind = ReadU32(record, 4);
+    resource.id = ReadU32(record, 8);
+    resource.space = ReadU32(record, 12);
+    resource.lower_bound = ReadU32(record, 16);
+    resource.upper_bound = ReadU32(record, 20);
+    const auto name_offset = ReadU32(record, 24);
+    resource.flags = ReadU32(record, 28);
+    if (!ReadNullableRdatString(info, name_offset, resource.name))
+      return ParseStatus::InvalidRuntimeData;
+    info.resources.push_back(std::move(resource));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataFunctionTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::FunctionTable);
+  if (!table)
+    return ParseStatus::Ok;
+  if (!table->record_count) {
+    info.functions.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatFunctionRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.functions.clear();
+  info.functions.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatFunctionRecordSize);
+
+    RdatFunctionInfo function = {};
+    const auto name_offset = ReadU32(record, 0);
+    const auto unmangled_name_offset = ReadU32(record, 4);
+    const auto resources_offset = ReadU32(record, 8);
+    const auto dependencies_offset = ReadU32(record, 12);
+    function.shader_kind = ReadU32(record, 16);
+    function.payload_size_in_bytes = ReadU32(record, 20);
+    function.attribute_size_in_bytes = ReadU32(record, 24);
+    function.feature_info1 = ReadU32(record, 28);
+    function.feature_info2 = ReadU32(record, 32);
+    function.shader_stage_flag = ReadU32(record, 36);
+    function.min_shader_target = ReadU32(record, 40);
+
+    if (!ReadNullableRdatString(info, name_offset, function.name) ||
+        !ReadNullableRdatString(info, unmangled_name_offset,
+                                function.unmangled_name) ||
+        !ReadNullableRdatIndexArray(info, resources_offset,
+                                    function.resource_indices))
+      return ParseStatus::InvalidRuntimeData;
+
+    for (const auto resource_index : function.resource_indices) {
+      if (resource_index >= info.resources.size())
+        return ParseStatus::InvalidRuntimeData;
+    }
+
+    std::vector<uint32_t> dependency_offsets;
+    if (!ReadNullableRdatIndexArray(info, dependencies_offset, dependency_offsets))
+      return ParseStatus::InvalidRuntimeData;
+
+    function.function_dependencies.reserve(dependency_offsets.size());
+    for (const auto dependency_offset : dependency_offsets) {
+      std::string dependency;
+      if (!ReadNullableRdatString(info, dependency_offset, dependency))
+        return ParseStatus::InvalidRuntimeData;
+      function.function_dependencies.push_back(std::move(dependency));
+    }
+
+    info.functions.push_back(std::move(function));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataSignatureElementTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::SignatureElementTable);
+  if (!table)
+    return ParseStatus::Ok;
+  if (!table->record_count) {
+    info.signature_elements.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table ||
+      table->record_stride < kRdatSignatureElementRecordPayloadSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.signature_elements.clear();
+  info.signature_elements.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(
+        offset, kRdatSignatureElementRecordPayloadSize);
+
+    RdatSignatureElementInfo element = {};
+    const auto semantic_name_offset = ReadU32(record, 0);
+    const auto semantic_indices_offset = ReadU32(record, 4);
+    element.semantic_kind = record[8];
+    element.component_type = record[9];
+    element.interpolation_mode = record[10];
+    element.start_row = record[11];
+    const auto cols_and_stream = record[12];
+    const auto usage_and_dyn_index_masks = record[13];
+    element.cols = (cols_and_stream & 3u) + 1u;
+    element.start_col = (cols_and_stream >> 2) & 3u;
+    element.output_stream = (cols_and_stream >> 4) & 3u;
+    element.usage_mask = usage_and_dyn_index_masks & 0xfu;
+    element.dynamic_index_mask = (usage_and_dyn_index_masks >> 4) & 0xfu;
+
+    if (!ReadNullableRdatString(info, semantic_name_offset,
+                                element.semantic_name) ||
+        !ReadNullableRdatIndexArray(info, semantic_indices_offset,
+                                    element.semantic_indices))
+      return ParseStatus::InvalidRuntimeData;
+
+    info.signature_elements.push_back(std::move(element));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataCoreTables(RuntimeDataInfo &info) {
+  auto status = ParseRuntimeDataResourceTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataFunctionTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  return ParseRuntimeDataSignatureElementTable(info);
+}
+
+ParseStatus
 ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info) {
   const auto data = part.data;
   if (data.size() < kRuntimeDataHeaderSize)
@@ -1582,6 +1804,8 @@ ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info) {
       return ParseStatus::InvalidRuntimeData;
 
     part_info.data = std::span<const uint8_t>(data.data() + part_header_end, part_info.size);
+    if (part_info.type == rdat::IndexArrays && (part_info.size & 3))
+      return ParseStatus::InvalidRuntimeData;
     part_info.is_table = IsRdatTablePart(part_info.type);
     if (part_info.is_table) {
       if (part_info.data.size() < kRuntimeDataTableHeaderSize)
@@ -1603,7 +1827,7 @@ ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info) {
     info.parts.push_back(part_info);
   }
 
-  return ParseStatus::Ok;
+  return ParseRuntimeDataCoreTables(info);
 }
 
 ParseStatus
