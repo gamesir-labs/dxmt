@@ -85,6 +85,8 @@ public:
 
     allocator_ = allocator;
     initial_pipeline_state_ = initial_state;
+    compute_root_signature_ = nullptr;
+    graphics_root_signature_ = nullptr;
     closed_ = false;
     submitted_ = false;
     return S_OK;
@@ -135,8 +137,13 @@ public:
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {}
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {}
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT heap_count, ID3D12DescriptorHeap *const *heaps) override {}
-  void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature *root_signature) override {}
-  void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature *root_signature) override {}
+  void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature *root_signature) override {
+    compute_root_signature_ = root_signature;
+  }
+
+  void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature *root_signature) override {
+    graphics_root_signature_ = root_signature;
+  }
   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT root_parameter_index,
                                                        D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) override {}
   void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT root_parameter_index,
@@ -206,6 +213,8 @@ private:
   D3D12_COMMAND_LIST_TYPE type_;
   Com<ID3D12CommandAllocator> allocator_;
   Com<ID3D12PipelineState> initial_pipeline_state_;
+  Com<ID3D12RootSignature> compute_root_signature_;
+  Com<ID3D12RootSignature> graphics_root_signature_;
   ComPrivateData private_data_;
   bool closed_ = false;
   bool submitted_ = false;

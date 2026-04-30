@@ -7,6 +7,7 @@
 #include "d3d12_command_list.hpp"
 #include "d3d12_command_queue.hpp"
 #include "d3d12_fence.hpp"
+#include "d3d12_root_signature.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -308,7 +309,7 @@ public:
         return E_INVALIDARG;
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE *>(feature_data);
-      data->HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+      data->HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
       return S_OK;
     }
     default:
@@ -330,7 +331,19 @@ public:
                                                 SIZE_T bytecode_length, REFIID riid,
                                                 void **root_signature) override {
     InitReturnPtr(root_signature);
-    return E_NOTIMPL;
+    if (!root_signature)
+      return E_POINTER;
+    if (node_mask > 1 || (!bytecode && bytecode_length))
+      return E_INVALIDARG;
+
+    auto object = d3d12::CreateRootSignatureFromBlob(
+        static_cast<IMTLD3D12Device *>(this),
+        std::span<const std::byte>(static_cast<const std::byte *>(bytecode),
+                                   bytecode_length));
+    if (!object)
+      return E_INVALIDARG;
+
+    return object->QueryInterface(riid, root_signature);
   }
 
   void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
