@@ -5,6 +5,7 @@
 #include "DXILParser/DXILParser.hpp"
 #include <d3d12.h>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -34,6 +35,16 @@ struct PipelineDxilShader {
   }
 };
 
+struct PipelineSignatureLink {
+  uint32_t producer_shader_index = 0;
+  uint32_t producer_signature_index = 0;
+  uint32_t consumer_shader_index = 0;
+  uint32_t consumer_signature_index = 0;
+  std::string semantic_key;
+  uint8_t producer_component_mask = 0;
+  uint8_t consumer_component_mask = 0;
+};
+
 class PipelineState {
 public:
   virtual ~PipelineState() = default;
@@ -41,6 +52,7 @@ public:
   virtual PipelineStateType GetType() const = 0;
   virtual ID3D12RootSignature *GetRootSignature() const = 0;
   virtual const std::vector<PipelineDxilShader> &GetDxilShaders() const = 0;
+  virtual const std::vector<PipelineSignatureLink> &GetSignatureLinks() const = 0;
 };
 
 Com<ID3D12PipelineState>

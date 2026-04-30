@@ -4360,6 +4360,53 @@ MetadataSignatureElementMatches(
          metadata.start_col == element.start_col;
 }
 
+std::string
+NormalizedSignatureSemanticName(std::string_view semantic_name) {
+  std::string out;
+  out.reserve(semantic_name.size());
+  for (char ch : semantic_name) {
+    if (ch >= 'a' && ch <= 'z')
+      out.push_back(char(ch - 'a' + 'A'));
+    else
+      out.push_back(ch);
+  }
+  return out;
+}
+
+uint8_t
+BuildSignatureComponentMask(uint8_t usage_mask, uint8_t start_col,
+                            uint8_t cols) {
+  if (usage_mask)
+    return usage_mask;
+  if (!cols || start_col >= 4)
+    return 0;
+
+  uint8_t mask = 0;
+  const auto end_col = std::min<uint8_t>(4, uint8_t(start_col + cols));
+  for (uint8_t component = start_col; component < end_col; component++)
+    mask |= uint8_t(1u << component);
+  return mask;
+}
+
+void
+NormalizeTranslationSignatureElement(
+    DxilTranslationSignatureElementInfo &element) {
+  if (!element.semantic_indices.empty()) {
+    element.semantic_index = element.semantic_indices.front();
+    element.has_semantic_index = true;
+  }
+
+  element.component_start = element.start_col < 4 ? element.start_col : 0;
+  element.component_count = element.cols;
+  element.component_mask = BuildSignatureComponentMask(
+      element.usage_mask, element.component_start, element.component_count);
+
+  auto semantic_name = NormalizedSignatureSemanticName(element.semantic_name);
+  std::ostringstream key;
+  key << semantic_name << element.semantic_index;
+  element.semantic_key = key.str();
+}
+
 const DxilMetadataSignatureElementInfo *
 FindMetadataSignatureElement(
     const std::vector<DxilMetadataSignatureElementInfo> &metadata,
@@ -4398,6 +4445,7 @@ BuildTranslationSignatureElement(
   out.usage_mask = element.usage_mask;
   out.dynamic_index_mask = element.dynamic_index_mask;
   out.allocated = element.start_row != 0xff;
+  NormalizeTranslationSignatureElement(out);
   return out;
 }
 
@@ -4430,6 +4478,7 @@ BuildTranslationMetadataSignatureElement(
                                : uint8_t(element.dynamic_index_mask);
   out.output_stream = element.stream > 0xffu ? 0xffu : uint8_t(element.stream);
   out.allocated = out.start_row != 0xff;
+  NormalizeTranslationSignatureElement(out);
   return out;
 }
 
@@ -4451,6 +4500,7 @@ BuildTranslationPsvSignatureElement(DxilTranslationSignatureKind kind,
   out.dynamic_index_mask = element.dynamic_index_mask;
   out.output_stream = element.output_stream;
   out.allocated = element.allocated;
+  NormalizeTranslationSignatureElement(out);
   return out;
 }
 
@@ -4477,6 +4527,7 @@ BuildTranslationLegacySignatureElement(DxilTranslationSignatureKind kind,
   out.dynamic_index_mask = element.read_write_mask;
   out.output_stream = element.stream > 0xffu ? 0xffu : uint8_t(element.stream);
   out.allocated = true;
+  NormalizeTranslationSignatureElement(out);
   return out;
 }
 

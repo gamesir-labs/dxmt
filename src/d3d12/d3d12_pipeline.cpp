@@ -5,6 +5,7 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -123,14 +124,120 @@ AppendDxilShader(PipelineShaderStage stage,
   return S_OK;
 }
 
+const PipelineDxilShader *
+FindShader(const std::vector<PipelineDxilShader> &shaders,
+           PipelineShaderStage stage, uint32_t *index = nullptr) {
+  for (uint32_t i = 0; i < shaders.size(); i++) {
+    if (shaders[i].stage == stage) {
+      if (index)
+        *index = i;
+      return &shaders[i];
+    }
+  }
+  return nullptr;
+}
+
+bool
+IsSystemGeneratedValue(const dxil::DxilTranslationSignatureElementInfo &sig) {
+  return sig.semantic_kind != 0 || sig.semantic_key == "SV_POSITION0" ||
+         sig.semantic_key == "SV_TARGET0" ||
+         sig.semantic_key == "SV_DEPTH0" ||
+         sig.semantic_key == "SV_COVERAGE0";
+}
+
+void
+AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
+                     PipelineShaderStage producer_stage,
+                     PipelineShaderStage consumer_stage,
+                     std::vector<PipelineSignatureLink> &links) {
+  uint32_t producer_shader_index = 0;
+  uint32_t consumer_shader_index = 0;
+  const auto *producer =
+      FindShader(shaders, producer_stage, &producer_shader_index);
+  const auto *consumer =
+      FindShader(shaders, consumer_stage, &consumer_shader_index);
+  if (!producer || !consumer)
+    return;
+
+  const auto *producer_info = producer->translation();
+  const auto *consumer_info = consumer->translation();
+  if (!producer_info || !consumer_info)
+    return;
+
+  for (uint32_t consumer_sig_index = 0;
+       consumer_sig_index < consumer_info->signatures.size();
+       consumer_sig_index++) {
+    const auto &consumer_sig = consumer_info->signatures[consumer_sig_index];
+    if (consumer_sig.kind != dxil::DxilTranslationSignatureKind::Input ||
+        IsSystemGeneratedValue(consumer_sig))
+      continue;
+
+    auto match = std::find_if(
+        producer_info->signatures.begin(), producer_info->signatures.end(),
+        [&](const dxil::DxilTranslationSignatureElementInfo &producer_sig) {
+          return producer_sig.kind ==
+                     dxil::DxilTranslationSignatureKind::Output &&
+                 producer_sig.output_stream == consumer_sig.output_stream &&
+                 producer_sig.semantic_key == consumer_sig.semantic_key &&
+                 (producer_sig.component_mask & consumer_sig.component_mask) ==
+                     consumer_sig.component_mask;
+        });
+    if (match == producer_info->signatures.end()) {
+      WARN("D3D12PipelineState: unmatched ", ShaderStageName(consumer_stage),
+           " input signature ", consumer_sig.semantic_key);
+      continue;
+    }
+
+    links.push_back({
+        .producer_shader_index = producer_shader_index,
+        .producer_signature_index =
+            uint32_t(match - producer_info->signatures.begin()),
+        .consumer_shader_index = consumer_shader_index,
+        .consumer_signature_index = consumer_sig_index,
+        .semantic_key = consumer_sig.semantic_key,
+        .producer_component_mask = match->component_mask,
+        .consumer_component_mask = consumer_sig.component_mask,
+    });
+  }
+}
+
+std::vector<PipelineSignatureLink>
+BuildSignatureLinks(const std::vector<PipelineDxilShader> &shaders) {
+  std::vector<PipelineSignatureLink> links;
+
+  if (FindShader(shaders, PipelineShaderStage::Hull))
+    AppendSignatureLinks(shaders, PipelineShaderStage::Vertex,
+                         PipelineShaderStage::Hull, links);
+  if (FindShader(shaders, PipelineShaderStage::Domain))
+    AppendSignatureLinks(shaders, PipelineShaderStage::Hull,
+                         PipelineShaderStage::Domain, links);
+
+  const auto raster_producer = FindShader(shaders, PipelineShaderStage::Domain)
+                                   ? PipelineShaderStage::Domain
+                                   : PipelineShaderStage::Vertex;
+  if (FindShader(shaders, PipelineShaderStage::Geometry)) {
+    AppendSignatureLinks(shaders, raster_producer,
+                         PipelineShaderStage::Geometry, links);
+    AppendSignatureLinks(shaders, PipelineShaderStage::Geometry,
+                         PipelineShaderStage::Pixel, links);
+  } else {
+    AppendSignatureLinks(shaders, raster_producer,
+                         PipelineShaderStage::Pixel, links);
+  }
+
+  return links;
+}
+
 class PipelineStateImpl final : public ComObjectWithInitialRef<ID3D12PipelineState>,
                                 public PipelineState {
 public:
   PipelineStateImpl(IMTLD3D12Device *device, PipelineStateType type,
                     ID3D12RootSignature *root_signature,
-                    std::vector<PipelineDxilShader> &&shaders)
+                    std::vector<PipelineDxilShader> &&shaders,
+                    std::vector<PipelineSignatureLink> &&signature_links)
       : device_(device), type_(type), root_signature_(root_signature),
-        shaders_(std::move(shaders)) {}
+        shaders_(std::move(shaders)),
+        signature_links_(std::move(signature_links)) {}
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
     if (!object)
@@ -192,11 +299,16 @@ public:
     return shaders_;
   }
 
+  const std::vector<PipelineSignatureLink> &GetSignatureLinks() const override {
+    return signature_links_;
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
   Com<ID3D12RootSignature> root_signature_;
   std::vector<PipelineDxilShader> shaders_;
+  std::vector<PipelineSignatureLink> signature_links_;
   ComPrivateData private_data_;
   std::string name_;
 };
@@ -205,8 +317,10 @@ Com<ID3D12PipelineState>
 CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
                           ID3D12RootSignature *root_signature,
                           std::vector<PipelineDxilShader> &&shaders) {
+  auto signature_links = BuildSignatureLinks(shaders);
   return Com<ID3D12PipelineState>::transfer(
-      new PipelineStateImpl(device, type, root_signature, std::move(shaders)));
+      new PipelineStateImpl(device, type, root_signature, std::move(shaders),
+                            std::move(signature_links)));
 }
 
 void
