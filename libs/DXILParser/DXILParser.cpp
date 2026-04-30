@@ -3,7 +3,9 @@
 #include "DXILParser/DXILParser.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
+#include <utility>
 
 namespace dxmt::dxil {
 
@@ -16,6 +18,16 @@ constexpr size_t kDxilBitcodeHeaderOffset = 8;
 constexpr size_t kDxilSignatureHeaderSize = 8;
 constexpr size_t kDxilSignatureElementSize = 32;
 constexpr size_t kFeatureInfoSize = 8;
+constexpr size_t kShaderHashSize = 20;
+constexpr size_t kCompilerVersionHeaderSize = 16;
+constexpr size_t kShaderDebugNameHeaderSize = 4;
+constexpr size_t kSourceInfoHeaderSize = 8;
+constexpr size_t kSourceInfoSectionHeaderSize = 8;
+constexpr size_t kShaderPdbInfoHeaderSize = 12;
+constexpr size_t kResourceDefHeaderSize = 28;
+constexpr size_t kResourceDefConstantBufferSize = 24;
+constexpr size_t kResourceDefResourceBindingSize = 32;
+constexpr size_t kResourceDefResourceBindingExtendedSize = 40;
 constexpr size_t kRuntimeDataHeaderSize = 8;
 constexpr size_t kRuntimeDataPartHeaderSize = 8;
 constexpr size_t kRuntimeDataTableHeaderSize = 8;
@@ -27,6 +39,21 @@ constexpr size_t kPsvResourceBindInfo0Size = 16;
 constexpr size_t kPsvResourceBindInfo1Size = 24;
 constexpr size_t kPsvSignatureElement0Size = 16;
 constexpr uint32_t kDxilMagicValue = MakeFourCC('D', 'X', 'I', 'L');
+constexpr uint32_t kBitcodeMagicValue = uint32_t('B') | (uint32_t('C') << 8) |
+                                        (uint32_t(0xc0) << 16) |
+                                        (uint32_t(0xde) << 24);
+constexpr uint32_t kBitcodeWrapperMagicValue = 0x0b17c0de;
+constexpr size_t kBitcodeWrapperHeaderSize = 20;
+
+namespace bitc {
+constexpr uint32_t EndBlock = 0;
+constexpr uint32_t EnterSubblock = 1;
+constexpr uint32_t DefineAbbrev = 2;
+constexpr uint32_t UnabbrevRecord = 3;
+constexpr uint32_t FirstApplicationAbbrev = 4;
+constexpr uint32_t BlockInfoBlockId = 0;
+constexpr uint32_t BlockInfoSetBid = 1;
+} // namespace bitc
 
 uint16_t
 ReadU16(std::span<const uint8_t> data, size_t offset) {
@@ -54,6 +81,14 @@ CheckedEnd(size_t offset, size_t size, size_t limit, size_t &end) {
 }
 
 bool
+CheckedAdd64(uint64_t offset, uint64_t size, uint64_t limit, uint64_t &end) {
+  if (offset > limit || size > limit - offset)
+    return false;
+  end = offset + size;
+  return true;
+}
+
+bool
 ReadString(std::span<const uint8_t> data, size_t offset, std::string &out) {
   if (offset >= data.size())
     return false;
@@ -65,6 +100,26 @@ ReadString(std::span<const uint8_t> data, size_t offset, std::string &out) {
     return false;
 
   out.assign(reinterpret_cast<const char *>(data.data() + offset), end - offset);
+  return true;
+}
+
+bool
+ReadStringList(std::span<const uint8_t> data, std::vector<std::string> &out) {
+  out.clear();
+  size_t offset = 0;
+  while (offset < data.size()) {
+    if (data[offset] == 0) {
+      offset++;
+      continue;
+    }
+
+    std::string text;
+    if (!ReadString(data, offset, text))
+      return false;
+
+    offset += text.size() + 1;
+    out.push_back(std::move(text));
+  }
   return true;
 }
 
@@ -112,6 +167,356 @@ IsRdatTablePart(uint32_t type) {
     return false;
   }
 }
+
+struct BitcodeAbbrevOperand {
+  bool literal = false;
+  uint64_t value = 0;
+  uint32_t encoding = 0;
+};
+
+using BitcodeAbbrev = std::vector<BitcodeAbbrevOperand>;
+
+class BitReader {
+public:
+  explicit BitReader(std::span<const uint8_t> data)
+      : data_(data), bit_limit_(uint64_t(data.size()) * 8) {}
+
+  uint64_t bitOffset() const { return bit_offset_; }
+
+  bool readBits(uint32_t width, uint64_t &value) {
+    if (width > 64)
+      return false;
+    uint64_t end = 0;
+    if (!CheckedAdd64(bit_offset_, width, bit_limit_, end))
+      return false;
+
+    value = 0;
+    for (uint32_t i = 0; i < width; i++) {
+      const auto bit = (data_[size_t((bit_offset_ + i) >> 3)] >>
+                        ((bit_offset_ + i) & 7)) &
+                       1u;
+      value |= uint64_t(bit) << i;
+    }
+    bit_offset_ = end;
+    return true;
+  }
+
+  bool readVbr(uint32_t width, uint64_t &value) {
+    if (width < 2 || width > 32)
+      return false;
+
+    value = 0;
+    uint32_t shift = 0;
+    const uint64_t payload_mask = (uint64_t(1) << (width - 1)) - 1;
+    const uint64_t continue_bit = uint64_t(1) << (width - 1);
+
+    for (;;) {
+      uint64_t piece = 0;
+      if (!readBits(width, piece))
+        return false;
+
+      if (shift >= 64 || ((piece & payload_mask) << shift) >> shift !=
+                              (piece & payload_mask))
+        return false;
+      value |= (piece & payload_mask) << shift;
+
+      if ((piece & continue_bit) == 0)
+        return true;
+      shift += width - 1;
+    }
+  }
+
+  bool align32() {
+    const auto aligned = (bit_offset_ + 31u) & ~uint64_t(31u);
+    if (aligned > bit_limit_)
+      return false;
+    bit_offset_ = aligned;
+    return true;
+  }
+
+  bool skipBits(uint64_t bits) {
+    uint64_t end = 0;
+    if (!CheckedAdd64(bit_offset_, bits, bit_limit_, end))
+      return false;
+    bit_offset_ = end;
+    return true;
+  }
+
+  bool seek(uint64_t bit_offset) {
+    if (bit_offset > bit_limit_)
+      return false;
+    bit_offset_ = bit_offset;
+    return true;
+  }
+
+private:
+  std::span<const uint8_t> data_;
+  uint64_t bit_offset_ = 0;
+  uint64_t bit_limit_ = 0;
+};
+
+class BitcodeParser {
+public:
+  explicit BitcodeParser(std::span<const uint8_t> data, BitcodeInfo &info)
+      : reader_(data), info_(info), bit_limit_(uint64_t(data.size()) * 8) {}
+
+  bool parse() {
+    uint64_t magic = 0;
+    if (!reader_.readBits(32, magic) || magic != kBitcodeMagicValue)
+      return false;
+
+    info_ = {};
+    info_.magic = uint32_t(magic);
+    return parseBlock(std::numeric_limits<uint32_t>::max(), 2, 0, bit_limit_);
+  }
+
+private:
+  bool parseBlock(uint32_t block_id, uint32_t abbrev_width, uint32_t depth,
+                  uint64_t end_bit) {
+    if (depth > 64 || abbrev_width == 0 || abbrev_width > 32)
+      return false;
+
+    const auto block_index = info_.blocks.size();
+    info_.blocks.push_back({
+        .id = block_id,
+        .abbreviation_id_width = abbrev_width,
+        .depth = depth,
+        .start_bit = reader_.bitOffset(),
+    });
+
+    auto abbrevs = findBlockInfoAbbrevs(block_id);
+    uint32_t block_info_set_bid = 0;
+
+    while (reader_.bitOffset() < end_bit) {
+      uint64_t abbrev_id = 0;
+      if (!reader_.readBits(abbrev_width, abbrev_id))
+        return false;
+
+      if (abbrev_id == bitc::EndBlock) {
+        if (!reader_.align32() || reader_.bitOffset() > end_bit)
+          return false;
+        info_.blocks[block_index].end_bit = reader_.bitOffset();
+        return true;
+      }
+
+      if (abbrev_id == bitc::EnterSubblock) {
+        uint64_t child_block_id = 0;
+        uint64_t child_abbrev_width = 0;
+        uint64_t child_block_words = 0;
+        if (!reader_.readVbr(8, child_block_id) ||
+            !reader_.readVbr(4, child_abbrev_width) ||
+            !reader_.align32() ||
+            !reader_.readBits(32, child_block_words))
+          return false;
+
+        uint64_t child_end = 0;
+        if (!CheckedAdd64(reader_.bitOffset(), child_block_words * 32,
+                          end_bit, child_end))
+          return false;
+
+        if (!parseBlock(uint32_t(child_block_id), uint32_t(child_abbrev_width),
+                        depth + 1, child_end))
+          return false;
+        if (reader_.bitOffset() > child_end)
+          return false;
+        if (!reader_.seek(child_end))
+          return false;
+        continue;
+      }
+
+      if (abbrev_id == bitc::DefineAbbrev) {
+        BitcodeAbbrev abbrev;
+        if (!readAbbrev(abbrev))
+          return false;
+        if (block_id == bitc::BlockInfoBlockId && block_info_set_bid)
+          addBlockInfoAbbrev(block_info_set_bid, std::move(abbrev));
+        else
+          abbrevs.push_back(std::move(abbrev));
+        continue;
+      }
+
+      BitcodeRecordInfo record = {
+          .block_id = block_id,
+          .abbreviated = abbrev_id != bitc::UnabbrevRecord,
+      };
+
+      std::vector<uint64_t> record_values;
+      if (abbrev_id == bitc::UnabbrevRecord) {
+        uint64_t code = 0;
+        uint64_t operand_count = 0;
+        if (!reader_.readVbr(6, code) || !reader_.readVbr(6, operand_count))
+          return false;
+        record.code = uint32_t(code);
+        record.operand_count = uint32_t(operand_count);
+        record_values.push_back(code);
+        for (uint64_t i = 0; i < operand_count; i++) {
+          uint64_t value = 0;
+          if (!reader_.readVbr(6, value))
+            return false;
+          if (record_values.size() < 16)
+            record_values.push_back(value);
+        }
+      } else {
+        const auto app_abbrev = abbrev_id - bitc::FirstApplicationAbbrev;
+        if (app_abbrev >= abbrevs.size())
+          return false;
+        uint32_t operand_count = 0;
+        if (!readAbbreviatedRecord(abbrevs[size_t(app_abbrev)],
+                                   record_values, operand_count))
+          return false;
+        if (record_values.empty())
+          return false;
+        record.code = uint32_t(record_values[0]);
+        record.operand_count = operand_count > 0 ? operand_count - 1 : 0;
+      }
+
+      if (block_id == bitc::BlockInfoBlockId &&
+          record.code == bitc::BlockInfoSetBid && record_values.size() >= 2)
+        block_info_set_bid = uint32_t(record_values[1]);
+
+      info_.blocks[block_index].record_count++;
+      info_.records.push_back(record);
+    }
+
+    if (reader_.bitOffset() != end_bit)
+      return false;
+    info_.blocks[block_index].end_bit = end_bit;
+    return true;
+  }
+
+  bool readAbbrev(BitcodeAbbrev &abbrev) {
+    uint64_t operand_count = 0;
+    if (!reader_.readVbr(5, operand_count))
+      return false;
+    abbrev.clear();
+    abbrev.reserve(size_t(operand_count));
+
+    for (uint64_t i = 0; i < operand_count; i++) {
+      uint64_t is_literal = 0;
+      if (!reader_.readBits(1, is_literal))
+        return false;
+      if (is_literal) {
+        uint64_t value = 0;
+        if (!reader_.readVbr(8, value))
+          return false;
+        abbrev.push_back({.literal = true, .value = value});
+        continue;
+      }
+
+      uint64_t encoding = 0;
+      if (!reader_.readBits(3, encoding) || encoding < 1 || encoding > 5)
+        return false;
+      BitcodeAbbrevOperand operand = {
+          .literal = false,
+          .encoding = uint32_t(encoding),
+      };
+      if (encoding == 1 || encoding == 2) {
+        if (!reader_.readVbr(5, operand.value))
+          return false;
+      }
+      abbrev.push_back(operand);
+    }
+
+    return true;
+  }
+
+  bool readAbbreviatedRecord(const BitcodeAbbrev &abbrev,
+                             std::vector<uint64_t> &values,
+                             uint32_t &operand_count) {
+    values.clear();
+    operand_count = 0;
+
+    for (size_t i = 0; i < abbrev.size(); i++) {
+      const auto &operand = abbrev[i];
+      if (operand.literal) {
+        pushRecordValue(values, operand.value, operand_count);
+        continue;
+      }
+
+      if (operand.encoding == 3) {
+        if (i + 1 >= abbrev.size())
+          return false;
+        uint64_t length = 0;
+        if (!reader_.readVbr(6, length))
+          return false;
+        for (uint64_t item = 0; item < length; item++) {
+          uint64_t value = 0;
+          if (!readEncodedValue(abbrev[i + 1], value))
+            return false;
+          pushRecordValue(values, value, operand_count);
+        }
+        i++;
+        continue;
+      }
+
+      if (operand.encoding == 5) {
+        uint64_t length = 0;
+        if (!reader_.readVbr(6, length) ||
+            length > std::numeric_limits<uint64_t>::max() / 8 ||
+            !reader_.align32() ||
+            !reader_.skipBits(length * 8) || !reader_.align32())
+          return false;
+        operand_count++;
+        continue;
+      }
+
+      uint64_t value = 0;
+      if (!readEncodedValue(operand, value))
+        return false;
+      pushRecordValue(values, value, operand_count);
+    }
+
+    return true;
+  }
+
+  bool readEncodedValue(const BitcodeAbbrevOperand &operand, uint64_t &value) {
+    if (operand.literal) {
+      value = operand.value;
+      return true;
+    }
+
+    switch (operand.encoding) {
+    case 1:
+      return reader_.readBits(uint32_t(operand.value), value);
+    case 2:
+      return reader_.readVbr(uint32_t(operand.value), value);
+    case 4:
+      return reader_.readBits(6, value);
+    default:
+      return false;
+    }
+  }
+
+  void pushRecordValue(std::vector<uint64_t> &values, uint64_t value,
+                       uint32_t &operand_count) {
+    operand_count++;
+    if (values.size() < 16)
+      values.push_back(value);
+  }
+
+  std::vector<BitcodeAbbrev> findBlockInfoAbbrevs(uint32_t block_id) const {
+    for (const auto &entry : block_info_abbrevs_) {
+      if (entry.first == block_id)
+        return entry.second;
+    }
+    return {};
+  }
+
+  void addBlockInfoAbbrev(uint32_t block_id, BitcodeAbbrev &&abbrev) {
+    for (auto &entry : block_info_abbrevs_) {
+      if (entry.first == block_id) {
+        entry.second.push_back(std::move(abbrev));
+        return;
+      }
+    }
+    block_info_abbrevs_.push_back({block_id, {std::move(abbrev)}});
+  }
+
+  BitReader reader_;
+  BitcodeInfo &info_;
+  uint64_t bit_limit_ = 0;
+  std::vector<std::pair<uint32_t, std::vector<BitcodeAbbrev>>> block_info_abbrevs_;
+};
 
 } // namespace
 
@@ -225,6 +630,12 @@ PsvShaderKindName(uint8_t shader_kind) {
   }
 }
 
+bool
+ShaderHashInfo::is_populated() const {
+  return std::any_of(digest.begin(), digest.end(),
+                     [](uint8_t value) { return value != 0; });
+}
+
 const char *
 StatusName(ParseStatus status) {
   switch (status) {
@@ -258,6 +669,22 @@ StatusName(ParseStatus status) {
     return "invalid runtime data";
   case ParseStatus::InvalidPipelineStateValidation:
     return "invalid pipeline state validation";
+  case ParseStatus::InvalidShaderHash:
+    return "invalid shader hash";
+  case ParseStatus::InvalidCompilerVersion:
+    return "invalid compiler version";
+  case ParseStatus::InvalidShaderDebugName:
+    return "invalid shader debug name";
+  case ParseStatus::InvalidSourceInfo:
+    return "invalid source info";
+  case ParseStatus::InvalidShaderPdbInfo:
+    return "invalid shader PDB info";
+  case ParseStatus::InvalidShaderStatistics:
+    return "invalid shader statistics";
+  case ParseStatus::InvalidResourceDef:
+    return "invalid resource definition";
+  case ParseStatus::InvalidBitcode:
+    return "invalid bitcode";
   }
   return "unknown";
 }
@@ -275,8 +702,16 @@ void
 Parser::reset() {
   container_ = {};
   dxil_program_.reset();
+  bitcode_.reset();
   signatures_.clear();
   feature_info_.reset();
+  shader_hash_.reset();
+  compiler_version_.reset();
+  shader_debug_name_.reset();
+  source_info_.reset();
+  shader_pdb_info_.reset();
+  shader_statistics_.reset();
+  resource_def_.reset();
   runtime_data_.reset();
   psv_info_.reset();
 }
@@ -293,6 +728,10 @@ Parser::parse(const void *data, size_t size) {
     return status;
 
   status = parseDxilProgram();
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = parseBitcode();
   if (status != ParseStatus::Ok)
     return status;
 
@@ -330,6 +769,7 @@ Parser::parseContainer(std::span<const uint8_t> data) {
   container_.major_version = ReadU16(data, 20);
   container_.minor_version = ReadU16(data, 22);
   container_.container_size = container_size;
+  std::copy_n(data.data() + 4, container_.hash.size(), container_.hash.begin());
   container_.parts.reserve(part_count);
 
   for (uint32_t i = 0; i < part_count; i++) {
@@ -373,6 +813,20 @@ Parser::parseDxilProgram() {
 }
 
 ParseStatus
+Parser::parseBitcode() {
+  if (!dxil_program_)
+    return ParseStatus::MissingDxilPart;
+
+  BitcodeInfo info = {};
+  auto status = ParseBitcode(dxil_program_->bitcode, info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  bitcode_ = std::move(info);
+  return ParseStatus::Ok;
+}
+
+ParseStatus
 Parser::parseKnownParts() {
   signatures_.clear();
 
@@ -395,6 +849,62 @@ Parser::parseKnownParts() {
     if (status != ParseStatus::Ok)
       return status;
     feature_info_ = info;
+  }
+
+  if (const auto *part = container_.findPart(fourcc::ShaderHash)) {
+    ShaderHashInfo info = {};
+    auto status = ParseShaderHash(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    shader_hash_ = info;
+  }
+
+  if (const auto *part = container_.findPart(fourcc::CompilerVersion)) {
+    CompilerVersionInfo info = {};
+    auto status = ParseCompilerVersion(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    compiler_version_ = std::move(info);
+  }
+
+  if (const auto *part = container_.findPart(fourcc::ShaderDebugName)) {
+    ShaderDebugNameInfo info = {};
+    auto status = ParseShaderDebugName(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    shader_debug_name_ = std::move(info);
+  }
+
+  if (const auto *part = container_.findPart(fourcc::ShaderSourceInfo)) {
+    SourceInfo info = {};
+    auto status = ParseSourceInfo(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    source_info_ = std::move(info);
+  }
+
+  if (const auto *part = container_.findPart(fourcc::ShaderPdbInfo)) {
+    ShaderPdbInfo info = {};
+    auto status = ParseShaderPdbInfo(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    shader_pdb_info_ = info;
+  }
+
+  if (const auto *part = container_.findPart(fourcc::ShaderStatistics)) {
+    ShaderStatisticsInfo info = {};
+    auto status = ParseShaderStatistics(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    shader_statistics_ = std::move(info);
+  }
+
+  if (const auto *part = container_.findPart(fourcc::ResourceDef)) {
+    ResourceDefInfo info = {};
+    auto status = ParseResourceDef(*part, info);
+    if (status != ParseStatus::Ok)
+      return status;
+    resource_def_ = std::move(info);
   }
 
   if (const auto *part = container_.findPart(fourcc::RuntimeData)) {
@@ -468,6 +978,46 @@ ParseDxilProgram(const BlobPart &part, DxilProgramInfo &info) {
 }
 
 ParseStatus
+ParseBitcode(std::span<const uint8_t> data, BitcodeInfo &info) {
+  if (data.size() < sizeof(uint32_t))
+    return ParseStatus::InvalidBitcode;
+
+  BitcodeInfo wrapper = {};
+  auto bitstream = data;
+  const auto magic = ReadU32(data, 0);
+  if (magic == kBitcodeWrapperMagicValue) {
+    if (data.size() < kBitcodeWrapperHeaderSize)
+      return ParseStatus::InvalidBitcode;
+
+    wrapper.has_wrapper = true;
+    wrapper.wrapper_version = ReadU32(data, 4);
+    wrapper.wrapper_offset = ReadU32(data, 8);
+    wrapper.wrapper_size = ReadU32(data, 12);
+    wrapper.wrapper_cpu_type = ReadU32(data, 16);
+
+    size_t bitstream_end = 0;
+    if (!CheckedEnd(wrapper.wrapper_offset, wrapper.wrapper_size, data.size(),
+                    bitstream_end))
+      return ParseStatus::InvalidBitcode;
+    bitstream = std::span<const uint8_t>(data.data() + wrapper.wrapper_offset,
+                                         wrapper.wrapper_size);
+  }
+
+  BitcodeParser parser(bitstream, info);
+  if (!parser.parse())
+    return ParseStatus::InvalidBitcode;
+
+  if (wrapper.has_wrapper) {
+    info.has_wrapper = true;
+    info.wrapper_version = wrapper.wrapper_version;
+    info.wrapper_offset = wrapper.wrapper_offset;
+    info.wrapper_size = wrapper.wrapper_size;
+    info.wrapper_cpu_type = wrapper.wrapper_cpu_type;
+  }
+  return ParseStatus::Ok;
+}
+
+ParseStatus
 ParseSignature(const BlobPart &part, SignatureInfo &info) {
   const auto data = part.data;
   if (data.size() < kDxilSignatureHeaderSize)
@@ -511,6 +1061,226 @@ ParseFeatureInfo(const BlobPart &part, FeatureInfo &info) {
     return ParseStatus::InvalidFeatureInfo;
 
   info.feature_flags = ReadU64(part.data, 0);
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseShaderHash(const BlobPart &part, ShaderHashInfo &info) {
+  if (part.data.size() < kShaderHashSize)
+    return ParseStatus::InvalidShaderHash;
+
+  info = {};
+  info.flags = ReadU32(part.data, 0);
+  std::copy_n(part.data.data() + sizeof(uint32_t), info.digest.size(),
+              info.digest.begin());
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseCompilerVersion(const BlobPart &part, CompilerVersionInfo &info) {
+  const auto data = part.data;
+  if (data.size() < kCompilerVersionHeaderSize)
+    return ParseStatus::InvalidCompilerVersion;
+
+  info = {};
+  info.major = ReadU16(data, 0);
+  info.minor = ReadU16(data, 2);
+  info.version_flags = ReadU32(data, 4);
+  info.commit_count = ReadU32(data, 8);
+  info.string_list_size = ReadU32(data, 12);
+
+  const auto aligned_size = (size_t(info.string_list_size) + 3u) & ~size_t(3u);
+  size_t strings_end = 0;
+  if (!CheckedEnd(kCompilerVersionHeaderSize, aligned_size, data.size(),
+                  strings_end))
+    return ParseStatus::InvalidCompilerVersion;
+
+  const auto string_list = std::span<const uint8_t>(
+      data.data() + kCompilerVersionHeaderSize, info.string_list_size);
+  if (!ReadStringList(string_list, info.strings))
+    return ParseStatus::InvalidCompilerVersion;
+
+  if (!info.strings.empty())
+    info.commit_sha = info.strings[0];
+  if (info.strings.size() > 1)
+    info.custom_version_string = info.strings[1];
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseShaderDebugName(const BlobPart &part, ShaderDebugNameInfo &info) {
+  const auto data = part.data;
+  if (data.size() < kShaderDebugNameHeaderSize)
+    return ParseStatus::InvalidShaderDebugName;
+
+  info = {};
+  info.flags = ReadU16(data, 0);
+  const auto name_length = ReadU16(data, 2);
+  size_t name_end = 0;
+  if (!CheckedEnd(kShaderDebugNameHeaderSize, size_t(name_length), data.size(),
+                  name_end))
+    return ParseStatus::InvalidShaderDebugName;
+  if (name_end >= data.size() || data[name_end] != 0)
+    return ParseStatus::InvalidShaderDebugName;
+
+  info.name.assign(reinterpret_cast<const char *>(data.data() +
+                                                 kShaderDebugNameHeaderSize),
+                   name_length);
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseSourceInfo(const BlobPart &part, SourceInfo &info) {
+  const auto data = part.data;
+  if (data.size() < kSourceInfoHeaderSize)
+    return ParseStatus::InvalidSourceInfo;
+
+  info = {};
+  info.aligned_size = ReadU32(data, 0);
+  info.flags = ReadU16(data, 4);
+  info.section_count = ReadU16(data, 6);
+  if ((info.aligned_size & 3) || info.aligned_size < kSourceInfoHeaderSize ||
+      info.aligned_size > data.size())
+    return ParseStatus::InvalidSourceInfo;
+
+  size_t offset = kSourceInfoHeaderSize;
+  info.sections.reserve(info.section_count);
+  for (uint16_t i = 0; i < info.section_count; i++) {
+    size_t section_header_end = 0;
+    if (!CheckedEnd(offset, kSourceInfoSectionHeaderSize, info.aligned_size,
+                    section_header_end))
+      return ParseStatus::InvalidSourceInfo;
+
+    SourceInfoSection section = {};
+    section.aligned_size = ReadU32(data, offset + 0);
+    section.flags = ReadU16(data, offset + 4);
+    section.type = ReadU16(data, offset + 6);
+    if ((section.aligned_size & 3) ||
+        section.aligned_size < kSourceInfoSectionHeaderSize)
+      return ParseStatus::InvalidSourceInfo;
+
+    size_t section_end = 0;
+    if (!CheckedEnd(offset, section.aligned_size, info.aligned_size,
+                    section_end))
+      return ParseStatus::InvalidSourceInfo;
+
+    section.data = std::span<const uint8_t>(
+        data.data() + section_header_end, section_end - section_header_end);
+    info.sections.push_back(section);
+    offset = section_end;
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseShaderPdbInfo(const BlobPart &part, ShaderPdbInfo &info) {
+  const auto data = part.data;
+  if (data.size() < kShaderPdbInfoHeaderSize)
+    return ParseStatus::InvalidShaderPdbInfo;
+
+  info = {};
+  info.version = ReadU16(data, 0);
+  info.compression_type = ReadU16(data, 2);
+  info.size_in_bytes = ReadU32(data, 4);
+  info.uncompressed_size_in_bytes = ReadU32(data, 8);
+
+  size_t payload_end = 0;
+  if (!CheckedEnd(kShaderPdbInfoHeaderSize, info.size_in_bytes, data.size(),
+                  payload_end))
+    return ParseStatus::InvalidShaderPdbInfo;
+  info.payload = std::span<const uint8_t>(data.data() + kShaderPdbInfoHeaderSize,
+                                          info.size_in_bytes);
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseShaderStatistics(const BlobPart &part, ShaderStatisticsInfo &info) {
+  if (part.data.size() & 3)
+    return ParseStatus::InvalidShaderStatistics;
+
+  info = {};
+  info.values.reserve(part.data.size() / sizeof(uint32_t));
+  for (size_t offset = 0; offset < part.data.size(); offset += sizeof(uint32_t))
+    info.values.push_back(ReadU32(part.data, offset));
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseResourceDef(const BlobPart &part, ResourceDefInfo &info) {
+  const auto data = part.data;
+  if (data.size() < kResourceDefHeaderSize)
+    return ParseStatus::InvalidResourceDef;
+
+  info = {};
+  info.constant_buffer_count = ReadU32(data, 0);
+  info.constant_buffer_offset = ReadU32(data, 4);
+  info.bound_resource_count = ReadU32(data, 8);
+  info.bound_resource_offset = ReadU32(data, 12);
+  info.target = ReadU32(data, 16);
+  info.flags = ReadU32(data, 20);
+
+  const auto creator_offset = ReadU32(data, 24);
+  if (creator_offset && !ReadString(data, creator_offset, info.creator))
+    return ParseStatus::InvalidResourceDef;
+
+  size_t cbuffers_end = 0;
+  if (!CheckedEnd(info.constant_buffer_offset,
+                  size_t(info.constant_buffer_count) *
+                      kResourceDefConstantBufferSize,
+                  data.size(), cbuffers_end))
+    return ParseStatus::InvalidResourceDef;
+
+  const auto shader_major = (info.target >> 4) & 0xf;
+  const auto shader_minor = info.target & 0xf;
+  const auto resource_stride =
+      (shader_major > 5 || (shader_major == 5 && shader_minor >= 1))
+          ? kResourceDefResourceBindingExtendedSize
+          : kResourceDefResourceBindingSize;
+
+  size_t resources_end = 0;
+  if (!CheckedEnd(info.bound_resource_offset,
+                  size_t(info.bound_resource_count) * resource_stride,
+                  data.size(), resources_end))
+    return ParseStatus::InvalidResourceDef;
+
+  info.constant_buffers.reserve(info.constant_buffer_count);
+  for (uint32_t i = 0; i < info.constant_buffer_count; i++) {
+    const auto offset = info.constant_buffer_offset +
+                        size_t(i) * kResourceDefConstantBufferSize;
+    ConstantBufferInfo cbuffer = {};
+    const auto name_offset = ReadU32(data, offset + 0);
+    cbuffer.variable_count = ReadU32(data, offset + 4);
+    cbuffer.variable_offset = ReadU32(data, offset + 8);
+    cbuffer.size = ReadU32(data, offset + 12);
+    cbuffer.flags = ReadU32(data, offset + 16);
+    cbuffer.type = ReadU32(data, offset + 20);
+    if (name_offset && !ReadString(data, name_offset, cbuffer.name))
+      return ParseStatus::InvalidResourceDef;
+    info.constant_buffers.push_back(std::move(cbuffer));
+  }
+
+  info.resources.reserve(info.bound_resource_count);
+  for (uint32_t i = 0; i < info.bound_resource_count; i++) {
+    const auto offset = info.bound_resource_offset + size_t(i) * resource_stride;
+    ResourceBindingInfo resource = {};
+    const auto name_offset = ReadU32(data, offset + 0);
+    resource.type = ReadU32(data, offset + 4);
+    resource.return_type = ReadU32(data, offset + 8);
+    resource.dimension = ReadU32(data, offset + 12);
+    resource.num_samples = ReadU32(data, offset + 16);
+    resource.bind_point = ReadU32(data, offset + 20);
+    resource.bind_count = ReadU32(data, offset + 24);
+    resource.flags = ReadU32(data, offset + 28);
+    if (resource_stride >= kResourceDefResourceBindingExtendedSize) {
+      resource.space = ReadU32(data, offset + 32);
+      resource.id = ReadU32(data, offset + 36);
+    }
+    if (name_offset && !ReadString(data, name_offset, resource.name))
+      return ParseStatus::InvalidResourceDef;
+    info.resources.push_back(std::move(resource));
+  }
+
   return ParseStatus::Ok;
 }
 
