@@ -975,11 +975,17 @@ struct DxilTranslationSignatureElementInfo {
   uint32_t element_id = 0;
   bool has_element_id = false;
   std::string semantic_name;
+  std::string semantic_key;
   std::vector<uint32_t> semantic_indices;
+  uint32_t semantic_index = 0;
+  bool has_semantic_index = false;
   uint8_t rows = 0;
   uint8_t cols = 0;
   uint8_t start_row = 0xff;
   uint8_t start_col = 0;
+  uint8_t component_start = 0;
+  uint8_t component_count = 0;
+  uint8_t component_mask = 0;
   uint8_t semantic_kind = 0;
   uint8_t component_type = 0;
   uint8_t interpolation_mode = 0;
