@@ -130,6 +130,56 @@ struct DxilShaderModelInfo {
   uint32_t minor = 0;
 };
 
+struct DxilMetadataTagValueInfo {
+  uint32_t tag = 0;
+  bool has_uint_value = false;
+  uint64_t uint_value = 0;
+  std::string string_value;
+  std::string text;
+};
+
+struct DxilMetadataSignatureElementInfo {
+  uint32_t id = 0;
+  std::string semantic_name;
+  std::vector<uint32_t> semantic_indices;
+  uint32_t rows = 0;
+  uint32_t cols = 0;
+  uint32_t start_row = 0;
+  uint32_t start_col = 0;
+  uint32_t semantic_kind = 0;
+  uint32_t component_type = 0;
+  uint32_t interpolation_mode = 0;
+  uint32_t dynamic_index_mask = 0;
+  uint32_t stream = 0;
+  std::vector<DxilMetadataTagValueInfo> tags;
+  std::string text;
+};
+
+enum class DxilMetadataResourceClass {
+  Srv,
+  Uav,
+  Cbv,
+  Sampler,
+  Unknown,
+};
+
+struct DxilMetadataResourceInfo {
+  DxilMetadataResourceClass resource_class = DxilMetadataResourceClass::Unknown;
+  uint32_t id = 0;
+  std::string global_name;
+  std::string name;
+  uint32_t space = 0;
+  uint32_t lower_bound = 0;
+  uint32_t range_size = 0;
+  uint32_t upper_bound = 0;
+  uint32_t kind = 0;
+  uint32_t element_type = 0;
+  uint32_t flags = 0;
+  std::vector<uint32_t> numeric_operands;
+  std::vector<DxilMetadataTagValueInfo> tags;
+  std::string text;
+};
+
 struct DxilEntryPointInfo {
   std::string name;
   std::string function_name;
@@ -140,6 +190,11 @@ struct DxilEntryPointInfo {
   uint32_t resource_operand_count = 0;
   uint32_t property_operand_count = 0;
   std::vector<uint32_t> properties;
+  std::vector<DxilMetadataTagValueInfo> property_tags;
+  std::vector<DxilMetadataSignatureElementInfo> input_signature;
+  std::vector<DxilMetadataSignatureElementInfo> output_signature;
+  std::vector<DxilMetadataSignatureElementInfo> patch_constant_signature;
+  std::vector<DxilMetadataResourceInfo> resources;
 };
 
 struct LlvmModuleFlagInfo {
@@ -276,6 +331,8 @@ struct LlvmModuleInfo {
   std::vector<uint32_t> dxil_version;
   std::vector<uint32_t> validator_version;
   std::vector<DxilEntryPointInfo> entry_points;
+  std::vector<DxilMetadataResourceInfo> resources;
+  std::vector<DxilMetadataSignatureElementInfo> signature_elements;
   std::vector<LlvmModuleFlagInfo> module_flags;
   std::vector<LlvmFunctionInfo> functions;
   std::vector<LlvmGlobalInfo> globals;

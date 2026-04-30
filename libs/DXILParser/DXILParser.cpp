@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -419,6 +420,22 @@ MetadataUInt32(const llvm::Metadata *metadata) {
   return uint32_t(integer->getZExtValue());
 }
 
+std::optional<uint64_t>
+MetadataUInt64(const llvm::Metadata *metadata) {
+  if (!metadata)
+    return std::nullopt;
+
+  const auto *constant = llvm::dyn_cast<llvm::ConstantAsMetadata>(metadata);
+  if (!constant)
+    return std::nullopt;
+
+  const auto *integer = llvm::dyn_cast<llvm::ConstantInt>(constant->getValue());
+  if (!integer)
+    return std::nullopt;
+
+  return integer->getZExtValue();
+}
+
 std::vector<uint32_t>
 MetadataUInt32List(const llvm::MDNode *node) {
   std::vector<uint32_t> values;
@@ -433,6 +450,234 @@ MetadataUInt32List(const llvm::MDNode *node) {
     values.push_back(*value);
   }
   return values;
+}
+
+const llvm::MDNode *
+MetadataNode(const llvm::Metadata *metadata) {
+  return llvm::dyn_cast_or_null<llvm::MDNode>(metadata);
+}
+
+std::string
+MetadataValueName(const llvm::Metadata *metadata) {
+  if (!metadata)
+    return {};
+
+  const auto *value = llvm::dyn_cast<llvm::ValueAsMetadata>(metadata);
+  if (!value)
+    return {};
+
+  const auto *named_value = value->getValue();
+  if (named_value && named_value->hasName())
+    return named_value->getName().str();
+  return ValueOperandText(named_value);
+}
+
+DxilMetadataTagValueInfo
+ParseMetadataTagValue(const llvm::MDNode *node) {
+  DxilMetadataTagValueInfo info = {};
+  if (!node)
+    return info;
+
+  if (node->getNumOperands() > 0) {
+    if (auto tag = MetadataUInt32(node->getOperand(0).get()))
+      info.tag = *tag;
+  }
+  if (node->getNumOperands() > 1) {
+    const auto *value = node->getOperand(1).get();
+    if (auto uint_value = MetadataUInt64(value)) {
+      info.has_uint_value = true;
+      info.uint_value = *uint_value;
+    }
+    info.string_value = MetadataString(value);
+    info.text = MetadataText(value);
+  }
+  if (info.text.empty())
+    info.text = MetadataText(node);
+  return info;
+}
+
+std::vector<DxilMetadataTagValueInfo>
+ParseMetadataTagValues(const llvm::MDNode *node) {
+  std::vector<DxilMetadataTagValueInfo> tags;
+  if (!node)
+    return tags;
+
+  tags.reserve(node->getNumOperands());
+  for (const auto &operand : node->operands()) {
+    const auto *tag_node = MetadataNode(operand.get());
+    if (!tag_node)
+      continue;
+    tags.push_back(ParseMetadataTagValue(tag_node));
+  }
+  return tags;
+}
+
+std::vector<DxilMetadataTagValueInfo>
+ParseTrailingMetadataTags(const llvm::MDNode *node, uint32_t first_tag_operand) {
+  if (!node || node->getNumOperands() <= first_tag_operand)
+    return {};
+
+  const auto *tags = MetadataNode(node->getOperand(first_tag_operand).get());
+  return ParseMetadataTagValues(tags);
+}
+
+DxilMetadataSignatureElementInfo
+ParseDxilMetadataSignatureElement(const llvm::MDNode *node) {
+  DxilMetadataSignatureElementInfo info = {};
+  if (!node)
+    return info;
+
+  info.text = MetadataText(node);
+  if (node->getNumOperands() > 0) {
+    if (auto id = MetadataUInt32(node->getOperand(0).get()))
+      info.id = *id;
+  }
+  if (node->getNumOperands() > 1)
+    info.semantic_name = MetadataString(node->getOperand(1).get());
+  if (node->getNumOperands() > 2) {
+    const auto *semantic_indices = MetadataNode(node->getOperand(2).get());
+    if (semantic_indices)
+      info.semantic_indices = MetadataUInt32List(semantic_indices);
+    else if (auto semantic_index = MetadataUInt32(node->getOperand(2).get()))
+      info.semantic_indices.push_back(*semantic_index);
+  }
+  if (node->getNumOperands() > 3) {
+    if (auto rows = MetadataUInt32(node->getOperand(3).get()))
+      info.rows = *rows;
+  }
+  if (node->getNumOperands() > 4) {
+    if (auto cols = MetadataUInt32(node->getOperand(4).get()))
+      info.cols = *cols;
+  }
+  if (node->getNumOperands() > 5) {
+    if (auto start_row = MetadataUInt32(node->getOperand(5).get()))
+      info.start_row = *start_row;
+  }
+  if (node->getNumOperands() > 6) {
+    if (auto start_col = MetadataUInt32(node->getOperand(6).get()))
+      info.start_col = *start_col;
+  }
+  if (node->getNumOperands() > 7) {
+    if (auto semantic_kind = MetadataUInt32(node->getOperand(7).get()))
+      info.semantic_kind = *semantic_kind;
+  }
+  if (node->getNumOperands() > 8) {
+    if (auto component_type = MetadataUInt32(node->getOperand(8).get()))
+      info.component_type = *component_type;
+  }
+  if (node->getNumOperands() > 9) {
+    if (auto interpolation_mode = MetadataUInt32(node->getOperand(9).get()))
+      info.interpolation_mode = *interpolation_mode;
+  }
+  if (node->getNumOperands() > 10) {
+    if (auto dynamic_index_mask = MetadataUInt32(node->getOperand(10).get()))
+      info.dynamic_index_mask = *dynamic_index_mask;
+  }
+  if (node->getNumOperands() > 11) {
+    if (auto stream = MetadataUInt32(node->getOperand(11).get()))
+      info.stream = *stream;
+  }
+  info.tags = ParseTrailingMetadataTags(node, 12);
+  return info;
+}
+
+std::vector<DxilMetadataSignatureElementInfo>
+ParseDxilMetadataSignatureList(const llvm::MDNode *node) {
+  std::vector<DxilMetadataSignatureElementInfo> elements;
+  if (!node)
+    return elements;
+
+  elements.reserve(node->getNumOperands());
+  for (const auto &operand : node->operands()) {
+    if (const auto *element = MetadataNode(operand.get()))
+      elements.push_back(ParseDxilMetadataSignatureElement(element));
+  }
+  return elements;
+}
+
+DxilMetadataResourceInfo
+ParseDxilMetadataResource(const llvm::MDNode *node,
+                          DxilMetadataResourceClass resource_class) {
+  DxilMetadataResourceInfo info = {};
+  info.resource_class = resource_class;
+  if (!node)
+    return info;
+
+  info.text = MetadataText(node);
+  if (node->getNumOperands() > 0) {
+    if (auto id = MetadataUInt32(node->getOperand(0).get()))
+      info.id = *id;
+  }
+  if (node->getNumOperands() > 1)
+    info.global_name = MetadataValueName(node->getOperand(1).get());
+  if (node->getNumOperands() > 2)
+    info.name = MetadataString(node->getOperand(2).get());
+  if (node->getNumOperands() > 3) {
+    if (auto space = MetadataUInt32(node->getOperand(3).get()))
+      info.space = *space;
+  }
+  if (node->getNumOperands() > 4) {
+    if (auto lower_bound = MetadataUInt32(node->getOperand(4).get()))
+      info.lower_bound = *lower_bound;
+  }
+  if (node->getNumOperands() > 5) {
+    if (auto range_size = MetadataUInt32(node->getOperand(5).get()))
+      info.range_size = *range_size;
+  }
+  if (info.range_size == std::numeric_limits<uint32_t>::max())
+    info.upper_bound = std::numeric_limits<uint32_t>::max();
+  else if (info.range_size)
+    info.upper_bound = info.lower_bound + info.range_size - 1;
+  else
+    info.upper_bound = info.lower_bound;
+
+  for (uint32_t i = 6; i < node->getNumOperands(); i++) {
+    const auto *operand = node->getOperand(i).get();
+    if (const auto *tag_node = MetadataNode(operand)) {
+      info.tags = ParseMetadataTagValues(tag_node);
+      break;
+    }
+    if (auto value = MetadataUInt32(operand)) {
+      info.numeric_operands.push_back(*value);
+      if (i == 6)
+        info.kind = *value;
+      else if (i == 7)
+        info.element_type = *value;
+      else if (i == 8)
+        info.flags = *value;
+    }
+  }
+  return info;
+}
+
+std::vector<DxilMetadataResourceInfo>
+ParseDxilMetadataResourceLists(const llvm::MDNode *node) {
+  std::vector<DxilMetadataResourceInfo> resources;
+  if (!node)
+    return resources;
+
+  const DxilMetadataResourceClass classes[] = {
+      DxilMetadataResourceClass::Srv,
+      DxilMetadataResourceClass::Uav,
+      DxilMetadataResourceClass::Cbv,
+      DxilMetadataResourceClass::Sampler,
+  };
+
+  for (uint32_t list_index = 0; list_index < node->getNumOperands(); list_index++) {
+    const auto *list = MetadataNode(node->getOperand(list_index).get());
+    if (!list)
+      continue;
+
+    const auto resource_class = list_index < (sizeof(classes) / sizeof(classes[0]))
+                                    ? classes[list_index]
+                                    : DxilMetadataResourceClass::Unknown;
+    resources.reserve(resources.size() + list->getNumOperands());
+    for (const auto &operand : list->operands()) {
+      if (const auto *resource = MetadataNode(operand.get()))
+        resources.push_back(ParseDxilMetadataResource(resource, resource_class));
+    }
+  }
+  return resources;
 }
 #endif
 
@@ -1557,6 +1802,16 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
       validator_version && validator_version->getNumOperands())
     info.validator_version = MetadataUInt32List(validator_version->getOperand(0));
 
+  if (const auto *resources = module->getNamedMetadata("dx.resources");
+      resources && resources->getNumOperands()) {
+    for (const auto *resource_lists : resources->operands()) {
+      auto parsed = ParseDxilMetadataResourceLists(resource_lists);
+      info.resources.insert(info.resources.end(),
+                            std::make_move_iterator(parsed.begin()),
+                            std::make_move_iterator(parsed.end()));
+    }
+  }
+
   if (const auto *entry_points = module->getNamedMetadata("dx.entryPoints")) {
     info.entry_points.reserve(entry_points->getNumOperands());
     for (const auto *entry : entry_points->operands()) {
@@ -1571,6 +1826,27 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
                 entry->getOperand(2).get())) {
           entry_info.has_signature = true;
           entry_info.signature_operand_count = signature->getNumOperands();
+          if (signature->getNumOperands() > 0)
+            entry_info.input_signature = ParseDxilMetadataSignatureList(
+                MetadataNode(signature->getOperand(0).get()));
+          if (signature->getNumOperands() > 1)
+            entry_info.output_signature = ParseDxilMetadataSignatureList(
+                MetadataNode(signature->getOperand(1).get()));
+          if (signature->getNumOperands() > 2)
+            entry_info.patch_constant_signature = ParseDxilMetadataSignatureList(
+                MetadataNode(signature->getOperand(2).get()));
+          info.signature_elements.insert(
+              info.signature_elements.end(),
+              entry_info.input_signature.begin(),
+              entry_info.input_signature.end());
+          info.signature_elements.insert(
+              info.signature_elements.end(),
+              entry_info.output_signature.begin(),
+              entry_info.output_signature.end());
+          info.signature_elements.insert(
+              info.signature_elements.end(),
+              entry_info.patch_constant_signature.begin(),
+              entry_info.patch_constant_signature.end());
         }
       }
       if (entry->getNumOperands() > 3) {
@@ -1578,6 +1854,7 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
                 entry->getOperand(3).get())) {
           entry_info.has_resources = true;
           entry_info.resource_operand_count = resources->getNumOperands();
+          entry_info.resources = ParseDxilMetadataResourceLists(resources);
         }
       }
       if (entry->getNumOperands() > 4) {
@@ -1586,6 +1863,7 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
           entry_info.has_properties = true;
           entry_info.property_operand_count = properties->getNumOperands();
           entry_info.properties = MetadataUInt32List(properties);
+          entry_info.property_tags = ParseMetadataTagValues(properties);
         }
       }
       info.entry_points.push_back(std::move(entry_info));
