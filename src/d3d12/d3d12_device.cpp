@@ -6,8 +6,10 @@
 #include "d3d12_command_allocator.hpp"
 #include "d3d12_command_list.hpp"
 #include "d3d12_command_queue.hpp"
+#include "d3d12_descriptor_heap.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_pipeline.hpp"
+#include "d3d12_query.hpp"
 #include "d3d12_root_signature.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
@@ -329,11 +331,38 @@ public:
   HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC *desc,
                                                  REFIID riid, void **descriptor_heap) override {
     InitReturnPtr(descriptor_heap);
-    return E_NOTIMPL;
+    if (!descriptor_heap)
+      return E_POINTER;
+    if (!desc || desc->NumDescriptors == 0)
+      return E_INVALIDARG;
+    if (desc->NodeMask > 1)
+      return E_INVALIDARG;
+
+    switch (desc->Type) {
+    case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
+      break;
+    default:
+      return E_INVALIDARG;
+    }
+
+    auto heap = d3d12::CreateDescriptorHeap(
+        static_cast<IMTLD3D12Device *>(this), desc);
+    return heap->QueryInterface(riid, descriptor_heap);
   }
 
   UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
-    return 1;
+    switch (descriptor_heap_type) {
+    case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
+      return sizeof(DescriptorRecord);
+    default:
+      return 0;
+    }
   }
 
   HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT node_mask, const void *bytecode,
@@ -356,27 +385,98 @@ public:
   }
 
   void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
-                                                  D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {}
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
+    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    if (!record)
+      return;
+    *record = {};
+    record->type = DescriptorRecordType::ConstantBufferView;
+    record->cpu_handle = descriptor;
+    if (desc) {
+      record->desc.cbv = *desc;
+      record->has_desc = true;
+    }
+  }
 
   void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource *resource,
                                                   const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
-                                                  D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {}
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
+    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    if (!record)
+      return;
+    *record = {};
+    record->type = DescriptorRecordType::ShaderResourceView;
+    record->cpu_handle = descriptor;
+    record->resource = resource;
+    if (desc) {
+      record->desc.srv = *desc;
+      record->has_desc = true;
+    }
+  }
 
   void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource *resource,
                                                    ID3D12Resource *counter_resource,
                                                    const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
-                                                   D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {}
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
+    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    if (!record)
+      return;
+    *record = {};
+    record->type = DescriptorRecordType::UnorderedAccessView;
+    record->cpu_handle = descriptor;
+    record->resource = resource;
+    record->counter_resource = counter_resource;
+    if (desc) {
+      record->desc.uav = *desc;
+      record->has_desc = true;
+    }
+  }
 
   void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource *resource,
                                                 const D3D12_RENDER_TARGET_VIEW_DESC *desc,
-                                                D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {}
+                                                D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
+    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    if (!record)
+      return;
+    *record = {};
+    record->type = DescriptorRecordType::RenderTargetView;
+    record->cpu_handle = descriptor;
+    record->resource = resource;
+    if (desc) {
+      record->desc.rtv = *desc;
+      record->has_desc = true;
+    }
+  }
 
   void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource *resource,
                                                 const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
-                                                D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {}
+                                                D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
+    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    if (!record)
+      return;
+    *record = {};
+    record->type = DescriptorRecordType::DepthStencilView;
+    record->cpu_handle = descriptor;
+    record->resource = resource;
+    if (desc) {
+      record->desc.dsv = *desc;
+      record->has_desc = true;
+    }
+  }
 
   void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC *desc,
-                                       D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {}
+                                       D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
+    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    if (!record)
+      return;
+    *record = {};
+    record->type = DescriptorRecordType::Sampler;
+    record->cpu_handle = descriptor;
+    if (desc) {
+      record->desc.sampler = *desc;
+      record->has_desc = true;
+    }
+  }
 
   void STDMETHODCALLTYPE CopyDescriptors(UINT dst_descriptor_range_count,
                                          const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_offsets,
@@ -384,12 +484,48 @@ public:
                                          UINT src_descriptor_range_count,
                                          const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_offsets,
                                          const UINT *src_descriptor_range_sizes,
-                                         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {}
+                                         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
+    UINT src_range = 0;
+    UINT src_index = 0;
+    for (UINT dst_range = 0; dst_range < dst_descriptor_range_count; dst_range++) {
+      const UINT dst_count = dst_descriptor_range_sizes
+                                 ? dst_descriptor_range_sizes[dst_range]
+                                 : 1;
+      auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(
+          dst_descriptor_range_offsets[dst_range]);
+      for (UINT i = 0; i < dst_count && dst; i++) {
+        while (src_range < src_descriptor_range_count) {
+          const UINT src_count = src_descriptor_range_sizes
+                                     ? src_descriptor_range_sizes[src_range]
+                                     : 1;
+          if (src_index < src_count)
+            break;
+          src_range++;
+          src_index = 0;
+        }
+        if (src_range >= src_descriptor_range_count)
+          return;
+
+        auto *src = d3d12::GetDescriptorRecordFromCpuHandle(
+            src_descriptor_range_offsets[src_range]);
+        if (src)
+          dst[i] = src[src_index];
+        src_index++;
+      }
+    }
+  }
 
   void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT descriptor_count,
                                                const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
                                                const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
-                                               D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {}
+                                               D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
+    auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(dst_descriptor_range_offset);
+    auto *src = d3d12::GetDescriptorRecordFromCpuHandle(src_descriptor_range_offset);
+    if (!dst || !src)
+      return;
+    for (UINT i = 0; i < descriptor_count; i++)
+      dst[i] = src[i];
+  }
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
   D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
@@ -512,11 +648,28 @@ public:
       *total_bytes = 0;
   }
 
-  HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *desc,
-                                            REFIID riid, void **heap) override {
-    InitReturnPtr(heap);
-    return E_NOTIMPL;
-  }
+    HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *desc,
+                                              REFIID riid, void **heap) override {
+      InitReturnPtr(heap);
+      if (!heap)
+        return E_POINTER;
+      if (!desc || desc->Count == 0 || desc->NodeMask > 1)
+        return E_INVALIDARG;
+
+      switch (desc->Type) {
+      case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
+      case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+      case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+      case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+        break;
+      default:
+        return E_INVALIDARG;
+      }
+
+      auto query_heap = d3d12::CreateQueryHeap(
+          static_cast<IMTLD3D12Device *>(this), desc);
+      return query_heap->QueryInterface(riid, heap);
+    }
 
   HRESULT STDMETHODCALLTYPE SetStablePowerState(WINBOOL enable) override {
     return S_OK;
