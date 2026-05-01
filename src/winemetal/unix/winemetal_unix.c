@@ -2444,21 +2444,24 @@ _MetalLayer_getEDRValue(void *obj) {
   value->maximum_edr_color_component_value = 1.0;
   value->maximum_potential_edr_color_component_value = 1.0;
 
-  if (![layer.delegate isKindOfClass:NSView.class])
+  if (!layer)
     return STATUS_SUCCESS;
 
-  NSView *view = (NSView *)layer.delegate;
-  if (!view.window)
-    return STATUS_SUCCESS;
+  execute_on_main(^{
+    if (![layer isKindOfClass:CAMetalLayer.class] ||
+        ![layer.delegate isKindOfClass:NSView.class])
+      return;
 
-  if (!view.window.screen)
-    return STATUS_SUCCESS;
+    NSView *view = (NSView *)layer.delegate;
+    if (!view.window || !view.window.screen)
+      return;
 
-  NSScreen *screen = view.window.screen;
-
-  value->maximum_edr_color_component_value =
-      layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
-  value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+    NSScreen *screen = view.window.screen;
+    value->maximum_edr_color_component_value =
+        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+    value->maximum_potential_edr_color_component_value =
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  });
 
   return STATUS_SUCCESS;
 }
@@ -2525,28 +2528,32 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
 
   params->version = 0;
-  if (![layer.delegate isKindOfClass:NSView.class])
+  params->edr_value.maximum_edr_color_component_value = 1.0;
+  params->edr_value.maximum_potential_edr_color_component_value = 1.0;
+  if (!layer)
     return STATUS_SUCCESS;
 
-  NSView *view = (NSView *)layer.delegate;
-  if (!view.window)
-    return STATUS_SUCCESS;
+  execute_on_main(^{
+    if (![layer isKindOfClass:CAMetalLayer.class] ||
+        ![layer.delegate isKindOfClass:NSView.class])
+      return;
 
-  if (!view.window.screen)
-    return STATUS_SUCCESS;
+    NSView *view = (NSView *)layer.delegate;
+    if (!view.window || !view.window.screen)
+      return;
 
-  NSScreen *screen = view.window.screen;
-  CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+    NSScreen *screen = view.window.screen;
+    CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
 
-  struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
-  *hdr_metadata_out = setting->hdr_metadata;
-  params->version = setting->version;
-  params->colorspace = setting->colorspace;
-  params->edr_value.maximum_edr_color_component_value =
-      layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
-  params->edr_value.maximum_potential_edr_color_component_value =
-      screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
-
+    struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
+    *hdr_metadata_out = setting->hdr_metadata;
+    params->version = setting->version;
+    params->colorspace = setting->colorspace;
+    params->edr_value.maximum_edr_color_component_value =
+        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+    params->edr_value.maximum_potential_edr_color_component_value =
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  });
   return STATUS_SUCCESS;
 }
 
