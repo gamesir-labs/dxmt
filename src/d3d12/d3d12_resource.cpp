@@ -203,6 +203,7 @@ private:
                                device_->GetDXMTDevice().device());
     buffer_allocation_ =
         buffer_->allocate(GetHeapBufferAllocationFlags(heap_properties_));
+    buffer_->rename(Rc<dxmt::BufferAllocation>(buffer_allocation_));
   }
 
   void CreateTexture2D() {
@@ -231,6 +232,7 @@ private:
       flags.set(dxmt::TextureAllocationFlag::CpuWriteCombined);
     }
     texture_allocation_ = texture_->allocate(flags);
+    texture_->rename(Rc<dxmt::TextureAllocation>(texture_allocation_));
   }
 
   Com<IMTLD3D12Device> device_;
