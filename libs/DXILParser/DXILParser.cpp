@@ -4093,6 +4093,16 @@ AppendReflectionResourceDef(ShaderReflectionInfo &info,
   info.resources.push_back(std::move(reflected));
 }
 
+uint32_t
+DxilMetadataResourceElementStride(const DxilMetadataResourceInfo &resource) {
+  for (const auto &tag : resource.tags) {
+    if (tag.tag == 1 && tag.has_uint_value)
+      return uint32_t(std::min<uint64_t>(
+          tag.uint_value, std::numeric_limits<uint32_t>::max()));
+  }
+  return 0;
+}
+
 void
 AppendReflectionMetadataResource(ShaderReflectionInfo &info,
                                  const DxilMetadataResourceInfo &resource) {
@@ -4100,6 +4110,7 @@ AppendReflectionMetadataResource(ShaderReflectionInfo &info,
   reflected.name = resource.name;
   reflected.resource_class = uint32_t(resource.resource_class);
   reflected.resource_kind = resource.kind;
+  reflected.element_stride = DxilMetadataResourceElementStride(resource);
   reflected.id = resource.id;
   reflected.space = resource.space;
   reflected.lower_bound = resource.lower_bound;
@@ -4316,6 +4327,7 @@ BuildTranslationResource(const ShaderReflectionResourceInfo &resource) {
   out.return_type = resource.return_type;
   out.dimension = resource.dimension;
   out.num_samples = resource.num_samples;
+  out.element_stride = resource.element_stride;
   out.flags = resource.flags;
   return out;
 }

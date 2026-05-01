@@ -692,6 +692,33 @@ TextureCoord(const dxil::DxilTranslationResourceInfo &resource,
                             floating, ctx);
 }
 
+bool
+IsStructuredBuffer(const dxil::DxilTranslationResourceInfo &resource) {
+  return resource.resource_kind == 12;
+}
+
+Value *
+BufferWordIndex(const dxil::DxilTranslationResourceInfo &resource,
+                const CallBase &call, uint32_t element_operand,
+                uint32_t offset_operand, DxilAirContext &ctx) {
+  auto *element = OperandValue(call, element_operand, ctx);
+  if (!element)
+    element = ctx.builder.getInt32(0);
+
+  auto *byte_offset = OperandValue(call, offset_operand, ctx);
+  if (!byte_offset)
+    byte_offset = ctx.builder.getInt32(0);
+
+  auto *word_offset = ctx.builder.CreateLShr(byte_offset, 2);
+  if (!IsStructuredBuffer(resource))
+    return ctx.builder.CreateAdd(element, word_offset);
+
+  const auto stride_words = std::max(1u, resource.element_stride >> 2);
+  return ctx.builder.CreateAdd(
+      ctx.builder.CreateMul(element, ctx.builder.getInt32(stride_words)),
+      word_offset);
+}
+
 llvm::AtomicRMWInst::BinOp
 AtomicOpFromDxil(uint32_t op) {
   switch (op) {
@@ -887,19 +914,14 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
   }
   if (name == "RawBufferLoad" || name == "BufferLoad") {
     auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    const auto *resource =
+        FindResource(ctx.translation, handle.resource_class, handle.range_id);
     auto *ptr = GetBufferPointer(handle,
                                  handle.resource_class == dxil::DxilTranslationResourceClass::Uav,
                                  ctx);
-    if (!ptr)
+    if (!ptr || !resource)
       return Unsupported("DXIL buffer load without resolved buffer handle");
-    auto *index = OperandValue(call, 2, ctx);
-    auto *byte_offset = name == "RawBufferLoad" ? OperandValue(call, 3, ctx)
-                                                : ctx.builder.getInt32(0);
-    auto *word_offset = ctx.builder.CreateLShr(byte_offset, 2);
-    auto *word_index = ctx.builder.CreateAdd(
-        ctx.builder.CreateMul(index ? index : ctx.builder.getInt32(0),
-                              ctx.builder.getInt32(1)),
-        word_offset);
+    auto *word_index = BufferWordIndex(*resource, call, 2, 3, ctx);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
     auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
     auto *load = ctx.builder.CreateLoad(pointee, gep);
@@ -909,24 +931,21 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
   }
   if (name == "RawBufferStore" || name == "BufferStore") {
     auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    const auto *resource =
+        FindResource(ctx.translation, handle.resource_class, handle.range_id);
     auto *ptr = GetBufferPointer(handle, true, ctx);
-    if (!ptr)
+    if (!ptr || !resource)
       return Unsupported("DXIL buffer store without resolved UAV handle");
-    auto *index = OperandValue(call, 2, ctx);
-    auto *byte_offset = name == "RawBufferStore" ? OperandValue(call, 3, ctx)
-                                                 : ctx.builder.getInt32(0);
     const uint32_t value_base = name == "RawBufferStore" ? 4 : 4;
     const uint32_t mask_index = name == "RawBufferStore" ? 8 : 8;
     const uint32_t mask = ConstantOperandU32(call, mask_index).value_or(0xfu);
-    auto *word_offset = ctx.builder.CreateLShr(byte_offset, 2);
+    auto *base_word_index = BufferWordIndex(*resource, call, 2, 3, ctx);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
     for (uint32_t i = 0; i < 4; i++) {
       if (!(mask & (1u << i)))
         continue;
-      auto *word_index = ctx.builder.CreateAdd(
-          ctx.builder.CreateAdd(index ? index : ctx.builder.getInt32(0),
-                                word_offset),
-          ctx.builder.getInt32(i));
+      auto *word_index =
+          ctx.builder.CreateAdd(base_word_index, ctx.builder.getInt32(i));
       auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
       ctx.builder.CreateStore(CastValue(OperandValue(call, value_base + i, ctx),
                                         pointee, ctx),
@@ -1399,7 +1418,7 @@ BuildShaderInfo(const dxil::DxilTranslationInfo &translation,
       srv.scaler_type = scaler;
       srv.read = resource.read;
       srv.sampled = resource.sampled;
-      srv.structure_stride = resource.flags;
+      srv.structure_stride = resource.element_stride;
       auto attr = GetArgumentIndex(SM50BindingType::SRV, range_id);
       if (resource_type != ResourceType::NonApplicable) {
         srv.arg_index = shader_info.binding_table.DefineTexture(
@@ -1425,7 +1444,7 @@ BuildShaderInfo(const dxil::DxilTranslationInfo &translation,
       uav.scaler_type = scaler;
       uav.read = resource.read;
       uav.written = resource.written;
-      uav.structure_stride = resource.flags;
+      uav.structure_stride = resource.element_stride;
       auto attr = GetArgumentIndex(SM50BindingType::UAV, range_id);
       const auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
                                                   : air::MemoryAccess::write)
