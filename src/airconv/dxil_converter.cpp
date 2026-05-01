@@ -31,11 +31,18 @@ public:
 MTL_SM50_SHADER_ARGUMENT_FLAG
 TextureArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
                      bool uav) {
-  auto flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
-      MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP |
-      MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+  auto flags = MTL_SM50_SHADER_ARGUMENT_FLAG(MTL_SM50_SHADER_ARGUMENT_TEXTURE);
 
-  switch (resource.dimension) {
+  if (resource.resource_kind == 10)
+    flags = MTL_SM50_SHADER_ARGUMENT_FLAG(flags |
+                                          MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+  else
+    flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
+        flags | MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
+
+  const uint32_t texture_kind =
+      resource.resource_kind ? resource.resource_kind : resource.dimension;
+  switch (texture_kind) {
   case 3:
   case 8:
     flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
@@ -67,8 +74,8 @@ TextureArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
     break;
   }
 
-  if (resource.dimension == 6 || resource.dimension == 7 ||
-      resource.dimension == 8 || resource.dimension == 9)
+  if (texture_kind == 6 || texture_kind == 7 || texture_kind == 8 ||
+      texture_kind == 9)
     flags =
         MTL_SM50_SHADER_ARGUMENT_FLAG(flags | MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
 
@@ -97,8 +104,25 @@ BufferArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
 }
 
 bool IsBufferResource(const dxmt::dxil::DxilTranslationResourceInfo &resource) {
-  return resource.resource_kind == 11 || resource.resource_kind == 12 ||
-         resource.dimension == 0;
+  switch (resource.resource_kind) {
+  case 1:
+  case 2:
+  case 3:
+  case 4:
+  case 5:
+  case 6:
+  case 7:
+  case 8:
+  case 9:
+  case 10:
+    return false;
+  case 11:
+  case 12:
+    return true;
+  default:
+    break;
+  }
+  return resource.dimension == 0 || resource.dimension == 1;
 }
 
 void
