@@ -1838,6 +1838,34 @@ thunk_SM50GetArgumentsInfo(void *args) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+thunk_DXILInitialize(void *args) {
+  struct sm50_initialize_params *params = args;
+
+  params->ret =
+      DXILInitialize(params->bytecode, params->bytecode_size, params->shader, params->reflection, params->error);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXILDestroy(void *args) {
+  struct sm50_destroy_params *params = args;
+
+  DXILDestroy(params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXILCompile(void *args) {
+  struct sm50_compile_params *params = args;
+
+  params->ret = DXILCompile(params->shader, params->args, params->func_name, params->bitcode, params->error);
+
+  return STATUS_SUCCESS;
+}
+
 static inline void *
 UInt32ToPtr(uint32_t v) {
   return (void *)(uint64_t)v;
@@ -2150,6 +2178,35 @@ thunk32_SM50GetArgumentsInfo(void *args) {
   struct sm50_get_arguments_info_params32 *params = args;
 
   SM50GetArgumentsInfo(params->shader, UInt32ToPtr(params->constant_buffers), UInt32ToPtr(params->arguments));
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXILInitialize(void *args) {
+  struct sm50_initialize_params32 *params = args;
+
+  params->ret = DXILInitialize(
+      UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader),
+      UInt32ToPtr(params->reflection), UInt32ToPtr(params->error)
+  );
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXILCompile(void *args) {
+  struct sm50_compile_params32 *params = args;
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
+  sm50_compilation_argument32_convert(&first_arg, args32);
+
+  params->ret = DXILCompile(
+      params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
+      UInt32ToPtr(params->error)
+  );
+
+  sm50_compilation_argument32_free(&first_arg);
 
   return STATUS_SUCCESS;
 }
@@ -3007,6 +3064,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandEncoder_setLabel,
     &_MTLDevice_setShouldMaximizeConcurrentCompilation,
     &thunk_SM50GetArgumentsInfo,
+    &thunk_DXILInitialize,
+    &thunk_DXILDestroy,
+    &thunk_DXILCompile,
     &_MTLCommandBuffer_error,
     &_MTLCommandBuffer_logs,
     &_MTLLogContainer_enumerate,
@@ -3143,6 +3203,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandEncoder_setLabel,
     &_MTLDevice_setShouldMaximizeConcurrentCompilation,
     &thunk32_SM50GetArgumentsInfo,
+    &thunk32_DXILInitialize,
+    &thunk_DXILDestroy,
+    &thunk32_DXILCompile,
     &_MTLCommandBuffer_error,
     &_MTLCommandBuffer_logs,
     &_MTLLogContainer_enumerate,

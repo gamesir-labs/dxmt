@@ -1,7 +1,13 @@
 #include "dxil_converter.hpp"
 
+#include "airconv_context.hpp"
+#include "airconv_error.hpp"
 #include "airconv_internal.hpp"
+#include "dxil_air_converter.hpp"
+#include "metallib_writer.hpp"
 
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstring>
@@ -26,16 +32,6 @@ DXILFail(sm50_error_t *ppError, const std::string &message) {
     *ppError = sm50_error_t(error.release());
   }
   return 1;
-}
-
-void
-InitializeEmptyReflection(MTL_SHADER_REFLECTION *pRefl) {
-  if (!pRefl)
-    return;
-
-  std::memset(pRefl, 0, sizeof(*pRefl));
-  pRefl->ConstanttBufferTableBindIndex = ~0u;
-  pRefl->ArgumentBufferBindIndex = ~0u;
 }
 
 } // namespace
@@ -66,7 +62,7 @@ DXILInitialize(const void *pBytecode, size_t BytecodeSize,
                                 dxmt::dxil::StatusName(status));
   }
 
-  InitializeEmptyReflection(pRefl);
+  dxmt::airconv::FillDxilReflection(shader->parser, pRefl);
   *ppShader = dxil_shader_t(shader.release());
   return 0;
 }
@@ -80,14 +76,41 @@ AIRCONV_API int
 DXILCompile(dxil_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
             const char *FunctionName, sm50_bitcode_t *ppBitcode,
             sm50_error_t *ppError) {
-  (void)pShader;
-  (void)pArgs;
-  (void)FunctionName;
   if (ppError)
     *ppError = nullptr;
   if (ppBitcode)
     *ppBitcode = nullptr;
-  return DXILFail(ppError, "DXIL to Metal translation is not implemented yet");
+
+  if (!pShader)
+    return DXILFail(ppError, "pShader can not be null");
+  if (!ppBitcode)
+    return DXILFail(ppError, "ppBitcode can not be null");
+
+  llvm::LLVMContext context;
+  context.setOpaquePointers(false);
+
+  auto module = std::make_unique<llvm::Module>("dxil.air", context);
+  dxmt::initializeModule(*module);
+
+  auto *shader = (DXILShaderInternal *)pShader;
+  if (auto err = dxmt::airconv::ConvertDxilToAir(
+          shader->parser, FunctionName, context, *module, pArgs)) {
+    std::string message;
+    llvm::raw_string_ostream stream(message);
+    llvm::handleAllErrors(std::move(err), [&](const dxmt::UnsupportedFeature &unsupported) {
+      stream << unsupported.msg;
+    });
+    return DXILFail(ppError, stream.str());
+  }
+
+  dxmt::runOptimizationPasses(*module);
+
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
+  llvm::raw_svector_ostream out(compiled->vec);
+  dxmt::metallib::MetallibWriter writer;
+  writer.Write(*module, out);
+  *ppBitcode = sm50_bitcode_t(compiled.release());
+  return 0;
 }
 
 namespace dxmt::airconv {
