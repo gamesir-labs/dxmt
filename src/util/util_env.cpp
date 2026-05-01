@@ -26,13 +26,27 @@ namespace dxmt::env {
 
 std::string getEnvVar(const char *name) {
 #ifdef _WIN32
-  std::vector<WCHAR> result;
-  result.resize(MAX_PATH + 1);
+  const auto wide_name = str::tows(name);
 
-  DWORD len = ::GetEnvironmentVariableW(str::tows(name).c_str(), result.data(),
-                                        MAX_PATH);
-  result.resize(len);
+  DWORD len = ::GetEnvironmentVariableW(wide_name.c_str(), nullptr, 0);
+  if (!len)
+    return "";
 
+  std::vector<WCHAR> result(len);
+  DWORD written = ::GetEnvironmentVariableW(wide_name.c_str(), result.data(), len);
+
+  if (!written)
+    return "";
+
+  if (written >= result.size()) {
+    result.resize(written);
+    written = ::GetEnvironmentVariableW(wide_name.c_str(), result.data(), result.size());
+
+    if (!written || written >= result.size())
+      return "";
+  }
+
+  result[written] = L'\0';
   return str::fromws(result.data());
 #else
   const char *result = std::getenv(name);
