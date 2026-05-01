@@ -13,6 +13,7 @@
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
+#include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -27,6 +28,16 @@ constexpr D3D_FEATURE_LEVEL kSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
 static UINT64
 Align(UINT64 value, UINT64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static UINT
+SubresourceMipSlice(UINT sub_resource, UINT mip_levels) {
+  return mip_levels ? sub_resource % mip_levels : 0;
+}
+
+static UINT64
+MipSize(UINT64 value, UINT mip_slice) {
+  return std::max<UINT64>(1, value >> mip_slice);
 }
 
 static bool
@@ -671,16 +682,9 @@ public:
                                                D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts,
                                                UINT *row_count, UINT64 *row_size,
                                                UINT64 *total_bytes) override {
-    if (row_count) {
-      for (UINT i = 0; i < sub_resource_count; i++)
-        row_count[i] = 0;
-    }
-    if (row_size) {
-      for (UINT i = 0; i < sub_resource_count; i++)
-        row_size[i] = 0;
-    }
-    if (total_bytes)
-      *total_bytes = 0;
+    GetCopyableFootprintsImpl(desc, first_sub_resource, sub_resource_count,
+                              base_offset, layouts, row_count, row_size,
+                              total_bytes);
   }
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *desc,
@@ -896,6 +900,87 @@ private:
       return false;
 
     return true;
+  }
+
+  void GetCopyableFootprintsImpl(
+      const D3D12_RESOURCE_DESC *desc, UINT first_sub_resource,
+      UINT sub_resource_count, UINT64 base_offset,
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts, UINT *row_count,
+      UINT64 *row_size, UINT64 *total_bytes) const {
+    UINT64 offset = base_offset;
+
+    if (!desc || sub_resource_count == 0) {
+      if (total_bytes)
+        *total_bytes = 0;
+      return;
+    }
+
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        FAILED(MTLQueryDXGIFormat(device_->device(), desc->Format, format))) {
+      if (total_bytes)
+        *total_bytes = 0;
+      return;
+    }
+
+    const UINT mip_levels = desc->MipLevels ? desc->MipLevels : 1;
+    for (UINT i = 0; i < sub_resource_count; i++) {
+      const UINT subresource = first_sub_resource + i;
+      D3D12_SUBRESOURCE_FOOTPRINT footprint = {};
+      UINT rows = 1;
+      UINT64 unpadded_row_size = desc->Width;
+      UINT64 subresource_size = desc->Width;
+
+      footprint.Format = desc->Format;
+
+      if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        footprint.Width = static_cast<UINT>(desc->Width);
+        footprint.Height = 1;
+        footprint.Depth = 1;
+        footprint.RowPitch =
+            static_cast<UINT>(Align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+      } else {
+        const UINT mip_slice = SubresourceMipSlice(subresource, mip_levels);
+        const UINT64 width = MipSize(desc->Width, mip_slice);
+        const UINT height = static_cast<UINT>(MipSize(desc->Height, mip_slice));
+        const UINT depth = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                               ? static_cast<UINT>(MipSize(desc->DepthOrArraySize, mip_slice))
+                               : 1;
+
+        footprint.Width = static_cast<UINT>(width);
+        footprint.Height = height;
+        footprint.Depth = depth;
+
+        if (format.Flag & MTL_DXGI_FORMAT_BC) {
+          const UINT block_width = static_cast<UINT>((width + 3) / 4);
+          const UINT block_height = (height + 3) / 4;
+          rows = std::max(1u, block_height);
+          unpadded_row_size = block_width * format.BlockSize;
+        } else {
+          rows = height;
+          unpadded_row_size = width * format.BytesPerTexel;
+        }
+
+        footprint.RowPitch = static_cast<UINT>(
+            Align(unpadded_row_size, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+        subresource_size = footprint.RowPitch * rows * depth;
+      }
+
+      offset = Align(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      if (layouts) {
+        layouts[i].Offset = offset;
+        layouts[i].Footprint = footprint;
+      }
+      if (row_count)
+        row_count[i] = rows;
+      if (row_size)
+        row_size[i] = unpadded_row_size;
+
+      offset += subresource_size;
+    }
+
+    if (total_bytes)
+      *total_bytes = offset - base_offset;
   }
 
   Com<IMTLDXGIAdapter> adapter_;
