@@ -871,6 +871,7 @@ struct ShaderReflectionResourceInfo {
   uint32_t return_type = 0;
   uint32_t dimension = 0;
   uint32_t num_samples = 0;
+  uint32_t element_stride = 0;
   uint32_t id = 0;
   uint32_t space = 0;
   uint32_t lower_bound = 0;
@@ -961,6 +962,7 @@ struct DxilTranslationResourceInfo {
   uint32_t return_type = 0;
   uint32_t dimension = 0;
   uint32_t num_samples = 0;
+  uint32_t element_stride = 0;
   uint32_t flags = 0;
   bool referenced_by_handle = false;
   bool read = false;
