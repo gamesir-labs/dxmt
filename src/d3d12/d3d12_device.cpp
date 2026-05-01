@@ -8,6 +8,7 @@
 #include "d3d12_command_queue.hpp"
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_fence.hpp"
+#include "d3d12_heap.hpp"
 #include "d3d12_pipeline.hpp"
 #include "d3d12_query.hpp"
 #include "d3d12_root_signature.hpp"
@@ -569,7 +570,14 @@ public:
   HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC *desc, REFIID riid,
                                        void **heap) override {
     InitReturnPtr(heap);
-    return E_NOTIMPL;
+    if (!heap)
+      return E_POINTER;
+    if (!IsValidHeapDesc(desc))
+      return E_INVALIDARG;
+
+    auto heap_object = d3d12::CreateHeap(static_cast<IMTLD3D12Device *>(this),
+                                         desc);
+    return heap_object->QueryInterface(riid, heap);
   }
 
   HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap *heap, UINT64 heap_offset,
@@ -737,6 +745,46 @@ private:
     properties.MemoryPoolPreference = IsCpuVisibleHeap(heap_type) ? D3D12_MEMORY_POOL_L0
                                                                   : D3D12_MEMORY_POOL_L1;
     return properties;
+  }
+
+  bool IsValidHeapDesc(const D3D12_HEAP_DESC *desc) const {
+    if (!desc || desc->SizeInBytes == 0 || desc->Alignment > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+      return false;
+    if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+        desc->Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+      return false;
+    if (desc->Properties.CreationNodeMask > 1 || desc->Properties.VisibleNodeMask > 1)
+      return false;
+    if (desc->Properties.Type == D3D12_HEAP_TYPE_CUSTOM) {
+      switch (desc->Properties.CPUPageProperty) {
+      case D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE:
+      case D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE:
+      case D3D12_CPU_PAGE_PROPERTY_WRITE_BACK:
+        break;
+      default:
+        return false;
+      }
+      switch (desc->Properties.MemoryPoolPreference) {
+      case D3D12_MEMORY_POOL_UNKNOWN:
+      case D3D12_MEMORY_POOL_L0:
+      case D3D12_MEMORY_POOL_L1:
+        break;
+      default:
+        return false;
+      }
+      return true;
+    }
+    if (desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
+        desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN)
+      return false;
+    switch (desc->Properties.Type) {
+    case D3D12_HEAP_TYPE_DEFAULT:
+    case D3D12_HEAP_TYPE_UPLOAD:
+    case D3D12_HEAP_TYPE_READBACK:
+      return true;
+    default:
+      return false;
+    }
   }
 
   Com<IMTLDXGIAdapter> adapter_;

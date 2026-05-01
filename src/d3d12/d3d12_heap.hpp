@@ -1,10 +1,28 @@
 #pragma once
 
 #include "d3d12_device.hpp"
+#include "dxmt_buffer.hpp"
+#include "rc/util_rc_ptr.hpp"
 #include <d3d12.h>
 
 namespace dxmt::d3d12 {
 
-class Heap;
+class Heap {
+public:
+  virtual ~Heap() = default;
+
+  virtual const D3D12_HEAP_DESC &GetHeapDesc() const = 0;
+  virtual D3D12_HEAP_TYPE GetHeapType() const = 0;
+  virtual bool IsCpuVisible() const = 0;
+  virtual dxmt::BufferAllocation *GetAllocation() const = 0;
+};
+
+Com<ID3D12Heap> CreateHeap(IMTLD3D12Device *device,
+                           const D3D12_HEAP_DESC *desc);
+
+D3D12_HEAP_TYPE GetHeapType(const D3D12_HEAP_PROPERTIES &properties);
+bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES &properties);
+Flags<dxmt::BufferAllocationFlag>
+GetHeapBufferAllocationFlags(const D3D12_HEAP_PROPERTIES &properties);
 
 } // namespace dxmt::d3d12
