@@ -960,6 +960,29 @@ ParseDxilMetadataSignatureElement(const llvm::MDNode *node) {
   }
   if (node->getNumOperands() > 1)
     info.semantic_name = MetadataString(node->getOperand(1).get());
+
+  if (node->getNumOperands() >= 11 &&
+      MetadataNode(node->getOperand(4).get())) {
+    if (auto component_type = MetadataUInt32(node->getOperand(2).get()))
+      info.component_type = *component_type;
+    if (auto semantic_kind = MetadataUInt32(node->getOperand(3).get()))
+      info.semantic_kind = *semantic_kind;
+    info.semantic_indices =
+        MetadataUInt32List(MetadataNode(node->getOperand(4).get()));
+    if (auto interpolation_mode = MetadataUInt32(node->getOperand(5).get()))
+      info.interpolation_mode = *interpolation_mode;
+    if (auto rows = MetadataUInt32(node->getOperand(6).get()))
+      info.rows = *rows;
+    if (auto cols = MetadataUInt32(node->getOperand(7).get()))
+      info.cols = *cols;
+    if (auto start_row = MetadataUInt32(node->getOperand(8).get()))
+      info.start_row = *start_row;
+    if (auto start_col = MetadataUInt32(node->getOperand(9).get()))
+      info.start_col = *start_col;
+    info.tags = ParseTrailingMetadataTags(node, 10);
+    return info;
+  }
+
   if (node->getNumOperands() > 2) {
     const auto *semantic_indices = MetadataNode(node->getOperand(2).get());
     if (semantic_indices)

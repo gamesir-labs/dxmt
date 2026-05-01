@@ -128,6 +128,19 @@ constexpr WMTLogicOperation kLogicOpMap[] = {
     WMTLogicOperationOrReverse,  WMTLogicOperationOrInverted,
 };
 
+WMTPixelFormat
+GetRenderTargetPixelFormat(WMT::Device device, DXGI_FORMAT format) {
+  if (format == DXGI_FORMAT_R8G8B8A8_UNORM)
+    return WMTPixelFormatBGRA8Unorm;
+  if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    return WMTPixelFormatBGRA8Unorm_sRGB;
+
+  MTL_DXGI_FORMAT_DESC desc = {};
+  if (FAILED(MTLQueryDXGIFormat(device, format, desc)))
+    return WMTPixelFormatInvalid;
+  return desc.PixelFormat;
+}
+
 class BlobImpl final : public ComObjectWithInitialRef<ID3DBlob> {
 public:
   explicit BlobImpl(std::vector<std::byte> &&data) : data_(std::move(data)) {}
@@ -840,10 +853,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (ps) {
     uint32_t unorm_output_reg_mask = 0;
     for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
-      MTL_DXGI_FORMAT_DESC format = {};
-      if (SUCCEEDED(MTLQueryDXGIFormat(device->GetMTLDevice(),
-                                       state.desc.RTVFormats[i], format)) &&
-          IsUnorm8RenderTargetFormat(format.PixelFormat))
+      const auto format = GetRenderTargetPixelFormat(device->GetMTLDevice(),
+                                                     state.desc.RTVFormats[i]);
+      if (IsUnorm8RenderTargetFormat(format))
         unorm_output_reg_mask |= 1u << i;
     }
 
@@ -875,11 +887,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
 
   for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
-    MTL_DXGI_FORMAT_DESC format = {};
-    if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN &&
-        SUCCEEDED(MTLQueryDXGIFormat(device->GetMTLDevice(),
-                                     state.desc.RTVFormats[i], format)))
-      info.colors[i].pixel_format = format.PixelFormat;
+    if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
+      info.colors[i].pixel_format = GetRenderTargetPixelFormat(
+          device->GetMTLDevice(), state.desc.RTVFormats[i]);
   }
   ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
 

@@ -55,6 +55,12 @@ WriteU32(std::vector<std::byte> &data, uint32_t value) {
 }
 
 void
+WriteU16(std::vector<std::byte> &data, uint16_t value) {
+  data.push_back(std::byte(value & 0xff));
+  data.push_back(std::byte((value >> 8) & 0xff));
+}
+
+void
 WriteF32(std::vector<std::byte> &data, float value) {
   uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
@@ -719,8 +725,8 @@ BuildDxbcContainer(std::span<const std::byte> rts0) {
   WriteU32(data, kDxbcFourCC);
   for (uint32_t i = 0; i < 4; i++)
     WriteU32(data, 0);
-  WriteU32(data, 1);
-  WriteU32(data, 0);
+  WriteU16(data, 1);
+  WriteU16(data, 0);
   WriteU32(data, container_size);
   WriteU32(data, part_count);
   WriteU32(data, part_offset);
