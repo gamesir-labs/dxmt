@@ -200,28 +200,34 @@ ToScalerDataType(uint32_t return_type) {
 shader::common::ResourceType
 ToResourceType(uint32_t resource_kind, uint32_t dimension) {
   switch (resource_kind) {
-  case 5:
-    return shader::common::ResourceType::Texture1D;
-  case 6:
-    return shader::common::ResourceType::Texture2D;
-  case 7:
-    return shader::common::ResourceType::Texture2DMultisampled;
-  case 8:
-    return shader::common::ResourceType::Texture3D;
-  case 9:
-    return shader::common::ResourceType::TextureCube;
-  case 10:
-    return shader::common::ResourceType::Texture1DArray;
-  case 11:
-    return shader::common::ResourceType::Texture2DArray;
-  case 12:
-    return shader::common::ResourceType::Texture2DMultisampledArray;
-  case 13:
-    return shader::common::ResourceType::TextureCubeArray;
   case 1:
+    return shader::common::ResourceType::Texture1D;
   case 2:
+    return shader::common::ResourceType::Texture2D;
   case 3:
+    return shader::common::ResourceType::Texture2DMultisampled;
   case 4:
+    return shader::common::ResourceType::Texture3D;
+  case 5:
+    return shader::common::ResourceType::TextureCube;
+  case 6:
+    return shader::common::ResourceType::Texture1DArray;
+  case 7:
+    return shader::common::ResourceType::Texture2DArray;
+  case 8:
+    return shader::common::ResourceType::Texture2DMultisampledArray;
+  case 9:
+    return shader::common::ResourceType::TextureCubeArray;
+  case 10:
+    return shader::common::ResourceType::TextureBuffer;
+  case 11:
+  case 12:
+  case 13:
+  case 14:
+  case 15:
+  case 16:
+  case 17:
+  case 18:
     return shader::common::ResourceType::NonApplicable;
   default:
     break;
