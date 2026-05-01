@@ -1,0 +1,1730 @@
+#include "dxil_air_converter.hpp"
+
+#include "air_signature.hpp"
+#include "air_type.hpp"
+#include "airconv_context.hpp"
+#include "airconv_error.hpp"
+#include "dxbc_converter.hpp"
+#include "metallib_writer.hpp"
+#include "nt/air_builder.hpp"
+#include "shader_common.hpp"
+
+#include "llvm/ADT/APFloat.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cctype>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace dxmt::airconv {
+namespace {
+
+using namespace llvm;
+
+enum class DxilStage {
+  Pixel = 0,
+  Vertex = 1,
+  Geometry = 2,
+  Hull = 3,
+  Domain = 4,
+  Compute = 5,
+};
+
+struct DxilResourceHandle {
+  dxil::DxilTranslationResourceClass resource_class =
+      dxil::DxilTranslationResourceClass::Unknown;
+  uint32_t range_id = 0;
+  Value *index = nullptr;
+  bool non_uniform = false;
+};
+
+struct DxilAirContext {
+  LLVMContext &llvm;
+  Module &module;
+  IRBuilder<> &builder;
+  llvm::air::AIRBuilder &air;
+  air::AirType &types;
+  const dxil::DxilTranslationInfo &translation;
+  const Function *source_function = nullptr;
+  Function *function = nullptr;
+
+  std::unordered_map<const Value *, Value *> values;
+  std::unordered_map<const BasicBlock *, BasicBlock *> blocks;
+  std::unordered_map<const Value *, DxilResourceHandle> handles;
+  std::map<uint32_t, uint32_t> input_args;
+  std::map<uint32_t, uint32_t> output_indices;
+  std::map<uint32_t, const dxil::DxilTranslationSignatureElementInfo *> inputs;
+  std::map<uint32_t, const dxil::DxilTranslationSignatureElementInfo *> outputs;
+  dxbc::ShaderInfo shader_info;
+  dxbc::io_binding_map resources;
+  AllocaInst *return_value = nullptr;
+};
+
+llvm::Error
+Unsupported(std::string message) {
+  return llvm::make_error<UnsupportedFeature>(message);
+}
+
+const char *
+StageName(uint32_t kind) {
+  switch (kind) {
+  case uint32_t(DxilStage::Vertex):
+    return "vertex";
+  case uint32_t(DxilStage::Pixel):
+    return "pixel";
+  case uint32_t(DxilStage::Compute):
+    return "compute";
+  case uint32_t(DxilStage::Hull):
+    return "hull";
+  case uint32_t(DxilStage::Domain):
+    return "domain";
+  case uint32_t(DxilStage::Geometry):
+    return "geometry";
+  default:
+    return "unknown";
+  }
+}
+
+std::string
+Lower(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value)
+    out.push_back(char(std::tolower(static_cast<unsigned char>(ch))));
+  return out;
+}
+
+std::string
+SemanticUserName(const dxil::DxilTranslationSignatureElementInfo &sig) {
+  if (!sig.semantic_key.empty())
+    return Lower(sig.semantic_key);
+  if (!sig.semantic_name.empty())
+    return Lower(sig.semantic_name) + std::to_string(sig.semantic_index);
+  return "sig" + std::to_string(sig.element_id);
+}
+
+uint32_t
+SignatureMask(const dxil::DxilTranslationSignatureElementInfo &sig) {
+  if (sig.component_mask)
+    return sig.component_mask;
+  if (sig.component_count)
+    return ((1u << sig.component_count) - 1u) << sig.component_start;
+  if (sig.cols)
+    return (1u << std::min<uint8_t>(sig.cols, 4u)) - 1u;
+  return 0xfu;
+}
+
+air::InputAttributeComponentType
+ToAirInputComponent(uint32_t type) {
+  switch (type) {
+  case 1:
+    return air::InputAttributeComponentType::Uint;
+  case 2:
+    return air::InputAttributeComponentType::Int;
+  case 3:
+    return air::InputAttributeComponentType::Float;
+  default:
+    return air::InputAttributeComponentType::Unknown;
+  }
+}
+
+air::MSLScalerOrVectorType
+ToAirSignatureType(uint32_t component_type, uint32_t mask) {
+  const auto components = std::max(1u, std::min(4u, uint32_t(std::popcount(mask & 0xfu))));
+  const bool is_int = component_type == 1 || component_type == 2;
+  const bool is_signed = component_type == 2;
+  if (components == 1)
+    return is_int ? (is_signed ? air::MSLScalerOrVectorType(air::msl_int)
+                               : air::MSLScalerOrVectorType(air::msl_uint))
+                  : air::MSLScalerOrVectorType(air::msl_float);
+  air::MSLScalerType scalar =
+      is_int ? (is_signed ? air::MSLScalerType(air::msl_int)
+                          : air::MSLScalerType(air::msl_uint))
+             : air::MSLScalerType(air::msl_float);
+  return air::MSLVector{components, scalar};
+}
+
+air::Interpolation
+ToAirInterpolation(uint32_t mode) {
+  switch (mode) {
+  case 1:
+    return air::Interpolation::flat;
+  case 3:
+    return air::Interpolation::center_no_perspective;
+  case 4:
+    return air::Interpolation::centroid_perspective;
+  case 5:
+    return air::Interpolation::centroid_no_perspective;
+  case 6:
+    return air::Interpolation::sample_perspective;
+  case 7:
+    return air::Interpolation::sample_no_perspective;
+  case 2:
+  default:
+    return air::Interpolation::center_perspective;
+  }
+}
+
+shader::common::ScalerDataType
+ToScalerDataType(uint32_t return_type) {
+  switch (return_type) {
+  case 2:
+    return shader::common::ScalerDataType::Uint;
+  case 3:
+    return shader::common::ScalerDataType::Int;
+  default:
+    return shader::common::ScalerDataType::Float;
+  }
+}
+
+shader::common::ResourceType
+ToResourceType(uint32_t resource_kind, uint32_t dimension) {
+  switch (resource_kind) {
+  case 5:
+    return shader::common::ResourceType::Texture1D;
+  case 6:
+    return shader::common::ResourceType::Texture2D;
+  case 7:
+    return shader::common::ResourceType::Texture2DMultisampled;
+  case 8:
+    return shader::common::ResourceType::Texture3D;
+  case 9:
+    return shader::common::ResourceType::TextureCube;
+  case 10:
+    return shader::common::ResourceType::Texture1DArray;
+  case 11:
+    return shader::common::ResourceType::Texture2DArray;
+  case 12:
+    return shader::common::ResourceType::Texture2DMultisampledArray;
+  case 13:
+    return shader::common::ResourceType::TextureCubeArray;
+  case 1:
+  case 2:
+  case 3:
+  case 4:
+    return shader::common::ResourceType::NonApplicable;
+  default:
+    break;
+  }
+
+  switch (dimension) {
+  case 1:
+    return shader::common::ResourceType::TextureBuffer;
+  case 2:
+    return shader::common::ResourceType::Texture1D;
+  case 3:
+    return shader::common::ResourceType::Texture2D;
+  case 4:
+    return shader::common::ResourceType::Texture2DMultisampled;
+  case 5:
+    return shader::common::ResourceType::Texture3D;
+  case 6:
+    return shader::common::ResourceType::TextureCube;
+  case 7:
+    return shader::common::ResourceType::Texture1DArray;
+  case 8:
+    return shader::common::ResourceType::Texture2DArray;
+  case 9:
+    return shader::common::ResourceType::Texture2DMultisampledArray;
+  case 10:
+    return shader::common::ResourceType::TextureCubeArray;
+  default:
+    return shader::common::ResourceType::NonApplicable;
+  }
+}
+
+bool
+IsSystemSemantic(const dxil::DxilTranslationSignatureElementInfo &sig,
+                 std::string_view name) {
+  return Lower(sig.semantic_key) == Lower(name) ||
+         Lower(sig.semantic_name) == Lower(name);
+}
+
+Type *
+MapType(Type *source, DxilAirContext &ctx);
+
+Value *
+MapConstant(const Constant *constant, DxilAirContext &ctx) {
+  if (const auto *integer = dyn_cast<ConstantInt>(constant))
+    return ConstantInt::get(MapType(integer->getType(), ctx),
+                            integer->getValue());
+  if (const auto *fp = dyn_cast<ConstantFP>(constant))
+    return ConstantFP::get(MapType(fp->getType(), ctx), fp->getValueAPF());
+  if (isa<UndefValue>(constant))
+    return UndefValue::get(MapType(constant->getType(), ctx));
+  if (const auto *aggregate = dyn_cast<ConstantAggregateZero>(constant))
+    return ConstantAggregateZero::get(MapType(aggregate->getType(), ctx));
+  if (const auto *vector = dyn_cast<ConstantDataVector>(constant)) {
+    std::vector<Constant *> elements;
+    for (uint32_t i = 0; i < vector->getNumElements(); i++)
+      elements.push_back(cast<Constant>(MapConstant(vector->getElementAsConstant(i), ctx)));
+    return ConstantVector::get(elements);
+  }
+  if (const auto *constant_vector = dyn_cast<ConstantVector>(constant)) {
+    std::vector<Constant *> elements;
+    for (uint32_t i = 0; i < constant_vector->getNumOperands(); i++)
+      elements.push_back(cast<Constant>(MapConstant(constant_vector->getOperand(i), ctx)));
+    return ConstantVector::get(elements);
+  }
+  if (const auto *constant_expr = dyn_cast<ConstantExpr>(constant)) {
+    if (constant_expr->isCast())
+    return ctx.builder.CreateCast(
+          static_cast<Instruction::CastOps>(constant_expr->getOpcode()),
+          MapConstant(constant_expr->getOperand(0), ctx),
+          MapType(constant_expr->getType(), ctx));
+  }
+  return UndefValue::get(MapType(constant->getType(), ctx));
+}
+
+Type *
+MapType(Type *source, DxilAirContext &ctx) {
+  if (source->isVoidTy())
+    return Type::getVoidTy(ctx.llvm);
+  if (source->isIntegerTy())
+    return IntegerType::get(ctx.llvm, source->getIntegerBitWidth());
+  if (source->isHalfTy())
+    return Type::getHalfTy(ctx.llvm);
+  if (source->isFloatTy())
+    return Type::getFloatTy(ctx.llvm);
+  if (source->isDoubleTy())
+    return Type::getDoubleTy(ctx.llvm);
+  if (const auto *vector = dyn_cast<FixedVectorType>(source))
+    return FixedVectorType::get(MapType(vector->getElementType(), ctx),
+                                vector->getNumElements());
+  if (const auto *array = dyn_cast<ArrayType>(source))
+    return ArrayType::get(MapType(array->getElementType(), ctx),
+                          array->getNumElements());
+  if (const auto *structure = dyn_cast<StructType>(source)) {
+    if (structure->isOpaque())
+      return StructType::create(ctx.llvm, structure->getName());
+    std::vector<Type *> elements;
+    for (auto *element : structure->elements())
+      elements.push_back(MapType(element, ctx));
+    return StructType::get(ctx.llvm, elements, structure->isPacked());
+  }
+  if (const auto *pointer = dyn_cast<PointerType>(source)) {
+    if (pointer->isOpaque())
+      return PointerType::get(ctx.llvm, pointer->getAddressSpace());
+    return MapType(pointer->getNonOpaquePointerElementType(), ctx)
+        ->getPointerTo(pointer->getAddressSpace());
+  }
+  return Type::getVoidTy(ctx.llvm);
+}
+
+Value *
+ZeroValue(Type *type) {
+  if (type->isVoidTy())
+    return nullptr;
+  return Constant::getNullValue(type);
+}
+
+Value *
+MapValue(const Value *source, DxilAirContext &ctx) {
+  if (!source)
+    return nullptr;
+  if (const auto *constant = dyn_cast<Constant>(source))
+    return MapConstant(constant, ctx);
+  auto found = ctx.values.find(source);
+  if (found != ctx.values.end())
+    return found->second;
+  return UndefValue::get(MapType(source->getType(), ctx));
+}
+
+Value *
+CastValue(Value *value, Type *type, DxilAirContext &ctx) {
+  if (!value || value->getType() == type)
+    return value;
+  if (value->getType()->isPointerTy() && type->isPointerTy())
+    return ctx.builder.CreatePointerCast(value, type);
+  if (value->getType()->isIntegerTy() && type->isIntegerTy())
+    return ctx.builder.CreateZExtOrTrunc(value, type);
+  if (value->getType()->isFloatingPointTy() && type->isFloatingPointTy())
+    return ctx.builder.CreateFPCast(value, type);
+  if (value->getType()->isIntegerTy() && type->isFloatingPointTy())
+    return ctx.builder.CreateUIToFP(value, type);
+  if (value->getType()->isFloatingPointTy() && type->isIntegerTy())
+    return ctx.builder.CreateFPToUI(value, type);
+  if (value->getType()->isVectorTy() && type->isVectorTy())
+    return ctx.builder.CreateBitCast(value, type);
+  return ctx.builder.CreateBitCast(value, type);
+}
+
+dxil::DxilTranslationResourceClass
+DxilResourceClassFromOperand(uint32_t value) {
+  switch (value) {
+  case 0:
+    return dxil::DxilTranslationResourceClass::Srv;
+  case 1:
+    return dxil::DxilTranslationResourceClass::Uav;
+  case 2:
+    return dxil::DxilTranslationResourceClass::Cbv;
+  case 3:
+    return dxil::DxilTranslationResourceClass::Sampler;
+  default:
+    return dxil::DxilTranslationResourceClass::Unknown;
+  }
+}
+
+Value *
+SplatOrExtract(Value *value, uint32_t component, DxilAirContext &ctx) {
+  if (!value)
+    return nullptr;
+  if (auto *vector = dyn_cast<FixedVectorType>(value->getType())) {
+    const auto index = std::min<uint32_t>(component, vector->getNumElements() - 1);
+    return ctx.builder.CreateExtractElement(value, index);
+  }
+  return value;
+}
+
+Value *
+BuildVector4(std::array<Value *, 4> values, DxilAirContext &ctx) {
+  Type *element_type = nullptr;
+  for (auto *value : values) {
+    if (value) {
+      element_type = value->getType();
+      break;
+    }
+  }
+  if (!element_type)
+    element_type = ctx.types._int;
+  Value *out = UndefValue::get(FixedVectorType::get(element_type, 4));
+  for (uint32_t i = 0; i < 4; i++) {
+    auto *value = values[i] ? CastValue(values[i], element_type, ctx)
+                            : Constant::getNullValue(element_type);
+    out = ctx.builder.CreateInsertElement(out, value, i);
+  }
+  return out;
+}
+
+Value *
+BitcastOrCastValue(Value *value, Type *type, DxilAirContext &ctx) {
+  if (!value || value->getType() == type)
+    return value;
+  if ((value->getType()->isIntegerTy() && type->isFloatingPointTy() &&
+       value->getType()->getIntegerBitWidth() ==
+           type->getPrimitiveSizeInBits()) ||
+      (value->getType()->isFloatingPointTy() && type->isIntegerTy() &&
+       value->getType()->getPrimitiveSizeInBits() ==
+           type->getIntegerBitWidth()))
+    return ctx.builder.CreateBitCast(value, type);
+  return CastValue(value, type, ctx);
+}
+
+Value *
+PackDxilReturn(const CallBase &call, Value *value, DxilAirContext &ctx,
+               Value *status = nullptr) {
+  auto *return_type = MapType(call.getType(), ctx);
+  if (return_type->isVoidTy())
+    return nullptr;
+  if (!value)
+    return ZeroValue(return_type);
+  if (return_type == value->getType())
+    return value;
+  if (auto *structure = dyn_cast<StructType>(return_type)) {
+    Value *out = UndefValue::get(structure);
+    const uint32_t elements = structure->getNumElements();
+    if (auto *vector = dyn_cast<FixedVectorType>(value->getType())) {
+      for (uint32_t i = 0; i < std::min<uint32_t>(elements, vector->getNumElements()); i++) {
+        auto *component = ctx.builder.CreateExtractElement(value, i);
+        out = ctx.builder.CreateInsertValue(
+            out, BitcastOrCastValue(component, structure->getElementType(i), ctx), i);
+      }
+    } else {
+      out = ctx.builder.CreateInsertValue(
+          out, BitcastOrCastValue(value, structure->getElementType(0), ctx), 0);
+    }
+    if (status && elements > 4)
+      out = ctx.builder.CreateInsertValue(
+          out, CastValue(status, structure->getElementType(4), ctx), 4);
+    return out;
+  }
+  return CastValue(value, return_type, ctx);
+}
+
+std::optional<uint32_t>
+ConstantOperandU32(const CallBase &call, uint32_t index) {
+  if (index >= call.arg_size())
+    return std::nullopt;
+  if (const auto *integer = dyn_cast<ConstantInt>(call.getArgOperand(index)))
+    return uint32_t(integer->getZExtValue());
+  return std::nullopt;
+}
+
+Value *
+OperandValue(const CallBase &call, uint32_t index, DxilAirContext &ctx) {
+  if (index >= call.arg_size())
+    return nullptr;
+  return MapValue(call.getArgOperand(index), ctx);
+}
+
+const dxil::DxilTranslationResourceInfo *
+FindResource(const dxil::DxilTranslationInfo &translation,
+             dxil::DxilTranslationResourceClass resource_class,
+             uint32_t id) {
+  auto found = std::find_if(
+      translation.resources.begin(), translation.resources.end(),
+      [&](const dxil::DxilTranslationResourceInfo &resource) {
+        return resource.resource_class == resource_class && resource.id == id;
+      });
+  return found == translation.resources.end() ? nullptr : &*found;
+}
+
+DxilResourceHandle
+ResolveHandle(const Value *value, DxilAirContext &ctx) {
+  if (!value)
+    return {};
+  auto found = ctx.handles.find(value);
+  if (found != ctx.handles.end())
+    return found->second;
+  return {};
+}
+
+std::string
+DxilCallName(const CallBase &call) {
+  if (auto opcode = ConstantOperandU32(call, 0))
+    return dxil::DxilOpcodeName(*opcode);
+
+  auto *called = call.getCalledFunction();
+  if (!called || !called->getName().startswith("dx.op."))
+    return {};
+
+  std::string name = called->getName().str().substr(strlen("dx.op."));
+  if (auto dot = name.find('.'); dot != std::string::npos)
+    name = name.substr(0, dot);
+  if (!name.empty())
+    name[0] = char(std::toupper(static_cast<unsigned char>(name[0])));
+  return name;
+}
+
+llvm::air::Texture
+BuildTexture(const dxil::DxilTranslationResourceInfo &resource,
+             air::MemoryAccess access) {
+  auto resource_type = ToResourceType(resource.resource_kind, resource.dimension);
+  auto texture_kind = air::to_air_resource_type(resource_type);
+  auto scaler = ToScalerDataType(resource.return_type);
+  llvm::air::Texture::SampleType sample_type = llvm::air::Texture::sample_float;
+  if (scaler == shader::common::ScalerDataType::Uint)
+    sample_type = llvm::air::Texture::sample_uint;
+  else if (scaler == shader::common::ScalerDataType::Int)
+    sample_type = llvm::air::Texture::sample_int;
+  llvm::air::Texture::MemoryAccess memory_access = llvm::air::Texture::access_read;
+  if (access == air::MemoryAccess::sample)
+    memory_access = llvm::air::Texture::access_sample;
+  else if (access == air::MemoryAccess::write)
+    memory_access = llvm::air::Texture::access_write;
+  else if (access == air::MemoryAccess::read_write)
+    memory_access = llvm::air::Texture::acesss_readwrite;
+  return {
+      .kind = texture_kind,
+      .sample_type = sample_type,
+      .memory_access = memory_access,
+  };
+}
+
+Value *
+GetResourceIndex(const DxilResourceHandle &handle, DxilAirContext &ctx) {
+  return handle.index ? handle.index : ctx.builder.getInt32(0);
+}
+
+Value *
+GetCBufferPointer(const DxilResourceHandle &handle, DxilAirContext &ctx) {
+  auto range = ctx.resources.cb_range_map.find(handle.range_id);
+  if (range == ctx.resources.cb_range_map.end())
+    return nullptr;
+  return range->second(GetResourceIndex(handle, ctx)).build(
+      dxbc::context{ctx.builder, ctx.air, ctx.llvm, ctx.module, ctx.function,
+                    ctx.resources, ctx.types, 0xffffffff,
+                    microsoft::D3D10_SB_PIXEL_SHADER, SM50_SHADER_METAL_310})
+      .get();
+}
+
+Value *
+GetBufferPointer(const DxilResourceHandle &handle, bool uav, DxilAirContext &ctx) {
+  auto &map = uav ? ctx.resources.uav_buf_range_map : ctx.resources.srv_buf_range_map;
+  auto range = map.find(handle.range_id);
+  if (range == map.end())
+    return nullptr;
+  return range->second.resource_id(GetResourceIndex(handle, ctx))
+      .build(dxbc::context{ctx.builder, ctx.air, ctx.llvm, ctx.module,
+                           ctx.function, ctx.resources, ctx.types, 0xffffffff,
+                           microsoft::D3D10_SB_PIXEL_SHADER,
+                           SM50_SHADER_METAL_310})
+      .get();
+}
+
+std::pair<Value *, const dxil::DxilTranslationResourceInfo *>
+GetTextureHandle(const DxilResourceHandle &handle, DxilAirContext &ctx) {
+  const auto *resource =
+      FindResource(ctx.translation, handle.resource_class, handle.range_id);
+  if (!resource)
+    return {nullptr, nullptr};
+  auto &map = handle.resource_class == dxil::DxilTranslationResourceClass::Uav
+                  ? ctx.resources.uav_range_map
+                  : ctx.resources.srv_range_map;
+  auto range = map.find(handle.range_id);
+  if (range == map.end())
+    return {nullptr, resource};
+  return {range->second.resource_id(GetResourceIndex(handle, ctx))
+              .build(dxbc::context{ctx.builder, ctx.air, ctx.llvm, ctx.module,
+                                   ctx.function, ctx.resources, ctx.types,
+                                   0xffffffff, microsoft::D3D10_SB_PIXEL_SHADER,
+                                   SM50_SHADER_METAL_310})
+              .get(),
+          resource};
+}
+
+Value *
+GetSamplerHandle(const DxilResourceHandle &handle, DxilAirContext &ctx) {
+  auto range = ctx.resources.sampler_range_map.find(handle.range_id);
+  if (range == ctx.resources.sampler_range_map.end())
+    return nullptr;
+  return range->second.handle(GetResourceIndex(handle, ctx))
+      .build(dxbc::context{ctx.builder, ctx.air, ctx.llvm, ctx.module,
+                           ctx.function, ctx.resources, ctx.types, 0xffffffff,
+                           microsoft::D3D10_SB_PIXEL_SHADER,
+                           SM50_SHADER_METAL_310})
+      .get();
+}
+
+Value *
+ComponentFromOperand(const CallBase &call, uint32_t index, DxilAirContext &ctx) {
+  auto *value = OperandValue(call, index, ctx);
+  return value ? value : ctx.builder.getInt32(0);
+}
+
+Value *
+VectorFromOperands(const CallBase &call, uint32_t first, uint32_t count,
+                   bool floating, DxilAirContext &ctx) {
+  std::array<Value *, 4> values = {};
+  for (uint32_t i = 0; i < count; i++) {
+    values[i] = ComponentFromOperand(call, first + i, ctx);
+    if (floating && values[i]->getType()->isIntegerTy())
+      values[i] = ctx.builder.CreateUIToFP(values[i], ctx.types._float);
+  }
+  auto *vec4 = BuildVector4(values, ctx);
+  if (count == 1)
+    return ctx.builder.CreateExtractElement(vec4, uint64_t(0));
+  SmallVector<int, 3> mask;
+  for (uint32_t i = 0; i < count; i++)
+    mask.push_back(int(i));
+  return ctx.builder.CreateShuffleVector(vec4, mask);
+}
+
+uint32_t
+TextureCoordinateCount(const dxil::DxilTranslationResourceInfo &resource) {
+  auto type = ToResourceType(resource.resource_kind, resource.dimension);
+  switch (type) {
+  case shader::common::ResourceType::Texture1D:
+  case shader::common::ResourceType::Texture1DArray:
+  case shader::common::ResourceType::TextureBuffer:
+    return 1;
+  case shader::common::ResourceType::Texture2D:
+  case shader::common::ResourceType::Texture2DArray:
+  case shader::common::ResourceType::Texture2DMultisampled:
+  case shader::common::ResourceType::Texture2DMultisampledArray:
+    return 2;
+  case shader::common::ResourceType::Texture3D:
+  case shader::common::ResourceType::TextureCube:
+  case shader::common::ResourceType::TextureCubeArray:
+    return 3;
+  default:
+    return 3;
+  }
+}
+
+Value *
+TextureArrayIndex(const dxil::DxilTranslationResourceInfo &resource,
+                  const CallBase &call, uint32_t first, bool floating,
+                  DxilAirContext &ctx) {
+  auto type = ToResourceType(resource.resource_kind, resource.dimension);
+  uint32_t operand = 0;
+  switch (type) {
+  case shader::common::ResourceType::Texture1DArray:
+    operand = first + 1;
+    break;
+  case shader::common::ResourceType::Texture2DArray:
+  case shader::common::ResourceType::Texture2DMultisampledArray:
+    operand = first + 2;
+    break;
+  case shader::common::ResourceType::TextureCubeArray:
+    operand = first + 3;
+    break;
+  default:
+    return nullptr;
+  }
+  auto *value = ComponentFromOperand(call, operand, ctx);
+  if (floating && value->getType()->isFloatingPointTy())
+    return ctx.builder.CreateFPToUI(value, ctx.types._int);
+  return CastValue(value, ctx.types._int, ctx);
+}
+
+Value *
+TextureCoord(const dxil::DxilTranslationResourceInfo &resource,
+             const CallBase &call, uint32_t first, bool floating,
+             DxilAirContext &ctx) {
+  return VectorFromOperands(call, first, TextureCoordinateCount(resource),
+                            floating, ctx);
+}
+
+llvm::AtomicRMWInst::BinOp
+AtomicOpFromDxil(uint32_t op) {
+  switch (op) {
+  case 0:
+    return llvm::AtomicRMWInst::Xchg;
+  case 1:
+    return llvm::AtomicRMWInst::Add;
+  case 2:
+    return llvm::AtomicRMWInst::And;
+  case 3:
+    return llvm::AtomicRMWInst::Or;
+  case 4:
+    return llvm::AtomicRMWInst::Xor;
+  case 5:
+    return llvm::AtomicRMWInst::Min;
+  case 6:
+    return llvm::AtomicRMWInst::Max;
+  case 7:
+    return llvm::AtomicRMWInst::UMin;
+  case 8:
+    return llvm::AtomicRMWInst::UMax;
+  default:
+    return llvm::AtomicRMWInst::Add;
+  }
+}
+
+Value *
+LoadSignatureInput(const CallBase &call, DxilAirContext &ctx) {
+  const auto element_id = ConstantOperandU32(call, 1).value_or(0);
+  const auto column = ConstantOperandU32(call, 3).value_or(0);
+  auto arg = ctx.input_args.find(element_id);
+  if (arg == ctx.input_args.end())
+    return UndefValue::get(MapType(call.getType(), ctx));
+  return SplatOrExtract(ctx.function->getArg(arg->second), column, ctx);
+}
+
+Value *
+StoreSignatureOutput(const CallBase &call, Value *current_return,
+                     DxilAirContext &ctx) {
+  const auto element_id = ConstantOperandU32(call, 1).value_or(0);
+  const auto column = ConstantOperandU32(call, 3).value_or(0);
+  auto out = ctx.output_indices.find(element_id);
+  if (out == ctx.output_indices.end())
+    return current_return;
+  auto *value = OperandValue(call, 4, ctx);
+  auto *return_type = ctx.function->getReturnType();
+  if (!value || return_type->isVoidTy())
+    return current_return;
+  auto *field_type = return_type->getStructElementType(out->second);
+  if (auto *field_vector = dyn_cast<FixedVectorType>(field_type)) {
+    auto *field = ctx.builder.CreateExtractValue(current_return, out->second);
+    value = CastValue(value, field_vector->getElementType(), ctx);
+    field = ctx.builder.CreateInsertElement(field, value, column);
+    return ctx.builder.CreateInsertValue(current_return, field, out->second);
+  }
+  value = CastValue(value, field_type, ctx);
+  return ctx.builder.CreateInsertValue(current_return, value, out->second);
+}
+
+Value *
+BuildSystemValue(const CallBase &call, std::string_view name, DxilAirContext &ctx) {
+  const auto component = ConstantOperandU32(call, 1).value_or(0);
+  Value *source = nullptr;
+  if (name == "ThreadId") {
+    auto idx = ctx.input_args[0xff00u];
+    source = ctx.function->getArg(idx);
+  } else if (name == "GroupId") {
+    auto idx = ctx.input_args[0xff01u];
+    source = ctx.function->getArg(idx);
+  } else if (name == "ThreadIdInGroup") {
+    auto idx = ctx.input_args[0xff02u];
+    source = ctx.function->getArg(idx);
+  } else if (name == "FlattenedThreadIdInGroup") {
+    auto idx = ctx.input_args[0xff03u];
+    source = ctx.function->getArg(idx);
+  } else {
+    return ZeroValue(MapType(call.getType(), ctx));
+  }
+  return SplatOrExtract(source, component, ctx);
+}
+
+Value *
+BuildDxilMath(const CallBase &call, std::string_view name, DxilAirContext &ctx) {
+  auto *a = OperandValue(call, 1, ctx);
+  auto *b = OperandValue(call, 2, ctx);
+  auto *c = OperandValue(call, 3, ctx);
+  if (name == "FAbs")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, a);
+  if (name == "Sqrt")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::sqrt, a);
+  if (name == "Rsqrt")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::rsqrt, a);
+  if (name == "Sin")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::sin, a);
+  if (name == "Cos")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::cos, a);
+  if (name == "Exp")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, a);
+  if (name == "Log")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::log2, a);
+  if (name == "Frc")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::fract, a);
+  if (name == "Round_ne")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::rint, a);
+  if (name == "Round_ni")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::floor, a);
+  if (name == "Round_pi")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::ceil, a);
+  if (name == "Round_z")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::trunc, a);
+  if (name == "IsNaN")
+    return ctx.builder.CreateSExt(ctx.air.CreateIsNaN(a), MapType(call.getType(), ctx));
+  if (name == "Bfrev")
+    return ctx.air.CreateIntUnOp(llvm::air::AIRBuilder::reverse_bits, a);
+  if (name == "Countbits")
+    return ctx.air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, a);
+  if (name == "FMax")
+    return ctx.air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, a, b);
+  if (name == "FMin")
+    return ctx.air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, a, b);
+  if (name == "IMax")
+    return ctx.air.CreateIntBinOp(llvm::air::AIRBuilder::max, a, b, true);
+  if (name == "IMin")
+    return ctx.air.CreateIntBinOp(llvm::air::AIRBuilder::min, a, b, true);
+  if (name == "UMax")
+    return ctx.air.CreateIntBinOp(llvm::air::AIRBuilder::max, a, b, false);
+  if (name == "UMin")
+    return ctx.air.CreateIntBinOp(llvm::air::AIRBuilder::min, a, b, false);
+  if (name == "FMad")
+    return ctx.air.CreateFMA(a, b, c);
+  if (name == "Dot2" || name == "Dot3" || name == "Dot4" ||
+      name == "FDot")
+    return ctx.air.CreateDotProduct(a, b);
+  if (name == "DerivCoarseX" || name == "DerivFineX")
+    return ctx.air.CreateDerivative(a, false);
+  if (name == "DerivCoarseY" || name == "DerivFineY")
+    return ctx.air.CreateDerivative(a, true);
+  return nullptr;
+}
+
+llvm::Error
+LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
+              Value *&current_return) {
+  auto *called = call.getCalledFunction();
+  if (!called || !called->getName().startswith("dx.op."))
+    return Unsupported("unsupported DXIL call: " +
+                       (called ? called->getName().str() : std::string("<indirect>")));
+
+  std::string name = DxilCallName(call);
+
+  if (name == "CreateHandle") {
+    DxilResourceHandle handle = {};
+    handle.resource_class =
+        DxilResourceClassFromOperand(ConstantOperandU32(call, 1).value_or(0));
+    handle.range_id = ConstantOperandU32(call, 2).value_or(0);
+    handle.index = OperandValue(call, 3, ctx);
+    ctx.handles[&call] = handle;
+    return Error::success();
+  }
+  if (name == "CreateHandleFromBinding" || name == "CreateHandleFromHeap") {
+    return Unsupported("DXIL " + name + " requires root descriptor heap lowering");
+  }
+  if (name == "AnnotateHandle") {
+    ctx.handles[&call] = ResolveHandle(call.getArgOperand(1), ctx);
+    return Error::success();
+  }
+  if (name == "LoadInput" || name == "LoadOutputControlPoint" ||
+      name == "LoadPatchConstant") {
+    ctx.values[&call] = LoadSignatureInput(call, ctx);
+    return Error::success();
+  }
+  if (name == "StoreOutput" || name == "StorePatchConstant" ||
+      name == "StoreVertexOutput" || name == "StorePrimitiveOutput") {
+    current_return = StoreSignatureOutput(call, current_return, ctx);
+    return Error::success();
+  }
+  if (name == "ThreadId" || name == "GroupId" || name == "ThreadIdInGroup" ||
+      name == "FlattenedThreadIdInGroup") {
+    ctx.values[&call] = BuildSystemValue(call, name, ctx);
+    return Error::success();
+  }
+  if (name == "CBufferLoad" || name == "CBufferLoadLegacy") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto *ptr = GetCBufferPointer(handle, ctx);
+    auto *index = OperandValue(call, 2, ctx);
+    if (!ptr)
+      return Unsupported("DXIL cbuffer load without resolved CBV handle");
+    auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
+    auto *gep = ctx.builder.CreateGEP(pointee, ptr, index ? index : ctx.builder.getInt32(0));
+    ctx.values[&call] =
+        PackDxilReturn(call, ctx.builder.CreateLoad(pointee, gep), ctx);
+    return Error::success();
+  }
+  if (name == "RawBufferLoad" || name == "BufferLoad") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto *ptr = GetBufferPointer(handle,
+                                 handle.resource_class == dxil::DxilTranslationResourceClass::Uav,
+                                 ctx);
+    if (!ptr)
+      return Unsupported("DXIL buffer load without resolved buffer handle");
+    auto *index = OperandValue(call, 2, ctx);
+    auto *byte_offset = name == "RawBufferLoad" ? OperandValue(call, 3, ctx)
+                                                : ctx.builder.getInt32(0);
+    auto *word_offset = ctx.builder.CreateLShr(byte_offset, 2);
+    auto *word_index = ctx.builder.CreateAdd(
+        ctx.builder.CreateMul(index ? index : ctx.builder.getInt32(0),
+                              ctx.builder.getInt32(1)),
+        word_offset);
+    auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
+    auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
+    auto *load = ctx.builder.CreateLoad(pointee, gep);
+    ctx.values[&call] =
+        PackDxilReturn(call, BuildVector4({load, nullptr, nullptr, nullptr}, ctx), ctx);
+    return Error::success();
+  }
+  if (name == "RawBufferStore" || name == "BufferStore") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto *ptr = GetBufferPointer(handle, true, ctx);
+    if (!ptr)
+      return Unsupported("DXIL buffer store without resolved UAV handle");
+    auto *index = OperandValue(call, 2, ctx);
+    auto *byte_offset = name == "RawBufferStore" ? OperandValue(call, 3, ctx)
+                                                 : ctx.builder.getInt32(0);
+    const uint32_t value_base = name == "RawBufferStore" ? 4 : 4;
+    const uint32_t mask_index = name == "RawBufferStore" ? 8 : 8;
+    const uint32_t mask = ConstantOperandU32(call, mask_index).value_or(0xfu);
+    auto *word_offset = ctx.builder.CreateLShr(byte_offset, 2);
+    auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
+    for (uint32_t i = 0; i < 4; i++) {
+      if (!(mask & (1u << i)))
+        continue;
+      auto *word_index = ctx.builder.CreateAdd(
+          ctx.builder.CreateAdd(index ? index : ctx.builder.getInt32(0),
+                                word_offset),
+          ctx.builder.getInt32(i));
+      auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
+      ctx.builder.CreateStore(CastValue(OperandValue(call, value_base + i, ctx),
+                                        pointee, ctx),
+                              gep);
+    }
+    return Error::success();
+  }
+  if (name == "TextureLoad") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto [texture_handle, resource] = GetTextureHandle(handle, ctx);
+    if (!texture_handle || !resource)
+      return Unsupported("DXIL texture load without resolved texture handle");
+    auto texture = BuildTexture(*resource, air::MemoryAccess::read);
+    auto *coord = TextureCoord(*resource, call, 3, false, ctx);
+    auto *array_index = TextureArrayIndex(*resource, call, 3, false, ctx);
+    auto [value, residency] =
+        ctx.air.CreateRead(texture, texture_handle, coord, array_index, nullptr,
+                           OperandValue(call, 2, ctx));
+    ctx.values[&call] = PackDxilReturn(call, value, ctx, residency);
+    return Error::success();
+  }
+  if (name == "TextureStore") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto [texture_handle, resource] = GetTextureHandle(handle, ctx);
+    if (!texture_handle || !resource)
+      return Unsupported("DXIL texture store without resolved texture handle");
+    auto texture = BuildTexture(*resource, air::MemoryAccess::write);
+    auto *coord = TextureCoord(*resource, call, 2, false, ctx);
+    auto *array_index = TextureArrayIndex(*resource, call, 2, false, ctx);
+    auto *value = BuildVector4({OperandValue(call, 5, ctx),
+                                OperandValue(call, 6, ctx),
+                                OperandValue(call, 7, ctx),
+                                OperandValue(call, 8, ctx)},
+                               ctx);
+    ctx.air.CreateWrite(texture, texture_handle, coord, array_index, nullptr,
+                        nullptr, value);
+    return Error::success();
+  }
+  if (name.starts_with("Sample")) {
+    auto texture_handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto sampler_handle = ResolveHandle(call.getArgOperand(2), ctx);
+    auto [texture, resource] = GetTextureHandle(texture_handle, ctx);
+    auto *sampler = GetSamplerHandle(sampler_handle, ctx);
+    if (!texture || !sampler || !resource)
+      return Unsupported("DXIL sample without resolved texture/sampler handle");
+    int32_t offset[3] = {};
+    auto air_texture = BuildTexture(*resource, air::MemoryAccess::sample);
+    auto *coord = TextureCoord(*resource, call, 3, true, ctx);
+    auto *array_index = TextureArrayIndex(*resource, call, 3, true, ctx);
+    std::pair<Value *, Value *> result = {nullptr, nullptr};
+    if (name == "SampleLevel")
+      result = ctx.air.CreateSample(air_texture, texture, sampler, coord,
+                                    array_index, offset,
+                                    llvm::air::sample_level{OperandValue(call, 8, ctx)});
+    else if (name == "SampleBias")
+      result = ctx.air.CreateSample(air_texture, texture, sampler, coord,
+                                    array_index, offset,
+                                    llvm::air::sample_bias{OperandValue(call, 8, ctx)});
+    else if (name == "SampleGrad")
+      result = ctx.air.CreateSampleGrad(
+          air_texture, texture, sampler, coord, array_index,
+          VectorFromOperands(call, 8, TextureCoordinateCount(*resource), true, ctx),
+          VectorFromOperands(call, 11, TextureCoordinateCount(*resource), true, ctx),
+          offset);
+    else if (name == "SampleCmp" || name == "SampleCmpLevelZero")
+      result = ctx.air.CreateSampleCmp(
+          air_texture, texture, sampler, coord, array_index,
+          OperandValue(call, 8, ctx), offset,
+          llvm::air::sample_level{name == "SampleCmpLevelZero"
+                                      ? ctx.air.getFloat(0)
+                                      : ctx.air.getFloat(0)});
+    else
+      result = ctx.air.CreateSample(air_texture, texture, sampler, coord,
+                                    array_index, offset);
+    ctx.values[&call] = PackDxilReturn(call, result.first, ctx, result.second);
+    return Error::success();
+  }
+  if (name == "TextureGather" || name == "TextureGatherCmp") {
+    auto texture_handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto sampler_handle = ResolveHandle(call.getArgOperand(2), ctx);
+    auto [texture, resource] = GetTextureHandle(texture_handle, ctx);
+    auto *sampler = GetSamplerHandle(sampler_handle, ctx);
+    if (!texture || !sampler || !resource)
+      return Unsupported("DXIL gather without resolved texture/sampler handle");
+    auto air_texture = BuildTexture(*resource, air::MemoryAccess::sample);
+    auto *coord = TextureCoord(*resource, call, 3, true, ctx);
+    auto *array_index = TextureArrayIndex(*resource, call, 3, true, ctx);
+    int32_t offset[3] = {};
+    std::pair<Value *, Value *> result = {nullptr, nullptr};
+    if (name == "TextureGatherCmp")
+      result = ctx.air.CreateGatherCompare(
+          air_texture, texture, sampler, coord, array_index,
+          OperandValue(call, 8, ctx), offset);
+    else
+      result = ctx.air.CreateGather(
+          air_texture, texture, sampler, coord, array_index, offset,
+          ctx.builder.getInt32(ConstantOperandU32(call, 8).value_or(0)));
+    ctx.values[&call] = PackDxilReturn(call, result.first, ctx, result.second);
+    return Error::success();
+  }
+  if (name == "AtomicBinOp" || name == "AtomicCompareExchange") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    auto [texture_handle, resource] = GetTextureHandle(handle, ctx);
+    if (texture_handle && resource) {
+      auto air_texture = BuildTexture(*resource, air::MemoryAccess::read_write);
+      auto *coord = TextureCoord(*resource, call, name == "AtomicBinOp" ? 3 : 2,
+                                 false, ctx);
+      auto *array_index = TextureArrayIndex(*resource, call,
+                                            name == "AtomicBinOp" ? 3 : 2,
+                                            false, ctx);
+      Value *value = nullptr;
+      if (name == "AtomicCompareExchange") {
+        auto [old_value, success] = ctx.air.CreateAtomicCmpXchg(
+            air_texture, texture_handle, coord,
+            BuildVector4({OperandValue(call, 5, ctx), nullptr, nullptr, nullptr}, ctx),
+            BuildVector4({OperandValue(call, 6, ctx), nullptr, nullptr, nullptr}, ctx),
+            array_index);
+        (void)success;
+        value = old_value;
+      } else {
+        value = ctx.air.CreateAtomicRMW(
+            air_texture, texture_handle,
+            AtomicOpFromDxil(ConstantOperandU32(call, 2).value_or(1)),
+            coord,
+            BuildVector4({OperandValue(call, 6, ctx), nullptr, nullptr, nullptr}, ctx),
+            array_index);
+      }
+      ctx.values[&call] = PackDxilReturn(call, value, ctx);
+      return Error::success();
+    }
+
+    auto *ptr = GetBufferPointer(handle, true, ctx);
+    if (!ptr)
+      return Unsupported("DXIL atomic without resolved UAV handle");
+    auto *offset = name == "AtomicBinOp" ? OperandValue(call, 3, ctx)
+                                         : OperandValue(call, 2, ctx);
+    auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
+    auto *gep = ctx.builder.CreateGEP(pointee, ptr, offset ? offset : ctx.builder.getInt32(0));
+    Value *value = nullptr;
+    if (name == "AtomicCompareExchange") {
+      auto *cmp = CastValue(OperandValue(call, 5, ctx), pointee, ctx);
+      auto *new_value = CastValue(OperandValue(call, 6, ctx), pointee, ctx);
+      auto *result = ctx.builder.CreateAtomicCmpXchg(
+          gep, cmp, new_value, llvm::MaybeAlign(),
+          llvm::AtomicOrdering::Monotonic, llvm::AtomicOrdering::Monotonic);
+      value = ctx.builder.CreateExtractValue(result, 0);
+    } else {
+      value = ctx.air.CreateAtomicRMW(
+          AtomicOpFromDxil(ConstantOperandU32(call, 2).value_or(1)), gep,
+          CastValue(OperandValue(call, 6, ctx), pointee, ctx));
+    }
+    ctx.values[&call] = PackDxilReturn(call, value, ctx);
+    return Error::success();
+  }
+  if (name == "Discard") {
+    ctx.air.CreateDiscard();
+    return Error::success();
+  }
+  if (name == "Barrier") {
+    ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+    return Error::success();
+  }
+  if (auto *math = BuildDxilMath(call, name, ctx)) {
+    ctx.values[&call] = math;
+    return Error::success();
+  }
+
+  return Unsupported("unsupported DXIL opcode: " + name);
+}
+
+llvm::Error
+LowerInstruction(const Instruction &instruction, DxilAirContext &ctx,
+                 Value *&current_return) {
+  if (const auto *call = dyn_cast<CallBase>(&instruction))
+    return LowerDxilCall(*call, ctx, current_return);
+
+  Value *result = nullptr;
+  switch (instruction.getOpcode()) {
+  case Instruction::Alloca:
+    result = ctx.builder.CreateAlloca(
+        MapType(cast<AllocaInst>(instruction).getAllocatedType(), ctx));
+    break;
+  case Instruction::Load: {
+    const auto &load = cast<LoadInst>(instruction);
+    auto *ptr = MapValue(load.getPointerOperand(), ctx);
+    result = ctx.builder.CreateLoad(MapType(load.getType(), ctx), ptr);
+    break;
+  }
+  case Instruction::Store: {
+    const auto &store = cast<StoreInst>(instruction);
+    ctx.builder.CreateStore(MapValue(store.getValueOperand(), ctx),
+                            MapValue(store.getPointerOperand(), ctx));
+    break;
+  }
+  case Instruction::GetElementPtr: {
+    const auto &gep = cast<GetElementPtrInst>(instruction);
+    SmallVector<Value *, 8> indices;
+    for (const auto &index : gep.indices())
+      indices.push_back(MapValue(index.get(), ctx));
+    result = ctx.builder.CreateGEP(
+        MapType(gep.getSourceElementType(), ctx),
+        MapValue(gep.getPointerOperand(), ctx), indices);
+    break;
+  }
+  case Instruction::ExtractElement: {
+    const auto &extract = cast<ExtractElementInst>(instruction);
+    result = ctx.builder.CreateExtractElement(
+        MapValue(extract.getVectorOperand(), ctx),
+        MapValue(extract.getIndexOperand(), ctx));
+    break;
+  }
+  case Instruction::InsertElement: {
+    const auto &insert = cast<InsertElementInst>(instruction);
+    result = ctx.builder.CreateInsertElement(
+        MapValue(insert.getOperand(0), ctx), MapValue(insert.getOperand(1), ctx),
+        MapValue(insert.getOperand(2), ctx));
+    break;
+  }
+  case Instruction::ExtractValue: {
+    const auto &extract = cast<ExtractValueInst>(instruction);
+    result = ctx.builder.CreateExtractValue(MapValue(extract.getAggregateOperand(), ctx),
+                                            extract.getIndices());
+    break;
+  }
+  case Instruction::InsertValue: {
+    const auto &insert = cast<InsertValueInst>(instruction);
+    result = ctx.builder.CreateInsertValue(MapValue(insert.getAggregateOperand(), ctx),
+                                           MapValue(insert.getInsertedValueOperand(), ctx),
+                                           insert.getIndices());
+    break;
+  }
+  case Instruction::PHI:
+    break;
+  case Instruction::Select: {
+    const auto &select = cast<SelectInst>(instruction);
+    result = ctx.builder.CreateSelect(MapValue(select.getCondition(), ctx),
+                                      MapValue(select.getTrueValue(), ctx),
+                                      MapValue(select.getFalseValue(), ctx));
+    break;
+  }
+  case Instruction::ICmp: {
+    const auto &cmp = cast<ICmpInst>(instruction);
+    result = ctx.builder.CreateICmp(cmp.getPredicate(),
+                                    MapValue(cmp.getOperand(0), ctx),
+                                    MapValue(cmp.getOperand(1), ctx));
+    break;
+  }
+  case Instruction::FCmp: {
+    const auto &cmp = cast<FCmpInst>(instruction);
+    result = ctx.builder.CreateFCmp(cmp.getPredicate(),
+                                    MapValue(cmp.getOperand(0), ctx),
+                                    MapValue(cmp.getOperand(1), ctx));
+    break;
+  }
+  case Instruction::Add:
+    result = ctx.builder.CreateAdd(MapValue(instruction.getOperand(0), ctx),
+                                   MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::Sub:
+    result = ctx.builder.CreateSub(MapValue(instruction.getOperand(0), ctx),
+                                   MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::Mul:
+    result = ctx.builder.CreateMul(MapValue(instruction.getOperand(0), ctx),
+                                   MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::UDiv:
+    result = ctx.builder.CreateUDiv(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::SDiv:
+    result = ctx.builder.CreateSDiv(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::URem:
+    result = ctx.builder.CreateURem(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::SRem:
+    result = ctx.builder.CreateSRem(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::FAdd:
+    result = ctx.builder.CreateFAdd(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::FSub:
+    result = ctx.builder.CreateFSub(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::FMul:
+    result = ctx.builder.CreateFMul(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::FDiv:
+    result = ctx.builder.CreateFDiv(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::And:
+    result = ctx.builder.CreateAnd(MapValue(instruction.getOperand(0), ctx),
+                                   MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::Or:
+    result = ctx.builder.CreateOr(MapValue(instruction.getOperand(0), ctx),
+                                  MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::Xor:
+    result = ctx.builder.CreateXor(MapValue(instruction.getOperand(0), ctx),
+                                   MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::Shl:
+    result = ctx.builder.CreateShl(MapValue(instruction.getOperand(0), ctx),
+                                   MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::LShr:
+    result = ctx.builder.CreateLShr(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::AShr:
+    result = ctx.builder.CreateAShr(MapValue(instruction.getOperand(0), ctx),
+                                    MapValue(instruction.getOperand(1), ctx));
+    break;
+  case Instruction::Trunc:
+  case Instruction::ZExt:
+  case Instruction::SExt:
+  case Instruction::FPToUI:
+  case Instruction::FPToSI:
+  case Instruction::UIToFP:
+  case Instruction::SIToFP:
+  case Instruction::FPTrunc:
+  case Instruction::FPExt:
+  case Instruction::PtrToInt:
+  case Instruction::IntToPtr:
+  case Instruction::BitCast:
+  case Instruction::AddrSpaceCast:
+    result = ctx.builder.CreateCast(static_cast<Instruction::CastOps>(instruction.getOpcode()),
+                                    MapValue(instruction.getOperand(0), ctx),
+                                    MapType(instruction.getType(), ctx));
+    break;
+  default:
+    if (!instruction.isTerminator())
+      return Unsupported("unsupported LLVM instruction in DXIL: " +
+                         std::string(instruction.getOpcodeName()));
+    break;
+  }
+
+  if (result)
+    ctx.values[&instruction] = result;
+  return Error::success();
+}
+
+llvm::Error
+LowerTerminator(const Instruction &terminator, DxilAirContext &ctx,
+                Value *current_return) {
+  if (const auto *ret = dyn_cast<ReturnInst>(&terminator)) {
+    (void)ret;
+    if (ctx.function->getReturnType()->isVoidTy())
+      ctx.builder.CreateRetVoid();
+    else
+      ctx.builder.CreateRet(ctx.return_value
+                                ? ctx.builder.CreateLoad(
+                                      ctx.function->getReturnType(),
+                                      ctx.return_value)
+                                : current_return);
+    return Error::success();
+  }
+  if (const auto *branch = dyn_cast<BranchInst>(&terminator)) {
+    if (branch->isUnconditional()) {
+      ctx.builder.CreateBr(ctx.blocks[branch->getSuccessor(0)]);
+    } else {
+      ctx.builder.CreateCondBr(MapValue(branch->getCondition(), ctx),
+                               ctx.blocks[branch->getSuccessor(0)],
+                               ctx.blocks[branch->getSuccessor(1)]);
+    }
+    return Error::success();
+  }
+  if (const auto *sw = dyn_cast<SwitchInst>(&terminator)) {
+    auto *out = ctx.builder.CreateSwitch(MapValue(sw->getCondition(), ctx),
+                                         ctx.blocks[sw->getDefaultDest()],
+                                         sw->getNumCases());
+    for (const auto &case_value : sw->cases())
+      out->addCase(const_cast<ConstantInt *>(case_value.getCaseValue()),
+                   ctx.blocks[case_value.getCaseSuccessor()]);
+    return Error::success();
+  }
+  if (isa<UnreachableInst>(terminator)) {
+    ctx.builder.CreateUnreachable();
+    return Error::success();
+  }
+  return Unsupported("unsupported DXIL terminator: " +
+                     std::string(terminator.getOpcodeName()));
+}
+
+llvm::Error
+BuildPhiNodes(const Function &source, DxilAirContext &ctx) {
+  for (const auto &block : source) {
+    ctx.builder.SetInsertPoint(ctx.blocks[&block]);
+    for (const auto &instruction : block) {
+      const auto *phi = dyn_cast<PHINode>(&instruction);
+      if (!phi)
+        break;
+      auto *mapped = ctx.builder.CreatePHI(MapType(phi->getType(), ctx),
+                                           phi->getNumIncomingValues());
+      ctx.values[phi] = mapped;
+    }
+  }
+  return Error::success();
+}
+
+void
+PatchPhiNodes(const Function &source, DxilAirContext &ctx) {
+  for (const auto &block : source) {
+    for (const auto &instruction : block) {
+      const auto *phi = dyn_cast<PHINode>(&instruction);
+      if (!phi)
+        break;
+      auto *mapped = cast<PHINode>(ctx.values[phi]);
+      for (uint32_t i = 0; i < phi->getNumIncomingValues(); i++)
+        mapped->addIncoming(MapValue(phi->getIncomingValue(i), ctx),
+                            ctx.blocks[phi->getIncomingBlock(i)]);
+    }
+  }
+}
+
+void
+BuildShaderInfo(const dxil::DxilTranslationInfo &translation,
+                dxbc::ShaderInfo &shader_info) {
+  using shader::common::ResourceType;
+  for (const auto &resource : translation.resources) {
+    const auto range_id = resource.id;
+    if (resource.resource_class == dxil::DxilTranslationResourceClass::Cbv) {
+      auto &cbv = shader_info.cbufferMap[range_id];
+      cbv.range = {.range_id = range_id,
+                   .lower_bound = resource.lower_bound,
+                   .size = resource.bind_count ? resource.bind_count : 1,
+                   .space = resource.space};
+      cbv.size_in_vec4 = 4096;
+      cbv.arg_index = shader_info.binding_table_cbuffer.DefineBuffer(
+          "cb" + std::to_string(range_id), air::AddressSpace::constant,
+          air::MemoryAccess::read, air::msl_uint4,
+          GetArgumentIndex(SM50BindingType::ConstantBuffer, range_id));
+      continue;
+    }
+    if (resource.resource_class == dxil::DxilTranslationResourceClass::Sampler) {
+      auto &sampler = shader_info.samplerMap[range_id];
+      sampler.range = {.range_id = range_id,
+                       .lower_bound = resource.lower_bound,
+                       .size = resource.bind_count ? resource.bind_count : 1,
+                       .space = resource.space};
+      auto attr = GetArgumentIndex(SM50BindingType::Sampler, range_id);
+      sampler.arg_index = shader_info.binding_table.DefineSampler(
+          "s" + std::to_string(range_id), attr);
+      sampler.arg_cube_index = shader_info.binding_table.DefineSampler(
+          "cube_s" + std::to_string(range_id), attr + 1);
+      sampler.arg_metadata_index = shader_info.binding_table.DefineInteger64(
+          "meta_s" + std::to_string(range_id), attr + 2);
+      continue;
+    }
+
+    auto resource_type =
+        ToResourceType(resource.resource_kind, resource.dimension);
+    auto scaler = ToScalerDataType(resource.return_type);
+    if (resource.resource_class == dxil::DxilTranslationResourceClass::Srv) {
+      auto &srv = shader_info.srvMap[range_id];
+      srv.range = {.range_id = range_id,
+                   .lower_bound = resource.lower_bound,
+                   .size = resource.bind_count ? resource.bind_count : 1,
+                   .space = resource.space};
+      srv.resource_type = resource_type;
+      srv.scaler_type = scaler;
+      srv.read = resource.read;
+      srv.sampled = resource.sampled;
+      srv.structure_stride = resource.flags;
+      auto attr = GetArgumentIndex(SM50BindingType::SRV, range_id);
+      if (resource_type != ResourceType::NonApplicable) {
+        srv.arg_index = shader_info.binding_table.DefineTexture(
+            "t" + std::to_string(range_id),
+            air::to_air_resource_type(resource_type),
+            resource.sampled ? air::MemoryAccess::sample
+                             : air::MemoryAccess::read,
+            air::to_air_scaler_type(scaler), attr);
+      } else {
+        srv.arg_index = shader_info.binding_table.DefineBuffer(
+            "t" + std::to_string(range_id), air::AddressSpace::device,
+            air::MemoryAccess::read, air::msl_uint, attr);
+      }
+      srv.arg_metadata_index = shader_info.binding_table.DefineInteger64(
+          "meta_t" + std::to_string(range_id), attr + 1);
+    } else if (resource.resource_class == dxil::DxilTranslationResourceClass::Uav) {
+      auto &uav = shader_info.uavMap[range_id];
+      uav.range = {.range_id = range_id,
+                   .lower_bound = resource.lower_bound,
+                   .size = resource.bind_count ? resource.bind_count : 1,
+                   .space = resource.space};
+      uav.resource_type = resource_type;
+      uav.scaler_type = scaler;
+      uav.read = resource.read;
+      uav.written = resource.written;
+      uav.structure_stride = resource.flags;
+      auto attr = GetArgumentIndex(SM50BindingType::UAV, range_id);
+      const auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
+                                                  : air::MemoryAccess::write)
+                                      : air::MemoryAccess::read;
+      if (resource_type != ResourceType::NonApplicable) {
+        uav.arg_index = shader_info.binding_table.DefineTexture(
+            "u" + std::to_string(range_id),
+            air::to_air_resource_type(resource_type), access,
+            air::to_air_scaler_type(scaler), attr);
+      } else {
+        uav.arg_index = shader_info.binding_table.DefineBuffer(
+            "u" + std::to_string(range_id), air::AddressSpace::device, access,
+            air::msl_uint, attr);
+      }
+      uav.arg_metadata_index = shader_info.binding_table.DefineInteger64(
+          "meta_u" + std::to_string(range_id), attr + 1);
+    }
+  }
+}
+
+void
+BuildSignature(const dxil::DxilTranslationInfo &translation,
+               air::FunctionSignatureBuilder &signature,
+               DxilAirContext &ctx) {
+  for (const auto &sig : translation.signatures) {
+    const auto mask = SignatureMask(sig);
+    if (sig.kind == dxil::DxilTranslationSignatureKind::Input) {
+      ctx.inputs[sig.element_id] = &sig;
+      if (translation.shader_kind == uint32_t(DxilStage::Vertex)) {
+        if (IsSystemSemantic(sig, "SV_VertexID"))
+          ctx.input_args[sig.element_id] = signature.DefineInput(air::InputVertexID{});
+        else if (IsSystemSemantic(sig, "SV_InstanceID"))
+          ctx.input_args[sig.element_id] = signature.DefineInput(air::InputInstanceID{});
+        else
+          ctx.input_args[sig.element_id] = signature.DefineInput(
+              air::InputVertexStageIn{.attribute = sig.element_id,
+                                      .type = ToAirInputComponent(sig.component_type),
+                                      .name = SemanticUserName(sig)});
+      } else if (translation.shader_kind == uint32_t(DxilStage::Pixel)) {
+        if (IsSystemSemantic(sig, "SV_Position"))
+          ctx.input_args[sig.element_id] =
+              signature.DefineInput(air::InputPosition{ToAirInterpolation(sig.interpolation_mode)});
+        else if (IsSystemSemantic(sig, "SV_PrimitiveID"))
+          ctx.input_args[sig.element_id] = signature.DefineInput(air::InputPrimitiveID{});
+        else if (IsSystemSemantic(sig, "SV_Coverage"))
+          ctx.input_args[sig.element_id] = signature.DefineInput(air::InputInputCoverage{});
+        else if (IsSystemSemantic(sig, "SV_SampleIndex"))
+          ctx.input_args[sig.element_id] = signature.DefineInput(air::InputSampleIndex{});
+        else
+          ctx.input_args[sig.element_id] = signature.DefineInput(
+              air::InputFragmentStageIn{.user = SemanticUserName(sig),
+                                        .type = ToAirSignatureType(sig.component_type, mask),
+                                        .interpolation = ToAirInterpolation(sig.interpolation_mode),
+                                        .pull_mode = false});
+      }
+    } else if (sig.kind == dxil::DxilTranslationSignatureKind::Output) {
+      ctx.outputs[sig.element_id] = &sig;
+      if (translation.shader_kind == uint32_t(DxilStage::Vertex)) {
+        if (IsSystemSemantic(sig, "SV_Position"))
+          ctx.output_indices[sig.element_id] =
+              signature.DefineOutput(air::OutputPosition{air::msl_float4});
+        else
+          ctx.output_indices[sig.element_id] = signature.DefineOutput(
+              air::OutputVertex{.user = SemanticUserName(sig),
+                                .type = ToAirSignatureType(sig.component_type, mask)});
+      } else if (translation.shader_kind == uint32_t(DxilStage::Pixel)) {
+        if (IsSystemSemantic(sig, "SV_Depth"))
+          ctx.output_indices[sig.element_id] =
+              signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
+        else if (IsSystemSemantic(sig, "SV_Coverage"))
+          ctx.output_indices[sig.element_id] =
+              signature.DefineOutput(air::OutputCoverageMask{});
+        else
+          ctx.output_indices[sig.element_id] = signature.DefineOutput(
+              air::OutputRenderTarget{.dual_source_blending = false,
+                                      .index = sig.semantic_index,
+                                      .type = ToAirSignatureType(sig.component_type, mask)});
+      }
+    }
+  }
+
+  if (translation.shader_kind == uint32_t(DxilStage::Compute)) {
+    ctx.input_args[0xff00u] = signature.DefineInput(air::InputThreadPositionInGrid{});
+    ctx.input_args[0xff01u] = signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+    ctx.input_args[0xff02u] =
+        signature.DefineInput(air::InputThreadPositionInThreadgroup{});
+    ctx.input_args[0xff03u] =
+        signature.DefineInput(air::InputThreadIndexInThreadgroup{});
+    signature.UseMaxWorkgroupSize(translation.num_threads_x *
+                                  translation.num_threads_y *
+                                  translation.num_threads_z);
+  }
+}
+
+const Function *
+FindEntryFunction(const Module &module, const dxil::DxilTranslationInfo &translation) {
+  if (!translation.function_name.empty()) {
+    if (auto *function = module.getFunction(translation.function_name))
+      return function;
+  }
+  if (!translation.entry_point_name.empty()) {
+    if (auto *function = module.getFunction(translation.entry_point_name))
+      return function;
+  }
+  for (const auto &function : module.functions()) {
+    if (!function.isDeclaration() && !function.getName().startswith("dx."))
+      return &function;
+  }
+  return nullptr;
+}
+
+llvm::Expected<std::unique_ptr<Module>>
+ParseInputModule(const dxil::Parser &parser, LLVMContext &context) {
+  const auto &program = parser.dxilProgram();
+  if (!program)
+    return llvm::make_error<UnsupportedFeature>("DXIL container has no DXIL program");
+  auto buffer = MemoryBuffer::getMemBufferCopy(
+      StringRef(reinterpret_cast<const char *>(program->bitcode.data()),
+                program->bitcode.size()));
+  return parseBitcodeFile(buffer->getMemBufferRef(), context);
+}
+
+llvm::Error
+LowerFunction(const Function &source, DxilAirContext &ctx) {
+  for (const auto &block : source)
+    ctx.blocks[&block] = BasicBlock::Create(ctx.llvm, block.getName(), ctx.function);
+  if (auto err = BuildPhiNodes(source, ctx))
+    return err;
+
+  if (!ctx.function->getReturnType()->isVoidTy()) {
+    ctx.builder.SetInsertPoint(ctx.blocks[&source.getEntryBlock()]);
+    ctx.return_value = ctx.builder.CreateAlloca(ctx.function->getReturnType());
+    ctx.builder.CreateStore(
+        ConstantAggregateZero::get(ctx.function->getReturnType()),
+        ctx.return_value);
+  }
+
+  for (const auto &block : source) {
+    ctx.builder.SetInsertPoint(ctx.blocks[&block]);
+    Value *current_return =
+        ctx.function->getReturnType()->isVoidTy()
+            ? nullptr
+            : ctx.builder.CreateLoad(ctx.function->getReturnType(),
+                                     ctx.return_value);
+    for (const auto &instruction : block) {
+      if (isa<PHINode>(&instruction) || instruction.isTerminator())
+        continue;
+      if (auto err = LowerInstruction(instruction, ctx, current_return))
+        return err;
+      if (ctx.return_value)
+        ctx.builder.CreateStore(current_return, ctx.return_value);
+    }
+    const auto *terminator = block.getTerminator();
+    if (!terminator)
+      return Unsupported("DXIL basic block without terminator");
+    if (auto err = LowerTerminator(*terminator, ctx, current_return))
+      return err;
+  }
+
+  PatchPhiNodes(source, ctx);
+  return Error::success();
+}
+
+SM50_SHADER_METAL_VERSION
+GetMetalVersion(SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
+  SM50_SHADER_COMMON_DATA *common = nullptr;
+  if (dxbc::args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(
+          args, &common))
+    return common->metal_version;
+  return SM50_SHADER_METAL_310;
+}
+
+} // namespace
+
+llvm::Error
+ConvertDxilToAir(const dxil::Parser &parser, const char *name,
+                 LLVMContext &context, Module &module,
+                 SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
+  const auto &translation = parser.dxilTranslation();
+  if (!translation || !translation->valid)
+    return Unsupported("DXIL translation info is not available");
+
+  if (translation->shader_kind != uint32_t(DxilStage::Vertex) &&
+      translation->shader_kind != uint32_t(DxilStage::Pixel) &&
+      translation->shader_kind != uint32_t(DxilStage::Compute)) {
+    return Unsupported(std::string("DXIL ") + StageName(translation->shader_kind) +
+                       " shader translation is not implemented yet");
+  }
+
+  auto input = ParseInputModule(parser, context);
+  if (!input)
+    return input.takeError();
+  auto input_module = std::move(*input);
+  const auto *source = FindEntryFunction(*input_module, *translation);
+  if (!source)
+    return Unsupported("DXIL entry function was not found");
+
+  dxbc::ShaderInfo shader_info;
+  BuildShaderInfo(*translation, shader_info);
+
+  air::FunctionSignatureBuilder signature;
+  air::AirType types(context);
+  llvm::raw_null_ostream null_debug;
+  auto *entry_block = BasicBlock::Create(context, "entry.stub");
+  IRBuilder<> builder(entry_block);
+  llvm::air::AIRBuilder air_builder(builder, null_debug);
+
+  DxilAirContext dxil_ctx{
+      .llvm = context,
+      .module = module,
+      .builder = builder,
+      .air = air_builder,
+      .types = types,
+      .translation = *translation,
+      .source_function = source,
+      .shader_info = std::move(shader_info),
+  };
+  BuildSignature(*translation, signature, dxil_ctx);
+
+  dxbc::setup_binding_table(&dxil_ctx.shader_info, dxil_ctx.resources,
+                            signature, module);
+  auto [function, metadata] = signature.CreateFunction(
+      name ? name : "main0", context, module, 0, false);
+  dxil_ctx.function = function;
+
+  entry_block->removeFromParent();
+  delete entry_block;
+
+  if (auto err = LowerFunction(*source, dxil_ctx))
+    return err;
+
+  dxbc::setup_metal_version(module, GetMetalVersion(args));
+  switch (translation->shader_kind) {
+  case uint32_t(DxilStage::Vertex):
+    module.getOrInsertNamedMetadata("air.vertex")->addOperand(metadata);
+    break;
+  case uint32_t(DxilStage::Pixel):
+    module.getOrInsertNamedMetadata("air.fragment")->addOperand(metadata);
+    break;
+  case uint32_t(DxilStage::Compute):
+    module.getOrInsertNamedMetadata("air.kernel")->addOperand(metadata);
+    break;
+  default:
+    break;
+  }
+  return Error::success();
+}
+
+void
+FillDxilReflection(const dxil::Parser &parser, MTL_SHADER_REFLECTION *reflection) {
+  if (!reflection)
+    return;
+
+  std::memset(reflection, 0, sizeof(*reflection));
+  reflection->ConstanttBufferTableBindIndex = dxbc::kConstantBufferBindIndex;
+  reflection->ArgumentBufferBindIndex = dxbc::kArgumentBufferBindIndex;
+
+  const auto &translation = parser.dxilTranslation();
+  if (!translation)
+    return;
+
+  uint32_t cbv_count = 0;
+  uint32_t argument_count = 0;
+  for (const auto &resource : translation->resources) {
+    switch (resource.resource_class) {
+    case dxil::DxilTranslationResourceClass::Cbv:
+      cbv_count++;
+      if (resource.id < 16)
+        reflection->ConstantBufferSlotMask |= uint16_t(1u << resource.id);
+      break;
+    case dxil::DxilTranslationResourceClass::Sampler:
+      argument_count++;
+      if (resource.id < 16)
+        reflection->SamplerSlotMask |= uint16_t(1u << resource.id);
+      break;
+    case dxil::DxilTranslationResourceClass::Srv:
+      argument_count++;
+      if (resource.id < 64)
+        reflection->SRVSlotMaskLo |= uint64_t(1) << resource.id;
+      else if (resource.id < 128)
+        reflection->SRVSlotMaskHi |= uint64_t(1) << (resource.id - 64);
+      break;
+    case dxil::DxilTranslationResourceClass::Uav:
+      argument_count++;
+      if (resource.id < 64)
+        reflection->UAVSlotMask |= uint64_t(1) << resource.id;
+      break;
+    default:
+      break;
+    }
+  }
+  reflection->NumConstantBuffers = cbv_count;
+  reflection->NumArguments = argument_count;
+  reflection->ArgumentTableQwords = argument_count;
+  reflection->ThreadgroupSize[0] = translation->num_threads_x;
+  reflection->ThreadgroupSize[1] = translation->num_threads_y;
+  reflection->ThreadgroupSize[2] = translation->num_threads_z;
+
+  for (const auto &sig : translation->signatures) {
+    if (sig.kind == dxil::DxilTranslationSignatureKind::Output &&
+        translation->shader_kind == uint32_t(DxilStage::Pixel)) {
+      if (IsSystemSemantic(sig, "SV_Target") && sig.semantic_index < 32)
+        reflection->PSValidRenderTargets |= 1u << sig.semantic_index;
+    }
+  }
+}
+
+} // namespace dxmt::airconv

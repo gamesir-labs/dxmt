@@ -3,6 +3,7 @@ airconv_src = files([
  'air_type.cpp',
  'air_signature.cpp',
  'air_operations.cpp',
+ 'dxil_air_converter.cpp',
  'dxil_converter.cpp',
  'dxbc_converter.cpp',
  'dxbc_converter_gs.cpp',
