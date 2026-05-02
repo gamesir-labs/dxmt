@@ -1712,9 +1712,9 @@ private:
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
       StoreRootConstants(state, record);
     } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
-      ReplayBeginQuery(record);
+      ReplayBeginQuery(chunk, record);
     } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
-      ReplayEndQuery(record);
+      ReplayEndQuery(chunk, record);
     } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
       ReplayResolveQueryData(chunk, record);
     } else if constexpr (std::is_same_v<T, PredicationRecord>) {
@@ -2003,22 +2003,43 @@ private:
     }
   }
 
-  void ReplayBeginQuery(const BeginQueryRecord &record) {
+  void ReplayBeginQuery(CommandChunk *chunk, const BeginQueryRecord &record) {
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: BeginQuery skipped for foreign query heap");
       return;
     }
-    heap->Begin(record.type, record.index);
+    auto query = heap->BeginVisibility(record.type, record.index);
+    if (!query)
+      return;
+    chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
+      enc.beginVisibilityResultQuery(std::move(query));
+    });
   }
 
-  void ReplayEndQuery(const EndQueryRecord &record) {
+  void ReplayEndQuery(CommandChunk *chunk, const EndQueryRecord &record) {
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: EndQuery skipped for foreign query heap");
       return;
     }
-    heap->End(record.type, record.index);
+    if (record.type == D3D12_QUERY_TYPE_TIMESTAMP) {
+      auto query = heap->EndTimestamp(record.type, record.index);
+      if (!query)
+        return;
+      chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
+        enc.endPass();
+        enc.sampleTimestamp(std::move(query));
+      });
+      return;
+    }
+
+    auto query = heap->EndVisibility(record.type, record.index);
+    if (!query)
+      return;
+    chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
+      enc.endVisibilityResultQuery(std::move(query));
+    });
   }
 
   void ReplayResolveQueryData(CommandChunk *chunk,
@@ -2029,45 +2050,40 @@ private:
       return;
     }
 
-    std::vector<uint8_t> data;
+    std::vector<uint8_t> sizing_data;
     if (!heap->Resolve(record.type, record.start_index, record.query_count,
-                       data))
+                       sizing_data))
       return;
-    if (!data.empty()) {
-      auto *dst = GetResource(record.dst_buffer.ptr());
-      if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
-                               "query resolve"))
-        return;
+    auto *dst = GetResource(record.dst_buffer.ptr());
+    if (!ValidateBufferRange(dst, record.dst_buffer_offset, sizing_data.size(),
+                             "query resolve"))
+      return;
 
-      WMTBufferInfo staging_info = {};
-      staging_info.length = data.size();
-      staging_info.options = WMTResourceStorageModeShared |
-                             WMTResourceOptionCPUCacheModeWriteCombined;
-      auto staging = device_->GetDXMTDevice().device().newBuffer(staging_info);
-      if (!staging || !staging_info.memory.get()) {
-        WARN("D3D12CommandQueue: ResolveQueryData failed to allocate staging buffer");
-        return;
-      }
-      std::memcpy(staging_info.memory.get(), data.data(), data.size());
+    Com<ID3D12QueryHeap> heap_ref = record.heap;
+    Com<ID3D12Resource> dst_ref = record.dst_buffer;
+    const auto type = record.type;
+    const UINT start_index = record.start_index;
+    const UINT query_count = record.query_count;
+    const UINT64 dst_buffer_offset = record.dst_buffer_offset;
+    chunk->deferred_readbacks.push_back(
+        [heap_ref = std::move(heap_ref), dst_ref = std::move(dst_ref), type,
+         start_index, query_count, dst_buffer_offset]() mutable {
+          auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
+          auto *dst = GetResource(dst_ref.ptr());
+          if (!heap || !dst)
+            return;
 
-      Rc<BufferAllocation> dst_allocation = dst->GetBufferAllocation();
-      const UINT64 dst_offset = dst->GetHeapOffset() + record.dst_buffer_offset;
-      const UINT64 copy_size = data.size();
-      chunk->emitcc([staging, dst_allocation, dst_offset,
-                     copy_size](ArgumentEncodingContext &enc) {
-        enc.retainAllocation(dst_allocation.ptr());
-        enc.startBlitPass();
-        auto &copy =
-            enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
-        copy.type = WMTBlitCommandCopyFromBufferToBuffer;
-        copy.src = staging;
-        copy.src_offset = 0;
-        copy.dst = dst_allocation->buffer();
-        copy.dst_offset = dst_offset;
-        copy.copy_length = copy_size;
-        enc.endPass();
-      });
-    }
+          std::vector<uint8_t> data;
+          if (!heap->Resolve(type, start_index, query_count, data))
+            return;
+          if (!ValidateBufferRange(dst, dst_buffer_offset, data.size(),
+                                   "query resolve"))
+            return;
+          if (!data.empty())
+            dst->GetBufferAllocation()->updateContents(
+                dst->GetHeapOffset() + dst_buffer_offset, data.data(),
+                data.size());
+        });
   }
 
   void ReplaySetPredication(ReplayState &state,

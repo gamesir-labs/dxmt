@@ -5,7 +5,6 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
-#include <atomic>
 #include <cstring>
 
 namespace dxmt::d3d12 {
@@ -62,55 +61,53 @@ public:
 
   const D3D12_QUERY_HEAP_DESC &GetDesc() const override { return desc_; }
 
-  bool Begin(D3D12_QUERY_TYPE type, UINT index) override {
+  Rc<VisibilityResultQuery> BeginVisibility(D3D12_QUERY_TYPE type,
+                                            UINT index) override {
     if (!ValidateAccess(type, index))
-      return false;
-    switch (desc_.Type) {
-    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
-      if (type != D3D12_QUERY_TYPE_OCCLUSION &&
-          type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
-        WARN("D3D12QueryHeap: unsupported begin query type ", type);
-        return false;
-      }
-      queries_[index].began = true;
-      queries_[index].value = 0;
-      queries_[index].valid = true;
-      return true;
-    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
-      WARN("D3D12QueryHeap: begin query is ignored for timestamp heap");
-      return true;
-    default:
-      WARN("D3D12QueryHeap: unsupported begin query heap type ", desc_.Type);
-      return false;
+      return {};
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION) {
+      WARN("D3D12QueryHeap: BeginQuery unsupported for heap type ",
+           desc_.Type);
+      return {};
     }
+    auto &query = queries_[index];
+    query.visibility = new VisibilityResultQuery();
+    query.began = true;
+    query.valid = false;
+    return query.visibility;
   }
 
-  bool End(D3D12_QUERY_TYPE type, UINT index) override {
+  Rc<VisibilityResultQuery> EndVisibility(D3D12_QUERY_TYPE type,
+                                          UINT index) override {
     if (!ValidateAccess(type, index))
-      return false;
-    switch (desc_.Type) {
-    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
-      if (type != D3D12_QUERY_TYPE_OCCLUSION &&
-          type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
-        WARN("D3D12QueryHeap: unsupported end query type ", type);
-        return false;
-      }
-      queries_[index].began = false;
-      queries_[index].value = 1;
-      queries_[index].valid = true;
-      return true;
-    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
-      if (type != D3D12_QUERY_TYPE_TIMESTAMP) {
-        WARN("D3D12QueryHeap: unsupported timestamp end query type ", type);
-        return false;
-      }
-      queries_[index].value = nextTimestamp_.fetch_add(1, std::memory_order_relaxed);
-      queries_[index].valid = true;
-      return true;
-    default:
-      WARN("D3D12QueryHeap: unsupported end query heap type ", desc_.Type);
-      return false;
+      return {};
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION) {
+      WARN("D3D12QueryHeap: EndQuery visibility unsupported for heap type ",
+           desc_.Type);
+      return {};
     }
+    auto &query = queries_[index];
+    if (!query.began || !query.visibility) {
+      WARN("D3D12QueryHeap: EndQuery without matching BeginQuery");
+      return {};
+    }
+    query.began = false;
+    query.valid = true;
+    return query.visibility;
+  }
+
+  Rc<TimestampQuery> EndTimestamp(D3D12_QUERY_TYPE type, UINT index) override {
+    if (!ValidateAccess(type, index))
+      return {};
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
+        type != D3D12_QUERY_TYPE_TIMESTAMP) {
+      WARN("D3D12QueryHeap: unsupported timestamp end query type ", type);
+      return {};
+    }
+    auto &query = queries_[index];
+    query.timestamp = new TimestampQuery();
+    query.valid = true;
+    return query.timestamp;
   }
 
   bool Resolve(D3D12_QUERY_TYPE type, UINT start_index, UINT query_count,
@@ -131,12 +128,18 @@ public:
       switch (type) {
       case D3D12_QUERY_TYPE_OCCLUSION:
       case D3D12_QUERY_TYPE_BINARY_OCCLUSION: {
-        const uint64_t value = query.valid ? query.value : 0;
+        uint64_t value = 0;
+        if (query.valid && query.visibility)
+          query.visibility->getValue(&value);
+        if (type == D3D12_QUERY_TYPE_BINARY_OCCLUSION && value)
+          value = 1;
         std::memcpy(data.data() + offset, &value, sizeof(value));
         break;
       }
       case D3D12_QUERY_TYPE_TIMESTAMP: {
-        const uint64_t value = query.valid ? query.value : 0;
+        uint64_t value = 0;
+        if (query.valid && query.timestamp)
+          query.timestamp->getValue(&value);
         std::memcpy(data.data() + offset, &value, sizeof(value));
         break;
       }
@@ -165,7 +168,8 @@ private:
   struct QueryData {
     bool began = false;
     bool valid = false;
-    uint64_t value = 0;
+    Rc<VisibilityResultQuery> visibility;
+    Rc<TimestampQuery> timestamp;
   };
 
   bool ValidateAccess(D3D12_QUERY_TYPE type, UINT index) const {
@@ -214,7 +218,6 @@ private:
   ComPrivateData private_data_;
   D3D12_QUERY_HEAP_DESC desc_ = {};
   std::vector<QueryData> queries_;
-  mutable std::atomic<uint64_t> nextTimestamp_ = 1;
   std::string name_;
 };
 

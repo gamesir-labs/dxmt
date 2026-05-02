@@ -17,7 +17,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <span>
+#include <vector>
 
 namespace dxmt {
 
@@ -93,6 +95,7 @@ public:
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
   QueryReadbacks readback;
+  std::vector<std::function<void()>> deferred_readbacks;
   uint64_t resource_initializer_event_id;
 
 private:
@@ -108,9 +111,12 @@ public:
   CommandChunk() {}
 
   void
-  reset() noexcept {
+  reset() {
     signal_frame_latency_fence_ = ~0ull;
     readback = {};
+    for (auto &readback : deferred_readbacks)
+      readback();
+    deferred_readbacks.clear();
     list_enc.reset();
     ref_tracker.clear();
     attached_cmdbuf = nullptr;
