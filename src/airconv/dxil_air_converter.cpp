@@ -86,6 +86,7 @@ struct DxilAirContext {
   uint32_t instance_id_arg = UINT32_MAX;
   uint32_t base_instance_arg = UINT32_MAX;
   AllocaInst *return_value = nullptr;
+  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
 };
 
 llvm::Error
@@ -859,6 +860,109 @@ AtomicOpFromDxil(uint32_t op) {
   }
 }
 
+struct DxilBarrierInfo {
+  llvm::air::MemFlags mem_flags = llvm::air::MemFlags::None;
+  llvm::air::ThreadScope scope = llvm::air::ThreadScope::Threadgroup;
+  bool execution_sync = false;
+};
+
+static bool
+HasFlag(uint32_t value, uint32_t flag) {
+  return (value & flag) != 0;
+}
+
+static llvm::air::MemFlags
+AppendMemFlags(llvm::air::MemFlags lhs, llvm::air::MemFlags rhs) {
+  return static_cast<llvm::air::MemFlags>(uint32_t(lhs) | uint32_t(rhs));
+}
+
+static llvm::air::ThreadScope
+AppendThreadScope(llvm::air::ThreadScope lhs, llvm::air::ThreadScope rhs) {
+  return static_cast<llvm::air::ThreadScope>(uint32_t(lhs) | uint32_t(rhs));
+}
+
+static bool
+SupportsNonExecutionBarrier(const DxilAirContext &ctx) {
+  return ctx.metal_version >= SM50_SHADER_METAL_320;
+}
+
+DxilBarrierInfo
+BarrierInfoFromLegacyMode(uint32_t mode) {
+  constexpr uint32_t kSyncThreadGroup = 1u;
+  constexpr uint32_t kUavFenceGlobal = 2u;
+  constexpr uint32_t kUavFenceThreadGroup = 4u;
+  constexpr uint32_t kTgsmFence = 8u;
+
+  DxilBarrierInfo info = {};
+  info.execution_sync = HasFlag(mode, kSyncThreadGroup);
+  if (HasFlag(mode, kTgsmFence))
+    info.mem_flags =
+        AppendMemFlags(info.mem_flags, llvm::air::MemFlags::Threadgroup);
+  if (HasFlag(mode, kUavFenceGlobal) || HasFlag(mode, kUavFenceThreadGroup)) {
+    info.mem_flags =
+        AppendMemFlags(info.mem_flags, llvm::air::MemFlags::Device);
+    info.mem_flags =
+        AppendMemFlags(info.mem_flags, llvm::air::MemFlags::Texture);
+  }
+  if (HasFlag(mode, kUavFenceGlobal))
+    info.scope = AppendThreadScope(info.scope, llvm::air::ThreadScope::Device);
+  return info;
+}
+
+std::optional<uint32_t>
+TranslateMemoryTypeBarrierMode(uint32_t memory_type_flags,
+                               uint32_t semantic_flags) {
+  constexpr uint32_t kUavMemory = 1u;
+  constexpr uint32_t kGroupSharedMemory = 2u;
+  constexpr uint32_t kNodeInputMemory = 4u;
+  constexpr uint32_t kNodeOutputMemory = 8u;
+  constexpr uint32_t kAllMemory = 0xfu;
+  constexpr uint32_t kGroupSync = 1u;
+  constexpr uint32_t kGroupScope = 2u;
+  constexpr uint32_t kDeviceScope = 4u;
+  constexpr uint32_t kLegacyMemoryFlags = kUavMemory | kGroupSharedMemory;
+  constexpr uint32_t kLegacySemanticFlags =
+      kGroupSync | kGroupScope | kDeviceScope;
+  constexpr uint32_t kSyncThreadGroup = 1u;
+  constexpr uint32_t kUavFenceGlobal = 2u;
+  constexpr uint32_t kUavFenceThreadGroup = 4u;
+  constexpr uint32_t kTgsmFence = 8u;
+
+  if (semantic_flags & ~kLegacySemanticFlags)
+    return std::nullopt;
+
+  if (memory_type_flags == kAllMemory)
+    memory_type_flags &= kLegacyMemoryFlags;
+  if (memory_type_flags & (kNodeInputMemory | kNodeOutputMemory))
+    return std::nullopt;
+  if (memory_type_flags & ~kLegacyMemoryFlags)
+    return std::nullopt;
+
+  uint32_t mode = 0;
+  if (memory_type_flags & kGroupSharedMemory)
+    mode |= kTgsmFence;
+  if (HasFlag(memory_type_flags, kUavMemory)) {
+    if (semantic_flags & kDeviceScope)
+      mode |= kUavFenceGlobal;
+    else if (semantic_flags & kGroupScope)
+      mode |= kUavFenceThreadGroup;
+  }
+  if (semantic_flags & kGroupSync)
+    mode |= kSyncThreadGroup;
+  return mode;
+}
+
+void
+EmitBarrier(const DxilBarrierInfo &info, DxilAirContext &ctx) {
+  const bool non_execution_barrier = SupportsNonExecutionBarrier(ctx);
+  if (info.mem_flags != llvm::air::MemFlags::None && non_execution_barrier)
+    ctx.air.CreateAtomicFence(info.mem_flags, info.scope);
+  if (info.execution_sync)
+    ctx.air.CreateBarrier(non_execution_barrier
+                              ? llvm::air::MemFlags::None
+                              : info.mem_flags);
+}
+
 Value *
 LoadSignatureInput(const CallBase &call, DxilAirContext &ctx) {
   const auto element_id = ConstantOperandU32(call, 1).value_or(0);
@@ -1296,8 +1400,30 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     return Error::success();
   }
   if (name == "Barrier") {
-    ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+    const auto mode = ConstantOperandU32(call, 1);
+    if (!mode)
+      return UnsupportedDxilCall(call, "barrier mode must be constant", ctx);
+    EmitBarrier(BarrierInfoFromLegacyMode(*mode), ctx);
     return Error::success();
+  }
+  if (name == "BarrierByMemoryType") {
+    const auto memory_type_flags = ConstantOperandU32(call, 1);
+    const auto semantic_flags = ConstantOperandU32(call, 2);
+    if (!memory_type_flags || !semantic_flags)
+      return UnsupportedDxilCall(
+          call, "memory type barrier flags must be constant", ctx);
+    const auto mode =
+        TranslateMemoryTypeBarrierMode(*memory_type_flags, *semantic_flags);
+    if (!mode)
+      return UnsupportedDxilCall(
+          call, "node/reorder scoped memory type barrier is unsupported", ctx);
+    EmitBarrier(BarrierInfoFromLegacyMode(*mode), ctx);
+    return Error::success();
+  }
+  if (name == "BarrierByMemoryHandle" ||
+      name == "BarrierByNodeRecordHandle") {
+    return UnsupportedDxilCall(
+        call, "handle-scoped barriers are unsupported", ctx);
   }
   if (auto *math = BuildDxilMath(call, name, ctx)) {
     ctx.values[&call] = math;
@@ -1857,6 +1983,7 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
   auto *entry_block = BasicBlock::Create(context, "entry.stub");
   IRBuilder<> builder(entry_block);
   llvm::air::AIRBuilder air_builder(builder, null_debug);
+  const auto metal_version = GetMetalVersion(args);
 
   DxilAirContext dxil_ctx{
       .llvm = context,
@@ -1867,6 +1994,7 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
       .translation = *translation,
       .source_function = source,
       .shader_info = std::move(shader_info),
+      .metal_version = metal_version,
   };
   if (translation->shader_kind == uint32_t(DxilStage::Vertex) && ia_layout) {
     dxil_ctx.vertex_slot_mask = ia_layout->slot_mask;
@@ -1901,7 +2029,7 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
   if (auto err = LowerFunction(*source, dxil_ctx))
     return err;
 
-  dxbc::setup_metal_version(module, GetMetalVersion(args));
+  dxbc::setup_metal_version(module, metal_version);
   switch (translation->shader_kind) {
   case uint32_t(DxilStage::Vertex):
     module.getOrInsertNamedMetadata("air.vertex")->addOperand(metadata);
