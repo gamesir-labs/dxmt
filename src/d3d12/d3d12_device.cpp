@@ -266,56 +266,76 @@ IsSupportedUavDimension(D3D12_UAV_DIMENSION dimension) {
   }
 }
 
-static void
+static bool
 ValidateShaderResourceView(ID3D12Resource *resource,
                            const D3D12_SHADER_RESOURCE_VIEW_DESC &desc) {
   if (!IsSupportedSrvDimension(desc.ViewDimension)) {
     WARN("D3D12Device: unsupported SRV dimension ",
          uint32_t(desc.ViewDimension));
-    return;
+    return false;
   }
   if (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-    if (resource && !IsBufferResource(resource))
+    if (resource && !IsBufferResource(resource)) {
       WARN("D3D12Device: buffer SRV created for non-buffer resource");
+      return false;
+    }
     const auto raw = (desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
     const auto structured = desc.Buffer.StructureByteStride != 0;
     const auto typed = desc.Format != DXGI_FORMAT_UNKNOWN;
-    if ((raw && structured) || (raw && typed) || (structured && typed))
+    if ((raw && structured) || (raw && typed) || (structured && typed)) {
       WARN("D3D12Device: ambiguous buffer SRV typed/raw/structured descriptor");
+      return false;
+    }
     if (raw && desc.Format != DXGI_FORMAT_R32_TYPELESS &&
-        desc.Format != DXGI_FORMAT_UNKNOWN)
+        desc.Format != DXGI_FORMAT_UNKNOWN) {
       WARN("D3D12Device: raw buffer SRV should use R32_TYPELESS/UNKNOWN format");
-    return;
+      return false;
+    }
+    return true;
   }
-  if (resource && !IsTextureResource(resource))
+  if (resource && !IsTextureResource(resource)) {
     WARN("D3D12Device: texture SRV created for non-texture resource");
+    return false;
+  }
+  return true;
 }
 
-static void
+static bool
 ValidateUnorderedAccessView(ID3D12Resource *resource,
                             ID3D12Resource *counter_resource,
                             const D3D12_UNORDERED_ACCESS_VIEW_DESC &desc) {
   if (!IsSupportedUavDimension(desc.ViewDimension)) {
     WARN("D3D12Device: unsupported UAV dimension ",
          uint32_t(desc.ViewDimension));
-    return;
+    return false;
   }
   if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-    if (resource && !IsBufferResource(resource))
+    if (resource && !IsBufferResource(resource)) {
       WARN("D3D12Device: buffer UAV created for non-buffer resource");
+      return false;
+    }
     const auto raw = (desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
     const auto structured = desc.Buffer.StructureByteStride != 0;
     const auto typed = desc.Format != DXGI_FORMAT_UNKNOWN;
-    if ((raw && structured) || (raw && typed) || (structured && typed))
+    if ((raw && structured) || (raw && typed) || (structured && typed)) {
       WARN("D3D12Device: ambiguous buffer UAV typed/raw/structured descriptor");
-    if (counter_resource && !structured)
+      return false;
+    }
+    if (counter_resource && !structured) {
       WARN("D3D12Device: UAV counter resource is only valid for structured buffer UAVs");
-    return;
+      return false;
+    }
+    return true;
   }
-  if (resource && !IsTextureResource(resource))
+  if (resource && !IsTextureResource(resource)) {
     WARN("D3D12Device: texture UAV created for non-texture resource");
-  if (counter_resource)
+    return false;
+  }
+  if (counter_resource) {
     WARN("D3D12Device: UAV counter resource is ignored for texture UAVs");
+    return false;
+  }
+  return true;
 }
 
 static void
@@ -1027,7 +1047,8 @@ public:
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
-      ValidateShaderResourceView(resource, *desc);
+      if (!ValidateShaderResourceView(resource, *desc))
+        return;
       record->desc.srv = *desc;
       record->has_desc = true;
     }
@@ -1047,7 +1068,8 @@ public:
     record->resource = resource;
     record->counter_resource = counter_resource;
     if (desc) {
-      ValidateUnorderedAccessView(resource, counter_resource, *desc);
+      if (!ValidateUnorderedAccessView(resource, counter_resource, *desc))
+        return;
       record->desc.uav = *desc;
       record->has_desc = true;
     }

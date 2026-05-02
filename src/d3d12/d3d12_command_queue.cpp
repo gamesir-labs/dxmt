@@ -3037,11 +3037,15 @@ private:
       return;
     }
     if (descriptor.desc.cbv.BufferLocation &
-        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) {
       WARN("D3D12CommandQueue: root/table CBV BufferLocation is not 256-byte aligned");
+      return;
+    }
     if (descriptor.desc.cbv.SizeInBytes &
-        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) {
       WARN("D3D12CommandQueue: root/table CBV SizeInBytes is not 256-byte aligned");
+      return;
+    }
 
     Resource *resource = nullptr;
     const auto offset =
@@ -3587,6 +3591,7 @@ private:
     if (type == DescriptorRecordType::ConstantBufferView &&
         (it->second & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
       WARN("D3D12CommandQueue: root CBV address is not 256-byte aligned");
+      return;
     }
 
     DescriptorRecord descriptor = {};
