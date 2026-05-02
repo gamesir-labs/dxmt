@@ -1384,8 +1384,11 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
       return UnsupportedDxilCall(call, "atomic without resolved UAV handle", ctx);
     auto *offset = name == "AtomicBinOp" ? OperandValue(call, 3, ctx)
                                          : OperandValue(call, 2, ctx);
+    if (!offset)
+      offset = ctx.builder.getInt32(0);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
-    auto *gep = ctx.builder.CreateGEP(pointee, ptr, offset ? offset : ctx.builder.getInt32(0));
+    auto *word_index = ctx.builder.CreateLShr(offset, 2);
+    auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
     Value *value = nullptr;
     if (name == "AtomicCompareExchange") {
       auto *cmp = CastValue(OperandValue(call, 5, ctx), pointee, ctx);
