@@ -3,6 +3,7 @@
 #include "airconv_context.hpp"
 #include "airconv_error.hpp"
 #include "airconv_internal.hpp"
+#include "dxbc_converter.hpp"
 #include "dxil_air_converter.hpp"
 #include "metallib_writer.hpp"
 
@@ -133,49 +134,65 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
   if (!translation)
     return;
 
+  dxmt::dxbc::ShaderInfo shader_info;
+  dxmt::airconv::BuildDxilShaderInfo(*translation, shader_info);
+
   for (const auto &resource : translation->resources) {
     switch (resource.resource_class) {
-    case dxmt::dxil::DxilTranslationResourceClass::Cbv:
+    case dxmt::dxil::DxilTranslationResourceClass::Cbv: {
+      auto it = shader_info.cbufferMap.find(resource.id);
+      if (it == shader_info.cbufferMap.end())
+        break;
       shader.cbuffer_arguments.push_back({
           .Type = SM50BindingType::ConstantBuffer,
           .SM50BindingSlot = resource.id,
           .Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
               MTL_SM50_SHADER_ARGUMENT_BUFFER |
               MTL_SM50_SHADER_ARGUMENT_READ_ACCESS),
-          .StructurePtrOffset = resource.id,
+          .StructurePtrOffset = it->second.arg_index,
       });
       break;
-    case dxmt::dxil::DxilTranslationResourceClass::Sampler:
+    }
+    case dxmt::dxil::DxilTranslationResourceClass::Sampler: {
+      auto it = shader_info.samplerMap.find(resource.id);
+      if (it == shader_info.samplerMap.end())
+        break;
       shader.resource_arguments.push_back({
           .Type = SM50BindingType::Sampler,
           .SM50BindingSlot = resource.id,
           .Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(0),
-          .StructurePtrOffset =
-              GetArgumentIndex(SM50BindingType::Sampler, resource.id),
+          .StructurePtrOffset = it->second.arg_index,
       });
       break;
-    case dxmt::dxil::DxilTranslationResourceClass::Srv:
+    }
+    case dxmt::dxil::DxilTranslationResourceClass::Srv: {
+      auto it = shader_info.srvMap.find(resource.id);
+      if (it == shader_info.srvMap.end())
+        break;
       shader.resource_arguments.push_back({
           .Type = SM50BindingType::SRV,
           .SM50BindingSlot = resource.id,
           .Flags = IsBufferResource(resource)
                        ? BufferArgumentFlags(resource, false)
                        : TextureArgumentFlags(resource, false),
-          .StructurePtrOffset =
-              GetArgumentIndex(SM50BindingType::SRV, resource.id),
+          .StructurePtrOffset = it->second.arg_index,
       });
       break;
-    case dxmt::dxil::DxilTranslationResourceClass::Uav:
+    }
+    case dxmt::dxil::DxilTranslationResourceClass::Uav: {
+      auto it = shader_info.uavMap.find(resource.id);
+      if (it == shader_info.uavMap.end())
+        break;
       shader.resource_arguments.push_back({
           .Type = SM50BindingType::UAV,
           .SM50BindingSlot = resource.id,
           .Flags = IsBufferResource(resource)
                        ? BufferArgumentFlags(resource, true)
                        : TextureArgumentFlags(resource, true),
-          .StructurePtrOffset =
-              GetArgumentIndex(SM50BindingType::UAV, resource.id),
+          .StructurePtrOffset = it->second.arg_index,
       });
       break;
+    }
     default:
       break;
     }

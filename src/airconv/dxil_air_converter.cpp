@@ -1433,8 +1433,8 @@ PatchPhiNodes(const Function &source, DxilAirContext &ctx) {
 }
 
 void
-BuildShaderInfo(const dxil::DxilTranslationInfo &translation,
-                dxbc::ShaderInfo &shader_info) {
+BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
+                        dxbc::ShaderInfo &shader_info) {
   using shader::common::ResourceType;
   for (const auto &resource : translation.resources) {
     const auto range_id = resource.id;
@@ -1686,6 +1686,12 @@ GetMetalVersion(SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
 
 } // namespace
 
+void
+BuildDxilShaderInfo(const dxil::DxilTranslationInfo &translation,
+                    dxbc::ShaderInfo &shader_info) {
+  BuildDxilShaderInfoImpl(translation, shader_info);
+}
+
 llvm::Error
 ConvertDxilToAir(const dxil::Parser &parser, const char *name,
                  LLVMContext &context, Module &module,
@@ -1710,7 +1716,7 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
     return Unsupported("DXIL entry function was not found");
 
   dxbc::ShaderInfo shader_info;
-  BuildShaderInfo(*translation, shader_info);
+  BuildDxilShaderInfoImpl(*translation, shader_info);
 
   SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout = nullptr;
   dxbc::args_get_data<SM50_SHADER_IA_INPUT_LAYOUT,

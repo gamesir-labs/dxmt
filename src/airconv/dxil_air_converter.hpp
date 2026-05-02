@@ -7,6 +7,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 
+namespace dxmt::dxbc {
+class ShaderInfo;
+}
+
 namespace dxmt::airconv {
 
 llvm::Error ConvertDxilToAir(const dxil::Parser &parser, const char *name,
@@ -16,5 +20,8 @@ llvm::Error ConvertDxilToAir(const dxil::Parser &parser, const char *name,
 
 void FillDxilReflection(const dxil::Parser &parser,
                         MTL_SHADER_REFLECTION *reflection);
+
+void BuildDxilShaderInfo(const dxil::DxilTranslationInfo &translation,
+                         dxbc::ShaderInfo &shader_info);
 
 } // namespace dxmt::airconv
