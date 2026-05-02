@@ -173,29 +173,29 @@ GetSubresourceSize(const Resource &resource, UINT subresource,
 
 static bool
 StateHasWriteAccess(D3D12_RESOURCE_STATES state) {
-  constexpr D3D12_RESOURCE_STATES kWriteStates =
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
-      D3D12_RESOURCE_STATE_RENDER_TARGET |
-      D3D12_RESOURCE_STATE_DEPTH_WRITE |
-      D3D12_RESOURCE_STATE_STREAM_OUT |
-      D3D12_RESOURCE_STATE_COPY_DEST |
-      D3D12_RESOURCE_STATE_RESOLVE_DEST;
-  return (state & kWriteStates) != 0;
+  constexpr uint32_t kWriteStates =
+      uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+      uint32_t(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+      uint32_t(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+      uint32_t(D3D12_RESOURCE_STATE_STREAM_OUT) |
+      uint32_t(D3D12_RESOURCE_STATE_COPY_DEST) |
+      uint32_t(D3D12_RESOURCE_STATE_RESOLVE_DEST);
+  return (uint32_t(state) & kWriteStates) != 0;
 }
 
 static bool
 StateHasReadAccess(D3D12_RESOURCE_STATES state) {
-  constexpr D3D12_RESOURCE_STATES kReadStates =
-      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
-      D3D12_RESOURCE_STATE_INDEX_BUFFER |
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
-      D3D12_RESOURCE_STATE_COPY_SOURCE |
-      D3D12_RESOURCE_STATE_DEPTH_READ |
-      D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
-      D3D12_RESOURCE_STATE_PREDICATION;
-  return (state & kReadStates) != 0;
+  constexpr uint32_t kReadStates =
+      uint32_t(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) |
+      uint32_t(D3D12_RESOURCE_STATE_INDEX_BUFFER) |
+      uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) |
+      uint32_t(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_DEPTH_READ) |
+      uint32_t(D3D12_RESOURCE_STATE_RESOLVE_SOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_PREDICATION);
+  return (uint32_t(state) & kReadStates) != 0;
 }
 
 static int
@@ -205,47 +205,47 @@ ResourceAccessForState(D3D12_RESOURCE_STATES state) {
     access |= ResourceAccess::Read;
   if (StateHasWriteAccess(state))
     access |= ResourceAccess::Write;
-  if (state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+  if (uint32_t(state) & uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     access |= ResourceAccess::UAV;
   return access;
 }
 
 static bool
 IsKnownResourceState(D3D12_RESOURCE_STATES state) {
-  constexpr D3D12_RESOURCE_STATES kKnownStates =
-      D3D12_RESOURCE_STATE_COMMON |
-      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
-      D3D12_RESOURCE_STATE_INDEX_BUFFER |
-      D3D12_RESOURCE_STATE_RENDER_TARGET |
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
-      D3D12_RESOURCE_STATE_DEPTH_WRITE |
-      D3D12_RESOURCE_STATE_DEPTH_READ |
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_STREAM_OUT |
-      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
-      D3D12_RESOURCE_STATE_COPY_DEST |
-      D3D12_RESOURCE_STATE_COPY_SOURCE |
-      D3D12_RESOURCE_STATE_RESOLVE_DEST |
-      D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
-      D3D12_RESOURCE_STATE_PREDICATION;
-  return (state & ~kKnownStates) == 0;
+  constexpr uint32_t kKnownStates =
+      uint32_t(D3D12_RESOURCE_STATE_COMMON) |
+      uint32_t(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) |
+      uint32_t(D3D12_RESOURCE_STATE_INDEX_BUFFER) |
+      uint32_t(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+      uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+      uint32_t(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+      uint32_t(D3D12_RESOURCE_STATE_DEPTH_READ) |
+      uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_STREAM_OUT) |
+      uint32_t(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) |
+      uint32_t(D3D12_RESOURCE_STATE_COPY_DEST) |
+      uint32_t(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_RESOLVE_DEST) |
+      uint32_t(D3D12_RESOURCE_STATE_RESOLVE_SOURCE) |
+      uint32_t(D3D12_RESOURCE_STATE_PREDICATION);
+  return (uint32_t(state) & ~kKnownStates) == 0;
 }
 
 static void
 WarnUnsupportedResourceState(D3D12_RESOURCE_STATES state, const char *context) {
-  constexpr D3D12_RESOURCE_STATES kWriteStates =
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
-      D3D12_RESOURCE_STATE_RENDER_TARGET |
-      D3D12_RESOURCE_STATE_DEPTH_WRITE |
-      D3D12_RESOURCE_STATE_STREAM_OUT |
-      D3D12_RESOURCE_STATE_COPY_DEST |
-      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  constexpr uint32_t kWriteStates =
+      uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+      uint32_t(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+      uint32_t(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+      uint32_t(D3D12_RESOURCE_STATE_STREAM_OUT) |
+      uint32_t(D3D12_RESOURCE_STATE_COPY_DEST) |
+      uint32_t(D3D12_RESOURCE_STATE_RESOLVE_DEST);
   if (!IsKnownResourceState(state)) {
     WARN("D3D12CommandQueue: unsupported resource state bits in ", context,
          " state=", uint32_t(state));
   }
-  const auto writes = uint32_t(state & kWriteStates);
+  const auto writes = uint32_t(state) & kWriteStates;
   if (writes && (StateHasReadAccess(state) || (writes & (writes - 1)))) {
     WARN("D3D12CommandQueue: conservative handling for combined write state in ",
          context, " state=", uint32_t(state));
