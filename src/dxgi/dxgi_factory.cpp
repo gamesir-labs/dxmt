@@ -192,8 +192,8 @@ public:
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
     InitReturnPtr(ppSwapChain);
 
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    WARN("CreateSwapChainForCoreWindow is unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(
@@ -201,8 +201,8 @@ public:
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
     InitReturnPtr(ppSwapChain);
 
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    WARN("CreateSwapChainForComposition is unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   HRESULT STDMETHODCALLTYPE EnumAdapters(UINT Adapter,
