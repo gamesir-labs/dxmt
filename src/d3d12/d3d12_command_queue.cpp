@@ -150,7 +150,7 @@ GetRootSignature(ID3D12RootSignature *root_signature) {
   return dynamic_cast<RootSignature *>(root_signature);
 }
 
-static WMTPrimitiveType
+static std::optional<WMTPrimitiveType>
 GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
   switch (topology) {
   case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
@@ -159,10 +159,12 @@ GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
     return WMTPrimitiveTypeLine;
   case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
     return WMTPrimitiveTypeLineStrip;
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+    return WMTPrimitiveTypeTriangle;
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
     return WMTPrimitiveTypeTriangleStrip;
   default:
-    return WMTPrimitiveTypeTriangle;
+    return std::nullopt;
   }
 }
 
@@ -2460,6 +2462,11 @@ private:
     }
 
     const auto primitive = GetPrimitiveType(state.topology);
+    if (!primitive) {
+      WARN("D3D12CommandQueue: indirect draw skipped because primitive topology is unsupported topology=",
+           uint32_t(state.topology));
+      return;
+    }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
     auto attachments = BuildRenderPassAttachments(state);
@@ -2517,7 +2524,7 @@ private:
 
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
       draw.type = WMTRenderCommandDrawIndirect;
-      draw.primitive_type = primitive;
+      draw.primitive_type = *primitive;
       draw.indirect_args_buffer = indirect_buffer;
       draw.indirect_args_offset = indirect_offset;
       enc.endPass();
@@ -2559,6 +2566,11 @@ private:
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
     const auto primitive = GetPrimitiveType(state.topology);
+    if (!primitive) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped because primitive topology is unsupported topology=",
+           uint32_t(state.topology));
+      return;
+    }
     const auto index_type = GetIndexType(state.index_buffer->Format);
     const UINT64 index_offset =
         index_resource->GetHeapOffset() + index_resource_offset;
@@ -2622,7 +2634,7 @@ private:
       auto &draw =
           enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
       draw.type = WMTRenderCommandDrawIndexedIndirect;
-      draw.primitive_type = primitive;
+      draw.primitive_type = *primitive;
       draw.index_type = index_type;
       draw.index_buffer = index_allocation->buffer();
       draw.index_buffer_offset = index_offset;
@@ -3958,6 +3970,11 @@ private:
     }
 
     const auto primitive = GetPrimitiveType(state.topology);
+    if (!primitive) {
+      WARN("D3D12CommandQueue: draw skipped because primitive topology is unsupported topology=",
+           uint32_t(state.topology));
+      return;
+    }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
     auto attachments = BuildRenderPassAttachments(state);
@@ -4000,7 +4017,7 @@ private:
 
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
       draw.type = WMTRenderCommandDraw;
-      draw.primitive_type = primitive;
+      draw.primitive_type = *primitive;
       draw.vertex_start = vertex_start;
       draw.vertex_count = vertex_count;
       draw.instance_count = instance_count;
@@ -4044,6 +4061,11 @@ private:
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
     const auto primitive = GetPrimitiveType(state.topology);
+    if (!primitive) {
+      WARN("D3D12CommandQueue: indexed draw skipped because primitive topology is unsupported topology=",
+           uint32_t(state.topology));
+      return;
+    }
     const auto index_type = GetIndexType(state.index_buffer->Format);
     const UINT64 index_offset = index_resource->GetHeapOffset() +
                                 index_resource_offset +
@@ -4093,7 +4115,7 @@ private:
 
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       draw.type = WMTRenderCommandDrawIndexed;
-      draw.primitive_type = primitive;
+      draw.primitive_type = *primitive;
       draw.index_type = index_type;
       draw.index_count = index_count;
       draw.index_buffer = index_allocation->buffer();
