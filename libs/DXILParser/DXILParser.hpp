@@ -244,6 +244,7 @@ struct LlvmOperandInfo {
   std::string text;
   bool is_integer = false;
   uint64_t integer_value = 0;
+  std::vector<uint64_t> aggregate_integer_values;
 };
 
 enum DxilOpcodeSemanticFlag : uint32_t {
@@ -339,6 +340,7 @@ struct DxilTypedOperandInfo {
   std::string text;
   bool is_integer = false;
   uint64_t integer_value = 0;
+  std::vector<uint64_t> aggregate_integer_values;
 };
 
 struct DxilTypedOperationInfo {

@@ -316,6 +316,24 @@ ConstantUInt32(const llvm::Value *value) {
   return uint32_t(*value64);
 }
 
+std::vector<uint64_t>
+ConstantAggregateUInt64Values(const llvm::Value *value) {
+  const auto *constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+  const auto *structure = value ? llvm::dyn_cast<llvm::StructType>(value->getType()) : nullptr;
+  if (!constant || !structure || structure->isOpaque())
+    return {};
+
+  std::vector<uint64_t> values;
+  values.reserve(structure->getNumElements());
+  for (uint32_t i = 0; i < structure->getNumElements(); i++) {
+    const auto element = ConstantUInt64(constant->getAggregateElement(i));
+    if (!element)
+      return {};
+    values.push_back(*element);
+  }
+  return values;
+}
+
 std::optional<uint32_t>
 IntegerOperandUInt32(const std::vector<LlvmOperandInfo> &operands,
                      size_t index) {
@@ -325,12 +343,17 @@ IntegerOperandUInt32(const std::vector<LlvmOperandInfo> &operands,
   return uint32_t(operands[index].integer_value);
 }
 
-std::optional<uint64_t>
-IntegerOperandUInt64(const std::vector<LlvmOperandInfo> &operands,
-                     size_t index) {
-  if (index >= operands.size() || !operands[index].is_integer)
+std::optional<uint32_t>
+AggregateIntegerOperandUInt32(const std::vector<LlvmOperandInfo> &operands,
+                              size_t operand_index,
+                              size_t element_index) {
+  if (operand_index >= operands.size())
     return std::nullopt;
-  return operands[index].integer_value;
+  const auto &values = operands[operand_index].aggregate_integer_values;
+  if (element_index >= values.size() ||
+      values[element_index] > std::numeric_limits<uint32_t>::max())
+    return std::nullopt;
+  return uint32_t(values[element_index]);
 }
 
 void
@@ -350,6 +373,7 @@ AppendTypedOperand(DxilTypedOperationInfo &typed,
       .text = operand.text,
       .is_integer = operand.is_integer,
       .integer_value = operand.integer_value,
+      .aggregate_integer_values = operand.aggregate_integer_values,
   });
 }
 
@@ -483,9 +507,11 @@ ParseDxilTypedOperation(std::string_view name,
     typed.kind = DxilTypedOperationKind::CreateHandleFromBinding;
     AppendTypedOperands(typed, operands,
                         {"binding", "index", "non_uniform_index"});
-    if (auto binding = IntegerOperandUInt64(operands, 1)) {
-      typed.resource_lower_bound = uint32_t(*binding & 0xffffffffu);
-      typed.resource_space = uint32_t((*binding >> 32) & 0xffffffffu);
+    if (auto lower_bound = AggregateIntegerOperandUInt32(operands, 1, 0);
+        lower_bound) {
+      typed.resource_lower_bound = *lower_bound;
+      typed.resource_space =
+          AggregateIntegerOperandUInt32(operands, 1, 2).value_or(0);
       typed.has_resource_binding = true;
     }
     SetTypedUInt32(operands, 2, typed.resource_index,
@@ -738,6 +764,7 @@ ParseLlvmOperand(const llvm::Value *value) {
     info.is_integer = true;
     info.integer_value = *integer;
   }
+  info.aggregate_integer_values = ConstantAggregateUInt64Values(value);
   return info;
 }
 
@@ -4371,7 +4398,13 @@ BuildTranslationResource(const ShaderReflectionResourceInfo &resource) {
 void
 ApplyOperationToTranslationResource(DxilTranslationResourceInfo &resource,
                                     const DxilTranslationOperationInfo &operation) {
-  if (!operation.has_resource_id || operation.resource_id != resource.id)
+  const bool id_matches =
+      operation.has_resource_id && operation.resource_id == resource.id;
+  const bool binding_matches =
+      operation.typed.has_resource_binding &&
+      operation.typed.resource_space == resource.space &&
+      operation.typed.resource_lower_bound == resource.lower_bound;
+  if (!id_matches && !binding_matches)
     return;
 
   switch (operation.semantic_kind) {
