@@ -15,6 +15,11 @@
 namespace dxmt::d3d12 {
 namespace {
 
+static UINT64
+Align(UINT64 value, UINT64 alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
 struct BufferGpuVirtualAddressRange {
   D3D12_GPU_VIRTUAL_ADDRESS base = 0;
   UINT64 size = 0;
@@ -59,6 +64,143 @@ GetTextureType(const D3D12_RESOURCE_DESC &desc) {
     return desc.DepthOrArraySize > 1 ? WMTTextureType2DMultisampleArray
                                      : WMTTextureType2DMultisample;
   return desc.DepthOrArraySize > 1 ? WMTTextureType2DArray : WMTTextureType2D;
+}
+
+struct TextureSubresourceLayout {
+  UINT64 width = 0;
+  UINT height = 0;
+  UINT depth = 0;
+  UINT block_width = 1;
+  UINT block_height = 1;
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  UINT row_pitch = 0;
+  UINT slice_pitch = 0;
+  UINT element_size = 0;
+};
+
+static bool
+IsSingleSubresourceTexture2D(const D3D12_RESOURCE_DESC &desc,
+                             UINT sub_resource) {
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+         sub_resource == 0 && (desc.MipLevels == 0 || desc.MipLevels == 1) &&
+         desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1;
+}
+
+static HRESULT
+GetTextureSubresourceLayout(WMT::Device device,
+                            const D3D12_RESOURCE_DESC &desc,
+                            TextureSubresourceLayout &layout) {
+  MTL_DXGI_FORMAT_DESC format = {};
+  if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format)))
+    return E_INVALIDARG;
+
+  layout.width = desc.Width;
+  layout.height = desc.Height;
+  layout.depth = 1;
+  layout.block_width = (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+  layout.block_height = (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+  layout.row_count = std::max<UINT>(
+      1, (layout.height + layout.block_height - 1) / layout.block_height);
+  layout.element_size = (format.Flag & MTL_DXGI_FORMAT_BC)
+                            ? format.BlockSize
+                            : format.BytesPerTexel;
+  if (!layout.element_size)
+    return E_INVALIDARG;
+
+  const UINT64 block_columns =
+      (layout.width + layout.block_width - 1) / layout.block_width;
+  layout.row_size = block_columns * layout.element_size;
+  layout.row_pitch = static_cast<UINT>(
+      Align(layout.row_size, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+  layout.slice_pitch = layout.row_pitch * layout.row_count;
+  return S_OK;
+}
+
+static bool
+NormalizeTextureBox(const D3D12_RESOURCE_DESC &desc,
+                    const TextureSubresourceLayout &layout,
+                    const D3D12_BOX *box, D3D12_BOX &normalized) {
+  if (box) {
+    normalized = *box;
+  } else {
+    normalized.left = 0;
+    normalized.top = 0;
+    normalized.front = 0;
+    normalized.right = static_cast<UINT>(layout.width);
+    normalized.bottom = layout.height;
+    normalized.back = layout.depth;
+  }
+
+  if (normalized.left >= normalized.right || normalized.top >= normalized.bottom ||
+      normalized.front >= normalized.back)
+    return false;
+  if (normalized.right > desc.Width || normalized.bottom > desc.Height ||
+      normalized.back > 1)
+    return false;
+  if ((normalized.left % layout.block_width) ||
+      (normalized.top % layout.block_height))
+    return false;
+  return true;
+}
+
+static UINT64
+TextureRowOffset(const D3D12_BOX &box,
+                 const TextureSubresourceLayout &layout, UINT row) {
+  const UINT block_x = box.left / layout.block_width;
+  const UINT block_y = (box.top / layout.block_height) + row;
+  return static_cast<UINT64>(block_y) * layout.row_pitch +
+         static_cast<UINT64>(block_x) * layout.element_size;
+}
+
+static UINT
+TextureBoxRowCount(const D3D12_BOX &box,
+                   const TextureSubresourceLayout &layout) {
+  return std::max<UINT>(
+      1, (box.bottom - box.top + layout.block_height - 1) /
+             layout.block_height);
+}
+
+static UINT64
+TextureBoxRowSize(const D3D12_BOX &box,
+                  const TextureSubresourceLayout &layout) {
+  const UINT64 block_columns =
+      (box.right - box.left + layout.block_width - 1) / layout.block_width;
+  return block_columns * layout.element_size;
+}
+
+static HRESULT
+ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT row_pitch,
+                           UINT slice_pitch) {
+  if (row_pitch < row_size)
+    return E_INVALIDARG;
+  if (slice_pitch && row_count > 1 &&
+      slice_pitch < row_pitch * (row_count - 1) + row_size)
+    return E_INVALIDARG;
+  if (row_count == 1 && slice_pitch && slice_pitch < row_size)
+    return E_INVALIDARG;
+  return S_OK;
+}
+
+static HRESULT
+CopyTextureRowsToMemory(void *dst_data, UINT dst_row_pitch,
+                        UINT dst_slice_pitch, const void *src_data,
+                        UINT src_row_pitch, UINT src_slice_pitch,
+                        UINT64 row_size, UINT row_count) {
+  if (!dst_data || !src_data)
+    return E_POINTER;
+  if (FAILED(ValidateTextureCopyPitches(row_size, row_count, src_row_pitch,
+                                        src_slice_pitch)) ||
+      FAILED(ValidateTextureCopyPitches(row_size, row_count, dst_row_pitch,
+                                        dst_slice_pitch)))
+    return E_INVALIDARG;
+
+  auto *dst = static_cast<char *>(dst_data);
+  const auto *src = static_cast<const char *>(src_data);
+  for (UINT row = 0; row < row_count; row++)
+    std::memcpy(dst + row * dst_row_pitch, src + row * src_row_pitch,
+                static_cast<size_t>(row_size));
+  return S_OK;
 }
 
 class ResourceImpl final : public ComObjectWithInitialRef<ID3D12Resource>,
@@ -179,13 +321,29 @@ public:
   HRESULT STDMETHODCALLTYPE WriteToSubresource(
       UINT dst_sub_resource, const D3D12_BOX *dst_box, const void *src_data,
       UINT src_row_pitch, UINT src_slice_pitch) override {
-    return E_NOTIMPL;
+    if (!src_data)
+      return E_POINTER;
+
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+      return WriteBufferSubresource(dst_sub_resource, dst_box, src_data,
+                                    src_row_pitch, src_slice_pitch);
+
+    return WriteTextureSubresource(dst_sub_resource, dst_box, src_data,
+                                   src_row_pitch, src_slice_pitch);
   }
 
   HRESULT STDMETHODCALLTYPE ReadFromSubresource(
       void *dst_data, UINT dst_row_pitch, UINT dst_slice_pitch,
       UINT src_sub_resource, const D3D12_BOX *src_box) override {
-    return E_NOTIMPL;
+    if (!dst_data)
+      return E_POINTER;
+
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+      return ReadBufferSubresource(dst_data, dst_row_pitch, dst_slice_pitch,
+                                   src_sub_resource, src_box);
+
+    return ReadTextureSubresource(dst_data, dst_row_pitch, dst_slice_pitch,
+                                  src_sub_resource, src_box);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -239,6 +397,265 @@ public:
   }
 
 private:
+  HRESULT WriteBufferSubresource(UINT dst_sub_resource,
+                                 const D3D12_BOX *dst_box,
+                                 const void *src_data, UINT src_row_pitch,
+                                 UINT src_slice_pitch) {
+    if (dst_sub_resource != 0 || !buffer_allocation_ ||
+        !buffer_allocation_->mappedMemory(0))
+      return E_INVALIDARG;
+
+    const UINT64 begin = dst_box ? dst_box->left : 0;
+    const UINT64 end = dst_box ? dst_box->right : desc_.Width;
+    if (begin >= end || end > desc_.Width)
+      return E_INVALIDARG;
+
+    const UINT64 row_size = end - begin;
+    if (row_size > UINT32_MAX)
+      return E_INVALIDARG;
+
+    UINT row_count = 1;
+    if (dst_box) {
+      if (dst_box->top >= dst_box->bottom ||
+          dst_box->front >= dst_box->back)
+        return E_INVALIDARG;
+      row_count = (dst_box->bottom - dst_box->top) *
+                  (dst_box->back - dst_box->front);
+      if (row_size * row_count > desc_.Width - begin)
+        return E_INVALIDARG;
+    }
+    if (FAILED(ValidateTextureCopyPitches(row_size, row_count,
+                                          src_row_pitch ? src_row_pitch
+                                                        : static_cast<UINT>(row_size),
+                                          src_slice_pitch)))
+      return E_INVALIDARG;
+
+    auto *dst = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
+                heap_offset_ + begin;
+    const auto *src = static_cast<const char *>(src_data);
+    const UINT dst_row_pitch = static_cast<UINT>(row_size);
+    const UINT src_pitch = src_row_pitch ? src_row_pitch : dst_row_pitch;
+    for (UINT row = 0; row < row_count; row++)
+      std::memcpy(dst + row * dst_row_pitch, src + row * src_pitch,
+                  static_cast<size_t>(row_size));
+
+    buffer_allocation_->flushCpuShadow(heap_offset_ + begin, row_size * row_count);
+    return S_OK;
+  }
+
+  HRESULT ReadBufferSubresource(void *dst_data, UINT dst_row_pitch,
+                                UINT dst_slice_pitch, UINT src_sub_resource,
+                                const D3D12_BOX *src_box) {
+    if (src_sub_resource != 0 || !buffer_allocation_ ||
+        !buffer_allocation_->mappedMemory(0))
+      return E_INVALIDARG;
+
+    const UINT64 begin = src_box ? src_box->left : 0;
+    const UINT64 end = src_box ? src_box->right : desc_.Width;
+    if (begin >= end || end > desc_.Width)
+      return E_INVALIDARG;
+
+    const UINT64 row_size = end - begin;
+    if (row_size > UINT32_MAX)
+      return E_INVALIDARG;
+
+    UINT row_count = 1;
+    if (src_box) {
+      if (src_box->top >= src_box->bottom ||
+          src_box->front >= src_box->back)
+        return E_INVALIDARG;
+      row_count = (src_box->bottom - src_box->top) *
+                  (src_box->back - src_box->front);
+      if (row_size * row_count > desc_.Width - begin)
+        return E_INVALIDARG;
+    }
+    const UINT dst_pitch =
+        dst_row_pitch ? dst_row_pitch : static_cast<UINT>(row_size);
+    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, dst_pitch,
+                                          dst_slice_pitch)))
+      return E_INVALIDARG;
+
+    const auto *src =
+        static_cast<const char *>(buffer_allocation_->mappedMemory(0)) +
+        heap_offset_ + begin;
+    auto *dst = static_cast<char *>(dst_data);
+    for (UINT row = 0; row < row_count; row++)
+      std::memcpy(dst + row * dst_pitch, src + row * row_size,
+                  static_cast<size_t>(row_size));
+    return S_OK;
+  }
+
+  HRESULT WriteTextureSubresource(UINT dst_sub_resource,
+                                  const D3D12_BOX *dst_box,
+                                  const void *src_data, UINT src_row_pitch,
+                                  UINT src_slice_pitch) {
+    if (!IsSingleSubresourceTexture2D(desc_, dst_sub_resource) ||
+        !texture_ || !texture_allocation_)
+      return E_NOTIMPL;
+
+    TextureSubresourceLayout layout = {};
+    HRESULT hr = GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
+                                             desc_, layout);
+    if (FAILED(hr))
+      return hr;
+
+    D3D12_BOX box = {};
+    if (!NormalizeTextureBox(desc_, layout, dst_box, box))
+      return E_INVALIDARG;
+
+    const UINT row_count = TextureBoxRowCount(box, layout);
+    const UINT64 row_size = TextureBoxRowSize(box, layout);
+    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, src_row_pitch,
+                                          src_slice_pitch)))
+      return E_INVALIDARG;
+
+    if (texture_allocation_->mappedMemory)
+      return WriteMappedTextureRows(box, layout, src_data, src_row_pitch,
+                                    row_size, row_count);
+
+    return WriteTextureRowsViaBlit(box, layout, src_data, src_row_pitch,
+                                   row_size, row_count);
+  }
+
+  HRESULT ReadTextureSubresource(void *dst_data, UINT dst_row_pitch,
+                                 UINT dst_slice_pitch, UINT src_sub_resource,
+                                 const D3D12_BOX *src_box) {
+    if (!IsSingleSubresourceTexture2D(desc_, src_sub_resource) ||
+        !texture_ || !texture_allocation_)
+      return E_NOTIMPL;
+
+    TextureSubresourceLayout layout = {};
+    HRESULT hr = GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
+                                             desc_, layout);
+    if (FAILED(hr))
+      return hr;
+
+    D3D12_BOX box = {};
+    if (!NormalizeTextureBox(desc_, layout, src_box, box))
+      return E_INVALIDARG;
+
+    const UINT row_count = TextureBoxRowCount(box, layout);
+    const UINT64 row_size = TextureBoxRowSize(box, layout);
+    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, dst_row_pitch,
+                                          dst_slice_pitch)))
+      return E_INVALIDARG;
+
+    if (texture_allocation_->mappedMemory)
+      return ReadMappedTextureRows(dst_data, dst_row_pitch, box, layout,
+                                   row_size, row_count);
+
+    return ReadTextureRowsViaBlit(dst_data, dst_row_pitch, box, layout,
+                                  row_size, row_count);
+  }
+
+  HRESULT WriteMappedTextureRows(const D3D12_BOX &box,
+                                 const TextureSubresourceLayout &layout,
+                                 const void *src_data, UINT src_row_pitch,
+                                 UINT64 row_size, UINT row_count) {
+    auto *dst = static_cast<char *>(texture_allocation_->mappedMemory);
+    const auto *src = static_cast<const char *>(src_data);
+    for (UINT row = 0; row < row_count; row++)
+      std::memcpy(dst + TextureRowOffset(box, layout, row),
+                  src + row * src_row_pitch, static_cast<size_t>(row_size));
+    return S_OK;
+  }
+
+  HRESULT ReadMappedTextureRows(void *dst_data, UINT dst_row_pitch,
+                                const D3D12_BOX &box,
+                                const TextureSubresourceLayout &layout,
+                                UINT64 row_size, UINT row_count) {
+    auto *dst = static_cast<char *>(dst_data);
+    const auto *src = static_cast<const char *>(texture_allocation_->mappedMemory);
+    for (UINT row = 0; row < row_count; row++)
+      std::memcpy(dst + row * dst_row_pitch,
+                  src + TextureRowOffset(box, layout, row),
+                  static_cast<size_t>(row_size));
+    return S_OK;
+  }
+
+  HRESULT WriteTextureRowsViaBlit(const D3D12_BOX &box,
+                                  const TextureSubresourceLayout &layout,
+                                  const void *src_data, UINT src_row_pitch,
+                                  UINT64 row_size, UINT row_count) {
+    WMTBufferInfo buffer_info = {};
+    buffer_info.length = layout.row_pitch * row_count;
+    buffer_info.options = WMTResourceHazardTrackingModeUntracked |
+                          WMTResourceOptionCPUCacheModeWriteCombined;
+    auto buffer = device_->GetDXMTDevice().device().newBuffer(buffer_info);
+    if (!buffer || !buffer_info.memory.get())
+      return E_FAIL;
+
+    auto *mapped = static_cast<char *>(buffer_info.memory.get());
+    std::memset(mapped, 0, static_cast<size_t>(buffer_info.length));
+    const auto *src = static_cast<const char *>(src_data);
+    for (UINT row = 0; row < row_count; row++)
+      std::memcpy(mapped + row * layout.row_pitch, src + row * src_row_pitch,
+                  static_cast<size_t>(row_size));
+
+    wmtcmd_blit_copy_from_buffer_to_texture copy = {};
+    copy.type = WMTBlitCommandCopyFromBufferToTexture;
+    copy.next.set(nullptr);
+    copy.src = buffer;
+    copy.src_offset = 0;
+    copy.bytes_per_row = layout.row_pitch;
+    copy.bytes_per_image = 0;
+    copy.size = {box.right - box.left, box.bottom - box.top, 1};
+    copy.dst = texture_allocation_->texture();
+    copy.slice = 0;
+    copy.level = 0;
+    copy.origin = {box.left, box.top, 0};
+
+    return SubmitSynchronousBlit(
+        reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+  }
+
+  HRESULT ReadTextureRowsViaBlit(void *dst_data, UINT dst_row_pitch,
+                                 const D3D12_BOX &box,
+                                 const TextureSubresourceLayout &layout,
+                                 UINT64 row_size, UINT row_count) {
+    WMTBufferInfo buffer_info = {};
+    buffer_info.length = layout.row_pitch * row_count;
+    buffer_info.options = WMTResourceHazardTrackingModeUntracked;
+    auto buffer = device_->GetDXMTDevice().device().newBuffer(buffer_info);
+    if (!buffer || !buffer_info.memory.get())
+      return E_FAIL;
+
+    wmtcmd_blit_copy_from_texture_to_buffer copy = {};
+    copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+    copy.next.set(nullptr);
+    copy.src = texture_allocation_->texture();
+    copy.slice = 0;
+    copy.level = 0;
+    copy.origin = {box.left, box.top, 0};
+    copy.size = {box.right - box.left, box.bottom - box.top, 1};
+    copy.dst = buffer;
+    copy.offset = 0;
+    copy.bytes_per_row = layout.row_pitch;
+    copy.bytes_per_image = 0;
+
+    HRESULT hr = SubmitSynchronousBlit(
+        reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+    if (FAILED(hr))
+      return hr;
+
+    return CopyTextureRowsToMemory(dst_data, dst_row_pitch, 0,
+                                   buffer_info.memory.get(), layout.row_pitch,
+                                   0, row_size, row_count);
+  }
+
+  HRESULT SubmitSynchronousBlit(const wmtcmd_blit_nop *cmd) {
+    auto queue = device_->GetDXMTDevice().device().newCommandQueue(1);
+    if (!queue)
+      return E_FAIL;
+    auto cmdbuf = queue.commandBuffer();
+    auto encoder = cmdbuf.blitCommandEncoder();
+    encoder.encodeCommands(cmd);
+    encoder.endEncoding();
+    cmdbuf.commit();
+    cmdbuf.waitUntilCompleted();
+    return cmdbuf.status() == WMTCommandBufferStatusCompleted ? S_OK : E_FAIL;
+  }
+
   void CreateBuffer() {
     buffer_ = new dxmt::Buffer(desc_.Width + heap_offset_,
                                device_->GetDXMTDevice().device());
@@ -265,8 +682,21 @@ private:
     info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
     info.usage = GetTextureUsage(desc_.Flags);
 
-    texture_ = new dxmt::Texture(info, device_->GetDXMTDevice().device());
     Flags<dxmt::TextureAllocationFlag> flags;
+    TextureSubresourceLayout layout = {};
+    const bool linear_cpu_texture =
+        GetHeapType(heap_properties_) != D3D12_HEAP_TYPE_DEFAULT &&
+        IsSingleSubresourceTexture2D(desc_, 0) &&
+        SUCCEEDED(GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
+                                             desc_, layout));
+
+    if (linear_cpu_texture) {
+      texture_ = new dxmt::Texture(layout.slice_pitch, layout.row_pitch, info,
+                                   device_->GetDXMTDevice().device());
+    } else {
+      texture_ = new dxmt::Texture(info, device_->GetDXMTDevice().device());
+    }
+
     if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
       flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
       flags.set(dxmt::TextureAllocationFlag::GpuPrivate);
@@ -320,10 +750,15 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
            desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   }
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-    if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
-        desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE &&
-        desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)
+    if (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+      if (desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
+          desc.MipLevels > 1)
+        return false;
+    } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+               desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE &&
+               desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
       return false;
+    }
     return desc.Format != DXGI_FORMAT_UNKNOWN;
   }
   return false;

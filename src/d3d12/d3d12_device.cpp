@@ -756,9 +756,18 @@ private:
 
     for (UINT i = 0; i < resource_desc_count; i++) {
       const auto &desc = resource_descs[i];
-      const UINT64 size = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
-                              ? desc.Width
-                              : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      UINT64 size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        size = desc.Width;
+      } else if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                 desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+        const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+        const UINT subresources = mip_levels * desc.DepthOrArraySize;
+        UINT64 total_bytes = 0;
+        GetCopyableFootprintsImpl(&desc, 0, subresources, 0, nullptr, nullptr,
+                                  nullptr, &total_bytes);
+        size = total_bytes;
+      }
       info.SizeInBytes += Align(size, info.Alignment);
     }
 
@@ -850,13 +859,10 @@ private:
       return false;
 
     const auto heap_type = d3d12::GetHeapType(*heap_properties);
-    if (heap_type == D3D12_HEAP_TYPE_UPLOAD ||
-        heap_type == D3D12_HEAP_TYPE_READBACK) {
-      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
-        return false;
-    }
-    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-        desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+    if ((heap_type == D3D12_HEAP_TYPE_UPLOAD ||
+         heap_type == D3D12_HEAP_TYPE_READBACK) &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
       return false;
 
     return true;
@@ -882,7 +888,8 @@ private:
     const auto heap_type = heap.GetHeapType();
     if ((heap_type == D3D12_HEAP_TYPE_UPLOAD ||
          heap_type == D3D12_HEAP_TYPE_READBACK) &&
-        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
       return false;
 
     const auto heap_flags = heap.GetHeapDesc().Flags;
