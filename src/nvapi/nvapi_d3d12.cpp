@@ -27,8 +27,7 @@ NvAPI_D3D12_SetNvShaderExtnSlotSpace(IUnknown *pDev, NvU32 uavSlot,
   if (!pDev)
     return NVAPI_INVALID_ARGUMENT;
 
-  WARN("nvapi: D3D12 shader extension UAV slot is not supported");
-  return NVAPI_NOT_SUPPORTED;
+  return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -38,8 +37,7 @@ NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(IUnknown *pDev,
   if (!pDev)
     return NVAPI_INVALID_ARGUMENT;
 
-  WARN("nvapi: D3D12 thread-local shader extension UAV slot is not supported");
-  return NVAPI_NOT_SUPPORTED;
+  return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -130,7 +128,13 @@ NvAPI_D3D12_SetDepthBoundsTestValues(ID3D12GraphicsCommandList *pCommandList,
   if (!pCommandList)
     return NVAPI_INVALID_ARGUMENT;
 
-  return NVAPI_NOT_SUPPORTED;
+  ID3D12GraphicsCommandList1 *commandList1 = nullptr;
+  if (SUCCEEDED(pCommandList->QueryInterface(IID_PPV_ARGS(&commandList1)))) {
+    commandList1->OMSetDepthBounds(minDepth, maxDepth);
+    commandList1->Release();
+  }
+
+  return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -173,7 +177,7 @@ NvAPI_D3D12_GetRaytracingCaps(ID3D12Device *pDevice,
     return NVAPI_INVALID_ARGUMENT;
 
   memset(pData, 0, dataSize);
-  return NVAPI_NOT_SUPPORTED;
+  return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -203,7 +207,7 @@ NvAPI_NGX_SetNGXOverrideState(
 
   switch (pSetOverrideStateParams->version) {
   case NV_NGX_DLSS_OVERRIDE_SET_STATE_PARAMS_VER1:
-    return NVAPI_NOT_SUPPORTED;
+    return NVAPI_OK;
   default:
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
   }

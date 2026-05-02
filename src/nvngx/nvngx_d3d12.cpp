@@ -14,12 +14,25 @@ CreateUnsupportedD3D12CapabilityParameters(NVNGXParameter **out_params) {
   auto out_parameters = new ParametersImpl();
   out_parameters->Set("SuperSampling.Available", 0u);
   out_parameters->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 0u);
+  out_parameters->Set("SuperSampling.MinDriverVersionMajor", 0);
+  out_parameters->Set("SuperSampling.MinDriverVersionMinor", 0);
   out_parameters->Set("SuperSampling.NeedsUpdatedDriver", 0);
   out_parameters->Set("SuperSampling.FeatureInitResult",
                       static_cast<unsigned int>(NVNGX_RESULT_FEATURE_NOT_SUPPORTED));
+  out_parameters->Set("DLSS.Available", 0u);
+  out_parameters->Set("DLSS.NeedsUpdatedDriver", 0);
+  out_parameters->Set("DLSS.FeatureInitResult",
+                      static_cast<unsigned int>(NVNGX_RESULT_FEATURE_NOT_SUPPORTED));
   out_parameters->Set("FrameGeneration.Available", 0u);
+  out_parameters->Set("FrameGeneration.FeatureInitResult",
+                      static_cast<unsigned int>(NVNGX_RESULT_FEATURE_NOT_SUPPORTED));
   out_parameters->Set("DLSSG.Available", 0u);
+  out_parameters->Set("DLSSG.FeatureInitResult",
+                      static_cast<unsigned int>(NVNGX_RESULT_FEATURE_NOT_SUPPORTED));
   out_parameters->Set("RayReconstruction.Available", 0u);
+  out_parameters->Set("RayReconstruction.FeatureInitResult",
+                      static_cast<unsigned int>(NVNGX_RESULT_FEATURE_NOT_SUPPORTED));
+  out_parameters->Set("DLSS_RR.Available", 0u);
   out_parameters->Set("RTXValue", 0);
   out_parameters->Set("CreationNodeMask", 1);
   out_parameters->Set("VisibilityNodeMask", 1);
@@ -96,17 +109,21 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int feature,
                                      const NVNGXParameter *params,
                                      size_t *out_size) {
-  if (out_size)
-    *out_size = 0;
+  if (!out_size)
+    return NVNGX_RESULT_INVALID_PARAMETER;
 
-  return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+  *out_size = 0;
+  return NVNGX_RESULT_OK;
 }
 
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList *command_list,
                               unsigned int feature, NVNGXParameter *params,
                               unsigned int **out_handle) {
-  if (!command_list || !params)
+  if (out_handle)
+    *out_handle = nullptr;
+
+  if (!command_list || !params || !out_handle)
     return NVNGX_RESULT_INVALID_PARAMETER;
 
   return RejectUnsupportedD3D12Feature(feature, out_handle);
@@ -162,7 +179,7 @@ NVSDK_NGX_D3D12_GetFeatureRequirements(
   requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_UNSUPPORTED;
   requirement->MinHWArchitecture = 0;
   strcpy_s(requirement->MinOSVersion, "10.0.16299.0");
-  return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+  return NVNGX_RESULT_OK;
 }
 
 } // namespace dxmt
