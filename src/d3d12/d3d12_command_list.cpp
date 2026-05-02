@@ -213,7 +213,13 @@ public:
                                    D3D12_TILE_COPY_FLAGS flags) override {}
   void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource *dst_resource, UINT dst_sub_resource,
                                             ID3D12Resource *src_resource, UINT src_sub_resource,
-                                            DXGI_FORMAT format) override {}
+                                            DXGI_FORMAT format) override {
+    if (!dst_resource || !src_resource)
+      return;
+    AddRecord(ResolveSubresourceRecord{
+        dst_resource, dst_sub_resource, src_resource, src_sub_resource,
+        format});
+  }
   void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology) override {
     AddRecord(PrimitiveTopologyRecord{primitive_topology});
   }
@@ -229,8 +235,15 @@ public:
       record.rects.assign(rects, rects + rect_count);
     AddRecord(std::move(record));
   }
-  void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT blend_factor[4]) override {}
-  void STDMETHODCALLTYPE OMSetStencilRef(UINT stencil_ref) override {}
+  void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT blend_factor[4]) override {
+    BlendFactorRecord record = {};
+    if (blend_factor)
+      std::copy(blend_factor, blend_factor + 4, record.blend_factor.begin());
+    AddRecord(record);
+  }
+  void STDMETHODCALLTYPE OMSetStencilRef(UINT stencil_ref) override {
+    AddRecord(StencilRefRecord{stencil_ref});
+  }
   void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
@@ -417,12 +430,65 @@ public:
   void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
                                                       D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle,
                                                       ID3D12Resource *resource, const UINT values[4],
-                                                      UINT rect_count, const D3D12_RECT *rects) override {}
+                                                      UINT rect_count, const D3D12_RECT *rects) override {
+    if (!resource || !values)
+      return;
+    auto *descriptor =
+        GetDescriptorRecordFromGpuHandle(gpu_handle,
+                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!descriptor)
+      descriptor =
+          GetDescriptorRecordFromCpuHandle(cpu_handle,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!descriptor || descriptor->type != DescriptorRecordType::UnorderedAccessView)
+      return;
+
+    ClearUnorderedAccessRecord record = {};
+    record.descriptor = *descriptor;
+    record.resource = resource;
+    record.integer = true;
+    std::copy(values, values + 4, record.uint_values.begin());
+    if (rects && rect_count)
+      record.rects.assign(rects, rects + rect_count);
+    AddRecord(std::move(record));
+  }
   void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
                                                        D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle,
                                                        ID3D12Resource *resource, const float values[4],
-                                                       UINT rect_count, const D3D12_RECT *rects) override {}
-  void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) override {}
+                                                       UINT rect_count, const D3D12_RECT *rects) override {
+    if (!resource || !values)
+      return;
+    auto *descriptor =
+        GetDescriptorRecordFromGpuHandle(gpu_handle,
+                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!descriptor)
+      descriptor =
+          GetDescriptorRecordFromCpuHandle(cpu_handle,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!descriptor || descriptor->type != DescriptorRecordType::UnorderedAccessView)
+      return;
+
+    ClearUnorderedAccessRecord record = {};
+    record.descriptor = *descriptor;
+    record.resource = resource;
+    std::copy(values, values + 4, record.float_values.begin());
+    if (rects && rect_count)
+      record.rects.assign(rects, rects + rect_count);
+    AddRecord(std::move(record));
+  }
+  void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) override {
+    if (!resource)
+      return;
+    DiscardResourceRecord record = {};
+    record.resource = resource;
+    if (region) {
+      record.first_subresource = region->FirstSubresource;
+      record.subresource_count = region->NumSubresources;
+      if (region->pRects && region->NumRects)
+        record.rects.assign(region->pRects, region->pRects + region->NumRects);
+    }
+    AddRecord(std::move(record));
+  }
   void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {}
   void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {}
   void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type,

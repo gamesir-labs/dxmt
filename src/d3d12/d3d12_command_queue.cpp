@@ -1397,6 +1397,8 @@ private:
     D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     std::vector<D3D12_VIEWPORT> viewports;
     std::vector<D3D12_RECT> scissors;
+    std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+    UINT stencil_ref = 0;
     std::vector<DescriptorRecord> render_targets;
     std::optional<DescriptorRecord> depth_stencil;
     std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
@@ -1455,10 +1457,16 @@ private:
       ReplayCopyTextureRegion(chunk, record);
     } else if constexpr (std::is_same_v<T, CopyResourceRecord>) {
       ReplayCopyResource(chunk, record);
+    } else if constexpr (std::is_same_v<T, ResolveSubresourceRecord>) {
+      ReplayResolveSubresource(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearRenderTargetRecord>) {
       ReplayClearRenderTarget(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
       ReplayClearDepthStencil(chunk, record);
+    } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
+      ReplayClearUnorderedAccess(chunk, record);
+    } else if constexpr (std::is_same_v<T, DiscardResourceRecord>) {
+      ReplayDiscardResource(chunk, record);
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
       state.pipeline_state = record.pipeline_state;
     } else if constexpr (std::is_same_v<T, PrimitiveTopologyRecord>) {
@@ -1467,6 +1475,10 @@ private:
       state.viewports = record.viewports;
     } else if constexpr (std::is_same_v<T, ScissorRecord>) {
       state.scissors = record.rects;
+    } else if constexpr (std::is_same_v<T, BlendFactorRecord>) {
+      state.blend_factor = record.blend_factor;
+    } else if constexpr (std::is_same_v<T, StencilRefRecord>) {
+      state.stencil_ref = record.stencil_ref;
     } else if constexpr (std::is_same_v<T, RenderTargetsRecord>) {
       state.render_targets = record.render_targets;
       state.depth_stencil = record.depth_stencil;
@@ -2564,6 +2576,77 @@ private:
     return true;
   }
 
+  static bool ResolveDynamicRasterRects(
+      std::vector<D3D12_VIEWPORT> &viewports,
+      std::vector<D3D12_RECT> &scissors, const char *context) {
+    if (viewports.empty()) {
+      WARN("D3D12CommandQueue: ", context,
+           " skipped because no viewport was set");
+      return false;
+    }
+
+    if (!scissors.empty())
+      return true;
+
+    scissors.reserve(viewports.size());
+    for (const auto &viewport : viewports) {
+      D3D12_RECT rect = {};
+      rect.left = static_cast<LONG>(std::max(0.0f, viewport.TopLeftX));
+      rect.top = static_cast<LONG>(std::max(0.0f, viewport.TopLeftY));
+      rect.right =
+          static_cast<LONG>(std::max(0.0f, viewport.TopLeftX + viewport.Width));
+      rect.bottom =
+          static_cast<LONG>(std::max(0.0f, viewport.TopLeftY + viewport.Height));
+      scissors.push_back(rect);
+    }
+    WARN("D3D12CommandQueue: ", context,
+         " used viewport-sized default scissor rects");
+    return true;
+  }
+
+  static void EncodeDynamicRenderState(
+      ArgumentEncodingContext &enc, const std::vector<D3D12_VIEWPORT> &viewports,
+      const std::vector<D3D12_RECT> &scissors,
+      const std::array<FLOAT, 4> &blend_factor, UINT stencil_ref) {
+    auto &blend = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
+    blend.type = WMTRenderCommandSetBlendFactorAndStencilRef;
+    blend.red = blend_factor[0];
+    blend.green = blend_factor[1];
+    blend.blue = blend_factor[2];
+    blend.alpha = blend_factor[3];
+    blend.stencil_ref = static_cast<uint8_t>(stencil_ref);
+
+    auto &viewport_cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
+    viewport_cmd.type = WMTRenderCommandSetViewports;
+    auto *viewport_data = static_cast<WMTViewport *>(
+        enc.allocate_cpu_heap(sizeof(WMTViewport) * viewports.size(),
+                              alignof(WMTViewport)));
+    for (size_t i = 0; i < viewports.size(); i++) {
+      const auto &viewport = viewports[i];
+      viewport_data[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+                          viewport.Height, viewport.MinDepth,
+                          viewport.MaxDepth};
+    }
+    viewport_cmd.viewports.set(viewport_data);
+    viewport_cmd.viewport_count = viewports.size();
+
+    auto &scissor_cmd =
+        enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
+    scissor_cmd.type = WMTRenderCommandSetScissorRects;
+    auto *scissor_data = static_cast<WMTScissorRect *>(
+        enc.allocate_cpu_heap(sizeof(WMTScissorRect) * scissors.size(),
+                              alignof(WMTScissorRect)));
+    for (size_t i = 0; i < scissors.size(); i++) {
+      const auto &rect = scissors[i];
+      scissor_data[i] = {uint32_t(std::max<LONG>(0, rect.left)),
+                         uint32_t(std::max<LONG>(0, rect.top)),
+                         uint32_t(std::max<LONG>(0, rect.right - rect.left)),
+                         uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
+    }
+    scissor_cmd.scissor_rects.set(scissor_data);
+    scissor_cmd.rect_count = scissors.size();
+  }
+
   void ReplayDrawInstanced(CommandChunk *chunk, ReplayState &state,
                            const DrawInstancedRecord &record) {
     if (!record.vertex_count_per_instance || !record.instance_count)
@@ -2585,12 +2668,16 @@ private:
     auto viewports = state.viewports;
     auto scissors = state.scissors;
     auto attachments = BuildRenderPassAttachments(state);
+    if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
+      return;
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
     chunk->emitcc([this, metal_pso = metal->pso,
                    depth_stencil = metal->depth_stencil,
                    rasterizer = metal->rasterizer,
                    pipeline, replay_state = state, primitive,
                    argument_buffer_size,
+                   blend_factor = state.blend_factor,
+                   stencil_ref = state.stencil_ref,
                    vertex_start = record.start_vertex_location,
                    vertex_count = record.vertex_count_per_instance,
                    instance_count = record.instance_count,
@@ -2608,45 +2695,15 @@ private:
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
         cmd.dsso = depth_stencil;
-        cmd.stencil_ref = 0;
+        cmd.stencil_ref = static_cast<uint8_t>(stencil_ref);
       }
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
       uint64_t argbuf_offset = 0;
       EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
-
-      if (!viewports.empty()) {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
-        cmd.type = WMTRenderCommandSetViewports;
-        auto *data = static_cast<WMTViewport *>(
-            enc.allocate_cpu_heap(sizeof(WMTViewport) * viewports.size(),
-                                  alignof(WMTViewport)));
-        for (size_t i = 0; i < viewports.size(); i++) {
-          const auto &viewport = viewports[i];
-          data[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
-                     viewport.Height, viewport.MinDepth, viewport.MaxDepth};
-        }
-        cmd.viewports.set(data);
-        cmd.viewport_count = viewports.size();
-      }
-
-      if (!scissors.empty()) {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
-        cmd.type = WMTRenderCommandSetScissorRects;
-        auto *data = static_cast<WMTScissorRect *>(
-            enc.allocate_cpu_heap(sizeof(WMTScissorRect) * scissors.size(),
-                                  alignof(WMTScissorRect)));
-        for (size_t i = 0; i < scissors.size(); i++) {
-          const auto &rect = scissors[i];
-          data[i] = {uint32_t(std::max<LONG>(0, rect.left)),
-                     uint32_t(std::max<LONG>(0, rect.top)),
-                     uint32_t(std::max<LONG>(0, rect.right - rect.left)),
-                     uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
-        }
-        cmd.scissor_rects.set(data);
-        cmd.rect_count = scissors.size();
-      }
+      EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
+                               stencil_ref);
 
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
       draw.type = WMTRenderCommandDraw;
@@ -2693,6 +2750,10 @@ private:
                                 record.start_index_location *
                                     GetIndexSize(state.index_buffer->Format);
     auto attachments = BuildRenderPassAttachments(state);
+    auto viewports = state.viewports;
+    auto scissors = state.scissors;
+    if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
+      return;
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
     chunk->emitcc([this, metal_pso = metal->pso,
                    depth_stencil = metal->depth_stencil,
@@ -2701,6 +2762,10 @@ private:
                    index_allocation, primitive,
                    index_type, index_offset,
                    argument_buffer_size,
+                   blend_factor = state.blend_factor,
+                   stencil_ref = state.stencil_ref,
+                   viewports = std::move(viewports),
+                   scissors = std::move(scissors),
                    index_count = record.index_count_per_instance,
                    instance_count = record.instance_count,
                    base_vertex = record.base_vertex_location,
@@ -2716,13 +2781,15 @@ private:
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
         cmd.dsso = depth_stencil;
-        cmd.stencil_ref = 0;
+        cmd.stencil_ref = static_cast<uint8_t>(stencil_ref);
       }
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
       uint64_t argbuf_offset = 0;
       EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
+                               stencil_ref);
 
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       draw.type = WMTRenderCommandDrawIndexed;
@@ -2817,6 +2884,73 @@ private:
         ReplayCopyTextureRegion(chunk, copy);
       }
     }
+  }
+
+  TextureViewKey CreateResolveView(Resource &resource, UINT subresource,
+                                   WMTPixelFormat format) {
+    auto *texture = resource.GetTexture();
+    if (!texture)
+      return {};
+
+    TextureViewDescriptor view = {};
+    view.format = format;
+    view.type = texture->textureType();
+    view.firstMiplevel = GetMipLevel(resource, subresource);
+    view.miplevelCount = 1;
+    view.firstArraySlice = GetArraySlice(resource, subresource);
+    view.arraySize = 1;
+    view.intendedUsage = WMTTextureUsageRenderTarget;
+    return texture->createView(view);
+  }
+
+  void ReplayResolveSubresource(CommandChunk *chunk,
+                                const ResolveSubresourceRecord &record) {
+    auto *dst = GetResource(record.dst.ptr());
+    auto *src = GetResource(record.src.ptr());
+    if (!dst || !src || !dst->GetTexture() || !src->GetTexture())
+      return;
+
+    const auto &dst_desc = dst->GetResourceDesc();
+    const auto &src_desc = src->GetResourceDesc();
+    if (src_desc.SampleDesc.Count <= 1 || dst_desc.SampleDesc.Count != 1) {
+      WARN("D3D12CommandQueue: ResolveSubresource supports MSAA color source to single-sample destination only");
+      return;
+    }
+    if (record.dst_subresource >= GetSubresourceCount(*dst) ||
+        record.src_subresource >= GetSubresourceCount(*src)) {
+      WARN("D3D12CommandQueue: ResolveSubresource subresource out of range");
+      return;
+    }
+
+    WMTPixelFormat format = src->GetTexture()->pixelFormat();
+    if (record.format != DXGI_FORMAT_UNKNOWN) {
+      MTL_DXGI_FORMAT_DESC format_desc = {};
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), record.format,
+                                    format_desc)) ||
+          format_desc.PixelFormat == WMTPixelFormatInvalid) {
+        WARN("D3D12CommandQueue: ResolveSubresource unsupported format ",
+             uint32_t(record.format));
+        return;
+      }
+      format = format_desc.PixelFormat;
+    }
+
+    if (src->GetTexture()->pixelFormat() != format ||
+        dst->GetTexture()->pixelFormat() != format) {
+      WARN("D3D12CommandQueue: ResolveSubresource currently supports same-format color resolves only");
+      return;
+    }
+
+    auto src_view = CreateResolveView(*src, record.src_subresource, format);
+    auto dst_view = CreateResolveView(*dst, record.dst_subresource, format);
+    Rc<Texture> src_texture = src->GetTexture();
+    Rc<Texture> dst_texture = dst->GetTexture();
+    chunk->emitcc([src_texture = std::move(src_texture),
+                   dst_texture = std::move(dst_texture), src_view,
+                   dst_view](ArgumentEncodingContext &enc) mutable {
+      enc.resolveTexture(std::move(src_texture), src_view,
+                         std::move(dst_texture), dst_view);
+    });
   }
 
   void ReplayCopyTextureRegion(CommandChunk *chunk,
@@ -3002,6 +3136,156 @@ private:
       enc.clearDepthStencil(std::move(texture), view, array_length, flags,
                             depth, stencil);
     });
+  }
+
+  void ReplayClearUnorderedAccess(CommandChunk *chunk,
+                                  const ClearUnorderedAccessRecord &record) {
+    auto *resource = GetResource(record.resource.ptr());
+    if (!resource) {
+      WARN("D3D12CommandQueue: ClearUnorderedAccessView skipped for foreign resource");
+      return;
+    }
+
+    if (resource->GetBuffer()) {
+      UINT64 offset = 0;
+      UINT64 byte_size = resource->GetResourceDesc().Width;
+      uint64_t view_id = 0;
+      bool raw_buffer = false;
+      bool raw_fallback = false;
+
+      if (record.descriptor.has_desc &&
+          record.descriptor.desc.uav.ViewDimension ==
+              D3D12_UAV_DIMENSION_BUFFER) {
+        const auto &uav = record.descriptor.desc.uav;
+        const UINT64 first_element = uav.Buffer.FirstElement;
+        if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+          raw_fallback = true;
+          offset += first_element * sizeof(uint32_t);
+          byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
+          view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                     DXGI_FORMAT_R32_UINT, offset, byte_size,
+                                     WMTTextureUsageShaderRead |
+                                         WMTTextureUsageShaderWrite);
+        } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
+          MTL_DXGI_FORMAT_DESC format = {};
+          if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
+                                           uav.Format, format))) {
+            offset += first_element * format.BytesPerTexel;
+            byte_size = UINT64(uav.Buffer.NumElements) *
+                        format.BytesPerTexel;
+            view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                       uav.Format, offset, byte_size,
+                                       WMTTextureUsageShaderRead |
+                                           WMTTextureUsageShaderWrite);
+          }
+        } else if (uav.Buffer.StructureByteStride) {
+          offset += first_element * uav.Buffer.StructureByteStride;
+          byte_size = UINT64(uav.Buffer.NumElements) *
+                      uav.Buffer.StructureByteStride;
+          if (const auto view_format =
+                  UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
+              view_format != DXGI_FORMAT_UNKNOWN) {
+            view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                       view_format, offset, byte_size,
+                                       WMTTextureUsageShaderRead |
+                                           WMTTextureUsageShaderWrite);
+          }
+        }
+      } else {
+        raw_buffer = true;
+      }
+
+      if (!view_id && raw_fallback)
+        raw_buffer = true;
+
+      if (!view_id && !raw_buffer) {
+        WARN("D3D12CommandQueue: ClearUnorderedAccessView buffer view is unsupported");
+        return;
+      }
+
+      Rc<Buffer> buffer = resource->GetBuffer();
+      const UINT element_count =
+          UINT(std::min<UINT64>(byte_size / sizeof(uint32_t), UINT_MAX));
+      if (!element_count)
+        return;
+      chunk->emitcc([buffer = std::move(buffer), view_id, raw_buffer,
+                     integer = record.integer,
+                     uint_values = record.uint_values,
+                     float_values = record.float_values,
+                     element_count](ArgumentEncodingContext &enc) mutable {
+        if (raw_buffer) {
+          if (integer)
+            enc.clear_res_cmd.begin(uint_values, Rc<Buffer>(buffer), true);
+          else
+            enc.clear_res_cmd.begin(float_values, Rc<Buffer>(buffer), false);
+          enc.clear_res_cmd.clear(0, 0, element_count, 1);
+        } else {
+          if (integer)
+            enc.clear_res_cmd.begin(uint_values, Rc<Buffer>(buffer), view_id);
+          else
+            enc.clear_res_cmd.begin(float_values, Rc<Buffer>(buffer), view_id);
+          enc.clear_res_cmd.clear(0, 0, element_count, 1);
+        }
+        enc.clear_res_cmd.end();
+      });
+      return;
+    }
+
+    if (resource->GetTexture()) {
+      auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
+                                                   *resource, record.descriptor);
+      if (!uint64_t(view))
+        return;
+      auto *texture = resource->GetTexture();
+      const auto type = texture->textureType(view);
+      if (type != WMTTextureType2D && type != WMTTextureType2DArray) {
+        WARN("D3D12CommandQueue: ClearUnorderedAccessView texture type is unsupported");
+        return;
+      }
+      std::vector<D3D12_RECT> rects = record.rects;
+      if (rects.empty()) {
+        rects.push_back({0, 0, static_cast<LONG>(texture->width(view)),
+                         static_cast<LONG>(texture->height(view))});
+      }
+      Rc<Texture> rc_texture = texture;
+      chunk->emitcc([texture = std::move(rc_texture), view,
+                     integer = record.integer,
+                     uint_values = record.uint_values,
+                     float_values = record.float_values,
+                     rects = std::move(rects)](ArgumentEncodingContext &enc) mutable {
+        if (integer)
+          enc.clear_res_cmd.begin(uint_values, Rc<Texture>(texture), view);
+        else
+          enc.clear_res_cmd.begin(float_values, Rc<Texture>(texture), view);
+        for (const auto &rect : rects) {
+          const auto left = uint32_t(std::max<LONG>(0, rect.left));
+          const auto top = uint32_t(std::max<LONG>(0, rect.top));
+          const auto width =
+              uint32_t(std::max<LONG>(0, rect.right - rect.left));
+          const auto height =
+              uint32_t(std::max<LONG>(0, rect.bottom - rect.top));
+          if (width && height)
+            enc.clear_res_cmd.clear(left, top, width, height);
+        }
+        enc.clear_res_cmd.end();
+      });
+      return;
+    }
+
+    WARN("D3D12CommandQueue: ClearUnorderedAccessView resource has no backing allocation");
+  }
+
+  void ReplayDiscardResource(CommandChunk *chunk,
+                             const DiscardResourceRecord &record) {
+    auto *resource = GetResource(record.resource.ptr());
+    if (!resource) {
+      WARN("D3D12CommandQueue: DiscardResource skipped for foreign resource");
+      return;
+    }
+
+    WARN("D3D12CommandQueue: DiscardResource treated as conservative no-op");
+    EmitResourceAccessBarrier(chunk, *resource, 0, GetSubresourceCount(*resource),
+                              ResourceAccess::All);
   }
 
   Com<IMTLD3D12Device> device_;

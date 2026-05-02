@@ -74,6 +74,14 @@ struct CopyResourceRecord {
   Com<ID3D12Resource> src;
 };
 
+struct ResolveSubresourceRecord {
+  Com<ID3D12Resource> dst;
+  UINT dst_subresource = 0;
+  Com<ID3D12Resource> src;
+  UINT src_subresource = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
 struct ResourceBarrierRecord {
   std::vector<StoredResourceBarrier> barriers;
 };
@@ -92,12 +100,36 @@ struct ClearDepthStencilRecord {
   std::vector<D3D12_RECT> rects;
 };
 
+struct ClearUnorderedAccessRecord {
+  DescriptorRecord descriptor;
+  Com<ID3D12Resource> resource;
+  std::array<UINT, 4> uint_values = {};
+  std::array<FLOAT, 4> float_values = {};
+  bool integer = false;
+  std::vector<D3D12_RECT> rects;
+};
+
+struct DiscardResourceRecord {
+  Com<ID3D12Resource> resource;
+  std::vector<D3D12_RECT> rects;
+  UINT first_subresource = 0;
+  UINT subresource_count = 0;
+};
+
 struct ViewportRecord {
   std::vector<D3D12_VIEWPORT> viewports;
 };
 
 struct ScissorRecord {
   std::vector<D3D12_RECT> rects;
+};
+
+struct BlendFactorRecord {
+  std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+struct StencilRefRecord {
+  UINT stencil_ref = 0;
 };
 
 struct PrimitiveTopologyRecord {
@@ -150,11 +182,13 @@ struct RootDescriptorRecord {
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
     PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
-    CopyResourceRecord, ResourceBarrierRecord, ClearRenderTargetRecord,
-    ClearDepthStencilRecord, ViewportRecord, ScissorRecord,
-    PrimitiveTopologyRecord, RenderTargetsRecord, VertexBuffersRecord,
-    IndexBufferRecord, RootSignatureRecord, DescriptorHeapsRecord,
-    RootDescriptorTableRecord, RootConstantsRecord, RootDescriptorRecord>;
+    CopyResourceRecord, ResolveSubresourceRecord, ResourceBarrierRecord,
+    ClearRenderTargetRecord, ClearDepthStencilRecord,
+    ClearUnorderedAccessRecord, DiscardResourceRecord, ViewportRecord,
+    ScissorRecord, BlendFactorRecord, StencilRefRecord, PrimitiveTopologyRecord,
+    RenderTargetsRecord, VertexBuffersRecord, IndexBufferRecord,
+    RootSignatureRecord, DescriptorHeapsRecord, RootDescriptorTableRecord,
+    RootConstantsRecord, RootDescriptorRecord>;
 
 struct CommandRecord {
   CommandRecordPayload payload;

@@ -498,10 +498,10 @@ ClearResourceKernelContext::ClearResourceKernelContext(
 void
 ClearResourceKernelContext::setClearColor(const std::array<float, 4> &color, bool is_integer) {
   if (is_integer) {
-    meta_temp_.color_f32[0] = uint32_t(std::max(color[0], 0.0f));
-    meta_temp_.color_f32[1] = uint32_t(std::max(color[1], 0.0f));
-    meta_temp_.color_f32[2] = uint32_t(std::max(color[2], 0.0f));
-    meta_temp_.color_f32[3] = uint32_t(std::max(color[3], 0.0f));
+    meta_temp_.color_u32[0] = uint32_t(std::max(color[0], 0.0f));
+    meta_temp_.color_u32[1] = uint32_t(std::max(color[1], 0.0f));
+    meta_temp_.color_u32[2] = uint32_t(std::max(color[2], 0.0f));
+    meta_temp_.color_u32[3] = uint32_t(std::max(color[3], 0.0f));
   } else {
     meta_temp_.color_f32[0] = color[0];
     meta_temp_.color_f32[1] = color[1];
@@ -511,10 +511,18 @@ ClearResourceKernelContext::setClearColor(const std::array<float, 4> &color, boo
 };
 
 void
+ClearResourceKernelContext::setClearColor(const std::array<uint32_t, 4> &color) {
+  meta_temp_.color_u32[0] = color[0];
+  meta_temp_.color_u32[1] = color[1];
+  meta_temp_.color_u32[2] = color[2];
+  meta_temp_.color_u32[3] = color[3];
+};
+
+void
 ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Texture> texture, TextureViewKey view) {
 
   clearing_texture_ = texture;
-  clearing_view_ = 0;
+  clearing_view_ = view;
   ctx_.startComputePass(0);
 
   bool is_integer = IsIntegerFormat(texture->pixelFormat(view));
@@ -547,6 +555,38 @@ ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Texture>
 }
 
 void
+ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Texture> texture, TextureViewKey view) {
+
+  clearing_texture_ = texture;
+  clearing_view_ = view;
+  ctx_.startComputePass(0);
+
+  setClearColor(color);
+
+  bool is_array = false;
+  switch (texture->textureType(view)) {
+  case WMTTextureType1DArray:
+  case WMTTextureType2DArray:
+    is_array = true;
+    dispatch_depth_ = texture->arrayLength(view);
+    break;
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+  case WMTTextureType3D:
+  case WMTTextureType2DMultisample:
+  case WMTTextureType2DMultisampleArray:
+    return;
+  default:
+    break;
+  }
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = is_array ? cs_clear_texture2d_array_uint_ : cs_clear_texture2d_uint_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
 ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, BufferViewKey view) {
 
   clearing_buffer_ = buffer;
@@ -564,6 +604,21 @@ ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> 
 }
 
 void
+ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, BufferViewKey view) {
+
+  clearing_buffer_ = buffer;
+  clearing_view_ = view;
+  ctx_.startComputePass(0);
+
+  setClearColor(color);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = cs_clear_tbuffer_uint_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
 ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer) {
 
   clearing_buffer_ = buffer;
@@ -575,6 +630,21 @@ ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> 
   auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;
   setpso.pso = raw_buffer_is_integer ? cs_clear_buffer_uint_ : cs_clear_buffer_float_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, bool) {
+
+  clearing_buffer_ = buffer;
+  clearing_view_ = 0;
+  ctx_.startComputePass(0);
+
+  setClearColor(color);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = cs_clear_buffer_uint_;
   setpso.threadgroup_size = {32, 1, 1};
 }
 
@@ -605,8 +675,7 @@ ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t
       setbuf.type = WMTComputeCommandSetBuffer;
       setbuf.buffer = dst_->buffer();
       setbuf.index = 0;
-      setbuf.offset = 0;
-      meta_temp_.offset[0] += dst_sub_offset;
+      setbuf.offset = dst_sub_offset;
     }
   } else {
     return;
