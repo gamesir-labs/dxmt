@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_resource.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -44,7 +45,17 @@ StoreResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
   return stored;
 }
 
-class GraphicsCommandListImpl final : public ComObjectWithInitialRef<ID3D12GraphicsCommandList>,
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+using GraphicsCommandListComBase = ID3D12GraphicsCommandList4;
+#elif defined(__ID3D12GraphicsCommandList2_INTERFACE_DEFINED__)
+using GraphicsCommandListComBase = ID3D12GraphicsCommandList2;
+#elif defined(__ID3D12GraphicsCommandList1_INTERFACE_DEFINED__)
+using GraphicsCommandListComBase = ID3D12GraphicsCommandList1;
+#else
+using GraphicsCommandListComBase = ID3D12GraphicsCommandList;
+#endif
+
+class GraphicsCommandListImpl final : public ComObjectWithInitialRef<GraphicsCommandListComBase>,
                                       public GraphicsCommandList {
 public:
   GraphicsCommandListImpl(IMTLD3D12Device *device, UINT node_mask,
@@ -74,16 +85,37 @@ public:
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12CommandList) ||
         riid == __uuidof(ID3D12GraphicsCommandList)) {
-      *ppvObject = ref(this);
+      *ppvObject = ref(AsGraphicsCommandList());
       return S_OK;
     }
 
-    if (riid == __uuidof(ID3D12GraphicsCommandList1) ||
-        riid == __uuidof(ID3D12GraphicsCommandList2)) {
-      WARN("D3D12GraphicsCommandList: higher command list interfaces are not "
-           "exposed until their extra methods are implemented");
-      return E_NOINTERFACE;
+#ifdef __ID3D12GraphicsCommandList1_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12GraphicsCommandList1)) {
+      *ppvObject = ref(static_cast<ID3D12GraphicsCommandList1 *>(
+          static_cast<GraphicsCommandListComBase *>(this)));
+      return S_OK;
     }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList2_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12GraphicsCommandList2)) {
+      *ppvObject = ref(static_cast<ID3D12GraphicsCommandList2 *>(
+          static_cast<GraphicsCommandListComBase *>(this)));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12GraphicsCommandList3)) {
+      *ppvObject = ref(static_cast<ID3D12GraphicsCommandList3 *>(
+          static_cast<GraphicsCommandListComBase *>(this)));
+      return S_OK;
+    }
+    if (riid == __uuidof(ID3D12GraphicsCommandList4)) {
+      *ppvObject = ref(static_cast<ID3D12GraphicsCommandList4 *>(this));
+      return S_OK;
+    }
+#endif
 
     if (logQueryInterfaceError(__uuidof(ID3D12GraphicsCommandList), riid))
       WARN("D3D12GraphicsCommandList: unknown interface query ", str::format(riid));
@@ -534,7 +566,164 @@ public:
         count_buffer, count_buffer_offset});
   }
 
+#ifdef __ID3D12GraphicsCommandList1_INTERFACE_DEFINED__
+  void STDMETHODCALLTYPE AtomicCopyBufferUINT(
+      ID3D12Resource *dst_buffer, UINT64 dst_offset,
+      ID3D12Resource *src_buffer, UINT64 src_offset,
+      UINT dependent_resource_count,
+      ID3D12Resource *const *dependent_resources,
+      const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
+    CopyBufferRegion(dst_buffer, dst_offset, src_buffer, src_offset,
+                     sizeof(UINT));
+  }
+
+  void STDMETHODCALLTYPE AtomicCopyBufferUINT64(
+      ID3D12Resource *dst_buffer, UINT64 dst_offset,
+      ID3D12Resource *src_buffer, UINT64 src_offset,
+      UINT dependent_resource_count,
+      ID3D12Resource *const *dependent_resources,
+      const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
+    CopyBufferRegion(dst_buffer, dst_offset, src_buffer, src_offset,
+                     sizeof(UINT64));
+  }
+
+  void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
+    depth_bounds_min_ = min;
+    depth_bounds_max_ = max;
+    WARN("D3D12GraphicsCommandList: depth bounds state recorded but not "
+         "applied by Metal");
+  }
+
+  void STDMETHODCALLTYPE SetSamplePositions(
+      UINT sample_count, UINT pixel_count,
+      D3D12_SAMPLE_POSITION *sample_positions) override {
+    sample_positions_.clear();
+    if (sample_positions && sample_count && pixel_count) {
+      sample_positions_.assign(sample_positions,
+                               sample_positions + sample_count * pixel_count);
+    }
+    sample_position_sample_count_ = sample_count;
+    sample_position_pixel_count_ = pixel_count;
+  }
+
+  void STDMETHODCALLTYPE ResolveSubresourceRegion(
+      ID3D12Resource *dst_resource, UINT dst_sub_resource_idx, UINT dst_x,
+      UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx,
+      D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
+    if (mode != D3D12_RESOLVE_MODE_AVERAGE || dst_x || dst_y || src_rect)
+      WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion falling back "
+           "to full-subresource resolve");
+    ResolveSubresource(dst_resource, dst_sub_resource_idx, src_resource,
+                       src_sub_resource_idx, format);
+  }
+
+  void STDMETHODCALLTYPE SetViewInstanceMask(UINT mask) override {
+    view_instance_mask_ = mask;
+  }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList2_INTERFACE_DEFINED__
+  void STDMETHODCALLTYPE WriteBufferImmediate(
+      UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters,
+      const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) override {
+    if (!count || !parameters)
+      return;
+
+    WriteBufferImmediateRecord record = {};
+    record.parameters.assign(parameters, parameters + count);
+    if (modes)
+      record.modes.assign(modes, modes + count);
+    AddRecord(std::move(record));
+  }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList3_INTERFACE_DEFINED__
+  void STDMETHODCALLTYPE SetProtectedResourceSession(
+      ID3D12ProtectedResourceSession *protected_resource_session) override {
+    if (protected_resource_session)
+      WARN("D3D12GraphicsCommandList: protected resource sessions are "
+           "unsupported");
+  }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+  void STDMETHODCALLTYPE BeginRenderPass(
+      UINT render_targets_count,
+      const D3D12_RENDER_PASS_RENDER_TARGET_DESC *render_targets,
+      const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *depth_stencil,
+      D3D12_RENDER_PASS_FLAGS flags) override {
+    RenderTargetsRecord record = {};
+    if (render_targets && render_targets_count) {
+      record.render_targets.reserve(render_targets_count);
+      for (UINT i = 0; i < render_targets_count; i++) {
+        if (auto *descriptor =
+                GetDescriptorRecordFromCpuHandle(render_targets[i].cpuDescriptor))
+          record.render_targets.push_back(*descriptor);
+      }
+    }
+    if (depth_stencil) {
+      if (auto *descriptor =
+              GetDescriptorRecordFromCpuHandle(depth_stencil->cpuDescriptor))
+        record.depth_stencil = *descriptor;
+    }
+    AddRecord(std::move(record));
+  }
+
+  void STDMETHODCALLTYPE EndRenderPass() override {}
+
+  void STDMETHODCALLTYPE InitializeMetaCommand(
+      ID3D12MetaCommand *meta_command,
+      const void *initialization_parameters_data,
+      SIZE_T initialization_parameters_data_size_in_bytes) override {
+    WARN("D3D12GraphicsCommandList: meta commands are unsupported");
+  }
+
+  void STDMETHODCALLTYPE ExecuteMetaCommand(
+      ID3D12MetaCommand *meta_command, const void *execution_parameters_data,
+      SIZE_T execution_parameters_data_size_in_bytes) override {
+    WARN("D3D12GraphicsCommandList: meta commands are unsupported");
+  }
+
+  void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
+      const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc,
+      UINT postbuild_info_descs_count,
+      const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs) override {
+    WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
+         "unsupported");
+  }
+
+  void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
+      const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
+      UINT src_acceleration_structures_count,
+      const D3D12_GPU_VIRTUAL_ADDRESS *src_acceleration_structure_data) override {
+    WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
+         "unsupported");
+  }
+
+  void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(
+      D3D12_GPU_VIRTUAL_ADDRESS dst_acceleration_structure_data,
+      D3D12_GPU_VIRTUAL_ADDRESS src_acceleration_structure_data,
+      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
+    WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
+         "unsupported");
+  }
+
+  void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject *state_object) override {
+    if (state_object)
+      WARN("D3D12GraphicsCommandList: state objects are unsupported");
+  }
+
+  void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC *desc) override {
+    WARN("D3D12GraphicsCommandList: ray dispatch is unsupported");
+  }
+#endif
+
 private:
+  ID3D12GraphicsCommandList *AsGraphicsCommandList() {
+    return static_cast<ID3D12GraphicsCommandList *>(
+        static_cast<GraphicsCommandListComBase *>(this));
+  }
+
   bool IsPipelineStateCompatible(ID3D12PipelineState *pipeline_state) const {
     if (!pipeline_state)
       return true;
@@ -571,6 +760,12 @@ private:
   Com<ID3D12RootSignature> graphics_root_signature_;
   ComPrivateData private_data_;
   std::vector<CommandRecord> records_;
+  FLOAT depth_bounds_min_ = 0.0f;
+  FLOAT depth_bounds_max_ = 1.0f;
+  UINT sample_position_sample_count_ = 0;
+  UINT sample_position_pixel_count_ = 0;
+  std::vector<D3D12_SAMPLE_POSITION> sample_positions_;
+  UINT view_instance_mask_ = 0xffffffffu;
   bool closed_ = false;
   bool submitted_ = false;
   std::string name_;

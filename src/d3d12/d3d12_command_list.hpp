@@ -82,6 +82,11 @@ struct ResolveSubresourceRecord {
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 };
 
+struct WriteBufferImmediateRecord {
+  std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> parameters;
+  std::vector<D3D12_WRITEBUFFERIMMEDIATE_MODE> modes;
+};
+
 struct ResourceBarrierRecord {
   std::vector<StoredResourceBarrier> barriers;
 };
@@ -226,6 +231,7 @@ using CommandRecordPayload = std::variant<
     RootSignatureRecord, DescriptorHeapsRecord, RootDescriptorTableRecord,
     RootConstantsRecord, RootDescriptorRecord, BeginQueryRecord,
     EndQueryRecord, ResolveQueryDataRecord, PredicationRecord,
+    WriteBufferImmediateRecord,
     ExecuteIndirectRecord>;
 
 struct CommandRecord {
