@@ -1715,6 +1715,8 @@ private:
       ReplayResolveQueryData(chunk, record);
     } else if constexpr (std::is_same_v<T, PredicationRecord>) {
       ReplaySetPredication(state, record);
+    } else if constexpr (std::is_same_v<T, WriteBufferImmediateRecord>) {
+      ReplayWriteBufferImmediate(record);
     } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
       ReplayExecuteIndirect(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
@@ -1777,6 +1779,23 @@ private:
         EmitPassSeparator(chunk);
         break;
       }
+    }
+  }
+
+  void ReplayWriteBufferImmediate(const WriteBufferImmediateRecord &record) {
+    for (size_t i = 0; i < record.parameters.size(); i++) {
+      Resource *resource = nullptr;
+      const UINT64 offset =
+          ResolveBufferGpuAddress(record.parameters[i].Dest, resource);
+      if (!resource || !resource->GetBufferAllocation()) {
+        WARN("D3D12CommandQueue: WriteBufferImmediate skipped unknown "
+             "destination");
+        continue;
+      }
+
+      resource->GetBufferAllocation()->updateContents(
+          resource->GetHeapOffset() + offset, &record.parameters[i].Value,
+          sizeof(record.parameters[i].Value));
     }
   }
 
