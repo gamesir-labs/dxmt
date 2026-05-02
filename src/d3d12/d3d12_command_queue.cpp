@@ -1421,7 +1421,8 @@ private:
           (present_parameters->DirtyRectsCount || present_parameters->pDirtyRects ||
            present_parameters->pScrollRect || present_parameters->pScrollOffset)) {
         WARN("D3D12SwapChain::Present1: dirty rect and scroll parameters are "
-             "not implemented");
+             "not supported");
+        return DXGI_ERROR_UNSUPPORTED;
       }
 
       bool occluded = wsi::isMinimized(hWnd_);
