@@ -16,9 +16,14 @@ public:
   DescriptorHeapImpl(IMTLD3D12Device *device,
                      const D3D12_DESCRIPTOR_HEAP_DESC &desc)
       : device_(device), desc_(desc), records_(desc.NumDescriptors) {
-    for (UINT i = 0; i < desc.NumDescriptors; i++)
+    for (UINT i = 0; i < desc.NumDescriptors; i++) {
+      records_[i].magic = DescriptorRecord::kMagic;
+      records_[i].heap_type = desc.Type;
+      records_[i].shader_visible =
+          (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
       records_[i].cpu_handle.ptr =
           reinterpret_cast<SIZE_T>(&records_[i]);
+    }
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -165,7 +170,38 @@ CreateDescriptorHeap(IMTLD3D12Device *device,
 
 DescriptorRecord *
 GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-  return reinterpret_cast<DescriptorRecord *>(handle.ptr);
+  auto *record = reinterpret_cast<DescriptorRecord *>(handle.ptr);
+  if (!record || record->magic != DescriptorRecord::kMagic)
+    return nullptr;
+  return record;
+}
+
+DescriptorRecord *
+GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                 D3D12_DESCRIPTOR_HEAP_TYPE expected_type) {
+  auto *record = GetDescriptorRecordFromCpuHandle(handle);
+  if (!record)
+    return nullptr;
+  if (record->heap_type != expected_type) {
+    WARN("D3D12DescriptorHeap: descriptor heap type mismatch expected=",
+         uint32_t(expected_type), " actual=", uint32_t(record->heap_type));
+    return nullptr;
+  }
+  return record;
+}
+
+const DescriptorRecord *
+GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
+                                 D3D12_DESCRIPTOR_HEAP_TYPE expected_type) {
+  auto *record =
+      GetDescriptorRecordFromCpuHandle({static_cast<SIZE_T>(handle.ptr)},
+                                       expected_type);
+  if (!record || !record->shader_visible) {
+    if (record)
+      WARN("D3D12DescriptorHeap: non shader-visible descriptor used as GPU handle");
+    return nullptr;
+  }
+  return record;
 }
 
 } // namespace dxmt::d3d12

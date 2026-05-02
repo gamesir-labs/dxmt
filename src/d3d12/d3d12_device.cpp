@@ -46,6 +46,42 @@ IsCpuVisibleHeap(D3D12_HEAP_TYPE heap_type) {
          heap_type == D3D12_HEAP_TYPE_READBACK;
 }
 
+static DescriptorRecord *
+GetDescriptorRecordForWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                            D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
+                            const char *context) {
+  auto *record = d3d12::GetDescriptorRecordFromCpuHandle(handle, expected_type);
+  if (!record)
+    WARN("D3D12Device: invalid descriptor handle for ", context);
+  return record;
+}
+
+static void
+ResetDescriptorRecord(DescriptorRecord &record) {
+  const auto magic = record.magic;
+  const auto heap_type = record.heap_type;
+  const auto shader_visible = record.shader_visible;
+  const auto cpu_handle = record.cpu_handle;
+  record = {};
+  record.magic = magic;
+  record.heap_type = heap_type;
+  record.shader_visible = shader_visible;
+  record.cpu_handle = cpu_handle;
+}
+
+static void
+CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
+  const auto magic = dst.magic;
+  const auto heap_type = dst.heap_type;
+  const auto shader_visible = dst.shader_visible;
+  const auto cpu_handle = dst.cpu_handle;
+  dst = src;
+  dst.magic = magic;
+  dst.heap_type = heap_type;
+  dst.shader_visible = shader_visible;
+  dst.cpu_handle = cpu_handle;
+}
+
 class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device, ID3D12Device> {
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
@@ -399,13 +435,18 @@ public:
 
   void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    auto *record = GetDescriptorRecordForWrite(
+        descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        "CreateConstantBufferView");
     if (!record)
       return;
-    *record = {};
+    ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::ConstantBufferView;
-    record->cpu_handle = descriptor;
     if (desc) {
+      if (desc->BufferLocation & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+        WARN("D3D12Device: CBV BufferLocation is not 256-byte aligned");
+      if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+        WARN("D3D12Device: CBV SizeInBytes is not 256-byte aligned");
       record->desc.cbv = *desc;
       record->has_desc = true;
     }
@@ -414,12 +455,13 @@ public:
   void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource *resource,
                                                   const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    auto *record = GetDescriptorRecordForWrite(
+        descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        "CreateShaderResourceView");
     if (!record)
       return;
-    *record = {};
+    ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::ShaderResourceView;
-    record->cpu_handle = descriptor;
     record->resource = resource;
     if (desc) {
       record->desc.srv = *desc;
@@ -431,12 +473,13 @@ public:
                                                    ID3D12Resource *counter_resource,
                                                    const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
                                                    D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    auto *record = GetDescriptorRecordForWrite(
+        descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        "CreateUnorderedAccessView");
     if (!record)
       return;
-    *record = {};
+    ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::UnorderedAccessView;
-    record->cpu_handle = descriptor;
     record->resource = resource;
     record->counter_resource = counter_resource;
     if (desc) {
@@ -448,12 +491,13 @@ public:
   void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource *resource,
                                                 const D3D12_RENDER_TARGET_VIEW_DESC *desc,
                                                 D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    auto *record = GetDescriptorRecordForWrite(
+        descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        "CreateRenderTargetView");
     if (!record)
       return;
-    *record = {};
+    ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::RenderTargetView;
-    record->cpu_handle = descriptor;
     record->resource = resource;
     if (desc) {
       record->desc.rtv = *desc;
@@ -464,12 +508,13 @@ public:
   void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource *resource,
                                                 const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
                                                 D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    auto *record = GetDescriptorRecordForWrite(
+        descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        "CreateDepthStencilView");
     if (!record)
       return;
-    *record = {};
+    ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::DepthStencilView;
-    record->cpu_handle = descriptor;
     record->resource = resource;
     if (desc) {
       record->desc.dsv = *desc;
@@ -479,12 +524,12 @@ public:
 
   void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC *desc,
                                        D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = d3d12::GetDescriptorRecordFromCpuHandle(descriptor);
+    auto *record = GetDescriptorRecordForWrite(
+        descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, "CreateSampler");
     if (!record)
       return;
-    *record = {};
+    ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::Sampler;
-    record->cpu_handle = descriptor;
     if (desc) {
       record->desc.sampler = *desc;
       record->has_desc = true;
@@ -505,7 +550,7 @@ public:
                                  ? dst_descriptor_range_sizes[dst_range]
                                  : 1;
       auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(
-          dst_descriptor_range_offsets[dst_range]);
+          dst_descriptor_range_offsets[dst_range], descriptor_heap_type);
       for (UINT i = 0; i < dst_count && dst; i++) {
         while (src_range < src_descriptor_range_count) {
           const UINT src_count = src_descriptor_range_sizes
@@ -520,9 +565,9 @@ public:
           return;
 
         auto *src = d3d12::GetDescriptorRecordFromCpuHandle(
-            src_descriptor_range_offsets[src_range]);
+            src_descriptor_range_offsets[src_range], descriptor_heap_type);
         if (src)
-          dst[i] = src[src_index];
+          CopyDescriptorRecord(dst[i], src[src_index]);
         src_index++;
       }
     }
@@ -532,12 +577,14 @@ public:
                                                const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
                                                const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
                                                D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
-    auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(dst_descriptor_range_offset);
-    auto *src = d3d12::GetDescriptorRecordFromCpuHandle(src_descriptor_range_offset);
+    auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(
+        dst_descriptor_range_offset, descriptor_heap_type);
+    auto *src = d3d12::GetDescriptorRecordFromCpuHandle(
+        src_descriptor_range_offset, descriptor_heap_type);
     if (!dst || !src)
       return;
     for (UINT i = 0; i < descriptor_count; i++)
-      dst[i] = src[i];
+      CopyDescriptorRecord(dst[i], src[i]);
   }
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
