@@ -22,6 +22,11 @@ enum class DescriptorRecordType {
 };
 
 struct DescriptorRecord {
+  static constexpr uint32_t kMagic = 0x44584d54;
+
+  uint32_t magic = kMagic;
+  D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
+  bool shader_visible = false;
   DescriptorRecordType type = DescriptorRecordType::Empty;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = {};
   Com<ID3D12Resource> resource;
@@ -49,5 +54,9 @@ CreateDescriptorHeap(IMTLD3D12Device *device,
                      const D3D12_DESCRIPTOR_HEAP_DESC *desc);
 
 DescriptorRecord *GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+DescriptorRecord *GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                                   D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
+const DescriptorRecord *GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
+                                                         D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
 
 } // namespace dxmt::d3d12
