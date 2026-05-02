@@ -16,6 +16,7 @@
 #include "dxmt_sampler.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include "util_win32_compat.h"
 #include "wsi_window.hpp"
 #include <algorithm>
 #include <array>
@@ -189,22 +190,28 @@ GetSwapChainColorSpace(DXGI_FORMAT format) {
                                                   : WMTColorSpaceSRGB;
 }
 
-static bool
-IsSupportedD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
+static WMTColorSpace
+GetD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
   switch (color_space) {
   case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+    return WMTColorSpaceSRGB;
   case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
-    return true;
+    return WMTColorSpaceSRGBLinear;
+  case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+    return WMTColorSpaceHDR_PQ;
+  case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
+    return WMTColorSpaceBT2020;
   default:
-    return false;
+    return WMTColorSpaceInvalid;
   }
 }
 
-static WMTColorSpace
-GetD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
-  return color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
-           ? WMTColorSpaceSRGBLinear
-           : WMTColorSpaceSRGB;
+static bool
+IsSupportedD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
+  const WMTColorSpace wmt_color_space =
+      GetD3D12SwapChainColorSpace(color_space);
+  return wmt_color_space != WMTColorSpaceInvalid &&
+         CGColorSpace_checkColorSpaceSupported(wmt_color_space);
 }
 
 static WMTColorSpace
@@ -1099,12 +1106,19 @@ private:
           queue->device_->GetDXMTDevice().queue().cmd_library, 1.0f,
           desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
       hud_.initialize(GetVersionDescriptionText(12, D3D_FEATURE_LEVEL_12_0));
+      if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+        present_semaphore_ =
+            CreateSemaphore(nullptr, frame_latency_, DXGI_MAX_SWAP_CHAIN_BUFFERS,
+                            nullptr);
+      }
       ResizeBuffers(desc_.BufferCount, desc_.Width, desc_.Height, desc_.Format,
                     desc_.Flags);
     }
 
     ~SwapChainImpl() {
       backbuffers_.clear();
+      if (present_semaphore_)
+        CloseHandle(present_semaphore_);
       if (native_view_)
         WMT::ReleaseMetalView(native_view_);
     }
@@ -1207,6 +1221,7 @@ private:
                                             UINT flags) override {
       UINT old_width = desc_.Width;
       UINT old_height = desc_.Height;
+      UINT old_index = current_backbuffer_;
       if (buffer_count == 0)
         buffer_count = desc_.BufferCount ? desc_.BufferCount : 2;
       if (!buffer_count || buffer_count > DXGI_MAX_SWAP_CHAIN_BUFFERS) {
@@ -1288,7 +1303,7 @@ private:
           return E_FAIL;
       }
 
-      current_backbuffer_ = 0;
+      current_backbuffer_ = desc_.BufferCount ? old_index % desc_.BufferCount : 0;
       if (!source_width_ || source_width_ == old_width)
         source_width_ = desc_.Width;
       if (!source_height_ || source_height_ == old_height)
@@ -1302,7 +1317,15 @@ private:
 
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput **output) override {
       InitReturnPtr(output);
-      return DXGI_ERROR_NOT_FOUND;
+      if (!output)
+        return E_POINTER;
+      if (!wsi::isWindow(hWnd_))
+        return DXGI_ERROR_INVALID_CALL;
+      if (target_) {
+        *output = target_.ref();
+        return S_OK;
+      }
+      return GetOutputFromMonitor(wsi::getWindowMonitor(hWnd_), output);
     }
 
     HRESULT STDMETHODCALLTYPE
@@ -1392,13 +1415,24 @@ private:
       auto *chunk = dxmt_queue.CurrentChunk();
       chunk->signal_frame_latency_fence_ = dxmt_queue.CurrentFrameSeq();
       auto state = presenter_->synchronizeLayerProperties();
+      HANDLE present_signal = nullptr;
+      if (present_semaphore_) {
+        HANDLE process = GetCurrentProcess();
+        DuplicateHandle(process, present_semaphore_, process, &present_signal,
+                        0, FALSE, DUPLICATE_SAME_ACCESS);
+      }
       chunk->emitcc([
         backbuffer = Rc<Texture>(resource->GetTexture()),
         presenter = presenter_,
+        present_signal,
         vsync_duration,
         state = std::move(state)
       ](ArgumentEncodingContext &ctx) mutable {
         ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+        if (present_signal) {
+          ReleaseSemaphore(present_signal, 1, nullptr);
+          CloseHandle(present_signal);
+        }
       });
       dxmt_queue.CommitCurrentChunk();
       dxmt_queue.PresentBoundary();
@@ -1460,6 +1494,9 @@ private:
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
       if (!max_latency || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
         return E_INVALIDARG;
+      if (present_semaphore_ && max_latency > frame_latency_)
+        ReleaseSemaphore(present_semaphore_, max_latency - frame_latency_,
+                         nullptr);
       frame_latency_ = max_latency;
       queue_->device_->GetDXMTDevice().queue().SetMaxLatency(max_latency);
       return S_OK;
@@ -1472,10 +1509,16 @@ private:
     }
 
     HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
-      if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
-        WARN("D3D12SwapChain::GetFrameLatencyWaitableObject: waitable object "
-             "is not implemented");
-      return nullptr;
+      if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) ||
+          !present_semaphore_)
+        return nullptr;
+
+      HANDLE result = nullptr;
+      HANDLE process = GetCurrentProcess();
+      if (!DuplicateHandle(process, present_semaphore_, process, &result, 0,
+                           FALSE, DUPLICATE_SAME_ACCESS))
+        return nullptr;
+      return result;
     }
 
     HRESULT STDMETHODCALLTYPE
@@ -1550,6 +1593,21 @@ private:
       return false;
     }
 
+    HRESULT GetOutputFromMonitor(HMONITOR monitor, IDXGIOutput **output) {
+      Com<IDXGIAdapter> adapter;
+      Com<IDXGIOutput> candidate;
+      if (FAILED(queue_->device_->GetAdapter(&adapter)))
+        return E_FAIL;
+
+      for (UINT i = 0; SUCCEEDED(adapter->EnumOutputs(i, &candidate)); i++) {
+        DXGI_OUTPUT_DESC desc = {};
+        if (SUCCEEDED(candidate->GetDesc(&desc)) && desc.Monitor == monitor)
+          return candidate->QueryInterface(IID_PPV_ARGS(output));
+        candidate = nullptr;
+      }
+      return DXGI_ERROR_NOT_FOUND;
+    }
+
     Com<CommandQueueImpl> queue_;
     Com<IDXGIFactory1> factory_;
     ComPrivateData private_data_;
@@ -1571,6 +1629,7 @@ private:
     DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
     DXGI_MATRIX_3X2_F matrix_ = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
     DXGI_COLOR_SPACE_TYPE color_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    HANDLE present_semaphore_ = nullptr;
   };
 
   struct ReplayState {
