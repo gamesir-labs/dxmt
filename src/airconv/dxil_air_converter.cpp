@@ -16,6 +16,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -70,6 +71,7 @@ struct DxilAirContext {
   Function *function = nullptr;
 
   std::unordered_map<const Value *, Value *> values;
+  std::unordered_map<const GlobalVariable *, GlobalVariable *> globals;
   std::unordered_map<const BasicBlock *, BasicBlock *> blocks;
   std::unordered_map<const Value *, DxilResourceHandle> handles;
   std::map<uint32_t, uint32_t> input_args;
@@ -391,6 +393,11 @@ Value *
 MapValue(const Value *source, DxilAirContext &ctx) {
   if (!source)
     return nullptr;
+  if (const auto *global = dyn_cast<GlobalVariable>(source)) {
+    auto found = ctx.globals.find(global);
+    if (found != ctx.globals.end())
+      return found->second;
+  }
   if (const auto *constant = dyn_cast<Constant>(source))
     return MapConstant(constant, ctx);
   auto found = ctx.values.find(source);
@@ -1891,6 +1898,19 @@ ParseInputModule(const dxil::Parser &parser, LLVMContext &context) {
 
 llvm::Error
 LowerFunction(const Function &source, DxilAirContext &ctx) {
+  for (const auto &global : source.getParent()->globals()) {
+    const auto address_space = global.getAddressSpace();
+    if (address_space != uint32_t(air::AddressSpace::threadgroup))
+      continue;
+    auto *type = MapType(global.getValueType(), ctx);
+    auto *mapped = new GlobalVariable(
+        ctx.module, type, false, GlobalValue::InternalLinkage,
+        UndefValue::get(type), global.getName(), nullptr,
+        GlobalValue::NotThreadLocal, address_space);
+    mapped->setAlignment(global.getAlign().valueOrOne());
+    ctx.globals[&global] = mapped;
+  }
+
   for (const auto &block : source)
     ctx.blocks[&block] = BasicBlock::Create(ctx.llvm, block.getName(), ctx.function);
   if (auto err = BuildPhiNodes(source, ctx))
