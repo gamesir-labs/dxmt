@@ -6,12 +6,14 @@
 #include "util_string.hpp"
 #include "winemetal.h"
 #include "wsi_monitor.hpp"
+#include <d3d12.h>
 #include <string>
 #define __NVAPI_EMPTY_SAL
 #include "nvapi.h"
 #include "nvapi_interface.h"
 #include "nvShaderExtnEnums.h"
 #undef __NVAPI_EMPTY_SAL
+#include "nvapi_d3d12.hpp"
 
 namespace dxmt {
 Logger Logger::s_instance("nvapi.log");
@@ -899,6 +901,42 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
   case 0x842b066e:
     return (void *)&NvAPI_GPU_GetLogicalGpuInfo;
+  case 0xac2dfeb5:
+    return (void *)&NvAPI_D3D12_SetNvShaderExtnSlotSpace;
+  case 0x43d867c0:
+    return (void *)&NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread;
+  case 0xa15faef7:
+    return (void *)&NvAPI_D3D12_QueryPresentBarrierSupport;
+  case 0x4d815de9:
+    return (void *)&NvAPI_D3D12_CreatePresentBarrierClient;
+  case 0xd53c9ef0:
+    return (void *)&NvAPI_D3D12_RegisterPresentBarrierResources;
+  case 0x2fc28856:
+    return (void *)&NvAPI_D3D12_CreateGraphicsPipelineState;
+  case 0x2762deac:
+    return (void *)&NvAPI_D3D12_CreateComputePipelineState;
+  case 0xb9333fe9:
+    return (void *)&NvAPI_D3D12_SetDepthBoundsTestValues;
+  case 0x3dfacec8:
+    return (void *)&NvAPI_D3D12_IsNvShaderExtnOpCodeSupported;
+  case 0x13c98f73:
+    return (void *)&NvAPI_D3D12_SetAsyncFrameMarker;
+  case 0x03d6e8cb:
+    return (void *)&NvAPI_D3D12_NotifyOutOfBandCommandQueue;
+  case 0x548c224f:
+    return (void *)&NvAPI_D3D12_SetCreateCommandQueueLowLatencyHint;
+  case 0x85a6c2a0:
+    return (void *)&NvAPI_D3D12_GetRaytracingCaps;
+  case 0x3fd96fba:
+    return (void *)&NvAPI_NGX_GetNGXOverrideState;
+  case 0xb60fcb4e:
+    return (void *)&NvAPI_NGX_SetNGXOverrideState;
+  case 0x74a4e712:
+    return (void *)&NvAPI_DirectD3D12GraphicsCommandList_Create;
+  case 0x99da3dde:
+    return (void *)&NvAPI_DirectD3D12GraphicsCommandList_Release;
+  case 0x999c26d8:
+    return (void *)&NvAPI_DirectD3D12GraphicsCommandList_Reset;
   default:
     break;
   }

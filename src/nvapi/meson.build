@@ -1,5 +1,6 @@
 nvapi_src = [
   'nvapi.cpp',
+  'nvapi_d3d12.cpp',
 ]
 
 nvapi_ld_args      = ['-L' + windows_native_install_dir] # a nice trick to force relink
