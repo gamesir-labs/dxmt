@@ -2296,7 +2296,7 @@ private:
       descriptor.desc.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       descriptor.desc.srv.Shader4ComponentMapping =
           D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      descriptor.desc.srv.Buffer.FirstElement = 0;
+      descriptor.desc.srv.Buffer.FirstElement = offset;
       descriptor.desc.srv.Buffer.NumElements =
           UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
                                 UINT_MAX));
@@ -2304,7 +2304,7 @@ private:
     } else {
       descriptor.desc.uav.Format = DXGI_FORMAT_UNKNOWN;
       descriptor.desc.uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-      descriptor.desc.uav.Buffer.FirstElement = 0;
+      descriptor.desc.uav.Buffer.FirstElement = offset;
       descriptor.desc.uav.Buffer.NumElements =
           UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
                                 UINT_MAX));
@@ -2464,6 +2464,31 @@ private:
                EstimateShaderArgumentBufferSize(shader);
     }
     return AlignArgumentBufferSize(size);
+  }
+
+  static bool ValidateComputeDispatch(const WMTSize &threadgroup_size,
+                                      UINT x, UINT y, UINT z) {
+    const auto threads_per_group = threadgroup_size.width *
+                                   threadgroup_size.height *
+                                   threadgroup_size.depth;
+    if (!threadgroup_size.width || !threadgroup_size.height ||
+        !threadgroup_size.depth || threads_per_group == 0) {
+      WARN("D3D12CommandQueue: dispatch skipped because compute shader has invalid threadgroup size");
+      return false;
+    }
+    if (threadgroup_size.width > 1024 || threadgroup_size.height > 1024 ||
+        threadgroup_size.depth > 64 || threads_per_group > 1024) {
+      WARN("D3D12CommandQueue: dispatch skipped because compute shader threadgroup size exceeds D3D limits size=",
+           threadgroup_size.width, "x", threadgroup_size.height, "x",
+           threadgroup_size.depth);
+      return false;
+    }
+    if (x > 65535 || y > 65535 || z > 65535) {
+      WARN("D3D12CommandQueue: dispatch grid exceeds D3D threadgroup-count limits grid=",
+           x, "x", y, "x", z);
+      return false;
+    }
+    return true;
   }
 
   ReplayRenderPassAttachments BuildRenderPassAttachments(
@@ -2822,6 +2847,10 @@ private:
       return;
     }
 
+    if (!ValidateComputeDispatch(metal->threadgroup_size, record.x, record.y,
+                                 record.z))
+      return;
+
     const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
     chunk->emitcc([this, metal_pso = metal->pso,
                    threadgroup_size = metal->threadgroup_size,
@@ -2836,6 +2865,10 @@ private:
 
       uint64_t argbuf_offset = 0;
       EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
+      if (argbuf_offset > argument_buffer_size) {
+        WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
+             argument_buffer_size, " actual=", argbuf_offset);
+      }
 
       auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
       dispatch.type = WMTComputeCommandDispatch;

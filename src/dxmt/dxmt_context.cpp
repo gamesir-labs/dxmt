@@ -878,7 +878,13 @@ ArgumentEncodingContext::encodeShaderResources(
     case SM50BindingType::UAV: {
       auto &uav = UAVBindingSet[arg.SM50BindingSlot];
       bool read = (arg.Flags >> 10) & 1, write = (arg.Flags >> 10) & 2;
-      int access_flags =  ((arg.Flags >> 10) & 3) | ResourceAccess::UAV;
+      if (!read && !write) {
+        read = true;
+        write = true;
+      }
+      int access_flags = (read ? ResourceAccess::Read : 0) |
+                         (write ? ResourceAccess::Write : 0) |
+                         ResourceAccess::UAV;
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (uav.buffer.ptr()) {
