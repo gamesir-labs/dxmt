@@ -256,8 +256,11 @@ public:
   ClearResourceKernelContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
 
   void begin(const std::array<float, 4> &color, Rc<Texture> texture, TextureViewKey view);
+  void begin(const std::array<uint32_t, 4> &color, Rc<Texture> texture, TextureViewKey view);
   void begin(const std::array<float, 4> &color, Rc<Buffer> buffer, BufferViewKey view);
+  void begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, BufferViewKey view);
   void begin(const std::array<float, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer);
+  void begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer);
 
   void clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height);
 
@@ -265,6 +268,7 @@ public:
 
 private:
   void setClearColor(const std::array<float, 4> &color, bool is_integer);
+  void setClearColor(const std::array<uint32_t, 4> &color);
 
   ArgumentEncodingContext &ctx_;
   WMT::Device device_;
