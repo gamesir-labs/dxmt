@@ -1190,59 +1190,73 @@ public:
                                          const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_offsets,
                                          const UINT *src_descriptor_range_sizes,
                                          D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
+    if (!dst_descriptor_range_count)
+      return;
     if ((dst_descriptor_range_count && !dst_descriptor_range_offsets) ||
         (src_descriptor_range_count && !src_descriptor_range_offsets)) {
       WARN("D3D12Device: CopyDescriptors called with null range offsets");
       return;
     }
 
-    std::vector<DescriptorRecord> copied;
-    UINT src_range = 0;
-    UINT src_index = 0;
+    std::vector<DescriptorRecord *> destinations;
+    UINT64 dst_total = 0;
     for (UINT dst_range = 0; dst_range < dst_descriptor_range_count; dst_range++) {
       const UINT dst_count = dst_descriptor_range_sizes
                                  ? dst_descriptor_range_sizes[dst_range]
                                  : 1;
+      if (!dst_count)
+        continue;
       auto *dst = d3d12::GetDescriptorRecordRangeFromCpuHandle(
           dst_descriptor_range_offsets[dst_range], descriptor_heap_type,
           dst_count, "CopyDescriptors destination");
       if (!dst)
         return;
-      copied.clear();
-      copied.reserve(dst_count);
-      for (UINT i = 0; i < dst_count; i++) {
-        while (src_range < src_descriptor_range_count) {
-          const UINT src_count = src_descriptor_range_sizes
-                                     ? src_descriptor_range_sizes[src_range]
-                                     : 1;
-          if (src_index < src_count)
-            break;
-          src_range++;
-          src_index = 0;
-        }
-        if (src_range >= src_descriptor_range_count)
-          return;
-
-        const UINT src_count = src_descriptor_range_sizes
-                                   ? src_descriptor_range_sizes[src_range]
-                                   : 1;
-        auto *src = d3d12::GetDescriptorRecordRangeFromCpuHandle(
-            src_descriptor_range_offsets[src_range], descriptor_heap_type,
-            src_count, "CopyDescriptors source");
-        if (!src)
-          return;
-        copied.push_back(src[src_index]);
-        src_index++;
+      if (dst_total > UINT_MAX - dst_count) {
+        WARN("D3D12Device: CopyDescriptors destination descriptor count overflow");
+        return;
       }
-      for (UINT i = 0; i < copied.size(); i++)
-        CopyDescriptorRecord(dst[i], copied[i]);
+      dst_total += dst_count;
+      destinations.reserve(static_cast<size_t>(dst_total));
+      for (UINT i = 0; i < dst_count; i++)
+        destinations.push_back(dst + i);
     }
+    if (destinations.empty())
+      return;
+
+    std::vector<DescriptorRecord> copied;
+    copied.reserve(destinations.size());
+    for (UINT src_range = 0; src_range < src_descriptor_range_count; src_range++) {
+      const UINT src_count = src_descriptor_range_sizes
+                                 ? src_descriptor_range_sizes[src_range]
+                                 : 1;
+      if (!src_count)
+        continue;
+      auto *src = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+          src_descriptor_range_offsets[src_range], descriptor_heap_type,
+          src_count, "CopyDescriptors source");
+      if (!src)
+        return;
+      for (UINT i = 0; i < src_count && copied.size() < destinations.size(); i++)
+        copied.push_back(src[i]);
+      if (copied.size() == destinations.size())
+        break;
+    }
+    if (copied.size() != destinations.size()) {
+      WARN("D3D12Device: CopyDescriptors source descriptor count is smaller "
+           "than destination descriptor count");
+      return;
+    }
+
+    for (size_t i = 0; i < copied.size(); i++)
+      CopyDescriptorRecord(*destinations[i], copied[i]);
   }
 
   void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT descriptor_count,
                                                const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
                                                const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
                                                D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
+    if (!descriptor_count)
+      return;
     auto *dst = d3d12::GetDescriptorRecordRangeFromCpuHandle(
         dst_descriptor_range_offset, descriptor_heap_type, descriptor_count,
         "CopyDescriptorsSimple destination");
