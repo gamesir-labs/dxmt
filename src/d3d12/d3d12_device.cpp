@@ -1578,8 +1578,12 @@ public:
     for (UINT i = 0; i < desc->NumArgumentDescs; i++) {
       const auto &argument = desc->pArgumentDescs[i];
       const auto argument_size = IndirectArgumentByteSize(argument);
-      if (!argument_size)
+      if (!argument_size) {
+        WARN("D3D12Device::CreateCommandSignature: unsupported indirect "
+             "argument type ",
+             argument.Type);
         return E_NOTIMPL;
+      }
       min_stride += argument_size;
       if (IsIndirectOperationArgument(argument.Type)) {
         if (++operation_count > 1 || i + 1 != desc->NumArgumentDescs) {
