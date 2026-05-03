@@ -914,7 +914,11 @@ public:
                                             const D3D12_TILE_RANGE_FLAGS *range_flags,
                                             const UINT *heap_range_offsets,
                                             const UINT *range_tile_counts,
-                                            D3D12_TILE_MAPPING_FLAGS flags) override {}
+                                            D3D12_TILE_MAPPING_FLAGS flags) override {
+    // TODO(d3d12): implement reserved-resource tile mappings once tiled
+    // resources are represented by the D3D12 resource layer.
+    WARN("D3D12CommandQueue: UpdateTileMappings is unsupported");
+  }
 #else
   void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource *resource, UINT region_count,
                                             const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
@@ -923,7 +927,11 @@ public:
                                             const D3D12_TILE_RANGE_FLAGS *range_flags,
                                             UINT *heap_range_offsets,
                                             UINT *range_tile_counts,
-                                            D3D12_TILE_MAPPING_FLAGS flags) override {}
+                                            D3D12_TILE_MAPPING_FLAGS flags) override {
+    // TODO(d3d12): implement reserved-resource tile mappings once tiled
+    // resources are represented by the D3D12 resource layer.
+    WARN("D3D12CommandQueue: UpdateTileMappings is unsupported");
+  }
 #endif
 
   void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource *dst_resource,
@@ -931,7 +939,11 @@ public:
                                           ID3D12Resource *src_resource,
                                           const D3D12_TILED_RESOURCE_COORDINATE *src_region_start_coordinate,
                                           const D3D12_TILE_REGION_SIZE *region_size,
-                                          D3D12_TILE_MAPPING_FLAGS flags) override {}
+                                          D3D12_TILE_MAPPING_FLAGS flags) override {
+    // TODO(d3d12): implement reserved-resource tile mapping copies once tiled
+    // resources are represented by the D3D12 resource layer.
+    WARN("D3D12CommandQueue: CopyTileMappings is unsupported");
+  }
 
   void STDMETHODCALLTYPE ExecuteCommandLists(UINT command_list_count,
                                              ID3D12CommandList *const *command_lists) override {
