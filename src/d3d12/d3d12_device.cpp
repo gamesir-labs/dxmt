@@ -1362,6 +1362,8 @@ public:
                                                    const D3D12_CLEAR_VALUE *optimized_clear_value,
                                                    REFIID riid, void **resource) override {
     InitReturnPtr(resource);
+    // TODO(d3d12): implement reserved resources together with tile mappings.
+    WARN("D3D12Device: reserved resources are unsupported");
     return E_NOTIMPL;
   }
 
@@ -1371,11 +1373,15 @@ public:
                                                HANDLE *handle) override {
     if (handle)
       *handle = nullptr;
+    // TODO(d3d12): export shareable NT handles once resource/process ownership
+    // is represented outside the local COM object lifetime.
+    WARN("D3D12Device: shared handles are unsupported");
     return E_NOTIMPL;
   }
 
   HRESULT STDMETHODCALLTYPE OpenSharedHandle(HANDLE handle, REFIID riid, void **object) override {
     InitReturnPtr(object);
+    WARN("D3D12Device: shared handles are unsupported");
     return E_NOTIMPL;
   }
 
@@ -1383,6 +1389,7 @@ public:
                                                    HANDLE *handle) override {
     if (handle)
       *handle = nullptr;
+    WARN("D3D12Device: named shared handles are unsupported");
     return E_NOTIMPL;
   }
 
@@ -1551,6 +1558,8 @@ public:
     }
 
   HRESULT STDMETHODCALLTYPE SetStablePowerState(WINBOOL enable) override {
+    if (enable)
+      WARN("D3D12Device: stable power state is unsupported");
     return S_OK;
   }
 
@@ -1609,6 +1618,10 @@ public:
                                            UINT *sub_resource_tiling_count,
                                            UINT first_sub_resource_tiling,
                                            D3D12_SUBRESOURCE_TILING *sub_resource_tilings) override {
+    // TODO(d3d12): return real tiling once reserved/tiled resources are
+    // implemented. The device advertises TiledResourcesTier NOT_SUPPORTED.
+    if (resource)
+      WARN("D3D12Device: resource tiling is unsupported");
     if (total_tile_count)
       *total_tile_count = 0;
     if (sub_resource_tiling_count)
