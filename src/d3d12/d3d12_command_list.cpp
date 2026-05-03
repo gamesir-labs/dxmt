@@ -827,8 +827,9 @@ private:
 
     switch (type_) {
     case D3D12_COMMAND_LIST_TYPE_DIRECT:
-    case D3D12_COMMAND_LIST_TYPE_BUNDLE:
       return true;
+    case D3D12_COMMAND_LIST_TYPE_BUNDLE:
+      return state->GetType() == PipelineStateType::Graphics;
     case D3D12_COMMAND_LIST_TYPE_COMPUTE:
       return state->GetType() == PipelineStateType::Compute;
     default:

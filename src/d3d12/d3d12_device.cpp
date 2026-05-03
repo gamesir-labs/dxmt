@@ -175,6 +175,7 @@ IsSupportedD3D12SampleCount(UINT sample_count) {
 static bool
 IsSupportedCommandListType(D3D12_COMMAND_LIST_TYPE type) {
   return type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+         type == D3D12_COMMAND_LIST_TYPE_BUNDLE ||
          type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
          type == D3D12_COMMAND_LIST_TYPE_COPY;
 }
@@ -616,6 +617,12 @@ public:
   HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type,
                                                    REFIID riid, void **command_allocator) override {
     InitReturnPtr(command_allocator);
+    if (!command_allocator)
+      return E_POINTER;
+    if (!IsSupportedCommandListType(type)) {
+      WARN("D3D12Device: unsupported command allocator type ", type);
+      return E_INVALIDARG;
+    }
 
     auto allocator = d3d12::CreateCommandAllocator(static_cast<IMTLD3D12Device *>(this), type);
     return allocator->QueryInterface(riid, command_allocator);
@@ -670,6 +677,10 @@ public:
 
     if (node_mask > 1 || !command_allocator)
       return E_INVALIDARG;
+    if (!IsSupportedCommandListType(type)) {
+      WARN("D3D12Device: unsupported command list type ", type);
+      return E_INVALIDARG;
+    }
 
     auto allocator_state = dynamic_cast<d3d12::CommandAllocator *>(command_allocator);
     if (!allocator_state || allocator_state->GetCommandListType() != type)
