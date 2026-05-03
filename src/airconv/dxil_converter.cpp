@@ -145,7 +145,7 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
         break;
       shader.cbuffer_arguments.push_back({
           .Type = SM50BindingType::ConstantBuffer,
-          .SM50BindingSlot = resource.id,
+          .SM50BindingSlot = it->second.range.binding_slot,
           .Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
               MTL_SM50_SHADER_ARGUMENT_BUFFER |
               MTL_SM50_SHADER_ARGUMENT_READ_ACCESS),
@@ -162,7 +162,7 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
         break;
       shader.resource_arguments.push_back({
           .Type = SM50BindingType::Sampler,
-          .SM50BindingSlot = resource.id,
+          .SM50BindingSlot = it->second.range.binding_slot,
           .Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(0),
           .StructurePtrOffset = it->second.arg_index,
           .RegisterSpace = resource.space,
@@ -177,7 +177,7 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
         break;
       shader.resource_arguments.push_back({
           .Type = SM50BindingType::SRV,
-          .SM50BindingSlot = resource.id,
+          .SM50BindingSlot = it->second.range.binding_slot,
           .Flags = IsBufferResource(resource)
                        ? BufferArgumentFlags(resource, false)
                        : TextureArgumentFlags(resource, false),
@@ -194,7 +194,7 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
         break;
       shader.resource_arguments.push_back({
           .Type = SM50BindingType::UAV,
-          .SM50BindingSlot = resource.id,
+          .SM50BindingSlot = it->second.range.binding_slot,
           .Flags = IsBufferResource(resource)
                        ? BufferArgumentFlags(resource, true)
                        : TextureArgumentFlags(resource, true),

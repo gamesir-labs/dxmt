@@ -512,6 +512,11 @@ ParseDxilTypedOperation(std::string_view name,
       typed.resource_lower_bound = *lower_bound;
       typed.resource_space =
           AggregateIntegerOperandUInt32(operands, 1, 2).value_or(0);
+      if (auto resource_class = AggregateIntegerOperandUInt32(operands, 1, 3);
+          resource_class) {
+        typed.resource_class = *resource_class;
+        typed.has_resource_class = true;
+      }
       typed.has_resource_binding = true;
     }
     SetTypedUInt32(operands, 2, typed.resource_index,
@@ -4402,6 +4407,9 @@ ApplyOperationToTranslationResource(DxilTranslationResourceInfo &resource,
       operation.has_resource_id && operation.resource_id == resource.id;
   const bool binding_matches =
       operation.typed.has_resource_binding &&
+      (!operation.typed.has_resource_class ||
+       TranslationResourceClassFromValue(operation.typed.resource_class) ==
+           resource.resource_class) &&
       operation.typed.resource_space == resource.space &&
       operation.typed.resource_lower_bound == resource.lower_bound;
   if (!id_matches && !binding_matches)

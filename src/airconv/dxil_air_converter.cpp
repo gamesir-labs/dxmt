@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -110,6 +111,22 @@ ResourceClassName(dxil::DxilTranslationResourceClass resource_class) {
   case dxil::DxilTranslationResourceClass::Unknown:
   default:
     return "Unknown";
+  }
+}
+
+dxil::DxilTranslationResourceClass
+ResourceClassFromDxilValue(uint32_t resource_class) {
+  switch (resource_class) {
+  case 0:
+    return dxil::DxilTranslationResourceClass::Srv;
+  case 1:
+    return dxil::DxilTranslationResourceClass::Uav;
+  case 2:
+    return dxil::DxilTranslationResourceClass::Cbv;
+  case 3:
+    return dxil::DxilTranslationResourceClass::Sampler;
+  default:
+    return dxil::DxilTranslationResourceClass::Unknown;
   }
 }
 
@@ -574,11 +591,13 @@ FindResource(const dxil::DxilTranslationInfo &translation,
 
 const dxil::DxilTranslationResourceInfo *
 FindResourceByBinding(const dxil::DxilTranslationInfo &translation,
+                      dxil::DxilTranslationResourceClass resource_class,
                       uint32_t space, uint32_t lower_bound) {
   auto found = std::find_if(
       translation.resources.begin(), translation.resources.end(),
       [&](const dxil::DxilTranslationResourceInfo &resource) {
-        return resource.space == space && resource.lower_bound == lower_bound;
+        return resource.resource_class == resource_class &&
+               resource.space == space && resource.lower_bound == lower_bound;
       });
   return found == translation.resources.end() ? nullptr : &*found;
 }
@@ -606,6 +625,17 @@ FormatResourceBinding(const dxil::DxilTranslationResourceInfo &resource) {
          BindingPrefix(resource.resource_class) +
          std::to_string(resource.lower_bound) + ".." + upper_bound +
          " space" + std::to_string(resource.space);
+}
+
+uint32_t
+AllocateDxilBindingSlot(std::set<uint32_t> &used_slots, uint32_t preferred_slot) {
+  if (used_slots.insert(preferred_slot).second)
+    return preferred_slot;
+
+  uint32_t slot = 0;
+  while (!used_slots.insert(slot).second)
+    slot++;
+  return slot;
 }
 
 std::string
@@ -1181,11 +1211,15 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
   if (name == "CreateHandleFromBinding") {
     const auto lower_bound =
         ConstantAggregateElementU32(call.getArgOperand(1), 0);
+    const auto resource_class =
+        ConstantAggregateElementU32(call.getArgOperand(1), 3);
     const auto space = ConstantAggregateElementU32(call.getArgOperand(1), 2);
-    if (!lower_bound || !space)
+    if (!lower_bound || !resource_class || !space)
       return UnsupportedDxilCall(call, "requires a constant ResBind", ctx);
     const auto *resource =
-        FindResourceByBinding(ctx.translation, *space, *lower_bound);
+        FindResourceByBinding(
+            ctx.translation, ResourceClassFromDxilValue(*resource_class),
+            *space, *lower_bound);
     if (!resource)
       return UnsupportedDxilCall(
           call,
@@ -1735,11 +1769,18 @@ void
 BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
                         dxbc::ShaderInfo &shader_info) {
   using shader::common::ResourceType;
+  std::set<uint32_t> cbv_slots;
+  std::set<uint32_t> sampler_slots;
+  std::set<uint32_t> srv_slots;
+  std::set<uint32_t> uav_slots;
   for (const auto &resource : translation.resources) {
     const auto range_id = resource.id;
     if (resource.resource_class == dxil::DxilTranslationResourceClass::Cbv) {
+      const auto binding_slot =
+          AllocateDxilBindingSlot(cbv_slots, resource.lower_bound);
       auto &cbv = shader_info.cbufferMap[range_id];
       cbv.range = {.range_id = range_id,
+                   .binding_slot = binding_slot,
                    .lower_bound = resource.lower_bound,
                    .size = resource.bind_count ? resource.bind_count : 1,
                    .space = resource.space};
@@ -1747,16 +1788,19 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       cbv.arg_index = shader_info.binding_table_cbuffer.DefineBuffer(
           "cb" + std::to_string(range_id), air::AddressSpace::constant,
           air::MemoryAccess::read, air::msl_uint4,
-          GetArgumentIndex(SM50BindingType::ConstantBuffer, range_id));
+          GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot));
       continue;
     }
     if (resource.resource_class == dxil::DxilTranslationResourceClass::Sampler) {
+      const auto binding_slot =
+          AllocateDxilBindingSlot(sampler_slots, resource.lower_bound);
       auto &sampler = shader_info.samplerMap[range_id];
       sampler.range = {.range_id = range_id,
+                       .binding_slot = binding_slot,
                        .lower_bound = resource.lower_bound,
                        .size = resource.bind_count ? resource.bind_count : 1,
                        .space = resource.space};
-      auto attr = GetArgumentIndex(SM50BindingType::Sampler, range_id);
+      auto attr = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
       sampler.arg_index = shader_info.binding_table.DefineSampler(
           "s" + std::to_string(range_id), attr);
       sampler.arg_cube_index = shader_info.binding_table.DefineSampler(
@@ -1770,8 +1814,11 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
         ToResourceType(resource.resource_kind, resource.dimension);
     auto scaler = ToScalerDataType(resource.return_type);
     if (resource.resource_class == dxil::DxilTranslationResourceClass::Srv) {
+      const auto binding_slot =
+          AllocateDxilBindingSlot(srv_slots, resource.lower_bound);
       auto &srv = shader_info.srvMap[range_id];
       srv.range = {.range_id = range_id,
+                   .binding_slot = binding_slot,
                    .lower_bound = resource.lower_bound,
                    .size = resource.bind_count ? resource.bind_count : 1,
                    .space = resource.space};
@@ -1780,7 +1827,7 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       srv.read = resource.read;
       srv.sampled = resource.sampled;
       srv.structure_stride = resource.element_stride;
-      auto attr = GetArgumentIndex(SM50BindingType::SRV, range_id);
+      auto attr = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
       if (resource_type != ResourceType::NonApplicable) {
         srv.arg_index = shader_info.binding_table.DefineTexture(
             "t" + std::to_string(range_id),
@@ -1796,8 +1843,11 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       srv.arg_metadata_index = shader_info.binding_table.DefineInteger64(
           "meta_t" + std::to_string(range_id), attr + 1);
     } else if (resource.resource_class == dxil::DxilTranslationResourceClass::Uav) {
+      const auto binding_slot =
+          AllocateDxilBindingSlot(uav_slots, resource.lower_bound);
       auto &uav = shader_info.uavMap[range_id];
       uav.range = {.range_id = range_id,
+                   .binding_slot = binding_slot,
                    .lower_bound = resource.lower_bound,
                    .size = resource.bind_count ? resource.bind_count : 1,
                    .space = resource.space};
@@ -1806,7 +1856,7 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       uav.read = resource.read;
       uav.written = resource.written;
       uav.structure_stride = resource.element_stride;
-      auto attr = GetArgumentIndex(SM50BindingType::UAV, range_id);
+      auto attr = GetArgumentIndex(SM50BindingType::UAV, binding_slot);
       const auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
                                                   : air::MemoryAccess::write)
                                       : air::MemoryAccess::read;
@@ -2116,32 +2166,55 @@ FillDxilReflection(const dxil::Parser &parser, MTL_SHADER_REFLECTION *reflection
   if (!translation)
     return;
 
+  dxbc::ShaderInfo shader_info;
+  BuildDxilShaderInfo(*translation, shader_info);
+
   uint32_t cbv_count = 0;
   uint32_t argument_count = 0;
   for (const auto &resource : translation->resources) {
     switch (resource.resource_class) {
-    case dxil::DxilTranslationResourceClass::Cbv:
+    case dxil::DxilTranslationResourceClass::Cbv: {
+      auto it = shader_info.cbufferMap.find(resource.id);
+      if (it == shader_info.cbufferMap.end())
+        break;
+      const auto binding_slot = it->second.range.binding_slot;
       cbv_count++;
-      if (resource.id < 16)
-        reflection->ConstantBufferSlotMask |= uint16_t(1u << resource.id);
+      if (binding_slot < 16)
+        reflection->ConstantBufferSlotMask |= uint16_t(1u << binding_slot);
       break;
-    case dxil::DxilTranslationResourceClass::Sampler:
+    }
+    case dxil::DxilTranslationResourceClass::Sampler: {
+      auto it = shader_info.samplerMap.find(resource.id);
+      if (it == shader_info.samplerMap.end())
+        break;
+      const auto binding_slot = it->second.range.binding_slot;
       argument_count++;
-      if (resource.id < 16)
-        reflection->SamplerSlotMask |= uint16_t(1u << resource.id);
+      if (binding_slot < 16)
+        reflection->SamplerSlotMask |= uint16_t(1u << binding_slot);
       break;
-    case dxil::DxilTranslationResourceClass::Srv:
+    }
+    case dxil::DxilTranslationResourceClass::Srv: {
+      auto it = shader_info.srvMap.find(resource.id);
+      if (it == shader_info.srvMap.end())
+        break;
+      const auto binding_slot = it->second.range.binding_slot;
       argument_count++;
-      if (resource.id < 64)
-        reflection->SRVSlotMaskLo |= uint64_t(1) << resource.id;
-      else if (resource.id < 128)
-        reflection->SRVSlotMaskHi |= uint64_t(1) << (resource.id - 64);
+      if (binding_slot < 64)
+        reflection->SRVSlotMaskLo |= uint64_t(1) << binding_slot;
+      else if (binding_slot < 128)
+        reflection->SRVSlotMaskHi |= uint64_t(1) << (binding_slot - 64);
       break;
-    case dxil::DxilTranslationResourceClass::Uav:
+    }
+    case dxil::DxilTranslationResourceClass::Uav: {
+      auto it = shader_info.uavMap.find(resource.id);
+      if (it == shader_info.uavMap.end())
+        break;
+      const auto binding_slot = it->second.range.binding_slot;
       argument_count++;
-      if (resource.id < 64)
-        reflection->UAVSlotMask |= uint64_t(1) << resource.id;
+      if (binding_slot < 64)
+        reflection->UAVSlotMask |= uint64_t(1) << binding_slot;
       break;
+    }
     default:
       break;
     }

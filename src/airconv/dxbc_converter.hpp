@@ -22,6 +22,7 @@ namespace dxmt::dxbc {
 
 struct ResourceRange {
   uint32_t range_id;
+  uint32_t binding_slot;
   uint32_t lower_bound;
   uint32_t size;
   uint32_t space;

@@ -79,15 +79,17 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
   auto &binding_table_cbuffer = shader_info.binding_table_cbuffer;
 
   for (auto &[range_id, cbv] : shader_info.cbufferMap) {
+    auto binding_slot = cbv.range.binding_slot;
     cbv.arg_index = binding_table_cbuffer.DefineBuffer(
       "cb" + std::to_string(range_id), AddressSpace::constant,
       MemoryAccess::read, msl_uint4,
-      GetArgumentIndex(SM50BindingType::ConstantBuffer, range_id)
+      GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot)
     );
   }
 
   for (auto &[range_id, sampler] : shader_info.samplerMap) {
-    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, range_id);
+    auto binding_slot = sampler.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
     sampler.arg_index =
       binding_table.DefineSampler("s" + std::to_string(range_id), attr_index);
     sampler.arg_cube_index =
@@ -98,7 +100,8 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
   }
 
   for (auto &[range_id, srv] : shader_info.srvMap) {
-    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, range_id);
+    auto binding_slot = srv.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
     if (srv.resource_type != ResourceType::NonApplicable) {
       auto access = srv.sampled ? MemoryAccess::sample : MemoryAccess::read;
       auto texture_kind = to_air_resource_type(srv.resource_type, srv.compared);
@@ -122,7 +125,8 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
     auto access =
       uav.written ? (uav.read ? MemoryAccess::read_write : MemoryAccess::write)
                   : MemoryAccess::read;
-    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, range_id);
+    auto binding_slot = uav.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, binding_slot);
     if (uav.resource_type != ResourceType::NonApplicable) {
       auto texture_kind = to_air_resource_type(uav.resource_type);
       auto scaler_type = to_air_scaler_type(uav.scaler_type);
@@ -1259,14 +1263,15 @@ AIRCONV_API int SM50Initialize(
 
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     // TODO: abstract SM 5.0 binding
+    auto binding_slot = cbv.range.binding_slot;
     cbv.arg_index = binding_table_cbuffer.DefineBuffer(
       "cb" + std::to_string(range_id), AddressSpace::constant,
       MemoryAccess::read, msl_uint4,
-      GetArgumentIndex(SM50BindingType::ConstantBuffer, range_id)
+      GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot)
     );
     sm50_shader->args_reflection_cbuffer.push_back({
       .Type = SM50BindingType::ConstantBuffer,
-      .SM50BindingSlot = range_id,
+      .SM50BindingSlot = binding_slot,
       .Flags =
         MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
       .StructurePtrOffset = cbv.arg_index,
@@ -1274,11 +1279,13 @@ AIRCONV_API int SM50Initialize(
       .RegisterLowerBound = cbv.range.lower_bound,
       .RegisterCount = cbv.range.size ? cbv.range.size : 1,
     });
-    binding_cbuffer_mask |= (1 << range_id);
+    if (binding_slot < 16)
+      binding_cbuffer_mask |= (1 << binding_slot);
   }
   for (auto &[range_id, sampler] : shader_info->samplerMap) {
     // TODO: abstract SM 5.0 binding
-    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, range_id);
+    auto binding_slot = sampler.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
     sampler.arg_index =
       binding_table.DefineSampler("s" + std::to_string(range_id), attr_index);
     sampler.arg_cube_index =
@@ -1288,17 +1295,19 @@ AIRCONV_API int SM50Initialize(
     );
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::Sampler,
-      .SM50BindingSlot = range_id,
+      .SM50BindingSlot = binding_slot,
       .Flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0,
       .StructurePtrOffset = sampler.arg_index,
       .RegisterSpace = sampler.range.space,
       .RegisterLowerBound = sampler.range.lower_bound,
       .RegisterCount = sampler.range.size ? sampler.range.size : 1,
     });
-    binding_sampler_mask |= (1 << range_id);
+    if (binding_slot < 16)
+      binding_sampler_mask |= (1 << binding_slot);
   }
   for (auto &[range_id, srv] : shader_info->srvMap) {
-    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, range_id);
+    auto binding_slot = srv.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
     if (srv.resource_type != ResourceType::NonApplicable) {
       // TODO: abstract SM 5.0 binding
       auto access = srv.sampled ? MemoryAccess::sample : MemoryAccess::read;
@@ -1346,24 +1355,25 @@ AIRCONV_API int SM50Initialize(
     }
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::SRV,
-      .SM50BindingSlot = range_id,
+      .SM50BindingSlot = binding_slot,
       .Flags = flags,
       .StructurePtrOffset = srv.arg_index,
       .RegisterSpace = srv.range.space,
       .RegisterLowerBound = srv.range.lower_bound,
       .RegisterCount = srv.range.size ? srv.range.size : 1,
     });
-    if (range_id & 64) {
-      binding_srv_hi_mask |= (1ULL << (range_id - 64));
-    } else {
-      binding_srv_lo_mask |= (1ULL << range_id);
+    if (binding_slot < 64) {
+      binding_srv_lo_mask |= (1ULL << binding_slot);
+    } else if (binding_slot < 128) {
+      binding_srv_hi_mask |= (1ULL << (binding_slot - 64));
     }
   }
   for (auto &[range_id, uav] : shader_info->uavMap) {
     auto access =
       uav.written ? (uav.read ? MemoryAccess::read_write : MemoryAccess::write)
                   : MemoryAccess::read;
-    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, range_id);
+    auto binding_slot = uav.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, binding_slot);
     if (uav.resource_type != ResourceType::NonApplicable) {
       auto texture_kind = to_air_resource_type(uav.resource_type);
       auto scaler_type = to_air_scaler_type(uav.scaler_type);
@@ -1420,14 +1430,15 @@ AIRCONV_API int SM50Initialize(
     }
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::UAV,
-      .SM50BindingSlot = range_id,
+      .SM50BindingSlot = binding_slot,
       .Flags = flags,
       .StructurePtrOffset = uav.arg_index,
       .RegisterSpace = uav.range.space,
       .RegisterLowerBound = uav.range.lower_bound,
       .RegisterCount = uav.range.size ? uav.range.size : 1,
     });
-    binding_uav_mask |= (1ULL << range_id);
+    if (binding_slot < 64)
+      binding_uav_mask |= (1ULL << binding_slot);
   }
 
   if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER &&

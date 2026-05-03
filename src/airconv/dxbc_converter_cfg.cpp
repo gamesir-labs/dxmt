@@ -342,7 +342,7 @@ read_control_flow(
       }
       shader_info.cbufferMap[RangeID] = {
           .range =
-              {.range_id = RangeID, .lower_bound = LB, .size = RangeSize, .space = Inst.m_ConstantBufferDecl.Space},
+              {.range_id = RangeID, .binding_slot = RangeID, .lower_bound = LB, .size = RangeSize, .space = Inst.m_ConstantBufferDecl.Space},
           .size_in_vec4 = CBufferSize,
           .arg_index = 0, // set it later
       };
@@ -367,7 +367,7 @@ read_control_flow(
         DXASSERT_DXBC(false);
       }
       shader_info.samplerMap[RangeID] = {
-          .range = {.range_id = RangeID, .lower_bound = LB, .size = RangeSize, .space = Inst.m_SamplerDecl.Space},
+          .range = {.range_id = RangeID, .binding_slot = RangeID, .lower_bound = LB, .size = RangeSize, .space = Inst.m_SamplerDecl.Space},
           // set them later,
           .arg_index = 0,
           .arg_cube_index = 0,
@@ -394,6 +394,7 @@ read_control_flow(
       ShaderResourceViewInfo srv;
       srv.range = {
           .range_id = RangeID,
+          .binding_slot = RangeID,
           .lower_bound = LB,
           .size = RangeSize,
           .space = 0,
@@ -447,6 +448,7 @@ read_control_flow(
       UnorderedAccessViewInfo uav;
       uav.range = {
           .range_id = RangeID,
+          .binding_slot = RangeID,
           .lower_bound = LB,
           .size = RangeSize,
           .space = 0,
