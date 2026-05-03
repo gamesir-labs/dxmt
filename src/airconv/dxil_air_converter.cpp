@@ -1244,12 +1244,25 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
                                  ctx);
     if (!ptr || !resource)
       return UnsupportedDxilCall(call, "buffer load without resolved buffer handle", ctx);
+    uint32_t mask = 0xfu;
+    if (name == "RawBufferLoad") {
+      const auto raw_mask = ConstantOperandU32(call, 4);
+      if (!raw_mask)
+        return UnsupportedDxilCall(call, "raw buffer load mask must be constant", ctx);
+      mask = *raw_mask;
+    }
     auto *word_index = BufferWordIndex(*resource, call, 2, 3, ctx);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
-    auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
-    auto *load = ctx.builder.CreateLoad(pointee, gep);
-    ctx.values[&call] =
-        PackDxilReturn(call, BuildVector4({load, nullptr, nullptr, nullptr}, ctx), ctx);
+    std::array<Value *, 4> values = {};
+    for (uint32_t i = 0; i < 4; i++) {
+      if (!(mask & (1u << i)))
+        continue;
+      auto *component_index =
+          ctx.builder.CreateAdd(word_index, ctx.builder.getInt32(i));
+      auto *gep = ctx.builder.CreateGEP(pointee, ptr, component_index);
+      values[i] = ctx.builder.CreateLoad(pointee, gep);
+    }
+    ctx.values[&call] = PackDxilReturn(call, BuildVector4(values, ctx), ctx);
     return Error::success();
   }
   if (name == "RawBufferStore" || name == "BufferStore") {
