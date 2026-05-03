@@ -249,7 +249,11 @@ public:
                                    const D3D12_TILED_RESOURCE_COORDINATE *tile_region_start_coordinate,
                                    const D3D12_TILE_REGION_SIZE *tile_region_size,
                                    ID3D12Resource *buffer, UINT64 buffer_offset,
-                                   D3D12_TILE_COPY_FLAGS flags) override {}
+                                   D3D12_TILE_COPY_FLAGS flags) override {
+    // TODO(d3d12): implement tiled-resource tile copies once reserved resources
+    // and tile mappings are represented by the D3D12 resource layer.
+    WARN("D3D12GraphicsCommandList: CopyTiles is unsupported");
+  }
   void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource *dst_resource, UINT dst_sub_resource,
                                             ID3D12Resource *src_resource, UINT src_sub_resource,
                                             DXGI_FORMAT format) override {
@@ -299,7 +303,19 @@ public:
       record.barriers.push_back(StoreResourceBarrier(barriers[i]));
     AddRecord(std::move(record));
   }
-  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {}
+  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {
+    auto *bundle = dynamic_cast<GraphicsCommandList *>(command_list);
+    if (!bundle || bundle->GetCommandListType() != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+      WARN("D3D12GraphicsCommandList: ExecuteBundle called with non-bundle command list");
+      return;
+    }
+    if (!bundle->IsClosed()) {
+      WARN("D3D12GraphicsCommandList: ExecuteBundle called with an open bundle");
+      return;
+    }
+    const auto &bundle_records = bundle->GetCommandRecords();
+    records_.insert(records_.end(), bundle_records.begin(), bundle_records.end());
+  }
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT heap_count, ID3D12DescriptorHeap *const *heaps) override {
     DescriptorHeapsRecord record = {};
     if (heaps && heap_count) {
@@ -415,7 +431,13 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SOSetTargets(UINT start_slot, UINT view_count,
-                                      const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) override {}
+                                      const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) override {
+    if (view_count && views) {
+      // TODO(d3d12): lower stream-output buffer bindings into Metal transform
+      // feedback or an emulated write path.
+      WARN("D3D12GraphicsCommandList: stream output targets are unsupported");
+    }
+  }
   void STDMETHODCALLTYPE OMSetRenderTargets(UINT render_target_descriptor_count,
                                             const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors,
                                             WINBOOL single_descriptor_handle,
@@ -610,9 +632,13 @@ public:
       ID3D12Resource *dst_resource, UINT dst_sub_resource_idx, UINT dst_x,
       UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx,
       D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
-    if (mode != D3D12_RESOLVE_MODE_AVERAGE || dst_x || dst_y || src_rect)
-      WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion falling back "
-           "to full-subresource resolve");
+    if (mode != D3D12_RESOLVE_MODE_AVERAGE || dst_x || dst_y || src_rect) {
+      // TODO(d3d12): support partial-region resolves and MIN/MAX/DECOMPRESS
+      // modes without silently resolving the wrong pixels.
+      WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion is unsupported "
+           "for partial regions or non-average modes");
+      return;
+    }
     ResolveSubresource(dst_resource, dst_sub_resource_idx, src_resource,
                        src_sub_resource_idx, format);
   }
