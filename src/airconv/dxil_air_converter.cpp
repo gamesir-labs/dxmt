@@ -754,6 +754,19 @@ GetBufferPointer(const DxilResourceHandle &handle, bool uav, DxilAirContext &ctx
       .get();
 }
 
+Value *
+GetUavCounterPointer(const DxilResourceHandle &handle, DxilAirContext &ctx) {
+  auto range = ctx.resources.uav_counter_range_map.find(handle.range_id);
+  if (range == ctx.resources.uav_counter_range_map.end())
+    return nullptr;
+  return range->second(GetResourceIndex(handle, ctx))
+      .build(dxbc::context{ctx.builder, ctx.air, ctx.llvm, ctx.module,
+                           ctx.function, ctx.resources, ctx.types, 0xffffffff,
+                           microsoft::D3D10_SB_PIXEL_SHADER,
+                           SM50_SHADER_METAL_310})
+      .get();
+}
+
 std::pair<Value *, const dxil::DxilTranslationResourceInfo *>
 GetTextureHandle(const DxilResourceHandle &handle, DxilAirContext &ctx) {
   const auto *resource =
@@ -1531,6 +1544,30 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     ctx.values[&call] = PackDxilReturn(call, value, ctx);
     return Error::success();
   }
+  if (name == "BufferUpdateCounter") {
+    auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    if (handle.resource_class != dxil::DxilTranslationResourceClass::Uav)
+      return UnsupportedDxilCall(call, "counter update requires a UAV handle", ctx);
+    auto *ptr = GetUavCounterPointer(handle, ctx);
+    if (!ptr)
+      return UnsupportedDxilCall(call, "counter update without resolved UAV counter", ctx);
+    auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
+    auto *i32_ptr = ptr;
+    if (!pointee->isIntegerTy(32))
+      i32_ptr = ctx.builder.CreatePointerCast(
+          ptr, ctx.types._int->getPointerTo(ptr->getType()->getPointerAddressSpace()));
+    const auto inc = ConstantOperandI32(call, 2);
+    if (!inc || (*inc != 1 && *inc != -1))
+      return UnsupportedDxilCall(
+          call, "counter update increment must be constant +1 or -1", ctx);
+    auto *old_value = ctx.builder.CreateAtomicRMW(
+        *inc > 0 ? llvm::AtomicRMWInst::Add : llvm::AtomicRMWInst::Sub,
+        i32_ptr, ctx.builder.getInt32(1), llvm::MaybeAlign(),
+        llvm::AtomicOrdering::Monotonic);
+    ctx.values[&call] =
+        *inc > 0 ? old_value : ctx.builder.CreateSub(old_value, ctx.builder.getInt32(1));
+    return Error::success();
+  }
   if (name == "Discard") {
     ctx.air.CreateDiscard();
     return Error::success();
@@ -1918,6 +1955,7 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       uav.scaler_type = scaler;
       uav.read = resource.read;
       uav.written = resource.written;
+      uav.with_counter = resource.counter;
       uav.structure_stride = resource.element_stride;
       auto attr = GetArgumentIndex(SM50BindingType::UAV, binding_slot);
       const auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
@@ -1939,6 +1977,11 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       }
       uav.arg_metadata_index = shader_info.binding_table.DefineInteger64(
           "meta_u" + std::to_string(range_id), attr + 1);
+      if (uav.with_counter) {
+        uav.arg_counter_index = shader_info.binding_table.DefineBuffer(
+            "counter" + std::to_string(range_id), air::AddressSpace::device,
+            air::MemoryAccess::read_write, air::msl_uint, attr + 2);
+      }
     }
   }
 }
