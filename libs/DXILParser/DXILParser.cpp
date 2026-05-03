@@ -667,6 +667,14 @@ ParseDxilTypedOperation(std::string_view name,
     return typed;
   }
 
+  if (name == "BufferUpdateCounter") {
+    typed.kind = DxilTypedOperationKind::BufferStore;
+    typed.is_read = true;
+    typed.is_write = true;
+    AppendTypedOperands(typed, operands, {"handle", "increment"});
+    return typed;
+  }
+
   if (name == "LoadInput" || name == "LoadOutputControlPoint" ||
       name == "LoadPatchConstant") {
     typed.kind = DxilTypedOperationKind::LoadInput;
@@ -4434,6 +4442,10 @@ ApplyOperationToTranslationResource(DxilTranslationResourceInfo &resource,
     break;
   case DxilSemanticOperationKind::ResourceWrite:
     resource.written = true;
+    if (operation.opcode_name == "BufferUpdateCounter") {
+      resource.read = true;
+      resource.counter = true;
+    }
     break;
   case DxilSemanticOperationKind::ResourceSample:
     resource.sampled = true;

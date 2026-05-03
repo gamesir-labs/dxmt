@@ -90,6 +90,9 @@ TextureArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
   if (resource.written)
     flags =
         MTL_SM50_SHADER_ARGUMENT_FLAG(flags | MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS);
+  if (resource.counter)
+    flags =
+        MTL_SM50_SHADER_ARGUMENT_FLAG(flags | MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER);
   return flags;
 }
 
@@ -105,6 +108,9 @@ BufferArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
   if (resource.written)
     flags =
         MTL_SM50_SHADER_ARGUMENT_FLAG(flags | MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS);
+  if (resource.counter)
+    flags =
+        MTL_SM50_SHADER_ARGUMENT_FLAG(flags | MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER);
   return flags;
 }
 

@@ -978,6 +978,7 @@ struct DxilTranslationResourceInfo {
   bool sampled = false;
   bool compared = false;
   bool queried = false;
+  bool counter = false;
 };
 
 struct DxilTranslationSignatureElementInfo {
