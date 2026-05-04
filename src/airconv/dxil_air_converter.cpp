@@ -1304,6 +1304,8 @@ BuildDxilMath(const CallBase &call, std::string_view name, DxilAirContext &ctx) 
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::sqrt, a);
   if (name == "Rsqrt")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::rsqrt, a);
+  if (name == "Atan")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::atan, a);
   if (name == "Sin")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::sin, a);
   if (name == "Cos")
