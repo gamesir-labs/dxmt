@@ -761,7 +761,8 @@ llvm::air::Texture
 BuildTexture(const dxil::DxilTranslationResourceInfo &resource,
              air::MemoryAccess access) {
   auto resource_type = ToResourceType(resource.resource_kind, resource.dimension);
-  auto texture_kind = air::to_air_resource_type(resource_type, resource.compared);
+  auto texture_kind = air::lowering_texture_1d_to_2d(
+      air::to_air_resource_type(resource_type, resource.compared));
   auto scaler = ToScalerDataType(resource.return_type);
   llvm::air::Texture::SampleType sample_type = llvm::air::Texture::sample_float;
   if (scaler == shader::common::ScalerDataType::Uint)
@@ -780,6 +781,13 @@ BuildTexture(const dxil::DxilTranslationResourceInfo &resource,
       .sample_type = sample_type,
       .memory_access = memory_access,
   };
+}
+
+bool
+IsTexture1DResource(const dxil::DxilTranslationResourceInfo &resource) {
+  auto type = ToResourceType(resource.resource_kind, resource.dimension);
+  return type == shader::common::ResourceType::Texture1D ||
+         type == shader::common::ResourceType::Texture1DArray;
 }
 
 Value *
@@ -936,8 +944,25 @@ Value *
 TextureCoord(const dxil::DxilTranslationResourceInfo &resource,
              const CallBase &call, uint32_t first, bool floating,
              DxilAirContext &ctx) {
+  if (IsTexture1DResource(resource)) {
+    auto *x = ComponentFromOperand(call, first, ctx);
+    if (floating && x->getType()->isIntegerTy())
+      x = ctx.builder.CreateUIToFP(x, ctx.types._float);
+    Value *coord = UndefValue::get(FixedVectorType::get(x->getType(), 2));
+    coord = ctx.builder.CreateInsertElement(coord, x, uint64_t(0));
+    coord = ctx.builder.CreateInsertElement(
+        coord, Constant::getNullValue(x->getType()), uint64_t(1));
+    return coord;
+  }
   return VectorFromOperands(call, first, TextureCoordinateCount(resource),
                             floating, ctx);
+}
+
+Value *
+TextureGradientCoord(const dxil::DxilTranslationResourceInfo &resource,
+                     const CallBase &call, uint32_t first,
+                     DxilAirContext &ctx) {
+  return TextureCoord(resource, call, first, true, ctx);
 }
 
 bool
@@ -1525,8 +1550,8 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     else if (name == "SampleGrad")
       result = ctx.air.CreateSampleGrad(
           air_texture, texture, sampler, coord, array_index,
-          VectorFromOperands(call, 8, TextureCoordinateCount(*resource), true, ctx),
-          VectorFromOperands(call, 11, TextureCoordinateCount(*resource), true, ctx),
+          TextureGradientCoord(*resource, call, 8, ctx),
+          TextureGradientCoord(*resource, call, 11, ctx),
           offset);
     else if (name == "SampleCmp" || name == "SampleCmpLevelZero" ||
              name == "SampleCmpLevel" || name == "SampleCmpBias" ||
@@ -2047,7 +2072,8 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       } else if (resource_type != ResourceType::NonApplicable) {
         srv.arg_index = shader_info.binding_table.DefineTexture(
             "t" + std::to_string(range_id),
-            air::to_air_resource_type(resource_type, resource.compared),
+            air::lowering_texture_1d_to_2d(
+                air::to_air_resource_type(resource_type, resource.compared)),
             resource.sampled ? air::MemoryAccess::sample
                              : air::MemoryAccess::read,
             air::to_air_scaler_type(scaler), attr);
@@ -2084,7 +2110,9 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       } else if (resource_type != ResourceType::NonApplicable) {
         uav.arg_index = shader_info.binding_table.DefineTexture(
             "u" + std::to_string(range_id),
-            air::to_air_resource_type(resource_type), access,
+            air::lowering_texture_1d_to_2d(
+                air::to_air_resource_type(resource_type)),
+            access,
             air::to_air_scaler_type(scaler), attr);
       } else {
         uav.arg_index = shader_info.binding_table.DefineBuffer(

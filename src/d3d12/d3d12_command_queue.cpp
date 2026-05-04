@@ -1057,7 +1057,7 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
 
   switch (srv.ViewDimension) {
   case D3D12_SRV_DIMENSION_TEXTURE1D:
-    view.type = WMTTextureType1D;
+    view.type = WMTTextureType2D;
     view.firstMiplevel = srv.Texture1D.MostDetailedMip;
     view.miplevelCount =
         NormalizeViewCount(srv.Texture1D.MipLevels, view.firstMiplevel,
@@ -1065,7 +1065,7 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
     view.arraySize = 1;
     break;
   case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
-    view.type = WMTTextureType1DArray;
+    view.type = WMTTextureType2DArray;
     view.firstMiplevel = srv.Texture1DArray.MostDetailedMip;
     view.miplevelCount =
         NormalizeViewCount(srv.Texture1DArray.MipLevels, view.firstMiplevel,
@@ -1177,12 +1177,12 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
 
   switch (uav.ViewDimension) {
   case D3D12_UAV_DIMENSION_TEXTURE1D:
-    view.type = WMTTextureType1D;
+    view.type = WMTTextureType2D;
     view.firstMiplevel = uav.Texture1D.MipSlice;
     view.arraySize = 1;
     break;
   case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
-    view.type = WMTTextureType1DArray;
+    view.type = WMTTextureType2DArray;
     view.firstMiplevel = uav.Texture1DArray.MipSlice;
     view.firstArraySlice = uav.Texture1DArray.FirstArraySlice;
     view.arraySize = NormalizeViewCount(uav.Texture1DArray.ArraySize,
@@ -4543,17 +4543,22 @@ private:
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t array_length = 1;
+    uint32_t sample_count = 1;
     for (const auto &color : attachments.colors) {
       render_target_count = std::max(render_target_count, color.slot + 1);
       width = width ? width : color.width;
       height = height ? height : color.height;
       array_length = std::max<uint32_t>(array_length, color.array_length);
+      sample_count = std::max<uint32_t>(sample_count,
+                                        color.texture->sampleCount());
     }
     if (attachments.depth_stencil) {
       width = width ? width : attachments.depth_stencil->width;
       height = height ? height : attachments.depth_stencil->height;
       array_length =
           std::max<uint32_t>(array_length, attachments.depth_stencil->array_length);
+      sample_count = std::max<uint32_t>(
+          sample_count, attachments.depth_stencil->texture->sampleCount());
     }
 
     const auto dsv_format = attachments.depth_stencil
@@ -4596,7 +4601,8 @@ private:
     info.render_target_width = width;
     info.render_target_height = height;
     info.render_target_array_length = array_length;
-    info.tile_barrier_pso_key.raster_sample_count = 1;
+    info.default_raster_sample_count = sample_count;
+    info.tile_barrier_pso_key.raster_sample_count = sample_count;
     return true;
   }
 

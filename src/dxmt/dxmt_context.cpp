@@ -2483,6 +2483,14 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         info.colors[0].load_action = WMTLoadActionLoad;
         info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
         info.colors[0].resolve_texture = data->dst.texture();
+        auto *src_allocation = data->src ? data->src->allocation : nullptr;
+        auto *src_descriptor = src_allocation ? src_allocation->descriptor : nullptr;
+        if (src_descriptor) {
+          info.render_target_width = src_descriptor->width(data->src->key);
+          info.render_target_height = src_descriptor->height(data->src->key);
+          info.render_target_array_length = 1;
+          info.default_raster_sample_count = src_descriptor->sampleCount();
+        }
 
         NormalizeRenderPassInfo(info);
         auto encoder = cmdbuf.renderCommandEncoder(info);

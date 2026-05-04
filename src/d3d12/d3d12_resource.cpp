@@ -51,7 +51,8 @@ void UnregisterBufferGpuVirtualAddress(Resource *resource) {
 
 WMTTextureUsage
 GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
-  WMTTextureUsage usage = WMTTextureUsageShaderRead;
+  WMTTextureUsage usage =
+      WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView;
   if (flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     usage |= WMTTextureUsageRenderTarget;
@@ -78,8 +79,8 @@ ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc) {
 WMTTextureType
 GetTextureType(const D3D12_RESOURCE_DESC &desc) {
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
-    return desc.DepthOrArraySize > 1 ? WMTTextureType1DArray
-                                     : WMTTextureType1D;
+    return desc.DepthOrArraySize > 1 ? WMTTextureType2DArray
+                                     : WMTTextureType2D;
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
     return WMTTextureType3D;
   if (desc.SampleDesc.Count > 1)
