@@ -328,6 +328,7 @@ public:
     floor,
     ceil,
     trunc,
+    atan,
     cos,
     sin,
     fabs,
