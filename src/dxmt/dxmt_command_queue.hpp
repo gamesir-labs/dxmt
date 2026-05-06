@@ -263,6 +263,8 @@ public:
 
   AllocatedArgumentBufferSlice
   AllocateArgumentBuffer(uint64_t seq, size_t size) {
+    if (!size)
+      return {};
     auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
     if constexpr (sizeof(void *) == 4) {
       auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);

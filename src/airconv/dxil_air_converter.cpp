@@ -29,7 +29,6 @@
 #include <array>
 #include <bit>
 #include <cctype>
-#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -114,14 +113,6 @@ ResourceClassName(dxil::DxilTranslationResourceClass resource_class) {
   default:
     return "Unknown";
   }
-}
-
-bool
-DebugForcePixelColorEnabled() {
-  const char *value = std::getenv("DXMT_DIAG_FORCE_PS_COLOR");
-  return value && (std::strcmp(value, "1") == 0 ||
-                   std::strcmp(value, "true") == 0 ||
-                   std::strcmp(value, "yes") == 0);
 }
 
 dxil::DxilTranslationResourceClass
@@ -600,9 +591,13 @@ PackDxilReturn(const CallBase &call, Value *value, DxilAirContext &ctx,
       out = ctx.builder.CreateInsertValue(
           out, BitcastOrCastValue(value, structure->getElementType(0), ctx), 0);
     }
-    if (status && elements > 4)
-      out = ctx.builder.CreateInsertValue(
-          out, CastValue(status, structure->getElementType(4), ctx), 4);
+    if (elements > 4) {
+      auto *status_type = structure->getElementType(4);
+      auto *mapped_status =
+          status ? CastValue(status, status_type, ctx)
+                 : ConstantInt::get(status_type, 1);
+      out = ctx.builder.CreateInsertValue(out, mapped_status, 4);
+    }
     return out;
   }
   return CastValue(value, return_type, ctx);
@@ -1205,7 +1200,18 @@ LoadSignatureInput(const CallBase &call, DxilAirContext &ctx) {
   auto arg = ctx.input_args.find(element_id);
   if (arg == ctx.input_args.end())
     return UndefValue::get(MapType(call.getType(), ctx));
-  return SplatOrExtract(ctx.function->getArg(arg->second), column, ctx);
+  Value *value = ctx.function->getArg(arg->second);
+  auto sig = ctx.inputs.find(element_id);
+  if (sig != ctx.inputs.end() &&
+      ctx.translation.shader_kind == uint32_t(DxilStage::Vertex)) {
+    if (IsSystemSemantic(*sig->second, "SV_VertexID") &&
+        ctx.base_vertex_arg != UINT32_MAX)
+      value = ctx.builder.CreateSub(value, ctx.function->getArg(ctx.base_vertex_arg));
+    else if (IsSystemSemantic(*sig->second, "SV_InstanceID") &&
+             ctx.base_instance_arg != UINT32_MAX)
+      value = ctx.builder.CreateSub(value, ctx.function->getArg(ctx.base_instance_arg));
+  }
+  return SplatOrExtract(value, column, ctx);
 }
 
 Value *
@@ -1229,46 +1235,6 @@ StoreSignatureOutput(const CallBase &call, Value *current_return,
   }
   value = CastValue(value, field_type, ctx);
   return ctx.builder.CreateInsertValue(current_return, value, out->second);
-}
-
-Value *
-BuildForcedPixelColorReturn(Value *current_return, DxilAirContext &ctx) {
-  if (!DebugForcePixelColorEnabled() ||
-      ctx.translation.shader_kind != uint32_t(DxilStage::Pixel) ||
-      !current_return || ctx.function->getReturnType()->isVoidTy())
-    return current_return;
-
-  for (const auto &[element_id, sig] : ctx.outputs) {
-    if (!sig || !IsSystemSemantic(*sig, "SV_Target"))
-      continue;
-    auto out = ctx.output_indices.find(element_id);
-    if (out == ctx.output_indices.end())
-      continue;
-
-    auto *field_type = ctx.function->getReturnType()->getStructElementType(out->second);
-    if (auto *field_vector = dyn_cast<FixedVectorType>(field_type)) {
-      auto *element_type = field_vector->getElementType();
-      Value *field = ConstantAggregateZero::get(field_type);
-      const double values[4] = {1.0, 0.0, 0.0, 1.0};
-      const auto count = std::min<unsigned>(field_vector->getNumElements(), 4);
-      for (unsigned i = 0; i < count; i++) {
-        Value *component = nullptr;
-        if (element_type->isFloatingPointTy())
-          component = ConstantFP::get(element_type, values[i]);
-        else
-          component = ConstantInt::get(element_type, i == 0 || i == 3 ? 1 : 0);
-        field = ctx.builder.CreateInsertElement(field, component, uint64_t(i));
-      }
-      current_return = ctx.builder.CreateInsertValue(current_return, field, out->second);
-    } else if (field_type->isFloatingPointTy()) {
-      current_return = ctx.builder.CreateInsertValue(
-          current_return, ConstantFP::get(field_type, 1.0), out->second);
-    } else if (field_type->isIntegerTy()) {
-      current_return = ctx.builder.CreateInsertValue(
-          current_return, ConstantInt::get(field_type, 1), out->second);
-    }
-  }
-  return current_return;
 }
 
 Value *
@@ -1471,7 +1437,8 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
       auto *gep = ctx.builder.CreateGEP(pointee, ptr, component_index);
       values[i] = ctx.builder.CreateLoad(pointee, gep);
     }
-    ctx.values[&call] = PackDxilReturn(call, BuildVector4(values, ctx), ctx);
+    ctx.values[&call] = PackDxilReturn(call, BuildVector4(values, ctx), ctx,
+                                       ctx.builder.getInt32(1));
     return Error::success();
   }
   if (name == "RawBufferStore" || name == "BufferStore") {
@@ -1699,8 +1666,30 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
         *inc > 0 ? old_value : ctx.builder.CreateSub(old_value, ctx.builder.getInt32(1));
     return Error::success();
   }
+  if (name == "CheckAccessFullyMapped") {
+    auto *status = OperandValue(call, 1, ctx);
+    if (!status)
+      return UnsupportedDxilCall(call, "CheckAccessFullyMapped without status", ctx);
+    auto *zero = Constant::getNullValue(status->getType());
+    ctx.values[&call] = ctx.builder.CreateICmpNE(status, zero);
+    return Error::success();
+  }
   if (name == "Discard") {
+    auto *condition = CastValue(OperandValue(call, 1, ctx), ctx.types._bool, ctx);
+    if (!condition)
+      return UnsupportedDxilCall(call, "discard without condition", ctx);
+
+    auto *discard_block =
+        BasicBlock::Create(ctx.llvm, "dxil.discard", ctx.function);
+    auto *continue_block =
+        BasicBlock::Create(ctx.llvm, "dxil.discard.continue", ctx.function);
+    ctx.builder.CreateCondBr(condition, discard_block, continue_block);
+
+    ctx.builder.SetInsertPoint(discard_block);
     ctx.air.CreateDiscard();
+    ctx.builder.CreateBr(continue_block);
+
+    ctx.builder.SetInsertPoint(continue_block);
     return Error::success();
   }
   if (name == "Barrier") {
@@ -1926,14 +1915,10 @@ LowerTerminator(const Instruction &terminator, DxilAirContext &ctx,
     if (ctx.function->getReturnType()->isVoidTy())
       ctx.builder.CreateRetVoid();
     else {
-      current_return = BuildForcedPixelColorReturn(
-          ctx.return_value
-              ? ctx.builder.CreateLoad(ctx.function->getReturnType(),
-                                       ctx.return_value)
-              : current_return,
-          ctx);
       ctx.builder.CreateRet(ctx.return_value
-                                ? current_return
+                                ? ctx.builder.CreateLoad(
+                                      ctx.function->getReturnType(),
+                                      ctx.return_value)
                                 : current_return);
     }
     return Error::success();

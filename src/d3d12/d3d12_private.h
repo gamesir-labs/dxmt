@@ -8,7 +8,7 @@
 
 namespace dxmt::d3d12 {
 
-constexpr const char *kExperimentD3D12SupportEnv = "DXMT_EXPERIENT_DX12_SUPPORT";
+constexpr const char *kExperimentD3D12SupportEnv = "DXMT_EXPERIMENT_DX12_SUPPORT";
 
 enum class SupportGateStatus {
   Enabled,

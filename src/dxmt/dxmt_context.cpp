@@ -2240,12 +2240,14 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStagePreRaster); },
           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); }
       );
-      encoder.setVertexBuffer(gpu_buffer_, 0, 16);
-      encoder.setVertexBuffer(gpu_buffer_, 0, 29);
-      encoder.setVertexBuffer(gpu_buffer_, 0, 30);
-      encoder.setFragmentBuffer(gpu_buffer_, 0, 29);
-      encoder.setFragmentBuffer(gpu_buffer_, 0, 30);
-      if (data->use_geometry || data->use_tessellation) {
+      if (data->allocated_argbuf_size) {
+        encoder.setVertexBuffer(gpu_buffer_, 0, 16);
+        encoder.setVertexBuffer(gpu_buffer_, 0, 29);
+        encoder.setVertexBuffer(gpu_buffer_, 0, 30);
+        encoder.setFragmentBuffer(gpu_buffer_, 0, 29);
+        encoder.setFragmentBuffer(gpu_buffer_, 0, 30);
+      }
+      if ((data->use_geometry || data->use_tessellation) && data->allocated_argbuf_size) {
         encoder.setObjectBuffer(gpu_buffer_, 0, 16);
         encoder.setObjectBuffer(gpu_buffer_, 0, 21); // draw arguments
         if (data->use_tessellation) {
@@ -2343,15 +2345,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       }
       auto encoder = cmdbuf.computeCommandEncoder(true);
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
-      struct wmtcmd_compute_setbuffer setcmd;
-      setcmd.type = WMTComputeCommandSetBuffer;
-      setcmd.next.set(nullptr);
-      setcmd.buffer = data->allocated_argbuf;
-      setcmd.offset = 0;
-      setcmd.index = 29;
-      encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
-      setcmd.index = 30;
-      encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
+      if (data->allocated_argbuf_size) {
+        struct wmtcmd_compute_setbuffer setcmd;
+        setcmd.type = WMTComputeCommandSetBuffer;
+        setcmd.next.set(nullptr);
+        setcmd.buffer = data->allocated_argbuf;
+        setcmd.offset = 0;
+        setcmd.index = 29;
+        encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
+        setcmd.index = 30;
+        encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
+      }
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
       encoder.endEncoding();

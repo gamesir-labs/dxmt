@@ -80,7 +80,7 @@ SupportGateStatusName(SupportGateStatus status) {
   case SupportGateStatus::Enabled:
     return "enabled";
   case SupportGateStatus::DisabledByEnv:
-    return "disabled by DXMT_EXPERIENT_DX12_SUPPORT";
+    return "disabled by DXMT_EXPERIMENT_DX12_SUPPORT";
   case SupportGateStatus::DisabledByAppleGpuFamily:
     return "requires Apple GPU family 7";
   case SupportGateStatus::DisabledByMetal4:

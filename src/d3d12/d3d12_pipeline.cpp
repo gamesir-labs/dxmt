@@ -10,6 +10,7 @@
 #include "util_string.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
@@ -1113,12 +1114,14 @@ GetTopologyClass(D3D12_PRIMITIVE_TOPOLOGY_TYPE type) {
 bool
 BuildInputElements(IMTLD3D12Device *device,
                    const PipelineGraphicsState &state,
+                   const PipelineDxilShader *vs,
                    std::vector<SM50_IA_INPUT_ELEMENT> &elements,
                    uint32_t &slot_mask) {
   elements.clear();
   slot_mask = 0;
   std::array<uint32_t, 32> append_offsets = {};
-  elements.reserve(state.input_elements.size());
+  std::vector<SM50_IA_INPUT_ELEMENT> layout_elements;
+  layout_elements.reserve(state.input_elements.size());
 
   for (uint32_t i = 0; i < state.input_elements.size(); i++) {
     const auto &input = state.input_elements[i];
@@ -1150,7 +1153,7 @@ BuildInputElements(IMTLD3D12Device *device,
     append_offsets[input.InputSlot] =
         aligned_byte_offset + format.BytesPerTexel;
 
-    elements.push_back({
+    layout_elements.push_back({
         .reg = i,
         .slot = input.InputSlot,
         .aligned_byte_offset = aligned_byte_offset,
@@ -1176,6 +1179,58 @@ BuildInputElements(IMTLD3D12Device *device,
     if (input.InputSlot < 32)
       slot_mask |= 1u << input.InputSlot;
   }
+
+  if (!vs) {
+    elements = std::move(layout_elements);
+    return true;
+  }
+
+  const auto *translation = vs->translation();
+  if (!translation) {
+    elements = std::move(layout_elements);
+    return true;
+  }
+
+  auto equal_semantic = [](std::string_view lhs, std::string_view rhs) {
+    return lhs.size() == rhs.size() &&
+           std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                      [](char a, char b) {
+                        return std::tolower(static_cast<unsigned char>(a)) ==
+                               std::tolower(static_cast<unsigned char>(b));
+                      });
+  };
+
+  for (const auto &sig : translation->signatures) {
+    if (sig.kind != dxil::DxilTranslationSignatureKind::Input ||
+        IsSystemGeneratedValue(sig))
+      continue;
+
+    auto match = std::find_if(
+        state.input_elements.begin(), state.input_elements.end(),
+        [&](const D3D12_INPUT_ELEMENT_DESC &input) {
+          const auto index =
+              uint32_t(&input - state.input_elements.data());
+          const auto semantic =
+              index < state.input_element_semantic_names.size()
+                  ? std::string_view(state.input_element_semantic_names[index])
+                  : std::string_view();
+          if (!sig.semantic_name.empty())
+            return input.SemanticIndex == sig.semantic_index &&
+                   equal_semantic(semantic, sig.semantic_name);
+          return equal_semantic(
+              str::format(semantic, input.SemanticIndex), sig.semantic_key);
+        });
+    if (match == state.input_elements.end())
+      continue;
+
+    const auto layout_index = size_t(match - state.input_elements.begin());
+    auto element = layout_elements[layout_index];
+    element.reg = sig.start_row;
+    elements.push_back(element);
+  }
+
+  if (elements.empty())
+    elements = std::move(layout_elements);
 
   return true;
 }
@@ -1387,7 +1442,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   std::vector<SM50_IA_INPUT_ELEMENT> input_elements;
   uint32_t slot_mask = 0;
-  if (!BuildInputElements(device, state, input_elements, slot_mask))
+  if (!BuildInputElements(device, state, vs, input_elements, slot_mask))
     return false;
 
   std::array<WMTPixelFormat, 8> rtv_formats = {};
@@ -1467,7 +1522,6 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
          error ? error.description().getUTF8String() : "unknown error");
     return false;
   }
-
   BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
   out.depth_stencil =
       CreateDepthStencilState(device, state.desc.DepthStencilState);
