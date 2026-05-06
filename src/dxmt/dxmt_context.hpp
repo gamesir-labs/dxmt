@@ -15,6 +15,7 @@
 #include "rc/util_rc_ptr.hpp"
 #include "airconv_public.h"
 #include <cassert>
+#include <optional>
 #include <string>
 
 #define DXMT_IMPLEMENT_ME __builtin_unreachable();
@@ -239,6 +240,10 @@ struct ClearEncoderData : EncoderData {
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+  WMT::RenderPipelineState pso;
+  std::optional<WMTScissorRect> src_rect;
+  WMTOrigin dst_origin;
+  WMTSize resolve_size;
 };
 
 class Presenter;
@@ -663,7 +668,11 @@ public:
   void clearDepthStencil(
       Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
   );
-  void resolveTexture(Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view);
+  void resolveTexture(
+      Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+      WMT::RenderPipelineState pso = {}, std::optional<WMTScissorRect> src_rect = std::nullopt,
+      WMTOrigin dst_origin = {}, WMTSize resolve_size = {}
+  );
 
   RenderEncoderData *startRenderPass(
       uint8_t dsv_planar_flags, uint8_t dsv_readonly_flags, uint8_t render_target_count, uint64_t argument_buffer_size
@@ -811,6 +820,7 @@ public:
 
   EmulatedCommandContext emulated_cmd;
   ClearRenderTargetContext clear_rt_cmd;
+  ResolveTextureContext resolve_texture_cmd;
   DepthStencilBlitContext blit_depth_stencil_cmd;
   ClearResourceKernelContext clear_res_cmd;
   MTLFXMVScaleContext mv_scale_cmd;

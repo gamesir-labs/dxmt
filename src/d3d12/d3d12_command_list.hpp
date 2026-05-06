@@ -77,9 +77,13 @@ struct CopyResourceRecord {
 struct ResolveSubresourceRecord {
   Com<ID3D12Resource> dst;
   UINT dst_subresource = 0;
+  UINT dst_x = 0;
+  UINT dst_y = 0;
   Com<ID3D12Resource> src;
   UINT src_subresource = 0;
+  std::optional<D3D12_RECT> src_rect;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  D3D12_RESOLVE_MODE mode = D3D12_RESOLVE_MODE_AVERAGE;
 };
 
 struct PendingRenderPassResolve {

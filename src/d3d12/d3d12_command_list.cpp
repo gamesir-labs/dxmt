@@ -301,9 +301,13 @@ public:
                                             DXGI_FORMAT format) override {
     if (!dst_resource || !src_resource)
       return;
-    AddRecord(ResolveSubresourceRecord{
-        dst_resource, dst_sub_resource, src_resource, src_sub_resource,
-        format});
+    ResolveSubresourceRecord record = {};
+    record.dst = dst_resource;
+    record.dst_subresource = dst_sub_resource;
+    record.src = src_resource;
+    record.src_subresource = src_sub_resource;
+    record.format = format;
+    AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology) override {
     AddRecord(PrimitiveTopologyRecord{primitive_topology});
@@ -661,28 +665,35 @@ public:
   void STDMETHODCALLTYPE SetSamplePositions(
       UINT sample_count, UINT pixel_count,
       D3D12_SAMPLE_POSITION *sample_positions) override {
-    sample_positions_.clear();
-    if (sample_positions && sample_count && pixel_count) {
-      sample_positions_.assign(sample_positions,
-                               sample_positions + sample_count * pixel_count);
+    const bool reset = sample_count == 0 && pixel_count == 0 && !sample_positions;
+    if (!reset) {
+      WARN("D3D12GraphicsCommandList: programmable sample positions are unsupported");
+      return;
     }
-    sample_position_sample_count_ = sample_count;
-    sample_position_pixel_count_ = pixel_count;
   }
 
   void STDMETHODCALLTYPE ResolveSubresourceRegion(
       ID3D12Resource *dst_resource, UINT dst_sub_resource_idx, UINT dst_x,
       UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx,
       D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
-    if (mode != D3D12_RESOLVE_MODE_AVERAGE || dst_x || dst_y || src_rect) {
-      // TODO(d3d12): support partial-region resolves and MIN/MAX/DECOMPRESS
-      // modes without silently resolving the wrong pixels.
-      WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion is unsupported "
-           "for partial regions or non-average modes");
+    if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) {
+      WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion decompress mode is unsupported");
       return;
     }
-    ResolveSubresource(dst_resource, dst_sub_resource_idx, src_resource,
-                       src_sub_resource_idx, format);
+    if (!dst_resource || !src_resource)
+      return;
+    ResolveSubresourceRecord record = {};
+    record.dst = dst_resource;
+    record.dst_subresource = dst_sub_resource_idx;
+    record.dst_x = dst_x;
+    record.dst_y = dst_y;
+    record.src = src_resource;
+    record.src_subresource = src_sub_resource_idx;
+    if (src_rect)
+      record.src_rect = *src_rect;
+    record.format = format;
+    record.mode = mode;
+    AddRecord(std::move(record));
   }
 
   void STDMETHODCALLTYPE SetViewInstanceMask(UINT mask) override {
@@ -757,9 +768,13 @@ public:
 
   void STDMETHODCALLTYPE EndRenderPass() override {
     for (const auto &resolve : pending_render_pass_resolves_) {
-      AddRecord(ResolveSubresourceRecord{
-          resolve.dst, resolve.dst_subresource, resolve.src,
-          resolve.src_subresource, resolve.format});
+      ResolveSubresourceRecord record = {};
+      record.dst = resolve.dst;
+      record.dst_subresource = resolve.dst_subresource;
+      record.src = resolve.src;
+      record.src_subresource = resolve.src_subresource;
+      record.format = resolve.format;
+      AddRecord(std::move(record));
     }
     pending_render_pass_resolves_.clear();
   }
@@ -957,12 +972,9 @@ private:
         !resolve.SubresourceCount || !resolve.pSubresourceParameters)
       return;
 
-    if (resolve.ResolveMode != D3D12_RESOLVE_MODE_AVERAGE ||
+    if (resolve.ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS ||
         !resolve.PreserveResolveSource) {
-      // TODO(d3d12): support MIN/MAX/decompress resolves and non-preserving
-      // source discard semantics without silently changing render-pass meaning.
-      WARN("D3D12GraphicsCommandList: render pass resolve mode/source discard "
-           "is unsupported");
+      WARN("D3D12GraphicsCommandList: render pass decompress resolve or source discard is unsupported");
       return;
     }
 
@@ -998,9 +1010,6 @@ private:
   std::vector<CommandRecord> records_;
   FLOAT depth_bounds_min_ = 0.0f;
   FLOAT depth_bounds_max_ = 1.0f;
-  UINT sample_position_sample_count_ = 0;
-  UINT sample_position_pixel_count_ = 0;
-  std::vector<D3D12_SAMPLE_POSITION> sample_positions_;
   UINT view_instance_mask_ = 0xffffffffu;
   std::vector<PendingRenderPassResolve> pending_render_pass_resolves_;
   bool closed_ = false;

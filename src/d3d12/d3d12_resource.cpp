@@ -123,6 +123,12 @@ GetMipLevels(const D3D12_RESOURCE_DESC &desc) {
   return levels;
 }
 
+static bool
+IsSupportedSampleCount(UINT sample_count) {
+  return sample_count == 1 || sample_count == 2 || sample_count == 4 ||
+         sample_count == 8;
+}
+
 static UINT
 GetTextureSubresourceCount(const D3D12_RESOURCE_DESC &desc) {
   const UINT mip_levels = GetMipLevels(desc);
@@ -921,6 +927,9 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
   if (desc.Width == 0 || desc.Height == 0 || desc.DepthOrArraySize == 0)
     return false;
   if (desc.SampleDesc.Count == 0)
+    return false;
+  if (!IsSupportedSampleCount(desc.SampleDesc.Count) ||
+      desc.SampleDesc.Quality != 0)
     return false;
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     return desc.Height == 1 && desc.DepthOrArraySize == 1 &&

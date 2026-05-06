@@ -2,6 +2,7 @@
 #include "Metal.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
+#include "log/log.hpp"
 
 #include "dxmt_command.h"
 
@@ -272,6 +273,70 @@ ClearRenderTargetContext::end() {
   clearing_texture_ = nullptr;
   clearing_texture_view_ = 0;
 };
+
+ResolveTextureContext::ResolveTextureContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_resolve_ = library.newFunction("vs_resolve_msaa");
+  fs_resolve_average_ = library.newFunction("fs_resolve_msaa_average");
+  fs_resolve_min_ = library.newFunction("fs_resolve_msaa_min");
+  fs_resolve_max_ = library.newFunction("fs_resolve_msaa_max");
+}
+
+WMT::RenderPipelineState
+ResolveTextureContext::getPSO(WMTPixelFormat format, ResolveTextureMode mode) {
+  PSOKey key = {format, mode};
+  auto cached = psos_.find(key);
+  if (cached != psos_.end())
+    return cached->second;
+
+  WMT::Function fs = {};
+  switch (mode) {
+  case ResolveTextureMode::Average:
+    fs = fs_resolve_average_;
+    break;
+  case ResolveTextureMode::Min:
+    fs = fs_resolve_min_;
+    break;
+  case ResolveTextureMode::Max:
+    fs = fs_resolve_max_;
+    break;
+  }
+
+  WMTRenderPipelineInfo info;
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = vs_resolve_;
+  info.fragment_function = fs;
+  info.colors[0].pixel_format = format;
+  info.rasterization_enabled = true;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  WMT::Reference<WMT::Error> error;
+  auto pso = device_.newRenderPipelineState(info, error);
+  if (!pso) {
+    WARN("Failed to create ResolveTexture PSO of format ", format, ": ",
+         error ? error.description().getUTF8String() : "unknown error");
+  }
+  auto [entry, _] = psos_.emplace(key, std::move(pso));
+  return entry->second;
+}
+
+void
+ResolveTextureContext::resolve(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    ResolveTextureMode mode, std::optional<WMTScissorRect> src_rect,
+    WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), mode);
+  if (!pso)
+    return;
+  ctx_.resolveTexture(
+      std::move(src), src_view, std::move(dst), dst_view, pso,
+      src_rect, dst_origin, resolve_size);
+}
 
 DepthStencilBlitContext::DepthStencilBlitContext(
     WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx

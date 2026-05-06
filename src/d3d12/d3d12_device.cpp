@@ -326,6 +326,17 @@ ValidateShaderResourceView(ID3D12Resource *resource,
     WARN("D3D12Device: texture SRV created for non-texture resource");
     return false;
   }
+  const auto *resource_desc = GetResourceDesc(resource);
+  if (resource_desc) {
+    const bool resource_msaa = resource_desc->SampleDesc.Count > 1;
+    const bool view_msaa =
+        desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS ||
+        desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    if (resource_msaa != view_msaa) {
+      WARN("D3D12Device: SRV multisample dimension does not match resource sample count");
+      return false;
+    }
+  }
   return true;
 }
 
@@ -362,8 +373,12 @@ ValidateUnorderedAccessView(ID3D12Resource *resource,
     WARN("D3D12Device: texture UAV created for non-texture resource");
     return false;
   }
+  const auto *resource_desc = GetResourceDesc(resource);
+  if (resource_desc && resource_desc->SampleDesc.Count > 1) {
+    WARN("D3D12Device: UAVs cannot be created for multisampled resources");
+    return false;
+  }
   if (desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D) {
-    const auto *resource_desc = GetResourceDesc(resource);
     if (resource_desc && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
       WARN("D3D12Device: 3D texture UAV created for non-3D texture resource");
       return false;
@@ -395,6 +410,40 @@ ValidateUnorderedAccessView(ID3D12Resource *resource,
   }
   if (counter_resource) {
     WARN("D3D12Device: UAV counter resource is ignored for texture UAVs");
+    return false;
+  }
+  return true;
+}
+
+static bool
+ValidateRenderTargetView(ID3D12Resource *resource,
+                         const D3D12_RENDER_TARGET_VIEW_DESC &desc) {
+  const auto *resource_desc = GetResourceDesc(resource);
+  if (!resource_desc || !IsTextureResource(resource))
+    return true;
+  const bool resource_msaa = resource_desc->SampleDesc.Count > 1;
+  const bool view_msaa =
+      desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS ||
+      desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+  if (resource_msaa != view_msaa) {
+    WARN("D3D12Device: RTV multisample dimension does not match resource sample count");
+    return false;
+  }
+  return true;
+}
+
+static bool
+ValidateDepthStencilView(ID3D12Resource *resource,
+                         const D3D12_DEPTH_STENCIL_VIEW_DESC &desc) {
+  const auto *resource_desc = GetResourceDesc(resource);
+  if (!resource_desc || !IsTextureResource(resource))
+    return true;
+  const bool resource_msaa = resource_desc->SampleDesc.Count > 1;
+  const bool view_msaa =
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS ||
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+  if (resource_msaa != view_msaa) {
+    WARN("D3D12Device: DSV multisample dimension does not match resource sample count");
     return false;
   }
   return true;
@@ -1176,6 +1225,8 @@ public:
     record->type = DescriptorRecordType::RenderTargetView;
     record->resource = resource;
     if (desc) {
+      if (!ValidateRenderTargetView(resource, *desc))
+        return;
       record->desc.rtv = *desc;
       record->has_desc = true;
     }
@@ -1193,6 +1244,8 @@ public:
     record->type = DescriptorRecordType::DepthStencilView;
     record->resource = resource;
     if (desc) {
+      if (!ValidateDepthStencilView(resource, *desc))
+        return;
       record->desc.dsv = *desc;
       record->has_desc = true;
     }

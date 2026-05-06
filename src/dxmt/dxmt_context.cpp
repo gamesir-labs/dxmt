@@ -99,6 +99,7 @@ ResolveRenderPassBufferColorAttachment(
 ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
     emulated_cmd(device, lib, *this),
     clear_rt_cmd(device, lib, *this),
+    resolve_texture_cmd(device, lib, *this),
     blit_depth_stencil_cmd(device, lib, *this),
     clear_res_cmd(device, lib, *this),
     mv_scale_cmd(device, lib, *this),
@@ -1708,7 +1709,9 @@ ArgumentEncodingContext::clearDepthStencil(
 
 void
 ArgumentEncodingContext::resolveTexture(
-    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect,
+    WMTOrigin dst_origin, WMTSize resolve_size
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<ResolveEncoderData>();
@@ -1720,6 +1723,10 @@ ArgumentEncodingContext::resolveTexture(
 
   encoder_info->src = access(src, src_view, ResourceAccess::Read);
   encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
+  encoder_info->pso = pso;
+  encoder_info->src_rect = src_rect;
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->resolve_size = resolve_size;
 
   endPass();
 };
@@ -2472,8 +2479,6 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::Resolve: {
       auto data = static_cast<ResolveEncoderData *>(current);
       {
-        WMTRenderPassInfo info;
-        WMT::InitializeRenderPassInfo(info);
         WMT::Texture src_texture;
         if (!ResolveRenderPassColorAttachment(
                 "ResolvePass guard: source attachment missing WMTTextureUsageRenderTarget", 0, data->src,
@@ -2483,23 +2488,59 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           data->~ResolveEncoderData();
           break;
         }
-        info.colors[0].texture = src_texture;
-        info.colors[0].load_action = WMTLoadActionLoad;
-        info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
-        info.colors[0].resolve_texture = data->dst.texture();
         auto *src_allocation = data->src ? data->src->allocation : nullptr;
         auto *src_descriptor = src_allocation ? src_allocation->descriptor : nullptr;
+        auto *dst_allocation = data->dst ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.colors[0].texture = data->pso ? data->dst.texture() : src_texture;
+        info.colors[0].load_action = WMTLoadActionLoad;
+        info.colors[0].store_action =
+            data->pso ? WMTStoreActionStore : WMTStoreActionStoreAndMultisampleResolve;
+        info.colors[0].resolve_texture = data->pso ? WMT::Texture{} : data->dst.texture();
+        if (dst_descriptor && data->pso) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+        }
         if (src_descriptor) {
-          info.render_target_width = src_descriptor->width(data->src->key);
-          info.render_target_height = src_descriptor->height(data->src->key);
+          if (!info.render_target_width)
+            info.render_target_width = src_descriptor->width(data->src->key);
+          if (!info.render_target_height)
+            info.render_target_height = src_descriptor->height(data->src->key);
           info.render_target_array_length = 1;
-          info.default_raster_sample_count = src_descriptor->sampleCount();
+          info.default_raster_sample_count = data->pso ? 1 : src_descriptor->sampleCount();
         }
 
         NormalizeRenderPassInfo(info);
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
+        if (data->pso) {
+          struct ResolveMetadata {
+            uint32_t src_origin[2];
+            uint32_t dst_origin[2];
+            uint32_t size[2];
+          } metadata = {};
+          metadata.src_origin[0] = data->src_rect ? data->src_rect->x : 0;
+          metadata.src_origin[1] = data->src_rect ? data->src_rect->y : 0;
+          metadata.dst_origin[0] = data->dst_origin.x;
+          metadata.dst_origin[1] = data->dst_origin.y;
+          metadata.size[0] = data->resolve_size.width;
+          metadata.size[1] = data->resolve_size.height;
+          if (!metadata.size[0])
+            metadata.size[0] = info.render_target_width;
+          if (!metadata.size[1])
+            metadata.size[1] = info.render_target_height;
+          encoder.setRenderPipelineState(data->pso);
+          encoder.setFragmentTexture(src_texture, 0);
+          encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+          encoder.setViewport({
+              double(metadata.dst_origin[0]), double(metadata.dst_origin[1]),
+              double(metadata.size[0]), double(metadata.size[1]), 0.0, 1.0});
+          encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        }
         data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
         encoder.endEncoding();
       }

@@ -230,6 +230,57 @@ struct present_data {
   return output;
 }
 
+struct resolve_data {
+  float4 position [[position]];
+};
+
+struct DXMTResolveMetadata {
+  uint2 src_origin;
+  uint2 dst_origin;
+  uint2 size;
+};
+
+[[vertex]] resolve_data vs_resolve_msaa(ushort id [[vertex_id]],
+                                        constant DXMTResolveMetadata& meta [[buffer(0)]]) {
+  const float2 uv = float2((id << 1) & 2, id & 2);
+  resolve_data output;
+  output.position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+  return output;
+}
+
+[[fragment]] float4 fs_resolve_msaa_average(resolve_data input [[stage_in]],
+                                            texture2d_ms<float, access::read> source [[texture(0)]],
+                                            constant DXMTResolveMetadata& meta [[buffer(0)]]) {
+  float4 output = float4(0);
+  const uint count = source.get_num_samples();
+  const uint2 coord = meta.src_origin + uint2(input.position.xy) - meta.dst_origin;
+  for (uint i = 0; i < count; i++)
+    output += source.read(coord, i);
+  return output / count;
+}
+
+[[fragment]] float4 fs_resolve_msaa_min(resolve_data input [[stage_in]],
+                                        texture2d_ms<float, access::read> source [[texture(0)]],
+                                        constant DXMTResolveMetadata& meta [[buffer(0)]]) {
+  const uint count = source.get_num_samples();
+  const uint2 coord = meta.src_origin + uint2(input.position.xy) - meta.dst_origin;
+  float4 output = source.read(coord, 0);
+  for (uint i = 1; i < count; i++)
+    output = min(output, source.read(coord, i));
+  return output;
+}
+
+[[fragment]] float4 fs_resolve_msaa_max(resolve_data input [[stage_in]],
+                                        texture2d_ms<float, access::read> source [[texture(0)]],
+                                        constant DXMTResolveMetadata& meta [[buffer(0)]]) {
+  const uint count = source.get_num_samples();
+  const uint2 coord = meta.src_origin + uint2(input.position.xy) - meta.dst_origin;
+  float4 output = source.read(coord, 0);
+  for (uint i = 1; i < count; i++)
+    output = max(output, source.read(coord, i));
+  return output;
+}
+
 constant constexpr float PQ_M1 = 0.1593017578125;
 constant constexpr float PQ_M2 = 78.84375;
 constant constexpr float PQ_C1 = 0.8359375;

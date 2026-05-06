@@ -5,6 +5,7 @@
 #include "dxmt_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
+#include <optional>
 #include <unordered_map>
 
 namespace dxmt {
@@ -230,6 +231,50 @@ private:
   std::unordered_map<WMTPixelFormat, WMT::Reference<WMT::RenderPipelineState>> pso_cache_;
   Rc<Texture> clearing_texture_;
   TextureViewKey clearing_texture_view_;
+};
+
+enum class ResolveTextureMode : uint32_t {
+  Average = 0,
+  Min = 1,
+  Max = 2,
+};
+
+class ResolveTextureContext {
+public:
+  ResolveTextureContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
+
+  void resolve(
+      Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+      ResolveTextureMode mode, std::optional<WMTScissorRect> src_rect,
+      WMTOrigin dst_origin, WMTSize resolve_size
+  );
+
+private:
+  WMT::RenderPipelineState getPSO(WMTPixelFormat format, ResolveTextureMode mode);
+
+  ArgumentEncodingContext &ctx_;
+  WMT::Device device_;
+  WMT::Reference<WMT::Function> vs_resolve_;
+  WMT::Reference<WMT::Function> fs_resolve_average_;
+  WMT::Reference<WMT::Function> fs_resolve_min_;
+  WMT::Reference<WMT::Function> fs_resolve_max_;
+
+  struct PSOKey {
+    WMTPixelFormat format;
+    ResolveTextureMode mode;
+
+    bool operator==(const PSOKey &other) const {
+      return format == other.format && mode == other.mode;
+    }
+  };
+
+  struct PSOKeyHash {
+    size_t operator()(const PSOKey &key) const noexcept {
+      return (size_t(key.format) << 8) ^ size_t(key.mode);
+    }
+  };
+
+  std::unordered_map<PSOKey, WMT::Reference<WMT::RenderPipelineState>, PSOKeyHash> psos_;
 };
 
 class DepthStencilBlitContext {
