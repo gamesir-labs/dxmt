@@ -35,6 +35,7 @@ CreateCoreDeviceFactory(REFIID riid, void **factory) {
   if (!factory)
     return E_POINTER;
 
+#if defined(__MINGW32__) || defined(_WIN32)
   HMODULE core = LoadLibraryA("d3d12core.dll");
   if (!core) {
     Logger::err("D3D12SDKConfiguration: failed to load d3d12core.dll");
@@ -49,6 +50,10 @@ CreateCoreDeviceFactory(REFIID riid, void **factory) {
   }
 
   return create_factory(riid, factory);
+#else
+  Logger::warn("D3D12SDKConfiguration: device factory is only available in the Wine DLL build");
+  return E_NOINTERFACE;
+#endif
 }
 
 class SDKConfigurationImpl final : public ComObjectWithInitialRef<ID3D12SDKConfiguration1> {

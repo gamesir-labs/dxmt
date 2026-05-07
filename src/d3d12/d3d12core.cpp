@@ -64,6 +64,7 @@ using PFN_D3D12CreateRootSignatureDeserializerFromSubobjectInLibrary = HRESULT (
 template <typename Proc>
 static Proc
 GetD3D12Proc(const char *name) {
+#if defined(__MINGW32__) || defined(_WIN32)
   HMODULE module = LoadLibraryA("d3d12.dll");
   if (!module) {
     Logger::err(str::format("D3D12Core: failed to load d3d12.dll for ", name));
@@ -74,6 +75,11 @@ GetD3D12Proc(const char *name) {
   if (!proc)
     Logger::err(str::format("D3D12Core: d3d12.dll does not export ", name));
   return proc;
+#else
+  Logger::warn(str::format("D3D12Core: ", name,
+                           " is only available in the Wine DLL build"));
+  return nullptr;
+#endif
 }
 
 class DeviceFactoryImpl final
