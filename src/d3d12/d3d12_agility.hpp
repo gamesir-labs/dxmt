@@ -2,6 +2,16 @@
 
 #include <d3d12.h>
 
+#ifndef __ID3D12SDKConfiguration_INTERFACE_DEFINED__
+MIDL_INTERFACE("e9eb5314-33aa-42b2-a718-d77f58b1f1c7")
+ID3D12SDKConfiguration : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT version,
+                                                  LPCSTR path) = 0;
+};
+__CRT_UUID_DECL(ID3D12SDKConfiguration, 0xe9eb5314, 0x33aa, 0x42b2,
+                0xa7, 0x18, 0xd7, 0x7f, 0x58, 0xb1, 0xf1, 0xc7)
+#endif
+
 #ifndef __ID3D12SDKConfiguration1_INTERFACE_DEFINED__
 MIDL_INTERFACE("8aaf9303-ad25-48b9-9a57-d9c37e009d9f")
 ID3D12SDKConfiguration1 : public ID3D12SDKConfiguration {
