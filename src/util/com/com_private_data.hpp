@@ -9,8 +9,10 @@
  */
 #pragma once
 
+#include <mutex>
 #include <vector>
 #include <unknwn.h>
+#include <windef.h>
 
 namespace dxmt {
 
@@ -87,9 +89,12 @@ public:
 
   HRESULT setInterface(REFGUID guid, const IUnknown *iface);
 
+  HRESULT setName(const WCHAR *name);
+
   HRESULT getData(REFGUID guid, UINT *size, void *data);
 
 private:
+  std::mutex m_mutex;
   std::vector<ComPrivateDataEntry> m_entries;
 
   ComPrivateDataEntry *findEntry(REFGUID guid);

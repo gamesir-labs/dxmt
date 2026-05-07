@@ -18,6 +18,12 @@ public:
         cpu_visible_(d3d12::IsCpuVisibleHeap(desc.Properties)),
         buffer_(new dxmt::Buffer(desc.SizeInBytes,
                                  device_->GetDXMTDevice().device())) {
+    if (!desc_.Alignment)
+      desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (!desc_.Properties.CreationNodeMask)
+      desc_.Properties.CreationNodeMask = 1;
+    if (!desc_.Properties.VisibleNodeMask)
+      desc_.Properties.VisibleNodeMask = 1;
     allocation_ = buffer_->allocate(GetHeapBufferAllocationFlags(desc.Properties));
   }
 
@@ -56,7 +62,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {

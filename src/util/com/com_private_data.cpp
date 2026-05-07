@@ -10,10 +10,18 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <d3dcommon.h>
 
 #include "com_private_data.hpp"
 
 namespace dxmt {
+
+namespace {
+
+static const GUID kDebugObjectNameWGuid = {
+    0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
+
+}
 
 ComPrivateDataEntry::ComPrivateDataEntry() {}
 ComPrivateDataEntry::ComPrivateDataEntry(REFGUID guid, UINT size,
@@ -96,6 +104,7 @@ void ComPrivateDataEntry::destroy() {
 }
 
 HRESULT ComPrivateData::setData(REFGUID guid, UINT size, const void *data) {
+  std::lock_guard lock(m_mutex);
   if (!data) {
     for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
       if (it->hasGuid(guid)) {
@@ -110,14 +119,27 @@ HRESULT ComPrivateData::setData(REFGUID guid, UINT size, const void *data) {
 }
 
 HRESULT ComPrivateData::setInterface(REFGUID guid, const IUnknown *iface) {
+  std::lock_guard lock(m_mutex);
   this->insertEntry(ComPrivateDataEntry(guid, iface));
   return S_OK;
+}
+
+HRESULT ComPrivateData::setName(const WCHAR *name) {
+  if (!name)
+    return setData(kDebugObjectNameWGuid, 0, nullptr);
+
+  UINT length = 0;
+  while (name[length])
+    length++;
+
+  return setData(kDebugObjectNameWGuid, (length + 1) * sizeof(WCHAR), name);
 }
 
 HRESULT ComPrivateData::getData(REFGUID guid, UINT *size, void *data) {
   if (!size)
     return E_INVALIDARG;
 
+  std::lock_guard lock(m_mutex);
   auto entry = this->findEntry(guid);
 
   if (!entry) {
