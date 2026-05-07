@@ -87,6 +87,45 @@ StoreResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
   return stored;
 }
 
+static bool
+IsWriteResourceState(D3D12_RESOURCE_STATES state) {
+  static constexpr D3D12_RESOURCE_STATES WriteStates =
+      D3D12_RESOURCE_STATE_RENDER_TARGET |
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+      D3D12_RESOURCE_STATE_DEPTH_WRITE |
+      D3D12_RESOURCE_STATE_COPY_DEST |
+      D3D12_RESOURCE_STATE_RESOLVE_DEST |
+      D3D12_RESOURCE_STATE_STREAM_OUT;
+  return (state & WriteStates) != 0;
+}
+
+static bool
+IsValidTransitionState(D3D12_RESOURCE_STATES state) {
+  if (state == D3D12_RESOURCE_STATE_COMMON)
+    return true;
+
+  if (!IsWriteResourceState(state))
+    return true;
+
+  const auto bits = static_cast<UINT>(state);
+  return (bits & (bits - 1)) == 0;
+}
+
+static bool
+IsValidResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
+  switch (barrier.Type) {
+  case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+    return barrier.Transition.pResource &&
+           IsValidTransitionState(barrier.Transition.StateBefore) &&
+           IsValidTransitionState(barrier.Transition.StateAfter);
+  case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
+  case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+    return true;
+  default:
+    return false;
+  }
+}
+
 #ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
 using GraphicsCommandListComBase = ID3D12GraphicsCommandList4;
 #elif defined(__ID3D12GraphicsCommandList2_INTERFACE_DEFINED__)
@@ -100,16 +139,29 @@ using GraphicsCommandListComBase = ID3D12GraphicsCommandList;
 class GraphicsCommandListImpl final : public ComObjectWithInitialRef<GraphicsCommandListComBase>,
                                       public GraphicsCommandList {
 public:
+  ~GraphicsCommandListImpl() override {
+    if (allocator_ && !closed_)
+      allocator_->EndCommandListRecording(this);
+  }
+
   GraphicsCommandListImpl(IMTLD3D12Device *device, UINT node_mask,
                           D3D12_COMMAND_LIST_TYPE type,
                           ID3D12CommandAllocator *command_allocator,
-                          ID3D12PipelineState *initial_pipeline_state)
-      : device_(device), node_mask_(node_mask), type_(type), allocator_(command_allocator),
+                          ID3D12PipelineState *initial_pipeline_state,
+                          HRESULT *status)
+      : device_(device), node_mask_(node_mask), type_(type),
         initial_pipeline_state_(initial_pipeline_state) {
-    if (allocator_) {
-      auto allocator_state = dynamic_cast<CommandAllocator *>(allocator_.ptr());
-      if (!allocator_state || allocator_state->GetCommandListType() != type_)
-        allocator_ = nullptr;
+    if (status)
+      *status = S_OK;
+    if (auto allocator_state = dynamic_cast<CommandAllocatorObject *>(command_allocator)) {
+      if (allocator_state->GetCommandListType() == type_) {
+        if (!allocator_state->BeginCommandListRecording(this)) {
+          if (status)
+            *status = E_INVALIDARG;
+          return;
+        }
+        allocator_ = allocator_state;
+      }
     }
     if (!IsPipelineStateCompatible(initial_pipeline_state_.ptr()))
       initial_pipeline_state_ = nullptr;
@@ -179,7 +231,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -192,6 +244,10 @@ public:
     if (closed_)
       return E_FAIL;
     closed_ = true;
+    if (allocator_)
+      allocator_->EndCommandListRecording(this);
+    if (recording_error_)
+      return recording_error_;
     return S_OK;
   }
 
@@ -200,13 +256,23 @@ public:
     if (!allocator)
       return E_INVALIDARG;
 
-    auto allocator_state = dynamic_cast<CommandAllocator *>(allocator);
+    auto allocator_state = dynamic_cast<CommandAllocatorObject *>(allocator);
     if (!allocator_state || allocator_state->GetCommandListType() != type_)
       return E_INVALIDARG;
     if (!IsPipelineStateCompatible(initial_state))
       return E_INVALIDARG;
 
-    allocator_ = allocator;
+    if (allocator_.ptr() == allocator_state) {
+      allocator_->EndCommandListRecording(this);
+      if (!allocator_state->BeginCommandListRecording(this))
+        return E_INVALIDARG;
+    } else {
+      if (!allocator_state->BeginCommandListRecording(this))
+        return E_INVALIDARG;
+      if (allocator_)
+        allocator_->EndCommandListRecording(this);
+    }
+    allocator_ = allocator_state;
     initial_pipeline_state_ = initial_state;
     current_pipeline_state_ = initial_pipeline_state_;
     compute_root_signature_ = nullptr;
@@ -214,6 +280,7 @@ public:
     records_.clear();
     closed_ = false;
     submitted_ = false;
+    recording_error_ = S_OK;
     if (current_pipeline_state_)
       AddRecord(PipelineStateRecord{current_pipeline_state_});
     return S_OK;
@@ -227,11 +294,17 @@ public:
     return records_;
   }
 
-  HRESULT MarkSubmittedToQueue(D3D12_COMMAND_LIST_TYPE queue_type) override {
+  HRESULT MarkSubmittedToQueue(
+      D3D12_COMMAND_LIST_TYPE queue_type,
+      std::vector<SubmittedCommandAllocatorUse> &allocator_uses) override {
     if (!closed_ || type_ != queue_type)
       return E_INVALIDARG;
 
     submitted_ = true;
+    if (allocator_) {
+      allocator_uses.push_back(
+          SubmittedCommandAllocatorUse{allocator_, allocator_->MarkCommandListSubmitted()});
+    }
     return S_OK;
   }
 
@@ -345,8 +418,11 @@ public:
 
     ResourceBarrierRecord record = {};
     record.barriers.reserve(barrier_count);
-    for (UINT i = 0; i < barrier_count; i++)
+    for (UINT i = 0; i < barrier_count; i++) {
+      if (!IsValidResourceBarrier(barriers[i]))
+        recording_error_ = E_INVALIDARG;
       record.barriers.push_back(StoreResourceBarrier(barriers[i]));
+    }
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {
@@ -1001,7 +1077,7 @@ private:
   Com<IMTLD3D12Device> device_;
   UINT node_mask_;
   D3D12_COMMAND_LIST_TYPE type_;
-  Com<ID3D12CommandAllocator> allocator_;
+  Com<CommandAllocatorObject, false> allocator_;
   Com<ID3D12PipelineState> initial_pipeline_state_;
   Com<ID3D12PipelineState> current_pipeline_state_;
   Com<ID3D12RootSignature> compute_root_signature_;
@@ -1014,6 +1090,7 @@ private:
   std::vector<PendingRenderPassResolve> pending_render_pass_resolves_;
   bool closed_ = false;
   bool submitted_ = false;
+  HRESULT recording_error_ = S_OK;
   std::string name_;
 };
 
@@ -1067,7 +1144,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -1101,9 +1178,15 @@ Com<ID3D12GraphicsCommandList>
 CreateGraphicsCommandList(IMTLD3D12Device *device, UINT node_mask,
                           D3D12_COMMAND_LIST_TYPE type,
                           ID3D12CommandAllocator *command_allocator,
-                          ID3D12PipelineState *initial_pipeline_state) {
-  return Com<ID3D12GraphicsCommandList>::transfer(new GraphicsCommandListImpl(
-      device, node_mask, type, command_allocator, initial_pipeline_state));
+                          ID3D12PipelineState *initial_pipeline_state,
+                          HRESULT *status) {
+  auto *list = new GraphicsCommandListImpl(
+      device, node_mask, type, command_allocator, initial_pipeline_state, status);
+  if (status && FAILED(*status)) {
+    list->ReleasePrivate();
+    return nullptr;
+  }
+  return Com<ID3D12GraphicsCommandList>::transfer(list);
 }
 
 Com<ID3D12CommandSignature>

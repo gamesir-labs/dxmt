@@ -6,14 +6,43 @@
 #include "log/log.hpp"
 #include "util_string.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 namespace dxmt::d3d12 {
 namespace {
 
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
-      : device_(device), event_(device->GetMTLDevice().newSharedEvent()), flags_(flags) {
+      : device_(device), event_(device->GetMTLDevice().newSharedEvent()), flags_(flags),
+        completed_value_(initial_value), has_manual_completed_value_(false) {
     event_.signalValue(initial_value);
+  }
+
+  ~FenceImpl() override {
+    std::vector<HANDLE> events_to_signal;
+    std::vector<std::function<void()>> callbacks_to_run;
+    {
+      std::lock_guard lock(mutex_);
+      completed_value_ = UINT64_MAX;
+      has_manual_completed_value_ = true;
+      for (const auto &pending : pending_events_)
+        events_to_signal.push_back(pending.event);
+      pending_events_.clear();
+      for (auto &pending : pending_callbacks_)
+        callbacks_to_run.push_back(std::move(pending.callback));
+      pending_callbacks_.clear();
+    }
+    event_.signalValue(UINT64_MAX);
+    for (HANDLE event : events_to_signal)
+      SetEvent(event);
+    for (auto &callback : callbacks_to_run)
+      callback();
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -49,7 +78,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -57,34 +86,181 @@ public:
   }
 
   UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
-    return event_.signaledValue();
+    std::lock_guard lock(mutex_);
+    return GetCompletedValueLocked();
+  }
+
+  UINT64 GetCompletedValue() const override {
+    std::lock_guard lock(mutex_);
+    return GetCompletedValueLocked();
   }
 
   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
-    if (!event)
-      return E_INVALIDARG;
+    if (!event) {
+      while (true) {
+        {
+          std::lock_guard lock(mutex_);
+          if (GetCompletedValueLocked() >= value)
+            return S_OK;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
 
-    auto shared_event_listener = device_->GetDXMTDevice().queue().GetSharedEventListener();
-    MTLSharedEvent_setWin32EventAtValue(event_.handle, shared_event_listener, event, value);
+    bool signal_now = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (GetCompletedValueLocked() >= value) {
+        signal_now = true;
+      } else {
+        pending_events_.push_back({value, event});
+      }
+    }
+
+    if (signal_now)
+      SetEvent(event);
+
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
+    std::vector<HANDLE> events_to_signal;
+    std::vector<std::function<void()>> callbacks_to_run;
+    {
+      std::lock_guard lock(mutex_);
+      completed_value_ = value;
+      has_manual_completed_value_ = true;
+      collectCompletedEventsLocked(events_to_signal, callbacks_to_run);
+    }
     event_.signalValue(value);
+    for (HANDLE event : events_to_signal)
+      SetEvent(event);
+    for (auto &callback : callbacks_to_run)
+      callback();
     return S_OK;
   }
 
   WMT::Reference<WMT::SharedEvent> GetSharedEvent() const override { return event_; }
+
+  void AddRefPrivate() override {
+    ComObjectWithInitialRef<ID3D12Fence>::AddRefPrivate();
+  }
+
+  void ReleasePrivate() override {
+    ComObjectWithInitialRef<ID3D12Fence>::ReleasePrivate();
+  }
+
+  void SetCompletedValue(UINT64 value) override {
+    std::vector<HANDLE> events_to_signal;
+    std::vector<std::function<void()>> callbacks_to_run;
+    {
+      std::lock_guard lock(mutex_);
+      completed_value_ = value;
+      has_manual_completed_value_ = true;
+      collectCompletedEventsLocked(events_to_signal, callbacks_to_run);
+    }
+    for (HANDLE event : events_to_signal)
+      SetEvent(event);
+    for (auto &callback : callbacks_to_run)
+      callback();
+  }
+
+  void SignalFromQueue(UINT64 value) override {
+    Signal(value);
+  }
+
+  void AddCompletionCallback(UINT64 value, std::function<void()> callback) override {
+    auto fired = std::make_shared<std::atomic_bool>(false);
+    auto run_once = [fired, callback = std::move(callback)]() mutable {
+      bool expected = false;
+      if (fired->compare_exchange_strong(expected, true))
+        callback();
+    };
+
+    bool run_now = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (GetCompletedValueLocked() >= value) {
+        run_now = true;
+      } else {
+        pending_callbacks_.push_back({value, run_once});
+      }
+    }
+
+    if (run_now) {
+      run_once();
+      return;
+    }
+
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) {
+      run_once();
+      return;
+    }
+
+    MTLSharedEvent_setWin32EventAtValue(
+        event_.handle, device_->GetDXMTDevice().queue().GetSharedEventListener(),
+        event, value);
+    dxmt::thread([event, run_once]() mutable {
+      WaitForSingleObject(event, INFINITE);
+      CloseHandle(event);
+      run_once();
+    }).detach();
+  }
 
   bool HasReached(UINT64 value) const override {
     return MTLSharedEvent_signaledValue(event_.handle) >= value;
   }
 
 private:
+  struct PendingEvent {
+    UINT64 value;
+    HANDLE event;
+  };
+
+  struct PendingCallback {
+    UINT64 value;
+    std::function<void()> callback;
+  };
+
+  UINT64 GetCompletedValueLocked() const {
+    if (has_manual_completed_value_)
+      return completed_value_;
+    return MTLSharedEvent_signaledValue(event_.handle);
+  }
+
+  void collectCompletedEventsLocked(
+      std::vector<HANDLE> &events,
+      std::vector<std::function<void()>> &callbacks) {
+    const UINT64 completed_value = GetCompletedValueLocked();
+    auto it = std::remove_if(pending_events_.begin(), pending_events_.end(),
+                             [&](const PendingEvent &pending) {
+                               if (completed_value < pending.value)
+                                 return false;
+                               events.push_back(pending.event);
+                               return true;
+                             });
+    pending_events_.erase(it, pending_events_.end());
+    auto callback_it = std::remove_if(
+        pending_callbacks_.begin(), pending_callbacks_.end(),
+        [&](PendingCallback &pending) {
+          if (completed_value < pending.value)
+            return false;
+          callbacks.push_back(std::move(pending.callback));
+          return true;
+        });
+    pending_callbacks_.erase(callback_it, pending_callbacks_.end());
+  }
+
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
   WMT::Reference<WMT::SharedEvent> event_;
   D3D12_FENCE_FLAGS flags_;
+  mutable std::mutex mutex_;
+  std::vector<PendingEvent> pending_events_;
+  std::vector<PendingCallback> pending_callbacks_;
+  UINT64 completed_value_;
+  bool has_manual_completed_value_;
   std::string name_;
 };
 

@@ -10,6 +10,17 @@ public:
   virtual ~CommandAllocator() = default;
 
   virtual D3D12_COMMAND_LIST_TYPE GetCommandListType() const = 0;
+  virtual bool BeginCommandListRecording(void *command_list) = 0;
+  virtual void EndCommandListRecording(void *command_list) = 0;
+  virtual UINT64 MarkCommandListSubmitted() = 0;
+  virtual void CompleteCommandListSubmission(UINT64 serial) = 0;
+};
+
+class CommandAllocatorObject : public ID3D12CommandAllocator,
+                               public CommandAllocator {
+public:
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
 };
 
 Com<ID3D12CommandAllocator>

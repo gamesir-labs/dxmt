@@ -5,12 +5,12 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include <mutex>
 
 namespace dxmt::d3d12 {
 namespace {
 
-class CommandAllocatorImpl final : public ComObjectWithInitialRef<ID3D12CommandAllocator>,
-                                   public CommandAllocator {
+class CommandAllocatorImpl final : public ComObjectWithInitialRef<CommandAllocatorObject> {
 public:
   CommandAllocatorImpl(IMTLD3D12Device *device, D3D12_COMMAND_LIST_TYPE type)
       : device_(device), type_(type) {}
@@ -48,7 +48,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -56,6 +56,9 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE Reset() override {
+    std::lock_guard lock(mutex_);
+    if (recording_list_ || pending_submission_count_)
+      return E_FAIL;
     return S_OK;
   }
 
@@ -63,10 +66,53 @@ public:
     return type_;
   }
 
+  bool BeginCommandListRecording(void *command_list) override {
+    std::lock_guard lock(mutex_);
+    if (recording_list_)
+      return false;
+
+    recording_list_ = command_list;
+    return true;
+  }
+
+  void EndCommandListRecording(void *command_list) override {
+    std::lock_guard lock(mutex_);
+    if (recording_list_ == command_list)
+      recording_list_ = nullptr;
+  }
+
+  UINT64 MarkCommandListSubmitted() override {
+    std::lock_guard lock(mutex_);
+    pending_submission_count_++;
+    return ++last_submission_serial_;
+  }
+
+  void CompleteCommandListSubmission(UINT64 serial) override {
+    std::lock_guard lock(mutex_);
+    if (serial && serial <= last_completed_submission_serial_)
+      return;
+    last_completed_submission_serial_ = serial;
+    if (pending_submission_count_)
+      pending_submission_count_--;
+  }
+
+  void AddRefPrivate() override {
+    ComObjectWithInitialRef<CommandAllocatorObject>::AddRefPrivate();
+  }
+
+  void ReleasePrivate() override {
+    ComObjectWithInitialRef<CommandAllocatorObject>::ReleasePrivate();
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
   D3D12_COMMAND_LIST_TYPE type_;
+  std::mutex mutex_;
+  void *recording_list_ = nullptr;
+  UINT64 last_submission_serial_ = 0;
+  UINT64 last_completed_submission_serial_ = 0;
+  UINT pending_submission_count_ = 0;
   std::string name_;
 };
 

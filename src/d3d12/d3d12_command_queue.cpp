@@ -30,6 +30,8 @@
 #include <iomanip>
 #include <mutex>
 #include <optional>
+#include <deque>
+#include <tuple>
 #include <sstream>
 #include <type_traits>
 #include <unordered_map>
@@ -37,6 +39,12 @@
 
 namespace dxmt::d3d12 {
 namespace {
+
+static UINT GetPlaneCount(const Resource &resource);
+static UINT GetSubresourceIndex(const Resource &resource, UINT subresource);
+static UINT GetSubresourcePlane(const Resource &resource, UINT subresource);
+static UINT GetMipLevel(const Resource &resource, UINT subresource);
+static UINT GetArraySlice(const Resource &resource, UINT subresource);
 
 static bool
 D3D12DiagEnabledEnv(const char *name) {
@@ -574,7 +582,7 @@ static UINT
 GetMipLevel(const Resource &resource, UINT subresource) {
   const auto &desc = resource.GetResourceDesc();
   const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
-  return mip_levels ? subresource % mip_levels : 0;
+  return mip_levels ? GetSubresourceIndex(resource, subresource) % mip_levels : 0;
 }
 
 static UINT
@@ -583,7 +591,7 @@ GetArraySlice(const Resource &resource, UINT subresource) {
   const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
   return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
              ? 0
-             : subresource / mip_levels;
+             : GetSubresourceIndex(resource, subresource) / mip_levels;
 }
 
 static UINT
@@ -595,7 +603,56 @@ GetSubresourceCount(const Resource &resource) {
   return mip_levels *
          (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
               ? 1
-              : desc.DepthOrArraySize);
+              : desc.DepthOrArraySize) *
+         GetPlaneCount(resource);
+}
+
+static UINT
+GetPlaneCount(const Resource &resource) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+  switch (desc.Format) {
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+  case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+  case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+  case DXGI_FORMAT_NV12:
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+  case DXGI_FORMAT_NV11:
+    return 2;
+  default:
+    return 1;
+  }
+}
+
+static UINT
+GetSubresourcePlane(const Resource &resource, UINT subresource) {
+  const auto plane_count = GetPlaneCount(resource);
+  if (plane_count <= 1)
+    return 0;
+  const auto &desc = resource.GetResourceDesc();
+  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  const UINT base_count = mip_levels *
+      (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
+  return base_count ? subresource / base_count : 0;
+}
+
+static UINT
+GetSubresourceIndex(const Resource &resource, UINT subresource) {
+  const auto &desc = resource.GetResourceDesc();
+  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  const UINT plane_count = GetPlaneCount(resource);
+  const UINT base_count = mip_levels *
+      (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
+  if (plane_count <= 1)
+    return subresource;
+  return subresource % base_count;
 }
 
 static WMTSize
@@ -613,6 +670,17 @@ GetSubresourceSize(const Resource &resource, UINT subresource,
           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
               ? std::max<UINT64>(1, desc.DepthOrArraySize >> mip)
               : 1};
+}
+
+static bool
+IsFullSubresourceBox(const Resource &resource, UINT subresource,
+                     const D3D12_BOX *box) {
+  if (!box)
+    return true;
+  const auto size = GetSubresourceSize(resource, subresource, nullptr);
+  return box->left == 0 && box->top == 0 && box->front == 0 &&
+         box->right == size.width && box->bottom == size.height &&
+         box->back == size.depth;
 }
 
 static bool
@@ -712,7 +780,7 @@ CreateRenderTargetView(Resource &resource, const DescriptorRecord &descriptor) {
   view.firstMiplevel = 0;
   view.miplevelCount = 1;
   view.firstArraySlice = 0;
-  view.arraySize = 1;
+  view.arraySize = texture->arrayLength();
   view.intendedUsage = WMTTextureUsageRenderTarget;
 
   if (descriptor.has_desc) {
@@ -758,7 +826,7 @@ CreateDepthStencilView(WMT::Device device, Resource &resource,
   view.firstMiplevel = 0;
   view.miplevelCount = 1;
   view.firstArraySlice = 0;
-  view.arraySize = 1;
+  view.arraySize = texture->arrayLength();
   view.intendedUsage = WMTTextureUsageRenderTarget;
 
   if (descriptor.has_desc) {
@@ -842,9 +910,9 @@ D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
 }
 
 static UINT
-GetDepthStencilArrayLength(const DescriptorRecord &descriptor) {
+GetDepthStencilArrayLength(Resource &resource, const DescriptorRecord &descriptor) {
   if (!descriptor.has_desc)
-    return 1;
+    return resource.GetTexture() ? resource.GetTexture()->arrayLength() : 1;
 
   switch (descriptor.desc.dsv.ViewDimension) {
   case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
@@ -1258,10 +1326,13 @@ NormalizeQueueDesc(const D3D12_COMMAND_QUEUE_DESC *desc,
   normalized.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   normalized.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
   normalized.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-  normalized.NodeMask = 0;
+  normalized.NodeMask = 1;
 
-  if (desc)
+  if (desc) {
     normalized = *desc;
+    if (!normalized.NodeMask)
+      normalized.NodeMask = 1;
+  }
 
   if (!IsSupportedQueueType(normalized.Type)) {
     Logger::err(str::format("D3D12CommandQueue: unsupported queue type ", normalized.Type));
@@ -1331,7 +1402,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -1388,7 +1459,8 @@ public:
       return;
     }
 
-    bool submitted_any = false;
+    PendingOperation op;
+    op.type = PendingOperationType::Execute;
     for (UINT i = 0; i < command_list_count; i++) {
       auto *command_list = command_lists[i];
       if (!command_list) {
@@ -1413,16 +1485,13 @@ public:
         continue;
       }
 
-      if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type))) {
-        ReplayCommandRecords(state->GetCommandRecords());
-        submitted_any = true;
+      if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
+        op.command_records.emplace_back(state->GetCommandRecords());
       }
     }
 
-    if (submitted_any) {
-      device_->GetDXMTDevice().queue().CommitCurrentChunk();
-      submitted_batches_++;
-    }
+    if (!op.command_records.empty())
+      EnqueuePendingOperation(std::move(op));
   }
 
   void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) override {}
@@ -1439,17 +1508,12 @@ public:
     if (!state)
       return E_INVALIDARG;
 
-    auto event = state->GetSharedEvent();
-    {
-      std::lock_guard lock(mutex_);
-      auto &queue = device_->GetDXMTDevice().queue();
-      queue.CurrentChunk()->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
-        enc.signalEvent(std::move(event), value);
-      });
-      queue.CommitCurrentChunk();
-      signal_count_++;
-      last_signal_value_ = value;
-    }
+    PendingOperation op;
+    op.type = PendingOperationType::Signal;
+    op.fence = state;
+    op.value = value;
+    state->AddRefPrivate();
+    EnqueuePendingOperation(std::move(op));
     return S_OK;
   }
 
@@ -1461,16 +1525,12 @@ public:
     if (!state)
       return E_INVALIDARG;
 
-    auto event = state->GetSharedEvent();
-    {
-      std::lock_guard lock(mutex_);
-      auto &queue = device_->GetDXMTDevice().queue();
-      queue.CurrentChunk()->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
-        enc.waitEvent(std::move(event), value);
-      });
-      queue.CommitCurrentChunk();
-      wait_values_.push_back(value);
-    }
+    PendingOperation op;
+    op.type = PendingOperationType::Wait;
+    op.fence = state;
+    op.value = value;
+    state->AddRefPrivate();
+    EnqueuePendingOperation(std::move(op));
     return S_OK;
   }
 
@@ -1807,7 +1867,7 @@ private:
 
         backbuffers_.push_back(CreateResource(
             queue_->device_.ptr(), &heap_props, D3D12_HEAP_FLAG_NONE,
-            &resource_desc, D3D12_RESOURCE_STATE_PRESENT, 0));
+            &resource_desc, D3D12_RESOURCE_STATE_PRESENT, 0, nullptr));
         if (!backbuffers_.back())
           return E_FAIL;
         D3D12DiagLogSwapChainBackBuffer("ResizeBuffers", i,
@@ -2670,19 +2730,22 @@ private:
 
     if (resource.GetTexture()) {
       Rc<Texture> texture = resource.GetTexture();
-      std::vector<std::pair<UINT, UINT>> subresources;
+      std::vector<std::tuple<UINT, UINT, UINT>> subresources;
       subresources.reserve(subresource_count);
       for (UINT i = 0; i < subresource_count; i++) {
         const UINT subresource = first_subresource + i;
         subresources.push_back({GetMipLevel(resource, subresource),
-                                GetArraySlice(resource, subresource)});
+                                GetArraySlice(resource, subresource),
+                                GetSubresourcePlane(resource, subresource)});
       }
       chunk->emitcc([texture = std::move(texture),
                      subresources = std::move(subresources),
                      access](ArgumentEncodingContext &enc) mutable {
         enc.startBlitPass();
-        for (const auto &[level, slice] : subresources)
+        for (const auto &[level, slice, plane] : subresources) {
+          (void)plane;
           enc.access(texture, level, slice, access);
+        }
         enc.endPass();
       });
       return;
@@ -4375,31 +4438,66 @@ private:
                   ? ReflectedDescriptorRangeCount(
                         pipeline, range, parameter.visibility, compute)
                   : range.descriptor_count;
-          for (UINT i = 0; i < count; i++) {
-            auto *descriptor = GetBoundDescriptorRecordInRange(
-                state, base, range_offset, i, count,
-                DescriptorHeapTypeForRange(range.range_type));
-            if (!descriptor)
-              continue;
-            ForEachVisibleStage(
-                parameter.visibility, compute, [&](PipelineStage stage) {
-                  auto slot = ResolveShaderBindingSlot(
-                      pipeline, stage, BindingTypeForRange(range.range_type),
-                      range.base_shader_register + i, range.register_space);
-                  if (!slot)
-                    return;
-                  const auto *argument = ResolveShaderBindingArgumentBySlot(
-                      pipeline, stage, BindingTypeForRange(range.range_type),
-                      *slot);
-                  DebugLogRootBinding(
-                      DescriptorRangeTypeName(range.range_type), pipeline,
-                      compute, stage, root_index, *slot,
-                      range.base_shader_register + i, range.register_space,
-                      DescriptorRecordSizeBytes(*descriptor), 0);
-                  BindDescriptor(enc, stage, range.range_type, *slot,
-                                 *descriptor, argument);
-                });
-          }
+          ForEachVisibleStage(
+              parameter.visibility, compute, [&](PipelineStage stage) {
+                const auto binding_type = BindingTypeForRange(range.range_type);
+                const auto *shader = FindShaderForStage(pipeline, stage);
+                if (!shader)
+                  return;
+                const auto *arguments =
+                    binding_type == SM50BindingType::ConstantBuffer
+                        ? shader->constantBufferInfo()
+                        : shader->resourceArgumentInfo();
+                const auto argument_count =
+                    binding_type == SM50BindingType::ConstantBuffer
+                        ? shader->reflection.NumConstantBuffers
+                        : shader->reflection.NumArguments;
+                if (!arguments)
+                  return;
+
+                for (UINT arg_index = 0; arg_index < argument_count;
+                     arg_index++) {
+                  const auto &argument = arguments[arg_index];
+                  if (argument.Type != binding_type)
+                    continue;
+                  const auto space = argument.RegisterCount
+                                         ? argument.RegisterSpace
+                                         : 0;
+                  const auto lower = argument.RegisterCount
+                                         ? argument.RegisterLowerBound
+                                         : argument.SM50BindingSlot;
+                  const auto arg_count =
+                      argument.RegisterCount ? argument.RegisterCount : 1;
+                  const auto resolved_count =
+                      arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+                  if (space != range.register_space ||
+                      lower + resolved_count < lower)
+                    continue;
+
+                  for (UINT i = 0; i < resolved_count; i++) {
+                    const auto shader_register = lower + i;
+                    if (shader_register < range.base_shader_register)
+                      continue;
+                    const auto descriptor_index =
+                        shader_register - range.base_shader_register;
+                    if (descriptor_index >= count)
+                      continue;
+                    const auto *descriptor = GetBoundDescriptorRecordInRange(
+                        state, base, range_offset, descriptor_index, 1,
+                        DescriptorHeapTypeForRange(range.range_type));
+                    if (!descriptor)
+                      continue;
+                    const auto slot = argument.SM50BindingSlot + i;
+                    DebugLogRootBinding(
+                        DescriptorRangeTypeName(range.range_type), pipeline,
+                        compute, stage, root_index, slot, shader_register,
+                        range.register_space,
+                        DescriptorRecordSizeBytes(*descriptor), 0);
+                    BindDescriptor(enc, stage, range.range_type, slot,
+                                   *descriptor, &argument);
+                  }
+                }
+              });
           if (range.descriptor_count != UINT_MAX)
             running_offset = range_offset + range.descriptor_count;
         }
@@ -4714,7 +4812,7 @@ private:
         attachments.depth_stencil = ReplayDepthStencilAttachment{
             .texture = texture,
             .view = view,
-            .array_length = GetDepthStencilArrayLength(*state.depth_stencil),
+            .array_length = GetDepthStencilArrayLength(*resource, *state.depth_stencil),
             .width = texture->width(),
             .height = texture->height(),
             .format = texture->pixelFormat(),
@@ -4777,6 +4875,10 @@ private:
         depth.attachment = enc.access<PipelineStage::Pixel>(
             attachments.depth_stencil->texture, attachments.depth_stencil->view,
             ResourceAccess::ReadWrite);
+        TextureViewKey view = attachments.depth_stencil->view;
+        depth.level = view.mip_start;
+        depth.slice = view.array_start;
+        depth.depth_plane = 0;
         depth.load_action = WMTLoadActionLoad;
         depth.store_action = WMTStoreActionStore;
       }
@@ -4785,6 +4887,10 @@ private:
         stencil.attachment = enc.access<PipelineStage::Pixel>(
             attachments.depth_stencil->texture, attachments.depth_stencil->view,
             ResourceAccess::ReadWrite);
+        TextureViewKey view = attachments.depth_stencil->view;
+        stencil.level = view.mip_start;
+        stencil.slice = view.array_start;
+        stencil.depth_plane = 0;
         stencil.load_action = WMTLoadActionLoad;
         stencil.store_action = WMTStoreActionStore;
       }
@@ -5864,16 +5970,101 @@ private:
     if (!dst || !src)
       return;
 
+    const bool src_planar = GetPlaneCount(*src) > 1;
+    const UINT src_subresource =
+        record.src.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+            ? record.src.subresource_index
+            : 0;
+    const UINT dst_subresource =
+        record.dst.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+            ? record.dst.subresource_index
+            : 0;
+
+    if (src_planar && src->GetTexture() && dst->GetTexture()) {
+      if (!IsFullSubresourceBox(*src, src_subresource,
+                                record.src_box ? &*record.src_box : nullptr) ||
+          record.dst_x || record.dst_y || record.dst_z) {
+        WARN("D3D12CommandQueue: planar texture copy with subregion is not supported yet");
+        return;
+      }
+
+      const UINT src_plane = GetSubresourcePlane(*src, src_subresource);
+      const UINT src_level = GetMipLevel(*src, src_subresource);
+      const UINT src_slice = GetArraySlice(*src, src_subresource);
+      const UINT dst_level = GetMipLevel(*dst, dst_subresource);
+      const UINT dst_slice = GetArraySlice(*dst, dst_subresource);
+      const DXGI_FORMAT dst_format = dst->GetResourceDesc().Format;
+
+      if ((src_plane == 0 && dst_format != DXGI_FORMAT_R32_FLOAT) ||
+          (src_plane != 0 && dst_format != DXGI_FORMAT_R8_UINT)) {
+        WARN("D3D12CommandQueue: planar copy destination format mismatch src_plane=",
+             src_plane, " dst_format=", uint32_t(dst_format));
+        return;
+      }
+
+      Rc<Texture> src_texture = src->GetTexture();
+      Rc<Texture> dst_texture = dst->GetTexture();
+      TextureViewDescriptor src_view = {};
+      src_view.format = src_plane ? WMTPixelFormatX32G8X32 : WMTPixelFormatR32X8X32;
+      src_view.type = src_texture->textureType();
+      switch (src_view.type) {
+      case WMTTextureType2DArray:
+      case WMTTextureTypeCube:
+      case WMTTextureTypeCubeArray:
+        src_view.type = WMTTextureType2D;
+        break;
+      default:
+        break;
+      }
+      src_view.firstMiplevel = src_level;
+      src_view.miplevelCount = 1;
+      src_view.firstArraySlice = src_slice;
+      src_view.arraySize = 1;
+      src_view.intendedUsage = WMTTextureUsageShaderRead;
+
+      auto src_key = src_texture->createView(src_view);
+      const auto copy_size = GetSubresourceSize(*src, src_subresource, nullptr);
+      const uint32_t bytes_per_pixel = src_plane ? 1 : 4;
+      const uint32_t bytes_per_row = uint32_t(copy_size.width) * bytes_per_pixel;
+      const uint32_t bytes_per_image = bytes_per_row * uint32_t(copy_size.height);
+      Rc<Buffer> staging = Rc<Buffer>(new Buffer(bytes_per_image, device_->GetDXMTDevice().device()));
+      Flags<BufferAllocationFlag> staging_flags;
+      staging_flags.set(BufferAllocationFlag::GpuPrivate);
+      auto staging_allocation = staging->allocate(staging_flags);
+      staging->rename(std::move(staging_allocation));
+      Rc<Buffer> staging_read = staging;
+      chunk->emitcc([src_texture = std::move(src_texture), src_key,
+                     staging = std::move(staging_read), bytes_per_row, bytes_per_image,
+                     stencil_plane = src_plane != 0](ArgumentEncodingContext &enc) mutable {
+        enc.blit_depth_stencil_cmd.copyPlaneToBuffer(std::move(src_texture), src_key,
+                                                     staging, 0, staging->length(),
+                                                     bytes_per_row, bytes_per_image,
+                                                     stencil_plane);
+      });
+      chunk->emitcc([dst_texture = std::move(dst_texture), dst_level, dst_slice,
+                     staging = staging, bytes_per_row, bytes_per_image,
+                     dst_format, copy_size](ArgumentEncodingContext &enc) mutable {
+        enc.startBlitPass();
+        auto [src_buffer, src_offset] = enc.access(staging, 0, staging->length(), ResourceAccess::Read);
+        auto dst = enc.access(dst_texture, dst_level, dst_slice, ResourceAccess::Write);
+        auto &copy = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+        copy.type = WMTBlitCommandCopyFromBufferToTexture;
+        copy.src = src_buffer->buffer();
+        copy.src_offset = src_offset;
+        copy.bytes_per_row = bytes_per_row;
+        copy.bytes_per_image = bytes_per_image;
+        copy.size = copy_size;
+        copy.dst = dst;
+        copy.slice = dst_slice;
+        copy.level = dst_level;
+        copy.origin = {0, 0, 0};
+        enc.endPass();
+      });
+      return;
+    }
+
     if (dst->GetTextureAllocation() && src->GetTextureAllocation() &&
         dst->GetTexture() && src->GetTexture()) {
-      const UINT dst_subresource =
-          record.dst.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
-              ? record.dst.subresource_index
-              : 0;
-      const UINT src_subresource =
-          record.src.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
-              ? record.src.subresource_index
-              : 0;
       const auto size =
           GetSubresourceSize(*src, src_subresource,
                              record.src_box ? &*record.src_box : nullptr);
@@ -6172,7 +6363,7 @@ private:
     Rc<Texture> texture = resource->GetTexture();
     auto view = CreateDepthStencilView(device_->GetMTLDevice(), *resource,
                                        record.descriptor);
-    const UINT array_length = GetDepthStencilArrayLength(record.descriptor);
+    const UINT array_length = GetDepthStencilArrayLength(*resource, record.descriptor);
     unsigned flags = 0;
     if (record.flags & D3D12_CLEAR_FLAG_DEPTH)
       flags |= 1;
@@ -6336,15 +6527,169 @@ private:
                               ResourceAccess::All);
   }
 
+  enum class PendingOperationType {
+    Execute,
+    Signal,
+    Wait,
+  };
+
+  struct PendingOperation {
+    PendingOperationType type = PendingOperationType::Execute;
+    std::vector<std::vector<CommandRecord>> command_records;
+    std::vector<SubmittedCommandAllocatorUse> allocator_uses;
+    Fence *fence = nullptr;
+    UINT64 value = 0;
+    bool wait_callback_armed = false;
+    bool wait_completed = false;
+
+    PendingOperation() = default;
+    PendingOperation(const PendingOperation &) = delete;
+    PendingOperation &operator=(const PendingOperation &) = delete;
+    PendingOperation(PendingOperation &&other) noexcept
+        : type(other.type),
+          command_records(std::move(other.command_records)),
+          allocator_uses(std::move(other.allocator_uses)),
+          fence(other.fence),
+          value(other.value),
+          wait_callback_armed(other.wait_callback_armed),
+          wait_completed(other.wait_completed) {
+      other.fence = nullptr;
+    }
+    PendingOperation &operator=(PendingOperation &&other) noexcept {
+      if (this != &other) {
+        ReleaseFence();
+        type = other.type;
+        command_records = std::move(other.command_records);
+        allocator_uses = std::move(other.allocator_uses);
+        fence = other.fence;
+        value = other.value;
+        wait_callback_armed = other.wait_callback_armed;
+        wait_completed = other.wait_completed;
+        other.fence = nullptr;
+      }
+      return *this;
+    }
+    ~PendingOperation() {
+      ReleaseFence();
+    }
+
+    void ReleaseFence() {
+      if (fence) {
+        fence->ReleasePrivate();
+        fence = nullptr;
+      }
+    }
+  };
+
+  void EnqueuePendingOperation(PendingOperation &&operation) {
+    std::lock_guard lock(mutex_);
+    if (operation.type == PendingOperationType::Wait)
+      has_waited_ = true;
+    pending_operations_.push_back(std::move(operation));
+    DrainPendingOperationsLocked();
+  }
+
+  void DrainPendingOperationsLocked() {
+    if (draining_pending_operations_)
+      return;
+
+    draining_pending_operations_ = true;
+    while (!pending_operations_.empty()) {
+      auto &operation = pending_operations_.front();
+      switch (operation.type) {
+      case PendingOperationType::Execute: {
+        for (const auto &records : operation.command_records)
+          ReplayCommandRecords(records);
+        auto allocator_uses = std::make_shared<std::vector<SubmittedCommandAllocatorUse>>(
+            std::move(operation.allocator_uses));
+        auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
+        chunk->deferred_readbacks.push_back([allocator_uses = std::move(allocator_uses)]() {
+          for (auto &use : *allocator_uses) {
+            if (use.allocator)
+              use.allocator->CompleteCommandListSubmission(use.serial);
+          }
+        });
+        device_->GetDXMTDevice().queue().CommitCurrentChunk();
+        submitted_batches_++;
+        pending_operations_.pop_front();
+        break;
+      }
+      case PendingOperationType::Signal:
+        SubmitFenceSignal(operation.fence, operation.value);
+        pending_operations_.pop_front();
+        break;
+      case PendingOperationType::Wait:
+        if (!operation.wait_completed &&
+            operation.fence->GetCompletedValue() < operation.value) {
+          if (operation.wait_callback_armed) {
+            draining_pending_operations_ = false;
+            return;
+          }
+          auto *fence = operation.fence;
+          auto value = operation.value;
+          AddRefPrivate();
+          draining_pending_operations_ = false;
+          operation.wait_callback_armed = true;
+          auto callback = [this, fence, value]() {
+            std::lock_guard lock(mutex_);
+            if (!pending_operations_.empty()) {
+              auto &front = pending_operations_.front();
+              if (front.type == PendingOperationType::Wait &&
+                  front.fence == fence && front.value == value) {
+                front.wait_completed = true;
+              }
+            }
+            DrainPendingOperationsLocked();
+            ReleasePrivate();
+          };
+          fence->AddCompletionCallback(value, std::move(callback));
+          return;
+        }
+        pending_operations_.pop_front();
+        break;
+      }
+    }
+    draining_pending_operations_ = false;
+  }
+
+  void SubmitFenceSignal(Fence *state, UINT64 value) {
+    if (!state)
+      return;
+
+    if (!submitted_batches_ && !has_waited_) {
+      state->SignalFromQueue(value);
+      signal_count_++;
+      last_signal_value_ = value;
+      return;
+    }
+
+    auto event = state->GetSharedEvent();
+    auto &queue = device_->GetDXMTDevice().queue();
+    auto chunk = queue.CurrentChunk();
+    chunk->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
+      enc.signalEvent(std::move(event), value);
+    });
+    state->AddRefPrivate();
+    chunk->deferred_readbacks.push_back([state, value]() {
+      state->SetCompletedValue(value);
+      state->ReleasePrivate();
+    });
+    queue.CommitCurrentChunk();
+    signal_count_++;
+    last_signal_value_ = value;
+  }
+
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
   D3D12_COMMAND_QUEUE_DESC desc_ = {};
   UINT64 submitted_batches_ = 0;
   UINT64 signal_count_ = 0;
   UINT64 last_signal_value_ = 0;
-  std::vector<UINT64> wait_values_;
+  bool has_waited_ = false;
   std::unordered_map<ID3D12Resource *,
                      std::vector<D3D12_RESOURCE_STATES>> resource_states_;
+  std::deque<PendingOperation> pending_operations_;
+  bool draining_pending_operations_ = false;
   std::mutex mutex_;
   std::string name_;
 };
