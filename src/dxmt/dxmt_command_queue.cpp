@@ -25,6 +25,16 @@ DiagMillis(clock::duration duration) {
   return duration.count() / 1000000.0;
 }
 
+static bool
+DiagSlowChunk(double total_ms) {
+  return total_ms > 250.0;
+}
+
+static bool
+DiagCommandCpuBottleneck(double command_cpu_ms, double total_ms) {
+  return total_ms > 0.0 && command_cpu_ms > (total_ms * 2.0 / 3.0);
+}
+
 void *
 CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
   return queue->AllocateCommandData(size, alignment);
@@ -49,7 +59,7 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   statistics.encode_flush_interval += flush_elapsed;
 
   auto total_ms = DiagMillis(total_elapsed);
-  if (DiagCommandQueueEnabled() || total_ms > 8.0) {
+  if (DiagCommandQueueEnabled() || DiagSlowChunk(total_ms)) {
     INFO("DXMT: CommandChunk encode frame=", frame_, " chunk=", chunk_id,
          " totalMs=", total_ms,
          " executeMs=", DiagMillis(execute_elapsed),
@@ -165,11 +175,17 @@ CommandQueue::PresentBoundary() {
   auto frame = frame_count;
   auto &completed = statistics.at(frame);
   auto frame_command_cpu = completed.commit_interval + completed.encode_prepare_interval + completed.encode_flush_interval;
+  auto frame_total = frame_command_cpu + completed.sync_interval +
+                     completed.drawable_blocking_interval +
+                     completed.present_latency_interval;
   auto frame_command_cpu_ms = DiagMillis(frame_command_cpu);
+  auto frame_total_ms = DiagMillis(frame_total);
 
-  if (DiagCommandQueueEnabled() || frame_command_cpu_ms > 12.0) {
+  if (DiagCommandQueueEnabled() || frame_total_ms > 250.0 ||
+      DiagCommandCpuBottleneck(frame_command_cpu_ms, frame_total_ms)) {
     INFO("DXMT: Frame command stats frame=", frame,
          " commandBuffers=", completed.command_buffer_count,
+         " totalMs=", frame_total_ms,
          " commandCpuMs=", frame_command_cpu_ms,
          " commitWaitMs=", DiagMillis(completed.commit_interval),
          " executeMs=", DiagMillis(completed.encode_prepare_interval),
@@ -262,7 +278,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
   auto commit_t1 = clock::now();
 
   auto total_ms = DiagMillis(commit_t1 - commit_t0);
-  if (DiagCommandQueueEnabled() || total_ms > 8.0) {
+  if (DiagCommandQueueEnabled() || DiagSlowChunk(total_ms)) {
     INFO("DXMT: CommitChunkInternal frame=", chunk.frame_, " chunk=", chunk.chunk_id,
          " seq=", seq,
          " totalMs=", total_ms,
