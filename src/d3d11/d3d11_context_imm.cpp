@@ -389,8 +389,7 @@ public:
     switch (desc.Query) {
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
     case D3D11_QUERY_EVENT: {
-    if (!pending_buffer_updates_.empty() || !pending_cb_shadow_writebacks_.empty() ||
-        ctx_state.has_dirty_op_since_last_event) {
+    if (!pending_buffer_updates_.empty() || ctx_state.has_dirty_op_since_last_event) {
         FlushAllPendingBufferUpdates();
         auto event_id = cmd_queue.GetNextEventSeqId();
         static_cast<MTLD3D11EventQuery *>(pAsync)->Issue(event_id);
@@ -538,8 +537,7 @@ public:
   Flush1(D3D11_CONTEXT_TYPE Type, HANDLE hEvent) override {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
-    if (!pending_buffer_updates_.empty() || !pending_cb_shadow_writebacks_.empty() ||
-        ctx_state.has_dirty_op_since_last_event || promote_flush) {
+    if (!pending_buffer_updates_.empty() || ctx_state.has_dirty_op_since_last_event || promote_flush) {
       FlushAllPendingBufferUpdates();
       InvalidateCurrentPass(true);
       Commit();

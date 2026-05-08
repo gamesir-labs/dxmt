@@ -35,7 +35,6 @@ struct CONSTANT_BUFFER_B {
   Com<D3D11ResourceCommon, false> Buffer;
   UINT FirstConstant;
   UINT NumConstants;
-  UINT64 ShadowVersion = 0;
 };
 
 typedef BindingSet<CONSTANT_BUFFER_B, 14> ConstantBufferBindingSet;
