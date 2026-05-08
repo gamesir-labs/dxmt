@@ -103,6 +103,38 @@ __CRT_UUID_DECL(ID3D12DeviceConfiguration1, 0xed342442, 0x6343, 0x4e16,
                 0xbb, 0x82, 0xa3, 0xa5, 0x77, 0x87, 0x4e, 0x56)
 #endif
 
+#ifndef __ID3D12DeviceRemovedExtendedDataSettings_INTERFACE_DEFINED__
+typedef enum D3D12_DRED_ENABLEMENT {
+  D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED = 0,
+  D3D12_DRED_ENABLEMENT_FORCED_OFF = 1,
+  D3D12_DRED_ENABLEMENT_FORCED_ON = 2,
+} D3D12_DRED_ENABLEMENT;
+
+MIDL_INTERFACE("82bc481c-6b9b-4030-aedb-7ee3d1df1e63")
+ID3D12DeviceRemovedExtendedDataSettings : public IUnknown {
+  virtual void STDMETHODCALLTYPE
+  SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT enablement) = 0;
+  virtual void STDMETHODCALLTYPE
+  SetPageFaultEnablement(D3D12_DRED_ENABLEMENT enablement) = 0;
+  virtual void STDMETHODCALLTYPE
+  SetWatsonDumpEnablement(D3D12_DRED_ENABLEMENT enablement) = 0;
+};
+__CRT_UUID_DECL(ID3D12DeviceRemovedExtendedDataSettings, 0x82bc481c, 0x6b9b,
+                0x4030, 0xae, 0xdb, 0x7e, 0xe3, 0xd1, 0xdf, 0x1e, 0x63)
+#endif
+
+#ifndef __ID3D12DeviceRemovedExtendedDataSettings1_INTERFACE_DEFINED__
+MIDL_INTERFACE("dbd5ae51-3317-4f0a-adf9-1d7cedcaae0b")
+ID3D12DeviceRemovedExtendedDataSettings1
+    : public ID3D12DeviceRemovedExtendedDataSettings {
+  virtual void STDMETHODCALLTYPE
+  SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT enablement) = 0;
+};
+__CRT_UUID_DECL(ID3D12DeviceRemovedExtendedDataSettings1, 0xdbd5ae51,
+                0x3317, 0x4f0a, 0xad, 0xf9, 0x1d, 0x7c, 0xed, 0xca,
+                0xae, 0x0b)
+#endif
+
 #ifndef D3D_ROOT_SIGNATURE_VERSION_1_2
 #define D3D_ROOT_SIGNATURE_VERSION_1_2 static_cast<D3D_ROOT_SIGNATURE_VERSION>(0x3)
 #endif

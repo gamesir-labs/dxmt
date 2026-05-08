@@ -5,6 +5,7 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include "util_win32_compat.h"
 
 #include <algorithm>
 #include <chrono>

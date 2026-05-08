@@ -7,6 +7,7 @@
 #include "log/log.hpp"
 
 #define THREAD_PRIORITY_TIME_CRITICAL 15
+#define INFINITE 0xffffffffu
 
 inline HANDLE GetCurrentProcess() {
   dxmt::Logger::warn("GetCurrentProcess not implemented.");
@@ -85,6 +86,24 @@ inline BOOL ReleaseSemaphore(HANDLE hSemaphore,
 inline BOOL CloseHandle(HANDLE hObject) {
   dxmt::Logger::warn("CloseHandle not implemented.");
   return FALSE;
+}
+
+inline HANDLE CreateEventW(LPSECURITY_ATTRIBUTES lpEventAttributes,
+                           BOOL                  bManualReset,
+                           BOOL                  bInitialState,
+                           LPCWSTR               lpName) {
+  dxmt::Logger::warn("CreateEventW not implemented.");
+  return nullptr;
+}
+
+inline BOOL SetEvent(HANDLE hEvent) {
+  dxmt::Logger::warn("SetEvent not implemented.");
+  return TRUE;
+}
+
+inline DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
+  dxmt::Logger::warn("WaitForSingleObject not implemented.");
+  return WAIT_OBJECT_0;
 }
 
 inline BOOL DuplicateHandle(HANDLE   hSourceProcessHandle,
