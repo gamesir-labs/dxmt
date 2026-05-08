@@ -1,19 +1,8 @@
 #pragma once
-#include <chrono>
 #include <concepts>
 #include <functional>
 
 namespace dxmt {
-
-using CommandListClock = std::chrono::high_resolution_clock;
-
-struct CommandListExecutionProfile {
-  unsigned command_count = 0;
-  unsigned slow_command_count = 0;
-  unsigned max_command_index = 0;
-  CommandListClock::duration max_command_duration {};
-  const char *max_command_name = nullptr;
-};
 
 template <typename F, typename context>
 concept CommandWithContext = requires(F f, context &ctx) {
@@ -129,29 +118,13 @@ public:
     list.list_end = nullptr;
   }
 
-  CommandListExecutionProfile
-  execute(Context &context, bool profile = false) {
-    CommandListExecutionProfile result;
+  void
+  execute(Context &context) {
     impl::CommandBase<Context> *cur = empty.next;
     while (cur) {
-      if (profile) {
-        auto t0 = CommandListClock::now();
-        cur->invoke(context);
-        auto elapsed = CommandListClock::now() - t0;
-        if (elapsed > result.max_command_duration) {
-          result.max_command_duration = elapsed;
-          result.max_command_index = result.command_count;
-          result.max_command_name = cur->name();
-        }
-        if (std::chrono::duration<double, std::milli>(elapsed).count() > 1.0)
-          result.slow_command_count++;
-      } else {
-        cur->invoke(context);
-      }
-      result.command_count++;
+      cur->invoke(context);
       cur = cur->next;
     }
-    return result;
   };
 };
 

@@ -128,7 +128,7 @@ public:
 class CommandQueue {
 
 private:
-  void CommitChunkInternal(CommandChunk &chunk, uint64_t seq);
+  void CommitChunkInternal(CommandChunk &chunk);
 
   uint32_t EncodingThread();
 
