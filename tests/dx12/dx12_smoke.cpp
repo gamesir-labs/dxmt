@@ -784,6 +784,73 @@ done:
   release_object(&device);
 }
 
+static void test_planar_format_resource_creation(void)
+{
+  static const DXGI_FORMAT formats[] = {
+    DXGI_FORMAT_NV12,
+    DXGI_FORMAT_P010,
+    DXGI_FORMAT_P016,
+  };
+
+  ID3D12Device *device = nullptr;
+  ID3D12Resource *resource = nullptr;
+  D3D12_HEAP_PROPERTIES heap = {};
+  D3D12_RESOURCE_DESC desc = {};
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  ID3D12DescriptorHeap *srv_heap = nullptr;
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heap_desc.NumDescriptors = 2;
+  check_hr(device->CreateDescriptorHeap(&heap_desc, __uuidof(ID3D12DescriptorHeap),
+                                        (void **)&srv_heap));
+
+  for (UINT i = 0; i < ARRAYSIZE(formats); ++i) {
+    desc = texture_desc(16, 16, formats[i], D3D12_RESOURCE_FLAG_NONE);
+    hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                         __uuidof(ID3D12Resource), (void **)&resource);
+    if (SUCCEEDED(hr)) {
+      printf("dx12_planar_resource created format=%u\n", formats[i]);
+      check_true(resource != nullptr);
+
+      if (srv_heap) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = srv_heap->GetCPUDescriptorHandleForHeapStart();
+        UINT descriptor_size =
+            device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        srv.Format = formats[i] == DXGI_FORMAT_NV12 ? DXGI_FORMAT_R8_UNORM
+                                                    : DXGI_FORMAT_R16_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        srv.Texture2D.PlaneSlice = 0;
+        device->CreateShaderResourceView(resource, &srv, handle);
+
+        handle.ptr += descriptor_size;
+        srv.Format = formats[i] == DXGI_FORMAT_NV12 ? DXGI_FORMAT_R8G8_UNORM
+                                                    : DXGI_FORMAT_R16G16_UNORM;
+        srv.Texture2D.PlaneSlice = 1;
+        device->CreateShaderResourceView(resource, &srv, handle);
+      }
+    } else {
+      printf("dx12_planar_resource rejected format=%u hr=%#lx\n",
+             formats[i], (unsigned long)hr);
+      check_hr_eq(hr, E_INVALIDARG);
+    }
+    release_object(&resource);
+  }
+
+done:
+  release_object(&srv_heap);
+  release_object(&resource);
+  release_object(&device);
+}
+
 static void test_resource_allocation_info(void)
 {
   ID3D12Device *device = nullptr;
@@ -1432,6 +1499,7 @@ int main(int argc, char **argv)
   bool run_map_resource = true;
   bool run_footprints = true;
   bool run_planar_formats = true;
+  bool run_planar_resource = true;
   bool run_allocation_info = true;
   bool run_committed_resource = true;
   bool run_command_list = true;
@@ -1453,6 +1521,7 @@ int main(int argc, char **argv)
       puts("map-resource");
       puts("get-copyable-footprints");
       puts("planar-format-traits");
+      puts("planar-format-resource-creation");
       puts("resource-allocation-info");
       puts("create-committed-resource");
       puts("command-list-basics");
@@ -1475,6 +1544,7 @@ int main(int argc, char **argv)
       run_map_resource = strstr("map-resource", filter) != nullptr;
       run_footprints = strstr("get-copyable-footprints", filter) != nullptr;
       run_planar_formats = strstr("planar-format-traits", filter) != nullptr;
+      run_planar_resource = strstr("planar-format-resource-creation", filter) != nullptr;
       run_allocation_info = strstr("resource-allocation-info", filter) != nullptr;
       run_committed_resource = strstr("create-committed-resource", filter) != nullptr;
       run_command_list = strstr("command-list-basics", filter) != nullptr;
@@ -1507,6 +1577,8 @@ int main(int argc, char **argv)
     test_get_copyable_footprints();
   if (run_planar_formats)
     test_planar_format_traits();
+  if (run_planar_resource)
+    test_planar_format_resource_creation();
   if (run_allocation_info)
     test_resource_allocation_info();
   if (run_committed_resource)
