@@ -686,6 +686,104 @@ done:
   release_object(&device);
 }
 
+static void test_planar_format_traits(void)
+{
+  struct planar_case {
+    DXGI_FORMAT format;
+    DXGI_FORMAT plane_format[2];
+    UINT plane_width[2];
+    UINT plane_height[2];
+    UINT64 row_size[2];
+  };
+  static const planar_case cases[] = {
+    { DXGI_FORMAT_NV12, { DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8G8_TYPELESS },
+      { 8, 4 }, { 6, 3 }, { 8, 8 } },
+    { DXGI_FORMAT_P010, { DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16G16_TYPELESS },
+      { 8, 4 }, { 6, 3 }, { 16, 16 } },
+    { DXGI_FORMAT_P016, { DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16G16_TYPELESS },
+      { 8, 4 }, { 6, 3 }, { 16, 16 } },
+  };
+
+  ID3D12Device *device = nullptr;
+  D3D12_FEATURE_DATA_FORMAT_INFO format_info = {};
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {};
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[2] = {};
+  D3D12_RESOURCE_ALLOCATION_INFO allocation_info = {};
+  D3D12_RESOURCE_DESC desc = {};
+  UINT row_counts[2] = {};
+  UINT64 row_sizes[2] = {};
+  UINT64 total_size = 0;
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  for (size_t i = 0; i < ARRAYSIZE(cases); ++i) {
+    const planar_case &c = cases[i];
+
+    format_info = {};
+    format_info.Format = c.format;
+    hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &format_info,
+                                     sizeof(format_info));
+    check_hr(hr);
+    check_true(format_info.PlaneCount == 2);
+
+    format_support = {};
+    format_support.Format = c.format;
+    hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                     &format_support, sizeof(format_support));
+    check_hr(hr);
+    check_true(format_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+    check_true(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
+    check_true(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
+    check_true(!(format_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE3D));
+    check_true(format_support.Support2 == D3D12_FORMAT_SUPPORT2_NONE);
+
+    memset(layouts, 0, sizeof(layouts));
+    memset(row_counts, 0, sizeof(row_counts));
+    memset(row_sizes, 0, sizeof(row_sizes));
+    total_size = 0;
+    desc = texture_desc(8, 6, c.format, D3D12_RESOURCE_FLAG_NONE);
+    device->GetCopyableFootprints(&desc, 0, 2, 0, layouts, row_counts,
+                                  row_sizes, &total_size);
+    for (UINT plane = 0; plane < 2; ++plane) {
+      check_true(layouts[plane].Footprint.Format == c.plane_format[plane]);
+      check_true(layouts[plane].Footprint.Width == c.plane_width[plane]);
+      check_true(layouts[plane].Footprint.Height == c.plane_height[plane]);
+      check_true(layouts[plane].Footprint.Depth == 1);
+      check_true(layouts[plane].Footprint.RowPitch ==
+                 2 * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+      check_true(row_counts[plane] == c.plane_height[plane]);
+      check_true(row_sizes[plane] == c.row_size[plane]);
+    }
+    check_true(layouts[1].Offset >= D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    check_true((layouts[1].Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) == 0);
+    check_true(total_size > layouts[1].Offset);
+
+    allocation_info = device->GetResourceAllocationInfo(0, 1, &desc);
+    check_true(allocation_info.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    check_true(allocation_info.SizeInBytes >= total_size);
+    check_true((allocation_info.SizeInBytes % allocation_info.Alignment) == 0);
+  }
+
+  format_info = {};
+  format_info.Format = DXGI_FORMAT_R1_UNORM;
+  check_hr_eq(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,
+                                          &format_info, sizeof(format_info)),
+              E_INVALIDARG);
+
+  format_support = {};
+  format_support.Format = DXGI_FORMAT_R1_UNORM;
+  hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                   &format_support, sizeof(format_support));
+  check_hr(hr);
+  check_true(format_support.Support1 == D3D12_FORMAT_SUPPORT1_NONE);
+  check_true(format_support.Support2 == D3D12_FORMAT_SUPPORT2_NONE);
+
+done:
+  release_object(&device);
+}
+
 static void test_resource_allocation_info(void)
 {
   ID3D12Device *device = nullptr;
@@ -1333,6 +1431,7 @@ int main(int argc, char **argv)
   bool run_create_heap = true;
   bool run_map_resource = true;
   bool run_footprints = true;
+  bool run_planar_formats = true;
   bool run_allocation_info = true;
   bool run_committed_resource = true;
   bool run_command_list = true;
@@ -1353,6 +1452,7 @@ int main(int argc, char **argv)
       puts("create-heap");
       puts("map-resource");
       puts("get-copyable-footprints");
+      puts("planar-format-traits");
       puts("resource-allocation-info");
       puts("create-committed-resource");
       puts("command-list-basics");
@@ -1374,6 +1474,7 @@ int main(int argc, char **argv)
       run_create_heap = strstr("create-heap", filter) != nullptr;
       run_map_resource = strstr("map-resource", filter) != nullptr;
       run_footprints = strstr("get-copyable-footprints", filter) != nullptr;
+      run_planar_formats = strstr("planar-format-traits", filter) != nullptr;
       run_allocation_info = strstr("resource-allocation-info", filter) != nullptr;
       run_committed_resource = strstr("create-committed-resource", filter) != nullptr;
       run_command_list = strstr("command-list-basics", filter) != nullptr;
@@ -1404,6 +1505,8 @@ int main(int argc, char **argv)
     test_map_resource();
   if (run_footprints)
     test_get_copyable_footprints();
+  if (run_planar_formats)
+    test_planar_format_traits();
   if (run_allocation_info)
     test_resource_allocation_info();
   if (run_committed_resource)
