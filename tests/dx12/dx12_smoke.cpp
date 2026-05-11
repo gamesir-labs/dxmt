@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 static int g_failures;
 
@@ -191,6 +192,8 @@ static void test_create_device(void)
   check_hr(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
                                      nullptr, __uuidof(ID3D12GraphicsCommandList),
                                      (void **)&list));
+  if (!queue || !allocator || !list)
+    goto done;
   if (list)
     check_hr(list->Close());
 
@@ -784,6 +787,18 @@ done:
   release_object(&device);
 }
 
+static void fill_planar_texture_bytes(std::vector<uint8_t> &data,
+                                      const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts,
+                                      const UINT *row_counts,
+                                      const UINT64 *row_sizes,
+                                      DXGI_FORMAT format);
+
+static void check_planar_texture_readback(const uint8_t *expected,
+                                          const uint8_t *actual,
+                                          const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts,
+                                          const UINT *row_counts,
+                                          const UINT64 *row_sizes);
+
 static void test_planar_format_resource_creation(void)
 {
   static const DXGI_FORMAT formats[] = {
@@ -793,61 +808,208 @@ static void test_planar_format_resource_creation(void)
   };
 
   ID3D12Device *device = nullptr;
-  ID3D12Resource *resource = nullptr;
+  ID3D12CommandQueue *queue = nullptr;
+  ID3D12CommandAllocator *allocator = nullptr;
+  ID3D12GraphicsCommandList *list = nullptr;
+  ID3D12DescriptorHeap *srv_heap = nullptr;
+  D3D12_HEAP_PROPERTIES default_heap = {};
+  D3D12_HEAP_PROPERTIES upload_heap = {};
+  D3D12_HEAP_PROPERTIES readback_heap = {};
   D3D12_HEAP_PROPERTIES heap = {};
   D3D12_RESOURCE_DESC desc = {};
+  D3D12_RESOURCE_DESC copy_desc = {};
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
-  ID3D12DescriptorHeap *srv_heap = nullptr;
+  std::vector<ID3D12Resource *> retained_resources;
   HRESULT hr = create_device(&device);
   check_hr(hr);
   if (FAILED(hr))
     goto done;
 
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  check_hr(create_queue(device, &queue));
+  check_hr(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          __uuidof(ID3D12CommandAllocator),
+                                          (void **)&allocator));
+  check_hr(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
+                                     nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                     (void **)&list));
+
+  default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+  upload_heap = heap_properties(D3D12_HEAP_TYPE_UPLOAD);
+  readback_heap = heap_properties(D3D12_HEAP_TYPE_READBACK);
+  heap = default_heap;
+
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   heap_desc.NumDescriptors = 2;
   check_hr(device->CreateDescriptorHeap(&heap_desc, __uuidof(ID3D12DescriptorHeap),
                                         (void **)&srv_heap));
 
   for (UINT i = 0; i < ARRAYSIZE(formats); ++i) {
-    desc = texture_desc(16, 16, formats[i], D3D12_RESOURCE_FLAG_NONE);
-    hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                         __uuidof(ID3D12Resource), (void **)&resource);
-    if (SUCCEEDED(hr)) {
-      printf("dx12_planar_resource created format=%u\n", formats[i]);
-      check_true(resource != nullptr);
+    ID3D12Resource *upload = nullptr;
+    ID3D12Resource *readback = nullptr;
+    ID3D12Resource *src_texture = nullptr;
+    ID3D12Resource *dst_texture = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[2] = {};
+    UINT row_counts[2] = {};
+    UINT64 row_sizes[2] = {};
+    UINT64 total_size = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst_location = {};
+    D3D12_TEXTURE_COPY_LOCATION src_location = {};
+    D3D12_RESOURCE_BARRIER barrier = {};
+    D3D12_RANGE read_range = {};
+    D3D12_RANGE write_range = {0, 0};
+    ID3D12CommandList *lists[] = { nullptr };
+    std::vector<uint8_t> expected;
+    uint8_t *mapped = nullptr;
 
-      if (srv_heap) {
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        D3D12_CPU_DESCRIPTOR_HANDLE handle = srv_heap->GetCPUDescriptorHandleForHeapStart();
-        UINT descriptor_size =
-            device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        srv.Format = formats[i] == DXGI_FORMAT_NV12 ? DXGI_FORMAT_R8_UNORM
-                                                    : DXGI_FORMAT_R16_UNORM;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        srv.Texture2D.PlaneSlice = 0;
-        device->CreateShaderResourceView(resource, &srv, handle);
+    desc = texture_desc(8, 6, formats[i], D3D12_RESOURCE_FLAG_NONE);
+    device->GetCopyableFootprints(&desc, 0, 2, 0, layouts, row_counts,
+                                  row_sizes, &total_size);
+    expected.assign(static_cast<size_t>(total_size), 0);
+    fill_planar_texture_bytes(expected, layouts, row_counts, row_sizes,
+                              formats[i]);
 
-        handle.ptr += descriptor_size;
-        srv.Format = formats[i] == DXGI_FORMAT_NV12 ? DXGI_FORMAT_R8G8_UNORM
-                                                    : DXGI_FORMAT_R16G16_UNORM;
-        srv.Texture2D.PlaneSlice = 1;
-        device->CreateShaderResourceView(resource, &srv, handle);
-      }
+    copy_desc = ::buffer_desc(total_size);
+    check_hr(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE,
+                                             &copy_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                             nullptr, __uuidof(ID3D12Resource),
+                                             (void **)&upload));
+    check_hr(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE,
+                                             &copy_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, __uuidof(ID3D12Resource),
+                                             (void **)&readback));
+    check_hr(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, __uuidof(ID3D12Resource),
+                                             (void **)&src_texture));
+    check_hr(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, __uuidof(ID3D12Resource),
+                                             (void **)&dst_texture));
+    if (!upload || !readback || !src_texture || !dst_texture || !list)
+      goto cleanup_iter;
+
+    check_hr(upload->Map(0, nullptr, (void **)&mapped));
+    if (mapped) {
+      memcpy(mapped, expected.data(), static_cast<size_t>(total_size));
+      upload->Unmap(0, &write_range);
     } else {
-      printf("dx12_planar_resource rejected format=%u hr=%#lx\n",
-             formats[i], (unsigned long)hr);
-      check_hr_eq(hr, E_INVALIDARG);
+      goto cleanup_iter;
     }
-    release_object(&resource);
+
+    if (srv_heap) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+      D3D12_CPU_DESCRIPTOR_HANDLE handle = srv_heap->GetCPUDescriptorHandleForHeapStart();
+      UINT descriptor_size =
+          device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels = 1;
+      srv.Texture2D.PlaneSlice = 0;
+      srv.Format = formats[i] == DXGI_FORMAT_NV12 ? DXGI_FORMAT_R8_UNORM
+                                                  : DXGI_FORMAT_R16_UNORM;
+      device->CreateShaderResourceView(src_texture, &srv, handle);
+      handle.ptr += descriptor_size;
+      srv.Texture2D.PlaneSlice = 1;
+      srv.Format = formats[i] == DXGI_FORMAT_NV12 ? DXGI_FORMAT_R8G8_UNORM
+                                                  : DXGI_FORMAT_R16G16_UNORM;
+      device->CreateShaderResourceView(src_texture, &srv, handle);
+    }
+
+    for (UINT plane = 0; plane < 2; ++plane) {
+      src_location = {};
+      src_location.pResource = upload;
+      src_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src_location.PlacedFootprint = layouts[plane];
+      dst_location = {};
+      dst_location.pResource = src_texture;
+      dst_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst_location.SubresourceIndex = plane;
+      list->CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, nullptr);
+    }
+
+    barrier = transition(src_texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &barrier);
+
+    for (UINT plane = 0; plane < 2; ++plane) {
+      src_location = {};
+      src_location.pResource = src_texture;
+      src_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      src_location.SubresourceIndex = plane;
+      dst_location = {};
+      dst_location.pResource = dst_texture;
+      dst_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst_location.SubresourceIndex = plane;
+      list->CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, nullptr);
+    }
+
+    barrier = transition(dst_texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &barrier);
+
+    for (UINT plane = 0; plane < 2; ++plane) {
+      src_location = {};
+      src_location.pResource = dst_texture;
+      src_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      src_location.SubresourceIndex = plane;
+      dst_location = {};
+      dst_location.pResource = readback;
+      dst_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      dst_location.PlacedFootprint = layouts[plane];
+      list->CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, nullptr);
+    }
+
+    hr = list->Close();
+    check_hr(hr);
+    if (FAILED(hr))
+      goto cleanup_iter;
+    lists[0] = list;
+    queue->ExecuteCommandLists(1, lists);
+    check_hr(wait_queue_idle(device, queue));
+
+    read_range.Begin = 0;
+    read_range.End = total_size;
+    check_hr(readback->Map(0, &read_range, (void **)&mapped));
+    if (mapped) {
+      printf("dx12_planar_resource copied format=%u total=%llu\n",
+             formats[i], (unsigned long long)total_size);
+      check_planar_texture_readback(expected.data(), mapped, layouts,
+                                    row_counts, row_sizes);
+      readback->Unmap(0, &write_range);
+    } else {
+      goto cleanup_iter;
+    }
+
+  cleanup_iter:
+    if (readback) {
+      retained_resources.push_back(readback);
+      readback = nullptr;
+    }
+    if (dst_texture) {
+      retained_resources.push_back(dst_texture);
+      dst_texture = nullptr;
+    }
+    if (src_texture) {
+      retained_resources.push_back(src_texture);
+      src_texture = nullptr;
+    }
+    if (upload) {
+      retained_resources.push_back(upload);
+      upload = nullptr;
+    }
+    if (allocator)
+      check_hr(allocator->Reset());
+    if (list && allocator)
+      check_hr(list->Reset(allocator, nullptr));
   }
 
 done:
+  for (auto *resource : retained_resources)
+    resource->Release();
   release_object(&srv_heap);
-  release_object(&resource);
+  release_object(&list);
+  release_object(&allocator);
+  release_object(&queue);
   release_object(&device);
 }
 
@@ -1171,6 +1333,61 @@ static void fill_upload_texture(ID3D12Resource *upload, const uint32_t *pixels,
     memcpy(mapped + y * 256, pixels + y * width, width * sizeof(*pixels));
 
   upload->Unmap(0, nullptr);
+}
+
+static void fill_planar_texture_bytes(std::vector<uint8_t> &data,
+                                      const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts,
+                                      const UINT *row_counts,
+                                      const UINT64 *row_sizes,
+                                      DXGI_FORMAT format)
+{
+  for (UINT plane = 0; plane < 2; ++plane) {
+    uint8_t *base = data.data() + layouts[plane].Offset;
+    const UINT row_pitch = layouts[plane].Footprint.RowPitch;
+    const UINT row_count = row_counts[plane];
+    const UINT64 row_size = row_sizes[plane];
+    if (format == DXGI_FORMAT_NV12) {
+      for (UINT row = 0; row < row_count; ++row) {
+        for (UINT64 col = 0; col < row_size; ++col) {
+          base[row * row_pitch + col] = static_cast<uint8_t>(
+              plane == 0 ? (0x10u + row * 7u + col)
+                         : (0x80u + row * 5u + col * 3u));
+        }
+      }
+    } else {
+      const UINT word_count = static_cast<UINT>(row_size / sizeof(uint16_t));
+      for (UINT row = 0; row < row_count; ++row) {
+        auto *dst_row = reinterpret_cast<uint16_t *>(base + row * row_pitch);
+        for (UINT word = 0; word < word_count; ++word) {
+          dst_row[word] = static_cast<uint16_t>(
+              plane == 0 ? (0x0100u + row * 16u + word)
+                         : (0x0200u + row * 16u + word));
+        }
+      }
+    }
+  }
+}
+
+static void check_planar_texture_readback(const uint8_t *expected,
+                                          const uint8_t *actual,
+                                          const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts,
+                                          const UINT *row_counts,
+                                          const UINT64 *row_sizes)
+{
+  for (UINT plane = 0; plane < 2; ++plane) {
+    const uint8_t *expected_plane = expected + layouts[plane].Offset;
+    const uint8_t *actual_plane = actual + layouts[plane].Offset;
+    const UINT row_pitch = layouts[plane].Footprint.RowPitch;
+    const UINT row_count = row_counts[plane];
+    const UINT64 row_size = row_sizes[plane];
+    for (UINT row = 0; row < row_count; ++row) {
+      printf("dx12_planar_copy plane=%u row=%u row_size=%llu\n",
+             plane, row, (unsigned long long)row_size);
+      check_true(!memcmp(actual_plane + row * row_pitch,
+                         expected_plane + row * row_pitch,
+                         (size_t)row_size));
+    }
+  }
 }
 
 static void test_copy_texture_region(void)
