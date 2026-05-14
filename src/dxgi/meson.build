@@ -22,6 +22,10 @@ dxgi_dll = shared_library('dxgi', dxgi_src, dxgi_res,
   link_depends        : [ dxgi_link_depends ],
 )
 
+dxgi_headers_dep = declare_dependency(
+  include_directories : [ dxmt_include_path, include_directories('.') ],
+)
+
 dxgi_dep = declare_dependency(
   link_with           : [ dxgi_dll ],
   include_directories : [ dxmt_include_path, include_directories('.') ],
