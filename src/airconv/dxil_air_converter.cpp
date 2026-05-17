@@ -323,6 +323,17 @@ ToResourceType(uint32_t resource_kind, uint32_t dimension) {
 }
 
 bool
+IsMultisampledResourceType(shader::common::ResourceType type) {
+  switch (type) {
+  case shader::common::ResourceType::Texture2DMultisampled:
+  case shader::common::ResourceType::Texture2DMultisampledArray:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool
 IsSystemSemantic(const dxil::DxilTranslationSignatureElementInfo &sig,
                  std::string_view name) {
   return Lower(sig.semantic_key) == Lower(name) ||
@@ -1471,11 +1482,16 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     if (!texture_handle || !resource)
       return UnsupportedDxilCall(call, "texture load without resolved texture handle", ctx);
     auto texture = BuildTexture(*resource, air::MemoryAccess::read);
+    auto resource_type = ToResourceType(resource->resource_kind, resource->dimension);
     auto *coord = TextureCoord(*resource, call, 3, false, ctx);
     auto *array_index = TextureArrayIndex(*resource, call, 3, false, ctx);
+    auto *mip_or_sample = ComponentFromOperand(call, 2, ctx);
+    const bool is_multisampled = IsMultisampledResourceType(resource_type);
+    auto *sample_index = is_multisampled ? mip_or_sample : nullptr;
+    auto *mip_level = is_multisampled ? nullptr : mip_or_sample;
     auto [value, residency] =
-        ctx.air.CreateRead(texture, texture_handle, coord, array_index, nullptr,
-                           OperandValue(call, 2, ctx));
+        ctx.air.CreateRead(texture, texture_handle, coord, array_index,
+                           sample_index, mip_level);
     ctx.values[&call] = PackDxilReturn(call, value, ctx, residency);
     return Error::success();
   }
