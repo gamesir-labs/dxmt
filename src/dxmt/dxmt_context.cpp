@@ -1745,6 +1745,11 @@ ArgumentEncodingContext::resolveTexture(
 
 void
 ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata) {
+  present(texture, texture->fullView, presenter, after, metadata);
+}
+
+void
+ArgumentEncodingContext::present(Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata) {
   assert(!encoder_current);
   auto encoder_info = allocate<PresentData>();
   encoder_info->type = EncoderType::Present;
@@ -1756,7 +1761,8 @@ ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter,
   encoder_info->metadata = metadata;
 
   encoder_current = encoder_info;
-  encoder_info->backbuffer = access(texture, texture->fullView, ResourceAccess::Read).texture;
+  TextureViewKey present_view = uint64_t(view) ? view : texture->fullView;
+  encoder_info->backbuffer = access(texture, present_view, ResourceAccess::Read).texture;
   endPass();
 }
 

@@ -650,6 +650,7 @@ public:
   };
 
   void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata);
+  void present(Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata);
 
   void upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);
 

@@ -716,6 +716,14 @@ public:
                : nullptr;
   }
 
+  void SetPresentSourceView(dxmt::TextureViewKey view) override {
+    present_source_view_ = view;
+  }
+
+  dxmt::TextureViewKey GetPresentSourceView() const override {
+    return present_source_view_;
+  }
+
   ID3D12Resource *GetD3D12Resource() override {
     return static_cast<ID3D12Resource *>(this);
   }
@@ -1214,6 +1222,7 @@ private:
   Rc<dxmt::TextureAllocation> texture_allocation_;
   std::array<Rc<dxmt::Texture>, kMaxTexturePlanes> plane_textures_{};
   std::array<Rc<dxmt::TextureAllocation>, kMaxTexturePlanes> plane_allocations_{};
+  dxmt::TextureViewKey present_source_view_ = {};
   std::string name_;
 };
 

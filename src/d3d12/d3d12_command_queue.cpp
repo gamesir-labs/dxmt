@@ -779,8 +779,13 @@ static WMTPixelFormat
 ResolveDepthStencilViewFormat(WMT::Device device, Resource &resource,
                               DXGI_FORMAT format);
 
+static WMTPixelFormat
+ResolveRenderTargetTextureViewFormat(WMT::Device device, Resource &resource,
+                                     DXGI_FORMAT format);
+
 static TextureViewKey
-CreateRenderTargetView(Resource &resource, const DescriptorRecord &descriptor) {
+CreateRenderTargetView(WMT::Device device, Resource &resource,
+                       const DescriptorRecord &descriptor) {
   auto *texture = resource.GetTexture();
   if (!texture)
     return {};
@@ -796,6 +801,11 @@ CreateRenderTargetView(Resource &resource, const DescriptorRecord &descriptor) {
 
   if (descriptor.has_desc) {
     const auto &rtv = descriptor.desc.rtv;
+    view.format = ResolveRenderTargetTextureViewFormat(device, resource,
+                                                       rtv.Format);
+    if (view.format == WMTPixelFormatInvalid)
+      return {};
+
     switch (rtv.ViewDimension) {
     case D3D12_RTV_DIMENSION_TEXTURE2D:
       view.firstMiplevel = rtv.Texture2D.MipSlice;
@@ -887,6 +897,32 @@ GetRenderTargetArrayLength(const DescriptorRecord &descriptor) {
   default:
     return 1;
   }
+}
+
+static bool
+IsPresentableRenderTargetView(Resource &resource, TextureViewKey view) {
+  auto *texture = resource.GetTexture();
+  if (!texture || !uint64_t(view))
+    return false;
+
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1)
+    return false;
+
+  if (texture->textureType(view) != WMTTextureType2D)
+    return false;
+
+  return view.mip_start == 0 && view.mip_end == 1 &&
+         view.array_start == 0 && view.array_end == 1 &&
+         texture->width(view) == texture->width() &&
+         texture->height(view) == texture->height();
+}
+
+static void
+TrackPresentSourceRenderTargetView(Resource &resource, TextureViewKey view) {
+  if (IsPresentableRenderTargetView(resource, view))
+    resource.SetPresentSourceView(view);
 }
 
 static void
@@ -1068,6 +1104,22 @@ ResolveTextureViewFormat(WMT::Device device, Resource &resource,
     return WMTPixelFormatInvalid;
   }
   return format_desc.PixelFormat;
+}
+
+static WMTPixelFormat
+ResolveRenderTargetTextureViewFormat(WMT::Device device, Resource &resource,
+                                     DXGI_FORMAT format) {
+  auto resolved = ResolveTextureViewFormat(device, resource, format, 0);
+  if (resolved == WMTPixelFormatInvalid)
+    return resolved;
+
+  if (DepthStencilPlanarFlags(resolved)) {
+    WARN("D3D12CommandQueue: unsupported RTV texture view format ",
+         uint32_t(format));
+    return WMTPixelFormatInvalid;
+  }
+
+  return resolved;
 }
 
 static WMTPixelFormat
@@ -2073,12 +2125,14 @@ private:
       }
       chunk->emitcc([
         backbuffer = Rc<Texture>(resource->GetTexture()),
+        present_view = resource->GetPresentSourceView(),
         presenter = presenter_,
         present_signal,
         vsync_duration,
         state = std::move(state)
       ](ArgumentEncodingContext &ctx) mutable {
-        ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+        ctx.present(backbuffer, present_view, presenter, vsync_duration,
+                    state.metadata);
         if (present_signal) {
           ReleaseSemaphore(present_signal, 1, nullptr);
           CloseHandle(present_signal);
@@ -4267,6 +4321,7 @@ private:
         WARN("D3D12CommandQueue: texture UAV cannot use BUFFER view dimension");
         return;
       }
+      resource->SetPresentSourceView({});
       const auto view =
           CreateUnorderedAccessTextureView(device_->GetMTLDevice(), *resource,
                                            descriptor);
@@ -4876,7 +4931,9 @@ private:
       if (!resource || !resource->GetTexture())
         continue;
 
-      auto view = CreateRenderTargetView(*resource, descriptor);
+      auto view = CreateRenderTargetView(device_->GetMTLDevice(), *resource,
+                                         descriptor);
+      TrackPresentSourceRenderTargetView(*resource, view);
       auto *texture = resource->GetTexture();
       attachments.colors.push_back({
           .texture = texture,
@@ -5962,6 +6019,7 @@ private:
     auto *src = GetResource(record.src.ptr());
     if (!dst || !src || !dst->GetTexture() || !src->GetTexture())
       return;
+    dst->SetPresentSourceView({});
 
     const auto &dst_desc = dst->GetResourceDesc();
     const auto &src_desc = src->GetResourceDesc();
@@ -6067,6 +6125,7 @@ private:
 
     if (dst->GetTextureAllocation() && src->GetTextureAllocation() &&
         dst->GetTexture() && src->GetTexture()) {
+      dst->SetPresentSourceView({});
       const auto size =
           GetSubresourceSize(*src, src_subresource,
                              record.src_box ? &*record.src_box : nullptr);
@@ -6188,6 +6247,8 @@ private:
 
     auto &buffer_resource = dst_is_buffer ? dst : src;
     auto &texture_resource = dst_is_buffer ? src : dst;
+    if (!dst_is_buffer)
+      texture_resource.SetPresentSourceView({});
     Rc<Buffer> buffer = buffer_resource.GetBuffer();
     if (!buffer)
       return;
@@ -6406,7 +6467,9 @@ private:
       return;
 
     Rc<Texture> texture = resource->GetTexture();
-    auto view = CreateRenderTargetView(*resource, record.descriptor);
+    auto view = CreateRenderTargetView(device_->GetMTLDevice(), *resource,
+                                       record.descriptor);
+    TrackPresentSourceRenderTargetView(*resource, view);
     const UINT array_length = GetRenderTargetArrayLength(record.descriptor);
     WMTClearColor color = {record.color[0], record.color[1], record.color[2],
                            record.color[3]};
