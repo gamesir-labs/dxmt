@@ -155,7 +155,7 @@ jobs:
             -Denable_nvapi=true \
             -Denable_nvngx=true \
             -Dnative_llvm_path=toolchains/llvm-darwin \
-            -Dwine_install_path=toolchains/wine \
+            -Dwine_build_path= -Dwine_install_path=toolchains/wine \
             --buildtype release \
             --prefix "$(pwd)/install" \
             --strip \
@@ -230,7 +230,7 @@ jobs:
       - name: Build x86 Wine Builtin Runtime
         run: |
           meson setup --cross-file build-win32.txt \
-            -Dwine_install_path=toolchains/wine \
+            -Dwine_build_path= -Dwine_install_path=toolchains/wine \
             --buildtype release \
             --prefix "$(pwd)/install" \
             --strip \
