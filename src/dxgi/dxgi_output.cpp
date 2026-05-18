@@ -577,7 +577,7 @@ public:
     InitReturnPtr(ppOutputDuplication);
 
     if (!pDevice)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     ERR("Not implemented");
 
@@ -668,7 +668,7 @@ public:
                    IDXGIOutputDuplication **ppOutputDuplication) override {
     InitReturnPtr(ppOutputDuplication);
     if (!pDevice)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     ERR("Not implemented");
 

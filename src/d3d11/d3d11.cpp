@@ -22,7 +22,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   // Try to find the corresponding Metal device for the DXGI adapter
   if (FAILED(pAdapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
     ERR("Not a DXMT adapter");
-    return E_INVALIDARG;
+    return ERR_E_INVALIDARG(__func__);
   }
 
   // Feature levels to probe if the
@@ -57,7 +57,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   if (!devFeatureLevel) {
     Logger::err(str::format("Minimum required feature level ", minFeatureLevel,
                             " not supported"));
-    return E_INVALIDARG;
+    return ERR_E_INVALIDARG(__func__);
   }
 
   try {
@@ -95,7 +95,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
   HRESULT hr;
 
   if (ppSwapChain && !pSwapChainDesc)
-    return E_INVALIDARG;
+    return ERR_E_INVALIDARG(__func__);
 
   if (!pAdapter) {
     // Ignore DriverType
@@ -120,7 +120,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     if (FAILED(dxgiAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory)))) {
       Logger::err(
           "D3D11CreateDevice: Failed to query DXGI factory from DXGI adapter");
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
     }
 
     // In theory we could ignore these, but the Microsoft docs explicitly
@@ -130,7 +130,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     // See:
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476082(v=vs.85).aspx
     if (DriverType != D3D_DRIVER_TYPE_UNKNOWN || Software)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
   }
   // Create the actual device
   hr = D3D11CoreCreateDevice(dxgiFactory.ptr(), dxgiAdapter.ptr(), Flags,
