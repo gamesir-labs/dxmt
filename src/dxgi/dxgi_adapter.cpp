@@ -69,7 +69,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -90,7 +90,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_ADAPTER_DESC1 *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -113,7 +113,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetDesc2(DXGI_ADAPTER_DESC2 *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -138,7 +138,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetDesc3(DXGI_ADAPTER_DESC3 *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     std::memset(pDesc->Description, 0, sizeof(pDesc->Description));
 
@@ -189,7 +189,7 @@ public:
 
     if (ppOutput == nullptr) {
       fh4bypass::ApplyBadFiberDataBypass();
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
     }
 
     HMONITOR monitor = wsi::enumMonitors(Output);
@@ -241,11 +241,11 @@ public:
       UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
       DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo) override {
     if (NodeIndex > 0 || !pVideoMemoryInfo)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     if (MemorySegmentGroup != DXGI_MEMORY_SEGMENT_GROUP_LOCAL &&
         MemorySegmentGroup != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     // we don't actually care about MemorySegmentGroup
     pVideoMemoryInfo->Budget = device_.recommendedMaxWorkingSetSize();
@@ -260,11 +260,11 @@ public:
       UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
       UINT64 Reservation) override {
     if (NodeIndex > 0)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     if (MemorySegmentGroup != DXGI_MEMORY_SEGMENT_GROUP_LOCAL &&
         MemorySegmentGroup != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
 
     mem_reserved_[uint32_t(MemorySegmentGroup)] = Reservation;
     return S_OK;

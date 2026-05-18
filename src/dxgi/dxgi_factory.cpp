@@ -358,14 +358,14 @@ public:
       auto info = static_cast<BOOL *>(pFeatureSupportData);
 
       if (FeatureSupportDataSize != sizeof(*info))
-        return E_INVALIDARG;
+        return ERR_E_INVALIDARG(__func__);
 
       *info = TRUE;
       return S_OK;
     }
     default: {
       ERR("DXGIFactory::CheckFeatureSupport: unknown feature ", Feature);
-      return E_INVALIDARG;
+      return ERR_E_INVALIDARG(__func__);
     }
     }
   };
