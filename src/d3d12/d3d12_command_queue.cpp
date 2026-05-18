@@ -4639,7 +4639,7 @@ private:
                     if (descriptor_index >= count)
                       continue;
                     const auto *descriptor = GetBoundDescriptorRecordInRange(
-                        state, base, range_offset, descriptor_index, 1,
+                        state, base, range_offset, descriptor_index, count,
                         DescriptorHeapTypeForRange(range.range_type));
                     if (!descriptor)
                       continue;
