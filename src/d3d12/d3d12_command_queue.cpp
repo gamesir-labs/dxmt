@@ -734,6 +734,18 @@ ResourceAccessForState(D3D12_RESOURCE_STATES state) {
 }
 
 static bool
+IsReadOnlyResourceState(D3D12_RESOURCE_STATES state) {
+  return StateHasReadAccess(state) && !StateHasWriteAccess(state);
+}
+
+static bool
+IsImplicitPromotionCompatible(D3D12_RESOURCE_STATES current,
+                              D3D12_RESOURCE_STATES before) {
+  return current == D3D12_RESOURCE_STATE_COMMON &&
+         IsReadOnlyResourceState(before);
+}
+
+static bool
 IsKnownResourceState(D3D12_RESOURCE_STATES state) {
   constexpr uint32_t kKnownStates =
       uint32_t(D3D12_RESOURCE_STATE_COMMON) |
@@ -2780,9 +2792,12 @@ private:
     const UINT count = all_subresources ? subresource_count : 1;
     for (UINT i = 0; i < count; i++) {
       const UINT subresource = first + i;
-      if (states[subresource] != transition.StateBefore) {
+      const auto current_state = states[subresource];
+      if (current_state != transition.StateBefore &&
+          !IsImplicitPromotionCompatible(current_state,
+                                         transition.StateBefore)) {
         WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
-             subresource, " expected=", uint32_t(states[subresource]),
+             subresource, " expected=", uint32_t(current_state),
              " before=", uint32_t(transition.StateBefore));
       }
       states[subresource] = transition.StateAfter;
