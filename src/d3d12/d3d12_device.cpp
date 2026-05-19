@@ -164,6 +164,96 @@ IsBcFormat(WMT::Device device, DXGI_FORMAT format) {
          (format_desc.Flag & MTL_DXGI_FORMAT_BC);
 }
 
+static bool
+GetSmallResource4KTileShape(WMT::Device device,
+                            const D3D12_RESOURCE_DESC &desc,
+                            D3D12_TILE_SHAPE &tile_shape) {
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+      desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return false;
+
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  if (traits.flags & (DXGI_FORMAT_TRAIT_MULTIPLANE |
+                      DXGI_FORMAT_TRAIT_VIDEO |
+                      DXGI_FORMAT_TRAIT_DEPTH_STENCIL))
+    return false;
+
+  MTL_DXGI_FORMAT_DESC format_desc = {};
+  if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format_desc)))
+    return false;
+
+  tile_shape = {};
+  const bool is_bc = format_desc.Flag & MTL_DXGI_FORMAT_BC;
+  const UINT unit_bytes =
+      is_bc ? format_desc.BlockSize : format_desc.BytesPerTexel;
+  const UINT bpu = unit_bytes * 8;
+  if (!bpu || bpu > 128)
+    return false;
+
+  if (is_bc) {
+    if (unit_bytes != 8 && unit_bytes != 16)
+      return false;
+
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+      tile_shape.WidthInTexels = 16 * GetD3D12FormatBlockWidth(format_desc);
+      tile_shape.HeightInTexels = 16 * GetD3D12FormatBlockHeight(format_desc);
+      tile_shape.DepthInTexels = 1;
+      if (unit_bytes == 8)
+        tile_shape.WidthInTexels *= 2;
+    } else {
+      tile_shape.WidthInTexels = 8 * GetD3D12FormatBlockWidth(format_desc);
+      tile_shape.HeightInTexels = 8 * GetD3D12FormatBlockHeight(format_desc);
+      tile_shape.DepthInTexels = unit_bytes == 8 ? 8 : 4;
+    }
+
+    return true;
+  }
+
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+    tile_shape.DepthInTexels = 1;
+    if (bpu <= 8) {
+      tile_shape.WidthInTexels = 64;
+      tile_shape.HeightInTexels = 64;
+    } else if (bpu <= 16) {
+      tile_shape.WidthInTexels = 64;
+      tile_shape.HeightInTexels = 32;
+    } else if (bpu <= 32) {
+      tile_shape.WidthInTexels = 32;
+      tile_shape.HeightInTexels = 32;
+    } else if (bpu <= 64) {
+      tile_shape.WidthInTexels = 32;
+      tile_shape.HeightInTexels = 16;
+    } else {
+      tile_shape.WidthInTexels = 16;
+      tile_shape.HeightInTexels = 16;
+    }
+  } else {
+    if (bpu <= 8) {
+      tile_shape.WidthInTexels = 16;
+      tile_shape.HeightInTexels = 16;
+      tile_shape.DepthInTexels = 16;
+    } else if (bpu <= 16) {
+      tile_shape.WidthInTexels = 16;
+      tile_shape.HeightInTexels = 16;
+      tile_shape.DepthInTexels = 8;
+    } else if (bpu <= 32) {
+      tile_shape.WidthInTexels = 16;
+      tile_shape.HeightInTexels = 8;
+      tile_shape.DepthInTexels = 8;
+    } else if (bpu <= 64) {
+      tile_shape.WidthInTexels = 8;
+      tile_shape.HeightInTexels = 8;
+      tile_shape.DepthInTexels = 8;
+    } else {
+      tile_shape.WidthInTexels = 8;
+      tile_shape.HeightInTexels = 8;
+      tile_shape.DepthInTexels = 4;
+    }
+  }
+
+  return true;
+}
+
 static UINT
 IndirectArgumentByteSize(const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
   switch (argument.Type) {
@@ -2667,23 +2757,46 @@ private:
     }
   }
 
-  bool IsSmallResourceAlignmentEligible(const D3D12_RESOURCE_DESC &desc) const {
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+  bool GetSmallResourceTileCount(const D3D12_RESOURCE_DESC &desc,
+                                 UINT64 *tile_count) const {
+    D3D12_TILE_SHAPE tile_shape = {};
+    if (!GetSmallResource4KTileShape(device_->device(), desc, tile_shape))
       return false;
 
-    auto mip0_desc = desc;
-    mip0_desc.Alignment = 0;
-    mip0_desc.DepthOrArraySize =
-        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-            ? desc.DepthOrArraySize
-            : 1;
-    mip0_desc.MipLevels = 1;
+    if (!tile_shape.WidthInTexels || !tile_shape.HeightInTexels ||
+        !tile_shape.DepthInTexels)
+      return false;
+    if (!desc.Width || !desc.Height || !desc.DepthOrArraySize)
+      return false;
 
-    UINT64 total_bytes = 0;
-    GetCopyableFootprintsImpl(&mip0_desc, 0, 1, 0, nullptr, nullptr, nullptr,
-                              &total_bytes, false);
-    return total_bytes && total_bytes <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    const UINT64 width_tiles =
+        (desc.Width + tile_shape.WidthInTexels - 1) /
+        tile_shape.WidthInTexels;
+    const UINT64 height_tiles =
+        (UINT64(desc.Height) + tile_shape.HeightInTexels - 1) /
+        tile_shape.HeightInTexels;
+    const UINT64 depth_tiles =
+        (UINT64(desc.DepthOrArraySize) + tile_shape.DepthInTexels - 1) /
+        tile_shape.DepthInTexels;
+
+    if (!width_tiles || !height_tiles || !depth_tiles)
+      return false;
+    if (width_tiles > ~UINT64(0) / height_tiles)
+      return false;
+    const UINT64 xy_tiles = width_tiles * height_tiles;
+    if (xy_tiles > ~UINT64(0) / depth_tiles)
+      return false;
+
+    if (tile_count)
+      *tile_count = xy_tiles * depth_tiles;
+    return true;
+  }
+
+  bool IsSmallResourceAlignmentEligible(const D3D12_RESOURCE_DESC &desc) const {
+    UINT64 tile_count = 0;
+    return GetSmallResourceTileCount(desc, &tile_count) &&
+           tile_count <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT /
+                             D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
   }
 
   bool IsValidCommittedResourceDesc(
@@ -2757,10 +2870,19 @@ private:
     const auto allocation_info = GetResourceAllocationInfoImpl(1, 1, desc);
     if (allocation_info.SizeInBytes == 0)
       return "zero-allocation-size";
-    if (heap_offset % allocation_info.Alignment)
+    const UINT64 placement_alignment =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            ? D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT
+            : allocation_info.Alignment;
+    if (heap_offset % placement_alignment)
       return "heap-offset-alignment";
-    if (heap_offset > heap.GetHeapDesc().SizeInBytes ||
-        allocation_info.SizeInBytes > heap.GetHeapDesc().SizeInBytes - heap_offset)
+    const auto &heap_desc = heap.GetHeapDesc();
+    const UINT64 heap_alignment = heap_desc.Alignment
+                                       ? heap_desc.Alignment
+                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    const UINT64 heap_size = Align(heap_desc.SizeInBytes, heap_alignment);
+    if (heap_offset > heap_size ||
+        allocation_info.SizeInBytes > heap_size - heap_offset)
       return "heap-range";
 
     const auto heap_type = heap.GetHeapType();

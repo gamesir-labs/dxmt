@@ -1319,6 +1319,58 @@ static void test_small_aligned_placed_resource(void)
       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
       nullptr, __uuidof(ID3D12Resource), (void **)&resource));
+  release_object(&resource);
+  resource = nullptr;
+
+  desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Width = 66;
+  desc.Height = 148;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  check_hr(device->CreatePlacedResource(
+      heap, 130 * D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, &desc,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+      nullptr, __uuidof(ID3D12Resource), (void **)&resource));
+
+done:
+  release_object(&resource);
+  release_object(&heap);
+  release_object(&device);
+}
+
+static void test_heap_placement_va_probe(void)
+{
+  ID3D12Device *device = nullptr;
+  ID3D12Heap *heap = nullptr;
+  ID3D12Resource *resource = nullptr;
+  D3D12_HEAP_DESC heap_desc = {};
+  D3D12_RESOURCE_DESC desc = {};
+  const UINT64 heap_offset = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT / 2;
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  heap_desc.SizeInBytes = 2 * 1024 * 1024;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS |
+                    D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+  check_hr(device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), (void **)&heap));
+  if (!heap)
+    goto done;
+
+  desc = buffer_desc(256 * 1024);
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  check_hr(device->CreatePlacedResource(
+      heap, heap_offset, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+      __uuidof(ID3D12Resource), (void **)&resource));
 
 done:
   release_object(&resource);
@@ -2077,6 +2129,8 @@ int main(int argc, char **argv)
     test_resource_allocation_info();
   if (run_allocation_info)
     test_small_aligned_placed_resource();
+  if (run_allocation_info)
+    test_heap_placement_va_probe();
   if (run_committed_resource)
     test_create_committed_resource();
   if (run_command_list)
