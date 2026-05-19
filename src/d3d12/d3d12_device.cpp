@@ -2660,12 +2660,30 @@ private:
           (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                          D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
         return false;
-      const auto allocation_info = GetResourceAllocationInfoImpl(1, 1, &desc);
-      return allocation_info.SizeInBytes <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      return IsSmallResourceAlignmentEligible(desc);
     }
     default:
       return false;
     }
+  }
+
+  bool IsSmallResourceAlignmentEligible(const D3D12_RESOURCE_DESC &desc) const {
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+      return false;
+
+    auto mip0_desc = desc;
+    mip0_desc.Alignment = 0;
+    mip0_desc.DepthOrArraySize =
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? desc.DepthOrArraySize
+            : 1;
+    mip0_desc.MipLevels = 1;
+
+    UINT64 total_bytes = 0;
+    GetCopyableFootprintsImpl(&mip0_desc, 0, 1, 0, nullptr, nullptr, nullptr,
+                              &total_bytes, false);
+    return total_bytes && total_bytes <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
   }
 
   bool IsValidCommittedResourceDesc(
