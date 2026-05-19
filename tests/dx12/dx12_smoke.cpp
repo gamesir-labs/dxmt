@@ -1283,6 +1283,49 @@ done:
   release_object(&device);
 }
 
+static void test_small_aligned_placed_resource(void)
+{
+  ID3D12Device *device = nullptr;
+  ID3D12Heap *heap = nullptr;
+  ID3D12Resource *resource = nullptr;
+  D3D12_HEAP_DESC heap_desc = {};
+  D3D12_RESOURCE_DESC desc = {};
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  heap_desc.SizeInBytes = 4 * 1024 * 1024;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES |
+                    D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+  check_hr(device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), (void **)&heap));
+  if (!heap)
+    goto done;
+
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Width = 128;
+  desc.Height = 128;
+  desc.DepthOrArraySize = 6;
+  desc.MipLevels = 8;
+  desc.Format = DXGI_FORMAT_BC1_TYPELESS;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+  check_hr(device->CreatePlacedResource(
+      heap, 152 * D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, &desc,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+      nullptr, __uuidof(ID3D12Resource), (void **)&resource));
+
+done:
+  release_object(&resource);
+  release_object(&heap);
+  release_object(&device);
+}
+
 static void test_create_committed_resource(void)
 {
   ID3D12Device *device = nullptr;
@@ -2032,6 +2075,8 @@ int main(int argc, char **argv)
     test_depth_stencil_planar_resource_creation();
   if (run_allocation_info)
     test_resource_allocation_info();
+  if (run_allocation_info)
+    test_small_aligned_placed_resource();
   if (run_committed_resource)
     test_create_committed_resource();
   if (run_command_list)
