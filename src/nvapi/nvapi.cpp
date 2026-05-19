@@ -301,6 +301,29 @@ NvAPI_EnumLogicalGPUs(NvLogicalGpuHandle nvGPUHandle[NVAPI_MAX_LOGICAL_GPUS], Nv
 }
 
 NVAPI_INTERFACE
+NvAPI_GetLogicalGPUFromPhysicalGPU(
+    NvPhysicalGpuHandle hPhysicalGPU,
+    NvLogicalGpuHandle *pLogicalGPU) {
+  if (!hPhysicalGPU || !pLogicalGPU)
+    return NVAPI_INVALID_ARGUMENT;
+
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  for (unsigned i = 0; i < adapter_count; i++) {
+    auto registry_id = devices.object(i).registryID();
+    if (hPhysicalGPU == reinterpret_cast<NvPhysicalGpuHandle>(registry_id)) {
+      *pLogicalGPU = reinterpret_cast<NvLogicalGpuHandle>(registry_id);
+      return NVAPI_OK;
+    }
+  }
+
+  return NVAPI_INVALID_HANDLE;
+}
+
+NVAPI_INTERFACE
 NvAPI_GetPhysicalGPUsFromDisplay(NvDisplayHandle hNvDisp, NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount) {
   if (!hNvDisp || !nvGPUHandle || !pGpuCount)
     return NVAPI_INVALID_ARGUMENT;
@@ -844,6 +867,8 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_EnumPhysicalGPUs;
   case 0x48b3ea59:
     return (void *)&NvAPI_EnumLogicalGPUs;
+  case 0xadd604d1:
+    return (void *)&NvAPI_GetLogicalGPUFromPhysicalGPU;
   case 0x34ef9506:
     return (void *)&NvAPI_GetPhysicalGPUsFromDisplay;
   case 0x351da224:

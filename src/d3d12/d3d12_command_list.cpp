@@ -126,7 +126,11 @@ IsValidResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
   }
 }
 
-#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+#ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
+using GraphicsCommandListComBase = ID3D12GraphicsCommandList6;
+#elif defined(__ID3D12GraphicsCommandList5_INTERFACE_DEFINED__)
+using GraphicsCommandListComBase = ID3D12GraphicsCommandList5;
+#elif defined(__ID3D12GraphicsCommandList4_INTERFACE_DEFINED__)
 using GraphicsCommandListComBase = ID3D12GraphicsCommandList4;
 #elif defined(__ID3D12GraphicsCommandList2_INTERFACE_DEFINED__)
 using GraphicsCommandListComBase = ID3D12GraphicsCommandList2;
@@ -217,6 +221,21 @@ public:
     }
     if (riid == __uuidof(ID3D12GraphicsCommandList4)) {
       *ppvObject = ref(static_cast<ID3D12GraphicsCommandList4 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList5_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12GraphicsCommandList5)) {
+      *ppvObject = ref(static_cast<ID3D12GraphicsCommandList5 *>(
+          static_cast<GraphicsCommandListComBase *>(this)));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12GraphicsCommandList6)) {
+      *ppvObject = ref(static_cast<ID3D12GraphicsCommandList6 *>(this));
       return S_OK;
     }
 #endif
@@ -962,6 +981,30 @@ public:
 
   void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC *desc) override {
     WARN("D3D12GraphicsCommandList: ray dispatch is unsupported");
+  }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList5_INTERFACE_DEFINED__
+  void STDMETHODCALLTYPE RSSetShadingRate(
+      D3D12_SHADING_RATE base_shading_rate,
+      const D3D12_SHADING_RATE_COMBINER *combiners) override {
+    if (base_shading_rate != D3D12_SHADING_RATE_1X1 || combiners)
+      WARN("D3D12GraphicsCommandList: variable rate shading is unsupported");
+  }
+
+  void STDMETHODCALLTYPE RSSetShadingRateImage(
+      ID3D12Resource *shading_rate_image) override {
+    if (shading_rate_image)
+      WARN("D3D12GraphicsCommandList: shading rate images are unsupported");
+  }
+#endif
+
+#ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
+  void STDMETHODCALLTYPE DispatchMesh(
+      UINT thread_group_count_x,
+      UINT thread_group_count_y,
+      UINT thread_group_count_z) override {
+    WARN("D3D12GraphicsCommandList: mesh shaders are unsupported");
   }
 #endif
 
