@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-BUILD_DIR="${DXMT_BUILD_DIR:-${REPO_ROOT}/build-builtin}"
+BUILD_DIR="${DXMT_BUILD_DIR:-build-gs-builtin2}"
 NATIVE_LLVM_PATH="${DXMT_NATIVE_LLVM_PATH:-/usr/local/opt/llvm@15}"
 GAMEHUB_BUNDLE_ID="${GAMEHUB_BUNDLE_ID:-com.gamemac.test}"
 GAMEHUB_DXMT_PACKAGE="${GAMEHUB_DXMT_PACKAGE:-dxmt-v0.80}"
@@ -53,9 +53,43 @@ setup_tool_path() {
   export PATH
 }
 
+build_dir_source_root() {
+  local ninja_file="${BUILD_DIR}/build.ninja"
+  [[ -f "${ninja_file}" ]] || return 0
+
+  python3 - "${ninja_file}" <<'PY'
+import shlex
+import sys
+
+ninja_file = sys.argv[1]
+with open(ninja_file, "r", encoding="utf-8") as f:
+    for line in f:
+        if "meson --internal regenerate" not in line:
+            continue
+        command = line.split("=", 1)[1].strip() if "=" in line else line.strip()
+        parts = shlex.split(command)
+        try:
+            index = parts.index("regenerate")
+        except ValueError:
+            continue
+        if index + 1 < len(parts):
+            print(parts[index + 1])
+            sys.exit(0)
+sys.exit(0)
+PY
+}
+
 setup_build_dir() {
   if [[ -f "${BUILD_DIR}/build.ninja" ]]; then
-    return
+    local source_root
+    source_root="$(build_dir_source_root)"
+    if [[ -z "${source_root}" || "${source_root}" == "${REPO_ROOT}" ]]; then
+      return
+    fi
+
+    log "removing stale build directory: ${BUILD_DIR}"
+    log "stale source root: ${source_root}"
+    rm -rf "${BUILD_DIR}"
   fi
 
   log "configuring builtin build: ${BUILD_DIR}"

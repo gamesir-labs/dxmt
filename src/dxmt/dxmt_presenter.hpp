@@ -5,6 +5,7 @@
 #include "util_cpu_fence.hpp"
 #include "winemetal.h"
 #include <atomic>
+#include <cstdint>
 
 namespace dxmt {
 
@@ -12,6 +13,8 @@ struct DXMTPresentMetadata {
   float edr_scale;
   float max_content_luminance;
   float max_display_luminance;
+  uint32_t alpha_mode;
+  float background_color[4];
 };
 
 constexpr uint32_t DXMT_GAMMA_CP_COUNT = 1024;
