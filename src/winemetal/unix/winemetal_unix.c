@@ -20,6 +20,35 @@ typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
 
+static void
+dxmt_set_layer_background_black(CAMetalLayer *layer) {
+  CGColorRef black = CGColorGetConstantColor(kCGColorBlack);
+  layer.backgroundColor = black;
+  layer.opaque = YES;
+
+  NSView *view = [layer.delegate isKindOfClass:NSView.class] ? (NSView *)layer.delegate : nil;
+  for (NSView *ancestor = view; ancestor; ancestor = ancestor.superview) {
+    CALayer *ancestor_layer = ancestor.layer;
+    if (ancestor_layer) {
+      ancestor_layer.backgroundColor = black;
+      ancestor_layer.opaque = YES;
+    }
+  }
+
+  NSWindow *window = view.window;
+  if (window) {
+    window.backgroundColor = NSColor.blackColor;
+    window.opaque = YES;
+
+    NSView *content_view = window.contentView;
+    CALayer *content_layer = content_view.layer;
+    if (content_layer) {
+      content_layer.backgroundColor = black;
+      content_layer.opaque = YES;
+    }
+  }
+}
+
 void
 execute_on_main(dispatch_block_t block) {
   if ([NSThread isMainThread]) {
@@ -1600,6 +1629,7 @@ _MetalLayer_setProps(void *obj) {
   execute_on_main(^{
     layer.device = (id<MTLDevice>)props->device;
     layer.opaque = props->opaque;
+    dxmt_set_layer_background_black(layer);
     layer.framebufferOnly = props->framebuffer_only;
     layer.contentsScale = props->contents_scale;
     layer.displaySyncEnabled = props->display_sync_enabled;
@@ -1683,6 +1713,9 @@ _CreateMetalViewFromHWND(void *obj) {
     params->ret_view = (obj_handle_t)view;
     if (view) {
       params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+      execute_on_main(^{
+        dxmt_set_layer_background_black((CAMetalLayer *)params->ret_layer);
+      });
     }
     pfn_release_win_data(win_data);
   }

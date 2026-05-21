@@ -5,7 +5,6 @@
 #include "dxmt_presenter.hpp"
 #include "util_likely.hpp"
 
-
 namespace dxmt {
 
 Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count) :
@@ -131,6 +130,11 @@ Presenter::synchronizeLayerProperties() {
   metadata.edr_scale = 1.0;
   metadata.max_content_luminance = 10000;
   metadata.max_display_luminance = display_edr_value_.maximum_potential_edr_color_component_value * 100;
+  metadata.alpha_mode = 0;
+  metadata.background_color[0] = 0.0f;
+  metadata.background_color[1] = 0.0f;
+  metadata.background_color[2] = 0.0f;
+  metadata.background_color[3] = 1.0f;
 
   if (is_hdr) {
     metadata.edr_scale = display_edr_value_.maximum_edr_color_component_value /
@@ -160,7 +164,8 @@ Presenter::encodeCommands(
 
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);
-  info.colors[0].load_action = WMTLoadActionDontCare;
+  info.colors[0].load_action = WMTLoadActionClear;
+  info.colors[0].clear_color = {0.0, 0.0, 0.0, 1.0};
   info.colors[0].store_action = WMTStoreActionStore;
   info.colors[0].texture = drawable.texture();
   auto encoder = cmdbuf.renderCommandEncoder(info);

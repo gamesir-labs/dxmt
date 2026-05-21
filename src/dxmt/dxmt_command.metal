@@ -348,6 +348,8 @@ struct DXMTPresentMetadata {
   float edr_scale;
   float max_content_luminance;
   float max_display_luminance;
+  uint alpha_mode;
+  float4 background_color;
 };
 
 float3 to_srgb(float3 linear) {
@@ -406,6 +408,21 @@ float3 to_srgb(float3 linear) {
     output_rgb = linear_to_pq(output_rgb);
   else if (present_with_hdr_metadata)
     output_rgb = output_rgb / 80;
+  if (meta.alpha_mode == 0) {
+    output_rgb = output_rgb * output.w + meta.background_color.rgb * (1.0 - output.w);
+    return float4(output_rgb, 1.0);
+  }
+  if (meta.alpha_mode == 1) {
+    output_rgb = output_rgb + meta.background_color.rgb * (1.0 - output.w);
+    return float4(output_rgb, 1.0);
+  }
+  if (meta.alpha_mode == 2) {
+    output_rgb = output_rgb * output.w + meta.background_color.rgb * (1.0 - output.w);
+    return float4(output_rgb, 1.0);
+  }
+  if (meta.alpha_mode == 3) {
+    return float4(output_rgb, 1.0);
+  }
   return float4(output_rgb, output.w);
 }
 
