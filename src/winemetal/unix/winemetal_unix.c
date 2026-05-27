@@ -53,6 +53,7 @@ static pthread_mutex_t dxmt_apitrace_lock = PTHREAD_MUTEX_INITIALIZER;
 static apitrace_metal_session_t *dxmt_apitrace_session = NULL;
 static NSMutableDictionary *dxmt_apitrace_command_buffers = nil;
 static NSMutableDictionary *dxmt_apitrace_encoders = nil;
+static NSMutableDictionary *dxmt_apitrace_functions = nil;
 static __thread uint64_t dxmt_apitrace_current_d3d_sequence = 0;
 
 static bool
@@ -88,6 +89,26 @@ dxmt_apitrace_key(obj_handle_t handle) {
   return [NSNumber numberWithUnsignedLongLong:(unsigned long long)handle];
 }
 
+static NSDictionary *
+dxmt_apitrace_function_state_locked(obj_handle_t handle) {
+  if (!handle || !dxmt_apitrace_functions)
+    return nil;
+  return [dxmt_apitrace_functions objectForKey:dxmt_apitrace_key(handle)];
+}
+
+static void
+dxmt_apitrace_track_function_locked(obj_handle_t function, obj_handle_t library, NSString *name) {
+  if (!function || !library || !name)
+    return;
+  if (!dxmt_apitrace_functions)
+    dxmt_apitrace_functions = [[NSMutableDictionary alloc] init];
+  NSDictionary *state = @{
+    @"library_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)library],
+    @"function_name" : name,
+  };
+  [dxmt_apitrace_functions setObject:state forKey:dxmt_apitrace_key(function)];
+}
+
 static apitrace_metal_session_t *
 dxmt_apitrace_ensure_session_locked(void) {
   if (dxmt_apitrace_session)
@@ -105,6 +126,8 @@ dxmt_apitrace_ensure_session_locked(void) {
     dxmt_apitrace_command_buffers = [[NSMutableDictionary alloc] init];
   if (!dxmt_apitrace_encoders)
     dxmt_apitrace_encoders = [[NSMutableDictionary alloc] init];
+  if (!dxmt_apitrace_functions)
+    dxmt_apitrace_functions = [[NSMutableDictionary alloc] init];
 
   dxmt_apitrace_log("session opened", 0, 0);
   return dxmt_apitrace_session;
@@ -118,6 +141,7 @@ dxmt_apitrace_close_session_locked(void) {
   }
   [dxmt_apitrace_command_buffers removeAllObjects];
   [dxmt_apitrace_encoders removeAllObjects];
+  [dxmt_apitrace_functions removeAllObjects];
   dxmt_apitrace_current_d3d_sequence = 0;
 }
 
@@ -159,26 +183,42 @@ dxmt_apitrace_texture_descriptor_json(const struct WMTTextureInfo *info) {
 static NSString *
 dxmt_apitrace_render_pipeline_json(const struct WMTRenderPipelineInfo *info) {
   NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+  NSDictionary *vertex_state = dxmt_apitrace_function_state_locked(info->vertex_function);
+  NSDictionary *fragment_state = dxmt_apitrace_function_state_locked(info->fragment_function);
   dict[@"rasterization_enabled"] = @(info->rasterization_enabled);
   dict[@"raster_sample_count"] = @(info->raster_sample_count);
   dict[@"depth_pixel_format"] = @(info->depth_pixel_format);
   dict[@"stencil_pixel_format"] = @(info->stencil_pixel_format);
+  dict[@"color_pixel_format"] = @(info->colors[0].pixel_format);
   dict[@"alpha_to_coverage_enabled"] = @(info->alpha_to_coverage_enabled);
   dict[@"logic_operation_enabled"] = @(info->logic_operation_enabled);
   dict[@"logic_operation"] = @(info->logic_operation);
   dict[@"input_primitive_topology"] = @(info->input_primitive_topology);
   dict[@"immutable_vertex_buffers"] = @(info->immutable_vertex_buffers);
   dict[@"immutable_fragment_buffers"] = @(info->immutable_fragment_buffers);
+  if (vertex_state) {
+    dict[@"vertex_library_id"] = vertex_state[@"library_id"];
+    dict[@"vertex_function"] = vertex_state[@"function_name"];
+  }
+  if (fragment_state) {
+    dict[@"fragment_library_id"] = fragment_state[@"library_id"];
+    dict[@"fragment_function"] = fragment_state[@"function_name"];
+  }
   return dxmt_apitrace_json_string(dict);
 }
 
 static NSString *
 dxmt_apitrace_compute_pipeline_json(const struct WMTComputePipelineInfo *info) {
   NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+  NSDictionary *function_state = dxmt_apitrace_function_state_locked(info->compute_function);
   dict[@"immutable_buffers"] = @(info->immutable_buffers);
   dict[@"tgsize_is_multiple_of_sgwidth"] = @(info->tgsize_is_multiple_of_sgwidth);
   dict[@"fail_on_binary_archive_miss"] = @(info->fail_on_binary_archive_miss);
   dict[@"num_binary_archives_for_lookup"] = @(info->num_binary_archives_for_lookup);
+  if (function_state) {
+    dict[@"library_id"] = function_state[@"library_id"];
+    dict[@"function"] = function_state[@"function_name"];
+  }
   return dxmt_apitrace_json_string(dict);
 }
 
@@ -205,6 +245,15 @@ dxmt_apitrace_render_pass_json(const struct WMTRenderPassInfo *info) {
     [colors addObject:color];
   }
   dict[@"colors"] = colors;
+  if ([colors count] > 0) {
+    NSDictionary *first_color = [colors objectAtIndex:0];
+    id texture = first_color[@"texture"];
+    if (texture && texture != [NSNull null])
+      dict[@"color_texture_id"] = texture;
+    dict[@"load_action"] = first_color[@"load_action"];
+    dict[@"store_action"] = first_color[@"store_action"];
+    dict[@"clear_color"] = first_color[@"clear_color"];
+  }
   dict[@"default_raster_sample_count"] = @(info->default_raster_sample_count);
   dict[@"render_target_array_length"] = @(info->render_target_array_length);
   dict[@"tile_width"] = @(info->tile_width);
@@ -959,6 +1008,13 @@ _MTLLibrary_newFunction(void *obj) {
   id<MTLLibrary> library = (id<MTLLibrary>)params->handle;
   NSString *name = [[NSString alloc] initWithCString:(char *)params->arg encoding:NSUTF8StringEncoding];
   params->ret = (obj_handle_t)[library newFunctionWithName:name];
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() && params->ret) {
+    pthread_mutex_lock(&dxmt_apitrace_lock);
+    dxmt_apitrace_track_function_locked(params->ret, params->handle, name);
+    pthread_mutex_unlock(&dxmt_apitrace_lock);
+  }
+#endif
   [name release];
   return STATUS_SUCCESS;
 }
