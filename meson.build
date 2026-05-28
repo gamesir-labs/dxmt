@@ -96,39 +96,59 @@ endif
 dxmt_include_path = include_directories(dxmt_include_dirs)
 dxmt_native_include_path = include_directories(dxmt_native_include_dirs)
 
-apitrace_source_path = get_option('apitrace_source_path')
-if apitrace_source_path != '' and not apitrace_source_path.startswith('/')
-  apitrace_source_path = join_paths(meson.project_source_root(), apitrace_source_path)
+apitrace_feature = get_option('apitrace')
+apitrace_buildtype = get_option('buildtype')
+dxmt_debug_build = apitrace_buildtype == 'debug' or apitrace_buildtype == 'debugoptimized'
+dxmt_apitrace_metal_enabled = apitrace_feature.enabled() or (apitrace_feature.auto() and dxmt_debug_build)
+if apitrace_feature.disabled()
+  dxmt_apitrace_metal_enabled = false
 endif
 
-apitrace_build_path = get_option('apitrace_build_path')
-if apitrace_build_path != '' and not apitrace_build_path.startswith('/')
-  apitrace_build_path = join_paths(meson.project_source_root(), apitrace_build_path)
-endif
-if apitrace_build_path == '' and apitrace_source_path != ''
-  apitrace_build_path = join_paths(apitrace_source_path, 'build/cmake')
-endif
-
-dxmt_apitrace_metal_enabled = apitrace_source_path != ''
+apitrace_source_path = ''
+apitrace_build_path = ''
 apitrace_metal_include_path = []
 apitrace_metal_native_deps = []
 if dxmt_apitrace_metal_enabled
+  apitrace_source_path = get_option('apitrace_source_path')
+  if apitrace_source_path == ''
+    error('apitrace_source_path is required when apitrace integration is enabled')
+  endif
+  if not apitrace_source_path.startswith('/')
+    apitrace_source_path = join_paths(meson.project_source_root(), apitrace_source_path)
+  endif
+
+  apitrace_build_path = get_option('apitrace_build_path')
+  if apitrace_build_path == ''
+    apitrace_build_path = join_paths(meson.project_build_root(), 'subprojects/apitrace')
+  elif not apitrace_build_path.startswith('/')
+    apitrace_build_path = join_paths(meson.project_source_root(), apitrace_build_path)
+  endif
+
   apitrace_metal_header = join_paths(apitrace_source_path, 'src/metal/include/apitrace/metal_capi.h')
   if not fs.is_file(apitrace_metal_header)
     error('apitrace metal header not found: ' + apitrace_metal_header)
   endif
+
+  apitrace_build_stamp = custom_target(
+    'apitrace_metal_build',
+    output: 'apitrace-metal.stamp',
+    command: [
+      find_program('scripts/build-apitrace.sh'),
+      apitrace_source_path,
+      apitrace_build_path,
+      '@OUTPUT@',
+    ],
+    build_by_default: true,
+  )
   apitrace_metal_archive = join_paths(apitrace_build_path, 'libapitrace_core.a')
-  if not fs.is_file(apitrace_metal_archive)
-    error('apitrace core archive not found: ' + apitrace_metal_archive)
-  endif
   apitrace_platform_archive = join_paths(apitrace_build_path, 'libapitrace_platform_apple_metal.a')
-  if not fs.is_file(apitrace_platform_archive)
-    error('apitrace metal platform archive not found: ' + apitrace_platform_archive)
-  endif
-  apitrace_metal_include_path = [include_directories(join_paths(apitrace_source_path, 'src/metal/include'))]
+  apitrace_metal_include_path = []
   apitrace_metal_native_deps = [
-    clangpp.find_library('apitrace_platform_apple_metal', dirs : [apitrace_build_path], static : true),
-    clangpp.find_library('apitrace_core', dirs : [apitrace_build_path], static : true),
+    declare_dependency(
+      compile_args : ['-I' + join_paths(apitrace_source_path, 'src/metal/include')],
+      link_args : [apitrace_platform_archive, apitrace_metal_archive],
+      sources : [apitrace_build_stamp],
+    ),
   ]
 endif
 

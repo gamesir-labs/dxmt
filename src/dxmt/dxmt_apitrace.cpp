@@ -5,6 +5,9 @@
 #include "winemetal.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <ctime>
+#include <string>
 
 namespace dxmt::apitrace {
 namespace {
@@ -14,12 +17,20 @@ std::atomic<int> verbose_cache{-1};
 std::atomic_bool session_open_logged = false;
 
 bool
+truthy_env_value(const std::string &value) {
+  return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+bool
 env_enabled() {
   const int cached = enabled_cache.load(std::memory_order_relaxed);
   if (cached >= 0)
     return cached != 0;
 
-  const bool enabled = !env::getEnvVar("APITRACE_METAL_BUNDLE").empty();
+  auto value = env::getEnvVar("DXMT_APITRACE_ENBALED");
+  if (value.empty())
+    value = env::getEnvVar("DXMT_APITRACE_ENABLED");
+  const bool enabled = truthy_env_value(value);
   enabled_cache.store(enabled ? 1 : 0, std::memory_order_relaxed);
   return enabled;
 }
@@ -31,7 +42,7 @@ verbose_enabled() {
     return cached != 0;
 
   const auto value = env::getEnvVar("APITRACE_METAL_VERBOSE");
-  const bool verbose = value == "1" || value == "true" || value == "yes" || value == "trace";
+  const bool verbose = truthy_env_value(value);
   verbose_cache.store(verbose ? 1 : 0, std::memory_order_relaxed);
   return verbose;
 }
@@ -55,6 +66,23 @@ void
 ensure_session_open() {
   if (!enabled())
     return;
+
+  static std::atomic_bool bundle_initialized = false;
+  if (!bundle_initialized.exchange(true, std::memory_order_relaxed) && env::getEnvVar("APITRACE_METAL_BUNDLE").empty()) {
+    const auto base_dir = env::getUnixPath(env::getExeBaseName() + "_dxmt_apitrace");
+    if (!base_dir.empty()) {
+      env::createDirectory(base_dir);
+      std::time_t now;
+      std::time(&now);
+      char timestamp[32] = {};
+      std::strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S", std::localtime(&now));
+      const auto bundle_root = base_dir + "/trace-" + timestamp + ".apitrace";
+      setenv("APITRACE_METAL_BUNDLE", bundle_root.c_str(), 1);
+      if (verbose_enabled()) {
+        INFO("DXMT apitrace: bundle root ", bundle_root);
+      }
+    }
+  }
 
   WMTApitraceSessionEnsureOpen();
   if (!session_open_logged.exchange(true, std::memory_order_relaxed) && verbose_enabled()) {

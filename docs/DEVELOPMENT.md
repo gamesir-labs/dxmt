@@ -84,6 +84,24 @@ meson compile -C build32
 
 There are other compile options in [meson.options](/meson.options).
 
+#### apitrace integration
+
+DXMT can link the apitrace Metal recorder directly for development traces. The
+default `-Dapitrace=auto` keeps release builds lean and only enables this
+integration for `debug` and `debugoptimized` builds. Use `-Dapitrace=enabled`
+to force it on for another build type, or `-Dapitrace=disabled` to force it off.
+
+The default source checkout is the `external/apitrace` submodule. When enabled,
+Meson builds only the required static apitrace recorder libraries into the DXMT
+build directory through `scripts/build-apitrace.sh`; it does not build apitrace
+Windows DLLs or tools.
+
+At runtime, set `DXMT_APITRACE_ENBALED=1` to record through DXMT without DLL
+overrides. `DXMT_APITRACE_ENABLED=1` is accepted as a spelling-compatible alias.
+If `APITRACE_METAL_BUNDLE` is unset, DXMT creates a per-run `.apitrace` bundle
+path automatically. Set `APITRACE_METAL_BUNDLE=/path/to/trace.apitrace` to
+choose the output bundle explicitly.
+
 #### `clangd` configuration for proper language server support 
 
 Since this project contains code runs on macOS/Windows(Wine)/both, `clangd` may not always be able to find the correct sysroot for e.g. libc++ include files. Add clangd argument `--query-driver=**/x86_64-w64-mingw32-**` may solve this problem. 
