@@ -8,3 +8,6 @@
 	path = external/wine
 	url = https://github.com/gamesir-labs/wine.git
 	branch = main
+[submodule "external/apitrace"]
+	path = external/apitrace
+	url = https://github.com/gamesir-labs/apitrace.git

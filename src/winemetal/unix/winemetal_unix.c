@@ -1,8 +1,11 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #import <Cocoa/Cocoa.h>
 #import <ColorSync/ColorSync.h>
 #import <CoreFoundation/CFRunLoop.h>
@@ -65,9 +68,49 @@ static NSMutableDictionary *dxmt_apitrace_functions = nil;
 static __thread uint64_t dxmt_apitrace_current_d3d_sequence = 0;
 
 static bool
+dxmt_apitrace_truthy_env_value(const char *value) {
+  if (!value || !value[0])
+    return false;
+  return !strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "yes") || !strcmp(value, "trace");
+}
+
+static bool
 dxmt_apitrace_runtime_enabled(void) {
+  const char *enabled = getenv("DXMT_APITRACE_ENBALED");
+  if (!enabled || !enabled[0])
+    enabled = getenv("DXMT_APITRACE_ENABLED");
+  return dxmt_apitrace_truthy_env_value(enabled);
+}
+
+static const char *
+dxmt_apitrace_bundle_root(void) {
   const char *bundle_root = getenv("APITRACE_METAL_BUNDLE");
-  return bundle_root && bundle_root[0];
+  if (bundle_root && bundle_root[0])
+    return bundle_root;
+
+  static char generated_bundle_root[PATH_MAX];
+  if (generated_bundle_root[0])
+    return generated_bundle_root;
+
+  const char *tmpdir = getenv("TMPDIR");
+  if (!tmpdir || !tmpdir[0])
+    tmpdir = "/tmp";
+
+  time_t now = time(NULL);
+  struct tm tm_value;
+  localtime_r(&now, &tm_value);
+
+  char timestamp[32];
+  strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S", &tm_value);
+  snprintf(
+      generated_bundle_root,
+      sizeof(generated_bundle_root),
+      "%s/dxmt-apitrace-%s-%d.apitrace",
+      tmpdir,
+      timestamp,
+      getpid());
+  setenv("APITRACE_METAL_BUNDLE", generated_bundle_root, 0);
+  return generated_bundle_root;
 }
 
 static bool
@@ -76,7 +119,7 @@ dxmt_apitrace_verbose_enabled(void) {
   static bool enabled = false;
   if (!initialized) {
     const char *value = getenv("APITRACE_METAL_VERBOSE");
-    enabled = value && (!strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "yes") || !strcmp(value, "trace"));
+    enabled = dxmt_apitrace_truthy_env_value(value);
     initialized = true;
   }
   return enabled;
@@ -190,7 +233,7 @@ dxmt_apitrace_ensure_session_locked(void) {
   if (!dxmt_apitrace_runtime_enabled())
     return NULL;
 
-  const char *bundle_root = getenv("APITRACE_METAL_BUNDLE");
+  const char *bundle_root = dxmt_apitrace_bundle_root();
   dxmt_apitrace_session = apitrace_metal_session_open(bundle_root);
   if (!dxmt_apitrace_session)
     return NULL;
