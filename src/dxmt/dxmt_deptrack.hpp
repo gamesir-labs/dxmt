@@ -158,6 +158,20 @@ public:
     return ret;
   }
 
+  LaneStorage
+  storage(int parity) const {
+    return storage_[parity];
+  }
+
+  uint32_t
+  count() const {
+    uint32_t ret = 0;
+    for (int i = 0; i < kParity; i++) {
+      ret += __builtin_popcountll(storage_[i]);
+    }
+    return ret;
+  }
+
   bool
   empty() const {
     return laneMask() == 0;
@@ -291,7 +305,11 @@ private:
 
 class FenceLocalityCheck {
 public:
-  FenceSet collectAndSimplifyWaits(FenceSet strong_fences, EncoderId id, bool implicit_pre_raster_wait = false);
+  FenceSet collectAndSimplifyWaits(
+      FenceSet strong_fences,
+      EncoderId id,
+      bool implicit_pre_raster_wait = false,
+      const char *trace_scope = nullptr);
 
 private:
   std::array<FenceSet, kParityLane> summary_;

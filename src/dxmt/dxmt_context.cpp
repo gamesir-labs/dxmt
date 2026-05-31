@@ -1960,12 +1960,44 @@ ArgumentEncodingContext::endPass() {
         );
 
       render_encoder->fence_wait_vertex =
-          fence_locality_.collectAndSimplifyWaits(render_encoder->fence_wait_vertex, render_encoder->encoder_id_vertex);
+          fence_locality_.collectAndSimplifyWaits(
+              render_encoder->fence_wait_vertex,
+              render_encoder->encoder_id_vertex,
+              false,
+              "render_vertex");
       encoder_current->fence_wait =
-          fence_locality_.collectAndSimplifyWaits(encoder_current->fence_wait, encoder_last->id, true);
+          fence_locality_.collectAndSimplifyWaits(
+              encoder_current->fence_wait,
+              encoder_last->id,
+              true,
+              "render_fragment");
     } else {
+      const char *trace_scope = "encoder";
+      switch (encoder_current->type) {
+      case EncoderType::Compute:
+        trace_scope = "compute";
+        break;
+      case EncoderType::Blit:
+        trace_scope = "blit";
+        break;
+      case EncoderType::Clear:
+        trace_scope = "clear";
+        break;
+      case EncoderType::Resolve:
+        trace_scope = "resolve";
+        break;
+      case EncoderType::Present:
+        trace_scope = "present";
+        break;
+      default:
+        break;
+      }
       encoder_current->fence_wait =
-          fence_locality_.collectAndSimplifyWaits(encoder_current->fence_wait, encoder_last->id);
+          fence_locality_.collectAndSimplifyWaits(
+              encoder_current->fence_wait,
+              encoder_last->id,
+              false,
+              trace_scope);
     }
   }
 

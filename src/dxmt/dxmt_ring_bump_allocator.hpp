@@ -3,7 +3,9 @@
 #include "Metal.hpp"
 #include "log/log.hpp"
 #include "thread.hpp"
+#include "util_env.hpp"
 #include "util_math.hpp"
+#include <cstring>
 #include <mutex>
 #include <queue>
 
@@ -12,6 +14,18 @@ namespace dxmt {
 constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
 constexpr size_t kStagingBlockLifetime = 300;
+constexpr size_t kRingBumpGuardBytes = 64;
+constexpr uint8_t kRingBumpGuardPattern = 0x5a;
+
+inline bool
+RingBumpGuardEnabled() {
+  static const bool enabled = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_CPU_HEAP_GUARD");
+    return value == "1" || value == "true" || value == "yes" ||
+           value == "trace";
+  }();
+  return enabled;
+}
 
 template <typename Allocator, size_t BlockSize = kStagingBlockSize, class mutex = dxmt::mutex> class RingBumpState {
 
@@ -36,6 +50,10 @@ private:
   };
 
   Allocation &allocate_or_reuse_block(uint64_t seq_id, uint64_t coherent_id, size_t block_size);
+
+  bool check_guard(const Allocation &allocation, const char *context) const;
+
+  void fill_guard(Allocation &allocation);
 
   std::pair<typename Allocator::Block &, uint64_t>
   suballocate(Allocation &allocation, size_t size, size_t alignment) {
@@ -168,15 +186,95 @@ public:
   };
 };
 
+template <typename Block>
+void *
+RingBumpBlockHostPtr(Block &block) {
+  if constexpr (requires { block.ptr; }) {
+    return block.ptr;
+  } else {
+    return nullptr;
+  }
+}
+
+template <typename Block>
+constexpr bool
+RingBumpBlockSupportsGuard() {
+  return requires(Block &block) { block.ptr; };
+}
+
+template <typename Allocator>
+constexpr bool
+RingBumpAllocatorSupportsGuard() {
+  return RingBumpBlockSupportsGuard<typename Allocator::Block>();
+}
+
+template <typename Allocator, size_t BlockSize, class mutex>
+bool
+RingBumpState<Allocator, BlockSize, mutex>::check_guard(
+    const Allocation &allocation, const char *context) const {
+  if (!RingBumpGuardEnabled() || !RingBumpAllocatorSupportsGuard<Allocator>())
+    return true;
+
+  auto *base = static_cast<const uint8_t *>(
+      RingBumpBlockHostPtr(const_cast<typename Allocator::Block &>(allocation.block)));
+  if (!base)
+    return true;
+
+  if (allocation.total_size < kRingBumpGuardBytes) {
+    ERR("RingBumpState metadata corrupted context=", context,
+        " blockSize=", allocation.total_size,
+        " allocatedSize=", allocation.allocated_size,
+        " lastUsedSeq=", allocation.last_used_seq_id);
+    return false;
+  }
+
+  const auto user_size = allocation.total_size - kRingBumpGuardBytes;
+  const auto *guard = base + user_size;
+  for (size_t i = 0; i < kRingBumpGuardBytes; i++) {
+    if (guard[i] != kRingBumpGuardPattern) {
+      ERR("RingBumpState guard corrupted context=", context,
+          " blockSize=", allocation.total_size,
+          " userSize=", user_size,
+          " allocatedSize=", allocation.allocated_size,
+          " lastUsedSeq=", allocation.last_used_seq_id,
+          " guardOffset=", i,
+          " value=", uint32_t(guard[i]));
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <typename Allocator, size_t BlockSize, class mutex>
+void
+RingBumpState<Allocator, BlockSize, mutex>::fill_guard(Allocation &allocation) {
+  if (!RingBumpGuardEnabled() || !RingBumpAllocatorSupportsGuard<Allocator>())
+    return;
+
+  auto *base = static_cast<uint8_t *>(RingBumpBlockHostPtr(allocation.block));
+  if (!base)
+    return;
+
+  std::memset(base + allocation.total_size - kRingBumpGuardBytes,
+              kRingBumpGuardPattern, kRingBumpGuardBytes);
+}
+
 template <typename Allocator, size_t BlockSize, class mutex>
 std::pair<typename Allocator::Block &, uint64_t>
 RingBumpState<Allocator, BlockSize, mutex>::allocate(
     uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment
 ) {
   std::lock_guard<mutex> lock(mutex_);
+  const auto guard_bytes =
+      RingBumpGuardEnabled() && RingBumpAllocatorSupportsGuard<Allocator>()
+          ? kRingBumpGuardBytes
+          : 0;
   while (!fifo.empty()) {
     auto &latest = fifo.back();
-    if ((align(latest.allocated_size, alignment) + size) > latest.total_size) {
+    check_guard(latest, "allocate_latest");
+    if ((align(latest.allocated_size, alignment) + size) >
+        latest.total_size - guard_bytes) {
       break;
     }
     latest.last_used_seq_id = seq_id;
@@ -184,7 +282,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
   }
   return suballocate(
       allocate_or_reuse_block(
-          seq_id, coherent_id, std::max(size, BlockSize) // in case required size is larger than block size
+          seq_id, coherent_id, std::max(size + guard_bytes, BlockSize) // in case required size is larger than block size
       ),
       size, alignment
   );
@@ -196,6 +294,7 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
   std::lock_guard<mutex> lock(mutex_);
   while (!fifo.empty()) {
     auto &front = fifo.front();
+    check_guard(front, "free_blocks");
     if (front.last_used_seq_id > coherent_id)
       break;
     auto expired = (coherent_id - front.last_used_seq_id) > kStagingBlockLifetime ||
@@ -219,6 +318,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
   while (!fifo.empty()) {
     auto &front = fifo.front();
     if (front.last_used_seq_id < coherent_id) {
+      check_guard(front, "reuse_front");
       if (front.total_size != BlockSize) {
         fifo.pop();
         continue;
@@ -228,6 +328,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
         front.inc_time_to_live = 0;
         fifo.push(std::move(front));
         fifo.pop();
+        fill_guard(fifo.back());
         return fifo.back();
       }
       WARN("forced to allocate new block of size ", block_size);
@@ -241,6 +342,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
       .inc_time_to_live = 0,
       .block = allocator_.allocate(block_size),
   });
+  fill_guard(fifo.back());
   return fifo.back();
 };
 
