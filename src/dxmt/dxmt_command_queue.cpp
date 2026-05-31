@@ -1,6 +1,7 @@
 #include "dxmt_command_queue.hpp"
 #include "Metal.hpp"
 #include "dxmt_apitrace.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
 #include "util_win32_compat.h"
@@ -192,7 +193,10 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   }
   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
   if (apitrace_enabled_) {
-    dxmt::apitrace::set_current_d3d_sequence(chunk.chunk_id);
+    uint64_t d3d_seq = dxmt::apitrace::d3d_enabled()
+                           ? dxmt::apitrace::current_d3d_sequence()
+                           : chunk.chunk_id;
+    dxmt::apitrace::set_current_d3d_sequence(d3d_seq);
     dxmt::apitrace::on_command_buffer_commit(cmdbuf.handle);
   }
   cmdbuf.commit();

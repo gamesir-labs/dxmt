@@ -9,6 +9,10 @@
 #include <ctime>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace dxmt::apitrace {
 namespace {
 
@@ -55,6 +59,26 @@ log_verbose(const char *message, uint64_t arg0 = 0, uint64_t arg1 = 0) {
   INFO("DXMT apitrace: ", message, " arg0=", arg0, " arg1=", arg1);
 }
 
+void
+set_env_var(const char *name, const char *value) {
+#ifdef _WIN32
+  SetEnvironmentVariableA(name, value);
+  // SetEnvironmentVariableA only updates the PEB; mingw msvcrt keeps its own
+  // environ table for std::getenv. apitrace's resolve_bundle_root reads via
+  // std::getenv, so without the CRT-side write the PE TraceSession would fall
+  // back to the cwd-default bundle even after we mirror the value here.
+  _putenv_s(name, value);
+
+  using WineSetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
+  auto set_unix_env = reinterpret_cast<WineSetUnixEnvProc>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
+  if (set_unix_env)
+    set_unix_env(name, value);
+#else
+  setenv(name, value, 1);
+#endif
+}
+
 } // namespace
 
 bool
@@ -77,10 +101,22 @@ ensure_session_open() {
       char timestamp[32] = {};
       std::strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S", std::localtime(&now));
       const auto bundle_root = base_dir + "/trace-" + timestamp + ".apitrace";
-      setenv("APITRACE_METAL_BUNDLE", bundle_root.c_str(), 1);
+      set_env_var("APITRACE_METAL_BUNDLE", bundle_root.c_str());
       if (verbose_enabled()) {
         INFO("DXMT apitrace: bundle root ", bundle_root);
       }
+    }
+  }
+
+  static std::atomic_bool trace_bundle_synced = false;
+  if (!trace_bundle_synced.exchange(true, std::memory_order_relaxed)) {
+    const auto bundle_root = env::getEnvVar("APITRACE_METAL_BUNDLE");
+    if (!bundle_root.empty() && env::getEnvVar("APITRACE_TRACE_BUNDLE").empty()) {
+      set_env_var("APITRACE_TRACE_BUNDLE", bundle_root.c_str());
+    }
+    if (verbose_enabled()) {
+      const char *crt_view = std::getenv("APITRACE_TRACE_BUNDLE");
+      INFO("DXMT apitrace: APITRACE_TRACE_BUNDLE crt-view=", crt_view ? crt_view : "(null)");
     }
   }
 

@@ -1,7 +1,50 @@
 #include "dxmt_deptrack.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include <cassert>
 
 namespace dxmt {
+namespace {
+
+void
+copyFenceMasks(const FenceSet &set, LaneStorage (&masks)[kParity]) {
+  for (int i = 0; i < kParity; i++) {
+    masks[i] = set.storage(i);
+  }
+}
+
+void
+emitFenceDependencyTrace(
+    const char *scope,
+    EncoderId id,
+    bool implicit_pre_raster_wait,
+    const FenceSet &strong_fences,
+    const FenceSet &full_fences,
+    const FenceSet &minimal_fences) {
+  if (!apitrace::d3d_enabled())
+    return;
+
+  LaneStorage strong_masks[kParity] = {};
+  LaneStorage full_masks[kParity] = {};
+  LaneStorage minimal_masks[kParity] = {};
+  copyFenceMasks(strong_fences, strong_masks);
+  copyFenceMasks(full_fences, full_masks);
+  copyFenceMasks(minimal_fences, minimal_masks);
+
+  apitrace::on_fence_dependency(
+      scope ? scope : "unknown",
+      apitrace::current_d3d_sequence(),
+      id,
+      implicit_pre_raster_wait,
+      strong_masks,
+      strong_fences.count(),
+      full_masks,
+      full_fences.count(),
+      minimal_masks,
+      minimal_fences.count(),
+      kParity);
+}
+
+} // namespace
 
 void
 GenericAccessTracker::accessShared(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state) {
@@ -260,12 +303,17 @@ private:
 constexpr auto WEAK_FENCE_MASK = WeakFenceMaskLTO();
 
 FenceSet
-FenceLocalityCheck::collectAndSimplifyWaits(FenceSet strong_fences, EncoderId id, bool implicit_pre_raster_wait) {
+FenceLocalityCheck::collectAndSimplifyWaits(
+    FenceSet strong_fences,
+    EncoderId id,
+    bool implicit_pre_raster_wait,
+    const char *trace_scope) {
   if (implicit_pre_raster_wait)
     strong_fences.set(id - 1);
 
   FenceSet full_fences(strong_fences);
-  full_fences.mergeWithLaneMaskOff(WEAK_FENCE_MASK[id], strong_fences.laneMask());
+  if (!strong_fences.empty())
+    full_fences.mergeWithLaneMaskOff(WEAK_FENCE_MASK[id], strong_fences.laneMask());
 
   FenceSet minimal_fences;
   FenceSet accessible_fences;
@@ -287,6 +335,14 @@ FenceLocalityCheck::collectAndSimplifyWaits(FenceSet strong_fences, EncoderId id
 
   if (implicit_pre_raster_wait)
     minimal_fences.unset(id - 1);
+
+  emitFenceDependencyTrace(
+      trace_scope,
+      id,
+      implicit_pre_raster_wait,
+      strong_fences,
+      full_fences,
+      minimal_fences);
 
   return minimal_fences;
 }
