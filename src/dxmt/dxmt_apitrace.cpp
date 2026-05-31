@@ -4,6 +4,10 @@
 #include "util_env.hpp"
 #include "winemetal.h"
 
+#ifdef DXMT_APITRACE_D3D
+#include "apitrace/capture_runtime.hpp"
+#endif
+
 #include <atomic>
 #include <cstdlib>
 #include <ctime>
@@ -131,6 +135,9 @@ shutdown() {
   if (!enabled())
     return;
 
+#ifdef DXMT_APITRACE_D3D
+  ::apitrace::runtime::shutdown_process_trace_session();
+#endif
   WMTApitraceSessionClose();
   log_verbose("session close");
 }
