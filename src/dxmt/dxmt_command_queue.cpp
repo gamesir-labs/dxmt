@@ -38,6 +38,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
     apitrace_enabled_(dxmt::apitrace::enabled()),
     encodeThread([this]() { this->EncodingThread(); }),
     finishThread([this]() { this->WaitForFinishThread(); }),
+    readbackThread([this]() { this->ReadbackThread(); }),
     device(device),
     commandQueue(device.newCommandQueue(kCommandChunkCount)),
     shared_event_listener(SharedEventListener_create()),
@@ -63,6 +64,9 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.queue = this;
     chunk.reset();
   };
+  if (apitrace_enabled_) {
+    max_latency_ = 1;
+  }
   event = device.newSharedEvent();
 
   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
@@ -85,6 +89,8 @@ CommandQueue::~CommandQueue() {
   SharedEventListener_destroy(shared_event_listener);
   encodeThread.join();
   finishThread.join();
+  readback_cond_.notify_all();
+  readbackThread.join();
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.reset();
@@ -186,6 +192,10 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   auto cmdbuf = commandQueue.commandBuffer();
   chunk.attached_cmdbuf = cmdbuf;
   if (apitrace_enabled_) {
+    uint64_t d3d_seq = dxmt::apitrace::d3d_enabled()
+                           ? dxmt::apitrace::current_d3d_sequence()
+                           : chunk.chunk_id;
+    dxmt::apitrace::set_current_d3d_sequence(d3d_seq);
     dxmt::apitrace::on_command_buffer_begin(cmdbuf.handle, chunk.frame_);
   }
   if (chunk.resource_initializer_event_id) {
@@ -193,10 +203,6 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   }
   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
   if (apitrace_enabled_) {
-    uint64_t d3d_seq = dxmt::apitrace::d3d_enabled()
-                           ? dxmt::apitrace::current_d3d_sequence()
-                           : chunk.chunk_id;
-    dxmt::apitrace::set_current_d3d_sequence(d3d_seq);
     dxmt::apitrace::on_command_buffer_commit(cmdbuf.handle);
   }
   cmdbuf.commit();
@@ -256,6 +262,7 @@ CommandQueue::WaitForFinishThread() {
     if (chunk.signal_frame_latency_fence_ != ~0ull)
       frame_latency_fence_.signal(chunk.signal_frame_latency_fence_);
 
+    EnqueueReadbacks(chunk);
     chunk.reset();
     cpu_coherent.signal(internal_seq);
     chunk_ongoing.fetch_sub(1, std::memory_order_release);
@@ -269,6 +276,54 @@ CommandQueue::WaitForFinishThread() {
     internal_seq++;
   }
   TRACE("finishing thread gracefully terminates");
+  return 0;
+}
+
+void
+CommandQueue::EnqueueReadbacks(CommandChunk &chunk) {
+  if (chunk.readback.diagnostics.empty() && chunk.deferred_readbacks.empty())
+    return;
+
+  std::vector<std::function<void()>> callbacks;
+  callbacks.reserve(chunk.readback.diagnostics.size() + chunk.deferred_readbacks.size());
+  for (auto &diagnostic : chunk.readback.diagnostics)
+    callbacks.push_back(std::move(diagnostic));
+  chunk.readback.diagnostics.clear();
+  for (auto &readback : chunk.deferred_readbacks)
+    callbacks.push_back(std::move(readback));
+  chunk.deferred_readbacks.clear();
+
+  {
+    std::lock_guard lock(readback_mutex_);
+    for (auto &callback : callbacks)
+      pending_readbacks_.push_back(std::move(callback));
+  }
+  readback_cond_.notify_one();
+}
+
+uint32_t
+CommandQueue::ReadbackThread() {
+  env::setThreadName("dxmt-readback-thread");
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+  for (;;) {
+    std::vector<std::function<void()>> callbacks;
+    {
+      std::unique_lock lock(readback_mutex_);
+      readback_cond_.wait(lock, [this]() {
+        return stopped.load(std::memory_order_acquire) || !pending_readbacks_.empty();
+      });
+      callbacks.swap(pending_readbacks_);
+    }
+
+    for (auto &callback : callbacks)
+      callback();
+
+    if (stopped.load(std::memory_order_acquire)) {
+      std::lock_guard lock(readback_mutex_);
+      if (pending_readbacks_.empty())
+        break;
+    }
+  }
   return 0;
 }
 

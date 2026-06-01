@@ -37,9 +37,21 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
 
 @interface DXMTApitraceCommandBufferState : NSObject
 @property(nonatomic, assign) uint64_t beginSequence;
+@property(nonatomic, retain) NSMutableData *blitCopyTextureOps;
+@property(nonatomic, retain) NSMutableData *blitWaitFences;
+@property(nonatomic, retain) NSMutableData *blitUpdateFences;
 @end
 
 @implementation DXMTApitraceCommandBufferState
+-(instancetype)init {
+  self = [super init];
+  if (self) {
+    _blitCopyTextureOps = [[NSMutableData alloc] init];
+    _blitWaitFences = [[NSMutableData alloc] init];
+    _blitUpdateFences = [[NSMutableData alloc] init];
+  }
+  return self;
+}
 @end
 
 @interface DXMTApitraceEncoderState : NSObject
@@ -51,6 +63,8 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
 @property(nonatomic, retain) NSMutableSet *snapshottedBuffers;
 @property(nonatomic, retain) NSMutableArray *fenceOps;
 @property(nonatomic, retain) NSMutableArray *blitOps;
+@property(nonatomic, retain) NSMutableData *blitWaitFences;
+@property(nonatomic, retain) NSMutableData *blitUpdateFences;
 @end
 
 @implementation DXMTApitraceEncoderState
@@ -60,6 +74,8 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
     _snapshottedBuffers = [[NSMutableSet alloc] init];
     _fenceOps = [[NSMutableArray alloc] init];
     _blitOps = [[NSMutableArray alloc] init];
+    _blitWaitFences = [[NSMutableData alloc] init];
+    _blitUpdateFences = [[NSMutableData alloc] init];
   }
   return self;
 }
@@ -71,6 +87,19 @@ static NSMutableDictionary *dxmt_apitrace_command_buffers = nil;
 static NSMutableDictionary *dxmt_apitrace_encoders = nil;
 static NSMutableDictionary *dxmt_apitrace_functions = nil;
 static __thread uint64_t dxmt_apitrace_current_d3d_sequence = 0;
+static uint64_t dxmt_apitrace_blit_payload_count = 0;
+static uint64_t dxmt_apitrace_blit_payload_ops = 0;
+static uint64_t dxmt_apitrace_blit_payload_wait_fences = 0;
+static uint64_t dxmt_apitrace_blit_payload_update_fences = 0;
+static uint64_t dxmt_apitrace_blit_payload_bytes = 0;
+static uint64_t dxmt_apitrace_blit_payload_build_ns = 0;
+static uint64_t dxmt_apitrace_blit_payload_max_build_ns = 0;
+static const NSUInteger dxmt_apitrace_command_buffer_blit_ops_flush_threshold = 256;
+
+static uint32_t
+dxmt_apitrace_command_buffer_copy_texture_count(DXMTApitraceCommandBufferState *state) {
+  return state ? (uint32_t)(state.blitCopyTextureOps.length / sizeof(apitrace_metal_copy_texture_op_t)) : 0;
+}
 
 static bool
 dxmt_apitrace_truthy_env_value(const char *value) {
@@ -86,6 +115,9 @@ dxmt_apitrace_runtime_enabled(void) {
     enabled = getenv("DXMT_APITRACE_ENABLED");
   return dxmt_apitrace_truthy_env_value(enabled);
 }
+
+static apitrace_metal_session_t *
+dxmt_apitrace_ensure_session_locked(void);
 
 static const char *
 dxmt_apitrace_bundle_root(void) {
@@ -123,6 +155,40 @@ dxmt_apitrace_log(const char *message, uint64_t arg0, uint64_t arg1) {
           message,
           (unsigned long long)arg0,
           (unsigned long long)arg1);
+}
+
+static uint64_t
+dxmt_apitrace_monotonic_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void
+dxmt_apitrace_record_blit_payload_stats(uint64_t build_ns, NSUInteger ops_count, NSUInteger wait_count, NSUInteger update_count, NSUInteger payload_bytes) {
+  ++dxmt_apitrace_blit_payload_count;
+  dxmt_apitrace_blit_payload_ops += (uint64_t)ops_count;
+  dxmt_apitrace_blit_payload_wait_fences += (uint64_t)wait_count;
+  dxmt_apitrace_blit_payload_update_fences += (uint64_t)update_count;
+  dxmt_apitrace_blit_payload_bytes += (uint64_t)payload_bytes;
+  dxmt_apitrace_blit_payload_build_ns += build_ns;
+  if (build_ns > dxmt_apitrace_blit_payload_max_build_ns)
+    dxmt_apitrace_blit_payload_max_build_ns = build_ns;
+}
+
+static void
+dxmt_apitrace_log_blit_payload_stats(void) {
+  if (!dxmt_apitrace_blit_payload_count)
+    return;
+  fprintf(stderr,
+          "info:  DXMT apitrace blit payload stats: count=%llu ops=%llu wait_fences=%llu update_fences=%llu bytes=%llu build_ns=%llu max_build_ns=%llu\n",
+          (unsigned long long)dxmt_apitrace_blit_payload_count,
+          (unsigned long long)dxmt_apitrace_blit_payload_ops,
+          (unsigned long long)dxmt_apitrace_blit_payload_wait_fences,
+          (unsigned long long)dxmt_apitrace_blit_payload_update_fences,
+          (unsigned long long)dxmt_apitrace_blit_payload_bytes,
+          (unsigned long long)dxmt_apitrace_blit_payload_build_ns,
+          (unsigned long long)dxmt_apitrace_blit_payload_max_build_ns);
 }
 
 static NSNumber *
@@ -197,6 +263,14 @@ dxmt_apitrace_track_function_locked(obj_handle_t function, obj_handle_t library,
     @"function_name" : name,
   };
   [dxmt_apitrace_functions setObject:state forKey:dxmt_apitrace_key(function)];
+  if (dxmt_apitrace_ensure_session_locked()) {
+    NSData *payload_data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
+    NSString *payload = payload_data ? [[NSString alloc] initWithData:payload_data encoding:NSUTF8StringEncoding] : nil;
+    if (payload) {
+      apitrace_metal_object_metadata(dxmt_apitrace_session, function, payload.UTF8String);
+      [payload release];
+    }
+  }
 }
 
 static void
@@ -213,6 +287,14 @@ dxmt_apitrace_track_function_with_constants_locked(
     @"function_constants" : dxmt_apitrace_function_constants_json(constants, num_constants, bool_values),
   };
   [dxmt_apitrace_functions setObject:state forKey:dxmt_apitrace_key(function)];
+  if (dxmt_apitrace_ensure_session_locked()) {
+    NSData *payload_data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
+    NSString *payload = payload_data ? [[NSString alloc] initWithData:payload_data encoding:NSUTF8StringEncoding] : nil;
+    if (payload) {
+      apitrace_metal_object_metadata(dxmt_apitrace_session, function, payload.UTF8String);
+      [payload release];
+    }
+  }
 }
 
 static apitrace_metal_session_t *
@@ -244,6 +326,7 @@ dxmt_apitrace_ensure_session_locked(void) {
 static void
 dxmt_apitrace_close_session_locked(void) {
   if (dxmt_apitrace_session) {
+    dxmt_apitrace_log_blit_payload_stats();
     apitrace_metal_session_close(dxmt_apitrace_session);
     dxmt_apitrace_session = NULL;
   }
@@ -271,6 +354,18 @@ dxmt_apitrace_optional_handle(obj_handle_t handle) {
   return handle ? [NSNumber numberWithUnsignedLongLong:(unsigned long long)handle] : (NSNumber *)[NSNull null];
 }
 
+static NSString *
+dxmt_apitrace_copy_texture_json(
+    obj_handle_t source_texture,
+    obj_handle_t destination_texture,
+    const struct WMTOrigin *source_origin,
+    const struct WMTSize *source_size,
+    uint32_t source_slice,
+    uint32_t source_level,
+    const struct WMTOrigin *destination_origin,
+    uint32_t destination_slice,
+    uint32_t destination_level);
+
 static void
 dxmt_apitrace_append_fence_op(DXMTApitraceEncoderState *state, const char *op, obj_handle_t fence, uint32_t stages) {
   if (!state || !op)
@@ -296,14 +391,138 @@ dxmt_apitrace_flush_fence_ops(apitrace_metal_session_t *session, obj_handle_t en
 
 static void
 dxmt_apitrace_flush_blit_ops(apitrace_metal_session_t *session, obj_handle_t encoder, DXMTApitraceEncoderState *state) {
-  if (!session || !state || !state.blitOps.count)
+  if (!session || !state ||
+      (!state.blitOps.count && !state.blitWaitFences.length && !state.blitUpdateFences.length))
     return;
-  NSString *payload = dxmt_apitrace_json_string(@{
-    @"kind" : @"dxmt_blit_batch",
-    @"ops" : state.blitOps,
-  });
+  const uint64_t build_start_ns = dxmt_apitrace_monotonic_ns();
+  const NSUInteger ops_count = state.blitOps.count;
+  const NSUInteger wait_count = state.blitWaitFences.length / sizeof(uint64_t);
+  const NSUInteger update_count = state.blitUpdateFences.length / sizeof(uint64_t);
+  if (!ops_count) {
+    dxmt_apitrace_record_blit_payload_stats(
+        dxmt_apitrace_monotonic_ns() - build_start_ns,
+        ops_count,
+        wait_count,
+        update_count,
+        0);
+    apitrace_metal_blit_fence_batch(
+        session,
+        encoder,
+        (const uint64_t *)state.blitWaitFences.bytes,
+        (uint32_t)wait_count,
+        (const uint64_t *)state.blitUpdateFences.bytes,
+        (uint32_t)update_count);
+    [state.blitWaitFences setLength:0];
+    [state.blitUpdateFences setLength:0];
+    return;
+  }
+  NSString *ops_json = state.blitOps.count ? dxmt_apitrace_json_string(state.blitOps) : @"[]";
+  NSMutableString *payload = [NSMutableString stringWithFormat:@"{\"kind\":\"dxmt_blit_batch\",\"ops\":%@", ops_json];
+  if (state.blitWaitFences.length || state.blitUpdateFences.length) {
+    [payload appendString:@",\"fence_ops\":{\"schema\":\"blit-fence-v2\",\"stages\":0"];
+    const uint64_t *wait_fences = (const uint64_t *)state.blitWaitFences.bytes;
+    [payload appendString:@",\"wait_fences\":["];
+    for (NSUInteger i = 0; i < wait_count; ++i) {
+      if (i)
+        [payload appendString:@","];
+      [payload appendFormat:@"%llu", (unsigned long long)wait_fences[i]];
+    }
+    [payload appendString:@"]"];
+    const uint64_t *update_fences = (const uint64_t *)state.blitUpdateFences.bytes;
+    [payload appendString:@",\"update_fences\":["];
+    for (NSUInteger i = 0; i < update_count; ++i) {
+      if (i)
+        [payload appendString:@","];
+      [payload appendFormat:@"%llu", (unsigned long long)update_fences[i]];
+    }
+    [payload appendString:@"]}"];
+  }
+  [payload appendString:@"}"];
+  dxmt_apitrace_record_blit_payload_stats(
+      dxmt_apitrace_monotonic_ns() - build_start_ns,
+      ops_count,
+      wait_count,
+      update_count,
+      [payload lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
   apitrace_metal_blit_batch(session, encoder, payload.UTF8String);
   [state.blitOps removeAllObjects];
+  [state.blitWaitFences setLength:0];
+  [state.blitUpdateFences setLength:0];
+}
+
+static DXMTApitraceCommandBufferState *
+dxmt_apitrace_command_buffer_state_for_id(obj_handle_t command_buffer) {
+  if (!command_buffer || !dxmt_apitrace_command_buffers)
+    return nil;
+  return [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(command_buffer)];
+}
+
+static void
+dxmt_apitrace_flush_command_buffer_blit_batch(apitrace_metal_session_t *session, obj_handle_t command_buffer) {
+  DXMTApitraceCommandBufferState *state = dxmt_apitrace_command_buffer_state_for_id(command_buffer);
+  if (!session || !state || (!state.blitCopyTextureOps.length && !state.blitWaitFences.length && !state.blitUpdateFences.length))
+    return;
+
+  const uint32_t ops_count = dxmt_apitrace_command_buffer_copy_texture_count(state);
+  const NSUInteger wait_count = state.blitWaitFences.length / sizeof(uint64_t);
+  const NSUInteger update_count = state.blitUpdateFences.length / sizeof(uint64_t);
+  apitrace_metal_blit_encoder_copy_texture_ops_batch(
+      session,
+      command_buffer,
+      command_buffer,
+      (const apitrace_metal_copy_texture_op_t *)state.blitCopyTextureOps.bytes,
+      ops_count,
+      (const uint64_t *)state.blitWaitFences.bytes,
+      (uint32_t)wait_count,
+      (const uint64_t *)state.blitUpdateFences.bytes,
+      (uint32_t)update_count);
+  dxmt_apitrace_record_blit_payload_stats(0, ops_count, wait_count, update_count, 0);
+  [state.blitCopyTextureOps setLength:0];
+  [state.blitWaitFences setLength:0];
+  [state.blitUpdateFences setLength:0];
+}
+
+static void
+dxmt_apitrace_accumulate_command_buffer_blit_fences(obj_handle_t command_buffer, DXMTApitraceEncoderState *encoder_state) {
+  DXMTApitraceCommandBufferState *command_state = dxmt_apitrace_command_buffer_state_for_id(command_buffer);
+  if (!command_state || !encoder_state)
+    return;
+  if (encoder_state.blitWaitFences.length)
+    [command_state.blitWaitFences appendData:encoder_state.blitWaitFences];
+  if (encoder_state.blitUpdateFences.length)
+    [command_state.blitUpdateFences appendData:encoder_state.blitUpdateFences];
+  [encoder_state.blitWaitFences setLength:0];
+  [encoder_state.blitUpdateFences setLength:0];
+}
+
+static void
+dxmt_apitrace_accumulate_command_buffer_blit_copy_texture(
+    apitrace_metal_session_t *session,
+    obj_handle_t command_buffer,
+    const struct wmtcmd_blit_copy_from_texture_to_texture *cmd) {
+  DXMTApitraceCommandBufferState *state = dxmt_apitrace_command_buffer_state_for_id(command_buffer);
+  if (!state || !cmd)
+    return;
+  if (dxmt_apitrace_command_buffer_copy_texture_count(state) >= dxmt_apitrace_command_buffer_blit_ops_flush_threshold)
+    dxmt_apitrace_flush_command_buffer_blit_batch(session, command_buffer);
+  apitrace_metal_copy_texture_op_t op = {
+    .source_texture_id = cmd->src,
+    .destination_texture_id = cmd->dst,
+    .source_origin_x = cmd->src_origin.x,
+    .source_origin_y = cmd->src_origin.y,
+    .source_origin_z = cmd->src_origin.z,
+    .source_size_width = cmd->src_size.width,
+    .source_size_height = cmd->src_size.height,
+    .source_size_depth = cmd->src_size.depth,
+    .source_slice = cmd->src_slice,
+    .source_level = cmd->src_level,
+    .destination_origin_x = cmd->dst_origin.x,
+    .destination_origin_y = cmd->dst_origin.y,
+    .destination_origin_z = cmd->dst_origin.z,
+    .destination_slice = cmd->dst_slice,
+    .destination_level = cmd->dst_level,
+  };
+  [state.blitCopyTextureOps appendBytes:&op length:sizeof(op)];
 }
 
 static void
@@ -316,14 +535,69 @@ dxmt_apitrace_begin_blit_encoder_if_needed(apitrace_metal_session_t *session, ob
 
 static void
 dxmt_apitrace_emit_blit_encoder_batch(apitrace_metal_session_t *session, obj_handle_t encoder, DXMTApitraceEncoderState *state) {
-  if (!session || !state)
+  if (!session || !state ||
+      (!state.blitOps.count && !state.blitWaitFences.length && !state.blitUpdateFences.length))
     return;
-  NSString *payload = dxmt_apitrace_json_string(@{
-    @"kind" : @"dxmt_blit_encoder_batch",
-    @"ops" : state.blitOps,
-  });
-  apitrace_metal_blit_encoder_batch(session, encoder, state.commandBuffer, payload.UTF8String);
+  const uint64_t build_start_ns = dxmt_apitrace_monotonic_ns();
+  const NSUInteger ops_count = state.blitOps.count;
+  const NSUInteger wait_count = state.blitWaitFences.length / sizeof(uint64_t);
+  const NSUInteger update_count = state.blitUpdateFences.length / sizeof(uint64_t);
+  if (!ops_count) {
+    const uint64_t *wait_fences = (const uint64_t *)state.blitWaitFences.bytes;
+    const uint64_t *update_fences = (const uint64_t *)state.blitUpdateFences.bytes;
+    dxmt_apitrace_record_blit_payload_stats(
+        dxmt_apitrace_monotonic_ns() - build_start_ns,
+        ops_count,
+        wait_count,
+        update_count,
+        0);
+    apitrace_metal_blit_encoder_fence_batch(
+        session,
+        encoder,
+        state.commandBuffer,
+        wait_fences,
+        (uint32_t)wait_count,
+        update_fences,
+        (uint32_t)update_count);
+    [state.blitWaitFences setLength:0];
+    [state.blitUpdateFences setLength:0];
+    return;
+  }
+  NSString *ops_json = state.blitOps.count ? dxmt_apitrace_json_string(state.blitOps) : @"[]";
+  NSMutableString *payload = [NSMutableString stringWithFormat:
+      @"{\"command_buffer_id\":%llu,\"kind\":\"dxmt_blit_encoder_batch\",\"ops\":%@",
+      (unsigned long long)state.commandBuffer,
+      ops_json];
+  if (state.blitWaitFences.length || state.blitUpdateFences.length) {
+    [payload appendString:@",\"fence_ops\":{\"schema\":\"blit-fence-v2\",\"stages\":0"];
+    const uint64_t *wait_fences = (const uint64_t *)state.blitWaitFences.bytes;
+    [payload appendString:@",\"wait_fences\":["];
+    for (NSUInteger i = 0; i < wait_count; ++i) {
+      if (i)
+        [payload appendString:@","];
+      [payload appendFormat:@"%llu", (unsigned long long)wait_fences[i]];
+    }
+    [payload appendString:@"]"];
+    const uint64_t *update_fences = (const uint64_t *)state.blitUpdateFences.bytes;
+    [payload appendString:@",\"update_fences\":["];
+    for (NSUInteger i = 0; i < update_count; ++i) {
+      if (i)
+        [payload appendString:@","];
+      [payload appendFormat:@"%llu", (unsigned long long)update_fences[i]];
+    }
+    [payload appendString:@"]}"];
+  }
+  [payload appendString:@"}"];
+  dxmt_apitrace_record_blit_payload_stats(
+      dxmt_apitrace_monotonic_ns() - build_start_ns,
+      ops_count,
+      wait_count,
+      update_count,
+      [payload lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+  apitrace_metal_blit_encoder_batch_with_command_buffer(session, encoder, state.commandBuffer, payload.UTF8String);
   [state.blitOps removeAllObjects];
+  [state.blitWaitFences setLength:0];
+  [state.blitUpdateFences setLength:0];
 }
 
 static NSString *
@@ -384,6 +658,86 @@ dxmt_apitrace_render_pipeline_json(const struct WMTRenderPipelineInfo *info) {
     dict[@"fragment_function"] = fragment_state[@"function_name"];
     if (fragment_state[@"function_constants"])
       dict[@"fragment_function_constants"] = fragment_state[@"function_constants"];
+  }
+  return dxmt_apitrace_json_string(dict);
+}
+
+static NSString *
+dxmt_apitrace_mesh_render_pipeline_json(const struct WMTMeshRenderPipelineInfo *info) {
+  NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+  NSDictionary *object_state = dxmt_apitrace_function_state_locked(info->object_function);
+  NSDictionary *mesh_state = dxmt_apitrace_function_state_locked(info->mesh_function);
+  NSDictionary *fragment_state = dxmt_apitrace_function_state_locked(info->fragment_function);
+  dict[@"pipeline_kind"] = @"mesh_render";
+  dict[@"rasterization_enabled"] = @(info->rasterization_enabled);
+  dict[@"raster_sample_count"] = @(info->raster_sample_count);
+  dict[@"depth_pixel_format"] = @(info->depth_pixel_format);
+  dict[@"stencil_pixel_format"] = @(info->stencil_pixel_format);
+  dict[@"color_pixel_format"] = @(info->colors[0].pixel_format);
+  dict[@"alpha_to_coverage_enabled"] = @(info->alpha_to_coverage_enabled);
+  dict[@"logic_operation_enabled"] = @(info->logic_operation_enabled);
+  dict[@"logic_operation"] = @(info->logic_operation);
+  dict[@"immutable_object_buffers"] = @(info->immutable_object_buffers);
+  dict[@"immutable_mesh_buffers"] = @(info->immutable_mesh_buffers);
+  dict[@"immutable_fragment_buffers"] = @(info->immutable_fragment_buffers);
+  dict[@"payload_memory_length"] = @(info->payload_memory_length);
+  dict[@"mesh_tgsize_is_multiple_of_sgwidth"] = @(info->mesh_tgsize_is_multiple_of_sgwidth);
+  dict[@"object_tgsize_is_multiple_of_sgwidth"] = @(info->object_tgsize_is_multiple_of_sgwidth);
+  NSMutableArray *colors = [NSMutableArray arrayWithCapacity:8];
+  for (unsigned i = 0; i < 8; i++) {
+    const struct WMTColorAttachmentBlendInfo *color = &info->colors[i];
+    [colors addObject:@{
+      @"pixel_format" : @(color->pixel_format),
+      @"blending_enabled" : @(color->blending_enabled),
+      @"write_mask" : @(color->write_mask),
+      @"rgb_blend_operation" : @(color->rgb_blend_operation),
+      @"alpha_blend_operation" : @(color->alpha_blend_operation),
+      @"src_rgb_blend_factor" : @(color->src_rgb_blend_factor),
+      @"dst_rgb_blend_factor" : @(color->dst_rgb_blend_factor),
+      @"src_alpha_blend_factor" : @(color->src_alpha_blend_factor),
+      @"dst_alpha_blend_factor" : @(color->dst_alpha_blend_factor),
+    }];
+  }
+  dict[@"colors"] = colors;
+  if (object_state) {
+    dict[@"object_library_id"] = object_state[@"library_id"];
+    dict[@"object_function"] = object_state[@"function_name"];
+    if (object_state[@"function_constants"])
+      dict[@"object_function_constants"] = object_state[@"function_constants"];
+  }
+  if (mesh_state) {
+    dict[@"mesh_library_id"] = mesh_state[@"library_id"];
+    dict[@"mesh_function"] = mesh_state[@"function_name"];
+    if (mesh_state[@"function_constants"])
+      dict[@"mesh_function_constants"] = mesh_state[@"function_constants"];
+  }
+  if (fragment_state) {
+    dict[@"fragment_library_id"] = fragment_state[@"library_id"];
+    dict[@"fragment_function"] = fragment_state[@"function_name"];
+    if (fragment_state[@"function_constants"])
+      dict[@"fragment_function_constants"] = fragment_state[@"function_constants"];
+  }
+  return dxmt_apitrace_json_string(dict);
+}
+
+static NSString *
+dxmt_apitrace_tile_render_pipeline_json(const struct WMTTileRenderPipelineInfo *info) {
+  NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+  NSDictionary *tile_state = dxmt_apitrace_function_state_locked(info->tile_function);
+  dict[@"pipeline_kind"] = @"tile_render";
+  dict[@"raster_sample_count"] = @(info->raster_sample_count);
+  dict[@"tgsize_matches_tile_size"] = @(info->tgsize_matches_tile_size);
+  dict[@"immutable_tile_buffers"] = @(info->immutable_tile_buffers);
+  NSMutableArray *colors = [NSMutableArray arrayWithCapacity:8];
+  for (unsigned i = 0; i < 8; i++) {
+    [colors addObject:@{@"pixel_format" : @(info->color_formats[i])}];
+  }
+  dict[@"colors"] = colors;
+  if (tile_state) {
+    dict[@"tile_library_id"] = tile_state[@"library_id"];
+    dict[@"tile_function"] = tile_state[@"function_name"];
+    if (tile_state[@"function_constants"])
+      dict[@"tile_function_constants"] = tile_state[@"function_constants"];
   }
   return dxmt_apitrace_json_string(dict);
 }
@@ -707,6 +1061,9 @@ dxmt_apitrace_bytes_json(const void *bytes, size_t length) {
   return dxmt_apitrace_json_string(@{ @"length" : @(length), @"bytes" : values });
 }
 
+static const void *
+dxmt_apitrace_buffer_range_contents(obj_handle_t buffer_handle, uint64_t offset, uint64_t requested_size, uint64_t *available_size);
+
 static void
 dxmt_apitrace_snapshot_buffer(apitrace_metal_session_t *session, obj_handle_t buffer_handle, NSMutableSet *seen) {
   if (!session || !buffer_handle)
@@ -727,13 +1084,55 @@ dxmt_apitrace_snapshot_buffer(apitrace_metal_session_t *session, obj_handle_t bu
     @"gpu_address" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)[buffer gpuAddress]],
   });
   apitrace_metal_object_metadata(session, buffer_handle, address_payload.UTF8String);
-  apitrace_metal_register_buffer(
-      session,
-      buffer_handle,
-      [buffer length],
-      (uint32_t)[buffer storageMode],
-      [buffer contents],
-      [buffer length]);
+}
+
+static uint64_t
+dxmt_apitrace_buffer_binding_snapshot_limit(void) {
+  static uint64_t limit = UINT64_MAX;
+  if (limit != UINT64_MAX)
+    return limit;
+
+  limit = 1024ull * 1024ull;
+  const char *env = getenv("DXMT_APITRACE_BUFFER_BINDING_SNAPSHOT_BYTES");
+  if (env && env[0]) {
+    char *end = NULL;
+    unsigned long long parsed = strtoull(env, &end, 10);
+    if (end && end != env)
+      limit = (uint64_t)parsed;
+  }
+  return limit;
+}
+
+static NSString *
+dxmt_apitrace_buffer_range_key(obj_handle_t buffer_handle, uint64_t offset, uint64_t size) {
+  return [NSString stringWithFormat:@"%llu:%llu:%llu",
+      (unsigned long long)buffer_handle,
+      (unsigned long long)offset,
+      (unsigned long long)size];
+}
+
+static const void *
+dxmt_apitrace_snapshot_buffer_range(apitrace_metal_session_t *session, obj_handle_t buffer_handle, uint64_t offset, uint64_t *available_size, NSMutableSet *seen) {
+  if (available_size)
+    *available_size = 0;
+  const uint64_t limit = dxmt_apitrace_buffer_binding_snapshot_limit();
+  if (!session || !buffer_handle || limit == 0)
+    return NULL;
+
+  dxmt_apitrace_snapshot_buffer(session, buffer_handle, seen);
+  uint64_t size = 0;
+  const void *bytes = dxmt_apitrace_buffer_range_contents(buffer_handle, offset, limit, &size);
+  if (!bytes || !size)
+    return NULL;
+
+  NSString *key = dxmt_apitrace_buffer_range_key(buffer_handle, offset, size);
+  if (seen && [seen containsObject:key])
+    return NULL;
+  if (seen)
+    [seen addObject:key];
+  if (available_size)
+    *available_size = size;
+  return bytes;
 }
 
 static const void *
@@ -760,7 +1159,7 @@ dxmt_apitrace_buffer_range_contents(obj_handle_t buffer_handle, uint64_t offset,
 static void
 dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMTApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
-  NSMutableSet *snapshotted_buffers = state.snapshottedBuffers ?: [NSMutableSet set];
+  NSMutableSet *snapshotted_ranges = state.snapshottedBuffers ?: [NSMutableSet set];
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTRenderCommandType)base->type) {
     case WMTRenderCommandSetPSO: {
@@ -770,14 +1169,20 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     }
     case WMTRenderCommandSetVertexBuffer: {
       const struct wmtcmd_render_setbuffer *cmd = (const struct wmtcmd_render_setbuffer *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->buffer, snapshotted_buffers);
-      apitrace_metal_set_vertex_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
+      uint64_t bytes_size = 0;
+      const void *bytes = dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->buffer, cmd->offset, &bytes_size, snapshotted_ranges);
+      apitrace_metal_set_vertex_buffer_with_contents(
+          session, encoder, cmd->buffer, cmd->offset, cmd->index, bytes, bytes_size);
       break;
     }
     case WMTRenderCommandSetFragmentBuffer: {
       const struct wmtcmd_render_setbuffer *cmd = (const struct wmtcmd_render_setbuffer *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->buffer, snapshotted_buffers);
-      apitrace_metal_set_fragment_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
+      uint64_t bytes_size = 0;
+      const void *bytes = dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->buffer, cmd->offset, &bytes_size, snapshotted_ranges);
+      apitrace_metal_set_fragment_buffer_with_contents(
+          session, encoder, cmd->buffer, cmd->offset, cmd->index, bytes, bytes_size);
       break;
     }
     case WMTRenderCommandSetVertexBufferOffset: {
@@ -846,7 +1251,7 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     case WMTRenderCommandUseResource: {
       const struct wmtcmd_render_useresource *cmd = (const struct wmtcmd_render_useresource *)base;
       if ([(id)cmd->resource conformsToProtocol:@protocol(MTLBuffer)])
-        dxmt_apitrace_snapshot_buffer(session, cmd->resource, snapshotted_buffers);
+        dxmt_apitrace_snapshot_buffer(session, cmd->resource, NULL);
       apitrace_metal_use_resource(session, encoder, cmd->resource, cmd->usage, cmd->stages);
       break;
     }
@@ -859,7 +1264,10 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     }
     case WMTRenderCommandDrawIndexed: {
       const struct wmtcmd_render_draw_indexed *cmd = (const struct wmtcmd_render_draw_indexed *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->index_buffer, snapshotted_buffers);
+      uint64_t bytes_size = 0;
+      dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->index_buffer, cmd->index_buffer_offset,
+          &bytes_size, snapshotted_ranges);
       apitrace_metal_draw_indexed_primitives(
           session, encoder, cmd->primitive_type, (uint32_t)cmd->index_count, cmd->index_type,
           cmd->index_buffer, cmd->index_buffer_offset, cmd->instance_count, cmd->base_vertex, cmd->base_instance);
@@ -867,15 +1275,23 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     }
     case WMTRenderCommandDrawIndirect: {
       const struct wmtcmd_render_draw_indirect *cmd = (const struct wmtcmd_render_draw_indirect *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->indirect_args_buffer, snapshotted_buffers);
+      uint64_t bytes_size = 0;
+      dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->indirect_args_buffer, cmd->indirect_args_offset,
+          &bytes_size, snapshotted_ranges);
       apitrace_metal_draw_primitives_indirect(
           session, encoder, cmd->primitive_type, cmd->indirect_args_buffer, cmd->indirect_args_offset);
       break;
     }
     case WMTRenderCommandDrawIndexedIndirect: {
       const struct wmtcmd_render_draw_indexed_indirect *cmd = (const struct wmtcmd_render_draw_indexed_indirect *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->index_buffer, snapshotted_buffers);
-      dxmt_apitrace_snapshot_buffer(session, cmd->indirect_args_buffer, snapshotted_buffers);
+      uint64_t bytes_size = 0;
+      dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->index_buffer, cmd->index_buffer_offset,
+          &bytes_size, snapshotted_ranges);
+      dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->indirect_args_buffer, cmd->indirect_args_offset,
+          &bytes_size, snapshotted_ranges);
       apitrace_metal_draw_indexed_primitives_indirect(
           session, encoder, cmd->primitive_type, cmd->index_type, cmd->index_buffer, cmd->index_buffer_offset,
           cmd->indirect_args_buffer, cmd->indirect_args_offset);
@@ -905,7 +1321,7 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
 static void
 dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMTApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
-  NSMutableSet *snapshotted_buffers = [NSMutableSet set];
+  NSMutableSet *snapshotted_ranges = state.snapshottedBuffers ?: [NSMutableSet set];
   struct WMTSize threadgroup_size = {1, 1, 1};
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTComputeCommandType)base->type) {
@@ -917,8 +1333,11 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     }
     case WMTComputeCommandSetBuffer: {
       const struct wmtcmd_compute_setbuffer *cmd = (const struct wmtcmd_compute_setbuffer *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->buffer, snapshotted_buffers);
-      apitrace_metal_set_compute_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
+      uint64_t bytes_size = 0;
+      const void *bytes = dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->buffer, cmd->offset, &bytes_size, snapshotted_ranges);
+      apitrace_metal_set_compute_buffer_with_contents(
+          session, encoder, cmd->buffer, cmd->offset, cmd->index, bytes, bytes_size);
       break;
     }
     case WMTComputeCommandSetBufferOffset: {
@@ -949,7 +1368,7 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     case WMTComputeCommandUseResource: {
       const struct wmtcmd_compute_useresource *cmd = (const struct wmtcmd_compute_useresource *)base;
       if ([(id)cmd->resource conformsToProtocol:@protocol(MTLBuffer)])
-        dxmt_apitrace_snapshot_buffer(session, cmd->resource, snapshotted_buffers);
+        dxmt_apitrace_snapshot_buffer(session, cmd->resource, NULL);
       apitrace_metal_use_resource(session, encoder, cmd->resource, cmd->usage, 0);
       break;
     }
@@ -968,7 +1387,10 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     }
     case WMTComputeCommandDispatchIndirect: {
       const struct wmtcmd_compute_dispatch_indirect *cmd = (const struct wmtcmd_compute_dispatch_indirect *)base;
-      dxmt_apitrace_snapshot_buffer(session, cmd->indirect_args_buffer, snapshotted_buffers);
+      uint64_t bytes_size = 0;
+      dxmt_apitrace_snapshot_buffer_range(
+          session, cmd->indirect_args_buffer, cmd->indirect_args_offset,
+          &bytes_size, snapshotted_ranges);
       apitrace_metal_dispatch_threadgroups_indirect(
           session, encoder, cmd->indirect_args_buffer, cmd->indirect_args_offset,
           (uint32_t)threadgroup_size.width, (uint32_t)threadgroup_size.height, (uint32_t)threadgroup_size.depth);
@@ -1003,6 +1425,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     case WMTBlitCommandCopyFromBufferToBuffer: {
       dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
+      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       const struct wmtcmd_blit_copy_from_buffer_to_buffer *cmd = (const struct wmtcmd_blit_copy_from_buffer_to_buffer *)base;
       uint64_t source_bytes_size = 0;
       const void *source_bytes =
@@ -1015,6 +1438,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     case WMTBlitCommandCopyFromBufferToTexture: {
       dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
+      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       const struct wmtcmd_blit_copy_from_buffer_to_texture *cmd = (const struct wmtcmd_blit_copy_from_buffer_to_texture *)base;
       NSString *payload = dxmt_apitrace_copy_buffer_to_texture_json(
           cmd->src, cmd->src_offset, cmd->bytes_per_row, cmd->bytes_per_image, &cmd->size, cmd->dst, cmd->slice,
@@ -1031,14 +1455,19 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
       const struct wmtcmd_blit_copy_from_texture_to_texture *cmd = (const struct wmtcmd_blit_copy_from_texture_to_texture *)base;
-      [state.blitOps addObject:@{
-        @"op" : @"copy_texture",
-        @"source_texture_id" : @(cmd->src),
-        @"destination_texture_id" : @(cmd->dst),
-        @"payload" : dxmt_apitrace_copy_texture_json(
-            cmd->src, cmd->dst, &cmd->src_origin, &cmd->src_size, cmd->src_slice, cmd->src_level,
-            &cmd->dst_origin, cmd->dst_slice, cmd->dst_level),
-      }];
+      if (!state.blitOps.count) {
+        dxmt_apitrace_accumulate_command_buffer_blit_fences(state.commandBuffer, state);
+        dxmt_apitrace_accumulate_command_buffer_blit_copy_texture(session, state.commandBuffer, cmd);
+      } else {
+        [state.blitOps addObject:@{
+          @"op" : @"copy_texture",
+          @"source_texture_id" : @(cmd->src),
+          @"destination_texture_id" : @(cmd->dst),
+          @"payload" : dxmt_apitrace_copy_texture_json(
+              cmd->src, cmd->dst, &cmd->src_origin, &cmd->src_size, cmd->src_slice, cmd->src_level,
+              &cmd->dst_origin, cmd->dst_slice, cmd->dst_level),
+        }];
+      }
       break;
     }
     case WMTBlitCommandFillBuffer: {
@@ -1055,11 +1484,11 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     case WMTBlitCommandWaitForFence:
     case WMTBlitCommandUpdateFence: {
       const struct wmtcmd_blit_fence_op *cmd = (const struct wmtcmd_blit_fence_op *)base;
-      if (base->type == WMTBlitCommandWaitForFence) {
-        [state.blitOps addObject:@[ @"wait_fence", @(cmd->fence), @0 ]];
-      } else {
-        [state.blitOps addObject:@[ @"update_fence", @(cmd->fence), @0 ]];
-      }
+      uint64_t fence = cmd->fence;
+      if (base->type == WMTBlitCommandWaitForFence)
+        [state.blitWaitFences appendBytes:&fence length:sizeof(fence)];
+      else
+        [state.blitUpdateFences appendBytes:&fence length:sizeof(fence)];
       break;
     }
     case WMTBlitCommandCopyFromTextureToBuffer:
@@ -1067,6 +1496,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     case WMTBlitCommandResolveCounters:
       dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
+      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       break;
     default:
       break;
@@ -1090,11 +1520,13 @@ dxmt_apitrace_begin_encoder_locked(
   BOOL metal_trace_began = YES;
   switch (kind) {
   case DXMTApitraceEncoderKindRender: {
+    dxmt_apitrace_flush_command_buffer_blit_batch(session, command_buffer);
     NSString *payload = dxmt_apitrace_render_pass_json(render_pass_info);
     begin_sequence = apitrace_metal_render_encoder_begin(session, encoder, command_buffer, payload.UTF8String);
     break;
   }
   case DXMTApitraceEncoderKindCompute:
+    dxmt_apitrace_flush_command_buffer_blit_batch(session, command_buffer);
     begin_sequence = apitrace_metal_compute_encoder_begin(session, encoder, command_buffer, "{}");
     break;
   case DXMTApitraceEncoderKindBlit:
@@ -1122,7 +1554,12 @@ dxmt_apitrace_end_encoder_locked(apitrace_metal_session_t *session, obj_handle_t
     if (state.metalTraceBegan) {
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
     } else {
-      dxmt_apitrace_emit_blit_encoder_batch(session, encoder, state);
+      if (state.blitOps.count) {
+        dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+        dxmt_apitrace_emit_blit_encoder_batch(session, encoder, state);
+      } else {
+        dxmt_apitrace_accumulate_command_buffer_blit_fences(state.commandBuffer, state);
+      }
     }
   }
   dxmt_apitrace_flush_fence_ops(session, encoder, state);
@@ -1678,7 +2115,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
                                                                                                       error:&err];
   }
 #if DXMT_APITRACE_METAL
-  if (dxmt_apitrace_runtime_enabled() && !err && params->ret_pso) {
+  if (dxmt_apitrace_runtime_enabled() && params->ret_pso) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
     if (dxmt_apitrace_ensure_session_locked()) {
       NSString *descriptor_json = dxmt_apitrace_compute_pipeline_json(info);
@@ -1914,12 +2351,13 @@ _MTLDevice_newRenderPipelineState(void *obj) {
                                                                                            reflection:nil
                                                                                                 error:&err];
   params->ret_error = (obj_handle_t)err;
-  if (!err && info->binary_archive_for_serialization) {
+  const BOOL pso_created = params->ret_pso != 0;
+  if (pso_created && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
                                                                                                      error:&err];
   }
 #if DXMT_APITRACE_METAL
-  if (dxmt_apitrace_runtime_enabled() && !err && params->ret_pso) {
+  if (dxmt_apitrace_runtime_enabled() && pso_created) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
     if (dxmt_apitrace_ensure_session_locked()) {
       NSString *descriptor_json = dxmt_apitrace_render_pipeline_json(info);
@@ -2070,13 +2508,30 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
                                                                         reflection:nil
                                                                              error:&err];
   params->ret_error = (obj_handle_t)err;
+  const BOOL pso_created = params->ret_pso != 0;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
-    if (!err && info->binary_archive_for_serialization) {
+    if (pso_created && info->binary_archive_for_serialization) {
       [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
           addMeshRenderPipelineFunctionsWithDescriptor:descriptor
                                                  error:&err];
     }
+  }
+#endif
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() && pso_created) {
+    pthread_mutex_lock(&dxmt_apitrace_lock);
+    if (dxmt_apitrace_ensure_session_locked()) {
+      NSString *descriptor_json = dxmt_apitrace_mesh_render_pipeline_json(info);
+      apitrace_metal_register_mesh_render_pipeline(
+          dxmt_apitrace_session,
+          params->ret_pso,
+          descriptor_json.UTF8String,
+          info->object_function,
+          info->mesh_function,
+          info->fragment_function);
+    }
+    pthread_mutex_unlock(&dxmt_apitrace_lock);
   }
 #endif
   [descriptor release];
@@ -2931,7 +3386,32 @@ _DeveloperHUDProperties_remove(void *obj) {
 static NTSTATUS
 _MetalDrawable_texture(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  params->ret = (obj_handle_t)[(id<CAMetalDrawable>)params->handle texture];
+  id<MTLTexture> texture = [(id<CAMetalDrawable>)params->handle texture];
+  params->ret = (obj_handle_t)texture;
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() && texture) {
+    struct WMTTextureInfo info;
+    extract_texture_descriptor(texture, &info);
+    info.gpu_resource_id = [texture gpuResourceID]._impl;
+    info.mach_port = 0;
+    pthread_mutex_lock(&dxmt_apitrace_lock);
+    if (dxmt_apitrace_ensure_session_locked()) {
+      NSString *resource_payload = dxmt_apitrace_json_string(@{
+        @"kind" : @"dxmt_texture_gpu_resource_id",
+        @"texture_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)params->ret],
+        @"gpu_resource_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)info.gpu_resource_id],
+      });
+      apitrace_metal_object_metadata(dxmt_apitrace_session, params->ret, resource_payload.UTF8String);
+      NSString *descriptor_json = dxmt_apitrace_texture_descriptor_json(&info);
+      apitrace_metal_register_drawable_texture(
+          dxmt_apitrace_session,
+          params->ret,
+          params->handle,
+          descriptor_json.UTF8String);
+    }
+    pthread_mutex_unlock(&dxmt_apitrace_lock);
+  }
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -4070,13 +4550,14 @@ _MTLBuffer_updateContents(void *obj) {
   if (dxmt_apitrace_runtime_enabled() && [(id<MTLBuffer>)params->buffer storageMode] != MTLStorageModePrivate) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
     if (dxmt_apitrace_ensure_session_locked()) {
-      apitrace_metal_register_buffer(
+      apitrace_metal_update_buffer_contents(
           dxmt_apitrace_session,
           params->buffer,
-          [(id<MTLBuffer>)params->buffer length],
+          params->offset,
+          params->length,
           (uint32_t)[(id<MTLBuffer>)params->buffer storageMode],
-          [(id<MTLBuffer>)params->buffer contents],
-          [(id<MTLBuffer>)params->buffer length]);
+          (const uint8_t *)[(id<MTLBuffer>)params->buffer contents] + params->offset,
+          params->length);
     }
     pthread_mutex_unlock(&dxmt_apitrace_lock);
   }
@@ -4372,13 +4853,28 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
                                                                                                reflection:nil
                                                                                                     error:&err];
   params->ret_error = (obj_handle_t)err;
+  const BOOL pso_created = params->ret_pso != 0;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
-    if (!err && info->binary_archive_for_serialization) {
+    if (pso_created && info->binary_archive_for_serialization) {
       [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
           addTileRenderPipelineFunctionsWithDescriptor:descriptor
                                                  error:&err];
     }
+  }
+#endif
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() && pso_created) {
+    pthread_mutex_lock(&dxmt_apitrace_lock);
+    if (dxmt_apitrace_ensure_session_locked()) {
+      NSString *descriptor_json = dxmt_apitrace_tile_render_pipeline_json(info);
+      apitrace_metal_register_tile_render_pipeline(
+          dxmt_apitrace_session,
+          params->ret_pso,
+          descriptor_json.UTF8String,
+          info->tile_function);
+    }
+    pthread_mutex_unlock(&dxmt_apitrace_lock);
   }
 #endif
   [descriptor release];
@@ -4404,6 +4900,18 @@ _WMTApitraceSessionClose(void *obj) {
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
   dxmt_apitrace_close_session_locked();
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTApitraceSessionSealCheckpoint(void *obj) {
+  (void)obj;
+  if (!dxmt_apitrace_runtime_enabled())
+    return STATUS_SUCCESS;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  if (dxmt_apitrace_session)
+    apitrace_metal_session_seal_checkpoint(dxmt_apitrace_session);
   pthread_mutex_unlock(&dxmt_apitrace_lock);
   return STATUS_SUCCESS;
 }
@@ -4448,6 +4956,7 @@ _WMTApitraceCommandBufferCommit(void *obj) {
   pthread_mutex_lock(&dxmt_apitrace_lock);
   DXMTApitraceCommandBufferState *state = [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(params->handle)];
   if (dxmt_apitrace_session && state) {
+    dxmt_apitrace_flush_command_buffer_blit_batch(dxmt_apitrace_session, params->handle);
     apitrace_metal_command_buffer_commit(dxmt_apitrace_session, params->handle);
     [dxmt_apitrace_command_buffers removeObjectForKey:dxmt_apitrace_key(params->handle)];
     apitrace_metal_set_current_d3d_sequence(dxmt_apitrace_session, 0);
@@ -4472,6 +4981,7 @@ _WMTApitracePresentDrawable(void *obj) {
         dxmt_apitrace_session,
         params->command_buffer,
         params->drawable,
+        (uint64_t)texture,
         params->frame_index,
         width,
         height,
@@ -4484,6 +4994,7 @@ _WMTApitracePresentDrawable(void *obj) {
 #else
 static NTSTATUS _WMTApitraceSessionEnsureOpen(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceSessionClose(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMTApitraceSessionSealCheckpoint(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceSetCurrentD3DSequence(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceCommandBufferBegin(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceCommandBufferCommit(void *obj) { (void)obj; return STATUS_SUCCESS; }
@@ -4643,6 +5154,7 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTApitraceCommandBufferBegin,
     &_WMTApitraceCommandBufferCommit,
     &_WMTApitracePresentDrawable,
+    &_WMTApitraceSessionSealCheckpoint,
 };
 
 #ifndef DXMT_NATIVE
@@ -4789,5 +5301,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTApitraceCommandBufferBegin,
     &_WMTApitraceCommandBufferCommit,
     &_WMTApitracePresentDrawable,
+    &_WMTApitraceSessionSealCheckpoint,
 };
 #endif

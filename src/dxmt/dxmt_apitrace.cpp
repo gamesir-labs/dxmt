@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <ctime>
+#include <limits>
 #include <string>
 
 #ifdef _WIN32
@@ -22,7 +23,12 @@ namespace {
 
 std::atomic<int> enabled_cache{-1};
 std::atomic<int> verbose_cache{-1};
+std::atomic<uint64_t> seal_after_frame_cache{std::numeric_limits<uint64_t>::max()};
+std::atomic_bool seal_after_frame_configured = false;
+std::atomic_bool seal_after_frame_metal_done = false;
+std::atomic_bool seal_after_frame_d3d_done = false;
 std::atomic_bool session_open_logged = false;
+std::atomic_bool shutdown_requested = false;
 
 bool
 truthy_env_value(const std::string &value) {
@@ -63,6 +69,21 @@ log_verbose(const char *message, uint64_t arg0 = 0, uint64_t arg1 = 0) {
   INFO("DXMT apitrace: ", message, " arg0=", arg0, " arg1=", arg1);
 }
 
+uint64_t
+seal_after_frame() {
+  if (!seal_after_frame_configured.exchange(true, std::memory_order_acq_rel)) {
+    const auto value = env::getEnvVar("APITRACE_D3D12_SEAL_CHECKPOINT_AFTER_FRAME");
+    if (!value.empty()) {
+      try {
+        seal_after_frame_cache.store(std::stoull(value), std::memory_order_relaxed);
+      } catch (...) {
+        seal_after_frame_cache.store(std::numeric_limits<uint64_t>::max(), std::memory_order_relaxed);
+      }
+    }
+  }
+  return seal_after_frame_cache.load(std::memory_order_relaxed);
+}
+
 void
 set_env_var(const char *name, const char *value) {
 #ifdef _WIN32
@@ -93,6 +114,9 @@ enabled() {
 void
 ensure_session_open() {
   if (!enabled())
+    return;
+
+  if (shutdown_requested.load(std::memory_order_acquire))
     return;
 
   static std::atomic_bool bundle_initialized = false;
@@ -131,14 +155,58 @@ ensure_session_open() {
 }
 
 void
+seal_checkpoint() {
+  if (!enabled())
+    return;
+
+  if (shutdown_requested.load(std::memory_order_acquire))
+    return;
+
+  WMTApitraceSessionSealCheckpoint();
+#ifdef DXMT_APITRACE_D3D
+  ::apitrace::runtime::seal_process_trace_session_checkpoint();
+#endif
+  log_verbose("session checkpoint sealed");
+}
+
+void
+seal_metal_checkpoint() {
+  if (!enabled())
+    return;
+
+  if (shutdown_requested.load(std::memory_order_acquire))
+    return;
+
+  WMTApitraceSessionSealCheckpoint();
+  log_verbose("metal checkpoint sealed");
+}
+
+void
+seal_d3d_checkpoint() {
+  if (!enabled())
+    return;
+
+  if (shutdown_requested.load(std::memory_order_acquire))
+    return;
+
+#ifdef DXMT_APITRACE_D3D
+  ::apitrace::runtime::seal_process_trace_session_checkpoint();
+#endif
+  log_verbose("d3d checkpoint sealed");
+}
+
+void
 shutdown() {
   if (!enabled())
     return;
 
+  if (shutdown_requested.exchange(true, std::memory_order_acq_rel))
+    return;
+
+  WMTApitraceSessionClose();
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::shutdown_process_trace_session();
 #endif
-  WMTApitraceSessionClose();
   log_verbose("session close");
 }
 
@@ -161,6 +229,26 @@ on_command_buffer_begin(uint64_t command_buffer_id, uint64_t frame_id) {
 }
 
 void
+maybe_seal_metal_checkpoint_after_frame(uint64_t frame_index) {
+  const auto target = seal_after_frame();
+  if (target == std::numeric_limits<uint64_t>::max() || frame_index + 1 < target)
+    return;
+  if (seal_after_frame_metal_done.exchange(true, std::memory_order_acq_rel))
+    return;
+  seal_metal_checkpoint();
+}
+
+void
+maybe_seal_d3d_checkpoint_after_frame(uint64_t frame_index) {
+  const auto target = seal_after_frame();
+  if (target == std::numeric_limits<uint64_t>::max() || frame_index + 1 < target)
+    return;
+  if (seal_after_frame_d3d_done.exchange(true, std::memory_order_acq_rel))
+    return;
+  seal_d3d_checkpoint();
+}
+
+void
 on_command_buffer_commit(uint64_t command_buffer_id) {
   if (!enabled())
     return;
@@ -180,6 +268,7 @@ on_present_drawable(
     return;
 
   WMTApitracePresentDrawable(command_buffer_id, drawable_id, frame_index, sync_interval, flags);
+  maybe_seal_metal_checkpoint_after_frame(frame_index);
   if (verbose_enabled()) {
     INFO("DXMT apitrace: present commandBuffer=", command_buffer_id,
          " drawable=", drawable_id,

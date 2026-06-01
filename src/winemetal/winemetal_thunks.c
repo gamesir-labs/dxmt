@@ -138,6 +138,13 @@ WMTApitraceSessionClose(void) {
 }
 
 WINEMETAL_API void
+WMTApitraceSessionSealCheckpoint(void) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = 0;
+  UNIX_CALL(142, &params);
+}
+
+WINEMETAL_API void
 WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence) {
   struct unixcall_generic_obj_uint64_noret params;
   params.handle = 0;
