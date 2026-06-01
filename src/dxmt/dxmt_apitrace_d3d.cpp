@@ -964,12 +964,26 @@ on_d3d12_resource_barrier(void *command_list, uint32_t count) {
   ::apitrace::d3d12::record_call("ID3D12GraphicsCommandList::ResourceBarrier");
 }
 
-void
-on_d3d12_present(void *swapchain, uint32_t sync_interval, uint32_t flags) {
+uint64_t
+on_d3d12_present(void *swapchain, uint32_t sync_interval, uint32_t flags,
+                 int32_t result_code, bool frame_presented) {
   if (!d3d_enabled() || !swapchain)
+    return ~0ull;
+  ensure_session_open();
+  return ::apitrace::d3d12::record_present(
+      swapchain, sync_interval, flags, result_code, frame_presented);
+}
+
+void
+record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
+                     uint32_t row_pitch, uint32_t sync_interval,
+                     uint32_t flags, const void *rgba_data, size_t rgba_size) {
+  if (!d3d_enabled() || frame_index == ~0ull)
     return;
   ensure_session_open();
-  ::apitrace::d3d12::record_present(swapchain, sync_interval, flags);
+  ::apitrace::d3d12::record_present_frame(
+      frame_index, width, height, row_pitch, sync_interval, flags, rgba_data,
+      rgba_size);
 }
 
 void

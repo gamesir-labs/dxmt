@@ -258,6 +258,9 @@ struct PresentData : EncoderData {
   Rc<Presenter> presenter;
   double after;
   DXMTPresentMetadata metadata;
+  uint64_t apitrace_frame_index = ~0ull;
+  uint32_t sync_interval = 0;
+  uint32_t flags = 0;
 };
 
 struct SpatialUpscaleData : EncoderData {
@@ -671,8 +674,13 @@ public:
     return (new (allocate_cpu_heap(sizeof(T), alignof(T))) T());
   };
 
-  void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata);
-  void present(Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata);
+  void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after,
+               DXMTPresentMetadata metadata, uint64_t apitrace_frame_index = ~0ull,
+               uint32_t sync_interval = 0, uint32_t flags = 0);
+  void present(Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter,
+               double after, DXMTPresentMetadata metadata,
+               uint64_t apitrace_frame_index = ~0ull, uint32_t sync_interval = 0,
+               uint32_t flags = 0);
 
   void upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);
 

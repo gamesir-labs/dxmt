@@ -2312,47 +2312,54 @@ private:
     HRESULT STDMETHODCALLTYPE Present1(
         UINT sync_interval, UINT flags,
         const DXGI_PRESENT_PARAMETERS *present_parameters) override {
-      dxmt::apitrace::on_d3d12_present(this, sync_interval, flags);
+      auto trace_present_return = [&](HRESULT result) {
+        dxmt::apitrace::on_d3d12_present(
+            this, sync_interval, flags, static_cast<int32_t>(result), false);
+        return result;
+      };
       if (sync_interval > 4)
-        return DXGI_ERROR_INVALID_CALL;
+        return trace_present_return(DXGI_ERROR_INVALID_CALL);
       if (flags & ~D3D12SupportedPresentFlags) {
         WARN("D3D12SwapChain::Present1: unsupported flags ",
              flags & ~D3D12SupportedPresentFlags);
-        return DXGI_ERROR_UNSUPPORTED;
+        return trace_present_return(DXGI_ERROR_UNSUPPORTED);
       }
       if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
           !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
         WARN("D3D12SwapChain::Present1: ALLOW_TEARING used without swapchain "
              "tearing support");
-        return DXGI_ERROR_INVALID_CALL;
+        return trace_present_return(DXGI_ERROR_INVALID_CALL);
       }
       if ((flags & DXGI_PRESENT_ALLOW_TEARING) && sync_interval) {
         WARN("D3D12SwapChain::Present1: ALLOW_TEARING requires sync interval 0");
-        return DXGI_ERROR_INVALID_CALL;
+        return trace_present_return(DXGI_ERROR_INVALID_CALL);
       }
       if (present_parameters &&
           (present_parameters->DirtyRectsCount || present_parameters->pDirtyRects ||
            present_parameters->pScrollRect || present_parameters->pScrollOffset)) {
         WARN("D3D12SwapChain::Present1: dirty rect and scroll parameters are "
              "not supported");
-        return DXGI_ERROR_UNSUPPORTED;
+        return trace_present_return(DXGI_ERROR_UNSUPPORTED);
       }
 
       bool occluded = wsi::isMinimized(hWnd_);
       HRESULT hr = occluded ? DXGI_STATUS_OCCLUDED : S_OK;
       if (flags & DXGI_PRESENT_TEST)
-        return hr;
+        return trace_present_return(hr);
       if (hr == DXGI_STATUS_OCCLUDED)
-        return hr;
+        return trace_present_return(hr);
 
       auto *resource = dynamic_cast<Resource *>(
           backbuffers_[current_backbuffer_].ptr());
       if (!resource || !resource->GetTexture())
-        return E_FAIL;
+        return trace_present_return(E_FAIL);
       D3D12DiagLogSwapChainBackBuffer("Present1", current_backbuffer_,
                                       current_backbuffer_,
                                       backbuffers_[current_backbuffer_].ptr());
 
+      const auto apitrace_frame_index =
+          dxmt::apitrace::on_d3d12_present(
+              this, sync_interval, flags, static_cast<int32_t>(S_OK), true);
       double vsync_duration = sync_interval ? sync_interval / 60.0 : 0.0;
       auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
       auto *chunk = dxmt_queue.CurrentChunk();
@@ -2370,10 +2377,14 @@ private:
         presenter = presenter_,
         present_signal,
         vsync_duration,
+        apitrace_frame_index,
+        sync_interval,
+        flags,
         state = std::move(state)
       ](ArgumentEncodingContext &ctx) mutable {
         ctx.present(backbuffer, present_view, presenter, vsync_duration,
-                    state.metadata);
+                    state.metadata, apitrace_frame_index, sync_interval,
+                    flags);
         if (present_signal) {
           ReleaseSemaphore(present_signal, 1, nullptr);
           CloseHandle(present_signal);

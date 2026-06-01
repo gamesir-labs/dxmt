@@ -1,6 +1,7 @@
 #include "dxmt_context.hpp"
 #include "Metal.hpp"
 #include "dxmt_apitrace.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_deptrack.hpp"
 #include "dxmt_format.hpp"
@@ -15,8 +16,10 @@
 #include <cfloat>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace dxmt {
 
@@ -536,6 +539,75 @@ DebugPresentReadbackEnabled() {
 }
 
 static bool
+TracePresentFrameCaptureEnabled() {
+  static const bool enabled = DebugEnabledEnv("APITRACE_D3D12_CAPTURE_PRESENT_FRAMES");
+  return enabled;
+}
+
+static uint32_t
+TracePresentFrameCaptureLimit() {
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("APITRACE_D3D12_CAPTURE_PRESENT_FRAME_LIMIT");
+    if (value.empty())
+      return std::numeric_limits<uint32_t>::max();
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return std::numeric_limits<uint32_t>::max();
+    return static_cast<uint32_t>(
+        std::min<unsigned long>(parsed, std::numeric_limits<uint32_t>::max()));
+  }();
+  return limit;
+}
+
+static uint32_t
+TracePresentFrameCaptureSkip() {
+  static const uint32_t skip = []() {
+    auto value = env::getEnvVar("APITRACE_D3D12_CAPTURE_PRESENT_FRAME_SKIP");
+    if (value.empty())
+      return 0u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 0u;
+    return static_cast<uint32_t>(
+        std::min<unsigned long>(parsed, std::numeric_limits<uint32_t>::max()));
+  }();
+  return skip;
+}
+
+static uint32_t
+TracePresentFrameCaptureInterval() {
+  static const uint32_t interval = []() {
+    auto value = env::getEnvVar("APITRACE_D3D12_CAPTURE_PRESENT_FRAME_INTERVAL");
+    if (value.empty())
+      return 1u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 1u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return interval;
+}
+
+static bool
+TraceShouldCapturePresentFrame(uint32_t &capture_index) {
+  static std::atomic<uint32_t> present_count = 0;
+  static std::atomic<uint32_t> capture_count = 0;
+  if (!TracePresentFrameCaptureEnabled())
+    return false;
+  const auto present_index = present_count.fetch_add(1, std::memory_order_relaxed);
+  const auto skip = TracePresentFrameCaptureSkip();
+  if (present_index < skip)
+    return false;
+  if (((present_index - skip) % TracePresentFrameCaptureInterval()) != 0)
+    return false;
+  capture_index = capture_count.fetch_add(1, std::memory_order_relaxed);
+  return capture_index < TracePresentFrameCaptureLimit();
+}
+
+static bool
 DebugRenderReadbackEnabled() {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_READBACK");
   return enabled;
@@ -846,6 +918,119 @@ DebugEncodePresentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf
           present_index, index, point_x, point_y, 0, 0, width, height);
     }
   }
+}
+
+static void
+TraceEncodePresentFrameReadback(QueryReadbacks &readbacks,
+                                WMT::CommandBuffer cmdbuf,
+                                WMT::Device device,
+                                WMT::Texture texture,
+                                uint64_t frame_index,
+                                uint32_t sync_interval,
+                                uint32_t flags,
+                                uint32_t capture_index) {
+  if (!DebugSupportsTextureReadback(texture)) {
+    WARN("DXMT apitrace: present frame capture skipped",
+         " frame_index=", frame_index,
+         " capture_index=", capture_index,
+         " reason=unsupported_texture",
+         " format=", texture ? uint32_t(texture.pixelFormat()) : 0);
+    return;
+  }
+
+  if (texture.pixelFormat() != WMTPixelFormatRGBA8Unorm &&
+      texture.pixelFormat() != WMTPixelFormatRGBA8Unorm_sRGB &&
+      texture.pixelFormat() != WMTPixelFormatBGRA8Unorm &&
+      texture.pixelFormat() != WMTPixelFormatBGRA8Unorm_sRGB) {
+    WARN("DXMT apitrace: present frame capture skipped",
+         " frame_index=", frame_index,
+         " capture_index=", capture_index,
+         " reason=unsupported_format",
+         " format=", uint32_t(texture.pixelFormat()));
+    return;
+  }
+
+  const uint32_t width = texture.width();
+  const uint32_t height = texture.height();
+  if (!width || !height) {
+    WARN("DXMT apitrace: present frame capture skipped",
+         " frame_index=", frame_index,
+         " capture_index=", capture_index,
+         " reason=empty_texture");
+    return;
+  }
+
+  const uint32_t row_pitch = width * 4u;
+  const uint64_t payload_size = uint64_t(row_pitch) * uint64_t(height);
+  if (payload_size > std::numeric_limits<uint32_t>::max()) {
+    WARN("DXMT apitrace: present frame capture skipped",
+         " frame_index=", frame_index,
+         " capture_index=", capture_index,
+         " reason=too_large",
+         " size=", payload_size);
+    return;
+  }
+
+  WMTBufferInfo buffer_info = {};
+  buffer_info.length = payload_size;
+  buffer_info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked;
+  buffer_info.memory.set(nullptr);
+#ifdef __i386__
+  buffer_info.memory.set(wsi::aligned_malloc(payload_size, DXMT_PAGE_SIZE));
+#endif
+  auto buffer = device.newBuffer(buffer_info);
+  auto *mapped = static_cast<uint8_t *>(buffer_info.memory.get_accessible_or_null());
+  if (!buffer || !mapped) {
+    WARN("DXMT apitrace: present frame capture skipped",
+         " frame_index=", frame_index,
+         " capture_index=", capture_index,
+         " reason=buffer_allocation_failed",
+         " size=", payload_size);
+#ifdef __i386__
+    wsi::aligned_free(buffer_info.memory.get_accessible_or_null());
+#endif
+    return;
+  }
+
+  auto encoder = cmdbuf.blitCommandEncoder();
+  wmtcmd_blit_copy_from_texture_to_buffer copy = {};
+  copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+  copy.next.set(nullptr);
+  copy.src = texture;
+  copy.slice = 0;
+  copy.level = 0;
+  copy.origin = {0, 0, 0};
+  copy.size = {width, height, 1};
+  copy.dst = buffer;
+  copy.offset = 0;
+  copy.bytes_per_row = row_pitch;
+  copy.bytes_per_image = static_cast<uint32_t>(payload_size);
+  encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+  encoder.endEncoding();
+
+  readbacks.diagnostics.push_back(
+      [buffer = WMT::Reference<WMT::Buffer>(buffer), mapped, frame_index,
+       width, height, row_pitch, sync_interval, flags, payload_size,
+       pixel_format = texture.pixelFormat()]() {
+        std::vector<uint8_t> rgba(static_cast<size_t>(payload_size));
+        if (pixel_format == WMTPixelFormatRGBA8Unorm ||
+            pixel_format == WMTPixelFormatRGBA8Unorm_sRGB) {
+          std::memcpy(rgba.data(), mapped, static_cast<size_t>(payload_size));
+        } else {
+          for (uint64_t offset = 0; offset < payload_size; offset += 4) {
+            rgba[static_cast<size_t>(offset + 0)] = mapped[offset + 2];
+            rgba[static_cast<size_t>(offset + 1)] = mapped[offset + 1];
+            rgba[static_cast<size_t>(offset + 2)] = mapped[offset + 0];
+            rgba[static_cast<size_t>(offset + 3)] = mapped[offset + 3];
+          }
+        }
+        dxmt::apitrace::record_present_frame(
+            frame_index, width, height, row_pitch, sync_interval, flags,
+            rgba.data(), rgba.size());
+#ifdef __i386__
+        wsi::aligned_free(mapped);
+#endif
+      });
 }
 
 static void
@@ -1759,12 +1944,20 @@ ArgumentEncodingContext::resolveTexture(
 };
 
 void
-ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata) {
-  present(texture, texture->fullView, presenter, after, metadata);
+ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter,
+                                 double after, DXMTPresentMetadata metadata,
+                                 uint64_t apitrace_frame_index,
+                                 uint32_t sync_interval, uint32_t flags) {
+  present(texture, texture->fullView, presenter, after, metadata,
+          apitrace_frame_index, sync_interval, flags);
 }
 
 void
-ArgumentEncodingContext::present(Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata) {
+ArgumentEncodingContext::present(Rc<Texture> &texture, TextureViewKey view,
+                                 Rc<Presenter> &presenter, double after,
+                                 DXMTPresentMetadata metadata,
+                                 uint64_t apitrace_frame_index,
+                                 uint32_t sync_interval, uint32_t flags) {
   assert(!encoder_current);
   auto encoder_info = allocate<PresentData>();
   encoder_info->type = EncoderType::Present;
@@ -1774,6 +1967,9 @@ ArgumentEncodingContext::present(Rc<Texture> &texture, TextureViewKey view, Rc<P
   encoder_info->presenter = presenter;
   encoder_info->after = after;
   encoder_info->metadata = metadata;
+  encoder_info->apitrace_frame_index = apitrace_frame_index;
+  encoder_info->sync_interval = sync_interval;
+  encoder_info->flags = flags;
 
   encoder_current = encoder_info;
   TextureViewKey present_view = uint64_t(view) ? view : texture->fullView;
@@ -2460,6 +2656,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       currentFrameStatistics().present_pass_count++;
       uint32_t present_index = 0;
       const bool sample_present_readback = DebugShouldSamplePresentReadback(present_index);
+      uint32_t trace_present_capture_index = 0;
+      const bool capture_trace_present_frame =
+          data->apitrace_frame_index != ~0ull &&
+          TraceShouldCapturePresentFrame(trace_present_capture_index);
       if (sample_present_readback) {
         DebugEncodePresentReadbacks(
             readbacks, cmdbuf, device_, data->backbuffer, "backbuffer-before-present",
@@ -2494,13 +2694,21 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
                " presentAfter=", data->after);
         }
       }
-      if (queue_.apitraceEnabled()) {
-        dxmt::apitrace::on_present_drawable(cmdbuf.handle, drawable.handle, currentFrameId(), 0, 0);
-      }
       if (data->after > 0)
         cmdbuf.presentDrawableAfterMinimumDuration(drawable, data->after);
       else
         cmdbuf.presentDrawable(drawable);
+      if (queue_.apitraceEnabled()) {
+        const auto present_frame_index =
+            data->apitrace_frame_index != ~0ull ? data->apitrace_frame_index : currentFrameId();
+        dxmt::apitrace::on_present_drawable(cmdbuf.handle, drawable.handle, present_frame_index, 0, 0);
+      }
+      if (capture_trace_present_frame) {
+        TraceEncodePresentFrameReadback(
+            readbacks, cmdbuf, device_, data->backbuffer,
+            data->apitrace_frame_index, data->sync_interval, data->flags,
+            trace_present_capture_index);
+      }
       data->~PresentData();
       break;
     }

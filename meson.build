@@ -184,9 +184,9 @@ if dxmt_apitrace_metal_enabled
           '-I' + join_paths(apitrace_source_path, 'src/d3d12/include'),
         ],
         link_args : [
+          apitrace_pe_core_archive,
           apitrace_pe_d3d12_archive,
           apitrace_pe_d3d11_archive,
-          apitrace_pe_core_archive,
         ],
         sources : [apitrace_pe_build_stamp],
       ),

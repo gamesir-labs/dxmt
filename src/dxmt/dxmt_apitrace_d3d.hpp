@@ -356,7 +356,12 @@ void on_d3d11_create_device(void *device);
 void on_dxgi_create_swapchain(void *factory, void *device, void *swapchain);
 void on_d3d12_execute_command_lists(void *queue, void *command_list);
 void on_d3d12_resource_barrier(void *command_list, uint32_t count);
-void on_d3d12_present(void *swapchain, uint32_t sync_interval, uint32_t flags);
+uint64_t on_d3d12_present(void *swapchain, uint32_t sync_interval, uint32_t flags,
+                          int32_t result_code, bool frame_presented);
+void record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
+                          uint32_t row_pitch, uint32_t sync_interval,
+                          uint32_t flags, const void *rgba_data,
+                          size_t rgba_size);
 void on_fence_dependency(
     const char *scope,
     uint64_t d3d_sequence,
@@ -458,7 +463,9 @@ inline void on_d3d11_create_device(void *) {}
 inline void on_dxgi_create_swapchain(void *, void *, void *) {}
 inline void on_d3d12_execute_command_lists(void *, void *) {}
 inline void on_d3d12_resource_barrier(void *, uint32_t) {}
-inline void on_d3d12_present(void *, uint32_t, uint32_t) {}
+inline uint64_t on_d3d12_present(void *, uint32_t, uint32_t, int32_t, bool) { return ~0ull; }
+inline void record_present_frame(uint64_t, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, uint32_t, const void *, size_t) {}
 inline void on_fence_dependency(
     const char *,
     uint64_t,

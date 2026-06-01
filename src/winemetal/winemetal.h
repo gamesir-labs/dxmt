@@ -91,6 +91,8 @@ WINEMETAL_API void WMTApitraceSessionEnsureOpen(void);
 
 WINEMETAL_API void WMTApitraceSessionClose(void);
 
+WINEMETAL_API void WMTApitraceSessionSealCheckpoint(void);
+
 WINEMETAL_API void WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence);
 
 WINEMETAL_API void WMTApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id);

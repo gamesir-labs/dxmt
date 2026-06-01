@@ -113,11 +113,7 @@ public:
   void
   reset() {
     signal_frame_latency_fence_ = ~0ull;
-    for (auto &diagnostic : readback.diagnostics)
-      diagnostic();
     readback = {};
-    for (auto &readback : deferred_readbacks)
-      readback();
     deferred_readbacks.clear();
     list_enc.reset();
     ref_tracker.clear();
@@ -134,12 +130,19 @@ private:
 
   uint32_t WaitForFinishThread();
 
+  uint32_t ReadbackThread();
+
+  void EnqueueReadbacks(CommandChunk &chunk);
+
   std::atomic_uint64_t ready_for_encode = 1; // we start from 1, so 0 is always coherent
   std::atomic_uint64_t ready_for_commit = 1;
   std::atomic_uint64_t chunk_ongoing = 0;
   CpuFence cpu_coherent;
   CpuFence frame_latency_fence_;
   std::atomic_bool stopped = false;
+  dxmt::mutex readback_mutex_;
+  dxmt::condition_variable readback_cond_;
+  std::vector<std::function<void()>> pending_readbacks_;
   const bool apitrace_enabled_;
 
   std::array<CommandChunk, kCommandChunkCount> chunks;
@@ -149,6 +152,7 @@ private:
 
   dxmt::thread encodeThread;
   dxmt::thread finishThread;
+  dxmt::thread readbackThread;
   WMT::Device device;
   WMT::Reference<WMT::CommandQueue> commandQueue;
 
