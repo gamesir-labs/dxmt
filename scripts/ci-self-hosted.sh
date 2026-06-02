@@ -114,6 +114,7 @@ ensure_homebrew_build_tools() {
   ensure_command_or_formula x86_64-w64-mingw32-gcc mingw-w64
   ensure_command_or_formula i686-w64-mingw32-gcc mingw-w64
   ensure_command_or_formula ccache ccache
+  ensure_command_or_formula gh gh
 }
 
 ensure_meson() {
@@ -198,28 +199,14 @@ wine_github_repo() {
     sed -E 's#^https://github.com/##; s#^git@github.com:##; s#\.git$##; s#/$##'
 }
 
-git_with_wine_auth() {
-  if [[ -n "${WINE_ACCESS_TOKEN:-}" ]]; then
-    local askpass
-    askpass="${RUNNER_TEMP:-${DOWNLOADS_DIR}}/dxmt-wine-git-askpass.sh"
-    mkdir -p "$(dirname "${askpass}")"
-    cat > "${askpass}" <<'EOF'
-#!/bin/sh
-case "$1" in
-  *Username*) printf '%s\n' x-access-token ;;
-  *Password*) printf '%s\n' "$WINE_ACCESS_TOKEN" ;;
-  *) printf '\n' ;;
-esac
-EOF
-    chmod 700 "${askpass}"
-    git \
-      -c credential.helper= \
-      -c http.https://github.com/.extraHeader= \
-      -c core.askPass="${askpass}" \
-      "$@"
-  else
-    git "$@"
-  fi
+gh_wine() {
+  GH_TOKEN="${WINE_ACCESS_TOKEN}" gh "$@"
+}
+
+setup_wine_git_auth() {
+  command -v gh >/dev/null || die "gh is required for private Wine repository access"
+  [[ -n "${WINE_ACCESS_TOKEN:-}" ]] || die "WINE_ACCESS_TOKEN is empty; set the repository secret for private Wine access"
+  gh_wine auth setup-git --hostname github.com
 }
 
 check_wine_access() {
@@ -258,13 +245,14 @@ sync_wine_git_source() {
   local source_dir="$1"
   local old_commit new_commit
   export GIT_TERMINAL_PROMPT=0
+  setup_wine_git_auth
   check_wine_access
 
   if [[ ! -d "${source_dir}/.git" ]]; then
     rm -rf "${source_dir}"
     log "cloning Wine source ${WINE_GIT_URL} (${WINE_GIT_BRANCH})"
-    git_with_wine_auth clone --depth 1 --single-branch --branch "${WINE_GIT_BRANCH}" \
-      "${WINE_GIT_URL}" "${source_dir}" ||
+    gh_wine repo clone "$(wine_github_repo)" "${source_dir}" -- \
+      --quiet --depth 1 --single-branch --branch "${WINE_GIT_BRANCH}" --no-tags ||
       die "failed to clone Wine source ${WINE_GIT_URL} (${WINE_GIT_BRANCH})"
     WINE_SOURCE_COMMIT="$(git -C "${source_dir}" rev-parse HEAD)" ||
       die "failed to resolve Wine source commit"
@@ -274,7 +262,7 @@ sync_wine_git_source() {
   old_commit="$(git -C "${source_dir}" rev-parse HEAD 2>/dev/null || true)"
   git -C "${source_dir}" remote set-url origin "${WINE_GIT_URL}"
   log "fetching Wine source ${WINE_GIT_BRANCH}"
-  git_with_wine_auth -C "${source_dir}" fetch --depth 1 origin "${WINE_GIT_BRANCH}" ||
+  git -C "${source_dir}" fetch --quiet --depth 1 --no-tags origin "${WINE_GIT_BRANCH}" ||
     die "failed to fetch Wine source ${WINE_GIT_BRANCH}"
   git -C "${source_dir}" reset --hard FETCH_HEAD >&2 ||
     die "failed to reset Wine source to FETCH_HEAD"
