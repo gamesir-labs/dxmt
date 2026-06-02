@@ -2011,7 +2011,17 @@ public:
         static_cast<IMTLD3D12Device *>(this), &heap_properties,
         D3D12_HEAP_FLAG_NONE, desc, initial_state, 0,
         optimized_clear_value);
-    return resource_object->QueryInterface(riid, resource);
+    auto hr = resource_object->QueryInterface(riid, resource);
+    if (dxmt::apitrace::d3d_enabled()) {
+      auto *created = resource && *resource ? dynamic_cast<d3d12::Resource *>(
+                                               static_cast<ID3D12Resource *>(*resource))
+                                             : nullptr;
+      dxmt::apitrace::record_create_reserved_resource(
+          this, desc, initial_state, optimized_clear_value,
+          resource ? *resource : nullptr,
+          created ? created->GetGpuVirtualAddress() : 0, static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild *object,

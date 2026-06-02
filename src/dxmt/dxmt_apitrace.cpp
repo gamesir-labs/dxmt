@@ -106,6 +106,37 @@ set_env_var(const char *name, const char *value) {
 #endif
 }
 
+std::string
+default_bundle_root() {
+  const auto base_dir = env::getUnixPath(env::getExeBaseName() + "_dxmt_apitrace");
+  if (base_dir.empty())
+    return {};
+
+  env::createDirectory(base_dir);
+  std::time_t now;
+  std::time(&now);
+  char timestamp[32] = {};
+  std::strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S", std::localtime(&now));
+  return base_dir + "/trace-" + timestamp + ".apitrace";
+}
+
+void
+initialize_bundle_root() {
+  auto trace_bundle = env::getEnvVar("APITRACE_TRACE_BUNDLE");
+
+  if (trace_bundle.empty())
+    trace_bundle = default_bundle_root();
+
+  if (!trace_bundle.empty())
+    set_env_var("APITRACE_TRACE_BUNDLE", trace_bundle.c_str());
+
+  if (verbose_enabled()) {
+    const char *trace_crt_view = std::getenv("APITRACE_TRACE_BUNDLE");
+    INFO("DXMT apitrace: bundle root ", trace_bundle);
+    INFO("DXMT apitrace: APITRACE_TRACE_BUNDLE crt-view=", trace_crt_view ? trace_crt_view : "(null)");
+  }
+}
+
 } // namespace
 
 bool
@@ -122,33 +153,8 @@ ensure_session_open() {
     return;
 
   static std::atomic_bool bundle_initialized = false;
-  if (!bundle_initialized.exchange(true, std::memory_order_relaxed) && env::getEnvVar("APITRACE_METAL_BUNDLE").empty()) {
-    const auto base_dir = env::getUnixPath(env::getExeBaseName() + "_dxmt_apitrace");
-    if (!base_dir.empty()) {
-      env::createDirectory(base_dir);
-      std::time_t now;
-      std::time(&now);
-      char timestamp[32] = {};
-      std::strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S", std::localtime(&now));
-      const auto bundle_root = base_dir + "/trace-" + timestamp + ".apitrace";
-      set_env_var("APITRACE_METAL_BUNDLE", bundle_root.c_str());
-      if (verbose_enabled()) {
-        INFO("DXMT apitrace: bundle root ", bundle_root);
-      }
-    }
-  }
-
-  static std::atomic_bool trace_bundle_synced = false;
-  if (!trace_bundle_synced.exchange(true, std::memory_order_relaxed)) {
-    const auto bundle_root = env::getEnvVar("APITRACE_METAL_BUNDLE");
-    if (!bundle_root.empty() && env::getEnvVar("APITRACE_TRACE_BUNDLE").empty()) {
-      set_env_var("APITRACE_TRACE_BUNDLE", bundle_root.c_str());
-    }
-    if (verbose_enabled()) {
-      const char *crt_view = std::getenv("APITRACE_TRACE_BUNDLE");
-      INFO("DXMT apitrace: APITRACE_TRACE_BUNDLE crt-view=", crt_view ? crt_view : "(null)");
-    }
-  }
+  if (!bundle_initialized.exchange(true, std::memory_order_relaxed))
+    initialize_bundle_root();
 
   WMTApitraceSessionEnsureOpen();
   if (!session_open_logged.exchange(true, std::memory_order_relaxed) && verbose_enabled()) {

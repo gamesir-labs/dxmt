@@ -328,6 +328,19 @@ record_create_placed_resource(
 }
 
 uint64_t
+record_create_reserved_resource(
+    ID3D12Device *device, const D3D12_RESOURCE_DESC *desc,
+    uint32_t initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value,
+    const void *resource, uint64_t gpu_virtual_address, int32_t result_code) {
+  if (!d3d_enabled())
+    return 0;
+  ensure_session_open();
+  return ::apitrace::d3d12::record_create_reserved_resource(
+      device, desc, initial_state, optimized_clear_value, resource,
+      gpu_virtual_address, result_code);
+}
+
+uint64_t
 record_create_fence(ID3D12Device *device, uint64_t initial_value,
                     uint32_t flags, const void *fence, int32_t result_code) {
   if (!d3d_enabled())
@@ -984,6 +997,18 @@ record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
   ::apitrace::d3d12::record_present_frame(
       frame_index, width, height, row_pitch, sync_interval, flags, rgba_data,
       rgba_size);
+}
+
+void
+record_resource_unmap(const void *resource, uint32_t subresource,
+                      uint64_t written_begin, uint64_t written_end,
+                      const void *written_data, size_t written_size) {
+  if (!d3d_enabled() || !resource || !written_data || !written_size)
+    return;
+  ensure_session_open();
+  ::apitrace::d3d12::record_resource_unmap(
+      resource, subresource, written_begin, written_end, written_data,
+      written_size);
 }
 
 void

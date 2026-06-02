@@ -158,6 +158,10 @@ uint64_t record_create_placed_resource(
     const D3D12_RESOURCE_DESC *desc, uint32_t initial_state,
     const D3D12_CLEAR_VALUE *optimized_clear_value, const void *resource,
     uint64_t gpu_virtual_address, int32_t result_code);
+uint64_t record_create_reserved_resource(
+    ID3D12Device *device, const D3D12_RESOURCE_DESC *desc,
+    uint32_t initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value,
+    const void *resource, uint64_t gpu_virtual_address, int32_t result_code);
 uint64_t record_create_fence(ID3D12Device *device, uint64_t initial_value,
                              uint32_t flags, const void *fence,
                              int32_t result_code);
@@ -364,6 +368,9 @@ void record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
                           uint32_t row_pitch, uint32_t sync_interval,
                           uint32_t flags, const void *rgba_data,
                           size_t rgba_size);
+void record_resource_unmap(const void *resource, uint32_t subresource,
+                           uint64_t written_begin, uint64_t written_end,
+                           const void *written_data, size_t written_size);
 void on_fence_dependency(
     const char *scope,
     uint64_t d3d_sequence,
@@ -408,6 +415,7 @@ inline uint64_t record_create_root_signature(ID3D12Device *, uint32_t, const voi
 inline uint64_t record_create_committed_resource(ID3D12Device *, const D3D12_HEAP_PROPERTIES *, uint32_t, const D3D12_RESOURCE_DESC *, uint32_t, const D3D12_CLEAR_VALUE *, const void *, uint64_t, int32_t) { return 0; }
 inline uint64_t record_create_heap(ID3D12Device *, const D3D12_HEAP_DESC *, const void *, int32_t) { return 0; }
 inline uint64_t record_create_placed_resource(ID3D12Device *, const void *, uint64_t, const D3D12_RESOURCE_DESC *, uint32_t, const D3D12_CLEAR_VALUE *, const void *, uint64_t, int32_t) { return 0; }
+inline uint64_t record_create_reserved_resource(ID3D12Device *, const D3D12_RESOURCE_DESC *, uint32_t, const D3D12_CLEAR_VALUE *, const void *, uint64_t, int32_t) { return 0; }
 inline uint64_t record_create_fence(ID3D12Device *, uint64_t, uint32_t, const void *, int32_t) { return 0; }
 inline uint64_t record_create_command_signature(ID3D12Device *, const D3D12_COMMAND_SIGNATURE_DESC *, const void *, const void *, int32_t) { return 0; }
 inline uint64_t record_create_constant_buffer_view(ID3D12Device *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE, const void *, uint64_t, uint64_t) { return 0; }
@@ -467,6 +475,8 @@ inline void on_d3d12_resource_barrier(void *, uint32_t) {}
 inline uint64_t on_d3d12_present(void *, uint32_t, uint32_t, int32_t, bool) { return ~0ull; }
 inline void record_present_frame(uint64_t, uint32_t, uint32_t, uint32_t,
                                  uint32_t, uint32_t, const void *, size_t) {}
+inline void record_resource_unmap(const void *, uint32_t, uint64_t, uint64_t,
+                                  const void *, size_t) {}
 inline void on_fence_dependency(
     const char *,
     uint64_t,
