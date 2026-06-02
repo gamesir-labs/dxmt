@@ -119,7 +119,7 @@ dxmt_apitrace_ensure_session_locked(void);
 
 static const char *
 dxmt_apitrace_bundle_root(void) {
-  const char *bundle_root = getenv("APITRACE_METAL_BUNDLE");
+  const char *bundle_root = getenv("APITRACE_TRACE_BUNDLE");
   if (bundle_root && bundle_root[0])
     return bundle_root;
 
@@ -127,7 +127,7 @@ dxmt_apitrace_bundle_root(void) {
   if (!warned) {
     warned = true;
     fprintf(stderr,
-            "warn:  DXMT apitrace: APITRACE_METAL_BUNDLE not set; PE side must "
+            "warn:  DXMT apitrace: APITRACE_TRACE_BUNDLE not set; PE side must "
             "initialize bundle root before opening unix session\n");
   }
   return NULL;
@@ -187,6 +187,18 @@ dxmt_apitrace_log_blit_payload_stats(void) {
           (unsigned long long)dxmt_apitrace_blit_payload_bytes,
           (unsigned long long)dxmt_apitrace_blit_payload_build_ns,
           (unsigned long long)dxmt_apitrace_blit_payload_max_build_ns);
+}
+
+static uint64_t
+dxmt_apitrace_texture_region_bytes_size(const struct WMTSize *size, uint64_t bytes_per_row, uint64_t bytes_per_image) {
+  if (!size || !size->width || !size->height || !size->depth || !bytes_per_row)
+    return 0;
+  if (size->depth > 1) {
+    if (!bytes_per_image)
+      return 0;
+    return bytes_per_image * size->depth;
+  }
+  return bytes_per_row * size->height;
 }
 
 static NSNumber *
@@ -1632,6 +1644,7 @@ _MTLDevice_newBuffer(void *obj) {
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTBufferInfo *info = params->info.ptr;
   id<MTLBuffer> buffer;
+  const void *initial_bytes = info->memory.ptr;
   if (info->memory.ptr) {
     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
                                        length:info->length
@@ -1658,8 +1671,8 @@ _MTLDevice_newBuffer(void *obj) {
           params->ret,
           info->length,
           (uint32_t)[buffer storageMode],
-          NULL,
-          0);
+          initial_bytes,
+          initial_bytes ? info->length : 0);
     }
     pthread_mutex_unlock(&dxmt_apitrace_lock);
   }
@@ -2994,6 +3007,33 @@ _MTLTexture_replaceRegion(void *obj) {
                                        withBytes:params->data.ptr
                                      bytesPerRow:params->bytes_per_row
                                    bytesPerImage:params->bytes_per_image];
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() && params->data.ptr) {
+    const uint64_t bytes_size =
+        dxmt_apitrace_texture_region_bytes_size(&params->size, params->bytes_per_row, params->bytes_per_image);
+    if (bytes_size) {
+      pthread_mutex_lock(&dxmt_apitrace_lock);
+      if (dxmt_apitrace_ensure_session_locked()) {
+        apitrace_metal_replace_texture_region(
+            dxmt_apitrace_session,
+            params->texture,
+            params->origin.x,
+            params->origin.y,
+            params->origin.z,
+            params->size.width,
+            params->size.height,
+            params->size.depth,
+            (uint32_t)params->level,
+            (uint32_t)params->slice,
+            params->bytes_per_row,
+            params->bytes_per_image,
+            params->data.ptr,
+            bytes_size);
+      }
+      pthread_mutex_unlock(&dxmt_apitrace_lock);
+    }
+  }
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -3001,6 +3041,28 @@ static NTSTATUS
 _MTLBuffer_didModifyRange(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() && [(id<MTLBuffer>)params->handle storageMode] != MTLStorageModePrivate) {
+    const uint64_t offset = params->arg;
+    const uint64_t length = params->ret;
+    const uint64_t buffer_length = [(id<MTLBuffer>)params->handle length];
+    const void *contents = [(id<MTLBuffer>)params->handle contents];
+    if (contents && length && offset <= buffer_length && length <= buffer_length - offset) {
+      pthread_mutex_lock(&dxmt_apitrace_lock);
+      if (dxmt_apitrace_ensure_session_locked()) {
+        apitrace_metal_update_buffer_contents(
+            dxmt_apitrace_session,
+            params->handle,
+            offset,
+            length,
+            (uint32_t)[(id<MTLBuffer>)params->handle storageMode],
+            (const uint8_t *)contents + offset,
+            length);
+      }
+      pthread_mutex_unlock(&dxmt_apitrace_lock);
+    }
+  }
+#endif
   return STATUS_SUCCESS;
 }
 
