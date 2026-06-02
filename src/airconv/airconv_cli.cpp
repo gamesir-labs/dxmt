@@ -21,6 +21,7 @@
 #include "d3dcompiler.h"
 #endif
 #include "dxbc_converter.hpp"
+#include "dxso_compile.hpp"
 
 using namespace llvm;
 
@@ -54,6 +55,33 @@ static cl::opt<bool>
 
 static cl::opt<bool> DisassembleDXBC(
   "disas-dxbc", cl::init(false), cl::desc("Disassemble dxbc shader")
+);
+
+static cl::opt<bool> InputIsDxso(
+  "dxso", cl::init(false),
+  cl::desc("Input is a D3D9 DXSO bytecode blob (vs/ps token-stream)")
+);
+
+static cl::opt<bool> DxsoSkinningLayout(
+  "dxso-skin", cl::init(false),
+  cl::desc("Compile VS with a canonical skinned-mesh IA layout: "
+           "v0=POSITION FLOAT3, v1=NORMAL FLOAT3, v2=TEXCOORD0 FLOAT2, "
+           "v3=BLENDINDICES UBYTE4, v4=BLENDWEIGHT FLOAT4. Lets us "
+           "diff the manual_fetch IR against the legacy stage-in IR.")
+);
+
+static cl::opt<int> DxsoFogMode(
+  "dxso-fog-mode", cl::init(-1),
+  cl::desc("Force the PS fog blend arg (DXSO_PS_FOG_MODE_*): "
+           "-1 none, 0 vertex, 1 linear, 2 exp, 3 exp2. Lets us diff "
+           "the table-fog epilogue IR against the unfogged IR.")
+);
+
+static cl::opt<bool> DxsoDualSource(
+  "dxso-dual-source", cl::init(false),
+  cl::desc("Force the PS dual-source-blending arg so oC0/oC1 are "
+           "declared as attachment 0's two color indices. Lets us diff "
+           "the index(1) render-target IR against the MRT IR.")
 );
 
 static cl::opt<bool>
@@ -204,6 +232,51 @@ int main(int argc, char **argv) {
 
   Module M("default", Context);
   dxmt::initializeModule(M);
+
+  if (InputIsDxso) {
+    auto *dxso = dxmt::dxso_shader_initialize(MemRef.getBufferStart(),
+                                              MemRef.getBufferSize());
+    if (!dxso) {
+      errs() << "DXSO parse failed\n";
+      return 1;
+    }
+    DXSO_SHADER_IA_INPUT_LAYOUT_DATA layout{};
+    DXSO_IA_INPUT_ELEMENT elements[5] = {};
+    if (DxsoSkinningLayout) {
+      // Mirrors d3d9_device.cpp:to_mtl_attr_format: FLOAT3=30, FLOAT2=29,
+      // FLOAT4=31, UBYTE4=3 (UChar4 raw, not normalised). Canonical
+      // skinned-mesh layout: POSITION:v0, NORMAL:v1, TEXCOORD0:v2,
+      // BLENDINDICES:v3, BLENDWEIGHT:v4. Stride 44, single stream.
+      uint32_t off = 0;
+      elements[0] = {0u, 0u, off, 30u, 0u, 0u}; off += 12; // FLOAT3
+      elements[1] = {1u, 0u, off, 30u, 0u, 0u}; off += 12;
+      elements[2] = {2u, 0u, off, 29u, 0u, 0u}; off +=  8; // FLOAT2
+      elements[3] = {3u, 0u, off,  3u, 0u, 0u}; off +=  4; // UBYTE4
+      elements[4] = {4u, 0u, off, 31u, 0u, 0u}; off += 16; // FLOAT4
+      layout.next                = nullptr;
+      layout.type                = DXSO_SHADER_IA_INPUT_LAYOUT;
+      layout.index_buffer_format = DXSO_INDEX_BUFFER_FORMAT_UINT16;
+      layout.slot_mask           = 1u;
+      layout.num_elements        = 5;
+      layout.elements            = elements;
+    }
+    DXSO_SHADER_PSO_PIXEL_SHADER_DATA ps_args{};
+    if (DxsoDualSource) {
+      ps_args.type = DXSO_SHADER_PSO_PIXEL_SHADER;
+      ps_args.alpha_test_func = 8; // D3DCMP_ALWAYS: no alpha-test snippet
+      ps_args.dual_source_blending = 1;
+    }
+    dxmt::compile_dxso(dxso,
+                       DxsoSkinningLayout ? &layout : nullptr,
+                       /*ps_args=*/DxsoDualSource ? &ps_args : nullptr,
+                       /*ps_samp_layout=*/nullptr,
+                       /*ps_point_sprite=*/false,
+                       /*vs_point_size_override=*/0.0f,
+                       /*ps_bump_env=*/nullptr,
+                       /*ps_fog_mode=*/DxsoFogMode,
+                       "shader_main", Context, M);
+    dxmt::dxso_shader_destroy(dxso);
+  } else {
 
   sm50_shader_t sm50;
   sm50_error_t err;
@@ -370,6 +443,7 @@ int main(int argc, char **argv) {
   }
 
   SM50Destroy(sm50);
+  } // end else (DXBC path)
 
   if (OptLevelO0) {
     // do nothing
