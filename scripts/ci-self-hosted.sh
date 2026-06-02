@@ -233,15 +233,22 @@ ensure_lunarg_vulkan_sdk() {
 }
 
 ensure_meson() {
+  local meson_path
   setup_paths
   if command -v meson >/dev/null 2>&1 &&
      [[ "$(meson --version)" == "${MESON_VERSION}" ]]; then
+    meson_path="$(command -v meson)"
+    if [[ "${meson_path}" != "/usr/local/bin/meson" ]]; then
+      sudo_run ln -sfn "${meson_path}" /usr/local/bin/meson
+    fi
     return
   fi
   log "installing Meson ${MESON_VERSION}"
   python3 -m pip install --user "meson==${MESON_VERSION}" --break-system-packages \
     || python3 -m pip install --user "meson==${MESON_VERSION}"
   setup_paths
+  meson_path="$(command -v meson)" || die "meson is missing after installation"
+  sudo_run ln -sfn "${meson_path}" /usr/local/bin/meson
 }
 
 check_apple_tools() {
