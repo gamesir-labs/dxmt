@@ -266,6 +266,11 @@ public:
 
   void SetMaxLatency(uint32_t value) { max_latency_ = value; };
 
+  // Last frame seq for which the present chunk has retired. Used by
+  // d3d9's D3DPRESENT_DONOTWAIT probe to peek whether the next
+  // PresentBoundary would block before actually entering the wait.
+  uint64_t FrameLatencySignaled() { return frame_latency_fence_.signaledValue(); }
+
   void
   WaitCPUFence(uint64_t seq);
 
