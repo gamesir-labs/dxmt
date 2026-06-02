@@ -200,9 +200,22 @@ wine_github_repo() {
 
 git_with_wine_auth() {
   if [[ -n "${WINE_ACCESS_TOKEN:-}" ]]; then
+    local askpass
+    askpass="${RUNNER_TEMP:-${DOWNLOADS_DIR}}/dxmt-wine-git-askpass.sh"
+    mkdir -p "$(dirname "${askpass}")"
+    cat > "${askpass}" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' x-access-token ;;
+  *Password*) printf '%s\n' "$WINE_ACCESS_TOKEN" ;;
+  *) printf '\n' ;;
+esac
+EOF
+    chmod 700 "${askpass}"
     git \
       -c credential.helper= \
-      -c "http.https://github.com/.extraHeader=AUTHORIZATION: Bearer ${WINE_ACCESS_TOKEN}" \
+      -c http.https://github.com/.extraHeader= \
+      -c core.askPass="${askpass}" \
       "$@"
   else
     git "$@"
