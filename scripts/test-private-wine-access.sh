@@ -58,17 +58,6 @@ api_headers="${tmp_dir}/api-headers.txt"
 api_body="${tmp_dir}/api-body.json"
 branch_headers="${tmp_dir}/branch-headers.txt"
 branch_body="${tmp_dir}/branch-body.json"
-askpass="${tmp_dir}/git-askpass.sh"
-
-cat > "${askpass}" <<'EOF'
-#!/bin/sh
-case "$1" in
-  *Username*) printf '%s\n' x-access-token ;;
-  *Password*) printf '%s\n' "$WINE_ACCESS_TOKEN" ;;
-  *) printf '\n' ;;
-esac
-EOF
-chmod 700 "${askpass}"
 curl_status() {
   local url="$1"
   local headers="$2"
@@ -151,13 +140,17 @@ print(f"[dxmt-test] branch commit={commit.get('sha')}")
 PY
 
 echo "[dxmt-test] git ls-remote"
+if command -v gh >/dev/null; then
+  echo "[dxmt-test] gh repo view"
+  GH_TOKEN="${TOKEN}" gh repo view "${REPO}" --json nameWithOwner,isPrivate,defaultBranchRef \
+    --jq '"[dxmt-test] gh repo=" + .nameWithOwner + " private=" + (.isPrivate|tostring) + " default_branch=" + .defaultBranchRef.name'
+  echo "[dxmt-test] gh auth setup-git"
+  GH_TOKEN="${TOKEN}" gh auth setup-git --hostname github.com
+fi
+
 GIT_TERMINAL_PROMPT=0 \
-WINE_ACCESS_TOKEN="${TOKEN}" \
 git \
   -c protocol.version=2 \
-  -c credential.helper= \
-  -c http.https://github.com/.extraHeader= \
-  -c core.askPass="${askpass}" \
   ls-remote --heads "https://github.com/${REPO}.git" "${BRANCH}" |
   sed 's/^/[dxmt-test] /'
 
