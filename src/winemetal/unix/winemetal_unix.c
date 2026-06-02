@@ -60,7 +60,6 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
 @property(nonatomic, assign) uint64_t d3dSequence;
 @property(nonatomic, assign) DXMTApitraceEncoderKind kind;
 @property(nonatomic, assign) BOOL metalTraceBegan;
-@property(nonatomic, retain) NSMutableSet *snapshottedBuffers;
 @property(nonatomic, retain) NSMutableArray *fenceOps;
 @property(nonatomic, retain) NSMutableArray *blitOps;
 @property(nonatomic, retain) NSMutableData *blitWaitFences;
@@ -71,7 +70,6 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
 -(instancetype)init {
   self = [super init];
   if (self) {
-    _snapshottedBuffers = [[NSMutableSet alloc] init];
     _fenceOps = [[NSMutableArray alloc] init];
     _blitOps = [[NSMutableArray alloc] init];
     _blitWaitFences = [[NSMutableData alloc] init];
@@ -1061,9 +1059,6 @@ dxmt_apitrace_bytes_json(const void *bytes, size_t length) {
   return dxmt_apitrace_json_string(@{ @"length" : @(length), @"bytes" : values });
 }
 
-static const void *
-dxmt_apitrace_buffer_range_contents(obj_handle_t buffer_handle, uint64_t offset, uint64_t requested_size, uint64_t *available_size);
-
 static void
 dxmt_apitrace_snapshot_buffer(apitrace_metal_session_t *session, obj_handle_t buffer_handle, NSMutableSet *seen) {
   if (!session || !buffer_handle)
@@ -1086,80 +1081,9 @@ dxmt_apitrace_snapshot_buffer(apitrace_metal_session_t *session, obj_handle_t bu
   apitrace_metal_object_metadata(session, buffer_handle, address_payload.UTF8String);
 }
 
-static uint64_t
-dxmt_apitrace_buffer_binding_snapshot_limit(void) {
-  static uint64_t limit = UINT64_MAX;
-  if (limit != UINT64_MAX)
-    return limit;
-
-  limit = 1024ull * 1024ull;
-  const char *env = getenv("DXMT_APITRACE_BUFFER_BINDING_SNAPSHOT_BYTES");
-  if (env && env[0]) {
-    char *end = NULL;
-    unsigned long long parsed = strtoull(env, &end, 10);
-    if (end && end != env)
-      limit = (uint64_t)parsed;
-  }
-  return limit;
-}
-
-static NSString *
-dxmt_apitrace_buffer_range_key(obj_handle_t buffer_handle, uint64_t offset, uint64_t size) {
-  return [NSString stringWithFormat:@"%llu:%llu:%llu",
-      (unsigned long long)buffer_handle,
-      (unsigned long long)offset,
-      (unsigned long long)size];
-}
-
-static const void *
-dxmt_apitrace_snapshot_buffer_range(apitrace_metal_session_t *session, obj_handle_t buffer_handle, uint64_t offset, uint64_t *available_size, NSMutableSet *seen) {
-  if (available_size)
-    *available_size = 0;
-  const uint64_t limit = dxmt_apitrace_buffer_binding_snapshot_limit();
-  if (!session || !buffer_handle || limit == 0)
-    return NULL;
-
-  dxmt_apitrace_snapshot_buffer(session, buffer_handle, seen);
-  uint64_t size = 0;
-  const void *bytes = dxmt_apitrace_buffer_range_contents(buffer_handle, offset, limit, &size);
-  if (!bytes || !size)
-    return NULL;
-
-  NSString *key = dxmt_apitrace_buffer_range_key(buffer_handle, offset, size);
-  if (seen && [seen containsObject:key])
-    return NULL;
-  if (seen)
-    [seen addObject:key];
-  if (available_size)
-    *available_size = size;
-  return bytes;
-}
-
-static const void *
-dxmt_apitrace_buffer_range_contents(obj_handle_t buffer_handle, uint64_t offset, uint64_t requested_size, uint64_t *available_size) {
-  if (available_size)
-    *available_size = 0;
-  if (!buffer_handle || requested_size == 0)
-    return NULL;
-
-  id<MTLBuffer> buffer = (id<MTLBuffer>)buffer_handle;
-  if ([buffer storageMode] == MTLStorageModePrivate || ![buffer contents])
-    return NULL;
-  uint64_t length = [buffer length];
-  if (offset >= length)
-    return NULL;
-  uint64_t clamped_size = requested_size;
-  if (clamped_size > length - offset)
-    clamped_size = length - offset;
-  if (available_size)
-    *available_size = clamped_size;
-  return (const uint8_t *)[buffer contents] + offset;
-}
-
 static void
 dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMTApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
-  NSMutableSet *snapshotted_ranges = state.snapshottedBuffers ?: [NSMutableSet set];
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTRenderCommandType)base->type) {
     case WMTRenderCommandSetPSO: {
@@ -1169,20 +1093,12 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     }
     case WMTRenderCommandSetVertexBuffer: {
       const struct wmtcmd_render_setbuffer *cmd = (const struct wmtcmd_render_setbuffer *)base;
-      uint64_t bytes_size = 0;
-      const void *bytes = dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->buffer, cmd->offset, &bytes_size, snapshotted_ranges);
-      apitrace_metal_set_vertex_buffer_with_contents(
-          session, encoder, cmd->buffer, cmd->offset, cmd->index, bytes, bytes_size);
+      apitrace_metal_set_vertex_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
       break;
     }
     case WMTRenderCommandSetFragmentBuffer: {
       const struct wmtcmd_render_setbuffer *cmd = (const struct wmtcmd_render_setbuffer *)base;
-      uint64_t bytes_size = 0;
-      const void *bytes = dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->buffer, cmd->offset, &bytes_size, snapshotted_ranges);
-      apitrace_metal_set_fragment_buffer_with_contents(
-          session, encoder, cmd->buffer, cmd->offset, cmd->index, bytes, bytes_size);
+      apitrace_metal_set_fragment_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
       break;
     }
     case WMTRenderCommandSetVertexBufferOffset: {
@@ -1264,10 +1180,6 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     }
     case WMTRenderCommandDrawIndexed: {
       const struct wmtcmd_render_draw_indexed *cmd = (const struct wmtcmd_render_draw_indexed *)base;
-      uint64_t bytes_size = 0;
-      dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->index_buffer, cmd->index_buffer_offset,
-          &bytes_size, snapshotted_ranges);
       apitrace_metal_draw_indexed_primitives(
           session, encoder, cmd->primitive_type, (uint32_t)cmd->index_count, cmd->index_type,
           cmd->index_buffer, cmd->index_buffer_offset, cmd->instance_count, cmd->base_vertex, cmd->base_instance);
@@ -1275,23 +1187,12 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     }
     case WMTRenderCommandDrawIndirect: {
       const struct wmtcmd_render_draw_indirect *cmd = (const struct wmtcmd_render_draw_indirect *)base;
-      uint64_t bytes_size = 0;
-      dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->indirect_args_buffer, cmd->indirect_args_offset,
-          &bytes_size, snapshotted_ranges);
       apitrace_metal_draw_primitives_indirect(
           session, encoder, cmd->primitive_type, cmd->indirect_args_buffer, cmd->indirect_args_offset);
       break;
     }
     case WMTRenderCommandDrawIndexedIndirect: {
       const struct wmtcmd_render_draw_indexed_indirect *cmd = (const struct wmtcmd_render_draw_indexed_indirect *)base;
-      uint64_t bytes_size = 0;
-      dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->index_buffer, cmd->index_buffer_offset,
-          &bytes_size, snapshotted_ranges);
-      dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->indirect_args_buffer, cmd->indirect_args_offset,
-          &bytes_size, snapshotted_ranges);
       apitrace_metal_draw_indexed_primitives_indirect(
           session, encoder, cmd->primitive_type, cmd->index_type, cmd->index_buffer, cmd->index_buffer_offset,
           cmd->indirect_args_buffer, cmd->indirect_args_offset);
@@ -1321,7 +1222,6 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
 static void
 dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMTApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
-  NSMutableSet *snapshotted_ranges = state.snapshottedBuffers ?: [NSMutableSet set];
   struct WMTSize threadgroup_size = {1, 1, 1};
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTComputeCommandType)base->type) {
@@ -1333,11 +1233,7 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     }
     case WMTComputeCommandSetBuffer: {
       const struct wmtcmd_compute_setbuffer *cmd = (const struct wmtcmd_compute_setbuffer *)base;
-      uint64_t bytes_size = 0;
-      const void *bytes = dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->buffer, cmd->offset, &bytes_size, snapshotted_ranges);
-      apitrace_metal_set_compute_buffer_with_contents(
-          session, encoder, cmd->buffer, cmd->offset, cmd->index, bytes, bytes_size);
+      apitrace_metal_set_compute_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
       break;
     }
     case WMTComputeCommandSetBufferOffset: {
@@ -1387,10 +1283,6 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     }
     case WMTComputeCommandDispatchIndirect: {
       const struct wmtcmd_compute_dispatch_indirect *cmd = (const struct wmtcmd_compute_dispatch_indirect *)base;
-      uint64_t bytes_size = 0;
-      dxmt_apitrace_snapshot_buffer_range(
-          session, cmd->indirect_args_buffer, cmd->indirect_args_offset,
-          &bytes_size, snapshotted_ranges);
       apitrace_metal_dispatch_threadgroups_indirect(
           session, encoder, cmd->indirect_args_buffer, cmd->indirect_args_offset,
           (uint32_t)threadgroup_size.width, (uint32_t)threadgroup_size.height, (uint32_t)threadgroup_size.depth);
@@ -1427,12 +1319,8 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
       dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       const struct wmtcmd_blit_copy_from_buffer_to_buffer *cmd = (const struct wmtcmd_blit_copy_from_buffer_to_buffer *)base;
-      uint64_t source_bytes_size = 0;
-      const void *source_bytes =
-          dxmt_apitrace_buffer_range_contents(cmd->src, cmd->src_offset, cmd->copy_length, &source_bytes_size);
-      apitrace_metal_copy_buffer_with_contents(
-          session, encoder, cmd->src, cmd->src_offset, cmd->dst, cmd->dst_offset, cmd->copy_length,
-          source_bytes, source_bytes_size);
+      apitrace_metal_copy_buffer(
+          session, encoder, cmd->src, cmd->src_offset, cmd->dst, cmd->dst_offset, cmd->copy_length);
       break;
     }
     case WMTBlitCommandCopyFromBufferToTexture: {
@@ -1443,14 +1331,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
       NSString *payload = dxmt_apitrace_copy_buffer_to_texture_json(
           cmd->src, cmd->src_offset, cmd->bytes_per_row, cmd->bytes_per_image, &cmd->size, cmd->dst, cmd->slice,
           cmd->level, &cmd->origin);
-      uint64_t copy_rows = cmd->size.height ? cmd->size.height : 1;
-      uint64_t copy_depth = cmd->size.depth ? cmd->size.depth : 1;
-      uint64_t source_bytes_size = 0;
-      uint64_t requested_size = cmd->bytes_per_image ? cmd->bytes_per_image * copy_depth : cmd->bytes_per_row * copy_rows;
-      const void *source_bytes =
-          dxmt_apitrace_buffer_range_contents(cmd->src, cmd->src_offset, requested_size, &source_bytes_size);
-      apitrace_metal_copy_buffer_to_texture_with_contents(
-          session, encoder, payload.UTF8String, source_bytes, source_bytes_size);
+      apitrace_metal_copy_buffer_to_texture(session, encoder, cmd->src, cmd->dst, payload.UTF8String);
       break;
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
