@@ -58,6 +58,17 @@ api_headers="${tmp_dir}/api-headers.txt"
 api_body="${tmp_dir}/api-body.json"
 branch_headers="${tmp_dir}/branch-headers.txt"
 branch_body="${tmp_dir}/branch-body.json"
+askpass="${tmp_dir}/git-askpass.sh"
+
+cat > "${askpass}" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' x-access-token ;;
+  *Password*) printf '%s\n' "$WINE_ACCESS_TOKEN" ;;
+  *) printf '\n' ;;
+esac
+EOF
+chmod 700 "${askpass}"
 curl_status() {
   local url="$1"
   local headers="$2"
@@ -141,10 +152,12 @@ PY
 
 echo "[dxmt-test] git ls-remote"
 GIT_TERMINAL_PROMPT=0 \
+WINE_ACCESS_TOKEN="${TOKEN}" \
 git \
   -c protocol.version=2 \
   -c credential.helper= \
-  -c "http.https://github.com/.extraHeader=AUTHORIZATION: Bearer ${TOKEN}" \
+  -c http.https://github.com/.extraHeader= \
+  -c core.askPass="${askpass}" \
   ls-remote --heads "https://github.com/${REPO}.git" "${BRANCH}" |
   sed 's/^/[dxmt-test] /'
 
