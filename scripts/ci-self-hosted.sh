@@ -80,16 +80,32 @@ ensure_brew() {
 
 ensure_brew_packages() {
   ensure_brew
-  local missing=()
   for package in "$@"; do
     if ! brew list --formula "${package}" >/dev/null 2>&1; then
-      missing+=("${package}")
+      log "installing Homebrew formula: ${package}"
+      brew install --formula "${package}"
     fi
   done
-  if (( ${#missing[@]} )); then
-    log "installing Homebrew packages: ${missing[*]}"
-    brew install "${missing[@]}"
+}
+
+ensure_command_or_formula() {
+  local command_name="$1"
+  local formula="$2"
+  if command -v "${command_name}" >/dev/null 2>&1; then
+    return
   fi
+  ensure_brew_packages "${formula}"
+  command -v "${command_name}" >/dev/null 2>&1 ||
+    die "${command_name} is missing after installing ${formula}"
+}
+
+ensure_homebrew_build_tools() {
+  ensure_command_or_formula cmake cmake
+  ensure_command_or_formula ninja ninja
+  ensure_command_or_formula bison bison
+  ensure_command_or_formula x86_64-w64-mingw32-gcc mingw-w64
+  ensure_command_or_formula i686-w64-mingw32-gcc mingw-w64
+  ensure_command_or_formula ccache ccache
 }
 
 ensure_meson() {
@@ -151,7 +167,7 @@ ensure_metal_toolchain() {
 setup_host() {
   ensure_root
   setup_paths
-  ensure_brew_packages cmake ninja bison mingw-w64 ccache
+  ensure_homebrew_build_tools
   ensure_meson
   check_apple_tools
 }
