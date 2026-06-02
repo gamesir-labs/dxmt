@@ -104,10 +104,11 @@ At runtime, the integration is opt-in through environment variables:
 - `DXMT_APITRACE_ENABLED=1` — activate the in-process recorder. The historical
   misspelling `DXMT_APITRACE_ENBALED=1` is accepted as a spelling-compatible
   alias and is checked first; new scripts should prefer the corrected name.
-- `APITRACE_METAL_BUNDLE=/abs/path/to/trace.apitrace` — explicit bundle root.
-  When unset, the PE side picks `<exe-basename>_dxmt_apitrace/trace-<ts>.apitrace`
-  and propagates it to the unix side via `__wine_set_unix_env`, so both halves
-  of the process write into the same bundle directory.
+- `APITRACE_TRACE_BUNDLE=/abs/path/to/trace.apitrace` — explicit bundle root
+  shared by the PE D3D stream and unix Metal stream. When unset, the PE side
+  picks `<exe-basename>_dxmt_apitrace/trace-<ts>.apitrace` and propagates it to
+  the unix side via `__wine_set_unix_env`, so both halves of the process write
+  into the same bundle directory.
 - `APITRACE_METAL_VERBOSE=1` — emit per-call info logs from the DXMT-side hook
   layer. Useful for confirming the recorder is wired in; noisy in long runs.
 
@@ -126,9 +127,9 @@ co-located streams:
   and falls back to the dxmt internal chunk id otherwise.
 
 The bundle root is created exactly once by the PE side on the first hook
-that calls `ensure_session_open()`; the unix side refuses to open its own
-session unless `APITRACE_METAL_BUNDLE` is already set, so the three streams
-are guaranteed to live under the same directory.
+that calls `ensure_session_open()`; the unix side reads the same
+`APITRACE_TRACE_BUNDLE`, so the three streams are guaranteed to live under the
+same directory.
 
 `apitrace_builtin` is a developer-facing build flag and is intentionally absent
 from `dxmt.conf`. The recorder is for in-tree debugging of the D3D↔Metal
