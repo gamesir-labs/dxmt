@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dxmt_apitrace.hpp"
+
 #include <d3d12.h>
 
 #include <cstddef>
