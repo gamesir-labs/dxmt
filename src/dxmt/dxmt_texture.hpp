@@ -20,6 +20,7 @@ enum class TextureAllocationFlag : uint32_t {
   GpuManaged = 4,
   Shared = 5,
   ShaderReadonly = 6,
+  PlacementSparse = 7,
 };
 
 struct TextureViewDescriptor {

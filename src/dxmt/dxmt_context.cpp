@@ -1690,6 +1690,18 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (srv.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+          auto allocation = srv.buffer->current();
+          auto *view_ptr = srv.buffer->tryView(srv.viewId, allocation);
+          if (!view_ptr || !view_ptr->texture) {
+            DebugLogNullShaderBinding<stage, kind>(
+                "SRV", "texture-buffer", shader_hash, arg,
+                bool(srv.buffer.ptr()), bool(srv.texture.ptr()), false,
+                encoder_id, "invalid_buffer_view"
+            );
+            encoded_buffer[arg.StructurePtrOffset] = 0;
+            encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+            break;
+          }
           auto [view, offset] = access<stage>(srv.buffer, srv.viewId, ResourceAccess::Read);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
           encoded_buffer[arg.StructurePtrOffset + 1] =
@@ -1755,6 +1767,18 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (uav.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+          auto allocation = uav.buffer->current();
+          auto *view_ptr = uav.buffer->tryView(uav.viewId, allocation);
+          if (!view_ptr || !view_ptr->texture) {
+            DebugLogNullShaderBinding<stage, kind>(
+                "UAV", "texture-buffer", shader_hash, arg,
+                bool(uav.buffer.ptr()), bool(uav.texture.ptr()),
+                bool(uav.counter.ptr()), encoder_id, "invalid_buffer_view"
+            );
+            encoded_buffer[arg.StructurePtrOffset] = 0;
+            encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+            break;
+          }
           auto [view, offset] = access<stage>(uav.buffer, uav.viewId, access_flags);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
           encoded_buffer[arg.StructurePtrOffset + 1] =
@@ -1846,8 +1870,9 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_info->clear_dsv = 0;
   encoder_info->color = color;
   encoder_info->array_length = arrayLength;
-  encoder_info->width = texture->width();
-  encoder_info->height = texture->height();
+  TextureViewKey view = viewId;
+  encoder_info->width = texture->width(view);
+  encoder_info->height = texture->height(view);
   encoder_info->sample_count = texture->sampleCount();
   encoder_current = encoder_info;
 
@@ -1903,8 +1928,9 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->clear_dsv = flag & DepthStencilPlanarFlags(texture->pixelFormat());
   encoder_info->depth_stencil = {depth, stencil};
   encoder_info->array_length = arrayLength;
-  encoder_info->width = texture->width();
-  encoder_info->height = texture->height();
+  TextureViewKey view = viewId;
+  encoder_info->width = texture->width(view);
+  encoder_info->height = texture->height(view);
   encoder_info->sample_count = texture->sampleCount();
   encoder_current = encoder_info;
 
@@ -2737,8 +2763,6 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
             info.stencil.load_action = WMTLoadActionClear;
             info.stencil.store_action = WMTStoreActionStore;
           }
-          info.render_target_width = data->width;
-          info.render_target_height = data->height;
         } else {
           WMT::Texture color_texture;
           bool valid_color_attachment = data->attachment
@@ -2763,6 +2787,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           info.colors[0].load_action = WMTLoadActionClear;
           info.colors[0].store_action = WMTStoreActionStore;
         }
+        info.render_target_width = data->width;
+        info.render_target_height = data->height;
         info.render_target_array_length = data->array_length;
         info.default_raster_sample_count = data->sample_count;
         NormalizeRenderPassInfo(info);

@@ -91,6 +91,8 @@ WINEMETAL_API void WMTApitraceSessionEnsureOpen(void);
 
 WINEMETAL_API void WMTApitraceSessionClose(void);
 
+WINEMETAL_API void WMTApitraceSessionFlush(void);
+
 WINEMETAL_API void WMTApitraceSessionSealCheckpoint(void);
 
 WINEMETAL_API void WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence);
@@ -521,7 +523,55 @@ struct WMTTextureInfo {
   uint64_t gpu_resource_id; // out
 };
 
+enum WMTTextureInfoFlag : uint32_t {
+  WMTTextureInfoFlagPlacementSparse = 1u << 0,
+};
+
+struct WMTPlacementHeapInfo {
+  uint64_t size;
+  enum WMTResourceOptions options;
+};
+
+struct WMTSparseTileSize {
+  uint64_t width;
+  uint64_t height;
+  uint64_t depth;
+  uint64_t bytes;
+};
+
+enum WMTSparseTextureMappingMode : uint32_t {
+  WMTSparseTextureMappingModeMap = 0,
+  WMTSparseTextureMappingModeUnmap = 1,
+};
+
+struct WMTSparseTextureMappingOperation {
+  enum WMTSparseTextureMappingMode mode;
+  uint32_t level;
+  uint32_t slice;
+  uint32_t x;
+  uint32_t y;
+  uint32_t z;
+  uint32_t width;
+  uint32_t height;
+  uint32_t depth;
+  uint64_t heap_offset;
+};
+
 WINEMETAL_API obj_handle_t MTLDevice_newTexture(obj_handle_t device, struct WMTTextureInfo *info);
+
+WINEMETAL_API bool MTLDevice_supportsPlacementSparse(obj_handle_t device);
+
+WINEMETAL_API bool MTLDevice_sparseTileSize(
+    obj_handle_t device, const struct WMTTextureInfo *info, struct WMTSparseTileSize *tile_size
+);
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newPlacementHeap(obj_handle_t device, const struct WMTPlacementHeapInfo *info);
+
+WINEMETAL_API bool MTLDevice_updateSparseTextureMappings(
+    obj_handle_t device, obj_handle_t texture, obj_handle_t heap,
+    const struct WMTSparseTextureMappingOperation *operations, uint64_t operation_count
+);
 
 WINEMETAL_API obj_handle_t
 MTLBuffer_newTexture(obj_handle_t buffer, struct WMTTextureInfo *info, uint64_t offset, uint64_t bytes_per_row);

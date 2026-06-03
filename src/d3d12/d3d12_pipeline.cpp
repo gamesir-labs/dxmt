@@ -1303,6 +1303,60 @@ CompileGeometryPipelineGeometryFunction(
       out);
 }
 
+bool
+CompileTessellationPipelineHullFunction(
+    IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &hs,
+    const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    PipelineMetalShader &out) {
+  if (vs.kind != PipelineShaderBytecodeKind::Dxbc ||
+      hs.kind != PipelineShaderBytecodeKind::Dxbc) {
+    // TODO(d3d12): add DXIL tessellation lowering once airconv exposes it.
+    WARN("D3D12PipelineState: DXIL tessellation hull lowering is unsupported");
+    return false;
+  }
+
+  sm50_bitcode_t bitcode_handle = nullptr;
+  sm50_error_t error = nullptr;
+  if (SM50CompileTessellationPipelineHull(vs.shader, hs.shader, args,
+                                          function_name, &bitcode_handle,
+                                          &error)) {
+    WARN("D3D12PipelineState: failed to compile DXBC tessellation hull shader: ",
+         SM50GetErrorMessageString(error));
+    SM50FreeError(error);
+    return false;
+  }
+
+  return CreateMetalFunctionFromBitcode(
+      device, PipelineShaderStage::Hull, function_name, bitcode_handle, out);
+}
+
+bool
+CompileTessellationPipelineDomainFunction(
+    IMTLD3D12Device *device, PipelineDxilShader &hs, PipelineDxilShader &ds,
+    const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    PipelineMetalShader &out) {
+  if (hs.kind != PipelineShaderBytecodeKind::Dxbc ||
+      ds.kind != PipelineShaderBytecodeKind::Dxbc) {
+    // TODO(d3d12): add DXIL tessellation lowering once airconv exposes it.
+    WARN("D3D12PipelineState: DXIL tessellation domain lowering is unsupported");
+    return false;
+  }
+
+  sm50_bitcode_t bitcode_handle = nullptr;
+  sm50_error_t error = nullptr;
+  if (SM50CompileTessellationPipelineDomain(hs.shader, ds.shader, args,
+                                            function_name, &bitcode_handle,
+                                            &error)) {
+    WARN("D3D12PipelineState: failed to compile DXBC tessellation domain shader: ",
+         SM50GetErrorMessageString(error));
+    SM50FreeError(error);
+    return false;
+  }
+
+  return CreateMetalFunctionFromBitcode(
+      device, PipelineShaderStage::Domain, function_name, bitcode_handle, out);
+}
+
 WMTPrimitiveTopologyClass
 GetTopologyClass(D3D12_PRIMITIVE_TOPOLOGY_TYPE type) {
   switch (type) {
@@ -1640,6 +1694,10 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       FindShader(shaders, PipelineShaderStage::Pixel));
   auto *gs = const_cast<PipelineDxilShader *>(
       FindShader(shaders, PipelineShaderStage::Geometry));
+  auto *hs = const_cast<PipelineDxilShader *>(
+      FindShader(shaders, PipelineShaderStage::Hull));
+  auto *ds = const_cast<PipelineDxilShader *>(
+      FindShader(shaders, PipelineShaderStage::Domain));
   if (!vs)
     return false;
 
@@ -1695,6 +1753,129 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ps_args),
                               out.pixel))
       return false;
+  }
+
+  if (hs || ds || state.desc.PrimitiveTopologyType ==
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
+    if (!hs || !ds) {
+      // TODO(d3d12): patch topology without a complete HS/DS pair cannot be lowered.
+      WARN("D3D12PipelineState: incomplete tessellation shader pair hasHS=",
+           bool(hs), " hasDS=", bool(ds));
+      return false;
+    }
+    if (gs && gs->reflection.GeometryShader.GSPassThrough == ~0u) {
+      // TODO(d3d12): lower full GS-after-DS pipelines through mesh shaders.
+      WARN("D3D12PipelineState: tessellation with full geometry shader is unsupported");
+      return false;
+    }
+    if (hs->reflection.Tessellator.OutputPrimitive ==
+            MTL_TESSELLATOR_OUTPUT_LINE ||
+        hs->reflection.Tessellator.OutputPrimitive ==
+            MTL_TESSELLATOR_OUTPUT_POINT) {
+      // TODO(d3d12): implement line/point tessellation primitive generation.
+      WARN("D3D12PipelineState: unsupported tessellation output primitive ",
+           uint32_t(hs->reflection.Tessellator.OutputPrimitive));
+      return false;
+    }
+
+    auto max_potential_factor =
+        ds->reflection.PostTessellator.MaxPotentialTessFactor;
+    if (!device->GetMTLDevice().supportsFamily(WMTGPUFamilyApple9))
+      max_potential_factor = std::min(8u, max_potential_factor);
+    if (float(max_potential_factor) < hs->reflection.Tessellator.MaxFactor) {
+      WARN("D3D12PipelineState: tessellation maxtessfactor(",
+           hs->reflection.Tessellator.MaxFactor,
+           ") exceeds mesh pipeline limit; clamping to ",
+           max_potential_factor);
+    }
+
+    SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess = {};
+    pso_tess.type = SM50_SHADER_PSO_TESSELLATOR;
+    pso_tess.next = &common;
+    pso_tess.max_potential_tess_factor = max_potential_factor;
+
+    SM50_SHADER_GS_PASS_THROUGH_DATA gs_passthrough = {};
+    gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
+    gs_passthrough.next = &pso_tess;
+    gs_passthrough.DataEncoded =
+        gs ? gs->reflection.GeometryShader.GSPassThrough : 0;
+    gs_passthrough.RasterizationDisabled = false;
+
+    const auto ds_name = BuildFunctionName("ds", shader_cache_key);
+    if (!CompileTessellationPipelineDomainFunction(
+            device, *hs, *ds, ds_name.c_str(),
+            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+                &gs_passthrough),
+            out.tessellation_domain))
+      return false;
+
+    auto create_tessellation_variant =
+        [&](uint32_t variant, SM50_INDEX_BUFFER_FORMAT index_format,
+            const char *prefix, WMT::Reference<WMT::RenderPipelineState> &pso) {
+      ia_layout.index_buffer_format = index_format;
+      ia_layout.next = &pso_tess;
+      const auto hs_name = BuildFunctionName(prefix, shader_cache_key);
+      if (!CompileTessellationPipelineHullFunction(
+              device, *vs, *hs, hs_name.c_str(),
+              reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+                  &ia_layout),
+              out.tessellation_vertex_hull[variant]))
+        return false;
+
+      WMTMeshRenderPipelineInfo info = {};
+      WMT::InitializeMeshRenderPipelineInfo(info);
+      info.object_function = out.tessellation_vertex_hull[variant].function;
+      info.mesh_function = out.tessellation_domain.function;
+      info.fragment_function = out.pixel.function;
+      info.rasterization_enabled = true;
+      info.raster_sample_count = state.desc.SampleDesc.Count;
+      if (!device->GetMTLDevice().supportsFamily(WMTGPUFamilyApple7))
+        info.payload_memory_length = 16384;
+      info.immutable_object_buffers =
+          (1 << 16) | (1 << 21) | (1 << 27) | (1 << 28) |
+          (1 << 29) | (1 << 30);
+      info.immutable_mesh_buffers = (1 << 29) | (1 << 30);
+      info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+      info.mesh_tgsize_is_multiple_of_sgwidth = true;
+      info.object_tgsize_is_multiple_of_sgwidth = true;
+
+      for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
+        if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
+          info.colors[i].pixel_format = rtv_formats[i];
+      }
+      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+
+      if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+        info.depth_pixel_format = depth_format;
+        info.stencil_pixel_format = stencil_format;
+      }
+
+      WMT::Reference<WMT::Error> error;
+      pso = device->GetMTLDevice().newRenderPipelineState(info, error);
+      if (error || !pso) {
+        WARN("D3D12PipelineState: failed to create Metal tessellation PSO: ",
+             error ? error.description().getUTF8String() : "unknown error");
+        return false;
+      }
+      return true;
+    };
+
+    if (!create_tessellation_variant(0, SM50_INDEX_BUFFER_FORMAT_NONE, "vshs",
+                                     out.pso) ||
+        !create_tessellation_variant(1, SM50_INDEX_BUFFER_FORMAT_UINT16,
+                                     "vshs_i16", out.tessellation_pso_u16) ||
+        !create_tessellation_variant(2, SM50_INDEX_BUFFER_FORMAT_UINT32,
+                                     "vshs_i32", out.tessellation_pso_u32))
+      return false;
+
+    out.use_tessellation = true;
+    out.tess_num_output_control_point_element =
+        hs->reflection.NumOutputElement;
+    out.tess_threads_per_patch = hs->reflection.ThreadsPerPatch;
+    BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
+    out.depth_stencil =
+        CreateDepthStencilState(device, state.desc.DepthStencilState);
+    return true;
   }
 
   if (gs) {
@@ -1915,8 +2096,12 @@ FixComputeStatePointers(PipelineComputeState &state,
 HRESULT
 CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
                    PipelineGraphicsState &state) {
-  if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
-      desc.SampleDesc.Count == 0)
+  if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+    return WARN_E_INVALIDARG(__func__);
+  const bool has_depth_stencil = desc.DSVFormat != DXGI_FORMAT_UNKNOWN;
+  const bool has_attachments =
+      desc.NumRenderTargets != 0 || has_depth_stencil;
+  if (desc.SampleDesc.Count == 0 && has_attachments)
     return WARN_E_INVALIDARG(__func__);
   if (desc.NodeMask > 1) {
     WARN("D3D12PipelineState: multi-node graphics PSOs are unsupported");
@@ -1940,8 +2125,7 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
     if (rt.LogicOpEnable && desc.BlendState.IndependentBlendEnable)
       return WARN_E_INVALIDARG(__func__);
   }
-  if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED ||
-      desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
+  if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED) {
     WARN("D3D12PipelineState: unsupported primitive topology type ",
          uint32_t(desc.PrimitiveTopologyType));
     return WARN_E_INVALIDARG(__func__);
@@ -1952,10 +2136,10 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
   }
   if ((desc.HS.BytecodeLength || desc.HS.pShaderBytecode ||
        desc.DS.BytecodeLength || desc.DS.pShaderBytecode) &&
-      (!HasBytecode(desc.HS) || !HasBytecode(desc.DS)))
-    return WARN_E_INVALIDARG(__func__);
-  if (HasBytecode(desc.HS) || HasBytecode(desc.DS)) {
-    WARN("D3D12PipelineState: tessellation shaders are unsupported");
+      (!HasBytecode(desc.HS) || !HasBytecode(desc.DS))) {
+    // TODO(d3d12): diagnose partial tessellation PSOs more precisely.
+    WARN("D3D12PipelineState: incomplete tessellation shader pair hasHS=",
+         HasBytecode(desc.HS), " hasDS=", HasBytecode(desc.DS));
     return WARN_E_INVALIDARG(__func__);
   }
   if (!HasBytecode(desc.VS))
@@ -1965,6 +2149,11 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
 
   state = {};
   state.desc = desc;
+  if (state.desc.SampleDesc.Count == 0) {
+    WARN("D3D12PipelineState: normalizing attachment-less PSO sample count "
+         "from 0 to 1");
+    state.desc.SampleDesc.Count = 1;
+  }
 
   state.input_elements.reserve(desc.InputLayout.NumElements);
   state.input_element_semantic_names.reserve(desc.InputLayout.NumElements);

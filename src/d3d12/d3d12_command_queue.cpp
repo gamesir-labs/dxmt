@@ -5,6 +5,7 @@
 #include "com/com_private_data.hpp"
 #include "d3d12_command_list.hpp"
 #include "d3d12_fence.hpp"
+#include "d3d12_heap.hpp"
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
@@ -50,10 +51,335 @@ std::unordered_map<IMTLD3D12Device *,
 std::mutex g_resource_states_mutex;
 
 static UINT GetPlaneCount(const Resource &resource);
+static UINT GetResourceMipLevelCount(const Resource &resource);
+static UINT GetResourceArraySliceCount(const Resource &resource);
 static UINT GetSubresourceIndex(const Resource &resource, UINT subresource);
 static UINT GetSubresourcePlane(const Resource &resource, UINT subresource);
 static UINT GetMipLevel(const Resource &resource, UINT subresource);
 static UINT GetArraySlice(const Resource &resource, UINT subresource);
+static UINT NormalizeViewCount(UINT requested, UINT first, UINT total);
+
+struct SubresourceRange {
+  UINT first = 0;
+  UINT count = 0;
+};
+
+static bool
+ShouldLogTileMappingDiag() {
+  static std::atomic<uint32_t> count = 0;
+  return count.fetch_add(1, std::memory_order_relaxed) < 16;
+}
+
+static bool
+ShouldLogTextureBufferViewDiag() {
+  static std::atomic<uint32_t> count = 0;
+  return count.fetch_add(1, std::memory_order_relaxed) < 32;
+}
+
+static void
+WarnTextureBufferViewUnavailable(const char *binding, DXGI_FORMAT format,
+                                 UINT stride, UINT64 offset,
+                                 UINT64 byte_size) {
+  if (!ShouldLogTextureBufferViewDiag())
+    return;
+  WARN("D3D12CommandQueue: ", binding,
+       " buffer view reflected as texture but Metal texture-buffer view is unavailable"
+       " format=", uint32_t(format),
+       " stride=", stride,
+       " offset=", offset,
+       " byteSize=", byte_size,
+       "; leaving binding null");
+}
+
+static const char *
+TileRangeFlagName(D3D12_TILE_RANGE_FLAGS flags) {
+  switch (flags) {
+  case D3D12_TILE_RANGE_FLAG_NONE:
+    return "NONE";
+  case D3D12_TILE_RANGE_FLAG_NULL:
+    return "NULL";
+  case D3D12_TILE_RANGE_FLAG_SKIP:
+    return "SKIP";
+  case D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE:
+    return "REUSE_SINGLE_TILE";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static UINT
+D3D12BlitBlockWidth(const MTL_DXGI_FORMAT_DESC &format) {
+  return (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+}
+
+static UINT
+D3D12BlitBlockHeight(const MTL_DXGI_FORMAT_DESC &format) {
+  return (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+}
+
+static UINT
+D3D12BlitElementSize(const MTL_DXGI_FORMAT_DESC &format) {
+  return (format.Flag & MTL_DXGI_FORMAT_BC) ? format.BlockSize
+                                            : format.BytesPerTexel;
+}
+
+static UINT64
+AlignUp(UINT64 value, UINT64 alignment) {
+  return alignment ? ((value + alignment - 1) / alignment) * alignment : value;
+}
+
+struct TileRangeCursor {
+  UINT index = 0;
+  UINT consumed = 0;
+  UINT total_consumed = 0;
+};
+
+static bool
+IsPackedTileSubresource(const SubresourceTiling &subresource) {
+  return subresource.start_tile_index == D3D12_PACKED_TILE ||
+         !subresource.width_in_tiles || !subresource.height_in_tiles ||
+         !subresource.depth_in_tiles;
+}
+
+static bool
+IsValidTileCoordinate(const ResourceTiling &tiling,
+                      const D3D12_TILED_RESOURCE_COORDINATE &coord) {
+  if (coord.Subresource >= tiling.subresources.size())
+    return false;
+  const auto &subresource = tiling.subresources[coord.Subresource];
+  if (IsPackedTileSubresource(subresource))
+    return false;
+  return coord.X < subresource.width_in_tiles &&
+         coord.Y < subresource.height_in_tiles &&
+         coord.Z < subresource.depth_in_tiles;
+}
+
+static bool
+AdvanceTileCoordinate(const ResourceTiling &tiling,
+                      D3D12_TILED_RESOURCE_COORDINATE &coord) {
+  if (coord.Subresource >= tiling.subresources.size())
+    return false;
+  const auto &subresource = tiling.subresources[coord.Subresource];
+  if (IsPackedTileSubresource(subresource))
+    return false;
+  if (++coord.X < subresource.width_in_tiles)
+    return true;
+  coord.X = 0;
+  if (++coord.Y < subresource.height_in_tiles)
+    return true;
+  coord.Y = 0;
+  if (++coord.Z < subresource.depth_in_tiles)
+    return true;
+  coord.Z = 0;
+  ++coord.Subresource;
+  return coord.Subresource < tiling.subresources.size();
+}
+
+static bool
+ConsumeTileRange(TileRangeCursor &cursor, UINT range_count,
+                 const D3D12_TILE_RANGE_FLAGS *range_flags,
+                 const UINT *heap_range_offsets,
+                 const UINT *range_tile_counts,
+                 D3D12_TILE_RANGE_FLAGS &flags, UINT &heap_tile) {
+  while (cursor.index < range_count) {
+    flags = range_flags ? range_flags[cursor.index] : D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT count = range_tile_counts ? range_tile_counts[cursor.index] : 1;
+    const UINT base = heap_range_offsets ? heap_range_offsets[cursor.index]
+                                         : cursor.total_consumed - cursor.consumed;
+    if (cursor.consumed < count) {
+      heap_tile = (flags & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE)
+                      ? base
+                      : base + cursor.consumed;
+      ++cursor.consumed;
+      ++cursor.total_consumed;
+      if (cursor.consumed == count) {
+        ++cursor.index;
+        cursor.consumed = 0;
+      }
+      return true;
+    }
+    ++cursor.index;
+    cursor.consumed = 0;
+  }
+  return false;
+}
+
+static bool
+TileRangeCursorConsumedAll(const TileRangeCursor &cursor, UINT range_count,
+                           const UINT *range_tile_counts) {
+  if (cursor.index >= range_count)
+    return true;
+  if (!range_tile_counts)
+    return cursor.consumed == 0 && cursor.index == range_count;
+  if (cursor.consumed)
+    return false;
+  for (UINT i = cursor.index; i < range_count; ++i) {
+    if (range_tile_counts[i])
+      return false;
+  }
+  return true;
+}
+
+static bool
+AppendSparseTileMappingOp(const ResourceTiling &tiling,
+                          const D3D12_TILED_RESOURCE_COORDINATE &coord,
+                          D3D12_TILE_RANGE_FLAGS range_flags, UINT heap_tile,
+                          std::vector<WMTSparseTextureMappingOperation> &ops) {
+  if (!IsValidTileCoordinate(tiling, coord))
+    return false;
+  const auto &subresource = tiling.subresources[coord.Subresource];
+
+  WMTSparseTextureMappingOperation op = {};
+  op.mode = (range_flags & D3D12_TILE_RANGE_FLAG_NULL)
+                ? WMTSparseTextureMappingModeUnmap
+                : WMTSparseTextureMappingModeMap;
+  op.level = subresource.mip_level;
+  op.slice = subresource.array_slice;
+  op.x = coord.X;
+  op.y = coord.Y;
+  op.z = coord.Z;
+  op.width = 1;
+  op.height = 1;
+  op.depth = 1;
+  op.heap_offset = UINT64(heap_tile) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  ops.push_back(op);
+  return true;
+}
+
+static bool
+AppendSparseTileMappingRegion(const ResourceTiling &tiling,
+                              const D3D12_TILED_RESOURCE_COORDINATE &start,
+                              const D3D12_TILE_REGION_SIZE *size,
+                              TileRangeCursor &cursor, UINT range_count,
+                              const D3D12_TILE_RANGE_FLAGS *range_flags,
+                              const UINT *heap_range_offsets,
+                              const UINT *range_tile_counts,
+                              std::vector<WMTSparseTextureMappingOperation> &ops) {
+  if (!IsValidTileCoordinate(tiling, start))
+    return false;
+
+  auto append_one = [&](const D3D12_TILED_RESOURCE_COORDINATE &coord) -> bool {
+    D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT heap_tile = 0;
+    if (!ConsumeTileRange(cursor, range_count, range_flags, heap_range_offsets,
+                          range_tile_counts, flags, heap_tile))
+      return false;
+    if (flags == D3D12_TILE_RANGE_FLAG_SKIP)
+      return true;
+    constexpr UINT supported_flags =
+        D3D12_TILE_RANGE_FLAG_NULL | D3D12_TILE_RANGE_FLAG_SKIP |
+        D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE;
+    if ((flags & ~supported_flags) ||
+        ((flags & D3D12_TILE_RANGE_FLAG_SKIP) &&
+         (flags & ~D3D12_TILE_RANGE_FLAG_SKIP)) ||
+        ((flags & D3D12_TILE_RANGE_FLAG_NULL) &&
+         (flags & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE))) {
+      if (ShouldLogTileMappingDiag())
+        WARN("D3D12CommandQueue: TODO unsupported tile range flag "
+             " flag=", flags,
+             " name=", TileRangeFlagName(flags));
+      return false;
+    }
+    return AppendSparseTileMappingOp(tiling, coord, flags, heap_tile, ops);
+  };
+
+  if (!size)
+    return append_one(start);
+
+  if (size->UseBox) {
+    const auto &subresource = tiling.subresources[start.Subresource];
+    if (start.X > subresource.width_in_tiles ||
+        size->Width > subresource.width_in_tiles - start.X ||
+        start.Y > subresource.height_in_tiles ||
+        size->Height > subresource.height_in_tiles - start.Y ||
+        start.Z > subresource.depth_in_tiles ||
+        size->Depth > subresource.depth_in_tiles - start.Z)
+      return false;
+    for (UINT z = 0; z < size->Depth; ++z) {
+      for (UINT y = 0; y < size->Height; ++y) {
+        for (UINT x = 0; x < size->Width; ++x) {
+          D3D12_TILED_RESOURCE_COORDINATE coord = start;
+          coord.X += x;
+          coord.Y += y;
+          coord.Z += z;
+          if (!append_one(coord))
+            return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  auto coord = start;
+  for (UINT i = 0; i < size->NumTiles; ++i) {
+    if (!IsValidTileCoordinate(tiling, coord) || !append_one(coord))
+      return false;
+    if (i + 1 < size->NumTiles && !AdvanceTileCoordinate(tiling, coord))
+      return false;
+  }
+  return true;
+}
+
+template <typename Fn>
+static bool
+ForEachTileInRegion(const ResourceTiling &tiling,
+                    const D3D12_TILED_RESOURCE_COORDINATE &start,
+                    const D3D12_TILE_REGION_SIZE *size, Fn &&fn) {
+  if (!IsValidTileCoordinate(tiling, start))
+    return false;
+
+  if (!size)
+    return fn(start.Subresource, start.X, start.Y, start.Z);
+
+  if (size->UseBox) {
+    const auto &subresource = tiling.subresources[start.Subresource];
+    if (start.X > subresource.width_in_tiles ||
+        size->Width > subresource.width_in_tiles - start.X ||
+        start.Y > subresource.height_in_tiles ||
+        size->Height > subresource.height_in_tiles - start.Y ||
+        start.Z > subresource.depth_in_tiles ||
+        size->Depth > subresource.depth_in_tiles - start.Z)
+      return false;
+    for (UINT z = 0; z < size->Depth; ++z)
+      for (UINT y = 0; y < size->Height; ++y)
+        for (UINT x = 0; x < size->Width; ++x)
+          if (!fn(start.Subresource, start.X + x, start.Y + y, start.Z + z))
+            return false;
+    return true;
+  }
+
+  auto coord = start;
+  for (UINT i = 0; i < size->NumTiles; ++i) {
+    if (!IsValidTileCoordinate(tiling, coord) ||
+        !fn(coord.Subresource, coord.X, coord.Y, coord.Z))
+      return false;
+    if (i + 1 < size->NumTiles && !AdvanceTileCoordinate(tiling, coord))
+      return false;
+  }
+  return true;
+}
+
+static void
+ApplySparseTileMappingOpsToResource(Resource &resource,
+                                    const ResourceTiling &tiling,
+                                    ID3D12Heap *heap,
+                                    const std::vector<WMTSparseTextureMappingOperation> &ops) {
+  for (const auto &op : ops) {
+    for (UINT subresource = 0; subresource < tiling.subresources.size();
+         ++subresource) {
+      const auto &tile = tiling.subresources[subresource];
+      if (tile.mip_level != op.level || tile.array_slice != op.slice ||
+          op.x >= tile.width_in_tiles || op.y >= tile.height_in_tiles ||
+          op.z >= tile.depth_in_tiles)
+        continue;
+      resource.UpdateTileMapping(
+          subresource, op.x, op.y, op.z, heap,
+          op.mode == WMTSparseTextureMappingModeMap,
+          op.heap_offset / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+      break;
+    }
+  }
+}
 
 static bool
 D3D12DiagEnabledEnv(const char *name) {
@@ -315,6 +641,44 @@ D3D12DiagDescriptorFormat(const DescriptorRecord &descriptor) {
   }
 }
 
+static const char *
+DescriptorRecordTypeName(DescriptorRecordType type) {
+  switch (type) {
+  case DescriptorRecordType::Empty:
+    return "empty";
+  case DescriptorRecordType::ConstantBufferView:
+    return "cbv";
+  case DescriptorRecordType::ShaderResourceView:
+    return "srv";
+  case DescriptorRecordType::UnorderedAccessView:
+    return "uav";
+  case DescriptorRecordType::RenderTargetView:
+    return "rtv";
+  case DescriptorRecordType::DepthStencilView:
+    return "dsv";
+  case DescriptorRecordType::Sampler:
+    return "sampler";
+  default:
+    return "unknown";
+  }
+}
+
+static DescriptorRecordType
+ExpectedDescriptorTypeForRange(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
+  switch (range_type) {
+  case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+    return DescriptorRecordType::ConstantBufferView;
+  case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+    return DescriptorRecordType::ShaderResourceView;
+  case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+    return DescriptorRecordType::UnorderedAccessView;
+  case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+    return DescriptorRecordType::Sampler;
+  default:
+    return DescriptorRecordType::Empty;
+  }
+}
+
 static void
 D3D12DiagLogTextureView(const char *kind, Resource &resource,
                         const DescriptorRecord &descriptor,
@@ -492,6 +856,15 @@ GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
   }
 }
 
+static std::optional<uint32_t>
+GetPatchControlPointCount(D3D12_PRIMITIVE_TOPOLOGY topology) {
+  if (topology < D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST ||
+      topology > D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST)
+    return std::nullopt;
+  return uint32_t(topology) -
+         uint32_t(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) + 1u;
+}
+
 struct DXMT_DRAW_ARGUMENTS {
   uint32_t VertexCount;
   uint32_t InstanceCount;
@@ -551,7 +924,15 @@ GetGeometryVertexCount(D3D12_PRIMITIVE_TOPOLOGY topology) {
 
 static WMT::Reference<WMT::RenderPipelineState>
 SelectGraphicsPipelineState(const PipelineMetalGraphicsState &metal,
-                            D3D12_PRIMITIVE_TOPOLOGY topology) {
+                            D3D12_PRIMITIVE_TOPOLOGY topology,
+                            DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN) {
+  if (metal.use_tessellation) {
+    if (index_format == DXGI_FORMAT_R16_UINT && metal.tessellation_pso_u16)
+      return metal.tessellation_pso_u16;
+    if (index_format == DXGI_FORMAT_R32_UINT && metal.tessellation_pso_u32)
+      return metal.tessellation_pso_u32;
+    return metal.pso;
+  }
   if (metal.use_geometry && IsGeometryStripTopology(topology) &&
       metal.strip_pso)
     return metal.strip_pso;
@@ -655,15 +1036,14 @@ PipelineStageName(PipelineStage stage) {
 
 static UINT
 GetMipLevel(const Resource &resource, UINT subresource) {
-  const auto &desc = resource.GetResourceDesc();
-  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  const UINT mip_levels = GetResourceMipLevelCount(resource);
   return mip_levels ? GetSubresourceIndex(resource, subresource) % mip_levels : 0;
 }
 
 static UINT
 GetArraySlice(const Resource &resource, UINT subresource) {
   const auto &desc = resource.GetResourceDesc();
-  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  const UINT mip_levels = GetResourceMipLevelCount(resource);
   return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
              ? 0
              : GetSubresourceIndex(resource, subresource) / mip_levels;
@@ -672,13 +1052,10 @@ GetArraySlice(const Resource &resource, UINT subresource) {
 static UINT
 GetSubresourceCount(const Resource &resource) {
   const auto &desc = resource.GetResourceDesc();
-  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     return 1;
-  return mip_levels *
-         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-              ? 1
-              : desc.DepthOrArraySize) *
+  return GetResourceMipLevelCount(resource) *
+         GetResourceArraySliceCount(resource) *
          GetPlaneCount(resource);
 }
 
@@ -689,6 +1066,45 @@ GetPlaneCount(const Resource &resource) {
     return 1;
   const auto &traits = GetDXGIFormatTraits(desc.Format);
   return traits.planeCount ? traits.planeCount : 1;
+}
+
+static UINT
+GetFullMipLevelCount(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+
+  UINT64 width = std::max<UINT64>(desc.Width, 1);
+  UINT height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                    ? 1
+                    : std::max<UINT>(desc.Height, 1);
+  UINT depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                   ? std::max<UINT>(desc.DepthOrArraySize, 1)
+                   : 1;
+  UINT levels = 1;
+  while (width > 1 || height > 1 || depth > 1) {
+    width = std::max<UINT64>(1, width >> 1);
+    height = std::max<UINT>(1, height >> 1);
+    depth = std::max<UINT>(1, depth >> 1);
+    levels++;
+  }
+  return levels;
+}
+
+static UINT
+GetResourceMipLevelCount(const Resource &resource) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+  return desc.MipLevels ? desc.MipLevels : GetFullMipLevelCount(desc);
+}
+
+static UINT
+GetResourceArraySliceCount(const Resource &resource) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+      desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return 1;
+  return std::max<UINT>(desc.DepthOrArraySize, 1);
 }
 
 static bool
@@ -727,23 +1143,58 @@ GetSubresourcePlane(const Resource &resource, UINT subresource) {
   const auto plane_count = GetPlaneCount(resource);
   if (plane_count <= 1)
     return 0;
-  const auto &desc = resource.GetResourceDesc();
-  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
-  const UINT base_count = mip_levels *
-      (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
+  const UINT base_count = GetResourceMipLevelCount(resource) *
+      GetResourceArraySliceCount(resource);
   return base_count ? subresource / base_count : 0;
 }
 
 static UINT
 GetSubresourceIndex(const Resource &resource, UINT subresource) {
-  const auto &desc = resource.GetResourceDesc();
-  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  const UINT mip_levels = GetResourceMipLevelCount(resource);
   const UINT plane_count = GetPlaneCount(resource);
-  const UINT base_count = mip_levels *
-      (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
+  const UINT base_count = mip_levels * GetResourceArraySliceCount(resource);
   if (plane_count <= 1)
     return subresource;
   return subresource % base_count;
+}
+
+static UINT
+MakeSubresourceIndex(const Resource &resource, UINT mip, UINT array_slice,
+                     UINT plane) {
+  const UINT mip_levels = GetResourceMipLevelCount(resource);
+  const UINT array_size = GetResourceArraySliceCount(resource);
+  const UINT base_count = mip_levels * array_size;
+  return plane * base_count + array_slice * mip_levels + mip;
+}
+
+static bool
+AppendTextureSubresourceRanges(const Resource &resource, UINT first_mip,
+                               UINT mip_count, UINT first_slice,
+                               UINT slice_count, UINT plane,
+                               std::vector<SubresourceRange> &ranges) {
+  const UINT mip_levels = GetResourceMipLevelCount(resource);
+  const UINT array_size = GetResourceArraySliceCount(resource);
+  if (plane >= GetPlaneCount(resource) || first_mip >= mip_levels ||
+      mip_count == 0 || mip_count > mip_levels - first_mip ||
+      first_slice >= array_size || slice_count == 0 ||
+      slice_count > array_size - first_slice)
+    return false;
+
+  for (UINT slice = first_slice; slice < first_slice + slice_count; ++slice) {
+    ranges.push_back({MakeSubresourceIndex(resource, first_mip, slice, plane),
+                      mip_count});
+  }
+  return true;
+}
+
+static bool
+AppendAllSubresourcesRange(const Resource &resource,
+                           std::vector<SubresourceRange> &ranges) {
+  const UINT count = GetSubresourceCount(resource);
+  if (!count)
+    return false;
+  ranges.push_back({0, count});
+  return true;
 }
 
 static WMTSize
@@ -854,12 +1305,47 @@ IsSingleWriteResourceState(D3D12_RESOURCE_STATES state) {
 }
 
 static bool
-IsDecayEligibleResource(const Resource &resource,
-                        D3D12_COMMAND_LIST_TYPE queue_type) {
+IsAlwaysDecayEligibleResource(const Resource &resource) {
   const auto &desc = resource.GetResourceDesc();
-  return queue_type == D3D12_COMMAND_LIST_TYPE_COPY ||
-         desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
          (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+}
+
+static bool
+IsImplicitPromotionCompatibleState(const Resource &resource,
+                                   D3D12_RESOURCE_STATES state) {
+  if (state == D3D12_RESOURCE_STATE_COMMON)
+    return true;
+
+  if (IsReadOnlyResourceState(state))
+    return true;
+
+  if (state == D3D12_RESOURCE_STATE_COPY_SOURCE ||
+      state == D3D12_RESOURCE_STATE_COPY_DEST)
+    return true;
+
+  if (IsSingleWriteResourceState(state) &&
+      IsAlwaysDecayEligibleResource(resource))
+    return true;
+
+  return false;
+}
+
+static bool
+IsDecayEligibleResourceState(const Resource &resource,
+                             D3D12_COMMAND_LIST_TYPE queue_type,
+                             D3D12_RESOURCE_STATES state,
+                             bool implicitly_promoted) {
+  if (state == D3D12_RESOURCE_STATE_COMMON)
+    return false;
+
+  if (queue_type == D3D12_COMMAND_LIST_TYPE_COPY)
+    return true;
+
+  if (IsAlwaysDecayEligibleResource(resource))
+    return true;
+
+  return implicitly_promoted && IsReadOnlyResourceState(state);
 }
 
 static bool
@@ -869,16 +1355,7 @@ IsImplicitPromotionCompatibleResource(const Resource &resource,
   if (current != D3D12_RESOURCE_STATE_COMMON)
     return false;
 
-  if (IsReadOnlyResourceState(before))
-    return true;
-
-  if (IsSingleWriteResourceState(before) &&
-      (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
-       (resource.GetResourceDesc().Flags &
-        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)))
-    return true;
-
-  return false;
+  return IsImplicitPromotionCompatibleState(resource, before);
 }
 
 static bool
@@ -1116,6 +1593,215 @@ GetDepthStencilArrayLength(Resource &resource, const DescriptorRecord &descripto
     return descriptor.desc.dsv.Texture2DMSArray.ArraySize;
   default:
     return 1;
+  }
+}
+
+static bool
+GetRenderTargetSubresourceRanges(Resource &resource,
+                                 const DescriptorRecord &descriptor,
+                                 std::vector<SubresourceRange> &ranges) {
+  if (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return AppendAllSubresourcesRange(resource, ranges);
+  if (!descriptor.has_desc)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const auto &rtv = descriptor.desc.rtv;
+  switch (rtv.ViewDimension) {
+  case D3D12_RTV_DIMENSION_TEXTURE1D:
+    return AppendTextureSubresourceRanges(resource, rtv.Texture1D.MipSlice, 1, 0,
+                                          1, 0, ranges);
+  case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, rtv.Texture1DArray.MipSlice, 1,
+        rtv.Texture1DArray.FirstArraySlice, rtv.Texture1DArray.ArraySize, 0,
+        ranges);
+  case D3D12_RTV_DIMENSION_TEXTURE2D:
+    return AppendTextureSubresourceRanges(resource, rtv.Texture2D.MipSlice, 1, 0,
+                                          1, rtv.Texture2D.PlaneSlice, ranges);
+  case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, rtv.Texture2DArray.MipSlice, 1,
+        rtv.Texture2DArray.FirstArraySlice, rtv.Texture2DArray.ArraySize,
+        rtv.Texture2DArray.PlaneSlice, ranges);
+  case D3D12_RTV_DIMENSION_TEXTURE2DMS:
+    return AppendTextureSubresourceRanges(resource, 0, 1, 0, 1, 0, ranges);
+  case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, 0, 1, rtv.Texture2DMSArray.FirstArraySlice,
+        rtv.Texture2DMSArray.ArraySize, 0, ranges);
+  case D3D12_RTV_DIMENSION_TEXTURE3D:
+    return AppendTextureSubresourceRanges(resource, rtv.Texture3D.MipSlice, 1, 0,
+                                          1, 0, ranges);
+  default:
+    return false;
+  }
+}
+
+static bool
+GetDepthStencilSubresourceRanges(Resource &resource,
+                                 const DescriptorRecord &descriptor,
+                                 std::vector<SubresourceRange> &ranges) {
+  if (!descriptor.has_desc)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const auto &dsv = descriptor.desc.dsv;
+  switch (dsv.ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1D:
+    return AppendTextureSubresourceRanges(resource, dsv.Texture1D.MipSlice, 1, 0,
+                                          1, 0, ranges);
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, dsv.Texture1DArray.MipSlice, 1,
+        dsv.Texture1DArray.FirstArraySlice, dsv.Texture1DArray.ArraySize, 0,
+        ranges);
+  case D3D12_DSV_DIMENSION_TEXTURE2D:
+    return AppendTextureSubresourceRanges(resource, dsv.Texture2D.MipSlice, 1, 0,
+                                          1, 0, ranges);
+  case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, dsv.Texture2DArray.MipSlice, 1,
+        dsv.Texture2DArray.FirstArraySlice, dsv.Texture2DArray.ArraySize, 0,
+        ranges);
+  case D3D12_DSV_DIMENSION_TEXTURE2DMS:
+    return AppendTextureSubresourceRanges(resource, 0, 1, 0, 1, 0, ranges);
+  case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, 0, 1, dsv.Texture2DMSArray.FirstArraySlice,
+        dsv.Texture2DMSArray.ArraySize, 0, ranges);
+  default:
+    return false;
+  }
+}
+
+static bool
+GetShaderResourceSubresourceRanges(Resource &resource,
+                                   const DescriptorRecord &descriptor,
+                                   std::vector<SubresourceRange> &ranges) {
+  if (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return AppendAllSubresourcesRange(resource, ranges);
+  if (!descriptor.has_desc)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const auto &srv = descriptor.desc.srv;
+  switch (srv.ViewDimension) {
+  case D3D12_SRV_DIMENSION_BUFFER:
+    return AppendAllSubresourcesRange(resource, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE1D:
+    return AppendTextureSubresourceRanges(
+        resource, srv.Texture1D.MostDetailedMip,
+        NormalizeViewCount(srv.Texture1D.MipLevels,
+                           srv.Texture1D.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        0, 1, 0, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, srv.Texture1DArray.MostDetailedMip,
+        NormalizeViewCount(srv.Texture1DArray.MipLevels,
+                           srv.Texture1DArray.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        srv.Texture1DArray.FirstArraySlice,
+        NormalizeViewCount(srv.Texture1DArray.ArraySize,
+                           srv.Texture1DArray.FirstArraySlice,
+                           resource.GetResourceDesc().DepthOrArraySize),
+        0, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE2D:
+    return AppendTextureSubresourceRanges(
+        resource, srv.Texture2D.MostDetailedMip,
+        NormalizeViewCount(srv.Texture2D.MipLevels,
+                           srv.Texture2D.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        0, 1, srv.Texture2D.PlaneSlice, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, srv.Texture2DArray.MostDetailedMip,
+        NormalizeViewCount(srv.Texture2DArray.MipLevels,
+                           srv.Texture2DArray.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        srv.Texture2DArray.FirstArraySlice,
+        NormalizeViewCount(srv.Texture2DArray.ArraySize,
+                           srv.Texture2DArray.FirstArraySlice,
+                           resource.GetResourceDesc().DepthOrArraySize),
+        srv.Texture2DArray.PlaneSlice, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+    return AppendTextureSubresourceRanges(resource, 0, 1, 0, 1, 0, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, 0, 1, srv.Texture2DMSArray.FirstArraySlice,
+        NormalizeViewCount(srv.Texture2DMSArray.ArraySize,
+                           srv.Texture2DMSArray.FirstArraySlice,
+                           resource.GetResourceDesc().DepthOrArraySize),
+        0, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURE3D:
+    return AppendTextureSubresourceRanges(
+        resource, srv.Texture3D.MostDetailedMip,
+        NormalizeViewCount(srv.Texture3D.MipLevels,
+                           srv.Texture3D.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        0, 1, 0, ranges);
+  case D3D12_SRV_DIMENSION_TEXTURECUBE:
+    return AppendTextureSubresourceRanges(
+        resource, srv.TextureCube.MostDetailedMip,
+        NormalizeViewCount(srv.TextureCube.MipLevels,
+                           srv.TextureCube.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        0, std::min<UINT>(6, resource.GetResourceDesc().DepthOrArraySize), 0,
+        ranges);
+  case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, srv.TextureCubeArray.MostDetailedMip,
+        NormalizeViewCount(srv.TextureCubeArray.MipLevels,
+                           srv.TextureCubeArray.MostDetailedMip,
+                           GetResourceMipLevelCount(resource)),
+        srv.TextureCubeArray.First2DArrayFace,
+        NormalizeViewCount(srv.TextureCubeArray.NumCubes * 6,
+                           srv.TextureCubeArray.First2DArrayFace,
+                           resource.GetResourceDesc().DepthOrArraySize),
+        0, ranges);
+  default:
+    return false;
+  }
+}
+
+static bool
+GetUnorderedAccessSubresourceRanges(Resource &resource,
+                                    const DescriptorRecord &descriptor,
+                                    std::vector<SubresourceRange> &ranges) {
+  if (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return AppendAllSubresourcesRange(resource, ranges);
+  if (!descriptor.has_desc)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const auto &uav = descriptor.desc.uav;
+  switch (uav.ViewDimension) {
+  case D3D12_UAV_DIMENSION_BUFFER:
+    return AppendAllSubresourcesRange(resource, ranges);
+  case D3D12_UAV_DIMENSION_TEXTURE1D:
+    return AppendTextureSubresourceRanges(resource, uav.Texture1D.MipSlice, 1, 0,
+                                          1, 0, ranges);
+  case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, uav.Texture1DArray.MipSlice, 1,
+        uav.Texture1DArray.FirstArraySlice,
+        NormalizeViewCount(uav.Texture1DArray.ArraySize,
+                           uav.Texture1DArray.FirstArraySlice,
+                           resource.GetResourceDesc().DepthOrArraySize),
+        0, ranges);
+  case D3D12_UAV_DIMENSION_TEXTURE2D:
+    return AppendTextureSubresourceRanges(resource, uav.Texture2D.MipSlice, 1, 0,
+                                          1, uav.Texture2D.PlaneSlice, ranges);
+  case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+    return AppendTextureSubresourceRanges(
+        resource, uav.Texture2DArray.MipSlice, 1,
+        uav.Texture2DArray.FirstArraySlice,
+        NormalizeViewCount(uav.Texture2DArray.ArraySize,
+                           uav.Texture2DArray.FirstArraySlice,
+                           resource.GetResourceDesc().DepthOrArraySize),
+        uav.Texture2DArray.PlaneSlice, ranges);
+  case D3D12_UAV_DIMENSION_TEXTURE3D:
+    return AppendTextureSubresourceRanges(resource, uav.Texture3D.MipSlice, 1, 0,
+                                          1, 0, ranges);
+  default:
+    return false;
   }
 }
 
@@ -1685,9 +2371,23 @@ struct CachedTemporalScaler {
   Rc<Texture> mv_downscaled;
 };
 
+struct ReplaySubresourceState {
+  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+  D3D12_RESOURCE_STATES pending_before = D3D12_RESOURCE_STATE_COMMON;
+  D3D12_RESOURCE_STATES pending_after = D3D12_RESOURCE_STATE_COMMON;
+  bool implicitly_promoted = false;
+  bool has_pending_split = false;
+};
+
+struct ReplayResourceStateEntry {
+  D3D12_RESOURCE_DESC desc = {};
+  D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON;
+  UINT64 heap_offset = 0;
+  std::vector<ReplaySubresourceState> subresources;
+};
+
 struct CommandQueueResourceStates {
-  std::unordered_map<ID3D12Resource *, std::vector<D3D12_RESOURCE_STATES>>
-      resources;
+  std::unordered_map<ID3D12Resource *, ReplayResourceStateEntry> resources;
   std::mutex mutex;
 };
 
@@ -1767,9 +2467,9 @@ public:
                                             const UINT *heap_range_offsets,
                                             const UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {
-    // TODO(d3d12): implement reserved-resource tile mappings once tiled
-    // resources are represented by the D3D12 resource layer.
-    WARN("D3D12CommandQueue: UpdateTileMappings is unsupported");
+    UpdateTileMappingsImpl(resource, region_count, region_start_coordinates,
+                           region_sizes, heap, range_count, range_flags,
+                           heap_range_offsets, range_tile_counts, flags);
   }
 #else
   void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource *resource, UINT region_count,
@@ -1780,9 +2480,9 @@ public:
                                             UINT *heap_range_offsets,
                                             UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {
-    // TODO(d3d12): implement reserved-resource tile mappings once tiled
-    // resources are represented by the D3D12 resource layer.
-    WARN("D3D12CommandQueue: UpdateTileMappings is unsupported");
+    UpdateTileMappingsImpl(resource, region_count, region_start_coordinates,
+                           region_sizes, nullptr, range_count, range_flags,
+                           heap_range_offsets, range_tile_counts, flags);
   }
 #endif
 
@@ -1792,9 +2492,305 @@ public:
                                           const D3D12_TILED_RESOURCE_COORDINATE *src_region_start_coordinate,
                                           const D3D12_TILE_REGION_SIZE *region_size,
                                           D3D12_TILE_MAPPING_FLAGS flags) override {
-    // TODO(d3d12): implement reserved-resource tile mapping copies once tiled
-    // resources are represented by the D3D12 resource layer.
-    WARN("D3D12CommandQueue: CopyTileMappings is unsupported");
+    CopyTileMappingsImpl(dst_resource, dst_region_start_coordinate,
+                         src_resource, src_region_start_coordinate,
+                         region_size, flags);
+  }
+
+  void UpdateTileMappingsImpl(ID3D12Resource *resource, UINT region_count,
+                              const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
+                                const D3D12_TILE_REGION_SIZE *region_sizes,
+                                ID3D12Heap *heap, UINT range_count,
+                                const D3D12_TILE_RANGE_FLAGS *range_flags,
+                              const UINT *heap_range_offsets,
+                              const UINT *range_tile_counts,
+                              D3D12_TILE_MAPPING_FLAGS flags) {
+    dxmt::apitrace::record_update_tile_mappings(
+        this, resource, region_count, region_start_coordinates, region_sizes,
+        heap, range_count, range_flags, heap_range_offsets, range_tile_counts,
+        flags);
+    if (!resource || !region_count || !region_start_coordinates)
+      return;
+    if (flags && ShouldLogTileMappingDiag()) {
+      WARN("D3D12CommandQueue: TODO UpdateTileMappings flags are ignored"
+           " flags=", flags,
+           " resource=", resource,
+           " regions=", region_count,
+           " ranges=", range_count);
+    }
+
+    auto *resource_object = dynamic_cast<d3d12::Resource *>(resource);
+    const auto *tiling = resource_object ? resource_object->GetTiling() : nullptr;
+    if (!resource_object || !resource_object->IsReservedTexture() || !tiling ||
+        !resource_object->GetTextureAllocation()) {
+      if (ShouldLogTileMappingDiag()) {
+        WARN("D3D12CommandQueue: TODO UpdateTileMappings requires reserved texture"
+             " resource=", resource,
+             " regions=", region_count,
+             " ranges=", range_count,
+             " flags=", flags);
+      }
+      return;
+    }
+
+    std::vector<WMTSparseTextureMappingOperation> ops;
+    TileRangeCursor cursor = {};
+    for (UINT i = 0; i < region_count; ++i) {
+      const D3D12_TILE_REGION_SIZE *size =
+          region_sizes ? &region_sizes[i] : nullptr;
+      if (!AppendSparseTileMappingRegion(
+              *tiling, region_start_coordinates[i], size, cursor,
+              range_count, range_flags, heap_range_offsets, range_tile_counts,
+              ops)) {
+        if (ShouldLogTileMappingDiag()) {
+          const auto &coord = region_start_coordinates[i];
+          WARN("D3D12CommandQueue: TODO UpdateTileMappings unsupported or invalid region"
+               " resource=", resource,
+               " regionIndex=", i,
+               " subresource=", coord.Subresource,
+               " x=", coord.X,
+               " y=", coord.Y,
+               " z=", coord.Z,
+               " useBox=", size ? size->UseBox : 0,
+               " numTiles=", size ? size->NumTiles : 1,
+               " width=", size ? size->Width : 1,
+               " height=", size ? size->Height : 1,
+               " depth=", size ? size->Depth : 1,
+               " ranges=", range_count);
+        }
+        return;
+      }
+    }
+    if (!TileRangeCursorConsumedAll(cursor, range_count, range_tile_counts) &&
+        ShouldLogTileMappingDiag()) {
+      WARN("D3D12CommandQueue: UpdateTileMappings tile range count mismatch"
+           " resource=", resource,
+           " consumed=", cursor.total_consumed,
+           " rangeIndex=", cursor.index,
+           " rangeConsumed=", cursor.consumed,
+           " ranges=", range_count);
+    }
+    if (ops.empty())
+      return;
+
+    bool has_map = false;
+    for (const auto &op : ops) {
+      has_map |= op.mode == WMTSparseTextureMappingModeMap;
+    }
+
+    WMT::Heap placement_heap = {};
+    if (has_map) {
+      auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
+      if (!heap_object) {
+        if (ShouldLogTileMappingDiag())
+          WARN("D3D12CommandQueue: TODO UpdateTileMappings map requires D3D12 heap"
+               " resource=", resource,
+               " heap=", heap,
+               " ops=", ops.size());
+        return;
+      }
+      const auto &heap_desc = heap_object->GetHeapDesc();
+      const UINT64 heap_tile_count =
+          heap_desc.SizeInBytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+      for (const auto &op : ops) {
+        if (op.mode != WMTSparseTextureMappingModeMap)
+          continue;
+        const UINT64 tile = op.heap_offset / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+        if (tile >= heap_tile_count) {
+          WARN("D3D12CommandQueue: TODO UpdateTileMappings heap tile out of range"
+               " resource=", resource,
+               " heap=", heap,
+               " tile=", tile,
+               " heapTiles=", heap_tile_count);
+          return;
+        }
+      }
+      placement_heap = heap_object->GetPlacementHeap();
+      if (!placement_heap) {
+        if (ShouldLogTileMappingDiag())
+          WARN("D3D12CommandQueue: TODO UpdateTileMappings failed to get placement heap"
+               " resource=", resource,
+               " heap=", heap,
+               " ops=", ops.size());
+        return;
+      }
+    }
+
+    auto texture = resource_object->GetTextureAllocation()->texture();
+    auto &queue = device_->GetDXMTDevice().queue();
+    auto *chunk = queue.CurrentChunk();
+    dxmt::apitrace::record_sparse_texture_mapping_ops(
+        this, resource, heap, "UpdateTileMappings", ops.data(), ops.size());
+    Com<ID3D12Resource> resource_ref = resource;
+    Com<ID3D12Heap> heap_ref = heap;
+    auto tiling_copy = *tiling;
+    chunk->emitcc([device = device_->GetDXMTDevice().device(),
+                   texture, placement_heap,
+                   ops = std::move(ops), resource_ref,
+                   tiling_copy = std::move(tiling_copy), heap_ref,
+                   has_map](
+                      ArgumentEncodingContext &) mutable {
+      if (!device.updateSparseTextureMappings(texture, placement_heap,
+                                              ops.data(), ops.size())) {
+        WARN("D3D12CommandQueue: TODO Metal4 UpdateTileMappings failed"
+             " resource=", resource_ref.ptr(),
+             " heap=", heap_ref.ptr(),
+             " ops=", ops.size(),
+             " hasMap=", has_map);
+        return;
+      }
+      if (auto *resource_object = dynamic_cast<d3d12::Resource *>(resource_ref.ptr()))
+        ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
+                                            heap_ref.ptr(), ops);
+    });
+  }
+
+  void CopyTileMappingsImpl(ID3D12Resource *dst_resource,
+                            const D3D12_TILED_RESOURCE_COORDINATE *dst_start,
+                            ID3D12Resource *src_resource,
+                            const D3D12_TILED_RESOURCE_COORDINATE *src_start,
+                            const D3D12_TILE_REGION_SIZE *region_size,
+                            D3D12_TILE_MAPPING_FLAGS flags) {
+    dxmt::apitrace::record_copy_tile_mappings(
+        this, dst_resource, dst_start, src_resource, src_start, region_size,
+        flags);
+    if (!dst_resource || !src_resource || !dst_start || !src_start)
+      return;
+    if (flags && ShouldLogTileMappingDiag()) {
+      WARN("D3D12CommandQueue: TODO CopyTileMappings flags are ignored"
+           " flags=", flags,
+           " dst=", dst_resource,
+           " src=", src_resource);
+    }
+
+    auto *dst = dynamic_cast<d3d12::Resource *>(dst_resource);
+    auto *src = dynamic_cast<d3d12::Resource *>(src_resource);
+    const auto *dst_tiling = dst ? dst->GetTiling() : nullptr;
+    const auto *src_tiling = src ? src->GetTiling() : nullptr;
+    if (!dst || !src || !dst->IsReservedTexture() || !src->IsReservedTexture() ||
+        !dst_tiling || !src_tiling || !dst->GetTextureAllocation()) {
+      WARN("D3D12CommandQueue: TODO CopyTileMappings requires reserved textures"
+           " dst=", dst_resource,
+           " src=", src_resource,
+           " flags=", flags);
+      return;
+    }
+    if (dst_start->Subresource >= dst_tiling->subresources.size() ||
+        src_start->Subresource >= src_tiling->subresources.size()) {
+      WARN("D3D12CommandQueue: CopyTileMappings subresource out of range"
+           " dstSubresource=", dst_start->Subresource,
+           " srcSubresource=", src_start->Subresource);
+      return;
+    }
+    if (dst_tiling->tile_shape.WidthInTexels != src_tiling->tile_shape.WidthInTexels ||
+        dst_tiling->tile_shape.HeightInTexels != src_tiling->tile_shape.HeightInTexels ||
+        dst_tiling->tile_shape.DepthInTexels != src_tiling->tile_shape.DepthInTexels ||
+        dst_tiling->packed_mip_info.NumStandardMips !=
+            src_tiling->packed_mip_info.NumStandardMips) {
+      WARN("D3D12CommandQueue: TODO CopyTileMappings incompatible tiling"
+           " dst=", dst_resource,
+           " src=", src_resource,
+           " dstTile=", dst_tiling->tile_shape.WidthInTexels, "x",
+                         dst_tiling->tile_shape.HeightInTexels, "x",
+                         dst_tiling->tile_shape.DepthInTexels,
+           " srcTile=", src_tiling->tile_shape.WidthInTexels, "x",
+                         src_tiling->tile_shape.HeightInTexels, "x",
+                         src_tiling->tile_shape.DepthInTexels,
+           " dstStandardMips=", uint32_t(dst_tiling->packed_mip_info.NumStandardMips),
+           " srcStandardMips=", uint32_t(src_tiling->packed_mip_info.NumStandardMips));
+      return;
+    }
+
+    std::unordered_map<ID3D12Heap *, std::vector<WMTSparseTextureMappingOperation>> map_ops;
+    std::vector<WMTSparseTextureMappingOperation> unmap_ops;
+    D3D12_TILED_RESOURCE_COORDINATE dst_cursor = *dst_start;
+    bool ok = ForEachTileInRegion(*src_tiling, *src_start, region_size,
+                                  [&](UINT src_subresource, UINT sx, UINT sy, UINT sz) {
+      if (!IsValidTileCoordinate(*dst_tiling, dst_cursor))
+        return false;
+      const auto &dst_sub = dst_tiling->subresources[dst_cursor.Subresource];
+
+      ResourceTileMapping mapping = {};
+      if (!src->GetTileMapping(src_subresource, sx, sy, sz, mapping))
+        return false;
+
+      WMTSparseTextureMappingOperation op = {};
+      op.mode = mapping.heap && mapping.heap_tile >= 0
+                    ? WMTSparseTextureMappingModeMap
+                    : WMTSparseTextureMappingModeUnmap;
+      op.level = dst_sub.mip_level;
+      op.slice = dst_sub.array_slice;
+      op.x = dst_cursor.X;
+      op.y = dst_cursor.Y;
+      op.z = dst_cursor.Z;
+      op.width = 1;
+      op.height = 1;
+      op.depth = 1;
+      op.heap_offset = mapping.heap_tile >= 0
+                           ? UINT64(mapping.heap_tile) *
+                                 D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES
+                           : 0;
+      if (op.mode == WMTSparseTextureMappingModeMap)
+        map_ops[mapping.heap.ptr()].push_back(op);
+      else
+        unmap_ops.push_back(op);
+
+      if (!AdvanceTileCoordinate(*dst_tiling, dst_cursor))
+        dst_cursor.Subresource = UINT(dst_tiling->subresources.size());
+      return true;
+    });
+    if (!ok) {
+      WARN("D3D12CommandQueue: TODO CopyTileMappings invalid or incompatible region"
+           " dst=", dst_resource,
+           " src=", src_resource,
+           " dstSubresource=", dst_start->Subresource,
+           " srcSubresource=", src_start->Subresource,
+           " useBox=", region_size ? region_size->UseBox : 0,
+           " numTiles=", region_size ? region_size->NumTiles : 1);
+      return;
+    }
+
+    auto texture = dst->GetTextureAllocation()->texture();
+    auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
+    Com<ID3D12Resource> dst_ref = dst_resource;
+    auto tiling_copy = *dst_tiling;
+    auto emit_ops = [&](ID3D12Heap *heap, std::vector<WMTSparseTextureMappingOperation> ops) {
+      dxmt::apitrace::record_sparse_texture_mapping_ops(
+          this, dst_resource, heap, "CopyTileMappings", ops.data(), ops.size());
+      Com<ID3D12Heap> heap_ref = heap;
+      WMT::Heap placement_heap = {};
+      if (heap) {
+        auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
+        if (!heap_object || !(placement_heap = heap_object->GetPlacementHeap())) {
+          WARN("D3D12CommandQueue: TODO CopyTileMappings failed to get placement heap"
+               " heap=", heap,
+               " dst=", dst_resource,
+               " ops=", ops.size());
+          return;
+        }
+      }
+      chunk->emitcc([device = device_->GetDXMTDevice().device(), texture,
+                     placement_heap, dst_ref, heap_ref,
+                     tiling_copy, ops = std::move(ops)](
+                        ArgumentEncodingContext &) mutable {
+        if (!device.updateSparseTextureMappings(texture, placement_heap,
+                                                ops.data(), ops.size())) {
+          WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
+               " dst=", dst_ref.ptr(),
+               " heap=", heap_ref.ptr(),
+               " ops=", ops.size());
+          return;
+        }
+        if (auto *dst = dynamic_cast<d3d12::Resource *>(dst_ref.ptr()))
+          ApplySparseTileMappingOpsToResource(*dst, tiling_copy, heap_ref.ptr(),
+                                              ops);
+      });
+    };
+
+    if (!unmap_ops.empty())
+      emit_ops(nullptr, std::move(unmap_ops));
+    for (auto &entry : map_ops)
+      emit_ops(entry.first, std::move(entry.second));
   }
 
   void STDMETHODCALLTYPE ExecuteCommandLists(UINT command_list_count,
@@ -2660,6 +3656,7 @@ private:
     uint64_t d3d_sequence = 0;
     uint64_t argument_buffer_size = 0;
     bool use_geometry = false;
+    bool use_tessellation = false;
   };
 
   struct ReplayGraphicsPassBatch {
@@ -2667,12 +3664,12 @@ private:
     std::vector<ReplayGraphicsPassCommand> commands;
     uint64_t argument_buffer_size = 0;
     bool use_geometry = false;
+    bool use_tessellation = false;
     bool active = false;
   };
 
   struct ReplayState {
-    std::unordered_map<ID3D12Resource *,
-                       std::vector<D3D12_RESOURCE_STATES>> *resource_states =
+    std::unordered_map<ID3D12Resource *, ReplayResourceStateEntry> *resource_states =
         nullptr;
     D3D12_COMMAND_LIST_TYPE queue_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     std::vector<Com<ID3D12Resource>> *touched_resources = nullptr;
@@ -2786,10 +3783,13 @@ private:
                    argument_buffer_size = batch.argument_buffer_size](
                       ArgumentEncodingContext &enc) mutable {
       bool use_geometry = false;
+      bool use_tessellation = false;
       for (const auto &command : commands)
         use_geometry = use_geometry || command.use_geometry;
+      for (const auto &command : commands)
+        use_tessellation = use_tessellation || command.use_tessellation;
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
-                           use_geometry))
+                           use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
       for (auto &command : commands) {
@@ -2808,7 +3808,8 @@ private:
   void QueueGraphicsPassCommand(CommandChunk *chunk, ReplayState &state,
                                 ReplayRenderPassAttachments attachments,
                                 uint64_t argument_buffer_size, Fn &&fn,
-                                bool use_geometry = false) {
+                                bool use_geometry = false,
+                                bool use_tessellation = false) {
     auto &batch = state.graphics_pass_batch;
     if (batch.active && !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
       FlushGraphicsPassBatch(chunk, state);
@@ -2822,9 +3823,12 @@ private:
 
     active_batch.argument_buffer_size += argument_buffer_size;
     active_batch.use_geometry = active_batch.use_geometry || use_geometry;
+    active_batch.use_tessellation =
+        active_batch.use_tessellation || use_tessellation;
     active_batch.commands.push_back(
         ReplayGraphicsPassCommand{std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
-                                  argument_buffer_size, use_geometry});
+                                  argument_buffer_size, use_geometry,
+                                  use_tessellation});
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -2836,13 +3840,14 @@ private:
   void EmitSingleGraphicsPass(CommandChunk *chunk,
                               ReplayRenderPassAttachments attachments,
                               uint64_t argument_buffer_size, uint64_t d3d_sequence, Fn &&fn,
-                              bool use_geometry = false) {
+                              bool use_geometry = false,
+                              bool use_tessellation = false) {
     chunk->emitcc([attachments = std::move(attachments), argument_buffer_size,
-                   use_geometry, d3d_sequence,
+                   use_geometry, use_tessellation, d3d_sequence,
                    encode = std::function<void(ArgumentEncodingContext &, uint64_t &)>(
                        std::forward<Fn>(fn))](ArgumentEncodingContext &enc) mutable {
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
-                           use_geometry))
+                           use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
       if (d3d_sequence != 0) {
@@ -2855,7 +3860,8 @@ private:
 
   void ReplayCommandRecords(const std::vector<CommandRecord> &records,
                             std::vector<Com<ID3D12Resource>> &touched_resources) {
-    auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
+    auto &queue = device_->GetDXMTDevice().queue();
+    auto *chunk = queue.CurrentChunk();
     ReplayState state = {};
     state.resource_states = &resource_states_->resources;
     state.queue_type = desc_.Type;
@@ -2866,44 +3872,99 @@ private:
       }
       std::visit([&](const auto &payload) { ReplayRecord(chunk, state, payload); },
                  record.payload);
+      chunk = queue.CurrentChunk();
     }
     FlushGraphicsPassBatch(chunk, state);
   }
 
   template <typename T>
   void ReplayRecord(CommandChunk *chunk, ReplayState &state, const T &record) {
-    if constexpr (std::is_same_v<T, CopyBufferRegionRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.dst.ptr());
-      TouchReplayResource(state, record.src.ptr());
-      ReplayCopyBufferRegion(chunk, record);
-    } else if constexpr (std::is_same_v<T, CopyTextureRegionRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.dst.resource.ptr());
-      TouchReplayResource(state, record.src.resource.ptr());
-      ReplayCopyTextureRegion(chunk, record);
-    } else if constexpr (std::is_same_v<T, CopyResourceRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.dst.ptr());
-      TouchReplayResource(state, record.src.ptr());
-      ReplayCopyResource(chunk, record);
-    } else if constexpr (std::is_same_v<T, ResolveSubresourceRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.dst.ptr());
-      TouchReplayResource(state, record.src.ptr());
-      ReplayResolveSubresource(chunk, record);
-    } else if constexpr (std::is_same_v<T, ClearRenderTargetRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.descriptor.resource.ptr());
-      ReplayClearRenderTarget(chunk, record);
-    } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.descriptor.resource.ptr());
-      ReplayClearDepthStencil(chunk, record);
-    } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      TouchReplayResource(state, record.resource.ptr());
-      ReplayClearUnorderedAccess(chunk, record);
+      if constexpr (std::is_same_v<T, CopyBufferRegionRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.dst.ptr(),
+                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                   "CopyBufferRegion dst");
+        RecordReplayResourceAccess(state, record.src.ptr(),
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   "CopyBufferRegion src");
+        ReplayCopyBufferRegion(chunk, record);
+      } else if constexpr (std::is_same_v<T, CopyTextureRegionRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(
+            state, record.dst.resource.ptr(), D3D12_RESOURCE_STATE_COPY_DEST,
+            "CopyTextureRegion dst",
+            record.dst.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+                ? record.dst.subresource_index
+                : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        RecordReplayResourceAccess(
+            state, record.src.resource.ptr(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            "CopyTextureRegion src",
+            record.src.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+                ? record.src.subresource_index
+                : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        ReplayCopyTextureRegion(chunk, record);
+      } else if constexpr (std::is_same_v<T, CopyResourceRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.dst.ptr(),
+                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                   "CopyResource dst");
+        RecordReplayResourceAccess(state, record.src.ptr(),
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   "CopyResource src");
+        ReplayCopyResource(chunk, record);
+      } else if constexpr (std::is_same_v<T, CopyTilesRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        const bool buffer_to_texture =
+            record.flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE;
+        RecordReplayResourceAccess(
+            state, record.tiled_resource.ptr(),
+            buffer_to_texture ? D3D12_RESOURCE_STATE_COPY_DEST
+                              : D3D12_RESOURCE_STATE_COPY_SOURCE,
+            "CopyTiles tiled resource", record.start.Subresource);
+        RecordReplayResourceAccess(
+            state, record.buffer.ptr(),
+            buffer_to_texture ? D3D12_RESOURCE_STATE_COPY_SOURCE
+                              : D3D12_RESOURCE_STATE_COPY_DEST,
+            "CopyTiles buffer");
+        ReplayCopyTiles(chunk, record);
+      } else if constexpr (std::is_same_v<T, ResolveSubresourceRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.dst.ptr(),
+                                   D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                   "ResolveSubresource dst",
+                                   record.dst_subresource);
+        RecordReplayResourceAccess(state, record.src.ptr(),
+                                   D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                   "ResolveSubresource src",
+                                   record.src_subresource);
+        ReplayResolveSubresource(chunk, record);
+      } else if constexpr (std::is_same_v<T, ClearRenderTargetRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        if (auto *resource = GetResource(record.descriptor.resource.ptr())) {
+          RecordDescriptorResourceAccessRanges(
+              state, *resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
+              record.descriptor, "ClearRenderTargetView",
+              GetRenderTargetSubresourceRanges);
+        }
+        ReplayClearRenderTarget(chunk, record);
+      } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        if (auto *resource = GetResource(record.descriptor.resource.ptr())) {
+          RecordDescriptorResourceAccessRanges(
+              state, *resource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+              record.descriptor, "ClearDepthStencilView",
+              GetDepthStencilSubresourceRanges);
+        }
+        ReplayClearDepthStencil(chunk, record);
+      } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        if (auto *resource = GetResource(record.resource.ptr())) {
+          RecordDescriptorResourceAccessRanges(
+              state, *resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              record.descriptor, "ClearUnorderedAccessView",
+              GetUnorderedAccessSubresourceRanges);
+        }
+        ReplayClearUnorderedAccess(chunk, record);
     } else if constexpr (std::is_same_v<T, DiscardResourceRecord>) {
       FlushGraphicsPassBatch(chunk, state);
       TouchReplayResource(state, record.resource.ptr());
@@ -2940,10 +4001,14 @@ private:
           state.sampler_heap = heap;
       }
     } else if constexpr (std::is_same_v<T, VertexBuffersRecord>) {
-      for (UINT i = 0; i < record.views.size() &&
+      for (UINT i = 0; i < record.view_count &&
                        record.start_slot + i < state.vertex_buffers.size();
-           i++)
-        state.vertex_buffers[record.start_slot + i] = record.views[i];
+           i++) {
+        if (i < record.views.size())
+          state.vertex_buffers[record.start_slot + i] = record.views[i];
+        else
+          state.vertex_buffers[record.start_slot + i].reset();
+      }
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
@@ -2969,20 +4034,48 @@ private:
     } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
       FlushGraphicsPassBatch(chunk, state);
       ReplayEndQuery(chunk, record);
-    } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      ReplayResolveQueryData(chunk, record);
-    } else if constexpr (std::is_same_v<T, PredicationRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      ReplaySetPredication(state, record);
-    } else if constexpr (std::is_same_v<T, WriteBufferImmediateRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      ReplayWriteBufferImmediate(record);
-    } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
-      ReplayExecuteIndirect(chunk, state, record);
-    } else if constexpr (std::is_same_v<T, TemporalUpscaleRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      ReplayTemporalUpscale(chunk, record);
+      } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.dst_buffer.ptr(),
+                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                   "ResolveQueryData dst");
+        ReplayResolveQueryData(record);
+      } else if constexpr (std::is_same_v<T, PredicationRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.buffer.ptr(),
+                                   D3D12_RESOURCE_STATE_PREDICATION,
+                                   "SetPredication");
+        ReplaySetPredication(state, record);
+      } else if constexpr (std::is_same_v<T, WriteBufferImmediateRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        ReplayWriteBufferImmediate(chunk, record);
+      } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.arg_buffer.ptr(),
+                                   D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                   "ExecuteIndirect arguments");
+        RecordReplayResourceAccess(state, record.count_buffer.ptr(),
+                                   D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                   "ExecuteIndirect count");
+        ReplayExecuteIndirect(chunk, state, record);
+      } else if constexpr (std::is_same_v<T, TemporalUpscaleRecord>) {
+        FlushGraphicsPassBatch(chunk, state);
+        RecordReplayResourceAccess(state, record.color.ptr(),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   "TemporalUpscale color");
+        RecordReplayResourceAccess(state, record.depth.ptr(),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   "TemporalUpscale depth");
+        RecordReplayResourceAccess(state, record.motion_vector.ptr(),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   "TemporalUpscale motion");
+        RecordReplayResourceAccess(state, record.exposure_texture.ptr(),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   "TemporalUpscale exposure");
+        RecordReplayResourceAccess(state, record.output.ptr(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   "TemporalUpscale output");
+        ReplayTemporalUpscale(chunk, record);
     } else if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
       ReplayDrawInstanced(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
@@ -3036,7 +4129,7 @@ private:
         ReplayUavBarrier(chunk, barrier);
         break;
       case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
-        ReplayAliasingBarrier(chunk, barrier);
+        ReplayAliasingBarrier(chunk, state, barrier);
         break;
       default:
         WARN("D3D12CommandQueue: unsupported resource barrier type ",
@@ -3047,7 +4140,16 @@ private:
     }
   }
 
-  void ReplayWriteBufferImmediate(const WriteBufferImmediateRecord &record) {
+  void ReplayWriteBufferImmediate(CommandChunk *chunk,
+                                  const WriteBufferImmediateRecord &record) {
+    struct WriteBufferImmediateOp {
+      Rc<Buffer> buffer;
+      UINT64 byte_offset;
+      UINT value;
+    };
+    std::vector<WriteBufferImmediateOp> ops;
+    ops.reserve(record.parameters.size());
+
     for (size_t i = 0; i < record.parameters.size(); i++) {
       Resource *resource = nullptr;
       const UINT64 offset =
@@ -3058,10 +4160,75 @@ private:
         continue;
       }
 
-      resource->GetBufferAllocation()->updateContents(
-          resource->GetHeapOffset() + offset, &record.parameters[i].Value,
-          sizeof(record.parameters[i].Value));
+      if (!resource->GetBuffer()) {
+        WARN("D3D12CommandQueue: WriteBufferImmediate skipped destination "
+             "without buffer resource");
+        continue;
+      }
+
+      ops.push_back({Rc<Buffer>(resource->GetBuffer()),
+                     resource->GetHeapOffset() + offset,
+                     record.parameters[i].Value});
     }
+
+    if (ops.empty())
+      return;
+
+    WMTBufferInfo staging_info = {};
+    staging_info.length = sizeof(UINT) * ops.size();
+    staging_info.options = WMTResourceHazardTrackingModeUntracked |
+                           WMTResourceOptionCPUCacheModeWriteCombined;
+    auto staging = device_->GetMTLDevice().newBuffer(staging_info);
+    auto *mapped = static_cast<UINT *>(staging_info.memory.get());
+    if (!staging || !mapped) {
+      WARN("D3D12CommandQueue: WriteBufferImmediate failed to allocate "
+           "staging buffer");
+      return;
+    }
+
+    for (size_t i = 0; i < ops.size(); ++i)
+      mapped[i] = ops[i].value;
+
+    chunk->emitcc([ops = std::move(ops),
+                   staging = WMT::Reference<WMT::Buffer>(staging)](
+                      ArgumentEncodingContext &enc) mutable {
+      struct EncodedWrite {
+        BufferAllocation *allocation;
+        UINT64 dst_offset;
+        UINT64 staging_offset;
+      };
+      enc.startBlitPass();
+      std::vector<EncodedWrite> encoded;
+      encoded.reserve(ops.size());
+      for (size_t i = 0; i < ops.size(); ++i) {
+        auto &op = ops[i];
+        auto [allocation, suballocation_offset] =
+            enc.access<PipelineStage::Compute>(
+                op.buffer, op.byte_offset, sizeof(UINT),
+                ResourceAccess::Write);
+        encoded.push_back({allocation, suballocation_offset + op.byte_offset,
+                           UINT64(i * sizeof(UINT))});
+      }
+
+      if (encoded.empty())
+      {
+        enc.endPass();
+        return;
+      }
+
+      for (const auto &op : encoded) {
+        enc.retainAllocation(op.allocation);
+        auto &copy =
+            enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+        copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+        copy.src = staging;
+        copy.src_offset = op.staging_offset;
+        copy.dst = op.allocation->buffer();
+        copy.dst_offset = op.dst_offset;
+        copy.copy_length = sizeof(UINT);
+      }
+      enc.endPass();
+    });
   }
 
   void ReplayTemporalUpscale(CommandChunk *chunk,
@@ -3261,13 +4428,23 @@ private:
     });
   }
 
-  std::vector<D3D12_RESOURCE_STATES> &
+  std::vector<ReplaySubresourceState> &
   GetReplayResourceStates(ReplayState &state, Resource &resource) {
-    auto &states = (*state.resource_states)[resource.GetD3D12Resource()];
+    auto &entry = (*state.resource_states)[resource.GetD3D12Resource()];
+    const auto &desc = resource.GetResourceDesc();
     const UINT subresource_count = GetSubresourceCount(resource);
-    if (states.size() != subresource_count)
-      states.assign(subresource_count, resource.GetInitialState());
-    return states;
+    if (entry.subresources.size() != subresource_count ||
+        std::memcmp(&entry.desc, &desc, sizeof(desc)) != 0 ||
+        entry.initial_state != resource.GetInitialState() ||
+        entry.heap_offset != resource.GetHeapOffset()) {
+      ReplaySubresourceState initial = {};
+      initial.state = resource.GetInitialState();
+      entry.desc = desc;
+      entry.initial_state = resource.GetInitialState();
+      entry.heap_offset = resource.GetHeapOffset();
+      entry.subresources.assign(subresource_count, initial);
+    }
+    return entry.subresources;
   }
 
   void TouchReplayResource(ReplayState &state, ID3D12Resource *resource) {
@@ -3282,19 +4459,174 @@ private:
     state.touched_resources->push_back(resource);
   }
 
+  void ResetReplayResourceStatesForAliasing(ReplayState &state,
+                                            Resource &resource) {
+    auto &states = GetReplayResourceStates(state, resource);
+    const auto initial_state = resource.GetInitialState();
+    for (auto &entry : states) {
+      entry.state = initial_state;
+      entry.pending_before = initial_state;
+      entry.pending_after = initial_state;
+      entry.implicitly_promoted = false;
+      entry.has_pending_split = false;
+    }
+  }
+
+  void WarnReplayResourceAccessMismatch(const Resource &resource,
+                                        UINT subresource,
+                                        D3D12_RESOURCE_STATES current,
+                                        D3D12_RESOURCE_STATES desired,
+                                        const char *context) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (log_count.fetch_add(1, std::memory_order_relaxed) >= 128)
+      return;
+    const auto &desc = resource.GetResourceDesc();
+    WARN("D3D12CommandQueue: resource access state mismatch context=",
+         context, " subresource=", subresource,
+         " resource=", const_cast<Resource &>(resource).GetD3D12Resource(),
+         " mip=", GetMipLevel(resource, subresource),
+         " slice=", GetArraySlice(resource, subresource),
+         " plane=", GetSubresourcePlane(resource, subresource),
+         " current=", uint32_t(current), " desired=", uint32_t(desired),
+         " queueType=", uint32_t(desc_.Type),
+         " dimension=", uint32_t(desc.Dimension),
+         " size=", uint64_t(desc.Width), "x", uint32_t(desc.Height), "x",
+         uint32_t(desc.DepthOrArraySize),
+         " format=", uint32_t(desc.Format),
+         " mipLevels=", uint32_t(GetResourceMipLevelCount(resource)),
+         " flags=", uint32_t(desc.Flags),
+         " initial=", uint32_t(resource.GetInitialState()));
+  }
+
+  void RecordReplayResourceAccess(ReplayState &state, ID3D12Resource *d3d_resource,
+                                  D3D12_RESOURCE_STATES desired,
+                                  const char *context,
+                                  UINT first_subresource =
+                                      D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                    UINT subresource_count = 0) {
+    auto *resource = GetResource(d3d_resource);
+    if (!resource)
+      return;
+    WarnUnsupportedResourceState(desired, context);
+
+    auto &states = GetReplayResourceStates(state, *resource);
+    TouchReplayResource(state, resource->GetD3D12Resource());
+    if (desired == D3D12_RESOURCE_STATE_COMMON)
+      return;
+
+    const bool all_subresources =
+        first_subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (!all_subresources && first_subresource >= states.size()) {
+      WARN("D3D12CommandQueue: resource access subresource out of range context=",
+           context, " subresource=", first_subresource,
+           " count=", uint32_t(states.size()));
+      return;
+    }
+
+    const UINT first = all_subresources ? 0 : first_subresource;
+    const UINT count = all_subresources
+                           ? UINT(states.size())
+                           : std::min<UINT>(subresource_count ? subresource_count : 1,
+                                            UINT(states.size()) - first);
+    for (UINT i = 0; i < count; i++) {
+      const UINT subresource = first + i;
+      auto &current = states[subresource];
+      if (current.state == desired)
+        continue;
+
+      if (current.state == D3D12_RESOURCE_STATE_COMMON &&
+          IsImplicitPromotionCompatibleState(*resource, desired)) {
+        current.state = desired;
+        current.implicitly_promoted = true;
+        continue;
+      }
+
+      if (IsReadOnlyResourceState(current.state) &&
+          IsReadOnlyResourceState(desired)) {
+        current.state =
+            D3D12_RESOURCE_STATES(uint32_t(current.state) | uint32_t(desired));
+        continue;
+      }
+
+      WarnReplayResourceAccessMismatch(*resource, subresource, current.state,
+                                       desired, context);
+      // Resource use does not transition D3D12 state. Keep the last explicit
+      // or implicitly promoted state so a missing or mismatched barrier does
+      // not poison subsequent state tracking.
+      }
+    }
+
+  void RecordReplayResourceAccessRanges(
+      ReplayState &state, ID3D12Resource *d3d_resource,
+      D3D12_RESOURCE_STATES desired, const char *context,
+      const std::vector<SubresourceRange> &ranges) {
+    if (ranges.empty()) {
+      RecordReplayResourceAccess(state, d3d_resource, desired, context);
+      return;
+    }
+    for (const auto &range : ranges) {
+      RecordReplayResourceAccess(state, d3d_resource, desired, context,
+                                 range.first, range.count);
+    }
+  }
+
+  void RecordDescriptorResourceAccessRanges(
+      ReplayState &state, Resource &resource, D3D12_RESOURCE_STATES desired,
+      const DescriptorRecord &descriptor, const char *context,
+      bool (*get_ranges)(Resource &, const DescriptorRecord &,
+                         std::vector<SubresourceRange> &)) {
+    std::vector<SubresourceRange> ranges;
+    if (!get_ranges(resource, descriptor, ranges)) {
+      static std::atomic<uint32_t> log_count = 0;
+      if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+        WARN("D3D12CommandQueue: TODO descriptor subresource range unsupported;"
+             " skipping resource-state tracking context=",
+             context, " resource=", resource.GetD3D12Resource(),
+             " descriptorType=", DescriptorRecordTypeName(descriptor.type),
+             " descriptorFormat=", uint32_t(D3D12DiagDescriptorFormat(descriptor)),
+             " dimension=", uint32_t(resource.GetResourceDesc().Dimension),
+             " size=", uint64_t(resource.GetResourceDesc().Width), "x",
+             uint32_t(resource.GetResourceDesc().Height), "x",
+             uint32_t(resource.GetResourceDesc().DepthOrArraySize),
+             " format=", uint32_t(resource.GetResourceDesc().Format),
+             " mipLevels=", uint32_t(GetResourceMipLevelCount(resource)),
+             " flags=", uint32_t(resource.GetResourceDesc().Flags));
+      }
+      return;
+    }
+    if (ranges.empty()) {
+      static std::atomic<uint32_t> log_count = 0;
+      if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+        WARN("D3D12CommandQueue: descriptor subresource range is empty;"
+             " skipping resource-state tracking context=",
+             context, " resource=", resource.GetD3D12Resource(),
+             " descriptorType=", DescriptorRecordTypeName(descriptor.type));
+      }
+      return;
+    }
+    RecordReplayResourceAccessRanges(state, resource.GetD3D12Resource(), desired,
+                                     context, ranges);
+  }
+
   void DecayTouchedResourceStates(
       const std::vector<Com<ID3D12Resource>> &touched_resources) {
     for (const auto &resource_com : touched_resources) {
       auto *resource = GetResource(resource_com.ptr());
-      if (!resource || !IsDecayEligibleResource(*resource, desc_.Type))
+      if (!resource)
         continue;
 
       auto it = resource_states_->resources.find(resource->GetD3D12Resource());
       if (it == resource_states_->resources.end())
         continue;
 
-      std::fill(it->second.begin(), it->second.end(),
-                D3D12_RESOURCE_STATE_COMMON);
+      for (auto &subresource_state : it->second.subresources) {
+        if (!IsDecayEligibleResourceState(
+                *resource, desc_.Type, subresource_state.state,
+                subresource_state.implicitly_promoted))
+          continue;
+        subresource_state.state = D3D12_RESOURCE_STATE_COMMON;
+        subresource_state.implicitly_promoted = false;
+      }
     }
   }
 
@@ -3327,19 +4659,103 @@ private:
     const UINT count = all_subresources ? subresource_count : 1;
     const bool begin_only =
         barrier.barrier.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+    const bool end_only =
+        barrier.barrier.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
     for (UINT i = 0; i < count; i++) {
       const UINT subresource = first + i;
-      const auto current_state = states[subresource];
-      if (!begin_only) {
-        if (current_state != transition.StateBefore &&
-            !IsImplicitPromotionCompatibleResource(*resource, current_state,
-                                                   transition.StateBefore)) {
-          WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
-               subresource, " expected=", uint32_t(current_state),
-               " before=", uint32_t(transition.StateBefore));
+      auto &current = states[subresource];
+      if (begin_only) {
+        if (current.has_pending_split) {
+          const auto &desc = resource->GetResourceDesc();
+          WARN("D3D12CommandQueue: split transition BEGIN overwrites pending barrier"
+               " subresource=", subresource,
+               " pendingBefore=", uint32_t(current.pending_before),
+               " pendingAfter=", uint32_t(current.pending_after),
+               " before=", uint32_t(transition.StateBefore),
+               " after=", uint32_t(transition.StateAfter),
+               " queueType=", uint32_t(desc_.Type),
+               " dimension=", uint32_t(desc.Dimension),
+               " flags=", uint32_t(desc.Flags));
         }
-        states[subresource] = transition.StateAfter;
+        if (current.state != transition.StateBefore &&
+            IsImplicitPromotionCompatibleResource(*resource, current.state,
+                                                  transition.StateBefore)) {
+          current.state = transition.StateBefore;
+          current.implicitly_promoted = true;
+        }
+        if (current.state != transition.StateBefore) {
+          const auto &desc = resource->GetResourceDesc();
+          WARN("D3D12CommandQueue: split transition BEGIN state mismatch"
+               " subresource=", subresource,
+               " expected=", uint32_t(current.state),
+               " before=", uint32_t(transition.StateBefore),
+               " after=", uint32_t(transition.StateAfter),
+               " queueType=", uint32_t(desc_.Type),
+               " dimension=", uint32_t(desc.Dimension),
+               " flags=", uint32_t(desc.Flags),
+               " initial=", uint32_t(resource->GetInitialState()));
+        }
+        current.pending_before = transition.StateBefore;
+        current.pending_after = transition.StateAfter;
+        current.has_pending_split = true;
+        continue;
       }
+
+      if (end_only) {
+        if (!current.has_pending_split ||
+            current.pending_before != transition.StateBefore ||
+            current.pending_after != transition.StateAfter) {
+          const auto &desc = resource->GetResourceDesc();
+          WARN("D3D12CommandQueue: split transition END mismatch"
+               " subresource=", subresource,
+               " hasPending=", current.has_pending_split,
+               " pendingBefore=", uint32_t(current.pending_before),
+               " pendingAfter=", uint32_t(current.pending_after),
+               " before=", uint32_t(transition.StateBefore),
+               " after=", uint32_t(transition.StateAfter),
+               " queueType=", uint32_t(desc_.Type),
+               " dimension=", uint32_t(desc.Dimension),
+               " flags=", uint32_t(desc.Flags),
+               " initial=", uint32_t(resource->GetInitialState()));
+        }
+        current.has_pending_split = false;
+        current.state = transition.StateAfter;
+        current.implicitly_promoted = false;
+        continue;
+      }
+
+      if (current.has_pending_split) {
+        const auto &desc = resource->GetResourceDesc();
+        WARN("D3D12CommandQueue: transition barrier clears unmatched split barrier"
+             " subresource=", subresource,
+             " pendingBefore=", uint32_t(current.pending_before),
+             " pendingAfter=", uint32_t(current.pending_after),
+             " before=", uint32_t(transition.StateBefore),
+             " after=", uint32_t(transition.StateAfter),
+             " queueType=", uint32_t(desc_.Type),
+             " dimension=", uint32_t(desc.Dimension),
+             " flags=", uint32_t(desc.Flags));
+        current.has_pending_split = false;
+      }
+      if (current.state != transition.StateBefore &&
+          IsImplicitPromotionCompatibleResource(*resource, current.state,
+                                                transition.StateBefore)) {
+        current.state = transition.StateBefore;
+        current.implicitly_promoted = true;
+      }
+      if (current.state != transition.StateBefore) {
+        const auto &desc = resource->GetResourceDesc();
+        WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
+             subresource, " expected=", uint32_t(current.state),
+             " before=", uint32_t(transition.StateBefore),
+             " after=", uint32_t(transition.StateAfter),
+             " queueType=", uint32_t(desc_.Type),
+             " dimension=", uint32_t(desc.Dimension),
+             " flags=", uint32_t(desc.Flags),
+             " initial=", uint32_t(resource->GetInitialState()));
+      }
+      current.state = transition.StateAfter;
+      current.implicitly_promoted = false;
     }
 
     const int before_access = ResourceAccessForState(transition.StateBefore);
@@ -3368,7 +4784,7 @@ private:
     EmitPassSeparator(chunk);
   }
 
-  void ReplayAliasingBarrier(CommandChunk *chunk,
+  void ReplayAliasingBarrier(CommandChunk *chunk, ReplayState &state,
                              const StoredResourceBarrier &barrier) {
     bool touched = false;
     if (auto *before = GetResource(barrier.resource_before.ptr())) {
@@ -3381,6 +4797,8 @@ private:
     }
 
     if (auto *after = GetResource(barrier.resource_after.ptr())) {
+      ResetReplayResourceStatesForAliasing(state, *after);
+      TouchReplayResource(state, after->GetD3D12Resource());
       EmitResourceAccessBarrier(chunk, *after, 0, GetSubresourceCount(*after),
                                 ResourceAccess::All);
       touched = true;
@@ -3529,6 +4947,18 @@ private:
       auto query = heap->EndTimestamp(record.type, record.index);
       if (!query)
         return;
+      Com<ID3D12QueryHeap> heap_ref = record.heap;
+      const auto type = record.type;
+      const UINT index = record.index;
+      chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
+        enc.sampleTimestamp(std::move(query));
+      });
+      chunk->completion_callbacks.push_back(
+          [heap_ref = std::move(heap_ref), type, index]() mutable {
+            auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
+            if (heap)
+              heap->MarkTimestampReady(type, index);
+          });
       return;
     }
     if (record.type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ||
@@ -3544,8 +4974,7 @@ private:
       return;
   }
 
-  void ReplayResolveQueryData(CommandChunk *chunk,
-                              const ResolveQueryDataRecord &record) {
+  void ReplayResolveQueryData(const ResolveQueryDataRecord &record) {
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: ResolveQueryData skipped for foreign query heap");
@@ -3561,31 +4990,30 @@ private:
                              "query resolve"))
       return;
 
-    Com<ID3D12QueryHeap> heap_ref = record.heap;
-    Com<ID3D12Resource> dst_ref = record.dst_buffer;
-    const auto type = record.type;
-    const UINT start_index = record.start_index;
-    const UINT query_count = record.query_count;
-    const UINT64 dst_buffer_offset = record.dst_buffer_offset;
-    chunk->deferred_readbacks.push_back(
-        [heap_ref = std::move(heap_ref), dst_ref = std::move(dst_ref), type,
-         start_index, query_count, dst_buffer_offset]() mutable {
-          auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
-          auto *dst = GetResource(dst_ref.ptr());
-          if (!heap || !dst)
-            return;
+    // Metal query results become CPU-visible after command-buffer completion.
+    // D3D12 ResolveQueryData is ordered in the command stream, so split here
+    // before writing the destination buffer and replaying later records.
+    auto &queue = device_->GetDXMTDevice().queue();
+    const auto seq = queue.CurrentSeqId();
+    queue.CommitCurrentChunk();
+    queue.WaitCPUFence(seq);
 
-          std::vector<uint8_t> data;
-          if (!heap->Resolve(type, start_index, query_count, data))
-            return;
-          if (!ValidateBufferRange(dst, dst_buffer_offset, data.size(),
-                                   "query resolve"))
-            return;
-          if (!data.empty())
-            dst->GetBufferAllocation()->updateContents(
-                dst->GetHeapOffset() + dst_buffer_offset, data.data(),
-                data.size());
-        });
+    std::vector<uint8_t> data;
+    if (!heap->Resolve(record.type, record.start_index, record.query_count,
+                       data))
+      return;
+    if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
+                             "query resolve"))
+      return;
+    if (!data.empty())
+      dst->GetBufferAllocation()->updateContents(
+          dst->GetHeapOffset() + record.dst_buffer_offset, data.data(),
+          data.size());
+    dxmt::apitrace::record_resolve_query_data_result(
+        record.command_list.ptr(), record.heap.ptr(),
+        static_cast<uint32_t>(record.type), record.start_index,
+        record.query_count, record.dst_buffer.ptr(), record.dst_buffer_offset,
+        data.data(), data.size());
   }
 
   void ReplaySetPredication(ReplayState &state,
@@ -3906,7 +5334,16 @@ private:
     }
     std::optional<WMTPrimitiveType> primitive;
     std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
-    if (metal->use_geometry) {
+    std::optional<uint32_t> control_point_count;
+    if (metal->use_tessellation) {
+      control_point_count = GetPatchControlPointCount(state.topology);
+      if (!control_point_count) {
+        // TODO(d3d12): support non-patch topologies with tessellation PSOs if needed.
+        WARN("D3D12CommandQueue: tessellation indirect draw skipped because primitive topology is not a patch list topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else if (metal->use_geometry) {
       geometry_counts = GetGeometryVertexCount(state.topology);
       if (!geometry_counts) {
         WARN("D3D12CommandQueue: geometry indirect draw skipped because primitive topology is unsupported topology=",
@@ -3923,18 +5360,24 @@ private:
     }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
-    auto attachments = BuildRenderPassAttachments(state);
-    if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
-      return;
-    const auto argument_buffer_size =
-        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry);
+      auto attachments = BuildRenderPassAttachments(state);
+      if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
+        return;
+      RecordGraphicsPipelineResourceAccess(state, *pipeline, nullptr);
+      const auto argument_buffer_size =
+          EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
+                                             metal->use_tessellation);
 
     auto encode_draw =
         [this, metal_pso, use_geometry = metal->use_geometry,
+         use_tessellation = metal->use_tessellation,
          depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         tess_threads_per_patch = metal->tess_threads_per_patch,
+         tess_num_output_control_point_element =
+             metal->tess_num_output_control_point_element,
          pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), primitive,
-         geometry_counts,
+         geometry_counts, control_point_count,
          blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
          arg_buffer, arg_offset, count_buffer, count_offset, counted_args,
          counted_offset, argument_size, command_index,
@@ -3955,11 +5398,55 @@ private:
       rs = rasterizer;
 
       EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
-                             argbuf_offset);
+                             use_tessellation, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
-      if (use_geometry) {
+      if (use_tessellation) {
+        if (count_buffer.ptr()) {
+          // TODO(d3d12): marshal counted tessellation indirect arguments.
+          WARN("D3D12CommandQueue: counted tessellation indirect draw is unsupported");
+          return;
+        }
+        if (!tess_threads_per_patch || !control_point_count) {
+          WARN("D3D12CommandQueue: tessellation indirect draw skipped because tessellation metadata is invalid");
+          return;
+        }
+        const auto patch_per_group = 32u / tess_threads_per_patch;
+        if (!patch_per_group) {
+          WARN("D3D12CommandQueue: tessellation indirect draw skipped because threads-per-patch is unsupported value=",
+               tess_threads_per_patch);
+          return;
+        }
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_tessellation = 1;
+        enc.tess_num_output_control_point_element =
+            tess_num_output_control_point_element;
+        enc.tess_threads_per_patch = tess_threads_per_patch;
+        auto [arg_allocation, arg_sub_offset] =
+            enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
+                                              sizeof(DXMT_DRAW_ARGUMENTS),
+                                              ResourceAccess::Read);
+        auto dispatch_arg =
+            enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        enc.encodeTSDispatchArgumentsMarshal(
+            arg_allocation->buffer(),
+            arg_allocation->gpuAddress() + arg_sub_offset + arg_offset, 0,
+            *control_point_count, patch_per_group, dispatch_arg.gpu_buffer,
+            dispatch_arg.gpu_address, dispatch_arg.offset,
+            max_object_threadgroups);
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<
+            wmtcmd_render_dxmt_tessellation_mesh_draw_indirect>();
+        draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndirect;
+        draw.dispatch_args_buffer = dispatch_arg.gpu_buffer;
+        draw.dispatch_args_offset = dispatch_arg.offset;
+        draw.patch_per_group = patch_per_group;
+        draw.threads_per_patch = tess_threads_per_patch;
+        draw.indirect_args_buffer = arg_allocation->buffer();
+        draw.indirect_args_offset = arg_sub_offset + arg_offset;
+        draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
+      } else if (use_geometry) {
         if (count_buffer.ptr()) {
           WARN("D3D12CommandQueue: counted geometry indirect draw is unsupported");
           return;
@@ -4013,7 +5500,7 @@ private:
     if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry);
+                               metal->use_geometry, metal->use_tessellation);
       return;
     }
 
@@ -4022,6 +5509,7 @@ private:
                    argument_buffer_size, arg_buffer, arg_offset, count_buffer,
                    count_offset, counted_args, counted_offset, argument_size,
                    command_index, use_geometry = metal->use_geometry,
+                   use_tessellation = metal->use_tessellation,
                    encode = std::move(encode_draw)](
                       ArgumentEncodingContext &enc) mutable {
       if (count_buffer) {
@@ -4031,7 +5519,7 @@ private:
       }
 
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
-                           use_geometry))
+                           use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
       encode(enc, argbuf_offset);
@@ -4073,14 +5561,24 @@ private:
     }
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
-    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    const auto metal_pso = SelectGraphicsPipelineState(
+        *metal, state.topology, state.index_buffer->Format);
     if (!metal_pso) {
       WARN("D3D12CommandQueue: indirect indexed draw skipped because selected Metal graphics PSO is unavailable");
       return;
     }
     std::optional<WMTPrimitiveType> primitive;
     std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
-    if (metal->use_geometry) {
+    std::optional<uint32_t> control_point_count;
+    if (metal->use_tessellation) {
+      control_point_count = GetPatchControlPointCount(state.topology);
+      if (!control_point_count) {
+        // TODO(d3d12): support non-patch topologies with tessellation PSOs if needed.
+        WARN("D3D12CommandQueue: tessellation indirect indexed draw skipped because primitive topology is not a patch list topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else if (metal->use_geometry) {
       geometry_counts = GetGeometryVertexCount(state.topology);
       if (!geometry_counts) {
         WARN("D3D12CommandQueue: geometry indirect indexed draw skipped because primitive topology is unsupported topology=",
@@ -4098,20 +5596,27 @@ private:
     const auto index_type = GetIndexType(state.index_buffer->Format);
     const UINT64 index_offset =
         index_resource->GetHeapOffset() + index_resource_offset;
-    auto attachments = BuildRenderPassAttachments(state);
-    auto viewports = state.viewports;
-    auto scissors = state.scissors;
-    if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
-      return;
-    const auto argument_buffer_size =
-        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry);
+      auto attachments = BuildRenderPassAttachments(state);
+      auto viewports = state.viewports;
+      auto scissors = state.scissors;
+      if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
+        return;
+      RecordGraphicsPipelineResourceAccess(state, *pipeline, index_resource);
+      const auto argument_buffer_size =
+          EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
+                                             metal->use_tessellation);
 
     auto encode_draw =
         [this, metal_pso, use_geometry = metal->use_geometry,
+         use_tessellation = metal->use_tessellation,
          depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         tess_threads_per_patch = metal->tess_threads_per_patch,
+         tess_num_output_control_point_element =
+             metal->tess_num_output_control_point_element,
          pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), index_allocation,
-         primitive, geometry_counts, index_type, index_offset,
+         primitive, geometry_counts, control_point_count, index_type,
+         index_offset,
          blend_factor = state.blend_factor,
          stencil_ref = state.stencil_ref, arg_buffer, arg_offset, count_buffer,
          count_offset, counted_args, counted_offset, argument_size,
@@ -4134,11 +5639,57 @@ private:
       rs = rasterizer;
 
       EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
-                             argbuf_offset);
+                             use_tessellation, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
-      if (use_geometry) {
+      if (use_tessellation) {
+        if (count_buffer.ptr()) {
+          // TODO(d3d12): marshal counted tessellation indirect indexed arguments.
+          WARN("D3D12CommandQueue: counted tessellation indirect indexed draw is unsupported");
+          return;
+        }
+        if (!tess_threads_per_patch || !control_point_count) {
+          WARN("D3D12CommandQueue: tessellation indirect indexed draw skipped because tessellation metadata is invalid");
+          return;
+        }
+        const auto patch_per_group = 32u / tess_threads_per_patch;
+        if (!patch_per_group) {
+          WARN("D3D12CommandQueue: tessellation indirect indexed draw skipped because threads-per-patch is unsupported value=",
+               tess_threads_per_patch);
+          return;
+        }
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_tessellation = 1;
+        enc.tess_num_output_control_point_element =
+            tess_num_output_control_point_element;
+        enc.tess_threads_per_patch = tess_threads_per_patch;
+        auto [arg_allocation, arg_sub_offset] =
+            enc.access<PipelineStage::Vertex>(
+                arg_buffer, arg_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS),
+                ResourceAccess::Read);
+        auto dispatch_arg =
+            enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        enc.encodeTSDispatchArgumentsMarshal(
+            arg_allocation->buffer(),
+            arg_allocation->gpuAddress() + arg_sub_offset + arg_offset, 0,
+            *control_point_count, patch_per_group, dispatch_arg.gpu_buffer,
+            dispatch_arg.gpu_address, dispatch_arg.offset,
+            max_object_threadgroups);
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<
+            wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect>();
+        draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect;
+        draw.dispatch_args_buffer = dispatch_arg.gpu_buffer;
+        draw.dispatch_args_offset = dispatch_arg.offset;
+        draw.patch_per_group = patch_per_group;
+        draw.threads_per_patch = tess_threads_per_patch;
+        draw.indirect_args_buffer = arg_allocation->buffer();
+        draw.indirect_args_offset = arg_sub_offset + arg_offset;
+        draw.index_buffer = index_allocation->buffer();
+        draw.index_buffer_offset = index_offset;
+        draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
+      } else if (use_geometry) {
         if (count_buffer.ptr()) {
           WARN("D3D12CommandQueue: counted geometry indirect indexed draw is unsupported");
           return;
@@ -4198,7 +5749,7 @@ private:
     if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry);
+                               metal->use_geometry, metal->use_tessellation);
       return;
     }
 
@@ -4207,6 +5758,7 @@ private:
                    argument_buffer_size, arg_buffer, arg_offset, count_buffer,
                    count_offset, counted_args, counted_offset, argument_size,
                    command_index, use_geometry = metal->use_geometry,
+                   use_tessellation = metal->use_tessellation,
                    encode = std::move(encode_draw)](
                       ArgumentEncodingContext &enc) mutable {
       if (count_buffer) {
@@ -4216,7 +5768,7 @@ private:
       }
 
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
-                           use_geometry))
+                           use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
       encode(enc, argbuf_offset);
@@ -4235,14 +5787,15 @@ private:
       return;
     }
 
-    auto *metal = pipeline->GetMetalComputeState();
-    if (!metal || !metal->pso) {
-      WARN("D3D12CommandQueue: indirect dispatch skipped because Metal compute PSO is unavailable");
-      return;
-    }
+      auto *metal = pipeline->GetMetalComputeState();
+      if (!metal || !metal->pso) {
+        WARN("D3D12CommandQueue: indirect dispatch skipped because Metal compute PSO is unavailable");
+        return;
+      }
 
-    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
-    chunk->emitcc([this, metal_pso = metal->pso,
+      RecordComputePipelineResourceAccess(state, *pipeline);
+      const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
+      chunk->emitcc([this, metal_pso = metal->pso,
                    threadgroup_size = metal->threadgroup_size, pipeline,
                    replay_state = state, argument_buffer_size, arg_buffer,
                    arg_offset, count_buffer, count_offset, counted_args,
@@ -4661,6 +6214,214 @@ private:
     }
   }
 
+  static D3D12_RESOURCE_STATES ShaderReadStateForStage(PipelineStage stage) {
+    return stage == PipelineStage::Pixel
+               ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+               : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  }
+
+  void RecordDescriptorResourceAccess(ReplayState &state, PipelineStage stage,
+                                      D3D12_DESCRIPTOR_RANGE_TYPE range_type,
+                                      const DescriptorRecord &descriptor,
+                                      const char *context) {
+    const auto expected_type = ExpectedDescriptorTypeForRange(range_type);
+    if (expected_type != DescriptorRecordType::Empty &&
+        descriptor.type != expected_type) {
+      if (descriptor.type != DescriptorRecordType::Empty) {
+        static std::atomic<uint32_t> log_count = 0;
+        if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+          WARN("D3D12CommandQueue: descriptor table type mismatch;"
+               " skipping resource-state tracking context=",
+               context,
+               " rangeType=", DescriptorRangeTypeName(range_type),
+               " descriptorType=", DescriptorRecordTypeName(descriptor.type),
+               " expectedType=", DescriptorRecordTypeName(expected_type),
+               " resource=", descriptor.resource.ptr());
+        }
+      }
+      return;
+    }
+
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: {
+      Resource *resource = nullptr;
+      if (descriptor.has_desc)
+        ResolveBufferGpuAddress(descriptor.desc.cbv.BufferLocation, resource);
+      if (!resource)
+        resource = GetResource(descriptor.resource.ptr());
+      if (resource)
+        RecordReplayResourceAccess(
+            state, resource->GetD3D12Resource(),
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, context);
+      break;
+      }
+      case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+        if (auto *resource = GetResource(descriptor.resource.ptr())) {
+          RecordDescriptorResourceAccessRanges(
+              state, *resource, ShaderReadStateForStage(stage), descriptor,
+              context, GetShaderResourceSubresourceRanges);
+        }
+        break;
+      case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+        if (auto *resource = GetResource(descriptor.resource.ptr())) {
+          RecordDescriptorResourceAccessRanges(
+              state, *resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              descriptor, context, GetUnorderedAccessSubresourceRanges);
+        }
+        RecordReplayResourceAccess(state, descriptor.counter_resource.ptr(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   "UAV counter");
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      break;
+    }
+  }
+
+  void RecordRootBufferDescriptorAccess(
+      ReplayState &state, PipelineStage stage, bool compute, UINT root_index,
+      const RootSignatureParameter &parameter, DescriptorRecordType type) {
+    const auto &map =
+        type == DescriptorRecordType::ConstantBufferView
+            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? (compute ? state.compute_srv_roots
+                             : state.graphics_srv_roots)
+                  : (compute ? state.compute_uav_roots
+                             : state.graphics_uav_roots);
+    auto it = map.find(root_index);
+    if (it == map.end())
+      return;
+
+    Resource *resource = nullptr;
+    ResolveBufferGpuAddress(it->second, resource);
+    if (!resource)
+      return;
+
+    D3D12_RESOURCE_STATES desired = D3D12_RESOURCE_STATE_COMMON;
+    const char *context = "root descriptor";
+    if (type == DescriptorRecordType::ConstantBufferView) {
+      desired = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+      context = "root CBV";
+    } else if (type == DescriptorRecordType::ShaderResourceView) {
+      desired = ShaderReadStateForStage(stage);
+      context = "root SRV";
+    } else {
+      desired = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      context = "root UAV";
+    }
+
+    (void)parameter;
+    RecordReplayResourceAccess(state, resource->GetD3D12Resource(), desired,
+                               context);
+  }
+
+  void RecordPipelineDescriptorAccess(ReplayState &state,
+                                      PipelineState &pipeline,
+                                      bool compute) {
+    auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
+                                          : state.graphics_root_signature.ptr());
+    if (!root)
+      return;
+
+    const auto parameters = root->GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type ==
+          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        const auto base = GetTableHandle(state, compute, root_index);
+        if (!base.ptr)
+          continue;
+        UINT running_offset = 0;
+        for (const auto &range : parameter.ranges) {
+          const auto range_offset = DescriptorRangeOffset(range, running_offset);
+          const auto count =
+              range.descriptor_count == UINT_MAX
+                  ? ReflectedDescriptorRangeCount(
+                        pipeline, range, parameter.visibility, compute)
+                  : range.descriptor_count;
+          ForEachVisibleStage(
+              parameter.visibility, compute, [&](PipelineStage stage) {
+                const auto binding_type = BindingTypeForRange(range.range_type);
+                const auto *shader = FindShaderForStage(pipeline, stage);
+                if (!shader)
+                  return;
+                const auto *arguments =
+                    binding_type == SM50BindingType::ConstantBuffer
+                        ? shader->constantBufferInfo()
+                        : shader->resourceArgumentInfo();
+                const auto argument_count =
+                    binding_type == SM50BindingType::ConstantBuffer
+                        ? shader->reflection.NumConstantBuffers
+                        : shader->reflection.NumArguments;
+                if (!arguments)
+                  return;
+
+                for (UINT arg_index = 0; arg_index < argument_count;
+                     arg_index++) {
+                  const auto &argument = arguments[arg_index];
+                  if (argument.Type != binding_type)
+                    continue;
+                  const auto space = argument.RegisterCount
+                                         ? argument.RegisterSpace
+                                         : 0;
+                  const auto lower = argument.RegisterCount
+                                         ? argument.RegisterLowerBound
+                                         : argument.SM50BindingSlot;
+                  const auto arg_count =
+                      argument.RegisterCount ? argument.RegisterCount : 1;
+                  const auto resolved_count =
+                      arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+                  if (space != range.register_space ||
+                      lower + resolved_count < lower)
+                    continue;
+
+                  for (UINT i = 0; i < resolved_count; i++) {
+                    const auto shader_register = lower + i;
+                    if (shader_register < range.base_shader_register)
+                      continue;
+                    const auto descriptor_index =
+                        shader_register - range.base_shader_register;
+                    if (descriptor_index >= count)
+                      continue;
+                    const auto *descriptor = GetBoundDescriptorRecordInRange(
+                        state, base, range_offset, descriptor_index, count,
+                        DescriptorHeapTypeForRange(range.range_type));
+                    if (!descriptor)
+                      continue;
+                    RecordDescriptorResourceAccess(
+                        state, stage, range.range_type, *descriptor,
+                        DescriptorRangeTypeName(range.range_type));
+                  }
+                }
+              });
+          if (range.descriptor_count != UINT_MAX)
+            running_offset = range_offset + range.descriptor_count;
+        }
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        ForEachVisibleStage(parameter.visibility, compute,
+                            [&](PipelineStage stage) {
+                              RecordRootBufferDescriptorAccess(
+                                  state, stage, compute, root_index, parameter,
+                                  DescriptorRecordType::ConstantBufferView);
+                            });
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        ForEachVisibleStage(parameter.visibility, compute,
+                            [&](PipelineStage stage) {
+                              RecordRootBufferDescriptorAccess(
+                                  state, stage, compute, root_index, parameter,
+                                  DescriptorRecordType::ShaderResourceView);
+                            });
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        ForEachVisibleStage(parameter.visibility, compute,
+                            [&](PipelineStage stage) {
+                              RecordRootBufferDescriptorAccess(
+                                  state, stage, compute, root_index, parameter,
+                                  DescriptorRecordType::UnorderedAccessView);
+                            });
+      }
+    }
+  }
+
   static UINT64 DescriptorRecordSizeBytes(const DescriptorRecord &descriptor) {
     if (!descriptor.has_desc)
       return 0;
@@ -4797,6 +6558,11 @@ private:
                 has_buffer_view = true;
                 slice = TextureBufferSlice(*resource, offset, byte_size,
                                            sizeof(uint32_t));
+              } else {
+                WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
+                                                 sizeof(uint32_t), offset,
+                                                 byte_size);
+                return;
               }
             }
             if (!has_buffer_view)
@@ -4821,11 +6587,12 @@ private:
                 } else {
                   // TODO(d3d12): typed buffer SRV shaders that reflect as
                   // texture arguments need a real typed Metal texture-buffer
-                  // view. The raw-buffer fallback cannot preserve typed load
-                  // conversion for all formats.
-                  WARN("D3D12CommandQueue: typed buffer SRV failed to create Metal texture buffer view format=",
-                       uint32_t(srv.Format),
-                       "; falling back to raw buffer binding");
+                  // view. Binding the raw buffer here is semantically wrong
+                  // and can make argument encoding dereference a missing view.
+                  WarnTextureBufferViewUnavailable("SRV", srv.Format,
+                                                   format.BytesPerTexel,
+                                                   offset, byte_size);
+                  return;
                 }
               }
               if (!has_buffer_view)
@@ -4841,9 +6608,9 @@ private:
             byte_size = UINT64(srv.Buffer.NumElements) *
                         srv.Buffer.StructureByteStride;
             if (needs_texture_buffer_view) {
-              if (const auto view_format = UintBufferViewFormatForStride(
-                      srv.Buffer.StructureByteStride);
-                  view_format != DXGI_FORMAT_UNKNOWN) {
+              const auto view_format =
+                  UintBufferViewFormatForStride(srv.Buffer.StructureByteStride);
+              if (view_format != DXGI_FORMAT_UNKNOWN) {
                 auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
                                              view_format, offset, byte_size,
                                              WMTTextureUsageShaderRead);
@@ -4853,7 +6620,20 @@ private:
                   slice = TextureBufferSlice(
                       *resource, offset, byte_size,
                       srv.Buffer.StructureByteStride);
+                } else {
+                  WarnTextureBufferViewUnavailable(
+                      "SRV", view_format, srv.Buffer.StructureByteStride,
+                      offset, byte_size);
+                  return;
                 }
+              } else {
+                // TODO(d3d12): Metal texture-buffer reflection for structured
+                // buffers with uncommon strides needs either shader lowering
+                // or a compatible packed view format.
+                WarnTextureBufferViewUnavailable(
+                    "SRV", view_format, srv.Buffer.StructureByteStride,
+                    offset, byte_size);
+                return;
               }
             }
             if (!has_buffer_view)
@@ -4977,6 +6757,11 @@ private:
                 has_buffer_view = true;
                 slice = TextureBufferSlice(*resource, offset, byte_size,
                                            sizeof(uint32_t));
+              } else {
+                WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
+                                                 sizeof(uint32_t), offset,
+                                                 byte_size);
+                return;
               }
             }
             if (!has_buffer_view)
@@ -5002,10 +6787,12 @@ private:
                 } else {
                   // TODO(d3d12): typed buffer UAV shaders that reflect as
                   // texture arguments need a real typed Metal texture-buffer
-                  // view. The raw-buffer fallback loses typed UAV semantics.
-                  WARN("D3D12CommandQueue: typed buffer UAV failed to create Metal texture buffer view format=",
-                       uint32_t(uav.Format),
-                       "; falling back to raw buffer binding");
+                  // view. Binding the raw buffer here loses typed UAV
+                  // semantics and can dereference a missing view later.
+                  WarnTextureBufferViewUnavailable("UAV", uav.Format,
+                                                   format.BytesPerTexel,
+                                                   offset, byte_size);
+                  return;
                 }
               }
               if (!has_buffer_view)
@@ -5021,9 +6808,9 @@ private:
             byte_size = UINT64(uav.Buffer.NumElements) *
                         uav.Buffer.StructureByteStride;
             if (needs_texture_buffer_view) {
-              if (const auto view_format = UintBufferViewFormatForStride(
-                      uav.Buffer.StructureByteStride);
-                  view_format != DXGI_FORMAT_UNKNOWN) {
+              const auto view_format =
+                  UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
+              if (view_format != DXGI_FORMAT_UNKNOWN) {
                 auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
                                              view_format, offset, byte_size,
                                              WMTTextureUsageShaderRead |
@@ -5034,7 +6821,20 @@ private:
                   slice = TextureBufferSlice(
                       *resource, offset, byte_size,
                       uav.Buffer.StructureByteStride);
+                } else {
+                  WarnTextureBufferViewUnavailable(
+                      "UAV", view_format, uav.Buffer.StructureByteStride,
+                      offset, byte_size);
+                  return;
                 }
+              } else {
+                // TODO(d3d12): Metal texture-buffer reflection for structured
+                // buffers with uncommon strides needs either shader lowering
+                // or a compatible packed view format.
+                WarnTextureBufferViewUnavailable(
+                    "UAV", view_format, uav.Buffer.StructureByteStride,
+                    offset, byte_size);
+                return;
               }
             }
             if (!has_buffer_view)
@@ -5590,6 +7390,8 @@ private:
     const auto offset = AllocateArgumentBuffer(argbuf_offset, table_size);
     if (pipeline_kind == PipelineKind::Geometry)
       enc.encodeVertexBuffers<PipelineKind::Geometry>(slot_mask, offset);
+    else if (pipeline_kind == PipelineKind::Tessellation)
+      enc.encodeVertexBuffers<PipelineKind::Tessellation>(slot_mask, offset);
     else
       enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
   }
@@ -5598,10 +7400,13 @@ private:
                               const ReplayState &state,
                               PipelineState &pipeline,
                               bool use_geometry,
+                              bool use_tessellation,
                               uint64_t &argbuf_offset) {
     ApplyRootDescriptorTables(enc, state, pipeline, false);
-    const auto pipeline_kind = use_geometry ? PipelineKind::Geometry
-                                            : PipelineKind::Ordinary;
+    const auto pipeline_kind = use_tessellation
+                                   ? PipelineKind::Tessellation
+                                   : use_geometry ? PipelineKind::Geometry
+                                                  : PipelineKind::Ordinary;
     EncodeVertexBuffers(enc, state, pipeline.GetGraphicsState(),
                         argbuf_offset, pipeline_kind);
     const auto &shaders = pipeline.GetDxilShaders();
@@ -5621,7 +7426,24 @@ private:
                                        PipelineKind::Geometry>(
               enc, shader, key, argbuf_offset);
       } else {
-        if (shader.stage == PipelineShaderStage::Vertex)
+        if (use_tessellation) {
+          if (shader.stage == PipelineShaderStage::Vertex)
+            EncodeShaderBindingsForStage<PipelineStage::Vertex,
+                                         PipelineKind::Tessellation>(
+                enc, shader, key, argbuf_offset);
+          else if (shader.stage == PipelineShaderStage::Hull)
+            EncodeShaderBindingsForStage<PipelineStage::Hull,
+                                         PipelineKind::Tessellation>(
+                enc, shader, key, argbuf_offset);
+          else if (shader.stage == PipelineShaderStage::Domain)
+            EncodeShaderBindingsForStage<PipelineStage::Domain,
+                                         PipelineKind::Tessellation>(
+                enc, shader, key, argbuf_offset);
+          else if (shader.stage == PipelineShaderStage::Pixel)
+            EncodeShaderBindingsForStage<PipelineStage::Pixel,
+                                         PipelineKind::Tessellation>(
+                enc, shader, key, argbuf_offset);
+        } else if (shader.stage == PipelineShaderStage::Vertex)
           EncodeShaderBindingsForStage<PipelineStage::Vertex,
                                        PipelineKind::Ordinary>(
               enc, shader, key, argbuf_offset);
@@ -5665,7 +7487,8 @@ private:
   }
 
   static uint64_t EstimateGraphicsArgumentBufferSize(PipelineState &pipeline,
-                                                     bool use_geometry) {
+                                                     bool use_geometry,
+                                                     bool use_tessellation) {
     uint64_t size = 0;
     if (const auto *graphics = pipeline.GetGraphicsState()) {
       uint32_t slot_mask = 0;
@@ -5680,6 +7503,9 @@ private:
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Vertex ||
           shader.stage == PipelineShaderStage::Pixel ||
+          (use_tessellation &&
+           (shader.stage == PipelineShaderStage::Hull ||
+            shader.stage == PipelineShaderStage::Domain)) ||
           (use_geometry && shader.stage == PipelineShaderStage::Geometry))
         size = AlignArgumentBufferSize(size) +
                EstimateShaderArgumentBufferSize(shader);
@@ -5748,8 +7574,8 @@ private:
           .view = view,
           .slot = i,
           .array_length = GetRenderTargetArrayLength(descriptor),
-          .width = texture->width(),
-          .height = texture->height(),
+          .width = texture->width(view),
+          .height = texture->height(view),
           .format = texture->pixelFormat(),
       });
     }
@@ -5764,8 +7590,8 @@ private:
             .texture = texture,
             .view = view,
             .array_length = GetDepthStencilArrayLength(*resource, *state.depth_stencil),
-            .width = texture->width(),
-            .height = texture->height(),
+            .width = texture->width(view),
+            .height = texture->height(view),
             .format = texture->pixelFormat(),
         };
       }
@@ -5777,7 +7603,8 @@ private:
   static bool BeginRenderPass(ArgumentEncodingContext &enc,
                               ReplayRenderPassAttachments &attachments,
                               uint64_t argument_buffer_size,
-                              bool use_geometry = false) {
+                              bool use_geometry = false,
+                              bool use_tessellation = false) {
     if (attachments.colors.empty() && !attachments.depth_stencil)
       return false;
 
@@ -5854,6 +7681,7 @@ private:
     info.default_raster_sample_count = sample_count;
     info.tile_barrier_pso_key.raster_sample_count = sample_count;
     info.use_geometry = info.use_geometry || use_geometry;
+    info.use_tessellation = info.use_tessellation || use_tessellation;
     return true;
   }
 
@@ -6391,6 +8219,90 @@ private:
             });
       }
     }
+    }
+
+  void RecordVertexBufferAccess(ReplayState &state,
+                                const PipelineGraphicsState *graphics_state) {
+    if (!graphics_state)
+      return;
+
+    uint32_t slot_mask = 0;
+    for (const auto &element : graphics_state->input_elements) {
+      if (element.InputSlot < 32)
+        slot_mask |= 1u << element.InputSlot;
+    }
+    if (!slot_mask)
+      return;
+
+    const auto max_slot = 32u - __builtin_clz(slot_mask);
+    for (UINT slot = 0; slot < max_slot; slot++) {
+      if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
+        continue;
+      Resource *resource = nullptr;
+      ResolveBufferGpuAddress(state.vertex_buffers[slot]->BufferLocation,
+                              resource);
+      if (resource) {
+        RecordReplayResourceAccess(
+            state, resource->GetD3D12Resource(),
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            "vertex buffer");
+      }
+    }
+  }
+
+    void RecordRenderAttachmentAccess(ReplayState &state) {
+      for (const auto &descriptor : state.render_targets) {
+        if (auto *resource = GetResource(descriptor.resource.ptr())) {
+          RecordDescriptorResourceAccessRanges(
+              state, *resource, D3D12_RESOURCE_STATE_RENDER_TARGET, descriptor,
+              "render target", GetRenderTargetSubresourceRanges);
+        }
+      }
+
+    if (!state.depth_stencil)
+      return;
+
+    D3D12_RESOURCE_STATES desired = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    if (state.depth_stencil->has_desc) {
+      const auto flags = state.depth_stencil->desc.dsv.Flags;
+      const auto read_only_flags =
+          D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+      if ((flags & read_only_flags) == read_only_flags)
+        desired = D3D12_RESOURCE_STATE_DEPTH_READ;
+    }
+      if (auto *resource = GetResource(state.depth_stencil->resource.ptr())) {
+        RecordDescriptorResourceAccessRanges(
+            state, *resource, desired, *state.depth_stencil, "depth stencil",
+            GetDepthStencilSubresourceRanges);
+      }
+    }
+
+  void RecordGraphicsPipelineResourceAccess(ReplayState &state,
+                                            PipelineState &pipeline,
+                                            Resource *index_resource) {
+    RecordRenderAttachmentAccess(state);
+    RecordPipelineDescriptorAccess(state, pipeline, false);
+    RecordVertexBufferAccess(state, pipeline.GetGraphicsState());
+    if (index_resource) {
+      RecordReplayResourceAccess(state, index_resource->GetD3D12Resource(),
+                                 D3D12_RESOURCE_STATE_INDEX_BUFFER,
+                                 "index buffer");
+    }
+    if (state.predication_buffer) {
+      RecordReplayResourceAccess(state, state.predication_buffer.ptr(),
+                                 D3D12_RESOURCE_STATE_PREDICATION,
+                                 "predication buffer");
+    }
+  }
+
+  void RecordComputePipelineResourceAccess(ReplayState &state,
+                                           PipelineState &pipeline) {
+    RecordPipelineDescriptorAccess(state, pipeline, true);
+    if (state.predication_buffer) {
+      RecordReplayResourceAccess(state, state.predication_buffer.ptr(),
+                                 D3D12_RESOURCE_STATE_PREDICATION,
+                                 "predication buffer");
+    }
   }
 
   static void EncodeDynamicRenderState(
@@ -6462,7 +8374,16 @@ private:
     }
     std::optional<WMTPrimitiveType> primitive;
     std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
-    if (metal->use_geometry) {
+    std::optional<uint32_t> control_point_count;
+    if (metal->use_tessellation) {
+      control_point_count = GetPatchControlPointCount(state.topology);
+      if (!control_point_count) {
+        // TODO(d3d12): support non-patch topologies with tessellation PSOs if needed.
+        WARN("D3D12CommandQueue: tessellation draw skipped because primitive topology is not a patch list topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else if (metal->use_geometry) {
       geometry_counts = GetGeometryVertexCount(state.topology);
       if (!geometry_counts) {
         WARN("D3D12CommandQueue: geometry draw skipped because primitive topology is unsupported topology=",
@@ -6479,11 +8400,12 @@ private:
     }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
-    auto attachments = BuildRenderPassAttachments(state);
-    if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
-      return;
-    DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
-                      viewports, scissors, &record, nullptr, 0, 0);
+      auto attachments = BuildRenderPassAttachments(state);
+      if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
+        return;
+      RecordGraphicsPipelineResourceAccess(state, *pipeline, nullptr);
+      DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
+                        viewports, scissors, &record, nullptr, 0, 0);
     DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
                            0);
     DebugEncodeCBVReadbacks(chunk, "draw", state, *pipeline);
@@ -6491,14 +8413,21 @@ private:
         chunk, "draw", pipeline->GetShaderCacheKey(),
         record.vertex_count_per_instance, 0, record.instance_count);
     const auto argument_buffer_size =
-        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry) +
-        (metal->use_geometry ? EstimateDrawArgumentBufferSize(false) : 0);
+        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
+                                           metal->use_tessellation) +
+        ((metal->use_geometry || metal->use_tessellation)
+             ? EstimateDrawArgumentBufferSize(false)
+             : 0);
     auto encode_draw =
         [this, metal_pso, use_geometry = metal->use_geometry,
+         use_tessellation = metal->use_tessellation,
          depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         tess_threads_per_patch = metal->tess_threads_per_patch,
+         tess_num_output_control_point_element =
+             metal->tess_num_output_control_point_element,
          pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), primitive,
-         geometry_counts,
+         geometry_counts, control_point_count,
          blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
          vertex_start = record.start_vertex_location,
          vertex_count = record.vertex_count_per_instance,
@@ -6522,7 +8451,7 @@ private:
       rs = rasterizer;
 
       EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
-                             argbuf_offset);
+                             use_tessellation, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
@@ -6533,7 +8462,57 @@ private:
         enc.bumpVisibilityResultOffset();
       }
 
-      if (use_geometry) {
+      if (use_tessellation) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_tessellation = 1;
+        enc.tess_num_output_control_point_element =
+            tess_num_output_control_point_element;
+        enc.tess_threads_per_patch = tess_threads_per_patch;
+        if (!tess_threads_per_patch || !control_point_count) {
+          WARN("D3D12CommandQueue: tessellation draw skipped because tessellation metadata is invalid");
+          return;
+        }
+
+        const auto patch_count_per_instance =
+            vertex_count / *control_point_count;
+        if (!patch_count_per_instance)
+          return;
+        const auto patch_per_group = 32u / tess_threads_per_patch;
+        if (!patch_per_group) {
+          WARN("D3D12CommandQueue: tessellation draw skipped because threads-per-patch is unsupported value=",
+               tess_threads_per_patch);
+          return;
+        }
+        const auto patch_per_mesh_instance =
+            (patch_count_per_instance - 1u) / patch_per_group + 1u;
+        if (uint64_t(patch_per_mesh_instance) * instance_count >
+            max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted tessellation draw because of too many object threadgroups patch_groups=",
+               patch_per_mesh_instance, " instance_count=", instance_count);
+          return;
+        }
+
+        const auto draw_arguments_offset =
+            AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->StartVertex = vertex_start;
+        draw_argument->VertexCount = vertex_count;
+        draw_argument->InstanceCount = instance_count;
+        draw_argument->StartInstance = base_instance;
+
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<
+            wmtcmd_render_dxmt_tessellation_mesh_draw>();
+        draw.type = WMTRenderCommandDXMTTessellationMeshDraw;
+        draw.draw_arguments_offset =
+            enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+        draw.instance_count = instance_count;
+        draw.threads_per_patch = tess_threads_per_patch;
+        draw.patch_per_group = patch_per_group;
+        draw.patch_per_mesh_instance = patch_per_mesh_instance;
+      } else if (use_geometry) {
         auto *render_encoder = enc.currentRenderEncoder();
         render_encoder->use_geometry = 1;
         const auto draw_arguments_offset =
@@ -6564,11 +8543,11 @@ private:
           draw.warp_count = warp_count;
           draw.vertex_per_warp = vertex_per_warp;
         }
-        } else {
-          enc.resolveRenderPassBarrier();
-          auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
-          draw.type = WMTRenderCommandDraw;
-          draw.primitive_type = *primitive;
+      } else {
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+        draw.type = WMTRenderCommandDraw;
+        draw.primitive_type = *primitive;
         draw.vertex_start = vertex_start;
         draw.vertex_count = vertex_count;
         draw.instance_count = instance_count;
@@ -6583,14 +8562,15 @@ private:
     if (D3D12ReplayGraphicsBatchingEnabled()) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry);
+                               metal->use_geometry, metal->use_tessellation);
       return;
     }
 
     FlushGraphicsPassBatch(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
                            dxmt::apitrace::current_d3d_sequence(),
-                           std::move(encode_draw), metal->use_geometry);
+                           std::move(encode_draw), metal->use_geometry,
+                           metal->use_tessellation);
   }
 
   void ReplayDrawIndexedInstanced(CommandChunk *chunk, ReplayState &state,
@@ -6627,14 +8607,24 @@ private:
     }
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
-    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    const auto metal_pso = SelectGraphicsPipelineState(
+        *metal, state.topology, state.index_buffer->Format);
     if (!metal_pso) {
       WARN("D3D12CommandQueue: indexed draw skipped because selected Metal graphics PSO is unavailable");
       return;
     }
     std::optional<WMTPrimitiveType> primitive;
     std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
-    if (metal->use_geometry) {
+    std::optional<uint32_t> control_point_count;
+    if (metal->use_tessellation) {
+      control_point_count = GetPatchControlPointCount(state.topology);
+      if (!control_point_count) {
+        // TODO(d3d12): support non-patch topologies with tessellation PSOs if needed.
+        WARN("D3D12CommandQueue: tessellation indexed draw skipped because primitive topology is not a patch list topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else if (metal->use_geometry) {
       geometry_counts = GetGeometryVertexCount(state.topology);
       if (!geometry_counts) {
         WARN("D3D12CommandQueue: geometry indexed draw skipped because primitive topology is unsupported topology=",
@@ -6655,13 +8645,14 @@ private:
     const UINT64 index_offset =
         index_binding_offset +
         record.start_index_location * GetIndexSize(state.index_buffer->Format);
-    auto attachments = BuildRenderPassAttachments(state);
-    auto viewports = state.viewports;
-    auto scissors = state.scissors;
-    if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
-      return;
-    DebugLogDrawState("indexed", state, *pipeline, *metal, attachments,
-                      viewports, scissors, nullptr, &record,
+      auto attachments = BuildRenderPassAttachments(state);
+      auto viewports = state.viewports;
+      auto scissors = state.scissors;
+      if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
+        return;
+      RecordGraphicsPipelineResourceAccess(state, *pipeline, index_resource);
+      DebugLogDrawState("indexed", state, *pipeline, *metal, attachments,
+                        viewports, scissors, nullptr, &record,
                       index_resource_offset, index_offset);
     DebugEncodeIAReadbacks(chunk, "indexed", state, *pipeline, nullptr,
                            &record, index_offset);
@@ -6670,14 +8661,22 @@ private:
         chunk, "indexed", pipeline->GetShaderCacheKey(), 0,
         record.index_count_per_instance, record.instance_count);
     const auto argument_buffer_size =
-        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry) +
-        (metal->use_geometry ? EstimateDrawArgumentBufferSize(true) : 0);
+        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
+                                           metal->use_tessellation) +
+        ((metal->use_geometry || metal->use_tessellation)
+             ? EstimateDrawArgumentBufferSize(true)
+             : 0);
     auto encode_draw =
         [this, metal_pso, use_geometry = metal->use_geometry,
+         use_tessellation = metal->use_tessellation,
          depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         tess_threads_per_patch = metal->tess_threads_per_patch,
+         tess_num_output_control_point_element =
+             metal->tess_num_output_control_point_element,
          pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), index_allocation,
-         primitive, geometry_counts, index_type, index_binding_offset,
+         primitive, geometry_counts, control_point_count, index_type,
+         index_binding_offset,
          index_offset,
          blend_factor = state.blend_factor,
          stencil_ref = state.stencil_ref, viewports = std::move(viewports),
@@ -6705,7 +8704,7 @@ private:
       rs = rasterizer;
 
       EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
-                             argbuf_offset);
+                             use_tessellation, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
@@ -6716,7 +8715,60 @@ private:
         enc.bumpVisibilityResultOffset();
       }
 
-      if (use_geometry) {
+      if (use_tessellation) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_tessellation = 1;
+        enc.tess_num_output_control_point_element =
+            tess_num_output_control_point_element;
+        enc.tess_threads_per_patch = tess_threads_per_patch;
+        if (!tess_threads_per_patch || !control_point_count) {
+          WARN("D3D12CommandQueue: tessellation indexed draw skipped because tessellation metadata is invalid");
+          return;
+        }
+
+        const auto patch_count_per_instance =
+            index_count / *control_point_count;
+        if (!patch_count_per_instance)
+          return;
+        const auto patch_per_group = 32u / tess_threads_per_patch;
+        if (!patch_per_group) {
+          WARN("D3D12CommandQueue: tessellation indexed draw skipped because threads-per-patch is unsupported value=",
+               tess_threads_per_patch);
+          return;
+        }
+        const auto patch_per_mesh_instance =
+            (patch_count_per_instance - 1u) / patch_per_group + 1u;
+        if (uint64_t(patch_per_mesh_instance) * instance_count >
+            max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted tessellation indexed draw because of too many object threadgroups patch_groups=",
+               patch_per_mesh_instance, " instance_count=", instance_count);
+          return;
+        }
+
+        const auto draw_arguments_offset = AllocateArgumentBuffer(
+            argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->BaseVertex = base_vertex;
+        draw_argument->IndexCount = index_count;
+        draw_argument->StartIndex = start_index;
+        draw_argument->InstanceCount = instance_count;
+        draw_argument->StartInstance = base_instance;
+
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<
+            wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
+        draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+        draw.draw_arguments_offset =
+            enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+        draw.index_buffer = index_allocation->buffer();
+        draw.index_buffer_offset = index_binding_offset;
+        draw.instance_count = instance_count;
+        draw.threads_per_patch = tess_threads_per_patch;
+        draw.patch_per_group = patch_per_group;
+        draw.patch_per_mesh_instance = patch_per_mesh_instance;
+      } else if (use_geometry) {
         auto *render_encoder = enc.currentRenderEncoder();
         render_encoder->use_geometry = 1;
         const auto draw_arguments_offset = AllocateArgumentBuffer(
@@ -6772,14 +8824,15 @@ private:
     if (D3D12ReplayGraphicsBatchingEnabled()) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry);
+                               metal->use_geometry, metal->use_tessellation);
       return;
     }
 
     FlushGraphicsPassBatch(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
                            dxmt::apitrace::current_d3d_sequence(),
-                           std::move(encode_draw), metal->use_geometry);
+                           std::move(encode_draw), metal->use_geometry,
+                           metal->use_tessellation);
   }
 
   void ReplayDispatch(CommandChunk *chunk, ReplayState &state,
@@ -6801,11 +8854,12 @@ private:
       return;
     }
 
-    if (!ValidateComputeDispatch(metal->threadgroup_size, record.x, record.y,
-                                 record.z))
-      return;
+      if (!ValidateComputeDispatch(metal->threadgroup_size, record.x, record.y,
+                                   record.z))
+        return;
 
-    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
+      RecordComputePipelineResourceAccess(state, *pipeline);
+      const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
     chunk->emitcc([this, metal_pso = metal->pso,
                    threadgroup_size = metal->threadgroup_size,
                    pipeline, replay_state = state,
@@ -6854,16 +8908,8 @@ private:
       copy.dst.type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
       copy.src.resource = record.src;
       copy.src.type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      const UINT dst_subresources =
-          (dst->GetResourceDesc().MipLevels ? dst->GetResourceDesc().MipLevels : 1) *
-          (dst->GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-               ? 1
-               : dst->GetResourceDesc().DepthOrArraySize);
-      const UINT src_subresources =
-          (src->GetResourceDesc().MipLevels ? src->GetResourceDesc().MipLevels : 1) *
-          (src->GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-               ? 1
-               : src->GetResourceDesc().DepthOrArraySize);
+      const UINT dst_subresources = GetSubresourceCount(*dst);
+      const UINT src_subresources = GetSubresourceCount(*src);
       const UINT count = std::min(dst_subresources, src_subresources);
       for (UINT i = 0; i < count; i++) {
         copy.dst.subresource_index = i;
@@ -7408,6 +9454,169 @@ private:
     });
   }
 
+  void ReplayCopyTiles(CommandChunk *chunk, const CopyTilesRecord &record) {
+    auto *tiled = GetResource(record.tiled_resource.ptr());
+    auto *buffer_resource = GetResource(record.buffer.ptr());
+    if (!tiled || !buffer_resource || !tiled->IsReservedTexture() ||
+        !buffer_resource->GetBuffer()) {
+      WARN("D3D12CommandQueue: TODO CopyTiles requires reserved texture and buffer"
+           " tiled=", record.tiled_resource.ptr(),
+           " buffer=", record.buffer.ptr(),
+           " flags=", record.flags);
+      return;
+    }
+
+    constexpr D3D12_TILE_COPY_FLAGS kDirectionFlags =
+        D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE |
+        D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
+    if (record.flags & ~kDirectionFlags) {
+      WARN("D3D12CommandQueue: TODO CopyTiles unsupported flags flags=", record.flags);
+      return;
+    }
+    const bool buffer_to_texture =
+        record.flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE;
+    const bool texture_to_buffer =
+        record.flags & D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
+    if (buffer_to_texture == texture_to_buffer) {
+      WARN("D3D12CommandQueue: TODO CopyTiles requires exactly one direction flag"
+           " flags=", record.flags);
+      return;
+    }
+
+    const auto *tiling = tiled->GetTiling();
+    if (!tiling || record.start.Subresource >= tiling->subresources.size()) {
+      WARN("D3D12CommandQueue: CopyTiles invalid tiled resource tiling"
+           " subresource=", record.start.Subresource);
+      return;
+    }
+    const auto &sub = tiling->subresources[record.start.Subresource];
+    if (sub.plane != 0 || IsPackedTileSubresource(sub)) {
+      WARN("D3D12CommandQueue: TODO CopyTiles unsupported packed/planar sparse texture region"
+           " plane=", sub.plane,
+           " packed=", IsPackedTileSubresource(sub),
+           " subresource=", record.start.Subresource);
+      return;
+    }
+
+    Rc<Texture> texture = Rc<Texture>(tiled->GetTexture(sub.plane));
+    Rc<Buffer> buffer = buffer_resource->GetBuffer();
+    if (!texture || !buffer)
+      return;
+
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
+                                  tiled->GetResourceDesc().Format, format))) {
+      WARN("D3D12CommandQueue: TODO CopyTiles unsupported format format=",
+           uint32_t(tiled->GetResourceDesc().Format));
+      return;
+    }
+
+    const UINT64 tile_bytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    UINT tile_index = 0;
+    const WMTSize subresource_size =
+        GetSubresourceSize(*tiled, record.start.Subresource, nullptr);
+    bool ok = ForEachTileInRegion(*tiling, record.start, &record.size,
+                                  [&](UINT subresource, UINT x, UINT y, UINT z) {
+      const auto &tile_subresource = tiling->subresources[subresource];
+      if (tile_subresource.plane != 0 ||
+          IsPackedTileSubresource(tile_subresource)) {
+        WARN("D3D12CommandQueue: TODO CopyTiles encountered unsupported packed/planar tile"
+             " subresource=", subresource,
+             " plane=", tile_subresource.plane,
+             " packed=", IsPackedTileSubresource(tile_subresource));
+        return false;
+      }
+      const UINT64 buffer_offset =
+          buffer_resource->GetHeapOffset() + record.buffer_offset +
+          UINT64(tile_index++) * tile_bytes;
+      const UINT level = tile_subresource.mip_level;
+      const UINT slice = tile_subresource.array_slice;
+      const WMTSize current_subresource_size =
+          subresource == record.start.Subresource
+              ? subresource_size
+              : GetSubresourceSize(*tiled, subresource, nullptr);
+      const WMTOrigin origin{x * tiling->tile_shape.WidthInTexels,
+                             y * tiling->tile_shape.HeightInTexels,
+                             z * tiling->tile_shape.DepthInTexels};
+      const WMTSize size{
+          std::min<UINT64>(tiling->tile_shape.WidthInTexels,
+                           current_subresource_size.width > origin.x
+                               ? current_subresource_size.width - origin.x
+                               : 0),
+          std::min<UINT64>(tiling->tile_shape.HeightInTexels,
+                           current_subresource_size.height > origin.y
+                               ? current_subresource_size.height - origin.y
+                               : 0),
+          std::min<UINT64>(tiling->tile_shape.DepthInTexels,
+                           current_subresource_size.depth > origin.z
+                               ? current_subresource_size.depth - origin.z
+                               : 0)};
+      if (!size.width || !size.height || !size.depth)
+        return false;
+      const UINT block_width = D3D12BlitBlockWidth(format);
+      const UINT block_height = D3D12BlitBlockHeight(format);
+      const UINT element_size = D3D12BlitElementSize(format);
+      const UINT row_pitch = static_cast<UINT>(
+          AlignUp(((size.width + block_width - 1) / block_width) * element_size,
+                  D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+      const UINT row_count =
+          std::max<UINT>(1, (size.height + block_height - 1) / block_height);
+      const UINT image_pitch = row_pitch * row_count;
+      chunk->emitcc([texture, buffer, buffer_offset, level, slice, origin, size,
+                     row_pitch, image_pitch, buffer_to_texture](
+                        ArgumentEncodingContext &enc) {
+        enc.startBlitPass();
+        if (buffer_to_texture) {
+          auto [src, src_offset] =
+              enc.access(buffer, buffer_offset,
+                         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
+                         ResourceAccess::Read);
+          auto dst = enc.access(texture, level, slice, ResourceAccess::Write);
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          copy.type = WMTBlitCommandCopyFromBufferToTexture;
+          copy.src = src->buffer();
+          copy.src_offset = src_offset + buffer_offset;
+          copy.bytes_per_row = row_pitch;
+          copy.bytes_per_image = image_pitch;
+          copy.size = size;
+          copy.dst = dst;
+          copy.slice = slice;
+          copy.level = level;
+          copy.origin = origin;
+        } else {
+          auto src = enc.access(texture, level, slice, ResourceAccess::Read);
+          auto [dst, dst_offset] =
+              enc.access(buffer, buffer_offset,
+                         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
+                         ResourceAccess::Write);
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+          copy.src = src;
+          copy.slice = slice;
+          copy.level = level;
+          copy.origin = origin;
+          copy.size = size;
+          copy.dst = dst->buffer();
+          copy.offset = dst_offset + buffer_offset;
+          copy.bytes_per_row = row_pitch;
+          copy.bytes_per_image = image_pitch;
+        }
+        enc.endPass();
+      });
+      return true;
+    });
+    if (!ok) {
+      WARN("D3D12CommandQueue: TODO CopyTiles invalid region"
+           " tiled=", record.tiled_resource.ptr(),
+           " subresource=", record.start.Subresource,
+           " x=", record.start.X,
+           " y=", record.start.Y,
+           " z=", record.start.Z);
+    }
+  }
+
   void ReplayClearRenderTarget(CommandChunk *chunk,
                                const ClearRenderTargetRecord &record) {
     auto *resource = GetResource(record.descriptor.resource.ptr());
@@ -7607,9 +9816,7 @@ private:
       return;
     }
 
-    WARN_FILE_ONLY("D3D12CommandQueue: DiscardResource treated as conservative no-op");
-    EmitResourceAccessBarrier(chunk, *resource, 0, GetSubresourceCount(*resource),
-                              ResourceAccess::All);
+    (void)chunk;
   }
 
   enum class PendingOperationType {
@@ -7667,20 +9874,83 @@ private:
   };
 
   void EnqueuePendingOperation(PendingOperation &&operation) {
-    std::lock_guard lock(mutex_);
-    if (operation.type == PendingOperationType::Wait)
-      has_waited_ = true;
-    pending_operations_.push_back(std::move(operation));
-    DrainPendingOperationsLocked();
+    bool should_drain = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (operation.type == PendingOperationType::Wait)
+        has_waited_ = true;
+      pending_operations_.push_back(std::move(operation));
+      if (!draining_pending_operations_) {
+        draining_pending_operations_ = true;
+        should_drain = true;
+      }
+    }
+    if (should_drain)
+      DrainPendingOperations();
   }
 
-  void DrainPendingOperationsLocked() {
-    if (draining_pending_operations_)
-      return;
+  void DrainPendingOperations() {
+    for (;;) {
+      PendingOperation operation;
+      bool has_operation = false;
+      Fence *wait_fence = nullptr;
+      UINT64 wait_value = 0;
+      bool arm_wait_callback = false;
 
-    draining_pending_operations_ = true;
-    while (!pending_operations_.empty()) {
-      auto &operation = pending_operations_.front();
+      {
+        std::lock_guard lock(mutex_);
+        if (pending_operations_.empty()) {
+          draining_pending_operations_ = false;
+          return;
+        }
+
+        auto &front = pending_operations_.front();
+        if (front.type == PendingOperationType::Wait &&
+            !front.wait_completed &&
+            front.fence->GetCompletedValue() < front.value) {
+          if (!front.wait_callback_armed) {
+            front.wait_callback_armed = true;
+            wait_fence = front.fence;
+            wait_value = front.value;
+            AddRefPrivate();
+            arm_wait_callback = true;
+          }
+          draining_pending_operations_ = false;
+        } else {
+          operation = std::move(front);
+          pending_operations_.pop_front();
+          has_operation = true;
+        }
+      }
+
+      if (arm_wait_callback) {
+        auto callback = [this, wait_fence, wait_value]() {
+          bool should_drain = false;
+          {
+            std::lock_guard lock(mutex_);
+            if (!pending_operations_.empty()) {
+              auto &front = pending_operations_.front();
+              if (front.type == PendingOperationType::Wait &&
+                  front.fence == wait_fence && front.value == wait_value) {
+                front.wait_completed = true;
+              }
+            }
+            if (!draining_pending_operations_) {
+              draining_pending_operations_ = true;
+              should_drain = true;
+            }
+          }
+          if (should_drain)
+            DrainPendingOperations();
+          ReleasePrivate();
+        };
+        wait_fence->AddCompletionCallback(wait_value, std::move(callback));
+        return;
+      }
+
+      if (!has_operation)
+        return;
+
       switch (operation.type) {
       case PendingOperationType::Execute: {
         std::lock_guard resource_state_lock(resource_states_->mutex);
@@ -7699,45 +9969,15 @@ private:
         });
         device_->GetDXMTDevice().queue().CommitCurrentChunk();
         submitted_batches_++;
-        pending_operations_.pop_front();
         break;
       }
       case PendingOperationType::Signal:
         SubmitFenceSignal(operation.fence, operation.value);
-        pending_operations_.pop_front();
         break;
       case PendingOperationType::Wait:
-        if (!operation.wait_completed &&
-            operation.fence->GetCompletedValue() < operation.value) {
-          if (operation.wait_callback_armed) {
-            draining_pending_operations_ = false;
-            return;
-          }
-          auto *fence = operation.fence;
-          auto value = operation.value;
-          AddRefPrivate();
-          draining_pending_operations_ = false;
-          operation.wait_callback_armed = true;
-          auto callback = [this, fence, value]() {
-            std::lock_guard lock(mutex_);
-            if (!pending_operations_.empty()) {
-              auto &front = pending_operations_.front();
-              if (front.type == PendingOperationType::Wait &&
-                  front.fence == fence && front.value == value) {
-                front.wait_completed = true;
-              }
-            }
-            DrainPendingOperationsLocked();
-            ReleasePrivate();
-          };
-          fence->AddCompletionCallback(value, std::move(callback));
-          return;
-        }
-        pending_operations_.pop_front();
         break;
       }
     }
-    draining_pending_operations_ = false;
   }
 
   void SubmitFenceSignal(Fence *state, UINT64 value) {

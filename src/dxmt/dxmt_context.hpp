@@ -587,8 +587,11 @@ public:
     auto allocation = buffer->current();
     uint64_t encoder_id = currentEncoder()->id;
     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
-    if (CheckResourceResidency(buffer->residency(viewId, allocation), encoder_id, requested)) {
-      makeResident<stage, kind>(buffer->view(viewId, allocation), requested);
+    auto *view = buffer->tryView(viewId, allocation);
+    if (!view || !view->texture)
+      return;
+    if (CheckResourceResidency(view->residency, encoder_id, requested)) {
+      makeResident<stage, kind>(view->texture, requested);
     };
   }
   template <PipelineStage stage, PipelineKind kind>

@@ -34,6 +34,31 @@ struct BufferGpuVirtualAddressRange {
 std::mutex g_buffer_va_mutex;
 std::vector<BufferGpuVirtualAddressRange> g_buffer_va_ranges;
 
+bool ShouldLogRepeatedGpuVaWarning(std::atomic<uint32_t> &counter) {
+  const uint32_t count = counter.fetch_add(1, std::memory_order_relaxed);
+  return count < 8 || (count & (count - 1)) == 0;
+}
+
+bool BufferGpuVirtualAddressRangeContains(
+    const BufferGpuVirtualAddressRange &range,
+    D3D12_GPU_VIRTUAL_ADDRESS address) {
+  if (!range.base || !range.size)
+    return false;
+  const UINT64 offset = address - range.base;
+  return address >= range.base && offset < range.size;
+}
+
+bool BufferGpuVirtualAddressRangesOverlap(
+    D3D12_GPU_VIRTUAL_ADDRESS a_base, UINT64 a_size,
+    D3D12_GPU_VIRTUAL_ADDRESS b_base, UINT64 b_size) {
+  if (!a_base || !a_size || !b_base || !b_size)
+    return false;
+  const UINT64 a_offset = b_base - a_base;
+  const UINT64 b_offset = a_base - b_base;
+  return (b_base >= a_base && a_offset < a_size) ||
+         (a_base >= b_base && b_offset < b_size);
+}
+
 void RegisterBufferGpuVirtualAddress(Resource *resource,
                                      D3D12_GPU_VIRTUAL_ADDRESS base,
                                      UINT64 size) {
@@ -41,6 +66,28 @@ void RegisterBufferGpuVirtualAddress(Resource *resource,
     return;
 
   std::lock_guard lock(g_buffer_va_mutex);
+  std::erase_if(g_buffer_va_ranges,
+                [resource](const BufferGpuVirtualAddressRange &range) {
+                  return range.resource == resource;
+                });
+  size_t removed_overlaps = 0;
+  std::erase_if(g_buffer_va_ranges,
+                [&](const BufferGpuVirtualAddressRange &range) {
+                  const bool overlaps = BufferGpuVirtualAddressRangesOverlap(
+                      base, size, range.base, range.size);
+                  if (overlaps)
+                    removed_overlaps++;
+                  return overlaps;
+                });
+  if (removed_overlaps) {
+    static std::atomic<uint32_t> overlap_log_count = 0;
+    if (ShouldLogRepeatedGpuVaWarning(overlap_log_count)) {
+      WARN("D3D12Resource: GPU virtual address range replaced overlapping"
+           " registrations base=", uint64_t(base),
+           " size=", size,
+           " overlapCount=", removed_overlaps);
+    }
+  }
   g_buffer_va_ranges.push_back({base, size, resource});
 }
 
@@ -497,10 +544,15 @@ public:
                const D3D12_RESOURCE_DESC &desc,
                D3D12_RESOURCE_STATES initial_state,
                UINT64 heap_offset,
-               const D3D12_CLEAR_VALUE *optimized_clear_value)
+               const D3D12_CLEAR_VALUE *optimized_clear_value,
+               ResourceKind kind,
+               dxmt::Buffer *placed_buffer = nullptr,
+               dxmt::BufferAllocation *placed_buffer_allocation = nullptr)
       : device_(device), heap_properties_(heap_properties),
         heap_flags_(heap_flags), desc_(desc), initial_state_(initial_state),
-        heap_offset_(heap_offset),
+        heap_offset_(heap_offset), kind_(kind),
+        placed_buffer_(placed_buffer),
+        placed_buffer_allocation_(placed_buffer_allocation),
         has_clear_value_(optimized_clear_value != nullptr) {
     if (optimized_clear_value)
       clear_value_ = *optimized_clear_value;
@@ -509,10 +561,17 @@ public:
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !desc_.MipLevels)
       desc_.MipLevels = GetMaxMipLevels(desc_);
 
-    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    if (kind_ == ResourceKind::ReservedTexture &&
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      WARN("D3D12Resource: TODO CreateReservedResource(buffer) unsupported"
+           " width=", desc_.Width,
+           " flags=", desc_.Flags,
+           " layout=", desc_.Layout);
+    } else if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
       CreateBuffer();
-    else
+    } else {
       CreateTexture();
+    }
   }
 
   ~ResourceImpl() {
@@ -563,33 +622,52 @@ public:
 
   HRESULT STDMETHODCALLTYPE Map(UINT sub_resource, const D3D12_RANGE *read_range,
                                 void **data) override {
-    if (sub_resource >= GetTextureSubresourceCount(desc_))
-      return WARN_E_INVALIDARG(__func__);
+    HRESULT hr = S_OK;
+    void *mapped = nullptr;
+    if (sub_resource >= GetTextureSubresourceCount(desc_)) {
+      hr = E_INVALIDARG;
+      WARN(__func__, ": invalid subresource");
+      goto done;
+    }
 
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
       if (sub_resource != 0 || !buffer_allocation_ ||
-          !buffer_allocation_->mappedMemory(0))
-        return WARN_E_INVALIDARG(__func__);
+          !buffer_allocation_->mappedMemory(0)) {
+        hr = E_INVALIDARG;
+        WARN(__func__, ": buffer is not mappable");
+        goto done;
+      }
 
-      if (data)
-        *data = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
-                heap_offset_;
-      return S_OK;
+      mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
+               heap_offset_;
+      goto done;
     }
 
     if (!texture_allocation_ ||
-        !IsTextureSubresourceMappable(desc_, sub_resource, heap_properties_))
-      return WARN_E_INVALIDARG(__func__);
+        !IsTextureSubresourceMappable(desc_, sub_resource, heap_properties_)) {
+      hr = E_INVALIDARG;
+      WARN(__func__, ": texture subresource is not mappable");
+      goto done;
+    }
 
     if (!data)
-      return S_OK;
+      goto done;
 
     if (!texture_allocation_->mappedMemory ||
-        !IsCpuLinearTextureSubresource(desc_, sub_resource))
-      return WARN_E_INVALIDARG(__func__);
+        !IsCpuLinearTextureSubresource(desc_, sub_resource)) {
+      hr = E_INVALIDARG;
+      WARN(__func__, ": texture allocation has no CPU-linear mapped memory");
+      goto done;
+    }
 
-    *data = texture_allocation_->mappedMemory;
-    return S_OK;
+    mapped = texture_allocation_->mappedMemory;
+
+  done:
+    if (data)
+      *data = SUCCEEDED(hr) ? mapped : nullptr;
+    dxmt::apitrace::record_resource_map(
+        this, sub_resource, read_range, SUCCEEDED(hr) && mapped != nullptr, hr);
+    return hr;
   }
 
   void STDMETHODCALLTYPE Unmap(UINT sub_resource,
@@ -677,6 +755,63 @@ public:
     *heap_properties = heap_properties_;
     *flags = heap_flags_;
     return S_OK;
+  }
+
+  ResourceKind GetKind() const override {
+    return kind_;
+  }
+
+  bool IsReservedTexture() const override {
+    return kind_ == ResourceKind::ReservedTexture;
+  }
+
+  const ResourceTiling *GetTiling() const override {
+    return has_tiling_ ? &tiling_ : nullptr;
+  }
+
+  bool UpdateTileMapping(UINT subresource, UINT x, UINT y, UINT z,
+                         ID3D12Heap *heap, bool mapped,
+                         UINT64 heap_tile) override {
+    if (!has_tiling_ || subresource >= tiling_.subresources.size())
+      return false;
+    const auto &tile = tiling_.subresources[subresource];
+    if (x >= tile.width_in_tiles || y >= tile.height_in_tiles ||
+        z >= tile.depth_in_tiles)
+      return false;
+    const UINT index = tile.start_tile_index +
+                       (z * tile.height_in_tiles + y) *
+                           tile.width_in_tiles +
+                       x;
+    if (index >= tile_map_.size())
+      return false;
+    if (mapped) {
+      tile_map_[index].heap = heap;
+      tile_map_[index].heap_tile = static_cast<int64_t>(heap_tile);
+    } else {
+      tile_map_[index] = {};
+      tile_map_[index].heap_tile = -1;
+    }
+    return true;
+  }
+
+  bool GetTileMapping(UINT subresource, UINT x, UINT y, UINT z,
+                      ResourceTileMapping &mapping) const override {
+    mapping = {};
+    mapping.heap_tile = -1;
+    if (!has_tiling_ || subresource >= tiling_.subresources.size())
+      return false;
+    const auto &tile = tiling_.subresources[subresource];
+    if (x >= tile.width_in_tiles || y >= tile.height_in_tiles ||
+        z >= tile.depth_in_tiles)
+      return false;
+    const UINT index = tile.start_tile_index +
+                       (z * tile.height_in_tiles + y) *
+                           tile.width_in_tiles +
+                       x;
+    if (index >= tile_map_.size())
+      return false;
+    mapping = tile_map_[index];
+    return true;
   }
 
   const D3D12_RESOURCE_DESC &GetResourceDesc() const override {
@@ -1082,11 +1217,22 @@ private:
   }
 
   void CreateBuffer() {
-    buffer_ = new dxmt::Buffer(desc_.Width + heap_offset_,
-                               device_->GetDXMTDevice().device());
-    buffer_allocation_ =
-        buffer_->allocate(GetHeapBufferAllocationFlags(heap_properties_));
-    buffer_->rename(Rc<dxmt::BufferAllocation>(buffer_allocation_));
+    if (placed_buffer_allocation_) {
+      buffer_ = placed_buffer_;
+      buffer_allocation_ = placed_buffer_allocation_;
+      if (!buffer_) {
+        WARN("D3D12Resource: placed buffer resource is missing heap backing"
+             " width=", desc_.Width,
+             " heapOffset=", heap_offset_,
+             " heapFlags=", heap_flags_);
+      }
+    } else {
+      buffer_ = new dxmt::Buffer(desc_.Width + heap_offset_,
+                                 device_->GetDXMTDevice().device());
+      buffer_allocation_ =
+          buffer_->allocate(GetHeapBufferAllocationFlags(heap_properties_));
+      buffer_->rename(Rc<dxmt::BufferAllocation>(buffer_allocation_));
+    }
     RegisterBufferGpuVirtualAddress(this, GetGpuVirtualAddress(), desc_.Width);
   }
 
@@ -1103,6 +1249,47 @@ private:
     if (plane_count > plane_textures_.size()) {
       WARN("D3D12Resource: unsupported texture plane count ", plane_count);
       return;
+    }
+    if (kind_ == ResourceKind::ReservedTexture && plane_count != 1) {
+      WARN("D3D12Resource: TODO reserved texture split-plane backing unsupported"
+           " format=", desc_.Format,
+           " planes=", plane_count,
+           " width=", desc_.Width,
+           " height=", desc_.Height);
+      return;
+    }
+    if (kind_ == ResourceKind::ReservedTexture) {
+      if (!device_->GetDXMTDevice().device().supportsPlacementSparse()) {
+        WARN("D3D12Resource: TODO reserved texture requires Metal4 placement sparse"
+             " format=", desc_.Format,
+             " width=", desc_.Width,
+             " height=", desc_.Height,
+             " depthOrArray=", desc_.DepthOrArraySize,
+             " flags=", desc_.Flags,
+             " layout=", desc_.Layout);
+        return;
+      }
+      if (desc_.SampleDesc.Count > 1) {
+        WARN("D3D12Resource: TODO reserved MSAA texture unsupported"
+             " format=", desc_.Format,
+             " samples=", desc_.SampleDesc.Count,
+             " width=", desc_.Width,
+             " height=", desc_.Height,
+             " flags=", desc_.Flags);
+        return;
+      }
+      if (desc_.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+          desc_.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE &&
+          desc_.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
+        WARN("D3D12Resource: TODO reserved texture layout unsupported"
+             " format=", desc_.Format,
+             " width=", desc_.Width,
+             " height=", desc_.Height,
+             " layout=", desc_.Layout,
+             " flags=", desc_.Flags);
+        return;
+      }
+      flags.set(dxmt::TextureAllocationFlag::PlacementSparse);
     }
 
     const bool cpu_linear_candidate =
@@ -1133,6 +1320,22 @@ private:
           std::min(GetMipLevels(desc_), GetMaxMipLevels(desc_));
       info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
       info.usage = GetTextureUsage(desc_.Flags);
+      if (kind_ == ResourceKind::ReservedTexture) {
+        WMTSparseTileSize tile_size = {};
+        if (!device_->GetDXMTDevice().device().sparseTileSize(info,
+                                                             tile_size)) {
+          WARN("D3D12Resource: TODO unsupported sparse texture format"
+               " format=", desc_.Format,
+               " metalFormat=", info.pixel_format,
+               " type=", info.type,
+               " width=", desc_.Width,
+               " height=", desc_.Height,
+               " depthOrArray=", desc_.DepthOrArraySize,
+               " flags=", desc_.Flags);
+          return;
+        }
+        BuildTilingMetadata(tile_size);
+      }
 
       TextureSubresourceLayout layout = {};
       const bool linear_cpu_texture =
@@ -1162,9 +1365,102 @@ private:
       }
     }
 
-    if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
+    if (kind_ != ResourceKind::ReservedTexture &&
+        GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
       InitializeTextureContents(first_pixel_format);
     }
+  }
+
+  void BuildTilingMetadata(const WMTSparseTileSize &tile_size) {
+    tiling_ = {};
+    const UINT tile_width = std::max<UINT>(1, static_cast<UINT>(tile_size.width));
+    const UINT tile_height = std::max<UINT>(1, static_cast<UINT>(tile_size.height));
+    const UINT tile_depth = std::max<UINT>(1, static_cast<UINT>(tile_size.depth));
+    tiling_.tile_shape.WidthInTexels = tile_width;
+    tiling_.tile_shape.HeightInTexels = tile_height;
+    tiling_.tile_shape.DepthInTexels = tile_depth;
+
+    const UINT mip_levels = GetMipLevels(desc_);
+    const UINT plane_count = GetTextureLogicalPlaneCount(desc_);
+    const UINT array_size =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : desc_.DepthOrArraySize;
+    UINT standard_mips = 0;
+    for (; standard_mips < mip_levels; ++standard_mips) {
+      const UINT64 width =
+          std::max<UINT64>(1, GetTexturePlaneWidth(desc_, 0) >> standard_mips);
+      const UINT height = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                              ? 1
+                              : std::max<UINT>(
+                                    1, GetTexturePlaneHeight(desc_, 0) >> standard_mips);
+      const UINT depth = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                             ? std::max<UINT>(1, desc_.DepthOrArraySize >> standard_mips)
+                             : 1;
+      bool standard = width >= tile_width;
+      if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+        standard &= height >= tile_height;
+      if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        standard &= depth >= tile_depth;
+      if (!standard)
+        break;
+    }
+    tiling_.packed_mip_info.NumStandardMips = standard_mips;
+    tiling_.packed_mip_info.NumPackedMips = mip_levels - standard_mips;
+    tiling_.packed_mip_info.NumTilesForPackedMips =
+        tiling_.packed_mip_info.NumPackedMips ? 1 : 0;
+    tiling_.packed_mip_info.StartTileIndexInOverallResource = 0;
+
+    tiling_.subresources.reserve(mip_levels * array_size * plane_count);
+    UINT next_tile = 0;
+    bool packed_start_set = false;
+    for (UINT plane = 0; plane < plane_count; ++plane) {
+      for (UINT slice = 0; slice < array_size; ++slice) {
+        for (UINT mip = 0; mip < mip_levels; ++mip) {
+          const UINT64 width = std::max<UINT64>(1, GetTexturePlaneWidth(desc_, plane) >> mip);
+          const UINT height = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                                  ? 1
+                                  : std::max<UINT>(1, GetTexturePlaneHeight(desc_, plane) >> mip);
+          const UINT depth = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                 ? std::max<UINT>(1, desc_.DepthOrArraySize >> mip)
+                                 : 1;
+          SubresourceTiling subresource = {};
+          subresource.width_in_tiles =
+              static_cast<UINT>((width + tile_size.width - 1) / tile_size.width);
+          subresource.height_in_tiles =
+              static_cast<UINT16>((height + tile_size.height - 1) / tile_size.height);
+          subresource.depth_in_tiles =
+              static_cast<UINT16>((depth + tile_size.depth - 1) / tile_size.depth);
+          subresource.start_tile_index = next_tile;
+          subresource.mip_level = mip;
+          subresource.array_slice = slice;
+          subresource.plane = plane;
+          if (mip < standard_mips) {
+            next_tile += subresource.width_in_tiles *
+                         subresource.height_in_tiles *
+                         subresource.depth_in_tiles;
+          } else {
+            if (mip == standard_mips) {
+              if (!packed_start_set) {
+                tiling_.packed_mip_info.StartTileIndexInOverallResource = next_tile;
+                packed_start_set = true;
+              }
+              ++next_tile;
+            }
+            subresource.width_in_tiles = 0;
+            subresource.height_in_tiles = 0;
+            subresource.depth_in_tiles = 0;
+            subresource.start_tile_index = D3D12_PACKED_TILE;
+          }
+          tiling_.subresources.push_back(subresource);
+        }
+      }
+    }
+    tiling_.total_tile_count = next_tile;
+    tile_map_.assign(next_tile, {});
+    for (auto &mapping : tile_map_)
+      mapping.heap_tile = -1;
+    has_tiling_ = true;
   }
 
   void InitializeTextureContents(WMTPixelFormat pixel_format) {
@@ -1231,8 +1527,14 @@ private:
   D3D12_RESOURCE_DESC desc_ = {};
   D3D12_RESOURCE_STATES initial_state_ = D3D12_RESOURCE_STATE_COMMON;
   UINT64 heap_offset_ = 0;
+  ResourceKind kind_ = ResourceKind::Committed;
+  Rc<dxmt::Buffer> placed_buffer_;
+  Rc<dxmt::BufferAllocation> placed_buffer_allocation_;
   D3D12_CLEAR_VALUE clear_value_ = {};
   bool has_clear_value_ = false;
+  bool has_tiling_ = false;
+  ResourceTiling tiling_ = {};
+  std::vector<ResourceTileMapping> tile_map_;
   Rc<dxmt::Buffer> buffer_;
   Rc<dxmt::BufferAllocation> buffer_allocation_;
   Rc<dxmt::Texture> texture_;
@@ -1249,8 +1551,9 @@ Resource *
 LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                                         UINT64 *offset) {
   std::lock_guard lock(g_buffer_va_mutex);
-  for (const auto &range : g_buffer_va_ranges) {
-    if (address >= range.base && address < range.base + range.size) {
+  for (auto it = g_buffer_va_ranges.rbegin(); it != g_buffer_va_ranges.rend(); ++it) {
+    const auto &range = *it;
+    if (BufferGpuVirtualAddressRangeContains(range, address)) {
       if (offset)
         *offset = address - range.base;
       return range.resource;
@@ -1327,10 +1630,14 @@ CreateResource(IMTLD3D12Device *device,
                const D3D12_HEAP_PROPERTIES *heap_properties,
                D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc,
                D3D12_RESOURCE_STATES initial_state, UINT64 heap_offset,
-               const D3D12_CLEAR_VALUE *optimized_clear_value) {
+               const D3D12_CLEAR_VALUE *optimized_clear_value,
+               ResourceKind kind,
+               dxmt::Buffer *placed_buffer,
+               dxmt::BufferAllocation *placed_buffer_allocation) {
   return Com<ID3D12Resource>::transfer(
       new ResourceImpl(device, *heap_properties, heap_flags, *desc,
-                       initial_state, heap_offset, optimized_clear_value));
+                       initial_state, heap_offset, optimized_clear_value,
+                       kind, placed_buffer, placed_buffer_allocation));
 }
 
 } // namespace dxmt::d3d12

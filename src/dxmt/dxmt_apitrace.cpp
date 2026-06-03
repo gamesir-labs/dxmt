@@ -29,6 +29,10 @@ std::atomic_bool seal_after_frame_metal_done = false;
 std::atomic_bool seal_after_frame_d3d_done = false;
 std::atomic_bool session_open_logged = false;
 std::atomic_bool shutdown_requested = false;
+#ifdef _WIN32
+std::atomic_bool crash_flush_handler_installed = false;
+std::atomic_bool crash_flush_running = false;
+#endif
 
 bool
 truthy_env_value(const std::string &value) {
@@ -137,6 +141,56 @@ initialize_bundle_root() {
   }
 }
 
+#ifdef _WIN32
+bool
+is_debug_exception(DWORD code) {
+  return code == DBG_PRINTEXCEPTION_C ||
+         code == DBG_PRINTEXCEPTION_WIDE_C ||
+         code == DBG_CONTROL_C ||
+         code == DBG_CONTROL_BREAK;
+}
+
+void
+flush_sessions_for_crash() {
+  if (!enabled())
+    return;
+
+  if (shutdown_requested.load(std::memory_order_acquire))
+    return;
+
+  if (crash_flush_running.exchange(true, std::memory_order_acq_rel))
+    return;
+
+#ifdef DXMT_APITRACE_D3D
+  ::apitrace::runtime::flush_process_trace_session();
+#endif
+  WMTApitraceSessionFlush();
+  log_verbose("session crash flush");
+  crash_flush_running.store(false, std::memory_order_release);
+}
+
+LONG WINAPI
+apitrace_crash_flush_handler(EXCEPTION_POINTERS *exception_info) {
+  if (!exception_info || !exception_info->ExceptionRecord)
+    return EXCEPTION_CONTINUE_SEARCH;
+
+  const DWORD code = exception_info->ExceptionRecord->ExceptionCode;
+  if (is_debug_exception(code))
+    return EXCEPTION_CONTINUE_SEARCH;
+
+  flush_sessions_for_crash();
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void
+install_crash_flush_handler() {
+  if (crash_flush_handler_installed.exchange(true, std::memory_order_acq_rel))
+    return;
+
+  AddVectoredExceptionHandler(1, apitrace_crash_flush_handler);
+}
+#endif
+
 } // namespace
 
 bool
@@ -155,6 +209,10 @@ ensure_session_open() {
   static std::atomic_bool bundle_initialized = false;
   if (!bundle_initialized.exchange(true, std::memory_order_relaxed))
     initialize_bundle_root();
+
+#ifdef _WIN32
+  install_crash_flush_handler();
+#endif
 
   WMTApitraceSessionEnsureOpen();
   if (!session_open_logged.exchange(true, std::memory_order_relaxed) && verbose_enabled()) {

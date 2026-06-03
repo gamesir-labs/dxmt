@@ -6,8 +6,16 @@
 #include "log/log.hpp"
 #include "util_string.hpp"
 
+#include <atomic>
+
 namespace dxmt::d3d12 {
 namespace {
+
+static bool
+ShouldLogExternalCpuHeapDiag() {
+  static std::atomic<uint32_t> count = 0;
+  return count.fetch_add(1, std::memory_order_relaxed) < 8;
+}
 
 class HeapImpl final : public ComObjectWithInitialRef<ID3D12Heap>,
                        public Heap {
@@ -15,16 +23,19 @@ public:
   HeapImpl(IMTLD3D12Device *device, const D3D12_HEAP_DESC &desc)
       : device_(device), desc_(desc),
         heap_type_(d3d12::GetHeapType(desc.Properties)),
-        cpu_visible_(d3d12::IsCpuVisibleHeap(desc.Properties)),
-        buffer_(new dxmt::Buffer(desc.SizeInBytes,
-                                 device_->GetDXMTDevice().device())) {
+        cpu_visible_(d3d12::IsCpuVisibleHeap(desc.Properties)) {
     if (!desc_.Alignment)
       desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     if (!desc_.Properties.CreationNodeMask)
       desc_.Properties.CreationNodeMask = 1;
     if (!desc_.Properties.VisibleNodeMask)
       desc_.Properties.VisibleNodeMask = 1;
-    allocation_ = buffer_->allocate(GetHeapBufferAllocationFlags(desc.Properties));
+  }
+
+  HeapImpl(IMTLD3D12Device *device, const D3D12_HEAP_DESC &desc,
+           const void *external_address)
+      : HeapImpl(device, desc) {
+    external_address_ = external_address;
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -93,8 +104,55 @@ public:
     return cpu_visible_;
   }
 
+  dxmt::Buffer *GetBuffer() const override {
+    EnsureBufferAllocation();
+    return buffer_.ptr();
+  }
+
   dxmt::BufferAllocation *GetAllocation() const override {
+    EnsureBufferAllocation();
     return allocation_.ptr();
+  }
+
+  void EnsureBufferAllocation() const {
+    if (!allocation_) {
+      buffer_ = new dxmt::Buffer(desc_.SizeInBytes,
+                                 device_->GetDXMTDevice().device());
+      if (external_address_) {
+        if (ShouldLogExternalCpuHeapDiag()) {
+          WARN("D3D12Heap: OpenExistingHeapFromAddress using external CPU backing"
+           " address=", external_address_,
+           " size=", desc_.SizeInBytes,
+           " flags=", desc_.Flags);
+        }
+        allocation_ = buffer_->allocateExternalCpu(
+            GetHeapBufferAllocationFlags(desc_.Properties),
+            const_cast<void *>(external_address_));
+      } else {
+        allocation_ = buffer_->allocate(GetHeapBufferAllocationFlags(desc_.Properties));
+      }
+      buffer_->rename(Rc<dxmt::BufferAllocation>(allocation_));
+    }
+  }
+
+  WMT::Heap GetPlacementHeap() override {
+    if (placement_heap_)
+      return placement_heap_;
+    if (heap_type_ != D3D12_HEAP_TYPE_DEFAULT || cpu_visible_)
+      return {};
+
+    WMTPlacementHeapInfo info = {};
+    info.size = desc_.SizeInBytes;
+    info.options = WMTResourceStorageModePrivate |
+                   WMTResourceHazardTrackingModeUntracked;
+    placement_heap_ =
+        device_->GetDXMTDevice().device().newPlacementHeap(info);
+    if (!placement_heap_) {
+      WARN("D3D12Heap: TODO failed to create Metal4 placement heap"
+           " size=", desc_.SizeInBytes,
+           " flags=", desc_.Flags);
+    }
+    return placement_heap_;
   }
 
 private:
@@ -103,8 +161,10 @@ private:
   D3D12_HEAP_DESC desc_ = {};
   D3D12_HEAP_TYPE heap_type_ = D3D12_HEAP_TYPE_DEFAULT;
   bool cpu_visible_ = false;
-  Rc<dxmt::Buffer> buffer_;
-  Rc<dxmt::BufferAllocation> allocation_;
+  mutable Rc<dxmt::Buffer> buffer_;
+  mutable Rc<dxmt::BufferAllocation> allocation_;
+  WMT::Reference<WMT::Heap> placement_heap_;
+  const void *external_address_ = nullptr;
   std::string name_;
 };
 
@@ -151,6 +211,12 @@ GetHeapBufferAllocationFlags(const D3D12_HEAP_PROPERTIES &properties) {
 Com<ID3D12Heap>
 CreateHeap(IMTLD3D12Device *device, const D3D12_HEAP_DESC *desc) {
   return Com<ID3D12Heap>::transfer(new HeapImpl(device, *desc));
+}
+
+Com<ID3D12Heap>
+CreateExternalCpuHeap(IMTLD3D12Device *device, const D3D12_HEAP_DESC *desc,
+                      const void *address) {
+  return Com<ID3D12Heap>::transfer(new HeapImpl(device, *desc, address));
 }
 
 } // namespace dxmt::d3d12

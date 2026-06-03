@@ -3,6 +3,7 @@
 #include "dxmt_apitrace.hpp"
 
 #include <d3d12.h>
+#include "winemetal.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,7 @@ enum class D3DObjectKind {
   CommandSignature,
   Fence,
   SwapChain,
+  Heap,
   Resource,
   View,
   Shader,
@@ -251,6 +253,11 @@ uint64_t record_copy_texture_region(const void *command_list,
                                     const D3D12_BOX *src_box);
 uint64_t record_copy_resource(const void *command_list, const void *dst_resource,
                               const void *src_resource);
+uint64_t record_copy_tiles(const void *command_list, const void *tiled_resource,
+                           const D3D12_TILED_RESOURCE_COORDINATE *start,
+                           const D3D12_TILE_REGION_SIZE *size,
+                           const void *buffer, uint64_t buffer_offset,
+                           uint32_t flags);
 uint64_t record_resolve_subresource(const void *command_list,
                                     const void *dst_resource,
                                     uint32_t dst_subresource,
@@ -356,6 +363,29 @@ uint64_t record_temporal_upscale(
     float motion_vector_scale_x, float motion_vector_scale_y,
     float pre_exposure, const void *exposure_texture, float jitter_offset_x,
     float jitter_offset_y);
+uint64_t record_get_resource_tiling(
+    const void *device, const void *resource, uint32_t total_tile_count,
+    const D3D12_PACKED_MIP_INFO *packed_mip_info,
+    const D3D12_TILE_SHAPE *standard_tile_shape,
+    uint32_t subresource_tiling_count, uint32_t first_subresource_tiling,
+    const D3D12_SUBRESOURCE_TILING *subresource_tilings);
+uint64_t record_update_tile_mappings(
+    const void *queue, const void *resource, uint32_t region_count,
+    const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
+    const D3D12_TILE_REGION_SIZE *region_sizes, const void *heap,
+    uint32_t range_count, const D3D12_TILE_RANGE_FLAGS *range_flags,
+    const uint32_t *heap_range_offsets, const uint32_t *range_tile_counts,
+    uint32_t flags);
+uint64_t record_copy_tile_mappings(
+    const void *queue, const void *dst_resource,
+    const D3D12_TILED_RESOURCE_COORDINATE *dst_start,
+    const void *src_resource,
+    const D3D12_TILED_RESOURCE_COORDINATE *src_start,
+    const D3D12_TILE_REGION_SIZE *region_size, uint32_t flags);
+uint64_t record_sparse_texture_mapping_ops(
+    const void *queue, const void *resource, const void *heap,
+    const char *source, const WMTSparseTextureMappingOperation *ops,
+    size_t op_count);
 
 void on_d3d12_create_device(void *device);
 void on_d3d11_create_device(void *device);
@@ -371,6 +401,14 @@ void record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
 void record_resource_unmap(const void *resource, uint32_t subresource,
                            uint64_t written_begin, uint64_t written_end,
                            const void *written_data, size_t written_size);
+uint64_t record_resource_map(const void *resource, uint32_t subresource,
+                             const D3D12_RANGE *read_range, bool mapped,
+                             int32_t result_code);
+void record_resolve_query_data_result(
+    const void *command_list, const void *query_heap, uint32_t type,
+    uint32_t start_index, uint32_t query_count, const void *dst_buffer,
+    uint64_t aligned_dst_buffer_offset, const void *resolved_data,
+    size_t resolved_size);
 void on_fence_dependency(
     const char *scope,
     uint64_t d3d_sequence,
@@ -436,6 +474,7 @@ inline uint64_t record_execute_bundle(const void *, const void *) { return 0; }
 inline uint64_t record_copy_buffer_region(const char *, const void *, const void *, uint64_t, const void *, uint64_t, uint64_t) { return 0; }
 inline uint64_t record_copy_texture_region(const void *, const D3D12_TEXTURE_COPY_LOCATION *, uint32_t, uint32_t, uint32_t, const D3D12_TEXTURE_COPY_LOCATION *, const D3D12_BOX *) { return 0; }
 inline uint64_t record_copy_resource(const void *, const void *, const void *) { return 0; }
+inline uint64_t record_copy_tiles(const void *, const void *, const D3D12_TILED_RESOURCE_COORDINATE *, const D3D12_TILE_REGION_SIZE *, const void *, uint64_t, uint32_t) { return 0; }
 inline uint64_t record_resolve_subresource(const void *, const void *, uint32_t, const void *, uint32_t, uint32_t) { return 0; }
 inline uint64_t record_ia_set_primitive_topology(const void *, uint32_t) { return 0; }
 inline uint64_t record_rs_set_viewports(const void *, uint32_t, const D3D12_VIEWPORT *) { return 0; }
@@ -467,6 +506,10 @@ inline uint64_t record_write_buffer_immediate(const void *, uint32_t, const D3D1
 inline uint64_t record_begin_render_pass(const void *, uint32_t, const RenderPassRenderTargetDesc *, const RenderPassDepthStencilDesc *, uint32_t) { return 0; }
 inline uint64_t record_end_render_pass(const void *) { return 0; }
 inline uint64_t record_temporal_upscale(const void *, uint32_t, uint32_t, bool, bool, bool, bool, const void *, const void *, const void *, const void *, float, float, float, const void *, float, float) { return 0; }
+inline uint64_t record_get_resource_tiling(const void *, const void *, uint32_t, const D3D12_PACKED_MIP_INFO *, const D3D12_TILE_SHAPE *, uint32_t, uint32_t, const D3D12_SUBRESOURCE_TILING *) { return 0; }
+inline uint64_t record_update_tile_mappings(const void *, const void *, uint32_t, const D3D12_TILED_RESOURCE_COORDINATE *, const D3D12_TILE_REGION_SIZE *, const void *, uint32_t, const D3D12_TILE_RANGE_FLAGS *, const uint32_t *, const uint32_t *, uint32_t) { return 0; }
+inline uint64_t record_copy_tile_mappings(const void *, const void *, const D3D12_TILED_RESOURCE_COORDINATE *, const void *, const D3D12_TILED_RESOURCE_COORDINATE *, const D3D12_TILE_REGION_SIZE *, uint32_t) { return 0; }
+inline uint64_t record_sparse_texture_mapping_ops(const void *, const void *, const void *, const char *, const WMTSparseTextureMappingOperation *, size_t) { return 0; }
 inline void on_d3d12_create_device(void *) {}
 inline void on_d3d11_create_device(void *) {}
 inline void on_dxgi_create_swapchain(void *, void *, void *) {}
@@ -477,6 +520,11 @@ inline void record_present_frame(uint64_t, uint32_t, uint32_t, uint32_t,
                                  uint32_t, uint32_t, const void *, size_t) {}
 inline void record_resource_unmap(const void *, uint32_t, uint64_t, uint64_t,
                                   const void *, size_t) {}
+inline uint64_t record_resource_map(const void *, uint32_t,
+                                    const D3D12_RANGE *, bool, int32_t) { return 0; }
+inline void record_resolve_query_data_result(
+    const void *, const void *, uint32_t, uint32_t, uint32_t, const void *,
+    uint64_t, const void *, size_t) {}
 inline void on_fence_dependency(
     const char *,
     uint64_t,

@@ -259,6 +259,12 @@ CommandQueue::WaitForFinishThread() {
     if (chunk.signal_frame_latency_fence_ != ~0ull)
       frame_latency_fence_.signal(chunk.signal_frame_latency_fence_);
 
+    chunk.readback.visibility = {};
+    chunk.readback.timestamp = {};
+    for (auto &callback : chunk.completion_callbacks)
+      callback();
+    chunk.completion_callbacks.clear();
+
     EnqueueReadbacks(chunk);
     chunk.reset();
     cpu_coherent.signal(internal_seq);
@@ -286,6 +292,8 @@ CommandQueue::EnqueueReadbacks(CommandChunk &chunk) {
   for (auto &diagnostic : chunk.readback.diagnostics)
     callbacks.push_back(std::move(diagnostic));
   chunk.readback.diagnostics.clear();
+  chunk.readback.visibility = {};
+  chunk.readback.timestamp = {};
   for (auto &readback : chunk.deferred_readbacks)
     callbacks.push_back(std::move(readback));
   chunk.deferred_readbacks.clear();
