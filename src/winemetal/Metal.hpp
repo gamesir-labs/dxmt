@@ -222,6 +222,10 @@ class Resource : public Object {
 public:
 };
 
+class Heap : public Object {
+public:
+};
+
 class Texture : public Resource {
 public:
   Reference<Texture>
@@ -774,6 +778,30 @@ public:
   Reference<Texture>
   newTexture(WMTTextureInfo &info) {
     return Reference<Texture>(MTLDevice_newTexture(handle, &info));
+  }
+
+  bool
+  supportsPlacementSparse() const {
+    return MTLDevice_supportsPlacementSparse(handle);
+  }
+
+  bool
+  sparseTileSize(const WMTTextureInfo &info, WMTSparseTileSize &tile_size) const {
+    return MTLDevice_sparseTileSize(handle, &info, &tile_size);
+  }
+
+  Reference<Heap>
+  newPlacementHeap(const WMTPlacementHeapInfo &info) {
+    return Reference<Heap>(MTLDevice_newPlacementHeap(handle, &info));
+  }
+
+  bool
+  updateSparseTextureMappings(Texture texture, Heap heap,
+                              const WMTSparseTextureMappingOperation *operations,
+                              uint64_t operation_count) const {
+    return MTLDevice_updateSparseTextureMappings(handle, texture.handle,
+                                                 heap.handle, operations,
+                                                 operation_count);
   }
 
   Reference<Library>

@@ -89,9 +89,27 @@ struct DXGIFormatTraits {
   DXGIFormatPlaneTraits planes[3] = {};
 };
 
+struct DXGIFormatFootprintLayout {
+  uint32_t blockWidth = 1;
+  uint32_t blockHeight = 1;
+  uint32_t elementSize = 0;
+};
+
+struct DXGIFormatPlaneFootprintLayout {
+  uint32_t blockWidth = 1;
+  uint32_t blockHeight = 1;
+  uint32_t elementSize = 0;
+};
+
 const DXGIFormatTraits &GetDXGIFormatTraits(uint32_t format);
 
 bool IsDXGIFormatSupportedByTraits(uint32_t format);
+
+bool GetDXGIFormatFootprintLayout(uint32_t format,
+                                  DXGIFormatFootprintLayout &layout);
+
+bool GetDXGIFormatPlaneFootprintLayout(uint32_t format, uint32_t plane,
+                                       DXGIFormatPlaneFootprintLayout &layout);
 
 bool IsDXGIFormatPlaneCompatible(uint32_t allocation_format, uint32_t view_or_copy_format,
                                  uint32_t plane);

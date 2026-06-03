@@ -167,7 +167,12 @@ Presenter::encodeCommands(
   info.colors[0].load_action = WMTLoadActionClear;
   info.colors[0].clear_color = {0.0, 0.0, 0.0, 1.0};
   info.colors[0].store_action = WMTStoreActionStore;
-  info.colors[0].texture = drawable.texture();
+  auto drawable_texture = drawable.texture();
+  info.colors[0].texture = drawable_texture;
+  info.render_target_width = drawable_texture.width();
+  info.render_target_height = drawable_texture.height();
+  info.render_target_array_length = drawable_texture.arrayLength();
+  info.default_raster_sample_count = 1;
   auto encoder = cmdbuf.renderCommandEncoder(info);
   wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);

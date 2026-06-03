@@ -110,9 +110,19 @@ public:
     }
     auto &query = queries_[index];
     query.timestamp = new TimestampQuery();
-    query.timestamp->issue(device_->NextTimestampQueryValue());
-    query.valid = true;
+    query.valid = false;
     return query.timestamp;
+  }
+
+  void MarkTimestampReady(D3D12_QUERY_TYPE type, UINT index) override {
+    if (!ValidateAccess(type, index))
+      return;
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
+        type != D3D12_QUERY_TYPE_TIMESTAMP) {
+      WARN("D3D12QueryHeap: unsupported timestamp ready query type ", type);
+      return;
+    }
+    queries_[index].valid = true;
   }
 
   bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) override {

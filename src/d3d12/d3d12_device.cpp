@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <winbase.h>
 
 namespace dxmt::d3d12 {
 
@@ -62,6 +63,71 @@ Align(UINT64 value, UINT64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
+static bool
+IsCommittedAccessibleVirtualMemory(const MEMORY_BASIC_INFORMATION &info) {
+  if (info.State != MEM_COMMIT)
+    return false;
+  if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+    return false;
+  return true;
+}
+
+static bool
+GetVirtualAllocationInfo(const void *address,
+                         MEMORY_BASIC_INFORMATION &first_region,
+                         SIZE_T &allocation_size,
+                         const char *&reason) {
+  allocation_size = 0;
+  reason = nullptr;
+
+  if (!VirtualQuery(address, &first_region, sizeof(first_region)) ||
+      !first_region.AllocationBase || !first_region.RegionSize) {
+    reason = "query";
+    return false;
+  }
+
+  if (address != first_region.AllocationBase) {
+    reason = "address-not-allocation-base";
+    return false;
+  }
+
+  auto *base = static_cast<const char *>(first_region.AllocationBase);
+  auto *cursor = base;
+  auto *end = base;
+
+  for (;;) {
+    MEMORY_BASIC_INFORMATION region = {};
+    if (!VirtualQuery(cursor, &region, sizeof(region)))
+      break;
+    if (region.AllocationBase != first_region.AllocationBase)
+      break;
+    if (static_cast<const char *>(region.BaseAddress) != cursor) {
+      reason = "non-contiguous-region";
+      return false;
+    }
+    if (!IsCommittedAccessibleVirtualMemory(region)) {
+      reason = "non-committed-or-inaccessible-region";
+      return false;
+    }
+
+    auto *next = cursor + region.RegionSize;
+    if (next <= cursor) {
+      reason = "region-overflow";
+      return false;
+    }
+    end = next;
+    cursor = next;
+  }
+
+  allocation_size = static_cast<SIZE_T>(end - base);
+  if (!allocation_size) {
+    reason = "zero-allocation-size";
+    return false;
+  }
+
+  return true;
+}
+
 static UINT
 SubresourceMipSlice(UINT sub_resource, UINT mip_levels) {
   return mip_levels ? sub_resource % mip_levels : 0;
@@ -83,31 +149,26 @@ GetD3D12FootprintFormat(DXGI_FORMAT format, UINT plane) {
 
 static UINT
 GetD3D12FormatPlaneElementSize(DXGI_FORMAT format, UINT plane,
-                               const MTL_DXGI_FORMAT_DESC &format_desc) {
+                               const DXGIFormatPlaneFootprintLayout &layout) {
   const auto &traits = GetDXGIFormatTraits(format);
   if (plane < traits.planeCount && traits.planes[plane].elementSize)
     return traits.planes[plane].elementSize;
-  return (format_desc.Flag & MTL_DXGI_FORMAT_BC)
-             ? format_desc.BlockSize
-             : format_desc.BytesPerTexel;
+  return layout.elementSize;
 }
 
-static bool
-HasD3D12TraitFootprintLayout(const DXGIFormatTraits &traits) {
-  if (!traits.planeCount || traits.classification == DXGIFormatClass::Unsupported ||
-      traits.classification == DXGIFormatClass::Mask)
-    return false;
-
-  for (UINT plane = 0; plane < traits.planeCount; ++plane) {
-    if (!traits.planes[plane].elementSize)
-      return false;
-  }
-  return true;
+static UINT
+GetD3D12FormatBlockWidth(const DXGIFormatPlaneFootprintLayout &layout) {
+  return layout.blockWidth;
 }
 
 static UINT
 GetD3D12FormatBlockWidth(const MTL_DXGI_FORMAT_DESC &format_desc) {
   return (format_desc.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+}
+
+static UINT
+GetD3D12FormatBlockHeight(const DXGIFormatPlaneFootprintLayout &layout) {
+  return layout.blockHeight;
 }
 
 static UINT
@@ -139,12 +200,17 @@ IsCpuVisibleHeap(D3D12_HEAP_TYPE heap_type) {
 }
 
 static bool
+IsAbstractedCpuVisibleHeap(const D3D12_HEAP_PROPERTIES &properties) {
+  return properties.Type == D3D12_HEAP_TYPE_UPLOAD ||
+         properties.Type == D3D12_HEAP_TYPE_READBACK;
+}
+
+static bool
 HasInvalidCpuVisibleBufferFlags(const D3D12_RESOURCE_DESC &desc,
-                                D3D12_HEAP_TYPE heap_type) {
+                                const D3D12_HEAP_PROPERTIES &heap_properties) {
   if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
     return false;
-  if (heap_type != D3D12_HEAP_TYPE_UPLOAD &&
-      heap_type != D3D12_HEAP_TYPE_READBACK)
+  if (!IsAbstractedCpuVisibleHeap(heap_properties))
     return false;
   return desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
@@ -152,9 +218,9 @@ HasInvalidCpuVisibleBufferFlags(const D3D12_RESOURCE_DESC &desc,
 }
 
 static bool
-IsValidCrossAdapterTextureDesc(const D3D12_HEAP_PROPERTIES &heap_properties,
-                               D3D12_HEAP_FLAGS heap_flags,
-                               const D3D12_RESOURCE_DESC &desc) {
+IsValidCrossAdapterResourceDesc(const D3D12_HEAP_PROPERTIES &heap_properties,
+                                D3D12_HEAP_FLAGS heap_flags,
+                                const D3D12_RESOURCE_DESC &desc) {
   const bool cross_adapter =
       desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
   const bool cross_adapter_heap =
@@ -166,6 +232,10 @@ IsValidCrossAdapterTextureDesc(const D3D12_HEAP_PROPERTIES &heap_properties,
   if (!cross_adapter || !cross_adapter_heap ||
       !(heap_flags & D3D12_HEAP_FLAG_SHARED))
     return false;
+
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return true;
+
   if (d3d12::GetHeapType(heap_properties) != D3D12_HEAP_TYPE_DEFAULT)
     return false;
   return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
@@ -400,9 +470,31 @@ GetD3D12FormatSupport2(FormatCapability caps) {
                D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
                D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
                D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
-  if (HasFormatCapability(caps, FormatCapability::Sparse))
-    support |= D3D12_FORMAT_SUPPORT2_TILED;
   return support;
+}
+
+static bool
+SupportsTiledTextureFormat(WMT::Device device, DXGI_FORMAT dxgi_format,
+                           const MTL_DXGI_FORMAT_DESC &format) {
+  const auto &traits = GetDXGIFormatTraits(dxgi_format);
+  if (traits.flags & (DXGI_FORMAT_TRAIT_MULTIPLANE |
+                      DXGI_FORMAT_TRAIT_VIDEO |
+                      DXGI_FORMAT_TRAIT_DEPTH_STENCIL))
+    return false;
+
+  WMTTextureInfo info = {};
+  info.pixel_format = format.PixelFormat;
+  info.width = 1;
+  info.height = 1;
+  info.depth = 1;
+  info.array_length = 1;
+  info.type = WMTTextureType2D;
+  info.mipmap_level_count = 1;
+  info.sample_count = 1;
+  info.usage = WMTTextureUsageShaderRead;
+
+  WMTSparseTileSize tile_size = {};
+  return device.sparseTileSize(info, tile_size);
 }
 
 static UINT8
@@ -983,10 +1075,6 @@ public:
     return *device_;
   }
 
-  uint64_t NextTimestampQueryValue() override {
-    return ++timestamp_query_value_;
-  }
-
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() override {
     return local_kmt_;
   }
@@ -1205,7 +1293,9 @@ public:
       std::memset(data, 0, sizeof(*data));
       data->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
       data->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
-      data->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+      data->TiledResourcesTier = GetDXMTDevice().device().supportsPlacementSparse()
+                                     ? D3D12_TILED_RESOURCES_TIER_1
+                                     : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
       data->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
       data->MaxGPUVirtualAddressBitsPerResource = 40;
       return S_OK;
@@ -1243,6 +1333,9 @@ public:
       const auto caps = GetD3D12FormatCapability(device_->device(), format);
       data->Support1 = GetD3D12FormatSupport1(caps, format);
       data->Support2 = GetD3D12FormatSupport2(caps);
+      if (GetDXMTDevice().device().supportsPlacementSparse() &&
+          SupportsTiledTextureFormat(device_->device(), data->Format, format))
+        data->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;
       return S_OK;
     }
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
@@ -1969,15 +2062,44 @@ public:
     if (!heap_object)
       return WARN_E_INVALIDARG(__func__);
 
-    if (GetInvalidPlacedResourceDescReason(*heap_object, heap_offset, desc,
-                                           initial_state))
+    if (const char *reason =
+            GetInvalidPlacedResourceDescReason(*heap_object, heap_offset, desc,
+                                               initial_state)) {
+      const auto &heap_desc = heap_object->GetHeapDesc();
+      WARN("D3D12Device: CreatePlacedResource invalid"
+           " reason=", reason,
+           " heapOffset=", heap_offset,
+           " heapSize=", heap_desc.SizeInBytes,
+           " heapType=", heap_desc.Properties.Type,
+           " cpuPage=", heap_desc.Properties.CPUPageProperty,
+           " memoryPool=", heap_desc.Properties.MemoryPoolPreference,
+           " heapFlags=", heap_desc.Flags,
+           " dimension=", desc->Dimension,
+           " width=", desc->Width,
+           " height=", desc->Height,
+           " depthOrArray=", desc->DepthOrArraySize,
+           " mipLevels=", desc->MipLevels,
+           " format=", desc->Format,
+           " layout=", desc->Layout,
+           " resourceFlags=", desc->Flags,
+           " initialState=", initial_state);
       return WARN_E_INVALIDARG(__func__);
+    }
 
     const auto &heap_desc = heap_object->GetHeapDesc();
+    dxmt::Buffer *placed_buffer =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            ? heap_object->GetBuffer()
+            : nullptr;
+    dxmt::BufferAllocation *placed_buffer_allocation =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            ? heap_object->GetAllocation()
+            : nullptr;
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), &heap_desc.Properties,
         heap_desc.Flags, desc, initial_state, heap_offset,
-        optimized_clear_value);
+        optimized_clear_value, d3d12::ResourceKind::Placed,
+        placed_buffer, placed_buffer_allocation);
     auto hr = resource_object->QueryInterface(riid, resource);
     if (dxmt::apitrace::d3d_enabled()) {
       auto *created = resource && *resource ? dynamic_cast<d3d12::Resource *>(
@@ -1999,18 +2121,49 @@ public:
     InitReturnPtr(resource);
     if (!resource)
       return E_POINTER;
-    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-        optimized_clear_value)
-      return WARN_E_INVALIDARG(__func__);
+    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      if (optimized_clear_value)
+        return WARN_E_INVALIDARG(__func__);
+      WARN("D3D12Device: TODO CreateReservedResource(buffer) unsupported"
+           " width=", desc->Width,
+           " flags=", desc->Flags,
+           " layout=", desc->Layout);
+      if (dxmt::apitrace::d3d_enabled()) {
+        dxmt::apitrace::record_create_reserved_resource(
+            this, desc, initial_state, optimized_clear_value, nullptr, 0,
+            static_cast<int32_t>(E_NOTIMPL));
+      }
+      return E_NOTIMPL;
+    }
     if (!IsValidReservedResourceDesc(desc, initial_state))
       return WARN_E_INVALIDARG(__func__);
 
-    WARN("D3D12Device: creating reserved resource with fully-backed storage; tile mappings remain unsupported");
     const auto heap_properties = GetDefaultResourceHeapProperties();
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), &heap_properties,
         D3D12_HEAP_FLAG_NONE, desc, initial_state, 0,
-        optimized_clear_value);
+        optimized_clear_value, d3d12::ResourceKind::ReservedTexture);
+    auto *reserved = resource_object.ptr()
+                         ? dynamic_cast<d3d12::Resource *>(resource_object.ptr())
+                         : nullptr;
+    if (!reserved || !reserved->GetTextureAllocation() || !reserved->GetTiling()) {
+      WARN("D3D12Device: TODO CreateReservedResource(texture) unsupported"
+           " format=", desc->Format,
+           " dimension=", desc->Dimension,
+           " width=", desc->Width,
+           " height=", desc->Height,
+           " depthOrArray=", desc->DepthOrArraySize,
+           " mipLevels=", desc->MipLevels,
+           " sampleCount=", desc->SampleDesc.Count,
+           " layout=", desc->Layout,
+           " flags=", desc->Flags);
+      if (dxmt::apitrace::d3d_enabled()) {
+        dxmt::apitrace::record_create_reserved_resource(
+            this, desc, initial_state, optimized_clear_value, nullptr, 0,
+            static_cast<int32_t>(E_NOTIMPL));
+      }
+      return E_NOTIMPL;
+    }
     auto hr = resource_object->QueryInterface(riid, resource);
     if (dxmt::apitrace::d3d_enabled()) {
       auto *created = resource && *resource ? dynamic_cast<d3d12::Resource *>(
@@ -2067,8 +2220,49 @@ public:
       return E_POINTER;
     if (!address)
       return WARN_E_INVALIDARG(__func__);
-    WARN("D3D12Device: existing heaps from CPU addresses are unsupported");
-    return E_NOTIMPL;
+
+    MEMORY_BASIC_INFORMATION memory_info = {};
+    SIZE_T allocation_size = 0;
+    const char *allocation_reason = nullptr;
+    if (!GetVirtualAllocationInfo(address, memory_info, allocation_size,
+                                  allocation_reason)) {
+      WARN("D3D12Device: OpenExistingHeapFromAddress failed to query allocation"
+           " address=", address,
+           " reason=", allocation_reason ? allocation_reason : "unknown",
+           " allocationBase=", memory_info.AllocationBase,
+           " regionSize=", memory_info.RegionSize,
+           " protect=", memory_info.Protect,
+           " state=", memory_info.State,
+           " type=", memory_info.Type);
+      return E_INVALIDARG;
+    }
+
+    D3D12_HEAP_DESC desc = {};
+    desc.SizeInBytes = allocation_size;
+    desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+    desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    desc.Properties.CreationNodeMask = 1;
+    desc.Properties.VisibleNodeMask = 1;
+    desc.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+
+    static std::atomic<uint32_t> log_count = 0;
+    if (ShouldLogRepeatedDescriptorWarning(log_count)) {
+      WARN("D3D12Device: OpenExistingHeapFromAddress using external CPU backing"
+           " address=", address,
+           " allocationBase=", memory_info.AllocationBase,
+           " regionSize=", memory_info.RegionSize,
+           " allocationSize=", allocation_size,
+           " protect=", memory_info.Protect,
+           " state=", memory_info.State,
+           " type=", memory_info.Type);
+    }
+
+    auto heap_object =
+        d3d12::CreateExternalCpuHeap(static_cast<IMTLD3D12Device *>(this),
+                                     &desc, memory_info.AllocationBase);
+    return heap_object->QueryInterface(riid, heap);
   }
 
   HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE file_mapping,
@@ -2403,14 +2597,80 @@ public:
                                            UINT *sub_resource_tiling_count,
                                            UINT first_sub_resource_tiling,
                                            D3D12_SUBRESOURCE_TILING *sub_resource_tilings) override {
-    // TODO(d3d12): return real tiling once reserved/tiled resources are
-    // implemented. The device advertises TiledResourcesTier NOT_SUPPORTED.
-    if (resource)
-      WARN("D3D12Device: resource tiling is unsupported");
+    auto *resource_object = dynamic_cast<d3d12::Resource *>(resource);
+    const auto *tiling = resource_object ? resource_object->GetTiling() : nullptr;
+    if (!tiling) {
+      if (resource) {
+        WARN("D3D12Device: TODO GetResourceTiling unsupported for non-reserved or unsupported resource"
+             " resource=", resource);
+      }
+      if (total_tile_count)
+        *total_tile_count = 0;
+      if (sub_resource_tiling_count)
+        *sub_resource_tiling_count = 0;
+      return;
+    }
+
+    UINT recorded_total_tile_count = 0;
+    D3D12_PACKED_MIP_INFO recorded_packed_mip_info = {};
+    D3D12_TILE_SHAPE recorded_tile_shape = {};
+    std::vector<D3D12_SUBRESOURCE_TILING> recorded_subresource_tilings;
+
     if (total_tile_count)
-      *total_tile_count = 0;
-    if (sub_resource_tiling_count)
-      *sub_resource_tiling_count = 0;
+      *total_tile_count = tiling->total_tile_count;
+    recorded_total_tile_count = tiling->total_tile_count;
+    if (packed_mip_info)
+      *packed_mip_info = tiling->packed_mip_info;
+    recorded_packed_mip_info = tiling->packed_mip_info;
+    if (standard_tile_shape)
+      *standard_tile_shape = tiling->tile_shape;
+    recorded_tile_shape = tiling->tile_shape;
+    if (!sub_resource_tiling_count) {
+      dxmt::apitrace::record_get_resource_tiling(
+          this, resource, recorded_total_tile_count,
+          packed_mip_info ? &recorded_packed_mip_info : nullptr,
+          standard_tile_shape ? &recorded_tile_shape : nullptr,
+          0, first_sub_resource_tiling, nullptr);
+      return;
+    }
+
+    const UINT available =
+        first_sub_resource_tiling < tiling->subresources.size()
+            ? static_cast<UINT>(tiling->subresources.size() -
+                                first_sub_resource_tiling)
+            : 0;
+    const UINT count = std::min(*sub_resource_tiling_count, available);
+    *sub_resource_tiling_count = count;
+    recorded_subresource_tilings.resize(count);
+    if (!sub_resource_tilings && count)
+      sub_resource_tilings = recorded_subresource_tilings.data();
+    if (!sub_resource_tilings) {
+      dxmt::apitrace::record_get_resource_tiling(
+          this, resource, recorded_total_tile_count,
+          packed_mip_info ? &recorded_packed_mip_info : nullptr,
+          standard_tile_shape ? &recorded_tile_shape : nullptr,
+          count, first_sub_resource_tiling, nullptr);
+      return;
+    }
+    for (UINT i = 0; i < count; ++i) {
+      const auto &src = tiling->subresources[first_sub_resource_tiling + i];
+      D3D12_SUBRESOURCE_TILING &dst = sub_resource_tilings[i];
+      if (src.start_tile_index == D3D12_PACKED_TILE) {
+        dst = {};
+        dst.StartTileIndexInOverallResource = D3D12_PACKED_TILE;
+      } else {
+        dst.WidthInTiles = src.width_in_tiles;
+        dst.HeightInTiles = src.height_in_tiles;
+        dst.DepthInTiles = src.depth_in_tiles;
+        dst.StartTileIndexInOverallResource = src.start_tile_index;
+      }
+      recorded_subresource_tilings[i] = dst;
+    }
+    dxmt::apitrace::record_get_resource_tiling(
+        this, resource, recorded_total_tile_count,
+        packed_mip_info ? &recorded_packed_mip_info : nullptr,
+        standard_tile_shape ? &recorded_tile_shape : nullptr,
+        count, first_sub_resource_tiling, recorded_subresource_tilings.data());
   }
 
 #ifdef __ID3D12Device4_INTERFACE_DEFINED__
@@ -3014,13 +3274,10 @@ private:
   bool IsValidInitialState(const D3D12_HEAP_PROPERTIES &properties,
                            D3D12_RESOURCE_STATES initial_state) const {
     if (properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
-      return initial_state == D3D12_RESOURCE_STATE_GENERIC_READ ||
-             initial_state == D3D12_RESOURCE_STATE_COMMON ||
-             initial_state == D3D12_RESOURCE_STATE_COPY_SOURCE;
+      return initial_state == D3D12_RESOURCE_STATE_GENERIC_READ;
     }
     if (properties.Type == D3D12_HEAP_TYPE_READBACK) {
-      return initial_state == D3D12_RESOURCE_STATE_COPY_DEST ||
-             initial_state == D3D12_RESOURCE_STATE_COMMON;
+      return initial_state == D3D12_RESOURCE_STATE_COPY_DEST;
     }
     if ((initial_state & D3D12_RESOURCE_STATE_RENDER_TARGET) &&
         initial_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
@@ -3128,13 +3385,11 @@ private:
         (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
       return false;
 
-    const auto heap_type = d3d12::GetHeapType(*heap_properties);
-    if (!IsValidCrossAdapterTextureDesc(*heap_properties, heap_flags, *desc))
+    if (!IsValidCrossAdapterResourceDesc(*heap_properties, heap_flags, *desc))
       return false;
-    if (HasInvalidCpuVisibleBufferFlags(*desc, heap_type))
+    if (HasInvalidCpuVisibleBufferFlags(*desc, *heap_properties))
       return false;
-    if (heap_type == D3D12_HEAP_TYPE_UPLOAD ||
-        heap_type == D3D12_HEAP_TYPE_READBACK) {
+    if (IsAbstractedCpuVisibleHeap(*heap_properties)) {
       if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
           desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
         return false;
@@ -3167,7 +3422,7 @@ private:
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
       return false;
-    if (!IsValidCrossAdapterTextureDesc(heap_properties, D3D12_HEAP_FLAG_NONE,
+    if (!IsValidCrossAdapterResourceDesc(heap_properties, D3D12_HEAP_FLAG_NONE,
                                         *desc))
       return false;
 
@@ -3228,14 +3483,12 @@ private:
         allocation_info.SizeInBytes > heap_size - heap_offset)
       return "heap-range";
 
-    const auto heap_type = heap.GetHeapType();
-    if (!IsValidCrossAdapterTextureDesc(heap.GetHeapDesc().Properties,
+    if (!IsValidCrossAdapterResourceDesc(heap.GetHeapDesc().Properties,
                                         heap.GetHeapDesc().Flags, *desc))
-      return "cross-adapter-texture";
-    if (HasInvalidCpuVisibleBufferFlags(*desc, heap_type))
+      return "cross-adapter-resource";
+    if (HasInvalidCpuVisibleBufferFlags(*desc, heap.GetHeapDesc().Properties))
       return "cpu-visible-buffer-flags";
-    if ((heap_type == D3D12_HEAP_TYPE_UPLOAD ||
-         heap_type == D3D12_HEAP_TYPE_READBACK) &&
+    if (IsAbstractedCpuVisibleHeap(heap.GetHeapDesc().Properties) &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
       return "cpu-visible-texture-layout";
@@ -3297,15 +3550,19 @@ private:
       return;
     }
 
-    const auto &traits = GetDXGIFormatTraits(desc->Format);
-    const bool trait_layout_format =
-        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-        HasD3D12TraitFootprintLayout(traits);
-
-    MTL_DXGI_FORMAT_DESC format = {};
+    DXGIFormatPlaneFootprintLayout default_format = {};
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-        !trait_layout_format &&
-        FAILED(MTLQueryDXGIFormat(device_->device(), desc->Format, format))) {
+        !GetDXGIFormatPlaneFootprintLayout(desc->Format, 0, default_format)) {
+      WARN("D3D12Device: TODO GetCopyableFootprints unsupported format"
+           " format=", uint32_t(desc->Format),
+           " dimension=", uint32_t(desc->Dimension),
+           " width=", uint64_t(desc->Width),
+           " height=", uint32_t(desc->Height),
+           " depthOrArraySize=", uint32_t(desc->DepthOrArraySize),
+           " mipLevels=", uint32_t(desc->MipLevels),
+           " sampleCount=", uint32_t(desc->SampleDesc.Count),
+           " layout=", uint32_t(desc->Layout),
+           " flags=", uint32_t(desc->Flags));
       set_invalid();
       return;
     }
@@ -3361,17 +3618,28 @@ private:
                                     subsample_y_log2);
         const UINT64 width =
             Align(MipSize(desc->Width, mip_slice + subsample_x_log2),
-                  GetD3D12FormatBlockWidth(format));
+                  GetD3D12FormatBlockWidth(default_format));
         const UINT height = static_cast<UINT>(
             Align(MipSize(desc->Height, mip_slice + subsample_y_log2),
-                  GetD3D12FormatBlockHeight(format)));
+                  GetD3D12FormatBlockHeight(default_format)));
         const UINT depth = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
                                ? static_cast<UINT>(MipSize(desc->DepthOrArraySize, mip_slice))
                                : 1;
-        const UINT block_width = GetD3D12FormatBlockWidth(format);
-        const UINT block_height = GetD3D12FormatBlockHeight(format);
+        DXGIFormatPlaneFootprintLayout plane_format = {};
+        if (!GetDXGIFormatPlaneFootprintLayout(desc->Format, plane,
+                                               plane_format)) {
+          WARN("D3D12Device: TODO GetCopyableFootprints unsupported plane"
+               " format=", uint32_t(desc->Format),
+               " plane=", uint32_t(plane),
+               " subresource=", uint32_t(subresource));
+          set_invalid();
+          return;
+        }
+
+        const UINT block_width = GetD3D12FormatBlockWidth(plane_format);
+        const UINT block_height = GetD3D12FormatBlockHeight(plane_format);
         const UINT element_size =
-            GetD3D12FormatPlaneElementSize(desc->Format, plane, format);
+            GetD3D12FormatPlaneElementSize(desc->Format, plane, plane_format);
         const UINT num_planes = std::max(1u, plane_count);
 
         footprint.Width = static_cast<UINT>(width);
@@ -3474,7 +3742,6 @@ private:
   LUID adapter_luid_ = {};
   UINT maximum_frame_latency_ = 3;
   INT gpu_thread_priority_ = 0;
-  uint64_t timestamp_query_value_ = 0;
   uint64_t enqueue_set_event_value_ = 0;
   uint64_t multiple_fence_wait_value_ = 0;
   std::string name_;

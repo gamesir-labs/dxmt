@@ -177,6 +177,57 @@ IsDXGIFormatSupportedByTraits(uint32_t format) {
 }
 
 bool
+GetDXGIFormatFootprintLayout(uint32_t format,
+                             DXGIFormatFootprintLayout &layout) {
+  layout = {};
+  layout.blockWidth = 1;
+  layout.blockHeight = 1;
+
+  const auto &traits = GetDXGIFormatTraits(format);
+  if (traits.planeCount == 1 && traits.planes[0].elementSize) {
+    layout.elementSize = traits.planes[0].elementSize;
+    return true;
+  }
+
+  MTL_DXGI_FORMAT_DESC description = {};
+  if (FAILED(MTLQueryDXGIFormat({}, format, description)))
+    return false;
+
+  if (description.Flag & MTL_DXGI_FORMAT_BC) {
+    layout.blockWidth = 4;
+    layout.blockHeight = 4;
+    layout.elementSize = description.BlockSize;
+    return layout.elementSize != 0;
+  }
+
+  layout.elementSize = description.BytesPerTexel;
+  return layout.elementSize != 0;
+}
+
+bool
+GetDXGIFormatPlaneFootprintLayout(uint32_t format, uint32_t plane,
+                                  DXGIFormatPlaneFootprintLayout &layout) {
+  layout = {};
+  layout.blockWidth = 1;
+  layout.blockHeight = 1;
+
+  const auto &traits = GetDXGIFormatTraits(format);
+  if (plane < traits.planeCount && traits.planes[plane].elementSize) {
+    layout.elementSize = traits.planes[plane].elementSize;
+    return true;
+  }
+
+  DXGIFormatFootprintLayout base_layout = {};
+  if (!GetDXGIFormatFootprintLayout(format, base_layout))
+    return false;
+
+  layout.blockWidth = base_layout.blockWidth;
+  layout.blockHeight = base_layout.blockHeight;
+  layout.elementSize = base_layout.elementSize;
+  return layout.elementSize != 0;
+}
+
+bool
 IsDXGIFormatPlaneCompatible(uint32_t allocation_format,
                             uint32_t view_or_copy_format, uint32_t plane) {
   const auto &traits = GetDXGIFormatTraits(allocation_format);

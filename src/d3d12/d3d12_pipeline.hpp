@@ -5,6 +5,7 @@
 #include "DXILParser/DXILParser.hpp"
 #include "airconv_public.h"
 #include <d3d12.h>
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -65,16 +66,23 @@ struct PipelineMetalShader {
 
 struct PipelineMetalGraphicsState {
   PipelineMetalShader vertex;
+  std::array<PipelineMetalShader, 3> tessellation_vertex_hull;
+  PipelineMetalShader tessellation_domain;
   PipelineMetalShader geometry_vertex;
   PipelineMetalShader geometry;
   PipelineMetalShader geometry_strip_vertex;
   PipelineMetalShader geometry_strip;
   PipelineMetalShader pixel;
   WMT::Reference<WMT::RenderPipelineState> pso;
+  WMT::Reference<WMT::RenderPipelineState> tessellation_pso_u16;
+  WMT::Reference<WMT::RenderPipelineState> tessellation_pso_u32;
   WMT::Reference<WMT::RenderPipelineState> strip_pso;
   WMT::Reference<WMT::DepthStencilState> depth_stencil;
   wmtcmd_render_setrasterizerstate rasterizer = {};
   bool use_geometry = false;
+  bool use_tessellation = false;
+  uint32_t tess_num_output_control_point_element = 0;
+  uint32_t tess_threads_per_patch = 0;
 };
 
 struct PipelineMetalComputeState {

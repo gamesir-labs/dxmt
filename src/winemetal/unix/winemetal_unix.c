@@ -10,6 +10,7 @@
 #import <ColorSync/ColorSync.h>
 #import <CoreFoundation/CFRunLoop.h>
 #import <Metal/Metal.h>
+#import <Metal/MTL4CommandQueue.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #include "objc/objc-runtime.h"
@@ -1778,6 +1779,11 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
   desc.sampleCount = info->sample_count;
   desc.usage = (MTLTextureUsage)info->usage;
   desc.resourceOptions = (MTLResourceOptions)info->options;
+  if (info->reserved & WMTTextureInfoFlagPlacementSparse) {
+    if (@available(macOS 26.0, *)) {
+      desc.placementSparsePageSize = MTLSparsePageSize64;
+    }
+  }
 };
 
 void
@@ -1805,10 +1811,10 @@ _MTLDevice_newTexture(void *obj) {
 
   id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
   params->ret = (obj_handle_t)ret;
-  info->gpu_resource_id = [ret gpuResourceID]._impl;
+  info->gpu_resource_id = ret ? [ret gpuResourceID]._impl : 0;
   info->mach_port = 0;
 #if DXMT_APITRACE_METAL
-  if (dxmt_apitrace_runtime_enabled()) {
+  if (ret && dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
     if (dxmt_apitrace_ensure_session_locked()) {
       NSString *resource_payload = dxmt_apitrace_json_string(@{
@@ -1825,6 +1831,127 @@ _MTLDevice_newTexture(void *obj) {
 #endif
 
   [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_supportsPlacementSparse(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->handle;
+  params->ret = 0;
+  if (@available(macOS 26.4, *)) {
+    params->ret = device.supportsPlacementSparse ? 1 : 0;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_sparseTileSize(void *obj) {
+  struct unixcall_mtldevice_sparsetilesize *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  const struct WMTTextureInfo *info = params->info.ptr;
+  struct WMTSparseTileSize *tile_size = params->tile_size.ptr;
+  params->ret = 0;
+  if (!info || !tile_size)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    const MTLPixelFormat format = to_metal_pixel_format(info->pixel_format);
+    MTLSize size = [device sparseTileSizeWithTextureType:(MTLTextureType)info->type
+                                             pixelFormat:format
+                                             sampleCount:info->sample_count
+                                          sparsePageSize:MTLSparsePageSize64];
+    tile_size->width = size.width;
+    tile_size->height = size.height;
+    tile_size->depth = size.depth;
+    tile_size->bytes = [device sparseTileSizeInBytesForSparsePageSize:MTLSparsePageSize64];
+    params->ret = tile_size->width && tile_size->height && tile_size->depth && tile_size->bytes;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newPlacementHeap(void *obj) {
+  struct unixcall_mtldevice_newplacementheap *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  const struct WMTPlacementHeapInfo *info = params->info.ptr;
+  params->ret = 0;
+  if (!info || !info->size)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+    desc.type = MTLHeapTypePlacement;
+    desc.size = info->size;
+    desc.resourceOptions = (MTLResourceOptions)info->options;
+    desc.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
+    params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static MTLSparseTextureMappingMode
+to_metal_sparse_texture_mapping_mode(enum WMTSparseTextureMappingMode mode) {
+  switch (mode) {
+  case WMTSparseTextureMappingModeUnmap:
+    return MTLSparseTextureMappingModeUnmap;
+  case WMTSparseTextureMappingModeMap:
+  default:
+    return MTLSparseTextureMappingModeMap;
+  }
+}
+
+static NTSTATUS
+_MTLDevice_updateSparseTextureMappings(void *obj) {
+  struct unixcall_mtldevice_updatesparsetexturemappings *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  id<MTLTexture> texture = (id<MTLTexture>)params->texture;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  const struct WMTSparseTextureMappingOperation *operations = params->operations.ptr;
+  params->ret = 0;
+  if (!texture || !operations || !params->operation_count)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTLSharedEvent> event = [device newSharedEvent];
+    if (!queue || !event) {
+      [queue release];
+      [event release];
+      return STATUS_SUCCESS;
+    }
+
+    MTL4UpdateSparseTextureMappingOperation *mtl_ops =
+        calloc((size_t)params->operation_count, sizeof(*mtl_ops));
+    if (!mtl_ops) {
+      [queue release];
+      [event release];
+      return STATUS_SUCCESS;
+    }
+
+    for (uint64_t i = 0; i < params->operation_count; ++i) {
+      const struct WMTSparseTextureMappingOperation *src = &operations[i];
+      mtl_ops[i].mode = to_metal_sparse_texture_mapping_mode(src->mode);
+      mtl_ops[i].textureRegion = MTLRegionMake3D(src->x, src->y, src->z,
+                                                 src->width, src->height,
+                                                 src->depth);
+      mtl_ops[i].textureLevel = src->level;
+      mtl_ops[i].textureSlice = src->slice;
+      mtl_ops[i].heapOffset = src->heap_offset;
+    }
+
+    [queue updateTextureMappings:texture
+                            heap:heap
+                      operations:mtl_ops
+                           count:(NSUInteger)params->operation_count];
+    [queue signalEvent:event value:1];
+    params->ret = [event waitUntilSignaledValue:1 timeoutMS:UINT64_MAX] ? 1 : 0;
+
+    free(mtl_ops);
+    [queue release];
+    [event release];
+  }
   return STATUS_SUCCESS;
 }
 
@@ -4848,6 +4975,18 @@ _WMTApitraceSessionClose(void *obj) {
 }
 
 static NTSTATUS
+_WMTApitraceSessionFlush(void *obj) {
+  (void)obj;
+  if (!dxmt_apitrace_runtime_enabled())
+    return STATUS_SUCCESS;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  if (dxmt_apitrace_session)
+    apitrace_metal_session_flush(dxmt_apitrace_session);
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _WMTApitraceSessionSealCheckpoint(void *obj) {
   (void)obj;
   if (!dxmt_apitrace_runtime_enabled())
@@ -4937,6 +5076,7 @@ _WMTApitracePresentDrawable(void *obj) {
 #else
 static NTSTATUS _WMTApitraceSessionEnsureOpen(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceSessionClose(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMTApitraceSessionFlush(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceSessionSealCheckpoint(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceSetCurrentD3DSequence(void *obj) { (void)obj; return STATUS_SUCCESS; }
 static NTSTATUS _WMTApitraceCommandBufferBegin(void *obj) { (void)obj; return STATUS_SUCCESS; }
@@ -5098,6 +5238,11 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTApitraceCommandBufferCommit,
     &_WMTApitracePresentDrawable,
     &_WMTApitraceSessionSealCheckpoint,
+    &_MTLDevice_supportsPlacementSparse,
+    &_MTLDevice_sparseTileSize,
+    &_MTLDevice_newPlacementHeap,
+    &_MTLDevice_updateSparseTextureMappings,
+    &_WMTApitraceSessionFlush,
 };
 
 #ifndef DXMT_NATIVE
@@ -5245,5 +5390,10 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTApitraceCommandBufferCommit,
     &_WMTApitracePresentDrawable,
     &_WMTApitraceSessionSealCheckpoint,
+    &_MTLDevice_supportsPlacementSparse,
+    &_MTLDevice_sparseTileSize,
+    &_MTLDevice_newPlacementHeap,
+    &_MTLDevice_updateSparseTextureMappings,
+    &_WMTApitraceSessionFlush,
 };
 #endif

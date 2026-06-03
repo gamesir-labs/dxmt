@@ -269,6 +269,9 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   if (flags.test(TextureAllocationFlag::GpuManaged)) {
     options |= WMTResourceStorageModeManaged;
   }
+  if (flags.test(TextureAllocationFlag::PlacementSparse)) {
+    info.reserved |= WMTTextureInfoFlagPlacementSparse;
+  }
   info.options = options;
   if (bytes_per_image_) {
     WMTBufferInfo buffer_info;

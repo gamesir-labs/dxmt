@@ -138,6 +138,13 @@ WMTApitraceSessionClose(void) {
 }
 
 WINEMETAL_API void
+WMTApitraceSessionFlush(void) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = 0;
+  UNIX_CALL(147, &params);
+}
+
+WINEMETAL_API void
 WMTApitraceSessionSealCheckpoint(void) {
   struct unixcall_generic_obj_noret params;
   params.handle = 0;
@@ -1254,4 +1261,52 @@ MTLDevice_newTileRenderPipelineState(
   if (err_out)
     *err_out = params.ret_error;
   return params.ret_pso;
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsPlacementSparse(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(143, &params);
+  return params.ret != 0;
+}
+
+WINEMETAL_API bool
+MTLDevice_sparseTileSize(
+    obj_handle_t device, const struct WMTTextureInfo *info, struct WMTSparseTileSize *tile_size
+) {
+  struct unixcall_mtldevice_sparsetilesize params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  WMT_MEMPTR_SET(params.tile_size, tile_size);
+  params.ret = 0;
+  UNIX_CALL(144, &params);
+  return params.ret != 0;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newPlacementHeap(obj_handle_t device, const struct WMTPlacementHeapInfo *info) {
+  struct unixcall_mtldevice_newplacementheap params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = 0;
+  UNIX_CALL(145, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_updateSparseTextureMappings(
+    obj_handle_t device, obj_handle_t texture, obj_handle_t heap,
+    const struct WMTSparseTextureMappingOperation *operations, uint64_t operation_count
+) {
+  struct unixcall_mtldevice_updatesparsetexturemappings params;
+  params.device = device;
+  params.texture = texture;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.operations, operations);
+  params.operation_count = operation_count;
+  params.ret = 0;
+  UNIX_CALL(146, &params);
+  return params.ret != 0;
 }

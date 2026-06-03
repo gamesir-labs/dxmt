@@ -21,6 +21,7 @@ public:
                                                   UINT index) = 0;
   virtual Rc<TimestampQuery> EndTimestamp(D3D12_QUERY_TYPE type,
                                           UINT index) = 0;
+  virtual void MarkTimestampReady(D3D12_QUERY_TYPE type, UINT index) = 0;
   virtual bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) = 0;
   virtual bool EndStatistics(D3D12_QUERY_TYPE type, UINT index) = 0;
   virtual bool Resolve(D3D12_QUERY_TYPE type, UINT start_index,

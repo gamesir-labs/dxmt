@@ -75,6 +75,15 @@ struct CopyResourceRecord {
   Com<ID3D12Resource> src;
 };
 
+struct CopyTilesRecord {
+  Com<ID3D12Resource> tiled_resource;
+  D3D12_TILED_RESOURCE_COORDINATE start = {};
+  D3D12_TILE_REGION_SIZE size = {};
+  Com<ID3D12Resource> buffer;
+  UINT64 buffer_offset = 0;
+  D3D12_TILE_COPY_FLAGS flags = D3D12_TILE_COPY_FLAG_NONE;
+};
+
 struct ResolveSubresourceRecord {
   Com<ID3D12Resource> dst;
   UINT dst_subresource = 0;
@@ -162,6 +171,7 @@ struct RenderTargetsRecord {
 
 struct VertexBuffersRecord {
   UINT start_slot = 0;
+  UINT view_count = 0;
   std::vector<D3D12_VERTEX_BUFFER_VIEW> views;
 };
 
@@ -211,6 +221,7 @@ struct EndQueryRecord {
 };
 
 struct ResolveQueryDataRecord {
+  Com<ID3D12GraphicsCommandList> command_list;
   Com<ID3D12QueryHeap> heap;
   D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_OCCLUSION;
   UINT start_index = 0;
@@ -258,8 +269,8 @@ struct TemporalUpscaleRecord {
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
     PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
-    CopyResourceRecord, ResolveSubresourceRecord, ResourceBarrierRecord,
-    ClearRenderTargetRecord, ClearDepthStencilRecord,
+    CopyResourceRecord, CopyTilesRecord, ResolveSubresourceRecord,
+    ResourceBarrierRecord, ClearRenderTargetRecord, ClearDepthStencilRecord,
     ClearUnorderedAccessRecord, DiscardResourceRecord, ViewportRecord,
     ScissorRecord, BlendFactorRecord, StencilRefRecord, PrimitiveTopologyRecord,
     RenderTargetsRecord, VertexBuffersRecord, IndexBufferRecord,

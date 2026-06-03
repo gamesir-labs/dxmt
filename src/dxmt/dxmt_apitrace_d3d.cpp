@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 
 namespace dxmt::apitrace {
 namespace {
@@ -21,6 +22,52 @@ d3d_builtin_capture_disabled() {
 }
 
 } // namespace
+
+static void
+AppendTileCoordinateJson(std::ostringstream &json,
+                         const D3D12_TILED_RESOURCE_COORDINATE &coord) {
+  json << "{\"subresource\":" << coord.Subresource
+       << ",\"x\":" << coord.X
+       << ",\"y\":" << coord.Y
+       << ",\"z\":" << coord.Z << '}';
+}
+
+static void
+AppendTileRegionSizeJson(std::ostringstream &json,
+                         const D3D12_TILE_REGION_SIZE &size) {
+  json << "{\"num_tiles\":" << size.NumTiles
+       << ",\"use_box\":" << (size.UseBox ? "true" : "false")
+       << ",\"width\":" << size.Width
+       << ",\"height\":" << size.Height
+       << ",\"depth\":" << size.Depth << '}';
+}
+
+static void
+AppendPackedMipInfoJson(std::ostringstream &json,
+                        const D3D12_PACKED_MIP_INFO &info) {
+  json << "{\"num_standard_mips\":" << unsigned(info.NumStandardMips)
+       << ",\"num_packed_mips\":" << unsigned(info.NumPackedMips)
+       << ",\"num_tiles_for_packed_mips\":" << info.NumTilesForPackedMips
+       << ",\"start_tile_index\":" << info.StartTileIndexInOverallResource
+       << '}';
+}
+
+static void
+AppendTileShapeJson(std::ostringstream &json, const D3D12_TILE_SHAPE &shape) {
+  json << "{\"width\":" << shape.WidthInTexels
+       << ",\"height\":" << shape.HeightInTexels
+       << ",\"depth\":" << shape.DepthInTexels << '}';
+}
+
+static void
+AppendSubresourceTilingJson(std::ostringstream &json,
+                            const D3D12_SUBRESOURCE_TILING &tiling) {
+  json << "{\"width\":" << tiling.WidthInTiles
+       << ",\"height\":" << tiling.HeightInTiles
+       << ",\"depth\":" << tiling.DepthInTiles
+       << ",\"start_tile_index\":" << tiling.StartTileIndexInOverallResource
+       << '}';
+}
 
 bool
 d3d_enabled() {
@@ -118,6 +165,8 @@ ToCaptureObjectKind(D3DObjectKind kind) {
     return ::apitrace::d3d12::CaptureObjectKind::Fence;
   case D3DObjectKind::SwapChain:
     return ::apitrace::d3d12::CaptureObjectKind::SwapChain;
+  case D3DObjectKind::Heap:
+    return ::apitrace::d3d12::CaptureObjectKind::Heap;
   case D3DObjectKind::Resource:
     return ::apitrace::d3d12::CaptureObjectKind::Resource;
   case D3DObjectKind::View:
@@ -582,6 +631,32 @@ record_copy_resource(const void *command_list, const void *dst_resource,
 }
 
 uint64_t
+record_copy_tiles(const void *command_list, const void *tiled_resource,
+                  const D3D12_TILED_RESOURCE_COORDINATE *start,
+                  const D3D12_TILE_REGION_SIZE *size, const void *buffer,
+                  uint64_t buffer_offset, uint32_t flags) {
+  if (!d3d_enabled())
+    return 0;
+  std::ostringstream json;
+  json << "{\"buffer_offset\":" << buffer_offset
+       << ",\"flags\":" << flags;
+  if (start) {
+    json << ",\"start\":";
+    AppendTileCoordinateJson(json, *start);
+  }
+  if (size) {
+    json << ",\"size\":";
+    AppendTileRegionSizeJson(json, *size);
+  }
+  json << '}';
+  const void *refs[] = {command_list, tiled_resource, buffer};
+  ensure_session_open();
+  return ::apitrace::d3d12::record_call(
+      "ID3D12GraphicsCommandList::CopyTiles", json.str().c_str(),
+      refs, 3, nullptr, 0, 0);
+}
+
+uint64_t
 record_resolve_subresource(const void *command_list, const void *dst_resource,
                            uint32_t dst_subresource,
                            const void *src_resource,
@@ -937,6 +1012,177 @@ record_temporal_upscale(
       pre_exposure, exposure_texture, jitter_offset_x, jitter_offset_y);
 }
 
+uint64_t
+record_get_resource_tiling(const void *device, const void *resource,
+                           uint32_t total_tile_count,
+                           const D3D12_PACKED_MIP_INFO *packed_mip_info,
+                           const D3D12_TILE_SHAPE *standard_tile_shape,
+                           uint32_t subresource_tiling_count,
+                           uint32_t first_subresource_tiling,
+                           const D3D12_SUBRESOURCE_TILING *subresource_tilings) {
+  if (!d3d_enabled())
+    return 0;
+  std::ostringstream json;
+  json << "{\"total_tile_count\":" << total_tile_count
+       << ",\"first_subresource_tiling\":" << first_subresource_tiling
+       << ",\"subresource_tiling_count\":" << subresource_tiling_count;
+  if (packed_mip_info) {
+    json << ",\"packed_mip_info\":";
+    AppendPackedMipInfoJson(json, *packed_mip_info);
+  }
+  if (standard_tile_shape) {
+    json << ",\"standard_tile_shape\":";
+    AppendTileShapeJson(json, *standard_tile_shape);
+  }
+  if (subresource_tilings) {
+    json << ",\"subresource_tilings\":[";
+    for (uint32_t i = 0; i < subresource_tiling_count; ++i) {
+      if (i)
+        json << ',';
+      AppendSubresourceTilingJson(json, subresource_tilings[i]);
+    }
+    json << ']';
+  }
+  json << '}';
+  const void *refs[] = {device, resource};
+  ensure_session_open();
+  return ::apitrace::d3d12::record_call(
+      "ID3D12Device::GetResourceTiling", json.str().c_str(),
+      refs, 2, nullptr, 0, 0);
+}
+
+uint64_t
+record_update_tile_mappings(
+    const void *queue, const void *resource, uint32_t region_count,
+    const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
+    const D3D12_TILE_REGION_SIZE *region_sizes, const void *heap,
+    uint32_t range_count, const D3D12_TILE_RANGE_FLAGS *range_flags,
+    const uint32_t *heap_range_offsets, const uint32_t *range_tile_counts,
+    uint32_t flags) {
+  if (!d3d_enabled())
+    return 0;
+  std::ostringstream json;
+  json << "{\"region_count\":" << region_count
+       << ",\"range_count\":" << range_count
+       << ",\"flags\":" << flags
+       << ",\"regions\":[";
+  if (region_start_coordinates) {
+    for (uint32_t i = 0; i < region_count; ++i) {
+      if (i)
+        json << ',';
+      AppendTileCoordinateJson(json, region_start_coordinates[i]);
+    }
+  }
+  json << ']';
+  if (region_sizes) {
+    json << ",\"region_sizes\":[";
+    for (uint32_t i = 0; i < region_count; ++i) {
+      if (i)
+        json << ',';
+      AppendTileRegionSizeJson(json, region_sizes[i]);
+    }
+    json << ']';
+  }
+  if (range_flags) {
+    json << ",\"range_flags\":[";
+    for (uint32_t i = 0; i < range_count; ++i) {
+      if (i)
+        json << ',';
+      json << uint32_t(range_flags[i]);
+    }
+    json << ']';
+  }
+  if (heap_range_offsets) {
+    json << ",\"heap_range_offsets\":[";
+    for (uint32_t i = 0; i < range_count; ++i) {
+      if (i)
+        json << ',';
+      json << heap_range_offsets[i];
+    }
+    json << ']';
+  }
+  if (range_tile_counts) {
+    json << ",\"range_tile_counts\":[";
+    for (uint32_t i = 0; i < range_count; ++i) {
+      if (i)
+        json << ',';
+      json << range_tile_counts[i];
+    }
+    json << ']';
+  }
+  json << '}';
+  const void *refs[] = {queue, resource, heap};
+  ensure_session_open();
+  return ::apitrace::d3d12::record_call(
+      "ID3D12CommandQueue::UpdateTileMappings", json.str().c_str(),
+      refs, heap ? 3 : 2, nullptr, 0, 0);
+}
+
+uint64_t
+record_copy_tile_mappings(
+    const void *queue, const void *dst_resource,
+    const D3D12_TILED_RESOURCE_COORDINATE *dst_start,
+    const void *src_resource,
+    const D3D12_TILED_RESOURCE_COORDINATE *src_start,
+    const D3D12_TILE_REGION_SIZE *region_size, uint32_t flags) {
+  if (!d3d_enabled())
+    return 0;
+  std::ostringstream json;
+  json << "{\"flags\":" << flags;
+  if (dst_start) {
+    json << ",\"dst_start\":";
+    AppendTileCoordinateJson(json, *dst_start);
+  }
+  if (src_start) {
+    json << ",\"src_start\":";
+    AppendTileCoordinateJson(json, *src_start);
+  }
+  if (region_size) {
+    json << ",\"region_size\":";
+    AppendTileRegionSizeJson(json, *region_size);
+  }
+  json << '}';
+  const void *refs[] = {queue, dst_resource, src_resource};
+  ensure_session_open();
+  return ::apitrace::d3d12::record_call(
+      "ID3D12CommandQueue::CopyTileMappings", json.str().c_str(),
+      refs, 3, nullptr, 0, 0);
+}
+
+uint64_t
+record_sparse_texture_mapping_ops(
+    const void *queue, const void *resource, const void *heap,
+    const char *source, const WMTSparseTextureMappingOperation *ops,
+    size_t op_count) {
+  if (!d3d_enabled())
+    return 0;
+  std::ostringstream json;
+  json << "{\"source\":\"" << (source ? source : "")
+       << "\",\"op_count\":" << op_count
+       << ",\"ops\":[";
+  for (size_t i = 0; i < op_count; ++i) {
+    if (i)
+      json << ',';
+    json << "{\"mode\":" << ops[i].mode
+         << ",\"level\":" << ops[i].level
+         << ",\"slice\":" << ops[i].slice
+         << ",\"x\":" << ops[i].x
+         << ",\"y\":" << ops[i].y
+         << ",\"z\":" << ops[i].z
+         << ",\"width\":" << ops[i].width
+         << ",\"height\":" << ops[i].height
+         << ",\"depth\":" << ops[i].depth
+         << ",\"heap_offset\":" << ops[i].heap_offset
+         << '}';
+  }
+  json << "]}";
+  const void *refs[] = {queue, resource, heap};
+  ensure_session_open();
+  return ::apitrace::d3d12::record_call(
+      "DXMT::SparseTextureMappingOps", json.str().c_str(),
+      refs, heap ? 3 : 2, nullptr, 0, 0);
+}
+
 void
 on_d3d12_create_device(void *device) {
   if (!d3d_enabled() || !device)
@@ -1009,6 +1255,35 @@ record_resource_unmap(const void *resource, uint32_t subresource,
   ::apitrace::d3d12::record_resource_unmap(
       resource, subresource, written_begin, written_end, written_data,
       written_size);
+}
+
+uint64_t
+record_resource_map(const void *resource, uint32_t subresource,
+                    const D3D12_RANGE *read_range, bool mapped,
+                    int32_t result_code) {
+  if (!d3d_enabled() || !resource)
+    return 0;
+  ensure_session_open();
+  const bool has_read_range = read_range != nullptr;
+  const uint64_t read_begin = has_read_range ? read_range->Begin : 0;
+  const uint64_t read_end = has_read_range ? read_range->End : 0;
+  return ::apitrace::d3d12::record_resource_map(
+      resource, subresource, has_read_range, read_begin, read_end, mapped,
+      result_code);
+}
+
+void
+record_resolve_query_data_result(
+    const void *command_list, const void *query_heap, uint32_t type,
+    uint32_t start_index, uint32_t query_count, const void *dst_buffer,
+    uint64_t aligned_dst_buffer_offset, const void *resolved_data,
+    size_t resolved_size) {
+  if (!d3d_enabled() || !dst_buffer || !resolved_data || !resolved_size)
+    return;
+  ensure_session_open();
+  ::apitrace::d3d12::record_resolve_query_data_result(
+      command_list, query_heap, type, start_index, query_count, dst_buffer,
+      aligned_dst_buffer_offset, resolved_data, resolved_size);
 }
 
 void

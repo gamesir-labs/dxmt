@@ -24,6 +24,8 @@ enum class BufferAllocationFlag : uint32_t {
   CpuPlaced = 6,
   /* low-address CPU mapping with a separate Metal-owned backing buffer */
   CpuShadow = 7,
+  /* external CPU allocation supplied by the application; never free it */
+  ExternalCpuPlaced = 8,
 };
 
 typedef uint64_t BufferViewKey;
@@ -153,6 +155,8 @@ public:
   }
 
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+  Rc<BufferAllocation> allocateExternalCpu(Flags<BufferAllocationFlag> flags,
+                                           void *memory);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 
@@ -163,6 +167,7 @@ public:
 
   BufferView const &view_(BufferViewKey key); 
   BufferView const &view_(BufferViewKey key, BufferAllocation *allocation);
+  BufferView *tryView(BufferViewKey key, BufferAllocation *allocation);
 
   DXMT_RESOURCE_RESIDENCY_STATE &residency(BufferViewKey key);
   DXMT_RESOURCE_RESIDENCY_STATE &residency(BufferViewKey key, BufferAllocation *allocation);

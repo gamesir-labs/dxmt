@@ -102,6 +102,28 @@ struct unixcall_mtldevice_newtexture {
   obj_handle_t ret;
 };
 
+struct unixcall_mtldevice_sparsetilesize {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  struct WMTMemoryPointer tile_size;
+  uint32_t ret;
+};
+
+struct unixcall_mtldevice_newplacementheap {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_updatesparsetexturemappings {
+  obj_handle_t device;
+  obj_handle_t texture;
+  obj_handle_t heap;
+  struct WMTConstMemoryPointer operations;
+  uint64_t operation_count;
+  uint32_t ret;
+};
+
 struct unixcall_mtlbuffer_newtexture {
   obj_handle_t buffer;
   struct WMTMemoryPointer info;

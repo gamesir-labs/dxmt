@@ -586,9 +586,37 @@ public:
                                    const D3D12_TILE_REGION_SIZE *tile_region_size,
                                    ID3D12Resource *buffer, UINT64 buffer_offset,
                                    D3D12_TILE_COPY_FLAGS flags) override {
-    // TODO(d3d12): implement tiled-resource tile copies once reserved resources
-    // and tile mappings are represented by the D3D12 resource layer.
-    WARN("D3D12GraphicsCommandList: CopyTiles is unsupported");
+    if (!tiled_resource || !tile_region_start_coordinate || !tile_region_size ||
+        !buffer)
+      return;
+    g_current_command_record_d3d_sequence =
+        dxmt::apitrace::record_copy_tiles(
+            this, tiled_resource, tile_region_start_coordinate,
+            tile_region_size, buffer, buffer_offset, flags);
+    if (g_apitrace_record_diag_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+      WARN("D3D12GraphicsCommandList: CopyTiles queued through minimal tiled-resource path"
+           " tiledResource=", tiled_resource,
+           " buffer=", buffer,
+           " bufferOffset=", buffer_offset,
+           " flags=", flags,
+           " subresource=", tile_region_start_coordinate->Subresource,
+           " x=", tile_region_start_coordinate->X,
+           " y=", tile_region_start_coordinate->Y,
+           " z=", tile_region_start_coordinate->Z,
+           " useBox=", tile_region_size->UseBox,
+           " numTiles=", tile_region_size->NumTiles,
+           " width=", tile_region_size->Width,
+           " height=", tile_region_size->Height,
+           " depth=", tile_region_size->Depth);
+    }
+    CopyTilesRecord record = {};
+    record.tiled_resource = tiled_resource;
+    record.start = *tile_region_start_coordinate;
+    record.size = *tile_region_size;
+    record.buffer = buffer;
+    record.buffer_offset = buffer_offset;
+    record.flags = flags;
+    AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource *dst_resource, UINT dst_sub_resource,
                                             ID3D12Resource *src_resource, UINT src_sub_resource,
@@ -841,6 +869,7 @@ public:
             this, start_slot, view_count, views);
     VertexBuffersRecord record = {};
     record.start_slot = start_slot;
+    record.view_count = view_count;
     if (views && view_count)
       record.views.assign(views, views + view_count);
     AddRecord(std::move(record));
@@ -1014,7 +1043,7 @@ public:
             this, heap, static_cast<uint32_t>(type), start_index, query_count,
             dst_buffer, aligned_dst_buffer_offset);
     AddRecord(ResolveQueryDataRecord{
-        heap, type, start_index, query_count, dst_buffer,
+        this, heap, type, start_index, query_count, dst_buffer,
         aligned_dst_buffer_offset});
   }
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *buffer, UINT64 aligned_buffer_offset,

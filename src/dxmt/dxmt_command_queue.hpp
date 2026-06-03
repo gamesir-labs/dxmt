@@ -114,10 +114,10 @@ public:
   void
   reset() {
     signal_frame_latency_fence_ = ~0ull;
+    readback = {};
     for (auto &callback : completion_callbacks)
       callback();
     completion_callbacks.clear();
-    readback = {};
     deferred_readbacks.clear();
     list_enc.reset();
     ref_tracker.clear();

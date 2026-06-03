@@ -1,5 +1,6 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_format.hpp"
+#include "log/log.hpp"
 #include "thread.hpp"
 #include "util_likely.hpp"
 #include "util_math.hpp"
@@ -36,7 +37,7 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
 };
 
 BufferAllocation::~BufferAllocation() {
-  if (placed_buffer) {
+  if (placed_buffer && !flags_.test(BufferAllocationFlag::ExternalCpuPlaced)) {
     wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;
   }
@@ -66,7 +67,9 @@ Buffer::view(BufferViewKey key) {
 
 WMT::Texture
 Buffer::view(BufferViewKey key, BufferAllocation *allocation) {
-  return view_(key, allocation).texture;
+  if (auto *view = tryView(key, allocation))
+    return view->texture;
+  return {};
 };
 
 BufferView const &
@@ -76,10 +79,28 @@ Buffer::view_(BufferViewKey key) {
 
 BufferView const &
 Buffer::view_(BufferViewKey key, BufferAllocation *allocation) {
+  auto *view = tryView(key, allocation);
+  if (likely(view != nullptr))
+    return *view;
+
+  WARN("DXMT: invalid buffer texture view requested view=", key,
+       " version=", version_,
+       " allocation=", reinterpret_cast<const void *>(allocation),
+       " length=", length_);
+  static BufferView null_view({}, 0, 0);
+  return null_view;
+};
+
+BufferView *
+Buffer::tryView(BufferViewKey key, BufferAllocation *allocation) {
+  if (unlikely(!allocation))
+    return nullptr;
   if (unlikely(allocation->version_ != version_)) {
     prepareAllocationViews(allocation);
   }
-  return *allocation->cached_view_[key];
+  if (unlikely(key >= allocation->cached_view_.size()))
+    return nullptr;
+  return allocation->cached_view_[key].get();
 };
 
 DXMT_RESOURCE_RESIDENCY_STATE &
@@ -89,10 +110,15 @@ Buffer::residency(BufferViewKey key) {
 
 DXMT_RESOURCE_RESIDENCY_STATE &
 Buffer::residency(BufferViewKey key, BufferAllocation *allocation) {
-  if (unlikely(allocation->version_ != version_)) {
-    prepareAllocationViews(allocation);
-  }
-  return allocation->cached_view_[key]->residency;
+  if (auto *view = tryView(key, allocation))
+    return view->residency;
+
+  WARN("DXMT: invalid buffer texture view residency requested view=", key,
+       " version=", version_,
+       " allocation=", reinterpret_cast<const void *>(allocation),
+       " length=", length_);
+  static DXMT_RESOURCE_RESIDENCY_STATE null_residency = {};
+  return null_residency;
 }
 
 void
@@ -172,6 +198,20 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
   info.memory.set(0);
   info.length = length_;
   info.options = options;
+  return new BufferAllocation(device_, info, flags);
+};
+
+Rc<BufferAllocation>
+Buffer::allocateExternalCpu(Flags<BufferAllocationFlag> flags, void *memory) {
+  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  }
+  WMTBufferInfo info;
+  info.memory.set(memory);
+  info.length = length_;
+  info.options = options;
+  flags.set(BufferAllocationFlag::ExternalCpuPlaced);
   return new BufferAllocation(device_, info, flags);
 };
 
