@@ -9522,10 +9522,10 @@ private:
       return;
     }
 
-    constexpr D3D12_TILE_COPY_FLAGS kDirectionFlags =
+    constexpr UINT kDirectionFlags =
         D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE |
         D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
-    if (record.flags & ~kDirectionFlags) {
+    if (static_cast<UINT>(record.flags) & ~kDirectionFlags) {
       WARN("D3D12CommandQueue: TODO CopyTiles unsupported flags flags=", record.flags);
       return;
     }
