@@ -41,6 +41,23 @@ dxmt_shaders_lib = metallib_generator.process(dxmt_shaders_ir)
 
 dxmt_shaders_header = hexdump_generator.process(dxmt_shaders_lib)
 
+dxmt_version_override = get_option('dxmt_version')
+if dxmt_version_override == ''
+  dxmt_version = vcs_tag(
+    command: ['git', 'describe', '--always'],
+    input:  '../../version.h.in',
+    output: 'version.h',
+  )
+else
+  dxmt_version_conf = configuration_data()
+  dxmt_version_conf.set('VCS_TAG', dxmt_version_override)
+  dxmt_version = configure_file(
+    input: '../../version.h.in',
+    output: 'version.h',
+    configuration: dxmt_version_conf,
+  )
+endif
+
 dxmt_lib = static_library('dxmt', dxmt_src, dxmt_shaders_header, dxmt_version,
   dependencies        : [ util_dep, airconv_forward_dep, winemetal_dep ] + apitrace_d3d_pe_deps,
   include_directories : [ dxmt_include_path ],
