@@ -4483,6 +4483,7 @@ private:
     });
   }
 
+  //fuck fh4 and Microsoft
   std::vector<ReplaySubresourceState> &
   GetReplayResourceStates(ReplayState &state, Resource &resource) {
     auto &entry = (*state.resource_states)[resource.GetD3D12Resource()];
