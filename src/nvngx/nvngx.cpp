@@ -327,6 +327,37 @@ NVSDK_NGX_D3D11_GetFeatureRequirements(
   return NVNGX_RESULT_FAIL;
 }
 
+namespace {
+// Lazy-resolve DXMT's custom DXGIGetDebugInterface1 from dxgi.dll at runtime.
+// Avoids a static import on dxgi.dll: a missing / corrupt / wrong-arch
+// dxgi.dll in the prefix would otherwise prevent nvngx.dll from loading at
+// all (STATUS_INVALID_IMAGE_NOT_MZ). With lazy resolution we still bail in
+// DllMain when DXMT's NV ext is unavailable, but only AFTER our own load
+// succeeds — leaving the rest of the application untouched.
+using PFN_DXGIGetDebugInterface1 = HRESULT(WINAPI *)(UINT, REFIID, void **);
+
+bool DxmtNvExtAvailable() {
+  HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+  if (!dxgi) {
+    WARN("dxgi.dll not loaded; DXMT NV extension unavailable");
+    return false;
+  }
+  auto pfn = reinterpret_cast<PFN_DXGIGetDebugInterface1>(
+      GetProcAddress(dxgi, "DXGIGetDebugInterface1"));
+  if (!pfn) {
+    WARN("dxgi.dll does not export DXGIGetDebugInterface1; "
+         "the loaded dxgi.dll is not DXMT (likely Wine builtin or Microsoft)");
+    return false;
+  }
+  if (FAILED(pfn(0, DXMT_NVEXT_GUID, nullptr))) {
+    INFO("DXMT NV extension not registered; "
+         "DXMT dxgi.dll is loaded but NV extension is disabled");
+    return false;
+  }
+  return true;
+}
+} // namespace
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
                                LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
@@ -335,7 +366,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
 
-  if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
+  if (!DxmtNvExtAvailable()) {
     return FALSE;
   }
 
