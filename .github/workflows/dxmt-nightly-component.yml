@@ -87,7 +87,7 @@ jobs:
       - name: Build x86_64 Wine Builtin Runtime
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
-          dxmt_version="dxmt-nightly-${short_sha}"
+          dxmt_version="${short_sha}"
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
           scripts/ci-self-hosted.sh prepare-ccache component-x86_64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++
@@ -119,7 +119,7 @@ jobs:
       - name: Build x86 Wine Builtin Runtime
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
-          dxmt_version="dxmt-nightly-${short_sha}"
+          dxmt_version="${short_sha}"
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
           scripts/ci-self-hosted.sh prepare-ccache component-x86 i686-w64-mingw32-gcc i686-w64-mingw32-g++
