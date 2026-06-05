@@ -142,8 +142,9 @@ jobs:
     env:
       CIAUTH_TOKEN: ${{ secrets.BACKEND_UPDATE_TOKEN }}
       COMPONENT_NAME: dxmt-nightly
-      COMPONENT_UPLOAD_URL: ${{ secrets.COMPONENT_UPLOAD_URL }}
-      COMPONENT_UPDATE_URL: ${{ secrets.COMPONENT_UPDATE_URL }}
+      DEV_COMPONENT_UPLOAD_URL: ${{ secrets.DEV_COMPONENT_UPLOAD_URL }}
+      DEV_COMPONENT_UPDATE_BASE_URL: ${{ secrets.DEV_COMPONENT_UPDATE_BASE_URL }}
+      DEV_COMPONENT_ID: ${{ secrets.DEV_COMPONENT_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -236,8 +237,9 @@ jobs:
       - name: Upload And Update Backend Component
         run: |
           test -n "${CIAUTH_TOKEN}" || { echo "::error::BACKEND_UPDATE_TOKEN is empty"; exit 1; }
-          test -n "${COMPONENT_UPLOAD_URL}" || { echo "::error::COMPONENT_UPLOAD_URL is empty"; exit 1; }
-          test -n "${COMPONENT_UPDATE_URL}" || { echo "::error::COMPONENT_UPDATE_URL is empty"; exit 1; }
+          test -n "${DEV_COMPONENT_UPLOAD_URL}" || { echo "::error::DEV_COMPONENT_UPLOAD_URL is empty"; exit 1; }
+          test -n "${DEV_COMPONENT_UPDATE_BASE_URL}" || { echo "::error::DEV_COMPONENT_UPDATE_BASE_URL is empty"; exit 1; }
+          test -n "${DEV_COMPONENT_ID}" || { echo "::error::DEV_COMPONENT_ID is empty"; exit 1; }
 
           package_file="${{ steps.version.outputs.package_file }}"
           case "${package_file}" in
@@ -258,7 +260,7 @@ jobs:
             fi
           }
 
-          upload_status="$(curl -sS -X POST "${COMPONENT_UPLOAD_URL}" \
+          upload_status="$(curl -sS -X POST "${DEV_COMPONENT_UPLOAD_URL}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -F "file=@${package_file}" \
             -F "dir=emulator" \
@@ -337,7 +339,7 @@ jobs:
               f.write("\n")
           PY
 
-          update_status="$(curl -sS -X PUT "${COMPONENT_UPDATE_URL}" \
+          update_status="$(curl -sS -X PUT "${DEV_COMPONENT_UPDATE_BASE_URL%/}/${DEV_COMPONENT_ID}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -H "Content-Type: application/json" \
             --data-binary @component-update.json \
