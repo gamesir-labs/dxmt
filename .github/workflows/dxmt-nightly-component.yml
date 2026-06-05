@@ -141,9 +141,9 @@ jobs:
     needs: [build-x86_64-windows, build-x86-windows]
     env:
       CIAUTH_TOKEN: ${{ secrets.BACKEND_UPDATE_TOKEN }}
-      COMPONENT_ID: "10000166"
       COMPONENT_NAME: dxmt-nightly
-      COMPONENT_API_BASE: https://<component-api-host>
+      COMPONENT_UPLOAD_URL: ${{ secrets.COMPONENT_UPLOAD_URL }}
+      COMPONENT_UPDATE_URL: ${{ secrets.COMPONENT_UPDATE_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -236,6 +236,8 @@ jobs:
       - name: Upload And Update Backend Component
         run: |
           test -n "${CIAUTH_TOKEN}" || { echo "::error::BACKEND_UPDATE_TOKEN is empty"; exit 1; }
+          test -n "${COMPONENT_UPLOAD_URL}" || { echo "::error::COMPONENT_UPLOAD_URL is empty"; exit 1; }
+          test -n "${COMPONENT_UPDATE_URL}" || { echo "::error::COMPONENT_UPDATE_URL is empty"; exit 1; }
 
           package_file="${{ steps.version.outputs.package_file }}"
           case "${package_file}" in
@@ -256,7 +258,7 @@ jobs:
             fi
           }
 
-          upload_status="$(curl -sS -X POST "${COMPONENT_API_BASE}/resource/v1/public/upload" \
+          upload_status="$(curl -sS -X POST "${COMPONENT_UPLOAD_URL}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -F "file=@${package_file}" \
             -F "dir=emulator" \
@@ -335,7 +337,7 @@ jobs:
               f.write("\n")
           PY
 
-          update_status="$(curl -sS -X PUT "${COMPONENT_API_BASE}/game/v1/public/simulator/component/${COMPONENT_ID}" \
+          update_status="$(curl -sS -X PUT "${COMPONENT_UPDATE_URL}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -H "Content-Type: application/json" \
             --data-binary @component-update.json \
