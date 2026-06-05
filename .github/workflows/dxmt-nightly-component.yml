@@ -243,11 +243,39 @@ jobs:
             *) echo "::error::component archive must end with .tzst"; exit 1 ;;
           esac
 
-          curl -fsS -X POST "${COMPONENT_API_BASE}/resource/v1/public/upload" \
+          print_response_body() {
+            local label="$1"
+            local response_path="$2"
+            if [[ -s "${response_path}" ]]; then
+              echo "::group::${label} response body"
+              cat "${response_path}"
+              echo
+              echo "::endgroup::"
+            else
+              echo "::warning::${label} response body is empty"
+            fi
+          }
+
+          upload_status="$(curl -sS -X POST "${COMPONENT_API_BASE}/resource/v1/public/upload" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -F "file=@${package_file}" \
             -F "dir=simulator" \
-            -o upload-response.json
+            -o upload-response.json \
+            -w '%{http_code}')" || {
+            curl_exit="$?"
+            echo "::error::upload request failed with curl exit ${curl_exit}"
+            print_response_body "upload" upload-response.json
+            exit "${curl_exit}"
+          }
+
+          case "${upload_status}" in
+            2??) ;;
+            *)
+              echo "::error::upload request failed with HTTP ${upload_status}"
+              print_response_body "upload" upload-response.json
+              exit 1
+              ;;
+          esac
 
           python3 - upload-response.json component-update.json <<'PY'
           import json
@@ -307,11 +335,26 @@ jobs:
               f.write("\n")
           PY
 
-          curl -fsS -X PUT "${COMPONENT_API_BASE}/game/v1/public/simulator/component/${COMPONENT_ID}" \
+          update_status="$(curl -sS -X PUT "${COMPONENT_API_BASE}/game/v1/public/simulator/component/${COMPONENT_ID}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -H "Content-Type: application/json" \
             --data-binary @component-update.json \
-            -o update-response.json
+            -o update-response.json \
+            -w '%{http_code}')" || {
+            curl_exit="$?"
+            echo "::error::component update request failed with curl exit ${curl_exit}"
+            print_response_body "component update" update-response.json
+            exit "${curl_exit}"
+          }
+
+          case "${update_status}" in
+            2??) ;;
+            *)
+              echo "::error::component update request failed with HTTP ${update_status}"
+              print_response_body "component update" update-response.json
+              exit 1
+              ;;
+          esac
 
           python3 - update-response.json <<'PY'
           import json
