@@ -789,18 +789,113 @@ ValidateRenderTargetView(ID3D12Resource *resource,
 static bool
 ValidateDepthStencilView(ID3D12Resource *resource,
                          const D3D12_DEPTH_STENCIL_VIEW_DESC &desc) {
+  auto log_invalid = [&](const char *reason) {
+    const auto *resource_desc = GetResourceDesc(resource);
+    WARN("D3D12Device: invalid DSV descriptor reason=", reason,
+         " resource=", reinterpret_cast<uintptr_t>(resource),
+         " resource_dimension=", resource_desc ? uint32_t(resource_desc->Dimension) : 0,
+         " resource_size=", resource_desc ? uint64_t(resource_desc->Width) : 0,
+         "x", resource_desc ? uint32_t(resource_desc->Height) : 0,
+         "x", resource_desc ? uint32_t(resource_desc->DepthOrArraySize) : 0,
+         " resource_mips=", resource_desc ? uint32_t(resource_desc->MipLevels) : 0,
+         " resource_format=", resource_desc ? uint32_t(resource_desc->Format) : 0,
+         " resource_samples=", resource_desc ? uint32_t(resource_desc->SampleDesc.Count) : 0,
+         " view_format=", uint32_t(desc.Format),
+         " view_dimension=", uint32_t(desc.ViewDimension),
+         " flags=", uint32_t(desc.Flags),
+         " tex1d_mip=", uint32_t(desc.Texture1D.MipSlice),
+         " tex1d_array_mip=", uint32_t(desc.Texture1DArray.MipSlice),
+         " tex1d_array_first=", uint32_t(desc.Texture1DArray.FirstArraySlice),
+         " tex1d_array_size=", uint32_t(desc.Texture1DArray.ArraySize),
+         " tex2d_mip=", uint32_t(desc.Texture2D.MipSlice),
+         " tex2d_array_mip=", uint32_t(desc.Texture2DArray.MipSlice),
+         " tex2d_array_first=", uint32_t(desc.Texture2DArray.FirstArraySlice),
+         " tex2d_array_size=", uint32_t(desc.Texture2DArray.ArraySize),
+         " tex2dms_array_first=", uint32_t(desc.Texture2DMSArray.FirstArraySlice),
+         " tex2dms_array_size=", uint32_t(desc.Texture2DMSArray.ArraySize));
+  };
+
+  switch (desc.ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1D:
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+  case D3D12_DSV_DIMENSION_TEXTURE2D:
+  case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+  case D3D12_DSV_DIMENSION_TEXTURE2DMS:
+  case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+    break;
+  default:
+    log_invalid("unsupported dimension");
+    return false;
+  }
+
   const auto *resource_desc = GetResourceDesc(resource);
-  if (!resource_desc || !IsTextureResource(resource))
+  if (!resource_desc)
     return true;
+  if (!IsTextureResource(resource)) {
+    log_invalid("non-texture resource");
+    return false;
+  }
+
+  const bool is_1d_view =
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D ||
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY;
+  const bool is_2d_view =
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D ||
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY ||
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS ||
+      desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+  if ((is_1d_view && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D) ||
+      (is_2d_view && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)) {
+    log_invalid("view dimension does not match resource dimension");
+    return false;
+  }
+
   const bool resource_msaa = resource_desc->SampleDesc.Count > 1;
   const bool view_msaa =
       desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS ||
       desc.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
   if (resource_msaa != view_msaa) {
-    WARN("D3D12Device: DSV multisample dimension does not match resource sample count");
+    log_invalid("multisample dimension does not match resource sample count");
     return false;
   }
-  return true;
+
+  auto validate_mip = [&](UINT mip) {
+    if (mip >= resource_desc->MipLevels) {
+      log_invalid("mip slice out of range");
+      return false;
+    }
+    return true;
+  };
+  auto validate_array = [&](UINT first, UINT count) {
+    if (count == 0 || first >= resource_desc->DepthOrArraySize ||
+        count > resource_desc->DepthOrArraySize - first) {
+      log_invalid("array slice range out of range");
+      return false;
+    }
+    return true;
+  };
+
+  switch (desc.ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1D:
+    return validate_mip(desc.Texture1D.MipSlice);
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+    return validate_mip(desc.Texture1DArray.MipSlice) &&
+           validate_array(desc.Texture1DArray.FirstArraySlice,
+                          desc.Texture1DArray.ArraySize);
+  case D3D12_DSV_DIMENSION_TEXTURE2D:
+    return validate_mip(desc.Texture2D.MipSlice);
+  case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+    return validate_mip(desc.Texture2DArray.MipSlice) &&
+           validate_array(desc.Texture2DArray.FirstArraySlice,
+                          desc.Texture2DArray.ArraySize);
+  case D3D12_DSV_DIMENSION_TEXTURE2DMS:
+    return true;
+  case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+    return validate_array(desc.Texture2DMSArray.FirstArraySlice,
+                          desc.Texture2DMSArray.ArraySize);
+  default:
+    return false;
+  }
 }
 
 static void
@@ -1828,8 +1923,14 @@ public:
     record->type = DescriptorRecordType::DepthStencilView;
     record->resource = resource;
     if (desc) {
-      if (!ValidateDepthStencilView(resource, *desc))
+      if (!ValidateDepthStencilView(resource, *desc)) {
+        WARN("D3D12Device: rejecting invalid DSV descriptor"
+             " cpuHandle=", uint64_t(descriptor.ptr),
+             " heapIndex=", record->heap_index,
+             " heapCount=", record->heap_count);
+        ResetDescriptorRecord(*record);
         return;
+      }
       record->desc.dsv = *desc;
       record->has_desc = true;
     }

@@ -15,6 +15,7 @@ endif
 
 winemetal_unix_ld_args = [
   '-Wl,-install_name,@rpath/winemetal.so',
+  '-Wl,-exported_symbols_list,' + join_paths(meson.current_source_dir(), 'exports.list'),
   wine_build_path != '' ? winemac_so.full_path() : winemac_so,
   wine_build_path != '' ? ntdll_so.full_path() : ntdll_so,
   '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
@@ -27,6 +28,7 @@ winemetal_unix_link_depends = []
 if wine_build_path != ''
   winemetal_unix_link_depends += [winemac_so, ntdll_so]
 endif
+winemetal_unix_link_depends += files('exports.list')
 winemetal_unix_link_depends += apitrace_metal_native_link_depends
 
 winemetal_unix_deps = [ airconv_dep_darwin ] + apitrace_metal_native_deps

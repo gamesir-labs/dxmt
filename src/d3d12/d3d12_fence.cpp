@@ -4,23 +4,121 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
+#include "thread.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <deque>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 namespace dxmt::d3d12 {
 namespace {
 
+class CompletionCallbackRunner {
+public:
+  CompletionCallbackRunner()
+      : worker_([this]() { WorkerThread(); }) {}
+
+  ~CompletionCallbackRunner() {
+    {
+      std::lock_guard lock(mutex_);
+      stopped_ = true;
+    }
+    cond_.notify_all();
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+  void Enqueue(std::vector<std::function<void()>> callbacks) {
+    if (callbacks.empty())
+      return;
+
+    {
+      std::lock_guard lock(mutex_);
+      for (auto &callback : callbacks)
+        callbacks_.push_back(std::move(callback));
+    }
+    cond_.notify_one();
+  }
+
+private:
+  void WorkerThread() {
+    for (;;) {
+      std::function<void()> callback;
+      {
+        std::unique_lock lock(mutex_);
+        cond_.wait(lock, [this]() { return stopped_ || !callbacks_.empty(); });
+        if (stopped_ && callbacks_.empty())
+          return;
+
+        callback = std::move(callbacks_.front());
+        callbacks_.pop_front();
+      }
+
+      callback();
+    }
+  }
+
+  dxmt::mutex mutex_;
+  dxmt::condition_variable cond_;
+  std::deque<std::function<void()>> callbacks_;
+  bool stopped_ = false;
+  dxmt::thread worker_;
+};
+
+static CompletionCallbackRunner &
+GetCompletionCallbackRunner() {
+  static CompletionCallbackRunner runner;
+  return runner;
+}
+
 static void
 RunCompletionCallbacksAsync(std::vector<std::function<void()>> callbacks) {
-  for (auto &callback : callbacks)
-    callback();
+  GetCompletionCallbackRunner().Enqueue(std::move(callbacks));
+}
+
+static bool
+D3D12FenceDiagEnabled() {
+  static const bool enabled = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_D3D12_FENCE");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_DIAG_COMMAND_QUEUE");
+    return value == "1" || value == "true" || value == "yes" ||
+           value == "trace";
+  }();
+  return enabled;
+}
+
+static uint32_t
+D3D12FenceDiagLogLimit() {
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_FENCE_LIMIT");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
+    if (value.empty())
+      return 2000u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 2000u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return limit;
+}
+
+static bool
+D3D12FenceDiagShouldLog(std::atomic<uint32_t> &counter) {
+  if (!D3D12FenceDiagEnabled())
+    return false;
+  return counter.fetch_add(1, std::memory_order_relaxed) <
+         D3D12FenceDiagLogLimit();
 }
 
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
@@ -29,6 +127,14 @@ public:
       : device_(device), event_(device->GetMTLDevice().newSharedEvent()), flags_(flags),
         completed_value_(initial_value), has_manual_completed_value_(false) {
     event_.signalValue(initial_value);
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: CreateFence"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " initial=", initial_value,
+           " flags=", flags,
+           " sharedEvent=", reinterpret_cast<uintptr_t>(event_.handle));
+    }
   }
 
   ~FenceImpl() override {
@@ -94,15 +200,42 @@ public:
 
   UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
     std::lock_guard lock(mutex_);
-    return GetCompletedValueLocked();
+    const UINT64 value = GetCompletedValueLocked();
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: GetCompletedValue"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " value=", value,
+           " manual=", has_manual_completed_value_,
+           " pendingEvents=", pending_events_.size(),
+           " pendingCallbacks=", pending_callbacks_.size());
+    }
+    return value;
   }
 
   UINT64 GetCompletedValue() const override {
     std::lock_guard lock(mutex_);
-    return GetCompletedValueLocked();
+    const UINT64 value = GetCompletedValueLocked();
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: GetCompletedValue internal"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " value=", value,
+           " manual=", has_manual_completed_value_,
+           " pendingEvents=", pending_events_.size(),
+           " pendingCallbacks=", pending_callbacks_.size());
+    }
+    return value;
   }
 
   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: SetEventOnCompletion enter"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " target=", value,
+           " event=", reinterpret_cast<uintptr_t>(event));
+    }
     if (!event) {
       while (true) {
         {
@@ -127,10 +260,23 @@ public:
     if (signal_now)
       SetEvent(event);
 
+    static std::atomic<uint32_t> result_log_count = 0;
+    if (D3D12FenceDiagShouldLog(result_log_count)) {
+      WARN("D3D12 fence diagnostic: SetEventOnCompletion result"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " target=", value,
+           " signalNow=", signal_now);
+    }
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: Signal CPU"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " value=", value);
+    }
     std::vector<HANDLE> events_to_signal;
     std::vector<std::function<void()>> callbacks_to_run;
     {
@@ -142,8 +288,7 @@ public:
     event_.signalValue(value);
     for (HANDLE event : events_to_signal)
       SetEvent(event);
-    for (auto &callback : callbacks_to_run)
-      callback();
+    RunCompletionCallbacksAsync(std::move(callbacks_to_run));
     return S_OK;
   }
 
@@ -158,6 +303,12 @@ public:
   }
 
   void SetCompletedValue(UINT64 value) override {
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: SetCompletedValue queue-complete"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " value=", value);
+    }
     std::vector<HANDLE> events_to_signal;
     std::vector<std::function<void()>> callbacks_to_run;
     {
@@ -173,10 +324,22 @@ public:
   }
 
   void SignalFromQueue(UINT64 value) override {
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: SignalFromQueue"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " value=", value);
+    }
     Signal(value);
   }
 
   void AddCompletionCallback(UINT64 value, std::function<void()> callback) override {
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12FenceDiagShouldLog(log_count)) {
+      WARN("D3D12 fence diagnostic: AddCompletionCallback"
+           " fence=", reinterpret_cast<uintptr_t>(this),
+           " target=", value);
+    }
     bool run_now = false;
     {
       std::lock_guard lock(mutex_);
@@ -188,7 +351,9 @@ public:
     }
 
     if (run_now) {
-      callback();
+      std::vector<std::function<void()>> callbacks;
+      callbacks.push_back(std::move(callback));
+      RunCompletionCallbacksAsync(std::move(callbacks));
       return;
     }
   }

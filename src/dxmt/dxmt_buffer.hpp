@@ -118,6 +118,18 @@ public:
   void
   flushCpuShadow(uint64_t offset, uint64_t length, uint32_t suballocation = 0) noexcept;
 
+  void
+  didModifyRange(uint64_t offset, uint64_t length, uint32_t suballocation = 0) noexcept {
+    if (unlikely(!length))
+      return;
+    if (unlikely(suballocation >= suballocation_count_ || offset >= suballocation_size_))
+      return;
+    auto max_length = suballocation_size_ - offset;
+    if (length > max_length)
+      length = max_length;
+    obj_.didModifyRange(suballocation * suballocation_size_ + offset, length);
+  }
+
   DXMT_RESOURCE_RESIDENCY_STATE residencyState;
   small_vector<GenericAccessTracker, 1> fenceTrackers;
 

@@ -4,11 +4,42 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
+#include <atomic>
 #include <cstring>
 
 namespace dxmt::d3d12 {
 namespace {
+
+static bool
+D3D12QueryDiagEnabled() {
+  static const bool enabled = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_D3D12_QUERY");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_DIAG_COMMAND_QUEUE");
+    return value == "1" || value == "true" || value == "yes" ||
+           value == "trace";
+  }();
+  return enabled;
+}
+
+static bool
+D3D12QueryDiagShouldLog(std::atomic<uint32_t> &counter) {
+  if (!D3D12QueryDiagEnabled())
+    return false;
+  auto value = env::getEnvVar("DXMT_DIAG_QUERY_LIMIT");
+  if (value.empty())
+    value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
+  uint32_t limit = 2000;
+  if (!value.empty()) {
+    char *end = nullptr;
+    const auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end != value.c_str())
+      limit = static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }
+  return counter.fetch_add(1, std::memory_order_relaxed) < limit;
+}
 
 class QueryHeapImpl final : public ComObjectWithInitialRef<ID3D12QueryHeap>,
                             public QueryHeap {
@@ -162,6 +193,16 @@ public:
   bool Resolve(D3D12_QUERY_TYPE type, UINT start_index, UINT query_count,
                std::vector<uint8_t> &data) const override {
     const auto stride = ResolveStride(type);
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12QueryDiagShouldLog(log_count)) {
+      WARN("D3D12 query diagnostic: Resolve enter"
+           " heap=", reinterpret_cast<uintptr_t>(this),
+           " heapType=", desc_.Type,
+           " type=", type,
+           " start=", start_index,
+           " count=", query_count,
+           " stride=", stride);
+    }
     if (!stride)
       return false;
     if (!query_count)
@@ -174,6 +215,16 @@ public:
     for (UINT i = 0; i < query_count; i++) {
       const auto &query = queries_[start_index + i];
       const auto offset = size_t(i) * stride;
+      if (D3D12QueryDiagShouldLog(log_count)) {
+        WARN("D3D12 query diagnostic: Resolve query"
+             " heap=", reinterpret_cast<uintptr_t>(this),
+             " type=", type,
+             " index=", start_index + i,
+             " began=", query.began,
+             " valid=", query.valid,
+             " hasVisibility=", bool(query.visibility),
+             " hasTimestamp=", bool(query.timestamp));
+      }
       switch (type) {
       case D3D12_QUERY_TYPE_OCCLUSION:
       case D3D12_QUERY_TYPE_BINARY_OCCLUSION: {
@@ -209,6 +260,15 @@ public:
         WARN("D3D12QueryHeap: unsupported resolve query type ", type);
         return false;
       }
+    }
+    if (D3D12QueryDiagShouldLog(log_count)) {
+      WARN("D3D12 query diagnostic: Resolve leave"
+           " heap=", reinterpret_cast<uintptr_t>(this),
+           " heapType=", desc_.Type,
+           " type=", type,
+           " start=", start_index,
+           " count=", query_count,
+           " bytes=", data.size());
     }
     return true;
   }

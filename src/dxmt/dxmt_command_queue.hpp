@@ -153,6 +153,7 @@ private:
   uint64_t encoder_seq = 1;
   uint64_t frame_count = 0;
   uint32_t max_latency_ = 3;
+  uint64_t diag_last_gpu_end_ns_ = 0;
 
   dxmt::thread encodeThread;
   dxmt::thread finishThread;

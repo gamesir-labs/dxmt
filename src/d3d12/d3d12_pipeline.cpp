@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string_view>
 #include <span>
@@ -1036,19 +1037,70 @@ D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
   for (const auto &shader : shaders) {
     const auto digest = PipelineShaderDigest(shader);
     const auto stage = ShaderStageName(shader.stage);
+    const auto bytecode_kind =
+        shader.kind == PipelineShaderBytecodeKind::Dxil ? "dxil" : "dxbc";
     const auto filename = env::getExeBaseName() + "_d3d12_" + key_prefix +
-                          "_" + stage + "_" + digest.substr(0, 16) + ".dxil";
+                          "_" + stage + "_" + digest.substr(0, 16) + "." +
+                          bytecode_kind;
     const auto path = dir + filename;
     std::ofstream dump(path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (dump && !shader.bytecode.empty())
       dump.write(reinterpret_cast<const char *>(shader.bytecode.data()),
                  shader.bytecode.size());
     if (manifest)
-      manifest << stage << "=" << digest << " " << filename
-               << " bytes=" << shader.bytecode.size() << "\n";
+      manifest << stage << "=" << digest << " kind=" << bytecode_kind << " "
+               << filename << " bytes=" << shader.bytecode.size() << "\n";
   }
 
   WARN("D3D12PipelineState: dumped ", kind, " pipeline shaders to ",
+       manifest_path);
+}
+
+void
+D3D12DumpFailedPipelineShader(const PipelineDxilShader &shader,
+                              const char *function_name,
+                              std::string_view error_message,
+                              int compile_result,
+                              uintptr_t error_handle) {
+  static std::atomic<uint32_t> failure_count = 0;
+  const auto index = failure_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= 32)
+    return;
+
+  const auto dir = D3D12PipelineDumpDirectory();
+  const auto digest = PipelineShaderDigest(shader);
+  const auto stage = ShaderStageName(shader.stage);
+  const auto kind =
+      shader.kind == PipelineShaderBytecodeKind::Dxil ? "dxil" : "dxbc";
+  const auto prefix = env::getExeBaseName() + "_d3d12_airconv_fail_" +
+                      std::to_string(index) + "_" + stage + "_" +
+                      digest.substr(0, 16);
+  const auto shader_filename = prefix + "." + kind;
+  const auto shader_path = dir + shader_filename;
+  const auto manifest_path = dir + prefix + ".txt";
+
+  std::ofstream dump(shader_path,
+                     std::ios::out | std::ios::binary | std::ios::trunc);
+  if (dump && !shader.bytecode.empty())
+    dump.write(reinterpret_cast<const char *>(shader.bytecode.data()),
+               shader.bytecode.size());
+
+  std::ofstream manifest(manifest_path, std::ios::out | std::ios::trunc);
+  if (manifest) {
+    manifest << "stage=" << stage << "\n"
+             << "kind=" << kind << "\n"
+             << "digest=" << digest << "\n"
+             << "bytes=" << shader.bytecode.size() << "\n"
+             << "function=shader_main\n"
+             << "requestedFunction=" << function_name << "\n"
+             << "compileResult=" << compile_result << "\n"
+             << "errorHandle=0x" << std::hex << error_handle << std::dec
+             << "\n"
+             << "errorMessage=" << error_message << "\n"
+             << "shaderFile=" << shader_filename << "\n";
+  }
+
+  WARN("D3D12PipelineState: dumped failed airconv shader to ",
        manifest_path);
 }
 
@@ -1174,24 +1226,45 @@ GetShaderFlags() {
   return SM50_SHADER_FLAG(0);
 }
 
+std::mutex &
+AirconvCompileMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
 bool
 CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      const char *function_name,
                      SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
                      PipelineMetalShader &out) {
+  const char *air_function_name = "shader_main";
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  const auto compile_failed =
-      shader.kind == PipelineShaderBytecodeKind::Dxil
-          ? DXILCompile(shader.shader, args, function_name, &bitcode_handle,
-                        &error)
-          : SM50Compile(shader.shader, args, function_name, &bitcode_handle,
-                        &error);
+  int compile_failed = 0;
+  {
+    std::lock_guard lock(AirconvCompileMutex());
+    compile_failed = shader.kind == PipelineShaderBytecodeKind::Dxil
+                         ? DXILCompile(shader.shader, args, air_function_name,
+                                       &bitcode_handle, &error)
+                         : SM50Compile(shader.shader, args, air_function_name,
+                                       &bitcode_handle, &error);
+  }
   if (compile_failed) {
+    auto error_message = SM50GetErrorMessageString(error);
+    WARN("D3D12PipelineState: airconv compile diagnostic stage=",
+         ShaderStageName(shader.stage),
+         shader.kind == PipelineShaderBytecodeKind::Dxil ? " kind=DXIL"
+                                                         : " kind=DXBC",
+         " ret=", compile_failed, " error=", reinterpret_cast<uintptr_t>(error),
+         " message_len=", error_message.size(), " function=", air_function_name,
+         " requestedFunction=", function_name);
     WARN("D3D12PipelineState: failed to compile ", ShaderStageName(shader.stage),
          shader.kind == PipelineShaderBytecodeKind::Dxil ? " DXIL shader: "
                                                          : " DXBC shader: ",
-         SM50GetErrorMessageString(error));
+         error_message);
+    D3D12DumpFailedPipelineShader(shader, function_name, error_message,
+                                  compile_failed,
+                                  reinterpret_cast<uintptr_t>(error));
     SM50FreeError(error);
     return false;
   }
@@ -1211,9 +1284,10 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
     return false;
   }
 
-  out.function = out.library.newFunction(function_name);
+  out.function = out.library.newFunction(air_function_name);
   if (!out.function) {
-    WARN("D3D12PipelineState: Metal function not found: ", function_name);
+    WARN("D3D12PipelineState: Metal function not found: ", air_function_name,
+         " requestedFunction=", function_name);
     return false;
   }
 
@@ -1263,9 +1337,13 @@ CompileGeometryPipelineVertexFunction(
 
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  if (SM50CompileGeometryPipelineVertex(vs.shader, gs.shader, args,
-                                        function_name, &bitcode_handle,
-                                        &error)) {
+  int compile_failed = 0;
+  {
+    std::lock_guard lock(AirconvCompileMutex());
+    compile_failed = SM50CompileGeometryPipelineVertex(
+        vs.shader, gs.shader, args, function_name, &bitcode_handle, &error);
+  }
+  if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC geometry vertex shader: ",
          SM50GetErrorMessageString(error));
     SM50FreeError(error);
@@ -1289,9 +1367,13 @@ CompileGeometryPipelineGeometryFunction(
 
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  if (SM50CompileGeometryPipelineGeometry(vs.shader, gs.shader, args,
-                                          function_name, &bitcode_handle,
-                                          &error)) {
+  int compile_failed = 0;
+  {
+    std::lock_guard lock(AirconvCompileMutex());
+    compile_failed = SM50CompileGeometryPipelineGeometry(
+        vs.shader, gs.shader, args, function_name, &bitcode_handle, &error);
+  }
+  if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC geometry shader: ",
          SM50GetErrorMessageString(error));
     SM50FreeError(error);
@@ -1317,9 +1399,13 @@ CompileTessellationPipelineHullFunction(
 
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  if (SM50CompileTessellationPipelineHull(vs.shader, hs.shader, args,
-                                          function_name, &bitcode_handle,
-                                          &error)) {
+  int compile_failed = 0;
+  {
+    std::lock_guard lock(AirconvCompileMutex());
+    compile_failed = SM50CompileTessellationPipelineHull(
+        vs.shader, hs.shader, args, function_name, &bitcode_handle, &error);
+  }
+  if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC tessellation hull shader: ",
          SM50GetErrorMessageString(error));
     SM50FreeError(error);
@@ -1344,9 +1430,13 @@ CompileTessellationPipelineDomainFunction(
 
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  if (SM50CompileTessellationPipelineDomain(hs.shader, ds.shader, args,
-                                            function_name, &bitcode_handle,
-                                            &error)) {
+  int compile_failed = 0;
+  {
+    std::lock_guard lock(AirconvCompileMutex());
+    compile_failed = SM50CompileTessellationPipelineDomain(
+        hs.shader, ds.shader, args, function_name, &bitcode_handle, &error);
+  }
+  if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC tessellation domain shader: ",
          SM50GetErrorMessageString(error));
     SM50FreeError(error);

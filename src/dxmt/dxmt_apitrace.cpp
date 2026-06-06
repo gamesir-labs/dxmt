@@ -34,6 +34,9 @@ std::atomic_bool crash_flush_handler_installed = false;
 std::atomic_bool crash_flush_running = false;
 #endif
 
+constexpr const char *kTraceBundleEnv = "APITRACE_TRACE_BUNDLE";
+constexpr const char *kTraceOutputDirEnv = "DXMT_APITRACE_TRACE_OUTPUT_DIR";
+
 bool
 truthy_env_value(const std::string &value) {
   return value == "1" || value == "true" || value == "yes" || value == "trace";
@@ -71,6 +74,22 @@ log_verbose(const char *message, uint64_t arg0 = 0, uint64_t arg1 = 0) {
     return;
 
   INFO("DXMT apitrace: ", message, " arg0=", arg0, " arg1=", arg1);
+}
+
+bool
+ends_with(const std::string &value, const char *suffix) {
+  const std::string suffix_string(suffix);
+  return value.size() >= suffix_string.size() &&
+         value.compare(value.size() - suffix_string.size(), suffix_string.size(), suffix_string) == 0;
+}
+
+std::string
+join_unix_path(const std::string &base, const std::string &child) {
+  if (base.empty())
+    return child;
+  if (base.back() == '/')
+    return base + child;
+  return base + "/" + child;
 }
 
 uint64_t
@@ -124,30 +143,73 @@ default_bundle_root() {
   return base_dir + "/trace-" + timestamp + ".apitrace";
 }
 
+std::string
+bundle_root_from_output_dir(const std::string &value) {
+  if (value.empty())
+    return {};
+
+  const auto unix_path = env::getUnixPath(value);
+  if (unix_path.empty())
+    return {};
+
+  env::createDirectory(unix_path);
+  return join_unix_path(unix_path, env::getExeName() + ".apitrace");
+}
+
+std::string
+bundle_root_from_env(const std::string &value, bool *directory_mode) {
+  if (directory_mode)
+    *directory_mode = false;
+  if (value.empty())
+    return {};
+
+  const auto unix_path = env::getUnixPath(value);
+  if (unix_path.empty())
+    return {};
+
+  if (ends_with(unix_path, ".apitrace"))
+    return unix_path;
+
+  if (directory_mode)
+    *directory_mode = true;
+  return bundle_root_from_output_dir(unix_path);
+}
+
 void
 initialize_bundle_root() {
-  auto trace_bundle = env::getEnvVar("APITRACE_TRACE_BUNDLE");
+  bool directory_mode = false;
+  auto trace_bundle = bundle_root_from_output_dir(env::getEnvVar(kTraceOutputDirEnv));
+
+  if (trace_bundle.empty())
+    trace_bundle = bundle_root_from_env(env::getEnvVar(kTraceBundleEnv), &directory_mode);
 
   if (trace_bundle.empty())
     trace_bundle = default_bundle_root();
 
-  if (!trace_bundle.empty())
-    set_env_var("APITRACE_TRACE_BUNDLE", trace_bundle.c_str());
+  if (!trace_bundle.empty()) {
+    if (directory_mode)
+      set_env_var(kTraceOutputDirEnv, env::getEnvVar(kTraceBundleEnv).c_str());
+    set_env_var(kTraceBundleEnv, trace_bundle.c_str());
+  }
 
   if (verbose_enabled()) {
-    const char *trace_crt_view = std::getenv("APITRACE_TRACE_BUNDLE");
+    const char *trace_crt_view = std::getenv(kTraceBundleEnv);
+    const char *output_dir_crt_view = std::getenv(kTraceOutputDirEnv);
     INFO("DXMT apitrace: bundle root ", trace_bundle);
     INFO("DXMT apitrace: APITRACE_TRACE_BUNDLE crt-view=", trace_crt_view ? trace_crt_view : "(null)");
+    INFO("DXMT apitrace: DXMT_APITRACE_TRACE_OUTPUT_DIR crt-view=", output_dir_crt_view ? output_dir_crt_view : "(null)");
   }
 }
 
 #ifdef _WIN32
 bool
 is_debug_exception(DWORD code) {
+  constexpr DWORD kThreadNameException = 0x406D1388;
   return code == DBG_PRINTEXCEPTION_C ||
          code == DBG_PRINTEXCEPTION_WIDE_C ||
          code == DBG_CONTROL_C ||
-         code == DBG_CONTROL_BREAK;
+         code == DBG_CONTROL_BREAK ||
+         code == kThreadNameException;
 }
 
 void

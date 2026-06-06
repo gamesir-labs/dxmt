@@ -37,6 +37,7 @@
 #include <tuple>
 #include <sstream>
 #include <type_traits>
+#include <typeinfo>
 #include <unordered_map>
 #include <vector>
 
@@ -717,6 +718,58 @@ D3D12DiagLogTextureView(const char *kind, Resource &resource,
        " view_array=", uint32_t(view.firstArraySlice),
        " view_array_size=", uint32_t(view.arraySize),
        " view_usage=", uint32_t(view.intendedUsage));
+}
+
+static void
+D3D12DiagLogDSVReplayDescriptor(const char *context, Resource &resource,
+                                const DescriptorRecord &descriptor,
+                                const TextureViewDescriptor &view,
+                                TextureViewKey key) {
+  static std::atomic<uint32_t> log_count = 0;
+  if (!D3D12DiagShouldLog(log_count, D3D12DiagViewEnabled()))
+    return;
+
+  auto *texture = resource.GetTexture();
+  const auto &desc = resource.GetResourceDesc();
+  const auto &dsv = descriptor.desc.dsv;
+  WARN("D3D12 diagnostic: DSV replay descriptor"
+       " context=", context,
+       " key=", uint64_t(key),
+       " descriptorType=", DescriptorRecordTypeName(descriptor.type),
+       " cpuHandle=", uint64_t(descriptor.cpu_handle.ptr),
+       " heapIndex=", descriptor.heap_index,
+       " heapCount=", descriptor.heap_count,
+       " has_desc=", descriptor.has_desc,
+       " resource=", uint64_t(resource.GetD3D12Resource()),
+       " resource_dimension=", uint32_t(desc.Dimension),
+       " resource_size=", uint64_t(desc.Width), "x", uint32_t(desc.Height),
+       "x", uint32_t(desc.DepthOrArraySize),
+       " resource_mips=", uint32_t(desc.MipLevels),
+       " resource_format=", uint32_t(desc.Format),
+       " resource_samples=", uint32_t(desc.SampleDesc.Count),
+       " texture_descriptor=", uint64_t(texture),
+       " texture_type=", texture ? uint32_t(texture->textureType()) : 0,
+       " texture_size=", texture ? texture->width() : 0, "x",
+       texture ? texture->height() : 0, "x",
+       texture ? texture->depth() : 0,
+       " texture_array=", texture ? texture->arrayLength() : 0,
+       " texture_mips=", texture ? texture->miplevelCount() : 0,
+       " texture_samples=", texture ? texture->sampleCount() : 0,
+       " dsv_format=", descriptor.has_desc ? uint32_t(dsv.Format) : 0,
+       " dsv_dimension=", descriptor.has_desc ? uint32_t(dsv.ViewDimension) : 0,
+       " dsv_flags=", descriptor.has_desc ? uint32_t(dsv.Flags) : 0,
+       " dsv_tex2d_mip=", descriptor.has_desc ? uint32_t(dsv.Texture2D.MipSlice) : 0,
+       " dsv_tex2d_array_mip=", descriptor.has_desc ? uint32_t(dsv.Texture2DArray.MipSlice) : 0,
+       " dsv_tex2d_array_first=", descriptor.has_desc ? uint32_t(dsv.Texture2DArray.FirstArraySlice) : 0,
+       " dsv_tex2d_array_size=", descriptor.has_desc ? uint32_t(dsv.Texture2DArray.ArraySize) : 0,
+       " dsv_tex2dms_array_first=", descriptor.has_desc ? uint32_t(dsv.Texture2DMSArray.FirstArraySlice) : 0,
+       " dsv_tex2dms_array_size=", descriptor.has_desc ? uint32_t(dsv.Texture2DMSArray.ArraySize) : 0,
+       " view_format=", uint32_t(view.format),
+       " view_type=", uint32_t(view.type),
+       " view_mip=", uint32_t(view.firstMiplevel),
+       " view_mips=", uint32_t(view.miplevelCount),
+       " view_array=", uint32_t(view.firstArraySlice),
+       " view_array_size=", uint32_t(view.arraySize));
 }
 
 static bool
@@ -1537,8 +1590,20 @@ CreateDepthStencilView(WMT::Device device, Resource &resource,
       return {};
 
     switch (dsv.ViewDimension) {
+    case D3D12_DSV_DIMENSION_TEXTURE1D:
+      view.type = WMTTextureType2D;
+      view.firstMiplevel = dsv.Texture1D.MipSlice;
+      view.arraySize = 1;
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+      view.type = WMTTextureType2DArray;
+      view.firstMiplevel = dsv.Texture1DArray.MipSlice;
+      view.firstArraySlice = dsv.Texture1DArray.FirstArraySlice;
+      view.arraySize = dsv.Texture1DArray.ArraySize;
+      break;
     case D3D12_DSV_DIMENSION_TEXTURE2D:
       view.firstMiplevel = dsv.Texture2D.MipSlice;
+      view.arraySize = 1;
       break;
     case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
       view.type = WMTTextureType2DArray;
@@ -1560,6 +1625,9 @@ CreateDepthStencilView(WMT::Device device, Resource &resource,
   }
 
   auto key = texture->createView(view);
+  if (!key)
+    D3D12DiagLogDSVReplayDescriptor("createView returned empty key", resource,
+                                    descriptor, view, key);
   D3D12DiagLogTextureView("DSV", resource, descriptor, view, key);
   return key;
 }
@@ -2463,7 +2531,17 @@ public:
   CommandQueueImpl(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC &desc,
                    std::shared_ptr<CommandQueueResourceStates> resource_states)
       : device_(device), desc_(desc),
-        resource_states_(std::move(resource_states)) {}
+        resource_states_(std::move(resource_states)) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: CreateCommandQueue"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " type=", desc_.Type,
+           " priority=", desc_.Priority,
+           " flags=", desc_.Flags,
+           " nodeMask=", desc_.NodeMask);
+    }
+  }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
     if (!ppvObject)
@@ -2865,7 +2943,9 @@ public:
       WARN("D3D12 diagnostic: ExecuteCommandLists"
            " queueType=", desc_.Type,
            " listCount=", command_list_count,
-           " queue=", reinterpret_cast<uintptr_t>(this));
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " submittedBatches=", submitted_batches_,
+           " pendingOps=", pending_operations_.size());
     }
 
     for (UINT i = 0; i < command_list_count; i++) {
@@ -2904,8 +2984,17 @@ public:
       }
     }
 
-    if (!op.command_records.empty())
+    if (!op.command_records.empty()) {
+      static std::atomic<uint32_t> log_count = 0;
+      if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+        WARN("D3D12 queue diagnostic: enqueue execute"
+             " queue=", reinterpret_cast<uintptr_t>(this),
+             " queueType=", desc_.Type,
+             " records=", op.command_records.size(),
+             " allocatorUses=", op.allocator_uses.size());
+      }
       EnqueuePendingOperation(std::move(op));
+    }
   }
 
   void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) override {}
@@ -2921,6 +3010,18 @@ public:
     auto *state = dynamic_cast<Fence *>(fence);
     if (!state)
       return WARN_E_INVALIDARG(__func__);
+
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: Signal enqueue"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " fence=", reinterpret_cast<uintptr_t>(fence),
+           " state=", reinterpret_cast<uintptr_t>(state),
+           " value=", value,
+           " submittedBatches=", submitted_batches_,
+           " hasWaited=", has_waited_);
+    }
 
     PendingOperation op;
     op.type = PendingOperationType::Signal;
@@ -2938,6 +3039,16 @@ public:
     auto *state = dynamic_cast<Fence *>(fence);
     if (!state)
       return WARN_E_INVALIDARG(__func__);
+
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: Wait enqueue"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " fence=", reinterpret_cast<uintptr_t>(fence),
+           " state=", reinterpret_cast<uintptr_t>(state),
+           " value=", value);
+    }
 
     PendingOperation op;
     op.type = PendingOperationType::Wait;
@@ -3921,15 +4032,54 @@ private:
     state.resource_states = &resource_states_->resources;
     state.queue_type = desc_.Type;
     state.touched_resources = &touched_resources;
+    static std::atomic<uint32_t> replay_log_count = 0;
+    if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: replay records begin"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " records=", records.size());
+    }
+    UINT record_index = 0;
     for (const auto &record : records) {
       if (record.d3d_sequence != 0) {
         dxmt::apitrace::set_current_d3d_sequence(record.d3d_sequence);
       }
-      std::visit([&](const auto &payload) { ReplayRecord(chunk, state, payload); },
-                 record.payload);
+      std::visit([&](const auto &payload) {
+        if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+          WARN("D3D12 queue diagnostic: replay record enter"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " queueType=", desc_.Type,
+               " index=", record_index,
+               " sequence=", record.d3d_sequence,
+               " kind=", typeid(payload).name());
+        }
+        ReplayRecord(chunk, state, payload);
+        if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+          WARN("D3D12 queue diagnostic: replay record leave"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " queueType=", desc_.Type,
+               " index=", record_index,
+               " sequence=", record.d3d_sequence,
+               " kind=", typeid(payload).name());
+        }
+      }, record.payload);
       chunk = queue.CurrentChunk();
+      record_index++;
+    }
+    if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: replay records flush begin"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " records=", records.size());
     }
     FlushGraphicsPassBatch(chunk, state);
+    if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: replay records end"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " records=", records.size(),
+           " touchedResources=", touched_resources.size());
+    }
   }
 
   template <typename T>
@@ -5037,10 +5187,39 @@ private:
       return;
     }
 
+    static std::atomic<uint32_t> query_log_count = 0;
+    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      const auto &desc = heap->GetDesc();
+      WARN("D3D12 queue diagnostic: ResolveQueryData enter"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " heap=", reinterpret_cast<uintptr_t>(heap),
+           " heapType=", desc.Type,
+           " heapCount=", desc.Count,
+           " queryType=", record.type,
+           " start=", record.start_index,
+           " count=", record.query_count,
+           " dst=", reinterpret_cast<uintptr_t>(record.dst_buffer.ptr()),
+           " dstOffset=", record.dst_buffer_offset);
+    }
+
     std::vector<uint8_t> sizing_data;
     if (!heap->Resolve(record.type, record.start_index, record.query_count,
-                       sizing_data))
+                       sizing_data)) {
+      if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+        WARN("D3D12 queue diagnostic: ResolveQueryData sizing failed"
+             " queue=", reinterpret_cast<uintptr_t>(this),
+             " queryType=", record.type,
+             " start=", record.start_index,
+             " count=", record.query_count);
+      }
       return;
+    }
+    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: ResolveQueryData sizing ok"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " bytes=", sizing_data.size());
+    }
     auto *dst = GetResource(record.dst_buffer.ptr());
     if (!ValidateBufferRange(dst, record.dst_buffer_offset, sizing_data.size(),
                              "query resolve"))
@@ -5051,13 +5230,39 @@ private:
     // before writing the destination buffer and replaying later records.
     auto &queue = device_->GetDXMTDevice().queue();
     const auto seq = queue.CurrentSeqId();
+    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: ResolveQueryData commit before wait"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " seq=", seq,
+           " coherent=", queue.CoherentSeqId());
+    }
     queue.CommitCurrentChunk();
+    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: ResolveQueryData wait begin"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " seq=", seq,
+           " coherent=", queue.CoherentSeqId());
+    }
     queue.WaitCPUFence(seq);
+    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: ResolveQueryData wait end"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " seq=", seq,
+           " coherent=", queue.CoherentSeqId());
+    }
 
     std::vector<uint8_t> data;
     if (!heap->Resolve(record.type, record.start_index, record.query_count,
-                       data))
+                       data)) {
+      if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+        WARN("D3D12 queue diagnostic: ResolveQueryData final failed"
+             " queue=", reinterpret_cast<uintptr_t>(this),
+             " queryType=", record.type,
+             " start=", record.start_index,
+             " count=", record.query_count);
+      }
       return;
+    }
     if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
                              "query resolve"))
       return;
@@ -5070,6 +5275,11 @@ private:
         static_cast<uint32_t>(record.type), record.start_index,
         record.query_count, record.dst_buffer.ptr(), record.dst_buffer_offset,
         data.data(), data.size());
+    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: ResolveQueryData leave"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " bytes=", data.size());
+    }
   }
 
   void ReplaySetPredication(ReplayState &state,
@@ -7641,6 +7851,10 @@ private:
       if (resource && resource->GetTexture()) {
         auto view = CreateDepthStencilView(device_->GetMTLDevice(), *resource,
                                            *state.depth_stencil);
+        if (!view)
+          D3D12DiagLogDSVReplayDescriptor("BuildRenderPassAttachments empty view",
+                                          *resource, *state.depth_stencil,
+                                          TextureViewDescriptor{}, view);
         auto *texture = resource->GetTexture();
         attachments.depth_stencil = ReplayDepthStencilAttachment{
             .texture = texture,
@@ -9701,6 +9915,10 @@ private:
     Rc<Texture> texture = resource->GetTexture();
     auto view = CreateDepthStencilView(device_->GetMTLDevice(), *resource,
                                        record.descriptor);
+    if (!view)
+      D3D12DiagLogDSVReplayDescriptor("ReplayClearDepthStencil empty view",
+                                      *resource, record.descriptor,
+                                      TextureViewDescriptor{}, view);
     const UINT array_length = GetDepthStencilArrayLength(*resource, record.descriptor);
     unsigned flags = 0;
     if (record.flags & D3D12_CLEAR_FLAG_DEPTH)
@@ -9964,6 +10182,16 @@ private:
         if (front.type == PendingOperationType::Wait &&
             !front.wait_completed &&
             front.fence->GetCompletedValue() < front.value) {
+          static std::atomic<uint32_t> log_count = 0;
+          if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain blocked on wait"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " fence=", reinterpret_cast<uintptr_t>(front.fence),
+                 " value=", front.value,
+                 " callbackArmed=", front.wait_callback_armed,
+                 " pendingOps=", pending_operations_.size());
+          }
           if (!front.wait_callback_armed) {
             front.wait_callback_armed = true;
             wait_fence = front.fence;
@@ -10009,11 +10237,60 @@ private:
 
       switch (operation.type) {
       case PendingOperationType::Execute: {
+        static std::atomic<uint32_t> log_count = 0;
+        if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+          WARN("D3D12 queue diagnostic: drain execute"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " queueType=", desc_.Type,
+               " records=", operation.command_records.size(),
+               " submittedBatchesBefore=", submitted_batches_);
+        }
         std::lock_guard resource_state_lock(resource_states_->mutex);
         std::vector<Com<ID3D12Resource>> touched_resources;
-        for (const auto &records : operation.command_records)
+        UINT command_list_index = 0;
+        for (const auto &records : operation.command_records) {
+          static std::atomic<uint32_t> replay_batch_log_count = 0;
+          if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain replay list begin"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " listIndex=", command_list_index,
+                 " records=", records.size(),
+                 " submittedBatchesBefore=", submitted_batches_);
+          }
           ReplayCommandRecords(records, touched_resources);
+          if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain replay list end"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " listIndex=", command_list_index,
+                 " records=", records.size(),
+                 " touchedResources=", touched_resources.size(),
+                 " submittedBatchesBefore=", submitted_batches_);
+          }
+          command_list_index++;
+        }
+        {
+          static std::atomic<uint32_t> replay_batch_log_count = 0;
+          if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain decay begin"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " touchedResources=", touched_resources.size(),
+                 " submittedBatchesBefore=", submitted_batches_);
+          }
+        }
         DecayTouchedResourceStates(touched_resources);
+        {
+          static std::atomic<uint32_t> replay_batch_log_count = 0;
+          if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain decay end"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " touchedResources=", touched_resources.size(),
+                 " submittedBatchesBefore=", submitted_batches_);
+          }
+        }
         auto allocator_uses = std::make_shared<std::vector<SubmittedCommandAllocatorUse>>(
             std::move(operation.allocator_uses));
         auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
@@ -10023,14 +10300,59 @@ private:
               use.allocator->CompleteCommandListSubmission(use.serial);
           }
         });
+        {
+          static std::atomic<uint32_t> replay_batch_log_count = 0;
+          if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain commit begin"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " submittedBatchesBefore=", submitted_batches_);
+          }
+        }
         device_->GetDXMTDevice().queue().CommitCurrentChunk();
+        {
+          static std::atomic<uint32_t> replay_batch_log_count = 0;
+          if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain commit end"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " submittedBatchesBefore=", submitted_batches_);
+          }
+        }
         submitted_batches_++;
+        static std::atomic<uint32_t> done_log_count = 0;
+        if (D3D12DiagShouldLog(done_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+          WARN("D3D12 queue diagnostic: drain execute submitted"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " queueType=", desc_.Type,
+               " submittedBatches=", submitted_batches_);
+        }
         break;
       }
       case PendingOperationType::Signal:
+        {
+          static std::atomic<uint32_t> log_count = 0;
+          if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain signal"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " fence=", reinterpret_cast<uintptr_t>(operation.fence),
+                 " value=", operation.value);
+          }
+        }
         SubmitFenceSignal(operation.fence, operation.value);
         break;
       case PendingOperationType::Wait:
+        {
+          static std::atomic<uint32_t> log_count = 0;
+          if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+            WARN("D3D12 queue diagnostic: drain wait satisfied"
+                 " queue=", reinterpret_cast<uintptr_t>(this),
+                 " queueType=", desc_.Type,
+                 " fence=", reinterpret_cast<uintptr_t>(operation.fence),
+                 " value=", operation.value);
+          }
+        }
         break;
       }
     }
@@ -10041,6 +10363,14 @@ private:
       return;
 
     if (!submitted_batches_ && !has_waited_) {
+      static std::atomic<uint32_t> log_count = 0;
+      if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+        WARN("D3D12 queue diagnostic: SubmitFenceSignal immediate"
+             " queue=", reinterpret_cast<uintptr_t>(this),
+             " queueType=", desc_.Type,
+             " fence=", reinterpret_cast<uintptr_t>(state),
+             " value=", value);
+      }
       state->SignalFromQueue(value);
       signal_count_++;
       last_signal_value_ = value;
@@ -10050,6 +10380,16 @@ private:
     auto event = state->GetSharedEvent();
     auto &queue = device_->GetDXMTDevice().queue();
     auto chunk = queue.CurrentChunk();
+    static std::atomic<uint32_t> log_count = 0;
+    if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 queue diagnostic: SubmitFenceSignal encoded"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " fence=", reinterpret_cast<uintptr_t>(state),
+           " value=", value,
+           " submittedBatches=", submitted_batches_,
+           " hasWaited=", has_waited_);
+    }
     chunk->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
       enc.signalEvent(std::move(event), value);
     });

@@ -167,6 +167,15 @@ FormatSupportGateFailure(const SupportGateResult &gate) {
       ", macOS=", gate.os_version.major, ".", gate.os_version.minor, ".", gate.os_version.patch);
 }
 
+static bool
+D3D12BootstrapDiagEnabled() {
+  auto enabled = env::getEnvVar("DXMT_DIAG_D3D12_DEVICE");
+  if (enabled.empty())
+    enabled = env::getEnvVar("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled == "1" || enabled == "true" || enabled == "yes" ||
+         enabled == "trace";
+}
+
 static HRESULT
 CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level,
                           REFIID riid, void **device,
@@ -176,28 +185,69 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
   dxmt::Com<IDXGIAdapter> dxgi_adapter = nullptr;
   dxmt::Com<IDXGIFactory1> dxgi_factory = nullptr;
 
+  if (D3D12BootstrapDiagEnabled()) {
+    dxmt::Logger::warn(dxmt::str::format(
+        "D3D12 bootstrap diagnostic: CreateD3D12DeviceInstance adapter=",
+        adapter ? "provided" : "null", " minimumFeatureLevel=",
+        minimum_feature_level, " riid=", dxmt::str::format(riid),
+        " singleton=", use_global_singleton ? "true" : "false"));
+  }
+
   if (adapter) {
-    if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
+    HRESULT hr = adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter));
+    if (FAILED(hr)) {
+      if (D3D12BootstrapDiagEnabled()) {
+        dxmt::Logger::warn(dxmt::str::format(
+            "D3D12 bootstrap diagnostic: adapter QueryInterface(IDXGIAdapter) "
+            "failed hr=",
+            hr));
+      }
       dxmt::Logger::err("D3D12CreateDevice: adapter is not a DXGI adapter");
       return WARN_E_INVALIDARG(__func__);
     }
   } else {
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory));
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+      if (D3D12BootstrapDiagEnabled()) {
+        dxmt::Logger::warn(dxmt::str::format(
+            "D3D12 bootstrap diagnostic: CreateDXGIFactory1 failed hr=", hr));
+      }
       return hr;
+    }
 
     hr = dxgi_factory->EnumAdapters(0, &dxgi_adapter);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+      if (D3D12BootstrapDiagEnabled()) {
+        dxmt::Logger::warn(dxmt::str::format(
+            "D3D12 bootstrap diagnostic: EnumAdapters(0) failed hr=", hr));
+      }
       return hr;
+    }
   }
 
   dxmt::Com<IMTLDXGIAdapter> metal_adapter = nullptr;
-  if (FAILED(dxgi_adapter->QueryInterface(IID_PPV_ARGS(&metal_adapter)))) {
+  HRESULT hr = dxgi_adapter->QueryInterface(IID_PPV_ARGS(&metal_adapter));
+  if (FAILED(hr)) {
+    if (D3D12BootstrapDiagEnabled()) {
+      dxmt::Logger::warn(dxmt::str::format(
+          "D3D12 bootstrap diagnostic: adapter QueryInterface(IMTLDXGIAdapter) "
+          "failed hr=",
+          hr));
+    }
     dxmt::Logger::err("D3D12CreateDevice: not a DXMT adapter");
     return WARN_E_INVALIDARG(__func__);
   }
 
   const auto gate = dxmt::d3d12::CheckSupportGate(metal_adapter->GetMTLDevice());
+  if (D3D12BootstrapDiagEnabled()) {
+    dxmt::Logger::warn(dxmt::str::format(
+        "D3D12 bootstrap diagnostic: supportGate=",
+        dxmt::d3d12::SupportGateStatusName(gate.status),
+        " appleGpuFamily7=", dxmt::d3d12::BoolString(gate.supports_apple_gpu_family_7),
+        " metal4=", dxmt::d3d12::BoolString(gate.supports_metal_4),
+        " os=", gate.os_version.major, ".", gate.os_version.minor, ".",
+        gate.os_version.patch));
+  }
   if (gate.status != dxmt::d3d12::SupportGateStatus::Enabled) {
     dxmt::Logger::err(dxmt::d3d12::FormatSupportGateFailure(gate));
     return DXGI_ERROR_UNSUPPORTED;
@@ -226,20 +276,42 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
 
     if (use_global_singleton) {
       std::lock_guard lock(singleton_mutex);
-      if (singleton_device)
-        return singleton_device->QueryInterface(riid, device);
+      if (singleton_device) {
+        HRESULT hr = singleton_device->QueryInterface(riid, device);
+        if (D3D12BootstrapDiagEnabled()) {
+          dxmt::Logger::warn(dxmt::str::format(
+              "D3D12 bootstrap diagnostic: singleton device QueryInterface "
+              "hr=",
+              hr));
+        }
+        return hr;
+      }
 
       singleton_device = dxmt::d3d12::CreateD3D12Device(
           dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
           metal_adapter.ptr()).prvRef();
-      return singleton_device->QueryInterface(riid, device);
+      HRESULT hr = singleton_device->QueryInterface(riid, device);
+      if (D3D12BootstrapDiagEnabled()) {
+        dxmt::Logger::warn(dxmt::str::format(
+            "D3D12 bootstrap diagnostic: created singleton device "
+            "QueryInterface hr=",
+            hr));
+      }
+      return hr;
     }
 
     auto d3d12_device = dxmt::d3d12::CreateD3D12Device(
         dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
         metal_adapter.ptr());
 
-    return d3d12_device->QueryInterface(riid, device);
+    HRESULT hr = d3d12_device->QueryInterface(riid, device);
+    if (D3D12BootstrapDiagEnabled()) {
+      dxmt::Logger::warn(dxmt::str::format(
+          "D3D12 bootstrap diagnostic: created non-singleton device "
+          "QueryInterface hr=",
+          hr));
+    }
+    return hr;
   } catch (const dxmt::MTLD3DError &e) {
     dxmt::Logger::err(dxmt::str::format("D3D12CreateDevice: failed to create device: ", e.message()));
     return E_FAIL;

@@ -9,6 +9,7 @@
 namespace WMT {
 
 class String;
+class CommandBuffer;
 
 struct OperatingSystemVersion {
   uint64_t major;
@@ -630,6 +631,21 @@ public:
   }
 
   uint64_t
+  kernelStartTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyKernelStartTime);
+  }
+
+  uint64_t
+  kernelEndTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyKernelEndTime);
+  }
+
+  uint64_t
+  gpuStartTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUStartTime);
+  }
+
+  uint64_t
   gpuEndTime() {
     return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUEndTime);
   }
@@ -945,6 +961,7 @@ public:
   newCounterSampleBuffer(uint32_t sample_count, bool shared = true) {
     return Reference<CounterSampleBuffer>(MTLCounterSampleBuffer_newTimestampBuffer(handle, sample_count, shared));
   }
+
 };
 
 inline Reference<Array<Device>>

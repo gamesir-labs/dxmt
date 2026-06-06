@@ -5,6 +5,7 @@
 #include "com/com_guid.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include "wsi_window.hpp"
@@ -37,6 +38,16 @@ static bool IsKnownSwapEffect(DXGI_SWAP_EFFECT swap_effect) {
   default:
     return false;
   }
+}
+
+static bool DxgiBootstrapDiagEnabled() {
+  auto enabled = env::getEnvVar("DXMT_DIAG_DXGI");
+  if (enabled.empty())
+    enabled = env::getEnvVar("DXMT_DIAG_D3D12_DEVICE");
+  if (enabled.empty())
+    enabled = env::getEnvVar("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled == "1" || enabled == "true" || enabled == "yes" ||
+         enabled == "trace";
 }
 
 class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {
@@ -242,7 +253,17 @@ public:
     auto devices = WMT::CopyAllDevices();
     UINT adapter_count = devices.count();
 
+    if (DxgiBootstrapDiagEnabled()) {
+      WARN("DXGI bootstrap diagnostic: EnumAdapters1 request adapter=", Adapter,
+           " deviceCount=", adapter_count);
+    }
+
     if (Adapter >= adapter_count) {
+      if (DxgiBootstrapDiagEnabled()) {
+        WARN("DXGI bootstrap diagnostic: EnumAdapters1 returning "
+             "DXGI_ERROR_NOT_FOUND for adapter=",
+             Adapter, " deviceCount=", adapter_count);
+      }
       fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_NOT_FOUND;
     }
@@ -261,6 +282,12 @@ public:
     }
 
     auto device = devices.object(adjusted_adapter);
+
+    if (DxgiBootstrapDiagEnabled()) {
+      WARN("DXGI bootstrap diagnostic: EnumAdapters1 selected adjustedAdapter=",
+           adjusted_adapter, " unifiedMemory=", device.hasUnifiedMemory(),
+           " registryID=", device.registryID());
+    }
 
     *ppAdapter = CreateAdapter(device, this, Config::getInstance());
     // devices->release(); // no you should not release it...
@@ -397,12 +424,23 @@ private:
 extern "C" HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid,
                                                 void **ppFactory) {
   try {
+    if (DxgiBootstrapDiagEnabled()) {
+      WARN("DXGI bootstrap diagnostic: CreateDXGIFactory2 flags=", Flags,
+           " riid=", str::format(riid));
+    }
+
     MTLDXGIFactory* factory = new MTLDXGIFactory(Flags);
     HRESULT hr = factory->QueryInterface(riid, ppFactory);
     factory->Release();
 
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+      if (DxgiBootstrapDiagEnabled()) {
+        WARN("DXGI bootstrap diagnostic: CreateDXGIFactory2 QueryInterface "
+             "failed hr=",
+             hr);
+      }
       return hr;
+    }
 
     return S_OK;
   } catch (const MTLD3DError &e) {

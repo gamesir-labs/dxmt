@@ -714,14 +714,15 @@ public:
         sub_resource != 0 || !buffer_allocation_)
       return;
 
+    UINT64 written_begin = 0;
+    UINT64 written_end = desc_.Width;
+    if (written_range) {
+      written_begin = std::min<UINT64>(written_range->Begin, desc_.Width);
+      written_end = std::min<UINT64>(written_range->End, desc_.Width);
+    }
+
     auto *mapped_memory = static_cast<char *>(buffer_allocation_->mappedMemory(0));
     if (mapped_memory && dxmt::apitrace::d3d_enabled()) {
-      UINT64 written_begin = 0;
-      UINT64 written_end = desc_.Width;
-      if (written_range) {
-        written_begin = std::min<UINT64>(written_range->Begin, desc_.Width);
-        written_end = std::min<UINT64>(written_range->End, desc_.Width);
-      }
       if (written_end > written_begin) {
         dxmt::apitrace::record_resource_unmap(
             this, sub_resource, written_begin, written_end,
@@ -730,9 +731,12 @@ public:
       }
     }
 
-    if (written_range && written_range->End > written_range->Begin)
-      buffer_allocation_->flushCpuShadow(written_range->Begin,
-                                         written_range->End - written_range->Begin);
+    if (written_end > written_begin) {
+      buffer_allocation_->flushCpuShadow(written_begin,
+                                         written_end - written_begin);
+      buffer_allocation_->didModifyRange(written_begin,
+                                         written_end - written_begin);
+    }
   }
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS

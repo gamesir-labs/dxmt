@@ -236,29 +236,65 @@ public:
   ) :
       queries_(std::move(queries)),
       num_samples_(num_samples) {
+#if DXMT_DX12_METAL4
+    WMT::Error error = {};
+    timestamp_context_ = device.newTimestampContext();
+    heap_entry_size_ = device.timestampHeapEntrySize();
+    timestamp_heap_ = device.newTimestampCounterHeap(num_samples, &error);
+    assert(timestamp_context_);
+    assert(timestamp_heap_);
+    assert(heap_entry_size_ >= sizeof(WMTMTL4TimestampHeapEntry));
+#else
     sample_buffer_ = device.newCounterSampleBuffer(num_samples, true);
+#endif
   }
 
   ~TimestampReadbackSBuf() {
     // TODO: small_vector opt
+#if DXMT_DX12_METAL4
+    std::vector<uint8_t> resolved(num_samples_ * heap_entry_size_);
+    timestamp_heap_.resolveCounterRange(0, num_samples_, resolved.data(), resolved.size());
+    for (const auto &[query, sample_index] : queries_) {
+      auto *entry = reinterpret_cast<const WMTMTL4TimestampHeapEntry *>(resolved.data() + sample_index * heap_entry_size_);
+      query->issue(entry->timestamp);
+    }
+    timestamp_context_.destroy();
+#else
     std::vector<uint64_t> results(num_samples_);
     sample_buffer_.resolveCounterRange(0, num_samples_, results.data(), num_samples_ * sizeof(uint64_t));
     for (const auto &[query, sample_index] : queries_) {
       query->issue(results[sample_index]);
     }
+#endif
   }
 
   TimestampReadbackSBuf(const TimestampReadbackSBuf &) = delete;
   TimestampReadbackSBuf(TimestampReadbackSBuf &&) = delete;
 
+#if DXMT_DX12_METAL4
+  WMT::CounterHeap counterHeap() {
+    return timestamp_heap_;
+  };
+
+  WMT::TimestampContext timestampContext() {
+    return timestamp_context_;
+  }
+#else
   WMT::CounterSampleBuffer
   sampleBuffer() {
     return sample_buffer_;
   };
+#endif
 
 private:
   TimestampQueryList queries_;
+#if DXMT_DX12_METAL4
+  WMT::TimestampContext timestamp_context_;
+  WMT::Reference<WMT::CounterHeap> timestamp_heap_;
+  uint64_t heap_entry_size_;
+#else
   WMT::Reference<WMT::CounterSampleBuffer> sample_buffer_;
+#endif
   uint64_t num_samples_;
 };
 
@@ -292,10 +328,21 @@ public:
   TimestampReadbackCBuf(const TimestampReadbackCBuf &) = delete;
   TimestampReadbackCBuf(TimestampReadbackCBuf &&) = delete;
 
+#if DXMT_DX12_METAL4
+  WMT::CounterHeap
+  counterHeap() {
+    return {};
+  };
+
+  WMT::TimestampContext timestampContext() {
+    return {};
+  }
+#else
   WMT::CounterSampleBuffer
   sampleBuffer() {
     return {};
   };
+#endif
 
 private:
   TimestampQueryList queries_;

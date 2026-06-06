@@ -1159,6 +1159,69 @@ DebugAccumulateRenderCommands(FrameStatistics &statistics,
   }
 }
 
+static void
+DebugAccumulateBlitCommands(FrameStatistics &statistics,
+                            const wmtcmd_blit_nop *cmd_head) {
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    statistics.blit_command_count++;
+    switch (static_cast<WMTBlitCommandType>(command->type)) {
+    case WMTBlitCommandCopyFromBufferToBuffer:
+      statistics.blit_copy_buffer_to_buffer_count++;
+      break;
+    case WMTBlitCommandCopyFromBufferToTexture:
+      statistics.blit_copy_buffer_to_texture_count++;
+      break;
+    case WMTBlitCommandCopyFromTextureToBuffer:
+      statistics.blit_copy_texture_to_buffer_count++;
+      break;
+    case WMTBlitCommandCopyFromTextureToTexture:
+      statistics.blit_copy_texture_to_texture_count++;
+      break;
+    case WMTBlitCommandGenerateMipmaps:
+      statistics.blit_generate_mipmaps_count++;
+      break;
+    case WMTBlitCommandWaitForFence:
+      statistics.blit_fence_wait_count++;
+      break;
+    case WMTBlitCommandUpdateFence:
+      statistics.blit_fence_update_count++;
+      break;
+    case WMTBlitCommandFillBuffer:
+      statistics.blit_fill_buffer_count++;
+      break;
+    case WMTBlitCommandResolveCounters:
+      statistics.blit_resolve_counters_count++;
+      break;
+    case WMTBlitCommandNop:
+      break;
+    }
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+}
+
+static void
+DebugAccumulateBlitPass(FrameStatistics &statistics,
+                        const BlitEncoderData *data) {
+  const bool has_commands = data->cmd_head.next.ptr != nullptr;
+  const auto fence_wait_count = data->fence_wait.count();
+  const auto fence_update_count = data->fence_update.count();
+
+  if (has_commands)
+    statistics.blit_pass_with_commands_count++;
+  else
+    statistics.blit_pass_empty_count++;
+
+  if (fence_wait_count)
+    statistics.blit_pass_with_fence_wait_count++;
+  if (fence_update_count)
+    statistics.blit_pass_with_fence_update_count++;
+
+  statistics.blit_fence_wait_entry_count += fence_wait_count;
+  statistics.blit_fence_update_entry_count += fence_update_count;
+  DebugAccumulateBlitCommands(statistics, &data->cmd_head);
+}
+
 struct DebugRenderCommandSummary {
   uint32_t command_count = 0;
   uint32_t pso_binds = 0;
@@ -2668,6 +2731,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       if (queue_.apitraceEnabled()) {
         dxmt::apitrace::set_current_d3d_sequence(seqId);
       }
+      DebugAccumulateBlitPass(currentFrameStatistics(), data);
       auto encoder = cmdbuf.blitCommandEncoder();
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       encoder.encodeCommands(&data->cmd_head);
@@ -2934,6 +2998,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::SampleTimestamp: {
       auto data = static_cast<SampleTimestampData *>(current);
+#if DXMT_DX12_METAL4
+      if (auto readback = readbacks.timestamp.get(); readback->counterHeap())
+        readback->timestampContext().writeTimestamp(cmdbuf, readback->counterHeap(), data->readback_index);
+#else
       if (auto readback = readbacks.timestamp.get(); readback->sampleBuffer()) {
 
         /**
@@ -2951,7 +3019,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         {
           /**
           `sampleBufferAttachments` does not work when the blit encoder is empty, just do something
-          FIXME: potential perf overhead? 
+          FIXME: potential perf overhead?
           */
           struct wmtcmd_blit_fillbuffer fill;
           fill.next.set(nullptr);
@@ -2967,6 +3035,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       } else {
         // Use timestamp from command buffer's `gpuEndTime`
       }
+#endif
       data->~SampleTimestampData();
       break;
     }

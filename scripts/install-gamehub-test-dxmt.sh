@@ -9,7 +9,6 @@ NATIVE_LLVM_PATH="${DXMT_NATIVE_LLVM_PATH:-/usr/local/opt/llvm@15}"
 GAMEHUB_BUNDLE_ID="${GAMEHUB_BUNDLE_ID:-com.gamemac.test}"
 GAMEHUB_DXMT_PACKAGE="${GAMEHUB_DXMT_PACKAGE:-dxmt-v0.80}"
 GAMEHUB_DXMT_ROOT="${GAMEHUB_DXMT_ROOT:-${HOME}/Library/Application Support/${GAMEHUB_BUNDLE_ID}/wine-engine/downloads/${GAMEHUB_DXMT_PACKAGE}}"
-GAMEHUB_WINE_INSTALLATIONS_ROOT="${GAMEHUB_WINE_INSTALLATIONS_ROOT:-${HOME}/Library/Application Support/${GAMEHUB_BUNDLE_ID}/wine-engine/containers/wine_installations}"
 BACKUP_ROOT="${DXMT_GAMEHUB_BACKUP_ROOT:-${HOME}/Library/Caches/dxmt-runtime-smoke}"
 STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${BACKUP_ROOT}/gamehub-test-stage}"
 BACKUP_TAG="${DXMT_GAMEHUB_BACKUP_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -17,6 +16,7 @@ BACKUP_DIR="${BACKUP_ROOT}/gamehub-${GAMEHUB_DXMT_PACKAGE}-backup-${BACKUP_TAG}"
 
 runtime_files=(
   "x86_64-windows/winemetal.dll"
+  "x86_64-windows/winemetal4.dll"
   "x86_64-windows/dxgi.dll"
   "x86_64-windows/d3d12.dll"
   "x86_64-windows/d3d12core.dll"
@@ -25,10 +25,12 @@ runtime_files=(
   "x86_64-windows/nvapi64.dll"
   "x86_64-windows/nvngx.dll"
   "x86_64-unix/winemetal.so"
+  "x86_64-unix/winemetal4.so"
 )
 
 windows_runtime_files=(
   "winemetal.dll"
+  "winemetal4.dll"
   "dxgi.dll"
   "d3d12.dll"
   "d3d12core.dll"
@@ -182,43 +184,6 @@ copy_runtime() {
   fi
 }
 
-copy_installed_wine_mirrors() {
-  local stage_prefix="$1"
-  [[ -d "${GAMEHUB_WINE_INSTALLATIONS_ROOT}" ]] || return 0
-
-  local installation
-  local target
-  while IFS= read -r -d '' target; do
-    installation="${target%/lib/wine/x86_64-windows}"
-    installation="${installation##*/}"
-    log "refreshing installed Wine DXMT mirror: ${target}"
-    mkdir -p "${BACKUP_DIR}/wine-installations/${installation}/x86_64-windows"
-    for file in "${windows_runtime_files[@]}"; do
-      if [[ -f "${stage_prefix}/x86_64-windows/${file}" &&
-            -e "${target}/${file}" ]]; then
-        cp -p "${target}/${file}" \
-          "${BACKUP_DIR}/wine-installations/${installation}/x86_64-windows/${file}"
-        cp -p "${stage_prefix}/x86_64-windows/${file}" "${target}/${file}"
-      fi
-    done
-  done < <(find "${GAMEHUB_WINE_INSTALLATIONS_ROOT}" -type d \
-    -path '*/lib/wine/x86_64-windows' -print0)
-
-  while IFS= read -r -d '' target; do
-    installation="${target%/lib/wine/x86_64-unix}"
-    installation="${installation##*/}"
-    if [[ -f "${stage_prefix}/x86_64-unix/winemetal.so" &&
-          -e "${target}/winemetal.so" ]]; then
-      log "refreshing installed Wine winemetal.so mirror: ${target}"
-      mkdir -p "${BACKUP_DIR}/wine-installations/${installation}/x86_64-unix"
-      cp -p "${target}/winemetal.so" \
-        "${BACKUP_DIR}/wine-installations/${installation}/x86_64-unix/winemetal.so"
-      cp -p "${stage_prefix}/x86_64-unix/winemetal.so" "${target}/winemetal.so"
-    fi
-  done < <(find "${GAMEHUB_WINE_INSTALLATIONS_ROOT}" -type d \
-    -path '*/lib/wine/x86_64-unix' -print0)
-}
-
 write_manifest() {
   mkdir -p "${GAMEHUB_DXMT_ROOT}"
   python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" <<'PY'
@@ -238,7 +203,7 @@ manifest = {
         "${COMPONENT_PATH}/wine/x86_64-windows",
     ],
     "environment_template": {
-        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d12,dxgi,winemetal,nvapi64,nvngx=n,b",
+        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
         "WINEDLLPATH": "${COMPONENT_PATH}/wine",
         "DYLD_FALLBACK_LIBRARY_PATH": "${COMPONENT_PATH}/wine/x86_64-unix:${WINE_INSTALL_PATH}/lib:${WINE_INSTALL_PATH}/lib/wine/x86_64-unix",
     },
@@ -258,7 +223,6 @@ main() {
   local stage_prefix
   stage_prefix="$(resolve_stage_prefix)"
   copy_runtime "${stage_prefix}"
-  copy_installed_wine_mirrors "${stage_prefix}"
   write_manifest
 
   log "done"
