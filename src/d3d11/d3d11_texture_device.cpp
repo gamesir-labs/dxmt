@@ -155,6 +155,12 @@ private:
     );
   }
 
+  // GDI DC interop state
+  HDC dc_ = nullptr;
+  HBITMAP dc_bitmap_ = nullptr;
+  void *dc_bits_ = nullptr;
+  Com<ID3D11Texture2D1> dc_staging_;
+
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
   class TextureSRV : public SRVBase {
@@ -459,6 +465,116 @@ public:
   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
 
   float GetMinLOD() override { return min_lod; }
+
+  ~DeviceTexture() {
+    if (dc_bitmap_) {
+      ::DeleteObject(dc_bitmap_);
+    }
+    if (dc_) {
+      ::DeleteDC(dc_);
+    }
+    if (local_kmt_) {
+      D3DKMT_DESTROYALLOCATION destroy = {};
+      destroy.hDevice = this->m_parent->GetLocalD3DKMT();
+      destroy.hResource = local_kmt_;
+      D3DKMTDestroyAllocation(&destroy);
+    }
+  }
+
+  HRESULT GetSurfaceDC(WINBOOL Discard, HDC *phdc) override {
+    if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
+      return E_NOTIMPL;
+    } else {
+      if (!phdc)
+        return E_INVALIDARG;
+      *phdc = nullptr;
+
+      auto *device = this->m_parent;
+      auto *ctx = device->GetImmediateContextPrivate();
+
+      // create staging texture on first use
+      if (!dc_staging_) {
+        D3D11_TEXTURE2D_DESC1 staging_desc = {};
+        staging_desc.Width = this->desc.Width;
+        staging_desc.Height = this->desc.Height;
+        staging_desc.MipLevels = 1;
+        staging_desc.ArraySize = 1;
+        staging_desc.Format = this->desc.Format;
+        staging_desc.SampleDesc.Count = 1;
+        staging_desc.SampleDesc.Quality = 0;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        HRESULT hr = CreateStagingTexture2D(device, &staging_desc, nullptr, &dc_staging_);
+        if (FAILED(hr))
+          return hr;
+      }
+
+      // copy device texture → staging
+      ctx->CopyResource(dc_staging_.ptr(), static_cast<D3D11ResourceCommon *>(this));
+      ctx->PrepareFlush();
+      ctx->Commit();
+      ctx->WaitUntilGPUIdle();
+
+      // map staging for read
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      HRESULT hr = ctx->Map(dc_staging_.ptr(), 0, D3D11_MAP_READ, 0, &mapped);
+      if (FAILED(hr))
+        return hr;
+
+      // create DC and DIB on first use
+      if (!dc_) {
+        dc_ = ::CreateCompatibleDC(nullptr);
+        if (!dc_) {
+          ctx->Unmap(dc_staging_.ptr(), 0);
+          return E_FAIL;
+        }
+      }
+
+      if (!dc_bitmap_) {
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+        bmi.bmiHeader.biWidth = static_cast<LONG>(this->desc.Width);
+        bmi.bmiHeader.biHeight = -static_cast<LONG>(this->desc.Height);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        dc_bitmap_ = ::CreateDIBSection(dc_, &bmi, DIB_RGB_COLORS, &dc_bits_, nullptr, 0);
+        if (!dc_bitmap_ || !dc_bits_) {
+          if (dc_bitmap_) {
+            ::DeleteObject(dc_bitmap_);
+            dc_bitmap_ = nullptr;
+          }
+          ctx->Unmap(dc_staging_.ptr(), 0);
+          return E_FAIL;
+        }
+        ::SelectObject(dc_, dc_bitmap_);
+      }
+
+      // copy pixel data from staging to DIB
+      UINT dc_pitch = this->desc.Width * 4u;
+      auto *src = static_cast<const uint8_t *>(mapped.pData);
+      auto *dst = static_cast<uint8_t *>(dc_bits_);
+      for (UINT y = 0; y < this->desc.Height; y++) {
+        memcpy(dst + y * dc_pitch, src + y * mapped.RowPitch, dc_pitch);
+      }
+
+      ctx->Unmap(dc_staging_.ptr(), 0);
+
+      *phdc = dc_;
+      return S_OK;
+    }
+  }
+
+  HRESULT ReleaseSurfaceDC(RECT *pDirtyRect) override {
+    if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
+      return E_NOTIMPL;
+    } else {
+      if (!dc_)
+        return E_FAIL;
+      return S_OK;
+    }
+  }
 };
 
 struct SharedResourceData {

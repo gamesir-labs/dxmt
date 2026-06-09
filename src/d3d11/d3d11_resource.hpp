@@ -187,6 +187,7 @@ public:
       MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(device),
       desc(desc),
       dxgi_resource(new MTLDXGIResource<TResourceBase<tag, Base...>>(this)),
+      dxgi_surface(new MTLDXGISurface<TResourceBase<tag, Base...>>(this)),
       d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
     // D3D11ResourceCommonß::bind_flags_
     this->bind_flags_ = desc.BindFlags;
@@ -235,6 +236,11 @@ public:
         riid == __uuidof(IDXGIDeviceSubObject) ||
         riid == __uuidof(IDXGIResource) || riid == __uuidof(IDXGIResource1)) {
       *ppvObject = ref(dxgi_resource.get());
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1)) {
+      *ppvObject = ref(dxgi_surface.get());
       return S_OK;
     }
 
@@ -304,9 +310,30 @@ public:
     return E_INVALIDARG;
   }
 
+  virtual HRESULT GetSurfaceDesc(DXGI_SURFACE_DESC *pDesc) {
+    if constexpr (std::is_same_v<tag, tag_texture_2d>) {
+      if (!pDesc) return E_INVALIDARG;
+      pDesc->Width = desc.Width;
+      pDesc->Height = desc.Height;
+      pDesc->Format = desc.Format;
+      pDesc->SampleDesc = desc.SampleDesc;
+      return S_OK;
+    }
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT GetSurfaceDC(WINBOOL Discard, HDC *phdc) {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT ReleaseSurfaceDC(RECT *pDirtyRect) {
+    return E_NOTIMPL;
+  }
+
 protected:
   tag::DESC1 desc;
   std::unique_ptr<IDXGIResource1> dxgi_resource;
+  std::unique_ptr<IDXGISurface1> dxgi_surface;
   tag::D3D10_IMPL d3d10;
 };
 

@@ -1902,7 +1902,50 @@ public:
   void
   STDMETHODCALLTYPE
   SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
-    UNIMPLEMENTED("SwapDeviceContextState");
+    std::lock_guard<mutex_t> lock(mutex);
+
+    if (!pState) {
+      if (ppPreviousState)
+        *ppPreviousState = nullptr;
+      return;
+    }
+
+    auto *incoming = static_cast<MTLD3D11DeviceContextState *>(pState);
+
+    if (!context_state_) {
+      context_state_ = ref(new MTLD3D11DeviceContextState(device));
+    }
+
+    // save current state into the outgoing state object
+    context_state_->state = std::move(state_);
+
+    if (ppPreviousState) {
+      *ppPreviousState = context_state_.ref();
+    }
+
+    // load state from the incoming state object
+    state_ = std::move(incoming->state);
+    context_state_ = incoming;
+
+    // refresh Metal encoding context with new state
+    ResetEncodingContextState();
+    RestoreEncodingContextState();
+
+    // mark all dirty
+    for (auto stage : {PipelineStage::Vertex, PipelineStage::Pixel,
+                       PipelineStage::Geometry, PipelineStage::Hull,
+                       PipelineStage::Domain, PipelineStage::Compute}) {
+      state_.ShaderStages[stage].ConstantBuffers.set_dirty();
+      state_.ShaderStages[stage].Samplers.set_dirty();
+      state_.ShaderStages[stage].SRVs.set_dirty();
+    }
+    state_.InputAssembler.VertexBuffers.set_dirty();
+    state_.OutputMerger.UAVs.set_dirty();
+    state_.ComputeStageUAV.UAVs.set_dirty();
+    dirty_state.set(
+        DirtyState::BlendFactorAndStencilRef, DirtyState::RasterizerState,
+        DirtyState::DepthStencilState, DirtyState::Viewport, DirtyState::Scissors
+    );
   }
 
   void
@@ -5390,6 +5433,7 @@ public:
 
 protected:
   D3D11ContextState state_;
+  Com<MTLD3D11DeviceContextState> context_state_;
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;
