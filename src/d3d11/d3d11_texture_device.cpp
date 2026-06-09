@@ -272,15 +272,6 @@ public:
         this->texture_ = std::move(u_texture);
       }
 
-  ~DeviceTexture() {
-    if (local_kmt_) {
-      D3DKMT_DESTROYALLOCATION destroy = {};
-      destroy.hDevice = this->m_parent->GetLocalD3DKMT();
-      destroy.hResource = local_kmt_;
-      D3DKMTDestroyAllocation(&destroy);
-    }
-  }
-
   Rc<StagingResource> staging(UINT) final { return nullptr; }
   Rc<DynamicBuffer> dynamicBuffer(UINT*, UINT*) final { return {}; }
   Rc<DynamicLinearTexture> dynamicLinearTexture(UINT*, UINT*) final { return {}; };
@@ -517,6 +508,8 @@ public:
         return E_INVALIDARG;
       *phdc = nullptr;
 
+      std::lock_guard<d3d11_device_mutex> lock(this->m_parent->mutex);
+
       HRESULT hr = EnsureStagingTexture();
       if (FAILED(hr))
         return hr;
@@ -589,6 +582,8 @@ public:
       if (!dc_ || !dc_bits_)
         return E_FAIL;
 
+      std::lock_guard<d3d11_device_mutex> lock(this->m_parent->mutex);
+
       auto *ctx = this->m_parent->GetImmediateContextPrivate();
 
       // determine dirty region
@@ -654,6 +649,8 @@ public:
       if (surface_mapped_)
         return DXGI_ERROR_WAS_STILL_DRAWING;
 
+      std::lock_guard<d3d11_device_mutex> lock(this->m_parent->mutex);
+
       HRESULT hr = EnsureStagingTexture();
       if (FAILED(hr))
         return hr;
@@ -692,6 +689,8 @@ public:
     } else {
       if (!surface_mapped_)
         return E_FAIL;
+
+      std::lock_guard<d3d11_device_mutex> lock(this->m_parent->mutex);
 
       auto *ctx = this->m_parent->GetImmediateContextPrivate();
       ctx->Unmap(dc_staging_.ptr(), 0);
