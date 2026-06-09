@@ -160,6 +160,7 @@ private:
   HBITMAP dc_bitmap_ = nullptr;
   void *dc_bits_ = nullptr;
   Com<ID3D11Texture2D1> dc_staging_;
+  bool surface_mapped_ = false;
 
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
@@ -481,6 +482,33 @@ public:
     }
   }
 
+  HRESULT EnsureStagingTexture() {
+    if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
+      return E_NOTIMPL;
+    } else {
+      if (dc_staging_)
+        return S_OK;
+      D3D11_TEXTURE2D_DESC1 staging_desc = {};
+      staging_desc.Width = this->desc.Width;
+      staging_desc.Height = this->desc.Height;
+      staging_desc.MipLevels = 1;
+      staging_desc.ArraySize = 1;
+      staging_desc.Format = this->desc.Format;
+      staging_desc.SampleDesc.Count = 1;
+      staging_desc.SampleDesc.Quality = 0;
+      staging_desc.Usage = D3D11_USAGE_STAGING;
+      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+      return CreateStagingTexture2D(this->m_parent, &staging_desc, nullptr, &dc_staging_);
+    }
+  }
+
+  void FlushAndSync() {
+    auto *ctx = this->m_parent->GetImmediateContextPrivate();
+    ctx->PrepareFlush();
+    ctx->Commit();
+    ctx->WaitUntilGPUIdle();
+  }
+
   HRESULT GetSurfaceDC(WINBOOL Discard, HDC *phdc) override {
     if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
       return E_NOTIMPL;
@@ -489,35 +517,21 @@ public:
         return E_INVALIDARG;
       *phdc = nullptr;
 
-      auto *device = this->m_parent;
-      auto *ctx = device->GetImmediateContextPrivate();
+      HRESULT hr = EnsureStagingTexture();
+      if (FAILED(hr))
+        return hr;
 
-      // create staging texture on first use
-      if (!dc_staging_) {
-        D3D11_TEXTURE2D_DESC1 staging_desc = {};
-        staging_desc.Width = this->desc.Width;
-        staging_desc.Height = this->desc.Height;
-        staging_desc.MipLevels = 1;
-        staging_desc.ArraySize = 1;
-        staging_desc.Format = this->desc.Format;
-        staging_desc.SampleDesc.Count = 1;
-        staging_desc.SampleDesc.Quality = 0;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        HRESULT hr = CreateStagingTexture2D(device, &staging_desc, nullptr, &dc_staging_);
-        if (FAILED(hr))
-          return hr;
+      auto *ctx = this->m_parent->GetImmediateContextPrivate();
+
+      // copy device texture → staging, then sync
+      if (!Discard) {
+        ctx->CopyResource(dc_staging_.ptr(), static_cast<D3D11ResourceCommon *>(this));
+        FlushAndSync();
       }
-
-      // copy device texture → staging
-      ctx->CopyResource(dc_staging_.ptr(), static_cast<D3D11ResourceCommon *>(this));
-      ctx->PrepareFlush();
-      ctx->Commit();
-      ctx->WaitUntilGPUIdle();
 
       // map staging for read
       D3D11_MAPPED_SUBRESOURCE mapped = {};
-      HRESULT hr = ctx->Map(dc_staging_.ptr(), 0, D3D11_MAP_READ, 0, &mapped);
+      hr = ctx->Map(dc_staging_.ptr(), 0, D3D11_MAP_READ, 0, &mapped);
       if (FAILED(hr))
         return hr;
 
@@ -552,11 +566,13 @@ public:
       }
 
       // copy pixel data from staging to DIB
-      UINT dc_pitch = this->desc.Width * 4u;
-      auto *src = static_cast<const uint8_t *>(mapped.pData);
-      auto *dst = static_cast<uint8_t *>(dc_bits_);
-      for (UINT y = 0; y < this->desc.Height; y++) {
-        memcpy(dst + y * dc_pitch, src + y * mapped.RowPitch, dc_pitch);
+      if (!Discard) {
+        UINT dc_pitch = this->desc.Width * 4u;
+        auto *src = static_cast<const uint8_t *>(mapped.pData);
+        auto *dst = static_cast<uint8_t *>(dc_bits_);
+        for (UINT y = 0; y < this->desc.Height; y++) {
+          memcpy(dst + y * dc_pitch, src + y * mapped.RowPitch, dc_pitch);
+        }
       }
 
       ctx->Unmap(dc_staging_.ptr(), 0);
@@ -570,8 +586,120 @@ public:
     if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
       return E_NOTIMPL;
     } else {
-      if (!dc_)
+      if (!dc_ || !dc_bits_)
         return E_FAIL;
+
+      auto *ctx = this->m_parent->GetImmediateContextPrivate();
+
+      // determine dirty region
+      RECT dirty;
+      if (pDirtyRect && !IsRectEmpty(pDirtyRect)) {
+        dirty = *pDirtyRect;
+        // clamp to texture bounds
+        if (dirty.left < 0) dirty.left = 0;
+        if (dirty.top < 0) dirty.top = 0;
+        if (dirty.right > (LONG)this->desc.Width) dirty.right = this->desc.Width;
+        if (dirty.bottom > (LONG)this->desc.Height) dirty.bottom = this->desc.Height;
+      } else {
+        dirty.left = 0;
+        dirty.top = 0;
+        dirty.right = this->desc.Width;
+        dirty.bottom = this->desc.Height;
+      }
+
+      // write DIB data back → staging → device texture
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      HRESULT hr = ctx->Map(dc_staging_.ptr(), 0, D3D11_MAP_WRITE, 0, &mapped);
+      if (FAILED(hr))
+        return hr;
+
+      UINT dc_pitch = this->desc.Width * 4u;
+      auto *src = static_cast<const uint8_t *>(dc_bits_);
+      auto *dst = static_cast<uint8_t *>(mapped.pData);
+      UINT row_bytes = (dirty.right - dirty.left) * 4u;
+      for (LONG y = dirty.top; y < dirty.bottom; y++) {
+        memcpy(
+          dst + y * mapped.RowPitch + dirty.left * 4u,
+          src + y * dc_pitch + dirty.left * 4u,
+          row_bytes
+        );
+      }
+
+      ctx->Unmap(dc_staging_.ptr(), 0);
+
+      // copy staging → device texture
+      D3D11_BOX box = {};
+      box.left = dirty.left;
+      box.top = dirty.top;
+      box.right = dirty.right;
+      box.bottom = dirty.bottom;
+      box.front = 0;
+      box.back = 1;
+      ctx->CopySubresourceRegion(
+        static_cast<D3D11ResourceCommon *>(this), 0,
+        dirty.left, dirty.top, 0,
+        dc_staging_.ptr(), 0, &box
+      );
+
+      return S_OK;
+    }
+  }
+
+  HRESULT SurfaceMap(DXGI_MAPPED_RECT *pLockedRect, UINT MapFlags) override {
+    if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
+      return E_NOTIMPL;
+    } else {
+      if (!pLockedRect)
+        return E_INVALIDARG;
+      if (surface_mapped_)
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+
+      HRESULT hr = EnsureStagingTexture();
+      if (FAILED(hr))
+        return hr;
+
+      auto *ctx = this->m_parent->GetImmediateContextPrivate();
+
+      // read: copy device → staging and sync
+      if (MapFlags & DXGI_MAP_READ) {
+        ctx->CopyResource(dc_staging_.ptr(), static_cast<D3D11ResourceCommon *>(this));
+        FlushAndSync();
+      }
+
+      D3D11_MAP d3d11_map;
+      if ((MapFlags & DXGI_MAP_READ) && (MapFlags & DXGI_MAP_WRITE))
+        d3d11_map = D3D11_MAP_READ_WRITE;
+      else if (MapFlags & DXGI_MAP_WRITE)
+        d3d11_map = D3D11_MAP_WRITE;
+      else
+        d3d11_map = D3D11_MAP_READ;
+
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      hr = ctx->Map(dc_staging_.ptr(), 0, d3d11_map, 0, &mapped);
+      if (FAILED(hr))
+        return hr;
+
+      pLockedRect->Pitch = mapped.RowPitch;
+      pLockedRect->pBits = static_cast<BYTE *>(mapped.pData);
+      surface_mapped_ = true;
+      return S_OK;
+    }
+  }
+
+  HRESULT SurfaceUnmap() override {
+    if constexpr (!std::is_same_v<tag_texture, tag_texture_2d>) {
+      return E_NOTIMPL;
+    } else {
+      if (!surface_mapped_)
+        return E_FAIL;
+
+      auto *ctx = this->m_parent->GetImmediateContextPrivate();
+      ctx->Unmap(dc_staging_.ptr(), 0);
+
+      // write back staging → device
+      ctx->CopyResource(static_cast<D3D11ResourceCommon *>(this), dc_staging_.ptr());
+
+      surface_mapped_ = false;
       return S_OK;
     }
   }

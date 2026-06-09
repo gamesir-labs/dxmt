@@ -239,7 +239,8 @@ public:
       return S_OK;
     }
 
-    if (riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1)) {
+    if (riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1) ||
+        riid == __uuidof(IDXGISurface2)) {
       *ppvObject = ref(dxgi_surface.get());
       return S_OK;
     }
@@ -330,10 +331,26 @@ public:
     return E_NOTIMPL;
   }
 
+  virtual HRESULT SurfaceMap(DXGI_MAPPED_RECT *pLockedRect, UINT MapFlags) {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT SurfaceUnmap() {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT GetSurfaceResource(REFIID riid, void **ppParentResource, UINT *pSubresourceIndex) {
+    if (!ppParentResource)
+      return E_INVALIDARG;
+    if (pSubresourceIndex)
+      *pSubresourceIndex = 0;
+    return this->QueryInterface(riid, ppParentResource);
+  }
+
 protected:
   tag::DESC1 desc;
   std::unique_ptr<IDXGIResource1> dxgi_resource;
-  std::unique_ptr<IDXGISurface1> dxgi_surface;
+  std::unique_ptr<IDXGISurface2> dxgi_surface;
   tag::D3D10_IMPL d3d10;
 };
 

@@ -112,7 +112,7 @@ private:
 
 /* designed to be used as an aggregated object */
 template <DXGIResourceAggregateContext IResource>
-class MTLDXGISurface : public IDXGISurface1 {
+class MTLDXGISurface : public IDXGISurface2 {
 public:
   MTLDXGISurface(IResource *pResource) : resource_(pResource) {}
 
@@ -164,13 +164,13 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   Map(DXGI_MAPPED_RECT *pLockedRect, UINT MapFlags) final {
-    return E_NOTIMPL;
+    return resource_->SurfaceMap(pLockedRect, MapFlags);
   }
 
   HRESULT
   STDMETHODCALLTYPE
   Unmap() final {
-    return E_NOTIMPL;
+    return resource_->SurfaceUnmap();
   }
 
   HRESULT
@@ -183,6 +183,12 @@ public:
   STDMETHODCALLTYPE
   ReleaseDC(RECT *pDirtyRect) final {
     return resource_->ReleaseSurfaceDC(pDirtyRect);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetResource(REFIID riid, void **ppParentResource, UINT *pSubresourceIndex) final {
+    return resource_->GetSurfaceResource(riid, ppParentResource, pSubresourceIndex);
   }
 
 private:
