@@ -13,6 +13,10 @@ BACKUP_ROOT="${DXMT_GAMEHUB_BACKUP_ROOT:-${HOME}/Library/Caches/dxmt-runtime-smo
 STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${BACKUP_ROOT}/gamehub-test-stage}"
 BACKUP_TAG="${DXMT_GAMEHUB_BACKUP_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BACKUP_DIR="${BACKUP_ROOT}/gamehub-${GAMEHUB_DXMT_PACKAGE}-backup-${BACKUP_TAG}"
+ENABLE_APITRACE="${DXMT_GAMEHUB_ENABLE_APITRACE:-0}"
+APITRACE_OUTPUT_DIR="${DXMT_GAMEHUB_APITRACE_OUTPUT_DIR:-${REPO_ROOT}/tmp/gamehub-apitrace}"
+APITRACE_VERBOSE="${DXMT_GAMEHUB_APITRACE_VERBOSE:-0}"
+APITRACE_SEAL_AFTER_FRAME="${DXMT_GAMEHUB_APITRACE_SEAL_AFTER_FRAME:-}"
 
 runtime_files=(
   "x86_64-windows/winemetal.dll"
@@ -188,12 +192,36 @@ copy_runtime() {
 
 write_manifest() {
   mkdir -p "${GAMEHUB_DXMT_ROOT}"
-  python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" <<'PY'
+  if [[ "${ENABLE_APITRACE}" == "1" ]]; then
+    mkdir -p "${APITRACE_OUTPUT_DIR}"
+  fi
+
+  python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" \
+    "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" "$APITRACE_VERBOSE" \
+    "$APITRACE_SEAL_AFTER_FRAME" <<'PY'
 import json
 import sys
 
 manifest_path = sys.argv[1]
 package_name = sys.argv[2]
+enable_apitrace = sys.argv[3] == "1"
+apitrace_output_dir = sys.argv[4]
+apitrace_verbose = sys.argv[5] == "1"
+apitrace_seal_after_frame = sys.argv[6]
+environment_template = {
+    "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
+    "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
+    "WINEDLLPATH": "${COMPONENT_PATH}/wine",
+    "DYLD_FALLBACK_LIBRARY_PATH": "${COMPONENT_PATH}/wine/x86_64-unix:${WINE_INSTALL_PATH}/lib:${WINE_INSTALL_PATH}/lib/wine/x86_64-unix",
+}
+if enable_apitrace:
+    environment_template["DXMT_APITRACE_ENABLED"] = "1"
+    environment_template["APITRACE_TRACE_BUNDLE"] = apitrace_output_dir
+    if apitrace_verbose:
+        environment_template["APITRACE_METAL_VERBOSE"] = "1"
+    if apitrace_seal_after_frame:
+        environment_template["DXMT_APITRACE_SEAL_CHECKPOINT_AFTER_FRAME"] = apitrace_seal_after_frame
+
 manifest = {
     "id": package_name,
     "name": "DXMT GameHub Test",
@@ -204,12 +232,7 @@ manifest = {
     "link_windows_dlls": [
         "${COMPONENT_PATH}/wine/x86_64-windows",
     ],
-    "environment_template": {
-        "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
-        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
-        "WINEDLLPATH": "${COMPONENT_PATH}/wine",
-        "DYLD_FALLBACK_LIBRARY_PATH": "${COMPONENT_PATH}/wine/x86_64-unix:${WINE_INSTALL_PATH}/lib:${WINE_INSTALL_PATH}/lib/wine/x86_64-unix",
-    },
+    "environment_template": environment_template,
 }
 with open(manifest_path, "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=4)
@@ -231,6 +254,9 @@ main() {
   log "done"
   log "package: ${GAMEHUB_DXMT_ROOT}"
   log "backup:  ${BACKUP_DIR}"
+  if [[ "${ENABLE_APITRACE}" == "1" ]]; then
+    log "apitrace output: ${APITRACE_OUTPUT_DIR}"
+  fi
 }
 
 main "$@"

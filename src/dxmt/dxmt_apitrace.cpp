@@ -112,6 +112,15 @@ join_unix_path(const std::string &base, const std::string &child) {
   return base + "/" + child;
 }
 
+std::string
+process_trace_bundle_name() {
+  auto name = env::getExeName();
+#ifdef _WIN32
+  name += "." + std::to_string(GetCurrentProcessId());
+#endif
+  return name + ".apitrace";
+}
+
 uint64_t
 seal_after_frame() {
   if (!seal_after_frame_configured.exchange(true, std::memory_order_acq_rel)) {
@@ -173,7 +182,7 @@ bundle_root_from_output_dir(const std::string &value) {
     return {};
 
   env::createDirectory(unix_path);
-  return join_unix_path(unix_path, env::getExeName() + ".apitrace");
+  return join_unix_path(unix_path, process_trace_bundle_name());
 }
 
 std::string
@@ -363,6 +372,7 @@ set_current_d3d_sequence(uint64_t d3d_sequence) {
   if (!enabled())
     return;
 
+  ensure_session_open();
   DXMT_WMT_APITRACE_SET_CURRENT_D3D_SEQUENCE(d3d_sequence);
 }
 
