@@ -147,8 +147,10 @@ IsValidTileCoordinate(const ResourceTiling &tiling,
   if (coord.Subresource >= tiling.subresources.size())
     return false;
   const auto &subresource = tiling.subresources[coord.Subresource];
-  if (IsPackedTileSubresource(subresource))
-    return false;
+  if (IsPackedTileSubresource(subresource)) {
+    return subresource.packed_tile_index != D3D12_PACKED_TILE &&
+           coord.X == 0 && coord.Y == 0 && coord.Z == 0;
+  }
   return coord.X < subresource.width_in_tiles &&
          coord.Y < subresource.height_in_tiles &&
          coord.Z < subresource.depth_in_tiles;
@@ -160,8 +162,19 @@ AdvanceTileCoordinate(const ResourceTiling &tiling,
   if (coord.Subresource >= tiling.subresources.size())
     return false;
   const auto &subresource = tiling.subresources[coord.Subresource];
-  if (IsPackedTileSubresource(subresource))
-    return false;
+  if (IsPackedTileSubresource(subresource)) {
+    const UINT packed_tile = subresource.packed_tile_index;
+    coord.X = 0;
+    coord.Y = 0;
+    coord.Z = 0;
+    do {
+      ++coord.Subresource;
+      if (coord.Subresource >= tiling.subresources.size())
+        return false;
+    } while (tiling.subresources[coord.Subresource].packed_tile_index ==
+             packed_tile);
+    return true;
+  }
   if (++coord.X < subresource.width_in_tiles)
     return true;
   coord.X = 0;
@@ -229,20 +242,34 @@ AppendSparseTileMappingOp(const ResourceTiling &tiling,
     return false;
   const auto &subresource = tiling.subresources[coord.Subresource];
 
-  WMTSparseTextureMappingOperation op = {};
-  op.mode = (range_flags & D3D12_TILE_RANGE_FLAG_NULL)
-                ? WMTSparseTextureMappingModeUnmap
-                : WMTSparseTextureMappingModeMap;
-  op.level = subresource.mip_level;
-  op.slice = subresource.array_slice;
-  op.x = coord.X;
-  op.y = coord.Y;
-  op.z = coord.Z;
-  op.width = 1;
-  op.height = 1;
-  op.depth = 1;
-  op.heap_offset = UINT64(heap_tile) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
-  ops.push_back(op);
+  auto append_op = [&](const SubresourceTiling &tile, UINT x, UINT y,
+                       UINT z) {
+    WMTSparseTextureMappingOperation op = {};
+    op.mode = (range_flags & D3D12_TILE_RANGE_FLAG_NULL)
+                  ? WMTSparseTextureMappingModeUnmap
+                  : WMTSparseTextureMappingModeMap;
+    op.level = tile.mip_level;
+    op.slice = tile.array_slice;
+    op.x = x;
+    op.y = y;
+    op.z = z;
+    op.width = 1;
+    op.height = 1;
+    op.depth = 1;
+    op.heap_offset = UINT64(heap_tile) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    ops.push_back(op);
+  };
+
+  if (IsPackedTileSubresource(subresource)) {
+    const UINT packed_tile = subresource.packed_tile_index;
+    for (const auto &tile : tiling.subresources) {
+      if (tile.packed_tile_index == packed_tile)
+        append_op(tile, 0, 0, 0);
+    }
+    return true;
+  }
+
+  append_op(subresource, coord.X, coord.Y, coord.Z);
   return true;
 }
 
@@ -288,6 +315,12 @@ AppendSparseTileMappingRegion(const ResourceTiling &tiling,
 
   if (size->UseBox) {
     const auto &subresource = tiling.subresources[start.Subresource];
+    if (IsPackedTileSubresource(subresource)) {
+      if (start.X || start.Y || start.Z || size->Width != 1 ||
+          size->Height != 1 || size->Depth != 1)
+        return false;
+      return append_one(start);
+    }
     if (start.X > subresource.width_in_tiles ||
         size->Width > subresource.width_in_tiles - start.X ||
         start.Y > subresource.height_in_tiles ||
@@ -369,8 +402,9 @@ ApplySparseTileMappingOpsToResource(Resource &resource,
          ++subresource) {
       const auto &tile = tiling.subresources[subresource];
       if (tile.mip_level != op.level || tile.array_slice != op.slice ||
-          op.x >= tile.width_in_tiles || op.y >= tile.height_in_tiles ||
-          op.z >= tile.depth_in_tiles)
+          (!IsPackedTileSubresource(tile) &&
+           (op.x >= tile.width_in_tiles || op.y >= tile.height_in_tiles ||
+            op.z >= tile.depth_in_tiles)))
         continue;
       resource.UpdateTileMapping(
           subresource, op.x, op.y, op.z, heap,
@@ -1411,6 +1445,31 @@ IsImplicitPromotionCompatibleResource(const Resource &resource,
     return false;
 
   return IsImplicitPromotionCompatibleState(resource, before);
+}
+
+static bool
+IsTransitionBeforeStateCompatible(D3D12_COMMAND_LIST_TYPE queue_type,
+                                  D3D12_RESOURCE_STATES current,
+                                  D3D12_RESOURCE_STATES before) {
+  if (current == before)
+    return true;
+
+  if (IsReadOnlyResourceState(current) && IsReadOnlyResourceState(before)) {
+    const auto current_bits = uint32_t(current);
+    const auto before_bits = uint32_t(before);
+    return (current_bits & before_bits) == before_bits;
+  }
+
+  if (queue_type == D3D12_COMMAND_LIST_TYPE_COPY &&
+      before == D3D12_RESOURCE_STATE_COMMON &&
+      IsReadOnlyResourceState(current)) {
+    constexpr uint32_t kShaderResourceStates =
+        uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+        uint32_t(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return (uint32_t(current) & kShaderResourceStates) != 0;
+  }
+
+  return false;
 }
 
 static bool
@@ -2676,27 +2735,37 @@ public:
     auto *chunk = queue.CurrentChunk();
     dxmt::apitrace::record_sparse_texture_mapping_ops(
         this, resource, heap, "UpdateTileMappings", ops.data(), ops.size());
+    auto ops_snapshot =
+        std::make_shared<std::vector<WMTSparseTextureMappingOperation>>(
+            std::move(ops));
+    auto tiling_snapshot = std::make_shared<ResourceTiling>(*tiling);
     Com<ID3D12Resource> resource_ref = resource;
     Com<ID3D12Heap> heap_ref = heap;
-    auto tiling_copy = *tiling;
+    const auto resource_diag = resource;
+    const auto heap_diag = heap;
+    const auto op_count_diag = ops_snapshot->size();
+    const auto has_map_diag = has_map;
     chunk->emitcc([device = device_->GetDXMTDevice().device(),
                    texture, placement_heap,
-                   ops = std::move(ops), resource_ref,
-                   tiling_copy = std::move(tiling_copy), heap_ref,
-                   has_map](
+                   ops_snapshot = std::move(ops_snapshot),
+                   resource_ref,
+                   tiling_snapshot = std::move(tiling_snapshot), heap_ref,
+                   resource_diag, heap_diag, op_count_diag, has_map_diag](
                       ArgumentEncodingContext &) mutable {
       if (!device.updateSparseTextureMappings(texture, placement_heap,
-                                              ops.data(), ops.size())) {
+                                              ops_snapshot->data(),
+                                              ops_snapshot->size())) {
         WARN("D3D12CommandQueue: TODO Metal4 UpdateTileMappings failed"
-             " resource=", resource_ref.ptr(),
-             " heap=", heap_ref.ptr(),
-             " ops=", ops.size(),
-             " hasMap=", has_map);
+             " resource=", resource_diag,
+             " heap=", heap_diag,
+             " ops=", op_count_diag,
+             " hasMap=", has_map_diag);
         return;
       }
       if (auto *resource_object = dynamic_cast<d3d12::Resource *>(resource_ref.ptr()))
-        ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
-                                            heap_ref.ptr(), ops);
+        ApplySparseTileMappingOpsToResource(*resource_object,
+                                            *tiling_snapshot, heap_ref.ptr(),
+                                            *ops_snapshot);
     });
   }
 
@@ -2808,7 +2877,7 @@ public:
     auto texture = dst->GetTextureAllocation()->texture();
     auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
     Com<ID3D12Resource> dst_ref = dst_resource;
-    auto tiling_copy = *dst_tiling;
+    auto tiling_snapshot = std::make_shared<ResourceTiling>(*dst_tiling);
     auto emit_ops = [&](ID3D12Heap *heap, std::vector<WMTSparseTextureMappingOperation> ops) {
       dxmt::apitrace::record_sparse_texture_mapping_ops(
           this, dst_resource, heap, "CopyTileMappings", ops.data(), ops.size());
@@ -2824,21 +2893,30 @@ public:
           return;
         }
       }
+      auto ops_snapshot =
+          std::make_shared<std::vector<WMTSparseTextureMappingOperation>>(
+              std::move(ops));
+      const auto dst_diag = dst_resource;
+      const auto heap_diag = heap;
+      const auto op_count_diag = ops_snapshot->size();
       chunk->emitcc([device = device_->GetDXMTDevice().device(), texture,
                      placement_heap, dst_ref, heap_ref,
-                     tiling_copy, ops = std::move(ops)](
+                     tiling_snapshot,
+                     ops_snapshot = std::move(ops_snapshot), dst_diag,
+                     heap_diag, op_count_diag](
                         ArgumentEncodingContext &) mutable {
         if (!device.updateSparseTextureMappings(texture, placement_heap,
-                                                ops.data(), ops.size())) {
+                                                ops_snapshot->data(),
+                                                ops_snapshot->size())) {
           WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
-               " dst=", dst_ref.ptr(),
-               " heap=", heap_ref.ptr(),
-               " ops=", ops.size());
+               " dst=", dst_diag,
+               " heap=", heap_diag,
+               " ops=", op_count_diag);
           return;
         }
         if (auto *dst = dynamic_cast<d3d12::Resource *>(dst_ref.ptr()))
-          ApplySparseTileMappingOpsToResource(*dst, tiling_copy, heap_ref.ptr(),
-                                              ops);
+          ApplySparseTileMappingOpsToResource(*dst, *tiling_snapshot,
+                                              heap_ref.ptr(), *ops_snapshot);
       });
     };
 
@@ -4739,7 +4817,8 @@ private:
           current.state = transition.StateBefore;
           current.implicitly_promoted = true;
         }
-        if (current.state != transition.StateBefore) {
+        if (!IsTransitionBeforeStateCompatible(desc_.Type, current.state,
+                                               transition.StateBefore)) {
           const auto &desc = resource->GetResourceDesc();
           WARN("D3D12CommandQueue: split transition BEGIN state mismatch"
                " subresource=", subresource,
@@ -4799,7 +4878,8 @@ private:
         current.state = transition.StateBefore;
         current.implicitly_promoted = true;
       }
-      if (current.state != transition.StateBefore) {
+      if (!IsTransitionBeforeStateCompatible(desc_.Type, current.state,
+                                             transition.StateBefore)) {
         const auto &desc = resource->GetResourceDesc();
         WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
              subresource, " expected=", uint32_t(current.state),
@@ -8393,12 +8473,25 @@ private:
     auto *scissor_data = static_cast<WMTScissorRect *>(
         enc.allocate_cpu_heap(sizeof(WMTScissorRect) * scissors.size(),
                               alignof(WMTScissorRect)));
+    const auto *render_encoder = enc.currentRenderEncoder();
+    const int64_t render_target_width = render_encoder
+                                            ? render_encoder->render_target_width
+                                            : 0;
+    const int64_t render_target_height = render_encoder
+                                             ? render_encoder->render_target_height
+                                             : 0;
     for (size_t i = 0; i < scissors.size(); i++) {
       const auto &rect = scissors[i];
-      scissor_data[i] = {uint32_t(std::max<LONG>(0, rect.left)),
-                         uint32_t(std::max<LONG>(0, rect.top)),
-                         uint32_t(std::max<LONG>(0, rect.right - rect.left)),
-                         uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
+      const int64_t left =
+          std::clamp<int64_t>(rect.left, 0, render_target_width);
+      const int64_t top =
+          std::clamp<int64_t>(rect.top, 0, render_target_height);
+      const int64_t right =
+          std::clamp<int64_t>(rect.right, left, render_target_width);
+      const int64_t bottom =
+          std::clamp<int64_t>(rect.bottom, top, render_target_height);
+      scissor_data[i] = {uint64_t(left), uint64_t(top),
+                         uint64_t(right - left), uint64_t(bottom - top)};
     }
     scissor_cmd.scissor_rects.set(scissor_data);
     scissor_cmd.rect_count = scissors.size();

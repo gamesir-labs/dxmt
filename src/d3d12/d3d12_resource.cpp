@@ -813,13 +813,18 @@ public:
     if (!has_tiling_ || subresource >= tiling_.subresources.size())
       return false;
     const auto &tile = tiling_.subresources[subresource];
-    if (x >= tile.width_in_tiles || y >= tile.height_in_tiles ||
-        z >= tile.depth_in_tiles)
-      return false;
-    const UINT index = tile.start_tile_index +
-                       (z * tile.height_in_tiles + y) *
-                           tile.width_in_tiles +
-                       x;
+    UINT index = 0;
+    if (tile.start_tile_index == D3D12_PACKED_TILE) {
+      if (tile.packed_tile_index == D3D12_PACKED_TILE || x || y || z)
+        return false;
+      index = tile.packed_tile_index;
+    } else {
+      if (x >= tile.width_in_tiles || y >= tile.height_in_tiles ||
+          z >= tile.depth_in_tiles)
+        return false;
+      index = tile.start_tile_index +
+              (z * tile.height_in_tiles + y) * tile.width_in_tiles + x;
+    }
     if (index >= tile_map_.size())
       return false;
     if (mapped) {
@@ -839,13 +844,18 @@ public:
     if (!has_tiling_ || subresource >= tiling_.subresources.size())
       return false;
     const auto &tile = tiling_.subresources[subresource];
-    if (x >= tile.width_in_tiles || y >= tile.height_in_tiles ||
-        z >= tile.depth_in_tiles)
-      return false;
-    const UINT index = tile.start_tile_index +
-                       (z * tile.height_in_tiles + y) *
-                           tile.width_in_tiles +
-                       x;
+    UINT index = 0;
+    if (tile.start_tile_index == D3D12_PACKED_TILE) {
+      if (tile.packed_tile_index == D3D12_PACKED_TILE || x || y || z)
+        return false;
+      index = tile.packed_tile_index;
+    } else {
+      if (x >= tile.width_in_tiles || y >= tile.height_in_tiles ||
+          z >= tile.depth_in_tiles)
+        return false;
+      index = tile.start_tile_index +
+              (z * tile.height_in_tiles + y) * tile.width_in_tiles + x;
+    }
     if (index >= tile_map_.size())
       return false;
     mapping = tile_map_[index];
@@ -1446,7 +1456,7 @@ private:
     tiling_.packed_mip_info.NumStandardMips = standard_mips;
     tiling_.packed_mip_info.NumPackedMips = mip_levels - standard_mips;
     tiling_.packed_mip_info.NumTilesForPackedMips =
-        tiling_.packed_mip_info.NumPackedMips ? 1 : 0;
+        tiling_.packed_mip_info.NumPackedMips ? plane_count * array_size : 0;
     tiling_.packed_mip_info.StartTileIndexInOverallResource = 0;
 
     tiling_.subresources.reserve(mip_levels * array_size * plane_count);
@@ -1483,7 +1493,10 @@ private:
                 tiling_.packed_mip_info.StartTileIndexInOverallResource = next_tile;
                 packed_start_set = true;
               }
+              subresource.packed_tile_index = next_tile;
               ++next_tile;
+            } else {
+              subresource.packed_tile_index = next_tile - 1;
             }
             subresource.width_in_tiles = 0;
             subresource.height_in_tiles = 0;

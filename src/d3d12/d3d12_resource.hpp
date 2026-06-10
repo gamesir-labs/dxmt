@@ -21,6 +21,7 @@ struct SubresourceTiling {
   UINT16 height_in_tiles = 0;
   UINT16 depth_in_tiles = 0;
   UINT start_tile_index = 0;
+  UINT packed_tile_index = D3D12_PACKED_TILE;
   UINT mip_level = 0;
   UINT array_slice = 0;
   UINT plane = 0;
