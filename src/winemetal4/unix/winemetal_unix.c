@@ -873,6 +873,9 @@ struct dxmt_metal4_argument_state {
   id<MTL4ArgumentTable> table;
   DXMTMetal4CommandBuffer *owner;
   struct dxmt_metal4_argument_binding buffers[31];
+  bool buffer_bound[31];
+  id<MTLTexture> textures[128];
+  bool texture_bound[128];
   NSMutableArray *upload_buffers;
 };
 
@@ -901,9 +904,14 @@ dxmt_metal4_argument_set_buffer(
     uint8_t index) {
   if (!state->table || index >= 31)
     return;
+  bool same_buffer = state->buffer_bound[index] && state->buffers[index].buffer == buffer;
+  if (same_buffer && state->buffers[index].offset == offset)
+    return;
   state->buffers[index].buffer = buffer;
   state->buffers[index].offset = offset;
-  [state->owner useResidencyAllocation:(id<MTLAllocation>)buffer];
+  state->buffer_bound[index] = true;
+  if (buffer && !same_buffer)
+    [state->owner useResidencyAllocation:(id<MTLAllocation>)buffer];
   [state->table setAddress:buffer ? [buffer gpuAddress] + offset : 0 atIndex:index];
 }
 
@@ -935,7 +943,12 @@ static void
 dxmt_metal4_argument_set_texture(struct dxmt_metal4_argument_state *state, id<MTLTexture> texture, uint8_t index) {
   if (!state->table || index >= 128)
     return;
-  [state->owner useResidencyAllocation:(id<MTLAllocation>)texture];
+  if (state->texture_bound[index] && state->textures[index] == texture)
+    return;
+  state->textures[index] = texture;
+  state->texture_bound[index] = true;
+  if (texture)
+    [state->owner useResidencyAllocation:(id<MTLAllocation>)texture];
   [state->table setTexture:texture ? [texture gpuResourceID] : (MTLResourceID){0} atIndex:index];
 }
 
