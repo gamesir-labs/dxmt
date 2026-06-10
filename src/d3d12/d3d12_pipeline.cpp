@@ -387,6 +387,58 @@ GetRootSignatureFlags(ID3D12RootSignature *root_signature) {
              : desc.Desc_1_1.Flags;
 }
 
+std::string
+PipelineShaderCacheKey(PipelineShaderStage stage,
+                       const D3D12_SHADER_BYTECODE &bytecode) {
+  std::string key = std::to_string(uint32_t(stage));
+  key += ':';
+  key += Sha1HashState::compute(
+      static_cast<const uint8_t *>(bytecode.pShaderBytecode),
+      bytecode.BytecodeLength).string();
+  return key;
+}
+
+std::mutex &
+PipelineShaderCacheMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, std::shared_ptr<PipelineCachedShader>> &
+PipelineShaderCache() {
+  static std::unordered_map<std::string, std::shared_ptr<PipelineCachedShader>>
+      cache;
+  return cache;
+}
+
+HRESULT
+InitializePipelineShaderHandle(PipelineShaderStage stage,
+                               PipelineCachedShader &cached_shader,
+                               dxmt12_airconv_shader_t *shader,
+                               DXMT12_MTL4_SHADER_REFLECTION *reflection) {
+  if (shader)
+    *shader = nullptr;
+
+  sm50_error_t error = nullptr;
+  const bool is_dxil = cached_shader.kind == PipelineShaderBytecodeKind::Dxil;
+  const auto initialize_failed =
+      is_dxil ? DXMT12DXILInitialize(cached_shader.bytecode.data(),
+                                     cached_shader.bytecode.size(), shader,
+                                     reflection, &error)
+              : DXMT12SM50Initialize(cached_shader.bytecode.data(),
+                                     cached_shader.bytecode.size(), shader,
+                                     reflection, &error);
+  if (initialize_failed) {
+    WARN("D3D12PipelineState: failed to initialize ", ShaderStageName(stage),
+         is_dxil ? " DXIL shader: " : " DXBC shader: ",
+         DXMT12SM50GetErrorMessageString(error));
+    DXMT12SM50FreeError(error);
+    return WARN_E_INVALIDARG(__func__);
+  }
+
+  return S_OK;
+}
+
 HRESULT
 ParsePipelineShader(PipelineShaderStage stage,
                     IMTLD3D12Device *device,
@@ -399,23 +451,37 @@ ParsePipelineShader(PipelineShaderStage stage,
 
   shader = {};
   shader.stage = stage;
-  shader.bytecode.resize(bytecode.BytecodeLength);
-  std::memcpy(shader.bytecode.data(), bytecode.pShaderBytecode,
+  const auto cache_key = PipelineShaderCacheKey(stage, bytecode);
+  {
+    std::lock_guard lock(PipelineShaderCacheMutex());
+    auto &cache = PipelineShaderCache();
+    auto cached = cache.find(cache_key);
+    if (cached != cache.end()) {
+      shader.cached_shader = cached->second;
+      DXMT12_MTL4_SHADER_REFLECTION reflection = {};
+      return InitializePipelineShaderHandle(stage, *shader.cached_shader,
+                                            &shader.shader, &reflection);
+    }
+  }
+
+  auto cached_shader = std::make_shared<PipelineCachedShader>();
+  cached_shader->bytecode.resize(bytecode.BytecodeLength);
+  std::memcpy(cached_shader->bytecode.data(), bytecode.pShaderBytecode,
               bytecode.BytecodeLength);
 
   const bool is_dxil = IsDxilContainer(bytecode);
-  shader.kind = is_dxil ? PipelineShaderBytecodeKind::Dxil
-                        : PipelineShaderBytecodeKind::Dxbc;
+  cached_shader->kind = is_dxil ? PipelineShaderBytecodeKind::Dxil
+                                : PipelineShaderBytecodeKind::Dxbc;
 
-  const auto status = shader.parser.parse(shader.bytecode.data(),
-                                          shader.bytecode.size());
+  const auto status = cached_shader->parser.parse(
+      cached_shader->bytecode.data(), cached_shader->bytecode.size());
   if (is_dxil && status != dxil::ParseStatus::Ok) {
     WARN("D3D12PipelineState: failed to parse ", ShaderStageName(stage),
          " DXIL bytecode: ", dxil::StatusName(status));
     return WARN_E_INVALIDARG(__func__);
   }
 
-  const auto &program = shader.parser.dxilProgram();
+  const auto &program = cached_shader->parser.dxilProgram();
   if (is_dxil) {
     const auto expected_kind = ExpectedShaderKind(stage);
     if (program && expected_kind != UINT32_MAX &&
@@ -431,34 +497,41 @@ ParsePipelineShader(PipelineShaderStage stage,
     return WARN_E_INVALIDARG(__func__);
   }
 
-  sm50_error_t error = nullptr;
-  const auto initialize_failed =
-      is_dxil ? DXMT12DXILInitialize(shader.bytecode.data(), shader.bytecode.size(),
-                               &shader.shader, &shader.reflection, &error)
-              : DXMT12SM50Initialize(shader.bytecode.data(), shader.bytecode.size(),
-                               &shader.shader, &shader.reflection, &error);
-  if (initialize_failed) {
-    WARN("D3D12PipelineState: failed to initialize ", ShaderStageName(stage),
-         is_dxil ? " DXIL shader: " : " DXBC shader: ",
-         DXMT12SM50GetErrorMessageString(error));
-    DXMT12SM50FreeError(error);
-    return WARN_E_INVALIDARG(__func__);
-  }
+  shader.cached_shader = cached_shader;
+  auto hr = InitializePipelineShaderHandle(stage, *cached_shader,
+                                           &shader.shader,
+                                           &cached_shader->reflection);
+  if (FAILED(hr))
+    return hr;
 
   const auto argument_count =
-      shader.reflection.NumConstantBuffers + shader.reflection.NumArguments;
-  shader.argument_info.resize(argument_count);
+      cached_shader->reflection.NumConstantBuffers +
+      cached_shader->reflection.NumArguments;
+  cached_shader->argument_info.resize(argument_count);
   if (argument_count) {
     auto *constant_buffers =
-        shader.argument_info.empty() ? nullptr : shader.argument_info.data();
-    auto *arguments =
-        shader.argument_info.size() <= shader.reflection.NumConstantBuffers
+        cached_shader->argument_info.empty()
             ? nullptr
-            : shader.argument_info.data() + shader.reflection.NumConstantBuffers;
+            : cached_shader->argument_info.data();
+    auto *arguments =
+        cached_shader->argument_info.size() <=
+                cached_shader->reflection.NumConstantBuffers
+            ? nullptr
+            : cached_shader->argument_info.data() +
+                  cached_shader->reflection.NumConstantBuffers;
     if (is_dxil)
-      DXMT12DXILGetArgumentsInfo(shader.shader, constant_buffers, arguments);
+      DXMT12DXILGetArgumentsInfo(shader.shader, constant_buffers,
+                                 arguments);
     else
-      DXMT12SM50GetArgumentsInfo(shader.shader, constant_buffers, arguments);
+      DXMT12SM50GetArgumentsInfo(shader.shader, constant_buffers,
+                                 arguments);
+  }
+
+  {
+    std::lock_guard lock(PipelineShaderCacheMutex());
+    auto &cache = PipelineShaderCache();
+    auto [it, inserted] = cache.emplace(cache_key, cached_shader);
+    shader.cached_shader = inserted ? cached_shader : it->second;
   }
 
   return S_OK;
@@ -501,9 +574,9 @@ ShaderBytecodeView(const std::vector<PipelineDxilShader> &shaders,
     return {};
 
   return {
-      .pShaderBytecode = shader->bytecode.empty() ? nullptr
-                                                  : shader->bytecode.data(),
-      .BytecodeLength = shader->bytecode.size(),
+      .pShaderBytecode = shader->bytecode().empty() ? nullptr
+                                                  : shader->bytecode().data(),
+      .BytecodeLength = shader->bytecode().size(),
   };
 }
 
@@ -608,10 +681,10 @@ DebugLogDxilShaderInfo(std::string_view shader_cache_key,
   INFO("D3D12 diagnostic: pipeline shader",
        " pso=", shader_cache_key.substr(0, std::min<size_t>(16, shader_cache_key.size())),
        " stage=", ShaderStageName(shader.stage),
-       " bytecode=", uint64_t(shader.bytecode.size()),
-       " cbv=", uint32_t(shader.reflection.NumConstantBuffers),
-       " resources=", uint32_t(shader.reflection.NumArguments),
-       " argumentQwords=", uint32_t(shader.reflection.ArgumentTableQwords),
+       " bytecode=", uint64_t(shader.bytecode().size()),
+       " cbv=", uint32_t(shader.reflection().NumConstantBuffers),
+       " resources=", uint32_t(shader.reflection().NumArguments),
+       " argumentQwords=", uint32_t(shader.reflection().ArgumentTableQwords),
        " signatures=", info ? uint32_t(info->signatures.size()) : 0u,
        " hasRootSignature=", info && info->has_root_signature);
 
@@ -734,13 +807,13 @@ HashPipelineShaders(Sha1HashState &hash,
   HashValue(hash, count);
   for (const auto &shader : shaders) {
     HashValue(hash, shader.stage);
-    HashVector(hash, shader.bytecode);
+    HashVector(hash, shader.bytecode());
   }
 }
 
 std::string
 PipelineShaderDigest(const PipelineDxilShader &shader) {
-  return Sha1HashState::compute(shader.bytecode.data(), shader.bytecode.size())
+  return Sha1HashState::compute(shader.bytecode().data(), shader.bytecode().size())
       .string();
 }
 
@@ -778,7 +851,7 @@ size_t
 ShaderBytecodeSize(const std::vector<PipelineDxilShader> &shaders,
                    PipelineShaderStage stage) {
   if (auto *shader = FindShader(shaders, stage))
-    return shader->bytecode.size();
+    return shader->bytecode().size();
   return 0;
 }
 
@@ -790,7 +863,7 @@ D3D12DebugShaderName(const std::vector<PipelineDxilShader> &shaders,
     return "null";
 
   std::stringstream stream;
-  stream << PipelineShaderDigest(*shader) << "/" << shader->bytecode.size();
+  stream << PipelineShaderDigest(*shader) << "/" << shader->bytecode().size();
   return stream.str();
 }
 
@@ -1039,18 +1112,18 @@ D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
     const auto digest = PipelineShaderDigest(shader);
     const auto stage = ShaderStageName(shader.stage);
     const auto bytecode_kind =
-        shader.kind == PipelineShaderBytecodeKind::Dxil ? "dxil" : "dxbc";
+        shader.kind() == PipelineShaderBytecodeKind::Dxil ? "dxil" : "dxbc";
     const auto filename = env::getExeBaseName() + "_d3d12_" + key_prefix +
                           "_" + stage + "_" + digest.substr(0, 16) + "." +
                           bytecode_kind;
     const auto path = dir + filename;
     std::ofstream dump(path, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (dump && !shader.bytecode.empty())
-      dump.write(reinterpret_cast<const char *>(shader.bytecode.data()),
-                 shader.bytecode.size());
+    if (dump && !shader.bytecode().empty())
+      dump.write(reinterpret_cast<const char *>(shader.bytecode().data()),
+                 shader.bytecode().size());
     if (manifest)
       manifest << stage << "=" << digest << " kind=" << bytecode_kind << " "
-               << filename << " bytes=" << shader.bytecode.size() << "\n";
+               << filename << " bytes=" << shader.bytecode().size() << "\n";
   }
 
   WARN("D3D12PipelineState: dumped ", kind, " pipeline shaders to ",
@@ -1072,7 +1145,7 @@ D3D12DumpFailedPipelineShader(const PipelineDxilShader &shader,
   const auto digest = PipelineShaderDigest(shader);
   const auto stage = ShaderStageName(shader.stage);
   const auto kind =
-      shader.kind == PipelineShaderBytecodeKind::Dxil ? "dxil" : "dxbc";
+      shader.kind() == PipelineShaderBytecodeKind::Dxil ? "dxil" : "dxbc";
   const auto prefix = env::getExeBaseName() + "_d3d12_airconv_fail_" +
                       std::to_string(index) + "_" + stage + "_" +
                       digest.substr(0, 16);
@@ -1082,16 +1155,16 @@ D3D12DumpFailedPipelineShader(const PipelineDxilShader &shader,
 
   std::ofstream dump(shader_path,
                      std::ios::out | std::ios::binary | std::ios::trunc);
-  if (dump && !shader.bytecode.empty())
-    dump.write(reinterpret_cast<const char *>(shader.bytecode.data()),
-               shader.bytecode.size());
+  if (dump && !shader.bytecode().empty())
+    dump.write(reinterpret_cast<const char *>(shader.bytecode().data()),
+               shader.bytecode().size());
 
   std::ofstream manifest(manifest_path, std::ios::out | std::ios::trunc);
   if (manifest) {
     manifest << "stage=" << stage << "\n"
              << "kind=" << kind << "\n"
              << "digest=" << digest << "\n"
-             << "bytes=" << shader.bytecode.size() << "\n"
+             << "bytes=" << shader.bytecode().size() << "\n"
              << "function=shader_main\n"
              << "requestedFunction=" << function_name << "\n"
              << "compileResult=" << compile_result << "\n"
@@ -1197,15 +1270,7 @@ BuildCachedShaderBlob(PipelineStateType type,
 
 void
 DestroyPipelineShaders(std::vector<PipelineDxilShader> &shaders) {
-  for (auto &shader : shaders) {
-    if (shader.shader) {
-      if (shader.kind == PipelineShaderBytecodeKind::Dxil)
-        DXMT12DXILDestroy(shader.shader);
-      else
-        DXMT12SM50Destroy(shader.shader);
-      shader.shader = nullptr;
-    }
-  }
+  shaders.clear();
 }
 
 std::string
@@ -1244,23 +1309,23 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   int compile_failed = 0;
   {
     std::lock_guard lock(AirconvCompileMutex());
-    compile_failed = shader.kind == PipelineShaderBytecodeKind::Dxil
-                         ? DXMT12DXILCompile(shader.shader, args, air_function_name,
+    compile_failed = shader.kind() == PipelineShaderBytecodeKind::Dxil
+                         ? DXMT12DXILCompile(shader.shaderHandle(), args, air_function_name,
                                        &bitcode_handle, &error)
-                         : DXMT12SM50Compile(shader.shader, args, air_function_name,
+                         : DXMT12SM50Compile(shader.shaderHandle(), args, air_function_name,
                                        &bitcode_handle, &error);
   }
   if (compile_failed) {
     auto error_message = DXMT12SM50GetErrorMessageString(error);
     WARN("D3D12PipelineState: airconv compile diagnostic stage=",
          ShaderStageName(shader.stage),
-         shader.kind == PipelineShaderBytecodeKind::Dxil ? " kind=DXIL"
+         shader.kind() == PipelineShaderBytecodeKind::Dxil ? " kind=DXIL"
                                                          : " kind=DXBC",
          " ret=", compile_failed, " error=", reinterpret_cast<uintptr_t>(error),
          " message_len=", error_message.size(), " function=", air_function_name,
          " requestedFunction=", function_name);
     WARN("D3D12PipelineState: failed to compile ", ShaderStageName(shader.stage),
-         shader.kind == PipelineShaderBytecodeKind::Dxil ? " DXIL shader: "
+         shader.kind() == PipelineShaderBytecodeKind::Dxil ? " DXIL shader: "
                                                          : " DXBC shader: ",
          error_message);
     D3D12DumpFailedPipelineShader(shader, function_name, error_message,
@@ -1330,8 +1395,8 @@ CompileGeometryPipelineVertexFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     PipelineMetalShader &out) {
-  if (vs.kind != PipelineShaderBytecodeKind::Dxbc ||
-      gs.kind != PipelineShaderBytecodeKind::Dxbc) {
+  if (vs.kind() != PipelineShaderBytecodeKind::Dxbc ||
+      gs.kind() != PipelineShaderBytecodeKind::Dxbc) {
     WARN("D3D12PipelineState: DXIL geometry shader mesh lowering is unsupported");
     return false;
   }
@@ -1342,7 +1407,7 @@ CompileGeometryPipelineVertexFunction(
   {
     std::lock_guard lock(AirconvCompileMutex());
     compile_failed = DXMT12SM50CompileGeometryPipelineVertex(
-        vs.shader, gs.shader, args, function_name, &bitcode_handle, &error);
+        vs.shaderHandle(), gs.shaderHandle(), args, function_name, &bitcode_handle, &error);
   }
   if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC geometry vertex shader: ",
@@ -1360,8 +1425,8 @@ CompileGeometryPipelineGeometryFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     PipelineMetalShader &out) {
-  if (vs.kind != PipelineShaderBytecodeKind::Dxbc ||
-      gs.kind != PipelineShaderBytecodeKind::Dxbc) {
+  if (vs.kind() != PipelineShaderBytecodeKind::Dxbc ||
+      gs.kind() != PipelineShaderBytecodeKind::Dxbc) {
     WARN("D3D12PipelineState: DXIL geometry shader mesh lowering is unsupported");
     return false;
   }
@@ -1372,7 +1437,7 @@ CompileGeometryPipelineGeometryFunction(
   {
     std::lock_guard lock(AirconvCompileMutex());
     compile_failed = DXMT12SM50CompileGeometryPipelineGeometry(
-        vs.shader, gs.shader, args, function_name, &bitcode_handle, &error);
+        vs.shaderHandle(), gs.shaderHandle(), args, function_name, &bitcode_handle, &error);
   }
   if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC geometry shader: ",
@@ -1391,8 +1456,8 @@ CompileTessellationPipelineHullFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &hs,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     PipelineMetalShader &out) {
-  if (vs.kind != PipelineShaderBytecodeKind::Dxbc ||
-      hs.kind != PipelineShaderBytecodeKind::Dxbc) {
+  if (vs.kind() != PipelineShaderBytecodeKind::Dxbc ||
+      hs.kind() != PipelineShaderBytecodeKind::Dxbc) {
     // TODO(d3d12): add DXIL tessellation lowering once airconv exposes it.
     WARN("D3D12PipelineState: DXIL tessellation hull lowering is unsupported");
     return false;
@@ -1404,7 +1469,7 @@ CompileTessellationPipelineHullFunction(
   {
     std::lock_guard lock(AirconvCompileMutex());
     compile_failed = DXMT12SM50CompileTessellationPipelineHull(
-        vs.shader, hs.shader, args, function_name, &bitcode_handle, &error);
+        vs.shaderHandle(), hs.shaderHandle(), args, function_name, &bitcode_handle, &error);
   }
   if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC tessellation hull shader: ",
@@ -1422,8 +1487,8 @@ CompileTessellationPipelineDomainFunction(
     IMTLD3D12Device *device, PipelineDxilShader &hs, PipelineDxilShader &ds,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     PipelineMetalShader &out) {
-  if (hs.kind != PipelineShaderBytecodeKind::Dxbc ||
-      ds.kind != PipelineShaderBytecodeKind::Dxbc) {
+  if (hs.kind() != PipelineShaderBytecodeKind::Dxbc ||
+      ds.kind() != PipelineShaderBytecodeKind::Dxbc) {
     // TODO(d3d12): add DXIL tessellation lowering once airconv exposes it.
     WARN("D3D12PipelineState: DXIL tessellation domain lowering is unsupported");
     return false;
@@ -1435,7 +1500,7 @@ CompileTessellationPipelineDomainFunction(
   {
     std::lock_guard lock(AirconvCompileMutex());
     compile_failed = DXMT12SM50CompileTessellationPipelineDomain(
-        hs.shader, ds.shader, args, function_name, &bitcode_handle, &error);
+        hs.shaderHandle(), ds.shaderHandle(), args, function_name, &bitcode_handle, &error);
   }
   if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile DXBC tessellation domain shader: ",
@@ -1854,28 +1919,28 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
            bool(hs), " hasDS=", bool(ds));
       return false;
     }
-    if (gs && gs->reflection.GeometryShader.GSPassThrough == ~0u) {
+    if (gs && gs->reflection().GeometryShader.GSPassThrough == ~0u) {
       // TODO(d3d12): lower full GS-after-DS pipelines through mesh shaders.
       WARN("D3D12PipelineState: tessellation with full geometry shader is unsupported");
       return false;
     }
-    if (hs->reflection.Tessellator.OutputPrimitive ==
+    if (hs->reflection().Tessellator.OutputPrimitive ==
             MTL_TESSELLATOR_OUTPUT_LINE ||
-        hs->reflection.Tessellator.OutputPrimitive ==
+        hs->reflection().Tessellator.OutputPrimitive ==
             MTL_TESSELLATOR_OUTPUT_POINT) {
       // TODO(d3d12): implement line/point tessellation primitive generation.
       WARN("D3D12PipelineState: unsupported tessellation output primitive ",
-           uint32_t(hs->reflection.Tessellator.OutputPrimitive));
+           uint32_t(hs->reflection().Tessellator.OutputPrimitive));
       return false;
     }
 
     auto max_potential_factor =
-        ds->reflection.PostTessellator.MaxPotentialTessFactor;
+        ds->reflection().PostTessellator.MaxPotentialTessFactor;
     if (!device->GetMTLDevice().supportsFamily(WMTGPUFamilyApple9))
       max_potential_factor = std::min(8u, max_potential_factor);
-    if (float(max_potential_factor) < hs->reflection.Tessellator.MaxFactor) {
+    if (float(max_potential_factor) < hs->reflection().Tessellator.MaxFactor) {
       WARN("D3D12PipelineState: tessellation maxtessfactor(",
-           hs->reflection.Tessellator.MaxFactor,
+           hs->reflection().Tessellator.MaxFactor,
            ") exceeds mesh pipeline limit; clamping to ",
            max_potential_factor);
     }
@@ -1889,7 +1954,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
     gs_passthrough.next = &pso_tess;
     gs_passthrough.DataEncoded =
-        gs ? gs->reflection.GeometryShader.GSPassThrough : 0;
+        gs ? gs->reflection().GeometryShader.GSPassThrough : 0;
     gs_passthrough.RasterizationDisabled = false;
 
     const auto ds_name = BuildFunctionName("ds", shader_cache_key);
@@ -1961,8 +2026,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
     out.use_tessellation = true;
     out.tess_num_output_control_point_element =
-        hs->reflection.NumOutputElement;
-    out.tess_threads_per_patch = hs->reflection.ThreadsPerPatch;
+        hs->reflection().NumOutputElement;
+    out.tess_threads_per_patch = hs->reflection().ThreadsPerPatch;
     BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
     out.depth_stencil =
         CreateDepthStencilState(device, state.desc.DepthStencilState);
@@ -2114,9 +2179,9 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   WMT::InitializeComputePipelineInfo(info);
   info.compute_function = out.compute.function;
   info.immutable_buffers = (1 << 29) | (1 << 30);
-  const auto tgx = std::max<uint32_t>(1, cs->reflection.ThreadgroupSize[0]);
-  const auto tgy = std::max<uint32_t>(1, cs->reflection.ThreadgroupSize[1]);
-  const auto tgz = std::max<uint32_t>(1, cs->reflection.ThreadgroupSize[2]);
+  const auto tgx = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[0]);
+  const auto tgy = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[1]);
+  const auto tgz = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[2]);
   info.tgsize_is_multiple_of_sgwidth = ((tgx * tgy * tgz) % 32) == 0;
 
   WMT::Reference<WMT::Error> error;

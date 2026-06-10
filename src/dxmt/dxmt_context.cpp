@@ -3679,12 +3679,37 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::ResolveTimestamp: {
       auto data = static_cast<ResolveTimestampData *>(current);
 #if DXMT_DX12_METAL4
-      if (auto readback = readbacks.timestamp.get();
-          readback && readback->counterHeap()) {
-        for (const auto &range : data->ranges) {
-          cmdbuf.resolveCounterHeap(
-              readback->counterHeap(), range.start_index, range.query_count,
-              range.dst_buffer, range.dst_offset, range.dst_length);
+      if (auto readback = readbacks.timestamp.get()) {
+        if (readback->counterHeap()) {
+          for (const auto &range : data->ranges) {
+            cmdbuf.resolveCounterHeap(
+                readback->counterHeap(), range.start_index, range.query_count,
+                range.dst_buffer, range.dst_offset, range.dst_length);
+          }
+        }
+      }
+#else
+      if (auto readback = readbacks.timestamp.get()) {
+        if (readback->sampleBuffer()) {
+          auto encoder = cmdbuf.blitCommandEncoder();
+          encoder.setLabel(WMT::String::string("ResolveTimestamp", WMTUTF8StringEncoding));
+          for (const auto &range : data->ranges) {
+            uint64_t remaining = range.query_count;
+            uint64_t start = range.start_index;
+            uint64_t dst_offset = range.dst_offset;
+            while (remaining) {
+              const uint64_t chunk = std::min<uint64_t>(
+                  remaining, std::numeric_limits<uint32_t>::max());
+              encoder.resolveCounters(readback->sampleBuffer(),
+                                      static_cast<uint32_t>(start),
+                                      static_cast<uint32_t>(chunk),
+                                      range.dst_buffer, dst_offset);
+              remaining -= chunk;
+              start += chunk;
+              dst_offset += chunk * sizeof(uint64_t);
+            }
+          }
+          encoder.endEncoding();
         }
       }
 #endif

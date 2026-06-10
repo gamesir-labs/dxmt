@@ -5843,7 +5843,6 @@ private:
                              "query resolve"))
       return;
 
-#if DXMT_DX12_METAL4
     if (D3D12TimestampGpuResolveEnabled() &&
         record.type == D3D12_QUERY_TYPE_TIMESTAMP &&
         dst->GetBufferAllocation() &&
@@ -5899,7 +5898,6 @@ private:
       }
       return;
     }
-#endif
 
 resolve_cpu_fallback:
     state.pending_cpu_query_resolves.push_back(record);
@@ -6314,10 +6312,7 @@ resolve_cpu_fallback:
          max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
          viewports = std::move(viewports), scissors = std::move(scissors)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
-      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
-      set_pso.type = WMTRenderCommandSetPSO;
-      set_pso.pso = metal_pso;
-      enc.currentRenderEncoder()->last_pso = metal_pso;
+      EncodeRenderPipelineStateIfChanged(enc, metal_pso);
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -6555,10 +6550,7 @@ resolve_cpu_fallback:
          scissors = std::move(scissors)](ArgumentEncodingContext &enc,
                                          uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
-      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
-      set_pso.type = WMTRenderCommandSetPSO;
-      set_pso.pso = metal_pso;
-      enc.currentRenderEncoder()->last_pso = metal_pso;
+      EncodeRenderPipelineStateIfChanged(enc, metal_pso);
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -6900,8 +6892,8 @@ resolve_cpu_fallback:
             : shader->resourceArgumentInfo();
     const auto argument_count =
         binding_type == SM50BindingType::ConstantBuffer
-            ? shader->reflection.NumConstantBuffers
-            : shader->reflection.NumArguments;
+            ? shader->reflection().NumConstantBuffers
+            : shader->reflection().NumArguments;
     if (!arguments)
       return std::nullopt;
 
@@ -6939,8 +6931,8 @@ resolve_cpu_fallback:
             : shader->resourceArgumentInfo();
     const auto argument_count =
         binding_type == SM50BindingType::ConstantBuffer
-            ? shader->reflection.NumConstantBuffers
-            : shader->reflection.NumArguments;
+            ? shader->reflection().NumConstantBuffers
+            : shader->reflection().NumArguments;
     if (!arguments)
       return nullptr;
 
@@ -6977,8 +6969,8 @@ resolve_cpu_fallback:
             : shader->resourceArgumentInfo();
     const auto argument_count =
         binding_type == SM50BindingType::ConstantBuffer
-            ? shader->reflection.NumConstantBuffers
-            : shader->reflection.NumArguments;
+            ? shader->reflection().NumConstantBuffers
+            : shader->reflection().NumArguments;
     if (!arguments)
       return nullptr;
 
@@ -7331,8 +7323,8 @@ resolve_cpu_fallback:
                         : shader->resourceArgumentInfo();
                 const auto argument_count =
                     binding_type == SM50BindingType::ConstantBuffer
-                        ? shader->reflection.NumConstantBuffers
-                        : shader->reflection.NumArguments;
+                        ? shader->reflection().NumConstantBuffers
+                        : shader->reflection().NumArguments;
                 if (!arguments)
                   return;
 
@@ -8168,8 +8160,8 @@ resolve_cpu_fallback:
                   : shader->resourceArgumentInfo();
           const auto argument_count =
               binding_type == SM50BindingType::ConstantBuffer
-                  ? shader->reflection.NumConstantBuffers
-                  : shader->reflection.NumArguments;
+                  ? shader->reflection().NumConstantBuffers
+                  : shader->reflection().NumArguments;
           if (!arguments)
             return;
           for (UINT i = 0; i < argument_count; i++) {
@@ -8272,8 +8264,8 @@ resolve_cpu_fallback:
                         : shader->resourceArgumentInfo();
                 const auto argument_count =
                     binding_type == SM50BindingType::ConstantBuffer
-                        ? shader->reflection.NumConstantBuffers
-                        : shader->reflection.NumArguments;
+                        ? shader->reflection().NumConstantBuffers
+                        : shader->reflection().NumArguments;
                 if (!arguments)
                   return;
 
@@ -8445,7 +8437,7 @@ resolve_cpu_fallback:
                                     const PipelineDxilShader &shader,
                                     const std::string &shader_key,
                                     uint64_t &argbuf_offset) {
-    const auto &reflection = shader.reflection;
+    const auto &reflection = shader.reflection();
     if (reflection.NumConstantBuffers && shader.constantBufferInfo()) {
       const auto offset =
           AllocateArgumentBuffer(argbuf_offset,
@@ -8593,12 +8585,12 @@ resolve_cpu_fallback:
   static uint64_t EstimateShaderArgumentBufferSize(
       const PipelineDxilShader &shader) {
     uint64_t size = 0;
-    if (shader.reflection.NumConstantBuffers)
+    if (shader.reflection().NumConstantBuffers)
       size = AlignArgumentBufferSize(size) +
-             (uint64_t(shader.reflection.NumConstantBuffers) << 3);
-    if (shader.reflection.NumArguments)
+             (uint64_t(shader.reflection().NumConstantBuffers) << 3);
+    if (shader.reflection().NumArguments)
       size = AlignArgumentBufferSize(size) +
-             (uint64_t(shader.reflection.ArgumentTableQwords) << 3);
+             (uint64_t(shader.reflection().ArgumentTableQwords) << 3);
     return AlignArgumentBufferSize(size);
   }
 
@@ -9468,6 +9460,18 @@ resolve_cpu_fallback:
     scissor_cmd.rect_count = scissors.size();
   }
 
+  static void EncodeRenderPipelineStateIfChanged(
+      ArgumentEncodingContext &enc, WMT::RenderPipelineState metal_pso) {
+    auto *render_encoder = enc.currentRenderEncoder();
+    if (render_encoder->last_pso.handle == metal_pso.handle)
+      return;
+
+    auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+    set_pso.type = WMTRenderCommandSetPSO;
+    set_pso.pso = metal_pso;
+    render_encoder->last_pso = metal_pso;
+  }
+
   void ReplayDrawInstanced(CommandChunk *chunk, ReplayState &state,
                            const DrawInstancedRecord &record) {
     if (!record.vertex_count_per_instance || !record.instance_count)
@@ -9557,10 +9561,7 @@ resolve_cpu_fallback:
          max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
          viewports = std::move(viewports), scissors = std::move(scissors)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
-      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
-      set_pso.type = WMTRenderCommandSetPSO;
-      set_pso.pso = metal_pso;
-      enc.currentRenderEncoder()->last_pso = metal_pso;
+      EncodeRenderPipelineStateIfChanged(enc, metal_pso);
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -9810,10 +9811,7 @@ resolve_cpu_fallback:
          visibility_query = std::move(visibility_query)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
-      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
-      set_pso.type = WMTRenderCommandSetPSO;
-      set_pso.pso = metal_pso;
-      enc.currentRenderEncoder()->last_pso = metal_pso;
+      EncodeRenderPipelineStateIfChanged(enc, metal_pso);
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;

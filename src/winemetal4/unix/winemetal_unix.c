@@ -990,6 +990,7 @@ struct dxmt_metal4_render_argument_state {
   struct dxmt_metal4_argument_state object;
   struct dxmt_metal4_argument_state mesh;
   struct dxmt_metal4_argument_state tile;
+  bool tables_bound;
 };
 
 static void
@@ -1001,6 +1002,7 @@ dxmt_metal4_render_argument_state_init(
   dxmt_metal4_argument_state_init(&state->object, owner, @"DXMT4 Object Arguments");
   dxmt_metal4_argument_state_init(&state->mesh, owner, @"DXMT4 Mesh Arguments");
   dxmt_metal4_argument_state_init(&state->tile, owner, @"DXMT4 Tile Arguments");
+  state->tables_bound = false;
 }
 
 static void
@@ -1016,17 +1018,21 @@ static void
 dxmt_metal4_render_set_argument_tables(
     id<MTL4RenderCommandEncoder> encoder,
     struct dxmt_metal4_render_argument_state *state) {
+  if (state->tables_bound)
+    return;
   [encoder setArgumentTable:state->vertex.table atStages:MTLRenderStageVertex];
   [encoder setArgumentTable:state->fragment.table atStages:MTLRenderStageFragment];
   [encoder setArgumentTable:state->object.table atStages:MTLRenderStageObject];
   [encoder setArgumentTable:state->mesh.table atStages:MTLRenderStageMesh];
   [encoder setArgumentTable:state->tile.table atStages:MTLRenderStageTile];
+  state->tables_bound = true;
 }
 
 @interface DXMTMetal4ComputeEncoderState : NSObject {
 @public
   struct dxmt_metal4_argument_state arguments;
   MTLSize threadgroupSize;
+  bool argumentTableBound;
 }
 - (instancetype)initWithOwner:(DXMTMetal4CommandBuffer *)owner;
 @end
@@ -1037,6 +1043,7 @@ dxmt_metal4_render_set_argument_tables(
   if (self) {
     dxmt_metal4_argument_state_init(&arguments, owner, @"DXMT4 Compute Arguments");
     threadgroupSize = MTLSizeMake(0, 0, 0);
+    argumentTableBound = false;
   }
   return self;
 }
@@ -1046,6 +1053,16 @@ dxmt_metal4_render_set_argument_tables(
   [super dealloc];
 }
 @end
+
+static void
+dxmt_metal4_compute_set_argument_table_if_needed(
+    id<MTL4ComputeCommandEncoder> encoder,
+    DXMTMetal4ComputeEncoderState *state) {
+  if (state->argumentTableBound)
+    return;
+  [encoder setArgumentTable:state->arguments.table];
+  state->argumentTableBound = true;
+}
 
 @interface DXMTMetal4RenderEncoderState : NSObject {
 @public
@@ -4208,14 +4225,14 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTComputeCommandDispatch: {
       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
-      [encoder setArgumentTable:args->table];
+      dxmt_metal4_compute_set_argument_table_if_needed(encoder, state);
       [encoder dispatchThreadgroups:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
               threadsPerThreadgroup:state->threadgroupSize];
       break;
     }
     case WMTComputeCommandDispatchThreads: {
       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
-      [encoder setArgumentTable:args->table];
+      dxmt_metal4_compute_set_argument_table_if_needed(encoder, state);
       [encoder dispatchThreads:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
           threadsPerThreadgroup:state->threadgroupSize];
       break;
@@ -4223,7 +4240,7 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     case WMTComputeCommandDispatchIndirect: {
       struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
-      [encoder setArgumentTable:args->table];
+      dxmt_metal4_compute_set_argument_table_if_needed(encoder, state);
       [encoder dispatchThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
                                 threadsPerThreadgroup:state->threadgroupSize];
       break;

@@ -7,9 +7,11 @@
 #include <d3d12.h>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -34,28 +36,91 @@ enum class PipelineShaderBytecodeKind {
   Dxil,
 };
 
-struct PipelineDxilShader {
-  PipelineShaderStage stage = PipelineShaderStage::Vertex;
+struct PipelineCachedShader {
   PipelineShaderBytecodeKind kind = PipelineShaderBytecodeKind::Unknown;
   std::vector<uint8_t> bytecode;
   dxil::Parser parser;
-  dxmt12_airconv_shader_t shader = nullptr;
   DXMT12_MTL4_SHADER_REFLECTION reflection = {};
   std::vector<DXMT12_MTL4_SHADER_ARGUMENT> argument_info;
+};
+
+struct PipelineDxilShader {
+  PipelineShaderStage stage = PipelineShaderStage::Vertex;
+  std::shared_ptr<PipelineCachedShader> cached_shader;
+  dxmt12_airconv_shader_t shader = nullptr;
+
+  PipelineDxilShader() = default;
+  ~PipelineDxilShader() {
+    destroyShader();
+  }
+
+  PipelineDxilShader(const PipelineDxilShader &) = delete;
+  PipelineDxilShader &operator=(const PipelineDxilShader &) = delete;
+
+  PipelineDxilShader(PipelineDxilShader &&other) noexcept {
+    *this = std::move(other);
+  }
+
+  PipelineDxilShader &operator=(PipelineDxilShader &&other) noexcept {
+    if (this == &other)
+      return *this;
+    destroyShader();
+    stage = other.stage;
+    cached_shader = std::move(other.cached_shader);
+    shader = std::exchange(other.shader, nullptr);
+    return *this;
+  }
+
+  PipelineShaderBytecodeKind kind() const {
+    return cached_shader ? cached_shader->kind : PipelineShaderBytecodeKind::Unknown;
+  }
+
+  const std::vector<uint8_t> &bytecode() const {
+    static const std::vector<uint8_t> empty;
+    return cached_shader ? cached_shader->bytecode : empty;
+  }
+
+  dxmt12_airconv_shader_t shaderHandle() const {
+    return shader;
+  }
+
+  const DXMT12_MTL4_SHADER_REFLECTION &reflection() const {
+    static const DXMT12_MTL4_SHADER_REFLECTION empty = {};
+    return cached_shader ? cached_shader->reflection : empty;
+  }
 
   const dxil::DxilTranslationInfo *translation() const {
-    const auto &info = parser.dxilTranslation();
+    if (!cached_shader)
+      return nullptr;
+    const auto &info = cached_shader->parser.dxilTranslation();
     return info ? &*info : nullptr;
   }
 
   const DXMT12_MTL4_SHADER_ARGUMENT *constantBufferInfo() const {
-    return argument_info.empty() ? nullptr : argument_info.data();
+    if (!cached_shader || cached_shader->argument_info.empty())
+      return nullptr;
+    return cached_shader->argument_info.data();
   }
 
   const DXMT12_MTL4_SHADER_ARGUMENT *resourceArgumentInfo() const {
-    return argument_info.size() <= reflection.NumConstantBuffers
+    if (!cached_shader)
+      return nullptr;
+    return cached_shader->argument_info.size() <=
+                   cached_shader->reflection.NumConstantBuffers
                ? nullptr
-               : argument_info.data() + reflection.NumConstantBuffers;
+               : cached_shader->argument_info.data() +
+                     cached_shader->reflection.NumConstantBuffers;
+  }
+
+private:
+  void destroyShader() {
+    if (!shader)
+      return;
+    if (kind() == PipelineShaderBytecodeKind::Dxil)
+      DXMT12DXILDestroy(shader);
+    else
+      DXMT12SM50Destroy(shader);
+    shader = nullptr;
   }
 };
 

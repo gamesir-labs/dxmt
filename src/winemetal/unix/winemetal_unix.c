@@ -2762,6 +2762,12 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
   id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)params->encoder;
+  id<MTLRenderPipelineState> current_pso = nil;
+  id<MTLDepthStencilState> current_dsso = nil;
+  uint8_t current_stencil_ref = 0;
+  bool current_stencil_ref_valid = false;
+  bool current_rasterizer_state_valid = false;
+  struct wmtcmd_render_setrasterizerstate current_rasterizer_state = {0};
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -2838,11 +2844,22 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandSetRasterizerState: {
       struct wmtcmd_render_setrasterizerstate *body = (struct wmtcmd_render_setrasterizerstate *)next;
-      [encoder setTriangleFillMode:(MTLTriangleFillMode)body->fill_mode];
-      [encoder setCullMode:(MTLCullMode)body->cull_mode];
-      [encoder setDepthClipMode:(MTLDepthClipMode)body->depth_clip_mode];
-      [encoder setDepthBias:body->depth_bias slopeScale:body->scole_scale clamp:body->depth_bias_clamp];
-      [encoder setFrontFacingWinding:(MTLWinding)body->winding];
+      if (!current_rasterizer_state_valid ||
+          current_rasterizer_state.fill_mode != body->fill_mode ||
+          current_rasterizer_state.cull_mode != body->cull_mode ||
+          current_rasterizer_state.depth_clip_mode != body->depth_clip_mode ||
+          current_rasterizer_state.winding != body->winding ||
+          current_rasterizer_state.depth_bias != body->depth_bias ||
+          current_rasterizer_state.scole_scale != body->scole_scale ||
+          current_rasterizer_state.depth_bias_clamp != body->depth_bias_clamp) {
+        [encoder setTriangleFillMode:(MTLTriangleFillMode)body->fill_mode];
+        [encoder setCullMode:(MTLCullMode)body->cull_mode];
+        [encoder setDepthClipMode:(MTLDepthClipMode)body->depth_clip_mode];
+        [encoder setDepthBias:body->depth_bias slopeScale:body->scole_scale clamp:body->depth_bias_clamp];
+        [encoder setFrontFacingWinding:(MTLWinding)body->winding];
+        current_rasterizer_state = *body;
+        current_rasterizer_state_valid = true;
+      }
       break;
     }
     case WMTRenderCommandSetViewports: {
@@ -2857,19 +2874,35 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandSetPSO: {
       struct wmtcmd_render_setpso *body = (struct wmtcmd_render_setpso *)next;
-      [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)body->pso];
+      id<MTLRenderPipelineState> pso = (id<MTLRenderPipelineState>)body->pso;
+      if (current_pso != pso) {
+        [encoder setRenderPipelineState:pso];
+        current_pso = pso;
+      }
       break;
     }
     case WMTRenderCommandSetDSSO: {
       struct wmtcmd_render_setdsso *body = (struct wmtcmd_render_setdsso *)next;
-      [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->dsso];
-      [encoder setStencilReferenceValue:body->stencil_ref];
+      id<MTLDepthStencilState> dsso = (id<MTLDepthStencilState>)body->dsso;
+      if (current_dsso != dsso) {
+        [encoder setDepthStencilState:dsso];
+        current_dsso = dsso;
+      }
+      if (!current_stencil_ref_valid || current_stencil_ref != body->stencil_ref) {
+        [encoder setStencilReferenceValue:body->stencil_ref];
+        current_stencil_ref = body->stencil_ref;
+        current_stencil_ref_valid = true;
+      }
       break;
     }
     case WMTRenderCommandSetBlendFactorAndStencilRef: {
       struct wmtcmd_render_setblendcolor *body = (struct wmtcmd_render_setblendcolor *)next;
       [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
-      [encoder setStencilReferenceValue:body->stencil_ref];
+      if (!current_stencil_ref_valid || current_stencil_ref != body->stencil_ref) {
+        [encoder setStencilReferenceValue:body->stencil_ref];
+        current_stencil_ref = body->stencil_ref;
+        current_stencil_ref_valid = true;
+      }
       break;
     }
     case WMTRenderCommandSetVisibilityMode: {

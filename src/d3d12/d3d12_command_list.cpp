@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <utility>
 
 namespace dxmt::d3d12 {
@@ -280,7 +281,7 @@ public:
       initial_pipeline_state_ = nullptr;
     current_pipeline_state_ = initial_pipeline_state_;
     if (current_pipeline_state_)
-      AddRecord(PipelineStateRecord{current_pipeline_state_});
+      RecordPipelineState(current_pipeline_state_.ptr(), true);
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -416,6 +417,7 @@ public:
     compute_root_signature_ = nullptr;
     graphics_root_signature_ = nullptr;
     records_.clear();
+    ClearRecordedStateCache();
     closed_ = false;
     submitted_ = false;
     recording_error_ = S_OK;
@@ -425,7 +427,8 @@ public:
             dxmt::apitrace::record_reset_command_list(
                 this, allocator, initial_state, S_OK);
       }
-      AddRecord(PipelineStateRecord{current_pipeline_state_});
+      if (current_pipeline_state_)
+        RecordPipelineState(current_pipeline_state_.ptr(), true);
     } else if (apitrace_lifecycle_recording_enabled_) {
       dxmt::apitrace::record_reset_command_list(
           this, allocator, initial_state, S_OK);
@@ -520,7 +523,8 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_clear_state(this, pipeline_state);
     current_pipeline_state_ = pipeline_state;
-    AddRecord(PipelineStateRecord{current_pipeline_state_});
+    ClearRecordedStateCache();
+    RecordPipelineState(current_pipeline_state_.ptr(), true);
   }
   void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count,
                                        UINT start_vertex_location, UINT start_instance_location) override {
@@ -676,7 +680,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_pipeline_state(this, pipeline_state);
     current_pipeline_state_ = pipeline_state;
-    AddRecord(PipelineStateRecord{current_pipeline_state_});
+    RecordPipelineState(current_pipeline_state_.ptr(), false);
   }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {
     if (!barriers || !barrier_count)
@@ -708,11 +712,14 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_execute_bundle(this, command_list);
     records_.insert(records_.end(), bundle_records.begin(), bundle_records.end());
+    ClearRecordedStateCache();
+    current_pipeline_state_ = nullptr;
   }
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT heap_count, ID3D12DescriptorHeap *const *heaps) override {
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_descriptor_heaps(
             this, heap_count, reinterpret_cast<const void *const *>(heaps));
+    ClearRootDescriptorTableCache();
     DescriptorHeapsRecord record = {};
     if (heaps && heap_count) {
       record.heaps.reserve(heap_count);
@@ -725,6 +732,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, true, root_signature);
     compute_root_signature_ = root_signature;
+    ClearComputeRootParameterCache();
     AddRecord(RootSignatureRecord{true, root_signature});
   }
 
@@ -732,6 +740,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, false, root_signature);
     graphics_root_signature_ = root_signature;
+    ClearGraphicsRootParameterCache();
     AddRecord(RootSignatureRecord{false, root_signature});
   }
   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT root_parameter_index,
@@ -739,16 +748,22 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor_table(
             this, true, root_parameter_index, base_descriptor);
-    AddRecord(RootDescriptorTableRecord{
-        true, root_parameter_index, base_descriptor});
+    RootDescriptorTableRecord record = {
+        true, root_parameter_index, base_descriptor};
+    if (RootDescriptorTableUnchanged(record))
+      return;
+    AddRecord(record);
   }
   void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT root_parameter_index,
                                                         D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) override {
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor_table(
             this, false, root_parameter_index, base_descriptor);
-    AddRecord(RootDescriptorTableRecord{
-        false, root_parameter_index, base_descriptor});
+    RootDescriptorTableRecord record = {
+        false, root_parameter_index, base_descriptor};
+    if (RootDescriptorTableUnchanged(record))
+      return;
+    AddRecord(record);
   }
   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT root_parameter_index, UINT data,
                                                      UINT dst_offset) override {
@@ -760,6 +775,8 @@ public:
     record.root_parameter_index = root_parameter_index;
     record.dst_offset = dst_offset;
     record.values.push_back(data);
+    if (RootConstantsUnchanged(record))
+      return;
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT root_parameter_index, UINT data,
@@ -772,6 +789,8 @@ public:
     record.root_parameter_index = root_parameter_index;
     record.dst_offset = dst_offset;
     record.values.push_back(data);
+    if (RootConstantsUnchanged(record))
+      return;
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT root_parameter_index, UINT constant_count,
@@ -788,6 +807,8 @@ public:
       const auto *values = static_cast<const UINT *>(data);
       record.values.assign(values, values + constant_count);
     }
+    if (RootConstantsUnchanged(record))
+      return;
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT root_parameter_index, UINT constant_count,
@@ -804,6 +825,8 @@ public:
       const auto *values = static_cast<const UINT *>(data);
       record.values.assign(values, values + constant_count);
     }
+    if (RootConstantsUnchanged(record))
+      return;
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT root_parameter_index,
@@ -811,6 +834,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, true, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address);
+    InvalidateRootParameterCache(true, root_parameter_index);
     AddRecord(RootDescriptorRecord{
         true, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address});
   }
@@ -819,6 +843,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, false, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address);
+    InvalidateRootParameterCache(false, root_parameter_index);
     AddRecord(RootDescriptorRecord{
         false, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address});
   }
@@ -827,6 +852,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, true, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address);
+    InvalidateRootParameterCache(true, root_parameter_index);
     AddRecord(RootDescriptorRecord{
         true, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address});
   }
@@ -835,6 +861,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, false, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address);
+    InvalidateRootParameterCache(false, root_parameter_index);
     AddRecord(RootDescriptorRecord{
         false, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address});
   }
@@ -843,6 +870,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, true, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address);
+    InvalidateRootParameterCache(true, root_parameter_index);
     AddRecord(RootDescriptorRecord{
         true, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address});
   }
@@ -851,6 +879,7 @@ public:
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, false, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address);
+    InvalidateRootParameterCache(false, root_parameter_index);
     AddRecord(RootDescriptorRecord{
         false, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address});
   }
@@ -860,6 +889,8 @@ public:
     IndexBufferRecord record = {};
     if (view)
       record.view = *view;
+    if (IndexBufferUnchanged(record))
+      return;
     AddRecord(record);
   }
   void STDMETHODCALLTYPE IASetVertexBuffers(UINT start_slot, UINT view_count,
@@ -872,6 +903,8 @@ public:
     record.view_count = view_count;
     if (views && view_count)
       record.views.assign(views, views + view_count);
+    if (VertexBuffersUnchanged(record))
+      return;
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SOSetTargets(UINT start_slot, UINT view_count,
@@ -1322,9 +1355,162 @@ public:
 #endif
 
 private:
+  struct RootConstantsCacheEntry {
+    UINT dst_offset = 0;
+    std::vector<UINT> values;
+  };
+
+  static bool SameIndexBufferView(const D3D12_INDEX_BUFFER_VIEW &a,
+                                  const D3D12_INDEX_BUFFER_VIEW &b) {
+    return a.BufferLocation == b.BufferLocation &&
+           a.SizeInBytes == b.SizeInBytes &&
+           a.Format == b.Format;
+  }
+
+  static bool SameVertexBufferView(const D3D12_VERTEX_BUFFER_VIEW &a,
+                                   const D3D12_VERTEX_BUFFER_VIEW &b) {
+    return a.BufferLocation == b.BufferLocation &&
+           a.SizeInBytes == b.SizeInBytes &&
+           a.StrideInBytes == b.StrideInBytes;
+  }
+
   ID3D12GraphicsCommandList *AsGraphicsCommandList() {
     return static_cast<ID3D12GraphicsCommandList *>(
         static_cast<GraphicsCommandListComBase *>(this));
+  }
+
+  void ClearRootConstantCache() {
+    compute_root_constants_cache_.clear();
+    graphics_root_constants_cache_.clear();
+  }
+
+  void ClearRootDescriptorTableCache() {
+    compute_root_descriptor_table_cache_.clear();
+    graphics_root_descriptor_table_cache_.clear();
+  }
+
+  void ClearComputeRootParameterCache() {
+    compute_root_constants_cache_.clear();
+    compute_root_descriptor_table_cache_.clear();
+  }
+
+  void ClearGraphicsRootParameterCache() {
+    graphics_root_constants_cache_.clear();
+    graphics_root_descriptor_table_cache_.clear();
+  }
+
+  void ClearInputAssemblerCache() {
+    index_buffer_cache_.reset();
+    for (auto &view : vertex_buffer_cache_)
+      view.reset();
+  }
+
+  void ClearRecordedPipelineStateCache() {
+    recorded_pipeline_state_ = nullptr;
+  }
+
+  void ClearRecordedBindingStateCache() {
+    ClearRootConstantCache();
+    ClearRootDescriptorTableCache();
+    ClearInputAssemblerCache();
+  }
+
+  void ClearRecordedStateCache() {
+    ClearRecordedPipelineStateCache();
+    ClearRecordedBindingStateCache();
+  }
+
+  void RecordPipelineState(ID3D12PipelineState *pipeline_state, bool force) {
+    if (!force && recorded_pipeline_state_.ptr() == pipeline_state)
+      return;
+    AddRecord(PipelineStateRecord{pipeline_state});
+    recorded_pipeline_state_ = pipeline_state;
+  }
+
+  void InvalidateRootParameterCache(bool compute, UINT root_parameter_index) {
+    if (compute) {
+      compute_root_constants_cache_.erase(root_parameter_index);
+      compute_root_descriptor_table_cache_.erase(root_parameter_index);
+    } else {
+      graphics_root_constants_cache_.erase(root_parameter_index);
+      graphics_root_descriptor_table_cache_.erase(root_parameter_index);
+    }
+  }
+
+  bool RootConstantsUnchanged(const RootConstantsRecord &record) {
+    auto &cache = record.compute ? compute_root_constants_cache_
+                                 : graphics_root_constants_cache_;
+    auto it = cache.find(record.root_parameter_index);
+    if (it != cache.end() &&
+        it->second.dst_offset == record.dst_offset &&
+        it->second.values == record.values)
+      return true;
+
+    cache[record.root_parameter_index] =
+        RootConstantsCacheEntry{record.dst_offset, record.values};
+    auto &table_cache = record.compute ? compute_root_descriptor_table_cache_
+                                       : graphics_root_descriptor_table_cache_;
+    table_cache.erase(record.root_parameter_index);
+    return false;
+  }
+
+  bool RootDescriptorTableUnchanged(const RootDescriptorTableRecord &record) {
+    auto &cache = record.compute ? compute_root_descriptor_table_cache_
+                                 : graphics_root_descriptor_table_cache_;
+    auto it = cache.find(record.root_parameter_index);
+    if (it != cache.end() &&
+        it->second.ptr == record.base_descriptor.ptr)
+      return true;
+
+    cache[record.root_parameter_index] = record.base_descriptor;
+    auto &constants_cache = record.compute ? compute_root_constants_cache_
+                                           : graphics_root_constants_cache_;
+    constants_cache.erase(record.root_parameter_index);
+    return false;
+  }
+
+  bool IndexBufferUnchanged(const IndexBufferRecord &record) {
+    if (index_buffer_cache_.has_value() != record.view.has_value()) {
+      index_buffer_cache_ = record.view;
+      return false;
+    }
+
+    if (!record.view)
+      return true;
+
+    if (SameIndexBufferView(*index_buffer_cache_, *record.view))
+      return true;
+
+    index_buffer_cache_ = record.view;
+    return false;
+  }
+
+  bool VertexBuffersUnchanged(const VertexBuffersRecord &record) {
+    if (record.view_count == 0)
+      return true;
+
+    if (record.start_slot >= vertex_buffer_cache_.size() ||
+        record.view_count > vertex_buffer_cache_.size() - record.start_slot ||
+        record.views.size() != record.view_count)
+      return false;
+
+    bool unchanged = true;
+    for (UINT i = 0; i < record.view_count; i++) {
+      const auto slot = record.start_slot + i;
+      const auto &view = record.views[i];
+      if (!vertex_buffer_cache_[slot] ||
+          !SameVertexBufferView(*vertex_buffer_cache_[slot], view)) {
+        unchanged = false;
+        break;
+      }
+    }
+
+    if (unchanged)
+      return true;
+
+    for (UINT i = 0; i < record.view_count; i++)
+      vertex_buffer_cache_[record.start_slot + i] = record.views[i];
+    return false;
   }
 
   bool IsPipelineStateCompatible(ID3D12PipelineState *pipeline_state) const {
@@ -1520,8 +1706,17 @@ private:
   Com<CommandAllocatorObject, false> allocator_;
   Com<ID3D12PipelineState> initial_pipeline_state_;
   Com<ID3D12PipelineState> current_pipeline_state_;
+  Com<ID3D12PipelineState> recorded_pipeline_state_;
   Com<ID3D12RootSignature> compute_root_signature_;
   Com<ID3D12RootSignature> graphics_root_signature_;
+  std::unordered_map<UINT, RootConstantsCacheEntry> compute_root_constants_cache_;
+  std::unordered_map<UINT, RootConstantsCacheEntry> graphics_root_constants_cache_;
+  std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> compute_root_descriptor_table_cache_;
+  std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> graphics_root_descriptor_table_cache_;
+  std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer_cache_;
+  std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>,
+             D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT>
+      vertex_buffer_cache_;
   ComPrivateData private_data_;
   std::vector<CommandRecord> records_;
   FLOAT depth_bounds_min_ = 0.0f;
