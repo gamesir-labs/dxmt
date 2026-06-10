@@ -1298,6 +1298,87 @@ AirconvCompileMutex() {
   return mutex;
 }
 
+std::mutex &
+PipelineMetalFunctionCacheMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, PipelineMetalShader> &
+PipelineMetalFunctionCache() {
+  static std::unordered_map<std::string, PipelineMetalShader> cache;
+  return cache;
+}
+
+std::string
+BuildMetalFunctionCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
+                           const char *function_name, const void *bitcode,
+                           size_t bitcode_size) {
+  Sha1HashState hash;
+  HashString(hash, "dxmt-d3d12-metal-function-cache-v1");
+  const auto device_handle = static_cast<obj_handle_t>(device->GetMTLDevice());
+  HashValue(hash, device_handle);
+  HashValue(hash, stage);
+  HashString(hash, function_name ? std::string_view(function_name)
+                                 : std::string_view());
+  HashValue(hash, uint64_t(bitcode_size));
+  HashBytes(hash, bitcode, bitcode_size);
+  return hash.final().string();
+}
+
+bool
+CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
+                          const char *function_name,
+                          sm50_bitcode_t bitcode_handle,
+                          PipelineMetalShader &out) {
+  SM50_COMPILED_BITCODE bitcode = {};
+  DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
+
+  const auto cache_key = BuildMetalFunctionCacheKey(
+      device, stage, function_name, bitcode.Data, bitcode.Size);
+  {
+    std::lock_guard lock(PipelineMetalFunctionCacheMutex());
+    auto &cache = PipelineMetalFunctionCache();
+    auto cached = cache.find(cache_key);
+    if (cached != cache.end()) {
+      out = cached->second;
+      DXMT12SM50DestroyBitcode(bitcode_handle);
+      return true;
+    }
+  }
+
+  WMT::Reference<WMT::Error> metal_error;
+  auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
+  PipelineMetalShader compiled = {};
+  compiled.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
+  DXMT12SM50DestroyBitcode(bitcode_handle);
+  if (metal_error || !compiled.library) {
+    WARN("D3D12PipelineState: failed to create Metal library for ",
+         ShaderStageName(stage), ": ",
+         metal_error ? metal_error.description().getUTF8String()
+                     : "unknown error");
+    return false;
+  }
+
+  compiled.function = compiled.library.newFunction(function_name);
+  if (!compiled.function) {
+    WARN("D3D12PipelineState: Metal function not found: ", function_name);
+    return false;
+  }
+
+  {
+    std::lock_guard lock(PipelineMetalFunctionCacheMutex());
+    auto &cache = PipelineMetalFunctionCache();
+    auto [it, inserted] = cache.emplace(cache_key, compiled);
+    if (inserted)
+      out = std::move(compiled);
+    else
+      out = it->second;
+  }
+
+  return true;
+}
+
 bool
 CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      const char *function_name,
@@ -1335,29 +1416,8 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
     return false;
   }
 
-  SM50_COMPILED_BITCODE bitcode = {};
-  DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
-
-  WMT::Reference<WMT::Error> metal_error;
-  auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
-  out.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
-  DXMT12SM50DestroyBitcode(bitcode_handle);
-  if (metal_error || !out.library) {
-    WARN("D3D12PipelineState: failed to create Metal library for ",
-         ShaderStageName(shader.stage), ": ",
-         metal_error ? metal_error.description().getUTF8String()
-                     : "unknown error");
-    return false;
-  }
-
-  out.function = out.library.newFunction(air_function_name);
-  if (!out.function) {
-    WARN("D3D12PipelineState: Metal function not found: ", air_function_name,
-         " requestedFunction=", function_name);
-    return false;
-  }
-
-  return true;
+  return CreateCachedMetalFunction(device, shader.stage, air_function_name,
+                                   bitcode_handle, out);
 }
 
 bool
@@ -1366,28 +1426,8 @@ CreateMetalFunctionFromBitcode(IMTLD3D12Device *device,
                                const char *function_name,
                                sm50_bitcode_t bitcode_handle,
                                PipelineMetalShader &out) {
-  SM50_COMPILED_BITCODE bitcode = {};
-  DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
-
-  WMT::Reference<WMT::Error> metal_error;
-  auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
-  out.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
-  DXMT12SM50DestroyBitcode(bitcode_handle);
-  if (metal_error || !out.library) {
-    WARN("D3D12PipelineState: failed to create Metal library for ",
-         ShaderStageName(stage), ": ",
-         metal_error ? metal_error.description().getUTF8String()
-                     : "unknown error");
-    return false;
-  }
-
-  out.function = out.library.newFunction(function_name);
-  if (!out.function) {
-    WARN("D3D12PipelineState: Metal function not found: ", function_name);
-    return false;
-  }
-
-  return true;
+  return CreateCachedMetalFunction(device, stage, function_name, bitcode_handle,
+                                   out);
 }
 
 bool
