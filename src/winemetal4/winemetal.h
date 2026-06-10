@@ -1046,6 +1046,8 @@ enum WMTComputeCommandType : uint16_t {
   WMTComputeCommandWaitForFence,
   WMTComputeCommandUpdateFence,
   WMTComputeCommandMemoryBarrier,
+  WMTComputeCommandSetArgumentBuffer,
+  WMTComputeCommandSetArgumentBufferOffset,
 };
 
 struct wmtcmd_compute_nop {
@@ -1087,6 +1089,23 @@ struct wmtcmd_compute_setbuffer {
 };
 
 struct wmtcmd_compute_setbufferoffset {
+  enum WMTComputeCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  uint64_t offset;
+  uint8_t index;
+};
+
+struct wmtcmd_compute_setargumentbuffer {
+  enum WMTComputeCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t buffer;
+  uint64_t offset;
+  uint8_t index;
+};
+
+struct wmtcmd_compute_setargumentbufferoffset {
   enum WMTComputeCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1190,6 +1209,8 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDXMTTessellationMeshDrawIndirect,
   WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
   WMTRenderCommandDispatchThreadsPerTile,
+  WMTRenderCommandSetArgumentBuffer,
+  WMTRenderCommandSetArgumentBufferOffset,
 };
 
 struct wmtcmd_render_nop {
@@ -1248,6 +1269,25 @@ struct wmtcmd_render_setbufferoffset {
   struct WMTMemoryPointer next;
   uint64_t offset;
   uint8_t index;
+};
+
+struct wmtcmd_render_setargumentbuffer {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t buffer;
+  uint64_t offset;
+  uint8_t index;
+  enum WMTRenderStages stages;
+};
+
+struct wmtcmd_render_setargumentbufferoffset {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  uint64_t offset;
+  uint8_t index;
+  enum WMTRenderStages stages;
 };
 
 enum WMTTriangleFillMode : uint8_t {

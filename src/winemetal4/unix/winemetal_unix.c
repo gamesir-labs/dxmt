@@ -205,6 +205,9 @@ enum {
   APITRACE_METAL_STAGE_COMPUTE = 3,
   APITRACE_METAL_STAGE_RENDER = 4,
   APITRACE_METAL_STAGE_BLIT = 5,
+  APITRACE_METAL_STAGE_OBJECT = 6,
+  APITRACE_METAL_STAGE_MESH = 7,
+  APITRACE_METAL_STAGE_TILE = 8,
 };
 
 enum {
@@ -1026,6 +1029,43 @@ dxmt_metal4_render_set_argument_tables(
   [encoder setArgumentTable:state->mesh.table atStages:MTLRenderStageMesh];
   [encoder setArgumentTable:state->tile.table atStages:MTLRenderStageTile];
   state->tables_bound = true;
+}
+
+static void
+dxmt_metal4_render_argument_set_buffer(
+    struct dxmt_metal4_render_argument_state *state,
+    id<MTLBuffer> buffer,
+    uint64_t offset,
+    uint8_t index,
+    enum WMTRenderStages stages) {
+  if (stages & WMTRenderStageVertex)
+    dxmt_metal4_argument_set_buffer(&state->vertex, buffer, offset, index);
+  if (stages & WMTRenderStageFragment)
+    dxmt_metal4_argument_set_buffer(&state->fragment, buffer, offset, index);
+  if (stages & WMTRenderStageObject)
+    dxmt_metal4_argument_set_buffer(&state->object, buffer, offset, index);
+  if (stages & WMTRenderStageMesh)
+    dxmt_metal4_argument_set_buffer(&state->mesh, buffer, offset, index);
+  if (stages & WMTRenderStageTile)
+    dxmt_metal4_argument_set_buffer(&state->tile, buffer, offset, index);
+}
+
+static void
+dxmt_metal4_render_argument_set_buffer_offset(
+    struct dxmt_metal4_render_argument_state *state,
+    uint64_t offset,
+    uint8_t index,
+    enum WMTRenderStages stages) {
+  if (stages & WMTRenderStageVertex)
+    dxmt_metal4_argument_set_buffer_offset(&state->vertex, offset, index);
+  if (stages & WMTRenderStageFragment)
+    dxmt_metal4_argument_set_buffer_offset(&state->fragment, offset, index);
+  if (stages & WMTRenderStageObject)
+    dxmt_metal4_argument_set_buffer_offset(&state->object, offset, index);
+  if (stages & WMTRenderStageMesh)
+    dxmt_metal4_argument_set_buffer_offset(&state->mesh, offset, index);
+  if (stages & WMTRenderStageTile)
+    dxmt_metal4_argument_set_buffer_offset(&state->tile, offset, index);
 }
 
 @interface DXMTMetal4ComputeEncoderState : NSObject {
@@ -2186,6 +2226,31 @@ dxmt_apitrace_record_buffer_binding(
 }
 
 static void
+dxmt_apitrace_record_render_argument_buffer_binding(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    enum WMTRenderStages stages,
+    obj_handle_t buffer_handle,
+    uint64_t offset,
+    uint8_t index) {
+  if (stages & WMTRenderStageVertex)
+    dxmt_apitrace_record_buffer_binding(
+        session, encoder, APITRACE_METAL_STAGE_VERTEX, buffer_handle, offset, index);
+  if (stages & WMTRenderStageFragment)
+    dxmt_apitrace_record_buffer_binding(
+        session, encoder, APITRACE_METAL_STAGE_FRAGMENT, buffer_handle, offset, index);
+  if (stages & WMTRenderStageObject)
+    dxmt_apitrace_record_buffer_binding(
+        session, encoder, APITRACE_METAL_STAGE_OBJECT, buffer_handle, offset, index);
+  if (stages & WMTRenderStageMesh)
+    dxmt_apitrace_record_buffer_binding(
+        session, encoder, APITRACE_METAL_STAGE_MESH, buffer_handle, offset, index);
+  if (stages & WMTRenderStageTile)
+    dxmt_apitrace_record_buffer_binding(
+        session, encoder, APITRACE_METAL_STAGE_TILE, buffer_handle, offset, index);
+}
+
+static void
 dxmt_apitrace_record_texture_binding(
     apitrace_metal_session_t *session,
     obj_handle_t encoder,
@@ -2355,7 +2420,8 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
   struct {
     obj_handle_t buffer;
     uint64_t offset;
-  } vertex_buffers[31] = {}, fragment_buffers[31] = {};
+  } vertex_buffers[31] = {}, fragment_buffers[31] = {},
+    object_buffers[31] = {}, mesh_buffers[31] = {}, tile_buffers[31] = {};
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTRenderCommandType)base->type) {
     case WMTRenderCommandSetPSO: {
@@ -2402,6 +2468,73 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
         fragment_buffers[cmd->index].offset = cmd->offset;
         dxmt_apitrace_record_buffer_binding(
             session, encoder, APITRACE_METAL_STAGE_FRAGMENT, fragment_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+      }
+      break;
+    }
+    case WMTRenderCommandSetArgumentBuffer: {
+      const struct wmtcmd_render_setargumentbuffer *cmd = (const struct wmtcmd_render_setargumentbuffer *)base;
+      apitrace_metal_set_argument_buffer(session, encoder, cmd->index, cmd->buffer, cmd->offset);
+      if (cmd->index < 31) {
+        if (cmd->stages & WMTRenderStageVertex) {
+          vertex_buffers[cmd->index].buffer = cmd->buffer;
+          vertex_buffers[cmd->index].offset = cmd->offset;
+        }
+        if (cmd->stages & WMTRenderStageFragment) {
+          fragment_buffers[cmd->index].buffer = cmd->buffer;
+          fragment_buffers[cmd->index].offset = cmd->offset;
+        }
+        if (cmd->stages & WMTRenderStageObject) {
+          object_buffers[cmd->index].buffer = cmd->buffer;
+          object_buffers[cmd->index].offset = cmd->offset;
+        }
+        if (cmd->stages & WMTRenderStageMesh) {
+          mesh_buffers[cmd->index].buffer = cmd->buffer;
+          mesh_buffers[cmd->index].offset = cmd->offset;
+        }
+        if (cmd->stages & WMTRenderStageTile) {
+          tile_buffers[cmd->index].buffer = cmd->buffer;
+          tile_buffers[cmd->index].offset = cmd->offset;
+        }
+      }
+      dxmt_apitrace_record_render_argument_buffer_binding(
+          session, encoder, cmd->stages, cmd->buffer, cmd->offset, cmd->index);
+      break;
+    }
+    case WMTRenderCommandSetArgumentBufferOffset: {
+      const struct wmtcmd_render_setargumentbufferoffset *cmd =
+          (const struct wmtcmd_render_setargumentbufferoffset *)base;
+      apitrace_metal_set_argument_buffer(session, encoder, cmd->index, 0, cmd->offset);
+      if (cmd->index < 31) {
+        if (cmd->stages & WMTRenderStageVertex) {
+          vertex_buffers[cmd->index].offset = cmd->offset;
+          dxmt_apitrace_record_buffer_binding(
+              session, encoder, APITRACE_METAL_STAGE_VERTEX,
+              vertex_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+        }
+        if (cmd->stages & WMTRenderStageFragment) {
+          fragment_buffers[cmd->index].offset = cmd->offset;
+          dxmt_apitrace_record_buffer_binding(
+              session, encoder, APITRACE_METAL_STAGE_FRAGMENT,
+              fragment_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+        }
+        if (cmd->stages & WMTRenderStageObject) {
+          object_buffers[cmd->index].offset = cmd->offset;
+          dxmt_apitrace_record_buffer_binding(
+              session, encoder, APITRACE_METAL_STAGE_OBJECT,
+              object_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+        }
+        if (cmd->stages & WMTRenderStageMesh) {
+          mesh_buffers[cmd->index].offset = cmd->offset;
+          dxmt_apitrace_record_buffer_binding(
+              session, encoder, APITRACE_METAL_STAGE_MESH,
+              mesh_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+        }
+        if (cmd->stages & WMTRenderStageTile) {
+          tile_buffers[cmd->index].offset = cmd->offset;
+          dxmt_apitrace_record_buffer_binding(
+              session, encoder, APITRACE_METAL_STAGE_TILE,
+              tile_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+        }
       }
       break;
     }
@@ -2666,6 +2799,30 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
         bound_buffers[cmd->index].offset = cmd->offset;
         dxmt_apitrace_record_buffer_binding(
             session, encoder, APITRACE_METAL_STAGE_COMPUTE, bound_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+      }
+      break;
+    }
+    case WMTComputeCommandSetArgumentBuffer: {
+      const struct wmtcmd_compute_setargumentbuffer *cmd =
+          (const struct wmtcmd_compute_setargumentbuffer *)base;
+      apitrace_metal_set_argument_buffer(session, encoder, cmd->index, cmd->buffer, cmd->offset);
+      if (cmd->index < 31) {
+        bound_buffers[cmd->index].buffer = cmd->buffer;
+        bound_buffers[cmd->index].offset = cmd->offset;
+      }
+      dxmt_apitrace_record_buffer_binding(
+          session, encoder, APITRACE_METAL_STAGE_COMPUTE, cmd->buffer, cmd->offset, cmd->index);
+      break;
+    }
+    case WMTComputeCommandSetArgumentBufferOffset: {
+      const struct wmtcmd_compute_setargumentbufferoffset *cmd =
+          (const struct wmtcmd_compute_setargumentbufferoffset *)base;
+      apitrace_metal_set_argument_buffer(session, encoder, cmd->index, 0, cmd->offset);
+      if (cmd->index < 31) {
+        bound_buffers[cmd->index].offset = cmd->offset;
+        dxmt_apitrace_record_buffer_binding(
+            session, encoder, APITRACE_METAL_STAGE_COMPUTE,
+            bound_buffers[cmd->index].buffer, cmd->offset, cmd->index);
       }
       break;
     }
@@ -4264,6 +4421,17 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       dxmt_metal4_argument_set_buffer_offset(args, body->offset, body->index);
       break;
     }
+    case WMTComputeCommandSetArgumentBuffer: {
+      struct wmtcmd_compute_setargumentbuffer *body = (struct wmtcmd_compute_setargumentbuffer *)next;
+      dxmt_metal4_argument_set_buffer(args, (id<MTLBuffer>)body->buffer, body->offset, body->index);
+      break;
+    }
+    case WMTComputeCommandSetArgumentBufferOffset: {
+      struct wmtcmd_compute_setargumentbufferoffset *body =
+          (struct wmtcmd_compute_setargumentbufferoffset *)next;
+      dxmt_metal4_argument_set_buffer_offset(args, body->offset, body->index);
+      break;
+    }
     case WMTComputeCommandUseResource: {
       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
       (void)body->usage;
@@ -4359,6 +4527,19 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetFragmentBufferOffset: {
       struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
       dxmt_metal4_argument_set_buffer_offset(&args->fragment, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetArgumentBuffer: {
+      struct wmtcmd_render_setargumentbuffer *body = (struct wmtcmd_render_setargumentbuffer *)next;
+      dxmt_metal4_render_argument_set_buffer(
+          args, (id<MTLBuffer>)body->buffer, body->offset, body->index, body->stages);
+      break;
+    }
+    case WMTRenderCommandSetArgumentBufferOffset: {
+      struct wmtcmd_render_setargumentbufferoffset *body =
+          (struct wmtcmd_render_setargumentbufferoffset *)next;
+      dxmt_metal4_render_argument_set_buffer_offset(
+          args, body->offset, body->index, body->stages);
       break;
     }
     case WMTRenderCommandSetMeshBuffer: {

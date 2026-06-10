@@ -2720,6 +2720,17 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       [encoder setBufferOffset:body->offset atIndex:body->index];
       break;
     }
+    case WMTComputeCommandSetArgumentBuffer: {
+      struct wmtcmd_compute_setargumentbuffer *body = (struct wmtcmd_compute_setargumentbuffer *)next;
+      [encoder setBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      break;
+    }
+    case WMTComputeCommandSetArgumentBufferOffset: {
+      struct wmtcmd_compute_setargumentbufferoffset *body =
+          (struct wmtcmd_compute_setargumentbufferoffset *)next;
+      [encoder setBufferOffset:body->offset atIndex:body->index];
+      break;
+    }
     case WMTComputeCommandUseResource: {
       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
       [encoder useResource:(id<MTLResource>)body->resource usage:(MTLResourceUsage)body->usage];
@@ -2810,6 +2821,31 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetFragmentBufferOffset: {
       struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
       [encoder setFragmentBufferOffset:body->offset atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetArgumentBuffer: {
+      struct wmtcmd_render_setargumentbuffer *body = (struct wmtcmd_render_setargumentbuffer *)next;
+      if (body->stages & WMTRenderStageVertex)
+        [encoder setVertexBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      if (body->stages & WMTRenderStageFragment)
+        [encoder setFragmentBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      if (body->stages & WMTRenderStageObject)
+        [encoder setObjectBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      if (body->stages & WMTRenderStageMesh)
+        [encoder setMeshBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetArgumentBufferOffset: {
+      struct wmtcmd_render_setargumentbufferoffset *body =
+          (struct wmtcmd_render_setargumentbufferoffset *)next;
+      if (body->stages & WMTRenderStageVertex)
+        [encoder setVertexBufferOffset:body->offset atIndex:body->index];
+      if (body->stages & WMTRenderStageFragment)
+        [encoder setFragmentBufferOffset:body->offset atIndex:body->index];
+      if (body->stages & WMTRenderStageObject)
+        [encoder setObjectBufferOffset:body->offset atIndex:body->index];
+      if (body->stages & WMTRenderStageMesh)
+        [encoder setMeshBufferOffset:body->offset atIndex:body->index];
       break;
     }
     case WMTRenderCommandSetMeshBuffer: {

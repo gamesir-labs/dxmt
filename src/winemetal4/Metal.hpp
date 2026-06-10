@@ -355,6 +355,18 @@ public:
   }
 
   void
+  setArgumentBuffer(Buffer buffer, uint64_t offset, uint8_t index, WMTRenderStages stages) {
+    struct wmtcmd_render_setargumentbuffer cmd;
+    cmd.type = WMTRenderCommandSetArgumentBuffer;
+    cmd.next.set(nullptr);
+    cmd.buffer = buffer;
+    cmd.offset = offset;
+    cmd.index = index;
+    cmd.stages = stages;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
   setVertexBuffer(Buffer buffer, uint64_t offset, uint8_t index) {
     struct wmtcmd_render_setbuffer cmd;
     cmd.type = WMTRenderCommandSetVertexBuffer;
