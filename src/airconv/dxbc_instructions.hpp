@@ -11,6 +11,17 @@
 
 namespace dxmt::dxbc {
 
+class ShaderInfo;
+
+class ScopedShaderInfo {
+public:
+  explicit ScopedShaderInfo(ShaderInfo &shader_info);
+  ~ScopedShaderInfo();
+
+private:
+  ShaderInfo *previous;
+};
+
 struct Swizzle {
   union {
     uint8_t x;

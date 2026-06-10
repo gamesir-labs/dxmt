@@ -84,6 +84,7 @@ struct PhaseInfo {
 class ShaderInfo {
 public:
   std::vector<std::array<uint32_t, 4>> immConstantBufferData;
+  uint32_t immConstantBufferMinSize = 0;
   std::map<uint32_t, ShaderResourceViewInfo> srvMap;
   std::map<uint32_t, UnorderedAccessViewInfo> uavMap;
   std::map<uint32_t, ConstantBufferInfo> cbufferMap;

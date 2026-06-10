@@ -97,6 +97,7 @@ read_control_flow(
 
   bool sm_ver_5_1_ = Parser.ShaderMajorVersion() == 5 && Parser.ShaderMinorVersion() >= 1;
   auto &shader_info = sm50_shader->shader_info;
+  ScopedShaderInfo shader_info_scope(shader_info);
   auto &func_signature = sm50_shader->func_signature;
 
   while (!Parser.EndOfShader()) {
@@ -570,6 +571,8 @@ read_control_flow(
             (std::array<uint32_t, 4> *)Inst.m_CustomData.pData,
             ((std::array<uint32_t, 4> *)Inst.m_CustomData.pData) + size_in_vec4
         );
+        shader_info.immConstantBufferMinSize =
+          std::max(shader_info.immConstantBufferMinSize, size_in_vec4);
       }
       break;
     }

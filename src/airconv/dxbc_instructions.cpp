@@ -6,6 +6,19 @@
 
 namespace dxmt::dxbc {
 
+namespace {
+thread_local ShaderInfo *current_shader_info = nullptr;
+}
+
+ScopedShaderInfo::ScopedShaderInfo(ShaderInfo &shader_info)
+    : previous(current_shader_info) {
+  current_shader_info = &shader_info;
+}
+
+ScopedShaderInfo::~ScopedShaderInfo() {
+  current_shader_info = previous;
+}
+
 auto readOperandRelativeIndex(
   const microsoft::D3D10ShaderBinary::COperandIndex &OpIndex, uint32_t phase,
   uint32_t offset = 0
@@ -322,7 +335,16 @@ SrcOperand readSrcOperand(
     assert(0 && "TODO: SM5.1");
   }
   case D3D10_SB_OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER: {
-    DXASSERT_DXBC(O.m_IndexDimension == D3D10_SB_OPERAND_INDEX_1D);
+    DXASSERT_DXBC(O.m_IndexDimension >= D3D10_SB_OPERAND_INDEX_1D);
+    if (current_shader_info) {
+      if (O.m_IndexType[0] == D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
+        current_shader_info->immConstantBufferMinSize =
+          std::max(current_shader_info->immConstantBufferMinSize, O.m_Index[0].m_RegIndex + 1);
+      } else {
+        current_shader_info->immConstantBufferMinSize =
+          std::max(current_shader_info->immConstantBufferMinSize, 1u);
+      }
+    }
     return SrcOperandImmediateConstantBuffer{
       ._ = readSrcOperandCommon(O, read_type),
       .regindex = readOperandIndex(O.m_Index[0], O.m_IndexType[0], phase),

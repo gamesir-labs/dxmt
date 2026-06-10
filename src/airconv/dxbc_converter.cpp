@@ -453,25 +453,31 @@ void setup_immediate_constant_buffer(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
   air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
 ) {
-  if (!shader_info->immConstantBufferData.size()) {
+  auto buffer_size = std::max(
+    shader_info->immConstantBufferData.size(),
+    static_cast<size_t>(shader_info->immConstantBufferMinSize)
+  );
+  if (!buffer_size) {
     return;
   }
   auto &context = module.getContext();
   auto type = llvm::ArrayType::get(
-    types._int4, shader_info->immConstantBufferData.size()
+    types._int4, buffer_size
   );
-  auto const_data = llvm::ConstantArray::get(
-    type,
-    shader_info->immConstantBufferData |
-      [&](auto data) {
-        return llvm::ConstantVector::get(
-          {llvm::ConstantInt::get(context, llvm::APInt{32, data[0], false}),
-           llvm::ConstantInt::get(context, llvm::APInt{32, data[1], false}),
-           llvm::ConstantInt::get(context, llvm::APInt{32, data[2], false}),
-           llvm::ConstantInt::get(context, llvm::APInt{32, data[3], false})}
-        );
-      }
-  );
+  llvm::SmallVector<llvm::Constant *> constants;
+  constants.reserve(buffer_size);
+  for (size_t i = 0; i < buffer_size; i++) {
+    std::array<uint32_t, 4> data = {};
+    if (i < shader_info->immConstantBufferData.size())
+      data = shader_info->immConstantBufferData[i];
+    constants.push_back(llvm::ConstantVector::get(
+      {llvm::ConstantInt::get(context, llvm::APInt{32, data[0], false}),
+       llvm::ConstantInt::get(context, llvm::APInt{32, data[1], false}),
+       llvm::ConstantInt::get(context, llvm::APInt{32, data[2], false}),
+       llvm::ConstantInt::get(context, llvm::APInt{32, data[3], false})}
+    ));
+  }
+  auto const_data = llvm::ConstantArray::get(type, constants);
   llvm::GlobalVariable *icb = new llvm::GlobalVariable(
     module, type, true, llvm::GlobalValue::InternalLinkage, const_data, "icb",
     nullptr, llvm::GlobalValue::NotThreadLocal, 2
@@ -480,7 +486,7 @@ void setup_immediate_constant_buffer(
   resource_map.icb = icb;
   resource_map.icb_float = builder.CreateBitCast(
     resource_map.icb, llvm::ArrayType::get(
-                        types._float4, shader_info->immConstantBufferData.size()
+                        types._float4, buffer_size
                       )
                         ->getPointerTo(2)
   );
