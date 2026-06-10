@@ -7,16 +7,19 @@
 #include "dxmt_format.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_pipeline_diag.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include "wsi_platform.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -530,6 +533,34 @@ static bool
 DebugShouldLogRenderPasses() {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_PASS");
   return enabled;
+}
+
+static bool
+DebugShouldLogFlushPerf() {
+  static const bool enabled =
+      DebugEnabledEnv("DXMT_DIAG_DXMT_QUEUE_VERBOSE") ||
+      DebugEnabledEnv("DXMT_DIAG_FLUSH_PERF");
+  return enabled;
+}
+
+static bool
+FenceOnlyBlitOptimizationEnabled() {
+  static const bool enabled = []() {
+    auto value = env::getEnvVar("DXMT_FENCE_ONLY_BLIT_OPT");
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+  }();
+  return enabled;
+}
+
+static bool
+DebugFlushPerfShouldLog() {
+  if (!DebugShouldLogFlushPerf())
+    return false;
+
+  static std::atomic<uint32_t> count = 0;
+  const auto index = count.fetch_add(1, std::memory_order_relaxed);
+  return index < 2048 || (index % 256) == 0;
 }
 
 static bool
@@ -1222,6 +1253,60 @@ DebugAccumulateBlitPass(FrameStatistics &statistics,
   DebugAccumulateBlitCommands(statistics, &data->cmd_head);
 }
 
+static void
+DebugAccumulateComputePass(FrameStatistics &statistics,
+                           const ComputeEncoderData *data) {
+  bool has_dispatch = false;
+  auto command = reinterpret_cast<const wmtcmd_base *>(data->cmd_head.next.ptr);
+  while (command) {
+    statistics.compute_command_count++;
+    switch (static_cast<WMTComputeCommandType>(command->type)) {
+    case WMTComputeCommandSetPSO:
+      statistics.compute_pso_bind_count++;
+      break;
+    case WMTComputeCommandSetBuffer:
+    case WMTComputeCommandSetBufferOffset:
+      statistics.compute_set_buffer_count++;
+      break;
+    case WMTComputeCommandSetTexture:
+      statistics.compute_set_texture_count++;
+      break;
+    case WMTComputeCommandSetBytes:
+      statistics.compute_set_bytes_count++;
+      break;
+    case WMTComputeCommandUseResource:
+      statistics.compute_use_resource_count++;
+      break;
+    case WMTComputeCommandDispatch:
+    case WMTComputeCommandDispatchThreads:
+      statistics.compute_dispatch_count++;
+      has_dispatch = true;
+      break;
+    case WMTComputeCommandDispatchIndirect:
+      statistics.compute_dispatch_indirect_count++;
+      has_dispatch = true;
+      break;
+    case WMTComputeCommandMemoryBarrier:
+      statistics.compute_memory_barrier_count++;
+      break;
+    case WMTComputeCommandWaitForFence:
+      statistics.compute_fence_wait_count++;
+      break;
+    case WMTComputeCommandUpdateFence:
+      statistics.compute_fence_update_count++;
+      break;
+    case WMTComputeCommandNop:
+      break;
+    }
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+
+  if (has_dispatch)
+    statistics.compute_pass_with_dispatch_count++;
+  else
+    statistics.compute_pass_without_dispatch_count++;
+}
+
 struct DebugRenderCommandSummary {
   uint32_t command_count = 0;
   uint32_t pso_binds = 0;
@@ -1231,6 +1316,186 @@ struct DebugRenderCommandSummary {
   uint32_t mesh_draws = 0;
   uint32_t tile_dispatches = 0;
 };
+
+struct DebugComputeCommandSummary {
+  uint32_t command_count = 0;
+  uint32_t pso_binds = 0;
+  uint32_t set_buffers = 0;
+  uint32_t set_textures = 0;
+  uint32_t set_bytes = 0;
+  uint32_t use_resources = 0;
+  uint32_t dispatches = 0;
+  uint32_t indirect_dispatches = 0;
+  uint32_t barriers = 0;
+  uint32_t wait_fences = 0;
+  uint32_t update_fences = 0;
+  obj_handle_t first_pso = 0;
+  obj_handle_t last_pso = 0;
+  WMTSize last_threadgroup_size = {};
+  WMTSize first_dispatch_size = {};
+  WMTSize last_dispatch_size = {};
+  WMTSize max_dispatch_size = {};
+  uint64_t dispatch_grid_volume = 0;
+  uint64_t max_dispatch_grid_volume = 0;
+  uint64_t set_bytes_total = 0;
+  uint64_t first_indirect_offset = 0;
+  uint64_t last_indirect_offset = 0;
+  obj_handle_t first_indirect_buffer = 0;
+  obj_handle_t last_indirect_buffer = 0;
+};
+
+static std::string
+DebugShortShaderKey(const std::string &key) {
+  if (key.empty())
+    return "-";
+  return key.substr(0, std::min<size_t>(key.size(), 16));
+}
+
+struct DebugBlitCommandSummary {
+  uint32_t command_count = 0;
+  uint32_t copy_buffer_to_buffer = 0;
+  uint32_t copy_buffer_to_texture = 0;
+  uint32_t copy_texture_to_buffer = 0;
+  uint32_t copy_texture_to_texture = 0;
+  uint32_t generate_mipmaps = 0;
+  uint32_t fills = 0;
+  uint32_t barriers = 0;
+  uint32_t wait_fences = 0;
+  uint32_t update_fences = 0;
+};
+
+struct DebugAttachmentKey {
+  obj_handle_t texture = 0;
+  uint64_t view = 0;
+  uint16_t level = 0;
+  uint16_t slice = 0;
+  uint32_t depth_plane = 0;
+
+  bool
+  operator==(const DebugAttachmentKey &other) const {
+    return texture == other.texture &&
+           view == other.view &&
+           level == other.level &&
+           slice == other.slice &&
+           depth_plane == other.depth_plane;
+  }
+};
+
+struct DebugLastAttachmentUse {
+  DebugAttachmentKey key = {};
+  enum WMTStoreAction store_action = WMTStoreActionDontCare;
+  bool valid = false;
+};
+
+static DebugAttachmentKey
+DebugMakeColorAttachmentKey(const RenderEncoderColorAttachmentData &color) {
+  WMT::Texture texture;
+  if (color.attachment)
+    texture = color.attachment.texture();
+  else
+    texture = color.buffer_texture;
+
+  return {
+      .texture = static_cast<obj_handle_t>(texture),
+      .view = color.attachment ? uint64_t(color.attachment->key) : color.buffer_view_id,
+      .level = color.level,
+      .slice = color.slice,
+      .depth_plane = color.depth_plane,
+  };
+}
+
+static DebugAttachmentKey
+DebugMakeDepthAttachmentKey(const RenderEncoderDepthAttachmentData &depth) {
+  return {
+      .texture = static_cast<obj_handle_t>(depth.attachment.texture()),
+      .view = depth.attachment ? uint64_t(depth.attachment->key) : 0,
+      .level = depth.level,
+      .slice = depth.slice,
+      .depth_plane = depth.depth_plane,
+  };
+}
+
+static DebugAttachmentKey
+DebugMakeStencilAttachmentKey(const RenderEncoderStencilAttachmentData &stencil) {
+  return {
+      .texture = static_cast<obj_handle_t>(stencil.attachment.texture()),
+      .view = stencil.attachment ? uint64_t(stencil.attachment->key) : 0,
+      .level = stencil.level,
+      .slice = stencil.slice,
+      .depth_plane = stencil.depth_plane,
+  };
+}
+
+static void
+DebugAccumulateAttachmentUse(FrameStatistics &statistics,
+                             const DebugAttachmentKey &key,
+                             enum WMTLoadAction load_action,
+                             enum WMTStoreAction store_action,
+                             DebugLastAttachmentUse &last_use) {
+  if (!key.texture)
+    return;
+
+  statistics.render_attachment_count++;
+  if (last_use.valid && last_use.key == key) {
+    statistics.render_attachment_reuse_count++;
+    if (load_action == WMTLoadActionLoad)
+      statistics.render_attachment_reload_count++;
+    if (load_action == WMTLoadActionLoad &&
+        last_use.store_action == WMTStoreActionStore)
+      statistics.render_attachment_store_then_load_count++;
+  }
+
+  last_use.key = key;
+  last_use.store_action = store_action;
+  last_use.valid = true;
+}
+
+static void
+DebugAccumulateRenderPassTileStats(FrameStatistics &statistics,
+                                   const RenderEncoderData *data,
+                                   std::array<DebugLastAttachmentUse, 10> &last_attachments) {
+  for (unsigned i = 0; i < data->render_target_count && i < data->colors.size(); i++) {
+    const auto &color = data->colors[i];
+    if (!color.attachment && !color.buffer_texture)
+      continue;
+
+    statistics.render_color_load_count += color.load_action == WMTLoadActionLoad;
+    statistics.render_color_store_count += color.store_action == WMTStoreActionStore;
+    statistics.render_color_store_count +=
+        color.store_action == WMTStoreActionStoreAndMultisampleResolve;
+    DebugAccumulateAttachmentUse(
+        statistics, DebugMakeColorAttachmentKey(color), color.load_action,
+        color.store_action, last_attachments[i]);
+  }
+
+  if (data->depth.attachment) {
+    statistics.render_depth_load_count += data->depth.load_action == WMTLoadActionLoad;
+    statistics.render_depth_store_count += data->depth.store_action == WMTStoreActionStore;
+    DebugAccumulateAttachmentUse(
+        statistics, DebugMakeDepthAttachmentKey(data->depth), data->depth.load_action,
+        data->depth.store_action, last_attachments[8]);
+  }
+
+  if (data->stencil.attachment) {
+    statistics.render_stencil_load_count += data->stencil.load_action == WMTLoadActionLoad;
+    statistics.render_stencil_store_count += data->stencil.store_action == WMTStoreActionStore;
+    DebugAccumulateAttachmentUse(
+        statistics, DebugMakeStencilAttachmentKey(data->stencil), data->stencil.load_action,
+        data->stencil.store_action, last_attachments[9]);
+  }
+}
+
+static WMT::String
+DebugEncoderLabel(const std::string &label) {
+  return WMT::String::string(label.c_str(), WMTUTF8StringEncoding);
+}
+
+static std::string
+DebugHex(uint64_t value) {
+  std::stringstream stream;
+  stream << std::hex << value;
+  return stream.str();
+}
 
 static DebugRenderCommandSummary
 DebugSummarizeRenderCommands(const wmtcmd_render_nop *cmd_head) {
@@ -1268,6 +1533,137 @@ DebugSummarizeRenderCommands(const wmtcmd_render_nop *cmd_head) {
       summary.tile_dispatches++;
       break;
     default:
+      break;
+    }
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+  return summary;
+}
+
+static DebugComputeCommandSummary
+DebugSummarizeComputeCommands(const wmtcmd_compute_nop *cmd_head) {
+  DebugComputeCommandSummary summary;
+  auto record_dispatch = [&](const WMTSize &size) {
+    summary.dispatches++;
+    if (summary.dispatches == 1)
+      summary.first_dispatch_size = size;
+    summary.last_dispatch_size = size;
+    summary.max_dispatch_size.width = std::max(summary.max_dispatch_size.width, size.width);
+    summary.max_dispatch_size.height = std::max(summary.max_dispatch_size.height, size.height);
+    summary.max_dispatch_size.depth = std::max(summary.max_dispatch_size.depth, size.depth);
+    const auto volume = size.width * std::max<uint64_t>(size.height, 1) * std::max<uint64_t>(size.depth, 1);
+    summary.dispatch_grid_volume += volume;
+    summary.max_dispatch_grid_volume = std::max(summary.max_dispatch_grid_volume, volume);
+  };
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    summary.command_count++;
+    switch (static_cast<WMTComputeCommandType>(command->type)) {
+    case WMTComputeCommandSetPSO: {
+      auto set_pso = reinterpret_cast<const wmtcmd_compute_setpso *>(command);
+      summary.pso_binds++;
+      if (!summary.first_pso)
+        summary.first_pso = set_pso->pso;
+      summary.last_pso = set_pso->pso;
+      summary.last_threadgroup_size = set_pso->threadgroup_size;
+      break;
+    }
+    case WMTComputeCommandSetBuffer:
+    case WMTComputeCommandSetBufferOffset:
+      summary.set_buffers++;
+      break;
+    case WMTComputeCommandSetTexture:
+      summary.set_textures++;
+      break;
+    case WMTComputeCommandSetBytes: {
+      auto set_bytes = reinterpret_cast<const wmtcmd_compute_setbytes *>(command);
+      summary.set_bytes++;
+      summary.set_bytes_total += set_bytes->length;
+      break;
+    }
+    case WMTComputeCommandUseResource:
+      summary.use_resources++;
+      break;
+    case WMTComputeCommandDispatch:
+    case WMTComputeCommandDispatchThreads: {
+      auto dispatch = reinterpret_cast<const wmtcmd_compute_dispatch *>(command);
+      record_dispatch(dispatch->size);
+      break;
+    }
+    case WMTComputeCommandDispatchIndirect: {
+      auto dispatch = reinterpret_cast<const wmtcmd_compute_dispatch_indirect *>(command);
+      summary.indirect_dispatches++;
+      if (summary.indirect_dispatches == 1) {
+        summary.first_indirect_buffer = dispatch->indirect_args_buffer;
+        summary.first_indirect_offset = dispatch->indirect_args_offset;
+      }
+      summary.last_indirect_buffer = dispatch->indirect_args_buffer;
+      summary.last_indirect_offset = dispatch->indirect_args_offset;
+      break;
+    }
+    case WMTComputeCommandMemoryBarrier:
+      summary.barriers++;
+      break;
+    case WMTComputeCommandWaitForFence:
+      summary.wait_fences++;
+      break;
+    case WMTComputeCommandUpdateFence:
+      summary.update_fences++;
+      break;
+    default:
+      break;
+    }
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+  return summary;
+}
+
+static bool
+DebugComputePerfShouldLog(const DebugComputeCommandSummary &summary) {
+  if (!DebugShouldLogFlushPerf())
+    return false;
+  static std::atomic<uint64_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index < 2048 || (index % 256) == 0)
+    return true;
+  return summary.indirect_dispatches || summary.max_dispatch_grid_volume >= (512ull * 512ull);
+}
+
+static DebugBlitCommandSummary
+DebugSummarizeBlitCommands(const wmtcmd_blit_nop *cmd_head) {
+  DebugBlitCommandSummary summary;
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    summary.command_count++;
+    switch (static_cast<WMTBlitCommandType>(command->type)) {
+    case WMTBlitCommandCopyFromBufferToBuffer:
+      summary.copy_buffer_to_buffer++;
+      break;
+    case WMTBlitCommandCopyFromBufferToTexture:
+      summary.copy_buffer_to_texture++;
+      break;
+    case WMTBlitCommandCopyFromTextureToBuffer:
+      summary.copy_texture_to_buffer++;
+      break;
+    case WMTBlitCommandCopyFromTextureToTexture:
+      summary.copy_texture_to_texture++;
+      break;
+    case WMTBlitCommandGenerateMipmaps:
+      summary.generate_mipmaps++;
+      break;
+    case WMTBlitCommandFillBuffer:
+      summary.fills++;
+      break;
+    case WMTBlitCommandResolveCounters:
+      summary.barriers++;
+      break;
+    case WMTBlitCommandWaitForFence:
+      summary.wait_fences++;
+      break;
+    case WMTBlitCommandUpdateFence:
+      summary.update_fences++;
+      break;
+    case WMTBlitCommandNop:
       break;
     }
     command = static_cast<const wmtcmd_base *>(command->next.ptr);
@@ -2225,8 +2621,25 @@ ArgumentEncodingContext::startBlitPass() {
 void
 ArgumentEncodingContext::endPass() {
   assert(encoder_current);
-  encoder_last->next = encoder_current;
-  encoder_last = encoder_current;
+
+  if (FenceOnlyBlitOptimizationEnabled()) {
+    if (tryDeferFenceOnlyBlitPass(encoder_current)) {
+      encoder_current = nullptr;
+      return;
+    }
+
+    switch (encoder_current->type) {
+    case EncoderType::SignalEvent:
+    case EncoderType::WaitForEvent:
+    case EncoderType::SampleTimestamp:
+    case EncoderType::ResolveTimestamp:
+      appendPendingFenceOnlyBlitPass();
+      break;
+    default:
+      mergePendingFenceOnlyBlitPassInto(encoder_current);
+      break;
+    }
+  }
 
   if (encoder_current->id != ~0ull) {
     if (encoder_current->type == EncoderType::Render) {
@@ -2253,7 +2666,7 @@ ArgumentEncodingContext::endPass() {
       encoder_current->fence_wait =
           fence_locality_.collectAndSimplifyWaits(
               encoder_current->fence_wait,
-              encoder_last->id,
+              encoder_current->id,
               true,
               "render_fragment");
     } else {
@@ -2280,12 +2693,14 @@ ArgumentEncodingContext::endPass() {
       encoder_current->fence_wait =
           fence_locality_.collectAndSimplifyWaits(
               encoder_current->fence_wait,
-              encoder_last->id,
+              encoder_current->id,
               false,
               trace_scope);
     }
   }
 
+  encoder_last->next = encoder_current;
+  encoder_last = encoder_current;
   encoder_current = nullptr;
   encoder_count_++;
 }
@@ -2340,16 +2755,57 @@ void
 ArgumentEncodingContext::sampleTimestamp(Rc<TimestampQuery> &&query) {
   assert(!encoder_current);
   if (encoder_last && encoder_last->type == EncoderType::SampleTimestamp) {
-    timestamp_state_.coalesceQuery(query.ptr());
-    static_cast<SampleTimestampData *>(encoder_last)->queries.push_back(std::move(query));
+    auto *last = static_cast<SampleTimestampData *>(encoder_last);
+    if (query->sampleIndex() == ~0ull) {
+      timestamp_state_.coalesceQuery(query.ptr());
+    } else {
+      timestamp_state_.addQueryAt(query.ptr(), query->sampleIndex());
+    }
+    last->queries.push_back(std::move(query));
     return;
   }
   auto encoder_info = allocate<SampleTimestampData>();
   encoder_info->type = EncoderType::SampleTimestamp;
   encoder_info->id = ~0ull;
-  encoder_info->readback_index = timestamp_state_.addQuery(query.ptr());
+  encoder_info->readback_index =
+      query->sampleIndex() == ~0ull
+          ? timestamp_state_.addQuery(query.ptr())
+          : timestamp_state_.addQueryAt(query.ptr(), query->sampleIndex());
   encoder_info->queries = {};
   encoder_info->queries.push_back(std::move(query));
+
+  encoder_current = encoder_info;
+  endPass();
+}
+
+void
+ArgumentEncodingContext::resolveTimestamp(uint64_t start_index, uint64_t query_count,
+                                          WMT::Reference<WMT::Buffer> dst_buffer,
+                                          uint64_t dst_offset, uint64_t dst_length) {
+  assert(!encoder_current);
+  if (!query_count || !dst_buffer || !dst_length)
+    return;
+
+  if (encoder_last && encoder_last->type == EncoderType::ResolveTimestamp) {
+    auto *last = static_cast<ResolveTimestampData *>(encoder_last);
+    last->ranges.push_back({
+        std::move(dst_buffer),
+        start_index,
+        query_count,
+        dst_offset,
+        dst_length});
+    return;
+  }
+
+  auto encoder_info = allocate<ResolveTimestampData>();
+  encoder_info->type = EncoderType::ResolveTimestamp;
+  encoder_info->id = ~0ull;
+  encoder_info->ranges.push_back({
+      std::move(dst_buffer),
+      start_index,
+      query_count,
+      dst_offset,
+      dst_length});
 
   encoder_current = encoder_info;
   endPass();
@@ -2374,13 +2830,12 @@ ArgumentEncodingContext::resolveRenderPassBarrier() {
   assert(encoder_current->type == EncoderType::Render);
   auto &barrier_state = encoder_current->barrier_state;
   if (barrier_state.barrierPreRasterAfterFragmentSet & ~intrapass_barrier_control_bits_) {
-    // TODO(barrier): encoder split
-    WARN("A fragment-vertex barrier is omitted");
-    barrier_state.barrierSet = 0;
-    barrier_state.barrierPreRasterSet = 0;
-    barrier_state.barrierFragmentAfterPreRasterSet = 0;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_memory_barrier>();
+    cmd.type = WMTRenderCommandMemoryBarrier;
+    cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
+    cmd.stages_before = WMTRenderStageFragment;
+    cmd.stages_after = WMTRenderStagePreRaster;
     barrier_state.barrierPreRasterAfterFragmentSet = 0;
-    return;
   }
   // Individual barriers
   if (barrier_state.barrierSet & ~intrapass_barrier_control_bits_) {
@@ -2467,22 +2922,90 @@ QueryReadbacks
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
 
+  struct FlushPerfStats {
+    clock::duration collect{};
+    clock::duration relation{};
+    clock::duration queries{};
+    clock::duration timestamp{};
+    clock::duration render{};
+    clock::duration compute{};
+    clock::duration blit{};
+    clock::duration present{};
+    clock::duration clear{};
+    clock::duration resolve{};
+    clock::duration scaler{};
+    clock::duration event{};
+    clock::duration sample{};
+    clock::duration pendingFence{};
+    clock::duration signal{};
+    clock::duration cleanup{};
+    uint32_t inputEncoders = 0;
+    uint32_t nullEncoders = 0;
+    uint32_t encodedRender = 0;
+    uint32_t encodedCompute = 0;
+    uint32_t encodedBlit = 0;
+    uint32_t encodedPresent = 0;
+    uint32_t encodedClear = 0;
+    uint32_t encodedResolve = 0;
+    uint32_t encodedScaler = 0;
+    uint32_t encodedSignalEvent = 0;
+    uint32_t encodedWaitEvent = 0;
+    uint32_t encodedTimestamp = 0;
+    uint32_t skippedRender = 0;
+    uint32_t skippedClear = 0;
+    uint32_t skippedResolve = 0;
+    uint32_t pendingFenceWaits = 0;
+    uint32_t pendingFenceUpdates = 0;
+  } perf;
+
+  const bool log_flush_perf = DebugShouldLogFlushPerf();
+  const auto flush_start = clock::now();
+
   unsigned encoder_count = encoder_count_;
+  perf.inputEncoders = encoder_count;
   unsigned encoder_index = 0;
   EncoderData **encoders =
       reinterpret_cast<EncoderData **>(allocate_cpu_heap(sizeof(EncoderData *) * encoder_count, alignof(EncoderData *))
       );
+  std::array<DebugLastAttachmentUse, 10> last_attachments = {};
+  EncoderType last_non_null_type = EncoderType::Null;
 
   {
+    const auto t0 = clock::now();
     EncoderData *current = encoder_head.next;
     while (current) {
       encoders[encoder_index++] = current;
       current = current->next;
     }
     assert(encoder_index == encoder_count);
+    perf.collect += clock::now() - t0;
+  }
+
+  {
+    auto &stats = currentFrameStatistics();
+    for (unsigned i = 0; i < encoder_count; i++) {
+      const auto *encoder = encoders[i];
+      if (encoder->type == EncoderType::Null)
+        continue;
+
+      if (last_non_null_type != EncoderType::Null &&
+          last_non_null_type != encoder->type) {
+        if (last_non_null_type == EncoderType::Render &&
+            encoder->type == EncoderType::Compute)
+          stats.encoder_switch_render_compute_count++;
+        else if (last_non_null_type == EncoderType::Compute &&
+                 encoder->type == EncoderType::Render)
+          stats.encoder_switch_compute_render_count++;
+        else
+          stats.encoder_switch_to_other_count++;
+      }
+
+      last_non_null_type = encoder->type;
+    }
   }
 
   if (encoder_count > 1) {
+    const auto t0 = clock::now();
     unsigned j, i;
     for (j = encoder_count - 2; j != ~0u; j--) {
       if (encoders[j]->type != EncoderType::Clear &&
@@ -2496,24 +3019,36 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           break;
       }
     }
+    perf.relation += clock::now() - t0;
   }
 
   QueryReadbacks readbacks{};
 
+  {
+    const auto t0 = clock::now();
   if (auto count = vro_state_.reset()) {
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
         device_, seqId, count, pending_queries_
     );
   }
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
+    perf.queries += clock::now() - t0;
+  }
 
+  {
+    const auto t0 = clock::now();
   readbacks.timestamp = timestamp_state_.flush(cmdbuf);
+    perf.timestamp += clock::now() - t0;
+  }
 
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
-    switch (current->type) {
+    const auto encoder_type = current->type;
+    const auto encoder_start = clock::now();
+    switch (encoder_type) {
     case EncoderType::Render: {
       auto data = static_cast<RenderEncoderData *>(current);
+      DebugAccumulateRenderPassTileStats(currentFrameStatistics(), data, last_attachments);
       WMTRenderPassInfo render_pass_info;
       WMT::InitializeRenderPassInfo(render_pass_info);
       bool valid_render_pass = true;
@@ -2583,6 +3118,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       if (!valid_render_pass) {
         WARN("RenderPass guard: skipped unsafe render pass encoder=", data->id);
         data->~RenderEncoderData();
+        perf.skippedRender++;
         break;
       }
       NormalizeRenderPassInfo(render_pass_info);
@@ -2685,6 +3221,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto command_summary = DebugSummarizeRenderCommands(&data->cmd_head);
       DebugAccumulateRenderCommands(currentFrameStatistics(), &data->cmd_head);
       DebugLogRenderPassInfo(frame_id_, seqId, data->id, data, command_summary);
+      encoder.setLabel(DebugEncoderLabel(
+          "RenderPass id=" + std::to_string(data->id) +
+          " draw=" + std::to_string(command_summary.draws + command_summary.indexed_draws) +
+          " mesh=" + std::to_string(command_summary.mesh_draws) +
+          " tile=" + std::to_string(command_summary.tile_dispatches)));
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update_vertex.forEach(
           data->fence_update, // if a fence is updated at fragment, no need to update again pre-raster
@@ -2696,10 +3237,15 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
                                            seqId, data, sample_render_readback,
                                            "render-color-after-pass");
       data->~RenderEncoderData();
+      perf.encodedRender++;
       break;
     }
     case EncoderType::Compute: {
       auto data = static_cast<ComputeEncoderData *>(current);
+      DebugAccumulateComputePass(currentFrameStatistics(), data);
+      auto command_summary = DebugSummarizeComputeCommands(&data->cmd_head);
+      auto first_pso_diag = LookupComputePipelineDiagInfo(command_summary.first_pso);
+      auto last_pso_diag = LookupComputePipelineDiagInfo(command_summary.last_pso);
       if (data->allocated_argbuf_needs_flush) {
         data->allocated_argbuf.updateContents(data->allocated_argbuf_offset, data->allocated_argbuf_mapping,
                                               data->allocated_argbuf_size);
@@ -2708,6 +3254,58 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         dxmt::apitrace::set_current_d3d_sequence(seqId);
       }
       auto encoder = cmdbuf.computeCommandEncoder(true);
+      encoder.setLabel(DebugEncoderLabel(
+          "C id=" + std::to_string(data->id) +
+          " pso=0x" + DebugHex(command_summary.last_pso) +
+          " d=" + std::to_string(command_summary.dispatches) +
+          " id=" + std::to_string(command_summary.indirect_dispatches) +
+          " max=" + std::to_string(command_summary.max_dispatch_size.width) + "x" +
+          std::to_string(command_summary.max_dispatch_size.height) + "x" +
+          std::to_string(command_summary.max_dispatch_size.depth) +
+          " wf=" + std::to_string(command_summary.wait_fences + data->fence_wait.count()) +
+          " uf=" + std::to_string(command_summary.update_fences + data->fence_update.count())));
+      if (DebugComputePerfShouldLog(command_summary)) {
+        WARN_FILE_ONLY("DXMT compute perf:"
+             " frame=", frame_id_,
+             " seq=", seqId,
+             " encoder=", data->id,
+             " commands=", command_summary.command_count,
+             " psoBinds=", command_summary.pso_binds,
+             " firstPsoId=", first_pso_diag.id,
+             " firstPsoKey=", DebugShortShaderKey(first_pso_diag.shader_cache_key),
+             " lastPsoId=", last_pso_diag.id,
+             " lastPsoKey=", DebugShortShaderKey(last_pso_diag.shader_cache_key),
+             " firstPso=0x", std::hex, command_summary.first_pso,
+             " lastPso=0x", command_summary.last_pso, std::dec,
+             " tg=", command_summary.last_threadgroup_size.width, "x",
+             command_summary.last_threadgroup_size.height, "x",
+             command_summary.last_threadgroup_size.depth,
+             " setBuf=", command_summary.set_buffers,
+             " setTex=", command_summary.set_textures,
+             " setBytes=", command_summary.set_bytes,
+             " setBytesTotal=", command_summary.set_bytes_total,
+             " useRes=", command_summary.use_resources,
+             " dispatch=", command_summary.dispatches,
+             " indirect=", command_summary.indirect_dispatches,
+             " firstDispatch=", command_summary.first_dispatch_size.width, "x",
+             command_summary.first_dispatch_size.height, "x",
+             command_summary.first_dispatch_size.depth,
+             " lastDispatch=", command_summary.last_dispatch_size.width, "x",
+             command_summary.last_dispatch_size.height, "x",
+             command_summary.last_dispatch_size.depth,
+             " maxDispatch=", command_summary.max_dispatch_size.width, "x",
+             command_summary.max_dispatch_size.height, "x",
+             command_summary.max_dispatch_size.depth,
+             " dispatchVolume=", command_summary.dispatch_grid_volume,
+             " maxDispatchVolume=", command_summary.max_dispatch_grid_volume,
+             " firstIndirect=0x", std::hex, command_summary.first_indirect_buffer,
+             "+0x", command_summary.first_indirect_offset,
+             " lastIndirect=0x", command_summary.last_indirect_buffer,
+             "+0x", command_summary.last_indirect_offset, std::dec,
+             " barriers=", command_summary.barriers,
+             " waitFence=", command_summary.wait_fences + data->fence_wait.count(),
+             " updateFence=", command_summary.update_fences + data->fence_update.count());
+      }
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       if (data->allocated_argbuf_size) {
         struct wmtcmd_compute_setbuffer setcmd;
@@ -2724,6 +3322,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
       encoder.endEncoding();
       data->~ComputeEncoderData();
+      perf.encodedCompute++;
       break;
     }
     case EncoderType::Blit: {
@@ -2732,12 +3331,24 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         dxmt::apitrace::set_current_d3d_sequence(seqId);
       }
       DebugAccumulateBlitPass(currentFrameStatistics(), data);
+      auto command_summary = DebugSummarizeBlitCommands(&data->cmd_head);
       auto encoder = cmdbuf.blitCommandEncoder();
+      encoder.setLabel(DebugEncoderLabel(
+          "BlitPass id=" + std::to_string(data->id) +
+          " cmd=" + std::to_string(command_summary.command_count) +
+          " b2t=" + std::to_string(command_summary.copy_buffer_to_texture) +
+          " t2t=" + std::to_string(command_summary.copy_texture_to_texture) +
+          " t2b=" + std::to_string(command_summary.copy_texture_to_buffer) +
+          " fill=" + std::to_string(command_summary.fills) +
+          " mip=" + std::to_string(command_summary.generate_mipmaps) +
+          " wf=" + std::to_string(command_summary.wait_fences + data->fence_wait.count()) +
+          " uf=" + std::to_string(command_summary.update_fences + data->fence_update.count())));
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
       encoder.endEncoding();
       data->~BlitEncoderData();
+      perf.encodedBlit++;
       break;
     }
     case EncoderType::Present: {
@@ -2800,6 +3411,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
             trace_present_capture_index);
       }
       data->~PresentData();
+      perf.encodedPresent++;
       break;
     }
     case EncoderType::Clear: {
@@ -2841,6 +3453,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           if (!valid_color_attachment) {
             WARN("ClearPass guard: skipped unsafe clear pass encoder=", data->id);
             data->~ClearEncoderData();
+            perf.skippedClear++;
             break;
           }
           info.colors[0].clear_color = data->color;
@@ -2866,6 +3479,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         encoder.endEncoding();
       }
       data->~ClearEncoderData();
+      perf.encodedClear++;
       break;
     }
     case EncoderType::Resolve: {
@@ -2878,6 +3492,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
             )) {
           WARN("ResolvePass guard: skipped unsafe resolve pass encoder=", data->id);
           data->~ResolveEncoderData();
+          perf.skippedResolve++;
           break;
         }
         auto *src_allocation = data->src ? data->src->allocation : nullptr;
@@ -2940,6 +3555,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         encoder.endEncoding();
       }
       data->~ResolveEncoderData();
+      perf.encodedResolve++;
       break;
     }
     case EncoderType::SpatialUpscale: {
@@ -2960,18 +3576,21 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       end_scaler.endEncoding();
 
       data->~SpatialUpscaleData();
+      perf.encodedScaler++;
       break;
     }
     case EncoderType::SignalEvent: {
       auto data = static_cast<SignalEventData *>(current);
       cmdbuf.encodeSignalEvent(data->event, data->value);
       data->~SignalEventData();
+      perf.encodedSignalEvent++;
       break;
     }
     case EncoderType::WaitForEvent: {
       auto data = static_cast<WaitForEventData *>(current);
       cmdbuf.encodeWaitForEvent(data->event, data->value);
       data->~WaitForEventData();
+      perf.encodedWaitEvent++;
       break;
     }
     case EncoderType::TemporalUpscale: {
@@ -2994,13 +3613,19 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id]); });
       end_scaler.endEncoding();
       data->~TemporalUpscaleData();
+      perf.encodedScaler++;
       break;
     }
     case EncoderType::SampleTimestamp: {
       auto data = static_cast<SampleTimestampData *>(current);
 #if DXMT_DX12_METAL4
-      if (auto readback = readbacks.timestamp.get(); readback->counterHeap())
-        readback->timestampContext().writeTimestamp(cmdbuf, readback->counterHeap(), data->readback_index);
+      if (auto readback = readbacks.timestamp.get(); readback->counterHeap()) {
+        auto timestamp_context = readback->timestampContext();
+        for (const auto &query : data->queries) {
+          if (query->sampleIndex() != ~0ull)
+            timestamp_context.writeTimestamp(cmdbuf, readback->counterHeap(), query->sampleIndex());
+        }
+      }
 #else
       if (auto readback = readbacks.timestamp.get(); readback->sampleBuffer()) {
 
@@ -3037,27 +3662,191 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       }
 #endif
       data->~SampleTimestampData();
+      perf.encodedTimestamp++;
+      break;
+    }
+    case EncoderType::ResolveTimestamp: {
+      auto data = static_cast<ResolveTimestampData *>(current);
+#if DXMT_DX12_METAL4
+      if (auto readback = readbacks.timestamp.get();
+          readback && readback->counterHeap()) {
+        for (const auto &range : data->ranges) {
+          cmdbuf.resolveCounterHeap(
+              readback->counterHeap(), range.start_index, range.query_count,
+              range.dst_buffer, range.dst_offset, range.dst_length);
+        }
+      }
+#endif
+      data->~ResolveTimestampData();
+      perf.encodedTimestamp++;
+      break;
+    }
+    case EncoderType::Null: {
+      perf.nullEncoders++;
       break;
     }
     default:
       break;
     }
+    const auto encoder_elapsed = clock::now() - encoder_start;
+    switch (encoder_type) {
+    case EncoderType::Render:
+      perf.render += encoder_elapsed;
+      break;
+    case EncoderType::Compute:
+      perf.compute += encoder_elapsed;
+      break;
+    case EncoderType::Blit:
+      perf.blit += encoder_elapsed;
+      break;
+    case EncoderType::Present:
+      perf.present += encoder_elapsed;
+      break;
+    case EncoderType::Clear:
+      perf.clear += encoder_elapsed;
+      break;
+    case EncoderType::Resolve:
+      perf.resolve += encoder_elapsed;
+      break;
+    case EncoderType::SpatialUpscale:
+    case EncoderType::TemporalUpscale:
+      perf.scaler += encoder_elapsed;
+      break;
+    case EncoderType::SignalEvent:
+    case EncoderType::WaitForEvent:
+      perf.event += encoder_elapsed;
+      break;
+    case EncoderType::SampleTimestamp:
+    case EncoderType::ResolveTimestamp:
+      perf.sample += encoder_elapsed;
+      break;
+    default:
+      break;
+    }
     encoder_index--;
   }
-  encoder_head.next = nullptr;
-  encoder_last = &encoder_head;
-  encoder_count_ = 0;
 
-  cmdbuf.encodeSignalEvent(queue_.event, event_seq_id);
+  if (FenceOnlyBlitOptimizationEnabled() && has_pending_fence_only_blit_) {
+    const auto t0 = clock::now();
+    perf.pendingFenceWaits = pending_fence_only_blit_wait_.count();
+    perf.pendingFenceUpdates = pending_fence_only_blit_update_.count();
+    auto encoder = cmdbuf.blitCommandEncoder();
+    pending_fence_only_blit_wait_.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
+    pending_fence_only_blit_update_.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
+    encoder.endEncoding();
+    pending_fence_only_blit_wait_ = {};
+    pending_fence_only_blit_update_ = {};
+    has_pending_fence_only_blit_ = false;
+    perf.pendingFence += clock::now() - t0;
+  }
 
-  for (size_t i = cpu_buffer_chunks_.size() - 1; i > current_buffer_chunk_; i--) {
-    if (++cpu_buffer_chunks_[i].underused_times > kEncodingContextCPUHeapLifetime) {
-      cpu_buffer_chunks_.pop_back();
+  {
+    const auto t0 = clock::now();
+    encoder_head.next = nullptr;
+    encoder_last = &encoder_head;
+    encoder_count_ = 0;
+    perf.cleanup += clock::now() - t0;
+  }
+
+  {
+    const auto t0 = clock::now();
+    cmdbuf.encodeSignalEvent(queue_.event, event_seq_id);
+    perf.signal += clock::now() - t0;
+  }
+
+  {
+    const auto t0 = clock::now();
+    for (size_t i = cpu_buffer_chunks_.size() - 1; i > current_buffer_chunk_; i--) {
+      if (++cpu_buffer_chunks_[i].underused_times > kEncodingContextCPUHeapLifetime) {
+        cpu_buffer_chunks_.pop_back();
+      }
     }
+    perf.cleanup += clock::now() - t0;
+  }
+
+  const auto total = clock::now() - flush_start;
+  {
+    auto &stats = currentFrameStatistics();
+    const bool event_only_chunk =
+        perf.inputEncoders == (perf.encodedSignalEvent + perf.encodedWaitEvent) &&
+        (perf.encodedSignalEvent || perf.encodedWaitEvent);
+    stats.flush_chunk_count++;
+    stats.flush_empty_chunk_count += perf.inputEncoders == 0;
+    stats.flush_event_only_chunk_count += event_only_chunk;
+    stats.flush_signal_chunk_count += perf.encodedSignalEvent != 0;
+    stats.flush_wait_chunk_count += perf.encodedWaitEvent != 0;
+    stats.flush_present_chunk_count += perf.encodedPresent != 0;
+    stats.flush_encoder_count += perf.inputEncoders;
+    stats.flush_null_encoder_count += perf.nullEncoders;
+    stats.flush_render_encoder_count += perf.encodedRender;
+    stats.flush_compute_encoder_count += perf.encodedCompute;
+    stats.flush_blit_encoder_count += perf.encodedBlit;
+    stats.flush_timestamp_encoder_count += perf.encodedTimestamp;
+    stats.flush_total_interval += total;
+    stats.flush_collect_interval += perf.collect;
+    stats.flush_relation_interval += perf.relation;
+    stats.flush_query_interval += perf.queries;
+    stats.flush_timestamp_interval += perf.timestamp;
+    stats.flush_render_interval += perf.render;
+    stats.flush_compute_interval += perf.compute;
+    stats.flush_blit_interval += perf.blit;
+    stats.flush_present_interval += perf.present;
+    stats.flush_event_interval += perf.event;
+    stats.flush_sample_interval += perf.sample;
+    stats.flush_pending_fence_interval += perf.pendingFence;
+    stats.flush_signal_interval += perf.signal;
+    stats.flush_cleanup_interval += perf.cleanup;
+    stats.flush_max_chunk_interval = std::max(stats.flush_max_chunk_interval, total);
+  }
+
+  if (log_flush_perf && DebugFlushPerfShouldLog()) {
+    WARN_FILE_ONLY("DXMT flush perf:"
+         " frame=", frame_id_,
+         " seq=", seqId,
+         " encoders=", perf.inputEncoders,
+         " null=", perf.nullEncoders,
+         " render=", perf.encodedRender,
+         " compute=", perf.encodedCompute,
+         " blit=", perf.encodedBlit,
+         " clear=", perf.encodedClear,
+         " resolve=", perf.encodedResolve,
+         " present=", perf.encodedPresent,
+         " scaler=", perf.encodedScaler,
+         " sig=", perf.encodedSignalEvent,
+         " wait=", perf.encodedWaitEvent,
+         " timestamp=", perf.encodedTimestamp,
+         " skipRender=", perf.skippedRender,
+         " skipClear=", perf.skippedClear,
+         " skipResolve=", perf.skippedResolve,
+         " pendingFenceW=", perf.pendingFenceWaits,
+         " pendingFenceU=", perf.pendingFenceUpdates,
+         " totalMs=", DebugMillis(total),
+         " collectMs=", DebugMillis(perf.collect),
+         " relationMs=", DebugMillis(perf.relation),
+         " queryMs=", DebugMillis(perf.queries),
+         " timestampMs=", DebugMillis(perf.timestamp),
+         " renderMs=", DebugMillis(perf.render),
+         " computeMs=", DebugMillis(perf.compute),
+         " blitMs=", DebugMillis(perf.blit),
+         " clearMs=", DebugMillis(perf.clear),
+         " resolveMs=", DebugMillis(perf.resolve),
+         " presentMs=", DebugMillis(perf.present),
+         " scalerMs=", DebugMillis(perf.scaler),
+         " eventMs=", DebugMillis(perf.event),
+         " sampleMs=", DebugMillis(perf.sample),
+         " pendingFenceMs=", DebugMillis(perf.pendingFence),
+         " signalMs=", DebugMillis(perf.signal),
+         " cleanupMs=", DebugMillis(perf.cleanup));
   }
 
   return readbacks;
 }
+
+static bool
+IsFenceOnlyBlitPass(const BlitEncoderData *data);
+
+static void
+MergeFenceOnlyBlitPassInto(BlitEncoderData *former, EncoderData *latter);
 
 DXMT_ENCODER_LIST_OP
 ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *latter) {
@@ -3078,6 +3867,18 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
   if (latter->type == EncoderType::SampleTimestamp)
     return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+  if (former->type == EncoderType::ResolveTimestamp)
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+  if (latter->type == EncoderType::ResolveTimestamp)
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+
+  if (FenceOnlyBlitOptimizationEnabled() &&
+      former->type == EncoderType::Blit &&
+      IsFenceOnlyBlitPass(reinterpret_cast<BlitEncoderData *>(former))) {
+    MergeFenceOnlyBlitPassInto(reinterpret_cast<BlitEncoderData *>(former), latter);
+    currentFrameStatistics().blit_pass_optimized++;
+    return DXMT_ENCODER_LIST_OP_SWAP;
+  }
 
   if (former->type == EncoderType::Blit && latter->type == EncoderType::Blit) {
     if (tryMergeBlitEncoders(
@@ -3289,6 +4090,77 @@ ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncod
   former->next = nullptr;
   former->type = EncoderType::Null;
   return true;
+}
+
+bool
+ArgumentEncodingContext::tryDeferFenceOnlyBlitPass(EncoderData *encoder) {
+  if (encoder->type != EncoderType::Blit)
+    return false;
+
+  auto blit = reinterpret_cast<BlitEncoderData *>(encoder);
+  if (!IsFenceOnlyBlitPass(blit))
+    return false;
+
+  pending_fence_only_blit_wait_.merge(blit->fence_wait);
+  pending_fence_only_blit_update_.merge(blit->fence_update);
+  pending_fence_only_blit_wait_.subtract(blit->fence_update);
+  has_pending_fence_only_blit_ = true;
+  currentFrameStatistics().blit_pass_optimized++;
+  blit->~BlitEncoderData();
+  blit->next = nullptr;
+  blit->type = EncoderType::Null;
+  return true;
+}
+
+void
+ArgumentEncodingContext::appendPendingFenceOnlyBlitPass() {
+  if (!has_pending_fence_only_blit_)
+    return;
+
+  auto encoder_info = allocate<BlitEncoderData>();
+  encoder_info->type = EncoderType::Blit;
+  encoder_info->id = ~0ull;
+  encoder_info->fence_wait = pending_fence_only_blit_wait_;
+  encoder_info->fence_update = pending_fence_only_blit_update_;
+  encoder_info->cmd_head.type = WMTBlitCommandNop;
+  encoder_info->cmd_head.next.set(0);
+  encoder_info->cmd_tail = (wmtcmd_base *)&encoder_info->cmd_head;
+
+  encoder_last->next = encoder_info;
+  encoder_last = encoder_info;
+  encoder_count_++;
+
+  pending_fence_only_blit_wait_ = {};
+  pending_fence_only_blit_update_ = {};
+  has_pending_fence_only_blit_ = false;
+}
+
+void
+ArgumentEncodingContext::mergePendingFenceOnlyBlitPassInto(EncoderData *encoder) {
+  if (!has_pending_fence_only_blit_)
+    return;
+
+  encoder->fence_wait.merge(pending_fence_only_blit_wait_);
+  encoder->fence_update.merge(pending_fence_only_blit_update_);
+  encoder->fence_wait.subtract(pending_fence_only_blit_update_);
+  pending_fence_only_blit_wait_ = {};
+  pending_fence_only_blit_update_ = {};
+  has_pending_fence_only_blit_ = false;
+}
+
+static bool
+IsFenceOnlyBlitPass(const BlitEncoderData *data) {
+  return data->cmd_head.next.ptr == nullptr;
+}
+
+static void
+MergeFenceOnlyBlitPassInto(BlitEncoderData *former, EncoderData *latter) {
+  latter->fence_wait.merge(former->fence_wait);
+  latter->fence_update.merge(former->fence_update);
+  latter->fence_wait.subtract(former->fence_update);
+  former->~BlitEncoderData();
+  former->next = nullptr;
+  former->type = EncoderType::Null;
 }
 
 bool

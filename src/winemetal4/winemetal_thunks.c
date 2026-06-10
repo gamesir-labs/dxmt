@@ -1275,6 +1275,25 @@ MTL4CounterHeap_resolveCounterRange(
 }
 
 WINEMETAL_API void
+MTL4CommandBuffer_resolveCounterHeap(
+    obj_handle_t cmdbuf, obj_handle_t heap, uint64_t start, uint64_t count,
+    obj_handle_t dst_buffer, uint64_t dst_offset, uint64_t dst_length,
+    obj_handle_t wait_fence, obj_handle_t update_fence
+) {
+  struct unixcall_mtl4commandbuffer_resolvecounterheap params;
+  params.cmdbuf = cmdbuf;
+  params.heap = heap;
+  params.start = start;
+  params.count = count;
+  params.dst_buffer = dst_buffer;
+  params.dst_offset = dst_offset;
+  params.dst_length = dst_length;
+  params.wait_fence = wait_fence;
+  params.update_fence = update_fence;
+  UNIX_CALL(154, &params);
+}
+
+WINEMETAL_API void
 MTL4TimestampContext_destroy(obj_handle_t context) {
   struct unixcall_generic_obj_noret params;
   params.handle = context;

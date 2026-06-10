@@ -1979,6 +1979,12 @@ WINEMETAL_API void MTL4CounterHeap_resolveCounterRange(
     obj_handle_t heap, uint64_t start, uint64_t len, void *data_out, uint64_t data_length
 );
 
+WINEMETAL_API void MTL4CommandBuffer_resolveCounterHeap(
+    obj_handle_t cmdbuf, obj_handle_t heap, uint64_t start, uint64_t count,
+    obj_handle_t dst_buffer, uint64_t dst_offset, uint64_t dst_length,
+    obj_handle_t wait_fence, obj_handle_t update_fence
+);
+
 WINEMETAL_API obj_handle_t MTL4TimestampContext_create(obj_handle_t device);
 
 WINEMETAL_API void MTL4TimestampContext_destroy(obj_handle_t context);

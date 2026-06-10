@@ -62,6 +62,8 @@ public:
   virtual dxmt::Texture *GetTexture(UINT plane) const = 0;
   virtual dxmt::TextureAllocation *GetTextureAllocation() const = 0;
   virtual dxmt::TextureAllocation *GetTextureAllocation(UINT plane) const = 0;
+  virtual void AddPendingTimestampResolve(UINT64 offset, UINT64 size,
+                                          uint64_t seq) = 0;
   virtual void SetPresentSourceView(dxmt::TextureViewKey view) = 0;
   virtual dxmt::TextureViewKey GetPresentSourceView() const = 0;
   virtual ID3D12Resource *GetD3D12Resource() = 0;

@@ -93,6 +93,26 @@ WarnTextureBufferViewUnavailable(const char *binding, DXGI_FORMAT format,
        "; leaving binding null");
 }
 
+static void
+WarnTextureBufferViewInvalidRange(const char *binding, DXGI_FORMAT format,
+                                  UINT stride, UINT64 offset,
+                                  UINT64 byte_size, UINT64 heap_offset,
+                                  UINT64 backing_length,
+                                  const char *reason) {
+  if (!ShouldLogTextureBufferViewDiag())
+    return;
+  WARN("D3D12CommandQueue: ", binding,
+       " buffer view reflected as texture but range is invalid"
+       " format=", uint32_t(format),
+       " stride=", stride,
+       " offset=", offset,
+       " byteSize=", byte_size,
+       " heapOffset=", heap_offset,
+       " backingLength=", backing_length,
+       " reason=", reason,
+       "; leaving binding null");
+}
+
 static const char *
 TileRangeFlagName(D3D12_TILE_RANGE_FLAGS flags) {
   switch (flags) {
@@ -390,6 +410,27 @@ D3D12DiagEnabledEnv(const char *name) {
 }
 
 static bool
+D3D12EnabledEnvDefaultOn(const char *name) {
+  auto value = env::getEnvVar(name);
+  return value != "0" && value != "false" && value != "no" &&
+         value != "off";
+}
+
+static bool
+D3D12TimestampGpuResolveEnabled() {
+  static const bool enabled =
+      D3D12EnabledEnvDefaultOn("DXMT_D3D12_TIMESTAMP_GPU_RESOLVE");
+  return enabled;
+}
+
+static bool
+D3D12DeferredTimestampMarkersEnabled() {
+  static const bool enabled =
+      D3D12EnabledEnvDefaultOn("DXMT_D3D12_DEFER_TIMESTAMP_MARKERS");
+  return enabled;
+}
+
+static bool
 D3D12DiagTextureCopyEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_TEXTURE_COPY") ||
@@ -452,6 +493,14 @@ D3D12DiagCBVReadbackEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_CBV_READBACK") ||
       D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE_READBACK");
+  return enabled;
+}
+
+static bool
+D3D12DiagExecuteIndirectEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_EXECUTE_INDIRECT") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
   return enabled;
 }
 
@@ -733,7 +782,7 @@ D3D12DiagLogDSVReplayDescriptor(const char *context, Resource &resource,
   auto *texture = resource.GetTexture();
   const auto &desc = resource.GetResourceDesc();
   const auto &dsv = descriptor.desc.dsv;
-  WARN("D3D12 diagnostic: DSV replay descriptor"
+  WARN_FILE_ONLY("D3D12 diagnostic: DSV replay descriptor"
        " context=", context,
        " key=", uint64_t(key),
        " descriptorType=", DescriptorRecordTypeName(descriptor.type),
@@ -1402,6 +1451,25 @@ ResourceAccessForState(D3D12_RESOURCE_STATES state) {
   return access;
 }
 
+static size_t
+QueryResultStride(D3D12_QUERY_TYPE type) {
+  switch (type) {
+  case D3D12_QUERY_TYPE_OCCLUSION:
+  case D3D12_QUERY_TYPE_BINARY_OCCLUSION:
+  case D3D12_QUERY_TYPE_TIMESTAMP:
+    return sizeof(uint64_t);
+  case D3D12_QUERY_TYPE_PIPELINE_STATISTICS:
+    return sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+  case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0:
+  case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1:
+  case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2:
+  case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
+    return sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
+  default:
+    return 0;
+  }
+}
+
 static bool
 IsReadOnlyResourceState(D3D12_RESOURCE_STATES state) {
   return StateHasReadAccess(state) && !StateHasWriteAccess(state);
@@ -1465,6 +1533,31 @@ IsImplicitPromotionCompatibleResource(const Resource &resource,
     return false;
 
   return IsImplicitPromotionCompatibleState(resource, before);
+}
+
+static bool
+IsTransitionBeforeStateCompatible(D3D12_COMMAND_LIST_TYPE queue_type,
+                                  D3D12_RESOURCE_STATES current,
+                                  D3D12_RESOURCE_STATES before) {
+  if (current == before)
+    return true;
+
+  if (IsReadOnlyResourceState(current) && IsReadOnlyResourceState(before)) {
+    const auto current_bits = uint32_t(current);
+    const auto before_bits = uint32_t(before);
+    return (current_bits & before_bits) == before_bits;
+  }
+
+  if (queue_type == D3D12_COMMAND_LIST_TYPE_COPY &&
+      before == D3D12_RESOURCE_STATE_COMMON &&
+      IsReadOnlyResourceState(current)) {
+    constexpr uint32_t kShaderResourceStates =
+        uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+        uint32_t(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return (uint32_t(current) & kShaderResourceStates) != 0;
+  }
+
+  return false;
 }
 
 static bool
@@ -1971,24 +2064,95 @@ ResolveBufferGpuAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
   return offset;
 }
 
-static std::optional<BufferViewKey>
+struct BufferViewBinding {
+  BufferViewKey key = 0;
+  UINT firstElementBias = 0;
+};
+
+static std::optional<BufferViewBinding>
 CreateBufferView(WMT::Device device, Resource &resource, DXGI_FORMAT format,
                  UINT64 offset, UINT64 byte_size, WMTTextureUsage usage) {
-  if (!resource.GetBuffer())
+  auto *buffer = resource.GetBuffer();
+  if (!buffer)
     return std::nullopt;
 
   MTL_DXGI_FORMAT_DESC format_desc = {};
   if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
-      format_desc.PixelFormat == WMTPixelFormatInvalid)
+      format_desc.PixelFormat == WMTPixelFormatInvalid ||
+      !format_desc.BytesPerTexel)
     return std::nullopt;
+
+  const UINT64 heap_offset = resource.GetHeapOffset();
+  const UINT64 backing_offset = heap_offset + offset;
+  if (backing_offset < heap_offset) {
+    WarnTextureBufferViewInvalidRange("resource", format,
+                                      format_desc.BytesPerTexel, offset,
+                                      byte_size, heap_offset, buffer->length(),
+                                      "offset-overflow");
+    return std::nullopt;
+  }
+  if (backing_offset > buffer->length()) {
+    WarnTextureBufferViewInvalidRange("resource", format,
+                                      format_desc.BytesPerTexel, offset,
+                                      byte_size, heap_offset, buffer->length(),
+                                      "offset-out-of-range");
+    return std::nullopt;
+  }
+
+  const UINT64 max_byte_size = buffer->length() - backing_offset;
+  const UINT64 clamped_byte_size = std::min<UINT64>(byte_size, max_byte_size);
+  if (!clamped_byte_size) {
+    WarnTextureBufferViewInvalidRange("resource", format,
+                                      format_desc.BytesPerTexel, offset,
+                                      byte_size, heap_offset, buffer->length(),
+                                      "empty-range");
+    return std::nullopt;
+  }
+  if ((backing_offset % format_desc.BytesPerTexel) ||
+      (clamped_byte_size % format_desc.BytesPerTexel)) {
+    WarnTextureBufferViewInvalidRange("resource", format,
+                                      format_desc.BytesPerTexel, offset,
+                                      byte_size, heap_offset, buffer->length(),
+                                      "texel-unaligned");
+    return std::nullopt;
+  }
+  const UINT64 texture_alignment = std::max<UINT64>(
+      format_desc.BytesPerTexel,
+      device.minimumLinearTextureAlignmentForPixelFormat(
+          format_desc.PixelFormat));
+  const UINT64 aligned_backing_offset =
+      backing_offset - (backing_offset % texture_alignment);
+  const UINT64 first_element_bias_bytes =
+      backing_offset - aligned_backing_offset;
+  const UINT64 view_byte_size =
+      first_element_bias_bytes + clamped_byte_size;
+  if (first_element_bias_bytes % format_desc.BytesPerTexel) {
+    WarnTextureBufferViewInvalidRange("resource", format,
+                                      format_desc.BytesPerTexel, offset,
+                                      byte_size, heap_offset, buffer->length(),
+                                      "alignment-bias-unaligned");
+    return std::nullopt;
+  }
+  if (aligned_backing_offset > UINT32_MAX || view_byte_size > UINT32_MAX) {
+    WarnTextureBufferViewInvalidRange("resource", format,
+                                      format_desc.BytesPerTexel, offset,
+                                      byte_size, heap_offset, buffer->length(),
+                                      "range-too-large");
+    return std::nullopt;
+  }
 
   BufferViewDescriptor view = {};
   view.format = format_desc.PixelFormat;
   view.usage = usage;
   view.type = WMTTextureTypeTextureBuffer;
-  view.byteOffset = UINT32(offset);
-  view.byteLength = UINT32(std::min<UINT64>(byte_size, UINT32_MAX));
-  return resource.GetBuffer()->createView(view);
+  view.byteOffset = UINT32(aligned_backing_offset);
+  view.byteLength = UINT32(view_byte_size);
+
+  BufferViewBinding binding = {};
+  binding.key = buffer->createView(view);
+  binding.firstElementBias =
+      UINT(first_element_bias_bytes / format_desc.BytesPerTexel);
+  return binding;
 }
 
 static DXGI_FORMAT
@@ -2535,7 +2699,7 @@ public:
         resource_states_(std::move(resource_states)) {
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: CreateCommandQueue"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: CreateCommandQueue"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " type=", desc_.Type,
            " priority=", desc_.Priority,
@@ -2941,7 +3105,7 @@ public:
     if (D3D12DiagShouldLog(diag_execute_log_count,
                            D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_DEVICE") ||
                                D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 diagnostic: ExecuteCommandLists"
+      WARN_FILE_ONLY("D3D12 diagnostic: ExecuteCommandLists"
            " queueType=", desc_.Type,
            " listCount=", command_list_count,
            " queue=", reinterpret_cast<uintptr_t>(this),
@@ -2988,7 +3152,7 @@ public:
     if (!op.command_records.empty()) {
       static std::atomic<uint32_t> log_count = 0;
       if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-        WARN("D3D12 queue diagnostic: enqueue execute"
+        WARN_FILE_ONLY("D3D12 queue diagnostic: enqueue execute"
              " queue=", reinterpret_cast<uintptr_t>(this),
              " queueType=", desc_.Type,
              " records=", op.command_records.size(),
@@ -3014,7 +3178,7 @@ public:
 
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: Signal enqueue"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: Signal enqueue"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " fence=", reinterpret_cast<uintptr_t>(fence),
@@ -3043,7 +3207,7 @@ public:
 
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: Wait enqueue"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: Wait enqueue"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " fence=", reinterpret_cast<uintptr_t>(fence),
@@ -3843,6 +4007,36 @@ private:
     bool active = false;
   };
 
+  struct ReplayComputePassCommand {
+    std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
+    uint64_t d3d_sequence = 0;
+    uint64_t argument_buffer_size = 0;
+  };
+
+  struct ReplayComputePassBatch {
+    std::vector<ReplayComputePassCommand> commands;
+    uint64_t argument_buffer_size = 0;
+    bool active = false;
+  };
+
+  struct PendingTimestampResolve {
+    Com<ID3D12GraphicsCommandList> command_list;
+    Com<ID3D12QueryHeap> heap;
+    Com<ID3D12Resource> dst_buffer;
+    std::vector<uint64_t> sample_indices;
+    UINT start_index = 0;
+    UINT query_count = 0;
+    UINT64 dst_offset = 0;
+    UINT64 byte_count = 0;
+  };
+
+  struct PendingTimestampMarker {
+    Com<ID3D12QueryHeap> heap;
+    Rc<TimestampQuery> query;
+    D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_TIMESTAMP;
+    UINT index = 0;
+  };
+
   struct ReplayState {
     std::unordered_map<ID3D12Resource *, ReplayResourceStateEntry> *resource_states =
         nullptr;
@@ -3877,6 +4071,10 @@ private:
     D3D12_PREDICATION_OP predication_operation =
         D3D12_PREDICATION_OP_EQUAL_ZERO;
     ReplayGraphicsPassBatch graphics_pass_batch;
+    ReplayComputePassBatch compute_pass_batch;
+    std::vector<PendingTimestampMarker> pending_timestamp_markers;
+    std::vector<PendingTimestampResolve> pending_timestamp_resolves;
+    std::vector<ResolveQueryDataRecord> pending_cpu_query_resolves;
   };
 
   static ReplayState
@@ -3948,6 +4146,32 @@ private:
            !state.graphics_pass_batch.commands.empty();
   }
 
+  static bool HasPendingComputePass(const ReplayState &state) {
+    return state.compute_pass_batch.active &&
+           !state.compute_pass_batch.commands.empty();
+  }
+
+  void FlushComputePassBatch(CommandChunk *chunk, ReplayState &state) {
+    auto &batch = state.compute_pass_batch;
+    if (!HasPendingComputePass(state))
+      return;
+
+    chunk->emitcc([commands = std::move(batch.commands),
+                   argument_buffer_size = batch.argument_buffer_size](
+                      ArgumentEncodingContext &enc) mutable {
+      enc.startComputePass(argument_buffer_size);
+      uint64_t argbuf_offset = 0;
+      for (auto &command : commands) {
+        if (command.d3d_sequence != 0)
+          dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
+        command.encode(enc, argbuf_offset);
+      }
+      enc.endPass();
+    });
+
+    batch = {};
+  }
+
   void FlushGraphicsPassBatch(CommandChunk *chunk, ReplayState &state) {
     auto &batch = state.graphics_pass_batch;
     if (!HasPendingGraphicsPass(state))
@@ -3979,15 +4203,298 @@ private:
     batch = {};
   }
 
+  void EmitTimestampMarkers(CommandChunk *chunk, ReplayState &state) {
+    if (state.pending_timestamp_markers.empty())
+      return;
+
+    auto markers = std::move(state.pending_timestamp_markers);
+    state.pending_timestamp_markers = {};
+    for (auto &marker : markers) {
+      Com<ID3D12QueryHeap> heap_ref = marker.heap;
+      const auto type = marker.type;
+      const UINT index = marker.index;
+      chunk->emitcc([query = std::move(marker.query)](
+                        ArgumentEncodingContext &enc) mutable {
+        enc.sampleTimestamp(std::move(query));
+      });
+      chunk->completion_callbacks.push_back(
+          [heap_ref = std::move(heap_ref), type, index]() mutable {
+            auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
+            if (heap)
+              heap->MarkTimestampReady(type, index);
+          });
+    }
+  }
+
+  void FlushPassBatches(CommandChunk *chunk, ReplayState &state) {
+    FlushComputePassBatch(chunk, state);
+    FlushGraphicsPassBatch(chunk, state);
+    EmitTimestampMarkers(chunk, state);
+  }
+
+  void FlushGraphicsBeforeCompute(CommandChunk *chunk, ReplayState &state) {
+    if (HasPendingGraphicsPass(state))
+      FlushPassBatches(chunk, state);
+  }
+
+  void SyncTimestampSampleAllocator() {
+    const auto current_sequence =
+        device_->GetDXMTDevice().queue().CurrentSeqId();
+    if (current_timestamp_sample_sequence_ == current_sequence)
+      return;
+
+    current_timestamp_sample_sequence_ = current_sequence;
+    current_timestamp_sample_count_ = 0;
+  }
+
+  uint64_t AllocateTimestampSample(TimestampQuery *query) {
+    SyncTimestampSampleAllocator();
+    const auto sample_index = current_timestamp_sample_count_++;
+    query->setSampleLocation(current_timestamp_sample_sequence_, sample_index);
+    return sample_index;
+  }
+
+  static bool BufferRangesOverlap(UINT64 a_offset, UINT64 a_size,
+                                  UINT64 b_offset, UINT64 b_size) {
+    if (!a_size || !b_size)
+      return false;
+    return a_offset < b_offset + b_size && b_offset < a_offset + a_size;
+  }
+
+  void EmitTimestampResolve(CommandChunk *chunk, PendingTimestampResolve resolve) {
+    auto *heap = dynamic_cast<QueryHeap *>(resolve.heap.ptr());
+    auto *dst = GetResource(resolve.dst_buffer.ptr());
+    if (!heap || !dst || !dst->GetBufferAllocation() || !resolve.query_count)
+      return;
+
+    if (resolve.sample_indices.empty()) {
+      const auto start_sample = heap->TimestampSampleIndex(
+          D3D12_QUERY_TYPE_TIMESTAMP, resolve.start_index);
+      if (start_sample == ~0ull)
+        return;
+      for (UINT i = 0; i < resolve.query_count; i++)
+        resolve.sample_indices.push_back(start_sample + i);
+    }
+
+    if (resolve.sample_indices.size() < resolve.query_count)
+      return;
+
+    Rc<BufferAllocation> allocation = dst->GetBufferAllocation();
+    WMT::Reference<WMT::Buffer> dst_buffer(allocation->buffer());
+    const uint64_t dst_buffer_offset = dst->GetHeapOffset() + resolve.dst_offset;
+    dst->AddPendingTimestampResolve(resolve.dst_offset, resolve.byte_count,
+                                    device_->GetDXMTDevice().queue().CurrentSeqId());
+    for (UINT i = 0; i < resolve.query_count;) {
+      const uint64_t start_sample = resolve.sample_indices[i];
+      UINT run_count = 1;
+      while (i + run_count < resolve.query_count &&
+             resolve.sample_indices[i + run_count] ==
+                 start_sample + run_count)
+        run_count++;
+
+      const uint64_t run_dst_offset =
+          dst_buffer_offset + uint64_t(i) * sizeof(uint64_t);
+      const uint64_t run_dst_length =
+          uint64_t(run_count) * sizeof(uint64_t);
+      chunk->emitcc([start_sample, run_count, dst_buffer, run_dst_offset,
+                     run_dst_length](ArgumentEncodingContext &enc) {
+        enc.resolveTimestamp(start_sample, run_count, dst_buffer,
+                             run_dst_offset, run_dst_length);
+      });
+      i += run_count;
+    }
+  }
+
+  bool MaterializeTimestampResolves(CommandChunk *chunk, ReplayState &state,
+                                    ID3D12Resource *resource = nullptr,
+                                    UINT64 offset = 0, UINT64 size = UINT64_MAX) {
+    if (state.pending_timestamp_resolves.empty())
+      return false;
+
+    FlushPassBatches(chunk, state);
+    auto matches = [&](const PendingTimestampResolve &resolve) {
+      if (!resource)
+        return true;
+      return resolve.dst_buffer.ptr() == resource &&
+             BufferRangesOverlap(resolve.dst_offset, resolve.byte_count,
+                                 offset, size);
+    };
+
+    std::vector<PendingTimestampResolve> remaining;
+    remaining.reserve(state.pending_timestamp_resolves.size());
+    bool emitted = false;
+    for (auto &resolve : state.pending_timestamp_resolves) {
+      if (matches(resolve)) {
+        EmitTimestampResolve(chunk, std::move(resolve));
+        emitted = true;
+      } else {
+        remaining.push_back(std::move(resolve));
+      }
+    }
+    state.pending_timestamp_resolves = std::move(remaining);
+    return emitted;
+  }
+
+  bool ResolveRecordTouchesRange(const ResolveQueryDataRecord &record,
+                                 ID3D12Resource *resource, UINT64 offset,
+                                 UINT64 size) const {
+    if (!resource)
+      return true;
+
+    auto *dst = GetResource(record.dst_buffer.ptr());
+    if (!dst)
+      return false;
+
+    const UINT64 byte_count =
+        UINT64(record.query_count) * QueryResultStride(record.type);
+    if (!byte_count)
+      return false;
+
+    return record.dst_buffer.ptr() == resource &&
+           BufferRangesOverlap(record.dst_buffer_offset, byte_count, offset,
+                               size);
+  }
+
+  void ResolveQueryDataToCpuBuffer(const ResolveQueryDataRecord &record,
+                                   const char *context) {
+    auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
+    auto *dst = GetResource(record.dst_buffer.ptr());
+    if (!heap || !dst)
+      return;
+
+    std::vector<uint8_t> data;
+    if (!heap->Resolve(record.type, record.start_index, record.query_count,
+                       data)) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData final failed"
+           " context=", context,
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queryType=", record.type,
+           " start=", record.start_index,
+           " count=", record.query_count);
+      return;
+    }
+    if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
+                             "query resolve"))
+      return;
+    if (!data.empty())
+      dst->GetBufferAllocation()->updateContents(
+          dst->GetHeapOffset() + record.dst_buffer_offset, data.data(),
+          data.size());
+    dxmt::apitrace::record_resolve_query_data_result(
+        record.command_list.ptr(), record.heap.ptr(),
+        static_cast<uint32_t>(record.type), record.start_index,
+        record.query_count, record.dst_buffer.ptr(), record.dst_buffer_offset,
+        data.data(), data.size());
+    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData leave"
+         " context=", context,
+         " queue=", reinterpret_cast<uintptr_t>(this),
+         " bytes=", data.size());
+  }
+
+  bool MaterializeCpuQueryResolves(CommandChunk *&chunk, ReplayState &state,
+                                   ID3D12Resource *resource = nullptr,
+                                   UINT64 offset = 0,
+                                   UINT64 size = UINT64_MAX) {
+    if (state.pending_cpu_query_resolves.empty())
+      return false;
+
+    std::vector<ResolveQueryDataRecord> selected;
+    std::vector<ResolveQueryDataRecord> remaining;
+    selected.reserve(state.pending_cpu_query_resolves.size());
+    remaining.reserve(state.pending_cpu_query_resolves.size());
+
+    for (auto &resolve : state.pending_cpu_query_resolves) {
+      if (ResolveRecordTouchesRange(resolve, resource, offset, size))
+        selected.push_back(std::move(resolve));
+      else
+        remaining.push_back(std::move(resolve));
+    }
+
+    state.pending_cpu_query_resolves = std::move(remaining);
+    if (selected.empty())
+      return false;
+
+    FlushPassBatches(chunk, state);
+    auto &queue = device_->GetDXMTDevice().queue();
+    const auto seq = queue.CurrentSeqId();
+    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch commit before wait"
+         " queue=", reinterpret_cast<uintptr_t>(this),
+         " count=", selected.size(),
+         " seq=", seq,
+         " coherent=", queue.CoherentSeqId());
+    queue.CommitCurrentChunk();
+    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait begin"
+         " queue=", reinterpret_cast<uintptr_t>(this),
+         " count=", selected.size(),
+         " seq=", seq,
+         " coherent=", queue.CoherentSeqId());
+    queue.WaitCPUFence(seq);
+    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait end"
+         " queue=", reinterpret_cast<uintptr_t>(this),
+         " count=", selected.size(),
+         " seq=", seq,
+         " coherent=", queue.CoherentSeqId());
+
+    for (const auto &resolve : selected)
+      ResolveQueryDataToCpuBuffer(resolve, "cpu-batch");
+
+    chunk = queue.CurrentChunk();
+    return true;
+  }
+
+  void MaterializeTimestampResolvesForAccess(CommandChunk *chunk,
+                                             ReplayState &state,
+                                             ID3D12Resource *resource,
+                                             D3D12_RESOURCE_STATES desired) {
+    auto *d3d_resource = GetResource(resource);
+    if (!d3d_resource || !d3d_resource->GetBufferAllocation())
+      return;
+
+    const bool reads = IsReadOnlyResourceState(desired) ||
+                       desired == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT ||
+                       desired == D3D12_RESOURCE_STATE_PREDICATION ||
+                       desired == D3D12_RESOURCE_STATE_COPY_SOURCE;
+    const bool writes = !IsReadOnlyResourceState(desired) &&
+                        desired != D3D12_RESOURCE_STATE_PREDICATION &&
+                        desired != D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT &&
+                        desired != D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (!reads && !writes)
+      return;
+
+    MaterializeTimestampResolves(chunk, state, resource, 0,
+                                 d3d_resource->GetResourceDesc().Width);
+  }
+
+  void MaterializeTimestampResolvesForCpuRead(CommandChunk *&chunk,
+                                              ReplayState &state,
+                                              ID3D12Resource *resource,
+                                              UINT64 offset, UINT64 size) {
+    const bool emitted_gpu =
+        MaterializeTimestampResolves(chunk, state, resource, offset, size);
+    const bool emitted_cpu =
+        MaterializeCpuQueryResolves(chunk, state, resource, offset, size);
+    if (emitted_gpu && !emitted_cpu) {
+      auto &queue = device_->GetDXMTDevice().queue();
+      const auto seq = queue.CurrentSeqId();
+      queue.CommitCurrentChunk();
+      queue.WaitCPUFence(seq);
+      chunk = queue.CurrentChunk();
+    }
+  }
+
   template <typename Fn>
   void QueueGraphicsPassCommand(CommandChunk *chunk, ReplayState &state,
                                 ReplayRenderPassAttachments attachments,
                                 uint64_t argument_buffer_size, Fn &&fn,
                                 bool use_geometry = false,
                                 bool use_tessellation = false) {
+    if (HasPendingComputePass(state))
+      FlushPassBatches(chunk, state);
+
     auto &batch = state.graphics_pass_batch;
-    if (batch.active && !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
-      FlushGraphicsPassBatch(chunk, state);
+    if (batch.active &&
+        !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
+      FlushPassBatches(chunk, state);
 
     auto &active_batch = state.graphics_pass_batch;
     if (!active_batch.active) {
@@ -4004,6 +4511,52 @@ private:
         ReplayGraphicsPassCommand{std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
                                   argument_buffer_size, use_geometry,
                                   use_tessellation});
+  }
+
+  bool D3D12ReplayComputeBatchingEnabled() {
+    static const bool enabled =
+        D3D12EnabledEnvDefaultOn("DXMT_D3D12_COMPUTE_BATCHING");
+    return enabled;
+  }
+
+  template <typename Fn>
+  void EmitSingleComputePass(CommandChunk *chunk, uint64_t argument_buffer_size,
+                             uint64_t d3d_sequence, Fn &&fn) {
+    chunk->emitcc([argument_buffer_size, d3d_sequence,
+                   encode = std::function<void(ArgumentEncodingContext &, uint64_t &)>(
+                       std::forward<Fn>(fn))](ArgumentEncodingContext &enc) mutable {
+      enc.startComputePass(argument_buffer_size);
+      uint64_t argbuf_offset = 0;
+      if (d3d_sequence != 0)
+        dxmt::apitrace::set_current_d3d_sequence(d3d_sequence);
+      encode(enc, argbuf_offset);
+      enc.endPass();
+    });
+  }
+
+  template <typename Fn>
+  void QueueComputePassCommand(CommandChunk *chunk, ReplayState &state,
+                               uint64_t argument_buffer_size, Fn &&fn) {
+    if (!D3D12ReplayComputeBatchingEnabled()) {
+      FlushPassBatches(chunk, state);
+      EmitSingleComputePass(chunk, argument_buffer_size,
+                            dxmt::apitrace::current_d3d_sequence(),
+                            std::forward<Fn>(fn));
+      return;
+    }
+
+    FlushGraphicsBeforeCompute(chunk, state);
+
+    auto &batch = state.compute_pass_batch;
+    if (!batch.active) {
+      batch.active = true;
+      batch.argument_buffer_size = 0;
+    }
+
+    batch.argument_buffer_size += argument_buffer_size;
+    batch.commands.push_back(ReplayComputePassCommand{
+        std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
+        argument_buffer_size});
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -4043,7 +4596,7 @@ private:
     state.touched_resources = &touched_resources;
     static std::atomic<uint32_t> replay_log_count = 0;
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: replay records begin"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: replay records begin"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " records=", records.size());
@@ -4055,7 +4608,7 @@ private:
       }
       std::visit([&](const auto &payload) {
         if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-          WARN("D3D12 queue diagnostic: replay record enter"
+          WARN_FILE_ONLY("D3D12 queue diagnostic: replay record enter"
                " queue=", reinterpret_cast<uintptr_t>(this),
                " queueType=", desc_.Type,
                " index=", record_index,
@@ -4064,7 +4617,7 @@ private:
         }
         ReplayRecord(chunk, state, payload);
         if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-          WARN("D3D12 queue diagnostic: replay record leave"
+          WARN_FILE_ONLY("D3D12 queue diagnostic: replay record leave"
                " queue=", reinterpret_cast<uintptr_t>(this),
                " queueType=", desc_.Type,
                " index=", record_index,
@@ -4076,14 +4629,16 @@ private:
       record_index++;
     }
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: replay records flush begin"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: replay records flush begin"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " records=", records.size());
     }
-    FlushGraphicsPassBatch(chunk, state);
+    FlushPassBatches(chunk, state);
+    MaterializeTimestampResolves(chunk, state);
+    MaterializeCpuQueryResolves(chunk, state);
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: replay records end"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: replay records end"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " records=", records.size(),
@@ -4094,93 +4649,93 @@ private:
   template <typename T>
   void ReplayRecord(CommandChunk *chunk, ReplayState &state, const T &record) {
       if constexpr (std::is_same_v<T, CopyBufferRegionRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.dst.ptr(),
+        FlushPassBatches(chunk, state);
+        RecordReplayResourceAccess(chunk, state, record.dst.ptr(),
                                    D3D12_RESOURCE_STATE_COPY_DEST,
                                    "CopyBufferRegion dst");
-        RecordReplayResourceAccess(state, record.src.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.src.ptr(),
                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
                                    "CopyBufferRegion src");
         ReplayCopyBufferRegion(chunk, record);
       } else if constexpr (std::is_same_v<T, CopyTextureRegionRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
+        FlushPassBatches(chunk, state);
         RecordReplayResourceAccess(
-            state, record.dst.resource.ptr(), D3D12_RESOURCE_STATE_COPY_DEST,
+            chunk, state, record.dst.resource.ptr(), D3D12_RESOURCE_STATE_COPY_DEST,
             "CopyTextureRegion dst",
             record.dst.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
                 ? record.dst.subresource_index
                 : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
         RecordReplayResourceAccess(
-            state, record.src.resource.ptr(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            chunk, state, record.src.resource.ptr(), D3D12_RESOURCE_STATE_COPY_SOURCE,
             "CopyTextureRegion src",
             record.src.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
                 ? record.src.subresource_index
                 : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
         ReplayCopyTextureRegion(chunk, record);
       } else if constexpr (std::is_same_v<T, CopyResourceRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.dst.ptr(),
+        FlushPassBatches(chunk, state);
+        RecordReplayResourceAccess(chunk, state, record.dst.ptr(),
                                    D3D12_RESOURCE_STATE_COPY_DEST,
                                    "CopyResource dst");
-        RecordReplayResourceAccess(state, record.src.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.src.ptr(),
                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
                                    "CopyResource src");
         ReplayCopyResource(chunk, record);
       } else if constexpr (std::is_same_v<T, CopyTilesRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
+        FlushPassBatches(chunk, state);
         const bool buffer_to_texture =
             record.flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE;
         RecordReplayResourceAccess(
-            state, record.tiled_resource.ptr(),
+            chunk, state, record.tiled_resource.ptr(),
             buffer_to_texture ? D3D12_RESOURCE_STATE_COPY_DEST
                               : D3D12_RESOURCE_STATE_COPY_SOURCE,
             "CopyTiles tiled resource", record.start.Subresource);
         RecordReplayResourceAccess(
-            state, record.buffer.ptr(),
+            chunk, state, record.buffer.ptr(),
             buffer_to_texture ? D3D12_RESOURCE_STATE_COPY_SOURCE
                               : D3D12_RESOURCE_STATE_COPY_DEST,
             "CopyTiles buffer");
         ReplayCopyTiles(chunk, record);
       } else if constexpr (std::is_same_v<T, ResolveSubresourceRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.dst.ptr(),
+        FlushPassBatches(chunk, state);
+        RecordReplayResourceAccess(chunk, state, record.dst.ptr(),
                                    D3D12_RESOURCE_STATE_RESOLVE_DEST,
                                    "ResolveSubresource dst",
                                    record.dst_subresource);
-        RecordReplayResourceAccess(state, record.src.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.src.ptr(),
                                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
                                    "ResolveSubresource src",
                                    record.src_subresource);
         ReplayResolveSubresource(chunk, record);
       } else if constexpr (std::is_same_v<T, ClearRenderTargetRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
+        FlushPassBatches(chunk, state);
         if (auto *resource = GetResource(record.descriptor.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
-              state, *resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
+              chunk, state, *resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
               record.descriptor, "ClearRenderTargetView",
               GetRenderTargetSubresourceRanges);
         }
         ReplayClearRenderTarget(chunk, record);
       } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
+        FlushPassBatches(chunk, state);
         if (auto *resource = GetResource(record.descriptor.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
-              state, *resource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+              chunk, state, *resource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
               record.descriptor, "ClearDepthStencilView",
               GetDepthStencilSubresourceRanges);
         }
         ReplayClearDepthStencil(chunk, record);
       } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
+        FlushPassBatches(chunk, state);
         if (auto *resource = GetResource(record.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
-              state, *resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              chunk, state, *resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
               record.descriptor, "ClearUnorderedAccessView",
               GetUnorderedAccessSubresourceRanges);
         }
         ReplayClearUnorderedAccess(chunk, record);
     } else if constexpr (std::is_same_v<T, DiscardResourceRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
+      FlushPassBatches(chunk, state);
       TouchReplayResource(state, record.resource.ptr());
       ReplayDiscardResource(chunk, record);
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
@@ -4199,7 +4754,7 @@ private:
       state.render_targets = record.render_targets;
       state.depth_stencil = record.depth_stencil;
     } else if constexpr (std::is_same_v<T, DescriptorHeapsRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
+      FlushPassBatches(chunk, state);
       state.cbv_srv_uav_heap = nullptr;
       state.sampler_heap = nullptr;
       for (const auto &heap : record.heaps) {
@@ -4226,10 +4781,10 @@ private:
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
+      FlushPassBatches(chunk, state);
       ReplayResourceBarrier(chunk, state, record);
     } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
+      FlushPassBatches(chunk, state);
       if (record.compute)
         state.compute_root_signature = record.root_signature;
       else
@@ -4243,50 +4798,52 @@ private:
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
       StoreRootConstants(state, record);
     } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
+      FlushPassBatches(chunk, state);
       ReplayBeginQuery(chunk, record);
     } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
-      ReplayEndQuery(chunk, record);
+      if (record.type != D3D12_QUERY_TYPE_TIMESTAMP)
+        FlushPassBatches(chunk, state);
+      ReplayEndQuery(chunk, state, record);
       } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.dst_buffer.ptr(),
+        FlushPassBatches(chunk, state);
+        RecordReplayResourceAccess(chunk, state, record.dst_buffer.ptr(),
                                    D3D12_RESOURCE_STATE_COPY_DEST,
-                                   "ResolveQueryData dst");
-        ReplayResolveQueryData(record);
+                                   "ResolveQueryData dst",
+                                   D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, 0,
+                                   false, false);
+        ReplayResolveQueryData(chunk, state, record);
       } else if constexpr (std::is_same_v<T, PredicationRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.buffer.ptr(),
+        FlushPassBatches(chunk, state);
+        RecordReplayResourceAccess(chunk, state, record.buffer.ptr(),
                                    D3D12_RESOURCE_STATE_PREDICATION,
                                    "SetPredication");
         ReplaySetPredication(state, record);
       } else if constexpr (std::is_same_v<T, WriteBufferImmediateRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
+        FlushPassBatches(chunk, state);
         ReplayWriteBufferImmediate(chunk, record);
       } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.arg_buffer.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.arg_buffer.ptr(),
                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                    "ExecuteIndirect arguments");
-        RecordReplayResourceAccess(state, record.count_buffer.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.count_buffer.ptr(),
                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                    "ExecuteIndirect count");
         ReplayExecuteIndirect(chunk, state, record);
       } else if constexpr (std::is_same_v<T, TemporalUpscaleRecord>) {
-        FlushGraphicsPassBatch(chunk, state);
-        RecordReplayResourceAccess(state, record.color.ptr(),
+        FlushPassBatches(chunk, state);
+        RecordReplayResourceAccess(chunk, state, record.color.ptr(),
                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                    "TemporalUpscale color");
-        RecordReplayResourceAccess(state, record.depth.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.depth.ptr(),
                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                    "TemporalUpscale depth");
-        RecordReplayResourceAccess(state, record.motion_vector.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.motion_vector.ptr(),
                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                    "TemporalUpscale motion");
-        RecordReplayResourceAccess(state, record.exposure_texture.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.exposure_texture.ptr(),
                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                    "TemporalUpscale exposure");
-        RecordReplayResourceAccess(state, record.output.ptr(),
+        RecordReplayResourceAccess(chunk, state, record.output.ptr(),
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                    "TemporalUpscale output");
         ReplayTemporalUpscale(chunk, record);
@@ -4295,7 +4852,7 @@ private:
     } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
       ReplayDrawIndexedInstanced(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DispatchRecord>) {
-      FlushGraphicsPassBatch(chunk, state);
+      FlushGraphicsBeforeCompute(chunk, state);
       ReplayDispatch(chunk, state, record);
     }
   }
@@ -4304,54 +4861,72 @@ private:
                               const CopyBufferRegionRecord &record) {
     auto *dst = GetResource(record.dst.ptr());
     auto *src = GetResource(record.src.ptr());
-    if (!dst || !src || !dst->GetBufferAllocation() ||
-        !src->GetBufferAllocation())
+    if (!dst || !src || !dst->GetBuffer() || !src->GetBuffer())
       return;
 
-    Rc<BufferAllocation> dst_allocation = dst->GetBufferAllocation();
-    Rc<BufferAllocation> src_allocation = src->GetBufferAllocation();
+    Rc<Buffer> dst_buffer = dst->GetBuffer();
+    Rc<Buffer> src_buffer = src->GetBuffer();
     const UINT64 src_offset = src->GetHeapOffset() + record.src_offset;
     const UINT64 dst_offset = dst->GetHeapOffset() + record.dst_offset;
-    chunk->emitcc([dst_allocation, src_allocation, src_offset, dst_offset,
+    chunk->emitcc([dst_buffer, src_buffer, src_offset, dst_offset,
                    byte_count = record.byte_count](ArgumentEncodingContext &enc) {
-      enc.retainAllocation(dst_allocation.ptr());
-      enc.retainAllocation(src_allocation.ptr());
       enc.startBlitPass();
+      auto [src_allocation, src_sub_offset] =
+          enc.access(src_buffer, src_offset, byte_count, ResourceAccess::Read);
+      auto [dst_allocation, dst_sub_offset] =
+          enc.access(dst_buffer, dst_offset, byte_count, ResourceAccess::Write);
       auto &copy =
           enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
       copy.type = WMTBlitCommandCopyFromBufferToBuffer;
       copy.src = src_allocation->buffer();
-      copy.src_offset = src_offset;
+      copy.src_offset = src_sub_offset + src_offset;
       copy.dst = dst_allocation->buffer();
-      copy.dst_offset = dst_offset;
+      copy.dst_offset = dst_sub_offset + dst_offset;
       copy.copy_length = byte_count;
       enc.endPass();
     });
   }
+
+  struct ResourceAccessBarrierEntry {
+    Rc<Buffer> buffer;
+    Rc<Texture> texture;
+    UINT buffer_length = 0;
+    UINT level = 0;
+    UINT slice = 0;
+    int access = 0;
+  };
+
+  struct ResourceAccessBarrierBatch {
+    std::vector<ResourceAccessBarrierEntry> entries;
+    bool needs_separator = false;
+  };
 
   void ReplayResourceBarrier(CommandChunk *chunk, ReplayState &state,
                              const ResourceBarrierRecord &record) {
     if (record.barriers.empty())
       return;
 
+    ResourceAccessBarrierBatch batch;
     for (const auto &barrier : record.barriers) {
       switch (barrier.barrier.Type) {
       case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
-        ReplayTransitionBarrier(chunk, state, barrier);
+        ReplayTransitionBarrier(state, barrier, batch);
         break;
       case D3D12_RESOURCE_BARRIER_TYPE_UAV:
-        ReplayUavBarrier(chunk, barrier);
+        ReplayUavBarrier(barrier, batch);
         break;
       case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
-        ReplayAliasingBarrier(chunk, state, barrier);
+        ReplayAliasingBarrier(state, barrier, batch);
         break;
       default:
         WARN("D3D12CommandQueue: unsupported resource barrier type ",
              barrier.barrier.Type);
-        EmitPassSeparator(chunk);
+        batch.needs_separator = true;
         break;
       }
     }
+
+    EmitResourceAccessBarrierBatch(chunk, std::move(batch));
   }
 
   void ReplayWriteBufferImmediate(CommandChunk *chunk,
@@ -4713,15 +5288,23 @@ private:
          " initial=", uint32_t(resource.GetInitialState()));
   }
 
-  void RecordReplayResourceAccess(ReplayState &state, ID3D12Resource *d3d_resource,
+  void RecordReplayResourceAccess(CommandChunk *chunk, ReplayState &state,
+                                  ID3D12Resource *d3d_resource,
                                   D3D12_RESOURCE_STATES desired,
                                   const char *context,
                                   UINT first_subresource =
                                       D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                                    UINT subresource_count = 0) {
+                                  UINT subresource_count = 0,
+                                  bool materialize_query_resolves = true,
+                                  bool materialize_timestamp_resolves = true) {
     auto *resource = GetResource(d3d_resource);
     if (!resource)
       return;
+    if (materialize_query_resolves && resource->GetBufferAllocation())
+      MaterializeCpuQueryResolves(chunk, state, d3d_resource, 0,
+                                  resource->GetResourceDesc().Width);
+    if (materialize_timestamp_resolves)
+      MaterializeTimestampResolvesForAccess(chunk, state, d3d_resource, desired);
     WarnUnsupportedResourceState(desired, context);
 
     auto &states = GetReplayResourceStates(state, *resource);
@@ -4772,21 +5355,21 @@ private:
     }
 
   void RecordReplayResourceAccessRanges(
-      ReplayState &state, ID3D12Resource *d3d_resource,
+      CommandChunk *chunk, ReplayState &state, ID3D12Resource *d3d_resource,
       D3D12_RESOURCE_STATES desired, const char *context,
       const std::vector<SubresourceRange> &ranges) {
     if (ranges.empty()) {
-      RecordReplayResourceAccess(state, d3d_resource, desired, context);
+      RecordReplayResourceAccess(chunk, state, d3d_resource, desired, context);
       return;
     }
     for (const auto &range : ranges) {
-      RecordReplayResourceAccess(state, d3d_resource, desired, context,
+      RecordReplayResourceAccess(chunk, state, d3d_resource, desired, context,
                                  range.first, range.count);
     }
   }
 
   void RecordDescriptorResourceAccessRanges(
-      ReplayState &state, Resource &resource, D3D12_RESOURCE_STATES desired,
+      CommandChunk *chunk, ReplayState &state, Resource &resource, D3D12_RESOURCE_STATES desired,
       const DescriptorRecord &descriptor, const char *context,
       bool (*get_ranges)(Resource &, const DescriptorRecord &,
                          std::vector<SubresourceRange> &)) {
@@ -4819,7 +5402,7 @@ private:
       }
       return;
     }
-    RecordReplayResourceAccessRanges(state, resource.GetD3D12Resource(), desired,
+    RecordReplayResourceAccessRanges(chunk, state, resource.GetD3D12Resource(), desired,
                                      context, ranges);
   }
 
@@ -4845,12 +5428,13 @@ private:
     }
   }
 
-  void ReplayTransitionBarrier(CommandChunk *chunk, ReplayState &state,
-                               const StoredResourceBarrier &barrier) {
+  void ReplayTransitionBarrier(ReplayState &state,
+                               const StoredResourceBarrier &barrier,
+                               ResourceAccessBarrierBatch &batch) {
     auto *resource = GetResource(barrier.resource.ptr());
     if (!resource) {
       WARN("D3D12CommandQueue: transition barrier skipped for foreign resource");
-      EmitPassSeparator(chunk);
+      batch.needs_separator = true;
       return;
     }
 
@@ -4866,7 +5450,7 @@ private:
     if (!all_subresources && transition.Subresource >= subresource_count) {
       WARN("D3D12CommandQueue: transition barrier subresource out of range ",
            transition.Subresource, " count=", subresource_count);
-      EmitPassSeparator(chunk);
+      batch.needs_separator = true;
       return;
     }
 
@@ -4898,7 +5482,8 @@ private:
           current.state = transition.StateBefore;
           current.implicitly_promoted = true;
         }
-        if (current.state != transition.StateBefore) {
+        if (!IsTransitionBeforeStateCompatible(desc_.Type, current.state,
+                                               transition.StateBefore)) {
           const auto &desc = resource->GetResourceDesc();
           WARN("D3D12CommandQueue: split transition BEGIN state mismatch"
                " subresource=", subresource,
@@ -4958,7 +5543,8 @@ private:
         current.state = transition.StateBefore;
         current.implicitly_promoted = true;
       }
-      if (current.state != transition.StateBefore) {
+      if (!IsTransitionBeforeStateCompatible(desc_.Type, current.state,
+                                             transition.StateBefore)) {
         const auto &desc = resource->GetResourceDesc();
         WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
              subresource, " expected=", uint32_t(current.state),
@@ -4978,34 +5564,35 @@ private:
     int access = before_access | after_access;
     if (!access)
       access = ResourceAccess::All;
-    EmitResourceAccessBarrier(chunk, *resource, first, count, access);
+    AddResourceAccessBarrier(batch, *resource, first, count, access);
   }
 
-  void ReplayUavBarrier(CommandChunk *chunk,
-                        const StoredResourceBarrier &barrier) {
+  void ReplayUavBarrier(const StoredResourceBarrier &barrier,
+                        ResourceAccessBarrierBatch &batch) {
     if (barrier.resource) {
       auto *resource = GetResource(barrier.resource.ptr());
       if (!resource) {
         WARN("D3D12CommandQueue: UAV barrier skipped for foreign resource");
-        EmitPassSeparator(chunk);
+        batch.needs_separator = true;
         return;
       }
-      EmitResourceAccessBarrier(chunk, *resource, 0,
-                                GetSubresourceCount(*resource),
-                                ResourceAccess::All);
+      AddResourceAccessBarrier(batch, *resource, 0,
+                               GetSubresourceCount(*resource),
+                               ResourceAccess::All);
       return;
     }
 
-    EmitPassSeparator(chunk);
+    batch.needs_separator = true;
   }
 
-  void ReplayAliasingBarrier(CommandChunk *chunk, ReplayState &state,
-                             const StoredResourceBarrier &barrier) {
+  void ReplayAliasingBarrier(ReplayState &state,
+                             const StoredResourceBarrier &barrier,
+                             ResourceAccessBarrierBatch &batch) {
     bool touched = false;
     if (auto *before = GetResource(barrier.resource_before.ptr())) {
-      EmitResourceAccessBarrier(chunk, *before, 0,
-                                GetSubresourceCount(*before),
-                                ResourceAccess::All);
+      AddResourceAccessBarrier(batch, *before, 0,
+                               GetSubresourceCount(*before),
+                               ResourceAccess::All);
       touched = true;
     } else if (barrier.resource_before) {
       WARN("D3D12CommandQueue: aliasing barrier has foreign before resource");
@@ -5014,34 +5601,30 @@ private:
     if (auto *after = GetResource(barrier.resource_after.ptr())) {
       ResetReplayResourceStatesForAliasing(state, *after);
       TouchReplayResource(state, after->GetD3D12Resource());
-      EmitResourceAccessBarrier(chunk, *after, 0, GetSubresourceCount(*after),
-                                ResourceAccess::All);
+      AddResourceAccessBarrier(batch, *after, 0, GetSubresourceCount(*after),
+                               ResourceAccess::All);
       touched = true;
     } else if (barrier.resource_after) {
       WARN("D3D12CommandQueue: aliasing barrier has foreign after resource");
     }
 
     if (!touched)
-      EmitPassSeparator(chunk);
+      batch.needs_separator = true;
   }
 
-  void EmitResourceAccessBarrier(CommandChunk *chunk, Resource &resource,
-                                 UINT first_subresource,
-                                 UINT subresource_count, int access) {
+  void AddResourceAccessBarrier(ResourceAccessBarrierBatch &batch,
+                                Resource &resource, UINT first_subresource,
+                                UINT subresource_count, int access) {
     if (resource.GetBuffer()) {
       Rc<Buffer> buffer = resource.GetBuffer();
       const UINT length =
           UINT(std::min<UINT64>(resource.GetResourceDesc().Width, UINT_MAX));
-      chunk->emitcc([buffer = std::move(buffer), length, access](ArgumentEncodingContext &enc) {
-        enc.startBlitPass();
-        enc.access(buffer, 0, length, access);
-        enc.endPass();
-      });
+      batch.entries.push_back({std::move(buffer), {}, length, 0, 0, access});
       return;
     }
 
     if (resource.GetTexture()) {
-      bool emitted = false;
+      bool added = false;
       for (UINT i = 0; i < subresource_count; i++) {
         const UINT subresource = first_subresource + i;
         const UINT plane = GetSubresourcePlane(resource, subresource);
@@ -5050,20 +5633,36 @@ private:
           continue;
         const UINT level = GetMipLevel(resource, subresource);
         const UINT slice = GetArraySlice(resource, subresource);
-        emitted = true;
-        chunk->emitcc([texture = std::move(texture), level, slice,
-                       access](ArgumentEncodingContext &enc) {
-          enc.startBlitPass();
-          enc.access(texture, level, slice, access);
-          enc.endPass();
-        });
+        batch.entries.push_back({{}, std::move(texture), 0, level, slice, access});
+        added = true;
       }
-      if (!emitted)
+      if (subresource_count && !added)
+        batch.needs_separator = true;
+      return;
+    }
+
+    batch.needs_separator = true;
+  }
+
+  void EmitResourceAccessBarrierBatch(CommandChunk *chunk,
+                                      ResourceAccessBarrierBatch batch) {
+    if (batch.entries.empty()) {
+      if (batch.needs_separator)
         EmitPassSeparator(chunk);
       return;
     }
 
-    EmitPassSeparator(chunk);
+    chunk->emitcc([entries = std::move(batch.entries)](ArgumentEncodingContext &enc) mutable {
+      enc.startBlitPass();
+      for (auto &entry : entries) {
+        if (entry.buffer) {
+          enc.access(entry.buffer, 0, entry.buffer_length, entry.access);
+        } else if (entry.texture) {
+          enc.access(entry.texture, entry.level, entry.slice, entry.access);
+        }
+      }
+      enc.endPass();
+    });
   }
 
   void EmitPassSeparator(CommandChunk *chunk) {
@@ -5109,10 +5708,13 @@ private:
     return pipeline && pipeline->GetType() == PipelineStateType::Compute;
   }
 
-  bool PredicationAllows(const ReplayState &state) const {
+  bool PredicationAllows(CommandChunk *&chunk, ReplayState &state) {
     if (!state.predication_buffer)
       return true;
 
+    MaterializeTimestampResolvesForCpuRead(
+        chunk, state, state.predication_buffer.ptr(),
+        state.predication_buffer_offset, sizeof(uint64_t));
     uint64_t value = 0;
     if (!ReadBufferBytes(state.predication_buffer.ptr(),
                          state.predication_buffer_offset, &value,
@@ -5152,7 +5754,8 @@ private:
       return;
   }
 
-  void ReplayEndQuery(CommandChunk *chunk, const EndQueryRecord &record) {
+  void ReplayEndQuery(CommandChunk *chunk, ReplayState &state,
+                      const EndQueryRecord &record) {
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: EndQuery skipped for foreign query heap");
@@ -5162,18 +5765,20 @@ private:
       auto query = heap->EndTimestamp(record.type, record.index);
       if (!query)
         return;
-      Com<ID3D12QueryHeap> heap_ref = record.heap;
-      const auto type = record.type;
-      const UINT index = record.index;
-      chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
-        enc.sampleTimestamp(std::move(query));
-      });
-      chunk->completion_callbacks.push_back(
-          [heap_ref = std::move(heap_ref), type, index]() mutable {
-            auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
-            if (heap)
-              heap->MarkTimestampReady(type, index);
-          });
+
+      if (!D3D12DeferredTimestampMarkersEnabled())
+        FlushPassBatches(chunk, state);
+
+      AllocateTimestampSample(query.ptr());
+      if (D3D12DeferredTimestampMarkersEnabled() &&
+          (HasPendingGraphicsPass(state) || HasPendingComputePass(state))) {
+        state.pending_timestamp_markers.push_back(PendingTimestampMarker{
+            record.heap, std::move(query), record.type, record.index});
+        return;
+      }
+      state.pending_timestamp_markers.push_back(PendingTimestampMarker{
+          record.heap, std::move(query), record.type, record.index});
+      EmitTimestampMarkers(chunk, state);
       return;
     }
     if (record.type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ||
@@ -5189,7 +5794,8 @@ private:
       return;
   }
 
-  void ReplayResolveQueryData(const ResolveQueryDataRecord &record) {
+  void ReplayResolveQueryData(CommandChunk *chunk, ReplayState &state,
+                              const ResolveQueryDataRecord &record) {
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: ResolveQueryData skipped for foreign query heap");
@@ -5197,9 +5803,12 @@ private:
     }
 
     static std::atomic<uint32_t> query_log_count = 0;
-    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+    const bool query_diag_enabled =
+        D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_QUERY") ||
+        D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+    if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
       const auto &desc = heap->GetDesc();
-      WARN("D3D12 queue diagnostic: ResolveQueryData enter"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData enter"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " heap=", reinterpret_cast<uintptr_t>(heap),
@@ -5215,8 +5824,8 @@ private:
     std::vector<uint8_t> sizing_data;
     if (!heap->Resolve(record.type, record.start_index, record.query_count,
                        sizing_data)) {
-      if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-        WARN("D3D12 queue diagnostic: ResolveQueryData sizing failed"
+      if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
+        WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData sizing failed"
              " queue=", reinterpret_cast<uintptr_t>(this),
              " queryType=", record.type,
              " start=", record.start_index,
@@ -5224,8 +5833,8 @@ private:
       }
       return;
     }
-    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: ResolveQueryData sizing ok"
+    if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData sizing ok"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " bytes=", sizing_data.size());
     }
@@ -5234,60 +5843,72 @@ private:
                              "query resolve"))
       return;
 
-    // Metal query results become CPU-visible after command-buffer completion.
-    // D3D12 ResolveQueryData is ordered in the command stream, so split here
-    // before writing the destination buffer and replaying later records.
-    auto &queue = device_->GetDXMTDevice().queue();
-    const auto seq = queue.CurrentSeqId();
-    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: ResolveQueryData commit before wait"
-           " queue=", reinterpret_cast<uintptr_t>(this),
-           " seq=", seq,
-           " coherent=", queue.CoherentSeqId());
-    }
-    queue.CommitCurrentChunk();
-    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: ResolveQueryData wait begin"
-           " queue=", reinterpret_cast<uintptr_t>(this),
-           " seq=", seq,
-           " coherent=", queue.CoherentSeqId());
-    }
-    queue.WaitCPUFence(seq);
-    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: ResolveQueryData wait end"
-           " queue=", reinterpret_cast<uintptr_t>(this),
-           " seq=", seq,
-           " coherent=", queue.CoherentSeqId());
-    }
+#if DXMT_DX12_METAL4
+    if (D3D12TimestampGpuResolveEnabled() &&
+        record.type == D3D12_QUERY_TYPE_TIMESTAMP &&
+        dst->GetBufferAllocation() &&
+        sizing_data.size() == UINT64(record.query_count) * sizeof(uint64_t)) {
+      bool current_samples = record.query_count != 0;
+      const auto current_sequence =
+          device_->GetDXMTDevice().queue().CurrentSeqId();
+      std::vector<uint64_t> sample_indices;
+      sample_indices.reserve(record.query_count);
+      UINT first_bad_index = 0;
+      uint64_t first_bad_sample = ~0ull;
+      uint64_t first_bad_sequence = ~0ull;
+      for (UINT i = 0; i < record.query_count; i++) {
+        const auto sample =
+            heap->TimestampSampleIndex(record.type, record.start_index + i);
+        const auto sequence =
+            heap->TimestampSampleSequence(record.type, record.start_index + i);
+        sample_indices.push_back(sample);
+        if (current_samples &&
+            (sample == ~0ull || sequence != current_sequence)) {
+          current_samples = false;
+          first_bad_index = record.start_index + i;
+          first_bad_sample = sample;
+          first_bad_sequence = sequence;
+        }
+      }
 
-    std::vector<uint8_t> data;
-    if (!heap->Resolve(record.type, record.start_index, record.query_count,
-                       data)) {
-      if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-        WARN("D3D12 queue diagnostic: ResolveQueryData final failed"
+      if (!current_samples) {
+        if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
+          WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData timestamp fallback"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " start=", record.start_index,
+               " count=", record.query_count,
+               " currentSeq=", current_sequence,
+               " badIndex=", first_bad_index,
+               " badSample=", first_bad_sample,
+               " badSeq=", first_bad_sequence);
+        }
+        goto resolve_cpu_fallback;
+      }
+
+      state.pending_timestamp_resolves.push_back(PendingTimestampResolve{
+          record.command_list, record.heap, record.dst_buffer,
+          std::move(sample_indices), record.start_index, record.query_count,
+          record.dst_buffer_offset,
+          static_cast<UINT64>(sizing_data.size())});
+      if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
+        WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData deferred timestamp"
              " queue=", reinterpret_cast<uintptr_t>(this),
-             " queryType=", record.type,
              " start=", record.start_index,
-             " count=", record.query_count);
+             " count=", record.query_count,
+             " bytes=", sizing_data.size());
       }
       return;
     }
-    if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
-                             "query resolve"))
-      return;
-    if (!data.empty())
-      dst->GetBufferAllocation()->updateContents(
-          dst->GetHeapOffset() + record.dst_buffer_offset, data.data(),
-          data.size());
-    dxmt::apitrace::record_resolve_query_data_result(
-        record.command_list.ptr(), record.heap.ptr(),
-        static_cast<uint32_t>(record.type), record.start_index,
-        record.query_count, record.dst_buffer.ptr(), record.dst_buffer_offset,
-        data.data(), data.size());
-    if (D3D12DiagShouldLog(query_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: ResolveQueryData leave"
+#endif
+
+resolve_cpu_fallback:
+    state.pending_cpu_query_resolves.push_back(record);
+    if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData deferred CPU fallback"
            " queue=", reinterpret_cast<uintptr_t>(this),
-           " bytes=", data.size());
+           " start=", record.start_index,
+           " count=", record.query_count,
+           " bytes=", sizing_data.size());
     }
   }
 
@@ -5300,7 +5921,7 @@ private:
 
   void ReplayExecuteIndirect(CommandChunk *chunk, ReplayState &state,
                              const ExecuteIndirectRecord &record) {
-    if (!PredicationAllows(state))
+    if (!PredicationAllows(chunk, state))
       return;
 
     auto *signature =
@@ -5320,6 +5941,12 @@ private:
     }
 
     const auto direct_operation = GetDirectIndirectOperation(arguments);
+    if (direct_operation == DirectIndirectOperation::Dispatch &&
+        ReplayExecuteIndirectDirect(chunk, state, record, desc, arguments[0],
+                                    direct_operation))
+      return;
+
+    FlushPassBatches(chunk, state);
     if (direct_operation != DirectIndirectOperation::None &&
         ReplayExecuteIndirectDirect(chunk, state, record, desc, arguments[0],
                                     direct_operation))
@@ -5370,9 +5997,11 @@ private:
     Rc<Buffer> arg_buffer = arg_resource->GetBuffer();
     const UINT64 arg_base_offset =
         arg_resource->GetHeapOffset() + record.arg_buffer_offset;
+    const UINT64 arg_heap_offset = arg_resource->GetHeapOffset();
 
     Rc<Buffer> count_buffer;
     UINT64 count_offset = 0;
+    UINT64 count_heap_offset = 0;
     WMT::Reference<WMT::Buffer> counted_args;
     if (record.count_buffer) {
       auto *count_resource = GetResource(record.count_buffer.ptr());
@@ -5381,6 +6010,7 @@ private:
         return true;
 
       count_buffer = count_resource->GetBuffer();
+      count_heap_offset = count_resource->GetHeapOffset();
       count_offset = count_resource->GetHeapOffset() + record.count_buffer_offset;
 
       WMTBufferInfo counted_info = {};
@@ -5393,6 +6023,25 @@ private:
         WARN("D3D12CommandQueue: ExecuteIndirect failed to allocate counted argument buffer");
         return true;
       }
+    }
+
+    static std::atomic<uint32_t> execute_indirect_log_count = 0;
+    if (D3D12DiagShouldLog(execute_indirect_log_count,
+                           D3D12DiagExecuteIndirectEnabled())) {
+      WARN_FILE_ONLY("D3D12 diagnostic: ExecuteIndirect direct"
+           " op=", static_cast<uint32_t>(operation),
+           " maxCount=", command_count,
+           " stride=", desc.ByteStride,
+           " argSize=", argument_size,
+           " hasCount=", record.count_buffer.ptr() != nullptr,
+           " argResource=", record.arg_buffer.ptr(),
+           " argHeapOffset=", arg_heap_offset,
+           " argD3DOffset=", record.arg_buffer_offset,
+           " argBaseOffset=", arg_base_offset,
+           " countResource=", record.count_buffer.ptr(),
+           " countHeapOffset=", count_heap_offset,
+           " countD3DOffset=", record.count_buffer_offset,
+           " countBaseOffset=", count_offset);
     }
 
     for (UINT command_index = 0; command_index < command_count;
@@ -5414,7 +6063,7 @@ private:
             counted_args, counted_offset, argument_size, command_index);
         break;
       case DirectIndirectOperation::Dispatch:
-        FlushGraphicsPassBatch(chunk, state);
+        FlushGraphicsBeforeCompute(chunk, state);
         ReplayDispatchIndirect(chunk, state, arg_buffer, arg_offset,
                                count_buffer, count_offset, counted_args,
                                counted_offset, argument_size, command_index);
@@ -5431,6 +6080,9 @@ private:
                                         const CommandSignature &signature) {
     UINT command_count = record.max_command_count;
     if (record.count_buffer) {
+      MaterializeTimestampResolvesForCpuRead(
+          chunk, state, record.count_buffer.ptr(), record.count_buffer_offset,
+          sizeof(UINT));
       UINT count = 0;
       if (!ReadBufferBytes(record.count_buffer.ptr(), record.count_buffer_offset,
                            &count, sizeof(count), "indirect count buffer")) {
@@ -5450,6 +6102,9 @@ private:
          command_index++) {
       const UINT64 command_offset =
           record.arg_buffer_offset + UINT64(command_index) * desc.ByteStride;
+      MaterializeTimestampResolvesForCpuRead(
+          chunk, state, record.arg_buffer.ptr(), command_offset,
+          command.size());
       if (!ReadBufferBytes(record.arg_buffer.ptr(), command_offset,
                            command.data(), command.size(),
                            "indirect argument buffer")) {
@@ -5638,7 +6293,7 @@ private:
       auto attachments = BuildRenderPassAttachments(state);
       if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
         return;
-      RecordGraphicsPipelineResourceAccess(state, *pipeline, nullptr);
+      RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
       const auto argument_buffer_size =
           EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
                                              metal->use_tessellation);
@@ -5779,7 +6434,7 @@ private:
       return;
     }
 
-    FlushGraphicsPassBatch(chunk, state);
+    FlushPassBatches(chunk, state);
     chunk->emitcc([this, attachments = std::move(attachments),
                    argument_buffer_size, arg_buffer, arg_offset, count_buffer,
                    count_offset, counted_args, counted_offset, argument_size,
@@ -5876,7 +6531,7 @@ private:
       auto scissors = state.scissors;
       if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
         return;
-      RecordGraphicsPipelineResourceAccess(state, *pipeline, index_resource);
+      RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
       const auto argument_buffer_size =
           EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
                                              metal->use_tessellation);
@@ -6028,7 +6683,7 @@ private:
       return;
     }
 
-    FlushGraphicsPassBatch(chunk, state);
+    FlushPassBatches(chunk, state);
     chunk->emitcc([this, attachments = std::move(attachments),
                    argument_buffer_size, arg_buffer, arg_offset, count_buffer,
                    count_offset, counted_args, counted_offset, argument_size,
@@ -6068,37 +6723,32 @@ private:
         return;
       }
 
-      RecordComputePipelineResourceAccess(state, *pipeline);
+      RecordComputePipelineResourceAccess(chunk, state, *pipeline);
       const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
-      chunk->emitcc([this, metal_pso = metal->pso,
-                   threadgroup_size = metal->threadgroup_size, pipeline,
-                   replay_state = state, argument_buffer_size, arg_buffer,
-                   arg_offset, count_buffer, count_offset, counted_args,
-                   counted_offset, argument_size,
-                   command_index](ArgumentEncodingContext &enc) {
-      const bool has_count = count_buffer.ptr();
-      if (has_count) {
-        PrepareCountedIndirectArguments(
-            enc, arg_buffer, arg_offset, count_buffer, count_offset,
-            counted_args, counted_offset, argument_size, command_index);
-      }
 
-      enc.startComputePass(argument_buffer_size);
+      auto encode_dispatch =
+          [this, metal_pso = metal->pso,
+           threadgroup_size = metal->threadgroup_size, pipeline,
+           replay_state = CloneReplayStateWithoutBatch(state),
+           argument_buffer_size, arg_buffer, arg_offset, count_buffer,
+           count_offset, counted_args, counted_offset, argument_size,
+           command_index](ArgumentEncodingContext &enc,
+                          uint64_t &argbuf_offset) mutable {
       auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
       set_pso.type = WMTComputeCommandSetPSO;
       set_pso.pso = metal_pso;
       set_pso.threadgroup_size = threadgroup_size;
 
-      uint64_t argbuf_offset = 0;
+      const uint64_t argbuf_base = argbuf_offset;
       EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
-      if (argbuf_offset > argument_buffer_size) {
+      if (argbuf_offset - argbuf_base > argument_buffer_size) {
         WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
-             argument_buffer_size, " actual=", argbuf_offset);
+             argument_buffer_size, " actual=", argbuf_offset - argbuf_base);
       }
 
       WMT::Buffer indirect_buffer = counted_args;
       UINT64 indirect_offset = counted_offset;
-      if (!has_count) {
+      if (!count_buffer.ptr()) {
         auto [arg_allocation, arg_sub_offset] =
             enc.access<PipelineStage::Compute>(arg_buffer, arg_offset,
                                                argument_size,
@@ -6107,11 +6757,50 @@ private:
         indirect_offset = arg_sub_offset + arg_offset;
       }
 
+      static std::atomic<uint32_t> dispatch_indirect_log_count = 0;
+      if (D3D12DiagShouldLog(dispatch_indirect_log_count,
+                             D3D12DiagExecuteIndirectEnabled())) {
+        WARN_FILE_ONLY("D3D12 diagnostic: DispatchIndirect encode"
+             " commandIndex=", command_index,
+             " hasCount=", count_buffer.ptr() != nullptr,
+             " argOffset=", arg_offset,
+             " argumentSize=", argument_size,
+             " countedOffset=", counted_offset,
+             " indirectBuffer=0x", std::hex,
+             static_cast<obj_handle_t>(indirect_buffer),
+             " indirectOffset=0x", indirect_offset,
+             " metalPso=0x", static_cast<obj_handle_t>(metal_pso),
+             std::dec,
+             " threadgroup=", threadgroup_size.width, "x",
+             threadgroup_size.height, "x", threadgroup_size.depth);
+      }
+
       auto &dispatch =
           enc.encodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
       dispatch.type = WMTComputeCommandDispatchIndirect;
       dispatch.indirect_args_buffer = indirect_buffer;
       dispatch.indirect_args_offset = indirect_offset;
+    };
+
+    const bool has_count = count_buffer.ptr();
+    if (!has_count) {
+      QueueComputePassCommand(chunk, state, argument_buffer_size,
+                              std::move(encode_dispatch));
+      return;
+    }
+
+    FlushPassBatches(chunk, state);
+    chunk->emitcc([this, argument_buffer_size, arg_buffer, arg_offset,
+                   count_buffer, count_offset, counted_args, counted_offset,
+                   argument_size, command_index,
+                   encode = std::move(encode_dispatch)](
+                      ArgumentEncodingContext &enc) mutable {
+      PrepareCountedIndirectArguments(
+          enc, arg_buffer, arg_offset, count_buffer, count_offset,
+          counted_args, counted_offset, argument_size, command_index);
+      enc.startComputePass(argument_buffer_size);
+      uint64_t argbuf_offset = 0;
+      encode(enc, argbuf_offset);
       enc.endPass();
     });
   }
@@ -6473,6 +7162,21 @@ private:
     }
   }
 
+  void ClearDescriptorBinding(ArgumentEncodingContext &enc, PipelineStage stage,
+                              D3D12_DESCRIPTOR_RANGE_TYPE range_type,
+                              UINT slot) {
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+      ClearShaderResourceBinding(enc, stage, slot);
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+      ClearUnorderedAccessBinding(enc, stage, slot);
+      break;
+    default:
+      break;
+    }
+  }
+
   static const char *
   DescriptorRangeTypeName(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
     switch (range_type) {
@@ -6495,7 +7199,7 @@ private:
                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   }
 
-  void RecordDescriptorResourceAccess(ReplayState &state, PipelineStage stage,
+  void RecordDescriptorResourceAccess(CommandChunk *chunk, ReplayState &state, PipelineStage stage,
                                       D3D12_DESCRIPTOR_RANGE_TYPE range_type,
                                       const DescriptorRecord &descriptor,
                                       const char *context) {
@@ -6526,24 +7230,24 @@ private:
         resource = GetResource(descriptor.resource.ptr());
       if (resource)
         RecordReplayResourceAccess(
-            state, resource->GetD3D12Resource(),
+            chunk, state, resource->GetD3D12Resource(),
             D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, context);
       break;
       }
       case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
         if (auto *resource = GetResource(descriptor.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
-              state, *resource, ShaderReadStateForStage(stage), descriptor,
+              chunk, state, *resource, ShaderReadStateForStage(stage), descriptor,
               context, GetShaderResourceSubresourceRanges);
         }
         break;
       case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
         if (auto *resource = GetResource(descriptor.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
-              state, *resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              chunk, state, *resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
               descriptor, context, GetUnorderedAccessSubresourceRanges);
         }
-        RecordReplayResourceAccess(state, descriptor.counter_resource.ptr(),
+        RecordReplayResourceAccess(chunk, state, descriptor.counter_resource.ptr(),
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                    "UAV counter");
       break;
@@ -6553,7 +7257,7 @@ private:
   }
 
   void RecordRootBufferDescriptorAccess(
-      ReplayState &state, PipelineStage stage, bool compute, UINT root_index,
+      CommandChunk *chunk, ReplayState &state, PipelineStage stage, bool compute, UINT root_index,
       const RootSignatureParameter &parameter, DescriptorRecordType type) {
     const auto &map =
         type == DescriptorRecordType::ConstantBufferView
@@ -6586,11 +7290,11 @@ private:
     }
 
     (void)parameter;
-    RecordReplayResourceAccess(state, resource->GetD3D12Resource(), desired,
+    RecordReplayResourceAccess(chunk, state, resource->GetD3D12Resource(), desired,
                                context);
   }
 
-  void RecordPipelineDescriptorAccess(ReplayState &state,
+  void RecordPipelineDescriptorAccess(CommandChunk *chunk, ReplayState &state,
                                       PipelineState &pipeline,
                                       bool compute) {
     auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
@@ -6664,7 +7368,7 @@ private:
                     if (!descriptor)
                       continue;
                     RecordDescriptorResourceAccess(
-                        state, stage, range.range_type, *descriptor,
+                        chunk, state, stage, range.range_type, *descriptor,
                         DescriptorRangeTypeName(range.range_type));
                   }
                 }
@@ -6676,21 +7380,21 @@ private:
         ForEachVisibleStage(parameter.visibility, compute,
                             [&](PipelineStage stage) {
                               RecordRootBufferDescriptorAccess(
-                                  state, stage, compute, root_index, parameter,
+                                  chunk, state, stage, compute, root_index, parameter,
                                   DescriptorRecordType::ConstantBufferView);
                             });
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
         ForEachVisibleStage(parameter.visibility, compute,
                             [&](PipelineStage stage) {
                               RecordRootBufferDescriptorAccess(
-                                  state, stage, compute, root_index, parameter,
+                                  chunk, state, stage, compute, root_index, parameter,
                                   DescriptorRecordType::ShaderResourceView);
                             });
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
         ForEachVisibleStage(parameter.visibility, compute,
                             [&](PipelineStage stage) {
                               RecordRootBufferDescriptorAccess(
-                                  state, stage, compute, root_index, parameter,
+                                  chunk, state, stage, compute, root_index, parameter,
                                   DescriptorRecordType::UnorderedAccessView);
                             });
       }
@@ -6729,6 +7433,36 @@ private:
          " space=", register_space,
          " size=", uint64_t(size),
          " address=", uint64_t(address));
+  }
+
+  void ClearShaderResourceBinding(ArgumentEncodingContext &enc,
+                                  PipelineStage stage, UINT slot) {
+    if (slot >= kSRVBindings)
+      return;
+
+    if (stage == PipelineStage::Compute)
+      enc.bindBuffer<PipelineStage::Compute>(slot, {}, 0, {});
+    else if (stage == PipelineStage::Pixel)
+      enc.bindBuffer<PipelineStage::Pixel>(slot, {}, 0, {});
+    else if (stage == PipelineStage::Geometry)
+      enc.bindBuffer<PipelineStage::Geometry>(slot, {}, 0, {});
+    else if (stage == PipelineStage::Hull)
+      enc.bindBuffer<PipelineStage::Hull>(slot, {}, 0, {});
+    else if (stage == PipelineStage::Domain)
+      enc.bindBuffer<PipelineStage::Domain>(slot, {}, 0, {});
+    else
+      enc.bindBuffer<PipelineStage::Vertex>(slot, {}, 0, {});
+  }
+
+  void ClearUnorderedAccessBinding(ArgumentEncodingContext &enc,
+                                   PipelineStage stage, UINT slot) {
+    if (slot >= kUAVBindings)
+      return;
+
+    if (stage == PipelineStage::Compute)
+      enc.bindOutputBuffer<PipelineStage::Compute>(slot, {}, 0, {}, {});
+    else if (stage == PipelineStage::Pixel)
+      enc.bindOutputBuffer<PipelineStage::Pixel>(slot, {}, 0, {}, {});
   }
 
   void BindConstantBufferDescriptor(ArgumentEncodingContext &enc,
@@ -6794,8 +7528,10 @@ private:
                                     PipelineStage stage, UINT slot,
                                     const DescriptorRecord &descriptor,
                                     const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
-    if (descriptor.type != DescriptorRecordType::ShaderResourceView)
+    if (descriptor.type != DescriptorRecordType::ShaderResourceView) {
+      ClearShaderResourceBinding(enc, stage, slot);
       return;
+    }
     if (slot >= kSRVBindings) {
       WARN("D3D12CommandQueue: SRV slot t", slot, " is unsupported for ",
            PipelineStageName(stage), " stage");
@@ -6803,8 +7539,10 @@ private:
     }
 
     auto *resource = GetResource(descriptor.resource.ptr());
-    if (!resource)
+    if (!resource) {
+      ClearShaderResourceBinding(enc, stage, slot);
       return;
+    }
 
     if (resource->GetBuffer()) {
       UINT64 offset = 0;
@@ -6813,12 +7551,12 @@ private:
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
       bool has_buffer_view = false;
+      const bool needs_texture_buffer_view =
+          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
       BufferSlice slice = DefaultBufferSlice(*resource);
       if (descriptor.has_desc) {
         const auto &srv = descriptor.desc.srv;
         if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-          const bool needs_texture_buffer_view =
-              argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
           const UINT64 first_element = srv.Buffer.FirstElement;
           if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
             offset += first_element * sizeof(uint32_t);
@@ -6829,14 +7567,16 @@ private:
                                            byte_size,
                                            WMTTextureUsageShaderRead);
               if (view) {
-                view_id = *view;
+                view_id = view->key;
                 has_buffer_view = true;
                 slice = TextureBufferSlice(*resource, offset, byte_size,
                                            sizeof(uint32_t));
+                slice.firstElement += view->firstElementBias;
               } else {
                 WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
                                                  sizeof(uint32_t), offset,
                                                  byte_size);
+                ClearShaderResourceBinding(enc, stage, slot);
                 return;
               }
             }
@@ -6855,10 +7595,11 @@ private:
                                              srv.Format, offset, byte_size,
                                              WMTTextureUsageShaderRead);
                 if (view) {
-                  view_id = *view;
+                  view_id = view->key;
                   has_buffer_view = true;
                   slice = TextureBufferSlice(*resource, offset, byte_size,
                                              format.BytesPerTexel);
+                  slice.firstElement += view->firstElementBias;
                 } else {
                   // TODO(d3d12): typed buffer SRV shaders that reflect as
                   // texture arguments need a real typed Metal texture-buffer
@@ -6867,6 +7608,7 @@ private:
                   WarnTextureBufferViewUnavailable("SRV", srv.Format,
                                                    format.BytesPerTexel,
                                                    offset, byte_size);
+                  ClearShaderResourceBinding(enc, stage, slot);
                   return;
                 }
               }
@@ -6890,15 +7632,17 @@ private:
                                              view_format, offset, byte_size,
                                              WMTTextureUsageShaderRead);
                 if (view) {
-                  view_id = *view;
+                  view_id = view->key;
                   has_buffer_view = true;
                   slice = TextureBufferSlice(
                       *resource, offset, byte_size,
                       srv.Buffer.StructureByteStride);
+                  slice.firstElement += view->firstElementBias;
                 } else {
                   WarnTextureBufferViewUnavailable(
                       "SRV", view_format, srv.Buffer.StructureByteStride,
                       offset, byte_size);
+                  ClearShaderResourceBinding(enc, stage, slot);
                   return;
                 }
               } else {
@@ -6908,6 +7652,7 @@ private:
                 WarnTextureBufferViewUnavailable(
                     "SRV", view_format, srv.Buffer.StructureByteStride,
                     offset, byte_size);
+                ClearShaderResourceBinding(enc, stage, slot);
                 return;
               }
             }
@@ -6917,11 +7662,48 @@ private:
           } else {
             offset += first_element;
             byte_size = srv.Buffer.NumElements;
-            slice = DefaultBufferSlice(*resource, offset, byte_size);
+            if (needs_texture_buffer_view) {
+              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           DXGI_FORMAT_R32_UINT, offset,
+                                           byte_size,
+                                           WMTTextureUsageShaderRead);
+              if (view) {
+                view_id = view->key;
+                has_buffer_view = true;
+                slice = TextureBufferSlice(*resource, offset, byte_size,
+                                           sizeof(uint32_t));
+                slice.firstElement += view->firstElementBias;
+              } else {
+                WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
+                                                 sizeof(uint32_t), offset,
+                                                 byte_size);
+                ClearShaderResourceBinding(enc, stage, slot);
+                return;
+              }
+            }
+            if (!has_buffer_view)
+              slice = DefaultBufferSlice(*resource, offset, byte_size);
           }
         } else {
           WARN("D3D12CommandQueue: buffer SRV has unsupported view dimension ",
                uint32_t(srv.ViewDimension));
+          ClearShaderResourceBinding(enc, stage, slot);
+          return;
+        }
+      } else if (needs_texture_buffer_view) {
+        auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                     DXGI_FORMAT_R32_UINT, offset, byte_size,
+                                     WMTTextureUsageShaderRead);
+        if (view) {
+          view_id = view->key;
+          has_buffer_view = true;
+          slice = TextureBufferSlice(*resource, offset, byte_size,
+                                     sizeof(uint32_t));
+          slice.firstElement += view->firstElementBias;
+        } else {
+          WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
+                                           sizeof(uint32_t), offset, byte_size);
+          ClearShaderResourceBinding(enc, stage, slot);
           return;
         }
       }
@@ -6951,13 +7733,16 @@ private:
       if (descriptor.has_desc &&
           descriptor.desc.srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         WARN("D3D12CommandQueue: texture SRV cannot use BUFFER view dimension");
+        ClearShaderResourceBinding(enc, stage, slot);
         return;
       }
       const auto view =
           CreateShaderResourceTextureView(device_->GetMTLDevice(), *resource,
                                           descriptor);
-      if (!view)
+      if (!view) {
+        ClearShaderResourceBinding(enc, stage, slot);
         return;
+      }
       auto texture = std::move(view.texture);
       if (stage == PipelineStage::Compute)
         enc.bindTexture<PipelineStage::Compute>(slot, std::move(texture),
@@ -6984,8 +7769,10 @@ private:
                                      PipelineStage stage, UINT slot,
                                      const DescriptorRecord &descriptor,
                                      const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
-    if (descriptor.type != DescriptorRecordType::UnorderedAccessView)
+    if (descriptor.type != DescriptorRecordType::UnorderedAccessView) {
+      ClearUnorderedAccessBinding(enc, stage, slot);
       return;
+    }
     if (slot >= kUAVBindings) {
       WARN("D3D12CommandQueue: UAV slot u", slot, " is unsupported for ",
            PipelineStageName(stage), " stage");
@@ -6993,8 +7780,10 @@ private:
     }
 
     auto *resource = GetResource(descriptor.resource.ptr());
-    if (!resource)
+    if (!resource) {
+      ClearUnorderedAccessBinding(enc, stage, slot);
       return;
+    }
 
     Rc<Buffer> counter;
     if (auto *counter_resource = GetResource(descriptor.counter_resource.ptr())) {
@@ -7011,12 +7800,12 @@ private:
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
       bool has_buffer_view = false;
+      const bool needs_texture_buffer_view =
+          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
       BufferSlice slice = DefaultBufferSlice(*resource);
       if (descriptor.has_desc) {
         const auto &uav = descriptor.desc.uav;
         if (uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-          const bool needs_texture_buffer_view =
-              argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
           const UINT64 first_element = uav.Buffer.FirstElement;
           if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
             offset += first_element * sizeof(uint32_t);
@@ -7028,14 +7817,16 @@ private:
                                            WMTTextureUsageShaderRead |
                                                WMTTextureUsageShaderWrite);
               if (view) {
-                view_id = *view;
+                view_id = view->key;
                 has_buffer_view = true;
                 slice = TextureBufferSlice(*resource, offset, byte_size,
                                            sizeof(uint32_t));
+                slice.firstElement += view->firstElementBias;
               } else {
                 WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
                                                  sizeof(uint32_t), offset,
                                                  byte_size);
+                ClearUnorderedAccessBinding(enc, stage, slot);
                 return;
               }
             }
@@ -7055,10 +7846,11 @@ private:
                                              WMTTextureUsageShaderRead |
                                                  WMTTextureUsageShaderWrite);
                 if (view) {
-                  view_id = *view;
+                  view_id = view->key;
                   has_buffer_view = true;
                   slice = TextureBufferSlice(*resource, offset, byte_size,
                                              format.BytesPerTexel);
+                  slice.firstElement += view->firstElementBias;
                 } else {
                   // TODO(d3d12): typed buffer UAV shaders that reflect as
                   // texture arguments need a real typed Metal texture-buffer
@@ -7067,6 +7859,7 @@ private:
                   WarnTextureBufferViewUnavailable("UAV", uav.Format,
                                                    format.BytesPerTexel,
                                                    offset, byte_size);
+                  ClearUnorderedAccessBinding(enc, stage, slot);
                   return;
                 }
               }
@@ -7091,15 +7884,17 @@ private:
                                              WMTTextureUsageShaderRead |
                                                  WMTTextureUsageShaderWrite);
                 if (view) {
-                  view_id = *view;
+                  view_id = view->key;
                   has_buffer_view = true;
                   slice = TextureBufferSlice(
                       *resource, offset, byte_size,
                       uav.Buffer.StructureByteStride);
+                  slice.firstElement += view->firstElementBias;
                 } else {
                   WarnTextureBufferViewUnavailable(
                       "UAV", view_format, uav.Buffer.StructureByteStride,
                       offset, byte_size);
+                  ClearUnorderedAccessBinding(enc, stage, slot);
                   return;
                 }
               } else {
@@ -7109,6 +7904,7 @@ private:
                 WarnTextureBufferViewUnavailable(
                     "UAV", view_format, uav.Buffer.StructureByteStride,
                     offset, byte_size);
+                ClearUnorderedAccessBinding(enc, stage, slot);
                 return;
               }
             }
@@ -7118,11 +7914,50 @@ private:
           } else {
             offset += first_element;
             byte_size = uav.Buffer.NumElements;
-            slice = DefaultBufferSlice(*resource, offset, byte_size);
+            if (needs_texture_buffer_view) {
+              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           DXGI_FORMAT_R32_UINT, offset,
+                                           byte_size,
+                                           WMTTextureUsageShaderRead |
+                                               WMTTextureUsageShaderWrite);
+              if (view) {
+                view_id = view->key;
+                has_buffer_view = true;
+                slice = TextureBufferSlice(*resource, offset, byte_size,
+                                           sizeof(uint32_t));
+                slice.firstElement += view->firstElementBias;
+              } else {
+                WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
+                                                 sizeof(uint32_t), offset,
+                                                 byte_size);
+                ClearUnorderedAccessBinding(enc, stage, slot);
+                return;
+              }
+            }
+            if (!has_buffer_view)
+              slice = DefaultBufferSlice(*resource, offset, byte_size);
           }
         } else {
           WARN("D3D12CommandQueue: buffer UAV has unsupported view dimension ",
                uint32_t(uav.ViewDimension));
+          ClearUnorderedAccessBinding(enc, stage, slot);
+          return;
+        }
+      } else if (needs_texture_buffer_view) {
+        auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                     DXGI_FORMAT_R32_UINT, offset, byte_size,
+                                     WMTTextureUsageShaderRead |
+                                         WMTTextureUsageShaderWrite);
+        if (view) {
+          view_id = view->key;
+          has_buffer_view = true;
+          slice = TextureBufferSlice(*resource, offset, byte_size,
+                                     sizeof(uint32_t));
+          slice.firstElement += view->firstElementBias;
+        } else {
+          WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
+                                           sizeof(uint32_t), offset, byte_size);
+          ClearUnorderedAccessBinding(enc, stage, slot);
           return;
         }
       }
@@ -7143,14 +7978,17 @@ private:
       if (descriptor.has_desc &&
           descriptor.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         WARN("D3D12CommandQueue: texture UAV cannot use BUFFER view dimension");
+        ClearUnorderedAccessBinding(enc, stage, slot);
         return;
       }
       resource->SetPresentSourceView({});
       const auto view =
           CreateUnorderedAccessTextureView(device_->GetMTLDevice(), *resource,
                                            descriptor);
-      if (!view)
+      if (!view) {
+        ClearUnorderedAccessBinding(enc, stage, slot);
         return;
+      }
       auto texture = std::move(view.texture);
       if (stage == PipelineStage::Compute)
         enc.bindOutputTexture<PipelineStage::Compute>(slot,
@@ -7465,12 +8303,14 @@ private:
                         shader_register - range.base_shader_register;
                     if (descriptor_index >= count)
                       continue;
+                    const auto slot = argument.SM50BindingSlot + i;
                     const auto *descriptor = GetBoundDescriptorRecordInRange(
                         state, base, range_offset, descriptor_index, count,
                         DescriptorHeapTypeForRange(range.range_type));
-                    if (!descriptor)
+                    if (!descriptor) {
+                      ClearDescriptorBinding(enc, stage, range.range_type, slot);
                       continue;
-                    const auto slot = argument.SM50BindingSlot + i;
+                    }
                     DebugLogRootBinding(
                         DescriptorRangeTypeName(range.range_type), pipeline,
                         compute, stage, root_index, slot, shader_register,
@@ -8500,7 +9340,7 @@ private:
     }
     }
 
-  void RecordVertexBufferAccess(ReplayState &state,
+  void RecordVertexBufferAccess(CommandChunk *chunk, ReplayState &state,
                                 const PipelineGraphicsState *graphics_state) {
     if (!graphics_state)
       return;
@@ -8522,18 +9362,18 @@ private:
                               resource);
       if (resource) {
         RecordReplayResourceAccess(
-            state, resource->GetD3D12Resource(),
+            chunk, state, resource->GetD3D12Resource(),
             D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
             "vertex buffer");
       }
     }
   }
 
-    void RecordRenderAttachmentAccess(ReplayState &state) {
+    void RecordRenderAttachmentAccess(CommandChunk *chunk, ReplayState &state) {
       for (const auto &descriptor : state.render_targets) {
         if (auto *resource = GetResource(descriptor.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
-              state, *resource, D3D12_RESOURCE_STATE_RENDER_TARGET, descriptor,
+              chunk, state, *resource, D3D12_RESOURCE_STATE_RENDER_TARGET, descriptor,
               "render target", GetRenderTargetSubresourceRanges);
         }
       }
@@ -8551,34 +9391,34 @@ private:
     }
       if (auto *resource = GetResource(state.depth_stencil->resource.ptr())) {
         RecordDescriptorResourceAccessRanges(
-            state, *resource, desired, *state.depth_stencil, "depth stencil",
+              chunk, state, *resource, desired, *state.depth_stencil, "depth stencil",
             GetDepthStencilSubresourceRanges);
       }
     }
 
-  void RecordGraphicsPipelineResourceAccess(ReplayState &state,
+  void RecordGraphicsPipelineResourceAccess(CommandChunk *chunk, ReplayState &state,
                                             PipelineState &pipeline,
                                             Resource *index_resource) {
-    RecordRenderAttachmentAccess(state);
-    RecordPipelineDescriptorAccess(state, pipeline, false);
-    RecordVertexBufferAccess(state, pipeline.GetGraphicsState());
+    RecordRenderAttachmentAccess(chunk, state);
+    RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
+    RecordVertexBufferAccess(chunk, state, pipeline.GetGraphicsState());
     if (index_resource) {
-      RecordReplayResourceAccess(state, index_resource->GetD3D12Resource(),
+      RecordReplayResourceAccess(chunk, state, index_resource->GetD3D12Resource(),
                                  D3D12_RESOURCE_STATE_INDEX_BUFFER,
                                  "index buffer");
     }
     if (state.predication_buffer) {
-      RecordReplayResourceAccess(state, state.predication_buffer.ptr(),
+      RecordReplayResourceAccess(chunk, state, state.predication_buffer.ptr(),
                                  D3D12_RESOURCE_STATE_PREDICATION,
                                  "predication buffer");
     }
   }
 
-  void RecordComputePipelineResourceAccess(ReplayState &state,
+  void RecordComputePipelineResourceAccess(CommandChunk *chunk, ReplayState &state,
                                            PipelineState &pipeline) {
-    RecordPipelineDescriptorAccess(state, pipeline, true);
+    RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
     if (state.predication_buffer) {
-      RecordReplayResourceAccess(state, state.predication_buffer.ptr(),
+      RecordReplayResourceAccess(chunk, state, state.predication_buffer.ptr(),
                                  D3D12_RESOURCE_STATE_PREDICATION,
                                  "predication buffer");
     }
@@ -8631,7 +9471,7 @@ private:
                            const DrawInstancedRecord &record) {
     if (!record.vertex_count_per_instance || !record.instance_count)
       return;
-    if (!PredicationAllows(state))
+    if (!PredicationAllows(chunk, state))
       return;
 
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
@@ -8682,7 +9522,7 @@ private:
       auto attachments = BuildRenderPassAttachments(state);
       if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
         return;
-      RecordGraphicsPipelineResourceAccess(state, *pipeline, nullptr);
+      RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
       DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
                         viewports, scissors, &record, nullptr, 0, 0);
     DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
@@ -8845,7 +9685,7 @@ private:
       return;
     }
 
-    FlushGraphicsPassBatch(chunk, state);
+    FlushPassBatches(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
                            dxmt::apitrace::current_d3d_sequence(),
                            std::move(encode_draw), metal->use_geometry,
@@ -8857,7 +9697,7 @@ private:
     if (!record.index_count_per_instance || !record.instance_count ||
         !state.index_buffer)
       return;
-    if (!PredicationAllows(state))
+    if (!PredicationAllows(chunk, state))
       return;
 
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
@@ -8929,7 +9769,7 @@ private:
       auto scissors = state.scissors;
       if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
         return;
-      RecordGraphicsPipelineResourceAccess(state, *pipeline, index_resource);
+      RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
       DebugLogDrawState("indexed", state, *pipeline, *metal, attachments,
                         viewports, scissors, nullptr, &record,
                       index_resource_offset, index_offset);
@@ -9107,7 +9947,7 @@ private:
       return;
     }
 
-    FlushGraphicsPassBatch(chunk, state);
+    FlushPassBatches(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
                            dxmt::apitrace::current_d3d_sequence(),
                            std::move(encode_draw), metal->use_geometry,
@@ -9118,7 +9958,7 @@ private:
                       const DispatchRecord &record) {
     if (!record.x || !record.y || !record.z)
       return;
-    if (!PredicationAllows(state))
+    if (!PredicationAllows(chunk, state))
       return;
 
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
@@ -9133,34 +9973,35 @@ private:
       return;
     }
 
-      if (!ValidateComputeDispatch(metal->threadgroup_size, record.x, record.y,
-                                   record.z))
-        return;
+    if (!ValidateComputeDispatch(metal->threadgroup_size, record.x, record.y,
+                                 record.z))
+      return;
 
-      RecordComputePipelineResourceAccess(state, *pipeline);
-      const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
-    chunk->emitcc([this, metal_pso = metal->pso,
-                   threadgroup_size = metal->threadgroup_size,
-                   pipeline, replay_state = state,
-                   argument_buffer_size,
-                   x = record.x, y = record.y, z = record.z](ArgumentEncodingContext &enc) {
-      enc.startComputePass(argument_buffer_size);
+    RecordComputePipelineResourceAccess(chunk, state, *pipeline);
+    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
+    QueueComputePassCommand(
+        chunk, state, argument_buffer_size,
+        [this, metal_pso = metal->pso,
+         threadgroup_size = metal->threadgroup_size, pipeline,
+         replay_state = CloneReplayStateWithoutBatch(state),
+         argument_buffer_size, x = record.x, y = record.y,
+         z = record.z](ArgumentEncodingContext &enc,
+                       uint64_t &argbuf_offset) mutable {
       auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
       set_pso.type = WMTComputeCommandSetPSO;
       set_pso.pso = metal_pso;
       set_pso.threadgroup_size = threadgroup_size;
 
-      uint64_t argbuf_offset = 0;
+      const uint64_t argbuf_base = argbuf_offset;
       EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
-      if (argbuf_offset > argument_buffer_size) {
+      if (argbuf_offset - argbuf_base > argument_buffer_size) {
         WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
-             argument_buffer_size, " actual=", argbuf_offset);
+             argument_buffer_size, " actual=", argbuf_offset - argbuf_base);
       }
 
       auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
       dispatch.type = WMTComputeCommandDispatch;
       dispatch.size = {x, y, z};
-      enc.endPass();
     });
   }
 
@@ -9794,6 +10635,16 @@ private:
     UINT tile_index = 0;
     const WMTSize subresource_size =
         GetSubresourceSize(*tiled, record.start.Subresource, nullptr);
+    struct CopyTileOp {
+      UINT64 buffer_offset;
+      UINT level;
+      UINT slice;
+      WMTOrigin origin;
+      WMTSize size;
+      UINT row_pitch;
+      UINT image_pitch;
+    };
+    std::vector<CopyTileOp> ops;
     bool ok = ForEachTileInRegion(*tiling, record.start, &record.size,
                                   [&](UINT subresource, UINT x, UINT y, UINT z) {
       const auto &tile_subresource = tiling->subresources[subresource];
@@ -9841,49 +10692,8 @@ private:
       const UINT row_count =
           std::max<UINT>(1, (size.height + block_height - 1) / block_height);
       const UINT image_pitch = row_pitch * row_count;
-      chunk->emitcc([texture, buffer, buffer_offset, level, slice, origin, size,
-                     row_pitch, image_pitch, buffer_to_texture](
-                        ArgumentEncodingContext &enc) {
-        enc.startBlitPass();
-        if (buffer_to_texture) {
-          auto [src, src_offset] =
-              enc.access(buffer, buffer_offset,
-                         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
-                         ResourceAccess::Read);
-          auto dst = enc.access(texture, level, slice, ResourceAccess::Write);
-          auto &copy =
-              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
-          copy.type = WMTBlitCommandCopyFromBufferToTexture;
-          copy.src = src->buffer();
-          copy.src_offset = src_offset + buffer_offset;
-          copy.bytes_per_row = row_pitch;
-          copy.bytes_per_image = image_pitch;
-          copy.size = size;
-          copy.dst = dst;
-          copy.slice = slice;
-          copy.level = level;
-          copy.origin = origin;
-        } else {
-          auto src = enc.access(texture, level, slice, ResourceAccess::Read);
-          auto [dst, dst_offset] =
-              enc.access(buffer, buffer_offset,
-                         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
-                         ResourceAccess::Write);
-          auto &copy =
-              enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
-          copy.type = WMTBlitCommandCopyFromTextureToBuffer;
-          copy.src = src;
-          copy.slice = slice;
-          copy.level = level;
-          copy.origin = origin;
-          copy.size = size;
-          copy.dst = dst->buffer();
-          copy.offset = dst_offset + buffer_offset;
-          copy.bytes_per_row = row_pitch;
-          copy.bytes_per_image = image_pitch;
-        }
-        enc.endPass();
-      });
+      ops.push_back({buffer_offset, level, slice, origin, size, row_pitch,
+                     image_pitch});
       return true;
     });
     if (!ok) {
@@ -9893,7 +10703,58 @@ private:
            " x=", record.start.X,
            " y=", record.start.Y,
            " z=", record.start.Z);
+      return;
     }
+    if (ops.empty())
+      return;
+
+    chunk->emitcc([texture = std::move(texture), buffer = std::move(buffer),
+                   ops = std::move(ops), buffer_to_texture](
+                      ArgumentEncodingContext &enc) mutable {
+      enc.startBlitPass();
+      for (const auto &op : ops) {
+        if (buffer_to_texture) {
+          auto [src, src_offset] =
+              enc.access(buffer, op.buffer_offset,
+                         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
+                         ResourceAccess::Read);
+          auto dst =
+              enc.access(texture, op.level, op.slice, ResourceAccess::Write);
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          copy.type = WMTBlitCommandCopyFromBufferToTexture;
+          copy.src = src->buffer();
+          copy.src_offset = src_offset + op.buffer_offset;
+          copy.bytes_per_row = op.row_pitch;
+          copy.bytes_per_image = op.image_pitch;
+          copy.size = op.size;
+          copy.dst = dst;
+          copy.slice = op.slice;
+          copy.level = op.level;
+          copy.origin = op.origin;
+        } else {
+          auto src =
+              enc.access(texture, op.level, op.slice, ResourceAccess::Read);
+          auto [dst, dst_offset] =
+              enc.access(buffer, op.buffer_offset,
+                         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
+                         ResourceAccess::Write);
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+          copy.src = src;
+          copy.slice = op.slice;
+          copy.level = op.level;
+          copy.origin = op.origin;
+          copy.size = op.size;
+          copy.dst = dst->buffer();
+          copy.offset = dst_offset + op.buffer_offset;
+          copy.bytes_per_row = op.row_pitch;
+          copy.bytes_per_image = op.image_pitch;
+        }
+      }
+      enc.endPass();
+    });
   }
 
   void ReplayClearRenderTarget(CommandChunk *chunk,
@@ -9954,6 +10815,7 @@ private:
       UINT64 offset = 0;
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
+      UINT view_first_element_bias = 0;
       bool has_buffer_view = false;
       bool raw_buffer = false;
 
@@ -9978,7 +10840,8 @@ private:
                                          WMTTextureUsageShaderRead |
                                              WMTTextureUsageShaderWrite);
             if (view) {
-              view_id = *view;
+              view_id = view->key;
+              view_first_element_bias = view->firstElementBias;
               has_buffer_view = true;
             }
           }
@@ -9994,7 +10857,8 @@ private:
                                          WMTTextureUsageShaderRead |
                                              WMTTextureUsageShaderWrite);
             if (view) {
-              view_id = *view;
+              view_id = view->key;
+              view_first_element_bias = view->firstElementBias;
               has_buffer_view = true;
             }
           }
@@ -10015,7 +10879,8 @@ private:
           UINT(std::min<UINT64>(byte_size / sizeof(uint32_t), UINT_MAX));
       if (!element_count)
         return;
-      chunk->emitcc([buffer = std::move(buffer), view_id, raw_buffer,
+      chunk->emitcc([buffer = std::move(buffer), view_id,
+                     view_first_element_bias, raw_buffer,
                      integer = record.integer,
                      uint_values = record.uint_values,
                      float_values = record.float_values,
@@ -10039,7 +10904,7 @@ private:
             enc.clear_res_cmd.begin(uint_values, Rc<Buffer>(buffer), view_id);
           else
             enc.clear_res_cmd.begin(float_values, Rc<Buffer>(buffer), view_id);
-          enc.clear_res_cmd.clear(0, 0, element_count, 1);
+          enc.clear_res_cmd.clear(view_first_element_bias, 0, element_count, 1);
         }
         enc.clear_res_cmd.end();
       });
@@ -10193,7 +11058,7 @@ private:
             front.fence->GetCompletedValue() < front.value) {
           static std::atomic<uint32_t> log_count = 0;
           if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain blocked on wait"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain blocked on wait"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " fence=", reinterpret_cast<uintptr_t>(front.fence),
@@ -10248,7 +11113,7 @@ private:
       case PendingOperationType::Execute: {
         static std::atomic<uint32_t> log_count = 0;
         if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-          WARN("D3D12 queue diagnostic: drain execute"
+          WARN_FILE_ONLY("D3D12 queue diagnostic: drain execute"
                " queue=", reinterpret_cast<uintptr_t>(this),
                " queueType=", desc_.Type,
                " records=", operation.command_records.size(),
@@ -10260,7 +11125,7 @@ private:
         for (const auto &records : operation.command_records) {
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain replay list begin"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain replay list begin"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " listIndex=", command_list_index,
@@ -10269,7 +11134,7 @@ private:
           }
           ReplayCommandRecords(records, touched_resources);
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain replay list end"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain replay list end"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " listIndex=", command_list_index,
@@ -10282,7 +11147,7 @@ private:
         {
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain decay begin"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain decay begin"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " touchedResources=", touched_resources.size(),
@@ -10293,7 +11158,7 @@ private:
         {
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain decay end"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain decay end"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " touchedResources=", touched_resources.size(),
@@ -10309,20 +11174,34 @@ private:
               use.allocator->CompleteCommandListSubmission(use.serial);
           }
         });
+
+        std::vector<PendingOperation> coalesced_signals;
+        {
+          std::lock_guard lock(mutex_);
+          while (!pending_operations_.empty() &&
+                 pending_operations_.front().type == PendingOperationType::Signal) {
+            coalesced_signals.push_back(std::move(pending_operations_.front()));
+            pending_operations_.pop_front();
+          }
+        }
+        for (auto &signal : coalesced_signals)
+          EncodeFenceSignal(signal.fence, signal.value, "coalesced");
+
         {
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain commit begin"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain commit begin"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
-                 " submittedBatchesBefore=", submitted_batches_);
+                 " submittedBatchesBefore=", submitted_batches_,
+                 " coalescedSignals=", coalesced_signals.size());
           }
         }
         device_->GetDXMTDevice().queue().CommitCurrentChunk();
         {
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain commit end"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain commit end"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " submittedBatchesBefore=", submitted_batches_);
@@ -10331,31 +11210,47 @@ private:
         submitted_batches_++;
         static std::atomic<uint32_t> done_log_count = 0;
         if (D3D12DiagShouldLog(done_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-          WARN("D3D12 queue diagnostic: drain execute submitted"
+          WARN_FILE_ONLY("D3D12 queue diagnostic: drain execute submitted"
                " queue=", reinterpret_cast<uintptr_t>(this),
                " queueType=", desc_.Type,
                " submittedBatches=", submitted_batches_);
         }
         break;
       }
-      case PendingOperationType::Signal:
+      case PendingOperationType::Signal: {
+        std::vector<PendingOperation> signals;
+        signals.push_back(std::move(operation));
+        {
+          std::lock_guard lock(mutex_);
+          while (!pending_operations_.empty() &&
+                 pending_operations_.front().type == PendingOperationType::Signal) {
+            signals.push_back(std::move(pending_operations_.front()));
+            pending_operations_.pop_front();
+          }
+        }
         {
           static std::atomic<uint32_t> log_count = 0;
           if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain signal"
+            auto &first = signals.front();
+            auto &last = signals.back();
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain signal batch"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
-                 " fence=", reinterpret_cast<uintptr_t>(operation.fence),
-                 " value=", operation.value);
+                 " count=", signals.size(),
+                 " firstFence=", reinterpret_cast<uintptr_t>(first.fence),
+                 " firstValue=", first.value,
+                 " lastFence=", reinterpret_cast<uintptr_t>(last.fence),
+                 " lastValue=", last.value);
           }
         }
-        SubmitFenceSignal(operation.fence, operation.value);
+        SubmitFenceSignals(std::move(signals));
         break;
+      }
       case PendingOperationType::Wait:
         {
           static std::atomic<uint32_t> log_count = 0;
           if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-            WARN("D3D12 queue diagnostic: drain wait satisfied"
+            WARN_FILE_ONLY("D3D12 queue diagnostic: drain wait satisfied"
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " fence=", reinterpret_cast<uintptr_t>(operation.fence),
@@ -10367,31 +11262,49 @@ private:
     }
   }
 
-  void SubmitFenceSignal(Fence *state, UINT64 value) {
-    if (!state)
+  void SubmitFenceSignals(std::vector<PendingOperation> signals) {
+    if (signals.empty())
       return;
 
     if (!submitted_batches_ && !has_waited_) {
-      static std::atomic<uint32_t> log_count = 0;
-      if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-        WARN("D3D12 queue diagnostic: SubmitFenceSignal immediate"
-             " queue=", reinterpret_cast<uintptr_t>(this),
-             " queueType=", desc_.Type,
-             " fence=", reinterpret_cast<uintptr_t>(state),
-             " value=", value);
+      for (auto &signal : signals) {
+        if (!signal.fence)
+          continue;
+
+        static std::atomic<uint32_t> log_count = 0;
+        if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+          WARN_FILE_ONLY("D3D12 queue diagnostic: SubmitFenceSignal immediate"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " queueType=", desc_.Type,
+               " fence=", reinterpret_cast<uintptr_t>(signal.fence),
+               " value=", signal.value,
+               " batchSize=", signals.size());
+        }
+        signal.fence->SignalFromQueue(signal.value);
+        signal_count_++;
+        last_signal_value_ = signal.value;
       }
-      state->SignalFromQueue(value);
-      signal_count_++;
-      last_signal_value_ = value;
       return;
     }
 
+    for (auto &signal : signals) {
+      if (!signal.fence)
+        continue;
+
+      EncodeFenceSignal(signal.fence, signal.value,
+          signals.size() > 1 ? "batched" : "encoded");
+    }
+    auto &queue = device_->GetDXMTDevice().queue();
+    queue.CommitCurrentChunk();
+  }
+
+  void EncodeFenceSignal(Fence *state, UINT64 value, const char *mode) {
     auto event = state->GetSharedEvent();
     auto &queue = device_->GetDXMTDevice().queue();
     auto chunk = queue.CurrentChunk();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN("D3D12 queue diagnostic: SubmitFenceSignal encoded"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: SubmitFenceSignal ", mode,
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " fence=", reinterpret_cast<uintptr_t>(state),
@@ -10407,7 +11320,6 @@ private:
       state->SetCompletedValue(value);
       state->ReleasePrivate();
     });
-    queue.CommitCurrentChunk();
     signal_count_++;
     last_signal_value_ = value;
   }
@@ -10419,6 +11331,8 @@ private:
   UINT64 signal_count_ = 0;
   UINT64 last_signal_value_ = 0;
   bool has_waited_ = false;
+  uint64_t current_timestamp_sample_sequence_ = ~0ull;
+  uint64_t current_timestamp_sample_count_ = 0;
   std::vector<CachedTemporalScaler> temporal_scaler_cache_;
   std::shared_ptr<CommandQueueResourceStates> resource_states_;
   std::deque<PendingOperation> pending_operations_;

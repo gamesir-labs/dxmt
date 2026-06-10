@@ -12,6 +12,12 @@ namespace dxmt {
 
 std::atomic_uint64_t global_buffer_seq = {0};
 
+static bool
+ShouldLogBufferTextureViewFailure() {
+  static std::atomic<uint32_t> count = 0;
+  return count.fetch_add(1, std::memory_order_relaxed) < 32;
+}
+
 BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags) :
     info_(info),
     flags_(flags) {
@@ -132,7 +138,7 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     assert(!(allocation->suballocation_size_ & (texel_size - 1)));
     auto total_length = descriptor.byteLength ? descriptor.byteLength
                                               : allocation->suballocation_size_ * allocation->suballocation_count_;
-    WMTTextureInfo info;
+    WMTTextureInfo info = {};
     info.type = descriptor.type;
     info.width = total_length / (uint64_t)texel_size;
     info.height = 1;
@@ -155,6 +161,24 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     info.usage = usage;
 
     auto view = allocation->obj_.newTexture(info, descriptor.byteOffset, total_length);
+    if (!view && ShouldLogBufferTextureViewFailure()) {
+      WARN("DXMT: failed to create buffer texture view"
+           " version=", version,
+           " format=", uint32_t(format),
+           " type=", uint32_t(descriptor.type),
+           " usage=", uint32_t(usage),
+           " byteOffset=", descriptor.byteOffset,
+           " byteLength=", total_length,
+           " bytesPerRow=", total_length,
+           " width=", info.width,
+           " texelSize=", texel_size,
+           " alignment=",
+           device_.minimumLinearTextureAlignmentForPixelFormat(format),
+           " allocationLength=", allocation->info_.length,
+           " suballocationSize=", allocation->suballocation_size_,
+           " suballocationCount=", allocation->suballocation_count_,
+           " options=", uint32_t(allocation->info_.options));
+    }
 
     allocation->cached_view_.push_back(std::make_unique<BufferView>(
         std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size

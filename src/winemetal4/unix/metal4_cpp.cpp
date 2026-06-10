@@ -39,6 +39,18 @@ struct unixcall_mtl4counterheap_resolvecounterrange {
   uint64_t data_length;
 };
 
+struct unixcall_mtl4commandbuffer_resolvecounterheap {
+  obj_handle_t cmdbuf;
+  obj_handle_t heap;
+  uint64_t start;
+  uint64_t count;
+  obj_handle_t dst_buffer;
+  uint64_t dst_offset;
+  uint64_t dst_length;
+  obj_handle_t wait_fence;
+  obj_handle_t update_fence;
+};
+
 struct unixcall_mtl4timestampcontext_writetimestamp {
   obj_handle_t context;
   obj_handle_t mtl_command_buffer;
@@ -65,6 +77,7 @@ typedef int NTSTATUS;
 
 NTSTATUS _MTL4CounterHeap_newTimestampHeap(void *obj);
 NTSTATUS _MTL4CounterHeap_resolveCounterRange(void *obj);
+NTSTATUS _MTL4CommandBuffer_resolveCounterHeap(void *obj);
 NTSTATUS _MTL4TimestampContext_create(void *obj);
 NTSTATUS _MTL4TimestampContext_destroy(void *obj);
 NTSTATUS _MTL4TimestampContext_writeTimestamp(void *obj);
@@ -90,6 +103,11 @@ struct TimestampContext {
 
 extern "C" void
 DXMTMetal4CommandBuffer_writeTimestampIntoHeap(obj_handle_t cmdbuf, obj_handle_t heap, uint64_t index);
+extern "C" void
+DXMTMetal4CommandBuffer_resolveCounterHeap(
+    obj_handle_t cmdbuf, obj_handle_t heap, uint64_t start, uint64_t count,
+    obj_handle_t dst_buffer, uint64_t dst_offset, uint64_t dst_length,
+    obj_handle_t wait_fence, obj_handle_t update_fence);
 
 } // namespace
 
@@ -131,6 +149,21 @@ _MTL4CounterHeap_resolveCounterRange(void *obj) {
   if (copy_len && src)
     std::memcpy(dst, src, copy_len);
 
+  return STATUS_SUCCESS;
+}
+
+extern "C" NTSTATUS
+_MTL4CommandBuffer_resolveCounterHeap(void *obj) {
+  auto *params = static_cast<unixcall_mtl4commandbuffer_resolvecounterheap *>(obj);
+  auto *heap = fromHandle<MTL4::CounterHeap>(params->heap);
+
+  if (!params->cmdbuf || !heap || !params->count || !params->dst_buffer || !params->dst_length)
+    return STATUS_SUCCESS;
+
+  DXMTMetal4CommandBuffer_resolveCounterHeap(
+      params->cmdbuf, params->heap, params->start, params->count,
+      params->dst_buffer, params->dst_offset, params->dst_length,
+      params->wait_fence, params->update_fence);
   return STATUS_SUCCESS;
 }
 

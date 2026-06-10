@@ -121,6 +121,13 @@ D3D12FenceDiagShouldLog(std::atomic<uint32_t> &counter) {
          D3D12FenceDiagLogLimit();
 }
 
+using D3D12FenceDiagClock = std::chrono::high_resolution_clock;
+
+static double
+D3D12FenceDiagDurationMs(D3D12FenceDiagClock::duration duration) {
+  return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(duration).count();
+}
+
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
@@ -129,7 +136,7 @@ public:
     event_.signalValue(initial_value);
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: CreateFence"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: CreateFence"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " initial=", initial_value,
            " flags=", flags,
@@ -203,7 +210,7 @@ public:
     const UINT64 value = GetCompletedValueLocked();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: GetCompletedValue"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: GetCompletedValue"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value,
            " manual=", has_manual_completed_value_,
@@ -218,7 +225,7 @@ public:
     const UINT64 value = GetCompletedValueLocked();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: GetCompletedValue internal"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: GetCompletedValue internal"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value,
            " manual=", has_manual_completed_value_,
@@ -229,19 +236,30 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
+    const auto register_time = D3D12FenceDiagClock::now();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: SetEventOnCompletion enter"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: SetEventOnCompletion enter"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " target=", value,
            " event=", reinterpret_cast<uintptr_t>(event));
     }
     if (!event) {
+      const auto wait_begin_time = D3D12FenceDiagClock::now();
       while (true) {
         {
           std::lock_guard lock(mutex_);
-          if (GetCompletedValueLocked() >= value)
+          if (GetCompletedValueLocked() >= value) {
+            const auto wait_end_time = D3D12FenceDiagClock::now();
+            static std::atomic<uint32_t> wait_log_count = 0;
+            if (D3D12FenceDiagShouldLog(wait_log_count)) {
+              WARN_FILE_ONLY("D3D12 fence diagnostic: SetEventOnCompletion sync wait"
+                   " fence=", reinterpret_cast<uintptr_t>(this),
+                   " target=", value,
+                   " waitMs=", D3D12FenceDiagDurationMs(wait_end_time - wait_begin_time));
+            }
             return S_OK;
+          }
         }
         dxmt::this_thread::yield();
       }
@@ -253,7 +271,7 @@ public:
       if (GetCompletedValueLocked() >= value) {
         signal_now = true;
       } else {
-        pending_events_.push_back({value, event});
+        pending_events_.push_back({value, event, register_time});
       }
     }
 
@@ -262,10 +280,11 @@ public:
 
     static std::atomic<uint32_t> result_log_count = 0;
     if (D3D12FenceDiagShouldLog(result_log_count)) {
-      WARN("D3D12 fence diagnostic: SetEventOnCompletion result"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: SetEventOnCompletion result"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " target=", value,
-           " signalNow=", signal_now);
+           " signalNow=", signal_now,
+           " elapsedMs=", D3D12FenceDiagDurationMs(D3D12FenceDiagClock::now() - register_time));
     }
     return S_OK;
   }
@@ -273,7 +292,7 @@ public:
   HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: Signal CPU"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: Signal CPU"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value);
     }
@@ -305,7 +324,7 @@ public:
   void SetCompletedValue(UINT64 value) override {
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: SetCompletedValue queue-complete"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: SetCompletedValue queue-complete"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value);
     }
@@ -326,7 +345,7 @@ public:
   void SignalFromQueue(UINT64 value) override {
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: SignalFromQueue"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: SignalFromQueue"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value);
     }
@@ -334,9 +353,10 @@ public:
   }
 
   void AddCompletionCallback(UINT64 value, std::function<void()> callback) override {
+    const auto register_time = D3D12FenceDiagClock::now();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN("D3D12 fence diagnostic: AddCompletionCallback"
+      WARN_FILE_ONLY("D3D12 fence diagnostic: AddCompletionCallback"
            " fence=", reinterpret_cast<uintptr_t>(this),
            " target=", value);
     }
@@ -346,11 +366,18 @@ public:
       if (GetCompletedValueLocked() >= value) {
         run_now = true;
       } else {
-        pending_callbacks_.push_back({value, std::move(callback)});
+        pending_callbacks_.push_back({value, std::move(callback), register_time});
       }
     }
 
     if (run_now) {
+      static std::atomic<uint32_t> run_now_log_count = 0;
+      if (D3D12FenceDiagShouldLog(run_now_log_count)) {
+        WARN_FILE_ONLY("D3D12 fence diagnostic: AddCompletionCallback run-now"
+             " fence=", reinterpret_cast<uintptr_t>(this),
+             " target=", value,
+             " elapsedMs=", D3D12FenceDiagDurationMs(D3D12FenceDiagClock::now() - register_time));
+      }
       std::vector<std::function<void()>> callbacks;
       callbacks.push_back(std::move(callback));
       RunCompletionCallbacksAsync(std::move(callbacks));
@@ -366,11 +393,13 @@ private:
   struct PendingEvent {
     UINT64 value;
     HANDLE event;
+    D3D12FenceDiagClock::time_point registered_time;
   };
 
   struct PendingCallback {
     UINT64 value;
     std::function<void()> callback;
+    D3D12FenceDiagClock::time_point registered_time;
   };
 
   UINT64 GetCompletedValueLocked() const {
@@ -383,11 +412,20 @@ private:
       std::vector<HANDLE> &events,
       std::vector<std::function<void()>> &callbacks) {
     const UINT64 completed_value = GetCompletedValueLocked();
+    const auto completed_time = D3D12FenceDiagClock::now();
     auto it = std::remove_if(pending_events_.begin(), pending_events_.end(),
                              [&](const PendingEvent &pending) {
                                if (completed_value < pending.value)
                                  return false;
                                events.push_back(pending.event);
+                               static std::atomic<uint32_t> event_log_count = 0;
+                               if (D3D12FenceDiagShouldLog(event_log_count)) {
+                                 WARN_FILE_ONLY("D3D12 fence diagnostic: CompletePendingEvent"
+                                      " fence=", reinterpret_cast<uintptr_t>(this),
+                                      " target=", pending.value,
+                                      " completed=", completed_value,
+                                      " ageMs=", D3D12FenceDiagDurationMs(completed_time - pending.registered_time));
+                               }
                                return true;
                              });
     pending_events_.erase(it, pending_events_.end());
@@ -397,6 +435,14 @@ private:
           if (completed_value < pending.value)
             return false;
           callbacks.push_back(std::move(pending.callback));
+          static std::atomic<uint32_t> callback_log_count = 0;
+          if (D3D12FenceDiagShouldLog(callback_log_count)) {
+            WARN_FILE_ONLY("D3D12 fence diagnostic: CompletePendingCallback"
+                 " fence=", reinterpret_cast<uintptr_t>(this),
+                 " target=", pending.value,
+                 " completed=", completed_value,
+                 " ageMs=", D3D12FenceDiagDurationMs(completed_time - pending.registered_time));
+          }
           return true;
         });
     pending_callbacks_.erase(callback_it, pending_callbacks_.end());

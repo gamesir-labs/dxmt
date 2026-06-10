@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <chrono>
 #include <functional>
 #include <span>
 #include <vector>
@@ -94,6 +95,12 @@ public:
   uint64_t chunk_event_id;
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
+  clock::time_point publish_time;
+  clock::time_point encode_begin_time;
+  clock::time_point encode_end_time;
+  clock::time_point metal_commit_time;
+  clock::time_point finish_begin_time;
+  clock::time_point finish_complete_time;
   QueryReadbacks readback;
   std::vector<std::function<void()>> completion_callbacks;
   std::vector<std::function<void()>> deferred_readbacks;
@@ -114,6 +121,12 @@ public:
   void
   reset() {
     signal_frame_latency_fence_ = ~0ull;
+    publish_time = {};
+    encode_begin_time = {};
+    encode_end_time = {};
+    metal_commit_time = {};
+    finish_begin_time = {};
+    finish_complete_time = {};
     readback = {};
     for (auto &callback : completion_callbacks)
       callback();
@@ -174,7 +187,7 @@ private:
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator;
   RingBumpState<StagingBufferBlockAllocator, kCommandChunkGPUHeapSize> argbuf_allocator;
   RingBumpState<HostBufferBlockAllocator, kCommandChunkGPUHeapSize> argbuf_shadow_allocator;
-  RingBumpState<HostBufferBlockAllocator, kCommandChunkCPUHeapSize, dxmt::null_mutex> cpu_command_allocator;
+  RingBumpState<HostBufferBlockAllocator, kCommandChunkCPUHeapSize> cpu_command_allocator;
   RingBumpState<HostBufferBlockAllocator, 0x1000 /* 4kB */> reftracker_storage_allocator;
   CaptureState capture_state;
 
@@ -254,9 +267,7 @@ public:
   void SetMaxLatency(uint32_t value) { max_latency_ = value; };
 
   void
-  WaitCPUFence(uint64_t seq) {
-    cpu_coherent.wait(seq);
-  };
+  WaitCPUFence(uint64_t seq);
 
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {

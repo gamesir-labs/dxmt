@@ -41,6 +41,13 @@ DxmtQueueDiagDurationMs(clock::duration duration) {
 }
 
 static double
+DxmtQueueDiagElapsedMs(clock::time_point start, clock::time_point end) {
+  if (start == clock::time_point{} || end == clock::time_point{} || end < start)
+    return 0.0;
+  return DxmtQueueDiagDurationMs(end - start);
+}
+
+static double
 DxmtQueueDiagNsToMs(uint64_t ns) {
   return static_cast<double>(ns) / 1000000.0;
 }
@@ -157,11 +164,12 @@ CommandQueue::CommitCurrentChunk() {
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
   chunk.frame_ = frame_count;
+  chunk.publish_time = clock::now();
   chunk.resource_initializer_event_id = initializer.flushToWait();
   statistics.command_buffer_count++;
   static std::atomic<uint32_t> commit_log_count = 0;
   if (DxmtQueueDiagShouldLog(commit_log_count)) {
-    WARN("DXMT queue diagnostic: CommitCurrentChunk publish"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitCurrentChunk publish"
          " chunk=", chunk_id,
          " slot=", chunk_id % kCommandChunkCount,
          " frame=", chunk.frame_,
@@ -176,7 +184,7 @@ CommandQueue::CommitCurrentChunk() {
   ready_for_encode.fetch_add(1, std::memory_order_release);
   ready_for_encode.notify_one();
   if (DxmtQueueDiagShouldLog(commit_log_count)) {
-    WARN("DXMT queue diagnostic: CommitCurrentChunk notified"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitCurrentChunk notified"
          " chunk=", chunk_id,
          " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
          " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
@@ -189,22 +197,57 @@ CommandQueue::CommitCurrentChunk() {
   CommitChunkInternal(chunk);
 #endif
 
-  cpu_command_allocator.free_blocks(cpu_coherent.signaledValue());
 }
 
 void
 CommandQueue::PresentBoundary() {
+  const auto frame_begin_time = statistics.at(frame_count).begin_time;
   statistics.compute(frame_count);
+  const auto boundary_time = clock::now();
   if (DxmtQueueDiagEnabled()) {
     const auto &frame = statistics.at(frame_count);
     const auto &average = statistics.average();
-    WARN("DXMT queue diagnostic: FrameBoundary"
+    WARN_FILE_ONLY("DXMT queue diagnostic: FrameBoundary"
          " frame=", frame_count,
          " cmdbufs=", frame.command_buffer_count,
          " avgCmdbufs=", average.command_buffer_count,
          " renderPasses=", frame.render_pass_count,
+         " renderOpt=", frame.render_pass_optimized,
+         " renderCmd=", frame.render_command_count,
+         " renderDraw=", frame.render_draw_count,
+         " renderIndexed=", frame.render_indexed_draw_count,
+         " renderIndirect=", frame.render_indirect_draw_count,
+         " renderMesh=", frame.render_mesh_draw_count,
+         " renderTile=", frame.render_tile_dispatch_count,
+         " renderColorLoad=", frame.render_color_load_count,
+         " renderColorStore=", frame.render_color_store_count,
+         " renderDepthLoad=", frame.render_depth_load_count,
+         " renderDepthStore=", frame.render_depth_store_count,
+         " renderStencilLoad=", frame.render_stencil_load_count,
+         " renderStencilStore=", frame.render_stencil_store_count,
+         " renderAttachments=", frame.render_attachment_count,
+         " renderAttachmentReuse=", frame.render_attachment_reuse_count,
+         " renderAttachmentReload=", frame.render_attachment_reload_count,
+         " renderStoreThenLoad=", frame.render_attachment_store_then_load_count,
+         " switchR2C=", frame.encoder_switch_render_compute_count,
+         " switchC2R=", frame.encoder_switch_compute_render_count,
+         " switchOther=", frame.encoder_switch_to_other_count,
          " computePasses=", frame.compute_pass_count,
+         " computePassDispatch=", frame.compute_pass_with_dispatch_count,
+         " computePassNoDispatch=", frame.compute_pass_without_dispatch_count,
+         " computeCommands=", frame.compute_command_count,
+         " computeDispatch=", frame.compute_dispatch_count,
+         " computeDispatchIndirect=", frame.compute_dispatch_indirect_count,
+         " computeBarriers=", frame.compute_memory_barrier_count,
+         " computePSO=", frame.compute_pso_bind_count,
+         " computeSetBuf=", frame.compute_set_buffer_count,
+         " computeSetTex=", frame.compute_set_texture_count,
+         " computeSetBytes=", frame.compute_set_bytes_count,
+         " computeUseRes=", frame.compute_use_resource_count,
+         " computeWaitFence=", frame.compute_fence_wait_count,
+         " computeUpdateFence=", frame.compute_fence_update_count,
          " blitPasses=", frame.blit_pass_count,
+         " blitPassOptimized=", frame.blit_pass_optimized,
          " blitPassCmd=", frame.blit_pass_with_commands_count,
          " blitPassEmpty=", frame.blit_pass_empty_count,
          " blitPassWaitFence=", frame.blit_pass_with_fence_wait_count,
@@ -223,23 +266,77 @@ CommandQueue::PresentBoundary() {
          " blitResolveCounters=", frame.blit_resolve_counters_count,
          " presentPasses=", frame.present_pass_count,
          " clearPasses=", frame.clear_pass_count,
+         " flushChunks=", frame.flush_chunk_count,
+         " flushEmpty=", frame.flush_empty_chunk_count,
+         " flushEventOnly=", frame.flush_event_only_chunk_count,
+         " flushSignal=", frame.flush_signal_chunk_count,
+         " flushWait=", frame.flush_wait_chunk_count,
+         " flushPresent=", frame.flush_present_chunk_count,
+         " flushEncoders=", frame.flush_encoder_count,
+         " flushNull=", frame.flush_null_encoder_count,
+         " flushRender=", frame.flush_render_encoder_count,
+         " flushCompute=", frame.flush_compute_encoder_count,
+         " flushBlit=", frame.flush_blit_encoder_count,
+         " flushTimestamp=", frame.flush_timestamp_encoder_count,
+         " avgFlushChunks=", average.flush_chunk_count,
+         " avgRenderPasses=", average.render_pass_count,
+         " avgRenderColorLoad=", average.render_color_load_count,
+         " avgRenderColorStore=", average.render_color_store_count,
+         " avgRenderDepthLoad=", average.render_depth_load_count,
+         " avgRenderDepthStore=", average.render_depth_store_count,
+         " avgRenderAttachmentReload=", average.render_attachment_reload_count,
+         " avgRenderStoreThenLoad=", average.render_attachment_store_then_load_count,
+         " avgSwitchR2C=", average.encoder_switch_render_compute_count,
+         " avgSwitchC2R=", average.encoder_switch_compute_render_count,
+         " avgFlushTotalMs=", DxmtQueueDiagDurationMs(average.flush_total_interval),
+         " avgFlushRenderMs=", DxmtQueueDiagDurationMs(average.flush_render_interval),
+         " avgFlushComputeMs=", DxmtQueueDiagDurationMs(average.flush_compute_interval),
+         " avgFlushBlitMs=", DxmtQueueDiagDurationMs(average.flush_blit_interval),
+         " avgFlushEventMs=", DxmtQueueDiagDurationMs(average.flush_event_interval),
+         " avgFlushSampleMs=", DxmtQueueDiagDurationMs(average.flush_sample_interval),
+         " avgFlushSignalMs=", DxmtQueueDiagDurationMs(average.flush_signal_interval),
+         " avgFlushCleanupMs=", DxmtQueueDiagDurationMs(average.flush_cleanup_interval),
+         " maxFlushChunkMs=", DxmtQueueDiagDurationMs(frame.flush_max_chunk_interval),
          " avgCommitMs=", DxmtQueueDiagDurationMs(average.commit_interval),
          " avgEncodePrepareMs=", DxmtQueueDiagDurationMs(average.encode_prepare_interval),
          " avgEncodeFlushMs=", DxmtQueueDiagDurationMs(average.encode_flush_interval),
          " avgDrawableMs=", DxmtQueueDiagDurationMs(average.drawable_blocking_interval),
          " avgPresentLatencyMs=", DxmtQueueDiagDurationMs(average.present_latency_interval),
+         " frameWallMs=", DxmtQueueDiagElapsedMs(frame_begin_time, boundary_time),
          " latency=", frame.latency);
   }
   frame_count++;
   statistics.at(frame_count).reset();
+  statistics.at(frame_count).begin_time = clock::now();
   // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering
   if (likely(frame_count > max_latency_)) {
     auto t0 = clock::now();
     frame_latency_fence_.wait(frame_count - max_latency_);
     auto t1 = clock::now();
     statistics.at(frame_count).present_latency_interval += (t1 - t0);
+    if (DxmtQueueDiagEnabled()) {
+      WARN_FILE_ONLY("DXMT queue diagnostic: FrameLatencyWait"
+           " frame=", frame_count,
+           " target=", frame_count - max_latency_,
+           " signaled=", frame_latency_fence_.signaledValue(),
+           " waitMs=", DxmtQueueDiagDurationMs(t1 - t0),
+           " latency=", max_latency_);
+    }
   }
   statistics.at(frame_count).latency = max_latency_;
+}
+
+void
+CommandQueue::WaitCPUFence(uint64_t seq) {
+  const auto t0 = clock::now();
+  cpu_coherent.wait(seq);
+  const auto t1 = clock::now();
+  if (DxmtQueueDiagEnabled()) {
+    WARN_FILE_ONLY("DXMT queue diagnostic: WaitCPUFence"
+         " target=", seq,
+         " coherent=", cpu_coherent.signaledValue(),
+         " waitMs=", DxmtQueueDiagDurationMs(t1 - t0));
+  }
 }
 
 void
@@ -247,7 +344,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   auto pool = WMT::MakeAutoreleasePool();
   static std::atomic<uint32_t> internal_log_count = 0;
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
-    WARN("DXMT queue diagnostic: CommitChunkInternal begin"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal begin"
          " chunk=", chunk.chunk_id,
          " slot=", chunk.chunk_id % kCommandChunkCount,
          " frame=", chunk.frame_,
@@ -291,8 +388,9 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
 
   auto cmdbuf = commandQueue.commandBuffer();
   chunk.attached_cmdbuf = cmdbuf;
+  chunk.encode_begin_time = clock::now();
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
-    WARN("DXMT queue diagnostic: CommitChunkInternal commandBuffer"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal commandBuffer"
          " chunk=", chunk.chunk_id,
          " cmdbuf=", cmdbuf.handle,
          " status=", static_cast<uint32_t>(cmdbuf.status()));
@@ -308,8 +406,9 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
     cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
   }
   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
+  chunk.encode_end_time = clock::now();
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
-    WARN("DXMT queue diagnostic: CommitChunkInternal encoded"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal encoded"
          " chunk=", chunk.chunk_id,
          " cmdbuf=", cmdbuf.handle,
          " status=", static_cast<uint32_t>(cmdbuf.status()));
@@ -318,14 +417,15 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
     dxmt::apitrace::on_command_buffer_commit(cmdbuf.handle);
   }
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
-    WARN("DXMT queue diagnostic: CommitChunkInternal before metal commit"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal before metal commit"
          " chunk=", chunk.chunk_id,
          " cmdbuf=", cmdbuf.handle,
          " status=", static_cast<uint32_t>(cmdbuf.status()));
   }
   cmdbuf.commit();
+  chunk.metal_commit_time = clock::now();
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
-    WARN("DXMT queue diagnostic: CommitChunkInternal after metal commit"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal after metal commit"
          " chunk=", chunk.chunk_id,
          " cmdbuf=", cmdbuf.handle,
          " status=", static_cast<uint32_t>(cmdbuf.status()));
@@ -334,7 +434,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   ready_for_commit.fetch_add(1, std::memory_order_release);
   ready_for_commit.notify_one();
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
-    WARN("DXMT queue diagnostic: CommitChunkInternal notified finish"
+    WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal notified finish"
          " chunk=", chunk.chunk_id,
          " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
          " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
@@ -358,9 +458,10 @@ CommandQueue::EncodingThread() {
       break;
     // perform...
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
+    chunk.finish_begin_time = clock::now();
     static std::atomic<uint32_t> encode_log_count = 0;
     if (DxmtQueueDiagShouldLog(encode_log_count)) {
-      WARN("DXMT queue diagnostic: EncodingThread begin"
+      WARN_FILE_ONLY("DXMT queue diagnostic: EncodingThread begin"
            " seq=", internal_seq,
            " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
            " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
@@ -369,7 +470,7 @@ CommandQueue::EncodingThread() {
     }
     CommitChunkInternal(chunk);
     if (DxmtQueueDiagShouldLog(encode_log_count)) {
-      WARN("DXMT queue diagnostic: EncodingThread end"
+      WARN_FILE_ONLY("DXMT queue diagnostic: EncodingThread end"
            " seq=", internal_seq,
            " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
            " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
@@ -398,7 +499,7 @@ CommandQueue::WaitForFinishThread() {
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
     static std::atomic<uint32_t> finish_log_count = 0;
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
-      WARN("DXMT queue diagnostic: FinishThread begin"
+      WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread begin"
            " seq=", internal_seq,
            " chunk=", chunk.chunk_id,
            " cmdbuf=", chunk.attached_cmdbuf.handle,
@@ -410,21 +511,25 @@ CommandQueue::WaitForFinishThread() {
     }
     if (chunk.attached_cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
       if (DxmtQueueDiagShouldLog(finish_log_count)) {
-        WARN("DXMT queue diagnostic: FinishThread wait begin"
+        WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread wait begin"
              " seq=", internal_seq,
              " chunk=", chunk.chunk_id,
              " cmdbuf=", chunk.attached_cmdbuf.handle,
              " status=", static_cast<uint32_t>(chunk.attached_cmdbuf.status()));
       }
+      auto wait_begin_time = clock::now();
       chunk.attached_cmdbuf.waitUntilCompleted();
+      auto wait_end_time = clock::now();
       if (DxmtQueueDiagShouldLog(finish_log_count)) {
-        WARN("DXMT queue diagnostic: FinishThread wait end"
+        WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread wait end"
              " seq=", internal_seq,
              " chunk=", chunk.chunk_id,
              " cmdbuf=", chunk.attached_cmdbuf.handle,
-             " status=", static_cast<uint32_t>(chunk.attached_cmdbuf.status()));
+             " status=", static_cast<uint32_t>(chunk.attached_cmdbuf.status()),
+             " waitMs=", DxmtQueueDiagDurationMs(wait_end_time - wait_begin_time));
       }
     }
+    chunk.finish_complete_time = clock::now();
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
     }
@@ -443,7 +548,7 @@ CommandQueue::WaitForFinishThread() {
       const auto queue_gap = gpu_start > diag_last_gpu_end_ns_ && diag_last_gpu_end_ns_
                                  ? gpu_start - diag_last_gpu_end_ns_
                                  : 0;
-      WARN("DXMT queue diagnostic: CommandBufferTiming"
+      WARN_FILE_ONLY("DXMT queue diagnostic: CommandBufferTiming"
            " seq=", internal_seq,
            " chunk=", chunk.chunk_id,
            " frame=", chunk.frame_,
@@ -456,6 +561,12 @@ CommandQueue::WaitForFinishThread() {
            " kernelEndMs=", DxmtQueueDiagNsToMs(kernel_end),
            " kernelSpanMs=", DxmtQueueDiagNsToMs(kernel_span),
            " queueGapMs=", DxmtQueueDiagNsToMs(queue_gap),
+           " publishToEncodeMs=", DxmtQueueDiagElapsedMs(chunk.publish_time, chunk.encode_begin_time),
+           " encodeWallMs=", DxmtQueueDiagElapsedMs(chunk.encode_begin_time, chunk.encode_end_time),
+           " encodeToCommitMs=", DxmtQueueDiagElapsedMs(chunk.encode_end_time, chunk.metal_commit_time),
+           " commitToFinishBeginMs=", DxmtQueueDiagElapsedMs(chunk.metal_commit_time, chunk.finish_begin_time),
+           " commitToCompleteMs=", DxmtQueueDiagElapsedMs(chunk.metal_commit_time, chunk.finish_complete_time),
+           " publishToCompleteMs=", DxmtQueueDiagElapsedMs(chunk.publish_time, chunk.finish_complete_time),
            " event=", chunk.chunk_event_id,
            " initEvent=", chunk.resource_initializer_event_id,
            " callbacks=", chunk.completion_callbacks.size());
@@ -480,7 +591,7 @@ CommandQueue::WaitForFinishThread() {
     // command heap cannot be recycled while chunk.reset() still walks it.
     cpu_coherent.signal(internal_seq);
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
-      WARN("DXMT queue diagnostic: FinishThread signaled"
+      WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread signaled"
            " seq=", internal_seq,
            " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
            " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
@@ -488,13 +599,21 @@ CommandQueue::WaitForFinishThread() {
            " ongoingBeforeDec=", chunk_ongoing.load(std::memory_order_relaxed),
            " coherent=", cpu_coherent.signaledValue());
     }
+    const auto callbacks_begin_time = clock::now();
     for (auto &callback : completion_callbacks)
       callback();
+    const auto callbacks_end_time = clock::now();
+    if (DxmtQueueDiagEnabled() && !completion_callbacks.empty()) {
+      WARN_FILE_ONLY("DXMT queue diagnostic: CompletionCallbacks"
+           " seq=", internal_seq,
+           " count=", completion_callbacks.size(),
+           " elapsedMs=", DxmtQueueDiagDurationMs(callbacks_end_time - callbacks_begin_time));
+    }
 
     chunk_ongoing.fetch_sub(1, std::memory_order_release);
     chunk_ongoing.notify_one();
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
-      WARN("DXMT queue diagnostic: FinishThread end"
+      WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread end"
            " seq=", internal_seq,
            " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
            " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
@@ -506,6 +625,7 @@ CommandQueue::WaitForFinishThread() {
     copy_temp_allocator.free_blocks(internal_seq);
     argbuf_allocator.free_blocks(internal_seq);
     argbuf_shadow_allocator.free_blocks(internal_seq);
+    cpu_command_allocator.free_blocks(internal_seq);
 
     internal_seq++;
   }

@@ -17,6 +17,7 @@
 #include <cassert>
 #include <optional>
 #include <string>
+#include <vector>
 
 #define DXMT_IMPLEMENT_ME __builtin_unreachable();
 #define DXMT_UNREACHABLE __builtin_unreachable();
@@ -106,6 +107,7 @@ enum class EncoderType {
   TemporalUpscale,
   WaitForEvent,
   SampleTimestamp,
+  ResolveTimestamp,
 };
 
 struct EncoderData {
@@ -283,6 +285,17 @@ struct SampleTimestampData: EncoderData {
   uint64_t readback_index;
   // TODO: small_vector opt
   std::vector<Rc<TimestampQuery>> queries;
+};
+
+struct ResolveTimestampData : EncoderData {
+  struct Range {
+    WMT::Reference<WMT::Buffer> dst_buffer;
+    uint64_t start_index;
+    uint64_t query_count;
+    uint64_t dst_offset;
+    uint64_t dst_length;
+  };
+  std::vector<Range> ranges;
 };
 
 struct TemporalUpscaleData : EncoderData {
@@ -571,11 +584,22 @@ public:
     }
   }
 
+  template <PipelineStage stage>
+  uint64_t
+  currentResourceResidencyEncoderId() {
+    if constexpr (stage == PipelineStage::Compute ||
+                  stage == PipelineStage::Pixel) {
+      return currentEncoderId();
+    } else {
+      return currentRenderEncoder()->encoder_id_vertex;
+    }
+  }
+
   template <PipelineStage stage, PipelineKind kind>
   void
   makeResident(Buffer *buffer, bool read = true, bool write = false) {
     auto allocation = buffer->current();
-    uint64_t encoder_id = currentEncoder()->id;
+    uint64_t encoder_id = currentResourceResidencyEncoderId<stage>();
     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
     if (CheckResourceResidency(allocation->residencyState, encoder_id, requested)) {
       makeResident<stage, kind>(allocation->buffer(), requested);
@@ -585,7 +609,7 @@ public:
   void
   makeResident(Buffer *buffer, uint64_t viewId, bool read = true, bool write = false) {
     auto allocation = buffer->current();
-    uint64_t encoder_id = currentEncoder()->id;
+    uint64_t encoder_id = currentResourceResidencyEncoderId<stage>();
     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
     auto *view = buffer->tryView(viewId, allocation);
     if (!view || !view->texture)
@@ -598,7 +622,7 @@ public:
   void
   makeResident(Texture *texture, uint64_t viewId, bool read = true, bool write = false) {
     auto allocation = texture->current();
-    uint64_t encoder_id = currentEncoder()->id;
+    uint64_t encoder_id = currentResourceResidencyEncoderId<stage>();
     DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
     auto &view = texture->view(viewId, allocation);
     if (CheckResourceResidency(view.residency, encoder_id, requested)) {
@@ -826,6 +850,9 @@ public:
   }
 
   void sampleTimestamp(Rc<TimestampQuery> &&query);
+  void resolveTimestamp(uint64_t start_index, uint64_t query_count,
+                        WMT::Reference<WMT::Buffer> dst_buffer, uint64_t dst_offset,
+                        uint64_t dst_length);
 
   void barrierOnQueue(WMT::CommandBuffer cmdbuf) {
     barrier_index_++;
@@ -868,6 +895,9 @@ private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
+  bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);
+  void appendPendingFenceOnlyBlitPass();
+  void mergePendingFenceOnlyBlitPassInto(EncoderData* encoder);
   bool isEncoderSignatureMatched(RenderEncoderData* former, RenderEncoderData* latter);
   RenderEncoderColorAttachmentData *isClearColorSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
   RenderEncoderDepthAttachmentData *isClearDepthSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
@@ -900,6 +930,9 @@ private:
   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};
   EncoderData *encoder_last = &encoder_head;
   EncoderData *encoder_current = nullptr;
+  FenceSet pending_fence_only_blit_wait_;
+  FenceSet pending_fence_only_blit_update_;
+  bool has_pending_fence_only_blit_ = false;
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0

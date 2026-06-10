@@ -48,6 +48,12 @@ bool BufferGpuVirtualAddressRangeContains(
   return address >= range.base && offset < range.size;
 }
 
+UINT64 BufferGpuVirtualAddressRangeRemaining(
+    const BufferGpuVirtualAddressRange &range,
+    D3D12_GPU_VIRTUAL_ADDRESS address) {
+  return range.size - (address - range.base);
+}
+
 bool BufferGpuVirtualAddressRangesOverlap(
     D3D12_GPU_VIRTUAL_ADDRESS a_base, UINT64 a_size,
     D3D12_GPU_VIRTUAL_ADDRESS b_base, UINT64 b_size) {
@@ -70,22 +76,19 @@ void RegisterBufferGpuVirtualAddress(Resource *resource,
                 [resource](const BufferGpuVirtualAddressRange &range) {
                   return range.resource == resource;
                 });
-  size_t removed_overlaps = 0;
-  std::erase_if(g_buffer_va_ranges,
-                [&](const BufferGpuVirtualAddressRange &range) {
-                  const bool overlaps = BufferGpuVirtualAddressRangesOverlap(
-                      base, size, range.base, range.size);
-                  if (overlaps)
-                    removed_overlaps++;
-                  return overlaps;
-                });
-  if (removed_overlaps) {
+  size_t overlap_count = 0;
+  for (const auto &range : g_buffer_va_ranges) {
+    if (BufferGpuVirtualAddressRangesOverlap(base, size, range.base,
+                                             range.size))
+      overlap_count++;
+  }
+  if (overlap_count) {
     static std::atomic<uint32_t> overlap_log_count = 0;
     if (ShouldLogRepeatedGpuVaWarning(overlap_log_count)) {
-      WARN("D3D12Resource: GPU virtual address range replaced overlapping"
+      WARN("D3D12Resource: GPU virtual address range registered overlapping"
            " registrations base=", uint64_t(base),
            " size=", size,
-           " overlapCount=", removed_overlaps);
+           " overlapCount=", overlap_count);
     }
   }
   g_buffer_va_ranges.push_back({base, size, resource});
@@ -676,6 +679,7 @@ public:
         goto done;
       }
 
+      WaitPendingTimestampResolveForMapRead(read_range);
       mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
                heap_offset_;
       goto done;
@@ -908,6 +912,23 @@ public:
     return backing_plane < plane_allocations_.size()
                ? plane_allocations_[backing_plane].ptr()
                : nullptr;
+  }
+
+  void AddPendingTimestampResolve(UINT64 offset, UINT64 size,
+                                  uint64_t seq) override {
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !size)
+      return;
+
+    PendingTimestampResolveRange range = {};
+    range.offset = std::min<UINT64>(offset, desc_.Width);
+    const UINT64 end = std::min<UINT64>(offset + size, desc_.Width);
+    if (end <= range.offset)
+      return;
+    range.size = end - range.offset;
+    range.seq = seq;
+
+    std::lock_guard lock(pending_timestamp_resolve_mutex_);
+    pending_timestamp_resolves_.push_back(range);
   }
 
   void SetPresentSourceView(dxmt::TextureViewKey view) override {
@@ -1562,6 +1583,49 @@ private:
     }
   }
 
+  struct PendingTimestampResolveRange {
+    UINT64 offset = 0;
+    UINT64 size = 0;
+    uint64_t seq = 0;
+  };
+
+  static bool BufferRangesOverlap(UINT64 a_offset, UINT64 a_size,
+                                  UINT64 b_offset, UINT64 b_size) {
+    if (!a_size || !b_size)
+      return false;
+    return a_offset < b_offset + b_size && b_offset < a_offset + a_size;
+  }
+
+  void WaitPendingTimestampResolveForMapRead(const D3D12_RANGE *read_range) {
+    UINT64 read_begin = 0;
+    UINT64 read_end = desc_.Width;
+    if (read_range) {
+      read_begin = std::min<UINT64>(read_range->Begin, desc_.Width);
+      read_end = std::min<UINT64>(read_range->End, desc_.Width);
+    }
+    if (read_end <= read_begin)
+      return;
+
+    uint64_t wait_seq = 0;
+    {
+      std::lock_guard lock(pending_timestamp_resolve_mutex_);
+      std::vector<PendingTimestampResolveRange> remaining;
+      remaining.reserve(pending_timestamp_resolves_.size());
+      for (auto &range : pending_timestamp_resolves_) {
+        if (BufferRangesOverlap(range.offset, range.size, read_begin,
+                                read_end - read_begin)) {
+          wait_seq = std::max(wait_seq, range.seq);
+        } else {
+          remaining.push_back(range);
+        }
+      }
+      pending_timestamp_resolves_ = std::move(remaining);
+    }
+
+    if (wait_seq)
+      device_->GetDXMTDevice().queue().WaitCPUFence(wait_seq);
+  }
+
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
   D3D12_HEAP_PROPERTIES heap_properties_ = {};
@@ -1585,6 +1649,8 @@ private:
   std::array<Rc<dxmt::TextureAllocation>, kMaxTexturePlanes> plane_allocations_{};
   dxmt::TextureViewKey present_source_view_ = {};
   std::string name_;
+  std::mutex pending_timestamp_resolve_mutex_;
+  std::vector<PendingTimestampResolveRange> pending_timestamp_resolves_;
 };
 
 } // namespace
@@ -1593,15 +1659,29 @@ Resource *
 LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                                         UINT64 *offset) {
   std::lock_guard lock(g_buffer_va_mutex);
-  for (auto it = g_buffer_va_ranges.rbegin(); it != g_buffer_va_ranges.rend(); ++it) {
-    const auto &range = *it;
-    if (BufferGpuVirtualAddressRangeContains(range, address)) {
-      if (offset)
-        *offset = address - range.base;
-      return range.resource;
+  const BufferGpuVirtualAddressRange *best = nullptr;
+  UINT64 best_size = 0;
+  UINT64 best_remaining = 0;
+  for (const auto &range : g_buffer_va_ranges) {
+    if (!BufferGpuVirtualAddressRangeContains(range, address))
+      continue;
+
+    const auto remaining =
+        BufferGpuVirtualAddressRangeRemaining(range, address);
+    if (!best || range.size < best_size ||
+        (range.size == best_size && remaining <= best_remaining)) {
+      best = &range;
+      best_size = range.size;
+      best_remaining = remaining;
     }
   }
-  return nullptr;
+
+  if (!best)
+    return nullptr;
+
+  if (offset)
+    *offset = address - best->base;
+  return best->resource;
 }
 
 bool

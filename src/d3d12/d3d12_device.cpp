@@ -1211,7 +1211,7 @@ public:
   HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type,
                                                    REFIID riid, void **command_allocator) override {
     if (D3D12DeviceDiagEnabled()) {
-      WARN("D3D12 diagnostic: CreateCommandAllocator enter"
+      WARN_FILE_ONLY("D3D12 diagnostic: CreateCommandAllocator enter"
            " type=", type,
            " riid=", str::format(riid));
     }
@@ -1231,7 +1231,7 @@ public:
           static_cast<int32_t>(hr));
     }
     if (D3D12DeviceDiagEnabled()) {
-      WARN("D3D12 diagnostic: CreateCommandAllocator result"
+      WARN_FILE_ONLY("D3D12 diagnostic: CreateCommandAllocator result"
            " hr=", hr,
            " allocator=", command_allocator && *command_allocator
                              ? reinterpret_cast<uintptr_t>(*command_allocator)
@@ -1308,7 +1308,7 @@ public:
                                               ID3D12PipelineState *initial_pipeline_state,
                                               REFIID riid, void **command_list) override {
     if (D3D12DeviceDiagEnabled()) {
-      WARN("D3D12 diagnostic: CreateCommandList enter"
+      WARN_FILE_ONLY("D3D12 diagnostic: CreateCommandList enter"
            " nodeMask=", node_mask,
            " type=", type,
            " allocator=", reinterpret_cast<uintptr_t>(command_allocator),
@@ -1341,7 +1341,7 @@ public:
           command_list ? *command_list : nullptr, static_cast<int32_t>(hr));
     }
     if (D3D12DeviceDiagEnabled()) {
-      WARN("D3D12 diagnostic: CreateCommandList result"
+      WARN_FILE_ONLY("D3D12 diagnostic: CreateCommandList result"
            " createStatus=", status,
            " hr=", hr,
            " list=", command_list && *command_list
@@ -2790,7 +2790,7 @@ public:
                                                REFIID riid,
                                                void **command_list) override {
     if (D3D12DeviceDiagEnabled()) {
-      WARN("D3D12 diagnostic: CreateCommandList1 enter"
+      WARN_FILE_ONLY("D3D12 diagnostic: CreateCommandList1 enter"
            " nodeMask=", node_mask,
            " type=", type,
            " flags=", flags,
@@ -2828,7 +2828,7 @@ public:
           static_cast<int32_t>(hr));
     }
     if (D3D12DeviceDiagEnabled()) {
-      WARN("D3D12 diagnostic: CreateCommandList1 result"
+      WARN_FILE_ONLY("D3D12 diagnostic: CreateCommandList1 result"
            " closeStatus=", status,
            " hr=", hr,
            " list=", command_list && *command_list

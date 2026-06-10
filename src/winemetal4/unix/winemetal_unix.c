@@ -86,21 +86,28 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 - (double)kernelEndTime;
 - (double)GPUStartTime;
 - (double)GPUEndTime;
-- (void)encodeSignalEvent:(id<MTLSharedEvent>)event value:(uint64_t)value;
-- (void)encodeWaitForEvent:(id<MTLSharedEvent>)event value:(uint64_t)value;
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value;
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value;
 - (void)presentDrawable:(id<MTLDrawable>)drawable;
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(double)duration;
 - (void)dxmtWriteTimestampIntoHeap:(id<MTL4CounterHeap>)heap atIndex:(NSUInteger)index;
+- (void)dxmtResolveCounterHeap:(id<MTL4CounterHeap>)heap
+                      withRange:(NSRange)range
+                     intoBuffer:(id<MTLBuffer>)buffer
+                         offset:(uint64_t)offset
+                         length:(uint64_t)length
+                      waitFence:(id<MTLFence>)fenceToWait
+                    updateFence:(id<MTLFence>)fenceToUpdate;
 @end
 
 @interface DXMTMetal4QueueEvent : NSObject
-@property(nonatomic, retain) id<MTLSharedEvent> event;
+@property(nonatomic, retain) id<MTLEvent> event;
 @property(nonatomic, assign) uint64_t value;
-- (instancetype)initWithEvent:(id<MTLSharedEvent>)event value:(uint64_t)value;
+- (instancetype)initWithEvent:(id<MTLEvent>)event value:(uint64_t)value;
 @end
 
 @implementation DXMTMetal4QueueEvent
-- (instancetype)initWithEvent:(id<MTLSharedEvent>)event value:(uint64_t)value {
+- (instancetype)initWithEvent:(id<MTLEvent>)event value:(uint64_t)value {
   self = [super init];
   if (self) {
     _event = [event retain];
@@ -114,6 +121,304 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
   [super dealloc];
 }
 @end
+
+static BOOL
+dxmt_metal4_validate_event(id event, const char *usage, uint64_t value) {
+  if (event && [event conformsToProtocol:@protocol(MTLEvent)])
+    return YES;
+
+  fprintf(stderr,
+          "err:   DXMT Metal4 invalid %s event object=%p class=%s value=%" PRIu64 "\n",
+          usage,
+          event,
+          event ? object_getClassName(event) : "<nil>",
+          value);
+  return NO;
+}
+
+#if DXMT_APITRACE_METAL
+static bool dxmt_apitrace_runtime_enabled(void);
+static void dxmt_apitrace_record_command_buffer_commit_state(
+    obj_handle_t command_buffer,
+    apitrace_metal_command_buffer_commit_phase phase,
+    uint64_t wait_event_count,
+    uint64_t signal_event_count,
+    BOOL has_drawable,
+    uint64_t completion_value,
+    uint64_t d3d_sequence);
+static void dxmt_apitrace_record_command_buffer_feedback(
+    obj_handle_t command_buffer,
+    apitrace_metal_command_buffer_feedback_status status,
+    double gpu_start_time,
+    double gpu_end_time,
+    NSString *error);
+static void dxmt_apitrace_record_command_buffer_event(
+    obj_handle_t command_buffer,
+    apitrace_metal_queue_event_op op,
+    obj_handle_t event,
+    uint64_t value,
+    apitrace_metal_queue_event_phase phase);
+static void dxmt_apitrace_record_counter_event(
+    obj_handle_t command_buffer,
+    apitrace_metal_counter_event_op op,
+    obj_handle_t counter_heap,
+    uint64_t start,
+    uint64_t count,
+    obj_handle_t destination_buffer,
+    uint64_t destination_offset,
+    uint64_t destination_length,
+    obj_handle_t wait_fence,
+    obj_handle_t update_fence);
+static void dxmt_apitrace_record_buffer_binding(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_stage_kind stage,
+    obj_handle_t buffer,
+    uint64_t offset,
+    uint8_t index);
+static void dxmt_apitrace_record_texture_binding(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_stage_kind stage,
+    obj_handle_t texture,
+    uint8_t index);
+static void dxmt_apitrace_record_indirect_arguments(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_indirect_arguments_info_t *info);
+static void dxmt_apitrace_record_emulated_blit(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_emulated_blit_op op,
+    obj_handle_t source_texture,
+    obj_handle_t destination_buffer,
+    uint64_t destination_offset,
+    uint64_t bytes_per_row,
+    uint64_t bytes_per_image,
+    uint64_t slice,
+    uint64_t level);
+static void dxmt_apitrace_finalize_command_buffer(obj_handle_t command_buffer);
+#else
+enum {
+  APITRACE_METAL_STAGE_VERTEX = 1,
+  APITRACE_METAL_STAGE_FRAGMENT = 2,
+  APITRACE_METAL_STAGE_COMPUTE = 3,
+  APITRACE_METAL_STAGE_RENDER = 4,
+  APITRACE_METAL_STAGE_BLIT = 5,
+};
+
+enum {
+  APITRACE_METAL_COMMAND_BUFFER_COMMIT_BEGIN = 1,
+  APITRACE_METAL_COMMAND_BUFFER_COMMIT_RECORDED_BEFORE_NATIVE_COMMIT = 2,
+  APITRACE_METAL_COMMAND_BUFFER_COMMIT_SUBMITTED = 3,
+};
+
+enum {
+  APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_COMPLETED = 1,
+  APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_ERROR = 2,
+};
+
+enum {
+  APITRACE_METAL_QUEUE_EVENT_WAIT = 1,
+  APITRACE_METAL_QUEUE_EVENT_SIGNAL = 2,
+};
+
+enum {
+  APITRACE_METAL_QUEUE_EVENT_RECORDED = 1,
+  APITRACE_METAL_QUEUE_EVENT_ENQUEUED = 2,
+};
+
+enum {
+  APITRACE_METAL_INDIRECT_DRAW = 1,
+  APITRACE_METAL_INDIRECT_DRAW_INDEXED = 2,
+  APITRACE_METAL_INDIRECT_DRAW_MESH_THREADGROUPS = 3,
+  APITRACE_METAL_INDIRECT_DISPATCH = 4,
+  APITRACE_METAL_INDIRECT_GEOMETRY_DRAW = 5,
+  APITRACE_METAL_INDIRECT_GEOMETRY_DRAW_INDEXED = 6,
+  APITRACE_METAL_INDIRECT_TESSELLATION_MESH_DRAW = 7,
+  APITRACE_METAL_INDIRECT_TESSELLATION_MESH_DRAW_INDEXED = 8,
+};
+
+enum {
+  APITRACE_METAL_COUNTER_WRITE_TIMESTAMP = 1,
+  APITRACE_METAL_COUNTER_RESOLVE_HEAP = 2,
+};
+
+enum {
+  APITRACE_METAL_EMULATED_BLIT_COPY_TEXTURE_TO_BUFFER = 1,
+  APITRACE_METAL_EMULATED_BLIT_GENERATE_MIPMAPS = 2,
+  APITRACE_METAL_EMULATED_BLIT_RESOLVE_COUNTERS = 3,
+};
+
+typedef struct apitrace_metal_indirect_arguments_info {
+  uint32_t op;
+  uint32_t stage;
+  uint64_t indirect_buffer_id;
+  uint64_t indirect_offset;
+  uint64_t indirect_gpu_address;
+  uint64_t indirect_buffer_length;
+  uint64_t draw_arguments_buffer_id;
+  uint64_t draw_arguments_offset;
+  uint64_t dispatch_arguments_buffer_id;
+  uint64_t dispatch_arguments_offset;
+  uint64_t immediate_arguments_buffer_id;
+  uint64_t index_buffer_id;
+  uint64_t index_buffer_offset;
+  uint32_t primitive_type;
+  uint32_t index_type;
+  uint32_t threadgroup_width;
+  uint32_t threadgroup_height;
+  uint32_t threadgroup_depth;
+  uint32_t object_threadgroup_width;
+  uint32_t object_threadgroup_height;
+  uint32_t object_threadgroup_depth;
+  uint32_t mesh_threadgroup_width;
+  uint32_t mesh_threadgroup_height;
+  uint32_t mesh_threadgroup_depth;
+  uint32_t vertex_per_warp;
+  uint32_t threads_per_patch;
+  uint32_t patch_per_group;
+} apitrace_metal_indirect_arguments_info_t;
+
+static void
+dxmt_apitrace_record_command_buffer_commit_state(
+    obj_handle_t command_buffer,
+    int phase,
+    uint64_t wait_event_count,
+    uint64_t signal_event_count,
+    BOOL has_drawable,
+    uint64_t completion_value,
+    uint64_t d3d_sequence) {
+  (void)command_buffer;
+  (void)phase;
+  (void)wait_event_count;
+  (void)signal_event_count;
+  (void)has_drawable;
+  (void)completion_value;
+  (void)d3d_sequence;
+}
+
+static void
+dxmt_apitrace_record_command_buffer_feedback(
+    obj_handle_t command_buffer,
+    int status,
+    double gpu_start_time,
+    double gpu_end_time,
+    NSString *error) {
+  (void)command_buffer;
+  (void)status;
+  (void)gpu_start_time;
+  (void)gpu_end_time;
+  (void)error;
+}
+
+static void
+dxmt_apitrace_record_command_buffer_event(
+    obj_handle_t command_buffer,
+    int op,
+    obj_handle_t event,
+    uint64_t value,
+    int phase) {
+  (void)command_buffer;
+  (void)op;
+  (void)event;
+  (void)value;
+  (void)phase;
+}
+
+static void
+dxmt_apitrace_record_counter_event(
+    obj_handle_t command_buffer,
+    int op,
+    obj_handle_t counter_heap,
+    uint64_t start,
+    uint64_t count,
+    obj_handle_t destination_buffer,
+    uint64_t destination_offset,
+    uint64_t destination_length,
+    obj_handle_t wait_fence,
+    obj_handle_t update_fence) {
+  (void)command_buffer;
+  (void)op;
+  (void)counter_heap;
+  (void)start;
+  (void)count;
+  (void)destination_buffer;
+  (void)destination_offset;
+  (void)destination_length;
+  (void)wait_fence;
+  (void)update_fence;
+}
+
+static void
+dxmt_apitrace_record_buffer_binding(
+    void *session,
+    obj_handle_t encoder,
+    int stage,
+    obj_handle_t buffer,
+    uint64_t offset,
+    uint8_t index) {
+  (void)session;
+  (void)encoder;
+  (void)stage;
+  (void)buffer;
+  (void)offset;
+  (void)index;
+}
+
+static void
+dxmt_apitrace_record_texture_binding(
+    void *session,
+    obj_handle_t encoder,
+    int stage,
+    obj_handle_t texture,
+    uint8_t index) {
+  (void)session;
+  (void)encoder;
+  (void)stage;
+  (void)texture;
+  (void)index;
+}
+
+static void
+dxmt_apitrace_record_indirect_arguments(
+    void *session,
+    obj_handle_t encoder,
+    apitrace_metal_indirect_arguments_info_t *info) {
+  (void)session;
+  (void)encoder;
+  (void)info;
+}
+
+static void
+dxmt_apitrace_record_emulated_blit(
+    void *session,
+    obj_handle_t encoder,
+    int op,
+    obj_handle_t source_texture,
+    obj_handle_t destination_buffer,
+    uint64_t destination_offset,
+    uint64_t bytes_per_row,
+    uint64_t bytes_per_image,
+    uint64_t slice,
+    uint64_t level) {
+  (void)session;
+  (void)encoder;
+  (void)op;
+  (void)source_texture;
+  (void)destination_buffer;
+  (void)destination_offset;
+  (void)bytes_per_row;
+  (void)bytes_per_image;
+  (void)slice;
+  (void)level;
+}
+
+static void
+dxmt_apitrace_finalize_command_buffer(obj_handle_t command_buffer) {
+  (void)command_buffer;
+}
+#endif
 
 static NSMutableDictionary *dxmt_metal4_compilers_by_device;
 
@@ -342,19 +647,56 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
     return;
 
-  for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents)
+  dxmt_apitrace_record_command_buffer_commit_state(
+      (obj_handle_t)self,
+      APITRACE_METAL_COMMAND_BUFFER_COMMIT_BEGIN,
+      _pendingWaitEvents.count,
+      _pendingSignalEvents.count,
+      _pendingDrawable != nil,
+      0,
+      0);
+
+  for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
+    dxmt_apitrace_record_command_buffer_event(
+        (obj_handle_t)self,
+        APITRACE_METAL_QUEUE_EVENT_WAIT,
+        (obj_handle_t)wait.event,
+        wait.value,
+        APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
     [_owner.metal4Queue waitForEvent:wait.event value:wait.value];
+  }
 
   [self prepareResidencyForCommit];
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValue];
   MTL4CommitOptions *options = [[MTL4CommitOptions alloc] init];
+  if (dxmt_apitrace_runtime_enabled()) {
+    __block DXMTMetal4CommandBuffer *retainedSelf = [self retain];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+      dxmt_apitrace_record_command_buffer_feedback(
+          (obj_handle_t)retainedSelf,
+          feedback.error ? APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_ERROR
+                         : APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_COMPLETED,
+          feedback.GPUStartTime,
+          feedback.GPUEndTime,
+          feedback.error && feedback.error.localizedDescription ? feedback.error.localizedDescription : @"");
+      [retainedSelf release];
+    }];
+  }
 
   id<MTL4CommandBuffer> commandBuffers[1] = {_metal4Buffer};
   _internalStatus = DXMTMetal4CommandBufferStateCommitted;
   [_owner.metal4Queue commit:commandBuffers count:1 options:options];
   [options release];
+  dxmt_apitrace_record_command_buffer_commit_state(
+      (obj_handle_t)self,
+      APITRACE_METAL_COMMAND_BUFFER_COMMIT_SUBMITTED,
+      0,
+      0,
+      NO,
+      _completionValue,
+      0);
 
   if (_pendingDrawable) {
     [_owner.metal4Queue signalDrawable:_pendingDrawable];
@@ -364,10 +706,18 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
       [_pendingDrawable present];
   }
 
-  for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents)
+  for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents) {
+    dxmt_apitrace_record_command_buffer_event(
+        (obj_handle_t)self,
+        APITRACE_METAL_QUEUE_EVENT_SIGNAL,
+        (obj_handle_t)signal.event,
+        signal.value,
+        APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
     [_owner.metal4Queue signalEvent:signal.event value:signal.value];
+  }
   [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
 
+  dxmt_apitrace_finalize_command_buffer((obj_handle_t)self);
 }
 
 - (void)waitUntilCompleted {
@@ -408,13 +758,29 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   return _feedbackGPUEndTime;
 }
 
-- (void)encodeSignalEvent:(id<MTLSharedEvent>)event value:(uint64_t)value {
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {
+  if (!dxmt_metal4_validate_event(event, "signal", value))
+    return;
+  dxmt_apitrace_record_command_buffer_event(
+      (obj_handle_t)self,
+      APITRACE_METAL_QUEUE_EVENT_SIGNAL,
+      (obj_handle_t)event,
+      value,
+      APITRACE_METAL_QUEUE_EVENT_RECORDED);
   DXMTMetal4QueueEvent *op = [[DXMTMetal4QueueEvent alloc] initWithEvent:event value:value];
   [_pendingSignalEvents addObject:op];
   [op release];
 }
 
-- (void)encodeWaitForEvent:(id<MTLSharedEvent>)event value:(uint64_t)value {
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {
+  if (!dxmt_metal4_validate_event(event, "wait", value))
+    return;
+  dxmt_apitrace_record_command_buffer_event(
+      (obj_handle_t)self,
+      APITRACE_METAL_QUEUE_EVENT_WAIT,
+      (obj_handle_t)event,
+      value,
+      APITRACE_METAL_QUEUE_EVENT_RECORDED);
   DXMTMetal4QueueEvent *op = [[DXMTMetal4QueueEvent alloc] initWithEvent:event value:value];
   [_pendingWaitEvents addObject:op];
   [op release];
@@ -434,7 +800,47 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
 }
 
 - (void)dxmtWriteTimestampIntoHeap:(id<MTL4CounterHeap>)heap atIndex:(NSUInteger)index {
+  dxmt_apitrace_record_counter_event(
+      (obj_handle_t)self,
+      APITRACE_METAL_COUNTER_WRITE_TIMESTAMP,
+      (obj_handle_t)heap,
+      index,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0);
   [_metal4Buffer writeTimestampIntoHeap:heap atIndex:index];
+}
+
+- (void)dxmtResolveCounterHeap:(id<MTL4CounterHeap>)heap
+                      withRange:(NSRange)range
+                     intoBuffer:(id<MTLBuffer>)buffer
+                         offset:(uint64_t)offset
+                         length:(uint64_t)length
+                      waitFence:(id<MTLFence>)fenceToWait
+                    updateFence:(id<MTLFence>)fenceToUpdate {
+  if (!heap || !buffer || !length)
+    return;
+
+  dxmt_apitrace_record_counter_event(
+      (obj_handle_t)self,
+      APITRACE_METAL_COUNTER_RESOLVE_HEAP,
+      (obj_handle_t)heap,
+      range.location,
+      range.length,
+      (obj_handle_t)buffer,
+      offset,
+      length,
+      (obj_handle_t)fenceToWait,
+      (obj_handle_t)fenceToUpdate);
+  [self useResidencyAllocation:(id<MTLAllocation>)buffer];
+  [_metal4Buffer resolveCounterHeap:heap
+                           withRange:range
+                          intoBuffer:MTL4BufferRangeMake([buffer gpuAddress] + offset, length)
+                           waitFence:fenceToWait
+                         updateFence:fenceToUpdate];
 }
 @end
 
@@ -442,6 +848,20 @@ void
 DXMTMetal4CommandBuffer_writeTimestampIntoHeap(obj_handle_t cmdbuf, obj_handle_t heap, uint64_t index) {
   [(DXMTMetal4CommandBuffer *)cmdbuf dxmtWriteTimestampIntoHeap:(id<MTL4CounterHeap>)heap
                                                         atIndex:(NSUInteger)index];
+}
+
+void
+DXMTMetal4CommandBuffer_resolveCounterHeap(
+    obj_handle_t cmdbuf, obj_handle_t heap, uint64_t start, uint64_t count,
+    obj_handle_t dst_buffer, uint64_t dst_offset, uint64_t dst_length,
+    obj_handle_t wait_fence, obj_handle_t update_fence) {
+  [(DXMTMetal4CommandBuffer *)cmdbuf dxmtResolveCounterHeap:(id<MTL4CounterHeap>)heap
+                                                  withRange:NSMakeRange((NSUInteger)start, (NSUInteger)count)
+                                                 intoBuffer:(id<MTLBuffer>)dst_buffer
+                                                     offset:dst_offset
+                                                     length:dst_length
+                                                  waitFence:(id<MTLFence>)wait_fence
+                                                updateFence:(id<MTLFence>)update_fence];
 }
 
 struct dxmt_metal4_argument_binding {
@@ -640,10 +1060,12 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
   DXMTApitraceEncoderKindRender = 1,
   DXMTApitraceEncoderKindCompute = 2,
   DXMTApitraceEncoderKindBlit = 3,
+  DXMTApitraceEncoderKindMetal4Blit = 4,
 };
 
 @interface DXMT4ApitraceCommandBufferState : NSObject
 @property(nonatomic, assign) uint64_t beginSequence;
+@property(nonatomic, assign) uint64_t d3dSequence;
 @property(nonatomic, retain) NSMutableData *blitCopyTextureOps;
 @property(nonatomic, retain) NSMutableData *blitWaitFences;
 @property(nonatomic, retain) NSMutableData *blitUpdateFences;
@@ -688,6 +1110,7 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
 
 static pthread_mutex_t dxmt_apitrace_lock = PTHREAD_MUTEX_INITIALIZER;
 static apitrace_metal_session_t *dxmt_apitrace_session = NULL;
+static char dxmt_apitrace_session_bundle_root[PATH_MAX] = {};
 static NSMutableDictionary *dxmt_apitrace_command_buffers = nil;
 static NSMutableDictionary *dxmt_apitrace_encoders = nil;
 static NSMutableDictionary *dxmt_apitrace_functions = nil;
@@ -704,6 +1127,13 @@ static const NSUInteger dxmt_apitrace_command_buffer_blit_ops_flush_threshold = 
 static uint32_t
 dxmt_apitrace_command_buffer_copy_texture_count(DXMT4ApitraceCommandBufferState *state) {
   return state ? (uint32_t)(state.blitCopyTextureOps.length / sizeof(apitrace_metal_copy_texture_op_t)) : 0;
+}
+
+static void
+dxmt_apitrace_set_sequence_locked(apitrace_metal_session_t *session, uint64_t sequence) {
+  dxmt_apitrace_current_d3d_sequence = sequence;
+  if (session)
+    apitrace_metal_set_current_d3d_sequence(session, sequence);
 }
 
 static bool
@@ -723,6 +1153,9 @@ dxmt_apitrace_runtime_enabled(void) {
 
 static apitrace_metal_session_t *
 dxmt_apitrace_ensure_session_locked(void);
+
+static void
+dxmt_apitrace_close_session_locked(void);
 
 static const char *
 dxmt_apitrace_bundle_root(void) {
@@ -916,18 +1349,25 @@ dxmt_apitrace_track_function_with_constants_locked(
 
 static apitrace_metal_session_t *
 dxmt_apitrace_ensure_session_locked(void) {
-  if (dxmt_apitrace_session)
-    return dxmt_apitrace_session;
-
   if (!dxmt_apitrace_runtime_enabled())
     return NULL;
 
   const char *bundle_root = dxmt_apitrace_bundle_root();
   if (!bundle_root)
     return NULL;
+
+  if (dxmt_apitrace_session) {
+    if (!strcmp(dxmt_apitrace_session_bundle_root, bundle_root))
+      return dxmt_apitrace_session;
+
+    dxmt_apitrace_log("session bundle changed; reopening", 0, 0);
+    dxmt_apitrace_close_session_locked();
+  }
+
   dxmt_apitrace_session = apitrace_metal_session_open(bundle_root);
   if (!dxmt_apitrace_session)
     return NULL;
+  snprintf(dxmt_apitrace_session_bundle_root, sizeof(dxmt_apitrace_session_bundle_root), "%s", bundle_root);
 
   if (!dxmt_apitrace_command_buffers)
     dxmt_apitrace_command_buffers = [[NSMutableDictionary alloc] init];
@@ -947,6 +1387,7 @@ dxmt_apitrace_close_session_locked(void) {
     apitrace_metal_session_close(dxmt_apitrace_session);
     dxmt_apitrace_session = NULL;
   }
+  dxmt_apitrace_session_bundle_root[0] = '\0';
   [dxmt_apitrace_command_buffers removeAllObjects];
   [dxmt_apitrace_encoders removeAllObjects];
   [dxmt_apitrace_functions removeAllObjects];
@@ -1692,17 +2133,199 @@ dxmt_apitrace_snapshot_buffer(apitrace_metal_session_t *session, obj_handle_t bu
   if ([buffer storageMode] == MTLStorageModePrivate || ![buffer contents])
     return;
 
-  NSString *address_payload = dxmt_apitrace_json_string(@{
-    @"kind" : @"dxmt_buffer_gpu_address",
-    @"buffer_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)buffer_handle],
-    @"gpu_address" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)[buffer gpuAddress]],
-  });
-  apitrace_metal_object_metadata(session, buffer_handle, address_payload.UTF8String);
+  apitrace_metal_buffer_gpu_address_metadata(session, buffer_handle, (uint64_t)[buffer gpuAddress]);
+}
+
+static void
+dxmt_apitrace_record_buffer_binding(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_stage_kind stage,
+    obj_handle_t buffer_handle,
+    uint64_t offset,
+    uint8_t index) {
+  uint64_t gpu_address = 0;
+  uint64_t length = 0;
+  if (buffer_handle) {
+    id<MTLBuffer> buffer = (id<MTLBuffer>)buffer_handle;
+    gpu_address = (uint64_t)[buffer gpuAddress] + offset;
+    length = (uint64_t)[buffer length];
+  }
+  apitrace_metal_argument_table_buffer_binding(
+      session, encoder, stage, index, buffer_handle, offset, gpu_address, length);
+}
+
+static void
+dxmt_apitrace_record_texture_binding(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_stage_kind stage,
+    obj_handle_t texture_handle,
+    uint8_t index) {
+  uint64_t resource_id = 0;
+  if (texture_handle)
+    resource_id = [(id<MTLTexture>)texture_handle gpuResourceID]._impl;
+  apitrace_metal_argument_table_texture_binding(session, encoder, stage, index, texture_handle, resource_id);
+}
+
+static void
+dxmt_apitrace_record_indirect_arguments(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_indirect_arguments_info_t *info) {
+  if (!info)
+    return;
+  if (info->indirect_buffer_id) {
+    id<MTLBuffer> buffer = (id<MTLBuffer>)info->indirect_buffer_id;
+    info->indirect_gpu_address = (uint64_t)[buffer gpuAddress] + info->indirect_offset;
+    info->indirect_buffer_length = (uint64_t)[buffer length];
+  }
+  apitrace_metal_indirect_arguments(session, encoder, info);
+}
+
+static void
+dxmt_apitrace_record_emulated_blit(
+    apitrace_metal_session_t *session,
+    obj_handle_t encoder,
+    apitrace_metal_emulated_blit_op op,
+    obj_handle_t source_texture,
+    obj_handle_t destination_buffer,
+    uint64_t destination_offset,
+    uint64_t bytes_per_row,
+    uint64_t bytes_per_image,
+    uint64_t slice,
+    uint64_t level) {
+  apitrace_metal_emulated_blit_marker(
+      session, encoder, op, source_texture, destination_buffer, destination_offset,
+      bytes_per_row, bytes_per_image, slice, level);
+}
+
+static void
+dxmt_apitrace_finalize_command_buffer_locked(obj_handle_t command_buffer) {
+  DXMT4ApitraceCommandBufferState *state =
+      [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(command_buffer)];
+  if (!dxmt_apitrace_session || !state)
+    return;
+
+  dxmt_apitrace_flush_command_buffer_blit_batch(dxmt_apitrace_session, command_buffer);
+  apitrace_metal_command_buffer_commit(dxmt_apitrace_session, command_buffer);
+  [dxmt_apitrace_command_buffers removeObjectForKey:dxmt_apitrace_key(command_buffer)];
+  dxmt_apitrace_set_sequence_locked(dxmt_apitrace_session, 0);
+}
+
+static void
+dxmt_apitrace_finalize_command_buffer(obj_handle_t command_buffer) {
+  if (!dxmt_apitrace_runtime_enabled())
+    return;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  dxmt_apitrace_finalize_command_buffer_locked(command_buffer);
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
+}
+
+static void
+dxmt_apitrace_record_command_buffer_commit_state(
+    obj_handle_t command_buffer,
+    apitrace_metal_command_buffer_commit_phase phase,
+    uint64_t wait_event_count,
+    uint64_t signal_event_count,
+    BOOL has_drawable,
+    uint64_t completion_value,
+    uint64_t d3d_sequence) {
+  if (!dxmt_apitrace_runtime_enabled())
+    return;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  if (dxmt_apitrace_ensure_session_locked()) {
+    apitrace_metal_command_buffer_commit_state(
+        dxmt_apitrace_session,
+        command_buffer,
+        phase,
+        wait_event_count,
+        signal_event_count,
+        has_drawable,
+        completion_value,
+        d3d_sequence);
+  }
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
+}
+
+static void
+dxmt_apitrace_record_command_buffer_feedback(
+    obj_handle_t command_buffer,
+    apitrace_metal_command_buffer_feedback_status status,
+    double gpu_start_time,
+    double gpu_end_time,
+    NSString *error) {
+  if (!dxmt_apitrace_runtime_enabled())
+    return;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  if (dxmt_apitrace_ensure_session_locked()) {
+    apitrace_metal_command_buffer_feedback(
+        dxmt_apitrace_session,
+        command_buffer,
+        status,
+        gpu_start_time,
+        gpu_end_time,
+        error ? error.UTF8String : "");
+  }
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
+}
+
+static void
+dxmt_apitrace_record_command_buffer_event(
+    obj_handle_t command_buffer,
+    apitrace_metal_queue_event_op op,
+    obj_handle_t event,
+    uint64_t value,
+    apitrace_metal_queue_event_phase phase) {
+  if (!dxmt_apitrace_runtime_enabled())
+    return;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  if (dxmt_apitrace_ensure_session_locked())
+    apitrace_metal_queue_event(dxmt_apitrace_session, command_buffer, op, phase, event, value);
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
+}
+
+static void
+dxmt_apitrace_record_counter_event(
+    obj_handle_t command_buffer,
+    apitrace_metal_counter_event_op op,
+    obj_handle_t counter_heap,
+    uint64_t start,
+    uint64_t count,
+    obj_handle_t destination_buffer,
+    uint64_t destination_offset,
+    uint64_t destination_length,
+    obj_handle_t wait_fence,
+    obj_handle_t update_fence) {
+  if (!dxmt_apitrace_runtime_enabled())
+    return;
+  pthread_mutex_lock(&dxmt_apitrace_lock);
+  if (dxmt_apitrace_ensure_session_locked()) {
+    apitrace_metal_counter_event(
+        dxmt_apitrace_session,
+        command_buffer,
+        op,
+        counter_heap,
+        start,
+        count,
+        destination_buffer,
+        destination_offset,
+        destination_length,
+        wait_fence,
+        update_fence);
+  }
+  pthread_mutex_unlock(&dxmt_apitrace_lock);
 }
 
 static void
 dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMT4ApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
+  if (state)
+    dxmt_apitrace_set_sequence_locked(session, state.d3dSequence);
+  struct {
+    obj_handle_t buffer;
+    uint64_t offset;
+  } vertex_buffers[31] = {}, fragment_buffers[31] = {};
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTRenderCommandType)base->type) {
     case WMTRenderCommandSetPSO: {
@@ -1713,26 +2336,50 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
     case WMTRenderCommandSetVertexBuffer: {
       const struct wmtcmd_render_setbuffer *cmd = (const struct wmtcmd_render_setbuffer *)base;
       apitrace_metal_set_vertex_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
+      if (cmd->index < 31) {
+        vertex_buffers[cmd->index].buffer = cmd->buffer;
+        vertex_buffers[cmd->index].offset = cmd->offset;
+      }
+      dxmt_apitrace_record_buffer_binding(
+          session, encoder, APITRACE_METAL_STAGE_VERTEX, cmd->buffer, cmd->offset, cmd->index);
       break;
     }
     case WMTRenderCommandSetFragmentBuffer: {
       const struct wmtcmd_render_setbuffer *cmd = (const struct wmtcmd_render_setbuffer *)base;
       apitrace_metal_set_fragment_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
+      if (cmd->index < 31) {
+        fragment_buffers[cmd->index].buffer = cmd->buffer;
+        fragment_buffers[cmd->index].offset = cmd->offset;
+      }
+      dxmt_apitrace_record_buffer_binding(
+          session, encoder, APITRACE_METAL_STAGE_FRAGMENT, cmd->buffer, cmd->offset, cmd->index);
       break;
     }
     case WMTRenderCommandSetVertexBufferOffset: {
       const struct wmtcmd_render_setbufferoffset *cmd = (const struct wmtcmd_render_setbufferoffset *)base;
       apitrace_metal_set_vertex_buffer_offset(session, encoder, cmd->offset, cmd->index);
+      if (cmd->index < 31) {
+        vertex_buffers[cmd->index].offset = cmd->offset;
+        dxmt_apitrace_record_buffer_binding(
+            session, encoder, APITRACE_METAL_STAGE_VERTEX, vertex_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+      }
       break;
     }
     case WMTRenderCommandSetFragmentBufferOffset: {
       const struct wmtcmd_render_setbufferoffset *cmd = (const struct wmtcmd_render_setbufferoffset *)base;
       apitrace_metal_set_fragment_buffer_offset(session, encoder, cmd->offset, cmd->index);
+      if (cmd->index < 31) {
+        fragment_buffers[cmd->index].offset = cmd->offset;
+        dxmt_apitrace_record_buffer_binding(
+            session, encoder, APITRACE_METAL_STAGE_FRAGMENT, fragment_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+      }
       break;
     }
     case WMTRenderCommandSetFragmentTexture: {
       const struct wmtcmd_render_settexture *cmd = (const struct wmtcmd_render_settexture *)base;
       apitrace_metal_set_fragment_texture(session, encoder, cmd->texture, cmd->index);
+      dxmt_apitrace_record_texture_binding(
+          session, encoder, APITRACE_METAL_STAGE_FRAGMENT, cmd->texture, cmd->index);
       break;
     }
     case WMTRenderCommandSetFragmentBytes: {
@@ -1808,6 +2455,14 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
       const struct wmtcmd_render_draw_indirect *cmd = (const struct wmtcmd_render_draw_indirect *)base;
       apitrace_metal_draw_primitives_indirect(
           session, encoder, cmd->primitive_type, cmd->indirect_args_buffer, cmd->indirect_args_offset);
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_DRAW,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->indirect_args_buffer,
+        .indirect_offset = cmd->indirect_args_offset,
+        .primitive_type = cmd->primitive_type,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
       break;
     }
     case WMTRenderCommandDrawIndexedIndirect: {
@@ -1815,6 +2470,113 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
       apitrace_metal_draw_indexed_primitives_indirect(
           session, encoder, cmd->primitive_type, cmd->index_type, cmd->index_buffer, cmd->index_buffer_offset,
           cmd->indirect_args_buffer, cmd->indirect_args_offset);
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_DRAW_INDEXED,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->indirect_args_buffer,
+        .indirect_offset = cmd->indirect_args_offset,
+        .index_buffer_id = cmd->index_buffer,
+        .index_buffer_offset = cmd->index_buffer_offset,
+        .primitive_type = cmd->primitive_type,
+        .index_type = cmd->index_type,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
+      break;
+    }
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
+      const struct wmtcmd_render_draw_meshthreadgroups_indirect *cmd =
+          (const struct wmtcmd_render_draw_meshthreadgroups_indirect *)base;
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_DRAW_MESH_THREADGROUPS,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->indirect_args_buffer,
+        .indirect_offset = cmd->indirect_args_offset,
+        .object_threadgroup_width = cmd->object_threadgroup_size.width,
+        .object_threadgroup_height = cmd->object_threadgroup_size.height,
+        .object_threadgroup_depth = cmd->object_threadgroup_size.depth,
+        .mesh_threadgroup_width = cmd->mesh_threadgroup_size.width,
+        .mesh_threadgroup_height = cmd->mesh_threadgroup_size.height,
+        .mesh_threadgroup_depth = cmd->mesh_threadgroup_size.depth,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
+      break;
+    }
+    case WMTRenderCommandDXMTGeometryDrawIndirect: {
+      const struct wmtcmd_render_dxmt_geometry_draw_indirect *cmd =
+          (const struct wmtcmd_render_dxmt_geometry_draw_indirect *)base;
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_GEOMETRY_DRAW,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->dispatch_args_buffer,
+        .indirect_offset = cmd->dispatch_args_offset,
+        .draw_arguments_buffer_id = cmd->indirect_args_buffer,
+        .draw_arguments_offset = cmd->indirect_args_offset,
+        .dispatch_arguments_buffer_id = cmd->dispatch_args_buffer,
+        .dispatch_arguments_offset = cmd->dispatch_args_offset,
+        .immediate_arguments_buffer_id = cmd->imm_draw_arguments,
+        .vertex_per_warp = cmd->vertex_per_warp,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
+      break;
+    }
+    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
+      const struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *cmd =
+          (const struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)base;
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_GEOMETRY_DRAW_INDEXED,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->dispatch_args_buffer,
+        .indirect_offset = cmd->dispatch_args_offset,
+        .draw_arguments_buffer_id = cmd->indirect_args_buffer,
+        .draw_arguments_offset = cmd->indirect_args_offset,
+        .dispatch_arguments_buffer_id = cmd->dispatch_args_buffer,
+        .dispatch_arguments_offset = cmd->dispatch_args_offset,
+        .immediate_arguments_buffer_id = cmd->imm_draw_arguments,
+        .index_buffer_id = cmd->index_buffer,
+        .index_buffer_offset = cmd->index_buffer_offset,
+        .vertex_per_warp = cmd->vertex_per_warp,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
+      break;
+    }
+    case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
+      const struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *cmd =
+          (const struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)base;
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_TESSELLATION_MESH_DRAW,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->dispatch_args_buffer,
+        .indirect_offset = cmd->dispatch_args_offset,
+        .draw_arguments_buffer_id = cmd->indirect_args_buffer,
+        .draw_arguments_offset = cmd->indirect_args_offset,
+        .dispatch_arguments_buffer_id = cmd->dispatch_args_buffer,
+        .dispatch_arguments_offset = cmd->dispatch_args_offset,
+        .immediate_arguments_buffer_id = cmd->imm_draw_arguments,
+        .threads_per_patch = cmd->threads_per_patch,
+        .patch_per_group = cmd->patch_per_group,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
+      break;
+    }
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
+      const struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *cmd =
+          (const struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)base;
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_TESSELLATION_MESH_DRAW_INDEXED,
+        .stage = APITRACE_METAL_STAGE_RENDER,
+        .indirect_buffer_id = cmd->dispatch_args_buffer,
+        .indirect_offset = cmd->dispatch_args_offset,
+        .draw_arguments_buffer_id = cmd->indirect_args_buffer,
+        .draw_arguments_offset = cmd->indirect_args_offset,
+        .dispatch_arguments_buffer_id = cmd->dispatch_args_buffer,
+        .dispatch_arguments_offset = cmd->dispatch_args_offset,
+        .immediate_arguments_buffer_id = cmd->imm_draw_arguments,
+        .index_buffer_id = cmd->index_buffer,
+        .index_buffer_offset = cmd->index_buffer_offset,
+        .threads_per_patch = cmd->threads_per_patch,
+        .patch_per_group = cmd->patch_per_group,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
       break;
     }
     case WMTRenderCommandWaitForFence:
@@ -1841,7 +2603,13 @@ dxmt_apitrace_record_render_commands(apitrace_metal_session_t *session, obj_hand
 static void
 dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMT4ApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
+  if (state)
+    dxmt_apitrace_set_sequence_locked(session, state.d3dSequence);
   struct WMTSize threadgroup_size = {1, 1, 1};
+  struct {
+    obj_handle_t buffer;
+    uint64_t offset;
+  } bound_buffers[31] = {};
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTComputeCommandType)base->type) {
     case WMTComputeCommandSetPSO: {
@@ -1853,11 +2621,22 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     case WMTComputeCommandSetBuffer: {
       const struct wmtcmd_compute_setbuffer *cmd = (const struct wmtcmd_compute_setbuffer *)base;
       apitrace_metal_set_compute_buffer(session, encoder, cmd->buffer, cmd->offset, cmd->index);
+      if (cmd->index < 31) {
+        bound_buffers[cmd->index].buffer = cmd->buffer;
+        bound_buffers[cmd->index].offset = cmd->offset;
+      }
+      dxmt_apitrace_record_buffer_binding(
+          session, encoder, APITRACE_METAL_STAGE_COMPUTE, cmd->buffer, cmd->offset, cmd->index);
       break;
     }
     case WMTComputeCommandSetBufferOffset: {
       const struct wmtcmd_compute_setbufferoffset *cmd = (const struct wmtcmd_compute_setbufferoffset *)base;
       apitrace_metal_set_compute_buffer_offset(session, encoder, cmd->offset, cmd->index);
+      if (cmd->index < 31) {
+        bound_buffers[cmd->index].offset = cmd->offset;
+        dxmt_apitrace_record_buffer_binding(
+            session, encoder, APITRACE_METAL_STAGE_COMPUTE, bound_buffers[cmd->index].buffer, cmd->offset, cmd->index);
+      }
       break;
     }
     case WMTComputeCommandSetBytes: {
@@ -1878,6 +2657,8 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
     case WMTComputeCommandSetTexture: {
       const struct wmtcmd_compute_settexture *cmd = (const struct wmtcmd_compute_settexture *)base;
       apitrace_metal_set_compute_texture(session, encoder, cmd->texture, cmd->index);
+      dxmt_apitrace_record_texture_binding(
+          session, encoder, APITRACE_METAL_STAGE_COMPUTE, cmd->texture, cmd->index);
       break;
     }
     case WMTComputeCommandUseResource: {
@@ -1905,6 +2686,16 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
       apitrace_metal_dispatch_threadgroups_indirect(
           session, encoder, cmd->indirect_args_buffer, cmd->indirect_args_offset,
           (uint32_t)threadgroup_size.width, (uint32_t)threadgroup_size.height, (uint32_t)threadgroup_size.depth);
+      apitrace_metal_indirect_arguments_info_t info = {
+        .op = APITRACE_METAL_INDIRECT_DISPATCH,
+        .stage = APITRACE_METAL_STAGE_COMPUTE,
+        .indirect_buffer_id = cmd->indirect_args_buffer,
+        .indirect_offset = cmd->indirect_args_offset,
+        .threadgroup_width = threadgroup_size.width,
+        .threadgroup_height = threadgroup_size.height,
+        .threadgroup_depth = threadgroup_size.depth,
+      };
+      dxmt_apitrace_record_indirect_arguments(session, encoder, &info);
       break;
     }
     case WMTComputeCommandWaitForFence:
@@ -1931,22 +2722,30 @@ dxmt_apitrace_record_compute_commands(apitrace_metal_session_t *session, obj_han
 static void
 dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle_t encoder, const struct wmtcmd_base *head) {
   DXMT4ApitraceEncoderState *state = [dxmt_apitrace_encoders objectForKey:dxmt_apitrace_key(encoder)];
+  if (!state)
+    return;
+  if (state)
+    dxmt_apitrace_set_sequence_locked(session, state.d3dSequence);
   for (const struct wmtcmd_base *base = head; base; base = (const struct wmtcmd_base *)base->next.ptr) {
     switch ((enum WMTBlitCommandType)base->type) {
     case WMTBlitCommandCopyFromBufferToBuffer: {
-      dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
-      dxmt_apitrace_flush_blit_ops(session, encoder, state);
-      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       const struct wmtcmd_blit_copy_from_buffer_to_buffer *cmd = (const struct wmtcmd_blit_copy_from_buffer_to_buffer *)base;
+      if (state.kind != DXMTApitraceEncoderKindMetal4Blit) {
+        dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
+        dxmt_apitrace_flush_blit_ops(session, encoder, state);
+        dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      }
       apitrace_metal_copy_buffer(
           session, encoder, cmd->src, cmd->src_offset, cmd->dst, cmd->dst_offset, cmd->copy_length);
       break;
     }
     case WMTBlitCommandCopyFromBufferToTexture: {
-      dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
-      dxmt_apitrace_flush_blit_ops(session, encoder, state);
-      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       const struct wmtcmd_blit_copy_from_buffer_to_texture *cmd = (const struct wmtcmd_blit_copy_from_buffer_to_texture *)base;
+      if (state.kind != DXMTApitraceEncoderKindMetal4Blit) {
+        dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
+        dxmt_apitrace_flush_blit_ops(session, encoder, state);
+        dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      }
       NSString *payload = dxmt_apitrace_copy_buffer_to_texture_json(
           cmd->src, cmd->src_offset, cmd->bytes_per_row, cmd->bytes_per_image, &cmd->size, cmd->dst, cmd->slice,
           cmd->level, &cmd->origin);
@@ -1955,7 +2754,12 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
       const struct wmtcmd_blit_copy_from_texture_to_texture *cmd = (const struct wmtcmd_blit_copy_from_texture_to_texture *)base;
-      if (!state.blitOps.count) {
+      if (state.kind == DXMTApitraceEncoderKindMetal4Blit) {
+        NSString *payload = dxmt_apitrace_copy_texture_json(
+            cmd->src, cmd->dst, &cmd->src_origin, &cmd->src_size, cmd->src_slice, cmd->src_level,
+            &cmd->dst_origin, cmd->dst_slice, cmd->dst_level);
+        apitrace_metal_copy_texture(session, encoder, cmd->src, cmd->dst, payload.UTF8String);
+      } else if (!state.blitOps.count) {
         dxmt_apitrace_accumulate_command_buffer_blit_fences(state.commandBuffer, state);
         dxmt_apitrace_accumulate_command_buffer_blit_copy_texture(session, state.commandBuffer, cmd);
       } else {
@@ -1972,31 +2776,98 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     }
     case WMTBlitCommandFillBuffer: {
       const struct wmtcmd_blit_fillbuffer *cmd = (const struct wmtcmd_blit_fillbuffer *)base;
-      [state.blitOps addObject:@{
-        @"op" : @"fill_buffer",
-        @"buffer_id" : @(cmd->buffer),
-        @"range_start" : @(cmd->offset),
-        @"range_length" : @(cmd->length),
-        @"value" : @(cmd->value),
-      }];
+      if (state.kind == DXMTApitraceEncoderKindMetal4Blit) {
+        apitrace_metal_blit_fill(session, encoder, cmd->buffer, cmd->offset, cmd->length, cmd->value);
+      } else {
+        [state.blitOps addObject:@{
+          @"op" : @"fill_buffer",
+          @"buffer_id" : @(cmd->buffer),
+          @"range_start" : @(cmd->offset),
+          @"range_length" : @(cmd->length),
+          @"value" : @(cmd->value),
+        }];
+      }
       break;
     }
     case WMTBlitCommandWaitForFence:
     case WMTBlitCommandUpdateFence: {
       const struct wmtcmd_blit_fence_op *cmd = (const struct wmtcmd_blit_fence_op *)base;
-      uint64_t fence = cmd->fence;
-      if (base->type == WMTBlitCommandWaitForFence)
-        [state.blitWaitFences appendBytes:&fence length:sizeof(fence)];
-      else
-        [state.blitUpdateFences appendBytes:&fence length:sizeof(fence)];
+      if (state.kind == DXMTApitraceEncoderKindMetal4Blit) {
+        dxmt_apitrace_append_fence_op(
+            state,
+            base->type == WMTBlitCommandWaitForFence ? "wait" : "update",
+            cmd->fence,
+            MTLStageBlit);
+      } else {
+        uint64_t fence = cmd->fence;
+        if (base->type == WMTBlitCommandWaitForFence)
+          [state.blitWaitFences appendBytes:&fence length:sizeof(fence)];
+        else
+          [state.blitUpdateFences appendBytes:&fence length:sizeof(fence)];
+      }
       break;
     }
-    case WMTBlitCommandCopyFromTextureToBuffer:
-    case WMTBlitCommandGenerateMipmaps:
+    case WMTBlitCommandCopyFromTextureToBuffer: {
+      const struct wmtcmd_blit_copy_from_texture_to_buffer *cmd =
+          (const struct wmtcmd_blit_copy_from_texture_to_buffer *)base;
+      if (state.kind == DXMTApitraceEncoderKindMetal4Blit) {
+        dxmt_apitrace_record_emulated_blit(
+            session,
+            encoder,
+            APITRACE_METAL_EMULATED_BLIT_COPY_TEXTURE_TO_BUFFER,
+            cmd->src,
+            cmd->dst,
+            cmd->offset,
+            cmd->bytes_per_row,
+            cmd->bytes_per_image,
+            cmd->slice,
+            cmd->level);
+      } else {
+        dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
+        dxmt_apitrace_flush_blit_ops(session, encoder, state);
+        dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      }
+      break;
+    }
+    case WMTBlitCommandGenerateMipmaps: {
+      const struct wmtcmd_blit_generate_mipmaps *cmd = (const struct wmtcmd_blit_generate_mipmaps *)base;
+      if (state.kind == DXMTApitraceEncoderKindMetal4Blit) {
+        dxmt_apitrace_record_emulated_blit(
+            session,
+            encoder,
+            APITRACE_METAL_EMULATED_BLIT_GENERATE_MIPMAPS,
+            cmd->texture,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0);
+      } else {
+        dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
+        dxmt_apitrace_flush_blit_ops(session, encoder, state);
+        dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      }
+      break;
+    }
     case WMTBlitCommandResolveCounters:
-      dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
-      dxmt_apitrace_flush_blit_ops(session, encoder, state);
-      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      if (state.kind == DXMTApitraceEncoderKindMetal4Blit) {
+        dxmt_apitrace_record_emulated_blit(
+            session,
+            encoder,
+            APITRACE_METAL_EMULATED_BLIT_RESOLVE_COUNTERS,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0);
+      } else {
+        dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
+        dxmt_apitrace_flush_blit_ops(session, encoder, state);
+        dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      }
       break;
     default:
       break;
@@ -2011,11 +2882,14 @@ dxmt_apitrace_begin_encoder_locked(
     obj_handle_t encoder,
     obj_handle_t command_buffer,
     const struct WMTRenderPassInfo *render_pass_info) {
-  if (!session || !dxmt_apitrace_current_d3d_sequence)
+  if (!session)
     return;
-  if (![dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(command_buffer)])
+  DXMT4ApitraceCommandBufferState *command_state =
+      [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(command_buffer)];
+  if (!command_state || !command_state.d3dSequence)
     return;
 
+  dxmt_apitrace_set_sequence_locked(session, command_state.d3dSequence);
   uint64_t begin_sequence = 0;
   BOOL metal_trace_began = YES;
   switch (kind) {
@@ -2032,12 +2906,16 @@ dxmt_apitrace_begin_encoder_locked(
   case DXMTApitraceEncoderKindBlit:
     metal_trace_began = NO;
     break;
+  case DXMTApitraceEncoderKindMetal4Blit:
+    dxmt_apitrace_flush_command_buffer_blit_batch(session, command_buffer);
+    begin_sequence = apitrace_metal_emulated_blit_encoder_begin(session, encoder, command_buffer);
+    break;
   }
 
   DXMT4ApitraceEncoderState *state = [[DXMT4ApitraceEncoderState alloc] init];
   state.beginSequence = begin_sequence;
   state.commandBuffer = command_buffer;
-  state.d3dSequence = dxmt_apitrace_current_d3d_sequence;
+  state.d3dSequence = command_state.d3dSequence;
   state.kind = kind;
   state.metalTraceBegan = metal_trace_began;
   [dxmt_apitrace_encoders setObject:state forKey:dxmt_apitrace_key(encoder)];
@@ -2069,6 +2947,7 @@ dxmt_apitrace_end_encoder_locked(apitrace_metal_session_t *session, obj_handle_t
     apitrace_metal_render_encoder_end(session, encoder);
     break;
   case DXMTApitraceEncoderKindCompute:
+  case DXMTApitraceEncoderKindMetal4Blit:
     apitrace_metal_compute_encoder_end(session, encoder);
     break;
   case DXMTApitraceEncoderKindBlit:
@@ -2244,7 +3123,7 @@ _MTLSharedEvent_signaledValue(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_encodeSignalEvent(void *obj) {
   struct unixcall_generic_obj_obj_uint64_noret *params = obj;
-  [(DXMTMetal4CommandBuffer *)params->handle encodeSignalEvent:(id<MTLSharedEvent>)params->arg0 value:params->arg1];
+  [(DXMTMetal4CommandBuffer *)params->handle encodeSignalEvent:(id<MTLEvent>)params->arg0 value:params->arg1];
   return STATUS_SUCCESS;
 }
 
@@ -2270,12 +3149,7 @@ _MTLDevice_newBuffer(void *obj) {
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
     if (dxmt_apitrace_ensure_session_locked()) {
-      NSString *address_payload = dxmt_apitrace_json_string(@{
-        @"kind" : @"dxmt_buffer_gpu_address",
-        @"buffer_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)params->ret],
-        @"gpu_address" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)[buffer gpuAddress]],
-      });
-      apitrace_metal_object_metadata(dxmt_apitrace_session, params->ret, address_payload.UTF8String);
+      apitrace_metal_buffer_gpu_address_metadata(dxmt_apitrace_session, params->ret, [buffer gpuAddress]);
       apitrace_metal_register_buffer(
           dxmt_apitrace_session,
           params->ret,
@@ -2574,7 +3448,7 @@ _MTLBuffer_newTexture(void *obj) {
 
   id<MTLTexture> ret = [buffer newTextureWithDescriptor:desc offset:params->offset bytesPerRow:params->bytes_per_row];
   params->ret = (obj_handle_t)ret;
-  info->gpu_resource_id = [ret gpuResourceID]._impl;
+  info->gpu_resource_id = ret ? [ret gpuResourceID]._impl : 0;
   info->mach_port = 0;
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
@@ -2772,7 +3646,7 @@ _MTLCommandBuffer_blitCommandEncoder(void *obj) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
     dxmt_apitrace_begin_encoder_locked(
         dxmt_apitrace_ensure_session_locked(),
-        DXMTApitraceEncoderKindBlit,
+        DXMTApitraceEncoderKindMetal4Blit,
         params->ret,
         params->handle,
         NULL);
@@ -3196,7 +4070,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     pthread_mutex_unlock(&dxmt_apitrace_lock);
   }
 #endif
-  bool has_prior_blit_work = false;
   while (next) {
     switch ((enum WMTBlitCommandType)next->type) {
     default:
@@ -3206,77 +4079,62 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_blit_copy_from_buffer_to_buffer *body = (struct wmtcmd_blit_copy_from_buffer_to_buffer *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
       [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
-      if (has_prior_blit_work)
-        [encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
-	      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
-	                 sourceOffset:body->src_offset
-	                     toBuffer:(id<MTLBuffer>)body->dst
-	            destinationOffset:body->dst_offset
-	                         size:body->copy_length];
-      has_prior_blit_work = true;
+      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
+                 sourceOffset:body->src_offset
+                     toBuffer:(id<MTLBuffer>)body->dst
+            destinationOffset:body->dst_offset
+                         size:body->copy_length];
       break;
     }
     case WMTBlitCommandCopyFromBufferToTexture: {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
       [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
-      if (has_prior_blit_work)
-        [encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
             sourceBytesPerRow:body->bytes_per_row
           sourceBytesPerImage:body->bytes_per_image
-	                   sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
-	                    toTexture:(id<MTLTexture>)body->dst
-	             destinationSlice:body->slice
-	             destinationLevel:body->level
-	            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)];
-      has_prior_blit_work = true;
+                   sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                     toTexture:(id<MTLTexture>)body->dst
+              destinationSlice:body->slice
+              destinationLevel:body->level
+             destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)];
       break;
     }
     case WMTBlitCommandCopyFromTextureToBuffer: {
       struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
       [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
-      if (has_prior_blit_work)
-        [encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                        sourceSlice:body->slice
                        sourceLevel:body->level
                       sourceOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
-	                        sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
-	                          toBuffer:(id<MTLBuffer>)body->dst
-	                 destinationOffset:body->offset
-	            destinationBytesPerRow:body->bytes_per_row
-	          destinationBytesPerImage:body->bytes_per_image];
-      has_prior_blit_work = true;
+                        sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                          toBuffer:(id<MTLBuffer>)body->dst
+                 destinationOffset:body->offset
+            destinationBytesPerRow:body->bytes_per_row
+          destinationBytesPerImage:body->bytes_per_image];
       break;
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
       struct wmtcmd_blit_copy_from_texture_to_texture *body = (struct wmtcmd_blit_copy_from_texture_to_texture *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
       [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
-      if (has_prior_blit_work)
-        [encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                    sourceSlice:body->src_slice
                    sourceLevel:body->src_level
                   sourceOrigin:MTLOriginMake(body->src_origin.x, body->src_origin.y, body->src_origin.z)
-	                    sourceSize:MTLSizeMake(body->src_size.width, body->src_size.height, body->src_size.depth)
-	                     toTexture:(id<MTLTexture>)body->dst
-	              destinationSlice:body->dst_slice
-	              destinationLevel:body->dst_level
-	             destinationOrigin:MTLOriginMake(body->dst_origin.x, body->dst_origin.y, body->dst_origin.z)];
-      has_prior_blit_work = true;
+                    sourceSize:MTLSizeMake(body->src_size.width, body->src_size.height, body->src_size.depth)
+                     toTexture:(id<MTLTexture>)body->dst
+              destinationSlice:body->dst_slice
+              destinationLevel:body->dst_level
+             destinationOrigin:MTLOriginMake(body->dst_origin.x, body->dst_origin.y, body->dst_origin.z)];
       break;
     }
     case WMTBlitCommandGenerateMipmaps: {
       struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->texture];
-      if (has_prior_blit_work)
-        [encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
-      has_prior_blit_work = true;
       break;
     }
     case WMTBlitCommandUpdateFence: {
@@ -3294,10 +4152,7 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     case WMTBlitCommandFillBuffer: {
       struct wmtcmd_blit_fillbuffer *body = (struct wmtcmd_blit_fillbuffer *)next;
       [owner useResidencyAllocation:(id<MTLAllocation>)body->buffer];
-      if (has_prior_blit_work)
-        [encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
-      has_prior_blit_work = true;
       break;
     }
     case WMTBlitCommandResolveCounters: {
@@ -5356,7 +6211,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_encodeWaitForEvent(void *obj) {
   struct unixcall_generic_obj_obj_uint64_noret *params = obj;
-  [(DXMTMetal4CommandBuffer *)params->handle encodeWaitForEvent:(id<MTLSharedEvent>)params->arg0 value:params->arg1];
+  [(DXMTMetal4CommandBuffer *)params->handle encodeWaitForEvent:(id<MTLEvent>)params->arg0 value:params->arg1];
   return STATUS_SUCCESS;
 }
 
@@ -5861,10 +6716,7 @@ _WMT4ApitraceSetCurrentD3DSequence(void *obj) {
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
-  dxmt_apitrace_current_d3d_sequence = params->arg;
-  if (dxmt_apitrace_ensure_session_locked()) {
-    apitrace_metal_set_current_d3d_sequence(dxmt_apitrace_session, params->arg);
-  }
+  dxmt_apitrace_set_sequence_locked(dxmt_apitrace_ensure_session_locked(), params->arg);
   pthread_mutex_unlock(&dxmt_apitrace_lock);
   return STATUS_SUCCESS;
 }
@@ -5876,10 +6728,12 @@ _WMT4ApitraceCommandBufferBegin(void *obj) {
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
   if (dxmt_apitrace_ensure_session_locked()) {
+    dxmt_apitrace_set_sequence_locked(dxmt_apitrace_session, dxmt_apitrace_current_d3d_sequence);
     uint64_t begin_sequence =
         apitrace_metal_command_buffer_begin(dxmt_apitrace_session, params->command_buffer, params->frame_id, "");
     DXMT4ApitraceCommandBufferState *state = [[DXMT4ApitraceCommandBufferState alloc] init];
     state.beginSequence = begin_sequence;
+    state.d3dSequence = dxmt_apitrace_current_d3d_sequence;
     [dxmt_apitrace_command_buffers setObject:state forKey:dxmt_apitrace_key(params->command_buffer)];
     [state release];
   }
@@ -5895,11 +6749,15 @@ _WMT4ApitraceCommandBufferCommit(void *obj) {
   pthread_mutex_lock(&dxmt_apitrace_lock);
   DXMT4ApitraceCommandBufferState *state = [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(params->handle)];
   if (dxmt_apitrace_session && state) {
-    dxmt_apitrace_flush_command_buffer_blit_batch(dxmt_apitrace_session, params->handle);
-    apitrace_metal_command_buffer_commit(dxmt_apitrace_session, params->handle);
-    [dxmt_apitrace_command_buffers removeObjectForKey:dxmt_apitrace_key(params->handle)];
-    apitrace_metal_set_current_d3d_sequence(dxmt_apitrace_session, 0);
-    dxmt_apitrace_current_d3d_sequence = 0;
+    apitrace_metal_command_buffer_commit_state(
+        dxmt_apitrace_session,
+        params->handle,
+        APITRACE_METAL_COMMAND_BUFFER_COMMIT_RECORDED_BEFORE_NATIVE_COMMIT,
+        0,
+        0,
+        0,
+        0,
+        state.d3dSequence);
   }
   pthread_mutex_unlock(&dxmt_apitrace_lock);
   return STATUS_SUCCESS;
@@ -5952,6 +6810,7 @@ NTSTATUS _WMT4CacheWriter_set(void *obj);
 NTSTATUS _WMT4SetMetalShaderCachePath(void *obj);
 NTSTATUS _MTL4CounterHeap_newTimestampHeap(void *obj);
 NTSTATUS _MTL4CounterHeap_resolveCounterRange(void *obj);
+NTSTATUS _MTL4CommandBuffer_resolveCounterHeap(void *obj);
 NTSTATUS _MTL4TimestampContext_create(void *obj);
 NTSTATUS _MTL4TimestampContext_destroy(void *obj);
 NTSTATUS _MTL4TimestampContext_writeTimestamp(void *obj);
@@ -6112,6 +6971,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4TimestampContext_destroy,
     &_MTL4TimestampContext_writeTimestamp,
     &_MTLDevice_sizeOfTimestampHeapEntry,
+    &_MTL4CommandBuffer_resolveCounterHeap,
 };
 
 #ifndef DXMT_NATIVE
@@ -6270,5 +7130,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4TimestampContext_destroy,
     &_MTL4TimestampContext_writeTimestamp,
     &_MTLDevice_sizeOfTimestampHeapEntry,
+    &_MTL4CommandBuffer_resolveCounterHeap,
 };
 #endif

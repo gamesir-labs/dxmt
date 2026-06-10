@@ -660,6 +660,15 @@ public:
     return MTLCommandBuffer_encodeWaitForEvent(handle, event.handle, value);
   }
 
+  void
+  resolveCounterHeap(
+      CounterHeap heap, uint64_t start, uint64_t count, Buffer dst_buffer,
+      uint64_t dst_offset, uint64_t dst_length, Fence wait_fence = {}, Fence update_fence = {}) {
+    MTL4CommandBuffer_resolveCounterHeap(
+        handle, heap.handle, start, count, dst_buffer.handle, dst_offset, dst_length,
+        wait_fence.handle, update_fence.handle);
+  }
+
   RenderCommandEncoder
   renderCommandEncoder(WMTRenderPassInfo &info) {
     return RenderCommandEncoder{MTLCommandBuffer_renderCommandEncoder(handle, &info)};

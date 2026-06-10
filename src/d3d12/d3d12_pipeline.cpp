@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_pipeline_diag.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include "util_env.hpp"
@@ -2127,6 +2128,8 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   }
 
   out.threadgroup_size = {tgx, tgy, tgz};
+  RegisterComputePipelineDiagInfo(static_cast<obj_handle_t>(out.pso),
+                                  std::string(shader_cache_key));
   return true;
 }
 

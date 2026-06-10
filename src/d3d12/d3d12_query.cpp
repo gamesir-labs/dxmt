@@ -156,6 +156,26 @@ public:
     queries_[index].valid = true;
   }
 
+  uint64_t TimestampSampleSequence(D3D12_QUERY_TYPE type, UINT index) const override {
+    if (!ValidateAccess(type, index))
+      return ~0ull;
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
+        type != D3D12_QUERY_TYPE_TIMESTAMP)
+      return ~0ull;
+    const auto &query = queries_[index];
+    return query.timestamp ? query.timestamp->sampleSequence() : ~0ull;
+  }
+
+  uint64_t TimestampSampleIndex(D3D12_QUERY_TYPE type, UINT index) const override {
+    if (!ValidateAccess(type, index))
+      return ~0ull;
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
+        type != D3D12_QUERY_TYPE_TIMESTAMP)
+      return ~0ull;
+    const auto &query = queries_[index];
+    return query.timestamp ? query.timestamp->sampleIndex() : ~0ull;
+  }
+
   bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) override {
     if (!ValidateAccess(type, index))
       return false;
@@ -195,7 +215,7 @@ public:
     const auto stride = ResolveStride(type);
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12QueryDiagShouldLog(log_count)) {
-      WARN("D3D12 query diagnostic: Resolve enter"
+      WARN_FILE_ONLY("D3D12 query diagnostic: Resolve enter"
            " heap=", reinterpret_cast<uintptr_t>(this),
            " heapType=", desc_.Type,
            " type=", type,
@@ -216,7 +236,7 @@ public:
       const auto &query = queries_[start_index + i];
       const auto offset = size_t(i) * stride;
       if (D3D12QueryDiagShouldLog(log_count)) {
-        WARN("D3D12 query diagnostic: Resolve query"
+        WARN_FILE_ONLY("D3D12 query diagnostic: Resolve query"
              " heap=", reinterpret_cast<uintptr_t>(this),
              " type=", type,
              " index=", start_index + i,
@@ -262,7 +282,7 @@ public:
       }
     }
     if (D3D12QueryDiagShouldLog(log_count)) {
-      WARN("D3D12 query diagnostic: Resolve leave"
+      WARN_FILE_ONLY("D3D12 query diagnostic: Resolve leave"
            " heap=", reinterpret_cast<uintptr_t>(this),
            " heapType=", desc_.Type,
            " type=", type,

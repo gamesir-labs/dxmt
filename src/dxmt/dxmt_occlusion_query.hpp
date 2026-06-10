@@ -3,6 +3,7 @@
 #include "Metal.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "wsi_platform.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -222,8 +223,31 @@ public:
     cached_value_ = sampled_data;
   }
 
+  uint64_t
+  sampleIndex() const {
+    return sample_index_;
+  }
+
+  uint64_t
+  sampleSequence() const {
+    return sample_sequence_;
+  }
+
+  void
+  setSampleIndex(uint64_t sample_index) {
+    sample_index_ = sample_index;
+  }
+
+  void
+  setSampleLocation(uint64_t sample_sequence, uint64_t sample_index) {
+    sample_sequence_ = sample_sequence;
+    sample_index_ = sample_index;
+  }
+
 private:
   uint64_t cached_value_ = ~0ull;
+  uint64_t sample_sequence_ = ~0ull;
+  uint64_t sample_index_ = ~0ull;
   std::atomic<uint32_t> refcount_ = {0u};
 };
 
@@ -275,6 +299,11 @@ public:
   WMT::CounterHeap counterHeap() {
     return timestamp_heap_;
   };
+
+  uint64_t
+  heapEntrySize() const {
+    return heap_entry_size_;
+  }
 
   WMT::TimestampContext timestampContext() {
     return timestamp_context_;
@@ -334,6 +363,11 @@ public:
     return {};
   };
 
+  uint64_t
+  heapEntrySize() const {
+    return 0;
+  }
+
   WMT::TimestampContext timestampContext() {
     return {};
   }
@@ -361,13 +395,23 @@ public:
 
   uint64_t
   addQuery(TimestampQuery *query) {
-    queries_.push_back({query, num_samples_});
-    return num_samples_++;
+    auto sample_index = num_samples_;
+    addQueryAt(query, sample_index);
+    return sample_index;
+  }
+
+  uint64_t
+  addQueryAt(TimestampQuery *query, uint64_t sample_index) {
+    query->setSampleIndex(sample_index);
+    queries_.push_back({query, sample_index});
+    num_samples_ = std::max(num_samples_, sample_index + 1);
+    return sample_index;
   }
 
   void
   coalesceQuery(TimestampQuery *query) {
     assert(num_samples_);
+    query->setSampleIndex(num_samples_ - 1);
     queries_.push_back({query, num_samples_ - 1});
   }
 

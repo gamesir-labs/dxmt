@@ -422,6 +422,18 @@ struct unixcall_mtl4counterheap_resolvecounterrange {
   uint64_t data_length;
 };
 
+struct unixcall_mtl4commandbuffer_resolvecounterheap {
+  obj_handle_t cmdbuf;
+  obj_handle_t heap;
+  uint64_t start;
+  uint64_t count;
+  obj_handle_t dst_buffer;
+  uint64_t dst_offset;
+  uint64_t dst_length;
+  obj_handle_t wait_fence;
+  obj_handle_t update_fence;
+};
+
 struct unixcall_mtl4timestampcontext_writetimestamp {
   obj_handle_t context;
   obj_handle_t mtl_command_buffer;
