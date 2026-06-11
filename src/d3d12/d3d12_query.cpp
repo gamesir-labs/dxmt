@@ -176,6 +176,16 @@ public:
     return query.timestamp ? query.timestamp->sampleIndex() : ~0ull;
   }
 
+  Rc<TimestampQuery> TimestampQueryAt(D3D12_QUERY_TYPE type,
+                                      UINT index) const override {
+    if (!ValidateAccess(type, index))
+      return {};
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
+        type != D3D12_QUERY_TYPE_TIMESTAMP)
+      return {};
+    return queries_[index].timestamp;
+  }
+
   bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) override {
     if (!ValidateAccess(type, index))
       return false;

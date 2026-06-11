@@ -244,10 +244,33 @@ public:
     sample_index_ = sample_index;
   }
 
+#if DXMT_DX12_METAL4
+  void
+  setResolveSource(const WMT::Reference<WMT::CounterHeap> &heap,
+                   uint64_t heap_entry_size) {
+    resolve_heap_ = heap;
+    resolve_heap_entry_size_ = heap_entry_size;
+  }
+
+  WMT::Reference<WMT::CounterHeap>
+  resolveHeap() const {
+    return resolve_heap_;
+  }
+
+  uint64_t
+  resolveHeapEntrySize() const {
+    return resolve_heap_entry_size_;
+  }
+#endif
+
 private:
   uint64_t cached_value_ = ~0ull;
   uint64_t sample_sequence_ = ~0ull;
   uint64_t sample_index_ = ~0ull;
+#if DXMT_DX12_METAL4
+  WMT::Reference<WMT::CounterHeap> resolve_heap_;
+  uint64_t resolve_heap_entry_size_ = 0;
+#endif
   std::atomic<uint32_t> refcount_ = {0u};
 };
 
@@ -268,6 +291,8 @@ public:
     assert(timestamp_context_);
     assert(timestamp_heap_);
     assert(heap_entry_size_ >= sizeof(WMTMTL4TimestampHeapEntry));
+    for (const auto &[query, sample_index] : queries_)
+      query->setResolveSource(timestamp_heap_, heap_entry_size_);
 #else
     sample_buffer_ = device.newCounterSampleBuffer(num_samples, true);
 #endif

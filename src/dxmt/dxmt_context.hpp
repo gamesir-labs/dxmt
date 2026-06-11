@@ -314,6 +314,9 @@ struct SampleTimestampData: EncoderData {
 
 struct ResolveTimestampData : EncoderData {
   struct Range {
+#if DXMT_DX12_METAL4
+    WMT::Reference<WMT::CounterHeap> src_heap;
+#endif
     WMT::Reference<WMT::Buffer> dst_buffer;
     uint64_t start_index;
     uint64_t query_count;
@@ -904,6 +907,19 @@ public:
   void resolveTimestamp(uint64_t start_index, uint64_t query_count,
                         WMT::Reference<WMT::Buffer> dst_buffer, uint64_t dst_offset,
                         uint64_t dst_length);
+#if DXMT_DX12_METAL4
+  void resolveTimestamp(WMT::Reference<WMT::CounterHeap> src_heap,
+                        uint64_t start_index, uint64_t query_count,
+                        WMT::Reference<WMT::Buffer> dst_buffer,
+                        uint64_t dst_offset, uint64_t dst_length);
+#endif
+  void appendResolveTimestampRange(
+#if DXMT_DX12_METAL4
+      WMT::Reference<WMT::CounterHeap> src_heap,
+#endif
+      uint64_t start_index, uint64_t query_count,
+      WMT::Reference<WMT::Buffer> dst_buffer, uint64_t dst_offset,
+      uint64_t dst_length);
 
   void barrierOnQueue(WMT::CommandBuffer cmdbuf) {
     barrier_index_++;

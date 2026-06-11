@@ -427,6 +427,12 @@ D3D12TimestampGpuResolveEnabled() {
   return enabled;
 }
 
+static std::atomic<uint64_t> g_timestamp_gpu_resolve_runs = {0};
+static std::atomic<uint64_t> g_timestamp_gpu_resolve_queries = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_fallbacks = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_fallback_queries = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_wait_us = {0};
+
 static bool
 D3D12DeferredTimestampMarkersEnabled() {
   static const bool enabled =
@@ -4065,10 +4071,17 @@ private:
   };
 
   struct PendingTimestampResolve {
+    struct Sample {
+#if DXMT_DX12_METAL4
+      WMT::Reference<WMT::CounterHeap> heap;
+      uint64_t heap_entry_size = 0;
+#endif
+      uint64_t index = ~0ull;
+    };
     Com<ID3D12GraphicsCommandList> command_list;
     Com<ID3D12QueryHeap> heap;
     Com<ID3D12Resource> dst_buffer;
-    std::vector<uint64_t> sample_indices;
+    std::vector<Sample> samples;
     UINT start_index = 0;
     UINT query_count = 0;
     UINT64 dst_offset = 0;
@@ -4312,16 +4325,20 @@ private:
     if (!heap || !dst || !dst->GetBufferAllocation() || !resolve.query_count)
       return;
 
-    if (resolve.sample_indices.empty()) {
-      const auto start_sample = heap->TimestampSampleIndex(
-          D3D12_QUERY_TYPE_TIMESTAMP, resolve.start_index);
+    if (resolve.samples.empty()) {
+      const auto start_sample =
+          heap->TimestampSampleIndex(D3D12_QUERY_TYPE_TIMESTAMP,
+                                     resolve.start_index);
       if (start_sample == ~0ull)
         return;
-      for (UINT i = 0; i < resolve.query_count; i++)
-        resolve.sample_indices.push_back(start_sample + i);
+      for (UINT i = 0; i < resolve.query_count; i++) {
+        PendingTimestampResolve::Sample sample = {};
+        sample.index = start_sample + i;
+        resolve.samples.push_back(std::move(sample));
+      }
     }
 
-    if (resolve.sample_indices.size() < resolve.query_count)
+    if (resolve.samples.size() < resolve.query_count)
       return;
 
     Rc<BufferAllocation> allocation = dst->GetBufferAllocation();
@@ -4330,22 +4347,43 @@ private:
     dst->AddPendingTimestampResolve(resolve.dst_offset, resolve.byte_count,
                                     device_->GetDXMTDevice().queue().CurrentSeqId());
     for (UINT i = 0; i < resolve.query_count;) {
-      const uint64_t start_sample = resolve.sample_indices[i];
+      const auto &first_sample = resolve.samples[i];
+      const uint64_t start_sample = first_sample.index;
+      if (start_sample == ~0ull)
+        return;
       UINT run_count = 1;
       while (i + run_count < resolve.query_count &&
-             resolve.sample_indices[i + run_count] ==
-                 start_sample + run_count)
+             resolve.samples[i + run_count].index == start_sample + run_count
+#if DXMT_DX12_METAL4
+             && resolve.samples[i + run_count].heap == first_sample.heap
+             && resolve.samples[i + run_count].heap_entry_size ==
+                    first_sample.heap_entry_size
+#endif
+      )
         run_count++;
 
       const uint64_t run_dst_offset =
           dst_buffer_offset + uint64_t(i) * sizeof(uint64_t);
       const uint64_t run_dst_length =
           uint64_t(run_count) * sizeof(uint64_t);
+#if DXMT_DX12_METAL4
+      WMT::Reference<WMT::CounterHeap> src_heap(first_sample.heap);
+      chunk->emitcc([src_heap = std::move(src_heap), start_sample, run_count,
+                     dst_buffer, run_dst_offset,
+                     run_dst_length](ArgumentEncodingContext &enc) mutable {
+        enc.resolveTimestamp(std::move(src_heap), start_sample, run_count,
+                             dst_buffer, run_dst_offset, run_dst_length);
+      });
+#else
       chunk->emitcc([start_sample, run_count, dst_buffer, run_dst_offset,
                      run_dst_length](ArgumentEncodingContext &enc) {
         enc.resolveTimestamp(start_sample, run_count, dst_buffer,
                              run_dst_offset, run_dst_length);
       });
+#endif
+      g_timestamp_gpu_resolve_runs.fetch_add(1, std::memory_order_relaxed);
+      g_timestamp_gpu_resolve_queries.fetch_add(run_count,
+                                                std::memory_order_relaxed);
       i += run_count;
     }
   }
@@ -4473,12 +4511,26 @@ private:
          " count=", selected.size(),
          " seq=", seq,
          " coherent=", queue.CoherentSeqId());
+    const auto wait_begin = std::chrono::steady_clock::now();
     queue.WaitCPUFence(seq);
+    const auto wait_end = std::chrono::steady_clock::now();
+    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             wait_end - wait_begin)
+                             .count();
+    if (wait_us > 0)
+      g_timestamp_cpu_wait_us.fetch_add(uint64_t(wait_us),
+                                        std::memory_order_relaxed);
     WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait end"
          " queue=", reinterpret_cast<uintptr_t>(this),
          " count=", selected.size(),
          " seq=", seq,
-         " coherent=", queue.CoherentSeqId());
+         " coherent=", queue.CoherentSeqId(),
+         " waitUs=", wait_us,
+         " tsGpuRuns=", g_timestamp_gpu_resolve_runs.load(std::memory_order_relaxed),
+         " tsGpuQueries=", g_timestamp_gpu_resolve_queries.load(std::memory_order_relaxed),
+         " tsCpuFallbacks=", g_timestamp_cpu_fallbacks.load(std::memory_order_relaxed),
+         " tsCpuFallbackQueries=", g_timestamp_cpu_fallback_queries.load(std::memory_order_relaxed),
+         " tsCpuWaitUs=", g_timestamp_cpu_wait_us.load(std::memory_order_relaxed));
 
     for (const auto &resolve : selected)
       ResolveQueryDataToCpuBuffer(resolve, "cpu-batch");
@@ -5908,46 +5960,62 @@ private:
         record.type == D3D12_QUERY_TYPE_TIMESTAMP &&
         dst->GetBufferAllocation() &&
         sizing_data.size() == UINT64(record.query_count) * sizeof(uint64_t)) {
-      bool current_samples = record.query_count != 0;
-      const auto current_sequence =
-          device_->GetDXMTDevice().queue().CurrentSeqId();
-      std::vector<uint64_t> sample_indices;
-      sample_indices.reserve(record.query_count);
+      bool gpu_samples = record.query_count != 0;
+      std::vector<PendingTimestampResolve::Sample> samples;
+      samples.reserve(record.query_count);
       UINT first_bad_index = 0;
       uint64_t first_bad_sample = ~0ull;
       uint64_t first_bad_sequence = ~0ull;
+#if !DXMT_DX12_METAL4
+      const auto current_sequence =
+          device_->GetDXMTDevice().queue().CurrentSeqId();
+#endif
       for (UINT i = 0; i < record.query_count; i++) {
-        const auto sample =
-            heap->TimestampSampleIndex(record.type, record.start_index + i);
-        const auto sequence =
-            heap->TimestampSampleSequence(record.type, record.start_index + i);
-        sample_indices.push_back(sample);
-        if (current_samples &&
-            (sample == ~0ull || sequence != current_sequence)) {
-          current_samples = false;
+        auto query = heap->TimestampQueryAt(record.type, record.start_index + i);
+        PendingTimestampResolve::Sample sample = {};
+        if (query) {
+          sample.index = query->sampleIndex();
+#if DXMT_DX12_METAL4
+          sample.heap = query->resolveHeap();
+          sample.heap_entry_size = query->resolveHeapEntrySize();
+#endif
+        }
+        samples.push_back(sample);
+        const auto sequence = query ? query->sampleSequence() : ~0ull;
+        if (gpu_samples && (sample.index == ~0ull
+#if DXMT_DX12_METAL4
+            || !sample.heap || !sample.heap_entry_size
+#else
+            || sequence != current_sequence
+#endif
+            )) {
+          gpu_samples = false;
           first_bad_index = record.start_index + i;
-          first_bad_sample = sample;
+          first_bad_sample = sample.index;
           first_bad_sequence = sequence;
         }
       }
 
-      if (!current_samples) {
+      if (!gpu_samples) {
         if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
           WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData timestamp fallback"
                " queue=", reinterpret_cast<uintptr_t>(this),
                " start=", record.start_index,
                " count=", record.query_count,
-               " currentSeq=", current_sequence,
                " badIndex=", first_bad_index,
                " badSample=", first_bad_sample,
-               " badSeq=", first_bad_sequence);
+               " badSeq=", first_bad_sequence
+#if !DXMT_DX12_METAL4
+               , " currentSeq=", current_sequence
+#endif
+          );
         }
         goto resolve_cpu_fallback;
       }
 
       state.pending_timestamp_resolves.push_back(PendingTimestampResolve{
           record.command_list, record.heap, record.dst_buffer,
-          std::move(sample_indices), record.start_index, record.query_count,
+          std::move(samples), record.start_index, record.query_count,
           record.dst_buffer_offset,
           static_cast<UINT64>(sizing_data.size())});
       if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
@@ -5961,6 +6029,11 @@ private:
     }
 
 resolve_cpu_fallback:
+    if (record.type == D3D12_QUERY_TYPE_TIMESTAMP) {
+      g_timestamp_cpu_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      g_timestamp_cpu_fallback_queries.fetch_add(record.query_count,
+                                                std::memory_order_relaxed);
+    }
     state.pending_cpu_query_resolves.push_back(record);
     if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData deferred CPU fallback"

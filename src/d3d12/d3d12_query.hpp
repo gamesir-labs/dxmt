@@ -25,6 +25,8 @@ public:
   virtual uint64_t TimestampSampleSequence(D3D12_QUERY_TYPE type,
                                            UINT index) const = 0;
   virtual uint64_t TimestampSampleIndex(D3D12_QUERY_TYPE type, UINT index) const = 0;
+  virtual Rc<TimestampQuery> TimestampQueryAt(D3D12_QUERY_TYPE type,
+                                              UINT index) const = 0;
   virtual bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) = 0;
   virtual bool EndStatistics(D3D12_QUERY_TYPE type, UINT index) = 0;
   virtual bool Resolve(D3D12_QUERY_TYPE type, UINT start_index,

@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -46,6 +47,49 @@ typedef int NTSTATUS;
 @end
 
 static NSObject *dxmt_metal4_compiler_lock;
+
+static bool
+dxmt_truthy_env_value(const char *value) {
+  if (!value || !value[0])
+    return false;
+  return !strcmp(value, "1") || !strcmp(value, "true") ||
+         !strcmp(value, "yes") || !strcmp(value, "trace") ||
+         !strcmp(value, "on");
+}
+
+static uint64_t
+dxmt_parse_u64_env(const char *name, uint64_t default_value) {
+  const char *value = getenv(name);
+  if (!value || !value[0])
+    return default_value;
+  char *end = NULL;
+  unsigned long long parsed = strtoull(value, &end, 10);
+  if (end == value)
+    return default_value;
+  return parsed;
+}
+
+static bool
+dxmt_metal4_commit_feedback_enabled(uint64_t completion_value) {
+  static bool initialized = false;
+  static bool enabled = false;
+  static bool sampled = false;
+  static uint64_t sample_rate = 64;
+  if (!initialized) {
+    const char *value = getenv("DXMT_METAL4_COMMIT_FEEDBACK");
+    enabled = dxmt_truthy_env_value(value);
+    sampled = value && !strcmp(value, "sampled");
+    sample_rate = dxmt_parse_u64_env("DXMT_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE", 64);
+    if (!sample_rate)
+      sample_rate = 64;
+    initialized = true;
+  }
+  if (enabled)
+    return true;
+  if (sampled)
+    return completion_value == 0 || (completion_value % sample_rate) == 0;
+  return false;
+}
 
 typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
   DXMTMetal4CommandBufferStateNotEnqueued = 0,
@@ -673,8 +717,11 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValue];
-  MTL4CommitOptions *options = [[MTL4CommitOptions alloc] init];
-  if (dxmt_apitrace_runtime_enabled()) {
+  MTL4CommitOptions *options = nil;
+#if DXMT_APITRACE_METAL
+  if (dxmt_apitrace_runtime_enabled() &&
+      dxmt_metal4_commit_feedback_enabled(_completionValue)) {
+    options = [[MTL4CommitOptions alloc] init];
     __block DXMTMetal4CommandBuffer *retainedSelf = [self retain];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
       dxmt_apitrace_record_command_buffer_feedback(
@@ -687,10 +734,14 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
       [retainedSelf release];
     }];
   }
+#endif
 
   id<MTL4CommandBuffer> commandBuffers[1] = {_metal4Buffer};
   _internalStatus = DXMTMetal4CommandBufferStateCommitted;
-  [_owner.metal4Queue commit:commandBuffers count:1 options:options];
+  if (options)
+    [_owner.metal4Queue commit:commandBuffers count:1 options:options];
+  else
+    [_owner.metal4Queue commit:commandBuffers count:1];
   [options release];
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
@@ -1222,9 +1273,7 @@ dxmt_apitrace_set_sequence_locked(apitrace_metal_session_t *session, uint64_t se
 
 static bool
 dxmt_apitrace_truthy_env_value(const char *value) {
-  if (!value || !value[0])
-    return false;
-  return !strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "yes") || !strcmp(value, "trace");
+  return dxmt_truthy_env_value(value);
 }
 
 static bool

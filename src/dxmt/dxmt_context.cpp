@@ -2963,6 +2963,32 @@ void
 ArgumentEncodingContext::resolveTimestamp(uint64_t start_index, uint64_t query_count,
                                           WMT::Reference<WMT::Buffer> dst_buffer,
                                           uint64_t dst_offset, uint64_t dst_length) {
+#if DXMT_DX12_METAL4
+  resolveTimestamp({}, start_index, query_count, std::move(dst_buffer),
+                   dst_offset, dst_length);
+#else
+  appendResolveTimestampRange(start_index, query_count, std::move(dst_buffer),
+                              dst_offset, dst_length);
+#endif
+}
+
+#if DXMT_DX12_METAL4
+void ArgumentEncodingContext::resolveTimestamp(
+    WMT::Reference<WMT::CounterHeap> src_heap, uint64_t start_index,
+    uint64_t query_count, WMT::Reference<WMT::Buffer> dst_buffer,
+    uint64_t dst_offset, uint64_t dst_length) {
+  appendResolveTimestampRange(std::move(src_heap), start_index, query_count,
+                              std::move(dst_buffer), dst_offset, dst_length);
+}
+#endif
+
+void ArgumentEncodingContext::appendResolveTimestampRange(
+#if DXMT_DX12_METAL4
+    WMT::Reference<WMT::CounterHeap> src_heap,
+#endif
+    uint64_t start_index, uint64_t query_count,
+    WMT::Reference<WMT::Buffer> dst_buffer, uint64_t dst_offset,
+    uint64_t dst_length) {
   assert(!encoder_current);
   if (!query_count || !dst_buffer || !dst_length)
     return;
@@ -2970,6 +2996,9 @@ ArgumentEncodingContext::resolveTimestamp(uint64_t start_index, uint64_t query_c
   if (encoder_last && encoder_last->type == EncoderType::ResolveTimestamp) {
     auto *last = static_cast<ResolveTimestampData *>(encoder_last);
     last->ranges.push_back({
+#if DXMT_DX12_METAL4
+        std::move(src_heap),
+#endif
         std::move(dst_buffer),
         start_index,
         query_count,
@@ -2982,6 +3011,9 @@ ArgumentEncodingContext::resolveTimestamp(uint64_t start_index, uint64_t query_c
   encoder_info->type = EncoderType::ResolveTimestamp;
   encoder_info->id = ~0ull;
   encoder_info->ranges.push_back({
+#if DXMT_DX12_METAL4
+      std::move(src_heap),
+#endif
       std::move(dst_buffer),
       start_index,
       query_count,
@@ -3866,12 +3898,15 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto data = static_cast<ResolveTimestampData *>(current);
 #if DXMT_DX12_METAL4
       if (auto readback = readbacks.timestamp.get()) {
-        if (readback->counterHeap()) {
-          for (const auto &range : data->ranges) {
-            cmdbuf.resolveCounterHeap(
-                readback->counterHeap(), range.start_index, range.query_count,
-                range.dst_buffer, range.dst_offset, range.dst_length);
-          }
+        for (const auto &range : data->ranges) {
+          WMT::CounterHeap heap =
+              range.src_heap ? WMT::CounterHeap(range.src_heap)
+                             : readback->counterHeap();
+          if (!heap)
+            continue;
+          cmdbuf.resolveCounterHeap(
+              heap, range.start_index, range.query_count,
+              range.dst_buffer, range.dst_offset, range.dst_length);
         }
       }
 #else
