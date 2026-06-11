@@ -195,6 +195,19 @@ struct ArgumentTableSliceCache {
   uint64_t bytes_avoided = 0;
 };
 
+struct RenderArgumentBufferOffsetState {
+  WMTRenderStages stages = WMTRenderStageVertex;
+  uint64_t offset = 0;
+  uint8_t index = 0;
+  bool valid = false;
+};
+
+struct ComputeArgumentBufferOffsetState {
+  uint64_t offset = 0;
+  uint8_t index = 0;
+  bool valid = false;
+};
+
 struct RenderEncoderData : EncoderData {
   std::array<RenderEncoderColorAttachmentData, 8> colors;
   RenderEncoderDepthAttachmentData depth;
@@ -229,6 +242,7 @@ struct RenderEncoderData : EncoderData {
   ArgumentTableSliceCache argument_table_cache_fragment;
   ArgumentTableSliceCache argument_table_cache_object;
   ArgumentTableSliceCache argument_table_cache_mesh;
+  std::array<RenderArgumentBufferOffsetState, 16> argument_buffer_offsets = {};
 };
 
 struct ComputeEncoderData : EncoderData {
@@ -240,6 +254,7 @@ struct ComputeEncoderData : EncoderData {
   void *allocated_argbuf_mapping;
   bool allocated_argbuf_needs_flush;
   ArgumentTableSliceCache argument_table_cache;
+  std::array<ComputeArgumentBufferOffsetState, 8> argument_buffer_offsets = {};
 };
 
 struct BlitEncoderData : EncoderData {
@@ -869,6 +884,11 @@ public:
   uint64_t deduplicateComputeArgumentTableSlice(uint8_t index, uint64_t offset, uint64_t size);
 
   uint64_t deduplicateComputeArgumentTableSliceBytes(uint8_t index, uint64_t offset, uint64_t size, const void *bytes);
+
+  bool shouldEmitRenderArgumentBufferOffset(
+      WMTRenderStages stages, uint8_t index, uint64_t offset, bool content_cache_hit);
+
+  bool shouldEmitComputeArgumentBufferOffset(uint8_t index, uint64_t offset, bool content_cache_hit);
 
   std::pair<WMT::Buffer , size_t> allocateTempBuffer(size_t size, size_t alignment);
   

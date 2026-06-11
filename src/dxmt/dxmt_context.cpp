@@ -190,8 +190,11 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
             : WMTRenderStageVertex;
     const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * sizeof(VERTEX_BUFFER_ENTRY);
     const auto binding_offset = deduplicateRenderArgumentTableSlice(stages, 16, offset, table_size);
+    const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
+    if (!shouldEmitRenderArgumentBufferOffset(stages, 16, final_offset, binding_offset != offset))
+      return;
     auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
+    cmd.offset = final_offset;
     cmd.index = 16;
     cmd.type = WMTRenderCommandSetArgumentBufferOffset;
     cmd.stages = stages;
@@ -316,39 +319,48 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     if (binding_offset == offset)
       std::memcpy(getMappedArgumentBuffer<uint64_t, true>(offset),
                   encoded_table.data(), table_size);
+    const auto final_offset = getFinalArgumentBufferOffset<true>(binding_offset);
+    if (!shouldEmitComputeArgumentBufferOffset(29, final_offset, binding_offset != offset))
+      return;
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
+    cmd.offset = final_offset;
     cmd.index = 29;
   } else {
-    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    cmd.index = 29;
+    uint8_t index = 29;
+    WMTRenderStages stages = WMTRenderStageVertex;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
-        cmd.stages = WMTRenderStageObject;
+        stages = WMTRenderStageObject;
       else if constexpr (kind == PipelineKind::Tessellation) {
-        cmd.stages = WMTRenderStageObject;
-        cmd.index = 27;
+        stages = WMTRenderStageObject;
+        index = 27;
       } else
-        cmd.stages = WMTRenderStageVertex;
+        stages = WMTRenderStageVertex;
     } else if constexpr (stage == PipelineStage::Pixel) {
-      cmd.stages = WMTRenderStageFragment;
+      stages = WMTRenderStageFragment;
     } else if constexpr (stage == PipelineStage::Hull) {
-      cmd.stages = WMTRenderStageObject;
+      stages = WMTRenderStageObject;
     } else if constexpr (stage == PipelineStage::Domain) {
-      cmd.stages = WMTRenderStageMesh;
+      stages = WMTRenderStageMesh;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      cmd.stages = WMTRenderStageMesh;
+      stages = WMTRenderStageMesh;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
     const auto binding_offset =
-        deduplicateRenderArgumentTableSliceBytes(cmd.stages, cmd.index, offset, table_size, encoded_table.data());
+        deduplicateRenderArgumentTableSliceBytes(stages, index, offset, table_size, encoded_table.data());
     if (binding_offset == offset)
       std::memcpy(getMappedArgumentBuffer<uint64_t>(offset),
                   encoded_table.data(), table_size);
-    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
+    const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
+    if (!shouldEmitRenderArgumentBufferOffset(stages, index, final_offset, binding_offset != offset))
+      return;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
+    cmd.index = index;
+    cmd.stages = stages;
+    cmd.offset = final_offset;
   }
 };
 
@@ -621,6 +633,59 @@ ArgumentEncodingContext::deduplicateComputeArgumentTableSliceBytes(
   auto *base = getMappedArgumentBuffer<uint8_t, true>(0);
   return DeduplicateArgumentTableSlice(
       data->argument_table_cache, index, offset, size, base, static_cast<const uint8_t *>(bytes));
+}
+
+bool
+ArgumentEncodingContext::shouldEmitRenderArgumentBufferOffset(
+    WMTRenderStages stages, uint8_t index, uint64_t offset, bool content_cache_hit
+) {
+  auto &states = currentRenderEncoder()->argument_buffer_offsets;
+  RenderArgumentBufferOffsetState *free_state = nullptr;
+  for (auto &state : states) {
+    if (!state.valid) {
+      if (!free_state)
+        free_state = &state;
+      continue;
+    }
+    if (state.stages != stages || state.index != index)
+      continue;
+    if (content_cache_hit && state.offset == offset)
+      return false;
+    state.offset = offset;
+    return true;
+  }
+  auto *state = free_state ? free_state : &states.back();
+  state->stages = stages;
+  state->index = index;
+  state->offset = offset;
+  state->valid = true;
+  return true;
+}
+
+bool
+ArgumentEncodingContext::shouldEmitComputeArgumentBufferOffset(
+    uint8_t index, uint64_t offset, bool content_cache_hit
+) {
+  auto &states = static_cast<ComputeEncoderData *>(currentEncoder())->argument_buffer_offsets;
+  ComputeArgumentBufferOffsetState *free_state = nullptr;
+  for (auto &state : states) {
+    if (!state.valid) {
+      if (!free_state)
+        free_state = &state;
+      continue;
+    }
+    if (state.index != index)
+      continue;
+    if (content_cache_hit && state.offset == offset)
+      return false;
+    state.offset = offset;
+    return true;
+  }
+  auto *state = free_state ? free_state : &states.back();
+  state->index = index;
+  state->offset = offset;
+  state->valid = true;
+  return true;
 }
 
 static void
@@ -2055,39 +2120,48 @@ ArgumentEncodingContext::encodeConstantBuffers(
     if (binding_offset == offset)
       std::memcpy(getMappedArgumentBuffer<uint64_t, true>(offset),
                   encoded_table.data(), table_size);
+    const auto final_offset = getFinalArgumentBufferOffset<true>(binding_offset);
+    if (!shouldEmitComputeArgumentBufferOffset(29, final_offset, binding_offset != offset))
+      return;
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
+    cmd.offset = final_offset;
     cmd.index = 29;
   } else {
-    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    cmd.index = 29;
+    uint8_t index = 29;
+    WMTRenderStages stages = WMTRenderStageVertex;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
-        cmd.stages = WMTRenderStageObject;
+        stages = WMTRenderStageObject;
       else if constexpr (kind == PipelineKind::Tessellation) {
-        cmd.stages = WMTRenderStageObject;
-        cmd.index = 27;
+        stages = WMTRenderStageObject;
+        index = 27;
       } else
-        cmd.stages = WMTRenderStageVertex;
+        stages = WMTRenderStageVertex;
     } else if constexpr (stage == PipelineStage::Pixel) {
-      cmd.stages = WMTRenderStageFragment;
+      stages = WMTRenderStageFragment;
     } else if constexpr (stage == PipelineStage::Hull) {
-      cmd.stages = WMTRenderStageObject;
+      stages = WMTRenderStageObject;
     } else if constexpr (stage == PipelineStage::Domain) {
-      cmd.stages = WMTRenderStageMesh;
+      stages = WMTRenderStageMesh;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      cmd.stages = WMTRenderStageMesh;
+      stages = WMTRenderStageMesh;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
     const auto binding_offset =
-        deduplicateRenderArgumentTableSliceBytes(cmd.stages, cmd.index, offset, table_size, encoded_table.data());
+        deduplicateRenderArgumentTableSliceBytes(stages, index, offset, table_size, encoded_table.data());
     if (binding_offset == offset)
       std::memcpy(getMappedArgumentBuffer<uint64_t>(offset),
                   encoded_table.data(), table_size);
-    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
+    const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
+    if (!shouldEmitRenderArgumentBufferOffset(stages, index, final_offset, binding_offset != offset))
+      return;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
+    cmd.index = index;
+    cmd.stages = stages;
+    cmd.offset = final_offset;
   }
 }
 
@@ -2459,36 +2533,45 @@ ArgumentEncodingContext::encodeShaderResources(
   if constexpr (stage == PipelineStage::Compute) {
     const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
     const auto binding_offset = deduplicateComputeArgumentTableSlice(30, offset, table_size);
+    const auto final_offset = getFinalArgumentBufferOffset<true>(binding_offset);
+    if (!shouldEmitComputeArgumentBufferOffset(30, final_offset, binding_offset != offset))
+      return;
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
+    cmd.offset = final_offset;
     cmd.index = 30;
   } else {
     const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
-    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    cmd.index = 30;
+    uint8_t index = 30;
+    WMTRenderStages stages = WMTRenderStageVertex;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
-        cmd.stages = WMTRenderStageObject;
+        stages = WMTRenderStageObject;
       else if constexpr (kind == PipelineKind::Tessellation) {
-        cmd.stages = WMTRenderStageObject;
-        cmd.index = 28;
+        stages = WMTRenderStageObject;
+        index = 28;
       } else
-        cmd.stages = WMTRenderStageVertex;
+        stages = WMTRenderStageVertex;
     } else if constexpr (stage == PipelineStage::Pixel) {
-      cmd.stages = WMTRenderStageFragment;
+      stages = WMTRenderStageFragment;
     } else if constexpr (stage == PipelineStage::Hull) {
-      cmd.stages = WMTRenderStageObject;
+      stages = WMTRenderStageObject;
     } else if constexpr (stage == PipelineStage::Domain) {
-      cmd.stages = WMTRenderStageMesh;
+      stages = WMTRenderStageMesh;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      cmd.stages = WMTRenderStageMesh;
+      stages = WMTRenderStageMesh;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
-    const auto binding_offset = deduplicateRenderArgumentTableSlice(cmd.stages, cmd.index, offset, table_size);
-    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
+    const auto binding_offset = deduplicateRenderArgumentTableSlice(stages, index, offset, table_size);
+    const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
+    if (!shouldEmitRenderArgumentBufferOffset(stages, index, final_offset, binding_offset != offset))
+      return;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
+    cmd.index = index;
+    cmd.stages = stages;
+    cmd.offset = final_offset;
   }
 }
 
