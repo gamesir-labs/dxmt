@@ -2,6 +2,7 @@
 #include "Metal.hpp"
 #include "dxmt_apitrace.hpp"
 #include "dxmt_apitrace_d3d.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
 #include "util_win32_compat.h"
@@ -306,6 +307,7 @@ CommandQueue::PresentBoundary() {
          " latency=", frame.latency);
   }
   frame_count++;
+  perf::recordFrameBoundary(frame_count);
   statistics.at(frame_count).reset();
   statistics.at(frame_count).begin_time = clock::now();
   // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering
@@ -334,6 +336,9 @@ CommandQueue::WaitCPUFence(uint64_t seq) {
   const auto t0 = clock::now();
   cpu_coherent.wait(seq);
   const auto t1 = clock::now();
+  const auto wait_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  perf::recordWaitCpuFence(uint64_t(wait_us));
   if (DxmtQueueDiagEnabled()) {
     WARN_FILE_ONLY("DXMT queue diagnostic: WaitCPUFence"
          " target=", seq,

@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "d3d12_heap.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "log/log.hpp"
@@ -1227,7 +1228,8 @@ public:
     const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - wait_begin)
                              .count();
-    if (wait_us > 1000) {
+    dxmt::perf::recordTimestampCpuWait(uint64_t(wait_us));
+    if (dxmt::perf::enabled() && wait_us > 1000) {
       INFO("D3D12Resource: materialized deferred query resolves"
            " context=", context ? context : "",
            " resource=", uint64_t(this),

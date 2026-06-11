@@ -21,6 +21,7 @@ dxmt_src = [
   'dxmt_pipeline_diag.cpp',
   'dxmt_subresource.cpp',
   'dxmt_deptrack.cpp',
+  'dxmt_perf_stats.cpp',
 ]
 
 if dxmt_apitrace_metal_enabled

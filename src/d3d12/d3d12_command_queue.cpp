@@ -15,6 +15,7 @@
 #include "dxmt_format.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_info.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "dxmt_presenter.hpp"
 #include "dxmt_sampler.hpp"
 #include "dxmt_shader_cache.hpp"
@@ -4464,6 +4465,7 @@ private:
       g_timestamp_gpu_resolve_runs.fetch_add(1, std::memory_order_relaxed);
       g_timestamp_gpu_resolve_queries.fetch_add(run_count,
                                                 std::memory_order_relaxed);
+      dxmt::perf::recordTimestampGpuResolve(run_count);
       i += run_count;
     }
   }
@@ -4575,6 +4577,7 @@ private:
          dst_identity, dst_buffer_offset, queue_id](Resource *resource) mutable {
           g_timestamp_cpu_map_materialized_fallbacks.fetch_add(
               1, std::memory_order_relaxed);
+          dxmt::perf::recordTimestampCpuMaterialized();
           ResolveQueryDataToCpuBufferStatic(
               command_list.ptr(), query_heap.ptr(), type, start_index,
               query_count, resource, dst_identity, dst_buffer_offset,
@@ -4584,6 +4587,7 @@ private:
                                                 std::memory_order_relaxed);
     g_timestamp_cpu_deferred_queries.fetch_add(record.query_count,
                                               std::memory_order_relaxed);
+    dxmt::perf::recordTimestampCpuDeferred(record.query_count);
     return true;
   }
 
@@ -4594,6 +4598,7 @@ private:
       g_timestamp_cpu_fallbacks.fetch_add(1, std::memory_order_relaxed);
       g_timestamp_cpu_fallback_queries.fetch_add(record.query_count,
                                                 std::memory_order_relaxed);
+      dxmt::perf::recordTimestampCpuFallback(record.query_count);
     }
 
     if (DeferCpuQueryResolveToResource(record, byte_count)) {
@@ -4617,6 +4622,7 @@ private:
       g_timestamp_cpu_immediate_fallbacks.fetch_add(1,
                                                    std::memory_order_relaxed);
       g_timestamp_cpu_unsafe_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      dxmt::perf::recordTimestampCpuImmediate(true);
     }
     state.pending_immediate_cpu_query_resolves.push_back(record);
     static std::atomic<uint32_t> immediate_log_count = 0;
@@ -4660,17 +4666,24 @@ private:
     FlushPassBatches(chunk, state);
     auto &queue = device_->GetDXMTDevice().queue();
     const auto seq = queue.CurrentSeqId();
-    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch commit before wait"
-         " queue=", reinterpret_cast<uintptr_t>(this),
-         " count=", selected.size(),
-         " seq=", seq,
-         " coherent=", queue.CoherentSeqId());
+    const bool query_wait_diag =
+        D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_QUERY") ||
+        D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+    if (query_wait_diag) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch commit before wait"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " count=", selected.size(),
+           " seq=", seq,
+           " coherent=", queue.CoherentSeqId());
+    }
     queue.CommitCurrentChunk();
-    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait begin"
-         " queue=", reinterpret_cast<uintptr_t>(this),
-         " count=", selected.size(),
-         " seq=", seq,
-         " coherent=", queue.CoherentSeqId());
+    if (query_wait_diag) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait begin"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " count=", selected.size(),
+           " seq=", seq,
+           " coherent=", queue.CoherentSeqId());
+    }
     const auto wait_begin = std::chrono::steady_clock::now();
     queue.WaitCPUFence(seq);
     const auto wait_end = std::chrono::steady_clock::now();
@@ -4680,17 +4693,22 @@ private:
     if (wait_us > 0)
       g_timestamp_cpu_wait_us.fetch_add(uint64_t(wait_us),
                                         std::memory_order_relaxed);
-    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait end"
-         " queue=", reinterpret_cast<uintptr_t>(this),
-         " count=", selected.size(),
-         " seq=", seq,
-         " coherent=", queue.CoherentSeqId(),
-         " waitUs=", wait_us,
-         " tsGpuRuns=", g_timestamp_gpu_resolve_runs.load(std::memory_order_relaxed),
-         " tsGpuQueries=", g_timestamp_gpu_resolve_queries.load(std::memory_order_relaxed),
-         " tsCpuFallbacks=", g_timestamp_cpu_fallbacks.load(std::memory_order_relaxed),
-         " tsCpuFallbackQueries=", g_timestamp_cpu_fallback_queries.load(std::memory_order_relaxed),
-         " tsCpuWaitUs=", g_timestamp_cpu_wait_us.load(std::memory_order_relaxed));
+    dxmt::perf::recordTimestampCpuWait(uint64_t(wait_us));
+    dxmt::perf::recordQueryBatchWait(
+        1, selected.size(), uint64_t(wait_us));
+    if (query_wait_diag) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData batch wait end"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " count=", selected.size(),
+           " seq=", seq,
+           " coherent=", queue.CoherentSeqId(),
+           " waitUs=", wait_us,
+           " tsGpuRuns=", g_timestamp_gpu_resolve_runs.load(std::memory_order_relaxed),
+           " tsGpuQueries=", g_timestamp_gpu_resolve_queries.load(std::memory_order_relaxed),
+           " tsCpuFallbacks=", g_timestamp_cpu_fallbacks.load(std::memory_order_relaxed),
+           " tsCpuFallbackQueries=", g_timestamp_cpu_fallback_queries.load(std::memory_order_relaxed),
+           " tsCpuWaitUs=", g_timestamp_cpu_wait_us.load(std::memory_order_relaxed));
+    }
 
     for (const auto &resolve : selected)
       ResolveQueryDataToCpuBuffer(resolve, "cpu-batch");
