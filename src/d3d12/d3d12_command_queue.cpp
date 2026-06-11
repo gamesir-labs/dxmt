@@ -4356,6 +4356,7 @@ private:
              resolve.samples[i + run_count].index == start_sample + run_count
 #if DXMT_DX12_METAL4
              && resolve.samples[i + run_count].heap == first_sample.heap
+             && bool(resolve.samples[i + run_count].heap) == bool(first_sample.heap)
              && resolve.samples[i + run_count].heap_entry_size ==
                     first_sample.heap_entry_size
 #endif
@@ -4367,13 +4368,21 @@ private:
       const uint64_t run_dst_length =
           uint64_t(run_count) * sizeof(uint64_t);
 #if DXMT_DX12_METAL4
-      WMT::Reference<WMT::CounterHeap> src_heap(first_sample.heap);
-      chunk->emitcc([src_heap = std::move(src_heap), start_sample, run_count,
-                     dst_buffer, run_dst_offset,
-                     run_dst_length](ArgumentEncodingContext &enc) mutable {
-        enc.resolveTimestamp(std::move(src_heap), start_sample, run_count,
-                             dst_buffer, run_dst_offset, run_dst_length);
-      });
+      if (first_sample.heap) {
+        WMT::Reference<WMT::CounterHeap> src_heap(first_sample.heap);
+        chunk->emitcc([src_heap = std::move(src_heap), start_sample, run_count,
+                       dst_buffer, run_dst_offset,
+                       run_dst_length](ArgumentEncodingContext &enc) mutable {
+          enc.resolveTimestamp(std::move(src_heap), start_sample, run_count,
+                               dst_buffer, run_dst_offset, run_dst_length);
+        });
+      } else {
+        chunk->emitcc([start_sample, run_count, dst_buffer, run_dst_offset,
+                       run_dst_length](ArgumentEncodingContext &enc) {
+          enc.resolveTimestamp(start_sample, run_count, dst_buffer,
+                               run_dst_offset, run_dst_length);
+        });
+      }
 #else
       chunk->emitcc([start_sample, run_count, dst_buffer, run_dst_offset,
                      run_dst_length](ArgumentEncodingContext &enc) {
@@ -5966,10 +5975,8 @@ private:
       UINT first_bad_index = 0;
       uint64_t first_bad_sample = ~0ull;
       uint64_t first_bad_sequence = ~0ull;
-#if !DXMT_DX12_METAL4
       const auto current_sequence =
           device_->GetDXMTDevice().queue().CurrentSeqId();
-#endif
       for (UINT i = 0; i < record.query_count; i++) {
         auto query = heap->TimestampQueryAt(record.type, record.start_index + i);
         PendingTimestampResolve::Sample sample = {};
@@ -5984,7 +5991,8 @@ private:
         const auto sequence = query ? query->sampleSequence() : ~0ull;
         if (gpu_samples && (sample.index == ~0ull
 #if DXMT_DX12_METAL4
-            || !sample.heap || !sample.heap_entry_size
+            || ((!sample.heap || !sample.heap_entry_size) &&
+                sequence != current_sequence)
 #else
             || sequence != current_sequence
 #endif
