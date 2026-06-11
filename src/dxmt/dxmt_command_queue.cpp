@@ -41,6 +41,11 @@ DxmtQueueDiagDurationMs(clock::duration duration) {
   return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(duration).count();
 }
 
+static uint64_t
+DxmtQueueDiagDurationUs(clock::duration duration) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+}
+
 static double
 DxmtQueueDiagElapsedMs(clock::time_point start, clock::time_point end) {
   if (start == clock::time_point{} || end == clock::time_point{} || end < start)
@@ -307,7 +312,9 @@ CommandQueue::PresentBoundary() {
          " latency=", frame.latency);
   }
   frame_count++;
-  perf::recordFrameBoundary(frame_count);
+  perf::recordFrameBoundary(
+      frame_count, statistics.at(frame_count - 1), statistics.average(),
+      DxmtQueueDiagDurationUs(boundary_time - frame_begin_time));
   statistics.at(frame_count).reset();
   statistics.at(frame_count).begin_time = clock::now();
   // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering

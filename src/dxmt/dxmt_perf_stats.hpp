@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dxmt_statistics.hpp"
 #include <cstdint>
 
 namespace dxmt::perf {
@@ -7,6 +8,9 @@ namespace dxmt::perf {
 bool enabled();
 
 void recordFrameBoundary(uint64_t frame);
+void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
+                         const FrameStatistics &average_stats,
+                         uint64_t frame_wall_us);
 void recordWaitCpuFence(uint64_t wait_us);
 
 void recordTimestampGpuResolve(uint64_t queries);
