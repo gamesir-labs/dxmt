@@ -110,4 +110,89 @@ private:
   IResource *resource_; // since it's aggregated, no extra reference is needed
 };
 
+/* designed to be used as an aggregated object */
+template <DXGIResourceAggregateContext IResource>
+class MTLDXGISurface : public IDXGISurface2 {
+public:
+  MTLDXGISurface(IResource *pResource) : resource_(pResource) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void **ppvObject) final {
+    return resource_->QueryInterface(riid, ppvObject);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() final { return resource_->AddRef(); }
+
+  ULONG STDMETHODCALLTYPE Release() final { return resource_->Release(); }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  SetPrivateData(REFGUID guid, UINT data_size, const void *data) final {
+    return resource_->SetPrivateData(guid, data_size, data);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  SetPrivateDataInterface(REFGUID guid, const IUnknown *object) final {
+    return resource_->SetPrivateDataInterface(guid, object);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetPrivateData(REFGUID guid, UINT *data_size, void *data) final {
+    return resource_->GetPrivateData(guid, data_size, data);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetParent(REFIID riid, void **parent) final {
+    return GetDevice(riid, parent);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetDevice(REFIID riid, void **ppDevice) final {
+    return resource_->GetDeviceInterface(riid, ppDevice);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetDesc(DXGI_SURFACE_DESC *pDesc) final {
+    return resource_->GetSurfaceDesc(pDesc);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  Map(DXGI_MAPPED_RECT *pLockedRect, UINT MapFlags) final {
+    return resource_->SurfaceMap(pLockedRect, MapFlags);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  Unmap() final {
+    return resource_->SurfaceUnmap();
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetDC(WINBOOL Discard, HDC *phdc) final {
+    return resource_->GetSurfaceDC(Discard, phdc);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  ReleaseDC(RECT *pDirtyRect) final {
+    return resource_->ReleaseSurfaceDC(pDirtyRect);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetResource(REFIID riid, void **ppParentResource, UINT *pSubresourceIndex) final {
+    return resource_->GetSurfaceResource(riid, ppParentResource, pSubresourceIndex);
+  }
+
+private:
+  IResource *resource_;
+};
+
 } // namespace dxmt

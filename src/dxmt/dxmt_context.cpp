@@ -2205,6 +2205,44 @@ DebugLogNullShaderBinding(
 }
 
 template <PipelineStage stage, PipelineKind kind>
+static bool
+EncodeMissingTextureBufferMetadata(
+    const char *binding_type, const std::string &shader_hash,
+    const MTL_SM50_SHADER_ARGUMENT &arg, uint64_t *encoded_buffer,
+    bool has_buffer_binding, bool has_texture_binding, bool has_counter_binding,
+    uint64_t encoder_id
+) {
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET)
+    return false;
+
+  DebugLogNullShaderBinding<stage, kind>(
+      binding_type, "texture-buffer", shader_hash, arg, has_buffer_binding,
+      has_texture_binding, has_counter_binding, encoder_id,
+      "missing_tbuffer_metadata"
+  );
+  encoded_buffer[arg.StructurePtrOffset] = 0;
+  encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+  return true;
+}
+
+template <PipelineStage stage, PipelineKind kind>
+static void
+DebugLogMissingTextureMetadata(
+    const char *binding_type, const std::string &shader_hash,
+    const MTL_SM50_SHADER_ARGUMENT &arg, bool has_buffer_binding,
+    bool has_texture_binding, bool has_counter_binding, uint64_t encoder_id
+) {
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP)
+    return;
+
+  DebugLogNullShaderBinding<stage, kind>(
+      binding_type, "texture", shader_hash, arg, has_buffer_binding,
+      has_texture_binding, has_counter_binding, encoder_id,
+      "missing_texture_metadata"
+  );
+}
+
+template <PipelineStage stage, PipelineKind kind>
 static void
 DebugLogTextureBindingMismatch(
     const std::string &shader_hash, const MTL_SM50_SHADER_ARGUMENT &arg, Texture *texture, TextureViewKey view_id,
@@ -2398,7 +2436,10 @@ ArgumentEncodingContext::encodeShaderResources(
         }
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (srv.buffer.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+          if (EncodeMissingTextureBufferMetadata<stage, kind>(
+                  "SRV", shader_hash, arg, encoded_buffer, bool(srv.buffer.ptr()),
+                  bool(srv.texture.ptr()), false, encoder_id))
+            break;
           auto allocation = srv.buffer->current();
           auto *view_ptr = srv.buffer->tryView(srv.viewId, allocation);
           if (!view_ptr || !view_ptr->texture) {
@@ -2417,7 +2458,10 @@ ArgumentEncodingContext::encodeShaderResources(
               ((uint64_t)srv.slice.elementCount << 32) | (uint64_t)(srv.slice.firstElement + offset);
           makeResident<stage, kind>(srv.buffer.ptr(), srv.viewId);
         } else if (srv.texture.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
+          DebugLogMissingTextureMetadata<stage, kind>(
+              "SRV", shader_hash, arg, bool(srv.buffer.ptr()),
+              bool(srv.texture.ptr()), false, encoder_id
+          );
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           DebugLogTextureBindingMismatch<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
           DebugLogShaderTextureBinding<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
@@ -2475,7 +2519,10 @@ ArgumentEncodingContext::encodeShaderResources(
         }
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (uav.buffer.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+          if (EncodeMissingTextureBufferMetadata<stage, kind>(
+                  "UAV", shader_hash, arg, encoded_buffer, bool(uav.buffer.ptr()),
+                  bool(uav.texture.ptr()), bool(uav.counter.ptr()), encoder_id))
+            break;
           auto allocation = uav.buffer->current();
           auto *view_ptr = uav.buffer->tryView(uav.viewId, allocation);
           if (!view_ptr || !view_ptr->texture) {
@@ -2494,7 +2541,10 @@ ArgumentEncodingContext::encodeShaderResources(
               ((uint64_t)uav.slice.elementCount << 32) | (uint64_t)(uav.slice.firstElement + offset);
           makeResident<stage, kind>(uav.buffer.ptr(), uav.viewId, read, write);
         } else if (uav.texture.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
+          DebugLogMissingTextureMetadata<stage, kind>(
+              "UAV", shader_hash, arg, bool(uav.buffer.ptr()),
+              bool(uav.texture.ptr()), bool(uav.counter.ptr()), encoder_id
+          );
           auto viewIdChecked = uav.texture->checkViewUseArray(uav.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           encoded_buffer[arg.StructurePtrOffset] = access<stage>(uav.texture, viewIdChecked, access_flags).gpuResourceID;
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(uav.texture->arrayLength(viewIdChecked), 0);

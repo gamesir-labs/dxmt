@@ -1840,7 +1840,9 @@ _MTLDevice_supportsPlacementSparse(void *obj) {
   id<MTLDevice> device = (id<MTLDevice>)params->handle;
   params->ret = 0;
   if (@available(macOS 26.4, *)) {
-    params->ret = device.supportsPlacementSparse ? 1 : 0;
+    SEL selector = @selector(supportsPlacementSparse);
+    if ([device respondsToSelector:selector])
+      params->ret = ((BOOL (*)(id, SEL))objc_msgSend)(device, selector) ? 1 : 0;
   }
   return STATUS_SUCCESS;
 }
