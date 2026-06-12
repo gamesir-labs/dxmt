@@ -77,6 +77,19 @@ ShouldLogTileMappingDiag() {
   return count.fetch_add(1, std::memory_order_relaxed) < 16;
 }
 
+static uint32_t
+GetSwapChainPresentAlphaMode(DXGI_ALPHA_MODE alpha_mode) {
+  switch (alpha_mode) {
+  case DXGI_ALPHA_MODE_PREMULTIPLIED:
+  case DXGI_ALPHA_MODE_STRAIGHT:
+  case DXGI_ALPHA_MODE_IGNORE:
+    return alpha_mode;
+  case DXGI_ALPHA_MODE_UNSPECIFIED:
+  default:
+    return DXGI_ALPHA_MODE_IGNORE;
+  }
+}
+
 static bool
 ShouldLogTextureBufferViewDiag() {
   static std::atomic<uint32_t> count = 0;
@@ -4157,6 +4170,11 @@ private:
       auto *chunk = dxmt_queue.CurrentChunk();
       chunk->signal_frame_latency_fence_ = dxmt_queue.CurrentFrameSeq();
       auto state = presenter_->synchronizeLayerProperties();
+      state.metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
+      state.metadata.background_color[0] = background_color_.r;
+      state.metadata.background_color[1] = background_color_.g;
+      state.metadata.background_color[2] = background_color_.b;
+      state.metadata.background_color[3] = background_color_.a;
       HANDLE present_signal = nullptr;
       if (present_semaphore_) {
         HANDLE process = GetCurrentProcess();
