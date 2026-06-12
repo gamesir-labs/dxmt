@@ -1,5 +1,9 @@
 #define WIN_EXPORT
+#ifdef DXMT_NATIVE
+#include "../nativemetal/wineunixlib.h"
+#else
 #include "wineunixlib.h"
+#endif
 #include "airconv_thunks.h"
 
 AIRCONV_API int

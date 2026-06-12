@@ -113,6 +113,7 @@ typedef HANDLE HINSTANCE;
 typedef HANDLE HWND;
 typedef HANDLE HKEY;
 typedef HANDLE *LPHANDLE;
+typedef void *FARPROC;
 typedef DWORD COLORREF;
 
 #if INTPTR_MAX == INT64_MAX
@@ -205,6 +206,16 @@ typedef struct RGNDATA {
   char          Buffer[1];
 } RGNDATA,*PRGNDATA,*NPRGNDATA,*LPRGNDATA;
 
+typedef struct MEMORY_BASIC_INFORMATION {
+  PVOID BaseAddress;
+  PVOID AllocationBase;
+  DWORD AllocationProtect;
+  SIZE_T RegionSize;
+  DWORD State;
+  DWORD Protect;
+  DWORD Type;
+} MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
+
 // Ignore these.
 #define STDMETHODCALLTYPE
 #define __stdcall
@@ -219,6 +230,17 @@ typedef struct RGNDATA {
 #define WAIT_FAILED	    0xffffffff
 #define WAIT_OBJECT_0		0
 #define WAIT_ABANDONED  0x00000080
+
+#define MEM_COMMIT 0x00001000
+#define PAGE_NOACCESS 0x01
+#define PAGE_GUARD 0x100
+
+#define THREAD_PRIORITY_LOWEST       -2
+#define THREAD_PRIORITY_BELOW_NORMAL -1
+#define THREAD_PRIORITY_NORMAL        0
+#define THREAD_PRIORITY_ABOVE_NORMAL  1
+#define THREAD_PRIORITY_HIGHEST       2
+#define THREAD_PRIORITY_TIME_CRITICAL 15
 
 #define interface struct
 #define MIDL_INTERFACE(x) struct
@@ -252,6 +274,8 @@ typedef struct RGNDATA {
 #define E_NOTIMPL     ((HRESULT)0x80004001)
 #define E_OUTOFMEMORY ((HRESULT)0x8007000E)
 #define E_POINTER     ((HRESULT)0x80004003)
+
+#define HRESULT_FROM_WIN32(x) ((HRESULT)(x) <= 0 ? ((HRESULT)(x)) : ((HRESULT)((((x) & 0x0000FFFF) | (7 << 16) | 0x80000000))))
 
 #define DXGI_STATUS_OCCLUDED                     ((HRESULT)0x087a0001)
 #define DXGI_STATUS_CLIPPED                      ((HRESULT)0x087a0002)

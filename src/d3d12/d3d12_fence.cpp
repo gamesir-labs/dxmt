@@ -140,7 +140,7 @@ public:
            " fence=", reinterpret_cast<uintptr_t>(this),
            " initial=", initial_value,
            " flags=", flags,
-           " sharedEvent=", reinterpret_cast<uintptr_t>(event_.handle));
+           " sharedEvent=", static_cast<uintptr_t>(event_.handle));
     }
   }
 
