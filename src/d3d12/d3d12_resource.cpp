@@ -1002,6 +1002,20 @@ public:
     return true;
   }
 
+  bool UpdateTileMappingByIndex(UINT tile_index, ID3D12Heap *heap,
+                                bool mapped, UINT64 heap_tile) override {
+    if (!has_tiling_ || tile_index >= tile_map_.size())
+      return false;
+    if (mapped) {
+      tile_map_[tile_index].heap = heap;
+      tile_map_[tile_index].heap_tile = static_cast<int64_t>(heap_tile);
+    } else {
+      tile_map_[tile_index] = {};
+      tile_map_[tile_index].heap_tile = -1;
+    }
+    return true;
+  }
+
   bool GetTileMapping(UINT subresource, UINT x, UINT y, UINT z,
                       ResourceTileMapping &mapping) const override {
     mapping = {};
@@ -1019,6 +1033,16 @@ public:
     if (index >= tile_map_.size())
       return false;
     mapping = tile_map_[index];
+    return true;
+  }
+
+  bool GetTileMappingByIndex(UINT tile_index,
+                             ResourceTileMapping &mapping) const override {
+    mapping = {};
+    mapping.heap_tile = -1;
+    if (!has_tiling_ || tile_index >= tile_map_.size())
+      return false;
+    mapping = tile_map_[tile_index];
     return true;
   }
 
@@ -1836,19 +1860,29 @@ private:
     };
     std::vector<MappingBatch> batches;
 
-    for (const auto &subresource : tiling_.subresources) {
-      if (!subresource.width_in_tiles || !subresource.height_in_tiles ||
-          !subresource.depth_in_tiles)
+    for (UINT subresource_index = 0;
+         subresource_index < tiling_.subresources.size(); ++subresource_index) {
+      const auto &subresource = tiling_.subresources[subresource_index];
+      const bool packed =
+          subresource.start_tile_index == D3D12_PACKED_TILE ||
+          !subresource.width_in_tiles || !subresource.height_in_tiles ||
+          !subresource.depth_in_tiles;
+      if (packed && subresource.mip_level !=
+                        tiling_.packed_mip_info.NumStandardMips)
         continue;
 
-      for (UINT z = 0; z < subresource.depth_in_tiles; ++z) {
-        for (UINT y = 0; y < subresource.height_in_tiles; ++y) {
-          for (UINT x = 0; x < subresource.width_in_tiles; ++x) {
+      const UINT z_count = packed ? 1 : subresource.depth_in_tiles;
+      const UINT y_count = packed ? 1 : subresource.height_in_tiles;
+      const UINT x_count = packed ? 1 : subresource.width_in_tiles;
+      for (UINT z = 0; z < z_count; ++z) {
+        for (UINT y = 0; y < y_count; ++y) {
+          for (UINT x = 0; x < x_count; ++x) {
             const UINT index =
-                subresource.start_tile_index +
-                (z * subresource.height_in_tiles + y) *
-                    subresource.width_in_tiles +
-                x;
+                packed ? subresource.packed_tile_index
+                       : subresource.start_tile_index +
+                             (z * subresource.height_in_tiles + y) *
+                                 subresource.width_in_tiles +
+                             x;
             if (index >= tile_map_.size())
               return false;
 
@@ -1867,7 +1901,8 @@ private:
 
             WMTSparseTextureMappingOperation op = {};
             op.mode = WMTSparseTextureMappingModeMap;
-            op.level = subresource.mip_level;
+            op.level = packed ? tiling_.packed_mip_info.NumStandardMips
+                              : subresource.mip_level;
             op.slice = subresource.array_slice;
             op.x = x;
             op.y = y;
@@ -2006,7 +2041,16 @@ private:
                 tiling_.packed_mip_info.StartTileIndexInOverallResource = next_tile;
                 packed_start_set = true;
               }
+              subresource.packed_tile_index = next_tile;
               ++next_tile;
+            } else if (standard_mips < mip_levels) {
+              const UINT subresource_index =
+                  UINT(tiling_.subresources.size());
+              const UINT first_packed_in_slice =
+                  subresource_index - (mip - standard_mips);
+              if (first_packed_in_slice < tiling_.subresources.size())
+                subresource.packed_tile_index =
+                    tiling_.subresources[first_packed_in_slice].packed_tile_index;
             }
             subresource.width_in_tiles = 0;
             subresource.height_in_tiles = 0;

@@ -57,6 +57,19 @@ dxmt_truthy_env_value(const char *value) {
          !strcmp(value, "on");
 }
 
+static bool
+dxmt_env_enabled_default(const char *name, bool default_value) {
+  const char *value = getenv(name);
+  if (!value || !value[0])
+    return default_value;
+  if (!strcmp(value, "0") || !strcmp(value, "false") ||
+      !strcmp(value, "no") || !strcmp(value, "off"))
+    return false;
+  if (dxmt_truthy_env_value(value))
+    return true;
+  return default_value;
+}
+
 static uint64_t
 dxmt_parse_u64_env(const char *name, uint64_t default_value) {
   const char *value = getenv(name);
@@ -91,6 +104,28 @@ dxmt_metal4_commit_feedback_enabled(uint64_t completion_value) {
   return false;
 }
 
+static bool
+dxmt_metal4_present_ordering_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = true;
+  if (!initialized) {
+    enabled = dxmt_env_enabled_default("DXMT_METAL4_PRESENT_ORDERING", true);
+    initialized = true;
+  }
+  return enabled;
+}
+
+static bool
+dxmt_metal4_wait_for_drawable_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = true;
+  if (!initialized) {
+    enabled = dxmt_env_enabled_default("DXMT_METAL4_WAIT_FOR_DRAWABLE", true);
+    initialized = true;
+  }
+  return enabled;
+}
+
 typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
   DXMTMetal4CommandBufferStateNotEnqueued = 0,
   DXMTMetal4CommandBufferStateCommitted = 2,
@@ -122,6 +157,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 - (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
 - (void)prepareResidencyForCommit;
 - (void)commit;
+- (void)commitLocked;
 - (void)waitUntilCompleted;
 - (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
@@ -549,7 +585,9 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
 @property(nonatomic, retain) id<MTL4CommandQueue> metal4Queue;
 @property(nonatomic, retain) id<MTL4Compiler> compiler;
 @property(nonatomic, retain) id<MTLSharedEvent> event;
+@property(nonatomic, retain) id<MTLSharedEvent> presentEvent;
 @property(nonatomic, assign) uint64_t eventValue;
+@property(nonatomic, assign) uint64_t presentEventValue;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValue;
 @end
@@ -567,9 +605,11 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   _compiler = [(id<MTLDevice>)device newCompilerWithDescriptor:compilerDesc error:&compilerError];
   [compilerDesc release];
   _event = [(id<MTLDevice>)device newSharedEvent];
+  _presentEvent = [(id<MTLDevice>)device newSharedEvent];
   _eventValue = 0;
+  _presentEventValue = 0;
 
-  if (!_metal4Queue || !_compiler || !_event) {
+  if (!_metal4Queue || !_compiler || !_event || !_presentEvent) {
     [self release];
     return nil;
   }
@@ -583,6 +623,7 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   [_metal4Queue release];
   [_compiler release];
   [_event release];
+  [_presentEvent release];
   [super dealloc];
 }
 
@@ -691,6 +732,17 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
 }
 
 - (void)commit {
+  if (_pendingDrawable && dxmt_metal4_present_ordering_enabled()) {
+    @synchronized(_owner) {
+      [self commitLocked];
+    }
+    return;
+  }
+
+  [self commitLocked];
+}
+
+- (void)commitLocked {
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
     return;
 
@@ -703,6 +755,17 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
       0,
       0);
 
+  const BOOL hasDrawable = _pendingDrawable != nil;
+  const BOOL presentOrdering = hasDrawable && dxmt_metal4_present_ordering_enabled();
+  const BOOL waitForDrawable = hasDrawable && dxmt_metal4_wait_for_drawable_enabled();
+  uint64_t previousPresentValue = 0;
+  uint64_t currentPresentValue = 0;
+
+  if (presentOrdering) {
+    previousPresentValue = _owner.presentEventValue;
+    currentPresentValue = ++_owner.presentEventValue;
+  }
+
   for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
     dxmt_apitrace_record_command_buffer_event(
         (obj_handle_t)self,
@@ -711,6 +774,21 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
         wait.value,
         APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
     [_owner.metal4Queue waitForEvent:wait.event value:wait.value];
+  }
+
+  if (waitForDrawable)
+    [_owner.metal4Queue waitForDrawable:_pendingDrawable];
+
+  if (presentOrdering && previousPresentValue) {
+#if DXMT_APITRACE_METAL
+    dxmt_apitrace_record_command_buffer_event(
+        (obj_handle_t)self,
+        APITRACE_METAL_QUEUE_EVENT_WAIT,
+        (obj_handle_t)_owner.presentEvent,
+        previousPresentValue,
+        APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
+#endif
+    [_owner.metal4Queue waitForEvent:_owner.presentEvent value:previousPresentValue];
   }
 
   [self prepareResidencyForCommit];
@@ -758,6 +836,17 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
       [_pendingDrawable presentAfterMinimumDuration:_presentDuration];
     else
       [_pendingDrawable present];
+    if (presentOrdering) {
+#if DXMT_APITRACE_METAL
+      dxmt_apitrace_record_command_buffer_event(
+          (obj_handle_t)self,
+          APITRACE_METAL_QUEUE_EVENT_SIGNAL,
+          (obj_handle_t)_owner.presentEvent,
+          currentPresentValue,
+          APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
+#endif
+      [_owner.metal4Queue signalEvent:_owner.presentEvent value:currentPresentValue];
+    }
   }
 
   for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents) {
@@ -3134,6 +3223,11 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
         dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
       }
       break;
+    case WMTBlitCommandResourceStateBarrier:
+      dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
+      dxmt_apitrace_flush_blit_ops(session, encoder, state);
+      dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
+      break;
     default:
       break;
     }
@@ -4422,6 +4516,15 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandResolveCounters: {
       assert(!"MTLCounterSampleBuffer resolve is not supported by winemetal4 blit emulation");
+      break;
+    }
+    case WMTBlitCommandResourceStateBarrier: {
+      [(id)encoder barrierAfterQueueStages:MTLStageResourceState
+                              beforeStages:(MTLStageVertex | MTLStageFragment |
+                                            MTLStageTile | MTLStageObject |
+                                            MTLStageMesh | MTLStageDispatch |
+                                            MTLStageBlit)
+                         visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     }

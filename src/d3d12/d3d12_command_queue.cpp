@@ -161,11 +161,68 @@ struct TileRangeCursor {
   UINT total_consumed = 0;
 };
 
+struct SparseTileCoordinate {
+  UINT subresource = 0;
+  UINT x = 0;
+  UINT y = 0;
+  UINT z = 0;
+  UINT tile_index = 0;
+  bool packed = false;
+};
+
+struct SparseTileBarrierSubresource {
+  UINT level = 0;
+  UINT slice = 0;
+};
+
+static bool D3D12TileMappingEnabled();
+
 static bool
 IsPackedTileSubresource(const SubresourceTiling &subresource) {
   return subresource.start_tile_index == D3D12_PACKED_TILE ||
          !subresource.width_in_tiles || !subresource.height_in_tiles ||
          !subresource.depth_in_tiles;
+}
+
+static bool
+ResolveSparseTileCoordinate(const ResourceTiling &tiling,
+                            const D3D12_TILED_RESOURCE_COORDINATE &coord,
+                            SparseTileCoordinate &resolved) {
+  if (coord.Subresource >= tiling.subresources.size())
+    return false;
+
+  const auto &subresource = tiling.subresources[coord.Subresource];
+  if (IsPackedTileSubresource(subresource)) {
+    if (!D3D12TileMappingEnabled())
+      return false;
+    if (coord.X || coord.Y || coord.Z)
+      return false;
+    if (!tiling.packed_mip_info.NumPackedMips ||
+        subresource.packed_tile_index >= tiling.total_tile_count)
+      return false;
+    resolved = {};
+    resolved.subresource = coord.Subresource;
+    resolved.tile_index = subresource.packed_tile_index;
+    resolved.packed = true;
+    return true;
+  }
+
+  if (coord.X >= subresource.width_in_tiles ||
+      coord.Y >= subresource.height_in_tiles ||
+      coord.Z >= subresource.depth_in_tiles)
+    return false;
+
+  resolved = {};
+  resolved.subresource = coord.Subresource;
+  resolved.x = coord.X;
+  resolved.y = coord.Y;
+  resolved.z = coord.Z;
+  resolved.tile_index =
+      subresource.start_tile_index +
+      (coord.Z * subresource.height_in_tiles + coord.Y) *
+          subresource.width_in_tiles +
+      coord.X;
+  return resolved.tile_index < tiling.total_tile_count;
 }
 
 static bool
@@ -199,6 +256,38 @@ AdvanceTileCoordinate(const ResourceTiling &tiling,
     return true;
   coord.Z = 0;
   ++coord.Subresource;
+  while (coord.Subresource < tiling.subresources.size()) {
+    const auto &next_subresource = tiling.subresources[coord.Subresource];
+    if (!IsPackedTileSubresource(next_subresource))
+      return true;
+    if (next_subresource.mip_level ==
+        tiling.packed_mip_info.NumStandardMips)
+      return true;
+    ++coord.Subresource;
+  }
+  return coord.Subresource < tiling.subresources.size();
+}
+
+static bool
+AdvanceLogicalTileCoordinate(const ResourceTiling &tiling,
+                             D3D12_TILED_RESOURCE_COORDINATE &coord) {
+  SparseTileCoordinate resolved = {};
+  if (!ResolveSparseTileCoordinate(tiling, coord, resolved))
+    return false;
+  const auto &subresource = tiling.subresources[coord.Subresource];
+  if (!resolved.packed)
+    return AdvanceTileCoordinate(tiling, coord);
+
+  const UINT packed_tile_index = subresource.packed_tile_index;
+  do {
+    ++coord.Subresource;
+  } while (coord.Subresource < tiling.subresources.size() &&
+           IsPackedTileSubresource(tiling.subresources[coord.Subresource]) &&
+           tiling.subresources[coord.Subresource].packed_tile_index ==
+               packed_tile_index);
+  coord.X = 0;
+  coord.Y = 0;
+  coord.Z = 0;
   return coord.Subresource < tiling.subresources.size();
 }
 
@@ -252,19 +341,21 @@ AppendSparseTileMappingOp(const ResourceTiling &tiling,
                           const D3D12_TILED_RESOURCE_COORDINATE &coord,
                           D3D12_TILE_RANGE_FLAGS range_flags, UINT heap_tile,
                           std::vector<WMTSparseTextureMappingOperation> &ops) {
-  if (!IsValidTileCoordinate(tiling, coord))
+  SparseTileCoordinate resolved = {};
+  if (!ResolveSparseTileCoordinate(tiling, coord, resolved))
     return false;
-  const auto &subresource = tiling.subresources[coord.Subresource];
+  const auto &subresource = tiling.subresources[resolved.subresource];
 
   WMTSparseTextureMappingOperation op = {};
   op.mode = (range_flags & D3D12_TILE_RANGE_FLAG_NULL)
                 ? WMTSparseTextureMappingModeUnmap
                 : WMTSparseTextureMappingModeMap;
-  op.level = subresource.mip_level;
+  op.level = resolved.packed ? tiling.packed_mip_info.NumStandardMips
+                             : subresource.mip_level;
   op.slice = subresource.array_slice;
-  op.x = coord.X;
-  op.y = coord.Y;
-  op.z = coord.Z;
+  op.x = resolved.packed ? 0 : resolved.x;
+  op.y = resolved.packed ? 0 : resolved.y;
+  op.z = resolved.packed ? 0 : resolved.z;
   op.width = 1;
   op.height = 1;
   op.depth = 1;
@@ -282,7 +373,8 @@ AppendSparseTileMappingRegion(const ResourceTiling &tiling,
                               const UINT *heap_range_offsets,
                               const UINT *range_tile_counts,
                               std::vector<WMTSparseTextureMappingOperation> &ops) {
-  if (!IsValidTileCoordinate(tiling, start))
+  SparseTileCoordinate start_resolved = {};
+  if (!ResolveSparseTileCoordinate(tiling, start, start_resolved))
     return false;
 
   auto append_one = [&](const D3D12_TILED_RESOURCE_COORDINATE &coord) -> bool {
@@ -315,6 +407,8 @@ AppendSparseTileMappingRegion(const ResourceTiling &tiling,
 
   if (size->UseBox) {
     const auto &subresource = tiling.subresources[start.Subresource];
+    if (IsPackedTileSubresource(subresource))
+      return false;
     if (start.X > subresource.width_in_tiles ||
         size->Width > subresource.width_in_tiles - start.X ||
         start.Y > subresource.height_in_tiles ||
@@ -339,9 +433,60 @@ AppendSparseTileMappingRegion(const ResourceTiling &tiling,
 
   auto coord = start;
   for (UINT i = 0; i < size->NumTiles; ++i) {
-    if (!IsValidTileCoordinate(tiling, coord) || !append_one(coord))
+    if (!ResolveSparseTileCoordinate(tiling, coord, start_resolved) ||
+        !append_one(coord))
       return false;
-    if (i + 1 < size->NumTiles && !AdvanceTileCoordinate(tiling, coord))
+    if (i + 1 < size->NumTiles &&
+        !AdvanceLogicalTileCoordinate(tiling, coord))
+      return false;
+  }
+  return true;
+}
+
+template <typename Fn>
+static bool
+ForEachLogicalTileInRegion(const ResourceTiling &tiling,
+                           const D3D12_TILED_RESOURCE_COORDINATE &start,
+                           const D3D12_TILE_REGION_SIZE *size, Fn &&fn) {
+  SparseTileCoordinate resolved = {};
+  if (!ResolveSparseTileCoordinate(tiling, start, resolved))
+    return false;
+
+  if (!size)
+    return fn(resolved);
+
+  if (size->UseBox) {
+    const auto &subresource = tiling.subresources[start.Subresource];
+    if (IsPackedTileSubresource(subresource))
+      return false;
+    if (start.X > subresource.width_in_tiles ||
+        size->Width > subresource.width_in_tiles - start.X ||
+        start.Y > subresource.height_in_tiles ||
+        size->Height > subresource.height_in_tiles - start.Y ||
+        start.Z > subresource.depth_in_tiles ||
+        size->Depth > subresource.depth_in_tiles - start.Z)
+      return false;
+    for (UINT z = 0; z < size->Depth; ++z)
+      for (UINT y = 0; y < size->Height; ++y)
+        for (UINT x = 0; x < size->Width; ++x) {
+          D3D12_TILED_RESOURCE_COORDINATE coord = start;
+          coord.X += x;
+          coord.Y += y;
+          coord.Z += z;
+          if (!ResolveSparseTileCoordinate(tiling, coord, resolved) ||
+              !fn(resolved))
+            return false;
+        }
+    return true;
+  }
+
+  auto coord = start;
+  for (UINT i = 0; i < size->NumTiles; ++i) {
+    if (!ResolveSparseTileCoordinate(tiling, coord, resolved) ||
+        !fn(resolved))
+      return false;
+    if (i + 1 < size->NumTiles &&
+        !AdvanceLogicalTileCoordinate(tiling, coord))
       return false;
   }
   return true;
@@ -395,8 +540,19 @@ ApplySparseTileMappingOpsToResource(Resource &resource,
     for (UINT subresource = 0; subresource < tiling.subresources.size();
          ++subresource) {
       const auto &tile = tiling.subresources[subresource];
-      if (tile.mip_level != op.level || tile.array_slice != op.slice ||
-          op.x >= tile.width_in_tiles || op.y >= tile.height_in_tiles ||
+      if (tile.mip_level != op.level || tile.array_slice != op.slice)
+        continue;
+      const bool packed = IsPackedTileSubresource(tile);
+      if (packed) {
+        if (op.x || op.y || op.z ||
+            !resource.UpdateTileMappingByIndex(
+                tile.packed_tile_index, heap,
+                op.mode == WMTSparseTextureMappingModeMap,
+                op.heap_offset / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES))
+          continue;
+        break;
+      }
+      if (op.x >= tile.width_in_tiles || op.y >= tile.height_in_tiles ||
           op.z >= tile.depth_in_tiles)
         continue;
       resource.UpdateTileMapping(
@@ -406,6 +562,15 @@ ApplySparseTileMappingOpsToResource(Resource &resource,
       break;
     }
   }
+}
+
+static bool
+GetSparseTileMapping(Resource &resource, const SparseTileCoordinate &coord,
+                     ResourceTileMapping &mapping) {
+  if (coord.packed)
+    return resource.GetTileMappingByIndex(coord.tile_index, mapping);
+  return resource.GetTileMapping(coord.subresource, coord.x, coord.y, coord.z,
+                                 mapping);
 }
 
 static bool
@@ -442,6 +607,136 @@ D3D12QueryFallbackStatsEnabled() {
       D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_QUERY") ||
       D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
   return enabled;
+}
+
+static bool
+D3D12TileMappingEnabled() {
+  static const bool enabled =
+      D3D12EnabledEnvDefaultOn("DXMT_D3D12_TILE_MAPPING");
+  return enabled;
+}
+
+static bool
+D3D12TileMappingStatsEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_D3D12_TILE_MAPPING_STATS") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_TILE_MAPPING");
+  return enabled;
+}
+
+struct D3D12TileMappingCounters {
+  std::atomic<uint64_t> calls = {0};
+  std::atomic<uint64_t> standard_ops = {0};
+  std::atomic<uint64_t> packed_ops = {0};
+  std::atomic<uint64_t> map_ops = {0};
+  std::atomic<uint64_t> unmap_ops = {0};
+  std::atomic<uint64_t> invalid = {0};
+  std::atomic<uint64_t> metal_failures = {0};
+  std::atomic<uint64_t> barriers = {0};
+};
+
+struct D3D12TileMappingDelta {
+  uint64_t standard_ops = 0;
+  uint64_t packed_ops = 0;
+  uint64_t map_ops = 0;
+  uint64_t unmap_ops = 0;
+};
+
+static D3D12TileMappingCounters &
+D3D12TileMappingStats() {
+  static D3D12TileMappingCounters counters;
+  return counters;
+}
+
+static D3D12TileMappingDelta
+RecordTileMappingOps(const ResourceTiling &tiling,
+                     const std::vector<WMTSparseTextureMappingOperation> &ops) {
+  D3D12TileMappingDelta delta;
+  auto &stats = D3D12TileMappingStats();
+  for (const auto &op : ops) {
+    bool packed = false;
+    for (const auto &subresource : tiling.subresources) {
+      if (subresource.mip_level != op.level ||
+          subresource.array_slice != op.slice)
+        continue;
+      packed = IsPackedTileSubresource(subresource);
+      break;
+    }
+    if (packed) {
+      stats.packed_ops.fetch_add(1, std::memory_order_relaxed);
+      delta.packed_ops++;
+    } else {
+      stats.standard_ops.fetch_add(1, std::memory_order_relaxed);
+      delta.standard_ops++;
+    }
+    if (op.mode == WMTSparseTextureMappingModeMap) {
+      stats.map_ops.fetch_add(1, std::memory_order_relaxed);
+      delta.map_ops++;
+    } else {
+      stats.unmap_ops.fetch_add(1, std::memory_order_relaxed);
+      delta.unmap_ops++;
+    }
+  }
+  return delta;
+}
+
+static void
+LogTileMappingStats(const char *context) {
+  if (!D3D12TileMappingStatsEnabled())
+    return;
+  static std::atomic<uint32_t> log_count = 0;
+  if (log_count.fetch_add(1, std::memory_order_relaxed) >= 128)
+    return;
+  auto &stats = D3D12TileMappingStats();
+  WARN_FILE_ONLY("D3D12 tile mapping stats"
+       " context=", context ? context : "",
+       " calls=", stats.calls.load(std::memory_order_relaxed),
+       " standardOps=", stats.standard_ops.load(std::memory_order_relaxed),
+       " packedOps=", stats.packed_ops.load(std::memory_order_relaxed),
+       " mapOps=", stats.map_ops.load(std::memory_order_relaxed),
+       " unmapOps=", stats.unmap_ops.load(std::memory_order_relaxed),
+       " invalid=", stats.invalid.load(std::memory_order_relaxed),
+       " metalFailures=", stats.metal_failures.load(std::memory_order_relaxed),
+       " barriers=", stats.barriers.load(std::memory_order_relaxed));
+}
+
+static std::vector<SparseTileBarrierSubresource>
+CollectSparseTileBarrierSubresources(
+    const std::vector<WMTSparseTextureMappingOperation> &ops) {
+  std::vector<SparseTileBarrierSubresource> subresources;
+  subresources.reserve(ops.size());
+  for (const auto &op : ops) {
+    SparseTileBarrierSubresource entry = {op.level, op.slice};
+    if (std::find_if(subresources.begin(), subresources.end(),
+                     [&](const SparseTileBarrierSubresource &existing) {
+                       return existing.level == entry.level &&
+                              existing.slice == entry.slice;
+                     }) == subresources.end())
+      subresources.push_back(entry);
+  }
+  return subresources;
+}
+
+static void
+EmitSparseTextureMappingBarrier(
+    CommandChunk *chunk, Rc<Texture> texture,
+    std::vector<SparseTileBarrierSubresource> subresources) {
+  if (!chunk || !texture || subresources.empty())
+    return;
+  chunk->emitcc([texture = std::move(texture),
+                 subresources = std::move(subresources)](
+                    ArgumentEncodingContext &enc) mutable {
+    enc.startBlitPass();
+    auto &barrier =
+        enc.encodeBlitCommand<wmtcmd_blit_resource_state_barrier>();
+    barrier.type = WMTBlitCommandResourceStateBarrier;
+    for (const auto &subresource : subresources)
+      enc.access(texture, subresource.level, subresource.slice,
+                 ResourceAccess::All);
+    enc.endPass();
+    D3D12TileMappingStats().barriers.fetch_add(1,
+                                               std::memory_order_relaxed);
+  });
 }
 
 static std::atomic<uint64_t> g_timestamp_gpu_resolve_runs = {0};
@@ -2755,6 +3050,8 @@ struct ReplaySubresourceState {
   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
   D3D12_RESOURCE_STATES pending_before = D3D12_RESOURCE_STATE_COMMON;
   D3D12_RESOURCE_STATES pending_after = D3D12_RESOURCE_STATE_COMMON;
+  D3D12_RESOURCE_STATES mismatch_barrier_synced_state =
+      D3D12_RESOURCE_STATE_COMMON;
   bool implicitly_promoted = false;
   bool has_pending_split = false;
 };
@@ -2903,6 +3200,7 @@ public:
         this, resource, region_count, region_start_coordinates, region_sizes,
         heap, range_count, range_flags, heap_range_offsets, range_tile_counts,
         flags);
+    D3D12TileMappingStats().calls.fetch_add(1, std::memory_order_relaxed);
     if (!resource || !region_count || !region_start_coordinates)
       return;
     if (flags && ShouldLogTileMappingDiag()) {
@@ -2935,6 +3233,8 @@ public:
               *tiling, region_start_coordinates[i], size, cursor,
               range_count, range_flags, heap_range_offsets, range_tile_counts,
               ops)) {
+        D3D12TileMappingStats().invalid.fetch_add(1, std::memory_order_relaxed);
+        dxmt::perf::recordTileMapping(0, 0, 0, 0, 1, 0, 0);
         if (ShouldLogTileMappingDiag()) {
           const auto &coord = region_start_coordinates[i];
           WARN("D3D12CommandQueue: TODO UpdateTileMappings unsupported or invalid region"
@@ -2965,6 +3265,8 @@ public:
     }
     if (ops.empty())
       return;
+    auto perf_delta = RecordTileMappingOps(*tiling, ops);
+    LogTileMappingStats("UpdateTileMappings");
 
     bool has_map = false;
     for (const auto &op : ops) {
@@ -2979,6 +3281,9 @@ public:
                " resource=", resource,
                " ops=", ops.size());
         }
+        dxmt::perf::recordTileMapping(
+            perf_delta.standard_ops, perf_delta.packed_ops,
+            perf_delta.map_ops, perf_delta.unmap_ops, 0, 1, 0);
         return;
       }
       auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
@@ -2988,6 +3293,9 @@ public:
                " resource=", resource,
                " heap=", heap,
                " ops=", ops.size());
+        dxmt::perf::recordTileMapping(
+            perf_delta.standard_ops, perf_delta.packed_ops,
+            perf_delta.map_ops, perf_delta.unmap_ops, 0, 1, 0);
         return;
       }
       const auto &heap_desc = heap_object->GetHeapDesc();
@@ -3003,6 +3311,9 @@ public:
                " heap=", heap,
                " tile=", tile,
                " heapTiles=", heap_tile_count);
+          dxmt::perf::recordTileMapping(
+              perf_delta.standard_ops, perf_delta.packed_ops,
+              perf_delta.map_ops, perf_delta.unmap_ops, 0, 1, 0);
           return;
         }
       }
@@ -3013,6 +3324,9 @@ public:
                " resource=", resource,
                " heap=", heap,
                " ops=", ops.size());
+        dxmt::perf::recordTileMapping(
+            perf_delta.standard_ops, perf_delta.packed_ops,
+            perf_delta.map_ops, perf_delta.unmap_ops, 0, 1, 0);
         return;
       }
     }
@@ -3021,12 +3335,16 @@ public:
       auto tiling_copy = *tiling;
       ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
                                           nullptr, ops);
+      dxmt::perf::recordTileMapping(
+          perf_delta.standard_ops, perf_delta.packed_ops,
+          perf_delta.map_ops, perf_delta.unmap_ops, 0, 0, 0);
       return;
     }
 
     auto texture = resource_object->GetTextureAllocation()->texture();
     auto &queue = device_->GetDXMTDevice().queue();
     auto *chunk = queue.CurrentChunk();
+    auto barrier_subresources = CollectSparseTileBarrierSubresources(ops);
     dxmt::apitrace::record_sparse_texture_mapping_ops(
         this, resource, heap, "UpdateTileMappings", ops.data(), ops.size());
     Com<ID3D12Resource> resource_ref = resource;
@@ -3040,6 +3358,8 @@ public:
                       ArgumentEncodingContext &) mutable {
       if (!device.updateSparseTextureMappings(texture, placement_heap,
                                               ops.data(), ops.size())) {
+        D3D12TileMappingStats().metal_failures.fetch_add(
+            1, std::memory_order_relaxed);
         WARN("D3D12CommandQueue: TODO Metal4 UpdateTileMappings failed"
              " resource=", resource_ref.ptr(),
              " heap=", heap_ref.ptr(),
@@ -3051,6 +3371,12 @@ public:
         ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
                                             heap_ref.ptr(), ops);
     });
+    EmitSparseTextureMappingBarrier(
+        chunk, Rc<Texture>(resource_object->GetTexture()),
+        std::move(barrier_subresources));
+    dxmt::perf::recordTileMapping(
+        perf_delta.standard_ops, perf_delta.packed_ops, perf_delta.map_ops,
+        perf_delta.unmap_ops, 0, 0, barrier_subresources.empty() ? 0 : 1);
   }
 
   void CopyTileMappingsImpl(ID3D12Resource *dst_resource,
@@ -3112,25 +3438,27 @@ public:
     std::unordered_map<ID3D12Heap *, std::vector<WMTSparseTextureMappingOperation>> map_ops;
     std::vector<WMTSparseTextureMappingOperation> unmap_ops;
     D3D12_TILED_RESOURCE_COORDINATE dst_cursor = *dst_start;
-    bool ok = ForEachTileInRegion(*src_tiling, *src_start, region_size,
-                                  [&](UINT src_subresource, UINT sx, UINT sy, UINT sz) {
-      if (!IsValidTileCoordinate(*dst_tiling, dst_cursor))
+    bool ok = ForEachLogicalTileInRegion(*src_tiling, *src_start, region_size,
+                                  [&](const SparseTileCoordinate &src_coord) {
+      SparseTileCoordinate dst_coord = {};
+      if (!ResolveSparseTileCoordinate(*dst_tiling, dst_cursor, dst_coord))
         return false;
-      const auto &dst_sub = dst_tiling->subresources[dst_cursor.Subresource];
+      const auto &dst_sub = dst_tiling->subresources[dst_coord.subresource];
 
       ResourceTileMapping mapping = {};
-      if (!src->GetTileMapping(src_subresource, sx, sy, sz, mapping))
+      if (!GetSparseTileMapping(*src, src_coord, mapping))
         return false;
 
       WMTSparseTextureMappingOperation op = {};
       op.mode = mapping.heap && mapping.heap_tile >= 0
                     ? WMTSparseTextureMappingModeMap
                     : WMTSparseTextureMappingModeUnmap;
-      op.level = dst_sub.mip_level;
+      op.level = dst_coord.packed ? dst_tiling->packed_mip_info.NumStandardMips
+                                  : dst_sub.mip_level;
       op.slice = dst_sub.array_slice;
-      op.x = dst_cursor.X;
-      op.y = dst_cursor.Y;
-      op.z = dst_cursor.Z;
+      op.x = dst_coord.packed ? 0 : dst_coord.x;
+      op.y = dst_coord.packed ? 0 : dst_coord.y;
+      op.z = dst_coord.packed ? 0 : dst_coord.z;
       op.width = 1;
       op.height = 1;
       op.depth = 1;
@@ -3143,7 +3471,7 @@ public:
       else
         unmap_ops.push_back(op);
 
-      if (!AdvanceTileCoordinate(*dst_tiling, dst_cursor))
+      if (!AdvanceLogicalTileCoordinate(*dst_tiling, dst_cursor))
         dst_cursor.Subresource = UINT(dst_tiling->subresources.size());
       return true;
     });
@@ -3180,6 +3508,7 @@ public:
           this, dst_resource, heap, "CopyTileMappings", ops.data(), ops.size());
       Com<ID3D12Heap> heap_ref = heap;
       WMT::Heap placement_heap = {};
+      auto barrier_subresources = CollectSparseTileBarrierSubresources(ops);
       if (heap) {
         auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
         if (!heap_object || !(placement_heap = heap_object->GetPlacementHeap())) {
@@ -3206,6 +3535,8 @@ public:
           ApplySparseTileMappingOpsToResource(*dst, tiling_copy, heap_ref.ptr(),
                                               ops);
       });
+      EmitSparseTextureMappingBarrier(
+          chunk, Rc<Texture>(dst->GetTexture()), std::move(barrier_subresources));
     };
 
     if (!unmap_ops.empty())
@@ -4108,6 +4439,8 @@ private:
     uint32_t width = 0;
     uint32_t height = 0;
     WMTPixelFormat format = WMTPixelFormatInvalid;
+    int depth_access = ResourceAccess::ReadWrite;
+    int stencil_access = ResourceAccess::ReadWrite;
   };
 
   struct ReplayRenderPassAttachments {
@@ -4266,6 +4599,8 @@ private:
       const auto &b = *rhs.depth_stencil;
       if (a.array_length != b.array_length || a.width != b.width ||
           a.height != b.height || a.format != b.format ||
+          a.depth_access != b.depth_access ||
+          a.stencil_access != b.stencil_access ||
           a.texture.ptr() != b.texture.ptr() ||
           uint64_t(a.view) != uint64_t(b.view))
         return false;
@@ -5578,6 +5913,7 @@ private:
       entry.state = initial_state;
       entry.pending_before = initial_state;
       entry.pending_after = initial_state;
+      entry.mismatch_barrier_synced_state = initial_state;
       entry.implicitly_promoted = false;
       entry.has_pending_split = false;
     }
@@ -5607,6 +5943,16 @@ private:
          " mipLevels=", uint32_t(GetResourceMipLevelCount(resource)),
          " flags=", uint32_t(desc.Flags),
          " initial=", uint32_t(resource.GetInitialState()));
+  }
+
+  bool ShouldEmitReadAfterWriteMismatchBarrier(D3D12_RESOURCE_STATES current,
+                                               D3D12_RESOURCE_STATES desired) {
+    return IsReadOnlyResourceState(desired) && StateHasWriteAccess(current);
+  }
+
+  bool ShouldEmitWriteAfterReadMismatchBarrier(D3D12_RESOURCE_STATES current,
+                                               D3D12_RESOURCE_STATES desired) {
+    return IsReadOnlyResourceState(current) && StateHasWriteAccess(desired);
   }
 
   void RecordReplayResourceAccess(CommandChunk *chunk, ReplayState &state,
@@ -5650,15 +5996,39 @@ private:
                            ? UINT(states.size())
                            : std::min<UINT>(subresource_count ? subresource_count : 1,
                                             UINT(states.size()) - first);
+    ResourceAccessBarrierBatch mismatch_resource_barriers;
+    bool has_mismatch_resource_barriers = false;
+    auto add_mismatch_barrier = [&](Resource &resource, UINT subresource,
+                                    D3D12_RESOURCE_STATES before,
+                                    D3D12_RESOURCE_STATES after) {
+      int access = ResourceAccessForState(before) | ResourceAccessForState(after);
+      if (!access)
+        access = ResourceAccess::All;
+      AddResourceAccessBarrier(mismatch_resource_barriers, resource,
+                               subresource, 1, access);
+      has_mismatch_resource_barriers = true;
+    };
     for (UINT i = 0; i < count; i++) {
       const UINT subresource = first + i;
       auto &current = states[subresource];
-      if (current.state == desired)
+      if (current.state == desired) {
+        if (IsReadOnlyResourceState(desired) &&
+            StateHasWriteAccess(current.mismatch_barrier_synced_state)) {
+          add_mismatch_barrier(*resource, subresource,
+                               current.mismatch_barrier_synced_state, desired);
+          current.mismatch_barrier_synced_state = desired;
+          continue;
+        }
+        if (StateHasWriteAccess(desired))
+          current.mismatch_barrier_synced_state =
+              D3D12_RESOURCE_STATE_COMMON;
         continue;
+      }
 
       if (current.state == D3D12_RESOURCE_STATE_COMMON &&
           IsImplicitPromotionCompatibleState(*resource, desired)) {
         current.state = desired;
+        current.mismatch_barrier_synced_state = D3D12_RESOURCE_STATE_COMMON;
         current.implicitly_promoted = true;
         continue;
       }
@@ -5667,6 +6037,23 @@ private:
           IsReadOnlyResourceState(desired)) {
         current.state =
             D3D12_RESOURCE_STATES(uint32_t(current.state) | uint32_t(desired));
+        current.mismatch_barrier_synced_state = D3D12_RESOURCE_STATE_COMMON;
+        continue;
+      }
+
+      if (ShouldEmitReadAfterWriteMismatchBarrier(current.state, desired)) {
+        if (current.mismatch_barrier_synced_state == current.state)
+          continue;
+        add_mismatch_barrier(*resource, subresource, current.state, desired);
+        current.mismatch_barrier_synced_state = current.state;
+        continue;
+      }
+
+      if (ShouldEmitWriteAfterReadMismatchBarrier(current.state, desired)) {
+        if (current.mismatch_barrier_synced_state == desired)
+          continue;
+        add_mismatch_barrier(*resource, subresource, current.state, desired);
+        current.mismatch_barrier_synced_state = desired;
         continue;
       }
 
@@ -5675,8 +6062,16 @@ private:
       // Resource use does not transition D3D12 state. Keep the last explicit
       // or implicitly promoted state so a missing or mismatched barrier does
       // not poison subsequent state tracking.
-      }
     }
+    if (has_mismatch_resource_barriers) {
+      // Some reflected uses can observe a read/write hazard before DXMT's
+      // replay state sees the app's later transition. Keep the D3D12 state
+      // unchanged, but make Metal visibility safe for the actual access.
+      FlushPassBatches(chunk, state);
+      EmitResourceAccessBarrierBatch(
+          chunk, std::move(mismatch_resource_barriers));
+    }
+  }
 
   void RecordReplayResourceAccessRanges(
       CommandChunk *chunk, ReplayState &state, ID3D12Resource *d3d_resource,
@@ -5747,6 +6142,8 @@ private:
                 subresource_state.implicitly_promoted))
           continue;
         subresource_state.state = D3D12_RESOURCE_STATE_COMMON;
+        subresource_state.mismatch_barrier_synced_state =
+            D3D12_RESOURCE_STATE_COMMON;
         subresource_state.implicitly_promoted = false;
       }
     }
@@ -5800,12 +6197,14 @@ private:
                " dimension=", uint32_t(desc.Dimension),
                " flags=", uint32_t(desc.Flags));
         }
-        if (current.state != transition.StateBefore &&
-            IsImplicitPromotionCompatibleResource(*resource, current.state,
-                                                  transition.StateBefore)) {
-          current.state = transition.StateBefore;
-          current.implicitly_promoted = true;
-        }
+      if (current.state != transition.StateBefore &&
+          IsImplicitPromotionCompatibleResource(*resource, current.state,
+                                                transition.StateBefore)) {
+        current.state = transition.StateBefore;
+        current.mismatch_barrier_synced_state =
+            D3D12_RESOURCE_STATE_COMMON;
+        current.implicitly_promoted = true;
+      }
         if (!IsTransitionBeforeStateCompatible(desc_.Type, current.state,
                                                transition.StateBefore)) {
           const auto &desc = resource->GetResourceDesc();
@@ -5844,6 +6243,8 @@ private:
         }
         current.has_pending_split = false;
         current.state = transition.StateAfter;
+        current.mismatch_barrier_synced_state =
+            D3D12_RESOURCE_STATE_COMMON;
         current.implicitly_promoted = false;
         continue;
       }
@@ -5865,6 +6266,8 @@ private:
           IsImplicitPromotionCompatibleResource(*resource, current.state,
                                                 transition.StateBefore)) {
         current.state = transition.StateBefore;
+        current.mismatch_barrier_synced_state =
+            D3D12_RESOURCE_STATE_COMMON;
         current.implicitly_promoted = true;
       }
       if (!IsTransitionBeforeStateCompatible(desc_.Type, current.state,
@@ -5880,6 +6283,7 @@ private:
              " initial=", uint32_t(resource->GetInitialState()));
       }
       current.state = transition.StateAfter;
+      current.mismatch_barrier_synced_state = D3D12_RESOURCE_STATE_COMMON;
       current.implicitly_promoted = false;
     }
 
@@ -6630,7 +7034,8 @@ private:
     }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
-      auto attachments = BuildRenderPassAttachments(state);
+      auto attachments = BuildRenderPassAttachments(state,
+                                                    pipeline->GetGraphicsState());
       if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
         return;
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
@@ -6863,7 +7268,8 @@ private:
     const auto index_type = GetIndexType(state.index_buffer->Format);
     const UINT64 index_offset =
         index_resource->GetHeapOffset() + index_resource_offset;
-      auto attachments = BuildRenderPassAttachments(state);
+      auto attachments = BuildRenderPassAttachments(state,
+                                                    pipeline->GetGraphicsState());
       auto viewports = state.viewports;
       auto scissors = state.scissors;
       if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
@@ -9453,6 +9859,49 @@ private:
     return AlignArgumentBufferSize(size);
   }
 
+  static bool StencilOpWrites(D3D12_STENCIL_OP op) {
+    return op != D3D12_STENCIL_OP_KEEP;
+  }
+
+  static bool StencilFaceWrites(const D3D12_DEPTH_STENCILOP_DESC &face) {
+    return StencilOpWrites(face.StencilFailOp) ||
+           StencilOpWrites(face.StencilDepthFailOp) ||
+           StencilOpWrites(face.StencilPassOp);
+  }
+
+  static bool PipelineWritesDepth(const PipelineGraphicsState *graphics) {
+    if (!graphics)
+      return true;
+    const auto &desc = graphics->desc.DepthStencilState;
+    return desc.DepthEnable &&
+           desc.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+  }
+
+  static bool PipelineWritesStencil(const PipelineGraphicsState *graphics) {
+    if (!graphics)
+      return true;
+    const auto &desc = graphics->desc.DepthStencilState;
+    return desc.StencilEnable && desc.StencilWriteMask &&
+           (StencilFaceWrites(desc.FrontFace) ||
+            StencilFaceWrites(desc.BackFace));
+  }
+
+  static int AccessForDepthStencilPlane(const DescriptorRecord &descriptor,
+                                        D3D12_DSV_FLAGS read_only_flag,
+                                        bool pipeline_writes) {
+    if (descriptor.has_desc &&
+        (descriptor.desc.dsv.Flags & read_only_flag))
+      return ResourceAccess::Read;
+    return pipeline_writes ? ResourceAccess::ReadWrite : ResourceAccess::Read;
+  }
+
+  static D3D12_RESOURCE_STATES
+  DepthStencilResourceStateForAccess(int depth_access, int stencil_access) {
+    return ((depth_access | stencil_access) & ResourceAccess::Write)
+               ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+               : D3D12_RESOURCE_STATE_DEPTH_READ;
+  }
+
   static bool ValidateComputeDispatch(const WMTSize &threadgroup_size,
                                       UINT x, UINT y, UINT z) {
     const auto threads_per_group = threadgroup_size.width *
@@ -9479,7 +9928,8 @@ private:
   }
 
   ReplayRenderPassAttachments BuildRenderPassAttachments(
-      const ReplayState &state) {
+      const ReplayState &state,
+      const PipelineGraphicsState *graphics = nullptr) {
     ReplayRenderPassAttachments attachments = {};
     attachments.colors.reserve(state.render_targets.size());
 
@@ -9525,6 +9975,12 @@ private:
             .width = texture->width(view),
             .height = texture->height(view),
             .format = texture->pixelFormat(),
+            .depth_access = AccessForDepthStencilPlane(
+                *state.depth_stencil, D3D12_DSV_FLAG_READ_ONLY_DEPTH,
+                PipelineWritesDepth(graphics)),
+            .stencil_access = AccessForDepthStencilPlane(
+                *state.depth_stencil, D3D12_DSV_FLAG_READ_ONLY_STENCIL,
+                PipelineWritesStencil(graphics)),
         };
       }
     }
@@ -9585,7 +10041,7 @@ private:
         auto &depth = info.depth;
         depth.attachment = enc.access<PipelineStage::Pixel>(
             attachments.depth_stencil->texture, attachments.depth_stencil->view,
-            ResourceAccess::ReadWrite);
+            attachments.depth_stencil->depth_access);
         TextureViewKey view = attachments.depth_stencil->view;
         depth.level = view.mip_start;
         depth.slice = view.array_start;
@@ -9597,7 +10053,7 @@ private:
         auto &stencil = info.stencil;
         stencil.attachment = enc.access<PipelineStage::Pixel>(
             attachments.depth_stencil->texture, attachments.depth_stencil->view,
-            ResourceAccess::ReadWrite);
+            attachments.depth_stencil->stencil_access);
         TextureViewKey view = attachments.depth_stencil->view;
         stencil.level = view.mip_start;
         stencil.slice = view.array_start;
@@ -10182,7 +10638,8 @@ private:
     }
   }
 
-    void RecordRenderAttachmentAccess(CommandChunk *chunk, ReplayState &state) {
+    void RecordRenderAttachmentAccess(CommandChunk *chunk, ReplayState &state,
+                                      const PipelineGraphicsState *graphics) {
       for (const auto &descriptor : state.render_targets) {
         if (auto *resource = GetResource(descriptor.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
@@ -10194,14 +10651,14 @@ private:
     if (!state.depth_stencil)
       return;
 
-    D3D12_RESOURCE_STATES desired = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    if (state.depth_stencil->has_desc) {
-      const auto flags = state.depth_stencil->desc.dsv.Flags;
-      const auto read_only_flags =
-          D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
-      if ((flags & read_only_flags) == read_only_flags)
-        desired = D3D12_RESOURCE_STATE_DEPTH_READ;
-    }
+    const int depth_access = AccessForDepthStencilPlane(
+        *state.depth_stencil, D3D12_DSV_FLAG_READ_ONLY_DEPTH,
+        PipelineWritesDepth(graphics));
+    const int stencil_access = AccessForDepthStencilPlane(
+        *state.depth_stencil, D3D12_DSV_FLAG_READ_ONLY_STENCIL,
+        PipelineWritesStencil(graphics));
+    const auto desired =
+        DepthStencilResourceStateForAccess(depth_access, stencil_access);
       if (auto *resource = GetResource(state.depth_stencil->resource.ptr())) {
         RecordDescriptorResourceAccessRanges(
               chunk, state, *resource, desired, *state.depth_stencil, "depth stencil",
@@ -10212,7 +10669,7 @@ private:
   void RecordGraphicsPipelineResourceAccess(CommandChunk *chunk, ReplayState &state,
                                             PipelineState &pipeline,
                                             Resource *index_resource) {
-    RecordRenderAttachmentAccess(chunk, state);
+    RecordRenderAttachmentAccess(chunk, state, pipeline.GetGraphicsState());
     RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
     RecordVertexBufferAccess(chunk, state, pipeline.GetGraphicsState());
     if (index_resource) {
@@ -10344,7 +10801,8 @@ private:
     }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
-      auto attachments = BuildRenderPassAttachments(state);
+      auto attachments = BuildRenderPassAttachments(state,
+                                                    pipeline->GetGraphicsState());
       if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
         return;
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
@@ -10586,7 +11044,8 @@ private:
     const UINT64 index_offset =
         index_binding_offset +
         record.start_index_location * GetIndexSize(state.index_buffer->Format);
-      auto attachments = BuildRenderPassAttachments(state);
+      auto attachments = BuildRenderPassAttachments(state,
+                                                    pipeline->GetGraphicsState());
       auto viewports = state.viewports;
       auto scissors = state.scissors;
       if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))

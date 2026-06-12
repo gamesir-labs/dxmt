@@ -982,9 +982,11 @@ private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
+  bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
   bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);
   void appendPendingFenceOnlyBlitPass();
   void mergePendingFenceOnlyBlitPassInto(EncoderData* encoder);
+  void appendComputeArgumentBufferBindings(ComputeEncoderData* data, WMT::Buffer buffer);
   bool isEncoderSignatureMatched(RenderEncoderData* former, RenderEncoderData* latter);
   RenderEncoderColorAttachmentData *isClearColorSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
   RenderEncoderDepthAttachmentData *isClearDepthSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);

@@ -22,6 +22,7 @@ struct SubresourceTiling {
   UINT16 height_in_tiles = 0;
   UINT16 depth_in_tiles = 0;
   UINT start_tile_index = 0;
+  UINT packed_tile_index = 0;
   UINT mip_level = 0;
   UINT array_slice = 0;
   UINT plane = 0;
@@ -51,8 +52,12 @@ public:
   virtual bool UpdateTileMapping(UINT subresource, UINT x, UINT y, UINT z,
                                  ID3D12Heap *heap, bool mapped,
                                  UINT64 heap_tile) = 0;
+  virtual bool UpdateTileMappingByIndex(UINT tile_index, ID3D12Heap *heap,
+                                        bool mapped, UINT64 heap_tile) = 0;
   virtual bool GetTileMapping(UINT subresource, UINT x, UINT y, UINT z,
                               ResourceTileMapping &mapping) const = 0;
+  virtual bool GetTileMappingByIndex(UINT tile_index,
+                                     ResourceTileMapping &mapping) const = 0;
   virtual const D3D12_RESOURCE_DESC &GetResourceDesc() const = 0;
   virtual const D3D12_HEAP_PROPERTIES &GetResourceHeapProperties() const = 0;
   virtual D3D12_HEAP_FLAGS GetResourceHeapFlags() const = 0;

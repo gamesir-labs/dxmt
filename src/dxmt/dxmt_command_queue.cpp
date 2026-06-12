@@ -14,16 +14,22 @@
 namespace dxmt {
 
 static bool
+DxmtQueueDiagEnabledEnv(const char *name) {
+  auto value = env::getEnvVar(name);
+  return value == "1" || value == "true" || value == "yes" ||
+         value == "on" || value == "trace";
+}
+
+static bool
 DxmtQueueDiagEnabled() {
-  static const bool enabled =
-      !env::getEnvVar("DXMT_DIAG_DXMT_QUEUE").empty();
+  static const bool enabled = DxmtQueueDiagEnabledEnv("DXMT_DIAG_DXMT_QUEUE");
   return enabled;
 }
 
 static bool
 DxmtQueueDiagVerboseEnabled() {
   static const bool enabled =
-      !env::getEnvVar("DXMT_DIAG_DXMT_QUEUE_VERBOSE").empty();
+      DxmtQueueDiagEnabledEnv("DXMT_DIAG_DXMT_QUEUE_VERBOSE");
   return enabled;
 }
 
@@ -111,6 +117,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.queue = this;
     chunk.reset();
   };
+  statistics.at(frame_count).begin_time = clock::now();
   event = device.newSharedEvent();
 
   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
@@ -142,6 +149,7 @@ CommandQueue::~CommandQueue() {
   event_listener_thread.join();
   if (apitrace_enabled_)
     dxmt::apitrace::shutdown();
+  perf::flushFinal(frame_count);
   TRACE("Destructed command queue");
 }
 
@@ -239,6 +247,7 @@ CommandQueue::PresentBoundary() {
          " switchC2R=", frame.encoder_switch_compute_render_count,
          " switchOther=", frame.encoder_switch_to_other_count,
          " computePasses=", frame.compute_pass_count,
+         " computeOpt=", frame.compute_pass_optimized,
          " computePassDispatch=", frame.compute_pass_with_dispatch_count,
          " computePassNoDispatch=", frame.compute_pass_without_dispatch_count,
          " computeCommands=", frame.compute_command_count,
@@ -279,6 +288,7 @@ CommandQueue::PresentBoundary() {
          " flushWait=", frame.flush_wait_chunk_count,
          " flushPresent=", frame.flush_present_chunk_count,
          " flushEncoders=", frame.flush_encoder_count,
+         " encodedEncoders=", frame.flush_encoded_encoder_count,
          " flushNull=", frame.flush_null_encoder_count,
          " flushRender=", frame.flush_render_encoder_count,
          " flushCompute=", frame.flush_compute_encoder_count,
@@ -312,9 +322,13 @@ CommandQueue::PresentBoundary() {
          " latency=", frame.latency);
   }
   frame_count++;
+  const auto frame_wall_us = frame_begin_time == clock::time_point{}
+                                 ? 0
+                                 : DxmtQueueDiagDurationUs(
+                                       boundary_time - frame_begin_time);
   perf::recordFrameBoundary(
       frame_count, statistics.at(frame_count - 1), statistics.average(),
-      DxmtQueueDiagDurationUs(boundary_time - frame_begin_time));
+      frame_wall_us);
   statistics.at(frame_count).reset();
   statistics.at(frame_count).begin_time = clock::now();
   // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering

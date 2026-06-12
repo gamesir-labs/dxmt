@@ -69,6 +69,7 @@ struct FrameStatistics {
   uint32_t clear_pass_optimized = 0;
   uint32_t resolve_pass_optimized = 0;
   uint32_t compute_pass_count = 0;
+  uint32_t compute_pass_optimized = 0;
   uint32_t compute_pass_with_dispatch_count = 0;
   uint32_t compute_pass_without_dispatch_count = 0;
   uint32_t compute_command_count = 0;
@@ -109,6 +110,7 @@ struct FrameStatistics {
   uint32_t flush_wait_chunk_count = 0;
   uint32_t flush_present_chunk_count = 0;
   uint32_t flush_encoder_count = 0;
+  uint32_t flush_encoded_encoder_count = 0;
   uint32_t flush_null_encoder_count = 0;
   uint32_t flush_render_encoder_count = 0;
   uint32_t flush_compute_encoder_count = 0;
@@ -176,6 +178,7 @@ struct FrameStatistics {
     clear_pass_optimized = 0;
     resolve_pass_optimized = 0;
     compute_pass_count = 0;
+    compute_pass_optimized = 0;
     compute_pass_with_dispatch_count = 0;
     compute_pass_without_dispatch_count = 0;
     compute_command_count = 0;
@@ -216,6 +219,7 @@ struct FrameStatistics {
     flush_wait_chunk_count = 0;
     flush_present_chunk_count = 0;
     flush_encoder_count = 0;
+    flush_encoded_encoder_count = 0;
     flush_null_encoder_count = 0;
     flush_render_encoder_count = 0;
     flush_compute_encoder_count = 0;
@@ -337,6 +341,7 @@ public:
       average_.encoder_switch_render_compute_count += frames_[i].encoder_switch_render_compute_count;
       average_.encoder_switch_compute_render_count += frames_[i].encoder_switch_compute_render_count;
       average_.encoder_switch_to_other_count += frames_[i].encoder_switch_to_other_count;
+      average_.compute_pass_optimized += frames_[i].compute_pass_optimized;
       average_.compute_pass_with_dispatch_count += frames_[i].compute_pass_with_dispatch_count;
       average_.compute_pass_without_dispatch_count += frames_[i].compute_pass_without_dispatch_count;
       average_.compute_command_count += frames_[i].compute_command_count;
@@ -376,6 +381,7 @@ public:
       average_.flush_wait_chunk_count += frames_[i].flush_wait_chunk_count;
       average_.flush_present_chunk_count += frames_[i].flush_present_chunk_count;
       average_.flush_encoder_count += frames_[i].flush_encoder_count;
+      average_.flush_encoded_encoder_count += frames_[i].flush_encoded_encoder_count;
       average_.flush_null_encoder_count += frames_[i].flush_null_encoder_count;
       average_.flush_render_encoder_count += frames_[i].flush_render_encoder_count;
       average_.flush_compute_encoder_count += frames_[i].flush_compute_encoder_count;
@@ -427,6 +433,7 @@ public:
     average_.encoder_switch_render_compute_count /= (kFrameStatisticsCount - 1);
     average_.encoder_switch_compute_render_count /= (kFrameStatisticsCount - 1);
     average_.encoder_switch_to_other_count /= (kFrameStatisticsCount - 1);
+    average_.compute_pass_optimized /= (kFrameStatisticsCount - 1);
     average_.compute_pass_with_dispatch_count /= (kFrameStatisticsCount - 1);
     average_.compute_pass_without_dispatch_count /= (kFrameStatisticsCount - 1);
     average_.compute_command_count /= (kFrameStatisticsCount - 1);
@@ -466,6 +473,7 @@ public:
     average_.flush_wait_chunk_count /= (kFrameStatisticsCount - 1);
     average_.flush_present_chunk_count /= (kFrameStatisticsCount - 1);
     average_.flush_encoder_count /= (kFrameStatisticsCount - 1);
+    average_.flush_encoded_encoder_count /= (kFrameStatisticsCount - 1);
     average_.flush_null_encoder_count /= (kFrameStatisticsCount - 1);
     average_.flush_render_encoder_count /= (kFrameStatisticsCount - 1);
     average_.flush_compute_encoder_count /= (kFrameStatisticsCount - 1);

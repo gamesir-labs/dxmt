@@ -1388,6 +1388,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     case WMTBlitCommandCopyFromTextureToBuffer:
     case WMTBlitCommandGenerateMipmaps:
     case WMTBlitCommandResolveCounters:
+    case WMTBlitCommandResourceStateBarrier:
       dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
       dxmt_apitrace_flush_command_buffer_blit_batch(session, state.commandBuffer);
@@ -2655,6 +2656,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
              destinationOffset:body->dst_offset];
       break;
     }
+    case WMTBlitCommandResourceStateBarrier:
+      break;
     }
 
     next = next->next.ptr;

@@ -736,14 +736,6 @@ DebugShouldLogBinding(const std::string &shader_hash) {
 }
 
 static bool
-DebugShouldLogRenderCommands() {
-  static const bool enabled =
-      DebugEnabledEnv("DXMT_DIAG_RENDER_COMMANDS") ||
-      DebugEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
-  return enabled;
-}
-
-static bool
 DebugShouldLogRenderPasses() {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_PASS");
   return enabled;
@@ -763,6 +755,16 @@ FenceOnlyBlitOptimizationEnabled() {
     auto value = env::getEnvVar("DXMT_FENCE_ONLY_BLIT_OPT");
     return value != "0" && value != "false" && value != "no" &&
            value != "off";
+  }();
+  return enabled;
+}
+
+static bool
+ComputeEncoderMergeEnabled() {
+  static const bool enabled = []() {
+    auto value = env::getEnvVar("DXMT_COMPUTE_ENCODER_MERGE");
+    return value == "1" || value == "true" || value == "yes" ||
+           value == "on";
   }();
   return enabled;
 }
@@ -882,121 +884,17 @@ DebugPresentReadbackGridSize() {
 }
 
 static uint32_t
-DebugPresentReadbackLimit() {
-  static const uint32_t limit = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_LIMIT");
-    if (value.empty())
-      return 16u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 16u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return limit;
-}
-
-static uint32_t
-DebugPresentReadbackSkip() {
-  static const uint32_t skip = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_SKIP");
-    if (value.empty())
-      return 0u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 0u;
-    return static_cast<uint32_t>(parsed);
-  }();
-  return skip;
-}
-
-static uint32_t
-DebugPresentReadbackInterval() {
-  static const uint32_t interval = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_INTERVAL");
-    if (value.empty())
-      return 1u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 1u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return interval;
-}
-
-static uint32_t
-DebugRenderReadbackLimit() {
-  static const uint32_t limit = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_RENDER_READBACK_LIMIT");
-    if (value.empty())
-      return 64u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 64u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return limit;
-}
-
-static uint64_t
-DebugRenderReadbackFrameSkip() {
-  static const uint64_t skip = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_RENDER_READBACK_FRAME_SKIP");
-    if (value.empty())
-      return 0ull;
-    char *end = nullptr;
-    auto parsed = std::strtoull(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 0ull;
-    return static_cast<uint64_t>(parsed);
-  }();
-  return skip;
-}
-
-static uint64_t
-DebugRenderReadbackFrameInterval() {
-  static const uint64_t interval = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_RENDER_READBACK_FRAME_INTERVAL");
-    if (value.empty())
-      return 1ull;
-    char *end = nullptr;
-    auto parsed = std::strtoull(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 1ull;
-    return static_cast<uint64_t>(std::max<unsigned long long>(1, parsed));
-  }();
-  return interval;
-}
-
-static bool
 DebugShouldSamplePresentReadback(uint32_t &present_index) {
   static std::atomic<uint32_t> present_count = 0;
-  static std::atomic<uint32_t> sample_count = 0;
   if (!DebugPresentReadbackEnabled())
     return false;
   present_index = present_count.fetch_add(1, std::memory_order_relaxed);
-  auto skip = DebugPresentReadbackSkip();
-  if (present_index < skip)
-    return false;
-  if (((present_index - skip) % DebugPresentReadbackInterval()) != 0)
-    return false;
-  return sample_count.fetch_add(1, std::memory_order_relaxed) < DebugPresentReadbackLimit();
+  return true;
 }
 
 static bool
-DebugShouldSampleRenderReadback(uint64_t frame_id) {
-  static std::atomic<uint32_t> sample_count = 0;
-  if (!DebugRenderReadbackEnabled())
-    return false;
-  auto skip = DebugRenderReadbackFrameSkip();
-  if (frame_id < skip)
-    return false;
-  if (((frame_id - skip) % DebugRenderReadbackFrameInterval()) != 0)
-    return false;
-  return sample_count.fetch_add(1, std::memory_order_relaxed) < DebugRenderReadbackLimit();
+DebugShouldSampleRenderReadback() {
+  return DebugRenderReadbackEnabled();
 }
 
 static bool
@@ -1362,9 +1260,6 @@ DebugPipelineStageName(PipelineStage stage) {
 static void
 DebugAccumulateRenderCommands(FrameStatistics &statistics,
                               const wmtcmd_render_nop *cmd_head) {
-  if (!DebugShouldLogRenderCommands())
-    return;
-
   auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
   while (command) {
     statistics.render_command_count++;
@@ -1437,6 +1332,8 @@ DebugAccumulateBlitCommands(FrameStatistics &statistics,
       break;
     case WMTBlitCommandResolveCounters:
       statistics.blit_resolve_counters_count++;
+      break;
+    case WMTBlitCommandResourceStateBarrier:
       break;
     case WMTBlitCommandNop:
       break;
@@ -1873,6 +1770,7 @@ DebugSummarizeBlitCommands(const wmtcmd_blit_nop *cmd_head) {
       summary.fills++;
       break;
     case WMTBlitCommandResolveCounters:
+    case WMTBlitCommandResourceStateBarrier:
       summary.barriers++;
       break;
     case WMTBlitCommandWaitForFence:
@@ -3215,6 +3113,24 @@ ArgumentEncodingContext::appendRenderArgumentBufferBindings(
   }
 }
 
+void
+ArgumentEncodingContext::appendComputeArgumentBufferBindings(ComputeEncoderData *data, WMT::Buffer buffer) {
+  auto append_setargumentbuffer = [&](uint8_t index) {
+    auto cmd = reinterpret_cast<wmtcmd_compute_setargumentbuffer *>(
+        allocate_cpu_heap(sizeof(wmtcmd_compute_setargumentbuffer), 16));
+    cmd->type = WMTComputeCommandSetArgumentBuffer;
+    cmd->next.set(nullptr);
+    cmd->buffer = buffer;
+    cmd->offset = 0;
+    cmd->index = index;
+    data->cmd_tail->next.set(cmd);
+    data->cmd_tail = reinterpret_cast<wmtcmd_base *>(cmd);
+  };
+
+  append_setargumentbuffer(29);
+  append_setargumentbuffer(30);
+}
+
 QueryReadbacks
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
@@ -3421,7 +3337,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       NormalizeRenderPassInfo(render_pass_info);
       FlushRenderEncoderArgumentBuffer(data);
       auto gpu_buffer_ = data->allocated_argbuf;
-      const bool sample_render_readback = DebugShouldSampleRenderReadback(frame_id_);
+      const bool sample_render_readback = DebugShouldSampleRenderReadback();
       DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
                                            seqId, data, sample_render_readback,
                                            "render-color-before-pass");
@@ -4107,6 +4023,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   const auto total = clock::now() - flush_start;
   {
     auto &stats = currentFrameStatistics();
+    const uint32_t encoded_encoders =
+        perf.encodedRender + perf.encodedCompute + perf.encodedBlit +
+        perf.encodedPresent + perf.encodedClear + perf.encodedResolve +
+        perf.encodedScaler + perf.encodedSignalEvent + perf.encodedWaitEvent +
+        perf.encodedTimestamp;
     const bool event_only_chunk =
         perf.inputEncoders == (perf.encodedSignalEvent + perf.encodedWaitEvent) &&
         (perf.encodedSignalEvent || perf.encodedWaitEvent);
@@ -4117,6 +4038,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     stats.flush_wait_chunk_count += perf.encodedWaitEvent != 0;
     stats.flush_present_chunk_count += perf.encodedPresent != 0;
     stats.flush_encoder_count += perf.inputEncoders;
+    stats.flush_encoded_encoder_count += encoded_encoders;
     stats.flush_null_encoder_count += perf.nullEncoders;
     stats.flush_render_encoder_count += perf.encodedRender;
     stats.flush_compute_encoder_count += perf.encodedCompute;
@@ -4224,6 +4146,17 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     if (tryMergeBlitEncoders(
             reinterpret_cast<BlitEncoderData *>(former),
             reinterpret_cast<BlitEncoderData *>(latter)
+        ))
+      return DXMT_ENCODER_LIST_OP_SWAP;
+
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+  }
+
+  if (ComputeEncoderMergeEnabled() &&
+      former->type == EncoderType::Compute && latter->type == EncoderType::Compute) {
+    if (tryMergeComputeEncoders(
+            reinterpret_cast<ComputeEncoderData *>(former),
+            reinterpret_cast<ComputeEncoderData *>(latter)
         ))
       return DXMT_ENCODER_LIST_OP_SWAP;
 
@@ -4427,6 +4360,53 @@ ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncod
   latter->fence_wait.subtract(former->fence_update);
 
   former->~BlitEncoderData();
+  former->next = nullptr;
+  former->type = EncoderType::Null;
+  return true;
+}
+
+bool
+ArgumentEncodingContext::tryMergeComputeEncoders(ComputeEncoderData *former, ComputeEncoderData *latter) {
+  if (!ComputeEncoderMergeEnabled())
+    return false;
+
+  if (hasDataDependency(latter, former))
+    return false;
+
+  if ((void *)former->cmd_tail != &former->cmd_head) {
+    if (former->allocated_argbuf_needs_flush)
+      former->allocated_argbuf.updateContents(
+          former->allocated_argbuf_offset, former->allocated_argbuf_mapping,
+          former->allocated_argbuf_size);
+    former->allocated_argbuf_needs_flush = false;
+
+    if (former->allocated_argbuf_size) {
+      auto original_head = former->cmd_head.next.get();
+      auto original_tail = former->cmd_tail;
+      former->cmd_head.next.set(nullptr);
+      former->cmd_tail = reinterpret_cast<wmtcmd_base *>(&former->cmd_head);
+      appendComputeArgumentBufferBindings(former, former->allocated_argbuf);
+      former->cmd_tail->next.set(original_head);
+      former->cmd_tail = original_tail;
+      if (latter->allocated_argbuf_size &&
+          former->allocated_argbuf != latter->allocated_argbuf)
+        appendComputeArgumentBufferBindings(former, latter->allocated_argbuf);
+    }
+
+    former->cmd_tail->next.set(latter->cmd_head.next.get());
+    latter->cmd_head.next.set(former->cmd_head.next.get());
+    if ((void *)latter->cmd_tail == &latter->cmd_head)
+      latter->cmd_tail = former->cmd_tail;
+    former->cmd_head.next.set(nullptr);
+    former->cmd_tail = reinterpret_cast<wmtcmd_base *>(&former->cmd_head);
+  }
+
+  latter->fence_update.merge(former->fence_update);
+  latter->fence_wait.merge(former->fence_wait);
+  latter->fence_wait.subtract(former->fence_update);
+
+  currentFrameStatistics().compute_pass_optimized++;
+  former->~ComputeEncoderData();
   former->next = nullptr;
   former->type = EncoderType::Null;
   return true;
