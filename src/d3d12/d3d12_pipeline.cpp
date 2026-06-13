@@ -195,11 +195,6 @@ constexpr WMTLogicOperation kLogicOpMap[] = {
 
 WMTPixelFormat
 GetRenderTargetPixelFormat(WMT::Device device, DXGI_FORMAT format) {
-  if (format == DXGI_FORMAT_R8G8B8A8_UNORM)
-    return WMTPixelFormatBGRA8Unorm;
-  if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
-    return WMTPixelFormatBGRA8Unorm_sRGB;
-
   MTL_DXGI_FORMAT_DESC desc = {};
   if (FAILED(MTLQueryDXGIFormat(device, format, desc)))
     return WMTPixelFormatInvalid;

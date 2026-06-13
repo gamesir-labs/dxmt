@@ -9970,7 +9970,7 @@ private:
           .array_length = GetRenderTargetArrayLength(descriptor),
           .width = texture->width(view),
           .height = texture->height(view),
-          .format = texture->pixelFormat(),
+          .format = texture->pixelFormat(view),
       });
     }
 
@@ -9992,7 +9992,7 @@ private:
             .array_length = GetDepthStencilArrayLength(*resource, *state.depth_stencil),
             .width = texture->width(view),
             .height = texture->height(view),
-            .format = texture->pixelFormat(),
+            .format = texture->pixelFormat(view),
             .depth_access = AccessForDepthStencilPlane(
                 *state.depth_stencil, D3D12_DSV_FLAG_READ_ONLY_DEPTH,
                 PipelineWritesDepth(graphics)),
