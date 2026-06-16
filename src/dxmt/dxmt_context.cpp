@@ -760,16 +760,6 @@ FenceOnlyBlitOptimizationEnabled() {
 }
 
 static bool
-ComputeEncoderMergeEnabled() {
-  static const bool enabled = []() {
-    auto value = env::getEnvVar("DXMT_COMPUTE_ENCODER_MERGE");
-    return value == "1" || value == "true" || value == "yes" ||
-           value == "on";
-  }();
-  return enabled;
-}
-
-static bool
 DebugFlushPerfShouldLog() {
   if (!DebugShouldLogFlushPerf())
     return false;
@@ -3247,6 +3237,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     for (j = encoder_count - 2; j != ~0u; j--) {
       if (encoders[j]->type != EncoderType::Clear &&
           encoders[j]->type != EncoderType::Render &&
+          encoders[j]->type != EncoderType::Compute &&
           encoders[j]->type != EncoderType::Blit)
         continue;
       for (i = j + 1; i < encoder_count; i++) {
@@ -4076,6 +4067,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     stats.flush_render_interval += perf.render;
     stats.flush_compute_interval += perf.compute;
     stats.flush_blit_interval += perf.blit;
+    stats.flush_clear_interval += perf.clear;
+    stats.flush_resolve_interval += perf.resolve;
+    stats.flush_scaler_interval += perf.scaler;
     stats.flush_present_interval += perf.present;
     stats.flush_event_interval += perf.event;
     stats.flush_sample_interval += perf.sample;
@@ -4176,15 +4170,16 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
   }
 
-  if (ComputeEncoderMergeEnabled() &&
-      former->type == EncoderType::Compute && latter->type == EncoderType::Compute) {
+  if (former->type == EncoderType::Compute && latter->type == EncoderType::Compute) {
     if (tryMergeComputeEncoders(
             reinterpret_cast<ComputeEncoderData *>(former),
             reinterpret_cast<ComputeEncoderData *>(latter)
         ))
       return DXMT_ENCODER_LIST_OP_SWAP;
 
-    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+    return hasDataDependency(latter, former)
+               ? DXMT_ENCODER_LIST_OP_SYNCHRONIZE
+               : DXMT_ENCODER_LIST_OP_SWAP;
   }
 
   while (former->type != latter->type) {
@@ -4391,9 +4386,6 @@ ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncod
 
 bool
 ArgumentEncodingContext::tryMergeComputeEncoders(ComputeEncoderData *former, ComputeEncoderData *latter) {
-  if (!ComputeEncoderMergeEnabled())
-    return false;
-
   if (hasDataDependency(latter, former))
     return false;
 
