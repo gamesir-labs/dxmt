@@ -82,6 +82,7 @@ typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
 
 static pthread_mutex_t dxmt_apitrace_lock = PTHREAD_MUTEX_INITIALIZER;
 static apitrace_metal_session_t *dxmt_apitrace_session = NULL;
+static char dxmt_apitrace_session_bundle_root[PATH_MAX] = {};
 static NSMutableDictionary *dxmt_apitrace_command_buffers = nil;
 static NSMutableDictionary *dxmt_apitrace_encoders = nil;
 static NSMutableDictionary *dxmt_apitrace_functions = nil;
@@ -118,18 +119,35 @@ dxmt_apitrace_runtime_enabled(void) {
 static apitrace_metal_session_t *
 dxmt_apitrace_ensure_session_locked(void);
 
+static void
+dxmt_apitrace_close_session_locked(void);
+
+static bool
+dxmt_apitrace_has_bundle_suffix(const char *path) {
+  if (!path)
+    return false;
+  static const char suffix[] = ".apitrace";
+  const size_t path_len = strlen(path);
+  const size_t suffix_len = sizeof(suffix) - 1;
+  return path_len >= suffix_len && !strcmp(path + path_len - suffix_len, suffix);
+}
+
 static const char *
 dxmt_apitrace_bundle_root(void) {
+  const char *resolved_bundle_root = getenv("DXMT_APITRACE_RESOLVED_TRACE_BUNDLE");
+  if (resolved_bundle_root && resolved_bundle_root[0])
+    return resolved_bundle_root;
+
   const char *bundle_root = getenv("APITRACE_TRACE_BUNDLE");
-  if (bundle_root && bundle_root[0])
+  if (bundle_root && bundle_root[0] && dxmt_apitrace_has_bundle_suffix(bundle_root))
     return bundle_root;
 
   static bool warned = false;
   if (!warned) {
     warned = true;
     fprintf(stderr,
-            "warn:  DXMT apitrace: APITRACE_TRACE_BUNDLE not set; PE side must "
-            "initialize bundle root before opening unix session\n");
+            "warn:  DXMT apitrace: resolved APITRACE_TRACE_BUNDLE not set; "
+            "PE side must initialize child bundle root before opening unix session\n");
   }
   return NULL;
 }
@@ -310,18 +328,25 @@ dxmt_apitrace_track_function_with_constants_locked(
 
 static apitrace_metal_session_t *
 dxmt_apitrace_ensure_session_locked(void) {
-  if (dxmt_apitrace_session)
-    return dxmt_apitrace_session;
-
   if (!dxmt_apitrace_runtime_enabled())
     return NULL;
 
   const char *bundle_root = dxmt_apitrace_bundle_root();
   if (!bundle_root)
     return NULL;
+
+  if (dxmt_apitrace_session) {
+    if (!strcmp(dxmt_apitrace_session_bundle_root, bundle_root))
+      return dxmt_apitrace_session;
+
+    dxmt_apitrace_log("session bundle changed; reopening", 0, 0);
+    dxmt_apitrace_close_session_locked();
+  }
+
   dxmt_apitrace_session = apitrace_metal_session_open(bundle_root);
   if (!dxmt_apitrace_session)
     return NULL;
+  snprintf(dxmt_apitrace_session_bundle_root, sizeof(dxmt_apitrace_session_bundle_root), "%s", bundle_root);
 
   if (!dxmt_apitrace_command_buffers)
     dxmt_apitrace_command_buffers = [[NSMutableDictionary alloc] init];
@@ -341,6 +366,7 @@ dxmt_apitrace_close_session_locked(void) {
     apitrace_metal_session_close(dxmt_apitrace_session);
     dxmt_apitrace_session = NULL;
   }
+  dxmt_apitrace_session_bundle_root[0] = '\0';
   [dxmt_apitrace_command_buffers removeAllObjects];
   [dxmt_apitrace_encoders removeAllObjects];
   [dxmt_apitrace_functions removeAllObjects];

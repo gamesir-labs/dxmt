@@ -56,6 +56,7 @@ std::atomic_bool crash_flush_running = false;
 
 constexpr const char *kTraceBundleEnv = "APITRACE_TRACE_BUNDLE";
 constexpr const char *kTraceOutputDirEnv = "DXMT_APITRACE_TRACE_OUTPUT_DIR";
+constexpr const char *kResolvedTraceBundleEnv = "DXMT_APITRACE_RESOLVED_TRACE_BUNDLE";
 
 bool
 truthy_env_value(const std::string &value) {
@@ -219,13 +220,16 @@ initialize_bundle_root() {
     if (directory_mode)
       set_env_var(kTraceOutputDirEnv, env::getEnvVar(kTraceBundleEnv).c_str());
     set_env_var(kTraceBundleEnv, trace_bundle.c_str());
+    set_env_var(kResolvedTraceBundleEnv, trace_bundle.c_str());
   }
 
   if (verbose_enabled()) {
     const char *trace_crt_view = std::getenv(kTraceBundleEnv);
+    const char *resolved_crt_view = std::getenv(kResolvedTraceBundleEnv);
     const char *output_dir_crt_view = std::getenv(kTraceOutputDirEnv);
     INFO("DXMT apitrace: bundle root ", trace_bundle);
     INFO("DXMT apitrace: APITRACE_TRACE_BUNDLE crt-view=", trace_crt_view ? trace_crt_view : "(null)");
+    INFO("DXMT apitrace: DXMT_APITRACE_RESOLVED_TRACE_BUNDLE crt-view=", resolved_crt_view ? resolved_crt_view : "(null)");
     INFO("DXMT apitrace: DXMT_APITRACE_TRACE_OUTPUT_DIR crt-view=", output_dir_crt_view ? output_dir_crt_view : "(null)");
   }
 }

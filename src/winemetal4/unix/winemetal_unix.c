@@ -1379,18 +1379,32 @@ dxmt_apitrace_ensure_session_locked(void);
 static void
 dxmt_apitrace_close_session_locked(void);
 
+static bool
+dxmt_apitrace_has_bundle_suffix(const char *path) {
+  if (!path)
+    return false;
+  static const char suffix[] = ".apitrace";
+  const size_t path_len = strlen(path);
+  const size_t suffix_len = sizeof(suffix) - 1;
+  return path_len >= suffix_len && !strcmp(path + path_len - suffix_len, suffix);
+}
+
 static const char *
 dxmt_apitrace_bundle_root(void) {
+  const char *resolved_bundle_root = getenv("DXMT_APITRACE_RESOLVED_TRACE_BUNDLE");
+  if (resolved_bundle_root && resolved_bundle_root[0])
+    return resolved_bundle_root;
+
   const char *bundle_root = getenv("APITRACE_TRACE_BUNDLE");
-  if (bundle_root && bundle_root[0])
+  if (bundle_root && bundle_root[0] && dxmt_apitrace_has_bundle_suffix(bundle_root))
     return bundle_root;
 
   static bool warned = false;
   if (!warned) {
     warned = true;
     fprintf(stderr,
-            "warn:  DXMT apitrace: APITRACE_TRACE_BUNDLE not set; PE side must "
-            "initialize bundle root before opening unix session\n");
+            "warn:  DXMT apitrace: resolved APITRACE_TRACE_BUNDLE not set; "
+            "PE side must initialize child bundle root before opening unix session\n");
   }
   return NULL;
 }
@@ -1735,6 +1749,36 @@ dxmt_apitrace_command_buffer_state_for_id(obj_handle_t command_buffer) {
   if (!command_buffer || !dxmt_apitrace_command_buffers)
     return nil;
   return [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(command_buffer)];
+}
+
+static DXMT4ApitraceCommandBufferState *
+dxmt_apitrace_ensure_command_buffer_begin_locked(
+    apitrace_metal_session_t *session,
+    obj_handle_t command_buffer,
+    uint64_t frame_id,
+    uint64_t d3d_sequence) {
+  if (!session || !command_buffer)
+    return nil;
+
+  NSNumber *key = dxmt_apitrace_key(command_buffer);
+  DXMT4ApitraceCommandBufferState *state = [dxmt_apitrace_command_buffers objectForKey:key];
+  if (state) {
+    if (d3d_sequence && !state.d3dSequence)
+      state.d3dSequence = d3d_sequence;
+    return state;
+  }
+
+  uint64_t previous_sequence = dxmt_apitrace_current_d3d_sequence;
+  dxmt_apitrace_set_sequence_locked(session, d3d_sequence);
+  uint64_t begin_sequence = apitrace_metal_command_buffer_begin(session, command_buffer, frame_id, "");
+  dxmt_apitrace_set_sequence_locked(session, previous_sequence);
+
+  state = [[DXMT4ApitraceCommandBufferState alloc] init];
+  state.beginSequence = begin_sequence;
+  state.d3dSequence = d3d_sequence;
+  [dxmt_apitrace_command_buffers setObject:state forKey:key];
+  [state release];
+  return state;
 }
 
 static void
@@ -2475,6 +2519,11 @@ dxmt_apitrace_record_command_buffer_commit_state(
     return;
   pthread_mutex_lock(&dxmt_apitrace_lock);
   if (dxmt_apitrace_ensure_session_locked()) {
+    dxmt_apitrace_ensure_command_buffer_begin_locked(
+        dxmt_apitrace_session,
+        command_buffer,
+        0,
+        d3d_sequence ? d3d_sequence : dxmt_apitrace_current_d3d_sequence);
     apitrace_metal_command_buffer_commit_state(
         dxmt_apitrace_session,
         command_buffer,
@@ -2520,8 +2569,14 @@ dxmt_apitrace_record_command_buffer_event(
   if (!dxmt_apitrace_runtime_enabled())
     return;
   pthread_mutex_lock(&dxmt_apitrace_lock);
-  if (dxmt_apitrace_ensure_session_locked())
+  if (dxmt_apitrace_ensure_session_locked()) {
+    dxmt_apitrace_ensure_command_buffer_begin_locked(
+        dxmt_apitrace_session,
+        command_buffer,
+        0,
+        dxmt_apitrace_current_d3d_sequence);
     apitrace_metal_queue_event(dxmt_apitrace_session, command_buffer, op, phase, event, value);
+  }
   pthread_mutex_unlock(&dxmt_apitrace_lock);
 }
 
@@ -2541,6 +2596,11 @@ dxmt_apitrace_record_counter_event(
     return;
   pthread_mutex_lock(&dxmt_apitrace_lock);
   if (dxmt_apitrace_ensure_session_locked()) {
+    dxmt_apitrace_ensure_command_buffer_begin_locked(
+        dxmt_apitrace_session,
+        command_buffer,
+        0,
+        dxmt_apitrace_current_d3d_sequence);
     apitrace_metal_counter_event(
         dxmt_apitrace_session,
         command_buffer,
@@ -3244,7 +3304,11 @@ dxmt_apitrace_begin_encoder_locked(
   if (!session)
     return;
   DXMT4ApitraceCommandBufferState *command_state =
-      [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(command_buffer)];
+      dxmt_apitrace_ensure_command_buffer_begin_locked(
+          session,
+          command_buffer,
+          0,
+          dxmt_apitrace_current_d3d_sequence);
   if (!command_state || !command_state.d3dSequence)
     return;
 
@@ -7135,13 +7199,11 @@ _WMT4ApitraceCommandBufferBegin(void *obj) {
   pthread_mutex_lock(&dxmt_apitrace_lock);
   if (dxmt_apitrace_ensure_session_locked()) {
     dxmt_apitrace_set_sequence_locked(dxmt_apitrace_session, dxmt_apitrace_current_d3d_sequence);
-    uint64_t begin_sequence =
-        apitrace_metal_command_buffer_begin(dxmt_apitrace_session, params->command_buffer, params->frame_id, "");
-    DXMT4ApitraceCommandBufferState *state = [[DXMT4ApitraceCommandBufferState alloc] init];
-    state.beginSequence = begin_sequence;
-    state.d3dSequence = dxmt_apitrace_current_d3d_sequence;
-    [dxmt_apitrace_command_buffers setObject:state forKey:dxmt_apitrace_key(params->command_buffer)];
-    [state release];
+    dxmt_apitrace_ensure_command_buffer_begin_locked(
+        dxmt_apitrace_session,
+        params->command_buffer,
+        params->frame_id,
+        dxmt_apitrace_current_d3d_sequence);
   }
   pthread_mutex_unlock(&dxmt_apitrace_lock);
   return STATUS_SUCCESS;
@@ -7153,8 +7215,15 @@ _WMT4ApitraceCommandBufferCommit(void *obj) {
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
-  DXMT4ApitraceCommandBufferState *state = [dxmt_apitrace_command_buffers objectForKey:dxmt_apitrace_key(params->handle)];
-  if (dxmt_apitrace_session && state) {
+  DXMT4ApitraceCommandBufferState *state = nil;
+  if (dxmt_apitrace_ensure_session_locked()) {
+    state = dxmt_apitrace_ensure_command_buffer_begin_locked(
+        dxmt_apitrace_session,
+        params->handle,
+        0,
+        dxmt_apitrace_current_d3d_sequence);
+  }
+  if (state) {
     apitrace_metal_command_buffer_commit_state(
         dxmt_apitrace_session,
         params->handle,
@@ -7176,6 +7245,11 @@ _WMT4ApitracePresentDrawable(void *obj) {
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
   if (dxmt_apitrace_ensure_session_locked()) {
+    dxmt_apitrace_ensure_command_buffer_begin_locked(
+        dxmt_apitrace_session,
+        params->command_buffer,
+        params->frame_index,
+        dxmt_apitrace_current_d3d_sequence);
     id<MTLDrawableWithTexture> drawable = (id<MTLDrawableWithTexture>)params->drawable;
     id<MTLTexture> texture = [drawable respondsToSelector:@selector(texture)] ? [drawable texture] : nil;
     uint32_t width = texture ? (uint32_t)texture.width : 0;

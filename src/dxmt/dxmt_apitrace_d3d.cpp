@@ -1208,6 +1208,17 @@ on_dxgi_create_swapchain(void *factory, void *device, void *swapchain) {
 }
 
 void
+record_swapchain_back_buffer(void *device, void *swapchain,
+                             ID3D12Resource *back_buffer,
+                             uint32_t buffer_index) {
+  if (!d3d_enabled() || !back_buffer)
+    return;
+  ensure_session_open();
+  ::apitrace::d3d12::record_swapchain_back_buffer(device, swapchain,
+                                                  back_buffer, buffer_index);
+}
+
+void
 on_d3d12_execute_command_lists(void *queue, void *command_list) {
   if (!d3d_enabled() || !queue || !command_list)
     return;
