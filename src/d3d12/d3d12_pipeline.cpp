@@ -6,23 +6,29 @@
 #include "dxmt_format.hpp"
 #include "dxmt_pipeline_diag.hpp"
 #include "dxmt_perf_stats.hpp"
+#include "dxmt_shader_cache.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
+#include "thread.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
+#include <version.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <string_view>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -1377,21 +1383,103 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
 }
 
 bool
+PersistentAirCacheEnabled() {
+  // Default ON; set DXMT_D3D12_PERSISTENT_SHADER_CACHE=0 to disable (A/B).
+  static const bool on =
+      env::getEnvVar("DXMT_D3D12_PERSISTENT_SHADER_CACHE") != "0";
+  return on;
+}
+
+// Key for the cross-run persistent AIR-bitcode cache. shader_cache_key already
+// hashes every shader bytecode + graphics/compute state + root signature that
+// feeds airconv's `args`, so (stage + key + metal version + flags) fully
+// determines the transpiled AIR output. Distinct "v1" tag keeps these entries
+// from colliding with the D3D11 cache entries sharing the same DB.
+Sha1Digest
+BuildPersistentAirCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
+                           std::string_view shader_cache_key) {
+  Sha1HashState hash;
+  HashString(hash, "dxmt-d3d12-persistent-air-cache-v1");
+  // Fold the DXMT build version (git short hash, regenerated per build) into
+  // the key so the cache auto-invalidates whenever airconv codegen could have
+  // changed — closes the stale-AIR risk without relying on bumping a manual
+  // constant. (Uncommitted dev airconv edits: use a fresh DXMT_SHADER_CACHE_PATH.)
+  HashString(hash, DXMT_VERSION);
+  HashValue(hash, uint32_t(stage));
+  HashValue(hash, uint32_t(GetMetalVersion(device)));
+  HashValue(hash, uint32_t(GetShaderFlags()));
+  HashString(hash, shader_cache_key);
+  return hash.final();
+}
+
+bool
 CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      const char *function_name,
                      SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-                     PipelineMetalShader &out) {
+                     PipelineMetalShader &out,
+                     std::string_view shader_cache_key) {
   const char *air_function_name = "shader_main";
+
+  // PERF DIAG (DXMT_DIAG_STALL): persistent-cache hit/miss + airconv transpile
+  // time. Distinguishes "airconv transpile is the stall (cache fixes it)" from
+  // "newRenderPipelineState is the stall (Metal-side, needs binary archive)".
+  static const bool stall_diag = env::getEnvVar("DXMT_DIAG_STALL") == "1";
+  static std::atomic<uint64_t> g_cache_hits{0}, g_cache_misses{0},
+      g_transpile_us{0};
+
+  // Persistent AIR cache lookup: a hit rebuilds the MTLLibrary from cached
+  // bitcode and skips the airconv transpile (the ~99% record-thread stall).
+  const bool persistent =
+      PersistentAirCacheEnabled() && !shader_cache_key.empty();
+  Sha1Digest persistent_key = {};
+  ShaderCache *scache = nullptr;
+  if (persistent) {
+    persistent_key =
+        BuildPersistentAirCacheKey(device, shader.stage, shader_cache_key);
+    scache = &ShaderCache::getInstance(device->GetDXMTDevice().metalVersion());
+    if (auto reader = scache->getReader()) {
+      if (auto lib_data = reader->get(persistent_key)) {
+        WMT::Reference<WMT::Error> metal_error;
+        PipelineMetalShader compiled = {};
+        compiled.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
+        if (compiled.library) {
+          compiled.function = compiled.library.newFunction(air_function_name);
+          if (compiled.function) {
+            out = std::move(compiled);
+            if (stall_diag) {
+              auto h = g_cache_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+              if ((h & 255) == 0)
+                INFO("D3D12 persistent-cache stats: hits=", h,
+                     " misses=", g_cache_misses.load(std::memory_order_relaxed),
+                     " transpileUs=", g_transpile_us.load(std::memory_order_relaxed));
+            }
+            return true; // cache hit: airconv transpile skipped
+          }
+        }
+        // Fall through to recompile if the cached bitcode failed to rebuild.
+      }
+    }
+  }
+  if (stall_diag && persistent)
+    g_cache_misses.fetch_add(1, std::memory_order_relaxed);
+
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
   int compile_failed = 0;
   {
     std::lock_guard lock(AirconvCompileMutex());
+    const auto t0 = stall_diag ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     compile_failed = shader.kind() == PipelineShaderBytecodeKind::Dxil
                          ? DXMT12DXILCompile(shader.shaderHandle(), args, air_function_name,
                                        &bitcode_handle, &error)
                          : DXMT12SM50Compile(shader.shaderHandle(), args, air_function_name,
                                        &bitcode_handle, &error);
+    if (stall_diag)
+      g_transpile_us.fetch_add(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - t0).count(),
+          std::memory_order_relaxed);
   }
   if (compile_failed) {
     auto error_message = DXMT12SM50GetErrorMessageString(error);
@@ -1411,6 +1499,21 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                                   reinterpret_cast<uintptr_t>(error));
     DXMT12SM50FreeError(error);
     return false;
+  }
+
+  // Cache miss: persist the freshly transpiled AIR bitcode for future runs.
+  // GetCompiledBitcode is non-destructive (returns pointers into the handle;
+  // the handle is freed later by CreateCachedMetalFunction), so reading the
+  // bytes here and again inside CreateCachedMetalFunction is safe.
+  if (persistent && scache) {
+    SM50_COMPILED_BITCODE bitcode = {};
+    DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
+    if (bitcode.Data && bitcode.Size) {
+      if (auto writer = scache->getWriter()) {
+        writer->set(persistent_key,
+                    WMT::MakeDispatchData(bitcode.Data, bitcode.Size));
+      }
+    }
   }
 
   return CreateCachedMetalFunction(device, shader.stage, air_function_name,
@@ -1944,7 +2047,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     const auto ps_name = BuildFunctionName("ps", shader_cache_key);
     if (!CompileMetalFunction(device, *ps, ps_name.c_str(),
                               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ps_args),
-                              out.pixel))
+                              out.pixel, shader_cache_key))
       return false;
   }
 
@@ -2149,7 +2252,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
                             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
-                            out.vertex))
+                            out.vertex, shader_cache_key))
     return false;
 
   WMTRenderPipelineInfo info = {};
@@ -2209,7 +2312,7 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
                            nullptr);
   if (!CompileMetalFunction(device, *cs, cs_name.c_str(),
                             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
-                            out.compute))
+                            out.compute, shader_cache_key))
     return false;
 
   WMTComputePipelineInfo info = {};
@@ -3063,6 +3166,119 @@ private:
   std::string name_;
 };
 
+// Async PSO precompile worker pool. The Metal PSO is otherwise compiled lazily
+// on the RECORD thread at first-draw (GetMetalGraphicsState/ComputeState),
+// which dominates frame time (~99% of stall, 0.8-44ms each). This pool calls
+// those same idempotent compile methods on low-priority background workers at
+// PSO-CREATE time, so the first draw usually finds the PSO already compiled.
+// The lazy path remains a correctness-preserving fallback (the compile methods
+// are guarded by metal_mutex_ + a ready flag, so a worker compile and a
+// fallback record-thread compile are mutually exclusive and idempotent).
+// Gated by DXMT_ASYNC_PSO_COMPILE (default off). Modeled on
+// ReservedTextureMaterializer (d3d12_resource.cpp).
+class PipelineCompiler {
+public:
+  static PipelineCompiler &Get() {
+    static PipelineCompiler instance;
+    return instance;
+  }
+
+  static bool Enabled() {
+    static const bool on = env::getEnvVar("DXMT_ASYNC_PSO_COMPILE") == "1";
+    return on;
+  }
+
+  void Enqueue(ID3D12PipelineState *pso) {
+    if (!pso)
+      return;
+    Com<ID3D12PipelineState> ref = pso; // keep alive while queued
+    {
+      std::lock_guard lock(mutex_);
+      if (stopping_)
+        return;
+      StartWorkersLocked();
+      queue_.push_back(std::move(ref));
+      ++enqueued_;
+    }
+    cond_.notify_one();
+  }
+
+private:
+  PipelineCompiler() = default;
+
+  ~PipelineCompiler() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+      queue_.clear();
+    }
+    cond_.notify_all();
+    for (auto &worker : workers_) {
+      if (worker.joinable())
+        worker.join();
+    }
+  }
+
+  void StartWorkersLocked() {
+    if (!workers_.empty())
+      return;
+    UINT count = ParseWorkerCount();
+    for (UINT i = 0; i < count; i++) {
+      workers_.emplace_back([this] { WorkerMain(); });
+      workers_.back().set_priority(dxmt::ThreadPriority::Lowest);
+    }
+  }
+
+  static UINT ParseWorkerCount() {
+    auto v = env::getEnvVar("DXMT_ASYNC_PSO_COMPILE_WORKERS");
+    UINT n = v.empty() ? 4u : (UINT)strtoul(v.c_str(), nullptr, 10);
+    if (n < 1u) n = 1u;
+    if (n > 16u) n = 16u;
+    return n;
+  }
+
+  void WorkerMain();
+
+  dxmt::mutex mutex_;
+  dxmt::condition_variable cond_;
+  std::deque<Com<ID3D12PipelineState>> queue_;
+  std::vector<dxmt::thread> workers_;
+  bool stopping_ = false;
+  uint64_t enqueued_ = 0;
+  std::atomic<uint64_t> compiled_{0};
+};
+
+void PipelineCompiler::WorkerMain() {
+  env::setThreadName("dxmt-pso-compile");
+  for (;;) {
+    Com<ID3D12PipelineState> pso;
+    {
+      std::unique_lock lock(mutex_);
+      cond_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (stopping_ && queue_.empty())
+        return;
+      if (queue_.empty())
+        continue;
+      pso = std::move(queue_.front());
+      queue_.pop_front();
+    }
+    auto *state = dynamic_cast<PipelineState *>(pso.ptr());
+    if (!state)
+      continue;
+    // Idempotent: ready-flag + metal_mutex_ guard inside these methods make a
+    // background compile race-free vs a fallback record-thread compile.
+    if (state->GetType() == PipelineStateType::Graphics)
+      state->GetMetalGraphicsState();
+    else if (state->GetType() == PipelineStateType::Compute)
+      state->GetMetalComputeState();
+    const auto done = compiled_.fetch_add(1, std::memory_order_relaxed) + 1;
+    static std::atomic<uint32_t> log_count{0};
+    if ((done & (done - 1)) == 0 &&
+        log_count.fetch_add(1, std::memory_order_relaxed) < 64)
+      INFO("D3D12PipelineCompiler: async precompile progress compiled=", done);
+  }
+}
+
 Com<ID3D12PipelineState>
 CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
                           ID3D12RootSignature *root_signature,
@@ -3076,11 +3292,15 @@ CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
       BuildShaderCacheKey(type, shaders, graphics_state, compute_state,
                           resolved_root_signature.ptr());
   DebugLogSignatureLinks(shader_cache_key, signature_links);
-  return Com<ID3D12PipelineState>::transfer(
+  auto pso = Com<ID3D12PipelineState>::transfer(
       new PipelineStateImpl(device, type, resolved_root_signature.ptr(),
                             std::move(shaders), std::move(signature_links),
                             std::move(graphics_state),
                             std::move(compute_state)));
+  // Async precompile the Metal PSO off the record thread (gated, default off).
+  if (PipelineCompiler::Enabled())
+    PipelineCompiler::Get().Enqueue(pso.ptr());
+  return pso;
 }
 
 void
