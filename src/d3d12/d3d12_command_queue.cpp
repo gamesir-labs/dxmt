@@ -4,6 +4,7 @@
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
+#include "config/config.hpp"
 #include "d3d12_command_list.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_heap.hpp"
@@ -24,6 +25,7 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
+#include "wsi_monitor.hpp"
 #include "wsi_window.hpp"
 #include <algorithm>
 #include <array>
@@ -3823,6 +3825,11 @@ private:
       if (!fullscreen_desc)
         fullscreen_desc_.Windowed = TRUE;
 
+      monitor_ = wsi::getWindowMonitor(hWnd_);
+      preferred_max_frame_rate_ =
+          Config::getInstance().getOption<int>("d3d12.preferredMaxFrameRate", 0);
+      InitDisplayRefreshRate();
+
       native_view_ = WMT::CreateMetalViewFromHWND(
           reinterpret_cast<intptr_t>(hWnd_), queue->device_->GetMTLDevice(),
           layer_);
@@ -4165,7 +4172,41 @@ private:
       const auto apitrace_frame_index =
           dxmt::apitrace::on_d3d12_present(
               this, sync_interval, flags, static_cast<int32_t>(S_OK), true);
-      double vsync_duration = sync_interval ? sync_interval / 60.0 : 0.0;
+      double present_rate = preferred_max_frame_rate_ ? preferred_max_frame_rate_
+                                                      : init_refresh_rate_;
+      double vsync_duration =
+          std::max(sync_interval * 1.0 / present_rate,
+                   preferred_max_frame_rate_
+                       ? 1.0 / preferred_max_frame_rate_
+                       : 0.0);
+      // PERF DIAG (DXMT_DIAG_PRESENT_PACING): mirror the D3D11 swapchain
+      // pacing path so D3D12 stays compatible with Wine and app-level frame
+      // latency behavior.
+      {
+        static const bool present_pacing =
+            D3D12DiagEnabledEnv("DXMT_DIAG_PRESENT_PACING");
+        if (present_pacing) {
+          static std::atomic<uint32_t> pc = 0;
+          static thread_local clock::time_point last;
+          auto now = clock::now();
+          const auto idx = pc.fetch_add(1, std::memory_order_relaxed);
+          double sinceMs =
+              last == clock::time_point{}
+                  ? 0.0
+                  : std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - last).count() / 1000.0;
+          last = now;
+          if (idx % 60 == 0)
+            WARN_FILE_ONLY("DXMT present pacing:"
+                 " syncInterval=", sync_interval,
+                 " flags=", flags,
+                 " vsyncDurationMs=", vsync_duration * 1000.0,
+                 " fpsCap=", vsync_duration > 0 ? 1.0 / vsync_duration : 0.0,
+                 " presentRate=", present_rate,
+                 " preferredMaxFrameRate=", preferred_max_frame_rate_,
+                 " actualPresentIntervalMs=", sinceMs);
+        }
+      }
       auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
       auto *chunk = dxmt_queue.CurrentChunk();
       chunk->signal_frame_latency_fence_ = dxmt_queue.CurrentFrameSeq();
@@ -4389,6 +4430,20 @@ private:
     }
 
   private:
+    void InitDisplayRefreshRate() {
+      if (!monitor_)
+        return;
+
+      wsi::WsiMode current_mode = {};
+      if (wsi::getCurrentDisplayMode(monitor_, &current_mode) &&
+          current_mode.refreshRate.numerator &&
+          current_mode.refreshRate.denominator) {
+        init_refresh_rate_ =
+            double(current_mode.refreshRate.numerator) /
+            double(current_mode.refreshRate.denominator);
+      }
+    }
+
     bool HasExternalBackBufferReferences() {
       for (auto &backbuffer : backbuffers_) {
         if (!backbuffer)
@@ -4420,6 +4475,7 @@ private:
     Com<IDXGIFactory1> factory_;
     ComPrivateData private_data_;
     HWND hWnd_ = nullptr;
+    HMONITOR monitor_ = nullptr;
     DXGI_SWAP_CHAIN_DESC1 desc_ = {};
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_ = {};
     std::vector<Com<ID3D12Resource>> backbuffers_;
@@ -4438,6 +4494,8 @@ private:
     DXGI_MATRIX_3X2_F matrix_ = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
     DXGI_COLOR_SPACE_TYPE color_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     HANDLE present_semaphore_ = nullptr;
+    double init_refresh_rate_ = DBL_MAX;
+    int preferred_max_frame_rate_ = 0;
   };
 
   struct ReplayRenderTargetAttachment {
