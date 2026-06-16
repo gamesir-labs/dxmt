@@ -564,6 +564,14 @@ public:
                                            const D3D12_BOX *src_box) override {
     if (!dst || !src || !dst->pResource || !src->pResource)
       return;
+    // buffer->texture upload: snapshot the source buffer's footprint region (persistent-mapped
+    // upload data is otherwise never captured; see SnapshotCopySourceBuffer / BUG-008).
+    if (src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+      const auto &fp = src->PlacedFootprint.Footprint;
+      const UINT64 rows = static_cast<UINT64>(fp.Height) * fp.Depth;
+      const UINT64 span = rows == 0 ? 0 : static_cast<UINT64>(fp.RowPitch) * rows;
+      SnapshotCopySourceBuffer(src->pResource, src->PlacedFootprint.Offset, span);
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_texture_region(
             this, dst, dst_x, dst_y, dst_z, src, src_box);
@@ -675,12 +683,48 @@ public:
     AddRecord(StencilRefRecord{stencil_ref});
   }
   void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {
+    // DIAG (DXMT_DIAG_PSO_RECORD): retrace observed draws skipped at replay with
+    // state.pipeline_state==null even though SetPipelineState was called before
+    // the draw on the same list. The replay side never nulls pipeline_state
+    // (only PipelineStateRecord sets it, Clone copies it), so the only way a
+    // draw sees null is the recorded stream lacking a *valid* PipelineStateRecord
+    // before it. This logs the three silent paths that produce that gap:
+    //   (a) incompatible PSO -> early return, NO record at all;
+    //   (b) null PSO bound   -> a PipelineStateRecord{null} that poisons the list;
+    //   (c) list already closed -> AddRecord drops the record.
+    DiagPsoRecord("SetPipelineState", pipeline_state);
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_pipeline_state(this, pipeline_state);
     current_pipeline_state_ = pipeline_state;
     RecordPipelineState(current_pipeline_state_.ptr(), false);
+  }
+
+  void DiagPsoRecord(const char *site, ID3D12PipelineState *pipeline_state) {
+    static const bool enabled = std::getenv("DXMT_DIAG_PSO_RECORD") != nullptr;
+    if (!enabled)
+      return;
+    static std::atomic<uint32_t> diag_count = 0;
+    if (diag_count.fetch_add(1, std::memory_order_relaxed) >= 256)
+      return;
+    const auto *state = dynamic_cast<PipelineState *>(pipeline_state);
+    const char *reason = "ok";
+    if (!pipeline_state)
+      reason = "null-pso-bound";            // (b) poisons the list
+    else if (!state)
+      reason = "not-dxmt-pipelinestate";    // (a) dynamic_cast fail -> silent drop
+    else if (!IsPipelineStateCompatible(pipeline_state))
+      reason = "type-mismatch-for-listtype"; // (a) wrong type for list -> silent drop
+    else if (closed_)
+      reason = "list-closed-record-dropped"; // (c) AddRecord no-op
+    WARN("DXMT_DIAG_PSO_RECORD: site=", site,
+         " reason=", reason,
+         " pso=", reinterpret_cast<uintptr_t>(pipeline_state),
+         " isDxmt=", state != nullptr,
+         " psoType=", state ? (int)state->GetType() : -1,
+         " listType=", (int)type_,
+         " closed=", closed_);
   }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {
     if (!barriers || !barrier_count)
@@ -884,6 +928,8 @@ public:
         false, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address});
   }
   void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *view) override {
+    if (view)
+      SnapshotGpuVirtualBufferRange(view->BufferLocation, view->SizeInBytes);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_ia_set_index_buffer(this, view);
     IndexBufferRecord record = {};
@@ -895,6 +941,8 @@ public:
   }
   void STDMETHODCALLTYPE IASetVertexBuffers(UINT start_slot, UINT view_count,
                                             const D3D12_VERTEX_BUFFER_VIEW *views) override {
+    for (UINT index = 0; views && index < view_count; ++index)
+      SnapshotGpuVirtualBufferRange(views[index].BufferLocation, views[index].SizeInBytes);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_ia_set_vertex_buffers(
             this, start_slot, view_count, views);
@@ -1533,11 +1581,54 @@ private:
     }
   }
 
+  // Snapshot a copy SOURCE buffer's read region into the apitrace stream, as if it had been
+  // Unmapped just before this copy. FH4 persistently Maps upload buffers once and writes directly,
+  // never Unmapping; apitrace's data snapshot is Unmap-tied, so the bytes a Copy reads from such a
+  // buffer are never recorded -> retrace's upload buffers are empty -> every texture/buffer copied
+  // from them is empty -> blank frames. Recording the source region at copy time captures exactly
+  // what the copy reads, independent of Unmap. Hot-path content dedup is intentionally avoided:
+  // the recorder must not scan large spans or take global locks before every copy, and lossless
+  // duplicate collapse belongs to bundle finalization. No-op for non-CPU-mapped sources.
+  void SnapshotCopySourceBuffer(ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
+    if (!src_buffer || byte_count == 0 || !dxmt::apitrace::d3d_enabled())
+      return;
+    auto *res = dynamic_cast<Resource *>(src_buffer);
+    if (!res)
+      return;
+    auto *alloc = res->GetBufferAllocation();
+    if (!alloc)
+      return;
+    auto *mapped = static_cast<const char *>(alloc->mappedMemory(0));
+    if (!mapped)
+      return;  // not CPU-mapped (DEFAULT heap): no CPU-visible source data to capture
+    const UINT64 width = res->GetResourceDesc().Width;
+    if (src_offset >= width)
+      return;
+    const UINT64 end = std::min<UINT64>(src_offset + byte_count, width);
+    if (end <= src_offset)
+      return;
+    const char *span_data = mapped + res->GetHeapOffset() + src_offset;
+    const size_t span_len = static_cast<size_t>(end - src_offset);
+    dxmt::apitrace::record_resource_unmap(
+        src_buffer, 0, src_offset, end, span_data, span_len);
+  }
+
+  void SnapshotGpuVirtualBufferRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 byte_count) {
+    if (address == 0 || byte_count == 0 || !dxmt::apitrace::d3d_enabled())
+      return;
+    UINT64 offset = 0;
+    Resource *resource = LookupBufferResourceByGpuVirtualAddress(address, &offset);
+    if (!resource)
+      return;
+    SnapshotCopySourceBuffer(resource->GetD3D12Resource(), offset, byte_count);
+  }
+
   void RecordCopyBufferRegion(const char *method, ID3D12Resource *dst_buffer,
                               UINT64 dst_offset, ID3D12Resource *src_buffer,
                               UINT64 src_offset, UINT64 byte_count) {
     if (!dst_buffer || !src_buffer || byte_count == 0)
       return;
+    SnapshotCopySourceBuffer(src_buffer, src_offset, byte_count);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_buffer_region(
             method, this, dst_buffer, dst_offset, src_buffer, src_offset,
