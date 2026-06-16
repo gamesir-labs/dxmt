@@ -1081,15 +1081,18 @@ TraceEncodePresentFrameReadback(QueryReadbacks &readbacks,
     return;
   }
 
-  if (texture.pixelFormat() != WMTPixelFormatRGBA8Unorm &&
-      texture.pixelFormat() != WMTPixelFormatRGBA8Unorm_sRGB &&
-      texture.pixelFormat() != WMTPixelFormatBGRA8Unorm &&
-      texture.pixelFormat() != WMTPixelFormatBGRA8Unorm_sRGB) {
+  const auto pixel_format = static_cast<WMTPixelFormat>(ORIGINAL_FORMAT(texture.pixelFormat()));
+  if (pixel_format != WMTPixelFormatRGBA8Unorm &&
+      pixel_format != WMTPixelFormatRGBA8Unorm_sRGB &&
+      pixel_format != WMTPixelFormatBGRA8Unorm &&
+      pixel_format != WMTPixelFormatBGRA8Unorm_sRGB &&
+      pixel_format != WMTPixelFormatRGB10A2Unorm &&
+      pixel_format != WMTPixelFormatBGR10A2Unorm) {
     WARN("DXMT apitrace: present frame capture skipped",
          " frame_index=", frame_index,
          " capture_index=", capture_index,
          " reason=unsupported_format",
-         " format=", uint32_t(texture.pixelFormat()));
+         " format=", uint32_t(pixel_format));
     return;
   }
 
@@ -1154,17 +1157,38 @@ TraceEncodePresentFrameReadback(QueryReadbacks &readbacks,
   readbacks.diagnostics.push_back(
       [buffer = WMT::Reference<WMT::Buffer>(buffer), mapped, frame_index,
        width, height, row_pitch, sync_interval, flags, payload_size,
-       pixel_format = texture.pixelFormat()]() {
+       pixel_format]() {
         std::vector<uint8_t> rgba(static_cast<size_t>(payload_size));
         if (pixel_format == WMTPixelFormatRGBA8Unorm ||
             pixel_format == WMTPixelFormatRGBA8Unorm_sRGB) {
           std::memcpy(rgba.data(), mapped, static_cast<size_t>(payload_size));
-        } else {
+        } else if (pixel_format == WMTPixelFormatBGRA8Unorm ||
+                   pixel_format == WMTPixelFormatBGRA8Unorm_sRGB) {
           for (uint64_t offset = 0; offset < payload_size; offset += 4) {
             rgba[static_cast<size_t>(offset + 0)] = mapped[offset + 2];
             rgba[static_cast<size_t>(offset + 1)] = mapped[offset + 1];
             rgba[static_cast<size_t>(offset + 2)] = mapped[offset + 0];
             rgba[static_cast<size_t>(offset + 3)] = mapped[offset + 3];
+          }
+        } else {
+          for (uint64_t offset = 0; offset < payload_size; offset += 4) {
+            const uint32_t px =
+                uint32_t(mapped[offset + 0]) |
+                (uint32_t(mapped[offset + 1]) << 8) |
+                (uint32_t(mapped[offset + 2]) << 16) |
+                (uint32_t(mapped[offset + 3]) << 24);
+            const uint32_t c0 = px & 0x3ffu;
+            const uint32_t c1 = (px >> 10) & 0x3ffu;
+            const uint32_t c2 = (px >> 20) & 0x3ffu;
+            const uint32_t a2 = (px >> 30) & 0x3u;
+            const bool bgr = pixel_format == WMTPixelFormatBGR10A2Unorm;
+            rgba[static_cast<size_t>(offset + 0)] =
+                static_cast<uint8_t>(((bgr ? c2 : c0) * 255u + 511u) / 1023u);
+            rgba[static_cast<size_t>(offset + 1)] =
+                static_cast<uint8_t>((c1 * 255u + 511u) / 1023u);
+            rgba[static_cast<size_t>(offset + 2)] =
+                static_cast<uint8_t>(((bgr ? c0 : c2) * 255u + 511u) / 1023u);
+            rgba[static_cast<size_t>(offset + 3)] = static_cast<uint8_t>(a2 * 85u);
           }
         }
         dxmt::apitrace::record_present_frame(
