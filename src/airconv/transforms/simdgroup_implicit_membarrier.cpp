@@ -7,8 +7,19 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
 #include "../nt/air_builder.hpp"
+#include <cstdlib>
 
 namespace llvm::air {
+
+// Diagnostic override for kernels whose implicit coherency path may need
+// threadgroup-wide ordering rather than SIMD-group scope. Default unchanged.
+static bool ForceThreadgroupBarrier() {
+  static const bool v = []() {
+    const char *e = std::getenv("DXMT_AE_FORCE_TG_BARRIER");
+    return e && e[0] && e[0] != '0';
+  }();
+  return v;
+}
 
 PreservedAnalyses
 SimdgroupImplicitMemBarrierPass::run(Function &F, FunctionAnalysisManager &AM) {
@@ -51,7 +62,8 @@ SimdgroupImplicitMemBarrierPass::run(Function &F, FunctionAnalysisManager &AM) {
             builder.SetInsertPoint(Store->getNextNode());
           AIRBuilder air(builder, nulls());
           // I expect atomic_thread_fence() to work, but no luck
-          air.CreateBarrier(MemFlags::Threadgroup, true);
+          // Env can force a full threadgroup barrier for scope validation.
+          air.CreateBarrier(MemFlags::Threadgroup, !ForceThreadgroupBarrier());
           Changed = true;
         }
       }
