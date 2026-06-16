@@ -8,6 +8,7 @@
 #include "util_win32_compat.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 
 #define ASYNC_ENCODING 1
 
@@ -118,6 +119,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.reset();
   };
   statistics.at(frame_count).begin_time = clock::now();
+  perf::setCurrentFrameStatistics(&statistics.at(frame_count));
   event = device.newSharedEvent();
 
   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
@@ -331,6 +333,7 @@ CommandQueue::PresentBoundary() {
       frame_wall_us);
   statistics.at(frame_count).reset();
   statistics.at(frame_count).begin_time = clock::now();
+  perf::setCurrentFrameStatistics(&statistics.at(frame_count));
   // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering
   if (likely(frame_count > max_latency_)) {
     auto t0 = clock::now();
@@ -451,8 +454,12 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
          " cmdbuf=", cmdbuf.handle,
          " status=", static_cast<uint32_t>(cmdbuf.status()));
   }
+  const auto commit_begin = clock::now();
   cmdbuf.commit();
   chunk.metal_commit_time = clock::now();
+  perf::recordMetalCommandBufferCommit(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          chunk.metal_commit_time - commit_begin).count());
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
     WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal after metal commit"
          " chunk=", chunk.chunk_id,

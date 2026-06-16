@@ -17,6 +17,7 @@
 #include "d3d12_root_signature.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
@@ -1243,6 +1244,8 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                               REFIID riid, void **pipeline_state) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreatePipeline);
     InitReturnPtr(pipeline_state);
     HRESULT status = S_OK;
     auto state = d3d12::CreateGraphicsPipelineState(
@@ -1261,6 +1264,8 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                              REFIID riid, void **pipeline_state) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreatePipeline);
     InitReturnPtr(pipeline_state);
     HRESULT status = S_OK;
     auto state = d3d12::CreateComputePipelineState(
@@ -1280,6 +1285,8 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
                       REFIID riid, void **pipeline_state) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreatePipeline);
     BeginDeviceCall("CreatePipelineState");
     InitReturnPtr(pipeline_state);
     if (!pipeline_state)
@@ -2107,6 +2114,8 @@ public:
                           D3D12_RESOURCE_STATES initial_state,
                           const D3D12_CLEAR_VALUE *optimized_clear_value,
                           REFIID riid, void **resource) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreateResource);
     BeginDeviceCall("CreateCommittedResource");
     InitReturnPtr(resource);
     if (!resource)
@@ -2136,6 +2145,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC *desc, REFIID riid,
                                        void **heap) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreateHeap);
     BeginDeviceCall("CreateHeap");
     InitReturnPtr(heap);
     if (!heap)
@@ -2158,6 +2169,8 @@ public:
                                                  D3D12_RESOURCE_STATES initial_state,
                                                  const D3D12_CLEAR_VALUE *optimized_clear_value,
                                                  REFIID riid, void **resource) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreateResource);
     BeginDeviceCall("CreatePlacedResource");
     InitReturnPtr(resource);
     if (!resource)
@@ -2227,6 +2240,8 @@ public:
                                                    D3D12_RESOURCE_STATES initial_state,
                                                    const D3D12_CLEAR_VALUE *optimized_clear_value,
                                                    REFIID riid, void **resource) override {
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CreateReservedResource);
     BeginDeviceCall("CreateReservedResource");
     InitReturnPtr(resource);
     if (!resource)

@@ -7,6 +7,51 @@ namespace dxmt::perf {
 
 bool enabled();
 
+enum class FrameTimeBucket : uint32_t {
+  ExecuteCommandLists,
+  Present,
+  QueueSignal,
+  QueueWait,
+  CreateResource,
+  CreateReservedResource,
+  CreateHeap,
+  CreatePipeline,
+  OtherD3D12,
+};
+
+enum class ExecuteTimeBucket : uint32_t {
+  Validate,
+  Collect,
+  Enqueue,
+  Drain,
+  DrainLock,
+  Replay,
+  Decay,
+  Signal,
+  Commit,
+  WaitArm,
+};
+
+class ScopedFrameTimer {
+public:
+  explicit ScopedFrameTimer(FrameTimeBucket bucket);
+  ~ScopedFrameTimer();
+  void stop();
+
+  ScopedFrameTimer(const ScopedFrameTimer &) = delete;
+  ScopedFrameTimer &operator=(const ScopedFrameTimer &) = delete;
+
+private:
+  FrameTimeBucket bucket_;
+  FrameStatistics *stats_;
+  dxmt::clock::time_point begin_;
+  bool active_;
+};
+
+void setCurrentFrameStatistics(FrameStatistics *stats);
+FrameStatistics *currentFrameStatistics();
+void recordExecuteTime(FrameStatistics *stats, ExecuteTimeBucket bucket,
+                       dxmt::clock::duration duration);
 void recordFrameBoundary(uint64_t frame);
 void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                          const FrameStatistics &average_stats,
@@ -30,5 +75,7 @@ void recordTileMapping(uint64_t standard_ops, uint64_t packed_ops,
 
 void recordGraphicsPipelineCreate(uint64_t duration_us, bool success);
 void recordComputePipelineCreate(uint64_t duration_us, bool success);
+void recordMetalCommandBufferCommit(uint64_t duration_us);
+void recordDrawableAcquire(uint64_t duration_us);
 
 } // namespace dxmt::perf
