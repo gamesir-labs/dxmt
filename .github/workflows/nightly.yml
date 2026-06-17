@@ -84,8 +84,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          submodules: true
+
+      - name: Checkout Build Submodules
+        run: git submodule update --init --depth=1 external/apitrace external/nvapi include/native/directx
 
       - name: Build x86_64 Wine Builtin Runtime
         run: |
@@ -116,8 +117,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          submodules: true
+
+      - name: Checkout Build Submodules
+        run: git submodule update --init --depth=1 external/apitrace external/nvapi include/native/directx
 
       - name: Build x86 Wine Builtin Runtime
         run: |
@@ -151,9 +153,11 @@ jobs:
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
           package_name="dxmt-nightly-${short_sha}"
-          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
-          echo "artifact_path=dist/${package_name}" >> "$GITHUB_OUTPUT"
+          {
+            echo "short_sha=${short_sha}"
+            echo "package_name=${package_name}"
+            echo "artifact_path=dist/${package_name}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Assemble Nightly Package
         run: |
