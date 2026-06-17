@@ -3041,6 +3041,11 @@ public:
 
     *object = nullptr;
 
+    if (riid == IID_DXMTPipelineStateDowncast) {
+      // Internal non-RTTI downcast (no AddRef); see d3d12_pipeline.hpp.
+      *object = static_cast<PipelineState *>(this);
+      return S_OK;
+    }
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
         riid == __uuidof(ID3D12PipelineState)) {

@@ -202,6 +202,25 @@ struct RenderArgumentBufferOffsetState {
   bool valid = false;
 };
 
+struct RenderDynamicStateCache {
+  WMT::DepthStencilState depth_stencil = {};
+  uint8_t stencil_ref = 0;
+  bool depth_stencil_valid = false;
+  wmtcmd_render_setrasterizerstate rasterizer = {};
+  bool rasterizer_valid = false;
+  std::array<float, 4> blend_factor = {};
+  bool blend_valid = false;
+  std::vector<WMTViewport> viewports;
+  bool viewports_valid = false;
+  std::vector<WMTScissorRect> scissors;
+  bool scissors_valid = false;
+};
+
+struct RenderBindingStateCache {
+  uint64_t graphics_generation = 0;
+  bool valid = false;
+};
+
 struct ComputeArgumentBufferOffsetState {
   uint64_t offset = 0;
   uint8_t index = 0;
@@ -243,6 +262,8 @@ struct RenderEncoderData : EncoderData {
   ArgumentTableSliceCache argument_table_cache_object;
   ArgumentTableSliceCache argument_table_cache_mesh;
   std::array<RenderArgumentBufferOffsetState, 16> argument_buffer_offsets = {};
+  RenderDynamicStateCache dynamic_state_cache = {};
+  RenderBindingStateCache binding_state_cache = {};
 };
 
 struct ComputeEncoderData : EncoderData {

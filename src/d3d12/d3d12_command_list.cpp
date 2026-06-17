@@ -6,6 +6,7 @@
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_resource.hpp"
 #include "dxmt_apitrace_d3d.hpp"
+#include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -564,14 +565,7 @@ public:
                                            const D3D12_BOX *src_box) override {
     if (!dst || !src || !dst->pResource || !src->pResource)
       return;
-    // buffer->texture upload: snapshot the source buffer's footprint region (persistent-mapped
-    // upload data is otherwise never captured; see SnapshotCopySourceBuffer / BUG-008).
-    if (src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
-      const auto &fp = src->PlacedFootprint.Footprint;
-      const UINT64 rows = static_cast<UINT64>(fp.Height) * fp.Depth;
-      const UINT64 span = rows == 0 ? 0 : static_cast<UINT64>(fp.RowPitch) * rows;
-      SnapshotCopySourceBuffer(src->pResource, src->PlacedFootprint.Offset, span);
-    }
+    SnapshotCopyTextureSourceBuffer(src, src_box);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_texture_region(
             this, dst, dst_x, dst_y, dst_z, src, src_box);
@@ -1604,13 +1598,75 @@ private:
     const UINT64 width = res->GetResourceDesc().Width;
     if (src_offset >= width)
       return;
-    const UINT64 end = std::min<UINT64>(src_offset + byte_count, width);
+    const UINT64 clamped_byte_count = std::min<UINT64>(byte_count, width - src_offset);
+    const UINT64 end = src_offset + clamped_byte_count;
     if (end <= src_offset)
       return;
     const char *span_data = mapped + res->GetHeapOffset() + src_offset;
     const size_t span_len = static_cast<size_t>(end - src_offset);
     dxmt::apitrace::record_resource_unmap(
         src_buffer, 0, src_offset, end, span_data, span_len);
+  }
+
+  void SnapshotCopyTextureSourceBuffer(const D3D12_TEXTURE_COPY_LOCATION *src,
+                                       const D3D12_BOX *src_box) {
+    if (!src || !src->pResource ||
+        src->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+      return;
+
+    const auto &placed = src->PlacedFootprint;
+    const auto &fp = placed.Footprint;
+    const UINT64 width64 = std::max<UINT64>(fp.Width, 1);
+    const UINT height = std::max<UINT>(fp.Height, 1);
+    const UINT depth = std::max<UINT>(fp.Depth, 1);
+    const UINT width = static_cast<UINT>(std::min<UINT64>(width64, UINT64(UINT_MAX)));
+
+    UINT top = 0;
+    UINT front = 0;
+    UINT bottom = height;
+    UINT back = depth;
+    if (src_box) {
+      top = std::min(src_box->top, bottom);
+      front = std::min(src_box->front, back);
+      bottom = std::min(src_box->bottom, bottom);
+      back = std::min(src_box->back, back);
+      const UINT left = std::min(src_box->left, width);
+      const UINT right = std::min(src_box->right, width);
+      if (right <= left)
+        return;
+    }
+    if (bottom <= top || back <= front)
+      return;
+
+    DXGIFormatFootprintLayout layout = {};
+    if (!GetDXGIFormatFootprintLayout(static_cast<uint32_t>(fp.Format), layout) ||
+        layout.blockHeight == 0) {
+      const UINT64 rows = static_cast<UINT64>(height) * depth;
+      SnapshotCopySourceBuffer(
+          src->pResource,
+          placed.Offset,
+          static_cast<UINT64>(fp.RowPitch) * rows);
+      return;
+    }
+
+    const UINT64 block_height = std::max<uint32_t>(layout.blockHeight, 1u);
+    const UINT64 footprint_rows =
+        (static_cast<UINT64>(height) + block_height - 1) / block_height;
+    const UINT64 row_begin = static_cast<UINT64>(top) / block_height;
+    const UINT64 row_end =
+        std::min<UINT64>((static_cast<UINT64>(bottom) + block_height - 1) / block_height,
+                         footprint_rows);
+    if (row_end <= row_begin)
+      return;
+
+    const UINT64 row_pitch = fp.RowPitch;
+    const UINT64 slice_pitch = row_pitch * footprint_rows;
+    const UINT64 bytes_per_slice = (row_end - row_begin) * row_pitch;
+    for (UINT z = front; z < back; ++z) {
+      const UINT64 offset =
+          placed.Offset + static_cast<UINT64>(z) * slice_pitch + row_begin * row_pitch;
+      SnapshotCopySourceBuffer(src->pResource, offset, bytes_per_slice);
+    }
   }
 
   void SnapshotGpuVirtualBufferRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 byte_count) {

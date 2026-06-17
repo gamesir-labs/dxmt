@@ -69,9 +69,13 @@ struct Counters {
   std::atomic<uint64_t> frame_blit_passes = {0};
   std::atomic<uint64_t> frame_blit_passes_max = {0};
   std::atomic<uint64_t> frame_blit_empty_passes = {0};
+  std::atomic<uint64_t> frame_blit_deferred_fence_only_passes = {0};
+  std::atomic<uint64_t> frame_blit_merged_fence_only_passes = {0};
   std::atomic<uint64_t> frame_blit_barrier_only_passes = {0};
   std::atomic<uint64_t> frame_blit_separator_passes = {0};
   std::atomic<uint64_t> frame_resource_barrier_batches_merged = {0};
+  std::atomic<uint64_t> frame_resource_barrier_batches_graphics_inlined = {0};
+  std::atomic<uint64_t> frame_resource_barrier_batches_compute_inlined = {0};
   std::atomic<uint64_t> frame_flush_chunks = {0};
   std::atomic<uint64_t> frame_flush_chunks_max = {0};
   std::atomic<uint64_t> frame_flush_encoders = {0};
@@ -335,12 +339,20 @@ void flushCounters(uint64_t frame, bool final) {
                   sample(g_counters.frame_blit_passes_max),
                   " frameBlitEmptyPasses=",
                   sample(g_counters.frame_blit_empty_passes),
+                  " frameBlitDeferredFenceOnlyPasses=",
+                  sample(g_counters.frame_blit_deferred_fence_only_passes),
+                  " frameBlitMergedFenceOnlyPasses=",
+                  sample(g_counters.frame_blit_merged_fence_only_passes),
                   " frameBlitBarrierOnlyPasses=",
                   sample(g_counters.frame_blit_barrier_only_passes),
                   " frameBlitSeparatorPasses=",
                   sample(g_counters.frame_blit_separator_passes),
                   " frameResourceBarrierBatchesMerged=",
                   sample(g_counters.frame_resource_barrier_batches_merged),
+                  " frameResourceBarrierBatchesGraphicsInlined=",
+                  sample(g_counters.frame_resource_barrier_batches_graphics_inlined),
+                  " frameResourceBarrierBatchesComputeInlined=",
+                  sample(g_counters.frame_resource_barrier_batches_compute_inlined),
                   " frameFlushChunks=",
                   sample(g_counters.frame_flush_chunks),
                   " frameFlushChunksMax=",
@@ -619,12 +631,24 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
   updateMax(g_counters.frame_blit_passes_max, frame_stats.blit_pass_count);
   g_counters.frame_blit_empty_passes.fetch_add(
       frame_stats.blit_pass_empty_count, std::memory_order_relaxed);
+  g_counters.frame_blit_deferred_fence_only_passes.fetch_add(
+      frame_stats.blit_pass_deferred_fence_only_count,
+      std::memory_order_relaxed);
+  g_counters.frame_blit_merged_fence_only_passes.fetch_add(
+      frame_stats.blit_pass_merged_fence_only_count,
+      std::memory_order_relaxed);
   g_counters.frame_blit_barrier_only_passes.fetch_add(
       frame_stats.blit_barrier_only_pass_count, std::memory_order_relaxed);
   g_counters.frame_blit_separator_passes.fetch_add(
       frame_stats.blit_separator_pass_count, std::memory_order_relaxed);
   g_counters.frame_resource_barrier_batches_merged.fetch_add(
       frame_stats.resource_barrier_batches_merged, std::memory_order_relaxed);
+  g_counters.frame_resource_barrier_batches_graphics_inlined.fetch_add(
+      frame_stats.resource_barrier_batches_graphics_inlined,
+      std::memory_order_relaxed);
+  g_counters.frame_resource_barrier_batches_compute_inlined.fetch_add(
+      frame_stats.resource_barrier_batches_compute_inlined,
+      std::memory_order_relaxed);
   g_counters.frame_flush_chunks.fetch_add(frame_stats.flush_chunk_count,
                                          std::memory_order_relaxed);
   updateMax(g_counters.frame_flush_chunks_max,
@@ -768,6 +792,10 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " blitPassOptimized=", frame_stats.blit_pass_optimized,
                   " blitPassCmd=", frame_stats.blit_pass_with_commands_count,
                   " emptyBlitPasses=", frame_stats.blit_pass_empty_count,
+                  " deferredFenceOnlyBlitPasses=",
+                  frame_stats.blit_pass_deferred_fence_only_count,
+                  " mergedFenceOnlyBlitPasses=",
+                  frame_stats.blit_pass_merged_fence_only_count,
                   " barrierOnlyBlitPasses=",
                   frame_stats.blit_barrier_only_pass_count,
                   " separatorBlitPasses=",
@@ -782,6 +810,10 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   frame_stats.blit_fence_update_entry_count,
                   " resourceBarrierBatchesMerged=",
                   frame_stats.resource_barrier_batches_merged,
+                  " resourceBarrierBatchesGraphicsInlined=",
+                  frame_stats.resource_barrier_batches_graphics_inlined,
+                  " resourceBarrierBatchesComputeInlined=",
+                  frame_stats.resource_barrier_batches_compute_inlined,
                   " blitCommands=", frame_stats.blit_command_count,
                   " blitB2B=", frame_stats.blit_copy_buffer_to_buffer_count,
                   " blitB2T=", frame_stats.blit_copy_buffer_to_texture_count,

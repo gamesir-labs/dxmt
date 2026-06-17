@@ -85,6 +85,16 @@ public:
   virtual ID3D12Resource *GetD3D12Resource() = 0;
 };
 
+// Private IID for a non-RTTI downcast ID3D12Resource* -> dxmt Resource*.
+// ResourceImpl::QueryInterface answers it by returning static_cast<Resource*>
+// WITHOUT AddRef — an internal fast-path that replaces the per-record
+// dynamic_cast on the replay hot path (1.33e8 casts/diag-run). It preserves
+// dynamic_cast semantics: a non-dxmt ID3D12Resource returns E_NOINTERFACE, so
+// GetResource() still yields nullptr. Not for external/COM callers.
+inline constexpr GUID IID_DXMTResourceDowncast = {
+    0x6b7e9c14, 0x3a8d, 0x4f21,
+    {0xb6, 0x05, 0x9e, 0x33, 0x77, 0x12, 0xad, 0x4c}};
+
 Com<ID3D12Resource>
 CreateResource(IMTLD3D12Device *device, const D3D12_HEAP_PROPERTIES *heap_properties,
                D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc,

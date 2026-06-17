@@ -2800,6 +2800,7 @@ ArgumentEncodingContext::endPass() {
 
   if (FenceOnlyBlitOptimizationEnabled()) {
     if (tryDeferFenceOnlyBlitPass(encoder_current)) {
+      currentFrameStatistics().blit_pass_deferred_fence_only_count++;
       encoder_current = nullptr;
       return;
     }
@@ -4157,6 +4158,7 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       IsFenceOnlyBlitPass(reinterpret_cast<BlitEncoderData *>(former))) {
     MergeFenceOnlyBlitPassInto(reinterpret_cast<BlitEncoderData *>(former), latter);
     currentFrameStatistics().blit_pass_optimized++;
+    currentFrameStatistics().blit_pass_merged_fence_only_count++;
     return DXMT_ENCODER_LIST_OP_SWAP;
   }
 
@@ -4365,6 +4367,10 @@ ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncod
   if (hasDataDependency(latter, former))
     return false;
 
+  const bool former_fence_only = IsFenceOnlyBlitPass(former);
+  if (former_fence_only)
+    currentFrameStatistics().blit_pass_merged_fence_only_count++;
+
   if ((void *)former->cmd_tail != &former->cmd_head) {
     former->cmd_tail->next.set(latter->cmd_head.next.get());
     latter->cmd_head.next.set(former->cmd_head.next.get());
@@ -4381,6 +4387,7 @@ ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncod
   former->~BlitEncoderData();
   former->next = nullptr;
   former->type = EncoderType::Null;
+  currentFrameStatistics().blit_pass_optimized++;
   return true;
 }
 

@@ -196,6 +196,13 @@ public:
   virtual const PipelineMetalComputeState *GetMetalComputeState() = 0;
 };
 
+// Private IID for a non-RTTI downcast ID3D12PipelineState* -> dxmt PipelineState*.
+// See IID_DXMTResourceDowncast in d3d12_resource.hpp for rationale (no AddRef,
+// internal replay fast-path, preserves dynamic_cast null-on-mismatch semantics).
+inline constexpr GUID IID_DXMTPipelineStateDowncast = {
+    0x9f2c5d83, 0x71e4, 0x4a6b,
+    {0x88, 0x1f, 0xc2, 0x40, 0x6e, 0x95, 0x3b, 0x7d}};
+
 Com<ID3D12PipelineState>
 CreateGraphicsPipelineState(IMTLD3D12Device *device,
                             const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,

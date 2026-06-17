@@ -267,6 +267,8 @@ CommandQueue::PresentBoundary() {
          " blitPassOptimized=", frame.blit_pass_optimized,
          " blitPassCmd=", frame.blit_pass_with_commands_count,
          " blitPassEmpty=", frame.blit_pass_empty_count,
+         " blitPassDeferredFenceOnly=", frame.blit_pass_deferred_fence_only_count,
+         " blitPassMergedFenceOnly=", frame.blit_pass_merged_fence_only_count,
          " blitPassWaitFence=", frame.blit_pass_with_fence_wait_count,
          " blitPassUpdateFence=", frame.blit_pass_with_fence_update_count,
          " blitFenceWaitEntries=", frame.blit_fence_wait_entry_count,

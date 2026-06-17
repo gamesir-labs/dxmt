@@ -749,6 +749,11 @@ public:
       return E_POINTER;
 
     *ppvObject = nullptr;
+    if (riid == IID_DXMTResourceDowncast) {
+      // Internal non-RTTI downcast (no AddRef); see d3d12_resource.hpp.
+      *ppvObject = static_cast<Resource *>(this);
+      return S_OK;
+    }
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) ||
         riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) ||

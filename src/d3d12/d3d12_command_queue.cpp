@@ -8,6 +8,7 @@
 #include "d3d12_command_list.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_heap.hpp"
+#include "d3d12_pipeline.hpp"
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
@@ -1202,14 +1203,62 @@ IsSupportedQueueFlags(D3D12_COMMAND_QUEUE_FLAGS flags) {
   return (flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) == 0;
 }
 
+// PERF DIAG (DXMT_DIAG_REPLAY_BREAKDOWN): count dynamic_cast RTTI resolves on
+// the replay hot path. Under Rosetta x86 translation each dynamic_cast walks
+// the RTTI tree (__dynamic_cast) and is a prime constant-factor-tax suspect.
+// File-scope thread_local so the free GetResource/GetPipelineState helpers can
+// bump it; reset at ReplayCommandRecords start, read in the breakdown dump.
+struct ReplayRttiCounters {
+  uint64_t getResource = 0;
+  uint64_t getPipeline = 0;
+};
+static ReplayRttiCounters &replayRttiCounters() {
+  static thread_local ReplayRttiCounters c;
+  return c;
+}
+static bool ReplayBreakdownEnabled() {
+  static const bool on = D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
+  return on;
+}
+// descAccess content-fingerprint cache (default ON; DXMT_DESCACCESS_CACHE=0 to
+// disable for instant A/B). DXMT_DESCACCESS_VERIFY=1 keeps computing the cache
+// but never skips (still runs the full hazard pass) — a failsafe to confirm the
+// fingerprint/epoch logic and hit-rate without risking a wrong skip.
+static bool DescAccessCacheEnabled() {
+  static const bool on = env::getEnvVar("DXMT_DESCACCESS_CACHE") != "0";
+  return on;
+}
+static bool DescAccessVerify() {
+  static const bool on = env::getEnvVar("DXMT_DESCACCESS_VERIFY") == "1";
+  return on;
+}
+
 static Resource *
 GetResource(ID3D12Resource *resource) {
-  return dynamic_cast<Resource *>(resource);
+  if (ReplayBreakdownEnabled())
+    replayRttiCounters().getResource++;
+  if (!resource)
+    return nullptr;
+  // Non-RTTI downcast via private IID (no AddRef) — replaces dynamic_cast on the
+  // replay hot path. A non-dxmt resource returns E_NOINTERFACE (out stays null),
+  // so this preserves dynamic_cast's null-on-mismatch semantics. See
+  // IID_DXMTResourceDowncast in d3d12_resource.hpp.
+  Resource *out = nullptr;
+  resource->QueryInterface(IID_DXMTResourceDowncast,
+                           reinterpret_cast<void **>(&out));
+  return out;
 }
 
 static PipelineState *
 GetPipelineState(ID3D12PipelineState *pipeline_state) {
-  return dynamic_cast<PipelineState *>(pipeline_state);
+  if (ReplayBreakdownEnabled())
+    replayRttiCounters().getPipeline++;
+  if (!pipeline_state)
+    return nullptr;
+  PipelineState *out = nullptr;
+  pipeline_state->QueryInterface(IID_DXMTPipelineStateDowncast,
+                                 reinterpret_cast<void **>(&out));
+  return out;
 }
 
 static UINT
@@ -4574,10 +4623,56 @@ private:
     std::optional<ReplayDepthStencilAttachment> depth_stencil;
   };
 
+  enum class ReplayGraphicsCommandKind : uint8_t {
+    Draw,
+    DrawIndexed,
+    DrawIndirect,
+    DrawIndexedIndirect,
+    Barrier,
+  };
+
+  static bool
+  ReplayGraphicsCommandKindIsIndexed(ReplayGraphicsCommandKind kind) {
+    return kind == ReplayGraphicsCommandKind::DrawIndexed ||
+           kind == ReplayGraphicsCommandKind::DrawIndexedIndirect;
+  }
+
+  static bool
+  ReplayGraphicsCommandKindIsIndirect(ReplayGraphicsCommandKind kind) {
+    return kind == ReplayGraphicsCommandKind::DrawIndirect ||
+           kind == ReplayGraphicsCommandKind::DrawIndexedIndirect;
+  }
+
+  static bool
+  ReplayGraphicsCommandKindIsRealWork(ReplayGraphicsCommandKind kind) {
+    return kind != ReplayGraphicsCommandKind::Barrier;
+  }
+
+  enum class ReplayComputeCommandKind : uint8_t {
+    Dispatch,
+    DispatchIndirect,
+    Barrier,
+  };
+
+  struct ReplayGraphicsPassPlan {
+    uint32_t command_count = 0;
+    uint32_t indexed_count = 0;
+    uint32_t indirect_count = 0;
+    uint32_t parallel_candidate_count = 0;
+    uint32_t current_parallel_candidate_run = 0;
+    uint32_t largest_parallel_candidate_run = 0;
+    uint64_t argument_buffer_size = 0;
+    bool all_parallel_candidates = true;
+  };
+
   struct ReplayGraphicsPassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
     uint64_t d3d_sequence = 0;
     uint64_t argument_buffer_size = 0;
+    uint64_t argument_buffer_offset = 0;
+    uint32_t command_index = 0;
+    ReplayGraphicsCommandKind kind = ReplayGraphicsCommandKind::Draw;
+    bool parallel_candidate = false;
     bool use_geometry = false;
     bool use_tessellation = false;
   };
@@ -4585,7 +4680,9 @@ private:
   struct ReplayGraphicsPassBatch {
     ReplayRenderPassAttachments attachments;
     std::vector<ReplayGraphicsPassCommand> commands;
+    std::unordered_set<uint64_t> captured_binding_generations;
     uint64_t argument_buffer_size = 0;
+    ReplayGraphicsPassPlan plan;
     bool use_geometry = false;
     bool use_tessellation = false;
     bool active = false;
@@ -4595,6 +4692,7 @@ private:
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
     uint64_t d3d_sequence = 0;
     uint64_t argument_buffer_size = 0;
+    ReplayComputeCommandKind kind = ReplayComputeCommandKind::Dispatch;
   };
 
   struct ReplayComputePassBatch {
@@ -4656,6 +4754,46 @@ private:
     bool needs_separator = false;
   };
 
+  static constexpr size_t kResourceAccessBarrierLinearEntryLimit = 32;
+
+  static ResourceAccessBarrierKey
+  MakeResourceAccessBarrierKey(const ResourceAccessBarrierEntry &entry) {
+    ResourceAccessBarrierKey key = {};
+    if (entry.buffer) {
+      key.object = reinterpret_cast<uintptr_t>(entry.buffer.ptr());
+    } else {
+      key.object = reinterpret_cast<uintptr_t>(entry.texture.ptr());
+      key.level = entry.level;
+      key.slice = entry.slice;
+      key.texture = true;
+    }
+    return key;
+  }
+
+  static bool
+  ResourceAccessBarrierEntriesMatch(const ResourceAccessBarrierEntry &lhs,
+                                    const ResourceAccessBarrierEntry &rhs) {
+    if (lhs.buffer || rhs.buffer)
+      return lhs.buffer.ptr() == rhs.buffer.ptr();
+    return lhs.texture.ptr() == rhs.texture.ptr() && lhs.level == rhs.level &&
+           lhs.slice == rhs.slice;
+  }
+
+  static void
+  MergeResourceAccessBarrierEntry(ResourceAccessBarrierEntry &dst,
+                                  ResourceAccessBarrierEntry &&src) {
+    dst.buffer_length = std::max(dst.buffer_length, src.buffer_length);
+    dst.access |= src.access;
+  }
+
+  static void
+  RebuildResourceAccessBarrierIndex(ResourceAccessBarrierBatch &batch) {
+    batch.entry_index.clear();
+    batch.entry_index.reserve(batch.entries.size());
+    for (size_t i = 0; i < batch.entries.size(); i++)
+      batch.entry_index.emplace(MakeResourceAccessBarrierKey(batch.entries[i]), i);
+  }
+
   struct PendingTimestampResolve {
     struct Sample {
 #if DXMT_DX12_METAL4
@@ -4682,6 +4820,11 @@ private:
   };
 
   struct ReplayState {
+    // Root parameter index is bounded by the D3D12 root-signature 64-DWORD
+    // limit, so the hottest root bindings use a fixed array indexed by parameter
+    // instead of a hash map — O(1) index, no hash+bucket on the per-draw replay
+    // hot path (RootDescriptorTable replay + GetTableHandle per descriptor).
+    static constexpr UINT kMaxRootParameters = 64;
     std::unordered_map<ID3D12Resource *, ReplayResourceStateEntry> *resource_states =
         nullptr;
     D3D12_COMMAND_LIST_TYPE queue_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -4709,8 +4852,8 @@ private:
     std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
     Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
     Com<ID3D12DescriptorHeap> sampler_heap;
-    std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> graphics_tables;
-    std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> compute_tables;
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaxRootParameters> graphics_tables = {};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaxRootParameters> compute_tables = {};
     std::unordered_map<UINT, std::vector<UINT>> graphics_root_constants;
     std::unordered_map<UINT, std::vector<UINT>> compute_root_constants;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_cbv_roots;
@@ -4719,6 +4862,16 @@ private:
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_srv_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_uav_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_uav_roots;
+    uint64_t graphics_binding_generation = 1;
+    // descAccess content-fingerprint cache (DXMT_DESCACCESS_CACHE): skip the
+    // per-draw hazard-record loop when (PSO, root-sig, descriptor CONTENT) is
+    // unchanged AND no resource state changed since the last record. The content
+    // fingerprint sees through ring-buffer handle churn — the same resources at
+    // new handles produce the same fingerprint. access_epoch bumps on every real
+    // resource-state change (barriers + non-no-op hazard records), so a cache
+    // hit proves "same bindings, frozen state" → the hazard result is identical.
+    uint64_t access_epoch = 0;
+    std::unordered_map<uint64_t, uint64_t> da_cache;
     Com<ID3D12Resource> predication_buffer;
     UINT64 predication_buffer_offset = 0;
     D3D12_PREDICATION_OP predication_operation =
@@ -4766,6 +4919,7 @@ private:
     copy.compute_srv_roots = state.compute_srv_roots;
     copy.graphics_uav_roots = state.graphics_uav_roots;
     copy.compute_uav_roots = state.compute_uav_roots;
+    copy.graphics_binding_generation = state.graphics_binding_generation;
     copy.predication_buffer = state.predication_buffer;
     copy.predication_buffer_offset = state.predication_buffer_offset;
     copy.predication_operation = state.predication_operation;
@@ -4774,6 +4928,13 @@ private:
           std::chrono::duration_cast<std::chrono::microseconds>(
               clock::now() - rb_clone_t0).count();
     return copy;
+  }
+
+  static void
+  BumpGraphicsBindingGeneration(ReplayState &state) {
+    state.graphics_binding_generation++;
+    if (!state.graphics_binding_generation)
+      state.graphics_binding_generation = 1;
   }
 
   static bool
@@ -4806,6 +4967,95 @@ private:
     return true;
   }
 
+  static bool
+  TextureSubresourceOverlapsView(const ResourceAccessBarrierEntry &entry,
+                                 TextureViewKey view) {
+    if (!entry.texture)
+      return false;
+    return entry.level >= view.mip_start && entry.level < view.mip_end &&
+           entry.slice >= view.array_start && entry.slice < view.array_end;
+  }
+
+  static bool
+  ResourceBarrierTouchesRenderPassAttachments(
+      const ResourceAccessBarrierBatch &batch,
+      const ReplayRenderPassAttachments &attachments) {
+    if (batch.needs_separator)
+      return true;
+    for (const auto &entry : batch.entries) {
+      if (!entry.texture)
+        continue;
+      for (const auto &color : attachments.colors) {
+        if (entry.texture.ptr() == color.texture.ptr() &&
+            TextureSubresourceOverlapsView(entry, color.view))
+          return true;
+      }
+      if (attachments.depth_stencil &&
+          entry.texture.ptr() == attachments.depth_stencil->texture.ptr() &&
+          TextureSubresourceOverlapsView(entry, attachments.depth_stencil->view))
+        return true;
+    }
+    return false;
+  }
+
+  static bool
+  ReplayGraphicsPassBatchHasRealWork(const ReplayGraphicsPassBatch &batch) {
+    if (!batch.active)
+      return false;
+    for (const auto &command : batch.commands) {
+      if (ReplayGraphicsCommandKindIsRealWork(command.kind))
+        return true;
+    }
+    return false;
+  }
+
+  static bool
+  ReplayComputePassBatchHasRealWork(const ReplayComputePassBatch &batch) {
+    if (!batch.active)
+      return false;
+    for (const auto &command : batch.commands) {
+      if (command.kind != ReplayComputeCommandKind::Barrier)
+        return true;
+    }
+    return false;
+  }
+
+  static bool
+  CanDeferResourceBarriersIntoGraphicsBatch(
+      const ReplayState &state, const ResourceAccessBarrierBatch &batch) {
+    if (!(state.graphics_pass_batch.active &&
+          ReplayGraphicsPassBatchHasRealWork(state.graphics_pass_batch)) ||
+        (state.compute_pass_batch.active &&
+         !state.compute_pass_batch.commands.empty()) ||
+        !state.blit_batch.commands.empty() ||
+        !state.pending_timestamp_markers.empty())
+      return false;
+    if (!state.pending_resource_barriers.entries.empty() ||
+        state.pending_resource_barriers.needs_separator)
+      return false;
+    if (batch.needs_separator)
+      return false;
+    const auto &graphics = state.graphics_pass_batch;
+    return !ResourceBarrierTouchesRenderPassAttachments(batch,
+                                                       graphics.attachments);
+  }
+
+  static bool
+  CanDeferResourceBarriersIntoComputeBatch(
+      const ReplayState &state, const ResourceAccessBarrierBatch &batch) {
+    if (!(state.compute_pass_batch.active &&
+          ReplayComputePassBatchHasRealWork(state.compute_pass_batch)) ||
+        (state.graphics_pass_batch.active &&
+         !state.graphics_pass_batch.commands.empty()) ||
+        !state.blit_batch.commands.empty() ||
+        !state.pending_timestamp_markers.empty())
+      return false;
+    if (!state.pending_resource_barriers.entries.empty() ||
+        state.pending_resource_barriers.needs_separator)
+      return false;
+    return !batch.needs_separator;
+  }
+
   static bool HasPendingGraphicsPass(const ReplayState &state) {
     return state.graphics_pass_batch.active &&
            !state.graphics_pass_batch.commands.empty();
@@ -4825,15 +5075,127 @@ private:
            state.pending_resource_barriers.needs_separator;
   }
 
+  static bool
+  ReplayGraphicsCommandCanParallelEncode(ReplayGraphicsCommandKind kind,
+                                         bool use_geometry,
+                                         bool use_tessellation) {
+    return (kind == ReplayGraphicsCommandKind::Draw ||
+            kind == ReplayGraphicsCommandKind::DrawIndexed) &&
+           !use_geometry && !use_tessellation;
+  }
+
+  static ReplayGraphicsPassPlan
+  BuildReplayGraphicsPassPlan(
+      const std::vector<ReplayGraphicsPassCommand> &commands,
+      uint64_t argument_buffer_size) {
+    ReplayGraphicsPassPlan plan = {};
+    plan.command_count = static_cast<uint32_t>(commands.size());
+    plan.argument_buffer_size = argument_buffer_size;
+    for (const auto &command : commands) {
+      if (ReplayGraphicsCommandKindIsIndexed(command.kind))
+        plan.indexed_count++;
+      if (ReplayGraphicsCommandKindIsIndirect(command.kind))
+        plan.indirect_count++;
+      if (command.parallel_candidate) {
+        plan.parallel_candidate_count++;
+        plan.current_parallel_candidate_run++;
+        plan.largest_parallel_candidate_run =
+            std::max(plan.largest_parallel_candidate_run,
+                     plan.current_parallel_candidate_run);
+      } else {
+        plan.current_parallel_candidate_run = 0;
+        plan.all_parallel_candidates = false;
+      }
+    }
+    return plan;
+  }
+
+  static bool HasPendingReplayWork(const ReplayState &state) {
+    return HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
+           HasPendingGraphicsPass(state) ||
+           !state.pending_timestamp_markers.empty();
+  }
+
+  static ResourceAccessBarrierBatch
+  TakePendingResourceBarrierBatch(ReplayState &state) {
+    auto batch = std::move(state.pending_resource_barriers);
+    state.pending_resource_barriers = {};
+    return batch;
+  }
+
+  template <PipelineStage stage>
+  static void EncodeResourceAccessBarrierEntriesForStage(
+      ArgumentEncodingContext &enc,
+      std::vector<ResourceAccessBarrierEntry> &entries) {
+    for (auto &entry : entries) {
+      if (entry.buffer) {
+        enc.access<stage>(entry.buffer, 0, entry.buffer_length, entry.access);
+      } else if (entry.texture) {
+        enc.access<stage>(entry.texture, entry.level, entry.slice, entry.access);
+      }
+    }
+  }
+
+  static void EncodeResourceAccessBarrierEntries(
+      ArgumentEncodingContext &enc,
+      std::vector<ResourceAccessBarrierEntry> &entries) {
+    EncodeResourceAccessBarrierEntriesForStage<PipelineStage::Compute>(
+        enc, entries);
+  }
+
+  static void EncodeRenderResourceAccessBarrierEntries(
+      ArgumentEncodingContext &enc,
+      std::vector<ResourceAccessBarrierEntry> &entries) {
+    EncodeResourceAccessBarrierEntriesForStage<PipelineStage::Vertex>(
+        enc, entries);
+  }
+
+  static void EncodeInlineRenderResourceBarrierEntries(
+      ArgumentEncodingContext &enc,
+      std::vector<ResourceAccessBarrierEntry> &entries) {
+    EncodeRenderResourceAccessBarrierEntries(enc, entries);
+    enc.resolveRenderPassBarrier();
+  }
+
+  static void EncodeStandaloneResourceBarrierEntries(
+      ArgumentEncodingContext &enc,
+      std::vector<ResourceAccessBarrierEntry> &entries) {
+    if (entries.empty())
+      return;
+
+    enc.currentFrameStatistics().blit_barrier_only_pass_count++;
+    enc.startBlitPass();
+    EncodeResourceAccessBarrierEntries(enc, entries);
+    enc.endPass();
+  }
+
+  static void RecordSeparatorOnlyBarrier(const ResourceAccessBarrierBatch &batch) {
+    if (batch.entries.empty() && batch.needs_separator) {
+      if (auto *stats = dxmt::perf::currentFrameStatistics())
+        stats->blit_separator_pass_count++;
+    }
+  }
+
   void FlushComputePassBatch(CommandChunk *chunk, ReplayState &state) {
     auto &batch = state.compute_pass_batch;
     if (!HasPendingComputePass(state))
       return;
+    const bool _rb = ReplayBreakdownEnabled();
+    if (_rb) perDrawSubTimers().flushComputeCalls++;
+    ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
+                      &perDrawSubTimers().flushComputeUs};
+
+    auto barriers = TakePendingResourceBarrierBatch(state);
+    RecordSeparatorOnlyBarrier(barriers);
 
     chunk->emitcc([commands = std::move(batch.commands),
+                   barrier_entries = std::move(barriers.entries),
                    argument_buffer_size = batch.argument_buffer_size](
                       ArgumentEncodingContext &enc) mutable {
       enc.startComputePass(argument_buffer_size);
+      EncodeResourceAccessBarrierEntries(enc, barrier_entries);
+      if (!barrier_entries.empty())
+        enc.resolveComputePassBarrier();
       uint64_t argbuf_offset = 0;
       for (auto &command : commands) {
         if (command.d3d_sequence != 0)
@@ -4850,9 +5212,25 @@ private:
     auto &batch = state.graphics_pass_batch;
     if (!HasPendingGraphicsPass(state))
       return;
+    const bool _rb = ReplayBreakdownEnabled();
+    if (_rb) perDrawSubTimers().flushGraphicsCalls++;
+    ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
+                      &perDrawSubTimers().flushGraphicsUs};
+
+    auto barriers = TakePendingResourceBarrierBatch(state);
+    RecordSeparatorOnlyBarrier(barriers);
+
+    {
+      ScopeAccum _rbplan{_rb, _rb ? clock::now() : clock::time_point{},
+                         &perDrawSubTimers().buildPlanUs};
+      batch.plan = BuildReplayGraphicsPassPlan(batch.commands,
+                                               batch.argument_buffer_size);
+    }
 
     chunk->emitcc([attachments = std::move(batch.attachments),
                    commands = std::move(batch.commands),
+                   plan = batch.plan,
+                   barrier_entries = std::move(barriers.entries),
                    argument_buffer_size = batch.argument_buffer_size](
                       ArgumentEncodingContext &enc) mutable {
       bool use_geometry = false;
@@ -4862,14 +5240,28 @@ private:
       for (const auto &command : commands)
         use_tessellation = use_tessellation || command.use_tessellation;
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
-                           use_geometry, use_tessellation))
+                           use_geometry, use_tessellation)) {
+        EncodeStandaloneResourceBarrierEntries(enc, barrier_entries);
         return;
-      uint64_t argbuf_offset = 0;
+      }
+      EncodeRenderResourceAccessBarrierEntries(enc, barrier_entries);
       for (auto &command : commands) {
         if (command.d3d_sequence != 0) {
           dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
         }
+        uint64_t argbuf_offset = command.argument_buffer_offset;
         command.encode(enc, argbuf_offset);
+        const auto argbuf_limit =
+            command.argument_buffer_offset + command.argument_buffer_size;
+        const auto command_used =
+            argbuf_offset - command.argument_buffer_offset;
+        if (argbuf_offset > argbuf_limit) {
+          WARN("D3D12CommandQueue: graphics pass argument-buffer reservation overflow"
+               " commandIndex=", command.command_index,
+               " reserved=", command.argument_buffer_size,
+               " used=", command_used,
+               " passCommands=", plan.command_count);
+        }
       }
       enc.endPass();
     });
@@ -4880,6 +5272,10 @@ private:
   void EmitTimestampMarkers(CommandChunk *chunk, ReplayState &state) {
     if (state.pending_timestamp_markers.empty())
       return;
+    const bool _rb = ReplayBreakdownEnabled();
+    if (_rb) perDrawSubTimers().emitTsMarkersCalls++;
+    ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
+                      &perDrawSubTimers().emitTsMarkersUs};
 
     auto markers = std::move(state.pending_timestamp_markers);
     state.pending_timestamp_markers = {};
@@ -4904,10 +5300,19 @@ private:
     auto &batch = state.blit_batch;
     if (!HasPendingBlitBatch(state))
       return;
+    const bool _rb = ReplayBreakdownEnabled();
+    if (_rb) perDrawSubTimers().flushBlitCalls++;
+    ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
+                      &perDrawSubTimers().flushBlitUs};
 
-    chunk->emitcc([commands = std::move(batch.commands)](
+    auto barriers = TakePendingResourceBarrierBatch(state);
+    RecordSeparatorOnlyBarrier(barriers);
+
+    chunk->emitcc([commands = std::move(batch.commands),
+                   barrier_entries = std::move(barriers.entries)](
                       ArgumentEncodingContext &enc) mutable {
       enc.startBlitPass();
+      EncodeResourceAccessBarrierEntries(enc, barrier_entries);
       for (auto &command : commands) {
         if (command.d3d_sequence != 0)
           dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
@@ -4922,61 +5327,59 @@ private:
   void FlushResourceBarrierBatch(CommandChunk *chunk, ReplayState &state) {
     if (!HasPendingResourceBarrierBatch(state))
       return;
+    const bool _rb = ReplayBreakdownEnabled();
+    if (_rb) perDrawSubTimers().flushBarrierCalls++;
+    ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
+                      &perDrawSubTimers().flushBarrierUs};
 
-    auto batch = std::move(state.pending_resource_barriers);
-    state.pending_resource_barriers = {};
-    if (batch.entries.empty()) {
-      if (batch.needs_separator) {
-        if (auto *stats = dxmt::perf::currentFrameStatistics())
-          stats->blit_separator_pass_count++;
-      }
+    auto batch = TakePendingResourceBarrierBatch(state);
+    RecordSeparatorOnlyBarrier(batch);
+    if (batch.entries.empty())
       return;
-    }
 
     chunk->emitcc([entries = std::move(batch.entries)](ArgumentEncodingContext &enc) mutable {
-      enc.currentFrameStatistics().blit_barrier_only_pass_count++;
-      enc.startBlitPass();
-      for (auto &entry : entries) {
-        if (entry.buffer) {
-          enc.access(entry.buffer, 0, entry.buffer_length, entry.access);
-        } else if (entry.texture) {
-          enc.access(entry.texture, entry.level, entry.slice, entry.access);
-        }
-      }
-      enc.endPass();
+      EncodeStandaloneResourceBarrierEntries(enc, entries);
     });
   }
 
   void FlushReplayRenderComputeTimestampBatches(CommandChunk *chunk,
-                                                ReplayState &state) {
-    FlushResourceBarrierBatch(chunk, state);
+                                                ReplayState &state,
+                                                bool force_resource_barriers = true) {
     FlushComputePassBatch(chunk, state);
     FlushGraphicsPassBatch(chunk, state);
+    if (force_resource_barriers)
+      FlushResourceBarrierBatch(chunk, state);
     EmitTimestampMarkers(chunk, state);
   }
 
   void FlushReplayWorkBeforeResourceBarrier(CommandChunk *chunk,
                                             ReplayState &state) {
-    if (HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
-        HasPendingGraphicsPass(state) || !state.pending_timestamp_markers.empty())
-      FlushResourceBarrierBatch(chunk, state);
-    FlushBlitBatch(chunk, state);
-    FlushComputePassBatch(chunk, state);
-    FlushGraphicsPassBatch(chunk, state);
-    EmitTimestampMarkers(chunk, state);
+    if (HasPendingReplayWork(state))
+      FlushPassBatches(chunk, state, false);
   }
 
-  void FlushPassBatches(CommandChunk *chunk, ReplayState &state) {
+  void FlushPassBatches(CommandChunk *chunk, ReplayState &state,
+                        bool force_resource_barriers = true) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().emitUs);
-    FlushResourceBarrierBatch(chunk, state);
+    const bool has_encoder_work =
+        HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
+        HasPendingGraphicsPass(state);
+    if (ReplayBreakdownEnabled()) {
+      perDrawSubTimers().flushPassBatchesCalls++;
+      if (!has_encoder_work)
+        perDrawSubTimers().flushPassBatchesEmpty++;
+    }
+    const bool force_before_timestamps =
+        !has_encoder_work && !state.pending_timestamp_markers.empty();
     FlushBlitBatch(chunk, state);
-    FlushReplayRenderComputeTimestampBatches(chunk, state);
+    FlushReplayRenderComputeTimestampBatches(chunk, state,
+                                             force_resource_barriers ||
+                                             force_before_timestamps);
   }
 
   void FlushGraphicsBeforeCompute(CommandChunk *chunk, ReplayState &state) {
-    if (HasPendingResourceBarrierBatch(state) || HasPendingGraphicsPass(state) ||
-        HasPendingBlitBatch(state))
-      FlushPassBatches(chunk, state);
+    if (HasPendingGraphicsPass(state) || HasPendingBlitBatch(state))
+      FlushPassBatches(chunk, state, false);
   }
 
   bool ReplayBlitBatchHasHazard(const ReplayBlitBatch &batch,
@@ -5013,7 +5416,10 @@ private:
                         std::initializer_list<ID3D12Resource *> reads,
                         std::initializer_list<ID3D12Resource *> writes,
                         Fn &&fn) {
-    FlushReplayRenderComputeTimestampBatches(chunk, state);
+    if (HasPendingComputePass(state) || HasPendingGraphicsPass(state) ||
+        !state.pending_timestamp_markers.empty())
+      FlushReplayRenderComputeTimestampBatches(
+          chunk, state, !state.pending_timestamp_markers.empty());
     if (ReplayBlitBatchHasHazard(state.blit_batch, reads, writes))
       FlushBlitBatch(chunk, state);
 
@@ -5448,9 +5854,10 @@ private:
                                 ReplayRenderPassAttachments attachments,
                                 uint64_t argument_buffer_size, Fn &&fn,
                                 bool use_geometry = false,
-                                bool use_tessellation = false) {
-    if (HasPendingResourceBarrierBatch(state) || HasPendingComputePass(state) ||
-        HasPendingBlitBatch(state))
+                                bool use_tessellation = false,
+                                ReplayGraphicsCommandKind kind =
+                                    ReplayGraphicsCommandKind::Draw) {
+    if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
       FlushPassBatches(chunk, state);
 
     auto &batch = state.graphics_pass_batch;
@@ -5465,14 +5872,106 @@ private:
       active_batch.argument_buffer_size = 0;
     }
 
+    const auto command_argbuf_offset = active_batch.argument_buffer_size;
+    const auto command_index =
+        static_cast<uint32_t>(active_batch.commands.size());
+    const bool parallel_candidate = ReplayGraphicsCommandCanParallelEncode(
+        kind, use_geometry, use_tessellation);
     active_batch.argument_buffer_size += argument_buffer_size;
     active_batch.use_geometry = active_batch.use_geometry || use_geometry;
     active_batch.use_tessellation =
         active_batch.use_tessellation || use_tessellation;
     active_batch.commands.push_back(
         ReplayGraphicsPassCommand{std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
-                                  argument_buffer_size, use_geometry,
-                                  use_tessellation});
+                                  argument_buffer_size, command_argbuf_offset,
+                                  command_index, kind, parallel_candidate,
+                                  use_geometry, use_tessellation});
+  }
+
+  void QueueGraphicsResourceBarrierCommand(CommandChunk *chunk,
+                                           ReplayState &state,
+                                           ResourceAccessBarrierBatch batch) {
+    (void)chunk;
+    if (batch.entries.empty())
+      return;
+    auto &active_batch = state.graphics_pass_batch;
+    const auto command_index =
+        static_cast<uint32_t>(active_batch.commands.size());
+    auto encode_barrier = [entries = std::move(batch.entries)](
+                              ArgumentEncodingContext &enc,
+                              uint64_t &argbuf_offset) mutable {
+      (void)argbuf_offset;
+      EncodeInlineRenderResourceBarrierEntries(enc, entries);
+    };
+    active_batch.commands.push_back(ReplayGraphicsPassCommand{
+        std::move(encode_barrier), dxmt::apitrace::current_d3d_sequence(), 0,
+        active_batch.argument_buffer_size, command_index,
+        ReplayGraphicsCommandKind::Barrier, false, false, false});
+    if (auto *stats = dxmt::perf::currentFrameStatistics())
+      stats->resource_barrier_batches_graphics_inlined++;
+  }
+
+  void QueueComputeResourceBarrierCommand(CommandChunk *chunk,
+                                          ReplayState &state,
+                                          ResourceAccessBarrierBatch batch) {
+    (void)chunk;
+    if (batch.entries.empty())
+      return;
+    auto &active_batch = state.compute_pass_batch;
+    auto encode_barrier = [entries = std::move(batch.entries)](
+                              ArgumentEncodingContext &enc,
+                              uint64_t &argbuf_offset) mutable {
+      (void)argbuf_offset;
+      EncodeResourceAccessBarrierEntries(enc, entries);
+      enc.resolveComputePassBarrier();
+    };
+    active_batch.commands.push_back(ReplayComputePassCommand{
+        std::move(encode_barrier), dxmt::apitrace::current_d3d_sequence(), 0,
+        ReplayComputeCommandKind::Barrier});
+    if (auto *stats = dxmt::perf::currentFrameStatistics())
+      stats->resource_barrier_batches_compute_inlined++;
+  }
+
+  void QueueOrDeferResourceAccessBarrierBatch(CommandChunk *chunk,
+                                              ReplayState &state,
+                                              ResourceAccessBarrierBatch batch) {
+    if (batch.entries.empty() && !batch.needs_separator)
+      return;
+    if (CanDeferResourceBarriersIntoGraphicsBatch(state, batch)) {
+      QueueGraphicsResourceBarrierCommand(chunk, state, std::move(batch));
+      return;
+    }
+    if (CanDeferResourceBarriersIntoComputeBatch(state, batch)) {
+      QueueComputeResourceBarrierCommand(chunk, state, std::move(batch));
+      return;
+    }
+    FlushReplayWorkBeforeResourceBarrier(chunk, state);
+    QueueResourceAccessBarrierBatch(state, std::move(batch));
+  }
+
+  bool GraphicsPassBatchNeedsBindingSnapshot(
+      CommandChunk *chunk, ReplayState &state,
+      const ReplayRenderPassAttachments &attachments) {
+    if (!D3D12ReplayGraphicsBatchingEnabled())
+      return true;
+    if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
+      FlushPassBatches(chunk, state);
+
+    auto &batch = state.graphics_pass_batch;
+    if (batch.active &&
+        !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
+      FlushPassBatches(chunk, state);
+
+    auto &active_batch = state.graphics_pass_batch;
+    if (!active_batch.active) {
+      active_batch.active = true;
+      active_batch.attachments = attachments;
+      active_batch.argument_buffer_size = 0;
+    }
+
+    return active_batch.captured_binding_generations
+        .insert(state.graphics_binding_generation)
+        .second;
   }
 
   bool D3D12ReplayComputeBatchingEnabled() {
@@ -5518,7 +6017,7 @@ private:
     batch.argument_buffer_size += argument_buffer_size;
     batch.commands.push_back(ReplayComputePassCommand{
         std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
-        argument_buffer_size});
+        argument_buffer_size, ReplayComputeCommandKind::Dispatch});
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -5552,7 +6051,19 @@ private:
   // start and printed in the replay breakdown, to rank descriptor-access vs
   // attachments vs state-clone within the ~59us/draw.
   struct PerDrawSubTimers { uint64_t desc = 0, attach = 0, clone = 0, stateUpd = 0;
-    uint64_t drawCount = 0, psoRootUnchanged = 0, fullBindUnchanged = 0; };
+    uint64_t drawCount = 0, psoRootUnchanged = 0, fullBindUnchanged = 0;
+    // One-shot replay-breakdown coverage (DXMT_DIAG_REPLAY_BREAKDOWN): attribute
+    // the per-pass/per-barrier fixed cost that dominates replay (decoupled from
+    // draw count). Times accumulate across the WHOLE replay regardless of where
+    // the flush was triggered (Clear/Copy/Resolve in the record loop, or the
+    // tail flush). Reset per ReplayCommandRecords, dumped in the breakdown line.
+    uint64_t flushBlitUs = 0, flushComputeUs = 0, flushGraphicsUs = 0,
+             flushBarrierUs = 0, emitTsMarkersUs = 0, buildPlanUs = 0;
+    uint64_t flushBlitCalls = 0, flushComputeCalls = 0, flushGraphicsCalls = 0,
+             flushBarrierCalls = 0, emitTsMarkersCalls = 0;
+    uint64_t flushPassBatchesCalls = 0, flushPassBatchesEmpty = 0;
+    uint64_t resAccessCalls = 0, resAccessSteadyNoop = 0;
+    uint64_t descAccessHits = 0, descAccessMiss = 0; };
   static PerDrawSubTimers &perDrawSubTimers() {
     static thread_local PerDrawSubTimers t;
     return t;
@@ -5612,7 +6123,9 @@ private:
     h = mix(h, (uint64_t)s.graphics_root_signature.ptr());
     h = mix(h, (uint64_t)s.cbv_srv_uav_heap.ptr());
     h = mix(h, (uint64_t)s.sampler_heap.ptr());
-    for (auto &kv : s.graphics_tables) h = mix(mix(h, kv.first), kv.second.ptr);
+    for (UINT i = 0; i < s.graphics_tables.size(); i++)
+      if (s.graphics_tables[i].ptr)
+        h = mix(mix(h, i), s.graphics_tables[i].ptr);
     for (auto &kv : s.graphics_cbv_roots) h = mix(mix(h, kv.first), kv.second);
     for (auto &kv : s.graphics_srv_roots) h = mix(mix(h, kv.first), kv.second);
     for (auto &kv : s.graphics_uav_roots) h = mix(mix(h, kv.first), kv.second);
@@ -5647,8 +6160,10 @@ private:
     static const bool replay_breakdown =
         D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
     const auto rb_t0 = replay_breakdown ? clock::now() : clock::time_point{};
-    if (replay_breakdown)
+    if (replay_breakdown) {
       perDrawSubTimers() = {};
+      replayRttiCounters() = {};
+    }
     // PERF DIAG: per-record-type cost accumulation (cleared & dumped per slow
     // replay below) to find WHICH D3D12 command type dominates the recordLoop.
     std::unordered_map<const char *, std::pair<uint64_t, uint64_t>> rb_by_type;
@@ -5733,7 +6248,11 @@ private:
         return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
       };
       const auto total = us(rb_t4 - rb_t0);
-      if (total > 50000) { // only explosion frames (>50ms)
+      static const uint64_t rb_threshold_us = []() {
+        auto v = env::getEnvVar("DXMT_DIAG_REPLAY_BREAKDOWN_US");
+        return v.empty() ? uint64_t(50000) : strtoull(v.c_str(), nullptr, 10);
+      }();
+      if (uint64_t(total) > rb_threshold_us) { // env-tunable; default 50ms explosion frames
         // Find the top-3 record types by accumulated time.
         std::vector<std::pair<const char *, std::pair<uint64_t, uint64_t>>>
             sorted(rb_by_type.begin(), rb_by_type.end());
@@ -5761,6 +6280,25 @@ private:
              " drawStateUpdUs=", perDrawSubTimers().stateUpd,
              " drawAttachUs=", perDrawSubTimers().attach,
              " drawCloneUs=", perDrawSubTimers().clone,
+             " flushBlitUs=", perDrawSubTimers().flushBlitUs,
+             " flushBlitCalls=", perDrawSubTimers().flushBlitCalls,
+             " flushComputeUs=", perDrawSubTimers().flushComputeUs,
+             " flushComputeCalls=", perDrawSubTimers().flushComputeCalls,
+             " flushGraphicsUs=", perDrawSubTimers().flushGraphicsUs,
+             " flushGraphicsCalls=", perDrawSubTimers().flushGraphicsCalls,
+             " buildPlanUs=", perDrawSubTimers().buildPlanUs,
+             " flushBarrierUs=", perDrawSubTimers().flushBarrierUs,
+             " flushBarrierCalls=", perDrawSubTimers().flushBarrierCalls,
+             " emitTsMarkersUs=", perDrawSubTimers().emitTsMarkersUs,
+             " emitTsMarkersCalls=", perDrawSubTimers().emitTsMarkersCalls,
+             " flushPassBatchesCalls=", perDrawSubTimers().flushPassBatchesCalls,
+             " flushPassBatchesEmpty=", perDrawSubTimers().flushPassBatchesEmpty,
+             " resAccessCalls=", perDrawSubTimers().resAccessCalls,
+             " resAccessSteadyNoop=", perDrawSubTimers().resAccessSteadyNoop,
+             " descAccessHits=", perDrawSubTimers().descAccessHits,
+             " descAccessMiss=", perDrawSubTimers().descAccessMiss,
+             " getResourceCasts=", replayRttiCounters().getResource,
+             " getPipelineCasts=", replayRttiCounters().getPipeline,
              " topTypes=", top);
       }
     }
@@ -5852,7 +6390,7 @@ private:
               GetDepthStencilSubresourceRanges);
         }
         ReplayClearDepthStencil(chunk, record);
-      } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
+    } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
         FlushPassBatches(chunk, state);
         if (auto *resource = GetResource(record.resource.ptr())) {
           RecordDescriptorResourceAccessRanges(
@@ -5867,6 +6405,7 @@ private:
       ReplayDiscardResource(chunk, record);
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
       state.pipeline_state = record.pipeline_state;
+      BumpGraphicsBindingGeneration(state);
     } else if constexpr (std::is_same_v<T, PrimitiveTopologyRecord>) {
       state.topology = record.topology;
     } else if constexpr (std::is_same_v<T, ViewportRecord>) {
@@ -5881,7 +6420,8 @@ private:
       state.render_targets = record.render_targets;
       state.depth_stencil = record.depth_stencil;
     } else if constexpr (std::is_same_v<T, DescriptorHeapsRecord>) {
-      FlushPassBatches(chunk, state);
+      // Queued draw/dispatch packets capture their binding state up front, so
+      // heap changes do not need to close an otherwise mergeable pass.
       state.cbv_srv_uav_heap = nullptr;
       state.sampler_heap = nullptr;
       for (const auto &heap : record.heaps) {
@@ -5896,6 +6436,7 @@ private:
         else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
           state.sampler_heap = heap;
       }
+      BumpGraphicsBindingGeneration(state);
     } else if constexpr (std::is_same_v<T, VertexBuffersRecord>) {
       for (UINT i = 0; i < record.view_count &&
                        record.start_slot + i < state.vertex_buffers.size();
@@ -5905,25 +6446,38 @@ private:
         else
           state.vertex_buffers[record.start_slot + i].reset();
       }
+      BumpGraphicsBindingGeneration(state);
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
-      FlushReplayWorkBeforeResourceBarrier(chunk, state);
-      ReplayResourceBarrier(chunk, state, record);
+      auto batch = BuildResourceBarrierBatch(state, record);
+      if (batch.entries.empty() && !batch.needs_separator)
+        return;
+      QueueOrDeferResourceAccessBarrierBatch(chunk, state, std::move(batch));
     } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
-      FlushPassBatches(chunk, state);
+      // Root signatures only affect binding translation for subsequently queued
+      // packets; already queued packets keep their cloned state.
       if (record.compute)
         state.compute_root_signature = record.root_signature;
-      else
+      else {
         state.graphics_root_signature = record.root_signature;
+        BumpGraphicsBindingGeneration(state);
+      }
     } else if constexpr (std::is_same_v<T, RootDescriptorTableRecord>) {
       auto &tables = record.compute ? state.compute_tables
                                     : state.graphics_tables;
-      tables[record.root_parameter_index] = record.base_descriptor;
+      if (record.root_parameter_index < tables.size())
+        tables[record.root_parameter_index] = record.base_descriptor;
+      if (!record.compute)
+        BumpGraphicsBindingGeneration(state);
     } else if constexpr (std::is_same_v<T, RootDescriptorRecord>) {
       StoreRootDescriptor(state, record);
+      if (!record.compute)
+        BumpGraphicsBindingGeneration(state);
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
       StoreRootConstants(state, record);
+      if (!record.compute)
+        BumpGraphicsBindingGeneration(state);
     } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
       FlushPassBatches(chunk, state);
       ReplayBeginQuery(chunk, record);
@@ -6013,12 +6567,13 @@ private:
     });
   }
 
-  void ReplayResourceBarrier(CommandChunk *chunk, ReplayState &state,
-                             const ResourceBarrierRecord &record) {
-    if (record.barriers.empty())
-      return;
-
+  ResourceAccessBarrierBatch
+  BuildResourceBarrierBatch(ReplayState &state,
+                            const ResourceBarrierRecord &record) {
     ResourceAccessBarrierBatch batch;
+    if (record.barriers.empty())
+      return batch;
+
     for (const auto &barrier : record.barriers) {
       switch (barrier.barrier.Type) {
       case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
@@ -6038,6 +6593,14 @@ private:
       }
     }
 
+    return batch;
+  }
+
+  void ReplayResourceBarrier(CommandChunk *chunk, ReplayState &state,
+                             const ResourceBarrierRecord &record) {
+    auto batch = BuildResourceBarrierBatch(state, record);
+    // Explicit barrier changes resource state — invalidate the descAccess cache.
+    state.access_epoch++;
     QueueResourceAccessBarrierBatch(state, std::move(batch));
   }
 
@@ -6455,6 +7018,7 @@ private:
         D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
     ScopeAccum rb_su_guard{rb_su, rb_su ? clock::now() : clock::time_point{},
                            &perDrawSubTimers().stateUpd};
+    if (rb_su) perDrawSubTimers().resAccessCalls++;
     // If this texture is cached as uniformly read-steady (all subresources in
     // one read-only state S with no write-sync debt) and the desired read-only
     // access is a subset of S, the full path is a no-op for every subresource:
@@ -6464,8 +7028,10 @@ private:
       auto sit = state.steady_read_states.find(d3d_resource);
       if (sit != state.steady_read_states.end() &&
           IsReadOnlyResourceState(sit->second) &&
-          (uint32_t(sit->second) & uint32_t(desired)) == uint32_t(desired))
+          (uint32_t(sit->second) & uint32_t(desired)) == uint32_t(desired)) {
+        if (rb_su) perDrawSubTimers().resAccessSteadyNoop++;
         return;
+      }
     }
     auto *resource = GetResource(d3d_resource);
     if (!resource)
@@ -6567,12 +7133,15 @@ private:
       // not poison subsequent state tracking.
     }
     if (has_mismatch_resource_barriers) {
+      // A real read/write hazard barrier is a resource-state sync point — bump
+      // the descAccess-cache epoch so a later same-binding draw re-records the
+      // hazard instead of wrongly reusing a stale "frozen state" result.
+      state.access_epoch++;
       // Some reflected uses can observe a read/write hazard before DXMT's
       // replay state sees the app's later transition. Keep the D3D12 state
       // unchanged, but make Metal visibility safe for the actual access.
-      FlushPassBatches(chunk, state);
-      EmitResourceAccessBarrierBatch(
-          chunk, std::move(mismatch_resource_barriers));
+      QueueOrDeferResourceAccessBarrierBatch(
+          chunk, state, std::move(mismatch_resource_barriers));
     }
     // Only textures are eligible. Buffers can carry pending timestamp/CPU query
     // resolves, which must not be skipped by a replay-state shortcut.
@@ -6876,25 +7445,30 @@ private:
                                 Resource &resource, UINT first_subresource,
                                 UINT subresource_count, int access) {
     auto add_or_merge_entry = [&](ResourceAccessBarrierEntry entry) {
-      ResourceAccessBarrierKey key = {};
-      if (entry.buffer) {
-        key.object = reinterpret_cast<uintptr_t>(entry.buffer.ptr());
-      } else {
-        key.object = reinterpret_cast<uintptr_t>(entry.texture.ptr());
-        key.level = entry.level;
-        key.slice = entry.slice;
-        key.texture = true;
+      if (batch.entry_index.empty()) {
+        if (batch.entries.size() < kResourceAccessBarrierLinearEntryLimit) {
+          for (auto &existing : batch.entries) {
+            if (!ResourceAccessBarrierEntriesMatch(existing, entry))
+              continue;
+            MergeResourceAccessBarrierEntry(existing, std::move(entry));
+            return;
+          }
+        } else {
+          RebuildResourceAccessBarrierIndex(batch);
+        }
       }
 
-      auto found = batch.entry_index.find(key);
-      if (found != batch.entry_index.end()) {
-        auto &existing = batch.entries[found->second];
-        existing.buffer_length =
-            std::max(existing.buffer_length, entry.buffer_length);
-        existing.access |= entry.access;
-        return;
+      if (!batch.entry_index.empty()) {
+        auto key = MakeResourceAccessBarrierKey(entry);
+        auto found = batch.entry_index.find(key);
+        if (found != batch.entry_index.end()) {
+          MergeResourceAccessBarrierEntry(batch.entries[found->second],
+                                          std::move(entry));
+          return;
+        }
+        batch.entry_index.emplace(key, batch.entries.size());
       }
-      batch.entry_index.emplace(key, batch.entries.size());
+
       batch.entries.push_back(std::move(entry));
     };
 
@@ -6929,6 +7503,46 @@ private:
     batch.needs_separator = true;
   }
 
+  static void MergeResourceAccessBarrierBatch(ResourceAccessBarrierBatch &dst,
+                                              ResourceAccessBarrierBatch src) {
+    if (dst.entry_index.empty() && src.entry_index.empty() &&
+        dst.entries.size() + src.entries.size() <=
+            kResourceAccessBarrierLinearEntryLimit) {
+      for (auto &entry : src.entries) {
+        bool merged = false;
+        for (auto &existing : dst.entries) {
+          if (!ResourceAccessBarrierEntriesMatch(existing, entry))
+            continue;
+          MergeResourceAccessBarrierEntry(existing, std::move(entry));
+          merged = true;
+          break;
+        }
+        if (!merged)
+          dst.entries.push_back(std::move(entry));
+      }
+      dst.needs_separator = dst.needs_separator || src.needs_separator;
+      return;
+    }
+
+    if (dst.entry_index.empty())
+      RebuildResourceAccessBarrierIndex(dst);
+
+    for (auto &entry : src.entries) {
+      auto key = MakeResourceAccessBarrierKey(entry);
+
+      auto found = dst.entry_index.find(key);
+      if (found != dst.entry_index.end()) {
+        MergeResourceAccessBarrierEntry(dst.entries[found->second],
+                                        std::move(entry));
+        continue;
+      }
+
+      dst.entry_index.emplace(key, dst.entries.size());
+      dst.entries.push_back(std::move(entry));
+    }
+    dst.needs_separator = dst.needs_separator || src.needs_separator;
+  }
+
   void QueueResourceAccessBarrierBatch(ReplayState &state,
                                        ResourceAccessBarrierBatch batch) {
     if (batch.entries.empty()) {
@@ -6938,34 +7552,11 @@ private:
     }
 
     auto &pending = state.pending_resource_barriers;
-    if (!pending.entries.empty()) {
-      if (auto *stats = dxmt::perf::currentFrameStatistics())
-        stats->resource_barrier_batches_merged++;
-    }
-    for (auto &entry : batch.entries) {
-      ResourceAccessBarrierKey key = {};
-      if (entry.buffer) {
-        key.object = reinterpret_cast<uintptr_t>(entry.buffer.ptr());
-      } else {
-        key.object = reinterpret_cast<uintptr_t>(entry.texture.ptr());
-        key.level = entry.level;
-        key.slice = entry.slice;
-        key.texture = true;
-      }
-
-      auto found = pending.entry_index.find(key);
-      if (found != pending.entry_index.end()) {
-        auto &existing = pending.entries[found->second];
-        existing.buffer_length =
-            std::max(existing.buffer_length, entry.buffer_length);
-        existing.access |= entry.access;
-        continue;
-      }
-
-      pending.entry_index.emplace(key, pending.entries.size());
-      pending.entries.push_back(std::move(entry));
-    }
-    pending.needs_separator = pending.needs_separator || batch.needs_separator;
+	    if (!pending.entries.empty()) {
+	      if (auto *stats = dxmt::perf::currentFrameStatistics())
+	        stats->resource_barrier_batches_merged++;
+	    }
+	    MergeResourceAccessBarrierBatch(pending, std::move(batch));
   }
 
   void EmitResourceAccessBarrierBatch(CommandChunk *chunk,
@@ -7495,8 +8086,10 @@ private:
         case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
           D3D12_VERTEX_BUFFER_VIEW view = {};
           std::memcpy(&view, bytes, sizeof(view));
-          if (argument.VertexBuffer.Slot < state.vertex_buffers.size())
+          if (argument.VertexBuffer.Slot < state.vertex_buffers.size()) {
             state.vertex_buffers[argument.VertexBuffer.Slot] = view;
+            BumpGraphicsBindingGeneration(state);
+          }
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: {
@@ -7517,6 +8110,8 @@ private:
             std::memcpy(constants.values.data(), bytes,
                         constants.values.size() * sizeof(UINT));
           StoreRootConstants(state, constants);
+          if (!compute)
+            BumpGraphicsBindingGeneration(state);
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
@@ -7527,6 +8122,8 @@ private:
                          compute, D3D12_ROOT_PARAMETER_TYPE_CBV,
                          argument.ConstantBufferView.RootParameterIndex,
                          address});
+          if (!compute)
+            BumpGraphicsBindingGeneration(state);
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
@@ -7537,6 +8134,8 @@ private:
                          compute, D3D12_ROOT_PARAMETER_TYPE_SRV,
                          argument.ShaderResourceView.RootParameterIndex,
                          address});
+          if (!compute)
+            BumpGraphicsBindingGeneration(state);
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
@@ -7547,6 +8146,8 @@ private:
                          compute, D3D12_ROOT_PARAMETER_TYPE_UAV,
                          argument.UnorderedAccessView.RootParameterIndex,
                          address});
+          if (!compute)
+            BumpGraphicsBindingGeneration(state);
           break;
         }
         default:
@@ -7766,7 +8367,8 @@ private:
     if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry, metal->use_tessellation);
+                               metal->use_geometry, metal->use_tessellation,
+                               ReplayGraphicsCommandKind::DrawIndirect);
       return;
     }
 
@@ -8013,7 +8615,8 @@ private:
     if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry, metal->use_tessellation);
+                               metal->use_geometry, metal->use_tessellation,
+                               ReplayGraphicsCommandKind::DrawIndexedIndirect);
       return;
     }
 
@@ -8408,8 +9011,9 @@ private:
   GetTableHandle(const ReplayState &state, bool compute,
                  UINT root_parameter_index) {
     const auto &tables = compute ? state.compute_tables : state.graphics_tables;
-    auto it = tables.find(root_parameter_index);
-    return it == tables.end() ? D3D12_GPU_DESCRIPTOR_HANDLE{} : it->second;
+    return root_parameter_index < tables.size()
+               ? tables[root_parameter_index]
+               : D3D12_GPU_DESCRIPTOR_HANDLE{};
   }
 
   static UINT
@@ -8789,6 +9393,21 @@ private:
   // P1: per-draw cached path. Plan lookup builds the invariant traversal
   // structure on miss, then each draw resolves only current heaps, table bases
   // and descriptor records before recording resource access.
+  // Root CBV/SRV/UAV GPU address for the descAccess content fingerprint (reads
+  // the same maps RecordRootBufferDescriptorAccess uses; 0 = unbound).
+  D3D12_GPU_VIRTUAL_ADDRESS GetRootBufferAddressForFingerprint(
+      const ReplayState &state, bool compute, UINT root_index,
+      DescriptorRecordType type) const {
+    const auto &map =
+        type == DescriptorRecordType::ConstantBufferView
+            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? (compute ? state.compute_srv_roots : state.graphics_srv_roots)
+                  : (compute ? state.compute_uav_roots : state.graphics_uav_roots);
+    auto it = map.find(root_index);
+    return it == map.end() ? 0 : it->second;
+  }
+
   void RecordPipelineDescriptorAccess_Cached(CommandChunk *chunk,
                                              ReplayState &state,
                                              PipelineState &pipeline,
@@ -8821,6 +9440,64 @@ private:
     auto *smp_heap = resolve_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
     const auto parameters = root->GetParameters();
+
+    // descAccess content-fingerprint cache: read each binding's resolved CONTENT
+    // (resource pointer + type) — this sees through ring-buffer handle churn
+    // (same resources at new handles -> same fp). If (PSO, root-sig, content fp,
+    // access_epoch) matches the previous draw, the per-entry hazard records are
+    // identical and the resource state is frozen, so the whole hazard pass is
+    // skipped. Resolve (cheap pointer arithmetic) is kept; the heavy get-ranges
+    // + RecordReplayResourceAccess hazard work is what's elided. Touch is NOT
+    // needed on a hit: the first miss with this fp already Touched the same
+    // resources into the per-list (accumulated) touched set.
+    const bool cache_on = DescAccessCacheEnabled() && !compute;
+    uint64_t fp = 0;
+    if (cache_on) {
+      auto mix = [](uint64_t h, uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+      };
+      fp = 1469598103934665603ull;
+      fp = mix(fp, reinterpret_cast<uintptr_t>(root));
+      fp = mix(fp, reinterpret_cast<uintptr_t>(&pipeline));
+      for (const auto &e : plan.entries) {
+        if (e.kind == BindingEntryKind::Table) {
+          const auto base = GetTableHandle(state, compute, e.root_index);
+          const DescriptorRecord *descriptor =
+              base.ptr ? GetBoundDescriptorRecordInRangeFromHeap(
+                             e.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+                                 ? smp_heap
+                                 : cbv_heap,
+                             base, e.range_offset, e.descriptor_index, e.count,
+                             e.heap_type)
+                       : nullptr;
+          fp = mix(fp, descriptor ? reinterpret_cast<uintptr_t>(
+                                        descriptor->resource.ptr())
+                                  : 0);
+          fp = mix(fp, (uint64_t(e.range_type) << 1) ^
+                           (descriptor
+                                ? (uint64_t(descriptor->type) << 20) ^
+                                      reinterpret_cast<uintptr_t>(
+                                          descriptor->counter_resource.ptr())
+                                : 0));
+        } else {
+          fp = mix(fp, GetRootBufferAddressForFingerprint(
+                           state, compute, e.root_index, e.buffer_type));
+          fp = mix(fp, uint64_t(e.buffer_type) << 3);
+        }
+      }
+      auto cit = state.da_cache.find(fp);
+      const bool hit =
+          cit != state.da_cache.end() && cit->second == state.access_epoch;
+      if (hit && !DescAccessVerify()) {
+        if (ReplayBreakdownEnabled())
+          perDrawSubTimers().descAccessHits++;
+        return; // identical bindings + frozen state -> hazard result unchanged
+      }
+      if (ReplayBreakdownEnabled())
+        perDrawSubTimers().descAccessMiss++;
+    }
+
     for (const auto &e : plan.entries) {
       if (e.kind == BindingEntryKind::Table) {
         const auto base = GetTableHandle(state, compute, e.root_index);
@@ -8841,6 +9518,8 @@ private:
                                          parameters[e.root_index], e.buffer_type);
       }
     }
+    if (cache_on)
+      state.da_cache[fp] = state.access_epoch; // fp -> epoch after the hazard pass
   }
 
   void RecordPipelineDescriptorAccess(CommandChunk *chunk, ReplayState &state,
@@ -11847,43 +12526,89 @@ private:
       ArgumentEncodingContext &enc, const std::vector<D3D12_VIEWPORT> &viewports,
       const std::vector<D3D12_RECT> &scissors,
       const std::array<FLOAT, 4> &blend_factor, UINT stencil_ref) {
-    auto &blend = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
-    blend.type = WMTRenderCommandSetBlendFactorAndStencilRef;
-    blend.red = blend_factor[0];
-    blend.green = blend_factor[1];
-    blend.blue = blend_factor[2];
-    blend.alpha = blend_factor[3];
-    blend.stencil_ref = static_cast<uint8_t>(stencil_ref);
+    auto viewport_values_equal = [](const std::vector<WMTViewport> &lhs,
+                                    const std::vector<WMTViewport> &rhs) {
+      return lhs.size() == rhs.size() &&
+             (!lhs.size() ||
+              std::memcmp(lhs.data(), rhs.data(),
+                          lhs.size() * sizeof(WMTViewport)) == 0);
+    };
+    auto scissor_values_equal = [](const std::vector<WMTScissorRect> &lhs,
+                                   const std::vector<WMTScissorRect> &rhs) {
+      return lhs.size() == rhs.size() &&
+             (!lhs.size() ||
+              std::memcmp(lhs.data(), rhs.data(),
+                          lhs.size() * sizeof(WMTScissorRect)) == 0);
+    };
+    auto *render_encoder = enc.currentRenderEncoder();
+    auto &cache = render_encoder->dynamic_state_cache;
+    const auto stencil_ref_u8 = static_cast<uint8_t>(stencil_ref);
+    if (!cache.blend_valid || cache.blend_factor != blend_factor ||
+        cache.stencil_ref != stencil_ref_u8) {
+      auto &blend = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
+      blend.type = WMTRenderCommandSetBlendFactorAndStencilRef;
+      blend.red = blend_factor[0];
+      blend.green = blend_factor[1];
+      blend.blue = blend_factor[2];
+      blend.alpha = blend_factor[3];
+      blend.stencil_ref = stencil_ref_u8;
+      cache.blend_factor = blend_factor;
+      cache.stencil_ref = stencil_ref_u8;
+      cache.blend_valid = true;
+    }
 
-    auto &viewport_cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
-    viewport_cmd.type = WMTRenderCommandSetViewports;
-    auto *viewport_data = static_cast<WMTViewport *>(
-        enc.allocate_cpu_heap(sizeof(WMTViewport) * viewports.size(),
-                              alignof(WMTViewport)));
+    std::vector<WMTViewport> viewport_values;
+    viewport_values.resize(viewports.size());
     for (size_t i = 0; i < viewports.size(); i++) {
       const auto &viewport = viewports[i];
-      viewport_data[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
-                          viewport.Height, viewport.MinDepth,
-                          viewport.MaxDepth};
+      viewport_values[i] = {viewport.TopLeftX, viewport.TopLeftY,
+                            viewport.Width, viewport.Height,
+                            viewport.MinDepth, viewport.MaxDepth};
     }
-    viewport_cmd.viewports.set(viewport_data);
-    viewport_cmd.viewport_count = viewports.size();
+    if (!cache.viewports_valid ||
+        !viewport_values_equal(cache.viewports, viewport_values)) {
+      auto &viewport_cmd =
+          enc.encodeRenderCommand<wmtcmd_render_setviewports>();
+      viewport_cmd.type = WMTRenderCommandSetViewports;
+      auto *viewport_data = static_cast<WMTViewport *>(
+          enc.allocate_cpu_heap(sizeof(WMTViewport) * viewport_values.size(),
+                                alignof(WMTViewport)));
+      if (!viewport_values.empty()) {
+        std::memcpy(viewport_data, viewport_values.data(),
+                    sizeof(WMTViewport) * viewport_values.size());
+      }
+      viewport_cmd.viewports.set(viewport_data);
+      viewport_cmd.viewport_count = viewport_values.size();
+      cache.viewports = std::move(viewport_values);
+      cache.viewports_valid = true;
+    }
 
-    auto &scissor_cmd =
-        enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
-    scissor_cmd.type = WMTRenderCommandSetScissorRects;
-    auto *scissor_data = static_cast<WMTScissorRect *>(
-        enc.allocate_cpu_heap(sizeof(WMTScissorRect) * scissors.size(),
-                              alignof(WMTScissorRect)));
+    std::vector<WMTScissorRect> scissor_values;
+    scissor_values.resize(scissors.size());
     for (size_t i = 0; i < scissors.size(); i++) {
       const auto &rect = scissors[i];
-      scissor_data[i] = {uint32_t(std::max<LONG>(0, rect.left)),
-                         uint32_t(std::max<LONG>(0, rect.top)),
-                         uint32_t(std::max<LONG>(0, rect.right - rect.left)),
-                         uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
+      scissor_values[i] = {uint32_t(std::max<LONG>(0, rect.left)),
+                           uint32_t(std::max<LONG>(0, rect.top)),
+                           uint32_t(std::max<LONG>(0, rect.right - rect.left)),
+                           uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
     }
-    scissor_cmd.scissor_rects.set(scissor_data);
-    scissor_cmd.rect_count = scissors.size();
+    if (!cache.scissors_valid ||
+        !scissor_values_equal(cache.scissors, scissor_values)) {
+      auto &scissor_cmd =
+          enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
+      scissor_cmd.type = WMTRenderCommandSetScissorRects;
+      auto *scissor_data = static_cast<WMTScissorRect *>(
+          enc.allocate_cpu_heap(sizeof(WMTScissorRect) * scissor_values.size(),
+                                alignof(WMTScissorRect)));
+      if (!scissor_values.empty()) {
+        std::memcpy(scissor_data, scissor_values.data(),
+                    sizeof(WMTScissorRect) * scissor_values.size());
+      }
+      scissor_cmd.scissor_rects.set(scissor_data);
+      scissor_cmd.rect_count = scissor_values.size();
+      cache.scissors = std::move(scissor_values);
+      cache.scissors_valid = true;
+    }
   }
 
   static void EncodeRenderPipelineStateIfChanged(
@@ -11896,6 +12621,333 @@ private:
     set_pso.type = WMTRenderCommandSetPSO;
     set_pso.pso = metal_pso;
     render_encoder->last_pso = metal_pso;
+  }
+
+  struct ReplayDrawPacketCommon {
+    WMT::Reference<WMT::RenderPipelineState> metal_pso;
+    WMT::Reference<WMT::DepthStencilState> depth_stencil;
+    wmtcmd_render_setrasterizerstate rasterizer = {};
+    PipelineState *pipeline = nullptr;
+    GraphicsBindingSnapshot binding_snapshot;
+    uint64_t binding_generation = 0;
+    std::optional<WMTPrimitiveType> primitive;
+    std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
+    std::optional<uint32_t> control_point_count;
+    std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+    UINT stencil_ref = 0;
+    Rc<VisibilityResultQuery> visibility_query;
+    std::vector<D3D12_VIEWPORT> viewports;
+    std::vector<D3D12_RECT> scissors;
+    uint64_t max_object_threadgroups = 0;
+    uint32_t tess_threads_per_patch = 0;
+    uint32_t tess_num_output_control_point_element = 0;
+    bool use_geometry = false;
+    bool use_tessellation = false;
+  };
+
+  struct ReplayDrawInstancedPacket {
+    ReplayDrawPacketCommon common;
+    UINT vertex_start = 0;
+    UINT vertex_count = 0;
+    UINT instance_count = 0;
+    UINT base_instance = 0;
+  };
+
+  struct ReplayDrawIndexedInstancedPacket {
+    ReplayDrawPacketCommon common;
+    Rc<BufferAllocation> index_allocation;
+    WMTIndexType index_type = WMTIndexTypeUInt16;
+    UINT64 index_binding_offset = 0;
+    UINT64 index_offset = 0;
+    UINT index_count = 0;
+    UINT start_index = 0;
+    UINT instance_count = 0;
+    INT base_vertex = 0;
+    UINT base_instance = 0;
+  };
+
+  void EncodeReplayDrawCommonState(ArgumentEncodingContext &enc,
+                                   ReplayDrawPacketCommon &packet,
+                                   uint64_t &argbuf_offset) {
+    EncodeRenderPipelineStateIfChanged(enc, packet.metal_pso);
+    auto *render_encoder = enc.currentRenderEncoder();
+    auto &cache = render_encoder->dynamic_state_cache;
+    const auto stencil_ref_u8 = static_cast<uint8_t>(packet.stencil_ref);
+    if (packet.depth_stencil &&
+        (!cache.depth_stencil_valid ||
+         cache.depth_stencil.handle != packet.depth_stencil.handle ||
+         cache.stencil_ref != stencil_ref_u8)) {
+      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+      cmd.type = WMTRenderCommandSetDSSO;
+      cmd.dsso = packet.depth_stencil;
+      cmd.stencil_ref = stencil_ref_u8;
+      cache.depth_stencil = packet.depth_stencil;
+      cache.stencil_ref = stencil_ref_u8;
+      cache.depth_stencil_valid = true;
+    }
+    if (!cache.rasterizer_valid ||
+        std::memcmp(&cache.rasterizer, &packet.rasterizer,
+                    sizeof(packet.rasterizer)) != 0) {
+      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+      rs = packet.rasterizer;
+      cache.rasterizer = packet.rasterizer;
+      cache.rasterizer_valid = true;
+    }
+
+    auto &binding_cache = render_encoder->binding_state_cache;
+    const bool skip_binding_snapshot =
+        binding_cache.valid &&
+        binding_cache.graphics_generation == packet.binding_generation;
+    if (!skip_binding_snapshot) {
+      ApplyGraphicsBindingSnapshot(enc, packet.binding_snapshot,
+                                   *packet.pipeline, packet.use_geometry,
+                                   packet.use_tessellation, argbuf_offset);
+      binding_cache.graphics_generation = packet.binding_generation;
+      binding_cache.valid = true;
+    }
+    EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
+                             packet.blend_factor, packet.stencil_ref);
+  }
+
+  static Rc<VisibilityResultQuery> BeginReplayDrawVisibilityQuery(
+      ArgumentEncodingContext &enc, Rc<VisibilityResultQuery> &visibility_query) {
+    Rc<VisibilityResultQuery> active_visibility_query;
+    if (visibility_query) {
+      active_visibility_query = visibility_query;
+      enc.beginVisibilityResultQuery(std::move(visibility_query));
+      enc.bumpVisibilityResultOffset();
+    }
+    return active_visibility_query;
+  }
+
+  static void EndReplayDrawVisibilityQuery(
+      ArgumentEncodingContext &enc,
+      Rc<VisibilityResultQuery> &active_visibility_query) {
+    if (active_visibility_query) {
+      enc.endVisibilityResultQuery(std::move(active_visibility_query));
+      enc.bumpVisibilityResultOffset();
+    }
+  }
+
+  void EncodeReplayDrawInstancedPacket(ArgumentEncodingContext &enc,
+                                       ReplayDrawInstancedPacket &packet,
+                                       uint64_t &argbuf_offset) {
+    auto &common = packet.common;
+    EncodeReplayDrawCommonState(enc, common, argbuf_offset);
+
+    auto active_visibility_query =
+        BeginReplayDrawVisibilityQuery(enc, common.visibility_query);
+
+    if (common.use_tessellation) {
+      auto *render_encoder = enc.currentRenderEncoder();
+      render_encoder->use_tessellation = 1;
+      enc.tess_num_output_control_point_element =
+          common.tess_num_output_control_point_element;
+      enc.tess_threads_per_patch = common.tess_threads_per_patch;
+      if (!common.tess_threads_per_patch || !common.control_point_count) {
+        WARN("D3D12CommandQueue: tessellation draw skipped because tessellation metadata is invalid");
+        return;
+      }
+
+      const auto patch_count_per_instance =
+          packet.vertex_count / *common.control_point_count;
+      if (!patch_count_per_instance)
+        return;
+      const auto patch_per_group = 32u / common.tess_threads_per_patch;
+      if (!patch_per_group) {
+        WARN("D3D12CommandQueue: tessellation draw skipped because threads-per-patch is unsupported value=",
+             common.tess_threads_per_patch);
+        return;
+      }
+      const auto patch_per_mesh_instance =
+          (patch_count_per_instance - 1u) / patch_per_group + 1u;
+      if (uint64_t(patch_per_mesh_instance) * packet.instance_count >
+          common.max_object_threadgroups) {
+        WARN("D3D12CommandQueue: omitted tessellation draw because of too many object threadgroups patch_groups=",
+             patch_per_mesh_instance, " instance_count=", packet.instance_count);
+        return;
+      }
+
+      const auto draw_arguments_offset =
+          AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
+      auto *draw_argument =
+          enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+              draw_arguments_offset);
+      draw_argument->StartVertex = packet.vertex_start;
+      draw_argument->VertexCount = packet.vertex_count;
+      draw_argument->InstanceCount = packet.instance_count;
+      draw_argument->StartInstance = packet.base_instance;
+
+      enc.resolveRenderPassBarrier();
+      auto &draw =
+          enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
+      draw.type = WMTRenderCommandDXMTTessellationMeshDraw;
+      draw.draw_arguments_offset =
+          enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+      draw.instance_count = packet.instance_count;
+      draw.threads_per_patch = common.tess_threads_per_patch;
+      draw.patch_per_group = patch_per_group;
+      draw.patch_per_mesh_instance = patch_per_mesh_instance;
+    } else if (common.use_geometry) {
+      auto *render_encoder = enc.currentRenderEncoder();
+      render_encoder->use_geometry = 1;
+      const auto draw_arguments_offset =
+          AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
+      auto *draw_argument =
+          enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+              draw_arguments_offset);
+      draw_argument->StartVertex = packet.vertex_start;
+      draw_argument->VertexCount = packet.vertex_count;
+      draw_argument->InstanceCount = packet.instance_count;
+      draw_argument->StartInstance = packet.base_instance;
+
+      auto [vertex_per_warp, vertex_increment_per_warp] =
+          *common.geometry_counts;
+      const auto warp_count =
+          (packet.vertex_count - 1) / vertex_increment_per_warp + 1;
+      if (uint64_t(warp_count) * packet.instance_count >
+          common.max_object_threadgroups) {
+        WARN("D3D12CommandQueue: omitted geometry draw because of too many object threadgroups warp_count=",
+             warp_count, " instance_count=", packet.instance_count);
+      } else {
+        enc.resolveRenderPassBarrier();
+        auto &draw =
+            enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
+        draw.type = WMTRenderCommandDXMTGeometryDraw;
+        draw.draw_arguments_offset =
+            enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+        draw.instance_count = packet.instance_count;
+        draw.warp_count = warp_count;
+        draw.vertex_per_warp = vertex_per_warp;
+      }
+    } else {
+      enc.resolveRenderPassBarrier();
+      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+      draw.type = WMTRenderCommandDraw;
+      draw.primitive_type = *common.primitive;
+      draw.vertex_start = packet.vertex_start;
+      draw.vertex_count = packet.vertex_count;
+      draw.instance_count = packet.instance_count;
+      draw.base_instance = packet.base_instance;
+    }
+
+    EndReplayDrawVisibilityQuery(enc, active_visibility_query);
+  }
+
+  void EncodeReplayDrawIndexedInstancedPacket(
+      ArgumentEncodingContext &enc, ReplayDrawIndexedInstancedPacket &packet,
+      uint64_t &argbuf_offset) {
+    enc.retainAllocation(packet.index_allocation.ptr());
+
+    auto &common = packet.common;
+    EncodeReplayDrawCommonState(enc, common, argbuf_offset);
+
+    auto active_visibility_query =
+        BeginReplayDrawVisibilityQuery(enc, common.visibility_query);
+
+    if (common.use_tessellation) {
+      auto *render_encoder = enc.currentRenderEncoder();
+      render_encoder->use_tessellation = 1;
+      enc.tess_num_output_control_point_element =
+          common.tess_num_output_control_point_element;
+      enc.tess_threads_per_patch = common.tess_threads_per_patch;
+      if (!common.tess_threads_per_patch || !common.control_point_count) {
+        WARN("D3D12CommandQueue: tessellation indexed draw skipped because tessellation metadata is invalid");
+        return;
+      }
+
+      const auto patch_count_per_instance =
+          packet.index_count / *common.control_point_count;
+      if (!patch_count_per_instance)
+        return;
+      const auto patch_per_group = 32u / common.tess_threads_per_patch;
+      if (!patch_per_group) {
+        WARN("D3D12CommandQueue: tessellation indexed draw skipped because threads-per-patch is unsupported value=",
+             common.tess_threads_per_patch);
+        return;
+      }
+      const auto patch_per_mesh_instance =
+          (patch_count_per_instance - 1u) / patch_per_group + 1u;
+      if (uint64_t(patch_per_mesh_instance) * packet.instance_count >
+          common.max_object_threadgroups) {
+        WARN("D3D12CommandQueue: omitted tessellation indexed draw because of too many object threadgroups patch_groups=",
+             patch_per_mesh_instance, " instance_count=", packet.instance_count);
+        return;
+      }
+
+      const auto draw_arguments_offset = AllocateArgumentBuffer(
+          argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
+      auto *draw_argument =
+          enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+              draw_arguments_offset);
+      draw_argument->BaseVertex = packet.base_vertex;
+      draw_argument->IndexCount = packet.index_count;
+      draw_argument->StartIndex = packet.start_index;
+      draw_argument->InstanceCount = packet.instance_count;
+      draw_argument->StartInstance = packet.base_instance;
+
+      enc.resolveRenderPassBarrier();
+      auto &draw = enc.encodeRenderCommand<
+          wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
+      draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+      draw.draw_arguments_offset =
+          enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+      draw.index_buffer = packet.index_allocation->buffer();
+      draw.index_buffer_offset = packet.index_binding_offset;
+      draw.instance_count = packet.instance_count;
+      draw.threads_per_patch = common.tess_threads_per_patch;
+      draw.patch_per_group = patch_per_group;
+      draw.patch_per_mesh_instance = patch_per_mesh_instance;
+    } else if (common.use_geometry) {
+      auto *render_encoder = enc.currentRenderEncoder();
+      render_encoder->use_geometry = 1;
+      const auto draw_arguments_offset = AllocateArgumentBuffer(
+          argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
+      auto *draw_argument =
+          enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+              draw_arguments_offset);
+      draw_argument->BaseVertex = packet.base_vertex;
+      draw_argument->IndexCount = packet.index_count;
+      draw_argument->StartIndex = packet.start_index;
+      draw_argument->InstanceCount = packet.instance_count;
+      draw_argument->StartInstance = packet.base_instance;
+
+      auto [vertex_per_warp, vertex_increment_per_warp] =
+          *common.geometry_counts;
+      const auto warp_count =
+          (packet.index_count - 1) / vertex_increment_per_warp + 1;
+      if (uint64_t(warp_count) * packet.instance_count >
+          common.max_object_threadgroups) {
+        WARN("D3D12CommandQueue: omitted geometry indexed draw because of too many object threadgroups warp_count=",
+             warp_count, " instance_count=", packet.instance_count);
+      } else {
+        enc.resolveRenderPassBarrier();
+        auto &draw =
+            enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
+        draw.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+        draw.draw_arguments_offset =
+            enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+        draw.instance_count = packet.instance_count;
+        draw.warp_count = warp_count;
+        draw.vertex_per_warp = vertex_per_warp;
+        draw.index_buffer = packet.index_allocation->buffer();
+        draw.index_buffer_offset = packet.index_binding_offset;
+      }
+    } else {
+      enc.resolveRenderPassBarrier();
+      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
+      draw.type = WMTRenderCommandDrawIndexed;
+      draw.primitive_type = *common.primitive;
+      draw.index_type = packet.index_type;
+      draw.index_count = packet.index_count;
+      draw.index_buffer = packet.index_allocation->buffer();
+      draw.index_buffer_offset = packet.index_offset;
+      draw.instance_count = packet.instance_count;
+      draw.base_vertex = packet.base_vertex;
+      draw.base_instance = packet.base_instance;
+    }
+
+    EndReplayDrawVisibilityQuery(enc, active_visibility_query);
   }
 
   void ReplayDrawInstanced(CommandChunk *chunk, ReplayState &state,
@@ -11955,7 +13007,9 @@ private:
       if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
         return;
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
-      auto binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+      GraphicsBindingSnapshot binding_snapshot;
+      if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
+        binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
       DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
                         viewports, scissors, &record, nullptr, 0, 0);
     DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
@@ -11970,149 +13024,44 @@ private:
         ((metal->use_geometry || metal->use_tessellation)
              ? EstimateDrawArgumentBufferSize(false)
              : 0);
-    auto encode_draw =
-        [this, metal_pso, use_geometry = metal->use_geometry,
-         use_tessellation = metal->use_tessellation,
-         depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
-         tess_threads_per_patch = metal->tess_threads_per_patch,
-         tess_num_output_control_point_element =
-             metal->tess_num_output_control_point_element,
-         pipeline,
-         binding_snapshot = std::move(binding_snapshot), primitive,
-         geometry_counts, control_point_count,
-         blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
-         vertex_start = record.start_vertex_location,
-         vertex_count = record.vertex_count_per_instance,
-         instance_count = record.instance_count,
-         base_instance = record.start_instance_location,
-         visibility_query = std::move(visibility_query),
-         max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
-         viewports = std::move(viewports), scissors = std::move(scissors)](
-            ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
-      EncodeRenderPipelineStateIfChanged(enc, metal_pso);
-      if (depth_stencil) {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
-        cmd.type = WMTRenderCommandSetDSSO;
-        cmd.dsso = depth_stencil;
-        cmd.stencil_ref = static_cast<uint8_t>(stencil_ref);
-      }
-      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
-      rs = rasterizer;
+    ReplayDrawInstancedPacket packet = {};
+    packet.common.metal_pso = metal_pso;
+    packet.common.depth_stencil = metal->depth_stencil;
+    packet.common.rasterizer = metal->rasterizer;
+    packet.common.pipeline = pipeline;
+    packet.common.binding_snapshot = std::move(binding_snapshot);
+    packet.common.binding_generation = state.graphics_binding_generation;
+    packet.common.primitive = primitive;
+    packet.common.geometry_counts = geometry_counts;
+    packet.common.control_point_count = control_point_count;
+    packet.common.blend_factor = state.blend_factor;
+    packet.common.stencil_ref = state.stencil_ref;
+    packet.common.visibility_query = std::move(visibility_query);
+    packet.common.viewports = std::move(viewports);
+    packet.common.scissors = std::move(scissors);
+    packet.common.max_object_threadgroups =
+        device_->GetDXMTDevice().maxObjectThreadgroups();
+    packet.common.tess_threads_per_patch = metal->tess_threads_per_patch;
+    packet.common.tess_num_output_control_point_element =
+        metal->tess_num_output_control_point_element;
+    packet.common.use_geometry = metal->use_geometry;
+    packet.common.use_tessellation = metal->use_tessellation;
+    packet.vertex_start = record.start_vertex_location;
+    packet.vertex_count = record.vertex_count_per_instance;
+    packet.instance_count = record.instance_count;
+    packet.base_instance = record.start_instance_location;
 
-      ApplyGraphicsBindingSnapshot(enc, binding_snapshot, *pipeline,
-                                   use_geometry, use_tessellation,
-                                   argbuf_offset);
-      EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
-                               stencil_ref);
-
-      Rc<VisibilityResultQuery> active_visibility_query;
-      if (visibility_query) {
-        active_visibility_query = visibility_query;
-        enc.beginVisibilityResultQuery(std::move(visibility_query));
-        enc.bumpVisibilityResultOffset();
-      }
-
-      if (use_tessellation) {
-        auto *render_encoder = enc.currentRenderEncoder();
-        render_encoder->use_tessellation = 1;
-        enc.tess_num_output_control_point_element =
-            tess_num_output_control_point_element;
-        enc.tess_threads_per_patch = tess_threads_per_patch;
-        if (!tess_threads_per_patch || !control_point_count) {
-          WARN("D3D12CommandQueue: tessellation draw skipped because tessellation metadata is invalid");
-          return;
-        }
-
-        const auto patch_count_per_instance =
-            vertex_count / *control_point_count;
-        if (!patch_count_per_instance)
-          return;
-        const auto patch_per_group = 32u / tess_threads_per_patch;
-        if (!patch_per_group) {
-          WARN("D3D12CommandQueue: tessellation draw skipped because threads-per-patch is unsupported value=",
-               tess_threads_per_patch);
-          return;
-        }
-        const auto patch_per_mesh_instance =
-            (patch_count_per_instance - 1u) / patch_per_group + 1u;
-        if (uint64_t(patch_per_mesh_instance) * instance_count >
-            max_object_threadgroups) {
-          WARN("D3D12CommandQueue: omitted tessellation draw because of too many object threadgroups patch_groups=",
-               patch_per_mesh_instance, " instance_count=", instance_count);
-          return;
-        }
-
-        const auto draw_arguments_offset =
-            AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
-        auto *draw_argument =
-            enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
-                draw_arguments_offset);
-        draw_argument->StartVertex = vertex_start;
-        draw_argument->VertexCount = vertex_count;
-        draw_argument->InstanceCount = instance_count;
-        draw_argument->StartInstance = base_instance;
-
-        enc.resolveRenderPassBarrier();
-        auto &draw = enc.encodeRenderCommand<
-            wmtcmd_render_dxmt_tessellation_mesh_draw>();
-        draw.type = WMTRenderCommandDXMTTessellationMeshDraw;
-        draw.draw_arguments_offset =
-            enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-        draw.instance_count = instance_count;
-        draw.threads_per_patch = tess_threads_per_patch;
-        draw.patch_per_group = patch_per_group;
-        draw.patch_per_mesh_instance = patch_per_mesh_instance;
-      } else if (use_geometry) {
-        auto *render_encoder = enc.currentRenderEncoder();
-        render_encoder->use_geometry = 1;
-        const auto draw_arguments_offset =
-            AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
-        auto *draw_argument =
-            enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
-                draw_arguments_offset);
-        draw_argument->StartVertex = vertex_start;
-        draw_argument->VertexCount = vertex_count;
-        draw_argument->InstanceCount = instance_count;
-        draw_argument->StartInstance = base_instance;
-
-        auto [vertex_per_warp, vertex_increment_per_warp] = *geometry_counts;
-        const auto warp_count =
-            (vertex_count - 1) / vertex_increment_per_warp + 1;
-        if (uint64_t(warp_count) * instance_count >
-            max_object_threadgroups) {
-          WARN("D3D12CommandQueue: omitted geometry draw because of too many object threadgroups warp_count=",
-               warp_count, " instance_count=", instance_count);
-        } else {
-          enc.resolveRenderPassBarrier();
-          auto &draw =
-              enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-          draw.type = WMTRenderCommandDXMTGeometryDraw;
-          draw.draw_arguments_offset =
-              enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-          draw.instance_count = instance_count;
-          draw.warp_count = warp_count;
-          draw.vertex_per_warp = vertex_per_warp;
-        }
-      } else {
-        enc.resolveRenderPassBarrier();
-        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
-        draw.type = WMTRenderCommandDraw;
-        draw.primitive_type = *primitive;
-        draw.vertex_start = vertex_start;
-        draw.vertex_count = vertex_count;
-        draw.instance_count = instance_count;
-        draw.base_instance = base_instance;
-      }
-      if (active_visibility_query) {
-        enc.endVisibilityResultQuery(std::move(active_visibility_query));
-        enc.bumpVisibilityResultOffset();
-      }
+    auto encode_draw = [this, packet = std::move(packet)](
+                           ArgumentEncodingContext &enc,
+                           uint64_t &argbuf_offset) mutable {
+      EncodeReplayDrawInstancedPacket(enc, packet, argbuf_offset);
     };
 
     if (D3D12ReplayGraphicsBatchingEnabled()) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry, metal->use_tessellation);
+                               metal->use_geometry, metal->use_tessellation,
+                               ReplayGraphicsCommandKind::Draw);
       return;
     }
 
@@ -12228,7 +13177,9 @@ private:
         return;
       const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
-      auto binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+      GraphicsBindingSnapshot binding_snapshot;
+      if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
+        binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
       if (rb_draw)
         perDrawSubTimers().desc +=
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -12248,163 +13199,49 @@ private:
         ((metal->use_geometry || metal->use_tessellation)
              ? EstimateDrawArgumentBufferSize(true)
              : 0);
-    auto encode_draw =
-        [this, metal_pso, use_geometry = metal->use_geometry,
-         use_tessellation = metal->use_tessellation,
-         depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
-         tess_threads_per_patch = metal->tess_threads_per_patch,
-         tess_num_output_control_point_element =
-             metal->tess_num_output_control_point_element,
-         pipeline,
-         binding_snapshot = std::move(binding_snapshot), index_allocation,
-         primitive, geometry_counts, control_point_count, index_type,
-         index_binding_offset,
-         index_offset,
-         blend_factor = state.blend_factor,
-         stencil_ref = state.stencil_ref, viewports = std::move(viewports),
-         scissors = std::move(scissors),
-         index_count = record.index_count_per_instance,
-         start_index = record.start_index_location,
-         instance_count = record.instance_count,
-         base_vertex = record.base_vertex_location,
-         base_instance = record.start_instance_location,
-         max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
-         visibility_query = std::move(visibility_query)](
-            ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
-      enc.retainAllocation(index_allocation.ptr());
-      EncodeRenderPipelineStateIfChanged(enc, metal_pso);
-      if (depth_stencil) {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
-        cmd.type = WMTRenderCommandSetDSSO;
-        cmd.dsso = depth_stencil;
-        cmd.stencil_ref = static_cast<uint8_t>(stencil_ref);
-      }
-      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
-      rs = rasterizer;
+    ReplayDrawIndexedInstancedPacket packet = {};
+    packet.common.metal_pso = metal_pso;
+    packet.common.depth_stencil = metal->depth_stencil;
+    packet.common.rasterizer = metal->rasterizer;
+    packet.common.pipeline = pipeline;
+    packet.common.binding_snapshot = std::move(binding_snapshot);
+    packet.common.binding_generation = state.graphics_binding_generation;
+    packet.common.primitive = primitive;
+    packet.common.geometry_counts = geometry_counts;
+    packet.common.control_point_count = control_point_count;
+    packet.common.blend_factor = state.blend_factor;
+    packet.common.stencil_ref = state.stencil_ref;
+    packet.common.visibility_query = std::move(visibility_query);
+    packet.common.viewports = std::move(viewports);
+    packet.common.scissors = std::move(scissors);
+    packet.common.max_object_threadgroups =
+        device_->GetDXMTDevice().maxObjectThreadgroups();
+    packet.common.tess_threads_per_patch = metal->tess_threads_per_patch;
+    packet.common.tess_num_output_control_point_element =
+        metal->tess_num_output_control_point_element;
+    packet.common.use_geometry = metal->use_geometry;
+    packet.common.use_tessellation = metal->use_tessellation;
+    packet.index_allocation = index_allocation;
+    packet.index_type = index_type;
+    packet.index_binding_offset = index_binding_offset;
+    packet.index_offset = index_offset;
+    packet.index_count = record.index_count_per_instance;
+    packet.start_index = record.start_index_location;
+    packet.instance_count = record.instance_count;
+    packet.base_vertex = record.base_vertex_location;
+    packet.base_instance = record.start_instance_location;
 
-      ApplyGraphicsBindingSnapshot(enc, binding_snapshot, *pipeline,
-                                   use_geometry, use_tessellation,
-                                   argbuf_offset);
-      EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
-                               stencil_ref);
-
-      Rc<VisibilityResultQuery> active_visibility_query;
-      if (visibility_query) {
-        active_visibility_query = visibility_query;
-        enc.beginVisibilityResultQuery(std::move(visibility_query));
-        enc.bumpVisibilityResultOffset();
-      }
-
-      if (use_tessellation) {
-        auto *render_encoder = enc.currentRenderEncoder();
-        render_encoder->use_tessellation = 1;
-        enc.tess_num_output_control_point_element =
-            tess_num_output_control_point_element;
-        enc.tess_threads_per_patch = tess_threads_per_patch;
-        if (!tess_threads_per_patch || !control_point_count) {
-          WARN("D3D12CommandQueue: tessellation indexed draw skipped because tessellation metadata is invalid");
-          return;
-        }
-
-        const auto patch_count_per_instance =
-            index_count / *control_point_count;
-        if (!patch_count_per_instance)
-          return;
-        const auto patch_per_group = 32u / tess_threads_per_patch;
-        if (!patch_per_group) {
-          WARN("D3D12CommandQueue: tessellation indexed draw skipped because threads-per-patch is unsupported value=",
-               tess_threads_per_patch);
-          return;
-        }
-        const auto patch_per_mesh_instance =
-            (patch_count_per_instance - 1u) / patch_per_group + 1u;
-        if (uint64_t(patch_per_mesh_instance) * instance_count >
-            max_object_threadgroups) {
-          WARN("D3D12CommandQueue: omitted tessellation indexed draw because of too many object threadgroups patch_groups=",
-               patch_per_mesh_instance, " instance_count=", instance_count);
-          return;
-        }
-
-        const auto draw_arguments_offset = AllocateArgumentBuffer(
-            argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
-        auto *draw_argument =
-            enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
-                draw_arguments_offset);
-        draw_argument->BaseVertex = base_vertex;
-        draw_argument->IndexCount = index_count;
-        draw_argument->StartIndex = start_index;
-        draw_argument->InstanceCount = instance_count;
-        draw_argument->StartInstance = base_instance;
-
-        enc.resolveRenderPassBarrier();
-        auto &draw = enc.encodeRenderCommand<
-            wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-        draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
-        draw.draw_arguments_offset =
-            enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-        draw.index_buffer = index_allocation->buffer();
-        draw.index_buffer_offset = index_binding_offset;
-        draw.instance_count = instance_count;
-        draw.threads_per_patch = tess_threads_per_patch;
-        draw.patch_per_group = patch_per_group;
-        draw.patch_per_mesh_instance = patch_per_mesh_instance;
-      } else if (use_geometry) {
-        auto *render_encoder = enc.currentRenderEncoder();
-        render_encoder->use_geometry = 1;
-        const auto draw_arguments_offset = AllocateArgumentBuffer(
-            argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
-        auto *draw_argument =
-            enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
-                draw_arguments_offset);
-        draw_argument->BaseVertex = base_vertex;
-        draw_argument->IndexCount = index_count;
-        draw_argument->StartIndex = start_index;
-        draw_argument->InstanceCount = instance_count;
-        draw_argument->StartInstance = base_instance;
-
-        auto [vertex_per_warp, vertex_increment_per_warp] = *geometry_counts;
-        const auto warp_count =
-            (index_count - 1) / vertex_increment_per_warp + 1;
-        if (uint64_t(warp_count) * instance_count >
-            max_object_threadgroups) {
-          WARN("D3D12CommandQueue: omitted geometry indexed draw because of too many object threadgroups warp_count=",
-               warp_count, " instance_count=", instance_count);
-        } else {
-          enc.resolveRenderPassBarrier();
-          auto &draw = enc.encodeRenderCommand<
-              wmtcmd_render_dxmt_geometry_draw_indexed>();
-          draw.type = WMTRenderCommandDXMTGeometryDrawIndexed;
-          draw.draw_arguments_offset =
-              enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-          draw.instance_count = instance_count;
-          draw.warp_count = warp_count;
-          draw.vertex_per_warp = vertex_per_warp;
-          draw.index_buffer = index_allocation->buffer();
-          draw.index_buffer_offset = index_binding_offset;
-        }
-      } else {
-        enc.resolveRenderPassBarrier();
-        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
-        draw.type = WMTRenderCommandDrawIndexed;
-        draw.primitive_type = *primitive;
-        draw.index_type = index_type;
-        draw.index_count = index_count;
-        draw.index_buffer = index_allocation->buffer();
-        draw.index_buffer_offset = index_offset;
-        draw.instance_count = instance_count;
-        draw.base_vertex = base_vertex;
-        draw.base_instance = base_instance;
-      }
-      if (active_visibility_query) {
-        enc.endVisibilityResultQuery(std::move(active_visibility_query));
-        enc.bumpVisibilityResultOffset();
-      }
+    auto encode_draw = [this, packet = std::move(packet)](
+                           ArgumentEncodingContext &enc,
+                           uint64_t &argbuf_offset) mutable {
+      EncodeReplayDrawIndexedInstancedPacket(enc, packet, argbuf_offset);
     };
 
     if (D3D12ReplayGraphicsBatchingEnabled()) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
                                argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry, metal->use_tessellation);
+                               metal->use_geometry, metal->use_tessellation,
+                               ReplayGraphicsCommandKind::DrawIndexed);
       return;
     }
 
