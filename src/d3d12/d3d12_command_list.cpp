@@ -7,6 +7,7 @@
 #include "d3d12_resource.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -1697,6 +1698,12 @@ private:
   void AddRecord(T &&payload) {
     if (closed_)
       return;
+    // PERF DIAG (otherWall split): time the record phase on the calling thread.
+    // ScopedFrameTimer is a no-op unless this thread has frame stats bound (the
+    // present thread), so a non-zero CommandListRecord total ALSO proves
+    // recording runs on the present thread (i.e. inside frame_wall / otherWall).
+    dxmt::perf::ScopedFrameTimer perf_timer(
+        dxmt::perf::FrameTimeBucket::CommandListRecord);
     if (g_current_command_record_d3d_sequence != 0 &&
         std::getenv("DXMT_APITRACE_DIAG") &&
         g_apitrace_record_diag_log_count.fetch_add(1, std::memory_order_relaxed) < 128) {

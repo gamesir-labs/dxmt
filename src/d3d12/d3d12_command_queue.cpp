@@ -1232,6 +1232,30 @@ static bool DescAccessVerify() {
   static const bool on = env::getEnvVar("DXMT_DESCACCESS_VERIFY") == "1";
   return on;
 }
+// Stage-2 passthrough barrier (default OFF). When on, the per-draw graphics
+// descriptor-access hazard pass (RecordPipelineDescriptorAccess) is skipped
+// entirely — DXMT trusts the app's explicit ResourceBarriers for cross-encoder
+// sync, and stage-B binding `access→track` (per-allocation GenericAccessTracker)
+// drives the Metal fence/residency regardless. This roots-out descAccess (the
+// miss-path full hazard, not just a cache skip) AND removes the per-draw global
+// D3D12-state dependency that serializes replay — resources map / steady_read /
+// epoch then only mutate at app-barrier (pass boundary) points, leaving in-pass
+// draws state-independent and parallelizable. Correctness rests on FH4's
+// barriers being passthrough-complete (measured: auto-inferred mismatch/app =
+// 1.8%); the residual gaps (index buffer & direct root CBV are untracked at
+// stage B; UNKNOWN/split app barriers read the now-frozen state machine; in-pass
+// UAV/RTV feedback memory-barrier precision) must be covered by app barriers and
+// confirmed visually. DXMT_PASSTHROUGH_BARRIER_VERIFY keeps running the full
+// hazard pass without skipping (A/B failsafe).
+static bool PassthroughBarrierEnabled() {
+  static const bool on = env::getEnvVar("DXMT_PASSTHROUGH_BARRIER") == "1";
+  return on;
+}
+static bool PassthroughBarrierVerify() {
+  static const bool on =
+      env::getEnvVar("DXMT_PASSTHROUGH_BARRIER_VERIFY") == "1";
+  return on;
+}
 
 static Resource *
 GetResource(ID3D12Resource *resource) {
@@ -6063,7 +6087,16 @@ private:
              flushBarrierCalls = 0, emitTsMarkersCalls = 0;
     uint64_t flushPassBatchesCalls = 0, flushPassBatchesEmpty = 0;
     uint64_t resAccessCalls = 0, resAccessSteadyNoop = 0;
-    uint64_t descAccessHits = 0, descAccessMiss = 0; };
+    uint64_t descAccessHits = 0, descAccessMiss = 0;
+    // Stage-2 (passthrough-barrier) feasibility probe: sync points DXMT
+    // AUTO-INFERS (mismatchBarriers) vs barrier transitions the app EXPLICITLY
+    // declares (appBarrierTransitions). auto≈0 relative to explicit ⇒ FH4's
+    // barriers are passthrough-complete ⇒ stage-2 full parallelism reachable.
+    uint64_t mismatchBarriers = 0, appBarrierTransitions = 0;
+    // Stage-2 passthrough: per-draw graphics hazard passes skipped wholesale
+    // (DXMT_PASSTHROUGH_BARRIER=1). Pairs with descAccessHits/Miss — when
+    // passthrough is on, graphics draws land here instead of hit/miss.
+    uint64_t descAccessPassthrough = 0; };
   static PerDrawSubTimers &perDrawSubTimers() {
     static thread_local PerDrawSubTimers t;
     return t;
@@ -6077,10 +6110,16 @@ private:
   // thread blocking on the full chunk ring). us accumulators are reset per
   // record by ReplayRecord and read back after the record completes.
   struct StallProbe {
-    uint64_t psoSelectUs = 0;   // GetMetalGraphicsState + SelectGraphicsPipelineState
-    uint64_t descAccessUs = 0;  // RecordGraphicsPipelineResourceAccess
-    uint64_t attachUs = 0;      // BuildRenderPassAttachments
-    uint64_t emitUs = 0;        // FlushPassBatches/EmitSingleGraphicsPass (+ chunk-ring backpressure)
+    uint64_t psoSelectUs = 0;    // GetMetalGraphicsState (PSO compile-on-demand)
+    uint64_t getPipelineUs = 0;  // GetPipelineState downcast
+    uint64_t selectPsoUs = 0;    // SelectGraphicsPipelineState (topology/index variant)
+    uint64_t descAccessUs = 0;   // RecordGraphicsPipelineResourceAccess (hazard)
+    uint64_t attachUs = 0;       // BuildRenderPassAttachments
+    uint64_t bindSnapUs = 0;     // GraphicsPassBatchNeedsBindingSnapshot + Capture
+    uint64_t estimateUs = 0;     // EstimateGraphicsArgumentBufferSize
+    uint64_t packetUs = 0;       // packet build + encode-closure capture (struct moves)
+    uint64_t queueUs = 0;        // QueueGraphicsPassCommand / EmitSingleGraphicsPass
+    uint64_t emitUs = 0;         // FlushPassBatches (chunk-ring back-pressure)
     void reset() { *this = {}; }
   };
   static StallProbe &stallProbe() {
@@ -6136,6 +6175,37 @@ private:
     return h;
   }
 
+  // Intra-pass parallel (DXMT_INTRAPASS_PARALLEL): a record that stays inside an
+  // active graphics render pass — a draw or a graphics state-setter — and does
+  // NOT force a FlushPassBatches. A maximal run of these between two flush points
+  // (barrier / clear / copy / dispatch / resolve / render-target change / query)
+  // is the unit replayable by parallel workers: within it the resource state is
+  // frozen (barrier-free) so per-draw hazard records are read-mostly. RootSig /
+  // descriptor-table / root-constant setters stay in the run (they only mutate
+  // per-list binding state, which each worker clones); RenderTargets does NOT
+  // (it flushes the batch and starts a new pass).
+  static bool IsGraphicsPassRunRecord(const CommandRecord &record) {
+    return std::holds_alternative<DrawInstancedRecord>(record.payload) ||
+           std::holds_alternative<DrawIndexedInstancedRecord>(record.payload) ||
+           std::holds_alternative<PipelineStateRecord>(record.payload) ||
+           std::holds_alternative<ViewportRecord>(record.payload) ||
+           std::holds_alternative<ScissorRecord>(record.payload) ||
+           std::holds_alternative<BlendFactorRecord>(record.payload) ||
+           std::holds_alternative<StencilRefRecord>(record.payload) ||
+           std::holds_alternative<PrimitiveTopologyRecord>(record.payload) ||
+           std::holds_alternative<VertexBuffersRecord>(record.payload) ||
+           std::holds_alternative<IndexBufferRecord>(record.payload) ||
+           std::holds_alternative<RootSignatureRecord>(record.payload) ||
+           std::holds_alternative<DescriptorHeapsRecord>(record.payload) ||
+           std::holds_alternative<RootDescriptorTableRecord>(record.payload) ||
+           std::holds_alternative<RootConstantsRecord>(record.payload) ||
+           std::holds_alternative<RootDescriptorRecord>(record.payload);
+  }
+  static bool IntraPassParallelEnabled() {
+    static const bool on = env::getEnvVar("DXMT_INTRAPASS_PARALLEL") == "1";
+    return on;
+  }
+
   void ReplayCommandRecords(const std::vector<CommandRecord> &records,
                             std::vector<Com<ID3D12Resource>> &touched_resources,
                             std::unordered_set<ID3D12Resource *> &touched_resources_set) {
@@ -6167,7 +6237,16 @@ private:
     // PERF DIAG: per-record-type cost accumulation (cleared & dumped per slow
     // replay below) to find WHICH D3D12 command type dominates the recordLoop.
     std::unordered_map<const char *, std::pair<uint64_t, uint64_t>> rb_by_type;
-    for (const auto &record : records) {
+    // PERF DIAG: per-list-replay stall sub-phase aggregation (needs DXMT_DIAG_STALL
+    // so the StallScope timers fire). Sums EVERY record's psoSelect/descAccess/
+    // attach/emit + per-record total, so the breakdown line below shows what
+    // dominates recordLoop in the heavy scene and — crucially — how much is
+    // stallUnaccounted: the ~85% that is none of those named phases (SelectPSO +
+    // binding snapshot + packet build + GetResource, or a pure first-use stall).
+    // Serial replay (intra-pass gate off) → no lock needed.
+    StallProbe rb_stall_accum = {};
+    uint64_t rb_stall_total_us = 0;
+    auto replay_one = [&](const CommandRecord &record) {
       if (record.d3d_sequence != 0) {
         dxmt::apitrace::set_current_d3d_sequence(record.d3d_sequence);
       }
@@ -6195,6 +6274,19 @@ private:
         if (stall_diag) {
           const auto rec_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                   clock::now() - stall_t0).count();
+          const auto &p = stallProbe();
+          // Aggregate EVERY record (not only slow ones) for the breakdown line.
+          rb_stall_accum.getPipelineUs += p.getPipelineUs;
+          rb_stall_accum.psoSelectUs += p.psoSelectUs;
+          rb_stall_accum.selectPsoUs += p.selectPsoUs;
+          rb_stall_accum.descAccessUs += p.descAccessUs;
+          rb_stall_accum.attachUs += p.attachUs;
+          rb_stall_accum.bindSnapUs += p.bindSnapUs;
+          rb_stall_accum.estimateUs += p.estimateUs;
+          rb_stall_accum.packetUs += p.packetUs;
+          rb_stall_accum.queueUs += p.queueUs;
+          rb_stall_accum.emitUs += p.emitUs;
+          rb_stall_total_us += rec_us;
           // Only slow records are interesting; threshold env-overridable.
           static const uint64_t thresh = []() {
             auto v = env::getEnvVar("DXMT_DIAG_STALL_US");
@@ -6202,18 +6294,25 @@ private:
             return n ? n : 500;
           }();
           if (uint64_t(rec_us) >= thresh) {
-            const auto &p = stallProbe();
-            const uint64_t accounted = p.psoSelectUs + p.descAccessUs +
-                                       p.attachUs + p.emitUs;
+            const uint64_t accounted =
+                p.getPipelineUs + p.psoSelectUs + p.selectPsoUs +
+                p.descAccessUs + p.attachUs + p.bindSnapUs + p.estimateUs +
+                p.packetUs + p.queueUs + p.emitUs;
             static std::atomic<uint32_t> stall_log_count = 0;
             if (stall_log_count.fetch_add(1, std::memory_order_relaxed) < 4000)
               WARN_FILE_ONLY("DXMT stall record:"
                    " kind=", typeid(payload).name(),
                    " seq=", record.d3d_sequence,
                    " totalUs=", rec_us,
+                   " getPipelineUs=", p.getPipelineUs,
                    " psoSelectUs=", p.psoSelectUs,
+                   " selectPsoUs=", p.selectPsoUs,
                    " descAccessUs=", p.descAccessUs,
                    " attachUs=", p.attachUs,
+                   " bindSnapUs=", p.bindSnapUs,
+                   " estimateUs=", p.estimateUs,
+                   " packetUs=", p.packetUs,
+                   " queueUs=", p.queueUs,
                    " emitUs=", p.emitUs,
                    " unaccountedUs=", (uint64_t(rec_us) > accounted ? uint64_t(rec_us) - accounted : 0));
           }
@@ -6229,6 +6328,25 @@ private:
       }, record.payload);
       chunk = queue.CurrentChunk();
       record_index++;
+    };
+    // SUBSTEP 1b (intra-pass parallel scaffold): replay a maximal graphics-pass
+    // run as a unit. Still SERIAL here — behavior is identical to the old
+    // per-record loop (gate on or off). SUBSTEP 2 will hand each run to parallel
+    // workers; this step only establishes the run boundary + dispatch shape.
+    for (UINT i = 0; i < records.size();) {
+      if (IntraPassParallelEnabled() && IsGraphicsPassRunRecord(records[i])) {
+        UINT j = i;
+        while (j < records.size() && IsGraphicsPassRunRecord(records[j]))
+          ++j;
+        if (j - i >= 8) {
+          for (UINT k = i; k < j; ++k)
+            replay_one(records[k]);
+          i = j;
+          continue;
+        }
+      }
+      replay_one(records[i]);
+      ++i;
     }
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: replay records flush begin"
@@ -6273,6 +6391,32 @@ private:
              " flushPassUs=", us(rb_t2 - rb_t1),
              " timestampResolveUs=", us(rb_t3 - rb_t2),
              " cpuQueryResolveUs=", us(rb_t4 - rb_t3),
+             // recordLoop sub-phase split (needs DXMT_DIAG_STALL). stallUnaccounted
+             // = recordLoop time that is none of pso/desc/attach/emit — the
+             // suspected ~85% (SelectPSO + binding snapshot + packet build /
+             // GetResource, or a pure first-use stall). If stallUnaccounted or
+             // stallEmit dominates, recordLoop-CPU optimization (parallel/cut-cost)
+             // is NOT the lever; emit dominance ⇒ encode-thread back-pressure.
+             " stallTotalUs=", rb_stall_total_us,
+             " stallGetPipelineUs=", rb_stall_accum.getPipelineUs,
+             " stallPsoSelectUs=", rb_stall_accum.psoSelectUs,
+             " stallSelectPsoUs=", rb_stall_accum.selectPsoUs,
+             " stallDescAccessUs=", rb_stall_accum.descAccessUs,
+             " stallAttachUs=", rb_stall_accum.attachUs,
+             " stallBindSnapUs=", rb_stall_accum.bindSnapUs,
+             " stallEstimateUs=", rb_stall_accum.estimateUs,
+             " stallPacketUs=", rb_stall_accum.packetUs,
+             " stallQueueUs=", rb_stall_accum.queueUs,
+             " stallEmitUs=", rb_stall_accum.emitUs,
+             " stallUnaccountedUs=", ([&] {
+               const uint64_t acc =
+                   rb_stall_accum.getPipelineUs + rb_stall_accum.psoSelectUs +
+                   rb_stall_accum.selectPsoUs + rb_stall_accum.descAccessUs +
+                   rb_stall_accum.attachUs + rb_stall_accum.bindSnapUs +
+                   rb_stall_accum.estimateUs + rb_stall_accum.packetUs +
+                   rb_stall_accum.queueUs + rb_stall_accum.emitUs;
+               return rb_stall_total_us > acc ? rb_stall_total_us - acc : 0;
+             }()),
              " drawCount=", perDrawSubTimers().drawCount,
              " psoRootUnchanged=", perDrawSubTimers().psoRootUnchanged,
              " fullBindUnchanged=", perDrawSubTimers().fullBindUnchanged,
@@ -6297,6 +6441,9 @@ private:
              " resAccessSteadyNoop=", perDrawSubTimers().resAccessSteadyNoop,
              " descAccessHits=", perDrawSubTimers().descAccessHits,
              " descAccessMiss=", perDrawSubTimers().descAccessMiss,
+             " descAccessPassthrough=", perDrawSubTimers().descAccessPassthrough,
+             " mismatchBarriers=", perDrawSubTimers().mismatchBarriers,
+             " appBarrierTransitions=", perDrawSubTimers().appBarrierTransitions,
              " getResourceCasts=", replayRttiCounters().getResource,
              " getPipelineCasts=", replayRttiCounters().getPipeline,
              " topTypes=", top);
@@ -6450,6 +6597,15 @@ private:
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
+      // This is the REAL app-barrier replay entry (ReplayResourceBarrier is a
+      // separate path). An app-declared barrier changes resource state, so it
+      // must invalidate the descAccess cache — otherwise a later same-binding
+      // draw could wrongly reuse a stale "frozen state" hazard result.
+      state.access_epoch++;
+      // Stage-2 probe: count app-DECLARED barrier transitions here (vs the
+      // auto-inferred mismatchBarriers) to gauge passthrough-completeness.
+      if (ReplayBreakdownEnabled())
+        perDrawSubTimers().appBarrierTransitions += record.barriers.size();
       auto batch = BuildResourceBarrierBatch(state, record);
       if (batch.entries.empty() && !batch.needs_separator)
         return;
@@ -6601,6 +6757,10 @@ private:
     auto batch = BuildResourceBarrierBatch(state, record);
     // Explicit barrier changes resource state — invalidate the descAccess cache.
     state.access_epoch++;
+    // Stage-2 probe: count app-DECLARED barrier transitions (vs auto-inferred
+    // mismatchBarriers) to gauge whether FH4's barriers are passthrough-complete.
+    if (ReplayBreakdownEnabled())
+      perDrawSubTimers().appBarrierTransitions += record.barriers.size();
     QueueResourceAccessBarrierBatch(state, std::move(batch));
   }
 
@@ -7137,6 +7297,9 @@ private:
       // the descAccess-cache epoch so a later same-binding draw re-records the
       // hazard instead of wrongly reusing a stale "frozen state" result.
       state.access_epoch++;
+      // Stage-2 probe: a sync point DXMT auto-inferred (not app-declared).
+      if (rb_su)
+        perDrawSubTimers().mismatchBarriers++;
       // Some reflected uses can observe a read/write hazard before DXMT's
       // replay state sees the app's later transition. Keep the D3D12 state
       // unchanged, but make Metal visibility safe for the actual access.
@@ -9412,6 +9575,17 @@ private:
                                              ReplayState &state,
                                              PipelineState &pipeline,
                                              bool compute) {
+    // Stage-2 passthrough: skip the entire per-draw graphics hazard pass and
+    // trust app barriers (+ stage-B binding access drives Metal fence/residency
+    // either way). Equivalent to a 100% descAccess-cache hit extended to miss
+    // paths. Compute keeps the hazard pass — few passes/frame (not the per-draw
+    // bottleneck) and its UAV write→read hazards are more load-bearing. VERIFY
+    // falls through to run the full pass without skipping (A/B failsafe).
+    if (PassthroughBarrierEnabled() && !compute && !PassthroughBarrierVerify()) {
+      if (ReplayBreakdownEnabled())
+        perDrawSubTimers().descAccessPassthrough++;
+      return;
+    }
     auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
                                           : state.graphics_root_signature.ptr());
     if (!root)
@@ -12957,7 +13131,10 @@ private:
     if (!PredicationAllows(chunk, state))
       return;
 
-    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    auto *pipeline = [&] {
+      StallScope _s(StallDiagEnabled(), &stallProbe().getPipelineUs);
+      return GetPipelineState(state.pipeline_state.ptr());
+    }();
     if (!pipeline) {
       WARN("D3D12CommandQueue: draw skipped without graphics pipeline state");
       return;
@@ -12969,7 +13146,10 @@ private:
       return;
     }
 
-    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    const auto metal_pso = [&] {
+      StallScope _s(StallDiagEnabled(), &stallProbe().selectPsoUs);
+      return SelectGraphicsPipelineState(*metal, state.topology);
+    }();
     if (!metal_pso) {
       WARN("D3D12CommandQueue: draw skipped because selected Metal graphics PSO is unavailable");
       return;
@@ -13008,8 +13188,11 @@ private:
         return;
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
       GraphicsBindingSnapshot binding_snapshot;
-      if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
-        binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+      {
+        StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
+        if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
+          binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+      }
       DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
                         viewports, scissors, &record, nullptr, 0, 0);
     DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
@@ -13018,12 +13201,15 @@ private:
     auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
         chunk, "draw", pipeline->GetShaderCacheKey(),
         record.vertex_count_per_instance, 0, record.instance_count);
-    const auto argument_buffer_size =
-        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
-                                           metal->use_tessellation) +
-        ((metal->use_geometry || metal->use_tessellation)
-             ? EstimateDrawArgumentBufferSize(false)
-             : 0);
+    const auto argument_buffer_size = [&] {
+      StallScope _s(StallDiagEnabled(), &stallProbe().estimateUs);
+      return EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
+                                                metal->use_tessellation) +
+             ((metal->use_geometry || metal->use_tessellation)
+                  ? EstimateDrawArgumentBufferSize(false)
+                  : 0);
+    }();
+    const auto _pkt_t0 = StallDiagEnabled() ? clock::now() : clock::time_point{};
     ReplayDrawInstancedPacket packet = {};
     packet.common.metal_pso = metal_pso;
     packet.common.depth_stencil = metal->depth_stencil;
@@ -13056,20 +13242,27 @@ private:
                            uint64_t &argbuf_offset) mutable {
       EncodeReplayDrawInstancedPacket(enc, packet, argbuf_offset);
     };
+    if (StallDiagEnabled())
+      stallProbe().packetUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - _pkt_t0).count();
 
-    if (D3D12ReplayGraphicsBatchingEnabled()) {
-      QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                               argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry, metal->use_tessellation,
-                               ReplayGraphicsCommandKind::Draw);
-      return;
+    {
+      StallScope _q(StallDiagEnabled(), &stallProbe().queueUs);
+      if (D3D12ReplayGraphicsBatchingEnabled()) {
+        QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                                 argument_buffer_size, std::move(encode_draw),
+                                 metal->use_geometry, metal->use_tessellation,
+                                 ReplayGraphicsCommandKind::Draw);
+        return;
+      }
+
+      FlushPassBatches(chunk, state);
+      EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
+                             dxmt::apitrace::current_d3d_sequence(),
+                             std::move(encode_draw), metal->use_geometry,
+                             metal->use_tessellation);
     }
-
-    FlushPassBatches(chunk, state);
-    EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
-                           dxmt::apitrace::current_d3d_sequence(),
-                           std::move(encode_draw), metal->use_geometry,
-                           metal->use_tessellation);
   }
 
   void ReplayDrawIndexedInstanced(CommandChunk *chunk, ReplayState &state,
@@ -13080,7 +13273,10 @@ private:
     if (!PredicationAllows(chunk, state))
       return;
 
-    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    auto *pipeline = [&] {
+      StallScope _s(StallDiagEnabled(), &stallProbe().getPipelineUs);
+      return GetPipelineState(state.pipeline_state.ptr());
+    }();
     if (!pipeline) {
       WARN("D3D12CommandQueue: indexed draw skipped without graphics pipeline state");
       return;
@@ -13106,8 +13302,11 @@ private:
     }
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
-    const auto metal_pso = SelectGraphicsPipelineState(
-        *metal, state.topology, state.index_buffer->Format);
+    const auto metal_pso = [&] {
+      StallScope _s(StallDiagEnabled(), &stallProbe().selectPsoUs);
+      return SelectGraphicsPipelineState(*metal, state.topology,
+                                         state.index_buffer->Format);
+    }();
     if (!metal_pso) {
       WARN("D3D12CommandQueue: indexed draw skipped because selected Metal graphics PSO is unavailable");
       return;
@@ -13178,8 +13377,11 @@ private:
       const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
       GraphicsBindingSnapshot binding_snapshot;
-      if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
-        binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+      {
+        StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
+        if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
+          binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+      }
       if (rb_draw)
         perDrawSubTimers().desc +=
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -13193,12 +13395,15 @@ private:
     auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
         chunk, "indexed", pipeline->GetShaderCacheKey(), 0,
         record.index_count_per_instance, record.instance_count);
-    const auto argument_buffer_size =
-        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
-                                           metal->use_tessellation) +
-        ((metal->use_geometry || metal->use_tessellation)
-             ? EstimateDrawArgumentBufferSize(true)
-             : 0);
+    const auto argument_buffer_size = [&] {
+      StallScope _s(StallDiagEnabled(), &stallProbe().estimateUs);
+      return EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry,
+                                                metal->use_tessellation) +
+             ((metal->use_geometry || metal->use_tessellation)
+                  ? EstimateDrawArgumentBufferSize(true)
+                  : 0);
+    }();
+    const auto _pkt_t0 = StallDiagEnabled() ? clock::now() : clock::time_point{};
     ReplayDrawIndexedInstancedPacket packet = {};
     packet.common.metal_pso = metal_pso;
     packet.common.depth_stencil = metal->depth_stencil;
@@ -13236,20 +13441,27 @@ private:
                            uint64_t &argbuf_offset) mutable {
       EncodeReplayDrawIndexedInstancedPacket(enc, packet, argbuf_offset);
     };
+    if (StallDiagEnabled())
+      stallProbe().packetUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - _pkt_t0).count();
 
-    if (D3D12ReplayGraphicsBatchingEnabled()) {
-      QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                               argument_buffer_size, std::move(encode_draw),
-                               metal->use_geometry, metal->use_tessellation,
-                               ReplayGraphicsCommandKind::DrawIndexed);
-      return;
+    {
+      StallScope _q(StallDiagEnabled(), &stallProbe().queueUs);
+      if (D3D12ReplayGraphicsBatchingEnabled()) {
+        QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                                 argument_buffer_size, std::move(encode_draw),
+                                 metal->use_geometry, metal->use_tessellation,
+                                 ReplayGraphicsCommandKind::DrawIndexed);
+        return;
+      }
+
+      FlushPassBatches(chunk, state);
+      EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
+                             dxmt::apitrace::current_d3d_sequence(),
+                             std::move(encode_draw), metal->use_geometry,
+                             metal->use_tessellation);
     }
-
-    FlushPassBatches(chunk, state);
-    EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
-                           dxmt::apitrace::current_d3d_sequence(),
-                           std::move(encode_draw), metal->use_geometry,
-                           metal->use_tessellation);
   }
 
   void ReplayDispatch(CommandChunk *chunk, ReplayState &state,

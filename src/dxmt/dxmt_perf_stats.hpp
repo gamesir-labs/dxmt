@@ -17,6 +17,12 @@ enum class FrameTimeBucket : uint32_t {
   CreateHeap,
   CreatePipeline,
   OtherD3D12,
+  // PERF DIAG (otherWall split): time spent in AddRecord recording CommandRecords
+  // on the calling thread. If this accumulates on the present thread, it is part
+  // of otherWall (DXMT record-phase, optimizable). If it stays 0, recording runs
+  // on worker threads and does NOT contribute to frame_wall (otherWall is then
+  // app CPU / waits). Lets us split the 90ms otherWall ceiling.
+  CommandListRecord,
 };
 
 enum class ExecuteTimeBucket : uint32_t {

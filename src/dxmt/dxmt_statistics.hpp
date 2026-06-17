@@ -160,6 +160,7 @@ struct FrameStatistics {
   clock::duration frame_create_heap_interval{};
   clock::duration frame_create_pipeline_interval{};
   clock::duration frame_other_d3d12_interval{};
+  clock::duration frame_cmdlist_record_interval{};
   clock::duration frame_execute_validate_interval{};
   clock::duration frame_execute_collect_interval{};
   clock::duration frame_execute_enqueue_interval{};
@@ -298,6 +299,7 @@ struct FrameStatistics {
     frame_create_heap_interval = {};
     frame_create_pipeline_interval = {};
     frame_other_d3d12_interval = {};
+    frame_cmdlist_record_interval = {};
     frame_execute_validate_interval = {};
     frame_execute_collect_interval = {};
     frame_execute_enqueue_interval = {};
@@ -486,6 +488,7 @@ public:
       average_.frame_create_heap_interval += frames_[i].frame_create_heap_interval;
       average_.frame_create_pipeline_interval += frames_[i].frame_create_pipeline_interval;
       average_.frame_other_d3d12_interval += frames_[i].frame_other_d3d12_interval;
+      average_.frame_cmdlist_record_interval += frames_[i].frame_cmdlist_record_interval;
       average_.frame_execute_validate_interval += frames_[i].frame_execute_validate_interval;
       average_.frame_execute_collect_interval += frames_[i].frame_execute_collect_interval;
       average_.frame_execute_enqueue_interval += frames_[i].frame_execute_enqueue_interval;
@@ -605,6 +608,7 @@ public:
     average_.frame_create_heap_interval /= (kFrameStatisticsCount - 1);
     average_.frame_create_pipeline_interval /= (kFrameStatisticsCount - 1);
     average_.frame_other_d3d12_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_cmdlist_record_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_validate_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_collect_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_enqueue_interval /= (kFrameStatisticsCount - 1);

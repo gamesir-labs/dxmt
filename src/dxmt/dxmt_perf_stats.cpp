@@ -169,6 +169,9 @@ void addDurationToBucket(FrameStatistics &stats, FrameTimeBucket bucket,
   case FrameTimeBucket::OtherD3D12:
     stats.frame_other_d3d12_interval += duration;
     break;
+  case FrameTimeBucket::CommandListRecord:
+    stats.frame_cmdlist_record_interval += duration;
+    break;
   }
 }
 
@@ -518,6 +521,10 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_create_pipeline_interval);
   const auto other_d3d12_us =
       durationUs(frame_stats.frame_other_d3d12_interval);
+  // PERF DIAG: observe-only (NOT added to accountedWall) so it shows how much of
+  // otherWall is the DXMT command-list record phase on this thread.
+  const auto cmdlist_record_us =
+      durationUs(frame_stats.frame_cmdlist_record_interval);
   const auto present_latency_wait_us =
       durationUs(frame_stats.present_latency_interval);
   const auto drawable_blocking_us =
@@ -752,6 +759,7 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " createHeapUs=", create_heap_us,
                   " createPipelineUs=", create_pipeline_us,
                   " otherD3D12Us=", other_d3d12_us,
+                  " cmdlistRecordUs=", cmdlist_record_us,
                   " presentLatencyWaitUs=", present_latency_wait_us,
                   " accountedWallUs=", accounted_wall_us,
                   " otherWallUs=", other_wall_us,
