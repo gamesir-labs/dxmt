@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 
@@ -23,6 +24,66 @@ namespace {
 
 std::atomic<uint32_t> g_apitrace_record_diag_log_count = 0;
 thread_local uint64_t g_current_command_record_d3d_sequence = 0;
+
+// --- Copy-source snapshot deduplication (BUG-008 IO blow-up fix) ---
+// SnapshotCopySourceBuffer captures a copy's source-buffer span into the trace on every copy,
+// because FH4's persistently-mapped upload buffers are never Unmapped (so the only way the bytes
+// reach the trace is at copy time). But FH4's load phase is a texture/geometry streaming storm:
+// the same ~286 persistent upload buffers are re-used as copy sources thousands of times, and the
+// naive version re-snapshotted the full span every time -> 24GB / 153K asset files, IO-bound, the
+// game never reaches present. We dedup by (resource, offset, end) -> last-emitted content
+// fingerprint: if a copy reads a span whose CURRENT bytes match what we already emitted for that
+// exact (resource,offset,end), the trace already contains it (retrace's upload heap holds the
+// last-emitted content, and nothing else writes that span between the two copies in callstream
+// order), so we skip the snapshot entirely -- saving the global record_call lock, a callstream
+// entry, and an asset file. We compare against the LAST-EMITTED fingerprint (not merely
+// last-seen): an X->Y->X CPU rewrite sequence re-emits correctly because every emit updates the
+// stored value and we skip only when current==stored. Global (not per-list) so cross-list /
+// cross-frame repeats (the dominant FH4 pattern) are caught too. The dedup lives inside
+// SnapshotCopySourceBuffer, so it covers ALL copy-source paths that funnel through it (placed-
+// footprint texture uploads, GPU-VA ranges, and CopyBufferRegion). Lock held only for map
+// lookup/insert; the FNV-1a hash runs lock-free. Disable via DXMT_APITRACE_NO_COPY_DEDUP=1.
+struct CopySnapshotKey {
+  const void *resource;
+  uint64_t offset;
+  uint64_t length;
+  bool operator==(const CopySnapshotKey &other) const {
+    return resource == other.resource && offset == other.offset &&
+           length == other.length;
+  }
+};
+struct CopySnapshotKeyHash {
+  size_t operator()(const CopySnapshotKey &key) const {
+    uint64_t h = 1469598103934665603ull; // FNV-1a offset basis
+    auto mix = [&h](uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        h ^= (v & 0xff);
+        h *= 1099511628211ull; // FNV-1a prime
+        v >>= 8;
+      }
+    };
+    mix(reinterpret_cast<uintptr_t>(key.resource));
+    mix(key.offset);
+    mix(key.length);
+    return static_cast<size_t>(h);
+  }
+};
+std::mutex g_copy_snapshot_dedup_mutex;
+std::unordered_map<CopySnapshotKey, uint64_t, CopySnapshotKeyHash>
+    g_copy_snapshot_dedup;
+
+// FNV-1a 64-bit over the span; a 64-bit fingerprint is enough for change-detection here -- a
+// collision (~2^-64) merely skips one redundant snapshot, never corrupts a real change because a
+// genuinely different span would have to hash identically AND share (resource,offset,end).
+static uint64_t FnvHashSpan(const void *data, size_t size) {
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < size; ++i) {
+    h ^= bytes[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
 
 #ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
 using ApitraceRenderPassResolveSubresources =
@@ -1581,9 +1642,11 @@ private:
   // never Unmapping; apitrace's data snapshot is Unmap-tied, so the bytes a Copy reads from such a
   // buffer are never recorded -> retrace's upload buffers are empty -> every texture/buffer copied
   // from them is empty -> blank frames. Recording the source region at copy time captures exactly
-  // what the copy reads, independent of Unmap. Hot-path content dedup is intentionally avoided:
-  // the recorder must not scan large spans or take global locks before every copy, and lossless
-  // duplicate collapse belongs to bundle finalization. No-op for non-CPU-mapped sources.
+  // what the copy reads, independent of Unmap. A (resource,offset,end) -> last-emitted-content
+  // FNV fingerprint dedups the FH4 load storm (same ~286 persistent upload buffers re-copied
+  // thousands of times, 24GB/153K files otherwise); see g_copy_snapshot_dedup above for the full
+  // correctness/perf rationale. Disable with DXMT_APITRACE_NO_COPY_DEDUP=1. No-op for
+  // non-CPU-mapped sources.
   void SnapshotCopySourceBuffer(ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
     if (!src_buffer || byte_count == 0 || !dxmt::apitrace::d3d_enabled())
       return;
@@ -1605,6 +1668,30 @@ private:
       return;
     const char *span_data = mapped + res->GetHeapOffset() + src_offset;
     const size_t span_len = static_cast<size_t>(end - src_offset);
+
+    // Dedup: skip the snapshot if this exact (resource,offset,end) span's current content matches
+    // what we last emitted -- the trace already carries identical bytes for it. Disable with
+    // DXMT_APITRACE_NO_COPY_DEDUP=1 (e.g. to A/B against the un-deduped capture).
+    static const bool dedup_disabled = std::getenv("DXMT_APITRACE_NO_COPY_DEDUP") != nullptr;
+    if (!dedup_disabled) {
+      const uint64_t fingerprint = FnvHashSpan(span_data, span_len);
+      const CopySnapshotKey key{src_buffer, src_offset, end};
+      {
+        std::lock_guard<std::mutex> lock(g_copy_snapshot_dedup_mutex);
+        auto it = g_copy_snapshot_dedup.find(key);
+        if (it != g_copy_snapshot_dedup.end() && it->second == fingerprint)
+          return; // unchanged since last emit -> already in trace
+        // Bound memory on pathologically long traces: distinct (resource,offset,end) tuples grow
+        // unbounded if the app sub-allocates many spans. ~2M entries ≈ a few hundred MB; past that
+        // we clear and rebuild. Clearing is correctness-safe -- it only forces a re-emit of spans
+        // seen before the clear (falls back toward un-deduped behavior), never a missed change.
+        constexpr size_t kMaxDedupEntries = 2u * 1024u * 1024u;
+        if (g_copy_snapshot_dedup.size() >= kMaxDedupEntries)
+          g_copy_snapshot_dedup.clear();
+        g_copy_snapshot_dedup[key] = fingerprint;
+      }
+    }
+
     dxmt::apitrace::record_resource_unmap(
         src_buffer, 0, src_offset, end, span_data, span_len);
   }
