@@ -2,12 +2,27 @@ name: DXMT Nightly Component
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or SHA to build
+        required: true
+        default: main
+        type: string
+      api_environment:
+        description: Backend API environment to upload to
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - main
+          - dev+main
 
 permissions:
   contents: read
 
 concurrency:
-  group: dxmt-nightly-component-${{ github.ref }}
+  group: dxmt-nightly-component-${{ github.ref }}-${{ inputs.source_ref }}-${{ inputs.api_environment }}
   cancel-in-progress: true
 
 env:
@@ -20,11 +35,73 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
 jobs:
+  resolve-source:
+    runs-on: self-macos-runner
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_short_sha: ${{ steps.source.outputs.source_short_sha }}
+      upload_matrix: ${{ steps.upload-targets.outputs.upload_matrix }}
+      upload_target_names: ${{ steps.upload-targets.outputs.upload_target_names }}
+    steps:
+      - name: Checkout Source Ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Resolve Source Ref
+        id: source
+        run: |
+          source_sha="$(git rev-parse HEAD)"
+          source_short_sha="$(git rev-parse --short=7 HEAD)"
+          {
+            echo "source_sha=${source_sha}"
+            echo "source_short_sha=${source_short_sha}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Workflow ref: ${GITHUB_REF}"
+          echo "Source ref: ${{ inputs.source_ref }}"
+          echo "Source commit: ${source_sha}"
+          echo "Source short SHA: ${source_short_sha}"
+
+      - name: Resolve Upload Targets
+        id: upload-targets
+        run: |
+          api_environment="${{ inputs.api_environment }}"
+
+          case "${api_environment}" in
+            dev)
+              upload_matrix='{"include":[{"target":"dev"}]}'
+              upload_target_names="dev"
+              ;;
+            main)
+              upload_matrix='{"include":[{"target":"main"}]}'
+              upload_target_names="main"
+              ;;
+            dev+main)
+              upload_matrix='{"include":[{"target":"dev"},{"target":"main"}]}'
+              upload_target_names="dev main"
+              ;;
+            *)
+              echo "::error::unsupported api_environment: ${api_environment}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "upload_matrix=${upload_matrix}"
+            echo "upload_target_names=${upload_target_names}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Requested backend API environment: ${api_environment}"
+          echo "Backend upload target(s): ${upload_target_names}"
+
   setup-host:
     runs-on: self-macos-runner
+    needs: resolve-source
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Probe and Prepare Host
         env:
@@ -33,10 +110,12 @@ jobs:
 
   setup-wine:
     runs-on: self-macos-runner
-    needs: setup-host
+    needs: [resolve-source, setup-host]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Prepare Wine
         env:
@@ -53,10 +132,12 @@ jobs:
 
   setup-llvm-project:
     runs-on: self-macos-runner
-    needs: setup-host
+    needs: [resolve-source, setup-host]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Prepare LLVM Source
         env:
@@ -65,10 +146,12 @@ jobs:
 
   setup-llvm-darwin:
     runs-on: self-macos-runner
-    needs: setup-llvm-project
+    needs: [resolve-source, setup-llvm-project]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Prepare LLVM Darwin x86_64
         env:
@@ -77,12 +160,15 @@ jobs:
 
   build-x86_64-windows:
     runs-on: self-macos-runner
-    needs: [setup-wine, setup-llvm-darwin]
+    needs: [resolve-source, setup-wine, setup-llvm-darwin]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          submodules: true
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+
+      - name: Checkout Build Submodules
+        run: git submodule update --init --depth=1 external/apitrace external/nvapi include/native/directx
 
       - name: Build x86_64 Wine Builtin Runtime
         run: |
@@ -109,12 +195,15 @@ jobs:
 
   build-x86-windows:
     runs-on: self-macos-runner
-    needs: setup-wine
+    needs: [resolve-source, setup-wine]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          submodules: true
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+
+      - name: Checkout Build Submodules
+        run: git submodule update --init --depth=1 external/apitrace external/nvapi include/native/directx
 
       - name: Build x86 Wine Builtin Runtime
         run: |
@@ -136,27 +225,30 @@ jobs:
           ccache --show-stats
           scripts/ci-self-hosted.sh stage-artifact component-x86-runtime install
 
-  package-and-upload:
+  package:
     runs-on: self-macos-runner
-    needs: [build-x86_64-windows, build-x86-windows]
+    needs: [resolve-source, build-x86_64-windows, build-x86-windows]
+    outputs:
+      package_name: ${{ steps.version.outputs.package_name }}
+      package_file: ${{ steps.version.outputs.package_file }}
     env:
-      CIAUTH_TOKEN: ${{ secrets.BACKEND_UPDATE_TOKEN }}
       COMPONENT_NAME: dxmt-nightly
-      DEV_COMPONENT_UPLOAD_URL: ${{ secrets.DEV_COMPONENT_UPLOAD_URL }}
-      DEV_COMPONENT_UPDATE_BASE_URL: ${{ secrets.DEV_COMPONENT_UPDATE_BASE_URL }}
-      DEV_COMPONENT_ID: ${{ secrets.DEV_COMPONENT_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Compute Package Version
         id: version
         run: |
-          short_sha="$(git rev-parse --short=7 HEAD)"
+          short_sha="${{ needs.resolve-source.outputs.source_short_sha }}"
           package_name="${COMPONENT_NAME}-${short_sha}"
-          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
-          echo "package_file=dist/${package_name}.tzst" >> "$GITHUB_OUTPUT"
+          {
+            echo "short_sha=${short_sha}"
+            echo "package_name=${package_name}"
+            echo "package_file=dist/${package_name}.tzst"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Assemble Component Package
         run: |
@@ -234,14 +326,106 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Stage Local Component Artifact
+        if: always()
+        run: |
+          if [[ -f "${{ steps.version.outputs.package_file }}" ]]; then
+            scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.package_name }}" \
+              "${{ steps.version.outputs.package_file }}" \
+              "${{ steps.version.outputs.package_file }}.sha256"
+          fi
+
+  upload-backend-component:
+    runs-on: self-macos-runner
+    needs: [resolve-source, package]
+    name: upload-${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve-source.outputs.upload_matrix) }}
+    environment:
+      name: ${{ matrix.target }}
+    env:
+      BACKEND_UPDATE_TOKEN: ${{ secrets.BACKEND_UPDATE_TOKEN }}
+      DEV_BACKEND_UPLOAD_TOKEN: ${{ secrets.DEV_BACKEND_UPLOAD_TOKEN }}
+      PRO_BACKEND_UPLOAD_TOKEN: ${{ secrets.PRO_BACKEND_UPLOAD_TOKEN }}
+      DEV_COMPONENT_UPLOAD_URL: ${{ secrets.DEV_COMPONENT_UPLOAD_URL }}
+      DEV_COMPONENT_UPDATE_BASE_URL: ${{ secrets.DEV_COMPONENT_UPDATE_BASE_URL }}
+      DEV_COMPONENT_ID: ${{ secrets.DEV_COMPONENT_ID }}
+      PRO_COMPONENT_UPLOAD_URL: ${{ secrets.PRO_COMPONENT_UPLOAD_URL }}
+      PRO_COMPONENT_UPDATE_BASE_URL: ${{ secrets.PRO_COMPONENT_UPDATE_BASE_URL }}
+      PRO_COMPONENT_ID: ${{ secrets.PRO_COMPONENT_ID }}
+    steps:
+      - name: Download Component Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.package_name }}
+          path: dist
+
+      - name: Verify Component Artifact
+        run: |
+          package_file="${{ needs.package.outputs.package_file }}"
+          test -f "${package_file}" || { echo "::error::component archive is missing: ${package_file}"; exit 1; }
+          test -f "${package_file}.sha256" || { echo "::error::component checksum is missing: ${package_file}.sha256"; exit 1; }
+          shasum -a 256 -c "${package_file}.sha256"
+
+      - name: Resolve Backend Upload Environment
+        run: |
+          api_environment="${{ matrix.target }}"
+
+          case "${api_environment}" in
+            dev)
+              resolved_token="${DEV_BACKEND_UPLOAD_TOKEN}"
+              token_secret_name="DEV_BACKEND_UPLOAD_TOKEN"
+              component_upload_url="${DEV_COMPONENT_UPLOAD_URL}"
+              component_update_base_url="${DEV_COMPONENT_UPDATE_BASE_URL}"
+              component_id="${DEV_COMPONENT_ID}"
+              ;;
+            main)
+              resolved_token="${BACKEND_UPDATE_TOKEN}"
+              token_secret_name="BACKEND_UPDATE_TOKEN"
+              if [[ -z "${resolved_token}" ]]; then
+                echo "::warning::BACKEND_UPDATE_TOKEN is empty; falling back to PRO_BACKEND_UPLOAD_TOKEN"
+                resolved_token="${PRO_BACKEND_UPLOAD_TOKEN}"
+                token_secret_name="PRO_BACKEND_UPLOAD_TOKEN"
+              fi
+              component_upload_url="${PRO_COMPONENT_UPLOAD_URL}"
+              component_update_base_url="${PRO_COMPONENT_UPDATE_BASE_URL}"
+              component_id="${PRO_COMPONENT_ID}"
+              ;;
+            *)
+              echo "::error::unsupported api_environment: ${api_environment}"
+              exit 1
+              ;;
+          esac
+
+          test -n "${resolved_token}" || { echo "::error::${token_secret_name} is empty"; exit 1; }
+          test -n "${component_upload_url}" || { echo "::error::${api_environment} component upload URL is empty"; exit 1; }
+          test -n "${component_update_base_url}" || { echo "::error::${api_environment} component update base URL is empty"; exit 1; }
+          test -n "${component_id}" || { echo "::error::${api_environment} component id is empty"; exit 1; }
+
+          echo "::add-mask::${resolved_token}"
+          {
+            echo "API_ENV=${api_environment}"
+            echo "CIAUTH_TOKEN=${resolved_token}"
+            echo "COMPONENT_UPLOAD_URL=${component_upload_url}"
+            echo "COMPONENT_UPDATE_BASE_URL=${component_update_base_url}"
+            echo "COMPONENT_ID=${component_id}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Requested backend API environment: ${{ inputs.api_environment }}"
+          echo "Resolved backend API environment: ${api_environment}"
+          echo "Using token secret: ${token_secret_name}"
+          echo "Component upload URL: ${component_upload_url}"
+          echo "Component update URL: ${component_update_base_url%/}/${component_id}"
+
       - name: Upload And Update Backend Component
         run: |
-          test -n "${CIAUTH_TOKEN}" || { echo "::error::BACKEND_UPDATE_TOKEN is empty"; exit 1; }
-          test -n "${DEV_COMPONENT_UPLOAD_URL}" || { echo "::error::DEV_COMPONENT_UPLOAD_URL is empty"; exit 1; }
-          test -n "${DEV_COMPONENT_UPDATE_BASE_URL}" || { echo "::error::DEV_COMPONENT_UPDATE_BASE_URL is empty"; exit 1; }
-          test -n "${DEV_COMPONENT_ID}" || { echo "::error::DEV_COMPONENT_ID is empty"; exit 1; }
+          test -n "${CIAUTH_TOKEN}" || { echo "::error::CIAUTH_TOKEN is empty"; exit 1; }
+          test -n "${COMPONENT_UPLOAD_URL}" || { echo "::error::COMPONENT_UPLOAD_URL is empty"; exit 1; }
+          test -n "${COMPONENT_UPDATE_BASE_URL}" || { echo "::error::COMPONENT_UPDATE_BASE_URL is empty"; exit 1; }
+          test -n "${COMPONENT_ID}" || { echo "::error::COMPONENT_ID is empty"; exit 1; }
 
-          package_file="${{ steps.version.outputs.package_file }}"
+          package_file="${{ needs.package.outputs.package_file }}"
           case "${package_file}" in
             *.tzst) ;;
             *) echo "::error::component archive must end with .tzst"; exit 1 ;;
@@ -260,7 +444,7 @@ jobs:
             fi
           }
 
-          upload_status="$(curl -sS -X POST "${DEV_COMPONENT_UPLOAD_URL}" \
+          upload_status="$(curl -sS -X POST "${COMPONENT_UPLOAD_URL}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -F "file=@${package_file}" \
             -F "dir=emulator" \
@@ -339,7 +523,7 @@ jobs:
               f.write("\n")
           PY
 
-          update_status="$(curl -sS -X PUT "${DEV_COMPONENT_UPDATE_BASE_URL%/}/${DEV_COMPONENT_ID}" \
+          update_status="$(curl -sS -X PUT "${COMPONENT_UPDATE_BASE_URL%/}/${COMPONENT_ID}" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -H "Content-Type: application/json" \
             --data-binary @component-update.json \
@@ -369,12 +553,3 @@ jobs:
           if response.get("code") not in (0, 200):
               raise SystemExit(f"component update failed: {response}")
           PY
-
-      - name: Stage Local Component Artifact
-        if: always()
-        run: |
-          if [[ -f "${{ steps.version.outputs.package_file }}" ]]; then
-            scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.package_name }}" \
-              "${{ steps.version.outputs.package_file }}" \
-              "${{ steps.version.outputs.package_file }}.sha256"
-          fi
