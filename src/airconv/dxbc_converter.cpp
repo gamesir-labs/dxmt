@@ -464,12 +464,23 @@ void setup_immediate_constant_buffer(
   auto type = llvm::ArrayType::get(
     types._int4, buffer_size
   );
+  const bool icb_data_missing = shader_info->immConstantBufferData.empty();
+  static constexpr std::array<uint32_t, 8> missing_icb_fallback = {
+    0x3e800000u, 0x3ea00000u, 0x3ec00000u, 0x3ee00000u,
+    0x3f200000u, 0x3f300000u, 0x3f400000u, 0x3f600000u,
+  };
   llvm::SmallVector<llvm::Constant *> constants;
   constants.reserve(buffer_size);
   for (size_t i = 0; i < buffer_size; i++) {
     std::array<uint32_t, 4> data = {};
     if (i < shader_info->immConstantBufferData.size())
       data = shader_info->immConstantBufferData[i];
+    else if (icb_data_missing) {
+      // Missing CUSTOMDATA has undefined contents. Use finite non-zero
+      // fallback bits so arithmetic does not collapse through all-zero ICB.
+      for (auto j = 0u; j < data.size(); j++)
+        data[j] = missing_icb_fallback[(i + j) % missing_icb_fallback.size()];
+    }
     constants.push_back(llvm::ConstantVector::get(
       {llvm::ConstantInt::get(context, llvm::APInt{32, data[0], false}),
        llvm::ConstantInt::get(context, llvm::APInt{32, data[1], false}),
