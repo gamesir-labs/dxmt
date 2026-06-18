@@ -223,8 +223,6 @@ if enable_apitrace:
     environment_template["APITRACE_TRACE_BUNDLE"] = apitrace_output_dir
     if apitrace_verbose:
         environment_template["APITRACE_METAL_VERBOSE"] = "1"
-    if apitrace_seal_after_frame:
-        environment_template["DXMT_APITRACE_SEAL_CHECKPOINT_AFTER_FRAME"] = apitrace_seal_after_frame
 
 manifest = {
     "id": package_name,

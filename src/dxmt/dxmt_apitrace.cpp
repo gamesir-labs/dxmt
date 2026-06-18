@@ -43,10 +43,6 @@ namespace {
 
 std::atomic<int> enabled_cache{-1};
 std::atomic<int> verbose_cache{-1};
-std::atomic<uint64_t> seal_after_frame_cache{std::numeric_limits<uint64_t>::max()};
-std::atomic_bool seal_after_frame_configured = false;
-std::atomic_bool seal_after_frame_metal_done = false;
-std::atomic_bool seal_after_frame_d3d_done = false;
 std::atomic_bool session_open_logged = false;
 std::atomic_bool shutdown_requested = false;
 #ifdef _WIN32
@@ -120,23 +116,6 @@ process_trace_bundle_name() {
   name += "." + std::to_string(GetCurrentProcessId());
 #endif
   return name + ".apitrace";
-}
-
-uint64_t
-seal_after_frame() {
-  if (!seal_after_frame_configured.exchange(true, std::memory_order_acq_rel)) {
-    auto value = env::getEnvVar("APITRACE_METAL_SEAL_CHECKPOINT_AFTER_FRAME");
-    if (value.empty())
-      value = env::getEnvVar("DXMT_APITRACE_SEAL_CHECKPOINT_AFTER_FRAME");
-    if (!value.empty()) {
-      try {
-        seal_after_frame_cache.store(std::stoull(value), std::memory_order_relaxed);
-      } catch (...) {
-        seal_after_frame_cache.store(std::numeric_limits<uint64_t>::max(), std::memory_order_relaxed);
-      }
-    }
-  }
-  return seal_after_frame_cache.load(std::memory_order_relaxed);
 }
 
 void
@@ -391,26 +370,6 @@ on_command_buffer_begin(uint64_t command_buffer_id, uint64_t frame_id) {
 }
 
 void
-maybe_seal_metal_checkpoint_after_frame(uint64_t frame_index) {
-  const auto target = seal_after_frame();
-  if (target == std::numeric_limits<uint64_t>::max() || frame_index + 1 < target)
-    return;
-  if (seal_after_frame_metal_done.exchange(true, std::memory_order_acq_rel))
-    return;
-  seal_metal_checkpoint();
-}
-
-void
-maybe_seal_d3d_checkpoint_after_frame(uint64_t frame_index) {
-  const auto target = seal_after_frame();
-  if (target == std::numeric_limits<uint64_t>::max() || frame_index + 1 < target)
-    return;
-  if (seal_after_frame_d3d_done.exchange(true, std::memory_order_acq_rel))
-    return;
-  seal_d3d_checkpoint();
-}
-
-void
 on_command_buffer_commit(uint64_t command_buffer_id) {
   if (!enabled())
     return;
@@ -430,7 +389,6 @@ on_present_drawable(
     return;
 
   DXMT_WMT_APITRACE_PRESENT_DRAWABLE(command_buffer_id, drawable_id, frame_index, sync_interval, flags);
-  maybe_seal_metal_checkpoint_after_frame(frame_index);
   if (verbose_enabled()) {
     INFO("DXMT apitrace: present commandBuffer=", command_buffer_id,
          " drawable=", drawable_id,

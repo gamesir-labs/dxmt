@@ -776,75 +776,6 @@ DebugPresentReadbackEnabled() {
 }
 
 static bool
-TracePresentFrameCaptureEnabled() {
-  static const bool enabled = DebugEnabledEnv("APITRACE_D3D12_CAPTURE_PRESENT_FRAMES");
-  return enabled;
-}
-
-static uint32_t
-TracePresentFrameCaptureLimit() {
-  static const uint32_t limit = []() {
-    auto value = env::getEnvVar("APITRACE_D3D12_CAPTURE_PRESENT_FRAME_LIMIT");
-    if (value.empty())
-      return std::numeric_limits<uint32_t>::max();
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return std::numeric_limits<uint32_t>::max();
-    return static_cast<uint32_t>(
-        std::min<unsigned long>(parsed, std::numeric_limits<uint32_t>::max()));
-  }();
-  return limit;
-}
-
-static uint32_t
-TracePresentFrameCaptureSkip() {
-  static const uint32_t skip = []() {
-    auto value = env::getEnvVar("APITRACE_D3D12_CAPTURE_PRESENT_FRAME_SKIP");
-    if (value.empty())
-      return 0u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 0u;
-    return static_cast<uint32_t>(
-        std::min<unsigned long>(parsed, std::numeric_limits<uint32_t>::max()));
-  }();
-  return skip;
-}
-
-static uint32_t
-TracePresentFrameCaptureInterval() {
-  static const uint32_t interval = []() {
-    auto value = env::getEnvVar("APITRACE_D3D12_CAPTURE_PRESENT_FRAME_INTERVAL");
-    if (value.empty())
-      return 1u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 1u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return interval;
-}
-
-static bool
-TraceShouldCapturePresentFrame(uint32_t &capture_index) {
-  static std::atomic<uint32_t> present_count = 0;
-  static std::atomic<uint32_t> capture_count = 0;
-  if (!TracePresentFrameCaptureEnabled())
-    return false;
-  const auto present_index = present_count.fetch_add(1, std::memory_order_relaxed);
-  const auto skip = TracePresentFrameCaptureSkip();
-  if (present_index < skip)
-    return false;
-  if (((present_index - skip) % TracePresentFrameCaptureInterval()) != 0)
-    return false;
-  capture_index = capture_count.fetch_add(1, std::memory_order_relaxed);
-  return capture_index < TracePresentFrameCaptureLimit();
-}
-
-static bool
 DebugRenderReadbackEnabled() {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_READBACK");
   return enabled;
@@ -1051,143 +982,6 @@ DebugEncodePresentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf
           present_index, index, point_x, point_y, 0, 0, width, height);
     }
   }
-}
-
-static void
-TraceEncodePresentFrameReadback(QueryReadbacks &readbacks,
-                                WMT::CommandBuffer cmdbuf,
-                                WMT::Device device,
-                                WMT::Texture texture,
-                                uint64_t frame_index,
-                                uint32_t sync_interval,
-                                uint32_t flags,
-                                uint32_t capture_index) {
-  if (!DebugSupportsTextureReadback(texture)) {
-    WARN("DXMT apitrace: present frame capture skipped",
-         " frame_index=", frame_index,
-         " capture_index=", capture_index,
-         " reason=unsupported_texture",
-         " format=", texture ? uint32_t(texture.pixelFormat()) : 0);
-    return;
-  }
-
-  const auto pixel_format = static_cast<WMTPixelFormat>(ORIGINAL_FORMAT(texture.pixelFormat()));
-  if (pixel_format != WMTPixelFormatRGBA8Unorm &&
-      pixel_format != WMTPixelFormatRGBA8Unorm_sRGB &&
-      pixel_format != WMTPixelFormatBGRA8Unorm &&
-      pixel_format != WMTPixelFormatBGRA8Unorm_sRGB &&
-      pixel_format != WMTPixelFormatRGB10A2Unorm &&
-      pixel_format != WMTPixelFormatBGR10A2Unorm) {
-    WARN("DXMT apitrace: present frame capture skipped",
-         " frame_index=", frame_index,
-         " capture_index=", capture_index,
-         " reason=unsupported_format",
-         " format=", uint32_t(pixel_format));
-    return;
-  }
-
-  const uint32_t width = texture.width();
-  const uint32_t height = texture.height();
-  if (!width || !height) {
-    WARN("DXMT apitrace: present frame capture skipped",
-         " frame_index=", frame_index,
-         " capture_index=", capture_index,
-         " reason=empty_texture");
-    return;
-  }
-
-  const uint32_t row_pitch = width * 4u;
-  const uint64_t payload_size = uint64_t(row_pitch) * uint64_t(height);
-  if (payload_size > std::numeric_limits<uint32_t>::max()) {
-    WARN("DXMT apitrace: present frame capture skipped",
-         " frame_index=", frame_index,
-         " capture_index=", capture_index,
-         " reason=too_large",
-         " size=", payload_size);
-    return;
-  }
-
-  WMTBufferInfo buffer_info = {};
-  buffer_info.length = payload_size;
-  buffer_info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked;
-  buffer_info.memory.set(nullptr);
-#ifdef __i386__
-  buffer_info.memory.set(wsi::aligned_malloc(payload_size, DXMT_PAGE_SIZE));
-#endif
-  auto buffer = device.newBuffer(buffer_info);
-  auto *mapped = static_cast<uint8_t *>(buffer_info.memory.get_accessible_or_null());
-  if (!buffer || !mapped) {
-    WARN("DXMT apitrace: present frame capture skipped",
-         " frame_index=", frame_index,
-         " capture_index=", capture_index,
-         " reason=buffer_allocation_failed",
-         " size=", payload_size);
-#ifdef __i386__
-    wsi::aligned_free(buffer_info.memory.get_accessible_or_null());
-#endif
-    return;
-  }
-
-  auto encoder = cmdbuf.blitCommandEncoder();
-  wmtcmd_blit_copy_from_texture_to_buffer copy = {};
-  copy.type = WMTBlitCommandCopyFromTextureToBuffer;
-  copy.next.set(nullptr);
-  copy.src = texture;
-  copy.slice = 0;
-  copy.level = 0;
-  copy.origin = {0, 0, 0};
-  copy.size = {width, height, 1};
-  copy.dst = buffer;
-  copy.offset = 0;
-  copy.bytes_per_row = row_pitch;
-  copy.bytes_per_image = static_cast<uint32_t>(payload_size);
-  encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
-  encoder.endEncoding();
-
-  readbacks.diagnostics.push_back(
-      [buffer = WMT::Reference<WMT::Buffer>(buffer), mapped, frame_index,
-       width, height, row_pitch, sync_interval, flags, payload_size,
-       pixel_format]() {
-        std::vector<uint8_t> rgba(static_cast<size_t>(payload_size));
-        if (pixel_format == WMTPixelFormatRGBA8Unorm ||
-            pixel_format == WMTPixelFormatRGBA8Unorm_sRGB) {
-          std::memcpy(rgba.data(), mapped, static_cast<size_t>(payload_size));
-        } else if (pixel_format == WMTPixelFormatBGRA8Unorm ||
-                   pixel_format == WMTPixelFormatBGRA8Unorm_sRGB) {
-          for (uint64_t offset = 0; offset < payload_size; offset += 4) {
-            rgba[static_cast<size_t>(offset + 0)] = mapped[offset + 2];
-            rgba[static_cast<size_t>(offset + 1)] = mapped[offset + 1];
-            rgba[static_cast<size_t>(offset + 2)] = mapped[offset + 0];
-            rgba[static_cast<size_t>(offset + 3)] = mapped[offset + 3];
-          }
-        } else {
-          for (uint64_t offset = 0; offset < payload_size; offset += 4) {
-            const uint32_t px =
-                uint32_t(mapped[offset + 0]) |
-                (uint32_t(mapped[offset + 1]) << 8) |
-                (uint32_t(mapped[offset + 2]) << 16) |
-                (uint32_t(mapped[offset + 3]) << 24);
-            const uint32_t c0 = px & 0x3ffu;
-            const uint32_t c1 = (px >> 10) & 0x3ffu;
-            const uint32_t c2 = (px >> 20) & 0x3ffu;
-            const uint32_t a2 = (px >> 30) & 0x3u;
-            const bool bgr = pixel_format == WMTPixelFormatBGR10A2Unorm;
-            rgba[static_cast<size_t>(offset + 0)] =
-                static_cast<uint8_t>(((bgr ? c2 : c0) * 255u + 511u) / 1023u);
-            rgba[static_cast<size_t>(offset + 1)] =
-                static_cast<uint8_t>((c1 * 255u + 511u) / 1023u);
-            rgba[static_cast<size_t>(offset + 2)] =
-                static_cast<uint8_t>(((bgr ? c0 : c2) * 255u + 511u) / 1023u);
-            rgba[static_cast<size_t>(offset + 3)] = static_cast<uint8_t>(a2 * 85u);
-          }
-        }
-        dxmt::apitrace::record_present_frame(
-            frame_index, width, height, row_pitch, sync_interval, flags,
-            rgba.data(), rgba.size());
-#ifdef __i386__
-        wsi::aligned_free(mapped);
-#endif
-      });
 }
 
 static void
@@ -3601,10 +3395,6 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       currentFrameStatistics().present_pass_count++;
       uint32_t present_index = 0;
       const bool sample_present_readback = DebugShouldSamplePresentReadback(present_index);
-      uint32_t trace_present_capture_index = 0;
-      const bool capture_trace_present_frame =
-          data->apitrace_frame_index != ~0ull &&
-          TraceShouldCapturePresentFrame(trace_present_capture_index);
       if (sample_present_readback) {
         DebugEncodePresentReadbacks(
             readbacks, cmdbuf, device_, data->backbuffer, "backbuffer-before-present",
@@ -3647,12 +3437,6 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         const auto present_frame_index =
             data->apitrace_frame_index != ~0ull ? data->apitrace_frame_index : currentFrameId();
         dxmt::apitrace::on_present_drawable(cmdbuf.handle, drawable.handle, present_frame_index, 0, 0);
-      }
-      if (capture_trace_present_frame) {
-        TraceEncodePresentFrameReadback(
-            readbacks, cmdbuf, device_, data->backbuffer,
-            data->apitrace_frame_index, data->sync_interval, data->flags,
-            trace_present_capture_index);
       }
       data->~PresentData();
       perf.encodedPresent++;

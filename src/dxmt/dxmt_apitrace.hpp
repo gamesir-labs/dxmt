@@ -19,8 +19,6 @@ void on_present_drawable(
     uint64_t frame_index,
     uint32_t sync_interval,
     uint32_t flags);
-void maybe_seal_metal_checkpoint_after_frame(uint64_t frame_index);
-void maybe_seal_d3d_checkpoint_after_frame(uint64_t frame_index);
 
 #else
 
@@ -32,8 +30,6 @@ inline void set_current_d3d_sequence(uint64_t) {}
 inline void on_command_buffer_begin(uint64_t, uint64_t) {}
 inline void on_command_buffer_commit(uint64_t) {}
 inline void on_present_drawable(uint64_t, uint64_t, uint64_t, uint32_t, uint32_t) {}
-inline void maybe_seal_metal_checkpoint_after_frame(uint64_t) {}
-inline void maybe_seal_d3d_checkpoint_after_frame(uint64_t) {}
 
 #endif
 

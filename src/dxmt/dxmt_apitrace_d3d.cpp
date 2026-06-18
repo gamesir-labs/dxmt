@@ -6,22 +6,9 @@
 
 #include "apitrace/d3d12_capture.hpp"
 
-#include <cstdlib>
-#include <cstring>
 #include <sstream>
 
 namespace dxmt::apitrace {
-namespace {
-
-bool
-d3d_builtin_capture_disabled() {
-  const char *value = std::getenv("APITRACE_D3D12_BUILTIN_CAPTURE");
-  return value && (std::strcmp(value, "0") == 0 ||
-                   std::strcmp(value, "false") == 0 ||
-                   std::strcmp(value, "FALSE") == 0);
-}
-
-} // namespace
 
 static void
 AppendTileCoordinateJson(std::ostringstream &json,
@@ -71,7 +58,7 @@ AppendSubresourceTilingJson(std::ostringstream &json,
 
 bool
 d3d_enabled() {
-  return enabled() && !d3d_builtin_capture_disabled();
+  return enabled();
 }
 
 uint64_t
