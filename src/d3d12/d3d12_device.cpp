@@ -1852,8 +1852,26 @@ public:
       auto *resource = desc ? LookupBufferResourceByGpuVirtualAddress(
                                   desc->BufferLocation, &offset)
                             : nullptr;
+      if (desc && desc->BufferLocation && desc->SizeInBytes && resource &&
+          resource->GetBufferAllocation() &&
+          resource->GetBufferAllocation()->mappedMemory(0)) {
+        const UINT64 width = resource->GetResourceDesc().Width;
+        if (offset < width) {
+          const UINT64 end =
+              std::min<UINT64>(width, offset + desc->SizeInBytes);
+          if (end > offset) {
+            const auto *mapped = static_cast<const char *>(
+                resource->GetBufferAllocation()->mappedMemory(0));
+            dxmt::apitrace::record_resource_unmap(
+                resource->GetD3D12Resource(), 0, offset, end,
+                mapped + resource->GetHeapOffset() + offset,
+                static_cast<size_t>(end - offset));
+          }
+        }
+      }
       dxmt::apitrace::record_create_constant_buffer_view(
-          this, desc, descriptor, resource, offset,
+          this, desc, descriptor,
+          resource ? resource->GetD3D12Resource() : nullptr, offset,
           resource ? resource->GetResourceDesc().Width : 0);
     }
   }
