@@ -16,7 +16,6 @@ BACKUP_DIR="${BACKUP_ROOT}/gamehub-${GAMEHUB_DXMT_PACKAGE}-backup-${BACKUP_TAG}"
 ENABLE_APITRACE="${DXMT_GAMEHUB_ENABLE_APITRACE:-0}"
 APITRACE_OUTPUT_DIR="${DXMT_GAMEHUB_APITRACE_OUTPUT_DIR:-${REPO_ROOT}/tmp/gamehub-apitrace}"
 APITRACE_VERBOSE="${DXMT_GAMEHUB_APITRACE_VERBOSE:-0}"
-APITRACE_SEAL_AFTER_FRAME="${DXMT_GAMEHUB_APITRACE_SEAL_AFTER_FRAME:-}"
 GAMEHUB_WINEDEBUG="${DXMT_GAMEHUB_WINEDEBUG:--all}"
 
 runtime_files=(
@@ -199,7 +198,7 @@ write_manifest() {
 
   python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" \
     "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" "$APITRACE_VERBOSE" \
-    "$APITRACE_SEAL_AFTER_FRAME" "$GAMEHUB_WINEDEBUG" <<'PY'
+    "$GAMEHUB_WINEDEBUG" <<'PY'
 import json
 import sys
 
@@ -208,8 +207,7 @@ package_name = sys.argv[2]
 enable_apitrace = sys.argv[3] == "1"
 apitrace_output_dir = sys.argv[4]
 apitrace_verbose = sys.argv[5] == "1"
-apitrace_seal_after_frame = sys.argv[6]
-winedebug = sys.argv[7]
+winedebug = sys.argv[6]
 environment_template = {
     "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
     "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
