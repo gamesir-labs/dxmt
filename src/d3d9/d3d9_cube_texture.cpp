@@ -86,7 +86,10 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
           /*pitch=*/pitch,
           /*arraySlice=*/face,
           /*ownedBacking=*/nullptr,
-          /*dxmtTexture=*/m_texture
+          /*dxmtTexture=*/m_texture,
+          /*textureMipSurface=*/false,
+          // Sub-resource: the cube face shares this cube texture's public refcount.
+          /*baseTexture=*/static_cast<IDirect3DBaseTexture9 *>(this)
       );
       m_levels.emplace_back(level);
     }
@@ -117,6 +120,11 @@ MTLD3D9CubeTexture::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9CubeTexture::Release() {
+  // D3D9 Release-at-0 clamp (hand-folded: multiply-inherits, so
+  // ComObjectClamp cannot wrap it). Also bounds a cube face's delegated
+  // Release against the shared counter.
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     if (m_isLosable) {
