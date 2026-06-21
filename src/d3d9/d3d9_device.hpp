@@ -1296,6 +1296,24 @@ private:
   class MTLD3D9VertexDeclaration *getOrCreateFvfDecl(DWORD FVF);
   D3DDEVICE_CREATION_PARAMETERS m_creationParams;
   D3DPRESENT_PARAMETERS m_presentParams;
+  // Fullscreen device-window management (wined3d swapchain.c
+  // setup_fullscreen / restore_from_fullscreen). When the app requests
+  // Windowed=FALSE, resize + restyle the device window to a borderless
+  // fullscreen rect and restore it on the windowed transition; without
+  // this a fullscreen game keeps its small windowed window. This is pure
+  // window geometry: the display-mode switch is a winemac concern (and a
+  // known hang), never touched here. m_fullscreenWindow is the window we
+  // currently hold fullscreen (null = none); the saved style/exstyle/rect
+  // are its pre-fullscreen state for restore.
+  HWND m_fullscreenWindow = nullptr;
+  LONG m_savedWindowStyle = 0;
+  LONG m_savedWindowExStyle = 0;
+  RECT m_savedWindowRect = {};
+  // Drive the device window into / out of the borderless fullscreen state.
+  // enterFullscreenWindow saves + restyles on first entry and repositions
+  // on a later resolution change; both honor D3DCREATE_NOWINDOWCHANGES.
+  void enterFullscreenWindow(HWND window, UINT width, UINT height);
+  void leaveFullscreenWindow();
   // Device9Ex frame-latency bookkeeping. SetMaximumFrameLatency
   // rejects >30 with INVALIDCALL; 0 selects the default 3 (DXVK
   // d3d9_device.cpp). Read-only round-trip; Metal
