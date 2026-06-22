@@ -481,6 +481,14 @@ public:
       // nop
   };
 
+  HRESULT KeyedMutexAcquire(WMT::Reference<WMT::SharedEvent>, UINT64) override {
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+  HRESULT KeyedMutexRelease(WMT::Reference<WMT::SharedEvent>, UINT64) override {
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
   HRESULT STDMETHODCALLTYPE
   Signal(ID3D11Fence *pFence, UINT64 Value) override {
     return DXGI_ERROR_INVALID_CALL;

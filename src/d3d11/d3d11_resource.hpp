@@ -9,9 +9,12 @@
 #include "d3d11_view.hpp"
 #include "dxgi_resource.hpp"
 #include "log/log.hpp"
+#include "util_d3dkmt.h"
+#include "util_win32_compat.h"
 #include "../d3d10/d3d10_buffer.hpp"
 #include "../d3d10/d3d10_texture.hpp"
 #include "../d3d10/d3d10_view.hpp"
+#include <atomic>
 #include <memory>
 #include <type_traits>
 #include <random>
@@ -128,6 +131,8 @@ struct D3D11ResourceCommon : ID3D11Resource {
   virtual HRESULT GetSharedHandle(HANDLE *pSharedHandle) = 0;
   virtual HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle) = 0;
+  virtual D3DKMT_HANDLE GetKeyedMutexHandle() const = 0;
+  virtual WMT::Reference<WMT::SharedEvent> GetKeyedMutexEvent() const = 0;
 
   virtual Rc<StagingResource> staging(UINT Subresource) = 0;
   virtual Rc<DynamicBuffer> dynamicBuffer(UINT *pBufferLength, UINT *pBindFlags) = 0;
@@ -180,6 +185,132 @@ GetTexture(ID3D11Resource *pResource) {
   return static_cast<D3D11ResourceCommon *>(pResource)->texture();
 }
 
+template <typename T>
+concept DXGIKeyedMutexAggregateContext =
+    std::is_base_of<IUnknown, T>::value &&
+    requires(T t, REFGUID guid, UINT data_size, const void *data, REFIID riid, void **out) {
+      { t.GetKeyedMutexHandle() } -> std::same_as<D3DKMT_HANDLE>;
+      { t.GetKeyedMutexEvent() } -> std::same_as<WMT::Reference<WMT::SharedEvent>>;
+      { t.GetParentDevice() } -> std::same_as<MTLD3D11Device *>;
+      { t.GetDeviceInterface(riid, out) } -> std::same_as<HRESULT>;
+      { t.SetPrivateData(guid, data_size, data) } -> std::same_as<HRESULT>;
+    };
+
+template <DXGIKeyedMutexAggregateContext IResource>
+class MTLDXGIKeyedMutex : public IDXGIKeyedMutex {
+public:
+  MTLDXGIKeyedMutex(IResource *pResource) : resource_(pResource) {}
+  ~MTLDXGIKeyedMutex() {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
+    return resource_->QueryInterface(riid, ppvObject);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() final { return resource_->AddRef(); }
+
+  ULONG STDMETHODCALLTYPE Release() final { return resource_->Release(); }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size, const void *data) final {
+    return resource_->SetPrivateData(guid, data_size, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown *object) final {
+    return resource_->SetPrivateDataInterface(guid, object);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size, void *data) final {
+    return resource_->GetPrivateData(guid, data_size, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **parent) final {
+    return GetDevice(riid, parent);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) final {
+    return resource_->GetDeviceInterface(riid, device);
+  }
+
+  HRESULT STDMETHODCALLTYPE AcquireSync(UINT64 Key, DWORD dwMilliseconds) final {
+    auto handle = resource_->GetKeyedMutexHandle();
+    if (!handle)
+      return DXGI_ERROR_INVALID_CALL;
+
+    LARGE_INTEGER timeout = {};
+    LARGE_INTEGER *timeout_ptr = nullptr;
+    if (dwMilliseconds != INFINITE) {
+      timeout.QuadPart = -static_cast<LONGLONG>(dwMilliseconds) * 10000;
+      timeout_ptr = &timeout;
+    }
+
+    D3DKMT_ACQUIREKEYEDMUTEX acquire = {};
+    acquire.hKeyedMutex = handle;
+    acquire.Key = Key;
+    acquire.pTimeout = timeout_ptr;
+    acquire.FenceValue = fence_value_.load();
+
+    auto status = D3DKMTAcquireKeyedMutex(&acquire);
+    if (status == 0x00000000) {
+      fence_value_.store(acquire.FenceValue);
+      if (auto event = resource_->GetKeyedMutexEvent()) {
+        auto hr = resource_->GetParentDevice()->GetImmediateContextPrivate()->KeyedMutexAcquire(
+            std::move(event), acquire.FenceValue);
+        if (FAILED(hr)) {
+          WARN("DXGIKeyedMutex::AcquireSync failed to encode GPU wait, hr=", hr);
+          return hr;
+        }
+      }
+      TRACE("DXGIKeyedMutex::AcquireSync key=", Key, " fence=", acquire.FenceValue);
+      return S_OK;
+    }
+    if (status == 0x00000080)
+      return WAIT_ABANDONED;
+    if (status == 0x00000102)
+      return WAIT_TIMEOUT;
+    if (status == static_cast<NTSTATUS>(0xc000000d))
+      return DXGI_ERROR_INVALID_CALL;
+
+    WARN("DXGIKeyedMutex::AcquireSync failed, status=", status);
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+  HRESULT STDMETHODCALLTYPE ReleaseSync(UINT64 Key) final {
+    auto handle = resource_->GetKeyedMutexHandle();
+    if (!handle)
+      return DXGI_ERROR_INVALID_CALL;
+
+    D3DKMT_RELEASEKEYEDMUTEX release = {};
+    release.hKeyedMutex = handle;
+    release.Key = Key;
+    release.FenceValue = fence_value_.load() + 1;
+
+    auto status = D3DKMTReleaseKeyedMutex(&release);
+    if (status == 0x00000000) {
+      fence_value_.store(release.FenceValue);
+      if (auto event = resource_->GetKeyedMutexEvent()) {
+        auto hr = resource_->GetParentDevice()->GetImmediateContextPrivate()->KeyedMutexRelease(
+            std::move(event), release.FenceValue);
+        if (FAILED(hr)) {
+          WARN("DXGIKeyedMutex::ReleaseSync failed to encode GPU signal, hr=", hr);
+          return hr;
+        }
+      }
+      TRACE("DXGIKeyedMutex::ReleaseSync key=", Key, " fence=", release.FenceValue);
+      return S_OK;
+    }
+    if (status == 0x00000080)
+      return WAIT_ABANDONED;
+    if (status == static_cast<NTSTATUS>(0xc000000d))
+      return DXGI_ERROR_INVALID_CALL;
+
+    WARN("DXGIKeyedMutex::ReleaseSync failed, status=", status);
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+private:
+  IResource *resource_; // aggregated; lifetime is owned by the resource.
+  std::atomic<UINT64> fence_value_ = 0;
+};
+
 template <typename tag, typename... Base>
 class TResourceBase : public MTLD3D11DeviceChild<D3D11ResourceCommon, Base...> {
 public:
@@ -187,10 +318,13 @@ public:
       MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(device),
       desc(desc),
       dxgi_resource(new MTLDXGIResource<TResourceBase<tag, Base...>>(this)),
+      keyed_mutex(new MTLDXGIKeyedMutex<TResourceBase<tag, Base...>>(this)),
       d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
     // D3D11ResourceCommonß::bind_flags_
     this->bind_flags_ = desc.BindFlags;
   }
+
+  MTLD3D11Device *GetParentDevice() const { return this->m_parent; }
 
   template <std::size_t n> HRESULT ResolveBase(REFIID riid, void **ppvObject) {
     return E_NOINTERFACE;
@@ -236,6 +370,21 @@ public:
         riid == __uuidof(IDXGIResource) || riid == __uuidof(IDXGIResource1)) {
       *ppvObject = ref(dxgi_resource.get());
       return S_OK;
+    }
+
+    if (riid == __uuidof(IDXGIKeyedMutex)) {
+      if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+        if (GetKeyedMutexHandle()) {
+          *ppvObject = ref(keyed_mutex.get());
+          return S_OK;
+        }
+        WARN("D3D11Resource(", tag::debug_name,
+             "): keyed resource has no D3DKMT keyed mutex handle");
+      } else {
+        TRACE("D3D11Resource(", tag::debug_name, "): keyed mutex interface query ",
+              str::format(riid));
+      }
+      return E_NOINTERFACE;
     }
 
     if (logQueryInterfaceError(__uuidof(typename tag::COM), riid)) {
@@ -303,10 +452,13 @@ public:
       override {
     return E_INVALIDARG;
   }
+  virtual D3DKMT_HANDLE GetKeyedMutexHandle() const override { return 0; }
+  virtual WMT::Reference<WMT::SharedEvent> GetKeyedMutexEvent() const override { return {}; }
 
 protected:
   tag::DESC1 desc;
   std::unique_ptr<IDXGIResource1> dxgi_resource;
+  std::unique_ptr<IDXGIKeyedMutex> keyed_mutex;
   tag::D3D10_IMPL d3d10;
 };
 

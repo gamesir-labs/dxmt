@@ -647,6 +647,31 @@ public:
     ctx_state.has_dirty_op_since_last_event = false;
   };
 
+  HRESULT KeyedMutexAcquire(WMT::Reference<WMT::SharedEvent> event, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    FlushAllPendingBufferUpdates();
+    Flush();
+    EmitOP([event = std::move(event), Value](ArgumentEncodingContext &enc) mutable {
+      enc.waitEvent(std::move(event), Value);
+    });
+
+    return S_OK;
+  }
+
+  HRESULT KeyedMutexRelease(WMT::Reference<WMT::SharedEvent> event, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    FlushAllPendingBufferUpdates();
+    InvalidateCurrentPass();
+    EmitOP([event = std::move(event), Value](ArgumentEncodingContext &enc) mutable {
+      enc.signalEvent(std::move(event), Value);
+    });
+    Flush();
+
+    return S_OK;
+  }
+
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 

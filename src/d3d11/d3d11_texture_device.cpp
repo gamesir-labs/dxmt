@@ -7,6 +7,7 @@
 #include "dxmt_texture.hpp"
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
+#include <cstddef>
 
 namespace dxmt {
 
@@ -81,6 +82,26 @@ CalculateD3DKMTExistingHeapSize(MTLD3D11Device *pDevice, const desc_t &desc) {
   return AlignD3DKMTExistingHeapSize(size);
 }
 
+static void
+DestroyD3DKMTKeyedMutex(D3DKMT_HANDLE &handle) {
+  if (!handle)
+    return;
+  D3DKMT_DESTROYKEYEDMUTEX destroy = {};
+  destroy.hKeyedMutex = handle;
+  D3DKMTDestroyKeyedMutex(&destroy);
+  handle = 0;
+}
+
+static void
+DestroyD3DKMTSyncObject(D3DKMT_HANDLE &handle) {
+  if (!handle)
+    return;
+  D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+  destroy.hSyncObject = handle;
+  D3DKMTDestroySynchronizationObject(&destroy);
+  handle = 0;
+}
+
 template <typename tag_texture>
 class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
 private:
@@ -88,6 +109,11 @@ private:
   float min_lod = 0.0;
   D3DKMT_HANDLE local_kmt_ = 0;
   D3DKMT_HANDLE global_kmt_ = 0;
+  D3DKMT_HANDLE keyed_mutex_ = 0;
+  D3DKMT_HANDLE sync_object_ = 0;
+  D3DKMT_HANDLE keyed_mutex_global_ = 0;
+  D3DKMT_HANDLE sync_object_global_ = 0;
+  WMT::Reference<WMT::SharedEvent> keyed_mutex_event_;
 
   static UINT
   DebugDescHeight(const typename tag_texture::DESC1 &desc) {
@@ -258,10 +284,14 @@ public:
 
   DeviceTexture(
       const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, D3DKMT_HANDLE localHandle, D3DKMT_HANDLE globalHandle,
-      MTLD3D11Device *pDevice
+      MTLD3D11Device *pDevice, D3DKMT_HANDLE keyedMutex = 0, D3DKMT_HANDLE syncObject = 0,
+      D3DKMT_HANDLE keyedMutexGlobal = 0, D3DKMT_HANDLE syncObjectGlobal = 0,
+      WMT::Reference<WMT::SharedEvent> keyedMutexEvent = {}
   ) :
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
-      local_kmt_(localHandle), global_kmt_(globalHandle) {
+      local_kmt_(localHandle), global_kmt_(globalHandle), keyed_mutex_(keyedMutex), sync_object_(syncObject),
+      keyed_mutex_global_(keyedMutexGlobal), sync_object_global_(syncObjectGlobal),
+      keyed_mutex_event_(std::move(keyedMutexEvent)) {
         this->texture_ = std::move(u_texture);
       }
 
@@ -272,6 +302,13 @@ public:
       destroy.hResource = local_kmt_;
       D3DKMTDestroyAllocation(&destroy);
     }
+    DestroyD3DKMTKeyedMutex(keyed_mutex_);
+    DestroyD3DKMTSyncObject(sync_object_);
+  }
+
+  void DetachKeyedMutexHandles() {
+    keyed_mutex_ = 0;
+    sync_object_ = 0;
   }
 
   Rc<StagingResource> staging(UINT) final { return nullptr; }
@@ -427,6 +464,8 @@ public:
     InitReturnPtr(pNTHandle);
     if (!local_kmt_)
       return E_INVALIDARG;
+    if ((this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) && (!keyed_mutex_ || !sync_object_))
+      return E_INVALIDARG;
 
     OBJECT_ATTRIBUTES attr = {};
     attr.Length = sizeof(attr);
@@ -448,7 +487,10 @@ public:
       attr.Attributes = OBJ_CASE_INSENSITIVE;
     }
 
-    if (D3DKMTShareObjects(1, &local_kmt_, &attr, Access, pNTHandle)) {
+    D3DKMT_HANDLE handles[3] = {local_kmt_, keyed_mutex_, sync_object_};
+    UINT count = (this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) ? 3 : 1;
+
+    if (D3DKMTShareObjects(count, handles, &attr, Access, pNTHandle)) {
       ERR("DeviceTexture: Failed to create shared handle");
       return E_FAIL;
     }
@@ -456,12 +498,49 @@ public:
     return S_OK;
   }
 
+  D3DKMT_HANDLE GetKeyedMutexHandle() const override { return keyed_mutex_; }
+
+  WMT::Reference<WMT::SharedEvent> GetKeyedMutexEvent() const override { return keyed_mutex_event_; }
+
   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
 
   float GetMinLOD() override { return min_lod; }
 };
 
-struct SharedResourceData {
+struct WineD3DKMTDXGIDesc {
+  UINT size;
+  UINT version;
+  UINT width;
+  UINT height;
+  DXGI_FORMAT format;
+  UINT unknown_0;
+  UINT unknown_1;
+  UINT keyed_mutex;
+  D3DKMT_HANDLE mutex_handle;
+  D3DKMT_HANDLE sync_handle;
+  UINT nt_shared;
+  UINT unknown_2;
+  UINT unknown_3;
+  UINT unknown_4;
+};
+
+struct WineD3DKMTD3D11Desc {
+  WineD3DKMTDXGIDesc dxgi;
+  D3D11_RESOURCE_DIMENSION dimension;
+  union {
+    D3D10_BUFFER_DESC d3d10_buf;
+    D3D10_TEXTURE1D_DESC d3d10_1d;
+    D3D10_TEXTURE2D_DESC d3d10_2d;
+    D3D10_TEXTURE3D_DESC d3d10_3d;
+    D3D11_BUFFER_DESC d3d11_buf;
+    D3D11_TEXTURE1D_DESC d3d11_1d;
+    D3D11_TEXTURE2D_DESC d3d11_2d;
+    D3D11_TEXTURE3D_DESC d3d11_3d;
+  };
+};
+static_assert(sizeof(WineD3DKMTD3D11Desc) == 0x68);
+
+struct SharedResourceDataV1 {
   char mach_port_name[54];
   D3D11_RESOURCE_DIMENSION dimension;
   union {
@@ -469,7 +548,175 @@ struct SharedResourceData {
     D3D11_TEXTURE2D_DESC1 desc2d;
     D3D11_TEXTURE3D_DESC1 desc3d;
   } desc;
+  D3DKMT_HANDLE keyed_mutex_global;
+  D3DKMT_HANDLE sync_object_global;
+  char keyed_mutex_event_name[54];
 };
+
+struct SharedResourceData {
+  WineD3DKMTD3D11Desc wine_desc;
+  char mach_port_name[54];
+  char keyed_mutex_event_name[54];
+};
+
+static constexpr UINT kSharedResourceDataLegacySize = offsetof(SharedResourceDataV1, keyed_mutex_global);
+static constexpr UINT kSharedResourceDataNoKeyedEventSize = offsetof(SharedResourceDataV1, keyed_mutex_event_name);
+
+static bool
+IsValidSharedResourceDataSize(UINT size) {
+  return (size >= kSharedResourceDataLegacySize && size <= sizeof(SharedResourceDataV1)) ||
+         size == sizeof(SharedResourceData);
+}
+
+struct SharedResourceInfo {
+  char mach_port_name[54] = {};
+  char keyed_mutex_event_name[54] = {};
+  D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+  union {
+    D3D11_TEXTURE1D_DESC desc1d;
+    D3D11_TEXTURE2D_DESC1 desc2d;
+    D3D11_TEXTURE3D_DESC1 desc3d;
+  } desc = {};
+  D3DKMT_HANDLE keyed_mutex_global = 0;
+  D3DKMT_HANDLE sync_object_global = 0;
+  bool has_keyed_mutex_event = false;
+};
+
+static bool
+NormalizeSharedResourceData(const SharedResourceData &runtimeData, UINT size, SharedResourceInfo &info) {
+  if (size == sizeof(SharedResourceData)) {
+    memcpy(info.mach_port_name, runtimeData.mach_port_name, sizeof(info.mach_port_name));
+    memcpy(info.keyed_mutex_event_name, runtimeData.keyed_mutex_event_name, sizeof(info.keyed_mutex_event_name));
+    info.dimension = runtimeData.wine_desc.dimension;
+    info.keyed_mutex_global = runtimeData.wine_desc.dxgi.mutex_handle;
+    info.sync_object_global = runtimeData.wine_desc.dxgi.sync_handle;
+    info.has_keyed_mutex_event = info.keyed_mutex_event_name[0] != '\0';
+
+    switch (info.dimension)
+    {
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+      info.desc.desc1d = runtimeData.wine_desc.d3d11_1d;
+      return true;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+      UpgradeResourceDescription(&runtimeData.wine_desc.d3d11_2d, info.desc.desc2d);
+      return true;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+      UpgradeResourceDescription(&runtimeData.wine_desc.d3d11_3d, info.desc.desc3d);
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  SharedResourceDataV1 legacy = {};
+  memcpy(&legacy, &runtimeData, std::min<size_t>(size, sizeof(legacy)));
+  memcpy(info.mach_port_name, legacy.mach_port_name, sizeof(info.mach_port_name));
+  info.dimension = legacy.dimension;
+  switch (info.dimension)
+  {
+  case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+    info.desc.desc1d = legacy.desc.desc1d;
+    break;
+  case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    info.desc.desc2d = legacy.desc.desc2d;
+    break;
+  case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+    info.desc.desc3d = legacy.desc.desc3d;
+    break;
+  default:
+    return false;
+  }
+  if (size >= kSharedResourceDataLegacySize + sizeof(D3DKMT_HANDLE) * 2) {
+    info.keyed_mutex_global = legacy.keyed_mutex_global;
+    info.sync_object_global = legacy.sync_object_global;
+  }
+  if (size >= sizeof(SharedResourceDataV1)) {
+    memcpy(info.keyed_mutex_event_name, legacy.keyed_mutex_event_name, sizeof(info.keyed_mutex_event_name));
+    info.has_keyed_mutex_event = info.keyed_mutex_event_name[0] != '\0';
+  }
+  return true;
+}
+
+template <typename desc_t>
+static void
+FillWineSharedResourceDesc(WineD3DKMTD3D11Desc &wineDesc, const desc_t &desc, D3DKMT_HANDLE keyedMutexGlobal,
+                           D3DKMT_HANDLE syncObjectGlobal, bool ntSecuritySharing) {
+  wineDesc.dxgi.size = sizeof(WineD3DKMTD3D11Desc);
+  wineDesc.dxgi.version = 1;
+  wineDesc.dxgi.width = desc.Width;
+  wineDesc.dxgi.height = TextureDescHeight(desc);
+  wineDesc.dxgi.format = desc.Format;
+  wineDesc.dxgi.keyed_mutex = keyedMutexGlobal ? 1 : 0;
+  wineDesc.dxgi.mutex_handle = keyedMutexGlobal;
+  wineDesc.dxgi.sync_handle = syncObjectGlobal;
+  wineDesc.dxgi.nt_shared = ntSecuritySharing ? 1 : 0;
+  wineDesc.dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+
+  if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE1D_DESC>) {
+    wineDesc.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE1D;
+    wineDesc.d3d11_1d = desc;
+  } else if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE2D_DESC1>) {
+    D3D11_TEXTURE2D_DESC desc2d = {};
+    DowngradeResourceDescription(desc, &desc2d);
+    wineDesc.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE2D;
+    wineDesc.d3d11_2d = desc2d;
+  } else if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE3D_DESC1>) {
+    D3D11_TEXTURE3D_DESC desc3d = {};
+    DowngradeResourceDescription(desc, &desc3d);
+    wineDesc.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE3D;
+    wineDesc.d3d11_3d = desc3d;
+  }
+}
+
+static WMT::Reference<WMT::SharedEvent>
+OpenSharedKeyedMutexEvent(MTLD3D11Device *pDevice, const SharedResourceInfo &runtimeData) {
+  mach_port_t mach_port;
+  if (!WMTBootstrapLookUp(runtimeData.keyed_mutex_event_name, &mach_port)) {
+    WARN("ImportSharedTexture: Failed to look up keyed mutex shared event");
+    return {};
+  }
+
+  auto event = pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port);
+  if (!event) {
+    WARN("ImportSharedTexture: Failed to import keyed mutex shared event");
+    return {};
+  }
+  return event;
+}
+
+static HRESULT
+OpenSharedKeyedMutexHandles(const SharedResourceInfo &runtimeData, D3DKMT_HANDLE &keyedMutex,
+                            D3DKMT_HANDLE &syncObject) {
+  keyedMutex = 0;
+  syncObject = 0;
+
+  if (!runtimeData.keyed_mutex_global || !runtimeData.sync_object_global) {
+    WARN("ImportSharedTexture: keyed resource is missing shared keyed mutex handles");
+    return E_INVALIDARG;
+  }
+
+  D3DKMT_OPENKEYEDMUTEX2 openMutex = {};
+  openMutex.hSharedHandle = runtimeData.keyed_mutex_global;
+  auto status = D3DKMTOpenKeyedMutex2(&openMutex);
+  if (status) {
+    WARN("ImportSharedTexture: Failed to open keyed mutex, status=", status);
+    return E_INVALIDARG;
+  }
+
+  D3DKMT_OPENSYNCHRONIZATIONOBJECT openSync = {};
+  openSync.hSharedHandle = runtimeData.sync_object_global;
+  status = D3DKMTOpenSynchronizationObject(&openSync);
+  if (status) {
+    WARN("ImportSharedTexture: Failed to open sync object, status=", status);
+    keyedMutex = openMutex.hKeyedMutex;
+    DestroyD3DKMTKeyedMutex(keyedMutex);
+    return E_INVALIDARG;
+  }
+
+  keyedMutex = openMutex.hKeyedMutex;
+  syncObject = openSync.hSyncObject;
+  return S_OK;
+}
 
 template <typename tag>
 HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
@@ -534,14 +781,75 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       ERR("DeviceTexture: Failed to get mach port for shared texture");
       return E_FAIL;
     }
-    SharedResourceData runtimeData;
+    D3DKMT_HANDLE keyedMutex = 0;
+    D3DKMT_HANDLE syncObject = 0;
+    D3DKMT_HANDLE keyedMutexGlobal = 0;
+    D3DKMT_HANDLE syncObjectGlobal = 0;
+    WMT::Reference<WMT::SharedEvent> keyedMutexEvent;
+    bool hasKeyedMutex = finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    bool ntSecuritySharing = finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    NTSTATUS status = 0;
+
+    if (hasKeyedMutex) {
+      D3DKMT_CREATEKEYEDMUTEX2 createMutex = {};
+      createMutex.Flags.NtSecuritySharing = ntSecuritySharing;
+      status = D3DKMTCreateKeyedMutex2(&createMutex);
+      if (status) {
+        ERR("DeviceTexture: Failed to create keyed mutex", " status=", status);
+        return E_FAIL;
+      }
+      keyedMutex = createMutex.hKeyedMutex;
+      keyedMutexGlobal = createMutex.hSharedHandle;
+
+      D3DKMT_CREATESYNCHRONIZATIONOBJECT2 createSync = {};
+      createSync.hDevice = local_kmt;
+      createSync.Info.Type = D3DDDI_SYNCHRONIZATION_MUTEX;
+      createSync.Info.Flags.Shared = 1;
+      createSync.Info.Flags.NtSecuritySharing = ntSecuritySharing;
+      status = D3DKMTCreateSynchronizationObject2(&createSync);
+      if (status) {
+        ERR("DeviceTexture: Failed to create keyed mutex sync object", " status=", status);
+        DestroyD3DKMTKeyedMutex(keyedMutex);
+        return E_FAIL;
+      }
+      syncObject = createSync.hSyncObject;
+      syncObjectGlobal = createSync.Info.SharedHandle;
+
+      keyedMutexEvent = pDevice->GetMTLDevice().newSharedEvent();
+      if (!keyedMutexEvent) {
+        ERR("DeviceTexture: Failed to create keyed mutex shared event");
+        DestroyD3DKMTKeyedMutex(keyedMutex);
+        DestroyD3DKMTSyncObject(syncObject);
+        return E_FAIL;
+      }
+      keyedMutexEvent.signalValue(0);
+    }
+
+    SharedResourceData runtimeData = {};
+    FillWineSharedResourceDesc(runtimeData.wine_desc, finalDesc, keyedMutexGlobal, syncObjectGlobal, ntSecuritySharing);
     MakeUniqueSharedName(runtimeData.mach_port_name);
     if (!WMTBootstrapRegister(runtimeData.mach_port_name, mach_port)) {
       ERR("DeviceTexture: Failed to register mach port for shared texture");
+      DestroyD3DKMTKeyedMutex(keyedMutex);
+      DestroyD3DKMTSyncObject(syncObject);
       return E_FAIL;
     }
-    runtimeData.dimension = tag::dimension;
-    memcpy(&runtimeData.desc, pDesc, sizeof(typename tag::DESC1));
+    if (keyedMutexEvent) {
+      auto eventMachPort = keyedMutexEvent.createMachPort();
+      if (!eventMachPort) {
+        ERR("DeviceTexture: Failed to get mach port for keyed mutex shared event");
+        DestroyD3DKMTKeyedMutex(keyedMutex);
+        DestroyD3DKMTSyncObject(syncObject);
+        return E_FAIL;
+      }
+      MakeUniqueSharedName(runtimeData.keyed_mutex_event_name);
+      if (!WMTBootstrapRegister(runtimeData.keyed_mutex_event_name, eventMachPort)) {
+        ERR("DeviceTexture: Failed to register keyed mutex shared event");
+        DestroyD3DKMTKeyedMutex(keyedMutex);
+        DestroyD3DKMTSyncObject(syncObject);
+        return E_FAIL;
+      }
+    }
 
     D3DKMT_CREATEALLOCATION create = {};
     create.hDevice = local_kmt;
@@ -560,8 +868,8 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     allocationInfo.pSystemMem = systemMem;
     create.Flags.CreateResource = 1;
     create.Flags.CreateShared = 1;
-    create.Flags.NtSecuritySharing = !!(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
-    auto status = D3DKMTCreateAllocation2(&create);
+    create.Flags.NtSecuritySharing = ntSecuritySharing;
+    status = D3DKMTCreateAllocation2(&create);
     if (status) {
       ERR(
           "DeviceTexture: Failed to create D3DKMT for shared texture",
@@ -573,15 +881,16 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
           " existing_heap_size=", standardAllocation.ExistingHeapData.Size,
           " allocation_private_size=", allocationInfo.PrivateDriverDataSize
       );
+      DestroyD3DKMTKeyedMutex(keyedMutex);
+      DestroyD3DKMTSyncObject(syncObject);
       return E_FAIL;
     }
-
-    // TODO: handle keyed mutex
 
     initialize(std::move(allocation));
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
-                                   create.hGlobalShare, pDevice))
+                                   create.hGlobalShare, pDevice, keyedMutex, syncObject,
+                                   keyedMutexGlobal, syncObjectGlobal, std::move(keyedMutexEvent)))
     );
     return S_OK;
   }
@@ -636,21 +945,37 @@ template <typename tag>
 HRESULT
 ImportSharedTextureInternal(
     MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, mach_port_t MachPort, REFIID riid,
-    void **ppTexture
+    void **ppTexture, D3DKMT_HANDLE keyedMutex = 0, D3DKMT_HANDLE syncObject = 0,
+    WMT::Reference<WMT::SharedEvent> keyedMutexEvent = {}
 ) {
   WMTTextureInfo info;
   typename tag::DESC1 finalDesc;
-  if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info)))
+  if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info))) {
+    DestroyD3DKMTKeyedMutex(keyedMutex);
+    DestroyD3DKMTSyncObject(syncObject);
     return E_INVALIDARG;
+  }
 
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
   auto allocation = texture->import(MachPort);
-  if (!allocation)
+  if (!allocation) {
+    DestroyD3DKMTKeyedMutex(keyedMutex);
+    DestroyD3DKMTSyncObject(syncObject);
     return E_FAIL;
+  }
   texture->rename(std::move(allocation));
 
-  Com<DeviceTexture<tag>> device_texture = (ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
-  return device_texture->QueryInterface(riid, ppTexture);
+  Com<DeviceTexture<tag>> device_texture = Com<DeviceTexture<tag>>::transfer(
+      ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), 0, 0, pDevice, keyedMutex, syncObject, 0, 0,
+                                 std::move(keyedMutexEvent)))
+  );
+  HRESULT hr = device_texture->QueryInterface(riid, ppTexture);
+  if (FAILED(hr)) {
+    device_texture->DetachKeyedMutexHandles();
+    DestroyD3DKMTKeyedMutex(keyedMutex);
+    DestroyD3DKMTSyncObject(syncObject);
+  }
+  return hr;
 }
 
 HRESULT
@@ -665,7 +990,7 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
   if (ppTexture == nullptr)
     return S_FALSE;
 
-  struct SharedResourceData runtimeData;
+  struct SharedResourceData runtimeData = {};
 
   D3DKMT_QUERYRESOURCEINFO query = {};
   query.hDevice = pDevice->GetLocalD3DKMT();
@@ -678,7 +1003,7 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
     return E_INVALIDARG;
   }
 
-  if (query.PrivateRuntimeDataSize != sizeof(runtimeData)) {
+  if (!IsValidSharedResourceDataSize(query.PrivateRuntimeDataSize)) {
     WARN("ImportSharedTexture: Unexpected size: ", query.PrivateRuntimeDataSize);
     return E_INVALIDARG;
   } 
@@ -702,28 +1027,70 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
   destroy.hResource = open.hResource;
   D3DKMTDestroyAllocation(&destroy);
 
-  mach_port_t mach_port;
-  if (!WMTBootstrapLookUp(runtimeData.mach_port_name, &mach_port)) {
-    ERR("ImportSharedTexture: Failed to look up mach port");
+  SharedResourceInfo runtimeInfo;
+  if (!NormalizeSharedResourceData(runtimeData, open.PrivateRuntimeDataSize, runtimeInfo)) {
+    WARN("ImportSharedTexture: Unsupported runtime data");
     return E_INVALIDARG;
   }
 
-  switch (runtimeData.dimension)
+  D3DKMT_HANDLE keyedMutex = 0;
+  D3DKMT_HANDLE syncObject = 0;
+  WMT::Reference<WMT::SharedEvent> keyedMutexEvent;
+  switch (runtimeInfo.dimension)
+  {
+  case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+    if (runtimeInfo.desc.desc1d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX &&
+        FAILED(OpenSharedKeyedMutexHandles(runtimeInfo, keyedMutex, syncObject)))
+      return E_INVALIDARG;
+    break;
+  case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    if (runtimeInfo.desc.desc2d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX &&
+        FAILED(OpenSharedKeyedMutexHandles(runtimeInfo, keyedMutex, syncObject)))
+      return E_INVALIDARG;
+    break;
+  case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+    if (runtimeInfo.desc.desc3d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX &&
+        FAILED(OpenSharedKeyedMutexHandles(runtimeInfo, keyedMutex, syncObject)))
+      return E_INVALIDARG;
+    break;
+  default:
+    break;
+  }
+
+  if (keyedMutex && runtimeInfo.has_keyed_mutex_event)
+    keyedMutexEvent = OpenSharedKeyedMutexEvent(pDevice, runtimeInfo);
+  else if (keyedMutex)
+    WARN("ImportSharedTexture: keyed resource has no shared GPU event in runtime data");
+
+  mach_port_t mach_port;
+  if (!WMTBootstrapLookUp(runtimeInfo.mach_port_name, &mach_port)) {
+    ERR("ImportSharedTexture: Failed to look up mach port");
+    DestroyD3DKMTKeyedMutex(keyedMutex);
+    DestroyD3DKMTSyncObject(syncObject);
+    return E_INVALIDARG;
+  }
+
+  switch (runtimeInfo.dimension)
   {
   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
     return ImportSharedTextureInternal<tag_texture_1d>(
-        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture
+        pDevice, &runtimeInfo.desc.desc1d, mach_port, riid, ppTexture, keyedMutex, syncObject,
+        std::move(keyedMutexEvent)
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     return ImportSharedTextureInternal<tag_texture_2d>(
-        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture
+        pDevice, &runtimeInfo.desc.desc2d, mach_port, riid, ppTexture, keyedMutex, syncObject,
+        std::move(keyedMutexEvent)
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
     return ImportSharedTextureInternal<tag_texture_3d>(
-        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture
+        pDevice, &runtimeInfo.desc.desc3d, mach_port, riid, ppTexture, keyedMutex, syncObject,
+        std::move(keyedMutexEvent)
     );
   default:
     ERR("ImportSharedTexture: Unsupported resource dimension");
+    DestroyD3DKMTKeyedMutex(keyedMutex);
+    DestroyD3DKMTSyncObject(syncObject);
     return E_INVALIDARG;
   }
 }
@@ -740,7 +1107,7 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
   if (ppTexture == nullptr)
     return S_FALSE;
 
-  struct SharedResourceData runtimeData;
+  struct SharedResourceData runtimeData = {};
 
   D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query = {};
   query.hDevice = pDevice->GetLocalD3DKMT();
@@ -753,7 +1120,7 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
     return E_INVALIDARG;
   }
   
-  if (query.PrivateRuntimeDataSize != sizeof(runtimeData)) {
+  if (!IsValidSharedResourceDataSize(query.PrivateRuntimeDataSize)) {
     WARN(str::format("ImportSharedTextureFromNtHandle: Unexpected size: ", query.PrivateRuntimeDataSize));
     return E_INVALIDARG;
   }
@@ -781,41 +1148,64 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
   destroy.hResource = open.hResource;
   D3DKMTDestroyAllocation(&destroy);
 
-  if (open.hSyncObject) {
-    WARN(str::format("ImportSharedTextureFromNtHandle: Ignoring bundled sync object"));
-    D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroySync = {};
-    destroySync.hSyncObject = open.hSyncObject;
-    D3DKMTDestroySynchronizationObject(&destroySync);
-  }
-  if (open.hKeyedMutex) {
-    WARN(str::format("ImportSharedTextureFromNtHandle: Ignoring bundled keyed mutex"));
-    D3DKMT_DESTROYKEYEDMUTEX destroyMutex = {};
-    destroyMutex.hKeyedMutex = open.hKeyedMutex;
-    D3DKMTDestroyKeyedMutex(&destroyMutex);
-  }
-
-  mach_port_t mach_port;
-  if (!WMTBootstrapLookUp(runtimeData.mach_port_name, &mach_port)) {
-    ERR("ImportSharedTexture: Failed to look up mach port");
+  SharedResourceInfo runtimeInfo;
+  if (!NormalizeSharedResourceData(runtimeData, open.PrivateRuntimeDataSize, runtimeInfo)) {
+    WARN("ImportSharedTextureFromNtHandle: Unsupported runtime data");
+    DestroyD3DKMTKeyedMutex(open.hKeyedMutex);
+    DestroyD3DKMTSyncObject(open.hSyncObject);
     return E_INVALIDARG;
   }
 
-  switch (runtimeData.dimension)
+  mach_port_t mach_port;
+  if (!WMTBootstrapLookUp(runtimeInfo.mach_port_name, &mach_port)) {
+    ERR("ImportSharedTexture: Failed to look up mach port");
+    DestroyD3DKMTKeyedMutex(open.hKeyedMutex);
+    DestroyD3DKMTSyncObject(open.hSyncObject);
+    return E_INVALIDARG;
+  }
+
+  WMT::Reference<WMT::SharedEvent> keyedMutexEvent;
+  if (open.hKeyedMutex && runtimeInfo.has_keyed_mutex_event)
+    keyedMutexEvent = OpenSharedKeyedMutexEvent(pDevice, runtimeInfo);
+  else if (open.hKeyedMutex)
+    WARN("ImportSharedTextureFromNtHandle: keyed resource has no shared GPU event in runtime data");
+
+  switch (runtimeInfo.dimension)
   {
   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+    if ((runtimeInfo.desc.desc1d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) && !open.hKeyedMutex) {
+      WARN("ImportSharedTextureFromNtHandle: Missing bundled keyed mutex");
+      DestroyD3DKMTSyncObject(open.hSyncObject);
+      return E_INVALIDARG;
+    }
     return ImportSharedTextureInternal<tag_texture_1d>(
-        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture
+        pDevice, &runtimeInfo.desc.desc1d, mach_port, riid, ppTexture, open.hKeyedMutex, open.hSyncObject,
+        std::move(keyedMutexEvent)
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    if ((runtimeInfo.desc.desc2d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) && !open.hKeyedMutex) {
+      WARN("ImportSharedTextureFromNtHandle: Missing bundled keyed mutex");
+      DestroyD3DKMTSyncObject(open.hSyncObject);
+      return E_INVALIDARG;
+    }
     return ImportSharedTextureInternal<tag_texture_2d>(
-        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture
+        pDevice, &runtimeInfo.desc.desc2d, mach_port, riid, ppTexture, open.hKeyedMutex, open.hSyncObject,
+        std::move(keyedMutexEvent)
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+    if ((runtimeInfo.desc.desc3d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) && !open.hKeyedMutex) {
+      WARN("ImportSharedTextureFromNtHandle: Missing bundled keyed mutex");
+      DestroyD3DKMTSyncObject(open.hSyncObject);
+      return E_INVALIDARG;
+    }
     return ImportSharedTextureInternal<tag_texture_3d>(
-        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture
+        pDevice, &runtimeInfo.desc.desc3d, mach_port, riid, ppTexture, open.hKeyedMutex, open.hSyncObject,
+        std::move(keyedMutexEvent)
     );
   default:
     ERR("ImportSharedTexture: Unsupported resource dimension");
+    DestroyD3DKMTKeyedMutex(open.hKeyedMutex);
+    DestroyD3DKMTSyncObject(open.hSyncObject);
     return E_INVALIDARG;
   }
 }
