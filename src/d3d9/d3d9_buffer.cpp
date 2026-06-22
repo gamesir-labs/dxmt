@@ -262,7 +262,11 @@ MTLD3D9VertexBuffer::Release() {
       m_isLosable = false;
       m_device->onLosableResourceDestroyed();
     }
-    m_device->Release();
+    // The destructor returns the buffer backing to the device pool, so the
+    // device has to outlive it. Drop the device pin LAST: capture it
+    // (ReleasePrivate frees `this`), let the destructor run while the pin still
+    // keeps the device alive, then release the pin, which may now free it.
+    MTLD3D9Device *device = m_device;
     // Drop the ctor self-pin exactly once: same shape as
     // MTLD3D9Surface / MTLD3D9Texture. Subsequent Get/Release cycles
     // on a slot-bound buffer must not call ReleasePrivate again
@@ -271,6 +275,7 @@ MTLD3D9VertexBuffer::Release() {
       m_self_pinned = false;
       ReleasePrivate();
     }
+    device->Release();
   }
   return ref;
 }
@@ -489,11 +494,15 @@ MTLD3D9IndexBuffer::Release() {
       m_isLosable = false;
       m_device->onLosableResourceDestroyed();
     }
-    m_device->Release();
+    // The destructor returns the buffer backing to the device pool, so the
+    // device has to outlive it (see MTLD3D9VertexBuffer::Release): drop the
+    // device pin last, after the destructor has run.
+    MTLD3D9Device *device = m_device;
     if (m_self_pinned) {
       m_self_pinned = false;
       ReleasePrivate();
     }
+    device->Release();
   }
   return ref;
 }
