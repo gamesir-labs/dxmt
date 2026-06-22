@@ -6,6 +6,7 @@
 #include "d3d11_context_impl.cpp"
 #include "dxmt_context.hpp"
 #include "dxmt_staging.hpp"
+#include <algorithm>
 
 namespace dxmt {
 struct ContextInternalState {
@@ -20,6 +21,512 @@ template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj) {
 }
 
 using ImmediateContextBase = MTLD3D11DeviceContextImplBase<ContextInternalState>;
+
+class MTLD3D11VideoContext final : public ID3D11VideoContext {
+public:
+  explicit MTLD3D11VideoContext(ID3D11DeviceContext *context) :
+      context_(context) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
+    return context_->QueryInterface(riid, ppvObject);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return context_->AddRef();
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    return context_->Release();
+  }
+
+  void STDMETHODCALLTYPE GetDevice(ID3D11Device **ppDevice) override {
+    return context_->GetDevice(ppDevice);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *pDataSize, void *pData) override {
+    return context_->GetPrivateData(guid, pDataSize, pData);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT DataSize, const void *pData) override {
+    return context_->SetPrivateData(guid, DataSize, pData);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown *pData) override {
+    return context_->SetPrivateDataInterface(guid, pData);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetDecoderBuffer(
+      ID3D11VideoDecoder *,
+      D3D11_VIDEO_DECODER_BUFFER_TYPE,
+      UINT *buffer_size,
+      void **buffer) override {
+    if (buffer_size)
+      *buffer_size = 0;
+    if (buffer)
+      *buffer = nullptr;
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE ReleaseDecoderBuffer(
+      ID3D11VideoDecoder *,
+      D3D11_VIDEO_DECODER_BUFFER_TYPE) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DecoderBeginFrame(
+      ID3D11VideoDecoder *,
+      ID3D11VideoDecoderOutputView *,
+      UINT,
+      const void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DecoderEndFrame(ID3D11VideoDecoder *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE SubmitDecoderBuffers(
+      ID3D11VideoDecoder *,
+      UINT,
+      const D3D11_VIDEO_DECODER_BUFFER_DESC *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE DecoderExtension(
+      ID3D11VideoDecoder *,
+      const D3D11_VIDEO_DECODER_EXTENSION *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorSetOutputTargetRect(
+      ID3D11VideoProcessor *,
+      WINBOOL,
+      const RECT *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetOutputBackgroundColor(
+      ID3D11VideoProcessor *,
+      WINBOOL,
+      const D3D11_VIDEO_COLOR *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetOutputColorSpace(
+      ID3D11VideoProcessor *,
+      const D3D11_VIDEO_PROCESSOR_COLOR_SPACE *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetOutputAlphaFillMode(
+      ID3D11VideoProcessor *,
+      D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE,
+      UINT) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetOutputConstriction(
+      ID3D11VideoProcessor *,
+      WINBOOL,
+      SIZE) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetOutputStereoMode(
+      ID3D11VideoProcessor *,
+      WINBOOL) override {}
+
+  HRESULT STDMETHODCALLTYPE VideoProcessorSetOutputExtension(
+      ID3D11VideoProcessor *,
+      const GUID *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetOutputTargetRect(
+      ID3D11VideoProcessor *,
+      WINBOOL *enabled,
+      RECT *rect) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (rect)
+      *rect = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetOutputBackgroundColor(
+      ID3D11VideoProcessor *,
+      WINBOOL *y_cb_cr,
+      D3D11_VIDEO_COLOR *color) override {
+    if (y_cb_cr)
+      *y_cb_cr = FALSE;
+    if (color)
+      *color = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetOutputColorSpace(
+      ID3D11VideoProcessor *,
+      D3D11_VIDEO_PROCESSOR_COLOR_SPACE *color_space) override {
+    if (color_space)
+      *color_space = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetOutputAlphaFillMode(
+      ID3D11VideoProcessor *,
+      D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE *alpha_fill_mode,
+      UINT *stream_idx) override {
+    if (alpha_fill_mode)
+      *alpha_fill_mode = D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE;
+    if (stream_idx)
+      *stream_idx = 0;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetOutputConstriction(
+      ID3D11VideoProcessor *,
+      WINBOOL *enabled,
+      SIZE *size) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (size)
+      *size = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetOutputStereoMode(
+      ID3D11VideoProcessor *,
+      WINBOOL *enabled) override {
+    if (enabled)
+      *enabled = FALSE;
+  }
+
+  HRESULT STDMETHODCALLTYPE VideoProcessorGetOutputExtension(
+      ID3D11VideoProcessor *,
+      const GUID *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamFrameFormat(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_FRAME_FORMAT) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamColorSpace(
+      ID3D11VideoProcessor *,
+      UINT,
+      const D3D11_VIDEO_PROCESSOR_COLOR_SPACE *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamOutputRate(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_PROCESSOR_OUTPUT_RATE,
+      WINBOOL,
+      const DXGI_RATIONAL *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamSourceRect(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      const RECT *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamDestRect(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      const RECT *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamAlpha(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      float) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamPalette(
+      ID3D11VideoProcessor *,
+      UINT,
+      UINT,
+      const UINT *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamPixelAspectRatio(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      const DXGI_RATIONAL *,
+      const DXGI_RATIONAL *) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamLumaKey(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      float,
+      float) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamStereoFormat(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      D3D11_VIDEO_PROCESSOR_STEREO_FORMAT,
+      WINBOOL,
+      WINBOOL,
+      D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE,
+      int) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamAutoProcessingMode(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamFilter(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_PROCESSOR_FILTER,
+      WINBOOL,
+      int) override {}
+
+  HRESULT STDMETHODCALLTYPE VideoProcessorSetStreamExtension(
+      ID3D11VideoProcessor *,
+      UINT,
+      const GUID *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamFrameFormat(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_FRAME_FORMAT *format) override {
+    if (format)
+      *format = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamColorSpace(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_PROCESSOR_COLOR_SPACE *color_space) override {
+    if (color_space)
+      *color_space = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamOutputRate(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_PROCESSOR_OUTPUT_RATE *rate,
+      WINBOOL *repeat,
+      DXGI_RATIONAL *custom_rate) override {
+    if (rate)
+      *rate = D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL;
+    if (repeat)
+      *repeat = FALSE;
+    if (custom_rate)
+      *custom_rate = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamSourceRect(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled,
+      RECT *rect) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (rect)
+      *rect = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamDestRect(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled,
+      RECT *rect) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (rect)
+      *rect = {};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamAlpha(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled,
+      float *alpha) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (alpha)
+      *alpha = 1.0f;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamPalette(
+      ID3D11VideoProcessor *,
+      UINT,
+      UINT entry_count,
+      UINT *entries) override {
+    if (entries)
+      std::fill_n(entries, entry_count, 0);
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamPixelAspectRatio(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled,
+      DXGI_RATIONAL *src_aspect_ratio,
+      DXGI_RATIONAL *dst_aspect_ratio) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (src_aspect_ratio)
+      *src_aspect_ratio = {1, 1};
+    if (dst_aspect_ratio)
+      *dst_aspect_ratio = {1, 1};
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamLumaKey(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled,
+      float *lower,
+      float *upper) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (lower)
+      *lower = 0.0f;
+    if (upper)
+      *upper = 1.0f;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamStereoFormat(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled,
+      D3D11_VIDEO_PROCESSOR_STEREO_FORMAT *format,
+      WINBOOL *left_view_frame0,
+      WINBOOL *base_view_frame0,
+      D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE *flip_mode,
+      int *mono_offset) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (format)
+      *format = D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_MONO;
+    if (left_view_frame0)
+      *left_view_frame0 = FALSE;
+    if (base_view_frame0)
+      *base_view_frame0 = FALSE;
+    if (flip_mode)
+      *flip_mode = D3D11_VIDEO_PROCESSOR_STEREO_FLIP_NONE;
+    if (mono_offset)
+      *mono_offset = 0;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamAutoProcessingMode(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enabled) override {
+    if (enabled)
+      *enabled = FALSE;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamFilter(
+      ID3D11VideoProcessor *,
+      UINT,
+      D3D11_VIDEO_PROCESSOR_FILTER,
+      WINBOOL *enabled,
+      int *level) override {
+    if (enabled)
+      *enabled = FALSE;
+    if (level)
+      *level = 0;
+  }
+
+  HRESULT STDMETHODCALLTYPE VideoProcessorGetStreamExtension(
+      ID3D11VideoProcessor *,
+      UINT,
+      const GUID *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE VideoProcessorBlt(
+      ID3D11VideoProcessor *,
+      ID3D11VideoProcessorOutputView *,
+      UINT,
+      UINT,
+      const D3D11_VIDEO_PROCESSOR_STREAM *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE NegotiateCryptoSessionKeyExchange(
+      ID3D11CryptoSession *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  void STDMETHODCALLTYPE EncryptionBlt(
+      ID3D11CryptoSession *,
+      ID3D11Texture2D *,
+      ID3D11Texture2D *,
+      UINT,
+      void *) override {}
+
+  void STDMETHODCALLTYPE DecryptionBlt(
+      ID3D11CryptoSession *,
+      ID3D11Texture2D *,
+      ID3D11Texture2D *,
+      D3D11_ENCRYPTED_BLOCK_INFO *,
+      UINT,
+      const void *,
+      UINT,
+      void *) override {}
+
+  void STDMETHODCALLTYPE StartSessionKeyRefresh(
+      ID3D11CryptoSession *,
+      UINT,
+      void *) override {}
+
+  void STDMETHODCALLTYPE FinishSessionKeyRefresh(ID3D11CryptoSession *) override {}
+
+  HRESULT STDMETHODCALLTYPE GetEncryptionBltKey(
+      ID3D11CryptoSession *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE NegotiateAuthenticatedChannelKeyExchange(
+      ID3D11AuthenticatedChannel *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE QueryAuthenticatedChannel(
+      ID3D11AuthenticatedChannel *,
+      UINT,
+      const void *,
+      UINT,
+      void *) override {
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE ConfigureAuthenticatedChannel(
+      ID3D11AuthenticatedChannel *,
+      UINT,
+      const void *,
+      D3D11_AUTHENTICATED_CONFIGURE_OUTPUT *output) override {
+    if (output)
+      *output = {};
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  void STDMETHODCALLTYPE VideoProcessorSetStreamRotation(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL,
+      D3D11_VIDEO_PROCESSOR_ROTATION) override {}
+
+  void STDMETHODCALLTYPE VideoProcessorGetStreamRotation(
+      ID3D11VideoProcessor *,
+      UINT,
+      WINBOOL *enable,
+      D3D11_VIDEO_PROCESSOR_ROTATION *rotation) override {
+    if (enable)
+      *enable = FALSE;
+    if (rotation)
+      *rotation = D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY;
+  }
+
+private:
+  ID3D11DeviceContext *context_;
+};
 
 template <>
 template <CommandWithContext<ArgumentEncodingContext> cmd>
@@ -82,6 +589,7 @@ public:
       ImmediateContextBase(pDevice, ctx_state, pDevice->mutex),
       cmd_queue(cmd_queue),
       ctx_state({cmd_queue}),
+      video_context_(this),
       d3dmt_(this, mutex) {
         ignore_map_flag_no_wait_ = Config::getInstance().getOption<bool>("d3d11.ignoreMapFlagNoWait", false);
       }
@@ -96,6 +604,11 @@ public:
 
     if (riid == __uuidof(ID3D11Multithread)) {
       *ppvObject = ref(&d3dmt_);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D11VideoContext)) {
+      *ppvObject = ref(&video_context_);
       return S_OK;
     }
 
@@ -708,6 +1221,7 @@ private:
   CommandQueue &cmd_queue;
   ContextInternalState ctx_state;
   std::atomic<uint32_t> refcount = 0;
+  MTLD3D11VideoContext video_context_;
   D3D11Multithread d3dmt_;
   bool ignore_map_flag_no_wait_;
 };

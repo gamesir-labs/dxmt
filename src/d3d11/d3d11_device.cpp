@@ -1146,6 +1146,220 @@ private:
   D3D11Multithread d3dmt_;
 };
 
+class MTLD3D11VideoDevice final : public ID3D11VideoDevice1 {
+public:
+  MTLD3D11VideoDevice(IUnknown *container) : container_(container) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
+    return container_->QueryInterface(riid, ppvObject);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return container_->AddRef(); }
+
+  ULONG STDMETHODCALLTYPE Release() override { return container_->Release(); }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoDecoder(
+      const D3D11_VIDEO_DECODER_DESC *,
+      const D3D11_VIDEO_DECODER_CONFIG *,
+      ID3D11VideoDecoder **ppDecoder) override {
+    InitReturnPtr(ppDecoder);
+    TRACE("D3D11VideoDevice::CreateVideoDecoder: unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessor(
+      ID3D11VideoProcessorEnumerator *,
+      UINT,
+      ID3D11VideoProcessor **ppVideoProcessor) override {
+    InitReturnPtr(ppVideoProcessor);
+    TRACE("D3D11VideoDevice::CreateVideoProcessor: unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateAuthenticatedChannel(
+      D3D11_AUTHENTICATED_CHANNEL_TYPE,
+      ID3D11AuthenticatedChannel **ppAuthenticatedChannel) override {
+    InitReturnPtr(ppAuthenticatedChannel);
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateCryptoSession(
+      const GUID *,
+      const GUID *,
+      const GUID *,
+      ID3D11CryptoSession **ppCryptoSession) override {
+    InitReturnPtr(ppCryptoSession);
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoDecoderOutputView(
+      ID3D11Resource *,
+      const D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC *,
+      ID3D11VideoDecoderOutputView **ppVDOVView) override {
+    InitReturnPtr(ppVDOVView);
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessorInputView(
+      ID3D11Resource *,
+      ID3D11VideoProcessorEnumerator *,
+      const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC *,
+      ID3D11VideoProcessorInputView **ppVPIView) override {
+    InitReturnPtr(ppVPIView);
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessorOutputView(
+      ID3D11Resource *,
+      ID3D11VideoProcessorEnumerator *,
+      const D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC *,
+      ID3D11VideoProcessorOutputView **ppVPOView) override {
+    InitReturnPtr(ppVPOView);
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessorEnumerator(
+      const D3D11_VIDEO_PROCESSOR_CONTENT_DESC *,
+      ID3D11VideoProcessorEnumerator **ppEnum) override {
+    InitReturnPtr(ppEnum);
+    TRACE("D3D11VideoDevice::CreateVideoProcessorEnumerator: unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  UINT STDMETHODCALLTYPE GetVideoDecoderProfileCount() override { return 0; }
+
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderProfile(
+      UINT,
+      GUID *pDecoderProfile) override {
+    if (!pDecoderProfile)
+      return E_INVALIDARG;
+    *pDecoderProfile = {};
+    return E_INVALIDARG;
+  }
+
+  HRESULT STDMETHODCALLTYPE CheckVideoDecoderFormat(
+      const GUID *,
+      DXGI_FORMAT,
+      WINBOOL *pSupported) override {
+    if (!pSupported)
+      return E_INVALIDARG;
+    *pSupported = FALSE;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderConfigCount(
+      const D3D11_VIDEO_DECODER_DESC *,
+      UINT *pCount) override {
+    if (!pCount)
+      return E_INVALIDARG;
+    *pCount = 0;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderConfig(
+      const D3D11_VIDEO_DECODER_DESC *,
+      UINT,
+      D3D11_VIDEO_DECODER_CONFIG *pConfig) override {
+    if (!pConfig)
+      return E_INVALIDARG;
+    *pConfig = {};
+    return E_INVALIDARG;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetContentProtectionCaps(
+      const GUID *,
+      const GUID *,
+      D3D11_VIDEO_CONTENT_PROTECTION_CAPS *pCaps) override {
+    if (!pCaps)
+      return E_INVALIDARG;
+    *pCaps = {};
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE CheckCryptoKeyExchange(
+      const GUID *,
+      const GUID *,
+      UINT,
+      GUID *pKeyExchangeType) override {
+    if (!pKeyExchangeType)
+      return E_INVALIDARG;
+    *pKeyExchangeType = {};
+    return E_INVALIDARG;
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateData(
+      REFGUID guid,
+      UINT DataSize,
+      const void *pData) override {
+    return private_data_.setData(guid, DataSize, pData);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(
+      REFGUID guid,
+      const IUnknown *pData) override {
+    return private_data_.setInterface(guid, pData);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetCryptoSessionPrivateDataSize(
+      const GUID *,
+      const GUID *,
+      const GUID *,
+      UINT *input_size,
+      UINT *output_size) override {
+    if (!input_size || !output_size)
+      return E_INVALIDARG;
+    *input_size = 0;
+    *output_size = 0;
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderCaps(
+      const GUID *,
+      UINT,
+      UINT,
+      const DXGI_RATIONAL *,
+      UINT,
+      const GUID *,
+      UINT *decoder_caps) override {
+    if (!decoder_caps)
+      return E_INVALIDARG;
+    *decoder_caps = 0;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE CheckVideoDecoderDownsampling(
+      const D3D11_VIDEO_DECODER_DESC *,
+      DXGI_COLOR_SPACE_TYPE,
+      const D3D11_VIDEO_DECODER_CONFIG *,
+      const DXGI_RATIONAL *,
+      const D3D11_VIDEO_SAMPLE_DESC *,
+      WINBOOL *supported,
+      WINBOOL *real_time_hint) override {
+    if (!supported)
+      return E_INVALIDARG;
+    *supported = FALSE;
+    if (real_time_hint)
+      *real_time_hint = FALSE;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE RecommendVideoDecoderDownsampleParameters(
+      const D3D11_VIDEO_DECODER_DESC *,
+      DXGI_COLOR_SPACE_TYPE,
+      const D3D11_VIDEO_DECODER_CONFIG *,
+      const DXGI_RATIONAL *,
+      D3D11_VIDEO_SAMPLE_DESC *recommended_output_desc) override {
+    if (!recommended_output_desc)
+      return E_INVALIDARG;
+    *recommended_output_desc = {};
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+
+private:
+  IUnknown *container_;
+  ComPrivateData private_data_;
+};
+
 /**
  * \brief D3D11 device container
  *
@@ -1161,7 +1375,8 @@ public:
       : adapter_(adapter), device(std::move(device)),
         cmd_queue_(this->device->queue()),
         d3d11_device_(this, adapter, feature_level, feature_flags,
-                      *this->device.get()) {
+                      *this->device.get()),
+        video_device_(this) {
     if (adapter_->GetLocalD3DKMT()) {
       D3DKMT_CREATEDEVICE create = {};
       create.hAdapter = adapter_->GetLocalD3DKMT();
@@ -1205,6 +1420,16 @@ public:
 
     if (riid == __uuidof(ID3D10Device) || riid == __uuidof(ID3D10Device1)) {
       *ppvObject = ref_and_cast<ID3D10Device>(d3d11_device_.d3d10_.get());
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D11VideoDevice)) {
+      *ppvObject = ref_and_cast<ID3D11VideoDevice>(&video_device_);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D11VideoDevice1)) {
+      *ppvObject = ref_and_cast<ID3D11VideoDevice1>(&video_device_);
       return S_OK;
     }
 
@@ -1335,6 +1560,7 @@ private:
   std::unique_ptr<Device> device;
   CommandQueue &cmd_queue_;
   MTLD3D11DeviceImpl d3d11_device_;
+  MTLD3D11VideoDevice video_device_;
 };
 
 Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,
