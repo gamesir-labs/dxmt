@@ -3646,6 +3646,14 @@ typedef struct macdrv_opaque_window *macdrv_window;
 typedef struct macdrv_opaque_window_data *macdrv_window_data;
 typedef struct opaque_window_surface *window_surface;
 typedef struct opaque_HWND *HWND;
+typedef struct _D3DKMT_ACQUIREKEYEDMUTEX D3DKMT_ACQUIREKEYEDMUTEX;
+typedef struct _D3DKMT_CREATEKEYEDMUTEX2 D3DKMT_CREATEKEYEDMUTEX2;
+typedef struct _D3DKMT_CREATESYNCHRONIZATIONOBJECT2 D3DKMT_CREATESYNCHRONIZATIONOBJECT2;
+typedef struct _D3DKMT_DESTROYKEYEDMUTEX D3DKMT_DESTROYKEYEDMUTEX;
+typedef struct _D3DKMT_DESTROYSYNCHRONIZATIONOBJECT D3DKMT_DESTROYSYNCHRONIZATIONOBJECT;
+typedef struct _D3DKMT_OPENKEYEDMUTEX2 D3DKMT_OPENKEYEDMUTEX2;
+typedef struct _D3DKMT_OPENSYNCHRONIZATIONOBJECT D3DKMT_OPENSYNCHRONIZATIONOBJECT;
+typedef struct _D3DKMT_RELEASEKEYEDMUTEX D3DKMT_RELEASEKEYEDMUTEX;
 struct macdrv_win_data {
   HWND hwnd; /* hwnd that this private data belongs to */
   macdrv_window cocoa_window;
@@ -3664,7 +3672,30 @@ struct macdrv_functions_t {
   macdrv_metal_layer (*macdrv_view_get_metal_layer)(macdrv_metal_view v);
   void (*macdrv_view_release_metal_view)(macdrv_metal_view v);
   void (*on_main_thread)(dispatch_block_t b);
+  void *RegQueryValueExA;
+  void *RegSetValueExA;
+  void *RegOpenKeyExA;
+  void *RegCreateKeyExA;
+  void *RegCloseKey;
+  void *EnumDisplayMonitors;
+  void *GetMonitorInfoA;
+  void *AdjustWindowRectEx;
+  void *GetWindowLongPtrW;
+  void *GetWindowRect;
+  void *MoveWindow;
+  void *SetWindowPos;
+  void *GetSystemMetrics;
+  void *SetWindowLongPtrW;
+  NTSTATUS (*D3DKMTAcquireKeyedMutex)(D3DKMT_ACQUIREKEYEDMUTEX *);
+  NTSTATUS (*D3DKMTCreateKeyedMutex2)(D3DKMT_CREATEKEYEDMUTEX2 *);
+  NTSTATUS (*D3DKMTCreateSynchronizationObject2)(D3DKMT_CREATESYNCHRONIZATIONOBJECT2 *);
+  NTSTATUS (*D3DKMTDestroyKeyedMutex)(const D3DKMT_DESTROYKEYEDMUTEX *);
+  NTSTATUS (*D3DKMTDestroySynchronizationObject)(const D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *);
+  NTSTATUS (*D3DKMTOpenKeyedMutex2)(D3DKMT_OPENKEYEDMUTEX2 *);
+  NTSTATUS (*D3DKMTOpenSynchronizationObject)(D3DKMT_OPENSYNCHRONIZATIONOBJECT *);
+  NTSTATUS (*D3DKMTReleaseKeyedMutex)(D3DKMT_RELEASEKEYEDMUTEX *);
 };
+_Static_assert(sizeof(struct macdrv_functions_t) == 256, "macdrv_functions_t size mismatch");
 
 static NTSTATUS
 _CreateMetalViewFromHWND(void *obj) {

@@ -135,10 +135,77 @@ typedef struct _D3DKMT_ESCAPE
   D3DKMT_HANDLE      hContext;
 } D3DKMT_ESCAPE;
 
+typedef struct _D3DKMT_CREATEKEYEDMUTEX
+{
+  UINT64 InitialValue;
+  D3DKMT_HANDLE hSharedHandle;
+  D3DKMT_HANDLE hKeyedMutex;
+} D3DKMT_CREATEKEYEDMUTEX;
+
+typedef struct _D3DKMT_CREATEKEYEDMUTEX2_FLAGS
+{
+  union
+  {
+    struct
+    {
+      UINT NtSecuritySharing : 1;
+      UINT Reserved : 31;
+    };
+    UINT Value;
+  };
+} D3DKMT_CREATEKEYEDMUTEX2_FLAGS;
+
+typedef struct _D3DKMT_CREATEKEYEDMUTEX2
+{
+  UINT64 InitialValue;
+  D3DKMT_HANDLE hSharedHandle;
+  D3DKMT_HANDLE hKeyedMutex;
+  void *pPrivateRuntimeData;
+  UINT PrivateRuntimeDataSize;
+  D3DKMT_CREATEKEYEDMUTEX2_FLAGS Flags;
+} D3DKMT_CREATEKEYEDMUTEX2;
+
 typedef struct _D3DKMT_DESTROYKEYEDMUTEX
 {
   D3DKMT_HANDLE hKeyedMutex;
 } D3DKMT_DESTROYKEYEDMUTEX;
+
+typedef struct _D3DKMT_OPENKEYEDMUTEX
+{
+  D3DKMT_HANDLE hSharedHandle;
+  D3DKMT_HANDLE hKeyedMutex;
+} D3DKMT_OPENKEYEDMUTEX;
+
+typedef struct _D3DKMT_OPENKEYEDMUTEX2
+{
+  D3DKMT_HANDLE hSharedHandle;
+  D3DKMT_HANDLE hKeyedMutex;
+  void *pPrivateRuntimeData;
+  UINT PrivateRuntimeDataSize;
+} D3DKMT_OPENKEYEDMUTEX2;
+
+typedef struct _D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE
+{
+  HANDLE hNtHandle;
+  D3DKMT_HANDLE hKeyedMutex;
+  void *pPrivateRuntimeData;
+  UINT PrivateRuntimeDataSize;
+} D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE;
+
+typedef struct _D3DKMT_ACQUIREKEYEDMUTEX
+{
+  D3DKMT_HANDLE hKeyedMutex;
+  UINT64 Key;
+  LARGE_INTEGER *pTimeout;
+  UINT64 FenceValue;
+} D3DKMT_ACQUIREKEYEDMUTEX;
+
+typedef struct _D3DKMT_RELEASEKEYEDMUTEX
+{
+  D3DKMT_HANDLE hKeyedMutex;
+  UINT64 Key;
+  UINT64 FenceValue;
+} D3DKMT_RELEASEKEYEDMUTEX;
 
 typedef struct _D3DKMT_QUERYRESOURCEINFO
 {
@@ -329,6 +396,13 @@ typedef struct _D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2
   };
 } D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2;
 
+typedef struct _D3DKMT_OPENSYNCHRONIZATIONOBJECT
+{
+  D3DKMT_HANDLE hSharedHandle;
+  D3DKMT_HANDLE hSyncObject;
+  UINT64 Reserved[8];
+} D3DKMT_OPENSYNCHRONIZATIONOBJECT;
+
 typedef struct _D3DKMT_CREATESTANDARDALLOCATIONFLAGS
 {
   union
@@ -485,11 +559,19 @@ extern "C"
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenResource2(D3DKMT_OPENRESOURCE *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenResourceFromNtHandle(D3DKMT_OPENRESOURCEFROMNTHANDLE *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTEscape(const D3DKMT_ESCAPE *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTAcquireKeyedMutex(D3DKMT_ACQUIREKEYEDMUTEX *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCreateKeyedMutex(D3DKMT_CREATEKEYEDMUTEX *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCreateKeyedMutex2(D3DKMT_CREATEKEYEDMUTEX2 *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTDestroyKeyedMutex(const D3DKMT_DESTROYKEYEDMUTEX *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenKeyedMutex(D3DKMT_OPENKEYEDMUTEX *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenKeyedMutex2(D3DKMT_OPENKEYEDMUTEX2 *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenKeyedMutexFromNtHandle(D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTReleaseKeyedMutex(D3DKMT_RELEASEKEYEDMUTEX *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTQueryResourceInfo(D3DKMT_QUERYRESOURCEINFO *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTQueryResourceInfoFromNtHandle(D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCreateSynchronizationObject2(D3DKMT_CREATESYNCHRONIZATIONOBJECT2 *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenSyncObjectFromNtHandle2(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *desc);
+  DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTOpenSynchronizationObject(D3DKMT_OPENSYNCHRONIZATIONOBJECT *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCreateAllocation2(D3DKMT_CREATEALLOCATION *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTCloseAdapter(const D3DKMT_CLOSEADAPTER *desc);
   DECLSPEC_IMPORT NTSTATUS WINAPI D3DKMTShareObjects(UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr, UINT access, HANDLE *handle);
@@ -547,8 +629,43 @@ extern "C"
     return -1;
   }
 
+  inline NTSTATUS D3DKMTAcquireKeyedMutex(D3DKMT_ACQUIREKEYEDMUTEX *desc) {
+    dxmt::Logger::warn("D3DKMTAcquireKeyedMutex not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTCreateKeyedMutex(D3DKMT_CREATEKEYEDMUTEX *desc) {
+    dxmt::Logger::warn("D3DKMTCreateKeyedMutex not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTCreateKeyedMutex2(D3DKMT_CREATEKEYEDMUTEX2 *desc) {
+    dxmt::Logger::warn("D3DKMTCreateKeyedMutex2 not implemented.");
+    return -1;
+  }
+
   inline NTSTATUS D3DKMTDestroyKeyedMutex(const D3DKMT_DESTROYKEYEDMUTEX *desc) {
     dxmt::Logger::warn("D3DKMTDestroyKeyedMutex not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTOpenKeyedMutex(D3DKMT_OPENKEYEDMUTEX *desc) {
+    dxmt::Logger::warn("D3DKMTOpenKeyedMutex not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTOpenKeyedMutex2(D3DKMT_OPENKEYEDMUTEX2 *desc) {
+    dxmt::Logger::warn("D3DKMTOpenKeyedMutex2 not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTOpenKeyedMutexFromNtHandle(D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE *desc) {
+    dxmt::Logger::warn("D3DKMTOpenKeyedMutexFromNtHandle not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTReleaseKeyedMutex(D3DKMT_RELEASEKEYEDMUTEX *desc) {
+    dxmt::Logger::warn("D3DKMTReleaseKeyedMutex not implemented.");
     return -1;
   }
 
@@ -569,6 +686,11 @@ extern "C"
 
   inline NTSTATUS D3DKMTOpenSyncObjectFromNtHandle2(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *desc) {
     dxmt::Logger::warn("D3DKMTOpenSyncObjectFromNtHandle2 not implemented.");
+    return -1;
+  }
+
+  inline NTSTATUS D3DKMTOpenSynchronizationObject(D3DKMT_OPENSYNCHRONIZATIONOBJECT *desc) {
+    dxmt::Logger::warn("D3DKMTOpenSynchronizationObject not implemented.");
     return -1;
   }
 
