@@ -860,6 +860,50 @@ D3D12DiagCBVReadbackEnabled() {
 }
 
 static bool
+D3D12ApitraceGpuCbvSnapshotEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_APITRACE_GPU_CBV_SNAPSHOT");
+  return enabled;
+}
+
+static bool
+DiagIsTargetCompositePso(const std::string &key) {
+  return key == "bee0b7250cb8447bc326e2ceeedb2f7083216c10";
+}
+
+static thread_local uint64_t g_diag_replay_record_sequence = 0;
+static thread_local uint64_t g_diag_replay_record_serial = 0;
+
+static uint64_t
+DiagCurrentReplayRecordSequence() {
+  if (g_diag_replay_record_sequence)
+    return g_diag_replay_record_sequence;
+  return dxmt::apitrace::current_d3d_sequence();
+}
+
+static uint64_t
+DiagCurrentReplayRecordSerial() {
+  return g_diag_replay_record_serial;
+}
+
+struct DiagReplayRecordScope {
+  uint64_t old_sequence = 0;
+  uint64_t old_serial = 0;
+
+  DiagReplayRecordScope(uint64_t sequence, uint64_t serial)
+      : old_sequence(g_diag_replay_record_sequence),
+        old_serial(g_diag_replay_record_serial) {
+    g_diag_replay_record_sequence = sequence;
+    g_diag_replay_record_serial = serial;
+  }
+
+  ~DiagReplayRecordScope() {
+    g_diag_replay_record_sequence = old_sequence;
+    g_diag_replay_record_serial = old_serial;
+  }
+};
+
+static bool
 D3D12DiagExecuteIndirectEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_EXECUTE_INDIRECT") ||
@@ -939,19 +983,25 @@ D3D12DiagHexBytes(const uint8_t *bytes, size_t size) {
 static Rc<VisibilityResultQuery>
 D3D12DiagCreateDrawVisibilityQuery(
     CommandChunk *chunk, const char *kind, const std::string &pso,
-    uint32_t vertex_count, uint32_t index_count, uint32_t instance_count) {
+    uint64_t d3d_sequence, uint32_t vertex_count, uint32_t index_count,
+    uint32_t instance_count) {
   static std::atomic<uint32_t> log_count = 0;
-  if (!D3D12DiagShouldLog(log_count, D3D12DiagDrawVisibilityEnabled()))
+  const bool target_pso = DiagIsTargetCompositePso(pso);
+  if (!target_pso &&
+      !D3D12DiagShouldLog(log_count, D3D12DiagDrawVisibilityEnabled()))
     return nullptr;
 
   Rc<VisibilityResultQuery> query = new VisibilityResultQuery();
+  const auto record_serial = DiagCurrentReplayRecordSerial();
   chunk->deferred_readbacks.push_back(
-      [query, kind = std::string(kind), pso, vertex_count, index_count,
-       instance_count]() {
+      [query, kind = std::string(kind), pso, d3d_sequence, vertex_count,
+       index_count, instance_count, record_serial]() {
         uint64_t value = 0;
         const bool ready = query->getValue(&value);
         INFO("D3D12 diagnostic: draw visibility",
              " kind=", kind,
+             " sequence=", d3d_sequence,
+             " recordSerial=", record_serial,
              " pso=", pso,
              " ready=", uint32_t(ready),
              " visibleSamples=", ready ? value : 0,
@@ -969,6 +1019,21 @@ D3D12DiagFloatWords(const uint8_t *bytes, size_t size) {
   for (size_t i = 0; i < count; i++) {
     float value = 0.0f;
     std::memcpy(&value, bytes + i * sizeof(value), sizeof(value));
+    if (i)
+      out << ',';
+    out << value;
+  }
+  return out.str();
+}
+
+static std::string
+D3D12DiagFloatsAt(const uint8_t *bytes, size_t size, size_t byte_offset) {
+  if (byte_offset + 4 * sizeof(float) > size)
+    return "oob";
+  std::ostringstream out;
+  for (size_t i = 0; i < 4; i++) {
+    float value = 0.0f;
+    std::memcpy(&value, bytes + byte_offset + i * sizeof(float), sizeof(value));
     if (i)
       out << ',';
     out << value;
@@ -1093,6 +1158,160 @@ ExpectedDescriptorTypeForRange(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
   }
 }
 
+static WMTTextureSwizzleChannels
+DefaultTextureViewSwizzle() {
+  return {
+      WMTTextureSwizzleRed,
+      WMTTextureSwizzleGreen,
+      WMTTextureSwizzleBlue,
+      WMTTextureSwizzleAlpha,
+  };
+}
+
+static WMTTextureSwizzleChannels
+BaseShaderReadSwizzleForFormat(WMTPixelFormat format) {
+  switch (format) {
+  case WMTPixelFormatA8Unorm:
+    return {
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleRed,
+    };
+  case WMTPixelFormatR8Unorm:
+  case WMTPixelFormatR8Unorm_sRGB:
+  case WMTPixelFormatR8Snorm:
+  case WMTPixelFormatR8Uint:
+  case WMTPixelFormatR8Sint:
+  case WMTPixelFormatR16Unorm:
+  case WMTPixelFormatR16Snorm:
+  case WMTPixelFormatR16Uint:
+  case WMTPixelFormatR16Sint:
+  case WMTPixelFormatR16Float:
+  case WMTPixelFormatR32Uint:
+  case WMTPixelFormatR32Sint:
+  case WMTPixelFormatR32Float:
+  case WMTPixelFormatBC4_RUnorm:
+  case WMTPixelFormatBC4_RSnorm:
+  case WMTPixelFormatEAC_R11Unorm:
+  case WMTPixelFormatEAC_R11Snorm:
+  case WMTPixelFormatDepth16Unorm:
+  case WMTPixelFormatDepth32Float:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleOne,
+    };
+  case WMTPixelFormatRG8Unorm:
+  case WMTPixelFormatRG8Unorm_sRGB:
+  case WMTPixelFormatRG8Snorm:
+  case WMTPixelFormatRG8Uint:
+  case WMTPixelFormatRG8Sint:
+  case WMTPixelFormatRG16Unorm:
+  case WMTPixelFormatRG16Snorm:
+  case WMTPixelFormatRG16Uint:
+  case WMTPixelFormatRG16Sint:
+  case WMTPixelFormatRG16Float:
+  case WMTPixelFormatRG32Uint:
+  case WMTPixelFormatRG32Sint:
+  case WMTPixelFormatRG32Float:
+  case WMTPixelFormatBC5_RGUnorm:
+  case WMTPixelFormatBC5_RGSnorm:
+  case WMTPixelFormatEAC_RG11Unorm:
+  case WMTPixelFormatEAC_RG11Snorm:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleGreen,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleOne,
+    };
+  case WMTPixelFormatRG11B10Float:
+  case WMTPixelFormatRGB9E5Float:
+  case WMTPixelFormatBC6H_RGBFloat:
+  case WMTPixelFormatBC6H_RGBUfloat:
+  case WMTPixelFormatB5G6R5Unorm:
+  case WMTPixelFormatPVRTC_RGB_2BPP:
+  case WMTPixelFormatPVRTC_RGB_2BPP_sRGB:
+  case WMTPixelFormatPVRTC_RGB_4BPP:
+  case WMTPixelFormatPVRTC_RGB_4BPP_sRGB:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleGreen,
+        WMTTextureSwizzleBlue,
+        WMTTextureSwizzleOne,
+    };
+  case WMTPixelFormatBGRX8Unorm:
+  case WMTPixelFormatBGRX8Unorm_sRGB:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleGreen,
+        WMTTextureSwizzleBlue,
+        WMTTextureSwizzleOne,
+    };
+  default:
+    return DefaultTextureViewSwizzle();
+  }
+}
+
+static WMTTextureSwizzle
+TextureSwizzleFromD3D12Component(UINT component_mapping, UINT component_index) {
+  switch (D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(component_index,
+                                                  component_mapping)) {
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0:
+    return WMTTextureSwizzleRed;
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1:
+    return WMTTextureSwizzleGreen;
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2:
+    return WMTTextureSwizzleBlue;
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3:
+    return WMTTextureSwizzleAlpha;
+  case D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0:
+    return WMTTextureSwizzleZero;
+  case D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1:
+    return WMTTextureSwizzleOne;
+  default:
+    WARN("D3D12CommandQueue: invalid shader component mapping ",
+         component_mapping);
+    return WMTTextureSwizzleZero;
+  }
+}
+
+static WMTTextureSwizzle
+ComposeTextureSwizzleComponent(const WMTTextureSwizzleChannels &base,
+                               WMTTextureSwizzle component) {
+  switch (component) {
+  case WMTTextureSwizzleRed:
+    return base.r;
+  case WMTTextureSwizzleGreen:
+    return base.g;
+  case WMTTextureSwizzleBlue:
+    return base.b;
+  case WMTTextureSwizzleAlpha:
+    return base.a;
+  case WMTTextureSwizzleZero:
+  case WMTTextureSwizzleOne:
+    return component;
+  default:
+    return WMTTextureSwizzleZero;
+  }
+}
+
+static WMTTextureSwizzleChannels
+ShaderResourceViewSwizzle(WMTPixelFormat format, UINT component_mapping) {
+  const auto base = BaseShaderReadSwizzleForFormat(format);
+  return {
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 0)),
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 1)),
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 2)),
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 3)),
+  };
+}
+
 static void
 D3D12DiagLogTextureView(const char *kind, Resource &resource,
                         const DescriptorRecord &descriptor,
@@ -1130,6 +1349,9 @@ D3D12DiagLogTextureView(const char *kind, Resource &resource,
        " view_mips=", uint32_t(view.miplevelCount),
        " view_array=", uint32_t(view.firstArraySlice),
        " view_array_size=", uint32_t(view.arraySize),
+       " view_swizzle=", uint32_t(view.swizzle.r), ",",
+       uint32_t(view.swizzle.g), ",", uint32_t(view.swizzle.b), ",",
+       uint32_t(view.swizzle.a),
        " view_usage=", uint32_t(view.intendedUsage));
 }
 
@@ -2807,6 +3029,9 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
   view.firstArraySlice = 0;
   view.arraySize = texture->arrayLength();
   view.intendedUsage = WMTTextureUsageShaderRead;
+  view.swizzle =
+      ShaderResourceViewSwizzle(view.format,
+                                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
 
   if (!descriptor.has_desc) {
     auto key = texture->createView(view);
@@ -2843,6 +3068,8 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
   view.format = ResolveTextureViewFormat(device, resource, srv.Format, plane);
   if (view.format == WMTPixelFormatInvalid)
     return {};
+  view.swizzle =
+      ShaderResourceViewSwizzle(view.format, srv.Shader4ComponentMapping);
 
   switch (srv.ViewDimension) {
   case D3D12_SRV_DIMENSION_TEXTURE1D:
@@ -4097,13 +4324,17 @@ private:
                            new_height ? nullptr : &new_height);
       new_width = new_width ? new_width : 1;
       new_height = new_height ? new_height : 1;
-      DXGI_FORMAT new_format =
+      const DXGI_FORMAT new_format =
           format == DXGI_FORMAT_UNKNOWN ? desc_.Format : format;
-      if (GetSwapChainPixelFormat(new_format) == WMTPixelFormatInvalid) {
+      const WMTPixelFormat new_pixel_format =
+          GetSwapChainPixelFormat(new_format);
+      if (new_pixel_format == WMTPixelFormatInvalid) {
         WARN("D3D12SwapChain::ResizeBuffers: unsupported format ",
              new_format);
         return DXGI_ERROR_UNSUPPORTED;
       }
+      const WMTColorSpace new_color_space =
+          GetD3D12SwapChainLayerColorSpace(new_format, color_space_);
       if (HasExternalBackBufferReferences()) {
         WARN("D3D12SwapChain::ResizeBuffers: backbuffer references are still "
              "held by the application");
@@ -4126,9 +4357,7 @@ private:
              desc_.Width, "x", desc_.Height);
       }
 
-      presenter_->changeLayerProperties(GetSwapChainPixelFormat(desc_.Format),
-                                        GetD3D12SwapChainLayerColorSpace(
-                                            desc_.Format, color_space_),
+      presenter_->changeLayerProperties(new_pixel_format, new_color_space,
                                         desc_.Width, desc_.Height,
                                         desc_.SampleDesc.Count
                                             ? desc_.SampleDesc.Count
@@ -4151,7 +4380,7 @@ private:
         resource_desc.Height = desc_.Height;
         resource_desc.DepthOrArraySize = 1;
         resource_desc.MipLevels = 1;
-        resource_desc.Format = desc_.Format;
+        resource_desc.Format = new_format;
         resource_desc.SampleDesc = desc_.SampleDesc;
         if (!resource_desc.SampleDesc.Count)
           resource_desc.SampleDesc.Count = 1;
@@ -4886,6 +5115,7 @@ private:
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_srv_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_uav_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_uav_roots;
+    uint64_t current_record_d3d_sequence = 0;
     uint64_t graphics_binding_generation = 1;
     // descAccess content-fingerprint cache (DXMT_DESCACCESS_CACHE): skip the
     // per-draw hazard-record loop when (PSO, root-sig, descriptor CONTENT) is
@@ -4943,6 +5173,7 @@ private:
     copy.compute_srv_roots = state.compute_srv_roots;
     copy.graphics_uav_roots = state.graphics_uav_roots;
     copy.compute_uav_roots = state.compute_uav_roots;
+    copy.current_record_d3d_sequence = state.current_record_d3d_sequence;
     copy.graphics_binding_generation = state.graphics_binding_generation;
     copy.predication_buffer = state.predication_buffer;
     copy.predication_buffer_offset = state.predication_buffer_offset;
@@ -4953,6 +5184,20 @@ private:
               clock::now() - rb_clone_t0).count();
     return copy;
   }
+
+  struct ReplayStateRecordScope {
+    ReplayState &state;
+    uint64_t old_sequence = 0;
+
+    ReplayStateRecordScope(ReplayState &state, uint64_t sequence)
+        : state(state), old_sequence(state.current_record_d3d_sequence) {
+      state.current_record_d3d_sequence = sequence;
+    }
+
+    ~ReplayStateRecordScope() {
+      state.current_record_d3d_sequence = old_sequence;
+    }
+  };
 
   static void
   BumpGraphicsBindingGeneration(ReplayState &state) {
@@ -6101,6 +6346,7 @@ private:
     static thread_local PerDrawSubTimers t;
     return t;
   }
+
   // PERF DIAG (DXMT_DIAG_STALL): per-RECORD-instance stall localization. The
   // real wall is NOT uniform per-draw descAccess (~0.14%) but a synchronous
   // first-use stall on SOME DrawIndexed/Dispatch records (per-draw cost varies
@@ -6224,6 +6470,7 @@ private:
            " records=", records.size());
     }
     UINT record_index = 0;
+    uint64_t replay_record_serial = 0;
     // PERF DIAG (DXMT_DIAG_REPLAY_BREAKDOWN): sub-time the replay stage to
     // attribute the 300-780ms explosion-frame replay to record-loop vs
     // FlushPassBatches vs timestamp/query materialization.
@@ -6247,6 +6494,9 @@ private:
     StallProbe rb_stall_accum = {};
     uint64_t rb_stall_total_us = 0;
     auto replay_one = [&](const CommandRecord &record) {
+      DiagReplayRecordScope diag_record_scope(record.d3d_sequence,
+                                              ++replay_record_serial);
+      ReplayStateRecordScope state_record_scope(state, record.d3d_sequence);
       if (record.d3d_sequence != 0) {
         dxmt::apitrace::set_current_d3d_sequence(record.d3d_sequence);
       }
@@ -8986,6 +9236,61 @@ private:
     }
   }
 
+  static UINT
+  ShaderBindingSlotCapacity(SM50BindingType binding_type) {
+    switch (binding_type) {
+    case SM50BindingType::ConstantBuffer:
+      return 14u;
+    case SM50BindingType::Sampler:
+      return 16u;
+    case SM50BindingType::UAV:
+      return kUAVBindings;
+    case SM50BindingType::SRV:
+    default:
+      return kSRVBindings;
+    }
+  }
+
+  static UINT
+  ShaderArgumentQwordStride(const DXMT12_MTL4_SHADER_ARGUMENT &argument) {
+    if (argument.Type == SM50BindingType::Sampler)
+      return 3u;
+
+    UINT stride = 1u;
+    if (argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)
+      stride = 2u;
+    else if (argument.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER)
+      stride = 2u;
+
+    if (argument.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER)
+      stride = std::max(stride, 3u);
+    return stride;
+  }
+
+  static UINT
+  ShaderArgumentRangeCount(const DXMT12_MTL4_SHADER_ARGUMENT &argument) {
+    const auto count = argument.RegisterCount ? argument.RegisterCount : 1u;
+    if (count != UINT_MAX)
+      return std::max<UINT>(count, 1u);
+
+    const auto capacity = ShaderBindingSlotCapacity(argument.Type);
+    if (argument.SM50BindingSlot >= capacity)
+      return 0u;
+    return capacity - argument.SM50BindingSlot;
+  }
+
+  static DXMT12_MTL4_SHADER_ARGUMENT
+  ShaderArgumentAtRangeOffset(const DXMT12_MTL4_SHADER_ARGUMENT &argument,
+                              UINT offset) {
+    auto result = argument;
+    result.SM50BindingSlot += offset;
+    result.RegisterLowerBound += offset;
+    result.StructurePtrOffset +=
+        offset * ShaderArgumentQwordStride(argument);
+    result.RegisterCount = 1u;
+    return result;
+  }
+
   static std::optional<UINT>
   ResolveShaderBindingSlot(const PipelineState &pipeline, PipelineStage stage,
                            SM50BindingType binding_type, UINT shader_register,
@@ -9496,10 +9801,8 @@ private:
                   const auto lower = argument.RegisterCount
                                          ? argument.RegisterLowerBound
                                          : argument.SM50BindingSlot;
-                  const auto arg_count =
-                      argument.RegisterCount ? argument.RegisterCount : 1;
                   const auto resolved_count =
-                      arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+                      ShaderArgumentRangeCount(argument);
                   if (space != range.register_space ||
                       lower + resolved_count < lower)
                     continue;
@@ -10649,7 +10952,7 @@ private:
     uint32_t entry_count = 0;
   };
 
-  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 1;
+  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 2;
 
   static std::string BuildDescriptorTableBindingRecipeCachePath() {
     return dxmt::GetDXMTShaderCacheDirectory() + "d3d12_binding_recipes.db";
@@ -10760,17 +11063,11 @@ private:
             const auto lower = argument.RegisterCount
                                    ? argument.RegisterLowerBound
                                    : argument.SM50BindingSlot;
-            const auto arg_count =
-                argument.RegisterCount ? argument.RegisterCount : 1;
             if (space != range.register_space ||
                 lower < range.base_shader_register)
               continue;
             const auto first = lower - range.base_shader_register;
-            // TODO(d3d12): unbounded descriptor ranges are currently clamped
-            // to reflected shader usage. Bindless tests need full descriptor
-            // table residency and dynamic indexing beyond reflected slots.
-            const auto size =
-                arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+            const auto size = ShaderArgumentRangeCount(argument);
             count = std::max(count, first + size);
           }
         });
@@ -10861,10 +11158,8 @@ private:
                 const auto lower =
                     argument.RegisterCount ? argument.RegisterLowerBound
                                            : argument.SM50BindingSlot;
-                const auto arg_count =
-                    argument.RegisterCount ? argument.RegisterCount : 1;
                 const auto resolved_count =
-                    arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+                    ShaderArgumentRangeCount(argument);
                 if (space != range.register_space ||
                     lower + resolved_count < lower)
                   continue;
@@ -10887,7 +11182,7 @@ private:
                   entry.descriptor_index = descriptor_index;
                   entry.descriptor_count = count;
                   entry.range_type = range.range_type;
-                  entry.argument = argument;
+                  entry.argument = ShaderArgumentAtRangeOffset(argument, i);
                   recipe.entries.push_back(entry);
                 }
               }
@@ -12125,22 +12420,28 @@ private:
                          UINT64 index_resource_offset,
                          UINT64 index_offset) {
     static std::atomic<uint32_t> log_count = 0;
-    if (!D3D12DiagShouldLog(log_count, D3D12DiagDrawStateEnabled()))
-      return;
 
     const auto *graphics = pipeline.GetGraphicsState();
     const auto &desc = graphics->desc;
     const auto slot_mask = InputSlotMask(graphics);
     const auto &cache_key = pipeline.GetShaderCacheKey();
+    const bool target_pso = DiagIsTargetCompositePso(cache_key);
+    if (!target_pso && !D3D12DiagShouldLog(log_count, D3D12DiagDrawStateEnabled()))
+      return;
+
     const auto *key = cache_key.c_str();
     const auto key_size = std::min<size_t>(cache_key.size(), 16);
     std::string key_prefix(key, key + key_size);
+    const auto d3d_sequence = DiagCurrentReplayRecordSequence();
+    const auto record_serial = DiagCurrentReplayRecordSerial();
     const bool color0_write =
         desc.NumRenderTargets &&
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask != 0;
 
     INFO("D3D12 diagnostic: draw state",
          " kind=", kind,
+         " sequence=", d3d_sequence,
+         " recordSerial=", record_serial,
          " pso=", key_prefix,
          " topology=", uint32_t(state.topology),
          " primitiveTopologyType=", uint32_t(desc.PrimitiveTopologyType),
@@ -12207,16 +12508,36 @@ private:
     for (const auto &color : attachments.colors) {
       INFO("D3D12 diagnostic: draw attachment state",
            " pso=", key_prefix,
+           " sequence=", d3d_sequence,
+           " recordSerial=", record_serial,
            " slot=", uint32_t(color.slot),
            " view=", uint64_t(color.view),
            " format=", uint32_t(color.format),
            " size=", color.width, "x", color.height,
            " array=", uint32_t(color.array_length));
     }
+    for (UINT i = 0; i < state.render_targets.size(); i++) {
+      const auto &descriptor = state.render_targets[i];
+      Resource *resource = GetResource(descriptor.resource.ptr());
+      INFO("D3D12 diagnostic: draw rtv binding",
+           " pso=", key_prefix,
+           " sequence=", d3d_sequence,
+           " recordSerial=", record_serial,
+           " slot=", i,
+           " descriptorType=", DescriptorRecordTypeName(descriptor.type),
+           " descriptorHeapIndex=", descriptor.heap_index,
+           " descriptorHeapCount=", descriptor.heap_count,
+           " descriptorResource=", uint64_t(descriptor.resource.ptr()),
+           " resource=", uint64_t(resource ? resource->GetD3D12Resource() : nullptr),
+           " hasTexture=", uint32_t(resource && resource->GetTexture()),
+           " descFormat=", uint32_t(D3D12DiagDescriptorFormat(descriptor)));
+    }
     if (attachments.depth_stencil) {
       const auto &depth = *attachments.depth_stencil;
       INFO("D3D12 diagnostic: draw depth state",
            " pso=", key_prefix,
+           " sequence=", d3d_sequence,
+           " recordSerial=", record_serial,
            " view=", uint64_t(depth.view),
            " format=", uint32_t(depth.format),
            " size=", depth.width, "x", depth.height,
@@ -12282,6 +12603,7 @@ private:
     const auto &cache_key = pipeline.GetShaderCacheKey();
     const auto key_size = std::min<size_t>(cache_key.size(), 16);
     std::string key_prefix(cache_key.c_str(), cache_key.c_str() + key_size);
+    const auto d3d_sequence = DiagCurrentReplayRecordSequence();
 
     if (indexed_draw && state.index_buffer) {
       UINT64 index_resource_offset = 0;
@@ -12324,13 +12646,14 @@ private:
             });
             chunk->deferred_readbacks.push_back(
                 [staging = WMT::Reference<WMT::Buffer>(staging), mapped,
-                 key_prefix, kind = std::string(kind),
+                 key_prefix, kind = std::string(kind), d3d_sequence,
                  format = state.index_buffer->Format, size,
                  start_index = indexed_draw->start_index_location,
                  index_count = indexed_draw->index_count_per_instance,
                  base_vertex = indexed_draw->base_vertex_location]() {
                   INFO("D3D12 diagnostic: IA index readback",
                        " kind=", kind,
+                       " sequence=", d3d_sequence,
                        " pso=", key_prefix,
                        " format=", uint32_t(format),
                        " startIndex=", start_index,
@@ -12417,11 +12740,12 @@ private:
       });
       chunk->deferred_readbacks.push_back(
           [staging = WMT::Reference<WMT::Buffer>(staging), mapped, key_prefix,
-           kind = std::string(kind), slot, stride = view.StrideInBytes,
+           kind = std::string(kind), d3d_sequence, slot, stride = view.StrideInBytes,
            view_size = view.SizeInBytes, resource_offset, vertex_offset,
            heap_offset = resource->GetHeapOffset(), size]() {
             INFO("D3D12 diagnostic: IA vertex readback",
                  " kind=", kind,
+                 " sequence=", d3d_sequence,
                  " pso=", key_prefix,
                  " slot=", slot,
                  " stride=", stride,
@@ -12441,9 +12765,12 @@ private:
 
   void DebugEncodeCBVReadbacks(CommandChunk *chunk, const char *kind,
                                const ReplayState &state,
-                               PipelineState &pipeline) {
+                               PipelineState &pipeline,
+                               uint64_t draw_record_sequence) {
     static std::atomic<uint32_t> log_count = 0;
-    if (!D3D12DiagShouldLog(log_count, D3D12DiagCBVReadbackEnabled()))
+    const bool diag_readback = D3D12DiagCBVReadbackEnabled();
+    const bool snapshot_readback = D3D12ApitraceGpuCbvSnapshotEnabled();
+    if (!diag_readback && !snapshot_readback)
       return;
 
     auto *root = GetRootSignature(state.graphics_root_signature.ptr());
@@ -12451,14 +12778,48 @@ private:
       return;
 
     const auto &cache_key = pipeline.GetShaderCacheKey();
+    // Gate: the target composite PSO (bee0b725) gets a BOUNDED number of readbacks
+    // (regardless of the global log limit) so we can dump its LIVE cbuffer - including
+    // dynamically-indexed elements beyond the bound view - without the unbounded
+    // per-draw readback that stalls/crashes the game. Other PSOs respect the global
+    // limit as before. With DXMT_DIAG_D3D12_LIMIT=1 only the target effectively fires.
+    const bool target_pso = DiagIsTargetCompositePso(cache_key);
+    static std::atomic<uint32_t> target_count = 0;
+    bool log_readback = false;
+    if (target_pso) {
+      log_readback =
+          diag_readback &&
+          target_count.fetch_add(1, std::memory_order_relaxed) < 8;
+    } else if (diag_readback) {
+      log_readback = D3D12DiagShouldLog(log_count, true);
+    }
+    const bool snapshot_target = snapshot_readback && target_pso;
+    if (!log_readback && !snapshot_target)
+      return;
+
     const auto key_size = std::min<size_t>(cache_key.size(), 16);
     std::string key_prefix(cache_key.c_str(), cache_key.c_str() + key_size);
+    const auto d3d_sequence = DiagCurrentReplayRecordSequence();
+    const bool record_snapshot = snapshot_target && draw_record_sequence != 0;
+    if (snapshot_target && !record_snapshot) {
+      static std::atomic<uint32_t> missing_sequence_log_count = 0;
+      if (D3D12DiagShouldLog(missing_sequence_log_count, true)) {
+        WARN("D3D12 diagnostic: CBV readback snapshot skipped without draw record sequence",
+             " kind=", kind,
+             " sequence=", d3d_sequence,
+             " currentD3DSequence=", dxmt::apitrace::current_d3d_sequence(),
+             " pso=", key_prefix);
+      }
+    }
+    if (!log_readback && !record_snapshot)
+      return;
     const auto sample_limit = D3D12DiagCBVReadbackBytes();
     const auto parameters = root->GetParameters();
 
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
       struct CBVReadbackTarget {
+        PipelineStage stage;
         UINT slot;
         DescriptorRecord descriptor;
       };
@@ -12486,14 +12847,12 @@ private:
                 continue;
               ForEachVisibleStage(
                   parameter.visibility, false, [&](PipelineStage stage) {
-                    if (stage != PipelineStage::Vertex)
-                      return;
                     auto slot = ResolveShaderBindingSlot(
                         pipeline, stage, SM50BindingType::ConstantBuffer,
                         range.base_shader_register + i,
                         range.register_space);
                     if (slot)
-                      cbvs.push_back({*slot, *descriptor});
+                      cbvs.push_back({stage, *slot, *descriptor});
                   });
             }
           }
@@ -12521,19 +12880,17 @@ private:
 
         ForEachVisibleStage(parameter.visibility, false,
                             [&](PipelineStage stage) {
-                              if (stage != PipelineStage::Vertex)
-                                return;
                               auto slot = ResolveShaderBindingSlot(
                                   pipeline, stage,
                                   SM50BindingType::ConstantBuffer,
                                   parameter.descriptor.ShaderRegister,
                                   parameter.descriptor.RegisterSpace);
                               if (slot)
-                                cbvs.push_back({*slot, descriptor});
+                                cbvs.push_back({stage, *slot, descriptor});
                             });
       }
 
-      for (const auto &[slot, descriptor] : cbvs) {
+      for (const auto &[stage, slot, descriptor] : cbvs) {
         if (descriptor.type != DescriptorRecordType::ConstantBufferView ||
             !descriptor.has_desc)
           continue;
@@ -12544,10 +12901,22 @@ private:
         if (!resource || !resource->GetBufferAllocation())
           continue;
 
-        const auto size =
-            std::min<UINT64>(sample_limit, descriptor.desc.cbv.SizeInBytes);
+        // Read up to sample_limit from the UNDERLYING RESOURCE, not capped by the bound
+        // CBV SizeInBytes. Shaders can DYNAMICALLY INDEX a mapped cbuffer beyond the
+        // small bound view (the FH4 homepage CG composite binds a 256B CBV but reads a
+        // transform palette at element 68 = +1088 bytes); to see the value the GPU
+        // actually reads we must read the resource range past the bound view.
+        const auto resource_width = resource->GetResourceDesc().Width;
+        const auto remaining = resource_width > resource_offset
+                                   ? resource_width - resource_offset
+                                   : UINT64{0};
+        const auto size = std::min<UINT64>(sample_limit, remaining);
         if (!size)
           continue;
+        const auto resource_object_id =
+            record_snapshot
+                ? dxmt::apitrace::object_id(resource->GetD3D12Resource())
+                : 0;
 
         WMTBufferInfo info = {};
         info.length = size;
@@ -12586,22 +12955,37 @@ private:
         });
         chunk->deferred_readbacks.push_back(
             [staging = WMT::Reference<WMT::Buffer>(staging), mapped,
-             key_prefix, kind = std::string(kind), root_index, slot,
-             address = descriptor.desc.cbv.BufferLocation,
+             key_prefix, kind = std::string(kind), d3d_sequence, root_index, slot,
+             stage, address = descriptor.desc.cbv.BufferLocation,
              declared_size = descriptor.desc.cbv.SizeInBytes, resource_offset,
-             heap_offset = resource->GetHeapOffset(), size]() {
-              INFO("D3D12 diagnostic: CBV readback",
-                   " kind=", kind,
-                   " pso=", key_prefix,
-                   " root=", root_index,
-                   " slot=", slot,
-                   " address=", uint64_t(address),
-                   " declaredSize=", uint32_t(declared_size),
-                   " resourceOffset=", uint64_t(resource_offset),
-                   " heapOffset=", uint64_t(heap_offset),
-                   " bytes=", size,
-                   " floats=", D3D12DiagFloatWords(mapped, size),
-                   " hex=", D3D12DiagHexBytes(mapped, size));
+             heap_offset = resource->GetHeapOffset(), size, log_readback,
+             record_snapshot, resource_object_id, draw_record_sequence]() {
+              if (log_readback) {
+                INFO("D3D12 diagnostic: CBV readback",
+                     " kind=", kind,
+                     " sequence=", d3d_sequence,
+                     " pso=", key_prefix,
+                     " stage=", uint32_t(stage),
+                     " root=", root_index,
+                     " slot=", slot,
+                     " address=", uint64_t(address),
+                     " declaredSize=", uint32_t(declared_size),
+                     " resourceOffset=", uint64_t(resource_offset),
+                     " heapOffset=", uint64_t(heap_offset),
+                     " bytes=", size,
+                     " el18=", D3D12DiagFloatsAt(mapped, size, 18 * 16),
+                     " el68=", D3D12DiagFloatsAt(mapped, size, 68 * 16),
+                     " floats=", D3D12DiagFloatWords(mapped, size),
+                     " hex=", D3D12DiagHexBytes(mapped, size));
+              }
+              if (record_snapshot && resource_object_id) {
+                dxmt::apitrace::record_resource_bytes_snapshot(
+                    resource_object_id,
+                    resource_offset,
+                    resource_offset + size,
+                    mapped,
+                    draw_record_sequence);
+              }
 #ifdef __i386__
               wsi::aligned_free(mapped);
 #endif
@@ -13197,9 +13581,11 @@ private:
                         viewports, scissors, &record, nullptr, 0, 0);
     DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
                            0);
-    DebugEncodeCBVReadbacks(chunk, "draw", state, *pipeline);
+    DebugEncodeCBVReadbacks(chunk, "draw", state, *pipeline,
+                            state.current_record_d3d_sequence);
     auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
         chunk, "draw", pipeline->GetShaderCacheKey(),
+        DiagCurrentReplayRecordSequence(),
         record.vertex_count_per_instance, 0, record.instance_count);
     const auto argument_buffer_size = [&] {
       StallScope _s(StallDiagEnabled(), &stallProbe().estimateUs);
@@ -13259,7 +13645,7 @@ private:
 
       FlushPassBatches(chunk, state);
       EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
-                             dxmt::apitrace::current_d3d_sequence(),
+                             DiagCurrentReplayRecordSequence(),
                              std::move(encode_draw), metal->use_geometry,
                              metal->use_tessellation);
     }
@@ -13391,9 +13777,11 @@ private:
                       index_resource_offset, index_offset);
     DebugEncodeIAReadbacks(chunk, "indexed", state, *pipeline, nullptr,
                            &record, index_offset);
-    DebugEncodeCBVReadbacks(chunk, "indexed", state, *pipeline);
+    DebugEncodeCBVReadbacks(chunk, "indexed", state, *pipeline,
+                            state.current_record_d3d_sequence);
     auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
-        chunk, "indexed", pipeline->GetShaderCacheKey(), 0,
+        chunk, "indexed", pipeline->GetShaderCacheKey(),
+        DiagCurrentReplayRecordSequence(), 0,
         record.index_count_per_instance, record.instance_count);
     const auto argument_buffer_size = [&] {
       StallScope _s(StallDiagEnabled(), &stallProbe().estimateUs);
@@ -13458,7 +13846,7 @@ private:
 
       FlushPassBatches(chunk, state);
       EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
-                             dxmt::apitrace::current_d3d_sequence(),
+                             DiagCurrentReplayRecordSequence(),
                              std::move(encode_draw), metal->use_geometry,
                              metal->use_tessellation);
     }

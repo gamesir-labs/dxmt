@@ -39,6 +39,19 @@ extern "C" HRESULT __stdcall DXMTDXGIRegisterBackend(
 
 } // namespace dxmt
 
+struct WineDXGIAdapterInfo {
+  GUID driver_uuid;
+  GUID device_uuid;
+  DWORD vendor_id;
+  DWORD device_id;
+  LUID luid;
+};
+
+DEFINE_COM_INTERFACE("17399d75-964e-4c03-99f8-9d4fd196dd62", IWineDXGIAdapter)
+    : public IDXGIAdapter4 {
+  virtual HRESULT STDMETHODCALLTYPE GetAdapterInfo(WineDXGIAdapterInfo *Info) = 0;
+};
+
 DEFINE_COM_INTERFACE("acdf3ef1-b33a-4cb6-97bd-1c1974827e6d", IMTLDXGIAdapter)
     : public IDXGIAdapter4 {
   virtual dxmt::DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() = 0;

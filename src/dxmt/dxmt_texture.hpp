@@ -31,6 +31,12 @@ struct TextureViewDescriptor {
   uint32_t firstArraySlice : 12 = 0;
   uint32_t arraySize       : 12 = 1;
   WMTTextureUsage intendedUsage : 8 = WMTTextureUsageUnknown;
+  WMTTextureSwizzleChannels swizzle = {
+      WMTTextureSwizzleRed,
+      WMTTextureSwizzleGreen,
+      WMTTextureSwizzleBlue,
+      WMTTextureSwizzleAlpha,
+  };
 };
 
 struct TextureViewKey {

@@ -875,7 +875,8 @@ public:
     if (data)
       *data = SUCCEEDED(hr) ? mapped : nullptr;
     dxmt::apitrace::record_resource_map(
-        this, sub_resource, read_range, SUCCEEDED(hr) && mapped != nullptr, hr);
+        this, sub_resource, read_range, SUCCEEDED(hr) && mapped != nullptr,
+        mapped, hr);
     return hr;
   }
 
@@ -899,6 +900,9 @@ public:
             this, sub_resource, written_begin, written_end,
             mapped_memory + heap_offset_ + written_begin,
             static_cast<size_t>(written_end - written_begin));
+      } else {
+        dxmt::apitrace::record_resource_unmap(
+            this, sub_resource, written_begin, written_end, nullptr, 0);
       }
     }
 

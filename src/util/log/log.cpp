@@ -91,8 +91,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message,
           std::cerr << adjusted;
       }
 
-      if (m_fileStream)
+      if (m_fileStream) {
         m_fileStream << adjusted;
+        m_fileStream.flush();
+      }
     }
   }
 }

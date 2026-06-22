@@ -10,6 +10,14 @@ namespace dxmt {
 
 std::atomic_uint64_t global_texture_seq = {0};
 
+static bool
+IsDefaultTextureSwizzle(WMTTextureSwizzleChannels swizzle) {
+  return swizzle.r == WMTTextureSwizzleRed &&
+         swizzle.g == WMTTextureSwizzleGreen &&
+         swizzle.b == WMTTextureSwizzleBlue &&
+         swizzle.a == WMTTextureSwizzleAlpha;
+}
+
 static void
 LogTextureUsageMismatch(
     const char *message, Texture *descriptor, WMT::Texture texture, WMTTextureUsage info_usage,
@@ -80,7 +88,8 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
       descriptor.firstMiplevel == 0 &&
       descriptor.miplevelCount == allocation->descriptor->miplevelCount() &&
       descriptor.firstArraySlice == 0 &&
-      descriptor.arraySize == allocation->descriptor->arrayLength();
+      descriptor.arraySize == allocation->descriptor->arrayLength() &&
+      IsDefaultTextureSwizzle(descriptor.swizzle);
 
   if (compressed_srgb_srv) {
     view_format = parent_format;
@@ -94,7 +103,7 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
   auto view = parent.newTextureView(
       view_format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
       descriptor.firstArraySlice, descriptor.arraySize,
-      {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, gpuResourceID
+      descriptor.swizzle, gpuResourceID
   );
   auto parent_usage = parent ? parent.usage() : WMTTextureUsageUnknown;
   auto view_usage = view ? view.usage() : WMTTextureUsageUnknown;
@@ -207,6 +216,14 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
     if (viewDescriptors_[i].arraySize != descriptor.arraySize)
       continue;
     if (viewDescriptors_[i].intendedUsage != descriptor.intendedUsage)
+      continue;
+    if (viewDescriptors_[i].swizzle.r != descriptor.swizzle.r)
+      continue;
+    if (viewDescriptors_[i].swizzle.g != descriptor.swizzle.g)
+      continue;
+    if (viewDescriptors_[i].swizzle.b != descriptor.swizzle.b)
+      continue;
+    if (viewDescriptors_[i].swizzle.a != descriptor.swizzle.a)
       continue;
     return TextureViewKey(descriptor, i, info_.mipmap_level_count);
   }

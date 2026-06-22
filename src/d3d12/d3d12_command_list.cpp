@@ -26,23 +26,10 @@ std::atomic<uint32_t> g_apitrace_record_diag_log_count = 0;
 thread_local uint64_t g_current_command_record_d3d_sequence = 0;
 
 // --- Copy-source snapshot deduplication (BUG-008 IO blow-up fix) ---
-// SnapshotCopySourceBuffer captures a copy's source-buffer span into the trace on every copy,
-// because FH4's persistently-mapped upload buffers are never Unmapped (so the only way the bytes
-// reach the trace is at copy time). But FH4's load phase is a texture/geometry streaming storm:
-// the same ~286 persistent upload buffers are re-used as copy sources thousands of times, and the
-// naive version re-snapshotted the full span every time -> 24GB / 153K asset files, IO-bound, the
-// game never reaches present. We dedup by (resource, offset, end) -> last-emitted content
-// fingerprint: if a copy reads a span whose CURRENT bytes match what we already emitted for that
-// exact (resource,offset,end), the trace already contains it (retrace's upload heap holds the
-// last-emitted content, and nothing else writes that span between the two copies in callstream
-// order), so we skip the snapshot entirely -- saving the global record_call lock, a callstream
-// entry, and an asset file. We compare against the LAST-EMITTED fingerprint (not merely
-// last-seen): an X->Y->X CPU rewrite sequence re-emits correctly because every emit updates the
-// stored value and we skip only when current==stored. Global (not per-list) so cross-list /
-// cross-frame repeats (the dominant FH4 pattern) are caught too. The dedup lives inside
-// SnapshotCopySourceBuffer, so it covers ALL copy-source paths that funnel through it (placed-
-// footprint texture uploads, GPU-VA ranges, and CopyBufferRegion). Lock held only for map
-// lookup/insert; the FNV-1a hash runs lock-free. Disable via DXMT_APITRACE_NO_COPY_DEDUP=1.
+// SnapshotCopySourceBuffer captures a copy's source-buffer span into the trace when an app keeps
+// upload buffers persistently mapped and writes directly instead of using Unmap as a synchronization
+// point. Dedup by (resource, offset, end) -> last-emitted content fingerprint avoids re-snapshotting
+// unchanged copy source spans in streaming-heavy traces.
 struct CopySnapshotKey {
   const void *resource;
   uint64_t offset;
@@ -1638,15 +1625,8 @@ private:
   }
 
   // Snapshot a copy SOURCE buffer's read region into the apitrace stream, as if it had been
-  // Unmapped just before this copy. FH4 persistently Maps upload buffers once and writes directly,
-  // never Unmapping; apitrace's data snapshot is Unmap-tied, so the bytes a Copy reads from such a
-  // buffer are never recorded -> retrace's upload buffers are empty -> every texture/buffer copied
-  // from them is empty -> blank frames. Recording the source region at copy time captures exactly
-  // what the copy reads, independent of Unmap. A (resource,offset,end) -> last-emitted-content
-  // FNV fingerprint dedups the FH4 load storm (same ~286 persistent upload buffers re-copied
-  // thousands of times, 24GB/153K files otherwise); see g_copy_snapshot_dedup above for the full
-  // correctness/perf rationale. Disable with DXMT_APITRACE_NO_COPY_DEDUP=1. No-op for
-  // non-CPU-mapped sources.
+  // Unmapped just before this copy. This covers persistently mapped upload buffers that are written
+  // directly and later consumed by copy commands. No-op for non-CPU-mapped sources.
   void SnapshotCopySourceBuffer(ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
     if (!src_buffer || byte_count == 0 || !dxmt::apitrace::d3d_enabled())
       return;
@@ -1669,27 +1649,19 @@ private:
     const char *span_data = mapped + res->GetHeapOffset() + src_offset;
     const size_t span_len = static_cast<size_t>(end - src_offset);
 
-    // Dedup: skip the snapshot if this exact (resource,offset,end) span's current content matches
-    // what we last emitted -- the trace already carries identical bytes for it. Disable with
-    // DXMT_APITRACE_NO_COPY_DEDUP=1 (e.g. to A/B against the un-deduped capture).
-    static const bool dedup_disabled = std::getenv("DXMT_APITRACE_NO_COPY_DEDUP") != nullptr;
-    if (!dedup_disabled) {
-      const uint64_t fingerprint = FnvHashSpan(span_data, span_len);
-      const CopySnapshotKey key{src_buffer, src_offset, end};
-      {
-        std::lock_guard<std::mutex> lock(g_copy_snapshot_dedup_mutex);
-        auto it = g_copy_snapshot_dedup.find(key);
-        if (it != g_copy_snapshot_dedup.end() && it->second == fingerprint)
-          return; // unchanged since last emit -> already in trace
-        // Bound memory on pathologically long traces: distinct (resource,offset,end) tuples grow
-        // unbounded if the app sub-allocates many spans. ~2M entries ≈ a few hundred MB; past that
-        // we clear and rebuild. Clearing is correctness-safe -- it only forces a re-emit of spans
-        // seen before the clear (falls back toward un-deduped behavior), never a missed change.
-        constexpr size_t kMaxDedupEntries = 2u * 1024u * 1024u;
-        if (g_copy_snapshot_dedup.size() >= kMaxDedupEntries)
-          g_copy_snapshot_dedup.clear();
-        g_copy_snapshot_dedup[key] = fingerprint;
-      }
+    const uint64_t fingerprint = FnvHashSpan(span_data, span_len);
+    const CopySnapshotKey key{src_buffer, src_offset, end};
+    {
+      std::lock_guard<std::mutex> lock(g_copy_snapshot_dedup_mutex);
+      auto it = g_copy_snapshot_dedup.find(key);
+      if (it != g_copy_snapshot_dedup.end() && it->second == fingerprint)
+        return; // unchanged since last emit -> already in trace
+      // Bound memory on pathologically long traces. Clearing is correctness-safe; it only forces
+      // re-emitting spans seen before the clear.
+      constexpr size_t kMaxDedupEntries = 2u * 1024u * 1024u;
+      if (g_copy_snapshot_dedup.size() >= kMaxDedupEntries)
+        g_copy_snapshot_dedup.clear();
+      g_copy_snapshot_dedup[key] = fingerprint;
     }
 
     dxmt::apitrace::record_resource_unmap(

@@ -821,6 +821,12 @@ PipelineShaderDigest(const PipelineDxilShader &shader) {
 }
 
 bool
+DiagForceFullscreenPositionForShader(const PipelineDxilShader &shader) {
+  (void)shader;
+  return false;
+}
+
+bool
 D3D12PipelineFilterMatches(std::string filter, std::string_view value) {
   if (filter.empty())
     return false;
@@ -2023,6 +2029,19 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   ia_layout.num_elements = uint32_t(input_elements.size());
   ia_layout.elements = input_elements.empty() ? nullptr : input_elements.data();
 
+  SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA diag_force_fullscreen = {};
+  diag_force_fullscreen.type = SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION;
+  diag_force_fullscreen.next = &ia_layout;
+  diag_force_fullscreen.enabled = true;
+  auto *vs_args =
+      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout);
+  if (DiagForceFullscreenPositionForShader(*vs)) {
+    vs_args = reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+        &diag_force_fullscreen);
+    WARN("D3D12 diagnostic: forcing fullscreen VS position for shader ",
+         PipelineShaderDigest(*vs), " pso=", shader_cache_key);
+  }
+
   const auto vs_name = BuildFunctionName("vs", shader_cache_key);
   for (const auto &shader : shaders)
     DebugLogDxilShaderInfo(shader_cache_key, shader);
@@ -2250,8 +2269,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     return true;
   }
 
-  if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
-                            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
+  if (!CompileMetalFunction(device, *vs, vs_name.c_str(), vs_args,
                             out.vertex, shader_cache_key))
     return false;
 

@@ -1247,7 +1247,7 @@ void
 record_resource_unmap(const void *resource, uint32_t subresource,
                       uint64_t written_begin, uint64_t written_end,
                       const void *written_data, size_t written_size) {
-  if (!d3d_enabled() || !resource || !written_data || !written_size)
+  if (!d3d_enabled() || !resource)
     return;
   ensure_session_open();
   ::apitrace::d3d12::record_resource_unmap(
@@ -1255,10 +1255,21 @@ record_resource_unmap(const void *resource, uint32_t subresource,
       written_size);
 }
 
+void
+record_resource_bytes_snapshot(uint64_t resource_object_id, uint64_t begin,
+                               uint64_t end, const void *bytes,
+                               uint64_t sequence) {
+  if (!d3d_enabled() || !resource_object_id || !bytes || end <= begin)
+    return;
+  ensure_session_open();
+  ::apitrace::d3d12::record_resource_bytes_snapshot(
+      resource_object_id, begin, end, bytes, sequence);
+}
+
 uint64_t
 record_resource_map(const void *resource, uint32_t subresource,
                     const D3D12_RANGE *read_range, bool mapped,
-                    int32_t result_code) {
+                    const void *mapped_data, int32_t result_code) {
   if (!d3d_enabled() || !resource)
     return 0;
   ensure_session_open();
@@ -1266,8 +1277,8 @@ record_resource_map(const void *resource, uint32_t subresource,
   const uint64_t read_begin = has_read_range ? read_range->Begin : 0;
   const uint64_t read_end = has_read_range ? read_range->End : 0;
   return ::apitrace::d3d12::record_resource_map(
-      resource, subresource, has_read_range, read_begin, read_end, mapped,
-      result_code);
+      resource, subresource, has_read_range, read_begin, read_end, mapped_data,
+      mapped, result_code);
 }
 
 void

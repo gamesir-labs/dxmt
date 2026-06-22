@@ -91,6 +91,7 @@ struct DxilAirContext {
   uint32_t base_instance_arg = UINT32_MAX;
   AllocaInst *return_value = nullptr;
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  bool diag_force_fullscreen_position = false;
 };
 
 llvm::Error
@@ -1249,6 +1250,46 @@ StoreSignatureOutput(const CallBase &call, Value *current_return,
 }
 
 Value *
+ForceFullscreenVertexPosition(Value *current_return, DxilAirContext &ctx) {
+  if (!current_return ||
+      ctx.translation.shader_kind != uint32_t(DxilStage::Vertex) ||
+      ctx.vertex_id_arg == UINT32_MAX)
+    return current_return;
+
+  uint32_t position_index = UINT32_MAX;
+  for (const auto &[element_id, index] : ctx.output_indices) {
+    auto output = ctx.outputs.find(element_id);
+    if (output != ctx.outputs.end() &&
+        IsSystemSemantic(*output->second, "SV_Position")) {
+      position_index = index;
+      break;
+    }
+  }
+  if (position_index == UINT32_MAX)
+    return current_return;
+
+  auto *vid = ctx.function->getArg(ctx.vertex_id_arg);
+  auto *quad_index = ctx.builder.CreateAnd(vid, ctx.builder.getInt32(3));
+  auto *x_bit = ctx.builder.CreateICmpNE(
+      ctx.builder.CreateAnd(quad_index, ctx.builder.getInt32(1)),
+      ctx.builder.getInt32(0));
+  auto *y_bit = ctx.builder.CreateICmpNE(
+      ctx.builder.CreateAnd(quad_index, ctx.builder.getInt32(2)),
+      ctx.builder.getInt32(0));
+  auto *one = ConstantFP::get(ctx.types._float, 1.0);
+  auto *neg_one = ConstantFP::get(ctx.types._float, -1.0);
+  auto *zero = ConstantFP::get(ctx.types._float, 0.0);
+  auto *x = ctx.builder.CreateSelect(x_bit, one, neg_one);
+  auto *y = ctx.builder.CreateSelect(y_bit, one, neg_one);
+  Value *position = UndefValue::get(ctx.types._float4);
+  position = ctx.builder.CreateInsertElement(position, x, uint64_t(0));
+  position = ctx.builder.CreateInsertElement(position, y, uint64_t(1));
+  position = ctx.builder.CreateInsertElement(position, zero, uint64_t(2));
+  position = ctx.builder.CreateInsertElement(position, one, uint64_t(3));
+  return ctx.builder.CreateInsertValue(current_return, position, position_index);
+}
+
+Value *
 BuildSystemValue(const CallBase &call, std::string_view name, DxilAirContext &ctx) {
   const auto component = ConstantOperandU32(call, 1).value_or(0);
   Value *source = nullptr;
@@ -1931,11 +1972,14 @@ LowerTerminator(const Instruction &terminator, DxilAirContext &ctx,
     if (ctx.function->getReturnType()->isVoidTy())
       ctx.builder.CreateRetVoid();
     else {
-      ctx.builder.CreateRet(ctx.return_value
-                                ? ctx.builder.CreateLoad(
-                                      ctx.function->getReturnType(),
-                                      ctx.return_value)
-                                : current_return);
+      auto *ret_value = ctx.return_value
+                            ? ctx.builder.CreateLoad(
+                                  ctx.function->getReturnType(),
+                                  ctx.return_value)
+                            : current_return;
+      if (ctx.diag_force_fullscreen_position)
+        ret_value = ForceFullscreenVertexPosition(ret_value, ctx);
+      ctx.builder.CreateRet(ret_value);
     }
     return Error::success();
   }
@@ -2341,6 +2385,10 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
   SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout = nullptr;
   dxbc::args_get_data<SM50_SHADER_IA_INPUT_LAYOUT,
                       SM50_SHADER_IA_INPUT_LAYOUT_DATA>(args, &ia_layout);
+  SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *diag_fullscreen = nullptr;
+  dxbc::args_get_data<SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION,
+                      SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA>(
+      args, &diag_fullscreen);
 
   air::FunctionSignatureBuilder signature;
   air::AirType types(context);
@@ -2360,6 +2408,8 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
       .source_function = source,
       .shader_info = std::move(shader_info),
       .metal_version = metal_version,
+      .diag_force_fullscreen_position =
+          diag_fullscreen && diag_fullscreen->enabled,
   };
   if (translation->shader_kind == uint32_t(DxilStage::Vertex) && ia_layout) {
     dxil_ctx.vertex_slot_mask = ia_layout->slot_mask;

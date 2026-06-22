@@ -5711,6 +5711,15 @@ sm50_compilation_argument_copy(const struct SM50_SHADER_COMPILATION_ARGUMENT_DAT
     copy->next = sm50_compilation_argument_copy(data->next);
     return (void *)copy;
   }
+  case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION: {
+    const struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *data = (const void *)src;
+    struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *copy = calloc(1, sizeof(*copy));
+    if (!copy)
+      return NULL;
+    *copy = *data;
+    copy->next = sm50_compilation_argument_copy(data->next);
+    return (void *)copy;
+  }
   case SM50_SHADER_PSO_PIXEL_SHADER: {
     const struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *data = (const void *)src;
     struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *copy = calloc(1, sizeof(*copy));
@@ -6007,6 +6016,12 @@ struct SM50_SHADER_COMMON_DATA32 {
   enum SM50_SHADER_FLAG flag;
 };
 
+struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  bool enabled;
+};
+
 struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -6097,6 +6112,17 @@ sm50_compilation_argument32_convert(
       data->type = src->type;
       data->metal_version = src->metal_version;
       data->flags = src->flag;
+      break;
+    }
+    case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION: {
+      struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *data =
+          malloc(sizeof(struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->enabled = src->enabled;
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {

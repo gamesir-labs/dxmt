@@ -15,6 +15,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 #include <bit>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -742,6 +743,40 @@ llvm::Error convert_dxbc_pixel_shader(
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
+  // DIAG: temporary root-cause instrumentation for FH4 frame-1200 blue bug.
+  // Gated to the composite-family PS (uses cb0 AND cb3) so only those draws are
+  // affected. Two modes:
+  //   DXMT_DIAG_PS_MARK_COMPOSITE: force o0 = (0,1,0,1) green marker -> if green
+  //     appears the draw rasterized (PS ran); if absent the geometry is off-screen.
+  //   DXMT_DIAG_PS_DUMP_CB0: force o0 = (cb0.w, 0, 0, 1) -> read cb0.w from red.
+  const bool diag_mark = std::getenv("DXMT_DIAG_PS_MARK_COMPOSITE") != nullptr;
+  const bool diag_cb0 = std::getenv("DXMT_DIAG_PS_DUMP_CB0") != nullptr;
+  if ((diag_mark || diag_cb0) && resource_map.output_element_count > 0 &&
+      resource_map.cb_range_map.count(0) && resource_map.cb_range_map.count(3)) {
+    auto out_f = builder.CreateBitOrPointerCast(
+      resource_map.output.ptr_float4, llvm::PointerType::get(types._float, 0));
+    auto zero = llvm::ConstantFP::get(types._float, 0.0);
+    auto one = llvm::ConstantFP::get(types._float, 1.0);
+    llvm::Value *r = zero, *g = zero;
+    if (diag_mark) {
+      g = one; // green marker
+    } else {
+      auto cbv = resource_map.cb_range_map.at(0)(nullptr).build(ctx);
+      if (cbv) {
+        auto handle = cbv.get();
+        auto comp_ptr = builder.CreateGEP(
+          types._int4, handle, {builder.getInt32(0), builder.getInt32(3)});
+        r = builder.CreateBitCast(
+          builder.CreateLoad(types._int, comp_ptr), types._float);
+      } else {
+        llvm::consumeError(cbv.takeError());
+      }
+    }
+    builder.CreateStore(r, builder.CreateConstGEP1_32(types._float, out_f, 0));
+    builder.CreateStore(g, builder.CreateConstGEP1_32(types._float, out_f, 1));
+    builder.CreateStore(zero, builder.CreateConstGEP1_32(types._float, out_f, 2));
+    builder.CreateStore(one, builder.CreateConstGEP1_32(types._float, out_f, 3));
+  }
   auto epilogue_result = epilogue.build(ctx);
   if (auto err = epilogue_result.takeError()) {
     return err;
@@ -962,7 +997,12 @@ llvm::Error convert_dxbc_vertex_shader(
     func_signature.DefineInput(air::InputBaseInstance{});
 
   uint32_t clip_distance_out_idx = ~0u;
-  if (pShaderInternal->clip_distance_scalars.size()) {
+  // DIAG (DXMT_DIAG_VS_NO_CLIP): suppress VS clip-distance export to test whether
+  // composite geometry is clip-rejected in retrace. Temporary root-cause probe.
+  const bool emit_clip_distance =
+      pShaderInternal->clip_distance_scalars.size() &&
+      std::getenv("DXMT_DIAG_VS_NO_CLIP") == nullptr;
+  if (emit_clip_distance) {
     clip_distance_out_idx = func_signature.DefineOutput(
       air::OutputClipDistance{pShaderInternal->clip_distance_scalars.size()}
     );
@@ -1048,13 +1088,37 @@ llvm::Error convert_dxbc_vertex_shader(
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
+  // DIAG (DXMT_DIAG_VS_FULLSCREEN): force composite-family VS (has clip distance)
+  // SV_Position to an on-screen quad spread by vertex id. If the composite then
+  // rasterizes, the bug is isolated to VS position-input reconstruction.
+  if (std::getenv("DXMT_DIAG_VS_FULLSCREEN") &&
+      pShaderInternal->clip_distance_scalars.size() &&
+      resource_map.output_element_count > 0 && resource_map.vertex_id) {
+    auto vid = resource_map.vertex_id;
+    auto b0 = builder.CreateICmpNE(
+      builder.CreateAnd(vid, builder.getInt32(1)), builder.getInt32(0));
+    auto b1 = builder.CreateICmpNE(
+      builder.CreateAnd(vid, builder.getInt32(2)), builder.getInt32(0));
+    auto px = builder.CreateSelect(b0, llvm::ConstantFP::get(types._float, 0.9),
+                                   llvm::ConstantFP::get(types._float, -0.9));
+    auto py = builder.CreateSelect(b1, llvm::ConstantFP::get(types._float, 0.9),
+                                   llvm::ConstantFP::get(types._float, -0.9));
+    auto out_f = builder.CreateBitOrPointerCast(
+      resource_map.output.ptr_float4, llvm::PointerType::get(types._float, 0));
+    builder.CreateStore(px, builder.CreateConstGEP1_32(types._float, out_f, 0));
+    builder.CreateStore(py, builder.CreateConstGEP1_32(types._float, out_f, 1));
+    builder.CreateStore(llvm::ConstantFP::get(types._float, 0.5),
+                        builder.CreateConstGEP1_32(types._float, out_f, 2));
+    builder.CreateStore(llvm::ConstantFP::get(types._float, 1.0),
+                        builder.CreateConstGEP1_32(types._float, out_f, 3));
+  }
   auto epilogue_result = epilogue.build(ctx);
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
   auto value = epilogue_result.get();
 
-  if (pShaderInternal->clip_distance_scalars.size()) {
+  if (emit_clip_distance) {
     auto clip_distance_ty = llvm::ArrayType::get(
       types._float, pShaderInternal->clip_distance_scalars.size()
     );

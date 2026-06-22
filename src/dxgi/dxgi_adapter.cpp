@@ -22,11 +22,116 @@ LUID GetAdapterLuid(uint64_t registry_id) {
 }
 
 class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
+  class WineAdapterView final : public IWineDXGIAdapter {
+  public:
+    explicit WineAdapterView(MTLDXGIAdapter *owner) : owner_(owner) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                             void **ppvObject) final {
+      return owner_->QueryInterface(riid, ppvObject);
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() final { return owner_->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() final { return owner_->Release(); }
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID Name, UINT *pDataSize,
+                                             void *pData) final {
+      return owner_->GetPrivateData(Name, pDataSize, pData);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID Name, UINT DataSize,
+                                             const void *pData) final {
+      return owner_->SetPrivateData(Name, DataSize, pData);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    SetPrivateDataInterface(REFGUID Name, const IUnknown *pUnknown) final {
+      return owner_->SetPrivateDataInterface(Name, pUnknown);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **ppParent) final {
+      return owner_->GetParent(riid, ppParent);
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT Output,
+                                          IDXGIOutput **ppOutput) final {
+      return owner_->EnumOutputs(Output, ppOutput);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC *pDesc) final {
+      return owner_->GetDesc(pDesc);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    CheckInterfaceSupport(const GUID &guid, LARGE_INTEGER *umd_version) final {
+      return owner_->CheckInterfaceSupport(guid, umd_version);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_ADAPTER_DESC1 *pDesc) final {
+      return owner_->GetDesc1(pDesc);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc2(DXGI_ADAPTER_DESC2 *pDesc) final {
+      return owner_->GetDesc2(pDesc);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE event,
+                                                         DWORD *cookie) final {
+      return owner_->RegisterHardwareContentProtectionTeardownStatusEvent(event,
+                                                                          cookie);
+    }
+
+    void STDMETHODCALLTYPE
+    UnregisterHardwareContentProtectionTeardownStatus(DWORD cookie) final {
+      owner_->UnregisterHardwareContentProtectionTeardownStatus(cookie);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    QueryVideoMemoryInfo(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP memory_segment_group,
+                         DXGI_QUERY_VIDEO_MEMORY_INFO *video_memory_info) final {
+      return owner_->QueryVideoMemoryInfo(node_index, memory_segment_group,
+                                          video_memory_info);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    SetVideoMemoryReservation(UINT node_index,
+                              DXGI_MEMORY_SEGMENT_GROUP memory_segment_group,
+                              UINT64 reservation) final {
+      return owner_->SetVideoMemoryReservation(node_index, memory_segment_group,
+                                               reservation);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE event,
+                                                     DWORD *cookie) final {
+      return owner_->RegisterVideoMemoryBudgetChangeNotificationEvent(event,
+                                                                      cookie);
+    }
+
+    void STDMETHODCALLTYPE
+    UnregisterVideoMemoryBudgetChangeNotification(DWORD cookie) final {
+      owner_->UnregisterVideoMemoryBudgetChangeNotification(cookie);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc3(DXGI_ADAPTER_DESC3 *pDesc) final {
+      return owner_->GetDesc3(pDesc);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetAdapterInfo(WineDXGIAdapterInfo *Info) final {
+      return owner_->GetWineAdapterInfo(Info);
+    }
+
+  private:
+    MTLDXGIAdapter *owner_;
+  };
+
 public:
   MTLDXGIAdapter(const DxgiBackendProvider &provider,
                  const DxgiBackendAdapterInfo &info,
                  IDXGIFactory *factory, Config &config)
-      : provider_(provider), info_(info), factory_(factory), options_(config) {
+      : wine_adapter_(this), provider_(provider), info_(info),
+        factory_(factory), options_(config) {
     if (info_.device_handle && provider_.retain_device)
       provider_.retain_device(info_.device_handle);
     if (!info_.device_handle || !info_.registry_id)
@@ -64,6 +169,11 @@ public:
         riid == __uuidof(IDXGIAdapter2) || riid == __uuidof(IDXGIAdapter3) ||
         riid == __uuidof(IDXGIAdapter4) || riid == __uuidof(IMTLDXGIAdapter)) {
       *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IWineDXGIAdapter)) {
+      *ppvObject = ref(&wine_adapter_);
       return S_OK;
     }
 
@@ -361,7 +471,24 @@ public:
                : true;
   }
 
+  HRESULT STDMETHODCALLTYPE GetWineAdapterInfo(WineDXGIAdapterInfo *Info) {
+    if (!Info)
+      return E_INVALIDARG;
+
+    DXGI_ADAPTER_DESC3 desc = {};
+    HRESULT hr = GetDesc3(&desc);
+    if (FAILED(hr))
+      return hr;
+
+    *Info = {};
+    Info->vendor_id = desc.VendorId;
+    Info->device_id = desc.DeviceId;
+    Info->luid = desc.AdapterLuid;
+    return S_OK;
+  }
+
 private:
+  WineAdapterView wine_adapter_;
   DxgiBackendProvider provider_;
   DxgiBackendAdapterInfo info_;
   D3DKMT_HANDLE local_kmt_ = 0;

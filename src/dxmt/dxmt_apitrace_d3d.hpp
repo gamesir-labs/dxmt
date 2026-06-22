@@ -404,9 +404,12 @@ void record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
 void record_resource_unmap(const void *resource, uint32_t subresource,
                            uint64_t written_begin, uint64_t written_end,
                            const void *written_data, size_t written_size);
+void record_resource_bytes_snapshot(uint64_t resource_object_id,
+                                    uint64_t begin, uint64_t end,
+                                    const void *bytes, uint64_t sequence);
 uint64_t record_resource_map(const void *resource, uint32_t subresource,
                              const D3D12_RANGE *read_range, bool mapped,
-                             int32_t result_code);
+                             const void *mapped_data, int32_t result_code);
 void record_resolve_query_data_result(
     const void *command_list, const void *query_heap, uint32_t type,
     uint32_t start_index, uint32_t query_count, const void *dst_buffer,
@@ -524,8 +527,10 @@ inline void record_present_frame(uint64_t, uint32_t, uint32_t, uint32_t,
                                  uint32_t, uint32_t, const void *, size_t) {}
 inline void record_resource_unmap(const void *, uint32_t, uint64_t, uint64_t,
                                   const void *, size_t) {}
+inline void record_resource_bytes_snapshot(uint64_t, uint64_t, uint64_t,
+                                           const void *, uint64_t) {}
 inline uint64_t record_resource_map(const void *, uint32_t,
-                                    const D3D12_RANGE *, bool, int32_t) { return 0; }
+                                    const D3D12_RANGE *, bool, const void *, int32_t) { return 0; }
 inline void record_resolve_query_data_result(
     const void *, const void *, uint32_t, uint32_t, uint32_t, const void *,
     uint64_t, const void *, size_t) {}

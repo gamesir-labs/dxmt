@@ -32,6 +32,7 @@ if not dxmt_crossbuild
   ])
 else
   util_src += files([
+    'util_mingw_pthread_compat.cpp',
     'wsi_monitor_win32.cpp',
     'wsi_window_win32.cpp',
     'wsi_platform_win32.cpp',
