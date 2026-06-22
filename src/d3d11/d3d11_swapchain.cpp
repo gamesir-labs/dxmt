@@ -23,6 +23,7 @@
 #include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
 #include <atomic>
+#include <chrono>
 #include <cfloat>
 #include <format>
 
@@ -785,13 +786,20 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
-    DEBUG("DXGISwapChain::GetFrameStatistics: stub");
+    if (!stats)
+      return E_POINTER;
+
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
+
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto timestamp =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() / 100;
+
+    *stats = {};
     stats->PresentCount = presentation_count_;
     stats->SyncRefreshCount = presentation_count_;
     stats->PresentRefreshCount = presentation_count_;
-    stats->SyncGPUTime = {};
-    stats->SyncQPCTime = {};
+    stats->SyncQPCTime.QuadPart = timestamp < 0 ? 0 : timestamp;
     return S_OK;
   };
 
