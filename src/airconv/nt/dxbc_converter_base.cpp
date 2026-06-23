@@ -47,7 +47,8 @@ Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
 
   auto RangeId = SrcOp.rangeid;
 
-  auto V = res.cb_range_map[RangeId](nullptr).build(ctx);
+  auto range_index = LoadOperandIndex(SrcOp.rangeindex);
+  auto V = res.cb_range_map[RangeId](range_index).build(ctx);
   if (auto err = V.takeError()) {
     return ApplySrcModifier(SrcOp._, llvm::ConstantAggregateZero::get(air.getIntTy(4)), Mask);
   }

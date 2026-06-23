@@ -12,8 +12,10 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include <memory>
@@ -28,6 +30,16 @@
 #include "ftl.hpp"
 
 namespace dxmt::dxbc {
+
+constexpr uint32_t kCBufferBindingSlotCapacity = 14;
+
+uint32_t cbuffer_binding_range_size(const ResourceRange &range) {
+  const uint32_t range_size = range.size ? range.size : 1;
+  if (range.binding_slot >= kCBufferBindingSlotCapacity)
+    return 0;
+  const uint32_t capacity = kCBufferBindingSlotCapacity - range.binding_slot;
+  return range_size == UINT_MAX ? capacity : std::min(range_size, capacity);
+}
 
 static bool
 DemoteSingleSampleMsaaSrv(ShaderInfo &shader_info, uint32_t slot) {
@@ -81,11 +93,17 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
 
   for (auto &[range_id, cbv] : shader_info.cbufferMap) {
     auto binding_slot = cbv.range.binding_slot;
-    cbv.arg_index = binding_table_cbuffer.DefineBuffer(
-      "cb" + std::to_string(range_id), AddressSpace::constant,
-      MemoryAccess::read, msl_uint4,
-      GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot)
-    );
+    const uint32_t range_size = cbuffer_binding_range_size(cbv.range);
+    cbv.arg_index = binding_table_cbuffer.Size();
+    for (uint32_t i = 0; i < range_size; i++) {
+      const auto name = range_size == 1
+                          ? "cb" + std::to_string(range_id)
+                          : "cb" + std::to_string(range_id) + "_" + std::to_string(i);
+      binding_table_cbuffer.DefineBuffer(
+        name, AddressSpace::constant, MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot + i)
+      );
+    }
   }
 
   for (auto &[range_id, sampler] : shader_info.samplerMap) {
@@ -228,6 +246,59 @@ auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
   });
 };
 
+auto get_cbuffer_in_argbuf_binding_table(
+    uint32_t argbuf_index, uint32_t base_index, uint32_t lower_bound,
+    uint32_t range_count) {
+  return [=](pvalue index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      if (!range_count)
+        return llvm::make_error<UnsupportedFeature>(
+            "SM5.1 constant buffer range has no supported binding slots");
+
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+          llvm::cast<llvm::PointerType>(argbuf->getType())
+              ->getNonOpaquePointerElementType());
+
+      const auto load_field = [&](uint32_t field_index) -> pvalue {
+        return ctx.builder.CreateLoad(
+            argbuf_struct_type->getElementType(field_index),
+            ctx.builder.CreateStructGEP(
+                llvm::cast<llvm::PointerType>(argbuf->getType())
+                    ->getNonOpaquePointerElementType(),
+                argbuf, field_index));
+      };
+
+      if (index) {
+        const auto range_index = llvm::dyn_cast_or_null<llvm::ConstantInt>(index);
+        if (range_index) {
+          const auto absolute_index = range_index->getZExtValue();
+          if (absolute_index < lower_bound)
+            return llvm::make_error<UnsupportedFeature>(
+                "SM5.1 constant buffer range index is below the declared lower bound");
+          const auto range_offset = absolute_index - lower_bound;
+          if (range_count != UINT_MAX && range_offset >= range_count)
+            return llvm::make_error<UnsupportedFeature>(
+                "SM5.1 constant buffer range index is outside the declared range");
+          const auto field_index = base_index + static_cast<uint32_t>(range_offset);
+          return load_field(field_index);
+        }
+
+        auto selected = load_field(base_index);
+        for (uint32_t i = 1; i < range_count; i++) {
+          auto matches = ctx.builder.CreateICmpEQ(
+              index, ctx.builder.getInt32(lower_bound + i));
+          selected = ctx.builder.CreateSelect(matches, load_field(base_index + i),
+                                              selected);
+        }
+        return selected;
+      }
+
+      return load_field(base_index);
+    });
+  };
+};
+
 static void
 add_texture_argument_flags(
     MTL_SM50_SHADER_ARGUMENT_FLAG &flags, shader::common::ResourceType resource_type,
@@ -310,12 +381,10 @@ void setup_binding_table(
   }
 
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
-    // TODO: abstract SM 5.0 binding
     auto index = cbv.arg_index;
-    resource_map.cb_range_map[range_id] = [=](pvalue) {
-      // ignore index in SM 5.0
-      return get_item_in_argbuf_binding_table(cbuf_table_index, index);
-    };
+    resource_map.cb_range_map[range_id] = get_cbuffer_in_argbuf_binding_table(
+        cbuf_table_index, index, cbv.range.lower_bound,
+        cbuffer_binding_range_size(cbv.range));
   }
   for (auto &[range_id, sampler] : shader_info->samplerMap) {
     // TODO: abstract SM 5.0 binding
@@ -1377,24 +1446,32 @@ AIRCONV_API int SM50Initialize(
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     // TODO: abstract SM 5.0 binding
     auto binding_slot = cbv.range.binding_slot;
-    cbv.arg_index = binding_table_cbuffer.DefineBuffer(
-      "cb" + std::to_string(range_id), AddressSpace::constant,
-      MemoryAccess::read, msl_uint4,
-      GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot)
-    );
-    sm50_shader->args_reflection_cbuffer.push_back({
-      .Type = SM50BindingType::ConstantBuffer,
-      .SM50BindingSlot = binding_slot,
-      .Flags =
-        MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
-      .StructurePtrOffset = cbv.arg_index,
-      .RegisterSpace = cbv.range.space,
-      .RegisterLowerBound = cbv.range.lower_bound,
-      .RegisterCount = cbv.range.size ? cbv.range.size : 1,
-      .CBufferSizeInVec4 = cbv.size_in_vec4,
-    });
-    if (binding_slot < 16)
-      binding_cbuffer_mask |= (1 << binding_slot);
+    const uint32_t range_size = cbuffer_binding_range_size(cbv.range);
+    cbv.arg_index = binding_table_cbuffer.Size();
+    for (uint32_t i = 0; i < range_size; i++) {
+      const uint32_t slot = binding_slot + i;
+      const uint32_t register_lower = cbv.range.lower_bound + i;
+      const auto name = range_size == 1
+                          ? "cb" + std::to_string(range_id)
+                          : "cb" + std::to_string(range_id) + "_" + std::to_string(i);
+      const auto arg_index = binding_table_cbuffer.DefineBuffer(
+        name, AddressSpace::constant, MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, slot)
+      );
+      sm50_shader->args_reflection_cbuffer.push_back({
+        .Type = SM50BindingType::ConstantBuffer,
+        .SM50BindingSlot = slot,
+        .Flags =
+          MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
+        .StructurePtrOffset = arg_index,
+        .RegisterSpace = cbv.range.space,
+        .RegisterLowerBound = register_lower,
+        .RegisterCount = 1,
+        .CBufferSizeInVec4 = cbv.size_in_vec4,
+      });
+      if (slot < 16)
+        binding_cbuffer_mask |= (1 << slot);
+    }
   }
   for (auto &[range_id, sampler] : shader_info->samplerMap) {
     // TODO: abstract SM 5.0 binding
