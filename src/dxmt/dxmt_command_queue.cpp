@@ -43,6 +43,15 @@ DxmtQueueDiagShouldLog(std::atomic<uint32_t> &counter) {
   return index < 512 || (index % 256) == 0;
 }
 
+static bool
+DxmtQueueDiagShouldLogIdleWait(std::atomic<uint32_t> &counter) {
+  if (!DxmtQueueDiagEnabled())
+    return false;
+
+  const auto index = counter.fetch_add(1, std::memory_order_relaxed);
+  return index < 64 || (index % 256) == 0;
+}
+
 static double
 DxmtQueueDiagDurationMs(clock::duration duration) {
   return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(duration).count();
@@ -134,11 +143,11 @@ CommandQueue::CommandQueue(WMT::Device device) :
 
 CommandQueue::~CommandQueue() {
   TRACE("Destructing command queue");
-  stopped.store(true);
-  ready_for_encode++;
-  ready_for_encode.notify_one();
-  ready_for_commit++;
-  ready_for_commit.notify_one();
+  stopped.store(true, std::memory_order_release);
+  ready_for_encode.fetch_add(1, std::memory_order_release);
+  ready_for_encode.notify_all();
+  ready_for_commit.fetch_add(1, std::memory_order_release);
+  ready_for_commit.notify_all();
   SharedEventListener_destroy(shared_event_listener);
   encodeThread.join();
   finishThread.join();
@@ -487,12 +496,34 @@ CommandQueue::EncodingThread() {
   env::setThreadName("dxmt-encode-thread");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
-  while (!stopped.load()) {
-    while (!stopped.load() &&
-           ready_for_encode.load(std::memory_order_acquire) == internal_seq) {
-      dxmt::this_thread::yield();
+  while (!stopped.load(std::memory_order_acquire)) {
+    auto ready = ready_for_encode.load(std::memory_order_acquire);
+    while (!stopped.load(std::memory_order_acquire) && ready == internal_seq) {
+      static std::atomic<uint32_t> encode_wait_log_count = 0;
+      const auto wait_begin_time = clock::now();
+      const bool log_wait = DxmtQueueDiagShouldLogIdleWait(encode_wait_log_count);
+      if (log_wait) {
+        WARN_FILE_ONLY("DXMT queue diagnostic: EncodingThread idle wait begin"
+             " internal_seq=", internal_seq,
+             " readyEncode=", ready,
+             " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
+             " ongoing=", chunk_ongoing.load(std::memory_order_relaxed),
+             " stopped=", stopped.load(std::memory_order_relaxed));
+      }
+      ready_for_encode.wait(ready, std::memory_order_acquire);
+      ready = ready_for_encode.load(std::memory_order_acquire);
+      if (log_wait) {
+        const auto wait_end_time = clock::now();
+        WARN_FILE_ONLY("DXMT queue diagnostic: EncodingThread idle wait wake"
+             " internal_seq=", internal_seq,
+             " readyEncode=", ready,
+             " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
+             " ongoing=", chunk_ongoing.load(std::memory_order_relaxed),
+             " stopped=", stopped.load(std::memory_order_relaxed),
+             " waitMs=", DxmtQueueDiagDurationMs(wait_end_time - wait_begin_time));
+      }
     }
-    if (stopped.load())
+    if (stopped.load(std::memory_order_acquire))
       break;
     // perform...
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
@@ -527,12 +558,34 @@ CommandQueue::WaitForFinishThread() {
   env::setThreadName("dxmt-finish-thread");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
-  while (!stopped.load()) {
-    while (!stopped.load() &&
-           ready_for_commit.load(std::memory_order_acquire) == internal_seq) {
-      dxmt::this_thread::yield();
+  while (!stopped.load(std::memory_order_acquire)) {
+    auto ready = ready_for_commit.load(std::memory_order_acquire);
+    while (!stopped.load(std::memory_order_acquire) && ready == internal_seq) {
+      static std::atomic<uint32_t> finish_wait_log_count = 0;
+      const auto wait_begin_time = clock::now();
+      const bool log_wait = DxmtQueueDiagShouldLogIdleWait(finish_wait_log_count);
+      if (log_wait) {
+        WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread idle wait begin"
+             " internal_seq=", internal_seq,
+             " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
+             " readyCommit=", ready,
+             " ongoing=", chunk_ongoing.load(std::memory_order_relaxed),
+             " stopped=", stopped.load(std::memory_order_relaxed));
+      }
+      ready_for_commit.wait(ready, std::memory_order_acquire);
+      ready = ready_for_commit.load(std::memory_order_acquire);
+      if (log_wait) {
+        const auto wait_end_time = clock::now();
+        WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread idle wait wake"
+             " internal_seq=", internal_seq,
+             " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
+             " readyCommit=", ready,
+             " ongoing=", chunk_ongoing.load(std::memory_order_relaxed),
+             " stopped=", stopped.load(std::memory_order_relaxed),
+             " waitMs=", DxmtQueueDiagDurationMs(wait_end_time - wait_begin_time));
+      }
     }
-    if (stopped.load())
+    if (stopped.load(std::memory_order_acquire))
       break;
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
     static std::atomic<uint32_t> finish_log_count = 0;

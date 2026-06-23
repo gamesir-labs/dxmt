@@ -19,6 +19,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -74,6 +75,13 @@ D3D12PipelineDiagShouldLog() {
     return false;
   return count.fetch_add(1, std::memory_order_relaxed) <
          D3D12PipelineDiagLimit();
+}
+
+static bool
+D3D12AttachmentlessPsoSampleCountWarnShouldLog() {
+  static std::atomic<uint64_t> count = 0;
+  const auto occurrence = count.fetch_add(1, std::memory_order_relaxed) + 1;
+  return occurrence == 1 || (occurrence & (occurrence - 1)) == 0;
 }
 
 static std::string
@@ -2466,8 +2474,9 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
   state = {};
   state.desc = desc;
   if (state.desc.SampleDesc.Count == 0) {
-    WARN("D3D12PipelineState: normalizing attachment-less PSO sample count "
-         "from 0 to 1");
+    if (D3D12AttachmentlessPsoSampleCountWarnShouldLog())
+      WARN("D3D12PipelineState: normalizing attachment-less PSO sample count "
+           "from 0 to 1");
     state.desc.SampleDesc.Count = 1;
   }
 
