@@ -9,6 +9,8 @@
 namespace dxmt::d3d12 {
 namespace {
 
+std::atomic<uint64_t> g_descriptor_content_generation{1};
+
 class DescriptorHeapImpl final
     : public ComObjectWithInitialRef<ID3D12DescriptorHeap>,
       public DescriptorHeap {
@@ -168,6 +170,17 @@ private:
 };
 
 } // namespace
+
+void BumpDescriptorContentGeneration() {
+  auto value = g_descriptor_content_generation.fetch_add(
+                   1, std::memory_order_relaxed) + 1;
+  if (!value)
+    g_descriptor_content_generation.store(1, std::memory_order_relaxed);
+}
+
+uint64_t GetDescriptorContentGeneration() {
+  return g_descriptor_content_generation.load(std::memory_order_relaxed);
+}
 
 Com<ID3D12DescriptorHeap>
 CreateDescriptorHeap(IMTLD3D12Device *device,

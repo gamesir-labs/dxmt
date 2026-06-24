@@ -218,6 +218,8 @@ struct RenderDynamicStateCache {
 
 struct RenderBindingStateCache {
   uint64_t graphics_generation = 0;
+  uint64_t descriptor_content_generation = 0;
+  uint64_t content_fingerprint = 0;
   bool valid = false;
 };
 

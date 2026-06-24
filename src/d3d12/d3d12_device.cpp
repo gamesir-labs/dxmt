@@ -917,6 +917,19 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   dst.heap_count = heap_count;
 }
 
+static bool
+DescriptorWriteAffectsShaderBinding(const DescriptorRecord &record) {
+  return record.shader_visible &&
+         (record.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+          record.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+}
+
+static void
+BumpDescriptorContentGenerationForWrite(const DescriptorRecord &record) {
+  if (DescriptorWriteAffectsShaderBinding(record))
+    BumpDescriptorContentGeneration();
+}
+
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
 using DeviceComBase = ID3D12Device9;
 #elif defined(__ID3D12Device8_INTERFACE_DEFINED__)
@@ -1822,6 +1835,7 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
+    BumpDescriptorContentGenerationForWrite(*record);
     record->type = DescriptorRecordType::ConstantBufferView;
     if (desc) {
       const bool null_cbv = !desc->BufferLocation && !desc->SizeInBytes;
@@ -1885,6 +1899,7 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
+    BumpDescriptorContentGenerationForWrite(*record);
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
@@ -1909,6 +1924,7 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
+    BumpDescriptorContentGenerationForWrite(*record);
     record->type = DescriptorRecordType::UnorderedAccessView;
     record->resource = resource;
     record->counter_resource = counter_resource;
@@ -1980,6 +1996,7 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
+    BumpDescriptorContentGenerationForWrite(*record);
     record->type = DescriptorRecordType::Sampler;
     if (desc) {
       record->desc.sampler = *desc;
@@ -2053,8 +2070,15 @@ public:
       return;
     }
 
-    for (size_t i = 0; i < copied.size(); i++)
+    bool affects_shader_binding = false;
+    for (size_t i = 0; i < copied.size(); i++) {
       CopyDescriptorRecord(*destinations[i], copied[i]);
+      affects_shader_binding =
+          affects_shader_binding ||
+          DescriptorWriteAffectsShaderBinding(*destinations[i]);
+    }
+    if (affects_shader_binding)
+      BumpDescriptorContentGeneration();
 
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_copy_descriptors(
@@ -2084,8 +2108,14 @@ public:
     if (!dst || !src)
       return;
     std::vector<DescriptorRecord> copied(src, src + descriptor_count);
-    for (UINT i = 0; i < copied.size(); i++)
+    bool affects_shader_binding = false;
+    for (UINT i = 0; i < copied.size(); i++) {
       CopyDescriptorRecord(dst[i], copied[i]);
+      affects_shader_binding =
+          affects_shader_binding || DescriptorWriteAffectsShaderBinding(dst[i]);
+    }
+    if (affects_shader_binding)
+      BumpDescriptorContentGeneration();
 
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_copy_descriptors_simple(
@@ -3128,8 +3158,10 @@ public:
     WARN("D3D12Device: sampler feedback UAVs are unsupported");
     if (auto *record = GetDescriptorRecordForWrite(
             dst_descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            "sampler feedback UAV"))
+            "sampler feedback UAV")) {
       ResetDescriptorRecord(*record);
+      BumpDescriptorContentGenerationForWrite(*record);
+    }
   }
 
   void STDMETHODCALLTYPE GetCopyableFootprints1(

@@ -4,7 +4,9 @@
 #include "d3d12_device.hpp"
 #include "com/com_pointer.hpp"
 #include <d3d12.h>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -65,5 +67,8 @@ DescriptorRecord *GetDescriptorRecordRangeFromCpuHandle(D3D12_CPU_DESCRIPTOR_HAN
                                                         const char *context);
 const DescriptorRecord *GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
                                                          D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
+
+void BumpDescriptorContentGeneration();
+uint64_t GetDescriptorContentGeneration();
 
 } // namespace dxmt::d3d12

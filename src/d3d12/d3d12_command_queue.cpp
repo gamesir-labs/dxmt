@@ -4930,10 +4930,31 @@ private:
     bool use_tessellation = false;
   };
 
+  struct ReplayBindingGenerationKey {
+    uint64_t graphics = 0;
+    uint64_t descriptor_content = 0;
+
+    bool operator==(const ReplayBindingGenerationKey &other) const {
+      return graphics == other.graphics &&
+             descriptor_content == other.descriptor_content;
+    }
+  };
+
+  struct ReplayBindingGenerationKeyHash {
+    size_t operator()(const ReplayBindingGenerationKey &key) const {
+      size_t hash = std::hash<uint64_t>{}(key.graphics);
+      hash ^= std::hash<uint64_t>{}(key.descriptor_content) +
+              0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+      return hash;
+    }
+  };
+
   struct ReplayGraphicsPassBatch {
     ReplayRenderPassAttachments attachments;
     std::vector<ReplayGraphicsPassCommand> commands;
-    std::unordered_set<uint64_t> captured_binding_generations;
+    std::unordered_set<ReplayBindingGenerationKey,
+                       ReplayBindingGenerationKeyHash>
+        captured_binding_generations;
     uint64_t argument_buffer_size = 0;
     ReplayGraphicsPassPlan plan;
     bool use_geometry = false;
@@ -6220,7 +6241,8 @@ private:
 
   bool GraphicsPassBatchNeedsBindingSnapshot(
       CommandChunk *chunk, ReplayState &state,
-      const ReplayRenderPassAttachments &attachments) {
+      const ReplayRenderPassAttachments &attachments,
+      uint64_t descriptor_content_generation) {
     if (!D3D12ReplayGraphicsBatchingEnabled())
       return true;
     if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
@@ -6239,7 +6261,8 @@ private:
     }
 
     return active_batch.captured_binding_generations
-        .insert(state.graphics_binding_generation)
+        .insert(ReplayBindingGenerationKey{state.graphics_binding_generation,
+                                           descriptor_content_generation})
         .second;
   }
 
@@ -10779,6 +10802,56 @@ private:
     std::vector<DescriptorTableBindingRecipeEntry> entries;
   };
 
+  static constexpr uint64_t kGraphicsBindingFingerprintOffset =
+      14695981039346656037ull;
+  static constexpr uint64_t kGraphicsBindingFingerprintPrime = 1099511628211ull;
+
+  static void HashGraphicsBindingBytes(uint64_t &hash, const void *data,
+                                       size_t size) {
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= kGraphicsBindingFingerprintPrime;
+    }
+  }
+
+  template <typename T>
+  static void HashGraphicsBindingValue(uint64_t &hash, const T &value) {
+    HashGraphicsBindingBytes(hash, &value, sizeof(value));
+  }
+
+  static void HashGraphicsBindingPointer(uint64_t &hash, const void *value) {
+    HashGraphicsBindingValue(hash, reinterpret_cast<uintptr_t>(value));
+  }
+
+  static void HashGraphicsBindingDescriptor(uint64_t &hash,
+                                            const DescriptorRecord &descriptor) {
+    HashGraphicsBindingValue(hash, descriptor.type);
+    HashGraphicsBindingValue(hash, descriptor.has_desc);
+    HashGraphicsBindingPointer(hash, descriptor.resource.ptr());
+    HashGraphicsBindingPointer(hash, descriptor.counter_resource.ptr());
+
+    if (!descriptor.has_desc)
+      return;
+
+    switch (descriptor.type) {
+    case DescriptorRecordType::ConstantBufferView:
+      HashGraphicsBindingValue(hash, descriptor.desc.cbv);
+      break;
+    case DescriptorRecordType::ShaderResourceView:
+      HashGraphicsBindingValue(hash, descriptor.desc.srv);
+      break;
+    case DescriptorRecordType::UnorderedAccessView:
+      HashGraphicsBindingValue(hash, descriptor.desc.uav);
+      break;
+    case DescriptorRecordType::Sampler:
+      HashGraphicsBindingValue(hash, descriptor.desc.sampler);
+      break;
+    default:
+      break;
+    }
+  }
+
   struct GraphicsBindingSnapshotEntry {
     enum class Kind : uint8_t { Descriptor, RootConstants };
 
@@ -10812,6 +10885,7 @@ private:
     std::vector<GraphicsBindingSnapshotEntry> entries;
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
+    uint64_t content_fingerprint = 0;
   };
 
   struct DescriptorTableBindingRecipeDiagStats {
@@ -10838,6 +10912,9 @@ private:
     std::atomic<uint64_t> apply_cleared = 0;
     std::atomic<uint64_t> apply_missing_table = 0;
     std::atomic<uint64_t> apply_ns = 0;
+    std::atomic<uint64_t> gate_generation_hits = 0;
+    std::atomic<uint64_t> gate_fingerprint_hits = 0;
+    std::atomic<uint64_t> gate_misses = 0;
   };
 
   static DescriptorTableBindingRecipeDiagStats &
@@ -10901,6 +10978,11 @@ private:
     const auto apply_missing_table =
         stats.apply_missing_table.load(std::memory_order_relaxed);
     const auto apply_ns = stats.apply_ns.load(std::memory_order_relaxed);
+    const auto gate_generation_hits =
+        stats.gate_generation_hits.load(std::memory_order_relaxed);
+    const auto gate_fingerprint_hits =
+        stats.gate_fingerprint_hits.load(std::memory_order_relaxed);
+    const auto gate_misses = stats.gate_misses.load(std::memory_order_relaxed);
 
     INFO("D3D12 binding recipe diagnostic: summary"
          " reason=", reason,
@@ -10934,7 +11016,10 @@ private:
          " applyMissingTable=", apply_missing_table,
          " applyMs=", BindingRecipeDiagNsToMs(apply_ns),
          " applyAvgNs=", BindingRecipeDiagAvgNs(apply_ns, apply_calls),
-         " applyAvgEntryNs=", BindingRecipeDiagAvgNs(apply_ns, apply_entries));
+         " applyAvgEntryNs=", BindingRecipeDiagAvgNs(apply_ns, apply_entries),
+         " gateGenHits=", gate_generation_hits,
+         " gateFpHits=", gate_fingerprint_hits,
+         " gateMisses=", gate_misses);
   }
 
   static void MaybeLogBindingRecipeDiagSummary(uint64_t calls,
@@ -11484,6 +11569,17 @@ private:
         entry.debug_size = DescriptorRecordSizeBytes(*descriptor);
       }
 
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.range_type);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.root_index);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.slot);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.argument);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.has_descriptor);
+      if (entry.has_descriptor)
+        HashGraphicsBindingDescriptor(snapshot.content_fingerprint,
+                                      entry.descriptor);
       snapshot.entries.push_back(std::move(entry));
     }
   }
@@ -11579,6 +11675,20 @@ private:
       entry.has_descriptor = true;
       entry.descriptor = descriptor;
       entry.argument = *argument;
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.range_type);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.root_index);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.slot);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.shader_register);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.register_space);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.argument);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.debug_address);
+      HashGraphicsBindingDescriptor(snapshot.content_fingerprint,
+                                    entry.descriptor);
       snapshot.entries.push_back(std::move(entry));
     });
   }
@@ -11623,6 +11733,18 @@ private:
       entry.debug_kind = "root-constants";
       entry.constants = it->second;
       entry.constant_count = actual_count;
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.root_index);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.slot);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.shader_register);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.register_space);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.constant_count);
+      for (const auto value : entry.constants)
+        HashGraphicsBindingValue(snapshot.content_fingerprint, value);
       snapshot.entries.push_back(std::move(entry));
     });
   }
@@ -11642,6 +11764,8 @@ private:
       return;
 
     snapshot.vertex_slot_mask = slot_mask;
+    HashGraphicsBindingValue(snapshot.content_fingerprint,
+                             snapshot.vertex_slot_mask);
     const auto max_slot = 32u - __builtin_clz(slot_mask);
     for (UINT slot = 0; slot < max_slot; slot++) {
       if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
@@ -11654,17 +11778,29 @@ private:
       if (!resource || !resource->GetBuffer())
         continue;
 
-      snapshot.vertex_buffers.push_back(GraphicsVertexBufferBindingSnapshot{
+      GraphicsVertexBufferBindingSnapshot binding = {
           slot, view.StrideInBytes, resource->GetHeapOffset() + resource_offset,
-          Rc<Buffer>(resource->GetBuffer())});
+          Rc<Buffer>(resource->GetBuffer())};
+      HashGraphicsBindingValue(snapshot.content_fingerprint, binding.slot);
+      HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                                 binding.buffer.ptr());
+      HashGraphicsBindingValue(snapshot.content_fingerprint, binding.offset);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, binding.stride);
+      snapshot.vertex_buffers.push_back(std::move(binding));
     }
   }
 
   GraphicsBindingSnapshot CaptureGraphicsBindingSnapshot(
       const ReplayState &state, PipelineState &pipeline) {
     GraphicsBindingSnapshot snapshot = {};
+    snapshot.content_fingerprint = kGraphicsBindingFingerprintOffset;
     snapshot.pipeline_state = state.pipeline_state;
     snapshot.root_signature = state.graphics_root_signature;
+    HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                               snapshot.root_signature.ptr());
+    HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                               snapshot.pipeline_state.ptr());
+    HashGraphicsBindingPointer(snapshot.content_fingerprint, &pipeline);
 
     auto *root = GetRootSignature(state.graphics_root_signature.ptr());
     if (!root)
@@ -13188,6 +13324,8 @@ private:
     PipelineState *pipeline = nullptr;
     GraphicsBindingSnapshot binding_snapshot;
     uint64_t binding_generation = 0;
+    uint64_t descriptor_content_generation = 0;
+    uint64_t binding_content_fingerprint = 0;
     std::optional<WMTPrimitiveType> primitive;
     std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
     std::optional<uint32_t> control_point_count;
@@ -13224,6 +13362,29 @@ private:
     UINT base_instance = 0;
   };
 
+  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
+    common.binding_content_fingerprint =
+        common.binding_snapshot.content_fingerprint;
+    HashGraphicsBindingValue(common.binding_content_fingerprint,
+                             common.metal_pso.handle);
+    HashGraphicsBindingValue(common.binding_content_fingerprint,
+                             common.use_geometry);
+    HashGraphicsBindingValue(common.binding_content_fingerprint,
+                             common.use_tessellation);
+  }
+
+  void FinalizeReplayDrawBindingFingerprint(
+      ReplayDrawIndexedInstancedPacket &packet) {
+    FinalizeReplayDrawBindingFingerprint(packet.common);
+    const auto index_buffer = packet.index_allocation->buffer();
+    HashGraphicsBindingValue(packet.common.binding_content_fingerprint,
+                             index_buffer.handle);
+    HashGraphicsBindingValue(packet.common.binding_content_fingerprint,
+                             packet.index_binding_offset);
+    HashGraphicsBindingValue(packet.common.binding_content_fingerprint,
+                             packet.index_type);
+  }
+
   void EncodeReplayDrawCommonState(ArgumentEncodingContext &enc,
                                    ReplayDrawPacketCommon &packet,
                                    uint64_t &argbuf_offset) {
@@ -13253,14 +13414,34 @@ private:
     }
 
     auto &binding_cache = render_encoder->binding_state_cache;
-    const bool skip_binding_snapshot =
+    const bool generation_hit =
         binding_cache.valid &&
-        binding_cache.graphics_generation == packet.binding_generation;
+        binding_cache.graphics_generation == packet.binding_generation &&
+        binding_cache.descriptor_content_generation ==
+            packet.descriptor_content_generation;
+    const bool fingerprint_hit =
+        binding_cache.valid && !generation_hit &&
+        binding_cache.content_fingerprint == packet.binding_content_fingerprint;
+    const bool skip_binding_snapshot = generation_hit || fingerprint_hit;
+    if (D3D12DiagBindingRecipeCacheEnabled()) {
+      auto &stats = BindingRecipeDiagStats();
+      if (generation_hit)
+        stats.gate_generation_hits.fetch_add(1, std::memory_order_relaxed);
+      else if (fingerprint_hit)
+        stats.gate_fingerprint_hits.fetch_add(1, std::memory_order_relaxed);
+      else
+        stats.gate_misses.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!skip_binding_snapshot) {
       ApplyGraphicsBindingSnapshot(enc, packet.binding_snapshot,
                                    *packet.pipeline, packet.use_geometry,
                                    packet.use_tessellation, argbuf_offset);
+    }
+    if (!generation_hit) {
       binding_cache.graphics_generation = packet.binding_generation;
+      binding_cache.descriptor_content_generation =
+          packet.descriptor_content_generation;
+      binding_cache.content_fingerprint = packet.binding_content_fingerprint;
       binding_cache.valid = true;
     }
     EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
@@ -13571,10 +13752,13 @@ private:
       if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
         return;
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
+      const auto descriptor_content_generation =
+          GetDescriptorContentGeneration();
       GraphicsBindingSnapshot binding_snapshot;
       {
         StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
-        if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
+        if (GraphicsPassBatchNeedsBindingSnapshot(
+                chunk, state, attachments, descriptor_content_generation))
           binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
       }
       DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
@@ -13603,6 +13787,8 @@ private:
     packet.common.pipeline = pipeline;
     packet.common.binding_snapshot = std::move(binding_snapshot);
     packet.common.binding_generation = state.graphics_binding_generation;
+    packet.common.descriptor_content_generation =
+        descriptor_content_generation;
     packet.common.primitive = primitive;
     packet.common.geometry_counts = geometry_counts;
     packet.common.control_point_count = control_point_count;
@@ -13618,6 +13804,7 @@ private:
         metal->tess_num_output_control_point_element;
     packet.common.use_geometry = metal->use_geometry;
     packet.common.use_tessellation = metal->use_tessellation;
+    FinalizeReplayDrawBindingFingerprint(packet.common);
     packet.vertex_start = record.start_vertex_location;
     packet.vertex_count = record.vertex_count_per_instance;
     packet.instance_count = record.instance_count;
@@ -13762,10 +13949,13 @@ private:
         return;
       const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
       RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
+      const auto descriptor_content_generation =
+          GetDescriptorContentGeneration();
       GraphicsBindingSnapshot binding_snapshot;
       {
         StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
-        if (GraphicsPassBatchNeedsBindingSnapshot(chunk, state, attachments))
+        if (GraphicsPassBatchNeedsBindingSnapshot(
+                chunk, state, attachments, descriptor_content_generation))
           binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
       }
       if (rb_draw)
@@ -13799,6 +13989,8 @@ private:
     packet.common.pipeline = pipeline;
     packet.common.binding_snapshot = std::move(binding_snapshot);
     packet.common.binding_generation = state.graphics_binding_generation;
+    packet.common.descriptor_content_generation =
+        descriptor_content_generation;
     packet.common.primitive = primitive;
     packet.common.geometry_counts = geometry_counts;
     packet.common.control_point_count = control_point_count;
@@ -13823,6 +14015,7 @@ private:
     packet.instance_count = record.instance_count;
     packet.base_vertex = record.base_vertex_location;
     packet.base_instance = record.start_instance_location;
+    FinalizeReplayDrawBindingFingerprint(packet);
 
     auto encode_draw = [this, packet = std::move(packet)](
                            ArgumentEncodingContext &enc,
