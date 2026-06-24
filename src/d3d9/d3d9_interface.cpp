@@ -381,7 +381,10 @@ MTLD3D9Interface::CheckDeviceFormat(
     if (wantDS)
       return isDSFormat(CheckFormat) ? D3D_OK : D3DERR_NOTAVAILABLE;
     if (wantRT)
-      return isColorRTFormat(CheckFormat) ? D3D_OK : D3DERR_NOTAVAILABLE;
+      // The 'NULL' FOURCC is RT-capable as a render-target texture too, not
+      // just a standalone surface (see the SURFACE branch); apps query it
+      // before binding a write-skipped colour slot backed by a texture.
+      return (isColorRTFormat(CheckFormat) || IsNullFormat(CheckFormat)) ? D3D_OK : D3DERR_NOTAVAILABLE;
     if (!isSamplable2D(CheckFormat))
       return D3DERR_NOTAVAILABLE;
     // Hardware mip generation renders each level down, so it needs a colour-
@@ -560,7 +563,11 @@ MTLD3D9Interface::CheckDepthStencilMatch(
     }
   };
 
-  return (isColorRT(RenderTargetFormat) && isDS(DepthStencilFormat)) ? D3D_OK : D3DERR_NOTAVAILABLE;
+  // A 'NULL' colour target pairs with any real depth/stencil: a depth-only
+  // pass binds NULL as the colour slot and a genuine DS attachment.
+  return ((isColorRT(RenderTargetFormat) || IsNullFormat(RenderTargetFormat)) && isDS(DepthStencilFormat))
+             ? D3D_OK
+             : D3DERR_NOTAVAILABLE;
 }
 
 HRESULT STDMETHODCALLTYPE
