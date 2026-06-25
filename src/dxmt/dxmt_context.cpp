@@ -671,6 +671,29 @@ ArgumentEncodingContext::packBindlessStage(
 // 29 sampler mirror / 30 texture mirror). Null buffers are skipped (the per-pass argbuf or a
 // prior bind stays at that slot; the shader for this PSO does not read a skipped slot). Sets the
 // mixed-PSO guard flag after binding mirrors.
+//
+// RESIDENCY (③.4): NO useResource is emitted here for the four bound buffers, and none is
+// needed. All four are bound DIRECTLY to the encoder via setArgumentBuffer, so they are
+// auto-resident in DXMT's model (DXMT has NO MTLResidencySet / requestResidency / useHeap —
+// grep src/dxmt src/winemetal src/d3d12; the only residency API is per-encoder useResource for
+// INDIRECTLY-accessed resources). Proof: the legacy per-pass argbuf is bound directly at slots
+// 16/29/30 (FlushRenderEncoderArgumentBuffer / appendRenderArgumentBufferBindings) and is NEVER
+// passed to useResource — directly-bound argument buffers do not need it. buf_table/root_offsets
+// come from the SAME argbuf ring (argbuf_allocator, dxmt_command_queue.cpp:114) as that legacy
+// argbuf; the two mirrors are separate persistent device.newBuffer allocations
+// (d3d12_descriptor_mirror.cpp:19) with the SAME storage/hazard options (Shared|Untracked) and
+// the same heap-less newBuffer path the ring blocks use (dxmt_ring_bump_allocator.hpp:92/146) —
+// so they are resident by virtue of the direct bind, exactly like the ring.
+//
+// The resources these four point to ARE accessed indirectly and DO need residency, but it is
+// already established elsewhere (do NOT re-emit it here): the ③.1 packers
+// (packBindlessCBuffers / packBindlessBufferTable) call access<>()/makeResident on every CBV /
+// SRV/UAV BUFFER they pack into buf_table, and on every mirrored TEXTURE this draw indexes (the
+// shader only reaches textures via reflection args, which those packers walk). FillBindlessMirror
+// Slot (d3d12_command_queue.cpp:10261) only writes the handle bytes once-per-change; the per-draw
+// residency for those textures is the packer's makeResident. (Stage-2 may replace the per-resource
+// makeResident with a single useResource over the whole mirror — explicitly deferred, not done
+// here.)
 template <PipelineStage stage>
 void
 ArgumentEncodingContext::bindBindlessTables(
