@@ -614,6 +614,162 @@ template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Ve
 template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Geometry, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const ShaderResourceBindingSnapshot *);
 template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const ShaderResourceBindingSnapshot *);
 
+// ---- bindless-mirror (Stage-1 sub-step ③.3) live per-draw wiring ----
+//
+// packBindlessStage: allocate + fill ONE stage's slot-27 buf_table for the current draw.
+// The compact bases come from BuildBufferTableCompactBases — the SAME walk airconv bakes its
+// compile-time compact_base from (dxmt_bindless_buffer_table.hpp / BINDLESS-ABI.md §4.5) — so
+// the runtime fill and the shader's indexing agree without any communication. Runs inside the
+// encode path so the packers' access<>()/makeResident calls bind to encoder_current.
+template <PipelineStage stage, PipelineKind kind>
+AllocatedArgumentBufferSlice
+ArgumentEncodingContext::packBindlessStage(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    const MTL_SM50_SHADER_ARGUMENT *arguments, const std::string &shader_hash
+) {
+  const uint32_t num_cbuffers = reflection->NumConstantBuffers;
+  const uint32_t num_arguments = reflection->NumArguments;
+
+  // Compute compact bases + total qword count via the shared walk. cb_bases[i] = CBV i's base;
+  // res_bases[i] = resource arg i's base (kNotABufferTableField for tex/sampler args).
+  std::vector<uint32_t> cb_bases(num_cbuffers ? num_cbuffers : 1);
+  std::vector<uint32_t> res_bases(num_arguments ? num_arguments : 1);
+  const uint32_t qword_count = BuildBufferTableCompactBases(
+      constant_buffers, num_cbuffers, arguments, num_arguments, cb_bases.data(), res_bases.data()
+  );
+
+  if (!qword_count) {
+    // No buffer fields in this stage; tex/sampler still need residency tracked. Run the
+    // packers anyway (with a null/zero-size buf_table) so the access<>()/makeResident for
+    // textures/samplers happens exactly as legacy; the write_slot bounds-guard (qw_base+1 <
+    // buf_table_qwords == 0) skips every write. The caller still binds the mirrors.
+    if (num_arguments && arguments)
+      packBindlessBufferTable<stage, kind>(reflection, arguments, shader_hash, nullptr, 0,
+                                           res_bases.data(), nullptr);
+    return {};
+  }
+
+  auto bt = queue_.AllocateArgumentBuffer(currentSeqId(), uint64_t(qword_count) * sizeof(uint64_t));
+  if (!bt.mapped || !bt.gpu_buffer)
+    return {};
+  auto *buf_table = static_cast<uint64_t *>(bt.mapped);
+  std::memset(buf_table, 0, bt.length);
+
+  if (num_cbuffers && constant_buffers)
+    packBindlessCBuffers<stage, kind>(reflection, constant_buffers, buf_table, qword_count,
+                                      cb_bases.data());
+  if (num_arguments && arguments)
+    packBindlessBufferTable<stage, kind>(reflection, arguments, shader_hash, buf_table, qword_count,
+                                         res_bases.data(), nullptr);
+
+  if (bt.needs_flush)
+    bt.gpu_buffer.updateContents(bt.offset, bt.mapped, bt.length);
+  return bt;
+}
+
+// bindBindlessTables: emit this draw's deferred slot binds (27 buf_table / 28 root_offsets /
+// 29 sampler mirror / 30 texture mirror). Null buffers are skipped (the per-pass argbuf or a
+// prior bind stays at that slot; the shader for this PSO does not read a skipped slot). Sets the
+// mixed-PSO guard flag after binding mirrors.
+template <PipelineStage stage>
+void
+ArgumentEncodingContext::bindBindlessTables(
+    WMT::Buffer buf_table, WMT::Buffer root_offsets, WMT::Buffer tex_mirror, WMT::Buffer sampler_mirror
+) {
+  if constexpr (stage == PipelineStage::Compute) {
+    auto bind = [&](WMT::Buffer buffer, uint8_t index) {
+      if (!buffer)
+        return;
+      auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbuffer>();
+      cmd.type = WMTComputeCommandSetArgumentBuffer;
+      cmd.buffer = buffer;
+      cmd.offset = 0;
+      cmd.index = index;
+    };
+    bind(buf_table, 27);
+    bind(root_offsets, 28);
+    bind(sampler_mirror, 29);
+    bind(tex_mirror, 30);
+    static_cast<ComputeEncoderData *>(encoder_current)->bindless_mirror_bound_29_30 = true;
+  } else {
+    static_assert(stage == PipelineStage::Vertex || stage == PipelineStage::Pixel,
+                  "bindless-mirror render binds support only Vertex/Pixel (no GS/HS/DS)");
+    constexpr WMTRenderStages stages =
+        stage == PipelineStage::Vertex ? WMTRenderStageVertex : WMTRenderStageFragment;
+    auto bind = [&](WMT::Buffer buffer, uint8_t index) {
+      if (!buffer)
+        return;
+      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbuffer>();
+      cmd.type = WMTRenderCommandSetArgumentBuffer;
+      cmd.buffer = buffer;
+      cmd.offset = 0;
+      cmd.index = index;
+      cmd.stages = stages;
+    };
+    bind(buf_table, 27);
+    bind(root_offsets, 28);
+    bind(sampler_mirror, 29);
+    bind(tex_mirror, 30);
+    currentRenderEncoder()->bindless_mirror_bound_29_30 = true;
+  }
+}
+
+// restorePerPassArgbufIfMirrorBound (mixed-PSO guard): a bindless draw rebinds slots 29/30 to the
+// persistent mirrors; a following LEGACY draw's encodeShaderResources only emits
+// setArgumentBufferOffset(30) assuming the per-pass argbuf is still bound whole at 29/30. If the
+// flag is set, re-bind the per-pass argbuf (currentRenderEncoder()->allocated_argbuf / compute
+// analog) whole at 29/30 — for render, for BOTH Vertex+Fragment (mirroring the flush-time whole
+// bind, FlushRenderEncoderArgumentBuffer / dxmt_context.cpp:3382-3386) — then clear the flag.
+// Called ONCE per legacy draw (before the per-stage encode loop), so the template `compute` only
+// selects render-vs-compute, not a single render stage. No-op when the flag is clear.
+template <bool compute>
+void
+ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound() {
+  if constexpr (compute) {
+    auto *data = static_cast<ComputeEncoderData *>(encoder_current);
+    if (!data->bindless_mirror_bound_29_30)
+      return;
+    auto argbuf = data->allocated_argbuf;
+    auto bind = [&](uint8_t index) {
+      auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbuffer>();
+      cmd.type = WMTComputeCommandSetArgumentBuffer;
+      cmd.buffer = argbuf;
+      cmd.offset = 0;
+      cmd.index = index;
+    };
+    bind(29);
+    bind(30);
+    data->bindless_mirror_bound_29_30 = false;
+  } else {
+    auto *data = currentRenderEncoder();
+    if (!data->bindless_mirror_bound_29_30)
+      return;
+    auto argbuf = data->allocated_argbuf;
+    auto bind = [&](WMTRenderStages stages, uint8_t index) {
+      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbuffer>();
+      cmd.type = WMTRenderCommandSetArgumentBuffer;
+      cmd.buffer = argbuf;
+      cmd.offset = 0;
+      cmd.index = index;
+      cmd.stages = stages;
+    };
+    bind(WMTRenderStageVertex, 29);
+    bind(WMTRenderStageVertex, 30);
+    bind(WMTRenderStageFragment, 29);
+    bind(WMTRenderStageFragment, 30);
+    data->bindless_mirror_bound_29_30 = false;
+  }
+}
+
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(WMT::Buffer, WMT::Buffer, WMT::Buffer, WMT::Buffer);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(WMT::Buffer, WMT::Buffer, WMT::Buffer, WMT::Buffer);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(WMT::Buffer, WMT::Buffer, WMT::Buffer, WMT::Buffer);
+template void ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound<false>();
+template void ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound<true>();
+
 inline uint64_t
 TextureMetadata(uint32_t array_length, float min_lod) {
   return ((uint64_t)array_length << 32) | (uint64_t)std::bit_cast<uint32_t>(min_lod);

@@ -11015,6 +11015,17 @@ private:
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
     uint64_t content_fingerprint = 0;
+    // Bindless-mirror (③.3) snapshot-path support: the snapshot replays draws WITHOUT the live
+    // ReplayState, so root_offsets (③.2, per-stage) and the two persistent mirror buffers are
+    // resolved at CAPTURE time (state valid) and carried here; the mirror itself is filled at
+    // APPLY from each entry.descriptor (which carries record.mirror). Ring slices captured here
+    // are applied within the same Execute, so their lifetime is valid. Empty when the captured
+    // PSO is not bindless. Indexed by PipelineStage (only Vertex/Pixel used for graphics).
+    bool bindless = false;
+    WMT::Buffer bindless_tex_mirror;
+    WMT::Buffer bindless_sampler_mirror;
+    AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
+    AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
 
   struct DescriptorTableBindingRecipeDiagStats {
@@ -12056,6 +12067,16 @@ private:
     if (!root)
       return snapshot;
 
+    // Bindless-mirror (③.3): the snapshot apply has no ReplayState, so resolve the two persistent
+    // mirror buffers here (state valid) and flag the snapshot bindless. root_offsets are rebuilt at
+    // apply from the captured entries (BuildBindlessRootOffsetsFromSnapshot); the mirror itself is
+    // filled at apply from each entry.descriptor.
+    if (pipeline.UsesBindlessMirror()) {
+      snapshot.bindless = true;
+      ResolveBindlessMirrorBuffers(state, snapshot.bindless_tex_mirror,
+                                   snapshot.bindless_sampler_mirror);
+    }
+
     CaptureDescriptorTableBindings(
         snapshot, state, pipeline,
         GetDescriptorTableBindingRecipe(pipeline, *root, false));
@@ -12206,6 +12227,137 @@ private:
     }
   }
 
+  // Bindless-mirror (③.3): is the env gate DXMT_BINDLESS_MIRROR on? Cheap cached read so a
+  // legacy-only run pays nothing for the mixed-PSO guard. (PsoBindlessEligible folds the same
+  // env into UsesBindlessMirror; this gate is only for the legacy-side guard re-bind.)
+  static bool BindlessMirrorEnvEnabled() {
+    static const bool on = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
+    return on;
+  }
+
+  // Bindless-mirror (③.3): resolve the two persistent mirror buffers (texture mirror from the
+  // CBV/SRV/UAV heap, sampler mirror from the SAMPLER heap) bound in `state`. Empty WMT::Buffer
+  // if the heap or its mirror is absent (the caller then skips that slot's bind).
+  void ResolveBindlessMirrorBuffers(const ReplayState &state,
+                                    WMT::Buffer &tex_mirror,
+                                    WMT::Buffer &sampler_mirror) {
+    auto *cbv_heap =
+        GetBoundDescriptorHeap(state, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto *samp_heap =
+        GetBoundDescriptorHeap(state, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    tex_mirror = (cbv_heap && cbv_heap->GetMirror())
+                     ? cbv_heap->GetMirror()->buffer()
+                     : WMT::Buffer{};
+    sampler_mirror = (samp_heap && samp_heap->GetMirror())
+                         ? samp_heap->GetMirror()->buffer()
+                         : WMT::Buffer{};
+  }
+
+  // Bindless-mirror (③.3) live/compute per-stage wiring: for the bindless path, replace the
+  // legacy encodeConstantBuffers/encodeShaderResources with (1) pack the slot-27 buf_table via the
+  // ③.1 packers and (2) emit the per-draw deferred binds of buf_table(27) + root_offsets(28, ③.2)
+  // + sampler mirror(29) + texture mirror(30). `state`/`root` are reachable here (live path clones
+  // replay_state into the lambda; compute path has state). Only the Ordinary Vertex/Pixel/Compute
+  // stages are wired — the bindless off-gate guarantees no GS/HS/DS, so the geometry/tess branches
+  // stay on the LEGACY EncodeShaderBindingsForStage.
+  template <PipelineStage Stage>
+  void EncodeShaderBindingsForStageBindless(ArgumentEncodingContext &enc,
+                                            const ReplayState &state,
+                                            const PipelineState &pipeline,
+                                            const RootSignature &root,
+                                            const PipelineDxilShader &shader,
+                                            const std::string &shader_key,
+                                            bool compute) {
+    const auto &reflection = shader.reflection();
+    auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
+        &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
+        shader_key);
+    auto root_offsets =
+        BuildBindlessRootOffsets(enc, state, pipeline, root, Stage, compute);
+    WMT::Buffer tex_mirror, sampler_mirror;
+    ResolveBindlessMirrorBuffers(state, tex_mirror, sampler_mirror);
+    enc.bindBindlessTables<Stage>(bt.gpu_buffer, root_offsets.gpu_buffer,
+                                  tex_mirror, sampler_mirror);
+  }
+
+  // Bindless-mirror (③.3) snapshot-path root_offsets: the snapshot replay has no live ReplayState
+  // (so BuildBindlessRootOffsets's table-handle walk is unreachable) but the captured entries DO
+  // carry, per texture/sampler descriptor, entry.argument (with StructurePtrOffset) and
+  // entry.descriptor.heap_index. In a descriptor-table range the base register occupies the LOWEST
+  // heap slot (heaps are contiguous + ascending), so root_offsets[arg.StructurePtrOffset] = the
+  // MIN heap_index over that arg's captured descriptors == BuildBindlessRootOffsets's base. Builds
+  // the slot-28 slice for ONE stage from the snapshot entries; empty if the stage has no tex/sampler.
+  AllocatedArgumentBufferSlice
+  BuildBindlessRootOffsetsFromSnapshot(ArgumentEncodingContext &enc,
+                                       const GraphicsBindingSnapshot &snapshot,
+                                       PipelineStage want_stage) {
+    uint32_t max_key_plus_one = 0;
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || entry.stage != want_stage)
+        continue;
+      const auto &arg = entry.argument;
+      const bool is_tex_or_sampler =
+          arg.Type == SM50BindingType::Sampler ||
+          ((arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
+           (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE));
+      if (is_tex_or_sampler)
+        max_key_plus_one =
+            std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
+    }
+    if (!max_key_plus_one)
+      return {};
+
+    auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), uint64_t(max_key_plus_one) * sizeof(uint32_t));
+    if (!slice.mapped || !slice.gpu_buffer)
+      return {};
+    auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
+    // UINT32_MAX sentinel so the first real heap_index wins the min().
+    for (uint32_t i = 0; i < max_key_plus_one; i++)
+      root_offsets[i] = UINT32_MAX;
+
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || entry.stage != want_stage)
+        continue;
+      const auto &arg = entry.argument;
+      const bool is_tex_or_sampler =
+          arg.Type == SM50BindingType::Sampler ||
+          (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+      if (!is_tex_or_sampler)
+        continue;
+      if (arg.StructurePtrOffset >= max_key_plus_one)
+        continue;
+      auto &slot = root_offsets[arg.StructurePtrOffset];
+      slot = std::min<uint32_t>(slot, entry.descriptor.heap_index);
+    }
+    for (uint32_t i = 0; i < max_key_plus_one; i++)
+      if (root_offsets[i] == UINT32_MAX)
+        root_offsets[i] = 0;
+    if (slice.needs_flush)
+      slice.gpu_buffer.updateContents(slice.offset, slice.mapped, slice.length);
+    return slice;
+  }
+
+  // Bindless-mirror (③.3) snapshot-path per-stage wiring: pack the slot-27 buf_table (encode-time,
+  // residency via packers) + bind 27/28/29/30. root_offsets is the slice pre-built from the
+  // snapshot entries; the two mirror buffers were resolved at capture and carried in the snapshot
+  // (their handles are stable on the heap). Only Ordinary Vertex/Pixel.
+  template <PipelineStage Stage>
+  void EncodeShaderBindingsForStageBindlessSnapshot(
+      ArgumentEncodingContext &enc, const PipelineDxilShader &shader,
+      const std::string &shader_key, const GraphicsBindingSnapshot &snapshot,
+      const AllocatedArgumentBufferSlice &root_offsets) {
+    const auto &reflection = shader.reflection();
+    auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
+        &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
+        shader_key);
+    enc.bindBindlessTables<Stage>(bt.gpu_buffer, root_offsets.gpu_buffer,
+                                  snapshot.bindless_tex_mirror,
+                                  snapshot.bindless_sampler_mirror);
+  }
+
   void BindRootConstantsSnapshot(ArgumentEncodingContext &enc,
                                  const GraphicsBindingSnapshotEntry &entry) {
     const auto constant_count =
@@ -12281,6 +12433,11 @@ private:
             entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
             entry.stage, entry.root_index, entry.slot, entry.shader_register,
             entry.register_space, entry.debug_size, entry.debug_address);
+        // Bindless-mirror (③.3): the snapshot path does not run ApplyDescriptorTableBindingRecipe,
+        // so fill the persistent mirror here from the captured descriptor (record.mirror travels
+        // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
+        if (snapshot.bindless)
+          MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor);
         BindDescriptor(enc, entry.stage, entry.range_type, entry.slot,
                        entry.descriptor, &entry.argument);
       } else {
@@ -12314,7 +12471,32 @@ private:
 
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
+    // Bindless-mirror (③.3) snapshot path: pre-build per-stage root_offsets from the captured
+    // entries (no ReplayState here). A bindless PSO is never geometry/tess (off-gate), so only
+    // Ordinary Vertex/Pixel branch; the geometry/tess branches stay legacy.
+    const bool snapshot_bindless =
+        snapshot.bindless && !use_geometry && !use_tessellation;
+    AllocatedArgumentBufferSlice ro_vertex, ro_pixel;
+    if (snapshot_bindless) {
+      ro_vertex =
+          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Vertex);
+      ro_pixel =
+          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Pixel);
+    }
+    // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
+    // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
+    if (!snapshot.bindless && BindlessMirrorEnvEnabled())
+      enc.restorePerPassArgbufIfMirrorBound<false>();
     for (const auto &shader : shaders) {
+      if (snapshot_bindless) {
+        if (shader.stage == PipelineShaderStage::Vertex)
+          EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
+              enc, shader, key, snapshot, ro_vertex);
+        else if (shader.stage == PipelineShaderStage::Pixel)
+          EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
+              enc, shader, key, snapshot, ro_pixel);
+        continue;
+      }
       if (use_geometry) {
         if (shader.stage == PipelineShaderStage::Vertex)
           EncodeShaderBindingsForStage<PipelineStage::Vertex,
@@ -12422,7 +12604,27 @@ private:
                         argbuf_offset, pipeline_kind);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
+    // Bindless-mirror (③.3): a bindless PSO is never geometry/tessellation (the off-gate
+    // excludes GS/HS/DS), so only the Ordinary Vertex/Pixel stages need the bindless wiring.
+    const bool bindless = pipeline.UsesBindlessMirror();
+    const RootSignature *bindless_root =
+        bindless ? GetRootSignature(state.graphics_root_signature.ptr())
+                 : nullptr;
+    // Mixed-PSO guard (③.3 STEP D): a legacy draw after a bindless draw must restore the per-pass
+    // argbuf at slots 29/30 (the bindless draw rebound them to mirrors). Gated on the env so a
+    // legacy-only run pays nothing.
+    if (!bindless && BindlessMirrorEnvEnabled())
+      enc.restorePerPassArgbufIfMirrorBound<false>();
     for (const auto &shader : shaders) {
+      if (bindless && bindless_root && !use_geometry && !use_tessellation) {
+        if (shader.stage == PipelineShaderStage::Vertex)
+          EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
+              enc, state, pipeline, *bindless_root, shader, key, false);
+        else if (shader.stage == PipelineShaderStage::Pixel)
+          EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
+              enc, state, pipeline, *bindless_root, shader, key, false);
+        continue;
+      }
       if (use_geometry) {
         if (shader.stage == PipelineShaderStage::Vertex)
           EncodeShaderBindingsForStage<PipelineStage::Vertex,
@@ -12473,11 +12675,25 @@ private:
     ApplyRootDescriptorTables(enc, state, pipeline, true);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
+    // Bindless-mirror (③.3): compute bindless wiring (slot-27 buf_table + 28/29/30 binds).
+    const bool bindless = pipeline.UsesBindlessMirror();
+    const RootSignature *bindless_root =
+        bindless ? GetRootSignature(state.compute_root_signature.ptr())
+                 : nullptr;
+    // Mixed-PSO guard (③.3 STEP D): restore the per-pass argbuf at 29/30 if a prior bindless
+    // dispatch rebound them. Compute analog of the graphics guard.
+    if (!bindless && BindlessMirrorEnvEnabled())
+      enc.restorePerPassArgbufIfMirrorBound<true>();
     for (const auto &shader : shaders) {
-      if (shader.stage == PipelineShaderStage::Compute)
-        EncodeShaderBindingsForStage<PipelineStage::Compute,
-                                     PipelineKind::Ordinary>(
-          enc, shader, key, argbuf_offset);
+      if (shader.stage == PipelineShaderStage::Compute) {
+        if (bindless && bindless_root)
+          EncodeShaderBindingsForStageBindless<PipelineStage::Compute>(
+              enc, state, pipeline, *bindless_root, shader, key, true);
+        else
+          EncodeShaderBindingsForStage<PipelineStage::Compute,
+                                       PipelineKind::Ordinary>(
+              enc, shader, key, argbuf_offset);
+      }
     }
   }
 

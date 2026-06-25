@@ -255,6 +255,9 @@ struct RenderEncoderData : EncoderData {
   bool use_visibility_result = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
+  // Bindless-mirror (③.3) mixed-PSO guard: true after a bindless draw rebinds slots 29/30 to
+  // the persistent mirrors; a following legacy draw restores the per-pass argbuf there first.
+  bool bindless_mirror_bound_29_30 = false;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
   uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
@@ -276,6 +279,9 @@ struct ComputeEncoderData : EncoderData {
   uint64_t allocated_argbuf_size;
   void *allocated_argbuf_mapping;
   bool allocated_argbuf_needs_flush;
+  // Bindless-mirror (③.3) mixed-PSO guard: true after a bindless dispatch rebinds slots 29/30 to
+  // the persistent mirrors; a following legacy dispatch restores the per-pass argbuf there first.
+  bool bindless_mirror_bound_29_30 = false;
   ArgumentTableSliceCache argument_table_cache;
   std::array<ComputeArgumentBufferOffsetState, 8> argument_buffer_offsets = {};
 };
@@ -671,6 +677,45 @@ public:
       const std::string &shader_hash, uint64_t *buf_table, uint32_t buf_table_qwords,
       const uint32_t *res_compact, const ShaderResourceBindingSnapshot *bindings
   );
+
+  // Bindless-mirror (Stage-1 sub-step ③.3): pack ONE stage's slot-27 buf_table for the
+  // current draw. Allocates the buf_table ring slice (sized via BuildBufferTableCompactBases,
+  // the SAME walk airconv bakes its compact bases from), runs the ③.1 packers
+  // (packBindlessCBuffers + packBindlessBufferTable) — which resolve buffer addresses with
+  // the legacy access<>()/makeResident expressions and persist tex/sampler residency — then
+  // flushes the slice. Runs inside the encode path (encoder_current set). Returns the buf_table
+  // slice (empty/null gpu_buffer when the stage has no buffer fields, in which case the caller
+  // still binds the mirrors). It does NOT emit the slot binds (see bindBindlessTables); the
+  // caller resolves root_offsets + the two mirror buffers which need root/heap state.
+  // Takes the same raw reflection/argument pointers as the ③.1 packers (constant_buffers ==
+  // constantBufferInfo(), arguments == resourceArgumentInfo()) to keep the dxmt layer free of
+  // the d3d12 PipelineDxilShader type.
+  template <PipelineStage stage, PipelineKind kind>
+  AllocatedArgumentBufferSlice
+  packBindlessStage(const MTL_SHADER_REFLECTION *reflection,
+                    const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+                    const MTL_SM50_SHADER_ARGUMENT *arguments,
+                    const std::string &shader_hash);
+
+  // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
+  // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null
+  // buffer (e.g. no samplers → sampler_mirror null; no buffer fields → buf_table null). Sets the
+  // encoder's bindless_mirror_bound_29_30 flag so a FOLLOWING legacy draw restores the per-pass
+  // argbuf at 29/30 (mixed-PSO guard). Vertex→WMTRenderStageVertex, Pixel→WMTRenderStageFragment,
+  // Compute uses the compute setargumentbuffer (no stages).
+  template <PipelineStage stage>
+  void bindBindlessTables(WMT::Buffer buf_table, WMT::Buffer root_offsets,
+                          WMT::Buffer tex_mirror, WMT::Buffer sampler_mirror);
+
+  // Bindless-mirror (Stage-1 sub-step ③.3) mixed-PSO guard: if the current encoder's last 29/30
+  // bind was a bindless mirror (a prior bindless draw rebound them), restore the per-pass argbuf
+  // (currentRenderEncoder()->allocated_argbuf / compute analog) WHOLE at slots 29/30 (render: both
+  // Vertex+Fragment, as the flush-time bind does) so a following LEGACY draw's
+  // setArgumentBufferOffset(30) reads the per-pass argbuf, not the mirror. No-op when the flag is
+  // clear. Called ONCE per legacy draw at the top of the legacy encode branch (bindless-after-
+  // legacy needs no guard — bindless rebinds 29/30 anyway). `compute` selects render-vs-compute.
+  template <bool compute>
+  void restorePerPassArgbufIfMirrorBound();
 
   void retainAllocation(Allocation* allocation);
 
