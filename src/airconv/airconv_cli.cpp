@@ -85,9 +85,8 @@ static cl::opt<bool> BindlessMirrorTextureSrvPrototype(
 
 static cl::opt<bool> BindlessMirror(
   "bindless-mirror",
-  cl::desc("Read ALL descriptor types (SRV/UAV texture+buffer, CBV, sampler) from "
-           "persistent typed argument-buffer mirror arrays indexed by "
-           "root_base + reflected_local_index. See BINDLESS-ABI.md."),
+  cl::desc("Read textures/samplers from persistent mirror arrays and buffers "
+           "from the per-draw buffer table. See BINDLESS-ABI.md."),
   cl::init(false), cl::Hidden
 );
 

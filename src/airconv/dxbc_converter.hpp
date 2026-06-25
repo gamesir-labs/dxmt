@@ -480,6 +480,14 @@ constexpr uint32_t kBindlessMirrorCapacity = 1u << 20; // 1,048,576 descriptors
 // (== MTL_SM50_SHADER_ARGUMENT::StructurePtrOffset) holds the absolute base slot
 // (uint32) of that resource's descriptor-table range inside its typed mirror.
 constexpr uint32_t kBindlessRootOffsetBindIndex = 28;
+// Metal buffer binding slot of the per-draw BUFFER table (slot 27). Under the
+// hybrid ABI, BUFFER descriptors (CBV + SRV/UAV buffer + UAV counter) do NOT live
+// in the persistent mirror (their gpuAddress = alloc base + per-draw suballocation
+// offset churns every draw); they are packed by the runtime into this small
+// per-draw table, indexed by a STATIC compact index airconv assigns in reflection
+// order (NOT via root_offsets). See BINDLESS-ABI.md §5. Textures + samplers stay in
+// the slot-30 mirror.
+constexpr uint32_t kBindlessBufferTableBindIndex = 27;
 
 void setup_binding_table(
   const ShaderInfo *shader_info, io_binding_map &resource_map,

@@ -328,6 +328,71 @@ mirror_local_index(context &ctx, pvalue dyn_index, uint32_t range_lower_bound) {
   );
 }
 
+static llvm::Value *
+buffer_table_qword_index(
+    context &ctx, pvalue dyn_index, uint32_t range_lower_bound,
+    uint32_t compact_base, uint32_t qword_offset) {
+  auto local = mirror_local_index(ctx, dyn_index, range_lower_bound);
+  auto descriptor_base = ctx.builder.CreateAdd(local, local);
+  return ctx.builder.CreateAdd(
+      ctx.builder.getInt32(compact_base + qword_offset), descriptor_base);
+}
+
+static auto get_buffer_table_qword(
+    uint32_t buffer_table_index, uint32_t compact_base,
+    uint32_t range_lower_bound, uint32_t qword_offset) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto buf_table = ctx.function->getArg(buffer_table_index);
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          i64, buf_table,
+          buffer_table_qword_index(
+              ctx, dyn_index, range_lower_bound, compact_base, qword_offset));
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+static auto get_buffer_in_buffer_table(
+    uint32_t buffer_table_index, uint32_t compact_base,
+    uint32_t range_lower_bound, air::AddressSpace address_space,
+    uint32_t qword_offset = 0) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto address = get_buffer_table_qword(
+          buffer_table_index, compact_base, range_lower_bound,
+          qword_offset)(dyn_index)
+          .build(ctx);
+      if (auto err = address.takeError())
+        return std::move(err);
+
+      auto ptr_ty = ctx.builder.getInt32Ty()->getPointerTo(
+          static_cast<unsigned>(address_space));
+      return ctx.builder.CreateIntToPtr(address.get(), ptr_ty);
+    });
+  };
+}
+
+static auto get_cbuffer_in_buffer_table(
+    uint32_t buffer_table_index, uint32_t compact_base,
+    uint32_t range_lower_bound) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto address = get_buffer_table_qword(
+          buffer_table_index, compact_base, range_lower_bound, 0)(dyn_index)
+          .build(ctx);
+      if (auto err = address.takeError())
+        return std::move(err);
+
+      return ctx.builder.CreateIntToPtr(
+          address.get(),
+          ctx.types._int4->getPointerTo(
+              static_cast<unsigned>(air::AddressSpace::constant)));
+    });
+  };
+}
+
 // Read element `mirror.field[field_index][ root_base[arg_index] + local ]` from a
 // typed mirror argument-buffer array, where local = operand_index - lower_bound.
 // `field_index` selects the typed array field; element type is whatever the
@@ -419,42 +484,31 @@ auto get_cbuffer_in_argbuf_binding_table(
   };
 };
 
-// Bindless-mirror CBV reader: the cbuffer mirror has a single typed array field
-// of `constant uint4*` pointers indexed by root_base[arg_index] + dyn_index. The
-// dyn_index is the ConstantBuffer<>[] descriptor index. Returns the uint4* the
-// SrcOperandConstantBuffer Load path consumes (it then GEPs by regindex).
-static auto get_cbuffer_in_mirror_binding_table(
-  uint32_t argbuf_index, uint32_t field_index,
-  uint32_t root_offset_arg_index, uint32_t arg_index, uint32_t range_lower_bound
-) {
-  return [=](pvalue dyn_index) {
-    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
-      auto argbuf = ctx.function->getArg(argbuf_index);
-      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
-        llvm::cast<llvm::PointerType>(argbuf->getType())
-          ->getNonOpaquePointerElementType()
-      );
-      auto array_ptr = ctx.builder.CreateStructGEP(
-        argbuf_struct_type, argbuf, field_index
-      );
-      auto array_ty = llvm::cast<llvm::ArrayType>(
-        argbuf_struct_type->getElementType(field_index)
-      );
-      llvm::Value *element_index =
-        mirror_local_index(ctx, dyn_index, range_lower_bound);
-      if (root_offset_arg_index != UINT32_MAX) {
-        auto base = get_root_base(root_offset_arg_index, arg_index).build(ctx);
-        if (auto err = base.takeError())
-          return std::move(err);
-        element_index = ctx.builder.CreateAdd(base.get(), element_index);
-      }
-      auto element_ptr = ctx.builder.CreateGEP(
-        array_ty, array_ptr, {ctx.builder.getInt32(0), element_index}
-      );
-      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
-    });
-  };
-};
+static uint32_t
+descriptor_range_qword_count(const ResourceRange &range) {
+  const uint32_t range_size = range.size ? range.size : 1;
+  return (range_size == UINT_MAX ? kBindlessMirrorCapacity : range_size) * 2;
+}
+
+static uint32_t
+bindless_buffer_table_qword_count(const ShaderInfo *shader_info) {
+  uint32_t running_qword = 0;
+
+  for (auto &[range_id, cbv] : shader_info->cbufferMap)
+    running_qword += descriptor_range_qword_count(cbv.range);
+
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      running_qword += descriptor_range_qword_count(srv.range);
+  }
+
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable)
+      running_qword += descriptor_range_qword_count(uav.range);
+  }
+
+  return running_qword;
+}
 
 static void
 add_texture_argument_flags(
@@ -518,7 +572,7 @@ void setup_binding_table(
         .arg_name = arg_name,
       });
   }
-  if (!shader_info->binding_table_cbuffer.Empty()) {
+  if (!gBindlessMirror && !shader_info->binding_table_cbuffer.Empty()) {
     auto [type, metadata] = shader_info->binding_table_cbuffer.Build(
       module.getContext(), module.getDataLayout()
     );
@@ -535,6 +589,20 @@ void setup_binding_table(
         .struct_type_info = metadata,
         .arg_name = arg_name,
       });
+  }
+
+  uint32_t buffer_table_index = ~0u;
+  if (gBindlessMirror && bindless_buffer_table_qword_count(shader_info)) {
+    buffer_table_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = std::nullopt,
+      .location_index = kBindlessBufferTableBindIndex,
+      .array_size = 1,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_ulong,
+      .arg_name = "buf_table",
+      .raster_order_group = std::nullopt,
+    });
   }
 
   // Per-draw root-offset buffer: element[arg_index] (== StructurePtrOffset) is
@@ -573,18 +641,13 @@ void setup_binding_table(
     };
   };
 
+  uint32_t compact_base = 0;
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     auto index = cbv.arg_index;
     if (gBindlessMirror) {
-      // binding_table and cbuffer_table have independent arg_index spaces (both
-      // start at 0). root_offsets is shared, so the CBV's root_offsets entry is
-      // offset by the binding_table field count to avoid colliding with the
-      // SRV/UAV/sampler entries. See BINDLESS-ABI.md §4.
-      const uint32_t cbv_root_key =
-        shader_info->binding_table.Size() + index;
-      resource_map.cb_range_map[range_id] = get_cbuffer_in_mirror_binding_table(
-        cbuf_table_index, index, root_offset_index, cbv_root_key,
-        cbv.range.lower_bound);
+      resource_map.cb_range_map[range_id] = get_cbuffer_in_buffer_table(
+          buffer_table_index, compact_base, cbv.range.lower_bound);
+      compact_base += descriptor_range_qword_count(cbv.range);
     } else {
       resource_map.cb_range_map[range_id] = get_cbuffer_in_argbuf_binding_table(
           cbuf_table_index, index, cbv.range.lower_bound,
@@ -635,10 +698,17 @@ void setup_binding_table(
     } else {
       resource_map.srv_buf_range_map[range_id] = {
         srv.structure_stride,
-        read_field(srv.arg_index, srv.arg_index, lb),
-        read_field(srv.arg_metadata_index, srv.arg_index, lb),
+        gBindlessMirror
+          ? get_buffer_in_buffer_table(
+              buffer_table_index, compact_base, lb, air::AddressSpace::device)
+          : read_field(srv.arg_index, srv.arg_index, lb),
+        gBindlessMirror
+          ? get_buffer_table_qword(buffer_table_index, compact_base, lb, 1)
+          : read_field(srv.arg_metadata_index, srv.arg_index, lb),
         false
       };
+      if (gBindlessMirror)
+        compact_base += descriptor_range_qword_count(srv.range);
     }
   }
   for (auto &[range_id, uav] : shader_info->uavMap) {
@@ -675,14 +745,25 @@ void setup_binding_table(
     } else {
       resource_map.uav_buf_range_map[range_id] = {
         uav.structure_stride,
-        read_field(uav.arg_index, uav.arg_index, lb),
-        read_field(uav.arg_metadata_index, uav.arg_index, lb),
+        gBindlessMirror
+          ? get_buffer_in_buffer_table(
+              buffer_table_index, compact_base, lb, air::AddressSpace::device)
+          : read_field(uav.arg_index, uav.arg_index, lb),
+        gBindlessMirror
+          ? get_buffer_table_qword(buffer_table_index, compact_base, lb, 1)
+          : read_field(uav.arg_metadata_index, uav.arg_index, lb),
         uav.global_coherent
       };
       if (uav.with_counter) {
         resource_map.uav_counter_range_map[range_id] =
-          read_field(uav.arg_counter_index, uav.arg_index, lb);
+          gBindlessMirror
+            ? get_buffer_in_buffer_table(
+                buffer_table_index, compact_base, lb,
+                air::AddressSpace::device, 2)
+            : read_field(uav.arg_counter_index, uav.arg_index, lb);
       }
+      if (gBindlessMirror)
+        compact_base += descriptor_range_qword_count(uav.range);
     }
   }
 };
@@ -1852,7 +1933,9 @@ AIRCONV_API int SM50Initialize(
 
   if (pRefl) {
     pRefl->ConstanttBufferTableBindIndex =
-      sm50_shader->args_reflection_cbuffer.size() > 0 ? 29 : ~0u;
+      (!gBindlessMirror && sm50_shader->args_reflection_cbuffer.size() > 0)
+        ? 29
+        : ~0u;
     pRefl->ArgumentBufferBindIndex =
       sm50_shader->args_reflection.size() > 0 ? 30 : ~0u;
     pRefl->ConstantBufferSlotMask = binding_cbuffer_mask;
