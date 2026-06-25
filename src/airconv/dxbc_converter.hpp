@@ -488,6 +488,16 @@ constexpr uint32_t kBindlessRootOffsetBindIndex = 28;
 // order (NOT via root_offsets). See BINDLESS-ABI.md §5. Textures + samplers stay in
 // the slot-30 mirror.
 constexpr uint32_t kBindlessBufferTableBindIndex = 27;
+// Metal buffer binding slot of the bindless-mirror SAMPLER mirror. In
+// bindless-mirror mode the legacy cbuffer_table (slot 29) is suppressed (CBVs go to
+// the slot-27 buffer table), freeing slot 29 for the persistent SAMPLER mirror: a
+// single shared flat `constant ulong*` array, stride 3 qw/descriptor
+// ([handle, cube_handle, lod_bias]), indexed by absolute heap slot. The TEXTURE
+// mirror keeps slot 30 (kArgumentBufferBindIndex), likewise a flat array, stride 2
+// ([handle, meta]). Slot 31 is intentionally NOT used (Metal guarantees buffer
+// indices 0..30 only). See BINDLESS-ABI.md / sub-step ②③.
+constexpr uint32_t kBindlessSamplerMirrorBindIndex = 29;
+constexpr uint32_t kBindlessTextureMirrorBindIndex = kArgumentBufferBindIndex; // 30
 
 void setup_binding_table(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
