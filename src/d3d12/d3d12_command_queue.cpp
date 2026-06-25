@@ -10208,9 +10208,25 @@ private:
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
+    } else if (record.type == DescriptorRecordType::UnorderedAccessView) {
+      if (record.has_desc &&
+          record.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        return;
+      if (resource->IsReservedTexture() &&
+          !resource->EnsureTextureAllocation("FillBindlessMirrorSlot"))
+        return;
+      const auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
+                                                         *resource, record);
+      if (!view || !view.texture.ptr())
+        return;
+      auto *allocation = view.texture->current();
+      if (!allocation)
+        return;
+      const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
+      const uint32_t array_length = view.texture->arrayLength(view.view);
+      mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
+      VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
     }
-    // NOTE: UAV texture fill is symmetric (CreateUnorderedAccessTextureView + resolve)
-    // and is added together with the ③ wiring; left out here to keep ② dormant-minimal.
   }
 
   /**
@@ -10241,6 +10257,25 @@ private:
       ERR("DXMT bindless-mirror VERIFY mismatch (texture) slot=", slot,
           " got=[", got[0], ",", got[1], "]",
           " expected=[", expected[0], ",", expected[1], "]");
+    }
+  }
+
+  void MaybeFillBindlessMirrorSlot(ArgumentEncodingContext &enc,
+                                   D3D12_DESCRIPTOR_RANGE_TYPE range_type,
+                                   const DescriptorRecord &record) {
+    if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
+        record.type == DescriptorRecordType::Sampler) {
+      FillBindlessMirrorSlot(enc, record.mirror, record);
+      return;
+    }
+
+    if ((range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+         range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) &&
+        (record.type == DescriptorRecordType::ShaderResourceView ||
+         record.type == DescriptorRecordType::UnorderedAccessView)) {
+      auto *resource = GetResource(record.resource.ptr());
+      if (resource && resource->GetTexture())
+        FillBindlessMirrorSlot(enc, record.mirror, record);
     }
   }
 
@@ -11528,8 +11563,9 @@ private:
       const auto range_type =
           static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
       const auto heap_type = DescriptorHeapTypeForRange(range_type);
+      auto *heap = get_heap(heap_type);
       const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
-          get_heap(heap_type), base, entry.range_offset, entry.descriptor_index,
+          heap, base, entry.range_offset, entry.descriptor_index,
           entry.descriptor_count, heap_type);
       const auto stage = static_cast<PipelineStage>(entry.stage);
       if (!descriptor) {
@@ -11541,6 +11577,7 @@ private:
           DescriptorRangeTypeName(range_type), pipeline, compute, stage,
           entry.root_index, entry.slot, 0, 0,
           DescriptorRecordSizeBytes(*descriptor), 0);
+      MaybeFillBindlessMirrorSlot(enc, range_type, *descriptor);
       BindDescriptor(enc, stage, range_type, entry.slot, *descriptor,
                      &entry.argument);
       bound++;
