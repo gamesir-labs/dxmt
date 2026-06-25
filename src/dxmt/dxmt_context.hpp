@@ -655,6 +655,23 @@ public:
       uint64_t demote_msaa_srv_mask_lo = 0, uint64_t demote_msaa_srv_mask_hi = 0
   );
 
+  // Bindless-mirror (Stage-1 sub-step ③): pack the per-draw slot-27 buf_table. The CBV
+  // half and the SRV/UAV-buffer half are split so each reuses its legacy resolve path
+  // verbatim (encodeConstantBuffers / encodeShaderResources). buf_table/qwords is the
+  // CPU-mapped ring slice; *_compact are the per-index compact qword bases from the
+  // shared ForEachBufferTableField walk (must match airconv). See dxmt_bindless_buffer_table.hpp.
+  template <PipelineStage stage, PipelineKind kind>
+  void packBindlessCBuffers(
+      const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+      uint64_t *buf_table, uint32_t buf_table_qwords, const uint32_t *cb_compact
+  );
+  template <PipelineStage stage, PipelineKind kind>
+  void packBindlessBufferTable(
+      const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments,
+      const std::string &shader_hash, uint64_t *buf_table, uint32_t buf_table_qwords,
+      const uint32_t *res_compact, const ShaderResourceBindingSnapshot *bindings
+  );
+
   void retainAllocation(Allocation* allocation);
 
   template <PipelineStage stage, PipelineKind kind>
