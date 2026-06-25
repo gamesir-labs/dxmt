@@ -6,6 +6,7 @@
 #include "com/com_private_data.hpp"
 #include "config/config.hpp"
 #include "d3d12_command_list.hpp"
+#include "d3d12_descriptor_mirror.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_heap.hpp"
 #include "d3d12_pipeline.hpp"
@@ -10147,6 +10148,99 @@ private:
       enc.bindConstantBuffer<PipelineStage::Vertex>(slot, buffer_offset,
                                                     std::move(buffer));
       break;
+    }
+  }
+
+  /**
+   * Bindless-mirror (sub-step ②/③ seam): resolve a stale descriptor's texture/sampler
+   * payload and write it into the persistent mirror, ON THE ENCODE THREAD. This is the
+   * fill entry the device write path (MarkDescriptorMirrorStaleForWrite) defers to.
+   *
+   * DORMANT in ②: defined but not yet called from any draw/replay path. Sub-step ③ will
+   * invoke it during the descriptor-table walk (once per stale slot per generation,
+   * NOT per draw) before binding the mirror at slot 30.
+   *
+   * Byte-identity: textures resolve gpuResourceID via the same CreateShaderResource
+   * TextureView() the draw path uses, and write through the shared EncodeMirror* writers;
+   * samplers reuse CreateSampler() + the encoder's dummy sampler handle. Only the slot
+   * location differs from the legacy packed encode. Buffers are intentionally NOT handled
+   * (hybrid ABI: they live in a per-draw buffer table owned by ③).
+   */
+  void FillBindlessMirrorSlot(ArgumentEncodingContext &enc, DescriptorHeapMirror *mirror,
+                              const DescriptorRecord &record) {
+    if (!mirror)
+      return;
+    const UINT slot = record.heap_index;
+    // Already up to date for the current content generation: skip (this is what makes
+    // the fill once-per-change rather than per-draw).
+    if (mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot))
+      return;
+
+    if (mirror->isSamplerHeap()) {
+      if (record.type != DescriptorRecordType::Sampler || !record.has_desc) {
+        mirror->FillSamplerSlot(slot, nullptr, enc.dummySamplerHandle());
+        return;
+      }
+      auto sampler = CreateSampler(record.desc.sampler);
+      mirror->FillSamplerSlot(slot, sampler.ptr(), enc.dummySamplerHandle());
+      return;
+    }
+
+    // CBV/SRV/UAV mirror: only texture views are persisted here. Buffer records and
+    // empty/null slots leave the mirror slot as-is (zero); ③'s per-draw buffer table
+    // covers buffers, and the texture index path never reads a buffer slot.
+    Resource *resource = nullptr;
+    if (record.type == DescriptorRecordType::ShaderResourceView ||
+        record.type == DescriptorRecordType::UnorderedAccessView)
+      resource = GetResource(record.resource.ptr());
+    if (!resource || !resource->GetTexture())
+      return;
+
+    if (record.type == DescriptorRecordType::ShaderResourceView) {
+      const auto view = CreateShaderResourceTextureView(device_->GetMTLDevice(),
+                                                        *resource, record);
+      if (!view || !view.texture.ptr())
+        return;
+      auto *allocation = view.texture->current();
+      if (!allocation)
+        return;
+      const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
+      const uint32_t array_length = view.texture->arrayLength(view.view);
+      mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
+      VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
+    }
+    // NOTE: UAV texture fill is symmetric (CreateUnorderedAccessTextureView + resolve)
+    // and is added together with the ③ wiring; left out here to keep ② dormant-minimal.
+  }
+
+  /**
+   * env-gated (DXMT_BINDLESS_MIRROR_VERIFY=1) correctness check for a filled texture
+   * mirror slot: re-resolve the same view via enc.access<>() — the EXACT call
+   * encodeShaderResources uses (dxmt_context.cpp) — and assert the persisted mirror
+   * qwords equal what the legacy packed encode would emit. This is a real check: the
+   * fill path resolves gpuResourceID with a residency-free Texture::view() lookup, and
+   * this verifies it matches the access<>() resolve byte-for-byte. Both sides funnel
+   * through the shared EncodeMirrorTextureSlot writer.
+   */
+  void VerifyBindlessMirrorTextureSlot(ArgumentEncodingContext &enc,
+                                       DescriptorHeapMirror *mirror, UINT slot,
+                                       const Rc<Texture> &texture, TextureViewKey view) {
+    static const bool verify = env::getEnvVar("DXMT_BINDLESS_MIRROR_VERIFY") == "1";
+    if (!verify)
+      return;
+    uint64_t expected[kMirrorTextureQwords] = {};
+    // Same resolve as encodeShaderResources' SRV-texture branch.
+    EncodeMirrorTextureSlot(
+        expected,
+        enc.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Read).gpuResourceID,
+        texture->arrayLength(view));
+    const uint64_t *got = mirror->slotPtr(slot);
+    if (!got)
+      return;
+    if (got[0] != expected[0] || got[1] != expected[1]) {
+      ERR("DXMT bindless-mirror VERIFY mismatch (texture) slot=", slot,
+          " got=[", got[0], ",", got[1], "]",
+          " expected=[", expected[0], ",", expected[1], "]");
     }
   }
 

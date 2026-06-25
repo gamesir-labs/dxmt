@@ -1,10 +1,14 @@
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_descriptor_mirror.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
+
+#include <memory>
 
 namespace dxmt::d3d12 {
 namespace {
@@ -27,6 +31,21 @@ public:
           reinterpret_cast<SIZE_T>(&records_[i]);
       records_[i].heap_index = i;
       records_[i].heap_count = desc.NumDescriptors;
+    }
+    // Eagerly allocate the bindless-mirror for shader-visible CBV/SRV/UAV and SAMPLER
+    // heaps when the feature is enabled, and back-fill the per-record back-pointer.
+    // Gated by the flag, so legacy runs allocate nothing and record.mirror stays null.
+    // Doing this at construction (rather than lazily) avoids any cross-thread
+    // first-touch ordering between the app thread (sampler fill / mark-stale) and the
+    // encode thread (texture fill).
+    const bool sampler_heap = desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    if (IsBindlessMirrorEnabled() &&
+        (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+        (sampler_heap || desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)) {
+      mirror_ = std::make_unique<DescriptorHeapMirror>(
+          device_->GetMTLDevice(), desc.NumDescriptors, sampler_heap);
+      for (UINT i = 0; i < desc.NumDescriptors; i++)
+        records_[i].mirror = mirror_.get();
     }
   }
 
@@ -126,6 +145,8 @@ public:
     return DescriptorRecordFromHandle({static_cast<SIZE_T>(handle.ptr)});
   }
 
+  DescriptorHeapMirror *GetMirror() override { return mirror_.get(); }
+
 private:
   D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandleForHeapStartImpl() const {
     if (records_.empty())
@@ -167,9 +188,15 @@ private:
   D3D12_DESCRIPTOR_HEAP_DESC desc_ = {};
   std::vector<DescriptorRecord> records_;
   std::string name_;
+  std::unique_ptr<DescriptorHeapMirror> mirror_;
 };
 
 } // namespace
+
+bool IsBindlessMirrorEnabled() {
+  static const bool enabled = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
+  return enabled;
+}
 
 void BumpDescriptorContentGeneration() {
   auto value = g_descriptor_content_generation.fetch_add(

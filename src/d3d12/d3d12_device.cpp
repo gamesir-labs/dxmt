@@ -8,6 +8,7 @@
 #include "d3d12_command_list.hpp"
 #include "d3d12_command_queue.hpp"
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_descriptor_mirror.hpp"
 #include "d3d12_agility.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_heap.hpp"
@@ -573,6 +574,7 @@ ResetDescriptorRecord(DescriptorRecord &record) {
   const auto cpu_handle = record.cpu_handle;
   const auto heap_index = record.heap_index;
   const auto heap_count = record.heap_count;
+  auto *const mirror = record.mirror;
   record = {};
   record.magic = magic;
   record.heap_type = heap_type;
@@ -580,6 +582,7 @@ ResetDescriptorRecord(DescriptorRecord &record) {
   record.cpu_handle = cpu_handle;
   record.heap_index = heap_index;
   record.heap_count = heap_count;
+  record.mirror = mirror;
 }
 
 static bool
@@ -908,6 +911,7 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   const auto cpu_handle = dst.cpu_handle;
   const auto heap_index = dst.heap_index;
   const auto heap_count = dst.heap_count;
+  auto *const mirror = dst.mirror;
   dst = src;
   dst.magic = magic;
   dst.heap_type = heap_type;
@@ -915,6 +919,7 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   dst.cpu_handle = cpu_handle;
   dst.heap_index = heap_index;
   dst.heap_count = heap_count;
+  dst.mirror = mirror;
 }
 
 static bool
@@ -928,6 +933,19 @@ static void
 BumpDescriptorContentGenerationForWrite(const DescriptorRecord &record) {
   if (DescriptorWriteAffectsShaderBinding(record))
     BumpDescriptorContentGeneration();
+}
+
+// Bindless-mirror (sub-step ②): mark this descriptor's mirror slot stale at descriptor
+// write time (app thread). This is lightweight generation bookkeeping only — no Metal
+// access and no handle resolution. The actual payload fill happens later:
+//   - texture/sampler slots are resolved + written on the dxmt-encode-thread (the
+//     gpuResourceID / dummy sampler info are only safe there), wired by sub-step ③.
+// record.mirror is null unless DXMT_BINDLESS_MIRROR is on and the heap is a
+// shader-visible CBV/SRV/UAV or SAMPLER heap, so legacy runs do nothing here.
+static void
+MarkDescriptorMirrorStaleForWrite(const DescriptorRecord &record) {
+  if (record.mirror)
+    record.mirror->MarkSlotStale(record.heap_index, GetDescriptorContentGeneration());
 }
 
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
@@ -1908,6 +1926,7 @@ public:
       record->desc.srv = *desc;
       record->has_desc = true;
     }
+    MarkDescriptorMirrorStaleForWrite(*record);
     if (dxmt::apitrace::d3d_enabled()) {
       dxmt::apitrace::record_create_shader_resource_view(
           this, resource, desc, descriptor);
@@ -1934,6 +1953,7 @@ public:
       record->desc.uav = *desc;
       record->has_desc = true;
     }
+    MarkDescriptorMirrorStaleForWrite(*record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_unordered_access_view(
           this, resource, counter_resource, desc, descriptor);
@@ -2002,6 +2022,7 @@ public:
       record->desc.sampler = *desc;
       record->has_desc = true;
     }
+    MarkDescriptorMirrorStaleForWrite(*record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_sampler(this, desc, descriptor);
   }
@@ -2079,6 +2100,11 @@ public:
     }
     if (affects_shader_binding)
       BumpDescriptorContentGeneration();
+    // Bindless-mirror: mark each destination slot stale so the encode thread re-resolves
+    // it from the freshly-copied record. (Done after the generation bump so the stale
+    // marker carries the new generation.)
+    for (size_t i = 0; i < destinations.size(); i++)
+      MarkDescriptorMirrorStaleForWrite(*destinations[i]);
 
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_copy_descriptors(
@@ -2116,6 +2142,9 @@ public:
     }
     if (affects_shader_binding)
       BumpDescriptorContentGeneration();
+    // Bindless-mirror: mark each destination slot stale (see CopyDescriptors).
+    for (UINT i = 0; i < descriptor_count; i++)
+      MarkDescriptorMirrorStaleForWrite(dst[i]);
 
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_copy_descriptors_simple(

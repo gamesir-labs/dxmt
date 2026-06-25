@@ -12,6 +12,14 @@
 namespace dxmt::d3d12 {
 
 class DescriptorHeap;
+class DescriptorHeapMirror;
+
+/**
+ * Whether the bindless-mirror path (Stage-1) is enabled (env DXMT_BINDLESS_MIRROR).
+ * Cached. When false, no mirror buffers are ever allocated and the legacy packed
+ * argument-buffer path is fully intact.
+ */
+bool IsBindlessMirrorEnabled();
 
 enum class DescriptorRecordType {
   Empty,
@@ -33,6 +41,11 @@ struct DescriptorRecord {
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = {};
   UINT heap_index = 0;
   UINT heap_count = 0;
+  // Non-owning back-pointer to the owning heap's bindless-mirror (or nullptr when the
+  // mirror is disabled / heap not shader-visible). The heap owns the mirror and the
+  // records, so this is lifetime-safe. Part of the heap-identity set preserved across
+  // ResetDescriptorRecord / CopyDescriptorRecord (a slot keeps its own heap's mirror).
+  DescriptorHeapMirror *mirror = nullptr;
   Com<ID3D12Resource> resource;
   Com<ID3D12Resource> counter_resource;
   union {
@@ -52,6 +65,13 @@ public:
   virtual DescriptorRecord *GetDescriptorRecord(D3D12_CPU_DESCRIPTOR_HANDLE handle) = 0;
   virtual const DescriptorRecord *GetDescriptorRecord(D3D12_CPU_DESCRIPTOR_HANDLE handle) const = 0;
   virtual const DescriptorRecord *GetDescriptorRecord(D3D12_GPU_DESCRIPTOR_HANDLE handle) const = 0;
+  /**
+   * The persistent bindless-mirror buffer for this heap, or nullptr when bindless-mirror
+   * is disabled or the heap is not shader-visible. Lazily allocated. Sub-step ③ binds
+   * this at Metal slot 30 and fills texture slots on the encode thread; sub-step ② fills
+   * sampler slots synchronously at descriptor-write time.
+   */
+  virtual DescriptorHeapMirror *GetMirror() = 0;
 };
 
 Com<ID3D12DescriptorHeap>

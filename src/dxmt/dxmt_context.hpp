@@ -434,6 +434,13 @@ private:
   template <PipelineStage stage> void track(GenericAccessTracker &tracker, int flags);
 
 public:
+  /**
+   * The dummy sampler's gpu_resource_id used by encodeShaderResources for an unbound
+   * sampler. Exposed so the bindless-mirror fill path (sub-step ②/③, in the d3d12
+   * command queue) can write the byte-identical null-sampler payload.
+   */
+  uint64_t dummySamplerHandle() const { return dummy_sampler_info_.gpu_resource_id; }
+
   template <PipelineStage stage>
   void
   trackBuffer(BufferAllocation *allocation, int flags) {

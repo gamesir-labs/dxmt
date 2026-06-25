@@ -1,6 +1,7 @@
 #include "dxmt_context.hpp"
 #include "Metal.hpp"
 #include "dxmt_apitrace.hpp"
+#include "dxmt_descriptor_mirror.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_deptrack.hpp"
@@ -2075,14 +2076,10 @@ ArgumentEncodingContext::encodeShaderResources(
       auto slot = 16 * unsigned(stage) + arg.SM50BindingSlot;
       auto sampler = bindings ? bindings[i].sampler : sampler_[slot].sampler.ptr();
       if (!sampler) {
-        encoded_buffer[arg.StructurePtrOffset] = dummy_sampler_info_.gpu_resource_id;
-        encoded_buffer[arg.StructurePtrOffset + 1] = dummy_sampler_info_.gpu_resource_id;
-        encoded_buffer[arg.StructurePtrOffset + 2] = (uint64_t)std::bit_cast<uint32_t>(0.0f);
+        EncodeMirrorSamplerSlotNull(&encoded_buffer[arg.StructurePtrOffset], dummy_sampler_info_.gpu_resource_id);
         break;
       }
-      encoded_buffer[arg.StructurePtrOffset] = sampler->sampler_state_handle;
-      encoded_buffer[arg.StructurePtrOffset + 1] = sampler->sampler_state_cube_handle;
-      encoded_buffer[arg.StructurePtrOffset + 2] = (uint64_t)std::bit_cast<uint32_t>(sampler->lod_bias);
+      EncodeMirrorSamplerSlot(&encoded_buffer[arg.StructurePtrOffset], *sampler);
       break;
     }
     case SM50BindingType::SRV: {
@@ -2127,9 +2124,10 @@ ArgumentEncodingContext::encodeShaderResources(
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           DebugLogTextureBindingMismatch<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
           DebugLogShaderTextureBinding<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
-          encoded_buffer[arg.StructurePtrOffset] =
-              access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
-          encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0);
+          EncodeMirrorTextureSlot(
+              &encoded_buffer[arg.StructurePtrOffset],
+              access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID,
+              srv.texture->arrayLength(viewIdChecked));
           makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
         } else {
           auto &dummy_texture = dummySRVTexture(arg);
@@ -2202,8 +2200,10 @@ ArgumentEncodingContext::encodeShaderResources(
         } else if (uav.texture.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = uav.texture->checkViewUseArray(uav.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
-          encoded_buffer[arg.StructurePtrOffset] = access<stage>(uav.texture, viewIdChecked, access_flags).gpuResourceID;
-          encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(uav.texture->arrayLength(viewIdChecked), 0);
+          EncodeMirrorTextureSlot(
+              &encoded_buffer[arg.StructurePtrOffset],
+              access<stage>(uav.texture, viewIdChecked, access_flags).gpuResourceID,
+              uav.texture->arrayLength(viewIdChecked));
           makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read, write);
         } else {
           DebugLogNullShaderBinding<stage, kind>(
