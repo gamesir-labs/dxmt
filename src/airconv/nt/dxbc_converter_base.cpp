@@ -408,7 +408,7 @@ Converter::LoadTexture(const SrcOperandResource &SrcOp) {
   using namespace llvm::air;
 
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.srv_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
+  auto res_handle = res_handle_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (res_handle.takeError())
     return {};
   auto md = md_fn(nullptr).build(ctx);
@@ -437,10 +437,10 @@ Converter::LoadTexture(const SrcOperandUAV &SrcOp) {
   using namespace llvm::air;
 
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.uav_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
+  auto res_handle = res_handle_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (res_handle.takeError())
     return {};
-  auto md = md_fn(nullptr).build(ctx);
+  auto md = md_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (md.takeError())
     return {};
 
@@ -466,10 +466,10 @@ Converter::LoadTexture(const AtomicDstOperandUAV &DstOp) {
   using namespace llvm::air;
 
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.uav_range_map[DstOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
+  auto res_handle = res_handle_fn(LoadOperandIndex(DstOp.index)).build(ctx);
   if (res_handle.takeError())
     return {};
-  auto md = md_fn(nullptr).build(ctx);
+  auto md = md_fn(LoadOperandIndex(DstOp.index)).build(ctx);
   if (md.takeError())
     return {};
 
@@ -498,11 +498,11 @@ Converter::LoadBuffer(const SrcOperandResource &SrcOp) {
     return {};
 
   auto &[stride, res_handle_fn, md_fn, global_coherent] = res.srv_buf_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
+  auto res_handle = res_handle_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (res_handle.takeError())
     return {};
 
-  auto md = md_fn(nullptr).build(ctx);
+  auto md = md_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (md.takeError())
     return {};
 
@@ -519,11 +519,11 @@ Converter::LoadBuffer(const SrcOperandUAV &SrcOp) {
     return {};
 
   auto &[stride, res_handle_fn, md_fn, global_coherent] = res.uav_buf_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
+  auto res_handle = res_handle_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (res_handle.takeError())
     return {};
 
-  auto md = md_fn(nullptr).build(ctx);
+  auto md = md_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (md.takeError())
     return {};
 
@@ -540,11 +540,11 @@ Converter::LoadBuffer(const AtomicDstOperandUAV &DstOp) {
     return {};
 
   auto &[stride, res_handle_fn, md_fn, global_coherent] = res.uav_buf_range_map[DstOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
+  auto res_handle = res_handle_fn(LoadOperandIndex(DstOp.index)).build(ctx);
   if (res_handle.takeError())
     return {};
 
-  auto md = md_fn(nullptr).build(ctx);
+  auto md = md_fn(LoadOperandIndex(DstOp.index)).build(ctx);
   if (md.takeError())
     return {};
 
@@ -587,7 +587,7 @@ Converter::LoadCounter(const AtomicDstOperandUAV &SrcOp) {
   if (!res.uav_counter_range_map.contains(SrcOp.range_id))
     return {};
 
-  auto handle = res.uav_counter_range_map[SrcOp.range_id](nullptr).build(ctx);
+  auto handle = res.uav_counter_range_map[SrcOp.range_id](LoadOperandIndex(SrcOp.index)).build(ctx);
   if (handle.takeError())
     return {};
 
@@ -599,13 +599,13 @@ Converter::LoadSampler(const SrcOperandSampler &SrcOp) {
   using namespace llvm::air;
 
   auto &[sampler_handle_fn, sampler_cube_fn, sampler_metadata] = res.sampler_range_map[SrcOp.range_id];
-  auto smp = sampler_handle_fn(nullptr).build(ctx);
+  auto smp = sampler_handle_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (smp.takeError())
     return {};
-  auto smpcube = sampler_cube_fn(nullptr).build(ctx);
+  auto smpcube = sampler_cube_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (smpcube.takeError())
     return {};
-  auto md = sampler_metadata(nullptr).build(ctx);
+  auto md = sampler_metadata(LoadOperandIndex(SrcOp.index)).build(ctx);
   if (md.takeError())
     return {};
 

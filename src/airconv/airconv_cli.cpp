@@ -77,6 +77,20 @@ static cl::opt<bool> PreserveAssemblyUseListOrder(
   cl::init(false), cl::Hidden
 );
 
+static cl::opt<bool> BindlessMirrorTextureSrvPrototype(
+  "bindless-mirror-texture-srv-prototype",
+  cl::desc("Prototype dynamic-indexed texture SRV loads from an argument-buffer mirror array."),
+  cl::init(false), cl::Hidden
+);
+
+static cl::opt<bool> BindlessMirror(
+  "bindless-mirror",
+  cl::desc("Read ALL descriptor types (SRV/UAV texture+buffer, CBV, sampler) from "
+           "persistent typed argument-buffer mirror arrays indexed by "
+           "root_base + reflected_local_index. See BINDLESS-ABI.md."),
+  cl::init(false), cl::Hidden
+);
+
 cl::list<std::string> f("f", cl::Prefix, cl::Hidden);
 
 namespace {
@@ -204,6 +218,10 @@ int main(int argc, char **argv) {
 
   Module M("default", Context);
   dxmt::initializeModule(M);
+  dxmt::dxbc::set_bindless_mirror_texture_srv_prototype(
+    BindlessMirrorTextureSrvPrototype
+  );
+  dxmt::dxbc::set_bindless_mirror(BindlessMirror);
 
   sm50_shader_t sm50;
   sm50_error_t err;

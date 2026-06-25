@@ -428,7 +428,8 @@ public:
   uint32_t DefineBuffer(
     std::string name, AddressSpace addressp_space, MemoryAccess access,
     MSLRepresentableType type, uint32_t location_index = UINT32_MAX,
-    std::optional<uint32_t> raster_order_group = std::nullopt
+    std::optional<uint32_t> raster_order_group = std::nullopt,
+    uint32_t array_size = 1
   );
   // uint32_t DefineIndirectBuffer(
   //   std::string name, llvm::StructType* struct_type, llvm::Metadata*
@@ -437,12 +438,15 @@ public:
   uint32_t DefineTexture(
     std::string name, TextureKind kind, MemoryAccess access,
     MSLScalerType scaler_type, uint32_t location_index = UINT32_MAX,
-    std::optional<uint32_t> raster_order_group = std::nullopt
+    std::optional<uint32_t> raster_order_group = std::nullopt,
+    uint32_t array_size = 1
   );
   uint32_t
-  DefineSampler(std::string name, uint32_t location_index = UINT32_MAX);
+  DefineSampler(std::string name, uint32_t location_index = UINT32_MAX,
+                uint32_t array_size = 1);
   uint32_t
-  DefineInteger64(std::string name, uint32_t location_index = UINT32_MAX);
+  DefineInteger64(std::string name, uint32_t location_index = UINT32_MAX,
+                  uint32_t array_size = 1);
 
   auto Build(llvm::LLVMContext &context, const llvm::DataLayout &layout) const
     -> std::tuple<llvm::StructType *, llvm::MDNode *>;

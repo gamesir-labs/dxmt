@@ -72,14 +72,14 @@ private:
 uint32_t ArgumentBufferBuilder::DefineBuffer(
   std::string name, AddressSpace addressp_space, MemoryAccess access,
   MSLRepresentableType type, uint32_t location_index,
-  std::optional<uint32_t> raster_order_group
+  std::optional<uint32_t> raster_order_group, uint32_t array_size
 ) {
   auto element_index = fieldsType.size();
   assert(!fields.count(name) && "otherwise duplicated field name");
   fieldsType.push_back(ArgumentBindingBuffer{
     .location_index =
       location_index == UINT32_MAX ? (uint32_t)element_index : location_index,
-    .array_size = 1,
+    .array_size = array_size,
     .memory_access = access,
     .address_space = addressp_space,
     .type = type,
@@ -90,14 +90,14 @@ uint32_t ArgumentBufferBuilder::DefineBuffer(
 };
 
 uint32_t ArgumentBufferBuilder::DefineSampler(
-  std::string name, uint32_t location_index
+  std::string name, uint32_t location_index, uint32_t array_size
 ) {
   auto element_index = fieldsType.size();
   assert(!fields.count(name) && "otherwise duplicated field name");
   fieldsType.push_back(ArgumentBindingSampler{
     .location_index =
       location_index == UINT32_MAX ? (uint32_t)element_index : location_index,
-    .array_size = 1,
+    .array_size = array_size,
     .arg_name = name
   });
   return element_index;
@@ -106,14 +106,15 @@ uint32_t ArgumentBufferBuilder::DefineSampler(
 uint32_t ArgumentBufferBuilder::DefineTexture(
   std::string name, TextureKind kind, MemoryAccess access,
   MSLScalerType scaler_type, uint32_t location_index,
-  std::optional<uint32_t> raster_order_group
+  std::optional<uint32_t> raster_order_group,
+  uint32_t array_size
 ) {
   auto element_index = fieldsType.size();
   assert(!fields.count(name) && "otherwise duplicated field name");
   fieldsType.push_back(ArgumentBindingTexture{
     .location_index =
       location_index == UINT32_MAX ? (uint32_t)element_index : location_index,
-    .array_size = 1,
+    .array_size = array_size,
     .memory_access = access,
     .type =
       MSLTexture{
@@ -129,15 +130,18 @@ uint32_t ArgumentBufferBuilder::DefineTexture(
 };
 
 uint32_t ArgumentBufferBuilder::DefineInteger64(
-  std::string name, uint32_t location_index
+  std::string name, uint32_t location_index, uint32_t array_size
 ) {
   auto element_index = fieldsType.size();
   assert(!fields.count(name) && "otherwise duplicated field name");
   fieldsType.push_back(ArgumentBindingIndirectConstant{
     .location_index =
       location_index == UINT32_MAX ? (uint32_t)element_index : location_index,
-    .array_size = 1,
-    .type = msl_ulong,
+    .array_size = array_size,
+    .type = array_size > 1
+              ? MSLRepresentableTypeWithArray(MSLStaticArray{
+                  .array_size = array_size, .element_type = msl_ulong})
+              : MSLRepresentableTypeWithArray(msl_ulong),
     .arg_name = name
   });
   return element_index;
@@ -195,7 +199,10 @@ auto build_argument_binding_buffer(
   md.string("air.arg_name");
   md.string(buffer.arg_name);
 
-  return type->getPointerTo((uint32_t)buffer.address_space);
+  auto ptr_type = type->getPointerTo((uint32_t)buffer.address_space);
+  if (buffer.array_size > 1)
+    return llvm::ArrayType::get(ptr_type, buffer.array_size);
+  return ptr_type;
 };
 auto build_argument_binding_indirect_buffer(
   StreamMDHelper &md, const ArgumentBindingIndirectBuffer &indirect_buffer,
@@ -280,7 +287,10 @@ auto build_argument_binding_texture(
     ->string("air.arg_name")
     ->string(texture.arg_name);
 
-  return texture.type.get_llvm_type(context);
+  auto type = texture.type.get_llvm_type(context);
+  if (texture.array_size > 1)
+    return llvm::ArrayType::get(type, texture.array_size);
+  return type;
 };
 auto build_argument_binding_sampler(
   StreamMDHelper &md, const ArgumentBindingSampler &sampler,
@@ -294,7 +304,10 @@ auto build_argument_binding_sampler(
     ->string("sampler")
     ->string("air.arg_name")
     ->string(sampler.arg_name);
-  return (MSLSampler{}).get_llvm_type(context);
+  auto type = (MSLSampler{}).get_llvm_type(context);
+  if (sampler.array_size > 1)
+    return llvm::ArrayType::get(type, sampler.array_size);
+  return type;
 };
 auto insert_inteterpolation(StreamMDHelper &md, Interpolation interpolation, bool pull_mode) {
   if (pull_mode) {

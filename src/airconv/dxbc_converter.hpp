@@ -20,6 +20,9 @@
 
 namespace dxmt::dxbc {
 
+void set_bindless_mirror_texture_srv_prototype(bool enabled);
+void set_bindless_mirror(bool enabled);
+
 struct ResourceRange {
   uint32_t range_id;
   uint32_t binding_slot;
@@ -466,6 +469,17 @@ size_t estimate_mesh_size(SM50ShaderInternal *pDomainStage, uint32_t max_potenti
 
 constexpr uint32_t kConstantBufferBindIndex = 29;
 constexpr uint32_t kArgumentBufferBindIndex = 30;
+
+// --- bindless-mirror ABI (see fh4-debug/BINDLESS-ABI.md) ---
+// Capacity declared for each per-resource typed mirror array in AIR. This is the
+// LLVM ArrayType bound used for in-bounds GEP typing only; the runtime binds the
+// real (larger) persistent heap-mirror buffer, and guarantees that
+// root_base + reflected_local_index stays within the bound region for any draw.
+constexpr uint32_t kBindlessMirrorCapacity = 1u << 20; // 1,048,576 descriptors
+// Metal buffer binding slot of the per-draw root-offset buffer. Element [arg_index]
+// (== MTL_SM50_SHADER_ARGUMENT::StructurePtrOffset) holds the absolute base slot
+// (uint32) of that resource's descriptor-table range inside its typed mirror.
+constexpr uint32_t kBindlessRootOffsetBindIndex = 28;
 
 void setup_binding_table(
   const ShaderInfo *shader_info, io_binding_map &resource_map,

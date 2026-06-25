@@ -31,6 +31,11 @@
 
 namespace dxmt::dxbc {
 
+// bindless-mirror toggles (defined here so both the parse-time and rebuild-time
+// argument-buffer builders can see them). Setters are exported below.
+static bool gBindlessMirrorTextureSrvPrototype = false;
+static bool gBindlessMirror = false;
+
 constexpr uint32_t kCBufferBindingSlotCapacity = 14;
 
 uint32_t cbuffer_binding_range_size(const ResourceRange &range) {
@@ -91,8 +96,23 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
   auto &binding_table = shader_info.binding_table;
   auto &binding_table_cbuffer = shader_info.binding_table_cbuffer;
 
+  // In bindless-mirror mode each per-resource argument-buffer field becomes a
+  // typed array sized to the heap-mirror capacity; the shader indexes it by
+  // root_base + reflected_local_index. See BINDLESS-ABI.md.
+  const uint32_t mirror_n = gBindlessMirror ? kBindlessMirrorCapacity : 1;
+
   for (auto &[range_id, cbv] : shader_info.cbufferMap) {
     auto binding_slot = cbv.range.binding_slot;
+    if (gBindlessMirror) {
+      // One uint4* mirror array per CBV range; indexed by root_base + descriptor.
+      cbv.arg_index = binding_table_cbuffer.DefineBuffer(
+        "cb" + std::to_string(range_id), AddressSpace::constant,
+        MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot),
+        std::nullopt, mirror_n
+      );
+      continue;
+    }
     const uint32_t range_size = cbuffer_binding_range_size(cbv.range);
     cbv.arg_index = binding_table_cbuffer.Size();
     for (uint32_t i = 0; i < range_size; i++) {
@@ -109,12 +129,12 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
   for (auto &[range_id, sampler] : shader_info.samplerMap) {
     auto binding_slot = sampler.range.binding_slot;
     auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
-    sampler.arg_index =
-      binding_table.DefineSampler("s" + std::to_string(range_id), attr_index);
-    sampler.arg_cube_index =
-      binding_table.DefineSampler("cube_s" + std::to_string(range_id), attr_index + 1);
+    sampler.arg_index = binding_table.DefineSampler(
+      "s" + std::to_string(range_id), attr_index, mirror_n);
+    sampler.arg_cube_index = binding_table.DefineSampler(
+      "cube_s" + std::to_string(range_id), attr_index + 1, mirror_n);
     sampler.arg_metadata_index = binding_table.DefineInteger64(
-      "meta_s" + std::to_string(range_id), attr_index + 2
+      "meta_s" + std::to_string(range_id), attr_index + 2, mirror_n
     );
   }
 
@@ -127,16 +147,16 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
       auto scaler_type = to_air_scaler_type(srv.scaler_type);
       srv.arg_index = binding_table.DefineTexture(
         "t" + std::to_string(range_id), texture_kind, access, scaler_type,
-        attr_index
+        attr_index, std::nullopt, mirror_n
       );
     } else {
       srv.arg_index = binding_table.DefineBuffer(
         "t" + std::to_string(range_id), AddressSpace::device,
-        MemoryAccess::read, msl_uint, attr_index
+        MemoryAccess::read, msl_uint, attr_index, std::nullopt, mirror_n
       );
     }
     srv.arg_metadata_index = binding_table.DefineInteger64(
-      "meta_t" + std::to_string(range_id), attr_index + 1
+      "meta_t" + std::to_string(range_id), attr_index + 1, mirror_n
     );
   }
 
@@ -151,22 +171,24 @@ RebuildArgumentBindingTables(ShaderInfo &shader_info) {
       auto scaler_type = to_air_scaler_type(uav.scaler_type);
       uav.arg_index = binding_table.DefineTexture(
         "u" + std::to_string(range_id), texture_kind, access, scaler_type,
-        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
       );
     } else {
       uav.arg_index = binding_table.DefineBuffer(
         "u" + std::to_string(range_id), AddressSpace::device, access, msl_uint,
-        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
       );
     }
     uav.arg_metadata_index = binding_table.DefineInteger64(
-      "meta_u" + std::to_string(range_id), attr_index + 1
+      "meta_u" + std::to_string(range_id), attr_index + 1, mirror_n
     );
     if (uav.with_counter) {
       uav.arg_counter_index = binding_table.DefineBuffer(
         "counter" + std::to_string(range_id), AddressSpace::device,
         MemoryAccess::read_write, msl_uint, attr_index + 2,
-        uav.rasterizer_order ? std::optional(1) : std::nullopt
+        uav.rasterizer_order ? std::optional(1) : std::nullopt, mirror_n
       );
     }
   }
@@ -228,6 +250,12 @@ uint32_t next_pow2(uint32_t x) {
   return x == 1 ? 1 : 1 << (32 - __builtin_clz(x - 1));
 }
 
+void set_bindless_mirror_texture_srv_prototype(bool enabled) {
+  gBindlessMirrorTextureSrvPrototype = enabled;
+}
+
+void set_bindless_mirror(bool enabled) { gBindlessMirror = enabled; }
+
 auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
   return make_irvalue([=](context ctx) {
     auto argbuf = ctx.function->getArg(argbuf_index);
@@ -244,6 +272,98 @@ auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
       )
     );
   });
+};
+
+auto get_texture_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType()
+      );
+      auto array_ptr = ctx.builder.CreateStructGEP(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType(),
+        argbuf, index
+      );
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+        argbuf_struct_type->getElementType(index)
+      );
+      auto element_index = dyn_index ? dyn_index : ctx.builder.getInt32(0);
+      auto element_ptr = ctx.builder.CreateGEP(
+        array_ty, array_ptr, {ctx.builder.getInt32(0), element_index}
+      );
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
+    });
+  };
+};
+
+// --- bindless-mirror read helpers (see BINDLESS-ABI.md) ---
+// Load the absolute base slot (uint32) for a resource from the per-draw
+// root-offset buffer. element == arg_index == StructurePtrOffset.
+static auto get_root_base(uint32_t root_offset_arg_index, uint32_t arg_index) {
+  return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+    auto root_buf = ctx.function->getArg(root_offset_arg_index);
+    auto i32 = ctx.builder.getInt32Ty();
+    auto elem_ptr = ctx.builder.CreateGEP(
+      i32, root_buf, ctx.builder.getInt32(arg_index)
+    );
+    return ctx.builder.CreateLoad(i32, elem_ptr);
+  });
+}
+
+// Compute reflected_local_index = operand_index - range_lower_bound. The DXBC
+// resource operand index is the ABSOLUTE shader register (BaseRegister for SM5.0
+// single resources, BaseRegister + array element for SM5.1 bindless arrays);
+// subtracting the range lower bound yields the 0-based offset into the range,
+// which is the local index added to the mirror base. See BINDLESS-ABI.md.
+static llvm::Value *
+mirror_local_index(context &ctx, pvalue dyn_index, uint32_t range_lower_bound) {
+  llvm::Value *operand = dyn_index ? dyn_index : ctx.builder.getInt32(0);
+  if (range_lower_bound == 0)
+    return operand;
+  return ctx.builder.CreateSub(
+    operand, ctx.builder.getInt32(range_lower_bound)
+  );
+}
+
+// Read element `mirror.field[field_index][ root_base[arg_index] + local ]` from a
+// typed mirror argument-buffer array, where local = operand_index - lower_bound.
+// `field_index` selects the typed array field; element type is whatever the
+// Load* path consumes (texture handle ptr, buffer ptr, sampler, or i64 metadata).
+// When `root_offset_arg_index` is UINT32_MAX root_base is 0 (direct binding).
+static auto get_mirror_item_in_argbuf_binding_table(
+  uint32_t argbuf_index, uint32_t field_index,
+  uint32_t root_offset_arg_index, uint32_t arg_index, uint32_t range_lower_bound
+) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType()
+      );
+      auto array_ptr = ctx.builder.CreateStructGEP(
+        argbuf_struct_type, argbuf, field_index
+      );
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+        argbuf_struct_type->getElementType(field_index)
+      );
+      llvm::Value *element_index =
+        mirror_local_index(ctx, dyn_index, range_lower_bound);
+      if (root_offset_arg_index != UINT32_MAX) {
+        auto base = get_root_base(root_offset_arg_index, arg_index).build(ctx);
+        if (auto err = base.takeError())
+          return std::move(err);
+        element_index = ctx.builder.CreateAdd(base.get(), element_index);
+      }
+      auto element_ptr = ctx.builder.CreateGEP(
+        array_ty, array_ptr, {ctx.builder.getInt32(0), element_index}
+      );
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
+    });
+  };
 };
 
 auto get_cbuffer_in_argbuf_binding_table(
@@ -295,6 +415,43 @@ auto get_cbuffer_in_argbuf_binding_table(
       }
 
       return load_field(base_index);
+    });
+  };
+};
+
+// Bindless-mirror CBV reader: the cbuffer mirror has a single typed array field
+// of `constant uint4*` pointers indexed by root_base[arg_index] + dyn_index. The
+// dyn_index is the ConstantBuffer<>[] descriptor index. Returns the uint4* the
+// SrcOperandConstantBuffer Load path consumes (it then GEPs by regindex).
+static auto get_cbuffer_in_mirror_binding_table(
+  uint32_t argbuf_index, uint32_t field_index,
+  uint32_t root_offset_arg_index, uint32_t arg_index, uint32_t range_lower_bound
+) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType()
+      );
+      auto array_ptr = ctx.builder.CreateStructGEP(
+        argbuf_struct_type, argbuf, field_index
+      );
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+        argbuf_struct_type->getElementType(field_index)
+      );
+      llvm::Value *element_index =
+        mirror_local_index(ctx, dyn_index, range_lower_bound);
+      if (root_offset_arg_index != UINT32_MAX) {
+        auto base = get_root_base(root_offset_arg_index, arg_index).build(ctx);
+        if (auto err = base.takeError())
+          return std::move(err);
+        element_index = ctx.builder.CreateAdd(base.get(), element_index);
+      }
+      auto element_ptr = ctx.builder.CreateGEP(
+        array_ty, array_ptr, {ctx.builder.getInt32(0), element_index}
+      );
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
     });
   };
 };
@@ -380,30 +537,73 @@ void setup_binding_table(
       });
   }
 
+  // Per-draw root-offset buffer: element[arg_index] (== StructurePtrOffset) is
+  // the absolute base slot of that resource's descriptor-table range inside its
+  // typed mirror array. Only present in bindless-mirror mode; see BINDLESS-ABI.md.
+  uint32_t root_offset_index = ~0u;
+  if (gBindlessMirror) {
+    root_offset_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = std::nullopt,
+      .location_index = kBindlessRootOffsetBindIndex,
+      .array_size = 1,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_uint,
+      .arg_name = "root_offsets",
+      .raster_order_group = std::nullopt,
+    });
+  }
+
+  // Pick the reader for an argument-buffer field: legacy reads a single struct
+  // field (dynamic index ignored, SM5.0); bindless-mirror reads the typed array
+  // field at root_base[arg_index] + dyn_index. `field_index` == `arg_index` here
+  // because each resource owns exactly one binding-table field.
+  // Read a binding-table field. `field_index` selects the typed mirror array;
+  // `root_key` selects the root_offsets entry that holds the resource's absolute
+  // base slot. A resource's handle and its parallel metadata array share the same
+  // root_key (== the handle's arg_index) so both index the same descriptor slot.
+  auto read_field = [=](uint32_t field_index, uint32_t root_key,
+                        uint32_t lower_bound) -> IndexedIRValue {
+    if (gBindlessMirror)
+      return get_mirror_item_in_argbuf_binding_table(
+        binding_table_index, field_index, root_offset_index, root_key,
+        lower_bound);
+    return [=](pvalue) {
+      return get_item_in_argbuf_binding_table(binding_table_index, field_index);
+    };
+  };
+
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     auto index = cbv.arg_index;
-    resource_map.cb_range_map[range_id] = get_cbuffer_in_argbuf_binding_table(
-        cbuf_table_index, index, cbv.range.lower_bound,
-        cbuffer_binding_range_size(cbv.range));
+    if (gBindlessMirror) {
+      // binding_table and cbuffer_table have independent arg_index spaces (both
+      // start at 0). root_offsets is shared, so the CBV's root_offsets entry is
+      // offset by the binding_table field count to avoid colliding with the
+      // SRV/UAV/sampler entries. See BINDLESS-ABI.md §4.
+      const uint32_t cbv_root_key =
+        shader_info->binding_table.Size() + index;
+      resource_map.cb_range_map[range_id] = get_cbuffer_in_mirror_binding_table(
+        cbuf_table_index, index, root_offset_index, cbv_root_key,
+        cbv.range.lower_bound);
+    } else {
+      resource_map.cb_range_map[range_id] = get_cbuffer_in_argbuf_binding_table(
+          cbuf_table_index, index, cbv.range.lower_bound,
+          cbuffer_binding_range_size(cbv.range));
+    }
   }
   for (auto &[range_id, sampler] : shader_info->samplerMap) {
-    // TODO: abstract SM 5.0 binding
+    // SM5.0 ignores the dynamic index; bindless-mirror uses it via read_field.
+    // All three sampler fields share the sampler's root_key (its arg_index).
+    auto lb = sampler.range.lower_bound;
+    auto key = sampler.arg_index;
     resource_map.sampler_range_map[range_id] = {
-      [=, index = sampler.arg_index](pvalue) {
-        // ignore index in SM 5.0
-        return get_item_in_argbuf_binding_table(binding_table_index, index);
-      },
-      [=, index = sampler.arg_cube_index](pvalue) {
-        // ignore index in SM 5.0
-        return get_item_in_argbuf_binding_table(binding_table_index, index);
-      },
-      [=, index = sampler.arg_metadata_index](pvalue) {
-        // ignore index in SM 5.0
-        return get_item_in_argbuf_binding_table(binding_table_index, index);
-      }
+      read_field(sampler.arg_index, key, lb),
+      read_field(sampler.arg_cube_index, key, lb),
+      read_field(sampler.arg_metadata_index, key, lb)
     };
   }
   for (auto &[range_id, srv] : shader_info->srvMap) {
+    auto lb = srv.range.lower_bound;
     if (srv.resource_type != shader::common::ResourceType::NonApplicable) {
       // TODO: abstract SM 5.0 binding
       auto access =
@@ -417,42 +617,32 @@ void setup_binding_table(
           .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
           .resource_kind_logical = texture_kind_logical,
         },
-        [=, index = srv.arg_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = srv.arg_metadata_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
+        (gBindlessMirrorTextureSrvPrototype && !gBindlessMirror &&
+         srv.resource_type == shader::common::ResourceType::Texture2D)
+          ? get_texture_item_in_argbuf_binding_table(binding_table_index, srv.arg_index)
+          : read_field(srv.arg_index, srv.arg_index, lb),
+        read_field(srv.arg_metadata_index, srv.arg_index, lb),
         false
       };
       if (srv.resource_type == shader::common::ResourceType::TextureBuffer) {
         resource_map.srv_buf_range_map[range_id] = {
           srv.structure_stride,
-          [=, index = srv.arg_index](pvalue) {
-            return get_item_in_argbuf_binding_table(binding_table_index, index);
-          },
-          [=, index = srv.arg_metadata_index](pvalue) {
-            return get_item_in_argbuf_binding_table(binding_table_index, index);
-          },
+          read_field(srv.arg_index, srv.arg_index, lb),
+          read_field(srv.arg_metadata_index, srv.arg_index, lb),
           false
         };
       }
     } else {
       resource_map.srv_buf_range_map[range_id] = {
         srv.structure_stride,
-        [=, index = srv.arg_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = srv.arg_metadata_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
+        read_field(srv.arg_index, srv.arg_index, lb),
+        read_field(srv.arg_metadata_index, srv.arg_index, lb),
         false
       };
     }
   }
   for (auto &[range_id, uav] : shader_info->uavMap) {
+    auto lb = uav.range.lower_bound;
     auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
                                           : air::MemoryAccess::write)
                               : air::MemoryAccess::read;
@@ -466,54 +656,32 @@ void setup_binding_table(
           .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
           .resource_kind_logical = texture_kind_logical,
         },
-        [=, index = uav.arg_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = uav.arg_metadata_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
+        read_field(uav.arg_index, uav.arg_index, lb),
+        read_field(uav.arg_metadata_index, uav.arg_index, lb),
         uav.global_coherent
       };
       if (uav.resource_type == shader::common::ResourceType::TextureBuffer) {
         resource_map.uav_buf_range_map[range_id] = {
           uav.structure_stride,
-          [=, index = uav.arg_index](pvalue) {
-            return get_item_in_argbuf_binding_table(binding_table_index, index);
-          },
-          [=, index = uav.arg_metadata_index](pvalue) {
-            return get_item_in_argbuf_binding_table(binding_table_index, index);
-          },
+          read_field(uav.arg_index, uav.arg_index, lb),
+          read_field(uav.arg_metadata_index, uav.arg_index, lb),
           uav.global_coherent
         };
         if (uav.with_counter) {
-          auto argbuf_index_counterptr = uav.arg_counter_index;
-          resource_map.uav_counter_range_map[range_id] = [=](pvalue) {
-            return get_item_in_argbuf_binding_table(
-              binding_table_index, argbuf_index_counterptr
-            );
-          };
+          resource_map.uav_counter_range_map[range_id] =
+            read_field(uav.arg_counter_index, uav.arg_index, lb);
         }
       }
     } else {
       resource_map.uav_buf_range_map[range_id] = {
         uav.structure_stride,
-        [=, index = uav.arg_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = uav.arg_metadata_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
+        read_field(uav.arg_index, uav.arg_index, lb),
+        read_field(uav.arg_metadata_index, uav.arg_index, lb),
         uav.global_coherent
       };
       if (uav.with_counter) {
-        auto argbuf_index_counterptr = uav.arg_counter_index;
-        resource_map.uav_counter_range_map[range_id] = [=](pvalue) {
-          return get_item_in_argbuf_binding_table(
-            binding_table_index, argbuf_index_counterptr
-          );
-        };
+        resource_map.uav_counter_range_map[range_id] =
+          read_field(uav.arg_counter_index, uav.arg_index, lb);
       }
     }
   }
@@ -1443,9 +1611,36 @@ AIRCONV_API int SM50Initialize(
   uint64_t binding_srv_hi_mask = 0;
   uint64_t binding_srv_lo_mask = 0;
 
+  // In bindless-mirror mode each per-resource argument-buffer field is a typed
+  // array sized to the heap-mirror capacity (see BINDLESS-ABI.md). Must match
+  // RebuildArgumentBindingTables exactly so StructurePtrOffset == arg_index.
+  const uint32_t mirror_n = gBindlessMirror ? kBindlessMirrorCapacity : 1;
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     // TODO: abstract SM 5.0 binding
     auto binding_slot = cbv.range.binding_slot;
+    if (gBindlessMirror) {
+      const auto arg_index = binding_table_cbuffer.DefineBuffer(
+        "cb" + std::to_string(range_id), AddressSpace::constant,
+        MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot),
+        std::nullopt, mirror_n
+      );
+      cbv.arg_index = arg_index;
+      sm50_shader->args_reflection_cbuffer.push_back({
+        .Type = SM50BindingType::ConstantBuffer,
+        .SM50BindingSlot = binding_slot,
+        .Flags =
+          MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
+        .StructurePtrOffset = arg_index,
+        .RegisterSpace = cbv.range.space,
+        .RegisterLowerBound = cbv.range.lower_bound,
+        .RegisterCount = cbv.range.size ? cbv.range.size : 1,
+        .CBufferSizeInVec4 = cbv.size_in_vec4,
+      });
+      if (binding_slot < 16)
+        binding_cbuffer_mask |= (1 << binding_slot);
+      continue;
+    }
     const uint32_t range_size = cbuffer_binding_range_size(cbv.range);
     cbv.arg_index = binding_table_cbuffer.Size();
     for (uint32_t i = 0; i < range_size; i++) {
@@ -1477,12 +1672,12 @@ AIRCONV_API int SM50Initialize(
     // TODO: abstract SM 5.0 binding
     auto binding_slot = sampler.range.binding_slot;
     auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
-    sampler.arg_index =
-      binding_table.DefineSampler("s" + std::to_string(range_id), attr_index);
-    sampler.arg_cube_index =
-      binding_table.DefineSampler("cube_s" + std::to_string(range_id), attr_index + 1);
+    sampler.arg_index = binding_table.DefineSampler(
+      "s" + std::to_string(range_id), attr_index, mirror_n);
+    sampler.arg_cube_index = binding_table.DefineSampler(
+      "cube_s" + std::to_string(range_id), attr_index + 1, mirror_n);
     sampler.arg_metadata_index = binding_table.DefineInteger64(
-      "meta_s" + std::to_string(range_id), attr_index + 2
+      "meta_s" + std::to_string(range_id), attr_index + 2, mirror_n
     );
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::Sampler,
@@ -1504,20 +1699,27 @@ AIRCONV_API int SM50Initialize(
       auto access = srv.sampled ? MemoryAccess::sample : MemoryAccess::read;
       auto texture_kind = to_air_resource_type(srv.resource_type, srv.compared);
       auto scaler_type = to_air_scaler_type(srv.scaler_type);
+      const uint32_t tex_array =
+        gBindlessMirror
+          ? mirror_n
+          : ((gBindlessMirrorTextureSrvPrototype &&
+              srv.resource_type == ResourceType::Texture2D)
+               ? 16
+               : 1);
       srv.arg_index = binding_table.DefineTexture(
         "t" + std::to_string(range_id), texture_kind, access, scaler_type,
-        attr_index
+        attr_index, std::nullopt, tex_array
       );
     } else {
       srv.arg_index = binding_table.DefineBuffer(
         "t" + std::to_string(range_id),
         AddressSpace::device, // it needs to be `device` since `constant` has
                               // size and alignment restriction
-        MemoryAccess::read, msl_uint, attr_index
+        MemoryAccess::read, msl_uint, attr_index, std::nullopt, mirror_n
       );
     }
     srv.arg_metadata_index = binding_table.DefineInteger64(
-      "meta_t" + std::to_string(range_id), attr_index + 1
+      "meta_t" + std::to_string(range_id), attr_index + 1, mirror_n
     );
     MTL_SM50_SHADER_ARGUMENT_FLAG flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0;
     if (srv.resource_type == ResourceType::NonApplicable) {
@@ -1570,22 +1772,24 @@ AIRCONV_API int SM50Initialize(
       auto scaler_type = to_air_scaler_type(uav.scaler_type);
       uav.arg_index = binding_table.DefineTexture(
         "u" + std::to_string(range_id), texture_kind, access, scaler_type,
-        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
       );
     } else {
       uav.arg_index = binding_table.DefineBuffer(
         "u" + std::to_string(range_id), AddressSpace::device, access, msl_uint,
-        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
       );
     }
     uav.arg_metadata_index = binding_table.DefineInteger64(
-      "meta_u" + std::to_string(range_id), attr_index + 1
+      "meta_u" + std::to_string(range_id), attr_index + 1, mirror_n
     );
     if (uav.with_counter) {
       uav.arg_counter_index = binding_table.DefineBuffer(
         "counter" + std::to_string(range_id), AddressSpace::device,
         MemoryAccess::read_write, msl_uint, attr_index + 2,
-        uav.rasterizer_order ? std::optional(1) : std::nullopt
+        uav.rasterizer_order ? std::optional(1) : std::nullopt, mirror_n
       );
     }
     MTL_SM50_SHADER_ARGUMENT_FLAG flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0;
