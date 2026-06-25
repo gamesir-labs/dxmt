@@ -2253,6 +2253,17 @@ AIRCONV_API int SM50Compile(
   using namespace llvm;
   using namespace dxmt;
 
+  bool bindless_requested = false;
+  {
+    SM50_SHADER_BINDLESS_MIRROR_DATA *bm = nullptr;
+    if (dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR, SM50_SHADER_BINDLESS_MIRROR_DATA>(pArgs, &bm) && bm)
+      bindless_requested = bm->enabled;
+  }
+  struct BindlessMirrorScope {
+    BindlessMirrorScope(bool on) { dxmt::dxbc::set_bindless_mirror(on); }
+    ~BindlessMirrorScope() { dxmt::dxbc::set_bindless_mirror(false); }
+  } bindless_scope(bindless_requested);
+
   if (ppError) {
     *ppError = nullptr;
   }

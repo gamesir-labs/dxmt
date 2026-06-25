@@ -194,6 +194,9 @@ public:
   virtual const std::string &GetShaderCacheKey() const = 0;
   virtual const PipelineMetalGraphicsState *GetMetalGraphicsState() = 0;
   virtual const PipelineMetalComputeState *GetMetalComputeState() = 0;
+  // Runtime draw-path gate for the Stage-1 bindless descriptor-mirror path.
+  // Mirrors PsoBindlessEligible(shaders) computed at PSO-create time.
+  virtual bool UsesBindlessMirror() const { return false; }
 };
 
 // Private IID for a non-RTTI downcast ID3D12PipelineState* -> dxmt PipelineState*.
