@@ -11408,6 +11408,125 @@ private:
     return recipe;
   }
 
+  // Bindless-mirror (Stage-1 sub-step ③.2): build the per-draw slot-28 root_offsets for
+  // ONE shader stage. root_offsets[arg.StructurePtrOffset] = the ABSOLUTE heap slot of
+  // the FIRST descriptor of that texture/sampler arg's descriptor-table range, so the
+  // shader computes mirror[ root_offsets[arg] + (reg - range.LowerBound) ] == the slot
+  // FillBindlessMirrorSlot wrote (mirror[descriptor->heap_index]). Per the hybrid ABI
+  // (BINDLESS-ABI.md §4), only TEXTURE/SAMPLER args get a root_offsets entry; BUFFER args
+  // (CBV/SRV-buffer/UAV-buffer) are addressed by the compile-time buf_table compact_base
+  // (slot 27) and are NOT written here.
+  //
+  // DORMANT in ③.2: defined but not yet called. ALSO gated on the slot-30 mirror layout
+  // matching airconv (see [[bindless-slot30-layout-mismatch]]); root_offsets values here
+  // (absolute heap base slot, keyed by StructurePtrOffset) are correct under the intended
+  // single-shared-array slot-30 layout that the airconv fix must land.
+  //
+  // Returns the ring slice (slot-28 buffer) holding uint32 root_offsets[N], or an empty
+  // slice if the stage has no texture/sampler args. The compute/graphics distinction is
+  // carried by `compute` (selects state.compute_tables vs graphics_tables / heap).
+  AllocatedArgumentBufferSlice
+  BuildBindlessRootOffsets(ArgumentEncodingContext &enc, const ReplayState &state,
+                           const PipelineState &pipeline, const RootSignature &root,
+                           PipelineStage want_stage, bool compute) {
+    const auto *shader = FindShaderForStage(pipeline, want_stage);
+    if (!shader)
+      return {};
+    const auto *arguments = shader->resourceArgumentInfo();
+    const auto argument_count = shader->reflection().NumArguments;
+    if (!arguments || !argument_count)
+      return {};
+
+    // Size root_offsets to cover the largest texture/sampler StructurePtrOffset (+1).
+    // (Buffer args also have StructurePtrOffsets but are not indexed via root_offsets;
+    // sizing by the max over tex/sampler args keeps the buffer tight while in-range.)
+    uint32_t max_key_plus_one = 0;
+    for (UINT i = 0; i < argument_count; i++) {
+      const auto &arg = arguments[i];
+      const bool is_tex_or_sampler =
+          arg.Type == SM50BindingType::Sampler ||
+          ((arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
+           (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE));
+      if (is_tex_or_sampler)
+        max_key_plus_one = std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
+    }
+    if (!max_key_plus_one)
+      return {};
+
+    auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), uint64_t(max_key_plus_one) * sizeof(uint32_t));
+    if (!slice.mapped || !slice.gpu_buffer)
+      return {};
+    auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
+    std::memset(root_offsets, 0, slice.length);
+
+    const auto parameters = root.GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        continue;
+      // Only this stage's tables matter for this stage's root_offsets.
+      bool visible = false;
+      ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
+        if (s == want_stage)
+          visible = true;
+      });
+      if (!visible)
+        continue;
+
+      const auto base_handle = GetTableHandle(state, compute, root_index);
+      if (!base_handle.ptr)
+        continue;
+
+      UINT running_offset = 0;
+      for (const auto &range : parameter.ranges) {
+        const auto range_offset = DescriptorRangeOffset(range, running_offset);
+        const auto count =
+            range.descriptor_count == UINT_MAX
+                ? ReflectedDescriptorRangeCount(pipeline, range, parameter.visibility, compute)
+                : range.descriptor_count;
+        const auto binding_type = BindingTypeForRange(range.range_type);
+        const auto heap_type = DescriptorHeapTypeForRange(range.range_type);
+        auto *heap = GetBoundDescriptorHeap(state, heap_type);
+
+        for (UINT i = 0; i < argument_count; i++) {
+          const auto &argument = arguments[i];
+          if (argument.Type != binding_type)
+            continue;
+          // Only texture/sampler args go in root_offsets; buffers use buf_table.
+          const bool is_tex_or_sampler =
+              argument.Type == SM50BindingType::Sampler ||
+              (argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+          if (!is_tex_or_sampler)
+            continue;
+          const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+          const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
+                                                    : argument.SM50BindingSlot;
+          if (space != range.register_space)
+            continue;
+          if (lower < range.base_shader_register)
+            continue;
+          const auto descriptor_index = lower - range.base_shader_register;
+          if (descriptor_index >= count)
+            continue;
+          // Resolve the range-base descriptor (reg == LowerBound) and read its absolute
+          // heap slot; that is root_offsets[arg]. The shader adds (reg - LowerBound).
+          const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+              heap, base_handle, range_offset, descriptor_index, count, heap_type);
+          if (!descriptor)
+            continue;
+          if (argument.StructurePtrOffset < max_key_plus_one)
+            root_offsets[argument.StructurePtrOffset] = descriptor->heap_index;
+        }
+        if (range.descriptor_count != UINT_MAX)
+          running_offset = range_offset + range.descriptor_count;
+      }
+    }
+    if (slice.needs_flush)
+      slice.gpu_buffer.updateContents(slice.offset, slice.mapped, slice.length);
+    return slice;
+  }
+
   const DescriptorTableBindingRecipe &
   GetDescriptorTableBindingRecipe(const PipelineState &pipeline,
                                   const RootSignature &root, bool compute) {
