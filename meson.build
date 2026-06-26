@@ -200,6 +200,7 @@ if dxmt_apitrace_metal_enabled
           apitrace_pe_core_archive,
           apitrace_pe_d3d12_archive,
           apitrace_pe_d3d11_archive,
+          '-lwinpthread',
         ],
         sources : [apitrace_pe_build_stamp],
       ),

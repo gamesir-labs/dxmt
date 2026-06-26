@@ -21,8 +21,8 @@
  * a small per-draw buffer table handled by sub-step ③. Consequently there is no
  * buffer writer in this header by design.
  *
- * The qword layout below mirrors exactly what encodeShaderResources writes via
- * arg.StructurePtrOffset:
+ * The qword layout below mirrors exactly what encodeShaderResources writes into
+ * typed Metal argument-buffer entries via arg.StructurePtrOffset:
  *   - texture: [0]=gpuResourceID, [1]=TextureMetadata(arrayLength, minLOD=0)
  *   - sampler: [0]=sampler_state_handle, [1]=sampler_state_cube_handle,
  *              [2]=lod_bias (f32 bits in low 32)

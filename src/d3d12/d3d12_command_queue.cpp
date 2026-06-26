@@ -15,6 +15,7 @@
 #include "d3d12_root_signature.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_context.hpp"
+#include "dxmt_bindless_buffer_table.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_info.hpp"
@@ -37,6 +38,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cfloat>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <initializer_list>
@@ -599,6 +603,18 @@ D3D12DiagEnabledEnv(const char *name) {
   return value == "1" || value == "true" || value == "yes" || value == "trace";
 }
 
+static bool
+D3D12RecordLoopBreakdownEnabled() {
+  static const bool on = D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
+  return on;
+}
+
+static bool
+D3D12RecordLoopStallEnabled() {
+  static const bool on = D3D12DiagEnabledEnv("DXMT_DIAG_STALL");
+  return on;
+}
+
 static void
 RecordExecuteDrainTime(dxmt::FrameStatistics *stats,
                        dxmt::perf::ExecuteTimeBucket bucket,
@@ -862,9 +878,7 @@ D3D12DiagCBVReadbackEnabled() {
 
 static bool
 D3D12ApitraceGpuCbvSnapshotEnabled() {
-  static const bool enabled =
-      D3D12DiagEnabledEnv("DXMT_APITRACE_GPU_CBV_SNAPSHOT");
-  return enabled;
+  return false;
 }
 
 static bool
@@ -3427,6 +3441,7 @@ public:
 
   ~CommandQueueImpl() {
     LogBindingRecipeDiagSummary("command-queue-destroy");
+    LogBindlessMirrorDiagSummary("command-queue-destroy");
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -4596,6 +4611,7 @@ private:
       dxmt_queue.CommitCurrentChunk();
       perf_timer.stop();
       dxmt_queue.PresentBoundary();
+      queue_->LogBindlessMirrorDiagSummary("present");
 
       presentation_count_++;
       current_backbuffer_ =
@@ -6397,8 +6413,7 @@ private:
     return p;
   }
   static bool StallDiagEnabled() {
-    static const bool on = D3D12DiagEnabledEnv("DXMT_DIAG_STALL");
-    return on;
+    return D3D12RecordLoopStallEnabled();
   }
   struct StallScope {
     bool on; clock::time_point t0; uint64_t *dst;
@@ -6499,7 +6514,7 @@ private:
     // attribute the 300-780ms explosion-frame replay to record-loop vs
     // FlushPassBatches vs timestamp/query materialization.
     static const bool replay_breakdown =
-        D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
+        D3D12RecordLoopBreakdownEnabled();
     const auto rb_t0 = replay_breakdown ? clock::now() : clock::time_point{};
     if (replay_breakdown) {
       perDrawSubTimers() = {};
@@ -6640,6 +6655,20 @@ private:
         return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
       };
       const auto total = us(rb_t4 - rb_t0);
+      const uint64_t record_loop_us = us(rb_t1 - rb_t0);
+      const uint64_t flush_pass_us = us(rb_t2 - rb_t1);
+      const uint64_t timestamp_resolve_us = us(rb_t3 - rb_t2);
+      const uint64_t cpu_query_resolve_us = us(rb_t4 - rb_t3);
+      const uint64_t stall_accounted_us =
+          rb_stall_accum.getPipelineUs + rb_stall_accum.psoSelectUs +
+          rb_stall_accum.selectPsoUs + rb_stall_accum.descAccessUs +
+          rb_stall_accum.attachUs + rb_stall_accum.bindSnapUs +
+          rb_stall_accum.estimateUs + rb_stall_accum.packetUs +
+          rb_stall_accum.queueUs + rb_stall_accum.emitUs;
+      const uint64_t stall_unaccounted_us =
+          rb_stall_total_us > stall_accounted_us
+              ? rb_stall_total_us - stall_accounted_us
+              : 0;
       static const uint64_t rb_threshold_us = []() {
         auto v = env::getEnvVar("DXMT_DIAG_REPLAY_BREAKDOWN_US");
         return v.empty() ? uint64_t(50000) : strtoull(v.c_str(), nullptr, 10);
@@ -6661,10 +6690,10 @@ private:
         WARN_FILE_ONLY("DXMT replay breakdown:"
              " records=", records.size(),
              " totalUs=", total,
-             " recordLoopUs=", us(rb_t1 - rb_t0),
-             " flushPassUs=", us(rb_t2 - rb_t1),
-             " timestampResolveUs=", us(rb_t3 - rb_t2),
-             " cpuQueryResolveUs=", us(rb_t4 - rb_t3),
+             " recordLoopUs=", record_loop_us,
+             " flushPassUs=", flush_pass_us,
+             " timestampResolveUs=", timestamp_resolve_us,
+             " cpuQueryResolveUs=", cpu_query_resolve_us,
              // recordLoop sub-phase split (needs DXMT_DIAG_STALL). stallUnaccounted
              // = recordLoop time that is none of pso/desc/attach/emit — the
              // suspected ~85% (SelectPSO + binding snapshot + packet build /
@@ -6682,15 +6711,7 @@ private:
              " stallPacketUs=", rb_stall_accum.packetUs,
              " stallQueueUs=", rb_stall_accum.queueUs,
              " stallEmitUs=", rb_stall_accum.emitUs,
-             " stallUnaccountedUs=", ([&] {
-               const uint64_t acc =
-                   rb_stall_accum.getPipelineUs + rb_stall_accum.psoSelectUs +
-                   rb_stall_accum.selectPsoUs + rb_stall_accum.descAccessUs +
-                   rb_stall_accum.attachUs + rb_stall_accum.bindSnapUs +
-                   rb_stall_accum.estimateUs + rb_stall_accum.packetUs +
-                   rb_stall_accum.queueUs + rb_stall_accum.emitUs;
-               return rb_stall_total_us > acc ? rb_stall_total_us - acc : 0;
-             }()),
+             " stallUnaccountedUs=", stall_unaccounted_us,
              " drawCount=", perDrawSubTimers().drawCount,
              " psoRootUnchanged=", perDrawSubTimers().psoRootUnchanged,
              " fullBindUnchanged=", perDrawSubTimers().fullBindUnchanged,
@@ -10166,25 +10187,92 @@ private:
    * location differs from the legacy packed encode. Buffers are intentionally NOT handled
    * (hybrid ABI: they live in a per-draw buffer table owned by ③).
    */
+  static bool BindlessMirrorVerifyEnabled() {
+    return false;
+  }
+
+  static bool BindlessMirrorVerifyShouldLog() {
+    static std::atomic<uint32_t> count = 0;
+    return BindlessMirrorVerifyEnabled() &&
+           count.fetch_add(1, std::memory_order_relaxed) < 50;
+  }
+
+  void VerifyBindlessMirrorSamplerSlot(DescriptorHeapMirror *mirror, UINT slot,
+                                       const Sampler *sampler, uint64_t dummy_handle,
+                                       PipelineStage stage,
+                                       const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
+    if (!BindlessMirrorVerifyEnabled())
+      return;
+    uint64_t expected[kMirrorSamplerQwords] = {};
+    if (sampler)
+      EncodeMirrorSamplerSlot(expected, *sampler);
+    else
+      EncodeMirrorSamplerSlotNull(expected, dummy_handle);
+    const uint64_t *got = mirror ? mirror->slotPtr(slot) : nullptr;
+    if (!got)
+      return;
+    for (uint32_t i = 0; i < kMirrorSamplerQwords; i++) {
+      if (got[i] == expected[i])
+        continue;
+      if (!BindlessMirrorVerifyShouldLog())
+        return;
+      ERR("DXMT bindless-mirror VERIFY mismatch (sampler)"
+          " draw=", DiagCurrentReplayRecordSequence(),
+          " drawSerial=", DiagCurrentReplayRecordSerial(),
+          " stage=", PipelineStageName(stage),
+          " arg=", arg ? arg->StructurePtrOffset : UINT32_MAX,
+          " slot=", slot,
+          " field=qword", i,
+          " expected=0x", std::hex, expected[i],
+          " actual=0x", got[i], std::dec);
+    }
+  }
+
+  void VerifyBindlessMirrorSamplerDescriptor(ArgumentEncodingContext &enc,
+                                             const DescriptorRecord &record,
+                                             PipelineStage stage,
+                                             const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
+    if (!BindlessMirrorVerifyEnabled())
+      return;
+    if (record.type != DescriptorRecordType::Sampler || !record.has_desc) {
+      VerifyBindlessMirrorSamplerSlot(record.mirror, record.heap_index, nullptr,
+                                      enc.dummySamplerHandle(), stage, arg);
+      return;
+    }
+    auto sampler = CreateSampler(record.desc.sampler);
+    VerifyBindlessMirrorSamplerSlot(record.mirror, record.heap_index, sampler.ptr(),
+                                    enc.dummySamplerHandle(), stage, arg);
+  }
+
   void FillBindlessMirrorSlot(ArgumentEncodingContext &enc, DescriptorHeapMirror *mirror,
-                              const DescriptorRecord &record) {
+                              const DescriptorRecord &record, PipelineStage stage,
+                              const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
     if (!mirror)
       return;
     const UINT slot = record.heap_index;
-    // Already up to date for the current content generation: skip (this is what makes
-    // the fill once-per-change rather than per-draw).
-    if (mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot))
-      return;
-
     if (mirror->isSamplerHeap()) {
+      const bool filled =
+          mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot);
       if (record.type != DescriptorRecordType::Sampler || !record.has_desc) {
-        mirror->FillSamplerSlot(slot, nullptr, enc.dummySamplerHandle());
+        if (!filled)
+          mirror->FillSamplerSlot(slot, nullptr, enc.dummySamplerHandle());
+        VerifyBindlessMirrorSamplerSlot(mirror, slot, nullptr,
+                                        enc.dummySamplerHandle(), stage, arg);
         return;
       }
       auto sampler = CreateSampler(record.desc.sampler);
-      mirror->FillSamplerSlot(slot, sampler.ptr(), enc.dummySamplerHandle());
+      if (!filled)
+        mirror->FillSamplerSlot(slot, sampler.ptr(), enc.dummySamplerHandle());
+      VerifyBindlessMirrorSamplerSlot(mirror, slot, sampler.ptr(),
+                                      enc.dummySamplerHandle(), stage, arg);
       return;
     }
+
+    // Already up to date for the current content generation: skip (this is what makes
+    // the texture fill once-per-change rather than per-draw). Samplers verify above
+    // still compares every bindless draw when the local verify path is enabled.
+    if (mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot))
+      return;
 
     // CBV/SRV/UAV mirror: only texture views are persisted here. Buffer records and
     // empty/null slots leave the mirror slot as-is (zero); ③'s per-draw buffer table
@@ -10229,43 +10317,24 @@ private:
     }
   }
 
-  /**
-   * env-gated (DXMT_BINDLESS_MIRROR_VERIFY=1) correctness check for a filled texture
-   * mirror slot: re-resolve the same view via enc.access<>() — the EXACT call
-   * encodeShaderResources uses (dxmt_context.cpp) — and assert the persisted mirror
-   * qwords equal what the legacy packed encode would emit. This is a real check: the
-   * fill path resolves gpuResourceID with a residency-free Texture::view() lookup, and
-   * this verifies it matches the access<>() resolve byte-for-byte. Both sides funnel
-   * through the shared EncodeMirrorTextureSlot writer.
-   */
   void VerifyBindlessMirrorTextureSlot(ArgumentEncodingContext &enc,
                                        DescriptorHeapMirror *mirror, UINT slot,
                                        const Rc<Texture> &texture, TextureViewKey view) {
-    static const bool verify = env::getEnvVar("DXMT_BINDLESS_MIRROR_VERIFY") == "1";
-    if (!verify)
-      return;
-    uint64_t expected[kMirrorTextureQwords] = {};
-    // Same resolve as encodeShaderResources' SRV-texture branch.
-    EncodeMirrorTextureSlot(
-        expected,
-        enc.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Read).gpuResourceID,
-        texture->arrayLength(view));
-    const uint64_t *got = mirror->slotPtr(slot);
-    if (!got)
-      return;
-    if (got[0] != expected[0] || got[1] != expected[1]) {
-      ERR("DXMT bindless-mirror VERIFY mismatch (texture) slot=", slot,
-          " got=[", got[0], ",", got[1], "]",
-          " expected=[", expected[0], ",", expected[1], "]");
-    }
+    (void)enc;
+    (void)mirror;
+    (void)slot;
+    (void)texture;
+    (void)view;
   }
 
   void MaybeFillBindlessMirrorSlot(ArgumentEncodingContext &enc,
                                    D3D12_DESCRIPTOR_RANGE_TYPE range_type,
-                                   const DescriptorRecord &record) {
+                                   const DescriptorRecord &record,
+                                   PipelineStage stage,
+                                   const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
     if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
         record.type == DescriptorRecordType::Sampler) {
-      FillBindlessMirrorSlot(enc, record.mirror, record);
+      FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
       return;
     }
 
@@ -10275,7 +10344,7 @@ private:
          record.type == DescriptorRecordType::UnorderedAccessView)) {
       auto *resource = GetResource(record.resource.ptr());
       if (resource && resource->GetTexture())
-        FillBindlessMirrorSlot(enc, record.mirror, record);
+        FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
     }
   }
 
@@ -10924,6 +10993,9 @@ private:
     uint32_t descriptor_index = 0;
     uint32_t descriptor_count = 0;
     uint32_t range_type = 0;
+    uint32_t shader_register = 0;
+    uint32_t register_lower_bound = 0;
+    uint32_t root_offset_key = 0;
     DXMT12_MTL4_SHADER_ARGUMENT argument = {};
   };
 
@@ -10991,6 +11063,8 @@ private:
     UINT slot = 0;
     UINT shader_register = 0;
     UINT register_space = 0;
+    UINT register_lower_bound = 0;
+    UINT root_offset_key = 0;
     UINT64 debug_size = 0;
     D3D12_GPU_VIRTUAL_ADDRESS debug_address = 0;
     const char *debug_kind = nullptr;
@@ -11016,14 +11090,10 @@ private:
     uint32_t vertex_slot_mask = 0;
     uint64_t content_fingerprint = 0;
     // Bindless-mirror (③.3) snapshot-path support: the snapshot replays draws WITHOUT the live
-    // ReplayState, so root_offsets (③.2, per-stage) and the two persistent mirror buffers are
-    // resolved at CAPTURE time (state valid) and carried here; the mirror itself is filled at
-    // APPLY from each entry.descriptor (which carries record.mirror). Ring slices captured here
-    // are applied within the same Execute, so their lifetime is valid. Empty when the captured
-    // PSO is not bindless. Indexed by PipelineStage (only Vertex/Pixel used for graphics).
+    // ReplayState, so root_offsets (③.2, per-stage) are rebuilt at APPLY from the captured
+    // entries. The persistent mirror buffers are derived from each entry.descriptor.mirror at
+    // APPLY too, matching the mirror slots filled by MaybeFillBindlessMirrorSlot.
     bool bindless = false;
-    WMT::Buffer bindless_tex_mirror;
-    WMT::Buffer bindless_sampler_mirror;
     AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
     AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
@@ -11407,6 +11477,9 @@ private:
                   entry.descriptor_index = descriptor_index;
                   entry.descriptor_count = count;
                   entry.range_type = range.range_type;
+                  entry.shader_register = shader_register;
+                  entry.register_lower_bound = lower;
+                  entry.root_offset_key = argument.StructurePtrOffset;
                   entry.argument = ShaderArgumentAtRangeOffset(argument, i);
                   recipe.entries.push_back(entry);
                 }
@@ -11417,6 +11490,347 @@ private:
       }
     }
     return recipe;
+  }
+
+  static bool BindlessMirrorDiagEnabled() {
+    return false;
+  }
+
+  static bool BindlessMirrorDiagShouldLog() {
+    static std::atomic<uint32_t> count = 0;
+    return BindlessMirrorDiagEnabled() &&
+           count.fetch_add(1, std::memory_order_relaxed) < 300;
+  }
+
+	  struct BindlessMirrorDiagStats {
+	    std::atomic<uint64_t> total_graphics_draws = 0;
+	    std::atomic<uint64_t> compute_dispatches = 0;
+	    std::atomic<uint64_t> bindless_bound = 0;
+	    std::atomic<uint64_t> legacy_bound = 0;
+	    std::atomic<uint64_t> uses_bindless_mirror = 0;
+    std::atomic<uint64_t> mismatch = 0;
+    std::atomic<uint64_t> ps_tex_null = 0;
+    std::atomic<uint64_t> vs_tex_null = 0;
+    std::atomic<uint64_t> buf_table_null = 0;
+    std::mutex mutex;
+    std::unordered_map<std::string, uint64_t> bindless_shader_pairs;
+    std::unordered_set<std::string> dumped_shader_blobs;
+  };
+
+  struct BindlessMirrorDrawDiag {
+    const char *path = "legacy";
+    bool uses_bindless_mirror = false;
+    bool bindless_bound = false;
+    uint32_t ps_tex = 0;
+    uint32_t vs_tex = 0;
+    uint32_t tex_null = 0;
+    uint32_t ps_tex_null = 0;
+    uint32_t vs_tex_null = 0;
+    uint32_t buf_table_entries = 0;
+    uint32_t buf_table_null_gpu_addr = 0;
+    PipelineStage example_buf_stage = PipelineStage::Vertex;
+    uint32_t example_buf_qword = 0;
+  };
+
+  static BindlessMirrorDiagStats &
+  BindlessMirrorDiagStatsInstance() {
+    static BindlessMirrorDiagStats stats;
+    return stats;
+  }
+
+  static const char *
+  BindlessMirrorDiagPathName(bool bindless_bound, bool snapshot) {
+    if (bindless_bound)
+      return snapshot ? "bindless-snapshot" : "bindless-live";
+    return "legacy";
+  }
+
+  static const std::filesystem::path &
+  BindlessMirrorDiagShaderDumpDir() {
+    static const std::filesystem::path path = []() {
+      const std::filesystem::path dump_dir("/tmp/fh4-cg-shaders");
+      try {
+        std::filesystem::create_directories(dump_dir);
+      } catch (...) {
+      }
+      return dump_dir;
+    }();
+    return path;
+  }
+
+  static std::string
+  BindlessMirrorDiagShaderDumpKey(const char *stage, std::string_view sha1) {
+    std::string key;
+    key.reserve(std::strlen(stage) + 1 + sha1.size());
+    key.append(stage);
+    key.push_back(':');
+    key.append(sha1);
+    return key;
+  }
+
+  static std::string
+  BindlessMirrorShaderSha1(const PipelineDxilShader &shader) {
+    const auto &bc = shader.bytecode();
+    return Sha1HashState::compute(bc.data(), bc.size()).string();
+  }
+
+  static void
+  DumpBindlessMirrorShaderDxbc(const char *stage,
+                               const PipelineDxilShader &shader) {
+    if (!BindlessMirrorDiagEnabled())
+      return;
+    const auto &bytecode = shader.bytecode();
+    if (bytecode.empty())
+      return;
+
+    const auto sha1 = BindlessMirrorShaderSha1(shader);
+    const auto key = BindlessMirrorDiagShaderDumpKey(stage, sha1);
+    auto &stats = BindlessMirrorDiagStatsInstance();
+    {
+      std::lock_guard lock(stats.mutex);
+      if (!stats.dumped_shader_blobs.insert(key).second)
+        return;
+    }
+
+    try {
+      std::filesystem::create_directories(BindlessMirrorDiagShaderDumpDir());
+      const auto path = BindlessMirrorDiagShaderDumpDir() /
+                        (std::string(stage) + "_" + sha1 + ".dxbc");
+      std::ofstream file(path, std::ios::binary | std::ios::trunc);
+      if (!file)
+        return;
+      file.write(reinterpret_cast<const char *>(bytecode.data()),
+                 static_cast<std::streamsize>(bytecode.size()));
+      file.flush();
+    } catch (...) {
+    }
+  }
+
+  static void
+  LogBindlessMirrorDiagSummary(const char *reason) {
+    if (!BindlessMirrorDiagEnabled())
+      return;
+
+	    auto &stats = BindlessMirrorDiagStatsInstance();
+	    const auto total =
+	        stats.total_graphics_draws.load(std::memory_order_relaxed);
+	    const auto dispatches =
+	        stats.compute_dispatches.load(std::memory_order_relaxed);
+	    if (!total && !dispatches)
+	      return;
+
+	    INFO("DXMT bindless-mirror DIAG summary"
+	         " reason=", reason,
+	         " totalGraphicsDraws=", total,
+	         " computeDispatches=", dispatches,
+	         " bindlessBound=", stats.bindless_bound.load(std::memory_order_relaxed),
+	         " legacyBound=", stats.legacy_bound.load(std::memory_order_relaxed),
+	         " usesBindlessMirror=",
+         stats.uses_bindless_mirror.load(std::memory_order_relaxed),
+         " mismatch=", stats.mismatch.load(std::memory_order_relaxed),
+         " psTexNull=", stats.ps_tex_null.load(std::memory_order_relaxed),
+         " vsTexNull=", stats.vs_tex_null.load(std::memory_order_relaxed),
+         " bufTableNull=",
+         stats.buf_table_null.load(std::memory_order_relaxed));
+
+    if (std::strcmp(reason, "command-queue-destroy") != 0)
+      return;
+
+    std::vector<std::pair<std::string, uint64_t>> pairs;
+    {
+      std::lock_guard lock(stats.mutex);
+      pairs.reserve(stats.bindless_shader_pairs.size());
+      for (const auto &entry : stats.bindless_shader_pairs)
+        pairs.emplace_back(entry.first, entry.second);
+    }
+    std::sort(pairs.begin(), pairs.end(),
+              [](const auto &lhs, const auto &rhs) {
+                if (lhs.second != rhs.second)
+                  return lhs.second > rhs.second;
+                return lhs.first < rhs.first;
+              });
+
+    for (const auto &entry : pairs) {
+      const auto sep = entry.first.find(':');
+      const auto vs_sha1 = entry.first.substr(0, sep);
+      const auto ps_sha1 = sep == std::string::npos ? std::string()
+                                                    : entry.first.substr(sep + 1);
+      INFO("DXMT bindless-mirror DIAG shader-pair"
+           " draws=", entry.second,
+           " vs=", vs_sha1,
+           " ps=", ps_sha1);
+    }
+  }
+
+	  void
+	  RecordBindlessMirrorDiagDraw(const PipelineState *pipeline,
+	                               const BindlessMirrorDrawDiag &diag) {
+    if (!BindlessMirrorDiagEnabled())
+      return;
+
+    auto &stats = BindlessMirrorDiagStatsInstance();
+    const auto draw =
+        stats.total_graphics_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag.bindless_bound)
+      stats.bindless_bound.fetch_add(1, std::memory_order_relaxed);
+    else
+      stats.legacy_bound.fetch_add(1, std::memory_order_relaxed);
+    if (diag.uses_bindless_mirror)
+      stats.uses_bindless_mirror.fetch_add(1, std::memory_order_relaxed);
+    const bool mismatch = diag.uses_bindless_mirror != diag.bindless_bound;
+    if (mismatch)
+      stats.mismatch.fetch_add(1, std::memory_order_relaxed);
+    stats.ps_tex_null.fetch_add(diag.ps_tex_null, std::memory_order_relaxed);
+    stats.vs_tex_null.fetch_add(diag.vs_tex_null, std::memory_order_relaxed);
+    stats.buf_table_null.fetch_add(diag.buf_table_null_gpu_addr,
+                                   std::memory_order_relaxed);
+
+    if (diag.uses_bindless_mirror && pipeline) {
+      const auto *vs_shader = FindShaderForStage(*pipeline, PipelineStage::Vertex);
+      const auto *ps_shader = FindShaderForStage(*pipeline, PipelineStage::Pixel);
+      if (vs_shader || ps_shader) {
+        const auto vs_sha1 = vs_shader ? BindlessMirrorShaderSha1(*vs_shader) : "";
+        const auto ps_sha1 = ps_shader ? BindlessMirrorShaderSha1(*ps_shader) : "";
+        if (vs_shader)
+          DumpBindlessMirrorShaderDxbc("vs", *vs_shader);
+        if (ps_shader)
+          DumpBindlessMirrorShaderDxbc("ps", *ps_shader);
+        std::lock_guard lock(stats.mutex);
+        stats.bindless_shader_pairs[vs_sha1 + ":" + ps_sha1]++;
+      }
+    }
+
+    if (!BindlessMirrorDiagShouldLog())
+      return;
+
+    INFO("DXMT bindless-mirror DIAG draw"
+         " draw=", draw,
+         " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
+         " d3dSeq=", DiagCurrentReplayRecordSequence(),
+         " serial=", DiagCurrentReplayRecordSerial(),
+         " psoBindless=", diag.uses_bindless_mirror ? 1 : 0,
+         " path=", diag.path,
+         mismatch ? " MISMATCH" : "",
+         " psTex=", diag.ps_tex,
+         " vsTex=", diag.vs_tex,
+         " texNull=", diag.tex_null,
+         " bufEntries=", diag.buf_table_entries,
+         " bufNullGpuAddr=", diag.buf_table_null_gpu_addr,
+         " exampleBufStage=",
+         diag.buf_table_null_gpu_addr
+             ? PipelineStageName(diag.example_buf_stage)
+             : "none",
+         " exampleBufQword=",
+	         diag.buf_table_null_gpu_addr ? diag.example_buf_qword : UINT32_MAX);
+	  }
+
+	  void RecordBindlessMirrorDiagDispatch() {
+	    if (!BindlessMirrorDiagEnabled())
+	      return;
+	    BindlessMirrorDiagStatsInstance().compute_dispatches.fetch_add(
+	        1, std::memory_order_relaxed);
+	  }
+
+  static void
+  AddBindlessMirrorDiagBufTable(BindlessMirrorDrawDiag &diag,
+                                PipelineStage stage,
+                                const MTL_SM50_SHADER_ARGUMENT *cbuffers,
+                                uint32_t num_cbuffers,
+                                const MTL_SM50_SHADER_ARGUMENT *arguments,
+                                uint32_t num_arguments,
+                                const AllocatedArgumentBufferSlice &slice) {
+    if (!BindlessMirrorDiagEnabled() || !slice.mapped || !slice.length)
+      return;
+    if ((num_cbuffers && !cbuffers) || (num_arguments && !arguments))
+      return;
+
+    const auto qword_count = uint32_t(slice.length / sizeof(uint64_t));
+    const auto *qwords = static_cast<const uint64_t *>(slice.mapped);
+    ForEachBufferTableField(
+        cbuffers, num_cbuffers, arguments, num_arguments,
+        [&](const MTL_SM50_SHADER_ARGUMENT &arg, uint32_t compact_base) {
+      if (compact_base + 1 >= qword_count)
+        return;
+      diag.buf_table_entries++;
+      if (qwords[compact_base] != 0)
+        return;
+      if (!diag.buf_table_null_gpu_addr) {
+        diag.example_buf_stage = stage;
+        diag.example_buf_qword = compact_base;
+      }
+      diag.buf_table_null_gpu_addr++;
+    });
+  }
+
+  struct BindlessMirrorDiagProbe {
+    const char *path = nullptr;
+    PipelineStage stage = PipelineStage::Pixel;
+    const DXMT12_MTL4_SHADER_ARGUMENT *arg = nullptr;
+    UINT shader_register = 0;
+    UINT lower_bound = 0;
+    uint32_t root_offset = 0;
+    uint32_t absolute_slot = 0;
+    uint32_t live_base = 0;
+    bool has_live_base = false;
+    const DescriptorRecord *descriptor = nullptr;
+  };
+
+  bool ProbeBindlessMirrorTextureBinding(const BindlessMirrorDiagProbe &probe,
+                                         BindlessMirrorDrawDiag *draw_diag) {
+    if (!BindlessMirrorDiagEnabled() || !probe.arg || !probe.descriptor)
+      return false;
+
+    auto *mirror = probe.descriptor->mirror;
+    const uint64_t *slot = mirror ? mirror->slotPtr(probe.absolute_slot) : nullptr;
+    const uint64_t handle = slot ? slot[0] : 0;
+    const uint64_t filled_gen =
+        mirror ? mirror->slotFilledGeneration(probe.absolute_slot) : 0;
+    const uint64_t stale_gen =
+        mirror ? mirror->slotStaleGeneration(probe.absolute_slot) : 0;
+    const bool snapshot_base_diverged =
+        probe.has_live_base && probe.root_offset != probe.live_base;
+    const bool null_handle = handle == 0;
+    if (draw_diag) {
+      if (probe.stage == PipelineStage::Pixel)
+        draw_diag->ps_tex++;
+      else if (probe.stage == PipelineStage::Vertex)
+        draw_diag->vs_tex++;
+      if (null_handle) {
+        draw_diag->tex_null++;
+        if (probe.stage == PipelineStage::Pixel)
+          draw_diag->ps_tex_null++;
+        else if (probe.stage == PipelineStage::Vertex)
+          draw_diag->vs_tex_null++;
+      }
+    }
+    if (!null_handle && !snapshot_base_diverged)
+      return false;
+    if (!BindlessMirrorDiagShouldLog())
+      return null_handle;
+    const char *fill_state = filled_gen == stale_gen
+                                 ? (filled_gen ? "filled" : "never-filled")
+                                 : "stale";
+
+    INFO("DXMT bindless-mirror DIAG"
+         " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
+         " draw=", DiagCurrentReplayRecordSequence(),
+         " drawSerial=", DiagCurrentReplayRecordSerial(),
+         " stage=", PipelineStageName(probe.stage),
+         " argKey=", probe.arg->StructurePtrOffset,
+         " register=", probe.shader_register,
+         " lower=", probe.lower_bound,
+         " rootOffset=", probe.root_offset,
+         " absoluteSlot=", probe.absolute_slot,
+         " path=", probe.path ? probe.path : "unknown",
+         " fill=", fill_state,
+         " filledGen=", filled_gen,
+         " staleGen=", stale_gen,
+         " handle=", handle,
+         " liveBase=", probe.has_live_base ? probe.live_base : UINT32_MAX,
+         " descriptorSlot=", probe.descriptor->heap_index,
+         " reason=", snapshot_base_diverged ? "snapshot-base-diverged"
+                                            : "null-handle");
+    return null_handle;
   }
 
   // Bindless-mirror (Stage-1 sub-step ③.2): build the per-draw slot-28 root_offsets for
@@ -11439,7 +11853,8 @@ private:
   AllocatedArgumentBufferSlice
   BuildBindlessRootOffsets(ArgumentEncodingContext &enc, const ReplayState &state,
                            const PipelineState &pipeline, const RootSignature &root,
-                           PipelineStage want_stage, bool compute) {
+                           PipelineStage want_stage, bool compute,
+                           BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto *shader = FindShaderForStage(pipeline, want_stage);
     if (!shader)
       return {};
@@ -11470,6 +11885,7 @@ private:
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
     std::memset(root_offsets, 0, slice.length);
+    std::vector<BindlessMirrorDiagProbe> bindless_diag_probes;
 
     const auto parameters = root.GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
@@ -11526,12 +11942,51 @@ private:
               heap, base_handle, range_offset, descriptor_index, count, heap_type);
           if (!descriptor)
             continue;
-          if (argument.StructurePtrOffset < max_key_plus_one)
+          if (argument.StructurePtrOffset < max_key_plus_one) {
             root_offsets[argument.StructurePtrOffset] = descriptor->heap_index;
+            if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
+                BindlessMirrorVerifyEnabled()) {
+              const auto resolved_count = ShaderArgumentRangeCount(argument);
+              for (UINT local = 0;
+                   local < resolved_count && descriptor_index + local < count;
+                   local++) {
+                const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+                    heap, base_handle, range_offset, descriptor_index + local,
+                    count, heap_type);
+                if (slot_descriptor)
+                  VerifyBindlessMirrorSamplerDescriptor(
+                      enc, *slot_descriptor, want_stage, &argument);
+              }
+            }
+            if (BindlessMirrorDiagEnabled() &&
+                range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+              const auto resolved_count = ShaderArgumentRangeCount(argument);
+              for (UINT local = 0;
+                   local < resolved_count && descriptor_index + local < count;
+                   local++) {
+                const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+                    heap, base_handle, range_offset, descriptor_index + local,
+                    count, heap_type);
+                if (!slot_descriptor)
+                  continue;
+                bindless_diag_probes.push_back(BindlessMirrorDiagProbe{
+                    "live", want_stage, &argument, lower + local, lower, 0, 0,
+                    0, false, slot_descriptor});
+              }
+            }
+          }
         }
         if (range.descriptor_count != UINT_MAX)
           running_offset = range_offset + range.descriptor_count;
       }
+    }
+    for (auto probe : bindless_diag_probes) {
+      if (!probe.arg || probe.arg->StructurePtrOffset >= max_key_plus_one)
+        continue;
+      const auto local = probe.shader_register - probe.lower_bound;
+      probe.root_offset = root_offsets[probe.arg->StructurePtrOffset];
+      probe.absolute_slot = probe.root_offset + local;
+      ProbeBindlessMirrorTextureBinding(probe, draw_diag);
     }
     if (slice.needs_flush)
       slice.gpu_buffer.updateContents(slice.offset, slice.mapped, slice.length);
@@ -11707,7 +12162,8 @@ private:
           DescriptorRangeTypeName(range_type), pipeline, compute, stage,
           entry.root_index, entry.slot, 0, 0,
           DescriptorRecordSizeBytes(*descriptor), 0);
-      MaybeFillBindlessMirrorSlot(enc, range_type, *descriptor);
+      MaybeFillBindlessMirrorSlot(enc, range_type, *descriptor, stage,
+                                  &entry.argument);
       BindDescriptor(enc, stage, range_type, entry.slot, *descriptor,
                      &entry.argument);
       bound++;
@@ -11816,6 +12272,9 @@ private:
       entry.range_type = range_type;
       entry.root_index = recipe_entry.root_index;
       entry.slot = recipe_entry.slot;
+      entry.shader_register = recipe_entry.shader_register;
+      entry.register_lower_bound = recipe_entry.register_lower_bound;
+      entry.root_offset_key = recipe_entry.root_offset_key;
       entry.argument = recipe_entry.argument;
       entry.debug_kind = DescriptorRangeTypeName(range_type);
 
@@ -11835,6 +12294,12 @@ private:
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.range_type);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.root_index);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.slot);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.shader_register);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.register_lower_bound);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.root_offset_key);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.argument);
       HashGraphicsBindingValue(snapshot.content_fingerprint,
                                entry.has_descriptor);
@@ -12067,15 +12532,11 @@ private:
     if (!root)
       return snapshot;
 
-    // Bindless-mirror (③.3): the snapshot apply has no ReplayState, so resolve the two persistent
-    // mirror buffers here (state valid) and flag the snapshot bindless. root_offsets are rebuilt at
-    // apply from the captured entries (BuildBindlessRootOffsetsFromSnapshot); the mirror itself is
-    // filled at apply from each entry.descriptor.
-    if (pipeline.UsesBindlessMirror()) {
+    // Bindless-mirror (③.3): root_offsets and mirror buffers are resolved at apply from
+    // the captured descriptors. The flag records that this PSO should use the snapshot
+    // bindless ABI instead of legacy packed argument buffers.
+    if (pipeline.UsesBindlessMirror())
       snapshot.bindless = true;
-      ResolveBindlessMirrorBuffers(state, snapshot.bindless_tex_mirror,
-                                   snapshot.bindless_sampler_mirror);
-    }
 
     CaptureDescriptorTableBindings(
         snapshot, state, pipeline,
@@ -12267,30 +12728,37 @@ private:
                                             const RootSignature &root,
                                             const PipelineDxilShader &shader,
                                             const std::string &shader_key,
-                                            bool compute) {
+                                            bool compute,
+                                            BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto &reflection = shader.reflection();
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
-        shader_key);
+        shader_key, DiagCurrentReplayRecordSequence(),
+        DiagCurrentReplayRecordSerial());
     auto root_offsets =
-        BuildBindlessRootOffsets(enc, state, pipeline, root, Stage, compute);
+        BuildBindlessRootOffsets(enc, state, pipeline, root, Stage, compute,
+                                 draw_diag);
+    if (draw_diag)
+      AddBindlessMirrorDiagBufTable(
+          *draw_diag, Stage, shader.constantBufferInfo(),
+          reflection.NumConstantBuffers, shader.resourceArgumentInfo(),
+          reflection.NumArguments, bt);
     WMT::Buffer tex_mirror, sampler_mirror;
     ResolveBindlessMirrorBuffers(state, tex_mirror, sampler_mirror);
     enc.bindBindlessTables<Stage>(bt.gpu_buffer, root_offsets.gpu_buffer,
                                   tex_mirror, sampler_mirror);
   }
 
-  // Bindless-mirror (③.3) snapshot-path root_offsets: the snapshot replay has no live ReplayState
-  // (so BuildBindlessRootOffsets's table-handle walk is unreachable) but the captured entries DO
-  // carry, per texture/sampler descriptor, entry.argument (with StructurePtrOffset) and
-  // entry.descriptor.heap_index. In a descriptor-table range the base register occupies the LOWEST
-  // heap slot (heaps are contiguous + ascending), so root_offsets[arg.StructurePtrOffset] = the
-  // MIN heap_index over that arg's captured descriptors == BuildBindlessRootOffsets's base. Builds
-  // the slot-28 slice for ONE stage from the snapshot entries; empty if the stage has no tex/sampler.
+  // Bindless-mirror (③.3) snapshot-path root_offsets: the snapshot replay has no live ReplayState,
+  // so reconstruct the same absolute range-base slot captured by the live root/table walk. Snapshot
+  // entries are per descriptor and may carry an element-expanded argument, so min(heap_index) is not
+  // a reliable range base. Instead use the original root key and shader register saved by the recipe:
+  // root_offsets[root_key] = descriptor.heap_index - (shader_register - range.LowerBound).
   AllocatedArgumentBufferSlice
   BuildBindlessRootOffsetsFromSnapshot(ArgumentEncodingContext &enc,
                                        const GraphicsBindingSnapshot &snapshot,
-                                       PipelineStage want_stage) {
+                                       PipelineStage want_stage,
+                                       BindlessMirrorDrawDiag *draw_diag = nullptr) {
     uint32_t max_key_plus_one = 0;
     for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
@@ -12303,7 +12771,7 @@ private:
            (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE));
       if (is_tex_or_sampler)
         max_key_plus_one =
-            std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
+            std::max<uint32_t>(max_key_plus_one, entry.root_offset_key + 1);
     }
     if (!max_key_plus_one)
       return {};
@@ -12327,10 +12795,42 @@ private:
           (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
       if (!is_tex_or_sampler)
         continue;
-      if (arg.StructurePtrOffset >= max_key_plus_one)
+      if (entry.root_offset_key >= max_key_plus_one)
         continue;
-      auto &slot = root_offsets[arg.StructurePtrOffset];
-      slot = std::min<uint32_t>(slot, entry.descriptor.heap_index);
+      if (entry.shader_register < entry.register_lower_bound)
+        continue;
+      const auto local = entry.shader_register - entry.register_lower_bound;
+      if (entry.descriptor.heap_index < local)
+        continue;
+      auto &slot = root_offsets[entry.root_offset_key];
+      slot = std::min<uint32_t>(slot, entry.descriptor.heap_index - local);
+    }
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || entry.stage != want_stage)
+        continue;
+      const auto &arg = entry.argument;
+      if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
+          entry.root_offset_key < max_key_plus_one) {
+        VerifyBindlessMirrorSamplerDescriptor(enc, entry.descriptor, want_stage,
+                                              &arg);
+        continue;
+      }
+      if (!(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) ||
+          entry.root_offset_key >= max_key_plus_one)
+        continue;
+      const auto lower = entry.register_lower_bound;
+      if (entry.shader_register < lower)
+        continue;
+      const auto local = entry.shader_register - lower;
+      if (entry.descriptor.heap_index < local)
+        continue;
+      const auto live_base = entry.descriptor.heap_index - local;
+      ProbeBindlessMirrorTextureBinding(BindlessMirrorDiagProbe{
+          "snapshot", want_stage, &arg, entry.shader_register, lower,
+          root_offsets[entry.root_offset_key],
+          root_offsets[entry.root_offset_key] + local, live_base, true,
+          &entry.descriptor}, draw_diag);
     }
     for (uint32_t i = 0; i < max_key_plus_one; i++)
       if (root_offsets[i] == UINT32_MAX)
@@ -12340,22 +12840,56 @@ private:
     return slice;
   }
 
+  // Bindless-mirror (③.3) snapshot-path mirror buffers: bind the same persistent mirror buffers
+  // that ApplyGraphicsBindingSnapshot just filled through entry.descriptor.mirror. Resolving these
+  // from the snapshot descriptors avoids binding a stale capture-time heap mirror while the shader
+  // reads slots 29/30.
+  void ResolveBindlessMirrorBuffersFromSnapshot(
+      const GraphicsBindingSnapshot &snapshot, WMT::Buffer &tex_mirror,
+      WMT::Buffer &sampler_mirror) {
+    tex_mirror = {};
+    sampler_mirror = {};
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || !entry.descriptor.mirror)
+        continue;
+      auto *mirror = entry.descriptor.mirror;
+      if (mirror->isSamplerHeap()) {
+        if (!sampler_mirror)
+          sampler_mirror = mirror->buffer();
+      } else if (!tex_mirror) {
+        tex_mirror = mirror->buffer();
+      }
+      if (tex_mirror && sampler_mirror)
+        return;
+    }
+  }
+
   // Bindless-mirror (③.3) snapshot-path per-stage wiring: pack the slot-27 buf_table (encode-time,
   // residency via packers) + bind 27/28/29/30. root_offsets is the slice pre-built from the
-  // snapshot entries; the two mirror buffers were resolved at capture and carried in the snapshot
-  // (their handles are stable on the heap). Only Ordinary Vertex/Pixel.
+  // snapshot entries; mirror buffers are resolved from the same descriptor mirrors filled above.
+  // Only Ordinary Vertex/Pixel.
   template <PipelineStage Stage>
   void EncodeShaderBindingsForStageBindlessSnapshot(
       ArgumentEncodingContext &enc, const PipelineDxilShader &shader,
       const std::string &shader_key, const GraphicsBindingSnapshot &snapshot,
-      const AllocatedArgumentBufferSlice &root_offsets) {
+      const AllocatedArgumentBufferSlice &root_offsets,
+      BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto &reflection = shader.reflection();
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
-        shader_key);
+        shader_key, DiagCurrentReplayRecordSequence(),
+        DiagCurrentReplayRecordSerial());
+    if (draw_diag)
+      AddBindlessMirrorDiagBufTable(
+          *draw_diag, Stage, shader.constantBufferInfo(),
+          reflection.NumConstantBuffers, shader.resourceArgumentInfo(),
+          reflection.NumArguments, bt);
+    WMT::Buffer tex_mirror, sampler_mirror;
+    ResolveBindlessMirrorBuffersFromSnapshot(snapshot, tex_mirror,
+                                             sampler_mirror);
     enc.bindBindlessTables<Stage>(bt.gpu_buffer, root_offsets.gpu_buffer,
-                                  snapshot.bindless_tex_mirror,
-                                  snapshot.bindless_sampler_mirror);
+                                  tex_mirror, sampler_mirror);
   }
 
   void BindRootConstantsSnapshot(ArgumentEncodingContext &enc,
@@ -12417,7 +12951,8 @@ private:
                                     PipelineState &pipeline,
                                     bool use_geometry,
                                     bool use_tessellation,
-                                    uint64_t &argbuf_offset) {
+                                    uint64_t &argbuf_offset,
+                                    BindlessMirrorDrawDiag *draw_diag = nullptr) {
     if (auto *root = GetRootSignature(snapshot.root_signature.ptr()))
       ApplyStaticSamplers(enc, pipeline, *root, false);
 
@@ -12437,7 +12972,8 @@ private:
         // so fill the persistent mirror here from the captured descriptor (record.mirror travels
         // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
         if (snapshot.bindless)
-          MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor);
+          MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
+                                      entry.stage, &entry.argument);
         BindDescriptor(enc, entry.stage, entry.range_type, entry.slot,
                        entry.descriptor, &entry.argument);
       } else {
@@ -12471,17 +13007,24 @@ private:
 
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
+    BindlessMirrorDrawDiag local_diag = {};
+    BindlessMirrorDrawDiag &diag = draw_diag ? *draw_diag : local_diag;
+    diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
     // Bindless-mirror (③.3) snapshot path: pre-build per-stage root_offsets from the captured
     // entries (no ReplayState here). A bindless PSO is never geometry/tess (off-gate), so only
     // Ordinary Vertex/Pixel branch; the geometry/tess branches stay legacy.
     const bool snapshot_bindless =
         snapshot.bindless && !use_geometry && !use_tessellation;
+    diag.bindless_bound = snapshot_bindless;
+    diag.path = BindlessMirrorDiagPathName(snapshot_bindless, true);
     AllocatedArgumentBufferSlice ro_vertex, ro_pixel;
     if (snapshot_bindless) {
       ro_vertex =
-          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Vertex);
+          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Vertex,
+                                               &diag);
       ro_pixel =
-          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Pixel);
+          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Pixel,
+                                               &diag);
     }
     // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
     // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
@@ -12491,10 +13034,10 @@ private:
       if (snapshot_bindless) {
         if (shader.stage == PipelineShaderStage::Vertex)
           EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
-              enc, shader, key, snapshot, ro_vertex);
+              enc, shader, key, snapshot, ro_vertex, &diag);
         else if (shader.stage == PipelineShaderStage::Pixel)
           EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
-              enc, shader, key, snapshot, ro_pixel);
+              enc, shader, key, snapshot, ro_pixel, &diag);
         continue;
       }
       if (use_geometry) {
@@ -12610,19 +13153,25 @@ private:
     const RootSignature *bindless_root =
         bindless ? GetRootSignature(state.graphics_root_signature.ptr())
                  : nullptr;
+    const bool bindless_path =
+        bindless && bindless_root && !use_geometry && !use_tessellation;
+    BindlessMirrorDrawDiag diag = {};
+    diag.uses_bindless_mirror = bindless;
+    diag.bindless_bound = bindless_path;
+    diag.path = BindlessMirrorDiagPathName(bindless_path, false);
     // Mixed-PSO guard (③.3 STEP D): a legacy draw after a bindless draw must restore the per-pass
     // argbuf at slots 29/30 (the bindless draw rebound them to mirrors). Gated on the env so a
     // legacy-only run pays nothing.
     if (!bindless && BindlessMirrorEnvEnabled())
       enc.restorePerPassArgbufIfMirrorBound<false>();
     for (const auto &shader : shaders) {
-      if (bindless && bindless_root && !use_geometry && !use_tessellation) {
+      if (bindless_path) {
         if (shader.stage == PipelineShaderStage::Vertex)
           EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
-              enc, state, pipeline, *bindless_root, shader, key, false);
+              enc, state, pipeline, *bindless_root, shader, key, false, &diag);
         else if (shader.stage == PipelineShaderStage::Pixel)
           EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
-              enc, state, pipeline, *bindless_root, shader, key, false);
+              enc, state, pipeline, *bindless_root, shader, key, false, &diag);
         continue;
       }
       if (use_geometry) {
@@ -12666,6 +13215,7 @@ private:
               enc, shader, key, argbuf_offset);
       }
     }
+    RecordBindlessMirrorDiagDraw(&pipeline, diag);
   }
 
   void EncodeComputeBindings(ArgumentEncodingContext &enc,
@@ -13805,6 +14355,7 @@ private:
     uint32_t tess_num_output_control_point_element = 0;
     bool use_geometry = false;
     bool use_tessellation = false;
+    BindlessMirrorDrawDiag bindless_diag = {};
   };
 
   struct ReplayDrawInstancedPacket {
@@ -13898,11 +14449,21 @@ private:
       else
         stats.gate_misses.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!skip_binding_snapshot) {
+    BindlessMirrorDrawDiag bindless_diag = {};
+    bindless_diag.uses_bindless_mirror =
+        packet.pipeline && packet.pipeline->UsesBindlessMirror();
+    bindless_diag.bindless_bound =
+        packet.binding_snapshot.bindless && !packet.use_geometry &&
+        !packet.use_tessellation;
+    bindless_diag.path =
+        BindlessMirrorDiagPathName(bindless_diag.bindless_bound, true);
+    if (!skip_binding_snapshot && packet.pipeline) {
       ApplyGraphicsBindingSnapshot(enc, packet.binding_snapshot,
                                    *packet.pipeline, packet.use_geometry,
-                                   packet.use_tessellation, argbuf_offset);
+                                   packet.use_tessellation, argbuf_offset,
+                                   &bindless_diag);
     }
+    packet.bindless_diag = bindless_diag;
     if (!generation_hit) {
       binding_cache.graphics_generation = packet.binding_generation;
       binding_cache.descriptor_content_generation =
@@ -14035,6 +14596,7 @@ private:
       draw.instance_count = packet.instance_count;
       draw.base_instance = packet.base_instance;
     }
+    RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
 
     EndReplayDrawVisibilityQuery(enc, active_visibility_query);
   }
@@ -14151,6 +14713,7 @@ private:
       draw.base_vertex = packet.base_vertex;
       draw.base_instance = packet.base_instance;
     }
+    RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
 
     EndReplayDrawVisibilityQuery(enc, active_visibility_query);
   }
@@ -14534,9 +15097,10 @@ private:
                                  record.z))
       return;
 
-    RecordComputePipelineResourceAccess(chunk, state, *pipeline);
-    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
-    QueueComputePassCommand(
+	    RecordComputePipelineResourceAccess(chunk, state, *pipeline);
+	    RecordBindlessMirrorDiagDispatch();
+	    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
+	    QueueComputePassCommand(
         chunk, state, argument_buffer_size,
         [this, metal_pso = metal->pso,
          threadgroup_size = metal->threadgroup_size, pipeline,

@@ -4,6 +4,7 @@
 #include "com/com_guid.hpp"
 #include "Metal.hpp"
 #include <d3d12.h>
+#include <mutex>
 
 namespace dxmt {
 class Device;
@@ -14,6 +15,9 @@ class Device;
 DEFINE_COM_INTERFACE("7f7f9293-9c67-4c3f-865b-30c92e1a7d12", IMTLD3D12Device)
     : public IMTLDXGIDevice {
   virtual WMT::Device STDMETHODCALLTYPE GetMTLDevice() = 0;
+  virtual WMT::BinaryArchive *STDMETHODCALLTYPE GetPSOBinaryArchive() = 0;
+  virtual std::mutex &STDMETHODCALLTYPE GetPSOBinaryArchiveMutex() = 0;
+  virtual void STDMETHODCALLTYPE NotePSOBinaryArchivePipelineCreated() = 0;
   virtual dxmt::Device &GetDXMTDevice() = 0;
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;

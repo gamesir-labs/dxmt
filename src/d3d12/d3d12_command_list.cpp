@@ -1763,13 +1763,6 @@ private:
     // recording runs on the present thread (i.e. inside frame_wall / otherWall).
     dxmt::perf::ScopedFrameTimer perf_timer(
         dxmt::perf::FrameTimeBucket::CommandListRecord);
-    if (g_current_command_record_d3d_sequence != 0 &&
-        std::getenv("DXMT_APITRACE_DIAG") &&
-        g_apitrace_record_diag_log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
-      WARN("DXMT apitrace d3d:",
-           " event=record_command",
-           " seq=", g_current_command_record_d3d_sequence);
-    }
     records_.push_back(CommandRecord{
         g_current_command_record_d3d_sequence, std::forward<T>(payload)});
   }

@@ -44,7 +44,6 @@ Converter::LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex) {
 
 llvm::Value *
 Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
-
   auto RangeId = SrcOp.rangeid;
 
   auto range_index = LoadOperandIndex(SrcOp.rangeindex);
@@ -408,10 +407,11 @@ Converter::LoadTexture(const SrcOperandResource &SrcOp) {
   using namespace llvm::air;
 
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.srv_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(LoadOperandIndex(SrcOp.index)).build(ctx);
+  auto operand_index = LoadOperandIndex(SrcOp.index);
+  auto res_handle = res_handle_fn(operand_index).build(ctx);
   if (res_handle.takeError())
     return {};
-  auto md = md_fn(nullptr).build(ctx);
+  auto md = md_fn(operand_index).build(ctx);
   if (md.takeError())
     return {};
 

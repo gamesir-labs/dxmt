@@ -197,7 +197,7 @@ write_manifest() {
   fi
 
   python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" \
-    "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" "$APITRACE_VERBOSE" \
+    "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" \
     "$GAMEHUB_WINEDEBUG" <<'PY'
 import json
 import sys
@@ -206,8 +206,7 @@ manifest_path = sys.argv[1]
 package_name = sys.argv[2]
 enable_apitrace = sys.argv[3] == "1"
 apitrace_output_dir = sys.argv[4]
-apitrace_verbose = sys.argv[5] == "1"
-winedebug = sys.argv[6]
+winedebug = sys.argv[5]
 environment_template = {
     "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
     "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
@@ -219,8 +218,6 @@ if winedebug:
 if enable_apitrace:
     environment_template["DXMT_APITRACE_ENABLED"] = "1"
     environment_template["APITRACE_TRACE_BUNDLE"] = apitrace_output_dir
-    if apitrace_verbose:
-        environment_template["APITRACE_METAL_VERBOSE"] = "1"
 
 manifest = {
     "id": package_name,

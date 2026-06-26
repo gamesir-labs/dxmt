@@ -131,14 +131,6 @@ CommandQueue::CommandQueue(WMT::Device device) :
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
   event = device.newSharedEvent();
 
-  std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
-
-  if (!env.empty()) {
-    try {
-      capture_state.scheduleNextFrameCapture(std::stoull(env));
-    } catch (const std::invalid_argument &) {
-    }
-  }
 }
 
 CommandQueue::~CommandQueue() {

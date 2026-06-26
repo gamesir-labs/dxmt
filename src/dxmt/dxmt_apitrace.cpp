@@ -44,7 +44,6 @@ namespace dxmt::apitrace {
 namespace {
 
 std::atomic<int> enabled_cache{-1};
-std::atomic<int> verbose_cache{-1};
 std::atomic_bool session_open_logged = false;
 std::atomic_bool shutdown_requested = false;
 #ifdef _WIN32
@@ -53,8 +52,6 @@ std::atomic_bool crash_flush_running = false;
 #endif
 
 constexpr const char *kTraceBundleEnv = "APITRACE_TRACE_BUNDLE";
-constexpr const char *kTraceOutputDirEnv = "DXMT_APITRACE_TRACE_OUTPUT_DIR";
-constexpr const char *kResolvedTraceBundleEnv = "DXMT_APITRACE_RESOLVED_TRACE_BUNDLE";
 
 bool
 truthy_env_value(const std::string &value) {
@@ -67,32 +64,10 @@ env_enabled() {
   if (cached >= 0)
     return cached != 0;
 
-  auto value = env::getEnvVar("DXMT_APITRACE_ENBALED");
-  if (value.empty())
-    value = env::getEnvVar("DXMT_APITRACE_ENABLED");
+  auto value = env::getEnvVar("DXMT_APITRACE_ENABLED");
   const bool enabled = truthy_env_value(value);
   enabled_cache.store(enabled ? 1 : 0, std::memory_order_relaxed);
   return enabled;
-}
-
-bool
-verbose_enabled() {
-  const int cached = verbose_cache.load(std::memory_order_relaxed);
-  if (cached >= 0)
-    return cached != 0;
-
-  const auto value = env::getEnvVar("APITRACE_METAL_VERBOSE");
-  const bool verbose = truthy_env_value(value);
-  verbose_cache.store(verbose ? 1 : 0, std::memory_order_relaxed);
-  return verbose;
-}
-
-void
-log_verbose(const char *message, uint64_t arg0 = 0, uint64_t arg1 = 0) {
-  if (!verbose_enabled())
-    return;
-
-  INFO("DXMT apitrace: ", message, " arg0=", arg0, " arg1=", arg1);
 }
 
 bool
@@ -225,31 +200,13 @@ bundle_root_from_env(const std::string &value, bool *directory_mode) {
 
 void
 initialize_bundle_root() {
-  bool directory_mode = false;
-  auto trace_bundle = bundle_root_from_output_dir(env::getEnvVar(kTraceOutputDirEnv));
-
-  if (trace_bundle.empty())
-    trace_bundle = bundle_root_from_env(env::getEnvVar(kTraceBundleEnv), &directory_mode);
+  auto trace_bundle = bundle_root_from_env(env::getEnvVar(kTraceBundleEnv), nullptr);
 
   if (trace_bundle.empty())
     trace_bundle = default_bundle_root();
 
-  if (!trace_bundle.empty()) {
-    if (directory_mode)
-      set_env_var(kTraceOutputDirEnv, env::getEnvVar(kTraceBundleEnv).c_str());
+  if (!trace_bundle.empty())
     set_env_var(kTraceBundleEnv, trace_bundle.c_str());
-    set_env_var(kResolvedTraceBundleEnv, trace_bundle.c_str());
-  }
-
-  if (verbose_enabled()) {
-    const char *trace_crt_view = std::getenv(kTraceBundleEnv);
-    const char *resolved_crt_view = std::getenv(kResolvedTraceBundleEnv);
-    const char *output_dir_crt_view = std::getenv(kTraceOutputDirEnv);
-    INFO("DXMT apitrace: bundle root ", trace_bundle);
-    INFO("DXMT apitrace: APITRACE_TRACE_BUNDLE crt-view=", trace_crt_view ? trace_crt_view : "(null)");
-    INFO("DXMT apitrace: DXMT_APITRACE_RESOLVED_TRACE_BUNDLE crt-view=", resolved_crt_view ? resolved_crt_view : "(null)");
-    INFO("DXMT apitrace: DXMT_APITRACE_TRACE_OUTPUT_DIR crt-view=", output_dir_crt_view ? output_dir_crt_view : "(null)");
-  }
 }
 
 #ifdef _WIN32
@@ -278,7 +235,6 @@ flush_sessions_for_crash() {
   ::apitrace::runtime::flush_process_trace_session();
 #endif
   DXMT_WMT_APITRACE_SESSION_FLUSH();
-  log_verbose("session crash flush");
   crash_flush_running.store(false, std::memory_order_release);
 }
 
@@ -328,9 +284,8 @@ ensure_session_open() {
 #endif
 
   DXMT_WMT_APITRACE_SESSION_ENSURE_OPEN();
-  if (!session_open_logged.exchange(true, std::memory_order_relaxed) && verbose_enabled()) {
+  if (!session_open_logged.exchange(true, std::memory_order_relaxed))
     INFO("DXMT apitrace: session open requested");
-  }
 }
 
 void
@@ -345,7 +300,6 @@ seal_checkpoint() {
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::seal_process_trace_session_checkpoint();
 #endif
-  log_verbose("session checkpoint sealed");
 }
 
 void
@@ -357,7 +311,6 @@ seal_metal_checkpoint() {
     return;
 
   DXMT_WMT_APITRACE_SESSION_SEAL_CHECKPOINT();
-  log_verbose("metal checkpoint sealed");
 }
 
 void
@@ -371,7 +324,6 @@ seal_d3d_checkpoint() {
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::seal_process_trace_session_checkpoint();
 #endif
-  log_verbose("d3d checkpoint sealed");
 }
 
 void
@@ -386,7 +338,6 @@ shutdown() {
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::shutdown_process_trace_session();
 #endif
-  log_verbose("session close");
 }
 
 void
@@ -405,7 +356,6 @@ on_command_buffer_begin(uint64_t command_buffer_id, uint64_t frame_id) {
 
   ensure_session_open();
   DXMT_WMT_APITRACE_COMMAND_BUFFER_BEGIN(command_buffer_id, frame_id);
-  log_verbose("command buffer begin", command_buffer_id, frame_id);
 }
 
 void
@@ -414,7 +364,6 @@ on_command_buffer_commit(uint64_t command_buffer_id) {
     return;
 
   DXMT_WMT_APITRACE_COMMAND_BUFFER_COMMIT(command_buffer_id);
-  log_verbose("command buffer commit", command_buffer_id, 0);
 }
 
 void
@@ -428,13 +377,6 @@ on_present_drawable(
     return;
 
   DXMT_WMT_APITRACE_PRESENT_DRAWABLE(command_buffer_id, drawable_id, frame_index, sync_interval, flags);
-  if (verbose_enabled()) {
-    INFO("DXMT apitrace: present commandBuffer=", command_buffer_id,
-         " drawable=", drawable_id,
-         " frame=", frame_index,
-         " syncInterval=", sync_interval,
-         " flags=", flags);
-  }
 }
 
 } // namespace dxmt::apitrace

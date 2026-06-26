@@ -1367,9 +1367,7 @@ dxmt_apitrace_truthy_env_value(const char *value) {
 
 static bool
 dxmt_apitrace_runtime_enabled(void) {
-  const char *enabled = getenv("DXMT_APITRACE_ENBALED");
-  if (!enabled || !enabled[0])
-    enabled = getenv("DXMT_APITRACE_ENABLED");
+  const char *enabled = getenv("DXMT_APITRACE_ENABLED");
   return dxmt_apitrace_truthy_env_value(enabled);
 }
 
@@ -1391,10 +1389,6 @@ dxmt_apitrace_has_bundle_suffix(const char *path) {
 
 static const char *
 dxmt_apitrace_bundle_root(void) {
-  const char *resolved_bundle_root = getenv("DXMT_APITRACE_RESOLVED_TRACE_BUNDLE");
-  if (resolved_bundle_root && resolved_bundle_root[0])
-    return resolved_bundle_root;
-
   const char *bundle_root = getenv("APITRACE_TRACE_BUNDLE");
   if (bundle_root && bundle_root[0] && dxmt_apitrace_has_bundle_suffix(bundle_root))
     return bundle_root;
@@ -1403,32 +1397,17 @@ dxmt_apitrace_bundle_root(void) {
   if (!warned) {
     warned = true;
     fprintf(stderr,
-            "warn:  DXMT apitrace: resolved APITRACE_TRACE_BUNDLE not set; "
+            "warn:  DXMT apitrace: APITRACE_TRACE_BUNDLE not set to a .apitrace bundle; "
             "PE side must initialize child bundle root before opening unix session\n");
   }
   return NULL;
 }
 
-static bool
-dxmt_apitrace_verbose_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    const char *value = getenv("APITRACE_METAL_VERBOSE");
-    enabled = dxmt_apitrace_truthy_env_value(value);
-    initialized = true;
-  }
-  return enabled;
-}
-
 static void
 dxmt_apitrace_log(const char *message, uint64_t arg0, uint64_t arg1) {
-  if (!dxmt_apitrace_verbose_enabled())
-    return;
-  fprintf(stderr, "info:  DXMT apitrace: %s arg0=%llu arg1=%llu\n",
-          message,
-          (unsigned long long)arg0,
-          (unsigned long long)arg1);
+  (void)message;
+  (void)arg0;
+  (void)arg1;
 }
 
 static uint64_t
@@ -5765,6 +5744,15 @@ sm50_compilation_argument_copy(const struct SM50_SHADER_COMPILATION_ARGUMENT_DAT
     copy->next = sm50_compilation_argument_copy(data->next);
     return (void *)copy;
   }
+  case SM50_SHADER_BINDLESS_MIRROR: {
+    const struct SM50_SHADER_BINDLESS_MIRROR_DATA *data = (const void *)src;
+    struct SM50_SHADER_BINDLESS_MIRROR_DATA *copy = calloc(1, sizeof(*copy));
+    if (!copy)
+      return NULL;
+    *copy = *data;
+    copy->next = sm50_compilation_argument_copy(data->next);
+    return (void *)copy;
+  }
   case SM50_SHADER_ARGUMENT_TYPE_MAX:
     break;
   }
@@ -6075,6 +6063,12 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA32 {
   uint32_t max_potential_tess_factor;
 };
 
+struct SM50_SHADER_BINDLESS_MIRROR_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  bool enabled;
+};
+
 void
 sm50_compilation_argument32_convert(
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
@@ -6182,6 +6176,16 @@ sm50_compilation_argument32_convert(
       last_arg->next = NULL;
       data->type = src->type;
       data->max_potential_tess_factor = src->max_potential_tess_factor;
+      break;
+    }
+    case SM50_SHADER_BINDLESS_MIRROR: {
+      struct SM50_SHADER_BINDLESS_MIRROR_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_BINDLESS_MIRROR_DATA *data = malloc(sizeof(struct SM50_SHADER_BINDLESS_MIRROR_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->enabled = src->enabled;
       break;
     }
     case SM50_SHADER_ARGUMENT_TYPE_MAX:

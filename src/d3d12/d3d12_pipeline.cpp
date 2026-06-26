@@ -2006,7 +2006,13 @@ PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders) {
   static const bool env_on = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
   if (!env_on)
     return false;
+  const PipelineDxilShader *vs = nullptr;
+  const PipelineDxilShader *ps = nullptr;
   for (const auto &shader : shaders) {
+    if (shader.stage == PipelineShaderStage::Vertex)
+      vs = &shader;
+    else if (shader.stage == PipelineShaderStage::Pixel)
+      ps = &shader;
     // Stage-1 covers SM5/DXBC single-stage VS/PS/CS only. DXIL (SM6) airconv
     // path does not thread the bindless flag; HS/DS/GS use separate compile
     // entries (CompileTessellation*/CompileGeometry*) that also don't thread it,

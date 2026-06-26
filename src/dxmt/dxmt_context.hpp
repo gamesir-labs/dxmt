@@ -677,6 +677,13 @@ public:
       const std::string &shader_hash, uint64_t *buf_table, uint32_t buf_table_qwords,
       const uint32_t *res_compact, const ShaderResourceBindingSnapshot *bindings
   );
+  template <PipelineStage stage, PipelineKind kind>
+  void verifyBindlessBufferTable(
+      const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+      const MTL_SM50_SHADER_ARGUMENT *arguments, const uint64_t *buf_table,
+      uint32_t buf_table_qwords, const uint32_t *cb_compact, const uint32_t *res_compact,
+      uint64_t verify_draw_id, uint64_t verify_draw_serial
+  );
 
   // Bindless-mirror (Stage-1 sub-step ③.3): pack ONE stage's slot-27 buf_table for the
   // current draw. Allocates the buf_table ring slice (sized via BuildBufferTableCompactBases,
@@ -695,7 +702,9 @@ public:
   packBindlessStage(const MTL_SHADER_REFLECTION *reflection,
                     const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
                     const MTL_SM50_SHADER_ARGUMENT *arguments,
-                    const std::string &shader_hash);
+                    const std::string &shader_hash,
+                    uint64_t verify_draw_id = 0,
+                    uint64_t verify_draw_serial = 0);
 
   // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
   // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null

@@ -39,6 +39,37 @@ static void DebugLogNullShaderBinding(
 );
 
 static bool
+BindlessMirrorVerifyEnabled() {
+  return false;
+}
+
+static bool
+BindlessMirrorVerifyShouldLog() {
+  static std::atomic<uint32_t> count = 0;
+  return BindlessMirrorVerifyEnabled() &&
+         count.fetch_add(1, std::memory_order_relaxed) < 50;
+}
+
+static const char *
+BindlessVerifyStageName(PipelineStage stage) {
+  switch (stage) {
+  case PipelineStage::Vertex:
+    return "Vertex";
+  case PipelineStage::Pixel:
+    return "Pixel";
+  case PipelineStage::Geometry:
+    return "Geometry";
+  case PipelineStage::Hull:
+    return "Hull";
+  case PipelineStage::Domain:
+    return "Domain";
+  case PipelineStage::Compute:
+    return "Compute";
+  }
+  return "Unknown";
+}
+
+static bool
 ResolveRenderPassColorAttachment(
     const char *message, unsigned slot, const TextureViewRef &attachment, WMT::Texture &resolved_texture
 ) {
@@ -450,6 +481,17 @@ ArgumentEncodingContext::packBindlessCBuffers(
       continue;
     auto slot = 14 * unsigned(stage) + arg.SM50BindingSlot;
     auto &cbuf = cbuf_[slot];
+    // Root CBV (SetGraphicsRootConstantBufferView -> bindConstantBufferDirect)
+    // clears cbuf.buffer and stores the address in direct_gpu_address. Mirror the
+    // legacy encodeConstantBuffers direct_buffer branch; without it this CBV would
+    // fall through to the dummy below and read garbage constants.
+    if (cbuf.direct_buffer) {
+      buf_table[qw_base] = cbuf.direct_gpu_address + cbuf.offset;
+      buf_table[qw_base + 1] = 0;
+      makeResident<stage, kind>(cbuf.direct_buffer,
+                                GetResidencyMask<kind>(stage, true, false));
+      continue;
+    }
     if (!cbuf.buffer.ptr()) {
       buf_table[qw_base] = dummy_cbuffer_info_.gpu_address;
       buf_table[qw_base + 1] = 0;
@@ -593,6 +635,110 @@ ArgumentEncodingContext::packBindlessBufferTable(
   }
 }
 
+template <PipelineStage stage, PipelineKind kind>
+void
+ArgumentEncodingContext::verifyBindlessBufferTable(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    const MTL_SM50_SHADER_ARGUMENT *arguments, const uint64_t *buf_table,
+    uint32_t buf_table_qwords, const uint32_t *cb_compact, const uint32_t *res_compact,
+    uint64_t verify_draw_id, uint64_t verify_draw_serial) {
+  if (!BindlessMirrorVerifyEnabled() || !buf_table || !buf_table_qwords)
+    return;
+
+  auto log_mismatch = [&](const MTL_SM50_SHADER_ARGUMENT &arg, uint32_t qw_base,
+                          const char *binding, const char *field,
+                          uint64_t expected, uint64_t actual) {
+    if (expected == actual || !BindlessMirrorVerifyShouldLog())
+      return;
+    ERR("DXMT bindless-mirror VERIFY mismatch (buf_table)"
+        " draw=", verify_draw_id,
+        " drawSerial=", verify_draw_serial,
+        " stage=", BindlessVerifyStageName(stage),
+        " arg=", arg.StructurePtrOffset,
+        " qword=", qw_base,
+        " binding=", binding,
+        " field=", field,
+        " expected=0x", std::hex, expected,
+        " actual=0x", actual, std::dec);
+  };
+
+  for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
+    const auto &arg = constant_buffers[i];
+    const uint32_t qw_base = cb_compact[i];
+    if (qw_base + 1 >= buf_table_qwords)
+      continue;
+
+    uint64_t expected_address = dummy_cbuffer_info_.gpu_address;
+    auto slot = 14 * unsigned(stage) + arg.SM50BindingSlot;
+    auto &cbuf = cbuf_[slot];
+    if (cbuf.direct_buffer) {
+      expected_address = cbuf.direct_gpu_address + cbuf.offset;
+    } else if (cbuf.buffer.ptr()) {
+      auto argbuf = cbuf.buffer;
+      auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
+      auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
+      expected_address = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+    }
+    log_mismatch(arg, qw_base, "CBV", "gpuAddr", expected_address, buf_table[qw_base]);
+    log_mismatch(arg, qw_base + 1, "CBV", "meta", 0, buf_table[qw_base + 1]);
+  }
+
+  auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
+  for (unsigned i = 0; i < reflection->NumArguments; i++) {
+    const auto &arg = arguments[i];
+    const uint32_t compact = res_compact[i];
+    if (compact == kNotABufferTableField || compact + 1 >= buf_table_qwords)
+      continue;
+
+    if (arg.Type == SM50BindingType::SRV &&
+        (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER)) {
+      auto slot = 128 * unsigned(stage) + arg.SM50BindingSlot;
+      auto &srv = resview_[slot];
+      uint64_t expected_address = 0;
+      uint64_t expected_meta = 0;
+      if (srv.buffer.ptr()) {
+        auto [srv_alloc, offset] = access<stage>(
+            srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, ResourceAccess::Read);
+        expected_address = srv_alloc->gpuAddress() + offset + srv.slice.byteOffset;
+        expected_meta = srv.slice.byteLength;
+      }
+      log_mismatch(arg, compact, "SRV", "gpuAddr", expected_address, buf_table[compact]);
+      log_mismatch(arg, compact + 1, "SRV", "meta", expected_meta, buf_table[compact + 1]);
+    } else if (arg.Type == SM50BindingType::UAV &&
+               (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER)) {
+      auto &uav = UAVBindingSet[arg.SM50BindingSlot];
+      bool read = (arg.Flags >> 10) & 1, write = (arg.Flags >> 10) & 2;
+      if (!read && !write) {
+        read = true;
+        write = true;
+      }
+      int access_flags = (read ? ResourceAccess::Read : 0) |
+                         (write ? ResourceAccess::Write : 0) |
+                         ResourceAccess::UAV;
+      uint64_t expected_address = 0;
+      uint64_t expected_meta = 0;
+      if (uav.buffer.ptr()) {
+        auto [uav_alloc, offset] = access<stage>(
+            uav.buffer, uav.slice.byteOffset, uav.slice.byteLength, access_flags);
+        expected_address = uav_alloc->gpuAddress() + offset + uav.slice.byteOffset;
+        expected_meta = uav.slice.byteLength;
+      }
+      log_mismatch(arg, compact, "UAV", "gpuAddr", expected_address, buf_table[compact]);
+      log_mismatch(arg, compact + 1, "UAV", "meta", expected_meta, buf_table[compact + 1]);
+
+      if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
+        uint64_t expected_counter = 0;
+        if (uav.counter) {
+          auto [counter_alloc, offset] = access<stage>(uav.counter, 0, 4, ResourceAccess::All);
+          expected_counter = counter_alloc->gpuAddress() + offset;
+        }
+        if (compact + 2 < buf_table_qwords)
+          log_mismatch(arg, compact + 2, "UAV", "counter", expected_counter, buf_table[compact + 2]);
+      }
+    }
+  }
+}
+
 template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, uint64_t *, uint32_t, const uint32_t *);
 template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, uint64_t *, uint32_t, const uint32_t *);
 template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Vertex, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, uint64_t *, uint32_t, const uint32_t *);
@@ -625,7 +771,8 @@ template <PipelineStage stage, PipelineKind kind>
 AllocatedArgumentBufferSlice
 ArgumentEncodingContext::packBindlessStage(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    const MTL_SM50_SHADER_ARGUMENT *arguments, const std::string &shader_hash
+    const MTL_SM50_SHADER_ARGUMENT *arguments, const std::string &shader_hash,
+    uint64_t verify_draw_id, uint64_t verify_draw_serial
 ) {
   const uint32_t num_cbuffers = reflection->NumConstantBuffers;
   const uint32_t num_arguments = reflection->NumArguments;
@@ -661,6 +808,10 @@ ArgumentEncodingContext::packBindlessStage(
   if (num_arguments && arguments)
     packBindlessBufferTable<stage, kind>(reflection, arguments, shader_hash, buf_table, qword_count,
                                          res_bases.data(), nullptr);
+
+  verifyBindlessBufferTable<stage, kind>(
+      reflection, constant_buffers, arguments, buf_table, qword_count,
+      cb_bases.data(), res_bases.data(), verify_draw_id, verify_draw_serial);
 
   if (bt.needs_flush)
     bt.gpu_buffer.updateContents(bt.offset, bt.mapped, bt.length);
@@ -762,6 +913,10 @@ ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound() {
     };
     bind(29);
     bind(30);
+    for (auto &state : data->argument_buffer_offsets) {
+      if (state.valid && (state.index == 29 || state.index == 30))
+        state.valid = false;
+    }
     data->bindless_mirror_bound_29_30 = false;
   } else {
     auto *data = currentRenderEncoder();
@@ -780,13 +935,22 @@ ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound() {
     bind(WMTRenderStageVertex, 30);
     bind(WMTRenderStageFragment, 29);
     bind(WMTRenderStageFragment, 30);
+    for (auto &state : data->argument_buffer_offsets) {
+      if (!state.valid)
+        continue;
+      const bool restored_stage =
+          state.stages == WMTRenderStageVertex ||
+          state.stages == WMTRenderStageFragment;
+      if (restored_stage && (state.index == 29 || state.index == 30))
+        state.valid = false;
+    }
     data->bindless_mirror_bound_29_30 = false;
   }
 }
 
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &);
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &);
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(WMT::Buffer, WMT::Buffer, WMT::Buffer, WMT::Buffer);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(WMT::Buffer, WMT::Buffer, WMT::Buffer, WMT::Buffer);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(WMT::Buffer, WMT::Buffer, WMT::Buffer, WMT::Buffer);

@@ -19,6 +19,7 @@
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_perf_stats.hpp"
+#include "dxmt_shader_cache.hpp"
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
@@ -26,9 +27,15 @@
 #include "util_win32_compat.h"
 #include <atomic>
 #include <algorithm>
+#include <cstdarg>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 #include <winbase.h>
 
@@ -64,6 +71,96 @@ D3D12DeviceDiagEnabled() {
 static UINT64
 Align(UINT64 value, UINT64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static void
+LogPSOBinaryArchiveMarker(const char *format, ...) {
+  char message[1024];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+
+  fprintf(stderr, "%s\n", message);
+
+  auto marker_path = env::getEnvVar("DXMT_PSO_ARCHIVE_MARKER");
+  if (marker_path.empty())
+    return;
+
+  FILE *marker = fopen(marker_path.c_str(), "a");
+  if (!marker)
+    return;
+  fprintf(marker, "%s\n", message);
+  fclose(marker);
+}
+
+static uint64_t
+GetPSOBinaryArchiveSerializeEvery() {
+  auto value = env::getEnvVar("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY");
+  if (value.empty())
+    return 256;
+  return strtoull(value.c_str(), nullptr, 10);
+}
+
+static std::string
+EnsureTrailingSlash(std::string path) {
+  if (!path.empty() && !path.ends_with('/') && !path.ends_with('\\'))
+    path += "/";
+  return path;
+}
+
+static std::string
+GetDarwinUserCacheDirectory() {
+  auto cache_dir = env::getEnvVar("DARWIN_USER_CACHE_DIR");
+  if (!cache_dir.empty() && cache_dir.starts_with("/"))
+    return EnsureTrailingSlash(cache_dir);
+
+  auto tmp_dir = env::getEnvVar("TMPDIR");
+  if (tmp_dir.empty() || !tmp_dir.starts_with("/"))
+    return {};
+
+  tmp_dir = EnsureTrailingSlash(tmp_dir);
+  if (tmp_dir.ends_with("/T/"))
+    return tmp_dir.substr(0, tmp_dir.size() - 3) + "/C/";
+  if (tmp_dir.ends_with("/T"))
+    return tmp_dir.substr(0, tmp_dir.size() - 2) + "/C/";
+
+  return {};
+}
+
+static bool
+FileExists(const std::string &path) {
+  FILE *file = fopen(path.c_str(), "rb");
+  if (!file)
+    return false;
+  fclose(file);
+  return true;
+}
+
+static std::string
+ResolvePSOBinaryArchiveDirectory() {
+  auto cache_dir = EnsureTrailingSlash(dxmt::GetDXMTShaderCacheDirectory());
+  if (cache_dir.empty())
+    return {};
+
+  if (cache_dir.starts_with("/"))
+    return cache_dir;
+
+  if (cache_dir.size() >= 2 && cache_dir[1] == ':') {
+    auto unix_dir = env::getUnixPath(cache_dir);
+    return unix_dir.empty() ? std::string() : EnsureTrailingSlash(unix_dir);
+  }
+
+  auto darwin_cache_dir = GetDarwinUserCacheDirectory();
+  if (!darwin_cache_dir.empty())
+    return EnsureTrailingSlash(darwin_cache_dir + cache_dir);
+
+  auto unix_dir = env::getUnixPath(cache_dir);
+  if (!unix_dir.empty() && unix_dir.starts_with("/"))
+    return EnsureTrailingSlash(unix_dir);
+
+  return {};
 }
 
 static bool
@@ -968,6 +1065,36 @@ class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device,
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
       : adapter_(adapter), device_(std::move(device)) {
+    pso_binary_archive_enabled_ =
+        env::getEnvVar("DXMT_PSO_BINARY_ARCHIVE") == "1";
+    if (pso_binary_archive_enabled_) {
+      pso_binary_archive_serialize_every_ =
+          GetPSOBinaryArchiveSerializeEvery();
+      auto archive_base_dir = ResolvePSOBinaryArchiveDirectory();
+      pso_binary_archive_unix_dir_ =
+          archive_base_dir.empty()
+              ? std::string()
+              : EnsureTrailingSlash(archive_base_dir + "com.apple.metal4");
+      pso_binary_archive_unix_path_ =
+          pso_binary_archive_unix_dir_.empty()
+              ? std::string()
+              : pso_binary_archive_unix_dir_ + "dxmt_pso.binaryarchive";
+      pso_binary_archive_unavailable_path_ =
+          pso_binary_archive_unix_dir_.empty()
+              ? std::string()
+              : pso_binary_archive_unix_dir_ + "dxmt_pso_archive_unavailable.txt";
+      try {
+        if (!pso_binary_archive_unix_dir_.empty())
+          std::filesystem::create_directories(pso_binary_archive_unix_dir_);
+      } catch (const std::exception &e) {
+        WARN("D3D12Device: failed to create DXMT PSO binary archive directory ",
+             pso_binary_archive_unix_dir_, ": ", e.what());
+      } catch (...) {
+        WARN("D3D12Device: failed to create DXMT PSO binary archive directory ",
+             pso_binary_archive_unix_dir_);
+      }
+    }
+
     enqueue_set_event_signal_ = device_->device().newSharedEvent();
     multiple_fence_wait_signal_ = device_->device().newSharedEvent();
     DXGI_ADAPTER_DESC adapter_desc = {};
@@ -985,6 +1112,14 @@ public:
   }
 
   ~DeviceImpl() {
+    if (pso_binary_archive_enabled_) {
+      LogPSOBinaryArchiveMarker(
+          "DXMT_PSO_ARCHIVE: dtor reached enabled=%d have_archive=%d",
+          pso_binary_archive_enabled_ ? 1 : 0, pso_binary_archive_ ? 1 : 0);
+      if (pso_binary_archive_)
+        SerializePSOBinaryArchive("dtor", 0);
+    }
+
     if (local_kmt_) {
       D3DKMT_DESTROYDEVICE destroy = {};
       destroy.hDevice = local_kmt_;
@@ -1197,6 +1332,30 @@ public:
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
     return GetD3D12AdapterDevice(adapter_.ptr());
+  }
+
+  WMT::BinaryArchive *STDMETHODCALLTYPE GetPSOBinaryArchive() override {
+    return GetOrCreatePSOBinaryArchive();
+  }
+
+  std::mutex &STDMETHODCALLTYPE GetPSOBinaryArchiveMutex() override {
+    return pso_binary_archive_mutex_;
+  }
+
+  void STDMETHODCALLTYPE NotePSOBinaryArchivePipelineCreated() override {
+    if (!pso_binary_archive_enabled_ || !pso_binary_archive_serialize_every_)
+      return;
+
+    auto count = pso_binary_archive_successful_creates_.fetch_add(
+                     1, std::memory_order_relaxed) +
+                 1;
+    if (count != 1 && count % pso_binary_archive_serialize_every_)
+      return;
+
+    bool ok = SerializePSOBinaryArchive("periodic", count);
+    LogPSOBinaryArchiveMarker(
+        "DXMT_PSO_ARCHIVE: periodic serialize after %llu creates ok=%d",
+        static_cast<unsigned long long>(count), ok ? 1 : 0);
   }
 
   DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() override {
@@ -3248,6 +3407,134 @@ private:
     return static_cast<ID3D12Device *>(static_cast<DeviceComBase *>(this));
   }
 
+  WMT::BinaryArchive *GetOrCreatePSOBinaryArchive() {
+    if (!pso_binary_archive_enabled_)
+      return nullptr;
+
+    LogPSOBinaryArchiveMarker("DXMT_PSO_ARCHIVE: enter");
+
+    std::lock_guard lock(pso_binary_archive_mutex_);
+    if (pso_binary_archive_) {
+      LogPSOBinaryArchiveMarker("DXMT_PSO_ARCHIVE: return ok=1");
+      return static_cast<WMT::BinaryArchive *>(&pso_binary_archive_);
+    }
+
+    if (pso_binary_archive_unavailable_) {
+      LogPSOBinaryArchiveMarker("DXMT_PSO_ARCHIVE: return ok=0");
+      return nullptr;
+    }
+
+    WMT::Reference<WMT::Error> error;
+    const char *archive_path = nullptr;
+    try {
+      if (!pso_binary_archive_unix_dir_.empty())
+        std::filesystem::create_directories(pso_binary_archive_unix_dir_);
+      if (FileExists(pso_binary_archive_unix_path_))
+        archive_path = pso_binary_archive_unix_path_.c_str();
+    } catch (const std::exception &e) {
+      WARN("D3D12Device: failed to check DXMT PSO binary archive at ",
+           pso_binary_archive_unix_path_, ": ", e.what());
+    } catch (...) {
+      WARN("D3D12Device: failed to check DXMT PSO binary archive at ",
+           pso_binary_archive_unix_path_);
+    }
+
+    if (pso_binary_archive_unix_path_.empty()) {
+      pso_binary_archive_unavailable_ = true;
+      LogPSOBinaryArchiveMarker(
+          "DXMT_PSO_ARCHIVE: create cold=1 ok=0 err=empty unix path");
+      LogPSOBinaryArchiveMarker("DXMT_PSO_ARCHIVE: return ok=0");
+      return nullptr;
+    }
+
+    pso_binary_archive_ = GetMTLDevice().newBinaryArchive(archive_path, error);
+    LogPSOBinaryArchiveMarker(
+        "DXMT_PSO_ARCHIVE: create cold=%d ok=%d err=%s",
+        archive_path ? 0 : 1, pso_binary_archive_ ? 1 : 0,
+        error ? error.description().getUTF8String() : "");
+    if (error || !pso_binary_archive_) {
+      WARN("D3D12Device: failed to ",
+           archive_path ? "load" : "create",
+           " DXMT PSO binary archive at ", pso_binary_archive_unix_path_, ": ",
+           error ? error.description().getUTF8String() : "unknown error");
+      WritePSOBinaryArchiveUnavailableMarker(
+          archive_path ? "load" : "create",
+          error ? error.description().getUTF8String() : "newBinaryArchive returned null");
+      pso_binary_archive_ = {};
+      pso_binary_archive_unavailable_ = true;
+      LogPSOBinaryArchiveMarker("DXMT_PSO_ARCHIVE: return ok=0");
+      return nullptr;
+    }
+
+    LogPSOBinaryArchiveMarker("DXMT_PSO_ARCHIVE: return ok=1");
+    return static_cast<WMT::BinaryArchive *>(&pso_binary_archive_);
+  }
+
+  bool SerializePSOBinaryArchive(const char *reason, uint64_t count) {
+    if (!pso_binary_archive_enabled_)
+      return false;
+
+    std::lock_guard lock(pso_binary_archive_mutex_);
+    if (!pso_binary_archive_ || pso_binary_archive_unix_path_.empty())
+      return false;
+
+    try {
+      if (!pso_binary_archive_unix_dir_.empty())
+        std::filesystem::create_directories(pso_binary_archive_unix_dir_);
+      WMT::Reference<WMT::Error> error;
+      pso_binary_archive_.serialize(pso_binary_archive_unix_path_.c_str(),
+                                    error);
+      if (error) {
+        WARN("D3D12Device: failed to serialize DXMT PSO binary archive to ",
+             pso_binary_archive_unix_path_, ": ",
+             error.description().getUTF8String());
+        LogPSOBinaryArchiveMarker(
+            "DXMT_PSO_ARCHIVE: serialize reason=%s count=%llu ok=0 path=%s err=%s",
+            reason, static_cast<unsigned long long>(count),
+            pso_binary_archive_unix_path_.c_str(),
+            error.description().getUTF8String());
+        return false;
+      }
+
+      INFO("D3D12Device: DXMT PSO binary archive serialized to ",
+           pso_binary_archive_unix_path_);
+      LogPSOBinaryArchiveMarker(
+          "DXMT_PSO_ARCHIVE: serialize reason=%s count=%llu ok=1 path=%s err=",
+          reason, static_cast<unsigned long long>(count),
+          pso_binary_archive_unix_path_.c_str());
+      return true;
+    } catch (...) {
+      WARN("D3D12Device: failed to serialize DXMT PSO binary archive to ",
+           pso_binary_archive_unix_path_);
+      LogPSOBinaryArchiveMarker(
+          "DXMT_PSO_ARCHIVE: serialize reason=%s count=%llu ok=0 path=%s err=exception",
+          reason, static_cast<unsigned long long>(count),
+          pso_binary_archive_unix_path_.c_str());
+      return false;
+    }
+  }
+
+  void WritePSOBinaryArchiveUnavailableMarker(const char *operation,
+                                             const std::string &error) {
+    if (pso_binary_archive_unavailable_path_.empty())
+      return;
+
+    try {
+      std::filesystem::create_directories(pso_binary_archive_unix_dir_);
+    } catch (...) {
+    }
+
+    FILE *marker = fopen(pso_binary_archive_unavailable_path_.c_str(), "w");
+    if (!marker)
+      return;
+
+    fprintf(marker, "DXMT_PSO_BINARY_ARCHIVE unavailable\n");
+    fprintf(marker, "operation=%s\n", operation ? operation : "");
+    fprintf(marker, "archive_path=%s\n", pso_binary_archive_unix_path_.c_str());
+    fprintf(marker, "error=%s\n", error.c_str());
+    fclose(marker);
+  }
+
   D3D12_RESOURCE_ALLOCATION_INFO
   GetResourceAllocationInfoImpl(UINT visible_mask, UINT resource_desc_count,
                                 const D3D12_RESOURCE_DESC *resource_descs) const {
@@ -3948,6 +4235,15 @@ private:
   INT gpu_thread_priority_ = 0;
   uint64_t enqueue_set_event_value_ = 0;
   uint64_t multiple_fence_wait_value_ = 0;
+  WMT::Reference<WMT::BinaryArchive> pso_binary_archive_;
+  std::mutex pso_binary_archive_mutex_;
+  std::atomic<uint64_t> pso_binary_archive_successful_creates_ = 0;
+  uint64_t pso_binary_archive_serialize_every_ = 200;
+  bool pso_binary_archive_enabled_ = false;
+  bool pso_binary_archive_unavailable_ = false;
+  std::string pso_binary_archive_unix_dir_;
+  std::string pso_binary_archive_unix_path_;
+  std::string pso_binary_archive_unavailable_path_;
   std::string name_;
 };
 

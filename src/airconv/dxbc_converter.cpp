@@ -395,17 +395,10 @@ static auto get_cbuffer_in_buffer_table(
 
 // --- bindless-mirror slot-30/29 SHARED FLAT mirror read (textures + samplers) ---
 //
-// The slot-30 texture mirror and slot-29 sampler mirror are SINGLE shared flat
-// `constant ulong*` arrays, NOT a struct of per-resource arrays. Each descriptor
-// occupies `stride` consecutive qwords (texture stride 2: [handle, meta]; sampler
-// stride 3: [handle, cube_handle, lod_bias]) at the ABSOLUTE heap slot, exactly as
-// the runtime DescriptorHeapMirror writes them (see BINDLESS-ABI.md / sub-step ②).
-// The element qword index is `(root_base[arg_index] + local) * stride + qoff`,
-// where `local = operand_index - range.LowerBound`. The handle qword is bitcast to
-// the typed texture/sampler pointer via inttoptr (verified AIR-valid — Apple's AIR
-// verifier accepts inttoptr i64 -> %struct._texture_*/_sampler_t addrspace(1/2)*);
-// metadata qwords are returned as raw i64. This is the byte-identical mirror of how
-// the slot-27 buffer table is read, just with a stride and a root_base.
+// Texture/sampler handles must be loaded from typed argument-buffer entries so
+// Metal lowers them as real indirect texture/sampler arguments. Metadata stays in
+// the same raw qword mirror layout. Each descriptor occupies `stride` entries at
+// the absolute heap slot: texture [handle, meta], sampler [handle, cube, lod_bias].
 static llvm::Value *
 mirror_flat_qword_index(
     context &ctx, pvalue dyn_index, uint32_t root_offset_arg_index,
@@ -435,8 +428,12 @@ static auto get_mirror_qword_flat(
     return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
       auto mirror = ctx.function->getArg(mirror_index);
       auto i64 = ctx.builder.getInt64Ty();
+      auto mirror_as_qwords = ctx.builder.CreateBitCast(
+          mirror, i64->getPointerTo(
+                      llvm::cast<llvm::PointerType>(mirror->getType())
+                          ->getAddressSpace()));
       auto elem_ptr = ctx.builder.CreateGEP(
-          i64, mirror,
+          i64, mirror_as_qwords,
           mirror_flat_qword_index(
               ctx, dyn_index, root_offset_arg_index, arg_index,
               range_lower_bound, stride, qword_offset));
@@ -445,24 +442,32 @@ static auto get_mirror_qword_flat(
   };
 }
 
-// Texture/sampler HANDLE: load the qword then inttoptr to the typed handle pointer.
-// `handle_type_fn(ctx)` yields the destination pointer type (texture addrspace(1)
-// or sampler addrspace(2)); deferred to build time because the LLVM type is per
-// module context.
 template <typename HandleTypeFn>
-static auto get_mirror_handle_flat(
+static auto get_mirror_typed_handle_flat(
     uint32_t mirror_index, uint32_t root_offset_arg_index, uint32_t arg_index,
     uint32_t range_lower_bound, uint32_t stride, uint32_t qword_offset,
     HandleTypeFn handle_type_fn) {
   return [=](pvalue dyn_index) {
     return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
-      auto address = get_mirror_qword_flat(
-          mirror_index, root_offset_arg_index, arg_index, range_lower_bound,
-          stride, qword_offset)(dyn_index)
-          .build(ctx);
-      if (auto err = address.takeError())
-        return std::move(err);
-      return ctx.builder.CreateIntToPtr(address.get(), handle_type_fn(ctx));
+      auto mirror = ctx.function->getArg(mirror_index);
+      auto mirror_struct_type = llvm::cast<llvm::StructType>(
+          llvm::cast<llvm::PointerType>(mirror->getType())
+              ->getNonOpaquePointerElementType());
+      auto handle_type = handle_type_fn(ctx);
+      auto array_ty = llvm::ArrayType::get(handle_type,
+                                           kBindlessMirrorCapacity * stride);
+      auto array_ptr = ctx.builder.CreateStructGEP(mirror_struct_type, mirror, 0);
+      array_ptr = ctx.builder.CreateBitCast(
+          array_ptr, array_ty->getPointerTo(
+                         llvm::cast<llvm::PointerType>(array_ptr->getType())
+                             ->getAddressSpace()));
+      auto element_ptr = ctx.builder.CreateGEP(
+          array_ty, array_ptr,
+          {ctx.builder.getInt32(0),
+           mirror_flat_qword_index(ctx, dyn_index, root_offset_arg_index,
+                                   arg_index, range_lower_bound, stride,
+                                   qword_offset)});
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
     });
   };
 }
@@ -600,6 +605,51 @@ bindless_buffer_table_qword_count(const ShaderInfo *shader_info) {
 static constexpr uint32_t kBindlessTextureMirrorStride = 2; // [handle, meta]
 static constexpr uint32_t kBindlessSamplerMirrorStride = 3; // [handle, cube, lod_bias]
 
+static auto
+build_flat_texture_mirror_struct(const ShaderInfo *shader_info,
+                                 llvm::LLVMContext &context,
+                                 const llvm::DataLayout &layout) {
+  air::ArgumentBufferBuilder builder;
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    const auto access = srv.sampled ? air::MemoryAccess::sample
+                                    : air::MemoryAccess::read;
+    builder.DefineTexture(
+        "tex_mirror_t" + std::to_string(range_id),
+        air::to_air_resource_type(srv.resource_type, srv.compared), access,
+        air::to_air_scaler_type(srv.scaler_type),
+        /*location_index=*/0, std::nullopt,
+        kBindlessMirrorCapacity * kBindlessTextureMirrorStride);
+    return builder.Build(context, layout);
+  }
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    const auto access =
+        uav.written ? (uav.read ? air::MemoryAccess::read_write
+                                : air::MemoryAccess::write)
+                    : air::MemoryAccess::read;
+    builder.DefineTexture(
+        "tex_mirror_u" + std::to_string(range_id),
+        air::to_air_resource_type(uav.resource_type), access,
+        air::to_air_scaler_type(uav.scaler_type),
+        /*location_index=*/0, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        kBindlessMirrorCapacity * kBindlessTextureMirrorStride);
+    return builder.Build(context, layout);
+  }
+  return builder.Build(context, layout);
+}
+
+static auto
+build_flat_sampler_mirror_struct(llvm::LLVMContext &context,
+                                 const llvm::DataLayout &layout) {
+  air::ArgumentBufferBuilder builder;
+  builder.DefineSampler("sampler_mirror", /*location_index=*/0,
+                        kBindlessMirrorCapacity * kBindlessSamplerMirrorStride);
+  return builder.Build(context, layout);
+}
+
 // True if the shader references any TEXTURE-mirror resource (SRV/UAV texture or a
 // TextureBuffer, which carries a gpu_resource_id and lives in the texture mirror).
 // Buffer SRV/UAV (NonApplicable) go to the slot-27 buffer table, not here.
@@ -687,35 +737,38 @@ void setup_binding_table(
       });
   }
 
-  // Bindless-mirror slot-30 TEXTURE mirror + slot-29 SAMPLER mirror: single shared
-  // flat `constant ulong*` arrays indexed by absolute heap slot (see BINDLESS-ABI.md
-  // and the runtime DescriptorHeapMirror). Each is defined only if the shader
-  // actually uses that resource class, so unused slots stay unbound.
+  // Bindless-mirror slot-30 TEXTURE mirror + slot-29 SAMPLER mirror. Handles are
+  // typed indirect argument-buffer entries; metadata is read from the same bytes
+  // as raw qwords.
   uint32_t texture_mirror_index = ~0u;
   uint32_t sampler_mirror_index = ~0u;
   if (gBindlessMirror && bindless_uses_texture_mirror(shader_info)) {
-    texture_mirror_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
-      .buffer_size = std::nullopt,
-      .location_index = kBindlessTextureMirrorBindIndex, // 30
-      .array_size = 1,
-      .memory_access = air::MemoryAccess::read,
-      .address_space = air::AddressSpace::constant,
-      .type = air::msl_ulong,
-      .arg_name = "tex_mirror",
-      .raster_order_group = std::nullopt,
-    });
+    auto [type, metadata] = build_flat_texture_mirror_struct(
+        shader_info, module.getContext(), module.getDataLayout());
+    texture_mirror_index =
+      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+        .location_index = kBindlessTextureMirrorBindIndex, // 30
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .struct_type = type,
+        .struct_type_info = metadata,
+        .arg_name = "tex_mirror",
+      });
   }
   if (gBindlessMirror && bindless_uses_sampler_mirror(shader_info)) {
-    sampler_mirror_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
-      .buffer_size = std::nullopt,
-      .location_index = kBindlessSamplerMirrorBindIndex, // 29
-      .array_size = 1,
-      .memory_access = air::MemoryAccess::read,
-      .address_space = air::AddressSpace::constant,
-      .type = air::msl_ulong,
-      .arg_name = "sampler_mirror",
-      .raster_order_group = std::nullopt,
-    });
+    auto [type, metadata] =
+        build_flat_sampler_mirror_struct(module.getContext(), module.getDataLayout());
+    sampler_mirror_index =
+      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+        .location_index = kBindlessSamplerMirrorBindIndex, // 29
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .struct_type = type,
+        .struct_type_info = metadata,
+        .arg_name = "sampler_mirror",
+      });
   }
   if (!gBindlessMirror && !shader_info->binding_table_cbuffer.Empty()) {
     auto [type, metadata] = shader_info->binding_table_cbuffer.Build(
@@ -786,14 +839,10 @@ void setup_binding_table(
     };
   };
 
-  // Bindless-mirror TEXTURE-handle read (slot-30 flat array, stride 2): load the
-  // handle qword and inttoptr to the typed texture pointer (built from the
-  // resource's MSLTexture, so the addrspace(1) + struct kind match the load
-  // intrinsic). `root_key` (== arg_index) selects the root_offsets base slot. The
-  // pointer type is resolved at build time from the per-build LLVMContext (ctx.llvm).
+  // Bindless-mirror TEXTURE-handle read (slot-30 flat typed array, stride 2).
   auto read_tex_handle = [=](const air::MSLTexture &tex, uint32_t root_key,
                              uint32_t lower_bound) -> IndexedIRValue {
-    return get_mirror_handle_flat(
+    return get_mirror_typed_handle_flat(
       texture_mirror_index, root_offset_index, root_key, lower_bound,
       kBindlessTextureMirrorStride, /*qword_offset=*/0,
       [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); });
@@ -805,11 +854,11 @@ void setup_binding_table(
                                 lower_bound, kBindlessTextureMirrorStride,
                                 /*qword_offset=*/1);
   };
-  // SAMPLER read (slot-29 flat array, stride 3): handle at qw0, cube handle at qw1
-  // (both inttoptr to %struct._sampler_t addrspace(2)*), lod_bias bits at qw2 (i64).
+  // SAMPLER read (slot-29 flat typed array, stride 3): handle at qw0, cube
+  // handle at qw1, lod_bias bits at qw2 (i64).
   auto read_sampler_handle = [=](uint32_t root_key, uint32_t lower_bound,
                                  uint32_t qword_offset) -> IndexedIRValue {
-    return get_mirror_handle_flat(
+    return get_mirror_typed_handle_flat(
       sampler_mirror_index, root_offset_index, root_key, lower_bound,
       kBindlessSamplerMirrorStride, qword_offset,
       [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); });
@@ -869,7 +918,7 @@ void setup_binding_table(
         .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
         .resource_kind_logical = texture_kind_logical,
       };
-      // Texture handle: bindless = slot-30 flat mirror (inttoptr); legacy = packed
+      // Texture handle: bindless = slot-30 typed flat mirror; legacy = packed
       // struct field (or the texture-srv prototype path).
       auto handle =
         gBindlessMirror
