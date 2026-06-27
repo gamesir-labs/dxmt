@@ -2175,12 +2175,12 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(*record);
     record->type = DescriptorRecordType::Sampler;
     if (desc) {
       record->desc.sampler = *desc;
       record->has_desc = true;
     }
+    BumpDescriptorContentGenerationForWrite(*record);
     MarkDescriptorMirrorStaleForWrite(*record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_sampler(this, desc, descriptor);

@@ -51,30 +51,13 @@ D3D12PipelineDiagEnabled() {
   return enabled;
 }
 
-static uint32_t
-D3D12PipelineDiagLimit() {
-  static const uint32_t limit = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_PIPELINE_LIMIT");
-    if (value.empty())
-      value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
-    if (value.empty())
-      return 512u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 512u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return limit;
-}
-
 static bool
 D3D12PipelineDiagShouldLog() {
   static std::atomic<uint32_t> count = 0;
   if (!D3D12PipelineDiagEnabled())
     return false;
-  return count.fetch_add(1, std::memory_order_relaxed) <
-         D3D12PipelineDiagLimit();
+  count.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 static bool
@@ -82,6 +65,20 @@ D3D12AttachmentlessPsoSampleCountWarnShouldLog() {
   static std::atomic<uint64_t> count = 0;
   const auto occurrence = count.fetch_add(1, std::memory_order_relaxed) + 1;
   return occurrence == 1 || (occurrence & (occurrence - 1)) == 0;
+}
+
+static bool
+BindlessUsesSamplerMirror(const PipelineDxilShader &shader) {
+  const auto *arguments = shader.resourceArgumentInfo();
+  if (!arguments)
+    return false;
+
+  for (uint32_t i = 0; i < shader.reflection().NumArguments; i++) {
+    if (arguments[i].Type == SM50BindingType::Sampler)
+      return true;
+  }
+
+  return false;
 }
 
 static std::string
@@ -103,6 +100,61 @@ constexpr uint32_t kShaderKindGeometry = 2;
 constexpr uint32_t kShaderKindHull = 3;
 constexpr uint32_t kShaderKindDomain = 4;
 constexpr uint32_t kShaderKindCompute = 5;
+
+constexpr uint32_t kBindlessBufferTableBindIndex = 27;
+constexpr uint32_t kBindlessRootOffsetBindIndex = 28;
+constexpr uint32_t kBindlessSamplerMirrorBindIndex = 29;
+constexpr uint32_t kBindlessTextureMirrorBindIndex = 30;
+
+static uint32_t
+BufferBindingBit(uint32_t index) {
+  return 1u << index;
+}
+
+static bool
+BindlessUsesTextureMirror(const PipelineDxilShader &shader) {
+  const auto *arguments = shader.resourceArgumentInfo();
+  if (!arguments)
+    return false;
+
+  for (uint32_t i = 0; i < shader.reflection().NumArguments; i++) {
+    if ((arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) &&
+        !(arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER))
+      return true;
+  }
+
+  return false;
+}
+
+static bool
+BindlessUsesBufferTable(const PipelineDxilShader &shader) {
+  if (shader.reflection().NumConstantBuffers)
+    return true;
+
+  const auto *arguments = shader.resourceArgumentInfo();
+  if (!arguments)
+    return false;
+
+  for (uint32_t i = 0; i < shader.reflection().NumArguments; i++) {
+    if (arguments[i].Flags & (MTL_SM50_SHADER_ARGUMENT_BUFFER |
+                              MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER))
+      return true;
+  }
+
+  return false;
+}
+
+static uint32_t
+BindlessImmutableBufferMask(const PipelineDxilShader &shader) {
+  uint32_t mask = BufferBindingBit(kBindlessRootOffsetBindIndex);
+  if (BindlessUsesBufferTable(shader))
+    mask |= BufferBindingBit(kBindlessBufferTableBindIndex);
+  if (BindlessUsesSamplerMirror(shader))
+    mask |= BufferBindingBit(kBindlessSamplerMirrorBindIndex);
+  if (BindlessUsesTextureMirror(shader))
+    mask |= BufferBindingBit(kBindlessTextureMirrorBindIndex);
+  return mask;
+}
 
 constexpr WMTCompareFunction kCompareFunctionMap[] = {
     WMTCompareFunctionNever, WMTCompareFunctionNever, WMTCompareFunctionLess,
@@ -1399,8 +1451,10 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
 
 bool
 PersistentAirCacheEnabled() {
-  // Default ON; set DXMT_D3D12_PERSISTENT_SHADER_CACHE=0 to disable (A/B).
+  // Default ON; DXMT_SHADER_CACHE=0 must disable every persistent shader cache
+  // user, including this D3D12 AIR-bitcode layer.
   static const bool on =
+      env::getEnvVar("DXMT_SHADER_CACHE") != "0" &&
       env::getEnvVar("DXMT_D3D12_PERSISTENT_SHADER_CACHE") != "0";
   return on;
 }
@@ -1414,7 +1468,7 @@ Sha1Digest
 BuildPersistentAirCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
                            std::string_view shader_cache_key, bool bindless) {
   Sha1HashState hash;
-  HashString(hash, "dxmt-d3d12-persistent-air-cache-v1");
+  HashString(hash, "dxmt-d3d12-persistent-air-cache-v2");
   // Fold the DXMT build version (git short hash, regenerated per build) into
   // the key so the cache auto-invalidates whenever airconv codegen could have
   // changed — closes the stale-AIR risk without relying on bumping a manual
@@ -2002,17 +2056,14 @@ CreateDepthStencilState(IMTLD3D12Device *device,
 // (PipelineStateImpl::UsesBindlessMirror, the draw-path gate), so a PSO compiled
 // as bindless is read back as bindless over the identical predicate/shaders.
 bool
-PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders) {
+PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders,
+                    const RootSignature *root_signature) {
   static const bool env_on = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
   if (!env_on)
     return false;
-  const PipelineDxilShader *vs = nullptr;
-  const PipelineDxilShader *ps = nullptr;
+  if (root_signature && !root_signature->GetStaticSamplers().empty())
+    return false;
   for (const auto &shader : shaders) {
-    if (shader.stage == PipelineShaderStage::Vertex)
-      vs = &shader;
-    else if (shader.stage == PipelineShaderStage::Pixel)
-      ps = &shader;
     // Stage-1 covers SM5/DXBC single-stage VS/PS/CS only. DXIL (SM6) airconv
     // path does not thread the bindless flag; HS/DS/GS use separate compile
     // entries (CompileTessellation*/CompileGeometry*) that also don't thread it,
@@ -2034,6 +2085,7 @@ bool
 CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                             std::vector<PipelineDxilShader> &shaders,
                             const PipelineGraphicsState &state,
+                            const RootSignature *root_signature,
                             std::string_view shader_cache_key,
                             PipelineMetalGraphicsState &out) {
   auto *vs = const_cast<PipelineDxilShader *>(
@@ -2055,13 +2107,11 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // Bindless off-gate: insert one SM50_SHADER_BINDLESS_MIRROR node between every
-  // stage's args head and &common. `enabled` carries PsoBindlessEligible so a
-  // non-eligible PSO folds the same disabled node + cache key as legacy (no
-  // collision); `pso_bindless` also threads into both shader cache keys via the
-  // CompileMetalFunction calls below. Stack-local; alive for the synchronous
-  // CompileMetalFunction calls that follow.
-  const bool pso_bindless = PsoBindlessEligible(shaders);
+  // Bindless off-gate: only eligible PSOs receive the bindless-mirror args node.
+  // Non-eligible PSOs, including DXIL and geometry/tessellation paths, must keep
+  // the exact legacy compilation argument chain so the environment toggle cannot
+  // perturb their AIR layout or reflection.
+  const bool pso_bindless = PsoBindlessEligible(shaders, root_signature);
   SM50_SHADER_BINDLESS_MIRROR_DATA bindless_node = {};
   bindless_node.type = SM50_SHADER_BINDLESS_MIRROR;
   bindless_node.enabled = pso_bindless;
@@ -2081,7 +2131,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
   ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-  ia_layout.next = &bindless_node;
+  ia_layout.next = pso_bindless
+                       ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
+                       : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
   ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
   ia_layout.slot_mask = slot_mask;
   ia_layout.num_elements = uint32_t(input_elements.size());
@@ -2114,7 +2166,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (ps) {
     SM50_SHADER_PSO_PIXEL_SHADER_DATA ps_args = {};
     ps_args.type = SM50_SHADER_PSO_PIXEL_SHADER;
-    ps_args.next = &bindless_node;
+    ps_args.next = pso_bindless
+                       ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
+                       : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
     ps_args.sample_mask = state.desc.SampleMask;
     ps_args.dual_source_blending =
         UsesDualSourceBlending(state.desc.BlendState);
@@ -2339,8 +2393,18 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   info.raster_sample_count = state.desc.SampleDesc.Count;
   info.input_primitive_topology =
       GetTopologyClass(state.desc.PrimitiveTopologyType);
-  info.immutable_vertex_buffers = (1 << 16) | (1 << 29) | (1 << 30);
-  info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+  info.immutable_vertex_buffers = BufferBindingBit(16);
+  info.immutable_fragment_buffers = 0;
+  if (pso_bindless) {
+    info.immutable_vertex_buffers |= BindlessImmutableBufferMask(*vs);
+    if (ps)
+      info.immutable_fragment_buffers |= BindlessImmutableBufferMask(*ps);
+  } else {
+    info.immutable_vertex_buffers |=
+        BufferBindingBit(29) | BufferBindingBit(30);
+    info.immutable_fragment_buffers |=
+        BufferBindingBit(29) | BufferBindingBit(30);
+  }
 
   for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
     if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
@@ -2370,6 +2434,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 bool
 CreateMetalComputePipeline(IMTLD3D12Device *device,
                            std::vector<PipelineDxilShader> &shaders,
+                           const RootSignature *root_signature,
                            std::string_view shader_cache_key,
                            PipelineMetalComputeState &out) {
   auto *cs = const_cast<PipelineDxilShader *>(
@@ -2383,9 +2448,9 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // Bindless off-gate (see CreateMetalGraphicsPipeline): node between the CS
-  // args head and &common; `enabled`/`pso_bindless` carry PsoBindlessEligible.
-  const bool pso_bindless = PsoBindlessEligible(shaders);
+  // Bindless off-gate (see CreateMetalGraphicsPipeline): only eligible compute
+  // PSOs receive the bindless-mirror args node.
+  const bool pso_bindless = PsoBindlessEligible(shaders, root_signature);
   SM50_SHADER_BINDLESS_MIRROR_DATA bindless_node = {};
   bindless_node.type = SM50_SHADER_BINDLESS_MIRROR;
   bindless_node.enabled = pso_bindless;
@@ -2395,14 +2460,18 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   D3D12DumpPipelineShaders("compute", shader_cache_key, shaders, nullptr,
                            nullptr);
   if (!CompileMetalFunction(device, *cs, cs_name.c_str(),
-                            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node),
+                            pso_bindless
+                                ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
+                                : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
                             out.compute, shader_cache_key, pso_bindless))
     return false;
 
   WMTComputePipelineInfo info = {};
   WMT::InitializeComputePipelineInfo(info);
   info.compute_function = out.compute.function;
-  info.immutable_buffers = (1 << 29) | (1 << 30);
+  info.immutable_buffers = pso_bindless
+                               ? BindlessImmutableBufferMask(*cs)
+                               : (BufferBindingBit(29) | BufferBindingBit(30));
   const auto tgx = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[0]);
   const auto tgy = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[1]);
   const auto tgz = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[2]);
@@ -3116,7 +3185,7 @@ public:
                               shader_cache_key_);
     // Same predicate over the same shaders the compile path uses, so the
     // runtime draw-path gate matches the AIR that was actually compiled.
-    uses_bindless_mirror_ = PsoBindlessEligible(shaders_);
+    uses_bindless_mirror_ = PsoBindlessEligible(shaders_, root_signature_.ptr());
   }
 
   ~PipelineStateImpl() {
@@ -3218,7 +3287,8 @@ public:
     if (!metal_graphics_ready_) {
       metal_graphics_ready_ = true;
       if (!CreateMetalGraphicsPipeline(device_.ptr(), shaders_, graphics_state_,
-                                       shader_cache_key_, metal_graphics_))
+                                       root_signature_.ptr(), shader_cache_key_,
+                                       metal_graphics_))
         metal_graphics_ = {};
     }
 
@@ -3233,7 +3303,8 @@ public:
     if (!metal_compute_ready_) {
       metal_compute_ready_ = true;
       if (!CreateMetalComputePipeline(device_.ptr(), shaders_,
-                                      shader_cache_key_, metal_compute_))
+                                      root_signature_.ptr(), shader_cache_key_,
+                                      metal_compute_))
         metal_compute_ = {};
     }
 

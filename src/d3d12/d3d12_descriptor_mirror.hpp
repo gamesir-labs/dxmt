@@ -18,12 +18,12 @@ namespace dxmt::d3d12 {
  *
  * A D3D12 descriptor heap has a single type, so each shader-visible heap backs exactly
  * one mirror array:
- *   - CBV_SRV_UAV heap -> a TEXTURE mirror: [NumDescriptors x kMirrorTextureQwords] u64,
- *     element = (gpuResourceID, TextureMetadata). Buffers (CBV/SRV/UAV buffer) are NOT
- *     stored here (hybrid ABI: their gpuAddress churns per-draw via ring-buffer
+ *   - CBV_SRV_UAV heap -> a planar TEXTURE mirror: typed texture handles first,
+ *     followed by uint64 metadata. Buffers (CBV/SRV/UAV buffer) are NOT stored
+ *     here (hybrid ABI: their gpuAddress churns per-draw via ring-buffer
  *     sub-allocation, so they go to a per-draw buffer table owned by sub-step ③).
- *   - SAMPLER heap -> a SAMPLER mirror: [NumDescriptors x kMirrorSamplerQwords] u64,
- *     element = (handle, cube_handle, lod_bias_bits).
+ *   - SAMPLER heap -> a planar SAMPLER mirror: typed sampler handles, cube
+ *     sampler handles, then uint64 lod-bias metadata.
  *
  * The buffer is Metal shared-storage so the CPU writes the payload and the GPU reads it
  * indirectly as an argument buffer (bound at slot 30 by sub-step ③). It is sized to the
@@ -54,16 +54,39 @@ public:
   uint32_t numDescriptors() const { return num_descriptors_; }
   bool isSamplerHeap() const { return sampler_heap_; }
 
-  /** Per-slot qword stride of this mirror's array. */
-  uint32_t qwordStride() const {
-    return sampler_heap_ ? kMirrorSamplerQwords : kMirrorTextureQwords;
+  /** Pointer to a texture slot's handle qword. */
+  uint64_t *textureHandlePtr(uint32_t index) {
+    if (sampler_heap_ || !mapped_ || index >= num_descriptors_)
+      return nullptr;
+    return mapped_ + index;
   }
 
-  /** Pointer to the first qword of slot `index` in the CPU-mapped mirror, or null. */
-  uint64_t *slotPtr(uint32_t index) {
+  /** Pointer to a texture slot's metadata qword. */
+  uint64_t *textureMetadataPtr(uint32_t index) {
+    if (sampler_heap_ || !mapped_ || index >= num_descriptors_)
+      return nullptr;
+    return mapped_ + num_descriptors_ + index;
+  }
+
+  /** Pointer to a sampler slot's primary sampler qword. */
+  uint64_t *samplerHandlePtr(uint32_t index) {
+    if (!sampler_heap_ || !mapped_ || index >= num_descriptors_)
+      return nullptr;
+    return mapped_ + index;
+  }
+
+  /** Pointer to a sampler slot's cube sampler qword. */
+  uint64_t *samplerCubeHandlePtr(uint32_t index) {
+    if (!sampler_heap_ || !mapped_ || index >= num_descriptors_)
+      return nullptr;
+    return mapped_ + num_descriptors_ + index;
+  }
+
+  /** Pointer to a sampler slot's lod-bias qword. */
+  uint64_t *samplerLodBiasPtr(uint32_t index) {
     if (!mapped_ || index >= num_descriptors_)
       return nullptr;
-    return mapped_ + (uint64_t)index * qwordStride();
+    return mapped_ + uint64_t(num_descriptors_) * 2 + index;
   }
 
   /**
@@ -79,6 +102,12 @@ public:
    * record there). Byte-identical via the shared writer.
    */
   void FillTextureSlot(uint32_t index, uint64_t gpu_resource_id, uint32_t array_length);
+
+  /** Fill a TEXTURE slot with an already-encoded handle/metadata pair. */
+  void FillTextureSlotPayload(uint32_t index, uint64_t handle, uint64_t metadata);
+
+  /** Clear a TEXTURE slot and mark the current stale generation as handled. */
+  void ClearTextureSlot(uint32_t index);
 
   /**
    * Mark a slot stale (app thread). The slot's content generation is recorded so the

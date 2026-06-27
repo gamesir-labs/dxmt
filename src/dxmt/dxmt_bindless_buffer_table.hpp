@@ -43,13 +43,13 @@ namespace dxmt {
 
 /**
  * Mirror/array GEP-typing capacity for an UNBOUNDED descriptor range (range.size ==
- * UINT_MAX). MUST equal airconv's kBindlessMirrorCapacity (dxbc_converter.hpp, 1<<20):
+ * UINT_MAX). MUST equal airconv's kBindlessMirrorCapacity (dxbc_converter.hpp):
  * the two sides assign compact bases by the same walk, so an unbounded range must
  * reserve the same qword count on both. (Defined locally to avoid pulling the heavy
  * airconv-internal dxbc_converter.hpp into the runtime; the value is a frozen ABI
  * constant — see BINDLESS-ABI.md §4.5 / §5.4.)
  */
-static constexpr uint32_t kBindlessMirrorCapacity = 1u << 20;
+static constexpr uint32_t kBindlessMirrorCapacity = 128;
 
 /** qword stride of one buffer descriptor in buf_table (qw0=address, qw1=meta). */
 static constexpr uint32_t kBufferTableQwordsPerDescriptor = 2;

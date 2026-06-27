@@ -8,8 +8,9 @@ namespace dxmt::d3d12 {
 
 DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_descriptors, bool sampler_heap)
     : num_descriptors_(num_descriptors), sampler_heap_(sampler_heap) {
-  const uint32_t stride = sampler_heap_ ? kMirrorSamplerQwords : kMirrorTextureQwords;
-  const uint64_t length = (uint64_t)num_descriptors_ * stride * sizeof(uint64_t);
+  const uint32_t plane_count = sampler_heap_ ? 3 : 2;
+  const uint64_t length =
+      uint64_t(num_descriptors_) * plane_count * sizeof(uint64_t);
 
   WMTBufferInfo info = {};
   info.length = length ? length : sizeof(uint64_t);
@@ -31,28 +32,62 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
   std::memset(mapped_, 0, info.length);
 
   stale_generation_.assign(num_descriptors_, 0);
-  filled_generation_.assign(num_descriptors_, 0);
+  filled_generation_.assign(num_descriptors_, UINT64_MAX);
 }
 
 void
 DescriptorHeapMirror::FillSamplerSlot(uint32_t index, const Sampler *sampler, uint64_t dummy_handle) {
-  auto *dst = slotPtr(index);
-  if (!dst)
+  auto *handle = samplerHandlePtr(index);
+  auto *cube = samplerCubeHandlePtr(index);
+  auto *lod_bias = samplerLodBiasPtr(index);
+  if (!handle || !cube || !lod_bias)
     return;
+  uint64_t encoded[kMirrorSamplerQwords] = {};
   if (sampler)
-    EncodeMirrorSamplerSlot(dst, *sampler);
+    EncodeMirrorSamplerSlot(encoded, *sampler);
   else
-    EncodeMirrorSamplerSlotNull(dst, dummy_handle);
+    EncodeMirrorSamplerSlotNull(encoded, dummy_handle);
+  *handle = encoded[0];
+  *cube = encoded[1];
+  *lod_bias = encoded[2];
   if (index < filled_generation_.size())
     filled_generation_[index] = stale_generation_[index];
 }
 
 void
 DescriptorHeapMirror::FillTextureSlot(uint32_t index, uint64_t gpu_resource_id, uint32_t array_length) {
-  auto *dst = slotPtr(index);
-  if (!dst)
+  auto *handle = textureHandlePtr(index);
+  auto *metadata = textureMetadataPtr(index);
+  if (!handle || !metadata)
     return;
-  EncodeMirrorTextureSlot(dst, gpu_resource_id, array_length);
+  uint64_t encoded[kMirrorTextureQwords] = {};
+  EncodeMirrorTextureSlot(encoded, gpu_resource_id, array_length);
+  *handle = encoded[0];
+  *metadata = encoded[1];
+  if (index < filled_generation_.size())
+    filled_generation_[index] = stale_generation_[index];
+}
+
+void
+DescriptorHeapMirror::FillTextureSlotPayload(uint32_t index, uint64_t handle_payload, uint64_t metadata_payload) {
+  auto *handle = textureHandlePtr(index);
+  auto *metadata = textureMetadataPtr(index);
+  if (!handle || !metadata)
+    return;
+  *handle = handle_payload;
+  *metadata = metadata_payload;
+  if (index < filled_generation_.size())
+    filled_generation_[index] = stale_generation_[index];
+}
+
+void
+DescriptorHeapMirror::ClearTextureSlot(uint32_t index) {
+  auto *handle = textureHandlePtr(index);
+  auto *metadata = textureMetadataPtr(index);
+  if (!handle || !metadata)
+    return;
+  *handle = 0;
+  *metadata = 0;
   if (index < filled_generation_.size())
     filled_generation_[index] = stale_generation_[index];
 }

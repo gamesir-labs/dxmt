@@ -255,8 +255,9 @@ struct RenderEncoderData : EncoderData {
   bool use_visibility_result = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
-  // Bindless-mirror (③.3) mixed-PSO guard: true after a bindless draw rebinds slots 29/30 to
-  // the persistent mirrors; a following legacy draw restores the per-pass argbuf there first.
+  // Bindless-mirror (③.3) mixed-PSO guard: true after a bindless draw rebinds
+  // argument-buffer slots used by legacy shaders; a following legacy draw
+  // restores the per-pass argbuf there first.
   bool bindless_mirror_bound_29_30 = false;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
@@ -669,7 +670,8 @@ public:
   template <PipelineStage stage, PipelineKind kind>
   void packBindlessCBuffers(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-      uint64_t *buf_table, uint32_t buf_table_qwords, const uint32_t *cb_compact
+      uint64_t *buf_table, uint32_t buf_table_qwords, const uint32_t *cb_compact,
+      const ConstantBufferBinding *bindings = nullptr
   );
   template <PipelineStage stage, PipelineKind kind>
   void packBindlessBufferTable(
@@ -704,7 +706,9 @@ public:
                     const MTL_SM50_SHADER_ARGUMENT *arguments,
                     const std::string &shader_hash,
                     uint64_t verify_draw_id = 0,
-                    uint64_t verify_draw_serial = 0);
+                    uint64_t verify_draw_serial = 0,
+                    const ConstantBufferBinding *cb_bindings = nullptr,
+                    const ShaderResourceBindingSnapshot *resource_bindings = nullptr);
 
   // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
   // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null
@@ -713,18 +717,16 @@ public:
   // argbuf at 29/30 (mixed-PSO guard). Vertex→WMTRenderStageVertex, Pixel→WMTRenderStageFragment,
   // Compute uses the compute setargumentbuffer (no stages).
   template <PipelineStage stage>
-  void bindBindlessTables(WMT::Buffer buf_table, WMT::Buffer root_offsets,
-                          WMT::Buffer tex_mirror, WMT::Buffer sampler_mirror);
+  void bindBindlessTables(const AllocatedArgumentBufferSlice &buf_table,
+                          const AllocatedArgumentBufferSlice &root_offsets,
+                          const AllocatedArgumentBufferSlice &tex_mirror,
+                          const AllocatedArgumentBufferSlice &sampler_mirror);
 
-  // Bindless-mirror (Stage-1 sub-step ③.3) mixed-PSO guard: if the current encoder's last 29/30
-  // bind was a bindless mirror (a prior bindless draw rebound them), restore the per-pass argbuf
-  // (currentRenderEncoder()->allocated_argbuf / compute analog) WHOLE at slots 29/30 (render: both
-  // Vertex+Fragment, as the flush-time bind does) so a following LEGACY draw's
-  // setArgumentBufferOffset(30) reads the per-pass argbuf, not the mirror. No-op when the flag is
-  // clear. Called ONCE per legacy draw at the top of the legacy encode branch (bindless-after-
-  // legacy needs no guard — bindless rebinds 29/30 anyway). `compute` selects render-vs-compute.
+  // Bindless-mirror (Stage-1 sub-step ③.3) mixed-PSO guard: if the current encoder's bindless
+  // draw rebound legacy argument-buffer slots, restore the per-pass argbuf before a following
+  // legacy draw emits setArgumentBufferOffset commands. `compute` selects render-vs-compute.
   template <bool compute>
-  void restorePerPassArgbufIfMirrorBound();
+  bool restorePerPassArgbufIfMirrorBound();
 
   void retainAllocation(Allocation* allocation);
 

@@ -472,10 +472,11 @@ constexpr uint32_t kArgumentBufferBindIndex = 30;
 
 // --- bindless-mirror ABI (see fh4-debug/BINDLESS-ABI.md) ---
 // Capacity declared for each per-resource typed mirror array in AIR. This is the
-// LLVM ArrayType bound used for in-bounds GEP typing only; the runtime binds the
-// real (larger) persistent heap-mirror buffer, and guarantees that
-// root_base + reflected_local_index stays within the bound region for any draw.
-constexpr uint32_t kBindlessMirrorCapacity = 1u << 20; // 1,048,576 descriptors
+// per-stage descriptor window size, not the D3D12 heap size. Runtime compacts the
+// descriptor ranges a shader can index into this window and writes root_offsets in
+// window-relative coordinates. This keeps Metal argument-buffer materialization
+// bounded while the owning D3D12 heap may still contain far more descriptors.
+constexpr uint32_t kBindlessMirrorCapacity = 128;
 // Metal buffer binding slot of the per-draw root-offset buffer. Element [arg_index]
 // (== MTL_SM50_SHADER_ARGUMENT::StructurePtrOffset) holds the absolute base slot
 // (uint32) of that resource's descriptor-table range inside its typed mirror.

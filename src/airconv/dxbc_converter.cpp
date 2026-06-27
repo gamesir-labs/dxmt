@@ -255,6 +255,7 @@ void set_bindless_mirror_texture_srv_prototype(bool enabled) {
 }
 
 void set_bindless_mirror(bool enabled) { gBindlessMirror = enabled; }
+bool get_bindless_mirror() { return gBindlessMirror; }
 
 auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
   return make_irvalue([=](context ctx) {
@@ -393,17 +394,17 @@ static auto get_cbuffer_in_buffer_table(
   };
 }
 
-// --- bindless-mirror slot-30/29 SHARED FLAT mirror read (textures + samplers) ---
+// --- bindless-mirror slot-30/29 SHARED PLANAR mirror read (textures + samplers) ---
 //
 // Texture/sampler handles must be loaded from typed argument-buffer entries so
-// Metal lowers them as real indirect texture/sampler arguments. Metadata stays in
-// the same raw qword mirror layout. Each descriptor occupies `stride` entries at
-// the absolute heap slot: texture [handle, meta], sampler [handle, cube, lod_bias].
+// Metal lowers them as real indirect texture/sampler arguments. Metadata lives in
+// parallel uint64 arrays in the same argument-buffer struct. The runtime mirrors
+// this layout as contiguous planes: texture handles then metadata; sampler
+// handles, cube handles, then lod-bias metadata.
 static llvm::Value *
-mirror_flat_qword_index(
+mirror_planar_slot_index(
     context &ctx, pvalue dyn_index, uint32_t root_offset_arg_index,
-    uint32_t arg_index, uint32_t range_lower_bound, uint32_t stride,
-    uint32_t qword_offset) {
+    uint32_t arg_index, uint32_t range_lower_bound) {
   llvm::Value *slot = mirror_local_index(ctx, dyn_index, range_lower_bound);
   if (root_offset_arg_index != UINT32_MAX) {
     // Load root_offsets[arg_index] (absolute base slot) and add the local index.
@@ -414,59 +415,54 @@ mirror_flat_qword_index(
         i32, ctx.builder.CreateGEP(i32, root_buf, ctx.builder.getInt32(arg_index)));
     slot = ctx.builder.CreateAdd(base, slot);
   }
-  // qword = slot * stride + qword_offset
-  llvm::Value *qword = ctx.builder.CreateMul(slot, ctx.builder.getInt32(stride));
-  if (qword_offset)
-    qword = ctx.builder.CreateAdd(qword, ctx.builder.getInt32(qword_offset));
-  return qword;
+  return slot;
 }
 
-static auto get_mirror_qword_flat(
-    uint32_t mirror_index, uint32_t root_offset_arg_index, uint32_t arg_index,
-    uint32_t range_lower_bound, uint32_t stride, uint32_t qword_offset) {
-  return [=](pvalue dyn_index) {
-    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
-      auto mirror = ctx.function->getArg(mirror_index);
-      auto i64 = ctx.builder.getInt64Ty();
-      auto mirror_as_qwords = ctx.builder.CreateBitCast(
-          mirror, i64->getPointerTo(
-                      llvm::cast<llvm::PointerType>(mirror->getType())
-                          ->getAddressSpace()));
-      auto elem_ptr = ctx.builder.CreateGEP(
-          i64, mirror_as_qwords,
-          mirror_flat_qword_index(
-              ctx, dyn_index, root_offset_arg_index, arg_index,
-              range_lower_bound, stride, qword_offset));
-      return ctx.builder.CreateLoad(i64, elem_ptr);
-    });
-  };
-}
-
-template <typename HandleTypeFn>
-static auto get_mirror_typed_handle_flat(
-    uint32_t mirror_index, uint32_t root_offset_arg_index, uint32_t arg_index,
-    uint32_t range_lower_bound, uint32_t stride, uint32_t qword_offset,
-    HandleTypeFn handle_type_fn) {
+static auto get_mirror_qword_planar(
+    uint32_t mirror_index, uint32_t field_index,
+    uint32_t root_offset_arg_index, uint32_t arg_index,
+    uint32_t range_lower_bound) {
   return [=](pvalue dyn_index) {
     return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
       auto mirror = ctx.function->getArg(mirror_index);
       auto mirror_struct_type = llvm::cast<llvm::StructType>(
           llvm::cast<llvm::PointerType>(mirror->getType())
               ->getNonOpaquePointerElementType());
-      auto handle_type = handle_type_fn(ctx);
-      auto array_ty = llvm::ArrayType::get(handle_type,
-                                           kBindlessMirrorCapacity * stride);
-      auto array_ptr = ctx.builder.CreateStructGEP(mirror_struct_type, mirror, 0);
-      array_ptr = ctx.builder.CreateBitCast(
-          array_ptr, array_ty->getPointerTo(
-                         llvm::cast<llvm::PointerType>(array_ptr->getType())
-                             ->getAddressSpace()));
+      auto array_ptr =
+          ctx.builder.CreateStructGEP(mirror_struct_type, mirror, field_index);
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+          mirror_struct_type->getElementType(field_index));
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          array_ty, array_ptr,
+          {ctx.builder.getInt32(0),
+           mirror_planar_slot_index(ctx, dyn_index, root_offset_arg_index,
+                                    arg_index, range_lower_bound)});
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+template <typename HandleTypeFn>
+static auto get_mirror_typed_handle_planar(
+    uint32_t mirror_index, uint32_t field_index,
+    uint32_t root_offset_arg_index, uint32_t arg_index,
+    uint32_t range_lower_bound, HandleTypeFn) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto mirror = ctx.function->getArg(mirror_index);
+      auto mirror_struct_type = llvm::cast<llvm::StructType>(
+          llvm::cast<llvm::PointerType>(mirror->getType())
+              ->getNonOpaquePointerElementType());
+      auto array_ptr =
+          ctx.builder.CreateStructGEP(mirror_struct_type, mirror, field_index);
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+          mirror_struct_type->getElementType(field_index));
       auto element_ptr = ctx.builder.CreateGEP(
           array_ty, array_ptr,
           {ctx.builder.getInt32(0),
-           mirror_flat_qword_index(ctx, dyn_index, root_offset_arg_index,
-                                   arg_index, range_lower_bound, stride,
-                                   qword_offset)});
+           mirror_planar_slot_index(ctx, dyn_index, root_offset_arg_index,
+                                    arg_index, range_lower_bound)});
       return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
     });
   };
@@ -474,12 +470,13 @@ static auto get_mirror_typed_handle_flat(
 
 // Texture/sampler METADATA: the raw i64 qword (arrayLength|minLOD packing, or the
 // sampler lod_bias bits). Returned verbatim, matching the legacy i64 meta field.
-static auto get_mirror_meta_flat(
-    uint32_t mirror_index, uint32_t root_offset_arg_index, uint32_t arg_index,
-    uint32_t range_lower_bound, uint32_t stride, uint32_t qword_offset) {
-  return get_mirror_qword_flat(
-      mirror_index, root_offset_arg_index, arg_index, range_lower_bound, stride,
-      qword_offset);
+static auto get_mirror_meta_planar(
+    uint32_t mirror_index, uint32_t field_index,
+    uint32_t root_offset_arg_index, uint32_t arg_index,
+    uint32_t range_lower_bound) {
+  return get_mirror_qword_planar(
+      mirror_index, field_index, root_offset_arg_index, arg_index,
+      range_lower_bound);
 }
 
 // Read element `mirror.field[field_index][ root_base[arg_index] + local ]` from a
@@ -599,44 +596,67 @@ bindless_buffer_table_qword_count(const ShaderInfo *shader_info) {
   return running_qword;
 }
 
-// Per-slot qword strides of the bindless-mirror flat arrays (slot 30 texture, slot
-// 29 sampler). MUST equal the runtime DescriptorHeapMirror strides
-// (kMirrorTextureQwords / kMirrorSamplerQwords in dxmt_descriptor_mirror.hpp).
-static constexpr uint32_t kBindlessTextureMirrorStride = 2; // [handle, meta]
-static constexpr uint32_t kBindlessSamplerMirrorStride = 3; // [handle, cube, lod_bias]
+static air::MemoryAccess
+bindless_texture_mirror_access(const ShaderInfo *shader_info) {
+  bool sampled = false;
+  bool read = false;
+  bool written = false;
+
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    sampled |= srv.sampled || srv.compared;
+    read |= srv.read || srv.sampled || srv.compared;
+  }
+
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    read |= uav.read;
+    written |= uav.written;
+    if (!uav.read && !uav.written) {
+      read = true;
+      written = true;
+    }
+  }
+
+  if (written)
+    return read ? air::MemoryAccess::read_write : air::MemoryAccess::write;
+  if (sampled)
+    return air::MemoryAccess::sample;
+  return air::MemoryAccess::read;
+}
 
 static auto
 build_flat_texture_mirror_struct(const ShaderInfo *shader_info,
                                  llvm::LLVMContext &context,
                                  const llvm::DataLayout &layout) {
   air::ArgumentBufferBuilder builder;
+  const auto mirror_access = bindless_texture_mirror_access(shader_info);
+  uint32_t field_index = 0;
   for (auto &[range_id, srv] : shader_info->srvMap) {
     if (srv.resource_type == shader::common::ResourceType::NonApplicable)
       continue;
-    const auto access = srv.sampled ? air::MemoryAccess::sample
-                                    : air::MemoryAccess::read;
     builder.DefineTexture(
         "tex_mirror_t" + std::to_string(range_id),
-        air::to_air_resource_type(srv.resource_type, srv.compared), access,
+        air::to_air_resource_type(srv.resource_type, srv.compared), mirror_access,
         air::to_air_scaler_type(srv.scaler_type),
-        /*location_index=*/0, std::nullopt,
-        kBindlessMirrorCapacity * kBindlessTextureMirrorStride);
-    return builder.Build(context, layout);
+        field_index++, std::nullopt,
+        kBindlessMirrorCapacity);
+    builder.DefineInteger64("tex_mirror_t_meta" + std::to_string(range_id),
+                            field_index++, kBindlessMirrorCapacity);
   }
   for (auto &[range_id, uav] : shader_info->uavMap) {
     if (uav.resource_type == shader::common::ResourceType::NonApplicable)
       continue;
-    const auto access =
-        uav.written ? (uav.read ? air::MemoryAccess::read_write
-                                : air::MemoryAccess::write)
-                    : air::MemoryAccess::read;
     builder.DefineTexture(
         "tex_mirror_u" + std::to_string(range_id),
-        air::to_air_resource_type(uav.resource_type), access,
+        air::to_air_resource_type(uav.resource_type), mirror_access,
         air::to_air_scaler_type(uav.scaler_type),
-        /*location_index=*/0, uav.rasterizer_order ? std::optional(1) : std::nullopt,
-        kBindlessMirrorCapacity * kBindlessTextureMirrorStride);
-    return builder.Build(context, layout);
+        field_index++, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        kBindlessMirrorCapacity);
+    builder.DefineInteger64("tex_mirror_u_meta" + std::to_string(range_id),
+                            field_index++, kBindlessMirrorCapacity);
   }
   return builder.Build(context, layout);
 }
@@ -646,7 +666,11 @@ build_flat_sampler_mirror_struct(llvm::LLVMContext &context,
                                  const llvm::DataLayout &layout) {
   air::ArgumentBufferBuilder builder;
   builder.DefineSampler("sampler_mirror", /*location_index=*/0,
-                        kBindlessMirrorCapacity * kBindlessSamplerMirrorStride);
+                        kBindlessMirrorCapacity);
+  builder.DefineSampler("sampler_mirror_cube", /*location_index=*/1,
+                        kBindlessMirrorCapacity);
+  builder.DefineInteger64("sampler_mirror_lod", /*location_index=*/2,
+                          kBindlessMirrorCapacity);
   return builder.Build(context, layout);
 }
 
@@ -840,37 +864,35 @@ void setup_binding_table(
   };
 
   // Bindless-mirror TEXTURE-handle read (slot-30 flat typed array, stride 2).
-  auto read_tex_handle = [=](const air::MSLTexture &tex, uint32_t root_key,
+  auto read_tex_handle = [=](const air::MSLTexture &tex, uint32_t field_index,
+                             uint32_t root_key,
                              uint32_t lower_bound) -> IndexedIRValue {
-    return get_mirror_typed_handle_flat(
-      texture_mirror_index, root_offset_index, root_key, lower_bound,
-      kBindlessTextureMirrorStride, /*qword_offset=*/0,
-      [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); });
+    return get_mirror_typed_handle_planar(
+        texture_mirror_index, field_index, root_offset_index, root_key,
+        lower_bound, [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); });
   };
   // TEXTURE metadata (qword 1 of the slot): raw i64.
-  auto read_tex_meta = [=](uint32_t root_key,
+  auto read_tex_meta = [=](uint32_t field_index, uint32_t root_key,
                            uint32_t lower_bound) -> IndexedIRValue {
-    return get_mirror_meta_flat(texture_mirror_index, root_offset_index, root_key,
-                                lower_bound, kBindlessTextureMirrorStride,
-                                /*qword_offset=*/1);
+    return get_mirror_meta_planar(texture_mirror_index, field_index,
+                                  root_offset_index, root_key, lower_bound);
   };
-  // SAMPLER read (slot-29 flat typed array, stride 3): handle at qw0, cube
-  // handle at qw1, lod_bias bits at qw2 (i64).
+  // SAMPLER read (slot-29 planar arrays): handle, cube handle, lod_bias bits.
   auto read_sampler_handle = [=](uint32_t root_key, uint32_t lower_bound,
                                  uint32_t qword_offset) -> IndexedIRValue {
-    return get_mirror_typed_handle_flat(
-      sampler_mirror_index, root_offset_index, root_key, lower_bound,
-      kBindlessSamplerMirrorStride, qword_offset,
-      [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); });
+    return get_mirror_typed_handle_planar(
+        sampler_mirror_index, qword_offset, root_offset_index, root_key,
+        lower_bound,
+        [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); });
   };
   auto read_sampler_meta = [=](uint32_t root_key,
                                uint32_t lower_bound) -> IndexedIRValue {
-    return get_mirror_meta_flat(sampler_mirror_index, root_offset_index, root_key,
-                                lower_bound, kBindlessSamplerMirrorStride,
-                                /*qword_offset=*/2);
+    return get_mirror_meta_planar(sampler_mirror_index, /*field_index=*/2,
+                                  root_offset_index, root_key, lower_bound);
   };
 
   uint32_t compact_base = 0;
+  uint32_t texture_mirror_field = 0;
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     auto index = cbv.arg_index;
     if (gBindlessMirror) {
@@ -907,6 +929,10 @@ void setup_binding_table(
   for (auto &[range_id, srv] : shader_info->srvMap) {
     auto lb = srv.range.lower_bound;
     if (srv.resource_type != shader::common::ResourceType::NonApplicable) {
+      const uint32_t texture_handle_field = texture_mirror_field;
+      const uint32_t texture_meta_field = texture_mirror_field + 1;
+      if (gBindlessMirror)
+        texture_mirror_field += 2;
       // TODO: abstract SM 5.0 binding
       auto access =
         srv.sampled ? air::MemoryAccess::sample : air::MemoryAccess::read;
@@ -922,12 +948,12 @@ void setup_binding_table(
       // struct field (or the texture-srv prototype path).
       auto handle =
         gBindlessMirror
-          ? read_tex_handle(tex, srv.arg_index, lb)
+          ? read_tex_handle(tex, texture_handle_field, srv.arg_index, lb)
           : ((gBindlessMirrorTextureSrvPrototype &&
               srv.resource_type == shader::common::ResourceType::Texture2D)
                ? get_texture_item_in_argbuf_binding_table(binding_table_index, srv.arg_index)
                : read_field(srv.arg_index, srv.arg_index, lb));
-      auto meta = gBindlessMirror ? read_tex_meta(srv.arg_index, lb)
+      auto meta = gBindlessMirror ? read_tex_meta(texture_meta_field, srv.arg_index, lb)
                                   : read_field(srv.arg_metadata_index, srv.arg_index, lb);
       resource_map.srv_range_map[range_id] = {tex, handle, meta, false};
       if (srv.resource_type == shader::common::ResourceType::TextureBuffer) {
@@ -935,9 +961,9 @@ void setup_binding_table(
         // lives in the texture mirror, same handle/meta slot.
         resource_map.srv_buf_range_map[range_id] = {
           srv.structure_stride,
-          gBindlessMirror ? read_tex_handle(tex, srv.arg_index, lb)
+          gBindlessMirror ? read_tex_handle(tex, texture_handle_field, srv.arg_index, lb)
                           : read_field(srv.arg_index, srv.arg_index, lb),
-          gBindlessMirror ? read_tex_meta(srv.arg_index, lb)
+          gBindlessMirror ? read_tex_meta(texture_meta_field, srv.arg_index, lb)
                           : read_field(srv.arg_metadata_index, srv.arg_index, lb),
           false
         };
@@ -964,6 +990,10 @@ void setup_binding_table(
                                           : air::MemoryAccess::write)
                               : air::MemoryAccess::read;
     if (uav.resource_type != shader::common::ResourceType::NonApplicable) {
+      const uint32_t texture_handle_field = texture_mirror_field;
+      const uint32_t texture_meta_field = texture_mirror_field + 1;
+      if (gBindlessMirror)
+        texture_mirror_field += 2;
       auto texture_kind_logical = air::to_air_resource_type(uav.resource_type);
       auto scaler_type = air::to_air_scaler_type(uav.scaler_type);
       air::MSLTexture tex{
@@ -972,17 +1002,17 @@ void setup_binding_table(
         .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
         .resource_kind_logical = texture_kind_logical,
       };
-      auto handle = gBindlessMirror ? read_tex_handle(tex, uav.arg_index, lb)
+      auto handle = gBindlessMirror ? read_tex_handle(tex, texture_handle_field, uav.arg_index, lb)
                                     : read_field(uav.arg_index, uav.arg_index, lb);
-      auto meta = gBindlessMirror ? read_tex_meta(uav.arg_index, lb)
+      auto meta = gBindlessMirror ? read_tex_meta(texture_meta_field, uav.arg_index, lb)
                                   : read_field(uav.arg_metadata_index, uav.arg_index, lb);
       resource_map.uav_range_map[range_id] = {tex, handle, meta, uav.global_coherent};
       if (uav.resource_type == shader::common::ResourceType::TextureBuffer) {
         resource_map.uav_buf_range_map[range_id] = {
           uav.structure_stride,
-          gBindlessMirror ? read_tex_handle(tex, uav.arg_index, lb)
+          gBindlessMirror ? read_tex_handle(tex, texture_handle_field, uav.arg_index, lb)
                           : read_field(uav.arg_index, uav.arg_index, lb),
-          gBindlessMirror ? read_tex_meta(uav.arg_index, lb)
+          gBindlessMirror ? read_tex_meta(texture_meta_field, uav.arg_index, lb)
                           : read_field(uav.arg_metadata_index, uav.arg_index, lb),
           uav.global_coherent
         };
@@ -1314,40 +1344,6 @@ llvm::Error convert_dxbc_pixel_shader(
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  // DIAG: temporary root-cause instrumentation for FH4 frame-1200 blue bug.
-  // Gated to the composite-family PS (uses cb0 AND cb3) so only those draws are
-  // affected. Two modes:
-  //   DXMT_DIAG_PS_MARK_COMPOSITE: force o0 = (0,1,0,1) green marker -> if green
-  //     appears the draw rasterized (PS ran); if absent the geometry is off-screen.
-  //   DXMT_DIAG_PS_DUMP_CB0: force o0 = (cb0.w, 0, 0, 1) -> read cb0.w from red.
-  const bool diag_mark = std::getenv("DXMT_DIAG_PS_MARK_COMPOSITE") != nullptr;
-  const bool diag_cb0 = std::getenv("DXMT_DIAG_PS_DUMP_CB0") != nullptr;
-  if ((diag_mark || diag_cb0) && resource_map.output_element_count > 0 &&
-      resource_map.cb_range_map.count(0) && resource_map.cb_range_map.count(3)) {
-    auto out_f = builder.CreateBitOrPointerCast(
-      resource_map.output.ptr_float4, llvm::PointerType::get(types._float, 0));
-    auto zero = llvm::ConstantFP::get(types._float, 0.0);
-    auto one = llvm::ConstantFP::get(types._float, 1.0);
-    llvm::Value *r = zero, *g = zero;
-    if (diag_mark) {
-      g = one; // green marker
-    } else {
-      auto cbv = resource_map.cb_range_map.at(0)(nullptr).build(ctx);
-      if (cbv) {
-        auto handle = cbv.get();
-        auto comp_ptr = builder.CreateGEP(
-          types._int4, handle, {builder.getInt32(0), builder.getInt32(3)});
-        r = builder.CreateBitCast(
-          builder.CreateLoad(types._int, comp_ptr), types._float);
-      } else {
-        llvm::consumeError(cbv.takeError());
-      }
-    }
-    builder.CreateStore(r, builder.CreateConstGEP1_32(types._float, out_f, 0));
-    builder.CreateStore(g, builder.CreateConstGEP1_32(types._float, out_f, 1));
-    builder.CreateStore(zero, builder.CreateConstGEP1_32(types._float, out_f, 2));
-    builder.CreateStore(one, builder.CreateConstGEP1_32(types._float, out_f, 3));
-  }
   auto epilogue_result = epilogue.build(ctx);
   if (auto err = epilogue_result.takeError()) {
     return err;
@@ -1568,11 +1564,8 @@ llvm::Error convert_dxbc_vertex_shader(
     func_signature.DefineInput(air::InputBaseInstance{});
 
   uint32_t clip_distance_out_idx = ~0u;
-  // DIAG (DXMT_DIAG_VS_NO_CLIP): suppress VS clip-distance export to test whether
-  // composite geometry is clip-rejected in retrace. Temporary root-cause probe.
   const bool emit_clip_distance =
-      pShaderInternal->clip_distance_scalars.size() &&
-      std::getenv("DXMT_DIAG_VS_NO_CLIP") == nullptr;
+      pShaderInternal->clip_distance_scalars.size();
   if (emit_clip_distance) {
     clip_distance_out_idx = func_signature.DefineOutput(
       air::OutputClipDistance{pShaderInternal->clip_distance_scalars.size()}
@@ -1659,30 +1652,6 @@ llvm::Error convert_dxbc_vertex_shader(
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  // DIAG (DXMT_DIAG_VS_FULLSCREEN): force composite-family VS (has clip distance)
-  // SV_Position to an on-screen quad spread by vertex id. If the composite then
-  // rasterizes, the bug is isolated to VS position-input reconstruction.
-  if (std::getenv("DXMT_DIAG_VS_FULLSCREEN") &&
-      pShaderInternal->clip_distance_scalars.size() &&
-      resource_map.output_element_count > 0 && resource_map.vertex_id) {
-    auto vid = resource_map.vertex_id;
-    auto b0 = builder.CreateICmpNE(
-      builder.CreateAnd(vid, builder.getInt32(1)), builder.getInt32(0));
-    auto b1 = builder.CreateICmpNE(
-      builder.CreateAnd(vid, builder.getInt32(2)), builder.getInt32(0));
-    auto px = builder.CreateSelect(b0, llvm::ConstantFP::get(types._float, 0.9),
-                                   llvm::ConstantFP::get(types._float, -0.9));
-    auto py = builder.CreateSelect(b1, llvm::ConstantFP::get(types._float, 0.9),
-                                   llvm::ConstantFP::get(types._float, -0.9));
-    auto out_f = builder.CreateBitOrPointerCast(
-      resource_map.output.ptr_float4, llvm::PointerType::get(types._float, 0));
-    builder.CreateStore(px, builder.CreateConstGEP1_32(types._float, out_f, 0));
-    builder.CreateStore(py, builder.CreateConstGEP1_32(types._float, out_f, 1));
-    builder.CreateStore(llvm::ConstantFP::get(types._float, 0.5),
-                        builder.CreateConstGEP1_32(types._float, out_f, 2));
-    builder.CreateStore(llvm::ConstantFP::get(types._float, 1.0),
-                        builder.CreateConstGEP1_32(types._float, out_f, 3));
-  }
   auto epilogue_result = epilogue.build(ctx);
   if (auto err = epilogue_result.takeError()) {
     return err;
@@ -2309,8 +2278,12 @@ AIRCONV_API int SM50Compile(
       bindless_requested = bm->enabled;
   }
   struct BindlessMirrorScope {
-    BindlessMirrorScope(bool on) { dxmt::dxbc::set_bindless_mirror(on); }
-    ~BindlessMirrorScope() { dxmt::dxbc::set_bindless_mirror(false); }
+    explicit BindlessMirrorScope(bool on)
+        : previous(dxmt::dxbc::get_bindless_mirror()) {
+      dxmt::dxbc::set_bindless_mirror(on);
+    }
+    ~BindlessMirrorScope() { dxmt::dxbc::set_bindless_mirror(previous); }
+    bool previous;
   } bindless_scope(bindless_requested);
 
   if (ppError) {
