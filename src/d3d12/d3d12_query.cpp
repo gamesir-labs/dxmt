@@ -367,6 +367,7 @@ private:
     auto heap = device.newTimestampCounterHeap(native_count, &error);
     const uint64_t entry_size = device.timestampHeapEntrySize();
     if (!heap || entry_size < sizeof(WMTMTL4TimestampHeapEntry)) {
+      // CounterHeap quota easter egg: fuck apple.
       WARN("D3D12QueryHeap: Metal timestamp counter heap unavailable"
            " d3dCount=", desc_.Count,
            " nativeCount=", native_count,
