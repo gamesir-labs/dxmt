@@ -104,18 +104,10 @@ At runtime, the integration is opt-in through environment variables:
 - `DXMT_APITRACE_ENABLED=1` — activate the in-process recorder. The historical
   misspelling `DXMT_APITRACE_ENBALED=1` is accepted as a spelling-compatible
   alias and is checked first; new scripts should prefer the corrected name.
-- `APITRACE_TRACE_BUNDLE=/abs/path/to/output-dir` — output directory for
-  per-process bundles. The PE side derives `<exe-name>.apitrace` under this
-  directory, e.g. `/tmp/b1.exe.apitrace` and `/tmp/helper.exe.apitrace`, then
-  propagates that concrete bundle root to the unix side via
-  `__wine_set_unix_env`, so one process' D3D and Metal streams stay together
-  while helper processes cannot overwrite the same bundle. Directory-mode
-  launches also preserve the original output directory in the internal
-  `DXMT_APITRACE_TRACE_OUTPUT_DIR` variable so child processes re-derive their
-  own `<exe-name>.apitrace` bundle instead of inheriting the parent's concrete
-  bundle path. Passing a full
-  `/abs/path/to/trace.apitrace` path remains supported for single-process
-  captures and compatibility with older scripts. When unset, the PE side picks
+- `APITRACE_TRACE_BUNDLE=/abs/path/to/trace.apitrace` — concrete output bundle
+  for the current process. The PE side propagates this bundle root to the unix
+  side via `__wine_set_unix_env`, so the D3D and Metal streams for the process
+  stay together. When unset, the PE side picks
   `<exe-basename>_dxmt_apitrace/trace-<ts>.apitrace`.
 - `APITRACE_METAL_VERBOSE=1` — emit per-call info logs from the DXMT-side hook
   layer. Useful for confirming the recorder is wired in; noisy in long runs.

@@ -96,29 +96,12 @@ D3D12FenceDiagEnabled() {
   return enabled;
 }
 
-static uint32_t
-D3D12FenceDiagLogLimit() {
-  static const uint32_t limit = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_FENCE_LIMIT");
-    if (value.empty())
-      value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
-    if (value.empty())
-      return 2000u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 2000u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return limit;
-}
-
 static bool
 D3D12FenceDiagShouldLog(std::atomic<uint32_t> &counter) {
   if (!D3D12FenceDiagEnabled())
     return false;
-  return counter.fetch_add(1, std::memory_order_relaxed) <
-         D3D12FenceDiagLogLimit();
+  counter.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 using D3D12FenceDiagClock = std::chrono::high_resolution_clock;

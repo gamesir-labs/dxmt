@@ -726,48 +726,12 @@ public:
     AddRecord(StencilRefRecord{stencil_ref});
   }
   void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {
-    // DIAG (DXMT_DIAG_PSO_RECORD): retrace observed draws skipped at replay with
-    // state.pipeline_state==null even though SetPipelineState was called before
-    // the draw on the same list. The replay side never nulls pipeline_state
-    // (only PipelineStateRecord sets it, Clone copies it), so the only way a
-    // draw sees null is the recorded stream lacking a *valid* PipelineStateRecord
-    // before it. This logs the three silent paths that produce that gap:
-    //   (a) incompatible PSO -> early return, NO record at all;
-    //   (b) null PSO bound   -> a PipelineStateRecord{null} that poisons the list;
-    //   (c) list already closed -> AddRecord drops the record.
-    DiagPsoRecord("SetPipelineState", pipeline_state);
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_pipeline_state(this, pipeline_state);
     current_pipeline_state_ = pipeline_state;
     RecordPipelineState(current_pipeline_state_.ptr(), false);
-  }
-
-  void DiagPsoRecord(const char *site, ID3D12PipelineState *pipeline_state) {
-    static const bool enabled = std::getenv("DXMT_DIAG_PSO_RECORD") != nullptr;
-    if (!enabled)
-      return;
-    static std::atomic<uint32_t> diag_count = 0;
-    if (diag_count.fetch_add(1, std::memory_order_relaxed) >= 256)
-      return;
-    const auto *state = dynamic_cast<PipelineState *>(pipeline_state);
-    const char *reason = "ok";
-    if (!pipeline_state)
-      reason = "null-pso-bound";            // (b) poisons the list
-    else if (!state)
-      reason = "not-dxmt-pipelinestate";    // (a) dynamic_cast fail -> silent drop
-    else if (!IsPipelineStateCompatible(pipeline_state))
-      reason = "type-mismatch-for-listtype"; // (a) wrong type for list -> silent drop
-    else if (closed_)
-      reason = "list-closed-record-dropped"; // (c) AddRecord no-op
-    WARN("DXMT_DIAG_PSO_RECORD: site=", site,
-         " reason=", reason,
-         " pso=", reinterpret_cast<uintptr_t>(pipeline_state),
-         " isDxmt=", state != nullptr,
-         " psoType=", state ? (int)state->GetType() : -1,
-         " listType=", (int)type_,
-         " closed=", closed_);
   }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {
     if (!barriers || !barrier_count)

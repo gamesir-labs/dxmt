@@ -73,6 +73,7 @@ static UINT GetResourceMipLevelCount(const Resource &resource);
 static UINT GetResourceArraySliceCount(const Resource &resource);
 static UINT GetSubresourceIndex(const Resource &resource, UINT subresource);
 static UINT GetSubresourcePlane(const Resource &resource, UINT subresource);
+
 static UINT GetMipLevel(const Resource &resource, UINT subresource);
 static UINT GetArraySlice(const Resource &resource, UINT subresource);
 static UINT NormalizeViewCount(UINT requested, UINT first, UINT total);
@@ -927,23 +928,6 @@ D3D12DiagExecuteIndirectEnabled() {
 }
 
 static uint32_t
-D3D12DiagLogLimit() {
-  static const uint32_t limit = []() {
-    auto value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
-    if (value.empty())
-      value = env::getEnvVar("DXMT_DIAG_BINDING_LIMIT");
-    if (value.empty())
-      return 2000u;
-    char *end = nullptr;
-    auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str())
-      return 2000u;
-    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }();
-  return limit;
-}
-
-static uint32_t
 D3D12DiagIAReadbackBytes() {
   static const uint32_t size = []() {
     auto value = env::getEnvVar("DXMT_DIAG_IA_READBACK_BYTES");
@@ -979,7 +963,8 @@ static bool
 D3D12DiagShouldLog(std::atomic<uint32_t> &counter, bool enabled) {
   if (!enabled)
     return false;
-  return counter.fetch_add(1, std::memory_order_relaxed) < D3D12DiagLogLimit();
+  counter.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 static std::string
@@ -2893,6 +2878,251 @@ UintBufferViewFormatForStride(UINT stride) {
   }
 }
 
+static std::optional<std::pair<BufferViewBinding, BufferSlice>>
+CreateShaderResourceTextureBufferBinding(WMT::Device device, Resource &resource,
+                                         const DescriptorRecord &descriptor,
+                                         WMTTextureUsage usage) {
+  UINT64 offset = 0;
+  UINT64 byte_size = resource.GetResourceDesc().Width;
+
+  if (descriptor.has_desc) {
+    const auto &srv = descriptor.desc.srv;
+    if (srv.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+      WARN("D3D12CommandQueue: buffer SRV has unsupported view dimension ",
+           uint32_t(srv.ViewDimension));
+      return std::nullopt;
+    }
+
+    const UINT64 first_element = srv.Buffer.FirstElement;
+    if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+      offset += first_element * sizeof(uint32_t);
+      byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
+      auto view = CreateBufferView(device, resource, DXGI_FORMAT_R32_UINT,
+                                   offset, byte_size, usage);
+      if (!view) {
+        WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
+                                         sizeof(uint32_t), offset, byte_size);
+        return std::nullopt;
+      }
+      auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                      sizeof(uint32_t));
+      slice.firstElement += view->firstElementBias;
+      return std::make_pair(*view, slice);
+    }
+
+    if (srv.Format != DXGI_FORMAT_UNKNOWN) {
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device, srv.Format, format))) {
+        WARN("D3D12CommandQueue: typed buffer SRV uses unsupported format ",
+             uint32_t(srv.Format));
+        return std::nullopt;
+      }
+      offset += first_element * format.BytesPerTexel;
+      byte_size = UINT64(srv.Buffer.NumElements) * format.BytesPerTexel;
+      auto view = CreateBufferView(device, resource, srv.Format, offset,
+                                   byte_size, usage);
+      if (!view) {
+        WarnTextureBufferViewUnavailable("SRV", srv.Format,
+                                         format.BytesPerTexel, offset,
+                                         byte_size);
+        return std::nullopt;
+      }
+      auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                      format.BytesPerTexel);
+      slice.firstElement += view->firstElementBias;
+      return std::make_pair(*view, slice);
+    }
+
+    if (srv.Buffer.StructureByteStride) {
+      offset += first_element * srv.Buffer.StructureByteStride;
+      byte_size = UINT64(srv.Buffer.NumElements) *
+                  srv.Buffer.StructureByteStride;
+      const auto view_format =
+          UintBufferViewFormatForStride(srv.Buffer.StructureByteStride);
+      if (view_format == DXGI_FORMAT_UNKNOWN) {
+        WarnTextureBufferViewUnavailable(
+            "SRV", view_format, srv.Buffer.StructureByteStride, offset,
+            byte_size);
+        return std::nullopt;
+      }
+      auto view = CreateBufferView(device, resource, view_format, offset,
+                                   byte_size, usage);
+      if (!view) {
+        WarnTextureBufferViewUnavailable(
+            "SRV", view_format, srv.Buffer.StructureByteStride, offset,
+            byte_size);
+        return std::nullopt;
+      }
+      auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                      srv.Buffer.StructureByteStride);
+      slice.firstElement += view->firstElementBias;
+      return std::make_pair(*view, slice);
+    }
+
+    offset += first_element;
+    byte_size = srv.Buffer.NumElements;
+  }
+
+  auto view = CreateBufferView(device, resource, DXGI_FORMAT_R32_UINT, offset,
+                               byte_size, usage);
+  if (!view) {
+    WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
+                                     sizeof(uint32_t), offset, byte_size);
+    return std::nullopt;
+  }
+  auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                  sizeof(uint32_t));
+  slice.firstElement += view->firstElementBias;
+  return std::make_pair(*view, slice);
+}
+
+static std::optional<std::pair<BufferViewBinding, BufferSlice>>
+CreateUnorderedAccessTextureBufferBinding(WMT::Device device, Resource &resource,
+                                          const DescriptorRecord &descriptor,
+                                          WMTTextureUsage usage) {
+  UINT64 offset = 0;
+  UINT64 byte_size = resource.GetResourceDesc().Width;
+
+  if (descriptor.has_desc) {
+    const auto &uav = descriptor.desc.uav;
+    if (uav.ViewDimension != D3D12_UAV_DIMENSION_BUFFER) {
+      WARN("D3D12CommandQueue: buffer UAV has unsupported view dimension ",
+           uint32_t(uav.ViewDimension));
+      return std::nullopt;
+    }
+
+    const UINT64 first_element = uav.Buffer.FirstElement;
+    if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+      offset += first_element * sizeof(uint32_t);
+      byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
+      auto view = CreateBufferView(device, resource, DXGI_FORMAT_R32_UINT,
+                                   offset, byte_size, usage);
+      if (!view) {
+        WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
+                                         sizeof(uint32_t), offset, byte_size);
+        return std::nullopt;
+      }
+      auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                      sizeof(uint32_t));
+      slice.firstElement += view->firstElementBias;
+      return std::make_pair(*view, slice);
+    }
+
+    if (uav.Format != DXGI_FORMAT_UNKNOWN) {
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device, uav.Format, format))) {
+        WARN("D3D12CommandQueue: typed buffer UAV uses unsupported format ",
+             uint32_t(uav.Format));
+        return std::nullopt;
+      }
+      offset += first_element * format.BytesPerTexel;
+      byte_size = UINT64(uav.Buffer.NumElements) * format.BytesPerTexel;
+      auto view = CreateBufferView(device, resource, uav.Format, offset,
+                                   byte_size, usage);
+      if (!view) {
+        WarnTextureBufferViewUnavailable("UAV", uav.Format,
+                                         format.BytesPerTexel, offset,
+                                         byte_size);
+        return std::nullopt;
+      }
+      auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                      format.BytesPerTexel);
+      slice.firstElement += view->firstElementBias;
+      return std::make_pair(*view, slice);
+    }
+
+    if (uav.Buffer.StructureByteStride) {
+      offset += first_element * uav.Buffer.StructureByteStride;
+      byte_size = UINT64(uav.Buffer.NumElements) *
+                  uav.Buffer.StructureByteStride;
+      const auto view_format =
+          UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
+      if (view_format == DXGI_FORMAT_UNKNOWN) {
+        WarnTextureBufferViewUnavailable(
+            "UAV", view_format, uav.Buffer.StructureByteStride, offset,
+            byte_size);
+        return std::nullopt;
+      }
+      auto view = CreateBufferView(device, resource, view_format, offset,
+                                   byte_size, usage);
+      if (!view) {
+        WarnTextureBufferViewUnavailable(
+            "UAV", view_format, uav.Buffer.StructureByteStride, offset,
+            byte_size);
+        return std::nullopt;
+      }
+      auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                      uav.Buffer.StructureByteStride);
+      slice.firstElement += view->firstElementBias;
+      return std::make_pair(*view, slice);
+    }
+
+    offset += first_element;
+    byte_size = uav.Buffer.NumElements;
+  }
+
+  auto view = CreateBufferView(device, resource, DXGI_FORMAT_R32_UINT, offset,
+                               byte_size, usage);
+  if (!view) {
+    WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
+                                     sizeof(uint32_t), offset, byte_size);
+    return std::nullopt;
+  }
+  auto slice = TextureBufferSlice(resource, offset, byte_size,
+                                  sizeof(uint32_t));
+  slice.firstElement += view->firstElementBias;
+  return std::make_pair(*view, slice);
+}
+
+template <PipelineStage stage>
+static void
+FillBindlessTextureBufferMirrorSlotForStage(
+    ArgumentEncodingContext &enc, DescriptorHeapMirror &mirror, UINT slot,
+    const Rc<Buffer> &buffer, const BufferViewBinding &binding,
+    const BufferSlice &slice, int access_flags) {
+  auto [view, suballocation_offset] =
+      enc.access<stage>(buffer, binding.key, access_flags);
+  mirror.FillTextureSlotPayload(
+      slot, view.gpu_resource_id,
+      (uint64_t(slice.elementCount) << 32) |
+          uint64_t(slice.firstElement + suballocation_offset));
+}
+
+static void
+FillBindlessTextureBufferMirrorSlot(
+    ArgumentEncodingContext &enc, DescriptorHeapMirror &mirror, UINT slot,
+    PipelineStage stage, const Rc<Buffer> &buffer,
+    const BufferViewBinding &binding, const BufferSlice &slice,
+    int access_flags) {
+  switch (stage) {
+  case PipelineStage::Compute:
+    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Compute>(
+        enc, mirror, slot, buffer, binding, slice, access_flags);
+    break;
+  case PipelineStage::Pixel:
+    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Pixel>(
+        enc, mirror, slot, buffer, binding, slice, access_flags);
+    break;
+  case PipelineStage::Geometry:
+    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Geometry>(
+        enc, mirror, slot, buffer, binding, slice, access_flags);
+    break;
+  case PipelineStage::Hull:
+    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Hull>(
+        enc, mirror, slot, buffer, binding, slice, access_flags);
+    break;
+  case PipelineStage::Domain:
+    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Domain>(
+        enc, mirror, slot, buffer, binding, slice, access_flags);
+    break;
+  case PipelineStage::Vertex:
+  default:
+    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Vertex>(
+        enc, mirror, slot, buffer, binding, slice, access_flags);
+    break;
+  }
+}
+
 static D3D12_DESCRIPTOR_HEAP_TYPE
 DescriptorHeapTypeForRange(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
   return range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER
@@ -3550,8 +3780,9 @@ public:
         heap, range_count, range_flags, heap_range_offsets, range_tile_counts,
         flags);
     D3D12TileMappingStats().calls.fetch_add(1, std::memory_order_relaxed);
-    if (!resource || !region_count || !region_start_coordinates)
+    if (!resource || !region_count || !region_start_coordinates) {
       return;
+    }
     if (flags && ShouldLogTileMappingDiag()) {
       WARN("D3D12CommandQueue: TODO UpdateTileMappings flags are ignored"
            " flags=", flags,
@@ -3612,8 +3843,9 @@ public:
            " rangeConsumed=", cursor.consumed,
            " ranges=", range_count);
     }
-    if (ops.empty())
+    if (ops.empty()) {
       return;
+    }
     auto perf_delta = RecordTileMappingOps(*tiling, ops);
     LogTileMappingStats("UpdateTileMappings");
 
@@ -3681,9 +3913,20 @@ public:
     }
 
     if (!has_map && !resource_object->GetTextureAllocation()) {
+      Com<ID3D12Resource> resource_ref = resource;
       auto tiling_copy = *tiling;
-      ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
-                                          nullptr, ops);
+      PendingOperation op = {};
+      op.type = PendingOperationType::QueueWork;
+      op.queue_work = [resource_ref, tiling_copy = std::move(tiling_copy),
+                       ops = std::move(ops)](CommandChunk *) mutable {
+        if (auto *resource_object =
+                dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
+          ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
+                                              nullptr, ops);
+        }
+        return false;
+      };
+      EnqueuePendingOperation(std::move(op), nullptr);
       dxmt::perf::recordTileMapping(
           perf_delta.standard_ops, perf_delta.packed_ops,
           perf_delta.map_ops, perf_delta.unmap_ops, 0, 0, 0);
@@ -3691,41 +3934,53 @@ public:
     }
 
     auto texture = resource_object->GetTextureAllocation()->texture();
-    auto &queue = device_->GetDXMTDevice().queue();
-    auto *chunk = queue.CurrentChunk();
     auto barrier_subresources = CollectSparseTileBarrierSubresources(ops);
+    const size_t barrier_subresource_count = barrier_subresources.size();
     dxmt::apitrace::record_sparse_texture_mapping_ops(
         this, resource, heap, "UpdateTileMappings", ops.data(), ops.size());
     Com<ID3D12Resource> resource_ref = resource;
     Com<ID3D12Heap> heap_ref = heap;
     auto tiling_copy = *tiling;
-    chunk->emitcc([device = device_->GetDXMTDevice().device(),
-                   texture, placement_heap,
-                   ops = std::move(ops), resource_ref,
-                   tiling_copy = std::move(tiling_copy), heap_ref,
-                   has_map](
-                      ArgumentEncodingContext &) mutable {
-      if (!device.updateSparseTextureMappings(texture, placement_heap,
-                                              ops.data(), ops.size())) {
-        D3D12TileMappingStats().metal_failures.fetch_add(
-            1, std::memory_order_relaxed);
-        WARN("D3D12CommandQueue: TODO Metal4 UpdateTileMappings failed"
-             " resource=", resource_ref.ptr(),
-             " heap=", heap_ref.ptr(),
-             " ops=", ops.size(),
-             " hasMap=", has_map);
-        return;
-      }
-      if (auto *resource_object = dynamic_cast<d3d12::Resource *>(resource_ref.ptr()))
-        ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
-                                            heap_ref.ptr(), ops);
-    });
-    EmitSparseTextureMappingBarrier(
-        chunk, Rc<Texture>(resource_object->GetTexture()),
-        std::move(barrier_subresources));
+    Rc<Texture> barrier_texture = Rc<Texture>(resource_object->GetTexture());
+    PendingOperation op = {};
+    op.type = PendingOperationType::QueueWork;
+    op.queue_work = [device = device_->GetDXMTDevice().device(),
+                     texture, placement_heap,
+                     ops = std::move(ops), resource_ref,
+                     tiling_copy = std::move(tiling_copy), heap_ref,
+                     has_map, barrier_texture = std::move(barrier_texture),
+                     barrier_subresources = std::move(barrier_subresources)](
+                        CommandChunk *chunk) mutable {
+      chunk->emitcc([device, texture, placement_heap,
+                     ops = std::move(ops), resource_ref,
+                     tiling_copy = std::move(tiling_copy), heap_ref,
+                     has_map](
+                        ArgumentEncodingContext &) mutable {
+        if (!device.updateSparseTextureMappings(texture, placement_heap,
+                                                ops.data(), ops.size())) {
+          D3D12TileMappingStats().metal_failures.fetch_add(
+              1, std::memory_order_relaxed);
+          WARN("D3D12CommandQueue: TODO Metal4 UpdateTileMappings failed"
+               " resource=", resource_ref.ptr(),
+               " heap=", heap_ref.ptr(),
+               " ops=", ops.size(),
+               " hasMap=", has_map);
+          return;
+        }
+        if (auto *resource_object =
+                dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
+          ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
+                                              heap_ref.ptr(), ops);
+        }
+      });
+      EmitSparseTextureMappingBarrier(
+          chunk, std::move(barrier_texture), std::move(barrier_subresources));
+      return true;
+    };
+    EnqueuePendingOperation(std::move(op), nullptr);
     dxmt::perf::recordTileMapping(
         perf_delta.standard_ops, perf_delta.packed_ops, perf_delta.map_ops,
-        perf_delta.unmap_ops, 0, 0, barrier_subresources.empty() ? 0 : 1);
+        perf_delta.unmap_ops, 0, 0, barrier_subresource_count ? 1 : 0);
   }
 
   void CopyTileMappingsImpl(ID3D12Resource *dst_resource,
@@ -3737,8 +3992,9 @@ public:
     dxmt::apitrace::record_copy_tile_mappings(
         this, dst_resource, dst_start, src_resource, src_start, region_size,
         flags);
-    if (!dst_resource || !src_resource || !dst_start || !src_start)
+    if (!dst_resource || !src_resource || !dst_start || !src_start) {
       return;
+    }
     if (flags && ShouldLogTileMappingDiag()) {
       WARN("D3D12CommandQueue: TODO CopyTileMappings flags are ignored"
            " flags=", flags,
@@ -3842,16 +4098,24 @@ public:
       return;
     }
     if (map_ops.empty() && !dst->GetTextureAllocation()) {
+      Com<ID3D12Resource> dst_ref = dst_resource;
       auto tiling_copy = *dst_tiling;
-      ApplySparseTileMappingOpsToResource(*dst, tiling_copy, nullptr,
-                                          unmap_ops);
+      PendingOperation op = {};
+      op.type = PendingOperationType::QueueWork;
+      op.queue_work = [dst_ref, tiling_copy = std::move(tiling_copy),
+                       ops = std::move(unmap_ops)](CommandChunk *) mutable {
+        if (auto *dst = dynamic_cast<d3d12::Resource *>(dst_ref.ptr()))
+          ApplySparseTileMappingOpsToResource(*dst, tiling_copy, nullptr, ops);
+        return false;
+      };
+      EnqueuePendingOperation(std::move(op), nullptr);
       return;
     }
 
     auto texture = dst->GetTextureAllocation()->texture();
-    auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
     Com<ID3D12Resource> dst_ref = dst_resource;
     auto tiling_copy = *dst_tiling;
+    std::vector<std::function<void(CommandChunk *)>> sparse_groups;
     auto emit_ops = [&](ID3D12Heap *heap, std::vector<WMTSparseTextureMappingOperation> ops) {
       dxmt::apitrace::record_sparse_texture_mapping_ops(
           this, dst_resource, heap, "CopyTileMappings", ops.data(), ops.size());
@@ -3868,30 +4132,51 @@ public:
           return;
         }
       }
-      chunk->emitcc([device = device_->GetDXMTDevice().device(), texture,
-                     placement_heap, dst_ref, heap_ref,
-                     tiling_copy, ops = std::move(ops)](
-                        ArgumentEncodingContext &) mutable {
-        if (!device.updateSparseTextureMappings(texture, placement_heap,
-                                                ops.data(), ops.size())) {
-          WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
-               " dst=", dst_ref.ptr(),
-               " heap=", heap_ref.ptr(),
-               " ops=", ops.size());
-          return;
-        }
-        if (auto *dst = dynamic_cast<d3d12::Resource *>(dst_ref.ptr()))
-          ApplySparseTileMappingOpsToResource(*dst, tiling_copy, heap_ref.ptr(),
-                                              ops);
-      });
-      EmitSparseTextureMappingBarrier(
-          chunk, Rc<Texture>(dst->GetTexture()), std::move(barrier_subresources));
+      Rc<Texture> barrier_texture = Rc<Texture>(dst->GetTexture());
+      sparse_groups.push_back(
+          [device = device_->GetDXMTDevice().device(), texture, placement_heap,
+           dst_ref, heap_ref, tiling_copy, ops = std::move(ops),
+           barrier_texture = std::move(barrier_texture),
+           barrier_subresources = std::move(barrier_subresources)](
+              CommandChunk *chunk) mutable {
+            chunk->emitcc([device, texture, placement_heap, dst_ref, heap_ref,
+                           tiling_copy, ops = std::move(ops)](
+                              ArgumentEncodingContext &) mutable {
+              if (!device.updateSparseTextureMappings(texture, placement_heap,
+                                                      ops.data(), ops.size())) {
+                WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
+                     " dst=", dst_ref.ptr(),
+                     " heap=", heap_ref.ptr(),
+                     " ops=", ops.size());
+                return;
+              }
+              if (auto *dst =
+                      dynamic_cast<d3d12::Resource *>(dst_ref.ptr())) {
+                ApplySparseTileMappingOpsToResource(*dst, tiling_copy,
+                                                    heap_ref.ptr(), ops);
+              }
+            });
+            EmitSparseTextureMappingBarrier(
+                chunk, std::move(barrier_texture),
+                std::move(barrier_subresources));
+          });
     };
 
     if (!unmap_ops.empty())
       emit_ops(nullptr, std::move(unmap_ops));
     for (auto &entry : map_ops)
       emit_ops(entry.first, std::move(entry.second));
+    if (!sparse_groups.empty()) {
+      PendingOperation op = {};
+      op.type = PendingOperationType::QueueWork;
+      op.queue_work = [sparse_groups = std::move(sparse_groups)](
+                          CommandChunk *chunk) mutable {
+        for (auto &emit_group : sparse_groups)
+          emit_group(chunk);
+        return true;
+      };
+      EnqueuePendingOperation(std::move(op), nullptr);
+    }
   }
 
   void STDMETHODCALLTYPE ExecuteCommandLists(UINT command_list_count,
@@ -6277,10 +6562,17 @@ private:
       active_batch.argument_buffer_size = 0;
     }
 
-    return active_batch.captured_binding_generations
-        .insert(ReplayBindingGenerationKey{state.graphics_binding_generation,
-                                           descriptor_content_generation})
-        .second;
+    active_batch.captured_binding_generations.insert(
+        ReplayBindingGenerationKey{state.graphics_binding_generation,
+                                   descriptor_content_generation});
+
+    // A queued graphics command replays later without the live ReplayState. The
+    // snapshot is therefore the command's binding payload, not just a cache key.
+    // Reusing only the "seen generation" bit leaves later commands with an
+    // empty snapshot; bindless-compiled PSOs then replay as legacy bindings.
+    // Keep batching, but capture a complete per-command snapshot until this
+    // cache stores and replays the snapshot itself.
+    return true;
   }
 
   bool D3D12ReplayComputeBatchingEnabled() {
@@ -10172,6 +10464,35 @@ private:
     }
   }
 
+  static bool
+  MakeConstantBufferBindingFromDescriptor(const DescriptorRecord &descriptor,
+                                          ConstantBufferBinding &binding) {
+    if (descriptor.type != DescriptorRecordType::ConstantBufferView ||
+        !descriptor.has_desc)
+      return false;
+    if (descriptor.desc.cbv.BufferLocation &
+        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+      return false;
+    if (descriptor.desc.cbv.SizeInBytes &
+        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+      return false;
+
+    Resource *resource = nullptr;
+    const auto offset =
+        ResolveBufferGpuAddress(descriptor.desc.cbv.BufferLocation, resource);
+    const bool null_cbv =
+        !descriptor.desc.cbv.BufferLocation && !descriptor.desc.cbv.SizeInBytes;
+    if (!null_cbv && (!resource || !resource->GetBuffer()))
+      return false;
+
+    binding = {};
+    if (!null_cbv) {
+      binding.buffer = Rc<Buffer>(resource->GetBuffer());
+      binding.offset = resource->GetHeapOffset() + offset;
+    }
+    return true;
+  }
+
   /**
    * Bindless-mirror (sub-step ②/③ seam): resolve a stale descriptor's texture/sampler
    * payload and write it into the persistent mirror, ON THE ENCODE THREAD. This is the
@@ -10208,11 +10529,15 @@ private:
       EncodeMirrorSamplerSlot(expected, *sampler);
     else
       EncodeMirrorSamplerSlotNull(expected, dummy_handle);
-    const uint64_t *got = mirror ? mirror->slotPtr(slot) : nullptr;
-    if (!got)
+    const uint64_t *got[kMirrorSamplerQwords] = {
+        mirror ? mirror->samplerHandlePtr(slot) : nullptr,
+        mirror ? mirror->samplerCubeHandlePtr(slot) : nullptr,
+        mirror ? mirror->samplerLodBiasPtr(slot) : nullptr,
+    };
+    if (!got[0] || !got[1] || !got[2])
       return;
     for (uint32_t i = 0; i < kMirrorSamplerQwords; i++) {
-      if (got[i] == expected[i])
+      if (*got[i] == expected[i])
         continue;
       if (!BindlessMirrorVerifyShouldLog())
         return;
@@ -10224,7 +10549,7 @@ private:
           " slot=", slot,
           " field=qword", i,
           " expected=0x", std::hex, expected[i],
-          " actual=0x", got[i], std::dec);
+          " actual=0x", *got[i], std::dec);
     }
   }
 
@@ -10274,42 +10599,108 @@ private:
     if (mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot))
       return;
 
-    // CBV/SRV/UAV mirror: only texture views are persisted here. Buffer records and
-    // empty/null slots leave the mirror slot as-is (zero); ③'s per-draw buffer table
-    // covers buffers, and the texture index path never reads a buffer slot.
+    // CBV/SRV/UAV mirror: ordinary buffer descriptors are covered by the per-draw
+    // buf_table, but DXBC typed/structured `dcl_resource dim=buffer` lowers to a
+    // Metal texture-buffer argument. Those descriptors must publish their texture
+    // view handle here just like texture SRVs/UAVs.
     Resource *resource = nullptr;
     if (record.type == DescriptorRecordType::ShaderResourceView ||
         record.type == DescriptorRecordType::UnorderedAccessView)
       resource = GetResource(record.resource.ptr());
-    if (!resource || !resource->GetTexture())
+    if (!resource) {
+      mirror->ClearTextureSlot(slot);
       return;
+    }
 
     if (record.type == DescriptorRecordType::ShaderResourceView) {
+      if (resource->GetBuffer()) {
+        if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
+          mirror->ClearTextureSlot(slot);
+          return;
+        }
+        auto binding = CreateShaderResourceTextureBufferBinding(
+            device_->GetMTLDevice(), *resource, record,
+            WMTTextureUsageShaderRead);
+        if (!binding) {
+          mirror->ClearTextureSlot(slot);
+          return;
+        }
+        auto buffer = Rc<Buffer>(resource->GetBuffer());
+        FillBindlessTextureBufferMirrorSlot(
+            enc, *mirror, slot, stage, buffer, binding->first, binding->second,
+            ResourceAccess::Read);
+        return;
+      }
+      if (!resource->GetTexture()) {
+        mirror->ClearTextureSlot(slot);
+        return;
+      }
       const auto view = CreateShaderResourceTextureView(device_->GetMTLDevice(),
                                                         *resource, record);
-      if (!view || !view.texture.ptr())
+      if (!view || !view.texture.ptr()) {
+        mirror->ClearTextureSlot(slot);
         return;
+      }
       auto *allocation = view.texture->current();
-      if (!allocation)
+      if (!allocation) {
+        mirror->ClearTextureSlot(slot);
         return;
+      }
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
     } else if (record.type == DescriptorRecordType::UnorderedAccessView) {
+      if (resource->GetBuffer()) {
+        if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
+          mirror->ClearTextureSlot(slot);
+          return;
+        }
+        bool read = (arg->Flags >> 10) & 1;
+        bool write = (arg->Flags >> 10) & 2;
+        if (!read && !write) {
+          read = true;
+          write = true;
+        }
+        auto binding = CreateUnorderedAccessTextureBufferBinding(
+            device_->GetMTLDevice(), *resource, record,
+            WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+        if (!binding) {
+          mirror->ClearTextureSlot(slot);
+          return;
+        }
+        auto buffer = Rc<Buffer>(resource->GetBuffer());
+        FillBindlessTextureBufferMirrorSlot(
+            enc, *mirror, slot, stage, buffer, binding->first, binding->second,
+            (read ? ResourceAccess::Read : 0) |
+                (write ? ResourceAccess::Write : 0) | ResourceAccess::UAV);
+        return;
+      }
       if (record.has_desc &&
-          record.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+          record.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        mirror->ClearTextureSlot(slot);
         return;
+      }
+      if (!resource->GetTexture()) {
+        mirror->ClearTextureSlot(slot);
+        return;
+      }
       if (resource->IsReservedTexture() &&
-          !resource->EnsureTextureAllocation("FillBindlessMirrorSlot"))
+          !resource->EnsureTextureAllocation("FillBindlessMirrorSlot")) {
+        mirror->ClearTextureSlot(slot);
         return;
+      }
       const auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
                                                          *resource, record);
-      if (!view || !view.texture.ptr())
+      if (!view || !view.texture.ptr()) {
+        mirror->ClearTextureSlot(slot);
         return;
+      }
       auto *allocation = view.texture->current();
-      if (!allocation)
+      if (!allocation) {
+        mirror->ClearTextureSlot(slot);
         return;
+      }
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
@@ -10342,9 +10733,7 @@ private:
          range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) &&
         (record.type == DescriptorRecordType::ShaderResourceView ||
          record.type == DescriptorRecordType::UnorderedAccessView)) {
-      auto *resource = GetResource(record.resource.ptr());
-      if (resource && resource->GetTexture())
-        FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
+      FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
     }
   }
 
@@ -11098,6 +11487,55 @@ private:
     AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
 
+  struct BindlessMirrorWindow {
+    AllocatedArgumentBufferSlice texture;
+    AllocatedArgumentBufferSlice sampler;
+    uint32_t texture_field_pairs = 0;
+  };
+
+  static bool IsBindlessTextureMirrorArgument(
+      const MTL_SM50_SHADER_ARGUMENT &arg) {
+    return (arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
+           (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+  }
+
+  static uint32_t CountBindlessTextureMirrorFieldPairs(
+      const MTL_SM50_SHADER_ARGUMENT *arguments, uint32_t argument_count) {
+    uint32_t count = 0;
+    if (!arguments)
+      return count;
+    for (uint32_t i = 0; i < argument_count; i++)
+      if (IsBindlessTextureMirrorArgument(arguments[i]))
+        count++;
+    return count;
+  }
+
+  static const MTL_SM50_SHADER_ARGUMENT *
+  FindBindlessMirrorArgument(const MTL_SM50_SHADER_ARGUMENT *arguments,
+                             uint32_t argument_count, SM50BindingType type,
+                             UINT shader_register, UINT register_space) {
+    if (!arguments)
+      return nullptr;
+
+    for (UINT i = 0; i < argument_count; i++) {
+      const auto &argument = arguments[i];
+      if (argument.Type != type)
+        continue;
+      const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+      const auto lower =
+          argument.RegisterCount ? argument.RegisterLowerBound
+                                 : argument.SM50BindingSlot;
+      const auto count = ShaderArgumentRangeCount(argument);
+      if (space != register_space || shader_register < lower)
+        continue;
+      const auto local = shader_register - lower;
+      if (count != UINT_MAX && local >= count)
+        continue;
+      return &argument;
+    }
+    return nullptr;
+  }
+
   struct DescriptorTableBindingRecipeDiagStats {
     std::atomic<uint64_t> get_calls = 0;
     std::atomic<uint64_t> get_ns = 0;
@@ -11781,8 +12219,17 @@ private:
       return false;
 
     auto *mirror = probe.descriptor->mirror;
-    const uint64_t *slot = mirror ? mirror->slotPtr(probe.absolute_slot) : nullptr;
-    const uint64_t handle = slot ? slot[0] : 0;
+    const bool sampler_heap = mirror && mirror->isSamplerHeap();
+    const uint64_t *handle_ptr =
+        !mirror ? nullptr
+                : sampler_heap ? mirror->samplerHandlePtr(probe.absolute_slot)
+                               : mirror->textureHandlePtr(probe.absolute_slot);
+    const uint64_t *meta_ptr =
+        !mirror ? nullptr
+                : sampler_heap ? mirror->samplerLodBiasPtr(probe.absolute_slot)
+                               : mirror->textureMetadataPtr(probe.absolute_slot);
+    const uint64_t handle = handle_ptr ? *handle_ptr : 0;
+    const uint64_t meta = meta_ptr ? *meta_ptr : 0;
     const uint64_t filled_gen =
         mirror ? mirror->slotFilledGeneration(probe.absolute_slot) : 0;
     const uint64_t stale_gen =
@@ -11803,9 +12250,10 @@ private:
           draw_diag->vs_tex_null++;
       }
     }
-    if (!null_handle && !snapshot_base_diverged)
+    const bool sample = BindlessMirrorDiagShouldLog();
+    if (!null_handle && !snapshot_base_diverged && !sample)
       return false;
-    if (!BindlessMirrorDiagShouldLog())
+    if (!sample)
       return null_handle;
     const char *fill_state = filled_gen == stale_gen
                                  ? (filled_gen ? "filled" : "never-filled")
@@ -11826,10 +12274,13 @@ private:
          " filledGen=", filled_gen,
          " staleGen=", stale_gen,
          " handle=", handle,
+         " meta=", meta,
          " liveBase=", probe.has_live_base ? probe.live_base : UINT32_MAX,
          " descriptorSlot=", probe.descriptor->heap_index,
+         " descriptorType=", uint32_t(probe.descriptor->type),
+         " hasDesc=", probe.descriptor->has_desc ? 1 : 0,
          " reason=", snapshot_base_diverged ? "snapshot-base-diverged"
-                                            : "null-handle");
+                                            : null_handle ? "null-handle" : "sample");
     return null_handle;
   }
 
@@ -11854,6 +12305,7 @@ private:
   BuildBindlessRootOffsets(ArgumentEncodingContext &enc, const ReplayState &state,
                            const PipelineState &pipeline, const RootSignature &root,
                            PipelineStage want_stage, bool compute,
+                           BindlessMirrorWindow *window = nullptr,
                            BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto *shader = FindShaderForStage(pipeline, want_stage);
     if (!shader)
@@ -11863,18 +12315,71 @@ private:
     if (!arguments || !argument_count)
       return {};
 
-    // Size root_offsets to cover the largest texture/sampler StructurePtrOffset (+1).
-    // (Buffer args also have StructurePtrOffsets but are not indexed via root_offsets;
-    // sizing by the max over tex/sampler args keeps the buffer tight while in-range.)
+    std::vector<uint32_t> texture_bases(argument_count, UINT_MAX);
+    std::vector<uint32_t> sampler_bases(argument_count, UINT_MAX);
+    std::vector<uint32_t> static_sampler_bases(argument_count, UINT_MAX);
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    const uint32_t texture_field_pairs =
+        CountBindlessTextureMirrorFieldPairs(arguments, argument_count);
+
+    // Size root_offsets to cover the largest texture/sampler StructurePtrOffset (+1)
+    // and assign each reflected range a compact base in its per-stage mirror window.
+    // The D3D12 heap may be huge; the Metal typed argument buffer only needs the
+    // descriptor ranges this shader can actually index.
     uint32_t max_key_plus_one = 0;
     for (UINT i = 0; i < argument_count; i++) {
       const auto &arg = arguments[i];
-      const bool is_tex_or_sampler =
-          arg.Type == SM50BindingType::Sampler ||
-          ((arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
-           (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE));
-      if (is_tex_or_sampler)
+      const bool is_sampler = arg.Type == SM50BindingType::Sampler;
+      const bool is_texture =
+          (arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
+          (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+      if (is_sampler || is_texture) {
         max_key_plus_one = std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
+        const auto count = ShaderArgumentRangeCount(arg);
+        if (is_sampler) {
+          sampler_bases[i] = sampler_count;
+          sampler_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
+                                             sampler_count + count);
+        } else {
+          texture_bases[i] = texture_count;
+          texture_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
+                                             texture_count + count);
+        }
+      }
+    }
+    for (const auto &sampler_desc : root.GetStaticSamplers()) {
+      bool visible = false;
+      ForEachVisibleStage(sampler_desc.ShaderVisibility, compute,
+                          [&](PipelineStage s) {
+                            if (s == want_stage)
+                              visible = true;
+                          });
+      if (!visible)
+        continue;
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &arg = arguments[i];
+        if (arg.Type != SM50BindingType::Sampler)
+          continue;
+        const auto space = arg.RegisterCount ? arg.RegisterSpace : 0;
+        const auto lower =
+            arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
+        if (space != sampler_desc.RegisterSpace ||
+            sampler_desc.ShaderRegister < lower)
+          continue;
+        const auto local = sampler_desc.ShaderRegister - lower;
+        const auto count = ShaderArgumentRangeCount(arg);
+        if (count != UINT_MAX && local >= count)
+          continue;
+        if (static_sampler_bases[i] == UINT_MAX) {
+          static_sampler_bases[i] = sampler_count;
+          sampler_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
+                                             sampler_count + count);
+        }
+        max_key_plus_one =
+            std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
+        break;
+      }
     }
     if (!max_key_plus_one)
       return {};
@@ -11885,6 +12390,26 @@ private:
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
     std::memset(root_offsets, 0, slice.length);
+    if (window) {
+      if (texture_count) {
+        const uint64_t qwords =
+            uint64_t(dxmt::kBindlessMirrorCapacity) *
+            dxmt::kMirrorTextureQwords * texture_field_pairs;
+        window->texture_field_pairs = texture_field_pairs;
+        window->texture = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+            enc.currentSeqId(), qwords * sizeof(uint64_t));
+        if (window->texture.mapped)
+          std::memset(window->texture.mapped, 0, window->texture.length);
+      }
+      if (sampler_count) {
+        const uint64_t qwords =
+            uint64_t(dxmt::kBindlessMirrorCapacity) * dxmt::kMirrorSamplerQwords;
+        window->sampler = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+            enc.currentSeqId(), qwords * sizeof(uint64_t));
+        if (window->sampler.mapped)
+          std::memset(window->sampler.mapped, 0, window->sampler.length);
+      }
+    }
     std::vector<BindlessMirrorDiagProbe> bindless_diag_probes;
 
     const auto parameters = root.GetParameters();
@@ -11921,10 +12446,10 @@ private:
           if (argument.Type != binding_type)
             continue;
           // Only texture/sampler args go in root_offsets; buffers use buf_table.
-          const bool is_tex_or_sampler =
-              argument.Type == SM50BindingType::Sampler ||
-              (argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
-          if (!is_tex_or_sampler)
+          const bool is_sampler = argument.Type == SM50BindingType::Sampler;
+          const bool is_texture =
+              (argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) != 0;
+          if (!is_sampler && !is_texture)
             continue;
           const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
           const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
@@ -11943,7 +12468,53 @@ private:
           if (!descriptor)
             continue;
           if (argument.StructurePtrOffset < max_key_plus_one) {
-            root_offsets[argument.StructurePtrOffset] = descriptor->heap_index;
+            const auto compact_base =
+                is_sampler ? sampler_bases[i] : texture_bases[i];
+            if (compact_base == UINT_MAX)
+              continue;
+            root_offsets[argument.StructurePtrOffset] = compact_base;
+            if (window) {
+              const auto resolved_count = ShaderArgumentRangeCount(argument);
+              for (UINT local = 0;
+                   local < resolved_count && descriptor_index + local < count;
+                   local++) {
+                if (compact_base + local >= dxmt::kBindlessMirrorCapacity)
+                  break;
+                const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+                    heap, base_handle, range_offset, descriptor_index + local,
+                    count, heap_type);
+                if (!slot_descriptor || !slot_descriptor->mirror)
+                  continue;
+                const auto source_slot = slot_descriptor->heap_index;
+                if (is_sampler && window->sampler.mapped) {
+                  auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+                  auto *src0 = slot_descriptor->mirror->samplerHandlePtr(source_slot);
+                  auto *src1 = slot_descriptor->mirror->samplerCubeHandlePtr(source_slot);
+                  auto *src2 = slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
+                  if (src0 && src1 && src2) {
+                    dst[compact_base + local] = *src0;
+                    dst[dxmt::kBindlessMirrorCapacity + compact_base + local] = *src1;
+                    dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
+                        compact_base + local] = *src2;
+                  }
+                } else if (is_texture && window->texture.mapped) {
+                  auto *dst = static_cast<uint64_t *>(window->texture.mapped);
+                  auto *src0 = slot_descriptor->mirror->textureHandlePtr(source_slot);
+                  auto *src1 = slot_descriptor->mirror->textureMetadataPtr(source_slot);
+                  if (src0 && src1) {
+                    for (uint32_t pair = 0; pair < window->texture_field_pairs;
+                         pair++) {
+                      const uint64_t pair_base =
+                          uint64_t(pair) * dxmt::kMirrorTextureQwords *
+                          dxmt::kBindlessMirrorCapacity;
+                      dst[pair_base + compact_base + local] = *src0;
+                      dst[pair_base + dxmt::kBindlessMirrorCapacity +
+                          compact_base + local] = *src1;
+                    }
+                  }
+                }
+              }
+            }
             if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
                 BindlessMirrorVerifyEnabled()) {
               const auto resolved_count = ShaderArgumentRangeCount(argument);
@@ -11980,6 +12551,46 @@ private:
           running_offset = range_offset + range.descriptor_count;
       }
     }
+    if (window && window->sampler.mapped) {
+      auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+      for (const auto &sampler_desc : root.GetStaticSamplers()) {
+        bool visible = false;
+        ForEachVisibleStage(sampler_desc.ShaderVisibility, compute,
+                            [&](PipelineStage s) {
+                              if (s == want_stage)
+                                visible = true;
+                            });
+        if (!visible)
+          continue;
+        auto sampler = CreateStaticSampler(sampler_desc);
+        if (!sampler)
+          continue;
+        uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
+        EncodeMirrorSamplerSlot(encoded, *sampler);
+        for (UINT i = 0; i < argument_count; i++) {
+          const auto &arg = arguments[i];
+          if (arg.Type != SM50BindingType::Sampler ||
+              static_sampler_bases[i] == UINT_MAX)
+            continue;
+          const auto space = arg.RegisterCount ? arg.RegisterSpace : 0;
+          const auto lower =
+              arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
+          if (space != sampler_desc.RegisterSpace ||
+              sampler_desc.ShaderRegister < lower)
+            continue;
+          const auto local = sampler_desc.ShaderRegister - lower;
+          const auto slot = static_sampler_bases[i] + local;
+          if (slot >= dxmt::kBindlessMirrorCapacity)
+            continue;
+          root_offsets[arg.StructurePtrOffset] = static_sampler_bases[i];
+          dst[slot] = encoded[0];
+          dst[dxmt::kBindlessMirrorCapacity + slot] = encoded[1];
+          dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + slot] =
+              encoded[2];
+          break;
+        }
+      }
+    }
     for (auto probe : bindless_diag_probes) {
       if (!probe.arg || probe.arg->StructurePtrOffset >= max_key_plus_one)
         continue;
@@ -11990,6 +12601,16 @@ private:
     }
     if (slice.needs_flush)
       slice.gpu_buffer.updateContents(slice.offset, slice.mapped, slice.length);
+    if (window) {
+      if (window->texture.needs_flush && window->texture.gpu_buffer)
+        window->texture.gpu_buffer.updateContents(
+            window->texture.offset, window->texture.mapped,
+            window->texture.length);
+      if (window->sampler.needs_flush && window->sampler.gpu_buffer)
+        window->sampler.gpu_buffer.updateContents(
+            window->sampler.offset, window->sampler.mapped,
+            window->sampler.length);
+    }
     return slice;
   }
 
@@ -12696,24 +13317,6 @@ private:
     return on;
   }
 
-  // Bindless-mirror (③.3): resolve the two persistent mirror buffers (texture mirror from the
-  // CBV/SRV/UAV heap, sampler mirror from the SAMPLER heap) bound in `state`. Empty WMT::Buffer
-  // if the heap or its mirror is absent (the caller then skips that slot's bind).
-  void ResolveBindlessMirrorBuffers(const ReplayState &state,
-                                    WMT::Buffer &tex_mirror,
-                                    WMT::Buffer &sampler_mirror) {
-    auto *cbv_heap =
-        GetBoundDescriptorHeap(state, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto *samp_heap =
-        GetBoundDescriptorHeap(state, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-    tex_mirror = (cbv_heap && cbv_heap->GetMirror())
-                     ? cbv_heap->GetMirror()->buffer()
-                     : WMT::Buffer{};
-    sampler_mirror = (samp_heap && samp_heap->GetMirror())
-                         ? samp_heap->GetMirror()->buffer()
-                         : WMT::Buffer{};
-  }
-
   // Bindless-mirror (③.3) live/compute per-stage wiring: for the bindless path, replace the
   // legacy encodeConstantBuffers/encodeShaderResources with (1) pack the slot-27 buf_table via the
   // ③.1 packers and (2) emit the per-draw deferred binds of buf_table(27) + root_offsets(28, ③.2)
@@ -12735,18 +13338,17 @@ private:
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
         DiagCurrentReplayRecordSerial());
+    BindlessMirrorWindow window = {};
     auto root_offsets =
         BuildBindlessRootOffsets(enc, state, pipeline, root, Stage, compute,
-                                 draw_diag);
+                                 &window, draw_diag);
     if (draw_diag)
       AddBindlessMirrorDiagBufTable(
           *draw_diag, Stage, shader.constantBufferInfo(),
           reflection.NumConstantBuffers, shader.resourceArgumentInfo(),
           reflection.NumArguments, bt);
-    WMT::Buffer tex_mirror, sampler_mirror;
-    ResolveBindlessMirrorBuffers(state, tex_mirror, sampler_mirror);
-    enc.bindBindlessTables<Stage>(bt.gpu_buffer, root_offsets.gpu_buffer,
-                                  tex_mirror, sampler_mirror);
+    enc.bindBindlessTables<Stage>(bt, root_offsets, window.texture,
+                                  window.sampler);
   }
 
   // Bindless-mirror (③.3) snapshot-path root_offsets: the snapshot replay has no live ReplayState,
@@ -12758,8 +13360,66 @@ private:
   BuildBindlessRootOffsetsFromSnapshot(ArgumentEncodingContext &enc,
                                        const GraphicsBindingSnapshot &snapshot,
                                        PipelineStage want_stage,
+                                       BindlessMirrorWindow *window = nullptr,
                                        BindlessMirrorDrawDiag *draw_diag = nullptr) {
+    const auto *pipeline = GetPipelineState(snapshot.pipeline_state.ptr());
+    const auto *shader = pipeline ? FindShaderForStage(*pipeline, want_stage) : nullptr;
+    const auto *arguments = shader ? shader->resourceArgumentInfo() : nullptr;
+    const auto argument_count = shader ? shader->reflection().NumArguments : 0u;
+
+    std::vector<uint32_t> texture_bases(argument_count ? argument_count : 1, UINT_MAX);
+    std::vector<uint32_t> sampler_bases(argument_count ? argument_count : 1, UINT_MAX);
+    std::vector<uint32_t> static_sampler_bases(argument_count ? argument_count : 1, UINT_MAX);
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    const uint32_t texture_field_pairs =
+        CountBindlessTextureMirrorFieldPairs(arguments, argument_count);
     uint32_t max_key_plus_one = 0;
+    if (arguments) {
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &arg = arguments[i];
+        const bool is_sampler = arg.Type == SM50BindingType::Sampler;
+        const bool is_texture =
+            (arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
+            (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+        if (!is_sampler && !is_texture)
+          continue;
+        max_key_plus_one =
+            std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
+        const auto count = ShaderArgumentRangeCount(arg);
+        if (is_sampler) {
+          sampler_bases[i] = sampler_count;
+          sampler_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
+                                             sampler_count + count);
+        } else {
+          texture_bases[i] = texture_count;
+          texture_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
+                                             texture_count + count);
+        }
+      }
+    }
+    const auto *root = snapshot.root_signature
+                           ? GetRootSignature(snapshot.root_signature.ptr())
+                           : nullptr;
+    if (root && arguments) {
+      for (const auto &sampler_desc : root->GetStaticSamplers()) {
+        const auto *arg = FindBindlessMirrorArgument(
+            arguments, argument_count, SM50BindingType::Sampler,
+            sampler_desc.ShaderRegister, sampler_desc.RegisterSpace);
+        if (!arg)
+          continue;
+        const auto index = uint32_t(arg - arguments);
+        if (static_sampler_bases[index] == UINT_MAX) {
+          static_sampler_bases[index] = sampler_count;
+          sampler_count = std::min<uint32_t>(
+              dxmt::kBindlessMirrorCapacity,
+              sampler_count + ShaderArgumentRangeCount(*arg));
+        }
+        max_key_plus_one =
+            std::max<uint32_t>(max_key_plus_one,
+                               arg->StructurePtrOffset + 1);
+      }
+    }
     for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor || entry.stage != want_stage)
@@ -12784,8 +13444,28 @@ private:
     // UINT32_MAX sentinel so the first real heap_index wins the min().
     for (uint32_t i = 0; i < max_key_plus_one; i++)
       root_offsets[i] = UINT32_MAX;
+    if (window) {
+      if (texture_count) {
+        const uint64_t qwords =
+            uint64_t(dxmt::kBindlessMirrorCapacity) *
+            dxmt::kMirrorTextureQwords * texture_field_pairs;
+        window->texture_field_pairs = texture_field_pairs;
+        window->texture = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+            enc.currentSeqId(), qwords * sizeof(uint64_t));
+        if (window->texture.mapped)
+          std::memset(window->texture.mapped, 0, window->texture.length);
+      }
+      if (sampler_count) {
+        const uint64_t qwords =
+            uint64_t(dxmt::kBindlessMirrorCapacity) * dxmt::kMirrorSamplerQwords;
+        window->sampler = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+            enc.currentSeqId(), qwords * sizeof(uint64_t));
+        if (window->sampler.mapped)
+          std::memset(window->sampler.mapped, 0, window->sampler.length);
+      }
+    }
 
-    for (const auto &entry : snapshot.entries) {
+	    for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor || entry.stage != want_stage)
         continue;
@@ -12802,8 +13482,82 @@ private:
       const auto local = entry.shader_register - entry.register_lower_bound;
       if (entry.descriptor.heap_index < local)
         continue;
-      auto &slot = root_offsets[entry.root_offset_key];
-      slot = std::min<uint32_t>(slot, entry.descriptor.heap_index - local);
+      uint32_t compact_base = UINT_MAX;
+      if (arguments) {
+        for (UINT i = 0; i < argument_count; i++) {
+          if (arguments[i].StructurePtrOffset != entry.root_offset_key ||
+              arguments[i].Type != arg.Type)
+            continue;
+          compact_base = arg.Type == SM50BindingType::Sampler
+                             ? sampler_bases[i]
+                             : texture_bases[i];
+          break;
+        }
+      }
+      if (compact_base == UINT_MAX)
+        continue;
+      root_offsets[entry.root_offset_key] = compact_base;
+      if (window && entry.descriptor.mirror) {
+        const auto dst_slot = compact_base + local;
+        if (dst_slot >= dxmt::kBindlessMirrorCapacity)
+          continue;
+        const auto source_slot = entry.descriptor.heap_index;
+        if (arg.Type == SM50BindingType::Sampler && window->sampler.mapped) {
+          auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+          auto *src0 = entry.descriptor.mirror->samplerHandlePtr(source_slot);
+          auto *src1 = entry.descriptor.mirror->samplerCubeHandlePtr(source_slot);
+          auto *src2 = entry.descriptor.mirror->samplerLodBiasPtr(source_slot);
+          if (src0 && src1 && src2) {
+            dst[dst_slot] = *src0;
+            dst[dxmt::kBindlessMirrorCapacity + dst_slot] = *src1;
+            dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + dst_slot] = *src2;
+          }
+        } else if ((arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) &&
+                   window->texture.mapped) {
+          auto *dst = static_cast<uint64_t *>(window->texture.mapped);
+          auto *src0 = entry.descriptor.mirror->textureHandlePtr(source_slot);
+          auto *src1 = entry.descriptor.mirror->textureMetadataPtr(source_slot);
+          if (src0 && src1) {
+            for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
+              const uint64_t pair_base =
+                  uint64_t(pair) * dxmt::kMirrorTextureQwords *
+                  dxmt::kBindlessMirrorCapacity;
+              dst[pair_base + dst_slot] = *src0;
+              dst[pair_base + dxmt::kBindlessMirrorCapacity + dst_slot] = *src1;
+            }
+          }
+        }
+	      }
+	    }
+    if (root && window && window->sampler.mapped && arguments) {
+      auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+      for (const auto &sampler_desc : root->GetStaticSamplers()) {
+        const auto *arg = FindBindlessMirrorArgument(
+            arguments, argument_count, SM50BindingType::Sampler,
+            sampler_desc.ShaderRegister, sampler_desc.RegisterSpace);
+        if (!arg)
+          continue;
+        const auto index = uint32_t(arg - arguments);
+        if (static_sampler_bases[index] == UINT_MAX)
+          continue;
+        const auto lower =
+            arg->RegisterCount ? arg->RegisterLowerBound : arg->SM50BindingSlot;
+        if (sampler_desc.ShaderRegister < lower)
+          continue;
+        const auto local = sampler_desc.ShaderRegister - lower;
+        const auto slot = static_sampler_bases[index] + local;
+        if (slot >= dxmt::kBindlessMirrorCapacity)
+          continue;
+        auto sampler = CreateStaticSampler(sampler_desc);
+        if (!sampler)
+          continue;
+        uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
+        EncodeMirrorSamplerSlot(encoded, *sampler);
+        root_offsets[arg->StructurePtrOffset] = static_sampler_bases[index];
+        dst[slot] = encoded[0];
+        dst[dxmt::kBindlessMirrorCapacity + slot] = encoded[1];
+        dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + slot] = encoded[2];
+      }
     }
     for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
@@ -12837,43 +13591,57 @@ private:
         root_offsets[i] = 0;
     if (slice.needs_flush)
       slice.gpu_buffer.updateContents(slice.offset, slice.mapped, slice.length);
-    return slice;
-  }
-
-  // Bindless-mirror (③.3) snapshot-path mirror buffers: bind the same persistent mirror buffers
-  // that ApplyGraphicsBindingSnapshot just filled through entry.descriptor.mirror. Resolving these
-  // from the snapshot descriptors avoids binding a stale capture-time heap mirror while the shader
-  // reads slots 29/30.
-  void ResolveBindlessMirrorBuffersFromSnapshot(
-      const GraphicsBindingSnapshot &snapshot, WMT::Buffer &tex_mirror,
-      WMT::Buffer &sampler_mirror) {
-    tex_mirror = {};
-    sampler_mirror = {};
-    for (const auto &entry : snapshot.entries) {
-      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
-          !entry.has_descriptor || !entry.descriptor.mirror)
-        continue;
-      auto *mirror = entry.descriptor.mirror;
-      if (mirror->isSamplerHeap()) {
-        if (!sampler_mirror)
-          sampler_mirror = mirror->buffer();
-      } else if (!tex_mirror) {
-        tex_mirror = mirror->buffer();
-      }
-      if (tex_mirror && sampler_mirror)
-        return;
+    if (window) {
+      if (window->texture.needs_flush && window->texture.gpu_buffer)
+        window->texture.gpu_buffer.updateContents(
+            window->texture.offset, window->texture.mapped,
+            window->texture.length);
+      if (window->sampler.needs_flush && window->sampler.gpu_buffer)
+        window->sampler.gpu_buffer.updateContents(
+            window->sampler.offset, window->sampler.mapped,
+            window->sampler.length);
     }
+    return slice;
   }
 
   // Bindless-mirror (③.3) snapshot-path per-stage wiring: pack the slot-27 buf_table (encode-time,
   // residency via packers) + bind 27/28/29/30. root_offsets is the slice pre-built from the
   // snapshot entries; mirror buffers are resolved from the same descriptor mirrors filled above.
   // Only Ordinary Vertex/Pixel.
+  static std::vector<ConstantBufferBinding>
+  BuildSnapshotConstantBufferBindings(const GraphicsBindingSnapshot &snapshot,
+                                      PipelineStage want_stage,
+                                      const MTL_SM50_SHADER_ARGUMENT *cbuffers,
+                                      uint32_t num_cbuffers) {
+    std::vector<ConstantBufferBinding> bindings(num_cbuffers);
+    if (!cbuffers || !num_cbuffers)
+      return bindings;
+
+    for (uint32_t i = 0; i < num_cbuffers; i++) {
+      const auto &arg = cbuffers[i];
+      for (const auto &entry : snapshot.entries) {
+        if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+            !entry.has_descriptor || entry.stage != want_stage ||
+            entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV)
+          continue;
+        const auto &entry_arg = entry.argument;
+        if (entry_arg.Type != SM50BindingType::ConstantBuffer)
+          continue;
+        if (entry_arg.RegisterSpace != arg.RegisterSpace ||
+            entry.shader_register != arg.RegisterLowerBound)
+          continue;
+        MakeConstantBufferBindingFromDescriptor(entry.descriptor, bindings[i]);
+        break;
+      }
+    }
+
+    return bindings;
+  }
+
   template <PipelineStage Stage>
   void EncodeShaderBindingsForStageBindlessSnapshot(
       ArgumentEncodingContext &enc, const PipelineDxilShader &shader,
       const std::string &shader_key, const GraphicsBindingSnapshot &snapshot,
-      const AllocatedArgumentBufferSlice &root_offsets,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto &reflection = shader.reflection();
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
@@ -12885,11 +13653,12 @@ private:
           *draw_diag, Stage, shader.constantBufferInfo(),
           reflection.NumConstantBuffers, shader.resourceArgumentInfo(),
           reflection.NumArguments, bt);
-    WMT::Buffer tex_mirror, sampler_mirror;
-    ResolveBindlessMirrorBuffersFromSnapshot(snapshot, tex_mirror,
-                                             sampler_mirror);
-    enc.bindBindlessTables<Stage>(bt.gpu_buffer, root_offsets.gpu_buffer,
-                                  tex_mirror, sampler_mirror);
+    BindlessMirrorWindow window = {};
+    auto compact_root_offsets =
+        BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, Stage, &window,
+                                             draw_diag);
+    enc.bindBindlessTables<Stage>(bt, compact_root_offsets, window.texture,
+                                  window.sampler);
   }
 
   void BindRootConstantsSnapshot(ArgumentEncodingContext &enc,
@@ -13010,22 +13779,13 @@ private:
     BindlessMirrorDrawDiag local_diag = {};
     BindlessMirrorDrawDiag &diag = draw_diag ? *draw_diag : local_diag;
     diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
-    // Bindless-mirror (③.3) snapshot path: pre-build per-stage root_offsets from the captured
-    // entries (no ReplayState here). A bindless PSO is never geometry/tess (off-gate), so only
-    // Ordinary Vertex/Pixel branch; the geometry/tess branches stay legacy.
+    // Bindless-mirror (③.3) snapshot path: root_offsets and compact mirror windows
+    // are rebuilt per stage from captured descriptors. A bindless PSO is never
+    // geometry/tess (off-gate), so only Ordinary Vertex/Pixel branch.
     const bool snapshot_bindless =
         snapshot.bindless && !use_geometry && !use_tessellation;
     diag.bindless_bound = snapshot_bindless;
     diag.path = BindlessMirrorDiagPathName(snapshot_bindless, true);
-    AllocatedArgumentBufferSlice ro_vertex, ro_pixel;
-    if (snapshot_bindless) {
-      ro_vertex =
-          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Vertex,
-                                               &diag);
-      ro_pixel =
-          BuildBindlessRootOffsetsFromSnapshot(enc, snapshot, PipelineStage::Pixel,
-                                               &diag);
-    }
     // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
     // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
     if (!snapshot.bindless && BindlessMirrorEnvEnabled())
@@ -13034,10 +13794,10 @@ private:
       if (snapshot_bindless) {
         if (shader.stage == PipelineShaderStage::Vertex)
           EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
-              enc, shader, key, snapshot, ro_vertex, &diag);
+              enc, shader, key, snapshot, &diag);
         else if (shader.stage == PipelineShaderStage::Pixel)
           EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
-              enc, shader, key, snapshot, ro_pixel, &diag);
+              enc, shader, key, snapshot, &diag);
         continue;
       }
       if (use_geometry) {
@@ -13930,11 +14690,10 @@ private:
       return;
 
     const auto &cache_key = pipeline.GetShaderCacheKey();
-    // Gate: the target composite PSO (bee0b725) gets a BOUNDED number of readbacks
-    // (regardless of the global log limit) so we can dump its LIVE cbuffer - including
-    // dynamically-indexed elements beyond the bound view - without the unbounded
-    // per-draw readback that stalls/crashes the game. Other PSOs respect the global
-    // limit as before. With DXMT_DIAG_D3D12_LIMIT=1 only the target effectively fires.
+    // Gate: the target composite PSO (bee0b725) gets a bounded number of readbacks
+    // so we can dump its LIVE cbuffer - including dynamically-indexed elements
+    // beyond the bound view - without the unbounded per-draw readback that
+    // stalls/crashes the game.
     const bool target_pso = DiagIsTargetCompositePso(cache_key);
     static std::atomic<uint32_t> target_count = 0;
     bool log_readback = false;
@@ -14435,11 +15194,15 @@ private:
         binding_cache.valid &&
         binding_cache.graphics_generation == packet.binding_generation &&
         binding_cache.descriptor_content_generation ==
-            packet.descriptor_content_generation;
+            packet.descriptor_content_generation &&
+        binding_cache.content_fingerprint == packet.binding_content_fingerprint;
     const bool fingerprint_hit =
         binding_cache.valid && !generation_hit &&
         binding_cache.content_fingerprint == packet.binding_content_fingerprint;
-    const bool skip_binding_snapshot = generation_hit || fingerprint_hit;
+    const bool bindless_snapshot =
+        packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
+        packet.binding_snapshot.bindless && !packet.use_geometry &&
+        !packet.use_tessellation;
     if (D3D12DiagBindingRecipeCacheEnabled()) {
       auto &stats = BindingRecipeDiagStats();
       if (generation_hit)
@@ -14457,6 +15220,12 @@ private:
         !packet.use_tessellation;
     bindless_diag.path =
         BindlessMirrorDiagPathName(bindless_diag.bindless_bound, true);
+    bool restored_legacy_argbuf = false;
+    if (!bindless_diag.bindless_bound && BindlessMirrorEnvEnabled())
+      restored_legacy_argbuf = enc.restorePerPassArgbufIfMirrorBound<false>();
+    const bool skip_binding_snapshot =
+        !bindless_snapshot && !restored_legacy_argbuf &&
+        (generation_hit || fingerprint_hit);
     if (!skip_binding_snapshot && packet.pipeline) {
       ApplyGraphicsBindingSnapshot(enc, packet.binding_snapshot,
                                    *packet.pipeline, packet.use_geometry,
@@ -16129,6 +16898,7 @@ private:
 
   enum class PendingOperationType {
     Execute,
+    QueueWork,
     Signal,
     Wait,
   };
@@ -16137,6 +16907,7 @@ private:
     PendingOperationType type = PendingOperationType::Execute;
     std::vector<std::vector<CommandRecord>> command_records;
     std::vector<SubmittedCommandAllocatorUse> allocator_uses;
+    std::function<bool(CommandChunk *)> queue_work;
     Fence *fence = nullptr;
     UINT64 value = 0;
     bool wait_callback_armed = false;
@@ -16149,6 +16920,7 @@ private:
         : type(other.type),
           command_records(std::move(other.command_records)),
           allocator_uses(std::move(other.allocator_uses)),
+          queue_work(std::move(other.queue_work)),
           fence(other.fence),
           value(other.value),
           wait_callback_armed(other.wait_callback_armed),
@@ -16161,6 +16933,7 @@ private:
         type = other.type;
         command_records = std::move(other.command_records);
         allocator_uses = std::move(other.allocator_uses);
+        queue_work = std::move(other.queue_work);
         fence = other.fence;
         value = other.value;
         wait_callback_armed = other.wait_callback_armed;
@@ -16418,6 +17191,44 @@ private:
                " queue=", reinterpret_cast<uintptr_t>(this),
                " queueType=", desc_.Type,
                " submittedBatches=", submitted_batches_);
+        }
+        break;
+      }
+      case PendingOperationType::QueueWork: {
+        bool has_gpu_work = false;
+        if (operation.queue_work) {
+          auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
+          has_gpu_work = operation.queue_work(chunk);
+        }
+
+        std::vector<PendingOperation> coalesced_signals;
+        {
+          lock_begin = clock::now();
+          std::lock_guard lock(mutex_);
+          while (has_gpu_work && !pending_operations_.empty() &&
+                 pending_operations_.front().type == PendingOperationType::Signal) {
+            coalesced_signals.push_back(std::move(pending_operations_.front()));
+            pending_operations_.pop_front();
+          }
+          RecordExecuteDrainTime(
+              perf_stats, dxmt::perf::ExecuteTimeBucket::DrainLock,
+              clock::now() - lock_begin);
+        }
+
+        if (has_gpu_work) {
+          const auto signal_begin = clock::now();
+          for (auto &signal : coalesced_signals)
+            EncodeFenceSignal(signal.fence, signal.value, "coalesced");
+          RecordExecuteDrainTime(
+              perf_stats, dxmt::perf::ExecuteTimeBucket::Signal,
+              clock::now() - signal_begin);
+
+          const auto commit_begin = clock::now();
+          device_->GetDXMTDevice().queue().CommitCurrentChunk();
+          RecordExecuteDrainTime(
+              perf_stats, dxmt::perf::ExecuteTimeBucket::Commit,
+              clock::now() - commit_begin);
+          submitted_batches_++;
         }
         break;
       }

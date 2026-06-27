@@ -28,17 +28,8 @@ static bool
 D3D12QueryDiagShouldLog(std::atomic<uint32_t> &counter) {
   if (!D3D12QueryDiagEnabled())
     return false;
-  auto value = env::getEnvVar("DXMT_DIAG_QUERY_LIMIT");
-  if (value.empty())
-    value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
-  uint32_t limit = 2000;
-  if (!value.empty()) {
-    char *end = nullptr;
-    const auto parsed = std::strtoul(value.c_str(), &end, 10);
-    if (end != value.c_str())
-      limit = static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
-  }
-  return counter.fetch_add(1, std::memory_order_relaxed) < limit;
+  counter.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 class QueryHeapImpl final : public ComObjectWithInitialRef<ID3D12QueryHeap>,

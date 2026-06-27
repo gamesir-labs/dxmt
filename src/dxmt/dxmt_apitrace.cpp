@@ -10,11 +10,7 @@
 
 #include <atomic>
 #include <cstdlib>
-#include <ctime>
-#include <filesystem>
-#include <limits>
 #include <string>
-#include <system_error>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -77,61 +73,6 @@ ends_with(const std::string &value, const char *suffix) {
          value.compare(value.size() - suffix_string.size(), suffix_string.size(), suffix_string) == 0;
 }
 
-std::string
-join_unix_path(const std::string &base, const std::string &child) {
-  if (base.empty())
-    return child;
-  if (base.back() == '/')
-    return base + child;
-  return base + "/" + child;
-}
-
-std::string
-process_trace_bundle_name() {
-  auto name = env::getExeName();
-#ifdef _WIN32
-  name += "." + std::to_string(GetCurrentProcessId());
-#endif
-  return name + ".apitrace";
-}
-
-std::string
-trace_session_timestamp() {
-  std::time_t now;
-  std::time(&now);
-  char timestamp[32] = {};
-  std::strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%S", std::localtime(&now));
-  return timestamp;
-}
-
-bool
-path_exists(const std::string &path) {
-  std::error_code error;
-  return std::filesystem::exists(std::filesystem::path(path), error);
-}
-
-std::string
-unique_bundle_root_in_directory(const std::string &directory, const std::string &bundle_name) {
-  const auto base_path = join_unix_path(directory, bundle_name);
-  if (!path_exists(base_path))
-    return base_path;
-
-  std::string stem = bundle_name;
-  if (ends_with(stem, ".apitrace"))
-    stem.resize(stem.size() - std::string(".apitrace").size());
-
-  const auto timestamp = trace_session_timestamp();
-  for (unsigned attempt = 1; attempt < 1000; ++attempt) {
-    const auto candidate = join_unix_path(
-        directory,
-        stem + "-" + timestamp + "-" + std::to_string(attempt) + ".apitrace");
-    if (!path_exists(candidate))
-      return candidate;
-  }
-
-  return join_unix_path(directory, stem + "-" + timestamp + "-overflow.apitrace");
-}
-
 void
 set_env_var(const char *name, const char *value) {
 #ifdef _WIN32
@@ -167,22 +108,7 @@ default_bundle_root() {
 }
 
 std::string
-bundle_root_from_output_dir(const std::string &value) {
-  if (value.empty())
-    return {};
-
-  const auto unix_path = env::getUnixPath(value);
-  if (unix_path.empty())
-    return {};
-
-  env::createDirectory(unix_path);
-  return unique_bundle_root_in_directory(unix_path, process_trace_bundle_name());
-}
-
-std::string
-bundle_root_from_env(const std::string &value, bool *directory_mode) {
-  if (directory_mode)
-    *directory_mode = false;
+bundle_root_from_env(const std::string &value) {
   if (value.empty())
     return {};
 
@@ -193,14 +119,13 @@ bundle_root_from_env(const std::string &value, bool *directory_mode) {
   if (ends_with(unix_path, ".apitrace"))
     return unix_path;
 
-  if (directory_mode)
-    *directory_mode = true;
-  return bundle_root_from_output_dir(unix_path);
+  WARN("DXMT apitrace: ignoring APITRACE_TRACE_BUNDLE because it is not a .apitrace bundle: ", unix_path.c_str());
+  return {};
 }
 
 void
 initialize_bundle_root() {
-  auto trace_bundle = bundle_root_from_env(env::getEnvVar(kTraceBundleEnv), nullptr);
+  auto trace_bundle = bundle_root_from_env(env::getEnvVar(kTraceBundleEnv));
 
   if (trace_bundle.empty())
     trace_bundle = default_bundle_root();
