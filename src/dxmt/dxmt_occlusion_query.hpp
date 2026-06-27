@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace dxmt {
@@ -199,6 +200,13 @@ public:
 
 class TimestampQuery {
 public:
+  ~TimestampQuery() {
+#if DXMT_DX12_METAL4
+    if (release_sample_ && sample_index_ != ~0ull)
+      release_sample_(sample_index_);
+#endif
+  }
+
   void
   incRef() {
     refcount_.fetch_add(1u, std::memory_order_acquire);
@@ -234,6 +242,11 @@ public:
   }
 
   void
+  setSampleSequence(uint64_t sample_sequence) {
+    sample_sequence_ = sample_sequence;
+  }
+
+  void
   setSampleIndex(uint64_t sample_index) {
     sample_index_ = sample_index;
   }
@@ -247,9 +260,11 @@ public:
 #if DXMT_DX12_METAL4
   void
   setResolveSource(const WMT::Reference<WMT::CounterHeap> &heap,
-                   uint64_t heap_entry_size) {
+                   uint64_t heap_entry_size,
+                   std::function<void(uint64_t)> release_sample = {}) {
     resolve_heap_ = heap;
     resolve_heap_entry_size_ = heap_entry_size;
+    release_sample_ = std::move(release_sample);
   }
 
   WMT::Reference<WMT::CounterHeap>
@@ -270,6 +285,7 @@ private:
 #if DXMT_DX12_METAL4
   WMT::Reference<WMT::CounterHeap> resolve_heap_;
   uint64_t resolve_heap_entry_size_ = 0;
+  std::function<void(uint64_t)> release_sample_;
 #endif
   std::atomic<uint32_t> refcount_ = {0u};
 };
@@ -281,31 +297,49 @@ public:
   TimestampReadbackSBuf(
       WMT::Device device, WMT::CommandBuffer cmdbuf, uint64_t num_samples, TimestampQueryList &&queries
   ) :
-      queries_(std::move(queries)),
-      num_samples_(num_samples) {
+      queries_(std::move(queries)) {
+    (void)cmdbuf;
 #if DXMT_DX12_METAL4
-    WMT::Error error = {};
+    (void)num_samples;
     timestamp_context_ = device.newTimestampContext();
-    heap_entry_size_ = device.timestampHeapEntrySize();
-    timestamp_heap_ = device.newTimestampCounterHeap(num_samples, &error);
     assert(timestamp_context_);
-    assert(timestamp_heap_);
-    assert(heap_entry_size_ >= sizeof(WMTMTL4TimestampHeapEntry));
-    for (const auto &[query, sample_index] : queries_)
-      query->setResolveSource(timestamp_heap_, heap_entry_size_);
 #else
     sample_buffer_ = device.newCounterSampleBuffer(num_samples, true);
+    num_samples_ = num_samples;
 #endif
   }
 
   ~TimestampReadbackSBuf() {
     // TODO: small_vector opt
 #if DXMT_DX12_METAL4
-    std::vector<uint8_t> resolved(num_samples_ * heap_entry_size_);
-    timestamp_heap_.resolveCounterRange(0, num_samples_, resolved.data(), resolved.size());
+    std::unordered_map<obj_handle_t, std::vector<std::pair<Rc<TimestampQuery>, uint64_t>>> groups;
     for (const auto &[query, sample_index] : queries_) {
-      auto *entry = reinterpret_cast<const WMTMTL4TimestampHeapEntry *>(resolved.data() + sample_index * heap_entry_size_);
-      query->issue(entry->timestamp);
+      auto heap = query->resolveHeap();
+      if (!heap || !query->resolveHeapEntrySize())
+        continue;
+      groups[heap.handle].push_back({query, sample_index});
+    }
+
+    for (auto &[heap_handle, group] : groups) {
+      if (group.empty())
+        continue;
+      uint64_t heap_entry_size = group.front().first->resolveHeapEntrySize();
+      uint64_t first = group.front().second;
+      uint64_t last = first;
+      for (const auto &[query, sample_index] : group) {
+        first = std::min(first, sample_index);
+        last = std::max(last, sample_index);
+      }
+
+      WMT::CounterHeap heap(heap_handle);
+      std::vector<uint8_t> resolved((last - first + 1) * heap_entry_size);
+      heap.resolveCounterRange(first, last - first + 1,
+                               resolved.data(), resolved.size());
+      for (const auto &[query, sample_index] : group) {
+        auto *entry = reinterpret_cast<const WMTMTL4TimestampHeapEntry *>(
+            resolved.data() + (sample_index - first) * heap_entry_size);
+        query->issue(entry->timestamp);
+      }
     }
     timestamp_context_.destroy();
 #else
@@ -321,15 +355,6 @@ public:
   TimestampReadbackSBuf(TimestampReadbackSBuf &&) = delete;
 
 #if DXMT_DX12_METAL4
-  WMT::CounterHeap counterHeap() {
-    return timestamp_heap_;
-  };
-
-  uint64_t
-  heapEntrySize() const {
-    return heap_entry_size_;
-  }
-
   WMT::TimestampContext timestampContext() {
     return timestamp_context_;
   }
@@ -344,12 +369,10 @@ private:
   TimestampQueryList queries_;
 #if DXMT_DX12_METAL4
   WMT::TimestampContext timestamp_context_;
-  WMT::Reference<WMT::CounterHeap> timestamp_heap_;
-  uint64_t heap_entry_size_;
 #else
   WMT::Reference<WMT::CounterSampleBuffer> sample_buffer_;
-#endif
   uint64_t num_samples_;
+#endif
 };
 
 class TimestampReadbackCBuf {

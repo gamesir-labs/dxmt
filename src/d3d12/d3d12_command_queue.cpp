@@ -6033,6 +6033,12 @@ private:
 
   uint64_t AllocateTimestampSample(TimestampQuery *query) {
     SyncTimestampSampleAllocator();
+#if DXMT_DX12_METAL4
+    if (query->resolveHeap()) {
+      query->setSampleSequence(current_timestamp_sample_sequence_);
+      return query->sampleIndex();
+    }
+#endif
     const auto sample_index = current_timestamp_sample_count_++;
     query->setSampleLocation(current_timestamp_sample_sequence_, sample_index);
     return sample_index;
@@ -6186,8 +6192,7 @@ private:
     if (sample.index == ~0ull)
       return false;
 #if DXMT_DX12_METAL4
-    return (sample.heap && sample.heap_entry_size) ||
-           sequence == current_sequence;
+    return sample.heap && sample.heap_entry_size;
 #else
     return sequence == current_sequence;
 #endif

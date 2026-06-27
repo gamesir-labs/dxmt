@@ -4219,11 +4219,12 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::SampleTimestamp: {
       auto data = static_cast<SampleTimestampData *>(current);
 #if DXMT_DX12_METAL4
-      if (auto readback = readbacks.timestamp.get(); readback->counterHeap()) {
+      if (auto readback = readbacks.timestamp.get()) {
         auto timestamp_context = readback->timestampContext();
         for (const auto &query : data->queries) {
-          if (query->sampleIndex() != ~0ull)
-            timestamp_context.writeTimestamp(cmdbuf, readback->counterHeap(), query->sampleIndex());
+          auto heap = query->resolveHeap();
+          if (heap && query->sampleIndex() != ~0ull)
+            timestamp_context.writeTimestamp(cmdbuf, heap, query->sampleIndex());
         }
       }
 #else
@@ -4268,17 +4269,13 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::ResolveTimestamp: {
       auto data = static_cast<ResolveTimestampData *>(current);
 #if DXMT_DX12_METAL4
-      if (auto readback = readbacks.timestamp.get()) {
-        for (const auto &range : data->ranges) {
-          WMT::CounterHeap heap =
-              range.src_heap ? WMT::CounterHeap(range.src_heap)
-                             : readback->counterHeap();
-          if (!heap)
-            continue;
-          cmdbuf.resolveCounterHeap(
-              heap, range.start_index, range.query_count,
-              range.dst_buffer, range.dst_offset, range.dst_length);
-        }
+      for (const auto &range : data->ranges) {
+        if (!range.src_heap)
+          continue;
+        cmdbuf.resolveCounterHeap(
+            WMT::CounterHeap(range.src_heap), range.start_index,
+            range.query_count, range.dst_buffer, range.dst_offset,
+            range.dst_length);
       }
 #else
       if (auto readback = readbacks.timestamp.get()) {

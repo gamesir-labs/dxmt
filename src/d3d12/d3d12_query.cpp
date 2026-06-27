@@ -8,6 +8,8 @@
 #include "util_string.hpp"
 #include <atomic>
 #include <cstring>
+#include <memory>
+#include <mutex>
 
 namespace dxmt::d3d12 {
 namespace {
@@ -36,7 +38,11 @@ class QueryHeapImpl final : public ComObjectWithInitialRef<ID3D12QueryHeap>,
                             public QueryHeap {
 public:
   QueryHeapImpl(IMTLD3D12Device *device, const D3D12_QUERY_HEAP_DESC &desc)
-      : device_(device), desc_(desc), queries_(desc.Count) {}
+      : device_(device), desc_(desc)
+#if DXMT_DX12_METAL4
+        , timestamp_pages_(std::make_shared<TimestampPageState>())
+#endif
+        , queries_(desc.Count) {}
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) override {
@@ -132,6 +138,9 @@ public:
     }
     auto &query = queries_[index];
     query.timestamp = new TimestampQuery();
+#if DXMT_DX12_METAL4
+    AssignTimestampSample(*query.timestamp, index);
+#endif
     query.valid = false;
     return query.timestamp;
   }
@@ -295,6 +304,86 @@ public:
   }
 
 private:
+#if DXMT_DX12_METAL4
+  struct TimestampPage {
+    WMT::Reference<WMT::CounterHeap> heap;
+    uint64_t entry_size = 0;
+    std::vector<bool> occupied;
+  };
+
+  struct TimestampPageState {
+    std::mutex mutex;
+    std::vector<TimestampPage> pages;
+  };
+
+  void AssignTimestampSample(TimestampQuery &query, UINT d3d_index) {
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP)
+      return;
+
+    auto state = timestamp_pages_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    const auto page_index = FindTimestampPage(*state, d3d_index);
+    if (page_index == size_t(-1))
+      return;
+
+    auto &page = state->pages[page_index];
+    page.occupied[d3d_index] = true;
+    query.setSampleIndex(d3d_index);
+    query.setResolveSource(
+        page.heap, page.entry_size,
+        [state = std::move(state), page_index](uint64_t slot) {
+          ReleaseTimestampSample(*state, page_index, slot);
+        });
+  }
+
+  static void ReleaseTimestampSample(TimestampPageState &state,
+                                     size_t page_index,
+                                     uint64_t d3d_index) {
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (page_index >= state.pages.size())
+      return;
+
+    auto &page = state.pages[page_index];
+    if (d3d_index < page.occupied.size())
+      page.occupied[d3d_index] = false;
+  }
+
+  size_t FindTimestampPage(TimestampPageState &state, UINT d3d_index) {
+    for (size_t i = 0; i < state.pages.size(); i++) {
+      auto &page = state.pages[i];
+      if (d3d_index < page.occupied.size() && !page.occupied[d3d_index])
+        return i;
+    }
+
+    return CreateTimestampPage(state);
+  }
+
+  size_t CreateTimestampPage(TimestampPageState &state) {
+    WMT::Device device = device_->GetMTLDevice();
+    const uint64_t native_count = std::max<uint64_t>(desc_.Count, 2);
+    WMT::Error error = {};
+    auto heap = device.newTimestampCounterHeap(native_count, &error);
+    const uint64_t entry_size = device.timestampHeapEntrySize();
+    if (!heap || entry_size < sizeof(WMTMTL4TimestampHeapEntry)) {
+      WARN("D3D12QueryHeap: Metal timestamp counter heap unavailable"
+           " d3dCount=", desc_.Count,
+           " nativeCount=", native_count,
+           " heap=", bool(heap),
+           " entrySize=", entry_size);
+      return size_t(-1);
+    }
+
+    TimestampPage page = {};
+    page.heap = std::move(heap);
+    page.entry_size = entry_size;
+    page.occupied.assign(desc_.Count, false);
+    state.pages.push_back(std::move(page));
+    return state.pages.size() - 1;
+  }
+#endif
+
   struct QueryData {
     bool began = false;
     bool valid = false;
@@ -347,6 +436,9 @@ private:
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
   D3D12_QUERY_HEAP_DESC desc_ = {};
+#if DXMT_DX12_METAL4
+  std::shared_ptr<TimestampPageState> timestamp_pages_;
+#endif
   std::vector<QueryData> queries_;
   std::string name_;
 };
