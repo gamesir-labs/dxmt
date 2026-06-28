@@ -12327,6 +12327,42 @@ private:
     uint32_t texture_field_pairs = 0;
   };
 
+  struct BindlessMirrorStagePlanEntry {
+    uint32_t root_index = 0;
+    uint32_t range_offset = 0;
+    uint32_t descriptor_index = 0;
+    uint32_t descriptor_count = 0;
+    uint32_t shader_register_lower_bound = 0;
+    uint32_t root_offset_key = 0;
+    uint32_t compact_base = 0;
+    uint32_t range_count = 0;
+    uint16_t argument_index = 0;
+    D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    bool sampler = false;
+    bool texture = false;
+  };
+
+  struct BindlessMirrorStaticSamplerPlanEntry {
+    D3D12_STATIC_SAMPLER_DESC desc = {};
+    uint32_t root_offset_key = 0;
+    uint32_t compact_base = 0;
+    uint32_t compact_slot = 0;
+  };
+
+  struct BindlessMirrorStagePlan {
+    const void *root_sig = nullptr;
+    const void *pso = nullptr;
+    PipelineStage stage = PipelineStage::Vertex;
+    bool compute = false;
+    uint32_t max_key_plus_one = 0;
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    uint32_t texture_field_pairs = 0;
+    std::vector<BindlessMirrorStagePlanEntry> entries;
+    std::vector<BindlessMirrorStaticSamplerPlanEntry> static_samplers;
+  };
+
   static bool IsBindlessTextureMirrorArgument(
       const MTL_SM50_SHADER_ARGUMENT &arg) {
     return (arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
@@ -13118,19 +13154,192 @@ private:
     return null_handle;
   }
 
-  // Bindless-mirror (Stage-1 sub-step ③.2): build the per-draw slot-28 root_offsets for
-  // ONE shader stage. root_offsets[arg.StructurePtrOffset] = the ABSOLUTE heap slot of
-  // the FIRST descriptor of that texture/sampler arg's descriptor-table range, so the
-  // shader computes mirror[ root_offsets[arg] + (reg - range.LowerBound) ] == the slot
-  // FillBindlessMirrorSlot wrote (mirror[descriptor->heap_index]). Per the hybrid ABI
-  // (BINDLESS-ABI.md §4), only TEXTURE/SAMPLER args get a root_offsets entry; BUFFER args
-  // (CBV/SRV-buffer/UAV-buffer) are addressed by the compile-time buf_table compact_base
-  // (slot 27) and are NOT written here.
-  //
-  // DORMANT in ③.2: defined but not yet called. ALSO gated on the slot-30 mirror layout
-  // matching airconv (see [[bindless-slot30-layout-mismatch]]); root_offsets values here
-  // (absolute heap base slot, keyed by StructurePtrOffset) are correct under the intended
-  // single-shared-array slot-30 layout that the airconv fix must land.
+  BindlessMirrorStagePlan
+  BuildBindlessMirrorStagePlan(const PipelineState &pipeline,
+                               const RootSignature &root,
+                               PipelineStage want_stage, bool compute) {
+    BindlessMirrorStagePlan plan = {};
+    plan.root_sig = &root;
+    plan.pso = &pipeline;
+    plan.stage = want_stage;
+    plan.compute = compute;
+
+    const auto *shader = FindShaderForStage(pipeline, want_stage);
+    if (!shader)
+      return plan;
+    const auto *arguments = shader->resourceArgumentInfo();
+    const auto argument_count = shader->reflection().NumArguments;
+    if (!arguments || !argument_count)
+      return plan;
+
+    std::vector<uint32_t> texture_bases(argument_count, UINT_MAX);
+    std::vector<uint32_t> sampler_bases(argument_count, UINT_MAX);
+    std::vector<uint32_t> static_sampler_bases(argument_count, UINT_MAX);
+    plan.texture_field_pairs =
+        CountBindlessTextureMirrorFieldPairs(arguments, argument_count);
+
+    for (UINT i = 0; i < argument_count; i++) {
+      const auto &arg = arguments[i];
+      const bool is_sampler = arg.Type == SM50BindingType::Sampler;
+      const bool is_texture = IsBindlessTextureMirrorArgument(arg);
+      if (!is_sampler && !is_texture)
+        continue;
+
+      plan.max_key_plus_one =
+          std::max<uint32_t>(plan.max_key_plus_one,
+                             arg.StructurePtrOffset + 1);
+      const auto count = ShaderArgumentRangeCount(arg);
+      if (is_sampler) {
+        sampler_bases[i] = plan.sampler_count;
+        plan.sampler_count = std::min<uint32_t>(
+            dxmt::kBindlessMirrorCapacity, plan.sampler_count + count);
+      } else {
+        texture_bases[i] = plan.texture_count;
+        plan.texture_count = std::min<uint32_t>(
+            dxmt::kBindlessMirrorCapacity, plan.texture_count + count);
+      }
+    }
+
+    for (const auto &sampler_desc : root.GetStaticSamplers()) {
+      bool visible = false;
+      ForEachVisibleStage(sampler_desc.ShaderVisibility, compute,
+                          [&](PipelineStage s) {
+                            if (s == want_stage)
+                              visible = true;
+                          });
+      if (!visible)
+        continue;
+
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &arg = arguments[i];
+        if (arg.Type != SM50BindingType::Sampler)
+          continue;
+        const auto space = arg.RegisterCount ? arg.RegisterSpace : 0;
+        const auto lower =
+            arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
+        if (space != sampler_desc.RegisterSpace ||
+            sampler_desc.ShaderRegister < lower)
+          continue;
+        const auto local = sampler_desc.ShaderRegister - lower;
+        const auto count = ShaderArgumentRangeCount(arg);
+        if (count != UINT_MAX && local >= count)
+          continue;
+        if (static_sampler_bases[i] == UINT_MAX) {
+          static_sampler_bases[i] = plan.sampler_count;
+          plan.sampler_count = std::min<uint32_t>(
+              dxmt::kBindlessMirrorCapacity, plan.sampler_count + count);
+        }
+        const auto slot = static_sampler_bases[i] + local;
+        if (slot < dxmt::kBindlessMirrorCapacity) {
+          plan.static_samplers.push_back(BindlessMirrorStaticSamplerPlanEntry{
+              sampler_desc, arg.StructurePtrOffset, static_sampler_bases[i],
+              slot});
+          plan.max_key_plus_one =
+              std::max<uint32_t>(plan.max_key_plus_one,
+                                 arg.StructurePtrOffset + 1);
+        }
+        break;
+      }
+    }
+
+    const auto parameters = root.GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        continue;
+      bool visible = false;
+      ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
+        if (s == want_stage)
+          visible = true;
+      });
+      if (!visible)
+        continue;
+
+      UINT running_offset = 0;
+      for (const auto &range : parameter.ranges) {
+        const auto range_offset = DescriptorRangeOffset(range, running_offset);
+        const auto count =
+            range.descriptor_count == UINT_MAX
+                ? ReflectedDescriptorRangeCount(
+                      pipeline, range, parameter.visibility, compute)
+                : range.descriptor_count;
+        const auto binding_type = BindingTypeForRange(range.range_type);
+        const auto heap_type = DescriptorHeapTypeForRange(range.range_type);
+
+        for (UINT i = 0; i < argument_count; i++) {
+          const auto &argument = arguments[i];
+          if (argument.Type != binding_type)
+            continue;
+          const bool is_sampler = argument.Type == SM50BindingType::Sampler;
+          const bool is_texture = IsBindlessTextureMirrorArgument(argument);
+          if (!is_sampler && !is_texture)
+            continue;
+          const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+          const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
+                                                    : argument.SM50BindingSlot;
+          if (space != range.register_space ||
+              lower < range.base_shader_register)
+            continue;
+          const auto descriptor_index = lower - range.base_shader_register;
+          if (descriptor_index >= count)
+            continue;
+          const auto compact_base =
+              is_sampler ? sampler_bases[i] : texture_bases[i];
+          if (compact_base == UINT_MAX)
+            continue;
+          plan.entries.push_back(BindlessMirrorStagePlanEntry{
+              root_index,
+              range_offset,
+              descriptor_index,
+              count,
+              lower,
+              argument.StructurePtrOffset,
+              compact_base,
+              ShaderArgumentRangeCount(argument),
+              uint16_t(i),
+              range.range_type,
+              heap_type,
+              is_sampler,
+              is_texture});
+        }
+        if (range.descriptor_count != UINT_MAX)
+          running_offset = range_offset + range.descriptor_count;
+      }
+    }
+
+    return plan;
+  }
+
+  const BindlessMirrorStagePlan &
+  GetBindlessMirrorStagePlan(const PipelineState &pipeline,
+                             const RootSignature &root,
+                             PipelineStage want_stage, bool compute) {
+    uint64_t key =
+        uint64_t(reinterpret_cast<uintptr_t>(&root)) * 0x9e3779b97f4a7c15ull;
+    key ^= uint64_t(reinterpret_cast<uintptr_t>(&pipeline)) +
+           0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= uint64_t(want_stage) + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+    key ^= uint64_t(compute ? 1 : 0) + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+
+    auto it = bindless_stage_plan_cache_.find(key);
+    if (it == bindless_stage_plan_cache_.end() ||
+        it->second.root_sig != &root || it->second.pso != &pipeline ||
+        it->second.stage != want_stage || it->second.compute != compute) {
+      it = bindless_stage_plan_cache_
+               .insert_or_assign(key, BuildBindlessMirrorStagePlan(
+                                          pipeline, root, want_stage, compute))
+               .first;
+    }
+    return it->second;
+  }
+
+  // Bindless-mirror: build the per-draw slot-28 root_offsets for ONE shader
+  // stage. root_offsets[arg.StructurePtrOffset] is the compact mirror-window
+  // base assigned by BindlessMirrorStagePlan; descriptor heap slots are copied
+  // into that compact window below. Per the hybrid ABI, only TEXTURE/SAMPLER
+  // args get a root_offsets entry. BUFFER args use the slot-27 buf_table.
   //
   // Returns the ring slice (slot-28 buffer) holding uint32 root_offsets[N], or an empty
   // slice if the stage has no texture/sampler args. The compute/graphics distinction is
@@ -13150,93 +13359,29 @@ private:
     if (!arguments || !argument_count)
       return {};
 
-    std::vector<uint32_t> texture_bases(argument_count, UINT_MAX);
-    std::vector<uint32_t> sampler_bases(argument_count, UINT_MAX);
-    std::vector<uint32_t> static_sampler_bases(argument_count, UINT_MAX);
-    uint32_t texture_count = 0;
-    uint32_t sampler_count = 0;
-    const uint32_t texture_field_pairs =
-        CountBindlessTextureMirrorFieldPairs(arguments, argument_count);
-
-    // Size root_offsets to cover the largest texture/sampler StructurePtrOffset (+1)
-    // and assign each reflected range a compact base in its per-stage mirror window.
-    // The D3D12 heap may be huge; the Metal typed argument buffer only needs the
-    // descriptor ranges this shader can actually index.
-    uint32_t max_key_plus_one = 0;
-    for (UINT i = 0; i < argument_count; i++) {
-      const auto &arg = arguments[i];
-      const bool is_sampler = arg.Type == SM50BindingType::Sampler;
-      const bool is_texture =
-          (arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
-          (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
-      if (is_sampler || is_texture) {
-        max_key_plus_one = std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
-        const auto count = ShaderArgumentRangeCount(arg);
-        if (is_sampler) {
-          sampler_bases[i] = sampler_count;
-          sampler_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
-                                             sampler_count + count);
-        } else {
-          texture_bases[i] = texture_count;
-          texture_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
-                                             texture_count + count);
-        }
-      }
-    }
-    for (const auto &sampler_desc : root.GetStaticSamplers()) {
-      bool visible = false;
-      ForEachVisibleStage(sampler_desc.ShaderVisibility, compute,
-                          [&](PipelineStage s) {
-                            if (s == want_stage)
-                              visible = true;
-                          });
-      if (!visible)
-        continue;
-      for (UINT i = 0; i < argument_count; i++) {
-        const auto &arg = arguments[i];
-        if (arg.Type != SM50BindingType::Sampler)
-          continue;
-        const auto space = arg.RegisterCount ? arg.RegisterSpace : 0;
-        const auto lower =
-            arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
-        if (space != sampler_desc.RegisterSpace ||
-            sampler_desc.ShaderRegister < lower)
-          continue;
-        const auto local = sampler_desc.ShaderRegister - lower;
-        const auto count = ShaderArgumentRangeCount(arg);
-        if (count != UINT_MAX && local >= count)
-          continue;
-        if (static_sampler_bases[i] == UINT_MAX) {
-          static_sampler_bases[i] = sampler_count;
-          sampler_count = std::min<uint32_t>(dxmt::kBindlessMirrorCapacity,
-                                             sampler_count + count);
-        }
-        max_key_plus_one =
-            std::max<uint32_t>(max_key_plus_one, arg.StructurePtrOffset + 1);
-        break;
-      }
-    }
-    if (!max_key_plus_one)
+    const auto &plan =
+        GetBindlessMirrorStagePlan(pipeline, root, want_stage, compute);
+    if (!plan.max_key_plus_one)
       return {};
 
     auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
-        enc.currentSeqId(), uint64_t(max_key_plus_one) * sizeof(uint32_t));
+        enc.currentSeqId(), uint64_t(plan.max_key_plus_one) * sizeof(uint32_t));
     if (!slice.mapped || !slice.gpu_buffer)
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
     std::memset(root_offsets, 0, slice.length);
     if (window) {
-      if (texture_count) {
+      if (plan.texture_count) {
         const uint64_t qwords =
             uint64_t(dxmt::kBindlessMirrorCapacity) *
-            dxmt::kMirrorTextureQwords * texture_field_pairs;
-        window->texture_field_pairs = texture_field_pairs;
+            dxmt::kMirrorTextureQwords * plan.texture_field_pairs;
+        window->texture_field_pairs = plan.texture_field_pairs;
         window->texture = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
             enc.currentSeqId(), qwords * sizeof(uint64_t));
         if (window->texture.mapped)
           std::memset(window->texture.mapped, 0, window->texture.length);
       }
-      if (sampler_count) {
+      if (plan.sampler_count) {
         const uint64_t qwords =
             uint64_t(dxmt::kBindlessMirrorCapacity) * dxmt::kMirrorSamplerQwords;
         window->sampler = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
@@ -13247,187 +13392,124 @@ private:
     }
     std::vector<BindlessMirrorDiagProbe> bindless_diag_probes;
 
-    const auto parameters = root.GetParameters();
-    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
-      const auto &parameter = parameters[root_index];
-      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+    for (const auto &entry : plan.entries) {
+      if (entry.argument_index >= argument_count ||
+          entry.root_offset_key >= plan.max_key_plus_one)
         continue;
-      // Only this stage's tables matter for this stage's root_offsets.
-      bool visible = false;
-      ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
-        if (s == want_stage)
-          visible = true;
-      });
-      if (!visible)
-        continue;
-
-      const auto base_handle = GetTableHandle(state, compute, root_index);
+      const auto &argument = arguments[entry.argument_index];
+      const auto base_handle = GetTableHandle(state, compute, entry.root_index);
       if (!base_handle.ptr)
         continue;
 
-      UINT running_offset = 0;
-      for (const auto &range : parameter.ranges) {
-        const auto range_offset = DescriptorRangeOffset(range, running_offset);
-        const auto count =
-            range.descriptor_count == UINT_MAX
-                ? ReflectedDescriptorRangeCount(pipeline, range, parameter.visibility, compute)
-                : range.descriptor_count;
-        const auto binding_type = BindingTypeForRange(range.range_type);
-        const auto heap_type = DescriptorHeapTypeForRange(range.range_type);
-        auto *heap = GetBoundDescriptorHeap(state, heap_type);
-
-        for (UINT i = 0; i < argument_count; i++) {
-          const auto &argument = arguments[i];
-          if (argument.Type != binding_type)
+      auto *heap = GetBoundDescriptorHeap(state, entry.heap_type);
+      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+          heap, base_handle, entry.range_offset, entry.descriptor_index,
+          entry.descriptor_count, entry.heap_type);
+      if (!descriptor)
+        continue;
+      root_offsets[entry.root_offset_key] = entry.compact_base;
+      if (window) {
+        for (UINT local = 0;
+             local < entry.range_count &&
+             entry.descriptor_index + local < entry.descriptor_count;
+             local++) {
+          if (entry.compact_base + local >= dxmt::kBindlessMirrorCapacity)
+            break;
+          const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+              heap, base_handle, entry.range_offset,
+              entry.descriptor_index + local, entry.descriptor_count,
+              entry.heap_type);
+          if (!slot_descriptor || !slot_descriptor->mirror)
             continue;
-          // Only texture/sampler args go in root_offsets; buffers use buf_table.
-          const bool is_sampler = argument.Type == SM50BindingType::Sampler;
-          const bool is_texture =
-              (argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) != 0;
-          if (!is_sampler && !is_texture)
-            continue;
-          const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
-          const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
-                                                    : argument.SM50BindingSlot;
-          if (space != range.register_space)
-            continue;
-          if (lower < range.base_shader_register)
-            continue;
-          const auto descriptor_index = lower - range.base_shader_register;
-          if (descriptor_index >= count)
-            continue;
-          // Resolve the range-base descriptor (reg == LowerBound) and read its absolute
-          // heap slot; that is root_offsets[arg]. The shader adds (reg - LowerBound).
-          const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
-              heap, base_handle, range_offset, descriptor_index, count, heap_type);
-          if (!descriptor)
-            continue;
-          if (argument.StructurePtrOffset < max_key_plus_one) {
-            const auto compact_base =
-                is_sampler ? sampler_bases[i] : texture_bases[i];
-            if (compact_base == UINT_MAX)
-              continue;
-            root_offsets[argument.StructurePtrOffset] = compact_base;
-            if (window) {
-              const auto resolved_count = ShaderArgumentRangeCount(argument);
-              for (UINT local = 0;
-                   local < resolved_count && descriptor_index + local < count;
-                   local++) {
-                if (compact_base + local >= dxmt::kBindlessMirrorCapacity)
-                  break;
-                const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
-                    heap, base_handle, range_offset, descriptor_index + local,
-                    count, heap_type);
-                if (!slot_descriptor || !slot_descriptor->mirror)
-                  continue;
-                const auto source_slot = slot_descriptor->heap_index;
-                if (is_sampler && window->sampler.mapped) {
-                  auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
-                  auto *src0 = slot_descriptor->mirror->samplerHandlePtr(source_slot);
-                  auto *src1 = slot_descriptor->mirror->samplerCubeHandlePtr(source_slot);
-                  auto *src2 = slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
-                  if (src0 && src1 && src2) {
-                    dst[compact_base + local] = *src0;
-                    dst[dxmt::kBindlessMirrorCapacity + compact_base + local] = *src1;
-                    dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
-                        compact_base + local] = *src2;
-                  }
-                } else if (is_texture && window->texture.mapped) {
-                  auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-                  auto *src0 = slot_descriptor->mirror->textureHandlePtr(source_slot);
-                  auto *src1 = slot_descriptor->mirror->textureMetadataPtr(source_slot);
-                  if (src0 && src1) {
-                    for (uint32_t pair = 0; pair < window->texture_field_pairs;
-                         pair++) {
-                      const uint64_t pair_base =
-                          uint64_t(pair) * dxmt::kMirrorTextureQwords *
-                          dxmt::kBindlessMirrorCapacity;
-                      dst[pair_base + compact_base + local] = *src0;
-                      dst[pair_base + dxmt::kBindlessMirrorCapacity +
-                          compact_base + local] = *src1;
-                    }
-                  }
-                }
-              }
+          const auto source_slot = slot_descriptor->heap_index;
+          if (entry.sampler && window->sampler.mapped) {
+            auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+            auto *src0 = slot_descriptor->mirror->samplerHandlePtr(source_slot);
+            auto *src1 =
+                slot_descriptor->mirror->samplerCubeHandlePtr(source_slot);
+            auto *src2 =
+                slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
+            if (src0 && src1 && src2) {
+              dst[entry.compact_base + local] = *src0;
+              dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + local] =
+                  *src1;
+              dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
+                  entry.compact_base + local] = *src2;
             }
-            if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
-                BindlessMirrorVerifyEnabled()) {
-              const auto resolved_count = ShaderArgumentRangeCount(argument);
-              for (UINT local = 0;
-                   local < resolved_count && descriptor_index + local < count;
-                   local++) {
-                const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
-                    heap, base_handle, range_offset, descriptor_index + local,
-                    count, heap_type);
-                if (slot_descriptor)
-                  VerifyBindlessMirrorSamplerDescriptor(
-                      enc, *slot_descriptor, want_stage, &argument);
-              }
-            }
-            if (BindlessMirrorDiagEnabled() &&
-                range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
-              const auto resolved_count = ShaderArgumentRangeCount(argument);
-              for (UINT local = 0;
-                   local < resolved_count && descriptor_index + local < count;
-                   local++) {
-                const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
-                    heap, base_handle, range_offset, descriptor_index + local,
-                    count, heap_type);
-                if (!slot_descriptor)
-                  continue;
-                bindless_diag_probes.push_back(BindlessMirrorDiagProbe{
-                    "live", want_stage, &argument, lower + local, lower, 0, 0,
-                    0, false, slot_descriptor});
+          } else if (entry.texture && window->texture.mapped) {
+            auto *dst = static_cast<uint64_t *>(window->texture.mapped);
+            auto *src0 = slot_descriptor->mirror->textureHandlePtr(source_slot);
+            auto *src1 =
+                slot_descriptor->mirror->textureMetadataPtr(source_slot);
+            if (src0 && src1) {
+              for (uint32_t pair = 0; pair < window->texture_field_pairs;
+                   pair++) {
+                const uint64_t pair_base =
+                    uint64_t(pair) * dxmt::kMirrorTextureQwords *
+                    dxmt::kBindlessMirrorCapacity;
+                dst[pair_base + entry.compact_base + local] = *src0;
+                dst[pair_base + dxmt::kBindlessMirrorCapacity +
+                    entry.compact_base + local] = *src1;
               }
             }
           }
         }
-        if (range.descriptor_count != UINT_MAX)
-          running_offset = range_offset + range.descriptor_count;
+      }
+      if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
+          BindlessMirrorVerifyEnabled()) {
+        for (UINT local = 0;
+             local < entry.range_count &&
+             entry.descriptor_index + local < entry.descriptor_count;
+             local++) {
+          const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+              heap, base_handle, entry.range_offset,
+              entry.descriptor_index + local, entry.descriptor_count,
+              entry.heap_type);
+          if (slot_descriptor)
+            VerifyBindlessMirrorSamplerDescriptor(enc, *slot_descriptor,
+                                                  want_stage, &argument);
+        }
+      }
+      if (BindlessMirrorDiagEnabled() &&
+          entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+        for (UINT local = 0;
+             local < entry.range_count &&
+             entry.descriptor_index + local < entry.descriptor_count;
+             local++) {
+          const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+              heap, base_handle, entry.range_offset,
+              entry.descriptor_index + local, entry.descriptor_count,
+              entry.heap_type);
+          if (!slot_descriptor)
+            continue;
+          bindless_diag_probes.push_back(BindlessMirrorDiagProbe{
+              "live", want_stage, &argument,
+              entry.shader_register_lower_bound + local,
+              entry.shader_register_lower_bound, 0, 0, 0, false,
+              slot_descriptor});
+        }
       }
     }
     if (window && window->sampler.mapped) {
       auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
-      for (const auto &sampler_desc : root.GetStaticSamplers()) {
-        bool visible = false;
-        ForEachVisibleStage(sampler_desc.ShaderVisibility, compute,
-                            [&](PipelineStage s) {
-                              if (s == want_stage)
-                                visible = true;
-                            });
-        if (!visible)
+      for (const auto &entry : plan.static_samplers) {
+        if (entry.root_offset_key >= plan.max_key_plus_one ||
+            entry.compact_slot >= dxmt::kBindlessMirrorCapacity)
           continue;
-        auto sampler = CreateStaticSampler(sampler_desc);
+        auto sampler = CreateStaticSampler(entry.desc);
         if (!sampler)
           continue;
         uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
         EncodeMirrorSamplerSlot(encoded, *sampler);
-        for (UINT i = 0; i < argument_count; i++) {
-          const auto &arg = arguments[i];
-          if (arg.Type != SM50BindingType::Sampler ||
-              static_sampler_bases[i] == UINT_MAX)
-            continue;
-          const auto space = arg.RegisterCount ? arg.RegisterSpace : 0;
-          const auto lower =
-              arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
-          if (space != sampler_desc.RegisterSpace ||
-              sampler_desc.ShaderRegister < lower)
-            continue;
-          const auto local = sampler_desc.ShaderRegister - lower;
-          const auto slot = static_sampler_bases[i] + local;
-          if (slot >= dxmt::kBindlessMirrorCapacity)
-            continue;
-          root_offsets[arg.StructurePtrOffset] = static_sampler_bases[i];
-          dst[slot] = encoded[0];
-          dst[dxmt::kBindlessMirrorCapacity + slot] = encoded[1];
-          dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + slot] =
-              encoded[2];
-          break;
-        }
+        root_offsets[entry.root_offset_key] = entry.compact_base;
+        dst[entry.compact_slot] = encoded[0];
+        dst[dxmt::kBindlessMirrorCapacity + entry.compact_slot] = encoded[1];
+        dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + entry.compact_slot] =
+            encoded[2];
       }
     }
     for (auto probe : bindless_diag_probes) {
-      if (!probe.arg || probe.arg->StructurePtrOffset >= max_key_plus_one)
+      if (!probe.arg || probe.arg->StructurePtrOffset >= plan.max_key_plus_one)
         continue;
       const auto local = probe.shader_register - probe.lower_bound;
       probe.root_offset = root_offsets[probe.arg->StructurePtrOffset];
@@ -18146,6 +18228,7 @@ private:
         // Within a batch every referenced PSO/root-sig is pinned alive by the
         // command records, so intra-batch (PSO*,root_sig*) reuse is safe.
         binding_plan_cache_.clear();
+        bindless_stage_plan_cache_.clear();
         RecordExecuteDrainTime(
             perf_stats, dxmt::perf::ExecuteTimeBucket::DrainLock,
             clock::now() - lock_begin);
@@ -18437,6 +18520,7 @@ private:
   // re-checked on hit; CLEARED once per Execute batch (intra-batch all PSOs/
   // root-sigs are pinned alive by the command records, so no ABA within batch).
   std::unordered_map<uint64_t, BindingPlan> binding_plan_cache_;
+  std::unordered_map<uint64_t, BindlessMirrorStagePlan> bindless_stage_plan_cache_;
   std::deque<PendingOperation> pending_operations_;
   bool draining_pending_operations_ = false;
   std::mutex mutex_;
