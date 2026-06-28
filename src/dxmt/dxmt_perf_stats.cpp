@@ -100,6 +100,13 @@ struct Counters {
   std::atomic<uint64_t> drawable_acquire_count = {0};
   std::atomic<uint64_t> drawable_acquire_us = {0};
   std::atomic<uint64_t> drawable_acquire_max_us = {0};
+  std::atomic<uint64_t> descriptor_content_writes = {0};
+  std::atomic<uint64_t> descriptor_content_write_cbv = {0};
+  std::atomic<uint64_t> descriptor_content_write_srv = {0};
+  std::atomic<uint64_t> descriptor_content_write_uav = {0};
+  std::atomic<uint64_t> descriptor_content_write_sampler = {0};
+  std::atomic<uint64_t> descriptor_content_write_copy = {0};
+  std::atomic<uint64_t> descriptor_content_write_feedback_uav = {0};
   std::atomic<uint64_t> avg_command_buffers = {0};
   std::atomic<uint64_t> avg_render_passes = {0};
   std::atomic<uint64_t> avg_render_draws = {0};
@@ -166,7 +173,7 @@ void addDurationToBucket(FrameStatistics &stats, FrameTimeBucket bucket,
   case FrameTimeBucket::CreatePipeline:
     stats.frame_create_pipeline_interval += duration;
     break;
-  case FrameTimeBucket::OtherD3D12:
+  case FrameTimeBucket::UnscopedD3D12Api:
     stats.frame_other_d3d12_interval += duration;
     break;
   case FrameTimeBucket::CommandListRecord:
@@ -473,6 +480,19 @@ void recordExecuteTime(FrameStatistics *stats, ExecuteTimeBucket bucket,
   addDurationToBucket(*stats, bucket, duration);
 }
 
+void recordReplayBreakdown(FrameStatistics *stats,
+                           dxmt::clock::duration record_loop,
+                           dxmt::clock::duration flush_pass,
+                           dxmt::clock::duration timestamp_resolve,
+                           dxmt::clock::duration cpu_query_resolve) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_replay_record_loop_interval += record_loop;
+  stats->frame_replay_flush_pass_interval += flush_pass;
+  stats->frame_replay_timestamp_resolve_interval += timestamp_resolve;
+  stats->frame_replay_cpu_query_resolve_interval += cpu_query_resolve;
+}
+
 void recordFrameBoundary(uint64_t frame) {
   if (!enabled())
     return;
@@ -485,6 +505,29 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                          uint64_t frame_wall_us) {
   if (!enabled())
     return;
+
+  auto frame_stats_with_external = frame_stats;
+  frame_stats_with_external.frame_descriptor_content_writes =
+      g_counters.descriptor_content_writes.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_descriptor_content_write_cbv =
+      g_counters.descriptor_content_write_cbv.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_descriptor_content_write_srv =
+      g_counters.descriptor_content_write_srv.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_descriptor_content_write_uav =
+      g_counters.descriptor_content_write_uav.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_descriptor_content_write_sampler =
+      g_counters.descriptor_content_write_sampler.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_descriptor_content_write_copy =
+      g_counters.descriptor_content_write_copy.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_descriptor_content_write_feedback_uav =
+      g_counters.descriptor_content_write_feedback_uav.exchange(
+          0, std::memory_order_relaxed);
 
   g_counters.frames.fetch_add(1, std::memory_order_relaxed);
   g_counters.frame_wall_us.fetch_add(frame_wall_us,
@@ -519,10 +562,8 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
   const auto create_heap_us = durationUs(frame_stats.frame_create_heap_interval);
   const auto create_pipeline_us =
       durationUs(frame_stats.frame_create_pipeline_interval);
-  const auto other_d3d12_us =
+  const auto unscoped_d3d12_api_us =
       durationUs(frame_stats.frame_other_d3d12_interval);
-  // PERF DIAG: observe-only (NOT added to accountedWall) so it shows how much of
-  // otherWall is the DXMT command-list record phase on this thread.
   const auto cmdlist_record_us =
       durationUs(frame_stats.frame_cmdlist_record_interval);
   const auto present_latency_wait_us =
@@ -549,12 +590,92 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_execute_commit_interval);
   const auto execute_wait_arm_us =
       durationUs(frame_stats.frame_execute_wait_arm_interval);
+  const auto replay_record_loop_us =
+      durationUs(frame_stats.frame_replay_record_loop_interval);
+  const auto replay_flush_pass_us =
+      durationUs(frame_stats.frame_replay_flush_pass_interval);
+  const auto replay_timestamp_resolve_us =
+      durationUs(frame_stats.frame_replay_timestamp_resolve_interval);
+  const auto replay_cpu_query_resolve_us =
+      durationUs(frame_stats.frame_replay_cpu_query_resolve_interval);
+  const auto replay_timed_us =
+      replay_record_loop_us + replay_flush_pass_us + replay_timestamp_resolve_us +
+      replay_cpu_query_resolve_us;
+  const auto replay_unaccounted_us =
+      execute_replay_us > replay_timed_us ? execute_replay_us - replay_timed_us : 0;
+  const auto replay_get_pipeline_us =
+      durationUs(frame_stats.frame_replay_get_pipeline_interval);
+  const auto replay_get_metal_pso_us =
+      durationUs(frame_stats.frame_replay_get_metal_pso_interval);
+  const auto replay_select_pso_us =
+      durationUs(frame_stats.frame_replay_select_pso_interval);
+  const auto replay_desc_access_us =
+      durationUs(frame_stats.frame_replay_desc_access_interval);
+  const auto replay_state_update_us =
+      durationUs(frame_stats.frame_replay_state_update_interval);
+  const auto replay_attach_us =
+      durationUs(frame_stats.frame_replay_attach_interval);
+  const auto replay_bind_snapshot_us =
+      durationUs(frame_stats.frame_replay_bind_snapshot_interval);
+  const auto replay_estimate_us =
+      durationUs(frame_stats.frame_replay_estimate_interval);
+  const auto replay_packet_us =
+      durationUs(frame_stats.frame_replay_packet_interval);
+  const auto replay_queue_us =
+      durationUs(frame_stats.frame_replay_queue_interval);
+  const auto replay_emit_us =
+      durationUs(frame_stats.frame_replay_emit_interval);
+  const auto replay_flush_blit_us =
+      durationUs(frame_stats.frame_replay_flush_blit_interval);
+  const auto replay_flush_compute_us =
+      durationUs(frame_stats.frame_replay_flush_compute_interval);
+  const auto replay_flush_graphics_us =
+      durationUs(frame_stats.frame_replay_flush_graphics_interval);
+  const auto replay_flush_barrier_us =
+      durationUs(frame_stats.frame_replay_flush_barrier_interval);
+  const auto replay_build_plan_us =
+      durationUs(frame_stats.frame_replay_build_plan_interval);
+  const auto replay_emit_timestamp_us =
+      durationUs(frame_stats.frame_replay_emit_timestamp_interval);
+  const auto replay_record_draw_us =
+      durationUs(frame_stats.frame_replay_record_draw_interval);
+  const auto replay_record_draw_indexed_us =
+      durationUs(frame_stats.frame_replay_record_draw_indexed_interval);
+  const auto replay_record_dispatch_us =
+      durationUs(frame_stats.frame_replay_record_dispatch_interval);
+  const auto replay_record_pipeline_state_us =
+      durationUs(frame_stats.frame_replay_record_pipeline_state_interval);
+  const auto replay_record_descriptor_heaps_us =
+      durationUs(frame_stats.frame_replay_record_descriptor_heaps_interval);
+  const auto replay_record_root_signature_us =
+      durationUs(frame_stats.frame_replay_record_root_signature_interval);
+  const auto replay_record_root_table_us =
+      durationUs(frame_stats.frame_replay_record_root_table_interval);
+  const auto replay_record_root_descriptor_us =
+      durationUs(frame_stats.frame_replay_record_root_descriptor_interval);
+  const auto replay_record_root_constants_us =
+      durationUs(frame_stats.frame_replay_record_root_constants_interval);
+  const auto replay_record_vertex_index_state_us =
+      durationUs(frame_stats.frame_replay_record_vertex_index_state_interval);
+  const auto replay_record_render_targets_us =
+      durationUs(frame_stats.frame_replay_record_render_targets_interval);
+  const auto replay_record_resource_barrier_us =
+      durationUs(frame_stats.frame_replay_record_resource_barrier_interval);
+  const auto replay_record_copy_clear_resolve_us =
+      durationUs(frame_stats.frame_replay_record_copy_clear_resolve_interval);
+  const auto replay_record_query_us =
+      durationUs(frame_stats.frame_replay_record_query_interval);
+  const auto replay_record_execute_indirect_us =
+      durationUs(frame_stats.frame_replay_record_execute_indirect_interval);
+  const auto replay_record_temporal_upscale_us =
+      durationUs(frame_stats.frame_replay_record_temporal_upscale_interval);
   const auto execute_known_us =
       execute_validate_us + execute_collect_us + execute_enqueue_us +
       execute_drain_us;
-  const auto execute_other_us = execute_command_lists_us > execute_known_us
-                                    ? execute_command_lists_us - execute_known_us
-                                    : 0;
+  const auto execute_unscoped_us =
+      execute_command_lists_us > execute_known_us
+          ? execute_command_lists_us - execute_known_us
+          : 0;
   const auto flush_collect_us = durationUs(frame_stats.flush_collect_interval);
   const auto flush_relation_us =
       durationUs(frame_stats.flush_relation_interval);
@@ -580,17 +701,19 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       flush_blit_us + flush_clear_us + flush_resolve_us + flush_scaler_us +
       flush_present_us + flush_event_us + flush_sample_us +
       flush_pending_fence_us + flush_signal_us + flush_cleanup_us;
-  const auto flush_other_us =
+  const auto flush_unscoped_us =
       flush_us > flush_known_us ? flush_us - flush_known_us : 0;
   const auto accounted_wall_us =
       execute_command_lists_us + present_us + queue_signal_us + queue_wait_us +
       create_resource_us + create_reserved_resource_us + create_heap_us +
-      create_pipeline_us + other_d3d12_us + present_latency_wait_us;
-  const auto other_wall_us =
+      create_pipeline_us + unscoped_d3d12_api_us + present_latency_wait_us;
+  const auto frame_unmeasured_caller_thread_us =
       frame_wall_us > accounted_wall_us ? frame_wall_us - accounted_wall_us : 0;
   const auto overlap_adjust_us =
       accounted_wall_us > frame_wall_us ? accounted_wall_us - frame_wall_us : 0;
-  const auto closure_us = accounted_wall_us + other_wall_us - overlap_adjust_us;
+  const auto closure_us =
+      accounted_wall_us + frame_unmeasured_caller_thread_us -
+      overlap_adjust_us;
   const auto monotonic_us = durationUs(dxmt::clock::now() - g_perf_start_time);
   const auto previous_monotonic_us =
       g_last_frame_log_monotonic_us.exchange(monotonic_us,
@@ -740,7 +863,7 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " totalWallUs=", frame_wall_us,
                   " executeCommandListsUs=", execute_command_lists_us,
                   " executeKnownUs=", execute_known_us,
-                  " executeOtherUs=", execute_other_us,
+                  " executeUnscopedUs=", execute_unscoped_us,
                   " executeValidateUs=", execute_validate_us,
                   " executeCollectUs=", execute_collect_us,
                   " executeEnqueueUs=", execute_enqueue_us,
@@ -751,6 +874,203 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " executeSignalUs=", execute_signal_us,
                   " executeCommitUs=", execute_commit_us,
                   " executeWaitArmUs=", execute_wait_arm_us,
+                  " replayRecordLoopUs=", replay_record_loop_us,
+                  " replayFlushPassUs=", replay_flush_pass_us,
+                  " replayTimestampResolveUs=", replay_timestamp_resolve_us,
+                  " replayCpuQueryResolveUs=", replay_cpu_query_resolve_us,
+                  " replayTimedUs=", replay_timed_us,
+                  " replayUnaccountedUs=", replay_unaccounted_us,
+                  " replayGetPipelineUs=", replay_get_pipeline_us,
+                  " replayGetMetalPsoUs=", replay_get_metal_pso_us,
+                  " replaySelectPsoUs=", replay_select_pso_us,
+                  " replayDescAccessUs=", replay_desc_access_us,
+                  " replayStateUpdateUs=", replay_state_update_us,
+                  " replayAttachUs=", replay_attach_us,
+                  " replayBindSnapshotUs=", replay_bind_snapshot_us,
+                  " replayEstimateUs=", replay_estimate_us,
+                  " replayPacketUs=", replay_packet_us,
+                  " replayQueueUs=", replay_queue_us,
+                  " replayEmitUs=", replay_emit_us,
+                  " replayFlushBlitUs=", replay_flush_blit_us,
+                  " replayFlushComputeUs=", replay_flush_compute_us,
+                  " replayFlushGraphicsUs=", replay_flush_graphics_us,
+                  " replayFlushBarrierUs=", replay_flush_barrier_us,
+                  " replayBuildPlanUs=", replay_build_plan_us,
+                  " replayEmitTimestampUs=", replay_emit_timestamp_us,
+                  " replayRecordDrawUs=", replay_record_draw_us,
+                  " replayRecordDrawCount=",
+                  frame_stats.frame_replay_record_draw_count,
+                  " replayRecordDrawIndexedUs=", replay_record_draw_indexed_us,
+                  " replayRecordDrawIndexedCount=",
+                  frame_stats.frame_replay_record_draw_indexed_count,
+                  " replayRecordDispatchUs=", replay_record_dispatch_us,
+                  " replayRecordDispatchCount=",
+                  frame_stats.frame_replay_record_dispatch_count,
+                  " replayRecordPipelineStateUs=",
+                  replay_record_pipeline_state_us,
+                  " replayRecordPipelineStateCount=",
+                  frame_stats.frame_replay_record_pipeline_state_count,
+                  " replayRecordDescriptorHeapsUs=",
+                  replay_record_descriptor_heaps_us,
+                  " replayRecordDescriptorHeapsCount=",
+                  frame_stats.frame_replay_record_descriptor_heaps_count,
+                  " replayRecordRootSignatureUs=",
+                  replay_record_root_signature_us,
+                  " replayRecordRootSignatureCount=",
+                  frame_stats.frame_replay_record_root_signature_count,
+                  " replayRecordRootTableUs=", replay_record_root_table_us,
+                  " replayRecordRootTableCount=",
+                  frame_stats.frame_replay_record_root_table_count,
+                  " replayRecordRootDescriptorUs=",
+                  replay_record_root_descriptor_us,
+                  " replayRecordRootDescriptorCount=",
+                  frame_stats.frame_replay_record_root_descriptor_count,
+                  " replayRecordRootConstantsUs=",
+                  replay_record_root_constants_us,
+                  " replayRecordRootConstantsCount=",
+                  frame_stats.frame_replay_record_root_constants_count,
+                  " replayRecordVertexIndexStateUs=",
+                  replay_record_vertex_index_state_us,
+                  " replayRecordVertexIndexStateCount=",
+                  frame_stats.frame_replay_record_vertex_index_state_count,
+                  " replayRecordRenderTargetsUs=",
+                  replay_record_render_targets_us,
+                  " replayRecordRenderTargetsCount=",
+                  frame_stats.frame_replay_record_render_targets_count,
+                  " replayRecordResourceBarrierUs=",
+                  replay_record_resource_barrier_us,
+                  " replayRecordResourceBarrierCount=",
+                  frame_stats.frame_replay_record_resource_barrier_count,
+                  " replayRecordCopyClearResolveUs=",
+                  replay_record_copy_clear_resolve_us,
+                  " replayRecordCopyClearResolveCount=",
+                  frame_stats.frame_replay_record_copy_clear_resolve_count,
+                  " replayRecordQueryUs=", replay_record_query_us,
+                  " replayRecordQueryCount=",
+                  frame_stats.frame_replay_record_query_count,
+                  " replayRecordExecuteIndirectUs=",
+                  replay_record_execute_indirect_us,
+                  " replayRecordExecuteIndirectCount=",
+                  frame_stats.frame_replay_record_execute_indirect_count,
+                  " replayRecordTemporalUpscaleUs=",
+                  replay_record_temporal_upscale_us,
+                  " replayRecordTemporalUpscaleCount=",
+                  frame_stats.frame_replay_record_temporal_upscale_count,
+                  " replayDrawCount=", frame_stats.frame_replay_draw_count,
+                  " replayPsoRootUnchanged=",
+                  frame_stats.frame_replay_pso_root_unchanged,
+                  " replayFullBindUnchanged=",
+                  frame_stats.frame_replay_full_bind_unchanged,
+                  " replayFlushBlitCalls=",
+                  frame_stats.frame_replay_flush_blit_count,
+                  " replayFlushComputeCalls=",
+                  frame_stats.frame_replay_flush_compute_count,
+                  " replayFlushGraphicsCalls=",
+                  frame_stats.frame_replay_flush_graphics_count,
+                  " replayFlushBarrierCalls=",
+                  frame_stats.frame_replay_flush_barrier_count,
+                  " replayEmitTimestampCalls=",
+                  frame_stats.frame_replay_emit_timestamp_count,
+                  " replayFlushPassBatchesCalls=",
+                  frame_stats.frame_replay_flush_pass_batches_count,
+                  " replayFlushPassBatchesEmpty=",
+                  frame_stats.frame_replay_flush_pass_batches_empty,
+                  " replayResourceAccessCalls=",
+                  frame_stats.frame_replay_resource_access_count,
+                  " replayResourceAccessSteadyNoop=",
+                  frame_stats.frame_replay_resource_access_steady_noop,
+                  " replayDescAccessHits=",
+                  frame_stats.frame_replay_desc_access_hit,
+                  " replayDescAccessMiss=",
+                  frame_stats.frame_replay_desc_access_miss,
+                  " replayDescAccessPassthrough=",
+                  frame_stats.frame_replay_desc_access_passthrough,
+                  " replaySupersededStateRecordsSkipped=",
+                  frame_stats.frame_replay_superseded_state_records_skipped,
+                  " replayCompiledGraphicsCandidates=",
+                  frame_stats.frame_replay_compiled_graphics_candidates,
+                  " replayCompiledGraphicsLegacy=",
+                  frame_stats.frame_replay_compiled_graphics_legacy,
+                  " replayCompiledGraphicsBarriers=",
+                  frame_stats.frame_replay_compiled_graphics_barriers,
+                  " replayCompiledGraphicsGsTs=",
+                  frame_stats.frame_replay_compiled_graphics_gs_ts,
+                  " replayCompiledGraphicsIndirect=",
+                  frame_stats.frame_replay_compiled_graphics_indirect,
+                  " replayMismatchBarriers=",
+                  frame_stats.frame_replay_mismatch_barriers,
+                  " replayAppBarrierTransitions=",
+                  frame_stats.frame_replay_app_barrier_transitions,
+                  " replayBindingGenBumps=",
+                  frame_stats.frame_replay_binding_gen_bumps,
+                  " replayBindingGenPipeline=",
+                  frame_stats.frame_replay_binding_gen_pipeline,
+                  " replayBindingGenDescriptorHeaps=",
+                  frame_stats.frame_replay_binding_gen_descriptor_heaps,
+                  " replayBindingGenVertexBuffers=",
+                  frame_stats.frame_replay_binding_gen_vertex_buffers,
+                  " replayBindingGenRootSignature=",
+                  frame_stats.frame_replay_binding_gen_root_signature,
+                  " replayBindingGenRootDescriptorTable=",
+                  frame_stats.frame_replay_binding_gen_root_descriptor_table,
+                  " replayBindingGenRootDescriptor=",
+                  frame_stats.frame_replay_binding_gen_root_descriptor,
+                  " replayBindingGenRootConstants=",
+                  frame_stats.frame_replay_binding_gen_root_constants,
+                  " replayBindingGenIndirectVertexBuffer=",
+                  frame_stats.frame_replay_binding_gen_indirect_vertex_buffer,
+                  " replayBindingGenIndirectRootConstants=",
+                  frame_stats
+                      .frame_replay_binding_gen_indirect_root_constants,
+                  " replayBindingGenIndirectRootDescriptor=",
+                  frame_stats
+                      .frame_replay_binding_gen_indirect_root_descriptor,
+                  " replaySnapshotRequests=",
+                  frame_stats.frame_replay_snapshot_requests,
+                  " replaySnapshotCacheHits=",
+                  frame_stats.frame_replay_snapshot_cache_hits,
+                  " replaySnapshotCacheMisses=",
+                  frame_stats.frame_replay_snapshot_cache_misses,
+                  " replaySnapshotPassthrough=",
+                  frame_stats.frame_replay_snapshot_passthrough,
+                  " replaySnapshotGraphicsGenChanges=",
+                  frame_stats.frame_replay_snapshot_graphics_gen_changes,
+                  " replaySnapshotDescriptorGenChanges=",
+                  frame_stats.frame_replay_snapshot_descriptor_gen_changes,
+                  " replaySnapshotBothGenChanges=",
+                  frame_stats.frame_replay_snapshot_both_gen_changes,
+                  " replaySnapshotNoGenChanges=",
+                  frame_stats.frame_replay_snapshot_no_gen_changes,
+                  " replaySnapshotCapturedEntries=",
+                  frame_stats.frame_replay_snapshot_captured_entries,
+                  " replaySnapshotCapturedDescriptors=",
+                  frame_stats.frame_replay_snapshot_captured_descriptors,
+                  " replaySnapshotCapturedMissingDescriptors=",
+                  frame_stats
+                      .frame_replay_snapshot_captured_missing_descriptors,
+                  " replaySnapshotCapturedRootDescriptors=",
+                  frame_stats.frame_replay_snapshot_captured_root_descriptors,
+                  " replaySnapshotCapturedRootConstants=",
+                  frame_stats.frame_replay_snapshot_captured_root_constants,
+                  " replaySnapshotCapturedVertexBuffers=",
+                  frame_stats.frame_replay_snapshot_captured_vertex_buffers,
+                  " replaySnapshotCapturedBindless=",
+                  frame_stats.frame_replay_snapshot_captured_bindless,
+                  " descriptorContentWrites=",
+                  frame_stats_with_external.frame_descriptor_content_writes,
+                  " descriptorContentWriteCBV=",
+                  frame_stats_with_external.frame_descriptor_content_write_cbv,
+                  " descriptorContentWriteSRV=",
+                  frame_stats_with_external.frame_descriptor_content_write_srv,
+                  " descriptorContentWriteUAV=",
+                  frame_stats_with_external.frame_descriptor_content_write_uav,
+                  " descriptorContentWriteSampler=",
+                  frame_stats_with_external.frame_descriptor_content_write_sampler,
+                  " descriptorContentWriteCopy=",
+                  frame_stats_with_external.frame_descriptor_content_write_copy,
+                  " descriptorContentWriteFeedbackUAV=",
+                  frame_stats_with_external
+                      .frame_descriptor_content_write_feedback_uav,
                   " presentUs=", present_us,
                   " queueSignalUs=", queue_signal_us,
                   " queueWaitUs=", queue_wait_us,
@@ -758,17 +1078,18 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " createReservedResourceUs=", create_reserved_resource_us,
                   " createHeapUs=", create_heap_us,
                   " createPipelineUs=", create_pipeline_us,
-                  " otherD3D12Us=", other_d3d12_us,
+                  " unscopedD3D12ApiUs=", unscoped_d3d12_api_us,
                   " cmdlistRecordUs=", cmdlist_record_us,
                   " presentLatencyWaitUs=", present_latency_wait_us,
                   " accountedWallUs=", accounted_wall_us,
-                  " otherWallUs=", other_wall_us,
+                  " frameUnmeasuredCallerThreadUs=",
+                  frame_unmeasured_caller_thread_us,
                   " overlapAdjustUs=", overlap_adjust_us,
                   " closureUs=", closure_us,
                   " asyncDrawableBlockingUs=", drawable_blocking_us,
                   " asyncFlushUs=", flush_us,
                   " asyncFlushKnownUs=", flush_known_us,
-                  " asyncFlushOtherUs=", flush_other_us,
+                  " asyncFlushUnscopedUs=", flush_unscoped_us,
                   " asyncFlushCollectUs=", flush_collect_us,
                   " asyncFlushRelationUs=", flush_relation_us,
                   " asyncFlushQueryUs=", flush_query_us,
@@ -980,8 +1301,43 @@ void recordDrawableAcquire(uint64_t duration_us) {
     return;
   g_counters.drawable_acquire_count.fetch_add(1, std::memory_order_relaxed);
   g_counters.drawable_acquire_us.fetch_add(duration_us,
-                                          std::memory_order_relaxed);
+                                           std::memory_order_relaxed);
   updateMax(g_counters.drawable_acquire_max_us, duration_us);
+}
+
+void recordDescriptorContentWrite(uint32_t kind) {
+  if (!enabled())
+    return;
+  g_counters.descriptor_content_writes.fetch_add(1,
+                                                 std::memory_order_relaxed);
+  switch (kind) {
+  case 1:
+    g_counters.descriptor_content_write_cbv.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 2:
+    g_counters.descriptor_content_write_srv.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 3:
+    g_counters.descriptor_content_write_uav.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 4:
+    g_counters.descriptor_content_write_sampler.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 5:
+    g_counters.descriptor_content_write_copy.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 6:
+    g_counters.descriptor_content_write_feedback_uav.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  default:
+    break;
+  }
 }
 
 } // namespace dxmt::perf

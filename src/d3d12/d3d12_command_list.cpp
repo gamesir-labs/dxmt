@@ -1721,10 +1721,10 @@ private:
   void AddRecord(T &&payload) {
     if (closed_)
       return;
-    // PERF DIAG (otherWall split): time the record phase on the calling thread.
+    // Track command-list recording on the calling thread.
     // ScopedFrameTimer is a no-op unless this thread has frame stats bound (the
-    // present thread), so a non-zero CommandListRecord total ALSO proves
-    // recording runs on the present thread (i.e. inside frame_wall / otherWall).
+    // present thread), so a non-zero CommandListRecord total proves recording
+    // contributes to the measured frame wall.
     dxmt::perf::ScopedFrameTimer perf_timer(
         dxmt::perf::FrameTimeBucket::CommandListRecord);
     records_.push_back(CommandRecord{

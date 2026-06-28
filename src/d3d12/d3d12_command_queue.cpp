@@ -1442,6 +1442,9 @@ static bool ReplayBreakdownEnabled() {
   static const bool on = D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
   return on;
 }
+static bool ReplayPerfEnabled() {
+  return ReplayBreakdownEnabled() || dxmt::perf::enabled();
+}
 // descAccess content-fingerprint cache (default ON; DXMT_DESCACCESS_CACHE=0 to
 // disable for instant A/B). DXMT_DESCACCESS_VERIFY=1 keeps computing the cache
 // but never skips (still runs the full hazard pass) — a failsafe to confirm the
@@ -1452,30 +1455,6 @@ static bool DescAccessCacheEnabled() {
 }
 static bool DescAccessVerify() {
   static const bool on = env::getEnvVar("DXMT_DESCACCESS_VERIFY") == "1";
-  return on;
-}
-// Stage-2 passthrough barrier (default OFF). When on, the per-draw graphics
-// descriptor-access hazard pass (RecordPipelineDescriptorAccess) is skipped
-// entirely — DXMT trusts the app's explicit ResourceBarriers for cross-encoder
-// sync, and stage-B binding `access→track` (per-allocation GenericAccessTracker)
-// drives the Metal fence/residency regardless. This roots-out descAccess (the
-// miss-path full hazard, not just a cache skip) AND removes the per-draw global
-// D3D12-state dependency that serializes replay — resources map / steady_read /
-// epoch then only mutate at app-barrier (pass boundary) points, leaving in-pass
-// draws state-independent and parallelizable. Correctness rests on FH4's
-// barriers being passthrough-complete (measured: auto-inferred mismatch/app =
-// 1.8%); the residual gaps (index buffer & direct root CBV are untracked at
-// stage B; UNKNOWN/split app barriers read the now-frozen state machine; in-pass
-// UAV/RTV feedback memory-barrier precision) must be covered by app barriers and
-// confirmed visually. DXMT_PASSTHROUGH_BARRIER_VERIFY keeps running the full
-// hazard pass without skipping (A/B failsafe).
-static bool PassthroughBarrierEnabled() {
-  static const bool on = env::getEnvVar("DXMT_PASSTHROUGH_BARRIER") == "1";
-  return on;
-}
-static bool PassthroughBarrierVerify() {
-  static const bool on =
-      env::getEnvVar("DXMT_PASSTHROUGH_BARRIER_VERIFY") == "1";
   return on;
 }
 
@@ -1647,7 +1626,7 @@ GetDirectIndirectOperation(
 
 static RootSignature *
 GetRootSignature(ID3D12RootSignature *root_signature) {
-  return dynamic_cast<RootSignature *>(root_signature);
+  return GetDXMTRootSignature(root_signature);
 }
 
 static std::optional<WMTPrimitiveType>
@@ -3732,7 +3711,7 @@ public:
                                             const UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {
     dxmt::perf::ScopedFrameTimer perf_timer(
-        dxmt::perf::FrameTimeBucket::OtherD3D12);
+        dxmt::perf::FrameTimeBucket::UnscopedD3D12Api);
     UpdateTileMappingsImpl(resource, region_count, region_start_coordinates,
                            region_sizes, heap, range_count, range_flags,
                            heap_range_offsets, range_tile_counts, flags);
@@ -3747,7 +3726,7 @@ public:
                                             UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {
     dxmt::perf::ScopedFrameTimer perf_timer(
-        dxmt::perf::FrameTimeBucket::OtherD3D12);
+        dxmt::perf::FrameTimeBucket::UnscopedD3D12Api);
     UpdateTileMappingsImpl(resource, region_count, region_start_coordinates,
                            region_sizes, nullptr, range_count, range_flags,
                            heap_range_offsets, range_tile_counts, flags);
@@ -3761,7 +3740,7 @@ public:
                                           const D3D12_TILE_REGION_SIZE *region_size,
                                           D3D12_TILE_MAPPING_FLAGS flags) override {
     dxmt::perf::ScopedFrameTimer perf_timer(
-        dxmt::perf::FrameTimeBucket::OtherD3D12);
+        dxmt::perf::FrameTimeBucket::UnscopedD3D12Api);
     CopyTileMappingsImpl(dst_resource, dst_region_start_coordinate,
                          src_resource, src_region_start_coordinate,
                          region_size, flags);
@@ -5214,14 +5193,40 @@ private:
     uint32_t indexed_count = 0;
     uint32_t indirect_count = 0;
     uint32_t parallel_candidate_count = 0;
+    uint32_t compiled_candidate_count = 0;
+    uint32_t compiled_legacy_count = 0;
+    uint32_t compiled_barrier_count = 0;
+    uint32_t compiled_gs_ts_count = 0;
+    uint32_t compiled_indirect_count = 0;
     uint32_t current_parallel_candidate_run = 0;
     uint32_t largest_parallel_candidate_run = 0;
     uint64_t argument_buffer_size = 0;
     bool all_parallel_candidates = true;
   };
 
+  struct ReplayGraphicsPassLegacyCommand {
+    std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
+  };
+
+  using ReplayGraphicsCompiledPayload =
+      std::shared_ptr<void>;
+  using ReplayGraphicsCompiledEncodeFn =
+      void (*)(CommandQueueImpl *, ArgumentEncodingContext &, void *,
+               uint64_t &);
+
+  template <typename T>
+  static ReplayGraphicsCompiledPayload
+  MakeReplayGraphicsCompiledPayload(T &&payload) {
+    using Payload = std::decay_t<T>;
+    return ReplayGraphicsCompiledPayload(
+        new Payload(std::forward<T>(payload)),
+        [](void *ptr) { delete static_cast<Payload *>(ptr); });
+  }
+
   struct ReplayGraphicsPassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
+    ReplayGraphicsCompiledEncodeFn compiled_encode = nullptr;
+    ReplayGraphicsCompiledPayload compiled_payload;
     uint64_t d3d_sequence = 0;
     uint64_t argument_buffer_size = 0;
     uint64_t argument_buffer_offset = 0;
@@ -5230,6 +5235,52 @@ private:
     bool parallel_candidate = false;
     bool use_geometry = false;
     bool use_tessellation = false;
+    bool bindless_compiled_candidate = false;
+  };
+
+  struct GraphicsBindingSnapshotEntry {
+    enum class Kind : uint8_t { Descriptor, RootConstants };
+
+    Kind kind = Kind::Descriptor;
+    PipelineStage stage = PipelineStage::Vertex;
+    D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    UINT root_index = 0;
+    UINT slot = 0;
+    UINT shader_register = 0;
+    UINT register_space = 0;
+    UINT register_lower_bound = 0;
+    UINT root_offset_key = 0;
+    UINT64 debug_size = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS debug_address = 0;
+    const char *debug_kind = nullptr;
+    bool has_descriptor = false;
+    DescriptorRecord descriptor = {};
+    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
+    std::vector<UINT> constants;
+    UINT constant_count = 0;
+  };
+
+  struct GraphicsVertexBufferBindingSnapshot {
+    UINT slot = 0;
+    UINT stride = 0;
+    UINT64 offset = 0;
+    Rc<Buffer> buffer;
+  };
+
+  struct GraphicsBindingSnapshot {
+    Com<ID3D12PipelineState> pipeline_state;
+    Com<ID3D12RootSignature> root_signature;
+    RootSignature *root_signature_impl = nullptr;
+    std::vector<GraphicsBindingSnapshotEntry> entries;
+    std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
+    uint32_t vertex_slot_mask = 0;
+    uint64_t content_fingerprint = 0;
+    // Bindless-mirror snapshot replay rebuilds root offsets and compact mirror
+    // windows from captured descriptors because deferred draws no longer have
+    // access to the live ReplayState.
+    bool bindless = false;
+    AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
+    AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
 
   struct ReplayBindingGenerationKey {
@@ -5254,14 +5305,25 @@ private:
   struct ReplayGraphicsPassBatch {
     ReplayRenderPassAttachments attachments;
     std::vector<ReplayGraphicsPassCommand> commands;
-    std::unordered_set<ReplayBindingGenerationKey,
+    std::unordered_map<ReplayBindingGenerationKey,
+                       std::shared_ptr<GraphicsBindingSnapshot>,
                        ReplayBindingGenerationKeyHash>
-        captured_binding_generations;
+        captured_binding_snapshots;
     uint64_t argument_buffer_size = 0;
     ReplayGraphicsPassPlan plan;
     bool use_geometry = false;
     bool use_tessellation = false;
     bool active = false;
+  };
+
+  struct GraphicsBindingSnapshotCaptureStats {
+    uint64_t entries = 0;
+    uint64_t descriptors = 0;
+    uint64_t missing_descriptors = 0;
+    uint64_t root_descriptors = 0;
+    uint64_t root_constants = 0;
+    uint64_t vertex_buffers = 0;
+    uint64_t bindless = 0;
   };
 
   struct ReplayComputePassCommand {
@@ -5395,6 +5457,34 @@ private:
     UINT index = 0;
   };
 
+  struct ResolvedReplayVertexBuffer {
+    bool valid = false;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    UINT64 binding_offset = 0;
+    Com<ID3D12Resource> d3d_resource;
+    Resource *resource = nullptr;
+    Rc<Buffer> buffer;
+  };
+
+  struct ResolvedReplayIndexBuffer {
+    bool valid = false;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    UINT64 binding_offset = 0;
+    Com<ID3D12Resource> d3d_resource;
+    Resource *resource = nullptr;
+    Rc<BufferAllocation> allocation;
+  };
+
+  struct ReplayRootConstantsSlot {
+    bool valid = false;
+    std::vector<UINT> values;
+  };
+
+  struct ReplayRootDescriptorSlot {
+    bool valid = false;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+  };
+
   struct ReplayState {
     // Root parameter index is bounded by the D3D12 root-signature 64-DWORD
     // limit, so the hottest root bindings use a fixed array indexed by parameter
@@ -5417,6 +5507,8 @@ private:
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> graphics_root_signature;
     Com<ID3D12RootSignature> compute_root_signature;
+    RootSignature *graphics_root_signature_impl = nullptr;
+    RootSignature *compute_root_signature_impl = nullptr;
     D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     std::vector<D3D12_VIEWPORT> viewports;
     std::vector<D3D12_RECT> scissors;
@@ -5426,20 +5518,37 @@ private:
     std::optional<DescriptorRecord> depth_stencil;
     std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
     std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
+    std::array<ResolvedReplayVertexBuffer, 32> resolved_vertex_buffers = {};
+    ResolvedReplayIndexBuffer resolved_index_buffer = {};
+    std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, ResolvedReplayVertexBuffer>
+        resolved_vertex_buffer_cache;
+    std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, ResolvedReplayIndexBuffer>
+        resolved_index_buffer_cache;
     Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
     Com<ID3D12DescriptorHeap> sampler_heap;
     std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaxRootParameters> graphics_tables = {};
     std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaxRootParameters> compute_tables = {};
-    std::unordered_map<UINT, std::vector<UINT>> graphics_root_constants;
-    std::unordered_map<UINT, std::vector<UINT>> compute_root_constants;
-    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_cbv_roots;
-    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_cbv_roots;
-    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_srv_roots;
-    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_srv_roots;
-    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_uav_roots;
-    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_uav_roots;
+    std::array<ReplayRootConstantsSlot, kMaxRootParameters>
+        graphics_root_constants = {};
+    std::array<ReplayRootConstantsSlot, kMaxRootParameters>
+        compute_root_constants = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        graphics_cbv_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        compute_cbv_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        graphics_srv_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        compute_srv_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        graphics_uav_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        compute_uav_roots = {};
     uint64_t current_record_d3d_sequence = 0;
     uint64_t graphics_binding_generation = 1;
+    uint64_t last_snapshot_request_graphics_generation = 0;
+    uint64_t last_snapshot_request_descriptor_generation = 0;
+    bool has_last_snapshot_request_generation = false;
     // descAccess content-fingerprint cache (DXMT_DESCACCESS_CACHE): skip the
     // per-draw hazard-record loop when (PSO, root-sig, descriptor CONTENT) is
     // unchanged AND no resource state changed since the last record. The content
@@ -5460,6 +5569,7 @@ private:
     std::vector<PendingTimestampMarker> pending_timestamp_markers;
     std::vector<PendingTimestampResolve> pending_timestamp_resolves;
     std::vector<ResolveQueryDataRecord> pending_immediate_cpu_query_resolves;
+    uint64_t bindless_replay_content_fingerprint = 0;
   };
 
   static ReplayState
@@ -5475,6 +5585,8 @@ private:
     copy.pipeline_state = state.pipeline_state;
     copy.graphics_root_signature = state.graphics_root_signature;
     copy.compute_root_signature = state.compute_root_signature;
+    copy.graphics_root_signature_impl = state.graphics_root_signature_impl;
+    copy.compute_root_signature_impl = state.compute_root_signature_impl;
     copy.topology = state.topology;
     copy.viewports = state.viewports;
     copy.scissors = state.scissors;
@@ -5484,6 +5596,8 @@ private:
     copy.depth_stencil = state.depth_stencil;
     copy.vertex_buffers = state.vertex_buffers;
     copy.index_buffer = state.index_buffer;
+    copy.resolved_vertex_buffers = state.resolved_vertex_buffers;
+    copy.resolved_index_buffer = state.resolved_index_buffer;
     copy.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
     copy.sampler_heap = state.sampler_heap;
     copy.graphics_tables = state.graphics_tables;
@@ -5508,6 +5622,124 @@ private:
     return copy;
   }
 
+  static uint64_t HashGraphicsBindlessReplayCaptureState(
+      const ReplayState &state) {
+    auto mix = [](uint64_t h, uint64_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      return h;
+    };
+    uint64_t h = 1469598103934665603ull;
+    h = mix(h, reinterpret_cast<uintptr_t>(state.pipeline_state.ptr()));
+    h = mix(h, reinterpret_cast<uintptr_t>(state.graphics_root_signature.ptr()));
+    h = mix(h, reinterpret_cast<uintptr_t>(state.cbv_srv_uav_heap.ptr()));
+    h = mix(h, reinterpret_cast<uintptr_t>(state.sampler_heap.ptr()));
+    for (UINT i = 0; i < state.graphics_tables.size(); i++) {
+      if (state.graphics_tables[i].ptr)
+        h = mix(mix(h, i), state.graphics_tables[i].ptr);
+    }
+    auto hash_root_descriptors = [&](const auto &roots) {
+      for (UINT i = 0; i < roots.size(); i++) {
+        if (roots[i].valid)
+          h = mix(mix(h, i), roots[i].address);
+      }
+    };
+    hash_root_descriptors(state.graphics_cbv_roots);
+    hash_root_descriptors(state.graphics_srv_roots);
+    hash_root_descriptors(state.graphics_uav_roots);
+    for (UINT i = 0; i < state.graphics_root_constants.size(); i++) {
+      const auto &slot = state.graphics_root_constants[i];
+      if (!slot.valid)
+        continue;
+      h = mix(h, i);
+      for (auto value : slot.values)
+        h = mix(h, value);
+    }
+    for (UINT slot = 0; slot < state.vertex_buffers.size(); slot++) {
+      const auto &view = state.vertex_buffers[slot];
+      if (!view)
+        continue;
+      h = mix(h, slot);
+      h = mix(h, view->BufferLocation);
+      h = mix(h, view->SizeInBytes);
+      h = mix(h, view->StrideInBytes);
+    }
+    return h;
+  }
+
+  static std::shared_ptr<ReplayState>
+  CaptureGraphicsBindlessReplayState(const ReplayState &state) {
+    auto copy = std::make_shared<ReplayState>();
+    copy->queue_type = state.queue_type;
+    copy->pipeline_state = state.pipeline_state;
+    copy->graphics_root_signature = state.graphics_root_signature;
+    copy->graphics_root_signature_impl = state.graphics_root_signature_impl;
+    copy->vertex_buffers = state.vertex_buffers;
+    copy->resolved_vertex_buffers = state.resolved_vertex_buffers;
+    copy->cbv_srv_uav_heap = state.cbv_srv_uav_heap;
+    copy->sampler_heap = state.sampler_heap;
+    copy->graphics_tables = state.graphics_tables;
+    for (UINT i = 0; i < state.graphics_root_constants.size(); i++) {
+      if (state.graphics_root_constants[i].valid)
+        copy->graphics_root_constants[i] = state.graphics_root_constants[i];
+    }
+    copy->graphics_cbv_roots = state.graphics_cbv_roots;
+    copy->graphics_srv_roots = state.graphics_srv_roots;
+    copy->graphics_uav_roots = state.graphics_uav_roots;
+    copy->current_record_d3d_sequence = state.current_record_d3d_sequence;
+    copy->graphics_binding_generation = state.graphics_binding_generation;
+    copy->bindless_replay_content_fingerprint =
+        HashGraphicsBindlessReplayCaptureState(*copy);
+    return copy;
+  }
+
+  ResolvedReplayVertexBuffer
+  ResolveReplayVertexBuffer(ReplayState &state,
+                            const D3D12_VERTEX_BUFFER_VIEW &view) {
+    auto cache_it = state.resolved_vertex_buffer_cache.find(view.BufferLocation);
+    if (cache_it != state.resolved_vertex_buffer_cache.end())
+      return cache_it->second;
+
+    ResolvedReplayVertexBuffer resolved = {};
+    resolved.address = view.BufferLocation;
+    UINT64 resource_offset = 0;
+    auto *resource =
+        LookupBufferResourceByGpuVirtualAddress(view.BufferLocation,
+                                                &resource_offset);
+    if (!resource || !resource->GetBuffer())
+      return resolved;
+    resolved.valid = true;
+    resolved.binding_offset = resource->GetHeapOffset() + resource_offset;
+    resolved.d3d_resource = resource->GetD3D12Resource();
+    resolved.resource = resource;
+    resolved.buffer = resource->GetBuffer();
+    state.resolved_vertex_buffer_cache[view.BufferLocation] = resolved;
+    return resolved;
+  }
+
+  ResolvedReplayIndexBuffer
+  ResolveReplayIndexBuffer(ReplayState &state,
+                           const D3D12_INDEX_BUFFER_VIEW &view) {
+    auto cache_it = state.resolved_index_buffer_cache.find(view.BufferLocation);
+    if (cache_it != state.resolved_index_buffer_cache.end())
+      return cache_it->second;
+
+    ResolvedReplayIndexBuffer resolved = {};
+    resolved.address = view.BufferLocation;
+    UINT64 resource_offset = 0;
+    auto *resource =
+        LookupBufferResourceByGpuVirtualAddress(view.BufferLocation,
+                                                &resource_offset);
+    if (!resource || !resource->GetBufferAllocation())
+      return resolved;
+    resolved.valid = true;
+    resolved.binding_offset = resource->GetHeapOffset() + resource_offset;
+    resolved.d3d_resource = resource->GetD3D12Resource();
+    resolved.resource = resource;
+    resolved.allocation = resource->GetBufferAllocation();
+    state.resolved_index_buffer_cache[view.BufferLocation] = resolved;
+    return resolved;
+  }
+
   struct ReplayStateRecordScope {
     ReplayState &state;
     uint64_t old_sequence = 0;
@@ -5522,12 +5754,18 @@ private:
     }
   };
 
-  static void
-  BumpGraphicsBindingGeneration(ReplayState &state) {
-    state.graphics_binding_generation++;
-    if (!state.graphics_binding_generation)
-      state.graphics_binding_generation = 1;
-  }
+  enum class GraphicsBindingGenerationBumpSource : uint8_t {
+    PipelineState,
+    DescriptorHeaps,
+    VertexBuffers,
+    RootSignature,
+    RootDescriptorTable,
+    RootDescriptor,
+    RootConstants,
+    IndirectVertexBuffer,
+    IndirectRootConstants,
+    IndirectRootDescriptor,
+  };
 
   static bool
   ReplayRenderPassAttachmentsMatch(const ReplayRenderPassAttachments &lhs,
@@ -5688,6 +5926,19 @@ private:
         plan.indexed_count++;
       if (ReplayGraphicsCommandKindIsIndirect(command.kind))
         plan.indirect_count++;
+      if (command.kind == ReplayGraphicsCommandKind::Barrier) {
+        plan.compiled_barrier_count++;
+      } else if (ReplayGraphicsCommandKindIsIndirect(command.kind)) {
+        plan.compiled_indirect_count++;
+        plan.compiled_legacy_count++;
+      } else if (command.use_geometry || command.use_tessellation) {
+        plan.compiled_gs_ts_count++;
+        plan.compiled_legacy_count++;
+      } else if (command.bindless_compiled_candidate) {
+        plan.compiled_candidate_count++;
+      } else {
+        plan.compiled_legacy_count++;
+      }
       if (command.parallel_candidate) {
         plan.parallel_candidate_count++;
         plan.current_parallel_candidate_run++;
@@ -5772,7 +6023,7 @@ private:
     auto &batch = state.compute_pass_batch;
     if (!HasPendingComputePass(state))
       return;
-    const bool _rb = ReplayBreakdownEnabled();
+    const bool _rb = ReplayPerfEnabled();
     if (_rb) perDrawSubTimers().flushComputeCalls++;
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().flushComputeUs};
@@ -5804,7 +6055,7 @@ private:
     auto &batch = state.graphics_pass_batch;
     if (!HasPendingGraphicsPass(state))
       return;
-    const bool _rb = ReplayBreakdownEnabled();
+    const bool _rb = ReplayPerfEnabled();
     if (_rb) perDrawSubTimers().flushGraphicsCalls++;
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().flushGraphicsUs};
@@ -5817,9 +6068,21 @@ private:
                          &perDrawSubTimers().buildPlanUs};
       batch.plan = BuildReplayGraphicsPassPlan(batch.commands,
                                                batch.argument_buffer_size);
+      if (auto *stats = dxmt::perf::currentFrameStatistics()) {
+        stats->frame_replay_compiled_graphics_candidates +=
+            batch.plan.compiled_candidate_count;
+        stats->frame_replay_compiled_graphics_legacy +=
+            batch.plan.compiled_legacy_count;
+        stats->frame_replay_compiled_graphics_barriers +=
+            batch.plan.compiled_barrier_count;
+        stats->frame_replay_compiled_graphics_gs_ts +=
+            batch.plan.compiled_gs_ts_count;
+        stats->frame_replay_compiled_graphics_indirect +=
+            batch.plan.compiled_indirect_count;
+      }
     }
 
-    chunk->emitcc([attachments = std::move(batch.attachments),
+    chunk->emitcc([this, attachments = std::move(batch.attachments),
                    commands = std::move(batch.commands),
                    plan = batch.plan,
                    barrier_entries = std::move(barriers.entries),
@@ -5842,7 +6105,12 @@ private:
           dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
         }
         uint64_t argbuf_offset = command.argument_buffer_offset;
-        command.encode(enc, argbuf_offset);
+        if (command.compiled_encode) {
+          command.compiled_encode(this, enc, command.compiled_payload.get(),
+                                  argbuf_offset);
+        } else {
+          command.encode(enc, argbuf_offset);
+        }
         const auto argbuf_limit =
             command.argument_buffer_offset + command.argument_buffer_size;
         const auto command_used =
@@ -5864,7 +6132,7 @@ private:
   void EmitTimestampMarkers(CommandChunk *chunk, ReplayState &state) {
     if (state.pending_timestamp_markers.empty())
       return;
-    const bool _rb = ReplayBreakdownEnabled();
+    const bool _rb = ReplayPerfEnabled();
     if (_rb) perDrawSubTimers().emitTsMarkersCalls++;
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().emitTsMarkersUs};
@@ -5892,7 +6160,7 @@ private:
     auto &batch = state.blit_batch;
     if (!HasPendingBlitBatch(state))
       return;
-    const bool _rb = ReplayBreakdownEnabled();
+    const bool _rb = ReplayPerfEnabled();
     if (_rb) perDrawSubTimers().flushBlitCalls++;
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().flushBlitUs};
@@ -5919,7 +6187,7 @@ private:
   void FlushResourceBarrierBatch(CommandChunk *chunk, ReplayState &state) {
     if (!HasPendingResourceBarrierBatch(state))
       return;
-    const bool _rb = ReplayBreakdownEnabled();
+    const bool _rb = ReplayPerfEnabled();
     if (_rb) perDrawSubTimers().flushBarrierCalls++;
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().flushBarrierUs};
@@ -5956,7 +6224,7 @@ private:
     const bool has_encoder_work =
         HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
         HasPendingGraphicsPass(state);
-    if (ReplayBreakdownEnabled()) {
+    if (ReplayPerfEnabled()) {
       perDrawSubTimers().flushPassBatchesCalls++;
       if (!has_encoder_work)
         perDrawSubTimers().flushPassBatchesEmpty++;
@@ -6453,7 +6721,8 @@ private:
                                 bool use_geometry = false,
                                 bool use_tessellation = false,
                                 ReplayGraphicsCommandKind kind =
-                                    ReplayGraphicsCommandKind::Draw) {
+                                    ReplayGraphicsCommandKind::Draw,
+                                bool bindless_compiled_candidate = false) {
     if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
       FlushPassBatches(chunk, state);
 
@@ -6478,11 +6747,66 @@ private:
     active_batch.use_geometry = active_batch.use_geometry || use_geometry;
     active_batch.use_tessellation =
         active_batch.use_tessellation || use_tessellation;
-    active_batch.commands.push_back(
-        ReplayGraphicsPassCommand{std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
-                                  argument_buffer_size, command_argbuf_offset,
-                                  command_index, kind, parallel_candidate,
-                                  use_geometry, use_tessellation});
+    ReplayGraphicsPassCommand command = {};
+    command.encode = std::forward<Fn>(fn);
+    command.d3d_sequence = dxmt::apitrace::current_d3d_sequence();
+    command.argument_buffer_size = argument_buffer_size;
+    command.argument_buffer_offset = command_argbuf_offset;
+    command.command_index = command_index;
+    command.kind = kind;
+    command.parallel_candidate = parallel_candidate;
+    command.use_geometry = use_geometry;
+    command.use_tessellation = use_tessellation;
+    command.bindless_compiled_candidate = bindless_compiled_candidate;
+    active_batch.commands.push_back(std::move(command));
+  }
+
+  template <typename Payload>
+  void QueueCompiledGraphicsPassCommand(
+      CommandChunk *chunk, ReplayState &state,
+      ReplayRenderPassAttachments attachments, uint64_t argument_buffer_size,
+      Payload &&payload, ReplayGraphicsCompiledEncodeFn compiled_encode,
+      bool use_geometry, bool use_tessellation,
+      ReplayGraphicsCommandKind kind) {
+    if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
+      FlushPassBatches(chunk, state);
+
+    auto &batch = state.graphics_pass_batch;
+    if (batch.active &&
+        !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
+      FlushPassBatches(chunk, state);
+
+    auto &active_batch = state.graphics_pass_batch;
+    if (!active_batch.active) {
+      active_batch.active = true;
+      active_batch.attachments = std::move(attachments);
+      active_batch.argument_buffer_size = 0;
+    }
+
+    const auto command_argbuf_offset = active_batch.argument_buffer_size;
+    const auto command_index =
+        static_cast<uint32_t>(active_batch.commands.size());
+    const bool parallel_candidate = ReplayGraphicsCommandCanParallelEncode(
+        kind, use_geometry, use_tessellation);
+    active_batch.argument_buffer_size += argument_buffer_size;
+    active_batch.use_geometry = active_batch.use_geometry || use_geometry;
+    active_batch.use_tessellation =
+        active_batch.use_tessellation || use_tessellation;
+
+    ReplayGraphicsPassCommand command = {};
+    command.compiled_encode = compiled_encode;
+    command.compiled_payload =
+        MakeReplayGraphicsCompiledPayload(std::forward<Payload>(payload));
+    command.d3d_sequence = dxmt::apitrace::current_d3d_sequence();
+    command.argument_buffer_size = argument_buffer_size;
+    command.argument_buffer_offset = command_argbuf_offset;
+    command.command_index = command_index;
+    command.kind = kind;
+    command.parallel_candidate = parallel_candidate;
+    command.use_geometry = use_geometry;
+    command.use_tessellation = use_tessellation;
+    command.bindless_compiled_candidate = true;
+    active_batch.commands.push_back(std::move(command));
   }
 
   void QueueGraphicsResourceBarrierCommand(CommandChunk *chunk,
@@ -6500,10 +6824,14 @@ private:
       (void)argbuf_offset;
       EncodeInlineRenderResourceBarrierEntries(enc, entries);
     };
-    active_batch.commands.push_back(ReplayGraphicsPassCommand{
-        std::move(encode_barrier), dxmt::apitrace::current_d3d_sequence(), 0,
-        active_batch.argument_buffer_size, command_index,
-        ReplayGraphicsCommandKind::Barrier, false, false, false});
+    ReplayGraphicsPassCommand command = {};
+    command.encode = std::move(encode_barrier);
+    command.d3d_sequence = dxmt::apitrace::current_d3d_sequence();
+    command.argument_buffer_size = 0;
+    command.argument_buffer_offset = active_batch.argument_buffer_size;
+    command.command_index = command_index;
+    command.kind = ReplayGraphicsCommandKind::Barrier;
+    active_batch.commands.push_back(std::move(command));
     if (auto *stats = dxmt::perf::currentFrameStatistics())
       stats->resource_barrier_batches_graphics_inlined++;
   }
@@ -6544,40 +6872,6 @@ private:
     }
     FlushReplayWorkBeforeResourceBarrier(chunk, state);
     QueueResourceAccessBarrierBatch(state, std::move(batch));
-  }
-
-  bool GraphicsPassBatchNeedsBindingSnapshot(
-      CommandChunk *chunk, ReplayState &state,
-      const ReplayRenderPassAttachments &attachments,
-      uint64_t descriptor_content_generation) {
-    if (!D3D12ReplayGraphicsBatchingEnabled())
-      return true;
-    if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
-      FlushPassBatches(chunk, state);
-
-    auto &batch = state.graphics_pass_batch;
-    if (batch.active &&
-        !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
-      FlushPassBatches(chunk, state);
-
-    auto &active_batch = state.graphics_pass_batch;
-    if (!active_batch.active) {
-      active_batch.active = true;
-      active_batch.attachments = attachments;
-      active_batch.argument_buffer_size = 0;
-    }
-
-    active_batch.captured_binding_generations.insert(
-        ReplayBindingGenerationKey{state.graphics_binding_generation,
-                                   descriptor_content_generation});
-
-    // A queued graphics command replays later without the live ReplayState. The
-    // snapshot is therefore the command's binding payload, not just a cache key.
-    // Reusing only the "seen generation" bit leaves later commands with an
-    // empty snapshot; bindless-compiled PSOs then replay as legacy bindings.
-    // Keep batching, but capture a complete per-command snapshot until this
-    // cache stores and replays the snapshot itself.
-    return true;
   }
 
   bool D3D12ReplayComputeBatchingEnabled() {
@@ -6658,6 +6952,39 @@ private:
   // attachments vs state-clone within the ~59us/draw.
   struct PerDrawSubTimers { uint64_t desc = 0, attach = 0, clone = 0, stateUpd = 0;
     uint64_t drawCount = 0, psoRootUnchanged = 0, fullBindUnchanged = 0;
+    uint64_t recordDrawUs = 0, recordDrawCount = 0;
+    uint64_t recordDrawIndexedUs = 0, recordDrawIndexedCount = 0;
+    uint64_t recordDispatchUs = 0, recordDispatchCount = 0;
+    uint64_t recordPipelineStateUs = 0, recordPipelineStateCount = 0;
+    uint64_t recordDescriptorHeapsUs = 0, recordDescriptorHeapsCount = 0;
+    uint64_t recordRootSignatureUs = 0, recordRootSignatureCount = 0;
+    uint64_t recordRootTableUs = 0, recordRootTableCount = 0;
+    uint64_t recordRootDescriptorUs = 0, recordRootDescriptorCount = 0;
+    uint64_t recordRootConstantsUs = 0, recordRootConstantsCount = 0;
+    uint64_t recordVertexIndexStateUs = 0, recordVertexIndexStateCount = 0;
+    uint64_t recordRenderTargetsUs = 0, recordRenderTargetsCount = 0;
+    uint64_t recordResourceBarrierUs = 0, recordResourceBarrierCount = 0;
+    uint64_t recordCopyClearResolveUs = 0, recordCopyClearResolveCount = 0;
+    uint64_t recordQueryUs = 0, recordQueryCount = 0;
+    uint64_t recordExecuteIndirectUs = 0, recordExecuteIndirectCount = 0;
+    uint64_t recordTemporalUpscaleUs = 0, recordTemporalUpscaleCount = 0;
+    uint64_t bindingGenBumps = 0, bindingGenPipeline = 0,
+             bindingGenDescriptorHeaps = 0, bindingGenVertexBuffers = 0,
+             bindingGenRootSignature = 0, bindingGenRootDescriptorTable = 0,
+             bindingGenRootDescriptor = 0, bindingGenRootConstants = 0,
+             bindingGenIndirectVertexBuffer = 0,
+             bindingGenIndirectRootConstants = 0,
+             bindingGenIndirectRootDescriptor = 0;
+    uint64_t snapshotRequests = 0, snapshotCacheHits = 0,
+             snapshotCacheMisses = 0, snapshotPassthrough = 0,
+             snapshotGraphicsGenChanges = 0, snapshotDescriptorGenChanges = 0,
+             snapshotBothGenChanges = 0, snapshotNoGenChanges = 0;
+    uint64_t snapshotCapturedEntries = 0, snapshotCapturedDescriptors = 0,
+             snapshotCapturedMissingDescriptors = 0,
+             snapshotCapturedRootDescriptors = 0,
+             snapshotCapturedRootConstants = 0,
+             snapshotCapturedVertexBuffers = 0,
+             snapshotCapturedBindless = 0;
     // One-shot replay-breakdown coverage (DXMT_DIAG_REPLAY_BREAKDOWN): attribute
     // the per-pass/per-barrier fixed cost that dominates replay (decoupled from
     // draw count). Times accumulate across the WHOLE replay regardless of where
@@ -6670,18 +6997,138 @@ private:
     uint64_t flushPassBatchesCalls = 0, flushPassBatchesEmpty = 0;
     uint64_t resAccessCalls = 0, resAccessSteadyNoop = 0;
     uint64_t descAccessHits = 0, descAccessMiss = 0;
+    uint64_t supersededStateRecordsSkipped = 0;
     // Stage-2 (passthrough-barrier) feasibility probe: sync points DXMT
     // AUTO-INFERS (mismatchBarriers) vs barrier transitions the app EXPLICITLY
     // declares (appBarrierTransitions). auto≈0 relative to explicit ⇒ FH4's
     // barriers are passthrough-complete ⇒ stage-2 full parallelism reachable.
     uint64_t mismatchBarriers = 0, appBarrierTransitions = 0;
-    // Stage-2 passthrough: per-draw graphics hazard passes skipped wholesale
-    // (DXMT_PASSTHROUGH_BARRIER=1). Pairs with descAccessHits/Miss — when
-    // passthrough is on, graphics draws land here instead of hit/miss.
+    // Bindless graphics fast path: per-draw descriptor hazard passes skipped
+    // because explicit D3D12 barriers and encode-time Metal resource access
+    // carry synchronization/residency. Pairs with descAccessHits/Miss.
     uint64_t descAccessPassthrough = 0; };
   static PerDrawSubTimers &perDrawSubTimers() {
     static thread_local PerDrawSubTimers t;
     return t;
+  }
+
+  template <typename T>
+  static void
+  RecordReplayRecordPerfBucket(uint64_t us) {
+    auto &timers = perDrawSubTimers();
+    if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
+      timers.recordDrawUs += us;
+      timers.recordDrawCount++;
+    } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
+      timers.recordDrawIndexedUs += us;
+      timers.recordDrawIndexedCount++;
+    } else if constexpr (std::is_same_v<T, DispatchRecord>) {
+      timers.recordDispatchUs += us;
+      timers.recordDispatchCount++;
+    } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
+      timers.recordPipelineStateUs += us;
+      timers.recordPipelineStateCount++;
+    } else if constexpr (std::is_same_v<T, DescriptorHeapsRecord>) {
+      timers.recordDescriptorHeapsUs += us;
+      timers.recordDescriptorHeapsCount++;
+    } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
+      timers.recordRootSignatureUs += us;
+      timers.recordRootSignatureCount++;
+    } else if constexpr (std::is_same_v<T, RootDescriptorTableRecord>) {
+      timers.recordRootTableUs += us;
+      timers.recordRootTableCount++;
+    } else if constexpr (std::is_same_v<T, RootDescriptorRecord>) {
+      timers.recordRootDescriptorUs += us;
+      timers.recordRootDescriptorCount++;
+    } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
+      timers.recordRootConstantsUs += us;
+      timers.recordRootConstantsCount++;
+    } else if constexpr (std::is_same_v<T, VertexBuffersRecord> ||
+                         std::is_same_v<T, IndexBufferRecord> ||
+                         std::is_same_v<T, PrimitiveTopologyRecord> ||
+                         std::is_same_v<T, ViewportRecord> ||
+                         std::is_same_v<T, ScissorRecord> ||
+                         std::is_same_v<T, BlendFactorRecord> ||
+                         std::is_same_v<T, StencilRefRecord>) {
+      timers.recordVertexIndexStateUs += us;
+      timers.recordVertexIndexStateCount++;
+    } else if constexpr (std::is_same_v<T, RenderTargetsRecord>) {
+      timers.recordRenderTargetsUs += us;
+      timers.recordRenderTargetsCount++;
+    } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
+      timers.recordResourceBarrierUs += us;
+      timers.recordResourceBarrierCount++;
+    } else if constexpr (std::is_same_v<T, CopyBufferRegionRecord> ||
+                         std::is_same_v<T, CopyTextureRegionRecord> ||
+                         std::is_same_v<T, CopyResourceRecord> ||
+                         std::is_same_v<T, CopyTilesRecord> ||
+                         std::is_same_v<T, ResolveSubresourceRecord> ||
+                         std::is_same_v<T, ClearRenderTargetRecord> ||
+                         std::is_same_v<T, ClearDepthStencilRecord> ||
+                         std::is_same_v<T, ClearUnorderedAccessRecord> ||
+                         std::is_same_v<T, DiscardResourceRecord> ||
+                         std::is_same_v<T, WriteBufferImmediateRecord>) {
+      timers.recordCopyClearResolveUs += us;
+      timers.recordCopyClearResolveCount++;
+    } else if constexpr (std::is_same_v<T, BeginQueryRecord> ||
+                         std::is_same_v<T, EndQueryRecord> ||
+                         std::is_same_v<T, ResolveQueryDataRecord> ||
+                         std::is_same_v<T, PredicationRecord>) {
+      timers.recordQueryUs += us;
+      timers.recordQueryCount++;
+    } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
+      timers.recordExecuteIndirectUs += us;
+      timers.recordExecuteIndirectCount++;
+    } else if constexpr (std::is_same_v<T, TemporalUpscaleRecord>) {
+      timers.recordTemporalUpscaleUs += us;
+      timers.recordTemporalUpscaleCount++;
+    } else {
+      static_assert(!sizeof(T), "CommandRecord payload lacks replay perf bucket");
+    }
+  }
+
+  static void
+  BumpGraphicsBindingGeneration(ReplayState &state,
+                                GraphicsBindingGenerationBumpSource source) {
+    state.graphics_binding_generation++;
+    if (!state.graphics_binding_generation)
+      state.graphics_binding_generation = 1;
+    if (!ReplayPerfEnabled())
+      return;
+    auto &timers = perDrawSubTimers();
+    timers.bindingGenBumps++;
+    switch (source) {
+    case GraphicsBindingGenerationBumpSource::PipelineState:
+      timers.bindingGenPipeline++;
+      break;
+    case GraphicsBindingGenerationBumpSource::DescriptorHeaps:
+      timers.bindingGenDescriptorHeaps++;
+      break;
+    case GraphicsBindingGenerationBumpSource::VertexBuffers:
+      timers.bindingGenVertexBuffers++;
+      break;
+    case GraphicsBindingGenerationBumpSource::RootSignature:
+      timers.bindingGenRootSignature++;
+      break;
+    case GraphicsBindingGenerationBumpSource::RootDescriptorTable:
+      timers.bindingGenRootDescriptorTable++;
+      break;
+    case GraphicsBindingGenerationBumpSource::RootDescriptor:
+      timers.bindingGenRootDescriptor++;
+      break;
+    case GraphicsBindingGenerationBumpSource::RootConstants:
+      timers.bindingGenRootConstants++;
+      break;
+    case GraphicsBindingGenerationBumpSource::IndirectVertexBuffer:
+      timers.bindingGenIndirectVertexBuffer++;
+      break;
+    case GraphicsBindingGenerationBumpSource::IndirectRootConstants:
+      timers.bindingGenIndirectRootConstants++;
+      break;
+    case GraphicsBindingGenerationBumpSource::IndirectRootDescriptor:
+      timers.bindingGenIndirectRootDescriptor++;
+      break;
+    }
   }
 
   // PERF DIAG (DXMT_DIAG_STALL): per-RECORD-instance stall localization. The
@@ -6710,7 +7157,7 @@ private:
     return p;
   }
   static bool StallDiagEnabled() {
-    return D3D12RecordLoopStallEnabled();
+    return D3D12RecordLoopStallEnabled() || dxmt::perf::enabled();
   }
   struct StallScope {
     bool on; clock::time_point t0; uint64_t *dst;
@@ -6747,14 +7194,57 @@ private:
     for (UINT i = 0; i < s.graphics_tables.size(); i++)
       if (s.graphics_tables[i].ptr)
         h = mix(mix(h, i), s.graphics_tables[i].ptr);
-    for (auto &kv : s.graphics_cbv_roots) h = mix(mix(h, kv.first), kv.second);
-    for (auto &kv : s.graphics_srv_roots) h = mix(mix(h, kv.first), kv.second);
-    for (auto &kv : s.graphics_uav_roots) h = mix(mix(h, kv.first), kv.second);
-    for (auto &kv : s.graphics_root_constants) {
-      h = mix(h, kv.first);
-      for (auto v : kv.second) h = mix(h, v);
+    for (UINT i = 0; i < s.graphics_cbv_roots.size(); i++)
+      if (s.graphics_cbv_roots[i].valid)
+        h = mix(mix(h, i), s.graphics_cbv_roots[i].address);
+    for (UINT i = 0; i < s.graphics_srv_roots.size(); i++)
+      if (s.graphics_srv_roots[i].valid)
+        h = mix(mix(h, i), s.graphics_srv_roots[i].address);
+    for (UINT i = 0; i < s.graphics_uav_roots.size(); i++)
+      if (s.graphics_uav_roots[i].valid)
+        h = mix(mix(h, i), s.graphics_uav_roots[i].address);
+    for (UINT i = 0; i < s.graphics_root_constants.size(); i++) {
+      const auto &slot = s.graphics_root_constants[i];
+      if (!slot.valid)
+        continue;
+      h = mix(h, i);
+      for (auto v : slot.values) h = mix(h, v);
     }
     return h;
+  }
+
+  static uint64_t HashGraphicsBindlessReplayStateFull(const ReplayState &s) {
+    uint64_t h = HashGraphicsBindingFull(s);
+    for (UINT slot = 0; slot < s.vertex_buffers.size(); slot++) {
+      const auto &view = s.vertex_buffers[slot];
+      if (!view)
+        continue;
+      HashGraphicsBindingValue(h, slot);
+      HashGraphicsBindingValue(h, view->BufferLocation);
+      HashGraphicsBindingValue(h, view->SizeInBytes);
+      HashGraphicsBindingValue(h, view->StrideInBytes);
+    }
+    return h;
+  }
+
+  static void RecordReplayBindingSignaturePerf(const ReplayState &state) {
+    if (!ReplayPerfEnabled())
+      return;
+    static thread_local const void *last_pso = nullptr;
+    static thread_local const void *last_rootsig = nullptr;
+    static thread_local uint64_t last_full = 0;
+    auto &timers = perDrawSubTimers();
+    timers.drawCount++;
+    const void *pso = state.pipeline_state.ptr();
+    const void *rs = state.graphics_root_signature.ptr();
+    if (pso == last_pso && rs == last_rootsig)
+      timers.psoRootUnchanged++;
+    const uint64_t full = HashGraphicsBindingFull(state);
+    if (timers.drawCount > 1 && full == last_full)
+      timers.fullBindUnchanged++;
+    last_pso = pso;
+    last_rootsig = rs;
+    last_full = full;
   }
 
   // Intra-pass parallel (DXMT_INTRAPASS_PARALLEL): a record that stays inside an
@@ -6783,6 +7273,118 @@ private:
            std::holds_alternative<RootConstantsRecord>(record.payload) ||
            std::holds_alternative<RootDescriptorRecord>(record.payload);
   }
+
+  static bool IsGraphicsStateSetterRecord(const CommandRecord &record) {
+    return std::holds_alternative<PipelineStateRecord>(record.payload) ||
+           std::holds_alternative<ViewportRecord>(record.payload) ||
+           std::holds_alternative<ScissorRecord>(record.payload) ||
+           std::holds_alternative<BlendFactorRecord>(record.payload) ||
+           std::holds_alternative<StencilRefRecord>(record.payload) ||
+           std::holds_alternative<PrimitiveTopologyRecord>(record.payload) ||
+           std::holds_alternative<VertexBuffersRecord>(record.payload) ||
+           std::holds_alternative<IndexBufferRecord>(record.payload) ||
+           std::holds_alternative<RootSignatureRecord>(record.payload) ||
+           std::holds_alternative<DescriptorHeapsRecord>(record.payload) ||
+           std::holds_alternative<RootDescriptorTableRecord>(record.payload) ||
+           std::holds_alternative<RootConstantsRecord>(record.payload) ||
+           std::holds_alternative<RootDescriptorRecord>(record.payload);
+  }
+
+  static bool LaterVertexBufferRecordCoversSlot(
+      const std::vector<CommandRecord> &records, UINT begin, UINT end,
+      UINT slot) {
+    for (UINT i = begin; i < end; i++) {
+      if (const auto *vb = std::get_if<VertexBuffersRecord>(&records[i].payload)) {
+        if (slot >= vb->start_slot && slot < vb->start_slot + vb->view_count)
+          return true;
+      }
+    }
+    return false;
+  }
+
+  static bool GraphicsStateSetterSupersededInRun(
+      const std::vector<CommandRecord> &records, UINT index, UINT run_end) {
+    const auto &payload = records[index].payload;
+    for (UINT i = index + 1; i < run_end; i++) {
+      const auto &later = records[i].payload;
+      if (std::holds_alternative<PipelineStateRecord>(payload) &&
+          std::holds_alternative<PipelineStateRecord>(later))
+        return true;
+      if (std::holds_alternative<ViewportRecord>(payload) &&
+          std::holds_alternative<ViewportRecord>(later))
+        return true;
+      if (std::holds_alternative<ScissorRecord>(payload) &&
+          std::holds_alternative<ScissorRecord>(later))
+        return true;
+      if (std::holds_alternative<BlendFactorRecord>(payload) &&
+          std::holds_alternative<BlendFactorRecord>(later))
+        return true;
+      if (std::holds_alternative<StencilRefRecord>(payload) &&
+          std::holds_alternative<StencilRefRecord>(later))
+        return true;
+      if (std::holds_alternative<PrimitiveTopologyRecord>(payload) &&
+          std::holds_alternative<PrimitiveTopologyRecord>(later))
+        return true;
+      if (std::holds_alternative<IndexBufferRecord>(payload) &&
+          std::holds_alternative<IndexBufferRecord>(later))
+        return true;
+      if (const auto *table =
+              std::get_if<RootDescriptorTableRecord>(&payload)) {
+        if (const auto *later_table =
+                std::get_if<RootDescriptorTableRecord>(&later)) {
+          if (table->compute == later_table->compute &&
+              table->root_parameter_index == later_table->root_parameter_index)
+            return true;
+        }
+      }
+      if (const auto *descriptor =
+              std::get_if<RootDescriptorRecord>(&payload)) {
+        if (const auto *later_descriptor =
+                std::get_if<RootDescriptorRecord>(&later)) {
+          if (descriptor->compute == later_descriptor->compute &&
+              descriptor->parameter_type == later_descriptor->parameter_type &&
+              descriptor->root_parameter_index ==
+                  later_descriptor->root_parameter_index)
+            return true;
+        }
+      }
+    }
+
+    if (const auto *vb = std::get_if<VertexBuffersRecord>(&payload)) {
+      if (!vb->view_count)
+        return true;
+      for (UINT slot = vb->start_slot; slot < vb->start_slot + vb->view_count;
+           slot++) {
+        if (!LaterVertexBufferRecordCoversSlot(records, index + 1, run_end,
+                                               slot))
+          return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  static std::vector<uint8_t>
+  BuildSupersededGraphicsStateRecordMask(
+      const std::vector<CommandRecord> &records) {
+    std::vector<uint8_t> skip(records.size(), 0);
+    for (UINT i = 0; i < records.size();) {
+      if (!IsGraphicsStateSetterRecord(records[i])) {
+        i++;
+        continue;
+      }
+      UINT run_end = i + 1;
+      while (run_end < records.size() &&
+             IsGraphicsStateSetterRecord(records[run_end]))
+        run_end++;
+      for (UINT k = i; k < run_end; k++) {
+        if (GraphicsStateSetterSupersededInRun(records, k, run_end))
+          skip[k] = 1;
+      }
+      i = run_end;
+    }
+    return skip;
+  }
   static bool IntraPassParallelEnabled() {
     static const bool on = env::getEnvVar("DXMT_INTRAPASS_PARALLEL") == "1";
     return on;
@@ -6810,18 +7412,19 @@ private:
     // PERF DIAG (DXMT_DIAG_REPLAY_BREAKDOWN): sub-time the replay stage to
     // attribute the 300-780ms explosion-frame replay to record-loop vs
     // FlushPassBatches vs timestamp/query materialization.
-    static const bool replay_breakdown =
-        D3D12RecordLoopBreakdownEnabled();
-    const auto rb_t0 = replay_breakdown ? clock::now() : clock::time_point{};
-    if (replay_breakdown) {
+    const bool replay_perf = ReplayPerfEnabled();
+    const bool replay_breakdown = D3D12RecordLoopBreakdownEnabled();
+    const auto rb_t0 = replay_perf ? clock::now() : clock::time_point{};
+    if (replay_perf) {
       perDrawSubTimers() = {};
       replayRttiCounters() = {};
     }
     // PERF DIAG: per-record-type cost accumulation (cleared & dumped per slow
     // replay below) to find WHICH D3D12 command type dominates the recordLoop.
     std::unordered_map<const char *, std::pair<uint64_t, uint64_t>> rb_by_type;
-    // PERF DIAG: per-list-replay stall sub-phase aggregation (needs DXMT_DIAG_STALL
-    // so the StallScope timers fire). Sums EVERY record's psoSelect/descAccess/
+    // Perf replay sub-phase aggregation. DXMT_PERF_STATS enables aggregate
+    // timers; DXMT_DIAG_STALL only adds the slow-record detail log.
+    // Sums EVERY record's psoSelect/descAccess/
     // attach/emit + per-record total, so the breakdown line below shows what
     // dominates recordLoop in the heavy scene and — crucially — how much is
     // stallUnaccounted: the ~85% that is none of those named phases (SelectPSO +
@@ -6829,6 +7432,8 @@ private:
     // Serial replay (intra-pass gate off) → no lock needed.
     StallProbe rb_stall_accum = {};
     uint64_t rb_stall_total_us = 0;
+    const auto superseded_state_record_mask =
+        BuildSupersededGraphicsStateRecordMask(records);
     auto replay_one = [&](const CommandRecord &record) {
       DiagReplayRecordScope diag_record_scope(record.d3d_sequence,
                                               ++replay_record_serial);
@@ -6836,10 +7441,12 @@ private:
       if (record.d3d_sequence != 0) {
         dxmt::apitrace::set_current_d3d_sequence(record.d3d_sequence);
       }
-      const auto rb_rec0 = replay_breakdown ? clock::now() : clock::time_point{};
-      const bool stall_diag = StallDiagEnabled();
-      const auto stall_t0 = stall_diag ? clock::now() : clock::time_point{};
-      if (stall_diag)
+      const bool record_perf = replay_perf || replay_breakdown;
+      const auto rb_rec0 = record_perf ? clock::now() : clock::time_point{};
+      const bool stall_timing = StallDiagEnabled();
+      const bool stall_log = D3D12RecordLoopStallEnabled();
+      const auto stall_t0 = stall_timing ? clock::now() : clock::time_point{};
+      if (stall_timing)
         stallProbe().reset();
       std::visit([&](const auto &payload) {
         if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
@@ -6851,13 +7458,19 @@ private:
                " kind=", typeid(payload).name());
         }
         ReplayRecord(chunk, state, payload);
+        const auto rb_rec_us =
+            record_perf ? std::chrono::duration_cast<std::chrono::microseconds>(
+                              clock::now() - rb_rec0).count()
+                        : 0;
+        if (replay_perf)
+          RecordReplayRecordPerfBucket<std::decay_t<decltype(payload)>>(
+              uint64_t(rb_rec_us));
         if (replay_breakdown) {
           auto &slot = rb_by_type[typeid(payload).name()];
           slot.first++;
-          slot.second += std::chrono::duration_cast<std::chrono::microseconds>(
-                             clock::now() - rb_rec0).count();
+          slot.second += uint64_t(rb_rec_us);
         }
-        if (stall_diag) {
+        if (stall_timing) {
           const auto rec_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                   clock::now() - stall_t0).count();
           const auto &p = stallProbe();
@@ -6879,7 +7492,7 @@ private:
             uint64_t n = v.empty() ? 500 : strtoull(v.c_str(), nullptr, 10);
             return n ? n : 500;
           }();
-          if (uint64_t(rec_us) >= thresh) {
+          if (stall_log && uint64_t(rec_us) >= thresh) {
             const uint64_t accounted =
                 p.getPipelineUs + p.psoSelectUs + p.selectPsoUs +
                 p.descAccessUs + p.attachUs + p.bindSnapUs + p.estimateUs +
@@ -6920,13 +7533,27 @@ private:
     // per-record loop (gate on or off). SUBSTEP 2 will hand each run to parallel
     // workers; this step only establishes the run boundary + dispatch shape.
     for (UINT i = 0; i < records.size();) {
+      if (superseded_state_record_mask[i]) {
+        if (replay_perf)
+          perDrawSubTimers().supersededStateRecordsSkipped++;
+        record_index++;
+        i++;
+        continue;
+      }
       if (IntraPassParallelEnabled() && IsGraphicsPassRunRecord(records[i])) {
         UINT j = i;
         while (j < records.size() && IsGraphicsPassRunRecord(records[j]))
           ++j;
         if (j - i >= 8) {
-          for (UINT k = i; k < j; ++k)
+          for (UINT k = i; k < j; ++k) {
+            if (superseded_state_record_mask[k]) {
+              if (replay_perf)
+                perDrawSubTimers().supersededStateRecordsSkipped++;
+              record_index++;
+              continue;
+            }
             replay_one(records[k]);
+          }
           i = j;
           continue;
         }
@@ -6940,12 +7567,187 @@ private:
            " queueType=", desc_.Type,
            " records=", records.size());
     }
-    const auto rb_t1 = replay_breakdown ? clock::now() : clock::time_point{};
+    const auto rb_t1 = replay_perf ? clock::now() : clock::time_point{};
     FlushPassBatches(chunk, state);
-    const auto rb_t2 = replay_breakdown ? clock::now() : clock::time_point{};
+    const auto rb_t2 = replay_perf ? clock::now() : clock::time_point{};
     MaterializeTimestampResolves(chunk, state);
-    const auto rb_t3 = replay_breakdown ? clock::now() : clock::time_point{};
+    const auto rb_t3 = replay_perf ? clock::now() : clock::time_point{};
     MaterializeCpuQueryResolves(chunk, state);
+    if (replay_perf) {
+      const auto rb_t4 = clock::now();
+      auto *stats = dxmt::perf::currentFrameStatistics();
+      dxmt::perf::recordReplayBreakdown(
+          stats, rb_t1 - rb_t0, rb_t2 - rb_t1, rb_t3 - rb_t2, rb_t4 - rb_t3);
+      if (stats) {
+        const auto &timers = perDrawSubTimers();
+        const auto &stall = rb_stall_accum;
+        stats->frame_replay_get_pipeline_interval +=
+            std::chrono::microseconds(stall.getPipelineUs);
+        stats->frame_replay_get_metal_pso_interval +=
+            std::chrono::microseconds(stall.psoSelectUs);
+        stats->frame_replay_select_pso_interval +=
+            std::chrono::microseconds(stall.selectPsoUs);
+        stats->frame_replay_desc_access_interval +=
+            std::chrono::microseconds(timers.desc);
+        stats->frame_replay_state_update_interval +=
+            std::chrono::microseconds(timers.stateUpd);
+        stats->frame_replay_attach_interval +=
+            std::chrono::microseconds(timers.attach);
+        stats->frame_replay_bind_snapshot_interval +=
+            std::chrono::microseconds(stall.bindSnapUs);
+        stats->frame_replay_estimate_interval +=
+            std::chrono::microseconds(stall.estimateUs);
+        stats->frame_replay_packet_interval +=
+            std::chrono::microseconds(stall.packetUs);
+        stats->frame_replay_queue_interval +=
+            std::chrono::microseconds(stall.queueUs);
+        stats->frame_replay_emit_interval +=
+            std::chrono::microseconds(stall.emitUs);
+        stats->frame_replay_flush_blit_interval +=
+            std::chrono::microseconds(timers.flushBlitUs);
+        stats->frame_replay_flush_compute_interval +=
+            std::chrono::microseconds(timers.flushComputeUs);
+        stats->frame_replay_flush_graphics_interval +=
+            std::chrono::microseconds(timers.flushGraphicsUs);
+        stats->frame_replay_flush_barrier_interval +=
+            std::chrono::microseconds(timers.flushBarrierUs);
+        stats->frame_replay_build_plan_interval +=
+            std::chrono::microseconds(timers.buildPlanUs);
+        stats->frame_replay_emit_timestamp_interval +=
+            std::chrono::microseconds(timers.emitTsMarkersUs);
+        stats->frame_replay_draw_count += timers.drawCount;
+        stats->frame_replay_record_draw_interval +=
+            std::chrono::microseconds(timers.recordDrawUs);
+        stats->frame_replay_record_draw_count += timers.recordDrawCount;
+        stats->frame_replay_record_draw_indexed_interval +=
+            std::chrono::microseconds(timers.recordDrawIndexedUs);
+        stats->frame_replay_record_draw_indexed_count +=
+            timers.recordDrawIndexedCount;
+        stats->frame_replay_record_dispatch_interval +=
+            std::chrono::microseconds(timers.recordDispatchUs);
+        stats->frame_replay_record_dispatch_count += timers.recordDispatchCount;
+        stats->frame_replay_record_pipeline_state_interval +=
+            std::chrono::microseconds(timers.recordPipelineStateUs);
+        stats->frame_replay_record_pipeline_state_count +=
+            timers.recordPipelineStateCount;
+        stats->frame_replay_record_descriptor_heaps_interval +=
+            std::chrono::microseconds(timers.recordDescriptorHeapsUs);
+        stats->frame_replay_record_descriptor_heaps_count +=
+            timers.recordDescriptorHeapsCount;
+        stats->frame_replay_record_root_signature_interval +=
+            std::chrono::microseconds(timers.recordRootSignatureUs);
+        stats->frame_replay_record_root_signature_count +=
+            timers.recordRootSignatureCount;
+        stats->frame_replay_record_root_table_interval +=
+            std::chrono::microseconds(timers.recordRootTableUs);
+        stats->frame_replay_record_root_table_count +=
+            timers.recordRootTableCount;
+        stats->frame_replay_record_root_descriptor_interval +=
+            std::chrono::microseconds(timers.recordRootDescriptorUs);
+        stats->frame_replay_record_root_descriptor_count +=
+            timers.recordRootDescriptorCount;
+        stats->frame_replay_record_root_constants_interval +=
+            std::chrono::microseconds(timers.recordRootConstantsUs);
+        stats->frame_replay_record_root_constants_count +=
+            timers.recordRootConstantsCount;
+        stats->frame_replay_record_vertex_index_state_interval +=
+            std::chrono::microseconds(timers.recordVertexIndexStateUs);
+        stats->frame_replay_record_vertex_index_state_count +=
+            timers.recordVertexIndexStateCount;
+        stats->frame_replay_record_render_targets_interval +=
+            std::chrono::microseconds(timers.recordRenderTargetsUs);
+        stats->frame_replay_record_render_targets_count +=
+            timers.recordRenderTargetsCount;
+        stats->frame_replay_record_resource_barrier_interval +=
+            std::chrono::microseconds(timers.recordResourceBarrierUs);
+        stats->frame_replay_record_resource_barrier_count +=
+            timers.recordResourceBarrierCount;
+        stats->frame_replay_record_copy_clear_resolve_interval +=
+            std::chrono::microseconds(timers.recordCopyClearResolveUs);
+        stats->frame_replay_record_copy_clear_resolve_count +=
+            timers.recordCopyClearResolveCount;
+        stats->frame_replay_record_query_interval +=
+            std::chrono::microseconds(timers.recordQueryUs);
+        stats->frame_replay_record_query_count += timers.recordQueryCount;
+        stats->frame_replay_record_execute_indirect_interval +=
+            std::chrono::microseconds(timers.recordExecuteIndirectUs);
+        stats->frame_replay_record_execute_indirect_count +=
+            timers.recordExecuteIndirectCount;
+        stats->frame_replay_record_temporal_upscale_interval +=
+            std::chrono::microseconds(timers.recordTemporalUpscaleUs);
+        stats->frame_replay_record_temporal_upscale_count +=
+            timers.recordTemporalUpscaleCount;
+        stats->frame_replay_pso_root_unchanged += timers.psoRootUnchanged;
+        stats->frame_replay_full_bind_unchanged += timers.fullBindUnchanged;
+        stats->frame_replay_flush_blit_count += timers.flushBlitCalls;
+        stats->frame_replay_flush_compute_count += timers.flushComputeCalls;
+        stats->frame_replay_flush_graphics_count += timers.flushGraphicsCalls;
+        stats->frame_replay_flush_barrier_count += timers.flushBarrierCalls;
+        stats->frame_replay_emit_timestamp_count += timers.emitTsMarkersCalls;
+        stats->frame_replay_flush_pass_batches_count +=
+            timers.flushPassBatchesCalls;
+        stats->frame_replay_flush_pass_batches_empty +=
+            timers.flushPassBatchesEmpty;
+        stats->frame_replay_resource_access_count += timers.resAccessCalls;
+        stats->frame_replay_resource_access_steady_noop +=
+            timers.resAccessSteadyNoop;
+        stats->frame_replay_desc_access_hit += timers.descAccessHits;
+        stats->frame_replay_desc_access_miss += timers.descAccessMiss;
+        stats->frame_replay_desc_access_passthrough +=
+            timers.descAccessPassthrough;
+        stats->frame_replay_superseded_state_records_skipped +=
+            timers.supersededStateRecordsSkipped;
+        stats->frame_replay_mismatch_barriers += timers.mismatchBarriers;
+        stats->frame_replay_app_barrier_transitions +=
+            timers.appBarrierTransitions;
+        stats->frame_replay_binding_gen_bumps += timers.bindingGenBumps;
+        stats->frame_replay_binding_gen_pipeline += timers.bindingGenPipeline;
+        stats->frame_replay_binding_gen_descriptor_heaps +=
+            timers.bindingGenDescriptorHeaps;
+        stats->frame_replay_binding_gen_vertex_buffers +=
+            timers.bindingGenVertexBuffers;
+        stats->frame_replay_binding_gen_root_signature +=
+            timers.bindingGenRootSignature;
+        stats->frame_replay_binding_gen_root_descriptor_table +=
+            timers.bindingGenRootDescriptorTable;
+        stats->frame_replay_binding_gen_root_descriptor +=
+            timers.bindingGenRootDescriptor;
+        stats->frame_replay_binding_gen_root_constants +=
+            timers.bindingGenRootConstants;
+        stats->frame_replay_binding_gen_indirect_vertex_buffer +=
+            timers.bindingGenIndirectVertexBuffer;
+        stats->frame_replay_binding_gen_indirect_root_constants +=
+            timers.bindingGenIndirectRootConstants;
+        stats->frame_replay_binding_gen_indirect_root_descriptor +=
+            timers.bindingGenIndirectRootDescriptor;
+        stats->frame_replay_snapshot_requests += timers.snapshotRequests;
+        stats->frame_replay_snapshot_cache_hits += timers.snapshotCacheHits;
+        stats->frame_replay_snapshot_cache_misses += timers.snapshotCacheMisses;
+        stats->frame_replay_snapshot_passthrough += timers.snapshotPassthrough;
+        stats->frame_replay_snapshot_graphics_gen_changes +=
+            timers.snapshotGraphicsGenChanges;
+        stats->frame_replay_snapshot_descriptor_gen_changes +=
+            timers.snapshotDescriptorGenChanges;
+        stats->frame_replay_snapshot_both_gen_changes +=
+            timers.snapshotBothGenChanges;
+        stats->frame_replay_snapshot_no_gen_changes +=
+            timers.snapshotNoGenChanges;
+        stats->frame_replay_snapshot_captured_entries +=
+            timers.snapshotCapturedEntries;
+        stats->frame_replay_snapshot_captured_descriptors +=
+            timers.snapshotCapturedDescriptors;
+        stats->frame_replay_snapshot_captured_missing_descriptors +=
+            timers.snapshotCapturedMissingDescriptors;
+        stats->frame_replay_snapshot_captured_root_descriptors +=
+            timers.snapshotCapturedRootDescriptors;
+        stats->frame_replay_snapshot_captured_root_constants +=
+            timers.snapshotCapturedRootConstants;
+        stats->frame_replay_snapshot_captured_vertex_buffers +=
+            timers.snapshotCapturedVertexBuffers;
+        stats->frame_replay_snapshot_captured_bindless +=
+            timers.snapshotCapturedBindless;
+      }
+    }
     if (replay_breakdown) {
       const auto rb_t4 = clock::now();
       const auto us = [](auto d) {
@@ -6991,12 +7793,8 @@ private:
              " flushPassUs=", flush_pass_us,
              " timestampResolveUs=", timestamp_resolve_us,
              " cpuQueryResolveUs=", cpu_query_resolve_us,
-             // recordLoop sub-phase split (needs DXMT_DIAG_STALL). stallUnaccounted
-             // = recordLoop time that is none of pso/desc/attach/emit — the
-             // suspected ~85% (SelectPSO + binding snapshot + packet build /
-             // GetResource, or a pure first-use stall). If stallUnaccounted or
-             // stallEmit dominates, recordLoop-CPU optimization (parallel/cut-cost)
-             // is NOT the lever; emit dominance ⇒ encode-thread back-pressure.
+             // recordLoop sub-phase split. DXMT_DIAG_STALL adds slow-record logs;
+             // DXMT_PERF_STATS records the aggregate fields without per-record log spam.
              " stallTotalUs=", rb_stall_total_us,
              " stallGetPipelineUs=", rb_stall_accum.getPipelineUs,
              " stallPsoSelectUs=", rb_stall_accum.psoSelectUs,
@@ -7144,7 +7942,8 @@ private:
       ReplayDiscardResource(chunk, record);
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
       state.pipeline_state = record.pipeline_state;
-      BumpGraphicsBindingGeneration(state);
+      BumpGraphicsBindingGeneration(
+          state, GraphicsBindingGenerationBumpSource::PipelineState);
     } else if constexpr (std::is_same_v<T, PrimitiveTopologyRecord>) {
       state.topology = record.topology;
     } else if constexpr (std::is_same_v<T, ViewportRecord>) {
@@ -7175,19 +7974,29 @@ private:
         else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
           state.sampler_heap = heap;
       }
-      BumpGraphicsBindingGeneration(state);
+      BumpGraphicsBindingGeneration(
+          state, GraphicsBindingGenerationBumpSource::DescriptorHeaps);
     } else if constexpr (std::is_same_v<T, VertexBuffersRecord>) {
       for (UINT i = 0; i < record.view_count &&
                        record.start_slot + i < state.vertex_buffers.size();
            i++) {
-        if (i < record.views.size())
-          state.vertex_buffers[record.start_slot + i] = record.views[i];
-        else
+        const auto slot = record.start_slot + i;
+        if (i < record.views.size()) {
+          state.vertex_buffers[slot] = record.views[i];
+          state.resolved_vertex_buffers[slot] =
+              ResolveReplayVertexBuffer(state, record.views[i]);
+        } else {
           state.vertex_buffers[record.start_slot + i].reset();
+          state.resolved_vertex_buffers[slot] = {};
+        }
       }
-      BumpGraphicsBindingGeneration(state);
+      BumpGraphicsBindingGeneration(
+          state, GraphicsBindingGenerationBumpSource::VertexBuffers);
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
+      state.resolved_index_buffer =
+          record.view ? ResolveReplayIndexBuffer(state, *record.view)
+                      : ResolvedReplayIndexBuffer{};
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
       // This is the REAL app-barrier replay entry (ReplayResourceBarrier is a
       // separate path). An app-declared barrier changes resource state, so it
@@ -7196,7 +8005,7 @@ private:
       state.access_epoch++;
       // Stage-2 probe: count app-DECLARED barrier transitions here (vs the
       // auto-inferred mismatchBarriers) to gauge passthrough-completeness.
-      if (ReplayBreakdownEnabled())
+      if (ReplayPerfEnabled())
         perDrawSubTimers().appBarrierTransitions += record.barriers.size();
       auto batch = BuildResourceBarrierBatch(state, record);
       if (batch.entries.empty() && !batch.needs_separator)
@@ -7205,11 +8014,15 @@ private:
     } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
       // Root signatures only affect binding translation for subsequently queued
       // packets; already queued packets keep their cloned state.
-      if (record.compute)
+      auto *root = GetRootSignature(record.root_signature.ptr());
+      if (record.compute) {
         state.compute_root_signature = record.root_signature;
-      else {
+        state.compute_root_signature_impl = root;
+      } else {
         state.graphics_root_signature = record.root_signature;
-        BumpGraphicsBindingGeneration(state);
+        state.graphics_root_signature_impl = root;
+        BumpGraphicsBindingGeneration(
+            state, GraphicsBindingGenerationBumpSource::RootSignature);
       }
     } else if constexpr (std::is_same_v<T, RootDescriptorTableRecord>) {
       auto &tables = record.compute ? state.compute_tables
@@ -7217,15 +8030,18 @@ private:
       if (record.root_parameter_index < tables.size())
         tables[record.root_parameter_index] = record.base_descriptor;
       if (!record.compute)
-        BumpGraphicsBindingGeneration(state);
+        BumpGraphicsBindingGeneration(
+            state, GraphicsBindingGenerationBumpSource::RootDescriptorTable);
     } else if constexpr (std::is_same_v<T, RootDescriptorRecord>) {
       StoreRootDescriptor(state, record);
       if (!record.compute)
-        BumpGraphicsBindingGeneration(state);
+        BumpGraphicsBindingGeneration(
+            state, GraphicsBindingGenerationBumpSource::RootDescriptor);
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
       StoreRootConstants(state, record);
       if (!record.compute)
-        BumpGraphicsBindingGeneration(state);
+        BumpGraphicsBindingGeneration(
+            state, GraphicsBindingGenerationBumpSource::RootConstants);
     } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
       FlushPassBatches(chunk, state);
       ReplayBeginQuery(chunk, record);
@@ -7351,7 +8167,7 @@ private:
     state.access_epoch++;
     // Stage-2 probe: count app-DECLARED barrier transitions (vs auto-inferred
     // mismatchBarriers) to gauge whether FH4's barriers are passthrough-complete.
-    if (ReplayBreakdownEnabled())
+    if (ReplayPerfEnabled())
       perDrawSubTimers().appBarrierTransitions += record.barriers.size();
     QueueResourceAccessBarrierBatch(state, std::move(batch));
   }
@@ -7766,8 +8582,7 @@ private:
                                   UINT subresource_count = 0,
                                   bool materialize_query_resolves = true,
                                   bool materialize_timestamp_resolves = true) {
-    static const bool rb_su =
-        D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
+    const bool rb_su = ReplayPerfEnabled();
     ScopeAccum rb_su_guard{rb_su, rb_su ? clock::now() : clock::time_point{},
                            &perDrawSubTimers().stateUpd};
     if (rb_su) perDrawSubTimers().resAccessCalls++;
@@ -8344,27 +9159,39 @@ private:
 
   void StoreRootDescriptor(ReplayState &state,
                            const RootDescriptorRecord &record) {
-    auto &map = [&]() -> std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> & {
-      switch (record.parameter_type) {
-      case D3D12_ROOT_PARAMETER_TYPE_CBV:
-        return record.compute ? state.compute_cbv_roots
-                              : state.graphics_cbv_roots;
-      case D3D12_ROOT_PARAMETER_TYPE_UAV:
-        return record.compute ? state.compute_uav_roots
-                              : state.graphics_uav_roots;
-      case D3D12_ROOT_PARAMETER_TYPE_SRV:
-      default:
-        return record.compute ? state.compute_srv_roots
-                              : state.graphics_srv_roots;
-      }
-    }();
-    map[record.root_parameter_index] = record.address;
+    if (record.root_parameter_index >= ReplayState::kMaxRootParameters)
+      return;
+    ReplayRootDescriptorSlot *slot = nullptr;
+    switch (record.parameter_type) {
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+      slot = record.compute
+                 ? &state.compute_cbv_roots[record.root_parameter_index]
+                 : &state.graphics_cbv_roots[record.root_parameter_index];
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+      slot = record.compute
+                 ? &state.compute_uav_roots[record.root_parameter_index]
+                 : &state.graphics_uav_roots[record.root_parameter_index];
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    default:
+      slot = record.compute
+                 ? &state.compute_srv_roots[record.root_parameter_index]
+                 : &state.graphics_srv_roots[record.root_parameter_index];
+      break;
+    }
+    slot->valid = true;
+    slot->address = record.address;
   }
 
   void StoreRootConstants(ReplayState &state, const RootConstantsRecord &record) {
-    auto &map = record.compute ? state.compute_root_constants
-                               : state.graphics_root_constants;
-    auto &values = map[record.root_parameter_index];
+    if (record.root_parameter_index >= ReplayState::kMaxRootParameters)
+      return;
+    auto &slot = record.compute
+                     ? state.compute_root_constants[record.root_parameter_index]
+                     : state.graphics_root_constants[record.root_parameter_index];
+    slot.valid = true;
+    auto &values = slot.values;
     const auto required_size =
         record.dst_offset + static_cast<UINT>(record.values.size());
     if (values.size() < required_size)
@@ -8400,8 +9227,9 @@ private:
       return value != 0;
     default:
       WARN("D3D12CommandQueue: unsupported predication operation ",
-           state.predication_operation);
-      return false;
+           uint32_t(state.predication_operation),
+           "; command will be executed");
+      return true;
     }
   }
 
@@ -8843,7 +9671,9 @@ private:
           std::memcpy(&view, bytes, sizeof(view));
           if (argument.VertexBuffer.Slot < state.vertex_buffers.size()) {
             state.vertex_buffers[argument.VertexBuffer.Slot] = view;
-            BumpGraphicsBindingGeneration(state);
+            BumpGraphicsBindingGeneration(
+                state,
+                GraphicsBindingGenerationBumpSource::IndirectVertexBuffer);
           }
           break;
         }
@@ -8866,7 +9696,9 @@ private:
                         constants.values.size() * sizeof(UINT));
           StoreRootConstants(state, constants);
           if (!compute)
-            BumpGraphicsBindingGeneration(state);
+            BumpGraphicsBindingGeneration(
+                state,
+                GraphicsBindingGenerationBumpSource::IndirectRootConstants);
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
@@ -8878,7 +9710,9 @@ private:
                          argument.ConstantBufferView.RootParameterIndex,
                          address});
           if (!compute)
-            BumpGraphicsBindingGeneration(state);
+            BumpGraphicsBindingGeneration(
+                state,
+                GraphicsBindingGenerationBumpSource::IndirectRootDescriptor);
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
@@ -8890,7 +9724,9 @@ private:
                          argument.ShaderResourceView.RootParameterIndex,
                          address});
           if (!compute)
-            BumpGraphicsBindingGeneration(state);
+            BumpGraphicsBindingGeneration(
+                state,
+                GraphicsBindingGenerationBumpSource::IndirectRootDescriptor);
           break;
         }
         case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
@@ -8902,7 +9738,9 @@ private:
                          argument.UnorderedAccessView.RootParameterIndex,
                          address});
           if (!compute)
-            BumpGraphicsBindingGeneration(state);
+            BumpGraphicsBindingGeneration(
+                state,
+                GraphicsBindingGenerationBumpSource::IndirectRootDescriptor);
           break;
         }
         default:
@@ -9742,15 +10580,16 @@ private:
                          const PipelineState &pipeline, bool compute,
                          UINT root_index,
                          const RootSignatureParameter &parameter) {
-    const auto &map = compute ? state.compute_root_constants
-                              : state.graphics_root_constants;
-    auto it = map.find(root_index);
-    if (it == map.end() || it->second.empty())
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto &slot = compute ? state.compute_root_constants[root_index]
+                               : state.graphics_root_constants[root_index];
+    if (!slot.valid || slot.values.empty())
       return;
 
     const auto declared_count = parameter.constants.Num32BitValues;
     const auto actual_count =
-        std::max<uint32_t>(declared_count, uint32_t(it->second.size()));
+        std::max<uint32_t>(declared_count, uint32_t(slot.values.size()));
     if (!actual_count)
       return;
 
@@ -9761,8 +10600,8 @@ private:
     if (!constants.mapped || !constants.gpu_buffer)
       return;
     std::memset(constants.mapped, 0, constants.length);
-    std::memcpy(constants.mapped, it->second.data(),
-                std::min<uint64_t>(uint64_t(it->second.size()) * sizeof(UINT),
+    std::memcpy(constants.mapped, slot.values.data(),
+                std::min<uint64_t>(uint64_t(slot.values.size()) * sizeof(UINT),
                                    constants.length));
     if (constants.needs_flush)
       constants.gpu_buffer.updateContents(constants.offset, constants.mapped,
@@ -10044,12 +10883,14 @@ private:
                              : state.graphics_srv_roots)
                   : (compute ? state.compute_uav_roots
                              : state.graphics_uav_roots);
-    auto it = map.find(root_index);
-    if (it == map.end())
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto &slot = map[root_index];
+    if (!slot.valid)
       return;
 
     Resource *resource = nullptr;
-    ResolveBufferGpuAddress(it->second, resource);
+    ResolveBufferGpuAddress(slot.address, resource);
     if (!resource)
       return;
 
@@ -10212,27 +11053,18 @@ private:
             : type == DescriptorRecordType::ShaderResourceView
                   ? (compute ? state.compute_srv_roots : state.graphics_srv_roots)
                   : (compute ? state.compute_uav_roots : state.graphics_uav_roots);
-    auto it = map.find(root_index);
-    return it == map.end() ? 0 : it->second;
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return 0;
+    const auto &slot = map[root_index];
+    return slot.valid ? slot.address : 0;
   }
 
   void RecordPipelineDescriptorAccess_Cached(CommandChunk *chunk,
                                              ReplayState &state,
                                              PipelineState &pipeline,
                                              bool compute) {
-    // Stage-2 passthrough: skip the entire per-draw graphics hazard pass and
-    // trust app barriers (+ stage-B binding access drives Metal fence/residency
-    // either way). Equivalent to a 100% descAccess-cache hit extended to miss
-    // paths. Compute keeps the hazard pass — few passes/frame (not the per-draw
-    // bottleneck) and its UAV write→read hazards are more load-bearing. VERIFY
-    // falls through to run the full pass without skipping (A/B failsafe).
-    if (PassthroughBarrierEnabled() && !compute && !PassthroughBarrierVerify()) {
-      if (ReplayBreakdownEnabled())
-        perDrawSubTimers().descAccessPassthrough++;
-      return;
-    }
-    auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
-                                          : state.graphics_root_signature.ptr());
+    auto *root = compute ? state.compute_root_signature_impl
+                         : state.graphics_root_signature_impl;
     if (!root)
       return;
     const uint64_t key =
@@ -10309,11 +11141,11 @@ private:
       const bool hit =
           cit != state.da_cache.end() && cit->second == state.access_epoch;
       if (hit && !DescAccessVerify()) {
-        if (ReplayBreakdownEnabled())
+        if (ReplayPerfEnabled())
           perDrawSubTimers().descAccessHits++;
         return; // identical bindings + frozen state -> hazard result unchanged
       }
-      if (ReplayBreakdownEnabled())
+      if (ReplayPerfEnabled())
         perDrawSubTimers().descAccessMiss++;
     }
 
@@ -11446,51 +12278,6 @@ private:
       break;
     }
   }
-
-  struct GraphicsBindingSnapshotEntry {
-    enum class Kind : uint8_t { Descriptor, RootConstants };
-
-    Kind kind = Kind::Descriptor;
-    PipelineStage stage = PipelineStage::Vertex;
-    D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    UINT root_index = 0;
-    UINT slot = 0;
-    UINT shader_register = 0;
-    UINT register_space = 0;
-    UINT register_lower_bound = 0;
-    UINT root_offset_key = 0;
-    UINT64 debug_size = 0;
-    D3D12_GPU_VIRTUAL_ADDRESS debug_address = 0;
-    const char *debug_kind = nullptr;
-    bool has_descriptor = false;
-    DescriptorRecord descriptor = {};
-    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
-    std::vector<UINT> constants;
-    UINT constant_count = 0;
-  };
-
-  struct GraphicsVertexBufferBindingSnapshot {
-    UINT slot = 0;
-    UINT stride = 0;
-    UINT64 offset = 0;
-    Rc<Buffer> buffer;
-  };
-
-  struct GraphicsBindingSnapshot {
-    Com<ID3D12PipelineState> pipeline_state;
-    Com<ID3D12RootSignature> root_signature;
-    std::vector<GraphicsBindingSnapshotEntry> entries;
-    std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
-    uint32_t vertex_slot_mask = 0;
-    uint64_t content_fingerprint = 0;
-    // Bindless-mirror (③.3) snapshot-path support: the snapshot replays draws WITHOUT the live
-    // ReplayState, so root_offsets (③.2, per-stage) are rebuilt at APPLY from the captured
-    // entries. The persistent mirror buffers are derived from each entry.descriptor.mirror at
-    // APPLY too, matching the mirror slots filled by MaybeFillBindlessMirrorSlot.
-    bool bindless = false;
-    AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
-    AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
-  };
 
   struct BindlessMirrorWindow {
     AllocatedArgumentBufferSlice texture;
@@ -12813,8 +13600,8 @@ private:
   void ApplyRootDescriptorTables(ArgumentEncodingContext &enc,
                                  const ReplayState &state,
                                  const PipelineState &pipeline, bool compute) {
-    auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
-                                          : state.graphics_root_signature.ptr());
+    auto *root = compute ? state.compute_root_signature_impl
+                         : state.graphics_root_signature_impl;
     if (!root)
       return;
 
@@ -12948,16 +13735,18 @@ private:
             : type == DescriptorRecordType::ShaderResourceView
                   ? state.graphics_srv_roots
                   : state.graphics_uav_roots;
-    auto it = map.find(root_index);
-    if (it == map.end())
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto &slot = map[root_index];
+    if (!slot.valid)
       return;
 
     Resource *resource = nullptr;
-    const auto offset = ResolveBufferGpuAddress(it->second, resource);
+    const auto offset = ResolveBufferGpuAddress(slot.address, resource);
     if (!resource || !resource->GetBuffer())
       return;
     if (type == DescriptorRecordType::ConstantBufferView &&
-        (it->second & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
+        (slot.address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
       WARN("D3D12CommandQueue: root CBV address is not 256-byte aligned");
       return;
     }
@@ -12973,7 +13762,7 @@ private:
         WARN("D3D12CommandQueue: root CBV resolved size is not 256-byte aligned");
         return;
       }
-      descriptor.desc.cbv.BufferLocation = it->second;
+      descriptor.desc.cbv.BufferLocation = slot.address;
       descriptor.desc.cbv.SizeInBytes = UINT(size);
     } else if (type == DescriptorRecordType::ShaderResourceView) {
       descriptor.desc.srv.Format = DXGI_FORMAT_UNKNOWN;
@@ -13018,7 +13807,7 @@ private:
       entry.shader_register = parameter.descriptor.ShaderRegister;
       entry.register_space = parameter.descriptor.RegisterSpace;
       entry.debug_size = resource->GetResourceDesc().Width - offset;
-      entry.debug_address = it->second;
+      entry.debug_address = slot.address;
       entry.debug_kind =
           type == DescriptorRecordType::ConstantBufferView
               ? "root-cbv"
@@ -13050,26 +13839,28 @@ private:
                                     const PipelineState &pipeline,
                                     UINT root_index,
                                     const RootSignatureParameter &parameter) {
-    auto it = state.graphics_root_constants.find(root_index);
-    if (it == state.graphics_root_constants.end() || it->second.empty())
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto &slot = state.graphics_root_constants[root_index];
+    if (!slot.valid || slot.values.empty())
       return;
 
     const auto declared_count = parameter.constants.Num32BitValues;
     const auto actual_count =
-        std::max<uint32_t>(declared_count, uint32_t(it->second.size()));
+        std::max<uint32_t>(declared_count, uint32_t(slot.values.size()));
     if (!actual_count)
       return;
 
     ForEachVisibleStage(parameter.visibility, false, [&](PipelineStage stage) {
-      auto slot = ResolveShaderBindingSlot(
+      auto binding_slot = ResolveShaderBindingSlot(
           pipeline, stage, SM50BindingType::ConstantBuffer,
           parameter.constants.ShaderRegister,
           parameter.constants.RegisterSpace);
-      if (!slot)
+      if (!binding_slot)
         return;
-      if (*slot >= 14) {
+      if (*binding_slot >= 14) {
         WARN("D3D12CommandQueue: root constants target unsupported CBV slot b",
-             *slot);
+             *binding_slot);
         return;
       }
 
@@ -13078,12 +13869,12 @@ private:
       entry.stage = stage;
       entry.range_type = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
       entry.root_index = root_index;
-      entry.slot = *slot;
+      entry.slot = *binding_slot;
       entry.shader_register = parameter.constants.ShaderRegister;
       entry.register_space = parameter.constants.RegisterSpace;
       entry.debug_size = uint64_t(actual_count) * sizeof(UINT);
       entry.debug_kind = "root-constants";
-      entry.constants = it->second;
+      entry.constants = slot.values;
       entry.constant_count = actual_count;
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
@@ -13143,18 +13934,20 @@ private:
   }
 
   GraphicsBindingSnapshot CaptureGraphicsBindingSnapshot(
-      const ReplayState &state, PipelineState &pipeline) {
+      const ReplayState &state, PipelineState &pipeline,
+      GraphicsBindingSnapshotCaptureStats *capture_stats = nullptr) {
     GraphicsBindingSnapshot snapshot = {};
     snapshot.content_fingerprint = kGraphicsBindingFingerprintOffset;
     snapshot.pipeline_state = state.pipeline_state;
     snapshot.root_signature = state.graphics_root_signature;
+    snapshot.root_signature_impl = state.graphics_root_signature_impl;
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.root_signature.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.pipeline_state.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint, &pipeline);
 
-    auto *root = GetRootSignature(state.graphics_root_signature.ptr());
+    auto *root = state.graphics_root_signature_impl;
     if (!root)
       return snapshot;
 
@@ -13192,7 +13985,122 @@ private:
     }
 
     CaptureGraphicsVertexBuffers(snapshot, state, pipeline.GetGraphicsState());
+    if (capture_stats) {
+      capture_stats->entries += snapshot.entries.size();
+      capture_stats->vertex_buffers += snapshot.vertex_buffers.size();
+      capture_stats->bindless += snapshot.bindless ? 1 : 0;
+      for (const auto &entry : snapshot.entries) {
+        if (entry.kind == GraphicsBindingSnapshotEntry::Kind::RootConstants) {
+          capture_stats->root_constants++;
+          continue;
+        }
+        capture_stats->descriptors++;
+        if (!entry.has_descriptor)
+          capture_stats->missing_descriptors++;
+        if (entry.debug_kind &&
+            (!std::strcmp(entry.debug_kind, "root-cbv") ||
+             !std::strcmp(entry.debug_kind, "root-srv") ||
+             !std::strcmp(entry.debug_kind, "root-uav")))
+          capture_stats->root_descriptors++;
+      }
+    }
     return snapshot;
+  }
+
+  void RecordGraphicsBindingSnapshotRequestPerf(
+      ReplayState &state, uint64_t descriptor_content_generation) {
+    if (!ReplayPerfEnabled())
+      return;
+    auto &timers = perDrawSubTimers();
+    timers.snapshotRequests++;
+    if (state.has_last_snapshot_request_generation) {
+      const bool graphics_changed =
+          state.last_snapshot_request_graphics_generation !=
+          state.graphics_binding_generation;
+      const bool descriptor_changed =
+          state.last_snapshot_request_descriptor_generation !=
+          descriptor_content_generation;
+      if (graphics_changed && descriptor_changed)
+        timers.snapshotBothGenChanges++;
+      else if (graphics_changed)
+        timers.snapshotGraphicsGenChanges++;
+      else if (descriptor_changed)
+        timers.snapshotDescriptorGenChanges++;
+      else
+        timers.snapshotNoGenChanges++;
+    }
+    state.last_snapshot_request_graphics_generation =
+        state.graphics_binding_generation;
+    state.last_snapshot_request_descriptor_generation =
+        descriptor_content_generation;
+    state.has_last_snapshot_request_generation = true;
+  }
+
+  void RecordGraphicsBindingSnapshotCapturePerf(
+      const GraphicsBindingSnapshotCaptureStats &capture_stats) {
+    if (!ReplayPerfEnabled())
+      return;
+    auto &timers = perDrawSubTimers();
+    timers.snapshotCapturedEntries += capture_stats.entries;
+    timers.snapshotCapturedDescriptors += capture_stats.descriptors;
+    timers.snapshotCapturedMissingDescriptors +=
+        capture_stats.missing_descriptors;
+    timers.snapshotCapturedRootDescriptors += capture_stats.root_descriptors;
+    timers.snapshotCapturedRootConstants += capture_stats.root_constants;
+    timers.snapshotCapturedVertexBuffers += capture_stats.vertex_buffers;
+    timers.snapshotCapturedBindless += capture_stats.bindless;
+  }
+
+  std::shared_ptr<GraphicsBindingSnapshot> GetOrCaptureGraphicsBindingSnapshot(
+      CommandChunk *chunk, ReplayState &state, PipelineState &pipeline,
+      const ReplayRenderPassAttachments &attachments,
+      uint64_t descriptor_content_generation) {
+    RecordGraphicsBindingSnapshotRequestPerf(state,
+                                             descriptor_content_generation);
+    if (!D3D12ReplayGraphicsBatchingEnabled())
+    {
+      if (ReplayPerfEnabled())
+        perDrawSubTimers().snapshotPassthrough++;
+      GraphicsBindingSnapshotCaptureStats capture_stats = {};
+      auto snapshot = std::make_shared<GraphicsBindingSnapshot>(
+          CaptureGraphicsBindingSnapshot(state, pipeline, &capture_stats));
+      RecordGraphicsBindingSnapshotCapturePerf(capture_stats);
+      return snapshot;
+    }
+
+    if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
+      FlushPassBatches(chunk, state);
+
+    auto &batch = state.graphics_pass_batch;
+    if (batch.active &&
+        !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
+      FlushPassBatches(chunk, state);
+
+    auto &active_batch = state.graphics_pass_batch;
+    if (!active_batch.active) {
+      active_batch.active = true;
+      active_batch.attachments = attachments;
+      active_batch.argument_buffer_size = 0;
+    }
+
+    const ReplayBindingGenerationKey key{state.graphics_binding_generation,
+                                         descriptor_content_generation};
+    auto it = active_batch.captured_binding_snapshots.find(key);
+    if (it == active_batch.captured_binding_snapshots.end()) {
+      if (ReplayPerfEnabled())
+        perDrawSubTimers().snapshotCacheMisses++;
+      GraphicsBindingSnapshotCaptureStats capture_stats = {};
+      it = active_batch.captured_binding_snapshots
+               .emplace(key,
+                        std::make_shared<GraphicsBindingSnapshot>(
+                            CaptureGraphicsBindingSnapshot(state, pipeline,
+                                                          &capture_stats)))
+               .first;
+      RecordGraphicsBindingSnapshotCapturePerf(capture_stats);
+    } else if (ReplayPerfEnabled()) {
+      perDrawSubTimers().snapshotCacheHits++;
+    }
+    return it->second;
   }
 
   void ApplyRootBufferDescriptor(ArgumentEncodingContext &enc,
@@ -13209,16 +14117,18 @@ private:
                              : state.graphics_srv_roots)
                   : (compute ? state.compute_uav_roots
                              : state.graphics_uav_roots);
-    auto it = map.find(root_index);
-    if (it == map.end())
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto &slot = map[root_index];
+    if (!slot.valid)
       return;
 
     Resource *resource = nullptr;
-    const auto offset = ResolveBufferGpuAddress(it->second, resource);
+    const auto offset = ResolveBufferGpuAddress(slot.address, resource);
     if (!resource || !resource->GetBuffer())
       return;
     if (type == DescriptorRecordType::ConstantBufferView &&
-        (it->second & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
+        (slot.address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
       WARN("D3D12CommandQueue: root CBV address is not 256-byte aligned");
       return;
     }
@@ -13234,7 +14144,7 @@ private:
         WARN("D3D12CommandQueue: root CBV resolved size is not 256-byte aligned");
         return;
       }
-      descriptor.desc.cbv.BufferLocation = it->second;
+      descriptor.desc.cbv.BufferLocation = slot.address;
       descriptor.desc.cbv.SizeInBytes = UINT(size);
     } else if (type == DescriptorRecordType::ShaderResourceView) {
       descriptor.desc.srv.Format = DXGI_FORMAT_UNKNOWN;
@@ -13277,7 +14187,7 @@ private:
           pipeline, compute, stage, root_index, argument->SM50BindingSlot,
           parameter.descriptor.ShaderRegister,
           parameter.descriptor.RegisterSpace,
-          resource->GetResourceDesc().Width - offset, it->second);
+          resource->GetResourceDesc().Width - offset, slot.address);
       BindDescriptor(enc, stage, range_type, argument->SM50BindingSlot,
                      descriptor, argument);
     });
@@ -13403,9 +14313,7 @@ private:
         }
       }
     }
-    const auto *root = snapshot.root_signature
-                           ? GetRootSignature(snapshot.root_signature.ptr())
-                           : nullptr;
+    const auto *root = snapshot.root_signature_impl;
     if (root && arguments) {
       for (const auto &sampler_desc : root->GetStaticSamplers()) {
         const auto *arg = FindBindlessMirrorArgument(
@@ -13727,7 +14635,7 @@ private:
                                     bool use_tessellation,
                                     uint64_t &argbuf_offset,
                                     BindlessMirrorDrawDiag *draw_diag = nullptr) {
-    if (auto *root = GetRootSignature(snapshot.root_signature.ptr()))
+    if (auto *root = snapshot.root_signature_impl)
       ApplyStaticSamplers(enc, pipeline, *root, false);
 
     for (const auto &entry : snapshot.entries) {
@@ -13876,15 +14784,12 @@ private:
       if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
         continue;
       const auto &view = *state.vertex_buffers[slot];
-      UINT64 resource_offset = 0;
-      auto *resource =
-          LookupBufferResourceByGpuVirtualAddress(view.BufferLocation,
-                                                  &resource_offset);
-      if (!resource || !resource->GetBuffer())
+      const auto &resolved = state.resolved_vertex_buffers[slot];
+      if (!resolved.valid || resolved.address != view.BufferLocation ||
+          !resolved.buffer)
         continue;
-      enc.bindVertexBuffer(slot, resource->GetHeapOffset() + resource_offset,
-                           view.StrideInBytes,
-                           Rc<Buffer>(resource->GetBuffer()));
+      enc.bindVertexBuffer(slot, resolved.binding_offset, view.StrideInBytes,
+                           Rc<Buffer>(resolved.buffer));
     }
 
     const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * 16u;
@@ -13902,7 +14807,8 @@ private:
                               PipelineState &pipeline,
                               bool use_geometry,
                               bool use_tessellation,
-                              uint64_t &argbuf_offset) {
+                              uint64_t &argbuf_offset,
+                              BindlessMirrorDrawDiag *out_diag = nullptr) {
     ApplyRootDescriptorTables(enc, state, pipeline, false);
     const auto pipeline_kind = use_tessellation
                                    ? PipelineKind::Tessellation
@@ -13916,8 +14822,7 @@ private:
     // excludes GS/HS/DS), so only the Ordinary Vertex/Pixel stages need the bindless wiring.
     const bool bindless = pipeline.UsesBindlessMirror();
     const RootSignature *bindless_root =
-        bindless ? GetRootSignature(state.graphics_root_signature.ptr())
-                 : nullptr;
+        bindless ? state.graphics_root_signature_impl : nullptr;
     const bool bindless_path =
         bindless && bindless_root && !use_geometry && !use_tessellation;
     BindlessMirrorDrawDiag diag = {};
@@ -13980,7 +14885,10 @@ private:
               enc, shader, key, argbuf_offset);
       }
     }
-    RecordBindlessMirrorDiagDraw(&pipeline, diag);
+    if (out_diag)
+      *out_diag = diag;
+    else
+      RecordBindlessMirrorDiagDraw(&pipeline, diag);
   }
 
   void EncodeComputeBindings(ArgumentEncodingContext &enc,
@@ -13993,8 +14901,7 @@ private:
     // Bindless-mirror (③.3): compute bindless wiring (slot-27 buf_table + 28/29/30 binds).
     const bool bindless = pipeline.UsesBindlessMirror();
     const RootSignature *bindless_root =
-        bindless ? GetRootSignature(state.compute_root_signature.ptr())
-                 : nullptr;
+        bindless ? state.compute_root_signature_impl : nullptr;
     // Mixed-PSO guard (③.3 STEP D): restore the per-pass argbuf at 29/30 if a prior bindless
     // dispatch rebound them. Compute analog of the graphics guard.
     if (!bindless && BindlessMirrorEnvEnabled())
@@ -14690,7 +15597,7 @@ private:
     if (!diag_readback && !snapshot_readback)
       return;
 
-    auto *root = GetRootSignature(state.graphics_root_signature.ptr());
+    auto *root = state.graphics_root_signature_impl;
     if (!root)
       return;
 
@@ -14776,12 +15683,14 @@ private:
             running_offset = range_offset + range.descriptor_count;
         }
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
-        auto it = state.graphics_cbv_roots.find(root_index);
-        if (it == state.graphics_cbv_roots.end())
+        if (root_index >= ReplayState::kMaxRootParameters)
+          continue;
+        const auto &root_cbv = state.graphics_cbv_roots[root_index];
+        if (!root_cbv.valid)
           continue;
 
         Resource *resource = nullptr;
-        const auto offset = ResolveBufferGpuAddress(it->second, resource);
+        const auto offset = ResolveBufferGpuAddress(root_cbv.address, resource);
         if (!resource || !resource->GetBuffer())
           continue;
 
@@ -14789,7 +15698,7 @@ private:
         descriptor.type = DescriptorRecordType::ConstantBufferView;
         descriptor.resource = resource->GetD3D12Resource();
         descriptor.has_desc = true;
-        descriptor.desc.cbv.BufferLocation = it->second;
+        descriptor.desc.cbv.BufferLocation = root_cbv.address;
         descriptor.desc.cbv.SizeInBytes =
             UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
                                   UINT_MAX));
@@ -14927,12 +15836,12 @@ private:
     for (UINT slot = 0; slot < max_slot; slot++) {
       if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
         continue;
-      Resource *resource = nullptr;
-      ResolveBufferGpuAddress(state.vertex_buffers[slot]->BufferLocation,
-                              resource);
-      if (resource) {
+      const auto &resolved = state.resolved_vertex_buffers[slot];
+      if (resolved.valid && resolved.address ==
+                                state.vertex_buffers[slot]->BufferLocation &&
+          resolved.d3d_resource) {
         RecordReplayResourceAccess(
-            chunk, state, resource->GetD3D12Resource(),
+            chunk, state, resolved.d3d_resource.ptr(),
             D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
             "vertex buffer");
       }
@@ -14972,7 +15881,14 @@ private:
                                             Resource *index_resource) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().descAccessUs);
     RecordRenderAttachmentAccess(chunk, state, pipeline.GetGraphicsState());
-    RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
+    const bool bindless_descriptor_hazards_are_barrier_driven =
+        pipeline.UsesBindlessMirror() && BindlessMirrorEnvEnabled();
+    if (bindless_descriptor_hazards_are_barrier_driven) {
+      if (ReplayPerfEnabled())
+        perDrawSubTimers().descAccessPassthrough++;
+    } else {
+      RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
+    }
     RecordVertexBufferAccess(chunk, state, pipeline.GetGraphicsState());
     if (index_resource) {
       RecordReplayResourceAccess(chunk, state, index_resource->GetD3D12Resource(),
@@ -15102,7 +16018,8 @@ private:
     WMT::Reference<WMT::DepthStencilState> depth_stencil;
     wmtcmd_render_setrasterizerstate rasterizer = {};
     PipelineState *pipeline = nullptr;
-    GraphicsBindingSnapshot binding_snapshot;
+    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
+    std::shared_ptr<const ReplayState> bindless_replay_state;
     uint64_t binding_generation = 0;
     uint64_t descriptor_content_generation = 0;
     uint64_t binding_content_fingerprint = 0;
@@ -15143,9 +16060,19 @@ private:
     UINT base_instance = 0;
   };
 
-  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
-    common.binding_content_fingerprint =
-        common.binding_snapshot.content_fingerprint;
+	  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
+	    common.binding_content_fingerprint =
+	        common.binding_snapshot ? common.binding_snapshot->content_fingerprint
+	                                : 0;
+    if (common.bindless_replay_state) {
+      common.binding_content_fingerprint =
+          common.bindless_replay_state->bindless_replay_content_fingerprint
+              ? common.bindless_replay_state->bindless_replay_content_fingerprint
+              : HashGraphicsBindlessReplayStateFull(
+                    *common.bindless_replay_state);
+      HashGraphicsBindingValue(common.binding_content_fingerprint,
+                               common.descriptor_content_generation);
+    }
     HashGraphicsBindingValue(common.binding_content_fingerprint,
                              common.metal_pso.handle);
     HashGraphicsBindingValue(common.binding_content_fingerprint,
@@ -15204,9 +16131,14 @@ private:
     const bool fingerprint_hit =
         binding_cache.valid && !generation_hit &&
         binding_cache.content_fingerprint == packet.binding_content_fingerprint;
-    const bool bindless_snapshot =
+	    const bool bindless_snapshot =
+	        packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
+	        packet.binding_snapshot && packet.binding_snapshot->bindless &&
+	        !packet.use_geometry &&
+	        !packet.use_tessellation;
+    const bool bindless_live_payload =
         packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
-        packet.binding_snapshot.bindless && !packet.use_geometry &&
+        packet.bindless_replay_state && !packet.use_geometry &&
         !packet.use_tessellation;
     if (D3D12DiagBindingRecipeCacheEnabled()) {
       auto &stats = BindingRecipeDiagStats();
@@ -15220,22 +16152,30 @@ private:
     BindlessMirrorDrawDiag bindless_diag = {};
     bindless_diag.uses_bindless_mirror =
         packet.pipeline && packet.pipeline->UsesBindlessMirror();
-    bindless_diag.bindless_bound =
-        packet.binding_snapshot.bindless && !packet.use_geometry &&
-        !packet.use_tessellation;
+	    bindless_diag.bindless_bound =
+	        (packet.binding_snapshot && packet.binding_snapshot->bindless &&
+	         !packet.use_geometry && !packet.use_tessellation) ||
+        bindless_live_payload;
     bindless_diag.path =
-        BindlessMirrorDiagPathName(bindless_diag.bindless_bound, true);
+        BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
+                                   !bindless_live_payload);
     bool restored_legacy_argbuf = false;
     if (!bindless_diag.bindless_bound && BindlessMirrorEnvEnabled())
       restored_legacy_argbuf = enc.restorePerPassArgbufIfMirrorBound<false>();
     const bool skip_binding_snapshot =
         !bindless_snapshot && !restored_legacy_argbuf &&
         (generation_hit || fingerprint_hit);
-    if (!skip_binding_snapshot && packet.pipeline) {
-      ApplyGraphicsBindingSnapshot(enc, packet.binding_snapshot,
-                                   *packet.pipeline, packet.use_geometry,
-                                   packet.use_tessellation, argbuf_offset,
-                                   &bindless_diag);
+    if (!skip_binding_snapshot && packet.pipeline && bindless_live_payload) {
+      EncodeGraphicsBindings(enc, *packet.bindless_replay_state,
+                             *packet.pipeline, packet.use_geometry,
+                             packet.use_tessellation, argbuf_offset,
+                             &bindless_diag);
+    } else if (!skip_binding_snapshot && packet.pipeline &&
+               packet.binding_snapshot) {
+	      ApplyGraphicsBindingSnapshot(enc, *packet.binding_snapshot,
+	                                   *packet.pipeline, packet.use_geometry,
+	                                   packet.use_tessellation, argbuf_offset,
+	                                   &bindless_diag);
     }
     packet.bindless_diag = bindless_diag;
     if (!generation_hit) {
@@ -15375,6 +16315,13 @@ private:
     EndReplayDrawVisibilityQuery(enc, active_visibility_query);
   }
 
+  static void EncodeReplayDrawInstancedCompiled(
+      CommandQueueImpl *queue, ArgumentEncodingContext &enc, void *payload,
+      uint64_t &argbuf_offset) {
+    queue->EncodeReplayDrawInstancedPacket(
+        enc, *static_cast<ReplayDrawInstancedPacket *>(payload), argbuf_offset);
+  }
+
   void EncodeReplayDrawIndexedInstancedPacket(
       ArgumentEncodingContext &enc, ReplayDrawIndexedInstancedPacket &packet,
       uint64_t &argbuf_offset) {
@@ -15492,6 +16439,14 @@ private:
     EndReplayDrawVisibilityQuery(enc, active_visibility_query);
   }
 
+  static void EncodeReplayDrawIndexedInstancedCompiled(
+      CommandQueueImpl *queue, ArgumentEncodingContext &enc, void *payload,
+      uint64_t &argbuf_offset) {
+    queue->EncodeReplayDrawIndexedInstancedPacket(
+        enc, *static_cast<ReplayDrawIndexedInstancedPacket *>(payload),
+        argbuf_offset);
+  }
+
   void ReplayDrawInstanced(CommandChunk *chunk, ReplayState &state,
                            const DrawInstancedRecord &record) {
     if (!record.vertex_count_per_instance || !record.instance_count)
@@ -15548,24 +16503,47 @@ private:
         return;
       }
     }
+    RecordReplayBindingSignaturePerf(state);
+    const bool rb_draw = ReplayPerfEnabled();
+    const auto rb_attach0 = rb_draw ? clock::now() : clock::time_point{};
+    auto attachments = BuildRenderPassAttachments(state,
+                                                  pipeline->GetGraphicsState());
+    if (rb_draw)
+      perDrawSubTimers().attach +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - rb_attach0).count();
     auto viewports = state.viewports;
     auto scissors = state.scissors;
-      auto attachments = BuildRenderPassAttachments(state,
-                                                    pipeline->GetGraphicsState());
-      if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
-        return;
-      RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
-      const auto descriptor_content_generation =
-          GetDescriptorContentGeneration();
-      GraphicsBindingSnapshot binding_snapshot;
-      {
-        StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
-        if (GraphicsPassBatchNeedsBindingSnapshot(
-                chunk, state, attachments, descriptor_content_generation))
-          binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
+    if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
+      return;
+    const auto rb_desc0 = rb_draw ? clock::now() : clock::time_point{};
+    RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
+    const auto descriptor_content_generation =
+        GetDescriptorContentGeneration();
+	    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
+    std::shared_ptr<const ReplayState> bindless_replay_state;
+    const bool bindless_replay_path =
+        pipeline->UsesBindlessMirror() && !metal->use_geometry &&
+        !metal->use_tessellation;
+	    {
+	      StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
+      if (bindless_replay_path) {
+        if (D3D12ReplayGraphicsBatchingEnabled() &&
+            (HasPendingComputePass(state) || HasPendingBlitBatch(state)))
+          FlushPassBatches(chunk, state);
+        bindless_replay_state = CaptureGraphicsBindlessReplayState(state);
+      } else {
+        binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
+            chunk, state, *pipeline, attachments,
+            descriptor_content_generation);
       }
-      DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
-                        viewports, scissors, &record, nullptr, 0, 0);
+	    }
+    if (rb_draw)
+      perDrawSubTimers().desc +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - rb_desc0).count();
+    DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
+                      viewports, scissors, &record, nullptr, 0, 0);
     DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
                            0);
     DebugEncodeCBVReadbacks(chunk, "draw", state, *pipeline,
@@ -15588,7 +16566,8 @@ private:
     packet.common.depth_stencil = metal->depth_stencil;
     packet.common.rasterizer = metal->rasterizer;
     packet.common.pipeline = pipeline;
-    packet.common.binding_snapshot = std::move(binding_snapshot);
+	    packet.common.binding_snapshot = std::move(binding_snapshot);
+    packet.common.bindless_replay_state = std::move(bindless_replay_state);
     packet.common.binding_generation = state.graphics_binding_generation;
     packet.common.descriptor_content_generation =
         descriptor_content_generation;
@@ -15613,11 +16592,6 @@ private:
     packet.instance_count = record.instance_count;
     packet.base_instance = record.start_instance_location;
 
-    auto encode_draw = [this, packet = std::move(packet)](
-                           ArgumentEncodingContext &enc,
-                           uint64_t &argbuf_offset) mutable {
-      EncodeReplayDrawInstancedPacket(enc, packet, argbuf_offset);
-    };
     if (StallDiagEnabled())
       stallProbe().packetUs +=
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -15626,13 +16600,31 @@ private:
     {
       StallScope _q(StallDiagEnabled(), &stallProbe().queueUs);
       if (D3D12ReplayGraphicsBatchingEnabled()) {
-        QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                                 argument_buffer_size, std::move(encode_draw),
-                                 metal->use_geometry, metal->use_tessellation,
-                                 ReplayGraphicsCommandKind::Draw);
+        if (bindless_replay_path) {
+          QueueCompiledGraphicsPassCommand(
+              chunk, state, std::move(attachments), argument_buffer_size,
+              std::move(packet), EncodeReplayDrawInstancedCompiled,
+              metal->use_geometry, metal->use_tessellation,
+              ReplayGraphicsCommandKind::Draw);
+        } else {
+          auto encode_draw = [this, packet = std::move(packet)](
+                                 ArgumentEncodingContext &enc,
+                                 uint64_t &argbuf_offset) mutable {
+            EncodeReplayDrawInstancedPacket(enc, packet, argbuf_offset);
+          };
+          QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                                   argument_buffer_size, std::move(encode_draw),
+                                   metal->use_geometry, metal->use_tessellation,
+                                   ReplayGraphicsCommandKind::Draw, false);
+        }
         return;
       }
 
+      auto encode_draw = [this, packet = std::move(packet)](
+                             ArgumentEncodingContext &enc,
+                             uint64_t &argbuf_offset) mutable {
+        EncodeReplayDrawInstancedPacket(enc, packet, argbuf_offset);
+      };
       FlushPassBatches(chunk, state);
       EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
                              DiagCurrentReplayRecordSequence(),
@@ -15664,10 +16656,13 @@ private:
       return;
     }
 
-    UINT64 index_resource_offset = 0;
-    auto *index_resource = LookupBufferResourceByGpuVirtualAddress(
-        state.index_buffer->BufferLocation, &index_resource_offset);
-    if (!index_resource || !index_resource->GetBufferAllocation()) {
+    const auto &resolved_index = state.resolved_index_buffer;
+    auto *index_resource =
+        resolved_index.valid &&
+                resolved_index.address == state.index_buffer->BufferLocation
+            ? resolved_index.resource
+            : nullptr;
+    if (!index_resource || !resolved_index.allocation) {
       WARN("D3D12CommandQueue: indexed draw skipped because index buffer binding is unavailable");
       return;
     }
@@ -15677,7 +16672,7 @@ private:
       return;
     }
 
-    Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
+    Rc<BufferAllocation> index_allocation = resolved_index.allocation;
     const auto metal_pso = [&] {
       StallScope _s(StallDiagEnabled(), &stallProbe().selectPsoUs);
       return SelectGraphicsPipelineState(*metal, state.topology,
@@ -15714,59 +16709,53 @@ private:
       }
     }
     const auto index_type = GetIndexType(state.index_buffer->Format);
-    const UINT64 index_binding_offset =
-        index_resource->GetHeapOffset() + index_resource_offset;
+    const UINT64 index_binding_offset = resolved_index.binding_offset;
+    const UINT64 index_resource_offset =
+        index_binding_offset - index_resource->GetHeapOffset();
     const UINT64 index_offset =
         index_binding_offset +
         record.start_index_location * GetIndexSize(state.index_buffer->Format);
-      static const bool rb_draw =
-          D3D12DiagEnabledEnv("DXMT_DIAG_REPLAY_BREAKDOWN");
-      if (rb_draw) {
-        // Binding-change hit-rate probe: compare this draw's binding signature
-        // to the previous draw's. psoRoot = structure (binding-plan reuse);
-        // full = whole descAccess could be skipped if unchanged.
-        static thread_local const void *last_pso = nullptr;
-        static thread_local const void *last_rootsig = nullptr;
-        static thread_local uint64_t last_full = 0;
-        auto &t = perDrawSubTimers();
-        t.drawCount++;
-        const void *pso = state.pipeline_state.ptr();
-        const void *rs = state.graphics_root_signature.ptr();
-        if (pso == last_pso && rs == last_rootsig)
-          t.psoRootUnchanged++;
-        const uint64_t full = HashGraphicsBindingFull(state);
-        if (t.drawCount > 1 && full == last_full)
-          t.fullBindUnchanged++;
-        last_pso = pso; last_rootsig = rs; last_full = full;
+    RecordReplayBindingSignaturePerf(state);
+    const bool rb_draw = ReplayPerfEnabled();
+    const auto rb_da0 = rb_draw ? clock::now() : clock::time_point{};
+    auto attachments = BuildRenderPassAttachments(state,
+                                                  pipeline->GetGraphicsState());
+    if (rb_draw)
+      perDrawSubTimers().attach +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - rb_da0).count();
+    auto viewports = state.viewports;
+    auto scissors = state.scissors;
+    if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
+      return;
+    const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
+    RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
+    const auto descriptor_content_generation =
+        GetDescriptorContentGeneration();
+	    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
+    std::shared_ptr<const ReplayState> bindless_replay_state;
+    const bool bindless_replay_path =
+        pipeline->UsesBindlessMirror() && !metal->use_geometry &&
+        !metal->use_tessellation;
+	    {
+	      StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
+      if (bindless_replay_path) {
+        if (D3D12ReplayGraphicsBatchingEnabled() &&
+            (HasPendingComputePass(state) || HasPendingBlitBatch(state)))
+          FlushPassBatches(chunk, state);
+        bindless_replay_state = CaptureGraphicsBindlessReplayState(state);
+      } else {
+        binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
+            chunk, state, *pipeline, attachments,
+            descriptor_content_generation);
       }
-      const auto rb_da0 = rb_draw ? clock::now() : clock::time_point{};
-      auto attachments = BuildRenderPassAttachments(state,
-                                                    pipeline->GetGraphicsState());
-      if (rb_draw)
-        perDrawSubTimers().attach +=
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                clock::now() - rb_da0).count();
-      auto viewports = state.viewports;
-      auto scissors = state.scissors;
-      if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
-        return;
-      const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
-      RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
-      const auto descriptor_content_generation =
-          GetDescriptorContentGeneration();
-      GraphicsBindingSnapshot binding_snapshot;
-      {
-        StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
-        if (GraphicsPassBatchNeedsBindingSnapshot(
-                chunk, state, attachments, descriptor_content_generation))
-          binding_snapshot = CaptureGraphicsBindingSnapshot(state, *pipeline);
-      }
-      if (rb_draw)
-        perDrawSubTimers().desc +=
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                clock::now() - rb_ra0).count();
-      DebugLogDrawState("indexed", state, *pipeline, *metal, attachments,
-                        viewports, scissors, nullptr, &record,
+	    }
+    if (rb_draw)
+      perDrawSubTimers().desc +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - rb_ra0).count();
+    DebugLogDrawState("indexed", state, *pipeline, *metal, attachments,
+                      viewports, scissors, nullptr, &record,
                       index_resource_offset, index_offset);
     DebugEncodeIAReadbacks(chunk, "indexed", state, *pipeline, nullptr,
                            &record, index_offset);
@@ -15791,6 +16780,7 @@ private:
     packet.common.rasterizer = metal->rasterizer;
     packet.common.pipeline = pipeline;
     packet.common.binding_snapshot = std::move(binding_snapshot);
+    packet.common.bindless_replay_state = std::move(bindless_replay_state);
     packet.common.binding_generation = state.graphics_binding_generation;
     packet.common.descriptor_content_generation =
         descriptor_content_generation;
@@ -15820,11 +16810,6 @@ private:
     packet.base_instance = record.start_instance_location;
     FinalizeReplayDrawBindingFingerprint(packet);
 
-    auto encode_draw = [this, packet = std::move(packet)](
-                           ArgumentEncodingContext &enc,
-                           uint64_t &argbuf_offset) mutable {
-      EncodeReplayDrawIndexedInstancedPacket(enc, packet, argbuf_offset);
-    };
     if (StallDiagEnabled())
       stallProbe().packetUs +=
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -15833,13 +16818,32 @@ private:
     {
       StallScope _q(StallDiagEnabled(), &stallProbe().queueUs);
       if (D3D12ReplayGraphicsBatchingEnabled()) {
-        QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                                 argument_buffer_size, std::move(encode_draw),
-                                 metal->use_geometry, metal->use_tessellation,
-                                 ReplayGraphicsCommandKind::DrawIndexed);
+        if (bindless_replay_path) {
+          QueueCompiledGraphicsPassCommand(
+              chunk, state, std::move(attachments), argument_buffer_size,
+              std::move(packet), EncodeReplayDrawIndexedInstancedCompiled,
+              metal->use_geometry, metal->use_tessellation,
+              ReplayGraphicsCommandKind::DrawIndexed);
+        } else {
+          auto encode_draw = [this, packet = std::move(packet)](
+                                 ArgumentEncodingContext &enc,
+                                 uint64_t &argbuf_offset) mutable {
+            EncodeReplayDrawIndexedInstancedPacket(enc, packet, argbuf_offset);
+          };
+          QueueGraphicsPassCommand(
+              chunk, state, std::move(attachments), argument_buffer_size,
+              std::move(encode_draw), metal->use_geometry,
+              metal->use_tessellation, ReplayGraphicsCommandKind::DrawIndexed,
+              false);
+        }
         return;
       }
 
+      auto encode_draw = [this, packet = std::move(packet)](
+                             ArgumentEncodingContext &enc,
+                             uint64_t &argbuf_offset) mutable {
+        EncodeReplayDrawIndexedInstancedPacket(enc, packet, argbuf_offset);
+      };
       FlushPassBatches(chunk, state);
       EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
                              DiagCurrentReplayRecordSequence(),

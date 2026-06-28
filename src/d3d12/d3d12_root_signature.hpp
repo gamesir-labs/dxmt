@@ -39,6 +39,14 @@ public:
   virtual std::span<const D3D12_STATIC_SAMPLER_DESC> GetStaticSamplers() const = 0;
 };
 
+// Private IID for a non-RTTI downcast ID3D12RootSignature* -> dxmt RootSignature*.
+// Internal fast-path only; QueryInterface returns a borrowed pointer without AddRef.
+inline constexpr GUID IID_DXMTRootSignatureDowncast = {
+    0x4bb5e4d2, 0x26d5, 0x4f8b,
+    {0xa1, 0xdb, 0x31, 0xa4, 0x71, 0x96, 0x42, 0x5e}};
+
+RootSignature *GetDXMTRootSignature(ID3D12RootSignature *root_signature);
+
 Com<ID3D12RootSignature> CreateRootSignatureFromBlob(IMTLD3D12Device *device,
                                                       std::span<const std::byte> blob);
 

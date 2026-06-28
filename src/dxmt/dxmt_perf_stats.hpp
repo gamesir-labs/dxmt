@@ -16,12 +16,11 @@ enum class FrameTimeBucket : uint32_t {
   CreateReservedResource,
   CreateHeap,
   CreatePipeline,
-  OtherD3D12,
-  // PERF DIAG (otherWall split): time spent in AddRecord recording CommandRecords
-  // on the calling thread. If this accumulates on the present thread, it is part
-  // of otherWall (DXMT record-phase, optimizable). If it stays 0, recording runs
-  // on worker threads and does NOT contribute to frame_wall (otherWall is then
-  // app CPU / waits). Lets us split the 90ms otherWall ceiling.
+  UnscopedD3D12Api,
+  // Time spent in AddRecord recording CommandRecords on the calling thread. If
+  // this accumulates on the present thread, it is part of the measured frame
+  // wall and must be optimized as DXMT recording work. If it stays zero,
+  // recording runs outside the measured frame boundary.
   CommandListRecord,
 };
 
@@ -58,6 +57,11 @@ void setCurrentFrameStatistics(FrameStatistics *stats);
 FrameStatistics *currentFrameStatistics();
 void recordExecuteTime(FrameStatistics *stats, ExecuteTimeBucket bucket,
                        dxmt::clock::duration duration);
+void recordReplayBreakdown(FrameStatistics *stats,
+                           dxmt::clock::duration record_loop,
+                           dxmt::clock::duration flush_pass,
+                           dxmt::clock::duration timestamp_resolve,
+                           dxmt::clock::duration cpu_query_resolve);
 void recordFrameBoundary(uint64_t frame);
 void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                          const FrameStatistics &average_stats,
@@ -83,5 +87,6 @@ void recordGraphicsPipelineCreate(uint64_t duration_us, bool success);
 void recordComputePipelineCreate(uint64_t duration_us, bool success);
 void recordMetalCommandBufferCommit(uint64_t duration_us);
 void recordDrawableAcquire(uint64_t duration_us);
+void recordDescriptorContentWrite(uint32_t kind);
 
 } // namespace dxmt::perf

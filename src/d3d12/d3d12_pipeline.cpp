@@ -440,7 +440,7 @@ ValidateDxbcShaderStage(PipelineShaderStage stage,
 
 D3D12_ROOT_SIGNATURE_FLAGS
 GetRootSignatureFlags(ID3D12RootSignature *root_signature) {
-  auto *rs = dynamic_cast<RootSignature *>(root_signature);
+  auto *rs = GetDXMTRootSignature(root_signature);
   if (!rs)
     return D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -1311,7 +1311,7 @@ BuildShaderCacheKey(PipelineStateType type,
   } else {
     HashValue(hash, compute_state.desc.Flags);
   }
-  if (auto *root = dynamic_cast<RootSignature *>(root_signature)) {
+  if (auto *root = GetDXMTRootSignature(root_signature)) {
     const auto blob = root->GetSerializedBlob();
     HashValue(hash, uint32_t(blob.size()));
     HashBytes(hash, blob.data(), blob.size());
@@ -3220,7 +3220,8 @@ public:
                     PipelineGraphicsState &&graphics_state,
                     PipelineComputeState &&compute_state)
       : device_(device), type_(type),
-        root_signature_(dynamic_cast<RootSignature *>(root_signature)),
+        public_root_signature_(root_signature),
+        root_signature_(GetDXMTRootSignature(root_signature)),
         shaders_(std::move(shaders)),
         signature_links_(std::move(signature_links)),
         graphics_state_(std::move(graphics_state)),
@@ -3304,9 +3305,7 @@ public:
   }
 
   ID3D12RootSignature *GetRootSignature() const override {
-    return root_signature_.ptr()
-               ? dynamic_cast<ID3D12RootSignature *>(root_signature_.ptr())
-               : nullptr;
+    return public_root_signature_.ptr();
   }
 
   const std::vector<PipelineDxilShader> &GetDxilShaders() const override {
@@ -3366,6 +3365,7 @@ public:
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
+  Com<ID3D12RootSignature> public_root_signature_;
   Com<RootSignature, false> root_signature_;
   std::vector<PipelineDxilShader> shaders_;
   std::vector<PipelineSignatureLink> signature_links_;

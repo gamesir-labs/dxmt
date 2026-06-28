@@ -1027,9 +1027,36 @@ DescriptorWriteAffectsShaderBinding(const DescriptorRecord &record) {
 }
 
 static void
-BumpDescriptorContentGenerationForWrite(const DescriptorRecord &record) {
-  if (DescriptorWriteAffectsShaderBinding(record))
+BumpDescriptorContentGenerationForWrite(
+    const DescriptorRecord &record,
+    DescriptorRecordType write_type = DescriptorRecordType::Empty) {
+  if (DescriptorWriteAffectsShaderBinding(record)) {
     BumpDescriptorContentGeneration();
+    const auto type =
+        write_type == DescriptorRecordType::Empty ? record.type : write_type;
+    switch (type) {
+    case DescriptorRecordType::ConstantBufferView:
+      dxmt::perf::recordDescriptorContentWrite(1);
+      break;
+    case DescriptorRecordType::ShaderResourceView:
+      dxmt::perf::recordDescriptorContentWrite(2);
+      break;
+    case DescriptorRecordType::UnorderedAccessView:
+      dxmt::perf::recordDescriptorContentWrite(3);
+      break;
+    case DescriptorRecordType::Sampler:
+      dxmt::perf::recordDescriptorContentWrite(4);
+      break;
+    default:
+      dxmt::perf::recordDescriptorContentWrite(0);
+      break;
+    }
+  }
+}
+
+static void
+RecordDescriptorContentCopyPerf() {
+  dxmt::perf::recordDescriptorContentWrite(5);
 }
 
 // Bindless-mirror (sub-step ②): mark this descriptor's mirror slot stale at descriptor
@@ -2012,7 +2039,8 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(*record);
+    BumpDescriptorContentGenerationForWrite(
+        *record, DescriptorRecordType::ConstantBufferView);
     record->type = DescriptorRecordType::ConstantBufferView;
     if (desc) {
       const bool null_cbv = !desc->BufferLocation && !desc->SizeInBytes;
@@ -2076,7 +2104,8 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(*record);
+    BumpDescriptorContentGenerationForWrite(
+        *record, DescriptorRecordType::ShaderResourceView);
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
@@ -2102,7 +2131,8 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(*record);
+    BumpDescriptorContentGenerationForWrite(
+        *record, DescriptorRecordType::UnorderedAccessView);
     record->type = DescriptorRecordType::UnorderedAccessView;
     record->resource = resource;
     record->counter_resource = counter_resource;
@@ -2180,7 +2210,8 @@ public:
       record->desc.sampler = *desc;
       record->has_desc = true;
     }
-    BumpDescriptorContentGenerationForWrite(*record);
+    BumpDescriptorContentGenerationForWrite(*record,
+                                            DescriptorRecordType::Sampler);
     MarkDescriptorMirrorStaleForWrite(*record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_sampler(this, desc, descriptor);
@@ -2257,8 +2288,10 @@ public:
           affects_shader_binding ||
           DescriptorWriteAffectsShaderBinding(*destinations[i]);
     }
-    if (affects_shader_binding)
+    if (affects_shader_binding) {
       BumpDescriptorContentGeneration();
+      RecordDescriptorContentCopyPerf();
+    }
     // Bindless-mirror: mark each destination slot stale so the encode thread re-resolves
     // it from the freshly-copied record. (Done after the generation bump so the stale
     // marker carries the new generation.)
@@ -2299,8 +2332,10 @@ public:
       affects_shader_binding =
           affects_shader_binding || DescriptorWriteAffectsShaderBinding(dst[i]);
     }
-    if (affects_shader_binding)
+    if (affects_shader_binding) {
       BumpDescriptorContentGeneration();
+      RecordDescriptorContentCopyPerf();
+    }
     // Bindless-mirror: mark each destination slot stale (see CopyDescriptors).
     for (UINT i = 0; i < descriptor_count; i++)
       MarkDescriptorMirrorStaleForWrite(dst[i]);
@@ -3348,7 +3383,9 @@ public:
             dst_descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             "sampler feedback UAV")) {
       ResetDescriptorRecord(*record);
-      BumpDescriptorContentGenerationForWrite(*record);
+      BumpDescriptorContentGenerationForWrite(
+          *record, DescriptorRecordType::UnorderedAccessView);
+      dxmt::perf::recordDescriptorContentWrite(6);
     }
   }
 

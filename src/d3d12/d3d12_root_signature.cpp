@@ -898,6 +898,10 @@ public:
       return E_POINTER;
     *object = nullptr;
 
+    if (riid == IID_DXMTRootSignatureDowncast) {
+      *object = static_cast<RootSignature *>(this);
+      return S_OK;
+    }
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) ||
         riid == __uuidof(ID3D12RootSignature)) {
@@ -1076,6 +1080,16 @@ SerializeVersionedRootSignatureImpl(
 }
 
 } // namespace
+
+RootSignature *
+GetDXMTRootSignature(ID3D12RootSignature *root_signature) {
+  if (!root_signature)
+    return nullptr;
+  RootSignature *out = nullptr;
+  root_signature->QueryInterface(IID_DXMTRootSignatureDowncast,
+                                 reinterpret_cast<void **>(&out));
+  return out;
+}
 
 Com<ID3D12RootSignature>
 CreateRootSignatureFromBlob(IMTLD3D12Device *device,
