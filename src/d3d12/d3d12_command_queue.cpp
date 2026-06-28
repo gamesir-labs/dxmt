@@ -5572,6 +5572,30 @@ private:
     uint64_t bindless_replay_content_fingerprint = 0;
   };
 
+  struct GraphicsBindlessReplayState {
+    static constexpr UINT kMaxRootParameters = ReplayState::kMaxRootParameters;
+    D3D12_COMMAND_LIST_TYPE queue_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Com<ID3D12PipelineState> pipeline_state;
+    Com<ID3D12RootSignature> graphics_root_signature;
+    RootSignature *graphics_root_signature_impl = nullptr;
+    std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
+    std::array<ResolvedReplayVertexBuffer, 32> resolved_vertex_buffers = {};
+    Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
+    Com<ID3D12DescriptorHeap> sampler_heap;
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaxRootParameters> graphics_tables = {};
+    std::array<ReplayRootConstantsSlot, kMaxRootParameters>
+        graphics_root_constants = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        graphics_cbv_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        graphics_srv_roots = {};
+    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
+        graphics_uav_roots = {};
+    uint64_t current_record_d3d_sequence = 0;
+    uint64_t graphics_binding_generation = 1;
+    uint64_t bindless_replay_content_fingerprint = 0;
+  };
+
   static ReplayState
   CloneReplayStateWithoutBatch(const ReplayState &state) {
     static const bool rb_clone =
@@ -5622,8 +5646,9 @@ private:
     return copy;
   }
 
+  template <typename GraphicsState>
   static uint64_t HashGraphicsBindlessReplayCaptureState(
-      const ReplayState &state) {
+      const GraphicsState &state) {
     auto mix = [](uint64_t h, uint64_t v) {
       h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
       return h;
@@ -5666,9 +5691,9 @@ private:
     return h;
   }
 
-  static std::shared_ptr<ReplayState>
+  static std::shared_ptr<GraphicsBindlessReplayState>
   CaptureGraphicsBindlessReplayState(const ReplayState &state) {
-    auto copy = std::make_shared<ReplayState>();
+    auto copy = std::make_shared<GraphicsBindlessReplayState>();
     copy->queue_type = state.queue_type;
     copy->pipeline_state = state.pipeline_state;
     copy->graphics_root_signature = state.graphics_root_signature;
@@ -7181,7 +7206,8 @@ private:
   // traversal STRUCTURE (binding-plan cache hit rate), and (b) full value hash
   // = structure + heaps + bound tables/roots/root-constants which determines
   // whether the whole descAccess can be skipped vs the previous draw.
-  static uint64_t HashGraphicsBindingFull(const ReplayState &s) {
+  template <typename GraphicsState>
+  static uint64_t HashGraphicsBindingFull(const GraphicsState &s) {
     auto mix = [](uint64_t h, uint64_t v) {
       h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
       return h;
@@ -7213,7 +7239,8 @@ private:
     return h;
   }
 
-  static uint64_t HashGraphicsBindlessReplayStateFull(const ReplayState &s) {
+  template <typename GraphicsState>
+  static uint64_t HashGraphicsBindlessReplayStateFull(const GraphicsState &s) {
     uint64_t h = HashGraphicsBindingFull(s);
     for (UINT slot = 0; slot < s.vertex_buffers.size(); slot++) {
       const auto &view = s.vertex_buffers[slot];
@@ -10576,14 +10603,20 @@ private:
     return nullptr;
   }
 
-  void BindRootConstants(ArgumentEncodingContext &enc, const ReplayState &state,
+  template <typename State>
+  void BindRootConstants(ArgumentEncodingContext &enc, const State &state,
                          const PipelineState &pipeline, bool compute,
                          UINT root_index,
                          const RootSignatureParameter &parameter) {
     if (root_index >= ReplayState::kMaxRootParameters)
       return;
-    const auto &slot = compute ? state.compute_root_constants[root_index]
-                               : state.graphics_root_constants[root_index];
+    const auto &slot = [&]() -> const ReplayRootConstantsSlot & {
+      if constexpr (requires { state.compute_root_constants; })
+        return compute ? state.compute_root_constants[root_index]
+                       : state.graphics_root_constants[root_index];
+      else
+        return state.graphics_root_constants[root_index];
+    }();
     if (!slot.valid || slot.values.empty())
       return;
 
@@ -10656,10 +10689,18 @@ private:
     });
   }
 
+  template <typename State>
   static D3D12_GPU_DESCRIPTOR_HANDLE
-  GetTableHandle(const ReplayState &state, bool compute,
+  GetTableHandle(const State &state, bool compute,
                  UINT root_parameter_index) {
-    const auto &tables = compute ? state.compute_tables : state.graphics_tables;
+    if constexpr (requires { state.compute_tables; }) {
+      const auto &tables = compute ? state.compute_tables : state.graphics_tables;
+      return root_parameter_index < tables.size()
+                 ? tables[root_parameter_index]
+                 : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    }
+    (void)compute;
+    const auto &tables = state.graphics_tables;
     return root_parameter_index < tables.size()
                ? tables[root_parameter_index]
                : D3D12_GPU_DESCRIPTOR_HANDLE{};
@@ -10693,8 +10734,9 @@ private:
     return descriptor;
   }
 
+  template <typename State>
   DescriptorHeap *
-  GetBoundDescriptorHeap(const ReplayState &state,
+  GetBoundDescriptorHeap(const State &state,
                          D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
     const auto &heap = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
                            ? state.sampler_heap
@@ -13093,8 +13135,9 @@ private:
   // Returns the ring slice (slot-28 buffer) holding uint32 root_offsets[N], or an empty
   // slice if the stage has no texture/sampler args. The compute/graphics distinction is
   // carried by `compute` (selects state.compute_tables vs graphics_tables / heap).
+  template <typename State>
   AllocatedArgumentBufferSlice
-  BuildBindlessRootOffsets(ArgumentEncodingContext &enc, const ReplayState &state,
+  BuildBindlessRootOffsets(ArgumentEncodingContext &enc, const State &state,
                            const PipelineState &pipeline, const RootSignature &root,
                            PipelineStage want_stage, bool compute,
                            BindlessMirrorWindow *window = nullptr,
@@ -13507,8 +13550,9 @@ private:
     return inserted.first->second;
   }
 
+  template <typename State>
   void ApplyDescriptorTableBindingRecipe(
-      ArgumentEncodingContext &enc, const ReplayState &state,
+      ArgumentEncodingContext &enc, const State &state,
       const PipelineState &pipeline, bool compute,
       const DescriptorTableBindingRecipe &recipe) {
     const bool diag_enabled = D3D12DiagBindingRecipeCacheEnabled();
@@ -13597,11 +13641,17 @@ private:
     }
   }
 
+  template <typename State>
   void ApplyRootDescriptorTables(ArgumentEncodingContext &enc,
-                                 const ReplayState &state,
+                                 const State &state,
                                  const PipelineState &pipeline, bool compute) {
-    auto *root = compute ? state.compute_root_signature_impl
-                         : state.graphics_root_signature_impl;
+    auto *root = [&]() -> RootSignature * {
+      if constexpr (requires { state.compute_root_signature_impl; })
+        return compute ? state.compute_root_signature_impl
+                       : state.graphics_root_signature_impl;
+      else
+        return state.graphics_root_signature_impl;
+    }();
     if (!root)
       return;
 
@@ -14103,23 +14153,36 @@ private:
     return it->second;
   }
 
+  template <typename State>
   void ApplyRootBufferDescriptor(ArgumentEncodingContext &enc,
-                                 const ReplayState &state,
+                                 const State &state,
                                  const PipelineState &pipeline, bool compute,
                                  UINT root_index,
                                  const RootSignatureParameter &parameter,
                                  DescriptorRecordType type) {
-    const auto &map =
-        type == DescriptorRecordType::ConstantBufferView
-            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
-            : type == DescriptorRecordType::ShaderResourceView
-                  ? (compute ? state.compute_srv_roots
-                             : state.graphics_srv_roots)
-                  : (compute ? state.compute_uav_roots
-                             : state.graphics_uav_roots);
     if (root_index >= ReplayState::kMaxRootParameters)
       return;
-    const auto &slot = map[root_index];
+    const ReplayRootDescriptorSlot *slot_ptr = nullptr;
+    if constexpr (requires { state.compute_cbv_roots; }) {
+      if (type == DescriptorRecordType::ConstantBufferView)
+        slot_ptr = compute ? &state.compute_cbv_roots[root_index]
+                           : &state.graphics_cbv_roots[root_index];
+      else if (type == DescriptorRecordType::ShaderResourceView)
+        slot_ptr = compute ? &state.compute_srv_roots[root_index]
+                           : &state.graphics_srv_roots[root_index];
+      else
+        slot_ptr = compute ? &state.compute_uav_roots[root_index]
+                           : &state.graphics_uav_roots[root_index];
+    } else {
+      (void)compute;
+      if (type == DescriptorRecordType::ConstantBufferView)
+        slot_ptr = &state.graphics_cbv_roots[root_index];
+      else if (type == DescriptorRecordType::ShaderResourceView)
+        slot_ptr = &state.graphics_srv_roots[root_index];
+      else
+        slot_ptr = &state.graphics_uav_roots[root_index];
+    }
+    const auto &slot = *slot_ptr;
     if (!slot.valid)
       return;
 
@@ -14239,9 +14302,9 @@ private:
   // replay_state into the lambda; compute path has state). Only the Ordinary Vertex/Pixel/Compute
   // stages are wired — the bindless off-gate guarantees no GS/HS/DS, so the geometry/tess branches
   // stay on the LEGACY EncodeShaderBindingsForStage.
-  template <PipelineStage Stage>
+  template <PipelineStage Stage, typename State>
   void EncodeShaderBindingsForStageBindless(ArgumentEncodingContext &enc,
-                                            const ReplayState &state,
+                                            const State &state,
                                             const PipelineState &pipeline,
                                             const RootSignature &root,
                                             const PipelineDxilShader &shader,
@@ -14763,8 +14826,9 @@ private:
     return aligned;
   }
 
+  template <typename State>
   void EncodeVertexBuffers(ArgumentEncodingContext &enc,
-                           const ReplayState &state,
+                           const State &state,
                            const PipelineGraphicsState *graphics_state,
                            uint64_t &argbuf_offset,
                            PipelineKind pipeline_kind) {
@@ -14802,8 +14866,9 @@ private:
       enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
   }
 
+  template <typename State>
   void EncodeGraphicsBindings(ArgumentEncodingContext &enc,
-                              const ReplayState &state,
+                              const State &state,
                               PipelineState &pipeline,
                               bool use_geometry,
                               bool use_tessellation,
@@ -16019,7 +16084,7 @@ private:
     wmtcmd_render_setrasterizerstate rasterizer = {};
     PipelineState *pipeline = nullptr;
     std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
-    std::shared_ptr<const ReplayState> bindless_replay_state;
+    std::shared_ptr<const GraphicsBindlessReplayState> bindless_replay_state;
     uint64_t binding_generation = 0;
     uint64_t descriptor_content_generation = 0;
     uint64_t binding_content_fingerprint = 0;
@@ -16521,7 +16586,7 @@ private:
     const auto descriptor_content_generation =
         GetDescriptorContentGeneration();
 	    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
-    std::shared_ptr<const ReplayState> bindless_replay_state;
+    std::shared_ptr<const GraphicsBindlessReplayState> bindless_replay_state;
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
         !metal->use_tessellation;
@@ -16733,7 +16798,7 @@ private:
     const auto descriptor_content_generation =
         GetDescriptorContentGeneration();
 	    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
-    std::shared_ptr<const ReplayState> bindless_replay_state;
+    std::shared_ptr<const GraphicsBindlessReplayState> bindless_replay_state;
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
         !metal->use_tessellation;
