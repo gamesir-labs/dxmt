@@ -556,97 +556,147 @@ ArgumentEncodingContext::packBindlessBufferTable(
       // sampler branch performs no access<>()/makeResident either.)
       break;
     case SM50BindingType::SRV: {
-      auto slot = 128 * unsigned(stage) + arg.SM50BindingSlot;
-      auto &srv = bindings ? bindings[i].srv : resview_[slot];
+      const auto slot = kSRVBindings * unsigned(stage) + arg.SM50BindingSlot;
+      const auto count = BufferTableRangeQwordCount(arg.RegisterCount) /
+                         kBufferTableQwordsPerDescriptor;
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
-        if (srv.buffer.ptr()) {
-          auto [srv_alloc, offset] = access<stage>(srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, ResourceAccess::Read);
-          write_slot(compact, srv_alloc->gpuAddress() + offset + srv.slice.byteOffset, srv.slice.byteLength);
-          makeResident<stage, kind>(srv.buffer.ptr());
-        } else {
-          DebugLogNullShaderBinding<stage, kind>(
-              "SRV", "buffer", shader_hash, arg, bool(srv.buffer.ptr()), bool(srv.texture.ptr()), false, encoder_id
-          );
-          write_slot(compact, 0, 0);
+        for (uint32_t local = 0; local < count; local++) {
+          const auto local_slot = slot + local;
+          if (local_slot >= kSRVBindings * (unsigned(stage) + 1))
+            break;
+          const auto &srv = (bindings && local == 0) ? bindings[i].srv
+                                                     : resview_[local_slot];
+          const uint32_t dst = compact + local * kBufferTableQwordsPerDescriptor;
+          if (srv.buffer.ptr()) {
+            auto [srv_alloc, offset] = access<stage>(
+                srv.buffer, srv.slice.byteOffset, srv.slice.byteLength,
+                ResourceAccess::Read);
+            write_slot(dst, srv_alloc->gpuAddress() + offset + srv.slice.byteOffset,
+                       srv.slice.byteLength);
+            makeResident<stage, kind>(srv.buffer.ptr());
+          } else {
+            DebugLogNullShaderBinding<stage, kind>(
+                "SRV", "buffer", shader_hash, arg, bool(srv.buffer.ptr()),
+                bool(srv.texture.ptr()), false, encoder_id);
+            write_slot(dst, 0, 0);
+          }
         }
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
-        // Texture / tbuffer: handled by the slot-30 mirror. Preserve residency + barrier
-        // tracking exactly as encodeShaderResources (same access<>()/makeResident).
-        if (srv.buffer.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto allocation = srv.buffer->current();
-          auto *view_ptr = srv.buffer->tryView(srv.viewId, allocation);
-          if (view_ptr && view_ptr->texture) {
-            access<stage>(srv.buffer, srv.viewId, ResourceAccess::Read);
-            makeResident<stage, kind>(srv.buffer.ptr(), srv.viewId);
-          }
-        } else if (srv.texture.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
-          auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
-          access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read);
-          makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
-        } else {
-          auto &dummy_texture = dummySRVTexture(arg);
-          if (dummy_texture.texture) {
-            DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, true, false);
-            if (CheckResourceResidency(dummy_texture.residency, currentEncoderId(), requested))
-              makeResident<stage, kind>(dummy_texture.texture, requested);
+        // Texture / tbuffer ranges live in the mirrors, but every descriptor the
+        // shader can index still needs the matching access and residency state.
+        for (uint32_t local = 0; local < count; local++) {
+          const auto local_slot = slot + local;
+          if (local_slot >= kSRVBindings * (unsigned(stage) + 1))
+            break;
+          const auto &srv = (bindings && local == 0) ? bindings[i].srv
+                                                     : resview_[local_slot];
+          if (srv.buffer.ptr()) {
+            assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+            auto allocation = srv.buffer->current();
+            auto *view_ptr = srv.buffer->tryView(srv.viewId, allocation);
+            if (view_ptr && view_ptr->texture) {
+              access<stage>(srv.buffer, srv.viewId, ResourceAccess::Read);
+              makeResident<stage, kind>(srv.buffer.ptr(), srv.viewId);
+            }
+          } else if (srv.texture.ptr()) {
+            assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
+            auto viewIdChecked = srv.texture->checkViewUseArray(
+                srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
+            access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read);
+            makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
+          } else {
+            auto &dummy_texture = dummySRVTexture(arg);
+            if (dummy_texture.texture) {
+              DXMT_RESOURCE_RESIDENCY requested =
+                  GetResidencyMask<kind>(stage, true, false);
+              if (CheckResourceResidency(dummy_texture.residency,
+                                         currentEncoderId(), requested))
+                makeResident<stage, kind>(dummy_texture.texture, requested);
+            }
           }
         }
       }
       break;
     }
     case SM50BindingType::UAV: {
-      auto &uav = UAVBindingSet[arg.SM50BindingSlot];
+      const auto count = BufferTableRangeQwordCount(arg.RegisterCount) /
+                         kBufferTableQwordsPerDescriptor;
       bool read = (arg.Flags >> 10) & 1, write = (arg.Flags >> 10) & 2;
       if (!read && !write) {
         read = true;
         write = true;
       }
       int access_flags = (read ? ResourceAccess::Read : 0) |
-                         (write ? ResourceAccess::Write : 0) |
-                         ResourceAccess::UAV;
+                             (write ? ResourceAccess::Write : 0) |
+                             ResourceAccess::UAV;
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
-        if (uav.buffer.ptr()) {
-          auto [uav_alloc, offset] = access<stage>(uav.buffer, uav.slice.byteOffset, uav.slice.byteLength, access_flags);
-          write_slot(compact, uav_alloc->gpuAddress() + offset + uav.slice.byteOffset, uav.slice.byteLength);
-          makeResident<stage, kind>(uav.buffer.ptr(), read, write);
-        } else {
-          DebugLogNullShaderBinding<stage, kind>(
-              "UAV", "buffer", shader_hash, arg, bool(uav.buffer.ptr()), bool(uav.texture.ptr()), bool(uav.counter.ptr()),
-              encoder_id
-          );
-          write_slot(compact, 0, 0);
+        for (uint32_t local = 0; local < count; local++) {
+          const auto local_slot = arg.SM50BindingSlot + local;
+          if (local_slot >= kUAVBindings)
+            break;
+          auto &uav = UAVBindingSet[local_slot];
+          const uint32_t dst = compact + local * kBufferTableQwordsPerDescriptor;
+          if (uav.buffer.ptr()) {
+            auto [uav_alloc, offset] = access<stage>(
+                uav.buffer, uav.slice.byteOffset, uav.slice.byteLength,
+                access_flags);
+            write_slot(dst, uav_alloc->gpuAddress() + offset + uav.slice.byteOffset,
+                       uav.slice.byteLength);
+            makeResident<stage, kind>(uav.buffer.ptr(), read, write);
+          } else {
+            DebugLogNullShaderBinding<stage, kind>(
+                "UAV", "buffer", shader_hash, arg, bool(uav.buffer.ptr()),
+                bool(uav.texture.ptr()), bool(uav.counter.ptr()), encoder_id);
+            write_slot(dst, 0, 0);
+          }
         }
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
-        if (uav.buffer.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto allocation = uav.buffer->current();
-          auto *view_ptr = uav.buffer->tryView(uav.viewId, allocation);
-          if (view_ptr && view_ptr->texture) {
-            access<stage>(uav.buffer, uav.viewId, access_flags);
-            makeResident<stage, kind>(uav.buffer.ptr(), uav.viewId, read, write);
+        for (uint32_t local = 0; local < count; local++) {
+          const auto local_slot = arg.SM50BindingSlot + local;
+          if (local_slot >= kUAVBindings)
+            break;
+          auto &uav = UAVBindingSet[local_slot];
+          if (uav.buffer.ptr()) {
+            assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
+            auto allocation = uav.buffer->current();
+            auto *view_ptr = uav.buffer->tryView(uav.viewId, allocation);
+            if (view_ptr && view_ptr->texture) {
+              access<stage>(uav.buffer, uav.viewId, access_flags);
+              makeResident<stage, kind>(uav.buffer.ptr(), uav.viewId, read,
+                                        write);
+            }
+          } else if (uav.texture.ptr()) {
+            assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
+            auto viewIdChecked = uav.texture->checkViewUseArray(
+                uav.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
+            access<stage>(uav.texture, viewIdChecked, access_flags);
+            makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read,
+                                      write);
           }
-        } else if (uav.texture.ptr()) {
-          assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
-          auto viewIdChecked = uav.texture->checkViewUseArray(uav.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
-          access<stage>(uav.texture, viewIdChecked, access_flags);
-          makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read, write);
         }
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
-        if (uav.counter) {
-          auto [counter_alloc, offset] = access<stage>(uav.counter, 0, 4, ResourceAccess::All);
-          if (compact + 2 < buf_table_qwords)
-            buf_table[compact + 2] = counter_alloc->gpuAddress() + offset;
-          makeResident<stage, kind>(uav.counter.ptr(), true, true);
-        } else {
-          DebugLogNullShaderBinding<stage, kind>(
-              "UAV_COUNTER", "counter", shader_hash, arg, bool(uav.buffer.ptr()), bool(uav.texture.ptr()),
-              bool(uav.counter.ptr()), encoder_id
-          );
-          if (compact + 2 < buf_table_qwords)
-            buf_table[compact + 2] = 0;
+        for (uint32_t local = 0; local < count; local++) {
+          const auto local_slot = arg.SM50BindingSlot + local;
+          if (local_slot >= kUAVBindings)
+            break;
+          auto &uav = UAVBindingSet[local_slot];
+          const uint32_t dst =
+              compact + local * kBufferTableQwordsPerDescriptor + 2;
+          if (uav.counter) {
+            auto [counter_alloc, offset] =
+                access<stage>(uav.counter, 0, 4, ResourceAccess::All);
+            if (dst < buf_table_qwords)
+              buf_table[dst] = counter_alloc->gpuAddress() + offset;
+            makeResident<stage, kind>(uav.counter.ptr(), true, true);
+          } else {
+            DebugLogNullShaderBinding<stage, kind>(
+                "UAV_COUNTER", "counter", shader_hash, arg,
+                bool(uav.buffer.ptr()), bool(uav.texture.ptr()),
+                bool(uav.counter.ptr()), encoder_id);
+            if (dst < buf_table_qwords)
+              buf_table[dst] = 0;
+          }
         }
       }
       break;
@@ -714,21 +764,34 @@ ArgumentEncodingContext::verifyBindlessBufferTable(
 
     if (arg.Type == SM50BindingType::SRV &&
         (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER)) {
-      auto slot = 128 * unsigned(stage) + arg.SM50BindingSlot;
-      auto &srv = resview_[slot];
-      uint64_t expected_address = 0;
-      uint64_t expected_meta = 0;
-      if (srv.buffer.ptr()) {
-        auto [srv_alloc, offset] = access<stage>(
-            srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, ResourceAccess::Read);
-        expected_address = srv_alloc->gpuAddress() + offset + srv.slice.byteOffset;
-        expected_meta = srv.slice.byteLength;
+      const auto slot = kSRVBindings * unsigned(stage) + arg.SM50BindingSlot;
+      const auto count = BufferTableRangeQwordCount(arg.RegisterCount) /
+                         kBufferTableQwordsPerDescriptor;
+      for (uint32_t local = 0; local < count; local++) {
+        const auto local_slot = slot + local;
+        if (local_slot >= kSRVBindings * (unsigned(stage) + 1))
+          break;
+        const auto qw_base = compact + local * kBufferTableQwordsPerDescriptor;
+        if (qw_base + 1 >= buf_table_qwords)
+          break;
+        auto &srv = resview_[local_slot];
+        uint64_t expected_address = 0;
+        uint64_t expected_meta = 0;
+        if (srv.buffer.ptr()) {
+          auto [srv_alloc, offset] = access<stage>(
+              srv.buffer, srv.slice.byteOffset, srv.slice.byteLength,
+              ResourceAccess::Read);
+          expected_address =
+              srv_alloc->gpuAddress() + offset + srv.slice.byteOffset;
+          expected_meta = srv.slice.byteLength;
+        }
+        log_mismatch(arg, qw_base, "SRV", "gpuAddr", expected_address,
+                     buf_table[qw_base]);
+        log_mismatch(arg, qw_base + 1, "SRV", "meta", expected_meta,
+                     buf_table[qw_base + 1]);
       }
-      log_mismatch(arg, compact, "SRV", "gpuAddr", expected_address, buf_table[compact]);
-      log_mismatch(arg, compact + 1, "SRV", "meta", expected_meta, buf_table[compact + 1]);
     } else if (arg.Type == SM50BindingType::UAV &&
                (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER)) {
-      auto &uav = UAVBindingSet[arg.SM50BindingSlot];
       bool read = (arg.Flags >> 10) & 1, write = (arg.Flags >> 10) & 2;
       if (!read && !write) {
         read = true;
@@ -737,25 +800,43 @@ ArgumentEncodingContext::verifyBindlessBufferTable(
       int access_flags = (read ? ResourceAccess::Read : 0) |
                          (write ? ResourceAccess::Write : 0) |
                          ResourceAccess::UAV;
-      uint64_t expected_address = 0;
-      uint64_t expected_meta = 0;
-      if (uav.buffer.ptr()) {
-        auto [uav_alloc, offset] = access<stage>(
-            uav.buffer, uav.slice.byteOffset, uav.slice.byteLength, access_flags);
-        expected_address = uav_alloc->gpuAddress() + offset + uav.slice.byteOffset;
-        expected_meta = uav.slice.byteLength;
-      }
-      log_mismatch(arg, compact, "UAV", "gpuAddr", expected_address, buf_table[compact]);
-      log_mismatch(arg, compact + 1, "UAV", "meta", expected_meta, buf_table[compact + 1]);
+      const auto count = BufferTableRangeQwordCount(arg.RegisterCount) /
+                         kBufferTableQwordsPerDescriptor;
+      for (uint32_t local = 0; local < count; local++) {
+        const auto local_slot = arg.SM50BindingSlot + local;
+        if (local_slot >= kUAVBindings)
+          break;
+        const auto qw_base = compact + local * kBufferTableQwordsPerDescriptor;
+        if (qw_base + 1 >= buf_table_qwords)
+          break;
+        auto &uav = UAVBindingSet[local_slot];
+        uint64_t expected_address = 0;
+        uint64_t expected_meta = 0;
+        if (uav.buffer.ptr()) {
+          auto [uav_alloc, offset] = access<stage>(
+              uav.buffer, uav.slice.byteOffset, uav.slice.byteLength,
+              access_flags);
+          expected_address =
+              uav_alloc->gpuAddress() + offset + uav.slice.byteOffset;
+          expected_meta = uav.slice.byteLength;
+        }
+        log_mismatch(arg, qw_base, "UAV", "gpuAddr", expected_address,
+                     buf_table[qw_base]);
+        log_mismatch(arg, qw_base + 1, "UAV", "meta", expected_meta,
+                     buf_table[qw_base + 1]);
 
-      if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
+        if (!(arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER))
+          continue;
+        const auto counter_qw = qw_base + 2;
+        if (counter_qw >= buf_table_qwords)
+          continue;
         uint64_t expected_counter = 0;
         if (uav.counter) {
           auto [counter_alloc, offset] = access<stage>(uav.counter, 0, 4, ResourceAccess::All);
           expected_counter = counter_alloc->gpuAddress() + offset;
         }
-        if (compact + 2 < buf_table_qwords)
-          log_mismatch(arg, compact + 2, "UAV", "counter", expected_counter, buf_table[compact + 2]);
+        log_mismatch(arg, counter_qw, "UAV", "counter", expected_counter,
+                     buf_table[counter_qw]);
       }
     }
   }
