@@ -16,6 +16,7 @@
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
+#include "d3d12_sampler.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_perf_stats.hpp"
@@ -1070,6 +1071,20 @@ static void
 MarkDescriptorMirrorStaleForWrite(const DescriptorRecord &record) {
   if (record.mirror)
     record.mirror->MarkSlotStale(record.heap_index, GetDescriptorContentGeneration());
+}
+
+static void
+MaterializeSamplerMirrorForWrite(WMT::Device device,
+                                 const DescriptorRecord &record) {
+  if (!record.mirror || !record.mirror->isSamplerHeap())
+    return;
+  if (record.type != DescriptorRecordType::Sampler || !record.has_desc)
+    return;
+
+  auto sampler = CreateD3D12Sampler(device, record.desc.sampler);
+  if (!sampler)
+    return;
+  record.mirror->FillSamplerSlot(record.heap_index, sampler.ptr(), 0);
 }
 
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
@@ -2213,6 +2228,7 @@ public:
     BumpDescriptorContentGenerationForWrite(*record,
                                             DescriptorRecordType::Sampler);
     MarkDescriptorMirrorStaleForWrite(*record);
+    MaterializeSamplerMirrorForWrite(GetMTLDevice(), *record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_sampler(this, desc, descriptor);
   }
@@ -2295,8 +2311,10 @@ public:
     // Bindless-mirror: mark each destination slot stale so the encode thread re-resolves
     // it from the freshly-copied record. (Done after the generation bump so the stale
     // marker carries the new generation.)
-    for (size_t i = 0; i < destinations.size(); i++)
+    for (size_t i = 0; i < destinations.size(); i++) {
       MarkDescriptorMirrorStaleForWrite(*destinations[i]);
+      MaterializeSamplerMirrorForWrite(GetMTLDevice(), *destinations[i]);
+    }
 
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_copy_descriptors(
@@ -2337,8 +2355,10 @@ public:
       RecordDescriptorContentCopyPerf();
     }
     // Bindless-mirror: mark each destination slot stale (see CopyDescriptors).
-    for (UINT i = 0; i < descriptor_count; i++)
+    for (UINT i = 0; i < descriptor_count; i++) {
       MarkDescriptorMirrorStaleForWrite(dst[i]);
+      MaterializeSamplerMirrorForWrite(GetMTLDevice(), dst[i]);
+    }
 
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_copy_descriptors_simple(

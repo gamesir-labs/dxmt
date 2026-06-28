@@ -13,6 +13,7 @@
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
+#include "d3d12_sampler.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_bindless_buffer_table.hpp"
@@ -11383,7 +11384,7 @@ private:
    *
    * Byte-identity: textures resolve gpuResourceID via the same CreateShaderResource
    * TextureView() the draw path uses, and write through the shared EncodeMirror* writers;
-   * samplers reuse CreateSampler() + the encoder's dummy sampler handle. Only the slot
+   * samplers reuse CreateD3D12Sampler() + the encoder's dummy sampler handle. Only the slot
    * location differs from the legacy packed encode. Buffers are intentionally NOT handled
    * (hybrid ABI: they live in a per-draw buffer table owned by ③).
    */
@@ -11443,7 +11444,8 @@ private:
                                       enc.dummySamplerHandle(), stage, arg);
       return;
     }
-    auto sampler = CreateSampler(record.desc.sampler);
+    auto sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
+                                      record.desc.sampler);
     VerifyBindlessMirrorSamplerSlot(record.mirror, record.heap_index, sampler.ptr(),
                                     enc.dummySamplerHandle(), stage, arg);
   }
@@ -11464,7 +11466,10 @@ private:
                                         enc.dummySamplerHandle(), stage, arg);
         return;
       }
-      auto sampler = CreateSampler(record.desc.sampler);
+      if (filled && !BindlessMirrorVerifyEnabled())
+        return;
+      auto sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
+                                        record.desc.sampler);
       if (!filled)
         mirror->FillSamplerSlot(slot, sampler.ptr(), enc.dummySamplerHandle());
       VerifyBindlessMirrorSamplerSlot(mirror, slot, sampler.ptr(),
@@ -12129,7 +12134,8 @@ private:
       return;
     }
 
-    auto sampler = CreateSampler(descriptor.desc.sampler);
+    auto sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
+                                      descriptor.desc.sampler);
     if (!sampler)
       return;
 
@@ -12147,109 +12153,8 @@ private:
       enc.bindSampler<PipelineStage::Vertex>(slot, std::move(sampler));
   }
 
-  Rc<Sampler> CreateSampler(const D3D12_SAMPLER_DESC &desc) {
-    WMTSamplerInfo info = {};
-    info.lod_average = false;
-    info.min_filter = D3D12_DECODE_MIN_FILTER(desc.Filter)
-                          ? WMTSamplerMinMagFilterLinear
-                          : WMTSamplerMinMagFilterNearest;
-    info.mag_filter = D3D12_DECODE_MAG_FILTER(desc.Filter)
-                          ? WMTSamplerMinMagFilterLinear
-                          : WMTSamplerMinMagFilterNearest;
-    info.mip_filter = D3D12_DECODE_MIP_FILTER(desc.Filter)
-                          ? WMTSamplerMipFilterLinear
-                          : WMTSamplerMipFilterNearest;
-    info.lod_min_clamp = desc.MinLOD;
-    info.lod_max_clamp = std::max(desc.MinLOD, desc.MaxLOD);
-    info.max_anisotroy =
-        D3D12_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter)
-            ? std::clamp<UINT>(desc.MaxAnisotropy, 1, 16)
-            : 1;
-    info.s_address_mode = AddressMode(desc.AddressU);
-    info.t_address_mode = AddressMode(desc.AddressV);
-    info.r_address_mode = AddressMode(desc.AddressW);
-    info.compare_function = WMTCompareFunctionNever;
-    if (D3D12_DECODE_IS_COMPARISON_FILTER(desc.Filter))
-      info.compare_function = CompareFunction(desc.ComparisonFunc);
-    info.border_color = BorderColor(desc.BorderColor);
-    info.support_argument_buffers = true;
-    info.normalized_coords = true;
-    return Sampler::createSampler(device_->GetMTLDevice(), info,
-                                  desc.MipLODBias);
-  }
-
   Rc<Sampler> CreateStaticSampler(const D3D12_STATIC_SAMPLER_DESC &desc) {
-    D3D12_SAMPLER_DESC sampler = {};
-    sampler.Filter = desc.Filter;
-    sampler.AddressU = desc.AddressU;
-    sampler.AddressV = desc.AddressV;
-    sampler.AddressW = desc.AddressW;
-    sampler.MipLODBias = desc.MipLODBias;
-    sampler.MaxAnisotropy = desc.MaxAnisotropy;
-    sampler.ComparisonFunc = desc.ComparisonFunc;
-    sampler.MinLOD = desc.MinLOD;
-    sampler.MaxLOD = desc.MaxLOD;
-    switch (desc.BorderColor) {
-    case D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK:
-      sampler.BorderColor[3] = 1.0f;
-      break;
-    case D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE:
-      sampler.BorderColor[0] = 1.0f;
-      sampler.BorderColor[1] = 1.0f;
-      sampler.BorderColor[2] = 1.0f;
-      sampler.BorderColor[3] = 1.0f;
-      break;
-    case D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK:
-    default:
-      break;
-    }
-    return CreateSampler(sampler);
-  }
-
-  static WMTSamplerAddressMode AddressMode(D3D12_TEXTURE_ADDRESS_MODE mode) {
-    switch (mode) {
-    case D3D12_TEXTURE_ADDRESS_MODE_MIRROR:
-      return WMTSamplerAddressModeMirrorRepeat;
-    case D3D12_TEXTURE_ADDRESS_MODE_CLAMP:
-      return WMTSamplerAddressModeClampToEdge;
-    case D3D12_TEXTURE_ADDRESS_MODE_BORDER:
-      return WMTSamplerAddressModeClampToBorderColor;
-    case D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE:
-      return WMTSamplerAddressModeMirrorClampToEdge;
-    default:
-      return WMTSamplerAddressModeRepeat;
-    }
-  }
-
-  static WMTCompareFunction CompareFunction(D3D12_COMPARISON_FUNC func) {
-    switch (func) {
-    case D3D12_COMPARISON_FUNC_LESS:
-      return WMTCompareFunctionLess;
-    case D3D12_COMPARISON_FUNC_EQUAL:
-      return WMTCompareFunctionEqual;
-    case D3D12_COMPARISON_FUNC_LESS_EQUAL:
-      return WMTCompareFunctionLessEqual;
-    case D3D12_COMPARISON_FUNC_GREATER:
-      return WMTCompareFunctionGreater;
-    case D3D12_COMPARISON_FUNC_NOT_EQUAL:
-      return WMTCompareFunctionNotEqual;
-    case D3D12_COMPARISON_FUNC_GREATER_EQUAL:
-      return WMTCompareFunctionGreaterEqual;
-    case D3D12_COMPARISON_FUNC_ALWAYS:
-      return WMTCompareFunctionAlways;
-    default:
-      return WMTCompareFunctionNever;
-    }
-  }
-
-  static WMTSamplerBorderColor BorderColor(const FLOAT color[4]) {
-    if (color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f &&
-        color[3] == 0.0f)
-      return WMTSamplerBorderColorTransparentBlack;
-    if (color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f &&
-        color[3] == 1.0f)
-      return WMTSamplerBorderColorOpaqueBlack;
-    return WMTSamplerBorderColorOpaqueWhite;
+    return CreateD3D12StaticSampler(device_->GetMTLDevice(), desc);
   }
 
   struct DescriptorTableBindingRecipeEntry {
