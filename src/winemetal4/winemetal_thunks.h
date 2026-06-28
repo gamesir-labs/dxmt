@@ -84,6 +84,18 @@ struct unixcall_mtldevice_newbuffer {
   obj_handle_t ret;
 };
 
+struct unixcall_mtldevice_newargumenttable {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtl4argumenttable_setentry {
+  obj_handle_t table;
+  uint64_t payload;
+  uint32_t index;
+};
+
 struct unixcall_mtldevice_newsamplerstate {
   obj_handle_t device;
   struct WMTMemoryPointer info;

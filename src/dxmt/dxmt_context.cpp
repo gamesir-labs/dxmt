@@ -1854,6 +1854,9 @@ DebugAccumulateComputePass(FrameStatistics &statistics,
     case WMTComputeCommandSetBufferOffset:
     case WMTComputeCommandSetArgumentBuffer:
     case WMTComputeCommandSetArgumentBufferOffset:
+#ifdef WMT_HAS_ARGUMENT_TABLE_COMMANDS
+    case WMTComputeCommandSetArgumentTable:
+#endif
       statistics.compute_set_buffer_count++;
       break;
     case WMTComputeCommandSetTexture:
@@ -2160,6 +2163,9 @@ DebugSummarizeComputeCommands(const wmtcmd_compute_nop *cmd_head) {
     case WMTComputeCommandSetBufferOffset:
     case WMTComputeCommandSetArgumentBuffer:
     case WMTComputeCommandSetArgumentBufferOffset:
+#ifdef WMT_HAS_ARGUMENT_TABLE_COMMANDS
+    case WMTComputeCommandSetArgumentTable:
+#endif
       summary.set_buffers++;
       break;
     case WMTComputeCommandSetTexture:

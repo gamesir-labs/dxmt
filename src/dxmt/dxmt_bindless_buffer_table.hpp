@@ -6,6 +6,13 @@
 /**
  * Bindless-mirror (Stage-1) HYBRID-ABI per-draw BUFFER table (Metal slot 27).
  *
+ * TODO(d3d12, bindless): This is the remaining temporary bindless buffer
+ * implementation. It preserves correctness for descriptors whose GPU address
+ * depends on the current DXMT allocation/suballocation, but it is not the final
+ * Metal4 argument-table design. Replace it with a descriptor-write-time buffer
+ * table/materialization path once buffer descriptor lifetime and suballocation
+ * address stability are modeled explicitly.
+ *
  * See fh4-debug/BINDLESS-ABI.md §4.5. Under the hybrid ABI, TEXTURES and SAMPLERS
  * live in the persistent slot-30 mirror, but BUFFER descriptors (CBV + SRV/UAV
  * buffer + UAV counter) do NOT: their gpuAddress = allocation base +

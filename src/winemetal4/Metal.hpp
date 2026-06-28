@@ -223,6 +223,24 @@ public:
   }
 };
 
+class ArgumentTable : public Object {
+public:
+  void
+  setAddress(uint64_t gpu_address, uint32_t index) {
+    MTL4ArgumentTable_setAddress(handle, gpu_address, index);
+  }
+
+  void
+  setTexture(uint64_t gpu_resource_id, uint32_t index) {
+    MTL4ArgumentTable_setTexture(handle, gpu_resource_id, index);
+  }
+
+  void
+  setSamplerState(uint64_t gpu_resource_id, uint32_t index) {
+    MTL4ArgumentTable_setSamplerState(handle, gpu_resource_id, index);
+  }
+};
+
 class TimestampContext : public Object {
 public:
   void
@@ -356,6 +374,16 @@ public:
   void
   encodeCommands(const wmtcmd_render_nop *cmd_head) {
     MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)cmd_head);
+  }
+
+  void
+  setArgumentTable(ArgumentTable table, WMTRenderStages stages) {
+    struct wmtcmd_render_setargumenttable cmd;
+    cmd.type = WMTRenderCommandSetArgumentTable;
+    cmd.next.set(nullptr);
+    cmd.table = table.handle;
+    cmd.stages = stages;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
   void
@@ -542,6 +570,15 @@ public:
   void
   encodeCommands(const wmtcmd_compute_nop *cmd_head) {
     MTLComputeCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)cmd_head);
+  }
+
+  void
+  setArgumentTable(ArgumentTable table) {
+    struct wmtcmd_compute_setargumenttable cmd;
+    cmd.type = WMTComputeCommandSetArgumentTable;
+    cmd.next.set(nullptr);
+    cmd.table = table.handle;
+    MTLComputeCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
   void
@@ -804,6 +841,11 @@ public:
   Reference<Buffer>
   newBuffer(WMTBufferInfo &info) {
     return Reference<Buffer>(MTLDevice_newBuffer(handle, &info));
+  }
+
+  Reference<ArgumentTable>
+  newArgumentTable(const WMTArgumentTableInfo &info) {
+    return Reference<ArgumentTable>(MTLDevice_newArgumentTable(handle, &info));
   }
 
   Reference<SamplerState>

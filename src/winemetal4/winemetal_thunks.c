@@ -237,6 +237,43 @@ MTLDevice_newBuffer(obj_handle_t device, struct WMTBufferInfo *info) {
 }
 
 WINEMETAL_API obj_handle_t
+MTLDevice_newArgumentTable(obj_handle_t device, const struct WMTArgumentTableInfo *info) {
+  struct unixcall_mtldevice_newargumenttable params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = 0;
+  UNIX_CALL(156, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTL4ArgumentTable_setAddress(obj_handle_t table, uint64_t gpu_address, uint32_t index) {
+  struct unixcall_mtl4argumenttable_setentry params;
+  params.table = table;
+  params.payload = gpu_address;
+  params.index = index;
+  UNIX_CALL(157, &params);
+}
+
+WINEMETAL_API void
+MTL4ArgumentTable_setTexture(obj_handle_t table, uint64_t gpu_resource_id, uint32_t index) {
+  struct unixcall_mtl4argumenttable_setentry params;
+  params.table = table;
+  params.payload = gpu_resource_id;
+  params.index = index;
+  UNIX_CALL(158, &params);
+}
+
+WINEMETAL_API void
+MTL4ArgumentTable_setSamplerState(obj_handle_t table, uint64_t gpu_resource_id, uint32_t index) {
+  struct unixcall_mtl4argumenttable_setentry params;
+  params.table = table;
+  params.payload = gpu_resource_id;
+  params.index = index;
+  UNIX_CALL(159, &params);
+}
+
+WINEMETAL_API obj_handle_t
 MTLDevice_newSamplerState(obj_handle_t device, struct WMTSamplerInfo *info) {
   struct unixcall_mtldevice_newsamplerstate params;
   params.device = device;

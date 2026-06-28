@@ -1111,6 +1111,16 @@ dxmt_metal4_render_stages(enum WMTRenderStages stages) {
   return ret;
 }
 
+static MTLRenderStages
+dxmt_metal4_render_argument_stages(enum WMTRenderStages stages) {
+  MTLRenderStages ret = 0;
+  if (stages & WMTRenderStageVertex)
+    ret |= MTLRenderStageVertex;
+  if (stages & WMTRenderStageFragment)
+    ret |= MTLRenderStageFragment;
+  return ret;
+}
+
 static NSUInteger
 dxmt_metal4_index_buffer_length(id<MTLBuffer> buffer, uint64_t offset) {
   if (!buffer)
@@ -1133,7 +1143,11 @@ struct dxmt_metal4_render_argument_state {
   struct dxmt_metal4_argument_state object;
   struct dxmt_metal4_argument_state mesh;
   struct dxmt_metal4_argument_state tile;
-  bool tables_bound;
+  bool vertex_table_bound;
+  bool fragment_table_bound;
+  bool object_table_bound;
+  bool mesh_table_bound;
+  bool tile_table_bound;
 };
 
 static void
@@ -1145,7 +1159,11 @@ dxmt_metal4_render_argument_state_init(
   dxmt_metal4_argument_state_init(&state->object, owner, @"DXMT4 Object Arguments");
   dxmt_metal4_argument_state_init(&state->mesh, owner, @"DXMT4 Mesh Arguments");
   dxmt_metal4_argument_state_init(&state->tile, owner, @"DXMT4 Tile Arguments");
-  state->tables_bound = false;
+  state->vertex_table_bound = false;
+  state->fragment_table_bound = false;
+  state->object_table_bound = false;
+  state->mesh_table_bound = false;
+  state->tile_table_bound = false;
 }
 
 static void
@@ -1161,14 +1179,26 @@ static void
 dxmt_metal4_render_set_argument_tables(
     id<MTL4RenderCommandEncoder> encoder,
     struct dxmt_metal4_render_argument_state *state) {
-  if (state->tables_bound)
-    return;
-  [encoder setArgumentTable:state->vertex.table atStages:MTLRenderStageVertex];
-  [encoder setArgumentTable:state->fragment.table atStages:MTLRenderStageFragment];
-  [encoder setArgumentTable:state->object.table atStages:MTLRenderStageObject];
-  [encoder setArgumentTable:state->mesh.table atStages:MTLRenderStageMesh];
-  [encoder setArgumentTable:state->tile.table atStages:MTLRenderStageTile];
-  state->tables_bound = true;
+  if (!state->vertex_table_bound) {
+    [encoder setArgumentTable:state->vertex.table atStages:MTLRenderStageVertex];
+    state->vertex_table_bound = true;
+  }
+  if (!state->fragment_table_bound) {
+    [encoder setArgumentTable:state->fragment.table atStages:MTLRenderStageFragment];
+    state->fragment_table_bound = true;
+  }
+  if (!state->object_table_bound) {
+    [encoder setArgumentTable:state->object.table atStages:MTLRenderStageObject];
+    state->object_table_bound = true;
+  }
+  if (!state->mesh_table_bound) {
+    [encoder setArgumentTable:state->mesh.table atStages:MTLRenderStageMesh];
+    state->mesh_table_bound = true;
+  }
+  if (!state->tile_table_bound) {
+    [encoder setArgumentTable:state->tile.table atStages:MTLRenderStageTile];
+    state->tile_table_bound = true;
+  }
 }
 
 static void
@@ -3567,6 +3597,65 @@ _MTLDevice_newBuffer(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_newArgumentTable(void *obj) {
+  struct unixcall_mtldevice_newargumenttable *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  const struct WMTArgumentTableInfo *info = params->info.ptr;
+  if (!device || !info) {
+    params->ret = 0;
+    return STATUS_SUCCESS;
+  }
+
+  MTL4ArgumentTableDescriptor *desc = [[MTL4ArgumentTableDescriptor alloc] init];
+  desc.maxBufferBindCount = info->max_buffer_bind_count;
+  desc.maxTextureBindCount = info->max_texture_bind_count;
+  desc.maxSamplerStateBindCount = info->max_sampler_state_bind_count;
+  desc.initializeBindings = info->initialize_bindings;
+  NSError *error = nil;
+  id<MTL4ArgumentTable> table =
+      [(id<MTLDeviceMetal4SPI>)device newArgumentTableWithDescriptor:desc
+                                                               error:&error];
+  if (!table) {
+    fprintf(stderr, "err:   DXMT Metal4 argument table creation failed: %s\n",
+            error.localizedDescription ? error.localizedDescription.UTF8String : "<no error>");
+  }
+  [desc release];
+  params->ret = (obj_handle_t)table;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4ArgumentTable_setAddress(void *obj) {
+  struct unixcall_mtl4argumenttable_setentry *params = obj;
+  id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)params->table;
+  if (table)
+    [table setAddress:(MTLGPUAddress)params->payload atIndex:params->index];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4ArgumentTable_setTexture(void *obj) {
+  struct unixcall_mtl4argumenttable_setentry *params = obj;
+  id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)params->table;
+  if (table) {
+    MTLResourceID resource_id = { ._impl = params->payload };
+    [table setTexture:resource_id atIndex:params->index];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4ArgumentTable_setSamplerState(void *obj) {
+  struct unixcall_mtl4argumenttable_setentry *params = obj;
+  id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)params->table;
+  if (table) {
+    MTLResourceID resource_id = { ._impl = params->payload };
+    [table setSamplerState:resource_id atIndex:params->index];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_newSamplerState(void *obj) {
   struct unixcall_mtldevice_newsamplerstate *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
@@ -4656,6 +4745,13 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       dxmt_metal4_argument_set_buffer_offset(args, body->offset, body->index);
       break;
     }
+    case WMTComputeCommandSetArgumentTable: {
+      struct wmtcmd_compute_setargumenttable *body =
+          (struct wmtcmd_compute_setargumenttable *)next;
+      [encoder setArgumentTable:(id<MTL4ArgumentTable>)body->table];
+      state->argumentTableBound = true;
+      break;
+    }
     case WMTComputeCommandUseResource: {
       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
       (void)body->usage;
@@ -4764,6 +4860,23 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
           (struct wmtcmd_render_setargumentbufferoffset *)next;
       dxmt_metal4_render_argument_set_buffer_offset(
           args, body->offset, body->index, body->stages);
+      break;
+    }
+    case WMTRenderCommandSetArgumentTable: {
+      struct wmtcmd_render_setargumenttable *body =
+          (struct wmtcmd_render_setargumenttable *)next;
+      [encoder setArgumentTable:(id<MTL4ArgumentTable>)body->table
+                       atStages:dxmt_metal4_render_argument_stages(body->stages)];
+      if (body->stages & WMTRenderStageVertex)
+        args->vertex_table_bound = true;
+      if (body->stages & WMTRenderStageFragment)
+        args->fragment_table_bound = true;
+      if (body->stages & WMTRenderStageObject)
+        args->object_table_bound = true;
+      if (body->stages & WMTRenderStageMesh)
+        args->mesh_table_bound = true;
+      if (body->stages & WMTRenderStageTile)
+        args->tile_table_bound = true;
       break;
     }
     case WMTRenderCommandSetMeshBuffer: {
@@ -7483,6 +7596,11 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4TimestampContext_writeTimestamp,
     &_MTLDevice_sizeOfTimestampHeapEntry,
     &_MTL4CommandBuffer_resolveCounterHeap,
+    &_DispatchData_copy,
+    &_MTLDevice_newArgumentTable,
+    &_MTL4ArgumentTable_setAddress,
+    &_MTL4ArgumentTable_setTexture,
+    &_MTL4ArgumentTable_setSamplerState,
 };
 
 #ifndef DXMT_NATIVE
@@ -7643,5 +7761,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_sizeOfTimestampHeapEntry,
     &_MTL4CommandBuffer_resolveCounterHeap,
     &_DispatchData_copy,
+    &_MTLDevice_newArgumentTable,
+    &_MTL4ArgumentTable_setAddress,
+    &_MTL4ArgumentTable_setTexture,
+    &_MTL4ArgumentTable_setSamplerState,
 };
 #endif

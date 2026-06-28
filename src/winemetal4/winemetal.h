@@ -28,6 +28,7 @@
 typedef uint64_t obj_handle_t;
 
 #define NULL_OBJECT_HANDLE 0
+#define WMT_HAS_ARGUMENT_TABLE_COMMANDS 1
 
 #ifndef _MACH_PORT_T
 typedef uint32_t mach_port_t;
@@ -216,6 +217,23 @@ struct WMTBufferInfo {
 STATIC_ASSERT(sizeof(WMTBufferInfo) == 32);
 
 WINEMETAL_API obj_handle_t MTLDevice_newBuffer(obj_handle_t device, struct WMTBufferInfo *info);
+
+struct WMTArgumentTableInfo {
+  uint32_t max_buffer_bind_count;
+  uint32_t max_texture_bind_count;
+  uint32_t max_sampler_state_bind_count;
+  bool initialize_bindings;
+};
+
+STATIC_ASSERT(sizeof(WMTArgumentTableInfo) == 16);
+
+WINEMETAL_API obj_handle_t MTLDevice_newArgumentTable(obj_handle_t device, const struct WMTArgumentTableInfo *info);
+
+WINEMETAL_API void MTL4ArgumentTable_setAddress(obj_handle_t table, uint64_t gpu_address, uint32_t index);
+
+WINEMETAL_API void MTL4ArgumentTable_setTexture(obj_handle_t table, uint64_t gpu_resource_id, uint32_t index);
+
+WINEMETAL_API void MTL4ArgumentTable_setSamplerState(obj_handle_t table, uint64_t gpu_resource_id, uint32_t index);
 
 enum WMTSamplerBorderColor : uint8_t {
   WMTSamplerBorderColorTransparentBlack = 0,
@@ -1055,6 +1073,7 @@ enum WMTComputeCommandType : uint16_t {
   WMTComputeCommandMemoryBarrier,
   WMTComputeCommandSetArgumentBuffer,
   WMTComputeCommandSetArgumentBufferOffset,
+  WMTComputeCommandSetArgumentTable,
 };
 
 struct wmtcmd_compute_nop {
@@ -1118,6 +1137,13 @@ struct wmtcmd_compute_setargumentbufferoffset {
   struct WMTMemoryPointer next;
   uint64_t offset;
   uint8_t index;
+};
+
+struct wmtcmd_compute_setargumenttable {
+  enum WMTComputeCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t table;
 };
 
 enum WMTResourceUsage {
@@ -1218,6 +1244,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDispatchThreadsPerTile,
   WMTRenderCommandSetArgumentBuffer,
   WMTRenderCommandSetArgumentBufferOffset,
+  WMTRenderCommandSetArgumentTable,
 };
 
 struct wmtcmd_render_nop {
@@ -1294,6 +1321,14 @@ struct wmtcmd_render_setargumentbufferoffset {
   struct WMTMemoryPointer next;
   uint64_t offset;
   uint8_t index;
+  enum WMTRenderStages stages;
+};
+
+struct wmtcmd_render_setargumenttable {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t table;
   enum WMTRenderStages stages;
 };
 
