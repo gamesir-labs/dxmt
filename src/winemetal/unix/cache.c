@@ -75,7 +75,11 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
   if (sqlite3_step(_stmt) == SQLITE_ROW) {
     const void *bytes = sqlite3_column_blob(_stmt, 0);
     int len = sqlite3_column_bytes(_stmt, 0);
-    result = dispatch_data_create(bytes, len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    void *copy = malloc(len);
+    if (copy) {
+      memcpy(copy, bytes, len);
+      result = dispatch_data_create(copy, len, nil, DISPATCH_DATA_DESTRUCTOR_FREE);
+    }
   }
   sqlite3_reset(_stmt);
   return result;

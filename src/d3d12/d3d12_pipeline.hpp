@@ -127,6 +127,8 @@ private:
 struct PipelineMetalShader {
   WMT::Reference<WMT::Library> library;
   WMT::Reference<WMT::Function> function;
+  bool persistent_cache_hit = false;
+  std::string persistent_cache_key;
 };
 
 struct PipelineMetalGraphicsState {

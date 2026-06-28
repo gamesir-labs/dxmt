@@ -1469,10 +1469,9 @@ BuildPersistentAirCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
                            std::string_view shader_cache_key, bool bindless) {
   Sha1HashState hash;
   HashString(hash, "dxmt-d3d12-persistent-air-cache-v2");
-  // Fold the DXMT build version (git short hash, regenerated per build) into
-  // the key so the cache auto-invalidates whenever airconv codegen could have
-  // changed — closes the stale-AIR risk without relying on bumping a manual
-  // constant. (Uncommitted dev airconv edits: use a fresh DXMT_SHADER_CACHE_PATH.)
+  // Fold the DXMT build version into the key so the cache auto-invalidates
+  // across clean commits and local dirty builds whenever airconv codegen could
+  // have changed.
   HashString(hash, DXMT_VERSION);
   HashValue(hash, uint32_t(stage));
   HashValue(hash, uint32_t(GetMetalVersion(device)));
@@ -1487,7 +1486,8 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      const char *function_name,
                      SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
                      PipelineMetalShader &out,
-                     std::string_view shader_cache_key, bool bindless) {
+                     std::string_view shader_cache_key, bool bindless,
+                     bool read_persistent_cache = true) {
   const char *air_function_name = "shader_main";
 
   // PERF DIAG (DXMT_DIAG_STALL): persistent-cache hit/miss + airconv transpile
@@ -1508,6 +1508,8 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
         BuildPersistentAirCacheKey(device, shader.stage, shader_cache_key,
                                    bindless);
     scache = &ShaderCache::getInstance(device->GetDXMTDevice().metalVersion());
+  }
+  if (persistent && read_persistent_cache) {
     if (auto reader = scache->getReader()) {
       if (auto lib_data = reader->get(persistent_key)) {
         WMT::Reference<WMT::Error> metal_error;
@@ -1516,6 +1518,8 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
         if (compiled.library) {
           compiled.function = compiled.library.newFunction(air_function_name);
           if (compiled.function) {
+            compiled.persistent_cache_hit = true;
+            compiled.persistent_cache_key = persistent_key.string();
             out = std::move(compiled);
             if (stall_diag) {
               auto h = g_cache_hits.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2459,11 +2463,18 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   const auto cs_name = BuildFunctionName("cs", shader_cache_key);
   D3D12DumpPipelineShaders("compute", shader_cache_key, shaders, nullptr,
                            nullptr);
-  if (!CompileMetalFunction(device, *cs, cs_name.c_str(),
-                            pso_bindless
-                                ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
-                                : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
-                            out.compute, shader_cache_key, pso_bindless))
+  auto *compile_args =
+      pso_bindless
+          ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+                &bindless_node)
+          : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+                &common);
+  auto compile_compute = [&](bool read_persistent_cache) {
+    return CompileMetalFunction(device, *cs, cs_name.c_str(), compile_args,
+                                out.compute, shader_cache_key, pso_bindless,
+                                read_persistent_cache);
+  };
+  if (!compile_compute(/*read_persistent_cache=*/true))
     return false;
 
   WMTComputePipelineInfo info = {};
@@ -2477,12 +2488,51 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   const auto tgz = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[2]);
   info.tgsize_is_multiple_of_sgwidth = ((tgx * tgy * tgz) % 32) == 0;
 
-  WMT::Reference<WMT::Error> error;
-  out.pso = device->GetMTLDevice().newComputePipelineState(info, error);
-  if (error || !out.pso) {
+  auto create_pso = [&](std::string &error_desc) {
+    WMT::Reference<WMT::Error> error;
+    out.pso = device->GetMTLDevice().newComputePipelineState(info, error);
+    if (error || !out.pso) {
+      error_desc = error ? error.description().getUTF8String()
+                         : "unknown error";
+      return false;
+    }
+    error_desc.clear();
+    return true;
+  };
+  auto log_failure = [&](std::string_view error_desc) {
     WARN("D3D12PipelineState: failed to create Metal compute PSO: ",
-         error ? error.description().getUTF8String() : "unknown error");
-    return false;
+         error_desc, " shaderKey=", shader_cache_key, " function=", cs_name,
+         " bindless=", pso_bindless ? 1 : 0,
+         " persistentCacheHit=", out.compute.persistent_cache_hit ? 1 : 0,
+         " persistentCacheKey=", out.compute.persistent_cache_key,
+         " immutableBuffers=0x", std::hex, info.immutable_buffers, std::dec,
+         " threadgroup=", tgx, "x", tgy, "x", tgz,
+         " tgMultipleOfSgWidth=", info.tgsize_is_multiple_of_sgwidth ? 1 : 0);
+  };
+
+  std::string error_desc;
+  if (!create_pso(error_desc)) {
+    const bool was_persistent_cache_hit = out.compute.persistent_cache_hit;
+    const auto persistent_cache_key = out.compute.persistent_cache_key;
+    log_failure(error_desc);
+    if (!was_persistent_cache_hit)
+      return false;
+
+    WARN("D3D12PipelineState: retrying compute PSO with fresh AIR after "
+         "persistent cache materialization failure shaderKey=",
+         shader_cache_key, " persistentCacheKey=", persistent_cache_key);
+    out.compute = {};
+    out.pso = {};
+    if (!compile_compute(/*read_persistent_cache=*/false))
+      return false;
+    info.compute_function = out.compute.function;
+    if (!create_pso(error_desc)) {
+      log_failure(error_desc);
+      return false;
+    }
+    INFO("D3D12PipelineState: recovered compute PSO by refreshing persistent "
+         "AIR cache shaderKey=",
+         shader_cache_key, " persistentCacheKey=", persistent_cache_key);
   }
 
   out.threadgroup_size = {tgx, tgy, tgz};

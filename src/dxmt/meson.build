@@ -46,7 +46,7 @@ dxmt_shaders_header = hexdump_generator.process(dxmt_shaders_lib)
 dxmt_version_override = get_option('dxmt_version')
 if dxmt_version_override == ''
   dxmt_version = vcs_tag(
-    command: ['git', 'describe', '--always'],
+    command: ['git', 'describe', '--always', '--dirty'],
     input:  '../../version.h.in',
     output: 'version.h',
   )
