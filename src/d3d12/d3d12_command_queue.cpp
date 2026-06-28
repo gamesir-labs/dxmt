@@ -885,7 +885,9 @@ D3D12ApitraceGpuCbvSnapshotEnabled() {
 
 static bool
 DiagIsTargetCompositePso(const std::string &key) {
-  return key == "bee0b7250cb8447bc326e2ceeedb2f7083216c10";
+  return (D3D12DiagDrawStateEnabled() || D3D12DiagDrawVisibilityEnabled() ||
+          D3D12DiagCBVReadbackEnabled()) &&
+         key == "bee0b7250cb8447bc326e2ceeedb2f7083216c10";
 }
 
 static thread_local uint64_t g_diag_replay_record_sequence = 0;
@@ -5486,6 +5488,8 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS address = 0;
   };
 
+  struct GraphicsBindlessReplayState;
+
   struct ReplayState {
     // Root parameter index is bounded by the D3D12 root-signature 64-DWORD
     // limit, so the hottest root bindings use a fixed array indexed by parameter
@@ -5559,6 +5563,9 @@ private:
     // hit proves "same bindings, frozen state" → the hazard result is identical.
     uint64_t access_epoch = 0;
     std::unordered_map<uint64_t, uint64_t> da_cache;
+    uint64_t bindless_replay_state_cache_hash = 0;
+    std::shared_ptr<const GraphicsBindlessReplayState>
+        bindless_replay_state_cache;
     Com<ID3D12Resource> predication_buffer;
     UINT64 predication_buffer_offset = 0;
     D3D12_PREDICATION_OP predication_operation =
@@ -5693,7 +5700,8 @@ private:
   }
 
   static std::shared_ptr<GraphicsBindlessReplayState>
-  CaptureGraphicsBindlessReplayState(const ReplayState &state) {
+  CaptureGraphicsBindlessReplayState(const ReplayState &state,
+                                     uint64_t content_fingerprint) {
     auto copy = std::make_shared<GraphicsBindlessReplayState>();
     copy->queue_type = state.queue_type;
     copy->pipeline_state = state.pipeline_state;
@@ -5713,9 +5721,26 @@ private:
     copy->graphics_uav_roots = state.graphics_uav_roots;
     copy->current_record_d3d_sequence = state.current_record_d3d_sequence;
     copy->graphics_binding_generation = state.graphics_binding_generation;
-    copy->bindless_replay_content_fingerprint =
-        HashGraphicsBindlessReplayCaptureState(*copy);
+    copy->bindless_replay_content_fingerprint = content_fingerprint;
     return copy;
+  }
+
+  struct GraphicsBindlessReplayStateCaptureResult {
+    std::shared_ptr<const GraphicsBindlessReplayState> state;
+    bool cache_hit = false;
+  };
+
+  static GraphicsBindlessReplayStateCaptureResult
+  GetOrCaptureGraphicsBindlessReplayState(ReplayState &state) {
+    const auto content_fingerprint =
+        HashGraphicsBindlessReplayCaptureState(state);
+    if (state.bindless_replay_state_cache &&
+        state.bindless_replay_state_cache_hash == content_fingerprint)
+      return {state.bindless_replay_state_cache, true};
+    auto copy = CaptureGraphicsBindlessReplayState(state, content_fingerprint);
+    state.bindless_replay_state_cache_hash = content_fingerprint;
+    state.bindless_replay_state_cache = copy;
+    return {copy, false};
   }
 
   ResolvedReplayVertexBuffer
@@ -7024,6 +7049,10 @@ private:
     uint64_t resAccessCalls = 0, resAccessSteadyNoop = 0;
     uint64_t descAccessHits = 0, descAccessMiss = 0;
     uint64_t supersededStateRecordsSkipped = 0;
+    uint64_t graphicsPsoUnavailable = 0, computePsoUnavailable = 0;
+    uint64_t bindlessReplayStateCacheHit = 0;
+    uint64_t bindlessReplayStateCacheMiss = 0;
+    std::string firstComputePsoUnavailableKey;
     // Stage-2 (passthrough-barrier) feasibility probe: sync points DXMT
     // AUTO-INFERS (mismatchBarriers) vs barrier transitions the app EXPLICITLY
     // declares (appBarrierTransitions). auto≈0 relative to explicit ⇒ FH4's
@@ -7774,6 +7803,40 @@ private:
             timers.snapshotCapturedVertexBuffers;
         stats->frame_replay_snapshot_captured_bindless +=
             timers.snapshotCapturedBindless;
+      }
+      const auto replay_total_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              rb_t4 - rb_t0).count();
+      const auto &timers = perDrawSubTimers();
+      if (replay_total_us >= 100000 || timers.graphicsPsoUnavailable ||
+          timers.computePsoUnavailable) {
+        static std::atomic<uint32_t> context_log_count = 0;
+        if (context_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+          WARN_FILE_ONLY("DXMT replay context:"
+               " queue=", reinterpret_cast<uintptr_t>(this),
+               " queueType=", desc_.Type,
+               " records=", records.size(),
+               " totalUs=", replay_total_us,
+               " recordLoopUs=",
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   rb_t1 - rb_t0).count(),
+               " flushPassUs=",
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   rb_t2 - rb_t1).count(),
+               " lastD3DSeq=", dxmt::apitrace::current_d3d_sequence(),
+               " drawCount=", timers.drawCount,
+               " indexedDrawRecords=", timers.recordDrawIndexedCount,
+               " dispatchRecords=", timers.recordDispatchCount,
+               " rootTableRecords=", timers.recordRootTableCount,
+               " vertexStateRecords=", timers.recordVertexIndexStateCount,
+               " descAccessPassthrough=", timers.descAccessPassthrough,
+               " bindlessStateCacheHit=", timers.bindlessReplayStateCacheHit,
+               " bindlessStateCacheMiss=", timers.bindlessReplayStateCacheMiss,
+               " graphicsPsoUnavailable=", timers.graphicsPsoUnavailable,
+               " computePsoUnavailable=", timers.computePsoUnavailable,
+               " firstComputePsoUnavailableKey=",
+               timers.firstComputePsoUnavailableKey);
+        }
       }
     }
     if (replay_breakdown) {
@@ -13215,7 +13278,7 @@ private:
     return plan;
   }
 
-  const BindlessMirrorStagePlan &
+  std::shared_ptr<const BindlessMirrorStagePlan>
   GetBindlessMirrorStagePlan(const PipelineState &pipeline,
                              const RootSignature &root,
                              PipelineStage want_stage, bool compute) {
@@ -13228,16 +13291,17 @@ private:
     key ^= uint64_t(compute ? 1 : 0) + 0x9e3779b97f4a7c15ull + (key << 6) +
            (key >> 2);
 
+    std::lock_guard lock(bindless_stage_plan_cache_mutex_);
     auto it = bindless_stage_plan_cache_.find(key);
-    if (it == bindless_stage_plan_cache_.end() ||
-        it->second.root_sig != &root || it->second.pso != &pipeline ||
-        it->second.stage != want_stage || it->second.compute != compute) {
-      it = bindless_stage_plan_cache_
-               .insert_or_assign(key, BuildBindlessMirrorStagePlan(
-                                          pipeline, root, want_stage, compute))
-               .first;
-    }
-    return it->second;
+    if (it != bindless_stage_plan_cache_.end() && it->second &&
+        it->second->root_sig == &root && it->second->pso == &pipeline &&
+        it->second->stage == want_stage && it->second->compute == compute)
+      return it->second;
+
+    auto plan = std::make_shared<BindlessMirrorStagePlan>(
+        BuildBindlessMirrorStagePlan(pipeline, root, want_stage, compute));
+    bindless_stage_plan_cache_[key] = plan;
+    return plan;
   }
 
   // Bindless-mirror: build the per-draw slot-28 root_offsets for ONE shader
@@ -13264,29 +13328,29 @@ private:
     if (!arguments || !argument_count)
       return {};
 
-    const auto &plan =
+    const auto plan =
         GetBindlessMirrorStagePlan(pipeline, root, want_stage, compute);
-    if (!plan.max_key_plus_one)
+    if (!plan || !plan->max_key_plus_one)
       return {};
 
     auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
-        enc.currentSeqId(), uint64_t(plan.max_key_plus_one) * sizeof(uint32_t));
+        enc.currentSeqId(), uint64_t(plan->max_key_plus_one) * sizeof(uint32_t));
     if (!slice.mapped || !slice.gpu_buffer)
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
     std::memset(root_offsets, 0, slice.length);
     if (window) {
-      if (plan.texture_count) {
+      if (plan->texture_count) {
         const uint64_t qwords =
             uint64_t(dxmt::kBindlessMirrorCapacity) *
-            dxmt::kMirrorTextureQwords * plan.texture_field_pairs;
-        window->texture_field_pairs = plan.texture_field_pairs;
+            dxmt::kMirrorTextureQwords * plan->texture_field_pairs;
+        window->texture_field_pairs = plan->texture_field_pairs;
         window->texture = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
             enc.currentSeqId(), qwords * sizeof(uint64_t));
         if (window->texture.mapped)
           std::memset(window->texture.mapped, 0, window->texture.length);
       }
-      if (plan.sampler_count) {
+      if (plan->sampler_count) {
         const uint64_t qwords =
             uint64_t(dxmt::kBindlessMirrorCapacity) * dxmt::kMirrorSamplerQwords;
         window->sampler = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
@@ -13297,9 +13361,9 @@ private:
     }
     std::vector<BindlessMirrorDiagProbe> bindless_diag_probes;
 
-    for (const auto &entry : plan.entries) {
+    for (const auto &entry : plan->entries) {
       if (entry.argument_index >= argument_count ||
-          entry.root_offset_key >= plan.max_key_plus_one)
+          entry.root_offset_key >= plan->max_key_plus_one)
         continue;
       const auto &argument = arguments[entry.argument_index];
       const auto base_handle = GetTableHandle(state, compute, entry.root_index);
@@ -13397,8 +13461,8 @@ private:
     }
     if (window && window->sampler.mapped) {
       auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
-      for (const auto &entry : plan.static_samplers) {
-        if (entry.root_offset_key >= plan.max_key_plus_one ||
+      for (const auto &entry : plan->static_samplers) {
+        if (entry.root_offset_key >= plan->max_key_plus_one ||
             entry.compact_slot >= dxmt::kBindlessMirrorCapacity)
           continue;
         auto sampler = CreateStaticSampler(entry.desc);
@@ -13414,7 +13478,7 @@ private:
       }
     }
     for (auto probe : bindless_diag_probes) {
-      if (!probe.arg || probe.arg->StructurePtrOffset >= plan.max_key_plus_one)
+      if (!probe.arg || probe.arg->StructurePtrOffset >= plan->max_key_plus_one)
         continue;
       const auto local = probe.shader_register - probe.lower_bound;
       probe.root_offset = root_offsets[probe.arg->StructurePtrOffset];
@@ -16517,6 +16581,8 @@ private:
 
     auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalGraphicsState(); }();
     if (!metal || !metal->pso) {
+      if (ReplayPerfEnabled())
+        perDrawSubTimers().graphicsPsoUnavailable++;
       WARN("D3D12CommandQueue: draw skipped because Metal graphics PSO is unavailable");
       return;
     }
@@ -16583,7 +16649,14 @@ private:
         if (D3D12ReplayGraphicsBatchingEnabled() &&
             (HasPendingComputePass(state) || HasPendingBlitBatch(state)))
           FlushPassBatches(chunk, state);
-        bindless_replay_state = CaptureGraphicsBindlessReplayState(state);
+        auto capture = GetOrCaptureGraphicsBindlessReplayState(state);
+        bindless_replay_state = std::move(capture.state);
+        if (ReplayPerfEnabled()) {
+          if (capture.cache_hit)
+            perDrawSubTimers().bindlessReplayStateCacheHit++;
+          else
+            perDrawSubTimers().bindlessReplayStateCacheMiss++;
+        }
       } else {
         binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
             chunk, state, *pipeline, attachments,
@@ -16704,6 +16777,8 @@ private:
 
     auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalGraphicsState(); }();
     if (!metal || !metal->pso) {
+      if (ReplayPerfEnabled())
+        perDrawSubTimers().graphicsPsoUnavailable++;
       WARN("D3D12CommandQueue: indexed draw skipped because Metal graphics PSO is unavailable");
       return;
     }
@@ -16795,7 +16870,14 @@ private:
         if (D3D12ReplayGraphicsBatchingEnabled() &&
             (HasPendingComputePass(state) || HasPendingBlitBatch(state)))
           FlushPassBatches(chunk, state);
-        bindless_replay_state = CaptureGraphicsBindlessReplayState(state);
+        auto capture = GetOrCaptureGraphicsBindlessReplayState(state);
+        bindless_replay_state = std::move(capture.state);
+        if (ReplayPerfEnabled()) {
+          if (capture.cache_hit)
+            perDrawSubTimers().bindlessReplayStateCacheHit++;
+          else
+            perDrawSubTimers().bindlessReplayStateCacheMiss++;
+        }
       } else {
         binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
             chunk, state, *pipeline, attachments,
@@ -16919,6 +17001,12 @@ private:
 
     auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalComputeState(); }();
     if (!metal || !metal->pso) {
+      if (ReplayPerfEnabled()) {
+        auto &timers = perDrawSubTimers();
+        timers.computePsoUnavailable++;
+        if (timers.firstComputePsoUnavailableKey.empty())
+          timers.firstComputePsoUnavailableKey = pipeline->GetShaderCacheKey();
+      }
       WARN("D3D12CommandQueue: dispatch skipped because Metal compute PSO is unavailable");
       return;
     }
@@ -18133,7 +18221,10 @@ private:
         // Within a batch every referenced PSO/root-sig is pinned alive by the
         // command records, so intra-batch (PSO*,root_sig*) reuse is safe.
         binding_plan_cache_.clear();
-        bindless_stage_plan_cache_.clear();
+        {
+          std::lock_guard lock(bindless_stage_plan_cache_mutex_);
+          bindless_stage_plan_cache_.clear();
+        }
         RecordExecuteDrainTime(
             perf_stats, dxmt::perf::ExecuteTimeBucket::DrainLock,
             clock::now() - lock_begin);
@@ -18425,7 +18516,9 @@ private:
   // re-checked on hit; CLEARED once per Execute batch (intra-batch all PSOs/
   // root-sigs are pinned alive by the command records, so no ABA within batch).
   std::unordered_map<uint64_t, BindingPlan> binding_plan_cache_;
-  std::unordered_map<uint64_t, BindlessMirrorStagePlan> bindless_stage_plan_cache_;
+  std::unordered_map<uint64_t, std::shared_ptr<const BindlessMirrorStagePlan>>
+      bindless_stage_plan_cache_;
+  std::mutex bindless_stage_plan_cache_mutex_;
   std::deque<PendingOperation> pending_operations_;
   bool draining_pending_operations_ = false;
   std::mutex mutex_;
