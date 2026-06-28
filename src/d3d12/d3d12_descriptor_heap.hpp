@@ -3,6 +3,7 @@
 #include "d3d12_resource.hpp"
 #include "d3d12_device.hpp"
 #include "com/com_pointer.hpp"
+#include "rc/util_rc_ptr.hpp"
 #include <d3d12.h>
 #include <atomic>
 #include <cstddef>
@@ -13,6 +14,14 @@ namespace dxmt::d3d12 {
 
 class DescriptorHeap;
 class DescriptorHeapMirror;
+
+} // namespace dxmt::d3d12
+
+namespace dxmt {
+class Sampler;
+}
+
+namespace dxmt::d3d12 {
 
 /**
  * Whether the bindless-mirror path (Stage-1) is enabled (env DXMT_BINDLESS_MIRROR).
@@ -48,6 +57,10 @@ struct DescriptorRecord {
   DescriptorHeapMirror *mirror = nullptr;
   Com<ID3D12Resource> resource;
   Com<ID3D12Resource> counter_resource;
+  // Descriptor-write-time sampler materialization stores resource IDs in the
+  // mirror buffer, but those IDs are only valid while the Metal sampler objects
+  // remain alive. Keep the object with the descriptor slot until overwritten.
+  Rc<dxmt::Sampler> materialized_sampler;
   union {
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv;

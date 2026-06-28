@@ -1075,16 +1075,20 @@ MarkDescriptorMirrorStaleForWrite(const DescriptorRecord &record) {
 
 static void
 MaterializeSamplerMirrorForWrite(WMT::Device device,
-                                 const DescriptorRecord &record) {
+                                 DescriptorRecord &record) {
   if (!record.mirror || !record.mirror->isSamplerHeap())
     return;
-  if (record.type != DescriptorRecordType::Sampler || !record.has_desc)
+  if (record.type != DescriptorRecordType::Sampler || !record.has_desc) {
+    record.materialized_sampler = nullptr;
     return;
+  }
 
   auto sampler = CreateD3D12Sampler(device, record.desc.sampler);
   if (!sampler)
     return;
-  record.mirror->FillSamplerSlot(record.heap_index, sampler.ptr(), 0);
+  record.materialized_sampler = std::move(sampler);
+  record.mirror->FillSamplerSlot(record.heap_index,
+                                 record.materialized_sampler.ptr(), 0);
 }
 
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
