@@ -7356,7 +7356,8 @@ private:
   }
 
   std::shared_ptr<GraphicsBindlessReplayState>
-  BuildCompiledGraphicsReplayState(const CompiledGraphicsPacket &packet) {
+  BuildCompiledGraphicsReplayState(const CompiledGraphicsPacket &packet,
+                                   bool build_fingerprint = true) {
     auto copy = std::make_shared<GraphicsBindlessReplayState>();
     copy->pipeline_state = packet.pipeline.pipeline_state;
     copy->graphics_root_signature = packet.pipeline.root_signature;
@@ -7419,8 +7420,9 @@ private:
 
     copy->current_record_d3d_sequence = packet.d3d_sequence;
     copy->graphics_binding_generation = packet.record_index + 1;
-    copy->bindless_replay_content_fingerprint =
-        HashGraphicsBindlessReplayStateFull(*copy);
+    if (build_fingerprint)
+      copy->bindless_replay_content_fingerprint =
+          HashGraphicsBindlessReplayStateFull(*copy);
     return copy;
   }
 
@@ -7825,11 +7827,10 @@ private:
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.bindless_replay_state =
-                BuildCompiledGraphicsReplayState(packet);
+                BuildCompiledGraphicsReplayState(packet, false);
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
-            FinalizeReplayDrawBindingFingerprint(replay_packet.common);
             replay_packet.common.primitive = primitive;
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
@@ -7845,8 +7846,6 @@ private:
                 packet.draw->start_instance_location;
             CompiledDirectDrawPayload payload = {};
             payload.draw = std::move(replay_packet);
-            payload.compiled = packet;
-            payload.binding_state = binding_state;
             payload.direct_access = direct_access;
             RegisterCompiledDirectAccessList(payload.direct_access);
             ReleaseCompiledDirectAccessListAfterSubmit(payload.direct_access);
@@ -7936,11 +7935,10 @@ private:
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.bindless_replay_state =
-                BuildCompiledGraphicsReplayState(packet);
+                BuildCompiledGraphicsReplayState(packet, false);
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
-            FinalizeReplayDrawBindingFingerprint(replay_packet.common);
             replay_packet.common.primitive = primitive;
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
@@ -7968,8 +7966,6 @@ private:
                 packet.draw_indexed->start_instance_location;
             CompiledDirectIndexedDrawPayload payload = {};
             payload.draw = std::move(replay_packet);
-            payload.compiled = packet;
-            payload.binding_state = binding_state;
             payload.direct_access = direct_access;
             if (index_allocation) {
               bool found_index = false;
@@ -15798,14 +15794,10 @@ private:
     return bindings;
   }
 
-  template <PipelineStage Stage>
-  void EncodeCompiledShaderBindingsForStage(
-      ArgumentEncodingContext &enc,
-      const std::vector<CompiledCommandRootDescriptorTable> &tables,
-      const CompiledPacketBindingState &binding_state,
-      const PipelineState &pipeline, const RootSignature &root,
-      const PipelineDxilShader &shader, const std::string &shader_key,
-      bool compute, uint64_t &argbuf_offset) {
+  void EncodeCompiledRootPayloads(ArgumentEncodingContext &enc,
+                                  const CompiledPacketBindingState &binding_state,
+                                  const PipelineState &pipeline,
+                                  const RootSignature &root, bool compute) {
     const auto parameters = root.GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
@@ -15827,7 +15819,16 @@ private:
                                    DescriptorRecordType::UnorderedAccessView);
       }
     }
+  }
 
+  template <PipelineStage Stage>
+  void EncodeCompiledShaderBindingsForStage(
+      ArgumentEncodingContext &enc,
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      const PipelineState &pipeline, const RootSignature &root,
+      const PipelineDxilShader &shader, const std::string &shader_key,
+      bool compute, uint64_t &argbuf_offset,
+      BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto &reflection = shader.reflection();
     auto bindings = BuildCompiledBindlessBufferTableBindings(
         tables, pipeline, root, Stage, compute);
@@ -15836,6 +15837,11 @@ private:
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
         DiagCurrentReplayRecordSerial(), &bindings_view);
+    if (draw_diag)
+      AddBindlessMirrorDiagBufTable(
+          *draw_diag, Stage, shader.constantBufferInfo(),
+          reflection.NumConstantBuffers, shader.resourceArgumentInfo(),
+          reflection.NumArguments, bt);
     BindlessMirrorWindow window = {};
     auto root_offsets = BuildCompiledBindlessRootOffsets(
         enc, tables, pipeline, root, Stage, compute, &window);
@@ -15881,22 +15887,29 @@ private:
       ArgumentEncodingContext &enc, const CompiledGraphicsPacket &packet,
       const CompiledPacketBindingState &binding_state,
       PipelineState &pipeline, RootSignature &root,
-      uint64_t &argbuf_offset) {
+      uint64_t &argbuf_offset,
+      BindlessMirrorDrawDiag *draw_diag = nullptr) {
+    BindlessMirrorDrawDiag local_diag = {};
+    BindlessMirrorDrawDiag &diag = draw_diag ? *draw_diag : local_diag;
+    diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
+    diag.bindless_bound = diag.uses_bindless_mirror;
+    diag.path = "compiled-direct";
     EncodeCompiledArgumentTables(enc, packet.root_tables, false,
                                  WMTRenderStageVertex |
                                      WMTRenderStageFragment);
     EncodeCompiledVertexBuffers(enc, packet, pipeline.GetGraphicsState(),
                                 argbuf_offset);
+    EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, false);
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Vertex) {
         EncodeCompiledShaderBindingsForStage<PipelineStage::Vertex>(
-            enc, packet.root_tables, binding_state, pipeline, root, shader, key,
-            false, argbuf_offset);
+            enc, packet.root_tables, pipeline, root, shader, key,
+            false, argbuf_offset, &diag);
       } else if (shader.stage == PipelineShaderStage::Pixel) {
         EncodeCompiledShaderBindingsForStage<PipelineStage::Pixel>(
-            enc, packet.root_tables, binding_state, pipeline, root, shader, key,
-            false, argbuf_offset);
+            enc, packet.root_tables, pipeline, root, shader, key,
+            false, argbuf_offset, &diag);
       }
     }
   }
@@ -15998,12 +16011,13 @@ private:
       uint64_t &argbuf_offset) {
     EncodeCompiledArgumentTables(enc, packet.root_tables, true, {});
     RecordBindlessMirrorDiagDispatch();
+    EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, true);
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage != PipelineShaderStage::Compute)
         continue;
       EncodeCompiledShaderBindingsForStage<PipelineStage::Compute>(
-          enc, packet.root_tables, binding_state, pipeline, root, shader, key,
+          enc, packet.root_tables, pipeline, root, shader, key,
           true, argbuf_offset);
     }
   }
@@ -17444,15 +17458,11 @@ private:
 
   struct CompiledDirectDrawPayload {
     ReplayDrawInstancedPacket draw;
-    CompiledGraphicsPacket compiled;
-    CompiledPacketBindingState binding_state;
     CompiledDirectAccessList direct_access;
   };
 
   struct CompiledDirectIndexedDrawPayload {
     ReplayDrawIndexedInstancedPacket draw;
-    CompiledGraphicsPacket compiled;
-    CompiledPacketBindingState binding_state;
     CompiledDirectAccessList direct_access;
   };
 
