@@ -3068,6 +3068,24 @@ FillBindlessTextureBufferMirrorSlotForStage(
       slot, view.gpu_resource_id,
       (uint64_t(slice.elementCount) << 32) |
           uint64_t(slice.firstElement + suballocation_offset));
+  DescriptorResidencyTarget target = {};
+  auto texture_allocation = view.texture ? WMT::Resource{view.texture.handle}
+                                         : WMT::Resource{};
+  if (texture_allocation)
+    target.allocation = texture_allocation;
+  auto previous = mirror.ReplaceResidencyTarget(slot, std::move(target));
+  if (texture_allocation)
+    enc.queue().AddPersistentResidency(texture_allocation);
+  if (previous.allocation)
+    enc.queue().RemovePersistentResidencyAfterCompletion(previous.allocation);
+  if (previous.secondary_allocation)
+    enc.queue().RemovePersistentResidencyAfterCompletion(
+        previous.secondary_allocation);
+  if (previous.sampler)
+    enc.queue().RetainUntilGpuComplete(
+        [sampler = std::move(previous.sampler)]() mutable {
+          sampler = nullptr;
+        });
 }
 
 static void
@@ -4226,6 +4244,7 @@ public:
 
       if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
         op.command_records.emplace_back(state->GetCommandRecords());
+        op.compiled_command_lists.emplace_back(state->GetCompiledCommands());
       }
     }
 
@@ -5329,6 +5348,30 @@ private:
     uint64_t bindless = 0;
   };
 
+  struct CompiledRootConstantsSlot {
+    bool valid = false;
+    UINT dst_offset = 0;
+    std::vector<UINT> values;
+  };
+
+  struct CompiledRootDescriptorSlot {
+    bool valid = false;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+  };
+
+  struct CompiledPacketBindingState {
+    static constexpr UINT kMaxRootParameters = 64;
+    std::array<CompiledRootConstantsSlot, kMaxRootParameters> root_constants =
+        {};
+    std::array<CompiledRootDescriptorSlot, kMaxRootParameters> cbv_roots = {};
+    std::array<CompiledRootDescriptorSlot, kMaxRootParameters> srv_roots = {};
+    std::array<CompiledRootDescriptorSlot, kMaxRootParameters> uav_roots = {};
+  };
+
+  struct CompiledDirectAccessList {
+    std::vector<Rc<BufferAllocation>> buffer_allocations;
+  };
+
   struct ReplayComputePassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
     uint64_t d3d_sequence = 0;
@@ -6120,6 +6163,26 @@ private:
       batch.plan = BuildReplayGraphicsPassPlan(batch.commands,
                                                batch.argument_buffer_size);
       if (auto *stats = dxmt::perf::currentFrameStatistics()) {
+        dxmt::perf::recordCompiledPassBuildTime(stats,
+                                                clock::now() - _rbplan.t0);
+        dxmt::perf::recordCompiledGraphicsPackets(
+            stats, batch.plan.compiled_candidate_count);
+        const auto legacy_other_count =
+            batch.plan.compiled_legacy_count -
+            batch.plan.compiled_gs_ts_count -
+            batch.plan.compiled_indirect_count;
+        dxmt::perf::recordFallbackGraphicsPackets(
+            stats, legacy_other_count,
+            dxmt::CompiledFallbackReason::LegacyPath);
+        dxmt::perf::recordFallbackGraphicsPackets(
+            stats, batch.plan.compiled_barrier_count,
+            dxmt::CompiledFallbackReason::ResourceBarrier);
+        dxmt::perf::recordFallbackGraphicsPackets(
+            stats, batch.plan.compiled_gs_ts_count,
+            dxmt::CompiledFallbackReason::GeometryOrTessellation);
+        dxmt::perf::recordFallbackGraphicsPackets(
+            stats, batch.plan.compiled_indirect_count,
+            dxmt::CompiledFallbackReason::Indirect);
         stats->frame_replay_compiled_graphics_candidates +=
             batch.plan.compiled_candidate_count;
         stats->frame_replay_compiled_graphics_legacy +=
@@ -6157,8 +6220,16 @@ private:
         }
         uint64_t argbuf_offset = command.argument_buffer_offset;
         if (command.compiled_encode) {
+          const bool compiled_encode_perf = dxmt::perf::enabled();
+          const auto compiled_encode_begin =
+              compiled_encode_perf ? clock::now() : clock::time_point{};
           command.compiled_encode(this, enc, command.compiled_payload.get(),
                                   argbuf_offset);
+          if (compiled_encode_perf) {
+            dxmt::perf::recordCompiledDrawEncodeTime(
+                &enc.currentFrameStatistics(),
+                clock::now() - compiled_encode_begin);
+          }
         } else {
           command.encode(enc, argbuf_offset);
         }
@@ -7284,6 +7355,75 @@ private:
     return h;
   }
 
+  std::shared_ptr<GraphicsBindlessReplayState>
+  BuildCompiledGraphicsReplayState(const CompiledGraphicsPacket &packet) {
+    auto copy = std::make_shared<GraphicsBindlessReplayState>();
+    copy->pipeline_state = packet.pipeline.pipeline_state;
+    copy->graphics_root_signature = packet.pipeline.root_signature;
+    copy->graphics_root_signature_impl =
+        GetRootSignature(packet.pipeline.root_signature.ptr());
+    copy->cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
+    copy->sampler_heap = packet.descriptor_heaps.sampler;
+
+    for (const auto &table : packet.root_tables) {
+      if (table.root_parameter_index < copy->graphics_tables.size())
+        copy->graphics_tables[table.root_parameter_index] =
+            table.base_descriptor;
+    }
+
+    for (const auto &constants : packet.root_constants) {
+      if (constants.root_parameter_index >=
+          copy->graphics_root_constants.size())
+        continue;
+      auto &slot = copy->graphics_root_constants[constants.root_parameter_index];
+      slot.valid = true;
+      const auto required_size =
+          constants.dst_offset + static_cast<UINT>(constants.values.size());
+      if (slot.values.size() < required_size)
+        slot.values.resize(required_size, 0);
+      std::copy(constants.values.begin(), constants.values.end(),
+                slot.values.begin() + constants.dst_offset);
+    }
+
+    for (const auto &descriptor : packet.root_descriptors) {
+      if (descriptor.root_parameter_index >= copy->graphics_cbv_roots.size())
+        continue;
+      auto *slot = descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV
+                       ? &copy->graphics_cbv_roots[descriptor.root_parameter_index]
+                       : descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
+                             ? &copy->graphics_srv_roots[descriptor.root_parameter_index]
+                             : &copy->graphics_uav_roots[descriptor.root_parameter_index];
+      slot->valid = true;
+      slot->address = descriptor.address;
+    }
+
+    for (const auto &vb : packet.input_assembler.vertex_buffers) {
+      if (vb.slot >= copy->vertex_buffers.size())
+        continue;
+      copy->vertex_buffers[vb.slot] = vb.view;
+
+      ResolvedReplayVertexBuffer resolved = {};
+      resolved.address = vb.view.BufferLocation;
+      Resource *resource = nullptr;
+      const auto resource_offset =
+          ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
+      if (resource && resource->GetBuffer()) {
+        resolved.valid = true;
+        resolved.binding_offset = resource->GetHeapOffset() + resource_offset;
+        resolved.d3d_resource = resource->GetD3D12Resource();
+        resolved.resource = resource;
+        resolved.buffer = resource->GetBuffer();
+      }
+      copy->resolved_vertex_buffers[vb.slot] = std::move(resolved);
+    }
+
+    copy->current_record_d3d_sequence = packet.d3d_sequence;
+    copy->graphics_binding_generation = packet.record_index + 1;
+    copy->bindless_replay_content_fingerprint =
+        HashGraphicsBindlessReplayStateFull(*copy);
+    return copy;
+  }
+
   static void RecordReplayBindingSignaturePerf(const ReplayState &state) {
     if (!ReplayPerfEnabled())
       return;
@@ -7448,6 +7588,7 @@ private:
   }
 
   void ReplayCommandRecords(const std::vector<CommandRecord> &records,
+                            const CompiledCommandList *compiled,
                             std::vector<Com<ID3D12Resource>> &touched_resources,
                             std::unordered_set<ID3D12Resource *> &touched_resources_set) {
     auto &queue = device_->GetDXMTDevice().queue();
@@ -7585,38 +7726,462 @@ private:
       chunk = queue.CurrentChunk();
       record_index++;
     };
-    // SUBSTEP 1b (intra-pass parallel scaffold): replay a maximal graphics-pass
-    // run as a unit. Still SERIAL here — behavior is identical to the old
-    // per-record loop (gate on or off). SUBSTEP 2 will hand each run to parallel
-    // workers; this step only establishes the run boundary + dispatch shape.
-    for (UINT i = 0; i < records.size();) {
-      if (superseded_state_record_mask[i]) {
-        if (replay_perf)
-          perDrawSubTimers().supersededStateRecordsSkipped++;
-        record_index++;
-        i++;
-        continue;
-      }
-      if (IntraPassParallelEnabled() && IsGraphicsPassRunRecord(records[i])) {
-        UINT j = i;
-        while (j < records.size() && IsGraphicsPassRunRecord(records[j]))
-          ++j;
-        if (j - i >= 8) {
-          for (UINT k = i; k < j; ++k) {
-            if (superseded_state_record_mask[k]) {
-              if (replay_perf)
-                perDrawSubTimers().supersededStateRecordsSkipped++;
-              record_index++;
-              continue;
-            }
-            replay_one(records[k]);
-          }
-          i = j;
+    auto replay_range = [&](UINT begin, UINT count) {
+      const UINT end = std::min<UINT>(begin + count,
+                                      static_cast<UINT>(records.size()));
+      for (UINT i = begin; i < end;) {
+        if (superseded_state_record_mask[i]) {
+          if (replay_perf)
+            perDrawSubTimers().supersededStateRecordsSkipped++;
+          record_index++;
+          i++;
           continue;
         }
+        if (IntraPassParallelEnabled() && IsGraphicsPassRunRecord(records[i])) {
+          UINT j = i;
+          while (j < end && IsGraphicsPassRunRecord(records[j]))
+            ++j;
+          if (j - i >= 8) {
+            for (UINT k = i; k < j; ++k) {
+              if (superseded_state_record_mask[k]) {
+                if (replay_perf)
+                  perDrawSubTimers().supersededStateRecordsSkipped++;
+                record_index++;
+                continue;
+              }
+              replay_one(records[k]);
+            }
+            i = j;
+            continue;
+          }
+        }
+        replay_one(records[i]);
+        ++i;
       }
-      replay_one(records[i]);
-      ++i;
+    };
+
+    auto queue_compiled_graphics_packet =
+        [&](const CompiledGraphicsPacket &packet) -> bool {
+          if (!packet.draw && !packet.draw_indexed)
+            return false;
+          DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
+                                                  ++replay_record_serial);
+          if (packet.d3d_sequence != 0)
+            dxmt::apitrace::set_current_d3d_sequence(packet.d3d_sequence);
+          auto *pipeline = packet.pipeline.metadata.pipeline;
+          if (!pipeline)
+            pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
+          auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
+          if (!pipeline || !root)
+            return false;
+          auto *metal = packet.pipeline.metadata.metal_graphics;
+          if (!metal || !metal->pso || metal->use_geometry ||
+              metal->use_tessellation)
+            return false;
+          if (packet.render_state.topology == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
+            return false;
+          auto metal_pso =
+              packet.draw_indexed && packet.input_assembler.index_buffer
+                  ? SelectGraphicsPipelineState(
+                        *metal, packet.render_state.topology,
+                        packet.input_assembler.index_buffer->Format)
+                  : SelectGraphicsPipelineState(*metal,
+                                                packet.render_state.topology);
+          if (!metal_pso)
+            return false;
+          auto primitive = GetPrimitiveType(packet.render_state.topology);
+          if (!primitive)
+            return false;
+
+          ReplayState attachment_state = {};
+          attachment_state.resource_states = state.resource_states;
+          attachment_state.queue_type = state.queue_type;
+          attachment_state.touched_resources = state.touched_resources;
+          attachment_state.touched_resources_set = state.touched_resources_set;
+          attachment_state.render_targets = packet.render_state.render_targets;
+          attachment_state.depth_stencil = packet.render_state.depth_stencil;
+          auto attachments =
+              BuildRenderPassAttachments(attachment_state,
+                                         pipeline->GetGraphicsState());
+          auto viewports = packet.render_state.viewports;
+          auto scissors = packet.render_state.scissors;
+          if (!ResolveDynamicRasterRects(viewports, scissors,
+                                         "compiled draw"))
+            return false;
+
+          CompiledPacketBindingState binding_state = {};
+          FillCompiledBindingState(binding_state, packet.root_constants,
+                                   packet.root_descriptors);
+          CompiledDirectAccessList direct_access = {};
+          AddCompiledRootDescriptorAccesses(direct_access, binding_state);
+          AddCompiledVertexBufferAccesses(
+              direct_access, packet, pipeline->GetGraphicsState());
+          const auto argument_buffer_size =
+              EstimateGraphicsArgumentBufferSize(*pipeline, false, false);
+          if (packet.draw) {
+            ReplayDrawInstancedPacket replay_packet = {};
+            replay_packet.common.metal_pso = metal_pso;
+            replay_packet.common.depth_stencil = metal->depth_stencil;
+            replay_packet.common.rasterizer = metal->rasterizer;
+            replay_packet.common.pipeline = pipeline;
+            replay_packet.common.bindless_replay_state =
+                BuildCompiledGraphicsReplayState(packet);
+            replay_packet.common.binding_generation = packet.record_index + 1;
+            replay_packet.common.descriptor_content_generation =
+                GetDescriptorContentGeneration();
+            FinalizeReplayDrawBindingFingerprint(replay_packet.common);
+            replay_packet.common.primitive = primitive;
+            replay_packet.common.blend_factor =
+                packet.render_state.blend_factor;
+            replay_packet.common.stencil_ref = packet.render_state.stencil_ref;
+            replay_packet.common.viewports = std::move(viewports);
+            replay_packet.common.scissors = std::move(scissors);
+            replay_packet.common.use_geometry = false;
+            replay_packet.common.use_tessellation = false;
+            replay_packet.vertex_start = packet.draw->start_vertex_location;
+            replay_packet.vertex_count = packet.draw->vertex_count_per_instance;
+            replay_packet.instance_count = packet.draw->instance_count;
+            replay_packet.base_instance =
+                packet.draw->start_instance_location;
+            CompiledDirectDrawPayload payload = {};
+            payload.draw = std::move(replay_packet);
+            payload.compiled = packet;
+            payload.binding_state = binding_state;
+            payload.direct_access = direct_access;
+            RegisterCompiledDirectAccessList(payload.direct_access);
+            ReleaseCompiledDirectAccessListAfterSubmit(payload.direct_access);
+            QueueCompiledGraphicsPassCommand(
+                chunk, state, std::move(attachments), argument_buffer_size,
+                std::move(payload),
+                [](CommandQueueImpl *queue, ArgumentEncodingContext &enc,
+                   void *payload, uint64_t &argbuf_offset) {
+                  auto &data =
+                      *static_cast<CompiledDirectDrawPayload *>(payload);
+                  auto &packet = data.draw;
+                  for (const auto &allocation :
+                       data.direct_access.buffer_allocations)
+                    enc.retainAllocation(allocation.ptr());
+                  queue->EncodeRenderPipelineStateIfChanged(
+                      enc, packet.common.metal_pso);
+                  auto *render_encoder = enc.currentRenderEncoder();
+                  auto &cache = render_encoder->dynamic_state_cache;
+                  const auto stencil_ref_u8 =
+                      static_cast<uint8_t>(packet.common.stencil_ref);
+                  if (packet.common.depth_stencil &&
+                      (!cache.depth_stencil_valid ||
+                       cache.depth_stencil.handle !=
+                           packet.common.depth_stencil.handle ||
+                       cache.stencil_ref != stencil_ref_u8)) {
+                    auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+                    cmd.type = WMTRenderCommandSetDSSO;
+                    cmd.dsso = packet.common.depth_stencil;
+                    cmd.stencil_ref = stencil_ref_u8;
+                    cache.depth_stencil = packet.common.depth_stencil;
+                    cache.stencil_ref = stencil_ref_u8;
+                    cache.depth_stencil_valid = true;
+                  }
+                  if (!cache.rasterizer_valid ||
+                      std::memcmp(&cache.rasterizer,
+                                  &packet.common.rasterizer,
+                                  sizeof(packet.common.rasterizer)) != 0) {
+                    auto &rs =
+                        enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+                    rs = packet.common.rasterizer;
+                    cache.rasterizer = packet.common.rasterizer;
+                    cache.rasterizer_valid = true;
+                  }
+                  if (packet.common.bindless_replay_state &&
+                      packet.common.pipeline) {
+                    BindlessMirrorDrawDiag diag = {};
+                    queue->EncodeGraphicsBindings(
+                        enc, *packet.common.bindless_replay_state,
+                        *packet.common.pipeline, false, false, argbuf_offset,
+                        &diag);
+                    diag.path = "compiled-direct";
+                    packet.common.bindless_diag = diag;
+                  }
+                  EncodeDynamicRenderState(
+                      enc, packet.common.viewports, packet.common.scissors,
+                      packet.common.blend_factor, packet.common.stencil_ref);
+                  enc.resolveRenderPassBarrier();
+                  auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+                  draw.type = WMTRenderCommandDraw;
+                  draw.primitive_type = *packet.common.primitive;
+                  draw.vertex_start = packet.vertex_start;
+                  draw.vertex_count = packet.vertex_count;
+                  draw.instance_count = packet.instance_count;
+                  draw.base_instance = packet.base_instance;
+                  queue->RecordBindlessMirrorDiagDraw(packet.common.pipeline,
+                                                      packet.common.bindless_diag);
+                },
+                false, false, ReplayGraphicsCommandKind::Draw);
+          } else {
+            if (!packet.input_assembler.index_buffer ||
+                !IsSupportedIndexBufferFormat(
+                    packet.input_assembler.index_buffer->Format))
+              return false;
+            Resource *index_resource = nullptr;
+            const auto index_binding_offset = ResolveBufferGpuAddress(
+                packet.input_assembler.index_buffer->BufferLocation,
+                index_resource);
+            if (!index_resource || !index_resource->GetBuffer())
+              return false;
+            Rc<BufferAllocation> index_allocation =
+                index_resource->GetBufferAllocation();
+            if (!index_allocation)
+              return false;
+            ReplayDrawIndexedInstancedPacket replay_packet = {};
+            replay_packet.common.metal_pso = metal_pso;
+            replay_packet.common.depth_stencil = metal->depth_stencil;
+            replay_packet.common.rasterizer = metal->rasterizer;
+            replay_packet.common.pipeline = pipeline;
+            replay_packet.common.bindless_replay_state =
+                BuildCompiledGraphicsReplayState(packet);
+            replay_packet.common.binding_generation = packet.record_index + 1;
+            replay_packet.common.descriptor_content_generation =
+                GetDescriptorContentGeneration();
+            FinalizeReplayDrawBindingFingerprint(replay_packet.common);
+            replay_packet.common.primitive = primitive;
+            replay_packet.common.blend_factor =
+                packet.render_state.blend_factor;
+            replay_packet.common.stencil_ref = packet.render_state.stencil_ref;
+            replay_packet.common.viewports = std::move(viewports);
+            replay_packet.common.scissors = std::move(scissors);
+            replay_packet.common.use_geometry = false;
+            replay_packet.common.use_tessellation = false;
+            replay_packet.index_allocation = index_allocation;
+            replay_packet.index_type =
+                GetIndexType(packet.input_assembler.index_buffer->Format);
+            replay_packet.index_binding_offset = index_binding_offset;
+            replay_packet.index_offset =
+                index_binding_offset +
+                packet.draw_indexed->start_index_location *
+                    GetIndexSize(packet.input_assembler.index_buffer->Format);
+            replay_packet.index_count =
+                packet.draw_indexed->index_count_per_instance;
+            replay_packet.start_index =
+                packet.draw_indexed->start_index_location;
+            replay_packet.instance_count = packet.draw_indexed->instance_count;
+            replay_packet.base_vertex =
+                packet.draw_indexed->base_vertex_location;
+            replay_packet.base_instance =
+                packet.draw_indexed->start_instance_location;
+            CompiledDirectIndexedDrawPayload payload = {};
+            payload.draw = std::move(replay_packet);
+            payload.compiled = packet;
+            payload.binding_state = binding_state;
+            payload.direct_access = direct_access;
+            if (index_allocation) {
+              bool found_index = false;
+              for (const auto &allocation :
+                   payload.direct_access.buffer_allocations) {
+                if (allocation.ptr() == index_allocation.ptr()) {
+                  found_index = true;
+                  break;
+                }
+              }
+              if (!found_index)
+                payload.direct_access.buffer_allocations.push_back(
+                    index_allocation);
+            }
+            RegisterCompiledDirectAccessList(payload.direct_access);
+            ReleaseCompiledDirectAccessListAfterSubmit(payload.direct_access);
+            QueueCompiledGraphicsPassCommand(
+                chunk, state, std::move(attachments), argument_buffer_size,
+                std::move(payload),
+                [](CommandQueueImpl *queue, ArgumentEncodingContext &enc,
+                   void *payload, uint64_t &argbuf_offset) {
+                  auto &data =
+                      *static_cast<CompiledDirectIndexedDrawPayload *>(payload);
+                  auto &packet = data.draw;
+                  for (const auto &allocation :
+                       data.direct_access.buffer_allocations)
+                    enc.retainAllocation(allocation.ptr());
+                  enc.retainAllocation(packet.index_allocation.ptr());
+                  queue->EncodeRenderPipelineStateIfChanged(
+                      enc, packet.common.metal_pso);
+                  auto *render_encoder = enc.currentRenderEncoder();
+                  auto &cache = render_encoder->dynamic_state_cache;
+                  const auto stencil_ref_u8 =
+                      static_cast<uint8_t>(packet.common.stencil_ref);
+                  if (packet.common.depth_stencil &&
+                      (!cache.depth_stencil_valid ||
+                       cache.depth_stencil.handle !=
+                           packet.common.depth_stencil.handle ||
+                       cache.stencil_ref != stencil_ref_u8)) {
+                    auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+                    cmd.type = WMTRenderCommandSetDSSO;
+                    cmd.dsso = packet.common.depth_stencil;
+                    cmd.stencil_ref = stencil_ref_u8;
+                    cache.depth_stencil = packet.common.depth_stencil;
+                    cache.stencil_ref = stencil_ref_u8;
+                    cache.depth_stencil_valid = true;
+                  }
+                  if (!cache.rasterizer_valid ||
+                      std::memcmp(&cache.rasterizer,
+                                  &packet.common.rasterizer,
+                                  sizeof(packet.common.rasterizer)) != 0) {
+                    auto &rs =
+                        enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+                    rs = packet.common.rasterizer;
+                    cache.rasterizer = packet.common.rasterizer;
+                    cache.rasterizer_valid = true;
+                  }
+                  if (packet.common.bindless_replay_state &&
+                      packet.common.pipeline) {
+                    BindlessMirrorDrawDiag diag = {};
+                    queue->EncodeGraphicsBindings(
+                        enc, *packet.common.bindless_replay_state,
+                        *packet.common.pipeline, false, false, argbuf_offset,
+                        &diag);
+                    diag.path = "compiled-direct";
+                    packet.common.bindless_diag = diag;
+                  }
+                  EncodeDynamicRenderState(
+                      enc, packet.common.viewports, packet.common.scissors,
+                      packet.common.blend_factor, packet.common.stencil_ref);
+                  enc.resolveRenderPassBarrier();
+                  auto &draw =
+                      enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
+                  draw.type = WMTRenderCommandDrawIndexed;
+                  draw.primitive_type = *packet.common.primitive;
+                  draw.index_type = packet.index_type;
+                  draw.index_count = packet.index_count;
+                  draw.index_buffer = packet.index_allocation->buffer();
+                  draw.index_buffer_offset = packet.index_offset;
+                  draw.instance_count = packet.instance_count;
+                  draw.base_vertex = packet.base_vertex;
+                  draw.base_instance = packet.base_instance;
+                  queue->RecordBindlessMirrorDiagDraw(packet.common.pipeline,
+                                                      packet.common.bindless_diag);
+                },
+                false, false, ReplayGraphicsCommandKind::DrawIndexed);
+          }
+          chunk = queue.CurrentChunk();
+          return true;
+        };
+
+    auto queue_compiled_compute_packet =
+        [&](const CompiledComputePacket &packet) -> bool {
+          if (!packet.dispatch.x || !packet.dispatch.y || !packet.dispatch.z)
+            return true;
+          DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
+                                                  ++replay_record_serial);
+          if (packet.d3d_sequence != 0)
+            dxmt::apitrace::set_current_d3d_sequence(packet.d3d_sequence);
+          auto *pipeline = packet.pipeline.metadata.pipeline;
+          if (!pipeline)
+            pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
+          auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
+          if (!pipeline || !root)
+            return false;
+          auto *metal = packet.pipeline.metadata.metal_compute;
+          if (!metal || !metal->pso ||
+              !ValidateComputeDispatch(metal->threadgroup_size,
+                                       packet.dispatch.x, packet.dispatch.y,
+                                       packet.dispatch.z))
+            return false;
+          CompiledPacketBindingState binding_state = {};
+          FillCompiledBindingState(binding_state, packet.root_constants,
+                                   packet.root_descriptors);
+          CompiledDirectAccessList direct_access = {};
+          AddCompiledRootDescriptorAccesses(direct_access, binding_state);
+          RegisterCompiledDirectAccessList(direct_access);
+          ReleaseCompiledDirectAccessListAfterSubmit(direct_access);
+          const auto argument_buffer_size =
+              EstimateComputeArgumentBufferSize(*pipeline);
+          QueueComputePassCommand(
+              chunk, state, argument_buffer_size,
+              [this, packet, binding_state, direct_access, pipeline, root,
+               metal_pso = metal->pso,
+               threadgroup_size = metal->threadgroup_size](
+                  ArgumentEncodingContext &enc,
+                  uint64_t &argbuf_offset) mutable {
+                const bool perf_enabled = dxmt::perf::enabled();
+                const auto encode_begin =
+                    perf_enabled ? clock::now() : clock::time_point{};
+                auto &set_pso =
+                    enc.encodeComputeCommand<wmtcmd_compute_setpso>();
+                set_pso.type = WMTComputeCommandSetPSO;
+                set_pso.pso = metal_pso;
+                set_pso.threadgroup_size = threadgroup_size;
+                for (const auto &allocation :
+                     direct_access.buffer_allocations)
+                  enc.retainAllocation(allocation.ptr());
+                EncodeCompiledComputeBindings(enc, packet, binding_state,
+                                              *pipeline, *root,
+                                              argbuf_offset);
+                auto &dispatch =
+                    enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
+                dispatch.type = WMTComputeCommandDispatch;
+                dispatch.size = {packet.dispatch.x, packet.dispatch.y,
+                                 packet.dispatch.z};
+                if (perf_enabled) {
+                  dxmt::perf::recordCompiledDispatchEncodeTime(
+                      &enc.currentFrameStatistics(),
+                      clock::now() - encode_begin);
+                }
+              });
+          chunk = queue.CurrentChunk();
+          return true;
+        };
+
+    auto compiled_list_is_valid = [&]() {
+      if (!compiled || compiled->record_count != records.size())
+        return false;
+      for (const auto &segment : compiled->segments) {
+        if (segment.record_count == 0 ||
+            segment.first_record_index > records.size() ||
+            segment.record_count > records.size() - segment.first_record_index)
+          return false;
+        if (segment.kind == CompiledCommandSegmentKind::Graphics &&
+            segment.first_graphics_packet + segment.graphics_packet_count >
+                compiled->graphics_packets.size())
+          return false;
+        if (segment.kind == CompiledCommandSegmentKind::Compute &&
+            segment.first_compute_packet + segment.compute_packet_count >
+                compiled->compute_packets.size())
+          return false;
+      }
+      return true;
+    };
+
+    if (compiled_list_is_valid() && !compiled->segments.empty()) {
+      for (const auto &segment : compiled->segments) {
+        record_index = segment.first_record_index;
+        switch (segment.kind) {
+        case CompiledCommandSegmentKind::Graphics:
+          for (UINT i = 0; i < segment.graphics_packet_count; i++) {
+            const auto &packet =
+                compiled->graphics_packets[segment.first_graphics_packet + i];
+            if (!queue_compiled_graphics_packet(packet)) {
+              if (auto *stats = dxmt::perf::currentFrameStatistics())
+                dxmt::perf::recordFallbackGraphicsPackets(
+                    stats, 1, dxmt::CompiledFallbackReason::Unknown);
+              replay_range(segment.first_record_index, segment.record_count);
+            }
+          }
+          break;
+        case CompiledCommandSegmentKind::Compute:
+          for (UINT i = 0; i < segment.compute_packet_count; i++) {
+            const auto &packet =
+                compiled->compute_packets[segment.first_compute_packet + i];
+            if (!queue_compiled_compute_packet(packet)) {
+              if (auto *stats = dxmt::perf::currentFrameStatistics())
+                dxmt::perf::recordFallbackComputePackets(
+                    stats, 1, dxmt::CompiledFallbackReason::Unknown);
+              replay_range(segment.first_record_index, segment.record_count);
+            }
+          }
+          break;
+        case CompiledCommandSegmentKind::Fallback:
+        default:
+          replay_range(segment.first_record_index, segment.record_count);
+          break;
+        }
+      }
+    } else {
+      replay_range(0, static_cast<UINT>(records.size()));
     }
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: replay records flush begin"
@@ -7754,6 +8319,8 @@ private:
             timers.descAccessPassthrough;
         stats->frame_replay_superseded_state_records_skipped +=
             timers.supersededStateRecordsSkipped;
+        dxmt::perf::recordStateRecordsElided(
+            stats, timers.supersededStateRecordsSkipped);
         stats->frame_replay_mismatch_barriers += timers.mismatchBarriers;
         stats->frame_replay_app_barrier_transitions +=
             timers.appBarrierTransitions;
@@ -11436,6 +12003,297 @@ private:
     return true;
   }
 
+  static bool
+  MakeShaderResourceBindingFromDescriptor(
+      WMT::Device device, const DescriptorRecord &descriptor,
+      const DXMT12_MTL4_SHADER_ARGUMENT *argument,
+      ResourceViewBinding &binding) {
+    if (descriptor.type != DescriptorRecordType::ShaderResourceView)
+      return false;
+    auto *resource = GetResource(descriptor.resource.ptr());
+    if (!resource)
+      return false;
+
+    binding = {};
+    if (resource->GetBuffer()) {
+      UINT64 offset = 0;
+      if (!ResolveDescriptorBufferOffset(descriptor.resource.ptr(), offset))
+        offset = 0;
+      UINT64 byte_size = resource->GetResourceDesc().Width;
+      const bool needs_texture_buffer_view =
+          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+      BufferSlice slice = DefaultBufferSlice(*resource);
+      uint64_t view_id = 0;
+      bool has_buffer_view = false;
+      if (descriptor.has_desc) {
+        const auto &srv = descriptor.desc.srv;
+        if (srv.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
+          return false;
+        const UINT64 first_element = srv.Buffer.FirstElement;
+        if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+          offset += first_element * sizeof(uint32_t);
+          byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
+          if (needs_texture_buffer_view) {
+            auto view = CreateBufferView(device, *resource, DXGI_FORMAT_R32_UINT,
+                                         offset, byte_size,
+                                         WMTTextureUsageShaderRead);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(*resource, offset, byte_size,
+                                       sizeof(uint32_t));
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          sizeof(uint32_t));
+        } else if (srv.Format != DXGI_FORMAT_UNKNOWN) {
+          MTL_DXGI_FORMAT_DESC format = {};
+          if (FAILED(MTLQueryDXGIFormat(device, srv.Format, format)))
+            return false;
+          offset += first_element * format.BytesPerTexel;
+          byte_size = UINT64(srv.Buffer.NumElements) * format.BytesPerTexel;
+          if (needs_texture_buffer_view) {
+            auto view = CreateBufferView(device, *resource, srv.Format, offset,
+                                         byte_size, WMTTextureUsageShaderRead);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(*resource, offset, byte_size,
+                                       format.BytesPerTexel);
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          format.BytesPerTexel);
+        } else if (srv.Buffer.StructureByteStride) {
+          offset += first_element * srv.Buffer.StructureByteStride;
+          byte_size =
+              UINT64(srv.Buffer.NumElements) * srv.Buffer.StructureByteStride;
+          if (needs_texture_buffer_view) {
+            const auto view_format =
+                UintBufferViewFormatForStride(srv.Buffer.StructureByteStride);
+            if (view_format == DXGI_FORMAT_UNKNOWN)
+              return false;
+            auto view = CreateBufferView(device, *resource, view_format, offset,
+                                         byte_size, WMTTextureUsageShaderRead);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(
+                *resource, offset, byte_size, srv.Buffer.StructureByteStride);
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          srv.Buffer.StructureByteStride);
+        } else {
+          offset += first_element;
+          byte_size = srv.Buffer.NumElements;
+          if (needs_texture_buffer_view) {
+            auto view = CreateBufferView(device, *resource, DXGI_FORMAT_R32_UINT,
+                                         offset, byte_size,
+                                         WMTTextureUsageShaderRead);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(*resource, offset, byte_size,
+                                       sizeof(uint32_t));
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = DefaultBufferSlice(*resource, offset, byte_size);
+        }
+      } else if (needs_texture_buffer_view) {
+        auto view = CreateBufferView(device, *resource, DXGI_FORMAT_R32_UINT,
+                                     offset, byte_size,
+                                     WMTTextureUsageShaderRead);
+        if (!view)
+          return false;
+        view_id = view->key;
+        has_buffer_view = true;
+        slice = TextureBufferSlice(*resource, offset, byte_size,
+                                   sizeof(uint32_t));
+        slice.firstElement += view->firstElementBias;
+      }
+      binding.viewId = view_id;
+      binding.buffer = Rc<Buffer>(resource->GetBuffer());
+      binding.slice = slice;
+      return true;
+    }
+
+    if (resource->GetTexture()) {
+      if (descriptor.has_desc &&
+          descriptor.desc.srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+        return false;
+      if (resource->IsReservedTexture() &&
+          !resource->EnsureTextureAllocation("MakeShaderResourceBinding"))
+        return false;
+      const auto view =
+          CreateShaderResourceTextureView(device, *resource, descriptor);
+      if (!view || !view.texture.ptr())
+        return false;
+      binding.texture = std::move(view.texture);
+      binding.viewId = view.view;
+      return true;
+    }
+
+    return false;
+  }
+
+  static bool
+  MakeUnorderedAccessBindingFromDescriptor(
+      WMT::Device device, const DescriptorRecord &descriptor,
+      const DXMT12_MTL4_SHADER_ARGUMENT *argument,
+      UnorderedAccessViewBinding &binding) {
+    if (descriptor.type != DescriptorRecordType::UnorderedAccessView)
+      return false;
+    auto *resource = GetResource(descriptor.resource.ptr());
+    if (!resource)
+      return false;
+
+    binding = {};
+    if (auto *counter_resource = GetResource(descriptor.counter_resource.ptr())) {
+      if (counter_resource->GetBuffer())
+        binding.counter = Rc<Buffer>(counter_resource->GetBuffer());
+    }
+
+    if (resource->GetBuffer()) {
+      UINT64 offset = 0;
+      if (!ResolveDescriptorBufferOffset(descriptor.resource.ptr(), offset))
+        offset = 0;
+      UINT64 byte_size = resource->GetResourceDesc().Width;
+      const bool needs_texture_buffer_view =
+          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+      BufferSlice slice = DefaultBufferSlice(*resource);
+      uint64_t view_id = 0;
+      bool has_buffer_view = false;
+      if (descriptor.has_desc) {
+        const auto &uav = descriptor.desc.uav;
+        if (uav.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+          return false;
+        const UINT64 first_element = uav.Buffer.FirstElement;
+        if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+          offset += first_element * sizeof(uint32_t);
+          byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
+          if (needs_texture_buffer_view) {
+            auto view = CreateBufferView(
+                device, *resource, DXGI_FORMAT_R32_UINT, offset, byte_size,
+                WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(*resource, offset, byte_size,
+                                       sizeof(uint32_t));
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          sizeof(uint32_t));
+        } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
+          MTL_DXGI_FORMAT_DESC format = {};
+          if (FAILED(MTLQueryDXGIFormat(device, uav.Format, format)))
+            return false;
+          offset += first_element * format.BytesPerTexel;
+          byte_size = UINT64(uav.Buffer.NumElements) * format.BytesPerTexel;
+          if (needs_texture_buffer_view) {
+            auto view = CreateBufferView(
+                device, *resource, uav.Format, offset, byte_size,
+                WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(*resource, offset, byte_size,
+                                       format.BytesPerTexel);
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          format.BytesPerTexel);
+        } else if (uav.Buffer.StructureByteStride) {
+          offset += first_element * uav.Buffer.StructureByteStride;
+          byte_size =
+              UINT64(uav.Buffer.NumElements) * uav.Buffer.StructureByteStride;
+          if (needs_texture_buffer_view) {
+            const auto view_format =
+                UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
+            if (view_format == DXGI_FORMAT_UNKNOWN)
+              return false;
+            auto view = CreateBufferView(
+                device, *resource, view_format, offset, byte_size,
+                WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(
+                *resource, offset, byte_size, uav.Buffer.StructureByteStride);
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          uav.Buffer.StructureByteStride);
+        } else {
+          offset += first_element;
+          byte_size = uav.Buffer.NumElements;
+          if (needs_texture_buffer_view) {
+            auto view = CreateBufferView(
+                device, *resource, DXGI_FORMAT_R32_UINT, offset, byte_size,
+                WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+            if (!view)
+              return false;
+            view_id = view->key;
+            has_buffer_view = true;
+            slice = TextureBufferSlice(*resource, offset, byte_size,
+                                       sizeof(uint32_t));
+            slice.firstElement += view->firstElementBias;
+          }
+          if (!has_buffer_view)
+            slice = DefaultBufferSlice(*resource, offset, byte_size);
+        }
+      } else if (needs_texture_buffer_view) {
+        auto view = CreateBufferView(
+            device, *resource, DXGI_FORMAT_R32_UINT, offset, byte_size,
+            WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+        if (!view)
+          return false;
+        view_id = view->key;
+        has_buffer_view = true;
+        slice = TextureBufferSlice(*resource, offset, byte_size,
+                                   sizeof(uint32_t));
+        slice.firstElement += view->firstElementBias;
+      }
+      binding.viewId = view_id;
+      binding.buffer = Rc<Buffer>(resource->GetBuffer());
+      binding.slice = slice;
+      return true;
+    }
+
+    if (resource->GetTexture()) {
+      if (descriptor.has_desc &&
+          descriptor.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        return false;
+      if (resource->IsReservedTexture() &&
+          !resource->EnsureTextureAllocation("MakeUnorderedAccessBinding"))
+        return false;
+      const auto view =
+          CreateUnorderedAccessTextureView(device, *resource, descriptor);
+      if (!view || !view.texture.ptr())
+        return false;
+      binding.texture = std::move(view.texture);
+      binding.viewId = view.view;
+      return true;
+    }
+
+    return false;
+  }
+
   /**
    * Bindless-mirror (sub-step ②/③ seam): resolve a stale descriptor's texture/sampler
    * payload and write it into the persistent mirror, ON THE ENCODE THREAD. This is the
@@ -11559,6 +12417,28 @@ private:
       return;
     }
 
+    auto replace_texture_residency_target =
+        [&](WMT::Resource texture_allocation) {
+          DescriptorResidencyTarget target = {};
+          if (texture_allocation)
+            target.allocation = texture_allocation;
+          auto previous =
+              mirror->ReplaceResidencyTarget(slot, std::move(target));
+          if (texture_allocation)
+            enc.queue().AddPersistentResidency(texture_allocation);
+          if (previous.allocation)
+            enc.queue().RemovePersistentResidencyAfterCompletion(
+                previous.allocation);
+          if (previous.secondary_allocation)
+            enc.queue().RemovePersistentResidencyAfterCompletion(
+                previous.secondary_allocation);
+          if (previous.sampler)
+            enc.queue().RetainUntilGpuComplete(
+                [sampler = std::move(previous.sampler)]() mutable {
+                  sampler = nullptr;
+                });
+        };
+
     if (record.type == DescriptorRecordType::ShaderResourceView) {
       if (resource->GetBuffer()) {
         if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
@@ -11596,6 +12476,7 @@ private:
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
+      replace_texture_residency_target(allocation->texture());
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
     } else if (record.type == DescriptorRecordType::UnorderedAccessView) {
       if (resource->GetBuffer()) {
@@ -11651,6 +12532,7 @@ private:
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
+      replace_texture_residency_target(allocation->texture());
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
     }
   }
@@ -11670,16 +12552,13 @@ private:
                                    const DescriptorRecord &record,
                                    PipelineStage stage,
                                    const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
-    if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
-        record.type == DescriptorRecordType::Sampler) {
+    if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
       FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
       return;
     }
 
-    if ((range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
-         range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) &&
-        (record.type == DescriptorRecordType::ShaderResourceView ||
-         record.type == DescriptorRecordType::UnorderedAccessView)) {
+    if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+        range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
       FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
     }
   }
@@ -11698,235 +12577,54 @@ private:
       return;
     }
 
-    auto *resource = GetResource(descriptor.resource.ptr());
-    if (!resource) {
+    ResourceViewBinding binding = {};
+    if (!MakeShaderResourceBindingFromDescriptor(
+            device_->GetMTLDevice(), descriptor, argument, binding)) {
       ClearShaderResourceBinding(enc, stage, slot);
       return;
     }
 
-    if (resource->GetBuffer()) {
-      UINT64 offset = 0;
-      if (!ResolveDescriptorBufferOffset(descriptor.resource.ptr(), offset))
-        offset = 0;
-      UINT64 byte_size = resource->GetResourceDesc().Width;
-      uint64_t view_id = 0;
-      bool has_buffer_view = false;
-      const bool needs_texture_buffer_view =
-          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
-      BufferSlice slice = DefaultBufferSlice(*resource);
-      if (descriptor.has_desc) {
-        const auto &srv = descriptor.desc.srv;
-        if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-          const UINT64 first_element = srv.Buffer.FirstElement;
-          if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-            offset += first_element * sizeof(uint32_t);
-            byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
-            if (needs_texture_buffer_view) {
-              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           DXGI_FORMAT_R32_UINT, offset,
-                                           byte_size,
-                                           WMTTextureUsageShaderRead);
-              if (view) {
-                view_id = view->key;
-                has_buffer_view = true;
-                slice = TextureBufferSlice(*resource, offset, byte_size,
-                                           sizeof(uint32_t));
-                slice.firstElement += view->firstElementBias;
-              } else {
-                WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
-                                                 sizeof(uint32_t), offset,
-                                                 byte_size);
-                ClearShaderResourceBinding(enc, stage, slot);
-                return;
-              }
-            }
-            if (!has_buffer_view)
-              slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                            sizeof(uint32_t));
-          } else if (srv.Format != DXGI_FORMAT_UNKNOWN) {
-            MTL_DXGI_FORMAT_DESC format = {};
-            if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
-                                             srv.Format, format))) {
-              offset += first_element * format.BytesPerTexel;
-              byte_size = UINT64(srv.Buffer.NumElements) *
-                          format.BytesPerTexel;
-              if (needs_texture_buffer_view) {
-                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                             srv.Format, offset, byte_size,
-                                             WMTTextureUsageShaderRead);
-                if (view) {
-                  view_id = view->key;
-                  has_buffer_view = true;
-                  slice = TextureBufferSlice(*resource, offset, byte_size,
-                                             format.BytesPerTexel);
-                  slice.firstElement += view->firstElementBias;
-                } else {
-                  // TODO(d3d12): typed buffer SRV shaders that reflect as
-                  // texture arguments need a real typed Metal texture-buffer
-                  // view. Binding the raw buffer here is semantically wrong
-                  // and can make argument encoding dereference a missing view.
-                  WarnTextureBufferViewUnavailable("SRV", srv.Format,
-                                                   format.BytesPerTexel,
-                                                   offset, byte_size);
-                  ClearShaderResourceBinding(enc, stage, slot);
-                  return;
-                }
-              }
-              if (!has_buffer_view)
-                slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                              format.BytesPerTexel);
-            } else {
-              WARN("D3D12CommandQueue: typed buffer SRV uses unsupported format ",
-                   uint32_t(srv.Format));
-              return;
-            }
-          } else if (srv.Buffer.StructureByteStride) {
-            offset += first_element * srv.Buffer.StructureByteStride;
-            byte_size = UINT64(srv.Buffer.NumElements) *
-                        srv.Buffer.StructureByteStride;
-            if (needs_texture_buffer_view) {
-              const auto view_format =
-                  UintBufferViewFormatForStride(srv.Buffer.StructureByteStride);
-              if (view_format != DXGI_FORMAT_UNKNOWN) {
-                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                             view_format, offset, byte_size,
-                                             WMTTextureUsageShaderRead);
-                if (view) {
-                  view_id = view->key;
-                  has_buffer_view = true;
-                  slice = TextureBufferSlice(
-                      *resource, offset, byte_size,
-                      srv.Buffer.StructureByteStride);
-                  slice.firstElement += view->firstElementBias;
-                } else {
-                  WarnTextureBufferViewUnavailable(
-                      "SRV", view_format, srv.Buffer.StructureByteStride,
-                      offset, byte_size);
-                  ClearShaderResourceBinding(enc, stage, slot);
-                  return;
-                }
-              } else {
-                // TODO(d3d12): Metal texture-buffer reflection for structured
-                // buffers with uncommon strides needs either shader lowering
-                // or a compatible packed view format.
-                WarnTextureBufferViewUnavailable(
-                    "SRV", view_format, srv.Buffer.StructureByteStride,
-                    offset, byte_size);
-                ClearShaderResourceBinding(enc, stage, slot);
-                return;
-              }
-            }
-            if (!has_buffer_view)
-              slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                            srv.Buffer.StructureByteStride);
-          } else {
-            offset += first_element;
-            byte_size = srv.Buffer.NumElements;
-            if (needs_texture_buffer_view) {
-              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           DXGI_FORMAT_R32_UINT, offset,
-                                           byte_size,
-                                           WMTTextureUsageShaderRead);
-              if (view) {
-                view_id = view->key;
-                has_buffer_view = true;
-                slice = TextureBufferSlice(*resource, offset, byte_size,
-                                           sizeof(uint32_t));
-                slice.firstElement += view->firstElementBias;
-              } else {
-                WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
-                                                 sizeof(uint32_t), offset,
-                                                 byte_size);
-                ClearShaderResourceBinding(enc, stage, slot);
-                return;
-              }
-            }
-            if (!has_buffer_view)
-              slice = DefaultBufferSlice(*resource, offset, byte_size);
-          }
-        } else {
-          WARN("D3D12CommandQueue: buffer SRV has unsupported view dimension ",
-               uint32_t(srv.ViewDimension));
-          ClearShaderResourceBinding(enc, stage, slot);
-          return;
-        }
-      } else if (needs_texture_buffer_view) {
-        auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                     DXGI_FORMAT_R32_UINT, offset, byte_size,
-                                     WMTTextureUsageShaderRead);
-        if (view) {
-          view_id = view->key;
-          has_buffer_view = true;
-          slice = TextureBufferSlice(*resource, offset, byte_size,
-                                     sizeof(uint32_t));
-          slice.firstElement += view->firstElementBias;
-        } else {
-          WarnTextureBufferViewUnavailable("SRV", DXGI_FORMAT_R32_UINT,
-                                           sizeof(uint32_t), offset, byte_size);
-          ClearShaderResourceBinding(enc, stage, slot);
-          return;
-        }
-      }
-      auto buffer = Rc<Buffer>(resource->GetBuffer());
+    if (binding.buffer.ptr()) {
       if (stage == PipelineStage::Compute)
-        enc.bindBuffer<PipelineStage::Compute>(slot, std::move(buffer),
-                                               view_id, slice);
+        enc.bindBuffer<PipelineStage::Compute>(
+            slot, std::move(binding.buffer), binding.viewId, binding.slice);
       else if (stage == PipelineStage::Pixel)
-        enc.bindBuffer<PipelineStage::Pixel>(slot, std::move(buffer),
-                                             view_id, slice);
+        enc.bindBuffer<PipelineStage::Pixel>(
+            slot, std::move(binding.buffer), binding.viewId, binding.slice);
       else if (stage == PipelineStage::Geometry)
-        enc.bindBuffer<PipelineStage::Geometry>(slot, std::move(buffer),
-                                                view_id, slice);
+        enc.bindBuffer<PipelineStage::Geometry>(
+            slot, std::move(binding.buffer), binding.viewId, binding.slice);
       else if (stage == PipelineStage::Hull)
-        enc.bindBuffer<PipelineStage::Hull>(slot, std::move(buffer),
-                                            view_id, slice);
+        enc.bindBuffer<PipelineStage::Hull>(
+            slot, std::move(binding.buffer), binding.viewId, binding.slice);
       else if (stage == PipelineStage::Domain)
-        enc.bindBuffer<PipelineStage::Domain>(slot, std::move(buffer),
-                                              view_id, slice);
+        enc.bindBuffer<PipelineStage::Domain>(
+            slot, std::move(binding.buffer), binding.viewId, binding.slice);
       else
-        enc.bindBuffer<PipelineStage::Vertex>(slot, std::move(buffer),
-                                              view_id, slice);
+        enc.bindBuffer<PipelineStage::Vertex>(
+            slot, std::move(binding.buffer), binding.viewId, binding.slice);
       return;
     }
 
-    if (resource->GetTexture()) {
-      if (descriptor.has_desc &&
-          descriptor.desc.srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-        WARN("D3D12CommandQueue: texture SRV cannot use BUFFER view dimension");
-        ClearShaderResourceBinding(enc, stage, slot);
-        return;
-      }
-      if (resource->IsReservedTexture() &&
-          !resource->EnsureTextureAllocation("BindTextureSRV")) {
-        ClearShaderResourceBinding(enc, stage, slot);
-        return;
-      }
-      const auto view =
-          CreateShaderResourceTextureView(device_->GetMTLDevice(), *resource,
-                                          descriptor);
-      if (!view) {
-        ClearShaderResourceBinding(enc, stage, slot);
-        return;
-      }
-      auto texture = std::move(view.texture);
+    if (binding.texture.ptr()) {
       if (stage == PipelineStage::Compute)
-        enc.bindTexture<PipelineStage::Compute>(slot, std::move(texture),
-                                                view.view);
+        enc.bindTexture<PipelineStage::Compute>(
+            slot, std::move(binding.texture), binding.viewId);
       else if (stage == PipelineStage::Pixel)
-        enc.bindTexture<PipelineStage::Pixel>(slot, std::move(texture),
-                                              view.view);
+        enc.bindTexture<PipelineStage::Pixel>(
+            slot, std::move(binding.texture), binding.viewId);
       else if (stage == PipelineStage::Geometry)
-        enc.bindTexture<PipelineStage::Geometry>(slot, std::move(texture),
-                                                 view.view);
+        enc.bindTexture<PipelineStage::Geometry>(
+            slot, std::move(binding.texture), binding.viewId);
       else if (stage == PipelineStage::Hull)
-        enc.bindTexture<PipelineStage::Hull>(slot, std::move(texture),
-                                             view.view);
+        enc.bindTexture<PipelineStage::Hull>(
+            slot, std::move(binding.texture), binding.viewId);
       else if (stage == PipelineStage::Domain)
-        enc.bindTexture<PipelineStage::Domain>(slot, std::move(texture),
-                                               view.view);
+        enc.bindTexture<PipelineStage::Domain>(
+            slot, std::move(binding.texture), binding.viewId);
       else
-        enc.bindTexture<PipelineStage::Vertex>(slot, std::move(texture),
-                                                view.view);
+        enc.bindTexture<PipelineStage::Vertex>(
+            slot, std::move(binding.texture), binding.viewId);
     }
   }
 
@@ -11944,229 +12642,35 @@ private:
       return;
     }
 
-    auto *resource = GetResource(descriptor.resource.ptr());
-    if (!resource) {
+    UnorderedAccessViewBinding binding = {};
+    if (!MakeUnorderedAccessBindingFromDescriptor(
+            device_->GetMTLDevice(), descriptor, argument, binding)) {
       ClearUnorderedAccessBinding(enc, stage, slot);
       return;
     }
 
-    Rc<Buffer> counter;
-    if (auto *counter_resource = GetResource(descriptor.counter_resource.ptr())) {
-      if (counter_resource->GetBuffer())
-        counter = Rc<Buffer>(counter_resource->GetBuffer());
-      else
-        WARN("D3D12CommandQueue: UAV counter resource must be a buffer");
-    }
-
-    if (resource->GetBuffer()) {
-      UINT64 offset = 0;
-      if (!ResolveDescriptorBufferOffset(descriptor.resource.ptr(), offset))
-        offset = 0;
-      UINT64 byte_size = resource->GetResourceDesc().Width;
-      uint64_t view_id = 0;
-      bool has_buffer_view = false;
-      const bool needs_texture_buffer_view =
-          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
-      BufferSlice slice = DefaultBufferSlice(*resource);
-      if (descriptor.has_desc) {
-        const auto &uav = descriptor.desc.uav;
-        if (uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-          const UINT64 first_element = uav.Buffer.FirstElement;
-          if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
-            offset += first_element * sizeof(uint32_t);
-            byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
-            if (needs_texture_buffer_view) {
-              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           DXGI_FORMAT_R32_UINT, offset,
-                                           byte_size,
-                                           WMTTextureUsageShaderRead |
-                                               WMTTextureUsageShaderWrite);
-              if (view) {
-                view_id = view->key;
-                has_buffer_view = true;
-                slice = TextureBufferSlice(*resource, offset, byte_size,
-                                           sizeof(uint32_t));
-                slice.firstElement += view->firstElementBias;
-              } else {
-                WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
-                                                 sizeof(uint32_t), offset,
-                                                 byte_size);
-                ClearUnorderedAccessBinding(enc, stage, slot);
-                return;
-              }
-            }
-            if (!has_buffer_view)
-              slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                            sizeof(uint32_t));
-          } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
-            MTL_DXGI_FORMAT_DESC format = {};
-            if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
-                                             uav.Format, format))) {
-              offset += first_element * format.BytesPerTexel;
-              byte_size = UINT64(uav.Buffer.NumElements) *
-                          format.BytesPerTexel;
-              if (needs_texture_buffer_view) {
-                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                             uav.Format, offset, byte_size,
-                                             WMTTextureUsageShaderRead |
-                                                 WMTTextureUsageShaderWrite);
-                if (view) {
-                  view_id = view->key;
-                  has_buffer_view = true;
-                  slice = TextureBufferSlice(*resource, offset, byte_size,
-                                             format.BytesPerTexel);
-                  slice.firstElement += view->firstElementBias;
-                } else {
-                  // TODO(d3d12): typed buffer UAV shaders that reflect as
-                  // texture arguments need a real typed Metal texture-buffer
-                  // view. Binding the raw buffer here loses typed UAV
-                  // semantics and can dereference a missing view later.
-                  WarnTextureBufferViewUnavailable("UAV", uav.Format,
-                                                   format.BytesPerTexel,
-                                                   offset, byte_size);
-                  ClearUnorderedAccessBinding(enc, stage, slot);
-                  return;
-                }
-              }
-              if (!has_buffer_view)
-                slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                              format.BytesPerTexel);
-            } else {
-              WARN("D3D12CommandQueue: typed buffer UAV uses unsupported format ",
-                   uint32_t(uav.Format));
-              return;
-            }
-          } else if (uav.Buffer.StructureByteStride) {
-            offset += first_element * uav.Buffer.StructureByteStride;
-            byte_size = UINT64(uav.Buffer.NumElements) *
-                        uav.Buffer.StructureByteStride;
-            if (needs_texture_buffer_view) {
-              const auto view_format =
-                  UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
-              if (view_format != DXGI_FORMAT_UNKNOWN) {
-                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                             view_format, offset, byte_size,
-                                             WMTTextureUsageShaderRead |
-                                                 WMTTextureUsageShaderWrite);
-                if (view) {
-                  view_id = view->key;
-                  has_buffer_view = true;
-                  slice = TextureBufferSlice(
-                      *resource, offset, byte_size,
-                      uav.Buffer.StructureByteStride);
-                  slice.firstElement += view->firstElementBias;
-                } else {
-                  WarnTextureBufferViewUnavailable(
-                      "UAV", view_format, uav.Buffer.StructureByteStride,
-                      offset, byte_size);
-                  ClearUnorderedAccessBinding(enc, stage, slot);
-                  return;
-                }
-              } else {
-                // TODO(d3d12): Metal texture-buffer reflection for structured
-                // buffers with uncommon strides needs either shader lowering
-                // or a compatible packed view format.
-                WarnTextureBufferViewUnavailable(
-                    "UAV", view_format, uav.Buffer.StructureByteStride,
-                    offset, byte_size);
-                ClearUnorderedAccessBinding(enc, stage, slot);
-                return;
-              }
-            }
-            if (!has_buffer_view)
-              slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                            uav.Buffer.StructureByteStride);
-          } else {
-            offset += first_element;
-            byte_size = uav.Buffer.NumElements;
-            if (needs_texture_buffer_view) {
-              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           DXGI_FORMAT_R32_UINT, offset,
-                                           byte_size,
-                                           WMTTextureUsageShaderRead |
-                                               WMTTextureUsageShaderWrite);
-              if (view) {
-                view_id = view->key;
-                has_buffer_view = true;
-                slice = TextureBufferSlice(*resource, offset, byte_size,
-                                           sizeof(uint32_t));
-                slice.firstElement += view->firstElementBias;
-              } else {
-                WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
-                                                 sizeof(uint32_t), offset,
-                                                 byte_size);
-                ClearUnorderedAccessBinding(enc, stage, slot);
-                return;
-              }
-            }
-            if (!has_buffer_view)
-              slice = DefaultBufferSlice(*resource, offset, byte_size);
-          }
-        } else {
-          WARN("D3D12CommandQueue: buffer UAV has unsupported view dimension ",
-               uint32_t(uav.ViewDimension));
-          ClearUnorderedAccessBinding(enc, stage, slot);
-          return;
-        }
-      } else if (needs_texture_buffer_view) {
-        auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                     DXGI_FORMAT_R32_UINT, offset, byte_size,
-                                     WMTTextureUsageShaderRead |
-                                         WMTTextureUsageShaderWrite);
-        if (view) {
-          view_id = view->key;
-          has_buffer_view = true;
-          slice = TextureBufferSlice(*resource, offset, byte_size,
-                                     sizeof(uint32_t));
-          slice.firstElement += view->firstElementBias;
-        } else {
-          WarnTextureBufferViewUnavailable("UAV", DXGI_FORMAT_R32_UINT,
-                                           sizeof(uint32_t), offset, byte_size);
-          ClearUnorderedAccessBinding(enc, stage, slot);
-          return;
-        }
-      }
-      auto buffer = Rc<Buffer>(resource->GetBuffer());
+    if (binding.buffer.ptr()) {
       if (stage == PipelineStage::Compute)
         enc.bindOutputBuffer<PipelineStage::Compute>(
-            slot, std::move(buffer), view_id, std::move(counter), slice);
+            slot, std::move(binding.buffer), binding.viewId,
+            std::move(binding.counter), binding.slice);
       else if (stage == PipelineStage::Pixel)
         enc.bindOutputBuffer<PipelineStage::Pixel>(
-            slot, std::move(buffer), view_id, std::move(counter), slice);
+            slot, std::move(binding.buffer), binding.viewId,
+            std::move(binding.counter), binding.slice);
       else
         WARN("D3D12CommandQueue: UAV binding for ", PipelineStageName(stage),
              " stage is unsupported");
       return;
     }
 
-    if (resource->GetTexture()) {
-      if (descriptor.has_desc &&
-          descriptor.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        WARN("D3D12CommandQueue: texture UAV cannot use BUFFER view dimension");
-        ClearUnorderedAccessBinding(enc, stage, slot);
-        return;
-      }
-      if (resource->IsReservedTexture() &&
-          !resource->EnsureTextureAllocation("BindTextureUAV")) {
-        ClearUnorderedAccessBinding(enc, stage, slot);
-        return;
-      }
-      resource->SetPresentSourceView({});
-      const auto view =
-          CreateUnorderedAccessTextureView(device_->GetMTLDevice(), *resource,
-                                           descriptor);
-      if (!view) {
-        ClearUnorderedAccessBinding(enc, stage, slot);
-        return;
-      }
-      auto texture = std::move(view.texture);
+    if (binding.texture.ptr()) {
       if (stage == PipelineStage::Compute)
-        enc.bindOutputTexture<PipelineStage::Compute>(slot,
-                                                      std::move(texture),
-                                                      view.view);
+        enc.bindOutputTexture<PipelineStage::Compute>(
+            slot, std::move(binding.texture), binding.viewId);
       else if (stage == PipelineStage::Pixel)
-        enc.bindOutputTexture<PipelineStage::Pixel>(slot, std::move(texture),
-                                                   view.view);
+        enc.bindOutputTexture<PipelineStage::Pixel>(
+            slot, std::move(binding.texture), binding.viewId);
       else
         WARN("D3D12CommandQueue: UAV binding for ", PipelineStageName(stage),
              " stage is unsupported");
@@ -13332,7 +13836,6 @@ private:
         GetBindlessMirrorStagePlan(pipeline, root, want_stage, compute);
     if (!plan || !plan->max_key_plus_one)
       return {};
-
     auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
         enc.currentSeqId(), uint64_t(plan->max_key_plus_one) * sizeof(uint32_t));
     if (!slice.mapped || !slice.gpu_buffer)
@@ -14635,17 +15138,32 @@ private:
   // residency via packers) + bind 27/28/29/30. root_offsets is the slice pre-built from the
   // snapshot entries; mirror buffers are resolved from the same descriptor mirrors filled above.
   // Only Ordinary Vertex/Pixel.
-  static std::vector<ConstantBufferBinding>
+  struct BindlessBufferTableSnapshotStorage {
+    std::array<ConstantBufferBindingSnapshot, 14 * kStages> constant_buffers =
+        {};
+    std::array<ShaderResourceBindingSnapshot, kSRVBindings * kStages>
+        resources = {};
+
+    BindlessBufferTableSnapshot view() const {
+      return BindlessBufferTableSnapshot{
+          constant_buffers.data(), resources.data()};
+    }
+  };
+
+  static std::vector<ConstantBufferBindingSnapshot>
   BuildSnapshotConstantBufferBindings(const GraphicsBindingSnapshot &snapshot,
                                       PipelineStage want_stage,
                                       const MTL_SM50_SHADER_ARGUMENT *cbuffers,
                                       uint32_t num_cbuffers) {
-    std::vector<ConstantBufferBinding> bindings(num_cbuffers);
+    std::vector<ConstantBufferBindingSnapshot> bindings(14 * kStages);
     if (!cbuffers || !num_cbuffers)
       return bindings;
 
     for (uint32_t i = 0; i < num_cbuffers; i++) {
       const auto &arg = cbuffers[i];
+      const auto slot = 14 * unsigned(want_stage) + arg.SM50BindingSlot;
+      if (slot >= bindings.size())
+        continue;
       for (const auto &entry : snapshot.entries) {
         if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
             !entry.has_descriptor || entry.stage != want_stage ||
@@ -14657,11 +15175,48 @@ private:
         if (entry_arg.RegisterSpace != arg.RegisterSpace ||
             entry.shader_register != arg.RegisterLowerBound)
           continue;
-        MakeConstantBufferBindingFromDescriptor(entry.descriptor, bindings[i]);
+        bindings[slot].valid =
+            MakeConstantBufferBindingFromDescriptor(entry.descriptor,
+                                                    bindings[slot].binding);
         break;
       }
     }
 
+    return bindings;
+  }
+
+  BindlessBufferTableSnapshotStorage
+  BuildSnapshotBindlessBufferTableBindings(
+      const GraphicsBindingSnapshot &snapshot, PipelineStage want_stage) {
+    BindlessBufferTableSnapshotStorage bindings = {};
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || entry.stage != want_stage)
+        continue;
+      if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
+        const auto slot = 14 * unsigned(want_stage) + entry.slot;
+        if (slot < bindings.constant_buffers.size()) {
+          bindings.constant_buffers[slot].valid =
+              MakeConstantBufferBindingFromDescriptor(
+                  entry.descriptor, bindings.constant_buffers[slot].binding);
+        }
+      } else if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+        const auto slot = kSRVBindings * unsigned(want_stage) + entry.slot;
+        if (slot < bindings.resources.size()) {
+          auto &binding = bindings.resources[slot];
+          binding.srv_valid = MakeShaderResourceBindingFromDescriptor(
+              device_->GetMTLDevice(), entry.descriptor, &entry.argument,
+              binding.srv);
+        }
+      } else if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
+        if (entry.slot < kUAVBindings) {
+          auto &binding = bindings.resources[entry.slot];
+          binding.uav_valid = MakeUnorderedAccessBindingFromDescriptor(
+              device_->GetMTLDevice(), entry.descriptor, &entry.argument,
+              binding.uav);
+        }
+      }
+    }
     return bindings;
   }
 
@@ -14671,10 +15226,13 @@ private:
       const std::string &shader_key, const GraphicsBindingSnapshot &snapshot,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto &reflection = shader.reflection();
+    auto bindings =
+        BuildSnapshotBindlessBufferTableBindings(snapshot, Stage);
+    const auto bindings_view = bindings.view();
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
-        DiagCurrentReplayRecordSerial());
+        DiagCurrentReplayRecordSerial(), &bindings_view);
     if (draw_diag)
       AddBindlessMirrorDiagBufTable(
           *draw_diag, Stage, shader.constantBufferInfo(),
@@ -14739,6 +15297,714 @@ private:
       enc.bindConstantBufferDirect<PipelineStage::Vertex>(
           entry.slot, constants.gpu_buffer, gpu_address, byte_length);
       break;
+    }
+  }
+
+  static const CompiledCommandRootDescriptorTable *
+  FindCompiledRootTable(const std::vector<CompiledCommandRootDescriptorTable> &tables,
+                        UINT root_index, D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
+    for (const auto &table : tables) {
+      if (table.root_parameter_index == root_index &&
+          table.heap_type == heap_type && table.resolved)
+        return &table;
+    }
+    return nullptr;
+  }
+
+  template <typename Fn>
+  static void ForEachCompiledArgumentTable(
+      const std::vector<CompiledCommandRootDescriptorTable> &tables, Fn &&fn) {
+    DescriptorHeapMirror *resource_mirror = nullptr;
+    DescriptorHeapMirror *sampler_mirror = nullptr;
+    for (const auto &table : tables) {
+      if (!table.argument_table_ready || !table.mirror)
+        continue;
+      if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+        if (!sampler_mirror)
+          sampler_mirror = table.mirror;
+      } else if (!resource_mirror) {
+        resource_mirror = table.mirror;
+      }
+    }
+    if (resource_mirror)
+      fn(*resource_mirror);
+    if (sampler_mirror && sampler_mirror != resource_mirror)
+      fn(*sampler_mirror);
+  }
+
+  void EncodeCompiledArgumentTables(
+      ArgumentEncodingContext &enc,
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      bool compute, WMTRenderStages render_stages) {
+    const bool perf_enabled = dxmt::perf::enabled();
+    const auto bind_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
+    ForEachCompiledArgumentTable(tables, [&](DescriptorHeapMirror &mirror) {
+      if (!mirror.argumentTable())
+        return;
+      if (compute) {
+        auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_setargumenttable>();
+        cmd.type = WMTComputeCommandSetArgumentTable;
+        cmd.table = mirror.argumentTable().handle;
+        if (mirror.buffer()) {
+          auto &use = enc.encodeComputeCommand<wmtcmd_compute_useresource>();
+          use.type = WMTComputeCommandUseResource;
+          use.resource = mirror.buffer().handle;
+          use.usage = WMTResourceUsageRead;
+        }
+        if (mirror.descriptorTableBuffer()) {
+          auto &use = enc.encodeComputeCommand<wmtcmd_compute_useresource>();
+          use.type = WMTComputeCommandUseResource;
+          use.resource = mirror.descriptorTableBuffer().handle;
+          use.usage = WMTResourceUsageRead;
+        }
+      } else {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setargumenttable>();
+        cmd.type = WMTRenderCommandSetArgumentTable;
+        cmd.table = mirror.argumentTable().handle;
+        cmd.stages = render_stages;
+        if (mirror.buffer()) {
+          auto &use = enc.encodeRenderCommand<wmtcmd_render_useresource>();
+          use.type = WMTRenderCommandUseResource;
+          use.resource = mirror.buffer().handle;
+          use.usage = WMTResourceUsageRead;
+          use.stages = render_stages;
+        }
+        if (mirror.descriptorTableBuffer()) {
+          auto &use = enc.encodeRenderCommand<wmtcmd_render_useresource>();
+          use.type = WMTRenderCommandUseResource;
+          use.resource = mirror.descriptorTableBuffer().handle;
+          use.usage = WMTResourceUsageRead;
+          use.stages = render_stages;
+        }
+      }
+    });
+    if (perf_enabled) {
+      dxmt::perf::recordArgumentTableBindTime(
+          &enc.currentFrameStatistics(), clock::now() - bind_begin);
+    }
+  }
+
+  DescriptorRecord BuildCompiledRootDescriptorRecord(
+      const CompiledPacketBindingState &state,
+      DescriptorRecordType type, UINT root_index) {
+    DescriptorRecord descriptor = {};
+    descriptor.type = type;
+    descriptor.has_desc = true;
+    const auto &slot =
+        type == DescriptorRecordType::ConstantBufferView
+            ? state.cbv_roots[root_index]
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? state.srv_roots[root_index]
+                  : state.uav_roots[root_index];
+    if (!slot.valid)
+      return {};
+
+    Resource *resource = nullptr;
+    const auto offset = ResolveBufferGpuAddress(slot.address, resource);
+    if (!resource || !resource->GetBuffer())
+      return {};
+
+    descriptor.resource = resource->GetD3D12Resource();
+    const auto remaining = resource->GetResourceDesc().Width - offset;
+    if (type == DescriptorRecordType::ConstantBufferView) {
+      descriptor.desc.cbv.BufferLocation = slot.address;
+      descriptor.desc.cbv.SizeInBytes =
+          UINT(std::min<UINT64>(remaining, UINT_MAX));
+    } else if (type == DescriptorRecordType::ShaderResourceView) {
+      descriptor.desc.srv.Format = DXGI_FORMAT_UNKNOWN;
+      descriptor.desc.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      descriptor.desc.srv.Shader4ComponentMapping =
+          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      descriptor.desc.srv.Buffer.FirstElement = offset;
+      descriptor.desc.srv.Buffer.NumElements =
+          UINT(std::min<UINT64>(remaining, UINT_MAX));
+      descriptor.desc.srv.Buffer.StructureByteStride = 1;
+    } else {
+      descriptor.desc.uav.Format = DXGI_FORMAT_UNKNOWN;
+      descriptor.desc.uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      descriptor.desc.uav.Buffer.FirstElement = offset;
+      descriptor.desc.uav.Buffer.NumElements =
+          UINT(std::min<UINT64>(remaining, UINT_MAX));
+      descriptor.desc.uav.Buffer.StructureByteStride = 1;
+    }
+    return descriptor;
+  }
+
+  void BindCompiledRootConstants(ArgumentEncodingContext &enc,
+                                 const CompiledPacketBindingState &state,
+                                 const PipelineState &pipeline, bool compute,
+                                 UINT root_index,
+                                 const RootSignatureParameter &parameter) {
+    if (root_index >= state.root_constants.size())
+      return;
+    const auto &slot = state.root_constants[root_index];
+    if (!slot.valid || slot.values.empty())
+      return;
+
+    const auto declared_count = parameter.constants.Num32BitValues;
+    const auto actual_count =
+        std::max<uint32_t>(declared_count,
+                           slot.dst_offset + uint32_t(slot.values.size()));
+    if (!actual_count)
+      return;
+
+    const auto byte_length = uint64_t(actual_count) * sizeof(UINT);
+    auto constants = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), byte_length,
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    if (!constants.mapped || !constants.gpu_buffer)
+      return;
+    std::memset(constants.mapped, 0, constants.length);
+    const auto dst_byte_offset = uint64_t(slot.dst_offset) * sizeof(UINT);
+    if (dst_byte_offset < constants.length) {
+      std::memcpy(static_cast<uint8_t *>(constants.mapped) + dst_byte_offset,
+                  slot.values.data(),
+                  std::min<uint64_t>(
+                      uint64_t(slot.values.size()) * sizeof(UINT),
+                      constants.length - dst_byte_offset));
+    }
+    if (constants.needs_flush)
+      constants.gpu_buffer.updateContents(constants.offset, constants.mapped,
+                                          constants.length);
+    const auto gpu_address = constants.gpu_address + constants.offset;
+
+    ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
+      auto binding_slot = ResolveShaderBindingSlot(
+          pipeline, stage, SM50BindingType::ConstantBuffer,
+          parameter.constants.ShaderRegister,
+          parameter.constants.RegisterSpace);
+      if (!binding_slot || *binding_slot >= 14)
+        return;
+      DebugLogRootBinding("compiled-root-constants", pipeline, compute, stage,
+                          root_index, *binding_slot,
+                          parameter.constants.ShaderRegister,
+                          parameter.constants.RegisterSpace, byte_length, 0);
+      switch (stage) {
+      case PipelineStage::Compute:
+        enc.bindConstantBufferDirect<PipelineStage::Compute>(
+            *binding_slot, constants.gpu_buffer, gpu_address, byte_length);
+        break;
+      case PipelineStage::Pixel:
+        enc.bindConstantBufferDirect<PipelineStage::Pixel>(
+            *binding_slot, constants.gpu_buffer, gpu_address, byte_length);
+        break;
+      case PipelineStage::Vertex:
+      default:
+        enc.bindConstantBufferDirect<PipelineStage::Vertex>(
+            *binding_slot, constants.gpu_buffer, gpu_address, byte_length);
+        break;
+      }
+    });
+  }
+
+  void BindCompiledRootDescriptor(ArgumentEncodingContext &enc,
+                                  const CompiledPacketBindingState &state,
+                                  const PipelineState &pipeline, bool compute,
+                                  UINT root_index,
+                                  const RootSignatureParameter &parameter,
+                                  DescriptorRecordType type) {
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto descriptor =
+        BuildCompiledRootDescriptorRecord(state, type, root_index);
+    if (!descriptor.has_desc)
+      return;
+    const auto range_type =
+        type == DescriptorRecordType::ConstantBufferView
+            ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                  : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
+      const auto *argument = ResolveShaderBindingArgument(
+          pipeline, stage, BindingTypeForRange(range_type),
+          parameter.descriptor.ShaderRegister,
+          parameter.descriptor.RegisterSpace);
+      if (!argument)
+        return;
+      DebugLogRootBinding("compiled-root-descriptor", pipeline, compute, stage,
+                          root_index, argument->SM50BindingSlot,
+                          parameter.descriptor.ShaderRegister,
+                          parameter.descriptor.RegisterSpace,
+                          DescriptorRecordSizeBytes(descriptor), 0);
+      BindDescriptor(enc, stage, range_type, argument->SM50BindingSlot,
+                     descriptor, argument);
+    });
+  }
+
+  AllocatedArgumentBufferSlice BuildCompiledBindlessRootOffsets(
+      ArgumentEncodingContext &enc,
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      const PipelineState &pipeline, const RootSignature &root,
+      PipelineStage want_stage, bool compute,
+      BindlessMirrorWindow *window = nullptr) {
+    const auto plan =
+        GetBindlessMirrorStagePlan(pipeline, root, want_stage, compute);
+    if (!plan || !plan->max_key_plus_one)
+      return {};
+    const auto *shader = FindShaderForStage(pipeline, want_stage);
+    const auto *arguments = shader ? shader->resourceArgumentInfo() : nullptr;
+    const auto argument_count = shader ? shader->reflection().NumArguments : 0u;
+    if (!arguments || !argument_count)
+      return {};
+
+    auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), uint64_t(plan->max_key_plus_one) * sizeof(uint32_t));
+    if (!slice.mapped || !slice.gpu_buffer)
+      return {};
+    auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
+    std::memset(root_offsets, 0, slice.length);
+    if (window) {
+      if (plan->texture_count) {
+        const uint64_t qwords =
+            uint64_t(dxmt::kBindlessMirrorCapacity) *
+            dxmt::kMirrorTextureQwords * plan->texture_field_pairs;
+        window->texture_field_pairs = plan->texture_field_pairs;
+        window->texture = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+            enc.currentSeqId(), qwords * sizeof(uint64_t));
+        if (window->texture.mapped)
+          std::memset(window->texture.mapped, 0, window->texture.length);
+      }
+      if (plan->sampler_count) {
+        const uint64_t qwords =
+            uint64_t(dxmt::kBindlessMirrorCapacity) * dxmt::kMirrorSamplerQwords;
+        window->sampler = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+            enc.currentSeqId(), qwords * sizeof(uint64_t));
+        if (window->sampler.mapped)
+          std::memset(window->sampler.mapped, 0, window->sampler.length);
+      }
+    }
+
+    for (const auto &entry : plan->entries) {
+      if (entry.root_offset_key >= plan->max_key_plus_one ||
+          entry.argument_index >= argument_count)
+        continue;
+      const auto *table =
+          FindCompiledRootTable(tables, entry.root_index, entry.heap_type);
+      if (!table || !table->mirror)
+        continue;
+      auto *heap = dynamic_cast<DescriptorHeap *>(table->owning_heap.ptr());
+      if (!heap)
+        continue;
+      root_offsets[entry.root_offset_key] = entry.compact_base;
+      if (!window)
+        continue;
+      for (UINT local = 0;
+           local < entry.range_count &&
+           entry.descriptor_index + local < entry.descriptor_count;
+           local++) {
+        if (entry.compact_base + local >= dxmt::kBindlessMirrorCapacity)
+          break;
+        const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+            heap, table->base_descriptor, entry.range_offset,
+            entry.descriptor_index + local, entry.descriptor_count,
+            entry.heap_type);
+        if (!slot_descriptor || !slot_descriptor->mirror)
+          continue;
+        const auto source_slot = slot_descriptor->heap_index;
+        const auto &argument = arguments[entry.argument_index];
+        MaybeFillBindlessMirrorSlot(enc, entry.range_type, *slot_descriptor,
+                                    want_stage, &argument);
+        if (entry.sampler && window->sampler.mapped) {
+          auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+          auto *src0 = slot_descriptor->mirror->samplerHandlePtr(source_slot);
+          auto *src1 =
+              slot_descriptor->mirror->samplerCubeHandlePtr(source_slot);
+          auto *src2 =
+              slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
+          if (src0 && src1 && src2) {
+            dst[entry.compact_base + local] = *src0;
+            dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + local] =
+                *src1;
+            dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
+                entry.compact_base + local] = *src2;
+          }
+        } else if (entry.texture && window->texture.mapped) {
+          auto *dst = static_cast<uint64_t *>(window->texture.mapped);
+          auto *src0 = slot_descriptor->mirror->textureHandlePtr(source_slot);
+          auto *src1 =
+              slot_descriptor->mirror->textureMetadataPtr(source_slot);
+          if (src0 && src1) {
+            for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
+              const uint64_t pair_base =
+                  uint64_t(pair) * dxmt::kMirrorTextureQwords *
+                  dxmt::kBindlessMirrorCapacity;
+              dst[pair_base + entry.compact_base + local] = *src0;
+              dst[pair_base + dxmt::kBindlessMirrorCapacity +
+                  entry.compact_base + local] = *src1;
+            }
+          }
+        }
+      }
+    }
+    for (const auto &entry : plan->static_samplers) {
+      if (entry.root_offset_key < plan->max_key_plus_one)
+        root_offsets[entry.root_offset_key] = entry.compact_base;
+      if (!window || !window->sampler.mapped ||
+          entry.compact_slot >= dxmt::kBindlessMirrorCapacity)
+        continue;
+      auto sampler = CreateStaticSampler(entry.desc);
+      if (!sampler)
+        continue;
+      auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
+      uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
+      EncodeMirrorSamplerSlot(encoded, *sampler);
+      dst[entry.compact_slot] = encoded[0];
+      dst[dxmt::kBindlessMirrorCapacity + entry.compact_slot] = encoded[1];
+      dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + entry.compact_slot] =
+          encoded[2];
+    }
+    if (slice.needs_flush)
+      slice.gpu_buffer.updateContents(slice.offset, slice.mapped,
+                                      slice.length);
+    if (window) {
+      if (window->texture.needs_flush && window->texture.gpu_buffer)
+        window->texture.gpu_buffer.updateContents(
+            window->texture.offset, window->texture.mapped,
+            window->texture.length);
+      if (window->sampler.needs_flush && window->sampler.gpu_buffer)
+        window->sampler.gpu_buffer.updateContents(
+            window->sampler.offset, window->sampler.mapped,
+            window->sampler.length);
+    }
+    return slice;
+  }
+
+  BindlessBufferTableSnapshotStorage BuildCompiledBindlessBufferTableBindings(
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      const PipelineState &pipeline, const RootSignature &root,
+      PipelineStage want_stage, bool compute) {
+    BindlessBufferTableSnapshotStorage bindings = {};
+    const auto *shader = FindShaderForStage(pipeline, want_stage);
+    if (!shader)
+      return bindings;
+    const auto *cbuffers = shader->constantBufferInfo();
+    const auto cbuffer_count = shader->reflection().NumConstantBuffers;
+    const auto *arguments = shader->resourceArgumentInfo();
+    const auto argument_count = shader->reflection().NumArguments;
+
+    auto fill_descriptor = [&](const CompiledCommandRootDescriptorTable &table,
+                               const RootSignatureRange &range,
+                               UINT range_offset, UINT descriptor_index,
+                               UINT descriptor_count,
+                               const DXMT12_MTL4_SHADER_ARGUMENT &argument,
+                               UINT binding_slot) {
+      auto *heap = dynamic_cast<DescriptorHeap *>(table.owning_heap.ptr());
+      if (!heap)
+        return;
+      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+          heap, table.base_descriptor, range_offset, descriptor_index,
+          descriptor_count, table.heap_type);
+      if (!descriptor)
+        return;
+
+      if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
+        const auto slot = 14 * unsigned(want_stage) + binding_slot;
+        if (slot < bindings.constant_buffers.size()) {
+          bindings.constant_buffers[slot].valid =
+              MakeConstantBufferBindingFromDescriptor(
+                  *descriptor, bindings.constant_buffers[slot].binding);
+        }
+      } else if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+        const auto slot = kSRVBindings * unsigned(want_stage) + binding_slot;
+        if (slot < bindings.resources.size()) {
+          auto &binding = bindings.resources[slot];
+          binding.srv_valid = MakeShaderResourceBindingFromDescriptor(
+              device_->GetMTLDevice(), *descriptor, &argument, binding.srv);
+        }
+      } else if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
+        if (binding_slot < kUAVBindings) {
+          auto &binding = bindings.resources[binding_slot];
+          binding.uav_valid = MakeUnorderedAccessBindingFromDescriptor(
+              device_->GetMTLDevice(), *descriptor, &argument, binding.uav);
+        }
+      }
+    };
+
+    const auto parameters = root.GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        continue;
+      bool visible = false;
+      ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
+        if (s == want_stage)
+          visible = true;
+      });
+      if (!visible)
+        continue;
+
+      UINT running_offset = 0;
+      for (const auto &range : parameter.ranges) {
+        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+          if (range.descriptor_count != UINT_MAX)
+            running_offset =
+                DescriptorRangeOffset(range, running_offset) +
+                range.descriptor_count;
+          continue;
+        }
+
+        const auto range_offset = DescriptorRangeOffset(range, running_offset);
+        const auto descriptor_count =
+            range.descriptor_count == UINT_MAX
+                ? ReflectedDescriptorRangeCount(
+                      pipeline, range, parameter.visibility, compute)
+                : range.descriptor_count;
+        const auto heap_type = DescriptorHeapTypeForRange(range.range_type);
+        const auto *table = FindCompiledRootTable(tables, root_index, heap_type);
+        if (!table)
+          continue;
+        const auto binding_type = BindingTypeForRange(range.range_type);
+        const auto *shader_args =
+            binding_type == SM50BindingType::ConstantBuffer ? cbuffers
+                                                            : arguments;
+        const auto shader_arg_count =
+            binding_type == SM50BindingType::ConstantBuffer ? cbuffer_count
+                                                            : argument_count;
+        if (!shader_args)
+          continue;
+
+        for (UINT i = 0; i < shader_arg_count; i++) {
+          const auto &argument = shader_args[i];
+          if (argument.Type != binding_type)
+            continue;
+          const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+          const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
+                                                    : argument.SM50BindingSlot;
+          if (space != range.register_space ||
+              lower < range.base_shader_register)
+            continue;
+          const auto first_descriptor = lower - range.base_shader_register;
+          if (first_descriptor >= descriptor_count)
+            continue;
+          const auto count = ShaderArgumentRangeCount(argument);
+          for (UINT local = 0;
+               local < count && first_descriptor + local < descriptor_count;
+               local++) {
+            auto local_argument = ShaderArgumentAtRangeOffset(argument, local);
+            fill_descriptor(*table, range, range_offset,
+                            first_descriptor + local, descriptor_count,
+                            local_argument,
+                            argument.SM50BindingSlot + local);
+          }
+        }
+
+        if (range.descriptor_count != UINT_MAX)
+          running_offset = range_offset + range.descriptor_count;
+      }
+    }
+
+    return bindings;
+  }
+
+  template <PipelineStage Stage>
+  void EncodeCompiledShaderBindingsForStage(
+      ArgumentEncodingContext &enc,
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      const CompiledPacketBindingState &binding_state,
+      const PipelineState &pipeline, const RootSignature &root,
+      const PipelineDxilShader &shader, const std::string &shader_key,
+      bool compute, uint64_t &argbuf_offset) {
+    const auto parameters = root.GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type ==
+          D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+        BindCompiledRootConstants(enc, binding_state, pipeline, compute,
+                                  root_index, parameter);
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        BindCompiledRootDescriptor(enc, binding_state, pipeline, compute,
+                                   root_index, parameter,
+                                   DescriptorRecordType::ConstantBufferView);
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        BindCompiledRootDescriptor(enc, binding_state, pipeline, compute,
+                                   root_index, parameter,
+                                   DescriptorRecordType::ShaderResourceView);
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        BindCompiledRootDescriptor(enc, binding_state, pipeline, compute,
+                                   root_index, parameter,
+                                   DescriptorRecordType::UnorderedAccessView);
+      }
+    }
+
+    const auto &reflection = shader.reflection();
+    auto bindings = BuildCompiledBindlessBufferTableBindings(
+        tables, pipeline, root, Stage, compute);
+    const auto bindings_view = bindings.view();
+    auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
+        &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
+        shader_key, DiagCurrentReplayRecordSequence(),
+        DiagCurrentReplayRecordSerial(), &bindings_view);
+    BindlessMirrorWindow window = {};
+    auto root_offsets = BuildCompiledBindlessRootOffsets(
+        enc, tables, pipeline, root, Stage, compute, &window);
+    enc.bindBindlessTables<Stage>(bt, root_offsets, window.texture,
+                                  window.sampler);
+    (void)argbuf_offset;
+  }
+
+  void EncodeCompiledVertexBuffers(ArgumentEncodingContext &enc,
+                                   const CompiledGraphicsPacket &packet,
+                                   const PipelineGraphicsState *graphics_state,
+                                   uint64_t &argbuf_offset) {
+    if (!graphics_state)
+      return;
+
+    uint32_t slot_mask = 0;
+    for (const auto &element : graphics_state->input_elements) {
+      if (element.InputSlot < 32)
+        slot_mask |= 1u << element.InputSlot;
+    }
+    if (!slot_mask)
+      return;
+
+    for (const auto &vb : packet.input_assembler.vertex_buffers) {
+      if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
+        continue;
+      Resource *resource = nullptr;
+      const auto offset =
+          ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
+      if (!resource || !resource->GetBuffer())
+        continue;
+      enc.bindVertexBuffer(vb.slot, resource->GetHeapOffset() + offset,
+                           vb.view.StrideInBytes,
+                           Rc<Buffer>(resource->GetBuffer()));
+    }
+
+    const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * 16u;
+    const auto offset = AllocateArgumentBuffer(argbuf_offset, table_size);
+    enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
+  }
+
+  void EncodeCompiledGraphicsBindings(
+      ArgumentEncodingContext &enc, const CompiledGraphicsPacket &packet,
+      const CompiledPacketBindingState &binding_state,
+      PipelineState &pipeline, RootSignature &root,
+      uint64_t &argbuf_offset) {
+    EncodeCompiledArgumentTables(enc, packet.root_tables, false,
+                                 WMTRenderStageVertex |
+                                     WMTRenderStageFragment);
+    EncodeCompiledVertexBuffers(enc, packet, pipeline.GetGraphicsState(),
+                                argbuf_offset);
+    const auto &key = pipeline.GetShaderCacheKey();
+    for (const auto &shader : pipeline.GetDxilShaders()) {
+      if (shader.stage == PipelineShaderStage::Vertex) {
+        EncodeCompiledShaderBindingsForStage<PipelineStage::Vertex>(
+            enc, packet.root_tables, binding_state, pipeline, root, shader, key,
+            false, argbuf_offset);
+      } else if (shader.stage == PipelineShaderStage::Pixel) {
+        EncodeCompiledShaderBindingsForStage<PipelineStage::Pixel>(
+            enc, packet.root_tables, binding_state, pipeline, root, shader, key,
+            false, argbuf_offset);
+      }
+    }
+  }
+
+  static void FillCompiledBindingState(
+      CompiledPacketBindingState &state,
+      const std::vector<CompiledCommandRootConstants> &constants,
+      const std::vector<CompiledCommandRootDescriptor> &descriptors) {
+    for (const auto &entry : constants) {
+      if (entry.root_parameter_index >= state.root_constants.size())
+        continue;
+      auto &slot = state.root_constants[entry.root_parameter_index];
+      slot.valid = true;
+      slot.dst_offset = entry.dst_offset;
+      slot.values = entry.values;
+    }
+    for (const auto &entry : descriptors) {
+      if (entry.root_parameter_index >= state.cbv_roots.size())
+        continue;
+      auto *slot = entry.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV
+                       ? &state.cbv_roots[entry.root_parameter_index]
+                       : entry.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
+                             ? &state.srv_roots[entry.root_parameter_index]
+                             : &state.uav_roots[entry.root_parameter_index];
+      slot->valid = true;
+      slot->address = entry.address;
+    }
+  }
+
+  void AddCompiledDirectBufferAccess(CompiledDirectAccessList &list,
+                                     D3D12_GPU_VIRTUAL_ADDRESS address) {
+    if (!address)
+      return;
+    Resource *resource = nullptr;
+    ResolveBufferGpuAddress(address, resource);
+    if (!resource || !resource->GetBufferAllocation())
+      return;
+    auto *allocation = resource->GetBufferAllocation();
+    for (const auto &existing : list.buffer_allocations) {
+      if (existing.ptr() == allocation)
+        return;
+    }
+    list.buffer_allocations.push_back(Rc<BufferAllocation>(allocation));
+  }
+
+  void AddCompiledVertexBufferAccesses(CompiledDirectAccessList &list,
+                                       const CompiledGraphicsPacket &packet,
+                                       const PipelineGraphicsState *graphics_state) {
+    if (!graphics_state)
+      return;
+    uint32_t slot_mask = 0;
+    for (const auto &element : graphics_state->input_elements) {
+      if (element.InputSlot < 32)
+        slot_mask |= 1u << element.InputSlot;
+    }
+    if (!slot_mask)
+      return;
+    for (const auto &vb : packet.input_assembler.vertex_buffers) {
+      if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
+        continue;
+      AddCompiledDirectBufferAccess(list, vb.view.BufferLocation);
+    }
+  }
+
+  void AddCompiledRootDescriptorAccesses(CompiledDirectAccessList &list,
+                                         const CompiledPacketBindingState &state) {
+    auto add_roots = [&](const auto &roots) {
+      for (const auto &slot : roots) {
+        if (slot.valid)
+          AddCompiledDirectBufferAccess(list, slot.address);
+      }
+    };
+    add_roots(state.cbv_roots);
+    add_roots(state.srv_roots);
+    add_roots(state.uav_roots);
+  }
+
+  void RegisterCompiledDirectAccessList(const CompiledDirectAccessList &list) {
+    auto &queue = device_->GetDXMTDevice().queue();
+    for (const auto &allocation : list.buffer_allocations) {
+      if (allocation)
+        queue.AddPersistentResidency(allocation->buffer());
+    }
+  }
+
+  void ReleaseCompiledDirectAccessListAfterSubmit(
+      const CompiledDirectAccessList &list) {
+    auto &queue = device_->GetDXMTDevice().queue();
+    for (const auto &allocation : list.buffer_allocations) {
+      if (allocation)
+        queue.RemovePersistentResidencyAfterCompletion(allocation->buffer());
+    }
+  }
+
+  void EncodeCompiledComputeBindings(
+      ArgumentEncodingContext &enc, const CompiledComputePacket &packet,
+      const CompiledPacketBindingState &binding_state,
+      PipelineState &pipeline, RootSignature &root,
+      uint64_t &argbuf_offset) {
+    EncodeCompiledArgumentTables(enc, packet.root_tables, true, {});
+    RecordBindlessMirrorDiagDispatch();
+    const auto &key = pipeline.GetShaderCacheKey();
+    for (const auto &shader : pipeline.GetDxilShaders()) {
+      if (shader.stage != PipelineShaderStage::Compute)
+        continue;
+      EncodeCompiledShaderBindingsForStage<PipelineStage::Compute>(
+          enc, packet.root_tables, binding_state, pipeline, root, shader, key,
+          true, argbuf_offset);
     }
   }
 
@@ -16174,6 +17440,20 @@ private:
     UINT instance_count = 0;
     INT base_vertex = 0;
     UINT base_instance = 0;
+  };
+
+  struct CompiledDirectDrawPayload {
+    ReplayDrawInstancedPacket draw;
+    CompiledGraphicsPacket compiled;
+    CompiledPacketBindingState binding_state;
+    CompiledDirectAccessList direct_access;
+  };
+
+  struct CompiledDirectIndexedDrawPayload {
+    ReplayDrawIndexedInstancedPacket draw;
+    CompiledGraphicsPacket compiled;
+    CompiledPacketBindingState binding_state;
+    CompiledDirectAccessList direct_access;
   };
 
 	  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
@@ -18055,6 +19335,8 @@ private:
   struct PendingOperation {
     PendingOperationType type = PendingOperationType::Execute;
     std::vector<std::vector<CommandRecord>> command_records;
+    std::vector<std::shared_ptr<const CompiledCommandList>>
+        compiled_command_lists;
     std::vector<SubmittedCommandAllocatorUse> allocator_uses;
     std::function<bool(CommandChunk *)> queue_work;
     Fence *fence = nullptr;
@@ -18068,6 +19350,7 @@ private:
     PendingOperation(PendingOperation &&other) noexcept
         : type(other.type),
           command_records(std::move(other.command_records)),
+          compiled_command_lists(std::move(other.compiled_command_lists)),
           allocator_uses(std::move(other.allocator_uses)),
           queue_work(std::move(other.queue_work)),
           fence(other.fence),
@@ -18081,6 +19364,7 @@ private:
         ReleaseFence();
         type = other.type;
         command_records = std::move(other.command_records);
+        compiled_command_lists = std::move(other.compiled_command_lists);
         allocator_uses = std::move(other.allocator_uses);
         queue_work = std::move(other.queue_work);
         fence = other.fence;
@@ -18232,6 +19516,10 @@ private:
         std::unordered_set<ID3D12Resource *> touched_resources_set;
         UINT command_list_index = 0;
         for (const auto &records : operation.command_records) {
+          const CompiledCommandList *compiled =
+              command_list_index < operation.compiled_command_lists.size()
+                  ? operation.compiled_command_lists[command_list_index].get()
+                  : nullptr;
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
             WARN_FILE_ONLY("D3D12 queue diagnostic: drain replay list begin"
@@ -18239,10 +19527,14 @@ private:
                  " queueType=", desc_.Type,
                  " listIndex=", command_list_index,
                  " records=", records.size(),
+                 " compiledSegments=", compiled ? compiled->segments.size() : 0,
+                 " compiledGraphicsPackets=", compiled ? compiled->graphics_packets.size() : 0,
+                 " compiledComputePackets=", compiled ? compiled->compute_packets.size() : 0,
                  " submittedBatchesBefore=", submitted_batches_);
           }
           const auto replay_begin = clock::now();
-          ReplayCommandRecords(records, touched_resources, touched_resources_set);
+          ReplayCommandRecords(records, compiled, touched_resources,
+                               touched_resources_set);
           RecordExecuteDrainTime(
               perf_stats, dxmt::perf::ExecuteTimeBucket::Replay,
               clock::now() - replay_begin);

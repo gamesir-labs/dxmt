@@ -20,6 +20,8 @@
 #include <chrono>
 #include <functional>
 #include <span>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace dxmt {
@@ -143,6 +145,8 @@ class CommandQueue {
 private:
   void CommitChunkInternal(CommandChunk &chunk);
 
+  void RetirePersistentResidencyRemovals(uint64_t completed_seq);
+
   uint32_t EncodingThread();
 
   uint32_t WaitForFinishThread();
@@ -161,6 +165,7 @@ private:
   dxmt::condition_variable readback_cond_;
   std::vector<std::function<void()>> pending_readbacks_;
   const bool apitrace_enabled_;
+  dxmt::mutex completion_callbacks_mutex_;
 
   std::array<CommandChunk, kCommandChunkCount> chunks;
   uint64_t encoder_seq = 1;
@@ -173,6 +178,16 @@ private:
   dxmt::thread readbackThread;
   WMT::Device device;
   WMT::Reference<WMT::CommandQueue> commandQueue;
+  struct PersistentResidencyEntry {
+    WMT::Reference<WMT::Resource> allocation;
+    uint32_t ref_count = 0;
+    uint64_t remove_after_seq = 0;
+    bool pending_remove = false;
+  };
+  dxmt::mutex persistent_residency_mutex_;
+  WMT::Reference<WMT::ResidencySet> persistent_residency_set_;
+  bool persistent_residency_dirty_ = false;
+  std::unordered_map<obj_handle_t, PersistentResidencyEntry> persistent_residency_entries_;
 
   obj_handle_t shared_event_listener;
   dxmt::thread event_listener_thread;
@@ -268,6 +283,18 @@ public:
 
   void
   WaitCPUFence(uint64_t seq);
+
+  void
+  AddPersistentResidency(WMT::Resource resource);
+
+  void
+  RemovePersistentResidencyAfterCompletion(WMT::Resource resource);
+
+  void
+  RetainUntilGpuComplete(std::function<void()> release);
+
+  uint64_t
+  FlushPersistentResidency();
 
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {

@@ -67,6 +67,11 @@ struct ConstantBufferBinding {
   unsigned offset;
 };
 
+struct ConstantBufferBindingSnapshot {
+  bool valid = false;
+  ConstantBufferBinding binding;
+};
+
 struct SamplerBinding {
   Rc<Sampler> sampler;
 };
@@ -78,17 +83,26 @@ struct ResourceViewBinding {
   BufferSlice slice;
 };
 
-struct ShaderResourceBindingSnapshot {
-  Sampler *sampler = nullptr;
-  ResourceViewBinding srv;
-};
-
 struct UnorderedAccessViewBinding {
   uint64_t viewId;
   Rc<Buffer> buffer;
   Rc<Texture> texture;
   Rc<Buffer> counter;
   BufferSlice slice;
+};
+
+struct ShaderResourceBindingSnapshot {
+  bool sampler_valid = false;
+  bool srv_valid = false;
+  bool uav_valid = false;
+  Sampler *sampler = nullptr;
+  ResourceViewBinding srv;
+  UnorderedAccessViewBinding uav;
+};
+
+struct BindlessBufferTableSnapshot {
+  const ConstantBufferBindingSnapshot *constant_buffers = nullptr;
+  const ShaderResourceBindingSnapshot *resources = nullptr;
 };
 
 struct DummyTextureBinding {
@@ -671,13 +685,13 @@ public:
   void packBindlessCBuffers(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
       uint64_t *buf_table, uint32_t buf_table_qwords, const uint32_t *cb_compact,
-      const ConstantBufferBinding *bindings = nullptr
+      const ConstantBufferBindingSnapshot *bindings = nullptr
   );
   template <PipelineStage stage, PipelineKind kind>
   void packBindlessBufferTable(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments,
       const std::string &shader_hash, uint64_t *buf_table, uint32_t buf_table_qwords,
-      const uint32_t *res_compact, const ShaderResourceBindingSnapshot *bindings
+      const uint32_t *res_compact, const BindlessBufferTableSnapshot *bindings
   );
   template <PipelineStage stage, PipelineKind kind>
   void verifyBindlessBufferTable(
@@ -707,8 +721,7 @@ public:
                     const std::string &shader_hash,
                     uint64_t verify_draw_id = 0,
                     uint64_t verify_draw_serial = 0,
-                    const ConstantBufferBinding *cb_bindings = nullptr,
-                    const ShaderResourceBindingSnapshot *resource_bindings = nullptr);
+                    const BindlessBufferTableSnapshot *bindings = nullptr);
 
   // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
   // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null

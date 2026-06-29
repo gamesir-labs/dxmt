@@ -5,8 +5,10 @@
 #include "d3d12_interfaces.hpp"
 #include "d3d12_pipeline.hpp"
 #include "com/com_pointer.hpp"
+#include "dxmt_statistics.hpp"
 #include <d3d12.h>
 #include <array>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <variant>
@@ -285,6 +287,176 @@ struct CommandRecord {
   CommandRecordPayload payload;
 };
 
+enum class CompiledCommandSegmentKind {
+  Graphics,
+  Compute,
+  Fallback,
+};
+
+enum class CompiledCommandFallbackReason {
+  None,
+  ConservativeCompiler,
+  LegacyPipelineState,
+  NonBindlessPipelineState,
+  GeometryPipeline,
+  TessellationPipeline,
+  MissingPipelineState,
+  MissingRootSignature,
+  ExecuteIndirect,
+  UnsupportedBarrier,
+  CopyOrResolve,
+  ClearOrDiscard,
+  QueryOrPredication,
+  SnapshotDependent,
+  TemporalUpscale,
+  UnsupportedRootSignature,
+  UnsupportedDescriptorTable,
+  UnsupportedRootDescriptor,
+  UnsupportedRootConstants,
+  UnsupportedVertexIndexState,
+  UnsupportedRenderTargetState,
+  UnsupportedArgumentTable,
+  UnsupportedCommand,
+};
+
+struct CompiledCommandDescriptorHeaps {
+  Com<ID3D12DescriptorHeap> cbv_srv_uav;
+  Com<ID3D12DescriptorHeap> sampler;
+  std::vector<Com<ID3D12DescriptorHeap>> all;
+};
+
+struct CompiledCommandPipelineMetadata {
+  PipelineState *pipeline = nullptr;
+  const PipelineMetalGraphicsState *metal_graphics = nullptr;
+  const PipelineMetalComputeState *metal_compute = nullptr;
+  PipelineStateType type = PipelineStateType::Graphics;
+  dxmt::CompiledFallbackReason perf_fallback_reason =
+      dxmt::CompiledFallbackReason::Unknown;
+  bool has_pipeline_state = false;
+  bool has_dxmt_pipeline = false;
+  bool type_matches = false;
+  bool has_root_signature = false;
+  bool uses_bindless_mirror = false;
+  bool uses_geometry = false;
+  bool uses_tessellation = false;
+  bool ordinary_bindless = false;
+  bool metal_pso_ready = false;
+};
+
+struct CompiledCommandPipelineBinding {
+  Com<ID3D12PipelineState> pipeline_state;
+  Com<ID3D12RootSignature> root_signature;
+  CompiledCommandPipelineMetadata metadata;
+  bool pipeline_state_pending = true;
+  bool root_signature_pending = true;
+  bool bindless_candidate = false;
+};
+
+struct CompiledCommandRootDescriptorTable {
+  UINT root_parameter_index = 0;
+  D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
+  D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor = {};
+  UINT heap_index = 0;
+  UINT descriptor_count = 0;
+  UINT heap_count = 0;
+  UINT table_offset = 0;
+  UINT table_entry_stride = sizeof(uint64_t) * 3;
+  uint64_t descriptor_table_gpu_address = 0;
+  uint64_t descriptor_table_entry_gpu_address = 0;
+  // Keeps the mirror-owned descriptor table buffer and argument table alive
+  // while compiled packets are in flight.
+  Com<ID3D12DescriptorHeap> owning_heap;
+  DescriptorHeapMirror *mirror = nullptr;
+  bool resolved = false;
+  bool argument_table_ready = false;
+};
+
+struct CompiledCommandRootConstants {
+  UINT root_parameter_index = 0;
+  UINT dst_offset = 0;
+  std::vector<UINT> values;
+};
+
+struct CompiledCommandRootDescriptor {
+  D3D12_ROOT_PARAMETER_TYPE parameter_type = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  UINT root_parameter_index = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+};
+
+struct CompiledCommandVertexBuffer {
+  UINT slot = 0;
+  D3D12_VERTEX_BUFFER_VIEW view = {};
+};
+
+struct CompiledCommandInputAssemblerState {
+  std::vector<CompiledCommandVertexBuffer> vertex_buffers;
+  std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
+  std::uint64_t vertex_buffer_dirty_mask = 0;
+  bool index_buffer_dirty = false;
+};
+
+struct CompiledCommandRenderState {
+  std::vector<DescriptorRecord> render_targets;
+  std::optional<DescriptorRecord> depth_stencil;
+  std::vector<D3D12_VIEWPORT> viewports;
+  std::vector<D3D12_RECT> scissors;
+  std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+  UINT stencil_ref = 0;
+  D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+};
+
+struct CompiledGraphicsPacket {
+  UINT record_index = 0;
+  std::uint64_t d3d_sequence = 0;
+  CompiledCommandPipelineBinding pipeline;
+  CompiledCommandDescriptorHeaps descriptor_heaps;
+  std::vector<CompiledCommandRootDescriptorTable> root_tables;
+  std::vector<CompiledCommandRootConstants> root_constants;
+  std::vector<CompiledCommandRootDescriptor> root_descriptors;
+  CompiledCommandInputAssemblerState input_assembler;
+  CompiledCommandRenderState render_state;
+  std::optional<DrawInstancedRecord> draw;
+  std::optional<DrawIndexedInstancedRecord> draw_indexed;
+};
+
+struct CompiledComputePacket {
+  UINT record_index = 0;
+  std::uint64_t d3d_sequence = 0;
+  CompiledCommandPipelineBinding pipeline;
+  CompiledCommandDescriptorHeaps descriptor_heaps;
+  std::vector<CompiledCommandRootDescriptorTable> root_tables;
+  std::vector<CompiledCommandRootConstants> root_constants;
+  std::vector<CompiledCommandRootDescriptor> root_descriptors;
+  DispatchRecord dispatch;
+};
+
+struct CompiledCommandSegment {
+  CompiledCommandSegmentKind kind = CompiledCommandSegmentKind::Fallback;
+  UINT first_record_index = 0;
+  UINT record_count = 0;
+  UINT first_graphics_packet = 0;
+  UINT graphics_packet_count = 0;
+  UINT first_compute_packet = 0;
+  UINT compute_packet_count = 0;
+  CompiledCommandFallbackReason fallback_reason =
+      CompiledCommandFallbackReason::None;
+  dxmt::CompiledFallbackReason perf_fallback_reason =
+      dxmt::CompiledFallbackReason::Unknown;
+};
+
+struct CompiledCommandList {
+  UINT record_count = 0;
+  std::vector<CompiledCommandSegment> segments;
+  std::vector<CompiledGraphicsPacket> graphics_packets;
+  std::vector<CompiledComputePacket> compute_packets;
+};
+
+const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind);
+const char *CompiledCommandFallbackReasonName(
+    CompiledCommandFallbackReason reason);
+dxmt::CompiledFallbackReason
+CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason);
+
 struct SubmittedCommandAllocatorUse {
   Com<CommandAllocatorObject, false> allocator;
   UINT64 serial = 0;
@@ -297,6 +469,8 @@ public:
   virtual bool IsClosed() const = 0;
   virtual D3D12_COMMAND_LIST_TYPE GetCommandListType() const = 0;
   virtual const std::vector<CommandRecord> &GetCommandRecords() const = 0;
+  virtual std::shared_ptr<const CompiledCommandList> GetCompiledCommands()
+      const = 0;
   virtual void SetApitraceLifecycleRecordingEnabled(bool enabled) = 0;
   virtual HRESULT MarkSubmittedToQueue(
       D3D12_COMMAND_LIST_TYPE queue_type,

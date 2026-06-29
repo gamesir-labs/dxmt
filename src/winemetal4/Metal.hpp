@@ -257,6 +257,44 @@ class Resource : public Object {
 public:
 };
 
+class ResourceViewPool : public Object {
+public:
+  uint64_t
+  baseResourceID() const {
+    return MTLResourceViewPool_baseResourceID(handle);
+  }
+
+  uint64_t
+  copyResourceViews(ResourceViewPool source, uint64_t source_index,
+                    uint64_t count, uint64_t destination_index) {
+    return MTLResourceViewPool_copyResourceViews(
+        handle, source.handle, source_index, count, destination_index);
+  }
+};
+
+class ResidencySet : public Object {
+public:
+  void
+  addAllocation(Object allocation) {
+    MTLResidencySet_addAllocation(handle, allocation.handle);
+  }
+
+  void
+  removeAllocation(Object allocation) {
+    MTLResidencySet_removeAllocation(handle, allocation.handle);
+  }
+
+  void
+  commit() {
+    MTLResidencySet_commit(handle);
+  }
+
+  void
+  requestResidency() {
+    MTLResidencySet_requestResidency(handle);
+  }
+};
+
 class Heap : public Object {
 public:
 };
@@ -337,6 +375,37 @@ public:
     WMTConstMemoryPointer ptr;
     ptr.set(data);
     MTLBuffer_updateContents(handle, offset, ptr, length);
+  }
+};
+
+class TextureViewPool : public ResourceViewPool {
+public:
+  uint64_t
+  setTextureView(Texture texture, uint64_t index) {
+    return MTLTextureViewPool_setTextureView(handle, texture.handle, index);
+  }
+
+  uint64_t
+  setTextureView(Texture texture, const WMTTextureViewDescriptor &descriptor,
+                 uint64_t index) {
+    return MTLTextureViewPool_setTextureViewWithDescriptor(
+        handle, texture.handle, &descriptor, index);
+  }
+
+  uint64_t
+  setTextureViewFromBuffer(Buffer buffer,
+                           const WMTTextureBufferViewDescriptor &descriptor,
+                           uint64_t offset, uint64_t bytes_per_row,
+                           uint64_t index) {
+    return MTLTextureViewPool_setTextureViewFromBuffer(
+        handle, buffer.handle, &descriptor, offset, bytes_per_row, index);
+  }
+
+  uint64_t
+  copyResourceViews(TextureViewPool source_pool, uint64_t source_index,
+                    uint64_t count, uint64_t destination_index) {
+    return MTLResourceViewPool_copyResourceViews(
+        handle, source_pool.handle, source_index, count, destination_index);
   }
 };
 
@@ -664,6 +733,11 @@ public:
   }
 
   void
+  commitAndGetStats(uint64_t *residency_submit_us) {
+    return MTLCommandBuffer_commitAndGetStats(handle, residency_submit_us);
+  }
+
+  void
   waitUntilCompleted() {
     return MTLCommandBuffer_waitUntilCompleted(handle);
   }
@@ -772,6 +846,16 @@ public:
   commandBuffer() {
     return CommandBuffer{MTLCommandQueue_commandBuffer(handle)};
   }
+
+  void
+  addResidencySet(ResidencySet set) {
+    MTLCommandQueue_addResidencySet(handle, set.handle);
+  }
+
+  void
+  removeResidencySet(ResidencySet set) {
+    MTLCommandQueue_removeResidencySet(handle, set.handle);
+  }
 };
 
 class Function : public Object {};
@@ -826,6 +910,23 @@ public:
   Reference<CommandQueue>
   newCommandQueue(uint64_t maxCommandBufferCount) {
     return Reference<CommandQueue>(MTLDevice_newCommandQueue(handle, maxCommandBufferCount));
+  }
+
+  Reference<ResidencySet>
+  newResidencySet(uint64_t initial_capacity) {
+    return Reference<ResidencySet>(MTLDevice_newResidencySet(handle, initial_capacity));
+  }
+
+  Reference<TextureViewPool>
+  newTextureViewPool(uint64_t initial_count, Error &error) {
+    WMTTextureViewPoolInfo info = {};
+    info.initial_count = initial_count;
+    return Reference<TextureViewPool>(MTLDevice_newTextureViewPool(handle, &info, &error.handle));
+  }
+
+  Reference<TextureViewPool>
+  newTextureViewPool(const WMTTextureViewPoolInfo &info, Error &error) {
+    return Reference<TextureViewPool>(MTLDevice_newTextureViewPool(handle, &info, &error.handle));
   }
 
   Reference<SharedEvent>
@@ -939,9 +1040,27 @@ public:
     return Reference<RenderPipelineState>(MTLDevice_newRenderPipelineState(handle, &info, &error.handle));
   }
 
+  Reference<RenderPipelineState>
+  newRenderPipelineStateAndGetStats(const WMTRenderPipelineInfo &info,
+                                    Error &error,
+                                    uint64_t *compile_wait_us) {
+    return Reference<RenderPipelineState>(
+        MTLDevice_newRenderPipelineStateAndGetStats(
+            handle, &info, &error.handle, compile_wait_us));
+  }
+
   Reference<ComputePipelineState>
   newComputePipelineState(const WMTComputePipelineInfo &info, Error &error) {
     return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, &error.handle));
+  }
+
+  Reference<ComputePipelineState>
+  newComputePipelineStateAndGetStats(const WMTComputePipelineInfo &info,
+                                     Error &error,
+                                     uint64_t *compile_wait_us) {
+    return Reference<ComputePipelineState>(
+        MTLDevice_newComputePipelineStateAndGetStats(
+            handle, &info, &error.handle, compile_wait_us));
   }
 
   Reference<RenderPipelineState>
@@ -950,8 +1069,26 @@ public:
   }
 
   Reference<RenderPipelineState>
+  newRenderPipelineStateAndGetStats(const WMTMeshRenderPipelineInfo &info,
+                                    Error &error,
+                                    uint64_t *compile_wait_us) {
+    return Reference<RenderPipelineState>(
+        MTLDevice_newMeshRenderPipelineStateAndGetStats(
+            handle, &info, &error.handle, compile_wait_us));
+  }
+
+  Reference<RenderPipelineState>
   newRenderPipelineState(const WMTTileRenderPipelineInfo &info, Error &error) {
     return Reference<RenderPipelineState>(MTLDevice_newTileRenderPipelineState(handle, &info, &error.handle));
+  }
+
+  Reference<RenderPipelineState>
+  newRenderPipelineStateAndGetStats(const WMTTileRenderPipelineInfo &info,
+                                    Error &error,
+                                    uint64_t *compile_wait_us) {
+    return Reference<RenderPipelineState>(
+        MTLDevice_newTileRenderPipelineStateAndGetStats(
+            handle, &info, &error.handle, compile_wait_us));
   }
 
   Reference<Fence>

@@ -55,6 +55,9 @@ private:
 
 void setCurrentFrameStatistics(FrameStatistics *stats);
 FrameStatistics *currentFrameStatistics();
+void resetCurrentFrameApiGapMarker(dxmt::clock::time_point now);
+void recordFrameBoundaryApiGap(FrameStatistics *stats,
+                               dxmt::clock::time_point boundary_time);
 void recordExecuteTime(FrameStatistics *stats, ExecuteTimeBucket bucket,
                        dxmt::clock::duration duration);
 void recordReplayBreakdown(FrameStatistics *stats,
@@ -62,6 +65,31 @@ void recordReplayBreakdown(FrameStatistics *stats,
                            dxmt::clock::duration flush_pass,
                            dxmt::clock::duration timestamp_resolve,
                            dxmt::clock::duration cpu_query_resolve);
+void recordCompiledPassBuildTime(FrameStatistics *stats,
+                                 dxmt::clock::duration duration);
+void recordCompiledDrawEncodeTime(FrameStatistics *stats,
+                                  dxmt::clock::duration duration);
+void recordCompiledDispatchEncodeTime(FrameStatistics *stats,
+                                      dxmt::clock::duration duration);
+void recordArgumentTableUpdateTime(FrameStatistics *stats,
+                                   dxmt::clock::duration duration);
+void recordArgumentTableBindTime(FrameStatistics *stats,
+                                 dxmt::clock::duration duration);
+void recordResidencySubmitTime(FrameStatistics *stats,
+                               dxmt::clock::duration duration);
+void recordPsoCacheLookupTime(FrameStatistics *stats,
+                              dxmt::clock::duration duration);
+void recordPsoMaterializeTime(FrameStatistics *stats,
+                              dxmt::clock::duration duration);
+void recordPsoCompileWaitTime(FrameStatistics *stats,
+                              dxmt::clock::duration duration);
+void recordCompiledGraphicsPackets(FrameStatistics *stats, uint64_t count);
+void recordFallbackGraphicsPackets(FrameStatistics *stats, uint64_t count,
+                                   CompiledFallbackReason reason);
+void recordCompiledComputePackets(FrameStatistics *stats, uint64_t count);
+void recordFallbackComputePackets(FrameStatistics *stats, uint64_t count,
+                                  CompiledFallbackReason reason);
+void recordStateRecordsElided(FrameStatistics *stats, uint64_t count);
 void recordFrameBoundary(uint64_t frame);
 void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                          const FrameStatistics &average_stats,

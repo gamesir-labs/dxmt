@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_descriptor_mirror.hpp"
 #include "d3d12_resource.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
@@ -20,6 +21,116 @@
 #include <utility>
 
 namespace dxmt::d3d12 {
+
+const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind) {
+  switch (kind) {
+  case CompiledCommandSegmentKind::Graphics:
+    return "graphics";
+  case CompiledCommandSegmentKind::Compute:
+    return "compute";
+  case CompiledCommandSegmentKind::Fallback:
+    return "fallback";
+  }
+  return "unknown";
+}
+
+const char *CompiledCommandFallbackReasonName(
+    CompiledCommandFallbackReason reason) {
+  switch (reason) {
+  case CompiledCommandFallbackReason::None:
+    return "none";
+  case CompiledCommandFallbackReason::ConservativeCompiler:
+    return "conservative_compiler";
+  case CompiledCommandFallbackReason::LegacyPipelineState:
+    return "legacy_pipeline_state";
+  case CompiledCommandFallbackReason::NonBindlessPipelineState:
+    return "non_bindless_pipeline_state";
+  case CompiledCommandFallbackReason::GeometryPipeline:
+    return "geometry_pipeline";
+  case CompiledCommandFallbackReason::TessellationPipeline:
+    return "tessellation_pipeline";
+  case CompiledCommandFallbackReason::MissingPipelineState:
+    return "missing_pipeline_state";
+  case CompiledCommandFallbackReason::MissingRootSignature:
+    return "missing_root_signature";
+  case CompiledCommandFallbackReason::ExecuteIndirect:
+    return "execute_indirect";
+  case CompiledCommandFallbackReason::UnsupportedBarrier:
+    return "unsupported_barrier";
+  case CompiledCommandFallbackReason::CopyOrResolve:
+    return "copy_or_resolve";
+  case CompiledCommandFallbackReason::ClearOrDiscard:
+    return "clear_or_discard";
+  case CompiledCommandFallbackReason::QueryOrPredication:
+    return "query_or_predication";
+  case CompiledCommandFallbackReason::SnapshotDependent:
+    return "snapshot_dependent";
+  case CompiledCommandFallbackReason::TemporalUpscale:
+    return "temporal_upscale";
+  case CompiledCommandFallbackReason::UnsupportedRootSignature:
+    return "unsupported_root_signature";
+  case CompiledCommandFallbackReason::UnsupportedDescriptorTable:
+    return "unsupported_descriptor_table";
+  case CompiledCommandFallbackReason::UnsupportedRootDescriptor:
+    return "unsupported_root_descriptor";
+  case CompiledCommandFallbackReason::UnsupportedRootConstants:
+    return "unsupported_root_constants";
+  case CompiledCommandFallbackReason::UnsupportedVertexIndexState:
+    return "unsupported_vertex_index_state";
+  case CompiledCommandFallbackReason::UnsupportedRenderTargetState:
+    return "unsupported_render_target_state";
+  case CompiledCommandFallbackReason::UnsupportedArgumentTable:
+    return "unsupported_argument_table";
+  case CompiledCommandFallbackReason::UnsupportedCommand:
+    return "unsupported_command";
+  }
+  return "unknown";
+}
+
+dxmt::CompiledFallbackReason
+CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason) {
+  switch (reason) {
+  case CompiledCommandFallbackReason::None:
+    return dxmt::CompiledFallbackReason::Unknown;
+  case CompiledCommandFallbackReason::ConservativeCompiler:
+  case CompiledCommandFallbackReason::UnsupportedCommand:
+  case CompiledCommandFallbackReason::CopyOrResolve:
+  case CompiledCommandFallbackReason::ClearOrDiscard:
+  case CompiledCommandFallbackReason::QueryOrPredication:
+  case CompiledCommandFallbackReason::SnapshotDependent:
+  case CompiledCommandFallbackReason::TemporalUpscale:
+    return dxmt::CompiledFallbackReason::MissingCompiledEncoder;
+  case CompiledCommandFallbackReason::LegacyPipelineState:
+    return dxmt::CompiledFallbackReason::LegacyPath;
+  case CompiledCommandFallbackReason::NonBindlessPipelineState:
+  case CompiledCommandFallbackReason::MissingPipelineState:
+    return dxmt::CompiledFallbackReason::UnsupportedPipeline;
+  case CompiledCommandFallbackReason::GeometryPipeline:
+  case CompiledCommandFallbackReason::TessellationPipeline:
+    return dxmt::CompiledFallbackReason::GeometryOrTessellation;
+  case CompiledCommandFallbackReason::MissingRootSignature:
+  case CompiledCommandFallbackReason::UnsupportedRootSignature:
+    return dxmt::CompiledFallbackReason::UnsupportedRootSignature;
+  case CompiledCommandFallbackReason::ExecuteIndirect:
+    return dxmt::CompiledFallbackReason::Indirect;
+  case CompiledCommandFallbackReason::UnsupportedBarrier:
+    return dxmt::CompiledFallbackReason::ResourceBarrier;
+  case CompiledCommandFallbackReason::UnsupportedDescriptorTable:
+    return dxmt::CompiledFallbackReason::UnsupportedDescriptorTable;
+  case CompiledCommandFallbackReason::UnsupportedRootDescriptor:
+    return dxmt::CompiledFallbackReason::UnsupportedRootDescriptor;
+  case CompiledCommandFallbackReason::UnsupportedRootConstants:
+    return dxmt::CompiledFallbackReason::UnsupportedRootConstants;
+  case CompiledCommandFallbackReason::UnsupportedVertexIndexState:
+    return dxmt::CompiledFallbackReason::UnsupportedVertexIndexState;
+  case CompiledCommandFallbackReason::UnsupportedRenderTargetState:
+    return dxmt::CompiledFallbackReason::UnsupportedRenderTargetState;
+  case CompiledCommandFallbackReason::UnsupportedArgumentTable:
+    return dxmt::CompiledFallbackReason::UnsupportedArgumentTable;
+  }
+  return dxmt::CompiledFallbackReason::Unknown;
+}
+
 namespace {
 
 std::atomic<uint32_t> g_apitrace_record_diag_log_count = 0;
@@ -276,6 +387,675 @@ IsValidResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
   }
 }
 
+struct CompiledCommandBuildState {
+  Com<ID3D12PipelineState> pipeline_state;
+  Com<ID3D12RootSignature> compute_root_signature;
+  Com<ID3D12RootSignature> graphics_root_signature;
+  CompiledCommandDescriptorHeaps descriptor_heaps;
+  std::vector<CompiledCommandRootDescriptorTable> compute_root_tables;
+  std::vector<CompiledCommandRootDescriptorTable> graphics_root_tables;
+  std::vector<CompiledCommandRootConstants> compute_root_constants;
+  std::vector<CompiledCommandRootConstants> graphics_root_constants;
+  std::vector<CompiledCommandRootDescriptor> compute_root_descriptors;
+  std::vector<CompiledCommandRootDescriptor> graphics_root_descriptors;
+  std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>,
+             D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT>
+      vertex_buffers;
+  std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
+  std::uint64_t vertex_buffer_dirty_mask = 0;
+  bool index_buffer_dirty = false;
+  CompiledCommandRenderState render_state;
+};
+
+static PipelineState *
+GetCompiledPipelineState(ID3D12PipelineState *pipeline_state) {
+  return dynamic_cast<PipelineState *>(pipeline_state);
+}
+
+static bool
+CompiledPipelineHasStage(const PipelineState &pipeline,
+                         PipelineShaderStage stage) {
+  const auto &shaders = pipeline.GetDxilShaders();
+  return std::any_of(shaders.begin(), shaders.end(),
+                     [stage](const PipelineDxilShader &shader) {
+    return shader.stage == stage;
+  });
+}
+
+static bool
+CompiledPipelineUsesGeometry(const PipelineState &pipeline) {
+  return CompiledPipelineHasStage(pipeline, PipelineShaderStage::Geometry);
+}
+
+static bool
+CompiledPipelineUsesTessellation(const PipelineState &pipeline) {
+  return CompiledPipelineHasStage(pipeline, PipelineShaderStage::Hull) ||
+         CompiledPipelineHasStage(pipeline, PipelineShaderStage::Domain);
+}
+
+static ID3D12RootSignature *
+ResolveCompiledRootSignature(const CompiledCommandBuildState &state,
+                             PipelineState *pipeline, bool compute) {
+  auto *root_signature = compute ? state.compute_root_signature.ptr()
+                                 : state.graphics_root_signature.ptr();
+  if (!root_signature && pipeline)
+    root_signature = pipeline->GetRootSignature();
+  return root_signature;
+}
+
+static UINT
+CompiledDescriptorRangeOffset(const RootSignatureRange &range,
+                              UINT running_offset) {
+  return range.offset_in_descriptors_from_table_start == UINT_MAX
+             ? running_offset
+             : range.offset_in_descriptors_from_table_start;
+}
+
+static D3D12_DESCRIPTOR_HEAP_TYPE
+CompiledDescriptorHeapTypeForRange(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
+  return range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER
+             ? D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+             : D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+}
+
+static bool
+CompiledRootParameterHasDescriptorRanges(
+    const RootSignatureParameter &parameter,
+    D3D12_DESCRIPTOR_HEAP_TYPE heap_type,
+    UINT *descriptor_count) {
+  if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+    return false;
+
+  bool has_matching_range = false;
+  UINT running_offset = 0;
+  UINT max_descriptor_count = 0;
+  for (const auto &range : parameter.ranges) {
+    const auto range_heap_type =
+        CompiledDescriptorHeapTypeForRange(range.range_type);
+    const auto range_offset =
+        CompiledDescriptorRangeOffset(range, running_offset);
+    if (range_heap_type == heap_type) {
+      if (range.descriptor_count == UINT_MAX)
+        return false;
+      if (range_offset + range.descriptor_count < range_offset)
+        return false;
+      max_descriptor_count =
+          std::max(max_descriptor_count, range_offset + range.descriptor_count);
+      has_matching_range = true;
+    }
+    if (range.descriptor_count != UINT_MAX)
+      running_offset = range_offset + range.descriptor_count;
+  }
+
+  if (descriptor_count)
+    *descriptor_count = max_descriptor_count;
+  return has_matching_range;
+}
+
+static CompiledCommandFallbackReason
+CompiledPipelineFallbackReasonFromMetadata(
+    const CompiledCommandPipelineMetadata &metadata, bool compute) {
+  if (!metadata.has_pipeline_state)
+    return CompiledCommandFallbackReason::MissingPipelineState;
+  if (!metadata.has_dxmt_pipeline)
+    return CompiledCommandFallbackReason::LegacyPipelineState;
+  if (!metadata.type_matches)
+    return CompiledCommandFallbackReason::LegacyPipelineState;
+  if (!compute && metadata.uses_geometry)
+    return CompiledCommandFallbackReason::GeometryPipeline;
+  if (!compute && metadata.uses_tessellation)
+    return CompiledCommandFallbackReason::TessellationPipeline;
+  if (!metadata.uses_bindless_mirror)
+    return CompiledCommandFallbackReason::NonBindlessPipelineState;
+  if (!metadata.has_root_signature)
+    return CompiledCommandFallbackReason::MissingRootSignature;
+  if (metadata.ordinary_bindless && !metadata.metal_pso_ready)
+    return CompiledCommandFallbackReason::LegacyPipelineState;
+  return CompiledCommandFallbackReason::None;
+}
+
+static CompiledCommandPipelineMetadata
+BuildCompiledPipelineMetadata(const CompiledCommandBuildState &state,
+                              bool compute) {
+  CompiledCommandPipelineMetadata metadata = {};
+  const auto expected_type = compute ? PipelineStateType::Compute
+                                     : PipelineStateType::Graphics;
+  metadata.type = expected_type;
+  metadata.has_pipeline_state = bool(state.pipeline_state);
+  if (!metadata.has_pipeline_state) {
+    metadata.perf_fallback_reason =
+        dxmt::CompiledFallbackReason::UnsupportedPipeline;
+    return metadata;
+  }
+
+  auto *pipeline = GetCompiledPipelineState(state.pipeline_state.ptr());
+  metadata.pipeline = pipeline;
+  metadata.has_dxmt_pipeline = pipeline != nullptr;
+  if (!pipeline) {
+    metadata.perf_fallback_reason = dxmt::CompiledFallbackReason::LegacyPath;
+    return metadata;
+  }
+
+  metadata.type = pipeline->GetType();
+  metadata.type_matches = metadata.type == expected_type;
+  metadata.has_root_signature =
+      ResolveCompiledRootSignature(state, pipeline, compute) != nullptr;
+  metadata.uses_bindless_mirror = pipeline->UsesBindlessMirror();
+  if (!compute) {
+    metadata.uses_geometry = CompiledPipelineUsesGeometry(*pipeline);
+    metadata.uses_tessellation = CompiledPipelineUsesTessellation(*pipeline);
+  }
+  metadata.ordinary_bindless =
+      metadata.type_matches && metadata.has_root_signature &&
+      metadata.uses_bindless_mirror &&
+      (compute || (!metadata.uses_geometry && !metadata.uses_tessellation));
+  if (metadata.ordinary_bindless) {
+    if (compute) {
+      metadata.metal_compute = pipeline->GetMetalComputeState();
+      metadata.metal_pso_ready =
+          metadata.metal_compute && metadata.metal_compute->pso;
+    } else {
+      metadata.metal_graphics = pipeline->GetMetalGraphicsState();
+      metadata.metal_pso_ready =
+          metadata.metal_graphics && metadata.metal_graphics->pso &&
+          !metadata.metal_graphics->use_geometry &&
+          !metadata.metal_graphics->use_tessellation;
+    }
+  }
+  metadata.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(
+      CompiledPipelineFallbackReasonFromMetadata(metadata, compute));
+  return metadata;
+}
+
+static CompiledCommandFallbackReason
+CompiledPipelineFallbackReason(const CompiledCommandBuildState &state,
+                               bool compute) {
+  auto metadata = BuildCompiledPipelineMetadata(state, compute);
+  return CompiledPipelineFallbackReasonFromMetadata(metadata, compute);
+}
+
+static void
+SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
+                           const DescriptorHeapsRecord &record) {
+  state.descriptor_heaps = {};
+  state.descriptor_heaps.all = record.heaps;
+  for (const auto &heap : record.heaps) {
+    auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
+    if (!descriptor_heap)
+      continue;
+    const auto &desc = descriptor_heap->GetDescriptorHeapDesc();
+    if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+      continue;
+    if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+      state.descriptor_heaps.cbv_srv_uav = heap;
+    else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+      state.descriptor_heaps.sampler = heap;
+  }
+}
+
+static void
+UpsertCompiledRootDescriptorTable(
+    std::vector<CompiledCommandRootDescriptorTable> &tables,
+    const RootDescriptorTableRecord &record) {
+  for (auto &table : tables) {
+    if (table.root_parameter_index == record.root_parameter_index) {
+      table = CompiledCommandRootDescriptorTable();
+      table.base_descriptor = record.base_descriptor;
+      table.root_parameter_index = record.root_parameter_index;
+      return;
+    }
+  }
+  CompiledCommandRootDescriptorTable table = {};
+  table.root_parameter_index = record.root_parameter_index;
+  table.base_descriptor = record.base_descriptor;
+  tables.push_back(table);
+}
+
+static void
+UpsertCompiledRootConstants(
+    std::vector<CompiledCommandRootConstants> &constants,
+    const RootConstantsRecord &record) {
+  for (auto &entry : constants) {
+    if (entry.root_parameter_index == record.root_parameter_index) {
+      const auto local_end =
+          record.dst_offset + static_cast<UINT>(record.values.size());
+      const auto local_begin =
+          std::min<UINT>(entry.dst_offset, record.dst_offset);
+      const auto local_size =
+          std::max<UINT>(entry.dst_offset + static_cast<UINT>(entry.values.size()),
+                         local_end) -
+          local_begin;
+      std::vector<UINT> merged(local_size, 0);
+      std::copy(entry.values.begin(), entry.values.end(),
+                merged.begin() + (entry.dst_offset - local_begin));
+      std::copy(record.values.begin(), record.values.end(),
+                merged.begin() + (record.dst_offset - local_begin));
+      entry.dst_offset = local_begin;
+      entry.values = std::move(merged);
+      return;
+    }
+  }
+  CompiledCommandRootConstants entry = {};
+  entry.root_parameter_index = record.root_parameter_index;
+  entry.dst_offset = record.dst_offset;
+  entry.values = record.values;
+  constants.push_back(std::move(entry));
+}
+
+static void
+UpsertCompiledRootDescriptor(
+    std::vector<CompiledCommandRootDescriptor> &descriptors,
+    const RootDescriptorRecord &record) {
+  for (auto &entry : descriptors) {
+    if (entry.root_parameter_index == record.root_parameter_index &&
+        entry.parameter_type == record.parameter_type) {
+      entry.address = record.address;
+      return;
+    }
+  }
+  descriptors.push_back(CompiledCommandRootDescriptor{
+      record.parameter_type, record.root_parameter_index, record.address});
+}
+
+static void
+UpdateCompiledCommandBuildState(CompiledCommandBuildState &state,
+                                const CommandRecordPayload &payload) {
+  if (const auto *record = std::get_if<PipelineStateRecord>(&payload)) {
+    state.pipeline_state = record->pipeline_state;
+  } else if (const auto *record =
+                 std::get_if<DescriptorHeapsRecord>(&payload)) {
+    SetCompiledDescriptorHeaps(state, *record);
+  } else if (const auto *record =
+                 std::get_if<RootSignatureRecord>(&payload)) {
+    if (record->compute) {
+      state.compute_root_signature = record->root_signature;
+      state.compute_root_tables.clear();
+      state.compute_root_constants.clear();
+      state.compute_root_descriptors.clear();
+    } else {
+      state.graphics_root_signature = record->root_signature;
+      state.graphics_root_tables.clear();
+      state.graphics_root_constants.clear();
+      state.graphics_root_descriptors.clear();
+    }
+  } else if (const auto *record =
+                 std::get_if<RootDescriptorTableRecord>(&payload)) {
+    auto &tables = record->compute ? state.compute_root_tables
+                                   : state.graphics_root_tables;
+    UpsertCompiledRootDescriptorTable(tables, *record);
+  } else if (const auto *record =
+                 std::get_if<RootConstantsRecord>(&payload)) {
+    auto &constants = record->compute ? state.compute_root_constants
+                                      : state.graphics_root_constants;
+    UpsertCompiledRootConstants(constants, *record);
+  } else if (const auto *record =
+                 std::get_if<RootDescriptorRecord>(&payload)) {
+    auto &descriptors = record->compute ? state.compute_root_descriptors
+                                        : state.graphics_root_descriptors;
+    UpsertCompiledRootDescriptor(descriptors, *record);
+  } else if (const auto *record = std::get_if<VertexBuffersRecord>(&payload)) {
+    for (UINT i = 0;
+         i < record->view_count &&
+         record->start_slot + i < state.vertex_buffers.size();
+         i++) {
+      const auto slot = record->start_slot + i;
+      if (i < record->views.size()) {
+        state.vertex_buffers[slot] = record->views[i];
+      } else {
+        state.vertex_buffers[slot].reset();
+      }
+      if (slot < 64)
+        state.vertex_buffer_dirty_mask |= 1ull << slot;
+    }
+  } else if (const auto *record = std::get_if<IndexBufferRecord>(&payload)) {
+    state.index_buffer = record->view;
+    state.index_buffer_dirty = true;
+  } else if (const auto *record = std::get_if<RenderTargetsRecord>(&payload)) {
+    state.render_state.render_targets = record->render_targets;
+    state.render_state.depth_stencil = record->depth_stencil;
+  } else if (const auto *record = std::get_if<ViewportRecord>(&payload)) {
+    state.render_state.viewports = record->viewports;
+  } else if (const auto *record = std::get_if<ScissorRecord>(&payload)) {
+    state.render_state.scissors = record->rects;
+  } else if (const auto *record = std::get_if<BlendFactorRecord>(&payload)) {
+    state.render_state.blend_factor = record->blend_factor;
+  } else if (const auto *record = std::get_if<StencilRefRecord>(&payload)) {
+    state.render_state.stencil_ref = record->stencil_ref;
+  } else if (const auto *record =
+                 std::get_if<PrimitiveTopologyRecord>(&payload)) {
+    state.render_state.topology = record->topology;
+  }
+}
+
+static void
+FillCompiledPipelineBinding(CompiledCommandPipelineBinding &binding,
+                            const CompiledCommandBuildState &state,
+                            bool compute) {
+  auto *pipeline = GetCompiledPipelineState(state.pipeline_state.ptr());
+  auto *root_signature =
+      ResolveCompiledRootSignature(state, pipeline, compute);
+  binding.pipeline_state = state.pipeline_state;
+  binding.root_signature = root_signature;
+  binding.metadata = BuildCompiledPipelineMetadata(state, compute);
+  binding.pipeline_state_pending = !state.pipeline_state;
+  binding.root_signature_pending = !root_signature;
+  binding.bindless_candidate = binding.metadata.ordinary_bindless;
+}
+
+static CompiledCommandInputAssemblerState
+BuildCompiledInputAssemblerState(const CompiledCommandBuildState &state) {
+  CompiledCommandInputAssemblerState result = {};
+  result.index_buffer = state.index_buffer;
+  result.vertex_buffer_dirty_mask = state.vertex_buffer_dirty_mask;
+  result.index_buffer_dirty = state.index_buffer_dirty;
+  for (UINT slot = 0; slot < state.vertex_buffers.size(); slot++) {
+    if (state.vertex_buffers[slot])
+      result.vertex_buffers.push_back(
+          CompiledCommandVertexBuffer{slot, *state.vertex_buffers[slot]});
+  }
+  return result;
+}
+
+static void
+ClearCompiledInputAssemblerDirtyState(CompiledCommandBuildState &state) {
+  state.vertex_buffer_dirty_mask = 0;
+  state.index_buffer_dirty = false;
+}
+
+static DescriptorHeap *
+GetCompiledDescriptorHeap(const CompiledCommandDescriptorHeaps &heaps,
+                          D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
+  const auto &heap = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+                         ? heaps.sampler
+                         : heaps.cbv_srv_uav;
+  return dynamic_cast<DescriptorHeap *>(heap.ptr());
+}
+
+static CompiledCommandFallbackReason
+MaterializeCompiledRootDescriptorTable(
+    CompiledCommandRootDescriptorTable &table,
+    const CompiledCommandDescriptorHeaps &heaps,
+    const RootSignatureParameter &parameter) {
+  if (!table.base_descriptor.ptr)
+    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+
+  D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
+  UINT descriptor_count = 0;
+  const bool has_resource_ranges = CompiledRootParameterHasDescriptorRanges(
+      parameter, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, &descriptor_count);
+  UINT sampler_descriptor_count = 0;
+  const bool has_sampler_ranges = CompiledRootParameterHasDescriptorRanges(
+      parameter, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+      &sampler_descriptor_count);
+  if (has_resource_ranges && has_sampler_ranges)
+    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+  if (has_resource_ranges) {
+    heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  } else if (has_sampler_ranges) {
+    heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    descriptor_count = sampler_descriptor_count;
+  } else {
+    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+  }
+
+  auto *heap = GetCompiledDescriptorHeap(heaps, heap_type);
+  if (!heap)
+    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+
+  auto *mirror = heap->GetMirror();
+  if (!mirror || !mirror->descriptorTableBuffer() ||
+      !mirror->descriptorTableGpuAddress() || !mirror->argumentTable())
+    return CompiledCommandFallbackReason::UnsupportedArgumentTable;
+  if (heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+      !mirror->textureViewPoolBaseResourceID())
+    return CompiledCommandFallbackReason::UnsupportedArgumentTable;
+
+  const auto *base = heap->GetDescriptorRecord(table.base_descriptor);
+  if (!base || !base->shader_visible || base->heap_type != heap_type)
+    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+  if (descriptor_count &&
+      (base->heap_index >= base->heap_count ||
+       descriptor_count > base->heap_count - base->heap_index))
+    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+
+  table.heap_type = heap_type;
+  table.heap_index = base->heap_index;
+  table.descriptor_count = descriptor_count;
+  table.heap_count = base->heap_count;
+  table.table_offset =
+      base->heap_index * table.table_entry_stride;
+  table.descriptor_table_gpu_address = mirror->descriptorTableGpuAddress();
+  table.descriptor_table_entry_gpu_address =
+      table.descriptor_table_gpu_address + table.table_offset;
+  table.owning_heap = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+                          ? heaps.sampler
+                          : heaps.cbv_srv_uav;
+  table.mirror = mirror;
+  table.resolved = true;
+  table.argument_table_ready = true;
+  return CompiledCommandFallbackReason::None;
+}
+
+static CompiledCommandFallbackReason
+MaterializeCompiledGraphicsRootTables(CompiledGraphicsPacket &packet) {
+  if (!packet.pipeline.root_signature)
+    return CompiledCommandFallbackReason::MissingRootSignature;
+
+  auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+  if (!root)
+    return CompiledCommandFallbackReason::MissingRootSignature;
+
+  const auto parameters = root->GetParameters();
+  for (auto &table : packet.root_tables) {
+    if (table.root_parameter_index >= parameters.size())
+      return CompiledCommandFallbackReason::UnsupportedRootSignature;
+    const auto &parameter = parameters[table.root_parameter_index];
+    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+      return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+
+    const auto reason = MaterializeCompiledRootDescriptorTable(
+        table, packet.descriptor_heaps, parameter);
+    if (reason != CompiledCommandFallbackReason::None)
+      return reason;
+  }
+
+  return CompiledCommandFallbackReason::None;
+}
+
+static CompiledCommandFallbackReason
+MaterializeCompiledComputeRootTables(CompiledComputePacket &packet) {
+  if (!packet.pipeline.root_signature)
+    return CompiledCommandFallbackReason::MissingRootSignature;
+
+  auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+  if (!root)
+    return CompiledCommandFallbackReason::MissingRootSignature;
+
+  const auto parameters = root->GetParameters();
+  for (auto &table : packet.root_tables) {
+    if (table.root_parameter_index >= parameters.size())
+      return CompiledCommandFallbackReason::UnsupportedRootSignature;
+    const auto &parameter = parameters[table.root_parameter_index];
+    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+      return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+
+    const auto reason = MaterializeCompiledRootDescriptorTable(
+        table, packet.descriptor_heaps, parameter);
+    if (reason != CompiledCommandFallbackReason::None)
+      return reason;
+  }
+
+  return CompiledCommandFallbackReason::None;
+}
+
+static CompiledGraphicsPacket
+BuildCompiledGraphicsPacket(const CommandRecord &record, UINT record_index,
+                            const CompiledCommandBuildState &state) {
+  CompiledGraphicsPacket packet = {};
+  packet.record_index = record_index;
+  packet.d3d_sequence = record.d3d_sequence;
+  FillCompiledPipelineBinding(packet.pipeline, state, false);
+  packet.descriptor_heaps = state.descriptor_heaps;
+  packet.root_tables = state.graphics_root_tables;
+  packet.root_constants = state.graphics_root_constants;
+  packet.root_descriptors = state.graphics_root_descriptors;
+  packet.input_assembler = BuildCompiledInputAssemblerState(state);
+  packet.render_state = state.render_state;
+  if (const auto *draw = std::get_if<DrawInstancedRecord>(&record.payload))
+    packet.draw = *draw;
+  else if (const auto *draw_indexed =
+               std::get_if<DrawIndexedInstancedRecord>(&record.payload))
+    packet.draw_indexed = *draw_indexed;
+  return packet;
+}
+
+static CompiledComputePacket
+BuildCompiledComputePacket(const CommandRecord &record, UINT record_index,
+                           const CompiledCommandBuildState &state) {
+  CompiledComputePacket packet = {};
+  packet.record_index = record_index;
+  packet.d3d_sequence = record.d3d_sequence;
+  FillCompiledPipelineBinding(packet.pipeline, state, true);
+  packet.descriptor_heaps = state.descriptor_heaps;
+  packet.root_tables = state.compute_root_tables;
+  packet.root_constants = state.compute_root_constants;
+  packet.root_descriptors = state.compute_root_descriptors;
+  if (const auto *dispatch = std::get_if<DispatchRecord>(&record.payload))
+    packet.dispatch = *dispatch;
+  return packet;
+}
+
+static CompiledCommandFallbackReason
+FallbackReasonForCommandRecord(const CommandRecordPayload &payload) {
+  if (std::holds_alternative<CopyBufferRegionRecord>(payload) ||
+      std::holds_alternative<CopyTextureRegionRecord>(payload))
+    return CompiledCommandFallbackReason::SnapshotDependent;
+  if (std::holds_alternative<CopyResourceRecord>(payload) ||
+      std::holds_alternative<CopyTilesRecord>(payload) ||
+      std::holds_alternative<ResolveSubresourceRecord>(payload))
+    return CompiledCommandFallbackReason::CopyOrResolve;
+  if (std::holds_alternative<ResourceBarrierRecord>(payload))
+    return CompiledCommandFallbackReason::UnsupportedBarrier;
+  if (std::holds_alternative<ClearRenderTargetRecord>(payload) ||
+      std::holds_alternative<ClearDepthStencilRecord>(payload) ||
+      std::holds_alternative<ClearUnorderedAccessRecord>(payload) ||
+      std::holds_alternative<DiscardResourceRecord>(payload))
+    return CompiledCommandFallbackReason::ClearOrDiscard;
+  if (std::holds_alternative<BeginQueryRecord>(payload) ||
+      std::holds_alternative<EndQueryRecord>(payload) ||
+      std::holds_alternative<ResolveQueryDataRecord>(payload) ||
+      std::holds_alternative<PredicationRecord>(payload) ||
+      std::holds_alternative<WriteBufferImmediateRecord>(payload))
+    return CompiledCommandFallbackReason::QueryOrPredication;
+  if (std::holds_alternative<ExecuteIndirectRecord>(payload))
+    return CompiledCommandFallbackReason::ExecuteIndirect;
+  if (std::holds_alternative<TemporalUpscaleRecord>(payload))
+    return CompiledCommandFallbackReason::TemporalUpscale;
+  return CompiledCommandFallbackReason::ConservativeCompiler;
+}
+
+static void
+AppendCompiledFallbackSegment(
+    CompiledCommandList &compiled, UINT record_index,
+    CompiledCommandFallbackReason reason) {
+  if (!compiled.segments.empty()) {
+    auto &last = compiled.segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Fallback &&
+        last.fallback_reason == reason &&
+        last.first_record_index + last.record_count == record_index) {
+      last.record_count++;
+      return;
+    }
+  }
+
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Fallback;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.fallback_reason = reason;
+  segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(reason);
+  compiled.segments.push_back(segment);
+}
+
+static void
+AppendCompiledGraphicsSegment(CompiledCommandList &compiled, UINT record_index,
+                              CompiledGraphicsPacket &&packet) {
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Graphics;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.first_graphics_packet =
+      static_cast<UINT>(compiled.graphics_packets.size());
+  segment.graphics_packet_count = 1;
+  compiled.graphics_packets.push_back(std::move(packet));
+  compiled.segments.push_back(segment);
+}
+
+static void
+AppendCompiledComputeSegment(CompiledCommandList &compiled, UINT record_index,
+                             CompiledComputePacket &&packet) {
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Compute;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.first_compute_packet =
+      static_cast<UINT>(compiled.compute_packets.size());
+  segment.compute_packet_count = 1;
+  compiled.compute_packets.push_back(std::move(packet));
+  compiled.segments.push_back(segment);
+}
+
+static std::shared_ptr<CompiledCommandList>
+BuildCompiledCommandList(const std::vector<CommandRecord> &records) {
+  auto compiled = std::make_shared<CompiledCommandList>();
+  compiled->record_count = static_cast<UINT>(records.size());
+
+  CompiledCommandBuildState state = {};
+  for (UINT record_index = 0; record_index < records.size(); record_index++) {
+    const auto &record = records[record_index];
+    if (std::holds_alternative<DrawInstancedRecord>(record.payload) ||
+        std::holds_alternative<DrawIndexedInstancedRecord>(record.payload)) {
+      const auto reason = CompiledPipelineFallbackReason(state, false);
+      if (reason == CompiledCommandFallbackReason::None) {
+        auto packet = BuildCompiledGraphicsPacket(record, record_index, state);
+        const auto table_reason =
+            MaterializeCompiledGraphicsRootTables(packet);
+        if (table_reason == CompiledCommandFallbackReason::None) {
+          AppendCompiledGraphicsSegment(*compiled, record_index,
+                                        std::move(packet));
+          ClearCompiledInputAssemblerDirtyState(state);
+        } else {
+          AppendCompiledFallbackSegment(*compiled, record_index, table_reason);
+        }
+      } else {
+        AppendCompiledFallbackSegment(*compiled, record_index, reason);
+      }
+    } else if (std::holds_alternative<DispatchRecord>(record.payload)) {
+      const auto reason = CompiledPipelineFallbackReason(state, true);
+      if (reason == CompiledCommandFallbackReason::None) {
+        auto packet = BuildCompiledComputePacket(record, record_index, state);
+        const auto table_reason =
+            MaterializeCompiledComputeRootTables(packet);
+        if (table_reason == CompiledCommandFallbackReason::None) {
+          AppendCompiledComputeSegment(*compiled, record_index,
+                                       std::move(packet));
+        } else {
+          AppendCompiledFallbackSegment(*compiled, record_index, table_reason);
+        }
+      } else {
+        AppendCompiledFallbackSegment(*compiled, record_index, reason);
+      }
+    } else {
+      AppendCompiledFallbackSegment(
+          *compiled, record_index,
+          FallbackReasonForCommandRecord(record.payload));
+    }
+    UpdateCompiledCommandBuildState(state, record.payload);
+  }
+
+  return compiled;
+}
+
 #ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
 using GraphicsCommandListComBase = ID3D12GraphicsCommandList6;
 #elif defined(__ID3D12GraphicsCommandList5_INTERFACE_DEFINED__)
@@ -427,6 +1207,8 @@ public:
   HRESULT STDMETHODCALLTYPE Close() override {
     if (closed_)
       return E_FAIL;
+    if (!recording_error_)
+      compiled_commands_ = BuildCompiledCommandList(records_);
     closed_ = true;
     if (allocator_)
       allocator_->EndCommandListRecording(this);
@@ -467,6 +1249,7 @@ public:
     compute_root_signature_ = nullptr;
     graphics_root_signature_ = nullptr;
     records_.clear();
+    compiled_commands_.reset();
     ClearRecordedStateCache();
     closed_ = false;
     submitted_ = false;
@@ -492,6 +1275,11 @@ public:
 
   const std::vector<CommandRecord> &GetCommandRecords() const override {
     return records_;
+  }
+
+  std::shared_ptr<const CompiledCommandList> GetCompiledCommands()
+      const override {
+    return compiled_commands_;
   }
 
   void SetApitraceLifecycleRecordingEnabled(bool enabled) override {
@@ -1889,6 +2677,7 @@ private:
       vertex_buffer_cache_;
   ComPrivateData private_data_;
   std::vector<CommandRecord> records_;
+  std::shared_ptr<const CompiledCommandList> compiled_commands_;
   FLOAT depth_bounds_min_ = 0.0f;
   FLOAT depth_bounds_max_ = 1.0f;
   UINT view_instance_mask_ = 0xffffffffu;

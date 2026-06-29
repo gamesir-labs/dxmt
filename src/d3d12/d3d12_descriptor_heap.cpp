@@ -32,12 +32,14 @@ public:
       records_[i].heap_index = i;
       records_[i].heap_count = desc.NumDescriptors;
     }
-    // Eagerly allocate the bindless-mirror for shader-visible CBV/SRV/UAV and SAMPLER
-    // heaps when the feature is enabled, and back-fill the per-record back-pointer.
-    // Gated by the flag, so legacy runs allocate nothing and record.mirror stays null.
-    // Doing this at construction (rather than lazily) avoids any cross-thread
-    // first-touch ordering between the app thread (sampler fill / mark-stale) and the
-    // encode thread (texture fill).
+    // Eagerly allocate the bindless descriptor owner for shader-visible
+    // CBV/SRV/UAV and SAMPLER heaps when the feature is enabled, and back-fill
+    // the per-record back-pointer. The owner preserves the old typed mirror
+    // buffers and also owns the MSC descriptor table buffer plus the Metal4
+    // argument table that binds that buffer at bind point 0 (resources) or 1
+    // (samplers). Gated by the flag, so legacy runs allocate nothing and
+    // record.mirror stays null. Doing this at construction avoids any
+    // cross-thread first-touch ordering between descriptor writes and replay.
     const bool sampler_heap = desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     if (IsBindlessMirrorEnabled() &&
         (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
@@ -46,6 +48,24 @@ public:
           device_->GetMTLDevice(), desc.NumDescriptors, sampler_heap);
       for (UINT i = 0; i < desc.NumDescriptors; i++)
         records_[i].mirror = mirror_.get();
+    }
+  }
+
+  ~DescriptorHeapImpl() {
+    if (!mirror_)
+      return;
+    auto &queue = device_->GetDXMTDevice().queue();
+    for (auto &target : mirror_->DrainResidencyTargets()) {
+      if (target.allocation)
+        queue.RemovePersistentResidencyAfterCompletion(target.allocation);
+      if (target.secondary_allocation)
+        queue.RemovePersistentResidencyAfterCompletion(
+            target.secondary_allocation);
+      if (target.sampler)
+        queue.RetainUntilGpuComplete(
+            [sampler = std::move(target.sampler)]() mutable {
+              sampler = nullptr;
+            });
     }
   }
 

@@ -29,6 +29,7 @@ typedef uint64_t obj_handle_t;
 
 #define NULL_OBJECT_HANDLE 0
 #define WMT_HAS_ARGUMENT_TABLE_COMMANDS 1
+#define WMT_HAS_TEXTURE_VIEW_POOL 1
 
 #ifndef _MACH_PORT_T
 typedef uint32_t mach_port_t;
@@ -84,9 +85,15 @@ NSString_getCString(obj_handle_t str, char *buffer, uint64_t maxLength, enum WMT
 
 WINEMETAL_API obj_handle_t MTLDevice_newCommandQueue(obj_handle_t device, uint64_t maxCommandBufferCount);
 
+WINEMETAL_API obj_handle_t MTLDevice_newResidencySet(obj_handle_t device, uint64_t initial_capacity);
+
 WINEMETAL_API obj_handle_t NSAutoreleasePool_alloc_init();
 
 WINEMETAL_API obj_handle_t MTLCommandQueue_commandBuffer(obj_handle_t queue);
+
+WINEMETAL_API void MTLCommandQueue_addResidencySet(obj_handle_t queue, obj_handle_t set);
+
+WINEMETAL_API void MTLCommandQueue_removeResidencySet(obj_handle_t queue, obj_handle_t set);
 
 WINEMETAL_API void WMT4ApitraceSessionEnsureOpen(void);
 
@@ -103,6 +110,9 @@ WINEMETAL_API void WMT4ApitraceCommandBufferBegin(obj_handle_t command_buffer, u
 WINEMETAL_API void WMT4ApitraceCommandBufferCommit(obj_handle_t command_buffer);
 
 WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
+
+WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
+    obj_handle_t cmdbuf, uint64_t *residency_submit_us);
 
 WINEMETAL_API void MTLCommandBuffer_waitUntilCompleted(obj_handle_t cmdbuf);
 
@@ -234,6 +244,23 @@ WINEMETAL_API void MTL4ArgumentTable_setAddress(obj_handle_t table, uint64_t gpu
 WINEMETAL_API void MTL4ArgumentTable_setTexture(obj_handle_t table, uint64_t gpu_resource_id, uint32_t index);
 
 WINEMETAL_API void MTL4ArgumentTable_setSamplerState(obj_handle_t table, uint64_t gpu_resource_id, uint32_t index);
+
+struct WMTTextureViewPoolInfo {
+  uint64_t initial_count;
+};
+
+STATIC_ASSERT(sizeof(WMTTextureViewPoolInfo) == 8);
+
+WINEMETAL_API obj_handle_t MTLDevice_newTextureViewPool(
+    obj_handle_t device, const struct WMTTextureViewPoolInfo *info, obj_handle_t *err_out
+);
+
+WINEMETAL_API uint64_t MTLResourceViewPool_baseResourceID(obj_handle_t pool);
+
+WINEMETAL_API uint64_t MTLResourceViewPool_copyResourceViews(
+    obj_handle_t destination_pool, obj_handle_t source_pool,
+    uint64_t source_index, uint64_t count, uint64_t destination_index
+);
 
 enum WMTSamplerBorderColor : uint8_t {
   WMTSamplerBorderColorTransparentBlack = 0,
@@ -541,6 +568,24 @@ struct WMTTextureInfo {
   uint64_t gpu_resource_id; // out
 };
 
+struct WMTTextureViewDescriptor {
+  enum WMTPixelFormat pixel_format;
+  enum WMTTextureType texture_type;
+  uint32_t level_start;
+  uint32_t level_count;
+  uint32_t slice_start;
+  uint32_t slice_count;
+  struct WMTTextureSwizzleChannels swizzle;
+};
+
+STATIC_ASSERT(sizeof(WMTTextureViewDescriptor) == 28);
+
+struct WMTTextureBufferViewDescriptor {
+  struct WMTTextureInfo texture;
+};
+
+STATIC_ASSERT(sizeof(WMTTextureBufferViewDescriptor) == 48);
+
 enum WMTTextureInfoFlag : uint32_t {
   WMTTextureInfoFlagPlacementSparse = 1u << 0,
 };
@@ -598,6 +643,19 @@ WINEMETAL_API obj_handle_t MTLTexture_newTextureView(
     obj_handle_t texture, enum WMTPixelFormat format, enum WMTTextureType texture_type, uint16_t level_start,
     uint16_t level_count, uint16_t slice_start, uint16_t slice_count, struct WMTTextureSwizzleChannels swizzle,
     uint64_t *out_gpu_resource_id
+);
+
+WINEMETAL_API uint64_t MTLTextureViewPool_setTextureView(
+    obj_handle_t pool, obj_handle_t texture, uint64_t index
+);
+
+WINEMETAL_API uint64_t MTLTextureViewPool_setTextureViewWithDescriptor(
+    obj_handle_t pool, obj_handle_t texture, const struct WMTTextureViewDescriptor *descriptor, uint64_t index
+);
+
+WINEMETAL_API uint64_t MTLTextureViewPool_setTextureViewFromBuffer(
+    obj_handle_t pool, obj_handle_t buffer, const struct WMTTextureBufferViewDescriptor *descriptor,
+    uint64_t offset, uint64_t bytes_per_row, uint64_t index
 );
 
 WINEMETAL_API uint64_t
@@ -682,6 +740,10 @@ struct WMTComputePipelineInfo {
 WINEMETAL_API obj_handle_t MTLDevice_newComputePipelineState(
     obj_handle_t device, const struct WMTComputePipelineInfo *info, obj_handle_t *err_out
 );
+
+WINEMETAL_API obj_handle_t MTLDevice_newComputePipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTComputePipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us);
 
 WINEMETAL_API obj_handle_t MTLCommandBuffer_blitCommandEncoder(obj_handle_t cmdbuf);
 
@@ -916,9 +978,17 @@ struct WMTMeshRenderPipelineInfo {
 WINEMETAL_API obj_handle_t
 MTLDevice_newRenderPipelineState(obj_handle_t device, const struct WMTRenderPipelineInfo *info, obj_handle_t *err_out);
 
+WINEMETAL_API obj_handle_t MTLDevice_newRenderPipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTRenderPipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us);
+
 WINEMETAL_API obj_handle_t MTLDevice_newMeshRenderPipelineState(
     obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info, obj_handle_t *err_out
 );
+
+WINEMETAL_API obj_handle_t MTLDevice_newMeshRenderPipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us);
 
 struct WMTSize {
   uint64_t width;
@@ -2079,6 +2149,14 @@ WINEMETAL_API void MTL4TimestampContext_writeTimestamp(
 
 WINEMETAL_API uint64_t MTLDevice_sizeOfTimestampHeapEntry(obj_handle_t device);
 
+WINEMETAL_API void MTLResidencySet_addAllocation(obj_handle_t set, obj_handle_t allocation);
+
+WINEMETAL_API void MTLResidencySet_removeAllocation(obj_handle_t set, obj_handle_t allocation);
+
+WINEMETAL_API void MTLResidencySet_commit(obj_handle_t set);
+
+WINEMETAL_API void MTLResidencySet_requestResidency(obj_handle_t set);
+
 enum WMTCommandBufferProperty : uint32_t {
   WMTCommandBufferPropertyKernelStartTime,
   WMTCommandBufferPropertyKernelEndTime,
@@ -2104,5 +2182,9 @@ struct WMTTileRenderPipelineInfo {
 WINEMETAL_API obj_handle_t MTLDevice_newTileRenderPipelineState(
     obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
 );
+
+WINEMETAL_API obj_handle_t MTLDevice_newTileRenderPipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTTileRenderPipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us);
 
 #endif

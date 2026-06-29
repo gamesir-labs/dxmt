@@ -107,6 +107,16 @@ MTLDevice_newCommandQueue(obj_handle_t device, uint64_t maxCommandBufferCount) {
 }
 
 WINEMETAL_API obj_handle_t
+MTLDevice_newResidencySet(obj_handle_t device, uint64_t initial_capacity) {
+  struct unixcall_generic_obj_uint64_obj_ret params;
+  params.handle = device;
+  params.arg = initial_capacity;
+  params.ret = 0;
+  UNIX_CALL(160, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
 NSAutoreleasePool_alloc_init() {
   struct unixcall_generic_obj_ret params;
   params.ret = 0;
@@ -121,6 +131,22 @@ MTLCommandQueue_commandBuffer(obj_handle_t queue) {
   params.ret = 0;
   UNIX_CALL(11, &params);
   return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandQueue_addResidencySet(obj_handle_t queue, obj_handle_t set) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = queue;
+  params.arg = set;
+  UNIX_CALL(161, &params);
+}
+
+WINEMETAL_API void
+MTLCommandQueue_removeResidencySet(obj_handle_t queue, obj_handle_t set) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = queue;
+  params.arg = set;
+  UNIX_CALL(162, &params);
 }
 
 WINEMETAL_API void
@@ -176,9 +202,22 @@ WMT4ApitraceCommandBufferCommit(obj_handle_t command_buffer) {
 
 WINEMETAL_API void
 MTLCommandBuffer_commit(obj_handle_t cmdbuf) {
-  struct unixcall_generic_obj_noret params;
+  struct unixcall_mtlcommandbuffer_commit_stats params;
   params.handle = cmdbuf;
+  params.ret_residency_submit_us = 0;
   UNIX_CALL(12, &params);
+  return;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_commitAndGetStats(obj_handle_t cmdbuf,
+                                   uint64_t *residency_submit_us) {
+  struct unixcall_mtlcommandbuffer_commit_stats params;
+  params.handle = cmdbuf;
+  params.ret_residency_submit_us = 0;
+  UNIX_CALL(12, &params);
+  if (residency_submit_us)
+    *residency_submit_us = params.ret_residency_submit_us;
   return;
 }
 
@@ -246,6 +285,21 @@ MTLDevice_newArgumentTable(obj_handle_t device, const struct WMTArgumentTableInf
   return params.ret;
 }
 
+WINEMETAL_API obj_handle_t
+MTLDevice_newTextureViewPool(
+    obj_handle_t device, const struct WMTTextureViewPoolInfo *info, obj_handle_t *err_out
+) {
+  struct unixcall_mtldevice_newtextureviewpool params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pool = 0;
+  UNIX_CALL(167, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_pool;
+}
+
 WINEMETAL_API void
 MTL4ArgumentTable_setAddress(obj_handle_t table, uint64_t gpu_address, uint32_t index) {
   struct unixcall_mtl4argumenttable_setentry params;
@@ -271,6 +325,31 @@ MTL4ArgumentTable_setSamplerState(obj_handle_t table, uint64_t gpu_resource_id, 
   params.payload = gpu_resource_id;
   params.index = index;
   UNIX_CALL(159, &params);
+}
+
+WINEMETAL_API uint64_t
+MTLResourceViewPool_baseResourceID(obj_handle_t pool) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = pool;
+  params.ret = 0;
+  UNIX_CALL(168, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLResourceViewPool_copyResourceViews(
+    obj_handle_t destination_pool, obj_handle_t source_pool,
+    uint64_t source_index, uint64_t count, uint64_t destination_index
+) {
+  struct unixcall_mtlresourceviewpool_copy params;
+  params.destination_pool = destination_pool;
+  params.source_pool = source_pool;
+  params.source_index = source_index;
+  params.count = count;
+  params.destination_index = destination_index;
+  params.ret_gpu_resource_id = 0;
+  UNIX_CALL(169, &params);
+  return params.ret_gpu_resource_id;
 }
 
 WINEMETAL_API obj_handle_t
@@ -326,9 +405,54 @@ MTLTexture_newTextureView(
   params.slice_start = slice_start;
   params.slice_count = slice_count;
   params.swizzle = swizzle;
+  params.ret = 0;
+  params.gpu_resource_id = 0;
   UNIX_CALL(23, &params);
-  *out_gpu_resource_id = params.gpu_resource_id;
+  if (out_gpu_resource_id)
+    *out_gpu_resource_id = params.gpu_resource_id;
   return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLTextureViewPool_setTextureView(obj_handle_t pool, obj_handle_t texture, uint64_t index) {
+  struct unixcall_mtltextureviewpool_set_texture params;
+  params.pool = pool;
+  params.texture = texture;
+  params.index = index;
+  params.ret_gpu_resource_id = 0;
+  UNIX_CALL(170, &params);
+  return params.ret_gpu_resource_id;
+}
+
+WINEMETAL_API uint64_t
+MTLTextureViewPool_setTextureViewWithDescriptor(
+    obj_handle_t pool, obj_handle_t texture, const struct WMTTextureViewDescriptor *descriptor, uint64_t index
+) {
+  struct unixcall_mtltextureviewpool_set_texture_descriptor params;
+  params.pool = pool;
+  params.texture = texture;
+  WMT_MEMPTR_SET(params.descriptor, descriptor);
+  params.index = index;
+  params.ret_gpu_resource_id = 0;
+  UNIX_CALL(171, &params);
+  return params.ret_gpu_resource_id;
+}
+
+WINEMETAL_API uint64_t
+MTLTextureViewPool_setTextureViewFromBuffer(
+    obj_handle_t pool, obj_handle_t buffer, const struct WMTTextureBufferViewDescriptor *descriptor,
+    uint64_t offset, uint64_t bytes_per_row, uint64_t index
+) {
+  struct unixcall_mtltextureviewpool_set_buffer_descriptor params;
+  params.pool = pool;
+  params.buffer = buffer;
+  WMT_MEMPTR_SET(params.descriptor, descriptor);
+  params.offset = offset;
+  params.bytes_per_row = bytes_per_row;
+  params.index = index;
+  params.ret_gpu_resource_id = 0;
+  UNIX_CALL(172, &params);
+  return params.ret_gpu_resource_id;
 }
 
 WINEMETAL_API uint64_t
@@ -393,9 +517,28 @@ MTLDevice_newComputePipelineState(
   WMT_MEMPTR_SET(params.info, info);
   params.ret_error = 0;
   params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
   UNIX_CALL(29, &params);
   if (err_out)
     *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newComputePipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTComputePipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us) {
+  struct unixcall_mtldevice_newcomputepso params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
+  UNIX_CALL(29, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  if (compile_wait_us)
+    *compile_wait_us = params.ret_compile_wait_us;
   return params.ret_pso;
 }
 
@@ -443,9 +586,28 @@ MTLDevice_newRenderPipelineState(obj_handle_t device, const struct WMTRenderPipe
   WMT_MEMPTR_SET(params.info, info);
   params.ret_error = 0;
   params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
   UNIX_CALL(34, &params);
   if (err_out)
     *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newRenderPipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTRenderPipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us) {
+  struct unixcall_mtldevice_newrenderpso params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
+  UNIX_CALL(34, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  if (compile_wait_us)
+    *compile_wait_us = params.ret_compile_wait_us;
   return params.ret_pso;
 }
 
@@ -458,9 +620,28 @@ MTLDevice_newMeshRenderPipelineState(
   WMT_MEMPTR_SET(params.info, info);
   params.ret_error = 0;
   params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
   UNIX_CALL(35, &params);
   if (err_out)
     *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newMeshRenderPipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us) {
+  struct unixcall_mtldevice_newmeshrenderpso params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
+  UNIX_CALL(35, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  if (compile_wait_us)
+    *compile_wait_us = params.ret_compile_wait_us;
   return params.ret_pso;
 }
 
@@ -1385,9 +1566,28 @@ MTLDevice_newTileRenderPipelineState(
   WMT_MEMPTR_SET(params.info, info);
   params.ret_error = 0;
   params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
   UNIX_CALL(135, &params);
   if (err_out)
     *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newTileRenderPipelineStateAndGetStats(
+    obj_handle_t device, const struct WMTTileRenderPipelineInfo *info,
+    obj_handle_t *err_out, uint64_t *compile_wait_us) {
+  struct unixcall_mtldevice_newrenderpso params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  params.ret_compile_wait_us = 0;
+  UNIX_CALL(135, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  if (compile_wait_us)
+    *compile_wait_us = params.ret_compile_wait_us;
   return params.ret_pso;
 }
 
@@ -1437,4 +1637,34 @@ MTLDevice_updateSparseTextureMappings(
   params.ret = 0;
   UNIX_CALL(146, &params);
   return params.ret != 0;
+}
+
+WINEMETAL_API void
+MTLResidencySet_addAllocation(obj_handle_t set, obj_handle_t allocation) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = set;
+  params.arg = allocation;
+  UNIX_CALL(163, &params);
+}
+
+WINEMETAL_API void
+MTLResidencySet_removeAllocation(obj_handle_t set, obj_handle_t allocation) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = set;
+  params.arg = allocation;
+  UNIX_CALL(164, &params);
+}
+
+WINEMETAL_API void
+MTLResidencySet_commit(obj_handle_t set) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = set;
+  UNIX_CALL(165, &params);
+}
+
+WINEMETAL_API void
+MTLResidencySet_requestResidency(obj_handle_t set) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = set;
+  UNIX_CALL(166, &params);
 }

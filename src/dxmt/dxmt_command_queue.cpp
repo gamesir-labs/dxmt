@@ -74,6 +74,8 @@ DxmtQueueDiagNsToMs(uint64_t ns) {
   return static_cast<double>(ns) / 1000000.0;
 }
 
+constexpr uint64_t kPersistentResidencyInitialCapacity = 4096;
+
 void *
 CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
   return queue->AllocateCommandData(size, alignment);
@@ -104,6 +106,8 @@ CommandQueue::CommandQueue(WMT::Device device) :
     readbackThread([this]() { this->ReadbackThread(); }),
     device(device),
     commandQueue(device.newCommandQueue(kCommandChunkCount)),
+    // Growth hint only; the residency set can grow as allocations are added.
+    persistent_residency_set_(device.newResidencySet(kPersistentResidencyInitialCapacity)),
     shared_event_listener(SharedEventListener_create()),
     event_listener_thread([this]() { SharedEventListener_start(this->shared_event_listener); }),
     staging_allocator({
@@ -127,9 +131,13 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.queue = this;
     chunk.reset();
   };
-  statistics.at(frame_count).begin_time = clock::now();
+  const auto initial_frame_time = clock::now();
+  statistics.at(frame_count).begin_time = initial_frame_time;
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
+  perf::resetCurrentFrameApiGapMarker(initial_frame_time);
   event = device.newSharedEvent();
+  persistent_residency_set_.requestResidency();
+  commandQueue.addResidencySet(persistent_residency_set_);
 
 }
 
@@ -219,8 +227,9 @@ CommandQueue::CommitCurrentChunk() {
 void
 CommandQueue::PresentBoundary() {
   const auto frame_begin_time = statistics.at(frame_count).begin_time;
-  statistics.compute(frame_count);
   const auto boundary_time = clock::now();
+  perf::recordFrameBoundaryApiGap(&statistics.at(frame_count), boundary_time);
+  statistics.compute(frame_count);
   if (DxmtQueueDiagEnabled()) {
     const auto &frame = statistics.at(frame_count);
     const auto &average = statistics.average();
@@ -335,8 +344,10 @@ CommandQueue::PresentBoundary() {
       frame_count, statistics.at(frame_count - 1), statistics.average(),
       frame_wall_us);
   statistics.at(frame_count).reset();
-  statistics.at(frame_count).begin_time = clock::now();
+  const auto next_frame_begin_time = clock::now();
+  statistics.at(frame_count).begin_time = next_frame_begin_time;
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
+  perf::resetCurrentFrameApiGapMarker(next_frame_begin_time);
   // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering
   if (likely(frame_count > max_latency_)) {
     auto t0 = clock::now();
@@ -371,6 +382,82 @@ CommandQueue::WaitCPUFence(uint64_t seq) {
          " target=", seq,
          " coherent=", cpu_coherent.signaledValue(),
          " waitMs=", DxmtQueueDiagDurationMs(t1 - t0));
+  }
+}
+
+void
+CommandQueue::AddPersistentResidency(WMT::Resource allocation) {
+  if (!allocation)
+    return;
+
+  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+  auto &entry = persistent_residency_entries_[allocation.handle];
+  if (!entry.allocation) {
+    entry.allocation = allocation;
+    persistent_residency_set_.addAllocation(allocation);
+    persistent_residency_dirty_ = true;
+  }
+  entry.ref_count++;
+  entry.pending_remove = false;
+  entry.remove_after_seq = 0;
+}
+
+void
+CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Resource allocation) {
+  if (!allocation)
+    return;
+
+  const auto completed_seq = CurrentSeqId();
+  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+  auto entry = persistent_residency_entries_.find(allocation.handle);
+  if (entry == persistent_residency_entries_.end())
+    return;
+  if (entry->second.ref_count)
+    entry->second.ref_count--;
+  if (entry->second.ref_count)
+    return;
+  entry->second.pending_remove = true;
+  entry->second.remove_after_seq =
+      std::max(entry->second.remove_after_seq, completed_seq);
+}
+
+void
+CommandQueue::RetainUntilGpuComplete(std::function<void()> release) {
+  if (!release)
+    return;
+
+  auto &chunk = chunks[CurrentSeqId() % kCommandChunkCount];
+  std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
+  chunk.completion_callbacks.push_back(std::move(release));
+}
+
+uint64_t
+CommandQueue::FlushPersistentResidency() {
+  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+  if (!persistent_residency_dirty_)
+    return 0;
+
+  const auto begin = clock::now();
+  persistent_residency_set_.commit();
+  const auto end = clock::now();
+  persistent_residency_dirty_ = false;
+  return std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
+}
+
+void
+CommandQueue::RetirePersistentResidencyRemovals(uint64_t completed_seq) {
+  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+  for (auto it = persistent_residency_entries_.begin();
+       it != persistent_residency_entries_.end();) {
+    auto &entry = it->second;
+    if (entry.pending_remove && entry.ref_count == 0 &&
+        entry.remove_after_seq <= completed_seq) {
+      persistent_residency_set_.removeAllocation(entry.allocation);
+      persistent_residency_dirty_ = true;
+      it = persistent_residency_entries_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
@@ -458,8 +545,14 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
          " status=", static_cast<uint32_t>(cmdbuf.status()));
   }
   const auto commit_begin = clock::now();
-  cmdbuf.commit();
+  const uint64_t persistent_residency_submit_us = FlushPersistentResidency();
+  uint64_t metal_residency_submit_us = 0;
+  cmdbuf.commitAndGetStats(&metal_residency_submit_us);
   chunk.metal_commit_time = clock::now();
+  const uint64_t residency_submit_us =
+      persistent_residency_submit_us + metal_residency_submit_us;
+  perf::recordResidencySubmitTime(perf::currentFrameStatistics(),
+                                  std::chrono::microseconds(residency_submit_us));
   perf::recordMetalCommandBufferCommit(
       std::chrono::duration_cast<std::chrono::microseconds>(
           chunk.metal_commit_time - commit_begin).count());
@@ -664,7 +757,10 @@ CommandQueue::WaitForFinishThread() {
     chunk.readback.timestamp = {};
 
     std::vector<std::function<void()>> completion_callbacks;
-    completion_callbacks.swap(chunk.completion_callbacks);
+    {
+      std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
+      completion_callbacks.swap(chunk.completion_callbacks);
+    }
 
     EnqueueReadbacks(chunk);
     chunk.reset();
@@ -673,6 +769,7 @@ CommandQueue::WaitForFinishThread() {
     // command-buffer completion after releasing command-list storage so the CPU
     // command heap cannot be recycled while chunk.reset() still walks it.
     cpu_coherent.signal(internal_seq);
+    RetirePersistentResidencyRemovals(internal_seq);
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
       WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread signaled"
            " seq=", internal_seq,

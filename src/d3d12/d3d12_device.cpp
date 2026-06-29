@@ -17,10 +17,12 @@
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
 #include "d3d12_sampler.hpp"
+#include "dxmt_command_queue.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_shader_cache.hpp"
+#include "dxmt_texture.hpp"
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
@@ -238,6 +240,33 @@ static UINT
 GetD3D12FormatPlaneCount(DXGI_FORMAT format) {
   const auto &traits = GetDXGIFormatTraits(format);
   return traits.planeCount ? traits.planeCount : 1;
+}
+
+static UINT
+GetDescriptorResourcePlaneCount(const Resource &resource) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+  return GetD3D12FormatPlaneCount(desc.Format);
+}
+
+static UINT
+NormalizeDescriptorViewCount(UINT requested, UINT first, UINT total) {
+  if (first >= total)
+    return 1;
+  const UINT remaining = total - first;
+  if (requested == UINT_MAX || requested == 0)
+    return remaining;
+  return std::min(requested, remaining);
+}
+
+static UINT
+GetDescriptorMipDepth(const Resource &resource, UINT mip_slice) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return 1;
+  return static_cast<UINT>(
+      std::max<UINT64>(1, desc.DepthOrArraySize >> mip_slice));
 }
 
 static DXGI_FORMAT
@@ -683,6 +712,16 @@ ResetDescriptorRecord(DescriptorRecord &record) {
   record.mirror = mirror;
 }
 
+static Resource *
+GetResourceFromD3D12(ID3D12Resource *resource) {
+  if (!resource)
+    return nullptr;
+  Resource *out = nullptr;
+  resource->QueryInterface(IID_DXMTResourceDowncast,
+                           reinterpret_cast<void **>(&out));
+  return out;
+}
+
 static bool
 IsBufferResource(ID3D12Resource *resource) {
   auto *d3d12_resource = dynamic_cast<Resource *>(resource);
@@ -1089,6 +1128,864 @@ MaterializeSamplerMirrorForWrite(WMT::Device device,
   record.materialized_sampler = std::move(sampler);
   record.mirror->FillSamplerSlot(record.heap_index,
                                  record.materialized_sampler.ptr(), 0);
+}
+
+static bool
+GetBufferSrvAddressAndMetadata(WMT::Device device, Resource &resource,
+                               const DescriptorRecord &record,
+                               uint64_t &gpu_va, uint64_t &byte_size,
+                               bool &typed) {
+  UINT64 offset = 0;
+  byte_size = resource.GetResourceDesc().Width;
+  typed = false;
+
+  if (record.has_desc) {
+    const auto &srv = record.desc.srv;
+    if (srv.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
+      return false;
+
+    const UINT64 first_element = srv.Buffer.FirstElement;
+    if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+      offset += first_element * sizeof(uint32_t);
+      byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
+    } else if (srv.Format != DXGI_FORMAT_UNKNOWN) {
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device, srv.Format, format)) ||
+          !format.BytesPerTexel)
+        return false;
+      offset += first_element * format.BytesPerTexel;
+      byte_size = UINT64(srv.Buffer.NumElements) * format.BytesPerTexel;
+      typed = true;
+    } else if (srv.Buffer.StructureByteStride) {
+      offset += first_element * srv.Buffer.StructureByteStride;
+      byte_size = UINT64(srv.Buffer.NumElements) *
+                  srv.Buffer.StructureByteStride;
+    } else {
+      offset += first_element;
+      byte_size = srv.Buffer.NumElements;
+    }
+  }
+
+  gpu_va = resource.GetGpuVirtualAddress() + offset;
+  return true;
+}
+
+static bool
+GetBufferUavAddressAndMetadata(WMT::Device device, Resource &resource,
+                               const DescriptorRecord &record,
+                               uint64_t &gpu_va, uint64_t &byte_size,
+                               bool &typed) {
+  UINT64 offset = 0;
+  byte_size = resource.GetResourceDesc().Width;
+  typed = false;
+
+  if (record.has_desc) {
+    const auto &uav = record.desc.uav;
+    if (uav.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+      return false;
+
+    const UINT64 first_element = uav.Buffer.FirstElement;
+    if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+      offset += first_element * sizeof(uint32_t);
+      byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
+    } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device, uav.Format, format)) ||
+          !format.BytesPerTexel)
+        return false;
+      offset += first_element * format.BytesPerTexel;
+      byte_size = UINT64(uav.Buffer.NumElements) * format.BytesPerTexel;
+      typed = true;
+    } else if (uav.Buffer.StructureByteStride) {
+      offset += first_element * uav.Buffer.StructureByteStride;
+      byte_size = UINT64(uav.Buffer.NumElements) *
+                  uav.Buffer.StructureByteStride;
+    } else {
+      offset += first_element;
+      byte_size = uav.Buffer.NumElements;
+    }
+  }
+
+  gpu_va = resource.GetGpuVirtualAddress() + offset;
+  return true;
+}
+
+static WMTTextureSwizzle
+ComposeTextureSwizzleComponent(const WMTTextureSwizzleChannels &base,
+                               WMTTextureSwizzle component) {
+  switch (component) {
+  case WMTTextureSwizzleRed:
+    return base.r;
+  case WMTTextureSwizzleGreen:
+    return base.g;
+  case WMTTextureSwizzleBlue:
+    return base.b;
+  case WMTTextureSwizzleAlpha:
+    return base.a;
+  case WMTTextureSwizzleZero:
+  case WMTTextureSwizzleOne:
+    return component;
+  default:
+    return WMTTextureSwizzleZero;
+  }
+}
+
+static WMTTextureSwizzle
+TextureSwizzleFromD3D12Component(UINT component_mapping,
+                                 UINT component_index) {
+  switch (D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(component_index,
+                                                  component_mapping)) {
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0:
+    return WMTTextureSwizzleRed;
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1:
+    return WMTTextureSwizzleGreen;
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2:
+    return WMTTextureSwizzleBlue;
+  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3:
+    return WMTTextureSwizzleAlpha;
+  case D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0:
+    return WMTTextureSwizzleZero;
+  case D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1:
+    return WMTTextureSwizzleOne;
+  default:
+    return WMTTextureSwizzleZero;
+  }
+}
+
+static WMTTextureSwizzleChannels
+DefaultTextureViewSwizzle() {
+  return {
+      WMTTextureSwizzleRed,
+      WMTTextureSwizzleGreen,
+      WMTTextureSwizzleBlue,
+      WMTTextureSwizzleAlpha,
+  };
+}
+
+static WMTTextureSwizzleChannels
+BaseShaderReadSwizzleForFormat(WMTPixelFormat format) {
+  switch (format) {
+  case WMTPixelFormatA8Unorm:
+    return {
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleRed,
+    };
+  case WMTPixelFormatR8Unorm:
+  case WMTPixelFormatR8Unorm_sRGB:
+  case WMTPixelFormatR8Snorm:
+  case WMTPixelFormatR8Uint:
+  case WMTPixelFormatR8Sint:
+  case WMTPixelFormatR16Unorm:
+  case WMTPixelFormatR16Snorm:
+  case WMTPixelFormatR16Uint:
+  case WMTPixelFormatR16Sint:
+  case WMTPixelFormatR16Float:
+  case WMTPixelFormatR32Uint:
+  case WMTPixelFormatR32Sint:
+  case WMTPixelFormatR32Float:
+  case WMTPixelFormatBC4_RUnorm:
+  case WMTPixelFormatBC4_RSnorm:
+  case WMTPixelFormatEAC_R11Unorm:
+  case WMTPixelFormatEAC_R11Snorm:
+  case WMTPixelFormatDepth16Unorm:
+  case WMTPixelFormatDepth32Float:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleOne,
+    };
+  case WMTPixelFormatRG8Unorm:
+  case WMTPixelFormatRG8Unorm_sRGB:
+  case WMTPixelFormatRG8Snorm:
+  case WMTPixelFormatRG8Uint:
+  case WMTPixelFormatRG8Sint:
+  case WMTPixelFormatRG16Unorm:
+  case WMTPixelFormatRG16Snorm:
+  case WMTPixelFormatRG16Uint:
+  case WMTPixelFormatRG16Sint:
+  case WMTPixelFormatRG16Float:
+  case WMTPixelFormatRG32Uint:
+  case WMTPixelFormatRG32Sint:
+  case WMTPixelFormatRG32Float:
+  case WMTPixelFormatBC5_RGUnorm:
+  case WMTPixelFormatBC5_RGSnorm:
+  case WMTPixelFormatEAC_RG11Unorm:
+  case WMTPixelFormatEAC_RG11Snorm:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleGreen,
+        WMTTextureSwizzleZero,
+        WMTTextureSwizzleOne,
+    };
+  case WMTPixelFormatRG11B10Float:
+  case WMTPixelFormatRGB9E5Float:
+  case WMTPixelFormatBC6H_RGBFloat:
+  case WMTPixelFormatBC6H_RGBUfloat:
+  case WMTPixelFormatB5G6R5Unorm:
+  case WMTPixelFormatPVRTC_RGB_2BPP:
+  case WMTPixelFormatPVRTC_RGB_2BPP_sRGB:
+  case WMTPixelFormatPVRTC_RGB_4BPP:
+  case WMTPixelFormatPVRTC_RGB_4BPP_sRGB:
+  case WMTPixelFormatBGRX8Unorm:
+  case WMTPixelFormatBGRX8Unorm_sRGB:
+    return {
+        WMTTextureSwizzleRed,
+        WMTTextureSwizzleGreen,
+        WMTTextureSwizzleBlue,
+        WMTTextureSwizzleOne,
+    };
+  default:
+    return DefaultTextureViewSwizzle();
+  }
+}
+
+static WMTTextureSwizzleChannels
+ShaderResourceViewSwizzle(WMTPixelFormat format, UINT component_mapping) {
+  const auto base = BaseShaderReadSwizzleForFormat(format);
+  return {
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 0)),
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 1)),
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 2)),
+      ComposeTextureSwizzleComponent(
+          base, TextureSwizzleFromD3D12Component(component_mapping, 3)),
+  };
+}
+
+static WMTPixelFormat
+ResolveDescriptorTextureViewFormat(WMT::Device device, Resource &resource,
+                                   DXGI_FORMAT format, UINT plane) {
+  auto *texture = resource.GetTexture(plane);
+  if (!texture)
+    return WMTPixelFormatInvalid;
+  if (format == DXGI_FORMAT_UNKNOWN)
+    return texture->pixelFormat();
+  if (DepthStencilPlanarFlags(texture->pixelFormat())) {
+    switch (format) {
+    case DXGI_FORMAT_R16_UNORM:
+      if (texture->pixelFormat() == WMTPixelFormatDepth16Unorm)
+        return texture->pixelFormat();
+      break;
+    case DXGI_FORMAT_R32_FLOAT:
+      if (texture->pixelFormat() == WMTPixelFormatDepth32Float)
+        return texture->pixelFormat();
+      break;
+    default:
+      break;
+    }
+  }
+
+  MTL_DXGI_FORMAT_DESC format_desc = {};
+  if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
+      format_desc.PixelFormat == WMTPixelFormatInvalid) {
+    WARN("D3D12Device: unsupported texture view format ", uint32_t(format));
+    return WMTPixelFormatInvalid;
+  }
+  return format_desc.PixelFormat;
+}
+
+static bool
+ValidateDescriptorTextureViewRange(const char *context,
+                                   TextureViewDescriptor &view,
+                                   const Resource &resource) {
+  const auto *texture = resource.GetTexture();
+  if (!texture)
+    return false;
+
+  if (view.firstMiplevel >= texture->miplevelCount() ||
+      view.miplevelCount == 0 ||
+      view.miplevelCount > texture->miplevelCount() - view.firstMiplevel) {
+    WARN("D3D12Device: ", context,
+         " mip range exceeds texture levels first=", view.firstMiplevel,
+         " count=", view.miplevelCount,
+         " levels=", texture->miplevelCount());
+    return false;
+  }
+
+  if (resource.GetResourceDesc().Dimension ==
+      D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+    view.firstArraySlice = 0;
+    view.arraySize = 1;
+    return true;
+  }
+
+  if (view.firstArraySlice >= texture->arrayLength() ||
+      view.arraySize == 0 ||
+      view.arraySize > texture->arrayLength() - view.firstArraySlice) {
+    WARN("D3D12Device: ", context,
+         " array range exceeds texture array first=", view.firstArraySlice,
+         " count=", view.arraySize, " array_length=", texture->arrayLength());
+    return false;
+  }
+  return true;
+}
+
+struct DescriptorTextureViewBinding {
+  Rc<Texture> texture;
+  TextureViewKey view;
+  uint32_t array_length = 0;
+
+  explicit operator bool() const {
+    return texture && uint64_t(view);
+  }
+};
+
+static DescriptorTextureViewBinding
+CreateDescriptorShaderResourceTextureView(WMT::Device device,
+                                          Resource &resource,
+                                          const DescriptorRecord &record) {
+  auto *texture = resource.GetTexture();
+  if (!texture)
+    return {};
+
+  TextureViewDescriptor view = {};
+  view.format = texture->pixelFormat();
+  view.type = texture->textureType();
+  view.firstMiplevel = 0;
+  view.miplevelCount = texture->miplevelCount();
+  view.firstArraySlice = 0;
+  view.arraySize = texture->arrayLength();
+  view.intendedUsage = WMTTextureUsageShaderRead;
+  view.swizzle =
+      ShaderResourceViewSwizzle(view.format,
+                                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+
+  Rc<Texture> view_texture(texture);
+  if (record.has_desc) {
+    const auto &srv = record.desc.srv;
+    UINT plane = 0;
+    switch (srv.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+      plane = srv.Texture2D.PlaneSlice;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+      plane = srv.Texture2DArray.PlaneSlice;
+      break;
+    default:
+      break;
+    }
+    if (GetDescriptorResourcePlaneCount(resource) > 1 &&
+        srv.Format != DXGI_FORMAT_UNKNOWN &&
+        !IsDXGIFormatPlaneCompatible(resource.GetResourceDesc().Format,
+                                     srv.Format, plane)) {
+      WARN("D3D12Device: unsupported SRV plane format resource_format=",
+           uint32_t(resource.GetResourceDesc().Format),
+           " view_format=", uint32_t(srv.Format),
+           " plane=", uint32_t(plane));
+      return {};
+    }
+
+    auto *plane_texture = resource.GetTexture(plane);
+    if (!plane_texture)
+      return {};
+    view_texture = Rc<Texture>(plane_texture);
+    view.format = ResolveDescriptorTextureViewFormat(device, resource,
+                                                     srv.Format, plane);
+    if (view.format == WMTPixelFormatInvalid)
+      return {};
+    view.swizzle =
+        ShaderResourceViewSwizzle(view.format, srv.Shader4ComponentMapping);
+
+    switch (srv.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+      view.type = WMTTextureType2D;
+      view.firstMiplevel = srv.Texture1D.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.Texture1D.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.arraySize = 1;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+      view.type = WMTTextureType2DArray;
+      view.firstMiplevel = srv.Texture1DArray.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.Texture1DArray.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.firstArraySlice = srv.Texture1DArray.FirstArraySlice;
+      view.arraySize = NormalizeDescriptorViewCount(
+          srv.Texture1DArray.ArraySize, view.firstArraySlice,
+          texture->arrayLength());
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+      view.type = WMTTextureType2D;
+      view.firstMiplevel = srv.Texture2D.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.Texture2D.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.firstArraySlice = 0;
+      view.arraySize = 1;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+      view.type = WMTTextureType2DArray;
+      view.firstMiplevel = srv.Texture2DArray.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.Texture2DArray.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.firstArraySlice = srv.Texture2DArray.FirstArraySlice;
+      view.arraySize = NormalizeDescriptorViewCount(
+          srv.Texture2DArray.ArraySize, view.firstArraySlice,
+          texture->arrayLength());
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+      view.type = WMTTextureType2DMultisample;
+      view.miplevelCount = 1;
+      view.arraySize = 1;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      view.type = WMTTextureType2DMultisampleArray;
+      view.miplevelCount = 1;
+      view.firstArraySlice = srv.Texture2DMSArray.FirstArraySlice;
+      view.arraySize = NormalizeDescriptorViewCount(
+          srv.Texture2DMSArray.ArraySize, view.firstArraySlice,
+          texture->arrayLength());
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+      view.type = WMTTextureType3D;
+      view.firstMiplevel = srv.Texture3D.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.Texture3D.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.arraySize = 1;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+      view.type = WMTTextureTypeCube;
+      view.firstMiplevel = srv.TextureCube.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.TextureCube.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.arraySize = std::min<UINT>(6, texture->arrayLength());
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+      view.type = WMTTextureTypeCubeArray;
+      view.firstMiplevel = srv.TextureCubeArray.MostDetailedMip;
+      view.miplevelCount = NormalizeDescriptorViewCount(
+          srv.TextureCubeArray.MipLevels, view.firstMiplevel,
+          texture->miplevelCount());
+      view.firstArraySlice = srv.TextureCubeArray.First2DArrayFace;
+      view.arraySize = NormalizeDescriptorViewCount(
+          srv.TextureCubeArray.NumCubes * 6, view.firstArraySlice,
+          texture->arrayLength());
+      break;
+    default:
+      WARN("D3D12Device: unsupported SRV texture dimension ",
+           uint32_t(srv.ViewDimension));
+      return {};
+    }
+  }
+
+  if (!ValidateDescriptorTextureViewRange("SRV texture view", view, resource))
+    return {};
+  auto key = view_texture->createView(view);
+  return {std::move(view_texture), key, view.arraySize};
+}
+
+static DescriptorTextureViewBinding
+CreateDescriptorUnorderedAccessTextureView(WMT::Device device,
+                                           Resource &resource,
+                                           const DescriptorRecord &record) {
+  auto *texture = resource.GetTexture();
+  if (!texture)
+    return {};
+
+  TextureViewDescriptor view = {};
+  view.format = texture->pixelFormat();
+  view.type = texture->textureType();
+  view.firstMiplevel = 0;
+  view.miplevelCount = 1;
+  view.firstArraySlice = 0;
+  view.arraySize = texture->arrayLength();
+  view.intendedUsage =
+      WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+
+  Rc<Texture> view_texture(texture);
+  if (record.has_desc) {
+    const auto &uav = record.desc.uav;
+    UINT plane = 0;
+    switch (uav.ViewDimension) {
+    case D3D12_UAV_DIMENSION_TEXTURE2D:
+      plane = uav.Texture2D.PlaneSlice;
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+      plane = uav.Texture2DArray.PlaneSlice;
+      break;
+    default:
+      break;
+    }
+    if (GetDescriptorResourcePlaneCount(resource) > 1 &&
+        uav.Format != DXGI_FORMAT_UNKNOWN &&
+        !IsDXGIFormatPlaneCompatible(resource.GetResourceDesc().Format,
+                                     uav.Format, plane)) {
+      WARN("D3D12Device: unsupported UAV plane format resource_format=",
+           uint32_t(resource.GetResourceDesc().Format),
+           " view_format=", uint32_t(uav.Format),
+           " plane=", uint32_t(plane));
+      return {};
+    }
+
+    auto *plane_texture = resource.GetTexture(plane);
+    if (!plane_texture)
+      return {};
+    view_texture = Rc<Texture>(plane_texture);
+    view.format = ResolveDescriptorTextureViewFormat(device, resource,
+                                                     uav.Format, plane);
+    if (view.format == WMTPixelFormatInvalid)
+      return {};
+
+    switch (uav.ViewDimension) {
+    case D3D12_UAV_DIMENSION_TEXTURE1D:
+      view.type = WMTTextureType2D;
+      view.firstMiplevel = uav.Texture1D.MipSlice;
+      view.arraySize = 1;
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+      view.type = WMTTextureType2DArray;
+      view.firstMiplevel = uav.Texture1DArray.MipSlice;
+      view.firstArraySlice = uav.Texture1DArray.FirstArraySlice;
+      view.arraySize = NormalizeDescriptorViewCount(
+          uav.Texture1DArray.ArraySize, view.firstArraySlice,
+          texture->arrayLength());
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE2D:
+      view.type = WMTTextureType2D;
+      view.firstMiplevel = uav.Texture2D.MipSlice;
+      view.arraySize = 1;
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+      view.type = WMTTextureType2DArray;
+      view.firstMiplevel = uav.Texture2DArray.MipSlice;
+      view.firstArraySlice = uav.Texture2DArray.FirstArraySlice;
+      view.arraySize = NormalizeDescriptorViewCount(
+          uav.Texture2DArray.ArraySize, view.firstArraySlice,
+          texture->arrayLength());
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE3D:
+      view.type = WMTTextureType3D;
+      view.firstMiplevel = uav.Texture3D.MipSlice;
+      view.arraySize = 1;
+      if (view.firstMiplevel >= texture->miplevelCount()) {
+        WARN("D3D12Device: invalid 3D texture UAV mip slice ",
+             view.firstMiplevel);
+        return {};
+      }
+      {
+        const UINT mip_depth =
+            GetDescriptorMipDepth(resource, view.firstMiplevel);
+        const UINT first_w = uav.Texture3D.FirstWSlice;
+        const UINT w_size = uav.Texture3D.WSize == UINT_MAX
+                                ? (first_w < mip_depth ? mip_depth - first_w
+                                                       : 0)
+                                : uav.Texture3D.WSize;
+        if (first_w >= mip_depth || w_size == 0 ||
+            w_size > mip_depth - first_w) {
+          WARN("D3D12Device: invalid 3D texture UAV W slice range first=",
+               first_w, " size=", w_size, " mip_depth=", mip_depth);
+          return {};
+        }
+        if (first_w != 0 || w_size != mip_depth) {
+          WARN("D3D12Device: unsupported 3D texture UAV W slice subrange first=",
+               first_w, " size=", w_size, " mip_depth=", mip_depth);
+          return {};
+        }
+      }
+      break;
+    default:
+      WARN("D3D12Device: unsupported UAV texture dimension ",
+           uint32_t(uav.ViewDimension));
+      return {};
+    }
+  }
+
+  if (!ValidateDescriptorTextureViewRange("UAV texture view", view, resource))
+    return {};
+  auto key = view_texture->createView(view);
+  return {std::move(view_texture), key, view.arraySize};
+}
+
+static float
+GetShaderResourceTextureMinLod(const DescriptorRecord &record) {
+  if (!record.has_desc)
+    return 0.0f;
+  const auto &srv = record.desc.srv;
+  switch (srv.ViewDimension) {
+  case D3D12_SRV_DIMENSION_TEXTURE1D:
+    return srv.Texture1D.ResourceMinLODClamp;
+  case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+    return srv.Texture1DArray.ResourceMinLODClamp;
+  case D3D12_SRV_DIMENSION_TEXTURE2D:
+    return srv.Texture2D.ResourceMinLODClamp;
+  case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+    return srv.Texture2DArray.ResourceMinLODClamp;
+  case D3D12_SRV_DIMENSION_TEXTURE3D:
+    return srv.Texture3D.ResourceMinLODClamp;
+  case D3D12_SRV_DIMENSION_TEXTURECUBE:
+    return srv.TextureCube.ResourceMinLODClamp;
+  case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    return srv.TextureCubeArray.ResourceMinLODClamp;
+  default:
+    return 0.0f;
+  }
+}
+
+static WMT::Resource
+DescriptorBufferResidencyAllocation(Resource *resource) {
+  if (!resource || !resource->GetBufferAllocation())
+    return {};
+  return WMT::Resource{resource->GetBufferAllocation()->buffer().handle};
+}
+
+static WMT::Resource
+DescriptorTextureResidencyAllocation(Resource *resource) {
+  if (!resource || !resource->GetTextureAllocation())
+    return {};
+  return WMT::Resource{resource->GetTextureAllocation()->texture().handle};
+}
+
+static void
+SetDescriptorResidencyAllocation(WMT::Reference<WMT::Resource> &dst,
+                                 WMT::Resource allocation) {
+  if (allocation)
+    dst = allocation;
+  else
+    dst = nullptr;
+}
+
+static DescriptorResidencyTarget
+GetDescriptorResidencyTarget(const DescriptorRecord &record) {
+  DescriptorResidencyTarget target = {};
+  switch (record.type) {
+  case DescriptorRecordType::ConstantBufferView: {
+    if (!record.has_desc || !record.desc.cbv.BufferLocation)
+      return target;
+    UINT64 offset = 0;
+    auto *resource = LookupBufferResourceByGpuVirtualAddress(
+        record.desc.cbv.BufferLocation, &offset);
+    (void)offset;
+    SetDescriptorResidencyAllocation(
+        target.allocation, DescriptorBufferResidencyAllocation(resource));
+    return target;
+  }
+  case DescriptorRecordType::ShaderResourceView:
+  case DescriptorRecordType::UnorderedAccessView: {
+    auto *resource = GetResourceFromD3D12(record.resource.ptr());
+    if (!resource)
+      return target;
+    if (resource->GetBuffer()) {
+      SetDescriptorResidencyAllocation(
+          target.allocation, DescriptorBufferResidencyAllocation(resource));
+    } else if (resource->GetTexture()) {
+      SetDescriptorResidencyAllocation(
+          target.allocation, DescriptorTextureResidencyAllocation(resource));
+    }
+
+    if (record.type == DescriptorRecordType::UnorderedAccessView) {
+      auto *counter = GetResourceFromD3D12(record.counter_resource.ptr());
+      SetDescriptorResidencyAllocation(
+          target.secondary_allocation,
+          DescriptorBufferResidencyAllocation(counter));
+    }
+    return target;
+  }
+  case DescriptorRecordType::Sampler:
+    target.sampler = record.materialized_sampler;
+    return target;
+  default:
+    return target;
+  }
+}
+
+static void
+ApplyDescriptorResidencyTarget(IMTLD3D12Device *device,
+                               DescriptorRecord &record) {
+  if (!device || !record.mirror)
+    return;
+
+  auto target = GetDescriptorResidencyTarget(record);
+  auto &queue = device->GetDXMTDevice().queue();
+  if (target.allocation)
+    queue.AddPersistentResidency(target.allocation);
+  if (target.secondary_allocation)
+    queue.AddPersistentResidency(target.secondary_allocation);
+
+  auto previous =
+      record.mirror->ReplaceResidencyTarget(record.heap_index, std::move(target));
+  if (previous.allocation)
+    queue.RemovePersistentResidencyAfterCompletion(previous.allocation);
+  if (previous.secondary_allocation)
+    queue.RemovePersistentResidencyAfterCompletion(previous.secondary_allocation);
+  if (previous.sampler)
+    queue.RetainUntilGpuComplete(
+        [sampler = std::move(previous.sampler)]() mutable {
+          sampler = nullptr;
+        });
+}
+
+static void
+MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
+                                   DescriptorRecord &record) {
+  const auto mtl_device = device->GetMTLDevice();
+  const bool perf_enabled = dxmt::perf::enabled();
+  const auto update_begin =
+      perf_enabled ? dxmt::clock::now() : dxmt::clock::time_point{};
+  auto record_update_time = [&] {
+    if (perf_enabled) {
+      dxmt::perf::recordArgumentTableUpdateTime(
+          dxmt::perf::currentFrameStatistics(),
+          dxmt::clock::now() - update_begin);
+    }
+  };
+  auto *mirror = record.mirror;
+  if (!mirror)
+    return;
+  auto finish = [&] {
+    ApplyDescriptorResidencyTarget(device, record);
+    record_update_time();
+  };
+
+  const UINT slot = record.heap_index;
+  switch (record.type) {
+  case DescriptorRecordType::ConstantBufferView: {
+    if (!record.has_desc ||
+        (!record.desc.cbv.BufferLocation && !record.desc.cbv.SizeInBytes)) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    mirror->WriteBufferTableEntry(slot, record.desc.cbv.BufferLocation,
+                                  record.desc.cbv.SizeInBytes, false);
+    finish();
+    return;
+  }
+  case DescriptorRecordType::ShaderResourceView: {
+    auto *resource = GetResourceFromD3D12(record.resource.ptr());
+    if (!resource) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    if (resource->GetBuffer()) {
+      uint64_t gpu_va = 0;
+      uint64_t byte_size = 0;
+      bool typed = false;
+      if (!GetBufferSrvAddressAndMetadata(mtl_device, *resource, record, gpu_va,
+                                          byte_size, typed)) {
+        mirror->WriteNullTableEntry(slot);
+        finish();
+        return;
+      }
+      // TODO(d3d12, bindless): typed buffer SRV descriptors still need the
+      // MSC texture-buffer view offset bits when the shader expects a typed
+      // texture-buffer entry. This is a descriptor-write-time bridge for the
+      // plain IRDescriptorTableSetBuffer encoding, not the final view metadata.
+      mirror->WriteBufferTableEntry(slot, gpu_va, byte_size, typed);
+      finish();
+      return;
+    }
+    if (resource->IsReservedTexture() &&
+        !resource->EnsureTextureAllocation("DescriptorTableTextureSRV")) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    auto binding =
+        CreateDescriptorShaderResourceTextureView(mtl_device, *resource, record);
+    auto *allocation =
+        binding.texture ? binding.texture->current() : nullptr;
+    if (!binding || !allocation ||
+        !mirror->SetTexturePoolSlot(slot, binding.texture.ptr(), binding.view,
+                                    allocation)) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    mirror->WriteTexturePoolTableEntry(slot,
+                                       GetShaderResourceTextureMinLod(record));
+    finish();
+    return;
+  }
+  case DescriptorRecordType::UnorderedAccessView: {
+    auto *resource = GetResourceFromD3D12(record.resource.ptr());
+    if (!resource) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    if (resource->GetBuffer()) {
+      uint64_t gpu_va = 0;
+      uint64_t byte_size = 0;
+      bool typed = false;
+      if (!GetBufferUavAddressAndMetadata(mtl_device, *resource, record, gpu_va,
+                                          byte_size, typed)) {
+        mirror->WriteNullTableEntry(slot);
+        finish();
+        return;
+      }
+      // TODO(d3d12, bindless): UAV counters and typed texture-buffer view
+      // offset metadata need the MSC buffer-view helper path before append /
+      // consume UAV descriptors are complete in the descriptor table.
+      mirror->WriteBufferTableEntry(slot, gpu_va, byte_size, typed);
+      finish();
+      return;
+    }
+    if (resource->IsReservedTexture() &&
+        !resource->EnsureTextureAllocation("DescriptorTableTextureUAV")) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    auto binding =
+        CreateDescriptorUnorderedAccessTextureView(mtl_device, *resource, record);
+    auto *allocation =
+        binding.texture ? binding.texture->current() : nullptr;
+    if (!binding || !allocation ||
+        !mirror->SetTexturePoolSlot(slot, binding.texture.ptr(), binding.view,
+                                    allocation)) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    mirror->WriteTexturePoolTableEntry(slot);
+    finish();
+    return;
+  }
+  case DescriptorRecordType::Sampler: {
+    if (!mirror->isSamplerHeap() || !record.has_desc) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    if (!record.materialized_sampler)
+      record.materialized_sampler = CreateD3D12Sampler(mtl_device,
+                                                       record.desc.sampler);
+    mirror->WriteSamplerTableEntry(slot, record.materialized_sampler.ptr());
+    finish();
+    return;
+  }
+  default:
+    mirror->WriteNullTableEntry(slot);
+    finish();
+    return;
+  }
+}
+
+static bool
+CopyDescriptorTexturePoolSlot(const DescriptorRecord &dst,
+                              const DescriptorRecord &src) {
+  if (!dst.mirror || !src.mirror || dst.mirror->isSamplerHeap() ||
+      src.mirror->isSamplerHeap())
+    return false;
+  if (dst.type != DescriptorRecordType::ShaderResourceView &&
+      dst.type != DescriptorRecordType::UnorderedAccessView)
+    return false;
+  auto *resource = GetResourceFromD3D12(dst.resource.ptr());
+  if (!resource || resource->GetBuffer())
+    return false;
+  return dst.mirror->CopyTexturePoolSlotFrom(dst.heap_index, *src.mirror,
+                                             src.heap_index) != 0;
 }
 
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
@@ -2085,6 +2982,7 @@ public:
       record->desc.cbv = *desc;
       record->has_desc = true;
     }
+    MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled()) {
       UINT64 offset = 0;
       auto *resource = desc ? LookupBufferResourceByGpuVirtualAddress(
@@ -2128,12 +3026,17 @@ public:
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
-      if (!ValidateShaderResourceView(resource, *desc))
+      if (!ValidateShaderResourceView(resource, *desc)) {
+        ResetDescriptorRecord(*record);
+        MarkDescriptorMirrorStaleForWrite(*record);
+        MaterializeDescriptorTableForWrite(this, *record);
         return;
+      }
       record->desc.srv = *desc;
       record->has_desc = true;
     }
     MarkDescriptorMirrorStaleForWrite(*record);
+    MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled()) {
       dxmt::apitrace::record_create_shader_resource_view(
           this, resource, desc, descriptor);
@@ -2156,12 +3059,17 @@ public:
     record->resource = resource;
     record->counter_resource = counter_resource;
     if (desc) {
-      if (!ValidateUnorderedAccessView(resource, counter_resource, *desc))
+      if (!ValidateUnorderedAccessView(resource, counter_resource, *desc)) {
+        ResetDescriptorRecord(*record);
+        MarkDescriptorMirrorStaleForWrite(*record);
+        MaterializeDescriptorTableForWrite(this, *record);
         return;
+      }
       record->desc.uav = *desc;
       record->has_desc = true;
     }
     MarkDescriptorMirrorStaleForWrite(*record);
+    MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_unordered_access_view(
           this, resource, counter_resource, desc, descriptor);
@@ -2233,6 +3141,7 @@ public:
                                             DescriptorRecordType::Sampler);
     MarkDescriptorMirrorStaleForWrite(*record);
     MaterializeSamplerMirrorForWrite(GetMTLDevice(), *record);
+    MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_sampler(this, desc, descriptor);
   }
@@ -2318,6 +3227,8 @@ public:
     for (size_t i = 0; i < destinations.size(); i++) {
       MarkDescriptorMirrorStaleForWrite(*destinations[i]);
       MaterializeSamplerMirrorForWrite(GetMTLDevice(), *destinations[i]);
+      CopyDescriptorTexturePoolSlot(*destinations[i], copied[i]);
+      MaterializeDescriptorTableForWrite(this, *destinations[i]);
     }
 
     if (dxmt::apitrace::d3d_enabled())
@@ -2362,6 +3273,8 @@ public:
     for (UINT i = 0; i < descriptor_count; i++) {
       MarkDescriptorMirrorStaleForWrite(dst[i]);
       MaterializeSamplerMirrorForWrite(GetMTLDevice(), dst[i]);
+      CopyDescriptorTexturePoolSlot(dst[i], copied[i]);
+      MaterializeDescriptorTableForWrite(this, dst[i]);
     }
 
     if (dxmt::apitrace::d3d_enabled())

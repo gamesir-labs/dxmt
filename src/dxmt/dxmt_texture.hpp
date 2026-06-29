@@ -263,6 +263,8 @@ public:
 
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);
+  uint64_t setViewPoolSlot(WMT::TextureViewPool pool, TextureViewKey key,
+                           TextureAllocation *allocation, uint32_t slot);
 
   TextureViewKey checkViewUseArray(TextureViewKey key, bool isArray);
   TextureViewKey checkViewUseFormat(TextureViewKey key, WMTPixelFormat format);

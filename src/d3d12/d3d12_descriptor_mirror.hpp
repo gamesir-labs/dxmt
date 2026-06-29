@@ -3,14 +3,37 @@
 #include "Metal.hpp"
 #include "winemetal.h"
 #include "dxmt_descriptor_mirror.hpp"
+#include "rc/util_rc_ptr.hpp"
 #include <cstdint>
 #include <vector>
 
 namespace dxmt {
 class Sampler;
+class Texture;
+class TextureAllocation;
+struct TextureViewKey;
 }
 
 namespace dxmt::d3d12 {
+
+enum class DescriptorArgumentTableKind {
+  Resource,
+  Sampler,
+};
+
+struct DescriptorTableEntry {
+  uint64_t gpu_va = 0;
+  uint64_t texture_view_id = 0;
+  uint64_t metadata = 0;
+};
+
+static_assert(sizeof(DescriptorTableEntry) == sizeof(uint64_t) * 3);
+
+struct DescriptorResidencyTarget {
+  WMT::Reference<WMT::Resource> allocation;
+  WMT::Reference<WMT::Resource> secondary_allocation;
+  Rc<dxmt::Sampler> sampler;
+};
 
 /**
  * Persistent typed descriptor mirror for ONE shader-visible D3D12 descriptor heap
@@ -34,10 +57,12 @@ namespace dxmt::d3d12 {
  *   - Sampler slots are filled synchronously at CreateSampler/CopyDescriptors on the
  *     app thread (Sampler handles are a pure function of the D3D12_SAMPLER_DESC and are
  *     immutable once created).
- *   - Texture slots CANNOT be resolved on the app thread (texture->current()->
- *     gpuResourceID is only safe on the dxmt-encode-thread). CreateShaderResourceView /
- *     CopyDescriptors only MARK the slot stale (bump its generation); the actual
- *     resolve+write happens on the encode thread via FillTextureSlot() — wired by ③.
+ *   - Texture slots CANNOT be resolved for the DXBC mirror on the app thread
+ *     (texture->current()->gpuResourceID is only safe on the dxmt-encode-thread).
+ *     CreateShaderResourceView / CopyDescriptors mark the slot stale; the
+ *     resolve+write happens on the encode thread via FillTextureSlot().
+ *     The Metal4 descriptor-table entry is materialized separately at descriptor
+ *     write time and must not be overwritten by the DXBC mirror fill.
  *
  * This whole type is dormant behind DXMT_BINDLESS_MIRROR; legacy runs never allocate it.
  */
@@ -51,8 +76,56 @@ public:
   /** The Metal buffer handle (for residency / binding by ③). */
   WMT::Buffer buffer() const { return buffer_; }
 
+  WMT::ArgumentTable argumentTable() const { return argument_table_; }
+  WMT::TextureViewPool textureViewPool() const { return texture_view_pool_; }
+  uint64_t textureViewPoolBaseResourceID() const {
+    return texture_view_pool_base_resource_id_;
+  }
+  uint64_t textureViewPoolSlotResourceID(uint32_t index) const {
+    return texture_view_pool_base_resource_id_ && index < num_descriptors_
+               ? texture_view_pool_base_resource_id_ + index
+               : 0;
+  }
+
+  uint32_t argumentTableBindPoint() const { return sampler_heap_ ? 1 : 0; }
+
+  uint64_t descriptorTableGpuAddress() const { return table_gpu_address_; }
+
+  WMT::Buffer descriptorTableBuffer() const { return table_buffer_; }
+
   uint32_t numDescriptors() const { return num_descriptors_; }
   bool isSamplerHeap() const { return sampler_heap_; }
+
+  DescriptorArgumentTableKind argumentTableKind() const {
+    return sampler_heap_ ? DescriptorArgumentTableKind::Sampler
+                         : DescriptorArgumentTableKind::Resource;
+  }
+
+  const DescriptorTableEntry *descriptorTableEntry(uint32_t index) const {
+    return index < table_entries_.size() ? &table_entries_[index] : nullptr;
+  }
+
+  void WriteNullTableEntry(uint32_t index);
+  void WriteBufferTableEntry(uint32_t index, uint64_t gpu_va, uint64_t size,
+                             bool typed, uint32_t texture_view_offset = 0);
+  void WriteTextureTableEntry(uint32_t index, uint64_t gpu_resource_id,
+                              float min_lod = 0.0f);
+  void WriteTexturePoolTableEntry(uint32_t index, float min_lod = 0.0f);
+  void WriteSamplerTableEntry(uint32_t index, const Sampler *sampler);
+  uint64_t SetTexturePoolSlot(uint32_t index, dxmt::Texture *texture,
+                              dxmt::TextureViewKey view,
+                              dxmt::TextureAllocation *allocation);
+  uint64_t CopyTexturePoolSlotFrom(uint32_t dst_index,
+                                   const DescriptorHeapMirror &src,
+                                   uint32_t src_index);
+
+  DescriptorResidencyTarget ReplaceResidencyTarget(
+      uint32_t index, DescriptorResidencyTarget target);
+  std::vector<DescriptorResidencyTarget> DrainResidencyTargets();
+  const DescriptorResidencyTarget *residencyTarget(uint32_t index) const {
+    return index < residency_targets_.size() ? &residency_targets_[index]
+                                             : nullptr;
+  }
 
   /** Pointer to a texture slot's handle qword. */
   uint64_t *textureHandlePtr(uint32_t index) {
@@ -99,7 +172,7 @@ public:
   /**
    * Fill a TEXTURE slot with an already-resolved (gpuResourceID, arrayLength). MUST be
    * called on the encode thread (the caller resolves the handle from the bound heap's
-   * record there). Byte-identical via the shared writer.
+   * record there). Byte-identical to the legacy DXBC resource writer.
    */
   void FillTextureSlot(uint32_t index, uint64_t gpu_resource_id, uint32_t array_length);
 
@@ -127,12 +200,27 @@ public:
     return index < stale_generation_.size() ? stale_generation_[index] : 0;
   }
 
+  bool SlotNeedsFill(uint32_t index) const {
+    return index < stale_generation_.size() &&
+           stale_generation_[index] != filled_generation_[index];
+  }
+
 private:
+  void WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry);
+
   WMT::Reference<WMT::Buffer> buffer_;
+  WMT::Reference<WMT::Buffer> table_buffer_;
+  WMT::Reference<WMT::ArgumentTable> argument_table_;
+  WMT::Reference<WMT::TextureViewPool> texture_view_pool_;
   uint64_t *mapped_ = nullptr;
+  DescriptorTableEntry *table_mapped_ = nullptr;
   uint64_t gpu_address_ = 0;
+  uint64_t table_gpu_address_ = 0;
+  uint64_t texture_view_pool_base_resource_id_ = 0;
   uint32_t num_descriptors_ = 0;
   bool sampler_heap_ = false;
+  std::vector<DescriptorTableEntry> table_entries_;
+  std::vector<DescriptorResidencyTarget> residency_targets_;
   // Per-slot generation bookkeeping. stale = bumped by Create*View (app thread);
   // filled = updated when the encode thread writes the slot. A slot needs re-resolve
   // when stale_generation_[i] != filled_generation_[i].

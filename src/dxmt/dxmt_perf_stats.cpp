@@ -131,6 +131,8 @@ std::atomic<uint64_t> g_last_flush_frame = {0};
 const dxmt::clock::time_point g_perf_start_time = dxmt::clock::now();
 std::atomic<uint64_t> g_last_frame_log_monotonic_us = {0};
 thread_local FrameStatistics *t_current_frame_stats = nullptr;
+thread_local dxmt::clock::time_point t_last_timed_api_end = {};
+thread_local uint32_t t_active_timed_api_depth = 0;
 
 bool parseEnabledEnv(const char *name) {
   const auto value = env::getEnvVar(name);
@@ -144,6 +146,14 @@ uint64_t sample(std::atomic<uint64_t> &value) {
 
 uint64_t durationUs(dxmt::clock::duration value) {
   return std::chrono::duration_cast<std::chrono::microseconds>(value).count();
+}
+
+void addCompiledFallbackReason(FrameStatistics &stats,
+                               CompiledFallbackReason reason,
+                               uint64_t count) {
+  const auto index = static_cast<size_t>(reason);
+  if (index < stats.frame_compiled_fallback_reasons.size())
+    stats.frame_compiled_fallback_reasons[index] += count;
 }
 
 void addDurationToBucket(FrameStatistics &stats, FrameTimeBucket bucket,
@@ -178,6 +188,42 @@ void addDurationToBucket(FrameStatistics &stats, FrameTimeBucket bucket,
     break;
   case FrameTimeBucket::CommandListRecord:
     stats.frame_cmdlist_record_interval += duration;
+    break;
+  }
+}
+
+void addApiGapToBucket(FrameStatistics &stats, FrameTimeBucket bucket,
+                       dxmt::clock::duration duration) {
+  switch (bucket) {
+  case FrameTimeBucket::ExecuteCommandLists:
+    stats.frame_api_gap_before_execute_command_lists_interval += duration;
+    break;
+  case FrameTimeBucket::Present:
+    stats.frame_api_gap_before_present_interval += duration;
+    break;
+  case FrameTimeBucket::QueueSignal:
+    stats.frame_api_gap_before_queue_signal_interval += duration;
+    break;
+  case FrameTimeBucket::QueueWait:
+    stats.frame_api_gap_before_queue_wait_interval += duration;
+    break;
+  case FrameTimeBucket::CreateResource:
+    stats.frame_api_gap_before_create_resource_interval += duration;
+    break;
+  case FrameTimeBucket::CreateReservedResource:
+    stats.frame_api_gap_before_create_reserved_resource_interval += duration;
+    break;
+  case FrameTimeBucket::CreateHeap:
+    stats.frame_api_gap_before_create_heap_interval += duration;
+    break;
+  case FrameTimeBucket::CreatePipeline:
+    stats.frame_api_gap_before_create_pipeline_interval += duration;
+    break;
+  case FrameTimeBucket::UnscopedD3D12Api:
+    stats.frame_api_gap_before_unscoped_d3d12_api_interval += duration;
+    break;
+  case FrameTimeBucket::CommandListRecord:
+    stats.frame_api_gap_before_cmdlist_record_interval += duration;
     break;
   }
 }
@@ -448,6 +494,12 @@ ScopedFrameTimer::ScopedFrameTimer(FrameTimeBucket bucket) :
     stats_(enabled() ? t_current_frame_stats : nullptr),
     begin_(enabled() ? dxmt::clock::now() : dxmt::clock::time_point{}),
     active_(begin_ != dxmt::clock::time_point{} && stats_) {
+  if (active_ && t_active_timed_api_depth == 0 &&
+      t_last_timed_api_end != dxmt::clock::time_point{} &&
+      begin_ > t_last_timed_api_end)
+    addApiGapToBucket(*stats_, bucket_, begin_ - t_last_timed_api_end);
+  if (active_)
+    t_active_timed_api_depth++;
 }
 
 ScopedFrameTimer::~ScopedFrameTimer() {
@@ -457,7 +509,12 @@ ScopedFrameTimer::~ScopedFrameTimer() {
 void ScopedFrameTimer::stop() {
   if (!active_)
     return;
-  addDurationToBucket(*stats_, bucket_, dxmt::clock::now() - begin_);
+  const auto end = dxmt::clock::now();
+  addDurationToBucket(*stats_, bucket_, end - begin_);
+  if (t_active_timed_api_depth)
+    t_active_timed_api_depth--;
+  if (t_active_timed_api_depth == 0)
+    t_last_timed_api_end = end;
   active_ = false;
 }
 
@@ -471,6 +528,24 @@ FrameStatistics *currentFrameStatistics() {
   if (!enabled())
     return nullptr;
   return t_current_frame_stats;
+}
+
+void resetCurrentFrameApiGapMarker(dxmt::clock::time_point now) {
+  if (!enabled())
+    return;
+  t_last_timed_api_end = now;
+  t_active_timed_api_depth = 0;
+}
+
+void recordFrameBoundaryApiGap(FrameStatistics *stats,
+                               dxmt::clock::time_point boundary_time) {
+  if (!enabled() || !stats || t_active_timed_api_depth != 0 ||
+      t_last_timed_api_end == dxmt::clock::time_point{} ||
+      boundary_time <= t_last_timed_api_end)
+    return;
+  stats->frame_api_gap_before_frame_boundary_interval +=
+      boundary_time - t_last_timed_api_end;
+  t_last_timed_api_end = boundary_time;
 }
 
 void recordExecuteTime(FrameStatistics *stats, ExecuteTimeBucket bucket,
@@ -491,6 +566,103 @@ void recordReplayBreakdown(FrameStatistics *stats,
   stats->frame_replay_flush_pass_interval += flush_pass;
   stats->frame_replay_timestamp_resolve_interval += timestamp_resolve;
   stats->frame_replay_cpu_query_resolve_interval += cpu_query_resolve;
+}
+
+void recordCompiledPassBuildTime(FrameStatistics *stats,
+                                 dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_compiled_pass_build_interval += duration;
+}
+
+void recordCompiledDrawEncodeTime(FrameStatistics *stats,
+                                  dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_compiled_draw_encode_interval += duration;
+}
+
+void recordCompiledDispatchEncodeTime(FrameStatistics *stats,
+                                      dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_compiled_dispatch_encode_interval += duration;
+}
+
+void recordArgumentTableUpdateTime(FrameStatistics *stats,
+                                   dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_argument_table_update_interval += duration;
+}
+
+void recordArgumentTableBindTime(FrameStatistics *stats,
+                                 dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_argument_table_bind_interval += duration;
+}
+
+void recordResidencySubmitTime(FrameStatistics *stats,
+                               dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_residency_submit_interval += duration;
+}
+
+void recordPsoCacheLookupTime(FrameStatistics *stats,
+                              dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_pso_cache_lookup_interval += duration;
+}
+
+void recordPsoMaterializeTime(FrameStatistics *stats,
+                              dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_pso_materialize_interval += duration;
+}
+
+void recordPsoCompileWaitTime(FrameStatistics *stats,
+                              dxmt::clock::duration duration) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_pso_compile_wait_interval += duration;
+}
+
+void recordCompiledGraphicsPackets(FrameStatistics *stats, uint64_t count) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_compiled_graphics_packets += count;
+}
+
+void recordFallbackGraphicsPackets(FrameStatistics *stats, uint64_t count,
+                                   CompiledFallbackReason reason) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_fallback_graphics_packets += count;
+  addCompiledFallbackReason(*stats, reason, count);
+}
+
+void recordCompiledComputePackets(FrameStatistics *stats, uint64_t count) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_compiled_compute_packets += count;
+}
+
+void recordFallbackComputePackets(FrameStatistics *stats, uint64_t count,
+                                  CompiledFallbackReason reason) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_fallback_compute_packets += count;
+  addCompiledFallbackReason(*stats, reason, count);
+}
+
+void recordStateRecordsElided(FrameStatistics *stats, uint64_t count) {
+  if (!enabled() || !stats)
+    return;
+  stats->frame_state_records_elided += count;
 }
 
 void recordFrameBoundary(uint64_t frame) {
@@ -566,6 +738,36 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_other_d3d12_interval);
   const auto cmdlist_record_us =
       durationUs(frame_stats.frame_cmdlist_record_interval);
+  const auto api_gap_before_execute_command_lists_us =
+      durationUs(frame_stats.frame_api_gap_before_execute_command_lists_interval);
+  const auto api_gap_before_present_us =
+      durationUs(frame_stats.frame_api_gap_before_present_interval);
+  const auto api_gap_before_queue_signal_us =
+      durationUs(frame_stats.frame_api_gap_before_queue_signal_interval);
+  const auto api_gap_before_queue_wait_us =
+      durationUs(frame_stats.frame_api_gap_before_queue_wait_interval);
+  const auto api_gap_before_create_resource_us =
+      durationUs(frame_stats.frame_api_gap_before_create_resource_interval);
+  const auto api_gap_before_create_reserved_resource_us = durationUs(
+      frame_stats.frame_api_gap_before_create_reserved_resource_interval);
+  const auto api_gap_before_create_heap_us =
+      durationUs(frame_stats.frame_api_gap_before_create_heap_interval);
+  const auto api_gap_before_create_pipeline_us =
+      durationUs(frame_stats.frame_api_gap_before_create_pipeline_interval);
+  const auto api_gap_before_unscoped_d3d12_api_us = durationUs(
+      frame_stats.frame_api_gap_before_unscoped_d3d12_api_interval);
+  const auto api_gap_before_cmdlist_record_us =
+      durationUs(frame_stats.frame_api_gap_before_cmdlist_record_interval);
+  const auto api_gap_before_frame_boundary_us =
+      durationUs(frame_stats.frame_api_gap_before_frame_boundary_interval);
+  const auto api_gap_total_us =
+      api_gap_before_execute_command_lists_us + api_gap_before_present_us +
+      api_gap_before_queue_signal_us + api_gap_before_queue_wait_us +
+      api_gap_before_create_resource_us +
+      api_gap_before_create_reserved_resource_us +
+      api_gap_before_create_heap_us + api_gap_before_create_pipeline_us +
+      api_gap_before_unscoped_d3d12_api_us +
+      api_gap_before_cmdlist_record_us + api_gap_before_frame_boundary_us;
   const auto present_latency_wait_us =
       durationUs(frame_stats.present_latency_interval);
   const auto drawable_blocking_us =
@@ -669,6 +871,31 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_replay_record_execute_indirect_interval);
   const auto replay_record_temporal_upscale_us =
       durationUs(frame_stats.frame_replay_record_temporal_upscale_interval);
+  const auto compiled_pass_build_us =
+      durationUs(frame_stats.frame_compiled_pass_build_interval);
+  const auto compiled_draw_encode_us =
+      durationUs(frame_stats.frame_compiled_draw_encode_interval);
+  const auto compiled_dispatch_encode_us =
+      durationUs(frame_stats.frame_compiled_dispatch_encode_interval);
+  const auto argument_table_update_us =
+      durationUs(frame_stats.frame_argument_table_update_interval);
+  const auto argument_table_bind_us =
+      durationUs(frame_stats.frame_argument_table_bind_interval);
+  const auto residency_submit_us =
+      durationUs(frame_stats.frame_residency_submit_interval);
+  const auto pso_cache_lookup_us =
+      durationUs(frame_stats.frame_pso_cache_lookup_interval);
+  const auto pso_materialize_us =
+      durationUs(frame_stats.frame_pso_materialize_interval);
+  const auto pso_compile_wait_us =
+      durationUs(frame_stats.frame_pso_compile_wait_interval);
+  const auto compiled_fallback_reason_count =
+      [&](CompiledFallbackReason reason) -> uint64_t {
+    const auto index = static_cast<size_t>(reason);
+    return index < frame_stats.frame_compiled_fallback_reasons.size()
+               ? frame_stats.frame_compiled_fallback_reasons[index]
+               : 0;
+  };
   const auto execute_known_us =
       execute_validate_us + execute_collect_us + execute_enqueue_us +
       execute_drain_us;
@@ -706,14 +933,14 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
   const auto accounted_wall_us =
       execute_command_lists_us + present_us + queue_signal_us + queue_wait_us +
       create_resource_us + create_reserved_resource_us + create_heap_us +
-      create_pipeline_us + unscoped_d3d12_api_us + present_latency_wait_us;
-  const auto frame_unmeasured_caller_thread_us =
-      frame_wall_us > accounted_wall_us ? frame_wall_us - accounted_wall_us : 0;
+      create_pipeline_us + unscoped_d3d12_api_us + cmdlist_record_us +
+      present_latency_wait_us + api_gap_total_us;
   const auto overlap_adjust_us =
       accounted_wall_us > frame_wall_us ? accounted_wall_us - frame_wall_us : 0;
+  const auto boundary_unclassified_us =
+      frame_wall_us > accounted_wall_us ? frame_wall_us - accounted_wall_us : 0;
   const auto closure_us =
-      accounted_wall_us + frame_unmeasured_caller_thread_us -
-      overlap_adjust_us;
+      accounted_wall_us + boundary_unclassified_us - overlap_adjust_us;
   const auto monotonic_us = durationUs(dxmt::clock::now() - g_perf_start_time);
   const auto previous_monotonic_us =
       g_last_frame_log_monotonic_us.exchange(monotonic_us,
@@ -956,6 +1183,74 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   replay_record_temporal_upscale_us,
                   " replayRecordTemporalUpscaleCount=",
                   frame_stats.frame_replay_record_temporal_upscale_count,
+                  " compiledPassBuildUs=", compiled_pass_build_us,
+                  " compiledDrawEncodeUs=", compiled_draw_encode_us,
+                  " compiledDispatchEncodeUs=",
+                  compiled_dispatch_encode_us,
+                  " argumentTableUpdateUs=", argument_table_update_us,
+                  " argumentTableBindUs=", argument_table_bind_us,
+                  " residencySubmitUs=", residency_submit_us,
+                  " psoCacheLookupUs=", pso_cache_lookup_us,
+                  " psoMaterializeUs=", pso_materialize_us,
+                  " psoCompileWaitUs=", pso_compile_wait_us,
+                  " compiledGraphicsPackets=",
+                  frame_stats.frame_compiled_graphics_packets,
+                  " fallbackGraphicsPackets=",
+                  frame_stats.frame_fallback_graphics_packets,
+                  " compiledComputePackets=",
+                  frame_stats.frame_compiled_compute_packets,
+                  " fallbackComputePackets=",
+                  frame_stats.frame_fallback_compute_packets,
+                  " stateRecordsElided=",
+                  frame_stats.frame_state_records_elided,
+                  " compiledFallbackReasonLegacyPath=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::LegacyPath),
+                  " compiledFallbackReasonResourceBarrier=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::ResourceBarrier),
+                  " compiledFallbackReasonGeometryOrTessellation=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::GeometryOrTessellation),
+                  " compiledFallbackReasonIndirect=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::Indirect),
+                  " compiledFallbackReasonMissingCompiledEncoder=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::MissingCompiledEncoder),
+                  " compiledFallbackReasonUnsupportedPipeline=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedPipeline),
+                  " compiledFallbackReasonUnsupportedRootSignature=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedRootSignature),
+                  " compiledFallbackReasonUnsupportedDescriptorTable=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedDescriptorTable),
+                  " compiledFallbackReasonUnsupportedRootDescriptor=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedRootDescriptor),
+                  " compiledFallbackReasonUnsupportedRootConstants=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedRootConstants),
+                  " compiledFallbackReasonUnsupportedVertexIndexState=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedVertexIndexState),
+                  " compiledFallbackReasonUnsupportedRenderTargetState=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedRenderTargetState),
+                  " compiledFallbackReasonUnsupportedResourceAccess=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedResourceAccess),
+                  " compiledFallbackReasonUnsupportedArgumentTable=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::UnsupportedArgumentTable),
+                  " compiledFallbackReasonResidency=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::Residency),
+                  " compiledFallbackReasonUnknown=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::Unknown),
                   " replayDrawCount=", frame_stats.frame_replay_draw_count,
                   " replayPsoRootUnchanged=",
                   frame_stats.frame_replay_pso_root_unchanged,
@@ -1080,10 +1375,30 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " createPipelineUs=", create_pipeline_us,
                   " unscopedD3D12ApiUs=", unscoped_d3d12_api_us,
                   " cmdlistRecordUs=", cmdlist_record_us,
+                  " apiGapBeforeExecuteCommandListsUs=",
+                  api_gap_before_execute_command_lists_us,
+                  " apiGapBeforePresentUs=", api_gap_before_present_us,
+                  " apiGapBeforeQueueSignalUs=", api_gap_before_queue_signal_us,
+                  " apiGapBeforeQueueWaitUs=", api_gap_before_queue_wait_us,
+                  " apiGapBeforeCreateResourceUs=",
+                  api_gap_before_create_resource_us,
+                  " apiGapBeforeCreateReservedResourceUs=",
+                  api_gap_before_create_reserved_resource_us,
+                  " apiGapBeforeCreateHeapUs=",
+                  api_gap_before_create_heap_us,
+                  " apiGapBeforeCreatePipelineUs=",
+                  api_gap_before_create_pipeline_us,
+                  " apiGapBeforeUnscopedD3D12ApiUs=",
+                  api_gap_before_unscoped_d3d12_api_us,
+                  " apiGapBeforeCmdlistRecordUs=",
+                  api_gap_before_cmdlist_record_us,
+                  " apiGapBeforeFrameBoundaryUs=",
+                  api_gap_before_frame_boundary_us,
+                  " apiGapTotalUs=", api_gap_total_us,
                   " presentLatencyWaitUs=", present_latency_wait_us,
                   " accountedWallUs=", accounted_wall_us,
-                  " frameUnmeasuredCallerThreadUs=",
-                  frame_unmeasured_caller_thread_us,
+                  " frameBoundaryUnclassifiedUs=",
+                  boundary_unclassified_us,
                   " overlapAdjustUs=", overlap_adjust_us,
                   " closureUs=", closure_us,
                   " asyncDrawableBlockingUs=", drawable_blocking_us,

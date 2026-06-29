@@ -90,10 +90,26 @@ struct unixcall_mtldevice_newargumenttable {
   obj_handle_t ret;
 };
 
+struct unixcall_mtldevice_newtextureviewpool {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret_error;
+  obj_handle_t ret_pool;
+};
+
 struct unixcall_mtl4argumenttable_setentry {
   obj_handle_t table;
   uint64_t payload;
   uint32_t index;
+};
+
+struct unixcall_mtlresourceviewpool_copy {
+  obj_handle_t destination_pool;
+  obj_handle_t source_pool;
+  uint64_t source_index;
+  uint64_t count;
+  uint64_t destination_index;
+  uint64_t ret_gpu_resource_id;
 };
 
 struct unixcall_mtldevice_newsamplerstate {
@@ -157,6 +173,31 @@ struct unixcall_mtltexture_newtextureview {
   uint64_t gpu_resource_id;
 };
 
+struct unixcall_mtltextureviewpool_set_texture {
+  obj_handle_t pool;
+  obj_handle_t texture;
+  uint64_t index;
+  uint64_t ret_gpu_resource_id;
+};
+
+struct unixcall_mtltextureviewpool_set_texture_descriptor {
+  obj_handle_t pool;
+  obj_handle_t texture;
+  struct WMTConstMemoryPointer descriptor;
+  uint64_t index;
+  uint64_t ret_gpu_resource_id;
+};
+
+struct unixcall_mtltextureviewpool_set_buffer_descriptor {
+  obj_handle_t pool;
+  obj_handle_t buffer;
+  struct WMTConstMemoryPointer descriptor;
+  uint64_t offset;
+  uint64_t bytes_per_row;
+  uint64_t index;
+  uint64_t ret_gpu_resource_id;
+};
+
 struct unixcall_mtldevice_newlibrary {
   obj_handle_t device;
   obj_handle_t data;
@@ -169,6 +210,7 @@ struct unixcall_mtldevice_newcomputepso {
   struct WMTConstMemoryPointer info;
   obj_handle_t ret_error;
   obj_handle_t ret_pso;
+  uint64_t ret_compile_wait_us;
 };
 
 struct unixcall_mtldevice_newrenderpso {
@@ -176,6 +218,7 @@ struct unixcall_mtldevice_newrenderpso {
   struct WMTConstMemoryPointer info;
   obj_handle_t ret_error;
   obj_handle_t ret_pso;
+  uint64_t ret_compile_wait_us;
 };
 
 struct unixcall_mtldevice_newmeshrenderpso {
@@ -183,6 +226,12 @@ struct unixcall_mtldevice_newmeshrenderpso {
   struct WMTConstMemoryPointer info;
   obj_handle_t ret_error;
   obj_handle_t ret_pso;
+  uint64_t ret_compile_wait_us;
+};
+
+struct unixcall_mtlcommandbuffer_commit_stats {
+  obj_handle_t handle;
+  uint64_t ret_residency_submit_us;
 };
 
 struct unixcall_generic_obj_cmd_noret {

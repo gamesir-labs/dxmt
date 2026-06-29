@@ -1417,6 +1417,7 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
     }
   }
 
+  const auto materialize_begin = dxmt::clock::now();
   WMT::Reference<WMT::Error> metal_error;
   auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
   PipelineMetalShader compiled = {};
@@ -1445,6 +1446,9 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
     else
       out = it->second;
   }
+  dxmt::perf::recordPsoMaterializeTime(
+      dxmt::perf::currentFrameStatistics(),
+      dxmt::clock::now() - materialize_begin);
 
   return true;
 }
@@ -1511,7 +1515,13 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   }
   if (persistent && read_persistent_cache) {
     if (auto reader = scache->getReader()) {
-      if (auto lib_data = reader->get(persistent_key)) {
+      const auto lookup_begin = dxmt::clock::now();
+      auto lib_data = reader->get(persistent_key);
+      dxmt::perf::recordPsoCacheLookupTime(
+          dxmt::perf::currentFrameStatistics(),
+          dxmt::clock::now() - lookup_begin);
+      if (lib_data) {
+        const auto materialize_begin = dxmt::clock::now();
         WMT::Reference<WMT::Error> metal_error;
         PipelineMetalShader compiled = {};
         compiled.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
@@ -1528,6 +1538,9 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      " misses=", g_cache_misses.load(std::memory_order_relaxed),
                      " transpileUs=", g_transpile_us.load(std::memory_order_relaxed));
             }
+            dxmt::perf::recordPsoMaterializeTime(
+                dxmt::perf::currentFrameStatistics(),
+                dxmt::clock::now() - materialize_begin);
             return true; // cache hit: airconv transpile skipped
           }
         }
@@ -2282,7 +2295,12 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       }
 
       WMT::Reference<WMT::Error> error;
-      pso = device->GetMTLDevice().newRenderPipelineState(info, error);
+      uint64_t compile_wait_us = 0;
+      pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+          info, error, &compile_wait_us);
+      dxmt::perf::recordPsoCompileWaitTime(
+          dxmt::perf::currentFrameStatistics(),
+          std::chrono::microseconds(compile_wait_us));
       if (error || !pso) {
         WARN("D3D12PipelineState: failed to create Metal tessellation PSO: ",
              error ? error.description().getUTF8String() : "unknown error");
@@ -2363,7 +2381,12 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       }
 
       WMT::Reference<WMT::Error> error;
-      pso = device->GetMTLDevice().newRenderPipelineState(info, error);
+      uint64_t compile_wait_us = 0;
+      pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+          info, error, &compile_wait_us);
+      dxmt::perf::recordPsoCompileWaitTime(
+          dxmt::perf::currentFrameStatistics(),
+          std::chrono::microseconds(compile_wait_us));
       if (error || !pso) {
         WARN("D3D12PipelineState: failed to create Metal geometry PSO: ",
              error ? error.description().getUTF8String() : "unknown error");
@@ -2422,7 +2445,12 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   }
 
   WMT::Reference<WMT::Error> error;
-  out.pso = device->GetMTLDevice().newRenderPipelineState(info, error);
+  uint64_t compile_wait_us = 0;
+  out.pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+      info, error, &compile_wait_us);
+  dxmt::perf::recordPsoCompileWaitTime(
+      dxmt::perf::currentFrameStatistics(),
+      std::chrono::microseconds(compile_wait_us));
   if (error || !out.pso) {
     WARN("D3D12PipelineState: failed to create Metal graphics PSO: ",
          error ? error.description().getUTF8String() : "unknown error");
@@ -2490,7 +2518,12 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
 
   auto create_pso = [&](std::string &error_desc) {
     WMT::Reference<WMT::Error> error;
-    out.pso = device->GetMTLDevice().newComputePipelineState(info, error);
+    uint64_t compile_wait_us = 0;
+    out.pso = device->GetMTLDevice().newComputePipelineStateAndGetStats(
+        info, error, &compile_wait_us);
+    dxmt::perf::recordPsoCompileWaitTime(
+        dxmt::perf::currentFrameStatistics(),
+        std::chrono::microseconds(compile_wait_us));
     if (error || !out.pso) {
       error_desc = error ? error.description().getUTF8String()
                          : "unknown error";

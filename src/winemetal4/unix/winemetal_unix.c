@@ -17,6 +17,10 @@
 #import <Metal/MTL4RenderPass.h>
 #import <Metal/MTL4CommandQueue.h>
 #import <Metal/MTL4Counters.h>
+#import <Metal/MTLAllocation.h>
+#import <Metal/MTLResourceViewPool.h>
+#import <Metal/MTLResidencySet.h>
+#import <Metal/MTLTextureViewPool.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #include "objc/objc-runtime.h"
@@ -126,6 +130,13 @@ dxmt_metal4_wait_for_drawable_enabled(void) {
   return enabled;
 }
 
+static uint64_t
+dxmt_monotonic_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
 typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
   DXMTMetal4CommandBufferStateNotEnqueued = 0,
   DXMTMetal4CommandBufferStateCommitted = 2,
@@ -156,8 +167,9 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label;
 - (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
 - (void)prepareResidencyForCommit;
+- (uint64_t)prepareResidencyForCommitAndMeasure;
 - (void)commit;
-- (void)commitLocked;
+- (uint64_t)commitLocked;
 - (void)waitUntilCompleted;
 - (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
@@ -579,6 +591,36 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   }
 }
 
+static BOOL
+dxmt_metal4_is_residency_set(id object) {
+  return object && [object conformsToProtocol:@protocol(MTLResidencySet)];
+}
+
+static BOOL
+dxmt_metal4_is_allocation(id object) {
+  return object && [object conformsToProtocol:@protocol(MTLAllocation)];
+}
+
+static BOOL
+dxmt_metal4_is_resource_view_pool(id object) {
+  return object && [object conformsToProtocol:@protocol(MTLResourceViewPool)];
+}
+
+static BOOL
+dxmt_metal4_is_texture_view_pool(id object) {
+  return object && [object conformsToProtocol:@protocol(MTLTextureViewPool)];
+}
+
+static BOOL
+dxmt_metal4_is_texture(id object) {
+  return object && [object conformsToProtocol:@protocol(MTLTexture)];
+}
+
+static BOOL
+dxmt_metal4_is_buffer(id object) {
+  return object && [object conformsToProtocol:@protocol(MTLBuffer)];
+}
+
 
 @interface DXMTMetal4CommandQueue : NSObject
 @property(nonatomic, retain) id<MTLDevice> device;
@@ -731,6 +773,13 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   [_metal4Buffer useResidencySet:_residencySet];
 }
 
+- (uint64_t)prepareResidencyForCommitAndMeasure {
+  uint64_t begin = dxmt_monotonic_us();
+  [self prepareResidencyForCommit];
+  uint64_t end = dxmt_monotonic_us();
+  return end >= begin ? end - begin : 0;
+}
+
 - (void)commit {
   if (_pendingDrawable && dxmt_metal4_present_ordering_enabled()) {
     @synchronized(_owner) {
@@ -742,9 +791,9 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   [self commitLocked];
 }
 
-- (void)commitLocked {
+- (uint64_t)commitLocked {
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
-    return;
+    return 0;
 
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
@@ -791,7 +840,7 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
     [_owner.metal4Queue waitForEvent:_owner.presentEvent value:previousPresentValue];
   }
 
-  [self prepareResidencyForCommit];
+  uint64_t residency_submit_us = [self prepareResidencyForCommitAndMeasure];
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValue];
@@ -861,6 +910,7 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
   [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
 
   dxmt_apitrace_finalize_command_buffer((obj_handle_t)self);
+  return residency_submit_us;
 }
 
 - (void)waitUntilCompleted {
@@ -871,6 +921,7 @@ dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
     if (_internalStatus == DXMTMetal4CommandBufferStateCommitted)
       _internalStatus = DXMTMetal4CommandBufferStateCompleted;
   }
+
 }
 
 - (enum WMTCommandBufferStatus)status {
@@ -3503,6 +3554,39 @@ _MTLDevice_newCommandQueue(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_newResidencySet(void *obj) {
+  struct unixcall_generic_obj_uint64_obj_ret *params = obj;
+  MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
+  descriptor.initialCapacity = params->arg;
+  NSError *error = nil;
+  params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newResidencySetWithDescriptor:descriptor
+                                                                                     error:&error];
+  [descriptor release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newTextureViewPool(void *obj) {
+  struct unixcall_mtldevice_newtextureviewpool *params = obj;
+  const struct WMTTextureViewPoolInfo *info = params->info.ptr;
+  params->ret_pool = 0;
+  params->ret_error = 0;
+  if (!params->device || !info)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    MTLResourceViewPoolDescriptor *descriptor = [[MTLResourceViewPoolDescriptor alloc] init];
+    descriptor.resourceViewCount = info->initial_count;
+    NSError *error = nil;
+    params->ret_pool = (obj_handle_t)[(id<MTLDevice>)params->device newTextureViewPoolWithDescriptor:descriptor
+                                                                                               error:&error];
+    params->ret_error = (obj_handle_t)error;
+    [descriptor release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _NSAutoreleasePool_alloc_init(void *obj) {
   struct unixcall_generic_obj_ret *params = obj;
   params->ret = (obj_handle_t)[[NSAutoreleasePool alloc] init];
@@ -3518,9 +3602,39 @@ _MTLCommandQueue_commandBuffer(void *obj) {
 }
 
 static NTSTATUS
+_MTLCommandQueue_addResidencySet(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  DXMTMetal4CommandQueue *queue = (DXMTMetal4CommandQueue *)params->handle;
+  id set = (id)params->arg;
+  if (!queue || !dxmt_metal4_is_residency_set(set))
+    return STATUS_SUCCESS;
+  [queue.metal4Queue addResidencySet:(id<MTLResidencySet>)set];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandQueue_removeResidencySet(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  DXMTMetal4CommandQueue *queue = (DXMTMetal4CommandQueue *)params->handle;
+  id set = (id)params->arg;
+  if (!queue || !dxmt_metal4_is_residency_set(set))
+    return STATUS_SUCCESS;
+  [queue.metal4Queue removeResidencySet:(id<MTLResidencySet>)set];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
-  struct unixcall_generic_obj_noret *params = obj;
-  [(DXMTMetal4CommandBuffer *)params->handle commit];
+  struct unixcall_mtlcommandbuffer_commit_stats *params = obj;
+  DXMTMetal4CommandBuffer *cmdbuf = (DXMTMetal4CommandBuffer *)params->handle;
+  params->ret_residency_submit_us = 0;
+  if (cmdbuf.pendingDrawable && dxmt_metal4_present_ordering_enabled()) {
+    @synchronized(cmdbuf.owner) {
+      params->ret_residency_submit_us = [cmdbuf commitLocked];
+    }
+  } else {
+    params->ret_residency_submit_us = [cmdbuf commitLocked];
+  }
   return STATUS_SUCCESS;
 }
 
@@ -3991,10 +4105,23 @@ to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat f
   );
 }
 
+static inline void
+fill_texture_view_descriptor(MTLTextureViewDescriptor *dst, const struct WMTTextureViewDescriptor *src) {
+  dst.pixelFormat = to_metal_pixel_format(src->pixel_format);
+  dst.textureType = (MTLTextureType)src->texture_type;
+  dst.levelRange = NSMakeRange(src->level_start, src->level_count);
+  dst.sliceRange = NSMakeRange(src->slice_start, src->slice_count);
+  dst.swizzle = to_metal_swizzle(src->swizzle, src->pixel_format);
+}
+
 static NTSTATUS
 _MTLTexture_newTextureView(void *obj) {
   struct unixcall_mtltexture_newtextureview *params = obj;
   id<MTLTexture> texture = (id<MTLTexture>)params->texture;
+  params->ret = 0;
+  params->gpu_resource_id = 0;
+  if (!dxmt_metal4_is_texture((id)texture))
+    return STATUS_SUCCESS;
 
   id<MTLTexture> ret = [texture
       newTextureViewWithPixelFormat:to_metal_pixel_format(params->format)
@@ -4003,7 +4130,7 @@ _MTLTexture_newTextureView(void *obj) {
                              slices:NSMakeRange(params->slice_start, params->slice_count)
                             swizzle:to_metal_swizzle(params->swizzle, params->format)];
   params->ret = (obj_handle_t)ret;
-  params->gpu_resource_id = [ret gpuResourceID]._impl;
+  params->gpu_resource_id = ret ? [ret gpuResourceID]._impl : 0;
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled() && params->ret) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -4020,6 +4147,100 @@ _MTLTexture_newTextureView(void *obj) {
     pthread_mutex_unlock(&dxmt_apitrace_lock);
   }
 #endif
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLTextureViewPool_setTextureView(void *obj) {
+  struct unixcall_mtltextureviewpool_set_texture *params = obj;
+  id pool = (id)params->pool;
+  id texture = (id)params->texture;
+  params->ret_gpu_resource_id = 0;
+  if (!dxmt_metal4_is_texture_view_pool(pool) || !dxmt_metal4_is_texture(texture))
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    params->ret_gpu_resource_id = [(id<MTLTextureViewPool>)pool setTextureView:(id<MTLTexture>)texture
+                                                                       atIndex:(NSUInteger)params->index]._impl;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLTextureViewPool_setTextureViewWithDescriptor(void *obj) {
+  struct unixcall_mtltextureviewpool_set_texture_descriptor *params = obj;
+  id pool = (id)params->pool;
+  id texture = (id)params->texture;
+  const struct WMTTextureViewDescriptor *info = params->descriptor.ptr;
+  params->ret_gpu_resource_id = 0;
+  if (!dxmt_metal4_is_texture_view_pool(pool) || !dxmt_metal4_is_texture(texture) || !info)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    MTLTextureViewDescriptor *descriptor = [[MTLTextureViewDescriptor alloc] init];
+    fill_texture_view_descriptor(descriptor, info);
+    params->ret_gpu_resource_id = [(id<MTLTextureViewPool>)pool setTextureView:(id<MTLTexture>)texture
+                                                                    descriptor:descriptor
+                                                                       atIndex:(NSUInteger)params->index]._impl;
+    [descriptor release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLTextureViewPool_setTextureViewFromBuffer(void *obj) {
+  struct unixcall_mtltextureviewpool_set_buffer_descriptor *params = obj;
+  id pool = (id)params->pool;
+  id buffer = (id)params->buffer;
+  const struct WMTTextureBufferViewDescriptor *info = params->descriptor.ptr;
+  params->ret_gpu_resource_id = 0;
+  if (!dxmt_metal4_is_texture_view_pool(pool) || !dxmt_metal4_is_buffer(buffer) || !info)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+    struct WMTTextureInfo texture_info = info->texture;
+    fill_texture_descriptor(descriptor, &texture_info);
+    params->ret_gpu_resource_id = [(id<MTLTextureViewPool>)pool setTextureViewFromBuffer:(id<MTLBuffer>)buffer
+                                                                              descriptor:descriptor
+                                                                                  offset:(NSUInteger)params->offset
+                                                                             bytesPerRow:(NSUInteger)params->bytes_per_row
+                                                                                 atIndex:(NSUInteger)params->index]._impl;
+    [descriptor release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResourceViewPool_baseResourceID(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  id pool = (id)params->handle;
+  params->ret = 0;
+  if (!dxmt_metal4_is_resource_view_pool(pool))
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    params->ret = [(id<MTLResourceViewPool>)pool baseResourceID]._impl;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResourceViewPool_copyResourceViews(void *obj) {
+  struct unixcall_mtlresourceviewpool_copy *params = obj;
+  id destination_pool = (id)params->destination_pool;
+  id source_pool = (id)params->source_pool;
+  params->ret_gpu_resource_id = 0;
+  if (!dxmt_metal4_is_resource_view_pool(destination_pool) ||
+      !dxmt_metal4_is_resource_view_pool(source_pool) || !params->count)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    params->ret_gpu_resource_id = [(id<MTLResourceViewPool>)destination_pool
+        copyResourceViewsFromPool:(id<MTLResourceViewPool>)source_pool
+                      sourceRange:NSMakeRange((NSUInteger)params->source_index, (NSUInteger)params->count)
+                 destinationIndex:(NSUInteger)params->destination_index]._impl;
+  }
   return STATUS_SUCCESS;
 }
 
@@ -4102,8 +4323,12 @@ _MTLDevice_newComputePipelineState(void *obj) {
                                                     count:info->num_binary_archives_for_lookup];
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+  uint64_t compile_wait_begin = dxmt_monotonic_us();
   params->ret_pso =
       (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
+  uint64_t compile_wait_end = dxmt_monotonic_us();
+  params->ret_compile_wait_us =
+      compile_wait_end >= compile_wait_begin ? compile_wait_end - compile_wait_begin : 0;
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
@@ -4353,10 +4578,14 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   NSError *err = NULL;
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+  uint64_t compile_wait_begin = dxmt_monotonic_us();
   params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
                                                                                               options:options
                                                                                            reflection:nil
                                                                                                 error:&err];
+  uint64_t compile_wait_end = dxmt_monotonic_us();
+  params->ret_compile_wait_us =
+      compile_wait_end >= compile_wait_begin ? compile_wait_end - compile_wait_begin : 0;
   params->ret_error = (obj_handle_t)err;
   const BOOL pso_created = params->ret_pso != 0;
   if (pso_created && info->binary_archive_for_serialization) {
@@ -4510,10 +4739,14 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   }
 #endif
   NSError *err = NULL;
+  uint64_t compile_wait_begin = dxmt_monotonic_us();
   params->ret_pso = (obj_handle_t)[device newRenderPipelineStateWithMeshDescriptor:descriptor
                                                                            options:options
                                                                         reflection:nil
                                                                              error:&err];
+  uint64_t compile_wait_end = dxmt_monotonic_us();
+  params->ret_compile_wait_us =
+      compile_wait_end >= compile_wait_begin ? compile_wait_end - compile_wait_begin : 0;
   params->ret_error = (obj_handle_t)err;
   const BOOL pso_created = params->ret_pso != 0;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
@@ -7213,6 +7446,48 @@ _MTLCommandBuffer_property(void *obj) {
 }
 
 static NTSTATUS
+_MTLResidencySet_addAllocation(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  id set = (id)params->handle;
+  id allocation = (id)params->arg;
+  if (!dxmt_metal4_is_residency_set(set) || !dxmt_metal4_is_allocation(allocation))
+    return STATUS_SUCCESS;
+  [(id<MTLResidencySet>)set addAllocation:(id<MTLAllocation>)allocation];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_removeAllocation(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  id set = (id)params->handle;
+  id allocation = (id)params->arg;
+  if (!dxmt_metal4_is_residency_set(set) || !dxmt_metal4_is_allocation(allocation))
+    return STATUS_SUCCESS;
+  [(id<MTLResidencySet>)set removeAllocation:(id<MTLAllocation>)allocation];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_commit(void *obj) {
+  struct unixcall_generic_obj_noret *params = obj;
+  id set = (id)params->handle;
+  if (!dxmt_metal4_is_residency_set(set))
+    return STATUS_SUCCESS;
+  [(id<MTLResidencySet>)set commit];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_requestResidency(void *obj) {
+  struct unixcall_generic_obj_noret *params = obj;
+  id set = (id)params->handle;
+  if (!dxmt_metal4_is_residency_set(set))
+    return STATUS_SUCCESS;
+  [(id<MTLResidencySet>)set requestResidency];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_newTileRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newrenderpso *params = obj;
   const struct WMTTileRenderPipelineInfo *info = params->info.ptr;
@@ -7243,10 +7518,14 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
   }
 #endif
   NSError *err = NULL;
+  uint64_t compile_wait_begin = dxmt_monotonic_us();
   params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithTileDescriptor:descriptor
                                                                                                   options:options
                                                                                                reflection:nil
                                                                                                     error:&err];
+  uint64_t compile_wait_end = dxmt_monotonic_us();
+  params->ret_compile_wait_us =
+      compile_wait_end >= compile_wait_begin ? compile_wait_end - compile_wait_begin : 0;
   params->ret_error = (obj_handle_t)err;
   const BOOL pso_created = params->ret_pso != 0;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
@@ -7601,6 +7880,19 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4ArgumentTable_setAddress,
     &_MTL4ArgumentTable_setTexture,
     &_MTL4ArgumentTable_setSamplerState,
+    &_MTLDevice_newResidencySet,
+    &_MTLCommandQueue_addResidencySet,
+    &_MTLCommandQueue_removeResidencySet,
+    &_MTLResidencySet_addAllocation,
+    &_MTLResidencySet_removeAllocation,
+    &_MTLResidencySet_commit,
+    &_MTLResidencySet_requestResidency,
+    &_MTLDevice_newTextureViewPool,
+    &_MTLResourceViewPool_baseResourceID,
+    &_MTLResourceViewPool_copyResourceViews,
+    &_MTLTextureViewPool_setTextureView,
+    &_MTLTextureViewPool_setTextureViewWithDescriptor,
+    &_MTLTextureViewPool_setTextureViewFromBuffer,
 };
 
 #ifndef DXMT_NATIVE
@@ -7765,5 +8057,18 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4ArgumentTable_setAddress,
     &_MTL4ArgumentTable_setTexture,
     &_MTL4ArgumentTable_setSamplerState,
+    &_MTLDevice_newResidencySet,
+    &_MTLCommandQueue_addResidencySet,
+    &_MTLCommandQueue_removeResidencySet,
+    &_MTLResidencySet_addAllocation,
+    &_MTLResidencySet_removeAllocation,
+    &_MTLResidencySet_commit,
+    &_MTLResidencySet_requestResidency,
+    &_MTLDevice_newTextureViewPool,
+    &_MTLResourceViewPool_baseResourceID,
+    &_MTLResourceViewPool_copyResourceViews,
+    &_MTLTextureViewPool_setTextureView,
+    &_MTLTextureViewPool_setTextureViewWithDescriptor,
+    &_MTLTextureViewPool_setTextureViewFromBuffer,
 };
 #endif

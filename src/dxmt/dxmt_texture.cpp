@@ -343,6 +343,57 @@ Texture::view(TextureViewKey key, TextureAllocation* allocation) {
   return *allocation->cached_view_[key.index];
 }
 
+uint64_t
+Texture::setViewPoolSlot(WMT::TextureViewPool pool, TextureViewKey key,
+                         TextureAllocation *allocation, uint32_t slot) {
+  if (!pool || !allocation || key.index >= version_)
+    return 0;
+
+  auto parent = allocation->texture();
+  if (!parent)
+    return 0;
+
+  if (!key.index)
+    return pool.setTextureView(parent, slot);
+
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  if (key.index >= viewDescriptors_.size())
+    return 0;
+  auto descriptor = viewDescriptors_[key.index];
+  shared_lock = {};
+
+  auto view_format = descriptor.format;
+  const auto parent_format = parent.pixelFormat();
+  const bool compressed_srgb_srv =
+      !(descriptor.intendedUsage & WMTTextureUsageRenderTarget) &&
+      IsBlockCompressionFormat(descriptor.format) &&
+      Is_sRGBVariant(descriptor.format) &&
+      Forget_sRGB(descriptor.format) == parent_format;
+  const bool full_parent_view =
+      compressed_srgb_srv &&
+      descriptor.type == textureType() &&
+      descriptor.firstMiplevel == 0 &&
+      descriptor.miplevelCount == miplevelCount() &&
+      descriptor.firstArraySlice == 0 &&
+      descriptor.arraySize == arrayLength() &&
+      IsDefaultTextureSwizzle(descriptor.swizzle);
+
+  if (full_parent_view)
+    return pool.setTextureView(parent, slot);
+  if (compressed_srgb_srv)
+    view_format = parent_format;
+
+  WMTTextureViewDescriptor view = {};
+  view.pixel_format = view_format;
+  view.texture_type = descriptor.type;
+  view.level_start = descriptor.firstMiplevel;
+  view.level_count = descriptor.miplevelCount;
+  view.slice_start = descriptor.firstArraySlice;
+  view.slice_count = descriptor.arraySize;
+  view.swizzle = descriptor.swizzle;
+  return pool.setTextureView(parent, view, slot);
+}
+
 TextureViewKey Texture::checkViewUseArray(TextureViewKey key, bool isArray) {
   std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
   auto view = viewDescriptors_[key.index];
