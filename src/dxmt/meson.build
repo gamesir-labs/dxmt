@@ -51,24 +51,23 @@ if dxmt_version_override == ''
     output: 'version.h',
   )
 else
-  dxmt_version_conf = configuration_data()
-  dxmt_version_conf.set('VCS_TAG', dxmt_version_override)
-  dxmt_version = configure_file(
-    input: '../../version.h.in',
+  dxmt_version = vcs_tag(
+    command: ['printf', '%s', dxmt_version_override],
+    input:  '../../version.h.in',
     output: 'version.h',
-    configuration: dxmt_version_conf,
   )
 endif
+dxmt_build_include_path = include_directories('.')
 
 dxmt_lib = static_library('dxmt', dxmt_src, dxmt_shaders_header, dxmt_version,
   dependencies        : [ util_dep, airconv_forward_dep, winemetal_dep ] + apitrace_d3d_pe_deps,
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ dxmt_include_path, dxmt_build_include_path ],
   link_depends        : dxmt_link_depends,
 )
 
 dxmt_dep = declare_dependency(
   link_with           : [ dxmt_lib ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ dxmt_include_path, dxmt_build_include_path ],
   dependencies        : apitrace_d3d_pe_deps,
 )
 
@@ -80,13 +79,13 @@ endif
 
 dxmt12_lib = static_library('dxmt12', dxmt_src, dxmt_shaders_header, dxmt_version,
   dependencies        : [ util_dep, dxmt12_airconv_dep, winemetal4_dep ] + apitrace_d3d_pe_deps,
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ dxmt_include_path, dxmt_build_include_path ],
   cpp_args            : ['-DDXMT_DX12_METAL4=1'],
   link_depends        : dxmt_link_depends,
 )
 
 dxmt12_dep = declare_dependency(
   link_with           : [ dxmt12_lib ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ dxmt_include_path, dxmt_build_include_path ],
   dependencies        : apitrace_d3d_pe_deps,
 )

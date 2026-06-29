@@ -8,7 +8,7 @@ void
 HUDState::initialize(const std::string &heading) {
   using namespace WMT;
   auto pool = MakeAutoreleasePool();
-  auto str_dxmt_version = MakeString("com.github.3shain.dxmt-version", WMTUTF8StringEncoding);
+  auto str_dxmt_version = MakeString("DXMT Version", WMTUTF8StringEncoding);
   hud_.addLabel(str_dxmt_version, String::string("com.apple.hud-graph.default", WMTUTF8StringEncoding));
   hud_.updateLabel(str_dxmt_version, String::string(heading.c_str(), WMTUTF8StringEncoding));
   line_labels_.push_back(std::move(str_dxmt_version));

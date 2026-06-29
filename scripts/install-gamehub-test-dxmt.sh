@@ -9,6 +9,8 @@ NATIVE_LLVM_PATH="${DXMT_NATIVE_LLVM_PATH:-/usr/local/opt/llvm@15}"
 GAMEHUB_BUNDLE_ID="${GAMEHUB_BUNDLE_ID:-com.gamemac.test}"
 GAMEHUB_DXMT_PACKAGE="${GAMEHUB_DXMT_PACKAGE:-dxmt-v0.80}"
 GAMEHUB_DXMT_ROOT="${GAMEHUB_DXMT_ROOT:-${HOME}/Library/Application Support/${GAMEHUB_BUNDLE_ID}/wine-engine/downloads/${GAMEHUB_DXMT_PACKAGE}}"
+GAMEHUB_VERSION_MODE="${DXMT_GAMEHUB_VERSION_MODE:-auto}"
+GAMEHUB_VERSION_OVERRIDE="${DXMT_GAMEHUB_VERSION:-}"
 BACKUP_ROOT="${DXMT_GAMEHUB_BACKUP_ROOT:-${HOME}/Library/Caches/dxmt-runtime-smoke}"
 STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${BACKUP_ROOT}/gamehub-test-stage}"
 BACKUP_TAG="${DXMT_GAMEHUB_BACKUP_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -53,6 +55,61 @@ log() {
 die() {
   printf '[gamehub-dxmt] error: %s\n' "$*" >&2
   exit 1
+}
+
+resolve_version_mode() {
+  case "${GAMEHUB_VERSION_MODE}" in
+    release|nightly)
+      printf '%s\n' "${GAMEHUB_VERSION_MODE}"
+      ;;
+    auto)
+      if [[ "${GAMEHUB_DXMT_PACKAGE}" == *nightly* ]]; then
+        printf 'nightly\n'
+      elif [[ "${GAMEHUB_DXMT_PACKAGE}" =~ ^dxmt-v[0-9] ]]; then
+        printf 'release\n'
+      else
+        printf 'nightly\n'
+      fi
+      ;;
+    *)
+      die "unsupported DXMT_GAMEHUB_VERSION_MODE: ${GAMEHUB_VERSION_MODE}"
+      ;;
+  esac
+}
+
+resolve_release_version() {
+  if [[ -n "${GAMEHUB_VERSION_OVERRIDE}" ]]; then
+    printf '%s\n' "${GAMEHUB_VERSION_OVERRIDE}"
+    return
+  fi
+  if [[ "${GAMEHUB_DXMT_PACKAGE}" =~ ^dxmt-(v[0-9][0-9A-Za-z._-]*)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return
+  fi
+  die "release mode requires DXMT_GAMEHUB_VERSION or a package id like dxmt-v0.80"
+}
+
+resolve_nightly_version() {
+  if [[ -n "${GAMEHUB_VERSION_OVERRIDE}" ]]; then
+    printf '%s\n' "${GAMEHUB_VERSION_OVERRIDE}"
+    return
+  fi
+  git -C "${REPO_ROOT}" rev-parse --short=12 HEAD
+}
+
+resolve_runtime_version() {
+  local mode="$1"
+  case "${mode}" in
+    release)
+      resolve_release_version
+      ;;
+    nightly)
+      resolve_nightly_version
+      ;;
+    *)
+      die "internal error: invalid resolved version mode: ${mode}"
+      ;;
+  esac
 }
 
 prepend_tool_path() {
@@ -120,6 +177,11 @@ setup_build_dir() {
     "${BUILD_DIR}"
 }
 
+configure_build_version() {
+  log "configuring runtime version (${RUNTIME_VERSION_MODE}): ${RUNTIME_VERSION}"
+  meson configure "${BUILD_DIR}" -Ddxmt_version="${RUNTIME_VERSION}"
+}
+
 install_to_stage() {
   rm -rf "${STAGE_DIR}"
   mkdir -p "${STAGE_DIR}"
@@ -129,6 +191,14 @@ install_to_stage() {
 
   log "installing runtime to staging root: ${STAGE_DIR}"
   DESTDIR="${STAGE_DIR}" meson install -C "${BUILD_DIR}" --tags runtime,nvext
+}
+
+verify_runtime_version() {
+  local dll="$1"
+  [[ -f "${dll}" ]] || die "missing d3d12.dll for version check: ${dll}"
+  if ! grep -aFq "${RUNTIME_VERSION}" "${dll}"; then
+    die "d3d12.dll does not contain expected version ${RUNTIME_VERSION}: ${dll}"
+  fi
 }
 
 resolve_stage_prefix() {
@@ -197,16 +267,17 @@ write_manifest() {
   fi
 
   python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" \
-    "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" \
+    "$RUNTIME_VERSION" "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" \
     "$GAMEHUB_WINEDEBUG" <<'PY'
 import json
 import sys
 
 manifest_path = sys.argv[1]
 package_name = sys.argv[2]
-enable_apitrace = sys.argv[3] == "1"
-apitrace_output_dir = sys.argv[4]
-winedebug = sys.argv[5]
+runtime_version = sys.argv[3]
+enable_apitrace = sys.argv[4] == "1"
+apitrace_output_dir = sys.argv[5]
+winedebug = sys.argv[6]
 environment_template = {
     "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
     "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
@@ -222,7 +293,7 @@ if enable_apitrace:
 manifest = {
     "id": package_name,
     "name": "DXMT GameHub Test",
-    "version": "codex-builtin-test",
+    "version": runtime_version,
     "link_unix_libs": [
         "${COMPONENT_PATH}/wine/x86_64-unix",
     ],
@@ -239,17 +310,25 @@ PY
 
 main() {
   cd "${REPO_ROOT}"
+  RUNTIME_VERSION_MODE="$(resolve_version_mode)"
+  RUNTIME_VERSION="$(resolve_runtime_version "${RUNTIME_VERSION_MODE}")"
+  export RUNTIME_VERSION_MODE RUNTIME_VERSION
+
   setup_tool_path
   setup_build_dir
+  configure_build_version
   install_to_stage
 
   local stage_prefix
   stage_prefix="$(resolve_stage_prefix)"
+  verify_runtime_version "${stage_prefix}/x86_64-windows/d3d12.dll"
   copy_runtime "${stage_prefix}"
   write_manifest
+  verify_runtime_version "${GAMEHUB_DXMT_ROOT}/wine/x86_64-windows/d3d12.dll"
 
   log "done"
   log "package: ${GAMEHUB_DXMT_ROOT}"
+  log "version: ${RUNTIME_VERSION} (${RUNTIME_VERSION_MODE})"
   log "backup:  ${BACKUP_DIR}"
   if [[ "${ENABLE_APITRACE}" == "1" ]]; then
     log "apitrace output: ${APITRACE_OUTPUT_DIR}"
