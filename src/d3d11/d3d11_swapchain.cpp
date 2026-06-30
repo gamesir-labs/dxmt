@@ -87,6 +87,19 @@ WMTColorSpace ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
   }
 }
 
+static uint32_t
+GetSwapChainPresentAlphaMode(DXGI_ALPHA_MODE alpha_mode) {
+  switch (alpha_mode) {
+  case DXGI_ALPHA_MODE_PREMULTIPLIED:
+  case DXGI_ALPHA_MODE_STRAIGHT:
+  case DXGI_ALPHA_MODE_IGNORE:
+    return alpha_mode;
+  case DXGI_ALPHA_MODE_UNSPECIFIED:
+  default:
+    return DXGI_ALPHA_MODE_IGNORE;
+  }
+}
+
 /**
  FIXME: duplicated implementation in dxgi_output.cpp
 */
@@ -954,12 +967,14 @@ public:
       presenter->changeGammaRamp(output->GetGammaRamp());
     }
     auto enqueue_t0 = clock::now();
+    auto state = presenter->synchronizeLayerProperties();
+    state.metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
     if constexpr (EnableMetalFX) {
       chunk->emitcc([
         this, vsync_duration, backbuffer = backbuffer_->texture(),
         sync_state = SyncFrame(++presentation_count_),
         upscaled = upscaled_backbuffer_->texture(),
-        scaler = this->metalfx_scaler, state = presenter->synchronizeLayerProperties()
+        scaler = this->metalfx_scaler, state = std::move(state)
       ](ArgumentEncodingContext &ctx) mutable {
         auto &scaler_info = ctx.currentFrameStatistics().last_scaler_info;
         scaler_info.type = ScalerType::Spatial;
@@ -974,7 +989,7 @@ public:
       });
     } else {
       chunk->emitcc([
-        this, vsync_duration, state = presenter->synchronizeLayerProperties(),
+        this, vsync_duration, state = std::move(state),
         sync_state = SyncFrame(++presentation_count_),
         backbuffer = backbuffer_->texture()
       ](ArgumentEncodingContext &ctx) mutable {
