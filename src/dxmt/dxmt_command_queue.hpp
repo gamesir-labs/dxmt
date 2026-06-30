@@ -73,7 +73,7 @@ private:
   size_t size_;
 };
 
-constexpr uint32_t kCommandChunkCount = 32;
+constexpr uint32_t kCommandChunkCount = 128;
 
 class CommandQueue;
 
@@ -144,6 +144,8 @@ class CommandQueue {
 
 private:
   void CommitChunkInternal(CommandChunk &chunk);
+
+  void FlushFinalFrameStatistics();
 
   void RetirePersistentResidencyRemovals(uint64_t completed_seq);
 

@@ -153,6 +153,7 @@ CommandQueue::~CommandQueue() {
   finishThread.join();
   readback_cond_.notify_all();
   readbackThread.join();
+  FlushFinalFrameStatistics();
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.reset();
@@ -165,6 +166,32 @@ CommandQueue::~CommandQueue() {
 }
 
 void
+CommandQueue::FlushFinalFrameStatistics() {
+  if (!perf::enabled())
+    return;
+
+  auto &frame = statistics.at(frame_count);
+  const bool has_work =
+      frame.command_buffer_count || frame.frame_execute_command_lists_interval != clock::duration{} ||
+      frame.frame_queue_signal_interval != clock::duration{} ||
+      frame.frame_queue_wait_interval != clock::duration{} ||
+      frame.frame_cmdlist_record_interval != clock::duration{} ||
+      frame.flush_chunk_count || frame.flush_total_interval != clock::duration{};
+  if (!has_work)
+    return;
+
+  const auto boundary_time = clock::now();
+  perf::recordFrameBoundaryApiGap(&frame, boundary_time);
+  statistics.compute(frame_count);
+  const auto frame_wall_us = frame.begin_time == clock::time_point{}
+                                 ? 0
+                                 : DxmtQueueDiagDurationUs(boundary_time - frame.begin_time);
+  const auto final_frame = frame_count + 1;
+  perf::recordFrameBoundary(final_frame, frame, statistics.average(), frame_wall_us);
+  frame_count = final_frame;
+}
+
+void
 CommandQueue::CommitCurrentChunk() {
   auto& statistics = CurrentFrameStatistics();
 #if ASYNC_ENCODING
@@ -172,7 +199,7 @@ CommandQueue::CommitCurrentChunk() {
   for (;;) {
     auto ongoing = chunk_ongoing.load(std::memory_order_acquire);
     while (ongoing >= kCommandChunkCount - 1) {
-      dxmt::this_thread::yield();
+      chunk_ongoing.wait(ongoing, std::memory_order_acquire);
       ongoing = chunk_ongoing.load(std::memory_order_acquire);
     }
     if (chunk_ongoing.compare_exchange_weak(
