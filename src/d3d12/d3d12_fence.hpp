@@ -2,10 +2,30 @@
 
 #include "d3d12_device.hpp"
 #include "Metal.hpp"
+#include <cstdint>
 #include <functional>
 #include <d3d12.h>
 
 namespace dxmt::d3d12 {
+
+struct FenceGpuSignal {
+  WMT::Reference<WMT::SharedEvent> event;
+  UINT64 signal_value = 0;
+  uintptr_t queue = 0;
+  D3D12_COMMAND_LIST_TYPE queue_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  uint64_t dxmt_chunk = 0;
+  uint64_t chunk_event = 0;
+  uint64_t frame = 0;
+};
+
+enum class FenceGpuWaitStatus {
+  Resolved,
+  External,
+  Shared,
+  CpuSignal,
+  Unknown,
+  Rewind,
+};
 
 class Fence {
 public:
@@ -19,6 +39,8 @@ public:
   virtual void SignalFromQueue(UINT64 value) = 0;
   virtual void AddCompletionCallback(UINT64 value, std::function<void()> callback) = 0;
   virtual bool HasReached(UINT64 value) const = 0;
+  virtual void RegisterQueueSignal(const FenceGpuSignal &signal) = 0;
+  virtual FenceGpuWaitStatus TryResolveGpuWait(UINT64 value, FenceGpuSignal &signal) const = 0;
 };
 
 Com<ID3D12Fence>
