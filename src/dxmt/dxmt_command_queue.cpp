@@ -761,6 +761,8 @@ CommandQueue::WaitForFinishThread() {
       std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
       completion_callbacks.swap(chunk.completion_callbacks);
     }
+    const auto completion_chunk_id = chunk.chunk_id;
+    const auto completion_frame = chunk.frame_;
 
     EnqueueReadbacks(chunk);
     chunk.reset();
@@ -786,6 +788,8 @@ CommandQueue::WaitForFinishThread() {
     if (DxmtQueueDiagEnabled() && !completion_callbacks.empty()) {
       WARN_FILE_ONLY("DXMT queue diagnostic: CompletionCallbacks"
            " seq=", internal_seq,
+           " chunk=", completion_chunk_id,
+           " frame=", completion_frame,
            " count=", completion_callbacks.size(),
            " elapsedMs=", DxmtQueueDiagDurationMs(callbacks_end_time - callbacks_begin_time));
     }

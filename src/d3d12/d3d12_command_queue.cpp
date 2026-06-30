@@ -19781,6 +19781,10 @@ private:
     auto event = state->GetSharedEvent();
     auto &queue = device_->GetDXMTDevice().queue();
     auto chunk = queue.CurrentChunk();
+    const auto chunk_id = queue.CurrentSeqId();
+    const auto chunk_slot = chunk_id % kCommandChunkCount;
+    const auto chunk_event_id = queue.GetCurrentEventSeqId() + 1;
+    const auto chunk_frame = queue.CurrentFrameSeq() - 1;
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: SubmitFenceSignal ", mode,
@@ -19791,11 +19795,39 @@ private:
            " submittedBatches=", submitted_batches_,
            " hasWaited=", has_waited_);
     }
+    static std::atomic<uint32_t> bind_log_count = 0;
+    if (D3D12DiagShouldLog(bind_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: FenceSignalBindChunk"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " queueType=", desc_.Type,
+           " fence=", reinterpret_cast<uintptr_t>(state),
+           " value=", value,
+           " mode=", mode,
+           " dxmtChunk=", chunk_id,
+           " chunkSlot=", chunk_slot,
+           " chunkEvent=", chunk_event_id,
+           " frame=", chunk_frame,
+           " submittedBatches=", submitted_batches_,
+           " hasWaited=", has_waited_);
+    }
     chunk->emitcc([event = std::move(event), value](ArgumentEncodingContext &enc) mutable {
       enc.signalEvent(std::move(event), value);
     });
     state->AddRefPrivate();
-    chunk->completion_callbacks.push_back([state, value]() {
+    chunk->completion_callbacks.push_back([state, value, queue_ptr = reinterpret_cast<uintptr_t>(this),
+                                           queue_type = desc_.Type, chunk_id, chunk_event_id,
+                                           chunk_frame]() {
+      static std::atomic<uint32_t> complete_log_count = 0;
+      if (D3D12DiagShouldLog(complete_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+        WARN_FILE_ONLY("D3D12 queue diagnostic: FenceSignalCompleteChunk"
+             " queue=", queue_ptr,
+             " queueType=", queue_type,
+             " fence=", reinterpret_cast<uintptr_t>(state),
+             " value=", value,
+             " dxmtChunk=", chunk_id,
+             " chunkEvent=", chunk_event_id,
+             " frame=", chunk_frame);
+      }
       state->SetCompletedValue(value);
       state->ReleasePrivate();
     });
