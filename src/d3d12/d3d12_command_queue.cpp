@@ -4864,11 +4864,9 @@ private:
                  " actualPresentIntervalMs=", sinceMs);
         }
       }
-      queue_->FlushPendingOperations();
-      std::lock_guard dxmt_queue_lock(queue_->resource_states_->dxmt_queue_mutex);
       auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
-      auto *chunk = dxmt_queue.CurrentChunk();
-      chunk->signal_frame_latency_fence_ = dxmt_queue.CurrentFrameSeq();
+      const auto present_frame_id = dxmt_queue.CurrentFrameSeq() - 1;
+      const auto present_frame_seq = present_frame_id + 1;
       auto state = presenter_->synchronizeLayerProperties();
       state.metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
       state.metadata.background_color[0] = background_color_.r;
@@ -4881,7 +4879,12 @@ private:
         DuplicateHandle(process, present_semaphore_, process, &present_signal,
                         0, FALSE, DUPLICATE_SAME_ACCESS);
       }
-      chunk->emitcc([
+      auto present_state = std::make_shared<decltype(state)>(std::move(state));
+      PendingOperation op = {};
+      op.type = PendingOperationType::QueueWork;
+      op.frame_id = present_frame_id;
+      op.queue_work = [
+        present_frame_seq,
         backbuffer = Rc<Texture>(resource->GetTexture()),
         present_view = resource->GetPresentSourceView(),
         presenter = presenter_,
@@ -4890,17 +4893,32 @@ private:
         apitrace_frame_index,
         sync_interval,
         flags,
-        state = std::move(state)
-      ](ArgumentEncodingContext &ctx) mutable {
-        ctx.present(backbuffer, present_view, presenter, vsync_duration,
-                    state.metadata, apitrace_frame_index, sync_interval,
-                    flags);
-        if (present_signal) {
-          ReleaseSemaphore(present_signal, 1, nullptr);
-          CloseHandle(present_signal);
-        }
-      });
-      dxmt_queue.CommitCurrentChunk();
+        present_state = std::move(present_state)
+      ](CommandChunk *chunk) mutable {
+        chunk->signal_frame_latency_fence_ = present_frame_seq;
+        auto state = std::move(*present_state);
+        chunk->emitcc([
+          backbuffer = std::move(backbuffer),
+          present_view = std::move(present_view),
+          presenter = std::move(presenter),
+          present_signal,
+          vsync_duration,
+          apitrace_frame_index,
+          sync_interval,
+          flags,
+          state = std::move(state)
+        ](ArgumentEncodingContext &ctx) mutable {
+          ctx.present(backbuffer, present_view, presenter, vsync_duration,
+                      state.metadata, apitrace_frame_index, sync_interval,
+                      flags);
+          if (present_signal) {
+            ReleaseSemaphore(present_signal, 1, nullptr);
+            CloseHandle(present_signal);
+          }
+        });
+        return true;
+      };
+      queue_->EnqueuePendingOperation(std::move(op), nullptr);
       perf_timer.stop();
       dxmt_queue.PresentBoundary();
       queue_->LogBindlessMirrorDiagSummary("present");
@@ -19359,6 +19377,7 @@ private:
     Fence *fence = nullptr;
     UINT64 value = 0;
     dxmt::FrameStatistics *perf_stats = nullptr;
+    uint64_t frame_id = ~0ull;
     bool wait_callback_armed = false;
     bool wait_completed = false;
 
@@ -19374,6 +19393,7 @@ private:
           fence(other.fence),
           value(other.value),
           perf_stats(other.perf_stats),
+          frame_id(other.frame_id),
           wait_callback_armed(other.wait_callback_armed),
           wait_completed(other.wait_completed) {
       other.fence = nullptr;
@@ -19389,6 +19409,7 @@ private:
         fence = other.fence;
         value = other.value;
         perf_stats = other.perf_stats;
+        frame_id = other.frame_id;
         wait_callback_armed = other.wait_callback_armed;
         wait_completed = other.wait_completed;
         other.fence = nullptr;
@@ -19428,6 +19449,9 @@ private:
   void EnqueuePendingOperation(PendingOperation &&operation,
                                dxmt::FrameStatistics *perf_stats) {
     auto t0 = clock::now();
+    if (operation.frame_id == ~0ull)
+      operation.frame_id =
+          device_->GetDXMTDevice().queue().CurrentFrameSeq() - 1;
     {
       std::lock_guard lock(mutex_);
       if (operation.type == PendingOperationType::Wait)
@@ -19606,7 +19630,7 @@ private:
         auto *chunk = queue.CurrentChunk();
         const auto wait_chunk_id = queue.CurrentSeqId();
         const auto wait_chunk_event_id = queue.GetCurrentEventSeqId() + 1;
-        const auto wait_frame = queue.CurrentFrameSeq() - 1;
+        const auto wait_frame = operation.frame_id;
         const auto waited_value = operation.value;
         chunk->emitcc([event = std::move(gpu_wait_signal.event),
                        waited_value](ArgumentEncodingContext &enc) mutable {
@@ -19743,7 +19767,8 @@ private:
         }
         const auto signal_begin = clock::now();
         for (auto &signal : coalesced_signals) {
-          EncodeFenceSignal(signal.fence, signal.value, "coalesced");
+          EncodeFenceSignal(signal.fence, signal.value, "coalesced",
+                            operation.frame_id);
         }
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Signal,
@@ -19760,7 +19785,8 @@ private:
           }
         }
         const auto commit_begin = clock::now();
-        device_->GetDXMTDevice().queue().CommitCurrentChunk();
+        device_->GetDXMTDevice().queue().CommitCurrentChunkForFrame(
+            operation.frame_id);
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Commit,
             clock::now() - commit_begin);
@@ -19808,13 +19834,15 @@ private:
         if (has_gpu_work) {
           const auto signal_begin = clock::now();
           for (auto &signal : coalesced_signals)
-            EncodeFenceSignal(signal.fence, signal.value, "coalesced");
+            EncodeFenceSignal(signal.fence, signal.value, "coalesced",
+                              operation.frame_id);
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Signal,
               clock::now() - signal_begin);
 
           const auto commit_begin = clock::now();
-          device_->GetDXMTDevice().queue().CommitCurrentChunk();
+          device_->GetDXMTDevice().queue().CommitCurrentChunkForFrame(
+              operation.frame_id);
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Commit,
               clock::now() - commit_begin);
@@ -19907,20 +19935,24 @@ private:
         continue;
 
       EncodeFenceSignal(signal.fence, signal.value,
-          signals.size() > 1 ? "batched" : "encoded");
+          signals.size() > 1 ? "batched" : "encoded", signal.frame_id);
     }
     auto &queue = device_->GetDXMTDevice().queue();
-    queue.CommitCurrentChunk();
+    queue.CommitCurrentChunkForFrame(
+        signals.front().frame_id == ~0ull
+            ? queue.CurrentFrameSeq() - 1
+            : signals.front().frame_id);
   }
 
-  void EncodeFenceSignal(Fence *state, UINT64 value, const char *mode) {
+  void EncodeFenceSignal(Fence *state, UINT64 value, const char *mode,
+                         uint64_t frame_id) {
     auto event = state->GetSharedEvent();
     auto &queue = device_->GetDXMTDevice().queue();
     auto chunk = queue.CurrentChunk();
     const auto chunk_id = queue.CurrentSeqId();
     const auto chunk_slot = chunk_id % kCommandChunkCount;
     const auto chunk_event_id = queue.GetCurrentEventSeqId() + 1;
-    const auto chunk_frame = queue.CurrentFrameSeq() - 1;
+    const auto chunk_frame = frame_id;
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: SubmitFenceSignal ", mode,

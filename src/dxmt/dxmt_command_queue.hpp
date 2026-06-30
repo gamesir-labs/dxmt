@@ -268,6 +268,8 @@ public:
   */
   void CommitCurrentChunk();
 
+  void CommitCurrentChunkForFrame(uint64_t frame_id);
+
   uint64_t CurrentFrameSeq() {
     return frame_count + 1;
   }

@@ -193,7 +193,12 @@ CommandQueue::FlushFinalFrameStatistics() {
 
 void
 CommandQueue::CommitCurrentChunk() {
-  auto& statistics = CurrentFrameStatistics();
+  CommitCurrentChunkForFrame(frame_count);
+}
+
+void
+CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
+  auto &frame_statistics = statistics.at(frame_id);
 #if ASYNC_ENCODING
   auto t0 = clock::now();
   for (;;) {
@@ -208,17 +213,17 @@ CommandQueue::CommitCurrentChunk() {
       break;
   }
   auto t1 = clock::now();
-  statistics.commit_interval += (t1 - t0);
+  frame_statistics.commit_interval += (t1 - t0);
 #endif
 
   auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
   auto &chunk = chunks[chunk_id % kCommandChunkCount];
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
-  chunk.frame_ = frame_count;
+  chunk.frame_ = frame_id;
   chunk.publish_time = clock::now();
   chunk.resource_initializer_event_id = initializer.flushToWait();
-  statistics.command_buffer_count++;
+  frame_statistics.command_buffer_count++;
   static std::atomic<uint32_t> commit_log_count = 0;
   if (DxmtQueueDiagShouldLog(commit_log_count)) {
     WARN_FILE_ONLY("DXMT queue diagnostic: CommitCurrentChunk publish"
