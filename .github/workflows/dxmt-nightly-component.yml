@@ -171,6 +171,8 @@ jobs:
         run: git submodule update --init --depth=1 external/apitrace external/nvapi include/native/directx
 
       - name: Build x86_64 Wine Builtin Runtime
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
           dxmt_version="${short_sha}"
@@ -206,6 +208,8 @@ jobs:
         run: git submodule update --init --depth=1 external/apitrace external/nvapi include/native/directx
 
       - name: Build x86 Wine Builtin Runtime
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
           dxmt_version="${short_sha}"

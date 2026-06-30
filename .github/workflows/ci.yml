@@ -137,6 +137,8 @@ jobs:
           submodules: true
 
       - name: Build
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
@@ -155,6 +157,8 @@ jobs:
           submodules: true
 
       - name: Build WoW64
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
@@ -173,6 +177,8 @@ jobs:
           submodules: true
 
       - name: Build
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
@@ -191,6 +197,8 @@ jobs:
           submodules: true
 
       - name: Build
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
@@ -209,6 +217,8 @@ jobs:
           submodules: true
 
       - name: Build WoW64
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
@@ -227,6 +237,8 @@ jobs:
           submodules: true
 
       - name: Build
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains arm64ec
@@ -245,6 +257,8 @@ jobs:
           submodules: true
 
       - name: Build
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
