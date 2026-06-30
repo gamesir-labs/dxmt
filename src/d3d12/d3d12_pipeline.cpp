@@ -81,6 +81,24 @@ BindlessUsesSamplerMirror(const PipelineDxilShader &shader) {
   return false;
 }
 
+static uint64_t
+AirconvHandleValue(sm50_ptr64_t handle) {
+#if defined(__LP64__) || defined(_WIN64)
+  return reinterpret_cast<uintptr_t>(handle);
+#else
+  return static_cast<uint64_t>(handle);
+#endif
+}
+
+static const void *
+AirconvLocalPointer(sm50_ptr64_t handle) {
+#if defined(__LP64__) || defined(_WIN64)
+  return handle;
+#else
+  return nullptr;
+#endif
+}
+
 static std::string
 D3D12PipelineDumpDirectory() {
   std::string path = env::getEnvVar("DXMT_DUMP_PATH");
@@ -1211,7 +1229,7 @@ D3D12DumpFailedPipelineShader(const PipelineDxilShader &shader,
                               const char *function_name,
                               std::string_view error_message,
                               int compile_result,
-                              uintptr_t error_handle) {
+                              uint64_t error_handle) {
   static std::atomic<uint32_t> failure_count = 0;
   const auto index = failure_count.fetch_add(1, std::memory_order_relaxed);
   if (index >= 32)
@@ -1410,23 +1428,36 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
                           PipelineMetalShader &out, bool bindless) {
   SM50_COMPILED_BITCODE bitcode = {};
   DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
+  const auto bitcode_data = AirconvLocalPointer(bitcode.Data);
+  const auto bitcode_data_native = AirconvHandleValue(bitcode.Data);
+  const auto can_hash_bitcode = bitcode_data && bitcode.Size;
 
-  const auto cache_key = BuildMetalFunctionCacheKey(
-      device, stage, function_name, bitcode.Data, bitcode.Size, bindless);
-  {
-    std::lock_guard lock(PipelineMetalFunctionCacheMutex());
-    auto &cache = PipelineMetalFunctionCache();
-    auto cached = cache.find(cache_key);
-    if (cached != cache.end()) {
-      out = cached->second;
-      DXMT12SM50DestroyBitcode(bitcode_handle);
-      return true;
+  if (!bitcode_data_native || !bitcode.Size) {
+    WARN("D3D12PipelineState: empty AIR bitcode for ",
+         ShaderStageName(stage), " function=", function_name);
+    DXMT12SM50DestroyBitcode(bitcode_handle);
+    return false;
+  }
+
+  std::string cache_key;
+  if (can_hash_bitcode) {
+    cache_key = BuildMetalFunctionCacheKey(
+        device, stage, function_name, bitcode_data, bitcode.Size, bindless);
+    {
+      std::lock_guard lock(PipelineMetalFunctionCacheMutex());
+      auto &cache = PipelineMetalFunctionCache();
+      auto cached = cache.find(cache_key);
+      if (cached != cache.end()) {
+        out = cached->second;
+        DXMT12SM50DestroyBitcode(bitcode_handle);
+        return true;
+      }
     }
   }
 
   const auto materialize_begin = dxmt::clock::now();
   WMT::Reference<WMT::Error> metal_error;
-  auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
+  auto lib_data = WMT::MakeDispatchData(bitcode_data_native, bitcode.Size);
   PipelineMetalShader compiled = {};
   compiled.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
   DXMT12SM50DestroyBitcode(bitcode_handle);
@@ -1444,7 +1475,7 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
     return false;
   }
 
-  {
+  if (can_hash_bitcode) {
     std::lock_guard lock(PipelineMetalFunctionCacheMutex());
     auto &cache = PipelineMetalFunctionCache();
     auto [it, inserted] = cache.emplace(cache_key, compiled);
@@ -1452,6 +1483,8 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
       out = std::move(compiled);
     else
       out = it->second;
+  } else {
+    out = std::move(compiled);
   }
   dxmt::perf::recordPsoMaterializeTime(
       dxmt::perf::currentFrameStatistics(),
@@ -1582,7 +1615,7 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
          ShaderStageName(shader.stage),
          shader.kind() == PipelineShaderBytecodeKind::Dxil ? " kind=DXIL"
                                                          : " kind=DXBC",
-         " ret=", compile_failed, " error=", reinterpret_cast<uintptr_t>(error),
+         " ret=", compile_failed, " error=", AirconvHandleValue(error),
          " message_len=", error_message.size(), " function=", air_function_name,
          " requestedFunction=", function_name);
     WARN("D3D12PipelineState: failed to compile ", ShaderStageName(shader.stage),
@@ -1591,7 +1624,7 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
          error_message);
     D3D12DumpFailedPipelineShader(shader, function_name, error_message,
                                   compile_failed,
-                                  reinterpret_cast<uintptr_t>(error));
+                                  AirconvHandleValue(error));
     DXMT12SM50FreeError(error);
     return false;
   }
@@ -1603,10 +1636,11 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   if (persistent && scache) {
     SM50_COMPILED_BITCODE bitcode = {};
     DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
-    if (bitcode.Data && bitcode.Size) {
+    const auto bitcode_data_native = AirconvHandleValue(bitcode.Data);
+    if (bitcode_data_native && bitcode.Size) {
       if (auto writer = scache->getWriter()) {
         writer->set(persistent_key,
-                    WMT::MakeDispatchData(bitcode.Data, bitcode.Size));
+                    WMT::MakeDispatchData(bitcode_data_native, bitcode.Size));
       }
     }
   }
