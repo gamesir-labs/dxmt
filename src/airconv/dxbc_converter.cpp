@@ -33,8 +33,8 @@ namespace dxmt::dxbc {
 
 // bindless-mirror toggles (defined here so both the parse-time and rebuild-time
 // argument-buffer builders can see them). Setters are exported below.
-static bool gBindlessMirrorTextureSrvPrototype = false;
-static bool gBindlessMirror = false;
+static thread_local bool gBindlessMirrorTextureSrvPrototype = false;
+static thread_local bool gBindlessMirror = false;
 
 constexpr uint32_t kCBufferBindingSlotCapacity = 14;
 

@@ -474,6 +474,9 @@ PipelineShaderCache() {
   return cache;
 }
 
+std::mutex &
+AirconvCompileMutex();
+
 HRESULT
 InitializePipelineShaderHandle(PipelineShaderStage stage,
                                PipelineCachedShader &cached_shader,
@@ -484,13 +487,17 @@ InitializePipelineShaderHandle(PipelineShaderStage stage,
 
   sm50_error_t error = nullptr;
   const bool is_dxil = cached_shader.kind == PipelineShaderBytecodeKind::Dxil;
-  const auto initialize_failed =
-      is_dxil ? DXMT12DXILInitialize(cached_shader.bytecode.data(),
-                                     cached_shader.bytecode.size(), shader,
-                                     reflection, &error)
-              : DXMT12SM50Initialize(cached_shader.bytecode.data(),
-                                     cached_shader.bytecode.size(), shader,
-                                     reflection, &error);
+  int initialize_failed = 0;
+  {
+    std::lock_guard lock(AirconvCompileMutex());
+    initialize_failed =
+        is_dxil ? DXMT12DXILInitialize(cached_shader.bytecode.data(),
+                                       cached_shader.bytecode.size(), shader,
+                                       reflection, &error)
+                : DXMT12SM50Initialize(cached_shader.bytecode.data(),
+                                       cached_shader.bytecode.size(), shader,
+                                       reflection, &error);
+  }
   if (initialize_failed) {
     WARN("D3D12PipelineState: failed to initialize ", ShaderStageName(stage),
          is_dxil ? " DXIL shader: " : " DXBC shader: ",
@@ -2548,6 +2555,7 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
     const bool was_persistent_cache_hit = out.compute.persistent_cache_hit;
     const auto persistent_cache_key = out.compute.persistent_cache_key;
     log_failure(error_desc);
+
     if (!was_persistent_cache_hit)
       return false;
 
