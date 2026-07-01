@@ -540,7 +540,8 @@ void
 ArgumentEncodingContext::packBindlessBufferTable(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments,
     const std::string &shader_hash, uint64_t *buf_table, uint32_t buf_table_qwords,
-    const uint32_t *res_compact, const BindlessBufferTableSnapshot *bindings
+    const uint32_t *res_compact, const BindlessBufferTableSnapshot *bindings,
+    uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 ) {
   auto BindingCount = reflection->NumArguments;
   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
@@ -555,6 +556,20 @@ ArgumentEncodingContext::packBindlessBufferTable(
 
   for (unsigned i = 0; i < BindingCount; i++) {
     auto arg = arguments[i];
+    if constexpr (stage == PipelineStage::Pixel) {
+      if (arg.Type == SM50BindingType::SRV && arg.SM50BindingSlot < 128) {
+        const bool demote_msaa =
+            arg.SM50BindingSlot < 64
+                ? (demote_msaa_srv_mask_lo &
+                   (uint64_t(1) << arg.SM50BindingSlot))
+                : (demote_msaa_srv_mask_hi &
+                   (uint64_t(1) << (arg.SM50BindingSlot - 64)));
+        if (demote_msaa) {
+          arg.Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
+              arg.Flags & ~MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED);
+        }
+      }
+    }
     const uint32_t compact = res_compact[i]; // qword base for this arg's buffer field
     switch (arg.Type) {
     case SM50BindingType::Sampler:
@@ -881,16 +896,16 @@ template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Compu
 template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Vertex, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, uint64_t *, uint32_t, const uint32_t *, const ConstantBufferBindingSnapshot *);
 template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Geometry, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, uint64_t *, uint32_t, const uint32_t *, const ConstantBufferBindingSnapshot *);
 template void ArgumentEncodingContext::packBindlessCBuffers<PipelineStage::Pixel, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, uint64_t *, uint32_t, const uint32_t *, const ConstantBufferBindingSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Vertex, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Hull, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Domain, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Vertex, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Geometry, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
-template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Vertex, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Hull, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Domain, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Vertex, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Geometry, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template void ArgumentEncodingContext::packBindlessBufferTable<PipelineStage::Pixel, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t *, uint32_t, const uint32_t *, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
 
 // ---- bindless-mirror (Stage-1 sub-step ③.3) live per-draw wiring ----
 //
@@ -905,7 +920,9 @@ ArgumentEncodingContext::packBindlessStage(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
     const MTL_SM50_SHADER_ARGUMENT *arguments, const std::string &shader_hash,
     uint64_t verify_draw_id, uint64_t verify_draw_serial,
-    const BindlessBufferTableSnapshot *bindings
+    const BindlessBufferTableSnapshot *bindings,
+    uint64_t demote_msaa_srv_mask_lo,
+    uint64_t demote_msaa_srv_mask_hi
 ) {
   const uint32_t num_cbuffers = reflection->NumConstantBuffers;
   const uint32_t num_arguments = reflection->NumArguments;
@@ -925,7 +942,9 @@ ArgumentEncodingContext::packBindlessStage(
     // buf_table_qwords == 0) skips every write. The caller still binds the mirrors.
     if (num_arguments && arguments)
       packBindlessBufferTable<stage, kind>(reflection, arguments, shader_hash, nullptr, 0,
-                                           res_bases.data(), bindings);
+                                           res_bases.data(), bindings,
+                                           demote_msaa_srv_mask_lo,
+                                           demote_msaa_srv_mask_hi);
     return {};
   }
 
@@ -940,7 +959,9 @@ ArgumentEncodingContext::packBindlessStage(
                                       cb_bases.data(), bindings ? bindings->constant_buffers : nullptr);
   if (num_arguments && arguments)
     packBindlessBufferTable<stage, kind>(reflection, arguments, shader_hash, buf_table, qword_count,
-                                         res_bases.data(), bindings);
+                                         res_bases.data(), bindings,
+                                         demote_msaa_srv_mask_lo,
+                                         demote_msaa_srv_mask_hi);
 
   verifyBindlessBufferTable<stage, kind>(
       reflection, constant_buffers, arguments, buf_table, qword_count,
@@ -1098,9 +1119,9 @@ ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound() {
   }
 }
 
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *);
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *);
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);

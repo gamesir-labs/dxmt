@@ -10461,7 +10461,13 @@ private:
       return;
     }
 
-    auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalGraphicsState(); }();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        PixelShaderSingleSampleMsaaSRVDemoteMask(state, *pipeline);
+    auto *metal = [&] {
+      StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs);
+      return pipeline->GetMetalGraphicsState(demote_msaa_srv_mask_lo,
+                                             demote_msaa_srv_mask_hi);
+    }();
     if (!metal || !metal->pso) {
       WARN("D3D12CommandQueue: indirect draw skipped because Metal graphics PSO is unavailable");
       return;
@@ -10512,6 +10518,7 @@ private:
     auto encode_draw =
         [this, metal_pso, use_geometry = metal->use_geometry,
          use_tessellation = metal->use_tessellation,
+         demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi,
          depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
          tess_threads_per_patch = metal->tess_threads_per_patch,
          tess_num_output_control_point_element =
@@ -10526,6 +10533,11 @@ private:
          viewports = std::move(viewports), scissors = std::move(scissors)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       EncodeRenderPipelineStateIfChanged(enc, metal_pso);
+      auto *render_encoder = enc.currentRenderEncoder();
+      render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
+          demote_msaa_srv_mask_lo;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
+          demote_msaa_srv_mask_hi;
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -10680,7 +10692,13 @@ private:
       return;
     }
 
-    auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalGraphicsState(); }();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        PixelShaderSingleSampleMsaaSRVDemoteMask(state, *pipeline);
+    auto *metal = [&] {
+      StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs);
+      return pipeline->GetMetalGraphicsState(demote_msaa_srv_mask_lo,
+                                             demote_msaa_srv_mask_hi);
+    }();
     if (!metal || !metal->pso) {
       WARN("D3D12CommandQueue: indirect indexed draw skipped because Metal graphics PSO is unavailable");
       return;
@@ -10749,6 +10767,7 @@ private:
     auto encode_draw =
         [this, metal_pso, use_geometry = metal->use_geometry,
          use_tessellation = metal->use_tessellation,
+         demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi,
          depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
          tess_threads_per_patch = metal->tess_threads_per_patch,
          tess_num_output_control_point_element =
@@ -10766,6 +10785,11 @@ private:
                                          uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
       EncodeRenderPipelineStateIfChanged(enc, metal_pso);
+      auto *render_encoder = enc.currentRenderEncoder();
+      render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
+          demote_msaa_srv_mask_lo;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
+          demote_msaa_srv_mask_hi;
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -11135,6 +11159,44 @@ private:
     if (argument.SM50BindingSlot >= capacity)
       return 0u;
     return capacity - argument.SM50BindingSlot;
+  }
+
+  struct DescriptorShaderRangeOverlap {
+    UINT descriptor_index = 0;
+    UINT argument_local_start = 0;
+    UINT count = 0;
+  };
+
+  static std::optional<DescriptorShaderRangeOverlap>
+  IntersectDescriptorRangeWithShaderArgument(UINT shader_lower_bound,
+                                             UINT shader_range_count,
+                                             UINT descriptor_lower_bound,
+                                             UINT descriptor_count) {
+    if (!shader_range_count || !descriptor_count)
+      return std::nullopt;
+
+    const uint64_t shader_first = shader_lower_bound;
+    const uint64_t shader_last = shader_first + uint64_t(shader_range_count);
+    const uint64_t descriptor_first = descriptor_lower_bound;
+    const uint64_t descriptor_last =
+        descriptor_count == UINT_MAX
+            ? UINT64_MAX
+            : descriptor_first + uint64_t(descriptor_count);
+    const uint64_t first = std::max(shader_first, descriptor_first);
+    const uint64_t last = std::min(shader_last, descriptor_last);
+    if (first >= last)
+      return std::nullopt;
+
+    const uint64_t descriptor_index = first - descriptor_first;
+    const uint64_t argument_local_start = first - shader_first;
+    const uint64_t count = last - first;
+    if (descriptor_index > UINT_MAX || argument_local_start > UINT_MAX ||
+        count > UINT_MAX)
+      return std::nullopt;
+
+    return DescriptorShaderRangeOverlap{UINT(descriptor_index),
+                                        UINT(argument_local_start),
+                                        UINT(count)};
   }
 
   static DXMT12_MTL4_SHADER_ARGUMENT
@@ -12825,6 +12887,7 @@ private:
     uint32_t descriptor_index = 0;
     uint32_t descriptor_count = 0;
     uint32_t shader_register_lower_bound = 0;
+    uint32_t argument_local_start = 0;
     uint32_t root_offset_key = 0;
     uint32_t compact_base = 0;
     uint32_t range_count = 0;
@@ -13047,7 +13110,7 @@ private:
     uint32_t entry_count = 0;
   };
 
-  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 2;
+  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 3;
 
   static std::string BuildDescriptorTableBindingRecipeCachePath() {
     return dxmt::GetDXMTShaderCacheDirectory() + "d3d12_binding_recipes.db";
@@ -13132,7 +13195,7 @@ private:
                                      const RootSignatureRange &range,
                                      D3D12_SHADER_VISIBILITY visibility,
                                      bool compute) {
-    UINT count = 0;
+    uint64_t count = 0;
     const auto binding_type = BindingTypeForRange(range.range_type);
     ForEachVisibleStage(
         visibility, compute, [&](PipelineStage stage) {
@@ -13158,15 +13221,18 @@ private:
             const auto lower = argument.RegisterCount
                                    ? argument.RegisterLowerBound
                                    : argument.SM50BindingSlot;
-            if (space != range.register_space ||
-                lower < range.base_shader_register)
+            if (space != range.register_space)
               continue;
-            const auto first = lower - range.base_shader_register;
             const auto size = ShaderArgumentRangeCount(argument);
-            count = std::max(count, first + size);
+            const auto overlap = IntersectDescriptorRangeWithShaderArgument(
+                lower, size, range.base_shader_register, UINT_MAX);
+            if (!overlap)
+              continue;
+            count = std::max<uint64_t>(
+                count, uint64_t(overlap->descriptor_index) + overlap->count);
           }
         });
-    return count ? std::min<UINT>(count, 4096u) : 1u;
+    return count ? UINT(std::min<uint64_t>(count, 4096u)) : 1u;
   }
 
   void ApplyStaticSamplers(ArgumentEncodingContext &enc,
@@ -13769,11 +13835,10 @@ private:
           const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
           const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
                                                     : argument.SM50BindingSlot;
-          if (space != range.register_space ||
-              lower < range.base_shader_register)
-            continue;
-          const auto descriptor_index = lower - range.base_shader_register;
-          if (descriptor_index >= count)
+          const auto argument_range_count = ShaderArgumentRangeCount(argument);
+          const auto overlap = IntersectDescriptorRangeWithShaderArgument(
+              lower, argument_range_count, range.base_shader_register, count);
+          if (space != range.register_space || !overlap)
             continue;
           const auto compact_base =
               is_sampler ? sampler_bases[i] : texture_bases[i];
@@ -13782,12 +13847,13 @@ private:
           plan.entries.push_back(BindlessMirrorStagePlanEntry{
               root_index,
               range_offset,
-              descriptor_index,
+              overlap->descriptor_index,
               count,
               lower,
+              overlap->argument_local_start,
               argument.StructurePtrOffset,
               compact_base,
-              ShaderArgumentRangeCount(argument),
+              overlap->count,
               uint16_t(i),
               range.range_type,
               heap_type,
@@ -13905,7 +13971,8 @@ private:
              local < entry.range_count &&
              entry.descriptor_index + local < entry.descriptor_count;
              local++) {
-          if (entry.compact_base + local >= dxmt::kBindlessMirrorCapacity)
+          const auto dst_local = entry.argument_local_start + local;
+          if (entry.compact_base + dst_local >= dxmt::kBindlessMirrorCapacity)
             break;
           const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
               heap, base_handle, entry.range_offset,
@@ -13922,11 +13989,11 @@ private:
             auto *src2 =
                 slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
             if (src0 && src1 && src2) {
-              dst[entry.compact_base + local] = *src0;
-              dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + local] =
+              dst[entry.compact_base + dst_local] = *src0;
+              dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + dst_local] =
                   *src1;
               dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
-                  entry.compact_base + local] = *src2;
+                  entry.compact_base + dst_local] = *src2;
             }
           } else if (entry.texture && window->texture.mapped) {
             auto *dst = static_cast<uint64_t *>(window->texture.mapped);
@@ -13939,9 +14006,9 @@ private:
                 const uint64_t pair_base =
                     uint64_t(pair) * dxmt::kMirrorTextureQwords *
                     dxmt::kBindlessMirrorCapacity;
-                dst[pair_base + entry.compact_base + local] = *src0;
+                dst[pair_base + entry.compact_base + dst_local] = *src0;
                 dst[pair_base + dxmt::kBindlessMirrorCapacity +
-                    entry.compact_base + local] = *src1;
+                    entry.compact_base + dst_local] = *src1;
               }
             }
           }
@@ -13974,9 +14041,10 @@ private:
               entry.heap_type);
           if (!slot_descriptor)
             continue;
+          const auto dst_local = entry.argument_local_start + local;
           bindless_diag_probes.push_back(BindlessMirrorDiagProbe{
               "live", want_stage, &argument,
-              entry.shader_register_lower_bound + local,
+              entry.shader_register_lower_bound + dst_local,
               entry.shader_register_lower_bound, 0, 0, 0, false,
               slot_descriptor});
         }
@@ -14838,6 +14906,128 @@ private:
     return false;
   }
 
+  static bool ShaderResourceViewIsMultisampledTexture(
+      const DescriptorRecord &descriptor) {
+    if (descriptor.type != DescriptorRecordType::ShaderResourceView ||
+        !descriptor.resource)
+      return false;
+
+    const auto *resource = GetResource(descriptor.resource.ptr());
+    if (!resource ||
+        resource->GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+      return false;
+
+    if (!descriptor.has_desc)
+      return resource->GetResourceDesc().SampleDesc.Count > 1;
+
+    const auto &srv = descriptor.desc.srv;
+    return srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS ||
+           srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+  }
+
+  static void SetPixelShaderMsaaSrvDemoteBit(uint64_t &mask_lo,
+                                             uint64_t &mask_hi,
+                                             UINT binding_slot) {
+    if (binding_slot < 64)
+      mask_lo |= uint64_t(1) << binding_slot;
+    else if (binding_slot < 128)
+      mask_hi |= uint64_t(1) << (binding_slot - 64);
+  }
+
+  std::pair<uint64_t, uint64_t>
+  PixelShaderSingleSampleMsaaSRVDemoteMask(const ReplayState &state,
+                                           const PipelineState &pipeline) {
+    const auto *shader = FindShaderForStage(pipeline, PipelineStage::Pixel);
+    if (!shader || !shader->resourceArgumentInfo() ||
+        !state.graphics_root_signature_impl)
+      return {0, 0};
+
+    uint64_t mask_lo = 0;
+    uint64_t mask_hi = 0;
+    const auto *arguments = shader->resourceArgumentInfo();
+    const auto argument_count = shader->reflection().NumArguments;
+    const auto parameters = state.graphics_root_signature_impl->GetParameters();
+
+    for (UINT arg_index = 0; arg_index < argument_count; arg_index++) {
+      const auto &argument = arguments[arg_index];
+      if (argument.Type != SM50BindingType::SRV ||
+          !(argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED) ||
+          argument.SM50BindingSlot >= 128)
+        continue;
+
+      const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+      const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
+                                                : argument.SM50BindingSlot;
+      const auto range_count = ShaderArgumentRangeCount(argument);
+      bool resolved = false;
+
+      for (UINT root_index = 0; !resolved && root_index < parameters.size();
+           root_index++) {
+        const auto &parameter = parameters[root_index];
+        if (parameter.parameter_type !=
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+          continue;
+
+        bool pixel_visible = false;
+        ForEachVisibleStage(parameter.visibility, false,
+                            [&](PipelineStage stage) {
+                              if (stage == PipelineStage::Pixel)
+                                pixel_visible = true;
+                            });
+        if (!pixel_visible)
+          continue;
+
+        UINT running_offset = 0;
+        for (const auto &range : parameter.ranges) {
+          const auto range_offset = DescriptorRangeOffset(range, running_offset);
+          const auto descriptor_count =
+              range.descriptor_count == UINT_MAX
+                  ? ReflectedDescriptorRangeCount(pipeline, range,
+                                                  parameter.visibility, false)
+                  : range.descriptor_count;
+          if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+            if (range.descriptor_count != UINT_MAX)
+              running_offset = range_offset + range.descriptor_count;
+            continue;
+          }
+          const auto overlap = IntersectDescriptorRangeWithShaderArgument(
+              lower, range_count, range.base_shader_register,
+              descriptor_count);
+          if (space != range.register_space || !overlap) {
+            if (range.descriptor_count != UINT_MAX)
+              running_offset = range_offset + range.descriptor_count;
+            continue;
+          }
+
+          const auto base = GetTableHandle(state, false, root_index);
+          if (!base.ptr) {
+            resolved = true;
+            break;
+          }
+
+          for (UINT local = 0;
+               local < overlap->count &&
+               overlap->descriptor_index + local < descriptor_count;
+               local++) {
+            const auto arg_local = overlap->argument_local_start + local;
+            const auto *descriptor = GetBoundDescriptorRecordInRange(
+                state, base, range_offset, overlap->descriptor_index + local,
+                descriptor_count, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            if (!descriptor)
+              continue;
+            if (!ShaderResourceViewIsMultisampledTexture(*descriptor))
+              SetPixelShaderMsaaSrvDemoteBit(
+                  mask_lo, mask_hi, argument.SM50BindingSlot + arg_local);
+          }
+          resolved = true;
+          break;
+        }
+      }
+    }
+
+    return {mask_lo, mask_hi};
+  }
+
   template <PipelineStage Stage, PipelineKind Kind>
   void EncodeShaderBindingsForStage(ArgumentEncodingContext &enc,
                                     const PipelineDxilShader &shader,
@@ -14855,9 +15045,18 @@ private:
       const auto offset =
           AllocateArgumentBuffer(argbuf_offset,
                                  reflection.ArgumentTableQwords << 3);
+      uint64_t demote_msaa_srv_mask_lo = 0;
+      uint64_t demote_msaa_srv_mask_hi = 0;
+      if constexpr (Stage == PipelineStage::Pixel) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        demote_msaa_srv_mask_lo =
+            render_encoder->pixel_shader_demote_msaa_srv_mask_lo;
+        demote_msaa_srv_mask_hi =
+            render_encoder->pixel_shader_demote_msaa_srv_mask_hi;
+      }
       enc.encodeShaderResources<Stage, Kind>(
           &reflection, shader.resourceArgumentInfo(), offset, shader_key,
-          nullptr);
+          nullptr, demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
     }
   }
 
@@ -14867,6 +15066,18 @@ private:
   static bool BindlessMirrorEnvEnabled() {
     static const bool on = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
     return on;
+  }
+
+  template <PipelineStage Stage>
+  static std::pair<uint64_t, uint64_t>
+  CurrentPixelShaderMsaaSrvDemoteMasks(ArgumentEncodingContext &enc) {
+    if constexpr (Stage == PipelineStage::Pixel) {
+      auto *render_encoder = enc.currentRenderEncoder();
+      return {render_encoder->pixel_shader_demote_msaa_srv_mask_lo,
+              render_encoder->pixel_shader_demote_msaa_srv_mask_hi};
+    } else {
+      return {0, 0};
+    }
   }
 
   // Bindless-mirror (③.3) live/compute per-stage wiring: for the bindless path, replace the
@@ -14886,10 +15097,13 @@ private:
                                             bool compute,
                                             BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto &reflection = shader.reflection();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        CurrentPixelShaderMsaaSrvDemoteMasks<Stage>(enc);
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
-        DiagCurrentReplayRecordSerial());
+        DiagCurrentReplayRecordSerial(), nullptr,
+        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
     BindlessMirrorWindow window = {};
     auto root_offsets =
         BuildBindlessRootOffsets(enc, state, pipeline, root, Stage, compute,
@@ -15249,10 +15463,13 @@ private:
     auto bindings =
         BuildSnapshotBindlessBufferTableBindings(snapshot, Stage);
     const auto bindings_view = bindings.view();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        CurrentPixelShaderMsaaSrvDemoteMasks<Stage>(enc);
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
-        DiagCurrentReplayRecordSerial(), &bindings_view);
+        DiagCurrentReplayRecordSerial(), &bindings_view,
+        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
     if (draw_diag)
       AddBindlessMirrorDiagBufTable(
           *draw_diag, Stage, shader.constantBufferInfo(),
@@ -15614,7 +15831,8 @@ private:
            local < entry.range_count &&
            entry.descriptor_index + local < entry.descriptor_count;
            local++) {
-        if (entry.compact_base + local >= dxmt::kBindlessMirrorCapacity)
+        const auto dst_local = entry.argument_local_start + local;
+        if (entry.compact_base + dst_local >= dxmt::kBindlessMirrorCapacity)
           break;
         const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
             heap, table->base_descriptor, entry.range_offset,
@@ -15634,11 +15852,11 @@ private:
           auto *src2 =
               slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
           if (src0 && src1 && src2) {
-            dst[entry.compact_base + local] = *src0;
-            dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + local] =
+            dst[entry.compact_base + dst_local] = *src0;
+            dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + dst_local] =
                 *src1;
             dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
-                entry.compact_base + local] = *src2;
+                entry.compact_base + dst_local] = *src2;
           }
         } else if (entry.texture && window->texture.mapped) {
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
@@ -15650,9 +15868,9 @@ private:
               const uint64_t pair_base =
                   uint64_t(pair) * dxmt::kMirrorTextureQwords *
                   dxmt::kBindlessMirrorCapacity;
-              dst[pair_base + entry.compact_base + local] = *src0;
+              dst[pair_base + entry.compact_base + dst_local] = *src0;
               dst[pair_base + dxmt::kBindlessMirrorCapacity +
-                  entry.compact_base + local] = *src1;
+                  entry.compact_base + dst_local] = *src1;
             }
           }
         }
@@ -15792,21 +16010,24 @@ private:
           const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
           const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
                                                     : argument.SM50BindingSlot;
-          if (space != range.register_space ||
-              lower < range.base_shader_register)
+          const auto argument_range_count = ShaderArgumentRangeCount(argument);
+          const auto overlap = IntersectDescriptorRangeWithShaderArgument(
+              lower, argument_range_count, range.base_shader_register,
+              descriptor_count);
+          if (space != range.register_space || !overlap)
             continue;
-          const auto first_descriptor = lower - range.base_shader_register;
-          if (first_descriptor >= descriptor_count)
-            continue;
-          const auto count = ShaderArgumentRangeCount(argument);
           for (UINT local = 0;
-               local < count && first_descriptor + local < descriptor_count;
+               local < overlap->count &&
+               overlap->descriptor_index + local < descriptor_count;
                local++) {
-            auto local_argument = ShaderArgumentAtRangeOffset(argument, local);
+            const auto arg_local = overlap->argument_local_start + local;
+            auto local_argument =
+                ShaderArgumentAtRangeOffset(argument, arg_local);
             fill_descriptor(*table, range, range_offset,
-                            first_descriptor + local, descriptor_count,
+                            overlap->descriptor_index + local,
+                            descriptor_count,
                             local_argument,
-                            argument.SM50BindingSlot + local);
+                            argument.SM50BindingSlot + arg_local);
           }
         }
 
@@ -15857,10 +16078,13 @@ private:
     auto bindings = BuildCompiledBindlessBufferTableBindings(
         tables, pipeline, root, Stage, compute);
     const auto bindings_view = bindings.view();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        CurrentPixelShaderMsaaSrvDemoteMasks<Stage>(enc);
     auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
-        DiagCurrentReplayRecordSerial(), &bindings_view);
+        DiagCurrentReplayRecordSerial(), &bindings_view,
+        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
     if (draw_diag)
       AddBindlessMirrorDiagBufTable(
           *draw_diag, Stage, shader.constantBufferInfo(),
@@ -17443,6 +17667,8 @@ private:
     uint64_t binding_generation = 0;
     uint64_t descriptor_content_generation = 0;
     uint64_t binding_content_fingerprint = 0;
+    uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
+    uint64_t pixel_shader_demote_msaa_srv_mask_hi = 0;
     std::optional<WMTPrimitiveType> primitive;
     std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
     std::optional<uint32_t> control_point_count;
@@ -17509,6 +17735,10 @@ private:
                              common.use_geometry);
     HashGraphicsBindingValue(common.binding_content_fingerprint,
                              common.use_tessellation);
+    HashGraphicsBindingValue(common.binding_content_fingerprint,
+                             common.pixel_shader_demote_msaa_srv_mask_lo);
+    HashGraphicsBindingValue(common.binding_content_fingerprint,
+                             common.pixel_shader_demote_msaa_srv_mask_hi);
   }
 
   void FinalizeReplayDrawBindingFingerprint(
@@ -17528,6 +17758,10 @@ private:
                                    uint64_t &argbuf_offset) {
     EncodeRenderPipelineStateIfChanged(enc, packet.metal_pso);
     auto *render_encoder = enc.currentRenderEncoder();
+    render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
+        packet.pixel_shader_demote_msaa_srv_mask_lo;
+    render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
+        packet.pixel_shader_demote_msaa_srv_mask_hi;
     auto &cache = render_encoder->dynamic_state_cache;
     const auto stencil_ref_u8 = static_cast<uint8_t>(packet.stencil_ref);
     if (packet.depth_stencil &&
@@ -17893,7 +18127,13 @@ private:
       return;
     }
 
-    auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalGraphicsState(); }();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        PixelShaderSingleSampleMsaaSRVDemoteMask(state, *pipeline);
+    auto *metal = [&] {
+      StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs);
+      return pipeline->GetMetalGraphicsState(demote_msaa_srv_mask_lo,
+                                             demote_msaa_srv_mask_hi);
+    }();
     if (!metal || !metal->pso) {
       if (ReplayPerfEnabled())
         perDrawSubTimers().graphicsPsoUnavailable++;
@@ -18010,6 +18250,10 @@ private:
     packet.common.binding_generation = state.graphics_binding_generation;
     packet.common.descriptor_content_generation =
         descriptor_content_generation;
+    packet.common.pixel_shader_demote_msaa_srv_mask_lo =
+        demote_msaa_srv_mask_lo;
+    packet.common.pixel_shader_demote_msaa_srv_mask_hi =
+        demote_msaa_srv_mask_hi;
     packet.common.primitive = primitive;
     packet.common.geometry_counts = geometry_counts;
     packet.common.control_point_count = control_point_count;
@@ -18089,7 +18333,13 @@ private:
       return;
     }
 
-    auto *metal = [&]{ StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs); return pipeline->GetMetalGraphicsState(); }();
+    const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+        PixelShaderSingleSampleMsaaSRVDemoteMask(state, *pipeline);
+    auto *metal = [&] {
+      StallScope _ss(StallDiagEnabled(), &stallProbe().psoSelectUs);
+      return pipeline->GetMetalGraphicsState(demote_msaa_srv_mask_lo,
+                                             demote_msaa_srv_mask_hi);
+    }();
     if (!metal || !metal->pso) {
       if (ReplayPerfEnabled())
         perDrawSubTimers().graphicsPsoUnavailable++;
@@ -18232,6 +18482,10 @@ private:
     packet.common.binding_generation = state.graphics_binding_generation;
     packet.common.descriptor_content_generation =
         descriptor_content_generation;
+    packet.common.pixel_shader_demote_msaa_srv_mask_lo =
+        demote_msaa_srv_mask_lo;
+    packet.common.pixel_shader_demote_msaa_srv_mask_hi =
+        demote_msaa_srv_mask_hi;
     packet.common.primitive = primitive;
     packet.common.geometry_counts = geometry_counts;
     packet.common.control_point_count = control_point_count;

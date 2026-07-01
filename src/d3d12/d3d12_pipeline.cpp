@@ -25,6 +25,7 @@
 #include <deque>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -1375,6 +1376,19 @@ BuildFunctionName(const char *prefix, std::string_view key) {
   return name;
 }
 
+std::string
+BuildGraphicsVariantShaderCacheKey(std::string_view shader_cache_key,
+                                   uint64_t demote_msaa_srv_mask_lo,
+                                   uint64_t demote_msaa_srv_mask_hi) {
+  if (!demote_msaa_srv_mask_lo && !demote_msaa_srv_mask_hi)
+    return std::string(shader_cache_key);
+
+  std::ostringstream key;
+  key << shader_cache_key << "_ps_msaa_demote_" << std::hex
+      << demote_msaa_srv_mask_lo << "_" << demote_msaa_srv_mask_hi;
+  return key.str();
+}
+
 SM50_SHADER_METAL_VERSION
 GetMetalVersion(IMTLD3D12Device *device) {
   return static_cast<SM50_SHADER_METAL_VERSION>(
@@ -2145,7 +2159,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                             const PipelineGraphicsState &state,
                             const RootSignature *root_signature,
                             std::string_view shader_cache_key,
-                            PipelineMetalGraphicsState &out) {
+                            PipelineMetalGraphicsState &out,
+                            uint64_t demote_msaa_srv_mask_lo = 0,
+                            uint64_t demote_msaa_srv_mask_hi = 0) {
   auto *vs = const_cast<PipelineDxilShader *>(
       FindShader(shaders, PipelineShaderStage::Vertex));
   auto *ps = const_cast<PipelineDxilShader *>(
@@ -2232,6 +2248,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         UsesDualSourceBlending(state.desc.BlendState);
     ps_args.disable_depth_output = state.desc.DSVFormat == DXGI_FORMAT_UNKNOWN;
     ps_args.unorm_output_reg_mask = unorm_output_reg_mask;
+    ps_args.demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
+    ps_args.demote_msaa_srv_mask_hi = demote_msaa_srv_mask_hi;
 
     const auto ps_name = BuildFunctionName("ps", shader_cache_key);
     if (!CompileMetalFunction(device, *ps, ps_name.c_str(),
@@ -2239,6 +2257,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                               out.pixel, shader_cache_key, pso_bindless))
       return false;
   }
+
+  out.pixel_shader_demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
+  out.pixel_shader_demote_msaa_srv_mask_hi = demote_msaa_srv_mask_hi;
 
   if (hs || ds || state.desc.PrimitiveTopologyType ==
                     D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
@@ -3404,10 +3425,35 @@ public:
   }
 
   const PipelineMetalGraphicsState *GetMetalGraphicsState() override {
+    return GetMetalGraphicsState(0, 0);
+  }
+
+  const PipelineMetalGraphicsState *
+  GetMetalGraphicsState(uint64_t demote_msaa_srv_mask_lo,
+                        uint64_t demote_msaa_srv_mask_hi) override {
     if (type_ != PipelineStateType::Graphics)
       return nullptr;
 
     std::lock_guard lock(metal_mutex_);
+    if (demote_msaa_srv_mask_lo || demote_msaa_srv_mask_hi) {
+      const auto key =
+          std::make_pair(demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
+      auto [it, inserted] =
+          metal_graphics_variants_.try_emplace(key, PipelineMetalGraphicsState{});
+      if (inserted) {
+        const auto variant_shader_cache_key =
+            BuildGraphicsVariantShaderCacheKey(
+                shader_cache_key_, demote_msaa_srv_mask_lo,
+                demote_msaa_srv_mask_hi);
+        if (!CreateMetalGraphicsPipeline(
+                device_.ptr(), shaders_, graphics_state_,
+                root_signature_.ptr(), variant_shader_cache_key, it->second,
+                demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi))
+          it->second = {};
+      }
+      return it->second.pso ? &it->second : nullptr;
+    }
+
     if (!metal_graphics_ready_) {
       metal_graphics_ready_ = true;
       if (!CreateMetalGraphicsPipeline(device_.ptr(), shaders_, graphics_state_,
@@ -3453,6 +3499,8 @@ private:
   bool metal_graphics_ready_ = false;
   bool metal_compute_ready_ = false;
   PipelineMetalGraphicsState metal_graphics_;
+  std::map<std::pair<uint64_t, uint64_t>, PipelineMetalGraphicsState>
+      metal_graphics_variants_;
   PipelineMetalComputeState metal_compute_;
   ComPrivateData private_data_;
   std::string name_;

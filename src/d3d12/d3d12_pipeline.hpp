@@ -148,6 +148,8 @@ struct PipelineMetalGraphicsState {
   wmtcmd_render_setrasterizerstate rasterizer = {};
   bool use_geometry = false;
   bool use_tessellation = false;
+  uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
+  uint64_t pixel_shader_demote_msaa_srv_mask_hi = 0;
   uint32_t tess_num_output_control_point_element = 0;
   uint32_t tess_threads_per_patch = 0;
 };
@@ -195,6 +197,9 @@ public:
   virtual const PipelineComputeState *GetComputeState() const = 0;
   virtual const std::string &GetShaderCacheKey() const = 0;
   virtual const PipelineMetalGraphicsState *GetMetalGraphicsState() = 0;
+  virtual const PipelineMetalGraphicsState *
+  GetMetalGraphicsState(uint64_t pixel_shader_demote_msaa_srv_mask_lo,
+                        uint64_t pixel_shader_demote_msaa_srv_mask_hi) = 0;
   virtual const PipelineMetalComputeState *GetMetalComputeState() = 0;
   // Runtime draw-path gate for the Stage-1 bindless descriptor-mirror path.
   // Mirrors PsoBindlessEligible(shaders) computed at PSO-create time.
