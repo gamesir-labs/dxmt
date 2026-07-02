@@ -7800,7 +7800,25 @@ private:
           auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
           if (!pipeline || !root)
             return false;
-          auto *metal = packet.pipeline.metadata.metal_graphics;
+          ReplayState compiled_binding_state = {};
+          compiled_binding_state.graphics_root_signature =
+              packet.pipeline.root_signature;
+          compiled_binding_state.graphics_root_signature_impl = root;
+          compiled_binding_state.cbv_srv_uav_heap =
+              packet.descriptor_heaps.cbv_srv_uav;
+          for (const auto &table : packet.root_tables) {
+            if (table.root_parameter_index <
+                compiled_binding_state.graphics_tables.size())
+              compiled_binding_state.graphics_tables[table.root_parameter_index] =
+                  table.base_descriptor;
+          }
+          const auto [compiled_demote_msaa_srv_mask_lo,
+                      compiled_demote_msaa_srv_mask_hi] =
+              PixelShaderSingleSampleMsaaSRVDemoteMask(compiled_binding_state,
+                                                       *pipeline);
+          auto *metal = pipeline->GetMetalGraphicsState(
+              compiled_demote_msaa_srv_mask_lo,
+              compiled_demote_msaa_srv_mask_hi);
           if (!metal || !metal->pso || metal->use_geometry ||
               metal->use_tessellation)
             return false;
@@ -7855,6 +7873,10 @@ private:
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
+            replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
+                compiled_demote_msaa_srv_mask_lo;
+            replay_packet.common.pixel_shader_demote_msaa_srv_mask_hi =
+                compiled_demote_msaa_srv_mask_hi;
             replay_packet.common.primitive = primitive;
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
@@ -7887,6 +7909,10 @@ private:
                   queue->EncodeRenderPipelineStateIfChanged(
                       enc, packet.common.metal_pso);
                   auto *render_encoder = enc.currentRenderEncoder();
+                  render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
+                      packet.common.pixel_shader_demote_msaa_srv_mask_lo;
+                  render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
+                      packet.common.pixel_shader_demote_msaa_srv_mask_hi;
                   auto &cache = render_encoder->dynamic_state_cache;
                   const auto stencil_ref_u8 =
                       static_cast<uint8_t>(packet.common.stencil_ref);
@@ -7963,6 +7989,10 @@ private:
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
+            replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
+                compiled_demote_msaa_srv_mask_lo;
+            replay_packet.common.pixel_shader_demote_msaa_srv_mask_hi =
+                compiled_demote_msaa_srv_mask_hi;
             replay_packet.common.primitive = primitive;
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
@@ -8021,6 +8051,10 @@ private:
                   queue->EncodeRenderPipelineStateIfChanged(
                       enc, packet.common.metal_pso);
                   auto *render_encoder = enc.currentRenderEncoder();
+                  render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
+                      packet.common.pixel_shader_demote_msaa_srv_mask_lo;
+                  render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
+                      packet.common.pixel_shader_demote_msaa_srv_mask_hi;
                   auto &cache = render_encoder->dynamic_state_cache;
                   const auto stencil_ref_u8 =
                       static_cast<uint8_t>(packet.common.stencil_ref);
