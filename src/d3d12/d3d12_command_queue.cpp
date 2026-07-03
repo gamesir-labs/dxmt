@@ -5555,8 +5555,6 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS address = 0;
   };
 
-  struct GraphicsBindlessReplayState;
-
   struct ReplayState {
     // Root parameter index is bounded by the D3D12 root-signature 64-DWORD
     // limit, so the hottest root bindings use a fixed array indexed by parameter
@@ -5630,9 +5628,6 @@ private:
     // hit proves "same bindings, frozen state" → the hazard result is identical.
     uint64_t access_epoch = 0;
     std::unordered_map<uint64_t, uint64_t> da_cache;
-    uint64_t bindless_replay_state_cache_hash = 0;
-    std::shared_ptr<const GraphicsBindlessReplayState>
-        bindless_replay_state_cache;
     Com<ID3D12Resource> predication_buffer;
     UINT64 predication_buffer_offset = 0;
     D3D12_PREDICATION_OP predication_operation =
@@ -5644,31 +5639,6 @@ private:
     std::vector<PendingTimestampMarker> pending_timestamp_markers;
     std::vector<PendingTimestampResolve> pending_timestamp_resolves;
     std::vector<ResolveQueryDataRecord> pending_immediate_cpu_query_resolves;
-    uint64_t bindless_replay_content_fingerprint = 0;
-  };
-
-  struct GraphicsBindlessReplayState {
-    static constexpr UINT kMaxRootParameters = ReplayState::kMaxRootParameters;
-    D3D12_COMMAND_LIST_TYPE queue_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    Com<ID3D12PipelineState> pipeline_state;
-    Com<ID3D12RootSignature> graphics_root_signature;
-    RootSignature *graphics_root_signature_impl = nullptr;
-    std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
-    std::array<ResolvedReplayVertexBuffer, 32> resolved_vertex_buffers = {};
-    Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
-    Com<ID3D12DescriptorHeap> sampler_heap;
-    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaxRootParameters> graphics_tables = {};
-    std::array<ReplayRootConstantsSlot, kMaxRootParameters>
-        graphics_root_constants = {};
-    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
-        graphics_cbv_roots = {};
-    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
-        graphics_srv_roots = {};
-    std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
-        graphics_uav_roots = {};
-    uint64_t current_record_d3d_sequence = 0;
-    uint64_t graphics_binding_generation = 1;
-    uint64_t bindless_replay_content_fingerprint = 0;
   };
 
   static ReplayState
@@ -5719,95 +5689,6 @@ private:
           std::chrono::duration_cast<std::chrono::microseconds>(
               clock::now() - rb_clone_t0).count();
     return copy;
-  }
-
-  template <typename GraphicsState>
-  static uint64_t HashGraphicsBindlessReplayCaptureState(
-      const GraphicsState &state) {
-    auto mix = [](uint64_t h, uint64_t v) {
-      h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-      return h;
-    };
-    uint64_t h = 1469598103934665603ull;
-    h = mix(h, reinterpret_cast<uintptr_t>(state.pipeline_state.ptr()));
-    h = mix(h, reinterpret_cast<uintptr_t>(state.graphics_root_signature.ptr()));
-    h = mix(h, reinterpret_cast<uintptr_t>(state.cbv_srv_uav_heap.ptr()));
-    h = mix(h, reinterpret_cast<uintptr_t>(state.sampler_heap.ptr()));
-    for (UINT i = 0; i < state.graphics_tables.size(); i++) {
-      if (state.graphics_tables[i].ptr)
-        h = mix(mix(h, i), state.graphics_tables[i].ptr);
-    }
-    auto hash_root_descriptors = [&](const auto &roots) {
-      for (UINT i = 0; i < roots.size(); i++) {
-        if (roots[i].valid)
-          h = mix(mix(h, i), roots[i].address);
-      }
-    };
-    hash_root_descriptors(state.graphics_cbv_roots);
-    hash_root_descriptors(state.graphics_srv_roots);
-    hash_root_descriptors(state.graphics_uav_roots);
-    for (UINT i = 0; i < state.graphics_root_constants.size(); i++) {
-      const auto &slot = state.graphics_root_constants[i];
-      if (!slot.valid)
-        continue;
-      h = mix(h, i);
-      for (auto value : slot.values)
-        h = mix(h, value);
-    }
-    for (UINT slot = 0; slot < state.vertex_buffers.size(); slot++) {
-      const auto &view = state.vertex_buffers[slot];
-      if (!view)
-        continue;
-      h = mix(h, slot);
-      h = mix(h, view->BufferLocation);
-      h = mix(h, view->SizeInBytes);
-      h = mix(h, view->StrideInBytes);
-    }
-    return h;
-  }
-
-  static std::shared_ptr<GraphicsBindlessReplayState>
-  CaptureGraphicsBindlessReplayState(const ReplayState &state,
-                                     uint64_t content_fingerprint) {
-    auto copy = std::make_shared<GraphicsBindlessReplayState>();
-    copy->queue_type = state.queue_type;
-    copy->pipeline_state = state.pipeline_state;
-    copy->graphics_root_signature = state.graphics_root_signature;
-    copy->graphics_root_signature_impl = state.graphics_root_signature_impl;
-    copy->vertex_buffers = state.vertex_buffers;
-    copy->resolved_vertex_buffers = state.resolved_vertex_buffers;
-    copy->cbv_srv_uav_heap = state.cbv_srv_uav_heap;
-    copy->sampler_heap = state.sampler_heap;
-    copy->graphics_tables = state.graphics_tables;
-    for (UINT i = 0; i < state.graphics_root_constants.size(); i++) {
-      if (state.graphics_root_constants[i].valid)
-        copy->graphics_root_constants[i] = state.graphics_root_constants[i];
-    }
-    copy->graphics_cbv_roots = state.graphics_cbv_roots;
-    copy->graphics_srv_roots = state.graphics_srv_roots;
-    copy->graphics_uav_roots = state.graphics_uav_roots;
-    copy->current_record_d3d_sequence = state.current_record_d3d_sequence;
-    copy->graphics_binding_generation = state.graphics_binding_generation;
-    copy->bindless_replay_content_fingerprint = content_fingerprint;
-    return copy;
-  }
-
-  struct GraphicsBindlessReplayStateCaptureResult {
-    std::shared_ptr<const GraphicsBindlessReplayState> state;
-    bool cache_hit = false;
-  };
-
-  static GraphicsBindlessReplayStateCaptureResult
-  GetOrCaptureGraphicsBindlessReplayState(ReplayState &state) {
-    const auto content_fingerprint =
-        HashGraphicsBindlessReplayCaptureState(state);
-    if (state.bindless_replay_state_cache &&
-        state.bindless_replay_state_cache_hash == content_fingerprint)
-      return {state.bindless_replay_state_cache, true};
-    auto copy = CaptureGraphicsBindlessReplayState(state, content_fingerprint);
-    state.bindless_replay_state_cache_hash = content_fingerprint;
-    state.bindless_replay_state_cache = copy;
-    return {copy, false};
   }
 
   ResolvedReplayVertexBuffer
@@ -7364,43 +7245,29 @@ private:
     return h;
   }
 
-  template <typename GraphicsState>
-  static uint64_t HashGraphicsBindlessReplayStateFull(const GraphicsState &s) {
-    uint64_t h = HashGraphicsBindingFull(s);
-    for (UINT slot = 0; slot < s.vertex_buffers.size(); slot++) {
-      const auto &view = s.vertex_buffers[slot];
-      if (!view)
-        continue;
-      HashGraphicsBindingValue(h, slot);
-      HashGraphicsBindingValue(h, view->BufferLocation);
-      HashGraphicsBindingValue(h, view->SizeInBytes);
-      HashGraphicsBindingValue(h, view->StrideInBytes);
-    }
-    return h;
-  }
-
-  std::shared_ptr<GraphicsBindlessReplayState>
-  BuildCompiledGraphicsReplayState(const CompiledGraphicsPacket &packet,
-                                   bool build_fingerprint = true) {
-    auto copy = std::make_shared<GraphicsBindlessReplayState>();
-    copy->pipeline_state = packet.pipeline.pipeline_state;
-    copy->graphics_root_signature = packet.pipeline.root_signature;
-    copy->graphics_root_signature_impl =
-        GetRootSignature(packet.pipeline.root_signature.ptr());
-    copy->cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
-    copy->sampler_heap = packet.descriptor_heaps.sampler;
+  std::shared_ptr<GraphicsBindingSnapshot>
+  BuildCompiledGraphicsBindingSnapshot(const CompiledGraphicsPacket &packet,
+                                       PipelineState &pipeline,
+                                       RootSignature *root) {
+    ReplayState replay_state = {};
+    replay_state.pipeline_state = packet.pipeline.pipeline_state;
+    replay_state.graphics_root_signature = packet.pipeline.root_signature;
+    replay_state.graphics_root_signature_impl = root;
+    replay_state.cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
+    replay_state.sampler_heap = packet.descriptor_heaps.sampler;
 
     for (const auto &table : packet.root_tables) {
-      if (table.root_parameter_index < copy->graphics_tables.size())
-        copy->graphics_tables[table.root_parameter_index] =
+      if (table.root_parameter_index < replay_state.graphics_tables.size())
+        replay_state.graphics_tables[table.root_parameter_index] =
             table.base_descriptor;
     }
 
     for (const auto &constants : packet.root_constants) {
       if (constants.root_parameter_index >=
-          copy->graphics_root_constants.size())
+          replay_state.graphics_root_constants.size())
         continue;
-      auto &slot = copy->graphics_root_constants[constants.root_parameter_index];
+      auto &slot =
+          replay_state.graphics_root_constants[constants.root_parameter_index];
       slot.valid = true;
       const auto required_size =
           constants.dst_offset + static_cast<UINT>(constants.values.size());
@@ -7411,43 +7278,32 @@ private:
     }
 
     for (const auto &descriptor : packet.root_descriptors) {
-      if (descriptor.root_parameter_index >= copy->graphics_cbv_roots.size())
+      if (descriptor.root_parameter_index >=
+          replay_state.graphics_cbv_roots.size())
         continue;
       auto *slot = descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV
-                       ? &copy->graphics_cbv_roots[descriptor.root_parameter_index]
-                       : descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
-                             ? &copy->graphics_srv_roots[descriptor.root_parameter_index]
-                             : &copy->graphics_uav_roots[descriptor.root_parameter_index];
+                       ? &replay_state.graphics_cbv_roots
+                              [descriptor.root_parameter_index]
+                       : descriptor.parameter_type ==
+                                 D3D12_ROOT_PARAMETER_TYPE_SRV
+                             ? &replay_state.graphics_srv_roots
+                                    [descriptor.root_parameter_index]
+                             : &replay_state.graphics_uav_roots
+                                    [descriptor.root_parameter_index];
       slot->valid = true;
       slot->address = descriptor.address;
     }
 
     for (const auto &vb : packet.input_assembler.vertex_buffers) {
-      if (vb.slot >= copy->vertex_buffers.size())
-        continue;
-      copy->vertex_buffers[vb.slot] = vb.view;
-
-      ResolvedReplayVertexBuffer resolved = {};
-      resolved.address = vb.view.BufferLocation;
-      Resource *resource = nullptr;
-      const auto resource_offset =
-          ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
-      if (resource && resource->GetBuffer()) {
-        resolved.valid = true;
-        resolved.binding_offset = resource->GetHeapOffset() + resource_offset;
-        resolved.d3d_resource = resource->GetD3D12Resource();
-        resolved.resource = resource;
-        resolved.buffer = resource->GetBuffer();
-      }
-      copy->resolved_vertex_buffers[vb.slot] = std::move(resolved);
+      if (vb.slot < replay_state.vertex_buffers.size())
+        replay_state.vertex_buffers[vb.slot] = vb.view;
     }
 
-    copy->current_record_d3d_sequence = packet.d3d_sequence;
-    copy->graphics_binding_generation = packet.record_index + 1;
-    if (build_fingerprint)
-      copy->bindless_replay_content_fingerprint =
-          HashGraphicsBindlessReplayStateFull(*copy);
-    return copy;
+    GraphicsBindingSnapshotCaptureStats capture_stats = {};
+    auto snapshot = std::make_shared<GraphicsBindingSnapshot>(
+        CaptureGraphicsBindingSnapshot(replay_state, pipeline, &capture_stats));
+    RecordGraphicsBindingSnapshotCapturePerf(capture_stats);
+    return snapshot;
   }
 
   static void RecordReplayBindingSignaturePerf(const ReplayState &state) {
@@ -7868,8 +7724,8 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
-            replay_packet.common.bindless_replay_state =
-                BuildCompiledGraphicsReplayState(packet, false);
+            replay_packet.common.binding_snapshot =
+                BuildCompiledGraphicsBindingSnapshot(packet, *pipeline, root);
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
@@ -7939,13 +7795,13 @@ private:
                     cache.rasterizer = packet.common.rasterizer;
                     cache.rasterizer_valid = true;
                   }
-                  if (packet.common.bindless_replay_state &&
+                  if (packet.common.binding_snapshot &&
                       packet.common.pipeline) {
                     BindlessMirrorDrawDiag diag = {};
-                    queue->EncodeGraphicsBindings(
-                        enc, *packet.common.bindless_replay_state,
-                        *packet.common.pipeline, false, false, argbuf_offset,
-                        &diag);
+                    queue->ApplyGraphicsBindingSnapshot(
+                        enc, *packet.common.binding_snapshot,
+                        *packet.common.pipeline, false, false,
+                        argbuf_offset, &diag);
                     diag.path = "compiled-direct";
                     packet.common.bindless_diag = diag;
                   }
@@ -7984,8 +7840,8 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
-            replay_packet.common.bindless_replay_state =
-                BuildCompiledGraphicsReplayState(packet, false);
+            replay_packet.common.binding_snapshot =
+                BuildCompiledGraphicsBindingSnapshot(packet, *pipeline, root);
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
@@ -8081,13 +7937,13 @@ private:
                     cache.rasterizer = packet.common.rasterizer;
                     cache.rasterizer_valid = true;
                   }
-                  if (packet.common.bindless_replay_state &&
+                  if (packet.common.binding_snapshot &&
                       packet.common.pipeline) {
                     BindlessMirrorDrawDiag diag = {};
-                    queue->EncodeGraphicsBindings(
-                        enc, *packet.common.bindless_replay_state,
-                        *packet.common.pipeline, false, false, argbuf_offset,
-                        &diag);
+                    queue->ApplyGraphicsBindingSnapshot(
+                        enc, *packet.common.binding_snapshot,
+                        *packet.common.pipeline, false, false,
+                        argbuf_offset, &diag);
                     diag.path = "compiled-direct";
                     packet.common.bindless_diag = diag;
                   }
@@ -14363,7 +14219,8 @@ private:
   void CaptureDescriptorTableBindings(GraphicsBindingSnapshot &snapshot,
                                       const ReplayState &state,
                                       const PipelineState &pipeline,
-                                      const DescriptorTableBindingRecipe &recipe) {
+                                      const DescriptorTableBindingRecipe &recipe,
+                                      bool compute) {
     std::array<D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_MAX_ROOT_COST> table_cache =
         {};
     std::array<bool, D3D12_MAX_ROOT_COST> table_cached = {};
@@ -14375,12 +14232,12 @@ private:
     auto get_table = [&](UINT root_index) {
       if (root_index < table_cache.size()) {
         if (!table_cached[root_index]) {
-          table_cache[root_index] = GetTableHandle(state, false, root_index);
+          table_cache[root_index] = GetTableHandle(state, compute, root_index);
           table_cached[root_index] = true;
         }
         return table_cache[root_index];
       }
-      return GetTableHandle(state, false, root_index);
+      return GetTableHandle(state, compute, root_index);
     };
 
     auto get_heap = [&](D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
@@ -14454,13 +14311,16 @@ private:
                                      const PipelineState &pipeline,
                                      UINT root_index,
                                      const RootSignatureParameter &parameter,
-                                     DescriptorRecordType type) {
+                                     DescriptorRecordType type,
+                                     bool compute = false) {
     const auto &map =
         type == DescriptorRecordType::ConstantBufferView
-            ? state.graphics_cbv_roots
+            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
             : type == DescriptorRecordType::ShaderResourceView
-                  ? state.graphics_srv_roots
-                  : state.graphics_uav_roots;
+                  ? (compute ? state.compute_srv_roots
+                             : state.graphics_srv_roots)
+                  : (compute ? state.compute_uav_roots
+                             : state.graphics_uav_roots);
     if (root_index >= ReplayState::kMaxRootParameters)
       return;
     const auto &slot = map[root_index];
@@ -14516,7 +14376,7 @@ private:
             : type == DescriptorRecordType::ShaderResourceView
                   ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
                   : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ForEachVisibleStage(parameter.visibility, false, [&](PipelineStage stage) {
+    ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
       const auto *argument = ResolveShaderBindingArgument(
           pipeline, stage, BindingTypeForRange(range_type),
           parameter.descriptor.ShaderRegister,
@@ -14564,10 +14424,12 @@ private:
                                     const ReplayState &state,
                                     const PipelineState &pipeline,
                                     UINT root_index,
-                                    const RootSignatureParameter &parameter) {
+                                    const RootSignatureParameter &parameter,
+                                    bool compute = false) {
     if (root_index >= ReplayState::kMaxRootParameters)
       return;
-    const auto &slot = state.graphics_root_constants[root_index];
+    const auto &slot = compute ? state.compute_root_constants[root_index]
+                               : state.graphics_root_constants[root_index];
     if (!slot.valid || slot.values.empty())
       return;
 
@@ -14577,7 +14439,7 @@ private:
     if (!actual_count)
       return;
 
-    ForEachVisibleStage(parameter.visibility, false, [&](PipelineStage stage) {
+    ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
       auto binding_slot = ResolveShaderBindingSlot(
           pipeline, stage, SM50BindingType::ConstantBuffer,
           parameter.constants.ShaderRegister,
@@ -14685,7 +14547,7 @@ private:
 
     CaptureDescriptorTableBindings(
         snapshot, state, pipeline,
-        GetDescriptorTableBindingRecipe(pipeline, *root, false));
+        GetDescriptorTableBindingRecipe(pipeline, *root, false), false);
 
     const auto parameters = root->GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
@@ -17697,7 +17559,6 @@ private:
     wmtcmd_render_setrasterizerstate rasterizer = {};
     PipelineState *pipeline = nullptr;
     std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
-    std::shared_ptr<const GraphicsBindlessReplayState> bindless_replay_state;
     uint64_t binding_generation = 0;
     uint64_t descriptor_content_generation = 0;
     uint64_t binding_content_fingerprint = 0;
@@ -17754,15 +17615,6 @@ private:
 	    common.binding_content_fingerprint =
 	        common.binding_snapshot ? common.binding_snapshot->content_fingerprint
 	                                : 0;
-    if (common.bindless_replay_state) {
-      common.binding_content_fingerprint =
-          common.bindless_replay_state->bindless_replay_content_fingerprint
-              ? common.bindless_replay_state->bindless_replay_content_fingerprint
-              : HashGraphicsBindlessReplayStateFull(
-                    *common.bindless_replay_state);
-      HashGraphicsBindingValue(common.binding_content_fingerprint,
-                               common.descriptor_content_generation);
-    }
     HashGraphicsBindingValue(common.binding_content_fingerprint,
                              common.metal_pso.handle);
     HashGraphicsBindingValue(common.binding_content_fingerprint,
@@ -17829,14 +17681,10 @@ private:
     const bool fingerprint_hit =
         binding_cache.valid && !generation_hit &&
         binding_cache.content_fingerprint == packet.binding_content_fingerprint;
-	    const bool bindless_snapshot =
-	        packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
-	        packet.binding_snapshot && packet.binding_snapshot->bindless &&
-	        !packet.use_geometry &&
-	        !packet.use_tessellation;
-    const bool bindless_live_payload =
+    const bool bindless_snapshot =
         packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
-        packet.bindless_replay_state && !packet.use_geometry &&
+        packet.binding_snapshot && packet.binding_snapshot->bindless &&
+        !packet.use_geometry &&
         !packet.use_tessellation;
     if (D3D12DiagBindingRecipeCacheEnabled()) {
       auto &stats = BindingRecipeDiagStats();
@@ -17851,24 +17699,18 @@ private:
     bindless_diag.uses_bindless_mirror =
         packet.pipeline && packet.pipeline->UsesBindlessMirror();
 	    bindless_diag.bindless_bound =
-	        (packet.binding_snapshot && packet.binding_snapshot->bindless &&
-	         !packet.use_geometry && !packet.use_tessellation) ||
-        bindless_live_payload;
+	        packet.binding_snapshot && packet.binding_snapshot->bindless &&
+	        !packet.use_geometry && !packet.use_tessellation;
     bindless_diag.path =
         BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
-                                   !bindless_live_payload);
+                                   true);
     bool restored_legacy_argbuf = false;
     if (!bindless_diag.bindless_bound && BindlessMirrorEnvEnabled())
       restored_legacy_argbuf = enc.restorePerPassArgbufIfMirrorBound<false>();
     const bool skip_binding_snapshot =
         !bindless_snapshot && !restored_legacy_argbuf &&
         (generation_hit || fingerprint_hit);
-    if (!skip_binding_snapshot && packet.pipeline && bindless_live_payload) {
-      EncodeGraphicsBindings(enc, *packet.bindless_replay_state,
-                             *packet.pipeline, packet.use_geometry,
-                             packet.use_tessellation, argbuf_offset,
-                             &bindless_diag);
-    } else if (!skip_binding_snapshot && packet.pipeline &&
+    if (!skip_binding_snapshot && packet.pipeline &&
                packet.binding_snapshot) {
 	      ApplyGraphicsBindingSnapshot(enc, *packet.binding_snapshot,
 	                                   *packet.pipeline, packet.use_geometry,
@@ -18226,31 +18068,16 @@ private:
     RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
     const auto descriptor_content_generation =
         GetDescriptorContentGeneration();
-	    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
-    std::shared_ptr<const GraphicsBindlessReplayState> bindless_replay_state;
+    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
         !metal->use_tessellation;
-	    {
-	      StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
-      if (bindless_replay_path) {
-        if (D3D12ReplayGraphicsBatchingEnabled() &&
-            (HasPendingComputePass(state) || HasPendingBlitBatch(state)))
-          FlushPassBatches(chunk, state);
-        auto capture = GetOrCaptureGraphicsBindlessReplayState(state);
-        bindless_replay_state = std::move(capture.state);
-        if (ReplayPerfEnabled()) {
-          if (capture.cache_hit)
-            perDrawSubTimers().bindlessReplayStateCacheHit++;
-          else
-            perDrawSubTimers().bindlessReplayStateCacheMiss++;
-        }
-      } else {
-        binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
-            chunk, state, *pipeline, attachments,
-            descriptor_content_generation);
-      }
-	    }
+    {
+      StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
+      binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
+          chunk, state, *pipeline, attachments,
+          descriptor_content_generation);
+    }
     if (rb_draw)
       perDrawSubTimers().desc +=
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -18279,8 +18106,7 @@ private:
     packet.common.depth_stencil = metal->depth_stencil;
     packet.common.rasterizer = metal->rasterizer;
     packet.common.pipeline = pipeline;
-	    packet.common.binding_snapshot = std::move(binding_snapshot);
-    packet.common.bindless_replay_state = std::move(bindless_replay_state);
+    packet.common.binding_snapshot = std::move(binding_snapshot);
     packet.common.binding_generation = state.graphics_binding_generation;
     packet.common.descriptor_content_generation =
         descriptor_content_generation;
@@ -18457,31 +18283,16 @@ private:
     RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
     const auto descriptor_content_generation =
         GetDescriptorContentGeneration();
-	    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
-    std::shared_ptr<const GraphicsBindlessReplayState> bindless_replay_state;
+    std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
         !metal->use_tessellation;
-	    {
-	      StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
-      if (bindless_replay_path) {
-        if (D3D12ReplayGraphicsBatchingEnabled() &&
-            (HasPendingComputePass(state) || HasPendingBlitBatch(state)))
-          FlushPassBatches(chunk, state);
-        auto capture = GetOrCaptureGraphicsBindlessReplayState(state);
-        bindless_replay_state = std::move(capture.state);
-        if (ReplayPerfEnabled()) {
-          if (capture.cache_hit)
-            perDrawSubTimers().bindlessReplayStateCacheHit++;
-          else
-            perDrawSubTimers().bindlessReplayStateCacheMiss++;
-        }
-      } else {
-        binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
-            chunk, state, *pipeline, attachments,
-            descriptor_content_generation);
-      }
-	    }
+    {
+      StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
+      binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
+          chunk, state, *pipeline, attachments,
+          descriptor_content_generation);
+    }
     if (rb_draw)
       perDrawSubTimers().desc +=
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -18512,7 +18323,6 @@ private:
     packet.common.rasterizer = metal->rasterizer;
     packet.common.pipeline = pipeline;
     packet.common.binding_snapshot = std::move(binding_snapshot);
-    packet.common.bindless_replay_state = std::move(bindless_replay_state);
     packet.common.binding_generation = state.graphics_binding_generation;
     packet.common.descriptor_content_generation =
         descriptor_content_generation;

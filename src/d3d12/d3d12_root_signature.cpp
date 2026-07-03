@@ -162,6 +162,18 @@ NormalizeDescriptorCount(UINT count) {
   return count == UINT_MAX ? UINT_MAX : count;
 }
 
+constexpr D3D12_DESCRIPTOR_RANGE_FLAGS
+RootSignature10DescriptorRangeFlags() {
+  return D3D12_DESCRIPTOR_RANGE_FLAGS(
+      D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+      D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+}
+
+constexpr D3D12_ROOT_DESCRIPTOR_FLAGS
+RootSignature10RootDescriptorFlags() {
+  return D3D12_ROOT_DESCRIPTOR_FLAGS(D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE);
+}
+
 void
 BuildBindingParameters(RootSignatureStorage &storage) {
   storage.parameters.clear();
@@ -216,7 +228,7 @@ BuildBindingParameters(RootSignatureStorage &storage) {
               .descriptor_count = NormalizeDescriptorCount(range.NumDescriptors),
               .offset_in_descriptors_from_table_start =
                   range.OffsetInDescriptorsFromTableStart,
-              .flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+              .flags = RootSignature10DescriptorRangeFlags(),
           });
         }
         break;
@@ -228,7 +240,7 @@ BuildBindingParameters(RootSignatureStorage &storage) {
       case D3D12_ROOT_PARAMETER_TYPE_UAV:
         dst.descriptor.ShaderRegister = src.Descriptor.ShaderRegister;
         dst.descriptor.RegisterSpace = src.Descriptor.RegisterSpace;
-        dst.descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+        dst.descriptor.Flags = RootSignature10RootDescriptorFlags();
         break;
       }
     }
@@ -384,7 +396,7 @@ CloneFromDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
             .NumDescriptors = range.NumDescriptors,
             .BaseShaderRegister = range.BaseShaderRegister,
             .RegisterSpace = range.RegisterSpace,
-            .Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+            .Flags = RootSignature10DescriptorRangeFlags(),
             .OffsetInDescriptorsFromTableStart =
                 range.OffsetInDescriptorsFromTableStart,
         });
@@ -400,7 +412,7 @@ CloneFromDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
       dst0.Descriptor = src.Descriptor;
       dst1.Descriptor.ShaderRegister = src.Descriptor.ShaderRegister;
       dst1.Descriptor.RegisterSpace = src.Descriptor.RegisterSpace;
-      dst1.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+      dst1.Descriptor.Flags = RootSignature10RootDescriptorFlags();
       break;
     default:
       break;
@@ -598,7 +610,7 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
         const auto range_flags =
             version_value == 2
                 ? D3D12_DESCRIPTOR_RANGE_FLAGS(ReadU32(rts0, range_offset + 16))
-                : D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+                : RootSignature10DescriptorRangeFlags();
         const auto range_desc_offset =
             ReadU32(rts0, range_offset + (version_value == 2 ? 20 : 16));
 
@@ -640,7 +652,7 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
       const auto descriptor_flags =
           version_value == 2
               ? D3D12_ROOT_DESCRIPTOR_FLAGS(ReadU32(rts0, data_offset + 8))
-              : D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+              : RootSignature10RootDescriptorFlags();
       param0.Descriptor.ShaderRegister = shader_register;
       param0.Descriptor.RegisterSpace = register_space;
       param1.Descriptor.ShaderRegister = shader_register;
