@@ -251,13 +251,16 @@ jobs:
           {
             echo "short_sha=${short_sha}"
             echo "package_name=${package_name}"
+            echo "package_root_name=${COMPONENT_NAME}"
             echo "package_file=dist/${package_name}.tzst"
           } >> "$GITHUB_OUTPUT"
 
       - name: Assemble Component Package
         run: |
+          short_sha="${{ steps.version.outputs.short_sha }}"
           package_name="${{ steps.version.outputs.package_name }}"
-          package_root="./combined/${package_name}"
+          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          package_root="./combined/${package_root_name}"
           rm -rf ./combined ./dist
           mkdir -p "${package_root}/wine" ./dist
 
@@ -265,15 +268,15 @@ jobs:
           scripts/ci-self-hosted.sh copy-artifact component-x86-runtime "${package_root}/wine"
           find "${package_root}" -name '*.a' -delete
 
-          python3 - "${package_root}/manifest.json" "${package_name}" <<'PY'
+          python3 - "${package_root}/manifest.json" "${package_root_name}" "${package_name}" "${short_sha}" <<'PY'
           import json
           import sys
 
-          manifest_path, package_name = sys.argv[1:]
+          manifest_path, component_id, package_name, version = sys.argv[1:]
           manifest = {
-              "id": package_name,
+              "id": component_id,
               "name": package_name,
-              "version": package_name,
+              "version": version,
               "link_unix_libs": [
                   "${COMPONENT_PATH}/wine/x86_64-unix",
               ],
@@ -292,7 +295,11 @@ jobs:
 
       - name: Verify Component Package Layout
         run: |
-          package_root="./combined/${{ steps.version.outputs.package_name }}"
+          short_sha="${{ steps.version.outputs.short_sha }}"
+          package_name="${{ steps.version.outputs.package_name }}"
+          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          package_root="./combined/${package_root_name}"
+          test ! -e "./combined/${package_name}"
           test -f "${package_root}/manifest.json"
           test -d "${package_root}/wine/i386-windows"
           test -d "${package_root}/wine/x86_64-windows"
@@ -304,15 +311,31 @@ jobs:
             ! -name manifest.json \
             ! -name wine \
             -exec sh -c 'echo "unexpected package entry: $1" >&2; exit 1' sh {} \;
+          python3 - "${package_root}/manifest.json" "${package_root_name}" "${package_name}" "${short_sha}" <<'PY'
+          import json
+          import sys
+
+          manifest_path, component_id, package_name, version = sys.argv[1:]
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+          expected = {
+              "id": component_id,
+              "name": package_name,
+              "version": version,
+          }
+          actual = {key: manifest.get(key) for key in expected}
+          if actual != expected:
+              raise SystemExit(f"unexpected manifest identity: {actual} != {expected}")
+          PY
 
       - name: Create Component Archive
         run: |
           if ! command -v zstd >/dev/null 2>&1; then
             brew install --formula zstd
           fi
-          package_name="${{ steps.version.outputs.package_name }}"
+          package_root_name="${{ steps.version.outputs.package_root_name }}"
           package_file="${{ steps.version.outputs.package_file }}"
-          tar -cf - -C ./combined "${package_name}" | zstd -T0 -19 -o "${package_file}"
+          tar -cf - -C ./combined "${package_root_name}" | zstd -T0 -19 -o "${package_file}"
           case "${package_file}" in
             *.tzst) ;;
             *) echo "::error::component archive must end with .tzst"; exit 1 ;;
