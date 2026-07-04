@@ -954,10 +954,10 @@ public:
       return hr;
     }
 
-    double present_rate = preferred_max_frame_rate ? preferred_max_frame_rate : init_refresh_rate_;
-    double vsync_duration =
-        std::max(SyncInterval * 1.0 / present_rate,
-                 preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
+    const bool display_sync_enabled =
+        SyncInterval > 0 && !(PresentFlags & DXGI_PRESENT_ALLOW_TEARING);
+    const double present_after =
+        preferred_max_frame_rate > 0 ? 1.0 / preferred_max_frame_rate : 0.0;
 
     auto &cmd_queue = device_->GetDXMTDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
@@ -967,11 +967,12 @@ public:
       presenter->changeGammaRamp(output->GetGammaRamp());
     }
     auto enqueue_t0 = clock::now();
+    presenter->setDisplaySyncEnabled(display_sync_enabled);
     auto state = presenter->synchronizeLayerProperties();
     state.metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
     if constexpr (EnableMetalFX) {
       chunk->emitcc([
-        this, vsync_duration, backbuffer = backbuffer_->texture(),
+        this, present_after, backbuffer = backbuffer_->texture(),
         sync_state = SyncFrame(++presentation_count_),
         upscaled = upscaled_backbuffer_->texture(),
         scaler = this->metalfx_scaler, state = std::move(state)
@@ -983,17 +984,17 @@ public:
         scaler_info.output_width = upscaled->width();
         scaler_info.output_height = upscaled->height();
         ctx.upscale(backbuffer, upscaled, scaler);
-        ctx.present(upscaled, presenter, vsync_duration, state.metadata);
+        ctx.present(upscaled, presenter, present_after, state.metadata);
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
     } else {
       chunk->emitcc([
-        this, vsync_duration, state = std::move(state),
+        this, present_after, state = std::move(state),
         sync_state = SyncFrame(++presentation_count_),
         backbuffer = backbuffer_->texture()
       ](ArgumentEncodingContext &ctx) mutable {
-        ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+        ctx.present(backbuffer, presenter, present_after, state.metadata);
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
@@ -1024,7 +1025,8 @@ public:
         WARN_FILE_ONLY("DXGI: PresentBoundary process=", DiagProcessName(),
            " frame=", presentation_count_, " syncInterval=", SyncInterval,
            " flags=", PresentFlags, " elapsedMs=", DiagMillis(diag_elapsed),
-           " vsyncDurationMs=", vsync_duration * 1000.0, " presentRate=", present_rate,
+           " displaySyncEnabled=", display_sync_enabled,
+           " presentAfterMs=", present_after * 1000.0,
            " preferredMaxFrameRate=", preferred_max_frame_rate,
            " swapchain=", desc_.Width, "x", desc_.Height, " windowed=", fullscreen_desc_.Windowed);
         WARN_FILE_ONLY("DXGI: Present1 timing process=", DiagProcessName(),

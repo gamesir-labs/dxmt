@@ -11,4 +11,8 @@ Set environment variable `DXMT_METALFX_SPATIAL_SWAPCHAIN=1` to enable MetalFX sp
 
 ### Metal Frame Pacing
 
-`d3d11.preferredMaxFrameRate` or `d3d12.preferredMaxFrameRate` can be set to enforce the application's frame pacing being controled by Metal. The value must be a factor of your display's refresh rate. (e.g. 15/30/40/60/120 is valid for a 120hz display).
+DXGI VSync is controlled by the swapchain present parameters and maps to
+`CAMetalLayer.displaySyncEnabled` by default. `d3d11.preferredMaxFrameRate` or
+`d3d12.preferredMaxFrameRate` can be set to request an explicit Metal frame-rate
+cap with `presentDrawableAfterMinimumDuration`. The value should be a factor of
+your display's refresh rate. (e.g. 15/30/40/60/120 is valid for a 120hz display).

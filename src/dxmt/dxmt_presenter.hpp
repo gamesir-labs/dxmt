@@ -34,6 +34,8 @@ public:
 
   void changeGammaRamp(const DXMTGammaRamp *gamma_ramp);
 
+  void setDisplaySyncEnabled(bool enabled);
+
   class PresentState {
   public:
     DXMTPresentMetadata metadata;

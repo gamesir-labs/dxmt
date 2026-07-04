@@ -17,7 +17,6 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   layer_.getProps(layer_props_);
   layer_props_.device = device;
   layer_props_.opaque = true;
-  layer_props_.display_sync_enabled = false;
   layer_props_.framebuffer_only = false; // how strangely setting it true results in worse performance
   layer_props_.contents_scale = layer_props_.contents_scale * scale_factor;
 
@@ -100,6 +99,15 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
           0);
     pso_valid.clear();
   }
+}
+
+void
+Presenter::setDisplaySyncEnabled(bool enabled) {
+  if (layer_props_.display_sync_enabled == enabled)
+    return;
+
+  layer_props_.display_sync_enabled = enabled;
+  layer_.setProps(layer_props_);
 }
 
 Presenter::PresentState

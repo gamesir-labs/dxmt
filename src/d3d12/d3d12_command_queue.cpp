@@ -4829,16 +4829,12 @@ private:
       const auto apitrace_frame_index =
           dxmt::apitrace::on_d3d12_present(
               this, sync_interval, flags, static_cast<int32_t>(S_OK), true);
-      double present_rate = preferred_max_frame_rate_ ? preferred_max_frame_rate_
-                                                      : init_refresh_rate_;
-      double vsync_duration =
-          std::max(sync_interval * 1.0 / present_rate,
-                   preferred_max_frame_rate_
-                       ? 1.0 / preferred_max_frame_rate_
-                       : 0.0);
-      // PERF DIAG (DXMT_DIAG_PRESENT_PACING): mirror the D3D11 swapchain
-      // pacing path so D3D12 stays compatible with Wine and app-level frame
-      // latency behavior.
+      const bool display_sync_enabled =
+          sync_interval > 0 && !(flags & DXGI_PRESENT_ALLOW_TEARING);
+      const double present_after =
+          preferred_max_frame_rate_ > 0 ? 1.0 / preferred_max_frame_rate_ : 0.0;
+      // PERF DIAG (DXMT_DIAG_PRESENT_PACING): report the split between
+      // CAMetalLayer display sync and explicit Metal frame-rate caps.
       {
         static const bool present_pacing =
             D3D12DiagEnabledEnv("DXMT_DIAG_PRESENT_PACING");
@@ -4857,9 +4853,9 @@ private:
             WARN_FILE_ONLY("DXMT present pacing:"
                  " syncInterval=", sync_interval,
                  " flags=", flags,
-                 " vsyncDurationMs=", vsync_duration * 1000.0,
-                 " fpsCap=", vsync_duration > 0 ? 1.0 / vsync_duration : 0.0,
-                 " presentRate=", present_rate,
+                 " displaySyncEnabled=", display_sync_enabled,
+                 " presentAfterMs=", present_after * 1000.0,
+                 " fpsCap=", present_after > 0 ? 1.0 / present_after : 0.0,
                  " preferredMaxFrameRate=", preferred_max_frame_rate_,
                  " actualPresentIntervalMs=", sinceMs);
         }
@@ -4867,6 +4863,7 @@ private:
       auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
       const auto present_frame_id = dxmt_queue.CurrentFrameSeq() - 1;
       const auto present_frame_seq = present_frame_id + 1;
+      presenter_->setDisplaySyncEnabled(display_sync_enabled);
       auto state = presenter_->synchronizeLayerProperties();
       state.metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
       state.metadata.background_color[0] = background_color_.r;
@@ -4889,7 +4886,7 @@ private:
         present_view = resource->GetPresentSourceView(),
         presenter = presenter_,
         present_signal,
-        vsync_duration,
+        present_after,
         apitrace_frame_index,
         sync_interval,
         flags,
@@ -4902,13 +4899,13 @@ private:
           present_view = std::move(present_view),
           presenter = std::move(presenter),
           present_signal,
-          vsync_duration,
+          present_after,
           apitrace_frame_index,
           sync_interval,
           flags,
           state = std::move(state)
         ](ArgumentEncodingContext &ctx) mutable {
-          ctx.present(backbuffer, present_view, presenter, vsync_duration,
+          ctx.present(backbuffer, present_view, presenter, present_after,
                       state.metadata, apitrace_frame_index, sync_interval,
                       flags);
           if (present_signal) {
