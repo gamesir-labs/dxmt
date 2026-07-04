@@ -241,6 +241,7 @@ BuildBindingParameters(RootSignatureStorage &storage) {
         dst.descriptor.ShaderRegister = src.Descriptor.ShaderRegister;
         dst.descriptor.RegisterSpace = src.Descriptor.RegisterSpace;
         dst.descriptor.Flags = RootSignature10RootDescriptorFlags();
+        dst.descriptor_flags = dst.descriptor.Flags;
         break;
       }
     }
