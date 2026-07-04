@@ -93,7 +93,7 @@ jobs:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
-          dxmt_version="dxmt-nightly-${short_sha}"
+          dxmt_version="${short_sha}"
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
           scripts/ci-self-hosted.sh prepare-ccache nightly-x86_64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++
@@ -128,7 +128,7 @@ jobs:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
-          dxmt_version="dxmt-nightly-${short_sha}"
+          dxmt_version="${short_sha}"
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
           scripts/ci-self-hosted.sh prepare-ccache nightly-x86 i686-w64-mingw32-gcc i686-w64-mingw32-g++
@@ -148,6 +148,8 @@ jobs:
   package:
     runs-on: self-macos-runner
     needs: [build-x86_64-windows, build-x86-windows]
+    env:
+      COMPONENT_NAME: dxmt-nightly
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -156,57 +158,127 @@ jobs:
         id: version
         run: |
           short_sha="$(git rev-parse --short=7 HEAD)"
-          package_name="dxmt-nightly-${short_sha}"
+          package_name="${COMPONENT_NAME}-${short_sha}"
+          artifact_name="${COMPONENT_NAME}-component-${short_sha}"
           {
             echo "short_sha=${short_sha}"
             echo "package_name=${package_name}"
-            echo "artifact_path=dist/${package_name}"
+            echo "artifact_name=${artifact_name}"
+            echo "package_root_name=${COMPONENT_NAME}"
+            echo "package_file=dist/${package_name}.tzst"
           } >> "$GITHUB_OUTPUT"
 
       - name: Assemble Nightly Package
         run: |
-          package_dir="./combined/${{ steps.version.outputs.package_name }}"
-          scripts/ci-self-hosted.sh copy-artifact nightly-x86_64-runtime "${package_dir}"
-          scripts/ci-self-hosted.sh copy-artifact nightly-x86-runtime "${package_dir}"
-          cp LICENSE COPYING.LIB "${package_dir}/"
-          find "${package_dir}" -name '*.a' -delete
-          test ! -d "${package_dir}/system32"
+          short_sha="${{ steps.version.outputs.short_sha }}"
+          package_name="${{ steps.version.outputs.package_name }}"
+          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          package_root="./combined/${package_root_name}"
+          rm -rf ./combined ./dist
+          mkdir -p "${package_root}/wine" ./dist
 
-      - name: Verify Builtin Package Layout
+          scripts/ci-self-hosted.sh copy-artifact nightly-x86_64-runtime "${package_root}/wine"
+          scripts/ci-self-hosted.sh copy-artifact nightly-x86-runtime "${package_root}/wine"
+          find "${package_root}" -name '*.a' -delete
+
+          python3 - "${package_root}/manifest.json" "${package_root_name}" "${package_name}" "${short_sha}" <<'PY'
+          import json
+          import sys
+
+          manifest_path, component_id, package_name, version = sys.argv[1:]
+          manifest = {
+              "id": component_id,
+              "name": package_name,
+              "version": version,
+              "link_unix_libs": [
+                  "${COMPONENT_PATH}/wine/x86_64-unix",
+              ],
+              "link_windows_dlls": [
+                  "${COMPONENT_PATH}/wine/i386-windows",
+                  "${COMPONENT_PATH}/wine/x86_64-windows",
+              ],
+              "environment_template": {
+                  "WINEDLLPATH": "${COMPONENT_PATH}/wine",
+              },
+          }
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Verify Component Package Layout
         run: |
-          package_dir="./combined/${{ steps.version.outputs.package_name }}"
-          test -d "${package_dir}/i386-windows"
-          test -d "${package_dir}/x86_64-windows"
-          test -d "${package_dir}/x86_64-unix"
-          test -f "${package_dir}/LICENSE"
-          test -f "${package_dir}/COPYING.LIB"
-          find "${package_dir}" -maxdepth 1 -mindepth 1 \
-            ! -name i386-windows \
-            ! -name x86_64-windows \
-            ! -name x86_64-unix \
-            ! -name LICENSE \
-            ! -name COPYING.LIB \
+          short_sha="${{ steps.version.outputs.short_sha }}"
+          package_name="${{ steps.version.outputs.package_name }}"
+          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          package_root="./combined/${package_root_name}"
+          test ! -e "./combined/${package_name}"
+          test -f "${package_root}/manifest.json"
+          test -d "${package_root}/wine/i386-windows"
+          test -d "${package_root}/wine/x86_64-windows"
+          test -d "${package_root}/wine/x86_64-unix"
+          test -f "${package_root}/wine/i386-windows/dxgi.dll"
+          test -f "${package_root}/wine/x86_64-windows/dxgi.dll"
+          test -f "${package_root}/wine/x86_64-unix/winemetal.so"
+          find "${package_root}" -maxdepth 1 -mindepth 1 \
+            ! -name manifest.json \
+            ! -name wine \
             -exec sh -c 'echo "unexpected package entry: $1" >&2; exit 1' sh {} \;
+          python3 - "${package_root}/manifest.json" "${package_root_name}" "${package_name}" "${short_sha}" <<'PY'
+          import json
+          import sys
 
-      - name: Create Nightly Tarball
+          manifest_path, component_id, package_name, version = sys.argv[1:]
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+          expected = {
+              "id": component_id,
+              "name": package_name,
+              "version": version,
+          }
+          actual = {key: manifest.get(key) for key in expected}
+          if actual != expected:
+              raise SystemExit(f"unexpected manifest identity: {actual} != {expected}")
+          PY
+
+      - name: Create Component Archive
         run: |
-          tar -czf "${{ steps.version.outputs.package_name }}.tar.gz" -C ./combined "${{ steps.version.outputs.package_name }}"
-          shasum -a 256 "${{ steps.version.outputs.package_name }}.tar.gz" > "${{ steps.version.outputs.package_name }}.tar.gz.sha256"
+          if ! command -v zstd >/dev/null 2>&1; then
+            brew install --formula zstd
+          fi
+          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          package_file="${{ steps.version.outputs.package_file }}"
+          tar -cf - -C ./combined "${package_root_name}" | zstd -T0 -19 -o "${package_file}"
+          case "${package_file}" in
+            *.tzst) ;;
+            *) echo "::error::component archive must end with .tzst"; exit 1 ;;
+          esac
+          zstd -t "${package_file}"
+          shasum -a 256 "${package_file}" > "${package_file}.sha256"
 
       - name: Stage Nightly Package
         run: |
-          mkdir -p "${{ steps.version.outputs.artifact_path }}"
-          cp "${{ steps.version.outputs.package_name }}.tar.gz" \
-            "${{ steps.version.outputs.package_name }}.tar.gz.sha256" \
-            "${{ steps.version.outputs.artifact_path }}/"
-          scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.package_name }}" \
-            "${{ steps.version.outputs.package_name }}.tar.gz" \
-            "${{ steps.version.outputs.package_name }}.tar.gz.sha256"
+          scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.artifact_name }}" \
+            "${{ steps.version.outputs.package_file }}" \
+            "${{ steps.version.outputs.package_file }}.sha256"
 
       - name: Upload Nightly Package
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.version.outputs.package_name }}
-          path: ${{ steps.version.outputs.artifact_path }}/
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: |
+            ${{ steps.version.outputs.package_file }}
+            ${{ steps.version.outputs.package_file }}.sha256
           if-no-files-found: error
           retention-days: 14
+
+  cleanup-runner-artifacts:
+    runs-on: self-macos-runner
+    needs: package
+    if: ${{ always() }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prune Runner Artifacts
+        run: scripts/ci-self-hosted.sh prune-artifact-runs 3

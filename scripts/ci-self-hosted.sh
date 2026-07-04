@@ -736,6 +736,37 @@ stage_files() {
   fi
 }
 
+prune_artifact_runs() {
+  local keep_count="${1:-3}"
+  [[ "${keep_count}" =~ ^[0-9]+$ ]] || die "keep count must be a positive integer: ${keep_count}"
+  (( keep_count > 0 )) || die "keep count must be greater than zero"
+
+  if [[ ! -d "${ARTIFACTS_DIR}" ]]; then
+    log "artifact root does not exist, nothing to prune: ${ARTIFACTS_DIR}"
+    return
+  fi
+
+  local current_run_dir="${ARTIFACTS_DIR}/${RUN_KEY}"
+  if [[ -d "${current_run_dir}" ]]; then
+    touch "${current_run_dir}"
+  fi
+
+  local index=0
+  local line dir
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    dir="${line#*$'\t'}"
+    index=$((index + 1))
+    if (( index <= keep_count )); then
+      log "keeping artifact run ${index}/${keep_count}: ${dir}"
+      continue
+    fi
+    [[ -d "${dir}" ]] || continue
+    log "removing old artifact run: ${dir}"
+    rm -rf "${dir}"
+  done < <(find "${ARTIFACTS_DIR}" -mindepth 1 -maxdepth 1 -type d -exec stat -f $'%m\t%N' {} \; | sort -rn)
+}
+
 usage() {
   cat <<'EOF'
 usage: ci-self-hosted.sh <command> [args]
@@ -753,6 +784,7 @@ commands:
   stage-artifact <name> <source-dir>
   copy-artifact <name> <dest-dir>
   stage-files <name> <file>...
+  prune-artifact-runs [keep-count]
 EOF
 }
 
@@ -771,6 +803,7 @@ case "${command}" in
   stage-artifact) stage_artifact "$@" ;;
   copy-artifact) copy_artifact "$@" ;;
   stage-files) stage_files "$@" ;;
+  prune-artifact-runs) prune_artifact_runs "$@" ;;
   ""|-h|--help) usage ;;
   *) usage; die "unknown command: ${command}" ;;
 esac

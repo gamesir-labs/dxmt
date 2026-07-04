@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: dxmt-nightly-component-${{ github.ref }}-${{ inputs.source_ref }}-${{ inputs.api_environment }}
@@ -40,6 +41,11 @@ jobs:
     outputs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       source_short_sha: ${{ steps.source.outputs.source_short_sha }}
+      package_name: ${{ steps.source.outputs.package_name }}
+      artifact_name: ${{ steps.source.outputs.artifact_name }}
+      package_file: ${{ steps.source.outputs.package_file }}
+      package_root_name: ${{ steps.source.outputs.package_root_name }}
+      reusable_artifact_run_id: ${{ steps.nightly-artifact.outputs.run_id }}
       upload_matrix: ${{ steps.upload-targets.outputs.upload_matrix }}
       upload_target_names: ${{ steps.upload-targets.outputs.upload_target_names }}
     steps:
@@ -53,14 +59,89 @@ jobs:
         run: |
           source_sha="$(git rev-parse HEAD)"
           source_short_sha="$(git rev-parse --short=7 HEAD)"
+          component_name="dxmt-nightly"
+          package_name="${component_name}-${source_short_sha}"
+          artifact_name="${component_name}-component-${source_short_sha}"
+          package_file="dist/${package_name}.tzst"
           {
             echo "source_sha=${source_sha}"
             echo "source_short_sha=${source_short_sha}"
+            echo "package_name=${package_name}"
+            echo "artifact_name=${artifact_name}"
+            echo "package_file=${package_file}"
+            echo "package_root_name=${component_name}"
           } >> "$GITHUB_OUTPUT"
           echo "Workflow ref: ${GITHUB_REF}"
           echo "Source ref: ${{ inputs.source_ref }}"
           echo "Source commit: ${source_sha}"
           echo "Source short SHA: ${source_short_sha}"
+          echo "Component artifact name: ${artifact_name}"
+
+      - name: Find Reusable Nightly Artifact
+        id: nightly-artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PACKAGE_ARTIFACT_NAME: ${{ steps.source.outputs.artifact_name }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ.get("GITHUB_TOKEN", "")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          source_sha = os.environ["SOURCE_SHA"]
+          artifact_name = os.environ["PACKAGE_ARTIFACT_NAME"]
+          output_path = os.environ["GITHUB_OUTPUT"]
+          api_base = f"https://api.github.com/repos/{repo}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def write_output(**values):
+              with open(output_path, "a", encoding="utf-8") as f:
+                  for key, value in values.items():
+                      f.write(f"{key}={value}\n")
+
+          def get_json(url):
+              request = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          query = urllib.parse.urlencode({
+              "head_sha": source_sha,
+              "status": "success",
+              "per_page": "20",
+          })
+          runs_url = f"{api_base}/actions/workflows/nightly.yml/runs?{query}"
+
+          try:
+              runs = get_json(runs_url).get("workflow_runs", [])
+              for run in runs:
+                  run_id = run.get("id")
+                  if not run_id:
+                      continue
+                  artifacts_url = f"{api_base}/actions/runs/{run_id}/artifacts?per_page=100"
+                  artifacts = get_json(artifacts_url).get("artifacts", [])
+                  for artifact in artifacts:
+                      if artifact.get("name") == artifact_name and not artifact.get("expired", False):
+                          print(f"Found reusable nightly artifact {artifact_name} in run {run_id}")
+                          write_output(run_id=run_id)
+                          sys.exit(0)
+          except urllib.error.HTTPError as error:
+              print(f"::warning::failed to query nightly artifacts: HTTP {error.code}", file=sys.stderr)
+          except Exception as error:
+              print(f"::warning::failed to query nightly artifacts: {error}", file=sys.stderr)
+
+          print(f"No reusable nightly artifact found for {artifact_name}; building in this workflow")
+          write_output(run_id="")
+          PY
 
       - name: Resolve Upload Targets
         id: upload-targets
@@ -97,6 +178,7 @@ jobs:
   setup-host:
     runs-on: self-macos-runner
     needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -111,6 +193,7 @@ jobs:
   setup-wine:
     runs-on: self-macos-runner
     needs: [resolve-source, setup-host]
+    if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -133,6 +216,7 @@ jobs:
   setup-llvm-project:
     runs-on: self-macos-runner
     needs: [resolve-source, setup-host]
+    if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -147,6 +231,7 @@ jobs:
   setup-llvm-darwin:
     runs-on: self-macos-runner
     needs: [resolve-source, setup-llvm-project]
+    if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -161,6 +246,7 @@ jobs:
   build-x86_64-windows:
     runs-on: self-macos-runner
     needs: [resolve-source, setup-wine, setup-llvm-darwin]
+    if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -198,6 +284,7 @@ jobs:
   build-x86-windows:
     runs-on: self-macos-runner
     needs: [resolve-source, setup-wine]
+    if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -232,34 +319,44 @@ jobs:
   package:
     runs-on: self-macos-runner
     needs: [resolve-source, build-x86_64-windows, build-x86-windows]
+    if: ${{ always() && needs.resolve-source.result == 'success' && (needs.resolve-source.outputs.reusable_artifact_run_id != '' || (needs.build-x86_64-windows.result == 'success' && needs.build-x86-windows.result == 'success')) }}
     outputs:
-      package_name: ${{ steps.version.outputs.package_name }}
-      package_file: ${{ steps.version.outputs.package_file }}
-    env:
-      COMPONENT_NAME: dxmt-nightly
+      package_name: ${{ steps.package.outputs.package_name }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+      package_file: ${{ steps.package.outputs.package_file }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
-      - name: Compute Package Version
-        id: version
+      - name: Set Package Outputs
+        id: package
         run: |
-          short_sha="${{ needs.resolve-source.outputs.source_short_sha }}"
-          package_name="${COMPONENT_NAME}-${short_sha}"
           {
-            echo "short_sha=${short_sha}"
-            echo "package_name=${package_name}"
-            echo "package_root_name=${COMPONENT_NAME}"
-            echo "package_file=dist/${package_name}.tzst"
+            echo "short_sha=${{ needs.resolve-source.outputs.source_short_sha }}"
+            echo "package_name=${{ needs.resolve-source.outputs.package_name }}"
+            echo "artifact_name=${{ needs.resolve-source.outputs.artifact_name }}"
+            echo "package_root_name=${{ needs.resolve-source.outputs.package_root_name }}"
+            echo "package_file=${{ needs.resolve-source.outputs.package_file }}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Download Reusable Nightly Artifact
+        if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.resolve-source.outputs.artifact_name }}
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.resolve-source.outputs.reusable_artifact_run_id }}
+
       - name: Assemble Component Package
+        if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
         run: |
-          short_sha="${{ steps.version.outputs.short_sha }}"
-          package_name="${{ steps.version.outputs.package_name }}"
-          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          short_sha="${{ steps.package.outputs.short_sha }}"
+          package_name="${{ steps.package.outputs.package_name }}"
+          package_root_name="${{ steps.package.outputs.package_root_name }}"
           package_root="./combined/${package_root_name}"
           rm -rf ./combined ./dist
           mkdir -p "${package_root}/wine" ./dist
@@ -294,10 +391,11 @@ jobs:
           PY
 
       - name: Verify Component Package Layout
+        if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
         run: |
-          short_sha="${{ steps.version.outputs.short_sha }}"
-          package_name="${{ steps.version.outputs.package_name }}"
-          package_root_name="${{ steps.version.outputs.package_root_name }}"
+          short_sha="${{ steps.package.outputs.short_sha }}"
+          package_name="${{ steps.package.outputs.package_name }}"
+          package_root_name="${{ steps.package.outputs.package_root_name }}"
           package_root="./combined/${package_root_name}"
           test ! -e "./combined/${package_name}"
           test -f "${package_root}/manifest.json"
@@ -329,12 +427,13 @@ jobs:
           PY
 
       - name: Create Component Archive
+        if: ${{ needs.resolve-source.outputs.reusable_artifact_run_id == '' }}
         run: |
           if ! command -v zstd >/dev/null 2>&1; then
             brew install --formula zstd
           fi
-          package_root_name="${{ steps.version.outputs.package_root_name }}"
-          package_file="${{ steps.version.outputs.package_file }}"
+          package_root_name="${{ steps.package.outputs.package_root_name }}"
+          package_file="${{ steps.package.outputs.package_file }}"
           tar -cf - -C ./combined "${package_root_name}" | zstd -T0 -19 -o "${package_file}"
           case "${package_file}" in
             *.tzst) ;;
@@ -343,23 +442,30 @@ jobs:
           zstd -t "${package_file}"
           shasum -a 256 "${package_file}" > "${package_file}.sha256"
 
+      - name: Verify Component Artifact
+        run: |
+          package_file="${{ steps.package.outputs.package_file }}"
+          test -f "${package_file}" || { echo "::error::component archive is missing: ${package_file}"; exit 1; }
+          test -f "${package_file}.sha256" || { echo "::error::component checksum is missing: ${package_file}.sha256"; exit 1; }
+          shasum -a 256 -c "${package_file}.sha256"
+
       - name: Upload GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.version.outputs.package_name }}
+          name: ${{ steps.package.outputs.artifact_name }}
           path: |
-            ${{ steps.version.outputs.package_file }}
-            ${{ steps.version.outputs.package_file }}.sha256
+            ${{ steps.package.outputs.package_file }}
+            ${{ steps.package.outputs.package_file }}.sha256
           if-no-files-found: error
           retention-days: 14
 
       - name: Stage Local Component Artifact
         if: always()
         run: |
-          if [[ -f "${{ steps.version.outputs.package_file }}" ]]; then
-            scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.package_name }}" \
-              "${{ steps.version.outputs.package_file }}" \
-              "${{ steps.version.outputs.package_file }}.sha256"
+          if [[ -f "${{ steps.package.outputs.package_file }}" ]]; then
+            scripts/ci-self-hosted.sh stage-files "${{ steps.package.outputs.artifact_name }}" \
+              "${{ steps.package.outputs.package_file }}" \
+              "${{ steps.package.outputs.package_file }}.sha256"
           fi
 
   upload-backend-component:
@@ -385,7 +491,7 @@ jobs:
       - name: Download Component Artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.package.outputs.package_name }}
+          name: ${{ needs.package.outputs.artifact_name }}
           path: dist
 
       - name: Verify Component Artifact
@@ -580,3 +686,14 @@ jobs:
           if response.get("code") not in (0, 200):
               raise SystemExit(f"component update failed: {response}")
           PY
+
+  cleanup-runner-artifacts:
+    runs-on: self-macos-runner
+    needs: [package, upload-backend-component]
+    if: ${{ always() }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prune Runner Artifacts
+        run: scripts/ci-self-hosted.sh prune-artifact-runs 3
