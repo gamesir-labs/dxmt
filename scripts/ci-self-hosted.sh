@@ -736,6 +736,53 @@ stage_files() {
   fi
 }
 
+restore_staged_files() {
+  (( $# >= 3 )) || die "restore-staged-files requires <name> <dest-dir> <file>..."
+  local name="$1"
+  local dest="$2"
+  shift 2
+
+  if [[ ! -d "${ARTIFACTS_DIR}" ]]; then
+    log "artifact root does not exist: ${ARTIFACTS_DIR}"
+    return 1
+  fi
+
+  local line run_dir source missing file base
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    run_dir="${line#*$'\t'}"
+    source="${run_dir}/${name}"
+    [[ -d "${source}" ]] || continue
+
+    missing=0
+    for file in "$@"; do
+      base="$(basename "${file}")"
+      if [[ ! -f "${source}/${base}" ]]; then
+        missing=1
+        break
+      fi
+    done
+    (( missing == 0 )) || continue
+
+    mkdir -p "${dest}"
+    for file in "$@"; do
+      base="$(basename "${file}")"
+      cp -a "${source}/${base}" "${dest}/"
+    done
+    log "restored staged files ${name} from ${source} into ${dest}"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      {
+        printf '### DXMT restored local artifact\n\n'
+        printf '`%s`\n' "${source}"
+      } >> "${GITHUB_STEP_SUMMARY}"
+    fi
+    return 0
+  done < <(find "${ARTIFACTS_DIR}" -mindepth 1 -maxdepth 1 -type d -exec stat -f $'%m\t%N' {} \; | sort -rn)
+
+  log "staged files ${name} not found under ${ARTIFACTS_DIR}"
+  return 1
+}
+
 prune_artifact_runs() {
   local keep_count="${1:-3}"
   [[ "${keep_count}" =~ ^[0-9]+$ ]] || die "keep count must be a positive integer: ${keep_count}"
@@ -784,6 +831,7 @@ commands:
   stage-artifact <name> <source-dir>
   copy-artifact <name> <dest-dir>
   stage-files <name> <file>...
+  restore-staged-files <name> <dest-dir> <file>...
   prune-artifact-runs [keep-count]
 EOF
 }
@@ -803,6 +851,7 @@ case "${command}" in
   stage-artifact) stage_artifact "$@" ;;
   copy-artifact) copy_artifact "$@" ;;
   stage-files) stage_files "$@" ;;
+  restore-staged-files) restore_staged_files "$@" ;;
   prune-artifact-runs) prune_artifact_runs "$@" ;;
   ""|-h|--help) usage ;;
   *) usage; die "unknown command: ${command}" ;;
