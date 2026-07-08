@@ -1146,9 +1146,71 @@ public:
 
     if (auto dst_bind = GetResourceCommon(pDstBuffer)) {
       if (auto uav = static_cast<D3D11UnorderedAccessView *>(pSrcView)) {
+        if (auto staging_dst = GetStagingResource(pDstBuffer, 0)) {
+          auto counter = uav->counter();
+          SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+          UseCopyDestination(staging_dst);
+          EmitOP([=, dst_ = std::move(staging_dst), counter = counter](ArgumentEncodingContext &enc) {
+            auto [dst_buffer, dst_offset] = enc.access(dst_->buffer(), DstAlignedByteOffset, 4, ResourceAccess::Write);
+
+            auto fill_zero = [&] {
+              auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_fillbuffer>();
+              cmd.type = WMTBlitCommandFillBuffer;
+              cmd.buffer = dst_buffer->buffer();
+              cmd.offset = DstAlignedByteOffset + dst_offset;
+              cmd.length = 4;
+              cmd.value = 0;
+            };
+
+            if (!counter.ptr()) {
+              fill_zero();
+              return;
+            }
+
+            if (!counter->current()) {
+              fill_zero();
+              return;
+            }
+
+            auto [counter_buffer, counter_offset] = enc.access(counter, 0, 4, ResourceAccess::Read);
+            auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+            cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+            cmd.copy_length = 4;
+            cmd.src = counter_buffer->buffer();
+            cmd.src_offset = counter_offset;
+            cmd.dst = dst_buffer->buffer();
+            cmd.dst_offset = DstAlignedByteOffset + dst_offset;
+          });
+          promote_flush = true;
+          return;
+        }
+
+        auto dst = dst_bind->buffer();
+        auto counter = uav->counter();
+        FlushPendingBufferUpdatesFor(dst.ptr());
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
-        EmitOP([=, dst = dst_bind->buffer(), counter = uav->counter()](ArgumentEncodingContext &enc) {
+        EmitOP([=, dst = dst, counter = counter](ArgumentEncodingContext &enc) {
           auto [dst_buffer, dst_offset] = enc.access(dst, DstAlignedByteOffset, 4, ResourceAccess::Write);
+
+          auto fill_zero = [&] {
+            auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_fillbuffer>();
+            cmd.type = WMTBlitCommandFillBuffer;
+            cmd.buffer = dst_buffer->buffer();
+            cmd.offset = DstAlignedByteOffset + dst_offset;
+            cmd.length = 4;
+            cmd.value = 0;
+          };
+
+          if (!counter.ptr()) {
+            fill_zero();
+            return;
+          }
+
+          if (!counter->current()) {
+            fill_zero();
+            return;
+          }
+
           auto [counter_buffer, counter_offset] = enc.access(counter, 0, 4, ResourceAccess::Read);
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
           cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
