@@ -52,11 +52,14 @@ public:
       presenter = move.presenter;
       move.presenter = nullptr;
     };
-    ~PresentState() {
+    void complete() {
       if (presenter) {
         presenter->frame_presented_.signal(frame_id);
         presenter = nullptr;
       }
+    };
+    ~PresentState() {
+      complete();
     };
   };
 

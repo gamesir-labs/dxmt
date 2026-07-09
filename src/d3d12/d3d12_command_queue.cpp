@@ -104,6 +104,41 @@ GetSwapChainPresentAlphaMode(DXGI_ALPHA_MODE alpha_mode) {
   }
 }
 
+struct PresentSemaphoreSignals {
+  HANDLE queue_depth = nullptr;
+  HANDLE waitable = nullptr;
+
+  PresentSemaphoreSignals(HANDLE queue_depth, HANDLE waitable)
+      : queue_depth(queue_depth), waitable(waitable) {}
+  PresentSemaphoreSignals(const PresentSemaphoreSignals &) = delete;
+  PresentSemaphoreSignals &operator=(const PresentSemaphoreSignals &) = delete;
+  ~PresentSemaphoreSignals() { close(); }
+
+  void signal() {
+    if (queue_depth) {
+      ReleaseSemaphore(queue_depth, 1, nullptr);
+      CloseHandle(queue_depth);
+      queue_depth = nullptr;
+    }
+    if (waitable) {
+      ReleaseSemaphore(waitable, 1, nullptr);
+      CloseHandle(waitable);
+      waitable = nullptr;
+    }
+  }
+
+  void close() {
+    if (queue_depth) {
+      CloseHandle(queue_depth);
+      queue_depth = nullptr;
+    }
+    if (waitable) {
+      CloseHandle(waitable);
+      waitable = nullptr;
+    }
+  }
+};
+
 static bool
 ShouldLogTextureBufferViewDiag() {
   static std::atomic<uint32_t> count = 0;
@@ -4486,6 +4521,11 @@ private:
           queue->device_->GetDXMTDevice().queue().cmd_library, 1.0f,
           desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
       hud_.initialize(GetVersionDescriptionText(12, D3D_FEATURE_LEVEL_12_0));
+      present_queue_semaphore_ =
+          CreateSemaphore(nullptr, frame_latency_,
+                          DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
+      if (!present_queue_semaphore_)
+        WARN("D3D12SwapChain: failed to create present queue semaphore");
       if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
         present_semaphore_ =
             CreateSemaphore(nullptr, frame_latency_, DXGI_MAX_SWAP_CHAIN_BUFFERS,
@@ -4500,6 +4540,8 @@ private:
       backbuffers_.clear();
       if (present_semaphore_)
         CloseHandle(present_semaphore_);
+      if (present_queue_semaphore_)
+        CloseHandle(present_queue_semaphore_);
       if (native_view_)
         WMT::ReleaseMetalView(native_view_);
     }
@@ -4862,56 +4904,75 @@ private:
       }
       auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
       const auto present_frame_id = dxmt_queue.CurrentFrameSeq() - 1;
-      const auto present_frame_seq = present_frame_id + 1;
       presenter_->setDisplaySyncEnabled(display_sync_enabled);
-      auto state = presenter_->synchronizeLayerProperties();
-      state.metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
-      state.metadata.background_color[0] = background_color_.r;
-      state.metadata.background_color[1] = background_color_.g;
-      state.metadata.background_color[2] = background_color_.b;
-      state.metadata.background_color[3] = background_color_.a;
+      HANDLE present_queue_signal = nullptr;
       HANDLE present_signal = nullptr;
-      if (present_semaphore_) {
-        HANDLE process = GetCurrentProcess();
-        DuplicateHandle(process, present_semaphore_, process, &present_signal,
-                        0, FALSE, DUPLICATE_SAME_ACCESS);
+      HANDLE process = GetCurrentProcess();
+      if (present_queue_semaphore_) {
+        DWORD wait_result =
+            WaitForSingleObject(present_queue_semaphore_, INFINITE);
+        if (wait_result != WAIT_OBJECT_0) {
+          WARN("D3D12SwapChain::Present1: present queue wait failed result=",
+               wait_result);
+        } else if (!DuplicateHandle(process, present_queue_semaphore_, process,
+                                    &present_queue_signal, 0, FALSE,
+                                    DUPLICATE_SAME_ACCESS)) {
+          WARN("D3D12SwapChain::Present1: failed to duplicate present queue "
+               "semaphore");
+          ReleaseSemaphore(present_queue_semaphore_, 1, nullptr);
+        }
       }
-      auto present_state = std::make_shared<decltype(state)>(std::move(state));
+      if (present_semaphore_) {
+        if (!DuplicateHandle(process, present_semaphore_, process,
+                             &present_signal, 0, FALSE,
+                             DUPLICATE_SAME_ACCESS)) {
+          WARN("D3D12SwapChain::Present1: failed to duplicate frame latency "
+               "waitable semaphore");
+        }
+      }
+
+      auto state_storage = presenter_->synchronizeLayerProperties();
+      auto state =
+          std::make_shared<Presenter::PresentState>(std::move(state_storage));
+      state->metadata.alpha_mode = GetSwapChainPresentAlphaMode(desc_.AlphaMode);
+      state->metadata.background_color[0] = background_color_.r;
+      state->metadata.background_color[1] = background_color_.g;
+      state->metadata.background_color[2] = background_color_.b;
+      state->metadata.background_color[3] = background_color_.a;
+
+      auto present_signals = std::make_shared<PresentSemaphoreSignals>(
+          present_queue_signal, present_signal);
       PendingOperation op = {};
       op.type = PendingOperationType::QueueWork;
       op.frame_id = present_frame_id;
       op.queue_work = [
-        present_frame_seq,
         backbuffer = Rc<Texture>(resource->GetTexture()),
         present_view = resource->GetPresentSourceView(),
         presenter = presenter_,
-        present_signal,
         present_after,
         apitrace_frame_index,
         sync_interval,
         flags,
-        present_state = std::move(present_state)
+        state,
+        present_signals
       ](CommandChunk *chunk) mutable {
-        chunk->signal_frame_latency_fence_ = present_frame_seq;
-        auto state = std::move(*present_state);
+        chunk->addCompletionCallback([state, present_signals]() {
+          state->complete();
+          present_signals->signal();
+        });
         chunk->emitcc([
           backbuffer = std::move(backbuffer),
           present_view = std::move(present_view),
           presenter = std::move(presenter),
-          present_signal,
           present_after,
           apitrace_frame_index,
           sync_interval,
           flags,
-          state = std::move(state)
+          state
         ](ArgumentEncodingContext &ctx) mutable {
           ctx.present(backbuffer, present_view, presenter, present_after,
-                      state.metadata, apitrace_frame_index, sync_interval,
+                      state->metadata, apitrace_frame_index, sync_interval,
                       flags);
-          if (present_signal) {
-            ReleaseSemaphore(present_signal, 1, nullptr);
-            CloseHandle(present_signal);
-          }
         });
         return true;
       };
@@ -4977,6 +5038,9 @@ private:
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
       if (!max_latency || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
         return WARN_E_INVALIDARG(__func__);
+      if (present_queue_semaphore_ && max_latency > frame_latency_)
+        ReleaseSemaphore(present_queue_semaphore_, max_latency - frame_latency_,
+                         nullptr);
       if (present_semaphore_ && max_latency > frame_latency_)
         ReleaseSemaphore(present_semaphore_, max_latency - frame_latency_,
                          nullptr);
@@ -5169,6 +5233,7 @@ private:
     DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
     DXGI_MATRIX_3X2_F matrix_ = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
     DXGI_COLOR_SPACE_TYPE color_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    HANDLE present_queue_semaphore_ = nullptr;
     HANDLE present_semaphore_ = nullptr;
     double init_refresh_rate_ = DBL_MAX;
     int preferred_max_frame_rate_ = 0;
@@ -6171,7 +6236,7 @@ private:
                         ArgumentEncodingContext &enc) mutable {
         enc.sampleTimestamp(std::move(query));
       });
-      chunk->completion_callbacks.push_back(
+      chunk->addCompletionCallback(
           [heap_ref = std::move(heap_ref), type, index]() mutable {
             auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
             if (heap)
@@ -19840,7 +19905,7 @@ private:
         auto allocator_uses = std::make_shared<std::vector<SubmittedCommandAllocatorUse>>(
             std::move(operation.allocator_uses));
         auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
-        chunk->completion_callbacks.push_back([allocator_uses = std::move(allocator_uses)]() {
+        chunk->addCompletionCallback([allocator_uses = std::move(allocator_uses)]() {
           for (auto &use : *allocator_uses) {
             if (use.allocator)
               use.allocator->CompleteCommandListSubmission(use.serial);
@@ -20086,9 +20151,9 @@ private:
       enc.signalEvent(std::move(event), value);
     });
     state->AddRefPrivate();
-    chunk->completion_callbacks.push_back([state, value, queue_ptr = reinterpret_cast<uintptr_t>(this),
-                                           queue_type = desc_.Type, chunk_id, chunk_event_id,
-                                           chunk_frame]() {
+    chunk->addCompletionCallback([state, value, queue_ptr = reinterpret_cast<uintptr_t>(this),
+                                  queue_type = desc_.Type, chunk_id, chunk_event_id,
+                                  chunk_frame]() {
       static std::atomic<uint32_t> complete_log_count = 0;
       if (D3D12DiagShouldLog(complete_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
         WARN_FILE_ONLY("D3D12 queue diagnostic: FenceSignalCompleteChunk"

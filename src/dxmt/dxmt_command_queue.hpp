@@ -93,6 +93,12 @@ public:
   void
   encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc);
 
+  void
+  addCompletionCallback(std::function<void()> callback) {
+    std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
+    completion_callbacks.push_back(std::move(callback));
+  }
+
   uint64_t chunk_id;
   uint64_t chunk_event_id;
   uint64_t frame_;
@@ -105,6 +111,7 @@ public:
   clock::time_point finish_complete_time;
   QueryReadbacks readback;
   std::vector<std::function<void()>> completion_callbacks;
+  dxmt::mutex completion_callbacks_mutex_;
   std::vector<std::function<void()>> deferred_readbacks;
   uint64_t resource_initializer_event_id;
 
@@ -130,9 +137,13 @@ public:
     finish_begin_time = {};
     finish_complete_time = {};
     readback = {};
-    for (auto &callback : completion_callbacks)
+    std::vector<std::function<void()>> callbacks;
+    {
+      std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
+      callbacks.swap(completion_callbacks);
+    }
+    for (auto &callback : callbacks)
       callback();
-    completion_callbacks.clear();
     deferred_readbacks.clear();
     list_enc.reset();
     ref_tracker.clear();
@@ -167,7 +178,6 @@ private:
   dxmt::condition_variable readback_cond_;
   std::vector<std::function<void()>> pending_readbacks_;
   const bool apitrace_enabled_;
-  dxmt::mutex completion_callbacks_mutex_;
 
   std::array<CommandChunk, kCommandChunkCount> chunks;
   uint64_t encoder_seq = 1;

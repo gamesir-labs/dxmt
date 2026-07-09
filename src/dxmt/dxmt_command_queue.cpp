@@ -380,21 +380,6 @@ CommandQueue::PresentBoundary() {
   statistics.at(frame_count).begin_time = next_frame_begin_time;
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
   perf::resetCurrentFrameApiGapMarker(next_frame_begin_time);
-  // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering
-  if (likely(frame_count > max_latency_)) {
-    auto t0 = clock::now();
-    frame_latency_fence_.wait(frame_count - max_latency_);
-    auto t1 = clock::now();
-    statistics.at(frame_count).present_latency_interval += (t1 - t0);
-    if (DxmtQueueDiagEnabled()) {
-      WARN_FILE_ONLY("DXMT queue diagnostic: FrameLatencyWait"
-           " frame=", frame_count,
-           " target=", frame_count - max_latency_,
-           " signaled=", frame_latency_fence_.signaledValue(),
-           " waitMs=", DxmtQueueDiagDurationMs(t1 - t0),
-           " latency=", max_latency_);
-    }
-  }
   statistics.at(frame_count).latency = max_latency_;
 }
 
@@ -459,8 +444,7 @@ CommandQueue::RetainUntilGpuComplete(std::function<void()> release) {
     return;
 
   auto &chunk = chunks[CurrentSeqId() % kCommandChunkCount];
-  std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
-  chunk.completion_callbacks.push_back(std::move(release));
+  chunk.addCompletionCallback(std::move(release));
 }
 
 uint64_t
@@ -790,7 +774,7 @@ CommandQueue::WaitForFinishThread() {
 
     std::vector<std::function<void()>> completion_callbacks;
     {
-      std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
+      std::lock_guard<dxmt::mutex> lock(chunk.completion_callbacks_mutex_);
       completion_callbacks.swap(chunk.completion_callbacks);
     }
     const auto completion_chunk_id = chunk.chunk_id;
