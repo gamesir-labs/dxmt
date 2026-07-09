@@ -109,17 +109,6 @@ dxmt_metal4_commit_feedback_enabled(uint64_t completion_value) {
 }
 
 static bool
-dxmt_metal4_present_ordering_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = true;
-  if (!initialized) {
-    enabled = dxmt_env_enabled_default("DXMT_METAL4_PRESENT_ORDERING", true);
-    initialized = true;
-  }
-  return enabled;
-}
-
-static bool
 dxmt_metal4_wait_for_drawable_enabled(void) {
   static bool initialized = false;
   static bool enabled = true;
@@ -627,9 +616,7 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, retain) id<MTL4CommandQueue> metal4Queue;
 @property(nonatomic, retain) id<MTL4Compiler> compiler;
 @property(nonatomic, retain) id<MTLSharedEvent> event;
-@property(nonatomic, retain) id<MTLSharedEvent> presentEvent;
 @property(nonatomic, assign) uint64_t eventValue;
-@property(nonatomic, assign) uint64_t presentEventValue;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValue;
 @end
@@ -647,11 +634,9 @@ dxmt_metal4_is_buffer(id object) {
   _compiler = [(id<MTLDevice>)device newCompilerWithDescriptor:compilerDesc error:&compilerError];
   [compilerDesc release];
   _event = [(id<MTLDevice>)device newSharedEvent];
-  _presentEvent = [(id<MTLDevice>)device newSharedEvent];
   _eventValue = 0;
-  _presentEventValue = 0;
 
-  if (!_metal4Queue || !_compiler || !_event || !_presentEvent) {
+  if (!_metal4Queue || !_compiler || !_event) {
     [self release];
     return nil;
   }
@@ -665,7 +650,6 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Queue release];
   [_compiler release];
   [_event release];
-  [_presentEvent release];
   [super dealloc];
 }
 
@@ -781,7 +765,7 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)commit {
-  if (_pendingDrawable && dxmt_metal4_present_ordering_enabled()) {
+  if (_pendingDrawable) {
     @synchronized(_owner) {
       [self commitLocked];
     }
@@ -880,6 +864,7 @@ dxmt_metal4_is_buffer(id object) {
       0);
 
   if (_pendingDrawable) {
+    [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
     [_owner.metal4Queue signalDrawable:_pendingDrawable];
     if (_hasPresentDuration)
       [_pendingDrawable presentAfterMinimumDuration:_presentDuration];
@@ -907,7 +892,8 @@ dxmt_metal4_is_buffer(id object) {
         APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
     [_owner.metal4Queue signalEvent:signal.event value:signal.value];
   }
-  [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
+  if (!_pendingDrawable)
+    [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
 
   dxmt_apitrace_finalize_command_buffer((obj_handle_t)self);
   return residency_submit_us;
