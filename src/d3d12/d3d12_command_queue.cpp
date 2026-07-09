@@ -7821,11 +7821,31 @@ private:
                   auto &data =
                       *static_cast<CompiledDirectDrawPayload *>(payload);
                   auto &packet = data.draw;
-                  for (const auto &allocation :
-                       data.direct_access.buffer_allocations)
-                    enc.retainAllocation(allocation.ptr());
-                  queue->EncodeRenderPipelineStateIfChanged(
-                      enc, packet.common.metal_pso);
+                  auto *perf_stats = queue->CompiledDrawFrameStats(enc);
+                  FramePerfDurationScope direct_scope(
+                      perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
+                  AddFramePerfCount(
+                      perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
+                  AddFramePerfCount(
+                      perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
+                  {
+                    FramePerfDurationScope retain_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
+                    for (const auto &allocation :
+                         data.direct_access.buffer_allocations)
+                      enc.retainAllocation(allocation.ptr());
+                  }
+                  {
+                    FramePerfDurationScope pipeline_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
+                    queue->EncodeRenderPipelineStateIfChanged(
+                        enc, packet.common.metal_pso);
+                  }
                   auto *render_encoder = enc.currentRenderEncoder();
                   render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
                       packet.common.pixel_shader_demote_msaa_srv_mask_lo;
@@ -7839,6 +7859,9 @@ private:
                        cache.depth_stencil.handle !=
                            packet.common.depth_stencil.handle ||
                        cache.stencil_ref != stencil_ref_u8)) {
+                    FramePerfDurationScope dsso_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
                     auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
                     cmd.type = WMTRenderCommandSetDSSO;
                     cmd.dsso = packet.common.depth_stencil;
@@ -7851,6 +7874,9 @@ private:
                       std::memcmp(&cache.rasterizer,
                                   &packet.common.rasterizer,
                                   sizeof(packet.common.rasterizer)) != 0) {
+                    FramePerfDurationScope rasterizer_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
                     auto &rs =
                         enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
                     rs = packet.common.rasterizer;
@@ -7867,17 +7893,27 @@ private:
                     diag.path = "compiled-direct";
                     packet.common.bindless_diag = diag;
                   }
-                  EncodeDynamicRenderState(
-                      enc, packet.common.viewports, packet.common.scissors,
-                      packet.common.blend_factor, packet.common.stencil_ref);
-                  enc.resolveRenderPassBarrier();
-                  auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
-                  draw.type = WMTRenderCommandDraw;
-                  draw.primitive_type = *packet.common.primitive;
-                  draw.vertex_start = packet.vertex_start;
-                  draw.vertex_count = packet.vertex_count;
-                  draw.instance_count = packet.instance_count;
-                  draw.base_instance = packet.base_instance;
+                  {
+                    FramePerfDurationScope dynamic_state_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
+                    EncodeDynamicRenderState(
+                        enc, packet.common.viewports, packet.common.scissors,
+                        packet.common.blend_factor, packet.common.stencil_ref);
+                  }
+                  {
+                    FramePerfDurationScope body_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
+                    enc.resolveRenderPassBarrier();
+                    auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+                    draw.type = WMTRenderCommandDraw;
+                    draw.primitive_type = *packet.common.primitive;
+                    draw.vertex_start = packet.vertex_start;
+                    draw.vertex_count = packet.vertex_count;
+                    draw.instance_count = packet.instance_count;
+                    draw.base_instance = packet.base_instance;
+                  }
                   queue->RecordBindlessMirrorDiagDraw(packet.common.pipeline,
                                                       packet.common.bindless_diag);
                 },
@@ -7962,12 +7998,32 @@ private:
                   auto &data =
                       *static_cast<CompiledDirectIndexedDrawPayload *>(payload);
                   auto &packet = data.draw;
-                  for (const auto &allocation :
-                       data.direct_access.buffer_allocations)
-                    enc.retainAllocation(allocation.ptr());
-                  enc.retainAllocation(packet.index_allocation.ptr());
-                  queue->EncodeRenderPipelineStateIfChanged(
-                      enc, packet.common.metal_pso);
+                  auto *perf_stats = queue->CompiledDrawFrameStats(enc);
+                  FramePerfDurationScope direct_scope(
+                      perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
+                  AddFramePerfCount(
+                      perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
+                  AddFramePerfCount(
+                      perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets);
+                  {
+                    FramePerfDurationScope retain_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
+                    for (const auto &allocation :
+                         data.direct_access.buffer_allocations)
+                      enc.retainAllocation(allocation.ptr());
+                    enc.retainAllocation(packet.index_allocation.ptr());
+                  }
+                  {
+                    FramePerfDurationScope pipeline_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
+                    queue->EncodeRenderPipelineStateIfChanged(
+                        enc, packet.common.metal_pso);
+                  }
                   auto *render_encoder = enc.currentRenderEncoder();
                   render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
                       packet.common.pixel_shader_demote_msaa_srv_mask_lo;
@@ -7981,6 +8037,9 @@ private:
                        cache.depth_stencil.handle !=
                            packet.common.depth_stencil.handle ||
                        cache.stencil_ref != stencil_ref_u8)) {
+                    FramePerfDurationScope dsso_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
                     auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
                     cmd.type = WMTRenderCommandSetDSSO;
                     cmd.dsso = packet.common.depth_stencil;
@@ -7993,6 +8052,9 @@ private:
                       std::memcmp(&cache.rasterizer,
                                   &packet.common.rasterizer,
                                   sizeof(packet.common.rasterizer)) != 0) {
+                    FramePerfDurationScope rasterizer_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
                     auto &rs =
                         enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
                     rs = packet.common.rasterizer;
@@ -8009,21 +8071,31 @@ private:
                     diag.path = "compiled-direct";
                     packet.common.bindless_diag = diag;
                   }
-                  EncodeDynamicRenderState(
-                      enc, packet.common.viewports, packet.common.scissors,
-                      packet.common.blend_factor, packet.common.stencil_ref);
-                  enc.resolveRenderPassBarrier();
-                  auto &draw =
-                      enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
-                  draw.type = WMTRenderCommandDrawIndexed;
-                  draw.primitive_type = *packet.common.primitive;
-                  draw.index_type = packet.index_type;
-                  draw.index_count = packet.index_count;
-                  draw.index_buffer = packet.index_allocation->buffer();
-                  draw.index_buffer_offset = packet.index_offset;
-                  draw.instance_count = packet.instance_count;
-                  draw.base_vertex = packet.base_vertex;
-                  draw.base_instance = packet.base_instance;
+                  {
+                    FramePerfDurationScope dynamic_state_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
+                    EncodeDynamicRenderState(
+                        enc, packet.common.viewports, packet.common.scissors,
+                        packet.common.blend_factor, packet.common.stencil_ref);
+                  }
+                  {
+                    FramePerfDurationScope body_scope(
+                        perf_stats,
+                        &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
+                    enc.resolveRenderPassBarrier();
+                    auto &draw =
+                        enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
+                    draw.type = WMTRenderCommandDrawIndexed;
+                    draw.primitive_type = *packet.common.primitive;
+                    draw.index_type = packet.index_type;
+                    draw.index_count = packet.index_count;
+                    draw.index_buffer = packet.index_allocation->buffer();
+                    draw.index_buffer_offset = packet.index_offset;
+                    draw.instance_count = packet.instance_count;
+                    draw.base_vertex = packet.base_vertex;
+                    draw.base_instance = packet.base_instance;
+                  }
                   queue->RecordBindlessMirrorDiagDraw(packet.common.pipeline,
                                                       packet.common.bindless_diag);
                 },
@@ -16234,31 +16306,79 @@ private:
                                     bool use_tessellation,
                                     uint64_t &argbuf_offset,
                                     BindlessMirrorDrawDiag *draw_diag = nullptr) {
-    if (auto *root = snapshot.root_signature_impl)
-      ApplyStaticSamplers(enc, pipeline, *root, false);
+    auto *perf_stats = CompiledDrawFrameStats(enc);
+    FramePerfDurationScope snapshot_scope(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_interval);
+    AddFramePerfCount(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_applied);
+    AddFramePerfCount(perf_stats,
+                      &dxmt::FrameStatistics::frame_compiled_snapshot_entries,
+                      snapshot.entries.size());
 
-    for (const auto &entry : snapshot.entries) {
-      if (entry.kind == GraphicsBindingSnapshotEntry::Kind::RootConstants) {
-        DebugLogRootBinding(
-            entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
-            entry.stage, entry.root_index, entry.slot, entry.shader_register,
-            entry.register_space, entry.debug_size, entry.debug_address);
-        BindRootConstantsSnapshot(enc, entry);
-      } else if (entry.has_descriptor) {
-        DebugLogRootBinding(
-            entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
-            entry.stage, entry.root_index, entry.slot, entry.shader_register,
-            entry.register_space, entry.debug_size, entry.debug_address);
-        // Bindless-mirror (③.3): the snapshot path does not run ApplyDescriptorTableBindingRecipe,
-        // so fill the persistent mirror here from the captured descriptor (record.mirror travels
-        // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
-        if (snapshot.bindless)
-          MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
-                                      entry.stage, &entry.argument);
-        BindDescriptor(enc, entry.stage, entry.range_type, entry.slot,
-                       entry.descriptor, &entry.argument);
-      } else {
-        ClearDescriptorBinding(enc, entry.stage, entry.range_type, entry.slot);
+    if (auto *root = snapshot.root_signature_impl) {
+      FramePerfDurationScope static_sampler_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_static_samplers_interval);
+      ApplyStaticSamplers(enc, pipeline, *root, false);
+    }
+
+    {
+      FramePerfDurationScope entries_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_entries_interval);
+      for (const auto &entry : snapshot.entries) {
+        if (entry.kind == GraphicsBindingSnapshotEntry::Kind::RootConstants) {
+          AddFramePerfCount(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_root_constants);
+          FramePerfDurationScope root_constants_scope(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_root_constants_interval);
+          DebugLogRootBinding(
+              entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
+              entry.stage, entry.root_index, entry.slot, entry.shader_register,
+              entry.register_space, entry.debug_size, entry.debug_address);
+          BindRootConstantsSnapshot(enc, entry);
+        } else if (entry.has_descriptor) {
+          AddFramePerfCount(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors);
+          DebugLogRootBinding(
+              entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
+              entry.stage, entry.root_index, entry.slot, entry.shader_register,
+              entry.register_space, entry.debug_size, entry.debug_address);
+          // Bindless-mirror (③.3): the snapshot path does not run ApplyDescriptorTableBindingRecipe,
+          // so fill the persistent mirror here from the captured descriptor (record.mirror travels
+          // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
+          if (snapshot.bindless) {
+            AddFramePerfCount(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fills);
+            FramePerfDurationScope bindless_fill_scope(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fill_interval);
+            MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
+                                        entry.stage, &entry.argument);
+          }
+          {
+            FramePerfDurationScope descriptor_scope(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors_interval);
+            BindDescriptor(enc, entry.stage, entry.range_type, entry.slot,
+                           entry.descriptor, &entry.argument);
+          }
+        } else {
+          AddFramePerfCount(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_clear_descriptors);
+          FramePerfDurationScope clear_scope(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_clear_descriptors_interval);
+          ClearDescriptorBinding(enc, entry.stage, entry.range_type,
+                                 entry.slot);
+        }
       }
     }
 
@@ -16266,12 +16386,24 @@ private:
                                    ? PipelineKind::Tessellation
                                    : use_geometry ? PipelineKind::Geometry
                                                   : PipelineKind::Ordinary;
-    for (const auto &binding : snapshot.vertex_buffers) {
-      auto buffer = binding.buffer;
-      enc.bindVertexBuffer(binding.slot, binding.offset, binding.stride,
-                           std::move(buffer));
+    {
+      AddFramePerfCount(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_buffers,
+          snapshot.vertex_buffers.size());
+      FramePerfDurationScope vertex_buffers_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_buffers_interval);
+      for (const auto &binding : snapshot.vertex_buffers) {
+        auto buffer = binding.buffer;
+        enc.bindVertexBuffer(binding.slot, binding.offset, binding.stride,
+                             std::move(buffer));
+      }
     }
     if (snapshot.vertex_slot_mask) {
+      FramePerfDurationScope vertex_table_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_table_interval);
       const auto table_size =
           uint64_t(__builtin_popcount(snapshot.vertex_slot_mask)) * 16u;
       const auto offset = AllocateArgumentBuffer(argbuf_offset, table_size);
@@ -16300,57 +16432,187 @@ private:
     diag.path = BindlessMirrorDiagPathName(snapshot_bindless, true);
     // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
     // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
-    if (!snapshot.bindless && DescriptorMirrorRuntimeEnabled())
-      enc.restorePerPassArgbufIfMirrorBound<false>();
-    for (const auto &shader : shaders) {
-      if (snapshot_bindless) {
-        if (shader.stage == PipelineShaderStage::Vertex)
-          EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
-              enc, shader, key, snapshot, &diag);
-        else if (shader.stage == PipelineShaderStage::Pixel)
-          EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
-              enc, shader, key, snapshot, &diag);
-        continue;
-      }
-      if (use_geometry) {
-        if (shader.stage == PipelineShaderStage::Vertex)
-          EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                       PipelineKind::Geometry>(
-              enc, shader, key, argbuf_offset);
-        else if (shader.stage == PipelineShaderStage::Geometry)
-          EncodeShaderBindingsForStage<PipelineStage::Geometry,
-                                       PipelineKind::Geometry>(
-              enc, shader, key, argbuf_offset);
-        else if (shader.stage == PipelineShaderStage::Pixel)
-          EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                       PipelineKind::Geometry>(
-              enc, shader, key, argbuf_offset);
-      } else {
-        if (use_tessellation) {
+    if (!snapshot.bindless && DescriptorMirrorRuntimeEnabled()) {
+      FramePerfDurationScope restore_argbuf_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_restore_argbuf_interval);
+      if (enc.restorePerPassArgbufIfMirrorBound<false>())
+        AddFramePerfCount(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_argbuf_restores);
+    }
+    {
+      FramePerfDurationScope shader_bindings_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings_interval);
+      for (const auto &shader : shaders) {
+        if (snapshot_bindless) {
+          if (shader.stage == PipelineShaderStage::Vertex) {
+            AddFramePerfCount(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+            AddFramePerfCount(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings);
+            FramePerfDurationScope bindless_shader_scope(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings_interval);
+            EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
+                enc, shader, key, snapshot, &diag);
+          } else if (shader.stage == PipelineShaderStage::Pixel) {
+            AddFramePerfCount(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+            AddFramePerfCount(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings);
+            FramePerfDurationScope bindless_shader_scope(
+                perf_stats,
+                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings_interval);
+            EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
+                enc, shader, key, snapshot, &diag);
+          }
+          continue;
+        }
+        if (use_geometry) {
           if (shader.stage == PipelineShaderStage::Vertex)
-            EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-          else if (shader.stage == PipelineShaderStage::Hull)
-            EncodeShaderBindingsForStage<PipelineStage::Hull,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-          else if (shader.stage == PipelineShaderStage::Domain)
-            EncodeShaderBindingsForStage<PipelineStage::Domain,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
+            {
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+              FramePerfDurationScope legacy_shader_scope(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+              EncodeShaderBindingsForStage<PipelineStage::Vertex,
+                                           PipelineKind::Geometry>(
+                  enc, shader, key, argbuf_offset);
+            }
+          else if (shader.stage == PipelineShaderStage::Geometry)
+            {
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+              FramePerfDurationScope legacy_shader_scope(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+              EncodeShaderBindingsForStage<PipelineStage::Geometry,
+                                           PipelineKind::Geometry>(
+                  enc, shader, key, argbuf_offset);
+            }
           else if (shader.stage == PipelineShaderStage::Pixel)
-            EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-        } else if (shader.stage == PipelineShaderStage::Vertex)
-          EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                       PipelineKind::Ordinary>(
-              enc, shader, key, argbuf_offset);
-        else if (shader.stage == PipelineShaderStage::Pixel)
-          EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                       PipelineKind::Ordinary>(
-              enc, shader, key, argbuf_offset);
+            {
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+              FramePerfDurationScope legacy_shader_scope(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+              EncodeShaderBindingsForStage<PipelineStage::Pixel,
+                                           PipelineKind::Geometry>(
+                  enc, shader, key, argbuf_offset);
+            }
+        } else {
+          if (use_tessellation) {
+            if (shader.stage == PipelineShaderStage::Vertex)
+              {
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+                FramePerfDurationScope legacy_shader_scope(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+                EncodeShaderBindingsForStage<PipelineStage::Vertex,
+                                             PipelineKind::Tessellation>(
+                    enc, shader, key, argbuf_offset);
+              }
+            else if (shader.stage == PipelineShaderStage::Hull)
+              {
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+                FramePerfDurationScope legacy_shader_scope(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+                EncodeShaderBindingsForStage<PipelineStage::Hull,
+                                             PipelineKind::Tessellation>(
+                    enc, shader, key, argbuf_offset);
+              }
+            else if (shader.stage == PipelineShaderStage::Domain)
+              {
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+                FramePerfDurationScope legacy_shader_scope(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+                EncodeShaderBindingsForStage<PipelineStage::Domain,
+                                             PipelineKind::Tessellation>(
+                    enc, shader, key, argbuf_offset);
+              }
+            else if (shader.stage == PipelineShaderStage::Pixel)
+              {
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+                AddFramePerfCount(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+                FramePerfDurationScope legacy_shader_scope(
+                    perf_stats,
+                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+                EncodeShaderBindingsForStage<PipelineStage::Pixel,
+                                             PipelineKind::Tessellation>(
+                    enc, shader, key, argbuf_offset);
+              }
+          } else if (shader.stage == PipelineShaderStage::Vertex)
+            {
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+              FramePerfDurationScope legacy_shader_scope(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+              EncodeShaderBindingsForStage<PipelineStage::Vertex,
+                                           PipelineKind::Ordinary>(
+                  enc, shader, key, argbuf_offset);
+            }
+          else if (shader.stage == PipelineShaderStage::Pixel)
+            {
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
+              AddFramePerfCount(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
+              FramePerfDurationScope legacy_shader_scope(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
+              EncodeShaderBindingsForStage<PipelineStage::Pixel,
+                                           PipelineKind::Ordinary>(
+                  enc, shader, key, argbuf_offset);
+            }
+        }
       }
     }
   }
@@ -17671,6 +17933,40 @@ private:
     CompiledDirectAccessList direct_access;
   };
 
+  struct FramePerfDurationScope {
+    dxmt::FrameStatistics *stats = nullptr;
+    dxmt::clock::duration dxmt::FrameStatistics::*target = nullptr;
+    dxmt::clock::time_point start = {};
+
+    FramePerfDurationScope(
+        dxmt::FrameStatistics *stats,
+        dxmt::clock::duration dxmt::FrameStatistics::*target)
+        : stats(stats), target(target),
+          start(stats && target ? dxmt::clock::now()
+                                : dxmt::clock::time_point{}) {
+    }
+
+    ~FramePerfDurationScope() {
+      if (stats && target)
+        (stats->*target) += dxmt::clock::now() - start;
+    }
+
+    FramePerfDurationScope(const FramePerfDurationScope &) = delete;
+    FramePerfDurationScope &operator=(const FramePerfDurationScope &) = delete;
+  };
+
+  static dxmt::FrameStatistics *CompiledDrawFrameStats(
+      ArgumentEncodingContext &enc) {
+    return dxmt::perf::enabled() ? &enc.currentFrameStatistics() : nullptr;
+  }
+
+  static void AddFramePerfCount(dxmt::FrameStatistics *stats,
+                                uint64_t dxmt::FrameStatistics::*target,
+                                uint64_t count = 1) {
+    if (stats && target)
+      (stats->*target) += count;
+  }
+
 	  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
 	    common.binding_content_fingerprint =
 	        common.binding_snapshot ? common.binding_snapshot->content_fingerprint
@@ -17702,7 +17998,16 @@ private:
   void EncodeReplayDrawCommonState(ArgumentEncodingContext &enc,
                                    ReplayDrawPacketCommon &packet,
                                    uint64_t &argbuf_offset) {
-    EncodeRenderPipelineStateIfChanged(enc, packet.metal_pso);
+    auto *perf_stats = CompiledDrawFrameStats(enc);
+    FramePerfDurationScope common_scope(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_common_interval);
+    {
+      FramePerfDurationScope pipeline_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
+      EncodeRenderPipelineStateIfChanged(enc, packet.metal_pso);
+    }
     auto *render_encoder = enc.currentRenderEncoder();
     render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
         packet.pixel_shader_demote_msaa_srv_mask_lo;
@@ -17714,6 +18019,9 @@ private:
         (!cache.depth_stencil_valid ||
          cache.depth_stencil.handle != packet.depth_stencil.handle ||
          cache.stencil_ref != stencil_ref_u8)) {
+      FramePerfDurationScope dsso_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
       cmd.type = WMTRenderCommandSetDSSO;
       cmd.dsso = packet.depth_stencil;
@@ -17725,6 +18033,9 @@ private:
     if (!cache.rasterizer_valid ||
         std::memcmp(&cache.rasterizer, &packet.rasterizer,
                     sizeof(packet.rasterizer)) != 0) {
+      FramePerfDurationScope rasterizer_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = packet.rasterizer;
       cache.rasterizer = packet.rasterizer;
@@ -17732,44 +18043,80 @@ private:
     }
 
     auto &binding_cache = render_encoder->binding_state_cache;
-    const bool generation_hit =
-        binding_cache.valid &&
-        binding_cache.graphics_generation == packet.binding_generation &&
-        binding_cache.descriptor_content_generation ==
-            packet.descriptor_content_generation &&
-        binding_cache.content_fingerprint == packet.binding_content_fingerprint;
-    const bool fingerprint_hit =
-        binding_cache.valid && !generation_hit &&
-        binding_cache.content_fingerprint == packet.binding_content_fingerprint;
-    const bool bindless_snapshot =
-        packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
-        packet.binding_snapshot && packet.binding_snapshot->bindless &&
-        !packet.use_geometry &&
-        !packet.use_tessellation;
-    if (D3D12DiagBindingRecipeCacheEnabled()) {
-      auto &stats = BindingRecipeDiagStats();
-      if (generation_hit)
-        stats.gate_generation_hits.fetch_add(1, std::memory_order_relaxed);
-      else if (fingerprint_hit)
-        stats.gate_fingerprint_hits.fetch_add(1, std::memory_order_relaxed);
-      else
-        stats.gate_misses.fetch_add(1, std::memory_order_relaxed);
-    }
+    bool generation_hit = false;
+    bool fingerprint_hit = false;
+    bool bindless_snapshot = false;
     BindlessMirrorDrawDiag bindless_diag = {};
-    bindless_diag.uses_bindless_mirror =
-        packet.pipeline && packet.pipeline->UsesBindlessMirror();
+    bool restored_legacy_argbuf = false;
+    bool skip_binding_snapshot = false;
+    {
+      FramePerfDurationScope binding_gate_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_binding_gate_interval);
+      generation_hit =
+          binding_cache.valid &&
+          binding_cache.graphics_generation == packet.binding_generation &&
+          binding_cache.descriptor_content_generation ==
+              packet.descriptor_content_generation &&
+          binding_cache.content_fingerprint ==
+              packet.binding_content_fingerprint;
+      fingerprint_hit =
+          binding_cache.valid && !generation_hit &&
+          binding_cache.content_fingerprint ==
+              packet.binding_content_fingerprint;
+      bindless_snapshot =
+          packet.pipeline && packet.pipeline->UsesBindlessMirror() &&
+          packet.binding_snapshot && packet.binding_snapshot->bindless &&
+          !packet.use_geometry &&
+          !packet.use_tessellation;
+      if (D3D12DiagBindingRecipeCacheEnabled()) {
+        auto &stats = BindingRecipeDiagStats();
+        if (generation_hit)
+          stats.gate_generation_hits.fetch_add(1, std::memory_order_relaxed);
+        else if (fingerprint_hit)
+          stats.gate_fingerprint_hits.fetch_add(1, std::memory_order_relaxed);
+        else
+          stats.gate_misses.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (generation_hit)
+        AddFramePerfCount(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_draw_binding_generation_hits);
+      else if (fingerprint_hit)
+        AddFramePerfCount(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_draw_binding_fingerprint_hits);
+      else
+        AddFramePerfCount(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_draw_binding_misses);
+      bindless_diag.uses_bindless_mirror =
+          packet.pipeline && packet.pipeline->UsesBindlessMirror();
 	    bindless_diag.bindless_bound =
 	        packet.binding_snapshot && packet.binding_snapshot->bindless &&
 	        !packet.use_geometry && !packet.use_tessellation;
-    bindless_diag.path =
-        BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
-                                   true);
-    bool restored_legacy_argbuf = false;
-    if (!bindless_diag.bindless_bound && DescriptorMirrorRuntimeEnabled())
-      restored_legacy_argbuf = enc.restorePerPassArgbufIfMirrorBound<false>();
-    const bool skip_binding_snapshot =
-        !bindless_snapshot && !restored_legacy_argbuf &&
-        (generation_hit || fingerprint_hit);
+      bindless_diag.path =
+          BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
+                                     true);
+      if (!bindless_diag.bindless_bound && DescriptorMirrorRuntimeEnabled()) {
+        FramePerfDurationScope restore_argbuf_scope(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_snapshot_restore_argbuf_interval);
+        restored_legacy_argbuf =
+            enc.restorePerPassArgbufIfMirrorBound<false>();
+        if (restored_legacy_argbuf)
+          AddFramePerfCount(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_argbuf_restores);
+      }
+      skip_binding_snapshot =
+          !bindless_snapshot && !restored_legacy_argbuf &&
+          (generation_hit || fingerprint_hit);
+      if (skip_binding_snapshot)
+        AddFramePerfCount(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_skipped);
+    }
     if (!skip_binding_snapshot && packet.pipeline &&
                packet.binding_snapshot) {
 	      ApplyGraphicsBindingSnapshot(enc, *packet.binding_snapshot,
@@ -17785,8 +18132,13 @@ private:
       binding_cache.content_fingerprint = packet.binding_content_fingerprint;
       binding_cache.valid = true;
     }
-    EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
-                             packet.blend_factor, packet.stencil_ref);
+    {
+      FramePerfDurationScope dynamic_state_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
+      EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
+                               packet.blend_factor, packet.stencil_ref);
+    }
   }
 
   static Rc<VisibilityResultQuery> BeginReplayDrawVisibilityQuery(
@@ -17812,107 +18164,134 @@ private:
   void EncodeReplayDrawInstancedPacket(ArgumentEncodingContext &enc,
                                        ReplayDrawInstancedPacket &packet,
                                        uint64_t &argbuf_offset) {
+    auto *perf_stats = CompiledDrawFrameStats(enc);
+    FramePerfDurationScope replay_scope(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
+    AddFramePerfCount(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
+    AddFramePerfCount(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
+
     auto &common = packet.common;
     EncodeReplayDrawCommonState(enc, common, argbuf_offset);
 
-    auto active_visibility_query =
-        BeginReplayDrawVisibilityQuery(enc, common.visibility_query);
+    Rc<VisibilityResultQuery> active_visibility_query;
+    {
+      FramePerfDurationScope visibility_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
+      active_visibility_query =
+          BeginReplayDrawVisibilityQuery(enc, common.visibility_query);
+    }
 
-    if (common.use_tessellation) {
-      auto *render_encoder = enc.currentRenderEncoder();
-      render_encoder->use_tessellation = 1;
-      enc.tess_num_output_control_point_element =
-          common.tess_num_output_control_point_element;
-      enc.tess_threads_per_patch = common.tess_threads_per_patch;
-      if (!common.tess_threads_per_patch || !common.control_point_count) {
-        WARN("D3D12CommandQueue: tessellation draw skipped because tessellation metadata is invalid");
-        return;
-      }
+    {
+      FramePerfDurationScope body_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
+      if (common.use_tessellation) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_tessellation = 1;
+        enc.tess_num_output_control_point_element =
+            common.tess_num_output_control_point_element;
+        enc.tess_threads_per_patch = common.tess_threads_per_patch;
+        if (!common.tess_threads_per_patch || !common.control_point_count) {
+          WARN("D3D12CommandQueue: tessellation draw skipped because tessellation metadata is invalid");
+          return;
+        }
 
-      const auto patch_count_per_instance =
-          packet.vertex_count / *common.control_point_count;
-      if (!patch_count_per_instance)
-        return;
-      const auto patch_per_group = 32u / common.tess_threads_per_patch;
-      if (!patch_per_group) {
-        WARN("D3D12CommandQueue: tessellation draw skipped because threads-per-patch is unsupported value=",
-             common.tess_threads_per_patch);
-        return;
-      }
-      const auto patch_per_mesh_instance =
-          (patch_count_per_instance - 1u) / patch_per_group + 1u;
-      if (uint64_t(patch_per_mesh_instance) * packet.instance_count >
-          common.max_object_threadgroups) {
-        WARN("D3D12CommandQueue: omitted tessellation draw because of too many object threadgroups patch_groups=",
-             patch_per_mesh_instance, " instance_count=", packet.instance_count);
-        return;
-      }
+        const auto patch_count_per_instance =
+            packet.vertex_count / *common.control_point_count;
+        if (!patch_count_per_instance)
+          return;
+        const auto patch_per_group = 32u / common.tess_threads_per_patch;
+        if (!patch_per_group) {
+          WARN("D3D12CommandQueue: tessellation draw skipped because threads-per-patch is unsupported value=",
+               common.tess_threads_per_patch);
+          return;
+        }
+        const auto patch_per_mesh_instance =
+            (patch_count_per_instance - 1u) / patch_per_group + 1u;
+        if (uint64_t(patch_per_mesh_instance) * packet.instance_count >
+            common.max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted tessellation draw because of too many object threadgroups patch_groups=",
+               patch_per_mesh_instance, " instance_count=", packet.instance_count);
+          return;
+        }
 
-      const auto draw_arguments_offset =
-          AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
-      auto *draw_argument =
-          enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
-              draw_arguments_offset);
-      draw_argument->StartVertex = packet.vertex_start;
-      draw_argument->VertexCount = packet.vertex_count;
-      draw_argument->InstanceCount = packet.instance_count;
-      draw_argument->StartInstance = packet.base_instance;
+        const auto draw_arguments_offset =
+            AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->StartVertex = packet.vertex_start;
+        draw_argument->VertexCount = packet.vertex_count;
+        draw_argument->InstanceCount = packet.instance_count;
+        draw_argument->StartInstance = packet.base_instance;
 
-      enc.resolveRenderPassBarrier();
-      auto &draw =
-          enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-      draw.type = WMTRenderCommandDXMTTessellationMeshDraw;
-      draw.draw_arguments_offset =
-          enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      draw.instance_count = packet.instance_count;
-      draw.threads_per_patch = common.tess_threads_per_patch;
-      draw.patch_per_group = patch_per_group;
-      draw.patch_per_mesh_instance = patch_per_mesh_instance;
-    } else if (common.use_geometry) {
-      auto *render_encoder = enc.currentRenderEncoder();
-      render_encoder->use_geometry = 1;
-      const auto draw_arguments_offset =
-          AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
-      auto *draw_argument =
-          enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
-              draw_arguments_offset);
-      draw_argument->StartVertex = packet.vertex_start;
-      draw_argument->VertexCount = packet.vertex_count;
-      draw_argument->InstanceCount = packet.instance_count;
-      draw_argument->StartInstance = packet.base_instance;
-
-      auto [vertex_per_warp, vertex_increment_per_warp] =
-          *common.geometry_counts;
-      const auto warp_count =
-          (packet.vertex_count - 1) / vertex_increment_per_warp + 1;
-      if (uint64_t(warp_count) * packet.instance_count >
-          common.max_object_threadgroups) {
-        WARN("D3D12CommandQueue: omitted geometry draw because of too many object threadgroups warp_count=",
-             warp_count, " instance_count=", packet.instance_count);
-      } else {
         enc.resolveRenderPassBarrier();
         auto &draw =
-            enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-        draw.type = WMTRenderCommandDXMTGeometryDraw;
+            enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
+        draw.type = WMTRenderCommandDXMTTessellationMeshDraw;
         draw.draw_arguments_offset =
             enc.getFinalArgumentBufferOffset(draw_arguments_offset);
         draw.instance_count = packet.instance_count;
-        draw.warp_count = warp_count;
-        draw.vertex_per_warp = vertex_per_warp;
-      }
-    } else {
-      enc.resolveRenderPassBarrier();
-      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
-      draw.type = WMTRenderCommandDraw;
-      draw.primitive_type = *common.primitive;
-      draw.vertex_start = packet.vertex_start;
-      draw.vertex_count = packet.vertex_count;
-      draw.instance_count = packet.instance_count;
-      draw.base_instance = packet.base_instance;
-    }
-    RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
+        draw.threads_per_patch = common.tess_threads_per_patch;
+        draw.patch_per_group = patch_per_group;
+        draw.patch_per_mesh_instance = patch_per_mesh_instance;
+      } else if (common.use_geometry) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_geometry = 1;
+        const auto draw_arguments_offset =
+            AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->StartVertex = packet.vertex_start;
+        draw_argument->VertexCount = packet.vertex_count;
+        draw_argument->InstanceCount = packet.instance_count;
+        draw_argument->StartInstance = packet.base_instance;
 
-    EndReplayDrawVisibilityQuery(enc, active_visibility_query);
+        auto [vertex_per_warp, vertex_increment_per_warp] =
+            *common.geometry_counts;
+        const auto warp_count =
+            (packet.vertex_count - 1) / vertex_increment_per_warp + 1;
+        if (uint64_t(warp_count) * packet.instance_count >
+            common.max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted geometry draw because of too many object threadgroups warp_count=",
+               warp_count, " instance_count=", packet.instance_count);
+        } else {
+          enc.resolveRenderPassBarrier();
+          auto &draw =
+              enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
+          draw.type = WMTRenderCommandDXMTGeometryDraw;
+          draw.draw_arguments_offset =
+              enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+          draw.instance_count = packet.instance_count;
+          draw.warp_count = warp_count;
+          draw.vertex_per_warp = vertex_per_warp;
+        }
+      } else {
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+        draw.type = WMTRenderCommandDraw;
+        draw.primitive_type = *common.primitive;
+        draw.vertex_start = packet.vertex_start;
+        draw.vertex_count = packet.vertex_count;
+        draw.instance_count = packet.instance_count;
+        draw.base_instance = packet.base_instance;
+      }
+      RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
+    }
+
+    {
+      FramePerfDurationScope visibility_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
+      EndReplayDrawVisibilityQuery(enc, active_visibility_query);
+    }
   }
 
   static void EncodeReplayDrawInstancedCompiled(
@@ -17925,118 +18304,150 @@ private:
   void EncodeReplayDrawIndexedInstancedPacket(
       ArgumentEncodingContext &enc, ReplayDrawIndexedInstancedPacket &packet,
       uint64_t &argbuf_offset) {
-    enc.retainAllocation(packet.index_allocation.ptr());
+    auto *perf_stats = CompiledDrawFrameStats(enc);
+    FramePerfDurationScope replay_scope(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
+    AddFramePerfCount(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
+    AddFramePerfCount(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets);
+
+    {
+      FramePerfDurationScope retain_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
+      enc.retainAllocation(packet.index_allocation.ptr());
+    }
 
     auto &common = packet.common;
     EncodeReplayDrawCommonState(enc, common, argbuf_offset);
 
-    auto active_visibility_query =
-        BeginReplayDrawVisibilityQuery(enc, common.visibility_query);
+    Rc<VisibilityResultQuery> active_visibility_query;
+    {
+      FramePerfDurationScope visibility_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
+      active_visibility_query =
+          BeginReplayDrawVisibilityQuery(enc, common.visibility_query);
+    }
 
-    if (common.use_tessellation) {
-      auto *render_encoder = enc.currentRenderEncoder();
-      render_encoder->use_tessellation = 1;
-      enc.tess_num_output_control_point_element =
-          common.tess_num_output_control_point_element;
-      enc.tess_threads_per_patch = common.tess_threads_per_patch;
-      if (!common.tess_threads_per_patch || !common.control_point_count) {
-        WARN("D3D12CommandQueue: tessellation indexed draw skipped because tessellation metadata is invalid");
-        return;
-      }
+    {
+      FramePerfDurationScope body_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
+      if (common.use_tessellation) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_tessellation = 1;
+        enc.tess_num_output_control_point_element =
+            common.tess_num_output_control_point_element;
+        enc.tess_threads_per_patch = common.tess_threads_per_patch;
+        if (!common.tess_threads_per_patch || !common.control_point_count) {
+          WARN("D3D12CommandQueue: tessellation indexed draw skipped because tessellation metadata is invalid");
+          return;
+        }
 
-      const auto patch_count_per_instance =
-          packet.index_count / *common.control_point_count;
-      if (!patch_count_per_instance)
-        return;
-      const auto patch_per_group = 32u / common.tess_threads_per_patch;
-      if (!patch_per_group) {
-        WARN("D3D12CommandQueue: tessellation indexed draw skipped because threads-per-patch is unsupported value=",
-             common.tess_threads_per_patch);
-        return;
-      }
-      const auto patch_per_mesh_instance =
-          (patch_count_per_instance - 1u) / patch_per_group + 1u;
-      if (uint64_t(patch_per_mesh_instance) * packet.instance_count >
-          common.max_object_threadgroups) {
-        WARN("D3D12CommandQueue: omitted tessellation indexed draw because of too many object threadgroups patch_groups=",
-             patch_per_mesh_instance, " instance_count=", packet.instance_count);
-        return;
-      }
+        const auto patch_count_per_instance =
+            packet.index_count / *common.control_point_count;
+        if (!patch_count_per_instance)
+          return;
+        const auto patch_per_group = 32u / common.tess_threads_per_patch;
+        if (!patch_per_group) {
+          WARN("D3D12CommandQueue: tessellation indexed draw skipped because threads-per-patch is unsupported value=",
+               common.tess_threads_per_patch);
+          return;
+        }
+        const auto patch_per_mesh_instance =
+            (patch_count_per_instance - 1u) / patch_per_group + 1u;
+        if (uint64_t(patch_per_mesh_instance) * packet.instance_count >
+            common.max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted tessellation indexed draw because of too many object threadgroups patch_groups=",
+               patch_per_mesh_instance, " instance_count=", packet.instance_count);
+          return;
+        }
 
-      const auto draw_arguments_offset = AllocateArgumentBuffer(
-          argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
-      auto *draw_argument =
-          enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
-              draw_arguments_offset);
-      draw_argument->BaseVertex = packet.base_vertex;
-      draw_argument->IndexCount = packet.index_count;
-      draw_argument->StartIndex = packet.start_index;
-      draw_argument->InstanceCount = packet.instance_count;
-      draw_argument->StartInstance = packet.base_instance;
+        const auto draw_arguments_offset = AllocateArgumentBuffer(
+            argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->BaseVertex = packet.base_vertex;
+        draw_argument->IndexCount = packet.index_count;
+        draw_argument->StartIndex = packet.start_index;
+        draw_argument->InstanceCount = packet.instance_count;
+        draw_argument->StartInstance = packet.base_instance;
 
-      enc.resolveRenderPassBarrier();
-      auto &draw = enc.encodeRenderCommand<
-          wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-      draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
-      draw.draw_arguments_offset =
-          enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      draw.index_buffer = packet.index_allocation->buffer();
-      draw.index_buffer_offset = packet.index_binding_offset;
-      draw.instance_count = packet.instance_count;
-      draw.threads_per_patch = common.tess_threads_per_patch;
-      draw.patch_per_group = patch_per_group;
-      draw.patch_per_mesh_instance = patch_per_mesh_instance;
-    } else if (common.use_geometry) {
-      auto *render_encoder = enc.currentRenderEncoder();
-      render_encoder->use_geometry = 1;
-      const auto draw_arguments_offset = AllocateArgumentBuffer(
-          argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
-      auto *draw_argument =
-          enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
-              draw_arguments_offset);
-      draw_argument->BaseVertex = packet.base_vertex;
-      draw_argument->IndexCount = packet.index_count;
-      draw_argument->StartIndex = packet.start_index;
-      draw_argument->InstanceCount = packet.instance_count;
-      draw_argument->StartInstance = packet.base_instance;
-
-      auto [vertex_per_warp, vertex_increment_per_warp] =
-          *common.geometry_counts;
-      const auto warp_count =
-          (packet.index_count - 1) / vertex_increment_per_warp + 1;
-      if (uint64_t(warp_count) * packet.instance_count >
-          common.max_object_threadgroups) {
-        WARN("D3D12CommandQueue: omitted geometry indexed draw because of too many object threadgroups warp_count=",
-             warp_count, " instance_count=", packet.instance_count);
-      } else {
         enc.resolveRenderPassBarrier();
-        auto &draw =
-            enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
-        draw.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+        auto &draw = enc.encodeRenderCommand<
+            wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
+        draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
         draw.draw_arguments_offset =
             enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-        draw.instance_count = packet.instance_count;
-        draw.warp_count = warp_count;
-        draw.vertex_per_warp = vertex_per_warp;
         draw.index_buffer = packet.index_allocation->buffer();
         draw.index_buffer_offset = packet.index_binding_offset;
-      }
-    } else {
-      enc.resolveRenderPassBarrier();
-      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
-      draw.type = WMTRenderCommandDrawIndexed;
-      draw.primitive_type = *common.primitive;
-      draw.index_type = packet.index_type;
-      draw.index_count = packet.index_count;
-      draw.index_buffer = packet.index_allocation->buffer();
-      draw.index_buffer_offset = packet.index_offset;
-      draw.instance_count = packet.instance_count;
-      draw.base_vertex = packet.base_vertex;
-      draw.base_instance = packet.base_instance;
-    }
-    RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
+        draw.instance_count = packet.instance_count;
+        draw.threads_per_patch = common.tess_threads_per_patch;
+        draw.patch_per_group = patch_per_group;
+        draw.patch_per_mesh_instance = patch_per_mesh_instance;
+      } else if (common.use_geometry) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_geometry = 1;
+        const auto draw_arguments_offset = AllocateArgumentBuffer(
+            argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->BaseVertex = packet.base_vertex;
+        draw_argument->IndexCount = packet.index_count;
+        draw_argument->StartIndex = packet.start_index;
+        draw_argument->InstanceCount = packet.instance_count;
+        draw_argument->StartInstance = packet.base_instance;
 
-    EndReplayDrawVisibilityQuery(enc, active_visibility_query);
+        auto [vertex_per_warp, vertex_increment_per_warp] =
+            *common.geometry_counts;
+        const auto warp_count =
+            (packet.index_count - 1) / vertex_increment_per_warp + 1;
+        if (uint64_t(warp_count) * packet.instance_count >
+            common.max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted geometry indexed draw because of too many object threadgroups warp_count=",
+               warp_count, " instance_count=", packet.instance_count);
+        } else {
+          enc.resolveRenderPassBarrier();
+          auto &draw =
+              enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
+          draw.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+          draw.draw_arguments_offset =
+              enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+          draw.instance_count = packet.instance_count;
+          draw.warp_count = warp_count;
+          draw.vertex_per_warp = vertex_per_warp;
+          draw.index_buffer = packet.index_allocation->buffer();
+          draw.index_buffer_offset = packet.index_binding_offset;
+        }
+      } else {
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
+        draw.type = WMTRenderCommandDrawIndexed;
+        draw.primitive_type = *common.primitive;
+        draw.index_type = packet.index_type;
+        draw.index_count = packet.index_count;
+        draw.index_buffer = packet.index_allocation->buffer();
+        draw.index_buffer_offset = packet.index_offset;
+        draw.instance_count = packet.instance_count;
+        draw.base_vertex = packet.base_vertex;
+        draw.base_instance = packet.base_instance;
+      }
+      RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
+    }
+
+    {
+      FramePerfDurationScope visibility_scope(
+          perf_stats,
+          &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
+      EndReplayDrawVisibilityQuery(enc, active_visibility_query);
+    }
   }
 
   static void EncodeReplayDrawIndexedInstancedCompiled(

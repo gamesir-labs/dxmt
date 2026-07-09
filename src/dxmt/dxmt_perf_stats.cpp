@@ -875,6 +875,56 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_compiled_pass_build_interval);
   const auto compiled_draw_encode_us =
       durationUs(frame_stats.frame_compiled_draw_encode_interval);
+  const auto compiled_draw_direct_encode_us =
+      durationUs(frame_stats.frame_compiled_draw_direct_encode_interval);
+  const auto compiled_draw_replay_encode_us =
+      durationUs(frame_stats.frame_compiled_draw_replay_encode_interval);
+  const auto compiled_draw_common_us =
+      durationUs(frame_stats.frame_compiled_draw_common_interval);
+  const auto compiled_draw_retain_us =
+      durationUs(frame_stats.frame_compiled_draw_retain_interval);
+  const auto compiled_draw_pipeline_us =
+      durationUs(frame_stats.frame_compiled_draw_pipeline_interval);
+  const auto compiled_draw_dsso_us =
+      durationUs(frame_stats.frame_compiled_draw_dsso_interval);
+  const auto compiled_draw_rasterizer_us =
+      durationUs(frame_stats.frame_compiled_draw_rasterizer_interval);
+  const auto compiled_draw_binding_gate_us =
+      durationUs(frame_stats.frame_compiled_draw_binding_gate_interval);
+  const auto compiled_draw_binding_snapshot_us =
+      durationUs(frame_stats.frame_compiled_draw_binding_snapshot_interval);
+  const auto compiled_draw_dynamic_state_us =
+      durationUs(frame_stats.frame_compiled_draw_dynamic_state_interval);
+  const auto compiled_draw_visibility_us =
+      durationUs(frame_stats.frame_compiled_draw_visibility_interval);
+  const auto compiled_draw_body_us =
+      durationUs(frame_stats.frame_compiled_draw_body_interval);
+  const auto compiled_snapshot_static_samplers_us =
+      durationUs(frame_stats.frame_compiled_snapshot_static_samplers_interval);
+  const auto compiled_snapshot_entries_us =
+      durationUs(frame_stats.frame_compiled_snapshot_entries_interval);
+  const auto compiled_snapshot_root_constants_us =
+      durationUs(frame_stats.frame_compiled_snapshot_root_constants_interval);
+  const auto compiled_snapshot_descriptors_us =
+      durationUs(frame_stats.frame_compiled_snapshot_descriptors_interval);
+  const auto compiled_snapshot_clear_descriptors_us =
+      durationUs(frame_stats.frame_compiled_snapshot_clear_descriptors_interval);
+  const auto compiled_snapshot_bindless_fill_us =
+      durationUs(frame_stats.frame_compiled_snapshot_bindless_fill_interval);
+  const auto compiled_snapshot_vertex_buffers_us =
+      durationUs(frame_stats.frame_compiled_snapshot_vertex_buffers_interval);
+  const auto compiled_snapshot_vertex_table_us =
+      durationUs(frame_stats.frame_compiled_snapshot_vertex_table_interval);
+  const auto compiled_snapshot_restore_argbuf_us =
+      durationUs(frame_stats.frame_compiled_snapshot_restore_argbuf_interval);
+  const auto compiled_snapshot_shader_bindings_us =
+      durationUs(frame_stats.frame_compiled_snapshot_shader_bindings_interval);
+  const auto compiled_snapshot_bindless_shader_bindings_us =
+      durationUs(
+          frame_stats.frame_compiled_snapshot_bindless_shader_bindings_interval);
+  const auto compiled_snapshot_legacy_shader_bindings_us =
+      durationUs(
+          frame_stats.frame_compiled_snapshot_legacy_shader_bindings_interval);
   const auto compiled_dispatch_encode_us =
       durationUs(frame_stats.frame_compiled_dispatch_encode_interval);
   const auto argument_table_update_us =
@@ -1185,6 +1235,47 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   frame_stats.frame_replay_record_temporal_upscale_count,
                   " compiledPassBuildUs=", compiled_pass_build_us,
                   " compiledDrawEncodeUs=", compiled_draw_encode_us,
+                  " compiledDrawDirectEncodeUs=",
+                  compiled_draw_direct_encode_us,
+                  " compiledDrawReplayEncodeUs=",
+                  compiled_draw_replay_encode_us,
+                  " compiledDrawCommonUs=", compiled_draw_common_us,
+                  " compiledDrawRetainUs=", compiled_draw_retain_us,
+                  " compiledDrawPipelineUs=", compiled_draw_pipeline_us,
+                  " compiledDrawDssoUs=", compiled_draw_dsso_us,
+                  " compiledDrawRasterizerUs=", compiled_draw_rasterizer_us,
+                  " compiledDrawBindingGateUs=",
+                  compiled_draw_binding_gate_us,
+                  " compiledDrawBindingSnapshotUs=",
+                  compiled_draw_binding_snapshot_us,
+                  " compiledDrawDynamicStateUs=",
+                  compiled_draw_dynamic_state_us,
+                  " compiledDrawVisibilityUs=", compiled_draw_visibility_us,
+                  " compiledDrawBodyUs=", compiled_draw_body_us,
+                  " compiledSnapshotStaticSamplersUs=",
+                  compiled_snapshot_static_samplers_us,
+                  " compiledSnapshotEntriesUs=",
+                  compiled_snapshot_entries_us,
+                  " compiledSnapshotRootConstantsUs=",
+                  compiled_snapshot_root_constants_us,
+                  " compiledSnapshotDescriptorsUs=",
+                  compiled_snapshot_descriptors_us,
+                  " compiledSnapshotClearDescriptorsUs=",
+                  compiled_snapshot_clear_descriptors_us,
+                  " compiledSnapshotBindlessFillUs=",
+                  compiled_snapshot_bindless_fill_us,
+                  " compiledSnapshotVertexBuffersUs=",
+                  compiled_snapshot_vertex_buffers_us,
+                  " compiledSnapshotVertexTableUs=",
+                  compiled_snapshot_vertex_table_us,
+                  " compiledSnapshotRestoreArgbufUs=",
+                  compiled_snapshot_restore_argbuf_us,
+                  " compiledSnapshotShaderBindingsUs=",
+                  compiled_snapshot_shader_bindings_us,
+                  " compiledSnapshotBindlessShaderBindingsUs=",
+                  compiled_snapshot_bindless_shader_bindings_us,
+                  " compiledSnapshotLegacyShaderBindingsUs=",
+                  compiled_snapshot_legacy_shader_bindings_us,
                   " compiledDispatchEncodeUs=",
                   compiled_dispatch_encode_us,
                   " argumentTableUpdateUs=", argument_table_update_us,
@@ -1195,6 +1286,44 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " psoCompileWaitUs=", pso_compile_wait_us,
                   " compiledGraphicsPackets=",
                   frame_stats.frame_compiled_graphics_packets,
+                  " compiledDrawDirectPackets=",
+                  frame_stats.frame_compiled_draw_direct_packets,
+                  " compiledDrawReplayPackets=",
+                  frame_stats.frame_compiled_draw_replay_packets,
+                  " compiledDrawIndexedPackets=",
+                  frame_stats.frame_compiled_draw_indexed_packets,
+                  " compiledDrawNonIndexedPackets=",
+                  frame_stats.frame_compiled_draw_nonindexed_packets,
+                  " compiledDrawSnapshotApplied=",
+                  frame_stats.frame_compiled_draw_binding_snapshot_applied,
+                  " compiledDrawSnapshotSkipped=",
+                  frame_stats.frame_compiled_draw_binding_snapshot_skipped,
+                  " compiledDrawBindingGenerationHits=",
+                  frame_stats.frame_compiled_draw_binding_generation_hits,
+                  " compiledDrawBindingFingerprintHits=",
+                  frame_stats.frame_compiled_draw_binding_fingerprint_hits,
+                  " compiledDrawBindingMisses=",
+                  frame_stats.frame_compiled_draw_binding_misses,
+                  " compiledSnapshotEntries=",
+                  frame_stats.frame_compiled_snapshot_entries,
+                  " compiledSnapshotRootConstants=",
+                  frame_stats.frame_compiled_snapshot_root_constants,
+                  " compiledSnapshotDescriptors=",
+                  frame_stats.frame_compiled_snapshot_descriptors,
+                  " compiledSnapshotClearDescriptors=",
+                  frame_stats.frame_compiled_snapshot_clear_descriptors,
+                  " compiledSnapshotBindlessFills=",
+                  frame_stats.frame_compiled_snapshot_bindless_fills,
+                  " compiledSnapshotVertexBuffers=",
+                  frame_stats.frame_compiled_snapshot_vertex_buffers,
+                  " compiledSnapshotShaderBindings=",
+                  frame_stats.frame_compiled_snapshot_shader_bindings,
+                  " compiledSnapshotBindlessShaderBindings=",
+                  frame_stats.frame_compiled_snapshot_bindless_shader_bindings,
+                  " compiledSnapshotLegacyShaderBindings=",
+                  frame_stats.frame_compiled_snapshot_legacy_shader_bindings,
+                  " compiledSnapshotLegacyArgbufRestores=",
+                  frame_stats.frame_compiled_snapshot_legacy_argbuf_restores,
                   " fallbackGraphicsPackets=",
                   frame_stats.frame_fallback_graphics_packets,
                   " compiledComputePackets=",
