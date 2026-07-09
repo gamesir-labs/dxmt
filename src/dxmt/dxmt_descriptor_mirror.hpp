@@ -23,7 +23,7 @@
  *
  * The qword layout below mirrors exactly what encodeShaderResources writes into
  * typed Metal argument-buffer entries via arg.StructurePtrOffset:
- *   - texture: [0]=gpuResourceID, [1]=TextureMetadata(arrayLength, minLOD=0)
+ *   - texture: [0]=gpuResourceID, [1]=TextureMetadata(arrayLength, minLOD)
  *   - sampler: [0]=sampler_state_handle, [1]=sampler_state_cube_handle,
  *              [2]=lod_bias (f32 bits in low 32)
  */
@@ -46,9 +46,10 @@ MirrorTextureMetadata(uint32_t array_length, float min_lod) {
  * in the legacy path, or mirror.textures + slot*kMirrorTextureQwords in the mirror).
  */
 inline void
-EncodeMirrorTextureSlot(uint64_t *dst, uint64_t gpu_resource_id, uint32_t array_length) {
+EncodeMirrorTextureSlot(uint64_t *dst, uint64_t gpu_resource_id,
+                        uint32_t array_length, float min_lod = 0.0f) {
   dst[0] = gpu_resource_id;
-  dst[1] = MirrorTextureMetadata(array_length, 0);
+  dst[1] = MirrorTextureMetadata(array_length, min_lod);
 }
 
 /**

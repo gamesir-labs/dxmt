@@ -337,6 +337,10 @@ struct FrameStatistics {
   uint64_t frame_compiled_snapshot_descriptors = 0;
   uint64_t frame_compiled_snapshot_clear_descriptors = 0;
   uint64_t frame_compiled_snapshot_bindless_fills = 0;
+  uint64_t frame_compiled_snapshot_bindless_fill_texture = 0;
+  uint64_t frame_compiled_snapshot_bindless_fill_sampler = 0;
+  uint64_t frame_compiled_snapshot_bindless_fill_texture_buffer = 0;
+  uint64_t frame_compiled_snapshot_bindless_fill_null = 0;
   uint64_t frame_compiled_snapshot_vertex_buffers = 0;
   uint64_t frame_compiled_snapshot_shader_bindings = 0;
   uint64_t frame_compiled_snapshot_bindless_shader_bindings = 0;
@@ -667,6 +671,10 @@ struct FrameStatistics {
     frame_compiled_snapshot_descriptors = 0;
     frame_compiled_snapshot_clear_descriptors = 0;
     frame_compiled_snapshot_bindless_fills = 0;
+    frame_compiled_snapshot_bindless_fill_texture = 0;
+    frame_compiled_snapshot_bindless_fill_sampler = 0;
+    frame_compiled_snapshot_bindless_fill_texture_buffer = 0;
+    frame_compiled_snapshot_bindless_fill_null = 0;
     frame_compiled_snapshot_vertex_buffers = 0;
     frame_compiled_snapshot_shader_bindings = 0;
     frame_compiled_snapshot_bindless_shader_bindings = 0;
@@ -1046,6 +1054,10 @@ public:
       average_.frame_compiled_snapshot_descriptors += frames_[i].frame_compiled_snapshot_descriptors;
       average_.frame_compiled_snapshot_clear_descriptors += frames_[i].frame_compiled_snapshot_clear_descriptors;
       average_.frame_compiled_snapshot_bindless_fills += frames_[i].frame_compiled_snapshot_bindless_fills;
+      average_.frame_compiled_snapshot_bindless_fill_texture += frames_[i].frame_compiled_snapshot_bindless_fill_texture;
+      average_.frame_compiled_snapshot_bindless_fill_sampler += frames_[i].frame_compiled_snapshot_bindless_fill_sampler;
+      average_.frame_compiled_snapshot_bindless_fill_texture_buffer += frames_[i].frame_compiled_snapshot_bindless_fill_texture_buffer;
+      average_.frame_compiled_snapshot_bindless_fill_null += frames_[i].frame_compiled_snapshot_bindless_fill_null;
       average_.frame_compiled_snapshot_vertex_buffers += frames_[i].frame_compiled_snapshot_vertex_buffers;
       average_.frame_compiled_snapshot_shader_bindings += frames_[i].frame_compiled_snapshot_shader_bindings;
       average_.frame_compiled_snapshot_bindless_shader_bindings += frames_[i].frame_compiled_snapshot_bindless_shader_bindings;
@@ -1358,6 +1370,10 @@ public:
     average_.frame_compiled_snapshot_descriptors /= (kFrameStatisticsCount - 1);
     average_.frame_compiled_snapshot_clear_descriptors /= (kFrameStatisticsCount - 1);
     average_.frame_compiled_snapshot_bindless_fills /= (kFrameStatisticsCount - 1);
+    average_.frame_compiled_snapshot_bindless_fill_texture /= (kFrameStatisticsCount - 1);
+    average_.frame_compiled_snapshot_bindless_fill_sampler /= (kFrameStatisticsCount - 1);
+    average_.frame_compiled_snapshot_bindless_fill_texture_buffer /= (kFrameStatisticsCount - 1);
+    average_.frame_compiled_snapshot_bindless_fill_null /= (kFrameStatisticsCount - 1);
     average_.frame_compiled_snapshot_vertex_buffers /= (kFrameStatisticsCount - 1);
     average_.frame_compiled_snapshot_shader_bindings /= (kFrameStatisticsCount - 1);
     average_.frame_compiled_snapshot_bindless_shader_bindings /= (kFrameStatisticsCount - 1);

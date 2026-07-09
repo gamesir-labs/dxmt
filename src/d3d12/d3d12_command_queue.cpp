@@ -12405,19 +12405,9 @@ private:
   }
 
   /**
-   * Bindless-mirror (sub-step ②/③ seam): resolve a stale descriptor's texture/sampler
-   * payload and write it into the persistent mirror, ON THE ENCODE THREAD. This is the
-   * fill entry the device write path (MarkDescriptorMirrorStaleForWrite) defers to.
-   *
-   * DORMANT in ②: defined but not yet called from any draw/replay path. Sub-step ③ will
-   * invoke it during the descriptor-table walk (once per stale slot per generation,
-   * NOT per draw) before binding the mirror at slot 30.
-   *
-   * Byte-identity: textures resolve gpuResourceID via the same CreateShaderResource
-   * TextureView() the draw path uses, and write through the shared EncodeMirror* writers;
-   * samplers reuse CreateD3D12Sampler() + the encoder's dummy sampler handle. Only the slot
-   * location differs from the legacy packed encode. Buffers are intentionally NOT handled
-   * (hybrid ABI: they live in a per-draw buffer table owned by ③).
+   * Bindless mirror deferred fill path. Ordinary texture/sampler/null descriptors are
+   * materialized at descriptor write time; only typed texture-buffer views and fallback
+   * repairs should arrive here as actual writes.
    */
   static bool BindlessMirrorVerifyEnabled() {
     return false;
@@ -12481,38 +12471,55 @@ private:
                                     enc.dummySamplerHandle(), stage, arg);
   }
 
-  void FillBindlessMirrorSlot(ArgumentEncodingContext &enc, DescriptorHeapMirror *mirror,
-                              const DescriptorRecord &record, PipelineStage stage,
-                              const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
+  enum class BindlessMirrorFillKind {
+    None,
+    Texture,
+    Sampler,
+    TextureBuffer,
+    Null,
+  };
+
+  BindlessMirrorFillKind FillBindlessMirrorSlot(
+      ArgumentEncodingContext &enc, DescriptorHeapMirror *mirror,
+      const DescriptorRecord &record, PipelineStage stage,
+      const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
     if (!mirror)
-      return;
+      return BindlessMirrorFillKind::None;
     const UINT slot = record.heap_index;
     if (mirror->isSamplerHeap()) {
       const bool filled =
           mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot);
       if (record.type != DescriptorRecordType::Sampler || !record.has_desc) {
-        if (!filled)
+        if (!filled) {
           mirror->FillSamplerSlot(slot, nullptr, enc.dummySamplerHandle());
+          VerifyBindlessMirrorSamplerSlot(mirror, slot, nullptr,
+                                          enc.dummySamplerHandle(), stage, arg);
+          return BindlessMirrorFillKind::Sampler;
+        }
         VerifyBindlessMirrorSamplerSlot(mirror, slot, nullptr,
                                         enc.dummySamplerHandle(), stage, arg);
-        return;
+        return BindlessMirrorFillKind::None;
       }
       if (filled && !BindlessMirrorVerifyEnabled())
-        return;
+        return BindlessMirrorFillKind::None;
       auto sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
                                         record.desc.sampler);
-      if (!filled)
+      if (!filled) {
         mirror->FillSamplerSlot(slot, sampler.ptr(), enc.dummySamplerHandle());
+        VerifyBindlessMirrorSamplerSlot(mirror, slot, sampler.ptr(),
+                                        enc.dummySamplerHandle(), stage, arg);
+        return BindlessMirrorFillKind::Sampler;
+      }
       VerifyBindlessMirrorSamplerSlot(mirror, slot, sampler.ptr(),
                                       enc.dummySamplerHandle(), stage, arg);
-      return;
+      return BindlessMirrorFillKind::None;
     }
 
     // Already up to date for the current content generation: skip (this is what makes
     // the texture fill once-per-change rather than per-draw). Samplers verify above
     // still compares every bindless draw when the local verify path is enabled.
     if (mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot))
-      return;
+      return BindlessMirrorFillKind::None;
 
     // CBV/SRV/UAV mirror: ordinary buffer descriptors are covered by the per-draw
     // buf_table, but DXBC typed/structured `dcl_resource dim=buffer` lowers to a
@@ -12524,7 +12531,7 @@ private:
       resource = GetResource(record.resource.ptr());
     if (!resource) {
       mirror->ClearTextureSlot(slot);
-      return;
+      return BindlessMirrorFillKind::Null;
     }
 
     auto replace_texture_residency_target =
@@ -12553,46 +12560,47 @@ private:
       if (resource->GetBuffer()) {
         if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
           mirror->ClearTextureSlot(slot);
-          return;
+          return BindlessMirrorFillKind::Null;
         }
         auto binding = CreateShaderResourceTextureBufferBinding(
             device_->GetMTLDevice(), *resource, record,
             WMTTextureUsageShaderRead);
         if (!binding) {
           mirror->ClearTextureSlot(slot);
-          return;
+          return BindlessMirrorFillKind::Null;
         }
         auto buffer = Rc<Buffer>(resource->GetBuffer());
         FillBindlessTextureBufferMirrorSlot(
             enc, *mirror, slot, stage, buffer, binding->first, binding->second,
             ResourceAccess::Read);
-        return;
+        return BindlessMirrorFillKind::TextureBuffer;
       }
       if (!resource->GetTexture()) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       const auto view = CreateShaderResourceTextureView(device_->GetMTLDevice(),
                                                         *resource, record);
       if (!view || !view.texture.ptr()) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       auto *allocation = view.texture->current();
       if (!allocation) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
       replace_texture_residency_target(allocation->texture());
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
+      return BindlessMirrorFillKind::Texture;
     } else if (record.type == DescriptorRecordType::UnorderedAccessView) {
       if (resource->GetBuffer()) {
         if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
           mirror->ClearTextureSlot(slot);
-          return;
+          return BindlessMirrorFillKind::Null;
         }
         bool read = (arg->Flags >> 10) & 1;
         bool write = (arg->Flags >> 10) & 2;
@@ -12605,46 +12613,48 @@ private:
             WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
         if (!binding) {
           mirror->ClearTextureSlot(slot);
-          return;
+          return BindlessMirrorFillKind::Null;
         }
         auto buffer = Rc<Buffer>(resource->GetBuffer());
         FillBindlessTextureBufferMirrorSlot(
             enc, *mirror, slot, stage, buffer, binding->first, binding->second,
             (read ? ResourceAccess::Read : 0) |
                 (write ? ResourceAccess::Write : 0) | ResourceAccess::UAV);
-        return;
+        return BindlessMirrorFillKind::TextureBuffer;
       }
       if (record.has_desc &&
           record.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       if (!resource->GetTexture()) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       if (resource->IsReservedTexture() &&
           !resource->EnsureTextureAllocation("FillBindlessMirrorSlot")) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       const auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
                                                          *resource, record);
       if (!view || !view.texture.ptr()) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       auto *allocation = view.texture->current();
       if (!allocation) {
         mirror->ClearTextureSlot(slot);
-        return;
+        return BindlessMirrorFillKind::Null;
       }
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
       mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
       replace_texture_residency_target(allocation->texture());
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
+      return BindlessMirrorFillKind::Texture;
     }
+    return BindlessMirrorFillKind::None;
   }
 
   void VerifyBindlessMirrorTextureSlot(ArgumentEncodingContext &enc,
@@ -12657,20 +12667,19 @@ private:
     (void)view;
   }
 
-  void MaybeFillBindlessMirrorSlot(ArgumentEncodingContext &enc,
-                                   D3D12_DESCRIPTOR_RANGE_TYPE range_type,
-                                   const DescriptorRecord &record,
-                                   PipelineStage stage,
-                                   const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
+  BindlessMirrorFillKind MaybeFillBindlessMirrorSlot(
+      ArgumentEncodingContext &enc, D3D12_DESCRIPTOR_RANGE_TYPE range_type,
+      const DescriptorRecord &record, PipelineStage stage,
+      const DXMT12_MTL4_SHADER_ARGUMENT *arg) {
     if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
-      FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
-      return;
+      return FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
     }
 
     if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
         range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
-      FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
+      return FillBindlessMirrorSlot(enc, record.mirror, record, stage, arg);
     }
+    return BindlessMirrorFillKind::None;
   }
 
   void BindShaderResourceDescriptor(ArgumentEncodingContext &enc,
@@ -16377,14 +16386,46 @@ private:
           // so fill the persistent mirror here from the captured descriptor (record.mirror travels
           // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
           if (snapshot.bindless) {
-            dxmt::perf::addFrameCounter(
-                perf_stats,
-                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fills);
-            dxmt::perf::ScopedFrameDuration bindless_fill_scope(
-                perf_stats,
-                &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fill_interval);
-            MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
-                                        entry.stage, &entry.argument);
+            const auto bindless_fill_begin = dxmt::clock::now();
+            const auto fill_kind = MaybeFillBindlessMirrorSlot(
+                enc, entry.range_type, entry.descriptor, entry.stage,
+                &entry.argument);
+            if (fill_kind != BindlessMirrorFillKind::None) {
+              dxmt::perf::addFrameCounter(
+                  perf_stats,
+                  &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fills);
+              if (perf_stats)
+                perf_stats->frame_compiled_snapshot_bindless_fill_interval +=
+                    dxmt::clock::now() - bindless_fill_begin;
+              switch (fill_kind) {
+              case BindlessMirrorFillKind::Texture:
+                dxmt::perf::addFrameCounter(
+                    perf_stats,
+                    &dxmt::FrameStatistics::
+                        frame_compiled_snapshot_bindless_fill_texture);
+                break;
+              case BindlessMirrorFillKind::Sampler:
+                dxmt::perf::addFrameCounter(
+                    perf_stats,
+                    &dxmt::FrameStatistics::
+                        frame_compiled_snapshot_bindless_fill_sampler);
+                break;
+              case BindlessMirrorFillKind::TextureBuffer:
+                dxmt::perf::addFrameCounter(
+                    perf_stats,
+                    &dxmt::FrameStatistics::
+                        frame_compiled_snapshot_bindless_fill_texture_buffer);
+                break;
+              case BindlessMirrorFillKind::Null:
+                dxmt::perf::addFrameCounter(
+                    perf_stats,
+                    &dxmt::FrameStatistics::
+                        frame_compiled_snapshot_bindless_fill_null);
+                break;
+              case BindlessMirrorFillKind::None:
+                break;
+              }
+            }
           }
           {
             dxmt::perf::ScopedFrameDuration descriptor_scope(

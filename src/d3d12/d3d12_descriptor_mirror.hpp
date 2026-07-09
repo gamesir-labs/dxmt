@@ -98,16 +98,14 @@ struct DescriptorResidencyTarget {
  * heap's real NumDescriptors (NOT kBindlessMirrorCapacity, which is an AIR GEP-typing
  * artifact only).
  *
- * THREADING (see [[bindless-mirror-texture-fill-needs-encode-thread]]):
+ * THREADING:
  *   - Sampler slots are filled synchronously at CreateSampler/CopyDescriptors on the
  *     app thread (Sampler handles are a pure function of the D3D12_SAMPLER_DESC and are
  *     immutable once created).
- *   - Texture slots CANNOT be resolved for the DXBC mirror on the app thread
- *     (texture->current()->gpuResourceID is only safe on the dxmt-encode-thread).
- *     CreateShaderResourceView / CopyDescriptors mark the slot stale; the
- *     resolve+write happens on the encode thread via FillTextureSlot().
- *     The Metal4 descriptor-table entry is materialized separately at descriptor
- *     write time and must not be overwritten by the DXBC mirror fill.
+ *   - Texture SRV/UAV slots backed by a Metal4 texture-view-pool descriptor are filled
+ *     synchronously at descriptor write/copy time using the pool slot resource ID.
+ *     Typed buffer views remain encode-thread materialized because their payload uses
+ *     encoder access/sub-allocation state.
  *
  * The runtime allocates this for shader-visible CBV/SRV/UAV and SAMPLER heaps.
  * Unsupported shader paths may still fall back to legacy bindings, but descriptor
@@ -203,7 +201,8 @@ public:
                                    const BufferDescriptorRecord &record);
   void WriteTextureTableEntry(uint32_t index, uint64_t gpu_resource_id,
                               float min_lod = 0.0f);
-  void WriteTexturePoolTableEntry(uint32_t index, float min_lod = 0.0f);
+  void WriteTexturePoolTableEntry(uint32_t index, uint32_t array_length,
+                                  float min_lod = 0.0f);
   void WriteSamplerTableEntry(uint32_t index, const Sampler *sampler);
   uint64_t SetTexturePoolSlot(uint32_t index, dxmt::Texture *texture,
                               dxmt::TextureViewKey view,
@@ -257,17 +256,19 @@ public:
 
   /**
    * Fill a SAMPLER slot synchronously (app-thread safe). `sampler` may be null, in which
-   * case the dummy/null sampler payload is written. Byte-identical to encodeShader
+   * case the heap-owned null sampler payload is written. Byte-identical to encodeShader
    * resources via the shared writer.
    */
-  void FillSamplerSlot(uint32_t index, const Sampler *sampler, uint64_t dummy_handle);
+  void FillSamplerSlot(uint32_t index, const Sampler *sampler, uint64_t null_handle);
 
   /**
-   * Fill a TEXTURE slot with an already-resolved (gpuResourceID, arrayLength). MUST be
-   * called on the encode thread (the caller resolves the handle from the bound heap's
-   * record there). Byte-identical to the legacy DXBC resource writer.
+   * Fill a TEXTURE slot with an already-resolved (gpuResourceID, arrayLength, minLOD).
+   * Texture pool resource IDs may be written on the app thread; typed buffer view
+   * payloads are still resolved on the encode thread. Byte-identical to the legacy DXBC
+   * resource writer.
    */
-  void FillTextureSlot(uint32_t index, uint64_t gpu_resource_id, uint32_t array_length);
+  void FillTextureSlot(uint32_t index, uint64_t gpu_resource_id,
+                       uint32_t array_length, float min_lod = 0.0f);
 
   /** Fill a TEXTURE slot with an already-encoded handle/metadata pair. */
   void FillTextureSlotPayload(uint32_t index, uint64_t handle, uint64_t metadata);
@@ -308,6 +309,7 @@ private:
   WMT::Reference<WMT::Buffer> buffer_record_buffer_;
   WMT::Reference<WMT::ArgumentTable> argument_table_;
   WMT::Reference<WMT::TextureViewPool> texture_view_pool_;
+  WMT::Reference<WMT::SamplerState> null_sampler_;
   uint64_t *mapped_ = nullptr;
   DescriptorTableEntry *table_mapped_ = nullptr;
   BufferDescriptorRecord *buffer_record_mapped_ = nullptr;
@@ -315,6 +317,7 @@ private:
   uint64_t table_gpu_address_ = 0;
   uint64_t buffer_record_gpu_address_ = 0;
   uint64_t texture_view_pool_base_resource_id_ = 0;
+  uint64_t null_sampler_handle_ = 0;
   uint64_t buffer_resource_table_generation_ = 0;
   uint32_t num_descriptors_ = 0;
   bool sampler_heap_ = false;

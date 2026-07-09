@@ -1099,11 +1099,10 @@ RecordDescriptorContentCopyPerf() {
   dxmt::perf::recordDescriptorContentWrite(5);
 }
 
-// Bindless-mirror (sub-step ②): mark this descriptor's mirror slot stale at descriptor
-// write time (app thread). This is lightweight generation bookkeeping only — no Metal
-// access and no handle resolution. The actual payload fill happens later:
-//   - texture/sampler slots are resolved + written on the dxmt-encode-thread (the
-//     gpuResourceID / dummy sampler info are only safe there), wired by sub-step ③.
+// Bindless mirror generation marker for descriptor writes. Phase 2 materializes
+// ordinary texture/sampler/null descriptors immediately; typed buffer texture
+// views still use this marker so the encode thread can publish the view payload
+// once the shader argument proves a texture-buffer binding is required.
 // record.mirror is null unless the heap is a shader-visible CBV/SRV/UAV or
 // SAMPLER heap, so non-shader heaps do nothing here.
 static void
@@ -2015,6 +2014,7 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       return;
     }
     mirror->WriteTexturePoolTableEntry(slot,
+                                       binding.texture->arrayLength(binding.view),
                                        GetShaderResourceTextureMinLod(record));
     finish();
     return;
@@ -2064,7 +2064,8 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       finish();
       return;
     }
-    mirror->WriteTexturePoolTableEntry(slot);
+    mirror->WriteTexturePoolTableEntry(slot,
+                                       binding.texture->arrayLength(binding.view));
     finish();
     return;
   }

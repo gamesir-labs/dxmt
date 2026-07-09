@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace dxmt::d3d12 {
@@ -26,6 +27,26 @@ BufferDescriptorMetadata(uint64_t size, bool typed, uint32_t texture_view_offset
 uint64_t
 FloatMetadata(float value) {
   return uint64_t(std::bit_cast<uint32_t>(value));
+}
+
+WMTSamplerInfo
+NullSamplerInfo() {
+  WMTSamplerInfo info = {};
+  info.support_argument_buffers = true;
+  info.border_color = WMTSamplerBorderColorTransparentBlack;
+  info.compare_function = WMTCompareFunctionNever;
+  info.normalized_coords = true;
+  info.r_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.s_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.t_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.min_filter = WMTSamplerMinMagFilterNearest;
+  info.mag_filter = WMTSamplerMinMagFilterNearest;
+  info.mip_filter = WMTSamplerMipFilterNotMipmapped;
+  info.lod_min_clamp = 0.0f;
+  info.lod_max_clamp = std::numeric_limits<float>::max();
+  info.max_anisotroy = 1;
+  info.lod_average = false;
+  return info;
 }
 
 } // namespace
@@ -144,10 +165,28 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
         ERR("DescriptorHeapMirror: texture view pool returned null baseResourceID descriptors=",
             num_descriptors_);
     }
+  } else {
+    auto null_info = NullSamplerInfo();
+    null_sampler_ = device.newSamplerState(null_info);
+    if (!null_sampler_) {
+      ERR("DescriptorHeapMirror: failed to allocate null sampler descriptors=",
+          num_descriptors_);
+    } else {
+      null_sampler_handle_ = null_info.gpu_resource_id;
+      if (!null_sampler_handle_)
+        ERR("DescriptorHeapMirror: null sampler returned null gpuResourceID descriptors=",
+            num_descriptors_);
+    }
   }
 
   stale_generation_.assign(num_descriptors_, 0);
-  filled_generation_.assign(num_descriptors_, UINT64_MAX);
+  filled_generation_.assign(num_descriptors_, 0);
+  if (sampler_heap_) {
+    for (uint32_t i = 0; i < num_descriptors_; i++) {
+      WriteTableEntry(i, {null_sampler_handle_, 0, FloatMetadata(0.0f)});
+      FillSamplerSlot(i, nullptr, null_sampler_handle_);
+    }
+  }
 }
 
 uint32_t
@@ -199,9 +238,16 @@ DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
 
 void
 DescriptorHeapMirror::WriteNullTableEntry(uint32_t index) {
+  if (sampler_heap_) {
+    WriteTableEntry(index, {null_sampler_handle_, 0, FloatMetadata(0.0f)});
+    WriteSlotMeta(index, DescriptorBackendSlotKind::Empty);
+    FillSamplerSlot(index, nullptr, null_sampler_handle_);
+    return;
+  }
   WriteTableEntry(index, {});
   WriteBufferDescriptorRecord(index, {});
   WriteSlotMeta(index, DescriptorBackendSlotKind::Empty);
+  ClearTextureSlot(index);
 }
 
 void
@@ -213,6 +259,8 @@ DescriptorHeapMirror::WriteBufferTableEntry(uint32_t index, uint64_t gpu_va,
                                                    texture_view_offset)});
   WriteSlotMeta(index, DescriptorBackendSlotKind::Buffer,
                 typed ? BufferDescriptorRecordFlagTyped : 0u);
+  if (!typed)
+    ClearTextureSlot(index);
 }
 
 void
@@ -234,8 +282,12 @@ DescriptorHeapMirror::WriteTextureTableEntry(uint32_t index,
 
 void
 DescriptorHeapMirror::WriteTexturePoolTableEntry(uint32_t index,
+                                                 uint32_t array_length,
                                                  float min_lod) {
-  WriteTextureTableEntry(index, textureViewPoolSlotResourceID(index), min_lod);
+  const uint64_t resource_id = textureViewPoolSlotResourceID(index);
+  WriteTextureTableEntry(index, resource_id, min_lod);
+  if (resource_id)
+    FillTextureSlot(index, resource_id, array_length, min_lod);
 }
 
 void
@@ -287,7 +339,7 @@ DescriptorHeapMirror::DrainResidencyTargets() {
 }
 
 void
-DescriptorHeapMirror::FillSamplerSlot(uint32_t index, const Sampler *sampler, uint64_t dummy_handle) {
+DescriptorHeapMirror::FillSamplerSlot(uint32_t index, const Sampler *sampler, uint64_t null_handle) {
   auto *handle = samplerHandlePtr(index);
   auto *cube = samplerCubeHandlePtr(index);
   auto *lod_bias = samplerLodBiasPtr(index);
@@ -297,7 +349,7 @@ DescriptorHeapMirror::FillSamplerSlot(uint32_t index, const Sampler *sampler, ui
   if (sampler)
     EncodeMirrorSamplerSlot(encoded, *sampler);
   else
-    EncodeMirrorSamplerSlotNull(encoded, dummy_handle);
+    EncodeMirrorSamplerSlotNull(encoded, null_handle);
   *handle = encoded[0];
   *cube = encoded[1];
   *lod_bias = encoded[2];
@@ -306,13 +358,16 @@ DescriptorHeapMirror::FillSamplerSlot(uint32_t index, const Sampler *sampler, ui
 }
 
 void
-DescriptorHeapMirror::FillTextureSlot(uint32_t index, uint64_t gpu_resource_id, uint32_t array_length) {
+DescriptorHeapMirror::FillTextureSlot(uint32_t index,
+                                      uint64_t gpu_resource_id,
+                                      uint32_t array_length,
+                                      float min_lod) {
   auto *handle = textureHandlePtr(index);
   auto *metadata = textureMetadataPtr(index);
   if (!handle || !metadata)
     return;
   uint64_t encoded[kMirrorTextureQwords] = {};
-  EncodeMirrorTextureSlot(encoded, gpu_resource_id, array_length);
+  EncodeMirrorTextureSlot(encoded, gpu_resource_id, array_length, min_lod);
   *handle = encoded[0];
   *metadata = encoded[1];
   if (index < filled_generation_.size())
