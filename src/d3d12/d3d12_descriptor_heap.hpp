@@ -24,9 +24,9 @@ class Sampler;
 namespace dxmt::d3d12 {
 
 /**
- * Whether the bindless-mirror path (Stage-1) is enabled (env DXMT_BINDLESS_MIRROR).
- * Cached. When false, no mirror buffers are ever allocated and the legacy packed
- * argument-buffer path is fully intact.
+ * Whether shader-visible D3D12 descriptor heaps use the unified descriptor
+ * mirror backing. This is an implementation capability, not a user-selectable
+ * architecture switch.
  */
 bool IsBindlessMirrorEnabled();
 
@@ -50,8 +50,9 @@ struct DescriptorRecord {
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = {};
   UINT heap_index = 0;
   UINT heap_count = 0;
-  // Non-owning back-pointer to the owning heap's bindless-mirror (or nullptr when the
-  // mirror is disabled / heap not shader-visible). The heap owns the mirror and the
+  // Non-owning back-pointer to the owning heap's descriptor mirror (or nullptr
+  // when the heap is not shader-visible / not a heap type consumed by shaders).
+  // The heap owns the mirror and the
   // records, so this is lifetime-safe. Part of the heap-identity set preserved across
   // ResetDescriptorRecord / CopyDescriptorRecord (a slot keeps its own heap's mirror).
   DescriptorHeapMirror *mirror = nullptr;
@@ -79,10 +80,10 @@ public:
   virtual const DescriptorRecord *GetDescriptorRecord(D3D12_CPU_DESCRIPTOR_HANDLE handle) const = 0;
   virtual const DescriptorRecord *GetDescriptorRecord(D3D12_GPU_DESCRIPTOR_HANDLE handle) const = 0;
   /**
-   * The persistent bindless-mirror buffer for this heap, or nullptr when bindless-mirror
-   * is disabled or the heap is not shader-visible. Lazily allocated. Sub-step ③ binds
-   * this at Metal slot 30 and fills texture slots on the encode thread; sub-step ② fills
-   * sampler slots synchronously at descriptor-write time.
+   * The persistent descriptor mirror for this heap, or nullptr when the heap is
+   * not shader-visible or not a shader descriptor heap. Texture slots are
+   * resolved on the encode thread; sampler slots are materialized at descriptor
+   * write time.
    */
   virtual DescriptorHeapMirror *GetMirror() = 0;
 };

@@ -5,7 +5,6 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
-#include "util_env.hpp"
 #include "util_string.hpp"
 
 #include <memory>
@@ -14,6 +13,14 @@ namespace dxmt::d3d12 {
 namespace {
 
 std::atomic<uint64_t> g_descriptor_content_generation{1};
+
+bool DescriptorHeapSupportsMirror(const D3D12_DESCRIPTOR_HEAP_DESC &desc) {
+  if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+    return false;
+
+  return desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+         desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+}
 
 class DescriptorHeapImpl final
     : public ComObjectWithInitialRef<ID3D12DescriptorHeap>,
@@ -32,18 +39,14 @@ public:
       records_[i].heap_index = i;
       records_[i].heap_count = desc.NumDescriptors;
     }
-    // Eagerly allocate the bindless descriptor owner for shader-visible
-    // CBV/SRV/UAV and SAMPLER heaps when the feature is enabled, and back-fill
-    // the per-record back-pointer. The owner preserves the old typed mirror
-    // buffers and also owns the MSC descriptor table buffer plus the Metal4
-    // argument table that binds that buffer at bind point 0 (resources) or 1
-    // (samplers). Gated by the flag, so legacy runs allocate nothing and
-    // record.mirror stays null. Doing this at construction avoids any
+    // Eagerly allocate the unified descriptor owner for shader-visible
+    // CBV/SRV/UAV and SAMPLER heaps, and back-fill the per-record back-pointer.
+    // The owner preserves the typed mirror buffers and owns the MSC descriptor
+    // table buffer plus the Metal4 argument table that binds that buffer at bind
+    // point 0 (resources) or 1 (samplers). Doing this at construction avoids
     // cross-thread first-touch ordering between descriptor writes and replay.
     const bool sampler_heap = desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    if (IsBindlessMirrorEnabled() &&
-        (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
-        (sampler_heap || desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)) {
+    if (DescriptorHeapSupportsMirror(desc_)) {
       mirror_ = std::make_unique<DescriptorHeapMirror>(
           device_->GetMTLDevice(), desc.NumDescriptors, sampler_heap);
       for (UINT i = 0; i < desc.NumDescriptors; i++)
@@ -214,8 +217,7 @@ private:
 } // namespace
 
 bool IsBindlessMirrorEnabled() {
-  static const bool enabled = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
-  return enabled;
+  return true;
 }
 
 void BumpDescriptorContentGeneration() {

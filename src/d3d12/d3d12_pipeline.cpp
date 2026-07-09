@@ -2121,18 +2121,14 @@ CreateDepthStencilState(IMTLD3D12Device *device,
   return device->GetMTLDevice().newDepthStencilState(info);
 }
 
-// Single source of truth for whether a PSO may use the Stage-1 bindless
-// descriptor-mirror path (env DXMT_BINDLESS_MIRROR=1). Consumed both at compile
-// time (CreateMetal*Pipeline: append the SM50_SHADER_BINDLESS_MIRROR args node +
-// fold the bindless bool into the shader cache keys) and at runtime
-// (PipelineStateImpl::UsesBindlessMirror, the draw-path gate), so a PSO compiled
-// as bindless is read back as bindless over the identical predicate/shaders.
+// Single source of truth for whether a PSO may use the descriptor-mirror path.
+// Consumed both at compile time (CreateMetal*Pipeline appends the
+// SM50_SHADER_BINDLESS_MIRROR args node and folds the bool into shader cache
+// keys) and at runtime (PipelineStateImpl::UsesBindlessMirror, the draw-path
+// gate), so a PSO compiled as mirrored is read back over the same predicate.
 bool
 PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders,
                     const RootSignature *root_signature) {
-  static const bool env_on = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
-  if (!env_on)
-    return false;
   if (root_signature && !root_signature->GetStaticSamplers().empty())
     return false;
   for (const auto &shader : shaders) {
@@ -2181,10 +2177,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // Bindless off-gate: only eligible PSOs receive the bindless-mirror args node.
-  // Non-eligible PSOs, including DXIL and geometry/tessellation paths, must keep
-  // the exact legacy compilation argument chain so the environment toggle cannot
-  // perturb their AIR layout or reflection.
+  // Only eligible PSOs receive the descriptor-mirror args node. Non-eligible
+  // PSOs, including DXIL and geometry/tessellation paths, keep the legacy
+  // compilation argument chain because they do not have matching mirror lowering.
   const bool pso_bindless = PsoBindlessEligible(shaders, root_signature);
   SM50_SHADER_BINDLESS_MIRROR_DATA bindless_node = {};
   bindless_node.type = SM50_SHADER_BINDLESS_MIRROR;
@@ -2542,8 +2537,8 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // Bindless off-gate (see CreateMetalGraphicsPipeline): only eligible compute
-  // PSOs receive the bindless-mirror args node.
+  // See CreateMetalGraphicsPipeline: only eligible compute PSOs receive the
+  // descriptor-mirror args node.
   const bool pso_bindless = PsoBindlessEligible(shaders, root_signature);
   SM50_SHADER_BINDLESS_MIRROR_DATA bindless_node = {};
   bindless_node.type = SM50_SHADER_BINDLESS_MIRROR;

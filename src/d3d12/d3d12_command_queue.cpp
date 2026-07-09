@@ -15018,12 +15018,11 @@ private:
     }
   }
 
-  // Bindless-mirror (③.3): is the env gate DXMT_BINDLESS_MIRROR on? Cheap cached read so a
-  // legacy-only run pays nothing for the mixed-PSO guard. (PsoBindlessEligible folds the same
-  // env into UsesBindlessMirror; this gate is only for the legacy-side guard re-bind.)
-  static bool BindlessMirrorEnvEnabled() {
-    static const bool on = env::getEnvVar("DXMT_BINDLESS_MIRROR") == "1";
-    return on;
+  // Descriptor mirroring is a runtime capability rather than an environment
+  // selected architecture. Unsupported PSOs still use the legacy binding path,
+  // so legacy-side guard re-binds remain required after a mirrored draw.
+  static bool DescriptorMirrorRuntimeEnabled() {
+    return true;
   }
 
   template <PipelineStage Stage>
@@ -16301,7 +16300,7 @@ private:
     diag.path = BindlessMirrorDiagPathName(snapshot_bindless, true);
     // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
     // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
-    if (!snapshot.bindless && BindlessMirrorEnvEnabled())
+    if (!snapshot.bindless && DescriptorMirrorRuntimeEnabled())
       enc.restorePerPassArgbufIfMirrorBound<false>();
     for (const auto &shader : shaders) {
       if (snapshot_bindless) {
@@ -16431,10 +16430,9 @@ private:
     diag.uses_bindless_mirror = bindless;
     diag.bindless_bound = bindless_path;
     diag.path = BindlessMirrorDiagPathName(bindless_path, false);
-    // Mixed-PSO guard (③.3 STEP D): a legacy draw after a bindless draw must restore the per-pass
-    // argbuf at slots 29/30 (the bindless draw rebound them to mirrors). Gated on the env so a
-    // legacy-only run pays nothing.
-    if (!bindless && BindlessMirrorEnvEnabled())
+    // Mixed-PSO guard (③.3 STEP D): a legacy draw after a mirrored draw must
+    // restore the per-pass argbuf at slots 29/30.
+    if (!bindless && DescriptorMirrorRuntimeEnabled())
       enc.restorePerPassArgbufIfMirrorBound<false>();
     for (const auto &shader : shaders) {
       if (bindless_path) {
@@ -16506,7 +16504,7 @@ private:
         bindless ? state.compute_root_signature_impl : nullptr;
     // Mixed-PSO guard (③.3 STEP D): restore the per-pass argbuf at 29/30 if a prior bindless
     // dispatch rebound them. Compute analog of the graphics guard.
-    if (!bindless && BindlessMirrorEnvEnabled())
+    if (!bindless && DescriptorMirrorRuntimeEnabled())
       enc.restorePerPassArgbufIfMirrorBound<true>();
     for (const auto &shader : shaders) {
       if (shader.stage == PipelineShaderStage::Compute) {
@@ -17484,7 +17482,7 @@ private:
     StallScope _ss(StallDiagEnabled(), &stallProbe().descAccessUs);
     RecordRenderAttachmentAccess(chunk, state, pipeline.GetGraphicsState());
     const bool bindless_descriptor_hazards_are_barrier_driven =
-        pipeline.UsesBindlessMirror() && BindlessMirrorEnvEnabled();
+        pipeline.UsesBindlessMirror() && DescriptorMirrorRuntimeEnabled();
     if (bindless_descriptor_hazards_are_barrier_driven) {
       if (ReplayPerfEnabled())
         perDrawSubTimers().descAccessPassthrough++;
@@ -17767,7 +17765,7 @@ private:
         BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
                                    true);
     bool restored_legacy_argbuf = false;
-    if (!bindless_diag.bindless_bound && BindlessMirrorEnvEnabled())
+    if (!bindless_diag.bindless_bound && DescriptorMirrorRuntimeEnabled())
       restored_legacy_argbuf = enc.restorePerPassArgbufIfMirrorBound<false>();
     const bool skip_binding_snapshot =
         !bindless_snapshot && !restored_legacy_argbuf &&

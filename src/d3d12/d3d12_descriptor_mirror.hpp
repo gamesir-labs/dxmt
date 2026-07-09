@@ -36,8 +36,7 @@ struct DescriptorResidencyTarget {
 };
 
 /**
- * Persistent typed descriptor mirror for ONE shader-visible D3D12 descriptor heap
- * (bindless-mirror Stage-1, sub-step ②). See fh4-debug/BINDLESS-ABI.md.
+ * Persistent descriptor mirror for one shader-visible D3D12 descriptor heap.
  *
  * A D3D12 descriptor heap has a single type, so each shader-visible heap backs exactly
  * one mirror array:
@@ -64,7 +63,9 @@ struct DescriptorResidencyTarget {
  *     The Metal4 descriptor-table entry is materialized separately at descriptor
  *     write time and must not be overwritten by the DXBC mirror fill.
  *
- * This whole type is dormant behind DXMT_BINDLESS_MIRROR; legacy runs never allocate it.
+ * The runtime allocates this for shader-visible CBV/SRV/UAV and SAMPLER heaps.
+ * Unsupported shader paths may still fall back to legacy bindings, but descriptor
+ * heap mirroring itself is not selected by an environment variable.
  */
 class DescriptorHeapMirror {
 public:

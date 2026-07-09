@@ -1104,8 +1104,8 @@ RecordDescriptorContentCopyPerf() {
 // access and no handle resolution. The actual payload fill happens later:
 //   - texture/sampler slots are resolved + written on the dxmt-encode-thread (the
 //     gpuResourceID / dummy sampler info are only safe there), wired by sub-step ③.
-// record.mirror is null unless DXMT_BINDLESS_MIRROR is on and the heap is a
-// shader-visible CBV/SRV/UAV or SAMPLER heap, so legacy runs do nothing here.
+// record.mirror is null unless the heap is a shader-visible CBV/SRV/UAV or
+// SAMPLER heap, so non-shader heaps do nothing here.
 static void
 MarkDescriptorMirrorStaleForWrite(const DescriptorRecord &record) {
   if (record.mirror)
