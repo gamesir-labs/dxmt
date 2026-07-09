@@ -7821,18 +7821,18 @@ private:
                   auto &data =
                       *static_cast<CompiledDirectDrawPayload *>(payload);
                   auto &packet = data.draw;
-                  auto *perf_stats = queue->CompiledDrawFrameStats(enc);
-                  FramePerfDurationScope direct_scope(
+                  auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+                  dxmt::perf::ScopedFrameDuration direct_scope(
                       perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
-                  AddFramePerfCount(
+                  dxmt::perf::addFrameCounter(
                       perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
-                  AddFramePerfCount(
+                  dxmt::perf::addFrameCounter(
                       perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
                   {
-                    FramePerfDurationScope retain_scope(
+                    dxmt::perf::ScopedFrameDuration retain_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
                     for (const auto &allocation :
@@ -7840,7 +7840,7 @@ private:
                       enc.retainAllocation(allocation.ptr());
                   }
                   {
-                    FramePerfDurationScope pipeline_scope(
+                    dxmt::perf::ScopedFrameDuration pipeline_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
                     queue->EncodeRenderPipelineStateIfChanged(
@@ -7859,7 +7859,7 @@ private:
                        cache.depth_stencil.handle !=
                            packet.common.depth_stencil.handle ||
                        cache.stencil_ref != stencil_ref_u8)) {
-                    FramePerfDurationScope dsso_scope(
+                    dxmt::perf::ScopedFrameDuration dsso_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
                     auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
@@ -7874,7 +7874,7 @@ private:
                       std::memcmp(&cache.rasterizer,
                                   &packet.common.rasterizer,
                                   sizeof(packet.common.rasterizer)) != 0) {
-                    FramePerfDurationScope rasterizer_scope(
+                    dxmt::perf::ScopedFrameDuration rasterizer_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
                     auto &rs =
@@ -7894,7 +7894,7 @@ private:
                     packet.common.bindless_diag = diag;
                   }
                   {
-                    FramePerfDurationScope dynamic_state_scope(
+                    dxmt::perf::ScopedFrameDuration dynamic_state_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
                     EncodeDynamicRenderState(
@@ -7902,7 +7902,7 @@ private:
                         packet.common.blend_factor, packet.common.stencil_ref);
                   }
                   {
-                    FramePerfDurationScope body_scope(
+                    dxmt::perf::ScopedFrameDuration body_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
                     enc.resolveRenderPassBarrier();
@@ -7998,18 +7998,18 @@ private:
                   auto &data =
                       *static_cast<CompiledDirectIndexedDrawPayload *>(payload);
                   auto &packet = data.draw;
-                  auto *perf_stats = queue->CompiledDrawFrameStats(enc);
-                  FramePerfDurationScope direct_scope(
+                  auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+                  dxmt::perf::ScopedFrameDuration direct_scope(
                       perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
-                  AddFramePerfCount(
+                  dxmt::perf::addFrameCounter(
                       perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
-                  AddFramePerfCount(
+                  dxmt::perf::addFrameCounter(
                       perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets);
                   {
-                    FramePerfDurationScope retain_scope(
+                    dxmt::perf::ScopedFrameDuration retain_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
                     for (const auto &allocation :
@@ -8018,7 +8018,7 @@ private:
                     enc.retainAllocation(packet.index_allocation.ptr());
                   }
                   {
-                    FramePerfDurationScope pipeline_scope(
+                    dxmt::perf::ScopedFrameDuration pipeline_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
                     queue->EncodeRenderPipelineStateIfChanged(
@@ -8037,7 +8037,7 @@ private:
                        cache.depth_stencil.handle !=
                            packet.common.depth_stencil.handle ||
                        cache.stencil_ref != stencil_ref_u8)) {
-                    FramePerfDurationScope dsso_scope(
+                    dxmt::perf::ScopedFrameDuration dsso_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
                     auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
@@ -8052,7 +8052,7 @@ private:
                       std::memcmp(&cache.rasterizer,
                                   &packet.common.rasterizer,
                                   sizeof(packet.common.rasterizer)) != 0) {
-                    FramePerfDurationScope rasterizer_scope(
+                    dxmt::perf::ScopedFrameDuration rasterizer_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
                     auto &rs =
@@ -8072,7 +8072,7 @@ private:
                     packet.common.bindless_diag = diag;
                   }
                   {
-                    FramePerfDurationScope dynamic_state_scope(
+                    dxmt::perf::ScopedFrameDuration dynamic_state_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
                     EncodeDynamicRenderState(
@@ -8080,7 +8080,7 @@ private:
                         packet.common.blend_factor, packet.common.stencil_ref);
                   }
                   {
-                    FramePerfDurationScope body_scope(
+                    dxmt::perf::ScopedFrameDuration body_scope(
                         perf_stats,
                         &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
                     enc.resolveRenderPassBarrier();
@@ -16306,34 +16306,34 @@ private:
                                     bool use_tessellation,
                                     uint64_t &argbuf_offset,
                                     BindlessMirrorDrawDiag *draw_diag = nullptr) {
-    auto *perf_stats = CompiledDrawFrameStats(enc);
-    FramePerfDurationScope snapshot_scope(
+    auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+    dxmt::perf::ScopedFrameDuration snapshot_scope(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_interval);
-    AddFramePerfCount(
+    dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_applied);
-    AddFramePerfCount(perf_stats,
+    dxmt::perf::addFrameCounter(perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_snapshot_entries,
                       snapshot.entries.size());
 
     if (auto *root = snapshot.root_signature_impl) {
-      FramePerfDurationScope static_sampler_scope(
+      dxmt::perf::ScopedFrameDuration static_sampler_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_static_samplers_interval);
       ApplyStaticSamplers(enc, pipeline, *root, false);
     }
 
     {
-      FramePerfDurationScope entries_scope(
+      dxmt::perf::ScopedFrameDuration entries_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_entries_interval);
       for (const auto &entry : snapshot.entries) {
         if (entry.kind == GraphicsBindingSnapshotEntry::Kind::RootConstants) {
-          AddFramePerfCount(
+          dxmt::perf::addFrameCounter(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_root_constants);
-          FramePerfDurationScope root_constants_scope(
+          dxmt::perf::ScopedFrameDuration root_constants_scope(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_root_constants_interval);
           DebugLogRootBinding(
@@ -16342,7 +16342,7 @@ private:
               entry.register_space, entry.debug_size, entry.debug_address);
           BindRootConstantsSnapshot(enc, entry);
         } else if (entry.has_descriptor) {
-          AddFramePerfCount(
+          dxmt::perf::addFrameCounter(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors);
           DebugLogRootBinding(
@@ -16353,27 +16353,27 @@ private:
           // so fill the persistent mirror here from the captured descriptor (record.mirror travels
           // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
           if (snapshot.bindless) {
-            AddFramePerfCount(
+            dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fills);
-            FramePerfDurationScope bindless_fill_scope(
+            dxmt::perf::ScopedFrameDuration bindless_fill_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_fill_interval);
             MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
                                         entry.stage, &entry.argument);
           }
           {
-            FramePerfDurationScope descriptor_scope(
+            dxmt::perf::ScopedFrameDuration descriptor_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors_interval);
             BindDescriptor(enc, entry.stage, entry.range_type, entry.slot,
                            entry.descriptor, &entry.argument);
           }
         } else {
-          AddFramePerfCount(
+          dxmt::perf::addFrameCounter(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_clear_descriptors);
-          FramePerfDurationScope clear_scope(
+          dxmt::perf::ScopedFrameDuration clear_scope(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_clear_descriptors_interval);
           ClearDescriptorBinding(enc, entry.stage, entry.range_type,
@@ -16387,11 +16387,11 @@ private:
                                    : use_geometry ? PipelineKind::Geometry
                                                   : PipelineKind::Ordinary;
     {
-      AddFramePerfCount(
+      dxmt::perf::addFrameCounter(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_buffers,
           snapshot.vertex_buffers.size());
-      FramePerfDurationScope vertex_buffers_scope(
+      dxmt::perf::ScopedFrameDuration vertex_buffers_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_buffers_interval);
       for (const auto &binding : snapshot.vertex_buffers) {
@@ -16401,7 +16401,7 @@ private:
       }
     }
     if (snapshot.vertex_slot_mask) {
-      FramePerfDurationScope vertex_table_scope(
+      dxmt::perf::ScopedFrameDuration vertex_table_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_table_interval);
       const auto table_size =
@@ -16433,40 +16433,40 @@ private:
     // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
     // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
     if (!snapshot.bindless && DescriptorMirrorRuntimeEnabled()) {
-      FramePerfDurationScope restore_argbuf_scope(
+      dxmt::perf::ScopedFrameDuration restore_argbuf_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_restore_argbuf_interval);
       if (enc.restorePerPassArgbufIfMirrorBound<false>())
-        AddFramePerfCount(
+        dxmt::perf::addFrameCounter(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_argbuf_restores);
     }
     {
-      FramePerfDurationScope shader_bindings_scope(
+      dxmt::perf::ScopedFrameDuration shader_bindings_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings_interval);
       for (const auto &shader : shaders) {
         if (snapshot_bindless) {
           if (shader.stage == PipelineShaderStage::Vertex) {
-            AddFramePerfCount(
+            dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-            AddFramePerfCount(
+            dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings);
-            FramePerfDurationScope bindless_shader_scope(
+            dxmt::perf::ScopedFrameDuration bindless_shader_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings_interval);
             EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
                 enc, shader, key, snapshot, &diag);
           } else if (shader.stage == PipelineShaderStage::Pixel) {
-            AddFramePerfCount(
+            dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-            AddFramePerfCount(
+            dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings);
-            FramePerfDurationScope bindless_shader_scope(
+            dxmt::perf::ScopedFrameDuration bindless_shader_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings_interval);
             EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
@@ -16477,13 +16477,13 @@ private:
         if (use_geometry) {
           if (shader.stage == PipelineShaderStage::Vertex)
             {
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              FramePerfDurationScope legacy_shader_scope(
+              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
               EncodeShaderBindingsForStage<PipelineStage::Vertex,
@@ -16492,13 +16492,13 @@ private:
             }
           else if (shader.stage == PipelineShaderStage::Geometry)
             {
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              FramePerfDurationScope legacy_shader_scope(
+              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
               EncodeShaderBindingsForStage<PipelineStage::Geometry,
@@ -16507,13 +16507,13 @@ private:
             }
           else if (shader.stage == PipelineShaderStage::Pixel)
             {
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              FramePerfDurationScope legacy_shader_scope(
+              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
               EncodeShaderBindingsForStage<PipelineStage::Pixel,
@@ -16524,13 +16524,13 @@ private:
           if (use_tessellation) {
             if (shader.stage == PipelineShaderStage::Vertex)
               {
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                FramePerfDurationScope legacy_shader_scope(
+                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
                 EncodeShaderBindingsForStage<PipelineStage::Vertex,
@@ -16539,13 +16539,13 @@ private:
               }
             else if (shader.stage == PipelineShaderStage::Hull)
               {
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                FramePerfDurationScope legacy_shader_scope(
+                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
                 EncodeShaderBindingsForStage<PipelineStage::Hull,
@@ -16554,13 +16554,13 @@ private:
               }
             else if (shader.stage == PipelineShaderStage::Domain)
               {
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                FramePerfDurationScope legacy_shader_scope(
+                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
                 EncodeShaderBindingsForStage<PipelineStage::Domain,
@@ -16569,13 +16569,13 @@ private:
               }
             else if (shader.stage == PipelineShaderStage::Pixel)
               {
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                AddFramePerfCount(
+                dxmt::perf::addFrameCounter(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                FramePerfDurationScope legacy_shader_scope(
+                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                     perf_stats,
                     &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
                 EncodeShaderBindingsForStage<PipelineStage::Pixel,
@@ -16584,13 +16584,13 @@ private:
               }
           } else if (shader.stage == PipelineShaderStage::Vertex)
             {
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              FramePerfDurationScope legacy_shader_scope(
+              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
               EncodeShaderBindingsForStage<PipelineStage::Vertex,
@@ -16599,13 +16599,13 @@ private:
             }
           else if (shader.stage == PipelineShaderStage::Pixel)
             {
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              AddFramePerfCount(
+              dxmt::perf::addFrameCounter(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              FramePerfDurationScope legacy_shader_scope(
+              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
                   perf_stats,
                   &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
               EncodeShaderBindingsForStage<PipelineStage::Pixel,
@@ -17933,40 +17933,6 @@ private:
     CompiledDirectAccessList direct_access;
   };
 
-  struct FramePerfDurationScope {
-    dxmt::FrameStatistics *stats = nullptr;
-    dxmt::clock::duration dxmt::FrameStatistics::*target = nullptr;
-    dxmt::clock::time_point start = {};
-
-    FramePerfDurationScope(
-        dxmt::FrameStatistics *stats,
-        dxmt::clock::duration dxmt::FrameStatistics::*target)
-        : stats(stats), target(target),
-          start(stats && target ? dxmt::clock::now()
-                                : dxmt::clock::time_point{}) {
-    }
-
-    ~FramePerfDurationScope() {
-      if (stats && target)
-        (stats->*target) += dxmt::clock::now() - start;
-    }
-
-    FramePerfDurationScope(const FramePerfDurationScope &) = delete;
-    FramePerfDurationScope &operator=(const FramePerfDurationScope &) = delete;
-  };
-
-  static dxmt::FrameStatistics *CompiledDrawFrameStats(
-      ArgumentEncodingContext &enc) {
-    return dxmt::perf::enabled() ? &enc.currentFrameStatistics() : nullptr;
-  }
-
-  static void AddFramePerfCount(dxmt::FrameStatistics *stats,
-                                uint64_t dxmt::FrameStatistics::*target,
-                                uint64_t count = 1) {
-    if (stats && target)
-      (stats->*target) += count;
-  }
-
 	  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
 	    common.binding_content_fingerprint =
 	        common.binding_snapshot ? common.binding_snapshot->content_fingerprint
@@ -17998,12 +17964,12 @@ private:
   void EncodeReplayDrawCommonState(ArgumentEncodingContext &enc,
                                    ReplayDrawPacketCommon &packet,
                                    uint64_t &argbuf_offset) {
-    auto *perf_stats = CompiledDrawFrameStats(enc);
-    FramePerfDurationScope common_scope(
+    auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+    dxmt::perf::ScopedFrameDuration common_scope(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_common_interval);
     {
-      FramePerfDurationScope pipeline_scope(
+      dxmt::perf::ScopedFrameDuration pipeline_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
       EncodeRenderPipelineStateIfChanged(enc, packet.metal_pso);
@@ -18019,7 +17985,7 @@ private:
         (!cache.depth_stencil_valid ||
          cache.depth_stencil.handle != packet.depth_stencil.handle ||
          cache.stencil_ref != stencil_ref_u8)) {
-      FramePerfDurationScope dsso_scope(
+      dxmt::perf::ScopedFrameDuration dsso_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
@@ -18033,7 +17999,7 @@ private:
     if (!cache.rasterizer_valid ||
         std::memcmp(&cache.rasterizer, &packet.rasterizer,
                     sizeof(packet.rasterizer)) != 0) {
-      FramePerfDurationScope rasterizer_scope(
+      dxmt::perf::ScopedFrameDuration rasterizer_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
@@ -18050,7 +18016,7 @@ private:
     bool restored_legacy_argbuf = false;
     bool skip_binding_snapshot = false;
     {
-      FramePerfDurationScope binding_gate_scope(
+      dxmt::perf::ScopedFrameDuration binding_gate_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_binding_gate_interval);
       generation_hit =
@@ -18079,15 +18045,15 @@ private:
           stats.gate_misses.fetch_add(1, std::memory_order_relaxed);
       }
       if (generation_hit)
-        AddFramePerfCount(
+        dxmt::perf::addFrameCounter(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_binding_generation_hits);
       else if (fingerprint_hit)
-        AddFramePerfCount(
+        dxmt::perf::addFrameCounter(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_binding_fingerprint_hits);
       else
-        AddFramePerfCount(
+        dxmt::perf::addFrameCounter(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_binding_misses);
       bindless_diag.uses_bindless_mirror =
@@ -18099,13 +18065,13 @@ private:
           BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
                                      true);
       if (!bindless_diag.bindless_bound && DescriptorMirrorRuntimeEnabled()) {
-        FramePerfDurationScope restore_argbuf_scope(
+        dxmt::perf::ScopedFrameDuration restore_argbuf_scope(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_snapshot_restore_argbuf_interval);
         restored_legacy_argbuf =
             enc.restorePerPassArgbufIfMirrorBound<false>();
         if (restored_legacy_argbuf)
-          AddFramePerfCount(
+          dxmt::perf::addFrameCounter(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_argbuf_restores);
       }
@@ -18113,7 +18079,7 @@ private:
           !bindless_snapshot && !restored_legacy_argbuf &&
           (generation_hit || fingerprint_hit);
       if (skip_binding_snapshot)
-        AddFramePerfCount(
+        dxmt::perf::addFrameCounter(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_skipped);
     }
@@ -18133,7 +18099,7 @@ private:
       binding_cache.valid = true;
     }
     {
-      FramePerfDurationScope dynamic_state_scope(
+      dxmt::perf::ScopedFrameDuration dynamic_state_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
       EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
@@ -18164,14 +18130,14 @@ private:
   void EncodeReplayDrawInstancedPacket(ArgumentEncodingContext &enc,
                                        ReplayDrawInstancedPacket &packet,
                                        uint64_t &argbuf_offset) {
-    auto *perf_stats = CompiledDrawFrameStats(enc);
-    FramePerfDurationScope replay_scope(
+    auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+    dxmt::perf::ScopedFrameDuration replay_scope(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
-    AddFramePerfCount(
+    dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
-    AddFramePerfCount(
+    dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
 
@@ -18180,7 +18146,7 @@ private:
 
     Rc<VisibilityResultQuery> active_visibility_query;
     {
-      FramePerfDurationScope visibility_scope(
+      dxmt::perf::ScopedFrameDuration visibility_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
       active_visibility_query =
@@ -18188,7 +18154,7 @@ private:
     }
 
     {
-      FramePerfDurationScope body_scope(
+      dxmt::perf::ScopedFrameDuration body_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
       if (common.use_tessellation) {
@@ -18287,7 +18253,7 @@ private:
     }
 
     {
-      FramePerfDurationScope visibility_scope(
+      dxmt::perf::ScopedFrameDuration visibility_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
       EndReplayDrawVisibilityQuery(enc, active_visibility_query);
@@ -18304,19 +18270,19 @@ private:
   void EncodeReplayDrawIndexedInstancedPacket(
       ArgumentEncodingContext &enc, ReplayDrawIndexedInstancedPacket &packet,
       uint64_t &argbuf_offset) {
-    auto *perf_stats = CompiledDrawFrameStats(enc);
-    FramePerfDurationScope replay_scope(
+    auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+    dxmt::perf::ScopedFrameDuration replay_scope(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
-    AddFramePerfCount(
+    dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
-    AddFramePerfCount(
+    dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets);
 
     {
-      FramePerfDurationScope retain_scope(
+      dxmt::perf::ScopedFrameDuration retain_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
       enc.retainAllocation(packet.index_allocation.ptr());
@@ -18327,7 +18293,7 @@ private:
 
     Rc<VisibilityResultQuery> active_visibility_query;
     {
-      FramePerfDurationScope visibility_scope(
+      dxmt::perf::ScopedFrameDuration visibility_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
       active_visibility_query =
@@ -18335,7 +18301,7 @@ private:
     }
 
     {
-      FramePerfDurationScope body_scope(
+      dxmt::perf::ScopedFrameDuration body_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
       if (common.use_tessellation) {
@@ -18443,7 +18409,7 @@ private:
     }
 
     {
-      FramePerfDurationScope visibility_scope(
+      dxmt::perf::ScopedFrameDuration visibility_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_visibility_interval);
       EndReplayDrawVisibilityQuery(enc, active_visibility_query);

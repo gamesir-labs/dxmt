@@ -55,6 +55,49 @@ private:
 
 void setCurrentFrameStatistics(FrameStatistics *stats);
 FrameStatistics *currentFrameStatistics();
+
+using FrameDurationMember = dxmt::clock::duration FrameStatistics::*;
+using FrameCounterMember = uint64_t FrameStatistics::*;
+
+class ScopedFrameDuration {
+public:
+  ScopedFrameDuration(FrameStatistics *stats, FrameDurationMember target)
+      : stats_(stats && target ? stats : nullptr),
+        target_(target),
+        begin_(stats_ ? dxmt::clock::now() : dxmt::clock::time_point{}) {
+  }
+
+  ~ScopedFrameDuration() {
+    stop();
+  }
+
+  void stop() {
+    if (!stats_)
+      return;
+    (stats_->*target_) += dxmt::clock::now() - begin_;
+    stats_ = nullptr;
+  }
+
+  ScopedFrameDuration(const ScopedFrameDuration &) = delete;
+  ScopedFrameDuration &operator=(const ScopedFrameDuration &) = delete;
+
+private:
+  FrameStatistics *stats_;
+  FrameDurationMember target_;
+  dxmt::clock::time_point begin_;
+};
+
+template <typename Context>
+inline FrameStatistics *frameStatisticsForContext(Context &context) {
+  return enabled() ? &context.currentFrameStatistics() : nullptr;
+}
+
+inline void addFrameCounter(FrameStatistics *stats, FrameCounterMember target,
+                            uint64_t count = 1) {
+  if (stats && target)
+    (stats->*target) += count;
+}
+
 void resetCurrentFrameApiGapMarker(dxmt::clock::time_point now);
 void recordFrameBoundaryApiGap(FrameStatistics *stats,
                                dxmt::clock::time_point boundary_time);
