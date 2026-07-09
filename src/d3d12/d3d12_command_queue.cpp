@@ -7774,6 +7774,8 @@ private:
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
                                    packet.root_descriptors);
+          RecordCompiledDescriptorBackendStats(
+              dxmt::perf::currentFrameStatistics(), packet.root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           AddCompiledVertexBufferAccesses(
@@ -8128,6 +8130,8 @@ private:
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
                                    packet.root_descriptors);
+          RecordCompiledDescriptorBackendStats(
+              dxmt::perf::currentFrameStatistics(), packet.root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           RegisterCompiledDirectAccessList(direct_access);
@@ -15596,6 +15600,26 @@ private:
       fn(*resource_mirror);
     if (sampler_mirror && sampler_mirror != resource_mirror)
       fn(*sampler_mirror);
+  }
+
+  static void RecordCompiledDescriptorBackendStats(
+      dxmt::FrameStatistics *stats,
+      const std::vector<CompiledCommandRootDescriptorTable> &tables) {
+    if (!stats)
+      return;
+    for (const auto &table : tables) {
+      if (!table.resolved)
+        continue;
+      stats->frame_native_descriptor_root_tables++;
+      if (table.descriptor_table_backend_ready)
+        stats->frame_native_descriptor_root_table_backend_ready++;
+      if (table.native_descriptor_record_storage_ready)
+        stats->frame_native_descriptor_record_storage_ready++;
+      if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+        stats->frame_native_descriptor_sampler_root_tables++;
+      else
+        stats->frame_native_descriptor_resource_root_tables++;
+    }
   }
 
   void EncodeCompiledArgumentTables(

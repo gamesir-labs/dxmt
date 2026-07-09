@@ -67,6 +67,26 @@ const char *CompiledCommandFallbackReasonName(
     return "snapshot_dependent";
   case CompiledCommandFallbackReason::TemporalUpscale:
     return "temporal_upscale";
+  case CompiledCommandFallbackReason::NativeUnsupportedRootSignature:
+    return "native_unsupported_root_signature";
+  case CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange:
+    return "native_unsupported_descriptor_range";
+  case CompiledCommandFallbackReason::NativeUnsupportedRootDescriptor:
+    return "native_unsupported_root_descriptor";
+  case CompiledCommandFallbackReason::NativeUnsupportedGeometryPipeline:
+    return "native_unsupported_geometry_pipeline";
+  case CompiledCommandFallbackReason::NativeUnsupportedTessellationPipeline:
+    return "native_unsupported_tessellation_pipeline";
+  case CompiledCommandFallbackReason::NativeUnsupportedExecuteIndirect:
+    return "native_unsupported_execute_indirect";
+  case CompiledCommandFallbackReason::NativeUnsupportedDynamicResource:
+    return "native_unsupported_dynamic_resource";
+  case CompiledCommandFallbackReason::NativeMissingDescriptorBackend:
+    return "native_missing_descriptor_backend";
+  case CompiledCommandFallbackReason::NativeShaderAbiMismatch:
+    return "native_shader_abi_mismatch";
+  case CompiledCommandFallbackReason::NativeResidencyUnsupported:
+    return "native_residency_unsupported";
   case CompiledCommandFallbackReason::UnsupportedRootSignature:
     return "unsupported_root_signature";
   case CompiledCommandFallbackReason::UnsupportedDescriptorTable:
@@ -100,6 +120,26 @@ CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason) {
   case CompiledCommandFallbackReason::SnapshotDependent:
   case CompiledCommandFallbackReason::TemporalUpscale:
     return dxmt::CompiledFallbackReason::MissingCompiledEncoder;
+  case CompiledCommandFallbackReason::NativeUnsupportedRootSignature:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedRootSignature;
+  case CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedDescriptorRange;
+  case CompiledCommandFallbackReason::NativeUnsupportedRootDescriptor:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedRootDescriptor;
+  case CompiledCommandFallbackReason::NativeUnsupportedGeometryPipeline:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedGeometryPipeline;
+  case CompiledCommandFallbackReason::NativeUnsupportedTessellationPipeline:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedTessellationPipeline;
+  case CompiledCommandFallbackReason::NativeUnsupportedExecuteIndirect:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedExecuteIndirect;
+  case CompiledCommandFallbackReason::NativeUnsupportedDynamicResource:
+    return dxmt::CompiledFallbackReason::NativeUnsupportedDynamicResource;
+  case CompiledCommandFallbackReason::NativeMissingDescriptorBackend:
+    return dxmt::CompiledFallbackReason::NativeMissingDescriptorBackend;
+  case CompiledCommandFallbackReason::NativeShaderAbiMismatch:
+    return dxmt::CompiledFallbackReason::NativeShaderAbiMismatch;
+  case CompiledCommandFallbackReason::NativeResidencyUnsupported:
+    return dxmt::CompiledFallbackReason::NativeResidencyUnsupported;
   case CompiledCommandFallbackReason::LegacyPipelineState:
     return dxmt::CompiledFallbackReason::LegacyPath;
   case CompiledCommandFallbackReason::NonBindlessPipelineState:
@@ -502,13 +542,13 @@ CompiledPipelineFallbackReasonFromMetadata(
   if (!metadata.type_matches)
     return CompiledCommandFallbackReason::LegacyPipelineState;
   if (!compute && metadata.uses_geometry)
-    return CompiledCommandFallbackReason::GeometryPipeline;
+    return CompiledCommandFallbackReason::NativeUnsupportedGeometryPipeline;
   if (!compute && metadata.uses_tessellation)
-    return CompiledCommandFallbackReason::TessellationPipeline;
+    return CompiledCommandFallbackReason::NativeUnsupportedTessellationPipeline;
   if (!metadata.uses_bindless_mirror)
     return CompiledCommandFallbackReason::NonBindlessPipelineState;
   if (!metadata.has_root_signature)
-    return CompiledCommandFallbackReason::MissingRootSignature;
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
   if (metadata.ordinary_bindless && !metadata.metal_pso_ready)
     return CompiledCommandFallbackReason::LegacyPipelineState;
   return CompiledCommandFallbackReason::None;
@@ -777,7 +817,7 @@ MaterializeCompiledRootDescriptorTable(
     const CompiledCommandDescriptorHeaps &heaps,
     const RootSignatureParameter &parameter) {
   if (!table.base_descriptor.ptr)
-    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
 
   D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
   UINT descriptor_count = 0;
@@ -788,35 +828,34 @@ MaterializeCompiledRootDescriptorTable(
       parameter, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
       &sampler_descriptor_count);
   if (has_resource_ranges && has_sampler_ranges)
-    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
   if (has_resource_ranges) {
     heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   } else if (has_sampler_ranges) {
     heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     descriptor_count = sampler_descriptor_count;
   } else {
-    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
   }
 
   auto *heap = GetCompiledDescriptorHeap(heaps, heap_type);
   if (!heap)
-    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+    return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
 
   auto *mirror = heap->GetMirror();
-  if (!mirror || !mirror->descriptorTableBuffer() ||
-      !mirror->descriptorTableGpuAddress() || !mirror->argumentTable())
-    return CompiledCommandFallbackReason::UnsupportedArgumentTable;
+  if (!mirror || !mirror->descriptorTableBackendReady())
+    return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
   if (heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
       !mirror->textureViewPoolBaseResourceID())
-    return CompiledCommandFallbackReason::UnsupportedArgumentTable;
+    return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
 
   const auto *base = heap->GetDescriptorRecord(table.base_descriptor);
   if (!base || !base->shader_visible || base->heap_type != heap_type)
-    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
   if (descriptor_count &&
       (base->heap_index >= base->heap_count ||
        descriptor_count > base->heap_count - base->heap_index))
-    return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
 
   table.heap_type = heap_type;
   table.heap_index = base->heap_index;
@@ -833,25 +872,28 @@ MaterializeCompiledRootDescriptorTable(
   table.mirror = mirror;
   table.resolved = true;
   table.argument_table_ready = true;
+  table.descriptor_table_backend_ready = mirror->descriptorTableBackendReady();
+  table.native_descriptor_record_storage_ready =
+      mirror->nativeDescriptorRecordStorageReady();
   return CompiledCommandFallbackReason::None;
 }
 
 static CompiledCommandFallbackReason
 MaterializeCompiledGraphicsRootTables(CompiledGraphicsPacket &packet) {
   if (!packet.pipeline.root_signature)
-    return CompiledCommandFallbackReason::MissingRootSignature;
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
 
   auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
   if (!root)
-    return CompiledCommandFallbackReason::MissingRootSignature;
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
 
   const auto parameters = root->GetParameters();
   for (auto &table : packet.root_tables) {
     if (table.root_parameter_index >= parameters.size())
-      return CompiledCommandFallbackReason::UnsupportedRootSignature;
+      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
     const auto &parameter = parameters[table.root_parameter_index];
     if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-      return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
 
     const auto reason = MaterializeCompiledRootDescriptorTable(
         table, packet.descriptor_heaps, parameter);
@@ -865,19 +907,19 @@ MaterializeCompiledGraphicsRootTables(CompiledGraphicsPacket &packet) {
 static CompiledCommandFallbackReason
 MaterializeCompiledComputeRootTables(CompiledComputePacket &packet) {
   if (!packet.pipeline.root_signature)
-    return CompiledCommandFallbackReason::MissingRootSignature;
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
 
   auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
   if (!root)
-    return CompiledCommandFallbackReason::MissingRootSignature;
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
 
   const auto parameters = root->GetParameters();
   for (auto &table : packet.root_tables) {
     if (table.root_parameter_index >= parameters.size())
-      return CompiledCommandFallbackReason::UnsupportedRootSignature;
+      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
     const auto &parameter = parameters[table.root_parameter_index];
     if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-      return CompiledCommandFallbackReason::UnsupportedDescriptorTable;
+      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
 
     const auto reason = MaterializeCompiledRootDescriptorTable(
         table, packet.descriptor_heaps, parameter);
@@ -948,7 +990,7 @@ FallbackReasonForCommandRecord(const CommandRecordPayload &payload) {
       std::holds_alternative<WriteBufferImmediateRecord>(payload))
     return CompiledCommandFallbackReason::QueryOrPredication;
   if (std::holds_alternative<ExecuteIndirectRecord>(payload))
-    return CompiledCommandFallbackReason::ExecuteIndirect;
+    return CompiledCommandFallbackReason::NativeUnsupportedExecuteIndirect;
   if (std::holds_alternative<TemporalUpscaleRecord>(payload))
     return CompiledCommandFallbackReason::TemporalUpscale;
   return CompiledCommandFallbackReason::ConservativeCompiler;

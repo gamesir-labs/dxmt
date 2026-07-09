@@ -107,6 +107,13 @@ struct Counters {
   std::atomic<uint64_t> descriptor_content_write_sampler = {0};
   std::atomic<uint64_t> descriptor_content_write_copy = {0};
   std::atomic<uint64_t> descriptor_content_write_feedback_uav = {0};
+  std::atomic<uint64_t> native_descriptor_buffer_records = {0};
+  std::atomic<uint64_t> native_descriptor_buffer_record_cbv = {0};
+  std::atomic<uint64_t> native_descriptor_buffer_record_srv = {0};
+  std::atomic<uint64_t> native_descriptor_buffer_record_uav = {0};
+  std::atomic<uint64_t> native_descriptor_buffer_record_counters = {0};
+  std::atomic<uint64_t> native_descriptor_buffer_record_missing_resource = {0};
+  std::atomic<uint64_t> native_descriptor_resource_table_entries = {0};
   std::atomic<uint64_t> avg_command_buffers = {0};
   std::atomic<uint64_t> avg_render_passes = {0};
   std::atomic<uint64_t> avg_render_draws = {0};
@@ -699,6 +706,27 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
           0, std::memory_order_relaxed);
   frame_stats_with_external.frame_descriptor_content_write_feedback_uav =
       g_counters.descriptor_content_write_feedback_uav.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_buffer_records =
+      g_counters.native_descriptor_buffer_records.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_buffer_record_cbv =
+      g_counters.native_descriptor_buffer_record_cbv.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_buffer_record_srv =
+      g_counters.native_descriptor_buffer_record_srv.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_buffer_record_uav =
+      g_counters.native_descriptor_buffer_record_uav.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_buffer_record_counters =
+      g_counters.native_descriptor_buffer_record_counters.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_buffer_record_missing_resource =
+      g_counters.native_descriptor_buffer_record_missing_resource.exchange(
+          0, std::memory_order_relaxed);
+  frame_stats_with_external.frame_native_descriptor_resource_table_entries =
+      g_counters.native_descriptor_resource_table_entries.exchange(
           0, std::memory_order_relaxed);
 
   g_counters.frames.fetch_add(1, std::memory_order_relaxed);
@@ -1377,6 +1405,36 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " compiledFallbackReasonResidency=",
                   compiled_fallback_reason_count(
                       CompiledFallbackReason::Residency),
+                  " compiledFallbackReasonNativeUnsupportedRootSignature=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedRootSignature),
+                  " compiledFallbackReasonNativeUnsupportedDescriptorRange=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedDescriptorRange),
+                  " compiledFallbackReasonNativeUnsupportedRootDescriptor=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedRootDescriptor),
+                  " compiledFallbackReasonNativeUnsupportedGeometryPipeline=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedGeometryPipeline),
+                  " compiledFallbackReasonNativeUnsupportedTessellationPipeline=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedTessellationPipeline),
+                  " compiledFallbackReasonNativeUnsupportedExecuteIndirect=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedExecuteIndirect),
+                  " compiledFallbackReasonNativeUnsupportedDynamicResource=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeUnsupportedDynamicResource),
+                  " compiledFallbackReasonNativeMissingDescriptorBackend=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeMissingDescriptorBackend),
+                  " compiledFallbackReasonNativeShaderAbiMismatch=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeShaderAbiMismatch),
+                  " compiledFallbackReasonNativeResidencyUnsupported=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeResidencyUnsupported),
                   " compiledFallbackReasonUnknown=",
                   compiled_fallback_reason_count(
                       CompiledFallbackReason::Unknown),
@@ -1480,6 +1538,37 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   frame_stats.frame_replay_snapshot_captured_vertex_buffers,
                   " replaySnapshotCapturedBindless=",
                   frame_stats.frame_replay_snapshot_captured_bindless,
+                  " nativeDescriptorRootTables=",
+                  frame_stats.frame_native_descriptor_root_tables,
+                  " nativeDescriptorRootTableBackendReady=",
+                  frame_stats.frame_native_descriptor_root_table_backend_ready,
+                  " nativeDescriptorRecordStorageReady=",
+                  frame_stats.frame_native_descriptor_record_storage_ready,
+                  " nativeDescriptorResourceRootTables=",
+                  frame_stats.frame_native_descriptor_resource_root_tables,
+                  " nativeDescriptorSamplerRootTables=",
+                  frame_stats.frame_native_descriptor_sampler_root_tables,
+                  " nativeDescriptorBufferRecords=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_buffer_records,
+                  " nativeDescriptorBufferRecordCBV=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_buffer_record_cbv,
+                  " nativeDescriptorBufferRecordSRV=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_buffer_record_srv,
+                  " nativeDescriptorBufferRecordUAV=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_buffer_record_uav,
+                  " nativeDescriptorBufferRecordCounters=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_buffer_record_counters,
+                  " nativeDescriptorBufferRecordMissingResource=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_buffer_record_missing_resource,
+                  " nativeDescriptorResourceTableEntries=",
+                  frame_stats_with_external
+                      .frame_native_descriptor_resource_table_entries,
                   " descriptorContentWrites=",
                   frame_stats_with_external.frame_descriptor_content_writes,
                   " descriptorContentWriteCBV=",
@@ -1782,6 +1871,50 @@ void recordDescriptorContentWrite(uint32_t kind) {
   default:
     break;
   }
+}
+
+void recordNativeDescriptorBufferRecord(uint32_t kind) {
+  if (!enabled())
+    return;
+  g_counters.native_descriptor_buffer_records.fetch_add(
+      1, std::memory_order_relaxed);
+  switch (kind) {
+  case 1:
+    g_counters.native_descriptor_buffer_record_cbv.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 2:
+    g_counters.native_descriptor_buffer_record_srv.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  case 3:
+    g_counters.native_descriptor_buffer_record_uav.fetch_add(
+        1, std::memory_order_relaxed);
+    break;
+  default:
+    break;
+  }
+}
+
+void recordNativeDescriptorBufferRecordCounter() {
+  if (!enabled())
+    return;
+  g_counters.native_descriptor_buffer_record_counters.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void recordNativeDescriptorBufferRecordMissingResource() {
+  if (!enabled())
+    return;
+  g_counters.native_descriptor_buffer_record_missing_resource.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void recordNativeDescriptorResourceTableEntry() {
+  if (!enabled())
+    return;
+  g_counters.native_descriptor_resource_table_entries.fetch_add(
+      1, std::memory_order_relaxed);
 }
 
 } // namespace dxmt::perf

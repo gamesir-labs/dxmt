@@ -41,6 +41,16 @@ enum class CompiledFallbackReason : uint32_t {
   UnsupportedResourceAccess,
   UnsupportedArgumentTable,
   Residency,
+  NativeUnsupportedRootSignature,
+  NativeUnsupportedDescriptorRange,
+  NativeUnsupportedRootDescriptor,
+  NativeUnsupportedGeometryPipeline,
+  NativeUnsupportedTessellationPipeline,
+  NativeUnsupportedExecuteIndirect,
+  NativeUnsupportedDynamicResource,
+  NativeMissingDescriptorBackend,
+  NativeShaderAbiMismatch,
+  NativeResidencyUnsupported,
   Unknown,
   Count,
 };
@@ -366,6 +376,18 @@ struct FrameStatistics {
   uint64_t frame_replay_snapshot_captured_root_constants = 0;
   uint64_t frame_replay_snapshot_captured_vertex_buffers = 0;
   uint64_t frame_replay_snapshot_captured_bindless = 0;
+  uint64_t frame_native_descriptor_root_tables = 0;
+  uint64_t frame_native_descriptor_root_table_backend_ready = 0;
+  uint64_t frame_native_descriptor_record_storage_ready = 0;
+  uint64_t frame_native_descriptor_resource_root_tables = 0;
+  uint64_t frame_native_descriptor_sampler_root_tables = 0;
+  uint64_t frame_native_descriptor_buffer_records = 0;
+  uint64_t frame_native_descriptor_buffer_record_cbv = 0;
+  uint64_t frame_native_descriptor_buffer_record_srv = 0;
+  uint64_t frame_native_descriptor_buffer_record_uav = 0;
+  uint64_t frame_native_descriptor_buffer_record_counters = 0;
+  uint64_t frame_native_descriptor_buffer_record_missing_resource = 0;
+  uint64_t frame_native_descriptor_resource_table_entries = 0;
   uint64_t frame_descriptor_content_writes = 0;
   uint64_t frame_descriptor_content_write_cbv = 0;
   uint64_t frame_descriptor_content_write_srv = 0;
@@ -683,6 +705,18 @@ struct FrameStatistics {
     frame_replay_snapshot_captured_root_constants = 0;
     frame_replay_snapshot_captured_vertex_buffers = 0;
     frame_replay_snapshot_captured_bindless = 0;
+    frame_native_descriptor_root_tables = 0;
+    frame_native_descriptor_root_table_backend_ready = 0;
+    frame_native_descriptor_record_storage_ready = 0;
+    frame_native_descriptor_resource_root_tables = 0;
+    frame_native_descriptor_sampler_root_tables = 0;
+    frame_native_descriptor_buffer_records = 0;
+    frame_native_descriptor_buffer_record_cbv = 0;
+    frame_native_descriptor_buffer_record_srv = 0;
+    frame_native_descriptor_buffer_record_uav = 0;
+    frame_native_descriptor_buffer_record_counters = 0;
+    frame_native_descriptor_buffer_record_missing_resource = 0;
+    frame_native_descriptor_resource_table_entries = 0;
     frame_descriptor_content_writes = 0;
     frame_descriptor_content_write_cbv = 0;
     frame_descriptor_content_write_srv = 0;
@@ -1052,6 +1086,18 @@ public:
       average_.frame_replay_snapshot_captured_root_constants += frames_[i].frame_replay_snapshot_captured_root_constants;
       average_.frame_replay_snapshot_captured_vertex_buffers += frames_[i].frame_replay_snapshot_captured_vertex_buffers;
       average_.frame_replay_snapshot_captured_bindless += frames_[i].frame_replay_snapshot_captured_bindless;
+      average_.frame_native_descriptor_root_tables += frames_[i].frame_native_descriptor_root_tables;
+      average_.frame_native_descriptor_root_table_backend_ready += frames_[i].frame_native_descriptor_root_table_backend_ready;
+      average_.frame_native_descriptor_record_storage_ready += frames_[i].frame_native_descriptor_record_storage_ready;
+      average_.frame_native_descriptor_resource_root_tables += frames_[i].frame_native_descriptor_resource_root_tables;
+      average_.frame_native_descriptor_sampler_root_tables += frames_[i].frame_native_descriptor_sampler_root_tables;
+      average_.frame_native_descriptor_buffer_records += frames_[i].frame_native_descriptor_buffer_records;
+      average_.frame_native_descriptor_buffer_record_cbv += frames_[i].frame_native_descriptor_buffer_record_cbv;
+      average_.frame_native_descriptor_buffer_record_srv += frames_[i].frame_native_descriptor_buffer_record_srv;
+      average_.frame_native_descriptor_buffer_record_uav += frames_[i].frame_native_descriptor_buffer_record_uav;
+      average_.frame_native_descriptor_buffer_record_counters += frames_[i].frame_native_descriptor_buffer_record_counters;
+      average_.frame_native_descriptor_buffer_record_missing_resource += frames_[i].frame_native_descriptor_buffer_record_missing_resource;
+      average_.frame_native_descriptor_resource_table_entries += frames_[i].frame_native_descriptor_resource_table_entries;
       average_.frame_descriptor_content_writes += frames_[i].frame_descriptor_content_writes;
       average_.frame_descriptor_content_write_cbv += frames_[i].frame_descriptor_content_write_cbv;
       average_.frame_descriptor_content_write_srv += frames_[i].frame_descriptor_content_write_srv;
@@ -1352,6 +1398,18 @@ public:
     average_.frame_replay_snapshot_captured_root_constants /= (kFrameStatisticsCount - 1);
     average_.frame_replay_snapshot_captured_vertex_buffers /= (kFrameStatisticsCount - 1);
     average_.frame_replay_snapshot_captured_bindless /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_root_tables /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_root_table_backend_ready /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_record_storage_ready /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_resource_root_tables /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_sampler_root_tables /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_buffer_records /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_buffer_record_cbv /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_buffer_record_srv /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_buffer_record_uav /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_buffer_record_counters /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_buffer_record_missing_resource /= (kFrameStatisticsCount - 1);
+    average_.frame_native_descriptor_resource_table_entries /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_writes /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_cbv /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_srv /= (kFrameStatisticsCount - 1);

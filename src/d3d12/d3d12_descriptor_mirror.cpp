@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <utility>
 
 namespace dxmt::d3d12 {
 namespace {
@@ -79,7 +80,38 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
     }
   }
   table_entries_.assign(num_descriptors_, {});
+  slot_meta_.resize(num_descriptors_);
   residency_targets_.resize(num_descriptors_);
+
+  if (!sampler_heap_) {
+    buffer_resources_.push_back({});
+    WMTBufferInfo record_info = {};
+    record_info.length =
+        num_descriptors_
+            ? uint64_t(num_descriptors_) * sizeof(BufferDescriptorRecord)
+            : sizeof(BufferDescriptorRecord);
+    record_info.options = static_cast<WMTResourceOptions>(
+        WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
+    record_info.memory.set(nullptr);
+    buffer_record_buffer_ = device.newBuffer(record_info);
+    if (!buffer_record_buffer_) {
+      ERR("DescriptorHeapMirror: failed to allocate buffer descriptor records length=",
+          record_info.length);
+    } else {
+      buffer_record_gpu_address_ = record_info.gpu_address;
+      buffer_record_mapped_ = reinterpret_cast<BufferDescriptorRecord *>(
+          record_info.memory.get_accessible_or_null());
+      if (!buffer_record_mapped_) {
+        ERR("DescriptorHeapMirror: buffer descriptor records are not CPU-accessible length=",
+            record_info.length);
+      } else {
+        const auto record_count =
+            record_info.length / sizeof(BufferDescriptorRecord);
+        std::fill(buffer_record_mapped_, buffer_record_mapped_ + record_count,
+                  BufferDescriptorRecord{});
+      }
+    }
+  }
 
   WMTArgumentTableInfo table = {};
   table.max_buffer_bind_count =
@@ -118,6 +150,30 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
   filled_generation_.assign(num_descriptors_, UINT64_MAX);
 }
 
+uint32_t
+DescriptorHeapMirror::RegisterBufferResource(WMT::Resource allocation) {
+  if (sampler_heap_ || !allocation)
+    return kNullDescriptorResourceIndex;
+
+  const obj_handle_t handle = allocation.handle;
+  auto found = buffer_resource_indices_.find(handle);
+  if (found != buffer_resource_indices_.end())
+    return found->second;
+
+  if (buffer_resources_.size() >= UINT32_MAX)
+    return kNullDescriptorResourceIndex;
+
+  DescriptorBackendResourceRecord record = {};
+  record.allocation = allocation;
+  record.allocation_handle = handle;
+  record.generation = ++buffer_resource_table_generation_;
+
+  const auto index = static_cast<uint32_t>(buffer_resources_.size());
+  buffer_resources_.push_back(std::move(record));
+  buffer_resource_indices_.emplace(handle, index);
+  return index;
+}
+
 void
 DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry) {
   if (index >= table_entries_.size())
@@ -128,8 +184,24 @@ DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry
 }
 
 void
+DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
+                                    DescriptorBackendSlotKind kind,
+                                    uint32_t flags) {
+  if (index >= slot_meta_.size())
+    return;
+  auto &meta = slot_meta_[index];
+  meta.kind = kind;
+  meta.flags = flags;
+  meta.generation++;
+  if (!meta.generation)
+    meta.generation = 1;
+}
+
+void
 DescriptorHeapMirror::WriteNullTableEntry(uint32_t index) {
   WriteTableEntry(index, {});
+  WriteBufferDescriptorRecord(index, {});
+  WriteSlotMeta(index, DescriptorBackendSlotKind::Empty);
 }
 
 void
@@ -139,6 +211,16 @@ DescriptorHeapMirror::WriteBufferTableEntry(uint32_t index, uint64_t gpu_va,
   WriteTableEntry(index, {gpu_va, 0,
                           BufferDescriptorMetadata(size, typed,
                                                    texture_view_offset)});
+  WriteSlotMeta(index, DescriptorBackendSlotKind::Buffer,
+                typed ? BufferDescriptorRecordFlagTyped : 0u);
+}
+
+void
+DescriptorHeapMirror::WriteBufferDescriptorRecord(
+    uint32_t index, const BufferDescriptorRecord &record) {
+  if (!buffer_record_mapped_ || index >= num_descriptors_)
+    return;
+  buffer_record_mapped_[index] = record;
 }
 
 void
@@ -146,6 +228,8 @@ DescriptorHeapMirror::WriteTextureTableEntry(uint32_t index,
                                              uint64_t gpu_resource_id,
                                              float min_lod) {
   WriteTableEntry(index, {0, gpu_resource_id, FloatMetadata(min_lod)});
+  WriteBufferDescriptorRecord(index, {});
+  WriteSlotMeta(index, DescriptorBackendSlotKind::Texture);
 }
 
 void
@@ -160,6 +244,7 @@ DescriptorHeapMirror::WriteSamplerTableEntry(uint32_t index,
   const uint64_t sampler_handle = sampler ? sampler->sampler_state_handle : 0;
   const float lod_bias = sampler ? sampler->lod_bias : 0.0f;
   WriteTableEntry(index, {sampler_handle, 0, FloatMetadata(lod_bias)});
+  WriteSlotMeta(index, DescriptorBackendSlotKind::Sampler);
 }
 
 uint64_t

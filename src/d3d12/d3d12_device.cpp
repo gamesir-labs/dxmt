@@ -1130,14 +1130,22 @@ MaterializeSamplerMirrorForWrite(WMT::Device device,
                                  record.materialized_sampler.ptr(), 0);
 }
 
+struct BufferDescriptorMaterialization {
+  UINT64 view_offset = 0;
+  uint64_t byte_size = 0;
+  uint32_t stride = 0;
+  uint32_t format = DXGI_FORMAT_UNKNOWN;
+  uint32_t flags = 0;
+  bool typed = false;
+};
+
 static bool
-GetBufferSrvAddressAndMetadata(WMT::Device device, Resource &resource,
-                               const DescriptorRecord &record,
-                               uint64_t &gpu_va, uint64_t &byte_size,
-                               bool &typed) {
-  UINT64 offset = 0;
-  byte_size = resource.GetResourceDesc().Width;
-  typed = false;
+GetBufferSrvMaterialization(WMT::Device device, Resource &resource,
+                            const DescriptorRecord &record,
+                            BufferDescriptorMaterialization &out) {
+  out = {};
+  out.byte_size = resource.GetResourceDesc().Width;
+  out.flags = BufferDescriptorRecordFlagSRV;
 
   if (record.has_desc) {
     const auto &srv = record.desc.srv;
@@ -1146,38 +1154,43 @@ GetBufferSrvAddressAndMetadata(WMT::Device device, Resource &resource,
 
     const UINT64 first_element = srv.Buffer.FirstElement;
     if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-      offset += first_element * sizeof(uint32_t);
-      byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
+      out.view_offset += first_element * sizeof(uint32_t);
+      out.byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
+      out.stride = sizeof(uint32_t);
+      out.flags |= BufferDescriptorRecordFlagRaw;
     } else if (srv.Format != DXGI_FORMAT_UNKNOWN) {
       MTL_DXGI_FORMAT_DESC format = {};
       if (FAILED(MTLQueryDXGIFormat(device, srv.Format, format)) ||
           !format.BytesPerTexel)
         return false;
-      offset += first_element * format.BytesPerTexel;
-      byte_size = UINT64(srv.Buffer.NumElements) * format.BytesPerTexel;
-      typed = true;
+      out.view_offset += first_element * format.BytesPerTexel;
+      out.byte_size = UINT64(srv.Buffer.NumElements) * format.BytesPerTexel;
+      out.stride = format.BytesPerTexel;
+      out.format = srv.Format;
+      out.typed = true;
+      out.flags |= BufferDescriptorRecordFlagTyped;
     } else if (srv.Buffer.StructureByteStride) {
-      offset += first_element * srv.Buffer.StructureByteStride;
-      byte_size = UINT64(srv.Buffer.NumElements) *
-                  srv.Buffer.StructureByteStride;
+      out.view_offset += first_element * srv.Buffer.StructureByteStride;
+      out.byte_size = UINT64(srv.Buffer.NumElements) *
+                      srv.Buffer.StructureByteStride;
+      out.stride = srv.Buffer.StructureByteStride;
+      out.flags |= BufferDescriptorRecordFlagStructured;
     } else {
-      offset += first_element;
-      byte_size = srv.Buffer.NumElements;
+      out.view_offset += first_element;
+      out.byte_size = srv.Buffer.NumElements;
     }
   }
 
-  gpu_va = resource.GetGpuVirtualAddress() + offset;
   return true;
 }
 
 static bool
-GetBufferUavAddressAndMetadata(WMT::Device device, Resource &resource,
-                               const DescriptorRecord &record,
-                               uint64_t &gpu_va, uint64_t &byte_size,
-                               bool &typed) {
-  UINT64 offset = 0;
-  byte_size = resource.GetResourceDesc().Width;
-  typed = false;
+GetBufferUavMaterialization(WMT::Device device, Resource &resource,
+                            const DescriptorRecord &record,
+                            BufferDescriptorMaterialization &out) {
+  out = {};
+  out.byte_size = resource.GetResourceDesc().Width;
+  out.flags = BufferDescriptorRecordFlagUAV;
 
   if (record.has_desc) {
     const auto &uav = record.desc.uav;
@@ -1186,27 +1199,33 @@ GetBufferUavAddressAndMetadata(WMT::Device device, Resource &resource,
 
     const UINT64 first_element = uav.Buffer.FirstElement;
     if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
-      offset += first_element * sizeof(uint32_t);
-      byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
+      out.view_offset += first_element * sizeof(uint32_t);
+      out.byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
+      out.stride = sizeof(uint32_t);
+      out.flags |= BufferDescriptorRecordFlagRaw;
     } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
       MTL_DXGI_FORMAT_DESC format = {};
       if (FAILED(MTLQueryDXGIFormat(device, uav.Format, format)) ||
           !format.BytesPerTexel)
         return false;
-      offset += first_element * format.BytesPerTexel;
-      byte_size = UINT64(uav.Buffer.NumElements) * format.BytesPerTexel;
-      typed = true;
+      out.view_offset += first_element * format.BytesPerTexel;
+      out.byte_size = UINT64(uav.Buffer.NumElements) * format.BytesPerTexel;
+      out.stride = format.BytesPerTexel;
+      out.format = uav.Format;
+      out.typed = true;
+      out.flags |= BufferDescriptorRecordFlagTyped;
     } else if (uav.Buffer.StructureByteStride) {
-      offset += first_element * uav.Buffer.StructureByteStride;
-      byte_size = UINT64(uav.Buffer.NumElements) *
-                  uav.Buffer.StructureByteStride;
+      out.view_offset += first_element * uav.Buffer.StructureByteStride;
+      out.byte_size = UINT64(uav.Buffer.NumElements) *
+                      uav.Buffer.StructureByteStride;
+      out.stride = uav.Buffer.StructureByteStride;
+      out.flags |= BufferDescriptorRecordFlagStructured;
     } else {
-      offset += first_element;
-      byte_size = uav.Buffer.NumElements;
+      out.view_offset += first_element;
+      out.byte_size = uav.Buffer.NumElements;
     }
   }
 
-  gpu_va = resource.GetGpuVirtualAddress() + offset;
   return true;
 }
 
@@ -1738,6 +1757,88 @@ DescriptorBufferResidencyAllocation(Resource *resource) {
   return WMT::Resource{resource->GetBufferAllocation()->buffer().handle};
 }
 
+static bool
+RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror,
+                                 Resource *resource,
+                                 uint32_t &resource_index) {
+  const auto before_count = mirror.backendResourceCount();
+  resource_index = mirror.RegisterBufferResource(
+      DescriptorBufferResidencyAllocation(resource));
+  if (mirror.backendResourceCount() > before_count)
+    dxmt::perf::recordNativeDescriptorResourceTableEntry();
+  return resource_index != kNullDescriptorResourceIndex;
+}
+
+static bool
+WriteNativeBufferDescriptorRecord(DescriptorHeapMirror &mirror, UINT slot,
+                                  Resource *resource,
+                                  const BufferDescriptorMaterialization &view,
+                                  DescriptorRecordType type) {
+  BufferDescriptorRecord native = {};
+  native.flags = BufferDescriptorRecordFlagValid | view.flags;
+  native.byte_size = view.byte_size;
+  native.stride = view.stride;
+  native.format = view.format;
+
+  if (type == DescriptorRecordType::ConstantBufferView)
+    native.flags |= BufferDescriptorRecordFlagCBV;
+
+  if (!RegisterBufferDescriptorResource(mirror, resource,
+                                        native.resource_index)) {
+    mirror.WriteBufferDescriptorRecord(slot, {});
+    dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
+    return false;
+  }
+
+  native.byte_offset = resource->GetHeapOffset() + view.view_offset;
+  mirror.WriteBufferDescriptorRecord(slot, native);
+
+  switch (type) {
+  case DescriptorRecordType::ConstantBufferView:
+    dxmt::perf::recordNativeDescriptorBufferRecord(1);
+    break;
+  case DescriptorRecordType::ShaderResourceView:
+    dxmt::perf::recordNativeDescriptorBufferRecord(2);
+    break;
+  case DescriptorRecordType::UnorderedAccessView:
+    dxmt::perf::recordNativeDescriptorBufferRecord(3);
+    break;
+  default:
+    break;
+  }
+  return true;
+}
+
+static bool
+WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
+                            const DescriptorRecord &record) {
+  if (record.type != DescriptorRecordType::UnorderedAccessView ||
+      !record.counter_resource.ptr())
+    return false;
+
+  auto current = mirror.bufferDescriptorRecord(slot);
+  if (!current || !(current->flags & BufferDescriptorRecordFlagValid)) {
+    dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
+    return false;
+  }
+
+  auto native = *current;
+  auto *counter = GetResourceFromD3D12(record.counter_resource.ptr());
+  if (!RegisterBufferDescriptorResource(mirror, counter,
+                                        native.counter_resource_index)) {
+    dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
+    return false;
+  }
+
+  native.flags |= BufferDescriptorRecordFlagCounter;
+  native.counter_offset =
+      counter->GetHeapOffset() +
+      (record.has_desc ? record.desc.uav.Buffer.CounterOffsetInBytes : 0);
+  mirror.WriteBufferDescriptorRecord(slot, native);
+  dxmt::perf::recordNativeDescriptorBufferRecordCounter();
+  return true;
+}
+
 static WMT::Resource
 DescriptorTextureResidencyAllocation(Resource *resource) {
   if (!resource || !resource->GetTextureAllocation())
@@ -1857,6 +1958,14 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
     }
     mirror->WriteBufferTableEntry(slot, record.desc.cbv.BufferLocation,
                                   record.desc.cbv.SizeInBytes, false);
+    UINT64 offset = 0;
+    auto *resource = LookupBufferResourceByGpuVirtualAddress(
+        record.desc.cbv.BufferLocation, &offset);
+    BufferDescriptorMaterialization native = {};
+    native.view_offset = offset;
+    native.byte_size = record.desc.cbv.SizeInBytes;
+    WriteNativeBufferDescriptorRecord(*mirror, slot, resource, native,
+                                      DescriptorRecordType::ConstantBufferView);
     finish();
     return;
   }
@@ -1868,11 +1977,9 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       return;
     }
     if (resource->GetBuffer()) {
-      uint64_t gpu_va = 0;
-      uint64_t byte_size = 0;
-      bool typed = false;
-      if (!GetBufferSrvAddressAndMetadata(mtl_device, *resource, record, gpu_va,
-                                          byte_size, typed)) {
+      BufferDescriptorMaterialization native = {};
+      if (!GetBufferSrvMaterialization(mtl_device, *resource, record,
+                                       native)) {
         mirror->WriteNullTableEntry(slot);
         finish();
         return;
@@ -1881,7 +1988,12 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       // MSC texture-buffer view offset bits when the shader expects a typed
       // texture-buffer entry. This is a descriptor-write-time bridge for the
       // plain IRDescriptorTableSetBuffer encoding, not the final view metadata.
-      mirror->WriteBufferTableEntry(slot, gpu_va, byte_size, typed);
+      mirror->WriteBufferTableEntry(
+          slot, resource->GetGpuVirtualAddress() + native.view_offset,
+          native.byte_size, native.typed);
+      WriteNativeBufferDescriptorRecord(
+          *mirror, slot, resource, native,
+          DescriptorRecordType::ShaderResourceView);
       finish();
       return;
     }
@@ -1915,19 +2027,23 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       return;
     }
     if (resource->GetBuffer()) {
-      uint64_t gpu_va = 0;
-      uint64_t byte_size = 0;
-      bool typed = false;
-      if (!GetBufferUavAddressAndMetadata(mtl_device, *resource, record, gpu_va,
-                                          byte_size, typed)) {
+      BufferDescriptorMaterialization native = {};
+      if (!GetBufferUavMaterialization(mtl_device, *resource, record,
+                                       native)) {
         mirror->WriteNullTableEntry(slot);
         finish();
         return;
       }
-      // TODO(d3d12, bindless): UAV counters and typed texture-buffer view
-      // offset metadata need the MSC buffer-view helper path before append /
-      // consume UAV descriptors are complete in the descriptor table.
-      mirror->WriteBufferTableEntry(slot, gpu_va, byte_size, typed);
+      // TODO(d3d12, bindless): the legacy IRDescriptorTableEntry path still
+      // needs the MSC buffer-view helper before append / consume UAV
+      // descriptors are complete without the native descriptor-record ABI.
+      mirror->WriteBufferTableEntry(
+          slot, resource->GetGpuVirtualAddress() + native.view_offset,
+          native.byte_size, native.typed);
+      if (WriteNativeBufferDescriptorRecord(
+              *mirror, slot, resource, native,
+              DescriptorRecordType::UnorderedAccessView))
+        WriteNativeUavCounterRecord(*mirror, slot, record);
       finish();
       return;
     }

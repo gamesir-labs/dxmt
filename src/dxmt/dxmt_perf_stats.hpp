@@ -159,5 +159,9 @@ void recordComputePipelineCreate(uint64_t duration_us, bool success);
 void recordMetalCommandBufferCommit(uint64_t duration_us);
 void recordDrawableAcquire(uint64_t duration_us);
 void recordDescriptorContentWrite(uint32_t kind);
+void recordNativeDescriptorBufferRecord(uint32_t kind);
+void recordNativeDescriptorBufferRecordCounter();
+void recordNativeDescriptorBufferRecordMissingResource();
+void recordNativeDescriptorResourceTableEntry();
 
 } // namespace dxmt::perf

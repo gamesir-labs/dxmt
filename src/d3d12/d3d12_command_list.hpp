@@ -309,6 +309,16 @@ enum class CompiledCommandFallbackReason {
   QueryOrPredication,
   SnapshotDependent,
   TemporalUpscale,
+  NativeUnsupportedRootSignature,
+  NativeUnsupportedDescriptorRange,
+  NativeUnsupportedRootDescriptor,
+  NativeUnsupportedGeometryPipeline,
+  NativeUnsupportedTessellationPipeline,
+  NativeUnsupportedExecuteIndirect,
+  NativeUnsupportedDynamicResource,
+  NativeMissingDescriptorBackend,
+  NativeShaderAbiMismatch,
+  NativeResidencyUnsupported,
   UnsupportedRootSignature,
   UnsupportedDescriptorTable,
   UnsupportedRootDescriptor,
@@ -369,6 +379,8 @@ struct CompiledCommandRootDescriptorTable {
   DescriptorHeapMirror *mirror = nullptr;
   bool resolved = false;
   bool argument_table_ready = false;
+  bool descriptor_table_backend_ready = false;
+  bool native_descriptor_record_storage_ready = false;
 };
 
 struct CompiledCommandRootConstants {

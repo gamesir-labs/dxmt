@@ -5,6 +5,7 @@
 #include "dxmt_descriptor_mirror.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace dxmt {
@@ -21,6 +22,26 @@ enum class DescriptorArgumentTableKind {
   Sampler,
 };
 
+enum class DescriptorBackendSlotKind : uint32_t {
+  Empty,
+  Buffer,
+  Texture,
+  Sampler,
+};
+
+enum BufferDescriptorRecordFlag : uint32_t {
+  BufferDescriptorRecordFlagValid = 1u << 0,
+  BufferDescriptorRecordFlagCBV = 1u << 1,
+  BufferDescriptorRecordFlagSRV = 1u << 2,
+  BufferDescriptorRecordFlagUAV = 1u << 3,
+  BufferDescriptorRecordFlagRaw = 1u << 4,
+  BufferDescriptorRecordFlagTyped = 1u << 5,
+  BufferDescriptorRecordFlagStructured = 1u << 6,
+  BufferDescriptorRecordFlagCounter = 1u << 7,
+};
+
+inline constexpr uint32_t kNullDescriptorResourceIndex = 0;
+
 struct DescriptorTableEntry {
   uint64_t gpu_va = 0;
   uint64_t texture_view_id = 0;
@@ -28,6 +49,31 @@ struct DescriptorTableEntry {
 };
 
 static_assert(sizeof(DescriptorTableEntry) == sizeof(uint64_t) * 3);
+
+struct BufferDescriptorRecord {
+  uint32_t resource_index = kNullDescriptorResourceIndex;
+  uint32_t flags = 0;
+  uint64_t byte_offset = 0;
+  uint64_t byte_size = 0;
+  uint32_t stride = 0;
+  uint32_t format = 0;
+  uint32_t counter_resource_index = kNullDescriptorResourceIndex;
+  uint64_t counter_offset = 0;
+};
+
+static_assert(sizeof(BufferDescriptorRecord) == 48);
+
+struct DescriptorBackendResourceRecord {
+  WMT::Reference<WMT::Resource> allocation;
+  uint64_t allocation_handle = 0;
+  uint64_t generation = 0;
+};
+
+struct DescriptorSlotMeta {
+  DescriptorBackendSlotKind kind = DescriptorBackendSlotKind::Empty;
+  uint32_t flags = 0;
+  uint64_t generation = 0;
+};
 
 struct DescriptorResidencyTarget {
   WMT::Reference<WMT::Resource> allocation;
@@ -94,8 +140,29 @@ public:
 
   WMT::Buffer descriptorTableBuffer() const { return table_buffer_; }
 
+  uint64_t bufferDescriptorRecordGpuAddress() const {
+    return buffer_record_gpu_address_;
+  }
+
+  WMT::Buffer bufferDescriptorRecordBuffer() const {
+    return buffer_record_buffer_;
+  }
+
   uint32_t numDescriptors() const { return num_descriptors_; }
   bool isSamplerHeap() const { return sampler_heap_; }
+
+  bool descriptorTableBackendReady() const {
+    if (!argument_table_ || !table_buffer_ || !table_gpu_address_)
+      return false;
+    return sampler_heap_ || texture_view_pool_base_resource_id_;
+  }
+
+  bool nativeDescriptorRecordStorageReady() const {
+    return descriptorTableBackendReady() &&
+           (sampler_heap_ || (buffer_record_buffer_ &&
+                              buffer_record_gpu_address_ &&
+                              buffer_record_mapped_));
+  }
 
   DescriptorArgumentTableKind argumentTableKind() const {
     return sampler_heap_ ? DescriptorArgumentTableKind::Sampler
@@ -106,9 +173,34 @@ public:
     return index < table_entries_.size() ? &table_entries_[index] : nullptr;
   }
 
+  const BufferDescriptorRecord *bufferDescriptorRecord(uint32_t index) const {
+    return buffer_record_mapped_ && index < num_descriptors_
+               ? &buffer_record_mapped_[index]
+               : nullptr;
+  }
+
+  const DescriptorSlotMeta *slotMeta(uint32_t index) const {
+    return index < slot_meta_.size() ? &slot_meta_[index] : nullptr;
+  }
+
+  uint32_t RegisterBufferResource(WMT::Resource allocation);
+  const DescriptorBackendResourceRecord *
+  backendResourceRecord(uint32_t index) const {
+    return index < buffer_resources_.size() ? &buffer_resources_[index]
+                                            : nullptr;
+  }
+  uint32_t backendResourceCount() const {
+    return static_cast<uint32_t>(buffer_resources_.size());
+  }
+  uint64_t backendResourceTableGeneration() const {
+    return buffer_resource_table_generation_;
+  }
+
   void WriteNullTableEntry(uint32_t index);
   void WriteBufferTableEntry(uint32_t index, uint64_t gpu_va, uint64_t size,
                              bool typed, uint32_t texture_view_offset = 0);
+  void WriteBufferDescriptorRecord(uint32_t index,
+                                   const BufferDescriptorRecord &record);
   void WriteTextureTableEntry(uint32_t index, uint64_t gpu_resource_id,
                               float min_lod = 0.0f);
   void WriteTexturePoolTableEntry(uint32_t index, float min_lod = 0.0f);
@@ -208,19 +300,28 @@ public:
 
 private:
   void WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry);
+  void WriteSlotMeta(uint32_t index, DescriptorBackendSlotKind kind,
+                     uint32_t flags = 0);
 
   WMT::Reference<WMT::Buffer> buffer_;
   WMT::Reference<WMT::Buffer> table_buffer_;
+  WMT::Reference<WMT::Buffer> buffer_record_buffer_;
   WMT::Reference<WMT::ArgumentTable> argument_table_;
   WMT::Reference<WMT::TextureViewPool> texture_view_pool_;
   uint64_t *mapped_ = nullptr;
   DescriptorTableEntry *table_mapped_ = nullptr;
+  BufferDescriptorRecord *buffer_record_mapped_ = nullptr;
   uint64_t gpu_address_ = 0;
   uint64_t table_gpu_address_ = 0;
+  uint64_t buffer_record_gpu_address_ = 0;
   uint64_t texture_view_pool_base_resource_id_ = 0;
+  uint64_t buffer_resource_table_generation_ = 0;
   uint32_t num_descriptors_ = 0;
   bool sampler_heap_ = false;
   std::vector<DescriptorTableEntry> table_entries_;
+  std::vector<DescriptorBackendResourceRecord> buffer_resources_;
+  std::unordered_map<obj_handle_t, uint32_t> buffer_resource_indices_;
+  std::vector<DescriptorSlotMeta> slot_meta_;
   std::vector<DescriptorResidencyTarget> residency_targets_;
   // Per-slot generation bookkeeping. stale = bumped by Create*View (app thread);
   // filled = updated when the encode thread writes the slot. A slot needs re-resolve
