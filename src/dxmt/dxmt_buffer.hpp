@@ -132,6 +132,8 @@ public:
   didModifyRange(uint64_t offset, uint64_t length, uint32_t suballocation = 0) noexcept {
     if (unlikely(!length))
       return;
+    if (!flags_.test(BufferAllocationFlag::GpuManaged))
+      return;
     if (unlikely(suballocation >= suballocation_count_ || offset >= suballocation_size_))
       return;
     auto max_length = suballocation_size_ - offset;
