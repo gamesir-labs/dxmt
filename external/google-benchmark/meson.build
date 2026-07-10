@@ -1,0 +1,43 @@
+google_benchmark_include_dirs = include_directories('.', 'include', is_system: true)
+google_benchmark_threads_dep = dependency('threads')
+
+google_benchmark_sources = files(
+  'src/benchmark.cc',
+  'src/benchmark_api_internal.cc',
+  'src/benchmark_name.cc',
+  'src/benchmark_register.cc',
+  'src/benchmark_runner.cc',
+  'src/check.cc',
+  'src/colorprint.cc',
+  'src/commandlineflags.cc',
+  'src/complexity.cc',
+  'src/console_reporter.cc',
+  'src/counter.cc',
+  'src/csv_reporter.cc',
+  'src/json_reporter.cc',
+  'src/perf_counters.cc',
+  'src/reporter.cc',
+  'src/statistics.cc',
+  'src/string_util.cc',
+  'src/sysinfo.cc',
+  'src/timers.cc',
+)
+
+google_benchmark_lib = static_library(
+  'dxmt-google-benchmark',
+  google_benchmark_sources,
+  cpp_args: [
+    '-DBENCHMARK_STATIC_DEFINE',
+    '-DBENCHMARK_VERSION="1.9.5"',
+  ],
+  dependencies: [google_benchmark_threads_dep],
+  include_directories: [google_benchmark_include_dirs],
+  install: false,
+)
+
+google_benchmark_dep = declare_dependency(
+  link_with: [google_benchmark_lib],
+  compile_args: ['-DBENCHMARK_STATIC_DEFINE'],
+  dependencies: [google_benchmark_threads_dep],
+  include_directories: [google_benchmark_include_dirs],
+)
