@@ -14,6 +14,17 @@
 
 The following documentation is NOT for beginners. You are assumed to be familiar with C/C++ compilers and build systems.
 
+## Project-local build state
+
+All reusable build state lives under `.cache/` in the repository. Meson/Ninja
+directories use `.cache/build/<profile>`, managed Wine uses
+`.cache/wine/build/x86_64`, host runtime dependencies use
+`.cache/wine-runtime/x86_64`, and self-hosted toolchains and downloads use
+`.cache/toolchains` and `.cache/downloads`. These are fixed defaults, not CI
+overrides: local builds and self-hosted jobs use the same directories without
+cache environment variables or setup steps. Final install and package trees
+remain separate from this state.
+
 ## Setup LLVM
 
 First of all, you need to build LLVM (or use a pre-built LLVM package) no matter if you want to use DXMT with Wine or as a native library. Then you need to decide which architecture should you target for LLVM: `x86_64` or `arm64`.
@@ -24,12 +35,11 @@ First of all, you need to build LLVM (or use a pre-built LLVM package) no matter
 This is an example of building `x86_64` LLVM
 ```sh
 # in root directory of the project
-mkdir -p ./toolchains/llvm-build
-echo '**' >> toolchains/.gitignore
-git clone --depth 1 --branch llvmorg-15.0.7 https://github.com/llvm/llvm-project.git toolchains/llvm-project
+mkdir -p ./.cache/toolchains/llvm-darwin-local-build
+git clone --depth 1 --branch llvmorg-15.0.7 https://github.com/llvm/llvm-project.git .cache/toolchains/llvm-project
 
-cmake -B ./toolchains/llvm-build -S ./toolchains/llvm-project/llvm \
-  -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm" \
+cmake -B ./.cache/toolchains/llvm-darwin-local-build -S ./.cache/toolchains/llvm-project/llvm \
+  -DCMAKE_INSTALL_PREFIX="$(pwd)/.cache/toolchains/llvm-darwin-local" \
   -DCMAKE_OSX_ARCHITECTURES=x86_64 \
   -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
   -DLLVM_ENABLE_ASSERTIONS=On \
@@ -41,11 +51,11 @@ cmake -B ./toolchains/llvm-build -S ./toolchains/llvm-project/llvm \
   -DPACKAGE_VENDOR="DXMT" \
   -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
   -G Ninja
-cmake --build ./toolchains/llvm-build
-cmake --install ./toolchains/llvm-build
+cmake --build ./.cache/toolchains/llvm-darwin-local-build
+cmake --install ./.cache/toolchains/llvm-darwin-local-build
 ```
 
-Then `./toolchains/llvm` contains what we need later.
+Then `./.cache/toolchains/llvm-darwin-local` contains what we need later.
 
 For `arm64` target, just replace any occurance of `x86_64` to `arm64` above.
 
@@ -58,9 +68,10 @@ See [winehq.org - MacOS Building](https://gitlab.winehq.org/wine/wine/-/wikis/Ma
 You should also check the target architecture of Wine build, `--enable-archs=i386,x86_64` is a popular option when you also want x86 (32-bit programs) support in addition to x86_64.
 
 DXMT uses the `external/wine` submodule as the default Wine source tree for
-cross builds. Meson builds Wine automatically into `external/wine/build` before
-linking the Wine-facing DXMT binaries. The default Wine configure arguments are
-defined by `wine_configure_args` in [meson.options](/meson.options).
+cross builds. Meson builds Wine automatically into
+`.cache/wine/build/x86_64` before linking the Wine-facing DXMT binaries. The
+default Wine configure arguments are defined by `wine_configure_args` in
+[meson.options](/meson.options).
 
 ## Build DXMT
 
@@ -69,15 +80,15 @@ defined by `wine_configure_args` in [meson.options](/meson.options).
 Build (64-bit) Windows PE+ dlls **and** 64-bit unixlib (a Mach-O library with `.so` extension by convention).
 
 ```sh
-meson setup --cross-file build-win64.txt -Dnative_llvm_path=</path/to/llvm> build-builtin --buildtype release
-meson compile -C build-builtin
+meson setup --cross-file build-win64.txt -Dnative_llvm_path=</path/to/llvm> .cache/build/x86_64-windows-release --buildtype release
+meson compile -C .cache/build/x86_64-windows-release
 ```
 
 (Optional) Build (32-bit) Windows PE dlls
 
 ```sh
-meson setup --cross-file build-win32.txt build32 --buildtype release
-meson compile -C build32
+meson setup --cross-file build-win32.txt .cache/build/x86-windows-release --buildtype release
+meson compile -C .cache/build/x86-windows-release
 ```
 
 > You can't build 32-bit dlls only, they need 64-bit unixlib to be functional
@@ -144,8 +155,8 @@ Since this project contains code runs on macOS/Windows(Wine)/both, `clangd` may 
 Build all components as Mach-O .dylib
 
 ```sh
-meson setup -Dnative_llvm_path=</path/to/llvm> build-native --buildtype release
-meson compile -C build-native
+meson setup -Dnative_llvm_path=</path/to/llvm> .cache/build/arm64-macos-release --buildtype release
+meson compile -C .cache/build/arm64-macos-release
 ```
 
 #### Side notes on building x86_64 target from arm64 device/environment

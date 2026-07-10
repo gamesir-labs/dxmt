@@ -94,10 +94,10 @@ Use a dedicated release build directory:
 meson setup \
   -Dnative_llvm_path=/usr/local/opt/llvm@15 \
   -Denable_benchmarks=true \
-  build-benchmarks \
+  .cache/build/benchmarks \
   --buildtype release
-meson compile -C build-benchmarks dxmt-benchmarks
-meson test -C build-benchmarks --benchmark --suite performance \
+meson compile -C .cache/build/benchmarks dxmt-benchmarks
+meson test -C .cache/build/benchmarks --benchmark --suite performance \
   --print-errorlogs
 ```
 
@@ -115,9 +115,9 @@ meson setup \
   -Dnative_llvm_path=/usr/local/opt/llvm@15 \
   -Denable_d3d12_tests=true \
   -Dwine_source_path=../wine-proton-macos \
-  build-wine-tests \
+  .cache/build/wine-tests \
   --buildtype release
-scripts/run-wine-tests.sh build-wine-tests integration
+scripts/run-wine-tests.sh .cache/build/wine-tests integration
 ```
 
 Managed and prebuilt Wine cache selection is identical to the unit-test path;

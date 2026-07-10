@@ -3,12 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CI_ROOT="${DXMT_CI_ROOT:-/opt/dxmt-ci}"
-TOOLCHAINS_DIR="${CI_ROOT}/toolchains"
-DOWNLOADS_DIR="${CI_ROOT}/downloads"
-ARTIFACTS_DIR="${CI_ROOT}/artifacts"
-CCACHE_ROOT="${CI_ROOT}/ccache"
-SOURCES_DIR="${CI_ROOT}/sources"
+CACHE_ROOT="${REPO_ROOT}/.cache"
+TOOLCHAINS_DIR="${CACHE_ROOT}/toolchains"
+DOWNLOADS_DIR="${CACHE_ROOT}/downloads"
+ARTIFACTS_DIR="${CACHE_ROOT}/artifacts"
+SOURCES_DIR="${CACHE_ROOT}/sources"
 RUN_KEY="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 
 LLVM_VERSION="${LLVM_VERSION:-llvmorg-15.0.7}"
@@ -38,7 +37,7 @@ sudo_run() {
   elif [[ -n "${MAC_RUNNER_SUDO_PASS:-}" ]]; then
     printf '%s\n' "${MAC_RUNNER_SUDO_PASS}" | sudo -S "$@"
   else
-    die "sudo is required for '$*'; set MAC_RUNNER_SUDO_PASS or pre-create ${CI_ROOT}"
+    die "sudo is required for '$*'; set MAC_RUNNER_SUDO_PASS"
   fi
 }
 
@@ -62,23 +61,14 @@ setup_paths() {
   for pybin in "${HOME}"/Library/Python/*/bin; do
     append_path "${pybin}"
   done
-  if [[ -d "${GITHUB_WORKSPACE:-}/toolchains/${LLVM_MINGW_DIR}/bin" ]]; then
-    append_path "${GITHUB_WORKSPACE}/toolchains/${LLVM_MINGW_DIR}/bin"
+  if [[ -d "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin" ]]; then
+    append_path "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin"
   fi
 }
 
 ensure_root() {
-  if [[ -d "${CI_ROOT}" && -w "${CI_ROOT}" ]]; then
-    mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" "${ARTIFACTS_DIR}" "${CCACHE_ROOT}" "${SOURCES_DIR}"
-    return
-  fi
-
-  if [[ ! -d "${CI_ROOT}" ]]; then
-    sudo_run mkdir -p "${CI_ROOT}"
-  fi
-
-  sudo_run mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" "${ARTIFACTS_DIR}" "${CCACHE_ROOT}" "${SOURCES_DIR}"
-  sudo_run chown -R "$(id -u):$(id -g)" "${CI_ROOT}"
+  mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" \
+    "${ARTIFACTS_DIR}" "${SOURCES_DIR}"
 }
 
 ensure_brew() {
@@ -116,7 +106,6 @@ ensure_homebrew_build_tools() {
   ensure_command_or_formula bison bison
   ensure_command_or_formula x86_64-w64-mingw32-gcc mingw-w64
   ensure_command_or_formula i686-w64-mingw32-gcc mingw-w64
-  ensure_command_or_formula ccache ccache
   ensure_command_or_formula gh gh
 }
 
@@ -505,8 +494,7 @@ prepare_dxmt_wine_runtime_cache() {
   local install_dir="$2"
   "${REPO_ROOT}/scripts/prepare-wine-runtime-cache.sh" \
     --wine-source "${source_dir}" \
-    --install-root "${install_dir}" \
-    --cache-dir "${CI_ROOT}/wine-runtime-cache/${WINE_VERSION}"
+    --install-root "${install_dir}"
 }
 
 ensure_wine_x86_64() {
@@ -676,47 +664,22 @@ prepare_job() {
 
 link_toolchains() {
   local wine_flavor="${1:-x86_64}"
-  mkdir -p toolchains
+  mkdir -p "${TOOLCHAINS_DIR}"
   case "${wine_flavor}" in
     x86_64)
-      ln -sfn "${TOOLCHAINS_DIR}/wine-x86_64-${WINE_VERSION}" toolchains/wine
+      ln -sfn "${TOOLCHAINS_DIR}/wine-x86_64-${WINE_VERSION}" "${TOOLCHAINS_DIR}/wine"
       ;;
     arm64ec)
-      ln -sfn "${TOOLCHAINS_DIR}/wine-arm64ec-${WINE_ARM64EC_VERSION}" toolchains/wine
+      ln -sfn "${TOOLCHAINS_DIR}/wine-arm64ec-${WINE_ARM64EC_VERSION}" "${TOOLCHAINS_DIR}/wine"
       ;;
     *)
       die "unknown Wine flavor for link-toolchains: ${wine_flavor}"
       ;;
   esac
-  ln -sfn "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}" "toolchains/${LLVM_MINGW_DIR}"
-  ln -sfn "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-x86_64" toolchains/llvm-darwin
-  ln -sfn "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-arm64" toolchains/llvm-darwin-arm64
-  ln -sfn "${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-x86_64-w64-mingw32" toolchains/llvm
-  append_path "${GITHUB_WORKSPACE}/toolchains/${LLVM_MINGW_DIR}/bin"
-}
-
-prepare_ccache() {
-  local namespace="$1"
-  shift
-  local dir="${CCACHE_ROOT}/${namespace}"
-  local wrapper_dir="${GITHUB_WORKSPACE}/.ccache-bin-${namespace}"
-  mkdir -p "${dir}" "${wrapper_dir}"
-  export CCACHE_DIR="${dir}"
-  if [[ -n "${GITHUB_ENV:-}" ]]; then
-    printf 'CCACHE_DIR=%s\n' "${dir}" >> "${GITHUB_ENV}"
-  fi
-  for compiler in "$@"; do
-    local real_compiler
-    real_compiler="$(command -v "${compiler}")" || die "missing compiler: ${compiler}"
-    cat > "${wrapper_dir}/${compiler}" <<WRAPPER
-#!/bin/sh
-exec ccache "${real_compiler}" "\$@"
-WRAPPER
-    chmod +x "${wrapper_dir}/${compiler}"
-  done
-  append_path "${wrapper_dir}"
-  ccache --set-config=max_size=4G
-  ccache --zero-stats
+  ln -sfn "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-x86_64" "${TOOLCHAINS_DIR}/llvm-darwin"
+  ln -sfn "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-arm64" "${TOOLCHAINS_DIR}/llvm-darwin-arm64"
+  ln -sfn "${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-x86_64-w64-mingw32" "${TOOLCHAINS_DIR}/llvm"
+  append_path "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin"
 }
 
 artifact_dir() {
@@ -855,7 +818,6 @@ commands:
   ensure-llvm-darwin <x86_64|arm64>
   ensure-llvm-win
   link-toolchains [x86_64|arm64ec]
-  prepare-ccache <namespace> <compiler>...
   stage-artifact <name> <source-dir>
   copy-artifact <name> <dest-dir>
   stage-files <name> <file>...
@@ -875,7 +837,6 @@ case "${command}" in
   ensure-llvm-darwin) ensure_llvm_darwin "$@" ;;
   ensure-llvm-win) ensure_llvm_win "$@" ;;
   link-toolchains) link_toolchains "$@" ;;
-  prepare-ccache) prepare_ccache "$@" ;;
   stage-artifact) stage_artifact "$@" ;;
   copy-artifact) copy_artifact "$@" ;;
   stage-files) stage_files "$@" ;;

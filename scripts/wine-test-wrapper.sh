@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
-export WINEPREFIX="${DXMT_TEST_WINEPREFIX:-$project_root/.wine-x86_64-test}"
+export WINEPREFIX="${DXMT_TEST_WINEPREFIX:-$project_root/.cache/wine/prefixes/x86_64-test}"
 export WINEARCH="${WINEARCH:-win64}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export DXMT_EXPERIMENT_DX12_SUPPORT="${DXMT_EXPERIMENT_DX12_SUPPORT:-1}"
@@ -38,8 +38,8 @@ if [ -z "$wine" ]; then
     wine=$(find_wine_launcher "$wine_root") || true
   else
     for candidate_root in \
-      "$project_root/toolchains/wine" \
-      "$project_root/external/wine/build/dxmt-install"
+      "$project_root/.cache/toolchains/wine" \
+      "$project_root/.cache/wine/build/x86_64/dxmt-install"
     do
       if wine=$(find_wine_launcher "$candidate_root"); then
         wine_root=$candidate_root
