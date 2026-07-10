@@ -1,4 +1,4 @@
-#include <gtest/gtest.h>
+#include <dxmt_test.hpp>
 
 #include <string_view>
 

@@ -1,13 +1,17 @@
-dxmt_unit_tests = executable(
-  'dxmt-unit-tests',
-  'framework_test.cpp',
-  dependencies: [gtest_main_dep],
+dxmt_test_include_dirs = include_directories('include')
+
+dxmt_test_main_lib = static_library(
+  'dxmt-test-main',
+  'support/main.cpp',
+  dependencies: [gtest_dep],
+  include_directories: [dxmt_test_include_dirs],
   install: false,
 )
 
-test(
-  'dxmt-unit-tests',
-  dxmt_unit_tests,
-  args: ['--gtest_brief=1'],
-  suite: 'unit',
+dxmt_test_dep = declare_dependency(
+  link_with: [dxmt_test_main_lib],
+  dependencies: [gtest_dep],
+  include_directories: [dxmt_test_include_dirs],
 )
+
+subdir('unit')
