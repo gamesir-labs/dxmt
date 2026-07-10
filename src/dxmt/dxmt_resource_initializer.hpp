@@ -4,6 +4,10 @@
 #include "dxmt_context.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
 #include "dxmt_texture.hpp"
+#include <array>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 namespace dxmt {
 
@@ -47,13 +51,25 @@ public:
     upload_queue_event_.waitUntilSignaledValue(seq_id, timeout);
   }
 
-  WMT::Event
+  WMT::SharedEvent
   event() {
     return upload_queue_event_;
   }
 
 private:
   uint64_t flushInternal();
+
+  struct InFlightBatch {
+    WMT::Reference<WMT::CommandBuffer> command_buffer;
+    std::vector<Allocation *> allocations;
+    std::vector<std::string> resource_diagnostics;
+    std::vector<std::string> operation_diagnostics;
+    uint64_t event_id = 0;
+  };
+
+  void retireInFlightBatch(size_t slot);
+  void recordDiagnosticResource(const Texture *texture, WMT::Texture allocation);
+  void recordDiagnosticResource(const BufferAllocation *allocation);
 
   struct ClearRenderPassInfo {
     WMTRenderPassInfo info;
@@ -140,6 +156,10 @@ private:
   ClearRenderPassInfo *clear_render_pass_tail;
 
   AllocationRefTracking ref_tracker;
+  std::array<InFlightBatch, kResourceInitializerChunks> in_flight_batches_;
+  std::unordered_set<obj_handle_t> pending_diagnostic_resource_handles_;
+  std::vector<std::string> pending_resource_diagnostics_;
+  std::vector<std::string> pending_operation_diagnostics_;
 };
 
 } // namespace dxmt

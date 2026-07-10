@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 namespace dxmt {
 
@@ -33,6 +34,8 @@ public:
   bool track(Allocation *allocation);
 
   void addStorage(void *ptr, size_t length);
+
+  void transferTo(std::vector<Allocation *> &allocations);
 
   void clear();
 

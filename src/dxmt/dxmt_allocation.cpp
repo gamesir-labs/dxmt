@@ -46,6 +46,20 @@ AllocationRefTracking::addStorage(void *ptr, size_t length) {
 }
 
 void
+AllocationRefTracking::transferTo(std::vector<Allocation *> &allocations) {
+  RefAddChunk<> *chunk = reinterpret_cast<RefAddChunk<> *>(&chunk_placed);
+  while (chunk) {
+    dxmt::Allocation **list = std::launder(chunk->allocations);
+    allocations.insert(allocations.end(), list, list + chunk->size);
+    chunk->size = 0;
+    chunk = chunk->next_chunk;
+  }
+
+  chunk_last = reinterpret_cast<RefAddChunk<> *>(&chunk_placed);
+  chunk_placed.next_chunk = nullptr;
+}
+
+void
 AllocationRefTracking::clear() {
   RefAddChunk<> *chunk = reinterpret_cast<RefAddChunk<> *>(&chunk_placed);
   while (chunk) {

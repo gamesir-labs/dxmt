@@ -541,7 +541,19 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
     dxmt::apitrace::on_command_buffer_begin(cmdbuf.handle, chunk.frame_);
   }
   if (chunk.resource_initializer_event_id) {
-    cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
+    auto initializer_event = initializer.event();
+    if (perf::enabled()) {
+      const auto initializer_current = initializer_event.signaledValue();
+      WARN_FILE_ONLY("DXMT queue perf dependency:"
+           " chunk=", chunk.chunk_id,
+           " frame=", chunk.frame_,
+           " cmdbuf=", cmdbuf.handle,
+           " initEventObject=", initializer_event.handle,
+           " initTarget=", chunk.resource_initializer_event_id,
+           " initCurrent=", initializer_current,
+           " blockedAtEncode=", initializer_current < chunk.resource_initializer_event_id);
+    }
+    cmdbuf.encodeWaitForEvent(initializer_event, chunk.resource_initializer_event_id);
   }
   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
   chunk.encode_end_time = clock::now();

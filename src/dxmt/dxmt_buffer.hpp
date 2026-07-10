@@ -62,6 +62,16 @@ public:
     return obj_;
   }
 
+  WMTResourceOptions
+  resourceOptions() const noexcept {
+    return info_.options;
+  }
+
+  uint64_t
+  length() const noexcept {
+    return info_.length;
+  }
+
   Flags<BufferAllocationFlag>
   flags() const {
     return flags_;

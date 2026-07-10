@@ -1,6 +1,7 @@
 #include "Metal.hpp"
 #include "dxmt_resource_initializer.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "log/log.hpp"
 #include "util_math.hpp"
 #include <cstdint>
@@ -80,6 +81,10 @@ ResourceInitializer::ResourceInitializer(WMT::Device device) :
 }
 
 ResourceInitializer::~ResourceInitializer() {
+  std::lock_guard<dxmt::mutex> lock(mutex_);
+  for (size_t slot = 0; slot < in_flight_batches_.size(); slot++)
+    retireInFlightBatch(slot);
+  ref_tracker.clear();
   free(cpu_command_heap);
 }
 
@@ -95,6 +100,7 @@ ResourceInitializer::initWithZero(BufferAllocation *buffer, uint64_t offset, uin
     fill->offset = offset;
     fill->length = length;
     fill->value = 0;
+    recordDiagnosticResource(buffer);
 
   } while (0);
 
@@ -135,6 +141,7 @@ ResourceInitializer::initDepthStencilWithZero(
       info->stencil.level = level;
       info->stencil.depth_plane = 0;
     }
+    recordDiagnosticResource(texture, allocation->texture());
 
   } while (0);
 
@@ -167,6 +174,7 @@ ResourceInitializer::initRenderTargetWithZero(
     info->colors[0].store_action = WMTStoreActionStore;
     info->colors[0].slice = slice;
     info->colors[0].level = level;
+    recordDiagnosticResource(texture, allocation->texture());
 
   } while (0);
 
@@ -234,6 +242,7 @@ ResourceInitializer::initWithZero(
     copy->slice = slice;
     copy->level = level;
     copy->origin = {0, 0, 0};
+    recordDiagnosticResource(texture, allocation->texture());
 
   } while (0);
 
@@ -315,6 +324,7 @@ ResourceInitializer::initWithData(
     copy->slice = slice;
     copy->level = level;
     copy->origin = {0, 0, 0};
+    recordDiagnosticResource(texture, allocation->texture());
 
   } while (0);
 
@@ -326,14 +336,85 @@ ResourceInitializer::flushInternal() {
   auto pool = WMT::MakeAutoreleasePool();
 
   auto seq_id = current_seq_id_++;
+  auto slot = (seq_id - 1) % in_flight_batches_.size();
+  retireInFlightBatch(slot);
+
   auto cmdbuf = upload_queue_.commandBuffer();
   encode(cmdbuf);
   cmdbuf.encodeSignalEvent(upload_queue_event_, seq_id);
   cmdbuf.commit();
+
+  auto &batch = in_flight_batches_[slot];
+  batch.command_buffer = cmdbuf;
+  batch.event_id = seq_id;
+  ref_tracker.transferTo(batch.allocations);
+  batch.resource_diagnostics = std::move(pending_resource_diagnostics_);
+  batch.operation_diagnostics = std::move(pending_operation_diagnostics_);
   reset();
   cached_coherent_seq_id = upload_queue_event_.signaledValue();
   gpu_command_heap_allocator.free_blocks(cached_coherent_seq_id);
   return seq_id;
+}
+
+void
+ResourceInitializer::retireInFlightBatch(size_t slot) {
+  auto &batch = in_flight_batches_[slot];
+  if (!batch.event_id)
+    return;
+
+  if (upload_queue_event_.signaledValue() < batch.event_id) {
+    if (!perf::enabled()) {
+      upload_queue_event_.waitUntilSignaledValue(batch.event_id, UINT64_MAX);
+    } else if (!upload_queue_event_.waitUntilSignaledValue(batch.event_id, 1000)) {
+      WARN(
+          "ResourceInitializer in-flight batch stall: slot=", slot,
+          " commandBuffer=", batch.command_buffer.handle,
+          " event=", upload_queue_event_.handle,
+          " target=", batch.event_id,
+          " current=", upload_queue_event_.signaledValue(),
+          " allocationCount=", batch.allocations.size(),
+          " resourceCount=", batch.resource_diagnostics.size(),
+          " operationCount=", batch.operation_diagnostics.size()
+      );
+      for (size_t i = 0; i < batch.allocations.size(); i++) {
+        WARN(
+            "ResourceInitializer in-flight allocation: target=", batch.event_id,
+            " index=", i,
+            " allocation=", batch.allocations[i]
+        );
+      }
+      for (size_t i = 0; i < batch.resource_diagnostics.size(); i++) {
+        WARN(
+            "ResourceInitializer in-flight resource: target=", batch.event_id,
+            " index=", i,
+            " ", batch.resource_diagnostics[i]
+        );
+      }
+      for (size_t i = 0; i < batch.operation_diagnostics.size(); i++) {
+        WARN(
+            "ResourceInitializer in-flight operation: target=", batch.event_id,
+            " index=", i,
+            " ", batch.operation_diagnostics[i]
+        );
+      }
+      upload_queue_event_.waitUntilSignaledValue(batch.event_id, UINT64_MAX);
+      WARN(
+          "ResourceInitializer in-flight batch recovered: slot=", slot,
+          " commandBuffer=", batch.command_buffer.handle,
+          " event=", upload_queue_event_.handle,
+          " target=", batch.event_id,
+          " current=", upload_queue_event_.signaledValue()
+      );
+    }
+  }
+
+  batch.command_buffer = nullptr;
+  for (auto *allocation : batch.allocations)
+    allocation->decRef();
+  batch.allocations.clear();
+  batch.resource_diagnostics.clear();
+  batch.operation_diagnostics.clear();
+  batch.event_id = 0;
 }
 
 uint64_t
@@ -365,6 +446,47 @@ ResourceInitializer::reset() {
   blit_cmd_tail = (wmtcmd_base *)&blit_cmd_head;
 
   ref_tracker.clear();
+  pending_diagnostic_resource_handles_.clear();
+  pending_resource_diagnostics_.clear();
+  pending_operation_diagnostics_.clear();
+}
+
+void
+ResourceInitializer::recordDiagnosticResource(const Texture *texture, WMT::Texture allocation) {
+  if (!perf::enabled() || !allocation)
+    return;
+  if (!pending_diagnostic_resource_handles_.insert(allocation.handle).second)
+    return;
+
+  pending_resource_diagnostics_.push_back(str::format(
+      "kind=Texture descriptor=", texture,
+      " allocation=", allocation.handle,
+      " format=", uint32_t(texture->pixelFormat()),
+      " type=", uint32_t(texture->textureType()),
+      " usage=", uint32_t(texture->usage()),
+      " width=", texture->width(),
+      " height=", texture->height(),
+      " depth=", texture->depth(),
+      " arrayLength=", texture->arrayLength(),
+      " samples=", texture->sampleCount()
+  ));
+}
+
+void
+ResourceInitializer::recordDiagnosticResource(const BufferAllocation *allocation) {
+  if (!perf::enabled() || !allocation)
+    return;
+  auto buffer = allocation->buffer();
+  if (!buffer || !pending_diagnostic_resource_handles_.insert(buffer.handle).second)
+    return;
+
+  pending_resource_diagnostics_.push_back(str::format(
+      "kind=Buffer allocation=", allocation,
+      " buffer=", buffer.handle,
+      " length=", allocation->length(),
+      " options=", uint64_t(allocation->resourceOptions()),
+      " gpuAddress=", allocation->gpuAddress()
+  ));
 }
 
 void
@@ -376,12 +498,171 @@ ResourceInitializer::encode(WMT::CommandBuffer cmdbuf) {
       clear_pass = clear_pass->next;
       continue;
     }
+    if (perf::enabled()) {
+      const auto &info = clear_pass->info;
+      std::string operation = str::format(
+          "kind=ClearRenderPass width=", info.render_target_width,
+          " height=", info.render_target_height,
+          " arrayLength=", uint32_t(info.render_target_array_length),
+          " samples=", uint32_t(info.default_raster_sample_count)
+      );
+      for (uint32_t i = 0; i < 8; i++) {
+        const auto &color = info.colors[i];
+        if (!color.texture)
+          continue;
+        operation += str::format(
+            " color[", i, "]={texture=", color.texture,
+            ",level=", color.level,
+            ",slice=", color.slice,
+            ",depthPlane=", color.depth_plane,
+            ",load=", uint32_t(color.load_action),
+            ",store=", uint32_t(color.store_action),
+            ",clear=", color.clear_color.r, ",", color.clear_color.g,
+            ",", color.clear_color.b, ",", color.clear_color.a, "}"
+        );
+      }
+      if (info.depth.texture) {
+        operation += str::format(
+            " depth={texture=", info.depth.texture,
+            ",level=", info.depth.level,
+            ",slice=", info.depth.slice,
+            ",depthPlane=", info.depth.depth_plane,
+            ",load=", uint32_t(info.depth.load_action),
+            ",store=", uint32_t(info.depth.store_action),
+            ",clear=", info.depth.clear_depth, "}"
+        );
+      }
+      if (info.stencil.texture) {
+        operation += str::format(
+            " stencil={texture=", info.stencil.texture,
+            ",level=", info.stencil.level,
+            ",slice=", info.stencil.slice,
+            ",depthPlane=", info.stencil.depth_plane,
+            ",load=", uint32_t(info.stencil.load_action),
+            ",store=", uint32_t(info.stencil.store_action),
+            ",clear=", uint32_t(info.stencil.clear_stencil), "}"
+        );
+      }
+      pending_operation_diagnostics_.push_back(std::move(operation));
+    }
     auto r = cmdbuf.renderCommandEncoder(clear_pass->info);
     r.endEncoding();
     clear_pass = clear_pass->next;
   }
 
   if (blit_cmd_head.next.ptr) {
+    if (perf::enabled()) {
+      for (const auto *base = reinterpret_cast<const wmtcmd_base *>(blit_cmd_head.next.ptr);
+           base;
+           base = reinterpret_cast<const wmtcmd_base *>(base->next.ptr)) {
+        switch (static_cast<WMTBlitCommandType>(base->type)) {
+        case WMTBlitCommandNop:
+          pending_operation_diagnostics_.push_back("kind=BlitNop");
+          break;
+        case WMTBlitCommandCopyFromBufferToBuffer: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_copy_from_buffer_to_buffer *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=CopyBufferToBuffer src=", cmd->src,
+              " srcOffset=", cmd->src_offset,
+              " dst=", cmd->dst,
+              " dstOffset=", cmd->dst_offset,
+              " length=", cmd->copy_length
+          ));
+          break;
+        }
+        case WMTBlitCommandCopyFromBufferToTexture: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_copy_from_buffer_to_texture *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=CopyBufferToTexture src=", cmd->src,
+              " srcOffset=", cmd->src_offset,
+              " bytesPerRow=", cmd->bytes_per_row,
+              " bytesPerImage=", cmd->bytes_per_image,
+              " size=", cmd->size.width, "x", cmd->size.height, "x", cmd->size.depth,
+              " dst=", cmd->dst,
+              " slice=", cmd->slice,
+              " level=", cmd->level,
+              " origin=", cmd->origin.x, ",", cmd->origin.y, ",", cmd->origin.z
+          ));
+          break;
+        }
+        case WMTBlitCommandCopyFromTextureToBuffer: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_copy_from_texture_to_buffer *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=CopyTextureToBuffer src=", cmd->src,
+              " slice=", cmd->slice,
+              " level=", cmd->level,
+              " origin=", cmd->origin.x, ",", cmd->origin.y, ",", cmd->origin.z,
+              " size=", cmd->size.width, "x", cmd->size.height, "x", cmd->size.depth,
+              " dst=", cmd->dst,
+              " dstOffset=", cmd->offset,
+              " bytesPerRow=", cmd->bytes_per_row,
+              " bytesPerImage=", cmd->bytes_per_image
+          ));
+          break;
+        }
+        case WMTBlitCommandCopyFromTextureToTexture: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_copy_from_texture_to_texture *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=CopyTextureToTexture src=", cmd->src,
+              " srcSlice=", cmd->src_slice,
+              " srcLevel=", cmd->src_level,
+              " srcOrigin=", cmd->src_origin.x, ",", cmd->src_origin.y, ",", cmd->src_origin.z,
+              " size=", cmd->src_size.width, "x", cmd->src_size.height, "x", cmd->src_size.depth,
+              " dst=", cmd->dst,
+              " dstSlice=", cmd->dst_slice,
+              " dstLevel=", cmd->dst_level,
+              " dstOrigin=", cmd->dst_origin.x, ",", cmd->dst_origin.y, ",", cmd->dst_origin.z
+          ));
+          break;
+        }
+        case WMTBlitCommandGenerateMipmaps: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_generate_mipmaps *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=GenerateMipmaps texture=", cmd->texture
+          ));
+          break;
+        }
+        case WMTBlitCommandWaitForFence:
+        case WMTBlitCommandUpdateFence: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_fence_op *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=", base->type == WMTBlitCommandWaitForFence ? "WaitForFence" : "UpdateFence",
+              " fence=", cmd->fence
+          ));
+          break;
+        }
+        case WMTBlitCommandFillBuffer: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_fillbuffer *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=FillBuffer buffer=", cmd->buffer,
+              " offset=", cmd->offset,
+              " length=", cmd->length,
+              " value=", uint32_t(cmd->value)
+          ));
+          break;
+        }
+        case WMTBlitCommandResolveCounters: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_blit_resolvecounters *>(base);
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=ResolveCounters sampleBuffer=", cmd->sample_buffer,
+              " start=", cmd->start,
+              " length=", cmd->len,
+              " dst=", cmd->dst_buffer,
+              " dstOffset=", cmd->dst_offset
+          ));
+          break;
+        }
+        case WMTBlitCommandResourceStateBarrier:
+          pending_operation_diagnostics_.push_back("kind=ResourceStateBarrier");
+          break;
+        default:
+          pending_operation_diagnostics_.push_back(str::format(
+              "kind=UnknownBlit type=", uint32_t(base->type)
+          ));
+          break;
+        }
+      }
+    }
     auto b = cmdbuf.blitCommandEncoder();
     b.encodeCommands(&blit_cmd_head);
     b.endEncoding();
