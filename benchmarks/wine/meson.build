@@ -1,3 +1,19 @@
+ue_d3d11_initialization = executable(
+  'dxmt-ue-d3d11-initialization',
+  files('ue_d3d11_initialization.cpp'),
+  dependencies: [d3d11_dep, dxgi_dep],
+  include_directories: [include_directories('../../tests/include')],
+  install: false,
+)
+
+ue_d3d12_initialization = executable(
+  'dxmt-ue-d3d12-initialization',
+  files('ue_d3d12_initialization.cpp'),
+  dependencies: [d3d12_dep, dxgi_dep],
+  include_directories: [include_directories('../../tests/include')],
+  install: false,
+)
+
 wine_benchmark_suites = {
   'd3d12-integration': {
     'sources': files('d3d12_integration_benchmark.cpp'),
@@ -6,9 +22,23 @@ wine_benchmark_suites = {
     'suite': ['wine', 'integration', 'd3d12'],
     'timeout': 600,
   },
+  'ue-rhi-initialization': {
+    'sources': files('ue_initialization_benchmark.cpp'),
+    'include_directories': [include_directories('../../tests/support')],
+    'runtime_targets': [
+      ue_d3d11_initialization,
+      ue_d3d12_initialization,
+    ],
+    'mode': 'integration',
+    'suite': ['wine', 'integration', 'ue', 'd3d11', 'd3d12'],
+    'timeout': 600,
+  },
 }
 
-wine_benchmark_targets = []
+wine_benchmark_targets = [
+  ue_d3d11_initialization,
+  ue_d3d12_initialization,
+]
 
 foreach suite_name, suite_config : wine_benchmark_suites
   target_name = 'dxmt-wine-benchmark-' + suite_name
@@ -44,6 +74,7 @@ foreach suite_name, suite_config : wine_benchmark_suites
     suite: suite_config.get('suite', ['wine']),
     timeout: suite_config.get('timeout', 120),
     env: wine_test_env,
+    depends: suite_config.get('runtime_targets', []),
   )
 endforeach
 
