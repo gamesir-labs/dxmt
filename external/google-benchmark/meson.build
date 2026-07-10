@@ -1,5 +1,9 @@
 google_benchmark_include_dirs = include_directories('.', 'include', is_system: true)
 google_benchmark_threads_dep = dependency('threads')
+google_benchmark_platform_deps = []
+if host_machine.system() == 'windows'
+  google_benchmark_platform_deps += cpp.find_library('shlwapi')
+endif
 
 google_benchmark_sources = files(
   'src/benchmark.cc',
@@ -30,7 +34,7 @@ google_benchmark_lib = static_library(
     '-DBENCHMARK_STATIC_DEFINE',
     '-DBENCHMARK_VERSION="1.9.5"',
   ],
-  dependencies: [google_benchmark_threads_dep],
+  dependencies: [google_benchmark_threads_dep] + google_benchmark_platform_deps,
   include_directories: [google_benchmark_include_dirs],
   install: false,
 )
@@ -38,6 +42,6 @@ google_benchmark_lib = static_library(
 google_benchmark_dep = declare_dependency(
   link_with: [google_benchmark_lib],
   compile_args: ['-DBENCHMARK_STATIC_DEFINE'],
-  dependencies: [google_benchmark_threads_dep],
+  dependencies: [google_benchmark_threads_dep] + google_benchmark_platform_deps,
   include_directories: [google_benchmark_include_dirs],
 )

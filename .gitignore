@@ -6,6 +6,8 @@ wineprefix
 .cache
 wine
 !external/wine
+!benchmarks/wine/
+!benchmarks/wine/**
 .local
 .config
 toolchains

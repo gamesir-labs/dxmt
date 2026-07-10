@@ -146,5 +146,58 @@ Use a separate cross-build directory for Wine-facing DLLs. GoogleTest unit
 tests intentionally reject cross-build configuration so the test runner and
 its scheduler never pay Wine process startup overhead.
 
+Windows D3D unit tests use that separate cross-build and run one GoogleTest
+image per API through Wine. Every operation remains an independently filterable
+`TEST` case; aggregating the cases into one image only amortizes Wine process
+startup. Long queue, resource-lifetime, and mixed-encoder workloads belong to
+the Wine integration benchmark layer instead of the unit-test image.
+
+The managed mode builds Wine once under `wine_build_path`, installs the runtime
+at `external/wine/build/dxmt-install`, and uses the Wine Proton development
+cache preparer to bundle relocatable host dylibs without removing the static
+archives needed by DXMT. The result is reused for DXMT linking, tests,
+benchmarks, and apitrace-enabled builds:
+
+```sh
+meson setup \
+  --cross-file build-win64.txt \
+  -Dnative_llvm_path=/usr/local/opt/llvm@15 \
+  -Denable_d3d12_tests=true \
+  -Dwine_source_path=../wine-proton-macos \
+  build-wine-tests \
+  --buildtype release
+scripts/run-wine-tests.sh build-wine-tests unit
+```
+
+The Wine Proton source tree supplies its official development-cache preparer;
+`wine_runtime_preparer_path` remains available only when the build source and
+the cache preparer intentionally come from different trees.
+
+`run-wine-tests.sh` compiles the build, stages the current DXMT runtime, and
+exports the stage to every Wine process before Meson schedules the tests. The
+Wine root itself is supplied by Meson, so no launcher path is required.
+
+To reuse a prebuilt cache, disable the managed build and point both build-time
+and runtime consumers at one complete Wine installation:
+
+```sh
+meson setup \
+  --cross-file build-win64.txt \
+  -Dnative_llvm_path=/usr/local/opt/llvm@15 \
+  -Denable_d3d12_tests=true \
+  -Dwine_build_path= \
+  -Dwine_install_path=/path/to/wine-cache \
+  build-wine-tests \
+  --buildtype release
+```
+
+The cache must contain `bin/wine` (or `bin/wine64`), `bin/wineserver`,
+`bin/winebuild`, the Wine development libraries under `lib/wine/`, and bundled
+host runtime dependencies such as `lib/libfreetype.6.dylib`. A raw Wine
+`make install` directory is intentionally rejected for runtime tests.
+`DXMT_TEST_WINE` remains an explicit diagnostic override; normal test and CI
+runs use the configured cache root. Meson enables
+`DXMT_EXPERIMENT_DX12_SUPPORT` automatically.
+
 GoogleTest is compiled from the pinned source snapshot in
 `external/googletest`.

@@ -85,7 +85,7 @@ if wine_builtin_dll
 custom_target('postprocess_libd3d11_dxmt',
   input : d3d11_backend_dll,
   output: 'd3d11_dxmt.dll.postproc',
-  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
+  command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d11_backend_dll,
   build_by_default : true
 )
@@ -93,7 +93,7 @@ custom_target('postprocess_libd3d11_dxmt',
 custom_target('postprocess_libd3d11',
   input : d3d11_dll,
   output: 'd3d11.dll.postproc',
-  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
+  command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d11_dll,
   build_by_default : true
 )

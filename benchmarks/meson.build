@@ -17,4 +17,8 @@ dxmt_benchmark_dep = declare_dependency(
   include_directories: [dxmt_benchmark_include_dirs],
 )
 
-subdir('suites')
+if dxmt_crossbuild
+  subdir('wine')
+else
+  subdir('suites')
+endif

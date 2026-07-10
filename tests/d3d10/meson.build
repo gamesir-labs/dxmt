@@ -23,7 +23,10 @@ d3d10_device_spec = executable(
 
 test(
   'dxmt-d3d10-device-spec',
-  d3d10_device_spec,
-  suite: ['d3d10'],
-  timeout: 30,
+  wine_test_launcher,
+  args: [d3d10_device_spec],
+  suite: ['unit', 'wine', 'd3d10'],
+  timeout: 120,
+  env: wine_test_env,
+  is_parallel: false,
 )
