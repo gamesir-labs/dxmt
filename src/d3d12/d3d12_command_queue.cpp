@@ -17900,14 +17900,24 @@ private:
       cache.viewports_valid = true;
     }
 
-    std::vector<WMTScissorRect> scissor_values;
-    scissor_values.resize(scissors.size());
-    for (size_t i = 0; i < scissors.size(); i++) {
+    // Metal requires one scissor per viewport. D3D12 ignores extra scissors
+    // and disables viewport slots without a corresponding scissor.
+    std::vector<WMTScissorRect> scissor_values(viewports.size());
+    const uint64_t target_width = render_encoder->render_target_width;
+    const uint64_t target_height = render_encoder->render_target_height;
+    const size_t active_scissor_count =
+        std::min(scissors.size(), viewports.size());
+    for (size_t i = 0; i < active_scissor_count; i++) {
       const auto &rect = scissors[i];
-      scissor_values[i] = {uint32_t(std::max<LONG>(0, rect.left)),
-                           uint32_t(std::max<LONG>(0, rect.top)),
-                           uint32_t(std::max<LONG>(0, rect.right - rect.left)),
-                           uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
+      const int64_t left = std::max<int64_t>(0, rect.left);
+      const int64_t top = std::max<int64_t>(0, rect.top);
+      const int64_t right = std::max<int64_t>(left, rect.right);
+      const int64_t bottom = std::max<int64_t>(top, rect.bottom);
+      const uint64_t x = std::min<uint64_t>(left, target_width);
+      const uint64_t y = std::min<uint64_t>(top, target_height);
+      const uint64_t clamped_right = std::min<uint64_t>(right, target_width);
+      const uint64_t clamped_bottom = std::min<uint64_t>(bottom, target_height);
+      scissor_values[i] = {x, y, clamped_right - x, clamped_bottom - y};
     }
     if (!cache.scissors_valid ||
         !scissor_values_equal(cache.scissors, scissor_values)) {

@@ -4566,6 +4566,7 @@ static NTSTATUS
 _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   struct WMTRenderPassInfo *info = (struct WMTRenderPassInfo *)params->arg;
+  DXMTMetal4CommandBuffer *owner = (DXMTMetal4CommandBuffer *)params->handle;
   MTL4RenderPassDescriptor *descriptor = [[MTL4RenderPassDescriptor alloc] init];
   for (unsigned i = 0; i < 8; i++) {
     descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
@@ -4582,6 +4583,8 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.colorAttachments[i].resolveLevel = info->colors[i].resolve_level;
     descriptor.colorAttachments[i].resolveSlice = info->colors[i].resolve_slice;
     descriptor.colorAttachments[i].resolveDepthPlane = info->colors[i].resolve_depth_plane;
+    [owner useResidencyAllocation:(id<MTLAllocation>)info->colors[i].texture];
+    [owner useResidencyAllocation:(id<MTLAllocation>)info->colors[i].resolve_texture];
   }
 
   if (info->depth.texture) {
@@ -4592,6 +4595,7 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.depthAttachment.texture = (id<MTLTexture>)info->depth.texture;
     descriptor.depthAttachment.loadAction = (MTLLoadAction)info->depth.load_action;
     descriptor.depthAttachment.storeAction = (MTLStoreAction)info->depth.store_action;
+    [owner useResidencyAllocation:(id<MTLAllocation>)info->depth.texture];
   }
 
   if (info->stencil.texture) {
@@ -4602,6 +4606,7 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.stencilAttachment.texture = (id<MTLTexture>)info->stencil.texture;
     descriptor.stencilAttachment.loadAction = (MTLLoadAction)info->stencil.load_action;
     descriptor.stencilAttachment.storeAction = (MTLStoreAction)info->stencil.store_action;
+    [owner useResidencyAllocation:(id<MTLAllocation>)info->stencil.texture];
   }
 
   descriptor.defaultRasterSampleCount = info->default_raster_sample_count;
@@ -4609,14 +4614,14 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
+  [owner useResidencyAllocation:(id<MTLAllocation>)info->visibility_buffer];
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
     descriptor.tileHeight = info->tile_height;
   }
 
-  params->ret = (obj_handle_t)[(DXMTMetal4CommandBuffer *)params->handle metal4RenderCommandEncoderWithDescriptor:descriptor];
-  DXMTMetal4CommandBuffer *owner = (DXMTMetal4CommandBuffer *)params->handle;
+  params->ret = (obj_handle_t)[owner metal4RenderCommandEncoderWithDescriptor:descriptor];
   dxmt_metal4_register_encoder(params->ret, owner);
   DXMTMetal4RenderEncoderState *state = [[DXMTMetal4RenderEncoderState alloc] initWithOwner:owner];
   dxmt_metal4_register_encoder_state(params->ret, state);
