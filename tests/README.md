@@ -78,8 +78,9 @@ Do not mix relatively slow cases into a fast suite: keeping them in a separate
 executable gives Meson a useful scheduling boundary.
 
 Performance benchmarks are not unit tests and must not be registered in this
-manifest. Benchmarks will use a separate dependency, runner, directory, and
-Meson abstraction.
+manifest. They have a separate dependency, runner, directory, Meson
+abstraction, and acceptance policy under `benchmarks/`; see
+`benchmarks/README.md`.
 
 ## Build and run
 
