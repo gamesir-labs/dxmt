@@ -276,15 +276,6 @@ if dxmt_crossbuild
     wine_install_path = join_paths(meson.project_source_root(), wine_install_path)
   endif
 
-  wine_runtime_preparer_path = get_option('wine_runtime_preparer_path')
-  if wine_runtime_preparer_path != '' and not wine_runtime_preparer_path.startswith('/')
-    wine_runtime_preparer_path = join_paths(meson.project_source_root(), wine_runtime_preparer_path)
-  endif
-  source_runtime_preparer = join_paths(wine_source_path, 'scripts/prepare_development_cache.sh')
-  if wine_runtime_preparer_path == '' and fs.is_file(source_runtime_preparer)
-    wine_runtime_preparer_path = source_runtime_preparer
-  endif
-
   if cpu_family == 'x86'
     # Enable stdcall fixup on 32-bit
     link_args += [
@@ -327,8 +318,15 @@ if dxmt_crossbuild
     if wine_source_path == ''
       error('wine_source_path is required when wine_build_path is used')
     endif
-    if wine_runtime_required and wine_runtime_preparer_path == ''
-      error('Managed Wine runtime tests require wine_runtime_preparer_path')
+    if wine_runtime_required
+      foreach packaging_tool : [
+        'scripts/pack_runtime_deps.sh',
+        'scripts/relocate_wine_runtime.sh',
+      ]
+        if not fs.is_file(join_paths(wine_source_path, packaging_tool))
+          error('Managed Wine runtime cache requires dependency packaging tool: ' + packaging_tool)
+        endif
+      endforeach
     endif
 
     wine_build_artifacts = {
@@ -358,7 +356,7 @@ if dxmt_crossbuild
         wine_source_path,
         wine_build_path,
         wine_runtime_root,
-        wine_runtime_preparer_path,
+        wine_runtime_required.to_string(),
         windows_builtin_install_dir,
         unix_install_dir,
         '@OUTPUT0@',
@@ -385,7 +383,6 @@ else
   wine_install_path = ''
   wine_build_target = []
   wine_build_artifacts = {}
-  wine_runtime_preparer_path = ''
 endif
 
 if wine_runtime_root != ''
@@ -399,7 +396,7 @@ if wine_runtime_required and wine_runtime_root == ''
 endif
 if wine_runtime_required and wine_build_path == ''
   wine_launcher_found = fs.is_file(join_paths(wine_runtime_root, 'bin/wine')) or fs.is_file(join_paths(wine_runtime_root, 'bin/wine64'))
-  wine_runtime_deps_found = fs.is_file(join_paths(wine_runtime_root, '.wine-development-cache'))
+  wine_runtime_deps_found = true
   foreach runtime_dylib : [
     'libfreetype.6.dylib',
     'libgcrypt.20.dylib',

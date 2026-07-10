@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CI_ROOT="${DXMT_CI_ROOT:-/opt/dxmt-ci}"
 TOOLCHAINS_DIR="${CI_ROOT}/toolchains"
 DOWNLOADS_DIR="${CI_ROOT}/downloads"
@@ -468,8 +470,8 @@ wine_development_install_ready() {
 
 wine_runtime_install_ready() {
   local install_dir="$1"
-  [[ -f "${install_dir}/.wine-development-cache" ]] &&
-    grep -qx 'schema=2' "${install_dir}/.wine-development-cache" &&
+  [[ -f "${install_dir}/.dxmt-wine-runtime-cache" ]] &&
+    grep -qx 'schema=1' "${install_dir}/.dxmt-wine-runtime-cache" &&
     [[ -f "${install_dir}/lib/libfreetype.6.dylib" ]] &&
     [[ -f "${install_dir}/lib/libgcrypt.20.dylib" ]] &&
     [[ -f "${install_dir}/lib/libgmp.10.dylib" ]] &&
@@ -480,17 +482,6 @@ wine_runtime_install_ready() {
 
 wine_install_ready() {
   wine_development_install_ready "$1" && wine_runtime_install_ready "$1"
-}
-
-write_wine_cache_manifest() {
-  local install_dir="$1"
-  local source_revision="$2"
-  cat > "${install_dir}/.dxmt-wine-cache" <<EOF
-schema=1
-provider=dxmt-ci
-runtime_root=${install_dir}
-source_revision=${source_revision}
-EOF
 }
 
 build_wine_git_source() {
@@ -509,17 +500,13 @@ build_wine_git_source() {
   esac
 }
 
-prepare_wine_development_cache() {
+prepare_dxmt_wine_runtime_cache() {
   local source_dir="$1"
   local install_dir="$2"
-  local prepare_script="${source_dir}/scripts/prepare_development_cache.sh"
-  [[ -f "${prepare_script}" ]] ||
-    die "Wine source is missing scripts/prepare_development_cache.sh"
-  chmod +x \
-    "${prepare_script}" \
-    "${source_dir}/scripts/pack_runtime_deps.sh" \
-    "${source_dir}/scripts/relocate_wine_runtime.sh"
-  (cd "${source_dir}" && "${prepare_script}" --install-root "${install_dir}")
+  "${REPO_ROOT}/scripts/prepare-wine-runtime-cache.sh" \
+    --wine-source "${source_dir}" \
+    --install-root "${install_dir}" \
+    --cache-dir "${CI_ROOT}/wine-runtime-cache/${WINE_VERSION}"
 }
 
 ensure_wine_x86_64() {
@@ -548,12 +535,11 @@ ensure_wine_x86_64() {
     printf '%s\n' "${commit}" > "${stamp}"
   fi
 
-  log "validating Wine x86_64 runtime dependencies in the development cache"
-  prepare_wine_development_cache "${source_dir}" "${install_dir}"
+  log "preparing DXMT Wine x86_64 runtime dependency cache"
+  prepare_dxmt_wine_runtime_cache "${source_dir}" "${install_dir}"
   wine_install_ready "${install_dir}" ||
-    die "Wine development cache is incomplete after runtime dependency preparation: ${install_dir}"
+    die "DXMT Wine runtime cache is incomplete after dependency preparation: ${install_dir}"
 
-  write_wine_cache_manifest "${install_dir}" "${commit}"
   ln -sfn "${install_dir}" "${target}"
 }
 

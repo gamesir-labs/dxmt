@@ -153,10 +153,12 @@ startup. Long queue, resource-lifetime, and mixed-encoder workloads belong to
 the Wine integration benchmark layer instead of the unit-test image.
 
 The managed mode builds Wine once under `wine_build_path`, installs the runtime
-at `external/wine/build/dxmt-install`, and uses the Wine Proton development
-cache preparer to bundle relocatable host dylibs without removing the static
-archives needed by DXMT. The result is reused for DXMT linking, tests,
-benchmarks, and apitrace-enabled builds:
+at `external/wine/build/dxmt-install`, and then runs DXMT's own runtime-cache
+preparer against the fixed Wine source dependency. The consumer-side preparer
+uses Wine's generic dylib packaging tools but owns all cache state, required
+dependency policy, and validation. The Wine repository contains no DXMT build
+or cache integration. The result is reused for DXMT linking, tests, benchmarks,
+and apitrace-enabled builds:
 
 ```sh
 meson setup \
@@ -169,9 +171,9 @@ meson setup \
 scripts/run-wine-tests.sh build-wine-tests unit
 ```
 
-The Wine Proton source tree supplies its official development-cache preparer;
-`wine_runtime_preparer_path` remains available only when the build source and
-the cache preparer intentionally come from different trees.
+The managed source dependency must provide its ordinary
+`pack_runtime_deps.sh` and `relocate_wine_runtime.sh` packaging tools. DXMT does
+not require a Wine-owned marker or consumer-specific helper.
 
 `run-wine-tests.sh` compiles the build, stages the current DXMT runtime, and
 exports the stage to every Wine process before Meson schedules the tests. The

@@ -2,14 +2,15 @@
 set -eu
 
 if [ "$#" -lt 13 ]; then
-  echo "usage: build-wine.sh <source-dir> <build-dir> <runtime-root> <runtime-preparer> <windows-arch> <unix-arch> <libwinecrt0> <libntdll> <dbghelp> <winebuild> <winemac> <ntdll-so> <runtime-manifest> [configure-arg...]" >&2
+  echo "usage: build-wine.sh <source-dir> <build-dir> <runtime-root> <prepare-runtime> <windows-arch> <unix-arch> <libwinecrt0> <libntdll> <dbghelp> <winebuild> <winemac> <ntdll-so> <runtime-manifest> [configure-arg...]" >&2
   exit 2
 fi
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 src=$1
 build=$2
 runtime_root=$3
-runtime_preparer=$4
+prepare_runtime=$4
 windows_arch=$5
 unix_arch=$6
 shift 6
@@ -21,6 +22,14 @@ out_winemac=$5
 out_ntdll_so=$6
 out_runtime_manifest=$7
 shift 7
+
+case "$prepare_runtime" in
+  true|false) ;;
+  *)
+    echo "prepare-runtime must be true or false: $prepare_runtime" >&2
+    exit 2
+    ;;
+esac
 
 if [ ! -d "$src" ]; then
   echo "Wine source directory not found: $src" >&2
@@ -72,6 +81,7 @@ fi
 
 {
   cat "$next_config"
+  printf 'prepare_runtime=%s\n' "$prepare_runtime"
   printf 'source_revision=%s\n' "$source_revision"
   printf 'source_diff=%s\n' "$source_diff"
 } > "$next_build"
@@ -98,11 +108,11 @@ runtime_install_ready() {
 }
 
 runtime_dependency_cache_ready() {
-  if [ -z "$runtime_preparer" ]; then
+  if [ "$prepare_runtime" != true ]; then
     return 0
   fi
-  [ -f "$runtime_root/.wine-development-cache" ] &&
-    grep -qx 'schema=2' "$runtime_root/.wine-development-cache" &&
+  [ -f "$runtime_root/.dxmt-wine-runtime-cache" ] &&
+    grep -qx 'schema=1' "$runtime_root/.dxmt-wine-runtime-cache" &&
     [ -f "$runtime_root/lib/libfreetype.6.dylib" ] &&
     [ -f "$runtime_root/lib/libgcrypt.20.dylib" ] &&
     [ -f "$runtime_root/lib/libgmp.10.dylib" ] &&
@@ -143,12 +153,9 @@ if ! build_cache_ready || ! runtime_install_ready || ! cmp -s "$next_build" "$bu
   cp "$next_build" "$build_stamp"
 fi
 
-if [ -n "$runtime_preparer" ]; then
-  if [ ! -x "$runtime_preparer" ]; then
-    echo "Wine runtime preparer is not executable: $runtime_preparer" >&2
-    exit 1
-  fi
-  "$runtime_preparer" \
+if [ "$prepare_runtime" = true ]; then
+  "$script_dir/prepare-wine-runtime-cache.sh" \
+    --wine-source "$src" \
     --install-root "$runtime_root" \
     --cache-dir "$build/dxmt-runtime-deps"
 fi
