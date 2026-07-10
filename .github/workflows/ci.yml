@@ -331,7 +331,7 @@ jobs:
             -Dnative_llvm_path=.cache/toolchains/llvm-darwin \
             -Dwine_build_path= \
             -Dwine_install_path=.cache/toolchains/wine \
-            -Denable_d3d12_tests=true \
+            -Denable_tests=true \
             --buildtype release \
             --prefix "$(pwd)/.cache/install/wine-tests" \
             "${build_dir}"

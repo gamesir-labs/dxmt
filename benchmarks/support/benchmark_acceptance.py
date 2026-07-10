@@ -23,7 +23,7 @@ TIME_UNIT_TO_NS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one native or Wine DXMT benchmark suite and validate its result."
+            "Run one Wine DXMT benchmark suite and validate its result."
         )
     )
     parser.add_argument("--executable", required=True, type=Path)
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
         "--mode", choices=("performance", "integration"), default="performance"
     )
     parser.add_argument("--budget", type=Path)
-    parser.add_argument("--launcher", type=Path)
+    parser.add_argument("--launcher", required=True, type=Path)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--min-time", default="0.05s")
     parser.add_argument("--warmup-time", type=float, default=0.01)
@@ -71,10 +71,8 @@ def canonical_name(result: dict[str, Any]) -> str:
 
 
 def run_benchmark(args: argparse.Namespace, output_path: Path) -> int:
-    command = []
-    if args.launcher is not None:
-        command.append(str(args.launcher))
-    command += [
+    command = [
+        str(args.launcher),
         str(args.executable.resolve()),
         f"--benchmark_out={output_path}",
         "--benchmark_out_format=json",

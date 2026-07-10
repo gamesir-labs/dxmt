@@ -6,6 +6,8 @@ wineprefix
 .cache
 wine
 !external/wine
+!tests/wine/
+!tests/wine/**
 !benchmarks/wine/
 !benchmarks/wine/**
 .local

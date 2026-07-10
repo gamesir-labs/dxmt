@@ -1,75 +1,55 @@
-# DXMT performance benchmarks
+# DXMT Wine benchmarks
 
-DXMT benchmarks use Google Benchmark and are separate from granular GoogleTest
-unit tests. Native macOS suites enforce reviewed performance budgets. Wine
-suites carry longer end-to-end D3D integration workloads through the same
-benchmark abstraction and Meson benchmark scheduler.
+All DXMT benchmarks run through Wine and execute serially. GoogleTest owns
+granular correctness cases; Google Benchmark owns long integration workloads
+and reviewed performance thresholds without adding native-only test paths.
 
 ## Layout
 
 ```text
 benchmarks/
   include/dxmt_benchmark.hpp       Stable include for benchmark sources
-  support/main.cpp                 Shared benchmark executable entry point
-  support/benchmark_acceptance.py  Integration validation and budget enforcement
-  suites/meson.build               Native performance suite manifest
-  suites/*_benchmark.cpp           Native performance sources
-  wine/meson.build                 Wine integration/performance suite manifest
+  support/main.cpp                 Shared Windows benchmark entry point
+  support/benchmark_acceptance.py  Integration and performance validation
+  wine/meson.build                 Wine benchmark manifest
   wine/*_benchmark.cpp             Wine D3D workloads
-  budgets/*.json                   Reviewed acceptance thresholds
 ```
 
-## Add a benchmark
+## Modes
 
-Write a benchmark under `benchmarks/suites/`:
+`integration` runs every registered workload exactly once and fails on any
+Google Benchmark error row. It is intended for long queue, resource-lifetime,
+mixed-encoder, and repeated-submission correctness scenarios and does not claim
+a timing budget.
+
+`performance` performs repeated serial measurements and validates the median
+against a reviewed JSON budget. Every result must be single-threaded, and
+missing or stale budget entries fail acceptance. Performance budgets are
+machine-specific contracts and should only be updated from the designated Wine
+benchmark machine.
+
+## Add a Wine workload
+
+Write the workload under `benchmarks/wine/` and register it in
+`benchmarks/wine/meson.build`. Keep related `BENCHMARK` cases in one executable
+so one Wine launch covers the whole group.
 
 ```cpp
 #include <dxmt_benchmark.hpp>
 
-static void BM_Example(benchmark::State& state) {
+static void BI_Example(benchmark::State &state) {
   for (auto _ : state) {
-    benchmark::DoNotOptimize(OperationUnderTest());
-  }
-}
-
-BENCHMARK(BM_Example);
-```
-
-Add a suite entry to `benchmarks/suites/meson.build` and define an exact budget
-for every benchmark name in its JSON budget file. Budgets currently accept
-`cpu_time` or `real_time` and enforce `max_median_ns`.
-
-```meson
-'example': {
-  'sources': files('example_benchmark.cpp'),
-  'budget': files('../budgets/example.json'),
-  'dependencies': [util_dep],
-},
-```
-
-```json
-{
-  "schema_version": 1,
-  "benchmarks": {
-    "BM_Example": {
-      "metric": "cpu_time",
-      "max_median_ns": 500
+    if (!RunOperation()) {
+      state.SkipWithError("operation failed");
+      return;
     }
   }
 }
+
+BENCHMARK(BI_Example)->Iterations(1)->UseRealTime();
 ```
 
-The acceptance runner performs five repetitions by default, validates the
-median, rejects missing or stale budgets, and rejects any benchmark result that
-uses more than one thread. Meson's dedicated benchmark entries are
-non-parallel by design, so suites execute serially.
-
-## Add a Wine workload
-
-Wine workloads use the same Google Benchmark entry point but declare a mode in
-`benchmarks/wine/meson.build`. Keep integration cases few and representative;
-split operation-level correctness into individual GoogleTest cases under
-`tests/d3d*/`.
+Register an integration suite as follows:
 
 ```meson
 'd3d12-integration': {
@@ -81,47 +61,25 @@ split operation-level correctness into individual GoogleTest cases under
 },
 ```
 
-Integration mode runs each registered workload exactly once and fails on a
-Google Benchmark error row. It does not claim a timing budget. A future Wine
-performance suite uses `mode: 'performance'` plus a reviewed budget file, with
-the same serial scheduler and median acceptance policy as native benchmarks.
+A future Wine performance suite uses `mode: 'performance'`, adds a budget file,
+and may set `repetitions`, `min_time`, and `warmup_time`. The acceptance runner
+supports `cpu_time` and `real_time` with `max_median_ns` thresholds.
 
 ## Build and run
 
-Use a dedicated release build directory:
-
-```sh
-meson setup \
-  -Dnative_llvm_path=/usr/local/opt/llvm@15 \
-  -Denable_benchmarks=true \
-  .cache/build/benchmarks \
-  --buildtype release
-meson compile -C .cache/build/benchmarks dxmt-benchmarks
-meson test -C .cache/build/benchmarks --benchmark --suite performance \
-  --print-errorlogs
-```
-
-Performance budgets are machine-specific acceptance contracts. Update them
-only from the designated benchmark machine and review threshold changes like
-source changes.
-
-Use the Wine cross-build for D3D integration workloads. The helper compiles
-DXMT, stages its current runtime, and then lets Meson schedule the benchmark
-entries:
+Benchmarks are built by the same Wine test configuration:
 
 ```sh
 meson setup \
   --cross-file build-win64.txt \
   -Dnative_llvm_path=/usr/local/opt/llvm@15 \
-  -Denable_d3d12_tests=true \
+  -Denable_tests=true \
   -Dwine_source_path=../wine-proton-macos \
   .cache/build/wine-tests \
   --buildtype release
 scripts/run-wine-tests.sh .cache/build/wine-tests integration
 ```
 
-Managed and prebuilt Wine cache selection is identical to the unit-test path;
-see `tests/README.md`. Cache construction and validation are owned entirely by
-DXMT; Wine remains an ordinary source/runtime dependency. The same complete
-Wine root is used by DXMT compilation, Wine benchmarks, and apitrace-enabled
-cross-build validation.
+The helper compiles and stages the current DXMT runtime before Meson executes
+the serial benchmark entries. Managed and prebuilt Wine cache selection is
+identical to the unit-test path described in `tests/README.md`.
