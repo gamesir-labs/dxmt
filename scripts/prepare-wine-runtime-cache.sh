@@ -52,8 +52,8 @@ CACHE_DIR="$(cd "${CACHE_DIR}" && pwd)"
 
 PACK_SCRIPT="${WINE_SOURCE}/scripts/pack_runtime_deps.sh"
 RELOCATE_SCRIPT="${WINE_SOURCE}/scripts/relocate_wine_runtime.sh"
-RUNTIME_DEPS_DIR="${CACHE_DIR}/runtime-deps"
-RUNTIME_DEPS_NEXT="${CACHE_DIR}/runtime-deps.next.$$"
+RUNTIME_DEPS_ARCHIVE="${CACHE_DIR}/runtime-deps.zip"
+RUNTIME_DEPS_STAGE="${CACHE_DIR}/runtime-deps-stage"
 RUNTIME_DEPS_STAMP="${CACHE_DIR}/runtime-deps.state"
 CACHE_STAMP="${INSTALLROOT}/.dxmt-wine-runtime-cache"
 
@@ -91,7 +91,7 @@ done
 
 next_state="${CACHE_DIR}/runtime-cache-state.$$"
 next_dependency_state="${CACHE_DIR}/runtime-deps-state.$$"
-trap 'rm -f "${next_state}" "${next_dependency_state}"; rm -rf "${RUNTIME_DEPS_NEXT}"' EXIT HUP INT TERM
+trap 'rm -f "${next_state}" "${next_dependency_state}"' EXIT HUP INT TERM
 
 write_dependency_state() {
   local output="$1"
@@ -151,20 +151,14 @@ write_runtime_state() {
   } > "${output}"
 }
 
-runtime_dependency_tree_ready() {
-  local root="$1"
+runtime_dependency_files_ready() {
   local dylib
   for dylib in "${required_dylibs[@]}"; do
-    [[ -f "${root}/${dylib}" ]] || return 1
+    [[ -f "${INSTALLROOT}/lib/${dylib}" ]] || return 1
   done
 }
 
-runtime_dependency_files_ready() {
-  runtime_dependency_tree_ready "${INSTALLROOT}/lib"
-}
-
 audit_runtime_dylibs() {
-  local root="${1:-${INSTALLROOT}/lib}"
   local dylib
   local leaked_dependency
   local leaked_rpath
@@ -187,7 +181,7 @@ audit_runtime_dylibs() {
       echo "Runtime dylib contains a host-only RPATH: ${dylib} -> ${leaked_rpath}" >&2
       return 1
     fi
-  done < <(find "${root}" -maxdepth 2 \
+  done < <(find "${INSTALLROOT}/lib" -maxdepth 2 \
     -type f -name '*.dylib' -print0)
 }
 
@@ -206,11 +200,11 @@ runtime_cache_ready() {
   runtime_dependency_files_ready
 }
 
-runtime_dependency_cache_ready() {
-  [[ -d "${RUNTIME_DEPS_DIR}" ]] || return 1
+runtime_dependency_archive_ready() {
+  [[ -f "${RUNTIME_DEPS_ARCHIVE}" ]] || return 1
   [[ -f "${RUNTIME_DEPS_STAMP}" ]] || return 1
   cmp -s "${next_dependency_state}" "${RUNTIME_DEPS_STAMP}" || return 1
-  runtime_dependency_tree_ready "${RUNTIME_DEPS_DIR}"
+  unzip -tq "${RUNTIME_DEPS_ARCHIVE}" >/dev/null
 }
 
 if runtime_cache_ready; then
@@ -219,20 +213,15 @@ if runtime_cache_ready; then
   exit 0
 fi
 
-if runtime_dependency_cache_ready; then
-  echo "Reusing Wine runtime dependency directory: ${RUNTIME_DEPS_DIR}"
+if runtime_dependency_archive_ready; then
+  echo "Reusing Wine runtime dependency archive: ${RUNTIME_DEPS_ARCHIVE}"
 else
-  rm -rf "${RUNTIME_DEPS_NEXT}"
-  bash "${PACK_SCRIPT}" \
+  rm -rf "${RUNTIME_DEPS_STAGE}"
+  rm -f "${RUNTIME_DEPS_ARCHIVE}"
+  KEEP_STAGE=0 bash "${PACK_SCRIPT}" \
     --install-root "${INSTALLROOT}" \
-    --out-dir "${RUNTIME_DEPS_NEXT}"
-  runtime_dependency_tree_ready "${RUNTIME_DEPS_NEXT}" || {
-    echo "Wine runtime dependency directory is incomplete" >&2
-    exit 1
-  }
-  audit_runtime_dylibs "${RUNTIME_DEPS_NEXT}"
-  rm -rf "${RUNTIME_DEPS_DIR}"
-  mv "${RUNTIME_DEPS_NEXT}" "${RUNTIME_DEPS_DIR}"
+    --out-zip "${RUNTIME_DEPS_ARCHIVE}" \
+    --stage-dir "${RUNTIME_DEPS_STAGE}"
   cp "${next_dependency_state}" "${RUNTIME_DEPS_STAMP}"
 fi
 
@@ -240,11 +229,11 @@ mkdir -p "${INSTALLROOT}/lib"
 find "${INSTALLROOT}/lib" -maxdepth 1 \
   \( -type f -o -type l \) -name '*.dylib' -delete
 rm -rf "${INSTALLROOT}/lib/gstreamer-1.0"
-cp -a "${RUNTIME_DEPS_DIR}/." "${INSTALLROOT}/lib/"
+unzip -oq "${RUNTIME_DEPS_ARCHIVE}" -d "${INSTALLROOT}/lib"
 bash "${RELOCATE_SCRIPT}" --install-root "${INSTALLROOT}"
 
 runtime_dependency_files_ready || {
-  echo "Wine runtime dependency directory is incomplete" >&2
+  echo "Wine runtime dependency archive is incomplete" >&2
   exit 1
 }
 

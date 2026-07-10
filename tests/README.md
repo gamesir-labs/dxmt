@@ -175,12 +175,12 @@ The managed source dependency must provide its ordinary
 `pack_runtime_deps.sh` and `relocate_wine_runtime.sh` packaging tools. DXMT does
 not require a Wine-owned marker or consumer-specific helper.
 
-Wine compilation state remains under `wine_build_path`. The unpacked host
-dependency tree and its validation state are shared by every build directory
-at `.cache/wine-runtime/x86_64/` in the DXMT repository. No ZIP is created or
-expanded on the cache path. Unit tests, integration benchmarks, apitrace
-builds, and self-hosted jobs all invoke the same DXMT preparer and use this
-project-local path; CI has no separate cache setting or behavior.
+Wine compilation state remains under `wine_build_path`. The host dependency
+archive and its validation state are shared by every build directory at
+`.cache/wine-runtime/x86_64/` in the DXMT repository. Unit tests, integration
+benchmarks, apitrace builds, and self-hosted jobs all invoke the same DXMT
+preparer and use this project-local path; CI has no separate cache setting or
+behavior.
 
 `run-wine-tests.sh` compiles the build, stages the current DXMT runtime, and
 exports the stage to every Wine process before Meson schedules the tests. The
