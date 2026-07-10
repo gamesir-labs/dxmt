@@ -13,6 +13,7 @@ benchmarks/
   support/benchmark_acceptance.py  Integration and performance validation
   wine/meson.build                 Wine benchmark manifest
   wine/*_benchmark.cpp             Wine D3D workloads
+  wine/ue_*_initialization.cpp     UE-like RHI initialization workload
 ```
 
 ## Modes
@@ -21,6 +22,17 @@ benchmarks/
 Google Benchmark error row. It is intended for long queue, resource-lifetime,
 mixed-encoder, and repeated-submission correctness scenarios and does not claim
 a timing budget.
+
+The `ue-rhi-initialization` integration suite reconstructs one full engine-like
+startup workload. Its benchmark executable has no D3D imports and sequentially
+starts API-isolated D3D11 and D3D12 workers inside the existing Wine session.
+Each worker performs a temporary support probe, recreates the selected adapter
+and final device, sweeps startup capabilities, creates the API's queue/view/
+descriptor/state structures, submits representative resource work, validates
+GPU output by readback, waits for idle, and tears down in reverse order. This
+keeps D3D11's Metal 3 and D3D12's Metal 4 backends out of the same PE while
+still presenting one serial integration result. The D3D12 probe makes the same
+combined SM6/SM5 decision as UE before the formal device bootstrap continues.
 
 `performance` performs repeated serial measurements and validates the median
 against a reviewed JSON budget. Every result must be single-threaded, and
