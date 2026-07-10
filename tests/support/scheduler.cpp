@@ -1,5 +1,7 @@
 #include <dxmt_test.hpp>
 
+#include "wine_process.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -7,19 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mach/mach.h>
-#include <mach-o/dyld.h>
 #include <optional>
-#include <spawn.h>
 #include <string>
 #include <string_view>
-#include <sys/wait.h>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <vector>
-
-extern char **environ;
 
 namespace dxmt::test {
 namespace {
@@ -181,12 +176,8 @@ struct SchedulerOptions {
   std::size_t jobs = 0;
   bool jobs_were_set = false;
   bool show_help = false;
+  bool is_worker = false;
   std::string report_path;
-};
-
-enum class WorkerMode {
-  Fork,
-  Spawn,
 };
 
 std::optional<SchedulerOptions>
@@ -213,6 +204,10 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
       options.show_help = true;
       continue;
     }
+    if (argument == "--dxmt-test-worker") {
+      options.is_worker = true;
+      continue;
+    }
     if (std::string_view(argument).starts_with(report_prefix)) {
       options.report_path =
           std::string(std::string_view(argument).substr(report_prefix.size()));
@@ -233,68 +228,9 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
     options.jobs_were_set = true;
   }
 
-  if (!options.jobs_were_set) {
+  if (!options.jobs_were_set)
     options.jobs = std::max(1u, std::thread::hardware_concurrency());
-  }
   return options;
-}
-
-std::string ExecutablePath() {
-  std::uint32_t size = 1024;
-  std::vector<char> buffer(size);
-  while (_NSGetExecutablePath(buffer.data(), &size) != 0)
-    buffer.resize(size);
-  return std::string(buffer.data());
-}
-
-bool IsSingleThreaded() {
-  thread_act_array_t threads = nullptr;
-  mach_msg_type_number_t thread_count = 0;
-  const auto result = task_threads(mach_task_self(), &threads, &thread_count);
-  if (result != KERN_SUCCESS)
-    return false;
-
-  for (mach_msg_type_number_t index = 0; index < thread_count; ++index)
-    mach_port_deallocate(mach_task_self(), threads[index]);
-  vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
-                thread_count * sizeof(thread_t));
-  return thread_count == 1;
-}
-
-WorkerMode SelectWorkerMode() {
-  if (const char *mode = std::getenv("DXMT_TEST_WORKER_MODE")) {
-    if (std::strcmp(mode, "fork") == 0)
-      return WorkerMode::Fork;
-    if (std::strcmp(mode, "spawn") == 0)
-      return WorkerMode::Spawn;
-    std::fprintf(stderr,
-                 "ignoring invalid DXMT_TEST_WORKER_MODE '%s'; expected "
-                 "'fork' or 'spawn'\n",
-                 mode);
-  }
-  return IsSingleThreaded() ? WorkerMode::Fork : WorkerMode::Spawn;
-}
-
-std::vector<std::string>
-BuildWorkerEnvironment(const std::vector<std::string> &extra_entries) {
-  std::vector<std::string> environment;
-  for (char **entry = environ; *entry != nullptr; ++entry) {
-    const std::string_view value(*entry);
-    if (!value.starts_with("DXMT_GTEST_WORKER="))
-      environment.emplace_back(value);
-  }
-  environment.insert(environment.end(), extra_entries.begin(),
-                     extra_entries.end());
-  return environment;
-}
-
-std::vector<char *> MutablePointers(std::vector<std::string> &values) {
-  std::vector<char *> pointers;
-  pointers.reserve(values.size() + 1);
-  for (auto &value : values)
-    pointers.push_back(value.data());
-  pointers.push_back(nullptr);
-  return pointers;
 }
 
 std::string BuildFilter(const TestShard &shard) {
@@ -314,29 +250,37 @@ std::string BuildFilter(const TestShard &shard) {
 
 std::vector<std::string>
 BuildWorkerArguments(const std::vector<std::string> &original_arguments,
-                     const std::string &executable, const TestShard &shard,
-                     std::string_view report_path) {
+                     const TestShard &shard, std::string_view report_path) {
   std::vector<std::string> arguments;
   arguments.reserve(original_arguments.size() + 2);
-  arguments.push_back(executable);
   for (std::size_t index = 1; index < original_arguments.size(); ++index) {
     const std::string_view argument(original_arguments[index]);
     if (!argument.starts_with("--dxmt-test-jobs=") &&
-        !argument.starts_with("--dxmt-test-report=")) {
+        !argument.starts_with("--dxmt-test-report=") &&
+        !argument.starts_with("--gtest_filter=") &&
+        argument != "--dxmt-test-worker") {
       arguments.push_back(original_arguments[index]);
     }
   }
+  arguments.push_back("--dxmt-test-worker");
   arguments.push_back("--gtest_filter=" + BuildFilter(shard));
   arguments.push_back("--dxmt-test-report=" + std::string(report_path));
   return arguments;
 }
 
 std::string BuildReportPrefix() {
-  std::string path =
-      std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp";
-  if (path.empty() || path.back() != '/')
-    path.push_back('/');
-  path += "dxmt-gtest-" + std::to_string(getpid()) + "-";
+  std::vector<char> buffer(32768);
+  const DWORD size =
+      GetTempPathA(static_cast<DWORD>(buffer.size()), buffer.data());
+  std::string path;
+  if (size == 0 || size >= buffer.size()) {
+    path = ".\\";
+  } else {
+    path.assign(buffer.data(), size);
+    if (!path.empty() && path.back() != '\\' && path.back() != '/')
+      path.push_back('\\');
+  }
+  path += "dxmt-gtest-" + std::to_string(GetCurrentProcessId()) + "-";
   path += std::to_string(Clock::now().time_since_epoch().count());
   return path;
 }
@@ -350,7 +294,7 @@ std::string ReadAndRemoveReport(std::string_view path) {
       report.append(buffer, size);
     std::fclose(file);
   }
-  unlink(std::string(path).c_str());
+  DeleteFileA(std::string(path).c_str());
   return report;
 }
 
@@ -388,12 +332,11 @@ int RunScheduledTests(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   DisableFailureShortCircuiting();
 
-  const bool is_worker = std::getenv("DXMT_GTEST_WORKER") != nullptr;
   if (options->show_help || GTEST_FLAG_GET(list_tests) ||
       HasUnrecognizedGoogleTestArgument(argc, argv)) {
     return RUN_ALL_TESTS();
   }
-  if (is_worker)
+  if (options->is_worker)
     return RunTestsAndReport(options->report_path);
   if (HasExternalSharding())
     return RunTestsAndReport();
@@ -413,13 +356,13 @@ int RunScheduledTests(int argc, char **argv) {
     return RunTestsAndReport();
 
   auto shards = BuildTestShards(std::move(tests), worker_count);
-  const auto worker_mode = SelectWorkerMode();
-  const auto executable =
-      worker_mode == WorkerMode::Spawn ? ExecutablePath() : std::string();
-  auto environment = worker_mode == WorkerMode::Spawn
-                         ? BuildWorkerEnvironment({"DXMT_GTEST_WORKER=1"})
-                         : std::vector<std::string>();
-  auto environment_pointers = MutablePointers(environment);
+  const auto executable = WineExecutablePath();
+  if (executable.empty()) {
+    std::fprintf(stderr, "failed to resolve Wine test executable path: %s\n",
+                 WineErrorMessage(GetLastError()).c_str());
+    return 2;
+  }
+
   std::vector<std::string> report_paths;
   report_paths.reserve(shards.size());
   const auto report_prefix = BuildReportPrefix();
@@ -431,7 +374,7 @@ int RunScheduledTests(int argc, char **argv) {
                            .count();
 
   std::printf(
-      "[ DXMT     ] scheduling %zu tests on %zu workers via %s "
+      "[ DXMT     ] scheduling %zu tests on %zu Wine workers "
       "(plan %lld us)\n",
       [&shards] {
         std::size_t count = 0;
@@ -439,11 +382,10 @@ int RunScheduledTests(int argc, char **argv) {
           count += shard.tests.size();
         return count;
       }(),
-      shards.size(), worker_mode == WorkerMode::Fork ? "fork" : "spawn",
-      static_cast<long long>(plan_us));
+      shards.size(), static_cast<long long>(plan_us));
   std::fflush(stdout);
 
-  std::vector<pid_t> children;
+  std::vector<WineProcess> children;
   children.reserve(shards.size());
   std::size_t spawn_failures = 0;
   std::string scheduler_errors;
@@ -451,65 +393,43 @@ int RunScheduledTests(int argc, char **argv) {
   std::fflush(nullptr);
   const auto run_start = Clock::now();
   for (std::size_t index = 0; index < shards.size(); ++index) {
-    const auto &shard = shards[index];
-    const auto &report_path = report_paths[index];
-    const auto filter = BuildFilter(shard);
-    pid_t child = -1;
-    int error = 0;
-    if (worker_mode == WorkerMode::Fork) {
-      child = fork();
-      if (child == 0) {
-        setenv("DXMT_GTEST_WORKER", "1", 1);
-        GTEST_FLAG_SET(filter, filter);
-        const int result = RunTestsAndReport(report_path);
-        std::exit(result);
-      }
-      if (child < 0)
-        error = errno;
-    } else {
-      auto arguments = BuildWorkerArguments(original_arguments, executable,
-                                            shard, report_path);
-      auto argument_pointers = MutablePointers(arguments);
-      error =
-          posix_spawn(&child, executable.c_str(), nullptr, nullptr,
-                      argument_pointers.data(), environment_pointers.data());
-    }
-    if (error != 0) {
-      scheduler_errors += "failed to start unit-test worker: ";
-      scheduler_errors += std::strerror(error);
+    const auto arguments = BuildWorkerArguments(
+        original_arguments, shards[index], report_paths[index]);
+    DWORD error = ERROR_SUCCESS;
+    auto child = StartWineProcess(executable, arguments, &error);
+    if (!child) {
+      scheduler_errors += "failed to start Wine unit-test worker: ";
+      scheduler_errors += WineErrorMessage(error);
       scheduler_errors += '\n';
       ++spawn_failures;
     } else {
-      children.push_back(child);
+      children.push_back(*child);
     }
   }
   const auto spawn_end = Clock::now();
 
   std::size_t failed_workers = spawn_failures;
-  for (const auto child : children) {
-    int status = 0;
-    pid_t result = -1;
-    do {
-      result = waitpid(child, &status, 0);
-    } while (result < 0 && errno == EINTR);
-
-    if (result < 0) {
-      scheduler_errors += "failed to wait for unit-test worker ";
-      scheduler_errors += std::to_string(child);
+  for (const auto &child : children) {
+    const DWORD wait_result = WaitForSingleObject(child.handle, INFINITE);
+    DWORD exit_code = 1;
+    if (wait_result != WAIT_OBJECT_0) {
+      scheduler_errors += "failed to wait for Wine unit-test worker ";
+      scheduler_errors += std::to_string(child.id);
       scheduler_errors += ": ";
-      scheduler_errors += std::strerror(errno);
+      scheduler_errors += WineErrorMessage(GetLastError());
       scheduler_errors += '\n';
       ++failed_workers;
-    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      if (WIFSIGNALED(status)) {
-        scheduler_errors += "unit-test worker ";
-        scheduler_errors += std::to_string(child);
-        scheduler_errors += " terminated by signal ";
-        scheduler_errors += std::to_string(WTERMSIG(status));
-        scheduler_errors += '\n';
-      }
+    } else if (!GetExitCodeProcess(child.handle, &exit_code)) {
+      scheduler_errors += "failed to read Wine unit-test worker status ";
+      scheduler_errors += std::to_string(child.id);
+      scheduler_errors += ": ";
+      scheduler_errors += WineErrorMessage(GetLastError());
+      scheduler_errors += '\n';
+      ++failed_workers;
+    } else if (exit_code != 0) {
       ++failed_workers;
     }
+    CloseHandle(child.handle);
   }
 
   std::string failure_reports;
@@ -528,9 +448,10 @@ int RunScheduledTests(int argc, char **argv) {
     std::fprintf(stderr, "[ DXMT     ] failure summary\n%s%s",
                  scheduler_errors.c_str(), failure_reports.c_str());
   }
-  std::printf("[ DXMT     ] workers %s (launch %lld us, wall %.3f ms)\n",
-              failed_workers == 0 ? "passed" : "failed",
-              static_cast<long long>(launch_us), run_ms);
+  std::printf(
+      "[ DXMT     ] Wine workers %s (launch %lld us, wall %.3f ms)\n",
+      failed_workers == 0 ? "passed" : "failed",
+      static_cast<long long>(launch_us), run_ms);
   return failed_workers == 0 ? 0 : 1;
 }
 

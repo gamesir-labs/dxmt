@@ -255,7 +255,7 @@ wine_runtime_root = ''
 wine_runtime_manifest = []
 wine_test_env = environment()
 wine_runtime_required = dxmt_crossbuild and (
-  get_option('enable_d3d12_tests') or dxmt_apitrace_metal_enabled
+  get_option('enable_tests') or dxmt_apitrace_metal_enabled
 )
 
 if dxmt_crossbuild
@@ -430,31 +430,13 @@ subdir('libs')
 subdir('src')
 
 if get_option('enable_tests')
-  if dxmt_crossbuild
-    error('GoogleTest unit tests require a native macOS build directory')
-  endif
-
-  subdir('external/googletest')
-  subdir('tests')
-endif
-
-if get_option('enable_d3d12_tests')
   if not dxmt_crossbuild
-    error('D3D12 runtime tests require a Windows cross-build directory')
+    error('Tests require a Windows cross-build directory and run through Wine')
   endif
 
   wine_test_launcher = find_program('scripts/wine-test-wrapper.sh')
   subdir('external/googletest')
-  subdir('tests/d3d10')
-  subdir('tests/d3d11')
-  subdir('tests/d3d12')
-endif
-
-if get_option('enable_benchmarks') and dxmt_crossbuild
-  error('Performance benchmarks require a native macOS build directory')
-endif
-
-if get_option('enable_benchmarks') or get_option('enable_d3d12_tests')
+  subdir('tests')
   subdir('external/google-benchmark')
   subdir('benchmarks')
 endif

@@ -2,7 +2,7 @@
 
 #include <string_view>
 
-TEST(GoogleTestIntegration, UsesDxmtCxxStandard) {
+TEST(GoogleTestIntegration, UsesDxmtCxxStandardUnderWine) {
   static_assert(__cplusplus >= 202002L);
 
   constexpr std::string_view project_name = "dxmt";

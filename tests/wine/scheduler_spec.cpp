@@ -1,8 +1,8 @@
 #include <dxmt_test.hpp>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -110,13 +110,15 @@ TEST(TestSchedulerWorker, CatchesConditionalException) {
 }
 
 TEST(TestSchedulerWorker, ReachesTestsAfterCaughtException) {
-  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr)
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
     EXPECT_EQ(conditional_failure_count, 3);
+  }
 }
 
 TEST(TestSchedulerWorker, ReportsIndependentConditionalFailure) {
-  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr)
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
     FAIL() << "independent injected worker failure";
+  }
 }
 
 class SchedulerParameterizedSmoke : public ::testing::TestWithParam<int> {};

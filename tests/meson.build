@@ -1,7 +1,7 @@
 dxmt_test_include_dirs = include_directories('include')
 
 dxmt_test_main_lib = static_library(
-  'dxmt-test-main',
+  'dxmt-wine-test-main',
   files(
     'support/main.cpp',
     'support/scheduler.cpp',
@@ -18,4 +18,81 @@ dxmt_test_dep = declare_dependency(
   include_directories: [dxmt_test_include_dirs],
 )
 
-subdir('unit')
+subdir('d3d10')
+subdir('d3d11')
+subdir('d3d12')
+
+dxmt_wine_framework_suites = {
+  'framework': {
+    'sources': files('wine/framework_spec.cpp'),
+  },
+  'scheduler': {
+    'sources': files('wine/scheduler_spec.cpp'),
+  },
+  'placeholder': {
+    'sources': files('wine/placeholder_spec.cpp'),
+  },
+  'layout': {
+    'sources': files('wine/layout_spec.cpp'),
+  },
+}
+
+dxmt_wine_framework_sources = []
+foreach suite_name, suite_config : dxmt_wine_framework_suites
+  dxmt_wine_framework_sources += suite_config['sources']
+endforeach
+
+dxmt_wine_framework_tests = executable(
+  'dxmt-wine-framework-tests',
+  dxmt_wine_framework_sources,
+  dependencies: [dxmt_test_dep],
+  install: false,
+)
+
+dxmt_wine_d3d10_tests = executable(
+  'dxmt-wine-d3d10-tests',
+  d3d10_unit_sources,
+  dependencies: [dxmt_test_dep] + d3d10_unit_dependencies,
+  install: false,
+)
+
+dxmt_wine_d3d11_tests = executable(
+  'dxmt-wine-d3d11-tests',
+  d3d11_unit_sources,
+  dependencies: [dxmt_test_dep] + d3d11_unit_dependencies,
+  install: false,
+)
+
+dxmt_wine_d3d12_tests = executable(
+  'dxmt-wine-d3d12-tests',
+  d3d12_unit_sources,
+  dependencies: [dxmt_test_dep] + d3d12_unit_dependencies,
+  install: false,
+)
+
+dxmt_wine_test_scheduler = executable(
+  'dxmt-wine-test-scheduler',
+  files('support/wine_suite_scheduler.cpp'),
+  include_directories: [include_directories('support')],
+  install: false,
+)
+
+test(
+  'dxmt-wine-unit-tests',
+  wine_test_launcher,
+  args: [dxmt_wine_test_scheduler],
+  suite: ['unit', 'wine'],
+  timeout: 120,
+  env: wine_test_env,
+  is_parallel: false,
+  workdir: meson.project_source_root(),
+)
+
+alias_target(
+  'dxmt-wine-tests',
+  dxmt_wine_test_scheduler,
+  dxmt_wine_framework_tests,
+  dxmt_wine_d3d10_tests,
+  dxmt_wine_d3d11_tests,
+  dxmt_wine_d3d12_tests,
+)
