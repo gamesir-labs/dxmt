@@ -16,7 +16,10 @@ d3d12_runtime_support_dep = declare_dependency(
 
 d3d12_unit_suites = {
   'device': {
-    'sources': files('device_spec.cpp'),
+    'sources': files(
+      'device_spec.cpp',
+      'capability_spec.cpp',
+    ),
   },
   'descriptor': {
     'sources': files(
@@ -42,4 +45,4 @@ foreach suite_name, suite_config : d3d12_unit_suites
   d3d12_unit_dependencies += suite_config.get('dependencies', [])
 endforeach
 
-d3d12_unit_dependencies += [d3d12_runtime_support_dep]
+d3d12_unit_dependencies += [d3d12_runtime_support_dep, dxgi_dep]
