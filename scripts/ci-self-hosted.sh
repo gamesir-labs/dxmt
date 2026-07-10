@@ -451,9 +451,11 @@ sync_wine_git_source() {
   download_wine_source_tarball "${source_dir}"
 }
 
-wine_install_ready() {
+wine_development_install_ready() {
   local install_dir="$1"
-  [[ -x "${install_dir}/bin/winebuild" ]] &&
+  { [[ -x "${install_dir}/bin/wine" ]] || [[ -x "${install_dir}/bin/wine64" ]]; } &&
+    [[ -x "${install_dir}/bin/wineserver" ]] &&
+    [[ -x "${install_dir}/bin/winebuild" ]] &&
     [[ -f "${install_dir}/lib/wine/i386-windows/libwinecrt0.a" ]] &&
     [[ -f "${install_dir}/lib/wine/i386-windows/libntdll.a" ]] &&
     [[ -f "${install_dir}/lib/wine/i386-windows/dbghelp.dll" ]] &&
@@ -464,26 +466,60 @@ wine_install_ready() {
     [[ -f "${install_dir}/lib/wine/x86_64-unix/ntdll.so" ]]
 }
 
+wine_runtime_install_ready() {
+  local install_dir="$1"
+  [[ -f "${install_dir}/.wine-development-cache" ]] &&
+    grep -qx 'schema=2' "${install_dir}/.wine-development-cache" &&
+    [[ -f "${install_dir}/lib/libfreetype.6.dylib" ]] &&
+    [[ -f "${install_dir}/lib/libgcrypt.20.dylib" ]] &&
+    [[ -f "${install_dir}/lib/libgmp.10.dylib" ]] &&
+    [[ -f "${install_dir}/lib/libgnutls.30.dylib" ]] &&
+    [[ -f "${install_dir}/lib/libSDL2-2.0.0.dylib" ]] &&
+    [[ -f "${install_dir}/lib/libMoltenVK.dylib" ]]
+}
+
+wine_install_ready() {
+  wine_development_install_ready "$1" && wine_runtime_install_ready "$1"
+}
+
+write_wine_cache_manifest() {
+  local install_dir="$1"
+  local source_revision="$2"
+  cat > "${install_dir}/.dxmt-wine-cache" <<EOF
+schema=1
+provider=dxmt-ci
+runtime_root=${install_dir}
+source_revision=${source_revision}
+EOF
+}
+
 build_wine_git_source() {
   local source_dir="$1"
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
   case "$(uname -m)" in
     arm64)
-      # MoltenVK comes from the LunarG Vulkan SDK. The x86_64 Homebrew formula
-      # currently fails to parse on the self-hosted runner.
-      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*) molten-vk( [^)]*\))/$1$2/' \
-        "${source_dir}/scripts/build_on_m1.sh"
       (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
     x86_64)
-      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*)\n    molten-vk\n([^)]*\))/$1\n$2/' \
-        "${source_dir}/scripts/build_on_intel.sh"
       (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
       die "unsupported host architecture for Wine build: $(uname -m)"
       ;;
   esac
+}
+
+prepare_wine_development_cache() {
+  local source_dir="$1"
+  local install_dir="$2"
+  local prepare_script="${source_dir}/scripts/prepare_development_cache.sh"
+  [[ -f "${prepare_script}" ]] ||
+    die "Wine source is missing scripts/prepare_development_cache.sh"
+  chmod +x \
+    "${prepare_script}" \
+    "${source_dir}/scripts/pack_runtime_deps.sh" \
+    "${source_dir}/scripts/relocate_wine_runtime.sh"
+  (cd "${source_dir}" && "${prepare_script}" --install-root "${install_dir}")
 }
 
 ensure_wine_x86_64() {
@@ -498,20 +534,26 @@ ensure_wine_x86_64() {
   install_dir="${source_dir}/install"
   stamp="${install_dir}/.dxmt-ci-source-commit"
 
-  if wine_install_ready "${install_dir}" &&
+  if wine_development_install_ready "${install_dir}" &&
      [[ -f "${stamp}" ]] &&
      [[ "$(cat "${stamp}")" == "${commit}" ]]; then
-    log "Wine x86_64 already prepared from ${commit}: ${install_dir}"
+    log "Wine x86_64 development artifacts already prepared from ${commit}: ${install_dir}"
   else
     log "building Wine x86_64 from ${commit}"
     rm -rf "${source_dir}/build" "${source_dir}/install"
     rm -f "${source_dir}/.generated"
     build_wine_git_source "${source_dir}"
-    wine_install_ready "${install_dir}" ||
+    wine_development_install_ready "${install_dir}" ||
       die "Wine build finished but required install artifacts are missing: ${install_dir}"
     printf '%s\n' "${commit}" > "${stamp}"
   fi
 
+  log "validating Wine x86_64 runtime dependencies in the development cache"
+  prepare_wine_development_cache "${source_dir}" "${install_dir}"
+  wine_install_ready "${install_dir}" ||
+    die "Wine development cache is incomplete after runtime dependency preparation: ${install_dir}"
+
+  write_wine_cache_manifest "${install_dir}" "${commit}"
   ln -sfn "${install_dir}" "${target}"
 }
 
