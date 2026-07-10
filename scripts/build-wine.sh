@@ -156,8 +156,7 @@ fi
 if [ "$prepare_runtime" = true ]; then
   "$script_dir/prepare-wine-runtime-cache.sh" \
     --wine-source "$src" \
-    --install-root "$runtime_root" \
-    --cache-dir "$build/dxmt-runtime-deps"
+    --install-root "$runtime_root"
 fi
 runtime_cache_ready || {
   echo "Wine install did not produce a complete runtime cache: $runtime_root" >&2
