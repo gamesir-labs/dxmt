@@ -14,16 +14,3 @@ gtest_dep = declare_dependency(
   dependencies: [gtest_threads_dep],
   include_directories: [gtest_include_dirs],
 )
-
-gtest_main_lib = static_library(
-  'dxmt-gtest-main',
-  'src/gtest_main.cc',
-  include_directories: [gtest_include_dirs],
-  install: false,
-)
-
-gtest_main_dep = declare_dependency(
-  link_with: [gtest_main_lib],
-  dependencies: [gtest_dep],
-  include_directories: [gtest_include_dirs],
-)
