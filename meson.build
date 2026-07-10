@@ -383,3 +383,12 @@ if get_option('enable_tests')
   subdir('external/googletest')
   subdir('tests')
 endif
+
+if get_option('enable_benchmarks')
+  if dxmt_crossbuild
+    error('Performance benchmarks require a native macOS build directory')
+  endif
+
+  subdir('external/google-benchmark')
+  subdir('benchmarks')
+endif
