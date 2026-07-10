@@ -544,6 +544,8 @@ enum WMTSparseTextureMappingMode : uint32_t {
   WMTSparseTextureMappingModeUnmap = 1,
 };
 
+#define WMT_SPARSE_TILE_SIZE_IN_BYTES (64ull * 1024ull)
+
 struct WMTSparseTextureMappingOperation {
   enum WMTSparseTextureMappingMode mode;
   uint32_t level;
@@ -554,7 +556,7 @@ struct WMTSparseTextureMappingOperation {
   uint32_t width;
   uint32_t height;
   uint32_t depth;
-  uint64_t heap_offset;
+  uint64_t heap_offset; // bytes
 };
 
 WINEMETAL_API obj_handle_t MTLDevice_newTexture(obj_handle_t device, struct WMTTextureInfo *info);

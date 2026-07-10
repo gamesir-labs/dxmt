@@ -4191,7 +4191,8 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
                                                  src->depth);
       mtl_ops[i].textureLevel = src->level;
       mtl_ops[i].textureSlice = src->slice;
-      mtl_ops[i].heapOffset = src->heap_offset;
+      mtl_ops[i].heapOffset =
+          src->heap_offset / WMT_SPARSE_TILE_SIZE_IN_BYTES;
     }
 
     [queue updateTextureMappings:texture
