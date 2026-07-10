@@ -2,6 +2,7 @@ build
 .vscode
 .DS_Store
 wineprefix
+.wine-x86_64-test
 .cache
 wine
 !external/wine
