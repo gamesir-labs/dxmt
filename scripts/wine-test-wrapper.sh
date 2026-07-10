@@ -71,11 +71,6 @@ fi
 export DXMT_TEST_WINE_ROOT="$wine_root"
 
 if [ "${DXMT_TEST_REQUIRE_RUNTIME:-0}" = "1" ]; then
-  if [ ! -f "$wine_root/.wine-development-cache" ] ||
-     ! grep -qx 'schema=2' "$wine_root/.wine-development-cache"; then
-    printf 'Wine cache is missing a schema-2 runtime marker: %s\n' "$wine_root" >&2
-    exit 2
-  fi
   for runtime_dylib in \
     libfreetype.6.dylib \
     libgcrypt.20.dylib \
@@ -85,7 +80,7 @@ if [ "${DXMT_TEST_REQUIRE_RUNTIME:-0}" = "1" ]; then
     libMoltenVK.dylib
   do
     if [ ! -f "$wine_root/lib/$runtime_dylib" ]; then
-      printf 'Wine cache is missing runtime dependency %s: %s\n' \
+      printf 'Wine runtime is missing dependency %s: %s\n' \
         "$runtime_dylib" "$wine_root" >&2
       exit 2
     fi

@@ -121,5 +121,7 @@ scripts/run-wine-tests.sh build-wine-tests integration
 ```
 
 Managed and prebuilt Wine cache selection is identical to the unit-test path;
-see `tests/README.md`. The same complete Wine root is used by DXMT compilation,
-Wine benchmarks, and apitrace-enabled cross-build validation.
+see `tests/README.md`. Cache construction and validation are owned entirely by
+DXMT; Wine remains an ordinary source/runtime dependency. The same complete
+Wine root is used by DXMT compilation, Wine benchmarks, and apitrace-enabled
+cross-build validation.
