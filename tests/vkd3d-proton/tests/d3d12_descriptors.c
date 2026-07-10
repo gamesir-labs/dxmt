@@ -2956,6 +2956,110 @@ void test_null_uav(void)
     destroy_test_context(&context);
 }
 
+void test_texture_uav_descriptor_copy_bindless_fallback(void)
+{
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc;
+    D3D12_DESCRIPTOR_RANGE descriptor_range;
+    D3D12_ROOT_PARAMETER root_parameters[2];
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+    D3D12_SUBRESOURCE_DATA upload;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle;
+    ID3D12DescriptorHeap *cpu_heap, *gpu_heap;
+    struct test_context_desc desc;
+    struct test_context context;
+    ID3D12Resource *texture;
+    const float value = 1.0f;
+    HRESULT hr;
+
+#include "shaders/descriptors/headers/null_uav_ld_texture.h"
+
+    memset(&desc, 0, sizeof(desc));
+    desc.no_root_signature = true;
+    if (!init_test_context(&context, &desc))
+        return;
+
+    memset(&descriptor_range, 0, sizeof(descriptor_range));
+    descriptor_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    /* Keep this valid for replay while forcing native table materialization to
+     * use its explicit unsupported-range fallback. */
+    descriptor_range.NumDescriptors = UINT_MAX;
+    descriptor_range.BaseShaderRegister = 1;
+    descriptor_range.OffsetInDescriptorsFromTableStart = 0;
+    memset(root_parameters, 0, sizeof(root_parameters));
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[0].DescriptorTable.pDescriptorRanges = &descriptor_range;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_parameters[1].Constants.ShaderRegister = 0;
+    root_parameters[1].Constants.Num32BitValues = 1;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    memset(&root_signature_desc, 0, sizeof(root_signature_desc));
+    root_signature_desc.NumParameters = ARRAY_SIZE(root_parameters);
+    root_signature_desc.pParameters = root_parameters;
+    hr = create_root_signature(context.device, &root_signature_desc,
+            &context.root_signature);
+    ok(SUCCEEDED(hr), "Failed to create root signature, hr %#x.\n", hr);
+    context.pipeline_state = create_pipeline_state(context.device,
+            context.root_signature, context.render_target_desc.Format, NULL,
+            &null_uav_ld_texture_dxbc, NULL);
+
+    texture = create_default_texture(context.device, 1, 1,
+            DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    upload.pData = &value;
+    upload.RowPitch = sizeof(value);
+    upload.SlicePitch = sizeof(value);
+    upload_texture_data(texture, &upload, 1, context.queue, context.list);
+    reset_command_list(context.list, context.allocator);
+    transition_resource_state(context.list, texture,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    cpu_heap = create_cpu_descriptor_heap(context.device,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+    gpu_heap = create_gpu_descriptor_heap(context.device,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+    memset(&uav_desc, 0, sizeof(uav_desc));
+    uav_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    cpu_handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cpu_heap);
+    ID3D12Device_CreateUnorderedAccessView(context.device, texture, NULL,
+            &uav_desc, cpu_handle);
+    ID3D12Device_CopyDescriptorsSimple(context.device, 1,
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(gpu_heap),
+            cpu_handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list,
+            context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list,
+            context.pipeline_state);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &gpu_heap);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(context.list, 0,
+            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(gpu_heap));
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(context.list, 1, 0, 0);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(context.list, 1,
+            &context.rtv, FALSE, NULL);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_RSSetViewports(context.list, 1,
+            &context.viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(context.list, 1,
+            &context.scissor_rect);
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+
+    transition_resource_state(context.list, context.render_target,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    check_sub_resource_uint(context.render_target, 0, context.queue,
+            context.list, 0xffffffff, 0);
+
+    ID3D12DescriptorHeap_Release(cpu_heap);
+    ID3D12DescriptorHeap_Release(gpu_heap);
+    ID3D12Resource_Release(texture);
+    destroy_test_context(&context);
+}
+
 void test_null_rtv(void)
 {
     ID3D12GraphicsCommandList *command_list;

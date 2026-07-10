@@ -2241,8 +2241,10 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       finish();
       return;
     }
-    mirror->WriteTextureTableEntry(slot, view.gpuResourceID,
-                                   binding.texture->arrayLength(binding.view));
+    const uint32_t array_length =
+        binding.texture->arrayLength(binding.view);
+    mirror->WriteTextureTableEntry(slot, view.gpuResourceID, array_length);
+    mirror->FillTextureSlot(slot, view.gpuResourceID, array_length);
     finish();
     return;
   }

@@ -136,6 +136,7 @@ decl_test(test_create_null_descriptors);
 decl_test(test_null_cbv);
 decl_test(test_null_srv);
 decl_test(test_null_uav);
+decl_test(test_texture_uav_descriptor_copy_bindless_fallback);
 decl_test(test_null_rtv);
 decl_test(test_null_vbv);
 decl_test(test_get_copyable_footprints);
