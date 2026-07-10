@@ -376,5 +376,10 @@ subdir('libs')
 subdir('src')
 
 if get_option('enable_tests')
-subdir('tests')
+  if dxmt_crossbuild
+    error('GoogleTest unit tests require a native macOS build directory')
+  endif
+
+  subdir('external/googletest')
+  subdir('tests')
 endif
