@@ -384,6 +384,15 @@ if get_option('enable_tests')
   subdir('tests')
 endif
 
+if get_option('enable_d3d12_tests')
+  if not dxmt_crossbuild
+    error('D3D12 runtime tests require a Windows cross-build directory')
+  endif
+
+  subdir('external/googletest')
+  subdir('tests/d3d12')
+endif
+
 if get_option('enable_benchmarks')
   if dxmt_crossbuild
     error('Performance benchmarks require a native macOS build directory')
