@@ -26,9 +26,9 @@ template <typename T> void release_object(T *&object) {
 class D3D11DeviceSpec : public ::testing::Test {
 protected:
   void SetUp() override {
-    HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-        D3D11_SDK_VERSION, &device_, &feature_level_, &context_);
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                   0, nullptr, 0, D3D11_SDK_VERSION, &device_,
+                                   &feature_level_, &context_);
 
     ASSERT_TRUE(HResultSucceeded(hr));
     ASSERT_NE(device_, nullptr);
@@ -48,16 +48,16 @@ protected:
 } // namespace
 
 TEST(D3D11DeviceCreationSpec, RejectsMissingOutputs) {
-  HRESULT hr = D3D11CreateDevice(
-      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-      D3D11_SDK_VERSION, nullptr, nullptr, nullptr);
+  HRESULT hr =
+      D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr,
+                        0, D3D11_SDK_VERSION, nullptr, nullptr, nullptr);
 
   EXPECT_EQ(hr, S_FALSE);
 }
 
 TEST_F(D3D11DeviceSpec, ReportsSupportedFeatureLevel) {
-  EXPECT_GE(feature_level_, D3D_FEATURE_LEVEL_10_0);
-  EXPECT_GE(device_->GetFeatureLevel(), D3D_FEATURE_LEVEL_10_0);
+  EXPECT_GE(feature_level_, D3D_FEATURE_LEVEL_11_0);
+  EXPECT_GE(device_->GetFeatureLevel(), D3D_FEATURE_LEVEL_11_0);
 }
 
 TEST_F(D3D11DeviceSpec, ReturnsImmediateContextFromDevice) {
