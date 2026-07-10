@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
+
+int conditional_failure_count = 0;
 
 DXMT_SLOW_TEST_PATTERN("NoSuchParameterizedTest.*");
 
@@ -34,6 +37,13 @@ TEST(TestSchedulerFilter, AppliesPositiveAndNegativePatterns) {
   EXPECT_FALSE(
       dxmt::test::FilterMatches("Pipeline*.*-*.Slow", "PipelineState.Slow"));
   EXPECT_TRUE(dxmt::test::FilterMatches("-*Disabled*", "PipelineState.Fast"));
+}
+
+TEST(TestSchedulerPolicy, DisablesFailureShortCircuiting) {
+  EXPECT_FALSE(GTEST_FLAG_GET(fail_fast));
+  EXPECT_FALSE(GTEST_FLAG_GET(break_on_failure));
+  EXPECT_FALSE(GTEST_FLAG_GET(throw_on_failure));
+  EXPECT_TRUE(GTEST_FLAG_GET(catch_exceptions));
 }
 
 TEST(TestSchedulerPlan, BalancesSlowHintsBeforeFastTests) {
@@ -77,8 +87,36 @@ TEST(TestSchedulerPlan, AmortizesDefaultWorkerLaunches) {
 }
 
 TEST(TestSchedulerWorker, PropagatesConditionalFailure) {
-  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr)
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
+    ++conditional_failure_count;
     FAIL() << "injected worker failure";
+  }
+}
+
+TEST(TestSchedulerWorker, ContinuesAfterFirstConditionalFailure) {
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
+    EXPECT_EQ(conditional_failure_count, 1);
+    ++conditional_failure_count;
+    FAIL() << "second injected worker failure";
+  }
+}
+
+TEST(TestSchedulerWorker, CatchesConditionalException) {
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
+    EXPECT_EQ(conditional_failure_count, 2);
+    ++conditional_failure_count;
+    throw std::runtime_error("injected worker exception");
+  }
+}
+
+TEST(TestSchedulerWorker, ReachesTestsAfterCaughtException) {
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr)
+    EXPECT_EQ(conditional_failure_count, 3);
+}
+
+TEST(TestSchedulerWorker, ReportsIndependentConditionalFailure) {
+  if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr)
+    FAIL() << "independent injected worker failure";
 }
 
 class SchedulerParameterizedSmoke : public ::testing::TestWithParam<int> {};

@@ -36,44 +36,98 @@ std::vector<CostHint> &CostHints() {
   return hints;
 }
 
-class FailureOnlyPrinter final : public ::testing::EmptyTestEventListener {
+class FailureCollector final : public ::testing::EmptyTestEventListener {
 public:
   void OnTestStart(const ::testing::TestInfo &test) override {
     current_test_ = std::string(test.test_suite_name()) + "." + test.name();
+    current_test_reported_ = false;
   }
 
   void OnTestPartResult(const ::testing::TestPartResult &result) override {
     if (!result.failed())
       return;
 
-    if (!current_test_.empty()) {
-      std::fprintf(stderr, "[  FAILED  ] %s\n", current_test_.c_str());
-    } else {
-      std::fprintf(stderr, "[  FAILED  ] global test environment\n");
+    if (!current_test_reported_) {
+      report_ += "[  FAILED  ] ";
+      report_ +=
+          current_test_.empty() ? "global test environment" : current_test_;
+      report_ += '\n';
+      current_test_reported_ = true;
     }
 
     if (result.file_name() != nullptr) {
-      std::fprintf(stderr, "%s:%d: Failure\n", result.file_name(),
-                   result.line_number());
+      report_ += result.file_name();
+      report_ += ':';
+      report_ += std::to_string(result.line_number());
+      report_ += ": Failure\n";
     }
-    std::fprintf(stderr, "%s\n", result.message());
+    report_ += result.message();
+    report_ += '\n';
   }
 
   void OnTestEnd(const ::testing::TestInfo &) override {
     current_test_.clear();
+    current_test_reported_ = false;
+  }
+
+  bool has_failures() const { return !report_.empty(); }
+  const std::string &report() const { return report_; }
+
+  bool WriteReport(std::string_view path) const {
+    if (!has_failures())
+      return true;
+
+    auto *file = std::fopen(std::string(path).c_str(), "w");
+    if (file == nullptr)
+      return false;
+    const auto written = std::fwrite(report_.data(), 1, report_.size(), file);
+    return std::fclose(file) == 0 && written == report_.size();
   }
 
 private:
   std::string current_test_;
+  std::string report_;
+  bool current_test_reported_ = false;
 };
 
-void ConfigureWorkerOutput() {
+FailureCollector *ConfigureWorkerOutput() {
   if (std::getenv("DXMT_TEST_VERBOSE_WORKERS") != nullptr)
-    return;
+    return nullptr;
 
   auto &listeners = ::testing::UnitTest::GetInstance()->listeners();
   delete listeners.Release(listeners.default_result_printer());
-  listeners.Append(new FailureOnlyPrinter());
+  auto *collector = new FailureCollector();
+  listeners.Append(collector);
+  return collector;
+}
+
+void DisableFailureShortCircuiting() {
+  GTEST_FLAG_SET(fail_fast, false);
+  GTEST_FLAG_SET(break_on_failure, false);
+  GTEST_FLAG_SET(throw_on_failure, false);
+  GTEST_FLAG_SET(catch_exceptions, true);
+}
+
+int RunTestsAndReport(std::string_view report_path = {}) {
+  auto *collector = ConfigureWorkerOutput();
+  const int result = RUN_ALL_TESTS();
+  if (collector == nullptr)
+    return result;
+
+  if (!report_path.empty()) {
+    if (!collector->WriteReport(report_path)) {
+      std::fprintf(stderr,
+                   "failed to write unit-test failure report '%s': %s\n",
+                   std::string(report_path).c_str(), std::strerror(errno));
+      return result == 0 ? 2 : result;
+    }
+  } else if (collector->has_failures()) {
+    std::fprintf(stderr, "[ DXMT     ] failure summary\n%s",
+                 collector->report().c_str());
+  } else {
+    std::printf("[ DXMT     ] all selected tests passed\n");
+  }
+  return result;
 }
 
 bool IsDisabledName(std::string_view name) {
@@ -127,6 +181,7 @@ struct SchedulerOptions {
   std::size_t jobs = 0;
   bool jobs_were_set = false;
   bool show_help = false;
+  std::string report_path;
 };
 
 enum class WorkerMode {
@@ -137,7 +192,8 @@ enum class WorkerMode {
 std::optional<SchedulerOptions>
 ParseSchedulerOptions(const std::vector<std::string> &arguments) {
   SchedulerOptions options;
-  constexpr std::string_view prefix = "--dxmt-test-jobs=";
+  constexpr std::string_view jobs_prefix = "--dxmt-test-jobs=";
+  constexpr std::string_view report_prefix = "--dxmt-test-report=";
 
   if (const char *value = std::getenv("DXMT_TEST_JOBS")) {
     const auto parsed = ParsePositiveInteger(value);
@@ -157,15 +213,20 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
       options.show_help = true;
       continue;
     }
-    if (!std::string_view(argument).starts_with(prefix))
+    if (std::string_view(argument).starts_with(report_prefix)) {
+      options.report_path =
+          std::string(std::string_view(argument).substr(report_prefix.size()));
+      continue;
+    }
+    if (!std::string_view(argument).starts_with(jobs_prefix))
       continue;
 
-    const auto parsed =
-        ParsePositiveInteger(std::string_view(argument).substr(prefix.size()));
+    const auto parsed = ParsePositiveInteger(
+        std::string_view(argument).substr(jobs_prefix.size()));
     if (!parsed) {
       std::fprintf(stderr,
                    "--dxmt-test-jobs must be a positive integer, got '%s'\n",
-                   argument.c_str() + prefix.size());
+                   argument.c_str() + jobs_prefix.size());
       return std::nullopt;
     }
     options.jobs = *parsed;
@@ -253,18 +314,44 @@ std::string BuildFilter(const TestShard &shard) {
 
 std::vector<std::string>
 BuildWorkerArguments(const std::vector<std::string> &original_arguments,
-                     const std::string &executable, const TestShard &shard) {
+                     const std::string &executable, const TestShard &shard,
+                     std::string_view report_path) {
   std::vector<std::string> arguments;
-  arguments.reserve(original_arguments.size() + 1);
+  arguments.reserve(original_arguments.size() + 2);
   arguments.push_back(executable);
   for (std::size_t index = 1; index < original_arguments.size(); ++index) {
-    if (!std::string_view(original_arguments[index])
-             .starts_with("--dxmt-test-jobs=")) {
+    const std::string_view argument(original_arguments[index]);
+    if (!argument.starts_with("--dxmt-test-jobs=") &&
+        !argument.starts_with("--dxmt-test-report=")) {
       arguments.push_back(original_arguments[index]);
     }
   }
   arguments.push_back("--gtest_filter=" + BuildFilter(shard));
+  arguments.push_back("--dxmt-test-report=" + std::string(report_path));
   return arguments;
+}
+
+std::string BuildReportPrefix() {
+  std::string path =
+      std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp";
+  if (path.empty() || path.back() != '/')
+    path.push_back('/');
+  path += "dxmt-gtest-" + std::to_string(getpid()) + "-";
+  path += std::to_string(Clock::now().time_since_epoch().count());
+  return path;
+}
+
+std::string ReadAndRemoveReport(std::string_view path) {
+  std::string report;
+  auto *file = std::fopen(std::string(path).c_str(), "r");
+  if (file != nullptr) {
+    char buffer[4096];
+    while (const auto size = std::fread(buffer, 1, sizeof(buffer), file))
+      report.append(buffer, size);
+    std::fclose(file);
+  }
+  unlink(std::string(path).c_str());
+  return report;
 }
 
 bool HasExternalSharding() {
@@ -299,15 +386,17 @@ int RunScheduledTests(int argc, char **argv) {
 
   GTEST_FLAG_SET(brief, true);
   ::testing::InitGoogleTest(&argc, argv);
+  DisableFailureShortCircuiting();
 
   const bool is_worker = std::getenv("DXMT_GTEST_WORKER") != nullptr;
-  if (is_worker || HasExternalSharding() || options->show_help ||
-      GTEST_FLAG_GET(list_tests) ||
+  if (options->show_help || GTEST_FLAG_GET(list_tests) ||
       HasUnrecognizedGoogleTestArgument(argc, argv)) {
-    if (is_worker)
-      ConfigureWorkerOutput();
     return RUN_ALL_TESTS();
   }
+  if (is_worker)
+    return RunTestsAndReport(options->report_path);
+  if (HasExternalSharding())
+    return RunTestsAndReport();
 
   auto worker_count = options->jobs;
   if (!GTEST_FLAG_GET(output).empty() ||
@@ -321,7 +410,7 @@ int RunScheduledTests(int argc, char **argv) {
                      ? std::min(worker_count, tests.size())
                      : SelectWorkerCount(tests, worker_count);
   if (worker_count <= 1)
-    return RUN_ALL_TESTS();
+    return RunTestsAndReport();
 
   auto shards = BuildTestShards(std::move(tests), worker_count);
   const auto worker_mode = SelectWorkerMode();
@@ -331,6 +420,11 @@ int RunScheduledTests(int argc, char **argv) {
                          ? BuildWorkerEnvironment({"DXMT_GTEST_WORKER=1"})
                          : std::vector<std::string>();
   auto environment_pointers = MutablePointers(environment);
+  std::vector<std::string> report_paths;
+  report_paths.reserve(shards.size());
+  const auto report_prefix = BuildReportPrefix();
+  for (std::size_t index = 0; index < shards.size(); ++index)
+    report_paths.push_back(report_prefix + "-" + std::to_string(index));
   const auto plan_end = Clock::now();
   const auto plan_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            plan_end - plan_start)
@@ -352,10 +446,13 @@ int RunScheduledTests(int argc, char **argv) {
   std::vector<pid_t> children;
   children.reserve(shards.size());
   std::size_t spawn_failures = 0;
+  std::string scheduler_errors;
 
   std::fflush(nullptr);
   const auto run_start = Clock::now();
-  for (const auto &shard : shards) {
+  for (std::size_t index = 0; index < shards.size(); ++index) {
+    const auto &shard = shards[index];
+    const auto &report_path = report_paths[index];
     const auto filter = BuildFilter(shard);
     pid_t child = -1;
     int error = 0;
@@ -364,23 +461,23 @@ int RunScheduledTests(int argc, char **argv) {
       if (child == 0) {
         setenv("DXMT_GTEST_WORKER", "1", 1);
         GTEST_FLAG_SET(filter, filter);
-        ConfigureWorkerOutput();
-        const int result = RUN_ALL_TESTS();
+        const int result = RunTestsAndReport(report_path);
         std::exit(result);
       }
       if (child < 0)
         error = errno;
     } else {
-      auto arguments =
-          BuildWorkerArguments(original_arguments, executable, shard);
+      auto arguments = BuildWorkerArguments(original_arguments, executable,
+                                            shard, report_path);
       auto argument_pointers = MutablePointers(arguments);
       error =
           posix_spawn(&child, executable.c_str(), nullptr, nullptr,
                       argument_pointers.data(), environment_pointers.data());
     }
     if (error != 0) {
-      std::fprintf(stderr, "failed to start unit-test worker: %s\n",
-                   std::strerror(error));
+      scheduler_errors += "failed to start unit-test worker: ";
+      scheduler_errors += std::strerror(error);
+      scheduler_errors += '\n';
       ++spawn_failures;
     } else {
       children.push_back(child);
@@ -397,17 +494,27 @@ int RunScheduledTests(int argc, char **argv) {
     } while (result < 0 && errno == EINTR);
 
     if (result < 0) {
-      std::fprintf(stderr, "failed to wait for unit-test worker %d: %s\n",
-                   child, std::strerror(errno));
+      scheduler_errors += "failed to wait for unit-test worker ";
+      scheduler_errors += std::to_string(child);
+      scheduler_errors += ": ";
+      scheduler_errors += std::strerror(errno);
+      scheduler_errors += '\n';
       ++failed_workers;
     } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
       if (WIFSIGNALED(status)) {
-        std::fprintf(stderr, "unit-test worker %d terminated by signal %d\n",
-                     child, WTERMSIG(status));
+        scheduler_errors += "unit-test worker ";
+        scheduler_errors += std::to_string(child);
+        scheduler_errors += " terminated by signal ";
+        scheduler_errors += std::to_string(WTERMSIG(status));
+        scheduler_errors += '\n';
       }
       ++failed_workers;
     }
   }
+
+  std::string failure_reports;
+  for (const auto &path : report_paths)
+    failure_reports += ReadAndRemoveReport(path);
   const auto run_end = Clock::now();
 
   const auto launch_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -417,6 +524,10 @@ int RunScheduledTests(int argc, char **argv) {
       std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
           run_end - run_start)
           .count();
+  if (!scheduler_errors.empty() || !failure_reports.empty()) {
+    std::fprintf(stderr, "[ DXMT     ] failure summary\n%s%s",
+                 scheduler_errors.c_str(), failure_reports.c_str());
+  }
   std::printf("[ DXMT     ] workers %s (launch %lld us, wall %.3f ms)\n",
               failed_workers == 0 ? "passed" : "failed",
               static_cast<long long>(launch_us), run_ms);

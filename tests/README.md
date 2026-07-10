@@ -102,6 +102,10 @@ instead of placing several hundred-millisecond cases in one tail batch.
 - Workers print failures only by default, avoiding per-test status output that
   can cost more than millisecond-scale tests. Set
   `DXMT_TEST_VERBOSE_WORKERS=1` when full worker output is needed.
+- Failure short-circuiting is disabled by policy: `fail_fast`,
+  `break_on_failure`, and `throw_on_failure` are forced off, while C++
+  exceptions are caught as test failures. Every worker finishes its complete
+  batch, then the coordinator prints one combined failure summary.
 - A GoogleTest XML output or result-stream request forces one worker because
   multiple writers cannot safely share one output destination.
 
@@ -112,7 +116,9 @@ runs GoogleTest directly without spawning a worker. Standard
 
 Parallel workers are separate processes. Unit tests must not rely on mutable
 process-global state created by another test, and shared filesystem artifacts
-must use unique temporary paths.
+must use unique temporary paths. A process-level crash or forced termination
+cannot continue the affected batch; the no-short-circuit guarantee applies to
+GoogleTest assertion failures and caught exceptions.
 
 Performance benchmarks are not unit tests and must not be registered in this
 manifest. They have a separate dependency, runner, directory, Meson
