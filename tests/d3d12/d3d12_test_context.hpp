@@ -1,59 +1,16 @@
 #pragma once
 
+#include <dxmt_test_com.hpp>
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 namespace dxmt::test {
-
-template <typename T> class ComPtr {
-public:
-  ComPtr() = default;
-  explicit ComPtr(T *object) : object_(object) {}
-
-  ~ComPtr() { reset(); }
-
-  ComPtr(const ComPtr &) = delete;
-  ComPtr &operator=(const ComPtr &) = delete;
-
-  ComPtr(ComPtr &&other) noexcept : object_(other.release()) {}
-
-  ComPtr &operator=(ComPtr &&other) noexcept {
-    if (this != &other) {
-      reset();
-      object_ = other.release();
-    }
-    return *this;
-  }
-
-  T *get() const { return object_; }
-  T **put() {
-    reset();
-    return &object_;
-  }
-  T *operator->() const { return object_; }
-  explicit operator bool() const { return object_ != nullptr; }
-
-  T *release() {
-    T *object = object_;
-    object_ = nullptr;
-    return object;
-  }
-
-  void reset(T *object = nullptr) {
-    if (object_)
-      object_->Release();
-    object_ = object;
-  }
-
-private:
-  T *object_ = nullptr;
-};
 
 struct TextureReadback {
   std::vector<std::uint8_t> data;
@@ -76,16 +33,16 @@ public:
   HRESULT SignalAndWait();
   HRESULT WaitForFence(ID3D12Fence *fence, UINT64 value);
 
-  ComPtr<ID3D12Resource>
-  CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap_type,
-               D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) const;
-  ComPtr<ID3D12Resource>
-  CreateUploadBuffer(UINT64 size, const void *data = nullptr,
-                     std::size_t data_size = 0) const;
-  ComPtr<ID3D12Resource>
-  CreateTexture2D(UINT64 width, UINT height, UINT16 mip_levels,
-                  DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
-                  D3D12_RESOURCE_STATES state) const;
+  ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap_type,
+                                      D3D12_RESOURCE_FLAGS flags,
+                                      D3D12_RESOURCE_STATES state) const;
+  ComPtr<ID3D12Resource> CreateUploadBuffer(UINT64 size,
+                                            const void *data = nullptr,
+                                            std::size_t data_size = 0) const;
+  ComPtr<ID3D12Resource> CreateTexture2D(UINT64 width, UINT height,
+                                         UINT16 mip_levels, DXGI_FORMAT format,
+                                         D3D12_RESOURCE_FLAGS flags,
+                                         D3D12_RESOURCE_STATES state) const;
   ComPtr<ID3D12DescriptorHeap>
   CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count,
                        bool shader_visible) const;
@@ -113,8 +70,7 @@ public:
   GpuDescriptorHandle(ID3D12DescriptorHeap *heap, UINT index) const;
 
   static void Transition(ID3D12GraphicsCommandList *list,
-                         ID3D12Resource *resource,
-                         D3D12_RESOURCE_STATES before,
+                         ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
                          D3D12_RESOURCE_STATES after);
   static void UavBarrier(ID3D12GraphicsCommandList *list,
                          ID3D12Resource *resource);
