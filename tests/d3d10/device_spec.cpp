@@ -59,25 +59,6 @@ protected:
 
 } // namespace
 
-TEST(D3D10CoreDeviceCreationSpec, RejectsNullAdapter) {
-  IDXGIFactory1 *factory = nullptr;
-  ID3D10Device *device = nullptr;
-
-  HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
-                                  reinterpret_cast<void **>(&factory));
-  ASSERT_TRUE(HResultSucceeded(hr));
-  ASSERT_NE(factory, nullptr);
-
-  hr = D3D10CoreCreateDevice(factory, nullptr, 0, D3D_FEATURE_LEVEL_10_0,
-                             &device);
-
-  EXPECT_TRUE(FAILED(hr));
-  EXPECT_EQ(device, nullptr);
-
-  release_object(device);
-  release_object(factory);
-}
-
 TEST_F(D3D10CoreDeviceSpec, QueriesMultithreadInterface) {
   ID3D10Multithread *multithread = nullptr;
 

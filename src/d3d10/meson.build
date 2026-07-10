@@ -27,7 +27,7 @@ if wine_builtin_dll
 custom_target('postprocess_libd3d10core',
   input : d3d10core_dll,
   output: 'd3d10core.dll.postproc',
-  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
+  command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d10core_dll,
   build_by_default : true
 )

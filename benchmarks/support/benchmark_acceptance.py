@@ -22,14 +22,23 @@ TIME_UNIT_TO_NS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run one DXMT benchmark suite and enforce its performance budget."
+        description=(
+            "Run one native or Wine DXMT benchmark suite and validate its result."
+        )
     )
     parser.add_argument("--executable", required=True, type=Path)
-    parser.add_argument("--budget", required=True, type=Path)
+    parser.add_argument(
+        "--mode", choices=("performance", "integration"), default="performance"
+    )
+    parser.add_argument("--budget", type=Path)
+    parser.add_argument("--launcher", type=Path)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--min-time", default="0.05s")
     parser.add_argument("--warmup-time", type=float, default=0.01)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.mode == "performance" and args.budget is None:
+        parser.error("--budget is required in performance mode")
+    return args
 
 
 def load_budget(path: Path) -> dict[str, dict[str, Any]]:
@@ -62,29 +71,46 @@ def canonical_name(result: dict[str, Any]) -> str:
 
 
 def run_benchmark(args: argparse.Namespace, output_path: Path) -> int:
-    command = [
-        str(args.executable),
+    command = []
+    if args.launcher is not None:
+        command.append(str(args.launcher))
+    command += [
+        str(args.executable.resolve()),
         f"--benchmark_out={output_path}",
         "--benchmark_out_format=json",
         "--benchmark_color=false",
-        f"--benchmark_repetitions={args.repetitions}",
-        "--benchmark_report_aggregates_only=true",
-        "--benchmark_display_aggregates_only=true",
-        f"--benchmark_min_time={args.min_time}",
-        f"--benchmark_min_warmup_time={args.warmup_time}",
     ]
+    if args.mode == "performance":
+        command += [
+            f"--benchmark_repetitions={args.repetitions}",
+            "--benchmark_report_aggregates_only=true",
+            "--benchmark_display_aggregates_only=true",
+            f"--benchmark_min_time={args.min_time}",
+            f"--benchmark_min_warmup_time={args.warmup_time}",
+        ]
+    else:
+        command += [
+            "--benchmark_repetitions=1",
+            "--benchmark_min_time=1x",
+            "--benchmark_min_warmup_time=0",
+        ]
     return subprocess.run(command, check=False).returncode
 
 
-def validate_results(
-    result_path: Path, budgets: dict[str, dict[str, Any]]
-) -> list[str]:
+def load_results(result_path: Path) -> list[dict[str, Any]]:
     with result_path.open(encoding="utf-8") as result_file:
         document = json.load(result_file)
 
     results = document.get("benchmarks")
     if not isinstance(results, list) or not results:
-        return ["benchmark produced no result rows"]
+        raise ValueError("benchmark produced no result rows")
+    return results
+
+
+def validate_performance_results(
+    result_path: Path, budgets: dict[str, dict[str, Any]]
+) -> list[str]:
+    results = load_results(result_path)
 
     errors: list[str] = []
     medians: dict[str, dict[str, Any]] = {}
@@ -131,10 +157,29 @@ def validate_results(
     return errors
 
 
+def validate_integration_results(result_path: Path) -> list[str]:
+    results = load_results(result_path)
+    errors: list[str] = []
+    completed: set[str] = set()
+
+    for result in results:
+        name = canonical_name(result)
+        if result.get("error_occurred"):
+            errors.append(f"{name}: {result.get('error_message', 'benchmark error')}")
+            continue
+        if int(result.get("threads", 1)) != 1:
+            errors.append(f"{name}: multithreaded integration work is not allowed")
+            continue
+        completed.add(name)
+
+    for name in sorted(completed):
+        print(f"[PASS] {name}")
+    return errors
+
+
 def main() -> int:
     args = parse_args()
     try:
-        budgets = load_budget(args.budget)
         with tempfile.TemporaryDirectory(prefix="dxmt-benchmark-") as temp_dir:
             result_path = Path(temp_dir) / "results.json"
             return_code = run_benchmark(args, result_path)
@@ -145,14 +190,18 @@ def main() -> int:
                 )
                 return return_code
 
-            errors = validate_results(result_path, budgets)
+            if args.mode == "performance":
+                budgets = load_budget(args.budget)
+                errors = validate_performance_results(result_path, budgets)
+            else:
+                errors = validate_integration_results(result_path)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
-        print(f"benchmark acceptance failed: {error}", file=sys.stderr)
+        print(f"benchmark runner failed: {error}", file=sys.stderr)
         return 2
 
     if errors:
         for error in errors:
-            print(f"benchmark acceptance failed: {error}", file=sys.stderr)
+            print(f"benchmark validation failed: {error}", file=sys.stderr)
         return 1
     return 0
 
