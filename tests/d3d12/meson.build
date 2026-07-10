@@ -2,7 +2,7 @@ d3d12_test_include_dirs = include_directories('../include')
 
 d3d12_test_main_lib = static_library(
   'dxmt-d3d12-test-main',
-  files('main.cpp'),
+  files('../support/win32_main.cpp'),
   dependencies: [gtest_dep],
   include_directories: [d3d12_test_include_dirs],
   install: false,

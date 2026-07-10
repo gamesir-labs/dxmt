@@ -390,6 +390,8 @@ if get_option('enable_d3d12_tests')
   endif
 
   subdir('external/googletest')
+  subdir('tests/d3d10')
+  subdir('tests/d3d11')
   subdir('tests/d3d12')
 endif
 
