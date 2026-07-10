@@ -41,10 +41,11 @@ public:
     }
     // Eagerly allocate the unified descriptor owner for shader-visible
     // CBV/SRV/UAV and SAMPLER heaps, and back-fill the per-record back-pointer.
-    // The owner preserves the typed mirror buffers and owns the MSC descriptor
-    // table buffer plus the Metal4 argument table that binds that buffer at bind
-    // point 0 (resources) or 1 (samplers). Doing this at construction avoids
-    // cross-thread first-touch ordering between descriptor writes and replay.
+    // The owner preserves the fallback mirrors and owns the MSC descriptor
+    // table/resource-record buffers. Native packets bind those buffers into the
+    // command encoder's per-stage argument table at fixed ABI slots. Eager
+    // construction avoids cross-thread first-touch ordering between descriptor
+    // writes and replay.
     const bool sampler_heap = desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     if (DescriptorHeapSupportsMirror(desc_)) {
       mirror_ = std::make_unique<DescriptorHeapMirror>(

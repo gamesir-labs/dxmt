@@ -1,6 +1,7 @@
 #include "dxbc_converter.hpp"
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/ShaderBinary.h"
+#include "airconv_dx12_metal4.h"
 #include "airconv_error.hpp"
 #include "airconv_internal.hpp"
 #include "llvm/ADT/SmallVector.h"
@@ -35,6 +36,7 @@ namespace dxmt::dxbc {
 // argument-buffer builders can see them). Setters are exported below.
 static thread_local bool gBindlessMirrorTextureSrvPrototype = false;
 static thread_local bool gBindlessMirror = false;
+static thread_local bool gNativeDescriptorTable = false;
 
 constexpr uint32_t kCBufferBindingSlotCapacity = 14;
 
@@ -256,6 +258,8 @@ void set_bindless_mirror_texture_srv_prototype(bool enabled) {
 
 void set_bindless_mirror(bool enabled) { gBindlessMirror = enabled; }
 bool get_bindless_mirror() { return gBindlessMirror; }
+void set_native_descriptor_table(bool enabled) { gNativeDescriptorTable = enabled; }
+bool get_native_descriptor_table() { return gNativeDescriptorTable; }
 
 auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
   return make_irvalue([=](context ctx) {
@@ -388,6 +392,166 @@ static auto get_cbuffer_in_buffer_table(
 
       return ctx.builder.CreateIntToPtr(
           address.get(),
+          ctx.types._int4->getPointerTo(
+              static_cast<unsigned>(air::AddressSpace::constant)));
+    });
+  };
+}
+
+static llvm::Value *
+native_descriptor_slot_index(
+    context &ctx, pvalue dyn_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound) {
+  llvm::Value *local = mirror_local_index(ctx, dyn_index, range_lower_bound);
+  auto root_bases = ctx.function->getArg(root_table_base_index);
+  auto i32 = ctx.builder.getInt32Ty();
+  auto base = ctx.builder.CreateLoad(
+      i32, ctx.builder.CreateGEP(i32, root_bases,
+                                 ctx.builder.getInt32(arg_index)));
+  return ctx.builder.CreateAdd(base, local);
+}
+
+static llvm::Value *
+native_descriptor_qword_index(
+    context &ctx, pvalue dyn_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound,
+    uint32_t qwords_per_descriptor, uint32_t qword_offset) {
+  auto slot = native_descriptor_slot_index(
+      ctx, dyn_index, root_table_base_index, arg_index, range_lower_bound);
+  auto slot64 = ctx.builder.CreateZExt(slot, ctx.builder.getInt64Ty());
+  return ctx.builder.CreateAdd(
+      ctx.builder.CreateMul(slot64,
+                            ctx.builder.getInt64(qwords_per_descriptor)),
+      ctx.builder.getInt64(qword_offset));
+}
+
+static auto get_native_descriptor_qword(
+    uint32_t descriptor_table_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound, uint32_t qword_offset) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto descriptor_table = ctx.function->getArg(descriptor_table_index);
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          i64, descriptor_table,
+          native_descriptor_qword_index(ctx, dyn_index, root_table_base_index,
+                                        arg_index, range_lower_bound, 3,
+                                        qword_offset));
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+template <typename HandleTypeFn>
+static auto get_native_typed_descriptor_handle(
+    uint32_t descriptor_table_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound, uint32_t qword_offset,
+    HandleTypeFn handle_type_fn) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto raw = get_native_descriptor_qword(
+          descriptor_table_index, root_table_base_index, arg_index,
+          range_lower_bound, qword_offset)(dyn_index)
+          .build(ctx);
+      if (auto err = raw.takeError())
+        return std::move(err);
+      return ctx.builder.CreateIntToPtr(raw.get(), handle_type_fn(ctx));
+    });
+  };
+}
+
+static auto get_native_buffer_record_qword(
+    uint32_t buffer_record_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound, uint32_t qword_offset) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto records = ctx.function->getArg(buffer_record_index);
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          i64, records,
+          native_descriptor_qword_index(ctx, dyn_index, root_table_base_index,
+                                        arg_index, range_lower_bound, 6,
+                                        qword_offset));
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+static llvm::Value *
+native_resource_table_qword(
+    context &ctx, uint32_t resource_table_index, llvm::Value *resource_index,
+    uint32_t qword_offset) {
+  auto resources = ctx.function->getArg(resource_table_index);
+  auto i64 = ctx.builder.getInt64Ty();
+  auto index64 = ctx.builder.CreateZExt(resource_index, i64);
+  auto qword_index = ctx.builder.CreateAdd(
+      ctx.builder.CreateMul(index64, ctx.builder.getInt64(4)),
+      ctx.builder.getInt64(qword_offset));
+  return ctx.builder.CreateLoad(
+      i64, ctx.builder.CreateGEP(i64, resources, qword_index));
+}
+
+static auto get_native_buffer_in_descriptor_record(
+    uint32_t buffer_record_index, uint32_t resource_table_index,
+    uint32_t root_table_base_index, uint32_t arg_index,
+    uint32_t range_lower_bound, air::AddressSpace address_space,
+    bool counter = false) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      const uint32_t resource_qword = counter ? 4u : 0u;
+      const uint32_t offset_qword = counter ? 5u : 1u;
+
+      auto resource_word = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, resource_qword)(dyn_index)
+          .build(ctx);
+      if (auto err = resource_word.takeError())
+        return std::move(err);
+      auto byte_offset = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, offset_qword)(dyn_index)
+          .build(ctx);
+      if (auto err = byte_offset.takeError())
+        return std::move(err);
+
+      auto resource_index =
+          ctx.builder.CreateTrunc(resource_word.get(), ctx.builder.getInt32Ty());
+      auto base = native_resource_table_qword(ctx, resource_table_index,
+                                             resource_index, 0);
+      auto address = ctx.builder.CreateAdd(base, byte_offset.get());
+      auto ptr_ty = ctx.builder.getInt32Ty()->getPointerTo(
+          static_cast<unsigned>(address_space));
+      return ctx.builder.CreateIntToPtr(address, ptr_ty);
+    });
+  };
+}
+
+static auto get_native_cbuffer_in_descriptor_record(
+    uint32_t buffer_record_index, uint32_t resource_table_index,
+    uint32_t root_table_base_index, uint32_t arg_index,
+    uint32_t range_lower_bound) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto resource_word = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, 0)(dyn_index)
+          .build(ctx);
+      if (auto err = resource_word.takeError())
+        return std::move(err);
+      auto byte_offset = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, 1)(dyn_index)
+          .build(ctx);
+      if (auto err = byte_offset.takeError())
+        return std::move(err);
+
+      auto resource_index =
+          ctx.builder.CreateTrunc(resource_word.get(), ctx.builder.getInt32Ty());
+      auto base = native_resource_table_qword(ctx, resource_table_index,
+                                             resource_index, 0);
+      auto address = ctx.builder.CreateAdd(base, byte_offset.get());
+      return ctx.builder.CreateIntToPtr(
+          address,
           ctx.types._int4->getPointerTo(
               static_cast<unsigned>(air::AddressSpace::constant)));
     });
@@ -693,6 +857,28 @@ bindless_uses_sampler_mirror(const ShaderInfo *shader_info) {
   return !shader_info->samplerMap.empty();
 }
 
+static bool
+native_uses_resource_descriptor_heap(const ShaderInfo *shader_info) {
+  return !shader_info->cbufferMap.empty() || !shader_info->srvMap.empty() ||
+         !shader_info->uavMap.empty();
+}
+
+static bool
+native_uses_buffer_descriptor_records(const ShaderInfo *shader_info) {
+  if (!shader_info->cbufferMap.empty())
+    return true;
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      return true;
+  }
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable ||
+        uav.with_counter)
+      return true;
+  }
+  return false;
+}
+
 static void
 add_texture_argument_flags(
     MTL_SM50_SHADER_ARGUMENT_FLAG &flags, shader::common::ResourceType resource_type,
@@ -742,7 +928,8 @@ void setup_binding_table(
   // per-resource struct `binding_table` is still BUILT (it backs the args_reflection
   // emission so StructurePtrOffset == arg_index for the runtime root_offsets), but
   // it is not a shader input here.
-  if (!gBindlessMirror && !shader_info->binding_table.Empty()) {
+  if (!gBindlessMirror && !gNativeDescriptorTable &&
+      !shader_info->binding_table.Empty()) {
     auto [type, metadata] = shader_info->binding_table.Build(
       module.getContext(), module.getDataLayout()
     );
@@ -794,7 +981,8 @@ void setup_binding_table(
         .arg_name = "sampler_mirror",
       });
   }
-  if (!gBindlessMirror && !shader_info->binding_table_cbuffer.Empty()) {
+  if (!gBindlessMirror && !gNativeDescriptorTable &&
+      !shader_info->binding_table_cbuffer.Empty()) {
     auto [type, metadata] = shader_info->binding_table_cbuffer.Build(
       module.getContext(), module.getDataLayout()
     );
@@ -825,6 +1013,97 @@ void setup_binding_table(
       .arg_name = "buf_table",
       .raster_order_group = std::nullopt,
     });
+  }
+
+  uint32_t native_descriptor_heap_index = ~0u;
+  uint32_t native_sampler_heap_index = ~0u;
+  uint32_t native_resource_table_index = ~0u;
+  uint32_t native_buffer_record_index = ~0u;
+  uint32_t native_cbuffer_root_table_base_index = ~0u;
+  uint32_t native_root_table_base_index = ~0u;
+  if (gNativeDescriptorTable) {
+    if (native_uses_resource_descriptor_heap(shader_info)) {
+      native_descriptor_heap_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_descriptor_heap",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (!shader_info->samplerMap.empty()) {
+      native_sampler_heap_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_sampler_heap",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (native_uses_buffer_descriptor_records(shader_info)) {
+      native_resource_table_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_buffer_resource_table",
+            .raster_order_group = std::nullopt,
+          });
+      native_buffer_record_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_buffer_descriptor_records",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (!shader_info->cbufferMap.empty()) {
+      native_cbuffer_root_table_base_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "native_cbuffer_root_table_base",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (!shader_info->samplerMap.empty() || !shader_info->srvMap.empty() ||
+        !shader_info->uavMap.empty()) {
+      native_root_table_base_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index = DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "native_root_table_base",
+            .raster_order_group = std::nullopt,
+          });
+    }
   }
 
   // Per-draw root-offset buffer: element[arg_index] (== StructurePtrOffset) is
@@ -895,7 +1174,13 @@ void setup_binding_table(
   uint32_t texture_mirror_field = 0;
   for (auto &[range_id, cbv] : shader_info->cbufferMap) {
     auto index = cbv.arg_index;
-    if (gBindlessMirror) {
+    if (gNativeDescriptorTable) {
+      resource_map.cb_range_map[range_id] =
+          get_native_cbuffer_in_descriptor_record(
+              native_buffer_record_index, native_resource_table_index,
+              native_cbuffer_root_table_base_index, cbv.arg_index,
+              cbv.range.lower_bound);
+    } else if (gBindlessMirror) {
       resource_map.cb_range_map[range_id] = get_cbuffer_in_buffer_table(
           buffer_table_index, compact_base, cbv.range.lower_bound);
       compact_base += descriptor_range_qword_count(cbv.range);
@@ -912,7 +1197,21 @@ void setup_binding_table(
     // qw2 lod_bias). Legacy mode reads the three packed struct fields.
     auto lb = sampler.range.lower_bound;
     auto key = sampler.arg_index;
-    if (gBindlessMirror) {
+    if (gNativeDescriptorTable) {
+      resource_map.sampler_range_map[range_id] = {
+        get_native_typed_descriptor_handle(
+            native_sampler_heap_index, native_root_table_base_index, key, lb,
+            /*qword_offset=*/0,
+            [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); }),
+        get_native_typed_descriptor_handle(
+            native_sampler_heap_index, native_root_table_base_index, key, lb,
+            /*qword_offset=*/1,
+            [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); }),
+        get_native_descriptor_qword(native_sampler_heap_index,
+                                    native_root_table_base_index, key, lb,
+                                    /*qword_offset=*/2)
+      };
+    } else if (gBindlessMirror) {
       resource_map.sampler_range_map[range_id] = {
         read_sampler_handle(key, lb, /*qword_offset=*/0),
         read_sampler_handle(key, lb, /*qword_offset=*/1),
@@ -947,35 +1246,52 @@ void setup_binding_table(
       // Texture handle: bindless = slot-30 typed flat mirror; legacy = packed
       // struct field (or the texture-srv prototype path).
       auto handle =
-        gBindlessMirror
+        gNativeDescriptorTable
+          ? get_native_typed_descriptor_handle(
+              native_descriptor_heap_index, native_root_table_base_index,
+              srv.arg_index, lb, /*qword_offset=*/1,
+              [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); })
+          : gBindlessMirror
           ? read_tex_handle(tex, texture_handle_field, srv.arg_index, lb)
           : ((gBindlessMirrorTextureSrvPrototype &&
               srv.resource_type == shader::common::ResourceType::Texture2D)
                ? get_texture_item_in_argbuf_binding_table(binding_table_index, srv.arg_index)
                : read_field(srv.arg_index, srv.arg_index, lb));
-      auto meta = gBindlessMirror ? read_tex_meta(texture_meta_field, srv.arg_index, lb)
-                                  : read_field(srv.arg_metadata_index, srv.arg_index, lb);
+      auto meta =
+        gNativeDescriptorTable
+          ? get_native_descriptor_qword(
+              native_descriptor_heap_index, native_root_table_base_index,
+              srv.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror ? read_tex_meta(texture_meta_field, srv.arg_index, lb)
+                            : read_field(srv.arg_metadata_index, srv.arg_index, lb);
       resource_map.srv_range_map[range_id] = {tex, handle, meta, false};
       if (srv.resource_type == shader::common::ResourceType::TextureBuffer) {
         // tbuffer carries a gpu_resource_id + (elementCount<<32|firstElement); it
         // lives in the texture mirror, same handle/meta slot.
         resource_map.srv_buf_range_map[range_id] = {
           srv.structure_stride,
-          gBindlessMirror ? read_tex_handle(tex, texture_handle_field, srv.arg_index, lb)
-                          : read_field(srv.arg_index, srv.arg_index, lb),
-          gBindlessMirror ? read_tex_meta(texture_meta_field, srv.arg_index, lb)
-                          : read_field(srv.arg_metadata_index, srv.arg_index, lb),
+          handle,
+          meta,
           false
         };
       }
     } else {
       resource_map.srv_buf_range_map[range_id] = {
         srv.structure_stride,
-        gBindlessMirror
+        gNativeDescriptorTable
+          ? get_native_buffer_in_descriptor_record(
+              native_buffer_record_index, native_resource_table_index,
+              native_root_table_base_index, srv.arg_index, lb,
+              air::AddressSpace::device)
+          : gBindlessMirror
           ? get_buffer_in_buffer_table(
               buffer_table_index, compact_base, lb, air::AddressSpace::device)
           : read_field(srv.arg_index, srv.arg_index, lb),
-        gBindlessMirror
+        gNativeDescriptorTable
+          ? get_native_buffer_record_qword(
+              native_buffer_record_index, native_root_table_base_index,
+              srv.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror
           ? get_buffer_table_qword(buffer_table_index, compact_base, lb, 1)
           : read_field(srv.arg_metadata_index, srv.arg_index, lb),
         false
@@ -1002,18 +1318,27 @@ void setup_binding_table(
         .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
         .resource_kind_logical = texture_kind_logical,
       };
-      auto handle = gBindlessMirror ? read_tex_handle(tex, texture_handle_field, uav.arg_index, lb)
-                                    : read_field(uav.arg_index, uav.arg_index, lb);
-      auto meta = gBindlessMirror ? read_tex_meta(texture_meta_field, uav.arg_index, lb)
-                                  : read_field(uav.arg_metadata_index, uav.arg_index, lb);
+      auto handle =
+        gNativeDescriptorTable
+          ? get_native_typed_descriptor_handle(
+              native_descriptor_heap_index, native_root_table_base_index,
+              uav.arg_index, lb, /*qword_offset=*/1,
+              [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); })
+          : gBindlessMirror ? read_tex_handle(tex, texture_handle_field, uav.arg_index, lb)
+                            : read_field(uav.arg_index, uav.arg_index, lb);
+      auto meta =
+        gNativeDescriptorTable
+          ? get_native_descriptor_qword(
+              native_descriptor_heap_index, native_root_table_base_index,
+              uav.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror ? read_tex_meta(texture_meta_field, uav.arg_index, lb)
+                            : read_field(uav.arg_metadata_index, uav.arg_index, lb);
       resource_map.uav_range_map[range_id] = {tex, handle, meta, uav.global_coherent};
       if (uav.resource_type == shader::common::ResourceType::TextureBuffer) {
         resource_map.uav_buf_range_map[range_id] = {
           uav.structure_stride,
-          gBindlessMirror ? read_tex_handle(tex, texture_handle_field, uav.arg_index, lb)
-                          : read_field(uav.arg_index, uav.arg_index, lb),
-          gBindlessMirror ? read_tex_meta(texture_meta_field, uav.arg_index, lb)
-                          : read_field(uav.arg_metadata_index, uav.arg_index, lb),
+          handle,
+          meta,
           uav.global_coherent
         };
         if (uav.with_counter) {
@@ -1022,24 +1347,43 @@ void setup_binding_table(
           // tbuffer-UAV-with-counter does not occur in the bindless SM5 corpus. If it
           // ever does, give the counter its own buf_table slot.
           resource_map.uav_counter_range_map[range_id] =
-            read_field(uav.arg_counter_index, uav.arg_index, lb);
+            gNativeDescriptorTable
+              ? get_native_buffer_in_descriptor_record(
+                  native_buffer_record_index, native_resource_table_index,
+                  native_root_table_base_index, uav.arg_index, lb,
+                  air::AddressSpace::device, /*counter=*/true)
+              : read_field(uav.arg_counter_index, uav.arg_index, lb);
         }
       }
     } else {
       resource_map.uav_buf_range_map[range_id] = {
         uav.structure_stride,
-        gBindlessMirror
+        gNativeDescriptorTable
+          ? get_native_buffer_in_descriptor_record(
+              native_buffer_record_index, native_resource_table_index,
+              native_root_table_base_index, uav.arg_index, lb,
+              air::AddressSpace::device)
+          : gBindlessMirror
           ? get_buffer_in_buffer_table(
               buffer_table_index, compact_base, lb, air::AddressSpace::device)
           : read_field(uav.arg_index, uav.arg_index, lb),
-        gBindlessMirror
+        gNativeDescriptorTable
+          ? get_native_buffer_record_qword(
+              native_buffer_record_index, native_root_table_base_index,
+              uav.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror
           ? get_buffer_table_qword(buffer_table_index, compact_base, lb, 1)
           : read_field(uav.arg_metadata_index, uav.arg_index, lb),
         uav.global_coherent
       };
       if (uav.with_counter) {
         resource_map.uav_counter_range_map[range_id] =
-          gBindlessMirror
+          gNativeDescriptorTable
+            ? get_native_buffer_in_descriptor_record(
+                native_buffer_record_index, native_resource_table_index,
+                native_root_table_base_index, uav.arg_index, lb,
+                air::AddressSpace::device, /*counter=*/true)
+            : gBindlessMirror
             ? get_buffer_in_buffer_table(
                 buffer_table_index, compact_base, lb,
                 air::AddressSpace::device, 2)
@@ -2271,21 +2615,6 @@ AIRCONV_API int SM50Compile(
   using namespace llvm;
   using namespace dxmt;
 
-  bool bindless_requested = false;
-  {
-    SM50_SHADER_BINDLESS_MIRROR_DATA *bm = nullptr;
-    if (dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR, SM50_SHADER_BINDLESS_MIRROR_DATA>(pArgs, &bm) && bm)
-      bindless_requested = bm->enabled;
-  }
-  struct BindlessMirrorScope {
-    explicit BindlessMirrorScope(bool on)
-        : previous(dxmt::dxbc::get_bindless_mirror()) {
-      dxmt::dxbc::set_bindless_mirror(on);
-    }
-    ~BindlessMirrorScope() { dxmt::dxbc::set_bindless_mirror(previous); }
-    bool previous;
-  } bindless_scope(bindless_requested);
-
   if (ppError) {
     *ppError = nullptr;
   }
@@ -2293,11 +2622,51 @@ AIRCONV_API int SM50Compile(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    if (ppError)
+      *ppError = (sm50_error_t)errorObj;
+    else
+      delete errorObj;
     return 1;
   }
 
-  // pArgs is ignored for now
+  DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
+      DXMT12_MTL4_SHADER_ABI_LEGACY;
+  {
+    DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *native_abi = nullptr;
+    if (dxmt::dxbc::args_get_data<
+            SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI,
+            DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA>(pArgs, &native_abi) &&
+        native_abi && native_abi->enabled)
+      shader_abi_version = native_abi->version;
+
+    SM50_SHADER_BINDLESS_MIRROR_DATA *bm = nullptr;
+    if (shader_abi_version == DXMT12_MTL4_SHADER_ABI_LEGACY &&
+        dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR,
+                                  SM50_SHADER_BINDLESS_MIRROR_DATA>(
+            pArgs, &bm) &&
+        bm && bm->enabled)
+      shader_abi_version = DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
+  }
+
+  const bool bindless_requested =
+      shader_abi_version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
+  const bool native_requested =
+      shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+  struct ShaderAbiScope {
+    ShaderAbiScope(bool bindless, bool native)
+        : previous(dxmt::dxbc::get_bindless_mirror()) {
+      previous_native = dxmt::dxbc::get_native_descriptor_table();
+      dxmt::dxbc::set_bindless_mirror(bindless);
+      dxmt::dxbc::set_native_descriptor_table(native);
+    }
+    ~ShaderAbiScope() {
+      dxmt::dxbc::set_bindless_mirror(previous);
+      dxmt::dxbc::set_native_descriptor_table(previous_native);
+    }
+    bool previous;
+    bool previous_native;
+  } shader_abi_scope(bindless_requested, native_requested);
+
   LLVMContext context;
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...

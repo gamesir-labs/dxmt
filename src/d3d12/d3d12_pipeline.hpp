@@ -30,6 +30,16 @@ enum class PipelineShaderStage {
   Compute,
 };
 
+enum class NativeShaderAbiEligibilityReason {
+  None,
+  UnsupportedRootSignature,
+  UnsupportedDescriptorRange,
+  UnsupportedRootDescriptor,
+  UnsupportedGeometryPipeline,
+  UnsupportedTessellationPipeline,
+  ShaderAbiMismatch,
+};
+
 enum class PipelineShaderBytecodeKind {
   Unknown,
   Dxbc,
@@ -204,7 +214,14 @@ public:
   // Runtime draw-path gate for the Stage-1 bindless descriptor-mirror path.
   // Mirrors PsoBindlessEligible(shaders) computed at PSO-create time.
   virtual bool UsesBindlessMirror() const { return false; }
+  virtual DXMT12_MTL4_SHADER_ABI_VERSION GetShaderAbiVersion() const {
+    return DXMT12_MTL4_SHADER_ABI_LEGACY;
+  }
 };
+
+NativeShaderAbiEligibilityReason
+GetNativeShaderAbiEligibility(const std::vector<PipelineDxilShader> &shaders,
+                              const RootSignature *root_signature);
 
 // Private IID for a non-RTTI downcast ID3D12PipelineState* -> dxmt PipelineState*.
 // See IID_DXMTResourceDowncast in d3d12_resource.hpp for rationale (no AddRef,

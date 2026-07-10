@@ -55,6 +55,10 @@ struct PipelineStateRecord {
   Com<ID3D12PipelineState> pipeline_state;
 };
 
+struct ClearStateRecord {
+  Com<ID3D12PipelineState> pipeline_state;
+};
+
 struct CopyBufferRegionRecord {
   Com<ID3D12Resource> dst;
   UINT64 dst_offset = 0;
@@ -270,8 +274,9 @@ struct TemporalUpscaleRecord {
 
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
-    PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
-    CopyResourceRecord, CopyTilesRecord, ResolveSubresourceRecord,
+    PipelineStateRecord, ClearStateRecord, CopyBufferRegionRecord,
+    CopyTextureRegionRecord, CopyResourceRecord, CopyTilesRecord,
+    ResolveSubresourceRecord,
     ResourceBarrierRecord, ClearRenderTargetRecord, ClearDepthStencilRecord,
     ClearUnorderedAccessRecord, DiscardResourceRecord, ViewportRecord,
     ScissorRecord, BlendFactorRecord, StencilRefRecord, PrimitiveTopologyRecord,
@@ -340,6 +345,10 @@ struct CompiledCommandPipelineMetadata {
   const PipelineMetalGraphicsState *metal_graphics = nullptr;
   const PipelineMetalComputeState *metal_compute = nullptr;
   PipelineStateType type = PipelineStateType::Graphics;
+  DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
+      DXMT12_MTL4_SHADER_ABI_LEGACY;
+  NativeShaderAbiEligibilityReason native_eligibility_reason =
+      NativeShaderAbiEligibilityReason::UnsupportedRootSignature;
   dxmt::CompiledFallbackReason perf_fallback_reason =
       dxmt::CompiledFallbackReason::Unknown;
   bool has_pipeline_state = false;
@@ -347,9 +356,13 @@ struct CompiledCommandPipelineMetadata {
   bool type_matches = false;
   bool has_root_signature = false;
   bool uses_bindless_mirror = false;
+  bool uses_bindless_mirror_abi = false;
+  bool uses_native_descriptor_table_abi = false;
   bool uses_geometry = false;
   bool uses_tessellation = false;
+  bool ordinary_native = false;
   bool ordinary_bindless = false;
+  bool ordinary_compiled = false;
   bool metal_pso_ready = false;
 };
 
@@ -371,16 +384,21 @@ struct CompiledCommandRootDescriptorTable {
   UINT heap_count = 0;
   UINT table_offset = 0;
   UINT table_entry_stride = sizeof(uint64_t) * 3;
+  UINT root_table_base_descriptor_index = 0;
   uint64_t descriptor_table_gpu_address = 0;
   uint64_t descriptor_table_entry_gpu_address = 0;
-  // Keeps the mirror-owned descriptor table buffer and argument table alive
-  // while compiled packets are in flight.
+  uint64_t buffer_descriptor_record_gpu_address = 0;
+  uint64_t buffer_resource_table_gpu_address = 0;
+  uint64_t buffer_resource_table_generation = 0;
+  // Keeps the mirror-owned descriptor backend buffers alive while compiled
+  // packets are in flight.
   Com<ID3D12DescriptorHeap> owning_heap;
   DescriptorHeapMirror *mirror = nullptr;
   bool resolved = false;
-  bool argument_table_ready = false;
   bool descriptor_table_backend_ready = false;
   bool native_descriptor_record_storage_ready = false;
+  bool native_buffer_resource_table_ready = false;
+  bool native_root_table_base_ready = false;
 };
 
 struct CompiledCommandRootConstants {
@@ -414,7 +432,15 @@ struct CompiledCommandRenderState {
   std::vector<D3D12_RECT> scissors;
   std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
   UINT stencil_ref = 0;
-  D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+};
+
+struct CompiledNativeStageBinding {
+  uint64_t cbuffer_root_base_offset = 0;
+  uint64_t resource_root_base_offset = 0;
+  uint32_t cbuffer_root_base_count = 0;
+  uint32_t resource_root_base_count = 0;
+  bool ready = false;
 };
 
 struct CompiledGraphicsPacket {
@@ -427,6 +453,8 @@ struct CompiledGraphicsPacket {
   std::vector<CompiledCommandRootDescriptor> root_descriptors;
   CompiledCommandInputAssemblerState input_assembler;
   CompiledCommandRenderState render_state;
+  CompiledNativeStageBinding native_vertex;
+  CompiledNativeStageBinding native_pixel;
   std::optional<DrawInstancedRecord> draw;
   std::optional<DrawIndexedInstancedRecord> draw_indexed;
 };
@@ -439,6 +467,7 @@ struct CompiledComputePacket {
   std::vector<CompiledCommandRootDescriptorTable> root_tables;
   std::vector<CompiledCommandRootConstants> root_constants;
   std::vector<CompiledCommandRootDescriptor> root_descriptors;
+  CompiledNativeStageBinding native_compute;
   DispatchRecord dispatch;
 };
 
@@ -458,6 +487,7 @@ struct CompiledCommandSegment {
 
 struct CompiledCommandList {
   UINT record_count = 0;
+  WMT::Reference<WMT::Buffer> native_root_base_buffer;
   std::vector<CompiledCommandSegment> segments;
   std::vector<CompiledGraphicsPacket> graphics_packets;
   std::vector<CompiledComputePacket> compute_packets;

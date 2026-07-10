@@ -13,6 +13,7 @@
 #include "util_string.hpp"
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -28,6 +29,13 @@ namespace {
 constexpr UINT kMaxTexturePlanes = 3;
 
 class ResourceImpl;
+
+std::atomic<uint64_t> g_next_descriptor_identity{1};
+
+uint64_t
+AllocateResourceDescriptorIdentity() {
+  return g_next_descriptor_identity.fetch_add(1, std::memory_order_relaxed);
+}
 
 struct ReservedTextureAsyncConfig {
   bool enabled = true;
@@ -1065,6 +1073,10 @@ public:
 
   D3D12_HEAP_FLAGS GetResourceHeapFlags() const override {
     return heap_flags_;
+  }
+
+  uint64_t GetDescriptorIdentity() const override {
+    return descriptor_identity_;
   }
 
   UINT64 GetHeapOffset() const override {
@@ -2192,6 +2204,7 @@ private:
 
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
+  uint64_t descriptor_identity_ = AllocateResourceDescriptorIdentity();
   D3D12_HEAP_PROPERTIES heap_properties_ = {};
   D3D12_HEAP_FLAGS heap_flags_ = D3D12_HEAP_FLAG_NONE;
   D3D12_RESOURCE_DESC desc_ = {};

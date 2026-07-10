@@ -1100,9 +1100,7 @@ RecordDescriptorContentCopyPerf() {
 }
 
 // Bindless mirror generation marker for descriptor writes. Phase 2 materializes
-// ordinary texture/sampler/null descriptors immediately; typed buffer texture
-// views still use this marker so the encode thread can publish the view payload
-// once the shader argument proves a texture-buffer binding is required.
+// texture, sampler, buffer texture-view, and null descriptors immediately.
 // record.mirror is null unless the heap is a shader-visible CBV/SRV/UAV or
 // SAMPLER heap, so non-shader heaps do nothing here.
 static void
@@ -1137,6 +1135,117 @@ struct BufferDescriptorMaterialization {
   uint32_t flags = 0;
   bool typed = false;
 };
+
+struct BufferTextureViewMaterialization {
+  WMTTextureBufferViewDescriptor descriptor = {};
+  uint64_t offset = 0;
+  uint64_t bytes_per_row = 0;
+  uint32_t element_count = 0;
+  uint32_t first_element = 0;
+};
+
+static DXGI_FORMAT
+BufferTextureViewFormat(const BufferDescriptorMaterialization &view) {
+  if (view.typed)
+    return static_cast<DXGI_FORMAT>(view.format);
+  if (view.flags & BufferDescriptorRecordFlagRaw)
+    return DXGI_FORMAT_R32_UINT;
+  if (view.flags & BufferDescriptorRecordFlagStructured) {
+    switch (view.stride) {
+    case 4:
+      return DXGI_FORMAT_R32_UINT;
+    case 8:
+      return DXGI_FORMAT_R32G32_UINT;
+    case 16:
+      return DXGI_FORMAT_R32G32B32A32_UINT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
+    }
+  }
+  return DXGI_FORMAT_R32_UINT;
+}
+
+static bool
+BuildBufferTextureViewMaterialization(
+    WMT::Device device, Resource &resource,
+    const BufferDescriptorMaterialization &view,
+    DescriptorRecordType descriptor_type,
+    BufferTextureViewMaterialization &out) {
+  out = {};
+  auto *allocation = resource.GetBufferAllocation();
+  if (!allocation || !allocation->buffer())
+    return false;
+
+  const auto dxgi_format = BufferTextureViewFormat(view);
+  if (dxgi_format == DXGI_FORMAT_UNKNOWN)
+    return false;
+
+  MTL_DXGI_FORMAT_DESC format = {};
+  if (FAILED(MTLQueryDXGIFormat(device, dxgi_format, format)) ||
+      format.PixelFormat == WMTPixelFormatInvalid || !format.BytesPerTexel)
+    return false;
+
+  const uint64_t resource_offset =
+      resource.GetHeapOffset() + allocation->currentSuballocationOffset();
+  if (resource_offset < resource.GetHeapOffset() ||
+      view.view_offset > UINT64_MAX - resource_offset)
+    return false;
+  const uint64_t backing_offset = resource_offset + view.view_offset;
+  if (backing_offset > allocation->length())
+    return false;
+
+  const uint64_t byte_size =
+      std::min<uint64_t>(view.byte_size, allocation->length() - backing_offset);
+  if (!byte_size || backing_offset % format.BytesPerTexel ||
+      byte_size % format.BytesPerTexel)
+    return false;
+
+  const uint64_t alignment = std::max<uint64_t>(
+      format.BytesPerTexel,
+      device.minimumLinearTextureAlignmentForPixelFormat(format.PixelFormat));
+  const uint64_t aligned_offset = backing_offset - backing_offset % alignment;
+  const uint64_t bias_bytes = backing_offset - aligned_offset;
+  const uint64_t view_byte_size = bias_bytes + byte_size;
+  if (bias_bytes % format.BytesPerTexel || aligned_offset > UINT32_MAX ||
+      view_byte_size > UINT32_MAX)
+    return false;
+
+  const uint64_t element_stride = view.stride ? view.stride : format.BytesPerTexel;
+  if (!element_stride || byte_size % element_stride ||
+      byte_size / element_stride > UINT32_MAX ||
+      bias_bytes / format.BytesPerTexel > UINT32_MAX)
+    return false;
+
+  auto &texture = out.descriptor.texture;
+  texture.type = WMTTextureTypeTextureBuffer;
+  texture.width = view_byte_size / format.BytesPerTexel;
+  texture.height = 1;
+  texture.depth = 1;
+  texture.array_length = 1;
+  texture.mipmap_level_count = 1;
+  texture.sample_count = 1;
+  texture.pixel_format = format.PixelFormat;
+  texture.options = allocation->resourceOptions();
+  texture.usage = descriptor_type == DescriptorRecordType::UnorderedAccessView
+                      ? static_cast<WMTTextureUsage>(
+                            WMTTextureUsageShaderRead |
+                            WMTTextureUsageShaderWrite)
+                      : WMTTextureUsageShaderRead;
+  if (descriptor_type == DescriptorRecordType::UnorderedAccessView &&
+      (format.PixelFormat == WMTPixelFormatR32Uint ||
+       format.PixelFormat == WMTPixelFormatR32Sint ||
+       (format.PixelFormat == WMTPixelFormatRG32Uint &&
+        device.supportsFamily(WMTGPUFamilyApple8))))
+    texture.usage = static_cast<WMTTextureUsage>(texture.usage |
+                                                 WMTTextureUsageShaderAtomic);
+
+  out.offset = aligned_offset;
+  out.bytes_per_row = view_byte_size;
+  out.element_count = static_cast<uint32_t>(byte_size / element_stride);
+  out.first_element =
+      static_cast<uint32_t>(bias_bytes / format.BytesPerTexel);
+  return true;
+}
 
 static bool
 GetBufferSrvMaterialization(WMT::Device device, Resource &resource,
@@ -1749,6 +1858,11 @@ GetShaderResourceTextureMinLod(const DescriptorRecord &record) {
   }
 }
 
+static uint64_t
+DescriptorBufferResourceIdentity(Resource *resource) {
+  return resource ? resource->GetDescriptorIdentity() : 0;
+}
+
 static WMT::Resource
 DescriptorBufferResidencyAllocation(Resource *resource) {
   if (!resource || !resource->GetBufferAllocation())
@@ -1757,13 +1871,45 @@ DescriptorBufferResidencyAllocation(Resource *resource) {
 }
 
 static bool
+GetBufferResourceTableBinding(Resource *resource, WMT::Resource &allocation,
+                              uint64_t &gpu_address, uint64_t &byte_size) {
+  allocation = {};
+  gpu_address = 0;
+  byte_size = 0;
+
+  if (!resource || !resource->GetBufferAllocation())
+    return false;
+
+  auto *buffer_allocation = resource->GetBufferAllocation();
+  allocation = WMT::Resource{buffer_allocation->buffer().handle};
+  if (!allocation)
+    return false;
+
+  gpu_address =
+      buffer_allocation->gpuAddress() +
+      buffer_allocation->currentSuballocationOffset();
+  byte_size = resource->GetResourceDesc().Width;
+  return byte_size != 0;
+}
+
+static bool
 RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror,
                                  Resource *resource,
                                  uint32_t &resource_index) {
-  const auto before_count = mirror.backendResourceCount();
+  WMT::Resource allocation;
+  uint64_t gpu_address = 0;
+  uint64_t byte_size = 0;
+  if (!GetBufferResourceTableBinding(resource, allocation, gpu_address,
+                                     byte_size)) {
+    resource_index = kNullDescriptorResourceIndex;
+    return false;
+  }
+
+  const auto before_generation = mirror.backendResourceTableGeneration();
   resource_index = mirror.RegisterBufferResource(
-      DescriptorBufferResidencyAllocation(resource));
-  if (mirror.backendResourceCount() > before_count)
+      DescriptorBufferResourceIdentity(resource), allocation, gpu_address,
+      byte_size);
+  if (mirror.backendResourceTableGeneration() != before_generation)
     dxmt::perf::recordNativeDescriptorResourceTableEntry();
   return resource_index != kNullDescriptorResourceIndex;
 }
@@ -1835,6 +1981,30 @@ WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
       (record.has_desc ? record.desc.uav.Buffer.CounterOffsetInBytes : 0);
   mirror.WriteBufferDescriptorRecord(slot, native);
   dxmt::perf::recordNativeDescriptorBufferRecordCounter();
+  return true;
+}
+
+static bool
+MaterializeBufferTextureViewForWrite(
+    WMT::Device device, DescriptorHeapMirror &mirror, UINT slot,
+    Resource &resource, BufferDescriptorMaterialization &view,
+    DescriptorRecordType descriptor_type) {
+  BufferTextureViewMaterialization texture_view = {};
+  if (!BuildBufferTextureViewMaterialization(
+          device, resource, view, descriptor_type, texture_view))
+    return false;
+
+  const auto texture_view_id = mirror.SetTexturePoolBufferSlot(
+      slot, resource.GetBufferAllocation()->buffer(), texture_view.descriptor,
+      texture_view.offset, texture_view.bytes_per_row);
+  if (!texture_view_id)
+    return false;
+
+  view.flags |= BufferDescriptorRecordFlagTextureView;
+  mirror.WriteBufferTextureTableEntry(
+      slot, resource.GetGpuVirtualAddress() + view.view_offset, view.byte_size,
+      texture_view_id, texture_view.element_count, texture_view.first_element,
+      view.flags);
   return true;
 }
 
@@ -1983,13 +2153,14 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
         finish();
         return;
       }
-      // TODO(d3d12, bindless): typed buffer SRV descriptors still need the
-      // MSC texture-buffer view offset bits when the shader expects a typed
-      // texture-buffer entry. This is a descriptor-write-time bridge for the
-      // plain IRDescriptorTableSetBuffer encoding, not the final view metadata.
-      mirror->WriteBufferTableEntry(
-          slot, resource->GetGpuVirtualAddress() + native.view_offset,
-          native.byte_size, native.typed);
+      if (!MaterializeBufferTextureViewForWrite(
+              mtl_device, *mirror, slot, *resource, native,
+              DescriptorRecordType::ShaderResourceView)) {
+        mirror->WriteBufferTableEntry(
+            slot, resource->GetGpuVirtualAddress() + native.view_offset,
+            native.byte_size, native.typed);
+        mirror->ClearTextureSlot(slot);
+      }
       WriteNativeBufferDescriptorRecord(
           *mirror, slot, resource, native,
           DescriptorRecordType::ShaderResourceView);
@@ -2034,12 +2205,14 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
         finish();
         return;
       }
-      // TODO(d3d12, bindless): the legacy IRDescriptorTableEntry path still
-      // needs the MSC buffer-view helper before append / consume UAV
-      // descriptors are complete without the native descriptor-record ABI.
-      mirror->WriteBufferTableEntry(
-          slot, resource->GetGpuVirtualAddress() + native.view_offset,
-          native.byte_size, native.typed);
+      if (!MaterializeBufferTextureViewForWrite(
+              mtl_device, *mirror, slot, *resource, native,
+              DescriptorRecordType::UnorderedAccessView)) {
+        mirror->WriteBufferTableEntry(
+            slot, resource->GetGpuVirtualAddress() + native.view_offset,
+            native.byte_size, native.typed);
+        mirror->ClearTextureSlot(slot);
+      }
       if (WriteNativeBufferDescriptorRecord(
               *mirror, slot, resource, native,
               DescriptorRecordType::UnorderedAccessView))
@@ -2057,15 +2230,19 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
         CreateDescriptorUnorderedAccessTextureView(mtl_device, *resource, record);
     auto *allocation =
         binding.texture ? binding.texture->current() : nullptr;
-    if (!binding || !allocation ||
-        !mirror->SetTexturePoolSlot(slot, binding.texture.ptr(), binding.view,
-                                    allocation)) {
+    if (!binding || !allocation) {
       mirror->WriteNullTableEntry(slot);
       finish();
       return;
     }
-    mirror->WriteTexturePoolTableEntry(slot,
-                                       binding.texture->arrayLength(binding.view));
+    auto &view = binding.texture->view(binding.view, allocation);
+    if (!view.texture || !view.gpuResourceID) {
+      mirror->WriteNullTableEntry(slot);
+      finish();
+      return;
+    }
+    mirror->WriteTextureTableEntry(slot, view.gpuResourceID,
+                                   binding.texture->arrayLength(binding.view));
     finish();
     return;
   }

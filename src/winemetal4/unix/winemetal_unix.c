@@ -6270,6 +6270,15 @@ sm50_compilation_argument_copy(const struct SM50_SHADER_COMPILATION_ARGUMENT_DAT
     copy->next = sm50_compilation_argument_copy(data->next);
     return (void *)copy;
   }
+  case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI: {
+    const struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *data = (const void *)src;
+    struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *copy = calloc(1, sizeof(*copy));
+    if (!copy)
+      return NULL;
+    *copy = *data;
+    copy->next = sm50_compilation_argument_copy(data->next);
+    return (void *)copy;
+  }
   case SM50_SHADER_ARGUMENT_TYPE_MAX:
     break;
   }
@@ -6586,6 +6595,13 @@ struct SM50_SHADER_BINDLESS_MIRROR_DATA32 {
   bool enabled;
 };
 
+struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  DXMT12_MTL4_SHADER_ABI_VERSION version;
+  bool enabled;
+};
+
 void
 sm50_compilation_argument32_convert(
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
@@ -6702,6 +6718,18 @@ sm50_compilation_argument32_convert(
       last_arg = (void *)data;
       last_arg->next = NULL;
       data->type = src->type;
+      data->enabled = src->enabled;
+      break;
+    }
+    case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI: {
+      struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA32 *src = (void *)args32;
+      struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *data =
+          malloc(sizeof(struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->version = src->version;
       data->enabled = src->enabled;
       break;
     }

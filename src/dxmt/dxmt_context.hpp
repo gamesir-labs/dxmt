@@ -243,6 +243,12 @@ struct ComputeArgumentBufferOffsetState {
   bool valid = false;
 };
 
+struct NativeArgumentBufferBindingState {
+  uint64_t buffer_handle = 0;
+  uint64_t offset = 0;
+  bool valid = false;
+};
+
 struct RenderEncoderData : EncoderData {
   std::array<RenderEncoderColorAttachmentData, 8> colors;
   RenderEncoderDepthAttachmentData depth;
@@ -282,6 +288,10 @@ struct RenderEncoderData : EncoderData {
   ArgumentTableSliceCache argument_table_cache_object;
   ArgumentTableSliceCache argument_table_cache_mesh;
   std::array<RenderArgumentBufferOffsetState, 16> argument_buffer_offsets = {};
+  std::array<NativeArgumentBufferBindingState, 31>
+      native_argument_buffers_vertex = {};
+  std::array<NativeArgumentBufferBindingState, 31>
+      native_argument_buffers_fragment = {};
   RenderDynamicStateCache dynamic_state_cache = {};
   RenderBindingStateCache binding_state_cache = {};
 };
@@ -299,6 +309,8 @@ struct ComputeEncoderData : EncoderData {
   bool bindless_mirror_bound_29_30 = false;
   ArgumentTableSliceCache argument_table_cache;
   std::array<ComputeArgumentBufferOffsetState, 8> argument_buffer_offsets = {};
+  std::array<NativeArgumentBufferBindingState, 31>
+      native_argument_buffers = {};
 };
 
 struct BlitEncoderData : EncoderData {
@@ -737,6 +749,16 @@ public:
                           const AllocatedArgumentBufferSlice &root_offsets,
                           const AllocatedArgumentBufferSlice &tex_mirror,
                           const AllocatedArgumentBufferSlice &sampler_mirror);
+
+  template <PipelineStage stage>
+  void bindNativeRootTableBases(const AllocatedArgumentBufferSlice &root_bases,
+                                uint32_t bind_index);
+
+  void bindNativeArgumentBuffer(WMT::Buffer buffer, uint64_t offset,
+                                uint32_t bind_index, bool compute,
+                                WMTRenderStages render_stages = {});
+  void invalidateNativeArgumentBuffers(bool compute,
+                                       WMTRenderStages render_stages = {});
 
   // Bindless-mirror (Stage-1 sub-step ③.3) mixed-PSO guard: if the current encoder's bindless
   // draw rebound legacy argument-buffer slots, restore the per-pass argbuf before a following

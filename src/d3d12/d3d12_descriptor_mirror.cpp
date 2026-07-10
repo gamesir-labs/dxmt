@@ -12,10 +12,17 @@
 namespace dxmt::d3d12 {
 namespace {
 
-constexpr uint32_t kIRDescriptorHeapBindPoint = 0;
-constexpr uint32_t kIRSamplerHeapBindPoint = 1;
 constexpr uint32_t kDescriptorTableEntryQwords = 3;
 constexpr uint64_t kDescriptorTableTypedBufferBit = 1ull << 63;
+
+uint32_t
+BufferResourceTableCapacity(uint32_t descriptor_count) {
+  if (!descriptor_count)
+    return 1;
+
+  const uint64_t capacity = uint64_t(descriptor_count) * 2u + 1u;
+  return uint32_t(std::min<uint64_t>(capacity, UINT32_MAX));
+}
 
 uint64_t
 BufferDescriptorMetadata(uint64_t size, bool typed, uint32_t texture_view_offset) {
@@ -106,6 +113,36 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
 
   if (!sampler_heap_) {
     buffer_resources_.push_back({});
+
+    buffer_resource_table_capacity_ =
+        BufferResourceTableCapacity(num_descriptors_);
+    WMTBufferInfo resource_table_info = {};
+    resource_table_info.length =
+        uint64_t(buffer_resource_table_capacity_) *
+        sizeof(BufferResourceTableEntry);
+    resource_table_info.options = static_cast<WMTResourceOptions>(
+        WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
+    resource_table_info.memory.set(nullptr);
+    buffer_resource_table_buffer_ = device.newBuffer(resource_table_info);
+    if (!buffer_resource_table_buffer_) {
+      ERR("DescriptorHeapMirror: failed to allocate buffer resource table length=",
+          resource_table_info.length);
+    } else {
+      buffer_resource_table_gpu_address_ = resource_table_info.gpu_address;
+      buffer_resource_table_mapped_ =
+          reinterpret_cast<BufferResourceTableEntry *>(
+              resource_table_info.memory.get_accessible_or_null());
+      if (!buffer_resource_table_mapped_) {
+        ERR("DescriptorHeapMirror: buffer resource table is not CPU-accessible length=",
+            resource_table_info.length);
+      } else {
+        std::fill(buffer_resource_table_mapped_,
+                  buffer_resource_table_mapped_ +
+                      buffer_resource_table_capacity_,
+                  BufferResourceTableEntry{});
+      }
+    }
+
     WMTBufferInfo record_info = {};
     record_info.length =
         num_descriptors_
@@ -132,22 +169,6 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
                   BufferDescriptorRecord{});
       }
     }
-  }
-
-  WMTArgumentTableInfo table = {};
-  table.max_buffer_bind_count =
-      sampler_heap_ ? kIRSamplerHeapBindPoint + 1 : kIRDescriptorHeapBindPoint + 1;
-  table.max_texture_bind_count = 0;
-  table.max_sampler_state_bind_count = 0;
-  table.initialize_bindings = true;
-  argument_table_ = device.newArgumentTable(table);
-  if (!argument_table_) {
-    ERR("DescriptorHeapMirror: failed to allocate Metal4 argument table sampler=",
-        sampler_heap_);
-  } else if (table_gpu_address_) {
-    argument_table_.setAddress(
-        table_gpu_address_,
-        sampler_heap_ ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint);
   }
 
   if (!sampler_heap_) {
@@ -183,34 +204,85 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
   filled_generation_.assign(num_descriptors_, 0);
   if (sampler_heap_) {
     for (uint32_t i = 0; i < num_descriptors_; i++) {
-      WriteTableEntry(i, {null_sampler_handle_, 0, FloatMetadata(0.0f)});
+      WriteTableEntry(i, {null_sampler_handle_, null_sampler_handle_,
+                          FloatMetadata(0.0f)});
       FillSamplerSlot(i, nullptr, null_sampler_handle_);
     }
   }
 }
 
 uint32_t
-DescriptorHeapMirror::RegisterBufferResource(WMT::Resource allocation) {
-  if (sampler_heap_ || !allocation)
+DescriptorHeapMirror::RegisterBufferResource(uint64_t resource_identity,
+                                             WMT::Resource allocation,
+                                             uint64_t gpu_address,
+                                             uint64_t byte_size) {
+  if (sampler_heap_ || !resource_identity || !allocation ||
+      !buffer_resource_table_mapped_)
     return kNullDescriptorResourceIndex;
 
-  const obj_handle_t handle = allocation.handle;
-  auto found = buffer_resource_indices_.find(handle);
-  if (found != buffer_resource_indices_.end())
-    return found->second;
+  const uint64_t allocation_handle = allocation.handle;
+  auto found = buffer_resource_indices_.find(resource_identity);
+  if (found != buffer_resource_indices_.end()) {
+    const auto index = found->second;
+    if (index >= buffer_resources_.size())
+      return kNullDescriptorResourceIndex;
 
-  if (buffer_resources_.size() >= UINT32_MAX)
+    auto &record = buffer_resources_[index];
+    if (record.allocation_handle != allocation_handle ||
+        record.gpu_address != gpu_address ||
+        record.byte_size != byte_size) {
+      record.allocation = allocation;
+      record.allocation_handle = allocation_handle;
+      record.gpu_address = gpu_address;
+      record.byte_size = byte_size;
+      record.generation = ++buffer_resource_table_generation_;
+      WriteBufferResourceTableEntry(index, record);
+    }
+    return index;
+  }
+
+  if (buffer_resources_.size() >= buffer_resource_table_capacity_ ||
+      buffer_resources_.size() >= UINT32_MAX)
     return kNullDescriptorResourceIndex;
 
   DescriptorBackendResourceRecord record = {};
   record.allocation = allocation;
-  record.allocation_handle = handle;
+  record.resource_identity = resource_identity;
+  record.gpu_address = gpu_address;
+  record.byte_size = byte_size;
+  record.allocation_handle = allocation_handle;
   record.generation = ++buffer_resource_table_generation_;
 
   const auto index = static_cast<uint32_t>(buffer_resources_.size());
   buffer_resources_.push_back(std::move(record));
-  buffer_resource_indices_.emplace(handle, index);
+  buffer_resource_indices_.emplace(resource_identity, index);
+  WriteBufferResourceTableEntry(index, buffer_resources_[index]);
   return index;
+}
+
+bool
+DescriptorHeapMirror::RefreshBufferResource(uint32_t resource_index,
+                                            WMT::Resource allocation,
+                                            uint64_t gpu_address,
+                                            uint64_t byte_size) {
+  if (sampler_heap_ || resource_index == kNullDescriptorResourceIndex ||
+      resource_index >= buffer_resources_.size() || !allocation ||
+      !buffer_resource_table_mapped_ || !byte_size)
+    return false;
+
+  auto &record = buffer_resources_[resource_index];
+  const uint64_t allocation_handle = allocation.handle;
+  if (record.allocation_handle == allocation_handle &&
+      record.gpu_address == gpu_address && record.byte_size == byte_size)
+    return false;
+
+  record.allocation = allocation;
+  record.allocation_handle = allocation_handle;
+  record.gpu_address = gpu_address;
+  record.byte_size = byte_size;
+  record.generation = ++buffer_resource_table_generation_;
+  WriteBufferResourceTableEntry(resource_index, record);
+  return true;
 }
 
 void
@@ -220,6 +292,20 @@ DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry
   table_entries_[index] = entry;
   if (table_mapped_)
     table_mapped_[index] = entry;
+}
+
+void
+DescriptorHeapMirror::WriteBufferResourceTableEntry(
+    uint32_t index, const DescriptorBackendResourceRecord &record) {
+  if (!buffer_resource_table_mapped_ ||
+      index >= buffer_resource_table_capacity_)
+    return;
+  buffer_resource_table_mapped_[index] = BufferResourceTableEntry{
+      record.gpu_address,
+      record.byte_size,
+      record.allocation_handle,
+      record.generation,
+  };
 }
 
 void
@@ -239,7 +325,8 @@ DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
 void
 DescriptorHeapMirror::WriteNullTableEntry(uint32_t index) {
   if (sampler_heap_) {
-    WriteTableEntry(index, {null_sampler_handle_, 0, FloatMetadata(0.0f)});
+    WriteTableEntry(index, {null_sampler_handle_, null_sampler_handle_,
+                            FloatMetadata(0.0f)});
     WriteSlotMeta(index, DescriptorBackendSlotKind::Empty);
     FillSamplerSlot(index, nullptr, null_sampler_handle_);
     return;
@@ -264,6 +351,19 @@ DescriptorHeapMirror::WriteBufferTableEntry(uint32_t index, uint64_t gpu_va,
 }
 
 void
+DescriptorHeapMirror::WriteBufferTextureTableEntry(
+    uint32_t index, uint64_t gpu_va, uint64_t size,
+    uint64_t texture_view_id, uint32_t element_count,
+    uint32_t first_element, uint32_t flags) {
+  const uint64_t metadata =
+      (uint64_t(element_count) << 32) | uint64_t(first_element);
+  WriteTableEntry(index, {gpu_va, texture_view_id, metadata});
+  WriteSlotMeta(index, DescriptorBackendSlotKind::Buffer,
+                flags | BufferDescriptorRecordFlagTextureView);
+  FillTextureSlotPayload(index, texture_view_id, metadata);
+}
+
+void
 DescriptorHeapMirror::WriteBufferDescriptorRecord(
     uint32_t index, const BufferDescriptorRecord &record) {
   if (!buffer_record_mapped_ || index >= num_descriptors_)
@@ -274,8 +374,11 @@ DescriptorHeapMirror::WriteBufferDescriptorRecord(
 void
 DescriptorHeapMirror::WriteTextureTableEntry(uint32_t index,
                                              uint64_t gpu_resource_id,
+                                             uint32_t array_length,
                                              float min_lod) {
-  WriteTableEntry(index, {0, gpu_resource_id, FloatMetadata(min_lod)});
+  WriteTableEntry(index,
+                  {0, gpu_resource_id,
+                   MirrorTextureMetadata(array_length, min_lod)});
   WriteBufferDescriptorRecord(index, {});
   WriteSlotMeta(index, DescriptorBackendSlotKind::Texture);
 }
@@ -285,7 +388,7 @@ DescriptorHeapMirror::WriteTexturePoolTableEntry(uint32_t index,
                                                  uint32_t array_length,
                                                  float min_lod) {
   const uint64_t resource_id = textureViewPoolSlotResourceID(index);
-  WriteTextureTableEntry(index, resource_id, min_lod);
+  WriteTextureTableEntry(index, resource_id, array_length, min_lod);
   if (resource_id)
     FillTextureSlot(index, resource_id, array_length, min_lod);
 }
@@ -294,8 +397,12 @@ void
 DescriptorHeapMirror::WriteSamplerTableEntry(uint32_t index,
                                              const Sampler *sampler) {
   const uint64_t sampler_handle = sampler ? sampler->sampler_state_handle : 0;
+  const uint64_t sampler_cube_handle =
+      sampler ? sampler->sampler_state_cube_handle : 0;
   const float lod_bias = sampler ? sampler->lod_bias : 0.0f;
-  WriteTableEntry(index, {sampler_handle, 0, FloatMetadata(lod_bias)});
+  WriteTableEntry(index,
+                  {sampler_handle, sampler_cube_handle,
+                   FloatMetadata(lod_bias)});
   WriteSlotMeta(index, DescriptorBackendSlotKind::Sampler);
 }
 
@@ -307,6 +414,18 @@ DescriptorHeapMirror::SetTexturePoolSlot(uint32_t index, Texture *texture,
       !texture || !allocation)
     return 0;
   return texture->setViewPoolSlot(texture_view_pool_, view, allocation, index);
+}
+
+uint64_t
+DescriptorHeapMirror::SetTexturePoolBufferSlot(
+    uint32_t index, WMT::Buffer buffer,
+    const WMTTextureBufferViewDescriptor &descriptor, uint64_t offset,
+    uint64_t bytes_per_row) {
+  if (sampler_heap_ || !texture_view_pool_ || index >= num_descriptors_ ||
+      !buffer)
+    return 0;
+  return texture_view_pool_.setTextureViewFromBuffer(
+      buffer, descriptor, offset, bytes_per_row, index);
 }
 
 uint64_t

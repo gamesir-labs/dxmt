@@ -1,4 +1,5 @@
 #include "dxmt_context.hpp"
+#include "airconv_dx12_metal4.h"
 #include "Metal.hpp"
 #include "dxmt_apitrace.hpp"
 #include "dxmt_bindless_buffer_table.hpp"
@@ -1008,6 +1009,7 @@ ArgumentEncodingContext::bindBindlessTables(
     const AllocatedArgumentBufferSlice &sampler_mirror
 ) {
   if constexpr (stage == PipelineStage::Compute) {
+    invalidateNativeArgumentBuffers(true);
     auto bind = [&](WMT::Buffer buffer, uint64_t offset, uint8_t index) {
       if (!buffer)
         return;
@@ -1031,6 +1033,7 @@ ArgumentEncodingContext::bindBindlessTables(
                   "bindless-mirror render binds support only Vertex/Pixel (no GS/HS/DS)");
     constexpr WMTRenderStages stages =
         stage == PipelineStage::Vertex ? WMTRenderStageVertex : WMTRenderStageFragment;
+    invalidateNativeArgumentBuffers(false, stages);
     auto bind = [&](WMT::Buffer buffer, uint64_t offset, uint8_t index) {
       if (!buffer)
         return;
@@ -1051,6 +1054,117 @@ ArgumentEncodingContext::bindBindlessTables(
         state.valid = false;
     }
     currentRenderEncoder()->bindless_mirror_bound_29_30 = true;
+  }
+}
+
+template <PipelineStage stage>
+void
+ArgumentEncodingContext::bindNativeRootTableBases(
+    const AllocatedArgumentBufferSlice &root_bases, uint32_t bind_index) {
+  if (!root_bases.gpu_buffer)
+    return;
+
+  if constexpr (stage == PipelineStage::Compute) {
+    bindNativeArgumentBuffer(root_bases.gpu_buffer, root_bases.offset,
+                             bind_index, true);
+  } else {
+    static_assert(stage == PipelineStage::Vertex ||
+                      stage == PipelineStage::Pixel,
+                  "native root table base binds support only Vertex/Pixel/Compute");
+    constexpr WMTRenderStages stages =
+        stage == PipelineStage::Vertex ? WMTRenderStageVertex
+                                       : WMTRenderStageFragment;
+    bindNativeArgumentBuffer(root_bases.gpu_buffer, root_bases.offset,
+                             bind_index, false, stages);
+  }
+}
+
+void
+ArgumentEncodingContext::bindNativeArgumentBuffer(
+    WMT::Buffer buffer, uint64_t offset, uint32_t bind_index, bool compute,
+    WMTRenderStages render_stages) {
+  if (!buffer || bind_index >= 31)
+    return;
+
+  if (compute) {
+    auto *data = static_cast<ComputeEncoderData *>(encoder_current);
+    auto &cached = data->native_argument_buffers[bind_index];
+    if (cached.valid && cached.buffer_handle == buffer.handle &&
+        cached.offset == offset)
+      return;
+    cached = {buffer.handle, offset, true};
+
+    auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbuffer>();
+    cmd.type = WMTComputeCommandSetArgumentBuffer;
+    cmd.buffer = buffer;
+    cmd.offset = offset;
+    cmd.index = bind_index;
+    auto &use = encodeComputeCommand<wmtcmd_compute_useresource>();
+    use.type = WMTComputeCommandUseResource;
+    use.resource = buffer;
+    use.usage = WMTResourceUsageRead;
+    for (auto &state : data->argument_buffer_offsets) {
+      if (state.valid && state.index == bind_index)
+        state.valid = false;
+    }
+    return;
+  }
+
+  auto *data = currentRenderEncoder();
+  WMTRenderStages changed_stages = {};
+  auto update = [&](WMTRenderStages stage,
+                    std::array<NativeArgumentBufferBindingState, 31> &cache) {
+    if (!(render_stages & stage))
+      return;
+    auto &cached = cache[bind_index];
+    if (cached.valid && cached.buffer_handle == buffer.handle &&
+        cached.offset == offset)
+      return;
+    cached = {buffer.handle, offset, true};
+    changed_stages = static_cast<WMTRenderStages>(changed_stages | stage);
+  };
+  update(WMTRenderStageVertex, data->native_argument_buffers_vertex);
+  update(WMTRenderStageFragment, data->native_argument_buffers_fragment);
+  if (!changed_stages)
+    return;
+
+  auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbuffer>();
+  cmd.type = WMTRenderCommandSetArgumentBuffer;
+  cmd.buffer = buffer;
+  cmd.offset = offset;
+  cmd.index = bind_index;
+  cmd.stages = changed_stages;
+  auto &use = encodeRenderCommand<wmtcmd_render_useresource>();
+  use.type = WMTRenderCommandUseResource;
+  use.resource = buffer;
+  use.usage = WMTResourceUsageRead;
+  use.stages = changed_stages;
+  for (auto &state : data->argument_buffer_offsets) {
+    if (state.valid && (state.stages & changed_stages) &&
+        state.index == bind_index)
+      state.valid = false;
+  }
+}
+
+void
+ArgumentEncodingContext::invalidateNativeArgumentBuffers(
+    bool compute, WMTRenderStages render_stages) {
+  if (compute) {
+    for (auto &state :
+         static_cast<ComputeEncoderData *>(encoder_current)
+             ->native_argument_buffers)
+      state.valid = false;
+    return;
+  }
+
+  auto *data = currentRenderEncoder();
+  if (render_stages & WMTRenderStageVertex) {
+    for (auto &state : data->native_argument_buffers_vertex)
+      state.valid = false;
+  }
+  if (render_stages & WMTRenderStageFragment) {
+    for (auto &state : data->native_argument_buffers_fragment)
+      state.valid = false;
   }
 }
 
@@ -1125,6 +1239,9 @@ template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, uint32_t);
+template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, uint32_t);
+template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, uint32_t);
 template bool ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound<false>();
 template bool ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound<true>();
 

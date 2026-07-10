@@ -175,6 +175,42 @@ BindlessImmutableBufferMask(const PipelineDxilShader &shader) {
   return mask;
 }
 
+static uint32_t
+NativeDescriptorImmutableBufferMask(const PipelineDxilShader &shader) {
+  uint32_t mask = 0;
+  if (shader.reflection().NumConstantBuffers)
+    mask |= BufferBindingBit(
+                DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX) |
+            BufferBindingBit(
+                DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX) |
+            BufferBindingBit(
+                DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX) |
+            BufferBindingBit(DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX);
+
+  const auto *arguments = shader.resourceArgumentInfo();
+  if (!arguments)
+    return mask;
+
+  for (uint32_t i = 0; i < shader.reflection().NumArguments; i++) {
+    const auto &arg = arguments[i];
+    mask |= BufferBindingBit(DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX);
+    if (arg.Type == SM50BindingType::Sampler) {
+      mask |= BufferBindingBit(DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX);
+    } else {
+      mask |= BufferBindingBit(DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX);
+      if (arg.Flags & (MTL_SM50_SHADER_ARGUMENT_BUFFER |
+                       MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER)) {
+        mask |= BufferBindingBit(
+                    DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX) |
+                BufferBindingBit(
+                    DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX);
+      }
+    }
+  }
+
+  return mask;
+}
+
 constexpr WMTCompareFunction kCompareFunctionMap[] = {
     WMTCompareFunctionNever, WMTCompareFunctionNever, WMTCompareFunctionLess,
     WMTCompareFunctionEqual, WMTCompareFunctionLessEqual,
@@ -1421,13 +1457,14 @@ PipelineMetalFunctionCache() {
 std::string
 BuildMetalFunctionCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
                            const char *function_name, const void *bitcode,
-                           size_t bitcode_size, bool bindless) {
+                           size_t bitcode_size,
+                           DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   Sha1HashState hash;
-  HashString(hash, "dxmt-d3d12-metal-function-cache-v1");
+  HashString(hash, "dxmt-d3d12-metal-function-cache-v2");
   const auto device_handle = static_cast<obj_handle_t>(device->GetMTLDevice());
   HashValue(hash, device_handle);
   HashValue(hash, stage);
-  HashValue(hash, uint32_t(bindless ? 1u : 0u));
+  HashValue(hash, uint32_t(shader_abi_version));
   HashString(hash, function_name ? std::string_view(function_name)
                                  : std::string_view());
   HashValue(hash, uint64_t(bitcode_size));
@@ -1439,7 +1476,8 @@ bool
 CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
                           const char *function_name,
                           sm50_bitcode_t bitcode_handle,
-                          PipelineMetalShader &out, bool bindless) {
+                          PipelineMetalShader &out,
+                          DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   SM50_COMPILED_BITCODE bitcode = {};
   DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
   const auto bitcode_data = AirconvLocalPointer(bitcode.Data);
@@ -1456,7 +1494,8 @@ CreateCachedMetalFunction(IMTLD3D12Device *device, PipelineShaderStage stage,
   std::string cache_key;
   if (can_hash_bitcode) {
     cache_key = BuildMetalFunctionCacheKey(
-        device, stage, function_name, bitcode_data, bitcode.Size, bindless);
+        device, stage, function_name, bitcode_data, bitcode.Size,
+        shader_abi_version);
     {
       std::lock_guard lock(PipelineMetalFunctionCacheMutex());
       auto &cache = PipelineMetalFunctionCache();
@@ -1520,13 +1559,14 @@ PersistentAirCacheEnabled() {
 // Key for the cross-run persistent AIR-bitcode cache. shader_cache_key already
 // hashes every shader bytecode + graphics/compute state + root signature that
 // feeds airconv's `args`, so (stage + key + metal version + flags) fully
-// determines the transpiled AIR output. Distinct "v1" tag keeps these entries
-// from colliding with the D3D11 cache entries sharing the same DB.
+// determines the transpiled AIR output. The versioned tag keeps entries from
+// older D3D12 AIR ABI key layouts out of this cache.
 Sha1Digest
 BuildPersistentAirCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
-                           std::string_view shader_cache_key, bool bindless) {
+                           std::string_view shader_cache_key,
+                           DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   Sha1HashState hash;
-  HashString(hash, "dxmt-d3d12-persistent-air-cache-v2");
+  HashString(hash, "dxmt-d3d12-persistent-air-cache-v3");
   // Fold the DXMT build version into the key so the cache auto-invalidates
   // across clean commits and local dirty builds whenever airconv codegen could
   // have changed.
@@ -1534,7 +1574,7 @@ BuildPersistentAirCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
   HashValue(hash, uint32_t(stage));
   HashValue(hash, uint32_t(GetMetalVersion(device)));
   HashValue(hash, uint32_t(GetShaderFlags()));
-  HashValue(hash, uint32_t(bindless ? 1u : 0u));
+  HashValue(hash, uint32_t(shader_abi_version));
   HashString(hash, shader_cache_key);
   return hash.final();
 }
@@ -1544,7 +1584,8 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      const char *function_name,
                      SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
                      PipelineMetalShader &out,
-                     std::string_view shader_cache_key, bool bindless,
+                     std::string_view shader_cache_key,
+                     DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version,
                      bool read_persistent_cache = true) {
   const char *air_function_name = "shader_main";
 
@@ -1564,7 +1605,7 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   if (persistent) {
     persistent_key =
         BuildPersistentAirCacheKey(device, shader.stage, shader_cache_key,
-                                   bindless);
+                                   shader_abi_version);
     scache = &ShaderCache::getInstance(device->GetDXMTDevice().metalVersion());
   }
   if (persistent && read_persistent_cache) {
@@ -1660,7 +1701,7 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   }
 
   return CreateCachedMetalFunction(device, shader.stage, air_function_name,
-                                   bitcode_handle, out, bindless);
+                                   bitcode_handle, out, shader_abi_version);
 }
 
 bool
@@ -1670,7 +1711,7 @@ CreateMetalFunctionFromBitcode(IMTLD3D12Device *device,
                                sm50_bitcode_t bitcode_handle,
                                PipelineMetalShader &out) {
   return CreateCachedMetalFunction(device, stage, function_name, bitcode_handle,
-                                   out, /*bindless=*/false);
+                                   out, DXMT12_MTL4_SHADER_ABI_LEGACY);
 }
 
 bool
@@ -2122,10 +2163,8 @@ CreateDepthStencilState(IMTLD3D12Device *device,
 }
 
 // Single source of truth for whether a PSO may use the descriptor-mirror path.
-// Consumed both at compile time (CreateMetal*Pipeline appends the
-// SM50_SHADER_BINDLESS_MIRROR args node and folds the bool into shader cache
-// keys) and at runtime (PipelineStateImpl::UsesBindlessMirror, the draw-path
-// gate), so a PSO compiled as mirrored is read back over the same predicate.
+// Consumed by PsoShaderAbiVersion below, so compile-time args, shader cache
+// keys, and runtime draw-path gates all agree on the selected shader ABI.
 bool
 PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders,
                     const RootSignature *root_signature) {
@@ -2147,6 +2186,167 @@ PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders,
       return false;
   }
   return true;
+}
+
+static bool
+NativeRootParameterVisibleToShader(const RootSignatureParameter &parameter,
+                                   PipelineShaderStage stage) {
+  if (parameter.visibility == D3D12_SHADER_VISIBILITY_ALL)
+    return true;
+  switch (stage) {
+  case PipelineShaderStage::Vertex:
+    return parameter.visibility == D3D12_SHADER_VISIBILITY_VERTEX;
+  case PipelineShaderStage::Pixel:
+    return parameter.visibility == D3D12_SHADER_VISIBILITY_PIXEL;
+  case PipelineShaderStage::Geometry:
+    return parameter.visibility == D3D12_SHADER_VISIBILITY_GEOMETRY;
+  case PipelineShaderStage::Hull:
+    return parameter.visibility == D3D12_SHADER_VISIBILITY_HULL;
+  case PipelineShaderStage::Domain:
+    return parameter.visibility == D3D12_SHADER_VISIBILITY_DOMAIN;
+  case PipelineShaderStage::Compute:
+    return false;
+  }
+  return false;
+}
+
+static std::optional<D3D12_DESCRIPTOR_RANGE_TYPE>
+NativeDescriptorRangeType(SM50BindingType type) {
+  switch (type) {
+  case SM50BindingType::ConstantBuffer:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+  case SM50BindingType::Sampler:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+  case SM50BindingType::SRV:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  case SM50BindingType::UAV:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  }
+  return std::nullopt;
+}
+
+static bool
+NativeShaderArgumentHasSingleTableRange(
+    const RootSignature &root, PipelineShaderStage stage,
+    const DXMT12_MTL4_SHADER_ARGUMENT &argument) {
+  const auto wanted_type = NativeDescriptorRangeType(argument.Type);
+  if (!wanted_type)
+    return false;
+
+  const uint32_t lower = argument.RegisterCount
+                             ? argument.RegisterLowerBound
+                             : argument.SM50BindingSlot;
+  const uint32_t count = argument.RegisterCount ? argument.RegisterCount : 1;
+  const uint32_t space = argument.RegisterCount ? argument.RegisterSpace : 0;
+  if (!count || count == UINT_MAX || lower > UINT_MAX - count)
+    return false;
+
+  uint32_t matches = 0;
+  for (const auto &parameter : root.GetParameters()) {
+    if (parameter.parameter_type !=
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+        !NativeRootParameterVisibleToShader(parameter, stage))
+      continue;
+    for (const auto &range : parameter.ranges) {
+      if (range.range_type != *wanted_type ||
+          range.register_space != space || !range.descriptor_count ||
+          range.descriptor_count == UINT_MAX ||
+          lower < range.base_shader_register)
+        continue;
+      const uint32_t local = lower - range.base_shader_register;
+      if (local > range.descriptor_count ||
+          count > range.descriptor_count - local)
+        continue;
+      matches++;
+    }
+  }
+  return matches == 1;
+}
+
+static NativeShaderAbiEligibilityReason
+GetNativeShaderAbiEligibilityImpl(
+    const std::vector<PipelineDxilShader> &shaders,
+    const RootSignature *root_signature) {
+  if (!root_signature || !root_signature->GetStaticSamplers().empty())
+    return NativeShaderAbiEligibilityReason::UnsupportedRootSignature;
+
+  for (const auto &shader : shaders) {
+    if (shader.kind() == PipelineShaderBytecodeKind::Dxil)
+      return NativeShaderAbiEligibilityReason::ShaderAbiMismatch;
+    if (shader.stage == PipelineShaderStage::Geometry)
+      return NativeShaderAbiEligibilityReason::UnsupportedGeometryPipeline;
+    if (shader.stage == PipelineShaderStage::Hull ||
+        shader.stage == PipelineShaderStage::Domain)
+      return NativeShaderAbiEligibilityReason::UnsupportedTessellationPipeline;
+  }
+
+  for (const auto &parameter : root_signature->GetParameters()) {
+    if (parameter.parameter_type !=
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+      return NativeShaderAbiEligibilityReason::UnsupportedRootDescriptor;
+    if (parameter.ranges.empty())
+      return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
+
+    std::optional<D3D12_DESCRIPTOR_HEAP_TYPE> heap_type;
+    uint32_t running_offset = 0;
+    for (const auto &range : parameter.ranges) {
+      if (!range.descriptor_count || range.descriptor_count == UINT_MAX)
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
+      const auto current_heap_type =
+          range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER
+              ? D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+              : D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+      if (heap_type && *heap_type != current_heap_type)
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
+      heap_type = current_heap_type;
+      const uint32_t offset =
+          range.offset_in_descriptors_from_table_start == UINT_MAX
+              ? running_offset
+              : range.offset_in_descriptors_from_table_start;
+      if (offset > UINT_MAX - range.descriptor_count)
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
+      running_offset = offset + range.descriptor_count;
+    }
+  }
+
+  for (const auto &shader : shaders) {
+    const auto *cbuffers = shader.constantBufferInfo();
+    for (uint32_t i = 0; cbuffers &&
+                         i < shader.reflection().NumConstantBuffers;
+         i++) {
+      if (!NativeShaderArgumentHasSingleTableRange(*root_signature,
+                                                   shader.stage,
+                                                   cbuffers[i]))
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
+    }
+    const auto *arguments = shader.resourceArgumentInfo();
+    for (uint32_t i = 0; arguments && i < shader.reflection().NumArguments;
+         i++) {
+      if (!NativeShaderArgumentHasSingleTableRange(*root_signature,
+                                                   shader.stage,
+                                                   arguments[i]))
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
+    }
+  }
+
+  return NativeShaderAbiEligibilityReason::None;
+}
+
+DXMT12_MTL4_SHADER_ABI_VERSION
+PsoShaderAbiVersion(const std::vector<PipelineDxilShader> &shaders,
+                    const RootSignature *root_signature) {
+  if (GetNativeShaderAbiEligibilityImpl(shaders, root_signature) ==
+      NativeShaderAbiEligibilityReason::None)
+    return DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+  return PsoBindlessEligible(shaders, root_signature)
+             ? DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR
+             : DXMT12_MTL4_SHADER_ABI_LEGACY;
+}
+
+bool
+ShaderAbiUsesBindlessMirror(
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
+  return shader_abi_version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
 }
 
 bool
@@ -2177,14 +2377,29 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // Only eligible PSOs receive the descriptor-mirror args node. Non-eligible
-  // PSOs, including DXIL and geometry/tessellation paths, keep the legacy
-  // compilation argument chain because they do not have matching mirror lowering.
-  const bool pso_bindless = PsoBindlessEligible(shaders, root_signature);
+  // Table-only SM50 PSOs use the native descriptor-table ABI. Root payload,
+  // static-sampler, DXIL, geometry, and tessellation cases retain the existing
+  // bindless/legacy fallbacks until their native ABI is complete.
+  const auto shader_abi_version =
+      PsoShaderAbiVersion(shaders, root_signature);
+  const bool pso_bindless = ShaderAbiUsesBindlessMirror(shader_abi_version);
+  const bool pso_native =
+      shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
   SM50_SHADER_BINDLESS_MIRROR_DATA bindless_node = {};
   bindless_node.type = SM50_SHADER_BINDLESS_MIRROR;
   bindless_node.enabled = pso_bindless;
   bindless_node.next = &common;
+  DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA native_abi_node = {};
+  native_abi_node.type = SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI;
+  native_abi_node.version = shader_abi_version;
+  native_abi_node.enabled =
+      shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+  native_abi_node.next = pso_bindless
+                             ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
+                             : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
+  auto *base_shader_args =
+      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+          &native_abi_node);
 
   std::vector<SM50_IA_INPUT_ELEMENT> input_elements;
   uint32_t slot_mask = 0;
@@ -2200,9 +2415,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
   ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-  ia_layout.next = pso_bindless
-                       ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
-                       : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
+  ia_layout.next = base_shader_args;
   ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
   ia_layout.slot_mask = slot_mask;
   ia_layout.num_elements = uint32_t(input_elements.size());
@@ -2235,9 +2448,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (ps) {
     SM50_SHADER_PSO_PIXEL_SHADER_DATA ps_args = {};
     ps_args.type = SM50_SHADER_PSO_PIXEL_SHADER;
-    ps_args.next = pso_bindless
-                       ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
-                       : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
+    ps_args.next = base_shader_args;
     ps_args.sample_mask = state.desc.SampleMask;
     ps_args.dual_source_blending =
         UsesDualSourceBlending(state.desc.BlendState);
@@ -2249,7 +2460,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     const auto ps_name = BuildFunctionName("ps", shader_cache_key);
     if (!CompileMetalFunction(device, *ps, ps_name.c_str(),
                               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ps_args),
-                              out.pixel, shader_cache_key, pso_bindless))
+                              out.pixel, shader_cache_key,
+                              shader_abi_version))
       return false;
   }
 
@@ -2466,7 +2678,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   }
 
   if (!CompileMetalFunction(device, *vs, vs_name.c_str(), vs_args,
-                            out.vertex, shader_cache_key, pso_bindless))
+                            out.vertex, shader_cache_key,
+                            shader_abi_version))
     return false;
 
   WMTRenderPipelineInfo info = {};
@@ -2483,6 +2696,11 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     info.immutable_vertex_buffers |= BindlessImmutableBufferMask(*vs);
     if (ps)
       info.immutable_fragment_buffers |= BindlessImmutableBufferMask(*ps);
+  } else if (pso_native) {
+    info.immutable_vertex_buffers |= NativeDescriptorImmutableBufferMask(*vs);
+    if (ps)
+      info.immutable_fragment_buffers |=
+          NativeDescriptorImmutableBufferMask(*ps);
   } else {
     info.immutable_vertex_buffers |=
         BufferBindingBit(29) | BufferBindingBit(30);
@@ -2537,27 +2755,35 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // See CreateMetalGraphicsPipeline: only eligible compute PSOs receive the
-  // descriptor-mirror args node.
-  const bool pso_bindless = PsoBindlessEligible(shaders, root_signature);
+  // See CreateMetalGraphicsPipeline for the shared native eligibility policy.
+  const auto shader_abi_version =
+      PsoShaderAbiVersion(shaders, root_signature);
+  const bool pso_bindless = ShaderAbiUsesBindlessMirror(shader_abi_version);
+  const bool pso_native =
+      shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
   SM50_SHADER_BINDLESS_MIRROR_DATA bindless_node = {};
   bindless_node.type = SM50_SHADER_BINDLESS_MIRROR;
   bindless_node.enabled = pso_bindless;
   bindless_node.next = &common;
+  DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA native_abi_node = {};
+  native_abi_node.type = SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI;
+  native_abi_node.version = shader_abi_version;
+  native_abi_node.enabled =
+      shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+  native_abi_node.next = pso_bindless
+                             ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&bindless_node)
+                             : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
 
   const auto cs_name = BuildFunctionName("cs", shader_cache_key);
   D3D12DumpPipelineShaders("compute", shader_cache_key, shaders, nullptr,
                            nullptr);
   auto *compile_args =
-      pso_bindless
-          ? reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
-                &bindless_node)
-          : reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
-                &common);
+      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+          &native_abi_node);
   auto compile_compute = [&](bool read_persistent_cache) {
     return CompileMetalFunction(device, *cs, cs_name.c_str(), compile_args,
-                                out.compute, shader_cache_key, pso_bindless,
-                                read_persistent_cache);
+                                out.compute, shader_cache_key,
+                                shader_abi_version, read_persistent_cache);
   };
   if (!compile_compute(/*read_persistent_cache=*/true))
     return false;
@@ -2565,9 +2791,12 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   WMTComputePipelineInfo info = {};
   WMT::InitializeComputePipelineInfo(info);
   info.compute_function = out.compute.function;
-  info.immutable_buffers = pso_bindless
-                               ? BindlessImmutableBufferMask(*cs)
-                               : (BufferBindingBit(29) | BufferBindingBit(30));
+  info.immutable_buffers =
+      pso_bindless
+          ? BindlessImmutableBufferMask(*cs)
+          : pso_native
+                ? NativeDescriptorImmutableBufferMask(*cs)
+                : (BufferBindingBit(29) | BufferBindingBit(30));
   const auto tgx = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[0]);
   const auto tgy = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[1]);
   const auto tgz = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[2]);
@@ -3325,9 +3554,12 @@ public:
     cached_shader_blob_ =
         BuildCachedShaderBlob(type_, graphics_state_, compute_state_,
                               shader_cache_key_);
-    // Same predicate over the same shaders the compile path uses, so the
+    // Same ABI selection over the same shaders the compile path uses, so the
     // runtime draw-path gate matches the AIR that was actually compiled.
-    uses_bindless_mirror_ = PsoBindlessEligible(shaders_, root_signature_.ptr());
+    shader_abi_version_ =
+        PsoShaderAbiVersion(shaders_, root_signature_.ptr());
+    uses_bindless_mirror_ =
+        ShaderAbiUsesBindlessMirror(shader_abi_version_);
   }
 
   ~PipelineStateImpl() {
@@ -3478,6 +3710,10 @@ public:
 
   bool UsesBindlessMirror() const override { return uses_bindless_mirror_; }
 
+  DXMT12_MTL4_SHADER_ABI_VERSION GetShaderAbiVersion() const override {
+    return shader_abi_version_;
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
@@ -3491,6 +3727,8 @@ private:
   std::vector<uint8_t> cached_shader_blob_;
   std::mutex metal_mutex_;
   bool uses_bindless_mirror_ = false;
+  DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version_ =
+      DXMT12_MTL4_SHADER_ABI_LEGACY;
   bool metal_graphics_ready_ = false;
   bool metal_compute_ready_ = false;
   PipelineMetalGraphicsState metal_graphics_;
@@ -3677,6 +3915,13 @@ ElapsedUs(std::chrono::steady_clock::time_point start) {
 }
 
 } // namespace
+
+NativeShaderAbiEligibilityReason
+GetNativeShaderAbiEligibility(
+    const std::vector<PipelineDxilShader> &shaders,
+    const RootSignature *root_signature) {
+  return GetNativeShaderAbiEligibilityImpl(shaders, root_signature);
+}
 
 Com<ID3D12PipelineState>
 CreateGraphicsPipelineState(IMTLD3D12Device *device,

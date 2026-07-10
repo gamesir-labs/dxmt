@@ -3934,6 +3934,12 @@ struct SM50_SHADER_COMMON_DATA32 {
   enum SM50_SHADER_FLAG flag;
 };
 
+struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  bool enabled;
+};
+
 struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -3987,6 +3993,12 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA32 {
   uint32_t max_potential_tess_factor;
 };
 
+struct SM50_SHADER_BINDLESS_MIRROR_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  bool enabled;
+};
+
 void
 sm50_compilation_argument32_convert(
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
@@ -4024,6 +4036,17 @@ sm50_compilation_argument32_convert(
       data->type = src->type;
       data->metal_version = src->metal_version;
       data->flags = src->flag;
+      break;
+    }
+    case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION: {
+      struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *data =
+          malloc(sizeof(struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->enabled = src->enabled;
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
@@ -4085,6 +4108,18 @@ sm50_compilation_argument32_convert(
       data->max_potential_tess_factor = src->max_potential_tess_factor;
       break;
     }
+    case SM50_SHADER_BINDLESS_MIRROR: {
+      struct SM50_SHADER_BINDLESS_MIRROR_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_BINDLESS_MIRROR_DATA *data =
+          malloc(sizeof(struct SM50_SHADER_BINDLESS_MIRROR_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->enabled = src->enabled;
+      break;
+    }
+    case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI:
     case SM50_SHADER_ARGUMENT_TYPE_MAX:
       break;
     }

@@ -1,6 +1,7 @@
 #include "d3d12_command_queue.hpp"
 #include "d3d12_dxgi_backend.hpp"
 
+#include "airconv_dx12_metal4.h"
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
@@ -5378,7 +5379,10 @@ private:
   struct GraphicsBindingSnapshot {
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
+    Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
+    Com<ID3D12DescriptorHeap> sampler_heap;
     RootSignature *root_signature_impl = nullptr;
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 64> graphics_tables = {};
     std::vector<GraphicsBindingSnapshotEntry> entries;
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
@@ -5387,6 +5391,7 @@ private:
     // windows from captured descriptors because deferred draws no longer have
     // access to the live ReplayState.
     bool bindless = false;
+    bool native = false;
     AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
     AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
@@ -5452,6 +5457,15 @@ private:
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> cbv_roots = {};
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> srv_roots = {};
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> uav_roots = {};
+  };
+
+  struct CompiledDirectGraphicsBindingPayload {
+    Com<ID3D12RootSignature> root_signature;
+    std::vector<CompiledCommandRootDescriptorTable> root_tables;
+    CompiledCommandInputAssemblerState input_assembler;
+    WMT::Reference<WMT::Buffer> native_root_base_buffer;
+    CompiledNativeStageBinding native_vertex;
+    CompiledNativeStageBinding native_pixel;
   };
 
   struct CompiledDirectAccessList {
@@ -5641,7 +5655,7 @@ private:
     Com<ID3D12RootSignature> compute_root_signature;
     RootSignature *graphics_root_signature_impl = nullptr;
     RootSignature *compute_root_signature_impl = nullptr;
-    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
     std::vector<D3D12_VIEWPORT> viewports;
     std::vector<D3D12_RECT> scissors;
     std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -5677,6 +5691,8 @@ private:
     std::array<ReplayRootDescriptorSlot, kMaxRootParameters>
         compute_uav_roots = {};
     uint64_t current_record_d3d_sequence = 0;
+    dxmt::CompiledFallbackReason compiled_fallback_reason =
+        dxmt::CompiledFallbackReason::Unknown;
     uint64_t graphics_binding_generation = 1;
     uint64_t last_snapshot_request_graphics_generation = 0;
     uint64_t last_snapshot_request_descriptor_generation = 0;
@@ -5752,6 +5768,25 @@ private:
               clock::now() - rb_clone_t0).count();
     return copy;
   }
+
+  struct CompiledDirectComputeBindingPayload {
+    CompiledComputePacket packet;
+    CompiledPacketBindingState binding_state;
+    CompiledDirectAccessList direct_access;
+    WMT::Reference<WMT::Buffer> native_root_base_buffer;
+    RootSignature *root = nullptr;
+  };
+
+  struct ReplayDispatchPacket {
+    WMT::Reference<WMT::ComputePipelineState> metal_pso;
+    WMTSize threadgroup_size = {};
+    PipelineState *pipeline = nullptr;
+    DispatchRecord dispatch = {};
+    uint64_t argument_buffer_size = 0;
+    std::optional<ReplayState> replay_state;
+    std::optional<CompiledDirectComputeBindingPayload>
+        compiled_binding_payload;
+  };
 
   ResolvedReplayVertexBuffer
   ResolveReplayVertexBuffer(ReplayState &state,
@@ -6129,27 +6164,13 @@ private:
                          &perDrawSubTimers().buildPlanUs};
       batch.plan = BuildReplayGraphicsPassPlan(batch.commands,
                                                batch.argument_buffer_size);
-      if (auto *stats = dxmt::perf::currentFrameStatistics()) {
+      if (auto *stats = dxmt::perf::enabled()
+                            ? &device_->GetDXMTDevice()
+                                   .queue()
+                                   .CurrentFrameStatistics()
+                            : nullptr) {
         dxmt::perf::recordCompiledPassBuildTime(stats,
                                                 clock::now() - _rbplan.t0);
-        dxmt::perf::recordCompiledGraphicsPackets(
-            stats, batch.plan.compiled_candidate_count);
-        const auto legacy_other_count =
-            batch.plan.compiled_legacy_count -
-            batch.plan.compiled_gs_ts_count -
-            batch.plan.compiled_indirect_count;
-        dxmt::perf::recordFallbackGraphicsPackets(
-            stats, legacy_other_count,
-            dxmt::CompiledFallbackReason::LegacyPath);
-        dxmt::perf::recordFallbackGraphicsPackets(
-            stats, batch.plan.compiled_barrier_count,
-            dxmt::CompiledFallbackReason::ResourceBarrier);
-        dxmt::perf::recordFallbackGraphicsPackets(
-            stats, batch.plan.compiled_gs_ts_count,
-            dxmt::CompiledFallbackReason::GeometryOrTessellation);
-        dxmt::perf::recordFallbackGraphicsPackets(
-            stats, batch.plan.compiled_indirect_count,
-            dxmt::CompiledFallbackReason::Indirect);
         stats->frame_replay_compiled_graphics_candidates +=
             batch.plan.compiled_candidate_count;
         stats->frame_replay_compiled_graphics_legacy +=
@@ -6803,6 +6824,48 @@ private:
     chunk = queue.CurrentChunk();
   }
 
+  void RecordGraphicsPacketClassification(
+      const ReplayState &state, ReplayGraphicsCommandKind kind,
+      bool compiled_candidate, bool use_geometry, bool use_tessellation) {
+    if (!dxmt::perf::enabled() ||
+        state.compiled_fallback_reason !=
+            dxmt::CompiledFallbackReason::Unknown ||
+        kind == ReplayGraphicsCommandKind::Barrier)
+      return;
+
+    auto *stats =
+        &device_->GetDXMTDevice().queue().CurrentFrameStatistics();
+    if (compiled_candidate &&
+        !ReplayGraphicsCommandKindIsIndirect(kind) && !use_geometry &&
+        !use_tessellation) {
+      dxmt::perf::recordCompiledGraphicsPackets(stats, 1);
+      return;
+    }
+
+    const auto reason = ReplayGraphicsCommandKindIsIndirect(kind)
+                            ? dxmt::CompiledFallbackReason::Indirect
+                        : (use_geometry || use_tessellation)
+                            ? dxmt::CompiledFallbackReason::GeometryOrTessellation
+                            : dxmt::CompiledFallbackReason::LegacyPath;
+    dxmt::perf::recordFallbackGraphicsPackets(stats, 1, reason);
+  }
+
+  void RecordComputePacketClassification(const ReplayState &state,
+                                         bool compiled_candidate) {
+    if (!dxmt::perf::enabled() ||
+        state.compiled_fallback_reason !=
+            dxmt::CompiledFallbackReason::Unknown)
+      return;
+
+    auto *stats =
+        &device_->GetDXMTDevice().queue().CurrentFrameStatistics();
+    if (compiled_candidate)
+      dxmt::perf::recordCompiledComputePackets(stats, 1);
+    else
+      dxmt::perf::recordFallbackComputePackets(
+          stats, 1, dxmt::CompiledFallbackReason::LegacyPath);
+  }
+
   template <typename Fn>
   void QueueGraphicsPassCommand(CommandChunk *chunk, ReplayState &state,
                                 ReplayRenderPassAttachments attachments,
@@ -6812,6 +6875,9 @@ private:
                                 ReplayGraphicsCommandKind kind =
                                     ReplayGraphicsCommandKind::Draw,
                                 bool bindless_compiled_candidate = false) {
+    RecordGraphicsPacketClassification(
+        state, kind, bindless_compiled_candidate, use_geometry,
+        use_tessellation);
     if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
       FlushPassBatches(chunk, state);
 
@@ -6857,6 +6923,8 @@ private:
       Payload &&payload, ReplayGraphicsCompiledEncodeFn compiled_encode,
       bool use_geometry, bool use_tessellation,
       ReplayGraphicsCommandKind kind) {
+    RecordGraphicsPacketClassification(state, kind, true, use_geometry,
+                                       use_tessellation);
     if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
       FlushPassBatches(chunk, state);
 
@@ -6986,7 +7054,9 @@ private:
 
   template <typename Fn>
   void QueueComputePassCommand(CommandChunk *chunk, ReplayState &state,
-                               uint64_t argument_buffer_size, Fn &&fn) {
+                               uint64_t argument_buffer_size, Fn &&fn,
+                               bool compiled_candidate = false) {
+    RecordComputePacketClassification(state, compiled_candidate);
     if (!D3D12ReplayComputeBatchingEnabled()) {
       FlushPassBatches(chunk, state);
       EmitSingleComputePass(chunk, argument_buffer_size,
@@ -7118,7 +7188,8 @@ private:
     } else if constexpr (std::is_same_v<T, DispatchRecord>) {
       timers.recordDispatchUs += us;
       timers.recordDispatchCount++;
-    } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
+    } else if constexpr (std::is_same_v<T, PipelineStateRecord> ||
+                         std::is_same_v<T, ClearStateRecord>) {
       timers.recordPipelineStateUs += us;
       timers.recordPipelineStateCount++;
     } else if constexpr (std::is_same_v<T, DescriptorHeapsRecord>) {
@@ -7670,7 +7741,10 @@ private:
       chunk = queue.CurrentChunk();
       record_index++;
     };
-    auto replay_range = [&](UINT begin, UINT count) {
+    auto replay_range = [&](UINT begin, UINT count,
+                            dxmt::CompiledFallbackReason fallback_reason) {
+      const auto previous_fallback_reason = state.compiled_fallback_reason;
+      state.compiled_fallback_reason = fallback_reason;
       const UINT end = std::min<UINT>(begin + count,
                                       static_cast<UINT>(records.size()));
       for (UINT i = begin; i < end;) {
@@ -7702,22 +7776,57 @@ private:
         replay_one(records[i]);
         ++i;
       }
+      state.compiled_fallback_reason = previous_fallback_reason;
     };
 
     auto queue_compiled_graphics_packet =
-        [&](const CompiledGraphicsPacket &packet) -> bool {
+        [&](const CompiledGraphicsPacket &packet)
+            -> CompiledCommandFallbackReason {
           if (!packet.draw && !packet.draw_indexed)
-            return false;
+            return CompiledCommandFallbackReason::UnsupportedCommand;
           DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
                                                   ++replay_record_serial);
           if (packet.d3d_sequence != 0)
             dxmt::apitrace::set_current_d3d_sequence(packet.d3d_sequence);
+          const bool native_packet =
+              packet.pipeline.metadata.uses_native_descriptor_table_abi;
           auto *pipeline = packet.pipeline.metadata.pipeline;
           if (!pipeline)
             pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
           auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
-          if (!pipeline || !root)
-            return false;
+          if (!pipeline)
+            return CompiledCommandFallbackReason::MissingPipelineState;
+          if (!root)
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeUnsupportedRootSignature
+                       : CompiledCommandFallbackReason::MissingRootSignature;
+          if (pipeline->GetShaderAbiVersion() !=
+              packet.pipeline.metadata.shader_abi_version)
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeShaderAbiMismatch
+                       : CompiledCommandFallbackReason::NonBindlessPipelineState;
+          if (pipeline->GetShaderAbiVersion() !=
+                  DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE &&
+              !pipeline->UsesBindlessMirror())
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeShaderAbiMismatch
+                       : CompiledCommandFallbackReason::NonBindlessPipelineState;
+          if (native_packet) {
+            if (!packet.root_constants.empty() ||
+                !packet.root_descriptors.empty() ||
+                !packet.native_vertex.ready || !packet.native_pixel.ready)
+              return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
+            if (!compiled->native_root_base_buffer &&
+                (packet.native_vertex.cbuffer_root_base_count ||
+                 packet.native_vertex.resource_root_base_count ||
+                 packet.native_pixel.cbuffer_root_base_count ||
+                 packet.native_pixel.resource_root_base_count))
+              return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+            const auto backend_reason =
+                ValidateCompiledNativeDescriptorBackends(packet.root_tables);
+            if (backend_reason != CompiledCommandFallbackReason::None)
+              return backend_reason;
+          }
           ReplayState compiled_binding_state = {};
           compiled_binding_state.graphics_root_signature =
               packet.pipeline.root_signature;
@@ -7737,11 +7846,18 @@ private:
           auto *metal = pipeline->GetMetalGraphicsState(
               compiled_demote_msaa_srv_mask_lo,
               compiled_demote_msaa_srv_mask_hi);
-          if (!metal || !metal->pso || metal->use_geometry ||
-              metal->use_tessellation)
-            return false;
+          if (!metal || !metal->pso)
+            return CompiledCommandFallbackReason::MissingPipelineState;
+          if (metal->use_geometry)
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeUnsupportedGeometryPipeline
+                       : CompiledCommandFallbackReason::GeometryPipeline;
+          if (metal->use_tessellation)
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeUnsupportedTessellationPipeline
+                       : CompiledCommandFallbackReason::TessellationPipeline;
           if (packet.render_state.topology == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
-            return false;
+            return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
           auto metal_pso =
               packet.draw_indexed && packet.input_assembler.index_buffer
                   ? SelectGraphicsPipelineState(
@@ -7750,10 +7866,16 @@ private:
                   : SelectGraphicsPipelineState(*metal,
                                                 packet.render_state.topology);
           if (!metal_pso)
-            return false;
+            return CompiledCommandFallbackReason::MissingPipelineState;
           auto primitive = GetPrimitiveType(packet.render_state.topology);
           if (!primitive)
-            return false;
+            return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+
+          const auto vertex_buffer_reason =
+              ValidateCompiledVertexBufferResources(
+                  packet, pipeline->GetGraphicsState());
+          if (vertex_buffer_reason != CompiledCommandFallbackReason::None)
+            return vertex_buffer_reason;
 
           ReplayState attachment_state = {};
           attachment_state.resource_states = state.resource_states;
@@ -7769,13 +7891,14 @@ private:
           auto scissors = packet.render_state.scissors;
           if (!ResolveDynamicRasterRects(viewports, scissors,
                                          "compiled draw"))
-            return false;
+            return CompiledCommandFallbackReason::UnsupportedRenderTargetState;
 
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
                                    packet.root_descriptors);
           RecordCompiledDescriptorBackendStats(
-              dxmt::perf::currentFrameStatistics(), packet.root_tables);
+              dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
+              packet.root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           AddCompiledVertexBufferAccesses(
@@ -7788,8 +7911,6 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
-            replay_packet.common.binding_snapshot =
-                BuildCompiledGraphicsBindingSnapshot(packet, *pipeline, root);
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
@@ -7810,138 +7931,50 @@ private:
             replay_packet.instance_count = packet.draw->instance_count;
             replay_packet.base_instance =
                 packet.draw->start_instance_location;
-            CompiledDirectDrawPayload payload = {};
-            payload.draw = std::move(replay_packet);
-            payload.direct_access = direct_access;
-            RegisterCompiledDirectAccessList(payload.direct_access);
-            ReleaseCompiledDirectAccessListAfterSubmit(payload.direct_access);
+            replay_packet.common.compiled_binding_payload.emplace();
+            auto &binding_payload =
+                *replay_packet.common.compiled_binding_payload;
+            binding_payload.root_signature = packet.pipeline.root_signature;
+            binding_payload.root_tables = packet.root_tables;
+            binding_payload.input_assembler = packet.input_assembler;
+            binding_payload.native_root_base_buffer =
+                compiled->native_root_base_buffer;
+            binding_payload.native_vertex = packet.native_vertex;
+            binding_payload.native_pixel = packet.native_pixel;
+            replay_packet.common.compiled_binding_state = binding_state;
+            replay_packet.common.compiled_direct_access = direct_access;
+            RegisterCompiledDirectAccessList(
+                replay_packet.common.compiled_direct_access);
+            ReleaseCompiledDirectAccessListAfterSubmit(
+                replay_packet.common.compiled_direct_access);
             QueueCompiledGraphicsPassCommand(
                 chunk, state, std::move(attachments), argument_buffer_size,
-                std::move(payload),
-                [](CommandQueueImpl *queue, ArgumentEncodingContext &enc,
-                   void *payload, uint64_t &argbuf_offset) {
-                  auto &data =
-                      *static_cast<CompiledDirectDrawPayload *>(payload);
-                  auto &packet = data.draw;
-                  auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
-                  dxmt::perf::ScopedFrameDuration direct_scope(
-                      perf_stats,
-                      &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
-                  dxmt::perf::addFrameCounter(
-                      perf_stats,
-                      &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
-                  dxmt::perf::addFrameCounter(
-                      perf_stats,
-                      &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
-                  {
-                    dxmt::perf::ScopedFrameDuration retain_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
-                    for (const auto &allocation :
-                         data.direct_access.buffer_allocations)
-                      enc.retainAllocation(allocation.ptr());
-                  }
-                  {
-                    dxmt::perf::ScopedFrameDuration pipeline_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
-                    queue->EncodeRenderPipelineStateIfChanged(
-                        enc, packet.common.metal_pso);
-                  }
-                  auto *render_encoder = enc.currentRenderEncoder();
-                  render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
-                      packet.common.pixel_shader_demote_msaa_srv_mask_lo;
-                  render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
-                      packet.common.pixel_shader_demote_msaa_srv_mask_hi;
-                  auto &cache = render_encoder->dynamic_state_cache;
-                  const auto stencil_ref_u8 =
-                      static_cast<uint8_t>(packet.common.stencil_ref);
-                  if (packet.common.depth_stencil &&
-                      (!cache.depth_stencil_valid ||
-                       cache.depth_stencil.handle !=
-                           packet.common.depth_stencil.handle ||
-                       cache.stencil_ref != stencil_ref_u8)) {
-                    dxmt::perf::ScopedFrameDuration dsso_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
-                    auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
-                    cmd.type = WMTRenderCommandSetDSSO;
-                    cmd.dsso = packet.common.depth_stencil;
-                    cmd.stencil_ref = stencil_ref_u8;
-                    cache.depth_stencil = packet.common.depth_stencil;
-                    cache.stencil_ref = stencil_ref_u8;
-                    cache.depth_stencil_valid = true;
-                  }
-                  if (!cache.rasterizer_valid ||
-                      std::memcmp(&cache.rasterizer,
-                                  &packet.common.rasterizer,
-                                  sizeof(packet.common.rasterizer)) != 0) {
-                    dxmt::perf::ScopedFrameDuration rasterizer_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
-                    auto &rs =
-                        enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
-                    rs = packet.common.rasterizer;
-                    cache.rasterizer = packet.common.rasterizer;
-                    cache.rasterizer_valid = true;
-                  }
-                  if (packet.common.binding_snapshot &&
-                      packet.common.pipeline) {
-                    BindlessMirrorDrawDiag diag = {};
-                    queue->ApplyGraphicsBindingSnapshot(
-                        enc, *packet.common.binding_snapshot,
-                        *packet.common.pipeline, false, false,
-                        argbuf_offset, &diag);
-                    diag.path = "compiled-direct";
-                    packet.common.bindless_diag = diag;
-                  }
-                  {
-                    dxmt::perf::ScopedFrameDuration dynamic_state_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
-                    EncodeDynamicRenderState(
-                        enc, packet.common.viewports, packet.common.scissors,
-                        packet.common.blend_factor, packet.common.stencil_ref);
-                  }
-                  {
-                    dxmt::perf::ScopedFrameDuration body_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
-                    enc.resolveRenderPassBarrier();
-                    auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
-                    draw.type = WMTRenderCommandDraw;
-                    draw.primitive_type = *packet.common.primitive;
-                    draw.vertex_start = packet.vertex_start;
-                    draw.vertex_count = packet.vertex_count;
-                    draw.instance_count = packet.instance_count;
-                    draw.base_instance = packet.base_instance;
-                  }
-                  queue->RecordBindlessMirrorDiagDraw(packet.common.pipeline,
-                                                      packet.common.bindless_diag);
-                },
+                std::move(replay_packet), EncodeReplayDrawInstancedCompiled,
                 false, false, ReplayGraphicsCommandKind::Draw);
           } else {
             if (!packet.input_assembler.index_buffer ||
                 !IsSupportedIndexBufferFormat(
                     packet.input_assembler.index_buffer->Format))
-              return false;
+              return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
             Resource *index_resource = nullptr;
             const auto index_binding_offset = ResolveBufferGpuAddress(
                 packet.input_assembler.index_buffer->BufferLocation,
                 index_resource);
             if (!index_resource || !index_resource->GetBuffer())
-              return false;
+              return native_packet
+                         ? CompiledCommandFallbackReason::NativeUnsupportedDynamicResource
+                         : CompiledCommandFallbackReason::UnsupportedVertexIndexState;
             Rc<BufferAllocation> index_allocation =
                 index_resource->GetBufferAllocation();
             if (!index_allocation)
-              return false;
+              return native_packet
+                         ? CompiledCommandFallbackReason::NativeUnsupportedDynamicResource
+                         : CompiledCommandFallbackReason::UnsupportedVertexIndexState;
             ReplayDrawIndexedInstancedPacket replay_packet = {};
             replay_packet.common.metal_pso = metal_pso;
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
-            replay_packet.common.binding_snapshot =
-                BuildCompiledGraphicsBindingSnapshot(packet, *pipeline, root);
             replay_packet.common.binding_generation = packet.record_index + 1;
             replay_packet.common.descriptor_content_generation =
                 GetDescriptorContentGeneration();
@@ -7974,204 +8007,185 @@ private:
                 packet.draw_indexed->base_vertex_location;
             replay_packet.base_instance =
                 packet.draw_indexed->start_instance_location;
-            CompiledDirectIndexedDrawPayload payload = {};
-            payload.draw = std::move(replay_packet);
-            payload.direct_access = direct_access;
+            replay_packet.common.compiled_binding_payload.emplace();
+            auto &binding_payload =
+                *replay_packet.common.compiled_binding_payload;
+            binding_payload.root_signature = packet.pipeline.root_signature;
+            binding_payload.root_tables = packet.root_tables;
+            binding_payload.input_assembler = packet.input_assembler;
+            binding_payload.native_root_base_buffer =
+                compiled->native_root_base_buffer;
+            binding_payload.native_vertex = packet.native_vertex;
+            binding_payload.native_pixel = packet.native_pixel;
+            replay_packet.common.compiled_binding_state = binding_state;
+            replay_packet.common.compiled_direct_access = direct_access;
             if (index_allocation) {
               bool found_index = false;
               for (const auto &allocation :
-                   payload.direct_access.buffer_allocations) {
+                   replay_packet.common.compiled_direct_access
+                       .buffer_allocations) {
                 if (allocation.ptr() == index_allocation.ptr()) {
                   found_index = true;
                   break;
                 }
               }
               if (!found_index)
-                payload.direct_access.buffer_allocations.push_back(
-                    index_allocation);
+                replay_packet.common.compiled_direct_access.buffer_allocations
+                    .push_back(index_allocation);
             }
-            RegisterCompiledDirectAccessList(payload.direct_access);
-            ReleaseCompiledDirectAccessListAfterSubmit(payload.direct_access);
+            RegisterCompiledDirectAccessList(
+                replay_packet.common.compiled_direct_access);
+            ReleaseCompiledDirectAccessListAfterSubmit(
+                replay_packet.common.compiled_direct_access);
             QueueCompiledGraphicsPassCommand(
                 chunk, state, std::move(attachments), argument_buffer_size,
-                std::move(payload),
-                [](CommandQueueImpl *queue, ArgumentEncodingContext &enc,
-                   void *payload, uint64_t &argbuf_offset) {
-                  auto &data =
-                      *static_cast<CompiledDirectIndexedDrawPayload *>(payload);
-                  auto &packet = data.draw;
-                  auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
-                  dxmt::perf::ScopedFrameDuration direct_scope(
-                      perf_stats,
-                      &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
-                  dxmt::perf::addFrameCounter(
-                      perf_stats,
-                      &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
-                  dxmt::perf::addFrameCounter(
-                      perf_stats,
-                      &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets);
-                  {
-                    dxmt::perf::ScopedFrameDuration retain_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
-                    for (const auto &allocation :
-                         data.direct_access.buffer_allocations)
-                      enc.retainAllocation(allocation.ptr());
-                    enc.retainAllocation(packet.index_allocation.ptr());
-                  }
-                  {
-                    dxmt::perf::ScopedFrameDuration pipeline_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_pipeline_interval);
-                    queue->EncodeRenderPipelineStateIfChanged(
-                        enc, packet.common.metal_pso);
-                  }
-                  auto *render_encoder = enc.currentRenderEncoder();
-                  render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
-                      packet.common.pixel_shader_demote_msaa_srv_mask_lo;
-                  render_encoder->pixel_shader_demote_msaa_srv_mask_hi =
-                      packet.common.pixel_shader_demote_msaa_srv_mask_hi;
-                  auto &cache = render_encoder->dynamic_state_cache;
-                  const auto stencil_ref_u8 =
-                      static_cast<uint8_t>(packet.common.stencil_ref);
-                  if (packet.common.depth_stencil &&
-                      (!cache.depth_stencil_valid ||
-                       cache.depth_stencil.handle !=
-                           packet.common.depth_stencil.handle ||
-                       cache.stencil_ref != stencil_ref_u8)) {
-                    dxmt::perf::ScopedFrameDuration dsso_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_dsso_interval);
-                    auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
-                    cmd.type = WMTRenderCommandSetDSSO;
-                    cmd.dsso = packet.common.depth_stencil;
-                    cmd.stencil_ref = stencil_ref_u8;
-                    cache.depth_stencil = packet.common.depth_stencil;
-                    cache.stencil_ref = stencil_ref_u8;
-                    cache.depth_stencil_valid = true;
-                  }
-                  if (!cache.rasterizer_valid ||
-                      std::memcmp(&cache.rasterizer,
-                                  &packet.common.rasterizer,
-                                  sizeof(packet.common.rasterizer)) != 0) {
-                    dxmt::perf::ScopedFrameDuration rasterizer_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_rasterizer_interval);
-                    auto &rs =
-                        enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
-                    rs = packet.common.rasterizer;
-                    cache.rasterizer = packet.common.rasterizer;
-                    cache.rasterizer_valid = true;
-                  }
-                  if (packet.common.binding_snapshot &&
-                      packet.common.pipeline) {
-                    BindlessMirrorDrawDiag diag = {};
-                    queue->ApplyGraphicsBindingSnapshot(
-                        enc, *packet.common.binding_snapshot,
-                        *packet.common.pipeline, false, false,
-                        argbuf_offset, &diag);
-                    diag.path = "compiled-direct";
-                    packet.common.bindless_diag = diag;
-                  }
-                  {
-                    dxmt::perf::ScopedFrameDuration dynamic_state_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
-                    EncodeDynamicRenderState(
-                        enc, packet.common.viewports, packet.common.scissors,
-                        packet.common.blend_factor, packet.common.stencil_ref);
-                  }
-                  {
-                    dxmt::perf::ScopedFrameDuration body_scope(
-                        perf_stats,
-                        &dxmt::FrameStatistics::frame_compiled_draw_body_interval);
-                    enc.resolveRenderPassBarrier();
-                    auto &draw =
-                        enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
-                    draw.type = WMTRenderCommandDrawIndexed;
-                    draw.primitive_type = *packet.common.primitive;
-                    draw.index_type = packet.index_type;
-                    draw.index_count = packet.index_count;
-                    draw.index_buffer = packet.index_allocation->buffer();
-                    draw.index_buffer_offset = packet.index_offset;
-                    draw.instance_count = packet.instance_count;
-                    draw.base_vertex = packet.base_vertex;
-                    draw.base_instance = packet.base_instance;
-                  }
-                  queue->RecordBindlessMirrorDiagDraw(packet.common.pipeline,
-                                                      packet.common.bindless_diag);
-                },
+                std::move(replay_packet),
+                EncodeReplayDrawIndexedInstancedCompiled,
                 false, false, ReplayGraphicsCommandKind::DrawIndexed);
           }
           chunk = queue.CurrentChunk();
-          return true;
+          return CompiledCommandFallbackReason::None;
         };
 
     auto queue_compiled_compute_packet =
-        [&](const CompiledComputePacket &packet) -> bool {
+        [&](const CompiledComputePacket &packet)
+            -> CompiledCommandFallbackReason {
           if (!packet.dispatch.x || !packet.dispatch.y || !packet.dispatch.z)
-            return true;
+            return CompiledCommandFallbackReason::None;
           DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
                                                   ++replay_record_serial);
           if (packet.d3d_sequence != 0)
             dxmt::apitrace::set_current_d3d_sequence(packet.d3d_sequence);
+          const bool native_packet =
+              packet.pipeline.metadata.uses_native_descriptor_table_abi;
           auto *pipeline = packet.pipeline.metadata.pipeline;
           if (!pipeline)
             pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
           auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
-          if (!pipeline || !root)
-            return false;
-          auto *metal = packet.pipeline.metadata.metal_compute;
-          if (!metal || !metal->pso ||
-              !ValidateComputeDispatch(metal->threadgroup_size,
+          if (!pipeline)
+            return CompiledCommandFallbackReason::MissingPipelineState;
+          if (!root)
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeUnsupportedRootSignature
+                       : CompiledCommandFallbackReason::MissingRootSignature;
+          if (pipeline->GetShaderAbiVersion() !=
+              packet.pipeline.metadata.shader_abi_version)
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeShaderAbiMismatch
+                       : CompiledCommandFallbackReason::NonBindlessPipelineState;
+          if (pipeline->GetShaderAbiVersion() !=
+                  DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE &&
+              !pipeline->UsesBindlessMirror())
+            return native_packet
+                       ? CompiledCommandFallbackReason::NativeShaderAbiMismatch
+                       : CompiledCommandFallbackReason::NonBindlessPipelineState;
+          if (native_packet) {
+            if (!packet.root_constants.empty() ||
+                !packet.root_descriptors.empty() ||
+                !packet.native_compute.ready)
+              return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
+            if (!compiled->native_root_base_buffer &&
+                (packet.native_compute.cbuffer_root_base_count ||
+                 packet.native_compute.resource_root_base_count))
+              return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+            const auto backend_reason =
+                ValidateCompiledNativeDescriptorBackends(packet.root_tables);
+            if (backend_reason != CompiledCommandFallbackReason::None)
+              return backend_reason;
+          }
+          auto *metal = pipeline->GetMetalComputeState();
+          if (!metal || !metal->pso)
+            return CompiledCommandFallbackReason::MissingPipelineState;
+          if (!ValidateComputeDispatch(metal->threadgroup_size,
                                        packet.dispatch.x, packet.dispatch.y,
                                        packet.dispatch.z))
-            return false;
+            return CompiledCommandFallbackReason::UnsupportedCommand;
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
                                    packet.root_descriptors);
           RecordCompiledDescriptorBackendStats(
-              dxmt::perf::currentFrameStatistics(), packet.root_tables);
+              dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
+              packet.root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           RegisterCompiledDirectAccessList(direct_access);
           ReleaseCompiledDirectAccessListAfterSubmit(direct_access);
           const auto argument_buffer_size =
               EstimateComputeArgumentBufferSize(*pipeline);
+          ReplayDispatchPacket dispatch_packet = {};
+          dispatch_packet.metal_pso = metal->pso;
+          dispatch_packet.threadgroup_size = metal->threadgroup_size;
+          dispatch_packet.pipeline = pipeline;
+          dispatch_packet.dispatch = packet.dispatch;
+          dispatch_packet.argument_buffer_size = argument_buffer_size;
+          dispatch_packet.compiled_binding_payload.emplace();
+          auto &binding_payload =
+              *dispatch_packet.compiled_binding_payload;
+          binding_payload.packet = packet;
+          binding_payload.binding_state = std::move(binding_state);
+          binding_payload.direct_access = std::move(direct_access);
+          binding_payload.native_root_base_buffer =
+              compiled->native_root_base_buffer;
+          binding_payload.root = root;
           QueueComputePassCommand(
               chunk, state, argument_buffer_size,
-              [this, packet, binding_state, direct_access, pipeline, root,
-               metal_pso = metal->pso,
-               threadgroup_size = metal->threadgroup_size](
+              [this, dispatch_packet = std::move(dispatch_packet)](
                   ArgumentEncodingContext &enc,
                   uint64_t &argbuf_offset) mutable {
-                const bool perf_enabled = dxmt::perf::enabled();
-                const auto encode_begin =
-                    perf_enabled ? clock::now() : clock::time_point{};
-                auto &set_pso =
-                    enc.encodeComputeCommand<wmtcmd_compute_setpso>();
-                set_pso.type = WMTComputeCommandSetPSO;
-                set_pso.pso = metal_pso;
-                set_pso.threadgroup_size = threadgroup_size;
-                for (const auto &allocation :
-                     direct_access.buffer_allocations)
-                  enc.retainAllocation(allocation.ptr());
-                EncodeCompiledComputeBindings(enc, packet, binding_state,
-                                              *pipeline, *root,
-                                              argbuf_offset);
-                auto &dispatch =
-                    enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
-                dispatch.type = WMTComputeCommandDispatch;
-                dispatch.size = {packet.dispatch.x, packet.dispatch.y,
-                                 packet.dispatch.z};
-                if (perf_enabled) {
-                  dxmt::perf::recordCompiledDispatchEncodeTime(
-                      &enc.currentFrameStatistics(),
-                      clock::now() - encode_begin);
-                }
-              });
+                EncodeReplayDispatchPacket(enc, dispatch_packet,
+                                           argbuf_offset);
+              }, true);
           chunk = queue.CurrentChunk();
-          return true;
+          return CompiledCommandFallbackReason::None;
+        };
+
+    auto record_fallback_range =
+        [&](UINT begin, UINT count, dxmt::CompiledFallbackReason reason) {
+          if (!dxmt::perf::enabled())
+            return;
+          uint64_t graphics_packets = 0;
+          uint64_t compute_packets = 0;
+          const UINT end = std::min<UINT>(
+              begin + count, static_cast<UINT>(records.size()));
+          for (UINT i = begin; i < end; i++) {
+            const auto &payload = records[i].payload;
+            if (std::holds_alternative<DrawInstancedRecord>(payload) ||
+                std::holds_alternative<DrawIndexedInstancedRecord>(payload)) {
+              graphics_packets++;
+              continue;
+            }
+            if (std::holds_alternative<DispatchRecord>(payload)) {
+              compute_packets++;
+              continue;
+            }
+            const auto *indirect =
+                std::get_if<ExecuteIndirectRecord>(&payload);
+            if (!indirect)
+              continue;
+            auto *signature = dynamic_cast<CommandSignature *>(
+                indirect->command_signature.ptr());
+            bool compute = false;
+            if (signature) {
+              for (const auto &argument : signature->GetArguments()) {
+                if (argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+                  compute = true;
+                  break;
+                }
+              }
+            }
+            if (compute)
+              compute_packets++;
+            else
+              graphics_packets++;
+          }
+
+          auto *stats = &queue.CurrentFrameStatistics();
+          if (graphics_packets)
+            dxmt::perf::recordFallbackGraphicsPackets(
+                stats, graphics_packets, reason);
+          if (compute_packets)
+            dxmt::perf::recordFallbackComputePackets(
+                stats, compute_packets, reason);
         };
 
     auto compiled_list_is_valid = [&]() {
@@ -8202,11 +8216,15 @@ private:
           for (UINT i = 0; i < segment.graphics_packet_count; i++) {
             const auto &packet =
                 compiled->graphics_packets[segment.first_graphics_packet + i];
-            if (!queue_compiled_graphics_packet(packet)) {
-              if (auto *stats = dxmt::perf::currentFrameStatistics())
-                dxmt::perf::recordFallbackGraphicsPackets(
-                    stats, 1, dxmt::CompiledFallbackReason::Unknown);
-              replay_range(segment.first_record_index, segment.record_count);
+            const auto fallback_reason =
+                queue_compiled_graphics_packet(packet);
+            if (fallback_reason != CompiledCommandFallbackReason::None) {
+              const auto perf_reason =
+                  CompiledCommandFallbackReasonToPerf(fallback_reason);
+              record_fallback_range(segment.first_record_index,
+                                    segment.record_count, perf_reason);
+              replay_range(segment.first_record_index, segment.record_count,
+                           perf_reason);
             }
           }
           break;
@@ -8214,22 +8232,32 @@ private:
           for (UINT i = 0; i < segment.compute_packet_count; i++) {
             const auto &packet =
                 compiled->compute_packets[segment.first_compute_packet + i];
-            if (!queue_compiled_compute_packet(packet)) {
-              if (auto *stats = dxmt::perf::currentFrameStatistics())
-                dxmt::perf::recordFallbackComputePackets(
-                    stats, 1, dxmt::CompiledFallbackReason::Unknown);
-              replay_range(segment.first_record_index, segment.record_count);
+            const auto fallback_reason = queue_compiled_compute_packet(packet);
+            if (fallback_reason != CompiledCommandFallbackReason::None) {
+              const auto perf_reason =
+                  CompiledCommandFallbackReasonToPerf(fallback_reason);
+              record_fallback_range(segment.first_record_index,
+                                    segment.record_count, perf_reason);
+              replay_range(segment.first_record_index, segment.record_count,
+                           perf_reason);
             }
           }
           break;
         case CompiledCommandSegmentKind::Fallback:
         default:
-          replay_range(segment.first_record_index, segment.record_count);
+          record_fallback_range(segment.first_record_index,
+                                segment.record_count,
+                                segment.perf_fallback_reason);
+          replay_range(segment.first_record_index, segment.record_count,
+                       segment.perf_fallback_reason);
           break;
         }
       }
     } else {
-      replay_range(0, static_cast<UINT>(records.size()));
+      record_fallback_range(0, static_cast<UINT>(records.size()),
+                            dxmt::CompiledFallbackReason::MissingCompiledEncoder);
+      replay_range(0, static_cast<UINT>(records.size()),
+                   dxmt::CompiledFallbackReason::MissingCompiledEncoder);
     }
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: replay records flush begin"
@@ -8646,6 +8674,9 @@ private:
       FlushPassBatches(chunk, state);
       TouchReplayResource(state, record.resource.ptr());
       ReplayDiscardResource(chunk, record);
+    } else if constexpr (std::is_same_v<T, ClearStateRecord>) {
+      FlushPassBatches(chunk, state);
+      ResetReplayApiState(state, record.pipeline_state.ptr());
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
       state.pipeline_state = record.pipeline_state;
       BumpGraphicsBindingGeneration(
@@ -9888,6 +9919,47 @@ private:
     }
     slot->valid = true;
     slot->address = record.address;
+  }
+
+  void ResetReplayApiState(ReplayState &state,
+                           ID3D12PipelineState *pipeline_state) {
+    state.pipeline_state = pipeline_state;
+    state.graphics_root_signature = nullptr;
+    state.compute_root_signature = nullptr;
+    state.graphics_root_signature_impl = nullptr;
+    state.compute_root_signature_impl = nullptr;
+    state.topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+    state.viewports.clear();
+    state.scissors.clear();
+    state.blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+    state.stencil_ref = 0;
+    state.render_targets.clear();
+    state.depth_stencil.reset();
+    state.vertex_buffers = {};
+    state.index_buffer.reset();
+    state.resolved_vertex_buffers = {};
+    state.resolved_index_buffer = {};
+    state.cbv_srv_uav_heap = nullptr;
+    state.sampler_heap = nullptr;
+    state.graphics_tables = {};
+    state.compute_tables = {};
+    state.graphics_root_constants = {};
+    state.compute_root_constants = {};
+    state.graphics_cbv_roots = {};
+    state.compute_cbv_roots = {};
+    state.graphics_srv_roots = {};
+    state.compute_srv_roots = {};
+    state.graphics_uav_roots = {};
+    state.compute_uav_roots = {};
+    state.has_last_snapshot_request_generation = false;
+    state.last_snapshot_request_graphics_generation = 0;
+    state.last_snapshot_request_descriptor_generation = 0;
+    state.da_cache.clear();
+    state.predication_buffer = nullptr;
+    state.predication_buffer_offset = 0;
+    state.predication_operation = D3D12_PREDICATION_OP_EQUAL_ZERO;
+    BumpGraphicsBindingGeneration(
+        state, GraphicsBindingGenerationBumpSource::PipelineState);
   }
 
   void StoreRootConstants(ReplayState &state, const RootConstantsRecord &record) {
@@ -11358,12 +11430,11 @@ private:
       else
         return state.graphics_root_constants[root_index];
     }();
-    if (!slot.valid || slot.values.empty())
-      return;
 
     const auto declared_count = parameter.constants.Num32BitValues;
     const auto actual_count =
-        std::max<uint32_t>(declared_count, uint32_t(slot.values.size()));
+        std::max<uint32_t>(declared_count,
+                           slot.valid ? uint32_t(slot.values.size()) : 0u);
     if (!actual_count)
       return;
 
@@ -11374,9 +11445,12 @@ private:
     if (!constants.mapped || !constants.gpu_buffer)
       return;
     std::memset(constants.mapped, 0, constants.length);
-    std::memcpy(constants.mapped, slot.values.data(),
-                std::min<uint64_t>(uint64_t(slot.values.size()) * sizeof(UINT),
-                                   constants.length));
+    if (slot.valid && !slot.values.empty()) {
+      std::memcpy(constants.mapped, slot.values.data(),
+                  std::min<uint64_t>(
+                      uint64_t(slot.values.size()) * sizeof(UINT),
+                      constants.length));
+    }
     if (constants.needs_flush)
       constants.gpu_buffer.updateContents(constants.offset, constants.mapped,
                                           constants.length);
@@ -11505,6 +11579,9 @@ private:
                                   UINT range_offset, UINT descriptor_index,
                                   UINT descriptor_count,
                                   D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
+    if (descriptor_count && descriptor_index >= descriptor_count)
+      return nullptr;
+
     const auto total_offset = range_offset + descriptor_index;
     if (total_offset < range_offset) {
       WARN("D3D12CommandQueue: descriptor table offset overflow");
@@ -11518,15 +11595,6 @@ private:
         GetBoundDescriptorRecordFromHeap(descriptor_heap, handle, heap_type);
     if (!descriptor)
       return nullptr;
-    if (descriptor_count &&
-        (descriptor->heap_index >= descriptor->heap_count ||
-         descriptor_count - descriptor_index >
-             descriptor->heap_count - descriptor->heap_index)) {
-      WARN("D3D12CommandQueue: descriptor table range exceeds heap start=",
-           descriptor->heap_index, " index=", descriptor_index,
-           " count=", descriptor_count, " heap_count=", descriptor->heap_count);
-      return nullptr;
-    }
     return descriptor;
   }
 
@@ -12955,6 +13023,30 @@ private:
     std::vector<BindlessMirrorStaticSamplerPlanEntry> static_samplers;
   };
 
+  struct NativeRootBaseStagePlanEntry {
+    uint32_t root_index = 0;
+    uint32_t range_offset = 0;
+    uint32_t descriptor_index = 0;
+    uint32_t descriptor_count = 0;
+    uint32_t argument_local_start = 0;
+    uint32_t root_base_key = 0;
+    uint32_t range_count = 0;
+    uint16_t argument_index = 0;
+    D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    bool cbuffer = false;
+  };
+
+  struct NativeRootBaseStagePlan {
+    const void *root_sig = nullptr;
+    const void *pso = nullptr;
+    PipelineStage stage = PipelineStage::Vertex;
+    bool compute = false;
+    uint32_t max_resource_key_plus_one = 0;
+    uint32_t max_cbuffer_key_plus_one = 0;
+    std::vector<NativeRootBaseStagePlanEntry> entries;
+  };
+
   static bool IsBindlessTextureMirrorArgument(
       const MTL_SM50_SHADER_ARGUMENT &arg) {
     return (arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
@@ -13931,6 +14023,165 @@ private:
     return plan;
   }
 
+  NativeRootBaseStagePlan
+  BuildNativeRootBaseStagePlan(const PipelineState &pipeline,
+                               const RootSignature &root,
+                               PipelineStage want_stage, bool compute) {
+    NativeRootBaseStagePlan plan = {};
+    plan.root_sig = &root;
+    plan.pso = &pipeline;
+    plan.stage = want_stage;
+    plan.compute = compute;
+
+    const auto *shader = FindShaderForStage(pipeline, want_stage);
+    if (!shader)
+      return plan;
+    const auto parameters = root.GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        continue;
+      bool visible = false;
+      ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
+        if (s == want_stage)
+          visible = true;
+      });
+      if (!visible)
+        continue;
+
+      UINT running_offset = 0;
+      for (const auto &range : parameter.ranges) {
+        const auto range_offset = DescriptorRangeOffset(range, running_offset);
+        const auto descriptor_count =
+            range.descriptor_count == UINT_MAX
+                ? ReflectedDescriptorRangeCount(
+                      pipeline, range, parameter.visibility, compute)
+                : range.descriptor_count;
+        const auto binding_type = BindingTypeForRange(range.range_type);
+        const bool cbuffer = binding_type == SM50BindingType::ConstantBuffer;
+        const auto *arguments =
+            cbuffer ? shader->constantBufferInfo()
+                    : shader->resourceArgumentInfo();
+        const auto argument_count =
+            cbuffer ? shader->reflection().NumConstantBuffers
+                    : shader->reflection().NumArguments;
+        if (arguments && argument_count) {
+          for (UINT i = 0; i < argument_count; i++) {
+            const auto &argument = arguments[i];
+            if (argument.Type != binding_type)
+              continue;
+            const auto space =
+                argument.RegisterCount ? argument.RegisterSpace : 0;
+            const auto lower = argument.RegisterCount
+                                   ? argument.RegisterLowerBound
+                                   : argument.SM50BindingSlot;
+            const auto argument_range_count =
+                ShaderArgumentRangeCount(argument);
+            const auto overlap = IntersectDescriptorRangeWithShaderArgument(
+                lower, argument_range_count, range.base_shader_register,
+                descriptor_count);
+            if (space != range.register_space || !overlap)
+              continue;
+
+            const auto key = argument.StructurePtrOffset;
+            if (cbuffer)
+              plan.max_cbuffer_key_plus_one =
+                  std::max<uint32_t>(plan.max_cbuffer_key_plus_one, key + 1);
+            else
+              plan.max_resource_key_plus_one =
+                  std::max<uint32_t>(plan.max_resource_key_plus_one, key + 1);
+
+            plan.entries.push_back(NativeRootBaseStagePlanEntry{
+                root_index,
+                range_offset,
+                overlap->descriptor_index,
+                descriptor_count,
+                overlap->argument_local_start,
+                key,
+                overlap->count,
+                uint16_t(i),
+                range.range_type,
+                DescriptorHeapTypeForRange(range.range_type),
+                cbuffer});
+          }
+        }
+
+        if (range.descriptor_count != UINT_MAX)
+          running_offset = range_offset + range.descriptor_count;
+      }
+    }
+    return plan;
+  }
+
+  std::shared_ptr<const NativeRootBaseStagePlan>
+  GetNativeRootBaseStagePlan(const PipelineState &pipeline,
+                             const RootSignature &root,
+                             PipelineStage want_stage, bool compute) {
+    uint64_t key =
+        uint64_t(reinterpret_cast<uintptr_t>(&root)) * 0x9e3779b97f4a7c15ull;
+    key ^= uint64_t(reinterpret_cast<uintptr_t>(&pipeline)) +
+           0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= uint64_t(want_stage) + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+    key ^= uint64_t(compute ? 1 : 0) + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+
+    std::lock_guard lock(native_stage_plan_cache_mutex_);
+    auto it = native_stage_plan_cache_.find(key);
+    if (it != native_stage_plan_cache_.end() && it->second &&
+        it->second->root_sig == &root && it->second->pso == &pipeline &&
+        it->second->stage == want_stage && it->second->compute == compute)
+      return it->second;
+
+    auto plan = std::make_shared<NativeRootBaseStagePlan>(
+        BuildNativeRootBaseStagePlan(pipeline, root, want_stage, compute));
+    native_stage_plan_cache_[key] = plan;
+    return plan;
+  }
+
+  template <typename State>
+  AllocatedArgumentBufferSlice
+  BuildNativeRootTableBases(ArgumentEncodingContext &enc, const State &state,
+                            const PipelineState &pipeline,
+                            const RootSignature &root,
+                            PipelineStage want_stage, bool compute,
+                            bool cbuffer) {
+    const auto plan =
+        GetNativeRootBaseStagePlan(pipeline, root, want_stage, compute);
+    const uint32_t max_key_plus_one =
+        cbuffer ? plan->max_cbuffer_key_plus_one
+                : plan->max_resource_key_plus_one;
+    if (!max_key_plus_one)
+      return {};
+
+    auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), uint64_t(max_key_plus_one) * sizeof(uint32_t));
+    if (!slice.mapped || !slice.gpu_buffer)
+      return {};
+
+    auto *root_bases = static_cast<uint32_t *>(slice.mapped);
+    std::memset(root_bases, 0, slice.length);
+    for (const auto &entry : plan->entries) {
+      if (entry.cbuffer != cbuffer || entry.root_base_key >= max_key_plus_one)
+        continue;
+      const auto base_handle = GetTableHandle(state, compute, entry.root_index);
+      if (!base_handle.ptr)
+        continue;
+      auto *heap = GetBoundDescriptorHeap(state, entry.heap_type);
+      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+          heap, base_handle, entry.range_offset, entry.descriptor_index,
+          entry.descriptor_count, entry.heap_type);
+      if (!descriptor || descriptor->heap_index < entry.argument_local_start)
+        continue;
+      root_bases[entry.root_base_key] =
+          descriptor->heap_index - entry.argument_local_start;
+    }
+    if (slice.needs_flush)
+      slice.gpu_buffer.updateContents(slice.offset, slice.mapped,
+                                      slice.length);
+    return slice;
+  }
+
   // Bindless-mirror: build the per-draw slot-28 root_offsets for ONE shader
   // stage. root_offsets[arg.StructurePtrOffset] is the compact mirror-window
   // base assigned by BindlessMirrorStagePlan; descriptor heap slots are copied
@@ -14577,12 +14828,11 @@ private:
       return;
     const auto &slot = compute ? state.compute_root_constants[root_index]
                                : state.graphics_root_constants[root_index];
-    if (!slot.valid || slot.values.empty())
-      return;
 
     const auto declared_count = parameter.constants.Num32BitValues;
     const auto actual_count =
-        std::max<uint32_t>(declared_count, uint32_t(slot.values.size()));
+        std::max<uint32_t>(declared_count,
+                           slot.valid ? uint32_t(slot.values.size()) : 0u);
     if (!actual_count)
       return;
 
@@ -14609,7 +14859,8 @@ private:
       entry.register_space = parameter.constants.RegisterSpace;
       entry.debug_size = uint64_t(actual_count) * sizeof(UINT);
       entry.debug_kind = "root-constants";
-      entry.constants = slot.values;
+      if (slot.valid)
+        entry.constants = slot.values;
       entry.constant_count = actual_count;
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
@@ -14676,46 +14927,66 @@ private:
     snapshot.pipeline_state = state.pipeline_state;
     snapshot.root_signature = state.graphics_root_signature;
     snapshot.root_signature_impl = state.graphics_root_signature_impl;
+    snapshot.native =
+        pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+    if (snapshot.native) {
+      snapshot.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
+      snapshot.sampler_heap = state.sampler_heap;
+      snapshot.graphics_tables = state.graphics_tables;
+    }
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.root_signature.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.pipeline_state.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint, &pipeline);
+    if (snapshot.native) {
+      HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                                 snapshot.cbv_srv_uav_heap.ptr());
+      HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                                 snapshot.sampler_heap.ptr());
+      for (UINT i = 0; i < snapshot.graphics_tables.size(); i++) {
+        if (!snapshot.graphics_tables[i].ptr)
+          continue;
+        HashGraphicsBindingValue(snapshot.content_fingerprint, i);
+        HashGraphicsBindingValue(snapshot.content_fingerprint,
+                                 snapshot.graphics_tables[i].ptr);
+      }
+    }
 
     auto *root = state.graphics_root_signature_impl;
-    if (!root)
-      return snapshot;
+    if (root && !snapshot.native) {
+      // Bindless snapshots rebuild root offsets and mirror windows from the
+      // captured descriptors because deferred draws have no live ReplayState.
+      snapshot.bindless = pipeline.UsesBindlessMirror();
 
-    // Bindless-mirror (③.3): root_offsets and mirror buffers are resolved at apply from
-    // the captured descriptors. The flag records that this PSO should use the snapshot
-    // bindless ABI instead of legacy packed argument buffers.
-    if (pipeline.UsesBindlessMirror())
-      snapshot.bindless = true;
+      CaptureDescriptorTableBindings(
+          snapshot, state, pipeline,
+          GetDescriptorTableBindingRecipe(pipeline, *root, false), false);
 
-    CaptureDescriptorTableBindings(
-        snapshot, state, pipeline,
-        GetDescriptorTableBindingRecipe(pipeline, *root, false), false);
-
-    const auto parameters = root->GetParameters();
-    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
-      const auto &parameter = parameters[root_index];
-      if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-        continue;
-      if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-        CaptureGraphicsRootConstants(snapshot, state, pipeline, root_index,
-                                     parameter);
-      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
-        CaptureGraphicsRootDescriptor(snapshot, state, pipeline, root_index,
-                                      parameter,
-                                      DescriptorRecordType::ConstantBufferView);
-      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
-        CaptureGraphicsRootDescriptor(snapshot, state, pipeline, root_index,
-                                      parameter,
-                                      DescriptorRecordType::ShaderResourceView);
-      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
-        CaptureGraphicsRootDescriptor(snapshot, state, pipeline, root_index,
-                                      parameter,
-                                      DescriptorRecordType::UnorderedAccessView);
+      const auto parameters = root->GetParameters();
+      for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+        const auto &parameter = parameters[root_index];
+        if (parameter.parameter_type ==
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+          continue;
+        if (parameter.parameter_type ==
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+          CaptureGraphicsRootConstants(snapshot, state, pipeline, root_index,
+                                       parameter);
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+          CaptureGraphicsRootDescriptor(
+              snapshot, state, pipeline, root_index, parameter,
+              DescriptorRecordType::ConstantBufferView);
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+          CaptureGraphicsRootDescriptor(
+              snapshot, state, pipeline, root_index, parameter,
+              DescriptorRecordType::ShaderResourceView);
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+          CaptureGraphicsRootDescriptor(
+              snapshot, state, pipeline, root_index, parameter,
+              DescriptorRecordType::UnorderedAccessView);
+        }
       }
     }
 
@@ -15076,6 +15347,13 @@ private:
                                     const PipelineDxilShader &shader,
                                     const std::string &shader_key,
                                     uint64_t &argbuf_offset) {
+    if constexpr (Stage == PipelineStage::Compute) {
+      enc.invalidateNativeArgumentBuffers(true);
+    } else if constexpr (Stage == PipelineStage::Vertex) {
+      enc.invalidateNativeArgumentBuffers(false, WMTRenderStageVertex);
+    } else if constexpr (Stage == PipelineStage::Pixel) {
+      enc.invalidateNativeArgumentBuffers(false, WMTRenderStageFragment);
+    }
     const auto &reflection = shader.reflection();
     if (reflection.NumConstantBuffers && shader.constantBufferInfo()) {
       const auto offset =
@@ -15138,6 +15416,23 @@ private:
                                             const std::string &shader_key,
                                             bool compute,
                                             BindlessMirrorDrawDiag *draw_diag = nullptr) {
+    if (pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
+      auto cbuffer_root_bases = BuildNativeRootTableBases(
+          enc, state, pipeline, root, Stage, compute, /*cbuffer=*/true);
+      auto resource_root_bases = BuildNativeRootTableBases(
+          enc, state, pipeline, root, Stage, compute, /*cbuffer=*/false);
+      enc.bindNativeRootTableBases<Stage>(
+          cbuffer_root_bases,
+          DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX);
+      enc.bindNativeRootTableBases<Stage>(
+          resource_root_bases,
+          DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX);
+      (void)shader;
+      (void)shader_key;
+      (void)draw_diag;
+      return;
+    }
     const auto &reflection = shader.reflection();
     const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
         CurrentPixelShaderMsaaSrvDemoteMasks<Stage>(enc);
@@ -15591,12 +15886,12 @@ private:
   }
 
   template <typename Fn>
-  static void ForEachCompiledArgumentTable(
+  static void ForEachCompiledDescriptorMirror(
       const std::vector<CompiledCommandRootDescriptorTable> &tables, Fn &&fn) {
     DescriptorHeapMirror *resource_mirror = nullptr;
     DescriptorHeapMirror *sampler_mirror = nullptr;
     for (const auto &table : tables) {
-      if (!table.argument_table_ready || !table.mirror)
+      if (!table.mirror)
         continue;
       if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
         if (!sampler_mirror)
@@ -15609,6 +15904,58 @@ private:
       fn(*resource_mirror);
     if (sampler_mirror && sampler_mirror != resource_mirror)
       fn(*sampler_mirror);
+  }
+
+  static CompiledCommandFallbackReason ValidateCompiledNativeDescriptorBackends(
+      const std::vector<CompiledCommandRootDescriptorTable> &tables) {
+    for (const auto &table : tables) {
+      if (!table.resolved || !table.owning_heap || !table.mirror ||
+          !table.native_root_table_base_ready)
+        return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+
+      auto *heap = dynamic_cast<DescriptorHeap *>(table.owning_heap.ptr());
+      if (!heap || heap->GetMirror() != table.mirror ||
+          !table.descriptor_table_backend_ready ||
+          !table.mirror->descriptorTableBackendReady())
+        return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+
+      if (table.heap_index > table.mirror->numDescriptors() ||
+          table.descriptor_count >
+              table.mirror->numDescriptors() - table.heap_index)
+        return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+
+      if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+          (!table.native_descriptor_record_storage_ready ||
+           !table.native_buffer_resource_table_ready ||
+           !table.mirror->nativeDescriptorRecordStorageReady()))
+        return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+    }
+    return CompiledCommandFallbackReason::None;
+  }
+
+  CompiledCommandFallbackReason ValidateCompiledVertexBufferResources(
+      const CompiledGraphicsPacket &packet,
+      const PipelineGraphicsState *graphics_state) {
+    if (!graphics_state)
+      return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+
+    uint32_t slot_mask = 0;
+    for (const auto &element : graphics_state->input_elements) {
+      if (element.InputSlot < 32)
+        slot_mask |= 1u << element.InputSlot;
+    }
+    for (const auto &vb : packet.input_assembler.vertex_buffers) {
+      if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
+        continue;
+      Resource *resource = nullptr;
+      ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
+      if (!resource || !resource->GetBuffer() ||
+          !resource->GetBufferAllocation())
+        return packet.pipeline.metadata.uses_native_descriptor_table_abi
+                   ? CompiledCommandFallbackReason::NativeUnsupportedDynamicResource
+                   : CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+    }
+    return CompiledCommandFallbackReason::None;
   }
 
   static void RecordCompiledDescriptorBackendStats(
@@ -15631,57 +15978,63 @@ private:
     }
   }
 
-  void EncodeCompiledArgumentTables(
+  void EncodeCompiledNativeArgumentTables(
       ArgumentEncodingContext &enc,
       const std::vector<CompiledCommandRootDescriptorTable> &tables,
       bool compute, WMTRenderStages render_stages) {
-    const bool perf_enabled = dxmt::perf::enabled();
-    const auto bind_begin =
-        perf_enabled ? clock::now() : clock::time_point{};
-    ForEachCompiledArgumentTable(tables, [&](DescriptorHeapMirror &mirror) {
-      if (!mirror.argumentTable())
+    ForEachCompiledDescriptorMirror(tables, [&](DescriptorHeapMirror &mirror) {
+      if (!mirror.descriptorTableBackendReady())
         return;
-      if (compute) {
-        auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_setargumenttable>();
-        cmd.type = WMTComputeCommandSetArgumentTable;
-        cmd.table = mirror.argumentTable().handle;
-        if (mirror.buffer()) {
-          auto &use = enc.encodeComputeCommand<wmtcmd_compute_useresource>();
-          use.type = WMTComputeCommandUseResource;
-          use.resource = mirror.buffer().handle;
-          use.usage = WMTResourceUsageRead;
-        }
-        if (mirror.descriptorTableBuffer()) {
-          auto &use = enc.encodeComputeCommand<wmtcmd_compute_useresource>();
-          use.type = WMTComputeCommandUseResource;
-          use.resource = mirror.descriptorTableBuffer().handle;
-          use.usage = WMTResourceUsageRead;
-        }
-      } else {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setargumenttable>();
-        cmd.type = WMTRenderCommandSetArgumentTable;
-        cmd.table = mirror.argumentTable().handle;
-        cmd.stages = render_stages;
-        if (mirror.buffer()) {
-          auto &use = enc.encodeRenderCommand<wmtcmd_render_useresource>();
-          use.type = WMTRenderCommandUseResource;
-          use.resource = mirror.buffer().handle;
-          use.usage = WMTResourceUsageRead;
-          use.stages = render_stages;
-        }
-        if (mirror.descriptorTableBuffer()) {
-          auto &use = enc.encodeRenderCommand<wmtcmd_render_useresource>();
-          use.type = WMTRenderCommandUseResource;
-          use.resource = mirror.descriptorTableBuffer().handle;
-          use.usage = WMTResourceUsageRead;
-          use.stages = render_stages;
-        }
-      }
+      enc.bindNativeArgumentBuffer(
+          mirror.descriptorTableBuffer(), 0,
+          mirror.isSamplerHeap()
+              ? DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX
+              : DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX,
+          compute, render_stages);
+      if (mirror.isSamplerHeap())
+        return;
+      enc.bindNativeArgumentBuffer(
+          mirror.bufferResourceTableBuffer(), 0,
+          DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX, compute,
+          render_stages);
+      enc.bindNativeArgumentBuffer(
+          mirror.bufferDescriptorRecordBuffer(), 0,
+          DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX, compute,
+          render_stages);
     });
-    if (perf_enabled) {
-      dxmt::perf::recordArgumentTableBindTime(
-          &enc.currentFrameStatistics(), clock::now() - bind_begin);
-    }
+  }
+
+  template <typename State>
+  void EncodeNativeArgumentTables(ArgumentEncodingContext &enc,
+                                  const State &state, bool compute,
+                                  WMTRenderStages render_stages) {
+    auto encode_mirror = [&](DescriptorHeapMirror *mirror) {
+      if (!mirror || !mirror->descriptorTableBackendReady())
+        return;
+      enc.bindNativeArgumentBuffer(
+          mirror->descriptorTableBuffer(), 0,
+          mirror->isSamplerHeap()
+              ? DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX
+              : DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX,
+          compute, render_stages);
+      if (mirror->isSamplerHeap())
+        return;
+      enc.bindNativeArgumentBuffer(
+          mirror->bufferResourceTableBuffer(), 0,
+          DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX, compute,
+          render_stages);
+      enc.bindNativeArgumentBuffer(
+          mirror->bufferDescriptorRecordBuffer(), 0,
+          DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX, compute,
+          render_stages);
+    };
+
+    auto *resource_heap = dynamic_cast<DescriptorHeap *>(state.cbv_srv_uav_heap.ptr());
+    auto *sampler_heap = dynamic_cast<DescriptorHeap *>(state.sampler_heap.ptr());
+    if (resource_heap)
+      encode_mirror(resource_heap->GetMirror());
+    if (sampler_heap)
+      encode_mirror(sampler_heap->GetMirror());
   }
 
   DescriptorRecord BuildCompiledRootDescriptorRecord(
@@ -15738,13 +16091,13 @@ private:
     if (root_index >= state.root_constants.size())
       return;
     const auto &slot = state.root_constants[root_index];
-    if (!slot.valid || slot.values.empty())
-      return;
 
     const auto declared_count = parameter.constants.Num32BitValues;
     const auto actual_count =
         std::max<uint32_t>(declared_count,
-                           slot.dst_offset + uint32_t(slot.values.size()));
+                           slot.valid
+                               ? slot.dst_offset + uint32_t(slot.values.size())
+                               : 0u);
     if (!actual_count)
       return;
 
@@ -15756,7 +16109,8 @@ private:
       return;
     std::memset(constants.mapped, 0, constants.length);
     const auto dst_byte_offset = uint64_t(slot.dst_offset) * sizeof(UINT);
-    if (dst_byte_offset < constants.length) {
+    if (slot.valid && !slot.values.empty() &&
+        dst_byte_offset < constants.length) {
       std::memcpy(static_cast<uint8_t *>(constants.mapped) + dst_byte_offset,
                   slot.values.data(),
                   std::min<uint64_t>(
@@ -16135,7 +16489,38 @@ private:
       const PipelineState &pipeline, const RootSignature &root,
       const PipelineDxilShader &shader, const std::string &shader_key,
       bool compute, uint64_t &argbuf_offset,
+      WMT::Buffer native_root_base_buffer = {},
+      const CompiledNativeStageBinding *native_binding = nullptr,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
+    if (pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
+      if (!native_binding || !native_binding->ready)
+        return;
+      constexpr WMTRenderStages render_stages =
+          Stage == PipelineStage::Vertex
+              ? WMTRenderStageVertex
+              : Stage == PipelineStage::Pixel ? WMTRenderStageFragment
+                                               : WMTRenderStages{};
+      if (native_binding->cbuffer_root_base_count) {
+        enc.bindNativeArgumentBuffer(
+            native_root_base_buffer,
+            native_binding->cbuffer_root_base_offset,
+            DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX, compute,
+            render_stages);
+      }
+      if (native_binding->resource_root_base_count) {
+        enc.bindNativeArgumentBuffer(
+            native_root_base_buffer,
+            native_binding->resource_root_base_offset,
+            DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX, compute,
+            render_stages);
+      }
+      (void)shader;
+      (void)shader_key;
+      (void)argbuf_offset;
+      (void)draw_diag;
+      return;
+    }
     const auto &reflection = shader.reflection();
     auto bindings = BuildCompiledBindlessBufferTableBindings(
         tables, pipeline, root, Stage, compute);
@@ -16160,10 +16545,11 @@ private:
     (void)argbuf_offset;
   }
 
-  void EncodeCompiledVertexBuffers(ArgumentEncodingContext &enc,
-                                   const CompiledGraphicsPacket &packet,
-                                   const PipelineGraphicsState *graphics_state,
-                                   uint64_t &argbuf_offset) {
+  void EncodeCompiledVertexBuffers(
+      ArgumentEncodingContext &enc,
+      const CompiledCommandInputAssemblerState &input_assembler,
+      const PipelineGraphicsState *graphics_state,
+      uint64_t &argbuf_offset) {
     if (!graphics_state)
       return;
 
@@ -16175,7 +16561,7 @@ private:
     if (!slot_mask)
       return;
 
-    for (const auto &vb : packet.input_assembler.vertex_buffers) {
+    for (const auto &vb : input_assembler.vertex_buffers) {
       if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
         continue;
       Resource *resource = nullptr;
@@ -16194,7 +16580,8 @@ private:
   }
 
   void EncodeCompiledGraphicsBindings(
-      ArgumentEncodingContext &enc, const CompiledGraphicsPacket &packet,
+      ArgumentEncodingContext &enc,
+      const CompiledDirectGraphicsBindingPayload &payload,
       const CompiledPacketBindingState &binding_state,
       PipelineState &pipeline, RootSignature &root,
       uint64_t &argbuf_offset,
@@ -16204,22 +16591,27 @@ private:
     diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
     diag.bindless_bound = diag.uses_bindless_mirror;
     diag.path = "compiled-direct";
-    EncodeCompiledArgumentTables(enc, packet.root_tables, false,
-                                 WMTRenderStageVertex |
-                                     WMTRenderStageFragment);
-    EncodeCompiledVertexBuffers(enc, packet, pipeline.GetGraphicsState(),
-                                argbuf_offset);
+    if (pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
+      EncodeCompiledNativeArgumentTables(
+          enc, payload.root_tables, false,
+          WMTRenderStageVertex | WMTRenderStageFragment);
+    }
+    EncodeCompiledVertexBuffers(enc, payload.input_assembler,
+                                pipeline.GetGraphicsState(), argbuf_offset);
     EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, false);
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Vertex) {
         EncodeCompiledShaderBindingsForStage<PipelineStage::Vertex>(
-            enc, packet.root_tables, pipeline, root, shader, key,
-            false, argbuf_offset, &diag);
+            enc, payload.root_tables, pipeline, root, shader, key,
+            false, argbuf_offset, payload.native_root_base_buffer,
+            &payload.native_vertex, &diag);
       } else if (shader.stage == PipelineShaderStage::Pixel) {
         EncodeCompiledShaderBindingsForStage<PipelineStage::Pixel>(
-            enc, packet.root_tables, pipeline, root, shader, key,
-            false, argbuf_offset, &diag);
+            enc, payload.root_tables, pipeline, root, shader, key,
+            false, argbuf_offset, payload.native_root_base_buffer,
+            &payload.native_pixel, &diag);
       }
     }
   }
@@ -16318,8 +16710,10 @@ private:
       ArgumentEncodingContext &enc, const CompiledComputePacket &packet,
       const CompiledPacketBindingState &binding_state,
       PipelineState &pipeline, RootSignature &root,
-      uint64_t &argbuf_offset) {
-    EncodeCompiledArgumentTables(enc, packet.root_tables, true, {});
+      uint64_t &argbuf_offset, WMT::Buffer native_root_base_buffer) {
+    if (pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE)
+      EncodeCompiledNativeArgumentTables(enc, packet.root_tables, true, {});
     RecordBindlessMirrorDiagDispatch();
     EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, true);
     const auto &key = pipeline.GetShaderCacheKey();
@@ -16328,7 +16722,49 @@ private:
         continue;
       EncodeCompiledShaderBindingsForStage<PipelineStage::Compute>(
           enc, packet.root_tables, pipeline, root, shader, key,
-          true, argbuf_offset);
+          true, argbuf_offset, native_root_base_buffer,
+          &packet.native_compute);
+    }
+  }
+
+  void EncodeReplayDispatchPacket(ArgumentEncodingContext &enc,
+                                  ReplayDispatchPacket &packet,
+                                  uint64_t &argbuf_offset) {
+    const bool compiled = packet.compiled_binding_payload.has_value();
+    const bool perf_enabled = compiled && dxmt::perf::enabled();
+    const auto encode_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
+
+    auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
+    set_pso.type = WMTComputeCommandSetPSO;
+    set_pso.pso = packet.metal_pso;
+    set_pso.threadgroup_size = packet.threadgroup_size;
+
+    if (compiled) {
+      auto &payload = *packet.compiled_binding_payload;
+      for (const auto &allocation : payload.direct_access.buffer_allocations)
+        enc.retainAllocation(allocation.ptr());
+      EncodeCompiledComputeBindings(
+          enc, payload.packet, payload.binding_state, *packet.pipeline,
+          *payload.root, argbuf_offset, payload.native_root_base_buffer);
+    } else {
+      const uint64_t argbuf_base = argbuf_offset;
+      EncodeComputeBindings(enc, *packet.replay_state, *packet.pipeline,
+                            argbuf_offset);
+      if (argbuf_offset - argbuf_base > packet.argument_buffer_size) {
+        WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
+             packet.argument_buffer_size,
+             " actual=", argbuf_offset - argbuf_base);
+      }
+    }
+
+    auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
+    dispatch.type = WMTComputeCommandDispatch;
+    dispatch.size = {packet.dispatch.x, packet.dispatch.y, packet.dispatch.z};
+
+    if (perf_enabled) {
+      dxmt::perf::recordCompiledDispatchEncodeTime(
+          &enc.currentFrameStatistics(), clock::now() - encode_begin);
     }
   }
 
@@ -16487,6 +16923,31 @@ private:
     const auto &key = pipeline.GetShaderCacheKey();
     BindlessMirrorDrawDiag local_diag = {};
     BindlessMirrorDrawDiag &diag = draw_diag ? *draw_diag : local_diag;
+    const bool native =
+        pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+    if (native) {
+      diag.path = "compiled-native";
+      diag.bindless_bound = snapshot.root_signature_impl != nullptr;
+      if (!snapshot.root_signature_impl)
+        return;
+
+      EncodeNativeArgumentTables(
+          enc, snapshot, false,
+          WMTRenderStageVertex | WMTRenderStageFragment);
+      for (const auto &shader : shaders) {
+        if (shader.stage == PipelineShaderStage::Vertex) {
+          EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
+              enc, snapshot, pipeline, *snapshot.root_signature_impl, shader,
+              key, false, &diag);
+        } else if (shader.stage == PipelineShaderStage::Pixel) {
+          EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
+              enc, snapshot, pipeline, *snapshot.root_signature_impl, shader,
+              key, false, &diag);
+        }
+      }
+      return;
+    }
     diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
     // Bindless-mirror (③.3) snapshot path: root_offsets and compact mirror windows
     // are rebuilt per stage from captured descriptors. A bindless PSO is never
@@ -16737,7 +17198,11 @@ private:
                               bool use_tessellation,
                               uint64_t &argbuf_offset,
                               BindlessMirrorDrawDiag *out_diag = nullptr) {
-    ApplyRootDescriptorTables(enc, state, pipeline, false);
+    const bool native =
+        pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+    if (!native)
+      ApplyRootDescriptorTables(enc, state, pipeline, false);
     const auto pipeline_kind = use_tessellation
                                    ? PipelineKind::Tessellation
                                    : use_geometry ? PipelineKind::Geometry
@@ -16749,14 +17214,41 @@ private:
     // Bindless-mirror (③.3): a bindless PSO is never geometry/tessellation (the off-gate
     // excludes GS/HS/DS), so only the Ordinary Vertex/Pixel stages need the bindless wiring.
     const bool bindless = pipeline.UsesBindlessMirror();
-    const RootSignature *bindless_root =
-        bindless ? state.graphics_root_signature_impl : nullptr;
+    const RootSignature *binding_root =
+        (bindless || native) ? state.graphics_root_signature_impl : nullptr;
+    const RootSignature *bindless_root = bindless ? binding_root : nullptr;
     const bool bindless_path =
-        bindless && bindless_root && !use_geometry && !use_tessellation;
+        bindless_root && !use_geometry && !use_tessellation;
+    const bool native_path =
+        native && binding_root && !use_geometry && !use_tessellation;
     BindlessMirrorDrawDiag diag = {};
     diag.uses_bindless_mirror = bindless;
     diag.bindless_bound = bindless_path;
     diag.path = BindlessMirrorDiagPathName(bindless_path, false);
+    if (native) {
+      diag.path = "native";
+      if (native_path) {
+        EncodeNativeArgumentTables(
+            enc, state, false,
+            WMTRenderStageVertex | WMTRenderStageFragment);
+        for (const auto &shader : shaders) {
+          if (shader.stage == PipelineShaderStage::Vertex) {
+            EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
+                enc, state, pipeline, *binding_root, shader, key, false,
+                &diag);
+          } else if (shader.stage == PipelineShaderStage::Pixel) {
+            EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
+                enc, state, pipeline, *binding_root, shader, key, false,
+                &diag);
+          }
+        }
+      }
+      if (out_diag)
+        *out_diag = diag;
+      else
+        RecordBindlessMirrorDiagDraw(&pipeline, diag);
+      return;
+    }
     // Mixed-PSO guard (③.3 STEP D): a legacy draw after a mirrored draw must
     // restore the per-pass argbuf at slots 29/30.
     if (!bindless && DescriptorMirrorRuntimeEnabled())
@@ -16822,13 +17314,28 @@ private:
                              const ReplayState &state,
                              PipelineState &pipeline,
                              uint64_t &argbuf_offset) {
-    ApplyRootDescriptorTables(enc, state, pipeline, true);
+    const bool native =
+        pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+    if (!native)
+      ApplyRootDescriptorTables(enc, state, pipeline, true);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
     // Bindless-mirror (③.3): compute bindless wiring (slot-27 buf_table + 28/29/30 binds).
     const bool bindless = pipeline.UsesBindlessMirror();
     const RootSignature *bindless_root =
-        bindless ? state.compute_root_signature_impl : nullptr;
+        (bindless || native) ? state.compute_root_signature_impl : nullptr;
+    if (native) {
+      if (!bindless_root)
+        return;
+      EncodeNativeArgumentTables(enc, state, true, {});
+      for (const auto &shader : shaders) {
+        if (shader.stage == PipelineShaderStage::Compute)
+          EncodeShaderBindingsForStageBindless<PipelineStage::Compute>(
+              enc, state, pipeline, *bindless_root, shader, key, true);
+      }
+      return;
+    }
     // Mixed-PSO guard (③.3 STEP D): restore the per-pass argbuf at 29/30 if a prior bindless
     // dispatch rebound them. Compute analog of the graphics guard.
     if (!bindless && DescriptorMirrorRuntimeEnabled())
@@ -16876,15 +17383,20 @@ private:
         size = AlignArgumentBufferSize(size) +
                uint64_t(__builtin_popcount(slot_mask)) * 16u;
     }
+    const bool native = pipeline.GetShaderAbiVersion() ==
+                        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Vertex ||
           shader.stage == PipelineShaderStage::Pixel ||
           (use_tessellation &&
            (shader.stage == PipelineShaderStage::Hull ||
             shader.stage == PipelineShaderStage::Domain)) ||
-          (use_geometry && shader.stage == PipelineShaderStage::Geometry))
+          (use_geometry && shader.stage == PipelineShaderStage::Geometry)) {
+        if (native)
+          continue;
         size = AlignArgumentBufferSize(size) +
                EstimateShaderArgumentBufferSize(shader);
+      }
     }
     return AlignArgumentBufferSize(size);
   }
@@ -16896,6 +17408,9 @@ private:
   }
 
   static uint64_t EstimateComputeArgumentBufferSize(PipelineState &pipeline) {
+    if (pipeline.GetShaderAbiVersion() ==
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE)
+      return 0;
     uint64_t size = 0;
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Compute)
@@ -17809,7 +18324,10 @@ private:
     StallScope _ss(StallDiagEnabled(), &stallProbe().descAccessUs);
     RecordRenderAttachmentAccess(chunk, state, pipeline.GetGraphicsState());
     const bool bindless_descriptor_hazards_are_barrier_driven =
-        pipeline.UsesBindlessMirror() && DescriptorMirrorRuntimeEnabled();
+        (pipeline.UsesBindlessMirror() ||
+         pipeline.GetShaderAbiVersion() ==
+             DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) &&
+        DescriptorMirrorRuntimeEnabled();
     if (bindless_descriptor_hazards_are_barrier_driven) {
       if (ReplayPerfEnabled())
         perDrawSubTimers().descAccessPassthrough++;
@@ -17831,7 +18349,9 @@ private:
 
   void RecordComputePipelineResourceAccess(CommandChunk *chunk, ReplayState &state,
                                            PipelineState &pipeline) {
-    RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
+    if (pipeline.GetShaderAbiVersion() !=
+        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE)
+      RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
     if (state.predication_buffer) {
       RecordReplayResourceAccess(chunk, state, state.predication_buffer.ptr(),
                                  D3D12_RESOURCE_STATE_PREDICATION,
@@ -17956,6 +18476,10 @@ private:
     wmtcmd_render_setrasterizerstate rasterizer = {};
     PipelineState *pipeline = nullptr;
     std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
+    std::optional<CompiledDirectGraphicsBindingPayload>
+        compiled_binding_payload;
+    CompiledPacketBindingState compiled_binding_state = {};
+    CompiledDirectAccessList compiled_direct_access;
     uint64_t binding_generation = 0;
     uint64_t descriptor_content_generation = 0;
     uint64_t binding_content_fingerprint = 0;
@@ -17998,20 +18522,33 @@ private:
     UINT base_instance = 0;
   };
 
-  struct CompiledDirectDrawPayload {
-    ReplayDrawInstancedPacket draw;
-    CompiledDirectAccessList direct_access;
-  };
+  void EncodeCompiledDirectGraphicsBindings(
+      ArgumentEncodingContext &enc,
+      const CompiledDirectGraphicsBindingPayload &payload,
+      const CompiledPacketBindingState &binding_state,
+      ReplayDrawPacketCommon &common, uint64_t &argbuf_offset) {
+    if (!common.pipeline)
+      return;
+    if (common.pipeline->GetShaderAbiVersion() !=
+            DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE &&
+        !common.pipeline->UsesBindlessMirror())
+      return;
+    auto *root = GetRootSignature(payload.root_signature.ptr());
+    if (!root)
+      return;
 
-  struct CompiledDirectIndexedDrawPayload {
-    ReplayDrawIndexedInstancedPacket draw;
-    CompiledDirectAccessList direct_access;
-  };
+    BindlessMirrorDrawDiag diag = {};
+    EncodeCompiledGraphicsBindings(enc, payload, binding_state,
+                                   *common.pipeline, *root,
+                                   argbuf_offset, &diag);
+    diag.path = "compiled-direct";
+    common.bindless_diag = diag;
+  }
 
-	  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
-	    common.binding_content_fingerprint =
-	        common.binding_snapshot ? common.binding_snapshot->content_fingerprint
-	                                : 0;
+  void FinalizeReplayDrawBindingFingerprint(ReplayDrawPacketCommon &common) {
+    common.binding_content_fingerprint =
+        common.binding_snapshot ? common.binding_snapshot->content_fingerprint
+                                : 0;
     HashGraphicsBindingValue(common.binding_content_fingerprint,
                              common.metal_pso.handle);
     HashGraphicsBindingValue(common.binding_content_fingerprint,
@@ -18081,6 +18618,28 @@ private:
       rs = packet.rasterizer;
       cache.rasterizer = packet.rasterizer;
       cache.rasterizer_valid = true;
+    }
+
+    if (packet.compiled_binding_payload) {
+      {
+        dxmt::perf::ScopedFrameDuration retain_scope(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
+        for (const auto &allocation :
+             packet.compiled_direct_access.buffer_allocations)
+          enc.retainAllocation(allocation.ptr());
+      }
+      EncodeCompiledDirectGraphicsBindings(
+          enc, *packet.compiled_binding_payload,
+          packet.compiled_binding_state, packet, argbuf_offset);
+      {
+        dxmt::perf::ScopedFrameDuration dynamic_state_scope(
+            perf_stats,
+            &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
+        EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
+                                 packet.blend_factor, packet.stencil_ref);
+      }
+      return;
     }
 
     auto &binding_cache = render_encoder->binding_state_cache;
@@ -18206,17 +18765,22 @@ private:
                                        ReplayDrawInstancedPacket &packet,
                                        uint64_t &argbuf_offset) {
     auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
-    dxmt::perf::ScopedFrameDuration replay_scope(
+    auto &common = packet.common;
+    const bool compiled_direct = common.compiled_binding_payload.has_value();
+    dxmt::perf::ScopedFrameDuration encode_scope(
         perf_stats,
-        &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
+        compiled_direct
+            ? &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval
+            : &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
     dxmt::perf::addFrameCounter(
         perf_stats,
-        &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
+        compiled_direct
+            ? &dxmt::FrameStatistics::frame_compiled_draw_direct_packets
+            : &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
     dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
 
-    auto &common = packet.common;
     EncodeReplayDrawCommonState(enc, common, argbuf_offset);
 
     Rc<VisibilityResultQuery> active_visibility_query;
@@ -18346,24 +18910,29 @@ private:
       ArgumentEncodingContext &enc, ReplayDrawIndexedInstancedPacket &packet,
       uint64_t &argbuf_offset) {
     auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
-    dxmt::perf::ScopedFrameDuration replay_scope(
+    auto &common = packet.common;
+    const bool compiled_direct = common.compiled_binding_payload.has_value();
+    dxmt::perf::ScopedFrameDuration encode_scope(
         perf_stats,
-        &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
+        compiled_direct
+            ? &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval
+            : &dxmt::FrameStatistics::frame_compiled_draw_replay_encode_interval);
     dxmt::perf::addFrameCounter(
         perf_stats,
-        &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
+        compiled_direct
+            ? &dxmt::FrameStatistics::frame_compiled_draw_direct_packets
+            : &dxmt::FrameStatistics::frame_compiled_draw_replay_packets);
     dxmt::perf::addFrameCounter(
         perf_stats,
         &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets);
 
-    {
+    if (!compiled_direct) {
       dxmt::perf::ScopedFrameDuration retain_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
       enc.retainAllocation(packet.index_allocation.ptr());
     }
 
-    auto &common = packet.common;
     EncodeReplayDrawCommonState(enc, common, argbuf_offset);
 
     Rc<VisibilityResultQuery> active_visibility_query;
@@ -18939,33 +19508,23 @@ private:
                                  record.z))
       return;
 
-	    RecordComputePipelineResourceAccess(chunk, state, *pipeline);
-	    RecordBindlessMirrorDiagDispatch();
-	    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
-	    QueueComputePassCommand(
+    RecordComputePipelineResourceAccess(chunk, state, *pipeline);
+    RecordBindlessMirrorDiagDispatch();
+    const auto argument_buffer_size =
+        EstimateComputeArgumentBufferSize(*pipeline);
+    ReplayDispatchPacket dispatch_packet = {};
+    dispatch_packet.metal_pso = metal->pso;
+    dispatch_packet.threadgroup_size = metal->threadgroup_size;
+    dispatch_packet.pipeline = pipeline;
+    dispatch_packet.dispatch = record;
+    dispatch_packet.argument_buffer_size = argument_buffer_size;
+    dispatch_packet.replay_state.emplace(CloneReplayStateWithoutBatch(state));
+    QueueComputePassCommand(
         chunk, state, argument_buffer_size,
-        [this, metal_pso = metal->pso,
-         threadgroup_size = metal->threadgroup_size, pipeline,
-         replay_state = CloneReplayStateWithoutBatch(state),
-         argument_buffer_size, x = record.x, y = record.y,
-         z = record.z](ArgumentEncodingContext &enc,
-                       uint64_t &argbuf_offset) mutable {
-      auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
-      set_pso.type = WMTComputeCommandSetPSO;
-      set_pso.pso = metal_pso;
-      set_pso.threadgroup_size = threadgroup_size;
-
-      const uint64_t argbuf_base = argbuf_offset;
-      EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
-      if (argbuf_offset - argbuf_base > argument_buffer_size) {
-        WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
-             argument_buffer_size, " actual=", argbuf_offset - argbuf_base);
-      }
-
-      auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
-      dispatch.type = WMTComputeCommandDispatch;
-      dispatch.size = {x, y, z};
-    });
+        [this, dispatch_packet = std::move(dispatch_packet)](
+            ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
+          EncodeReplayDispatchPacket(enc, dispatch_packet, argbuf_offset);
+        });
   }
 
   void ReplayCopyResource(CommandChunk *chunk, ReplayState &state,
@@ -20287,6 +20846,10 @@ private:
           std::lock_guard lock(bindless_stage_plan_cache_mutex_);
           bindless_stage_plan_cache_.clear();
         }
+        {
+          std::lock_guard lock(native_stage_plan_cache_mutex_);
+          native_stage_plan_cache_.clear();
+        }
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::DrainLock,
             clock::now() - lock_begin);
@@ -20640,6 +21203,9 @@ private:
   std::unordered_map<uint64_t, std::shared_ptr<const BindlessMirrorStagePlan>>
       bindless_stage_plan_cache_;
   std::mutex bindless_stage_plan_cache_mutex_;
+  std::unordered_map<uint64_t, std::shared_ptr<const NativeRootBaseStagePlan>>
+      native_stage_plan_cache_;
+  std::mutex native_stage_plan_cache_mutex_;
   std::deque<PendingOperation> pending_operations_;
   dxmt::mutex mutex_;
   dxmt::condition_variable pending_operations_cond_;
