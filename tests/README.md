@@ -12,6 +12,7 @@ Metal3 and Metal4 backends into one Windows process.
 ```text
 tests/
   include/dxmt_test.hpp             Stable include for every test
+  include/dxmt_test_com.hpp         Move-only COM ownership helper
   include/dxmt_test_scheduler.hpp   Scheduler API and slow-test markers
   support/main.cpp                  Shared Windows scheduler entry point
   support/scheduler.cpp             Wine worker launcher and failure aggregation
@@ -24,6 +25,19 @@ tests/
   d3d11/*_spec.cpp                  D3D11 correctness tests
   d3d12/*_spec.cpp                  D3D12 correctness tests
 ```
+
+`d3d11/capability_spec.cpp` and `d3d12/capability_spec.cpp` reconstruct the
+observable device-probe contracts used by Unreal Engine 5.7.4's Windows RHI.
+They deliberately depend only on public DXGI/D3D interfaces: no Unreal Engine
+headers, source, shaders, binaries, configuration types, or implementation text
+are copied into DXMT. The cases are split by adapter identity, probe/final
+device creation, feature queries, format support, MSAA, memory budgets, COM
+interface consistency, descriptors, and queue behavior so failures identify a
+single capability boundary. The D3D12 suite also feeds the live feature level,
+shader model, resource binding tier, WaveOps, and typed atomic64 reports through
+UE's complete SM6 gate, including the Intel-emulation policy branch and valid
+SM5 fallback. The live macOS/Wine probe treats that Windows-only vendor
+extension as unavailable.
 
 `tests/meson.build` owns the only Meson/Wine test entry, the top-level scheduler,
 the shared GoogleTest runner, and the API-isolated test images. The API-specific
