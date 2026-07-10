@@ -100,9 +100,12 @@ void test_create_descriptor_heap(void)
     ok(!refcount, "ID3D12Device has %u references left.\n", (unsigned int)refcount);
 }
 
-void test_descriptor_tables(void)
+static void run_descriptor_tables(bool execute_indirect)
 {
     ID3D12DescriptorHeap *heap, *sampler_heap, *heaps[2];
+    ID3D12CommandSignature *command_signature = NULL;
+    D3D12_COMMAND_SIGNATURE_DESC command_signature_desc;
+    D3D12_INDIRECT_ARGUMENT_DESC indirect_argument_descs[2];
     D3D12_ROOT_SIGNATURE_DESC root_signature_desc;
     D3D12_DESCRIPTOR_RANGE descriptor_range[4];
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc;
@@ -110,7 +113,7 @@ void test_descriptor_tables(void)
     ID3D12GraphicsCommandList *command_list;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle;
-    ID3D12Resource *cb, *textures[4];
+    ID3D12Resource *argument_buffer = NULL, *cb, *textures[4];
     unsigned int i, descriptor_size;
     D3D12_SAMPLER_DESC sampler_desc;
     struct test_context_desc desc;
@@ -167,6 +170,11 @@ void test_descriptor_tables(void)
     static const float white[] = {1.0f, 1.0f, 1.0f, 1.0f};
     static const struct vec4 constant = {0.1f, 0.2f, 0.3f, 0.1f};
     static const unsigned int texture_data[4] = {0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffff00};
+    struct
+    {
+        D3D12_VERTEX_BUFFER_VIEW vertex_buffer;
+        D3D12_DRAW_ARGUMENTS draw;
+    } indirect_arguments;
 
     memset(&desc, 0, sizeof(desc));
     desc.no_root_signature = true;
@@ -220,6 +228,29 @@ void test_descriptor_tables(void)
 
     context.pipeline_state = create_pipeline_state(context.device,
             context.root_signature, context.render_target_desc.Format, NULL, &ps, NULL);
+    if (execute_indirect)
+    {
+        memset(indirect_argument_descs, 0, sizeof(indirect_argument_descs));
+        indirect_argument_descs[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+        indirect_argument_descs[0].VertexBuffer.Slot = 0;
+        indirect_argument_descs[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        memset(&command_signature_desc, 0, sizeof(command_signature_desc));
+        command_signature_desc.ByteStride = sizeof(indirect_arguments);
+        command_signature_desc.NumArgumentDescs = ARRAY_SIZE(indirect_argument_descs);
+        command_signature_desc.pArgumentDescs = indirect_argument_descs;
+        hr = ID3D12Device_CreateCommandSignature(context.device,
+                &command_signature_desc, NULL, &IID_ID3D12CommandSignature,
+                (void **)&command_signature);
+        ok(SUCCEEDED(hr), "Failed to create command signature, hr %#x.\n", hr);
+        memset(&indirect_arguments, 0, sizeof(indirect_arguments));
+        indirect_arguments.vertex_buffer.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(cb);
+        indirect_arguments.vertex_buffer.SizeInBytes = sizeof(constant);
+        indirect_arguments.vertex_buffer.StrideInBytes = sizeof(constant);
+        indirect_arguments.draw.VertexCountPerInstance = 3;
+        indirect_arguments.draw.InstanceCount = 1;
+        argument_buffer = create_upload_buffer(context.device,
+                sizeof(indirect_arguments), &indirect_arguments);
+    }
 
     memset(&sampler_desc, 0, sizeof(sampler_desc));
     sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -282,17 +313,129 @@ void test_descriptor_tables(void)
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(command_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D12GraphicsCommandList_RSSetViewports(command_list, 1, &context.viewport);
     ID3D12GraphicsCommandList_RSSetScissorRects(command_list, 1, &context.scissor_rect);
-    ID3D12GraphicsCommandList_DrawInstanced(command_list, 3, 1, 0, 0);
+    if (execute_indirect)
+        ID3D12GraphicsCommandList_ExecuteIndirect(command_list, command_signature,
+                1, argument_buffer, 0, NULL, 0);
+    else
+        ID3D12GraphicsCommandList_DrawInstanced(command_list, 3, 1, 0, 0);
 
     transition_resource_state(command_list, context.render_target,
             D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     check_sub_resource_uint(context.render_target, 0, queue, command_list, 0xb2664c19, 2);
 
+    if (argument_buffer)
+        ID3D12Resource_Release(argument_buffer);
+    if (command_signature)
+        ID3D12CommandSignature_Release(command_signature);
     ID3D12Resource_Release(cb);
     for (i = 0; i < ARRAY_SIZE(textures); ++i)
         ID3D12Resource_Release(textures[i]);
     ID3D12DescriptorHeap_Release(heap);
     ID3D12DescriptorHeap_Release(sampler_heap);
+    destroy_test_context(&context);
+}
+
+void test_descriptor_tables(void)
+{
+    run_descriptor_tables(false);
+}
+
+void test_descriptor_tables_execute_indirect(void)
+{
+    run_descriptor_tables(true);
+}
+
+void test_descriptor_table_compute_copy(void)
+{
+    D3D12_DESCRIPTOR_RANGE descriptor_ranges[2];
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc;
+    D3D12_ROOT_PARAMETER root_parameter;
+    D3D12_GPU_DESCRIPTOR_HANDLE table;
+    D3D12_SUBRESOURCE_DATA upload;
+    struct test_context_desc desc;
+    struct test_context context;
+    ID3D12DescriptorHeap *heap;
+    ID3D12Resource *src, *dst;
+    struct vec4 input[16];
+    unsigned int i;
+    HRESULT hr;
+
+#include "shaders/resource/headers/cs_copy_simple.h"
+
+    static const struct vec4 expected = {1.0f, 2.0f, 3.0f, 4.0f};
+
+    memset(&desc, 0, sizeof(desc));
+    desc.no_render_target = true;
+    desc.no_pipeline = true;
+    desc.no_root_signature = true;
+    if (!init_test_context(&context, &desc))
+        return;
+
+    memset(descriptor_ranges, 0, sizeof(descriptor_ranges));
+    descriptor_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptor_ranges[0].NumDescriptors = 1;
+    descriptor_ranges[0].BaseShaderRegister = 0;
+    descriptor_ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    descriptor_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    descriptor_ranges[1].NumDescriptors = 1;
+    descriptor_ranges[1].BaseShaderRegister = 0;
+    descriptor_ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+    memset(&root_parameter, 0, sizeof(root_parameter));
+    root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameter.DescriptorTable.NumDescriptorRanges = ARRAY_SIZE(descriptor_ranges);
+    root_parameter.DescriptorTable.pDescriptorRanges = descriptor_ranges;
+    root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    memset(&root_signature_desc, 0, sizeof(root_signature_desc));
+    root_signature_desc.NumParameters = 1;
+    root_signature_desc.pParameters = &root_parameter;
+    hr = create_root_signature(context.device, &root_signature_desc,
+            &context.root_signature);
+    ok(SUCCEEDED(hr), "Failed to create root signature, hr %#x.\n", hr);
+    context.pipeline_state = create_compute_pipeline_state(context.device,
+            context.root_signature, cs_copy_simple_dxbc);
+
+    for (i = 0; i < ARRAY_SIZE(input); ++i)
+        input[i] = expected;
+    src = create_default_texture(context.device, 4, 4,
+            DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    dst = create_default_texture(context.device, 4, 4,
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    upload.pData = input;
+    upload.RowPitch = 4 * sizeof(*input);
+    upload.SlicePitch = sizeof(input);
+    upload_texture_data(src, &upload, 1, context.queue, context.list);
+    reset_command_list(context.list, context.allocator);
+    transition_resource_state(context.list, src,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    heap = create_gpu_descriptor_heap(context.device,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2);
+    ID3D12Device_CreateShaderResourceView(context.device, src, NULL,
+            get_cpu_descriptor_handle(&context, heap, 0));
+    ID3D12Device_CreateUnorderedAccessView(context.device, dst, NULL, NULL,
+            get_cpu_descriptor_handle(&context, heap, 1));
+    table = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context.list,
+            context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list,
+            context.pipeline_state);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &heap);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0,
+            table);
+    ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+    transition_resource_state(context.list, dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    check_sub_resource_vec4(dst, 0, context.queue, context.list, &expected, 0);
+
+    ID3D12DescriptorHeap_Release(heap);
+    ID3D12Resource_Release(src);
+    ID3D12Resource_Release(dst);
     destroy_test_context(&context);
 }
 
@@ -6734,4 +6877,3 @@ void test_static_sampler_dynamic_index(void)
     ID3D12Resource_Release(output);
     destroy_test_context(&context);
 }
-

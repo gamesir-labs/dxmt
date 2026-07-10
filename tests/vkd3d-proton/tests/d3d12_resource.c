@@ -3058,6 +3058,306 @@ done:
     destroy_test_context(&context);
 }
 
+void test_dxmt_mixed_encoder_stress(void)
+{
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {0};
+    D3D12_ROOT_PARAMETER root_parameters[2] = {0};
+    ID3D12PipelineState *pipeline_state = NULL;
+    ID3D12RootSignature *root_signature = NULL;
+    struct test_context_desc context_desc = {0};
+    struct resource_readback rb;
+    struct test_context context;
+    ID3D12Resource *destination;
+    ID3D12Resource *readback_source;
+    ID3D12Resource *source;
+    const char *case_env;
+    const char *iterations_env;
+    const char *submissions_env;
+    unsigned int smoke_case;
+    unsigned int iterations;
+    unsigned int submissions;
+    unsigned int i;
+    HRESULT hr;
+
+#include "shaders/resource/headers/cs_clear_buffer.h"
+
+    case_env = getenv("DXMT_MIXED_ENCODER_CASE");
+    smoke_case = case_env ? strtoul(case_env, NULL, 0) : 1;
+    iterations_env = getenv("DXMT_MIXED_ENCODER_ITERATIONS");
+    iterations = iterations_env ? strtoul(iterations_env, NULL, 0) : 384;
+    if (!iterations)
+        iterations = 384;
+    submissions_env = getenv("DXMT_MIXED_ENCODER_SUBMISSIONS");
+    submissions = submissions_env ? strtoul(submissions_env, NULL, 0) : 1;
+    if (!submissions)
+        submissions = 1;
+    if (smoke_case > 1)
+    {
+        skip("Unknown DXMT_MIXED_ENCODER_CASE %u.\n", smoke_case);
+        return;
+    }
+
+    context_desc.no_render_target = true;
+    context_desc.no_root_signature = true;
+    context_desc.no_pipeline = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    root_parameters[0].Descriptor.ShaderRegister = 0;
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    root_parameters[1].Constants.ShaderRegister = 0;
+    root_parameters[1].Constants.Num32BitValues = 1;
+    root_signature_desc.NumParameters = ARRAY_SIZE(root_parameters);
+    root_signature_desc.pParameters = root_parameters;
+
+    hr = create_root_signature(context.device, &root_signature_desc, &root_signature);
+    ok(SUCCEEDED(hr), "Failed to create mixed encoder root signature, hr %#x.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    pipeline_state = create_compute_pipeline_state(context.device, root_signature,
+            cs_clear_buffer_dxbc);
+    if (!pipeline_state)
+        goto done;
+
+    source = create_default_buffer(context.device, 64 * sizeof(uint32_t),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    destination = create_default_buffer(context.device, 64 * sizeof(uint32_t),
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!source || !destination)
+        goto done_resources;
+
+    trace("DXMT mixed encoder stress case %u iterations %u submissions %u begin.\n",
+            smoke_case, iterations, submissions);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, pipeline_state);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context.list, 0,
+            ID3D12Resource_GetGPUVirtualAddress(source));
+
+    for (i = 0; i < iterations; i++)
+    {
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstant(context.list, 1, i + 1, 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+        if (smoke_case == 0)
+        {
+            uav_barrier(context.list, source);
+            continue;
+        }
+        transition_resource_state(context.list, source,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(context.list, destination, 0,
+                source, 0, 64 * sizeof(uint32_t));
+        transition_resource_state(context.list, source,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    hr = ID3D12GraphicsCommandList_Close(context.list);
+    ok(SUCCEEDED(hr), "Failed to close mixed encoder command list, hr %#x.\n", hr);
+    if (FAILED(hr))
+        goto done_resources;
+
+    for (i = 0; i < submissions; i++)
+        exec_command_list(context.queue, context.list);
+    wait_queue_idle(context.device, context.queue);
+    reset_command_list(context.list, context.allocator);
+
+    if (smoke_case == 0)
+    {
+        transition_resource_state(context.list, source,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        readback_source = source;
+    }
+    else
+    {
+        transition_resource_state(context.list, destination,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        readback_source = destination;
+    }
+    get_buffer_readback_with_command_list(readback_source, DXGI_FORMAT_R32_UINT,
+            &rb, context.queue, context.list);
+    for (i = 0; i < 64; i++)
+    {
+        uint32_t got = get_readback_uint(&rb, i, 0, 0);
+        ok(got == iterations, "Got %u, expected %u at %u.\n",
+                got, iterations, i);
+    }
+    release_resource_readback(&rb);
+    trace("DXMT mixed encoder stress case %u iterations %u submissions %u end.\n",
+            smoke_case, iterations, submissions);
+
+done_resources:
+    if (destination)
+        ID3D12Resource_Release(destination);
+    if (source)
+        ID3D12Resource_Release(source);
+done:
+    if (pipeline_state)
+        ID3D12PipelineState_Release(pipeline_state);
+    if (root_signature)
+        ID3D12RootSignature_Release(root_signature);
+    destroy_test_context(&context);
+}
+
+void test_dxmt_fence_only_barrier_chain(void)
+{
+    enum { barrier_count = 384 };
+    ID3D12CommandAllocator *allocators[barrier_count] = {0};
+    ID3D12GraphicsCommandList *command_lists[barrier_count] = {0};
+    ID3D12CommandList *submit_lists[barrier_count];
+    struct test_context_desc context_desc = {0};
+    struct test_context context;
+    ID3D12Resource *resource = NULL;
+    D3D12_RESOURCE_STATES before, after;
+    unsigned int i;
+    HRESULT hr;
+
+    context_desc.no_render_target = true;
+    context_desc.no_root_signature = true;
+    context_desc.no_pipeline = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    resource = create_default_buffer(context.device, 4096,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!resource)
+        goto done;
+
+    allocators[0] = context.allocator;
+    command_lists[0] = context.list;
+    for (i = 1; i < barrier_count; i++)
+    {
+        hr = ID3D12Device_CreateCommandAllocator(context.device,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator,
+                (void **)&allocators[i]);
+        ok(SUCCEEDED(hr), "Failed to create command allocator %u, hr %#x.\n", i, hr);
+        if (FAILED(hr))
+            goto done;
+
+        hr = ID3D12Device_CreateCommandList(context.device, 0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i], NULL,
+                &IID_ID3D12GraphicsCommandList, (void **)&command_lists[i]);
+        ok(SUCCEEDED(hr), "Failed to create command list %u, hr %#x.\n", i, hr);
+        if (FAILED(hr))
+            goto done;
+    }
+
+    before = D3D12_RESOURCE_STATE_COPY_DEST;
+    after = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    for (i = 0; i < barrier_count; i++)
+    {
+        transition_resource_state(command_lists[i], resource, before, after);
+        hr = ID3D12GraphicsCommandList_Close(command_lists[i]);
+        ok(SUCCEEDED(hr), "Failed to close command list %u, hr %#x.\n", i, hr);
+        submit_lists[i] = (ID3D12CommandList *)command_lists[i];
+        before = after;
+        after = after == D3D12_RESOURCE_STATE_COPY_SOURCE
+                ? D3D12_RESOURCE_STATE_COPY_DEST
+                : D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+
+    ID3D12CommandQueue_ExecuteCommandLists(context.queue, barrier_count, submit_lists);
+    wait_queue_idle(context.device, context.queue);
+
+done:
+    for (i = 1; i < barrier_count; i++)
+    {
+        if (command_lists[i])
+            ID3D12GraphicsCommandList_Release(command_lists[i]);
+        if (allocators[i])
+            ID3D12CommandAllocator_Release(allocators[i]);
+    }
+    if (resource)
+        ID3D12Resource_Release(resource);
+    destroy_test_context(&context);
+}
+
+void test_dxmt_resource_initializer_lifetime(void)
+{
+    struct test_context_desc context_desc = {0};
+    struct test_context context;
+    ID3D12Fence *fence = NULL;
+    ID3D12Resource *texture;
+    const char *batches_env;
+    const char *textures_env;
+    unsigned int submitted_batches = 0;
+    unsigned int textures_per_batch;
+    unsigned int batches;
+    unsigned int i, j;
+    HRESULT hr;
+
+    batches_env = getenv("DXMT_INITIALIZER_LIFETIME_BATCHES");
+    batches = batches_env ? strtoul(batches_env, NULL, 0) : 1152;
+    if (!batches)
+        batches = 1152;
+    textures_env = getenv("DXMT_INITIALIZER_LIFETIME_TEXTURES");
+    textures_per_batch = textures_env ? strtoul(textures_env, NULL, 0) : 4;
+    if (!textures_per_batch)
+        textures_per_batch = 4;
+
+    context_desc.no_render_target = true;
+    context_desc.no_root_signature = true;
+    context_desc.no_pipeline = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    hr = ID3D12GraphicsCommandList_Close(context.list);
+    ok(SUCCEEDED(hr), "Failed to close command list, hr %#x.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    hr = ID3D12Device_CreateFence(context.device, 0, D3D12_FENCE_FLAG_NONE,
+            &IID_ID3D12Fence, (void **)&fence);
+    ok(SUCCEEDED(hr), "Failed to create fence, hr %#x.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    trace("DXMT resource initializer lifetime batches %u textures %u begin.\n",
+            batches, textures_per_batch);
+    for (i = 0; i < batches; i++)
+    {
+        for (j = 0; j < textures_per_batch; j++)
+        {
+            texture = create_default_texture(context.device, 64, 64,
+                    DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COMMON);
+            if (!texture)
+                goto wait_submitted;
+            ID3D12Resource_Release(texture);
+        }
+
+        exec_command_list(context.queue, context.list);
+        submitted_batches = i + 1;
+        hr = ID3D12CommandQueue_Signal(context.queue, fence, submitted_batches);
+        ok(SUCCEEDED(hr), "Failed to signal batch %u, hr %#x.\n",
+                submitted_batches, hr);
+        if (FAILED(hr))
+            goto done;
+    }
+
+wait_submitted:
+    if (submitted_batches)
+    {
+        hr = wait_for_fence(fence, submitted_batches);
+        ok(SUCCEEDED(hr), "Failed to wait for batch %u, hr %#x.\n",
+                submitted_batches, hr);
+    }
+    trace("DXMT resource initializer lifetime submitted %u batches end.\n",
+            submitted_batches);
+
+done:
+    if (fence)
+        ID3D12Fence_Release(fence);
+    destroy_test_context(&context);
+}
+
 struct suballocation_thread_data
 {
     struct test_context *context;

@@ -1553,6 +1553,281 @@ void test_copy_tiles(void)
 #undef TILE_SIZE
 }
 
+enum dxmt_sparse_smoke_case
+{
+    DXMT_SPARSE_SMOKE_CREATE_ONLY = 0,
+    DXMT_SPARSE_SMOKE_WRITE_SRV = 1,
+    DXMT_SPARSE_SMOKE_COPY_SRV = 2,
+    DXMT_SPARSE_SMOKE_EMPTY_SUBMIT = 3,
+    DXMT_SPARSE_SMOKE_SAMPLE_UNMAPPED = 4,
+    DXMT_SPARSE_SMOKE_SAMPLE_MAPPED = 5,
+    DXMT_SPARSE_SMOKE_COPY_TO_UNMAPPED = 6,
+    DXMT_SPARSE_SMOKE_COPY_TO_MAPPED = 7,
+};
+
+static ID3D12Heap *dxmt_sparse_smoke_map_all_tiles(struct test_context *context,
+        ID3D12Resource *resource)
+{
+    D3D12_TILED_RESOURCE_COORDINATE coordinate = {0};
+    D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+    D3D12_PACKED_MIP_INFO packed_mip_info;
+    D3D12_TILE_REGION_SIZE region_size = {0};
+    D3D12_TILE_SHAPE tile_shape;
+    D3D12_HEAP_DESC heap_desc = {0};
+    D3D12_SUBRESOURCE_TILING tiling;
+    ID3D12Heap *heap = NULL;
+    UINT heap_range_offset = 0;
+    UINT subresource_count = 1;
+    UINT total_tile_count = 0;
+    HRESULT hr;
+
+    ID3D12Device_GetResourceTiling(context->device, resource, &total_tile_count,
+            &packed_mip_info, &tile_shape, &subresource_count, 0, &tiling);
+    ok(total_tile_count != 0, "Reserved texture returned no tiles.\n");
+    if (!total_tile_count)
+        return NULL;
+
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.SizeInBytes = (UINT64)total_tile_count * D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    hr = ID3D12Device_CreateHeap(context->device, &heap_desc,
+            &IID_ID3D12Heap, (void **)&heap);
+    ok(SUCCEEDED(hr), "Failed to create sparse backing heap, hr %#x.\n", hr);
+    if (FAILED(hr))
+        return NULL;
+
+    region_size.NumTiles = total_tile_count;
+    ID3D12CommandQueue_UpdateTileMappings(context->queue, resource,
+            1, &coordinate, &region_size, heap, 1, &range_flag,
+            &heap_range_offset, &total_tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+    return heap;
+}
+
+static void dxmt_sparse_smoke_submit(struct test_context *context)
+{
+    HRESULT hr = ID3D12GraphicsCommandList_Close(context->list);
+    ok(SUCCEEDED(hr), "Failed to close sparse smoke command list, hr %#x.\n", hr);
+    if (FAILED(hr))
+        return;
+    exec_command_list(context->queue, context->list);
+    wait_queue_idle(context->device, context->queue);
+}
+
+static void dxmt_sparse_smoke_sample(struct test_context *context,
+        ID3D12Resource *texture, ID3D12DescriptorHeap *descriptor_heap,
+        UINT descriptor_index)
+{
+    D3D12_DESCRIPTOR_RANGE descriptor_range = {0};
+    D3D12_ROOT_PARAMETER root_parameters[2] = {0};
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {0};
+    ID3D12PipelineState *pipeline = NULL;
+    ID3D12RootSignature *root_signature = NULL;
+    ID3D12Resource *output = NULL;
+    D3D12_GPU_DESCRIPTOR_HANDLE descriptor;
+    HRESULT hr;
+
+#include "shaders/sparse/headers/update_tile_mappings_texture.h"
+
+    descriptor_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptor_range.NumDescriptors = 1;
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[0].DescriptorTable.pDescriptorRanges = &descriptor_range;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    root_parameters[1].Descriptor.ShaderRegister = 0;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    root_signature_desc.NumParameters = ARRAY_SIZE(root_parameters);
+    root_signature_desc.pParameters = root_parameters;
+
+    hr = create_root_signature(context->device, &root_signature_desc, &root_signature);
+    ok(SUCCEEDED(hr), "Failed to create sparse smoke root signature, hr %#x.\n", hr);
+    if (FAILED(hr))
+        return;
+    pipeline = create_compute_pipeline_state(context->device, root_signature,
+            update_tile_mappings_texture_dxbc);
+    if (!pipeline)
+        goto done;
+
+    output = create_default_buffer(context->device, 28 * sizeof(uint32_t),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!output)
+        goto done;
+
+    descriptor = get_gpu_descriptor_handle(context, descriptor_heap, descriptor_index);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(context->list, 1, &descriptor_heap);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context->list, root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context->list, pipeline);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context->list, 0, descriptor);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context->list, 1,
+            ID3D12Resource_GetGPUVirtualAddress(output));
+    ID3D12GraphicsCommandList_Dispatch(context->list, 1, 1, 1);
+    dxmt_sparse_smoke_submit(context);
+
+done:
+    if (output)
+        ID3D12Resource_Release(output);
+    if (pipeline)
+        ID3D12PipelineState_Release(pipeline);
+    ID3D12RootSignature_Release(root_signature);
+    (void)texture;
+}
+
+static void dxmt_sparse_smoke_copy_to_texture(struct test_context *context,
+        ID3D12Resource *texture)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    D3D12_RESOURCE_DESC texture_desc;
+    D3D12_TEXTURE_COPY_LOCATION dst = {0};
+    D3D12_TEXTURE_COPY_LOCATION src = {0};
+    ID3D12Resource *upload;
+    UINT row_count;
+    UINT64 row_size;
+    UINT64 total_size;
+    void *data;
+    HRESULT hr;
+
+    texture_desc = ID3D12Resource_GetDesc(texture);
+    ID3D12Device_GetCopyableFootprints(context->device,
+            &texture_desc, 0, 1, 0, &footprint,
+            &row_count, &row_size, &total_size);
+    upload = create_upload_buffer(context->device, total_size, NULL);
+    if (!upload)
+        return;
+    hr = ID3D12Resource_Map(upload, 0, NULL, &data);
+    ok(SUCCEEDED(hr), "Failed to map sparse smoke upload buffer, hr %#x.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        memset(data, 0x5a, total_size);
+        /* Upload heaps may remain persistently mapped until resource release. */
+    }
+
+    src.pResource = upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = footprint;
+    dst.pResource = texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    ID3D12GraphicsCommandList_CopyTextureRegion(context->list, &dst, 0, 0, 0,
+            &src, NULL);
+    dxmt_sparse_smoke_submit(context);
+    ID3D12Resource_Release(upload);
+}
+
+void test_dxmt_sparse_descriptor_smoke(void)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options;
+    D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {0};
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    D3D12_RESOURCE_DESC resource_desc = {0};
+    struct test_context context;
+    ID3D12DescriptorHeap *descriptor_heap = NULL;
+    ID3D12Resource *texture = NULL;
+    ID3D12Heap *backing_heap = NULL;
+    D3D12_RESOURCE_STATES initial_state;
+    D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor;
+    D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor;
+    const char *case_env = getenv("DXMT_SPARSE_SMOKE_CASE");
+    unsigned int smoke_case = case_env ? strtoul(case_env, NULL, 0) : 0;
+    HRESULT hr;
+
+    if (!init_compute_test_context(&context))
+        return;
+
+    hr = ID3D12Device_CheckFeatureSupport(context.device,
+            D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+    ok(SUCCEEDED(hr), "Failed to query tiled resource support, hr %#x.\n", hr);
+    if (FAILED(hr) || options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    {
+        skip("Tiled resources are not supported.\n");
+        goto done;
+    }
+    if (smoke_case > DXMT_SPARSE_SMOKE_COPY_TO_MAPPED)
+    {
+        skip("Unknown DXMT_SPARSE_SMOKE_CASE %u.\n", smoke_case);
+        goto done;
+    }
+
+    trace("DXMT sparse descriptor smoke case %u begin.\n", smoke_case);
+    initial_state = smoke_case >= DXMT_SPARSE_SMOKE_COPY_TO_UNMAPPED
+            ? D3D12_RESOURCE_STATE_COPY_DEST
+            : smoke_case >= DXMT_SPARSE_SMOKE_SAMPLE_UNMAPPED
+                    ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                    : D3D12_RESOURCE_STATE_COMMON;
+    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    resource_desc.Width = 512;
+    resource_desc.Height = 512;
+    resource_desc.DepthOrArraySize = 1;
+    resource_desc.MipLevels = 10;
+    resource_desc.Format = DXGI_FORMAT_R32_UINT;
+    resource_desc.SampleDesc.Count = 1;
+    resource_desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    hr = ID3D12Device_CreateReservedResource(context.device, &resource_desc,
+            initial_state, NULL, &IID_ID3D12Resource, (void **)&texture);
+    ok(SUCCEEDED(hr), "Failed to create sparse smoke texture, hr %#x.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    if (smoke_case == DXMT_SPARSE_SMOKE_CREATE_ONLY)
+        goto done;
+
+    descriptor_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    descriptor_heap_desc.NumDescriptors = 2;
+    descriptor_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = ID3D12Device_CreateDescriptorHeap(context.device, &descriptor_heap_desc,
+            &IID_ID3D12DescriptorHeap, (void **)&descriptor_heap);
+    ok(SUCCEEDED(hr), "Failed to create sparse smoke descriptor heap, hr %#x.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    srv_desc.Format = resource_desc.Format;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels = resource_desc.MipLevels;
+    src_descriptor = get_cpu_descriptor_handle(&context, descriptor_heap, 0);
+    dst_descriptor = get_cpu_descriptor_handle(&context, descriptor_heap, 1);
+    ID3D12Device_CreateShaderResourceView(context.device, texture, &srv_desc,
+            src_descriptor);
+    if (smoke_case == DXMT_SPARSE_SMOKE_WRITE_SRV)
+        goto done;
+
+    ID3D12Device_CopyDescriptorsSimple(context.device, 1, dst_descriptor,
+            src_descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (smoke_case == DXMT_SPARSE_SMOKE_COPY_SRV)
+        goto done;
+
+    if (smoke_case == DXMT_SPARSE_SMOKE_EMPTY_SUBMIT)
+    {
+        dxmt_sparse_smoke_submit(&context);
+        goto done;
+    }
+
+    if (smoke_case == DXMT_SPARSE_SMOKE_SAMPLE_MAPPED ||
+            smoke_case == DXMT_SPARSE_SMOKE_COPY_TO_MAPPED)
+    {
+        backing_heap = dxmt_sparse_smoke_map_all_tiles(&context, texture);
+        if (!backing_heap)
+            goto done;
+    }
+
+    if (smoke_case == DXMT_SPARSE_SMOKE_SAMPLE_UNMAPPED ||
+            smoke_case == DXMT_SPARSE_SMOKE_SAMPLE_MAPPED)
+        dxmt_sparse_smoke_sample(&context, texture, descriptor_heap, 1);
+    else
+        dxmt_sparse_smoke_copy_to_texture(&context, texture);
+
+done:
+    trace("DXMT sparse descriptor smoke case %u end.\n", smoke_case);
+    if (backing_heap)
+        ID3D12Heap_Release(backing_heap);
+    if (descriptor_heap)
+        ID3D12DescriptorHeap_Release(descriptor_heap);
+    if (texture)
+        ID3D12Resource_Release(texture);
+    destroy_test_context(&context);
+}
+
 static void test_buffer_feedback_instructions(bool use_dxil)
 {
 #define TILE_SIZE 65536
