@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-BUILD_DIR="${DXMT_BUILD_DIR:-build-builtin}"
+BUILD_DIR="${DXMT_BUILD_DIR:-${REPO_ROOT}/.cache/build/gamehub-runtime}"
 NATIVE_LLVM_PATH="${DXMT_NATIVE_LLVM_PATH:-/usr/local/opt/llvm@15}"
 GAMEHUB_BUNDLE_ID="${GAMEHUB_BUNDLE_ID:-com.gamemac.test}"
 GAMEHUB_DXMT_PACKAGE="${GAMEHUB_DXMT_PACKAGE:-dxmt-v0.80}"
@@ -12,7 +12,7 @@ GAMEHUB_DXMT_ROOT="${GAMEHUB_DXMT_ROOT:-${HOME}/Library/Application Support/${GA
 GAMEHUB_VERSION_MODE="${DXMT_GAMEHUB_VERSION_MODE:-auto}"
 GAMEHUB_VERSION_OVERRIDE="${DXMT_GAMEHUB_VERSION:-}"
 BACKUP_ROOT="${DXMT_GAMEHUB_BACKUP_ROOT:-${HOME}/Library/Caches/dxmt-runtime-smoke}"
-STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${BACKUP_ROOT}/gamehub-test-stage}"
+STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${REPO_ROOT}/.cache/stage/gamehub-test}"
 BACKUP_TAG="${DXMT_GAMEHUB_BACKUP_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BACKUP_DIR="${BACKUP_ROOT}/gamehub-${GAMEHUB_DXMT_PACKAGE}-backup-${BACKUP_TAG}"
 ENABLE_APITRACE="${DXMT_GAMEHUB_ENABLE_APITRACE:-0}"

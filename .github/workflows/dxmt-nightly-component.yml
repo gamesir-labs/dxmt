@@ -26,7 +26,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DXMT_CI_ROOT: /opt/dxmt-ci
   LLVM_VERSION: llvmorg-15.0.7
   WINE_VERSION: proton-11.0-macos
   WINE_GIT_URL: https://github.com/gamesir123/wine-proton-macos.git
@@ -51,6 +50,7 @@ jobs:
       - name: Checkout Source Ref
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ inputs.source_ref }}
 
       - name: Resolve Source Ref
@@ -132,6 +132,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Probe and Prepare Host
@@ -147,6 +148,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Prepare Wine
@@ -170,6 +172,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Prepare LLVM Source
@@ -185,6 +188,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Prepare LLVM Darwin x86_64
@@ -200,6 +204,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Checkout Build Submodules
@@ -209,26 +214,27 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
+          build_dir=.cache/build/x86_64-windows-release
+          install_dir=.cache/install/x86_64-windows-release
+          rm -rf "${install_dir}"
           short_sha="$(git rev-parse --short=7 HEAD)"
           dxmt_version="${short_sha}"
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
-          scripts/ci-self-hosted.sh prepare-ccache component-x86_64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++
           meson setup --cross-file build-win64.txt \
             -Denable_nvapi=true \
             -Denable_nvngx=true \
             -Ddxmt_version="${dxmt_version}" \
-            -Dnative_llvm_path=toolchains/llvm-darwin \
-            -Dwine_build_path= -Dwine_install_path=toolchains/wine \
+            -Dnative_llvm_path=.cache/toolchains/llvm-darwin \
+            -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine \
             --buildtype release \
-            --prefix "$(pwd)/install" \
+            --prefix "$(pwd)/${install_dir}" \
             --strip \
-            build
-          meson compile -C build
-          meson install -C build
-          find install -name '*.a' -delete
-          ccache --show-stats
-          scripts/ci-self-hosted.sh stage-artifact component-x86_64-runtime install
+            "${build_dir}"
+          meson compile -C "${build_dir}"
+          meson install -C "${build_dir}"
+          find "${install_dir}" -name '*.a' -delete
+          scripts/ci-self-hosted.sh stage-artifact component-x86_64-runtime "${install_dir}"
 
   build-x86-windows:
     runs-on: self-macos-runner
@@ -238,6 +244,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Checkout Build Submodules
@@ -247,23 +254,24 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
+          build_dir=.cache/build/x86-windows-release
+          install_dir=.cache/install/x86-windows-release
+          rm -rf "${install_dir}"
           short_sha="$(git rev-parse --short=7 HEAD)"
           dxmt_version="${short_sha}"
           scripts/ci-self-hosted.sh prepare-job
           scripts/ci-self-hosted.sh link-toolchains x86_64
-          scripts/ci-self-hosted.sh prepare-ccache component-x86 i686-w64-mingw32-gcc i686-w64-mingw32-g++
           meson setup --cross-file build-win32.txt \
             -Ddxmt_version="${dxmt_version}" \
-            -Dwine_build_path= -Dwine_install_path=toolchains/wine \
+            -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine \
             --buildtype release \
-            --prefix "$(pwd)/install" \
+            --prefix "$(pwd)/${install_dir}" \
             --strip \
-            build
-          meson compile -C build
-          meson install -C build
-          find install -name '*.a' -delete
-          ccache --show-stats
-          scripts/ci-self-hosted.sh stage-artifact component-x86-runtime install
+            "${build_dir}"
+          meson compile -C "${build_dir}"
+          meson install -C "${build_dir}"
+          find "${install_dir}" -name '*.a' -delete
+          scripts/ci-self-hosted.sh stage-artifact component-x86-runtime "${install_dir}"
 
   package:
     runs-on: self-macos-runner
@@ -277,6 +285,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          clean: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Set Package Outputs
@@ -303,8 +312,8 @@ jobs:
           short_sha="${{ steps.package.outputs.short_sha }}"
           package_name="${{ steps.package.outputs.package_name }}"
           package_root_name="${{ steps.package.outputs.package_root_name }}"
-          package_root="./combined/${package_root_name}"
-          rm -rf ./combined ./dist
+          package_root=".cache/package/combined/${package_root_name}"
+          rm -rf .cache/package/combined ./dist
           mkdir -p "${package_root}/wine" ./dist
 
           scripts/ci-self-hosted.sh copy-artifact component-x86_64-runtime "${package_root}/wine"
@@ -342,8 +351,8 @@ jobs:
           short_sha="${{ steps.package.outputs.short_sha }}"
           package_name="${{ steps.package.outputs.package_name }}"
           package_root_name="${{ steps.package.outputs.package_root_name }}"
-          package_root="./combined/${package_root_name}"
-          test ! -e "./combined/${package_name}"
+          package_root=".cache/package/combined/${package_root_name}"
+          test ! -e ".cache/package/combined/${package_name}"
           test -f "${package_root}/manifest.json"
           test -d "${package_root}/wine/i386-windows"
           test -d "${package_root}/wine/x86_64-windows"
@@ -380,7 +389,7 @@ jobs:
           fi
           package_root_name="${{ steps.package.outputs.package_root_name }}"
           package_file="${{ steps.package.outputs.package_file }}"
-          tar -cf - -C ./combined "${package_root_name}" | zstd -T0 -19 -o "${package_file}"
+          tar -cf - -C .cache/package/combined "${package_root_name}" | zstd -T0 -19 -o "${package_file}"
           case "${package_file}" in
             *.tzst) ;;
             *) echo "::error::component archive must end with .tzst"; exit 1 ;;
@@ -640,6 +649,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          clean: false
 
       - name: Prune Runner Artifacts
         run: scripts/ci-self-hosted.sh prune-artifact-runs 3

@@ -133,13 +133,13 @@ Configure, build, and run all unit-test suites with:
 meson setup \
   -Dnative_llvm_path=/usr/local/opt/llvm@15 \
   -Denable_tests=true \
-  build-tests \
+  .cache/build/tests \
   --buildtype release
-meson compile -C build-tests dxmt-unit-tests
+meson compile -C .cache/build/tests dxmt-unit-tests
 # Lowest-overhead local path; run from the repository root.
-build-tests/tests/unit/dxmt-unit-tests
+.cache/build/tests/tests/unit/dxmt-unit-tests
 # Meson/CI registration; also runs every correctness test.
-meson test -C build-tests --suite unit --print-errorlogs
+meson test -C .cache/build/tests --suite unit --print-errorlogs
 ```
 
 Use a separate cross-build directory for Wine-facing DLLs. GoogleTest unit
@@ -153,7 +153,7 @@ startup. Long queue, resource-lifetime, and mixed-encoder workloads belong to
 the Wine integration benchmark layer instead of the unit-test image.
 
 The managed mode builds Wine once under `wine_build_path`, installs the runtime
-at `external/wine/build/dxmt-install`, and then runs DXMT's own runtime-cache
+at `.cache/wine/build/x86_64/dxmt-install`, and then runs DXMT's own runtime-cache
 preparer against the fixed Wine source dependency. The consumer-side preparer
 uses Wine's generic dylib packaging tools but owns all cache state, required
 dependency policy, and validation. The Wine repository contains no DXMT build
@@ -166,14 +166,21 @@ meson setup \
   -Dnative_llvm_path=/usr/local/opt/llvm@15 \
   -Denable_d3d12_tests=true \
   -Dwine_source_path=../wine-proton-macos \
-  build-wine-tests \
+  .cache/build/wine-tests \
   --buildtype release
-scripts/run-wine-tests.sh build-wine-tests unit
+scripts/run-wine-tests.sh .cache/build/wine-tests unit
 ```
 
 The managed source dependency must provide its ordinary
 `pack_runtime_deps.sh` and `relocate_wine_runtime.sh` packaging tools. DXMT does
 not require a Wine-owned marker or consumer-specific helper.
+
+Wine compilation state remains under `wine_build_path`. The unpacked host
+dependency tree and its validation state are shared by every build directory
+at `.cache/wine-runtime/x86_64/` in the DXMT repository. No ZIP is created or
+expanded on the cache path. Unit tests, integration benchmarks, apitrace
+builds, and self-hosted jobs all invoke the same DXMT preparer and use this
+project-local path; CI has no separate cache setting or behavior.
 
 `run-wine-tests.sh` compiles the build, stages the current DXMT runtime, and
 exports the stage to every Wine process before Meson schedules the tests. The
@@ -189,7 +196,7 @@ meson setup \
   -Denable_d3d12_tests=true \
   -Dwine_build_path= \
   -Dwine_install_path=/path/to/wine-cache \
-  build-wine-tests \
+  .cache/build/wine-tests \
   --buildtype release
 ```
 
