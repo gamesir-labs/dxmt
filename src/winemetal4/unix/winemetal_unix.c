@@ -130,6 +130,17 @@ dxmt_metal4_wait_for_drawable_enabled(void) {
   return enabled;
 }
 
+static bool
+dxmt_metal4_perf_stats_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_PERF_STATS"));
+    initialized = true;
+  }
+  return enabled;
+}
+
 static uint64_t
 dxmt_monotonic_us(void) {
   struct timespec ts;
@@ -226,6 +237,13 @@ dxmt_metal4_validate_event(id event, const char *usage, uint64_t value) {
           event ? object_getClassName(event) : "<nil>",
           value);
   return NO;
+}
+
+static uint64_t
+dxmt_metal4_shared_event_value(id<MTLEvent> event) {
+  if (!event || ![event respondsToSelector:@selector(signaledValue)])
+    return 0;
+  return [(id<MTLSharedEvent>)event signaledValue];
 }
 
 #if DXMT_APITRACE_METAL
@@ -630,8 +648,11 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, retain) id<MTLSharedEvent> presentEvent;
 @property(nonatomic, assign) uint64_t eventValue;
 @property(nonatomic, assign) uint64_t presentEventValue;
+@property(nonatomic, assign) uint64_t maxCommandBufferCount;
+@property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
-- (uint64_t)nextEventValue;
+- (uint64_t)nextEventValueLocked;
+- (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
 @end
 
 @implementation DXMTMetal4CommandQueue
@@ -650,6 +671,8 @@ dxmt_metal4_is_buffer(id object) {
   _presentEvent = [(id<MTLDevice>)device newSharedEvent];
   _eventValue = 0;
   _presentEventValue = 0;
+  _maxCommandBufferCount = maxCommandBufferCount;
+  _commandBufferThrottleWaitCount = 0;
 
   if (!_metal4Queue || !_compiler || !_event || !_presentEvent) {
     [self release];
@@ -669,9 +692,31 @@ dxmt_metal4_is_buffer(id object) {
   [super dealloc];
 }
 
-- (uint64_t)nextEventValue {
-  @synchronized(self) {
-    return ++_eventValue;
+- (uint64_t)nextEventValueLocked {
+  return ++_eventValue;
+}
+
+- (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue {
+  if (!_maxCommandBufferCount || completionValue <= _maxCommandBufferCount)
+    return;
+
+  const uint64_t waitValue = completionValue - _maxCommandBufferCount;
+  const uint64_t currentValue = _event.signaledValue;
+  if (currentValue >= waitValue)
+    return;
+
+  const uint64_t waitBeginUs = dxmt_monotonic_us();
+  [_event waitUntilSignaledValue:waitValue timeoutMS:UINT64_MAX];
+  const uint64_t waitElapsedUs = dxmt_monotonic_us() - waitBeginUs;
+  const uint64_t waitIndex = ++_commandBufferThrottleWaitCount;
+  if (dxmt_metal4_perf_stats_enabled() && waitElapsedUs >= 1000 &&
+      (waitIndex <= 5 || (waitIndex % 256) == 0)) {
+    fprintf(stderr,
+            "warn:  DXMT Metal4 queue depth wait: queue=%p max=%" PRIu64
+            " target=%" PRIu64 " current=%" PRIu64 " elapsedMs=%.3f waitIndex=%" PRIu64 "\n",
+            _metal4Queue, _maxCommandBufferCount, waitValue, currentValue,
+            (double)waitElapsedUs / 1000.0, waitIndex);
+    fflush(stderr);
   }
 }
 @end
@@ -781,14 +826,9 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)commit {
-  if (_pendingDrawable) {
-    @synchronized(_owner) {
-      [self commitLocked];
-    }
-    return;
+  @synchronized(_owner) {
+    [self commitLocked];
   }
-
-  [self commitLocked];
 }
 
 - (uint64_t)commitLocked {
@@ -843,25 +883,101 @@ dxmt_metal4_is_buffer(id object) {
   uint64_t residency_submit_us = [self prepareResidencyForCommitAndMeasure];
   [_metal4Buffer endCommandBuffer];
 
-  _completionValue = [_owner nextEventValue];
+  _completionValue = [_owner nextEventValueLocked];
+  [_owner waitForCommandBufferSlotLocked:_completionValue];
+
+  const BOOL perfFeedback = dxmt_metal4_perf_stats_enabled();
+  if (perfFeedback && !_metal4Buffer.label) {
+    NSString *label = [[NSString alloc]
+        initWithFormat:@"DXMT queue=%p depth=%" PRIu64 " completion=%" PRIu64,
+                       _owner.metal4Queue, _owner.maxCommandBufferCount,
+                       _completionValue];
+    _metal4Buffer.label = label;
+    [label release];
+  }
+
   MTL4CommitOptions *options = nil;
+  BOOL traceFeedback = NO;
 #if DXMT_APITRACE_METAL
-  if (dxmt_apitrace_runtime_enabled() &&
-      dxmt_metal4_commit_feedback_enabled(_completionValue)) {
+  traceFeedback = dxmt_apitrace_runtime_enabled() &&
+                  dxmt_metal4_commit_feedback_enabled(_completionValue);
+#endif
+  if (perfFeedback || traceFeedback) {
     options = [[MTL4CommitOptions alloc] init];
-    __block DXMTMetal4CommandBuffer *retainedSelf = [self retain];
+    const obj_handle_t feedbackCommandBuffer = (obj_handle_t)self;
+    const obj_handle_t feedbackMetalBuffer = (obj_handle_t)_metal4Buffer;
+    const obj_handle_t feedbackQueue = (obj_handle_t)_owner.metal4Queue;
+    const uint64_t feedbackQueueDepth = _owner.maxCommandBufferCount;
+    const uint64_t feedbackCompletionValue = _completionValue;
+    const BOOL feedbackHasDrawable = _pendingDrawable != nil;
+    __block id<MTLSharedEvent> feedbackCompletionEvent = [_owner.event retain];
+    __block NSArray *feedbackWaitEvents = [_pendingWaitEvents copy];
+    __block NSArray *feedbackSignalEvents = [_pendingSignalEvents copy];
+    __block NSString *feedbackLabel = [_metal4Buffer.label copy];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-      dxmt_apitrace_record_command_buffer_feedback(
-          (obj_handle_t)retainedSelf,
-          feedback.error ? APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_ERROR
-                         : APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_COMPLETED,
-          feedback.GPUStartTime,
-          feedback.GPUEndTime,
-          feedback.error && feedback.error.localizedDescription ? feedback.error.localizedDescription : @"");
-      [retainedSelf release];
+      NSError *error = feedback.error;
+      if (perfFeedback && error) {
+        fprintf(stderr,
+                "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
+                " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
+                " completionCurrent=%" PRIu64 " waitCount=%lu signalCount=%lu drawable=%d"
+                " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
+                (void *)(uintptr_t)feedbackCommandBuffer,
+                (void *)(uintptr_t)feedbackMetalBuffer,
+                (void *)(uintptr_t)feedbackQueue,
+                feedbackQueueDepth,
+                feedbackCompletionValue,
+                feedbackCompletionEvent.signaledValue,
+                (unsigned long)feedbackWaitEvents.count,
+                (unsigned long)feedbackSignalEvents.count,
+                feedbackHasDrawable,
+                feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
+                feedback.GPUStartTime, feedback.GPUEndTime,
+                error.domain ? error.domain.UTF8String : "<no domain>",
+                (long)error.code,
+                error.localizedDescription ? error.localizedDescription.UTF8String
+                                           : "<no description>");
+
+        NSUInteger waitIndex = 0;
+        for (DXMTMetal4QueueEvent *wait in feedbackWaitEvents) {
+          uint64_t current = dxmt_metal4_shared_event_value(wait.event);
+          fprintf(stderr,
+                  "err:   DXMT Metal4 commit feedback wait: commandBuffer=%p index=%lu"
+                  " event=%p target=%" PRIu64 " current=%" PRIu64 " blocked=%d\n",
+                  (void *)(uintptr_t)feedbackCommandBuffer,
+                  (unsigned long)waitIndex++, wait.event,
+                  wait.value, current, current < wait.value);
+        }
+
+        NSUInteger signalIndex = 0;
+        for (DXMTMetal4QueueEvent *signal in feedbackSignalEvents) {
+          uint64_t current = dxmt_metal4_shared_event_value(signal.event);
+          fprintf(stderr,
+                  "err:   DXMT Metal4 commit feedback signal: commandBuffer=%p index=%lu"
+                  " event=%p target=%" PRIu64 " current=%" PRIu64 "\n",
+                  (void *)(uintptr_t)feedbackCommandBuffer,
+                  (unsigned long)signalIndex++, signal.event,
+                  signal.value, current);
+        }
+        fflush(stderr);
+      }
+#if DXMT_APITRACE_METAL
+      if (traceFeedback) {
+        dxmt_apitrace_record_command_buffer_feedback(
+            feedbackCommandBuffer,
+            error ? APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_ERROR
+                  : APITRACE_METAL_COMMAND_BUFFER_FEEDBACK_COMPLETED,
+            feedback.GPUStartTime,
+            feedback.GPUEndTime,
+            error && error.localizedDescription ? error.localizedDescription : @"");
+      }
+#endif
+      [feedbackLabel release];
+      [feedbackSignalEvents release];
+      [feedbackWaitEvents release];
+      [feedbackCompletionEvent release];
     }];
   }
-#endif
 
   id<MTL4CommandBuffer> commandBuffers[1] = {_metal4Buffer};
   _internalStatus = DXMTMetal4CommandBufferStateCommitted;
@@ -919,7 +1035,58 @@ dxmt_metal4_is_buffer(id object) {
   if (_internalStatus == DXMTMetal4CommandBufferStateNotEnqueued)
     [self commit];
   if (_completionValue) {
-    [_owner.event waitUntilSignaledValue:_completionValue timeoutMS:UINT64_MAX];
+    if (!dxmt_metal4_perf_stats_enabled()) {
+      [_owner.event waitUntilSignaledValue:_completionValue timeoutMS:UINT64_MAX];
+    } else {
+      uint64_t wait_begin_us = dxmt_monotonic_us();
+      uint64_t timeout_count = 0;
+      while (![_owner.event waitUntilSignaledValue:_completionValue timeoutMS:1000]) {
+        timeout_count++;
+        uint64_t elapsed_ms = (dxmt_monotonic_us() - wait_begin_us) / 1000;
+        if (timeout_count <= 5 || (timeout_count % 5) == 0) {
+          uint64_t completion_current = _owner.event.signaledValue;
+          uint64_t present_current = _owner.presentEvent.signaledValue;
+          fprintf(stderr,
+                  "warn:  DXMT Metal4 completion stall: commandBuffer=%p metalBuffer=%p queue=%p"
+                  " elapsedMs=%" PRIu64 " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64
+                  " waitCount=%lu signalCount=%lu drawable=%d presentTarget=%" PRIu64
+                  " presentCurrent=%" PRIu64 "\n",
+                  self, _metal4Buffer, _owner.metal4Queue, elapsed_ms,
+                  _completionValue, completion_current,
+                  (unsigned long)_pendingWaitEvents.count,
+                  (unsigned long)_pendingSignalEvents.count,
+                  _pendingDrawable != nil, _owner.presentEventValue,
+                  present_current);
+          NSUInteger wait_index = 0;
+          for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
+            uint64_t wait_current = dxmt_metal4_shared_event_value(wait.event);
+            fprintf(stderr,
+                    "warn:  DXMT Metal4 completion wait: commandBuffer=%p index=%lu event=%p"
+                    " target=%" PRIu64 " current=%" PRIu64 " blocked=%d\n",
+                    self, (unsigned long)wait_index++, wait.event,
+                    wait.value, wait_current, wait_current < wait.value);
+          }
+          NSUInteger signal_index = 0;
+          for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents) {
+            uint64_t signal_current = dxmt_metal4_shared_event_value(signal.event);
+            fprintf(stderr,
+                    "warn:  DXMT Metal4 completion signal: commandBuffer=%p index=%lu event=%p"
+                    " target=%" PRIu64 " current=%" PRIu64 "\n",
+                    self, (unsigned long)signal_index++, signal.event,
+                    signal.value, signal_current);
+          }
+          fflush(stderr);
+        }
+      }
+      if (timeout_count) {
+        fprintf(stderr,
+                "warn:  DXMT Metal4 completion recovered: commandBuffer=%p elapsedMs=%" PRIu64
+                " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64 "\n",
+                self, (dxmt_monotonic_us() - wait_begin_us) / 1000,
+                _completionValue, _owner.event.signaledValue);
+        fflush(stderr);
+      }
+    }
     if (_internalStatus == DXMTMetal4CommandBufferStateCommitted)
       _internalStatus = DXMTMetal4CommandBufferStateCompleted;
   }
@@ -3630,11 +3797,7 @@ _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_mtlcommandbuffer_commit_stats *params = obj;
   DXMTMetal4CommandBuffer *cmdbuf = (DXMTMetal4CommandBuffer *)params->handle;
   params->ret_residency_submit_us = 0;
-  if (cmdbuf.pendingDrawable && dxmt_metal4_present_ordering_enabled()) {
-    @synchronized(cmdbuf.owner) {
-      params->ret_residency_submit_us = [cmdbuf commitLocked];
-    }
-  } else {
+  @synchronized(cmdbuf.owner) {
     params->ret_residency_submit_us = [cmdbuf commitLocked];
   }
   return STATUS_SUCCESS;
