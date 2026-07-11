@@ -2928,6 +2928,7 @@ public:
 
       const auto caps = GetD3D12FormatCapability(device_->device(), format);
       if (IsSupportedD3D12SampleCount(data->SampleCount) &&
+          device_->device().supportsTextureSampleCount(data->SampleCount) &&
           (data->SampleCount == 1 || HasFormatCapability(caps, FormatCapability::MSAA)))
         data->NumQualityLevels = 1;
       return S_OK;
@@ -4904,6 +4905,14 @@ private:
     fclose(marker);
   }
 
+  bool IsResourceDescSupportedByDevice(
+      const D3D12_RESOURCE_DESC &desc) const {
+    if (!d3d12::IsSupportedResourceDesc(desc))
+      return false;
+    return desc.SampleDesc.Count == 1 ||
+           device_->device().supportsTextureSampleCount(desc.SampleDesc.Count);
+  }
+
   bool GetResourceSizeAndAlignment(const D3D12_RESOURCE_DESC &desc,
                                    UINT64 &size,
                                    UINT64 &alignment) const {
@@ -4920,7 +4929,7 @@ private:
     }
 
     WMTSizeAndAlign metal_size_and_align = {};
-    if (!d3d12::IsSupportedResourceDesc(desc) ||
+    if (!IsResourceDescSupportedByDevice(desc) ||
         !d3d12::GetTextureHeapSizeAndAlign(
             device_->device(), desc, metal_size_and_align))
       return false;
@@ -5258,7 +5267,7 @@ private:
       D3D12_RESOURCE_STATES initial_state) const {
     if (!IsValidHeapProperties(heap_properties) || !desc)
       return false;
-    if (!d3d12::IsSupportedResourceDesc(*desc))
+    if (!IsResourceDescSupportedByDevice(*desc))
       return false;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
@@ -5296,7 +5305,7 @@ private:
                                    D3D12_RESOURCE_STATES initial_state) const {
     if (!desc)
       return false;
-    if (!d3d12::IsSupportedResourceDesc(*desc))
+    if (!IsResourceDescSupportedByDevice(*desc))
       return false;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
@@ -5340,7 +5349,7 @@ private:
       D3D12_RESOURCE_STATES initial_state) const {
     if (!desc)
       return "null-desc";
-    if (!d3d12::IsSupportedResourceDesc(*desc))
+    if (!IsResourceDescSupportedByDevice(*desc))
       return "unsupported-desc";
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
@@ -5431,7 +5440,7 @@ private:
       return;
     }
 
-    if (!(strict_resource_desc ? d3d12::IsSupportedResourceDesc(*desc)
+    if (!(strict_resource_desc ? IsResourceDescSupportedByDevice(*desc)
                                : IsValidCopyableFootprintDesc(*desc))) {
       set_invalid();
       return;

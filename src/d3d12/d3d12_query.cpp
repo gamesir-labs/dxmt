@@ -272,8 +272,14 @@ private:
 
     page->occupied[d3d_index] = true;
     query.setSampleIndex(d3d_index);
+
+    // Preserve these arguments before moving the page into the callback.
+    // Function argument evaluation order does not guarantee that page->heap
+    // and page->entry_size are read before the lambda capture moves page.
+    auto resolve_heap = page->heap;
+    const auto resolve_entry_size = page->entry_size;
     query.setResolveSource(
-        page->heap, page->entry_size,
+        resolve_heap, resolve_entry_size,
         [state = std::move(state), page = std::move(page)](uint64_t slot) {
           ReleaseTimestampSample(*state, page, slot);
         });

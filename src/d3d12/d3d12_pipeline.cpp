@@ -2048,7 +2048,8 @@ template <typename PipelineInfo>
 void
 ApplyBlendState(PipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
-                uint32_t render_target_count) {
+                uint32_t render_target_count,
+                const FormatCapabilityInspector &format_capabilities) {
   for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
     const auto &src =
         blend_desc.RenderTarget[blend_desc.IndependentBlendEnable ? rt : 0];
@@ -2058,6 +2059,15 @@ ApplyBlendState(PipelineInfo &info,
                kColorWriteMaskMap[15]);
     if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid)
       continue;
+
+    const auto format_capability =
+        format_capabilities.textureCapabilities.find(dst.pixel_format);
+    if (format_capability == format_capabilities.textureCapabilities.end() ||
+        !any_bit_set(format_capability->second & FormatCapability::Blend)) {
+      WARN("D3D12PipelineState: ignoring blending on non-blendable RTV slot=",
+           rt, " format=", dst.pixel_format);
+      continue;
+    }
 
     dst.blending_enabled = true;
     dst.rgb_blend_operation =
@@ -2412,6 +2422,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (!ValidateGraphicsRenderFormats(device, state, rtv_formats,
                                      depth_format, stencil_format))
     return false;
+  FormatCapabilityInspector format_capabilities;
+  format_capabilities.Inspect(device->GetMTLDevice());
 
   SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
   ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
@@ -2556,7 +2568,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
           info.colors[i].pixel_format = rtv_formats[i];
       }
-      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
         info.depth_pixel_format = depth_format;
@@ -2642,7 +2655,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
           info.colors[i].pixel_format = rtv_formats[i];
       }
-      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
         info.depth_pixel_format = depth_format;
@@ -2712,7 +2726,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
       info.colors[i].pixel_format = rtv_formats[i];
   }
-  ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+  ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                  format_capabilities);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
     info.depth_pixel_format = depth_format;
@@ -3954,6 +3969,14 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   if (FAILED(hr)) {
     dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
+    return nullptr;
+  }
+  if (!device->GetMTLDevice().supportsTextureSampleCount(
+          graphics_state.desc.SampleDesc.Count)) {
+    WARN("D3D12PipelineState: unsupported Metal sample count ",
+         graphics_state.desc.SampleDesc.Count);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
+    StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
 

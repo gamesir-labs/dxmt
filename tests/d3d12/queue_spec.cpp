@@ -393,6 +393,36 @@ TEST_F(D3D12QueueSpec, ResolveQueryRecordDoesNotRetainItsCommandList) {
   EXPECT_TRUE(destroyed->load(std::memory_order_acquire));
 }
 
+TEST_F(D3D12QueueSpec, EndsAndResolvesTimestampQuery) {
+  D3D12_QUERY_HEAP_DESC query_desc = {};
+  query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  query_desc.Count = 2;
+  ComPtr<ID3D12QueryHeap> query_heap;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateQueryHeap(
+      &query_desc, __uuidof(ID3D12QueryHeap),
+      reinterpret_cast<void **>(query_heap.put()))));
+
+  ComPtr<ID3D12Resource> result = context_.CreateBuffer(
+      sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(result);
+
+  context_.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  context_.list()->ResolveQueryData(query_heap.get(),
+                                    D3D12_QUERY_TYPE_TIMESTAMP, 0, 1,
+                                    result.get(), 0);
+  EXPECT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+
+  UINT64 *timestamp = nullptr;
+  D3D12_RANGE read_range = {0, sizeof(*timestamp)};
+  ASSERT_TRUE(SUCCEEDED(result->Map(
+      0, &read_range, reinterpret_cast<void **>(&timestamp))));
+  ASSERT_NE(timestamp, nullptr);
+  EXPECT_NE(*timestamp, ~UINT64{0});
+  D3D12_RANGE written_range = {};
+  result->Unmap(0, &written_range);
+}
+
 TEST_F(D3D12QueueSpec, ReleasingQueueCancelsAnUnresolvedFenceWait) {
   D3D12_COMMAND_QUEUE_DESC queue_desc = {};
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

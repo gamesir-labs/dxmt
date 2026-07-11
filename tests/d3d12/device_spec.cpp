@@ -369,6 +369,68 @@ TEST_F(D3D12DeviceSpec, RejectsStreamOutputAtPipelineCreation) {
   release_object(root_signature);
 }
 
+TEST_F(D3D12DeviceSpec, IgnoresSharedBlendStateForReportedNonBlendableTarget) {
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = UINT_MAX;
+  range.BaseShaderRegister = 1;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[0].DescriptorTable.pDescriptorRanges = &range;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants.ShaderRegister = 0;
+  parameters[1].Constants.Num32BitValues = 1;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
+  ID3D12RootSignature *root_signature =
+      CreateRootSignature(device_, root_desc);
+  ASSERT_NE(root_signature, nullptr);
+
+  DXGI_FORMAT non_blendable_format = DXGI_FORMAT_UNKNOWN;
+  for (const DXGI_FORMAT format : {
+           DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_SINT,
+           DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_SINT,
+           DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT}) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+    support.Format = format;
+    ASSERT_EQ(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                           &support, sizeof(support)),
+              S_OK);
+    if ((support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) &&
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE)) {
+      non_blendable_format = format;
+      break;
+    }
+  }
+  ASSERT_NE(non_blendable_format, DXGI_FORMAT_UNKNOWN);
+
+  auto desc = BasicGraphicsPipelineDesc(root_signature);
+  desc.NumRenderTargets = 2;
+  desc.RTVFormats[1] = non_blendable_format;
+  desc.BlendState.IndependentBlendEnable = FALSE;
+  auto &shared_blend = desc.BlendState.RenderTarget[0];
+  shared_blend.BlendEnable = TRUE;
+  shared_blend.SrcBlend = D3D12_BLEND_ONE;
+  shared_blend.DestBlend = D3D12_BLEND_ZERO;
+  shared_blend.BlendOp = D3D12_BLEND_OP_ADD;
+  shared_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+  shared_blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+  shared_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+
+  ID3D12PipelineState *pipeline = nullptr;
+  EXPECT_EQ(device_->CreateGraphicsPipelineState(
+                &desc, __uuidof(ID3D12PipelineState),
+                reinterpret_cast<void **>(&pipeline)),
+            S_OK);
+  EXPECT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(root_signature);
+}
+
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
 TEST_F(D3D12DeviceSpec, RejectsPipelineStreamMixingComputeAndPixelShaders) {
   ID3D12Device2 *device2 = nullptr;
