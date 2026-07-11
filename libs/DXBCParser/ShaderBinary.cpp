@@ -1107,7 +1107,17 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
 //*****************************************************************************
 BOOL CInstruction::Disassemble(LPSTR pString,
                                UINT StringSize) {
-  strcpy(pString, g_InstructionInfo[m_OpCode].m_Name);
+  if (!pString || !StringSize)
+    return FALSE;
+
+  const char *name = g_InstructionInfo[m_OpCode].m_Name;
+  const size_t length = strlen(name);
+  if (length >= StringSize) {
+    pString[0] = '\0';
+    return FALSE;
+  }
+
+  memcpy(pString, name, length + 1);
   return TRUE;
 }
 
