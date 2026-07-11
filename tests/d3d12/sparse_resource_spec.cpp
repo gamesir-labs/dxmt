@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <array>
+#include <algorithm>
 
 namespace {
 
@@ -67,7 +69,9 @@ protected:
     return heap;
   }
 
-  void SampleTexture(ID3D12DescriptorHeap *descriptor_heap) {
+  void SampleTexture(ID3D12DescriptorHeap *descriptor_heap,
+                     std::array<std::uint32_t, 28> *results) {
+    constexpr std::uint32_t sentinel = 0xf17e5a3cu;
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
@@ -90,11 +94,21 @@ protected:
     ComPtr<ID3D12PipelineState> pipeline = context_.CreateComputePipeline(
         root_signature.get(), SparseTextureComputeShader());
     ASSERT_TRUE(pipeline);
+    std::array<std::uint32_t, 28> initial_values = {};
+    initial_values.fill(sentinel);
+    ComPtr<ID3D12Resource> initial = context_.CreateUploadBuffer(
+        sizeof(initial_values), initial_values.data(), sizeof(initial_values));
     ComPtr<ID3D12Resource> output = context_.CreateBuffer(
-        28 * sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+        sizeof(initial_values), D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(initial);
     ASSERT_TRUE(output);
+    context_.list()->CopyBufferRegion(output.get(), 0, initial.get(), 0,
+                                      sizeof(initial_values));
+    D3D12TestContext::Transition(
+        context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     ID3D12DescriptorHeap *heaps[] = {descriptor_heap};
     context_.list()->SetDescriptorHeaps(1, heaps);
@@ -105,7 +119,18 @@ protected:
     context_.list()->SetComputeRootUnorderedAccessView(
         1, output->GetGPUVirtualAddress());
     context_.list()->Dispatch(1, 1, 1);
-    ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+    D3D12TestContext::Transition(
+        context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<std::uint8_t> bytes;
+    ASSERT_TRUE(SUCCEEDED(
+        context_.ReadbackBuffer(output.get(), sizeof(*results), &bytes)));
+    ASSERT_EQ(bytes.size(), sizeof(*results));
+    std::memcpy(results->data(), bytes.data(), sizeof(*results));
+    EXPECT_TRUE(std::none_of(
+        results->begin(), results->end(), [sentinel](std::uint32_t value) {
+          return value == sentinel;
+        }));
   }
 
   void CopyToTexture(ID3D12Resource *texture) {
@@ -215,9 +240,10 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
     ASSERT_TRUE(backing_heap);
   }
 
-  if (sample_case)
-    SampleTexture(descriptor_heap.get());
-  else
+  if (sample_case) {
+    std::array<std::uint32_t, 28> results = {};
+    SampleTexture(descriptor_heap.get(), &results);
+  } else
     CopyToTexture(texture.get());
 }
 
@@ -251,6 +277,40 @@ TEST_F(D3D12SparseResourceSpec, CopiesIntoUnmappedReservedTexture) {
 
 TEST_F(D3D12SparseResourceSpec, CopiesIntoMappedReservedTexture) {
   RunCase(SparseCase::CopyToMapped);
+}
+
+TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  constexpr UINT16 array_size = 3;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 512;
+  desc.Height = 512;
+  desc.DepthOrArraySize = array_size;
+  desc.MipLevels = 10;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+      reinterpret_cast<void **>(texture.put()))));
+  ASSERT_TRUE(texture);
+
+  D3D12_PACKED_MIP_INFO packed = {};
+  D3D12_TILE_SHAPE shape = {};
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
+                                       &shape, nullptr, 0, nullptr);
+  ASSERT_GT(packed.NumPackedMips, 0u);
+  EXPECT_EQ(packed.NumTilesForPackedMips, array_size);
+  EXPECT_GE(total_tiles, packed.NumTilesForPackedMips);
 }
 
 } // namespace

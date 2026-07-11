@@ -3,8 +3,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 
+#include <atomic>
 #include <iomanip>
+#include <thread>
 
 namespace {
 
@@ -83,4 +86,55 @@ TEST_F(D3D11DeviceSpec, CreatesDefaultVertexBuffer) {
   EXPECT_NE(buffer, nullptr);
 
   release_object(buffer);
+}
+
+TEST_F(D3D11DeviceSpec, RejectsUnsupportedPipelineStatisticsQuery) {
+  D3D11_QUERY_DESC desc = {};
+  desc.Query = D3D11_QUERY_PIPELINE_STATISTICS;
+  ID3D11Query *query = nullptr;
+  EXPECT_EQ(device_->CreateQuery(&desc, &query), E_NOTIMPL);
+  EXPECT_EQ(query, nullptr);
+
+  desc.Query = D3D11_QUERY_OCCLUSION;
+  EXPECT_TRUE(HResultSucceeded(device_->CreateQuery(&desc, &query)));
+  EXPECT_NE(query, nullptr);
+  release_object(query);
+}
+
+TEST_F(D3D11DeviceSpec, IgnoresInvalidCommandListWithoutCrashing) {
+  context_->ExecuteCommandList(nullptr, FALSE);
+  SUCCEED();
+}
+
+TEST_F(D3D11DeviceSpec, AllowsRecursiveContextEntryWhileAnotherThreadWaits) {
+  ID3D11Multithread *multithread = nullptr;
+  ASSERT_TRUE(HResultSucceeded(context_->QueryInterface(
+      __uuidof(ID3D11Multithread),
+      reinterpret_cast<void **>(&multithread))));
+  ASSERT_NE(multithread, nullptr);
+  multithread->SetMultithreadProtected(TRUE);
+  ASSERT_TRUE(multithread->GetMultithreadProtected());
+
+  std::atomic_bool contender_started = false;
+  std::atomic_bool contender_completed = false;
+  multithread->Enter();
+  std::thread contender([&] {
+    contender_started.store(true, std::memory_order_release);
+    multithread->Enter();
+    multithread->Leave();
+    contender_completed.store(true, std::memory_order_release);
+  });
+  while (!contender_started.load(std::memory_order_acquire))
+    Sleep(0);
+
+  // Give the contender time to block on the outer Enter, then exercise an
+  // immediate-context method that recursively acquires the same protection
+  // lock. A waiter must not hold a transition gate needed by this recursion.
+  Sleep(25);
+  context_->Flush();
+  multithread->Leave();
+  contender.join();
+
+  EXPECT_TRUE(contender_completed.load(std::memory_order_acquire));
+  multithread->Release();
 }
