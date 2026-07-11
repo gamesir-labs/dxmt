@@ -59,6 +59,7 @@ d3d11_backend_dll = shared_library('d3d11_dxmt', d3d11_src, d3d10_src, d3d11_bac
   include_directories : [ dxmt_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,
+  install_tag         : 'runtime-metal3',
   vs_module_defs      : 'd3d11_dxmt.def',
   link_args           : d3d11_ld_args,
   link_depends        : [ d3d11_link_depends ],
@@ -71,6 +72,7 @@ d3d11_dll = shared_library('d3d11', d3d11_stub_src, d3d11_res,
   include_directories : [ dxmt_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,
+  install_tag         : 'runtime-metal3',
   vs_module_defs      : 'd3d11.def',
   link_args           : d3d11_ld_args,
   link_depends        : [ d3d11_link_depends ],
@@ -82,19 +84,21 @@ d3d11_dep = declare_dependency(
 )
 
 if wine_builtin_dll
-custom_target('postprocess_libd3d11_dxmt',
+d3d11_backend_postprocess = custom_target('postprocess_libd3d11_dxmt',
   input : d3d11_backend_dll,
   output: 'd3d11_dxmt.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d11_backend_dll,
   build_by_default : true
 )
+d3d11_postprocess_targets += [d3d11_backend_postprocess]
 
-custom_target('postprocess_libd3d11',
+d3d11_postprocess = custom_target('postprocess_libd3d11',
   input : d3d11_dll,
   output: 'd3d11.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d11_dll,
   build_by_default : true
 )
+d3d11_postprocess_targets += [d3d11_postprocess]
 endif

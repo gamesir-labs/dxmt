@@ -6,7 +6,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 WINE_SOURCE=""
 INSTALLROOT=""
-CACHE_DIR="${PROJECT_ROOT}/.cache/wine-runtime/x86_64"
+MANAGED_CACHE_ROOT="${DXMT_MANAGED_CACHE_ROOT:-${PROJECT_ROOT}/.cache/managed}"
+CACHE_DIR="${MANAGED_CACHE_ROOT}/wine-runtime/x86_64"
 
 usage() {
   cat <<USAGE
@@ -131,7 +132,7 @@ write_runtime_state() {
 
   runtime_dylibs_sha256="$({
     while IFS= read -r -d '' dylib; do
-      relative_path="${dylib#${INSTALLROOT}/lib/}"
+      relative_path="${dylib#"${INSTALLROOT}"/lib/}"
       if [[ -L "${dylib}" ]]; then
         printf 'link=%s:%s\n' "${relative_path}" "$(readlink "${dylib}")"
       else

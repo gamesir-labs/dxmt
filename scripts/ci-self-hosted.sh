@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CACHE_ROOT="${REPO_ROOT}/.cache"
-TOOLCHAINS_DIR="${CACHE_ROOT}/toolchains"
+CACHE_ROOT="${DXMT_MANAGED_CACHE_ROOT:-${REPO_ROOT}/.cache/managed}"
+TOOLCHAINS_DIR="${CACHE_ROOT}/deps"
 DOWNLOADS_DIR="${CACHE_ROOT}/downloads"
 ARTIFACTS_DIR="${CACHE_ROOT}/artifacts"
 SOURCES_DIR="${CACHE_ROOT}/sources"
@@ -14,8 +14,6 @@ LLVM_VERSION="${LLVM_VERSION:-llvmorg-15.0.7}"
 WINE_VERSION="${WINE_VERSION:-proton-11.0-macos}"
 WINE_GIT_URL="${WINE_GIT_URL:-https://github.com/gamesir123/wine-proton-macos.git}"
 WINE_GIT_BRANCH="${WINE_GIT_BRANCH:-proton-11.0-macos}"
-WINE_ARM64EC_VERSION="${WINE_ARM64EC_VERSION:-wine-11.2}"
-WINE_ARM64EC_URL="${WINE_ARM64EC_URL:-https://github.com/3Shain/wine/releases/download/wine-11.2/wine-11.2.tar.gz}"
 LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-20251216}"
 LLVM_MINGW_DIR="${LLVM_MINGW_DIR:-llvm-mingw-20251216-ucrt-macos-universal}"
 MESON_VERSION="${MESON_VERSION:-1.10.0}"
@@ -61,9 +59,9 @@ setup_paths() {
   for pybin in "${HOME}"/Library/Python/*/bin; do
     append_path "${pybin}"
   done
-  if [[ -d "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin" ]]; then
-    append_path "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin"
-  fi
+  for llvm_mingw in "${TOOLCHAINS_DIR}"/llvm-mingw-*; do
+    [[ -d "${llvm_mingw}/bin" ]] && append_path "${llvm_mingw}/bin"
+  done
 }
 
 ensure_root() {
@@ -106,6 +104,7 @@ ensure_homebrew_build_tools() {
   ensure_command_or_formula bison bison
   ensure_command_or_formula x86_64-w64-mingw32-gcc mingw-w64
   ensure_command_or_formula i686-w64-mingw32-gcc mingw-w64
+  ensure_command_or_formula ccache ccache
   ensure_command_or_formula gh gh
 }
 
@@ -336,7 +335,11 @@ download_file() {
   local output="$2"
   if [[ ! -f "${output}" ]]; then
     log "downloading ${url}"
-    curl -fL "${url}" -o "${output}"
+    local temporary="${output}.incomplete-$$"
+    trap 'rm -f "${temporary}"' RETURN
+    curl -fL "${url}" -o "${temporary}"
+    mv "${temporary}" "${output}"
+    trap - RETURN
   fi
 }
 
@@ -499,13 +502,23 @@ prepare_dxmt_wine_runtime_cache() {
 
 ensure_wine_x86_64() {
   ensure_root
-  local source_dir target install_dir commit stamp
+  local source_dir target install_dir commit stamp fingerprint temporary
   source_dir="${SOURCES_DIR}/wine-proton-macos-$(safe_name "${WINE_GIT_BRANCH}")"
-  target="${TOOLCHAINS_DIR}/wine-x86_64-${WINE_VERSION}"
   WINE_SOURCE_COMMIT=""
   sync_wine_git_source "${source_dir}"
   commit="${WINE_SOURCE_COMMIT}"
   [[ -n "${commit}" ]] || die "Wine source commit is empty"
+  fingerprint="$(printf '%s\n' \
+    "schema=1" "version=${WINE_VERSION}" "commit=${commit}" \
+    "build_m1=$(shasum -a 256 "${source_dir}/scripts/build_on_m1.sh" | awk '{print $1}')" \
+    "build_intel=$(shasum -a 256 "${source_dir}/scripts/build_on_intel.sh" | awk '{print $1}')" \
+    "runtime=$(shasum -a 256 "${REPO_ROOT}/scripts/prepare-wine-runtime-cache.sh" | awk '{print $1}')" \
+    | shasum -a 256 | awk '{print substr($1,1,16)}')"
+  target="${TOOLCHAINS_DIR}/wine-x86_64-${WINE_VERSION}-${fingerprint}"
+  if wine_install_ready "${target}" && [[ -f "${target}/.dxmt-builder-dependency" ]]; then
+    log "Wine x86_64 immutable dependency already prepared: ${target}"
+    return
+  fi
   install_dir="${source_dir}/install"
   stamp="${install_dir}/.dxmt-ci-source-commit"
 
@@ -528,26 +541,13 @@ ensure_wine_x86_64() {
   wine_install_ready "${install_dir}" ||
     die "DXMT Wine runtime cache is incomplete after dependency preparation: ${install_dir}"
 
-  ln -sfn "${install_dir}" "${target}"
-}
-
-ensure_wine_arm64ec() {
-  ensure_root
-  local version url target archive
-  version="${WINE_ARM64EC_VERSION}"
-  url="${WINE_ARM64EC_URL}"
-  target="${TOOLCHAINS_DIR}/wine-arm64ec-${version}"
-  archive="${DOWNLOADS_DIR}/wine-arm64ec-${version}.tar.gz"
-
-  if [[ -f "${target}/.dxmt-ci-ready" ]]; then
-    log "Wine arm64ec already prepared: ${target}"
-    return
-  fi
-  rm -rf "${target}"
-  mkdir -p "${target}"
-  download_file "${url}" "${archive}"
-  tar -zxf "${archive}" --strip-components 2 -C "${target}"
-  touch "${target}/.dxmt-ci-ready"
+  temporary="${target}.incomplete-$$"
+  rm -rf "${temporary}"
+  mkdir -p "${temporary}"
+  cp -a "${install_dir}/." "${temporary}/"
+  printf 'schema=1\nfingerprint=%s\nsource_commit=%s\n' \
+    "${fingerprint}" "${commit}" > "${temporary}/.dxmt-builder-dependency"
+  mv "${temporary}" "${target}"
 }
 
 ensure_wine() {
@@ -555,9 +555,6 @@ ensure_wine() {
   case "${flavor}" in
     x86_64)
       ensure_wine_x86_64
-      ;;
-    arm64ec)
-      ensure_wine_arm64ec
       ;;
     *)
       die "unknown Wine flavor: ${flavor}"
@@ -567,27 +564,38 @@ ensure_wine() {
 
 ensure_llvm_mingw() {
   ensure_root
-  local target="${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}"
+  local target archive_hash temporary extraction
   local archive="${DOWNLOADS_DIR}/${LLVM_MINGW_DIR}.tar.xz"
+  download_file "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_DIR}.tar.xz" "${archive}"
+  archive_hash="$(shasum -a 256 "${archive}" | awk '{print substr($1,1,16)}')"
+  target="${TOOLCHAINS_DIR}/llvm-mingw-${LLVM_MINGW_VERSION}-${archive_hash}"
   if [[ -x "${target}/bin/x86_64-w64-mingw32-gcc" ]]; then
     log "LLVM-MinGW already prepared: ${target}"
     return
   fi
-  rm -rf "${target}"
-  download_file "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_DIR}.tar.xz" "${archive}"
-  mkdir -p "${TOOLCHAINS_DIR}"
-  tar -xf "${archive}" -C "${TOOLCHAINS_DIR}"
+  temporary="${target}.incomplete-$$"
+  extraction="${temporary}-extract"
+  rm -rf "${temporary}" "${extraction}"
+  mkdir -p "${extraction}"
+  tar -xf "${archive}" -C "${extraction}"
+  mv "${extraction}/${LLVM_MINGW_DIR}" "${temporary}"
+  rm -rf "${extraction}"
+  printf 'schema=1\narchive_sha256=%s\n' "$(shasum -a 256 "${archive}" | awk '{print $1}')" \
+    > "${temporary}/.dxmt-builder-dependency"
+  mv "${temporary}" "${target}"
 }
 
 ensure_llvm_project() {
   ensure_root
   local target="${TOOLCHAINS_DIR}/llvm-project-${LLVM_VERSION}"
+  local temporary="${target}.incomplete-$$"
   if [[ -d "${target}/llvm" ]]; then
     log "LLVM source already prepared: ${target}"
     return
   fi
-  rm -rf "${target}"
-  git clone --depth 1 --branch "${LLVM_VERSION}" https://github.com/llvm/llvm-project.git "${target}"
+  rm -rf "${temporary}"
+  git clone --depth 1 --branch "${LLVM_VERSION}" https://github.com/llvm/llvm-project.git "${temporary}"
+  mv "${temporary}" "${target}"
 }
 
 llvm_project_dir() {
@@ -596,19 +604,25 @@ llvm_project_dir() {
 
 ensure_llvm_darwin() {
   local arch="$1"
+  [[ "${arch}" == "x86_64" ]] || die "only x86_64 LLVM Darwin dependencies are supported"
   ensure_root
   setup_paths
-  local target="${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-${arch}"
-  local build="${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-${arch}-build"
-  if [[ -d "${target}/lib" || -d "${target}/include" ]]; then
+  local fingerprint target temporary build
+  fingerprint="$(printf '%s\n' "schema=1" "version=${LLVM_VERSION}" "arch=${arch}" \
+    'assertions=on' 'zstd=off' 'targets=' 'tools=off' 'tests=off' \
+    'benchmarks=off' 'examples=off' | shasum -a 256 | awk '{print substr($1,1,16)}')"
+  target="${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-${fingerprint}-${arch}"
+  temporary="${target}.incomplete-$$"
+  build="${temporary}-build"
+  if [[ -f "${target}/.dxmt-builder-dependency" ]]; then
     log "LLVM Darwin ${arch} already prepared: ${target}"
     return
   fi
   ensure_llvm_project
-  rm -rf "${build}" "${target}"
+  rm -rf "${build}" "${temporary}"
   mkdir -p "${build}"
   cmake -B "${build}" -S "$(llvm_project_dir)/llvm" \
-    -DCMAKE_INSTALL_PREFIX="${target}" \
+    -DCMAKE_INSTALL_PREFIX="${temporary}" \
     -DCMAKE_OSX_ARCHITECTURES="${arch}" \
     -DLLVM_HOST_TRIPLE="${arch}-apple-darwin" \
     -DLLVM_ENABLE_ASSERTIONS=On \
@@ -616,44 +630,62 @@ ensure_llvm_darwin() {
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_TARGETS_TO_BUILD="" \
     -DLLVM_BUILD_TOOLS=Off \
+    -DLLVM_INCLUDE_TESTS=Off \
+    -DLLVM_INCLUDE_BENCHMARKS=Off \
+    -DLLVM_INCLUDE_EXAMPLES=Off \
     -DBUG_REPORT_URL="https://github.com/gamesir-labs/dxmt" \
     -DPACKAGE_VENDOR="DXMT" \
     -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
     -G Ninja
-  cmake --build "${build}" --parallel "$(sysctl -n hw.ncpu)"
-  cmake --install "${build}"
+  cmake --build "${build}" --target install --parallel "$(sysctl -n hw.ncpu)"
+  printf 'schema=1\nfingerprint=%s\n' "${fingerprint}" > "${temporary}/.dxmt-builder-dependency"
+  mv "${temporary}" "${target}"
+  rm -rf "${build}"
 }
 
 ensure_llvm_win() {
   ensure_root
   setup_paths
-  local target="${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-x86_64-w64-mingw32"
-  local build="${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-x86_64-w64-mingw32-build"
-  if [[ -d "${target}/lib" || -d "${target}/include" ]]; then
+  local fingerprint target temporary build llvm_mingw
+  fingerprint="$(printf '%s\n' "schema=1" "version=${LLVM_VERSION}" \
+    'host=x86_64-w64-mingw32' 'assertions=on' 'zstd=off' 'targets=' 'tools=off' \
+    'tests=off' 'benchmarks=off' 'examples=off' \
+    | shasum -a 256 | awk '{print substr($1,1,16)}')"
+  target="${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-${fingerprint}-x86_64-w64-mingw32"
+  temporary="${target}.incomplete-$$"
+  build="${temporary}-build"
+  if [[ -f "${target}/.dxmt-builder-dependency" ]]; then
     log "LLVM Windows already prepared: ${target}"
     return
   fi
   ensure_llvm_project
   ensure_llvm_mingw
-  rm -rf "${build}" "${target}"
+  llvm_mingw="$(find "${TOOLCHAINS_DIR}" -maxdepth 1 -type d -name 'llvm-mingw-*' | sort | tail -1)"
+  [[ -n "${llvm_mingw}" ]] || die "managed LLVM-MinGW dependency was not found"
+  rm -rf "${build}" "${temporary}"
   mkdir -p "${build}"
-  append_path "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin"
+  append_path "${llvm_mingw}/bin"
   cmake -B "${build}" -S "$(llvm_project_dir)/llvm" -DCMAKE_SYSTEM_NAME=Windows \
-    -DCMAKE_INSTALL_PREFIX="${target}" \
+    -DCMAKE_INSTALL_PREFIX="${temporary}" \
     -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32 \
     -DLLVM_ENABLE_ASSERTIONS=On \
     -DLLVM_ENABLE_ZSTD=Off \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_TARGETS_TO_BUILD="" \
     -DLLVM_BUILD_TOOLS=Off \
-    -DCMAKE_SYSROOT="${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}" \
+    -DLLVM_INCLUDE_TESTS=Off \
+    -DLLVM_INCLUDE_BENCHMARKS=Off \
+    -DLLVM_INCLUDE_EXAMPLES=Off \
+    -DCMAKE_SYSROOT="${llvm_mingw}" \
     -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
     -DBUG_REPORT_URL="https://github.com/gamesir-labs/dxmt" \
     -DPACKAGE_VENDOR="DXMT" \
     -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
     -G Ninja
-  cmake --build "${build}" --parallel "$(sysctl -n hw.ncpu)"
-  cmake --install "${build}"
+  cmake --build "${build}" --target install --parallel "$(sysctl -n hw.ncpu)"
+  printf 'schema=1\nfingerprint=%s\n' "${fingerprint}" > "${temporary}/.dxmt-builder-dependency"
+  mv "${temporary}" "${target}"
+  rm -rf "${build}"
 }
 
 prepare_job() {
@@ -664,22 +696,25 @@ prepare_job() {
 
 link_toolchains() {
   local wine_flavor="${1:-x86_64}"
+  local wine_target llvm_darwin_x64 llvm_win
   mkdir -p "${TOOLCHAINS_DIR}"
   case "${wine_flavor}" in
     x86_64)
-      ln -sfn "${TOOLCHAINS_DIR}/wine-x86_64-${WINE_VERSION}" "${TOOLCHAINS_DIR}/wine"
-      ;;
-    arm64ec)
-      ln -sfn "${TOOLCHAINS_DIR}/wine-arm64ec-${WINE_ARM64EC_VERSION}" "${TOOLCHAINS_DIR}/wine"
+      wine_target="$(find "${TOOLCHAINS_DIR}" -maxdepth 1 -type d -name 'wine-x86_64-*' | sort | tail -1)"
       ;;
     *)
       die "unknown Wine flavor for link-toolchains: ${wine_flavor}"
       ;;
   esac
-  ln -sfn "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-x86_64" "${TOOLCHAINS_DIR}/llvm-darwin"
-  ln -sfn "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-arm64" "${TOOLCHAINS_DIR}/llvm-darwin-arm64"
-  ln -sfn "${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-x86_64-w64-mingw32" "${TOOLCHAINS_DIR}/llvm"
-  append_path "${TOOLCHAINS_DIR}/${LLVM_MINGW_DIR}/bin"
+  [[ -n "${wine_target}" ]] || die "managed Wine dependency is missing"
+  ln -sfn "${wine_target}" "${TOOLCHAINS_DIR}/wine"
+  llvm_darwin_x64="$(find "${TOOLCHAINS_DIR}" -maxdepth 1 -type d -name 'llvm-darwin-*-x86_64' | sort | tail -1)"
+  llvm_win="$(find "${TOOLCHAINS_DIR}" -maxdepth 1 -type d -name 'llvm-win-*-x86_64-w64-mingw32' | sort | tail -1)"
+  [[ -n "${llvm_darwin_x64}" ]] && ln -sfn "${llvm_darwin_x64}" "${TOOLCHAINS_DIR}/llvm-darwin"
+  [[ -n "${llvm_win}" ]] && ln -sfn "${llvm_win}" "${TOOLCHAINS_DIR}/llvm"
+  for llvm_mingw in "${TOOLCHAINS_DIR}"/llvm-mingw-*; do
+    [[ -d "${llvm_mingw}/bin" ]] && append_path "${llvm_mingw}/bin"
+  done
 }
 
 artifact_dir() {
@@ -722,7 +757,7 @@ stage_files() {
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
       printf '### DXMT local artifact\n\n'
-      printf '`%s`\n' "${dest}"
+      printf '%s\n' "\`${dest}\`"
     } >> "${GITHUB_STEP_SUMMARY}"
   fi
 }
@@ -764,7 +799,7 @@ restore_staged_files() {
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
       {
         printf '### DXMT restored local artifact\n\n'
-        printf '`%s`\n' "${source}"
+        printf '%s\n' "\`${source}\`"
       } >> "${GITHUB_STEP_SUMMARY}"
     fi
     return 0
@@ -812,12 +847,12 @@ usage: ci-self-hosted.sh <command> [args]
 commands:
   setup-host
   prepare-job
-  ensure-wine <x86_64|arm64ec>
+  ensure-wine <x86_64>
   ensure-llvm-mingw
   ensure-llvm-project
-  ensure-llvm-darwin <x86_64|arm64>
+  ensure-llvm-darwin <x86_64>
   ensure-llvm-win
-  link-toolchains [x86_64|arm64ec]
+  link-toolchains [x86_64]
   stage-artifact <name> <source-dir>
   copy-artifact <name> <dest-dir>
   stage-files <name> <file>...

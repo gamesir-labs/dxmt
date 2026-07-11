@@ -42,7 +42,7 @@ if dxmt_apitrace_metal_enabled
   winemetal4_unix_c_args += ['-DDXMT_APITRACE_METAL=1']
 endif
 
-shared_library('winemetal4', winemetal4_unix_src,
+winemetal4_unix_lib = shared_library('winemetal4', winemetal4_unix_src,
   name_prefix         : '',
   dependencies        : winemetal4_unix_deps,
   include_directories : winemetal4_unix_include_dirs,
@@ -56,8 +56,9 @@ shared_library('winemetal4', winemetal4_unix_src,
   build_rpath         : '@loader_path/:@loader_path/../../',
   override_options    : { 'b_asneeded' : false },
 )
+winemetal4_runtime_targets += [winemetal4_unix_lib]
 
 meson.add_install_script(
   'install.sh', get_option('strip').to_string(), unix_install_dir,
-  install_tag: 'runtime'
+  install_tag: 'runtime-metal4'
 )

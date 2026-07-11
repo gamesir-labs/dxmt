@@ -3,8 +3,7 @@
 #include "wineunixlib.h"
 #include <stdint.h>
 
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__aarch64__) &&       \
-    !defined(__arm64ec__) && !defined(_M_ARM64) && !defined(_M_ARM64EC)
+#if defined(__x86_64__) || defined(_M_X64)
 #define DXMT_FH4_BYPASS_HAS_X64_GS 1
 #endif
 

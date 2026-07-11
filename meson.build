@@ -16,6 +16,10 @@ clangpp = meson.get_compiler('cpp', native: true)
 
 cpu_family = host_machine.cpu_family()
 
+if cpu_family != 'x86' and cpu_family != 'x86_64'
+  error('DXMT currently supports only x86 and x86_64 targets')
+endif
+
 dxmt_include_dirs = [
   './include',
   './libs'
@@ -225,23 +229,50 @@ else
 endif
 
 xcrun = find_program('xcrun')
-
-metalir_generator = generator(xcrun,
-  output    : [ '@BASENAME@.air'],
-  arguments : [ '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
-)
-
-metallib_generator = generator(xcrun,
-  output    : [ '@BASENAME@.metallib'],
-  arguments : [ '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@'],
-)
-
 xxd = find_program('xxd')
+dxmt_builder_path = get_option('dxmt_builder_path')
+dxmt_cache_root = get_option('dxmt_cache_root')
 
-hexdump_generator = generator(xxd,
-  output    : [ '@BASENAME@.h'],
-  arguments : [ '-n', '@BASENAME@', '-i', '@INPUT@', '@OUTPUT@'],
-)
+if dxmt_builder_path != ''
+  dxmt_builder = find_program(dxmt_builder_path)
+  metalir_generator = generator(dxmt_builder,
+    output: ['@BASENAME@.air'],
+    arguments: [
+      'internal', 'cache-command', '--namespace', 'metal',
+      '--output', '@OUTPUT@', '--input', '@INPUT@', '--',
+      xcrun.full_path(), '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@',
+    ],
+  )
+  metallib_generator = generator(dxmt_builder,
+    output: ['@BASENAME@.metallib'],
+    arguments: [
+      'internal', 'cache-command', '--namespace', 'metal',
+      '--output', '@OUTPUT@', '--input', '@INPUT@', '--',
+      xcrun.full_path(), '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@',
+    ],
+  )
+  hexdump_generator = generator(dxmt_builder,
+    output: ['@BASENAME@.h'],
+    arguments: [
+      'internal', 'cache-command', '--namespace', 'metal',
+      '--output', '@OUTPUT@', '--input', '@INPUT@', '--',
+      xxd.full_path(), '-n', '@BASENAME@', '-i', '@INPUT@', '@OUTPUT@',
+    ],
+  )
+else
+  metalir_generator = generator(xcrun,
+    output    : [ '@BASENAME@.air'],
+    arguments : [ '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
+  )
+  metallib_generator = generator(xcrun,
+    output    : [ '@BASENAME@.metallib'],
+    arguments : [ '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@'],
+  )
+  hexdump_generator = generator(xxd,
+    output    : [ '@BASENAME@.h'],
+    arguments : [ '-n', '@BASENAME@', '-i', '@INPUT@', '@OUTPUT@'],
+  )
+endif
 
 dxmt_debug = get_option('dxmt_debug')
 
@@ -299,13 +330,6 @@ if dxmt_crossbuild
       windows_native_install_dir = 'system32'
     endif
     windows_builtin_install_dir = 'x86_64-windows'
-  elif cpu_family == 'aarch64'
-    if wine_builtin_dll
-      windows_native_install_dir = 'aarch64-windows'
-    else
-      windows_native_install_dir = 'system32'
-    endif
-    windows_builtin_install_dir = 'aarch64-windows'
   else
     error('invalid cpu family')
   endif
@@ -412,7 +436,7 @@ if wine_runtime_required and wine_build_path == ''
   endif
 endif
 
-native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'
+native_compiler_arch = 'x86_64'
 
 add_project_arguments(cpp.get_supported_arguments(compiler_args), language: 'cpp')
 add_project_arguments(clangpp.get_supported_arguments(native_compiler_args), language: 'cpp', native: true)

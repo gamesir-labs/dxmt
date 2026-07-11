@@ -10,13 +10,12 @@
 
 #pragma once
 
-#if (defined(__x86_64__) && !defined(__arm64ec__)) || (defined(_M_X64) && !defined(_M_ARM64EC)) \
-    || defined(__i386__) ||  defined(_M_IX86)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define DXMT_ARCH_X86
 #if defined(__x86_64__) || defined(_M_X64)
 #define DXMT_ARCH_X86_64
 #endif
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
+#elif defined(__aarch64__) || defined(_M_ARM64)
 #define DXMT_ARCH_ARM64
 #else
 #error "Unknown CPU Architecture"
