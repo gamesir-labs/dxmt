@@ -174,6 +174,45 @@ TEST_F(D3D12QueueSpec, ReportsTimestampFrequency) {
   UINT64 frequency = 0;
   ASSERT_TRUE(SUCCEEDED(context_.queue()->GetTimestampFrequency(&frequency)));
   EXPECT_GT(frequency, 0ull);
+TEST_F(D3D12QueueSpec, PreservesLongBlitDependencyChainAcrossEncoders) {
+  constexpr UINT kLinkCount = 32;
+  const std::array<std::uint32_t, 16> expected = {
+      0x0badc0de, 0x10203040, 0x50607080, 0x90a0b0c0,
+      0xd0e0f001, 0x12345678, 0x89abcdef, 0xfedcba98,
+      0x76543210, 0x13579bdf, 0x2468ace0, 0x55aa55aa,
+      0xaa55aa55, 0x01010101, 0x7f7f7f7f, 0xffffffff,
+  };
+  auto upload = context_.CreateUploadBuffer(
+      sizeof(expected), expected.data(), sizeof(expected));
+  ASSERT_TRUE(upload);
+
+  std::array<ComPtr<ID3D12Resource>, kLinkCount> buffers;
+  for (auto &buffer : buffers) {
+    buffer = context_.CreateBuffer(
+        sizeof(expected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(buffer);
+  }
+
+  context_.list()->CopyBufferRegion(buffers[0].get(), 0, upload.get(), 0,
+                                    sizeof(expected));
+  D3D12TestContext::Transition(
+      context_.list(), buffers[0].get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  for (UINT index = 1; index < kLinkCount; ++index) {
+    context_.list()->CopyBufferRegion(
+        buffers[index].get(), 0, buffers[index - 1].get(), 0,
+        sizeof(expected));
+    D3D12TestContext::Transition(
+        context_.list(), buffers[index].get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  }
+
+  std::vector<std::uint8_t> actual;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackBuffer(
+      buffers.back().get(), sizeof(expected), &actual)));
+  ASSERT_EQ(actual.size(), sizeof(expected));
+  EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
 }
 
 TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {

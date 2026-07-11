@@ -5150,14 +5150,12 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandUpdateFence: {
       struct wmtcmd_blit_fence_op *body = (struct wmtcmd_blit_fence_op *)next;
-      [(id)encoder barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageBlit];
       break;
     }
     case WMTBlitCommandWaitForFence: {
       struct wmtcmd_blit_fence_op *body = (struct wmtcmd_blit_fence_op *)next;
       [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageBlit];
-      [(id)encoder barrierAfterQueueStages:MTLStageBlit beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTBlitCommandFillBuffer: {
@@ -5290,14 +5288,12 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTComputeCommandUpdateFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [(id)encoder barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageDispatch];
       break;
     }
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
       [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageDispatch];
-      [(id)encoder barrierAfterQueueStages:MTLStageDispatch beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTComputeCommandMemoryBarrier: {
@@ -5649,7 +5645,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandUpdateFence: {
       struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
       MTLStages stages = dxmt_metal4_render_stages(body->stages);
-      [(id)encoder barrierAfterStages:stages beforeQueueStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
       [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:stages];
       break;
     }
@@ -5657,7 +5652,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
       MTLStages stages = dxmt_metal4_render_stages(body->stages);
       [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:stages];
-      [(id)encoder barrierAfterQueueStages:stages beforeStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTRenderCommandSetViewport: {
