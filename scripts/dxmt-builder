@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+build_dir="$repo_root/.cache/managed/bootstrap/dxmt-builder"
+lock_dir="$repo_root/.cache/managed/locks"
+lock_path="$lock_dir/dxmt-builder-bootstrap.lock"
+owner_path="$lock_path/owner"
+
+for tool in meson ninja; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'dxmt-builder requires %s; install prerequisites with: brew install meson ninja\n' "$tool" >&2
+    exit 2
+  fi
+done
+if ! command -v clang++ >/dev/null 2>&1; then
+  printf '%s\n' 'dxmt-builder requires Apple Clang; install Xcode Command Line Tools.' >&2
+  exit 2
+fi
+
+mkdir -p "$lock_dir"
+while ! mkdir "$lock_path" 2>/dev/null; do
+  if [ -f "$owner_path" ]; then
+    owner=$(sed -n '1p' "$owner_path" 2>/dev/null || true)
+    case $owner in
+      ''|*[!0-9]*) ;;
+      *)
+        if ! kill -0 "$owner" 2>/dev/null; then
+          rm -rf "$lock_path"
+          continue
+        fi
+        ;;
+    esac
+  fi
+  sleep 1
+done
+printf '%s\n' "$$" > "$owner_path"
+cleanup() {
+  rm -f "$owner_path"
+  rmdir "$lock_path" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+if [ ! -f "$build_dir/meson-private/coredata.dat" ]; then
+  rm -rf "$build_dir"
+  meson setup "$build_dir" "$repo_root/tools/dxmt-builder" --buildtype release >&2
+fi
+meson compile -C "$build_dir" >&2
+
+binary="$build_dir/dxmt-builder"
+if [ ! -x "$binary" ]; then
+  printf 'dxmt-builder binary was not produced: %s\n' "$binary" >&2
+  exit 1
+fi
+
+cleanup
+trap - EXIT HUP INT TERM
+export DXMT_REPO_ROOT="$repo_root"
+export DXMT_BUILDER_BINARY="$binary"
+exec "$binary" "$@"
