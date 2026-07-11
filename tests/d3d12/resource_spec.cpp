@@ -258,6 +258,8 @@ TEST_F(D3D12ResourceSpec, PreservesPlacedTextureContentsAcrossAliasing) {
   aliasing.Aliasing.pResourceBefore = before.get();
   aliasing.Aliasing.pResourceAfter = after.get();
   context_.list()->ResourceBarrier(1, &aliasing);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
   D3D12TestContext::Transition(
       context_.list(), after.get(), D3D12_RESOURCE_STATE_COPY_DEST,
       D3D12_RESOURCE_STATE_COPY_SOURCE);

@@ -10,6 +10,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -80,8 +81,11 @@ struct ScopedBarrierOnlyMarker {
     std::ifstream input(path);
     size_t count = 0;
     std::string line;
-    while (std::getline(input, line))
-      count += line == "standalone";
+    while (std::getline(input, line)) {
+      constexpr std::string_view prefix = "barrierOnly=";
+      if (line.rfind(prefix.data(), 0) == 0)
+        count += std::stoull(line.substr(prefix.size()));
+    }
     return count;
   }
 
@@ -117,6 +121,7 @@ std::vector<ComPtr<ID3D12GraphicsCommandList>> CreateBarrierOnlyLists(
 }
 
 TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
+  ScopedBarrierOnlyMarker marker("copy-barrier-readback");
   const std::array<std::uint32_t, 16> expected = {
       0x01020304, 0x11121314, 0x21222324, 0x31323334, 0x41424344, 0x51525354,
       0x61626364, 0x71727374, 0x81828384, 0x91929394, 0xa1a2a3a4, 0xb1b2b3b4,
@@ -138,11 +143,14 @@ TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
   D3D12TestContext::Transition(context_.list(), destination.get(),
                                D3D12_RESOURCE_STATE_COPY_DEST,
                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
   std::vector<std::uint8_t> actual;
   ASSERT_TRUE(SUCCEEDED(
       context_.ReadbackBuffer(destination.get(), sizeof(expected), &actual)));
   ASSERT_EQ(actual.size(), sizeof(expected));
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
+  EXPECT_EQ(marker.Count(), 0u);
 }
 
 TEST_F(D3D12QueueSpec, CompletesFenceSignalsInValueOrder) {
@@ -233,6 +241,8 @@ TEST_F(D3D12QueueSpec, ReportsTimestampFrequency) {
   UINT64 frequency = 0;
   ASSERT_TRUE(SUCCEEDED(context_.queue()->GetTimestampFrequency(&frequency)));
   EXPECT_GT(frequency, 0ull);
+}
+
 TEST_F(D3D12QueueSpec, PreservesLongBlitDependencyChainAcrossEncoders) {
   constexpr UINT kLinkCount = 32;
   const std::array<std::uint32_t, 16> expected = {
@@ -274,8 +284,8 @@ TEST_F(D3D12QueueSpec, PreservesLongBlitDependencyChainAcrossEncoders) {
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
 }
 
-TEST_F(D3D12QueueSpec, CoalescesTrailingBarriersWithinOneExecute) {
-  constexpr UINT kListCount = 32;
+TEST_F(D3D12QueueSpec, BarrierStormDoesNotEncodeStandaloneWork) {
+  constexpr UINT kListCount = 1000;
   ScopedBarrierOnlyMarker marker("coalesced");
   auto resource = context_.CreateBuffer(
       4096, D3D12_HEAP_TYPE_DEFAULT,
@@ -292,11 +302,11 @@ TEST_F(D3D12QueueSpec, CoalescesTrailingBarriersWithinOneExecute) {
   context_.queue()->ExecuteCommandLists(static_cast<UINT>(raw_lists.size()),
                                         raw_lists.data());
   ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
-  EXPECT_EQ(marker.Count(), 1u);
+  EXPECT_EQ(marker.Count(), 0u);
 }
 
-TEST_F(D3D12QueueSpec, PreservesBarrierBoundaryAcrossSeparateExecutes) {
-  constexpr UINT kExecuteCount = 8;
+TEST_F(D3D12QueueSpec, CarriesBarriersAcrossSeparateExecutes) {
+  constexpr UINT kExecuteCount = 64;
   ScopedBarrierOnlyMarker marker("separate-executes");
   auto resource = context_.CreateBuffer(
       4096, D3D12_HEAP_TYPE_DEFAULT,
@@ -312,7 +322,7 @@ TEST_F(D3D12QueueSpec, PreservesBarrierBoundaryAcrossSeparateExecutes) {
     context_.queue()->ExecuteCommandLists(1, &raw_list);
   }
   ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
-  EXPECT_EQ(marker.Count(), kExecuteCount);
+  EXPECT_EQ(marker.Count(), 0u);
 }
 
 TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {

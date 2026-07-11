@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 
 #define ASYNC_ENCODING 1
 
@@ -101,6 +102,15 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
 
   diagnostic.barrier_only_pass_count =
       statistics.blit_barrier_only_pass_count - barrier_only_before;
+  const auto barrier_marker =
+      env::getEnvVar("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER");
+  if (!barrier_marker.empty()) {
+    if (FILE *marker = fopen(barrier_marker.c_str(), "a")) {
+      fprintf(marker, "barrierOnly=%u\n",
+              diagnostic.barrier_only_pass_count);
+      fclose(marker);
+    }
+  }
   const uint64_t d3d_sequence = dxmt::apitrace::d3d_enabled()
                                     ? dxmt::apitrace::current_d3d_sequence()
                                     : chunk_id;
