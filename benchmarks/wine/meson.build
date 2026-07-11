@@ -14,12 +14,22 @@ ue_d3d12_initialization = executable(
   install: false,
 )
 
+d3dcompiler_47_dep = cpp.find_library('d3dcompiler_47')
+
 wine_benchmark_suites = {
   'd3d12-integration': {
     'sources': files('d3d12_integration_benchmark.cpp'),
     'dependencies': [d3d12_runtime_support_dep],
     'mode': 'integration',
     'suite': ['wine', 'integration', 'd3d12'],
+    'timeout': 600,
+  },
+  'd3d12-pipeline-creation': {
+    'sources': files('d3d12_pipeline_creation_benchmark.cpp'),
+    'dependencies': [d3d12_dep, d3dcompiler_47_dep],
+    'include_directories': [include_directories('../../tests/include')],
+    'mode': 'integration',
+    'suite': ['wine', 'integration', 'd3d12', 'pipeline'],
     'timeout': 600,
   },
   'ue-rhi-initialization': {
