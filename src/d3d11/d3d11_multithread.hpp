@@ -8,13 +8,14 @@ class d3d11_device_mutex {
 public:
   void lock();
   void unlock() noexcept;
-  bool try_lock() { return true; }
+  bool try_lock();
 
   bool set_protected(bool Protected);
   bool get_protected();
 
 private:
-  bool protected_ = false;
+  std::atomic_bool protected_{false};
+  std::atomic_flag transition_ = ATOMIC_FLAG_INIT;
   std::atomic_uint32_t owner_ = 0;
   uint32_t counter_ = 0;
 };

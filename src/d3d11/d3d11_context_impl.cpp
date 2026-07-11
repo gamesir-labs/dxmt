@@ -18,6 +18,7 @@ since it is for internal use only
 #include "d3d11_pipeline.hpp"
 #include "d3d11_query.hpp"
 #include "dxmt_apitrace_d3d.hpp"
+#include "dxmt_argument_buffer.hpp"
 #include "dxmt_buffer.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
@@ -1506,11 +1507,14 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->StartVertex = StartVertexLocation;
-      draw_argument->VertexCount = VertexCountPerInstance;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = StartInstanceLocation;
+      if (!TryWriteMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+              enc, draw_arguments_offset, [&](DXMT_DRAW_ARGUMENTS &draw_argument) {
+                draw_argument.StartVertex = StartVertexLocation;
+                draw_argument.VertexCount = VertexCountPerInstance;
+                draw_argument.InstanceCount = InstanceCount;
+                draw_argument.StartInstance = StartInstanceLocation;
+              }))
+        return;
 
       auto PatchCountPerInstance = VertexCountPerInstance / NumControlPoint;
       auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
@@ -1546,12 +1550,16 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->BaseVertex = BaseVertexLocation;
-      draw_argument->IndexCount = IndexCountPerInstance;
-      draw_argument->StartIndex = StartIndexLocation;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = BaseInstance;
+      if (!TryWriteMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+              enc, draw_arguments_offset,
+              [&](DXMT_DRAW_INDEXED_ARGUMENTS &draw_argument) {
+                draw_argument.BaseVertex = BaseVertexLocation;
+                draw_argument.IndexCount = IndexCountPerInstance;
+                draw_argument.StartIndex = StartIndexLocation;
+                draw_argument.InstanceCount = InstanceCount;
+                draw_argument.StartInstance = BaseInstance;
+              }))
+        return;
 
       auto PatchCountPerInstance = IndexCountPerInstance / NumControlPoint;
       auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
@@ -1589,11 +1597,14 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->StartVertex = StartVertexLocation;
-      draw_argument->VertexCount = VertexCountPerInstance;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = StartInstanceLocation;
+      if (!TryWriteMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+              enc, draw_arguments_offset, [&](DXMT_DRAW_ARGUMENTS &draw_argument) {
+                draw_argument.StartVertex = StartVertexLocation;
+                draw_argument.VertexCount = VertexCountPerInstance;
+                draw_argument.InstanceCount = InstanceCount;
+                draw_argument.StartInstance = StartInstanceLocation;
+              }))
+        return;
 
       auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
       auto warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
@@ -1623,12 +1634,16 @@ public:
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->BaseVertex = BaseVertexLocation;
-      draw_argument->IndexCount = IndexCountPerInstance;
-      draw_argument->StartIndex = StartIndexLocation;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = BaseInstance;
+      if (!TryWriteMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+              enc, draw_arguments_offset,
+              [&](DXMT_DRAW_INDEXED_ARGUMENTS &draw_argument) {
+                draw_argument.BaseVertex = BaseVertexLocation;
+                draw_argument.IndexCount = IndexCountPerInstance;
+                draw_argument.StartIndex = StartIndexLocation;
+                draw_argument.InstanceCount = InstanceCount;
+                draw_argument.StartInstance = BaseInstance;
+              }))
+        return;
 
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
