@@ -1075,9 +1075,15 @@ public:
   ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
+    auto *command_list = dynamic_cast<MTLD3D11CommandList *>(pCommandList);
+    if (!command_list) {
+      WARN("D3D11ImmediateContext: ExecuteCommandList called with an invalid command list");
+      return;
+    }
+
     ResetEncodingContextState();
 
-    Com<MTLD3D11CommandList, false> cmdlist = static_cast<MTLD3D11CommandList *>(pCommandList);
+    Com<MTLD3D11CommandList, false> cmdlist = command_list;
     auto seq_id = ctx_state.cmd_queue.CurrentSeqId();
 
     promote_flush = cmdlist->promote_flush;
@@ -1186,7 +1192,11 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
-    auto fence = static_cast<MTLD3D11Fence *>(pFence);
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    auto fence = dynamic_cast<MTLD3D11Fence *>(pFence);
+    if (!fence)
+      return E_INVALIDARG;
 
     FlushAllPendingBufferUpdates();
     InvalidateCurrentPass();
@@ -1199,7 +1209,11 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *pFence, UINT64 Value) override {
-    auto fence = static_cast<MTLD3D11Fence *>(pFence);
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    auto fence = dynamic_cast<MTLD3D11Fence *>(pFence);
+    if (!fence)
+      return E_INVALIDARG;
 
     FlushAllPendingBufferUpdates();
     Flush();
