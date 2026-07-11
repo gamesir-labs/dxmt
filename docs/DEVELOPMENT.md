@@ -14,23 +14,30 @@
 
 The following documentation is NOT for beginners. You are assumed to be familiar with C/C++ compilers and build systems.
 
-## Project-local build state
+## Managed builder and project-local state
 
-All reusable build state lives under `.cache/` in the repository. Meson/Ninja
-directories use `.cache/build/<profile>`, managed Wine uses
-`.cache/wine/build/x86_64`, host runtime dependencies use
-`.cache/wine-runtime/x86_64`, and self-hosted toolchains and downloads use
-`.cache/toolchains` and `.cache/downloads`. These are fixed defaults, not CI
-overrides: local builds and self-hosted jobs use the same directories without
-cache environment variables or setup steps. Final install and package trees
-remain separate from this state.
+The supported entry point is the standalone C++20 builder. Its own Meson
+project lives in `tools/dxmt-builder` and is bootstrapped by the thin launcher:
+
+```sh
+scripts/dxmt-builder bootstrap host wine-x64 llvm-darwin-x64
+scripts/dxmt-builder build --profile gcc-x64-release-full runtime
+scripts/dxmt-builder test --profile gcc-x64-release-full all
+```
+
+All state owned by the builder lives under `.cache/managed`: stable Meson/Ninja
+profile directories, ccache, Metal and apitrace CAS entries, immutable Wine and
+LLVM dependencies, staged artifacts, locks, and telemetry. Existing directories
+outside `.cache/managed` are legacy state; the builder neither reads, prunes,
+nor deletes them.
+
+Use `scripts/dxmt-builder cache status`, `cache verify`, and `cache prune
+--dry-run` to inspect managed state. There is no automatic capacity eviction in
+the initial implementation.
 
 ## Setup LLVM
 
-First of all, you need to build LLVM (or use a pre-built LLVM package) no matter if you want to use DXMT with Wine or as a native library. Then you need to decide which architecture should you target for LLVM: `x86_64` or `arm64`.
-
-- For a **Cross Build**, you most likely want `x86_64` at the moment.
-- Otherwise you probably should use `arm64`, since Intel Macs and Rosetta 2 are being deprecated.
+First of all, you need to build LLVM (or use a pre-built LLVM package) no matter if you want to use DXMT with Wine or as a native library. DXMT currently standardizes Wine, test helpers, native tools, and native libraries on `x86_64`; the supported Windows targets are x86 and x86_64.
 
 This is an example of building `x86_64` LLVM
 ```sh
@@ -57,8 +64,6 @@ cmake --install ./.cache/toolchains/llvm-darwin-local-build
 
 Then `./.cache/toolchains/llvm-darwin-local` contains what we need later.
 
-For `arm64` target, just replace any occurance of `x86_64` to `arm64` above.
-
 ## Setup Wine
 
 > Skip this part if you are NOT doing a **Cross Build**
@@ -80,15 +85,13 @@ default Wine configure arguments are defined by `wine_configure_args` in
 Build (64-bit) Windows PE+ dlls **and** 64-bit unixlib (a Mach-O library with `.so` extension by convention).
 
 ```sh
-meson setup --cross-file build-win64.txt -Dnative_llvm_path=</path/to/llvm> .cache/build/x86_64-windows-release --buildtype release
-meson compile -C .cache/build/x86_64-windows-release
+scripts/dxmt-builder build --profile gcc-x64-release-full runtime
 ```
 
 (Optional) Build (32-bit) Windows PE dlls
 
 ```sh
-meson setup --cross-file build-win32.txt .cache/build/x86-windows-release --buildtype release
-meson compile -C .cache/build/x86-windows-release
+scripts/dxmt-builder build --profile gcc-x86-release runtime
 ```
 
 > You can't build 32-bit dlls only, they need 64-bit unixlib to be functional
@@ -155,8 +158,7 @@ Since this project contains code runs on macOS/Windows(Wine)/both, `clangd` may 
 Build all components as Mach-O .dylib
 
 ```sh
-meson setup -Dnative_llvm_path=</path/to/llvm> .cache/build/arm64-macos-release --buildtype release
-meson compile -C .cache/build/arm64-macos-release
+scripts/dxmt-builder build --profile apple-clang-x86_64-release runtime
 ```
 
 #### Side notes on building x86_64 target from arm64 device/environment

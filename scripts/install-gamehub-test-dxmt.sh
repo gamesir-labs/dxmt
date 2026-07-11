@@ -4,20 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-BUILD_DIR="${DXMT_BUILD_DIR:-${REPO_ROOT}/.cache/build/gamehub-runtime}"
-NATIVE_LLVM_PATH="${DXMT_NATIVE_LLVM_PATH:-/usr/local/opt/llvm@15}"
+BUILDER_PROFILE="${DXMT_BUILDER_PROFILE:-gcc-x64-release-full}"
 GAMEHUB_BUNDLE_ID="${GAMEHUB_BUNDLE_ID:-com.gamemac.test}"
 GAMEHUB_DXMT_PACKAGE="${GAMEHUB_DXMT_PACKAGE:-dxmt-v0.80}"
 GAMEHUB_DXMT_ROOT="${GAMEHUB_DXMT_ROOT:-${HOME}/Library/Application Support/${GAMEHUB_BUNDLE_ID}/wine-engine/downloads/${GAMEHUB_DXMT_PACKAGE}}"
 GAMEHUB_VERSION_MODE="${DXMT_GAMEHUB_VERSION_MODE:-auto}"
 GAMEHUB_VERSION_OVERRIDE="${DXMT_GAMEHUB_VERSION:-}"
 BACKUP_ROOT="${DXMT_GAMEHUB_BACKUP_ROOT:-${HOME}/Library/Caches/dxmt-runtime-smoke}"
-STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${REPO_ROOT}/.cache/stage/gamehub-test}"
+STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${REPO_ROOT}/.cache/managed/profiles/${BUILDER_PROFILE}/stage/gamehub-test}"
 BACKUP_TAG="${DXMT_GAMEHUB_BACKUP_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BACKUP_DIR="${BACKUP_ROOT}/gamehub-${GAMEHUB_DXMT_PACKAGE}-backup-${BACKUP_TAG}"
 ENABLE_APITRACE="${DXMT_GAMEHUB_ENABLE_APITRACE:-0}"
 APITRACE_OUTPUT_DIR="${DXMT_GAMEHUB_APITRACE_OUTPUT_DIR:-${REPO_ROOT}/tmp/gamehub-apitrace}"
-APITRACE_VERBOSE="${DXMT_GAMEHUB_APITRACE_VERBOSE:-0}"
 GAMEHUB_WINEDEBUG="${DXMT_GAMEHUB_WINEDEBUG:--all}"
 
 runtime_files=(
@@ -130,67 +128,21 @@ setup_tool_path() {
   export PATH
 }
 
-build_dir_source_root() {
-  local ninja_file="${BUILD_DIR}/build.ninja"
-  [[ -f "${ninja_file}" ]] || return 0
-
-  python3 - "${ninja_file}" <<'PY'
-import shlex
-import sys
-
-ninja_file = sys.argv[1]
-with open(ninja_file, "r", encoding="utf-8") as f:
-    for line in f:
-        if "meson --internal regenerate" not in line:
-            continue
-        command = line.split("=", 1)[1].strip() if "=" in line else line.strip()
-        parts = shlex.split(command)
-        try:
-            index = parts.index("regenerate")
-        except ValueError:
-            continue
-        if index + 1 < len(parts):
-            print(parts[index + 1])
-            sys.exit(0)
-sys.exit(0)
-PY
-}
-
-setup_build_dir() {
-  if [[ -f "${BUILD_DIR}/build.ninja" ]]; then
-    local source_root
-    source_root="$(build_dir_source_root)"
-    if [[ -z "${source_root}" || "${source_root}" == "${REPO_ROOT}" ]]; then
-      return
-    fi
-
-    log "removing stale build directory: ${BUILD_DIR}"
-    log "stale source root: ${source_root}"
-    rm -rf "${BUILD_DIR}"
-  fi
-
-  log "configuring builtin build: ${BUILD_DIR}"
-  meson setup \
-    --cross-file "${REPO_ROOT}/build-win64.txt" \
-    -Dnative_llvm_path="${NATIVE_LLVM_PATH}" \
-    --buildtype release \
-    "${BUILD_DIR}"
-}
-
-configure_build_version() {
-  log "configuring runtime version (${RUNTIME_VERSION_MODE}): ${RUNTIME_VERSION}"
-  meson configure "${BUILD_DIR}" -Ddxmt_version="${RUNTIME_VERSION}"
-}
-
 install_to_stage() {
   rm -rf "${STAGE_DIR}"
   mkdir -p "${STAGE_DIR}"
 
-  log "compiling builtin build"
-  meson compile -C "${BUILD_DIR}"
+  log "building managed profile: ${BUILDER_PROFILE}"
+  DXMT_BUILDER_DXMT_VERSION="${RUNTIME_VERSION}" \
+  DXMT_BUILDER_APITRACE="${ENABLE_APITRACE}" \
+    "${REPO_ROOT}/scripts/dxmt-builder" build \
+      --profile "${BUILDER_PROFILE}" runtime
 
-  log "installing runtime to staging root: ${STAGE_DIR}"
-  DESTDIR="${STAGE_DIR}" meson install -C "${BUILD_DIR}" --tags runtime,nvext
+  log "installing tested runtime to staging root: ${STAGE_DIR}"
+  DXMT_BUILDER_DXMT_VERSION="${RUNTIME_VERSION}" \
+  DXMT_BUILDER_APITRACE="${ENABLE_APITRACE}" \
+    "${REPO_ROOT}/scripts/dxmt-builder" install \
+      --profile "${BUILDER_PROFILE}" --component runtime --dest "${STAGE_DIR}"
 }
 
 verify_runtime_version() {
@@ -199,19 +151,6 @@ verify_runtime_version() {
   if ! grep -aFq "${RUNTIME_VERSION}" "${dll}"; then
     die "d3d12.dll does not contain expected version ${RUNTIME_VERSION}: ${dll}"
   fi
-}
-
-resolve_stage_prefix() {
-  local prefix
-  prefix="$(meson introspect "${BUILD_DIR}" --buildoptions | python3 -c 'import json, sys
-data = json.load(sys.stdin)
-for item in data:
-    if item.get("name") == "prefix":
-        print(item.get("value"))
-        break
-')"
-  [[ -n "${prefix}" ]] || die "failed to read Meson install prefix"
-  printf '%s%s\n' "${STAGE_DIR}" "${prefix}"
 }
 
 copy_runtime() {
@@ -315,12 +254,10 @@ main() {
   export RUNTIME_VERSION_MODE RUNTIME_VERSION
 
   setup_tool_path
-  setup_build_dir
-  configure_build_version
   install_to_stage
 
   local stage_prefix
-  stage_prefix="$(resolve_stage_prefix)"
+  stage_prefix="${STAGE_DIR}/usr/local"
   verify_runtime_version "${stage_prefix}/x86_64-windows/d3d12.dll"
   copy_runtime "${stage_prefix}"
   write_manifest
