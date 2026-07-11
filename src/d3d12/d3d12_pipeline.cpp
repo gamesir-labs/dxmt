@@ -1429,6 +1429,22 @@ GetShaderFlags() {
   return SM50_SHADER_FLAG(0);
 }
 
+template <typename PipelineInfo>
+bool AttachPSOBinaryArchive(
+    IMTLD3D12Device *device, PipelineInfo &info,
+    std::array<obj_handle_t, 1> &lookup_archives) {
+  auto *archive = device->GetPSOBinaryArchive();
+  if (!archive)
+    return false;
+
+  lookup_archives[0] = archive->handle;
+  info.binary_archive_for_serialization = archive->handle;
+  info.binary_archives_for_lookup.set(lookup_archives.data());
+  info.num_binary_archives_for_lookup = lookup_archives.size();
+  info.fail_on_binary_archive_miss = false;
+  return true;
+}
+
 std::mutex &
 PipelineMetalFunctionCacheMutex() {
   static std::mutex mutex;
@@ -2549,10 +2565,21 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         info.stencil_pixel_format = stencil_format;
       }
 
+      std::array<obj_handle_t, 1> lookup_archives = {};
+      const bool archive_attached =
+          AttachPSOBinaryArchive(device, info, lookup_archives);
       WMT::Reference<WMT::Error> error;
       uint64_t compile_wait_us = 0;
-      pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
-          info, error, &compile_wait_us);
+      auto create_pipeline = [&] {
+        pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+            info, error, &compile_wait_us);
+      };
+      if (archive_attached) {
+        std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+        create_pipeline();
+      } else {
+        create_pipeline();
+      }
       dxmt::perf::recordPsoCompileWaitTime(
           dxmt::perf::currentFrameStatistics(),
           std::chrono::microseconds(compile_wait_us));
@@ -2561,6 +2588,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
              error ? error.description().getUTF8String() : "unknown error");
         return false;
       }
+      if (archive_attached)
+        device->NotePSOBinaryArchivePipelineCreated();
       return true;
     };
 
@@ -2636,10 +2665,21 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         info.stencil_pixel_format = stencil_format;
       }
 
+      std::array<obj_handle_t, 1> lookup_archives = {};
+      const bool archive_attached =
+          AttachPSOBinaryArchive(device, info, lookup_archives);
       WMT::Reference<WMT::Error> error;
       uint64_t compile_wait_us = 0;
-      pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
-          info, error, &compile_wait_us);
+      auto create_pipeline = [&] {
+        pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+            info, error, &compile_wait_us);
+      };
+      if (archive_attached) {
+        std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+        create_pipeline();
+      } else {
+        create_pipeline();
+      }
       dxmt::perf::recordPsoCompileWaitTime(
           dxmt::perf::currentFrameStatistics(),
           std::chrono::microseconds(compile_wait_us));
@@ -2648,6 +2688,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
              error ? error.description().getUTF8String() : "unknown error");
         return false;
       }
+      if (archive_attached)
+        device->NotePSOBinaryArchivePipelineCreated();
       return true;
     };
 
@@ -2707,10 +2749,21 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     info.stencil_pixel_format = stencil_format;
   }
 
+  std::array<obj_handle_t, 1> lookup_archives = {};
+  const bool archive_attached =
+      AttachPSOBinaryArchive(device, info, lookup_archives);
   WMT::Reference<WMT::Error> error;
   uint64_t compile_wait_us = 0;
-  out.pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
-      info, error, &compile_wait_us);
+  auto create_pipeline = [&] {
+    out.pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+        info, error, &compile_wait_us);
+  };
+  if (archive_attached) {
+    std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+    create_pipeline();
+  } else {
+    create_pipeline();
+  }
   dxmt::perf::recordPsoCompileWaitTime(
       dxmt::perf::currentFrameStatistics(),
       std::chrono::microseconds(compile_wait_us));
@@ -2719,6 +2772,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
          error ? error.description().getUTF8String() : "unknown error");
     return false;
   }
+  if (archive_attached)
+    device->NotePSOBinaryArchivePipelineCreated();
   BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
   out.depth_stencil =
       CreateDepthStencilState(device, state.desc.DepthStencilState);
@@ -2790,11 +2845,23 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   const auto tgz = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[2]);
   info.tgsize_is_multiple_of_sgwidth = ((tgx * tgy * tgz) % 32) == 0;
 
+  std::array<obj_handle_t, 1> lookup_archives = {};
+  const bool archive_attached =
+      AttachPSOBinaryArchive(device, info, lookup_archives);
+
   auto create_pso = [&](std::string &error_desc) {
     WMT::Reference<WMT::Error> error;
     uint64_t compile_wait_us = 0;
-    out.pso = device->GetMTLDevice().newComputePipelineStateAndGetStats(
-        info, error, &compile_wait_us);
+    auto create_pipeline = [&] {
+      out.pso = device->GetMTLDevice().newComputePipelineStateAndGetStats(
+          info, error, &compile_wait_us);
+    };
+    if (archive_attached) {
+      std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+      create_pipeline();
+    } else {
+      create_pipeline();
+    }
     dxmt::perf::recordPsoCompileWaitTime(
         dxmt::perf::currentFrameStatistics(),
         std::chrono::microseconds(compile_wait_us));
@@ -2803,6 +2870,8 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
                          : "unknown error";
       return false;
     }
+    if (archive_attached)
+      device->NotePSOBinaryArchivePipelineCreated();
     error_desc.clear();
     return true;
   };

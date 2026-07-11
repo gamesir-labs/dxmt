@@ -9,7 +9,10 @@
 
 #include <array>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
+#include <sstream>
+#include <string>
 
 namespace {
 
@@ -67,6 +70,59 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC BasicGraphicsPipelineDesc(
   return desc;
 }
 
+struct ScopedArchiveTestEnvironment {
+  ScopedArchiveTestEnvironment(const char *suffix) {
+    std::ostringstream name;
+    name << "dxmt-pso-archive-" << GetCurrentProcessId() << "-" << suffix;
+    root = "C:\\" + name.str();
+    unix_cache_root = "/tmp/" + name.str();
+    windows_cache_root = "Z:\\tmp\\" + name.str();
+    marker = root + "\\marker.txt";
+    CreateDirectoryA(root.c_str(), nullptr);
+    CreateDirectoryA(windows_cache_root.c_str(), nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", "1");
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", unix_cache_root.c_str());
+    SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "1");
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY", "1");
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_MARKER", marker.c_str());
+  }
+
+  ~ScopedArchiveTestEnvironment() {
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_MARKER", nullptr);
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY", nullptr);
+    SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", nullptr);
+  }
+
+  std::string ReadMarker() const {
+    std::ifstream input(marker);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+  }
+
+  std::string root;
+  std::string unix_cache_root;
+  std::string windows_cache_root;
+  std::string marker;
+};
+
+ID3D12PipelineState *CreateBasicGraphicsPipeline(ID3D12Device *device) {
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto *root_signature = CreateRootSignature(device, root_desc);
+  if (!root_signature)
+    return nullptr;
+  auto desc = BasicGraphicsPipelineDesc(root_signature);
+  ID3D12PipelineState *pipeline = nullptr;
+  const auto hr = device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(&pipeline));
+  release_object(root_signature);
+  return SUCCEEDED(hr) ? pipeline : nullptr;
+}
+
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
 struct alignas(void *) ShaderPipelineSubobject {
   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
@@ -104,6 +160,52 @@ TEST(D3D12DeviceCreationSpec, RejectsFeatureLevel93) {
   EXPECT_EQ(device, nullptr);
 
   release_object(device);
+}
+
+TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
+  ScopedArchiveTestEnvironment environment("attached");
+  ID3D12Device *device = nullptr;
+  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(&device))));
+  ASSERT_NE(device, nullptr);
+
+  auto *pipeline = CreateBasicGraphicsPipeline(device);
+  ASSERT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(device);
+
+  const auto marker = environment.ReadMarker();
+  EXPECT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
+            std::string::npos)
+      << marker;
+}
+
+TEST(D3D12PipelineArchiveSpec, RejectsCorruptArchiveAndFallsBackToCompilation) {
+  ScopedArchiveTestEnvironment environment("corrupt");
+  const auto archive_dir =
+      environment.windows_cache_root + "\\com.apple.metal4";
+  ASSERT_TRUE(CreateDirectoryA(archive_dir.c_str(), nullptr) ||
+              GetLastError() == ERROR_ALREADY_EXISTS);
+  const auto archive_path = archive_dir + "\\dxmt_pso.binaryarchive";
+  {
+    std::ofstream corrupt(archive_path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(corrupt.good());
+    corrupt << "not-a-metal-binary-archive";
+  }
+
+  ID3D12Device *device = nullptr;
+  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(&device))));
+  ASSERT_NE(device, nullptr);
+  auto *pipeline = CreateBasicGraphicsPipeline(device);
+  EXPECT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(device);
+
+  const auto marker = environment.ReadMarker();
+  EXPECT_NE(marker.find("create cold=0 ok=0"), std::string::npos) << marker;
 }
 
 TEST_F(D3D12DeviceSpec, ReportsAtLeastOneNode) {

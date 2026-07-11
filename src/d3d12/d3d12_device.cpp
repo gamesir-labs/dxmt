@@ -79,6 +79,10 @@ Align(UINT64 value, UINT64 alignment) {
 
 static void
 LogPSOBinaryArchiveMarker(const char *format, ...) {
+  auto marker_path = env::getEnvVar("DXMT_PSO_ARCHIVE_MARKER");
+  if (marker_path.empty() && !D3D12DeviceDiagEnabled())
+    return;
+
   char message[1024];
 
   va_list args;
@@ -86,9 +90,8 @@ LogPSOBinaryArchiveMarker(const char *format, ...) {
   vsnprintf(message, sizeof(message), format, args);
   va_end(args);
 
-  fprintf(stderr, "%s\n", message);
-
-  auto marker_path = env::getEnvVar("DXMT_PSO_ARCHIVE_MARKER");
+  if (D3D12DeviceDiagEnabled())
+    fprintf(stderr, "%s\n", message);
   if (marker_path.empty())
     return;
 
@@ -2325,8 +2328,10 @@ class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device,
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
       : adapter_(adapter), device_(std::move(device)) {
+    const auto archive_setting = env::getEnvVar("DXMT_PSO_BINARY_ARCHIVE");
     pso_binary_archive_enabled_ =
-        env::getEnvVar("DXMT_PSO_BINARY_ARCHIVE") == "1";
+        env::getEnvVar("DXMT_SHADER_CACHE") != "0" &&
+        archive_setting != "0";
     if (pso_binary_archive_enabled_) {
       pso_binary_archive_serialize_every_ =
           GetPSOBinaryArchiveSerializeEvery();
