@@ -1688,6 +1688,49 @@ _MTLDevice_newBuffer(void *obj) {
 }
 
 static NTSTATUS
+_MTLHeap_newBuffer(void *obj) {
+  struct unixcall_mtlheap_newbuffer *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  struct WMTBufferInfo *info = params->info.ptr;
+  params->ret = 0;
+  if (!heap || !info || info->memory.ptr)
+    return STATUS_SUCCESS;
+
+  id<MTLBuffer> buffer = nil;
+  if (@available(macOS 10.15, *)) {
+    const MTLSizeAndAlign placement =
+        [heap.device heapBufferSizeAndAlignWithLength:info->length
+                                              options:(MTLResourceOptions)info->options];
+    const uint64_t heap_size = heap.size;
+    if (placement.align && !(params->offset % placement.align) &&
+        params->offset <= heap_size && placement.size <= heap_size - params->offset) {
+      buffer = [heap newBufferWithLength:info->length
+                                 options:(MTLResourceOptions)info->options
+                                  offset:params->offset];
+    }
+  }
+  params->ret = (obj_handle_t)buffer;
+  info->memory.ptr = buffer && [buffer storageMode] != MTLStorageModePrivate
+                         ? [buffer contents]
+                         : NULL;
+  info->gpu_address = buffer ? [buffer gpuAddress] : 0;
+#if DXMT_APITRACE_METAL
+  if (buffer && dxmt_apitrace_runtime_enabled()) {
+    pthread_mutex_lock(&dxmt_apitrace_lock);
+    if (dxmt_apitrace_ensure_session_locked()) {
+      apitrace_metal_buffer_gpu_address_metadata(
+          dxmt_apitrace_session, params->ret, [buffer gpuAddress]);
+      apitrace_metal_register_buffer(
+          dxmt_apitrace_session, params->ret, info->length,
+          (uint32_t)[buffer storageMode], NULL, 0);
+    }
+    pthread_mutex_unlock(&dxmt_apitrace_lock);
+  }
+#endif
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_newSamplerState(void *obj) {
   struct unixcall_mtldevice_newsamplerstate *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
@@ -1841,6 +1884,52 @@ _MTLDevice_newTexture(void *obj) {
 }
 
 static NTSTATUS
+_MTLHeap_newTexture(void *obj) {
+  struct unixcall_mtlheap_newtexture *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  struct WMTTextureInfo *info = params->info.ptr;
+  params->ret = 0;
+  if (!heap || !info)
+    return STATUS_SUCCESS;
+
+  MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+  fill_texture_descriptor(desc, info);
+  id<MTLTexture> texture = nil;
+  if (@available(macOS 10.15, *)) {
+    const MTLSizeAndAlign placement =
+        [heap.device heapTextureSizeAndAlignWithDescriptor:desc];
+    const uint64_t heap_size = heap.size;
+    if (placement.align && !(params->offset % placement.align) &&
+        params->offset <= heap_size && placement.size <= heap_size - params->offset) {
+      texture = [heap newTextureWithDescriptor:desc offset:params->offset];
+    }
+  }
+  params->ret = (obj_handle_t)texture;
+  info->gpu_resource_id = texture ? [texture gpuResourceID]._impl : 0;
+  info->mach_port = 0;
+#if DXMT_APITRACE_METAL
+  if (texture && dxmt_apitrace_runtime_enabled()) {
+    pthread_mutex_lock(&dxmt_apitrace_lock);
+    if (dxmt_apitrace_ensure_session_locked()) {
+      NSString *resource_payload = dxmt_apitrace_json_string(@{
+        @"kind" : @"dxmt_texture_gpu_resource_id",
+        @"texture_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)params->ret],
+        @"gpu_resource_id" : [NSNumber numberWithUnsignedLongLong:(unsigned long long)info->gpu_resource_id],
+      });
+      apitrace_metal_object_metadata(
+          dxmt_apitrace_session, params->ret, resource_payload.UTF8String);
+      NSString *descriptor_json = dxmt_apitrace_texture_descriptor_json(info);
+      apitrace_metal_register_texture(
+          dxmt_apitrace_session, params->ret, descriptor_json.UTF8String);
+    }
+    pthread_mutex_unlock(&dxmt_apitrace_lock);
+  }
+#endif
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_supportsPlacementSparse(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->handle;
@@ -1877,6 +1966,32 @@ _MTLDevice_sparseTileSize(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_heapTextureSizeAndAlign(void *obj) {
+  struct unixcall_mtldevice_heaptexturesizeandalign *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  const struct WMTTextureInfo *info = params->info.ptr;
+  struct WMTSizeAndAlign *size_and_align = params->size_and_align.ptr;
+  params->ret = 0;
+  if (!device || !info || !size_and_align)
+    return STATUS_SUCCESS;
+
+  size_and_align->size = 0;
+  size_and_align->alignment = 0;
+  if (@available(macOS 10.13, *)) {
+    struct WMTTextureInfo descriptor_info = *info;
+    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+    fill_texture_descriptor(desc, &descriptor_info);
+    const MTLSizeAndAlign placement =
+        [device heapTextureSizeAndAlignWithDescriptor:desc];
+    size_and_align->size = placement.size;
+    size_and_align->alignment = placement.align;
+    params->ret = placement.size && placement.align;
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_newPlacementHeap(void *obj) {
   struct unixcall_mtldevice_newplacementheap *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
@@ -1885,12 +2000,13 @@ _MTLDevice_newPlacementHeap(void *obj) {
   if (!info || !info->size)
     return STATUS_SUCCESS;
 
-  if (@available(macOS 26.0, *)) {
+  if (@available(macOS 10.15, *)) {
     MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
     desc.type = MTLHeapTypePlacement;
     desc.size = info->size;
     desc.resourceOptions = (MTLResourceOptions)info->options;
-    desc.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
+    if (@available(macOS 26.0, *))
+      desc.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
     params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
     [desc release];
   }
@@ -5368,6 +5484,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newPlacementHeap,
     &_MTLDevice_updateSparseTextureMappings,
     &_WMTApitraceSessionFlush,
+    &_MTLHeap_newBuffer,
+    &_MTLHeap_newTexture,
+    &_MTLDevice_heapTextureSizeAndAlign,
 };
 
 #ifndef DXMT_NATIVE
@@ -5520,5 +5639,8 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newPlacementHeap,
     &_MTLDevice_updateSparseTextureMappings,
     &_WMTApitraceSessionFlush,
+    &_MTLHeap_newBuffer,
+    &_MTLHeap_newTexture,
+    &_MTLDevice_heapTextureSizeAndAlign,
 };
 #endif

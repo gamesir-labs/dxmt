@@ -1623,6 +1623,42 @@ MTLDevice_newPlacementHeap(obj_handle_t device, const struct WMTPlacementHeapInf
   return params.ret;
 }
 
+WINEMETAL_API obj_handle_t
+MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newbuffer params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  params.ret = 0;
+  UNIX_CALL(173, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newtexture params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  params.ret = 0;
+  UNIX_CALL(174, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_heapTextureSizeAndAlign(
+    obj_handle_t device, const struct WMTTextureInfo *info,
+    struct WMTSizeAndAlign *size_and_align
+) {
+  struct unixcall_mtldevice_heaptexturesizeandalign params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  WMT_MEMPTR_SET(params.size_and_align, size_and_align);
+  params.ret = 0;
+  UNIX_CALL(175, &params);
+  return params.ret != 0;
+}
+
 WINEMETAL_API bool
 MTLDevice_updateSparseTextureMappings(
     obj_handle_t device, obj_handle_t texture, obj_handle_t heap,

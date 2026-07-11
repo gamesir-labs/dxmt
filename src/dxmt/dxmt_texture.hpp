@@ -259,6 +259,8 @@ public:
   TextureViewKey fullView;
 
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
+  Rc<TextureAllocation> allocatePlaced(WMT::Heap heap, uint64_t offset,
+                                       Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
 
   TextureView &view(TextureViewKey key);
@@ -273,14 +275,15 @@ public:
 
   Texture(const WMTTextureInfo &info, WMT::Device device);
 
-  Texture(unsigned bytes_per_image, unsigned bytes_per_row, const WMTTextureInfo &info, WMT::Device device);
+  Texture(uint64_t bytes_per_image, uint32_t bytes_per_row,
+          const WMTTextureInfo &info, WMT::Device device);
 
 private:
   void prepareAllocationViews(TextureAllocation* allocation);
 
   WMTTextureInfo info_;
-  unsigned bytes_per_image_ = 0;
-  unsigned bytes_per_row_ = 0;
+  uint64_t bytes_per_image_ = 0;
+  uint32_t bytes_per_row_ = 0;
 
   Rc<TextureAllocation> current_;
   uint32_t version_ = 0;

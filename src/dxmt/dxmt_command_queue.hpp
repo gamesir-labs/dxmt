@@ -99,6 +99,12 @@ public:
     completion_callbacks.push_back(std::move(callback));
   }
 
+  size_t
+  completionCallbackCount() {
+    std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
+    return completion_callbacks.size();
+  }
+
   uint64_t chunk_id;
   uint64_t chunk_event_id;
   uint64_t frame_;
@@ -160,6 +166,12 @@ private:
 
   void RetirePersistentResidencyRemovals(uint64_t completed_seq);
 
+  void PersistentResidencyThread();
+
+  void CompleteDeferredReleases(uint64_t completed_seq);
+
+  void DrainDeferredReleases();
+
   uint32_t EncodingThread();
 
   uint32_t WaitForFinishThread();
@@ -200,6 +212,19 @@ private:
   WMT::Reference<WMT::ResidencySet> persistent_residency_set_;
   bool persistent_residency_dirty_ = false;
   std::unordered_map<obj_handle_t, PersistentResidencyEntry> persistent_residency_entries_;
+  // Strong references for allocations removed from the userspace set but not
+  // yet committed to its kernel mirror. The maintenance worker guarantees an
+  // idle queue flushes this list after a short coalescing delay.
+  std::vector<WMT::Reference<WMT::Resource>>
+      persistent_residency_retired_allocations_;
+  dxmt::condition_variable persistent_residency_cond_;
+  bool persistent_residency_flush_requested_ = false;
+  bool persistent_residency_stop_ = false;
+  dxmt::thread persistent_residency_thread_;
+  dxmt::mutex deferred_release_mutex_;
+  uint64_t deferred_release_completed_seq_ = 0;
+  std::unordered_map<uint64_t, std::vector<std::function<void()>>>
+      deferred_releases_;
 
   obj_handle_t shared_event_listener;
   dxmt::thread event_listener_thread;
@@ -301,11 +326,24 @@ public:
   void
   AddPersistentResidency(WMT::Resource resource);
 
+  // App-thread retirement: waits only for work that has actually been
+  // published. This avoids pinning descriptor history to an empty next chunk.
   void
   RemovePersistentResidencyAfterCompletion(WMT::Resource resource);
 
+  // Encode/submission-thread retirement: `sequence` is the exact chunk that
+  // may reference the resource.
+  void
+  RemovePersistentResidencyAfterCompletion(WMT::Resource resource,
+                                             uint64_t sequence);
+
+  // App-thread lifetime retirement, paired with the last published sequence.
   void
   RetainUntilGpuComplete(std::function<void()> release);
+
+  // Keep an object alive through completion of an exact encoded sequence.
+  void
+  RetainUntilGpuComplete(uint64_t sequence, std::function<void()> release);
 
   uint64_t
   FlushPersistentResidency();

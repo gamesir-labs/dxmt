@@ -249,7 +249,8 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
 }
 
 Texture::Texture(
-    unsigned bytes_per_image, unsigned bytes_per_row, const WMTTextureInfo &descriptor, WMT::Device device
+    uint64_t bytes_per_image, uint32_t bytes_per_row,
+    const WMTTextureInfo &descriptor, WMT::Device device
 ) :
     info_(descriptor),
     bytes_per_image_(bytes_per_image),
@@ -306,6 +307,46 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
 }
 
 Rc<TextureAllocation>
+Texture::allocatePlaced(WMT::Heap heap, uint64_t offset,
+                        Flags<TextureAllocationFlag> flags) {
+  if (!heap)
+    return nullptr;
+
+  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  WMTTextureInfo info = info_;
+  info.mach_port = 0;
+  if (flags.test(TextureAllocationFlag::CpuWriteCombined))
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  if (flags.test(TextureAllocationFlag::CpuInvisible))
+    options |= WMTResourceStorageModePrivate;
+  if (flags.test(TextureAllocationFlag::GpuManaged))
+    options |= WMTResourceStorageModeManaged;
+  if (flags.test(TextureAllocationFlag::PlacementSparse))
+    info.reserved |= WMTTextureInfoFlagPlacementSparse;
+  info.options = options;
+
+  if (bytes_per_image_) {
+    WMTBufferInfo buffer_info = {};
+    buffer_info.length = bytes_per_image_;
+    buffer_info.options = options;
+    buffer_info.memory.set(nullptr);
+    auto buffer = WMT::Reference<WMT::Buffer>(
+        MTLHeap_newBuffer(heap.handle, &buffer_info, offset));
+    if (!buffer)
+      return nullptr;
+    return new TextureAllocation(this, std::move(buffer),
+                                 buffer_info.memory.get(), info,
+                                 bytes_per_row_, flags);
+  }
+
+  auto texture = WMT::Reference<WMT::Texture>(
+      MTLHeap_newTexture(heap.handle, &info, offset));
+  if (!texture)
+    return nullptr;
+  return new TextureAllocation(this, std::move(texture), info, flags);
+}
+
+Rc<TextureAllocation>
 Texture::import(mach_port_t mach_port) {
   Flags<TextureAllocationFlag> flags;
   WMTTextureInfo info;
@@ -353,8 +394,11 @@ Texture::setViewPoolSlot(WMT::TextureViewPool pool, TextureViewKey key,
   if (!parent)
     return 0;
 
+  // The allocation's implicit full view already has a stable resource ID.
+  // Reusing it avoids an unnecessary lightweight view and also keeps Metal
+  // Shader Validation able to associate the ID with the original texture.
   if (!key.index)
-    return pool.setTextureView(parent, slot);
+    return allocation->gpuResourceID;
 
   std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
   if (key.index >= viewDescriptors_.size())

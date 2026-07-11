@@ -147,6 +147,9 @@ public:
 
 private:
   BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
+  BufferAllocation(WMT::Reference<WMT::Buffer> &&buffer,
+                   const WMTBufferInfo &info,
+                   Flags<BufferAllocationFlag> flags);
   ~BufferAllocation();
 
   BufferAllocation(const BufferAllocation &) = delete;
@@ -160,7 +163,7 @@ private:
   void *mappedMemory_;
   uint64_t gpuAddress_;
   uint32_t current_suballocation_ = 0;
-  uint32_t suballocation_size_;
+  uint64_t suballocation_size_;
   uint32_t suballocation_count_ = 1;
 
   void * placed_buffer = nullptr;
@@ -179,6 +182,8 @@ public:
   }
 
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+  Rc<BufferAllocation> allocatePlaced(WMT::Heap heap, uint64_t offset,
+                                      Flags<BufferAllocationFlag> flags);
   Rc<BufferAllocation> allocateExternalCpu(Flags<BufferAllocationFlag> flags,
                                            void *memory);
 
