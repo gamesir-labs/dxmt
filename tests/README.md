@@ -123,25 +123,19 @@ not to the remaining tests inside a process that has crashed.
 
 ## Build and run
 
-Use a Windows cross-build directory. Managed mode builds and prepares the Wine
-cache under the repository-local `.cache/` tree:
+Use the full x64 builder profile. It shares one incremental build directory and
+one staged Wine runtime across runtime, tests, and benchmarks:
 
 ```sh
-meson setup \
-  --cross-file build-win64.txt \
-  -Dnative_llvm_path=/usr/local/opt/llvm@15 \
-  -Denable_tests=true \
-  -Dwine_source_path=../wine-proton-macos \
-  .cache/build/wine-tests \
-  --buildtype release
-scripts/run-wine-tests.sh .cache/build/wine-tests unit
+scripts/dxmt-builder build --profile gcc-x64-release-full tests-all
+scripts/dxmt-builder test --profile gcc-x64-release-full unit
 ```
 
 Filter a subsystem without creating another Wine test image:
 
 ```sh
-scripts/run-wine-tests.sh .cache/build/wine-tests unit \
-  --test-args='--gtest_filter=D3D12*'
+scripts/dxmt-builder test --profile gcc-x64-release-full unit \
+  --suite d3d12 --test-args='--gtest_filter=D3D12*'
 ```
 
 `run-wine-tests.sh` compiles and stages the current DXMT DLLs, initializes the
@@ -149,11 +143,9 @@ dedicated prefix when needed, and injects the staged runtime before starting the
 coordinator. Do not run the PE directly when validating DXMT behavior, because
 that can silently select stale DLLs.
 
-The managed Wine source dependency must provide its generic
-`pack_runtime_deps.sh` and `relocate_wine_runtime.sh` tools. DXMT owns the cache
-state and validation contract at `.cache/wine-runtime/x86_64/`.
+The managed Wine dependency is fingerprinted below `.cache/managed/deps`.
 
-To use a complete prebuilt Wine cache:
+To use a complete prebuilt Wine cache for a one-off run:
 
 ```sh
 meson setup \
@@ -162,7 +154,7 @@ meson setup \
   -Denable_tests=true \
   -Dwine_build_path= \
   -Dwine_install_path=/path/to/wine-cache \
-  .cache/build/wine-tests \
+  .cache/managed/manual/wine-tests \
   --buildtype release
 ```
 
