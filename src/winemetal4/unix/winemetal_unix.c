@@ -142,8 +142,23 @@ dxmt_metal4_perf_stats_enabled(void) {
 }
 
 static bool
+dxmt_metal4_test_feedback_error_enabled(void) {
+  return dxmt_truthy_env_value(
+             getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")) ||
+         dxmt_truthy_env_value(
+             getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE"));
+}
+
+static bool
 dxmt_metal4_test_inject_feedback_error(void) {
-  return dxmt_truthy_env_value(getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"));
+  if (dxmt_truthy_env_value(
+          getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")))
+    return true;
+  if (!dxmt_truthy_env_value(
+          getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE")))
+    return false;
+  static atomic_bool injected = false;
+  return !atomic_exchange_explicit(&injected, true, memory_order_acq_rel);
 }
 
 static uint64_t
@@ -656,6 +671,7 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, assign) uint64_t presentEventValue;
 @property(nonatomic, assign) uint64_t maxCommandBufferCount;
 @property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
+@property(nonatomic, retain) NSError *firstError;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
@@ -695,6 +711,7 @@ dxmt_metal4_is_buffer(id object) {
   [_compiler release];
   [_event release];
   [_presentEvent release];
+  [_firstError release];
   [super dealloc];
 }
 
@@ -842,6 +859,39 @@ dxmt_metal4_is_buffer(id object) {
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
     return 0;
 
+  if (_owner.firstError &&
+      [_owner.firstError.domain isEqualToString:@"DXMTMetal4TestErrorDomain"] &&
+      !dxmt_metal4_test_feedback_error_enabled())
+    _owner.firstError = nil;
+
+  if (_owner.firstError) {
+    _feedbackError = [_owner.firstError retain];
+    _internalStatus = DXMTMetal4CommandBufferStateError;
+    const char *rejection_marker =
+        getenv("DXMT_TEST_METAL4_REJECTION_MARKER");
+    if (rejection_marker && *rejection_marker) {
+      FILE *marker = fopen(rejection_marker, "a");
+      if (marker) {
+        fputs("rejected\n", marker);
+        fclose(marker);
+      }
+    }
+    if (dxmt_metal4_perf_stats_enabled()) {
+      fprintf(stderr,
+              "err:   DXMT Metal4 queue rejected command buffer after first error:"
+              " commandBuffer=%p queue=%p domain=%s code=%ld description=%s\n",
+              self, _owner.metal4Queue,
+              _feedbackError.domain ? _feedbackError.domain.UTF8String
+                                    : "<no domain>",
+              (long)_feedbackError.code,
+              _feedbackError.localizedDescription
+                  ? _feedbackError.localizedDescription.UTF8String
+                  : "<no description>");
+      fflush(stderr);
+    }
+    return 0;
+  }
+
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
       APITRACE_METAL_COMMAND_BUFFER_COMMIT_BEGIN,
@@ -945,6 +995,12 @@ dxmt_metal4_is_buffer(id object) {
         if (error) {
           feedbackOwner.feedbackError = error;
           feedbackOwner.internalStatus = DXMTMetal4CommandBufferStateError;
+        }
+      }
+      if (error) {
+        @synchronized(feedbackOwner.owner) {
+          if (!feedbackOwner.owner.firstError)
+            feedbackOwner.owner.firstError = error;
         }
       }
       if (error && feedbackCompletionEvent.signaledValue <

@@ -4202,7 +4202,7 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
-    return S_OK;
+    return device_->queue().HasDeviceError() ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
   }
 
   void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC *desc,

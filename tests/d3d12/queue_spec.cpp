@@ -2,11 +2,13 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -20,6 +22,14 @@ using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
+
+void SetUnixEnvironment(const char *name, const char *value) {
+  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
+  auto set_unix_env = reinterpret_cast<SetUnixEnvProc>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
+  ASSERT_NE(set_unix_env, nullptr);
+  EXPECT_EQ(set_unix_env(name, value), 0);
+}
 
 class LifetimeProbe final : public IUnknown {
 public:
@@ -90,6 +100,82 @@ struct ScopedBarrierOnlyMarker {
   }
 
   std::string path;
+};
+
+struct ScopedCommandBufferErrorMarker {
+  ScopedCommandBufferErrorMarker() {
+    std::ostringstream name;
+    name << "C:\\dxmt-command-buffer-error-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << ".txt";
+    path = name.str();
+    std::ofstream(path, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_ERROR_MARKER",
+                            path.c_str());
+  }
+
+  ~ScopedCommandBufferErrorMarker() {
+    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_ERROR_MARKER", nullptr);
+    DeleteFileA(path.c_str());
+  }
+
+  size_t Count() const {
+    std::ifstream input(path);
+    return static_cast<size_t>(
+        std::count(std::istream_iterator<std::string>(input),
+                   std::istream_iterator<std::string>(), "error"));
+  }
+
+  bool WaitForCount(size_t expected,
+                    std::chrono::milliseconds timeout) const {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (Count() >= expected)
+        return true;
+      Sleep(10);
+    }
+    return Count() >= expected;
+  }
+
+  std::string path;
+};
+
+struct ScopedMetal4RejectionMarker {
+  ScopedMetal4RejectionMarker() {
+    std::ostringstream name;
+    name << "dxmt-metal4-rejection-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << ".txt";
+    unix_path = "/tmp/" + name.str();
+    windows_path = "Z:\\tmp\\" + name.str();
+    std::ofstream(windows_path, std::ios::trunc).close();
+    SetUnixEnvironment("DXMT_TEST_METAL4_REJECTION_MARKER",
+                       unix_path.c_str());
+  }
+
+  ~ScopedMetal4RejectionMarker() {
+    SetUnixEnvironment("DXMT_TEST_METAL4_REJECTION_MARKER", nullptr);
+    DeleteFileA(windows_path.c_str());
+  }
+
+  size_t Count() const {
+    std::ifstream input(windows_path);
+    return static_cast<size_t>(
+        std::count(std::istream_iterator<std::string>(input),
+                   std::istream_iterator<std::string>(), "rejected"));
+  }
+
+  bool WaitForCount(size_t expected,
+                    std::chrono::milliseconds timeout) const {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (Count() >= expected)
+        return true;
+      Sleep(10);
+    }
+    return Count() >= expected;
+  }
+
+  std::string unix_path;
+  std::string windows_path;
 };
 
 std::vector<ComPtr<ID3D12GraphicsCommandList>> CreateBarrierOnlyLists(
@@ -742,11 +828,15 @@ TEST_F(D3D12QueueSpec, QueueDestructionCanRaceFenceWaitCallbackArming) {
   }
 }
 
-TEST(D3D12QueueErrorSpec, CommitFeedbackErrorDoesNotDeadlockCompletion) {
-  ASSERT_TRUE(SetEnvironmentVariableA(
-      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR", "1"));
+TEST(D3D12QueueErrorSpec,
+     CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions) {
+  ScopedCommandBufferErrorMarker marker;
+  ScopedMetal4RejectionMarker rejection_marker;
   D3D12TestContext context;
   ASSERT_TRUE(SUCCEEDED(context.Initialize()));
+  ASSERT_TRUE(SetEnvironmentVariableA(
+      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", "1"));
+  SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", "1");
 
   const std::array<std::uint32_t, 4> expected = {
       0x01020304, 0x11223344, 0x55667788, 0x99aabbcc};
@@ -765,8 +855,28 @@ TEST(D3D12QueueErrorSpec, CommitFeedbackErrorDoesNotDeadlockCompletion) {
   const auto elapsed = std::chrono::steady_clock::now() - begin;
   EXPECT_LT(elapsed, std::chrono::seconds(5));
 
+  ASSERT_TRUE(SUCCEEDED(context.ResetCommandList()));
+  context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
+                                   sizeof(expected));
+  const auto rejected_begin = std::chrono::steady_clock::now();
+  EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
+  EXPECT_LT(std::chrono::steady_clock::now() - rejected_begin,
+            std::chrono::seconds(5));
+  EXPECT_TRUE(marker.WaitForCount(1u, std::chrono::seconds(2)));
+  EXPECT_TRUE(
+      rejection_marker.WaitForCount(1u, std::chrono::seconds(2)));
+  EXPECT_EQ(context.device()->GetDeviceRemovedReason(),
+            DXGI_ERROR_DEVICE_REMOVED);
+
   ASSERT_TRUE(SetEnvironmentVariableA(
-      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR", nullptr));
+      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr));
+  SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr);
+
+  ASSERT_TRUE(SUCCEEDED(context.ResetCommandList()));
+  context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
+                                   sizeof(expected));
+  EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
+  EXPECT_EQ(rejection_marker.Count(), 1u);
 }
 
 } // namespace
