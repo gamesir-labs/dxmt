@@ -6,7 +6,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -57,6 +60,61 @@ protected:
 
   D3D12TestContext context_;
 };
+
+struct ScopedBarrierOnlyMarker {
+  explicit ScopedBarrierOnlyMarker(const char *suffix) {
+    std::ostringstream name;
+    name << "C:\\dxmt-barrier-only-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << "-" << suffix << ".txt";
+    path = name.str();
+    std::ofstream(path, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER",
+                            path.c_str());
+  }
+
+  ~ScopedBarrierOnlyMarker() {
+    SetEnvironmentVariableA("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER", nullptr);
+  }
+
+  size_t Count() const {
+    std::ifstream input(path);
+    size_t count = 0;
+    std::string line;
+    while (std::getline(input, line))
+      count += line == "standalone";
+    return count;
+  }
+
+  std::string path;
+};
+
+std::vector<ComPtr<ID3D12GraphicsCommandList>> CreateBarrierOnlyLists(
+    D3D12TestContext &context, ID3D12Resource *resource, UINT count,
+    std::vector<ComPtr<ID3D12CommandAllocator>> *allocators) {
+  std::vector<ComPtr<ID3D12GraphicsCommandList>> lists;
+  allocators->reserve(count);
+  lists.reserve(count);
+  for (UINT index = 0; index < count; ++index) {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    if (FAILED(context.device()->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            __uuidof(ID3D12CommandAllocator),
+            reinterpret_cast<void **>(allocator.put()))))
+      return {};
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(context.device()->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+            __uuidof(ID3D12GraphicsCommandList),
+            reinterpret_cast<void **>(list.put()))))
+      return {};
+    D3D12TestContext::UavBarrier(list.get(), resource);
+    if (FAILED(list->Close()))
+      return {};
+    allocators->push_back(std::move(allocator));
+    lists.push_back(std::move(list));
+  }
+  return lists;
+}
 
 TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
   const std::array<std::uint32_t, 16> expected = {
@@ -214,6 +272,47 @@ TEST_F(D3D12QueueSpec, PreservesLongBlitDependencyChainAcrossEncoders) {
       buffers.back().get(), sizeof(expected), &actual)));
   ASSERT_EQ(actual.size(), sizeof(expected));
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
+}
+
+TEST_F(D3D12QueueSpec, CoalescesTrailingBarriersWithinOneExecute) {
+  constexpr UINT kListCount = 32;
+  ScopedBarrierOnlyMarker marker("coalesced");
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(resource);
+  std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
+  auto lists = CreateBarrierOnlyLists(context_, resource.get(), kListCount,
+                                      &allocators);
+  ASSERT_EQ(lists.size(), kListCount);
+  std::vector<ID3D12CommandList *> raw_lists;
+  for (const auto &list : lists)
+    raw_lists.push_back(list.get());
+  context_.queue()->ExecuteCommandLists(static_cast<UINT>(raw_lists.size()),
+                                        raw_lists.data());
+  ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+  EXPECT_EQ(marker.Count(), 1u);
+}
+
+TEST_F(D3D12QueueSpec, PreservesBarrierBoundaryAcrossSeparateExecutes) {
+  constexpr UINT kExecuteCount = 8;
+  ScopedBarrierOnlyMarker marker("separate-executes");
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(resource);
+  std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
+  auto lists = CreateBarrierOnlyLists(context_, resource.get(), kExecuteCount,
+                                      &allocators);
+  ASSERT_EQ(lists.size(), kExecuteCount);
+  for (const auto &list : lists) {
+    ID3D12CommandList *raw_list = list.get();
+    context_.queue()->ExecuteCommandLists(1, &raw_list);
+  }
+  ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+  EXPECT_EQ(marker.Count(), kExecuteCount);
 }
 
 TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {

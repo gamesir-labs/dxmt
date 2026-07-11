@@ -6169,6 +6169,14 @@ private:
     enc.startBlitPass();
     EncodeResourceAccessBarrierEntries(enc, entries);
     enc.endPass();
+    const auto marker_path =
+        env::getEnvVar("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER");
+    if (!marker_path.empty()) {
+      if (FILE *marker = fopen(marker_path.c_str(), "a")) {
+        fputs("standalone\n", marker);
+        fclose(marker);
+      }
+    }
   }
 
   static void RecordSeparatorOnlyBarrier(const ResourceAccessBarrierBatch &batch) {
@@ -7701,10 +7709,14 @@ private:
   void ReplayCommandRecords(const std::vector<CommandRecord> &records,
                             const CompiledCommandList *compiled,
                             std::vector<Com<ID3D12Resource>> &touched_resources,
-                            std::unordered_set<ID3D12Resource *> &touched_resources_set) {
+                            std::unordered_set<ID3D12Resource *> &touched_resources_set,
+                            ResourceAccessBarrierBatch &execute_trailing_barriers,
+                            bool final_command_list) {
     auto &queue = device_->GetDXMTDevice().queue();
     auto *chunk = queue.CurrentChunk();
     ReplayState state = {};
+    state.pending_resource_barriers =
+        std::move(execute_trailing_barriers);
     state.resource_states = &resource_states_->resources;
     state.queue_type = desc_.Type;
     state.touched_resources = &touched_resources;
@@ -8362,11 +8374,13 @@ private:
            " records=", records.size());
     }
     const auto rb_t1 = replay_perf ? clock::now() : clock::time_point{};
-    FlushPassBatches(chunk, state);
+    FlushPassBatches(chunk, state, final_command_list);
     const auto rb_t2 = replay_perf ? clock::now() : clock::time_point{};
     MaterializeTimestampResolves(chunk, state);
     const auto rb_t3 = replay_perf ? clock::now() : clock::time_point{};
     MaterializeCpuQueryResolves(chunk, state);
+    if (!final_command_list)
+      execute_trailing_barriers = TakePendingResourceBarrierBatch(state);
     if (replay_perf) {
       const auto rb_t4 = clock::now();
       auto *stats = dxmt::perf::currentFrameStatistics();
@@ -21080,6 +21094,7 @@ private:
             clock::now() - lock_begin);
         std::vector<Com<ID3D12Resource>> touched_resources;
         std::unordered_set<ID3D12Resource *> touched_resources_set;
+        ResourceAccessBarrierBatch execute_trailing_barriers;
         UINT command_list_index = 0;
         for (const auto &records : operation.command_records) {
           const CompiledCommandList *compiled =
@@ -21100,7 +21115,10 @@ private:
           }
           const auto replay_begin = clock::now();
           ReplayCommandRecords(records, compiled, touched_resources,
-                               touched_resources_set);
+                               touched_resources_set,
+                               execute_trailing_barriers,
+                               command_list_index + 1 ==
+                                   operation.command_records.size());
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Replay,
               clock::now() - replay_begin);
