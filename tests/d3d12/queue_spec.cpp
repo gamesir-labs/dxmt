@@ -33,6 +33,14 @@ void SetUnixEnvironment(const char *name, const char *value) {
   EXPECT_EQ(set_unix_env(name, value), 0);
 }
 
+void SetUnixEnvironment(const char *name, const char *value) {
+  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
+  auto set_unix_env = reinterpret_cast<SetUnixEnvProc>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
+  ASSERT_NE(set_unix_env, nullptr);
+  EXPECT_EQ(set_unix_env(name, value), 0);
+}
+
 class LifetimeProbe final : public IUnknown {
 public:
   explicit LifetimeProbe(std::shared_ptr<std::atomic_bool> destroyed)
