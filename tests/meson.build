@@ -109,3 +109,24 @@ alias_target(
   dxmt_wine_d3d11_tests,
   dxmt_wine_d3d12_tests,
 )
+
+alias_target(
+  'dxmt-wine-tests-framework',
+  dxmt_wine_test_scheduler,
+  dxmt_wine_framework_tests,
+)
+alias_target(
+  'dxmt-wine-tests-d3d10',
+  dxmt_wine_test_scheduler,
+  dxmt_wine_d3d10_tests,
+)
+alias_target(
+  'dxmt-wine-tests-d3d11',
+  dxmt_wine_test_scheduler,
+  dxmt_wine_d3d11_tests,
+)
+alias_target(
+  'dxmt-wine-tests-d3d12',
+  dxmt_wine_test_scheduler,
+  dxmt_wine_d3d12_tests,
+)

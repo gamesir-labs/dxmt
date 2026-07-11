@@ -85,6 +85,7 @@ BuildSuiteArguments(const std::vector<std::string> &original_arguments,
   for (std::size_t index = 1; index < original_arguments.size(); ++index) {
     const std::string_view argument(original_arguments[index]);
     if (!argument.starts_with("--dxmt-test-jobs=") &&
+        !argument.starts_with("--dxmt-test-suite=") &&
         !argument.starts_with("--dxmt-test-report=") &&
         argument != "--dxmt-test-worker") {
       arguments.push_back(original_arguments[index]);
@@ -92,6 +93,29 @@ BuildSuiteArguments(const std::vector<std::string> &original_arguments,
   }
   arguments.push_back("--dxmt-test-jobs=" + std::to_string(jobs));
   return arguments;
+}
+
+std::optional<std::vector<const Suite *>>
+SelectSuites(const std::vector<std::string> &arguments) {
+  std::string_view selected = "all";
+  constexpr std::string_view prefix = "--dxmt-test-suite=";
+  for (const auto &argument : arguments) {
+    const std::string_view value(argument);
+    if (value.starts_with(prefix))
+      selected = value.substr(prefix.size());
+  }
+
+  std::vector<const Suite *> suites;
+  for (const auto &suite : kSuites) {
+    if (selected == "all" || selected == suite.name)
+      suites.push_back(&suite);
+  }
+  if (suites.empty()) {
+    std::fprintf(stderr, "unknown DXMT Wine test suite: %.*s\n",
+                 static_cast<int>(selected.size()), selected.data());
+    return std::nullopt;
+  }
+  return suites;
 }
 
 std::wstring ExecutableDirectory() {
@@ -152,6 +176,9 @@ int main(int argc, char **argv) {
   const auto jobs = SelectJobCount(original_arguments);
   if (!jobs)
     return 2;
+  const auto selected_suites = SelectSuites(original_arguments);
+  if (!selected_suites)
+    return 2;
 
   const auto directory = ExecutableDirectory();
   if (directory.empty()) {
@@ -159,15 +186,16 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  const auto concurrency = std::min(*jobs, kSuites.size());
+  const auto concurrency = std::min(*jobs, selected_suites->size());
   const auto log_prefix = BuildLogPrefix();
   std::size_t failed_suites = 0;
   std::string scheduler_errors;
   std::array<std::string, kSuites.size()> suite_logs;
   const auto run_start = Clock::now();
 
-  for (std::size_t wave = 0; wave < kSuites.size(); wave += concurrency) {
-    const auto wave_size = std::min(concurrency, kSuites.size() - wave);
+  for (std::size_t wave = 0; wave < selected_suites->size(); wave += concurrency) {
+    const auto wave_size =
+        std::min(concurrency, selected_suites->size() - wave);
     const auto jobs_per_suite = *jobs / wave_size;
     const auto extra_jobs = *jobs % wave_size;
     std::vector<SuiteRun> runs;
@@ -175,7 +203,7 @@ int main(int argc, char **argv) {
 
     for (std::size_t offset = 0; offset < wave_size; ++offset) {
       const auto suite_index = wave + offset;
-      const auto &suite = kSuites[suite_index];
+      const auto &suite = *selected_suites->at(suite_index);
       const auto suite_jobs = jobs_per_suite + (offset < extra_jobs ? 1 : 0);
       const auto arguments =
           BuildSuiteArguments(original_arguments, suite_jobs);

@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-project_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 
-export WINEPREFIX="${DXMT_TEST_WINEPREFIX:-$project_root/.cache/wine/prefixes/x86_64-test}"
+export WINEPREFIX="${DXMT_TEST_WINEPREFIX:-$project_root/.cache/managed/profiles/gcc-x64-release-full/prefix}"
 export WINEARCH="${WINEARCH:-win64}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export DXMT_EXPERIMENT_DX12_SUPPORT="${DXMT_EXPERIMENT_DX12_SUPPORT:-1}"
@@ -38,8 +38,7 @@ if [ -z "$wine" ]; then
     wine=$(find_wine_launcher "$wine_root") || true
   else
     for candidate_root in \
-      "$project_root/.cache/toolchains/wine" \
-      "$project_root/.cache/wine/build/x86_64/dxmt-install"
+      "$project_root"/.cache/managed/deps/wine-x86_64-*
     do
       if wine=$(find_wine_launcher "$candidate_root"); then
         wine_root=$candidate_root
@@ -61,7 +60,7 @@ if [ -z "$wine" ] || [ ! -x "$wine" ]; then
 fi
 
 if [ -z "$wine_root" ]; then
-  wine_root=$(CDPATH= cd -- "$(dirname -- "$wine")/.." && pwd)
+  wine_root=$(CDPATH='' cd -- "$(dirname -- "$wine")/.." && pwd)
 fi
 if [ ! -x "$wine_root/bin/wineserver" ] ||
    { [ "$wine_explicit" -eq 0 ] && [ ! -x "$wine_root/bin/winebuild" ]; }; then
@@ -119,6 +118,7 @@ stop_test_wine() {
   WINEPREFIX="$WINEPREFIX" "$wine_root/bin/wineserver" -w >/dev/null 2>&1 || true
 }
 
+# shellcheck disable=SC2329 # Invoked by trap.
 handle_signal() {
   stop_test_wine
   exit 143

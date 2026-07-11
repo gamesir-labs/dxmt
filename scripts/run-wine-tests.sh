@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-project_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 
 if [ "$#" -lt 1 ]; then
   printf 'usage: %s <meson-build-dir> [all|unit|integration] [meson-test-option...]\n' "$0" >&2
@@ -25,8 +25,29 @@ case $mode in
   *) mode=all ;;
 esac
 
-runtime_root=$("$script_dir/stage-wine-test-runtime.sh" "$build_dir")
-export DXMT_TEST_RUNTIME_ROOT=$runtime_root
+suite=all
+forwarded_args=
+for argument in "$@"; do
+  case "$argument" in
+    --suite=*) suite=${argument#--suite=} ;;
+    *)
+      if [ -z "$forwarded_args" ]; then
+        forwarded_args=$argument
+      else
+        forwarded_args="$forwarded_args
+$argument"
+      fi
+      ;;
+  esac
+done
+
+case $suite in
+  all|framework|d3d10|d3d11|d3d12) ;;
+  *) printf 'unsupported Wine test suite: %s\n' "$suite" >&2; exit 2 ;;
+esac
+
+runtime_root=$("$script_dir/stage-wine-test-runtime.sh" "$build_dir" "" "$suite" "$mode")
+export DXMT_TEST_RUNTIME_ROOT="$runtime_root"
 
 wine_root=$(meson introspect "$build_dir" --buildoptions | python3 -c '
 import json
@@ -46,7 +67,7 @@ if not os.path.isabs(wine_root):
     wine_root = os.path.join(source_root, wine_root)
 print(os.path.realpath(wine_root))
 ' "$project_root")
-export DXMT_TEST_WINE_ROOT=$wine_root
+export DXMT_TEST_WINE_ROOT="$wine_root"
 export DXMT_TEST_WINEPREFIX="${DXMT_TEST_WINEPREFIX:-$build_dir/wine-prefix}"
 
 prefix_ready() {
@@ -89,12 +110,32 @@ WINEPREFIX="$DXMT_TEST_WINEPREFIX" "$wine_root/bin/wineserver" -w
 
 case $mode in
   all|unit)
-    meson test -C "$build_dir" --no-rebuild --suite wine --print-errorlogs "$@"
+    set --
+    if [ -n "$forwarded_args" ]; then
+      old_ifs=$IFS
+      IFS='
+'
+      for argument in $forwarded_args; do set -- "$@" "$argument"; done
+      IFS=$old_ifs
+    fi
+    meson test -C "$build_dir" --no-rebuild --suite wine --print-errorlogs \
+      --test-args="--dxmt-test-suite=$suite" "$@"
     ;;
 esac
 
 case $mode in
   all|integration)
-    meson test -C "$build_dir" --no-rebuild --benchmark --suite wine --print-errorlogs "$@"
+    benchmark_suite=wine
+    if [ "$suite" != all ]; then benchmark_suite=$suite; fi
+    set --
+    if [ -n "$forwarded_args" ]; then
+      old_ifs=$IFS
+      IFS='
+'
+      for argument in $forwarded_args; do set -- "$@" "$argument"; done
+      IFS=$old_ifs
+    fi
+    meson test -C "$build_dir" --no-rebuild --benchmark \
+      --suite "$benchmark_suite" --print-errorlogs "$@"
     ;;
 esac

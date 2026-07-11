@@ -79,17 +79,11 @@ supports `cpu_time` and `real_time` with `max_median_ns` thresholds.
 
 ## Build and run
 
-Benchmarks are built by the same Wine test configuration:
+Benchmarks are built by the same full profile as the Wine tests:
 
 ```sh
-meson setup \
-  --cross-file build-win64.txt \
-  -Dnative_llvm_path=/usr/local/opt/llvm@15 \
-  -Denable_tests=true \
-  -Dwine_source_path=../wine-proton-macos \
-  .cache/build/wine-tests \
-  --buildtype release
-scripts/run-wine-tests.sh .cache/build/wine-tests integration
+scripts/dxmt-builder build --profile gcc-x64-release-full benchmarks
+scripts/dxmt-builder test --profile gcc-x64-release-full integration
 ```
 
 The helper compiles and stages the current DXMT runtime before Meson executes
