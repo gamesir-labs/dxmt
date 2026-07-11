@@ -1,0 +1,49 @@
+#pragma once
+
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace dxmt::builder {
+
+struct Profile {
+  std::string_view name;
+  std::string_view target_arch;
+  std::string_view compiler_family;
+  std::string_view buildtype;
+  bool cross;
+  bool tests;
+  bool nvapi;
+  bool nvngx;
+  bool airconv_windows;
+};
+
+const std::vector<Profile> &Profiles();
+const Profile *FindProfile(std::string_view name);
+std::string JsonEscape(std::string_view value);
+bool IsPathWithin(const std::filesystem::path &path,
+                  const std::filesystem::path &root);
+
+namespace testing {
+std::map<std::string, std::string> ParseProperties(std::string_view contents);
+void WriteFileAtomic(const std::filesystem::path &path, std::string_view contents);
+void WithFileLock(const std::filesystem::path &path,
+                  const std::function<void()> &operation);
+} // namespace testing
+
+class Application {
+public:
+  explicit Application(std::filesystem::path repo_root);
+  int Run(std::span<const std::string> arguments);
+
+private:
+  std::filesystem::path repo_root_;
+  std::filesystem::path managed_root_;
+};
+
+} // namespace dxmt::builder
