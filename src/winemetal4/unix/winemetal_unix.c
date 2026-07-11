@@ -141,6 +141,11 @@ dxmt_metal4_perf_stats_enabled(void) {
   return enabled;
 }
 
+static bool
+dxmt_metal4_test_inject_feedback_error(void) {
+  return dxmt_truthy_env_value(getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"));
+}
+
 static uint64_t
 dxmt_monotonic_us(void) {
   struct timespec ts;
@@ -901,8 +906,13 @@ dxmt_metal4_is_buffer(id object) {
 #if DXMT_APITRACE_METAL
   traceFeedback = dxmt_apitrace_runtime_enabled() &&
                   dxmt_metal4_commit_feedback_enabled(_completionValue);
+#else
+  (void)traceFeedback;
 #endif
-  if (perfFeedback || traceFeedback) {
+  // Metal 4 exposes command-buffer failures through commit feedback. Always
+  // install the handler so release builds propagate GPU errors instead of
+  // waiting forever for a completion event that a failed submission skipped.
+  {
     options = [[MTL4CommitOptions alloc] init];
     const obj_handle_t feedbackCommandBuffer = (obj_handle_t)self;
     const obj_handle_t feedbackMetalBuffer = (obj_handle_t)_metal4Buffer;
@@ -914,8 +924,32 @@ dxmt_metal4_is_buffer(id object) {
     __block NSArray *feedbackWaitEvents = [_pendingWaitEvents copy];
     __block NSArray *feedbackSignalEvents = [_pendingSignalEvents copy];
     __block NSString *feedbackLabel = [_metal4Buffer.label copy];
+    __block DXMTMetal4CommandBuffer *feedbackOwner = [self retain];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
       NSError *error = feedback.error;
+      if (!error && dxmt_metal4_test_inject_feedback_error()) {
+        error = [NSError errorWithDomain:@"DXMTMetal4TestErrorDomain"
+                                    code:1
+                                userInfo:@{
+                                  NSLocalizedDescriptionKey:
+                                      @"Injected Metal 4 commit feedback error"
+                                }];
+      }
+      @synchronized(feedbackOwner) {
+        feedbackOwner.feedbackGPUStartTime = feedback.GPUStartTime;
+        feedbackOwner.feedbackGPUEndTime = feedback.GPUEndTime;
+        if (error) {
+          feedbackOwner.feedbackError = error;
+          feedbackOwner.internalStatus = DXMTMetal4CommandBufferStateError;
+        }
+      }
+      if (error && feedbackCompletionEvent.signaledValue <
+                       feedbackCompletionValue) {
+        // This event is DXMT's CPU-side retirement timeline. Feedback means the
+        // GPU has finished processing the submission, successfully or not, so
+        // advancing it is safe and releases waiters/resource retirement.
+        feedbackCompletionEvent.signaledValue = feedbackCompletionValue;
+      }
       if (perfFeedback && error) {
         fprintf(stderr,
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
@@ -976,6 +1010,7 @@ dxmt_metal4_is_buffer(id object) {
       [feedbackSignalEvents release];
       [feedbackWaitEvents release];
       [feedbackCompletionEvent release];
+      [feedbackOwner release];
     }];
   }
 
@@ -1094,11 +1129,15 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (enum WMTCommandBufferStatus)status {
-  return (enum WMTCommandBufferStatus)_internalStatus;
+  @synchronized(self) {
+    return (enum WMTCommandBufferStatus)_internalStatus;
+  }
 }
 
 - (NSError *)error {
-  return _feedbackError;
+  @synchronized(self) {
+    return [[_feedbackError retain] autorelease];
+  }
 }
 
 - (id)logs {
@@ -1114,11 +1153,15 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (double)GPUStartTime {
-  return _feedbackGPUStartTime;
+  @synchronized(self) {
+    return _feedbackGPUStartTime;
+  }
 }
 
 - (double)GPUEndTime {
-  return _feedbackGPUEndTime;
+  @synchronized(self) {
+    return _feedbackGPUEndTime;
+  }
 }
 
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {

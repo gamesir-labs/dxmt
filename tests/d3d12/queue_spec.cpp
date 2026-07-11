@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -630,6 +631,33 @@ TEST_F(D3D12QueueSpec, QueueDestructionCanRaceFenceWaitCallbackArming) {
     ASSERT_TRUE(SUCCEEDED(queue->Wait(fence.get(), iteration + 1)));
     queue.reset();
   }
+}
+
+TEST(D3D12QueueErrorSpec, CommitFeedbackErrorDoesNotDeadlockCompletion) {
+  ASSERT_TRUE(SetEnvironmentVariableA(
+      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR", "1"));
+  D3D12TestContext context;
+  ASSERT_TRUE(SUCCEEDED(context.Initialize()));
+
+  const std::array<std::uint32_t, 4> expected = {
+      0x01020304, 0x11223344, 0x55667788, 0x99aabbcc};
+  auto upload = context.CreateUploadBuffer(
+      sizeof(expected), expected.data(), sizeof(expected));
+  auto destination = context.CreateBuffer(
+      sizeof(expected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(destination);
+  context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
+                                   sizeof(expected));
+
+  const auto begin = std::chrono::steady_clock::now();
+  EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  EXPECT_LT(elapsed, std::chrono::seconds(5));
+
+  ASSERT_TRUE(SetEnvironmentVariableA(
+      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR", nullptr));
 }
 
 } // namespace
