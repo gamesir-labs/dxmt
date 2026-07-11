@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -20,6 +21,9 @@ constexpr unsigned int kMixedEncoderIterations = 384;
 constexpr unsigned int kBarrierCount = 384;
 constexpr unsigned int kInitializerBatches = 1152;
 constexpr unsigned int kTexturesPerInitializerBatch = 4;
+constexpr unsigned int kFh4BlitPasses = 810;
+constexpr unsigned int kFh4BarrierPasses = 121;
+constexpr unsigned int kFh4BaselineFenceEntries = 1861;
 
 using IntegrationError = std::optional<std::string>;
 
@@ -199,6 +203,166 @@ IntegrationError RunBarrierChainScenario() {
   return HResultError("barrier-chain queue completion", context.SignalAndWait());
 }
 
+struct CommandBufferDiagnosticTotals {
+  std::uint64_t input_encoders = 0;
+  std::uint64_t encoded_encoders = 0;
+  std::uint64_t encoded_blit = 0;
+  std::uint64_t barrier_only = 0;
+  std::uint64_t fence_waits = 0;
+  std::uint64_t fence_updates = 0;
+};
+
+IntegrationError RunFh4SynchronizationScenario(
+    CommandBufferDiagnosticTotals *totals) {
+  std::ostringstream marker_name;
+  marker_name << "C:\\dxmt-fh4-sync-" << GetCurrentProcessId() << "-"
+              << GetTickCount64() << ".txt";
+  const auto marker_path = marker_name.str();
+  std::ofstream(marker_path, std::ios::trunc).close();
+  struct MarkerGuard {
+    explicit MarkerGuard(std::string marker_path)
+        : path(std::move(marker_path)) {
+      SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
+                              path.c_str());
+    }
+    ~MarkerGuard() {
+      Disable();
+      DeleteFileA(path.c_str());
+    }
+    void Disable() {
+      if (!enabled)
+        return;
+      SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
+                              nullptr);
+      enabled = false;
+    }
+    std::string path;
+    bool enabled = true;
+  } marker_guard(marker_path);
+
+  D3D12TestContext context;
+  if (auto error = HResultError("D3D12 context initialization",
+                                context.Initialize()))
+    return error;
+
+  const std::array<std::uint32_t, 64> expected = [] {
+    std::array<std::uint32_t, 64> values = {};
+    for (std::uint32_t i = 0; i < values.size(); i++)
+      values[i] = 0x9e370000u + i;
+    return values;
+  }();
+  auto upload = context.CreateUploadBuffer(
+      sizeof(expected), expected.data(), sizeof(expected));
+  auto barrier_resource = context.CreateBuffer(
+      sizeof(expected), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (!upload || !barrier_resource)
+    return "failed to create FH4 synchronization resources";
+
+  std::vector<ComPtr<ID3D12Resource>> destinations;
+  std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
+  std::vector<ComPtr<ID3D12GraphicsCommandList>> command_lists;
+  std::vector<ID3D12CommandList *> submit_lists;
+  destinations.reserve(kFh4BlitPasses);
+  allocators.reserve(kFh4BlitPasses + kFh4BarrierPasses);
+  command_lists.reserve(kFh4BlitPasses + kFh4BarrierPasses);
+  submit_lists.reserve(kFh4BlitPasses + kFh4BarrierPasses);
+
+  auto append_list = [&](bool barrier_only,
+                         ID3D12Resource *destination) -> IntegrationError {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    HRESULT hr = context.device()->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+        reinterpret_cast<void **>(allocator.put()));
+    if (auto error = HResultError("FH4 allocator creation", hr))
+      return error;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    hr = context.device()->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+        __uuidof(ID3D12GraphicsCommandList),
+        reinterpret_cast<void **>(list.put()));
+    if (auto error = HResultError("FH4 command-list creation", hr))
+      return error;
+    if (barrier_only)
+      D3D12TestContext::UavBarrier(list.get(), barrier_resource.get());
+    else
+      list->CopyBufferRegion(destination, 0, upload.get(), 0,
+                             sizeof(expected));
+    if (auto error = HResultError("FH4 command-list close", list->Close()))
+      return error;
+    submit_lists.push_back(list.get());
+    allocators.push_back(std::move(allocator));
+    command_lists.push_back(std::move(list));
+    return std::nullopt;
+  };
+
+  for (unsigned int i = 0; i < kFh4BlitPasses; i++) {
+    auto destination = context.CreateBuffer(
+        sizeof(expected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!destination)
+      return "failed to create FH4 blit destination";
+    auto *destination_ptr = destination.get();
+    destinations.push_back(std::move(destination));
+    if (auto error = append_list(false, destination_ptr))
+      return error;
+    if (((i + 1) * kFh4BarrierPasses) / kFh4BlitPasses !=
+        (i * kFh4BarrierPasses) / kFh4BlitPasses) {
+      if (auto error = append_list(true, nullptr))
+        return error;
+    }
+  }
+
+  context.queue()->ExecuteCommandLists(
+      static_cast<UINT>(submit_lists.size()), submit_lists.data());
+  if (auto error = HResultError("FH4 synchronization queue completion",
+                                context.SignalAndWait()))
+    return error;
+  marker_guard.Disable();
+
+  std::ifstream marker(marker_path);
+  CommandBufferDiagnosticTotals measured = {};
+  CommandBufferDiagnosticTotals line = {};
+  while (marker >> line.input_encoders >> line.encoded_encoders >>
+         line.encoded_blit >> line.barrier_only >> line.fence_waits >>
+         line.fence_updates) {
+    measured.input_encoders += line.input_encoders;
+    measured.encoded_encoders += line.encoded_encoders;
+    measured.encoded_blit += line.encoded_blit;
+    measured.barrier_only += line.barrier_only;
+    measured.fence_waits += line.fence_waits;
+    measured.fence_updates += line.fence_updates;
+  }
+  if (totals)
+    *totals = measured;
+  if (measured.barrier_only)
+    return "FH4 synchronization workload encoded standalone barriers";
+  if (measured.fence_waits + measured.fence_updates >
+      kFh4BaselineFenceEntries / 4)
+    return "FH4 synchronization workload did not reduce fence entries by 75 percent";
+
+  if (auto error = HResultError("FH4 empty command-list close",
+                                context.list()->Close()))
+    return error;
+  if (auto error = HResultError("FH4 readback list reset",
+                                context.ResetCommandList()))
+    return error;
+  D3D12TestContext::Transition(
+      context.list(), destinations.back().get(),
+      D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> readback;
+  if (auto error = HResultError(
+          "FH4 synchronization readback",
+          context.ReadbackBuffer(destinations.back().get(), sizeof(expected),
+                                 &readback)))
+    return error;
+  if (readback.size() != sizeof(expected) ||
+      std::memcmp(readback.data(), expected.data(), sizeof(expected)) != 0)
+    return "FH4 synchronization readback mismatch";
+  return std::nullopt;
+}
+
 IntegrationError RunInitializerLifetimeScenario() {
   D3D12TestContext context;
   if (auto error = HResultError("D3D12 context initialization",
@@ -265,6 +429,25 @@ void BI_D3D12FenceOnlyBarrierChain(benchmark::State &state) {
   RunIntegrationBenchmark(state, RunBarrierChainScenario, kBarrierCount);
 }
 
+void BI_D3D12Fh4SynchronizationAmplification(benchmark::State &state) {
+  for (auto _ : state) {
+    CommandBufferDiagnosticTotals totals = {};
+    if (IntegrationError error = RunFh4SynchronizationScenario(&totals)) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+    state.counters["logical_blit"] = kFh4BlitPasses;
+    state.counters["logical_barrier"] = kFh4BarrierPasses;
+    state.counters["input_encoders"] = totals.input_encoders;
+    state.counters["encoded_encoders"] = totals.encoded_encoders;
+    state.counters["encoded_blit"] = totals.encoded_blit;
+    state.counters["barrier_only"] = totals.barrier_only;
+    state.counters["fence_edges"] =
+        totals.fence_waits + totals.fence_updates;
+  }
+  state.SetItemsProcessed(state.iterations() * kFh4BlitPasses);
+}
+
 void BI_D3D12ResourceInitializerLifetime(benchmark::State &state) {
   RunIntegrationBenchmark(
       state, RunInitializerLifetimeScenario,
@@ -274,6 +457,9 @@ void BI_D3D12ResourceInitializerLifetime(benchmark::State &state) {
 BENCHMARK(BI_D3D12MixedEncoderBarrierOnly)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12MixedEncoderCopyTransitions)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12FenceOnlyBarrierChain)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12Fh4SynchronizationAmplification)
+    ->Iterations(1)
+    ->UseRealTime();
 BENCHMARK(BI_D3D12ResourceInitializerLifetime)->Iterations(1)->UseRealTime();
 
 } // namespace

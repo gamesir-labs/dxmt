@@ -3529,6 +3529,18 @@ ArgumentEncodingContext::endPass() {
     }
   }
 
+  // Resource dependencies are established when each access is appended. Only
+  // attempt a constant-time merge with the immediately preceding encoder;
+  // unrelated work remains in submission order and no flush-time relation
+  // search is required.
+  if (encoder_last != &encoder_head) {
+    checkEncoderRelation(encoder_last, encoder_current);
+    if (encoder_current->type == EncoderType::Null) {
+      encoder_current = nullptr;
+      return;
+    }
+  }
+
   encoder_last->next = encoder_current;
   encoder_last = encoder_current;
   encoder_current = nullptr;
@@ -3922,25 +3934,6 @@ ArgumentEncodingContext::flushCommands(
     }
   }
 
-  if (encoder_count > 1) {
-    const auto t0 = clock::now();
-    unsigned j, i;
-    for (j = encoder_count - 2; j != ~0u; j--) {
-      if (encoders[j]->type != EncoderType::Clear &&
-          encoders[j]->type != EncoderType::Render &&
-          encoders[j]->type != EncoderType::Compute &&
-          encoders[j]->type != EncoderType::Blit)
-        continue;
-      for (i = j + 1; i < encoder_count; i++) {
-        if (encoders[i]->type == EncoderType::Null)
-          continue;
-        if (checkEncoderRelation(encoders[j], encoders[i]) == DXMT_ENCODER_LIST_OP_SYNCHRONIZE)
-          break;
-      }
-    }
-    perf.relation += clock::now() - t0;
-  }
-
   QueryReadbacks readbacks{};
 
   {
@@ -4053,8 +4046,8 @@ ArgumentEncodingContext::flushCommands(
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
-          [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStagePreRaster); },
-          [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); }
+          [&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStagePreRaster); },
+          [&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); }
       );
       if (data->allocated_argbuf_size) {
         encoder.setArgumentBuffer(gpu_buffer_, 0, 16, WMTRenderStageVertex);
@@ -4081,10 +4074,10 @@ ArgumentEncodingContext::flushCommands(
         data->fence_update_vertex.forEach(
             data->fence_update,
             [&](auto id) {
-              encoder.updateFence(fence_pool_[id], WMTRenderStageFragment);
+              encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment);
             },
             [&](auto id) {
-              encoder.updateFence(fence_pool_[id], WMTRenderStagePreRaster);
+              encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStagePreRaster);
             });
         encoder.endEncoding();
         data->~RenderEncoderData();
@@ -4201,8 +4194,8 @@ ArgumentEncodingContext::flushCommands(
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update_vertex.forEach(
           data->fence_update, // if a fence is updated at fragment, no need to update again pre-raster
-          [&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); },
-          [&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStagePreRaster); }
+          [&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); },
+          [&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStagePreRaster); }
       );
       encoder.endEncoding();
       DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
@@ -4281,7 +4274,7 @@ ArgumentEncodingContext::flushCommands(
              " waitFence=", command_summary.wait_fences + data->fence_wait.count(),
              " updateFence=", command_summary.update_fences + data->fence_update.count());
       }
-      data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
+      data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane]); });
       if (data->allocated_argbuf_size) {
         struct wmtcmd_compute_setargumentbuffer setcmd;
         setcmd.type = WMTComputeCommandSetArgumentBuffer;
@@ -4294,7 +4287,7 @@ ArgumentEncodingContext::flushCommands(
         encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
       }
       encoder.encodeCommands(&data->cmd_head);
-      data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
+      data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane]); });
       encoder.endEncoding();
       data->~ComputeEncoderData();
       perf.encodedCompute++;
@@ -4318,9 +4311,9 @@ ArgumentEncodingContext::flushCommands(
           " mip=" + std::to_string(command_summary.generate_mipmaps) +
           " wf=" + std::to_string(command_summary.wait_fences + data->fence_wait.count()) +
           " uf=" + std::to_string(command_summary.update_fences + data->fence_update.count())));
-      data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
+      data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane]); });
       encoder.encodeCommands(&data->cmd_head);
-      data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
+      data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane]); });
       encoder.endEncoding();
       data->~BlitEncoderData();
       perf.encodedBlit++;
@@ -4343,10 +4336,10 @@ ArgumentEncodingContext::flushCommands(
       auto drawable = data->presenter->encodeCommands(
           cmdbuf, data->backbuffer, data->metadata,
           [&](WMT::RenderCommandEncoder encoder) {
-            data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
+            data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
           },
           [&](WMT::RenderCommandEncoder encoder) {
-            data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
+            data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
           }
       );
       auto t1 = clock::now();
@@ -4439,8 +4432,8 @@ ArgumentEncodingContext::flushCommands(
         }
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
-        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
-        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
+        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
+        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
         encoder.endEncoding();
       }
       data->~ClearEncoderData();
@@ -4496,7 +4489,7 @@ ArgumentEncodingContext::flushCommands(
         }
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
-        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
+        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
         if (data->pso) {
           struct ResolveMetadata {
             uint32_t src_origin[2];
@@ -4521,7 +4514,7 @@ ArgumentEncodingContext::flushCommands(
               double(metadata.size[0]), double(metadata.size[1]), 0.0, 1.0});
           encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
         }
-        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
+        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
         encoder.endEncoding();
       }
       data->~ResolveEncoderData();
@@ -4533,7 +4526,7 @@ ArgumentEncodingContext::flushCommands(
 
       auto begin_scaler = cmdbuf.blitCommandEncoder();
       begin_scaler.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
-      data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id]); });
+      data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id % kParityLane]); });
       begin_scaler.updateFence(data->scaler->fence());
       begin_scaler.endEncoding();
 
@@ -4542,7 +4535,7 @@ ArgumentEncodingContext::flushCommands(
       auto end_scaler = cmdbuf.blitCommandEncoder();
       end_scaler.waitForFence(data->scaler->fence());
       end_scaler.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
-      data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id]); });
+      data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id % kParityLane]); });
       end_scaler.endEncoding();
 
       data->~SpatialUpscaleData();
@@ -4568,7 +4561,7 @@ ArgumentEncodingContext::flushCommands(
 
       auto begin_scaler = cmdbuf.blitCommandEncoder();
       begin_scaler.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
-      data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id]); });
+      data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id % kParityLane]); });
       begin_scaler.updateFence(data->scaler->fence());
       begin_scaler.endEncoding();
 
@@ -4580,7 +4573,7 @@ ArgumentEncodingContext::flushCommands(
       auto end_scaler = cmdbuf.blitCommandEncoder();
       end_scaler.waitForFence(data->scaler->fence());
       end_scaler.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
-      data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id]); });
+      data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id % kParityLane]); });
       end_scaler.endEncoding();
       data->~TemporalUpscaleData();
       perf.encodedScaler++;
@@ -4728,8 +4721,8 @@ ArgumentEncodingContext::flushCommands(
     perf.fenceWaits += perf.pendingFenceWaits;
     perf.fenceUpdates += perf.pendingFenceUpdates;
     auto encoder = cmdbuf.blitCommandEncoder();
-    pending_fence_only_blit_wait_.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
-    pending_fence_only_blit_update_.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
+    pending_fence_only_blit_wait_.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane]); });
+    pending_fence_only_blit_update_.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane]); });
     encoder.endEncoding();
     pending_fence_only_blit_wait_ = {};
     pending_fence_only_blit_update_ = {};
