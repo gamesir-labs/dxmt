@@ -86,13 +86,45 @@ void
 CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   enc.$$setEncodingContext(chunk_id, frame_);
   auto &statistics = enc.currentFrameStatistics();
+  CommandBufferDiagnosticInfo diagnostic = {};
+  diagnostic.frame_id = frame_;
+  diagnostic.chunk_id = chunk_id;
+  diagnostic.resource_initializer_event_id = resource_initializer_event_id;
+  const auto barrier_only_before = statistics.blit_barrier_only_pass_count;
 
   auto t0 = clock::now();
   list_enc.execute(enc);
   attached_cmdbuf = cmdbuf;
   auto t1 = clock::now();
-  readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
+  readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id, &diagnostic);
   auto t2 = clock::now();
+
+  diagnostic.barrier_only_pass_count =
+      statistics.blit_barrier_only_pass_count - barrier_only_before;
+  const uint64_t d3d_sequence = dxmt::apitrace::d3d_enabled()
+                                    ? dxmt::apitrace::current_d3d_sequence()
+                                    : chunk_id;
+  diagnostic.d3d_sequence_begin = d3d_sequence;
+  diagnostic.d3d_sequence_end = d3d_sequence;
+#if DXMT_DX12_METAL4
+  WMTCommandBufferDiagnosticInfo wmt_diagnostic = {};
+  wmt_diagnostic.frame_id = diagnostic.frame_id;
+  wmt_diagnostic.chunk_id = diagnostic.chunk_id;
+  wmt_diagnostic.d3d_sequence_begin = diagnostic.d3d_sequence_begin;
+  wmt_diagnostic.d3d_sequence_end = diagnostic.d3d_sequence_end;
+  wmt_diagnostic.resource_initializer_event_id =
+      diagnostic.resource_initializer_event_id;
+  wmt_diagnostic.input_encoder_count = diagnostic.input_encoder_count;
+  wmt_diagnostic.encoded_encoder_count = diagnostic.encoded_encoder_count;
+  wmt_diagnostic.render_encoder_count = diagnostic.render_encoder_count;
+  wmt_diagnostic.compute_encoder_count = diagnostic.compute_encoder_count;
+  wmt_diagnostic.blit_encoder_count = diagnostic.blit_encoder_count;
+  wmt_diagnostic.other_encoder_count = diagnostic.other_encoder_count;
+  wmt_diagnostic.barrier_only_pass_count = diagnostic.barrier_only_pass_count;
+  wmt_diagnostic.fence_wait_count = diagnostic.fence_wait_count;
+  wmt_diagnostic.fence_update_count = diagnostic.fence_update_count;
+  cmdbuf.setDiagnosticInfo(wmt_diagnostic);
+#endif
 
   auto execute_elapsed = t1 - t0;
   auto flush_elapsed = t2 - t1;

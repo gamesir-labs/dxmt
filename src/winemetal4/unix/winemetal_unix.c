@@ -175,6 +175,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) NSError *feedbackError;
 @property(nonatomic, assign) double feedbackGPUStartTime;
 @property(nonatomic, assign) double feedbackGPUEndTime;
+@property(nonatomic, assign) struct WMTCommandBufferDiagnosticInfo diagnosticInfo;
 - (instancetype)initWithQueue:(DXMTMetal4CommandQueue *)queue;
 - (id<MTL4CommandBuffer>)commandBuffer;
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder;
@@ -747,6 +748,7 @@ dxmt_metal4_is_buffer(id object) {
   _internalStatus = DXMTMetal4CommandBufferStateNotEnqueued;
   _feedbackGPUStartTime = 0.0;
   _feedbackGPUEndTime = 0.0;
+  memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
   if (!_allocator || !_metal4Buffer || !_pendingWaitEvents || !_pendingSignalEvents || !_residencySet) {
     [self release];
@@ -920,6 +922,8 @@ dxmt_metal4_is_buffer(id object) {
     const uint64_t feedbackQueueDepth = _owner.maxCommandBufferCount;
     const uint64_t feedbackCompletionValue = _completionValue;
     const BOOL feedbackHasDrawable = _pendingDrawable != nil;
+    const struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic =
+        _diagnosticInfo;
     __block id<MTLSharedEvent> feedbackCompletionEvent = [_owner.event retain];
     __block NSArray *feedbackWaitEvents = [_pendingWaitEvents copy];
     __block NSArray *feedbackSignalEvents = [_pendingSignalEvents copy];
@@ -955,6 +959,10 @@ dxmt_metal4_is_buffer(id object) {
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
                 " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
                 " completionCurrent=%" PRIu64 " waitCount=%lu signalCount=%lu drawable=%d"
+                " frame=%" PRIu64 " chunk=%" PRIu64
+                " d3dSeq=%" PRIu64 "-%" PRIu64
+                " encoders=%u/%u render=%u compute=%u blit=%u other=%u"
+                " barrierOnly=%u fenceWait=%u fenceUpdate=%u initEvent=%" PRIu64
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
                 (void *)(uintptr_t)feedbackMetalBuffer,
@@ -965,6 +973,20 @@ dxmt_metal4_is_buffer(id object) {
                 (unsigned long)feedbackWaitEvents.count,
                 (unsigned long)feedbackSignalEvents.count,
                 feedbackHasDrawable,
+                feedbackDiagnostic.frame_id,
+                feedbackDiagnostic.chunk_id,
+                feedbackDiagnostic.d3d_sequence_begin,
+                feedbackDiagnostic.d3d_sequence_end,
+                feedbackDiagnostic.input_encoder_count,
+                feedbackDiagnostic.encoded_encoder_count,
+                feedbackDiagnostic.render_encoder_count,
+                feedbackDiagnostic.compute_encoder_count,
+                feedbackDiagnostic.blit_encoder_count,
+                feedbackDiagnostic.other_encoder_count,
+                feedbackDiagnostic.barrier_only_pass_count,
+                feedbackDiagnostic.fence_wait_count,
+                feedbackDiagnostic.fence_update_count,
+                feedbackDiagnostic.resource_initializer_event_id,
                 feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
                 feedback.GPUStartTime, feedback.GPUEndTime,
                 error.domain ? error.domain.UTF8String : "<no domain>",
@@ -3843,6 +3865,15 @@ _MTLCommandBuffer_commit(void *obj) {
   @synchronized(cmdbuf.owner) {
     params->ret_residency_submit_us = [cmdbuf commitLocked];
   }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_setDiagnosticInfo(void *obj) {
+  struct unixcall_mtlcommandbuffer_set_diagnostic_info *params = obj;
+  DXMTMetal4CommandBuffer *cmdbuf =
+      (DXMTMetal4CommandBuffer *)params->handle;
+  cmdbuf.diagnosticInfo = params->info;
   return STATUS_SUCCESS;
 }
 
@@ -8248,6 +8279,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLCommandBuffer_setDiagnosticInfo,
 };
 
 #ifndef DXMT_NATIVE
@@ -8428,5 +8460,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLCommandBuffer_setDiagnosticInfo,
 };
 #endif

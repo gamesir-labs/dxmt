@@ -114,6 +114,30 @@ WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
     obj_handle_t cmdbuf, uint64_t *residency_submit_us);
 
+struct WMTCommandBufferDiagnosticInfo {
+  uint64_t frame_id;
+  uint64_t chunk_id;
+  uint64_t d3d_sequence_begin;
+  uint64_t d3d_sequence_end;
+  uint64_t resource_initializer_event_id;
+  uint32_t input_encoder_count;
+  uint32_t encoded_encoder_count;
+  uint32_t render_encoder_count;
+  uint32_t compute_encoder_count;
+  uint32_t blit_encoder_count;
+  uint32_t other_encoder_count;
+  uint32_t barrier_only_pass_count;
+  uint32_t fence_wait_count;
+  uint32_t fence_update_count;
+  uint32_t reserved[3];
+};
+
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 88);
+
+WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
+    obj_handle_t cmdbuf,
+    const struct WMTCommandBufferDiagnosticInfo *info);
+
 WINEMETAL_API void MTLCommandBuffer_waitUntilCompleted(obj_handle_t cmdbuf);
 
 enum WMTCommandBufferStatus : uint64_t {

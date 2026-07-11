@@ -3800,7 +3800,9 @@ ArgumentEncodingContext::appendComputeArgumentBufferBindings(ComputeEncoderData 
 }
 
 QueryReadbacks
-ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
+ArgumentEncodingContext::flushCommands(
+    WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id,
+    CommandBufferDiagnosticInfo *diagnostic_info) {
   assert(!encoder_current);
 
   struct FlushPerfStats {
@@ -3837,6 +3839,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     uint32_t skippedResolve = 0;
     uint32_t pendingFenceWaits = 0;
     uint32_t pendingFenceUpdates = 0;
+    uint32_t fenceWaits = 0;
+    uint32_t fenceUpdates = 0;
   } perf;
 
   const bool log_flush_perf = DebugShouldLogFlushPerf();
@@ -3865,9 +3869,42 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   {
     auto &stats = currentFrameStatistics();
     for (unsigned i = 0; i < encoder_count; i++) {
-      const auto *encoder = encoders[i];
+      auto *encoder = encoders[i];
       if (encoder->type == EncoderType::Null)
         continue;
+
+      auto count_fences = [&](const FenceSet &waits,
+                              const FenceSet &updates) {
+        perf.fenceWaits += waits.count();
+        perf.fenceUpdates += updates.count();
+      };
+      switch (encoder->type) {
+      case EncoderType::Render: {
+        auto *data = static_cast<RenderEncoderData *>(encoder);
+        data->fence_wait.forEach(
+            data->fence_wait_vertex,
+            [&](auto) { perf.fenceWaits++; },
+            [&](auto) { perf.fenceWaits++; });
+        data->fence_update.forEach(
+            data->fence_update_vertex,
+            [&](auto) { perf.fenceUpdates++; },
+            [&](auto) { perf.fenceUpdates++; });
+        break;
+      }
+      case EncoderType::Compute: {
+        auto *data = static_cast<ComputeEncoderData *>(encoder);
+        count_fences(data->fence_wait, data->fence_update);
+        break;
+      }
+      case EncoderType::Blit: {
+        auto *data = static_cast<BlitEncoderData *>(encoder);
+        count_fences(data->fence_wait, data->fence_update);
+        break;
+      }
+      default:
+        count_fences(encoder->fence_wait, encoder->fence_update);
+        break;
+      }
 
       if (last_non_null_type != EncoderType::Null &&
           last_non_null_type != encoder->type) {
@@ -4688,6 +4725,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     const auto t0 = clock::now();
     perf.pendingFenceWaits = pending_fence_only_blit_wait_.count();
     perf.pendingFenceUpdates = pending_fence_only_blit_update_.count();
+    perf.fenceWaits += perf.pendingFenceWaits;
+    perf.fenceUpdates += perf.pendingFenceUpdates;
     auto encoder = cmdbuf.blitCommandEncoder();
     pending_fence_only_blit_wait_.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
     pending_fence_only_blit_update_.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
@@ -4723,13 +4762,25 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   }
 
   const auto total = clock::now() - flush_start;
+  const uint32_t encoded_encoders =
+      perf.encodedRender + perf.encodedCompute + perf.encodedBlit +
+      perf.encodedPresent + perf.encodedClear + perf.encodedResolve +
+      perf.encodedScaler + perf.encodedSignalEvent + perf.encodedWaitEvent +
+      perf.encodedTimestamp;
+  if (diagnostic_info) {
+    diagnostic_info->input_encoder_count = perf.inputEncoders;
+    diagnostic_info->encoded_encoder_count = encoded_encoders;
+    diagnostic_info->render_encoder_count = perf.encodedRender;
+    diagnostic_info->compute_encoder_count = perf.encodedCompute;
+    diagnostic_info->blit_encoder_count = perf.encodedBlit;
+    diagnostic_info->other_encoder_count =
+        encoded_encoders - perf.encodedRender - perf.encodedCompute -
+        perf.encodedBlit;
+    diagnostic_info->fence_wait_count = perf.fenceWaits;
+    diagnostic_info->fence_update_count = perf.fenceUpdates;
+  }
   {
     auto &stats = currentFrameStatistics();
-    const uint32_t encoded_encoders =
-        perf.encodedRender + perf.encodedCompute + perf.encodedBlit +
-        perf.encodedPresent + perf.encodedClear + perf.encodedResolve +
-        perf.encodedScaler + perf.encodedSignalEvent + perf.encodedWaitEvent +
-        perf.encodedTimestamp;
     const bool event_only_chunk =
         perf.inputEncoders == (perf.encodedSignalEvent + perf.encodedWaitEvent) &&
         (perf.encodedSignalEvent || perf.encodedWaitEvent);

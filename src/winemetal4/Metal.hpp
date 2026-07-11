@@ -728,6 +728,11 @@ public:
 class CommandBuffer : public Object {
 public:
   void
+  setDiagnosticInfo(const WMTCommandBufferDiagnosticInfo &info) {
+    MTLCommandBuffer_setDiagnosticInfo(handle, &info);
+  }
+
+  void
   commit() {
     return MTLCommandBuffer_commit(handle);
   }
