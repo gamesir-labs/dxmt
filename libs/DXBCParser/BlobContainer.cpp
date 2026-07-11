@@ -3,7 +3,20 @@
 #include "DXBCUtils.h"
 #include "BlobContainer.h"
 
+#include <cstdint>
+#include <cstring>
+
 namespace microsoft {
+
+namespace {
+
+UINT32 ReadUInt32(const void *address) {
+    UINT32 value;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+}
 
 //=================================================================================================================================
 // CDXBCParser
@@ -20,6 +33,9 @@ CDXBCParser::CDXBCParser()
 // CDXBCParser::ReadDXBC()
 HRESULT CDXBCParser::ReadDXBC( const void* pContainer, UINT ContainerSizeInBytes )
 {
+    m_pHeader = NULL;
+    m_pIndex = NULL;
+
     if (!pContainer)
     {
         return E_FAIL;
@@ -28,7 +44,7 @@ HRESULT CDXBCParser::ReadDXBC( const void* pContainer, UINT ContainerSizeInBytes
     {
         return E_FAIL;
     }
-    DXBCHeader* pHeader = (DXBCHeader*)pContainer;
+    const DXBCHeader* pHeader = static_cast<const DXBCHeader*>(pContainer);
     if (pHeader->ContainerSizeInBytes != ContainerSizeInBytes)
     {
         return E_FAIL;
@@ -39,56 +55,36 @@ HRESULT CDXBCParser::ReadDXBC( const void* pContainer, UINT ContainerSizeInBytes
     {
         return E_FAIL;
     }
-    const void* pContainerEnd = ((const BYTE*)pHeader + ContainerSizeInBytes);
-    if (pContainerEnd < pContainer)
+    const uint64_t indexEnd = uint64_t(sizeof(DXBCHeader)) +
+                              uint64_t(pHeader->BlobCount) * sizeof(UINT32);
+    if (indexEnd > ContainerSizeInBytes)
     {
         return E_FAIL;
     }
-    UINT* pIndex = (UINT*)((BYTE*)pHeader + sizeof( DXBCHeader ));
-    if ((const BYTE*)pContainer + sizeof( UINT ) * pHeader->BlobCount < (const BYTE*)pContainer)
-    {
-        return E_FAIL; // overflow would break the calculation of OffsetOfCurrentSegmentEnd below
-    }
-    UINT OffsetOfCurrentSegmentEnd = (UINT)((BYTE*)pIndex - (const BYTE*)pContainer + sizeof( UINT ) * pHeader->BlobCount - 1);
-    // Is the entire index within the container?
-    if (OffsetOfCurrentSegmentEnd > ContainerSizeInBytes)
-    {
-        return E_FAIL;
-    }
-    // Is each blob in the index directly after the previous entry and not past the end of the container?
-    UINT OffsetOfLastSegmentEnd = OffsetOfCurrentSegmentEnd;
+    const BYTE* bytes = static_cast<const BYTE*>(pContainer);
+    const BYTE* pIndex = bytes + sizeof(DXBCHeader);
+    uint64_t expectedBlobOffset = indexEnd;
+
     for (UINT b = 0; b < pHeader->BlobCount; b++)
     {
-        DXBCBlobHeader* pBlobHeader = (DXBCBlobHeader*)((const BYTE*)pContainer + pIndex[b]);
-        DXBCBlobHeader* pAfterBlobHeader = pBlobHeader + 1;
+        const uint64_t blobOffset = ReadUInt32(pIndex + b * sizeof(UINT32));
+        if (blobOffset != expectedBlobOffset ||
+            blobOffset + sizeof(DXBCBlobHeader) > ContainerSizeInBytes)
+        {
+            return E_FAIL;
+        }
 
-        if (pAfterBlobHeader < pBlobHeader || pAfterBlobHeader > pContainerEnd)
-        {
+        const UINT32 blobSize = ReadUInt32(
+            bytes + blobOffset + offsetof(DXBCBlobHeader, BlobSize));
+        expectedBlobOffset = blobOffset + sizeof(DXBCBlobHeader) +
+                             uint64_t(blobSize);
+        if (expectedBlobOffset > ContainerSizeInBytes)
             return E_FAIL;
-        }
-        if (((BYTE*)pBlobHeader < (const BYTE*)pContainer) || (pIndex[b] + sizeof( DXBCBlobHeader ) < pIndex[b]))
-        {
-            return E_FAIL; // overflow because of bad pIndex[b] value
-        }
-        if (pIndex[b] + sizeof( DXBCBlobHeader ) + pBlobHeader->BlobSize < pIndex[b])
-        {
-            return E_FAIL; // overflow because of bad pBlobHeader->BlobSize value
-        }
-        OffsetOfCurrentSegmentEnd = pIndex[b] + sizeof( DXBCBlobHeader ) + pBlobHeader->BlobSize - 1;
-        if (OffsetOfCurrentSegmentEnd > ContainerSizeInBytes)
-        {
-            return E_FAIL;
-        }
-        if (OffsetOfLastSegmentEnd != pIndex[b] - 1)
-        {
-            return E_FAIL;
-        }
-        OffsetOfLastSegmentEnd = OffsetOfCurrentSegmentEnd;
     }
 
     // Ok, satisfied with integrity of container, store info.
     m_pHeader = pHeader;
-    m_pIndex = pIndex;
+    m_pIndex = reinterpret_cast<const UINT32*>(pIndex);
     return S_OK;
 }
 
@@ -98,7 +94,7 @@ HRESULT CDXBCParser::ReadDXBCAssumingValidSize( const void* pContainer )
 {
     if (!pContainer)
     {
-        return E_FAIL;
+        return ReadDXBC(NULL, 0);
     }
     return ReadDXBC( (const BYTE*)pContainer, DXBCGetSizeAssumingValidPointer( (const BYTE*)pContainer ) );
 }
@@ -113,8 +109,12 @@ UINT CDXBCParser::FindNextMatchingBlob( DXBCFourCC SearchFourCC, UINT SearchStar
     }
     for (UINT b = SearchStartBlobIndex; b < m_pHeader->BlobCount; b++)
     {
-        DXBCBlobHeader* pBlob = (DXBCBlobHeader*)((BYTE*)m_pHeader + m_pIndex[b]);
-        if (pBlob->BlobFourCC == SearchFourCC)
+        const BYTE* index = reinterpret_cast<const BYTE*>(m_pIndex) +
+                            b * sizeof(UINT32);
+        const BYTE* blob = reinterpret_cast<const BYTE*>(m_pHeader) +
+                           ReadUInt32(index);
+        if (ReadUInt32(blob + offsetof(DXBCBlobHeader, BlobFourCC)) ==
+            static_cast<UINT32>(SearchFourCC))
         {
             return b;
         }
@@ -151,7 +151,10 @@ const void* CDXBCParser::GetBlob( UINT BlobIndex )
     {
         return NULL;
     }
-    return (BYTE*)m_pHeader + m_pIndex[BlobIndex] + sizeof( DXBCBlobHeader );
+    const BYTE* index = reinterpret_cast<const BYTE*>(m_pIndex) +
+                        BlobIndex * sizeof(UINT32);
+    return reinterpret_cast<const BYTE*>(m_pHeader) + ReadUInt32(index) +
+           sizeof(DXBCBlobHeader);
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
@@ -162,7 +165,11 @@ UINT CDXBCParser::GetBlobSize( UINT BlobIndex )
     {
         return 0;
     }
-    return ((DXBCBlobHeader*)((BYTE*)m_pHeader + m_pIndex[BlobIndex]))->BlobSize;
+    const BYTE* index = reinterpret_cast<const BYTE*>(m_pIndex) +
+                        BlobIndex * sizeof(UINT32);
+    const BYTE* blob = reinterpret_cast<const BYTE*>(m_pHeader) +
+                       ReadUInt32(index);
+    return ReadUInt32(blob + offsetof(DXBCBlobHeader, BlobSize));
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
@@ -173,7 +180,11 @@ UINT CDXBCParser::GetBlobFourCC( UINT BlobIndex )
     {
         return 0;
     }
-    return ((DXBCBlobHeader*)((BYTE*)m_pHeader + m_pIndex[BlobIndex]))->BlobFourCC;
+    const BYTE* index = reinterpret_cast<const BYTE*>(m_pIndex) +
+                        BlobIndex * sizeof(UINT32);
+    const BYTE* blob = reinterpret_cast<const BYTE*>(m_pHeader) +
+                       ReadUInt32(index);
+    return ReadUInt32(blob + offsetof(DXBCBlobHeader, BlobFourCC));
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------

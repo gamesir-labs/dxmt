@@ -47,18 +47,53 @@ dxmt_wine_framework_suites = {
   'checked_math': {
     'sources': files('wine/checked_math_test.cpp'),
   },
+  'internal_units': {
+    'sources': files(
+      'support/logger.cpp',
+      'wine/binding_set_test.cpp',
+      'wine/com_private_data_test.cpp',
+      'wine/descriptor_table_test.cpp',
+      'wine/dxbc_parser_test.cpp',
+      'wine/dxil_parser_test.cpp',
+      'wine/format_test.cpp',
+      'wine/names_test.cpp',
+      'wine/resource_state_test.cpp',
+      'wine/resource_subset_test.cpp',
+      'wine/ring_bump_allocator_test.cpp',
+      'wine/task_scheduler_test.cpp',
+      'wine/utility_bit_test.cpp',
+      'wine/utility_config_test.cpp',
+      'wine/utility_container_test.cpp',
+      'wine/utility_math_test.cpp',
+      'wine/utility_sha1_test.cpp',
+      'wine/utility_string_test.cpp',
+      '../src/dxmt/dxmt_allocation.cpp',
+      '../src/dxmt/dxmt_format.cpp',
+      '../src/dxmt/dxmt_names.cpp',
+      '../src/dxmt/dxmt_subresource.cpp',
+    ),
+    'dependencies': [util_dep, dxbc_parser_dep, dxil_parser_dep],
+  },
 }
 
 dxmt_wine_framework_sources = []
+dxmt_wine_framework_dependencies = []
 foreach suite_name, suite_config : dxmt_wine_framework_suites
   dxmt_wine_framework_sources += suite_config['sources']
+  dxmt_wine_framework_dependencies += suite_config.get('dependencies', [])
 endforeach
 
 dxmt_wine_framework_tests = executable(
   'dxmt-wine-framework-tests',
   dxmt_wine_framework_sources,
-  dependencies: [dxmt_test_dep],
-  include_directories: [dxmt_include_path],
+  dependencies: [dxmt_test_dep] + dxmt_wine_framework_dependencies,
+  include_directories: [
+    dxmt_include_path,
+    dxmt_build_include_path,
+    include_directories('../src/airconv'),
+    include_directories('../src/winemetal'),
+  ],
+  cpp_args: ['-DWINEMETAL_STATIC'],
   install: false,
 )
 

@@ -81,10 +81,12 @@ namespace dxmt {
      */
     template<typename T>
     T getOption(const char* option, T fallback = T()) const {
-      const std::string& value = getOptionValue(option);
+      const auto entry = m_options.find(option);
+      if (entry == m_options.end())
+        return fallback;
 
       T result = fallback;
-      parseOptionValue(value, result);
+      parseOptionValue(entry->second, result);
       return result;
     }
 
@@ -120,9 +122,6 @@ namespace dxmt {
   private:
 
     OptionMap m_options;
-
-    std::string getOptionValue(
-      const char*         option) const;
 
     static bool parseOptionValue(
       const std::string&  value,

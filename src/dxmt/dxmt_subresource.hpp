@@ -31,10 +31,15 @@ public:
 
   inline bool
   overlapWith(const ResourceSubsetState &other) const {
-    if (encoded_tag && other.encoded_tag && encoded_tag != other.encoded_tag)
+    if (!encoded_tag || !other.encoded_tag)
+      return true;
+
+    if (encoded_tag != other.encoded_tag)
       return false;
 
     if (encoded_tag == 0b01) {
+      if (!buffer.length || !other.buffer.length)
+        return false;
       return (buffer.offset < other.buffer.offset + other.buffer.length) &&
              (other.buffer.offset < buffer.offset + buffer.length);
     } else if (encoded_tag == 0b11) {

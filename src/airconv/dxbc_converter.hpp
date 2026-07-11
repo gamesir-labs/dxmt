@@ -476,7 +476,9 @@ constexpr uint32_t kArgumentBufferBindIndex = 30;
 // descriptor ranges a shader can index into this window and writes root_offsets in
 // window-relative coordinates. This keeps Metal argument-buffer materialization
 // bounded while the owning D3D12 heap may still contain far more descriptors.
-constexpr uint32_t kBindlessMirrorCapacity = 128;
+constexpr uint32_t kBindlessMirrorCapacity = MTL_BINDLESS_MIRROR_CAPACITY;
+constexpr uint32_t kBindlessBufferDescriptorQwords =
+    MTL_BINDLESS_BUFFER_DESCRIPTOR_QWORDS;
 // Metal buffer binding slot of the per-draw root-offset buffer. Element [arg_index]
 // (== MTL_SM50_SHADER_ARGUMENT::StructurePtrOffset) holds the absolute base slot
 // (uint32) of that resource's descriptor-table range inside its typed mirror.

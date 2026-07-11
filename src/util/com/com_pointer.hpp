@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <unknwn.h>
 #include <cassert>
+#include <memory>
 
 namespace dxmt {
 
@@ -71,9 +72,10 @@ public:
   Com(Com &&other) : m_ptr(other.m_ptr) { other.m_ptr = nullptr; }
 
   Com &operator=(T *object) {
+    if (object != nullptr)
+      ComRef::incRef(object);
     this->decRef();
     m_ptr = object;
-    this->incRef();
     return *this;
   }
 
@@ -85,9 +87,11 @@ public:
   }
 
   Com &operator=(Com &&other) {
-    this->decRef();
-    this->m_ptr = other.m_ptr;
-    other.m_ptr = nullptr;
+    if (this != std::addressof(other)) {
+      this->decRef();
+      this->m_ptr = other.m_ptr;
+      other.m_ptr = nullptr;
+    }
     return *this;
   }
 

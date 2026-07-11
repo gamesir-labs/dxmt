@@ -707,7 +707,7 @@ TEST_F(D3D12DescriptorSpec, CopiesTextureThroughComputeDescriptorTable) {
   ComPtr<ID3D12Resource> destination = context_.CreateTexture2D(
       4, 4, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(source);
   ASSERT_TRUE(destination);
   ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
@@ -715,6 +715,9 @@ TEST_F(D3D12DescriptorSpec, CopiesTextureThroughComputeDescriptorTable) {
   D3D12TestContext::Transition(
       context_.list(), source.get(), D3D12_RESOURCE_STATE_COPY_DEST,
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  D3D12TestContext::Transition(
+      context_.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   ComPtr<ID3D12DescriptorHeap> heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);

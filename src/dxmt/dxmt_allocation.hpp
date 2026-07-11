@@ -30,6 +30,10 @@ private:
 class AllocationRefTracking {
 public:
   AllocationRefTracking();
+  ~AllocationRefTracking();
+
+  AllocationRefTracking(const AllocationRefTracking &) = delete;
+  AllocationRefTracking &operator=(const AllocationRefTracking &) = delete;
 
   bool track(Allocation *allocation);
 

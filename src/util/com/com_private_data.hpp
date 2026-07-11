@@ -9,20 +9,15 @@
  */
 #pragma once
 
+#include "com_pointer.hpp"
+
+#include <cstdint>
 #include <mutex>
+#include <variant>
 #include <vector>
 #include <unknwn.h>
 
 namespace dxmt {
-
-/**
- * \brief COM private data entry type
- */
-enum ComPrivateDataType {
-  None,
-  Data,
-  Iface,
-};
 
 /**
  * \brief Data entry for private storage
@@ -34,10 +29,9 @@ public:
   ComPrivateDataEntry();
   ComPrivateDataEntry(REFGUID guid, UINT size, const void *data);
   ComPrivateDataEntry(REFGUID guid, const IUnknown *iface);
-  ~ComPrivateDataEntry();
 
-  ComPrivateDataEntry(ComPrivateDataEntry &&other);
-  ComPrivateDataEntry &operator=(ComPrivateDataEntry &&other);
+  ComPrivateDataEntry(ComPrivateDataEntry &&other) noexcept = default;
+  ComPrivateDataEntry &operator=(ComPrivateDataEntry &&other) noexcept = default;
 
   /**
    * \brief The entry's GUID
@@ -65,13 +59,10 @@ public:
   HRESULT get(UINT &size, void *data) const;
 
 private:
-  GUID m_guid = __uuidof(IUnknown);
-  ComPrivateDataType m_type = ComPrivateDataType::None;
-  UINT m_size = 0;
-  void *m_data = nullptr;
-  IUnknown *m_iface = nullptr;
+  using Data = std::vector<uint8_t>;
 
-  void destroy();
+  GUID m_guid = __uuidof(IUnknown);
+  std::variant<std::monostate, Data, Com<IUnknown>> m_value;
 };
 
 /**

@@ -24,6 +24,10 @@ AllocationRefTracking::AllocationRefTracking() {
   chunk_last = reinterpret_cast<RefAddChunk<> *>(&chunk_placed);
 }
 
+AllocationRefTracking::~AllocationRefTracking() {
+  clear();
+}
+
 bool
 AllocationRefTracking::track(Allocation *allocation) {
   if (unlikely(chunk_last->capacity <= chunk_last->size))

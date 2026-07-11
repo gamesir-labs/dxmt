@@ -9,6 +9,7 @@
  */
 
 #include <array>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -167,14 +168,6 @@ namespace dxmt {
   }
 
 
-  std::string Config::getOptionValue(const char* option) const {
-    auto iter = m_options.find(option);
-
-    return iter != m_options.end()
-      ? iter->second : std::string();
-  }
-
-
   bool Config::parseOptionValue(
     const std::string&  value,
           std::string&  result) {
@@ -199,31 +192,12 @@ namespace dxmt {
   bool Config::parseOptionValue(
     const std::string&  value,
           int32_t&      result) {
-    if (value.size() == 0)
+    int32_t parsed = 0;
+    const auto [end, error] =
+      std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc() || end != value.data() + value.size())
       return false;
-
-    // Parse sign, don't allow '+'
-    int32_t sign = 1;
-    size_t start = 0;
-
-    if (value[0] == '-') {
-      sign = -1;
-      start = 1;
-    }
-
-    // Parse absolute number
-    int32_t intval = 0;
-
-    for (size_t i = start; i < value.size(); i++) {
-      if (value[i] < '0' || value[i] > '9')
-        return false;
-
-      intval *= 10;
-      intval += value[i] - '0';
-    }
-
-    // Apply sign and return
-    result = sign * intval;
+    result = parsed;
     return true;
   }
 
@@ -231,62 +205,14 @@ namespace dxmt {
   bool Config::parseOptionValue(
     const std::string&  value,
           float&        result) {
-    if (value.size() == 0)
+    float parsed = 0.0f;
+    const auto [end, error] = std::from_chars(
+      value.data(), value.data() + value.size(), parsed, std::chars_format::general);
+    if (error != std::errc() || end != value.data() + value.size() ||
+        !std::isfinite(parsed))
       return false;
-
-    // Parse sign
-    size_t pos = 0;
-    bool negate = false;
-
-    if (value[0] == '-') {
-      negate = true;
-
-      if (++pos == value.size())
-        return false;
-    }
-
-    // Parse integer part
-    uint64_t intPart = 0;
-
-    if (value[pos] == '.')
-      return false;
-
-    while (pos < value.size()) {
-      if (value[pos] == '.') {
-        if (++pos == value.size())
-          return false;
-        break;
-      }
-
-      if (value[pos] < '0' || value[pos] > '9')
-        return false;
-
-      intPart *= 10;
-      intPart += value[pos] - '0';
-      pos += 1;
-    }
-
-    // Parse fractional part
-    uint64_t fractPart = 0;
-    uint64_t fractDivisor = 1;
-
-    while (pos < value.size()) {
-      if (value[pos] < '0' || value[pos] > '9')
-        return false;
-
-      fractDivisor *= 10;
-      fractPart *= 10;
-      fractPart += value[pos] - '0';
-      pos += 1;
-    }
-
-    // Compute final number, not super accurate but this should do
-    result = float((double(fractPart) / double(fractDivisor)) + double(intPart));
-
-    if (negate)
-      result = -result;
-
-    return std::isfinite(result);
+    result = parsed;
+    return true;
   }
 
 

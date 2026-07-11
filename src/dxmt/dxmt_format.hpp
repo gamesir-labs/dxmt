@@ -101,7 +101,7 @@ struct DXGIFormatPlaneFootprintLayout {
   uint32_t elementSize = 0;
 };
 
-const DXGIFormatTraits &GetDXGIFormatTraits(uint32_t format);
+DXGIFormatTraits GetDXGIFormatTraits(uint32_t format);
 
 bool IsDXGIFormatSupportedByTraits(uint32_t format);
 

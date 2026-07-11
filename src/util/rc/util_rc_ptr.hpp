@@ -70,9 +70,11 @@ public:
   }
 
   Rc &operator=(Rc &&other) {
-    this->decRef();
-    this->m_object = other.m_object;
-    other.m_object = nullptr;
+    if (this != &other) {
+      this->decRef();
+      this->m_object = other.m_object;
+      other.m_object = nullptr;
+    }
     return *this;
   }
 

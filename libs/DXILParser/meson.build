@@ -2,15 +2,21 @@ dxil_parser_src = files([
   'DXILParser.cpp',
 ])
 
-dxil_llvm_deps = [
-  '-lLLVMBitReader',
-  '-lLLVMCore',
-  '-lLLVMRemarks',
-  '-lLLVMBitstreamReader',
-  '-lLLVMBinaryFormat',
-  '-lLLVMSupport',
-  '-lLLVMDemangle',
+dxil_llvm_components = [
+  'bitreader',
+  'core',
+  'remarks',
+  'bitstreamreader',
+  'binaryformat',
+  'support',
+  'demangle',
 ]
+
+dxil_llvm_config_link_args = [
+  '--link-static',
+  '--ldflags',
+  '--libs',
+] + dxil_llvm_components + ['--system-libs']
 
 dxil_parser_args = [
   '-Wno-extern-c-compat',
@@ -30,7 +36,6 @@ dxil_llvm_args = [
 dxil_target_include_dirs = [ dxmt_include_path ]
 dxil_target_cpp_args = dxil_parser_args
 dxil_target_link_args = []
-dxil_target_llvm_deps = []
 
 if not dxmt_crossbuild
   dxil_target_llvm_path = get_option('native_llvm_path')
@@ -46,18 +51,12 @@ if not dxmt_crossbuild
 
   dxil_target_include_dirs += dxil_target_llvm_include_path
   dxil_target_cpp_args += dxil_llvm_args
-  dxil_target_llvm_deps += dxil_llvm_deps
-  dxil_target_link_args += [
-    '-L'+join_paths(dxil_target_llvm_path, 'lib'),
-    '-lm', '-lz', '-lcurses', '-lxml2',
-  ]
-
-  if dxil_target_llvm_path.startswith('/usr/local/opt')
-    dxil_target_link_args = [
-      dxil_target_link_args,
-      '/usr/local/opt/zstd/lib/libzstd.a', '/usr/local/opt/llvm@15/lib/libunwind.a'
-    ]
-  endif
+  dxil_target_llvm_config = find_program(
+    join_paths(dxil_target_llvm_path, 'bin/llvm-config'))
+  dxil_target_link_args += run_command(
+    dxil_target_llvm_config, dxil_llvm_config_link_args,
+    check: true,
+  ).stdout().strip().split()
 endif
 
 dxil_parser_lib = static_library('DXILParser', dxil_parser_src,
@@ -69,7 +68,7 @@ dxil_parser_lib = static_library('DXILParser', dxil_parser_src,
 dxil_parser_dep = declare_dependency(
   link_with           : [ dxil_parser_lib ],
   include_directories : [ dxmt_include_path ],
-  link_args           : [ dxil_target_link_args, dxil_target_llvm_deps ],
+  link_args           : dxil_target_link_args,
 )
 
 if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
@@ -85,17 +84,12 @@ else
     join_paths(dxil_native_llvm_path, 'include'))
 endif
 
-dxil_llvm_ld_flags_native = [
-  '-L'+join_paths(dxil_native_llvm_path, 'lib'),
-  '-lm', '-lz', '-lcurses', '-lxml2',
-]
-
-if dxil_native_llvm_path.startswith('/usr/local/opt')
-  dxil_llvm_ld_flags_native = [
-    dxil_llvm_ld_flags_native,
-    '/usr/local/opt/zstd/lib/libzstd.a', '/usr/local/opt/llvm@15/lib/libunwind.a'
-  ]
-endif
+dxil_native_llvm_config = find_program(
+  join_paths(dxil_native_llvm_path, 'bin/llvm-config'))
+dxil_llvm_ld_flags_native = run_command(
+  dxil_native_llvm_config, dxil_llvm_config_link_args,
+  check: true,
+).stdout().strip().split()
 
 dxil_parser_native_lib = static_library('DXILParserNative', dxil_parser_src,
   include_directories : [
@@ -111,7 +105,7 @@ dxil_parser_native_lib = static_library('DXILParserNative', dxil_parser_src,
 dxil_parser_native_dep = declare_dependency(
   link_with           : [ dxil_parser_native_lib ],
   include_directories : [ dxmt_native_include_path, include_directories('..') ],
-  link_args           : [ dxil_llvm_ld_flags_native, dxil_llvm_deps ],
+  link_args           : dxil_llvm_ld_flags_native,
 )
 
 endif

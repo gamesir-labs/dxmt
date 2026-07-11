@@ -35,6 +35,11 @@ typedef uint32_t ShaderType;
 typedef uint32_t SM50BindingType;
 #endif
 
+enum MTL_BINDLESS_ABI_CONSTANT {
+  MTL_BINDLESS_MIRROR_CAPACITY = 128,
+  MTL_BINDLESS_BUFFER_DESCRIPTOR_QWORDS = 3,
+};
+
 enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
   MTL_SM50_SHADER_ARGUMENT_BUFFER = 1 << 0,
   MTL_SM50_SHADER_ARGUMENT_TEXTURE = 1 << 1,
@@ -185,6 +190,7 @@ GetArgumentIndex(SM50BindingType Type, uint32_t SM50BindingSlot) {
   case SM50BindingType::UAV:
     return SM50BindingSlot * 3 + 512;
   }
+  return UINT32_MAX;
 };
 
 inline uint32_t GetArgumentIndex(struct MTL_SM50_SHADER_ARGUMENT &Argument) {

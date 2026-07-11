@@ -27,9 +27,32 @@ esac
 
 suite=all
 forwarded_args=
-for argument in "$@"; do
+test_args=
+while [ "$#" -gt 0 ]; do
+  argument=$1
+  shift
   case "$argument" in
     --suite=*) suite=${argument#--suite=} ;;
+    --suite)
+      if [ "$#" -eq 0 ]; then
+        printf '%s\n' '--suite requires a value' >&2
+        exit 2
+      fi
+      suite=$1
+      shift
+      ;;
+    --test-args=*)
+      value=${argument#--test-args=}
+      test_args="${test_args:+$test_args }$value"
+      ;;
+    --test-args)
+      if [ "$#" -eq 0 ]; then
+        printf '%s\n' '--test-args requires a value' >&2
+        exit 2
+      fi
+      test_args="${test_args:+$test_args }$1"
+      shift
+      ;;
     *)
       if [ -z "$forwarded_args" ]; then
         forwarded_args=$argument
@@ -37,6 +60,7 @@ for argument in "$@"; do
         forwarded_args="$forwarded_args
 $argument"
       fi
+      continue
       ;;
   esac
 done
@@ -118,8 +142,12 @@ case $mode in
       for argument in $forwarded_args; do set -- "$@" "$argument"; done
       IFS=$old_ifs
     fi
+    scheduler_args="--dxmt-test-suite=$suite"
+    if [ -n "$test_args" ]; then
+      scheduler_args="$scheduler_args $test_args"
+    fi
     meson test -C "$build_dir" --no-rebuild --suite wine --print-errorlogs \
-      --test-args="--dxmt-test-suite=$suite" "$@"
+      --test-args="$scheduler_args" "$@"
     ;;
 esac
 
@@ -134,6 +162,9 @@ case $mode in
 '
       for argument in $forwarded_args; do set -- "$@" "$argument"; done
       IFS=$old_ifs
+    fi
+    if [ -n "$test_args" ]; then
+      set -- "$@" "--test-args=$test_args"
     fi
     meson test -C "$build_dir" --no-rebuild --benchmark \
       --suite "$benchmark_suite" --print-errorlogs "$@"

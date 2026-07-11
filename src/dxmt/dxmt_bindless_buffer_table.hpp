@@ -21,7 +21,7 @@
  * `uint64 buf_table[]` bound at slot 27.
  *
  * The shader (airconv `--bindless-mirror`) reads a buffer field as:
- *     buf_table[ compact_base + (operand_register - range.LowerBound) ]   (stride 2 qw)
+ *     buf_table[compact_base + (operand_register - range.LowerBound) * 3]
  * where `compact_base` is baked at COMPILE time by walking the shader reflection in
  * its native order and counting only buffer fields. The runtime MUST fill buf_table
  * by the IDENTICAL walk so compact_base matches without any runtime communication.
@@ -35,9 +35,9 @@
  *   3. UAVs   — args_reflection UAV entries that are buffers.
  * (Samplers and texture SRV/UAV fields are skipped — they are not buffers.) For each
  * buffer field, assign compact_base = running_qword_total, then advance by
- * range_capacity*2 qw, where range_capacity = (RegisterCount == UINT_MAX ?
- * kBindlessMirrorCapacity : RegisterCount). The UAV counter shares the field's slot
- * at qw2; it does NOT add to the per-field stride (still 2 qw per descriptor).
+ * range_capacity*3 qw, where range_capacity = (RegisterCount == UINT_MAX ?
+ * kBindlessMirrorCapacity : RegisterCount). Every descriptor reserves qw2 for an
+ * optional UAV counter, so adjacent records never alias.
  *
  * The per-slot payload bytes are byte-identical to what
  * ArgumentEncodingContext::encodeShaderResources / encodeConstantBuffers write today
@@ -50,16 +50,15 @@ namespace dxmt {
 
 /**
  * Mirror/array GEP-typing capacity for an UNBOUNDED descriptor range (range.size ==
- * UINT_MAX). MUST equal airconv's kBindlessMirrorCapacity (dxbc_converter.hpp):
- * the two sides assign compact bases by the same walk, so an unbounded range must
- * reserve the same qword count on both. (Defined locally to avoid pulling the heavy
- * airconv-internal dxbc_converter.hpp into the runtime; the value is a frozen ABI
- * constant — see BINDLESS-ABI.md §4.5 / §5.4.)
+ * UINT_MAX). The shared public ABI constants keep airconv and the runtime's compact
+ * bases in lockstep without pulling the heavy converter internals into the runtime.
  */
-static constexpr uint32_t kBindlessMirrorCapacity = 128;
+static constexpr uint32_t kBindlessMirrorCapacity =
+    MTL_BINDLESS_MIRROR_CAPACITY;
 
-/** qword stride of one buffer descriptor in buf_table (qw0=address, qw1=meta). */
-static constexpr uint32_t kBufferTableQwordsPerDescriptor = 2;
+/** qword stride: qw0=address, qw1=metadata, qw2=optional UAV counter. */
+static constexpr uint32_t kBufferTableQwordsPerDescriptor =
+    MTL_BINDLESS_BUFFER_DESCRIPTOR_QWORDS;
 
 /**
  * Number of buf_table qwords reserved for a reflection range whose D3D12 register

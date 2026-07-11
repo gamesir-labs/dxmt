@@ -1868,14 +1868,13 @@ private:
 
 std::string
 FourCCString(uint32_t fourcc) {
-  char text[5] = {
+  const char text[4] = {
       char(fourcc & 0xff),
       char((fourcc >> 8) & 0xff),
       char((fourcc >> 16) & 0xff),
       char((fourcc >> 24) & 0xff),
-      0,
   };
-  return text;
+  return std::string(text, sizeof(text));
 }
 
 const char *
@@ -2258,6 +2257,13 @@ Parser::parseContainer(std::span<const uint8_t> data) {
     size_t part_end = 0;
     if (!CheckedEnd(part_header_end, part_size, container_size, part_end))
       return ParseStatus::InvalidPartSize;
+
+    for (const auto &part : container_.parts) {
+      const size_t existing_end =
+          size_t(part.offset) + kPartHeaderSize + part.data.size();
+      if (part_offset < existing_end && part.offset < part_end)
+        return ParseStatus::InvalidPartOffset;
+    }
 
     container_.parts.push_back({
         .fourcc = part_fourcc,

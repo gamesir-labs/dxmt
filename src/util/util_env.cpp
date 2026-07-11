@@ -9,10 +9,16 @@
  */
 
 #include "util_string.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdlib>
-#include <numeric>
 #include <filesystem>
+#include <string_view>
+
+#ifdef __APPLE__
+#include <limits.h>
+#include <mach-o/dyld.h>
+#endif
 
 #ifdef __linux__
 #include <unistd.h>
@@ -57,15 +63,22 @@ std::string getEnvVar(const char *name) {
 size_t matchFileExtension(const std::string &name, const char *ext) {
   auto pos = name.find_last_of('.');
 
-  if (pos == std::string::npos)
+  if (pos == std::string::npos || !ext)
     return pos;
 
-  bool matches = std::accumulate(name.begin() + pos + 1, name.end(), true,
-                                 [&ext](bool current, char a) {
-                                   if (a >= 'A' && a <= 'Z')
-                                     a += 'a' - 'A';
-                                   return current && *ext && a == *(ext++);
-                                 });
+  const std::string_view expected(ext);
+  const std::string_view actual(name.data() + pos + 1, name.size() - pos - 1);
+  if (actual.size() != expected.size())
+    return std::string::npos;
+
+  const bool matches = std::equal(
+      actual.begin(), actual.end(), expected.begin(), [](char left, char right) {
+        if (left >= 'A' && left <= 'Z')
+          left += 'a' - 'A';
+        if (right >= 'A' && right <= 'Z')
+          right += 'a' - 'A';
+        return left == right;
+      });
 
   return matches ? pos : std::string::npos;
 }
@@ -101,9 +114,20 @@ std::string getExePath() {
 #elif defined(__linux__)
   std::array<char, PATH_MAX> exePath = {};
 
-  size_t count = readlink("/proc/self/exe", exePath.data(), exePath.size());
+  const auto count = readlink("/proc/self/exe", exePath.data(), exePath.size());
 
-  return std::string(exePath.begin(), exePath.begin() + count);
+  return count > 0 ? std::string(exePath.begin(), exePath.begin() + count)
+                   : std::string();
+#elif defined(__APPLE__)
+  std::array<char, PATH_MAX> staticPath = {};
+  uint32_t size = staticPath.size();
+  if (_NSGetExecutablePath(staticPath.data(), &size) == 0)
+    return std::filesystem::weakly_canonical(staticPath.data()).string();
+
+  std::vector<char> dynamicPath(size);
+  if (_NSGetExecutablePath(dynamicPath.data(), &size) == 0)
+    return std::filesystem::weakly_canonical(dynamicPath.data()).string();
+  return {};
 #else
   return std::string(""); //TODO
 #endif

@@ -57,10 +57,17 @@ EncodeMirrorTextureSlot(uint64_t *dst, uint64_t gpu_resource_id,
  * lod_bias bits). Identical to the legacy sampler branch in encodeShaderResources.
  */
 inline void
+EncodeMirrorSamplerSlot(uint64_t *dst, uint64_t sampler_handle,
+                        uint64_t cube_sampler_handle, float lod_bias) {
+  dst[0] = sampler_handle;
+  dst[1] = cube_sampler_handle;
+  dst[2] = (uint64_t)std::bit_cast<uint32_t>(lod_bias);
+}
+
+inline void
 EncodeMirrorSamplerSlot(uint64_t *dst, const Sampler &sampler) {
-  dst[0] = sampler.sampler_state_handle;
-  dst[1] = sampler.sampler_state_cube_handle;
-  dst[2] = (uint64_t)std::bit_cast<uint32_t>(sampler.lod_bias);
+  EncodeMirrorSamplerSlot(dst, sampler.sampler_state_handle,
+                          sampler.sampler_state_cube_handle, sampler.lod_bias);
 }
 
 /** Null/dummy sampler payload (no sampler bound) — matches the legacy null branch. */

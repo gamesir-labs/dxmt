@@ -338,7 +338,8 @@ buffer_table_qword_index(
     context &ctx, pvalue dyn_index, uint32_t range_lower_bound,
     uint32_t compact_base, uint32_t qword_offset) {
   auto local = mirror_local_index(ctx, dyn_index, range_lower_bound);
-  auto descriptor_base = ctx.builder.CreateAdd(local, local);
+  auto descriptor_base = ctx.builder.CreateMul(
+      local, ctx.builder.getInt32(kBindlessBufferDescriptorQwords));
   return ctx.builder.CreateAdd(
       ctx.builder.getInt32(compact_base + qword_offset), descriptor_base);
 }
@@ -737,7 +738,8 @@ auto get_cbuffer_in_argbuf_binding_table(
 static uint32_t
 descriptor_range_qword_count(const ResourceRange &range) {
   const uint32_t range_size = range.size ? range.size : 1;
-  return (range_size == UINT_MAX ? kBindlessMirrorCapacity : range_size) * 2;
+  return (range_size == UINT_MAX ? kBindlessMirrorCapacity : range_size) *
+         kBindlessBufferDescriptorQwords;
 }
 
 static uint32_t

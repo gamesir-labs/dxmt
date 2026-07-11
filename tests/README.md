@@ -21,6 +21,7 @@ tests/
   support/wine_suite_scheduler.cpp  Top-level API suite scheduler
   meson.build                       Unified Wine unit-test manifest
   wine/*_spec.cpp                   Framework and scheduler contract tests
+  wine/*_test.cpp                   Internal implementation unit tests
   d3d10/*_spec.cpp                  D3D10 correctness tests
   d3d11/*_spec.cpp                  D3D11 correctness tests
   d3d12/*_spec.cpp                  D3D12 correctness tests
@@ -60,7 +61,8 @@ TEST(D3D12ExampleSpec, DoesSomething) {
 Add the source and any additional dependency to that API's `meson.build`. The
 central manifest automatically links it into the matching Wine suite image.
 Framework-only Wine tests live under `tests/wine/` and are registered directly
-in `tests/meson.build`.
+in `tests/meson.build`. Internal implementation tests use the same framework
+image and remain independently filterable GoogleTest cases.
 
 ## Mark slow tests
 

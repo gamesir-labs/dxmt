@@ -352,6 +352,9 @@ private:
 class bitvector {
 public:
   bool get(uint32_t idx) const {
+    if (idx >= m_bitCount)
+      return false;
+
     uint32_t dword = idx / 32;
     uint32_t bit = idx % 32;
 
@@ -359,18 +362,17 @@ public:
   }
 
   void ensureSize(uint32_t bitCount) {
-    uint32_t dword = bitCount / 32;
-    if (unlikely(dword >= m_dwords.size())) {
-      m_dwords.resize(dword + 1);
-    }
+    const uint32_t dwordCount = bitCount / 32 + (bitCount % 32 != 0);
+    if (unlikely(dwordCount > m_dwords.size()))
+      m_dwords.resize(dwordCount);
     m_bitCount = std::max(m_bitCount, bitCount);
   }
 
   void set(uint32_t idx, bool value) {
     ensureSize(idx + 1);
 
-    uint32_t dword = 0;
-    uint32_t bit = idx;
+    uint32_t dword = idx / 32;
+    uint32_t bit = idx % 32;
 
     if (value)
       m_dwords[dword] |= 1uLL << bit;

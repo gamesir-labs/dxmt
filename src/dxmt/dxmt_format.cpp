@@ -112,7 +112,7 @@ IsDepthStencilDXGIFormat(uint32_t format) {
 
 } // namespace
 
-const DXGIFormatTraits &
+DXGIFormatTraits
 GetDXGIFormatTraits(uint32_t format) {
   switch (format) {
   case DXGI_FORMAT_R32G8X24_TYPELESS:
@@ -163,9 +163,7 @@ GetDXGIFormatTraits(uint32_t format) {
   case DXGI_FORMAT_FORCE_UINT:
     return kUnsupportedFormatTraits;
   default:
-    static thread_local DXGIFormatTraits native;
-    native = SinglePlaneNative(format);
-    return native;
+    return SinglePlaneNative(format);
   }
 }
 
@@ -212,6 +210,9 @@ GetDXGIFormatPlaneFootprintLayout(uint32_t format, uint32_t plane,
   layout.blockHeight = 1;
 
   const auto &traits = GetDXGIFormatTraits(format);
+  if (!traits.planeCount || plane >= traits.planeCount)
+    return false;
+
   if (plane < traits.planeCount && traits.planes[plane].elementSize) {
     layout.elementSize = traits.planes[plane].elementSize;
     return true;

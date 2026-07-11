@@ -2,9 +2,11 @@
 
 #include "thread.hpp"
 #include "util_win32_compat.h"
+#include <algorithm>
 #include <atomic>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
 namespace dxmt {
 
@@ -41,16 +43,15 @@ private:
 
   std::atomic_bool destroyed = false;
   std::atomic_uint64_t running = 0;
-  uint64_t threads;
   uint64_t max_threads;
 };
 
 template <typename Task> task_scheduler<Task>::task_scheduler() {
-  max_threads = dxmt::thread::hardware_concurrency() * 2;
+  max_threads =
+      std::max<uint64_t>(2, dxmt::thread::hardware_concurrency() * 2);
   workers_.reserve(max_threads);
-  threads = 2;
 
-  for (unsigned i = 0; i < threads; i++) {
+  for (unsigned i = 0; i < 2; i++) {
     workers_.emplace_back([this]() { worker_func(); });
   }
 }
@@ -135,9 +136,10 @@ task_scheduler<Task>::submit(Task task) {
   std::unique_lock<dxmt::mutex> lock(worker_mutex_);
   task_queue_.push(task);
 
-  if (running.load(std::memory_order_relaxed) == threads && threads < max_threads) {
+  const auto thread_count = workers_.size();
+  if (running.load(std::memory_order_relaxed) == thread_count &&
+      thread_count < max_threads) {
     workers_.emplace_back([this]() { worker_func(); });
-    threads++;
   }
 
   worker_cond_.notify_one();

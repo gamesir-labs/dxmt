@@ -60,11 +60,17 @@ template <class T> constexpr T parse_hex(const char *ptr) {
   constexpr size_t digits = sizeof(T) * 2;
   T result{};
   for (size_t i = 0; i < digits; ++i)
-    result |= parse_hex_digit(ptr[i]) << (4 * (digits - i - 1));
+    result |= static_cast<T>(static_cast<uint64_t>(parse_hex_digit(ptr[i]))
+                             << (4 * (digits - i - 1)));
   return result;
 }
 
 constexpr GUID make_guid_helper(const char *begin) {
+  using namespace std::string_literals;
+  if (begin[8] != '-' || begin[13] != '-' || begin[18] != '-' ||
+      begin[23] != '-')
+    throw std::domain_error{"invalid GUID separators"s};
+
   GUID result{};
   result.Data1 = parse_hex<uint32_t>(begin);
   begin += 8 + 1;

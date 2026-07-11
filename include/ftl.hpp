@@ -3,20 +3,14 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <iterator>
 
 template <class Tp, typename Func>
 auto operator | (const std::vector<Tp> &vec, Func &&f)  {
   using R = decltype(f(std::declval<Tp>()));
   std::vector<R> ret;
+  ret.reserve(vec.size());
   std::transform(vec.begin(), vec.end(), std::back_inserter(ret), std::forward<Func>(f));
-  return ret;
-};
-
-template <class Tp, typename Func>
-auto operator | (const std::vector<Tp> &vec, const Func &f)  {
-  using R = decltype(f(std::declval<Tp>()));
-  std::vector<R> ret;
-  std::transform(vec.begin(), vec.end(), std::back_inserter(ret), f);
   return ret;
 };
 

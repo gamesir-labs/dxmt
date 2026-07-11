@@ -119,7 +119,7 @@ size_t transcodeString(D *dstBegin, size_t dstLength, const S *srcBegin,
                        size_t srcLength) {
   size_t totalLength = 0;
 
-  auto dstEnd = dstBegin + dstLength;
+  auto dstEnd = dstBegin ? dstBegin + dstLength : nullptr;
   auto srcEnd = srcBegin + srcLength;
 
   while (srcBegin < srcEnd) {
@@ -127,10 +127,17 @@ size_t transcodeString(D *dstBegin, size_t dstLength, const S *srcBegin,
 
     srcBegin = decodeChar<S>(srcBegin, srcEnd, ch);
 
-    if (dstBegin)
+    const auto encodedLength = encodeChar<D>(nullptr, nullptr, ch);
+    if (!encodedLength)
+      continue;
+
+    if (dstBegin) {
+      if (encodedLength > dstLength - totalLength)
+        break;
       totalLength += encodeChar<D>(dstBegin + totalLength, dstEnd, ch);
-    else
-      totalLength += encodeChar<D>(nullptr, nullptr, ch);
+    } else {
+      totalLength += encodedLength;
+    }
 
     if (!ch)
       break;
@@ -184,10 +191,12 @@ template <typename... Args> std::string format(const Args &...args) {
 }
 
 inline void strlcpy(char *dst, const char *src, size_t count) {
-  if (count > 0) {
-    std::strncpy(dst, src, count - 1);
-    dst[count - 1] = '\0';
-  }
+  if (!count)
+    return;
+
+  const size_t length = std::min(std::strlen(src), count - 1);
+  std::memcpy(dst, src, length);
+  dst[length] = '\0';
 }
 
 /**
