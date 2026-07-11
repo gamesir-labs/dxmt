@@ -279,7 +279,7 @@ public:
              const std::chrono::time_point<Clock, Duration> &time) {
     auto now = Clock::now();
 
-    return (now < time) ? wait_for(lock, now - time) : std::cv_status::timeout;
+    return (now < time) ? wait_for(lock, time - now) : std::cv_status::timeout;
   }
 
   template <typename Clock, typename Duration, typename Predicate>
@@ -290,7 +290,7 @@ public:
       return true;
 
     auto now = Clock::now();
-    return now < time && wait_for(lock, now - time, pred);
+    return now < time && wait_for(lock, time - now, pred);
   }
 
   template <typename Rep, typename Period>
