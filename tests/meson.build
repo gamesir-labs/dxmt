@@ -35,6 +35,18 @@ dxmt_wine_framework_suites = {
   'layout': {
     'sources': files('wine/layout_spec.cpp'),
   },
+  'descriptor_revision': {
+    'sources': files('wine/descriptor_revision_test.cpp'),
+  },
+  'lease_range_registry': {
+    'sources': files('wine/lease_range_registry_test.cpp'),
+  },
+  'argument_buffer': {
+    'sources': files('wine/argument_buffer_test.cpp'),
+  },
+  'checked_math': {
+    'sources': files('wine/checked_math_test.cpp'),
+  },
 }
 
 dxmt_wine_framework_sources = []
@@ -46,6 +58,7 @@ dxmt_wine_framework_tests = executable(
   'dxmt-wine-framework-tests',
   dxmt_wine_framework_sources,
   dependencies: [dxmt_test_dep],
+  include_directories: [dxmt_include_path],
   install: false,
 )
 

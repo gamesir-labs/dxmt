@@ -31,6 +31,11 @@ d3d12_unit_suites = {
       'queue_spec.cpp',
     ),
   },
+  'resource': {
+    'sources': files(
+      'resource_spec.cpp',
+    ),
+  },
   'sparse-resource': {
     'sources': files(
       'sparse_resource_spec.cpp',
