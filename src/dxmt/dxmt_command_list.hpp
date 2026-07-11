@@ -1,6 +1,7 @@
 #pragma once
 #include <concepts>
 #include <functional>
+#include <utility>
 
 namespace dxmt {
 
@@ -77,20 +78,19 @@ public:
   }
 
   CommandList(const CommandList &copy) = delete;
-  CommandList(CommandList &&move) {
-    this->reset();
-    empty.next = move.empty.next;
-    list_end = move.list_end;
-    move.empty.next = nullptr;
-    move.list_end = nullptr;
+  CommandList(CommandList &&move) noexcept : CommandList() {
+    *this = std::move(move);
   }
 
-  CommandList& operator=(CommandList&& move) {
+  CommandList &operator=(CommandList &&move) noexcept {
+    if (this == &move)
+      return *this;
+
     this->reset();
     empty.next = move.empty.next;
-    list_end = move.list_end;
+    list_end = empty.next ? move.list_end : &empty;
     move.empty.next = nullptr;
-    move.list_end = nullptr;
+    move.list_end = &move.empty;
     return *this;
   }
 
@@ -112,10 +112,13 @@ public:
   }
 
   void append(CommandList &&list) {
+    if (this == &list || !list.empty.next)
+      return;
+
     list_end->next = list.empty.next;
     list_end = list.list_end;
     list.empty.next = nullptr;
-    list.list_end = nullptr;
+    list.list_end = &list.empty;
   }
 
   void
