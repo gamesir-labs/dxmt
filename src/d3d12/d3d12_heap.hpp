@@ -17,7 +17,7 @@ public:
   virtual bool IsCpuVisible() const = 0;
   virtual dxmt::Buffer *GetBuffer() const = 0;
   virtual dxmt::BufferAllocation *GetAllocation() const = 0;
-  virtual WMT::Heap GetPlacementHeap() = 0;
+  virtual WMT::Reference<WMT::Heap> GetPlacementHeap() = 0;
 };
 
 Com<ID3D12Heap> CreateHeap(IMTLD3D12Device *device,

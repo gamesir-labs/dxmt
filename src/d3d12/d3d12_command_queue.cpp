@@ -21,6 +21,7 @@
 #include "dxmt_format.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_info.hpp"
+#include "dxmt_legacy_buffer_slice.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_presenter.hpp"
 #include "dxmt_sampler.hpp"
@@ -1588,20 +1589,20 @@ ValidateBufferRange(Resource *resource, UINT64 offset, UINT64 size,
 }
 
 static void
-ResolveQueryDataToCpuBufferStatic(ID3D12GraphicsCommandList *command_list,
+ResolveQueryDataToCpuBufferStatic(const void *command_list_identity,
                                   ID3D12QueryHeap *query_heap,
                                   D3D12_QUERY_TYPE type, UINT start_index,
                                   UINT query_count, Resource *dst,
                                   ID3D12Resource *dst_identity,
                                   UINT64 dst_buffer_offset,
+                                  const QueryResolveSnapshot &snapshot,
                                   const char *context,
                                   uintptr_t queue_id) {
-  auto *heap = dynamic_cast<QueryHeap *>(query_heap);
-  if (!heap || !dst)
+  if (!dst)
     return;
 
   std::vector<uint8_t> data;
-  if (!heap->Resolve(type, start_index, query_count, data)) {
+  if (!ResolveQuerySnapshot(snapshot, data)) {
     WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData final failed"
          " context=", context,
          " queue=", queue_id,
@@ -1618,7 +1619,7 @@ ResolveQueryDataToCpuBufferStatic(ID3D12GraphicsCommandList *command_list,
         dst->GetHeapOffset() + dst_buffer_offset, data.data(),
         data.size());
   dxmt::apitrace::record_resolve_query_data_result(
-      command_list, query_heap, static_cast<uint32_t>(type), start_index,
+      command_list_identity, query_heap, static_cast<uint32_t>(type), start_index,
       query_count, dst_identity, dst_buffer_offset,
       data.data(), data.size());
   static std::atomic<uint32_t> log_count = 0;
@@ -1629,14 +1630,16 @@ ResolveQueryDataToCpuBufferStatic(ID3D12GraphicsCommandList *command_list,
          " bytes=", data.size());
 }
 
-static void
-ResolveQueryDataToCpuBufferStatic(const ResolveQueryDataRecord &record,
-                                  const char *context,
-                                  uintptr_t queue_id) {
+static void ResolveQueryDataToCpuBufferStatic(
+    const ResolveQueryDataRecord &record,
+    const QueryResolveSnapshot &snapshot, const char *context,
+    uintptr_t queue_id) {
   ResolveQueryDataToCpuBufferStatic(
-      record.command_list.ptr(), record.heap.ptr(), record.type,
+      reinterpret_cast<const void *>(record.command_list_identity),
+      record.heap.ptr(), record.type,
       record.start_index, record.query_count, GetResource(record.dst_buffer.ptr()),
-      record.dst_buffer.ptr(), record.dst_buffer_offset, context, queue_id);
+      record.dst_buffer.ptr(), record.dst_buffer_offset, snapshot, context,
+      queue_id);
 }
 
 enum class DirectIndirectOperation {
@@ -2765,6 +2768,17 @@ DefaultBufferSlice(Resource &resource, UINT64 offset = 0,
   };
 }
 
+static bool
+ValidateLegacyBufferSliceRange(const char *binding_type, UINT64 byte_offset,
+                               UINT64 byte_length) {
+  if (LegacyBufferSliceRepresentable(byte_offset, byte_length))
+    return true;
+  WARN("D3D12CommandQueue: ", binding_type,
+       " buffer range exceeds the legacy shader ABI; binding null instead"
+       " offset=", byte_offset, " length=", byte_length);
+  return false;
+}
+
 static BufferSlice
 StructuredBufferSlice(Resource &resource, UINT64 offset,
                       UINT64 byte_size, UINT stride) {
@@ -3093,70 +3107,96 @@ CreateUnorderedAccessTextureBufferBinding(WMT::Device device, Resource &resource
   return std::make_pair(*view, slice);
 }
 
+static bool ReplaceDescriptorMirrorResidencyTargetForEncode(
+    ArgumentEncodingContext &enc, DescriptorHeapMirror &mirror, UINT slot,
+    dxmt::DescriptorSlotVersion expected_version,
+    DescriptorResidencyTarget target) {
+  // The caller holds mirror.AcquireLock() from payload publication through
+  // this lifetime publication, so readers can never observe a mixed pair.
+  // Metal command buffers do not retain resources. Keep fallback mirror
+  // residency independent from native descriptor primary/counter resources,
+  // and defer release of the previous payload until encoded GPU work finishes.
+  const auto mirror_allocation = target.mirror_allocation;
+  if (mirror_allocation)
+    enc.queue().AddPersistentResidency(mirror_allocation);
+
+  DescriptorResidencyTarget previous = {};
+  if (!mirror.ReplaceMirrorResidencyTargetIfCurrent(
+          slot, expected_version, std::move(target), &previous)) {
+    if (mirror_allocation)
+      enc.queue().RemovePersistentResidencyAfterCompletion(
+          mirror_allocation, enc.currentSeqId());
+    return false;
+  }
+
+  if (previous.mirror_allocation)
+    enc.queue().RemovePersistentResidencyAfterCompletion(
+        previous.mirror_allocation, enc.currentSeqId());
+  if (previous.sampler)
+    enc.queue().RetainUntilGpuComplete(
+        enc.currentSeqId(),
+        [sampler = std::move(previous.sampler)]() mutable {
+          sampler = nullptr;
+        });
+  return true;
+}
+
 template <PipelineStage stage>
-static void
-FillBindlessTextureBufferMirrorSlotForStage(
+static bool FillBindlessTextureBufferMirrorSlotForStage(
     ArgumentEncodingContext &enc, DescriptorHeapMirror &mirror, UINT slot,
     const Rc<Buffer> &buffer, const BufferViewBinding &binding,
-    const BufferSlice &slice, int access_flags) {
+    const BufferSlice &slice, int access_flags,
+    dxmt::DescriptorSlotVersion expected_version) {
   auto [view, suballocation_offset] =
       enc.access<stage>(buffer, binding.key, access_flags);
-  mirror.FillTextureSlotPayload(
-      slot, view.gpu_resource_id,
-      (uint64_t(slice.elementCount) << 32) |
-          uint64_t(slice.firstElement + suballocation_offset));
+  auto mirror_lock = mirror.AcquireLock();
+  if (!mirror.FillTextureSlotPayload(
+          slot, view.gpu_resource_id,
+          (uint64_t(slice.elementCount) << 32) |
+              uint64_t(slice.firstElement + suballocation_offset),
+          expected_version))
+    return false;
   DescriptorResidencyTarget target = {};
   auto texture_allocation = view.texture ? WMT::Resource{view.texture.handle}
                                          : WMT::Resource{};
   if (texture_allocation)
-    target.allocation = texture_allocation;
-  auto previous = mirror.ReplaceResidencyTarget(slot, std::move(target));
-  if (texture_allocation)
-    enc.queue().AddPersistentResidency(texture_allocation);
-  if (previous.allocation)
-    enc.queue().RemovePersistentResidencyAfterCompletion(previous.allocation);
-  if (previous.secondary_allocation)
-    enc.queue().RemovePersistentResidencyAfterCompletion(
-        previous.secondary_allocation);
-  if (previous.sampler)
-    enc.queue().RetainUntilGpuComplete(
-        [sampler = std::move(previous.sampler)]() mutable {
-          sampler = nullptr;
-        });
+    target.mirror_allocation = texture_allocation;
+  return ReplaceDescriptorMirrorResidencyTargetForEncode(
+      enc, mirror, slot, expected_version, std::move(target));
 }
 
-static void
+static bool
 FillBindlessTextureBufferMirrorSlot(
     ArgumentEncodingContext &enc, DescriptorHeapMirror &mirror, UINT slot,
     PipelineStage stage, const Rc<Buffer> &buffer,
     const BufferViewBinding &binding, const BufferSlice &slice,
-    int access_flags) {
+    int access_flags, dxmt::DescriptorSlotVersion expected_version) {
   switch (stage) {
   case PipelineStage::Compute:
-    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Compute>(
-        enc, mirror, slot, buffer, binding, slice, access_flags);
-    break;
+    return FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Compute>(
+        enc, mirror, slot, buffer, binding, slice, access_flags,
+        expected_version);
   case PipelineStage::Pixel:
-    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Pixel>(
-        enc, mirror, slot, buffer, binding, slice, access_flags);
-    break;
+    return FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Pixel>(
+        enc, mirror, slot, buffer, binding, slice, access_flags,
+        expected_version);
   case PipelineStage::Geometry:
-    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Geometry>(
-        enc, mirror, slot, buffer, binding, slice, access_flags);
-    break;
+    return FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Geometry>(
+        enc, mirror, slot, buffer, binding, slice, access_flags,
+        expected_version);
   case PipelineStage::Hull:
-    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Hull>(
-        enc, mirror, slot, buffer, binding, slice, access_flags);
-    break;
+    return FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Hull>(
+        enc, mirror, slot, buffer, binding, slice, access_flags,
+        expected_version);
   case PipelineStage::Domain:
-    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Domain>(
-        enc, mirror, slot, buffer, binding, slice, access_flags);
-    break;
+    return FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Domain>(
+        enc, mirror, slot, buffer, binding, slice, access_flags,
+        expected_version);
   case PipelineStage::Vertex:
   default:
-    FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Vertex>(
-        enc, mirror, slot, buffer, binding, slice, access_flags);
-    break;
+    return FillBindlessTextureBufferMirrorSlotForStage<PipelineStage::Vertex>(
+        enc, mirror, slot, buffer, binding, slice, access_flags,
+        expected_version);
   }
 }
 
@@ -3673,6 +3713,14 @@ struct ReplayResourceStateEntry {
 };
 
 struct CommandQueueResourceStates {
+  ~CommandQueueResourceStates() {
+    std::lock_guard lock(g_resource_states_mutex);
+    auto entry = g_resource_states_by_device.find(device_key);
+    if (entry != g_resource_states_by_device.end() && entry->second.expired())
+      g_resource_states_by_device.erase(entry);
+  }
+
+  IMTLD3D12Device *device_key = nullptr;
   std::unordered_map<ID3D12Resource *, ReplayResourceStateEntry> resources;
   std::mutex mutex;
   std::mutex dxmt_queue_mutex;
@@ -3685,6 +3733,7 @@ GetDeviceResourceStates(IMTLD3D12Device *device) {
   auto states = weak.lock();
   if (!states) {
     states = std::make_shared<CommandQueueResourceStates>();
+    states->device_key = device;
     weak = states;
   }
   return states;
@@ -3692,10 +3741,15 @@ GetDeviceResourceStates(IMTLD3D12Device *device) {
 
 class CommandQueueImpl final : public ComObjectWithInitialRef<ID3D12CommandQueue, IMTLDXGIDevice> {
 public:
+  struct SubmissionWakeState {
+    dxmt::condition_variable condition;
+  };
+
   CommandQueueImpl(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC &desc,
                    std::shared_ptr<CommandQueueResourceStates> resource_states)
       : device_(device), desc_(desc),
         resource_states_(std::move(resource_states)),
+        submission_wake_state_(std::make_shared<SubmissionWakeState>()),
         submission_worker_([this]() { SubmissionWorkerMain(); }) {
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
@@ -5398,7 +5452,7 @@ private:
 
   struct ReplayBindingGenerationKey {
     uint64_t graphics = 0;
-    uint64_t descriptor_content = 0;
+    dxmt::DescriptorContentRevision descriptor_content = {};
 
     bool operator==(const ReplayBindingGenerationKey &other) const {
       return graphics == other.graphics &&
@@ -5409,7 +5463,9 @@ private:
   struct ReplayBindingGenerationKeyHash {
     size_t operator()(const ReplayBindingGenerationKey &key) const {
       size_t hash = std::hash<uint64_t>{}(key.graphics);
-      hash ^= std::hash<uint64_t>{}(key.descriptor_content) +
+      hash ^= std::hash<uint64_t>{}(key.descriptor_content.epoch) +
+              0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+      hash ^= std::hash<uint64_t>{}(key.descriptor_content.sequence) +
               0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
       return hash;
     }
@@ -5499,7 +5555,7 @@ private:
   struct ResourceAccessBarrierEntry {
     Rc<Buffer> buffer;
     Rc<Texture> texture;
-    UINT buffer_length = 0;
+    UINT64 buffer_length = 0;
     UINT level = 0;
     UINT slice = 0;
     int access = 0;
@@ -5580,13 +5636,14 @@ private:
 
   struct PendingTimestampResolve {
     struct Sample {
+      Rc<TimestampQuery> query;
 #if DXMT_DX12_METAL4
       WMT::Reference<WMT::CounterHeap> heap;
       uint64_t heap_entry_size = 0;
 #endif
       uint64_t index = ~0ull;
     };
-    Com<ID3D12GraphicsCommandList> command_list;
+    uintptr_t command_list_identity = 0;
     Com<ID3D12QueryHeap> heap;
     Com<ID3D12Resource> dst_buffer;
     std::vector<Sample> samples;
@@ -5601,6 +5658,11 @@ private:
     Rc<TimestampQuery> query;
     D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_TIMESTAMP;
     UINT index = 0;
+  };
+
+  struct PendingCpuQueryResolve {
+    ResolveQueryDataRecord record;
+    QueryResolveSnapshot snapshot;
   };
 
   struct ResolvedReplayVertexBuffer {
@@ -5695,7 +5757,8 @@ private:
         dxmt::CompiledFallbackReason::Unknown;
     uint64_t graphics_binding_generation = 1;
     uint64_t last_snapshot_request_graphics_generation = 0;
-    uint64_t last_snapshot_request_descriptor_generation = 0;
+    dxmt::DescriptorContentRevision last_snapshot_request_descriptor_revision =
+        {};
     bool has_last_snapshot_request_generation = false;
     // descAccess content-fingerprint cache (DXMT_DESCACCESS_CACHE): skip the
     // per-draw hazard-record loop when (PSO, root-sig, descriptor CONTENT) is
@@ -5716,7 +5779,7 @@ private:
     ResourceAccessBarrierBatch pending_resource_barriers;
     std::vector<PendingTimestampMarker> pending_timestamp_markers;
     std::vector<PendingTimestampResolve> pending_timestamp_resolves;
-    std::vector<ResolveQueryDataRecord> pending_immediate_cpu_query_resolves;
+    std::vector<PendingCpuQueryResolve> pending_immediate_cpu_query_resolves;
   };
 
   static ReplayState
@@ -6139,7 +6202,15 @@ private:
       for (auto &command : commands) {
         if (command.d3d_sequence != 0)
           dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
+        const auto command_begin = argbuf_offset;
+        enc.setArgumentBufferWriteRange(command_begin,
+                                        command.argument_buffer_size);
         command.encode(enc, argbuf_offset);
+        if (enc.argumentBufferOverflowed()) {
+          WARN("D3D12CommandQueue: compute argument-buffer reservation overflow"
+               " reserved=", command.argument_buffer_size,
+               " begin=", command_begin);
+        }
       }
       enc.endPass();
     });
@@ -6206,7 +6277,11 @@ private:
         if (command.d3d_sequence != 0) {
           dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
         }
+        if (ReplayGraphicsCommandKindIsRealWork(command.kind))
+          enc.bumpVisibilityResultOffset();
         uint64_t argbuf_offset = command.argument_buffer_offset;
+        enc.setArgumentBufferWriteRange(command.argument_buffer_offset,
+                                        command.argument_buffer_size);
         if (command.compiled_encode) {
           const bool compiled_encode_perf = dxmt::perf::enabled();
           const auto compiled_encode_begin =
@@ -6221,11 +6296,14 @@ private:
         } else {
           command.encode(enc, argbuf_offset);
         }
-        const auto argbuf_limit =
-            command.argument_buffer_offset + command.argument_buffer_size;
+        const bool cursor_underflow =
+            argbuf_offset < command.argument_buffer_offset;
         const auto command_used =
-            argbuf_offset - command.argument_buffer_offset;
-        if (argbuf_offset > argbuf_limit) {
+            cursor_underflow
+                ? UINT64_MAX
+                : argbuf_offset - command.argument_buffer_offset;
+        if (enc.argumentBufferOverflowed() || cursor_underflow ||
+            command_used > command.argument_buffer_size) {
           WARN("D3D12CommandQueue: graphics pass argument-buffer reservation overflow"
                " commandIndex=", command.command_index,
                " reserved=", command.argument_buffer_size,
@@ -6250,19 +6328,10 @@ private:
     auto markers = std::move(state.pending_timestamp_markers);
     state.pending_timestamp_markers = {};
     for (auto &marker : markers) {
-      Com<ID3D12QueryHeap> heap_ref = marker.heap;
-      const auto type = marker.type;
-      const UINT index = marker.index;
       chunk->emitcc([query = std::move(marker.query)](
                         ArgumentEncodingContext &enc) mutable {
         enc.sampleTimestamp(std::move(query));
       });
-      chunk->addCompletionCallback(
-          [heap_ref = std::move(heap_ref), type, index]() mutable {
-            auto *heap = dynamic_cast<QueryHeap *>(heap_ref.ptr());
-            if (heap)
-              heap->MarkTimestampReady(type, index);
-          });
     }
   }
 
@@ -6426,7 +6495,9 @@ private:
                                   UINT64 b_offset, UINT64 b_size) {
     if (!a_size || !b_size)
       return false;
-    return a_offset < b_offset + b_size && b_offset < a_offset + a_size;
+    if (a_offset <= b_offset)
+      return b_offset - a_offset < a_size;
+    return a_offset - b_offset < b_size;
   }
 
   void EmitTimestampResolve(CommandChunk *chunk, PendingTimestampResolve resolve) {
@@ -6435,21 +6506,14 @@ private:
     if (!heap || !dst || !dst->GetBufferAllocation() || !resolve.query_count)
       return;
 
-    if (resolve.samples.empty()) {
-      const auto start_sample =
-          heap->TimestampSampleIndex(D3D12_QUERY_TYPE_TIMESTAMP,
-                                     resolve.start_index);
-      if (start_sample == ~0ull)
-        return;
-      for (UINT i = 0; i < resolve.query_count; i++) {
-        PendingTimestampResolve::Sample sample = {};
-        sample.index = start_sample + i;
-        resolve.samples.push_back(std::move(sample));
-      }
-    }
-
     if (resolve.samples.size() < resolve.query_count)
       return;
+
+    std::vector<Rc<TimestampQuery>> retained_queries;
+    retained_queries.reserve(resolve.query_count);
+    for (const auto &sample : resolve.samples)
+      if (sample.query)
+        retained_queries.push_back(sample.query);
 
     Rc<BufferAllocation> allocation = dst->GetBufferAllocation();
     WMT::Reference<WMT::Buffer> dst_buffer(allocation->buffer());
@@ -6506,6 +6570,11 @@ private:
       dxmt::perf::recordTimestampGpuResolve(run_count);
       i += run_count;
     }
+    if (!retained_queries.empty())
+      chunk->addCompletionCallback(
+          [queries = std::move(retained_queries)]() mutable {
+            queries.clear();
+          });
   }
 
   bool MaterializeTimestampResolves(CommandChunk *chunk, ReplayState &state,
@@ -6559,8 +6628,9 @@ private:
   }
 
   void ResolveQueryDataToCpuBuffer(const ResolveQueryDataRecord &record,
+                                   const QueryResolveSnapshot &snapshot,
                                    const char *context) {
-    ResolveQueryDataToCpuBufferStatic(record, context,
+    ResolveQueryDataToCpuBufferStatic(record, snapshot, context,
                                       reinterpret_cast<uintptr_t>(this));
   }
 
@@ -6587,11 +6657,24 @@ private:
     return slice;
   }
 
+  QueryResolveSnapshot
+  SliceResolveSnapshot(const QueryResolveSnapshot &snapshot, UINT offset,
+                       UINT query_count) const {
+    QueryResolveSnapshot slice;
+    slice.type = snapshot.type;
+    if (offset > snapshot.entries.size() ||
+        query_count > snapshot.entries.size() - offset)
+      return slice;
+    slice.entries.insert(slice.entries.end(),
+                         snapshot.entries.begin() + offset,
+                         snapshot.entries.begin() + offset + query_count);
+    return slice;
+  }
+
   bool DeferCpuQueryResolveToResource(const ResolveQueryDataRecord &record,
+                                      QueryResolveSnapshot snapshot,
                                       UINT64 byte_count) {
     if (!D3D12QueryCpuFallbackDeferEnabled())
-      return false;
-    if (record.type != D3D12_QUERY_TYPE_TIMESTAMP)
       return false;
 
     auto *dst = GetResource(record.dst_buffer.ptr());
@@ -6600,36 +6683,44 @@ private:
 
     const auto seq = device_->GetDXMTDevice().queue().CurrentSeqId();
     const auto queue_id = reinterpret_cast<uintptr_t>(this);
-    Com<ID3D12GraphicsCommandList> command_list = record.command_list;
+    const uintptr_t command_list_identity = record.command_list_identity;
     Com<ID3D12QueryHeap> query_heap = record.heap;
     ID3D12Resource *dst_identity = record.dst_buffer.ptr();
     const auto type = record.type;
     const auto start_index = record.start_index;
     const auto query_count = record.query_count;
     const auto dst_buffer_offset = record.dst_buffer_offset;
+    const bool timestamp = record.type == D3D12_QUERY_TYPE_TIMESTAMP;
     dst->AddPendingCpuQueryResolve(
         record.dst_buffer_offset, byte_count, seq,
-        [command_list = std::move(command_list),
-         query_heap = std::move(query_heap), type, start_index, query_count,
-         dst_identity, dst_buffer_offset, queue_id](Resource *resource) mutable {
-          g_timestamp_cpu_map_materialized_fallbacks.fetch_add(
-              1, std::memory_order_relaxed);
-          dxmt::perf::recordTimestampCpuMaterialized();
+        [command_list_identity, query_heap = std::move(query_heap), type,
+         start_index, query_count, timestamp,
+         dst_identity, dst_buffer_offset, queue_id,
+         snapshot = std::move(snapshot)](Resource *resource) mutable {
+          if (timestamp) {
+            g_timestamp_cpu_map_materialized_fallbacks.fetch_add(
+                1, std::memory_order_relaxed);
+            dxmt::perf::recordTimestampCpuMaterialized();
+          }
           ResolveQueryDataToCpuBufferStatic(
-              command_list.ptr(), query_heap.ptr(), type, start_index,
+              reinterpret_cast<const void *>(command_list_identity),
+              query_heap.ptr(), type, start_index,
               query_count, resource, dst_identity, dst_buffer_offset,
-              "cpu-deferred-map", queue_id);
+              snapshot, "cpu-deferred-map", queue_id);
         });
-    g_timestamp_cpu_deferred_fallbacks.fetch_add(1,
-                                                std::memory_order_relaxed);
-    g_timestamp_cpu_deferred_queries.fetch_add(record.query_count,
-                                              std::memory_order_relaxed);
-    dxmt::perf::recordTimestampCpuDeferred(record.query_count);
+    if (timestamp) {
+      g_timestamp_cpu_deferred_fallbacks.fetch_add(
+          1, std::memory_order_relaxed);
+      g_timestamp_cpu_deferred_queries.fetch_add(
+          record.query_count, std::memory_order_relaxed);
+      dxmt::perf::recordTimestampCpuDeferred(record.query_count);
+    }
     return true;
   }
 
   void QueueCpuQueryFallback(ReplayState &state,
                              const ResolveQueryDataRecord &record,
+                             QueryResolveSnapshot snapshot,
                              UINT64 byte_count, const char *reason) {
     if (record.type == D3D12_QUERY_TYPE_TIMESTAMP) {
       g_timestamp_cpu_fallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -6638,7 +6729,7 @@ private:
       dxmt::perf::recordTimestampCpuFallback(record.query_count);
     }
 
-    if (DeferCpuQueryResolveToResource(record, byte_count)) {
+    if (DeferCpuQueryResolveToResource(record, snapshot, byte_count)) {
       static std::atomic<uint32_t> defer_log_count = 0;
       if (D3D12DiagShouldLog(defer_log_count, D3D12QueryFallbackStatsEnabled())) {
         WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData CPU fallback deferred"
@@ -6661,7 +6752,8 @@ private:
       g_timestamp_cpu_unsafe_fallbacks.fetch_add(1, std::memory_order_relaxed);
       dxmt::perf::recordTimestampCpuImmediate(true);
     }
-    state.pending_immediate_cpu_query_resolves.push_back(record);
+    state.pending_immediate_cpu_query_resolves.push_back(
+        PendingCpuQueryResolve{record, std::move(snapshot)});
     static std::atomic<uint32_t> immediate_log_count = 0;
     if (D3D12DiagShouldLog(immediate_log_count, D3D12QueryFallbackStatsEnabled())) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData CPU fallback immediate"
@@ -6684,13 +6776,13 @@ private:
     if (state.pending_immediate_cpu_query_resolves.empty())
       return false;
 
-    std::vector<ResolveQueryDataRecord> selected;
-    std::vector<ResolveQueryDataRecord> remaining;
+    std::vector<PendingCpuQueryResolve> selected;
+    std::vector<PendingCpuQueryResolve> remaining;
     selected.reserve(state.pending_immediate_cpu_query_resolves.size());
     remaining.reserve(state.pending_immediate_cpu_query_resolves.size());
 
     for (auto &resolve : state.pending_immediate_cpu_query_resolves) {
-      if (ResolveRecordTouchesRange(resolve, resource, offset, size))
+      if (ResolveRecordTouchesRange(resolve.record, resource, offset, size))
         selected.push_back(std::move(resolve));
       else
         remaining.push_back(std::move(resolve));
@@ -6748,7 +6840,8 @@ private:
     }
 
     for (const auto &resolve : selected)
-      ResolveQueryDataToCpuBuffer(resolve, "cpu-batch");
+      ResolveQueryDataToCpuBuffer(resolve.record, resolve.snapshot,
+                                  "cpu-batch");
 
     chunk = queue.CurrentChunk();
     return true;
@@ -7045,6 +7138,7 @@ private:
                        std::forward<Fn>(fn))](ArgumentEncodingContext &enc) mutable {
       enc.startComputePass(argument_buffer_size);
       uint64_t argbuf_offset = 0;
+      enc.setArgumentBufferWriteRange(0, argument_buffer_size);
       if (d3d_sequence != 0)
         dxmt::apitrace::set_current_d3d_sequence(d3d_sequence);
       encode(enc, argbuf_offset);
@@ -7098,9 +7192,11 @@ private:
                            use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
+      enc.setArgumentBufferWriteRange(0, argument_buffer_size);
       if (d3d_sequence != 0) {
         dxmt::apitrace::set_current_d3d_sequence(d3d_sequence);
       }
+      enc.bumpVisibilityResultOffset();
       encode(enc, argbuf_offset);
       enc.endPass();
     });
@@ -7912,8 +8008,8 @@ private:
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.binding_generation = packet.record_index + 1;
-            replay_packet.common.descriptor_content_generation =
-                GetDescriptorContentGeneration();
+            replay_packet.common.descriptor_content_revision =
+                GetDescriptorContentRevision();
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
                 compiled_demote_msaa_srv_mask_lo;
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_hi =
@@ -7976,8 +8072,8 @@ private:
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.binding_generation = packet.record_index + 1;
-            replay_packet.common.descriptor_content_generation =
-                GetDescriptorContentGeneration();
+            replay_packet.common.descriptor_content_revision =
+                GetDescriptorContentRevision();
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
                 compiled_demote_msaa_srv_mask_lo;
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_hi =
@@ -8755,9 +8851,19 @@ private:
       if (record.compute) {
         state.compute_root_signature = record.root_signature;
         state.compute_root_signature_impl = root;
+        state.compute_tables = {};
+        state.compute_root_constants = {};
+        state.compute_cbv_roots = {};
+        state.compute_srv_roots = {};
+        state.compute_uav_roots = {};
       } else {
         state.graphics_root_signature = record.root_signature;
         state.graphics_root_signature_impl = root;
+        state.graphics_tables = {};
+        state.graphics_root_constants = {};
+        state.graphics_cbv_roots = {};
+        state.graphics_srv_roots = {};
+        state.graphics_uav_roots = {};
         BumpGraphicsBindingGeneration(
             state, GraphicsBindingGenerationBumpSource::RootSignature);
       }
@@ -8781,7 +8887,7 @@ private:
             state, GraphicsBindingGenerationBumpSource::RootConstants);
     } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
       FlushPassBatches(chunk, state);
-      ReplayBeginQuery(chunk, record);
+      ReplayBeginQuery(chunk, state, record);
     } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
       FlushPassBatches(chunk, state);
       ReplayEndQuery(chunk, state, record);
@@ -9781,8 +9887,7 @@ private:
 
     if (resource.GetBuffer()) {
       Rc<Buffer> buffer = resource.GetBuffer();
-      const UINT length =
-          UINT(std::min<UINT64>(resource.GetResourceDesc().Width, UINT_MAX));
+      const UINT64 length = resource.GetResourceDesc().Width;
       add_or_merge_entry({std::move(buffer), {}, length, 0, 0, access});
       return;
     }
@@ -9953,7 +10058,7 @@ private:
     state.compute_uav_roots = {};
     state.has_last_snapshot_request_generation = false;
     state.last_snapshot_request_graphics_generation = 0;
-    state.last_snapshot_request_descriptor_generation = 0;
+    state.last_snapshot_request_descriptor_revision = {};
     state.da_cache.clear();
     state.predication_buffer = nullptr;
     state.predication_buffer_offset = 0;
@@ -10011,7 +10116,9 @@ private:
     }
   }
 
-  void ReplayBeginQuery(CommandChunk *chunk, const BeginQueryRecord &record) {
+  void ReplayBeginQuery(CommandChunk *chunk, ReplayState &state,
+                        const BeginQueryRecord &record) {
+    FlushPassBatches(chunk, state);
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: BeginQuery skipped for foreign query heap");
@@ -10028,10 +10135,15 @@ private:
     auto query = heap->BeginVisibility(record.type, record.index);
     if (!query)
       return;
+    chunk->emitcc([query = std::move(query)](
+                      ArgumentEncodingContext &enc) mutable {
+      enc.beginVisibilityResultQuery(std::move(query));
+    });
   }
 
   void ReplayEndQuery(CommandChunk *chunk, ReplayState &state,
                       const EndQueryRecord &record) {
+    FlushPassBatches(chunk, state);
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: EndQuery skipped for foreign query heap");
@@ -10068,6 +10180,10 @@ private:
     auto query = heap->EndVisibility(record.type, record.index);
     if (!query)
       return;
+    chunk->emitcc([query = std::move(query)](
+                      ArgumentEncodingContext &enc) mutable {
+      enc.endVisibilityResultQuery(std::move(query));
+    });
   }
 
   void ReplayResolveQueryData(CommandChunk *chunk, ReplayState &state,
@@ -10097,9 +10213,11 @@ private:
            " dstOffset=", record.dst_buffer_offset);
     }
 
+    QueryResolveSnapshot snapshot;
     std::vector<uint8_t> sizing_data;
-    if (!heap->Resolve(record.type, record.start_index, record.query_count,
-                       sizing_data)) {
+    if (!heap->CaptureResolve(record.type, record.start_index,
+                              record.query_count, snapshot) ||
+        !ResolveQuerySnapshot(snapshot, sizing_data)) {
       if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
         WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData sizing failed"
              " queue=", reinterpret_cast<uintptr_t>(this),
@@ -10130,10 +10248,11 @@ private:
       const auto current_sequence =
           device_->GetDXMTDevice().queue().CurrentSeqId();
       for (UINT i = 0; i < record.query_count; i++) {
-        auto query = heap->TimestampQueryAt(record.type, record.start_index + i);
+        const auto &query = snapshot.entries[i].timestamp;
         PendingTimestampResolve::Sample sample = {};
         uint64_t sequence = ~0ull;
         if (query) {
+          sample.query = query;
           sample.index = query->sampleIndex();
           sequence = query->sampleSequence();
 #if DXMT_DX12_METAL4
@@ -10163,12 +10282,14 @@ private:
           for (UINT j = 0; j < run_count; j++)
             run_samples.push_back(samples[i + j]);
           state.pending_timestamp_resolves.push_back(PendingTimestampResolve{
-              record.command_list, record.heap, record.dst_buffer,
+              record.command_list_identity, record.heap, record.dst_buffer,
               std::move(run_samples), run_start, run_count,
               run_record.dst_buffer_offset, run_bytes});
           emitted_any_run = true;
         } else {
-          QueueCpuQueryFallback(state, run_record, run_bytes,
+          auto run_snapshot = SliceResolveSnapshot(snapshot, i, run_count);
+          QueueCpuQueryFallback(state, run_record, std::move(run_snapshot),
+                                run_bytes,
                                 "timestamp-missing-gpu-resolve-source");
         }
         i += run_count;
@@ -10192,7 +10313,8 @@ private:
       return;
     }
 
-    QueueCpuQueryFallback(state, record, sizing_data.size(), "non-gpu-query");
+    QueueCpuQueryFallback(state, record, std::move(snapshot),
+                          sizing_data.size(), "non-gpu-query");
     if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData deferred CPU fallback"
            " queue=", reinterpret_cast<uintptr_t>(this),
@@ -10649,6 +10771,8 @@ private:
 
       EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
                              use_tessellation, argbuf_offset);
+      if (enc.argumentBufferOverflowed())
+        return;
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
@@ -10773,6 +10897,8 @@ private:
                            use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
+      enc.setArgumentBufferWriteRange(0, argument_buffer_size);
+      enc.bumpVisibilityResultOffset();
       encode(enc, argbuf_offset);
       enc.endPass();
     });
@@ -10901,6 +11027,8 @@ private:
 
       EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
                              use_tessellation, argbuf_offset);
+      if (enc.argumentBufferOverflowed())
+        return;
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
@@ -11033,6 +11161,8 @@ private:
                            use_geometry, use_tessellation))
         return;
       uint64_t argbuf_offset = 0;
+      enc.setArgumentBufferWriteRange(0, argument_buffer_size);
+      enc.bumpVisibilityResultOffset();
       encode(enc, argbuf_offset);
       enc.endPass();
     });
@@ -11073,6 +11203,8 @@ private:
 
       const uint64_t argbuf_base = argbuf_offset;
       EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
+      if (enc.argumentBufferOverflowed())
+        return;
       if (argbuf_offset - argbuf_base > argument_buffer_size) {
         WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
              argument_buffer_size, " actual=", argbuf_offset - argbuf_base);
@@ -11132,6 +11264,7 @@ private:
           counted_args, counted_offset, argument_size, command_index);
       enc.startComputePass(argument_buffer_size);
       uint64_t argbuf_offset = 0;
+      enc.setArgumentBufferWriteRange(0, argument_buffer_size);
       encode(enc, argbuf_offset);
       enc.endPass();
     });
@@ -11529,24 +11662,27 @@ private:
                : range.offset_in_descriptors_from_table_start;
   }
 
-  const DescriptorRecord *
+  std::optional<DescriptorRecord>
   GetBoundDescriptorRecordFromHeap(DescriptorHeap *descriptor_heap,
                                    D3D12_GPU_DESCRIPTOR_HANDLE handle,
                                    D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
     if (!descriptor_heap)
-      return nullptr;
+      return std::nullopt;
 
+    auto *mirror = descriptor_heap->GetMirror();
+    auto mirror_lock = mirror ? mirror->AcquireLock()
+                              : DescriptorHeapMirror::ScopedLock{};
     const auto *descriptor = descriptor_heap->GetDescriptorRecord(handle);
     if (!descriptor) {
       WARN("D3D12CommandQueue: GPU descriptor handle does not belong to the currently bound heap type=",
            uint32_t(heap_type));
-      return nullptr;
+      return std::nullopt;
     }
     if (!descriptor->shader_visible || descriptor->heap_type != heap_type) {
       WARN("D3D12CommandQueue: invalid GPU descriptor heap visibility/type");
-      return nullptr;
+      return std::nullopt;
     }
-    return descriptor;
+    return *descriptor;
   }
 
   template <typename State>
@@ -11565,7 +11701,7 @@ private:
     return descriptor_heap;
   }
 
-  const DescriptorRecord *
+  std::optional<DescriptorRecord>
   GetBoundDescriptorRecord(const ReplayState &state,
                            D3D12_GPU_DESCRIPTOR_HANDLE handle,
                            D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
@@ -11573,32 +11709,32 @@ private:
         GetBoundDescriptorHeap(state, heap_type), handle, heap_type);
   }
 
-  const DescriptorRecord *
+  std::optional<DescriptorRecord>
   GetBoundDescriptorRecordInRangeFromHeap(DescriptorHeap *descriptor_heap,
                                   D3D12_GPU_DESCRIPTOR_HANDLE base,
                                   UINT range_offset, UINT descriptor_index,
                                   UINT descriptor_count,
                                   D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
     if (descriptor_count && descriptor_index >= descriptor_count)
-      return nullptr;
+      return std::nullopt;
 
     const auto total_offset = range_offset + descriptor_index;
     if (total_offset < range_offset) {
       WARN("D3D12CommandQueue: descriptor table offset overflow");
-      return nullptr;
+      return std::nullopt;
     }
 
     const auto handle =
         D3D12_GPU_DESCRIPTOR_HANDLE{base.ptr +
                                     sizeof(DescriptorRecord) * total_offset};
-    const auto *descriptor =
+    const auto descriptor =
         GetBoundDescriptorRecordFromHeap(descriptor_heap, handle, heap_type);
     if (!descriptor)
-      return nullptr;
+      return std::nullopt;
     return descriptor;
   }
 
-  const DescriptorRecord *
+  std::optional<DescriptorRecord>
   GetBoundDescriptorRecordInRange(const ReplayState &state,
                                   D3D12_GPU_DESCRIPTOR_HANDLE base,
                                   UINT range_offset, UINT descriptor_index,
@@ -11965,14 +12101,14 @@ private:
       for (const auto &e : plan.entries) {
         if (e.kind == BindingEntryKind::Table) {
           const auto base = GetTableHandle(state, compute, e.root_index);
-          const DescriptorRecord *descriptor =
+          std::optional<DescriptorRecord> descriptor =
               base.ptr ? GetBoundDescriptorRecordInRangeFromHeap(
                              e.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
                                  ? smp_heap
                                  : cbv_heap,
                              base, e.range_offset, e.descriptor_index, e.count,
                              e.heap_type)
-                       : nullptr;
+                       : std::nullopt;
           fp = mix(fp, descriptor ? reinterpret_cast<uintptr_t>(
                                         descriptor->resource.ptr())
                                   : 0);
@@ -12007,7 +12143,7 @@ private:
           continue;
         auto *dh = e.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? smp_heap
                                                                     : cbv_heap;
-        const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+        const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
             dh, base, e.range_offset, e.descriptor_index, e.count, e.heap_type);
         if (!descriptor)
           continue;
@@ -12298,6 +12434,8 @@ private:
                                    sizeof(uint32_t));
         slice.firstElement += view->firstElementBias;
       }
+      if (!ValidateLegacyBufferSliceRange("SRV", offset, byte_size))
+        return false;
       binding.viewId = view_id;
       binding.buffer = Rc<Buffer>(resource->GetBuffer());
       binding.slice = slice;
@@ -12447,6 +12585,8 @@ private:
                                    sizeof(uint32_t));
         slice.firstElement += view->firstElementBias;
       }
+      if (!ValidateLegacyBufferSliceRange("UAV", offset, byte_size))
+        return false;
       binding.viewId = view_id;
       binding.buffer = Rc<Buffer>(resource->GetBuffer());
       binding.slice = slice;
@@ -12498,15 +12638,14 @@ private:
       EncodeMirrorSamplerSlot(expected, *sampler);
     else
       EncodeMirrorSamplerSlotNull(expected, dummy_handle);
-    const uint64_t *got[kMirrorSamplerQwords] = {
-        mirror ? mirror->samplerHandlePtr(slot) : nullptr,
-        mirror ? mirror->samplerCubeHandlePtr(slot) : nullptr,
-        mirror ? mirror->samplerLodBiasPtr(slot) : nullptr,
-    };
-    if (!got[0] || !got[1] || !got[2])
+    const auto payload = mirror ? mirror->samplerSlotPayload(slot)
+                                : std::nullopt;
+    if (!payload)
       return;
+    const uint64_t got[kMirrorSamplerQwords] = {
+        payload->handle, payload->cube_handle, payload->lod_bias};
     for (uint32_t i = 0; i < kMirrorSamplerQwords; i++) {
-      if (*got[i] == expected[i])
+      if (got[i] == expected[i])
         continue;
       if (!BindlessMirrorVerifyShouldLog())
         return;
@@ -12518,7 +12657,7 @@ private:
           " slot=", slot,
           " field=qword", i,
           " expected=0x", std::hex, expected[i],
-          " actual=0x", *got[i], std::dec);
+          " actual=0x", got[i], std::dec);
     }
   }
 
@@ -12554,12 +12693,21 @@ private:
     if (!mirror)
       return BindlessMirrorFillKind::None;
     const UINT slot = record.heap_index;
+    const auto pending_version = mirror->slotPendingVersion(slot);
+    if (pending_version && record.slot_version != *pending_version)
+      return BindlessMirrorFillKind::None;
     if (mirror->isSamplerHeap()) {
-      const bool filled =
-          mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot);
       if (record.type != DescriptorRecordType::Sampler || !record.has_desc) {
-        if (!filled) {
-          mirror->FillSamplerSlot(slot, nullptr, enc.dummySamplerHandle());
+        bool filled = false;
+        if (pending_version) {
+          auto mirror_lock = mirror->AcquireLock();
+          filled = mirror->FillSamplerSlot(
+                       slot, nullptr, enc.dummySamplerHandle(),
+                       *pending_version) &&
+                   ReplaceDescriptorMirrorResidencyTargetForEncode(
+                       enc, *mirror, slot, *pending_version, {});
+        }
+        if (filled) {
           VerifyBindlessMirrorSamplerSlot(mirror, slot, nullptr,
                                           enc.dummySamplerHandle(), stage, arg);
           return BindlessMirrorFillKind::Sampler;
@@ -12568,12 +12716,26 @@ private:
                                         enc.dummySamplerHandle(), stage, arg);
         return BindlessMirrorFillKind::None;
       }
-      if (filled && !BindlessMirrorVerifyEnabled())
+      if (!pending_version && !BindlessMirrorVerifyEnabled())
         return BindlessMirrorFillKind::None;
-      auto sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
-                                        record.desc.sampler);
-      if (!filled) {
-        mirror->FillSamplerSlot(slot, sampler.ptr(), enc.dummySamplerHandle());
+      auto sampler = record.materialized_sampler;
+      if (!sampler)
+        sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
+                                     record.desc.sampler);
+      if (!sampler)
+        return BindlessMirrorFillKind::None;
+      if (pending_version) {
+        auto mirror_lock = mirror->AcquireLock();
+        if (!mirror->FillSamplerSlot(slot, sampler.ptr(),
+                                     enc.dummySamplerHandle(),
+                                     *pending_version))
+          return BindlessMirrorFillKind::None;
+        DescriptorResidencyTarget target = {};
+        target.sampler = sampler;
+        if (!ReplaceDescriptorMirrorResidencyTargetForEncode(
+                enc, *mirror, slot, *pending_version,
+                std::move(target)))
+          return BindlessMirrorFillKind::None;
         VerifyBindlessMirrorSamplerSlot(mirror, slot, sampler.ptr(),
                                         enc.dummySamplerHandle(), stage, arg);
         return BindlessMirrorFillKind::Sampler;
@@ -12583,11 +12745,20 @@ private:
       return BindlessMirrorFillKind::None;
     }
 
-    // Already up to date for the current content generation: skip (this is what makes
-    // the texture fill once-per-change rather than per-draw). Samplers verify above
-    // still compares every bindless draw when the local verify path is enabled.
-    if (mirror->slotFilledGeneration(slot) == mirror->slotStaleGeneration(slot))
+    // A fill token ties the DescriptorRecord snapshot to one app-thread write.
+    // Conditional mirror writes below refuse to publish if a newer descriptor
+    // generation wins while resource/view materialization is in progress.
+    if (!pending_version)
       return BindlessMirrorFillKind::None;
+    const dxmt::DescriptorSlotVersion expected_version = *pending_version;
+    auto clear_current = [&] {
+      auto mirror_lock = mirror->AcquireLock();
+      if (!mirror->ClearTextureSlot(slot, expected_version) ||
+          !ReplaceDescriptorMirrorResidencyTargetForEncode(
+              enc, *mirror, slot, expected_version, {}))
+        return BindlessMirrorFillKind::None;
+      return BindlessMirrorFillKind::Null;
+    };
 
     // CBV/SRV/UAV mirror: ordinary buffer descriptors are covered by the per-draw
     // buf_table, but DXBC typed/structured `dcl_resource dim=buffer` lowers to a
@@ -12597,79 +12768,52 @@ private:
     if (record.type == DescriptorRecordType::ShaderResourceView ||
         record.type == DescriptorRecordType::UnorderedAccessView)
       resource = GetResource(record.resource.ptr());
-    if (!resource) {
-      mirror->ClearTextureSlot(slot);
-      return BindlessMirrorFillKind::Null;
-    }
-
-    auto replace_texture_residency_target =
-        [&](WMT::Resource texture_allocation) {
-          DescriptorResidencyTarget target = {};
-          if (texture_allocation)
-            target.allocation = texture_allocation;
-          auto previous =
-              mirror->ReplaceResidencyTarget(slot, std::move(target));
-          if (texture_allocation)
-            enc.queue().AddPersistentResidency(texture_allocation);
-          if (previous.allocation)
-            enc.queue().RemovePersistentResidencyAfterCompletion(
-                previous.allocation);
-          if (previous.secondary_allocation)
-            enc.queue().RemovePersistentResidencyAfterCompletion(
-                previous.secondary_allocation);
-          if (previous.sampler)
-            enc.queue().RetainUntilGpuComplete(
-                [sampler = std::move(previous.sampler)]() mutable {
-                  sampler = nullptr;
-                });
-        };
+    if (!resource)
+      return clear_current();
 
     if (record.type == DescriptorRecordType::ShaderResourceView) {
       if (resource->GetBuffer()) {
-        if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
-          mirror->ClearTextureSlot(slot);
-          return BindlessMirrorFillKind::Null;
-        }
+        if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE))
+          return clear_current();
         auto binding = CreateShaderResourceTextureBufferBinding(
             device_->GetMTLDevice(), *resource, record,
             WMTTextureUsageShaderRead);
-        if (!binding) {
-          mirror->ClearTextureSlot(slot);
-          return BindlessMirrorFillKind::Null;
-        }
+        if (!binding)
+          return clear_current();
         auto buffer = Rc<Buffer>(resource->GetBuffer());
-        FillBindlessTextureBufferMirrorSlot(
-            enc, *mirror, slot, stage, buffer, binding->first, binding->second,
-            ResourceAccess::Read);
-        return BindlessMirrorFillKind::TextureBuffer;
+        return FillBindlessTextureBufferMirrorSlot(
+                   enc, *mirror, slot, stage, buffer, binding->first,
+                   binding->second, ResourceAccess::Read,
+                   expected_version)
+                   ? BindlessMirrorFillKind::TextureBuffer
+                   : BindlessMirrorFillKind::None;
       }
-      if (!resource->GetTexture()) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+      if (!resource->GetTexture())
+        return clear_current();
       const auto view = CreateShaderResourceTextureView(device_->GetMTLDevice(),
                                                         *resource, record);
-      if (!view || !view.texture.ptr()) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+      if (!view || !view.texture.ptr())
+        return clear_current();
       auto *allocation = view.texture->current();
-      if (!allocation) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+      if (!allocation)
+        return clear_current();
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
-      mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
-      replace_texture_residency_target(allocation->texture());
+      auto mirror_lock = mirror->AcquireLock();
+      if (!mirror->FillTextureSlot(slot, gpu_resource_id, array_length, 0.0f,
+                                   expected_version))
+        return BindlessMirrorFillKind::None;
+      DescriptorResidencyTarget target = {};
+      target.mirror_allocation = allocation->texture();
+      if (!ReplaceDescriptorMirrorResidencyTargetForEncode(
+              enc, *mirror, slot, expected_version, std::move(target)))
+        return BindlessMirrorFillKind::None;
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
       return BindlessMirrorFillKind::Texture;
     } else if (record.type == DescriptorRecordType::UnorderedAccessView) {
       if (resource->GetBuffer()) {
-        if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE)) {
-          mirror->ClearTextureSlot(slot);
-          return BindlessMirrorFillKind::Null;
-        }
+        if (!arg || !(arg->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE))
+          return clear_current();
         bool read = (arg->Flags >> 10) & 1;
         bool write = (arg->Flags >> 10) & 2;
         if (!read && !write) {
@@ -12679,46 +12823,45 @@ private:
         auto binding = CreateUnorderedAccessTextureBufferBinding(
             device_->GetMTLDevice(), *resource, record,
             WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
-        if (!binding) {
-          mirror->ClearTextureSlot(slot);
-          return BindlessMirrorFillKind::Null;
-        }
+        if (!binding)
+          return clear_current();
         auto buffer = Rc<Buffer>(resource->GetBuffer());
-        FillBindlessTextureBufferMirrorSlot(
-            enc, *mirror, slot, stage, buffer, binding->first, binding->second,
-            (read ? ResourceAccess::Read : 0) |
-                (write ? ResourceAccess::Write : 0) | ResourceAccess::UAV);
-        return BindlessMirrorFillKind::TextureBuffer;
+        return FillBindlessTextureBufferMirrorSlot(
+                   enc, *mirror, slot, stage, buffer, binding->first,
+                   binding->second,
+                   (read ? ResourceAccess::Read : 0) |
+                       (write ? ResourceAccess::Write : 0) |
+                       ResourceAccess::UAV,
+                   expected_version)
+                   ? BindlessMirrorFillKind::TextureBuffer
+                   : BindlessMirrorFillKind::None;
       }
       if (record.has_desc &&
-          record.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
-      if (!resource->GetTexture()) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+          record.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        return clear_current();
+      if (!resource->GetTexture())
+        return clear_current();
       if (resource->IsReservedTexture() &&
-          !resource->EnsureTextureAllocation("FillBindlessMirrorSlot")) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+          !resource->EnsureTextureAllocation("FillBindlessMirrorSlot"))
+        return clear_current();
       const auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
                                                          *resource, record);
-      if (!view || !view.texture.ptr()) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+      if (!view || !view.texture.ptr())
+        return clear_current();
       auto *allocation = view.texture->current();
-      if (!allocation) {
-        mirror->ClearTextureSlot(slot);
-        return BindlessMirrorFillKind::Null;
-      }
+      if (!allocation)
+        return clear_current();
       const uint64_t gpu_resource_id = view.texture->view(view.view, allocation).gpuResourceID;
       const uint32_t array_length = view.texture->arrayLength(view.view);
-      mirror->FillTextureSlot(slot, gpu_resource_id, array_length);
-      replace_texture_residency_target(allocation->texture());
+      auto mirror_lock = mirror->AcquireLock();
+      if (!mirror->FillTextureSlot(slot, gpu_resource_id, array_length, 0.0f,
+                                   expected_version))
+        return BindlessMirrorFillKind::None;
+      DescriptorResidencyTarget target = {};
+      target.mirror_allocation = allocation->texture();
+      if (!ReplaceDescriptorMirrorResidencyTargetForEncode(
+              enc, *mirror, slot, expected_version, std::move(target)))
+        return BindlessMirrorFillKind::None;
       VerifyBindlessMirrorTextureSlot(enc, mirror, slot, view.texture, view.view);
       return BindlessMirrorFillKind::Texture;
     }
@@ -13767,7 +13910,7 @@ private:
     uint32_t absolute_slot = 0;
     uint32_t live_base = 0;
     bool has_live_base = false;
-    const DescriptorRecord *descriptor = nullptr;
+    std::optional<DescriptorRecord> descriptor;
   };
 
   bool ProbeBindlessMirrorTextureBinding(const BindlessMirrorDiagProbe &probe,
@@ -13777,20 +13920,25 @@ private:
 
     auto *mirror = probe.descriptor->mirror;
     const bool sampler_heap = mirror && mirror->isSamplerHeap();
-    const uint64_t *handle_ptr =
-        !mirror ? nullptr
-                : sampler_heap ? mirror->samplerHandlePtr(probe.absolute_slot)
-                               : mirror->textureHandlePtr(probe.absolute_slot);
-    const uint64_t *meta_ptr =
-        !mirror ? nullptr
-                : sampler_heap ? mirror->samplerLodBiasPtr(probe.absolute_slot)
-                               : mirror->textureMetadataPtr(probe.absolute_slot);
-    const uint64_t handle = handle_ptr ? *handle_ptr : 0;
-    const uint64_t meta = meta_ptr ? *meta_ptr : 0;
-    const uint64_t filled_gen =
-        mirror ? mirror->slotFilledGeneration(probe.absolute_slot) : 0;
-    const uint64_t stale_gen =
-        mirror ? mirror->slotStaleGeneration(probe.absolute_slot) : 0;
+    const auto sampler_payload =
+        sampler_heap ? mirror->samplerSlotPayload(probe.absolute_slot)
+                     : std::nullopt;
+    const auto texture_payload =
+        mirror && !sampler_heap
+            ? mirror->textureSlotPayload(probe.absolute_slot)
+            : std::nullopt;
+    const uint64_t handle = sampler_payload
+                                ? sampler_payload->handle
+                                : texture_payload ? texture_payload->handle : 0;
+    const uint64_t meta = sampler_payload
+                              ? sampler_payload->lod_bias
+                              : texture_payload ? texture_payload->metadata : 0;
+    const auto filled_version =
+        mirror ? mirror->slotFilledVersion(probe.absolute_slot)
+               : dxmt::DescriptorSlotVersion{};
+    const auto stale_version =
+        mirror ? mirror->slotStaleVersion(probe.absolute_slot)
+               : dxmt::DescriptorSlotVersion{};
     const bool snapshot_base_diverged =
         probe.has_live_base && probe.root_offset != probe.live_base;
     const bool null_handle = handle == 0;
@@ -13812,8 +13960,8 @@ private:
       return false;
     if (!sample)
       return null_handle;
-    const char *fill_state = filled_gen == stale_gen
-                                 ? (filled_gen ? "filled" : "never-filled")
+    const char *fill_state = filled_version == stale_version
+                                 ? (filled_version ? "filled" : "never-filled")
                                  : "stale";
 
     INFO("DXMT bindless-mirror DIAG"
@@ -13828,8 +13976,10 @@ private:
          " absoluteSlot=", probe.absolute_slot,
          " path=", probe.path ? probe.path : "unknown",
          " fill=", fill_state,
-         " filledGen=", filled_gen,
-         " staleGen=", stale_gen,
+         " filledEpoch=", filled_version.epoch,
+         " filledSequence=", filled_version.sequence,
+         " staleEpoch=", stale_version.epoch,
+         " staleSequence=", stale_version.sequence,
          " handle=", handle,
          " meta=", meta,
          " liveBase=", probe.has_live_base ? probe.live_base : UINT32_MAX,
@@ -14168,7 +14318,7 @@ private:
       if (!base_handle.ptr)
         continue;
       auto *heap = GetBoundDescriptorHeap(state, entry.heap_type);
-      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+      const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           heap, base_handle, entry.range_offset, entry.descriptor_index,
           entry.descriptor_count, entry.heap_type);
       if (!descriptor || descriptor->heap_index < entry.argument_local_start)
@@ -14248,7 +14398,7 @@ private:
         continue;
 
       auto *heap = GetBoundDescriptorHeap(state, entry.heap_type);
-      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+      const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           heap, base_handle, entry.range_offset, entry.descriptor_index,
           entry.descriptor_count, entry.heap_type);
       if (!descriptor)
@@ -14262,7 +14412,7 @@ private:
           const auto dst_local = entry.argument_local_start + local;
           if (entry.compact_base + dst_local >= dxmt::kBindlessMirrorCapacity)
             break;
-          const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+          const auto slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
               heap, base_handle, entry.range_offset,
               entry.descriptor_index + local, entry.descriptor_count,
               entry.heap_type);
@@ -14271,32 +14421,29 @@ private:
           const auto source_slot = slot_descriptor->heap_index;
           if (entry.sampler && window->sampler.mapped) {
             auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
-            auto *src0 = slot_descriptor->mirror->samplerHandlePtr(source_slot);
-            auto *src1 =
-                slot_descriptor->mirror->samplerCubeHandlePtr(source_slot);
-            auto *src2 =
-                slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
-            if (src0 && src1 && src2) {
-              dst[entry.compact_base + dst_local] = *src0;
+            const auto payload = slot_descriptor->mirror->samplerSlotPayload(
+                source_slot, slot_descriptor->slot_version);
+            if (payload) {
+              dst[entry.compact_base + dst_local] = payload->handle;
               dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + dst_local] =
-                  *src1;
+                  payload->cube_handle;
               dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
-                  entry.compact_base + dst_local] = *src2;
+                  entry.compact_base + dst_local] = payload->lod_bias;
             }
           } else if (entry.texture && window->texture.mapped) {
             auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-            auto *src0 = slot_descriptor->mirror->textureHandlePtr(source_slot);
-            auto *src1 =
-                slot_descriptor->mirror->textureMetadataPtr(source_slot);
-            if (src0 && src1) {
+            const auto payload = slot_descriptor->mirror->textureSlotPayload(
+                source_slot, slot_descriptor->slot_version);
+            if (payload) {
               for (uint32_t pair = 0; pair < window->texture_field_pairs;
                    pair++) {
                 const uint64_t pair_base =
                     uint64_t(pair) * dxmt::kMirrorTextureQwords *
                     dxmt::kBindlessMirrorCapacity;
-                dst[pair_base + entry.compact_base + dst_local] = *src0;
+                dst[pair_base + entry.compact_base + dst_local] =
+                    payload->handle;
                 dst[pair_base + dxmt::kBindlessMirrorCapacity +
-                    entry.compact_base + dst_local] = *src1;
+                    entry.compact_base + dst_local] = payload->metadata;
               }
             }
           }
@@ -14308,7 +14455,7 @@ private:
              local < entry.range_count &&
              entry.descriptor_index + local < entry.descriptor_count;
              local++) {
-          const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+          const auto slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
               heap, base_handle, entry.range_offset,
               entry.descriptor_index + local, entry.descriptor_count,
               entry.heap_type);
@@ -14323,7 +14470,7 @@ private:
              local < entry.range_count &&
              entry.descriptor_index + local < entry.descriptor_count;
              local++) {
-          const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+          const auto slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
               heap, base_handle, entry.range_offset,
               entry.descriptor_index + local, entry.descriptor_count,
               entry.heap_type);
@@ -14536,7 +14683,7 @@ private:
           static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
       const auto heap_type = DescriptorHeapTypeForRange(range_type);
       auto *heap = get_heap(heap_type);
-      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+      const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           heap, base, entry.range_offset, entry.descriptor_index,
           entry.descriptor_count, heap_type);
       const auto stage = static_cast<PipelineStage>(entry.stage);
@@ -14673,7 +14820,7 @@ private:
       entry.debug_kind = DescriptorRangeTypeName(range_type);
 
       const auto heap_type = DescriptorHeapTypeForRange(range_type);
-      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+      const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           get_heap(heap_type), base, recipe_entry.range_offset,
           recipe_entry.descriptor_index, recipe_entry.descriptor_count,
           heap_type);
@@ -14927,31 +15074,30 @@ private:
     snapshot.pipeline_state = state.pipeline_state;
     snapshot.root_signature = state.graphics_root_signature;
     snapshot.root_signature_impl = state.graphics_root_signature_impl;
+    // Captured DescriptorRecord values contain non-owning pointers to their
+    // heap-owned mirrors. Keep both bound heaps alive for every deferred
+    // snapshot path, not only the native descriptor-table ABI.
+    snapshot.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
+    snapshot.sampler_heap = state.sampler_heap;
+    snapshot.graphics_tables = state.graphics_tables;
     snapshot.native =
         pipeline.GetShaderAbiVersion() ==
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
-    if (snapshot.native) {
-      snapshot.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
-      snapshot.sampler_heap = state.sampler_heap;
-      snapshot.graphics_tables = state.graphics_tables;
-    }
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.root_signature.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.pipeline_state.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint, &pipeline);
-    if (snapshot.native) {
-      HashGraphicsBindingPointer(snapshot.content_fingerprint,
-                                 snapshot.cbv_srv_uav_heap.ptr());
-      HashGraphicsBindingPointer(snapshot.content_fingerprint,
-                                 snapshot.sampler_heap.ptr());
-      for (UINT i = 0; i < snapshot.graphics_tables.size(); i++) {
-        if (!snapshot.graphics_tables[i].ptr)
-          continue;
-        HashGraphicsBindingValue(snapshot.content_fingerprint, i);
-        HashGraphicsBindingValue(snapshot.content_fingerprint,
-                                 snapshot.graphics_tables[i].ptr);
-      }
+    HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                               snapshot.cbv_srv_uav_heap.ptr());
+    HashGraphicsBindingPointer(snapshot.content_fingerprint,
+                               snapshot.sampler_heap.ptr());
+    for (UINT i = 0; i < snapshot.graphics_tables.size(); i++) {
+      if (!snapshot.graphics_tables[i].ptr)
+        continue;
+      HashGraphicsBindingValue(snapshot.content_fingerprint, i);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               snapshot.graphics_tables[i].ptr);
     }
 
     auto *root = state.graphics_root_signature_impl;
@@ -15014,7 +15160,8 @@ private:
   }
 
   void RecordGraphicsBindingSnapshotRequestPerf(
-      ReplayState &state, uint64_t descriptor_content_generation) {
+      ReplayState &state,
+      dxmt::DescriptorContentRevision descriptor_content_revision) {
     if (!ReplayPerfEnabled())
       return;
     auto &timers = perDrawSubTimers();
@@ -15024,8 +15171,8 @@ private:
           state.last_snapshot_request_graphics_generation !=
           state.graphics_binding_generation;
       const bool descriptor_changed =
-          state.last_snapshot_request_descriptor_generation !=
-          descriptor_content_generation;
+          state.last_snapshot_request_descriptor_revision !=
+          descriptor_content_revision;
       if (graphics_changed && descriptor_changed)
         timers.snapshotBothGenChanges++;
       else if (graphics_changed)
@@ -15037,8 +15184,8 @@ private:
     }
     state.last_snapshot_request_graphics_generation =
         state.graphics_binding_generation;
-    state.last_snapshot_request_descriptor_generation =
-        descriptor_content_generation;
+    state.last_snapshot_request_descriptor_revision =
+        descriptor_content_revision;
     state.has_last_snapshot_request_generation = true;
   }
 
@@ -15060,9 +15207,9 @@ private:
   std::shared_ptr<GraphicsBindingSnapshot> GetOrCaptureGraphicsBindingSnapshot(
       CommandChunk *chunk, ReplayState &state, PipelineState &pipeline,
       const ReplayRenderPassAttachments &attachments,
-      uint64_t descriptor_content_generation) {
+      dxmt::DescriptorContentRevision descriptor_content_revision) {
     RecordGraphicsBindingSnapshotRequestPerf(state,
-                                             descriptor_content_generation);
+                                             descriptor_content_revision);
     if (!D3D12ReplayGraphicsBatchingEnabled())
     {
       if (ReplayPerfEnabled())
@@ -15090,7 +15237,7 @@ private:
     }
 
     const ReplayBindingGenerationKey key{state.graphics_binding_generation,
-                                         descriptor_content_generation};
+                                         descriptor_content_revision};
     auto it = active_batch.captured_binding_snapshots.find(key);
     if (it == active_batch.captured_binding_snapshots.end()) {
       if (ReplayPerfEnabled())
@@ -15324,7 +15471,7 @@ private:
                overlap->descriptor_index + local < descriptor_count;
                local++) {
             const auto arg_local = overlap->argument_local_start + local;
-            const auto *descriptor = GetBoundDescriptorRecordInRange(
+            const auto descriptor = GetBoundDescriptorRecordInRange(
                 state, base, range_offset, overlap->descriptor_index + local,
                 descriptor_count, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             if (!descriptor)
@@ -15603,28 +15750,32 @@ private:
         if (dst_slot >= dxmt::kBindlessMirrorCapacity)
           continue;
         const auto source_slot = entry.descriptor.heap_index;
+        MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
+                                    want_stage, &arg);
         if (arg.Type == SM50BindingType::Sampler && window->sampler.mapped) {
           auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
-          auto *src0 = entry.descriptor.mirror->samplerHandlePtr(source_slot);
-          auto *src1 = entry.descriptor.mirror->samplerCubeHandlePtr(source_slot);
-          auto *src2 = entry.descriptor.mirror->samplerLodBiasPtr(source_slot);
-          if (src0 && src1 && src2) {
-            dst[dst_slot] = *src0;
-            dst[dxmt::kBindlessMirrorCapacity + dst_slot] = *src1;
-            dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + dst_slot] = *src2;
+          const auto payload = entry.descriptor.mirror->samplerSlotPayload(
+              source_slot, entry.descriptor.slot_version);
+          if (payload) {
+            dst[dst_slot] = payload->handle;
+            dst[dxmt::kBindlessMirrorCapacity + dst_slot] =
+                payload->cube_handle;
+            dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + dst_slot] =
+                payload->lod_bias;
           }
         } else if ((arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) &&
                    window->texture.mapped) {
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-          auto *src0 = entry.descriptor.mirror->textureHandlePtr(source_slot);
-          auto *src1 = entry.descriptor.mirror->textureMetadataPtr(source_slot);
-          if (src0 && src1) {
+          const auto payload = entry.descriptor.mirror->textureSlotPayload(
+              source_slot, entry.descriptor.slot_version);
+          if (payload) {
             for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
               const uint64_t pair_base =
                   uint64_t(pair) * dxmt::kMirrorTextureQwords *
                   dxmt::kBindlessMirrorCapacity;
-              dst[pair_base + dst_slot] = *src0;
-              dst[pair_base + dxmt::kBindlessMirrorCapacity + dst_slot] = *src1;
+              dst[pair_base + dst_slot] = payload->handle;
+              dst[pair_base + dxmt::kBindlessMirrorCapacity + dst_slot] =
+                  payload->metadata;
             }
           }
         }
@@ -15685,7 +15836,7 @@ private:
           "snapshot", want_stage, &arg, entry.shader_register, lower,
           root_offsets[entry.root_offset_key],
           root_offsets[entry.root_offset_key] + local, live_base, true,
-          &entry.descriptor}, draw_diag);
+          entry.descriptor}, draw_diag);
     }
     for (uint32_t i = 0; i < max_key_plus_one; i++)
       if (root_offsets[i] == UINT32_MAX)
@@ -16250,7 +16401,7 @@ private:
         const auto dst_local = entry.argument_local_start + local;
         if (entry.compact_base + dst_local >= dxmt::kBindlessMirrorCapacity)
           break;
-        const auto *slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+        const auto slot_descriptor = GetBoundDescriptorRecordInRangeFromHeap(
             heap, table->base_descriptor, entry.range_offset,
             entry.descriptor_index + local, entry.descriptor_count,
             entry.heap_type);
@@ -16262,31 +16413,28 @@ private:
                                     want_stage, &argument);
         if (entry.sampler && window->sampler.mapped) {
           auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
-          auto *src0 = slot_descriptor->mirror->samplerHandlePtr(source_slot);
-          auto *src1 =
-              slot_descriptor->mirror->samplerCubeHandlePtr(source_slot);
-          auto *src2 =
-              slot_descriptor->mirror->samplerLodBiasPtr(source_slot);
-          if (src0 && src1 && src2) {
-            dst[entry.compact_base + dst_local] = *src0;
+          const auto payload = slot_descriptor->mirror->samplerSlotPayload(
+              source_slot, slot_descriptor->slot_version);
+          if (payload) {
+            dst[entry.compact_base + dst_local] = payload->handle;
             dst[dxmt::kBindlessMirrorCapacity + entry.compact_base + dst_local] =
-                *src1;
+                payload->cube_handle;
             dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 +
-                entry.compact_base + dst_local] = *src2;
+                entry.compact_base + dst_local] = payload->lod_bias;
           }
         } else if (entry.texture && window->texture.mapped) {
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-          auto *src0 = slot_descriptor->mirror->textureHandlePtr(source_slot);
-          auto *src1 =
-              slot_descriptor->mirror->textureMetadataPtr(source_slot);
-          if (src0 && src1) {
+          const auto payload = slot_descriptor->mirror->textureSlotPayload(
+              source_slot, slot_descriptor->slot_version);
+          if (payload) {
             for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
               const uint64_t pair_base =
                   uint64_t(pair) * dxmt::kMirrorTextureQwords *
                   dxmt::kBindlessMirrorCapacity;
-              dst[pair_base + entry.compact_base + dst_local] = *src0;
+              dst[pair_base + entry.compact_base + dst_local] =
+                  payload->handle;
               dst[pair_base + dxmt::kBindlessMirrorCapacity +
-                  entry.compact_base + dst_local] = *src1;
+                  entry.compact_base + dst_local] = payload->metadata;
             }
           }
         }
@@ -16347,7 +16495,7 @@ private:
       auto *heap = dynamic_cast<DescriptorHeap *>(table.owning_heap.ptr());
       if (!heap)
         return;
-      const auto *descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+      const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           heap, table.base_descriptor, range_offset, descriptor_index,
           descriptor_count, table.heap_type);
       if (!descriptor)
@@ -16700,9 +16848,11 @@ private:
   void ReleaseCompiledDirectAccessListAfterSubmit(
       const CompiledDirectAccessList &list) {
     auto &queue = device_->GetDXMTDevice().queue();
+    const auto sequence = queue.CurrentSeqId();
     for (const auto &allocation : list.buffer_allocations) {
       if (allocation)
-        queue.RemovePersistentResidencyAfterCompletion(allocation->buffer());
+        queue.RemovePersistentResidencyAfterCompletion(allocation->buffer(),
+                                                        sequence);
     }
   }
 
@@ -16757,6 +16907,9 @@ private:
              " actual=", argbuf_offset - argbuf_base);
       }
     }
+
+    if (enc.argumentBufferOverflowed())
+      return;
 
     auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
@@ -17145,8 +17298,17 @@ private:
 
   static uint64_t AllocateArgumentBuffer(uint64_t &cursor, uint64_t size) {
     const auto alignment = 32ull;
+    if (cursor > UINT64_MAX - (alignment - 1)) {
+      cursor = UINT64_MAX;
+      return UINT64_MAX;
+    }
     const auto aligned = (cursor + alignment - 1) & ~(alignment - 1);
-    cursor = aligned + std::max<uint64_t>(size, 8);
+    const auto allocation_size = std::max<uint64_t>(size, 8);
+    if (allocation_size > UINT64_MAX - aligned) {
+      cursor = UINT64_MAX;
+      return UINT64_MAX;
+    }
+    cursor = aligned + allocation_size;
     return aligned;
   }
 
@@ -17354,18 +17516,26 @@ private:
   }
 
   static uint64_t AlignArgumentBufferSize(uint64_t size) {
+    if (size > UINT64_MAX - 31ull)
+      return UINT64_MAX;
     return (size + 31ull) & ~31ull;
+  }
+
+  static uint64_t AdvanceArgumentBufferEstimate(uint64_t cursor,
+                                                uint64_t size) {
+    AllocateArgumentBuffer(cursor, size);
+    return cursor;
   }
 
   static uint64_t EstimateShaderArgumentBufferSize(
       const PipelineDxilShader &shader) {
     uint64_t size = 0;
     if (shader.reflection().NumConstantBuffers)
-      size = AlignArgumentBufferSize(size) +
-             (uint64_t(shader.reflection().NumConstantBuffers) << 3);
+      size = AdvanceArgumentBufferEstimate(
+          size, uint64_t(shader.reflection().NumConstantBuffers) << 3);
     if (shader.reflection().NumArguments)
-      size = AlignArgumentBufferSize(size) +
-             (uint64_t(shader.reflection().ArgumentTableQwords) << 3);
+      size = AdvanceArgumentBufferEstimate(
+          size, uint64_t(shader.reflection().ArgumentTableQwords) << 3);
     return AlignArgumentBufferSize(size);
   }
 
@@ -17380,8 +17550,8 @@ private:
           slot_mask |= 1u << element.InputSlot;
       }
       if (slot_mask)
-        size = AlignArgumentBufferSize(size) +
-               uint64_t(__builtin_popcount(slot_mask)) * 16u;
+        size = AdvanceArgumentBufferEstimate(
+            size, uint64_t(__builtin_popcount(slot_mask)) * 16u);
     }
     const bool native = pipeline.GetShaderAbiVersion() ==
                         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
@@ -17394,8 +17564,9 @@ private:
           (use_geometry && shader.stage == PipelineShaderStage::Geometry)) {
         if (native)
           continue;
-        size = AlignArgumentBufferSize(size) +
-               EstimateShaderArgumentBufferSize(shader);
+        const auto shader_size = EstimateShaderArgumentBufferSize(shader);
+        if (shader_size)
+          size = AdvanceArgumentBufferEstimate(size, shader_size);
       }
     }
     return AlignArgumentBufferSize(size);
@@ -17414,8 +17585,8 @@ private:
     uint64_t size = 0;
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Compute)
-        size = AlignArgumentBufferSize(size) +
-               EstimateShaderArgumentBufferSize(shader);
+        if (const auto shader_size = EstimateShaderArgumentBufferSize(shader))
+          size = AdvanceArgumentBufferEstimate(size, shader_size);
     }
     return AlignArgumentBufferSize(size);
   }
@@ -18105,7 +18276,7 @@ private:
                   : range.descriptor_count;
           if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
             for (UINT i = 0; i < count; i++) {
-              auto *descriptor = GetBoundDescriptorRecordInRange(
+              auto descriptor = GetBoundDescriptorRecordInRange(
                   state, base, range_offset, i, count,
                   D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
               if (!descriptor)
@@ -18481,7 +18652,7 @@ private:
     CompiledPacketBindingState compiled_binding_state = {};
     CompiledDirectAccessList compiled_direct_access;
     uint64_t binding_generation = 0;
-    uint64_t descriptor_content_generation = 0;
+    dxmt::DescriptorContentRevision descriptor_content_revision = {};
     uint64_t binding_content_fingerprint = 0;
     uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
     uint64_t pixel_shader_demote_msaa_srv_mask_hi = 0;
@@ -18656,8 +18827,8 @@ private:
       generation_hit =
           binding_cache.valid &&
           binding_cache.graphics_generation == packet.binding_generation &&
-          binding_cache.descriptor_content_generation ==
-              packet.descriptor_content_generation &&
+          binding_cache.descriptor_content_revision ==
+              packet.descriptor_content_revision &&
           binding_cache.content_fingerprint ==
               packet.binding_content_fingerprint;
       fingerprint_hit =
@@ -18727,8 +18898,8 @@ private:
     packet.bindless_diag = bindless_diag;
     if (!generation_hit) {
       binding_cache.graphics_generation = packet.binding_generation;
-      binding_cache.descriptor_content_generation =
-          packet.descriptor_content_generation;
+      binding_cache.descriptor_content_revision =
+          packet.descriptor_content_revision;
       binding_cache.content_fingerprint = packet.binding_content_fingerprint;
       binding_cache.valid = true;
     }
@@ -18782,6 +18953,8 @@ private:
         &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
 
     EncodeReplayDrawCommonState(enc, common, argbuf_offset);
+    if (enc.argumentBufferOverflowed())
+      return;
 
     Rc<VisibilityResultQuery> active_visibility_query;
     {
@@ -18831,6 +19004,8 @@ private:
         auto *draw_argument =
             enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
                 draw_arguments_offset);
+        if (!draw_argument)
+          return;
         draw_argument->StartVertex = packet.vertex_start;
         draw_argument->VertexCount = packet.vertex_count;
         draw_argument->InstanceCount = packet.instance_count;
@@ -18854,6 +19029,8 @@ private:
         auto *draw_argument =
             enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
                 draw_arguments_offset);
+        if (!draw_argument)
+          return;
         draw_argument->StartVertex = packet.vertex_start;
         draw_argument->VertexCount = packet.vertex_count;
         draw_argument->InstanceCount = packet.instance_count;
@@ -18934,6 +19111,8 @@ private:
     }
 
     EncodeReplayDrawCommonState(enc, common, argbuf_offset);
+    if (enc.argumentBufferOverflowed())
+      return;
 
     Rc<VisibilityResultQuery> active_visibility_query;
     {
@@ -18983,6 +19162,8 @@ private:
         auto *draw_argument =
             enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
                 draw_arguments_offset);
+        if (!draw_argument)
+          return;
         draw_argument->BaseVertex = packet.base_vertex;
         draw_argument->IndexCount = packet.index_count;
         draw_argument->StartIndex = packet.start_index;
@@ -19009,6 +19190,8 @@ private:
         auto *draw_argument =
             enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
                 draw_arguments_offset);
+        if (!draw_argument)
+          return;
         draw_argument->BaseVertex = packet.base_vertex;
         draw_argument->IndexCount = packet.index_count;
         draw_argument->StartIndex = packet.start_index;
@@ -19147,8 +19330,8 @@ private:
       return;
     const auto rb_desc0 = rb_draw ? clock::now() : clock::time_point{};
     RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
-    const auto descriptor_content_generation =
-        GetDescriptorContentGeneration();
+    const auto descriptor_content_revision =
+        GetDescriptorContentRevision();
     std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
@@ -19157,7 +19340,7 @@ private:
       StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
       binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
           chunk, state, *pipeline, attachments,
-          descriptor_content_generation);
+          descriptor_content_revision);
     }
     if (rb_draw)
       perDrawSubTimers().desc +=
@@ -19189,8 +19372,8 @@ private:
     packet.common.pipeline = pipeline;
     packet.common.binding_snapshot = std::move(binding_snapshot);
     packet.common.binding_generation = state.graphics_binding_generation;
-    packet.common.descriptor_content_generation =
-        descriptor_content_generation;
+    packet.common.descriptor_content_revision =
+        descriptor_content_revision;
     packet.common.pixel_shader_demote_msaa_srv_mask_lo =
         demote_msaa_srv_mask_lo;
     packet.common.pixel_shader_demote_msaa_srv_mask_hi =
@@ -19362,8 +19545,8 @@ private:
       return;
     const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
     RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, index_resource);
-    const auto descriptor_content_generation =
-        GetDescriptorContentGeneration();
+    const auto descriptor_content_revision =
+        GetDescriptorContentRevision();
     std::shared_ptr<const GraphicsBindingSnapshot> binding_snapshot;
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
@@ -19372,7 +19555,7 @@ private:
       StallScope _s(StallDiagEnabled(), &stallProbe().bindSnapUs);
       binding_snapshot = GetOrCaptureGraphicsBindingSnapshot(
           chunk, state, *pipeline, attachments,
-          descriptor_content_generation);
+          descriptor_content_revision);
     }
     if (rb_draw)
       perDrawSubTimers().desc +=
@@ -19405,8 +19588,8 @@ private:
     packet.common.pipeline = pipeline;
     packet.common.binding_snapshot = std::move(binding_snapshot);
     packet.common.binding_generation = state.graphics_binding_generation;
-    packet.common.descriptor_content_generation =
-        descriptor_content_generation;
+    packet.common.descriptor_content_revision =
+        descriptor_content_revision;
     packet.common.pixel_shader_demote_msaa_srv_mask_lo =
         demote_msaa_srv_mask_lo;
     packet.common.pixel_shader_demote_msaa_srv_mask_hi =
@@ -19598,10 +19781,12 @@ private:
   }
 
   static bool IsFullResolveRegion(const ResolveSubresourceRecord &record,
-                                  uint64_t width, uint64_t height) {
+                                  uint64_t src_width, uint64_t src_height,
+                                  uint64_t dst_width, uint64_t dst_height) {
     if (record.dst_x || record.dst_y || record.src_rect)
       return false;
-    return width && height;
+    return src_width && src_height && src_width == dst_width &&
+           src_height == dst_height;
   }
 
   static bool NormalizeResolveRegion(const ResolveSubresourceRecord &record,
@@ -19721,12 +19906,13 @@ private:
     auto src_view = CreateResolveView(*src, record.src_subresource, format,
                                       WMTTextureUsageRenderTarget);
     auto dst_view = CreateResolveView(*dst, record.dst_subresource, format,
-                                      WMTTextureUsageShaderWrite);
+                                      WMTTextureUsageRenderTarget);
     Rc<Texture> src_texture = src->GetTexture();
     Rc<Texture> dst_texture = dst->GetTexture();
     const bool fast_path =
         *mode == ResolveTextureMode::Average &&
-        IsFullResolveRegion(record, src_width, src_height);
+        IsFullResolveRegion(record, src_width, src_height, dst_width,
+                            dst_height);
     chunk->emitcc([src_texture = std::move(src_texture),
                    dst_texture = std::move(dst_texture), src_view, dst_view,
                    mode = *mode, src_rect, dst_origin, resolve_size,
@@ -20548,7 +20734,7 @@ private:
     dxmt::FrameStatistics *perf_stats = nullptr;
     uint64_t frame_id = ~0ull;
     bool wait_callback_armed = false;
-    bool wait_completed = false;
+    std::shared_ptr<std::atomic_bool> wait_completion;
 
     PendingOperation() = default;
     PendingOperation(const PendingOperation &) = delete;
@@ -20564,7 +20750,7 @@ private:
           perf_stats(other.perf_stats),
           frame_id(other.frame_id),
           wait_callback_armed(other.wait_callback_armed),
-          wait_completed(other.wait_completed) {
+          wait_completion(std::move(other.wait_completion)) {
       other.fence = nullptr;
     }
     PendingOperation &operator=(PendingOperation &&other) noexcept {
@@ -20580,7 +20766,7 @@ private:
         perf_stats = other.perf_stats;
         frame_id = other.frame_id;
         wait_callback_armed = other.wait_callback_armed;
-        wait_completed = other.wait_completed;
+        wait_completion = std::move(other.wait_completion);
         other.fence = nullptr;
       }
       return *this;
@@ -20630,7 +20816,7 @@ private:
     dxmt::perf::recordExecuteTime(
         perf_stats, dxmt::perf::ExecuteTimeBucket::Enqueue,
         clock::now() - t0);
-    pending_operations_cond_.notify_one();
+    submission_wake_state_->condition.notify_one();
   }
 
   size_t PendingOperationCountForDiag() {
@@ -20644,22 +20830,53 @@ private:
       return;
 
     std::unique_lock lock(mutex_);
-    pending_operations_cond_.wait(lock, [this]() {
+    submission_wake_state_->condition.wait(lock, [this]() {
       return pending_operations_.empty() && !submission_worker_active_;
     });
   }
 
   void StopSubmissionWorker() {
+    std::deque<PendingOperation> cancelled;
     {
       std::lock_guard lock(mutex_);
       if (!submission_worker_stopping_) {
+        // Operations before the first unresolved queue wait may still be
+        // drained. The wait and everything ordered after it cannot make
+        // progress during destruction, so cancel that suffix and put Stop at
+        // the now-reachable tail.
+        auto first_wait = std::find_if(
+            pending_operations_.begin(), pending_operations_.end(),
+            [](const PendingOperation &operation) {
+              if (operation.type != PendingOperationType::Wait)
+                return false;
+              if ((operation.wait_completion &&
+                   operation.wait_completion->load(
+                       std::memory_order_acquire)) ||
+                  operation.fence->GetCompletedValue() >= operation.value)
+                return false;
+              FenceGpuSignal signal = {};
+              return operation.fence->TryResolveGpuWait(operation.value,
+                                                        signal) !=
+                     FenceGpuWaitStatus::Resolved;
+            });
+        while (first_wait != pending_operations_.end()) {
+          cancelled.push_back(std::move(*first_wait));
+          first_wait = pending_operations_.erase(first_wait);
+        }
         PendingOperation stop;
         stop.type = PendingOperationType::Stop;
         pending_operations_.push_back(std::move(stop));
         submission_worker_stopping_ = true;
+        submission_worker_waiting_for_wait_ = false;
       }
     }
-    pending_operations_cond_.notify_all();
+    for (auto &operation : cancelled) {
+      for (auto &use : operation.allocator_uses) {
+        if (use.allocator)
+          use.allocator->CompleteCommandListSubmission(use.serial);
+      }
+    }
+    submission_wake_state_->condition.notify_all();
     if (submission_worker_.joinable()) {
       if (dxmt::this_thread::get_id() ==
           submission_worker_thread_id_.load(std::memory_order_relaxed))
@@ -20677,9 +20894,15 @@ private:
     for (;;) {
       {
         std::unique_lock lock(mutex_);
-        pending_operations_cond_.wait(lock, [this]() {
-          return !pending_operations_.empty() &&
-                 !submission_worker_waiting_for_wait_;
+        submission_wake_state_->condition.wait(lock, [this]() {
+          if (pending_operations_.empty())
+            return false;
+          if (!submission_worker_waiting_for_wait_)
+            return true;
+          const auto &front = pending_operations_.front();
+          return front.type == PendingOperationType::Wait &&
+                 front.wait_completion &&
+                 front.wait_completion->load(std::memory_order_acquire);
         });
         submission_worker_active_ = true;
       }
@@ -20692,7 +20915,7 @@ private:
         submission_worker_active_ = false;
         should_exit = submission_worker_stopping_ && pending_operations_.empty();
       }
-      pending_operations_cond_.notify_all();
+      submission_wake_state_->condition.notify_all();
       if (should_exit)
         return;
     }
@@ -20707,6 +20930,7 @@ private:
       bool has_operation = false;
       Fence *wait_fence = nullptr;
       UINT64 wait_value = 0;
+      std::shared_ptr<std::atomic_bool> wait_completion;
       bool arm_wait_callback = false;
       bool resolved_gpu_wait = false;
       FenceGpuSignal gpu_wait_signal = {};
@@ -20721,8 +20945,11 @@ private:
 
         auto &front = pending_operations_.front();
         operation_perf_stats = front.perf_stats;
+        const bool callback_completed =
+            front.wait_completion &&
+            front.wait_completion->load(std::memory_order_acquire);
         if (front.type == PendingOperationType::Wait &&
-            !front.wait_completed &&
+            !callback_completed &&
             front.fence->GetCompletedValue() < front.value) {
           gpu_wait_status =
               front.fence->TryResolveGpuWait(front.value, gpu_wait_signal);
@@ -20746,9 +20973,15 @@ private:
             }
             if (!front.wait_callback_armed) {
               front.wait_callback_armed = true;
+              front.wait_completion =
+                  std::make_shared<std::atomic_bool>(false);
+              wait_completion = front.wait_completion;
               wait_fence = front.fence;
+              // StopSubmissionWorker may erase the queued Wait as soon as we
+              // drop mutex_. Keep the fence alive until callback registration
+              // finishes; the callback itself runs from fence-owned storage.
+              wait_fence->AddRefPrivate();
               wait_value = front.value;
-              AddRefPrivate();
               arm_wait_callback = true;
             }
             submission_worker_waiting_for_wait_ = true;
@@ -20768,22 +21001,14 @@ private:
 
       if (arm_wait_callback) {
         const auto arm_begin = clock::now();
-        auto callback = [this, wait_fence, wait_value]() {
-          {
-            std::lock_guard lock(mutex_);
-            if (!pending_operations_.empty()) {
-              auto &front = pending_operations_.front();
-              if (front.type == PendingOperationType::Wait &&
-                  front.fence == wait_fence && front.value == wait_value) {
-                front.wait_completed = true;
-                submission_worker_waiting_for_wait_ = false;
-              }
-            }
-          }
-          pending_operations_cond_.notify_one();
-          ReleasePrivate();
+        auto wake_state = submission_wake_state_;
+        auto callback = [wake_state = std::move(wake_state),
+                         wait_completion = std::move(wait_completion)]() {
+          wait_completion->store(true, std::memory_order_release);
+          wake_state->condition.notify_one();
         };
         wait_fence->AddCompletionCallback(wait_value, std::move(callback));
+        wait_fence->ReleasePrivate();
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::WaitArm,
             clock::now() - arm_begin);
@@ -21208,16 +21433,24 @@ private:
   std::mutex native_stage_plan_cache_mutex_;
   std::deque<PendingOperation> pending_operations_;
   dxmt::mutex mutex_;
-  dxmt::condition_variable pending_operations_cond_;
   bool submission_worker_active_ = false;
   bool submission_worker_waiting_for_wait_ = false;
   bool submission_worker_stopping_ = false;
   std::atomic<uint32_t> submission_worker_thread_id_{0};
+  std::shared_ptr<SubmissionWakeState> submission_wake_state_;
   dxmt::thread submission_worker_;
   std::string name_;
 };
 
 } // namespace
+
+DxmtQueueSubmissionGuard
+AcquireDxmtQueueSubmissionGuard(IMTLD3D12Device *device) {
+  auto states = GetDeviceResourceStates(device);
+  return DxmtQueueSubmissionGuard{
+      std::static_pointer_cast<void>(states),
+      std::unique_lock<std::mutex>(states->dxmt_queue_mutex)};
+}
 
 HRESULT
 CreateCommandQueue(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC *desc,

@@ -330,33 +330,6 @@ IsRenderPassPreserveOrNoAccess(D3D12_RENDER_PASS_ENDING_ACCESS_TYPE type) {
          type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
 }
 
-static UINT
-RenderPassMipLevel(const D3D12_RESOURCE_DESC &desc, UINT subresource) {
-  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
-  return mip_levels ? subresource % mip_levels : 0;
-}
-
-static bool
-IsFullSubresourceRect(ID3D12Resource *resource, UINT subresource,
-                      const D3D12_RECT &rect) {
-  if (!resource)
-    return false;
-
-  auto *d3d12_resource = dynamic_cast<Resource *>(resource);
-  if (!d3d12_resource)
-    return false;
-
-  const auto &desc = d3d12_resource->GetResourceDesc();
-  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-    return false;
-
-  const UINT mip = RenderPassMipLevel(desc, subresource);
-  const LONG width = static_cast<LONG>(std::max<UINT64>(1, desc.Width >> mip));
-  const LONG height =
-      static_cast<LONG>(std::max<UINT64>(1, desc.Height >> mip));
-  return rect.left == 0 && rect.top == 0 && rect.right == width &&
-         rect.bottom == height;
-}
 #endif
 
 StoredTextureCopyLocation
@@ -766,9 +739,15 @@ UpdateCompiledCommandBuildState(CompiledCommandBuildState &state,
                  std::get_if<RootSignatureRecord>(&payload)) {
     if (record->compute) {
       state.compute_root_signature = record->root_signature;
+      state.compute_root_tables.clear();
+      state.compute_root_constants.clear();
+      state.compute_root_descriptors.clear();
       state.compute_pipeline_metadata.reset();
     } else {
       state.graphics_root_signature = record->root_signature;
+      state.graphics_root_tables.clear();
+      state.graphics_root_constants.clear();
+      state.graphics_root_descriptors.clear();
       state.graphics_pipeline_metadata.reset();
     }
   } else if (const auto *record =
@@ -2202,11 +2181,13 @@ public:
   }
   void STDMETHODCALLTYPE SOSetTargets(UINT start_slot, UINT view_count,
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) override {
-    if (view_count && views) {
-      // TODO(d3d12): lower stream-output buffer bindings into Metal transform
-      // feedback or an emulated write path.
-      WARN("D3D12GraphicsCommandList: stream output targets are unsupported");
-    }
+    if (!view_count)
+      return;
+
+    // StreamOutputTier is reported as NOT_SUPPORTED. Do not accept a command
+    // that would otherwise be silently dropped and leave stale output data.
+    recording_error_ = E_NOTIMPL;
+    WARN("D3D12GraphicsCommandList: stream output targets are unsupported");
   }
   void STDMETHODCALLTYPE OMSetRenderTargets(UINT render_target_descriptor_count,
                                             const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors,
@@ -2219,17 +2200,30 @@ public:
     RenderTargetsRecord record = {};
     if (render_target_descriptors && render_target_descriptor_count) {
       record.render_targets.reserve(render_target_descriptor_count);
-      auto *base = GetDescriptorRecordFromCpuHandle(render_target_descriptors[0]);
-      for (UINT i = 0; i < render_target_descriptor_count; i++) {
-        auto *descriptor = single_descriptor_handle
-                               ? base + i
-                               : GetDescriptorRecordFromCpuHandle(render_target_descriptors[i]);
-        if (descriptor)
-          record.render_targets.push_back(*descriptor);
+      if (single_descriptor_handle) {
+        auto base = GetDescriptorRecordRangeFromCpuHandle(
+            render_target_descriptors[0], D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            render_target_descriptor_count, "OMSetRenderTargets");
+        if (base) {
+          for (UINT i = 0; i < render_target_descriptor_count; i++)
+            record.render_targets.push_back(base.get()[i]);
+        }
+      } else {
+        for (UINT i = 0; i < render_target_descriptor_count; i++) {
+          auto descriptor =
+              GetDescriptorRecordFromCpuHandle(
+                  render_target_descriptors[i],
+                  D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+          if (descriptor)
+            record.render_targets.push_back(*descriptor);
+        }
       }
     }
     if (depth_stencil_descriptor) {
-      if (auto *descriptor = GetDescriptorRecordFromCpuHandle(*depth_stencil_descriptor))
+      if (auto descriptor =
+              GetDescriptorRecordFromCpuHandle(
+                  *depth_stencil_descriptor,
+                  D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
         record.depth_stencil = *descriptor;
     }
     AddRecord(std::move(record));
@@ -2237,7 +2231,8 @@ public:
   void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags,
                                                FLOAT depth, UINT8 stencil, UINT rect_count,
                                                const D3D12_RECT *rects) override {
-    auto *descriptor = GetDescriptorRecordFromCpuHandle(dsv);
+    auto descriptor = GetDescriptorRecordFromCpuHandle(
+        dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     if (!descriptor)
       return;
     g_current_command_record_d3d_sequence =
@@ -2254,7 +2249,8 @@ public:
   }
   void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4],
                                                UINT rect_count, const D3D12_RECT *rects) override {
-    auto *descriptor = GetDescriptorRecordFromCpuHandle(rtv);
+    auto descriptor = GetDescriptorRecordFromCpuHandle(
+        rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     if (!descriptor)
       return;
     g_current_command_record_d3d_sequence =
@@ -2274,7 +2270,7 @@ public:
                                                       UINT rect_count, const D3D12_RECT *rects) override {
     if (!resource || !values)
       return;
-    auto *descriptor =
+    auto descriptor =
         GetDescriptorRecordFromGpuHandle(gpu_handle,
                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (!descriptor)
@@ -2302,7 +2298,7 @@ public:
                                                        UINT rect_count, const D3D12_RECT *rects) override {
     if (!resource || !values)
       return;
-    auto *descriptor =
+    auto descriptor =
         GetDescriptorRecordFromGpuHandle(gpu_handle,
                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (!descriptor)
@@ -2369,8 +2365,8 @@ public:
             this, heap, static_cast<uint32_t>(type), start_index, query_count,
             dst_buffer, aligned_dst_buffer_offset);
     AddRecord(ResolveQueryDataRecord{
-        this, heap, type, start_index, query_count, dst_buffer,
-        aligned_dst_buffer_offset});
+        reinterpret_cast<uintptr_t>(this), heap, type, start_index,
+        query_count, dst_buffer, aligned_dst_buffer_offset});
   }
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *buffer, UINT64 aligned_buffer_offset,
                                         D3D12_PREDICATION_OP operation) override {
@@ -2404,8 +2400,11 @@ public:
       UINT dependent_resource_count,
       ID3D12Resource *const *dependent_resources,
       const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
-    RecordCopyBufferRegion("AtomicCopyBufferUINT", dst_buffer, dst_offset,
-                           src_buffer, src_offset, sizeof(UINT));
+    // A normal blit copy cannot provide AtomicCopy's dependent-range ordering
+    // and atomic publication contract. Fail Close explicitly rather than
+    // recording a semantically different CopyBufferRegion.
+    recording_error_ = E_NOTIMPL;
+    WARN("D3D12GraphicsCommandList: AtomicCopyBufferUINT is unsupported");
   }
 
   void STDMETHODCALLTYPE AtomicCopyBufferUINT64(
@@ -2414,15 +2413,20 @@ public:
       UINT dependent_resource_count,
       ID3D12Resource *const *dependent_resources,
       const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
-    RecordCopyBufferRegion("AtomicCopyBufferUINT64", dst_buffer, dst_offset,
-                           src_buffer, src_offset, sizeof(UINT64));
+    recording_error_ = E_NOTIMPL;
+    WARN("D3D12GraphicsCommandList: AtomicCopyBufferUINT64 is unsupported");
   }
 
   void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
     depth_bounds_min_ = min;
     depth_bounds_max_ = max;
-    WARN("D3D12GraphicsCommandList: depth bounds state recorded but not "
-         "applied by Metal");
+    if (min == 0.0f && max == 1.0f)
+      return;
+
+    // DepthBoundsTestSupported is reported as FALSE. Default bounds are a
+    // harmless no-op; non-default bounds must not be silently ignored.
+    recording_error_ = E_NOTIMPL;
+    WARN("D3D12GraphicsCommandList: non-default depth bounds are unsupported");
   }
 
   void STDMETHODCALLTYPE SetSamplePositions(
@@ -2440,6 +2444,7 @@ public:
       UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx,
       D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
     if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) {
+      recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion decompress mode is unsupported");
       return;
     }
@@ -2509,6 +2514,7 @@ public:
       // flattening them into ordinary target binds.
       WARN("D3D12GraphicsCommandList: suspended/resumed render passes are "
            "unsupported");
+      recording_error_ = E_NOTIMPL;
       return;
     }
 
@@ -2539,14 +2545,18 @@ public:
     if (render_targets && render_targets_count) {
       record.render_targets.reserve(render_targets_count);
       for (UINT i = 0; i < render_targets_count; i++) {
-        if (auto *descriptor =
-                GetDescriptorRecordFromCpuHandle(render_targets[i].cpuDescriptor))
+        if (auto descriptor =
+                GetDescriptorRecordFromCpuHandle(
+                    render_targets[i].cpuDescriptor,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV))
           record.render_targets.push_back(*descriptor);
       }
     }
     if (depth_stencil) {
-      if (auto *descriptor =
-              GetDescriptorRecordFromCpuHandle(depth_stencil->cpuDescriptor))
+      if (auto descriptor =
+              GetDescriptorRecordFromCpuHandle(
+                  depth_stencil->cpuDescriptor,
+                  D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
         record.depth_stencil = *descriptor;
     }
     AddRecord(std::move(record));
@@ -2567,8 +2577,11 @@ public:
       ResolveSubresourceRecord record = {};
       record.dst = resolve.dst;
       record.dst_subresource = resolve.dst_subresource;
+      record.dst_x = resolve.dst_x;
+      record.dst_y = resolve.dst_y;
       record.src = resolve.src;
       record.src_subresource = resolve.src_subresource;
+      record.src_rect = resolve.src_rect;
       record.format = resolve.format;
       record.mode = resolve.mode;
       AddRecord(std::move(record));
@@ -2972,7 +2985,9 @@ private:
 #ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
   void AddRenderPassRenderTargetAccess(
       const D3D12_RENDER_PASS_RENDER_TARGET_DESC &render_target) {
-    auto *descriptor = GetDescriptorRecordFromCpuHandle(render_target.cpuDescriptor);
+    auto descriptor =
+        GetDescriptorRecordFromCpuHandle(render_target.cpuDescriptor,
+                                         D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     if (!descriptor)
       return;
 
@@ -3002,7 +3017,9 @@ private:
 
   void AddRenderPassDepthStencilAccess(
       const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC &depth_stencil) {
-    auto *descriptor = GetDescriptorRecordFromCpuHandle(depth_stencil.cpuDescriptor);
+    auto descriptor =
+        GetDescriptorRecordFromCpuHandle(depth_stencil.cpuDescriptor,
+                                         D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     if (!descriptor)
       return;
 
@@ -3082,27 +3099,18 @@ private:
         !resolve.SubresourceCount || !resolve.pSubresourceParameters)
       return;
 
-    if (resolve.ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS ||
-        !resolve.PreserveResolveSource) {
-      WARN("D3D12GraphicsCommandList: render pass decompress resolve or source discard is unsupported");
+    if (resolve.ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS) {
+      recording_error_ = E_NOTIMPL;
+      WARN("D3D12GraphicsCommandList: render pass decompress resolve is unsupported");
       return;
     }
 
     for (UINT i = 0; i < resolve.SubresourceCount; i++) {
       const auto &subresource = resolve.pSubresourceParameters[i];
-      if (subresource.DstX || subresource.DstY ||
-          !IsFullSubresourceRect(resolve.pSrcResource,
-                                 subresource.SrcSubresource,
-                                 subresource.SrcRect)) {
-        // TODO(d3d12): lower partial render-pass resolves once
-        // ResolveSubresourceRegion has real region support.
-        WARN("D3D12GraphicsCommandList: partial render pass resolves are "
-             "unsupported");
-        continue;
-      }
       pending_render_pass_resolves_.push_back(PendingRenderPassResolve{
           resolve.pSrcResource, resolve.pDstResource,
           subresource.SrcSubresource, subresource.DstSubresource,
+          subresource.DstX, subresource.DstY, subresource.SrcRect,
           resolve.Format, resolve.ResolveMode});
     }
   }

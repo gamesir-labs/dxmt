@@ -7,6 +7,7 @@
 #include "util_string.hpp"
 
 #include <atomic>
+#include <mutex>
 
 namespace dxmt::d3d12 {
 namespace {
@@ -15,6 +16,17 @@ static bool
 ShouldLogExternalCpuHeapDiag() {
   static std::atomic<uint32_t> count = 0;
   return count.fetch_add(1, std::memory_order_relaxed) < 8;
+}
+
+static UINT64
+GetBackendHeapSize(const D3D12_HEAP_DESC &desc) {
+  const UINT64 alignment = desc.Alignment
+                               ? desc.Alignment
+                               : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  if (!alignment || (alignment & (alignment - 1)) ||
+      desc.SizeInBytes > UINT64_MAX - (alignment - 1))
+    return 0;
+  return (desc.SizeInBytes + alignment - 1) & ~(alignment - 1);
 }
 
 class HeapImpl final : public ComObjectWithInitialRef<ID3D12Heap>,
@@ -26,6 +38,7 @@ public:
         cpu_visible_(d3d12::IsCpuVisibleHeap(desc.Properties)) {
     if (!desc_.Alignment)
       desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    backend_size_ = GetBackendHeapSize(desc_);
     if (!desc_.Properties.CreationNodeMask)
       desc_.Properties.CreationNodeMask = 1;
     if (!desc_.Properties.VisibleNodeMask)
@@ -115,14 +128,16 @@ public:
   }
 
   void EnsureBufferAllocation() const {
+    std::lock_guard lock(allocation_mutex_);
     if (!allocation_) {
-      buffer_ = new dxmt::Buffer(desc_.SizeInBytes,
+      buffer_ = new dxmt::Buffer(backend_size_,
                                  device_->GetDXMTDevice().device());
       if (external_address_) {
         if (ShouldLogExternalCpuHeapDiag()) {
           WARN("D3D12Heap: OpenExistingHeapFromAddress using external CPU backing"
            " address=", external_address_,
            " size=", desc_.SizeInBytes,
+           " backendSize=", backend_size_,
            " flags=", desc_.Flags);
         }
         allocation_ = buffer_->allocateExternalCpu(
@@ -135,21 +150,26 @@ public:
     }
   }
 
-  WMT::Heap GetPlacementHeap() override {
+  WMT::Reference<WMT::Heap> GetPlacementHeap() override {
+    std::lock_guard lock(allocation_mutex_);
     if (placement_heap_)
       return placement_heap_;
-    if (heap_type_ != D3D12_HEAP_TYPE_DEFAULT || cpu_visible_)
+    if (external_address_)
       return {};
 
     WMTPlacementHeapInfo info = {};
-    info.size = desc_.SizeInBytes;
-    info.options = WMTResourceStorageModePrivate |
-                   WMTResourceHazardTrackingModeUntracked;
+    info.size = backend_size_;
+    info.options = WMTResourceHazardTrackingModeUntracked;
+    if (heap_type_ == D3D12_HEAP_TYPE_DEFAULT)
+      info.options |= WMTResourceStorageModePrivate;
+    else if (heap_type_ == D3D12_HEAP_TYPE_UPLOAD)
+      info.options |= WMTResourceOptionCPUCacheModeWriteCombined;
     placement_heap_ =
         device_->GetDXMTDevice().device().newPlacementHeap(info);
     if (!placement_heap_) {
       WARN("D3D12Heap: TODO failed to create Metal4 placement heap"
            " size=", desc_.SizeInBytes,
+           " backendSize=", backend_size_,
            " flags=", desc_.Flags);
     }
     return placement_heap_;
@@ -161,9 +181,11 @@ private:
   D3D12_HEAP_DESC desc_ = {};
   D3D12_HEAP_TYPE heap_type_ = D3D12_HEAP_TYPE_DEFAULT;
   bool cpu_visible_ = false;
+  UINT64 backend_size_ = 0;
   mutable Rc<dxmt::Buffer> buffer_;
   mutable Rc<dxmt::BufferAllocation> allocation_;
   WMT::Reference<WMT::Heap> placement_heap_;
+  mutable std::mutex allocation_mutex_;
   const void *external_address_ = nullptr;
   std::string name_;
 };

@@ -4,6 +4,7 @@
 #include "d3d12_device.hpp"
 #include "com/com_pointer.hpp"
 #include "rc/util_rc_ptr.hpp"
+#include "dxmt_descriptor_revision.hpp"
 #include <d3d12.h>
 #include <atomic>
 #include <cstddef>
@@ -50,6 +51,10 @@ struct DescriptorRecord {
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = {};
   UINT heap_index = 0;
   UINT heap_count = 0;
+  // Heap-local version assigned when a shader-visible slot write begins under
+  // the mirror lock. Queue-side snapshots carry it so an older record cannot
+  // satisfy a newer deferred mirror fill token.
+  dxmt::DescriptorSlotVersion slot_version = {};
   // Non-owning back-pointer to the owning heap's descriptor mirror (or nullptr
   // when the heap is not shader-visible / not a heap type consumed by shaders).
   // The heap owns the mirror and the
@@ -86,23 +91,69 @@ public:
    * write time.
    */
   virtual DescriptorHeapMirror *GetMirror() = 0;
+
+  // Descriptor handles are pointer-shaped tokens into heap-owned storage.
+  // Registry lookups must take a private heap reference before releasing the
+  // registry lock so concurrent application Release() cannot destroy the
+  // records or mirror while a D3D entry point is consuming the handle.
+  virtual void AcquireDescriptorRecordLease() = 0;
+  virtual void ReleaseDescriptorRecordLease() = 0;
+};
+
+/**
+ * Move-only lifetime lease for a descriptor record returned by the global
+ * CPU/GPU handle registry.
+ *
+ * The record pointer remains valid until this object is destroyed or reset.
+ * Callers should keep the lease in the narrowest scope that contains every
+ * record or mirror access and must not retain the raw pointer beyond it.
+ */
+class DescriptorRecordLease {
+public:
+  DescriptorRecordLease() = default;
+  DescriptorRecordLease(const DescriptorRecordLease &) = delete;
+  DescriptorRecordLease &operator=(const DescriptorRecordLease &) = delete;
+
+  DescriptorRecordLease(DescriptorRecordLease &&other) noexcept;
+  DescriptorRecordLease &operator=(DescriptorRecordLease &&other) noexcept;
+  ~DescriptorRecordLease();
+
+  static DescriptorRecordLease Acquire(DescriptorRecord *record,
+                                       DescriptorHeap *owner);
+
+  DescriptorRecord *get() const { return record_; }
+  DescriptorRecord *operator->() const { return record_; }
+  DescriptorRecord &operator*() const { return *record_; }
+  explicit operator bool() const { return record_ != nullptr; }
+  void reset();
+
+private:
+  DescriptorRecordLease(DescriptorRecord *record, DescriptorHeap *owner)
+      : record_(record), owner_(owner) {}
+
+  DescriptorRecord *record_ = nullptr;
+  DescriptorHeap *owner_ = nullptr;
 };
 
 Com<ID3D12DescriptorHeap>
 CreateDescriptorHeap(IMTLD3D12Device *device,
                      const D3D12_DESCRIPTOR_HEAP_DESC *desc);
 
-DescriptorRecord *GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle);
-DescriptorRecord *GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                   D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
-DescriptorRecord *GetDescriptorRecordRangeFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                        D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
-                                                        UINT descriptor_count,
-                                                        const char *context);
-const DescriptorRecord *GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
-                                                         D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
+DescriptorRecordLease
+GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+DescriptorRecordLease
+GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                 D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
+DescriptorRecordLease
+GetDescriptorRecordRangeFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                      D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
+                                      UINT descriptor_count,
+                                      const char *context);
+DescriptorRecordLease
+GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
+                                 D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
 
-void BumpDescriptorContentGeneration();
-uint64_t GetDescriptorContentGeneration();
+dxmt::DescriptorContentRevision BumpDescriptorContentRevision();
+dxmt::DescriptorContentRevision GetDescriptorContentRevision();
 
 } // namespace dxmt::d3d12

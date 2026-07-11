@@ -10,6 +10,20 @@ namespace dxmt::d3d12 {
 
 class QueryHeap;
 
+struct QueryResolveSnapshotEntry {
+  bool ended = false;
+  Rc<VisibilityResultQuery> visibility;
+  Rc<TimestampQuery> timestamp;
+};
+
+struct QueryResolveSnapshot {
+  D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_OCCLUSION;
+  std::vector<QueryResolveSnapshotEntry> entries;
+};
+
+bool ResolveQuerySnapshot(const QueryResolveSnapshot &snapshot,
+                          std::vector<uint8_t> &data);
+
 class QueryHeap {
 public:
   virtual ~QueryHeap() = default;
@@ -21,16 +35,11 @@ public:
                                                   UINT index) = 0;
   virtual Rc<TimestampQuery> EndTimestamp(D3D12_QUERY_TYPE type,
                                           UINT index) = 0;
-  virtual void MarkTimestampReady(D3D12_QUERY_TYPE type, UINT index) = 0;
-  virtual uint64_t TimestampSampleSequence(D3D12_QUERY_TYPE type,
-                                           UINT index) const = 0;
-  virtual uint64_t TimestampSampleIndex(D3D12_QUERY_TYPE type, UINT index) const = 0;
-  virtual Rc<TimestampQuery> TimestampQueryAt(D3D12_QUERY_TYPE type,
-                                              UINT index) const = 0;
   virtual bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) = 0;
   virtual bool EndStatistics(D3D12_QUERY_TYPE type, UINT index) = 0;
-  virtual bool Resolve(D3D12_QUERY_TYPE type, UINT start_index,
-                       UINT query_count, std::vector<uint8_t> &data) const = 0;
+  virtual bool CaptureResolve(D3D12_QUERY_TYPE type, UINT start_index,
+                              UINT query_count,
+                              QueryResolveSnapshot &snapshot) const = 0;
 };
 
 Com<ID3D12QueryHeap>

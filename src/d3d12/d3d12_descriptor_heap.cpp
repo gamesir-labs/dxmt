@@ -1,6 +1,8 @@
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_descriptor_mirror.hpp"
 
+#include "dxmt_lease_range_registry.hpp"
+
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
@@ -12,7 +14,37 @@
 namespace dxmt::d3d12 {
 namespace {
 
-std::atomic<uint64_t> g_descriptor_content_generation{1};
+dxmt::DescriptorRevisionClock g_descriptor_content_revision;
+
+dxmt::LeaseRangeRegistry<DescriptorRecord, DescriptorHeap>
+    g_descriptor_heap_ranges;
+
+bool RegisterDescriptorHeapRange(DescriptorRecord *records, UINT count,
+                                 DescriptorHeap *owner) {
+  if (g_descriptor_heap_ranges.Register(records, count, owner))
+    return true;
+  ERR("D3D12DescriptorHeap: failed to register descriptor handle range");
+  return false;
+}
+
+void UnregisterDescriptorHeapRange(DescriptorRecord *records,
+                                   DescriptorHeap *owner) {
+  g_descriptor_heap_ranges.Unregister(records, owner);
+}
+
+DescriptorRecordLease LookupDescriptorRecord(uintptr_t address) {
+  return g_descriptor_heap_ranges.Lookup(
+      address,
+      [](const DescriptorRecord *record) {
+        return record->magic == DescriptorRecord::kMagic;
+      },
+      [](DescriptorRecord *record, DescriptorHeap *owner) {
+        // The registry's shared lock remains held during Acquire. Its owner
+        // reference therefore cannot be released by final public Release
+        // until this private lease has been retained.
+        return DescriptorRecordLease::Acquire(record, owner);
+      });
+}
 
 bool DescriptorHeapSupportsMirror(const D3D12_DESCRIPTOR_HEAP_DESC &desc) {
   if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
@@ -53,9 +85,23 @@ public:
       for (UINT i = 0; i < desc.NumDescriptors; i++)
         records_[i].mirror = mirror_.get();
     }
+    // Keep one private reference on behalf of the global handle registry. The
+    // final public Release unregisters the range before dropping this owner,
+    // making it safe for a concurrent lookup to take its own private lease.
+    AddRefPrivate();
+    if (RegisterDescriptorHeapRange(records_.data(), desc.NumDescriptors,
+                                    this)) {
+      registry_registered_.store(true, std::memory_order_release);
+    } else {
+      ReleasePrivate();
+    }
   }
 
   ~DescriptorHeapImpl() {
+    // Normally final public Release has already removed the range. Keep this
+    // defensive erase owner-qualified so an address-reused heap can never be
+    // removed by a stale destructor.
+    UnregisterDescriptorHeapRange(records_.data(), this);
     if (!mirror_)
       return;
     auto &queue = device_->GetDXMTDevice().queue();
@@ -65,12 +111,30 @@ public:
       if (target.secondary_allocation)
         queue.RemovePersistentResidencyAfterCompletion(
             target.secondary_allocation);
+      if (target.mirror_allocation)
+        queue.RemovePersistentResidencyAfterCompletion(
+            target.mirror_allocation);
       if (target.sampler)
         queue.RetainUntilGpuComplete(
             [sampler = std::move(target.sampler)]() mutable {
               sampler = nullptr;
             });
     }
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    const uint32_t ref_count = --m_refCount;
+    if (!ref_count) {
+      if (registry_registered_.exchange(false, std::memory_order_acq_rel)) {
+        UnregisterDescriptorHeapRange(records_.data(), this);
+        // Drop registry ownership first, while the public-reference private
+        // count still guarantees that `this` remains valid for the final drop.
+        ReleasePrivate();
+      }
+      // This may delete the object. Do not access members after this call.
+      ReleasePrivate();
+    }
+    return ref_count;
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -171,6 +235,9 @@ public:
 
   DescriptorHeapMirror *GetMirror() override { return mirror_.get(); }
 
+  void AcquireDescriptorRecordLease() override { AddRefPrivate(); }
+  void ReleaseDescriptorRecordLease() override { ReleasePrivate(); }
+
 private:
   D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandleForHeapStartImpl() const {
     if (records_.empty())
@@ -189,22 +256,28 @@ private:
   }
 
   DescriptorRecord *DescriptorRecordFromHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-    auto *record = reinterpret_cast<DescriptorRecord *>(handle.ptr);
-    if (!record || records_.empty())
+    const uintptr_t address = static_cast<uintptr_t>(handle.ptr);
+    if (!address || records_.empty())
       return nullptr;
-    if (record < records_.data() || record >= records_.data() + records_.size())
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(records_.data());
+    const uintptr_t size = records_.size() * sizeof(DescriptorRecord);
+    if (address < begin || address - begin >= size ||
+        (address - begin) % sizeof(DescriptorRecord))
       return nullptr;
-    return record;
+    return records_.data() + (address - begin) / sizeof(DescriptorRecord);
   }
 
   const DescriptorRecord *
   DescriptorRecordFromHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle) const {
-    auto *record = reinterpret_cast<const DescriptorRecord *>(handle.ptr);
-    if (!record || records_.empty())
+    const uintptr_t address = static_cast<uintptr_t>(handle.ptr);
+    if (!address || records_.empty())
       return nullptr;
-    if (record < records_.data() || record >= records_.data() + records_.size())
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(records_.data());
+    const uintptr_t size = records_.size() * sizeof(DescriptorRecord);
+    if (address < begin || address - begin >= size ||
+        (address - begin) % sizeof(DescriptorRecord))
       return nullptr;
-    return record;
+    return records_.data() + (address - begin) / sizeof(DescriptorRecord);
   }
 
   Com<IMTLD3D12Device> device_;
@@ -213,6 +286,7 @@ private:
   std::vector<DescriptorRecord> records_;
   std::string name_;
   std::unique_ptr<DescriptorHeapMirror> mirror_;
+  std::atomic<bool> registry_registered_{false};
 };
 
 } // namespace
@@ -221,15 +295,52 @@ bool IsBindlessMirrorEnabled() {
   return true;
 }
 
-void BumpDescriptorContentGeneration() {
-  auto value = g_descriptor_content_generation.fetch_add(
-                   1, std::memory_order_relaxed) + 1;
-  if (!value)
-    g_descriptor_content_generation.store(1, std::memory_order_relaxed);
+DescriptorRecordLease::DescriptorRecordLease(
+    DescriptorRecordLease &&other) noexcept
+    : record_(other.record_), owner_(other.owner_) {
+  other.record_ = nullptr;
+  other.owner_ = nullptr;
 }
 
-uint64_t GetDescriptorContentGeneration() {
-  return g_descriptor_content_generation.load(std::memory_order_relaxed);
+DescriptorRecordLease &
+DescriptorRecordLease::operator=(DescriptorRecordLease &&other) noexcept {
+  if (this == &other)
+    return *this;
+  reset();
+  record_ = other.record_;
+  owner_ = other.owner_;
+  other.record_ = nullptr;
+  other.owner_ = nullptr;
+  return *this;
+}
+
+DescriptorRecordLease::~DescriptorRecordLease() {
+  reset();
+}
+
+DescriptorRecordLease
+DescriptorRecordLease::Acquire(DescriptorRecord *record,
+                               DescriptorHeap *owner) {
+  if (!record || !owner)
+    return {};
+  owner->AcquireDescriptorRecordLease();
+  return DescriptorRecordLease(record, owner);
+}
+
+void DescriptorRecordLease::reset() {
+  auto *owner = owner_;
+  record_ = nullptr;
+  owner_ = nullptr;
+  if (owner)
+    owner->ReleaseDescriptorRecordLease();
+}
+
+dxmt::DescriptorContentRevision BumpDescriptorContentRevision() {
+  return g_descriptor_content_revision.Bump();
+}
+
+dxmt::DescriptorContentRevision GetDescriptorContentRevision() {
+  return g_descriptor_content_revision.Load();
 }
 
 Com<ID3D12DescriptorHeap>
@@ -238,57 +349,54 @@ CreateDescriptorHeap(IMTLD3D12Device *device,
   return Com<ID3D12DescriptorHeap>::transfer(new DescriptorHeapImpl(device, *desc));
 }
 
-DescriptorRecord *
+DescriptorRecordLease
 GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-  auto *record = reinterpret_cast<DescriptorRecord *>(handle.ptr);
-  if (!record || record->magic != DescriptorRecord::kMagic)
-    return nullptr;
-  return record;
+  return LookupDescriptorRecord(static_cast<uintptr_t>(handle.ptr));
 }
 
-DescriptorRecord *
+DescriptorRecordLease
 GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                  D3D12_DESCRIPTOR_HEAP_TYPE expected_type) {
-  auto *record = GetDescriptorRecordFromCpuHandle(handle);
+  auto record = GetDescriptorRecordFromCpuHandle(handle);
   if (!record)
-    return nullptr;
+    return {};
   if (record->heap_type != expected_type) {
     WARN("D3D12DescriptorHeap: descriptor heap type mismatch expected=",
          uint32_t(expected_type), " actual=", uint32_t(record->heap_type));
-    return nullptr;
+    return {};
   }
   return record;
 }
 
-const DescriptorRecord *
+DescriptorRecordLease
 GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
                                  D3D12_DESCRIPTOR_HEAP_TYPE expected_type) {
-  auto *record =
+  auto record =
       GetDescriptorRecordFromCpuHandle({static_cast<SIZE_T>(handle.ptr)},
                                        expected_type);
   if (!record || !record->shader_visible) {
     if (record)
       WARN("D3D12DescriptorHeap: non shader-visible descriptor used as GPU handle");
-    return nullptr;
+    return {};
   }
   return record;
 }
 
-DescriptorRecord *
+DescriptorRecordLease
 GetDescriptorRecordRangeFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                       D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
                                       UINT descriptor_count,
                                       const char *context) {
-  auto *record = GetDescriptorRecordFromCpuHandle(handle, expected_type);
+  auto record = GetDescriptorRecordFromCpuHandle(handle, expected_type);
   if (!record)
-    return nullptr;
+    return {};
   if (descriptor_count &&
       (record->heap_index >= record->heap_count ||
        descriptor_count > record->heap_count - record->heap_index)) {
     WARN("D3D12DescriptorHeap: descriptor range exceeds heap for ",
          context ? context : "<unknown>", " start=", record->heap_index,
          " count=", descriptor_count, " heap_count=", record->heap_count);
-    return nullptr;
+    return {};
   }
   return record;
 }
