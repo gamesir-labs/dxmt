@@ -125,4 +125,86 @@ TEST(ShaderBinary, ParsesExtendedRegisterOperandWithoutChangingParserState) {
   EXPECT_TRUE(operand.m_Nonuniform);
 }
 
+TEST(ShaderBinary, ParsesSignedExtendedSampleOffsets) {
+  constexpr std::array<CShaderToken, 4> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
+                                                      0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(4),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(2) |
+          ENCODE_D3D10_SB_OPCODE_EXTENDED(true),
+      ENCODE_D3D10_SB_EXTENDED_OPCODE_TYPE(
+          D3D10_SB_EXTENDED_OPCODE_SAMPLE_CONTROLS) |
+          ENCODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(
+              D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_U, 0xf) |
+          ENCODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(
+              D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_V, 2) |
+          ENCODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(
+              D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_W, 0x8),
+  };
+
+  CShaderCodeParser parser(shader.data());
+  CInstruction instruction;
+  parser.ParseInstruction(&instruction);
+
+  EXPECT_EQ(instruction.m_ExtendedOpCodeCount, 1u);
+  EXPECT_EQ(instruction.m_OpCodeEx[0],
+            D3D10_SB_EXTENDED_OPCODE_SAMPLE_CONTROLS);
+  EXPECT_EQ(instruction.m_TexelOffset[0], -1);
+  EXPECT_EQ(instruction.m_TexelOffset[1], 2);
+  EXPECT_EQ(instruction.m_TexelOffset[2], -8);
+  EXPECT_TRUE(parser.EndOfShader());
+}
+
+TEST(ShaderBinary, CopiesAndTerminatesCommentCustomData) {
+  constexpr std::array<CShaderToken, 7> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
+                                                      0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(7),
+      ENCODE_D3D10_SB_CUSTOMDATA_CLASS(D3D10_SB_CUSTOMDATA_COMMENT),
+      4,
+      0x11223344,
+      0xaabbccdd,
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1),
+  };
+
+  CShaderCodeParser parser(shader.data());
+  CInstruction instruction;
+  parser.ParseInstruction(&instruction);
+  ASSERT_NE(instruction.m_CustomData.pData, nullptr);
+  EXPECT_EQ(instruction.m_CustomData.Type, D3D10_SB_CUSTOMDATA_COMMENT);
+  EXPECT_EQ(instruction.m_CustomData.DataSizeInBytes, 8u);
+  const auto *data = static_cast<const UINT *>(instruction.m_CustomData.pData);
+  EXPECT_EQ(data[0], 0x11223344u);
+  EXPECT_EQ(data[1], 0x00bbccddu);
+
+  parser.ParseInstruction(&instruction);
+  EXPECT_EQ(instruction.OpCode(), D3D10_SB_OPCODE_RET);
+  EXPECT_TRUE(parser.EndOfShader());
+}
+
+TEST(ShaderBinary, DecodesEverySynchronizationScope) {
+  constexpr std::array<CShaderToken, 3> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D11_SB_COMPUTE_SHADER,
+                                                      5, 0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(3),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D11_SB_OPCODE_SYNC) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1) |
+          ENCODE_D3D11_SB_SYNC_FLAGS(
+              D3D11_SB_SYNC_THREADS_IN_GROUP |
+              D3D11_SB_SYNC_THREAD_GROUP_SHARED_MEMORY |
+              D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL),
+  };
+
+  CShaderCodeParser parser(shader.data());
+  CInstruction instruction;
+  parser.ParseInstruction(&instruction);
+
+  EXPECT_TRUE(instruction.m_SyncFlags.bThreadsInGroup);
+  EXPECT_TRUE(instruction.m_SyncFlags.bThreadGroupSharedMemory);
+  EXPECT_TRUE(instruction.m_SyncFlags.bUnorderedAccessViewMemoryGlobal);
+  EXPECT_FALSE(instruction.m_SyncFlags.bUnorderedAccessViewMemoryGroup);
+}
+
 } // namespace
