@@ -15,8 +15,6 @@ env:
   WINE_VERSION: proton-11.0-macos
   WINE_GIT_URL: https://github.com/gamesir123/wine-proton-macos.git
   WINE_GIT_BRANCH: proton-11.0-macos
-  WINE_ARM64EC_VERSION: wine-11.2
-  WINE_ARM64EC_URL: https://github.com/3Shain/wine/releases/download/wine-11.2/wine-11.2.tar.gz
   LLVM_MINGW_VERSION: "20251216"
   LLVM_MINGW_DIR: llvm-mingw-20251216-ucrt-macos-universal
   HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -34,7 +32,9 @@ jobs:
       - name: Probe and Prepare Host
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh setup-host
+        run: |
+          scripts/ci-self-hosted.sh setup-host
+          scripts/dxmt-builder --help
 
   setup-wine:
     runs-on: self-macos-runner
@@ -56,21 +56,7 @@ jobs:
             "") echo "::error::WINE_ACCESS_TOKEN is empty"; exit 1 ;;
             *) echo "Wine token kind: unknown" ;;
           esac
-          scripts/ci-self-hosted.sh ensure-wine x86_64
-
-  setup-wine-arm64ec:
-    runs-on: self-macos-runner
-    needs: setup-host
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          clean: false
-
-      - name: Prepare Wine ARM64EC
-        env:
-          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh ensure-wine arm64ec
+          scripts/dxmt-builder bootstrap wine-x64
 
   setup-llvm-mingw:
     runs-on: self-macos-runner
@@ -84,7 +70,7 @@ jobs:
       - name: Prepare LLVM-MinGW
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh ensure-llvm-mingw
+        run: scripts/dxmt-builder bootstrap llvm-mingw
 
   setup-llvm-project:
     runs-on: self-macos-runner
@@ -98,7 +84,7 @@ jobs:
       - name: Prepare LLVM Source
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh ensure-llvm-project
+        run: scripts/dxmt-builder bootstrap llvm-project
 
   setup-llvm-darwin:
     runs-on: self-macos-runner
@@ -112,7 +98,7 @@ jobs:
       - name: Prepare LLVM Darwin x86_64
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh ensure-llvm-darwin x86_64
+        run: scripts/dxmt-builder bootstrap llvm-darwin-x64
 
   setup-llvm-win:
     runs-on: self-macos-runner
@@ -126,21 +112,7 @@ jobs:
       - name: Prepare LLVM Windows
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh ensure-llvm-win
-
-  setup-llvm-darwin-arm64:
-    runs-on: self-macos-runner
-    needs: setup-llvm-project
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          clean: false
-
-      - name: Prepare LLVM Darwin arm64
-        env:
-          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/ci-self-hosted.sh ensure-llvm-darwin arm64
+        run: scripts/dxmt-builder bootstrap llvm-win
 
   build-gcc-release-x86_64-windows-cross:
     runs-on: self-macos-runner
@@ -156,15 +128,15 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          build_dir=.cache/build/x86_64-windows-release
-          install_dir=.cache/install/x86_64-windows-release
+          profile=gcc-x64-release-full
+          install_dir=.cache/managed/profiles/${profile}/install
           rm -rf "${install_dir}"
           scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup --cross-file build-win64.txt -Denable_nvapi=true -Denable_nvngx=true -Ddxmt_version= -Dnative_llvm_path=.cache/toolchains/llvm-darwin -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine "${build_dir}" --buildtype release --prefix "$(pwd)/${install_dir}" --strip
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact gcc-release-x86_64-windows-cross "${install_dir}"
+          scripts/dxmt-builder build --profile "${profile}" runtime tests-all benchmarks
+          scripts/dxmt-builder test --profile "${profile}" all
+          DXMT_BUILDER_REQUIRE_TESTED=1 scripts/dxmt-builder install \
+            --profile "${profile}" --component runtime
+          scripts/ci-self-hosted.sh stage-artifact gcc-release-x86_64-windows-cross "${install_dir}/usr/local"
 
   build-gcc-release-x86-windows-cross:
     runs-on: self-macos-runner
@@ -180,15 +152,13 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          build_dir=.cache/build/x86-windows-release
-          install_dir=.cache/install/x86-windows-release
+          profile=gcc-x86-release
+          install_dir=.cache/managed/profiles/${profile}/install
           rm -rf "${install_dir}"
           scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup --cross-file build-win32.txt -Ddxmt_version= -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine "${build_dir}" --buildtype release --prefix "$(pwd)/${install_dir}" --strip
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact gcc-release-x86-windows-cross "${install_dir}"
+          scripts/dxmt-builder build --profile "${profile}" runtime
+          scripts/dxmt-builder install --profile "${profile}" --component runtime
+          scripts/ci-self-hosted.sh stage-artifact gcc-release-x86-windows-cross "${install_dir}/usr/local"
 
   build-clang-debugoptimized-x86_64-windows-cross:
     runs-on: self-macos-runner
@@ -204,15 +174,13 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          build_dir=.cache/build/x86_64-windows-debugoptimized
-          install_dir=.cache/install/x86_64-windows-debugoptimized
+          profile=llvm-mingw-x64-debugoptimized
+          install_dir=.cache/managed/profiles/${profile}/install
           rm -rf "${install_dir}"
           scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup --cross-file build-win64.txt -Dnative_llvm_path=.cache/toolchains/llvm-darwin -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine -Dbuild_airconv_for_windows=true -Denable_nvapi=true -Denable_nvngx=true "${build_dir}" --buildtype debugoptimized --prefix "$(pwd)/${install_dir}"
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact clang-debugoptimized-x86_64-windows-cross "${install_dir}"
+          scripts/dxmt-builder build --profile "${profile}" runtime
+          scripts/dxmt-builder install --profile "${profile}" --component runtime
+          scripts/ci-self-hosted.sh stage-artifact clang-debugoptimized-x86_64-windows-cross "${install_dir}/usr/local"
 
   build-clang-release-x86_64-windows-cross:
     runs-on: self-macos-runner
@@ -228,15 +196,13 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          build_dir=.cache/build/x86_64-windows-release
-          install_dir=.cache/install/x86_64-windows-release
+          profile=llvm-mingw-x64-release
+          install_dir=.cache/managed/profiles/${profile}/install
           rm -rf "${install_dir}"
           scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup --cross-file build-win64.txt -Denable_nvapi=true -Denable_nvngx=true -Ddxmt_version= -Dnative_llvm_path=.cache/toolchains/llvm-darwin -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine "${build_dir}" --buildtype release --prefix "$(pwd)/${install_dir}" --strip
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact clang-release-x86_64-windows-cross "${install_dir}"
+          scripts/dxmt-builder build --profile "${profile}" runtime
+          scripts/dxmt-builder install --profile "${profile}" --component runtime
+          scripts/ci-self-hosted.sh stage-artifact clang-release-x86_64-windows-cross "${install_dir}/usr/local"
 
   build-clang-release-x86-windows-cross:
     runs-on: self-macos-runner
@@ -252,19 +218,17 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          build_dir=.cache/build/x86-windows-release
-          install_dir=.cache/install/x86-windows-release
+          profile=llvm-mingw-x86-release
+          install_dir=.cache/managed/profiles/${profile}/install
           rm -rf "${install_dir}"
           scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup --cross-file build-win32.txt -Ddxmt_version= -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine "${build_dir}" --buildtype release --prefix "$(pwd)/${install_dir}" --strip
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact clang-release-x86-windows-cross "${install_dir}"
+          scripts/dxmt-builder build --profile "${profile}" runtime
+          scripts/dxmt-builder install --profile "${profile}" --component runtime
+          scripts/ci-self-hosted.sh stage-artifact clang-release-x86-windows-cross "${install_dir}/usr/local"
 
-  build-clang-debugoptimized-arm64ec-windows-cross:
+  build-clang-release-x86_64-macos:
     runs-on: self-macos-runner
-    needs: [setup-wine-arm64ec, setup-llvm-mingw, setup-llvm-darwin-arm64]
+    needs: setup-llvm-darwin
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -276,72 +240,13 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          build_dir=.cache/build/arm64ec-windows-debugoptimized
-          install_dir=.cache/install/arm64ec-windows-debugoptimized
-          rm -rf "${install_dir}"
+          profile=apple-clang-x86_64-release
           scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains arm64ec
-          meson setup --cross-file build-arm64ec.txt -Dnative_llvm_path=.cache/toolchains/llvm-darwin-arm64 -Dwine_build_path= -Dwine_install_path=.cache/toolchains/wine "${build_dir}" --buildtype debugoptimized --prefix "$(pwd)/${install_dir}"
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact clang-debugoptimized-arm64ec-windows-cross "${install_dir}"
-
-  build-clang-release-arm64-macos:
-    runs-on: self-macos-runner
-    needs: setup-llvm-darwin-arm64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          clean: false
-          submodules: true
-
-      - name: Build
-        env:
-          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: |
-          build_dir=.cache/build/arm64-macos-release
-          install_dir=.cache/install/arm64-macos-release
-          rm -rf "${install_dir}"
-          scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup -Dnative_llvm_path=.cache/toolchains/llvm-darwin-arm64 "${build_dir}" --buildtype release --prefix "$(pwd)/${install_dir}" --strip
-          meson compile -C "${build_dir}"
-          meson install -C "${build_dir}"
-          scripts/ci-self-hosted.sh stage-artifact clang-release-arm64-macos "${install_dir}"
-
-  test-wine-d3d:
-    runs-on: self-macos-runner
-    needs: [setup-wine, setup-llvm-darwin]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          clean: false
-          submodules: true
-
-      - name: Configure Wine test build
-        env:
-          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: |
-          build_dir=.cache/build/wine-tests
-          scripts/ci-self-hosted.sh prepare-job
-          scripts/ci-self-hosted.sh link-toolchains x86_64
-          meson setup --cross-file build-win64.txt \
-            -Dnative_llvm_path=.cache/toolchains/llvm-darwin \
-            -Dwine_build_path= \
-            -Dwine_install_path=.cache/toolchains/wine \
-            -Denable_tests=true \
-            --buildtype release \
-            --prefix "$(pwd)/.cache/install/wine-tests" \
-            "${build_dir}"
-
-      - name: Run Wine unit and integration suites
-        run: scripts/run-wine-tests.sh .cache/build/wine-tests all
+          scripts/dxmt-builder build --profile "${profile}" runtime
 
   package:
     runs-on: self-macos-runner
-    needs: [build-gcc-release-x86_64-windows-cross, build-gcc-release-x86-windows-cross, test-wine-d3d]
+    needs: [build-gcc-release-x86_64-windows-cross, build-gcc-release-x86-windows-cross]
     env:
       PACKAGE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
     steps:
