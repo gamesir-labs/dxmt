@@ -216,7 +216,6 @@ private:
   uint64_t length_;
 
   Rc<BufferAllocation> current_;
-  uint32_t version_ = 0;
   std::atomic<uint32_t> refcount_ = {0u};
 
   std::vector<BufferViewDescriptor> viewDescriptors_;

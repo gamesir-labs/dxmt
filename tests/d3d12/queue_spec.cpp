@@ -209,6 +209,131 @@ TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {
   }
 }
 
+TEST_F(D3D12QueueSpec, ClearsRenderTargetViewsAcrossMipChain) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+  support.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+  if (FAILED(context_.device()->CheckFeatureSupport(
+          D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+      !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
+    GTEST_SKIP() << "R11G11B10_FLOAT render targets are unavailable";
+
+  ComPtr<ID3D12Resource> texture = context_.CreateTexture2D(
+      480, 270, 9, DXGI_FORMAT_R11G11B10_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 9, false);
+  ASSERT_TRUE(texture);
+  ASSERT_TRUE(rtv_heap);
+
+  const FLOAT clear_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
+  for (UINT mip = 0; mip < 9; ++mip) {
+    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+    rtv_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtv_desc.Texture2D.MipSlice = mip;
+    const auto rtv = context_.CpuDescriptorHandle(rtv_heap.get(), mip);
+    context_.device()->CreateRenderTargetView(texture.get(), &rtv_desc, rtv);
+    context_.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  }
+  D3D12TestContext::Transition(
+      context_.list(), texture.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackTexture(texture.get(), &readback, 6)));
+  ASSERT_EQ(readback.width, 7u);
+  ASSERT_EQ(readback.height, 4u);
+  constexpr std::uint32_t kPackedWhite = 0x781e03c0;
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      std::uint32_t pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      EXPECT_EQ(pixel, kPackedWhite)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(D3D12QueueSpec, ClearsNonzeroMipPlacedRenderTargetView) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+  support.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+  if (FAILED(context_.device()->CheckFeatureSupport(
+          D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+      !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
+    GTEST_SKIP() << "R11G11B10_FLOAT render targets are unavailable";
+
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 480;
+  desc.Height = 270;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 9;
+  desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+  const auto allocation =
+      context_.device()->GetResourceAllocationInfo(0, 1, &desc);
+  ASSERT_NE(allocation.SizeInBytes, UINT64_MAX);
+  ASSERT_NE(allocation.SizeInBytes, 0u);
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes = allocation.SizeInBytes;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> heap;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateHeap(
+      &heap_desc, __uuidof(ID3D12Heap),
+      reinterpret_cast<void **>(heap.put()))));
+
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreatePlacedResource(
+      heap.get(), 0, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+      __uuidof(ID3D12Resource), reinterpret_cast<void **>(texture.put()))));
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(rtv_heap);
+
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  rtv_desc.Texture2D.MipSlice = 3;
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(texture.get(), &rtv_desc, rtv);
+
+  const FLOAT clear_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
+  context_.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  D3D12TestContext::Transition(
+      context_.list(), texture.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackTexture(texture.get(), &readback, 3)));
+  ASSERT_EQ(readback.width, 60u);
+  ASSERT_EQ(readback.height, 33u);
+  constexpr std::uint32_t kPackedWhite = 0x781e03c0;
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      std::uint32_t pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      EXPECT_EQ(pixel, kPackedWhite)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
 TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
   constexpr UINT kSampleCount = 4;
   D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};

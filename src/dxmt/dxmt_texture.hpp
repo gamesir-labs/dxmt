@@ -286,7 +286,6 @@ private:
   uint32_t bytes_per_row_ = 0;
 
   Rc<TextureAllocation> current_;
-  uint32_t version_ = 0;
   std::atomic<uint32_t> refcount_ = {0u};
 
   small_vector<TextureViewDescriptor, 4> viewDescriptors_;
