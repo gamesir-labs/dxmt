@@ -148,6 +148,20 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   wmt_diagnostic.fence_wait_count = diagnostic.fence_wait_count;
   wmt_diagnostic.fence_update_count = diagnostic.fence_update_count;
   cmdbuf.setDiagnosticInfo(wmt_diagnostic);
+  const auto diagnostic_marker =
+      env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");
+  if (!diagnostic_marker.empty()) {
+    if (FILE *marker = fopen(diagnostic_marker.c_str(), "a")) {
+      fprintf(marker, "%u %u %u %u %u %u\n",
+              diagnostic.input_encoder_count,
+              diagnostic.encoded_encoder_count,
+              diagnostic.blit_encoder_count,
+              diagnostic.barrier_only_pass_count,
+              diagnostic.fence_wait_count,
+              diagnostic.fence_update_count);
+      fclose(marker);
+    }
+  }
 #endif
 
   auto execute_elapsed = t1 - t0;
