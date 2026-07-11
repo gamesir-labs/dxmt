@@ -75,6 +75,7 @@ DxmtQueueDiagNsToMs(uint64_t ns) {
 }
 
 constexpr uint64_t kPersistentResidencyInitialCapacity = 4096;
+constexpr auto kPersistentResidencyFlushDelay = std::chrono::milliseconds(1);
 
 void *
 CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
@@ -108,6 +109,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
     commandQueue(device.newCommandQueue(kCommandChunkCount)),
     // Growth hint only; the residency set can grow as allocations are added.
     persistent_residency_set_(device.newResidencySet(kPersistentResidencyInitialCapacity)),
+    persistent_residency_thread_([this]() { this->PersistentResidencyThread(); }),
     shared_event_listener(SharedEventListener_create()),
     event_listener_thread([this]() { SharedEventListener_start(this->shared_event_listener); }),
     staging_allocator({
@@ -142,6 +144,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
 }
 
 CommandQueue::~CommandQueue() {
+  auto pool = WMT::MakeAutoreleasePool();
   TRACE("Destructing command queue");
   stopped.store(true, std::memory_order_release);
   ready_for_encode.fetch_add(1, std::memory_order_release);
@@ -153,11 +156,19 @@ CommandQueue::~CommandQueue() {
   finishThread.join();
   readback_cond_.notify_all();
   readbackThread.join();
+  {
+    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+    persistent_residency_stop_ = true;
+  }
+  persistent_residency_cond_.notify_all();
+  persistent_residency_thread_.join();
+  FlushPersistentResidency();
   FlushFinalFrameStatistics();
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.reset();
   };
+  DrainDeferredReleases();
   event_listener_thread.join();
   if (apitrace_enabled_)
     dxmt::apitrace::shutdown();
@@ -421,60 +432,215 @@ CommandQueue::AddPersistentResidency(WMT::Resource allocation) {
 
 void
 CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Resource allocation) {
+  // Descriptor writes happen independently of queue submission. Retire against
+  // the last sequence that was actually published, rather than the current
+  // (possibly forever empty) chunk.
+  const auto next_seq = ready_for_encode.load(std::memory_order_acquire);
+  RemovePersistentResidencyAfterCompletion(
+      allocation, next_seq ? next_seq - 1 : 0);
+}
+
+void
+CommandQueue::RemovePersistentResidencyAfterCompletion(
+    WMT::Resource allocation, uint64_t sequence) {
   if (!allocation)
     return;
 
-  const auto completed_seq = CurrentSeqId();
-  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  auto entry = persistent_residency_entries_.find(allocation.handle);
-  if (entry == persistent_residency_entries_.end())
-    return;
-  if (entry->second.ref_count)
-    entry->second.ref_count--;
-  if (entry->second.ref_count)
-    return;
-  entry->second.pending_remove = true;
-  entry->second.remove_after_seq =
-      std::max(entry->second.remove_after_seq, completed_seq);
+  bool notify_flush = false;
+  {
+    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+    auto entry = persistent_residency_entries_.find(allocation.handle);
+    if (entry == persistent_residency_entries_.end())
+      return;
+    if (entry->second.ref_count)
+      entry->second.ref_count--;
+    if (entry->second.ref_count)
+      return;
+
+    // Removal is safe immediately when the sequence that could have referenced
+    // the allocation has already completed. RetirePersistentResidencyRemovals()
+    // handles the complementary race where completion happens just after this
+    // check while holding the same mutex.
+    if (sequence <= cpu_coherent.signaledValue()) {
+      // Metal residency removals are only effective after commit. Keep an
+      // explicit strong reference through that commit. A short-lived worker
+      // coalesces descriptor churn while still guaranteeing that an idle queue
+      // eventually publishes the removal and drops even a single large
+      // allocation.
+      persistent_residency_retired_allocations_.push_back(
+          entry->second.allocation);
+      persistent_residency_set_.removeAllocation(entry->second.allocation);
+      persistent_residency_dirty_ = true;
+      persistent_residency_entries_.erase(entry);
+      if (!persistent_residency_flush_requested_) {
+        persistent_residency_flush_requested_ = true;
+        notify_flush = true;
+      }
+    } else {
+      entry->second.pending_remove = true;
+      entry->second.remove_after_seq =
+          std::max(entry->second.remove_after_seq, sequence);
+    }
+  }
+  if (notify_flush)
+    persistent_residency_cond_.notify_one();
 }
 
 void
 CommandQueue::RetainUntilGpuComplete(std::function<void()> release) {
+  const auto next_seq = ready_for_encode.load(std::memory_order_acquire);
+  RetainUntilGpuComplete(next_seq ? next_seq - 1 : 0, std::move(release));
+}
+
+void
+CommandQueue::RetainUntilGpuComplete(uint64_t sequence,
+                                     std::function<void()> release) {
   if (!release)
     return;
 
-  auto &chunk = chunks[CurrentSeqId() % kCommandChunkCount];
-  chunk.addCompletionCallback(std::move(release));
+  std::function<void()> release_now;
+  {
+    std::lock_guard<dxmt::mutex> lock(deferred_release_mutex_);
+    deferred_release_completed_seq_ = std::max(
+        deferred_release_completed_seq_, cpu_coherent.signaledValue());
+    if (sequence <= deferred_release_completed_seq_)
+      release_now = std::move(release);
+    else
+      deferred_releases_[sequence].push_back(std::move(release));
+  }
+  if (release_now)
+    release_now();
 }
 
 uint64_t
 CommandQueue::FlushPersistentResidency() {
-  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  if (!persistent_residency_dirty_)
-    return 0;
+  std::vector<WMT::Reference<WMT::Resource>> retired_allocations;
+  clock::time_point begin;
+  clock::time_point end;
+  {
+    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+    if (!persistent_residency_dirty_) {
+      persistent_residency_flush_requested_ = false;
+      return 0;
+    }
 
-  const auto begin = clock::now();
-  persistent_residency_set_.commit();
-  const auto end = clock::now();
-  persistent_residency_dirty_ = false;
+    begin = clock::now();
+    persistent_residency_set_.commit();
+    end = clock::now();
+    persistent_residency_dirty_ = false;
+    persistent_residency_flush_requested_ = false;
+    retired_allocations.swap(persistent_residency_retired_allocations_);
+  }
   return std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
 }
 
 void
 CommandQueue::RetirePersistentResidencyRemovals(uint64_t completed_seq) {
-  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  for (auto it = persistent_residency_entries_.begin();
-       it != persistent_residency_entries_.end();) {
-    auto &entry = it->second;
-    if (entry.pending_remove && entry.ref_count == 0 &&
-        entry.remove_after_seq <= completed_seq) {
-      persistent_residency_set_.removeAllocation(entry.allocation);
-      persistent_residency_dirty_ = true;
-      it = persistent_residency_entries_.erase(it);
-    } else {
-      ++it;
+  std::vector<WMT::Reference<WMT::Resource>> retired_allocations;
+  {
+    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+    bool removed = false;
+    for (auto it = persistent_residency_entries_.begin();
+         it != persistent_residency_entries_.end();) {
+      auto &entry = it->second;
+      if (entry.pending_remove && entry.ref_count == 0 &&
+          entry.remove_after_seq <= completed_seq) {
+        persistent_residency_retired_allocations_.push_back(entry.allocation);
+        persistent_residency_set_.removeAllocation(entry.allocation);
+        persistent_residency_dirty_ = true;
+        removed = true;
+        it = persistent_residency_entries_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (removed || !persistent_residency_retired_allocations_.empty()) {
+      // A completion may be the queue's last submission. Commit the whole batch
+      // here instead of waiting for a future submit that may never arrive; the
+      // local references remain alive until the commit has consumed removals.
+      persistent_residency_set_.commit();
+      persistent_residency_dirty_ = false;
+      persistent_residency_flush_requested_ = false;
+      retired_allocations.swap(persistent_residency_retired_allocations_);
     }
   }
+}
+
+void
+CommandQueue::PersistentResidencyThread() {
+  env::setThreadName("dxmt-residency-thread");
+
+  for (;;) {
+    std::vector<WMT::Reference<WMT::Resource>> retired_allocations;
+    std::unique_lock<dxmt::mutex> lock(persistent_residency_mutex_);
+    persistent_residency_cond_.wait(lock, [this]() {
+      return persistent_residency_stop_ ||
+             persistent_residency_flush_requested_;
+    });
+    if (persistent_residency_stop_)
+      return;
+
+    // Keep the request armed during this delay, so additional removals join
+    // the same batch without repeatedly waking the worker.
+    persistent_residency_cond_.wait_for(
+        lock, kPersistentResidencyFlushDelay,
+        [this]() { return persistent_residency_stop_; });
+    if (persistent_residency_stop_)
+      return;
+
+    // This is a long-lived Wine/engine thread. Bound every flush with its own
+    // autorelease pool so Metal/Foundation temporaries cannot accumulate for
+    // the lifetime of the queue.
+    auto pool = WMT::MakeAutoreleasePool();
+    if (persistent_residency_dirty_) {
+      persistent_residency_set_.commit();
+      persistent_residency_dirty_ = false;
+      retired_allocations.swap(persistent_residency_retired_allocations_);
+    }
+    persistent_residency_flush_requested_ = false;
+    lock.unlock();
+    // Resource releases may enter backend/object lifetime code. Keep them
+    // outside the residency mutex so no callback can invert this lock order.
+    retired_allocations.clear();
+  }
+}
+
+void
+CommandQueue::CompleteDeferredReleases(uint64_t completed_seq) {
+  std::vector<std::function<void()>> releases;
+  {
+    std::lock_guard<dxmt::mutex> lock(deferred_release_mutex_);
+    deferred_release_completed_seq_ =
+        std::max(deferred_release_completed_seq_, completed_seq);
+    for (auto it = deferred_releases_.begin();
+         it != deferred_releases_.end();) {
+      if (it->first <= deferred_release_completed_seq_) {
+        for (auto &release : it->second)
+          releases.push_back(std::move(release));
+        it = deferred_releases_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto &release : releases)
+    release();
+}
+
+void
+CommandQueue::DrainDeferredReleases() {
+  std::vector<std::function<void()>> releases;
+  {
+    std::lock_guard<dxmt::mutex> lock(deferred_release_mutex_);
+    for (auto &[sequence, callbacks] : deferred_releases_) {
+      (void)sequence;
+      for (auto &callback : callbacks)
+        releases.push_back(std::move(callback));
+    }
+    deferred_releases_.clear();
+  }
+  for (auto &release : releases)
+    release();
 }
 
 void
@@ -700,6 +866,10 @@ CommandQueue::WaitForFinishThread() {
     }
     if (stopped.load(std::memory_order_acquire))
       break;
+    // Finish callbacks and Metal error/log inspection may create autoreleased
+    // Foundation objects. Drain them once per completed command buffer rather
+    // than retaining them for this thread's lifetime.
+    auto pool = WMT::MakeAutoreleasePool();
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
     static std::atomic<uint32_t> finish_log_count = 0;
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
@@ -773,7 +943,7 @@ CommandQueue::WaitForFinishThread() {
            " publishToCompleteMs=", DxmtQueueDiagElapsedMs(chunk.publish_time, chunk.finish_complete_time),
            " event=", chunk.chunk_event_id,
            " initEvent=", chunk.resource_initializer_event_id,
-           " callbacks=", chunk.completion_callbacks.size());
+           " callbacks=", chunk.completionCallbackCount());
       if (gpu_end)
         diag_last_gpu_end_ns_ = std::max(diag_last_gpu_end_ns_, gpu_end);
     }
@@ -800,6 +970,7 @@ CommandQueue::WaitForFinishThread() {
     // command heap cannot be recycled while chunk.reset() still walks it.
     cpu_coherent.signal(internal_seq);
     RetirePersistentResidencyRemovals(internal_seq);
+    CompleteDeferredReleases(internal_seq);
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
       WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread signaled"
            " seq=", internal_seq,
@@ -883,6 +1054,7 @@ CommandQueue::ReadbackThread() {
       callbacks.swap(pending_readbacks_);
     }
 
+    auto pool = WMT::MakeAutoreleasePool();
     for (auto &callback : callbacks)
       callback();
 

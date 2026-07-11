@@ -137,9 +137,30 @@ struct unixcall_mtldevice_sparsetilesize {
   uint32_t ret;
 };
 
+struct unixcall_mtldevice_heaptexturesizeandalign {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  struct WMTMemoryPointer size_and_align;
+  uint32_t ret;
+};
+
 struct unixcall_mtldevice_newplacementheap {
   obj_handle_t device;
   struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlheap_newbuffer {
+  obj_handle_t heap;
+  struct WMTMemoryPointer info;
+  uint64_t offset;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlheap_newtexture {
+  obj_handle_t heap;
+  struct WMTMemoryPointer info;
+  uint64_t offset;
   obj_handle_t ret;
 };
 

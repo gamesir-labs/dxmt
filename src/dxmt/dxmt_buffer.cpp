@@ -18,11 +18,28 @@ ShouldLogBufferTextureViewFailure() {
   return count.fetch_add(1, std::memory_order_relaxed) < 32;
 }
 
+static WMTResourceOptions
+GetBufferResourceOptions(Flags<BufferAllocationFlag> flags) {
+  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  if (flags.test(BufferAllocationFlag::CpuWriteCombined))
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  if (flags.test(BufferAllocationFlag::CpuInvisible))
+    options |= WMTResourceStorageModePrivate;
+  if (flags.test(BufferAllocationFlag::GpuManaged))
+    options |= WMTResourceStorageModeManaged;
+  return options;
+}
+
+static void
+NormalizeBufferLength(WMTBufferInfo &info) {
+  info.length = align(std::max(info.length, 256ull), 256ull);
+}
+
 BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags) :
     info_(info),
     flags_(flags) {
   // (sub)allocate a minimum of 256B buffer so that texture can be created
-  info_.length = align(std::max(info_.length, 256ull), 256ull);
+  NormalizeBufferLength(info_);
   suballocation_size_ = info_.length;
   if (flags_.test(BufferAllocationFlag::SuballocateFromOnePage) && suballocation_size_ <= DXMT_PAGE_SIZE) {
     suballocation_size_ = align(info_.length, 16);
@@ -41,6 +58,15 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
                     ? placed_buffer
                     : info_.memory.get_accessible_or_null();
 };
+
+BufferAllocation::BufferAllocation(
+    WMT::Reference<WMT::Buffer> &&buffer, const WMTBufferInfo &info,
+    Flags<BufferAllocationFlag> flags)
+    : obj_(std::move(buffer)), info_(info), flags_(flags),
+      mappedMemory_(info_.memory.get_accessible_or_null()),
+      gpuAddress_(info_.gpu_address), suballocation_size_(info_.length) {
+  fenceTrackers.resize(1);
+}
 
 BufferAllocation::~BufferAllocation() {
   if (placed_buffer && !flags_.test(BufferAllocationFlag::ExternalCpuPlaced)) {
@@ -208,33 +234,37 @@ Buffer::createView(BufferViewDescriptor const &descriptor) {
 
 Rc<BufferAllocation>
 Buffer::allocate(Flags<BufferAllocationFlag> flags) {
-  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
-  if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
-  }
-  if (flags.test(BufferAllocationFlag::CpuInvisible)) {
-    options |= WMTResourceStorageModePrivate;
-  }
-  if (flags.test(BufferAllocationFlag::GpuManaged)) {
-    options |= WMTResourceStorageModeManaged;
-  }
-  WMTBufferInfo info;
+  WMTBufferInfo info = {};
   info.memory.set(0);
   info.length = length_;
-  info.options = options;
+  info.options = GetBufferResourceOptions(flags);
   return new BufferAllocation(device_, info, flags);
 };
 
 Rc<BufferAllocation>
+Buffer::allocatePlaced(WMT::Heap heap, uint64_t offset,
+                       Flags<BufferAllocationFlag> flags) {
+  if (!heap)
+    return nullptr;
+
+  WMTBufferInfo info = {};
+  info.memory.set(nullptr);
+  info.length = length_;
+  info.options = GetBufferResourceOptions(flags);
+  NormalizeBufferLength(info);
+  auto buffer = WMT::Reference<WMT::Buffer>(
+      MTLHeap_newBuffer(heap.handle, &info, offset));
+  if (!buffer)
+    return nullptr;
+  return new BufferAllocation(std::move(buffer), info, flags);
+}
+
+Rc<BufferAllocation>
 Buffer::allocateExternalCpu(Flags<BufferAllocationFlag> flags, void *memory) {
-  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
-  if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
-  }
-  WMTBufferInfo info;
+  WMTBufferInfo info = {};
   info.memory.set(memory);
   info.length = length_;
-  info.options = options;
+  info.options = GetBufferResourceOptions(flags);
   flags.set(BufferAllocationFlag::ExternalCpuPlaced);
   return new BufferAllocation(device_, info, flags);
 };

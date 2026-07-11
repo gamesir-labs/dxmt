@@ -974,6 +974,12 @@ public:
     return MTLDevice_sparseTileSize(handle, &info, &tile_size);
   }
 
+  bool
+  heapTextureSizeAndAlign(const WMTTextureInfo &info,
+                          WMTSizeAndAlign &size_and_align) const {
+    return MTLDevice_heapTextureSizeAndAlign(handle, &info, &size_and_align);
+  }
+
   Reference<Heap>
   newPlacementHeap(const WMTPlacementHeapInfo &info) {
     return Reference<Heap>(MTLDevice_newPlacementHeap(handle, &info));

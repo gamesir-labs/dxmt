@@ -602,6 +602,11 @@ struct WMTSparseTileSize {
   uint64_t bytes;
 };
 
+struct WMTSizeAndAlign {
+  uint64_t size;
+  uint64_t alignment;
+};
+
 enum WMTSparseTextureMappingMode : uint32_t {
   WMTSparseTextureMappingModeMap = 0,
   WMTSparseTextureMappingModeUnmap = 1,
@@ -630,8 +635,19 @@ WINEMETAL_API bool MTLDevice_sparseTileSize(
     obj_handle_t device, const struct WMTTextureInfo *info, struct WMTSparseTileSize *tile_size
 );
 
+WINEMETAL_API bool MTLDevice_heapTextureSizeAndAlign(
+    obj_handle_t device, const struct WMTTextureInfo *info,
+    struct WMTSizeAndAlign *size_and_align
+);
+
 WINEMETAL_API obj_handle_t
 MTLDevice_newPlacementHeap(obj_handle_t device, const struct WMTPlacementHeapInfo *info);
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset);
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset);
 
 WINEMETAL_API bool MTLDevice_updateSparseTextureMappings(
     obj_handle_t device, obj_handle_t texture, obj_handle_t heap,

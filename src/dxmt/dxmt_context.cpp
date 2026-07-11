@@ -3,6 +3,7 @@
 #include "Metal.hpp"
 #include "dxmt_apitrace.hpp"
 #include "dxmt_bindless_buffer_table.hpp"
+#include "dxmt_argument_buffer.hpp"
 #include "dxmt_descriptor_mirror.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_command_queue.hpp"
@@ -204,8 +205,13 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
     uint32_t length;
   };
   uint32_t max_slot = 32 - __builtin_clz(slot_mask);
+  const auto table_size =
+      uint64_t(__builtin_popcount(slot_mask)) * sizeof(VERTEX_BUFFER_ENTRY);
 
-  VERTEX_BUFFER_ENTRY *entries = getMappedArgumentBuffer<VERTEX_BUFFER_ENTRY>(offset);
+  VERTEX_BUFFER_ENTRY *entries =
+      getMappedArgumentBuffer<VERTEX_BUFFER_ENTRY>(offset, table_size);
+  if (!entries)
+    return;
 
   for (unsigned slot = 0, index = 0; slot < max_slot; slot++) {
     if (!(slot_mask & (1 << slot)))
@@ -232,7 +238,6 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
         (kind == PipelineKind::Geometry || kind == PipelineKind::Tessellation)
             ? WMTRenderStageObject
             : WMTRenderStageVertex;
-    const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * sizeof(VERTEX_BUFFER_ENTRY);
     const auto binding_offset = deduplicateRenderArgumentTableSlice(stages, 16, offset, table_size);
     const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
     if (!shouldEmitRenderArgumentBufferOffset(stages, 16, final_offset, binding_offset != offset))
@@ -360,9 +365,13 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
   if constexpr (stage == PipelineStage::Compute) {
     const auto binding_offset =
         deduplicateComputeArgumentTableSliceBytes(29, offset, table_size, encoded_table.data());
-    if (binding_offset == offset)
-      std::memcpy(getMappedArgumentBuffer<uint64_t, true>(offset),
-                  encoded_table.data(), table_size);
+    if (binding_offset == offset) {
+      auto *mapped =
+          getMappedArgumentBuffer<uint64_t, true>(offset, table_size);
+      if (!mapped)
+        return;
+      std::memcpy(mapped, encoded_table.data(), table_size);
+    }
     const auto final_offset = getFinalArgumentBufferOffset<true>(binding_offset);
     if (!shouldEmitComputeArgumentBufferOffset(29, final_offset, binding_offset != offset))
       return;
@@ -394,9 +403,12 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     }
     const auto binding_offset =
         deduplicateRenderArgumentTableSliceBytes(stages, index, offset, table_size, encoded_table.data());
-    if (binding_offset == offset)
-      std::memcpy(getMappedArgumentBuffer<uint64_t>(offset),
-                  encoded_table.data(), table_size);
+    if (binding_offset == offset) {
+      auto *mapped = getMappedArgumentBuffer<uint64_t>(offset, table_size);
+      if (!mapped)
+        return;
+      std::memcpy(mapped, encoded_table.data(), table_size);
+    }
     const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
     if (!shouldEmitRenderArgumentBufferOffset(stages, index, final_offset, binding_offset != offset))
       return;
@@ -1451,7 +1463,9 @@ uint64_t
 ArgumentEncodingContext::deduplicateRenderArgumentTableSlice(
     WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size
 ) {
-  auto *bytes = getMappedArgumentBuffer<uint8_t>(offset);
+  auto *bytes = getMappedArgumentBuffer<uint8_t>(offset, size);
+  if (!bytes)
+    return offset;
   return deduplicateRenderArgumentTableSliceBytes(stages, index, offset, size, bytes);
 }
 
@@ -1463,7 +1477,9 @@ ArgumentEncodingContext::deduplicateRenderArgumentTableSliceBytes(
   auto *cache = RenderArgumentTableSliceCache(data, stages);
   if (!cache)
     return offset;
-  auto *base = getMappedArgumentBuffer<uint8_t>(0);
+  auto *base = getMappedArgumentBuffer<uint8_t>(0, 0);
+  if (!base)
+    return offset;
   return DeduplicateArgumentTableSlice(*cache, index, offset, size, base, static_cast<const uint8_t *>(bytes));
 }
 
@@ -1471,7 +1487,9 @@ uint64_t
 ArgumentEncodingContext::deduplicateComputeArgumentTableSlice(
     uint8_t index, uint64_t offset, uint64_t size
 ) {
-  auto *bytes = getMappedArgumentBuffer<uint8_t, true>(offset);
+  auto *bytes = getMappedArgumentBuffer<uint8_t, true>(offset, size);
+  if (!bytes)
+    return offset;
   return deduplicateComputeArgumentTableSliceBytes(index, offset, size, bytes);
 }
 
@@ -1480,7 +1498,9 @@ ArgumentEncodingContext::deduplicateComputeArgumentTableSliceBytes(
     uint8_t index, uint64_t offset, uint64_t size, const void *bytes
 ) {
   auto *data = static_cast<ComputeEncoderData *>(currentEncoder());
-  auto *base = getMappedArgumentBuffer<uint8_t, true>(0);
+  auto *base = getMappedArgumentBuffer<uint8_t, true>(0, 0);
+  if (!base)
+    return offset;
   return DeduplicateArgumentTableSlice(
       data->argument_table_cache, index, offset, size, base, static_cast<const uint8_t *>(bytes));
 }
@@ -2655,9 +2675,13 @@ ArgumentEncodingContext::encodeConstantBuffers(
   if constexpr (stage == PipelineStage::Compute) {
     const auto binding_offset =
         deduplicateComputeArgumentTableSliceBytes(29, offset, table_size, encoded_table.data());
-    if (binding_offset == offset)
-      std::memcpy(getMappedArgumentBuffer<uint64_t, true>(offset),
-                  encoded_table.data(), table_size);
+    if (binding_offset == offset) {
+      auto *mapped =
+          getMappedArgumentBuffer<uint64_t, true>(offset, table_size);
+      if (!mapped)
+        return;
+      std::memcpy(mapped, encoded_table.data(), table_size);
+    }
     const auto final_offset = getFinalArgumentBufferOffset<true>(binding_offset);
     if (!shouldEmitComputeArgumentBufferOffset(29, final_offset, binding_offset != offset))
       return;
@@ -2689,9 +2713,12 @@ ArgumentEncodingContext::encodeConstantBuffers(
     }
     const auto binding_offset =
         deduplicateRenderArgumentTableSliceBytes(stages, index, offset, table_size, encoded_table.data());
-    if (binding_offset == offset)
-      std::memcpy(getMappedArgumentBuffer<uint64_t>(offset),
-                  encoded_table.data(), table_size);
+    if (binding_offset == offset) {
+      auto *mapped = getMappedArgumentBuffer<uint64_t>(offset, table_size);
+      if (!mapped)
+        return;
+      std::memcpy(mapped, encoded_table.data(), table_size);
+    }
     const auto final_offset = getFinalArgumentBufferOffset(binding_offset);
     if (!shouldEmitRenderArgumentBufferOffset(stages, index, final_offset, binding_offset != offset))
       return;
@@ -2872,7 +2899,16 @@ ArgumentEncodingContext::encodeShaderResources(
     uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 ) {
   auto BindingCount = reflection->NumArguments;
-  uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
+  const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
+  if (BindingCount && !table_size) {
+    markArgumentBufferOverflow();
+    return;
+  }
+  uint64_t *encoded_buffer =
+      getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(
+          offset, table_size);
+  if (!encoded_buffer)
+    return;
 
   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
   auto encoder_id = currentEncoderId();
@@ -3062,7 +3098,6 @@ ArgumentEncodingContext::encodeShaderResources(
   }
 
   if constexpr (stage == PipelineStage::Compute) {
-    const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
     const auto binding_offset = deduplicateComputeArgumentTableSlice(30, offset, table_size);
     const auto final_offset = getFinalArgumentBufferOffset<true>(binding_offset);
     if (!shouldEmitComputeArgumentBufferOffset(30, final_offset, binding_offset != offset))
@@ -3072,7 +3107,6 @@ ArgumentEncodingContext::encodeShaderResources(
     cmd.offset = final_offset;
     cmd.index = 30;
   } else {
-    const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
     uint8_t index = 30;
     WMTRenderStages stages = WMTRenderStageVertex;
     if constexpr (stage == PipelineStage::Vertex) {
@@ -4004,6 +4038,21 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         encoder.setArgumentBuffer(gpu_buffer_, 0, 29, WMTRenderStageMesh);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 30, WMTRenderStageMesh);
       }
+      auto abort_unmapped_marshal_buffer = [&](const char *kind) {
+        WARN("RenderPass guard: skipped pass after ", kind,
+             " marshal argument-buffer allocation failed encoder=", data->id);
+        data->fence_update_vertex.forEach(
+            data->fence_update,
+            [&](auto id) {
+              encoder.updateFence(fence_pool_[id], WMTRenderStageFragment);
+            },
+            [&](auto id) {
+              encoder.updateFence(fence_pool_[id], WMTRenderStagePreRaster);
+            });
+        encoder.endEncoding();
+        data->~RenderEncoderData();
+        perf.skippedRender++;
+      };
       if (data->gs_arg_marshal_tasks.size()) {
         auto task_count = data->gs_arg_marshal_tasks.size();
         struct GS_MARSHAL_TASK {
@@ -4013,8 +4062,21 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint32_t vertex_count_per_warp;
           uint32_t end_of_command;
         };
-        auto task_argbuf = queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
-        auto tasks_data = (GS_MARSHAL_TASK *)task_argbuf.mapped;
+        size_t task_bytes = 0;
+        if (!ArgumentBufferByteSize<GS_MARSHAL_TASK>(task_count,
+                                                     task_bytes)) {
+          abort_unmapped_marshal_buffer("geometry");
+          break;
+        }
+        auto task_argbuf =
+            queue_.AllocateArgumentBuffer(seq_id_, task_bytes);
+        auto *tasks_data =
+            MappedArgumentBufferSlice<GS_MARSHAL_TASK>(task_argbuf,
+                                                       task_count);
+        if (!tasks_data) {
+          abort_unmapped_marshal_buffer("geometry");
+          break;
+        }
         for (unsigned i = 0; i<task_count; i++) {
           auto & task = data->gs_arg_marshal_tasks[i];
           tasks_data[i].draw_args = task.draw_arguments_va;
@@ -4041,8 +4103,21 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint16_t patch_per_group;
           uint32_t end_of_command;
         };
-        auto task_argbuf = queue_.AllocateArgumentBuffer(seq_id_, sizeof(TS_MARSHAL_TASK) * task_count);
-        auto tasks_data = (TS_MARSHAL_TASK *)task_argbuf.mapped;
+        size_t task_bytes = 0;
+        if (!ArgumentBufferByteSize<TS_MARSHAL_TASK>(task_count,
+                                                     task_bytes)) {
+          abort_unmapped_marshal_buffer("tessellation");
+          break;
+        }
+        auto task_argbuf =
+            queue_.AllocateArgumentBuffer(seq_id_, task_bytes);
+        auto *tasks_data =
+            MappedArgumentBufferSlice<TS_MARSHAL_TASK>(task_argbuf,
+                                                       task_count);
+        if (!tasks_data) {
+          abort_unmapped_marshal_buffer("tessellation");
+          break;
+        }
         for (unsigned i = 0; i<task_count; i++) {
           auto & task = data->ts_arg_marshal_tasks[i];
           tasks_data[i].draw_args = task.draw_arguments_va;
@@ -4339,9 +4414,14 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto data = static_cast<ResolveEncoderData *>(current);
       {
         WMT::Texture src_texture;
+        WMT::Texture dst_texture;
         if (!ResolveRenderPassColorAttachment(
                 "ResolvePass guard: source attachment missing WMTTextureUsageRenderTarget", 0, data->src,
                 src_texture
+            ) ||
+            !ResolveRenderPassColorAttachment(
+                "ResolvePass guard: destination attachment missing WMTTextureUsageRenderTarget", 0, data->dst,
+                dst_texture
             )) {
           WARN("ResolvePass guard: skipped unsafe resolve pass encoder=", data->id);
           data->~ResolveEncoderData();
@@ -4355,11 +4435,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
 
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
-        info.colors[0].texture = data->pso ? data->dst.texture() : src_texture;
+        info.colors[0].texture = data->pso ? dst_texture : src_texture;
         info.colors[0].load_action = WMTLoadActionLoad;
         info.colors[0].store_action =
             data->pso ? WMTStoreActionStore : WMTStoreActionStoreAndMultisampleResolve;
-        info.colors[0].resolve_texture = data->pso ? WMT::Texture{} : data->dst.texture();
+        info.colors[0].resolve_texture = data->pso ? WMT::Texture{} : dst_texture;
         if (dst_descriptor && data->pso) {
           info.render_target_width = dst_descriptor->width(data->dst->key);
           info.render_target_height = dst_descriptor->height(data->dst->key);

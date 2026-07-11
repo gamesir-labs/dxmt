@@ -11,6 +11,7 @@
 #include "dxmt_scaler.hpp"
 #include "dxmt_statistics.hpp"
 #include "dxmt_texture.hpp"
+#include "dxmt_descriptor_revision.hpp"
 #include "log/log.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "airconv_public.h"
@@ -232,7 +233,7 @@ struct RenderDynamicStateCache {
 
 struct RenderBindingStateCache {
   uint64_t graphics_generation = 0;
-  uint64_t descriptor_content_generation = 0;
+  DescriptorContentRevision descriptor_content_revision = {};
   uint64_t content_fingerprint = 0;
   bool valid = false;
 };
@@ -991,14 +992,55 @@ public:
 
   template <typename T, bool ComputeCommandEncoder = false>
   T *
-  getMappedArgumentBuffer(size_t offset) {
-    if constexpr (ComputeCommandEncoder)
-      return reinterpret_cast<T *>(
-          (char *)static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_mapping + offset
-      );
-    return reinterpret_cast<T *>(
-        (char *)static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_mapping + offset
-    );
+  getMappedArgumentBuffer(size_t offset, size_t byte_size = sizeof(T)) {
+    auto *mapping = [&]() -> void * {
+      if constexpr (ComputeCommandEncoder)
+        return static_cast<ComputeEncoderData *>(encoder_current)
+            ->allocated_argbuf_mapping;
+      return static_cast<RenderEncoderData *>(encoder_current)
+          ->allocated_argbuf_mapping;
+    }();
+    const uint64_t allocated_size = [&]() {
+      if constexpr (ComputeCommandEncoder)
+        return static_cast<ComputeEncoderData *>(encoder_current)
+            ->allocated_argbuf_size;
+      return static_cast<RenderEncoderData *>(encoder_current)
+          ->allocated_argbuf_size;
+    }();
+    const uint64_t offset64 = offset;
+    const uint64_t size64 = byte_size;
+    const bool in_allocation =
+        mapping && offset64 <= allocated_size &&
+        size64 <= allocated_size - offset64;
+    const bool in_write_window =
+        !size64 ||
+        (offset64 >= argument_buffer_write_begin_ &&
+         offset64 <= argument_buffer_write_end_ &&
+         size64 <= argument_buffer_write_end_ - offset64);
+    if (!in_allocation || !in_write_window) {
+      argument_buffer_overflowed_ = true;
+      return nullptr;
+    }
+    return reinterpret_cast<T *>(static_cast<char *>(mapping) + offset);
+  }
+
+  void setArgumentBufferWriteRange(uint64_t offset, uint64_t size) {
+    argument_buffer_overflowed_ = false;
+    argument_buffer_write_begin_ = offset;
+    if (size > UINT64_MAX - offset) {
+      argument_buffer_write_end_ = offset;
+      argument_buffer_overflowed_ = true;
+      return;
+    }
+    argument_buffer_write_end_ = offset + size;
+  }
+
+  bool argumentBufferOverflowed() const {
+    return argument_buffer_overflowed_;
+  }
+
+  void markArgumentBufferOverflow() {
+    argument_buffer_overflowed_ = true;
   }
 
   template <bool ComputeCommandEncoder = false>
@@ -1207,6 +1249,10 @@ private:
   uint64_t barrier_index_ = 0;
 
   uint64_t intrapass_barrier_control_bits_ = 0;
+
+  uint64_t argument_buffer_write_begin_ = 0;
+  uint64_t argument_buffer_write_end_ = UINT64_MAX;
+  bool argument_buffer_overflowed_ = false;
 
   WMT::Device device_;
   CommandQueue& queue_;
