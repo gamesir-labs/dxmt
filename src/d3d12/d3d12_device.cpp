@@ -18,6 +18,7 @@
 #include "d3d12_root_signature.hpp"
 #include "d3d12_sampler.hpp"
 #include "dxmt_command_queue.hpp"
+#include "dxmt_checked_math.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_perf_stats.hpp"
@@ -348,13 +349,20 @@ HasInvalidCpuVisibleBufferFlags(const D3D12_RESOURCE_DESC &desc,
 }
 
 static bool
-IsValidCrossAdapterResourceDesc(const D3D12_HEAP_PROPERTIES &heap_properties,
+IsValidCrossAdapterResourceDesc(const D3D12_HEAP_PROPERTIES &,
                                 D3D12_HEAP_FLAGS heap_flags,
                                 const D3D12_RESOURCE_DESC &desc) {
   const bool cross_adapter =
       desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
   const bool cross_adapter_heap =
       heap_flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+
+  // D3D12 row-major textures are exclusively cross-adapter resources. DXMT
+  // does not yet implement shared cross-adapter texture backing, so accepting
+  // one would silently create an ordinary tiled Metal texture instead.
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+      desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+    return false;
 
   if (!cross_adapter && !cross_adapter_heap)
     return true;
@@ -366,12 +374,9 @@ IsValidCrossAdapterResourceDesc(const D3D12_HEAP_PROPERTIES &heap_properties,
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     return true;
 
-  if (d3d12::GetHeapType(heap_properties) != D3D12_HEAP_TYPE_DEFAULT)
-    return false;
-  return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-         desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
-         desc.MipLevels <= 1 && desc.DepthOrArraySize == 1 &&
-         desc.SampleDesc.Count == 1;
+  // The only legal cross-adapter texture layout is row-major, which is failed
+  // closed above until the shared linear backing path is implemented.
+  return false;
 }
 
 static bool
@@ -572,7 +577,12 @@ GetD3D12FormatSupport1(FormatCapability caps,
   if (HasFormatCapability(caps, FormatCapability::MSAA))
     support |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
                D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
-  if (HasFormatCapability(caps, FormatCapability::Resolve))
+  // ResolveSubresource currently lowers through a color render pass. Do not
+  // advertise depth/stencil resolve until the command path implements the
+  // corresponding depth/stencil attachment semantics.
+  if (HasFormatCapability(caps, FormatCapability::Resolve) &&
+      !(format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER |
+                       MTL_DXGI_FORMAT_STENCIL_PLANER)))
     support |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
   if (HasFormatCapability(caps, FormatCapability::Write))
     support |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
@@ -682,15 +692,21 @@ IsSupportedCommandQueuePriority(UINT priority) {
          priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
 }
 
-static DescriptorRecord *
+static DescriptorRecordLease
 GetDescriptorRecordForWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                             D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
                             const char *context) {
-  auto *record = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+  auto record = d3d12::GetDescriptorRecordRangeFromCpuHandle(
       handle, expected_type, 1, context);
   if (!record)
     WARN("D3D12Device: invalid descriptor handle for ", context);
   return record;
+}
+
+static DescriptorHeapMirror::ScopedLock
+LockDescriptorRecordForWrite(const DescriptorRecord &record) {
+  return record.mirror ? record.mirror->AcquireLock()
+                       : DescriptorHeapMirror::ScopedLock{};
 }
 
 static void
@@ -701,6 +717,7 @@ ResetDescriptorRecord(DescriptorRecord &record) {
   const auto cpu_handle = record.cpu_handle;
   const auto heap_index = record.heap_index;
   const auto heap_count = record.heap_count;
+  const auto slot_version = record.slot_version;
   auto *const mirror = record.mirror;
   record = {};
   record.magic = magic;
@@ -709,6 +726,7 @@ ResetDescriptorRecord(DescriptorRecord &record) {
   record.cpu_handle = cpu_handle;
   record.heap_index = heap_index;
   record.heap_count = heap_count;
+  record.slot_version = slot_version;
   record.mirror = mirror;
 }
 
@@ -1066,12 +1084,28 @@ DescriptorWriteAffectsShaderBinding(const DescriptorRecord &record) {
           record.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 }
 
+class DescriptorContentRevisionCommitGuard {
+public:
+  explicit DescriptorContentRevisionCommitGuard(bool armed) : armed_(armed) {}
+  DescriptorContentRevisionCommitGuard(
+      const DescriptorContentRevisionCommitGuard &) = delete;
+  DescriptorContentRevisionCommitGuard &operator=(
+      const DescriptorContentRevisionCommitGuard &) = delete;
+  ~DescriptorContentRevisionCommitGuard() {
+    if (armed_)
+      BumpDescriptorContentRevision();
+  }
+
+private:
+  bool armed_ = false;
+};
+
 static void
-BumpDescriptorContentGenerationForWrite(
-    const DescriptorRecord &record,
+BeginDescriptorSlotWrite(
+    DescriptorRecord &record,
     DescriptorRecordType write_type = DescriptorRecordType::Empty) {
   if (DescriptorWriteAffectsShaderBinding(record)) {
-    BumpDescriptorContentGeneration();
+    record.slot_version = record.mirror->BeginSlotWrite(record.heap_index);
     const auto type =
         write_type == DescriptorRecordType::Empty ? record.type : write_type;
     switch (type) {
@@ -1103,12 +1137,6 @@ RecordDescriptorContentCopyPerf() {
 // texture, sampler, buffer texture-view, and null descriptors immediately.
 // record.mirror is null unless the heap is a shader-visible CBV/SRV/UAV or
 // SAMPLER heap, so non-shader heaps do nothing here.
-static void
-MarkDescriptorMirrorStaleForWrite(const DescriptorRecord &record) {
-  if (record.mirror)
-    record.mirror->MarkSlotStale(record.heap_index, GetDescriptorContentGeneration());
-}
-
 static void
 MaterializeSamplerMirrorForWrite(WMT::Device device,
                                  DescriptorRecord &record) {
@@ -1893,7 +1921,8 @@ GetBufferResourceTableBinding(Resource *resource, WMT::Resource &allocation,
 }
 
 static bool
-RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror,
+RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror, UINT slot,
+                                 bool counter_resource,
                                  Resource *resource,
                                  uint32_t &resource_index) {
   WMT::Resource allocation;
@@ -1907,8 +1936,8 @@ RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror,
 
   const auto before_generation = mirror.backendResourceTableGeneration();
   resource_index = mirror.RegisterBufferResource(
-      DescriptorBufferResourceIdentity(resource), allocation, gpu_address,
-      byte_size);
+      slot, counter_resource, DescriptorBufferResourceIdentity(resource),
+      allocation, gpu_address, byte_size);
   if (mirror.backendResourceTableGeneration() != before_generation)
     dxmt::perf::recordNativeDescriptorResourceTableEntry();
   return resource_index != kNullDescriptorResourceIndex;
@@ -1928,7 +1957,7 @@ WriteNativeBufferDescriptorRecord(DescriptorHeapMirror &mirror, UINT slot,
   if (type == DescriptorRecordType::ConstantBufferView)
     native.flags |= BufferDescriptorRecordFlagCBV;
 
-  if (!RegisterBufferDescriptorResource(mirror, resource,
+  if (!RegisterBufferDescriptorResource(mirror, slot, false, resource,
                                         native.resource_index)) {
     mirror.WriteBufferDescriptorRecord(slot, {});
     dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
@@ -1969,7 +1998,7 @@ WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
 
   auto native = *current;
   auto *counter = GetResourceFromD3D12(record.counter_resource.ptr());
-  if (!RegisterBufferDescriptorResource(mirror, counter,
+  if (!RegisterBufferDescriptorResource(mirror, slot, true, counter,
                                         native.counter_resource_index)) {
     dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
     return false;
@@ -2087,6 +2116,8 @@ ApplyDescriptorResidencyTarget(IMTLD3D12Device *device,
     queue.RemovePersistentResidencyAfterCompletion(previous.allocation);
   if (previous.secondary_allocation)
     queue.RemovePersistentResidencyAfterCompletion(previous.secondary_allocation);
+  if (previous.mirror_allocation)
+    queue.RemovePersistentResidencyAfterCompletion(previous.mirror_allocation);
   if (previous.sampler)
     queue.RetainUntilGpuComplete(
         [sampler = std::move(previous.sampler)]() mutable {
@@ -2177,16 +2208,22 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
         CreateDescriptorShaderResourceTextureView(mtl_device, *resource, record);
     auto *allocation =
         binding.texture ? binding.texture->current() : nullptr;
-    if (!binding || !allocation ||
-        !mirror->SetTexturePoolSlot(slot, binding.texture.ptr(), binding.view,
-                                    allocation)) {
+    const uint64_t gpu_resource_id =
+        binding && allocation
+            ? mirror->SetTexturePoolSlot(slot, binding.texture.ptr(),
+                                         binding.view, allocation)
+            : 0;
+    if (!gpu_resource_id) {
       mirror->WriteNullTableEntry(slot);
       finish();
       return;
     }
-    mirror->WriteTexturePoolTableEntry(slot,
-                                       binding.texture->arrayLength(binding.view),
-                                       GetShaderResourceTextureMinLod(record));
+    const uint32_t array_length =
+        binding.texture->arrayLength(binding.view);
+    const float min_lod = GetShaderResourceTextureMinLod(record);
+    mirror->WriteTextureTableEntry(slot, gpu_resource_id, array_length,
+                                   min_lod);
+    mirror->FillTextureSlot(slot, gpu_resource_id, array_length, min_lod);
     finish();
     return;
   }
@@ -2266,22 +2303,6 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
     finish();
     return;
   }
-}
-
-static bool
-CopyDescriptorTexturePoolSlot(const DescriptorRecord &dst,
-                              const DescriptorRecord &src) {
-  if (!dst.mirror || !src.mirror || dst.mirror->isSamplerHeap() ||
-      src.mirror->isSamplerHeap())
-    return false;
-  if (dst.type != DescriptorRecordType::ShaderResourceView &&
-      dst.type != DescriptorRecordType::UnorderedAccessView)
-    return false;
-  auto *resource = GetResourceFromD3D12(dst.resource.ptr());
-  if (!resource || resource->GetBuffer())
-    return false;
-  return dst.mirror->CopyTexturePoolSlotFrom(dst.heap_index, *src.mirror,
-                                             src.heap_index) != 0;
 }
 
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
@@ -2554,6 +2575,8 @@ public:
   HRESULT STDMETHODCALLTYPE EnqueueSetEvent(HANDLE event) override {
     if (!event)
       return WARN_E_INVALIDARG(__func__);
+    auto submission_guard = AcquireDxmtQueueSubmissionGuard(
+        static_cast<IMTLD3D12Device *>(this));
     auto &queue = device_->queue();
     auto signal = enqueue_set_event_signal_;
     auto value = ++enqueue_set_event_value_;
@@ -3245,13 +3268,16 @@ public:
 
   void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = GetDescriptorRecordForWrite(
+    auto record = GetDescriptorRecordForWrite(
         descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
         "CreateConstantBufferView");
     if (!record)
       return;
+    auto descriptor_lock = LockDescriptorRecordForWrite(*record);
+    DescriptorContentRevisionCommitGuard revision_commit(
+        DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(
+    BeginDescriptorSlotWrite(
         *record, DescriptorRecordType::ConstantBufferView);
     record->type = DescriptorRecordType::ConstantBufferView;
     if (desc) {
@@ -3311,27 +3337,28 @@ public:
   void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource *resource,
                                                   const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = GetDescriptorRecordForWrite(
+    auto record = GetDescriptorRecordForWrite(
         descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
         "CreateShaderResourceView");
     if (!record)
       return;
+    auto descriptor_lock = LockDescriptorRecordForWrite(*record);
+    DescriptorContentRevisionCommitGuard revision_commit(
+        DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(
+    BeginDescriptorSlotWrite(
         *record, DescriptorRecordType::ShaderResourceView);
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
       if (!ValidateShaderResourceView(resource, *desc)) {
         ResetDescriptorRecord(*record);
-        MarkDescriptorMirrorStaleForWrite(*record);
         MaterializeDescriptorTableForWrite(this, *record);
         return;
       }
       record->desc.srv = *desc;
       record->has_desc = true;
     }
-    MarkDescriptorMirrorStaleForWrite(*record);
     MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled()) {
       dxmt::apitrace::record_create_shader_resource_view(
@@ -3343,13 +3370,16 @@ public:
                                                    ID3D12Resource *counter_resource,
                                                    const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
                                                    D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = GetDescriptorRecordForWrite(
+    auto record = GetDescriptorRecordForWrite(
         descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
         "CreateUnorderedAccessView");
     if (!record)
       return;
+    auto descriptor_lock = LockDescriptorRecordForWrite(*record);
+    DescriptorContentRevisionCommitGuard revision_commit(
+        DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
-    BumpDescriptorContentGenerationForWrite(
+    BeginDescriptorSlotWrite(
         *record, DescriptorRecordType::UnorderedAccessView);
     record->type = DescriptorRecordType::UnorderedAccessView;
     record->resource = resource;
@@ -3357,14 +3387,12 @@ public:
     if (desc) {
       if (!ValidateUnorderedAccessView(resource, counter_resource, *desc)) {
         ResetDescriptorRecord(*record);
-        MarkDescriptorMirrorStaleForWrite(*record);
         MaterializeDescriptorTableForWrite(this, *record);
         return;
       }
       record->desc.uav = *desc;
       record->has_desc = true;
     }
-    MarkDescriptorMirrorStaleForWrite(*record);
     MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_unordered_access_view(
@@ -3374,11 +3402,12 @@ public:
   void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource *resource,
                                                 const D3D12_RENDER_TARGET_VIEW_DESC *desc,
                                                 D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = GetDescriptorRecordForWrite(
+    auto record = GetDescriptorRecordForWrite(
         descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
         "CreateRenderTargetView");
     if (!record)
       return;
+    auto descriptor_lock = LockDescriptorRecordForWrite(*record);
     ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::RenderTargetView;
     record->resource = resource;
@@ -3396,7 +3425,7 @@ public:
   void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource *resource,
                                                 const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
                                                 D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = GetDescriptorRecordForWrite(
+    auto record = GetDescriptorRecordForWrite(
         descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
         "CreateDepthStencilView");
     if (!record)
@@ -3423,19 +3452,20 @@ public:
 
   void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC *desc,
                                        D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override {
-    auto *record = GetDescriptorRecordForWrite(
+    auto record = GetDescriptorRecordForWrite(
         descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, "CreateSampler");
     if (!record)
       return;
+    auto descriptor_lock = LockDescriptorRecordForWrite(*record);
+    DescriptorContentRevisionCommitGuard revision_commit(
+        DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::Sampler;
     if (desc) {
       record->desc.sampler = *desc;
       record->has_desc = true;
     }
-    BumpDescriptorContentGenerationForWrite(*record,
-                                            DescriptorRecordType::Sampler);
-    MarkDescriptorMirrorStaleForWrite(*record);
+    BeginDescriptorSlotWrite(*record, DescriptorRecordType::Sampler);
     MaterializeSamplerMirrorForWrite(GetMTLDevice(), *record);
     MaterializeDescriptorTableForWrite(this, *record);
     if (dxmt::apitrace::d3d_enabled())
@@ -3458,6 +3488,7 @@ public:
     }
 
     std::vector<DescriptorRecord *> destinations;
+    std::vector<DescriptorRecordLease> destination_leases;
     UINT64 dst_total = 0;
     for (UINT dst_range = 0; dst_range < dst_descriptor_range_count; dst_range++) {
       const UINT dst_count = dst_descriptor_range_sizes
@@ -3465,11 +3496,12 @@ public:
                                  : 1;
       if (!dst_count)
         continue;
-      auto *dst = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+      auto dst_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
           dst_descriptor_range_offsets[dst_range], descriptor_heap_type,
           dst_count, "CopyDescriptors destination");
-      if (!dst)
+      if (!dst_lease)
         return;
+      auto *dst = dst_lease.get();
       if (dst_total > UINT_MAX - dst_count) {
         WARN("D3D12Device: CopyDescriptors destination descriptor count overflow");
         return;
@@ -3478,6 +3510,7 @@ public:
       destinations.reserve(static_cast<size_t>(dst_total));
       for (UINT i = 0; i < dst_count; i++)
         destinations.push_back(dst + i);
+      destination_leases.push_back(std::move(dst_lease));
     }
     if (destinations.empty())
       return;
@@ -3490,13 +3523,21 @@ public:
                                  : 1;
       if (!src_count)
         continue;
-      auto *src = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+      auto src_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
           src_descriptor_range_offsets[src_range], descriptor_heap_type,
           src_count, "CopyDescriptors source");
-      if (!src)
+      if (!src_lease)
         return;
-      for (UINT i = 0; i < src_count && copied.size() < destinations.size(); i++)
+      auto *src = src_lease.get();
+      if (src[0].shader_visible) {
+        WARN("D3D12Device: CopyDescriptors source heap must not be "
+             "shader-visible");
+        return;
+      }
+      for (UINT i = 0; i < src_count && copied.size() < destinations.size(); i++) {
+        auto source_lock = LockDescriptorRecordForWrite(src[i]);
         copied.push_back(src[i]);
+      }
       if (copied.size() == destinations.size())
         break;
     }
@@ -3506,24 +3547,25 @@ public:
       return;
     }
 
-    bool affects_shader_binding = false;
-    for (size_t i = 0; i < copied.size(); i++) {
-      CopyDescriptorRecord(*destinations[i], copied[i]);
-      affects_shader_binding =
-          affects_shader_binding ||
-          DescriptorWriteAffectsShaderBinding(*destinations[i]);
-    }
-    if (affects_shader_binding) {
-      BumpDescriptorContentGeneration();
+    const bool affects_shader_binding = std::any_of(
+        destinations.begin(), destinations.end(), [](const auto *record) {
+          return record && DescriptorWriteAffectsShaderBinding(*record);
+        });
+    if (affects_shader_binding)
       RecordDescriptorContentCopyPerf();
-    }
-    // Bindless-mirror: mark each destination slot stale so the encode thread re-resolves
-    // it from the freshly-copied record. (Done after the generation bump so the stale
-    // marker carries the new generation.)
+    // Publish each destination record and its stale marker under the same
+    // heap lock. Queue-side snapshot readers can therefore observe either the
+    // old descriptor or the complete new descriptor, never an in-between
+    // record paired with the wrong generation.
     for (size_t i = 0; i < destinations.size(); i++) {
-      MarkDescriptorMirrorStaleForWrite(*destinations[i]);
+      auto destination_lock =
+          LockDescriptorRecordForWrite(*destinations[i]);
+      DescriptorContentRevisionCommitGuard revision_commit(
+          DescriptorWriteAffectsShaderBinding(*destinations[i]));
+      CopyDescriptorRecord(*destinations[i], copied[i]);
+      if (DescriptorWriteAffectsShaderBinding(*destinations[i]))
+        BeginDescriptorSlotWrite(*destinations[i]);
       MaterializeSamplerMirrorForWrite(GetMTLDevice(), *destinations[i]);
-      CopyDescriptorTexturePoolSlot(*destinations[i], copied[i]);
       MaterializeDescriptorTableForWrite(this, *destinations[i]);
     }
 
@@ -3546,30 +3588,38 @@ public:
                                                D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
     if (!descriptor_count)
       return;
-    auto *dst = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+    auto dst_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
         dst_descriptor_range_offset, descriptor_heap_type, descriptor_count,
         "CopyDescriptorsSimple destination");
-    auto *src = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+    auto src_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
         src_descriptor_range_offset, descriptor_heap_type, descriptor_count,
         "CopyDescriptorsSimple source");
-    if (!dst || !src)
+    if (!dst_lease || !src_lease)
       return;
-    std::vector<DescriptorRecord> copied(src, src + descriptor_count);
-    bool affects_shader_binding = false;
-    for (UINT i = 0; i < copied.size(); i++) {
-      CopyDescriptorRecord(dst[i], copied[i]);
-      affects_shader_binding =
-          affects_shader_binding || DescriptorWriteAffectsShaderBinding(dst[i]);
+    auto *dst = dst_lease.get();
+    auto *src = src_lease.get();
+    if (src[0].shader_visible) {
+      WARN("D3D12Device: CopyDescriptorsSimple source heap must not be "
+           "shader-visible");
+      return;
     }
-    if (affects_shader_binding) {
-      BumpDescriptorContentGeneration();
-      RecordDescriptorContentCopyPerf();
-    }
-    // Bindless-mirror: mark each destination slot stale (see CopyDescriptors).
+    std::vector<DescriptorRecord> copied;
+    copied.reserve(descriptor_count);
     for (UINT i = 0; i < descriptor_count; i++) {
-      MarkDescriptorMirrorStaleForWrite(dst[i]);
+      auto source_lock = LockDescriptorRecordForWrite(src[i]);
+      copied.push_back(src[i]);
+    }
+    const bool affects_shader_binding = DescriptorWriteAffectsShaderBinding(dst[0]);
+    if (affects_shader_binding)
+      RecordDescriptorContentCopyPerf();
+    for (UINT i = 0; i < descriptor_count; i++) {
+      auto destination_lock = LockDescriptorRecordForWrite(dst[i]);
+      DescriptorContentRevisionCommitGuard revision_commit(
+          DescriptorWriteAffectsShaderBinding(dst[i]));
+      CopyDescriptorRecord(dst[i], copied[i]);
+      if (DescriptorWriteAffectsShaderBinding(dst[i]))
+        BeginDescriptorSlotWrite(dst[i]);
       MaterializeSamplerMirrorForWrite(GetMTLDevice(), dst[i]);
-      CopyDescriptorTexturePoolSlot(dst[i], copied[i]);
       MaterializeDescriptorTableForWrite(this, dst[i]);
     }
 
@@ -3714,19 +3764,56 @@ public:
     }
 
     const auto &heap_desc = heap_object->GetHeapDesc();
+    const auto &format_traits = GetDXGIFormatTraits(desc->Format);
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        (format_traits.flags & DXGI_FORMAT_TRAIT_VIDEO) &&
+        format_traits.planeCount > 1) {
+      WARN("D3D12Device: CreatePlacedResource does not support split-plane "
+           "texture placement"
+           " format=", desc->Format,
+           " planes=", format_traits.planeCount);
+      return E_NOTIMPL;
+    }
+
+    auto placement_heap = heap_object->GetPlacementHeap();
+    if (!placement_heap &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+      WARN("D3D12Device: CreatePlacedResource could not create placement heap"
+           " heapSize=", heap_desc.SizeInBytes,
+           " heapType=", heap_desc.Properties.Type,
+           " heapFlags=", heap_desc.Flags,
+           " dimension=", desc->Dimension);
+      return E_NOTIMPL;
+    }
     dxmt::Buffer *placed_buffer =
-        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !placement_heap
             ? heap_object->GetBuffer()
             : nullptr;
     dxmt::BufferAllocation *placed_buffer_allocation =
-        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !placement_heap
             ? heap_object->GetAllocation()
             : nullptr;
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), &heap_desc.Properties,
         heap_desc.Flags, desc, initial_state, heap_offset,
         optimized_clear_value, d3d12::ResourceKind::Placed,
-        placed_buffer, placed_buffer_allocation);
+        placed_buffer, placed_buffer_allocation, placement_heap);
+    auto *resource_impl = dynamic_cast<d3d12::Resource *>(resource_object.ptr());
+    const bool allocation_valid =
+        resource_impl &&
+        (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+             ? resource_impl->GetBufferAllocation() != nullptr
+             : resource_impl->GetTextureAllocation() != nullptr);
+    if (!allocation_valid) {
+      WARN("D3D12Device: CreatePlacedResource backing allocation failed"
+           " heapOffset=", heap_offset,
+           " heapSize=", heap_desc.SizeInBytes,
+           " dimension=", desc->Dimension,
+           " width=", desc->Width,
+           " height=", desc->Height,
+           " format=", desc->Format);
+      return E_OUTOFMEMORY;
+    }
     auto hr = resource_object->QueryInterface(riid, resource);
     if (dxmt::apitrace::d3d_enabled()) {
       auto *created = resource && *resource ? dynamic_cast<d3d12::Resource *>(
@@ -3929,19 +4016,14 @@ public:
     InitReturnPtr(lib);
     if (!lib)
       return E_POINTER;
-    if (!blob && blob_size)
-      return WARN_E_INVALIDARG(__func__);
-
-    if (blob_size)
-      WARN("D3D12Device: ignoring serialized pipeline library blob");
-
-#ifdef __ID3D12PipelineLibrary_INTERFACE_DEFINED__
-    auto library = d3d12::CreatePipelineLibrary(
-        static_cast<IMTLD3D12Device *>(this));
-    return library->QueryInterface(iid, lib);
-#else
-    return E_NOINTERFACE;
-#endif
+    (void)blob;
+    (void)blob_size;
+    (void)iid;
+    // CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE) reports NONE. D3D12
+    // requires CreatePipelineLibrary to fail with DXGI_ERROR_UNSUPPORTED when
+    // D3D12_SHADER_CACHE_SUPPORT_LIBRARY is not advertised; returning an empty
+    // library would falsely promise persistence while discarding its blob.
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(
@@ -4139,9 +4221,12 @@ public:
       switch (desc->Type) {
       case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
       case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+        break;
       case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
       case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
-        break;
+        WARN("D3D12Device::CreateQueryHeap: pipeline and stream-output "
+             "statistics are unsupported");
+        return E_NOTIMPL;
       default:
         return WARN_E_INVALIDARG(__func__);
       }
@@ -4207,6 +4292,14 @@ public:
     }
     if (desc->ByteStride < min_stride)
       return WARN_E_INVALIDARG(__func__);
+    if (desc->NumArgumentDescs != 1) {
+      // State-changing signatures require GPU-side argument preprocessing.
+      // The CPU expansion path cannot read legal DEFAULT-heap arguments, so
+      // reject these signatures instead of accepting and later dropping work.
+      WARN("D3D12Device::CreateCommandSignature: state-changing indirect "
+           "signatures are unsupported");
+      return E_NOTIMPL;
+    }
 
     auto signature = d3d12::CreateCommandSignature(
         static_cast<IMTLD3D12Device *>(this), desc, root_signature);
@@ -4612,12 +4705,16 @@ public:
       ID3D12Resource *targeted_resource, ID3D12Resource *feedback_resource,
       D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor) override {
     WARN("D3D12Device: sampler feedback UAVs are unsupported");
-    if (auto *record = GetDescriptorRecordForWrite(
+    if (auto record = GetDescriptorRecordForWrite(
             dst_descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             "sampler feedback UAV")) {
+      auto descriptor_lock = LockDescriptorRecordForWrite(*record);
+      DescriptorContentRevisionCommitGuard revision_commit(
+          DescriptorWriteAffectsShaderBinding(*record));
       ResetDescriptorRecord(*record);
-      BumpDescriptorContentGenerationForWrite(
+      BeginDescriptorSlotWrite(
           *record, DescriptorRecordType::UnorderedAccessView);
+      MaterializeDescriptorTableForWrite(this, *record);
       dxmt::perf::recordDescriptorContentWrite(6);
     }
   }
@@ -4718,10 +4815,12 @@ private:
     }
 
     pso_binary_archive_ = GetMTLDevice().newBinaryArchive(archive_path, error);
+    const std::string archive_error =
+        error ? error.description().getUTF8String() : std::string{};
     LogPSOBinaryArchiveMarker(
         "DXMT_PSO_ARCHIVE: create cold=%d ok=%d err=%s",
         archive_path ? 0 : 1, pso_binary_archive_ ? 1 : 0,
-        error ? error.description().getUTF8String() : "");
+        archive_error.c_str());
     if (error || !pso_binary_archive_) {
       WARN("D3D12Device: failed to ",
            archive_path ? "load" : "create",
@@ -4762,7 +4861,7 @@ private:
             "DXMT_PSO_ARCHIVE: serialize reason=%s count=%llu ok=0 path=%s err=%s",
             reason, static_cast<unsigned long long>(count),
             pso_binary_archive_unix_path_.c_str(),
-            error.description().getUTF8String());
+            error.description().getUTF8String().c_str());
         return false;
       }
 
@@ -4805,6 +4904,32 @@ private:
     fclose(marker);
   }
 
+  bool GetResourceSizeAndAlignment(const D3D12_RESOURCE_DESC &desc,
+                                   UINT64 &size,
+                                   UINT64 &alignment) const {
+    alignment = desc.Alignment;
+    if (!alignment) {
+      alignment = desc.SampleDesc.Count > 1
+                      ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                      : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    }
+
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      size = desc.Width;
+      return size != 0;
+    }
+
+    WMTSizeAndAlign metal_size_and_align = {};
+    if (!d3d12::IsSupportedResourceDesc(desc) ||
+        !d3d12::GetTextureHeapSizeAndAlign(
+            device_->device(), desc, metal_size_and_align))
+      return false;
+
+    size = metal_size_and_align.size;
+    alignment = std::max(alignment, metal_size_and_align.alignment);
+    return size != 0 && alignment != 0;
+  }
+
   D3D12_RESOURCE_ALLOCATION_INFO
   GetResourceAllocationInfoImpl(UINT visible_mask, UINT resource_desc_count,
                                 const D3D12_RESOURCE_DESC *resource_descs) const {
@@ -4814,37 +4939,30 @@ private:
     if (!resource_desc_count || !resource_descs)
       return info;
 
+    UINT64 offset = 0;
     for (UINT i = 0; i < resource_desc_count; i++) {
       const auto &desc = resource_descs[i];
-      UINT64 alignment = desc.Alignment;
-      if (!alignment)
-        alignment = desc.SampleDesc.Count > 1
-                        ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                        : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-
-      UINT64 size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-      if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        size = desc.Width;
-      } else {
-        const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
-        const UINT plane_count = GetD3D12FormatPlaneCount(desc.Format);
-        const UINT subresources = mip_levels *
-                                  (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                                       ? 1
-                                       : desc.DepthOrArraySize) *
-                                  plane_count;
-        UINT64 total_bytes = 0;
-        GetCopyableFootprintsImpl(&desc, 0, subresources, 0, nullptr, nullptr,
-                                  nullptr, &total_bytes, false);
-        size = total_bytes;
+      UINT64 size = 0;
+      UINT64 alignment = 0;
+      if (!GetResourceSizeAndAlignment(desc, size, alignment)) {
+        info.SizeInBytes = UINT64_MAX;
+        return info;
       }
-      if (!info.Alignment)
-        info.Alignment = alignment;
-      else
-        info.Alignment = std::max(info.Alignment, alignment);
-      info.SizeInBytes += Align(size, alignment);
+
+      info.Alignment = std::max(info.Alignment, alignment);
+      UINT64 resource_offset = 0;
+      UINT64 aligned_size = 0;
+      UINT64 next_offset = 0;
+      if (!CheckedAlign(offset, alignment, resource_offset) ||
+          !CheckedAlign(size, alignment, aligned_size) ||
+          !CheckedAdd(resource_offset, aligned_size, next_offset)) {
+        info.SizeInBytes = UINT64_MAX;
+        return info;
+      }
+      offset = next_offset;
     }
 
+    info.SizeInBytes = offset;
     return info;
   }
 
@@ -4899,42 +5017,46 @@ private:
     if (!resource_desc_count || !resource_descs)
       return info;
 
+    auto invalidate_resource_info = [&](UINT first, UINT64 alignment) {
+      if (!resource_info)
+        return;
+      for (UINT i = first; i < resource_desc_count; ++i) {
+        resource_info[i].Offset = UINT64_MAX;
+        resource_info[i].Alignment = 0;
+        resource_info[i].SizeInBytes = UINT64_MAX;
+      }
+      resource_info[first].Alignment = alignment;
+    };
+
     UINT64 offset = 0;
     for (UINT i = 0; i < resource_desc_count; i++) {
       const auto &desc = resource_descs[i];
-      UINT64 alignment = desc.Alignment;
-      if (!alignment)
-        alignment = desc.SampleDesc.Count > 1
-                        ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                        : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-
-      UINT64 size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-      if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        size = desc.Width;
-      } else {
-        const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
-        const UINT plane_count = GetD3D12FormatPlaneCount(desc.Format);
-        const UINT subresources = mip_levels *
-                                  (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                                       ? 1
-                                       : desc.DepthOrArraySize) *
-                                  plane_count;
-        UINT64 total_bytes = 0;
-        GetCopyableFootprintsImpl(&desc, 0, subresources, 0, nullptr, nullptr,
-                                  nullptr, &total_bytes, false);
-        size = total_bytes;
+      UINT64 size = 0;
+      UINT64 alignment = 0;
+      if (!GetResourceSizeAndAlignment(desc, size, alignment)) {
+        info.SizeInBytes = UINT64_MAX;
+        invalidate_resource_info(i, alignment);
+        return info;
       }
 
-      offset = Align(offset, alignment);
-      const UINT64 aligned_size = Align(size, alignment);
+      info.Alignment = std::max(info.Alignment, alignment);
+      UINT64 resource_offset = 0;
+      UINT64 aligned_size = 0;
+      UINT64 next_offset = 0;
+      if (!CheckedAlign(offset, alignment, resource_offset) ||
+          !CheckedAlign(size, alignment, aligned_size) ||
+          !CheckedAdd(resource_offset, aligned_size, next_offset)) {
+        info.SizeInBytes = UINT64_MAX;
+        invalidate_resource_info(i, alignment);
+        return info;
+      }
       if (resource_info) {
-        resource_info[i].Offset = offset;
+        resource_info[i].Offset = resource_offset;
         resource_info[i].Alignment = alignment;
         resource_info[i].SizeInBytes = aligned_size;
       }
 
-      info.Alignment = std::max(info.Alignment, alignment);
-      offset += aligned_size;
+      offset = next_offset;
     }
 
     info.SizeInBytes = offset;
@@ -4966,6 +5088,11 @@ private:
         desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
         desc->Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
       return "unsupported-alignment";
+    const UINT64 heap_alignment =
+        desc->Alignment ? desc->Alignment
+                        : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (desc->SizeInBytes > UINT64_MAX - (heap_alignment - 1))
+      return "size-alignment-overflow";
     if (desc->Properties.CreationNodeMask > 1)
       return "creation-node-mask";
     if (desc->Properties.VisibleNodeMask > 1)
@@ -5151,8 +5278,10 @@ private:
     if (HasInvalidCpuVisibleBufferFlags(*desc, *heap_properties))
       return false;
     if (IsAbstractedCpuVisibleHeap(*heap_properties)) {
-      if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-          desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+      // UPLOAD and READBACK are abstracted buffer-only heap types. CPU-visible
+      // custom heaps have separate UMA-dependent rules and are intentionally
+      // not covered by this check.
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         return false;
       if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
@@ -5227,12 +5356,10 @@ private:
       return "buffer-simultaneous-access";
 
     const auto allocation_info = GetResourceAllocationInfoImpl(1, 1, desc);
-    if (allocation_info.SizeInBytes == 0)
-      return "zero-allocation-size";
-    const UINT64 placement_alignment =
-        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
-            ? D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT
-            : allocation_info.Alignment;
+    if (allocation_info.SizeInBytes == 0 ||
+        allocation_info.SizeInBytes == UINT64_MAX)
+      return "invalid-allocation-size";
+    const UINT64 placement_alignment = allocation_info.Alignment;
     if (heap_offset % placement_alignment)
       return "heap-offset-alignment";
     const auto &heap_desc = heap.GetHeapDesc();
@@ -5250,9 +5377,8 @@ private:
     if (HasInvalidCpuVisibleBufferFlags(*desc, heap.GetHeapDesc().Properties))
       return "cpu-visible-buffer-flags";
     if (IsAbstractedCpuVisibleHeap(heap.GetHeapDesc().Properties) &&
-        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-        desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
-      return "cpu-visible-texture-layout";
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+      return "abstracted-cpu-visible-texture";
 
     const auto heap_flags = heap.GetHeapDesc().Flags;
     if ((heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&

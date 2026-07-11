@@ -1,8 +1,10 @@
 #include "d3d12_resource.hpp"
+#include "dxmt_checked_math.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
+#include "d3d12_command_queue.hpp"
 #include "d3d12_heap.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_format.hpp"
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -189,14 +192,10 @@ private:
   bool stopping_ = false;
 };
 
-static UINT64
-Align(UINT64 value, UINT64 alignment) {
-  return (value + alignment - 1) & ~(alignment - 1);
-}
-
 struct BufferGpuVirtualAddressRange {
   D3D12_GPU_VIRTUAL_ADDRESS base = 0;
   UINT64 size = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS prefix_max_last_address = 0;
   Resource *resource = nullptr;
 };
 
@@ -211,10 +210,30 @@ bool ShouldLogRepeatedGpuVaWarning(std::atomic<uint32_t> &counter) {
 bool BufferGpuVirtualAddressRangeContains(
     const BufferGpuVirtualAddressRange &range,
     D3D12_GPU_VIRTUAL_ADDRESS address) {
-  if (!range.base || !range.size)
+  if (!range.base || !range.size || address < range.base)
     return false;
   const UINT64 offset = address - range.base;
-  return address >= range.base && offset < range.size;
+  return offset < range.size;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS BufferGpuVirtualAddressRangeLastAddress(
+    D3D12_GPU_VIRTUAL_ADDRESS base, UINT64 size) {
+  if (!size)
+    return base;
+  const UINT64 extent = size - 1;
+  return extent > std::numeric_limits<UINT64>::max() - base
+             ? std::numeric_limits<UINT64>::max()
+             : base + extent;
+}
+
+void RefreshBufferGpuVirtualAddressPrefixMax() {
+  D3D12_GPU_VIRTUAL_ADDRESS prefix_max = 0;
+  for (auto &range : g_buffer_va_ranges) {
+    prefix_max = std::max(
+        prefix_max,
+        BufferGpuVirtualAddressRangeLastAddress(range.base, range.size));
+    range.prefix_max_last_address = prefix_max;
+  }
 }
 
 UINT64 BufferGpuVirtualAddressRangeRemaining(
@@ -260,7 +279,14 @@ void RegisterBufferGpuVirtualAddress(Resource *resource,
            " overlapCount=", overlap_count);
     }
   }
-  g_buffer_va_ranges.push_back({base, size, resource});
+  const auto insertion = std::upper_bound(
+      g_buffer_va_ranges.begin(), g_buffer_va_ranges.end(), base,
+      [](D3D12_GPU_VIRTUAL_ADDRESS address,
+         const BufferGpuVirtualAddressRange &range) {
+        return address < range.base;
+      });
+  g_buffer_va_ranges.insert(insertion, {base, size, 0, resource});
+  RefreshBufferGpuVirtualAddressPrefixMax();
 }
 
 void UnregisterBufferGpuVirtualAddress(Resource *resource) {
@@ -269,14 +295,17 @@ void UnregisterBufferGpuVirtualAddress(Resource *resource) {
                 [resource](const BufferGpuVirtualAddressRange &range) {
                   return range.resource == resource;
                 });
+  RefreshBufferGpuVirtualAddressPrefixMax();
 }
 
 WMTTextureUsage
-GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
+GetTextureUsage(D3D12_RESOURCE_FLAGS flags,
+                bool resolve_destination_compatible) {
   WMTTextureUsage usage =
       WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView;
-  if (flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+  if (resolve_destination_compatible ||
+      (flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
     usage |= WMTTextureUsageRenderTarget;
   if (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
     usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
@@ -402,7 +431,7 @@ struct TextureSubresourceLayout {
   UINT row_count = 0;
   UINT64 row_size = 0;
   UINT row_pitch = 0;
-  UINT slice_pitch = 0;
+  UINT64 slice_pitch = 0;
   UINT element_size = 0;
 };
 
@@ -434,6 +463,44 @@ GetMipLevels(const D3D12_RESOURCE_DESC &desc) {
   if (desc.MipLevels)
     return desc.MipLevels;
   return GetMaxMipLevels(desc);
+}
+
+static bool
+BuildTextureInfo(WMT::Device device, const D3D12_RESOURCE_DESC &desc,
+                 UINT plane, WMTTextureInfo &info) {
+  MTL_DXGI_FORMAT_DESC format = {};
+  if (FAILED(MTLQueryDXGIFormat(device,
+                                ResolveTextureBackingFormat(desc, plane),
+                                format)))
+    return false;
+
+  info = {};
+  info.pixel_format = format.PixelFormat;
+  info.width = static_cast<uint32_t>(GetTexturePlaneWidth(desc, plane));
+  info.height = GetTexturePlaneHeight(desc, plane);
+  info.depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                   ? desc.DepthOrArraySize
+                   : 1;
+  info.array_length = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                          ? 1
+                          : desc.DepthOrArraySize;
+  info.type = GetTextureType(desc);
+  info.mipmap_level_count =
+      std::min(GetMipLevels(desc), GetMaxMipLevels(desc));
+  info.sample_count = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+  // D3D12 does not require ALLOW_RENDER_TARGET on a ResolveSubresource
+  // destination. DXMT implements both whole and region resolves with a Metal
+  // render pass, so every color format that could legally be a resolve target
+  // must be created with MTLTextureUsageRenderTarget from the outset. Views
+  // cannot add that capability later. Block-compressed and video formats are
+  // not color-render-pass resolve destinations.
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  const bool resolve_destination_compatible =
+      !(format.Flag & MTL_DXGI_FORMAT_BC) &&
+      !(traits.flags & DXGI_FORMAT_TRAIT_VIDEO);
+  info.usage =
+      GetTextureUsage(desc.Flags, resolve_destination_compatible);
+  return true;
 }
 
 static UINT64
@@ -576,11 +643,19 @@ GetTextureSubresourceLayout(WMT::Device device,
     return WARN_E_INVALIDARG(__func__);
 
   const UINT64 block_columns =
-      (layout.width + layout.block_width - 1) / layout.block_width;
-  layout.row_size = block_columns * layout.element_size;
-  layout.row_pitch = static_cast<UINT>(
-      Align(layout.row_size, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
-  layout.slice_pitch = layout.row_pitch * layout.row_count;
+      layout.width / layout.block_width +
+      (layout.width % layout.block_width != 0);
+  if (!CheckedMultiply(block_columns, layout.element_size, layout.row_size))
+    return E_INVALIDARG;
+  UINT64 aligned_row_pitch = 0;
+  if (!CheckedAlign(layout.row_size, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT,
+                    aligned_row_pitch) ||
+      aligned_row_pitch > UINT_MAX)
+    return E_INVALIDARG;
+  layout.row_pitch = static_cast<UINT>(aligned_row_pitch);
+  if (!CheckedMultiply(layout.row_pitch, layout.row_count,
+                       layout.slice_pitch))
+    return E_INVALIDARG;
   return S_OK;
 }
 
@@ -617,31 +692,40 @@ NormalizeTextureBox(const D3D12_RESOURCE_DESC &desc,
   return true;
 }
 
-static UINT64
+static bool
 TextureRowOffset(const D3D12_BOX &box,
                  const TextureSubresourceLayout &layout, UINT row,
-                 UINT depth_slice) {
-  const UINT block_x = box.left / layout.block_width;
-  const UINT block_y = (box.top / layout.block_height) + row;
-  return static_cast<UINT64>(box.front + depth_slice) * layout.slice_pitch +
-         static_cast<UINT64>(block_y) * layout.row_pitch +
-         static_cast<UINT64>(block_x) * layout.element_size;
+                 UINT depth_slice, UINT64 &offset) {
+  const UINT64 block_x = box.left / layout.block_width;
+  const UINT64 block_y = UINT64(box.top / layout.block_height) + row;
+  const UINT64 depth = UINT64(box.front) + depth_slice;
+  UINT64 depth_offset = 0;
+  UINT64 row_offset = 0;
+  UINT64 column_offset = 0;
+  UINT64 partial = 0;
+  return CheckedMultiply(depth, layout.slice_pitch, depth_offset) &&
+         CheckedMultiply(block_y, layout.row_pitch, row_offset) &&
+         CheckedMultiply(block_x, layout.element_size, column_offset) &&
+         CheckedAdd(depth_offset, row_offset, partial) &&
+         CheckedAdd(partial, column_offset, offset);
 }
 
 static UINT
 TextureBoxRowCount(const D3D12_BOX &box,
                    const TextureSubresourceLayout &layout) {
+  const UINT height = box.bottom - box.top;
   return std::max<UINT>(
-      1, (box.bottom - box.top + layout.block_height - 1) /
-             layout.block_height);
+      1, height / layout.block_height +
+             (height % layout.block_height != 0));
 }
 
-static UINT64
+static bool
 TextureBoxRowSize(const D3D12_BOX &box,
-                  const TextureSubresourceLayout &layout) {
+                  const TextureSubresourceLayout &layout, UINT64 &row_size) {
+  const UINT64 width = UINT64(box.right) - box.left;
   const UINT64 block_columns =
-      (box.right - box.left + layout.block_width - 1) / layout.block_width;
-  return block_columns * layout.element_size;
+      width / layout.block_width + (width % layout.block_width != 0);
+  return CheckedMultiply(block_columns, layout.element_size, row_size);
 }
 
 static UINT
@@ -649,39 +733,50 @@ TextureBoxDepthCount(const D3D12_BOX &box) {
   return box.back - box.front;
 }
 
-static UINT
-EffectiveSlicePitch(UINT slice_pitch, UINT row_pitch, UINT row_count) {
-  return slice_pitch ? slice_pitch : row_pitch * row_count;
-}
-
-static HRESULT
-ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT row_pitch,
-                           UINT slice_pitch) {
-  if (row_pitch < row_size)
-    return WARN_E_INVALIDARG(__func__);
-  if (slice_pitch && row_count > 1 &&
-      slice_pitch < row_pitch * (row_count - 1) + row_size)
-    return WARN_E_INVALIDARG(__func__);
-  if (row_count == 1 && slice_pitch && slice_pitch < row_size)
-    return WARN_E_INVALIDARG(__func__);
-  return S_OK;
+static bool
+EffectiveSlicePitch(UINT64 slice_pitch, UINT64 row_pitch, UINT row_count,
+                    UINT64 &effective_slice_pitch) {
+  if (slice_pitch) {
+    effective_slice_pitch = slice_pitch;
+    return true;
+  }
+  return CheckedMultiply(row_pitch, row_count, effective_slice_pitch);
 }
 
 static HRESULT
 ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT depth_count,
-                           UINT row_pitch, UINT slice_pitch) {
-  if (FAILED(ValidateTextureCopyPitches(row_size, row_count, row_pitch,
-                                        slice_pitch)))
+                           UINT64 row_pitch, UINT64 slice_pitch) {
+  if (row_pitch < row_size)
     return WARN_E_INVALIDARG(__func__);
-  if (depth_count > 1 && slice_pitch < row_pitch * (row_count - 1) + row_size)
+  UINT64 preceding_rows = 0;
+  UINT64 row_span = 0;
+  if (!CheckedMultiply(row_pitch, row_count ? row_count - 1 : 0,
+                       preceding_rows) ||
+      !CheckedAdd(preceding_rows, row_size, row_span))
+    return WARN_E_INVALIDARG(__func__);
+  if (slice_pitch && slice_pitch < row_span)
+    return WARN_E_INVALIDARG(__func__);
+  if (depth_count > 1 && slice_pitch < row_span)
+    return WARN_E_INVALIDARG(__func__);
+
+  UINT64 effective_slice_pitch = 0;
+  UINT64 preceding_slices = 0;
+  UINT64 total_span = 0;
+  if (!EffectiveSlicePitch(slice_pitch, row_pitch, row_count,
+                           effective_slice_pitch) ||
+      !CheckedMultiply(effective_slice_pitch,
+                       depth_count ? depth_count - 1 : 0,
+                       preceding_slices) ||
+      !CheckedAdd(preceding_slices, row_span, total_span) ||
+      total_span > std::numeric_limits<size_t>::max())
     return WARN_E_INVALIDARG(__func__);
   return S_OK;
 }
 
 static HRESULT
-CopyTextureRowsToMemory(void *dst_data, UINT dst_row_pitch,
-                        UINT dst_slice_pitch, const void *src_data,
-                        UINT src_row_pitch, UINT src_slice_pitch,
+CopyTextureRowsToMemory(void *dst_data, UINT64 dst_row_pitch,
+                        UINT64 dst_slice_pitch, const void *src_data,
+                        UINT64 src_row_pitch, UINT64 src_slice_pitch,
                         UINT64 row_size, UINT row_count,
                         UINT depth_count = 1) {
   if (!dst_data || !src_data)
@@ -694,15 +789,34 @@ CopyTextureRowsToMemory(void *dst_data, UINT dst_row_pitch,
 
   auto *dst = static_cast<char *>(dst_data);
   const auto *src = static_cast<const char *>(src_data);
-  const UINT dst_effective_slice =
-      EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count);
-  const UINT src_effective_slice =
-      EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
+  UINT64 dst_effective_slice = 0;
+  UINT64 src_effective_slice = 0;
+  if (!EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count,
+                           dst_effective_slice) ||
+      !EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count,
+                           src_effective_slice))
+    return WARN_E_INVALIDARG(__func__);
   for (UINT z = 0; z < depth_count; z++) {
-    for (UINT row = 0; row < row_count; row++)
-      std::memcpy(dst + z * dst_effective_slice + row * dst_row_pitch,
-                  src + z * src_effective_slice + row * src_row_pitch,
+    for (UINT row = 0; row < row_count; row++) {
+      UINT64 dst_slice_offset = 0;
+      UINT64 dst_row_offset = 0;
+      UINT64 dst_offset = 0;
+      UINT64 src_slice_offset = 0;
+      UINT64 src_row_offset = 0;
+      UINT64 src_offset = 0;
+      if (!CheckedMultiply(z, dst_effective_slice, dst_slice_offset) ||
+          !CheckedMultiply(row, dst_row_pitch, dst_row_offset) ||
+          !CheckedAdd(dst_slice_offset, dst_row_offset, dst_offset) ||
+          !CheckedMultiply(z, src_effective_slice, src_slice_offset) ||
+          !CheckedMultiply(row, src_row_pitch, src_row_offset) ||
+          !CheckedAdd(src_slice_offset, src_row_offset, src_offset) ||
+          dst_offset > std::numeric_limits<size_t>::max() ||
+          src_offset > std::numeric_limits<size_t>::max())
+        return WARN_E_INVALIDARG(__func__);
+      std::memcpy(dst + static_cast<size_t>(dst_offset),
+                  src + static_cast<size_t>(src_offset),
                   static_cast<size_t>(row_size));
+    }
   }
   return S_OK;
 }
@@ -716,18 +830,18 @@ public:
                const D3D12_RESOURCE_DESC &desc,
                D3D12_RESOURCE_STATES initial_state,
                UINT64 heap_offset,
-               const D3D12_CLEAR_VALUE *optimized_clear_value,
+               const D3D12_CLEAR_VALUE *,
                ResourceKind kind,
                dxmt::Buffer *placed_buffer = nullptr,
-               dxmt::BufferAllocation *placed_buffer_allocation = nullptr)
+               dxmt::BufferAllocation *placed_buffer_allocation = nullptr,
+               WMT::Heap placement_heap = {})
       : device_(device), heap_properties_(heap_properties),
         heap_flags_(heap_flags), desc_(desc), initial_state_(initial_state),
-        heap_offset_(heap_offset), kind_(kind),
+        heap_offset_(heap_offset), buffer_backing_offset_(heap_offset),
+        kind_(kind),
         placed_buffer_(placed_buffer),
         placed_buffer_allocation_(placed_buffer_allocation),
-        has_clear_value_(optimized_clear_value != nullptr) {
-    if (optimized_clear_value)
-      clear_value_ = *optimized_clear_value;
+        placement_heap_(placement_heap) {
     if (!desc_.Alignment)
       desc_.Alignment = GetDefaultResourceAlignment(desc_);
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !desc_.MipLevels)
@@ -856,7 +970,7 @@ public:
 
       WaitPendingTimestampResolveForMapRead(read_range);
       mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
-               heap_offset_;
+               buffer_backing_offset_;
       goto done;
     }
 
@@ -906,7 +1020,7 @@ public:
       if (written_end > written_begin) {
         dxmt::apitrace::record_resource_unmap(
             this, sub_resource, written_begin, written_end,
-            mapped_memory + heap_offset_ + written_begin,
+            mapped_memory + buffer_backing_offset_ + written_begin,
             static_cast<size_t>(written_end - written_begin));
       } else {
         dxmt::apitrace::record_resource_unmap(
@@ -915,9 +1029,9 @@ public:
     }
 
     if (written_end > written_begin) {
-      buffer_allocation_->flushCpuShadow(written_begin,
+      buffer_allocation_->flushCpuShadow(buffer_backing_offset_ + written_begin,
                                          written_end - written_begin);
-      buffer_allocation_->didModifyRange(written_begin,
+      buffer_allocation_->didModifyRange(buffer_backing_offset_ + written_begin,
                                          written_end - written_begin);
     }
   }
@@ -943,7 +1057,7 @@ public:
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
         !buffer_allocation_)
       return 0;
-    return buffer_allocation_->gpuAddress() + heap_offset_;
+    return buffer_allocation_->gpuAddress() + buffer_backing_offset_;
   }
 
   HRESULT STDMETHODCALLTYPE WriteToSubresource(
@@ -1080,7 +1194,7 @@ public:
   }
 
   UINT64 GetHeapOffset() const override {
-    return heap_offset_;
+    return buffer_backing_offset_;
   }
 
   D3D12_RESOURCE_STATES GetInitialState() const override {
@@ -1181,11 +1295,9 @@ public:
       return;
 
     PendingTimestampResolveRange range = {};
-    range.offset = std::min<UINT64>(offset, desc_.Width);
-    const UINT64 end = std::min<UINT64>(offset + size, desc_.Width);
-    if (end <= range.offset)
+    if (!ClampBufferRange(offset, size, desc_.Width, range.offset,
+                          range.size))
       return;
-    range.size = end - range.offset;
     range.seq = seq;
 
     std::lock_guard lock(pending_timestamp_resolve_mutex_);
@@ -1204,11 +1316,9 @@ public:
       return;
 
     PendingCpuQueryResolveRange range = {};
-    range.offset = std::min<UINT64>(offset, desc_.Width);
-    const UINT64 end = std::min<UINT64>(offset + size, desc_.Width);
-    if (end <= range.offset)
+    if (!ClampBufferRange(offset, size, desc_.Width, range.offset,
+                          range.size))
       return;
-    range.size = end - range.offset;
     range.seq = seq;
     range.resolve = std::move(resolve);
 
@@ -1220,15 +1330,15 @@ public:
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !size)
       return false;
 
-    const UINT64 read_begin = std::min<UINT64>(offset, desc_.Width);
-    const UINT64 read_end = std::min<UINT64>(offset + size, desc_.Width);
-    if (read_end <= read_begin)
+    UINT64 read_begin = 0;
+    UINT64 read_size = 0;
+    if (!ClampBufferRange(offset, size, desc_.Width, read_begin, read_size))
       return false;
 
     std::lock_guard lock(pending_cpu_query_resolve_mutex_);
     for (const auto &range : pending_cpu_query_resolves_) {
       if (BufferRangesOverlap(range.offset, range.size, read_begin,
-                              read_end - read_begin))
+                              read_size))
         return true;
     }
     return false;
@@ -1239,9 +1349,9 @@ public:
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !size)
       return false;
 
-    const UINT64 read_begin = std::min<UINT64>(offset, desc_.Width);
-    const UINT64 read_end = std::min<UINT64>(offset + size, desc_.Width);
-    if (read_end <= read_begin)
+    UINT64 read_begin = 0;
+    UINT64 read_size = 0;
+    if (!ClampBufferRange(offset, size, desc_.Width, read_begin, read_size))
       return false;
 
     std::vector<PendingCpuQueryResolveRange> selected;
@@ -1252,7 +1362,7 @@ public:
       selected.reserve(pending_cpu_query_resolves_.size());
       for (auto &range : pending_cpu_query_resolves_) {
         if (BufferRangesOverlap(range.offset, range.size, read_begin,
-                                read_end - read_begin))
+                                read_size))
           selected.push_back(std::move(range));
         else
           remaining.push_back(std::move(range));
@@ -1352,7 +1462,9 @@ private:
 
     const UINT row_count = TextureBoxRowCount(box, layout);
     const UINT depth_count = TextureBoxDepthCount(box);
-    const UINT64 row_size = TextureBoxRowSize(box, layout);
+    UINT64 row_size = 0;
+    if (!TextureBoxRowSize(box, layout, row_size))
+      return WARN_E_INVALIDARG(__func__);
     if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
                                           src_row_pitch, src_slice_pitch)))
       return WARN_E_INVALIDARG(__func__);
@@ -1390,7 +1502,9 @@ private:
 
     const UINT row_count = TextureBoxRowCount(box, layout);
     const UINT depth_count = TextureBoxDepthCount(box);
-    const UINT64 row_size = TextureBoxRowSize(box, layout);
+    UINT64 row_size = 0;
+    if (!TextureBoxRowSize(box, layout, row_size))
+      return WARN_E_INVALIDARG(__func__);
     if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
                                           dst_row_pitch, dst_slice_pitch)))
       return WARN_E_INVALIDARG(__func__);
@@ -1415,13 +1529,27 @@ private:
                                  dxmt::TextureAllocation *texture_allocation) {
     auto *dst = static_cast<char *>(texture_allocation->mappedMemory);
     const auto *src = static_cast<const char *>(src_data);
-    const UINT src_effective_slice =
-        EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
+    UINT64 src_effective_slice = 0;
+    if (!EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count,
+                             src_effective_slice))
+      return WARN_E_INVALIDARG(__func__);
     for (UINT z = 0; z < depth_count; z++) {
-      for (UINT row = 0; row < row_count; row++)
-        std::memcpy(dst + TextureRowOffset(box, layout, row, z),
-                    src + z * src_effective_slice + row * src_row_pitch,
+      for (UINT row = 0; row < row_count; row++) {
+        UINT64 texture_offset = 0;
+        UINT64 src_slice_offset = 0;
+        UINT64 src_row_offset = 0;
+        UINT64 src_offset = 0;
+        if (!TextureRowOffset(box, layout, row, z, texture_offset) ||
+            !CheckedMultiply(z, src_effective_slice, src_slice_offset) ||
+            !CheckedMultiply(row, src_row_pitch, src_row_offset) ||
+            !CheckedAdd(src_slice_offset, src_row_offset, src_offset) ||
+            texture_offset > std::numeric_limits<size_t>::max() ||
+            src_offset > std::numeric_limits<size_t>::max())
+          return WARN_E_INVALIDARG(__func__);
+        std::memcpy(dst + static_cast<size_t>(texture_offset),
+                    src + static_cast<size_t>(src_offset),
                     static_cast<size_t>(row_size));
+      }
     }
     return S_OK;
   }
@@ -1434,13 +1562,27 @@ private:
                                 dxmt::TextureAllocation *texture_allocation) {
     auto *dst = static_cast<char *>(dst_data);
     const auto *src = static_cast<const char *>(texture_allocation->mappedMemory);
-    const UINT dst_effective_slice =
-        EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count);
+    UINT64 dst_effective_slice = 0;
+    if (!EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count,
+                             dst_effective_slice))
+      return WARN_E_INVALIDARG(__func__);
     for (UINT z = 0; z < depth_count; z++) {
-      for (UINT row = 0; row < row_count; row++)
-        std::memcpy(dst + z * dst_effective_slice + row * dst_row_pitch,
-                    src + TextureRowOffset(box, layout, row, z),
+      for (UINT row = 0; row < row_count; row++) {
+        UINT64 texture_offset = 0;
+        UINT64 dst_slice_offset = 0;
+        UINT64 dst_row_offset = 0;
+        UINT64 dst_offset = 0;
+        if (!TextureRowOffset(box, layout, row, z, texture_offset) ||
+            !CheckedMultiply(z, dst_effective_slice, dst_slice_offset) ||
+            !CheckedMultiply(row, dst_row_pitch, dst_row_offset) ||
+            !CheckedAdd(dst_slice_offset, dst_row_offset, dst_offset) ||
+            texture_offset > std::numeric_limits<size_t>::max() ||
+            dst_offset > std::numeric_limits<size_t>::max())
+          return WARN_E_INVALIDARG(__func__);
+        std::memcpy(dst + static_cast<size_t>(dst_offset),
+                    src + static_cast<size_t>(texture_offset),
                     static_cast<size_t>(row_size));
+      }
     }
     return S_OK;
   }
@@ -1452,15 +1594,24 @@ private:
                                   UINT row_count, UINT depth_count,
                                   UINT dst_sub_resource,
                                   Rc<dxmt::Texture> texture) {
-    const UINT staging_slice_pitch = layout.row_pitch * row_count;
+    UINT64 staging_slice_pitch = 0;
+    UINT64 staging_total_size = 0;
+    if (!CheckedMultiply(layout.row_pitch, row_count, staging_slice_pitch) ||
+        !CheckedMultiply(staging_slice_pitch, depth_count,
+                         staging_total_size) ||
+        staging_total_size > std::numeric_limits<size_t>::max())
+      return E_INVALIDARG;
     const UINT dst_slice = GetTextureSubresourceArraySlice(desc_, dst_sub_resource);
     const UINT dst_level = GetTextureSubresourceMipLevel(desc_, dst_sub_resource);
     const UINT dst_plane = GetTextureSubresourcePlane(desc_, dst_sub_resource);
     const UINT origin_z =
         desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+        staging_slice_pitch > UINT_MAX)
+      return E_INVALIDARG;
     const UINT bytes_per_image =
         desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-            ? staging_slice_pitch
+            ? static_cast<UINT>(staging_slice_pitch)
             : 0;
 
     if (IsDepthStencilResourceFormat(desc_.Format) &&
@@ -1474,17 +1625,19 @@ private:
           new dxmt::Buffer(staging_slice_pitch,
                            device_->GetDXMTDevice().device());
       auto allocation = buffer->allocate(flags);
+      if (!allocation || !allocation->buffer())
+        return E_OUTOFMEMORY;
       buffer->rename(Rc<dxmt::BufferAllocation>(allocation));
       auto *mapped = static_cast<char *>(allocation->mappedMemory(0));
       if (!mapped)
         return E_FAIL;
 
       std::memset(mapped, 0, static_cast<size_t>(staging_slice_pitch));
-      const auto *src = static_cast<const char *>(src_data);
-      for (UINT row = 0; row < row_count; row++)
-        std::memcpy(mapped + row * layout.row_pitch,
-                    src + row * src_row_pitch,
-                    static_cast<size_t>(row_size));
+      HRESULT copy_hr = CopyTextureRowsToMemory(
+          mapped, layout.row_pitch, staging_slice_pitch, src_data,
+          src_row_pitch, src_slice_pitch, row_size, row_count, depth_count);
+      if (FAILED(copy_hr))
+        return copy_hr;
 
       const WMTOrigin origin = {box.left, box.top, origin_z};
       const WMTSize size = {box.right - box.left, box.bottom - box.top, 1};
@@ -1499,7 +1652,7 @@ private:
     }
 
     WMTBufferInfo buffer_info = {};
-    buffer_info.length = staging_slice_pitch * depth_count;
+    buffer_info.length = staging_total_size;
     buffer_info.options = WMTResourceHazardTrackingModeUntracked |
                           WMTResourceOptionCPUCacheModeWriteCombined;
     auto buffer = device_->GetDXMTDevice().device().newBuffer(buffer_info);
@@ -1508,15 +1661,11 @@ private:
 
     auto *mapped = static_cast<char *>(buffer_info.memory.get());
     std::memset(mapped, 0, static_cast<size_t>(buffer_info.length));
-    const auto *src = static_cast<const char *>(src_data);
-    const UINT src_effective_slice =
-        EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
-    for (UINT z = 0; z < depth_count; z++) {
-      for (UINT row = 0; row < row_count; row++)
-        std::memcpy(mapped + z * staging_slice_pitch + row * layout.row_pitch,
-                    src + z * src_effective_slice + row * src_row_pitch,
-                    static_cast<size_t>(row_size));
-    }
+    HRESULT copy_hr = CopyTextureRowsToMemory(
+        mapped, layout.row_pitch, staging_slice_pitch, src_data,
+        src_row_pitch, src_slice_pitch, row_size, row_count, depth_count);
+    if (FAILED(copy_hr))
+      return copy_hr;
 
     return SubmitSynchronousDxmtBlit(
         [buffer, texture, box, row_pitch = layout.row_pitch,
@@ -1549,15 +1698,24 @@ private:
                                  UINT row_count, UINT depth_count,
                                  UINT src_sub_resource,
                                  Rc<dxmt::Texture> texture) {
-    const UINT staging_slice_pitch = layout.row_pitch * row_count;
+    UINT64 staging_slice_pitch = 0;
+    UINT64 staging_total_size = 0;
+    if (!CheckedMultiply(layout.row_pitch, row_count, staging_slice_pitch) ||
+        !CheckedMultiply(staging_slice_pitch, depth_count,
+                         staging_total_size) ||
+        staging_total_size > std::numeric_limits<size_t>::max())
+      return E_INVALIDARG;
     const UINT src_slice = GetTextureSubresourceArraySlice(desc_, src_sub_resource);
     const UINT src_level = GetTextureSubresourceMipLevel(desc_, src_sub_resource);
     const UINT src_plane = GetTextureSubresourcePlane(desc_, src_sub_resource);
     const UINT origin_z =
         desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+        staging_slice_pitch > UINT_MAX)
+      return E_INVALIDARG;
     const UINT bytes_per_image =
         desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-            ? staging_slice_pitch
+            ? static_cast<UINT>(staging_slice_pitch)
             : 0;
 
     if (IsDepthStencilResourceFormat(desc_.Format) &&
@@ -1570,6 +1728,8 @@ private:
                            device_->GetDXMTDevice().device());
       Flags<dxmt::BufferAllocationFlag> flags;
       auto allocation = buffer->allocate(flags);
+      if (!allocation || !allocation->buffer())
+        return E_OUTOFMEMORY;
       buffer->rename(Rc<dxmt::BufferAllocation>(allocation));
       if (!allocation->mappedMemory(0))
         return E_FAIL;
@@ -1600,7 +1760,7 @@ private:
     }
 
     WMTBufferInfo buffer_info = {};
-    buffer_info.length = staging_slice_pitch * depth_count;
+    buffer_info.length = staging_total_size;
     buffer_info.options = WMTResourceHazardTrackingModeUntracked;
     auto buffer = device_->GetDXMTDevice().device().newBuffer(buffer_info);
     if (!buffer || !buffer_info.memory.get())
@@ -1640,16 +1800,34 @@ private:
   template <typename Encode>
   HRESULT SubmitSynchronousDxmtBlit(Encode &&encode) {
     auto &queue = device_->GetDXMTDevice().queue();
+    auto submission_guard =
+        AcquireDxmtQueueSubmissionGuard(device_.ptr());
     const auto seq = queue.CurrentSeqId();
     auto *chunk = queue.CurrentChunk();
     chunk->emitcc(std::forward<Encode>(encode));
     queue.CommitCurrentChunk();
+    submission_guard.lock.unlock();
     queue.WaitCPUFence(seq);
     return S_OK;
   }
 
   void CreateBuffer() {
-    if (placed_buffer_allocation_) {
+    if (kind_ == ResourceKind::Placed && placement_heap_) {
+      buffer_ = new dxmt::Buffer(desc_.Width,
+                                 device_->GetDXMTDevice().device());
+      buffer_allocation_ = buffer_->allocatePlaced(
+          placement_heap_, heap_offset_,
+          GetHeapBufferAllocationFlags(heap_properties_));
+      if (buffer_allocation_)
+        buffer_->rename(Rc<dxmt::BufferAllocation>(buffer_allocation_));
+      buffer_backing_offset_ = 0;
+      if (!buffer_allocation_) {
+        WARN("D3D12Resource: failed to allocate placed buffer from heap"
+             " width=", desc_.Width,
+             " heapOffset=", heap_offset_,
+             " heapFlags=", heap_flags_);
+      }
+    } else if (placed_buffer_allocation_) {
       buffer_ = placed_buffer_;
       buffer_allocation_ = placed_buffer_allocation_;
       if (!buffer_) {
@@ -1729,29 +1907,11 @@ private:
         GetHeapType(heap_properties_) != D3D12_HEAP_TYPE_DEFAULT &&
         IsCpuLinearTextureSubresource(desc_, 0);
 
-    WMTPixelFormat first_pixel_format = WMTPixelFormatInvalid;
     for (UINT plane = 0; plane < plane_count; ++plane) {
-      MTL_DXGI_FORMAT_DESC format = {};
-      if (FAILED(MTLQueryDXGIFormat(device_->GetDXMTDevice().device(),
-                                    ResolveTextureBackingFormat(desc_, plane),
-                                    format)))
-        return;
-
       WMTTextureInfo info = {};
-      info.pixel_format = format.PixelFormat;
-      info.width = static_cast<uint32_t>(GetTexturePlaneWidth(desc_, plane));
-      info.height = GetTexturePlaneHeight(desc_, plane);
-      info.depth = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                       ? desc_.DepthOrArraySize
-                       : 1;
-      info.array_length = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                              ? 1
-                              : desc_.DepthOrArraySize;
-      info.type = GetTextureType(desc_);
-      info.mipmap_level_count =
-          std::min(GetMipLevels(desc_), GetMaxMipLevels(desc_));
-      info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
-      info.usage = GetTextureUsage(desc_.Flags);
+      if (!BuildTextureInfo(device_->GetDXMTDevice().device(), desc_, plane,
+                            info))
+        return;
       if (kind_ == ResourceKind::ReservedTexture) {
         WMTSparseTileSize tile_size = {};
         if (!device_->GetDXMTDevice().device().sparseTileSize(info,
@@ -1787,19 +1947,30 @@ private:
             new dxmt::Texture(info, device_->GetDXMTDevice().device());
       }
 
-      if (kind_ != ResourceKind::ReservedTexture)
+      if (kind_ == ResourceKind::Placed && placement_heap_) {
+        plane_allocations_[plane] = plane_textures_[plane]->allocatePlaced(
+            placement_heap_, heap_offset_, flags);
+        if (plane_allocations_[plane]) {
+          plane_textures_[plane]->rename(
+              Rc<dxmt::TextureAllocation>(plane_allocations_[plane]));
+          if (!plane)
+            texture_allocation_ = plane_allocations_[plane];
+        } else {
+          WARN("D3D12Resource: failed to allocate placed texture from heap"
+               " plane=", plane,
+               " heapOffset=", heap_offset_,
+               " width=", desc_.Width,
+               " height=", desc_.Height,
+               " format=", uint32_t(desc_.Format));
+        }
+      } else if (kind_ != ResourceKind::ReservedTexture) {
         AllocateTexturePlane(plane, flags);
-      else
+      } else {
         reserved_texture_allocation_flags_ = flags;
+      }
       if (!plane) {
-        first_pixel_format = format.PixelFormat;
         texture_ = plane_textures_[plane];
       }
-    }
-
-    if (kind_ != ResourceKind::ReservedTexture &&
-        GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
-      InitializeTextureContents(first_pixel_format);
     }
     if (kind_ == ResourceKind::ReservedTexture) {
       std::lock_guard lock(materialization_mutex_);
@@ -2025,7 +2196,9 @@ private:
     tiling_.packed_mip_info.NumStandardMips = standard_mips;
     tiling_.packed_mip_info.NumPackedMips = mip_levels - standard_mips;
     tiling_.packed_mip_info.NumTilesForPackedMips =
-        tiling_.packed_mip_info.NumPackedMips ? 1 : 0;
+        tiling_.packed_mip_info.NumPackedMips
+            ? array_size * plane_count
+            : 0;
     tiling_.packed_mip_info.StartTileIndexInOverallResource = 0;
 
     tiling_.subresources.reserve(mip_levels * array_size * plane_count);
@@ -2089,63 +2262,6 @@ private:
     has_tiling_ = true;
   }
 
-  void InitializeTextureContents(WMTPixelFormat pixel_format) {
-    auto &initializer = device_->GetDXMTDevice().queue().initializer;
-    const UINT mip_levels = desc_.MipLevels ? desc_.MipLevels : 1;
-    const UINT array_size =
-        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-            ? 1
-            : desc_.DepthOrArraySize;
-    const auto dsv_planar = DepthStencilPlanarFlags(pixel_format);
-    const UINT plane_count = GetTextureBackingPlaneCount(desc_);
-
-    for (UINT plane = 0; plane < plane_count; ++plane) {
-      auto texture = plane_textures_[plane];
-      auto allocation = plane_allocations_[plane];
-      if (!texture || !allocation)
-        continue;
-
-      if (!plane && dsv_planar &&
-          (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
-        const float depth = has_clear_value_ ? clear_value_.DepthStencil.Depth : 0.0f;
-        const uint8_t stencil = has_clear_value_ ? clear_value_.DepthStencil.Stencil : 0;
-        for (UINT slice = 0; slice < array_size; ++slice) {
-          for (UINT level = 0; level < mip_levels; ++level) {
-            initializer.initDepthStencilWithZero(
-                texture.ptr(), texture->current(), slice, level, dsv_planar,
-                depth, stencil);
-          }
-        }
-        continue;
-      }
-
-      if (!plane && (texture->usage() & WMTTextureUsageRenderTarget) &&
-          (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
-        WMTClearColor color = {0, 0, 0, 0};
-        if (has_clear_value_) {
-          color.r = clear_value_.Color[0];
-          color.g = clear_value_.Color[1];
-          color.b = clear_value_.Color[2];
-          color.a = clear_value_.Color[3];
-        }
-        for (UINT slice = 0; slice < array_size; ++slice) {
-          for (UINT level = 0; level < mip_levels; ++level) {
-            initializer.initRenderTargetWithZero(
-                texture.ptr(), texture->current(), slice, level, color);
-          }
-        }
-        continue;
-      }
-
-      for (UINT slice = 0; slice < array_size; ++slice) {
-        for (UINT level = 0; level < mip_levels; ++level) {
-          initializer.initWithZero(texture.ptr(), texture->current(),
-                                   slice, level);
-        }
-      }
-    }
-  }
-
   struct PendingTimestampResolveRange {
     UINT64 offset = 0;
     UINT64 size = 0;
@@ -2159,11 +2275,25 @@ private:
     PendingCpuQueryResolveFn resolve;
   };
 
+  static bool ClampBufferRange(UINT64 offset, UINT64 size, UINT64 limit,
+                               UINT64 &clamped_offset,
+                               UINT64 &clamped_size) {
+    clamped_offset = 0;
+    clamped_size = 0;
+    if (!size || offset >= limit)
+      return false;
+    clamped_offset = offset;
+    clamped_size = std::min(size, limit - offset);
+    return clamped_size != 0;
+  }
+
   static bool BufferRangesOverlap(UINT64 a_offset, UINT64 a_size,
                                   UINT64 b_offset, UINT64 b_size) {
     if (!a_size || !b_size)
       return false;
-    return a_offset < b_offset + b_size && b_offset < a_offset + a_size;
+    if (a_offset <= b_offset)
+      return b_offset - a_offset < a_size;
+    return a_offset - b_offset < b_size;
   }
 
   void WaitPendingTimestampResolveForMapRead(const D3D12_RANGE *read_range) {
@@ -2210,11 +2340,11 @@ private:
   D3D12_RESOURCE_DESC desc_ = {};
   D3D12_RESOURCE_STATES initial_state_ = D3D12_RESOURCE_STATE_COMMON;
   UINT64 heap_offset_ = 0;
+  UINT64 buffer_backing_offset_ = 0;
   ResourceKind kind_ = ResourceKind::Committed;
   Rc<dxmt::Buffer> placed_buffer_;
   Rc<dxmt::BufferAllocation> placed_buffer_allocation_;
-  D3D12_CLEAR_VALUE clear_value_ = {};
-  bool has_clear_value_ = false;
+  WMT::Reference<WMT::Heap> placement_heap_;
   bool has_tiling_ = false;
   ResourceTiling tiling_ = {};
   std::vector<ResourceTileMapping> tile_map_;
@@ -2314,6 +2444,51 @@ ReservedTextureMaterializer::WorkerMain() {
 
 } // namespace
 
+bool
+GetTextureHeapSizeAndAlign(WMT::Device device,
+                           const D3D12_RESOURCE_DESC &desc,
+                           WMTSizeAndAlign &size_and_align) {
+  size_and_align = {};
+  if (!device || desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return false;
+
+  if (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+    TextureSubresourceLayout layout = {};
+    if (FAILED(GetTextureSubresourceLayout(device, desc, 0, layout)) ||
+        !layout.slice_pitch)
+      return false;
+    size_and_align.size = layout.slice_pitch;
+    size_and_align.alignment = 1;
+    return true;
+  }
+
+  UINT64 size = 0;
+  UINT64 alignment = 1;
+  const UINT plane_count = GetTextureBackingPlaneCount(desc);
+  for (UINT plane = 0; plane < plane_count; ++plane) {
+    WMTTextureInfo info = {};
+    if (!BuildTextureInfo(device, desc, plane, info))
+      return false;
+    info.options = WMTResourceHazardTrackingModeUntracked |
+                   WMTResourceStorageModePrivate;
+
+    WMTSizeAndAlign plane_size_and_align = {};
+    if (!device.heapTextureSizeAndAlign(info, plane_size_and_align) ||
+        !plane_size_and_align.size || !plane_size_and_align.alignment)
+      return false;
+
+    UINT64 plane_offset = 0;
+    if (!CheckedAlign(size, plane_size_and_align.alignment, plane_offset) ||
+        !CheckedAdd(plane_offset, plane_size_and_align.size, size))
+      return false;
+    alignment = std::max(alignment, plane_size_and_align.alignment);
+  }
+
+  size_and_align.size = size;
+  size_and_align.alignment = alignment;
+  return size != 0;
+}
+
 Resource *
 LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                                         UINT64 *offset) {
@@ -2321,14 +2496,24 @@ LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
   const BufferGpuVirtualAddressRange *best = nullptr;
   UINT64 best_size = 0;
   UINT64 best_remaining = 0;
-  for (const auto &range : g_buffer_va_ranges) {
+  auto it = std::upper_bound(
+      g_buffer_va_ranges.begin(), g_buffer_va_ranges.end(), address,
+      [](D3D12_GPU_VIRTUAL_ADDRESS candidate,
+         const BufferGpuVirtualAddressRange &range) {
+        return candidate < range.base;
+      });
+  while (it != g_buffer_va_ranges.begin()) {
+    --it;
+    const auto &range = *it;
+    if (range.prefix_max_last_address < address)
+      break;
     if (!BufferGpuVirtualAddressRangeContains(range, address))
       continue;
 
     const auto remaining =
         BufferGpuVirtualAddressRangeRemaining(range, address);
     if (!best || range.size < best_size ||
-        (range.size == best_size && remaining <= best_remaining)) {
+        (range.size == best_size && remaining < best_remaining)) {
       best = &range;
       best_size = range.size;
       best_remaining = remaining;
@@ -2360,6 +2545,8 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
   }
   if (desc.Format == DXGI_FORMAT_UNKNOWN)
     return false;
+  if (desc.MipLevels > GetMaxMipLevels(desc))
+    return false;
   const auto &traits = GetDXGIFormatTraits(desc.Format);
   if (traits.classification == DXGIFormatClass::Mask)
     return false;
@@ -2382,12 +2569,18 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
 
   switch (desc.Dimension) {
   case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-    if (desc.Height != 1 || desc.SampleDesc.Count != 1)
+    if (desc.Width > D3D12_REQ_TEXTURE1D_U_DIMENSION ||
+        desc.DepthOrArraySize > D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION ||
+        desc.Height != 1 || desc.SampleDesc.Count != 1)
       return false;
     if (layout_row_major)
       return desc.DepthOrArraySize == 1 && desc.MipLevels <= 1;
     return true;
   case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+    if (desc.Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        desc.Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        desc.DepthOrArraySize > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION)
+      return false;
     if (layout_row_major) {
       if (desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
           desc.MipLevels > 1)
@@ -2398,7 +2591,10 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
     }
     return true;
   case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-    if (desc.SampleDesc.Count != 1 || layout_row_major)
+    if (desc.Width > D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION ||
+        desc.Height > D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION ||
+        desc.DepthOrArraySize > D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION ||
+        desc.SampleDesc.Count != 1 || layout_row_major)
       return false;
     return true;
   default:
@@ -2414,11 +2610,13 @@ CreateResource(IMTLD3D12Device *device,
                const D3D12_CLEAR_VALUE *optimized_clear_value,
                ResourceKind kind,
                dxmt::Buffer *placed_buffer,
-               dxmt::BufferAllocation *placed_buffer_allocation) {
+               dxmt::BufferAllocation *placed_buffer_allocation,
+               WMT::Heap placement_heap) {
   return Com<ID3D12Resource>::transfer(
       new ResourceImpl(device, *heap_properties, heap_flags, *desc,
                        initial_state, heap_offset, optimized_clear_value,
-                       kind, placed_buffer, placed_buffer_allocation));
+                       kind, placed_buffer, placed_buffer_allocation,
+                       placement_heap));
 }
 
 } // namespace dxmt::d3d12

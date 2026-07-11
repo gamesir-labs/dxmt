@@ -107,6 +107,9 @@ struct PendingRenderPassResolve {
   Com<ID3D12Resource> dst;
   UINT src_subresource = 0;
   UINT dst_subresource = 0;
+  UINT dst_x = 0;
+  UINT dst_y = 0;
+  std::optional<D3D12_RECT> src_rect;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
   D3D12_RESOLVE_MODE mode = D3D12_RESOLVE_MODE_AVERAGE;
 };
@@ -227,7 +230,7 @@ struct EndQueryRecord {
 };
 
 struct ResolveQueryDataRecord {
-  Com<ID3D12GraphicsCommandList> command_list;
+  uintptr_t command_list_identity = 0;
   Com<ID3D12QueryHeap> heap;
   D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_OCCLUSION;
   UINT start_index = 0;

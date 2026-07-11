@@ -164,9 +164,10 @@ NormalizeDescriptorCount(UINT count) {
 
 constexpr D3D12_DESCRIPTOR_RANGE_FLAGS
 RootSignature10DescriptorRangeFlags() {
-  return D3D12_DESCRIPTOR_RANGE_FLAGS(
-      D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
-      D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+  return static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(
+      static_cast<unsigned>(
+          D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE) |
+      static_cast<unsigned>(D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE));
 }
 
 constexpr D3D12_ROOT_DESCRIPTOR_FLAGS
@@ -279,7 +280,7 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
     }
   }
 
-  UINT root_cost = 0;
+  uint64_t root_cost = 0;
   for (UINT i = 0; i < desc.NumParameters; i++) {
     const auto &parameter = desc.pParameters[i];
     switch (parameter.ParameterType) {
@@ -287,7 +288,7 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
       root_cost += 1;
       break;
     case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
-      root_cost += parameter.Constants.Num32BitValues + 1;
+      root_cost += parameter.Constants.Num32BitValues;
       break;
     case D3D12_ROOT_PARAMETER_TYPE_CBV:
     case D3D12_ROOT_PARAMETER_TYPE_SRV:
@@ -335,7 +336,7 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
     }
   }
 
-  UINT root_cost = 0;
+  uint64_t root_cost = 0;
   for (UINT i = 0; i < desc.NumParameters; i++) {
     const auto &parameter = desc.pParameters[i];
     switch (parameter.ParameterType) {
@@ -343,7 +344,7 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
       root_cost += 1;
       break;
     case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
-      root_cost += parameter.Constants.Num32BitValues + 1;
+      root_cost += parameter.Constants.Num32BitValues;
       break;
     case D3D12_ROOT_PARAMETER_TYPE_CBV:
     case D3D12_ROOT_PARAMETER_TYPE_SRV:
@@ -491,6 +492,14 @@ CloneFromDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc,
 
 std::optional<RootSignatureStorage>
 CloneFromVersionedDesc(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &desc) {
+  // The Wine headers used by this runtime do not expose
+  // D3D12_ROOT_SIGNATURE_DESC2 / D3D12_STATIC_SAMPLER_DESC1. The device also
+  // advertises at most root-signature 1.1, so accepting 1.2 through the 1.1
+  // union member would serialize a structurally different descriptor and lose
+  // static-sampler flags. Fail closed until the complete 1.2 ABI is available.
+  if (desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_2)
+    return std::nullopt;
+
   switch (desc.Version) {
   case D3D_ROOT_SIGNATURE_VERSION_1_0:
     if (!ValidateDesc0(desc.Desc_1_0))
@@ -500,10 +509,6 @@ CloneFromVersionedDesc(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &desc) {
     if (!ValidateDesc1(desc.Desc_1_1))
       return std::nullopt;
     return CloneFromDesc1(desc.Desc_1_1, D3D_ROOT_SIGNATURE_VERSION_1_1);
-  case D3D_ROOT_SIGNATURE_VERSION_1_2:
-    if (!ValidateDesc1(desc.Desc_1_1))
-      return std::nullopt;
-    return CloneFromDesc1(desc.Desc_1_1, D3D_ROOT_SIGNATURE_VERSION_1_2);
   default:
     return std::nullopt;
   }
@@ -540,7 +545,10 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
     return false;
 
   const auto version_value = ReadU32(rts0, 0);
-  if (version_value != 1 && version_value != 2 && version_value != 3)
+  // Version 1.2 has a different static-sampler record. Treating it as either
+  // the 1.0 or 1.1 layout can shift subsequent records and silently alter the
+  // root signature. This runtime advertises 1.1, so reject 1.2 blobs.
+  if (version_value != 1 && version_value != 2)
     return false;
 
   const auto parameter_count = ReadU32(rts0, 4);

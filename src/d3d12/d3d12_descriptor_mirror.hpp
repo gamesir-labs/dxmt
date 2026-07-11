@@ -3,9 +3,11 @@
 #include "Metal.hpp"
 #include "winemetal.h"
 #include "dxmt_descriptor_mirror.hpp"
+#include "dxmt_descriptor_revision.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <cstdint>
-#include <unordered_map>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 namespace dxmt {
@@ -84,9 +86,26 @@ struct DescriptorSlotMeta {
 };
 
 struct DescriptorResidencyTarget {
+  // Resources referenced by the native descriptor table. These must survive
+  // independently of any bindless-mirror repair payload.
   WMT::Reference<WMT::Resource> allocation;
   WMT::Reference<WMT::Resource> secondary_allocation;
+  // Allocation backing a deferred bindless texture/texture-buffer payload.
+  // Kept separate so repairing the fallback mirror cannot drop native buffer
+  // or UAV-counter residency.
+  WMT::Reference<WMT::Resource> mirror_allocation;
   Rc<dxmt::Sampler> sampler;
+};
+
+struct DescriptorTextureSlotPayload {
+  uint64_t handle = 0;
+  uint64_t metadata = 0;
+};
+
+struct DescriptorSamplerSlotPayload {
+  uint64_t handle = 0;
+  uint64_t cube_handle = 0;
+  uint64_t lod_bias = 0;
 };
 
 /**
@@ -120,41 +139,70 @@ struct DescriptorResidencyTarget {
  */
 class DescriptorHeapMirror {
 public:
+  using ScopedLock = std::unique_lock<std::recursive_mutex>;
+
   DescriptorHeapMirror(WMT::Device device, uint32_t num_descriptors, bool sampler_heap);
 
+  // DescriptorRecord storage is owned by the heap, but shader-visible record
+  // publication shares this lock with mirror state. Queue-side readers take a
+  // snapshot while holding it; app-thread writers hold it from record mutation
+  // through stale-generation publication.
+  ScopedLock AcquireLock() const { return ScopedLock(mutex_); }
+
   /** GPU virtual address of the mirror buffer (for binding at slot 30 by ③). */
-  uint64_t gpuAddress() const { return gpu_address_; }
+  uint64_t gpuAddress() const {
+    std::lock_guard lock(mutex_);
+    return gpu_address_;
+  }
 
   /** The Metal buffer handle (for residency / binding by ③). */
-  WMT::Buffer buffer() const { return buffer_; }
+  WMT::Buffer buffer() const {
+    std::lock_guard lock(mutex_);
+    return buffer_;
+  }
 
-  WMT::TextureViewPool textureViewPool() const { return texture_view_pool_; }
+  WMT::TextureViewPool textureViewPool() const {
+    std::lock_guard lock(mutex_);
+    return texture_view_pool_;
+  }
   uint64_t textureViewPoolBaseResourceID() const {
+    std::lock_guard lock(mutex_);
     return texture_view_pool_base_resource_id_;
   }
   uint64_t textureViewPoolSlotResourceID(uint32_t index) const {
+    std::lock_guard lock(mutex_);
     return texture_view_pool_base_resource_id_ && index < num_descriptors_
                ? texture_view_pool_base_resource_id_ + index
                : 0;
   }
 
-  uint64_t descriptorTableGpuAddress() const { return table_gpu_address_; }
+  uint64_t descriptorTableGpuAddress() const {
+    std::lock_guard lock(mutex_);
+    return table_gpu_address_;
+  }
 
-  WMT::Buffer descriptorTableBuffer() const { return table_buffer_; }
+  WMT::Buffer descriptorTableBuffer() const {
+    std::lock_guard lock(mutex_);
+    return table_buffer_;
+  }
 
   uint64_t bufferDescriptorRecordGpuAddress() const {
+    std::lock_guard lock(mutex_);
     return buffer_record_gpu_address_;
   }
 
   WMT::Buffer bufferDescriptorRecordBuffer() const {
+    std::lock_guard lock(mutex_);
     return buffer_record_buffer_;
   }
 
   uint64_t bufferResourceTableGpuAddress() const {
+    std::lock_guard lock(mutex_);
     return buffer_resource_table_gpu_address_;
   }
 
   WMT::Buffer bufferResourceTableBuffer() const {
+    std::lock_guard lock(mutex_);
     return buffer_resource_table_buffer_;
   }
 
@@ -162,13 +210,13 @@ public:
   bool isSamplerHeap() const { return sampler_heap_; }
 
   bool descriptorTableBackendReady() const {
-    if (!table_buffer_ || !table_gpu_address_)
-      return false;
-    return sampler_heap_ || texture_view_pool_base_resource_id_;
+    std::lock_guard lock(mutex_);
+    return DescriptorTableBackendReadyUnlocked();
   }
 
   bool nativeDescriptorRecordStorageReady() const {
-    return descriptorTableBackendReady() &&
+    std::lock_guard lock(mutex_);
+    return DescriptorTableBackendReadyUnlocked() &&
            (sampler_heap_ || (buffer_record_buffer_ &&
                               buffer_record_gpu_address_ &&
                               buffer_record_mapped_ &&
@@ -177,21 +225,33 @@ public:
                               buffer_resource_table_mapped_));
   }
 
-  const DescriptorTableEntry *descriptorTableEntry(uint32_t index) const {
-    return index < table_entries_.size() ? &table_entries_[index] : nullptr;
+  std::optional<DescriptorTableEntry>
+  descriptorTableEntry(uint32_t index) const {
+    std::lock_guard lock(mutex_);
+    return index < table_entries_.size()
+               ? std::optional<DescriptorTableEntry>(table_entries_[index])
+               : std::nullopt;
   }
 
-  const BufferDescriptorRecord *bufferDescriptorRecord(uint32_t index) const {
+  std::optional<BufferDescriptorRecord>
+  bufferDescriptorRecord(uint32_t index) const {
+    std::lock_guard lock(mutex_);
     return buffer_record_mapped_ && index < num_descriptors_
-               ? &buffer_record_mapped_[index]
-               : nullptr;
+               ? std::optional<BufferDescriptorRecord>(
+                     buffer_record_mapped_[index])
+               : std::nullopt;
   }
 
-  const DescriptorSlotMeta *slotMeta(uint32_t index) const {
-    return index < slot_meta_.size() ? &slot_meta_[index] : nullptr;
+  std::optional<DescriptorSlotMeta> slotMeta(uint32_t index) const {
+    std::lock_guard lock(mutex_);
+    return index < slot_meta_.size()
+               ? std::optional<DescriptorSlotMeta>(slot_meta_[index])
+               : std::nullopt;
   }
 
-  uint32_t RegisterBufferResource(uint64_t resource_identity,
+  uint32_t RegisterBufferResource(uint32_t descriptor_index,
+                                  bool counter_resource,
+                                  uint64_t resource_identity,
                                   WMT::Resource allocation,
                                   uint64_t gpu_address,
                                   uint64_t byte_size);
@@ -199,15 +259,20 @@ public:
                              WMT::Resource allocation,
                              uint64_t gpu_address,
                              uint64_t byte_size);
-  const DescriptorBackendResourceRecord *
+  std::optional<DescriptorBackendResourceRecord>
   backendResourceRecord(uint32_t index) const {
-    return index < buffer_resources_.size() ? &buffer_resources_[index]
-                                            : nullptr;
+    std::lock_guard lock(mutex_);
+    return index < buffer_resources_.size()
+               ? std::optional<DescriptorBackendResourceRecord>(
+                     buffer_resources_[index])
+               : std::nullopt;
   }
   uint32_t backendResourceCount() const {
+    std::lock_guard lock(mutex_);
     return static_cast<uint32_t>(buffer_resources_.size());
   }
   uint64_t backendResourceTableGeneration() const {
+    std::lock_guard lock(mutex_);
     return buffer_resource_table_generation_;
   }
 
@@ -239,53 +304,43 @@ public:
 
   DescriptorResidencyTarget ReplaceResidencyTarget(
       uint32_t index, DescriptorResidencyTarget target);
+  bool ReplaceMirrorResidencyTargetIfCurrent(
+      uint32_t index, dxmt::DescriptorSlotVersion expected_version,
+      DescriptorResidencyTarget target, DescriptorResidencyTarget *previous);
   std::vector<DescriptorResidencyTarget> DrainResidencyTargets();
-  const DescriptorResidencyTarget *residencyTarget(uint32_t index) const {
-    return index < residency_targets_.size() ? &residency_targets_[index]
-                                             : nullptr;
+  std::optional<DescriptorResidencyTarget>
+  residencyTarget(uint32_t index) const {
+    std::lock_guard lock(mutex_);
+    return index < residency_targets_.size()
+               ? std::optional<DescriptorResidencyTarget>(
+                     residency_targets_[index])
+               : std::nullopt;
   }
 
-  /** Pointer to a texture slot's handle qword. */
-  uint64_t *textureHandlePtr(uint32_t index) {
-    if (sampler_heap_ || !mapped_ || index >= num_descriptors_)
-      return nullptr;
-    return mapped_ + index;
-  }
-
-  /** Pointer to a texture slot's metadata qword. */
-  uint64_t *textureMetadataPtr(uint32_t index) {
-    if (sampler_heap_ || !mapped_ || index >= num_descriptors_)
-      return nullptr;
-    return mapped_ + num_descriptors_ + index;
-  }
-
-  /** Pointer to a sampler slot's primary sampler qword. */
-  uint64_t *samplerHandlePtr(uint32_t index) {
-    if (!sampler_heap_ || !mapped_ || index >= num_descriptors_)
-      return nullptr;
-    return mapped_ + index;
-  }
-
-  /** Pointer to a sampler slot's cube sampler qword. */
-  uint64_t *samplerCubeHandlePtr(uint32_t index) {
-    if (!sampler_heap_ || !mapped_ || index >= num_descriptors_)
-      return nullptr;
-    return mapped_ + num_descriptors_ + index;
-  }
-
-  /** Pointer to a sampler slot's lod-bias qword. */
-  uint64_t *samplerLodBiasPtr(uint32_t index) {
-    if (!mapped_ || index >= num_descriptors_)
-      return nullptr;
-    return mapped_ + uint64_t(num_descriptors_) * 2 + index;
-  }
+  /**
+   * Read every qword belonging to one slot under a single mirror lock. When an
+   * expected generation is supplied, the payload is returned only if that
+   * descriptor version is still fully published. This prevents deferred
+   * encoding from combining fields written by different descriptor versions.
+   */
+  std::optional<DescriptorTextureSlotPayload> textureSlotPayload(
+      uint32_t index,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt) const;
+  std::optional<DescriptorSamplerSlotPayload> samplerSlotPayload(
+      uint32_t index,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt) const;
 
   /**
    * Fill a SAMPLER slot synchronously (app-thread safe). `sampler` may be null, in which
    * case the heap-owned null sampler payload is written. Byte-identical to encodeShader
    * resources via the shared writer.
    */
-  void FillSamplerSlot(uint32_t index, const Sampler *sampler, uint64_t null_handle);
+  bool FillSamplerSlot(
+      uint32_t index, const Sampler *sampler, uint64_t null_handle,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
 
   /**
    * Fill a TEXTURE slot with an already-resolved (gpuResourceID, arrayLength, minLOD).
@@ -293,39 +348,97 @@ public:
    * payloads are still resolved on the encode thread. Byte-identical to the legacy DXBC
    * resource writer.
    */
-  void FillTextureSlot(uint32_t index, uint64_t gpu_resource_id,
-                       uint32_t array_length, float min_lod = 0.0f);
+  bool FillTextureSlot(
+      uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
+      float min_lod = 0.0f,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
 
   /** Fill a TEXTURE slot with an already-encoded handle/metadata pair. */
-  void FillTextureSlotPayload(uint32_t index, uint64_t handle, uint64_t metadata);
+  bool FillTextureSlotPayload(
+      uint32_t index, uint64_t handle, uint64_t metadata,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
 
   /** Clear a TEXTURE slot and mark the current stale generation as handled. */
-  void ClearTextureSlot(uint32_t index);
+  bool ClearTextureSlot(
+      uint32_t index,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
 
-  /**
-   * Mark a slot stale (app thread). The slot's content generation is recorded so the
-   * encode-thread fill can decide whether a re-resolve is needed. Applies to both
-   * texture and sampler mirrors (it is pure per-slot generation bookkeeping). Returns
-   * false if out of range. Lightweight; no Metal access.
-   */
-  bool MarkSlotStale(uint32_t index, uint64_t content_generation);
+  /** Begin one heap-local slot publication while holding the mirror lock. */
+  dxmt::DescriptorSlotVersion BeginSlotWrite(uint32_t index);
 
-  /** Content generation last FILLED into a slot (encode thread updates it). */
-  uint64_t slotFilledGeneration(uint32_t index) const {
-    return index < filled_generation_.size() ? filled_generation_[index] : 0;
+  std::optional<dxmt::DescriptorSlotVersion>
+  slotPendingVersion(uint32_t index) const {
+    std::lock_guard lock(mutex_);
+    return index < needs_fill_.size() && needs_fill_[index]
+               ? std::optional<dxmt::DescriptorSlotVersion>(
+                     stale_versions_[index])
+               : std::nullopt;
   }
 
-  /** Content generation last MARKED stale for a slot (app thread). */
-  uint64_t slotStaleGeneration(uint32_t index) const {
-    return index < stale_generation_.size() ? stale_generation_[index] : 0;
+  /** Slot version last FILLED by the encode thread. */
+  dxmt::DescriptorSlotVersion slotFilledVersion(uint32_t index) const {
+    std::lock_guard lock(mutex_);
+    return index < filled_versions_.size() ? filled_versions_[index]
+                                           : dxmt::DescriptorSlotVersion{};
+  }
+
+  /** Slot version assigned by the most recent app-thread write. */
+  dxmt::DescriptorSlotVersion slotStaleVersion(uint32_t index) const {
+    std::lock_guard lock(mutex_);
+    return index < stale_versions_.size() ? stale_versions_[index]
+                                          : dxmt::DescriptorSlotVersion{};
   }
 
   bool SlotNeedsFill(uint32_t index) const {
-    return index < stale_generation_.size() &&
-           stale_generation_[index] != filled_generation_[index];
+    std::lock_guard lock(mutex_);
+    return index < needs_fill_.size() && needs_fill_[index];
   }
 
 private:
+  bool CanPublishVersionUnlocked(
+      uint32_t index,
+      const std::optional<dxmt::DescriptorSlotVersion> &expected_version) const {
+    return !expected_version ||
+           (index < needs_fill_.size() && needs_fill_[index] &&
+            stale_versions_[index] == *expected_version);
+  }
+  bool IsPublishedVersionUnlocked(
+      uint32_t index,
+      const std::optional<dxmt::DescriptorSlotVersion> &expected_version) const {
+    return !expected_version ||
+           (index < needs_fill_.size() &&
+            index < filled_versions_.size() && !needs_fill_[index] &&
+            filled_versions_[index] == *expected_version);
+  }
+  void MarkVersionFilledUnlocked(
+      uint32_t index,
+      const std::optional<dxmt::DescriptorSlotVersion> &expected_version) {
+    if (index < filled_versions_.size())
+      filled_versions_[index] =
+          expected_version.value_or(stale_versions_[index]);
+    if (index < needs_fill_.size())
+      needs_fill_[index] = 0;
+  }
+  bool DescriptorTableBackendReadyUnlocked() const {
+    if (!table_buffer_ || !table_gpu_address_ || !table_mapped_)
+      return false;
+    return sampler_heap_ || texture_view_pool_base_resource_id_;
+  }
+  uint64_t *TextureHandlePtrUnlocked(uint32_t index);
+  uint64_t *TextureMetadataPtrUnlocked(uint32_t index);
+  uint64_t *SamplerHandlePtrUnlocked(uint32_t index);
+  uint64_t *SamplerCubeHandlePtrUnlocked(uint32_t index);
+  uint64_t *SamplerLodBiasPtrUnlocked(uint32_t index);
+  uint32_t BufferResourceIndex(uint32_t descriptor_index,
+                               bool counter_resource) const;
+  uint64_t NextBufferResourceTableGeneration();
+  void ClearBufferResource(uint32_t resource_index);
+  void ClearBufferResourcesForSlot(uint32_t descriptor_index,
+                                   bool clear_primary,
+                                   bool clear_counter);
   void WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry);
   void WriteBufferResourceTableEntry(uint32_t index,
                                      const DescriptorBackendResourceRecord &record);
@@ -354,14 +467,16 @@ private:
   bool sampler_heap_ = false;
   std::vector<DescriptorTableEntry> table_entries_;
   std::vector<DescriptorBackendResourceRecord> buffer_resources_;
-  std::unordered_map<uint64_t, uint32_t> buffer_resource_indices_;
   std::vector<DescriptorSlotMeta> slot_meta_;
   std::vector<DescriptorResidencyTarget> residency_targets_;
-  // Per-slot generation bookkeeping. stale = bumped by Create*View (app thread);
-  // filled = updated when the encode thread writes the slot. A slot needs re-resolve
-  // when stale_generation_[i] != filled_generation_[i].
-  std::vector<uint64_t> stale_generation_;
-  std::vector<uint64_t> filled_generation_;
+  // Per-slot version bookkeeping. Each heap advances its slots independently;
+  // the process-wide content revision is a separate cache invalidation clock.
+  std::vector<dxmt::DescriptorSlotVersion> stale_versions_;
+  std::vector<dxmt::DescriptorSlotVersion> filled_versions_;
+  // Every write sets this flag and every completed fill clears it under
+  // mutex_. The epoch+sequence pair also prevents finite-width ABA.
+  std::vector<uint8_t> needs_fill_;
+  mutable std::recursive_mutex mutex_;
 };
 
 } // namespace dxmt::d3d12

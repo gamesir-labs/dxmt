@@ -103,9 +103,14 @@ CreateResource(IMTLD3D12Device *device, const D3D12_HEAP_PROPERTIES *heap_proper
                const D3D12_CLEAR_VALUE *optimized_clear_value,
                ResourceKind kind = ResourceKind::Committed,
                dxmt::Buffer *placed_buffer = nullptr,
-               dxmt::BufferAllocation *placed_buffer_allocation = nullptr);
+               dxmt::BufferAllocation *placed_buffer_allocation = nullptr,
+               WMT::Heap placement_heap = {});
 
 bool IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc);
+
+bool GetTextureHeapSizeAndAlign(WMT::Device device,
+                                const D3D12_RESOURCE_DESC &desc,
+                                WMTSizeAndAlign &size_and_align);
 
 Resource *LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                                                   UINT64 *offset = nullptr);

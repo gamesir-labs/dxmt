@@ -2928,12 +2928,24 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
     WARN("D3D12PipelineState: multi-node graphics PSOs are unsupported");
     return WARN_E_INVALIDARG(__func__);
   }
+  if ((desc.StreamOutput.NumEntries &&
+       !desc.StreamOutput.pSODeclaration) ||
+      (desc.StreamOutput.NumStrides &&
+       !desc.StreamOutput.pBufferStrides)) {
+    WARN("D3D12PipelineState: stream output descriptor has a null array");
+    return WARN_E_INVALIDARG(__func__);
+  }
   if (desc.StreamOutput.NumEntries || desc.StreamOutput.NumStrides) {
     if (!(GetRootSignatureFlags(desc.pRootSignature) &
           D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT)) {
       WARN("D3D12PipelineState: stream output requires root signature support");
       return WARN_E_INVALIDARG(__func__);
     }
+    // DX12 stream-output lowering is not implemented. Reject the PSO at its
+    // creation boundary instead of accepting it and silently discarding
+    // SOSetTargets during replay.
+    WARN("D3D12PipelineState: stream output is unsupported");
+    return E_NOTIMPL;
   }
   for (UINT i = desc.NumRenderTargets; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
     if (desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
@@ -3311,7 +3323,8 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
 
   if (has_compute_shader &&
       (HasBytecode(graphics.VS) || HasBytecode(graphics.DS) ||
-       HasBytecode(graphics.HS) || HasBytecode(graphics.GS)))
+       HasBytecode(graphics.HS) || HasBytecode(graphics.GS) ||
+       HasBytecode(graphics.PS)))
     return FailPipelineStreamParse("compute stream has incompatible shader",
                                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
                                    stream.SizeInBytes);
@@ -3665,28 +3678,31 @@ public:
     if (demote_msaa_srv_mask_lo || demote_msaa_srv_mask_hi) {
       const auto key =
           std::make_pair(demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
-      auto [it, inserted] =
-          metal_graphics_variants_.try_emplace(key, PipelineMetalGraphicsState{});
-      if (inserted) {
+      auto it = metal_graphics_variants_.find(key);
+      if (it == metal_graphics_variants_.end()) {
+        PipelineMetalGraphicsState variant = {};
         const auto variant_shader_cache_key =
             BuildGraphicsVariantShaderCacheKey(
                 shader_cache_key_, demote_msaa_srv_mask_lo,
                 demote_msaa_srv_mask_hi);
         if (!CreateMetalGraphicsPipeline(
                 device_.ptr(), shaders_, graphics_state_,
-                root_signature_.ptr(), variant_shader_cache_key, it->second,
+                root_signature_.ptr(), variant_shader_cache_key, variant,
                 demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi))
-          it->second = {};
+          return nullptr;
+        it = metal_graphics_variants_.emplace(key, std::move(variant)).first;
       }
       return it->second.pso ? &it->second : nullptr;
     }
 
     if (!metal_graphics_ready_) {
-      metal_graphics_ready_ = true;
+      PipelineMetalGraphicsState state = {};
       if (!CreateMetalGraphicsPipeline(device_.ptr(), shaders_, graphics_state_,
                                        root_signature_.ptr(), shader_cache_key_,
-                                       metal_graphics_))
-        metal_graphics_ = {};
+                                       state))
+        return nullptr;
+      metal_graphics_ = std::move(state);
+      metal_graphics_ready_ = true;
     }
 
     return metal_graphics_.pso ? &metal_graphics_ : nullptr;
@@ -3698,11 +3714,13 @@ public:
 
     std::lock_guard lock(metal_mutex_);
     if (!metal_compute_ready_) {
-      metal_compute_ready_ = true;
+      PipelineMetalComputeState state = {};
       if (!CreateMetalComputePipeline(device_.ptr(), shaders_,
                                       root_signature_.ptr(), shader_cache_key_,
-                                      metal_compute_))
-        metal_compute_ = {};
+                                      state))
+        return nullptr;
+      metal_compute_ = std::move(state);
+      metal_compute_ready_ = true;
     }
 
     return metal_compute_.pso ? &metal_compute_ : nullptr;
@@ -3870,9 +3888,6 @@ CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
                             std::move(shaders), std::move(signature_links),
                             std::move(graphics_state),
                             std::move(compute_state)));
-  // Async precompile the Metal PSO off the record thread (gated, default off).
-  if (PipelineCompiler::Enabled())
-    PipelineCompiler::Get().Enqueue(pso.ptr());
   return pso;
 }
 
@@ -3992,8 +4007,11 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
       device, PipelineStateType::Graphics, desc->pRootSignature,
       std::move(shaders), std::move(graphics_state),
       std::move(compute_state));
+  auto *pipeline = pso ? dynamic_cast<PipelineState *>(pso.ptr()) : nullptr;
+  if (!pipeline || !pipeline->GetMetalGraphicsState())
+    pso = nullptr;
   dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), bool(pso));
-  StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
+  StoreStatus(status, pso ? S_OK : E_INVALIDARG);
   return pso;
 }
 
@@ -4036,8 +4054,11 @@ CreateComputePipelineState(IMTLD3D12Device *device,
       device, PipelineStateType::Compute, desc->pRootSignature,
       std::move(shaders), std::move(graphics_state),
       std::move(compute_state));
+  auto *pipeline = pso ? dynamic_cast<PipelineState *>(pso.ptr()) : nullptr;
+  if (!pipeline || !pipeline->GetMetalComputeState())
+    pso = nullptr;
   dxmt::perf::recordComputePipelineCreate(ElapsedUs(create_start), bool(pso));
-  StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
+  StoreStatus(status, pso ? S_OK : E_INVALIDARG);
   return pso;
 }
 

@@ -6,6 +6,7 @@
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <mutex>
+#include <unordered_set>
 
 namespace dxmt::d3d12 {
 namespace {
@@ -86,17 +87,19 @@ public:
 
   UINT64 MarkCommandListSubmitted() override {
     std::lock_guard lock(mutex_);
-    pending_submission_count_++;
-    return ++last_submission_serial_;
+    const UINT64 serial = ++last_submission_serial_;
+    pending_submission_serials_.insert(serial);
+    pending_submission_count_ = pending_submission_serials_.size();
+    return serial;
   }
 
   void CompleteCommandListSubmission(UINT64 serial) override {
     std::lock_guard lock(mutex_);
-    if (serial && serial <= last_completed_submission_serial_)
+    if (!serial || !pending_submission_serials_.erase(serial))
       return;
-    last_completed_submission_serial_ = serial;
-    if (pending_submission_count_)
-      pending_submission_count_--;
+    last_completed_submission_serial_ =
+        std::max(last_completed_submission_serial_, serial);
+    pending_submission_count_ = pending_submission_serials_.size();
   }
 
   void AddRefPrivate() override {
@@ -115,7 +118,8 @@ private:
   void *recording_list_ = nullptr;
   UINT64 last_submission_serial_ = 0;
   UINT64 last_completed_submission_serial_ = 0;
-  UINT pending_submission_count_ = 0;
+  size_t pending_submission_count_ = 0;
+  std::unordered_set<UINT64> pending_submission_serials_;
   std::string name_;
 };
 
