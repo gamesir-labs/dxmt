@@ -52,10 +52,6 @@ airconv_args = [
   '-D__STDC_LIMIT_MACROS',
 ]
 
-llvm_ld_flags = [
- '-L'+join_paths(meson.project_source_root(), 'toolchains/llvm/lib')
-]
-
 airconv_forward_dep = declare_dependency(
   include_directories : [ dxmt_include_path, include_directories('.') ],
 )
@@ -83,7 +79,18 @@ build_airconv_for_windows = get_option('build_airconv_for_windows')
 
 if build_airconv_for_windows
 
-llvm_include_path = include_directories('../../toolchains/llvm/include') # FIXME: in favor of path relative to project
+windows_llvm_path = get_option('windows_llvm_path')
+if windows_llvm_path == ''
+  error('windows_llvm_path is required when build_airconv_for_windows is enabled')
+endif
+if not windows_llvm_path.startswith('/')
+  windows_llvm_path = join_paths(meson.project_source_root(), windows_llvm_path)
+endif
+llvm_include_path = include_directories(fs.relative_to(
+  join_paths(windows_llvm_path, 'include'),
+  meson.current_source_dir(),
+))
+llvm_ld_flags = ['-L' + join_paths(windows_llvm_path, 'lib')]
 
 airconv_lib = static_library('airconv', airconv_src,
   include_directories : [ dxmt_include_path, llvm_include_path ],
@@ -109,6 +116,6 @@ executable('airconv', airconv_src + airconv_cli_src,
 
 endif
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
+if cpu_family == 'x86_64' or not dxmt_crossbuild
   subdir('darwin')
 endif

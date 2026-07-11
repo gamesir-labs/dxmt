@@ -18,10 +18,11 @@ nvngx_dll = shared_library('nvngx', nvngx_src,
 )
 
 # always build as a wine-builtin dll
-custom_target('postprocess_libnvngx',
+nvngx_postprocess = custom_target('postprocess_libnvngx',
   input : nvngx_dll,
   output: 'nvngx.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : nvngx_dll,
   build_by_default : true
 )
+nvext_postprocess_targets += [nvngx_postprocess]

@@ -39,6 +39,7 @@ d3d12_dll = shared_library('d3d12', d3d12_src, d3d12_res,
   cpp_args            : ['-DDXMT_DX12_METAL4=1'],
   install             : true,
   install_dir         : windows_native_install_dir,
+  install_tag         : 'runtime-metal4',
   vs_module_defs      : 'd3d12.def',
   link_args           : d3d12_ld_args,
   link_depends        : [ d3d12_link_depends ],
@@ -52,6 +53,7 @@ d3d12core_dll = shared_library('d3d12core', d3d12core_src,
   include_directories : [ dxmt_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,
+  install_tag         : 'runtime-metal4',
   vs_module_defs      : 'd3d12core.def',
   link_args           : d3d12_ld_args,
   link_depends        : [ d3d12_link_depends ],
@@ -63,21 +65,23 @@ d3d12_dep = declare_dependency(
 )
 
 if wine_builtin_dll
-custom_target('postprocess_libd3d12',
+d3d12_postprocess = custom_target('postprocess_libd3d12',
   input : d3d12_dll,
   output: 'd3d12.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d12_dll,
   build_by_default : true
 )
+d3d12_postprocess_targets += [d3d12_postprocess]
 endif
 
 if wine_builtin_dll
-custom_target('postprocess_libd3d12core',
+d3d12core_postprocess = custom_target('postprocess_libd3d12core',
   input : d3d12core_dll,
   output: 'd3d12core.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : d3d12core_dll,
   build_by_default : true
 )
+d3d12_postprocess_targets += [d3d12core_postprocess]
 endif

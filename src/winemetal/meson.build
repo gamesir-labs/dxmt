@@ -37,6 +37,7 @@ winemetal_dll = shared_library('winemetal', winemetal_src,
   include_directories : dxmt_include_path,
   install             : true,
   install_dir         : windows_builtin_install_dir,
+  install_tag         : 'runtime-metal3',
   link_args           : winemetal_ld_args,
   link_depends        : winemetal_link_depends,
 )
@@ -46,14 +47,15 @@ winemetal_dep = declare_dependency(
   include_directories : [ include_directories('.') ],
 )
 
-custom_target('postprocess_lib',
+winemetal_postprocess = custom_target('postprocess_lib',
   input : winemetal_dll,
   output: 'winemetal.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : [ winemetal_dll ],
   build_by_default : true
 )
+winemetal_runtime_targets += [winemetal_dll, winemetal_postprocess]
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64'
+if cpu_family == 'x86_64'
   subdir('unix')
 endif

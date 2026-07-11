@@ -19,11 +19,12 @@ nvapi_dll = shared_library('nvapi64', nvapi_src,
 )
 
 if wine_builtin_dll
-custom_target('postprocess_libnvapi64',
+nvapi_postprocess = custom_target('postprocess_libnvapi64',
   input : nvapi_dll,
   output: 'nvapi64.dll.postproc',
   command : [ winebuild_command, '--builtin', '@INPUT@' ],
   depends : nvapi_dll,
   build_by_default : true
 )
+nvext_postprocess_targets += [nvapi_postprocess]
 endif
