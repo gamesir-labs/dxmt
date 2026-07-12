@@ -7869,6 +7869,14 @@ private:
             -> CompiledCommandFallbackReason {
           if (!packet.draw && !packet.draw_indexed)
             return CompiledCommandFallbackReason::UnsupportedCommand;
+          if (packet.draw &&
+              (!packet.draw->vertex_count_per_instance ||
+               !packet.draw->instance_count))
+            return CompiledCommandFallbackReason::None;
+          if (packet.draw_indexed &&
+              (!packet.draw_indexed->index_count_per_instance ||
+               !packet.draw_indexed->instance_count))
+            return CompiledCommandFallbackReason::None;
           DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
                                                   ++replay_record_serial);
           if (packet.d3d_sequence != 0)
