@@ -136,6 +136,70 @@ TEST_F(D3D11PipelineSpec, DrawsFullscreenTriangleIntoRenderTarget) {
   context_.context()->Unmap(staging.get(), 0);
 }
 
+TEST_F(D3D11PipelineSpec, ReportsSamplesForAnOcclusionQuery) {
+  const auto vertex = CompileShader(kFullscreenVertexShader, "vs_5_0");
+  const auto pixel = CompileShader(kSolidPixelShader, "ps_5_0");
+  ASSERT_TRUE(HResultSucceeded(vertex.result)) << vertex.diagnostic_text();
+  ASSERT_TRUE(HResultSucceeded(pixel.result)) << pixel.diagnostic_text();
+  ComPtr<ID3D11VertexShader> vertex_shader;
+  ComPtr<ID3D11PixelShader> pixel_shader;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateVertexShader(
+      vertex.bytecode->GetBufferPointer(), vertex.bytecode->GetBufferSize(),
+      nullptr, vertex_shader.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreatePixelShader(
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
+      nullptr, pixel_shader.put())));
+
+  D3D11_TEXTURE2D_DESC target_desc = {};
+  target_desc.Width = 8;
+  target_desc.Height = 8;
+  target_desc.MipLevels = 1;
+  target_desc.ArraySize = 1;
+  target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  target_desc.SampleDesc.Count = 1;
+  target_desc.Usage = D3D11_USAGE_DEFAULT;
+  target_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> target;
+  ComPtr<ID3D11RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateTexture2D(&target_desc, nullptr, target.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRenderTargetView(
+      target.get(), nullptr, target_view.put())));
+
+  D3D11_QUERY_DESC query_desc = {};
+  query_desc.Query = D3D11_QUERY_OCCLUSION;
+  ComPtr<ID3D11Query> query;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateQuery(&query_desc, query.put())));
+  D3D11_VIEWPORT viewport = {};
+  viewport.Width = static_cast<float>(target_desc.Width);
+  viewport.Height = static_cast<float>(target_desc.Height);
+  viewport.MaxDepth = 1.0f;
+  ID3D11RenderTargetView *target_views[] = {target_view.get()};
+  context_.context()->OMSetRenderTargets(1, target_views, nullptr);
+  context_.context()->RSSetViewports(1, &viewport);
+  context_.context()->IASetPrimitiveTopology(
+      D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.context()->VSSetShader(vertex_shader.get(), nullptr, 0);
+  context_.context()->PSSetShader(pixel_shader.get(), nullptr, 0);
+  context_.context()->Begin(query.get());
+  context_.context()->Draw(3, 0);
+  context_.context()->End(query.get());
+  context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
+  context_.context()->Flush();
+
+  UINT64 samples = 0;
+  HRESULT data_hr = S_FALSE;
+  for (UINT attempt = 0; attempt < 100 && data_hr == S_FALSE; ++attempt) {
+    data_hr =
+        context_.context()->GetData(query.get(), &samples, sizeof(samples), 0);
+    if (data_hr == S_FALSE)
+      Sleep(1);
+  }
+  EXPECT_EQ(data_hr, S_OK);
+  EXPECT_GT(samples, 0u);
+}
+
 TEST_F(D3D11PipelineSpec, DispatchesComputeShaderIntoStorageTexture) {
   const auto compute = CompileShader(kTextureComputeShader, "cs_5_0");
   ASSERT_TRUE(HResultSucceeded(compute.result)) << compute.diagnostic_text();
