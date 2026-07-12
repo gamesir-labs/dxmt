@@ -86,6 +86,19 @@ TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
 }
 
+TEST_F(D3D12QueueSpec, CompletesFenceSignalsInValueOrder) {
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateFence(
+      0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+      reinterpret_cast<void **>(fence.put()))));
+  ASSERT_TRUE(SUCCEEDED(context_.queue()->Signal(fence.get(), 3)));
+  ASSERT_TRUE(SUCCEEDED(context_.queue()->Signal(fence.get(), 7)));
+  ASSERT_TRUE(SUCCEEDED(context_.WaitForFence(fence.get(), 3)));
+  EXPECT_GE(fence->GetCompletedValue(), 3ull);
+  ASSERT_TRUE(SUCCEEDED(context_.WaitForFence(fence.get(), 7)));
+  EXPECT_GE(fence->GetCompletedValue(), 7ull);
+}
+
 TEST_F(D3D12QueueSpec, RejectsClosingAlreadyClosedCommandList) {
   ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
   EXPECT_EQ(context_.list()->Close(), E_FAIL);
