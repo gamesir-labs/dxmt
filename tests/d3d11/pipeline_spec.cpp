@@ -37,6 +37,33 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
 }
 )";
 
+constexpr std::string_view kVertexColorVertexShader = R"(
+struct Input {
+  float2 position : POSITION;
+  float4 color : COLOR0;
+};
+struct Output {
+  float4 position : SV_Position;
+  float4 color : COLOR0;
+};
+Output main(Input input) {
+  Output output;
+  output.position = float4(input.position, 0.0, 1.0);
+  output.color = input.color;
+  return output;
+}
+)";
+
+constexpr std::string_view kVertexColorPixelShader = R"(
+struct Input {
+  float4 position : SV_Position;
+  float4 color : COLOR0;
+};
+float4 main(Input input) : SV_Target {
+  return input.color;
+}
+)";
+
 ::testing::AssertionResult HResultSucceeded(HRESULT hr) {
   if (SUCCEEDED(hr))
     return ::testing::AssertionSuccess();
@@ -133,6 +160,107 @@ TEST_F(D3D11PipelineSpec, DrawsFullscreenTriangleIntoRenderTarget) {
           << "pixel (" << x << ", " << y << ") was 0x" << std::hex << actual;
     }
   }
+  context_.context()->Unmap(staging.get(), 0);
+}
+
+TEST_F(D3D11PipelineSpec, DrawsWithInputLayoutAndVertexBuffer) {
+  const auto vertex = CompileShader(kVertexColorVertexShader, "vs_5_0");
+  const auto pixel = CompileShader(kVertexColorPixelShader, "ps_5_0");
+  ASSERT_TRUE(HResultSucceeded(vertex.result)) << vertex.diagnostic_text();
+  ASSERT_TRUE(HResultSucceeded(pixel.result)) << pixel.diagnostic_text();
+
+  ComPtr<ID3D11VertexShader> vertex_shader;
+  ComPtr<ID3D11PixelShader> pixel_shader;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateVertexShader(
+      vertex.bytecode->GetBufferPointer(), vertex.bytecode->GetBufferSize(),
+      nullptr, vertex_shader.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreatePixelShader(
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
+      nullptr, pixel_shader.put())));
+
+  const D3D11_INPUT_ELEMENT_DESC elements[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+       D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8,
+       D3D11_INPUT_PER_VERTEX_DATA, 0},
+  };
+  ComPtr<ID3D11InputLayout> input_layout;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateInputLayout(
+      elements, ARRAYSIZE(elements), vertex.bytecode->GetBufferPointer(),
+      vertex.bytecode->GetBufferSize(), input_layout.put())));
+
+  struct Vertex {
+    float position[2];
+    float color[4];
+  };
+  constexpr std::array<Vertex, 3> vertices = {
+      {{{-1.0f, -1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+       {{0.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+       {{1.0f, -1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}}}};
+  D3D11_BUFFER_DESC buffer_desc = {};
+  buffer_desc.ByteWidth = sizeof(vertices);
+  buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA initial = {};
+  initial.pSysMem = vertices.data();
+  ComPtr<ID3D11Buffer> vertex_buffer;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
+      &buffer_desc, &initial, vertex_buffer.put())));
+
+  D3D11_TEXTURE2D_DESC target_desc = {};
+  target_desc.Width = 16;
+  target_desc.Height = 16;
+  target_desc.MipLevels = 1;
+  target_desc.ArraySize = 1;
+  target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  target_desc.SampleDesc.Count = 1;
+  target_desc.Usage = D3D11_USAGE_DEFAULT;
+  target_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> target;
+  ComPtr<ID3D11RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateTexture2D(&target_desc, nullptr, target.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRenderTargetView(
+      target.get(), nullptr, target_view.put())));
+
+  D3D11_VIEWPORT viewport = {};
+  viewport.Width = 16.0f;
+  viewport.Height = 16.0f;
+  viewport.MaxDepth = 1.0f;
+  UINT stride = sizeof(Vertex);
+  UINT offset = 0;
+  ID3D11Buffer *vertex_buffers[] = {vertex_buffer.get()};
+  ID3D11RenderTargetView *targets[] = {target_view.get()};
+  context_.context()->OMSetRenderTargets(1, targets, nullptr);
+  context_.context()->RSSetViewports(1, &viewport);
+  context_.context()->IASetInputLayout(input_layout.get());
+  context_.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride,
+                                         &offset);
+  context_.context()->IASetPrimitiveTopology(
+      D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.context()->VSSetShader(vertex_shader.get(), nullptr, 0);
+  context_.context()->PSSetShader(pixel_shader.get(), nullptr, 0);
+  context_.context()->Draw(3, 0);
+  context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
+
+  D3D11_TEXTURE2D_DESC staging_desc = target_desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture2D> staging;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &staging_desc, nullptr, staging.put())));
+  context_.context()->CopyResource(staging.get(), target.get());
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  ASSERT_TRUE(HResultSucceeded(
+      context_.context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)));
+  uint32_t center = 0;
+  std::memcpy(&center,
+              static_cast<const uint8_t *>(mapped.pData) + 8 * mapped.RowPitch +
+                  8 * sizeof(center),
+              sizeof(center));
+  EXPECT_TRUE(ColorMatches(center, 0xff0000ff, 2))
+      << "center pixel was 0x" << std::hex << center;
   context_.context()->Unmap(staging.get(), 0);
 }
 
