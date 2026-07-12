@@ -99,6 +99,48 @@ TEST_F(D3D11ResourceSpec, WritesDynamicBufferAndCopiesLatestContents) {
   context_.context()->Unmap(staging.get(), 0);
 }
 
+TEST_F(D3D11ResourceSpec, AppendsDynamicBufferDataWithNoOverwrite) {
+  std::array<uint32_t, 16> expected = {};
+  D3D11_BUFFER_DESC dynamic_desc = {};
+  dynamic_desc.ByteWidth = sizeof(expected);
+  dynamic_desc.Usage = D3D11_USAGE_DYNAMIC;
+  dynamic_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  dynamic_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  ComPtr<ID3D11Buffer> dynamic;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateBuffer(&dynamic_desc, nullptr, dynamic.put())));
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+      dynamic.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)));
+  auto *first = static_cast<uint32_t *>(mapped.pData);
+  for (UINT i = 0; i < 8; ++i)
+    first[i] = expected[i] = 0x1000u + i;
+  context_.context()->Unmap(dynamic.get(), 0);
+
+  mapped = {};
+  ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+      dynamic.get(), 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped)));
+  auto *second = static_cast<uint32_t *>(mapped.pData);
+  for (UINT i = 8; i < expected.size(); ++i)
+    second[i] = expected[i] = 0x2000u + i;
+  context_.context()->Unmap(dynamic.get(), 0);
+
+  D3D11_BUFFER_DESC staging_desc = dynamic_desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Buffer> staging;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateBuffer(&staging_desc, nullptr, staging.put())));
+  context_.context()->CopyResource(staging.get(), dynamic.get());
+  mapped = {};
+  ASSERT_TRUE(HResultSucceeded(
+      context_.context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)));
+  EXPECT_EQ(std::memcmp(mapped.pData, expected.data(), sizeof(expected)), 0);
+  context_.context()->Unmap(staging.get(), 0);
+}
+
 TEST_F(D3D11ResourceSpec, CopiesBufferRangeAtNonZeroOffsets) {
   std::array<uint8_t, 64> source_data = {};
   std::array<uint8_t, 64> destination_data = {};

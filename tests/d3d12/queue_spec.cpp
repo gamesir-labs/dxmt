@@ -157,6 +157,12 @@ TEST_F(D3D12QueueSpec, CopiesTextureRegionAtNonZeroOffsets) {
   }
 }
 
+TEST_F(D3D12QueueSpec, ReportsTimestampFrequency) {
+  UINT64 frequency = 0;
+  ASSERT_TRUE(SUCCEEDED(context_.queue()->GetTimestampFrequency(&frequency)));
+  EXPECT_GT(frequency, 0ull);
+}
+
 TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {
   const std::array<std::uint32_t, 16> expected = {
       0xff000001, 0xff000002, 0xff000003, 0xff000004, 0xff000011, 0xff000012,
