@@ -4983,9 +4983,11 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       if (result.src) {
         result.src->store_action = WMTStoreActionStoreAndMultisampleResolve;
         result.src->resolve_attachment = result.dst;
-        render->fence_update.merge(resolve->fence_update);
-        render->fence_wait.merge(resolve->fence_wait);
-        render->fence_wait.subtract(resolve->fence_update);
+        auto fence_merge = BuildRenderResolveFenceMergePlan(
+            render->fence_wait, render->fence_update,
+            resolve->fence_wait, resolve->fence_update);
+        render->fence_wait = std::move(fence_merge.fragment_waits);
+        render->fence_update = std::move(fence_merge.fragment_updates);
 
         currentFrameStatistics().resolve_pass_optimized++;
         resolve->~ResolveEncoderData();
@@ -5001,8 +5003,16 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     auto r1 = reinterpret_cast<RenderEncoderData *>(latter);
     auto r0 = reinterpret_cast<RenderEncoderData *>(former);
 
-    if (isEncoderSignatureMatched(r0, r1) &&
-        !r1->fence_wait_vertex.intersectedWith(r0->fence_update)) {
+    std::optional<RenderFenceMergePlan> fence_merge;
+    if (isEncoderSignatureMatched(r0, r1)) {
+      fence_merge = BuildRenderFenceMergePlan(
+          r1->fence_wait, r1->fence_wait_vertex,
+          r1->fence_update, r1->fence_update_vertex,
+          r0->fence_wait, r0->fence_wait_vertex,
+          r0->fence_update, r0->fence_update_vertex);
+    }
+
+    if (fence_merge && fence_merge->valid()) {
       for (unsigned i = 0; i < r0->render_target_count; i++) {
         auto &a0 = r0->colors[i];
         auto &a1 = r1->colors[i];
@@ -5059,19 +5069,10 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->ts_arg_marshal_tasks = std::move(r0->ts_arg_marshal_tasks);
       r1->use_visibility_result = r0->use_visibility_result || r1->use_visibility_result;
 
-      r1->fence_update.merge(r0->fence_update);
-      r1->fence_wait.merge(r0->fence_wait);
-      r1->fence_wait.subtract(r0->fence_update);
-      r1->fence_update_vertex.merge(r0->fence_update_vertex);
-      r1->fence_wait_vertex.merge(r0->fence_wait_vertex);
-      r1->fence_wait_vertex.subtract(r0->fence_update_vertex);
-
-      // just in case
-      r1->fence_wait.subtract(r0->fence_update_vertex);
-      /* 
-      r1->fence_wait_vertex.subtract(r0->fence_update);
-      does not make sense
-      */
+      r1->fence_wait = std::move(fence_merge->fragment_waits);
+      r1->fence_wait_vertex = std::move(fence_merge->pre_raster_waits);
+      r1->fence_update = std::move(fence_merge->fragment_updates);
+      r1->fence_update_vertex = std::move(fence_merge->pre_raster_updates);
 
       // r0's commands are prepended into r1, but r0 itself will not be encoded after this point.
       // On 32-bit builds the argument buffer writes live in a shadow allocation until explicitly flushed.
