@@ -142,6 +142,17 @@ dxmt_metal4_perf_stats_enabled(void) {
 }
 
 static bool
+dxmt_metal4_dense_hang_diagnostics_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static bool
 dxmt_metal4_test_feedback_error_enabled(void) {
   return dxmt_truthy_env_value(
              getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")) ||
@@ -190,6 +201,8 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) NSError *feedbackError;
 @property(nonatomic, assign) double feedbackGPUStartTime;
 @property(nonatomic, assign) double feedbackGPUEndTime;
+@property(nonatomic, assign) uint64_t completionCurrentBeforeThrottle;
+@property(nonatomic, assign) uint64_t completionCurrentAtCommit;
 @property(nonatomic, assign) struct WMTCommandBufferDiagnosticInfo diagnosticInfo;
 - (instancetype)initWithQueue:(DXMTMetal4CommandQueue *)queue;
 - (id<MTL4CommandBuffer>)commandBuffer;
@@ -941,9 +954,14 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValueLocked];
+  _completionCurrentBeforeThrottle = _owner.event.signaledValue;
   [_owner waitForCommandBufferSlotLocked:_completionValue];
+  _completionCurrentAtCommit = _owner.event.signaledValue;
 
-  const BOOL perfFeedback = dxmt_metal4_perf_stats_enabled();
+  const BOOL denseHangDiagnostics =
+      dxmt_metal4_dense_hang_diagnostics_enabled();
+  const BOOL perfFeedback =
+      dxmt_metal4_perf_stats_enabled() || denseHangDiagnostics;
   if (perfFeedback && !_metal4Buffer.label) {
     NSString *label = [[NSString alloc]
         initWithFormat:@"DXMT queue=%p depth=%" PRIu64 " completion=%" PRIu64,
@@ -971,6 +989,17 @@ dxmt_metal4_is_buffer(id object) {
     const obj_handle_t feedbackQueue = (obj_handle_t)_owner.metal4Queue;
     const uint64_t feedbackQueueDepth = _owner.maxCommandBufferCount;
     const uint64_t feedbackCompletionValue = _completionValue;
+    const uint64_t feedbackCompletionBeforeThrottle =
+        _completionCurrentBeforeThrottle;
+    const uint64_t feedbackCompletionAtCommit = _completionCurrentAtCommit;
+    const uint64_t feedbackInflightBeforeThrottle =
+        feedbackCompletionValue > feedbackCompletionBeforeThrottle
+            ? feedbackCompletionValue - feedbackCompletionBeforeThrottle
+            : 0;
+    const uint64_t feedbackInflightAtCommit =
+        feedbackCompletionValue > feedbackCompletionAtCommit
+            ? feedbackCompletionValue - feedbackCompletionAtCommit
+            : 0;
     const BOOL feedbackHasDrawable = _pendingDrawable != nil;
     const struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic =
         _diagnosticInfo;
@@ -1015,9 +1044,15 @@ dxmt_metal4_is_buffer(id object) {
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
                 " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
                 " completionCurrent=%" PRIu64 " waitCount=%lu signalCount=%lu drawable=%d"
+                " completionBeforeThrottle=%" PRIu64
+                " completionAtCommit=%" PRIu64
+                " inflightBeforeThrottle=%" PRIu64
+                " inflightAtCommit=%" PRIu64
                 " frame=%" PRIu64 " chunk=%" PRIu64
                 " d3dSeq=%" PRIu64 "-%" PRIu64
                 " encoders=%u/%u render=%u compute=%u blit=%u other=%u"
+                " present=%u clear=%u resolve=%u scaler=%u"
+                " signal=%u wait=%u timestamp=%u"
                 " barrierOnly=%u fenceWait=%u fenceUpdate=%u initEvent=%" PRIu64
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
@@ -1029,6 +1064,10 @@ dxmt_metal4_is_buffer(id object) {
                 (unsigned long)feedbackWaitEvents.count,
                 (unsigned long)feedbackSignalEvents.count,
                 feedbackHasDrawable,
+                feedbackCompletionBeforeThrottle,
+                feedbackCompletionAtCommit,
+                feedbackInflightBeforeThrottle,
+                feedbackInflightAtCommit,
                 feedbackDiagnostic.frame_id,
                 feedbackDiagnostic.chunk_id,
                 feedbackDiagnostic.d3d_sequence_begin,
@@ -1039,6 +1078,13 @@ dxmt_metal4_is_buffer(id object) {
                 feedbackDiagnostic.compute_encoder_count,
                 feedbackDiagnostic.blit_encoder_count,
                 feedbackDiagnostic.other_encoder_count,
+                feedbackDiagnostic.present_encoder_count,
+                feedbackDiagnostic.clear_encoder_count,
+                feedbackDiagnostic.resolve_encoder_count,
+                feedbackDiagnostic.scaler_encoder_count,
+                feedbackDiagnostic.signal_event_count,
+                feedbackDiagnostic.wait_event_count,
+                feedbackDiagnostic.timestamp_encoder_count,
                 feedbackDiagnostic.barrier_only_pass_count,
                 feedbackDiagnostic.fence_wait_count,
                 feedbackDiagnostic.fence_update_count,
@@ -1049,6 +1095,17 @@ dxmt_metal4_is_buffer(id object) {
                 (long)error.code,
                 error.localizedDescription ? error.localizedDescription.UTF8String
                                            : "<no description>");
+
+        if (denseHangDiagnostics) {
+          NSString *debugDescription = error.debugDescription;
+          NSString *userInfoDescription = error.userInfo.description;
+          fprintf(stderr,
+                  "err:   DXMT Metal4 dense feedback error: commandBuffer=%p"
+                  " debug=%s userInfo=%s\n",
+                  (void *)(uintptr_t)feedbackCommandBuffer,
+                  debugDescription ? debugDescription.UTF8String : "<none>",
+                  userInfoDescription ? userInfoDescription.UTF8String : "<none>");
+        }
 
         NSUInteger waitIndex = 0;
         for (DXMTMetal4QueueEvent *wait in feedbackWaitEvents) {

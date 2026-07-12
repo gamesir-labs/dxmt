@@ -144,6 +144,13 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   wmt_diagnostic.compute_encoder_count = diagnostic.compute_encoder_count;
   wmt_diagnostic.blit_encoder_count = diagnostic.blit_encoder_count;
   wmt_diagnostic.other_encoder_count = diagnostic.other_encoder_count;
+  wmt_diagnostic.present_encoder_count = diagnostic.present_encoder_count;
+  wmt_diagnostic.clear_encoder_count = diagnostic.clear_encoder_count;
+  wmt_diagnostic.resolve_encoder_count = diagnostic.resolve_encoder_count;
+  wmt_diagnostic.scaler_encoder_count = diagnostic.scaler_encoder_count;
+  wmt_diagnostic.signal_event_count = diagnostic.signal_event_count;
+  wmt_diagnostic.wait_event_count = diagnostic.wait_event_count;
+  wmt_diagnostic.timestamp_encoder_count = diagnostic.timestamp_encoder_count;
   wmt_diagnostic.barrier_only_pass_count = diagnostic.barrier_only_pass_count;
   wmt_diagnostic.fence_wait_count = diagnostic.fence_wait_count;
   wmt_diagnostic.fence_update_count = diagnostic.fence_update_count;
@@ -152,13 +159,21 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
       env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");
   if (!diagnostic_marker.empty()) {
     if (FILE *marker = fopen(diagnostic_marker.c_str(), "a")) {
-      fprintf(marker, "%u %u %u %u %u %u\n",
+      fprintf(marker, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u\n",
               diagnostic.input_encoder_count,
               diagnostic.encoded_encoder_count,
               diagnostic.blit_encoder_count,
               diagnostic.barrier_only_pass_count,
               diagnostic.fence_wait_count,
-              diagnostic.fence_update_count);
+              diagnostic.fence_update_count,
+              diagnostic.other_encoder_count,
+              diagnostic.present_encoder_count,
+              diagnostic.clear_encoder_count,
+              diagnostic.resolve_encoder_count,
+              diagnostic.scaler_encoder_count,
+              diagnostic.signal_event_count,
+              diagnostic.wait_event_count,
+              diagnostic.timestamp_encoder_count);
       fclose(marker);
     }
   }

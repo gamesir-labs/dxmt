@@ -5531,6 +5531,7 @@ private:
   struct ReplayComputePassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
     uint64_t d3d_sequence = 0;
+    uint64_t argument_buffer_offset = 0;
     uint64_t argument_buffer_size = 0;
     ReplayComputeCommandKind kind = ReplayComputeCommandKind::Dispatch;
   };
@@ -6190,18 +6191,25 @@ private:
       EncodeResourceAccessBarrierEntries(enc, barrier_entries);
       if (!barrier_entries.empty())
         enc.resolveComputePassBarrier();
-      uint64_t argbuf_offset = 0;
       for (auto &command : commands) {
         if (command.d3d_sequence != 0)
           dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
-        const auto command_begin = argbuf_offset;
-        enc.setArgumentBufferWriteRange(command_begin,
+        uint64_t argbuf_offset = command.argument_buffer_offset;
+        enc.setArgumentBufferWriteRange(command.argument_buffer_offset,
                                         command.argument_buffer_size);
         command.encode(enc, argbuf_offset);
-        if (enc.argumentBufferOverflowed()) {
+        const bool cursor_underflow =
+            argbuf_offset < command.argument_buffer_offset;
+        const bool cursor_overflow =
+            !cursor_underflow &&
+            argbuf_offset - command.argument_buffer_offset >
+                command.argument_buffer_size;
+        if (enc.argumentBufferOverflowed() || cursor_underflow ||
+            cursor_overflow) {
           WARN("D3D12CommandQueue: compute argument-buffer reservation overflow"
                " reserved=", command.argument_buffer_size,
-               " begin=", command_begin);
+               " begin=", command.argument_buffer_offset,
+               " end=", argbuf_offset);
         }
       }
       enc.endPass();
@@ -7087,7 +7095,8 @@ private:
       enc.resolveComputePassBarrier();
     };
     active_batch.commands.push_back(ReplayComputePassCommand{
-        std::move(encode_barrier), dxmt::apitrace::current_d3d_sequence(), 0,
+        std::move(encode_barrier), dxmt::apitrace::current_d3d_sequence(),
+        active_batch.argument_buffer_size, 0,
         ReplayComputeCommandKind::Barrier});
     if (auto *stats = dxmt::perf::currentFrameStatistics())
       stats->resource_barrier_batches_compute_inlined++;
@@ -7153,10 +7162,12 @@ private:
       batch.argument_buffer_size = 0;
     }
 
+    const uint64_t argument_buffer_offset = batch.argument_buffer_size;
     batch.argument_buffer_size += argument_buffer_size;
     batch.commands.push_back(ReplayComputePassCommand{
         std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
-        argument_buffer_size, ReplayComputeCommandKind::Dispatch});
+        argument_buffer_offset, argument_buffer_size,
+        ReplayComputeCommandKind::Dispatch});
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -20484,9 +20495,10 @@ private:
     const UINT array_length = GetRenderTargetArrayLength(record.descriptor);
     WMTClearColor color = {record.color[0], record.color[1], record.color[2],
                            record.color[3]};
+    const bool has_rects = !record.rects.empty();
     chunk->emitcc([texture = std::move(texture), view, array_length,
-                   color](ArgumentEncodingContext &enc) mutable {
-      enc.clearColor(std::move(texture), view, array_length, color);
+                   color, has_rects](ArgumentEncodingContext &enc) mutable {
+      enc.clearColor(std::move(texture), view, array_length, color, has_rects);
     });
   }
 
@@ -20514,11 +20526,13 @@ private:
       flags |= 1;
     if (record.flags & D3D12_CLEAR_FLAG_STENCIL)
       flags |= 2;
+    const bool has_rects = !record.rects.empty();
     chunk->emitcc([texture = std::move(texture), view, array_length, flags,
                    depth = record.depth,
-                   stencil = record.stencil](ArgumentEncodingContext &enc) mutable {
+                   stencil = record.stencil,
+                   has_rects](ArgumentEncodingContext &enc) mutable {
       enc.clearDepthStencil(std::move(texture), view, array_length, flags,
-                            depth, stencil);
+                            depth, stencil, has_rects);
     });
   }
 

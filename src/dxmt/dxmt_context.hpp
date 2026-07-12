@@ -45,6 +45,13 @@ struct CommandBufferDiagnosticInfo {
   uint32_t compute_encoder_count = 0;
   uint32_t blit_encoder_count = 0;
   uint32_t other_encoder_count = 0;
+  uint32_t present_encoder_count = 0;
+  uint32_t clear_encoder_count = 0;
+  uint32_t resolve_encoder_count = 0;
+  uint32_t scaler_encoder_count = 0;
+  uint32_t signal_event_count = 0;
+  uint32_t wait_event_count = 0;
+  uint32_t timestamp_encoder_count = 0;
   uint32_t barrier_only_pass_count = 0;
   uint32_t fence_wait_count = 0;
   uint32_t fence_update_count = 0;
@@ -336,15 +343,22 @@ struct BlitEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
 };
 
-struct ClearEncoderData : EncoderData {
-  union {
-    WMTClearColor color;
-    std::pair<float, uint8_t> depth_stencil;
-  };
+struct ClearColorAttachmentData {
+  WMTClearColor color = {};
   TextureViewRef attachment;
   Rc<Buffer> buffer_attachment;
   WMT::Reference<WMT::Texture> buffer_texture;
   uint64_t buffer_view_id = 0;
+  uint16_t level = 0;
+  uint16_t slice = 0;
+  uint32_t depth_plane = 0;
+  bool has_rects = false;
+};
+
+struct ClearEncoderData : EncoderData {
+  std::array<ClearColorAttachmentData, 8> colors = {};
+  std::pair<float, uint8_t> depth_stencil = {};
+  TextureViewRef attachment;
   unsigned clear_dsv;
   unsigned array_length;
   unsigned width;
@@ -354,6 +368,8 @@ struct ClearEncoderData : EncoderData {
   uint16_t slice = 0;
   uint32_t depth_plane = 0;
   uint32_t stencil_depth_plane = 0;
+  bool has_rects = false;
+  uint8_t color_attachment_count = 0;
 
   ClearEncoderData() {}
 };
@@ -944,10 +960,13 @@ public:
     return encoder_id_++;
   };
 
-  void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, WMTClearColor color);
-  void clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width, WMTClearColor color);
+  void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength,
+                  WMTClearColor color, bool has_rects = false);
+  void clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width,
+                  WMTClearColor color, bool has_rects = false);
   void clearDepthStencil(
-      Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
+      Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag,
+      float depth, uint8_t stencil, bool has_rects = false
   );
   void resolveTexture(
       Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
@@ -1183,6 +1202,7 @@ public:
 private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
+  bool tryMergeClearEncoders(ClearEncoderData* former, ClearEncoderData* latter);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
   bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);

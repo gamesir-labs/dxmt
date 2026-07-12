@@ -126,13 +126,19 @@ struct WMTCommandBufferDiagnosticInfo {
   uint32_t compute_encoder_count;
   uint32_t blit_encoder_count;
   uint32_t other_encoder_count;
+  uint32_t present_encoder_count;
+  uint32_t clear_encoder_count;
+  uint32_t resolve_encoder_count;
+  uint32_t scaler_encoder_count;
+  uint32_t signal_event_count;
+  uint32_t wait_event_count;
+  uint32_t timestamp_encoder_count;
   uint32_t barrier_only_pass_count;
   uint32_t fence_wait_count;
   uint32_t fence_update_count;
-  uint32_t reserved[3];
 };
 
-STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 88);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 104);
 
 WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,
