@@ -153,6 +153,30 @@ dxmt_metal4_pso_labels_enabled(void) {
 }
 
 static bool
+dxmt_metal4_residency_diag_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_RESIDENCY"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static id<MTLAllocation>
+dxmt_metal4_backing_allocation(id<MTLAllocation> allocation) {
+  if (!allocation || ![(id)allocation conformsToProtocol:@protocol(MTLTexture)])
+    return allocation;
+
+  id<MTLTexture> texture = (id<MTLTexture>)allocation;
+  for (unsigned depth = 0; depth < 64 && texture.parentTexture; depth++)
+    texture = texture.parentTexture;
+  if (texture.buffer)
+    return (id<MTLAllocation>)texture.buffer;
+  return (id<MTLAllocation>)texture;
+}
+
+static bool
 dxmt_metal4_dense_hang_diagnostics_enabled(void) {
   static bool initialized = false;
   static bool enabled = false;
@@ -826,7 +850,7 @@ dxmt_metal4_is_buffer(id object) {
 - (void)useResidencyAllocation:(id<MTLAllocation>)allocation {
   if (!allocation)
     return;
-  [_residencySet addAllocation:allocation];
+  [_residencySet addAllocation:dxmt_metal4_backing_allocation(allocation)];
 }
 
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label {
@@ -1341,12 +1365,57 @@ dxmt_metal4_is_buffer(id object) {
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
   [_pendingDrawable release];
   _pendingDrawable = [drawable retain];
+  if ([drawable conformsToProtocol:@protocol(CAMetalDrawable)]) {
+    id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
+    CAMetalLayer *layer = metalDrawable.layer;
+    id<MTLResidencySet> layerSet = layer.residencySet;
+    if (layerSet)
+      [_metal4Buffer useResidencySet:layerSet];
+    if (dxmt_metal4_residency_diag_enabled()) {
+      static atomic_uint_fast64_t occurrence = 0;
+      const uint64_t index = atomic_fetch_add_explicit(
+                                 &occurrence, 1, memory_order_relaxed) +
+                             1;
+      id<MTLTexture> texture = metalDrawable.texture;
+      if (texture && !texture.label) {
+        texture.label = [NSString
+            stringWithFormat:@"DXMT drawable texture=%p layer=%p", texture,
+                             layer];
+      }
+      if (index <= 8 || (index & (index - 1)) == 0) {
+        fprintf(stderr,
+                "info:  DXMT Metal4 drawable residency: index=%" PRIu64
+                " drawable=%p texture=%p layer=%p set=%p contains=%u allocations=%lu\n",
+                index, drawable, texture, layer, layerSet,
+                layerSet && texture
+                    ? [layerSet containsAllocation:(id<MTLAllocation>)texture]
+                    : 0,
+                layerSet ? (unsigned long)layerSet.allocationCount : 0ul);
+        fflush(stderr);
+      }
+    }
+  }
   _hasPresentDuration = NO;
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(double)duration {
   [_pendingDrawable release];
   _pendingDrawable = [drawable retain];
+  if ([drawable conformsToProtocol:@protocol(CAMetalDrawable)]) {
+    id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
+    CAMetalLayer *layer = metalDrawable.layer;
+    id<MTLResidencySet> layerSet = layer.residencySet;
+    if (layerSet)
+      [_metal4Buffer useResidencySet:layerSet];
+    if (dxmt_metal4_residency_diag_enabled()) {
+      id<MTLTexture> texture = metalDrawable.texture;
+      if (texture && !texture.label) {
+        texture.label = [NSString
+            stringWithFormat:@"DXMT drawable texture=%p layer=%p", texture,
+                             layer];
+      }
+    }
+  }
   _presentDuration = duration;
   _hasPresentDuration = YES;
 }
@@ -4877,6 +4946,60 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static void
+dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
+                                  id<MTLTexture> texture,
+                                  const char *role,
+                                  unsigned attachment_index) {
+  if (!texture)
+    return;
+
+  [owner useResidencyAllocation:(id<MTLAllocation>)texture];
+  if (!dxmt_metal4_residency_diag_enabled())
+    return;
+
+  const BOOL was_unlabelled = texture.label == nil;
+  if (was_unlabelled) {
+    texture.label = [NSString
+        stringWithFormat:@"DXMT attachment %s[%u] texture=%p", role,
+                         attachment_index, texture];
+  }
+  id<MTLAllocation> backing = dxmt_metal4_backing_allocation(
+      (id<MTLAllocation>)texture);
+  if (backing != (id<MTLAllocation>)texture &&
+      [(id)backing conformsToProtocol:@protocol(MTLResource)] &&
+      ![(id<MTLResource>)backing label]) {
+    [(id<MTLResource>)backing setLabel:[NSString
+        stringWithFormat:@"DXMT backing for %s[%u] allocation=%p", role,
+                         attachment_index, backing]];
+  }
+
+  static atomic_uint_fast64_t occurrence = 0;
+  const uint64_t index = atomic_fetch_add_explicit(
+                             &occurrence, 1, memory_order_relaxed) +
+                         1;
+  if (was_unlabelled && (index <= 32 || (index & (index - 1)) == 0)) {
+    fprintf(stderr,
+            "info:  DXMT Metal4 render attachment: index=%" PRIu64
+            " role=%s slot=%u texture=%p class=%s label=%s parent=%p buffer=%p"
+            " heap=%p storage=%lu type=%lu format=%lu size=%lux%lu samples=%lu"
+            " framebufferOnly=%u backing=%p setContainsView=%u"
+            " setContainsBacking=%u setAllocations=%lu\n",
+            index, role, attachment_index, texture,
+            class_getName(object_getClass(texture)), texture.label.UTF8String,
+            texture.parentTexture, texture.buffer, texture.heap,
+            (unsigned long)texture.storageMode,
+            (unsigned long)texture.textureType,
+            (unsigned long)texture.pixelFormat, (unsigned long)texture.width,
+            (unsigned long)texture.height, (unsigned long)texture.sampleCount,
+            texture.framebufferOnly, backing,
+            [owner.residencySet containsAllocation:(id<MTLAllocation>)texture],
+            [owner.residencySet containsAllocation:backing],
+            (unsigned long)owner.residencySet.allocationCount);
+    fflush(stderr);
+  }
+}
+
 static NTSTATUS
 _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
@@ -4884,6 +5007,10 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   DXMTMetal4CommandBuffer *owner = (DXMTMetal4CommandBuffer *)params->handle;
   MTL4RenderPassDescriptor *descriptor = [[MTL4RenderPassDescriptor alloc] init];
   for (unsigned i = 0; i < 8; i++) {
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->colors[i].texture, "color", i);
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->colors[i].resolve_texture, "resolve", i);
     descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
         info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
         info->colors[i].clear_color.a
@@ -4898,11 +5025,11 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.colorAttachments[i].resolveLevel = info->colors[i].resolve_level;
     descriptor.colorAttachments[i].resolveSlice = info->colors[i].resolve_slice;
     descriptor.colorAttachments[i].resolveDepthPlane = info->colors[i].resolve_depth_plane;
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->colors[i].texture];
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->colors[i].resolve_texture];
   }
 
   if (info->depth.texture) {
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->depth.texture, "depth", 0);
     descriptor.depthAttachment.clearDepth = info->depth.clear_depth;
     descriptor.depthAttachment.depthPlane = info->depth.depth_plane;
     descriptor.depthAttachment.level = info->depth.level;
@@ -4910,10 +5037,11 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.depthAttachment.texture = (id<MTLTexture>)info->depth.texture;
     descriptor.depthAttachment.loadAction = (MTLLoadAction)info->depth.load_action;
     descriptor.depthAttachment.storeAction = (MTLStoreAction)info->depth.store_action;
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->depth.texture];
   }
 
   if (info->stencil.texture) {
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->stencil.texture, "stencil", 0);
     descriptor.stencilAttachment.clearStencil = info->stencil.clear_stencil;
     descriptor.stencilAttachment.depthPlane = info->stencil.depth_plane;
     descriptor.stencilAttachment.level = info->stencil.level;
@@ -4921,7 +5049,6 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.stencilAttachment.texture = (id<MTLTexture>)info->stencil.texture;
     descriptor.stencilAttachment.loadAction = (MTLLoadAction)info->stencil.load_action;
     descriptor.stencilAttachment.storeAction = (MTLStoreAction)info->stencil.store_action;
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->stencil.texture];
   }
 
   descriptor.defaultRasterSampleCount = info->default_raster_sample_count;
