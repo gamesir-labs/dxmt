@@ -194,4 +194,23 @@ TEST_F(D3D10PipelineSpec, CreatesStateObjectsWithRequestedDescriptions) {
   EXPECT_FLOAT_EQ(actual_sampler.BorderColor[0], 0.25f);
 }
 
+TEST_F(D3D10PipelineSpec, CompletesOcclusionQueryData) {
+  D3D10_QUERY_DESC query_desc = {};
+  query_desc.Query = D3D10_QUERY_OCCLUSION;
+  ComPtr<ID3D10Query> query;
+  ASSERT_TRUE(HResultSucceeded(device_->CreateQuery(&query_desc, query.put())));
+  query->Begin();
+  query->End();
+  device_->Flush();
+
+  UINT64 samples = 0;
+  HRESULT data_hr = S_FALSE;
+  for (UINT attempt = 0; attempt < 100 && data_hr == S_FALSE; ++attempt) {
+    data_hr = query->GetData(&samples, sizeof(samples), 0);
+    if (data_hr == S_FALSE)
+      Sleep(1);
+  }
+  EXPECT_EQ(data_hr, S_OK);
+}
+
 } // namespace

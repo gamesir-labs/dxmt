@@ -200,6 +200,27 @@ TEST_F(D3D11PipelineSpec, ReportsSamplesForAnOcclusionQuery) {
   EXPECT_GT(samples, 0u);
 }
 
+TEST_F(D3D11PipelineSpec, ReadsCompletedTimestampQuery) {
+  D3D11_QUERY_DESC query_desc = {};
+  query_desc.Query = D3D11_QUERY_TIMESTAMP;
+  ComPtr<ID3D11Query> query;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateQuery(&query_desc, query.put())));
+  context_.context()->End(query.get());
+  context_.context()->Flush();
+
+  UINT64 timestamp = 0;
+  HRESULT data_hr = S_FALSE;
+  for (UINT attempt = 0; attempt < 100 && data_hr == S_FALSE; ++attempt) {
+    data_hr = context_.context()->GetData(query.get(), &timestamp,
+                                          sizeof(timestamp), 0);
+    if (data_hr == S_FALSE)
+      Sleep(1);
+  }
+  EXPECT_EQ(data_hr, S_OK);
+  EXPECT_GT(timestamp, 0ull);
+}
+
 TEST_F(D3D11PipelineSpec, DispatchesComputeShaderIntoStorageTexture) {
   const auto compute = CompileShader(kTextureComputeShader, "cs_5_0");
   ASSERT_TRUE(HResultSucceeded(compute.result)) << compute.diagnostic_text();
