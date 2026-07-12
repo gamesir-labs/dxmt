@@ -185,4 +185,23 @@ TEST(FenceLocalityCheck, RemovesTransitiveAndImplicitWaits) {
   EXPECT_FALSE(waits.test(258));
 }
 
+TEST(FenceLocalityCheck, PreservesStrongDependenciesOutsideSummaryWindow) {
+  dxmt::GenericAccessTracker tracker;
+  dxmt::FenceSet strong_waits;
+  dxmt::EncoderBarrierState barriers;
+  tracker.accessExclusive(256, strong_waits, barriers, false);
+  strong_waits = {};
+  tracker.accessShared(600, strong_waits, barriers);
+  ASSERT_TRUE(strong_waits.test(256));
+
+  dxmt::FenceLocalityCheck locality;
+
+  for (dxmt::EncoderId id = 256; id < 600; id++)
+    locality.collectAndSimplifyWaits({}, id);
+
+  auto waits = locality.collectAndSimplifyWaits(strong_waits, 600);
+  EXPECT_EQ(waits.count(), 1u);
+  EXPECT_TRUE(waits.test(256));
+}
+
 } // namespace

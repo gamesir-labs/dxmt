@@ -294,6 +294,15 @@ FenceLocalityCheck::collectAndSimplifyWaits(
   FenceSet minimal_fences;
   FenceSet accessible_fences;
 
+  // The rolling summaries below can only prove transitive coverage inside
+  // their generation window. A strong dependency outside that window must be
+  // kept explicitly; otherwise a correctly tracked distant producer silently
+  // disappears before Metal fence encoding.
+  strong_fences.forEach([&](EncoderId producer_id) {
+    if (producer_id < id && id - producer_id >= kParityLane)
+      minimal_fences.set(producer_id);
+  });
+
   for (EncoderId offset = 1; offset < kParityLane && offset <= id; offset++) {
     EncoderId prev_encoder_id = id - offset;
 
