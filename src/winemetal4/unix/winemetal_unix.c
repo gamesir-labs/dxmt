@@ -142,6 +142,17 @@ dxmt_metal4_perf_stats_enabled(void) {
 }
 
 static bool
+dxmt_metal4_pso_labels_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static bool
 dxmt_metal4_dense_hang_diagnostics_enabled(void) {
   static bool initialized = false;
   static bool enabled = false;
@@ -5045,6 +5056,8 @@ _MTLDevice_newRenderPipelineState(void *obj) {
 
   descriptor.vertexFunction = (id<MTLFunction>)info->vertex_function;
   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
+  if (dxmt_metal4_pso_labels_enabled() && info->debug_label[0])
+    descriptor.label = [NSString stringWithUTF8String:info->debug_label];
 
   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
@@ -5176,6 +5189,8 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   if (info->rasterization_enabled && !fragment_function)
     fragment_function = DXMTGetNullFragmentFunction(device);
   descriptor.fragmentFunction = fragment_function;
+  if (dxmt_metal4_pso_labels_enabled() && info->debug_label[0])
+    descriptor.label = [NSString stringWithUTF8String:info->debug_label];
   descriptor.payloadMemoryLength = info->payload_memory_length;
 
   if (info->rasterization_enabled && !info->fragment_function) {

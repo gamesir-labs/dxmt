@@ -52,4 +52,18 @@ TEST(PipelineDiag, SerializesConcurrentRegistration) {
             keys.end());
 }
 
+TEST(PipelineDiag, BuildsStableMetalPsoLabel) {
+  const std::string key = "0123456789abcdef0123456789abcdef01234567";
+  EXPECT_EQ(dxmt::BuildMetalPsoDebugLabel("graphics", key, 64),
+            "graphics:" + key);
+}
+
+TEST(PipelineDiag, BoundsAdversarialMetalPsoLabelInputs) {
+  const auto label = dxmt::BuildMetalPsoDebugLabel(
+      std::string(256, 'k'), std::string(256, 'f'), 16);
+  EXPECT_EQ(label, "kkkk:ffffffffff");
+  EXPECT_EQ(label.size(), 15u);
+  EXPECT_TRUE(dxmt::BuildMetalPsoDebugLabel("x", "y", 1).empty());
+}
+
 } // namespace

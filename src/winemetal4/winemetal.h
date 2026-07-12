@@ -996,6 +996,7 @@ struct WMTRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   uint8_t padding[6];
+  char debug_label[64];
 };
 
 struct WMTMeshRenderPipelineInfo {
@@ -1021,6 +1022,7 @@ struct WMTMeshRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   uint8_t padding[6];
+  char debug_label[64];
 };
 
 WINEMETAL_API obj_handle_t

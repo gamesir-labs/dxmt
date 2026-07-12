@@ -53,6 +53,23 @@ D3D12PipelineDiagEnabled() {
 }
 
 static bool
+D3D12MetalPsoLabelsEnabled() {
+  static const bool enabled =
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_METAL_PSO_LABELS");
+  return enabled;
+}
+
+template <typename PipelineInfo>
+void SetMetalPsoDebugLabel(PipelineInfo &info, std::string_view kind,
+                           std::string_view shader_cache_key) {
+  if (!D3D12MetalPsoLabelsEnabled())
+    return;
+  const auto label = dxmt::BuildMetalPsoDebugLabel(
+      kind, shader_cache_key, sizeof(info.debug_label));
+  std::memcpy(info.debug_label, label.c_str(), label.size() + 1);
+}
+
+static bool
 D3D12PipelineDiagShouldLog() {
   static std::atomic<uint32_t> count = 0;
   if (!D3D12PipelineDiagEnabled())
@@ -2718,6 +2735,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
       WMTMeshRenderPipelineInfo info = {};
       WMT::InitializeMeshRenderPipelineInfo(info);
+      SetMetalPsoDebugLabel(info, prefix, shader_cache_key);
       info.object_function = out.tessellation_vertex_hull[variant].function;
       info.mesh_function = out.tessellation_domain.function;
       info.fragment_function = out.pixel.function;
@@ -2822,6 +2840,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
       WMTMeshRenderPipelineInfo info = {};
       WMT::InitializeMeshRenderPipelineInfo(info);
+      SetMetalPsoDebugLabel(
+          info, strip_topology ? "mesh-gs-strip" : "mesh-gs",
+          shader_cache_key);
       info.object_function = object_shader.function;
       info.mesh_function = mesh_shader.function;
       info.fragment_function = out.pixel.function;
@@ -2892,6 +2913,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   WMTRenderPipelineInfo info = {};
   WMT::InitializeRenderPipelineInfo(info);
+  SetMetalPsoDebugLabel(info, "graphics", shader_cache_key);
   info.vertex_function = out.vertex.function;
   info.fragment_function = out.pixel.function;
   info.rasterization_enabled = true;
