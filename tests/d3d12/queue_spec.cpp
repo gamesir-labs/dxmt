@@ -248,6 +248,52 @@ struct ScopedCommandBufferErrorMarker {
   std::string path;
 };
 
+struct CommandBufferDiagnosticTotals {
+  std::uint64_t input_encoders = 0;
+  std::uint64_t encoded_encoders = 0;
+  std::uint64_t encoded_blit = 0;
+  std::uint64_t barrier_only = 0;
+  std::uint64_t fence_waits = 0;
+  std::uint64_t fence_updates = 0;
+};
+
+struct ScopedCommandBufferDiagnosticMarker {
+  ScopedCommandBufferDiagnosticMarker() {
+    std::ostringstream name;
+    name << "C:\\dxmt-command-buffer-diagnostic-" << GetCurrentProcessId()
+         << "-" << GetTickCount64() << ".txt";
+    path = name.str();
+    std::ofstream(path, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
+                            path.c_str());
+  }
+
+  ~ScopedCommandBufferDiagnosticMarker() {
+    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
+                            nullptr);
+    DeleteFileA(path.c_str());
+  }
+
+  CommandBufferDiagnosticTotals Read() const {
+    std::ifstream input(path);
+    CommandBufferDiagnosticTotals totals = {};
+    CommandBufferDiagnosticTotals line = {};
+    while (input >> line.input_encoders >> line.encoded_encoders >>
+           line.encoded_blit >> line.barrier_only >> line.fence_waits >>
+           line.fence_updates) {
+      totals.input_encoders += line.input_encoders;
+      totals.encoded_encoders += line.encoded_encoders;
+      totals.encoded_blit += line.encoded_blit;
+      totals.barrier_only += line.barrier_only;
+      totals.fence_waits += line.fence_waits;
+      totals.fence_updates += line.fence_updates;
+    }
+    return totals;
+  }
+
+  std::string path;
+};
+
 struct ScopedMetal4RejectionMarker {
   ScopedMetal4RejectionMarker() {
     std::ostringstream name;
@@ -599,6 +645,63 @@ TEST_F(D3D12QueueSpec, ClearsRenderTargetViewsAcrossMipChain) {
                       x * sizeof(pixel),
                   sizeof(pixel));
       EXPECT_EQ(pixel, kPackedWhite)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(D3D12QueueSpec,
+       LargeClearDependencyStormCompletesWithoutFenceAmplification) {
+  constexpr UINT kResourceCount = 64;
+  constexpr UINT kClearCount = 600;
+  ScopedCommandBufferDiagnosticMarker diagnostic;
+
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResourceCount, false);
+  ASSERT_TRUE(rtv_heap);
+
+  std::array<ComPtr<ID3D12Resource>, kResourceCount> textures;
+  for (UINT i = 0; i < kResourceCount; i++) {
+    textures[i] = context_.CreateTexture2D(
+        64, 64, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ASSERT_TRUE(textures[i]);
+    context_.device()->CreateRenderTargetView(
+        textures[i].get(), nullptr,
+        context_.CpuDescriptorHandle(rtv_heap.get(), i));
+  }
+
+  constexpr FLOAT kClearColor[] = {0.25f, 0.5f, 0.75f, 1.0f};
+  for (UINT i = 0; i < kClearCount; i++) {
+    context_.list()->ClearRenderTargetView(
+        context_.CpuDescriptorHandle(rtv_heap.get(), i % kResourceCount),
+        kClearColor, 0, nullptr);
+  }
+
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+  const auto totals = diagnostic.Read();
+  EXPECT_GE(totals.input_encoders, kClearCount);
+  EXPECT_LE(totals.fence_waits, kClearCount);
+  EXPECT_LE(totals.fence_updates, kClearCount + kResourceCount);
+  EXPECT_EQ(totals.barrier_only, 0u);
+
+  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+  D3D12TestContext::Transition(
+      context_.list(), textures[0].get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  ASSERT_TRUE(
+      SUCCEEDED(context_.ReadbackTexture(textures[0].get(), &readback)));
+  ASSERT_EQ(readback.width, 64u);
+  ASSERT_EQ(readback.height, 64u);
+
+  const std::array<std::uint8_t, 4> expected = {64, 128, 191, 255};
+  for (UINT y = 0; y < readback.height; y++) {
+    for (UINT x = 0; x < readback.width; x++) {
+      const auto *pixel = readback.data.data() + y * readback.row_pitch +
+                          x * expected.size();
+      EXPECT_TRUE(std::equal(expected.begin(), expected.end(), pixel))
           << "pixel (" << x << ", " << y << ")";
     }
   }
