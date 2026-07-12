@@ -154,6 +154,24 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   wmt_diagnostic.barrier_only_pass_count = diagnostic.barrier_only_pass_count;
   wmt_diagnostic.fence_wait_count = diagnostic.fence_wait_count;
   wmt_diagnostic.fence_update_count = diagnostic.fence_update_count;
+  wmt_diagnostic.prior_local_fence_wait_count =
+      diagnostic.prior_local_fence_wait_count;
+  wmt_diagnostic.future_local_fence_wait_count =
+      diagnostic.future_local_fence_wait_count;
+  wmt_diagnostic.same_encoder_fence_wait_count =
+      diagnostic.same_encoder_fence_wait_count;
+  wmt_diagnostic.external_fence_wait_count =
+      diagnostic.external_fence_wait_count;
+  wmt_diagnostic.repeated_fence_update_count =
+      diagnostic.repeated_fence_update_count;
+  wmt_diagnostic.render_valid_cross_stage_count =
+      diagnostic.render_valid_cross_stage_count;
+  wmt_diagnostic.render_same_stage_wait_count =
+      diagnostic.render_same_stage_wait_count;
+  wmt_diagnostic.render_reverse_stage_wait_count =
+      diagnostic.render_reverse_stage_wait_count;
+  wmt_diagnostic.local_fence_id_count = diagnostic.local_fence_id_count;
+  wmt_diagnostic.bound_fence_slot_count = diagnostic.bound_fence_slot_count;
   cmdbuf.setDiagnosticInfo(wmt_diagnostic);
   const auto diagnostic_marker =
       env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");

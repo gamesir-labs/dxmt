@@ -1089,6 +1089,10 @@ dxmt_metal4_is_buffer(id object) {
                 " present=%u clear=%u resolve=%u scaler=%u"
                 " signal=%u wait=%u timestamp=%u"
                 " barrierOnly=%u fenceWait=%u fenceUpdate=%u initEvent=%" PRIu64
+                " priorLocalWait=%u futureLocalWait=%u sameEncoderWait=%u"
+                " externalWait=%u repeatedUpdate=%u"
+                " renderValidCrossStage=%u renderSameStage=%u renderReverseStage=%u"
+                " localFenceIds=%u boundFenceSlots=%u"
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
                 (void *)(uintptr_t)feedbackMetalBuffer,
@@ -1124,6 +1128,16 @@ dxmt_metal4_is_buffer(id object) {
                 feedbackDiagnostic.fence_wait_count,
                 feedbackDiagnostic.fence_update_count,
                 feedbackDiagnostic.resource_initializer_event_id,
+                feedbackDiagnostic.prior_local_fence_wait_count,
+                feedbackDiagnostic.future_local_fence_wait_count,
+                feedbackDiagnostic.same_encoder_fence_wait_count,
+                feedbackDiagnostic.external_fence_wait_count,
+                feedbackDiagnostic.repeated_fence_update_count,
+                feedbackDiagnostic.render_valid_cross_stage_count,
+                feedbackDiagnostic.render_same_stage_wait_count,
+                feedbackDiagnostic.render_reverse_stage_wait_count,
+                feedbackDiagnostic.local_fence_id_count,
+                feedbackDiagnostic.bound_fence_slot_count,
                 feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
                 feedback.GPUStartTime, feedback.GPUEndTime,
                 error.domain ? error.domain.UTF8String : "<no domain>",

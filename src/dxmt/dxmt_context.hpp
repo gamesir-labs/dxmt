@@ -55,6 +55,16 @@ struct CommandBufferDiagnosticInfo {
   uint32_t barrier_only_pass_count = 0;
   uint32_t fence_wait_count = 0;
   uint32_t fence_update_count = 0;
+  uint32_t prior_local_fence_wait_count = 0;
+  uint32_t future_local_fence_wait_count = 0;
+  uint32_t same_encoder_fence_wait_count = 0;
+  uint32_t external_fence_wait_count = 0;
+  uint32_t repeated_fence_update_count = 0;
+  uint32_t render_valid_cross_stage_count = 0;
+  uint32_t render_same_stage_wait_count = 0;
+  uint32_t render_reverse_stage_wait_count = 0;
+  uint32_t local_fence_id_count = 0;
+  uint32_t bound_fence_slot_count = 0;
 };
 
 inline std::size_t
@@ -1205,6 +1215,14 @@ private:
   bool tryMergeClearEncoders(ClearEncoderData* former, ClearEncoderData* latter);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
+  WMT::Fence fenceForEncoder(EncoderId id);
+  void prepareFencePool(EncoderData **encoders, unsigned encoder_count,
+                        CommandBufferDiagnosticInfo *diagnostic_info);
+  template <typename Fn>
+  void withFence(EncoderId id, Fn &&fn) {
+    if (auto fence = fenceForEncoder(id))
+      fn(fence);
+  }
   bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);
   void appendPendingFenceOnlyBlitPass();
   void mergePendingFenceOnlyBlitPassInto(EncoderData* encoder);
@@ -1247,7 +1265,9 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
-  std::array<WMT::Reference<WMT::Fence>, kParityLane> fence_pool_;
+  std::vector<WMT::Reference<WMT::Fence>> fence_pool_;
+  CommandBufferFenceBindingTable fence_bindings_;
+  uint32_t created_fence_count_ = 0;
   FenceLocalityCheck fence_locality_;
 
   uint64_t seq_id_;
