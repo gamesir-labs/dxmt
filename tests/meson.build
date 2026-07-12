@@ -1,4 +1,5 @@
 dxmt_test_include_dirs = include_directories('include')
+d3dcompiler_test_dep = cpp.find_library('d3dcompiler_47')
 
 dxmt_test_main_lib = static_library(
   'dxmt-wine-test-main',
