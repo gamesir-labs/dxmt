@@ -11,8 +11,8 @@
 
 namespace {
 
-using dxmt::test::ComPtr;
 using dxmt::test::ColorsMatch;
+using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
@@ -21,9 +21,7 @@ public:
   explicit LifetimeProbe(std::shared_ptr<std::atomic_bool> destroyed)
       : destroyed_(std::move(destroyed)) {}
 
-  ~LifetimeProbe() {
-    destroyed_->store(true, std::memory_order_release);
-  }
+  ~LifetimeProbe() { destroyed_->store(true, std::memory_order_release); }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
     if (!object)
@@ -54,18 +52,15 @@ private:
 
 class D3D12QueueSpec : public ::testing::Test {
 protected:
-  void SetUp() override {
-    ASSERT_TRUE(SUCCEEDED(context_.Initialize()));
-  }
+  void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
 
   D3D12TestContext context_;
 };
 
 TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
   const std::array<std::uint32_t, 16> expected = {
-      0x01020304, 0x11121314, 0x21222324, 0x31323334,
-      0x41424344, 0x51525354, 0x61626364, 0x71727374,
-      0x81828384, 0x91929394, 0xa1a2a3a4, 0xb1b2b3b4,
+      0x01020304, 0x11121314, 0x21222324, 0x31323334, 0x41424344, 0x51525354,
+      0x61626364, 0x71727374, 0x81828384, 0x91929394, 0xa1a2a3a4, 0xb1b2b3b4,
       0xc1c2c3c4, 0xd1d2d3d4, 0xe1e2e3e4, 0xf1f2f3f4,
   };
   ComPtr<ID3D12Resource> upload = context_.CreateUploadBuffer(
@@ -81,21 +76,91 @@ TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
   ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
 
-  D3D12TestContext::Transition(
-      context_.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context_.list(), destination.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   std::vector<std::uint8_t> actual;
-  ASSERT_TRUE(SUCCEEDED(context_.ReadbackBuffer(destination.get(),
-                                               sizeof(expected), &actual)));
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackBuffer(destination.get(), sizeof(expected), &actual)));
   ASSERT_EQ(actual.size(), sizeof(expected));
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
 }
 
+TEST_F(D3D12QueueSpec, RejectsClosingAlreadyClosedCommandList) {
+  ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
+  EXPECT_EQ(context_.list()->Close(), E_FAIL);
+  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+}
+
+TEST_F(D3D12QueueSpec, CopiesTextureRegionAtNonZeroOffsets) {
+  constexpr UINT source_width = 5;
+  constexpr UINT source_height = 4;
+  constexpr UINT destination_width = 8;
+  constexpr UINT destination_height = 6;
+  const std::array<std::uint32_t, source_width *source_height> source_data = {
+      0xff000001, 0xff000002, 0xff000003, 0xff000004, 0xff000005,
+      0xff000011, 0xff000012, 0xff000013, 0xff000014, 0xff000015,
+      0xff000021, 0xff000022, 0xff000023, 0xff000024, 0xff000025,
+      0xff000031, 0xff000032, 0xff000033, 0xff000034, 0xff000035,
+  };
+  std::array<std::uint32_t, destination_width * destination_height>
+      destination_initial;
+  destination_initial.fill(0x7f334455);
+  auto expected = destination_initial;
+  for (UINT y = 0; y < 2; ++y) {
+    for (UINT x = 0; x < 3; ++x) {
+      expected[(y + 2) * destination_width + x + 3] =
+          source_data[(y + 1) * source_width + x + 1];
+    }
+  }
+
+  ComPtr<ID3D12Resource> source = context_.CreateTexture2D(
+      source_width, source_height, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12Resource> destination = context_.CreateTexture2D(
+      destination_width, destination_height, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      source.get(), source_data.data(), source_width * sizeof(std::uint32_t),
+      source_data.size() * sizeof(std::uint32_t))));
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      destination.get(), destination_initial.data(),
+      destination_width * sizeof(std::uint32_t),
+      expected.size() * sizeof(std::uint32_t))));
+
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source.get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination_location = {};
+  destination_location.pResource = destination.get();
+  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_BOX source_box = {1, 1, 0, 4, 3, 1};
+  context_.list()->CopyTextureRegion(&destination_location, 3, 2, 0,
+                                     &source_location, &source_box);
+  D3D12TestContext::Transition(context_.list(), destination.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(
+      SUCCEEDED(context_.ReadbackTexture(destination.get(), &readback)));
+  ASSERT_EQ(readback.width, destination_width);
+  ASSERT_EQ(readback.height, destination_height);
+  for (UINT y = 0; y < destination_height; ++y) {
+    const auto *row = readback.data.data() + y * readback.row_pitch;
+    EXPECT_EQ(std::memcmp(row, expected.data() + y * destination_width,
+                          destination_width * sizeof(std::uint32_t)),
+              0)
+        << "row " << y;
+  }
+}
+
 TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {
   const std::array<std::uint32_t, 16> expected = {
-      0xff000001, 0xff000002, 0xff000003, 0xff000004,
-      0xff000011, 0xff000012, 0xff000013, 0xff000014,
-      0xff000021, 0xff000022, 0xff000023, 0xff000024,
+      0xff000001, 0xff000002, 0xff000003, 0xff000004, 0xff000011, 0xff000012,
+      0xff000013, 0xff000014, 0xff000021, 0xff000022, 0xff000023, 0xff000024,
       0xff000031, 0xff000032, 0xff000033, 0xff000034,
   };
   ComPtr<ID3D12Resource> texture = context_.CreateTexture2D(
@@ -106,9 +171,9 @@ TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {
       texture.get(), expected.data(), 4 * sizeof(std::uint32_t),
       sizeof(expected))));
 
-  D3D12TestContext::Transition(
-      context_.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context_.list(), texture.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   TextureReadback readback;
   ASSERT_TRUE(SUCCEEDED(context_.ReadbackTexture(texture.get(), &readback)));
   ASSERT_EQ(readback.width, 4u);
@@ -173,34 +238,33 @@ TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
   ComPtr<ID3D12Resource> destination;
   ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommittedResource(
       &heap, D3D12_HEAP_FLAG_NONE, &destination_desc,
-      D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
-      __uuidof(ID3D12Resource),
+      D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr, __uuidof(ID3D12Resource),
       reinterpret_cast<void **>(destination.put()))));
 
-  auto rtv_heap = context_.CreateDescriptorHeap(
-      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  auto rtv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
   ASSERT_TRUE(rtv_heap);
   const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
   context_.device()->CreateRenderTargetView(source.get(), nullptr, rtv);
   context_.list()->ClearRenderTargetView(rtv, clear_value.Color, 0, nullptr);
-  D3D12TestContext::Transition(
-      context_.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  D3D12TestContext::Transition(context_.list(), source.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
 
   ComPtr<ID3D12GraphicsCommandList1> list1;
-  ASSERT_TRUE(SUCCEEDED(context_.list()->QueryInterface(
-      __uuidof(ID3D12GraphicsCommandList1),
-      reinterpret_cast<void **>(list1.put()))));
-  list1->ResolveSubresourceRegion(
-      destination.get(), 0, 0, 0, source.get(), 0, nullptr,
-      DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOLVE_MODE_AVERAGE);
-  D3D12TestContext::Transition(
-      context_.list(), destination.get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ASSERT_TRUE(SUCCEEDED(
+      context_.list()->QueryInterface(__uuidof(ID3D12GraphicsCommandList1),
+                                      reinterpret_cast<void **>(list1.put()))));
+  list1->ResolveSubresourceRegion(destination.get(), 0, 0, 0, source.get(), 0,
+                                  nullptr, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                  D3D12_RESOLVE_MODE_AVERAGE);
+  D3D12TestContext::Transition(context_.list(), destination.get(),
+                               D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
 
   TextureReadback readback;
-  ASSERT_TRUE(SUCCEEDED(
-      context_.ReadbackTexture(destination.get(), &readback)));
+  ASSERT_TRUE(
+      SUCCEEDED(context_.ReadbackTexture(destination.get(), &readback)));
   ASSERT_EQ(readback.width, 8u);
   ASSERT_EQ(readback.height, 8u);
   for (UINT y = 0; y < 4; ++y) {
@@ -217,30 +281,28 @@ TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
 
 TEST_F(D3D12QueueSpec, FailsCloseForUnadvertisedCommandFeatures) {
   ComPtr<ID3D12GraphicsCommandList1> list1;
-  ASSERT_TRUE(SUCCEEDED(context_.list()->QueryInterface(
-      __uuidof(ID3D12GraphicsCommandList1),
-      reinterpret_cast<void **>(list1.put()))));
+  ASSERT_TRUE(SUCCEEDED(
+      context_.list()->QueryInterface(__uuidof(ID3D12GraphicsCommandList1),
+                                      reinterpret_cast<void **>(list1.put()))));
 
   std::array<std::uint32_t, 64> atomic_data = {};
   auto atomic_source = context_.CreateUploadBuffer(
       sizeof(atomic_data), atomic_data.data(), sizeof(atomic_data));
-  auto atomic_destination = context_.CreateBuffer(
-      sizeof(atomic_data), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  auto atomic_dependent = context_.CreateBuffer(
-      sizeof(atomic_data), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto atomic_destination =
+      context_.CreateBuffer(sizeof(atomic_data), D3D12_HEAP_TYPE_DEFAULT,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+  auto atomic_dependent =
+      context_.CreateBuffer(sizeof(atomic_data), D3D12_HEAP_TYPE_DEFAULT,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(atomic_source);
   ASSERT_TRUE(atomic_destination);
   ASSERT_TRUE(atomic_dependent);
   ID3D12Resource *dependent_resources[] = {atomic_dependent.get()};
-  D3D12_SUBRESOURCE_RANGE_UINT64 dependent_ranges[] = {
-      {0, {0, sizeof(UINT)}}};
-  list1->AtomicCopyBufferUINT(
-      atomic_destination.get(), 0, atomic_source.get(), 0, 1,
-      dependent_resources, dependent_ranges);
+  D3D12_SUBRESOURCE_RANGE_UINT64 dependent_ranges[] = {{0, {0, sizeof(UINT)}}};
+  list1->AtomicCopyBufferUINT(atomic_destination.get(), 0, atomic_source.get(),
+                              0, 1, dependent_resources, dependent_ranges);
   EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
 
@@ -257,13 +319,13 @@ TEST_F(D3D12QueueSpec, FailsCloseForUnadvertisedCommandFeatures) {
   EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
 
-  auto decompress_source = context_.CreateTexture2D(
-      16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
-      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  auto decompress_source =
+      context_.CreateTexture2D(16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
   auto decompress_destination = context_.CreateTexture2D(
-      16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
-      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+      16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_RESOLVE_DEST);
   ASSERT_TRUE(decompress_source);
   ASSERT_TRUE(decompress_destination);
   list1->ResolveSubresourceRegion(
@@ -302,8 +364,8 @@ TEST_F(D3D12QueueSpec, ResolveQueryRecordDoesNotRetainItsCommandList) {
 
   auto destroyed = std::make_shared<std::atomic_bool>(false);
   auto *probe = new LifetimeProbe(destroyed);
-  ASSERT_TRUE(SUCCEEDED(list->SetPrivateDataInterface(__uuidof(IUnknown),
-                                                      probe)));
+  ASSERT_TRUE(
+      SUCCEEDED(list->SetPrivateDataInterface(__uuidof(IUnknown), probe)));
   probe->Release();
   list->ResolveQueryData(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
                          result.get(), 0);
@@ -326,8 +388,8 @@ TEST_F(D3D12QueueSpec, ReleasingQueueCancelsAnUnresolvedFenceWait) {
 
   auto destroyed = std::make_shared<std::atomic_bool>(false);
   auto *probe = new LifetimeProbe(destroyed);
-  ASSERT_TRUE(SUCCEEDED(queue->SetPrivateDataInterface(__uuidof(IUnknown),
-                                                       probe)));
+  ASSERT_TRUE(
+      SUCCEEDED(queue->SetPrivateDataInterface(__uuidof(IUnknown), probe)));
   probe->Release();
   ASSERT_TRUE(SUCCEEDED(queue->Wait(fence.get(), 1)));
   Sleep(50);
