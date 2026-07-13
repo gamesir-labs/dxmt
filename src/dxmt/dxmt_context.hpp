@@ -831,6 +831,8 @@ public:
                                 WMTRenderStages render_stages = {});
   void bindNativeNullConstantBuffer(bool compute,
                                     WMTRenderStages render_stages = {});
+  void bindNativeNullBuffer(bool compute,
+                            WMTRenderStages render_stages = {});
   void diagnoseNativeShaderBinding(
       PipelineStage stage, const std::string &shader_hash, const char *path,
       const AllocatedArgumentBufferSlice &cbuffer_root_bases,

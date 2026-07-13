@@ -496,7 +496,7 @@ static auto get_native_buffer_in_descriptor_record(
     uint32_t buffer_record_index, uint32_t resource_table_index,
     uint32_t root_table_base_index, uint32_t arg_index,
     uint32_t range_lower_bound, air::AddressSpace address_space,
-    bool counter = false) {
+    bool counter = false, uint32_t null_buffer_index = UINT32_MAX) {
   return [=](pvalue dyn_index) {
     return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
       const uint32_t resource_qword = counter ? 4u : 0u;
@@ -522,7 +522,13 @@ static auto get_native_buffer_in_descriptor_record(
       auto address = ctx.builder.CreateAdd(base, byte_offset.get());
       auto ptr_ty = ctx.builder.getInt32Ty()->getPointerTo(
           static_cast<unsigned>(address_space));
-      return ctx.builder.CreateIntToPtr(address, ptr_ty);
+      auto descriptor_ptr = ctx.builder.CreateIntToPtr(address, ptr_ty);
+      if (null_buffer_index == UINT32_MAX)
+        return descriptor_ptr;
+      auto is_null = ctx.builder.CreateICmpEQ(
+          resource_index, ctx.builder.getInt32(0));
+      return ctx.builder.CreateSelect(
+          is_null, ctx.function->getArg(null_buffer_index), descriptor_ptr);
     });
   };
 }
@@ -885,6 +891,14 @@ native_uses_buffer_descriptor_records(const ShaderInfo *shader_info) {
   return false;
 }
 
+static bool
+native_uses_buffer_srv(const ShaderInfo *shader_info) {
+  for (auto &[range_id, srv] : shader_info->srvMap)
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      return true;
+  return false;
+}
+
 static void
 add_texture_argument_flags(
     MTL_SM50_SHADER_ARGUMENT_FLAG &flags, shader::common::ResourceType resource_type,
@@ -1025,6 +1039,7 @@ void setup_binding_table(
   uint32_t native_sampler_heap_index = ~0u;
   uint32_t native_resource_table_index = ~0u;
   uint32_t native_buffer_record_index = ~0u;
+  uint32_t native_null_buffer_index = ~0u;
   uint32_t native_null_cbuffer_index = ~0u;
   uint32_t native_cbuffer_root_table_base_index = ~0u;
   uint32_t native_root_table_base_index = ~0u;
@@ -1082,6 +1097,19 @@ void setup_binding_table(
             .arg_name = "native_buffer_descriptor_records",
             .raster_order_group = std::nullopt,
           });
+      if (native_uses_buffer_srv(shader_info)) {
+        native_null_buffer_index =
+            func_signature.DefineInput(air::ArgumentBindingBuffer{
+              .buffer_size = std::nullopt,
+              .location_index = DXMT12_MTL4_NATIVE_NULL_BUFFER_BIND_INDEX,
+              .array_size = 1,
+              .memory_access = air::MemoryAccess::read,
+              .address_space = air::AddressSpace::device,
+              .type = air::msl_uint,
+              .arg_name = "native_null_buffer",
+              .raster_order_group = std::nullopt,
+            });
+      }
     }
     if (!shader_info->cbufferMap.empty()) {
       native_null_cbuffer_index =
@@ -1301,7 +1329,8 @@ void setup_binding_table(
           ? get_native_buffer_in_descriptor_record(
               native_buffer_record_index, native_resource_table_index,
               native_root_table_base_index, srv.arg_index, lb,
-              air::AddressSpace::device)
+              air::AddressSpace::device, /*counter=*/false,
+              native_null_buffer_index)
           : gBindlessMirror
           ? get_buffer_in_buffer_table(
               buffer_table_index, compact_base, lb, air::AddressSpace::device)

@@ -224,6 +224,10 @@ NativeDescriptorImmutableBufferMask(const PipelineDxilShader &shader) {
                     DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX) |
                 BufferBindingBit(
                     DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX);
+        if (arg.Type == SM50BindingType::SRV &&
+            (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER))
+          mask |= BufferBindingBit(
+              DXMT12_MTL4_NATIVE_NULL_BUFFER_BIND_INDEX);
       }
     }
   }
@@ -2522,6 +2526,15 @@ GetNativeShaderAbiEligibilityImpl(
     const auto *arguments = shader.resourceArgumentInfo();
     for (uint32_t i = 0; arguments && i < shader.reflection().NumArguments;
          i++) {
+      // The native descriptor table indexes a heap-global texture-view slot.
+      // Metal texture arrayness is part of the shader-visible texture type, so
+      // it must be specialized per shader rather than written into shared heap
+      // state. Texture-bearing shaders use the per-draw bindless window until
+      // native tables gain an equivalent shader-specific view indirection.
+      if ((arguments[i].Type == SM50BindingType::SRV ||
+           arguments[i].Type == SM50BindingType::UAV) &&
+          (arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE))
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
       if (!NativeShaderArgumentHasSingleTableRange(*root_signature,
                                                    shader.stage,
                                                    arguments[i]))

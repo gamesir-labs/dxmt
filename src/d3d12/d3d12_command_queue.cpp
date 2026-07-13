@@ -13295,6 +13295,46 @@ private:
     return BindlessMirrorFillKind::None;
   }
 
+  std::optional<DescriptorTextureSlotPayload>
+  BuildBindlessTextureWindowPayload(
+      const DescriptorRecord &record,
+      const DXMT12_MTL4_SHADER_ARGUMENT &argument) {
+    if (!(argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE))
+      return std::nullopt;
+
+    auto *resource = GetResource(record.resource.ptr());
+    if (!resource || resource->GetBuffer() || !resource->GetTexture())
+      return std::nullopt;
+    if (resource->IsReservedTexture() &&
+        !resource->EnsureTextureAllocation(
+            "BuildBindlessTextureWindowPayload"))
+      return std::nullopt;
+
+    TextureViewBinding view = {};
+    if (record.type == DescriptorRecordType::ShaderResourceView) {
+      view = CreateShaderResourceTextureView(device_->GetMTLDevice(),
+                                             *resource, record);
+    } else if (record.type == DescriptorRecordType::UnorderedAccessView) {
+      view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
+                                              *resource, record);
+    }
+    if (!view || !view.texture.ptr())
+      return std::nullopt;
+
+    const auto adapted_view = view.texture->checkViewUseArray(
+        view.view,
+        argument.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
+    auto *allocation = view.texture->current();
+    if (!allocation)
+      return std::nullopt;
+
+    uint64_t encoded[dxmt::kMirrorTextureQwords] = {};
+    EncodeMirrorTextureSlot(
+        encoded, view.texture->view(adapted_view, allocation).gpuResourceID,
+        view.texture->arrayLength(adapted_view), 0.0f);
+    return DescriptorTextureSlotPayload{encoded[0], encoded[1]};
+  }
+
   void BindShaderResourceDescriptor(ArgumentEncodingContext &enc,
                                     PipelineStage stage, UINT slot,
                                     const DescriptorRecord &descriptor,
@@ -14976,8 +15016,11 @@ private:
             }
           } else if (entry.texture && window->texture.mapped) {
             auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-            const auto payload = slot_descriptor->mirror->textureSlotPayload(
-                source_slot, slot_descriptor->slot_version);
+            auto payload = BuildBindlessTextureWindowPayload(
+                *slot_descriptor, argument);
+            if (!payload)
+              payload = slot_descriptor->mirror->textureSlotPayload(
+                  source_slot, slot_descriptor->slot_version);
             if (payload) {
               for (uint32_t pair = 0; pair < window->texture_field_pairs;
                    pair++) {
@@ -16091,6 +16134,18 @@ private:
     }
   }
 
+  static bool NativeShaderUsesBufferSrv(const PipelineDxilShader &shader) {
+    const auto *arguments = shader.resourceArgumentInfo();
+    if (!arguments)
+      return false;
+    for (uint32_t i = 0; i < shader.reflection().NumArguments; i++) {
+      if (arguments[i].Type == SM50BindingType::SRV &&
+          (arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER))
+        return true;
+    }
+    return false;
+  }
+
   // Bindless-mirror (③.3) live/compute per-stage wiring: for the bindless path, replace the
   // legacy encodeConstantBuffers/encodeShaderResources with (1) pack the slot-27 buf_table via the
   // ③.1 packers and (2) emit the per-draw deferred binds of buf_table(27) + root_offsets(28, ③.2)
@@ -16116,6 +16171,8 @@ private:
                                                : WMTRenderStages{};
       if (shader.reflection().NumConstantBuffers)
         enc.bindNativeNullConstantBuffer(compute, render_stages);
+      if (NativeShaderUsesBufferSrv(shader))
+        enc.bindNativeNullBuffer(compute, render_stages);
       auto cbuffer_root_bases = BuildNativeRootTableBases(
           enc, state, pipeline, root, Stage, compute, /*cbuffer=*/true);
       auto resource_root_bases = BuildNativeRootTableBases(
@@ -16321,8 +16378,11 @@ private:
         } else if ((arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) &&
                    window->texture.mapped) {
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-          const auto payload = entry.descriptor.mirror->textureSlotPayload(
-              source_slot, entry.descriptor.slot_version);
+          auto payload = BuildBindlessTextureWindowPayload(entry.descriptor,
+                                                           arg);
+          if (!payload)
+            payload = entry.descriptor.mirror->textureSlotPayload(
+                source_slot, entry.descriptor.slot_version);
           if (payload) {
             for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
               const uint64_t pair_base =
@@ -16980,8 +17040,11 @@ private:
           }
         } else if (entry.texture && window->texture.mapped) {
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
-          const auto payload = slot_descriptor->mirror->textureSlotPayload(
-              source_slot, slot_descriptor->slot_version);
+          auto payload = BuildBindlessTextureWindowPayload(
+              *slot_descriptor, argument);
+          if (!payload)
+            payload = slot_descriptor->mirror->textureSlotPayload(
+                source_slot, slot_descriptor->slot_version);
           if (payload) {
             for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
               const uint64_t pair_base =
@@ -17220,6 +17283,8 @@ private:
                                                : WMTRenderStages{};
       if (shader.reflection().NumConstantBuffers)
         enc.bindNativeNullConstantBuffer(compute, render_stages);
+      if (NativeShaderUsesBufferSrv(shader))
+        enc.bindNativeNullBuffer(compute, render_stages);
       if (native_binding->cbuffer_root_base_count) {
         enc.bindNativeArgumentBuffer(
             native_root_base_buffer,
@@ -19066,17 +19131,7 @@ private:
                                             Resource *index_resource) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().descAccessUs);
     RecordRenderAttachmentAccess(chunk, state, pipeline.GetGraphicsState());
-    const bool bindless_descriptor_hazards_are_barrier_driven =
-        (pipeline.UsesBindlessMirror() ||
-         pipeline.GetShaderAbiVersion() ==
-             DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) &&
-        DescriptorMirrorRuntimeEnabled();
-    if (bindless_descriptor_hazards_are_barrier_driven) {
-      if (ReplayPerfEnabled())
-        perDrawSubTimers().descAccessPassthrough++;
-    } else {
-      RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
-    }
+    RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
     RecordVertexBufferAccess(chunk, state, pipeline.GetGraphicsState());
     if (index_resource) {
       RecordReplayResourceAccess(chunk, state, index_resource->GetD3D12Resource(),
@@ -19092,9 +19147,7 @@ private:
 
   void RecordComputePipelineResourceAccess(CommandChunk *chunk, ReplayState &state,
                                            PipelineState &pipeline) {
-    if (pipeline.GetShaderAbiVersion() !=
-        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE)
-      RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
+    RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
     if (state.predication_buffer) {
       RecordReplayResourceAccess(chunk, state, state.predication_buffer.ptr(),
                                  D3D12_RESOURCE_STATE_PREDICATION,
