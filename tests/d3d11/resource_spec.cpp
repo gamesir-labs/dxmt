@@ -402,6 +402,174 @@ TEST_F(D3D11ResourceSpec, CopiesOneMipWithoutChangingOtherSubresources) {
   }
 }
 
+TEST_F(D3D11ResourceSpec, PreservesTexture1DArraySubresources) {
+  constexpr UINT width = 8;
+  constexpr UINT mip_levels = 2;
+  constexpr UINT array_size = 3;
+  constexpr UINT subresource_count = mip_levels * array_size;
+  std::array<std::array<uint32_t, width>, subresource_count> contents = {};
+  std::array<D3D11_SUBRESOURCE_DATA, subresource_count> initial = {};
+  for (UINT slice = 0; slice < array_size; ++slice) {
+    for (UINT mip = 0; mip < mip_levels; ++mip) {
+      const UINT subresource = D3D11CalcSubresource(mip, slice, mip_levels);
+      const UINT mip_width = width >> mip;
+      for (UINT x = 0; x < mip_width; ++x)
+        contents[subresource][x] = 0x10000000u | subresource << 8 | x;
+      initial[subresource].pSysMem = contents[subresource].data();
+      initial[subresource].SysMemPitch = mip_width * sizeof(uint32_t);
+    }
+  }
+
+  D3D11_TEXTURE1D_DESC desc = {};
+  desc.Width = width;
+  desc.MipLevels = mip_levels;
+  desc.ArraySize = array_size;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  ComPtr<ID3D11Texture1D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture1D(
+      &desc, initial.data(), texture.put())));
+
+  D3D11_TEXTURE1D_DESC staging_desc = desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture1D> staging;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture1D(
+      &staging_desc, nullptr, staging.put())));
+  context_.context()->CopyResource(staging.get(), texture.get());
+
+  for (UINT slice = 0; slice < array_size; ++slice) {
+    for (UINT mip = 0; mip < mip_levels; ++mip) {
+      const UINT subresource = D3D11CalcSubresource(mip, slice, mip_levels);
+      const UINT mip_width = width >> mip;
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+          staging.get(), subresource, D3D11_MAP_READ, 0, &mapped)));
+      EXPECT_EQ(std::memcmp(mapped.pData, contents[subresource].data(),
+                            mip_width * sizeof(uint32_t)),
+                0)
+          << "slice " << slice << ", mip " << mip;
+      context_.context()->Unmap(staging.get(), subresource);
+    }
+  }
+}
+
+TEST_F(D3D11ResourceSpec, CopiesOneTexture2DArraySliceInIsolation) {
+  constexpr UINT width = 4;
+  constexpr UINT height = 3;
+  constexpr UINT array_size = 3;
+  constexpr UINT pixel_count = width * height;
+  std::array<std::array<uint32_t, pixel_count>, array_size> source = {};
+  std::array<std::array<uint32_t, pixel_count>, array_size> destination = {};
+  std::array<D3D11_SUBRESOURCE_DATA, array_size> source_initial = {};
+  std::array<D3D11_SUBRESOURCE_DATA, array_size> destination_initial = {};
+  for (UINT slice = 0; slice < array_size; ++slice) {
+    source[slice].fill(0x11000000u + slice);
+    destination[slice].fill(0x22000000u + slice);
+    source_initial[slice].pSysMem = source[slice].data();
+    source_initial[slice].SysMemPitch = width * sizeof(uint32_t);
+    destination_initial[slice].pSysMem = destination[slice].data();
+    destination_initial[slice].SysMemPitch = width * sizeof(uint32_t);
+  }
+
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = width;
+  desc.Height = height;
+  desc.MipLevels = 1;
+  desc.ArraySize = array_size;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  ComPtr<ID3D11Texture2D> source_texture;
+  ComPtr<ID3D11Texture2D> destination_texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &desc, source_initial.data(), source_texture.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &desc, destination_initial.data(), destination_texture.put())));
+
+  constexpr UINT source_slice = 2;
+  constexpr UINT destination_slice = 1;
+  context_.context()->CopySubresourceRegion(
+      destination_texture.get(), destination_slice, 0, 0, 0,
+      source_texture.get(), source_slice, nullptr);
+
+  D3D11_TEXTURE2D_DESC staging_desc = desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture2D> staging;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &staging_desc, nullptr, staging.put())));
+  context_.context()->CopyResource(staging.get(), destination_texture.get());
+
+  for (UINT slice = 0; slice < array_size; ++slice) {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+        staging.get(), slice, D3D11_MAP_READ, 0, &mapped)));
+    const auto &expected =
+        slice == destination_slice ? source[source_slice] : destination[slice];
+    for (UINT y = 0; y < height; ++y) {
+      EXPECT_EQ(std::memcmp(static_cast<const uint8_t *>(mapped.pData) +
+                                y * mapped.RowPitch,
+                            expected.data() + y * width,
+                            width * sizeof(uint32_t)),
+                0)
+          << "slice " << slice << ", row " << y;
+    }
+    context_.context()->Unmap(staging.get(), slice);
+  }
+}
+
+TEST_F(D3D11ResourceSpec, PreservesTexture3DRowsAndDepthSlices) {
+  constexpr UINT width = 4;
+  constexpr UINT height = 3;
+  constexpr UINT depth = 2;
+  std::array<uint32_t, width *height *depth> contents = {};
+  for (UINT z = 0; z < depth; ++z) {
+    for (UINT y = 0; y < height; ++y) {
+      for (UINT x = 0; x < width; ++x)
+        contents[(z * height + y) * width + x] =
+            0x30000000u | z << 16 | y << 8 | x;
+    }
+  }
+
+  D3D11_TEXTURE3D_DESC desc = {};
+  desc.Width = width;
+  desc.Height = height;
+  desc.Depth = depth;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  D3D11_SUBRESOURCE_DATA initial = {};
+  initial.pSysMem = contents.data();
+  initial.SysMemPitch = width * sizeof(uint32_t);
+  initial.SysMemSlicePitch = width * height * sizeof(uint32_t);
+  ComPtr<ID3D11Texture3D> texture;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateTexture3D(&desc, &initial, texture.put())));
+
+  D3D11_TEXTURE3D_DESC staging_desc = desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture3D> staging;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture3D(
+      &staging_desc, nullptr, staging.put())));
+  context_.context()->CopyResource(staging.get(), texture.get());
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  ASSERT_TRUE(HResultSucceeded(
+      context_.context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)));
+  for (UINT z = 0; z < depth; ++z) {
+    for (UINT y = 0; y < height; ++y) {
+      const auto *actual = static_cast<const uint8_t *>(mapped.pData) +
+                           z * mapped.DepthPitch + y * mapped.RowPitch;
+      const auto *expected = contents.data() + (z * height + y) * width;
+      EXPECT_EQ(std::memcmp(actual, expected, width * sizeof(uint32_t)), 0)
+          << "depth " << z << ", row " << y;
+    }
+  }
+  context_.context()->Unmap(staging.get(), 0);
+}
+
 TEST_F(D3D11ResourceSpec, RejectsZeroSizedBufferAndClearsOutput) {
   D3D11_BUFFER_DESC desc = {};
   desc.Usage = D3D11_USAGE_DEFAULT;
