@@ -12723,9 +12723,14 @@ private:
   static bool
   MakeConstantBufferBindingFromDescriptor(const DescriptorRecord &descriptor,
                                           ConstantBufferBinding &binding) {
-    if (descriptor.type != DescriptorRecordType::ConstantBufferView ||
-        !descriptor.has_desc)
+    if (descriptor.type != DescriptorRecordType::ConstantBufferView)
       return false;
+    binding = {};
+    // CreateConstantBufferView(nullptr, ...) is an explicitly populated null
+    // descriptor. Preserve it as a valid empty snapshot so compiled replay
+    // does not fall back to live encoder state left by an earlier draw.
+    if (!descriptor.has_desc)
+      return true;
     if (descriptor.desc.cbv.BufferLocation &
         (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
       return false;
@@ -12741,7 +12746,6 @@ private:
     if (!null_cbv && (!resource || !resource->GetBuffer()))
       return false;
 
-    binding = {};
     if (!null_cbv) {
       binding.buffer = Rc<Buffer>(resource->GetBuffer());
       binding.offset = resource->GetHeapOffset() + offset;

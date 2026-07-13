@@ -700,6 +700,16 @@ TEST_F(D3D12DescriptorSpec, DrawsIndirectWithSplitDescriptorTables) {
   RunDescriptorTableDraw(context_, {.execute_indirect = true});
 }
 
+TEST(D3D12DescriptorStateSpec, PreservesNullCbvAfterIndirectDraw) {
+  D3D12TestContext indirect_context;
+  ASSERT_TRUE(SUCCEEDED(indirect_context.Initialize()));
+  RunDescriptorTableDraw(indirect_context, {.execute_indirect = true});
+
+  D3D12TestContext null_context;
+  ASSERT_TRUE(SUCCEEDED(null_context.Initialize()));
+  RunDescriptorTableDraw(null_context, {.null_cbv = true});
+}
+
 TEST_F(D3D12DescriptorSpec, ResolvesOcclusionAcrossBatchedDrawBoundaries) {
   RunDescriptorTableDraw(context_, {.test_occlusion_queries = true});
 }
