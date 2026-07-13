@@ -2243,6 +2243,7 @@ void
 ApplyBlendState(PipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
                 uint32_t render_target_count,
+                uint32_t pixel_shader_render_target_mask,
                 const FormatCapabilityInspector &format_capabilities) {
   for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
     const auto &src =
@@ -2251,7 +2252,8 @@ ApplyBlendState(PipelineInfo &info,
     dst.write_mask =
         Lookup(kColorWriteMaskMap, uint32_t(src.RenderTargetWriteMask),
                kColorWriteMaskMap[15]);
-    if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid)
+    if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid ||
+        !(pixel_shader_render_target_mask & (1u << rt)))
       continue;
 
     const auto format_capability =
@@ -2772,6 +2774,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
           info.colors[i].pixel_format = rtv_formats[i];
       }
       ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      ps ? ps->reflection().PSValidRenderTargets : 0,
                       format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
@@ -2875,6 +2878,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
           info.colors[i].pixel_format = rtv_formats[i];
       }
       ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      ps ? ps->reflection().PSValidRenderTargets : 0,
                       format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
@@ -2959,6 +2963,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       info.colors[i].pixel_format = rtv_formats[i];
   }
   ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                  ps ? ps->reflection().PSValidRenderTargets : 0,
                   format_capabilities);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {

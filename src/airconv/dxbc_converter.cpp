@@ -2292,7 +2292,14 @@ AIRCONV_API int SM50Initialize(
     const D3D11_SIGNATURE_PARAMETER *parameters;
     outputParser.RastSignature()->GetParameters(&parameters);
     for (unsigned i = 0; i < outputParser.RastSignature()->GetNumParameters(); i++) {
-      sm50_shader->output_signature.push_back(Signature(parameters[i]));
+      Signature signature(parameters[i]);
+      if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER &&
+          signature.semanticName() == "sv_target" &&
+          signature.semanticIndex() < 32) {
+        sm50_shader->pso_valid_output_reg_mask |=
+            1u << signature.semanticIndex();
+      }
+      sm50_shader->output_signature.push_back(std::move(signature));
     }
   }
 
