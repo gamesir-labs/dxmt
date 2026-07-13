@@ -167,6 +167,14 @@ public:
   void incRef();
   void decRef();
 
+  void setDiagnosticIdentity(uint64_t identity) {
+    diagnostic_identity_ = identity;
+  }
+
+  uint64_t diagnosticIdentity() const {
+    return diagnostic_identity_;
+  }
+
   TextureViewKey createView(TextureViewDescriptor const &descriptor);
 
   constexpr TextureAllocation *
@@ -279,6 +287,7 @@ public:
           const WMTTextureInfo &info, WMT::Device device);
 
 private:
+  uint64_t diagnostic_identity_ = 0;
   void prepareAllocationViews(TextureAllocation* allocation);
 
   WMTTextureInfo info_;

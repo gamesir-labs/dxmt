@@ -279,6 +279,62 @@ TEST_F(D3D12SparseResourceSpec, CopiesIntoMappedReservedTexture) {
   RunCase(SparseCase::CopyToMapped);
 }
 
+TEST_F(D3D12SparseResourceSpec, WritesMappedDeepPackedMipTail) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 256;
+  desc.Height = 256;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 9;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource),
+      reinterpret_cast<void **>(texture.put()))));
+  ASSERT_TRUE(texture);
+
+  D3D12_PACKED_MIP_INFO packed = {};
+  D3D12_TILE_SHAPE shape = {};
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
+                                       &shape, nullptr, 0, nullptr);
+  ASSERT_GT(packed.NumPackedMips, 0u);
+  const UINT packed_subresource = desc.MipLevels - 1;
+  ASSERT_GE(packed_subresource, packed.NumStandardMips);
+
+  auto backing_heap = MapAllTiles(texture.get());
+  ASSERT_TRUE(backing_heap);
+
+  constexpr std::uint32_t expected = 0x89abcdefu;
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      texture.get(), &expected, sizeof(expected), sizeof(expected),
+      packed_subresource)));
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = texture.get();
+  barrier.Transition.Subresource = packed_subresource;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  context_.list()->ResourceBarrier(1, &barrier);
+
+  dxmt::test::TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackTexture(texture.get(), &readback, packed_subresource)));
+  ASSERT_GE(readback.data.size(), sizeof(expected));
+  std::uint32_t actual = 0;
+  std::memcpy(&actual, readback.data.data(), sizeof(actual));
+  EXPECT_EQ(actual, expected);
+}
+
 TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(

@@ -861,6 +861,14 @@ public:
   removeResidencySet(ResidencySet set) {
     MTLCommandQueue_removeResidencySet(handle, set.handle);
   }
+
+  bool
+  updateSparseTextureMappings(Object texture, Object heap,
+                              const WMTSparseTextureMappingOperation *operations,
+                              uint64_t operation_count) {
+    return MTLCommandQueue_updateSparseTextureMappings(
+        handle, texture.handle, heap.handle, operations, operation_count);
+  }
 };
 
 class Function : public Object {};

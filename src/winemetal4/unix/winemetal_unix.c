@@ -52,6 +52,122 @@ typedef int NTSTATUS;
 
 static NSObject *dxmt_metal4_compiler_lock;
 
+struct DXMTSparseTextureTileKey {
+  uint32_t level;
+  uint32_t slice;
+  uint32_t x;
+  uint32_t y;
+  uint32_t z;
+};
+
+@interface DXMTSparseTextureResidency : NSObject {
+  NSLock *_lock;
+  NSMutableDictionary *_tileHeaps;
+  NSCountedSet *_mappedHeaps;
+}
+- (void)applyOperations:(const struct WMTSparseTextureMappingOperation *)operations
+                  count:(uint64_t)count
+                   heap:(id<MTLHeap>)heap;
+- (void)addMappedHeapsToResidencySet:(id<MTLResidencySet>)residencySet;
+@end
+
+static NSLock *dxmt_sparse_texture_residency_lock;
+static NSMapTable *dxmt_sparse_texture_residency;
+static pthread_once_t dxmt_sparse_texture_residency_once = PTHREAD_ONCE_INIT;
+
+static void
+dxmt_sparse_texture_residency_init(void) {
+  dxmt_sparse_texture_residency_lock = [[NSLock alloc] init];
+  dxmt_sparse_texture_residency = [[NSMapTable alloc]
+      initWithKeyOptions:NSPointerFunctionsWeakMemory |
+                         NSPointerFunctionsObjectPointerPersonality
+      valueOptions:NSPointerFunctionsStrongMemory
+      capacity:0];
+}
+
+static DXMTSparseTextureResidency *
+dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
+                                          bool create) {
+  if (!texture)
+    return nil;
+  pthread_once(&dxmt_sparse_texture_residency_once,
+               dxmt_sparse_texture_residency_init);
+  [dxmt_sparse_texture_residency_lock lock];
+  DXMTSparseTextureResidency *residency =
+      [dxmt_sparse_texture_residency objectForKey:texture];
+  if (!residency && create) {
+    residency = [[DXMTSparseTextureResidency alloc] init];
+    [dxmt_sparse_texture_residency setObject:residency forKey:texture];
+    [residency release];
+  }
+  [residency retain];
+  [dxmt_sparse_texture_residency_lock unlock];
+  return [residency autorelease];
+}
+
+@implementation DXMTSparseTextureResidency
+- (instancetype)init {
+  self = [super init];
+  if (!self)
+    return nil;
+  _lock = [[NSLock alloc] init];
+  _tileHeaps = [[NSMutableDictionary alloc] init];
+  _mappedHeaps = [[NSCountedSet alloc] init];
+  return self;
+}
+
+- (void)dealloc {
+  [_mappedHeaps release];
+  [_tileHeaps release];
+  [_lock release];
+  [super dealloc];
+}
+
+- (void)applyOperations:(const struct WMTSparseTextureMappingOperation *)operations
+                  count:(uint64_t)count
+                   heap:(id<MTLHeap>)heap {
+  [_lock lock];
+  for (uint64_t i = 0; i < count; ++i) {
+    const struct WMTSparseTextureMappingOperation *operation = &operations[i];
+    for (uint32_t z = 0; z < operation->depth; ++z) {
+      for (uint32_t y = 0; y < operation->height; ++y) {
+        for (uint32_t x = 0; x < operation->width; ++x) {
+          const struct DXMTSparseTextureTileKey tile = {
+              .level = operation->level,
+              .slice = operation->slice,
+              .x = operation->x + x,
+              .y = operation->y + y,
+              .z = operation->z + z,
+          };
+          NSData *key = [NSData dataWithBytes:&tile length:sizeof(tile)];
+          id<MTLHeap> oldHeap = [_tileHeaps objectForKey:key];
+          id<MTLHeap> newHeap =
+              operation->mode == WMTSparseTextureMappingModeMap ? heap : nil;
+          if (oldHeap == newHeap)
+            continue;
+          if (oldHeap) {
+            [_mappedHeaps removeObject:oldHeap];
+            [_tileHeaps removeObjectForKey:key];
+          }
+          if (newHeap) {
+            [_tileHeaps setObject:newHeap forKey:key];
+            [_mappedHeaps addObject:newHeap];
+          }
+        }
+      }
+    }
+  }
+  [_lock unlock];
+}
+
+- (void)addMappedHeapsToResidencySet:(id<MTLResidencySet>)residencySet {
+  [_lock lock];
+  for (id<MTLHeap> heap in _mappedHeaps)
+    [residencySet addAllocation:(id<MTLAllocation>)heap];
+  [_lock unlock];
+}
+@end
+
 static bool
 dxmt_truthy_env_value(const char *value) {
   if (!value || !value[0])
@@ -230,6 +346,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) id<MTLResidencySet> residencySet;
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
+@property(nonatomic, retain) NSMutableArray *sparseResidencySets;
 @property(nonatomic, retain) id<MTLDrawable> pendingDrawable;
 @property(nonatomic, assign) BOOL hasPresentDuration;
 @property(nonatomic, assign) double presentDuration;
@@ -253,6 +370,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 - (void)commit;
 - (uint64_t)commitLocked;
 - (void)waitUntilCompleted;
+- (void)releaseSparseResidencySets;
 - (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
 - (id)logs;
@@ -722,6 +840,7 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, assign) uint64_t maxCommandBufferCount;
 @property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
 @property(nonatomic, retain) NSError *firstError;
+@property(nonatomic, retain) NSMutableArray *pendingSparseResidencySets;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
@@ -745,8 +864,10 @@ dxmt_metal4_is_buffer(id object) {
   _presentEventValue = 0;
   _maxCommandBufferCount = maxCommandBufferCount;
   _commandBufferThrottleWaitCount = 0;
+  _pendingSparseResidencySets = [[NSMutableArray alloc] init];
 
-  if (!_metal4Queue || !_compiler || !_event || !_presentEvent) {
+  if (!_metal4Queue || !_compiler || !_event || !_presentEvent ||
+      !_pendingSparseResidencySets) {
     [self release];
     return nil;
   }
@@ -756,6 +877,11 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)dealloc {
+  for (id<MTLResidencySet> residencySet in _pendingSparseResidencySets) {
+    [_metal4Queue removeResidencySet:residencySet];
+    [residencySet endResidency];
+  }
+  [_pendingSparseResidencySets release];
   [_device release];
   [_metal4Queue release];
   [_compiler release];
@@ -806,6 +932,7 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
   _pendingWaitEvents = [[NSMutableArray alloc] init];
   _pendingSignalEvents = [[NSMutableArray alloc] init];
+  _sparseResidencySets = [[NSMutableArray alloc] init];
   MTLResidencySetDescriptor *residencyDesc = [[MTLResidencySetDescriptor alloc] init];
   residencyDesc.initialCapacity = 1024;
   NSError *residencyError = nil;
@@ -817,7 +944,8 @@ dxmt_metal4_is_buffer(id object) {
   _feedbackGPUEndTime = 0.0;
   memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
-  if (!_allocator || !_metal4Buffer || !_pendingWaitEvents || !_pendingSignalEvents || !_residencySet) {
+  if (!_allocator || !_metal4Buffer || !_pendingWaitEvents ||
+      !_pendingSignalEvents || !_sparseResidencySets || !_residencySet) {
     [self release];
     return nil;
   }
@@ -830,6 +958,7 @@ dxmt_metal4_is_buffer(id object) {
   [_feedbackError release];
   [_pendingWaitEvents release];
   [_pendingSignalEvents release];
+  [_sparseResidencySets release];
   [_residencySet release];
   [_metal4Buffer release];
   [_allocator release];
@@ -852,7 +981,14 @@ dxmt_metal4_is_buffer(id object) {
 - (void)useResidencyAllocation:(id<MTLAllocation>)allocation {
   if (!allocation)
     return;
-  [_residencySet addAllocation:dxmt_metal4_backing_allocation(allocation)];
+  id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
+  [_residencySet addAllocation:backing];
+  if ([(id)backing conformsToProtocol:@protocol(MTLTexture)]) {
+    DXMTSparseTextureResidency *sparseResidency =
+        dxmt_sparse_texture_residency_for_texture((id<MTLTexture>)backing,
+                                                  false);
+    [sparseResidency addMappedHeapsToResidencySet:_residencySet];
+  }
 }
 
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label {
@@ -941,6 +1077,9 @@ dxmt_metal4_is_buffer(id object) {
     }
     return 0;
   }
+
+  [_sparseResidencySets addObjectsFromArray:_owner.pendingSparseResidencySets];
+  [_owner.pendingSparseResidencySets removeAllObjects];
 
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
@@ -1097,6 +1236,18 @@ dxmt_metal4_is_buffer(id object) {
                 " localFenceIds=%u boundFenceSlots=%u"
                 " encodedFenceWait=%u skippedExternalFenceWait=%u"
                 " fenceEdgeCount=%u fenceEdgeOverflow=%u"
+                " sparseCalls=%u sparseOps=%u sparseMap=%u sparseUnmap=%u"
+                " sparseFailures=%u sparseBarriers=%u"
+                " sparseResource=%" PRIu64 " sparseTexture=0x%" PRIx64
+                " sparseHeap=0x%" PRIx64 " sparseGpuResource=%" PRIu64
+                " sparseGeneration=%" PRIu64 "-%" PRIu64
+                " sparseAccess=%u sparseAccessFlags=0x%x"
+                " sparseAccessSubresource=%u:%u"
+                " sparseAccessDescriptor=0x%" PRIx64
+                " sparseAccessResource=%" PRIu64
+                " sparseAccessTexture=0x%" PRIx64
+                " sparseAccessGpuResource=%" PRIu64
+                " sparseAccessEncoder=%" PRIu64
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
                 (void *)(uintptr_t)feedbackMetalBuffer,
@@ -1146,6 +1297,27 @@ dxmt_metal4_is_buffer(id object) {
                 feedbackDiagnostic.skipped_external_fence_wait_count,
                 feedbackDiagnostic.fence_edge_count,
                 feedbackDiagnostic.fence_edge_overflow_count,
+                feedbackDiagnostic.sparse_mapping_call_count,
+                feedbackDiagnostic.sparse_mapping_operation_count,
+                feedbackDiagnostic.sparse_mapping_map_count,
+                feedbackDiagnostic.sparse_mapping_unmap_count,
+                feedbackDiagnostic.sparse_mapping_failure_count,
+                feedbackDiagnostic.sparse_mapping_barrier_count,
+                feedbackDiagnostic.sparse_resource_identity,
+                feedbackDiagnostic.sparse_texture_handle,
+                feedbackDiagnostic.sparse_heap_handle,
+                feedbackDiagnostic.sparse_gpu_resource_id,
+                feedbackDiagnostic.sparse_mapping_generation_begin,
+                feedbackDiagnostic.sparse_mapping_generation_end,
+                feedbackDiagnostic.sparse_access_count,
+                feedbackDiagnostic.sparse_access_flags,
+                feedbackDiagnostic.sparse_access_level,
+                feedbackDiagnostic.sparse_access_slice,
+                feedbackDiagnostic.sparse_access_descriptor,
+                feedbackDiagnostic.sparse_access_resource_identity,
+                feedbackDiagnostic.sparse_access_texture_handle,
+                feedbackDiagnostic.sparse_access_gpu_resource_id,
+                feedbackDiagnostic.sparse_access_encoder_id,
                 feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
                 feedback.GPUStartTime, feedback.GPUEndTime,
                 error.domain ? error.domain.UTF8String : "<no domain>",
@@ -1387,6 +1559,18 @@ dxmt_metal4_is_buffer(id object) {
       _internalStatus = DXMTMetal4CommandBufferStateCompleted;
   }
 
+  [self releaseSparseResidencySets];
+
+}
+
+- (void)releaseSparseResidencySets {
+  @synchronized(_owner) {
+    for (id<MTLResidencySet> residencySet in _sparseResidencySets) {
+      [_owner.metal4Queue removeResidencySet:residencySet];
+      [residencySet endResidency];
+    }
+    [_sparseResidencySets removeAllObjects];
+  }
 }
 
 - (enum WMTCommandBufferStatus)status {
@@ -4643,15 +4827,37 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
   if (@available(macOS 26.0, *)) {
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     id<MTLSharedEvent> event = [device newSharedEvent];
-    if (!queue || !event) {
+    MTLResidencySetDescriptor *residencyDescriptor =
+        [[MTLResidencySetDescriptor alloc] init];
+    residencyDescriptor.initialCapacity = 2;
+    NSError *residencyError = nil;
+    id<MTLResidencySet> residencySet =
+        [device newResidencySetWithDescriptor:residencyDescriptor
+                                        error:&residencyError];
+    [residencyDescriptor release];
+    if (!queue || !event || !residencySet) {
       [queue release];
       [event release];
+      [residencySet release];
       return STATUS_SUCCESS;
     }
+
+    [residencySet addAllocation:(id<MTLAllocation>)texture];
+    DXMTSparseTextureResidency *residency =
+        dxmt_sparse_texture_residency_for_texture(texture, true);
+    [residency addMappedHeapsToResidencySet:residencySet];
+    if (heap)
+      [residencySet addAllocation:(id<MTLAllocation>)heap];
+    [residencySet commit];
+    [residencySet requestResidency];
+    [queue addResidencySet:residencySet];
 
     MTL4UpdateSparseTextureMappingOperation *mtl_ops =
         calloc((size_t)params->operation_count, sizeof(*mtl_ops));
     if (!mtl_ops) {
+      [queue removeResidencySet:residencySet];
+      [residencySet endResidency];
+      [residencySet release];
       [queue release];
       [event release];
       return STATUS_SUCCESS;
@@ -4676,9 +4882,89 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
     [queue signalEvent:event value:1];
     params->ret = [event waitUntilSignaledValue:1 timeoutMS:UINT64_MAX] ? 1 : 0;
 
+    if (params->ret) {
+      [residency applyOperations:operations
+                           count:params->operation_count
+                            heap:heap];
+    }
+
+    [queue removeResidencySet:residencySet];
+    [residencySet endResidency];
+    [residencySet release];
     free(mtl_ops);
     [queue release];
     [event release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandQueue_updateSparseTextureMappings(void *obj) {
+  struct unixcall_mtldevice_updatesparsetexturemappings *params = obj;
+  DXMTMetal4CommandQueue *queue =
+      (DXMTMetal4CommandQueue *)params->device;
+  id<MTLTexture> texture = (id<MTLTexture>)params->texture;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  const struct WMTSparseTextureMappingOperation *operations =
+      params->operations.ptr;
+  params->ret = 0;
+  if (!queue || !texture || !operations || !params->operation_count)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    MTL4UpdateSparseTextureMappingOperation *mtl_ops =
+        calloc((size_t)params->operation_count, sizeof(*mtl_ops));
+    if (!mtl_ops)
+      return STATUS_SUCCESS;
+
+    for (uint64_t i = 0; i < params->operation_count; ++i) {
+      const struct WMTSparseTextureMappingOperation *src = &operations[i];
+      mtl_ops[i].mode = to_metal_sparse_texture_mapping_mode(src->mode);
+      mtl_ops[i].textureRegion =
+          MTLRegionMake3D(src->x, src->y, src->z, src->width, src->height,
+                          src->depth);
+      mtl_ops[i].textureLevel = src->level;
+      mtl_ops[i].textureSlice = src->slice;
+      mtl_ops[i].heapOffset =
+          src->heap_offset / WMT_SPARSE_TILE_SIZE_IN_BYTES;
+    }
+
+    MTLResidencySetDescriptor *descriptor =
+        [[MTLResidencySetDescriptor alloc] init];
+    descriptor.initialCapacity = 2;
+    NSError *error = nil;
+    id<MTLResidencySet> residencySet =
+        [queue.device newResidencySetWithDescriptor:descriptor error:&error];
+    [descriptor release];
+    if (!residencySet) {
+      free(mtl_ops);
+      return STATUS_SUCCESS;
+    }
+
+    [residencySet addAllocation:(id<MTLAllocation>)texture];
+    DXMTSparseTextureResidency *residency =
+        dxmt_sparse_texture_residency_for_texture(texture, true);
+    [residency addMappedHeapsToResidencySet:residencySet];
+    if (heap)
+      [residencySet addAllocation:(id<MTLAllocation>)heap];
+    [residencySet commit];
+    [residencySet requestResidency];
+
+    @synchronized(queue) {
+      [queue.metal4Queue addResidencySet:residencySet];
+      [queue.metal4Queue updateTextureMappings:texture
+                                           heap:heap
+                                     operations:mtl_ops
+                                          count:(NSUInteger)params->operation_count];
+      [queue.pendingSparseResidencySets addObject:residencySet];
+      [residency applyOperations:operations
+                           count:params->operation_count
+                            heap:heap];
+      params->ret = 1;
+    }
+
+    [residencySet release];
+    free(mtl_ops);
   }
   return STATUS_SUCCESS;
 }
@@ -8626,6 +8912,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLCommandBuffer_setDiagnosticInfo,
+    &_MTLCommandQueue_updateSparseTextureMappings,
 };
 
 #ifndef DXMT_NATIVE
@@ -8807,5 +9094,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLCommandBuffer_setDiagnosticInfo,
+    &_MTLCommandQueue_updateSparseTextureMappings,
 };
 #endif

@@ -93,6 +93,34 @@ public:
   void
   encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc);
 
+  void beginSparseMappingDiagnostic(uint64_t resource_identity,
+                                    uint64_t texture_handle,
+                                    uint64_t heap_handle,
+                                    uint64_t gpu_resource_id,
+                                    uint64_t generation,
+                                    uint32_t operation_count,
+                                    uint32_t map_count,
+                                    uint32_t unmap_count,
+                                    uint32_t barrier_count) {
+    sparse_mapping_diagnostic.sparse_mapping_call_count++;
+    sparse_mapping_diagnostic.sparse_mapping_operation_count += operation_count;
+    sparse_mapping_diagnostic.sparse_mapping_map_count += map_count;
+    sparse_mapping_diagnostic.sparse_mapping_unmap_count += unmap_count;
+    sparse_mapping_diagnostic.sparse_mapping_barrier_count += barrier_count;
+    sparse_mapping_diagnostic.sparse_resource_identity = resource_identity;
+    sparse_mapping_diagnostic.sparse_texture_handle = texture_handle;
+    sparse_mapping_diagnostic.sparse_heap_handle = heap_handle;
+    sparse_mapping_diagnostic.sparse_gpu_resource_id = gpu_resource_id;
+    sparse_mapping_diagnostic.sparse_mapping_generation_begin = generation;
+    sparse_mapping_diagnostic.sparse_mapping_generation_end = generation;
+  }
+
+  void completeSparseMappingDiagnostic(uint64_t generation, bool success) {
+    sparse_mapping_diagnostic.sparse_mapping_generation_end = generation;
+    if (!success)
+      sparse_mapping_diagnostic.sparse_mapping_failure_count++;
+  }
+
   void
   addCompletionCallback(std::function<void()> callback) {
     std::lock_guard<dxmt::mutex> lock(completion_callbacks_mutex_);
@@ -120,6 +148,7 @@ public:
   dxmt::mutex completion_callbacks_mutex_;
   std::vector<std::function<void()>> deferred_readbacks;
   uint64_t resource_initializer_event_id;
+  CommandBufferDiagnosticInfo sparse_mapping_diagnostic = {};
 
 private:
   CommandQueue *queue;
@@ -151,6 +180,7 @@ public:
     for (auto &callback : callbacks)
       callback();
     deferred_readbacks.clear();
+    sparse_mapping_diagnostic = {};
     list_enc.reset();
     ref_tracker.clear();
     attached_cmdbuf = nullptr;
@@ -352,6 +382,15 @@ public:
 
   uint64_t
   FlushPersistentResidency();
+
+  bool
+  UpdateSparseTextureMappings(
+      WMT::Texture texture, WMT::Heap heap,
+      const WMTSparseTextureMappingOperation *operations,
+      uint64_t operation_count) {
+    return commandQueue.updateSparseTextureMappings(texture, heap, operations,
+                                                    operation_count);
+  }
 
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {

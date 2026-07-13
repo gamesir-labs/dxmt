@@ -149,6 +149,22 @@ MTLCommandQueue_removeResidencySet(obj_handle_t queue, obj_handle_t set) {
   UNIX_CALL(162, &params);
 }
 
+WINEMETAL_API bool
+MTLCommandQueue_updateSparseTextureMappings(
+    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap,
+    const struct WMTSparseTextureMappingOperation *operations,
+    uint64_t operation_count) {
+  struct unixcall_mtldevice_updatesparsetexturemappings params;
+  params.device = queue;
+  params.texture = texture;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.operations, operations);
+  params.operation_count = operation_count;
+  params.ret = 0;
+  UNIX_CALL(177, &params);
+  return params.ret != 0;
+}
+
 WINEMETAL_API void
 WMT4ApitraceSessionEnsureOpen(void) {
   struct unixcall_generic_obj_noret params;

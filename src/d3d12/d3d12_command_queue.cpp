@@ -4409,6 +4409,19 @@ public:
     }
 
     auto texture = resource_object->GetTextureAllocation()->texture();
+    const uint64_t sparse_resource_identity =
+        resource_object->GetDescriptorIdentity();
+    const uint64_t sparse_gpu_resource_id =
+        resource_object->GetTextureAllocation()->gpuResourceID;
+    const uint64_t sparse_mapping_generation =
+        resource_object->GetTileMappingGeneration();
+    const uint32_t sparse_operation_count = static_cast<uint32_t>(
+        std::min<size_t>(ops.size(), std::numeric_limits<uint32_t>::max()));
+    const uint32_t sparse_map_count = static_cast<uint32_t>(std::min<uint64_t>(
+        perf_delta.map_ops, std::numeric_limits<uint32_t>::max()));
+    const uint32_t sparse_unmap_count = static_cast<uint32_t>(
+        std::min<uint64_t>(perf_delta.unmap_ops,
+                           std::numeric_limits<uint32_t>::max()));
     auto barrier_subresources = CollectSparseTileBarrierSubresources(ops);
     const size_t barrier_subresource_count = barrier_subresources.size();
     dxmt::apitrace::record_sparse_texture_mapping_ops(
@@ -4419,20 +4432,27 @@ public:
     Rc<Texture> barrier_texture = Rc<Texture>(resource_object->GetTexture());
     PendingOperation op = {};
     op.type = PendingOperationType::QueueWork;
-    op.queue_work = [device = device_->GetDXMTDevice().device(),
-                     texture, placement_heap,
+    op.queue_work = [texture, placement_heap,
                      ops = std::move(ops), resource_ref,
                      tiling_copy = std::move(tiling_copy), heap_ref,
                      has_map, barrier_texture = std::move(barrier_texture),
-                     barrier_subresources = std::move(barrier_subresources)](
+                     barrier_subresources = std::move(barrier_subresources),
+                     sparse_resource_identity, sparse_gpu_resource_id,
+                     sparse_mapping_generation, sparse_operation_count,
+                     sparse_map_count, sparse_unmap_count](
                         CommandChunk *chunk) mutable {
-      chunk->emitcc([device, texture, placement_heap,
+      chunk->beginSparseMappingDiagnostic(
+          sparse_resource_identity, uint64_t(texture.handle),
+          uint64_t(placement_heap.handle), sparse_gpu_resource_id,
+          sparse_mapping_generation, sparse_operation_count, sparse_map_count,
+          sparse_unmap_count, barrier_subresources.empty() ? 0 : 1);
+      chunk->emitcc([texture, placement_heap,
                      ops = std::move(ops), resource_ref,
                      tiling_copy = std::move(tiling_copy), heap_ref,
-                     has_map](
-                        ArgumentEncodingContext &) mutable {
-        if (!device.updateSparseTextureMappings(texture, placement_heap,
-                                                ops.data(), ops.size())) {
+                     has_map, chunk](
+                        ArgumentEncodingContext &enc) mutable {
+        if (!enc.queue().UpdateSparseTextureMappings(
+                texture, placement_heap, ops.data(), ops.size())) {
           D3D12TileMappingStats().metal_failures.fetch_add(
               1, std::memory_order_relaxed);
           WARN("D3D12CommandQueue: TODO Metal4 UpdateTileMappings failed"
@@ -4440,12 +4460,22 @@ public:
                " heap=", heap_ref.ptr(),
                " ops=", ops.size(),
                " hasMap=", has_map);
+          auto *resource_object =
+              dynamic_cast<d3d12::Resource *>(resource_ref.ptr());
+          chunk->completeSparseMappingDiagnostic(
+              resource_object ? resource_object->GetTileMappingGeneration()
+                              : 0,
+              false);
           return;
         }
         if (auto *resource_object =
                 dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
           ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
                                               heap_ref.ptr(), ops);
+          chunk->completeSparseMappingDiagnostic(
+              resource_object->GetTileMappingGeneration(), true);
+        } else {
+          chunk->completeSparseMappingDiagnostic(0, false);
         }
       });
       EmitSparseTextureMappingBarrier(
@@ -4609,16 +4639,16 @@ public:
       }
       Rc<Texture> barrier_texture = Rc<Texture>(dst->GetTexture());
       sparse_groups.push_back(
-          [device = device_->GetDXMTDevice().device(), texture, placement_heap,
+          [texture, placement_heap,
            dst_ref, heap_ref, tiling_copy, ops = std::move(ops),
            barrier_texture = std::move(barrier_texture),
            barrier_subresources = std::move(barrier_subresources)](
               CommandChunk *chunk) mutable {
-            chunk->emitcc([device, texture, placement_heap, dst_ref, heap_ref,
+            chunk->emitcc([texture, placement_heap, dst_ref, heap_ref,
                            tiling_copy, ops = std::move(ops)](
-                              ArgumentEncodingContext &) mutable {
-              if (!device.updateSparseTextureMappings(texture, placement_heap,
-                                                      ops.data(), ops.size())) {
+                              ArgumentEncodingContext &enc) mutable {
+              if (!enc.queue().UpdateSparseTextureMappings(
+                      texture, placement_heap, ops.data(), ops.size())) {
                 WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
                      " dst=", dst_ref.ptr(),
                      " heap=", heap_ref.ptr(),

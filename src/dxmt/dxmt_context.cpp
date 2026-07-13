@@ -3741,6 +3741,29 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
   cpu_buffer_offset_ = 0;
   seq_id_ = seq_id;
   frame_id_ = frame_id;
+  sparse_access_diagnostic_ = {};
+}
+
+void
+ArgumentEncodingContext::noteSparseTextureAccess(
+    TextureAllocation *allocation, unsigned level, unsigned slice,
+    int flags) {
+  if (!allocation ||
+      !allocation->flags().test(TextureAllocationFlag::PlacementSparse))
+    return;
+  sparse_access_diagnostic_.sparse_access_count++;
+  sparse_access_diagnostic_.sparse_access_flags |= uint32_t(flags);
+  sparse_access_diagnostic_.sparse_access_level = level;
+  sparse_access_diagnostic_.sparse_access_slice = slice;
+  sparse_access_diagnostic_.sparse_access_descriptor =
+      uint64_t(allocation->descriptor);
+  sparse_access_diagnostic_.sparse_access_resource_identity =
+      allocation->descriptor->diagnosticIdentity();
+  sparse_access_diagnostic_.sparse_access_texture_handle =
+      uint64_t(allocation->texture().handle);
+  sparse_access_diagnostic_.sparse_access_gpu_resource_id =
+      allocation->gpuResourceID;
+  sparse_access_diagnostic_.sparse_access_encoder_id = currentEncoderId();
 }
 
 constexpr unsigned kEncoderOptimizerThreshold = 64;
@@ -4771,6 +4794,24 @@ ArgumentEncodingContext::flushCommands(
         perf.encodedBlit;
     diagnostic_info->fence_wait_count = perf.fenceWaits;
     diagnostic_info->fence_update_count = perf.fenceUpdates;
+    diagnostic_info->sparse_access_count =
+        sparse_access_diagnostic_.sparse_access_count;
+    diagnostic_info->sparse_access_flags =
+        sparse_access_diagnostic_.sparse_access_flags;
+    diagnostic_info->sparse_access_level =
+        sparse_access_diagnostic_.sparse_access_level;
+    diagnostic_info->sparse_access_slice =
+        sparse_access_diagnostic_.sparse_access_slice;
+    diagnostic_info->sparse_access_descriptor =
+        sparse_access_diagnostic_.sparse_access_descriptor;
+    diagnostic_info->sparse_access_resource_identity =
+        sparse_access_diagnostic_.sparse_access_resource_identity;
+    diagnostic_info->sparse_access_texture_handle =
+        sparse_access_diagnostic_.sparse_access_texture_handle;
+    diagnostic_info->sparse_access_gpu_resource_id =
+        sparse_access_diagnostic_.sparse_access_gpu_resource_id;
+    diagnostic_info->sparse_access_encoder_id =
+        sparse_access_diagnostic_.sparse_access_encoder_id;
   }
   {
     auto &stats = currentFrameStatistics();

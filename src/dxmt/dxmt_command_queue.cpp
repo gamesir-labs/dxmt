@@ -100,6 +100,30 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id, &diagnostic);
   auto t2 = clock::now();
 
+  diagnostic.sparse_mapping_call_count =
+      sparse_mapping_diagnostic.sparse_mapping_call_count;
+  diagnostic.sparse_mapping_operation_count =
+      sparse_mapping_diagnostic.sparse_mapping_operation_count;
+  diagnostic.sparse_mapping_map_count =
+      sparse_mapping_diagnostic.sparse_mapping_map_count;
+  diagnostic.sparse_mapping_unmap_count =
+      sparse_mapping_diagnostic.sparse_mapping_unmap_count;
+  diagnostic.sparse_mapping_failure_count =
+      sparse_mapping_diagnostic.sparse_mapping_failure_count;
+  diagnostic.sparse_mapping_barrier_count =
+      sparse_mapping_diagnostic.sparse_mapping_barrier_count;
+  diagnostic.sparse_resource_identity =
+      sparse_mapping_diagnostic.sparse_resource_identity;
+  diagnostic.sparse_texture_handle =
+      sparse_mapping_diagnostic.sparse_texture_handle;
+  diagnostic.sparse_heap_handle = sparse_mapping_diagnostic.sparse_heap_handle;
+  diagnostic.sparse_gpu_resource_id =
+      sparse_mapping_diagnostic.sparse_gpu_resource_id;
+  diagnostic.sparse_mapping_generation_begin =
+      sparse_mapping_diagnostic.sparse_mapping_generation_begin;
+  diagnostic.sparse_mapping_generation_end =
+      sparse_mapping_diagnostic.sparse_mapping_generation_end;
+
   diagnostic.barrier_only_pass_count =
       statistics.blit_barrier_only_pass_count - barrier_only_before;
   const auto barrier_marker =
@@ -179,6 +203,40 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   wmt_diagnostic.fence_edge_count = diagnostic.fence_edge_count;
   wmt_diagnostic.fence_edge_overflow_count =
       diagnostic.fence_edge_overflow_count;
+  wmt_diagnostic.sparse_mapping_call_count =
+      diagnostic.sparse_mapping_call_count;
+  wmt_diagnostic.sparse_mapping_operation_count =
+      diagnostic.sparse_mapping_operation_count;
+  wmt_diagnostic.sparse_mapping_map_count = diagnostic.sparse_mapping_map_count;
+  wmt_diagnostic.sparse_mapping_unmap_count =
+      diagnostic.sparse_mapping_unmap_count;
+  wmt_diagnostic.sparse_mapping_failure_count =
+      diagnostic.sparse_mapping_failure_count;
+  wmt_diagnostic.sparse_mapping_barrier_count =
+      diagnostic.sparse_mapping_barrier_count;
+  wmt_diagnostic.sparse_resource_identity =
+      diagnostic.sparse_resource_identity;
+  wmt_diagnostic.sparse_texture_handle = diagnostic.sparse_texture_handle;
+  wmt_diagnostic.sparse_heap_handle = diagnostic.sparse_heap_handle;
+  wmt_diagnostic.sparse_gpu_resource_id = diagnostic.sparse_gpu_resource_id;
+  wmt_diagnostic.sparse_mapping_generation_begin =
+      diagnostic.sparse_mapping_generation_begin;
+  wmt_diagnostic.sparse_mapping_generation_end =
+      diagnostic.sparse_mapping_generation_end;
+  wmt_diagnostic.sparse_access_count = diagnostic.sparse_access_count;
+  wmt_diagnostic.sparse_access_flags = diagnostic.sparse_access_flags;
+  wmt_diagnostic.sparse_access_level = diagnostic.sparse_access_level;
+  wmt_diagnostic.sparse_access_slice = diagnostic.sparse_access_slice;
+  wmt_diagnostic.sparse_access_descriptor =
+      diagnostic.sparse_access_descriptor;
+  wmt_diagnostic.sparse_access_resource_identity =
+      diagnostic.sparse_access_resource_identity;
+  wmt_diagnostic.sparse_access_texture_handle =
+      diagnostic.sparse_access_texture_handle;
+  wmt_diagnostic.sparse_access_gpu_resource_id =
+      diagnostic.sparse_access_gpu_resource_id;
+  wmt_diagnostic.sparse_access_encoder_id =
+      diagnostic.sparse_access_encoder_id;
   for (uint32_t i = 0;
        i < diagnostic.fence_edge_count &&
        i < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;

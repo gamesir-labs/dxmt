@@ -89,6 +89,27 @@ struct CommandBufferDiagnosticInfo {
   uint32_t skipped_external_fence_wait_count = 0;
   uint32_t fence_edge_count = 0;
   uint32_t fence_edge_overflow_count = 0;
+  uint32_t sparse_mapping_call_count = 0;
+  uint32_t sparse_mapping_operation_count = 0;
+  uint32_t sparse_mapping_map_count = 0;
+  uint32_t sparse_mapping_unmap_count = 0;
+  uint32_t sparse_mapping_failure_count = 0;
+  uint32_t sparse_mapping_barrier_count = 0;
+  uint64_t sparse_resource_identity = 0;
+  uint64_t sparse_texture_handle = 0;
+  uint64_t sparse_heap_handle = 0;
+  uint64_t sparse_gpu_resource_id = 0;
+  uint64_t sparse_mapping_generation_begin = 0;
+  uint64_t sparse_mapping_generation_end = 0;
+  uint32_t sparse_access_count = 0;
+  uint32_t sparse_access_flags = 0;
+  uint32_t sparse_access_level = 0;
+  uint32_t sparse_access_slice = 0;
+  uint64_t sparse_access_descriptor = 0;
+  uint64_t sparse_access_resource_identity = 0;
+  uint64_t sparse_access_texture_handle = 0;
+  uint64_t sparse_access_gpu_resource_id = 0;
+  uint64_t sparse_access_encoder_id = 0;
   std::array<CommandBufferFenceEdgeDiagnostic,
              kCommandBufferFenceEdgeCapacity>
       fence_edges = {};
@@ -536,6 +557,8 @@ struct AllocatedArgumentBufferSlice {
 class ArgumentEncodingContext {
 private:
   template <PipelineStage stage> void track(GenericAccessTracker &tracker, int flags);
+  void noteSparseTextureAccess(TextureAllocation *allocation, unsigned level,
+                               unsigned slice, int flags);
 
 public:
   /**
@@ -578,6 +601,7 @@ public:
   access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
     auto allocation = texture->current();
     retainAllocation(allocation);
+    noteSparseTextureAccess(allocation, level, slice, flags);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
         track<stage>(allocation->fenceTrackers[0], flags);
@@ -606,11 +630,12 @@ public:
     auto allocation = texture->current();
     retainAllocation(allocation);
     auto &view = texture->view(viewId, allocation);
+    TextureViewKey key = viewId;
+    noteSparseTextureAccess(allocation, key.mip_start, key.array_start, flags);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
         track<stage>(allocation->fenceTrackers[0], flags);
       } else {
-        TextureViewKey key = viewId;
         const auto mip_count = allocation->descriptor->miplevelCount();
         for (unsigned slice = key.array_start; slice < key.array_end; slice++) {
           for (unsigned level = key.mip_start; level < key.mip_end; level++) {
@@ -1308,6 +1333,7 @@ private:
 
   uint64_t seq_id_;
   uint64_t frame_id_;
+  CommandBufferDiagnosticInfo sparse_access_diagnostic_ = {};
 
   struct chunk {
     void *ptr;

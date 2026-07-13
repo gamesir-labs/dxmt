@@ -128,6 +128,13 @@ ShouldLogReservedTextureDiag() {
   return value < 32 || (value & (value - 1)) == 0;
 }
 
+static bool
+ShouldLogReservedTextureFaultDiag() {
+  static std::atomic<uint32_t> count = 0;
+  const uint32_t value = count.fetch_add(1, std::memory_order_relaxed);
+  return value < 128 || (value & (value - 1)) == 0;
+}
+
 static void
 LogReservedTextureCounters(const char *event) {
   if (!ShouldLogReservedTextureDiag())
@@ -861,6 +868,7 @@ public:
   }
 
   ~ResourceImpl() {
+    LogReservedTextureFaultDiagnostic("destroy", nullptr);
     CancelReservedTextureMaterialization();
     UnregisterBufferGpuVirtualAddress(this);
   }
@@ -1130,6 +1138,7 @@ public:
       tile_map_[index] = {};
       tile_map_[index].heap_tile = -1;
     }
+    tile_mapping_generation_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 
@@ -1144,6 +1153,7 @@ public:
       tile_map_[tile_index] = {};
       tile_map_[tile_index].heap_tile = -1;
     }
+    tile_mapping_generation_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 
@@ -1191,6 +1201,10 @@ public:
 
   uint64_t GetDescriptorIdentity() const override {
     return descriptor_identity_;
+  }
+
+  uint64_t GetTileMappingGeneration() const override {
+    return tile_mapping_generation_.load(std::memory_order_relaxed);
   }
 
   UINT64 GetHeapOffset() const override {
@@ -1946,6 +1960,7 @@ private:
         plane_textures_[plane] =
             new dxmt::Texture(info, device_->GetDXMTDevice().device());
       }
+      plane_textures_[plane]->setDiagnosticIdentity(descriptor_identity_);
 
       if (kind_ == ResourceKind::Placed && placement_heap_) {
         plane_allocations_[plane] = plane_textures_[plane]->allocatePlaced(
@@ -2003,7 +2018,34 @@ private:
     return false;
   }
 
+  void LogReservedTextureFaultDiagnostic(const char *event,
+                                         const char *reason) const {
+    if (kind_ != ResourceKind::ReservedTexture ||
+        !ShouldLogReservedTextureFaultDiag())
+      return;
+    auto *allocation = texture_allocation_.ptr();
+    const auto texture = allocation ? allocation->texture() : WMT::Texture{};
+    WARN_FILE_ONLY(
+        "D3D12 reserved texture fault diagnostic"
+        " event=", event ? event : "",
+        " reason=", reason ? reason : "",
+        " resource=", uint64_t(this),
+        " identity=", descriptor_identity_,
+        " descriptor=", uint64_t(texture_.ptr()),
+        " allocation=", uint64_t(allocation),
+        " metalTexture=", uint64_t(texture.handle),
+        " gpuResourceId=", allocation ? allocation->gpuResourceID : 0,
+        " mappingGeneration=", GetTileMappingGeneration(),
+        " totalTiles=", tiling_.total_tile_count,
+        " width=", desc_.Width,
+        " height=", desc_.Height,
+        " depthOrArray=", desc_.DepthOrArraySize,
+        " mips=", desc_.MipLevels,
+        " format=", uint32_t(desc_.Format));
+  }
+
   void MaterializeReservedTexture(const char *reason) {
+    LogReservedTextureFaultDiagnostic("materialize-begin", reason);
     bool success = true;
     for (UINT plane = 0; plane < GetTextureBackingPlaneCount(desc_); ++plane) {
       if (!plane_textures_[plane]) {
@@ -2019,6 +2061,9 @@ private:
     }
     if (success && !ReplayReservedTextureMappings())
       success = false;
+
+    LogReservedTextureFaultDiagnostic(
+        success ? "materialize-ready" : "materialize-failed", reason);
 
     {
       std::lock_guard lock(materialization_mutex_);
@@ -2045,6 +2090,8 @@ private:
   bool ReplayReservedTextureMappings() {
     if (!has_tiling_ || tile_map_.empty() || !texture_allocation_)
       return true;
+
+    LogReservedTextureFaultDiagnostic("replay-begin", nullptr);
 
     struct MappingBatch {
       ID3D12Heap *heap = nullptr;
@@ -2136,7 +2183,9 @@ private:
              " format=", uint32_t(desc_.Format));
         return false;
       }
+      LogReservedTextureFaultDiagnostic("replay-batch-complete", nullptr);
     }
+    LogReservedTextureFaultDiagnostic("replay-complete", nullptr);
     return true;
   }
 
@@ -2348,6 +2397,7 @@ private:
   bool has_tiling_ = false;
   ResourceTiling tiling_ = {};
   std::vector<ResourceTileMapping> tile_map_;
+  std::atomic<uint64_t> tile_mapping_generation_ = {0};
   Rc<dxmt::Buffer> buffer_;
   Rc<dxmt::BufferAllocation> buffer_allocation_;
   Rc<dxmt::Texture> texture_;

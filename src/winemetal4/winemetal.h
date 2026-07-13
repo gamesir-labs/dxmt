@@ -161,12 +161,33 @@ struct WMTCommandBufferDiagnosticInfo {
   uint32_t skipped_external_fence_wait_count;
   uint32_t fence_edge_count;
   uint32_t fence_edge_overflow_count;
+  uint32_t sparse_mapping_call_count;
+  uint32_t sparse_mapping_operation_count;
+  uint32_t sparse_mapping_map_count;
+  uint32_t sparse_mapping_unmap_count;
+  uint32_t sparse_mapping_failure_count;
+  uint32_t sparse_mapping_barrier_count;
+  uint64_t sparse_resource_identity;
+  uint64_t sparse_texture_handle;
+  uint64_t sparse_heap_handle;
+  uint64_t sparse_gpu_resource_id;
+  uint64_t sparse_mapping_generation_begin;
+  uint64_t sparse_mapping_generation_end;
+  uint32_t sparse_access_count;
+  uint32_t sparse_access_flags;
+  uint32_t sparse_access_level;
+  uint32_t sparse_access_slice;
+  uint64_t sparse_access_descriptor;
+  uint64_t sparse_access_resource_identity;
+  uint64_t sparse_access_texture_handle;
+  uint64_t sparse_access_gpu_resource_id;
+  uint64_t sparse_access_encoder_id;
   struct WMTCommandBufferFenceEdgeDiagnostic
       fence_edges[WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY];
 };
 
 STATIC_ASSERT(sizeof(struct WMTCommandBufferFenceEdgeDiagnostic) == 32);
-STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 416);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 544);
 
 WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,
@@ -684,6 +705,12 @@ struct WMTSparseTextureMappingOperation {
   uint32_t depth;
   uint64_t heap_offset; // bytes
 };
+
+WINEMETAL_API bool MTLCommandQueue_updateSparseTextureMappings(
+    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap,
+    const struct WMTSparseTextureMappingOperation *operations,
+    uint64_t operation_count
+);
 
 WINEMETAL_API obj_handle_t MTLDevice_newTexture(obj_handle_t device, struct WMTTextureInfo *info);
 
