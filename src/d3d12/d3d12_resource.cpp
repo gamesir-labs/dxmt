@@ -1112,6 +1112,10 @@ public:
     return kind_ == ResourceKind::ReservedTexture;
   }
 
+  bool UsesPlacementSparse() const override {
+    return uses_placement_sparse_;
+  }
+
   const ResourceTiling *GetTiling() const override {
     return has_tiling_ ? &tiling_ : nullptr;
   }
@@ -1913,7 +1917,6 @@ private:
              " flags=", desc_.Flags);
         return;
       }
-      flags.set(dxmt::TextureAllocationFlag::PlacementSparse);
     }
 
     const bool cpu_linear_candidate =
@@ -1941,6 +1944,22 @@ private:
           return;
         }
         BuildTilingMetadata(tile_size);
+
+        MTL_DXGI_FORMAT_DESC format = {};
+        if (FAILED(MTLQueryDXGIFormat(device_->GetDXMTDevice().device(),
+                                      desc_.Format, format)))
+          return;
+        // Metal placement-sparse BC textures accept a tail mapping, but blits
+        // to mip levels below firstMipmapInTail can read back zero and have
+        // produced GPU page faults in real workloads. Keep D3D12 mapping state
+        // for these resources, but use fully-backed storage until Metal can
+        // safely address every mip in a compressed tail.
+        const bool unsafe_compressed_tail =
+            (format.Flag & MTL_DXGI_FORMAT_BC) &&
+            tiling_.packed_mip_info.NumPackedMips > 1;
+        uses_placement_sparse_ = !unsafe_compressed_tail;
+        if (uses_placement_sparse_)
+          flags.set(dxmt::TextureAllocationFlag::PlacementSparse);
       }
 
       TextureSubresourceLayout layout = {};
@@ -2088,6 +2107,8 @@ private:
   }
 
   bool ReplayReservedTextureMappings() {
+    if (!uses_placement_sparse_)
+      return true;
     if (!has_tiling_ || tile_map_.empty() || !texture_allocation_)
       return true;
 
@@ -2395,6 +2416,7 @@ private:
   Rc<dxmt::BufferAllocation> placed_buffer_allocation_;
   WMT::Reference<WMT::Heap> placement_heap_;
   bool has_tiling_ = false;
+  bool uses_placement_sparse_ = false;
   ResourceTiling tiling_ = {};
   std::vector<ResourceTileMapping> tile_map_;
   std::atomic<uint64_t> tile_mapping_generation_ = {0};

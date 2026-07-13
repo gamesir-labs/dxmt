@@ -467,6 +467,140 @@ TEST_F(D3D12SparseResourceSpec,
   EXPECT_EQ(actual, expected);
 }
 
+DXMT_SERIAL_TEST_F(
+    D3D12SparseResourceSpec,
+    PreservesCompressedPackedMipWritesAcrossSeparateExecutes) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  constexpr UINT16 kMipLevels = 11;
+  constexpr UINT kRowPitch = 256;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 1024;
+  desc.Height = 1024;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = kMipLevels;
+  desc.Format = DXGI_FORMAT_BC7_UNORM_SRGB;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+      __uuidof(ID3D12Resource),
+      reinterpret_cast<void **>(texture.put()))));
+  ASSERT_TRUE(texture);
+
+  D3D12_PACKED_MIP_INFO packed = {};
+  D3D12_TILE_SHAPE shape = {};
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
+                                       &shape, nullptr, 0, nullptr);
+  ASSERT_GT(packed.NumPackedMips, 0u);
+  constexpr UINT kPackedSubresource = kMipLevels - 1;
+  ASSERT_GE(kPackedSubresource, packed.NumStandardMips);
+
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.SizeInBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> backing_heap;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateHeap(
+      &heap_desc, __uuidof(ID3D12Heap),
+      reinterpret_cast<void **>(backing_heap.put()))));
+  ASSERT_TRUE(backing_heap);
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  coordinate.Subresource = packed.NumStandardMips;
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = 1;
+  D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_offset = 0;
+  UINT tile_count = 1;
+  context_.queue()->UpdateTileMappings(
+      texture.get(), 1, &coordinate, &region, backing_heap.get(), 1,
+      &range_flag, &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+
+  constexpr std::array<std::uint8_t, 16> producer_block = {
+      0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+      0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
+  constexpr std::array<std::uint8_t, 16> expected_block = {
+      0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+      0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01};
+  std::array<std::uint8_t, kRowPitch> producer_data = {};
+  std::array<std::uint8_t, kRowPitch> consumer_data = {};
+  std::copy(producer_block.begin(), producer_block.end(),
+            producer_data.begin());
+  std::copy(expected_block.begin(), expected_block.end(),
+            consumer_data.begin());
+  auto producer_upload = context_.CreateUploadBuffer(
+      producer_data.size(), producer_data.data(), producer_data.size());
+  auto consumer_upload = context_.CreateUploadBuffer(
+      consumer_data.size(), consumer_data.data(), consumer_data.size());
+  ASSERT_TRUE(producer_upload);
+  ASSERT_TRUE(consumer_upload);
+
+  auto create_copy_list = [&](ID3D12Resource *upload,
+                              ComPtr<ID3D12CommandAllocator> *allocator,
+                              ComPtr<ID3D12GraphicsCommandList> *list) {
+    if (FAILED(context_.device()->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        __uuidof(ID3D12CommandAllocator),
+        reinterpret_cast<void **>(allocator->put()))))
+      return false;
+    if (FAILED(context_.device()->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator->get(), nullptr,
+        __uuidof(ID3D12GraphicsCommandList),
+        reinterpret_cast<void **>(list->put()))))
+      return false;
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = upload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Footprint = {
+        desc.Format, 1, 1, 1, kRowPitch};
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = texture.get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = kPackedSubresource;
+    (*list)->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    return SUCCEEDED((*list)->Close());
+  };
+
+  ComPtr<ID3D12CommandAllocator> producer_allocator;
+  ComPtr<ID3D12GraphicsCommandList> producer_list;
+  ComPtr<ID3D12CommandAllocator> consumer_allocator;
+  ComPtr<ID3D12GraphicsCommandList> consumer_list;
+  ASSERT_TRUE(create_copy_list(producer_upload.get(), &producer_allocator,
+                               &producer_list));
+  ASSERT_TRUE(create_copy_list(consumer_upload.get(), &consumer_allocator,
+                               &consumer_list));
+
+  ID3D12CommandList *producer = producer_list.get();
+  context_.queue()->ExecuteCommandLists(1, &producer);
+  ID3D12CommandList *consumer = consumer_list.get();
+  context_.queue()->ExecuteCommandLists(1, &consumer);
+  ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = texture.get();
+  barrier.Transition.Subresource = kPackedSubresource;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  context_.list()->ResourceBarrier(1, &barrier);
+  dxmt::test::TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackTexture(
+      texture.get(), &readback, kPackedSubresource)));
+  ASSERT_GE(readback.data.size(), expected_block.size());
+  for (std::size_t i = 0; i < expected_block.size(); ++i)
+    EXPECT_EQ(readback.data[i], expected_block[i]) << "byte " << i;
+}
+
 DXMT_SERIAL_TEST_F(D3D12SparseResourceSpec,
                    DoesNotAccumulateSparseResidencySetsAfterQueueFailure) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};

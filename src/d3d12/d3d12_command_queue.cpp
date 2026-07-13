@@ -4324,6 +4324,32 @@ public:
     auto perf_delta = RecordTileMappingOps(*tiling, ops);
     LogTileMappingStats("UpdateTileMappings");
 
+    if (!resource_object->UsesPlacementSparse()) {
+      dxmt::apitrace::record_sparse_texture_mapping_ops(
+          this, resource, heap, "UpdateTileMappings fully-backed fallback",
+          ops.data(), ops.size());
+      Com<ID3D12Resource> resource_ref = resource;
+      Com<ID3D12Heap> heap_ref = heap;
+      auto tiling_copy = *tiling;
+      PendingOperation op = {};
+      op.type = PendingOperationType::QueueWork;
+      op.queue_work = [resource_ref, heap_ref,
+                       tiling_copy = std::move(tiling_copy),
+                       ops = std::move(ops)](CommandChunk *) mutable {
+        if (auto *resource_object =
+                dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
+          ApplySparseTileMappingOpsToResource(
+              *resource_object, tiling_copy, heap_ref.ptr(), ops);
+        }
+        return false;
+      };
+      EnqueuePendingOperation(std::move(op), nullptr);
+      dxmt::perf::recordTileMapping(
+          perf_delta.standard_ops, perf_delta.packed_ops,
+          perf_delta.map_ops, perf_delta.unmap_ops, 0, 0, 0);
+      return;
+    }
+
     bool has_map = false;
     for (const auto &op : ops) {
       has_map |= op.mode == WMTSparseTextureMappingModeMap;
