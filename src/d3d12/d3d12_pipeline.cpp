@@ -529,9 +529,6 @@ PipelineShaderCache() {
   return cache;
 }
 
-std::mutex &
-AirconvCompileMutex();
-
 HRESULT
 InitializePipelineShaderHandle(PipelineShaderStage stage,
                                PipelineCachedShader &cached_shader,
@@ -542,17 +539,13 @@ InitializePipelineShaderHandle(PipelineShaderStage stage,
 
   sm50_error_t error = nullptr;
   const bool is_dxil = cached_shader.kind == PipelineShaderBytecodeKind::Dxil;
-  int initialize_failed = 0;
-  {
-    std::lock_guard lock(AirconvCompileMutex());
-    initialize_failed =
-        is_dxil ? DXMT12DXILInitialize(cached_shader.bytecode.data(),
-                                       cached_shader.bytecode.size(), shader,
-                                       reflection, &error)
-                : DXMT12SM50Initialize(cached_shader.bytecode.data(),
-                                       cached_shader.bytecode.size(), shader,
-                                       reflection, &error);
-  }
+  const int initialize_failed =
+      is_dxil ? DXMT12DXILInitialize(cached_shader.bytecode.data(),
+                                     cached_shader.bytecode.size(), shader,
+                                     reflection, &error)
+              : DXMT12SM50Initialize(cached_shader.bytecode.data(),
+                                     cached_shader.bytecode.size(), shader,
+                                     reflection, &error);
   if (initialize_failed) {
     WARN("D3D12PipelineState: failed to initialize ", ShaderStageName(stage),
          is_dxil ? " DXIL shader: " : " DXBC shader: ",
@@ -1436,10 +1429,20 @@ GetShaderFlags() {
   return SM50_SHADER_FLAG(0);
 }
 
-std::mutex &
-AirconvCompileMutex() {
-  static std::mutex mutex;
-  return mutex;
+template <typename PipelineInfo>
+bool AttachPSOBinaryArchive(
+    IMTLD3D12Device *device, PipelineInfo &info,
+    std::array<obj_handle_t, 1> &lookup_archives) {
+  auto *archive = device->GetPSOBinaryArchive();
+  if (!archive)
+    return false;
+
+  lookup_archives[0] = archive->handle;
+  info.binary_archive_for_serialization = archive->handle;
+  info.binary_archives_for_lookup.set(lookup_archives.data());
+  info.num_binary_archives_for_lookup = lookup_archives.size();
+  info.fail_on_binary_archive_miss = false;
+  return true;
 }
 
 std::mutex &
@@ -1556,27 +1559,147 @@ PersistentAirCacheEnabled() {
   return on;
 }
 
-// Key for the cross-run persistent AIR-bitcode cache. shader_cache_key already
-// hashes every shader bytecode + graphics/compute state + root signature that
-// feeds airconv's `args`, so (stage + key + metal version + flags) fully
-// determines the transpiled AIR output. The versioned tag keeps entries from
-// older D3D12 AIR ABI key layouts out of this cache.
-Sha1Digest
-BuildPersistentAirCacheKey(IMTLD3D12Device *device, PipelineShaderStage stage,
-                           std::string_view shader_cache_key,
-                           DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
+bool HashShaderCompilationArguments(
+    Sha1HashState &hash, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
+  for (auto *node = args; node; node =
+           static_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(node->next)) {
+    HashValue(hash, uint32_t(node->type));
+    switch (node->type) {
+    case SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA *>(node);
+      HashValue(hash, value->num_output_slots);
+      HashValue(hash, value->num_elements);
+      HashBytes(hash, value->strides, sizeof(value->strides));
+      for (uint32_t i = 0; i < value->num_elements; ++i) {
+        HashValue(hash, value->elements[i].reg_id);
+        HashValue(hash, value->elements[i].component);
+        HashValue(hash, value->elements[i].output_slot);
+        HashValue(hash, value->elements[i].offset);
+      }
+      break;
+    }
+    case SM50_SHADER_COMMON: {
+      const auto *value = reinterpret_cast<SM50_SHADER_COMMON_DATA *>(node);
+      HashValue(hash, uint32_t(value->metal_version));
+      HashValue(hash, uint32_t(value->flags));
+      break;
+    }
+    case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION: {
+      const auto *value = reinterpret_cast<
+          SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *>(node);
+      HashValue(hash, uint8_t(value->enabled));
+      break;
+    }
+    case SM50_SHADER_BINDLESS_MIRROR: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_BINDLESS_MIRROR_DATA *>(node);
+      HashValue(hash, uint8_t(value->enabled));
+      break;
+    }
+    case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI: {
+      const auto *value = reinterpret_cast<
+          DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *>(node);
+      HashValue(hash, uint32_t(value->version));
+      HashValue(hash, uint8_t(value->enabled));
+      break;
+    }
+    case SM50_SHADER_PSO_PIXEL_SHADER: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_PSO_PIXEL_SHADER_DATA *>(node);
+      HashValue(hash, value->sample_mask);
+      HashValue(hash, uint8_t(value->dual_source_blending));
+      HashValue(hash, uint8_t(value->disable_depth_output));
+      HashValue(hash, value->unorm_output_reg_mask);
+      HashValue(hash, value->demote_msaa_srv_mask_lo);
+      HashValue(hash, value->demote_msaa_srv_mask_hi);
+      break;
+    }
+    case SM50_SHADER_IA_INPUT_LAYOUT: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_IA_INPUT_LAYOUT_DATA *>(node);
+      HashValue(hash, uint32_t(value->index_buffer_format));
+      HashValue(hash, value->slot_mask);
+      HashValue(hash, value->num_elements);
+      for (uint32_t i = 0; i < value->num_elements; ++i) {
+        const auto &element = value->elements[i];
+        HashValue(hash, element.reg);
+        HashValue(hash, element.slot);
+        HashValue(hash, element.aligned_byte_offset);
+        HashValue(hash, element.format);
+        HashValue(hash, uint32_t(element.step_function));
+        HashValue(hash, uint32_t(element.step_rate));
+      }
+      break;
+    }
+    case SM50_SHADER_GS_PASS_THROUGH: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_GS_PASS_THROUGH_DATA *>(node);
+      HashValue(hash, value->DataEncoded);
+      HashValue(hash, uint8_t(value->RasterizationDisabled));
+      break;
+    }
+    case SM50_SHADER_PSO_GEOMETRY_SHADER: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *>(node);
+      HashValue(hash, uint8_t(value->strip_topology));
+      break;
+    }
+    case SM50_SHADER_PSO_TESSELLATOR: {
+      const auto *value =
+          reinterpret_cast<SM50_SHADER_PSO_TESSELLATOR_DATA *>(node);
+      HashValue(hash, value->max_potential_tess_factor);
+      break;
+    }
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<Sha1Digest> BuildPersistentAirCacheKey(
+    IMTLD3D12Device *device, PipelineShaderStage stage,
+    std::string_view compile_kind,
+    std::initializer_list<const PipelineDxilShader *> shaders,
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   Sha1HashState hash;
-  HashString(hash, "dxmt-d3d12-persistent-air-cache-v3");
+  HashString(hash, "dxmt-d3d12-persistent-air-cache-v4");
   // Fold the DXMT build version into the key so the cache auto-invalidates
   // across clean commits and local dirty builds whenever airconv codegen could
   // have changed.
   HashString(hash, DXMT_VERSION);
+  HashString(hash, compile_kind);
   HashValue(hash, uint32_t(stage));
   HashValue(hash, uint32_t(GetMetalVersion(device)));
   HashValue(hash, uint32_t(GetShaderFlags()));
   HashValue(hash, uint32_t(shader_abi_version));
-  HashString(hash, shader_cache_key);
+  HashValue(hash, uint32_t(shaders.size()));
+  for (const auto *shader : shaders) {
+    if (!shader)
+      return std::nullopt;
+    HashValue(hash, uint32_t(shader->stage));
+    HashValue(hash, uint32_t(shader->kind()));
+    HashVector(hash, shader->bytecode());
+  }
+  if (!HashShaderCompilationArguments(hash, args))
+    return std::nullopt;
   return hash.final();
+}
+
+void LogPersistentAirCacheMarker(const char *result,
+                                 PipelineShaderStage stage,
+                                 const Sha1Digest &key) {
+  const auto marker_path = env::getEnvVar("DXMT_PERSISTENT_AIR_CACHE_MARKER");
+  if (marker_path.empty())
+    return;
+  FILE *marker = fopen(marker_path.c_str(), "a");
+  if (!marker)
+    return;
+  fprintf(marker, "%s stage=%s key=%s\n", result, ShaderStageName(stage),
+          key.string().c_str());
+  fclose(marker);
 }
 
 bool
@@ -1584,7 +1707,6 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      const char *function_name,
                      SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
                      PipelineMetalShader &out,
-                     std::string_view shader_cache_key,
                      DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version,
                      bool read_persistent_cache = true) {
   const char *air_function_name = "shader_main";
@@ -1598,14 +1720,14 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
 
   // Persistent AIR cache lookup: a hit rebuilds the MTLLibrary from cached
   // bitcode and skips the airconv transpile (the ~99% record-thread stall).
+  const auto persistent_key_result = BuildPersistentAirCacheKey(
+      device, shader.stage, "single", {&shader}, args, shader_abi_version);
   const bool persistent =
-      PersistentAirCacheEnabled() && !shader_cache_key.empty();
+      PersistentAirCacheEnabled() && persistent_key_result.has_value();
   Sha1Digest persistent_key = {};
   ShaderCache *scache = nullptr;
   if (persistent) {
-    persistent_key =
-        BuildPersistentAirCacheKey(device, shader.stage, shader_cache_key,
-                                   shader_abi_version);
+    persistent_key = *persistent_key_result;
     scache = &ShaderCache::getInstance(device->GetDXMTDevice().metalVersion());
   }
   if (persistent && read_persistent_cache) {
@@ -1626,6 +1748,7 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
             compiled.persistent_cache_hit = true;
             compiled.persistent_cache_key = persistent_key.string();
             out = std::move(compiled);
+            LogPersistentAirCacheMarker("hit", shader.stage, persistent_key);
             if (stall_diag) {
               auto h = g_cache_hits.fetch_add(1, std::memory_order_relaxed) + 1;
               if ((h & 255) == 0)
@@ -1643,27 +1766,28 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
       }
     }
   }
-  if (stall_diag && persistent)
-    g_cache_misses.fetch_add(1, std::memory_order_relaxed);
+  if (persistent) {
+    LogPersistentAirCacheMarker("miss", shader.stage, persistent_key);
+    if (stall_diag)
+      g_cache_misses.fetch_add(1, std::memory_order_relaxed);
+  }
 
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  int compile_failed = 0;
-  {
-    std::lock_guard lock(AirconvCompileMutex());
-    const auto t0 = stall_diag ? std::chrono::steady_clock::now()
-                               : std::chrono::steady_clock::time_point{};
-    compile_failed = shader.kind() == PipelineShaderBytecodeKind::Dxil
-                         ? DXMT12DXILCompile(shader.shaderHandle(), args, air_function_name,
-                                       &bitcode_handle, &error)
-                         : DXMT12SM50Compile(shader.shaderHandle(), args, air_function_name,
-                                       &bitcode_handle, &error);
-    if (stall_diag)
-      g_transpile_us.fetch_add(
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - t0).count(),
-          std::memory_order_relaxed);
-  }
+  const auto t0 = stall_diag ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+  const int compile_failed =
+      shader.kind() == PipelineShaderBytecodeKind::Dxil
+          ? DXMT12DXILCompile(shader.shaderHandle(), args, air_function_name,
+                              &bitcode_handle, &error)
+          : DXMT12SM50Compile(shader.shaderHandle(), args, air_function_name,
+                              &bitcode_handle, &error);
+  if (stall_diag)
+    g_transpile_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count(),
+        std::memory_order_relaxed);
   if (compile_failed) {
     auto error_message = DXMT12SM50GetErrorMessageString(error);
     WARN("D3D12PipelineState: airconv compile diagnostic stage=",
@@ -1714,6 +1838,90 @@ CreateMetalFunctionFromBitcode(IMTLD3D12Device *device,
                                    out, DXMT12_MTL4_SHADER_ABI_LEGACY);
 }
 
+template <typename Compile>
+bool CompileCombinedMetalFunction(
+    IMTLD3D12Device *device, PipelineShaderStage stage,
+    std::string_view compile_kind,
+    std::initializer_list<const PipelineDxilShader *> shaders,
+    const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    PipelineMetalShader &out, const char *failure_description,
+    Compile &&compile) {
+  const auto persistent_key_result = BuildPersistentAirCacheKey(
+      device, stage, compile_kind, shaders, args,
+      DXMT12_MTL4_SHADER_ABI_LEGACY);
+  const bool persistent =
+      PersistentAirCacheEnabled() && persistent_key_result.has_value();
+  Sha1Digest persistent_key = {};
+  ShaderCache *scache = nullptr;
+  std::string cached_function_name;
+  const char *air_function_name = function_name;
+  if (persistent) {
+    persistent_key = *persistent_key_result;
+    scache = &ShaderCache::getInstance(device->GetDXMTDevice().metalVersion());
+    const std::string function_prefix(compile_kind);
+    cached_function_name =
+        BuildFunctionName(function_prefix.c_str(), persistent_key.string());
+    air_function_name = cached_function_name.c_str();
+  }
+
+  if (persistent) {
+    if (auto reader = scache->getReader()) {
+      const auto lookup_begin = dxmt::clock::now();
+      auto lib_data = reader->get(persistent_key);
+      dxmt::perf::recordPsoCacheLookupTime(
+          dxmt::perf::currentFrameStatistics(),
+          dxmt::clock::now() - lookup_begin);
+      if (lib_data) {
+        const auto materialize_begin = dxmt::clock::now();
+        WMT::Reference<WMT::Error> metal_error;
+        PipelineMetalShader compiled = {};
+        compiled.library =
+            device->GetMTLDevice().newLibrary(lib_data, metal_error);
+        if (compiled.library) {
+          compiled.function = compiled.library.newFunction(air_function_name);
+          if (compiled.function) {
+            compiled.persistent_cache_hit = true;
+            compiled.persistent_cache_key = persistent_key.string();
+            out = std::move(compiled);
+            LogPersistentAirCacheMarker("hit", stage, persistent_key);
+            dxmt::perf::recordPsoMaterializeTime(
+                dxmt::perf::currentFrameStatistics(),
+                dxmt::clock::now() - materialize_begin);
+            return true;
+          }
+        }
+      }
+    }
+    LogPersistentAirCacheMarker("miss", stage, persistent_key);
+  }
+
+  sm50_bitcode_t bitcode_handle = nullptr;
+  sm50_error_t error = nullptr;
+  const int compile_failed =
+      compile(air_function_name, &bitcode_handle, &error);
+  if (compile_failed) {
+    WARN("D3D12PipelineState: ", failure_description, ": ",
+         DXMT12SM50GetErrorMessageString(error));
+    DXMT12SM50FreeError(error);
+    return false;
+  }
+
+  if (persistent && scache) {
+    SM50_COMPILED_BITCODE bitcode = {};
+    DXMT12SM50GetCompiledBitcode(bitcode_handle, &bitcode);
+    const auto bitcode_data_native = AirconvHandleValue(bitcode.Data);
+    if (bitcode_data_native && bitcode.Size) {
+      if (auto writer = scache->getWriter()) {
+        writer->set(persistent_key,
+                    WMT::MakeDispatchData(bitcode_data_native, bitcode.Size));
+      }
+    }
+  }
+
+  return CreateMetalFunctionFromBitcode(device, stage, air_function_name,
+                                        bitcode_handle, out);
+}
+
 bool
 CompileGeometryPipelineVertexFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
@@ -1725,23 +1933,14 @@ CompileGeometryPipelineVertexFunction(
     return false;
   }
 
-  sm50_bitcode_t bitcode_handle = nullptr;
-  sm50_error_t error = nullptr;
-  int compile_failed = 0;
-  {
-    std::lock_guard lock(AirconvCompileMutex());
-    compile_failed = DXMT12SM50CompileGeometryPipelineVertex(
-        vs.shaderHandle(), gs.shaderHandle(), args, function_name, &bitcode_handle, &error);
-  }
-  if (compile_failed) {
-    WARN("D3D12PipelineState: failed to compile DXBC geometry vertex shader: ",
-         DXMT12SM50GetErrorMessageString(error));
-    DXMT12SM50FreeError(error);
-    return false;
-  }
-
-  return CreateMetalFunctionFromBitcode(
-      device, PipelineShaderStage::Vertex, function_name, bitcode_handle, out);
+  return CompileCombinedMetalFunction(
+      device, PipelineShaderStage::Vertex, "geometry-vertex", {&vs, &gs},
+      function_name, args, out,
+      "failed to compile DXBC geometry vertex shader",
+      [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
+        return DXMT12SM50CompileGeometryPipelineVertex(
+            vs.shaderHandle(), gs.shaderHandle(), args, name, bitcode, error);
+      });
 }
 
 bool
@@ -1755,24 +1954,13 @@ CompileGeometryPipelineGeometryFunction(
     return false;
   }
 
-  sm50_bitcode_t bitcode_handle = nullptr;
-  sm50_error_t error = nullptr;
-  int compile_failed = 0;
-  {
-    std::lock_guard lock(AirconvCompileMutex());
-    compile_failed = DXMT12SM50CompileGeometryPipelineGeometry(
-        vs.shaderHandle(), gs.shaderHandle(), args, function_name, &bitcode_handle, &error);
-  }
-  if (compile_failed) {
-    WARN("D3D12PipelineState: failed to compile DXBC geometry shader: ",
-         DXMT12SM50GetErrorMessageString(error));
-    DXMT12SM50FreeError(error);
-    return false;
-  }
-
-  return CreateMetalFunctionFromBitcode(
-      device, PipelineShaderStage::Geometry, function_name, bitcode_handle,
-      out);
+  return CompileCombinedMetalFunction(
+      device, PipelineShaderStage::Geometry, "geometry-mesh", {&vs, &gs},
+      function_name, args, out, "failed to compile DXBC geometry shader",
+      [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
+        return DXMT12SM50CompileGeometryPipelineGeometry(
+            vs.shaderHandle(), gs.shaderHandle(), args, name, bitcode, error);
+      });
 }
 
 bool
@@ -1787,23 +1975,14 @@ CompileTessellationPipelineHullFunction(
     return false;
   }
 
-  sm50_bitcode_t bitcode_handle = nullptr;
-  sm50_error_t error = nullptr;
-  int compile_failed = 0;
-  {
-    std::lock_guard lock(AirconvCompileMutex());
-    compile_failed = DXMT12SM50CompileTessellationPipelineHull(
-        vs.shaderHandle(), hs.shaderHandle(), args, function_name, &bitcode_handle, &error);
-  }
-  if (compile_failed) {
-    WARN("D3D12PipelineState: failed to compile DXBC tessellation hull shader: ",
-         DXMT12SM50GetErrorMessageString(error));
-    DXMT12SM50FreeError(error);
-    return false;
-  }
-
-  return CreateMetalFunctionFromBitcode(
-      device, PipelineShaderStage::Hull, function_name, bitcode_handle, out);
+  return CompileCombinedMetalFunction(
+      device, PipelineShaderStage::Hull, "tessellation-hull", {&vs, &hs},
+      function_name, args, out,
+      "failed to compile DXBC tessellation hull shader",
+      [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
+        return DXMT12SM50CompileTessellationPipelineHull(
+            vs.shaderHandle(), hs.shaderHandle(), args, name, bitcode, error);
+      });
 }
 
 bool
@@ -1818,23 +1997,14 @@ CompileTessellationPipelineDomainFunction(
     return false;
   }
 
-  sm50_bitcode_t bitcode_handle = nullptr;
-  sm50_error_t error = nullptr;
-  int compile_failed = 0;
-  {
-    std::lock_guard lock(AirconvCompileMutex());
-    compile_failed = DXMT12SM50CompileTessellationPipelineDomain(
-        hs.shaderHandle(), ds.shaderHandle(), args, function_name, &bitcode_handle, &error);
-  }
-  if (compile_failed) {
-    WARN("D3D12PipelineState: failed to compile DXBC tessellation domain shader: ",
-         DXMT12SM50GetErrorMessageString(error));
-    DXMT12SM50FreeError(error);
-    return false;
-  }
-
-  return CreateMetalFunctionFromBitcode(
-      device, PipelineShaderStage::Domain, function_name, bitcode_handle, out);
+  return CompileCombinedMetalFunction(
+      device, PipelineShaderStage::Domain, "tessellation-domain", {&hs, &ds},
+      function_name, args, out,
+      "failed to compile DXBC tessellation domain shader",
+      [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
+        return DXMT12SM50CompileTessellationPipelineDomain(
+            hs.shaderHandle(), ds.shaderHandle(), args, name, bitcode, error);
+      });
 }
 
 WMTPrimitiveTopologyClass
@@ -2048,7 +2218,8 @@ template <typename PipelineInfo>
 void
 ApplyBlendState(PipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
-                uint32_t render_target_count) {
+                uint32_t render_target_count,
+                const FormatCapabilityInspector &format_capabilities) {
   for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
     const auto &src =
         blend_desc.RenderTarget[blend_desc.IndependentBlendEnable ? rt : 0];
@@ -2058,6 +2229,15 @@ ApplyBlendState(PipelineInfo &info,
                kColorWriteMaskMap[15]);
     if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid)
       continue;
+
+    const auto format_capability =
+        format_capabilities.textureCapabilities.find(dst.pixel_format);
+    if (format_capability == format_capabilities.textureCapabilities.end() ||
+        !any_bit_set(format_capability->second & FormatCapability::Blend)) {
+      WARN("D3D12PipelineState: ignoring blending on non-blendable RTV slot=",
+           rt, " format=", dst.pixel_format);
+      continue;
+    }
 
     dst.blending_enabled = true;
     dst.rgb_blend_operation =
@@ -2412,6 +2592,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (!ValidateGraphicsRenderFormats(device, state, rtv_formats,
                                      depth_format, stencil_format))
     return false;
+  FormatCapabilityInspector format_capabilities;
+  format_capabilities.Inspect(device->GetMTLDevice());
 
   SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
   ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
@@ -2460,8 +2642,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     const auto ps_name = BuildFunctionName("ps", shader_cache_key);
     if (!CompileMetalFunction(device, *ps, ps_name.c_str(),
                               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ps_args),
-                              out.pixel, shader_cache_key,
-                              shader_abi_version))
+                              out.pixel, shader_abi_version))
       return false;
   }
 
@@ -2556,17 +2737,29 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
           info.colors[i].pixel_format = rtv_formats[i];
       }
-      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
         info.depth_pixel_format = depth_format;
         info.stencil_pixel_format = stencil_format;
       }
 
+      std::array<obj_handle_t, 1> lookup_archives = {};
+      const bool archive_attached =
+          AttachPSOBinaryArchive(device, info, lookup_archives);
       WMT::Reference<WMT::Error> error;
       uint64_t compile_wait_us = 0;
-      pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
-          info, error, &compile_wait_us);
+      auto create_pipeline = [&] {
+        pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+            info, error, &compile_wait_us);
+      };
+      if (archive_attached) {
+        std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+        create_pipeline();
+      } else {
+        create_pipeline();
+      }
       dxmt::perf::recordPsoCompileWaitTime(
           dxmt::perf::currentFrameStatistics(),
           std::chrono::microseconds(compile_wait_us));
@@ -2575,6 +2768,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
              error ? error.description().getUTF8String() : "unknown error");
         return false;
       }
+      if (archive_attached)
+        device->NotePSOBinaryArchivePipelineCreated();
       return true;
     };
 
@@ -2642,17 +2837,29 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
           info.colors[i].pixel_format = rtv_formats[i];
       }
-      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
         info.depth_pixel_format = depth_format;
         info.stencil_pixel_format = stencil_format;
       }
 
+      std::array<obj_handle_t, 1> lookup_archives = {};
+      const bool archive_attached =
+          AttachPSOBinaryArchive(device, info, lookup_archives);
       WMT::Reference<WMT::Error> error;
       uint64_t compile_wait_us = 0;
-      pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
-          info, error, &compile_wait_us);
+      auto create_pipeline = [&] {
+        pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+            info, error, &compile_wait_us);
+      };
+      if (archive_attached) {
+        std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+        create_pipeline();
+      } else {
+        create_pipeline();
+      }
       dxmt::perf::recordPsoCompileWaitTime(
           dxmt::perf::currentFrameStatistics(),
           std::chrono::microseconds(compile_wait_us));
@@ -2661,6 +2868,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
              error ? error.description().getUTF8String() : "unknown error");
         return false;
       }
+      if (archive_attached)
+        device->NotePSOBinaryArchivePipelineCreated();
       return true;
     };
 
@@ -2678,8 +2887,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   }
 
   if (!CompileMetalFunction(device, *vs, vs_name.c_str(), vs_args,
-                            out.vertex, shader_cache_key,
-                            shader_abi_version))
+                            out.vertex, shader_abi_version))
     return false;
 
   WMTRenderPipelineInfo info = {};
@@ -2712,17 +2920,29 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
       info.colors[i].pixel_format = rtv_formats[i];
   }
-  ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+  ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                  format_capabilities);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
     info.depth_pixel_format = depth_format;
     info.stencil_pixel_format = stencil_format;
   }
 
+  std::array<obj_handle_t, 1> lookup_archives = {};
+  const bool archive_attached =
+      AttachPSOBinaryArchive(device, info, lookup_archives);
   WMT::Reference<WMT::Error> error;
   uint64_t compile_wait_us = 0;
-  out.pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
-      info, error, &compile_wait_us);
+  auto create_pipeline = [&] {
+    out.pso = device->GetMTLDevice().newRenderPipelineStateAndGetStats(
+        info, error, &compile_wait_us);
+  };
+  if (archive_attached) {
+    std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+    create_pipeline();
+  } else {
+    create_pipeline();
+  }
   dxmt::perf::recordPsoCompileWaitTime(
       dxmt::perf::currentFrameStatistics(),
       std::chrono::microseconds(compile_wait_us));
@@ -2731,6 +2951,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
          error ? error.description().getUTF8String() : "unknown error");
     return false;
   }
+  if (archive_attached)
+    device->NotePSOBinaryArchivePipelineCreated();
   BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
   out.depth_stencil =
       CreateDepthStencilState(device, state.desc.DepthStencilState);
@@ -2782,8 +3004,8 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
           &native_abi_node);
   auto compile_compute = [&](bool read_persistent_cache) {
     return CompileMetalFunction(device, *cs, cs_name.c_str(), compile_args,
-                                out.compute, shader_cache_key,
-                                shader_abi_version, read_persistent_cache);
+                                out.compute, shader_abi_version,
+                                read_persistent_cache);
   };
   if (!compile_compute(/*read_persistent_cache=*/true))
     return false;
@@ -2802,11 +3024,23 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   const auto tgz = std::max<uint32_t>(1, cs->reflection().ThreadgroupSize[2]);
   info.tgsize_is_multiple_of_sgwidth = ((tgx * tgy * tgz) % 32) == 0;
 
+  std::array<obj_handle_t, 1> lookup_archives = {};
+  const bool archive_attached =
+      AttachPSOBinaryArchive(device, info, lookup_archives);
+
   auto create_pso = [&](std::string &error_desc) {
     WMT::Reference<WMT::Error> error;
     uint64_t compile_wait_us = 0;
-    out.pso = device->GetMTLDevice().newComputePipelineStateAndGetStats(
-        info, error, &compile_wait_us);
+    auto create_pipeline = [&] {
+      out.pso = device->GetMTLDevice().newComputePipelineStateAndGetStats(
+          info, error, &compile_wait_us);
+    };
+    if (archive_attached) {
+      std::lock_guard lock(device->GetPSOBinaryArchiveMutex());
+      create_pipeline();
+    } else {
+      create_pipeline();
+    }
     dxmt::perf::recordPsoCompileWaitTime(
         dxmt::perf::currentFrameStatistics(),
         std::chrono::microseconds(compile_wait_us));
@@ -2815,6 +3049,8 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
                          : "unknown error";
       return false;
     }
+    if (archive_attached)
+      device->NotePSOBinaryArchivePipelineCreated();
     error_desc.clear();
     return true;
   };
@@ -3954,6 +4190,14 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   if (FAILED(hr)) {
     dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
+    return nullptr;
+  }
+  if (!device->GetMTLDevice().supportsTextureSampleCount(
+          graphics_state.desc.SampleDesc.Count)) {
+    WARN("D3D12PipelineState: unsupported Metal sample count ",
+         graphics_state.desc.SampleDesc.Count);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
+    StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
 

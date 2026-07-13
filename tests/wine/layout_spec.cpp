@@ -5,13 +5,14 @@
 #include <string_view>
 
 TEST(TestLayout, KeepsWineInfrastructureInStableLocations) {
-  constexpr std::array<std::string_view, 32> required_files = {
+  constexpr std::array<std::string_view, 33> required_files = {
       "benchmarks/README.md",
       "benchmarks/include/dxmt_benchmark.hpp",
       "benchmarks/meson.build",
       "benchmarks/support/benchmark_acceptance.py",
       "benchmarks/support/main.cpp",
       "benchmarks/wine/d3d12_integration_benchmark.cpp",
+      "benchmarks/wine/d3d12_pipeline_creation_benchmark.cpp",
       "benchmarks/wine/meson.build",
       "benchmarks/wine/ue_d3d11_initialization.cpp",
       "benchmarks/wine/ue_d3d12_initialization.cpp",

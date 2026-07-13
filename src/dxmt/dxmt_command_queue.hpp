@@ -186,6 +186,7 @@ private:
   CpuFence cpu_coherent;
   CpuFence frame_latency_fence_;
   std::atomic_bool stopped = false;
+  std::atomic_bool device_error_ = false;
   dxmt::mutex readback_mutex_;
   dxmt::condition_variable readback_cond_;
   std::vector<std::function<void()>> pending_readbacks_;
@@ -254,6 +255,10 @@ public:
   CommandQueue(WMT::Device device);
 
   ~CommandQueue();
+
+  bool HasDeviceError() const {
+    return device_error_.load(std::memory_order_acquire);
+  }
 
   CommandChunk *
   CurrentChunk() {

@@ -2,8 +2,8 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
-#include <cstring>
 #include "util_bit.hpp"
+#include "util_svector.hpp"
 
 namespace dxmt {
 
@@ -40,77 +40,82 @@ LANE(EncoderId id) {
 
 class FenceSet {
 public:
-  constexpr FenceSet() {
-    for (int i = 0; i < kParity; i++) {
-      storage_[i] = 0;
-    }
-  }
+  FenceSet() = default;
 
-  constexpr FenceSet(EncoderId id) {
-    for (int i = 0; i < kParity; i++) {
-      storage_[i] = 0;
-    }
+  FenceSet(EncoderId id) {
     set(id);
   }
 
-  FenceSet(const FenceSet &copy) {
-    memcpy(&storage_, &copy.storage_, sizeof(storage_));
-  }
-
-  FenceSet &
-  operator=(const dxmt::FenceSet &copy) {
-    memcpy(&storage_, &copy.storage_, sizeof(storage_));
-    return *this;
-  }
-
-  ~FenceSet() = default;
-
-  constexpr void
+  bool
   set(EncoderId id) {
-    storage_[PARITY(id)] |= (1ull << LANE(id));
+    for (auto &entry : entries_) {
+      if (entry == id)
+        return false;
+      if ((entry % kParityLane) == (id % kParityLane)) {
+        entry = std::max(entry, id);
+        return false;
+      }
+    }
+    entries_.push_back(id);
+    return true;
   }
 
-  constexpr void
+  void
   unset(EncoderId id) {
-    storage_[PARITY(id)] &= (kAllLaneMask & ~(1ull << LANE(id)));
-  }
-
-  constexpr void
-  fillGenerationBefore(int parity, int lane) {
-    const int idx = (parity + kParity + (kParity - 1)) * kLane + lane;
-    for (int offset = 0; offset < kLane; ++offset) {
-      set(idx - offset);
+    for (size_t i = 0; i < entries_.size(); i++) {
+      if (entries_[i] == id) {
+        entries_.erase(i);
+        return;
+      }
     }
   }
 
-  constexpr bool
+  bool
   test(EncoderId id) const {
-    return storage_[PARITY(id)] & (1ull << LANE(id));
+    return std::find(entries_.begin(), entries_.end(), id) != entries_.end();
   }
 
-  constexpr bool
+  bool
   testAndSet(EncoderId id) {
-    auto P = PARITY(id);
-    auto LM = 1ull << LANE(id);
-    if (storage_[P] & LM)
-      return true;
-    storage_[P] |= LM;
-    return false;
+    return !set(id);
   }
 
-  constexpr bool
+  bool
+  add(EncoderId id) {
+    return set(id);
+  }
+
+  bool
+  isLastAccess(EncoderId id) const {
+    return test(id);
+  }
+
+  template <typename Fn>
+  size_t
+  enumerate(EncoderId id_before, Fn &&fn) {
+    size_t count = 0;
+    for (auto id : entries_) {
+      if (id >= id_before)
+        continue;
+      fn(id);
+      count++;
+    }
+    return count;
+  }
+
+  bool
   intersectedWith(const FenceSet &set) const {
-    for (int i = 0; i < kParity; i++) {
-      if (storage_[i] & set.storage_[i])
+    for (auto id : entries_) {
+      if (set.test(id))
         return true;
     }
     return false;
   }
 
-  constexpr bool
+  bool
   contains(const FenceSet &set) const {
-    for (int i = 0; i < kParity; i++) {
-      if ((storage_[i] & set.storage_[i]) != set.storage_[i])
+    for (auto id : set.entries_) {
+      if (!test(id))
         return false;
     }
     return true;
@@ -118,98 +123,78 @@ public:
 
   FenceSet &
   merge(const FenceSet &set) {
-    for (int i = 0; i < kParity; i++) {
-      storage_[i] |= set.storage_[i];
-    }
+    for (auto id : set.entries_)
+      this->set(id);
     return *this;
   }
 
   FenceSet
   unionOf(const FenceSet &set) const {
-    FenceSet ret{};
-    for (int i = 0; i < kParity; i++) {
-      ret.storage_[i] = storage_[i] | set.storage_[i];
-    }
+    FenceSet ret(*this);
+    ret.merge(set);
     return ret;
   }
 
   FenceSet &
   subtract(const FenceSet &set) {
-    for (int i = 0; i < kParity; i++) {
-      storage_[i] &= (kAllLaneMask & ~set.storage_[i]);
-    }
-    return *this;
-  }
-
-  FenceSet &
-  mergeWithLaneMaskOff(const FenceSet &set, const LaneStorage &mask) {
-    for (int i = 0; i < kParity; i++) {
-      storage_[i] |= (set.storage_[i] & (kAllLaneMask & ~mask));
-    }
+    for (auto id : set.entries_)
+      unset(id);
     return *this;
   }
 
   LaneStorage
   laneMask() const {
     LaneStorage ret = 0;
-    for (int i = 0; i < kParity; i++) {
-      ret |= storage_[i];
-    }
+    for (auto id : entries_)
+      ret |= 1ull << LANE(id);
     return ret;
   }
 
   LaneStorage
   storage(int parity) const {
-    return storage_[parity];
-  }
-
-  uint32_t
-  count() const {
-    uint32_t ret = 0;
-    for (int i = 0; i < kParity; i++) {
-      ret += __builtin_popcountll(storage_[i]);
+    LaneStorage ret = 0;
+    for (auto id : entries_) {
+      if (PARITY(id) == static_cast<uint64_t>(parity))
+        ret |= 1ull << LANE(id);
     }
     return ret;
   }
 
+  uint32_t
+  count() const {
+    return static_cast<uint32_t>(entries_.size());
+  }
+
   bool
   empty() const {
-    return laneMask() == 0;
+    return entries_.empty();
+  }
+
+  void
+  clear() {
+    entries_.clear();
   }
 
   template <typename Fn>
   void
   forEach(Fn &&fn) {
-    for (int P = 0; P < kParity; P++) {
-      auto lanes = storage_[P];
-      while (lanes) {
-        auto lane = bit::tzcnt(lanes);
-        fn(P * kLane + lane);
-        lanes &= ~(1ull << lane);
-      }
-    }
+    for (auto id : entries_)
+      fn(id);
   }
 
   template <typename Fn, typename FnPrior>
   void
   forEach(const FenceSet &prior, FnPrior &&fnPrior, Fn &&fn) {
-    for (int P = 0; P < kParity; P++) {
-      auto lanes = storage_[P];
-      auto lanes_prior = prior.storage_[P];
-      while (auto lanes_combine = lanes | lanes_prior) {
-        auto lane = bit::tzcnt(lanes_combine);
-        if (lanes_prior & (1ull << lane))
-          fnPrior(P * kLane + lane);
-        else
-          fn(P * kLane + lane);
-        lanes &= ~(1ull << lane);
-        lanes_prior &= ~(1ull << lane);
-      }
+    for (auto id : prior.entries_)
+      fnPrior(id);
+    for (auto id : entries_) {
+      if (!prior.test(id))
+        fn(id);
     }
   }
 
 private:
-  LaneStorage storage_[kParity];
+  small_vector<EncoderId, 4> entries_;
 };
 
 template <size_t Sz = kLane, size_t Forward = 1> class TrackingSet {
@@ -293,7 +278,7 @@ private:
   /**
    * Previous shared access
    */
-  TrackingSet<> shared_;
+  FenceSet shared_;
   /**
    * Last exclusive access
    */
@@ -313,6 +298,7 @@ public:
 
 private:
   std::array<FenceSet, kParityLane> summary_;
+  std::array<EncoderId, kParityLane> summary_generation_ = {};
 };
 
 } // namespace dxmt

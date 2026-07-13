@@ -255,6 +255,11 @@ struct unixcall_mtlcommandbuffer_commit_stats {
   uint64_t ret_residency_submit_us;
 };
 
+struct unixcall_mtlcommandbuffer_set_diagnostic_info {
+  obj_handle_t handle;
+  struct WMTCommandBufferDiagnosticInfo info;
+};
+
 struct unixcall_generic_obj_cmd_noret {
   obj_handle_t encoder;
   struct WMTConstMemoryPointer cmd_head;

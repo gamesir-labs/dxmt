@@ -141,6 +141,26 @@ dxmt_metal4_perf_stats_enabled(void) {
   return enabled;
 }
 
+static bool
+dxmt_metal4_test_feedback_error_enabled(void) {
+  return dxmt_truthy_env_value(
+             getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")) ||
+         dxmt_truthy_env_value(
+             getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE"));
+}
+
+static bool
+dxmt_metal4_test_inject_feedback_error(void) {
+  if (dxmt_truthy_env_value(
+          getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")))
+    return true;
+  if (!dxmt_truthy_env_value(
+          getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE")))
+    return false;
+  static atomic_bool injected = false;
+  return !atomic_exchange_explicit(&injected, true, memory_order_acq_rel);
+}
+
 static uint64_t
 dxmt_monotonic_us(void) {
   struct timespec ts;
@@ -170,6 +190,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) NSError *feedbackError;
 @property(nonatomic, assign) double feedbackGPUStartTime;
 @property(nonatomic, assign) double feedbackGPUEndTime;
+@property(nonatomic, assign) struct WMTCommandBufferDiagnosticInfo diagnosticInfo;
 - (instancetype)initWithQueue:(DXMTMetal4CommandQueue *)queue;
 - (id<MTL4CommandBuffer>)commandBuffer;
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder;
@@ -650,6 +671,7 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, assign) uint64_t presentEventValue;
 @property(nonatomic, assign) uint64_t maxCommandBufferCount;
 @property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
+@property(nonatomic, retain) NSError *firstError;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
@@ -689,6 +711,7 @@ dxmt_metal4_is_buffer(id object) {
   [_compiler release];
   [_event release];
   [_presentEvent release];
+  [_firstError release];
   [super dealloc];
 }
 
@@ -742,6 +765,7 @@ dxmt_metal4_is_buffer(id object) {
   _internalStatus = DXMTMetal4CommandBufferStateNotEnqueued;
   _feedbackGPUStartTime = 0.0;
   _feedbackGPUEndTime = 0.0;
+  memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
   if (!_allocator || !_metal4Buffer || !_pendingWaitEvents || !_pendingSignalEvents || !_residencySet) {
     [self release];
@@ -835,6 +859,39 @@ dxmt_metal4_is_buffer(id object) {
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
     return 0;
 
+  if (_owner.firstError &&
+      [_owner.firstError.domain isEqualToString:@"DXMTMetal4TestErrorDomain"] &&
+      !dxmt_metal4_test_feedback_error_enabled())
+    _owner.firstError = nil;
+
+  if (_owner.firstError) {
+    _feedbackError = [_owner.firstError retain];
+    _internalStatus = DXMTMetal4CommandBufferStateError;
+    const char *rejection_marker =
+        getenv("DXMT_TEST_METAL4_REJECTION_MARKER");
+    if (rejection_marker && *rejection_marker) {
+      FILE *marker = fopen(rejection_marker, "a");
+      if (marker) {
+        fputs("rejected\n", marker);
+        fclose(marker);
+      }
+    }
+    if (dxmt_metal4_perf_stats_enabled()) {
+      fprintf(stderr,
+              "err:   DXMT Metal4 queue rejected command buffer after first error:"
+              " commandBuffer=%p queue=%p domain=%s code=%ld description=%s\n",
+              self, _owner.metal4Queue,
+              _feedbackError.domain ? _feedbackError.domain.UTF8String
+                                    : "<no domain>",
+              (long)_feedbackError.code,
+              _feedbackError.localizedDescription
+                  ? _feedbackError.localizedDescription.UTF8String
+                  : "<no description>");
+      fflush(stderr);
+    }
+    return 0;
+  }
+
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
       APITRACE_METAL_COMMAND_BUFFER_COMMIT_BEGIN,
@@ -901,8 +958,13 @@ dxmt_metal4_is_buffer(id object) {
 #if DXMT_APITRACE_METAL
   traceFeedback = dxmt_apitrace_runtime_enabled() &&
                   dxmt_metal4_commit_feedback_enabled(_completionValue);
+#else
+  (void)traceFeedback;
 #endif
-  if (perfFeedback || traceFeedback) {
+  // Metal 4 exposes command-buffer failures through commit feedback. Always
+  // install the handler so release builds propagate GPU errors instead of
+  // waiting forever for a completion event that a failed submission skipped.
+  {
     options = [[MTL4CommitOptions alloc] init];
     const obj_handle_t feedbackCommandBuffer = (obj_handle_t)self;
     const obj_handle_t feedbackMetalBuffer = (obj_handle_t)_metal4Buffer;
@@ -910,17 +972,53 @@ dxmt_metal4_is_buffer(id object) {
     const uint64_t feedbackQueueDepth = _owner.maxCommandBufferCount;
     const uint64_t feedbackCompletionValue = _completionValue;
     const BOOL feedbackHasDrawable = _pendingDrawable != nil;
+    const struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic =
+        _diagnosticInfo;
     __block id<MTLSharedEvent> feedbackCompletionEvent = [_owner.event retain];
     __block NSArray *feedbackWaitEvents = [_pendingWaitEvents copy];
     __block NSArray *feedbackSignalEvents = [_pendingSignalEvents copy];
     __block NSString *feedbackLabel = [_metal4Buffer.label copy];
+    __block DXMTMetal4CommandBuffer *feedbackOwner = [self retain];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
       NSError *error = feedback.error;
+      if (!error && dxmt_metal4_test_inject_feedback_error()) {
+        error = [NSError errorWithDomain:@"DXMTMetal4TestErrorDomain"
+                                    code:1
+                                userInfo:@{
+                                  NSLocalizedDescriptionKey:
+                                      @"Injected Metal 4 commit feedback error"
+                                }];
+      }
+      @synchronized(feedbackOwner) {
+        feedbackOwner.feedbackGPUStartTime = feedback.GPUStartTime;
+        feedbackOwner.feedbackGPUEndTime = feedback.GPUEndTime;
+        if (error) {
+          feedbackOwner.feedbackError = error;
+          feedbackOwner.internalStatus = DXMTMetal4CommandBufferStateError;
+        }
+      }
+      if (error) {
+        @synchronized(feedbackOwner.owner) {
+          if (!feedbackOwner.owner.firstError)
+            feedbackOwner.owner.firstError = error;
+        }
+      }
+      if (error && feedbackCompletionEvent.signaledValue <
+                       feedbackCompletionValue) {
+        // This event is DXMT's CPU-side retirement timeline. Feedback means the
+        // GPU has finished processing the submission, successfully or not, so
+        // advancing it is safe and releases waiters/resource retirement.
+        feedbackCompletionEvent.signaledValue = feedbackCompletionValue;
+      }
       if (perfFeedback && error) {
         fprintf(stderr,
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
                 " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
                 " completionCurrent=%" PRIu64 " waitCount=%lu signalCount=%lu drawable=%d"
+                " frame=%" PRIu64 " chunk=%" PRIu64
+                " d3dSeq=%" PRIu64 "-%" PRIu64
+                " encoders=%u/%u render=%u compute=%u blit=%u other=%u"
+                " barrierOnly=%u fenceWait=%u fenceUpdate=%u initEvent=%" PRIu64
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
                 (void *)(uintptr_t)feedbackMetalBuffer,
@@ -931,6 +1029,20 @@ dxmt_metal4_is_buffer(id object) {
                 (unsigned long)feedbackWaitEvents.count,
                 (unsigned long)feedbackSignalEvents.count,
                 feedbackHasDrawable,
+                feedbackDiagnostic.frame_id,
+                feedbackDiagnostic.chunk_id,
+                feedbackDiagnostic.d3d_sequence_begin,
+                feedbackDiagnostic.d3d_sequence_end,
+                feedbackDiagnostic.input_encoder_count,
+                feedbackDiagnostic.encoded_encoder_count,
+                feedbackDiagnostic.render_encoder_count,
+                feedbackDiagnostic.compute_encoder_count,
+                feedbackDiagnostic.blit_encoder_count,
+                feedbackDiagnostic.other_encoder_count,
+                feedbackDiagnostic.barrier_only_pass_count,
+                feedbackDiagnostic.fence_wait_count,
+                feedbackDiagnostic.fence_update_count,
+                feedbackDiagnostic.resource_initializer_event_id,
                 feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
                 feedback.GPUStartTime, feedback.GPUEndTime,
                 error.domain ? error.domain.UTF8String : "<no domain>",
@@ -976,6 +1088,7 @@ dxmt_metal4_is_buffer(id object) {
       [feedbackSignalEvents release];
       [feedbackWaitEvents release];
       [feedbackCompletionEvent release];
+      [feedbackOwner release];
     }];
   }
 
@@ -1094,11 +1207,15 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (enum WMTCommandBufferStatus)status {
-  return (enum WMTCommandBufferStatus)_internalStatus;
+  @synchronized(self) {
+    return (enum WMTCommandBufferStatus)_internalStatus;
+  }
 }
 
 - (NSError *)error {
-  return _feedbackError;
+  @synchronized(self) {
+    return [[_feedbackError retain] autorelease];
+  }
 }
 
 - (id)logs {
@@ -1114,11 +1231,15 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (double)GPUStartTime {
-  return _feedbackGPUStartTime;
+  @synchronized(self) {
+    return _feedbackGPUStartTime;
+  }
 }
 
 - (double)GPUEndTime {
-  return _feedbackGPUEndTime;
+  @synchronized(self) {
+    return _feedbackGPUEndTime;
+  }
 }
 
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {
@@ -3804,6 +3925,15 @@ _MTLCommandBuffer_commit(void *obj) {
 }
 
 static NTSTATUS
+_MTLCommandBuffer_setDiagnosticInfo(void *obj) {
+  struct unixcall_mtlcommandbuffer_set_diagnostic_info *params = obj;
+  DXMTMetal4CommandBuffer *cmdbuf =
+      (DXMTMetal4CommandBuffer *)params->handle;
+  cmdbuf.diagnosticInfo = params->info;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLCommandBuffer_waitUntilCompleted(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   [(DXMTMetal4CommandBuffer *)params->handle waitUntilCompleted];
@@ -5150,14 +5280,12 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandUpdateFence: {
       struct wmtcmd_blit_fence_op *body = (struct wmtcmd_blit_fence_op *)next;
-      [(id)encoder barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageBlit];
       break;
     }
     case WMTBlitCommandWaitForFence: {
       struct wmtcmd_blit_fence_op *body = (struct wmtcmd_blit_fence_op *)next;
       [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageBlit];
-      [(id)encoder barrierAfterQueueStages:MTLStageBlit beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTBlitCommandFillBuffer: {
@@ -5290,14 +5418,12 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTComputeCommandUpdateFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [(id)encoder barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageDispatch];
       break;
     }
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
       [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageDispatch];
-      [(id)encoder barrierAfterQueueStages:MTLStageDispatch beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTComputeCommandMemoryBarrier: {
@@ -5649,7 +5775,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandUpdateFence: {
       struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
       MTLStages stages = dxmt_metal4_render_stages(body->stages);
-      [(id)encoder barrierAfterStages:stages beforeQueueStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
       [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:stages];
       break;
     }
@@ -5657,7 +5782,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
       MTLStages stages = dxmt_metal4_render_stages(body->stages);
       [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:stages];
-      [(id)encoder barrierAfterQueueStages:stages beforeStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTRenderCommandSetViewport: {
@@ -8211,6 +8335,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLCommandBuffer_setDiagnosticInfo,
 };
 
 #ifndef DXMT_NATIVE
@@ -8391,5 +8516,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLCommandBuffer_setDiagnosticInfo,
 };
 #endif

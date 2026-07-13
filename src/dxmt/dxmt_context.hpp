@@ -33,6 +33,23 @@ constexpr size_t kEncodingContextCPUHeapLifetime = 600;
 
 constexpr auto kIntrapassControlBitIgnoreUAVWaW = 1ull << 1;
 
+struct CommandBufferDiagnosticInfo {
+  uint64_t frame_id = 0;
+  uint64_t chunk_id = 0;
+  uint64_t d3d_sequence_begin = 0;
+  uint64_t d3d_sequence_end = 0;
+  uint64_t resource_initializer_event_id = 0;
+  uint32_t input_encoder_count = 0;
+  uint32_t encoded_encoder_count = 0;
+  uint32_t render_encoder_count = 0;
+  uint32_t compute_encoder_count = 0;
+  uint32_t blit_encoder_count = 0;
+  uint32_t other_encoder_count = 0;
+  uint32_t barrier_only_pass_count = 0;
+  uint32_t fence_wait_count = 0;
+  uint32_t fence_update_count = 0;
+};
+
 inline std::size_t
 align_forward_adjustment(const void *const ptr, const std::size_t &alignment) noexcept {
   const auto iptr = reinterpret_cast<std::uintptr_t>(ptr);
@@ -1077,7 +1094,9 @@ public:
   
   AllocatedTempBufferSlice allocateTempBuffer1(size_t size, size_t alignment);
 
-  QueryReadbacks flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id);
+  QueryReadbacks flushCommands(
+      WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id,
+      CommandBufferDiagnosticInfo *diagnostic_info = nullptr);
 
   uint64_t currentSeqId() {return seq_id_;}
 

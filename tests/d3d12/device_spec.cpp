@@ -9,7 +9,10 @@
 
 #include <array>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
+#include <sstream>
+#include <string>
 
 namespace {
 
@@ -67,6 +70,129 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC BasicGraphicsPipelineDesc(
   return desc;
 }
 
+struct ScopedArchiveTestEnvironment {
+  ScopedArchiveTestEnvironment(const char *suffix) {
+    std::ostringstream name;
+    name << "dxmt-pso-archive-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << "-" << suffix;
+    root = "C:\\" + name.str();
+    unix_cache_root = "/tmp/" + name.str();
+    windows_cache_root = "Z:\\tmp\\" + name.str();
+    marker = root + "\\marker.txt";
+    CreateDirectoryA(root.c_str(), nullptr);
+    std::ofstream(marker, std::ios::trunc).close();
+    CreateDirectoryA(windows_cache_root.c_str(), nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", "1");
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", unix_cache_root.c_str());
+    SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "1");
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY", "1");
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_MARKER", marker.c_str());
+  }
+
+  ~ScopedArchiveTestEnvironment() {
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_MARKER", nullptr);
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY", nullptr);
+    SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", nullptr);
+  }
+
+  std::string ReadMarker() const {
+    std::ifstream input(marker);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+  }
+
+  std::string root;
+  std::string unix_cache_root;
+  std::string windows_cache_root;
+  std::string marker;
+};
+
+struct ScopedAirCacheTestEnvironment {
+  explicit ScopedAirCacheTestEnvironment(const char *suffix) {
+    std::ostringstream name;
+    name << "dxmt-air-cache-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << "-" << suffix;
+    root = "C:\\" + name.str();
+    unix_cache_root = "/tmp/" + name.str();
+    marker = root + "\\marker.txt";
+    CreateDirectoryA(root.c_str(), nullptr);
+    std::ofstream(marker, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", "1");
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", unix_cache_root.c_str());
+    SetEnvironmentVariableA("DXMT_D3D12_PERSISTENT_SHADER_CACHE", "1");
+    SetEnvironmentVariableA("DXMT_PERSISTENT_AIR_CACHE_MARKER",
+                            marker.c_str());
+  }
+
+  ~ScopedAirCacheTestEnvironment() {
+    SetEnvironmentVariableA("DXMT_PERSISTENT_AIR_CACHE_MARKER", nullptr);
+    SetEnvironmentVariableA("DXMT_D3D12_PERSISTENT_SHADER_CACHE", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", nullptr);
+  }
+
+  std::string ReadMarker() const {
+    std::ifstream input(marker);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+  }
+
+  std::string root;
+  std::string unix_cache_root;
+  std::string marker;
+};
+
+size_t CountOccurrences(std::string_view value, std::string_view needle) {
+  size_t count = 0;
+  size_t offset = 0;
+  while ((offset = value.find(needle, offset)) != std::string_view::npos) {
+    ++count;
+    offset += needle.size();
+  }
+  return count;
+}
+
+std::vector<std::string> ExtractAirCacheKeys(std::string_view marker,
+                                             std::string_view stage) {
+  std::vector<std::string> keys;
+  const std::string stage_token = "stage=" + std::string(stage) + " ";
+  size_t line_begin = 0;
+  while (line_begin < marker.size()) {
+    const auto line_end = marker.find('\n', line_begin);
+    const auto line = marker.substr(
+        line_begin, line_end == std::string_view::npos
+                        ? marker.size() - line_begin
+                        : line_end - line_begin);
+    if (line.find(stage_token) != std::string_view::npos) {
+      const auto key_begin = line.find("key=");
+      if (key_begin != std::string_view::npos)
+        keys.emplace_back(line.substr(key_begin + 4));
+    }
+    if (line_end == std::string_view::npos)
+      break;
+    line_begin = line_end + 1;
+  }
+  return keys;
+}
+
+ID3D12PipelineState *CreateBasicGraphicsPipeline(ID3D12Device *device) {
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto *root_signature = CreateRootSignature(device, root_desc);
+  if (!root_signature)
+    return nullptr;
+  auto desc = BasicGraphicsPipelineDesc(root_signature);
+  ID3D12PipelineState *pipeline = nullptr;
+  const auto hr = device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(&pipeline));
+  release_object(root_signature);
+  return SUCCEEDED(hr) ? pipeline : nullptr;
+}
+
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
 struct alignas(void *) ShaderPipelineSubobject {
   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
@@ -104,6 +230,140 @@ TEST(D3D12DeviceCreationSpec, RejectsFeatureLevel93) {
   EXPECT_EQ(device, nullptr);
 
   release_object(device);
+}
+
+TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
+  ScopedArchiveTestEnvironment environment("attached");
+  ID3D12Device *device = nullptr;
+  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(&device))));
+  ASSERT_NE(device, nullptr);
+
+  auto *pipeline = CreateBasicGraphicsPipeline(device);
+  ASSERT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(device);
+
+  const auto marker = environment.ReadMarker();
+  if (marker.find("serialize reason=periodic count=1") == std::string::npos)
+    GTEST_SKIP() << "D3D12 device was reused after archive state was fixed: "
+                 << marker;
+  EXPECT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
+            std::string::npos)
+      << marker;
+}
+
+TEST(D3D12PipelineArchiveSpec, RejectsCorruptArchiveAndFallsBackToCompilation) {
+  ScopedArchiveTestEnvironment environment("corrupt");
+  const auto archive_dir =
+      environment.windows_cache_root + "\\com.apple.metal4";
+  ASSERT_TRUE(CreateDirectoryA(archive_dir.c_str(), nullptr) ||
+              GetLastError() == ERROR_ALREADY_EXISTS);
+  const auto archive_path = archive_dir + "\\dxmt_pso.binaryarchive";
+  {
+    std::ofstream corrupt(archive_path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(corrupt.good());
+    corrupt << "not-a-metal-binary-archive";
+  }
+
+  ID3D12Device *device = nullptr;
+  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(&device))));
+  ASSERT_NE(device, nullptr);
+  auto *pipeline = CreateBasicGraphicsPipeline(device);
+  EXPECT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(device);
+
+  const auto marker = environment.ReadMarker();
+  if (marker.find("create cold=0") == std::string::npos)
+    GTEST_SKIP() << "D3D12 device was reused after archive state was fixed: "
+                 << marker;
+  EXPECT_NE(marker.find("create cold=0 ok=0"), std::string::npos) << marker;
+}
+
+TEST(D3D12PersistentAirCacheSpec, ReusesAirAcrossIrrelevantPsoState) {
+  ScopedAirCacheTestEnvironment environment("irrelevant-state");
+  ID3D12Device *device = nullptr;
+  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(&device))));
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto *root_signature = CreateRootSignature(device, root_desc);
+  ASSERT_NE(root_signature, nullptr);
+
+  auto desc = BasicGraphicsPipelineDesc(root_signature);
+  ID3D12PipelineState *first = nullptr;
+  ASSERT_TRUE(HResultSucceeded(device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(&first))));
+
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+  desc.RasterizerState.DepthBias = 17;
+  ID3D12PipelineState *second = nullptr;
+  ASSERT_TRUE(HResultSucceeded(device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(&second))));
+
+  release_object(second);
+  release_object(first);
+  release_object(root_signature);
+  release_object(device);
+
+  const auto marker = environment.ReadMarker();
+  const auto vertex_keys = ExtractAirCacheKeys(marker, "VS");
+  const auto pixel_keys = ExtractAirCacheKeys(marker, "PS");
+  ASSERT_EQ(vertex_keys.size(), 2u) << marker;
+  ASSERT_EQ(pixel_keys.size(), 2u) << marker;
+  EXPECT_EQ(vertex_keys[0], vertex_keys[1]) << marker;
+  EXPECT_EQ(pixel_keys[0], pixel_keys[1]) << marker;
+  EXPECT_GE(CountOccurrences(marker, "hit stage=VS"), 1u) << marker;
+  EXPECT_GE(CountOccurrences(marker, "hit stage=PS"), 1u) << marker;
+}
+
+TEST(D3D12PersistentAirCacheSpec, SeparatesAirWhenStageArgumentsChange) {
+  ScopedAirCacheTestEnvironment environment("relevant-state");
+  ID3D12Device *device = nullptr;
+  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(&device))));
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto *root_signature = CreateRootSignature(device, root_desc);
+  ASSERT_NE(root_signature, nullptr);
+
+  auto desc = BasicGraphicsPipelineDesc(root_signature);
+  ID3D12PipelineState *first = nullptr;
+  ASSERT_TRUE(HResultSucceeded(device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(&first))));
+
+  desc.SampleMask = 0x55555555u;
+  ID3D12PipelineState *second = nullptr;
+  ASSERT_TRUE(HResultSucceeded(device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(&second))));
+
+  release_object(second);
+  release_object(first);
+  release_object(root_signature);
+  release_object(device);
+
+  const auto marker = environment.ReadMarker();
+  const auto vertex_keys = ExtractAirCacheKeys(marker, "VS");
+  const auto pixel_keys = ExtractAirCacheKeys(marker, "PS");
+  ASSERT_EQ(vertex_keys.size(), 2u) << marker;
+  ASSERT_EQ(pixel_keys.size(), 2u) << marker;
+  EXPECT_EQ(vertex_keys[0], vertex_keys[1]) << marker;
+  EXPECT_NE(pixel_keys[0], pixel_keys[1]) << marker;
+  EXPECT_GE(CountOccurrences(marker, "hit stage=VS"), 1u) << marker;
 }
 
 TEST_F(D3D12DeviceSpec, ReportsAtLeastOneNode) {
@@ -366,6 +626,68 @@ TEST_F(D3D12DeviceSpec, RejectsStreamOutputAtPipelineCreation) {
                 reinterpret_cast<void **>(&pipeline)),
             E_INVALIDARG);
   EXPECT_EQ(pipeline, nullptr);
+  release_object(root_signature);
+}
+
+TEST_F(D3D12DeviceSpec, IgnoresSharedBlendStateForReportedNonBlendableTarget) {
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = UINT_MAX;
+  range.BaseShaderRegister = 1;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[0].DescriptorTable.pDescriptorRanges = &range;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants.ShaderRegister = 0;
+  parameters[1].Constants.Num32BitValues = 1;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
+  ID3D12RootSignature *root_signature =
+      CreateRootSignature(device_, root_desc);
+  ASSERT_NE(root_signature, nullptr);
+
+  DXGI_FORMAT non_blendable_format = DXGI_FORMAT_UNKNOWN;
+  for (const DXGI_FORMAT format : {
+           DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_SINT,
+           DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_SINT,
+           DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT}) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+    support.Format = format;
+    ASSERT_EQ(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                           &support, sizeof(support)),
+              S_OK);
+    if ((support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) &&
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE)) {
+      non_blendable_format = format;
+      break;
+    }
+  }
+  ASSERT_NE(non_blendable_format, DXGI_FORMAT_UNKNOWN);
+
+  auto desc = BasicGraphicsPipelineDesc(root_signature);
+  desc.NumRenderTargets = 2;
+  desc.RTVFormats[1] = non_blendable_format;
+  desc.BlendState.IndependentBlendEnable = FALSE;
+  auto &shared_blend = desc.BlendState.RenderTarget[0];
+  shared_blend.BlendEnable = TRUE;
+  shared_blend.SrcBlend = D3D12_BLEND_ONE;
+  shared_blend.DestBlend = D3D12_BLEND_ZERO;
+  shared_blend.BlendOp = D3D12_BLEND_OP_ADD;
+  shared_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+  shared_blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+  shared_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+
+  ID3D12PipelineState *pipeline = nullptr;
+  EXPECT_EQ(device_->CreateGraphicsPipelineState(
+                &desc, __uuidof(ID3D12PipelineState),
+                reinterpret_cast<void **>(&pipeline)),
+            S_OK);
+  EXPECT_NE(pipeline, nullptr);
+  release_object(pipeline);
   release_object(root_signature);
 }
 

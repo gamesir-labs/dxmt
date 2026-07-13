@@ -25,6 +25,27 @@ DXMT_SLOW_TEST_PATTERN("*D3D12Unreal*");
          << "HRESULT failed: 0x" << std::hex << static_cast<unsigned long>(hr);
 }
 
+HRESULT CreateMsaaRenderTarget(ID3D12Device *device, DXGI_FORMAT format,
+                               UINT sample_count,
+                               ComPtr<ID3D12Resource> *texture) {
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 64;
+  desc.Height = 64;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = sample_count;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  return device->CreateCommittedResource(
+      &heap, D3D12_HEAP_FLAG_NONE, &desc,
+      D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, __uuidof(ID3D12Resource),
+      reinterpret_cast<void **>(texture->put()));
+}
+
 D3D_FEATURE_LEVEL ResolveFeatureLevel(HRESULT query_result,
                                       D3D_FEATURE_LEVEL reported,
                                       D3D_FEATURE_LEVEL minimum) {
@@ -220,9 +241,6 @@ struct FormatExpectation {
 class D3D12UnrealFormatSpec
     : public D3D12UnrealCapabilitySpec,
       public ::testing::WithParamInterface<FormatExpectation> {};
-
-class D3D12UnrealMsaaSpec : public D3D12UnrealCapabilitySpec,
-                            public ::testing::WithParamInterface<UINT> {};
 
 class D3D12UnrealQueueSpec
     : public D3D12UnrealCapabilitySpec,
@@ -671,43 +689,52 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(info.param.name);
     });
 
-TEST_P(D3D12UnrealMsaaSpec, CreatesEveryReportedRenderTargetConfiguration) {
-  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
-  levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  levels.SampleCount = GetParam();
-  ASSERT_TRUE(HResultSucceeded(device_->CheckFeatureSupport(
-      D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels))));
+TEST_F(D3D12UnrealCapabilitySpec,
+       CreatesEveryReportedRenderTargetConfiguration) {
+  for (const UINT sample_count : {1u, 2u, 4u, 8u}) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    levels.SampleCount = sample_count;
+    ASSERT_TRUE(HResultSucceeded(device_->CheckFeatureSupport(
+        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels))))
+        << sample_count << "x MSAA query failed";
+    if (sample_count == 1) {
+      ASSERT_GT(levels.NumQualityLevels, 0u);
+    }
+    if (levels.NumQualityLevels == 0)
+      continue;
 
-  if (levels.SampleCount == 1) {
-    ASSERT_GT(levels.NumQualityLevels, 0u);
+    ComPtr<ID3D12Resource> texture;
+    EXPECT_TRUE(HResultSucceeded(CreateMsaaRenderTarget(
+        device_.get(), levels.Format, sample_count, &texture)))
+        << sample_count << "x MSAA was reported but could not be created";
   }
-  if (levels.NumQualityLevels == 0)
-    GTEST_SKIP() << levels.SampleCount
-                 << "x MSAA is not supported by this device";
-
-  D3D12_HEAP_PROPERTIES heap = {};
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC desc = {};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = 64;
-  desc.Height = 64;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
-  desc.Format = levels.Format;
-  desc.SampleDesc.Count = levels.SampleCount;
-  desc.SampleDesc.Quality = 0;
-  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-  ComPtr<ID3D12Resource> texture;
-  EXPECT_TRUE(HResultSucceeded(device_->CreateCommittedResource(
-      &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
-      nullptr, __uuidof(ID3D12Resource),
-      reinterpret_cast<void **>(texture.put()))));
 }
 
-INSTANTIATE_TEST_SUITE_P(UnrealFallbackOrder, D3D12UnrealMsaaSpec,
-                         ::testing::Values(1u, 2u, 4u));
+TEST_F(D3D12UnrealCapabilitySpec,
+       RejectsEveryUnreportedRenderTargetConfiguration) {
+  bool found_unsupported = false;
+  for (const UINT sample_count : {2u, 4u, 8u, 16u}) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    levels.SampleCount = sample_count;
+    ASSERT_TRUE(HResultSucceeded(device_->CheckFeatureSupport(
+        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels))))
+        << sample_count << "x MSAA query failed";
+    if (levels.NumQualityLevels != 0)
+      continue;
+    found_unsupported = true;
+
+    ComPtr<ID3D12Resource> texture;
+    const HRESULT hr = CreateMsaaRenderTarget(
+        device_.get(), levels.Format, sample_count, &texture);
+    EXPECT_TRUE(FAILED(hr))
+        << sample_count << "x MSAA was unreported but creation succeeded";
+    EXPECT_FALSE(texture) << sample_count
+                          << "x MSAA returned a resource after rejection";
+  }
+  EXPECT_TRUE(found_unsupported);
+}
 
 TEST_F(D3D12UnrealCapabilitySpec, ReportsEveryUnrealMsaaFallbackCandidate) {
   for (const UINT sample_count : {1u, 2u, 4u, 8u}) {

@@ -56,6 +56,15 @@ TEST(FenceSet, EnumeratesCurrentAndPriorEntriesDeterministically) {
   EXPECT_EQ(current_ids, (std::vector<dxmt::EncoderId>{3}));
 }
 
+TEST(FenceSet, RetainsOnlyLatestGenerationForEachMetalFenceSlot) {
+  dxmt::FenceSet fences;
+  EXPECT_TRUE(fences.set(256));
+  EXPECT_FALSE(fences.set(512));
+  EXPECT_EQ(fences.count(), 1u);
+  EXPECT_FALSE(fences.test(256));
+  EXPECT_TRUE(fences.test(512));
+}
+
 TEST(TrackingSet, RetainsOnlyTheRecentEncoderWindow) {
   dxmt::TrackingSet<4> tracking;
   EXPECT_TRUE(tracking.add(65));
@@ -118,24 +127,81 @@ TEST(GenericAccessTracker, DistinguishesPreRasterAndFragmentBarriers) {
   EXPECT_EQ(barriers.barrierSet, 0u);
 }
 
+TEST(GenericAccessTracker, RetainsDistantWriterAndAllActiveReaders) {
+  dxmt::GenericAccessTracker writer_tracker;
+  dxmt::FenceSet waits;
+  dxmt::EncoderBarrierState barriers;
+  writer_tracker.accessExclusive(256, waits, barriers, false);
+  waits = {};
+  writer_tracker.accessShared(400, waits, barriers);
+  EXPECT_EQ(waits.count(), 1u);
+  EXPECT_TRUE(waits.test(256));
+
+  dxmt::GenericAccessTracker reader_tracker;
+  for (dxmt::EncoderId id = 256; id < 356; id++)
+    reader_tracker.accessShared(id, waits, barriers);
+  waits = {};
+  reader_tracker.accessExclusive(356, waits, barriers, false);
+  EXPECT_EQ(waits.count(), 100u);
+  for (dxmt::EncoderId id = 256; id < 356; id++)
+    EXPECT_TRUE(waits.test(id));
+}
+
+TEST(GenericAccessTracker, KeepsOneProducerForMultipleReadersWithoutReadEdges) {
+  dxmt::GenericAccessTracker tracker;
+  dxmt::FenceSet waits;
+  dxmt::EncoderBarrierState barriers;
+  tracker.accessExclusive(256, waits, barriers, false);
+
+  waits = {};
+  tracker.accessShared(257, waits, barriers);
+  EXPECT_EQ(waits.count(), 1u);
+  EXPECT_TRUE(waits.test(256));
+
+  waits = {};
+  tracker.accessShared(258, waits, barriers);
+  EXPECT_EQ(waits.count(), 1u);
+  EXPECT_TRUE(waits.test(256));
+  EXPECT_FALSE(waits.test(257));
+}
+
 TEST(FenceLocalityCheck, RemovesTransitiveAndImplicitWaits) {
   dxmt::FenceLocalityCheck locality;
 
   auto waits = locality.collectAndSimplifyWaits(dxmt::FenceSet(256), 257);
-  EXPECT_EQ(waits.count(), dxmt::kLane);
+  EXPECT_EQ(waits.count(), 1u);
   EXPECT_TRUE(waits.test(256));
 
   dxmt::FenceSet chained;
   chained.set(256);
   chained.set(257);
   waits = locality.collectAndSimplifyWaits(chained, 258);
-  EXPECT_EQ(waits.count(), 2u);
+  EXPECT_EQ(waits.count(), 1u);
   EXPECT_TRUE(waits.test(257));
   EXPECT_FALSE(waits.test(256));
 
   waits = locality.collectAndSimplifyWaits({}, 259, true);
-  EXPECT_EQ(waits.count(), 2u);
+  EXPECT_EQ(waits.count(), 0u);
   EXPECT_FALSE(waits.test(258));
+}
+
+TEST(FenceLocalityCheck, PreservesStrongDependenciesOutsideSummaryWindow) {
+  dxmt::GenericAccessTracker tracker;
+  dxmt::FenceSet strong_waits;
+  dxmt::EncoderBarrierState barriers;
+  tracker.accessExclusive(256, strong_waits, barriers, false);
+  strong_waits = {};
+  tracker.accessShared(600, strong_waits, barriers);
+  ASSERT_TRUE(strong_waits.test(256));
+
+  dxmt::FenceLocalityCheck locality;
+
+  for (dxmt::EncoderId id = 256; id < 600; id++)
+    locality.collectAndSimplifyWaits({}, id);
+
+  auto waits = locality.collectAndSimplifyWaits(strong_waits, 600);
+  EXPECT_EQ(waits.count(), 1u);
+  EXPECT_TRUE(waits.test(256));
 }
 
 } // namespace

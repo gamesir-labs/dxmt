@@ -24,6 +24,8 @@
 #include "llvm/Transforms/IPO/InferFunctionAttrs.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 
+#include <mutex>
+
 #include "airconv_context.hpp"
 
 #include "air_msad.h"
@@ -62,18 +64,18 @@ void initializeModule(llvm::Module &M) {
 
 };
 
-static std::atomic_flag llvm_overwrite = false;
+static std::once_flag llvm_options_once;
 
 void
 runOptimizationPasses(llvm::Module &M) {
 
-  if (!llvm_overwrite.test_and_set()) {
+  std::call_once(llvm_options_once, [] {
     auto Map = cl::getRegisteredOptions();
     auto InfiniteLoopThreshold = Map["instcombine-infinite-loop-threshold"];
     if (InfiniteLoopThreshold) {
       reinterpret_cast<cl::opt<unsigned> *>(InfiniteLoopThreshold)->setValue(1000);
     }
-  }
+  });
 
   // Following optimization passes are picked from default LLVM pipelines
   // An unoptimized shader can make PSO compilation take a very long time

@@ -5553,6 +5553,7 @@ private:
   };
 
   struct ResourceAccessBarrierEntry {
+    Com<ID3D12Resource> d3d_resource;
     Rc<Buffer> buffer;
     Rc<Texture> texture;
     UINT64 buffer_length = 0;
@@ -5563,12 +5564,14 @@ private:
 
   struct ResourceAccessBarrierKey {
     uintptr_t object = 0;
+    uintptr_t d3d_resource = 0;
     UINT level = 0;
     UINT slice = 0;
     bool texture = false;
 
     bool operator==(const ResourceAccessBarrierKey &other) const {
-      return object == other.object && level == other.level &&
+      return object == other.object && d3d_resource == other.d3d_resource &&
+             level == other.level &&
              slice == other.slice && texture == other.texture;
     }
   };
@@ -5576,6 +5579,8 @@ private:
   struct ResourceAccessBarrierKeyHash {
     size_t operator()(const ResourceAccessBarrierKey &key) const {
       size_t hash = std::hash<uintptr_t>{}(key.object);
+      hash ^= (std::hash<uintptr_t>{}(key.d3d_resource) +
+               0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
       hash ^= (size_t(key.level) + 0x9e3779b97f4a7c15ull + (hash << 6) +
                (hash >> 2));
       hash ^= (size_t(key.slice) + 0x9e3779b97f4a7c15ull + (hash << 6) +
@@ -5599,6 +5604,8 @@ private:
   static ResourceAccessBarrierKey
   MakeResourceAccessBarrierKey(const ResourceAccessBarrierEntry &entry) {
     ResourceAccessBarrierKey key = {};
+    key.d3d_resource =
+        reinterpret_cast<uintptr_t>(entry.d3d_resource.ptr());
     if (entry.buffer) {
       key.object = reinterpret_cast<uintptr_t>(entry.buffer.ptr());
     } else {
@@ -5614,8 +5621,10 @@ private:
   ResourceAccessBarrierEntriesMatch(const ResourceAccessBarrierEntry &lhs,
                                     const ResourceAccessBarrierEntry &rhs) {
     if (lhs.buffer || rhs.buffer)
-      return lhs.buffer.ptr() == rhs.buffer.ptr();
-    return lhs.texture.ptr() == rhs.texture.ptr() && lhs.level == rhs.level &&
+      return lhs.d3d_resource.ptr() == rhs.d3d_resource.ptr() &&
+             lhs.buffer.ptr() == rhs.buffer.ptr();
+    return lhs.d3d_resource.ptr() == rhs.d3d_resource.ptr() &&
+           lhs.texture.ptr() == rhs.texture.ptr() && lhs.level == rhs.level &&
            lhs.slice == rhs.slice;
   }
 
@@ -6059,11 +6068,6 @@ private:
     return !state.blit_batch.commands.empty();
   }
 
-  static bool HasPendingResourceBarrierBatch(const ReplayState &state) {
-    return !state.pending_resource_barriers.entries.empty() ||
-           state.pending_resource_barriers.needs_separator;
-  }
-
   static bool
   ReplayGraphicsCommandCanParallelEncode(ReplayGraphicsCommandKind kind,
                                          bool use_geometry,
@@ -6157,18 +6161,6 @@ private:
       std::vector<ResourceAccessBarrierEntry> &entries) {
     EncodeRenderResourceAccessBarrierEntries(enc, entries);
     enc.resolveRenderPassBarrier();
-  }
-
-  static void EncodeStandaloneResourceBarrierEntries(
-      ArgumentEncodingContext &enc,
-      std::vector<ResourceAccessBarrierEntry> &entries) {
-    if (entries.empty())
-      return;
-
-    enc.currentFrameStatistics().blit_barrier_only_pass_count++;
-    enc.startBlitPass();
-    EncodeResourceAccessBarrierEntries(enc, entries);
-    enc.endPass();
   }
 
   static void RecordSeparatorOnlyBarrier(const ResourceAccessBarrierBatch &batch) {
@@ -6269,7 +6261,6 @@ private:
         use_tessellation = use_tessellation || command.use_tessellation;
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
                            use_geometry, use_tessellation)) {
-        EncodeStandaloneResourceBarrierEntries(enc, barrier_entries);
         return;
       }
       EncodeRenderResourceAccessBarrierEntries(enc, barrier_entries);
@@ -6335,6 +6326,26 @@ private:
     }
   }
 
+  static ResourceAccessBarrierBatch TakeMatchingPendingResourceBarriers(
+      ReplayState &state,
+      const std::unordered_set<ID3D12Resource *> &reads,
+      const std::unordered_set<ID3D12Resource *> &writes) {
+    ResourceAccessBarrierBatch matched;
+    ResourceAccessBarrierBatch remaining;
+    for (auto &entry : state.pending_resource_barriers.entries) {
+      auto *resource = entry.d3d_resource.ptr();
+      if (resource && (reads.count(resource) || writes.count(resource)))
+        matched.entries.push_back(std::move(entry));
+      else
+        remaining.entries.push_back(std::move(entry));
+    }
+    matched.needs_separator = state.pending_resource_barriers.needs_separator;
+    RebuildResourceAccessBarrierIndex(matched);
+    RebuildResourceAccessBarrierIndex(remaining);
+    state.pending_resource_barriers = std::move(remaining);
+    return matched;
+  }
+
   void FlushBlitBatch(CommandChunk *chunk, ReplayState &state) {
     auto &batch = state.blit_batch;
     if (!HasPendingBlitBatch(state))
@@ -6344,7 +6355,8 @@ private:
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().flushBlitUs};
 
-    auto barriers = TakePendingResourceBarrierBatch(state);
+    auto barriers = TakeMatchingPendingResourceBarriers(
+        state, batch.reads, batch.writes);
     RecordSeparatorOnlyBarrier(barriers);
 
     chunk->emitcc([commands = std::move(batch.commands),
@@ -6363,42 +6375,20 @@ private:
     batch = {};
   }
 
-  void FlushResourceBarrierBatch(CommandChunk *chunk, ReplayState &state) {
-    if (!HasPendingResourceBarrierBatch(state))
-      return;
-    const bool _rb = ReplayPerfEnabled();
-    if (_rb) perDrawSubTimers().flushBarrierCalls++;
-    ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
-                      &perDrawSubTimers().flushBarrierUs};
-
-    auto batch = TakePendingResourceBarrierBatch(state);
-    RecordSeparatorOnlyBarrier(batch);
-    if (batch.entries.empty())
-      return;
-
-    chunk->emitcc([entries = std::move(batch.entries)](ArgumentEncodingContext &enc) mutable {
-      EncodeStandaloneResourceBarrierEntries(enc, entries);
-    });
-  }
-
   void FlushReplayRenderComputeTimestampBatches(CommandChunk *chunk,
-                                                ReplayState &state,
-                                                bool force_resource_barriers = true) {
+                                                ReplayState &state) {
     FlushComputePassBatch(chunk, state);
     FlushGraphicsPassBatch(chunk, state);
-    if (force_resource_barriers)
-      FlushResourceBarrierBatch(chunk, state);
     EmitTimestampMarkers(chunk, state);
   }
 
   void FlushReplayWorkBeforeResourceBarrier(CommandChunk *chunk,
                                             ReplayState &state) {
     if (HasPendingReplayWork(state))
-      FlushPassBatches(chunk, state, false);
+      FlushPassBatches(chunk, state);
   }
 
-  void FlushPassBatches(CommandChunk *chunk, ReplayState &state,
-                        bool force_resource_barriers = true) {
+  void FlushPassBatches(CommandChunk *chunk, ReplayState &state) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().emitUs);
     const bool has_encoder_work =
         HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
@@ -6408,17 +6398,13 @@ private:
       if (!has_encoder_work)
         perDrawSubTimers().flushPassBatchesEmpty++;
     }
-    const bool force_before_timestamps =
-        !has_encoder_work && !state.pending_timestamp_markers.empty();
     FlushBlitBatch(chunk, state);
-    FlushReplayRenderComputeTimestampBatches(chunk, state,
-                                             force_resource_barriers ||
-                                             force_before_timestamps);
+    FlushReplayRenderComputeTimestampBatches(chunk, state);
   }
 
   void FlushGraphicsBeforeCompute(CommandChunk *chunk, ReplayState &state) {
     if (HasPendingGraphicsPass(state) || HasPendingBlitBatch(state))
-      FlushPassBatches(chunk, state, false);
+      FlushPassBatches(chunk, state);
   }
 
   bool ReplayBlitBatchHasHazard(const ReplayBlitBatch &batch,
@@ -6458,7 +6444,7 @@ private:
     if (HasPendingComputePass(state) || HasPendingGraphicsPass(state) ||
         !state.pending_timestamp_markers.empty())
       FlushReplayRenderComputeTimestampBatches(
-          chunk, state, !state.pending_timestamp_markers.empty());
+          chunk, state);
     if (ReplayBlitBatchHasHazard(state.blit_batch, reads, writes))
       FlushBlitBatch(chunk, state);
 
@@ -7701,10 +7687,13 @@ private:
   void ReplayCommandRecords(const std::vector<CommandRecord> &records,
                             const CompiledCommandList *compiled,
                             std::vector<Com<ID3D12Resource>> &touched_resources,
-                            std::unordered_set<ID3D12Resource *> &touched_resources_set) {
+                            std::unordered_set<ID3D12Resource *> &touched_resources_set,
+                            ResourceAccessBarrierBatch &queue_pending_barriers) {
     auto &queue = device_->GetDXMTDevice().queue();
     auto *chunk = queue.CurrentChunk();
     ReplayState state = {};
+    state.pending_resource_barriers =
+        std::move(queue_pending_barriers);
     state.resource_states = &resource_states_->resources;
     state.queue_type = desc_.Type;
     state.touched_resources = &touched_resources;
@@ -8367,6 +8356,7 @@ private:
     MaterializeTimestampResolves(chunk, state);
     const auto rb_t3 = replay_perf ? clock::now() : clock::time_point{};
     MaterializeCpuQueryResolves(chunk, state);
+    queue_pending_barriers = TakePendingResourceBarrierBatch(state);
     if (replay_perf) {
       const auto rb_t4 = clock::now();
       auto *stats = dxmt::perf::currentFrameStatistics();
@@ -9888,7 +9878,8 @@ private:
     if (resource.GetBuffer()) {
       Rc<Buffer> buffer = resource.GetBuffer();
       const UINT64 length = resource.GetResourceDesc().Width;
-      add_or_merge_entry({std::move(buffer), {}, length, 0, 0, access});
+      add_or_merge_entry({Com<ID3D12Resource>(resource.GetD3D12Resource()),
+                          std::move(buffer), {}, length, 0, 0, access});
       return;
     }
 
@@ -9904,7 +9895,8 @@ private:
           continue;
         const UINT level = GetMipLevel(resource, subresource);
         const UINT slice = GetArraySlice(resource, subresource);
-        add_or_merge_entry({{}, std::move(texture), 0, level, slice, access});
+        add_or_merge_entry({Com<ID3D12Resource>(resource.GetD3D12Resource()),
+                            {}, std::move(texture), 0, level, slice, access});
         added = true;
       }
       if (subresource_count && !added)
@@ -9957,40 +9949,15 @@ private:
 
   void QueueResourceAccessBarrierBatch(ReplayState &state,
                                        ResourceAccessBarrierBatch batch) {
-    if (batch.entries.empty()) {
-      if (batch.needs_separator)
-        EmitPassSeparator(nullptr);
+    if (batch.entries.empty() && !batch.needs_separator)
       return;
-    }
 
     auto &pending = state.pending_resource_barriers;
-	    if (!pending.entries.empty()) {
-	      if (auto *stats = dxmt::perf::currentFrameStatistics())
-	        stats->resource_barrier_batches_merged++;
-	    }
-	    MergeResourceAccessBarrierBatch(pending, std::move(batch));
-  }
-
-  void EmitResourceAccessBarrierBatch(CommandChunk *chunk,
-                                      ResourceAccessBarrierBatch batch) {
-    if (batch.entries.empty()) {
-      if (batch.needs_separator)
-        EmitPassSeparator(chunk);
-      return;
+    if (!pending.entries.empty() || pending.needs_separator) {
+      if (auto *stats = dxmt::perf::currentFrameStatistics())
+        stats->resource_barrier_batches_merged++;
     }
-
-    chunk->emitcc([entries = std::move(batch.entries)](ArgumentEncodingContext &enc) mutable {
-      enc.currentFrameStatistics().blit_barrier_only_pass_count++;
-      enc.startBlitPass();
-      for (auto &entry : entries) {
-        if (entry.buffer) {
-          enc.access(entry.buffer, 0, entry.buffer_length, entry.access);
-        } else if (entry.texture) {
-          enc.access(entry.texture, entry.level, entry.slice, entry.access);
-        }
-      }
-      enc.endPass();
-    });
+    MergeResourceAccessBarrierBatch(pending, std::move(batch));
   }
 
   void EmitPassSeparator(CommandChunk *) {
@@ -21080,6 +21047,8 @@ private:
             clock::now() - lock_begin);
         std::vector<Com<ID3D12Resource>> touched_resources;
         std::unordered_set<ID3D12Resource *> touched_resources_set;
+        ResourceAccessBarrierBatch queue_pending_barriers =
+            std::move(pending_queue_resource_barriers_);
         UINT command_list_index = 0;
         for (const auto &records : operation.command_records) {
           const CompiledCommandList *compiled =
@@ -21100,7 +21069,8 @@ private:
           }
           const auto replay_begin = clock::now();
           ReplayCommandRecords(records, compiled, touched_resources,
-                               touched_resources_set);
+                               touched_resources_set,
+                               queue_pending_barriers);
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Replay,
               clock::now() - replay_begin);
@@ -21115,6 +21085,8 @@ private:
           }
           command_list_index++;
         }
+        pending_queue_resource_barriers_ =
+            std::move(queue_pending_barriers);
         {
           static std::atomic<uint32_t> replay_batch_log_count = 0;
           if (D3D12DiagShouldLog(replay_batch_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
@@ -21421,6 +21393,10 @@ private:
   uint64_t current_timestamp_sample_count_ = 0;
   std::vector<CachedTemporalScaler> temporal_scaler_cache_;
   std::shared_ptr<CommandQueueResourceStates> resource_states_;
+  // D3D12 barriers are queue-local ordering tokens. Keep trailing barriers
+  // across ExecuteCommandLists calls and consume them only when this queue
+  // encodes a real render, compute, or blit pass.
+  ResourceAccessBarrierBatch pending_queue_resource_barriers_;
   // P1 binding-plan cache (Option A): keyed by (root_sig*,pso*) mixed hash,
   // re-checked on hit; CLEARED once per Execute batch (intra-batch all PSOs/
   // root-sigs are pinned alive by the command records, so no ABA within batch).

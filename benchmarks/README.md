@@ -13,6 +13,8 @@ benchmarks/
   support/benchmark_acceptance.py  Integration and performance validation
   wine/meson.build                 Wine benchmark manifest
   wine/*_benchmark.cpp             Wine D3D workloads
+  wine/d3d12_pipeline_creation_benchmark.cpp
+                                   Parallel cold PSO creation burst
   wine/ue_*_initialization.cpp     UE-like RHI initialization workload
 ```
 
@@ -33,6 +35,17 @@ GPU output by readback, waits for idle, and tears down in reverse order. This
 keeps D3D11's Metal 3 and D3D12's Metal 4 backends out of the same PE while
 still presenting one serial integration result. The D3D12 probe makes the same
 combined SM6/SM5 decision as UE before the formal device bootstrap continues.
+
+The `d3d12-pipeline-creation` integration suite models an engine loading-screen
+PSO burst. It synchronizes one or four application worker threads before they
+create 96 unique graphics pipelines, mixes regular and tessellation pipelines,
+and includes adversarial sample-count requests when the device reports an
+unsupported count. The process disables the DXMT shader cache before creating
+the D3D12 device so the result exposes cold creation-boundary serialization.
+HLSL compilation is outside the measured interval. Result counters report
+mean, p50, p95, maximum CreatePSO latency, and summed-call-time to wall-time
+ratio; the Google Benchmark entry itself remains serial so Wine benchmark
+suite isolation is preserved.
 
 `performance` performs repeated serial measurements and validates the median
 against a reviewed JSON budget. Every result must be single-threaded, and

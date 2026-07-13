@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 
 #define ASYNC_ENCODING 1
 
@@ -86,13 +87,68 @@ void
 CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   enc.$$setEncodingContext(chunk_id, frame_);
   auto &statistics = enc.currentFrameStatistics();
+  CommandBufferDiagnosticInfo diagnostic = {};
+  diagnostic.frame_id = frame_;
+  diagnostic.chunk_id = chunk_id;
+  diagnostic.resource_initializer_event_id = resource_initializer_event_id;
+  const auto barrier_only_before = statistics.blit_barrier_only_pass_count;
 
   auto t0 = clock::now();
   list_enc.execute(enc);
   attached_cmdbuf = cmdbuf;
   auto t1 = clock::now();
-  readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
+  readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id, &diagnostic);
   auto t2 = clock::now();
+
+  diagnostic.barrier_only_pass_count =
+      statistics.blit_barrier_only_pass_count - barrier_only_before;
+  const auto barrier_marker =
+      env::getEnvVar("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER");
+  if (!barrier_marker.empty()) {
+    if (FILE *marker = fopen(barrier_marker.c_str(), "a")) {
+      fprintf(marker, "barrierOnly=%u\n",
+              diagnostic.barrier_only_pass_count);
+      fclose(marker);
+    }
+  }
+  const auto diagnostic_marker =
+      env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");
+  if (!diagnostic_marker.empty()) {
+    if (FILE *marker = fopen(diagnostic_marker.c_str(), "a")) {
+      fprintf(marker, "%u %u %u %u %u %u\n",
+              diagnostic.input_encoder_count,
+              diagnostic.encoded_encoder_count,
+              diagnostic.blit_encoder_count,
+              diagnostic.barrier_only_pass_count,
+              diagnostic.fence_wait_count,
+              diagnostic.fence_update_count);
+      fclose(marker);
+    }
+  }
+  const uint64_t d3d_sequence = dxmt::apitrace::d3d_enabled()
+                                    ? dxmt::apitrace::current_d3d_sequence()
+                                    : chunk_id;
+  diagnostic.d3d_sequence_begin = d3d_sequence;
+  diagnostic.d3d_sequence_end = d3d_sequence;
+#if DXMT_DX12_METAL4
+  WMTCommandBufferDiagnosticInfo wmt_diagnostic = {};
+  wmt_diagnostic.frame_id = diagnostic.frame_id;
+  wmt_diagnostic.chunk_id = diagnostic.chunk_id;
+  wmt_diagnostic.d3d_sequence_begin = diagnostic.d3d_sequence_begin;
+  wmt_diagnostic.d3d_sequence_end = diagnostic.d3d_sequence_end;
+  wmt_diagnostic.resource_initializer_event_id =
+      diagnostic.resource_initializer_event_id;
+  wmt_diagnostic.input_encoder_count = diagnostic.input_encoder_count;
+  wmt_diagnostic.encoded_encoder_count = diagnostic.encoded_encoder_count;
+  wmt_diagnostic.render_encoder_count = diagnostic.render_encoder_count;
+  wmt_diagnostic.compute_encoder_count = diagnostic.compute_encoder_count;
+  wmt_diagnostic.blit_encoder_count = diagnostic.blit_encoder_count;
+  wmt_diagnostic.other_encoder_count = diagnostic.other_encoder_count;
+  wmt_diagnostic.barrier_only_pass_count = diagnostic.barrier_only_pass_count;
+  wmt_diagnostic.fence_wait_count = diagnostic.fence_wait_count;
+  wmt_diagnostic.fence_update_count = diagnostic.fence_update_count;
+  cmdbuf.setDiagnosticInfo(wmt_diagnostic);
+#endif
 
   auto execute_elapsed = t1 - t0;
   auto flush_elapsed = t2 - t1;
@@ -905,7 +961,16 @@ CommandQueue::WaitForFinishThread() {
     }
     chunk.finish_complete_time = clock::now();
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
+      device_error_.store(true, std::memory_order_release);
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
+      const auto error_marker =
+          env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_ERROR_MARKER");
+      if (!error_marker.empty()) {
+        if (FILE *marker = fopen(error_marker.c_str(), "a")) {
+          fputs("error\n", marker);
+          fclose(marker);
+        }
+      }
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {
       for (auto &log : logs.elements()) {

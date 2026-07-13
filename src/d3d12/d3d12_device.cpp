@@ -79,6 +79,10 @@ Align(UINT64 value, UINT64 alignment) {
 
 static void
 LogPSOBinaryArchiveMarker(const char *format, ...) {
+  auto marker_path = env::getEnvVar("DXMT_PSO_ARCHIVE_MARKER");
+  if (marker_path.empty() && !D3D12DeviceDiagEnabled())
+    return;
+
   char message[1024];
 
   va_list args;
@@ -86,9 +90,8 @@ LogPSOBinaryArchiveMarker(const char *format, ...) {
   vsnprintf(message, sizeof(message), format, args);
   va_end(args);
 
-  fprintf(stderr, "%s\n", message);
-
-  auto marker_path = env::getEnvVar("DXMT_PSO_ARCHIVE_MARKER");
+  if (D3D12DeviceDiagEnabled())
+    fprintf(stderr, "%s\n", message);
   if (marker_path.empty())
     return;
 
@@ -2325,8 +2328,10 @@ class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device,
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
       : adapter_(adapter), device_(std::move(device)) {
+    const auto archive_setting = env::getEnvVar("DXMT_PSO_BINARY_ARCHIVE");
     pso_binary_archive_enabled_ =
-        env::getEnvVar("DXMT_PSO_BINARY_ARCHIVE") == "1";
+        env::getEnvVar("DXMT_SHADER_CACHE") != "0" &&
+        archive_setting != "0";
     if (pso_binary_archive_enabled_) {
       pso_binary_archive_serialize_every_ =
           GetPSOBinaryArchiveSerializeEvery();
@@ -2928,6 +2933,7 @@ public:
 
       const auto caps = GetD3D12FormatCapability(device_->device(), format);
       if (IsSupportedD3D12SampleCount(data->SampleCount) &&
+          device_->device().supportsTextureSampleCount(data->SampleCount) &&
           (data->SampleCount == 1 || HasFormatCapability(caps, FormatCapability::MSAA)))
         data->NumQualityLevels = 1;
       return S_OK;
@@ -4196,7 +4202,7 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
-    return S_OK;
+    return device_->queue().HasDeviceError() ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
   }
 
   void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC *desc,
@@ -4904,6 +4910,14 @@ private:
     fclose(marker);
   }
 
+  bool IsResourceDescSupportedByDevice(
+      const D3D12_RESOURCE_DESC &desc) const {
+    if (!d3d12::IsSupportedResourceDesc(desc))
+      return false;
+    return desc.SampleDesc.Count == 1 ||
+           device_->device().supportsTextureSampleCount(desc.SampleDesc.Count);
+  }
+
   bool GetResourceSizeAndAlignment(const D3D12_RESOURCE_DESC &desc,
                                    UINT64 &size,
                                    UINT64 &alignment) const {
@@ -4920,7 +4934,7 @@ private:
     }
 
     WMTSizeAndAlign metal_size_and_align = {};
-    if (!d3d12::IsSupportedResourceDesc(desc) ||
+    if (!IsResourceDescSupportedByDevice(desc) ||
         !d3d12::GetTextureHeapSizeAndAlign(
             device_->device(), desc, metal_size_and_align))
       return false;
@@ -5258,7 +5272,7 @@ private:
       D3D12_RESOURCE_STATES initial_state) const {
     if (!IsValidHeapProperties(heap_properties) || !desc)
       return false;
-    if (!d3d12::IsSupportedResourceDesc(*desc))
+    if (!IsResourceDescSupportedByDevice(*desc))
       return false;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
@@ -5296,7 +5310,7 @@ private:
                                    D3D12_RESOURCE_STATES initial_state) const {
     if (!desc)
       return false;
-    if (!d3d12::IsSupportedResourceDesc(*desc))
+    if (!IsResourceDescSupportedByDevice(*desc))
       return false;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
@@ -5340,7 +5354,7 @@ private:
       D3D12_RESOURCE_STATES initial_state) const {
     if (!desc)
       return "null-desc";
-    if (!d3d12::IsSupportedResourceDesc(*desc))
+    if (!IsResourceDescSupportedByDevice(*desc))
       return "unsupported-desc";
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
@@ -5431,7 +5445,7 @@ private:
       return;
     }
 
-    if (!(strict_resource_desc ? d3d12::IsSupportedResourceDesc(*desc)
+    if (!(strict_resource_desc ? IsResourceDescSupportedByDevice(*desc)
                                : IsValidCopyableFootprintDesc(*desc))) {
       set_invalid();
       return;

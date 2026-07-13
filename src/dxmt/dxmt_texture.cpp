@@ -192,17 +192,18 @@ Texture::prepareAllocationViews(TextureAllocation *allocation) {
     allocation->version_ = 1;
   }
   std::shared_lock<dxmt::shared_mutex> lock(mutex_);
-  for (unsigned version = allocation->version_; version < version_; version++) {
+  const auto descriptor_count = viewDescriptors_.size();
+  for (unsigned version = allocation->version_; version < descriptor_count; version++) {
     allocation->cached_view_.push_back(new TextureView(allocation, version, viewDescriptors_[version]));
   }
-  allocation->version_ = version_;
+  allocation->version_ = descriptor_count;
 }
 
 TextureViewKey
 Texture::createView(TextureViewDescriptor const &descriptor) {
   std::unique_lock<dxmt::shared_mutex> lock(mutex_);
   unsigned i = 0;
-  for (; i < version_; i++) {
+  for (; i < viewDescriptors_.size(); i++) {
     if (viewDescriptors_[i].format != descriptor.format)
       continue;
     if (viewDescriptors_[i].type != descriptor.type)
@@ -228,7 +229,6 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
     return TextureViewKey(descriptor, i, info_.mipmap_level_count);
   }
   viewDescriptors_.push_back(descriptor);
-  version_ = version_ + 1;
   return TextureViewKey(descriptor, i, info_.mipmap_level_count);
 }
 
@@ -244,7 +244,6 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
       .firstArraySlice = 0,
       .arraySize = arrayLength(),
   });
-  version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
 
@@ -269,7 +268,6 @@ Texture::Texture(
       .firstArraySlice = 0,
       .arraySize = 1,
   });
-  version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
 
@@ -378,16 +376,23 @@ Texture::view(TextureViewKey key) {
 
 TextureView &
 Texture::view(TextureViewKey key, TextureAllocation* allocation) {
-  if (unlikely(allocation->version_ != version_)) {
+  // View descriptors are appended by the replay thread while cached Metal
+  // views are materialized by the asynchronous encode thread. Comparing an
+  // allocation-local version against the descriptor count without the mutex
+  // races with createView() and can falsely treat a shorter cache as current.
+  // The requested key is the actual synchronization boundary: only materialize
+  // when that concrete index is not cached yet.
+  if (unlikely(key.index >= allocation->cached_view_.size())) {
     prepareAllocationViews(allocation);
   }
+  assert(key.index < allocation->cached_view_.size());
   return *allocation->cached_view_[key.index];
 }
 
 uint64_t
 Texture::setViewPoolSlot(WMT::TextureViewPool pool, TextureViewKey key,
                          TextureAllocation *allocation, uint32_t slot) {
-  if (!pool || !allocation || key.index >= version_)
+  if (!pool || !allocation)
     return 0;
 
   auto parent = allocation->texture();

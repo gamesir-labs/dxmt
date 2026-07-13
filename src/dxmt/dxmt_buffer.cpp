@@ -116,7 +116,7 @@ Buffer::view_(BufferViewKey key, BufferAllocation *allocation) {
     return *view;
 
   WARN("DXMT: invalid buffer texture view requested view=", key,
-       " version=", version_,
+       " cached_views=", allocation ? allocation->cached_view_.size() : 0,
        " allocation=", reinterpret_cast<const void *>(allocation),
        " length=", length_);
   static BufferView null_view({}, 0, 0);
@@ -127,7 +127,7 @@ BufferView *
 Buffer::tryView(BufferViewKey key, BufferAllocation *allocation) {
   if (unlikely(!allocation))
     return nullptr;
-  if (unlikely(allocation->version_ != version_)) {
+  if (unlikely(key >= allocation->cached_view_.size())) {
     prepareAllocationViews(allocation);
   }
   if (unlikely(key >= allocation->cached_view_.size()))
@@ -146,7 +146,7 @@ Buffer::residency(BufferViewKey key, BufferAllocation *allocation) {
     return view->residency;
 
   WARN("DXMT: invalid buffer texture view residency requested view=", key,
-       " version=", version_,
+       " cached_views=", allocation ? allocation->cached_view_.size() : 0,
        " allocation=", reinterpret_cast<const void *>(allocation),
        " length=", length_);
   static DXMT_RESOURCE_RESIDENCY_STATE null_residency = {};
@@ -156,7 +156,8 @@ Buffer::residency(BufferViewKey key, BufferAllocation *allocation) {
 void
 Buffer::prepareAllocationViews(BufferAllocation *allocation) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
-  for (unsigned version = allocation->version_; version < version_; version++) {
+  const auto descriptor_count = viewDescriptors_.size();
+  for (unsigned version = allocation->version_; version < descriptor_count; version++) {
     auto descriptor = viewDescriptors_[version];
     auto format = descriptor.format;
     auto texel_size = MTLGetTexelSize(format);
@@ -210,14 +211,14 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
         std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
     ));
   }
-  allocation->version_ = version_;
+  allocation->version_ = descriptor_count;
 };
 
 BufferViewKey
 Buffer::createView(BufferViewDescriptor const &descriptor) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
   unsigned i = 0;
-  for (; i < version_; i++) {
+  for (; i < viewDescriptors_.size(); i++) {
     auto &existing = viewDescriptors_[i];
     if (existing.format == descriptor.format &&
         existing.usage == descriptor.usage &&
@@ -228,7 +229,6 @@ Buffer::createView(BufferViewDescriptor const &descriptor) {
     }
   }
   viewDescriptors_.push_back(descriptor);
-  version_ = version_ + 1;
   return i;
 }
 

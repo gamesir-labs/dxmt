@@ -59,7 +59,7 @@ GenericAccessTracker::accessShared(EncoderId id, FenceSet &wait_fences, EncoderB
   if (shared_.isLastAccess(id))
     return;
   shared_.add(id);
-  if (id - exclusive_ < kLane) {
+  if (exclusive_) {
     wait_fences.set(exclusive_);
   }
 }
@@ -78,7 +78,7 @@ GenericAccessTracker::accessExclusive(
   }
   shared_.enumerate(id, [&](EncoderId id) { wait_fences.set(id); });
   shared_.clear();
-  if (id - exclusive_ < kLane)
+  if (exclusive_)
     wait_fences.set(exclusive_);
   exclusive_ = id;
 }
@@ -107,7 +107,7 @@ GenericAccessTracker::accessSharedPreRaster(EncoderId id, FenceSet &wait_fences,
     if (isSharedPreRaster)
       return;
     isSharedPreRaster = 1;
-    if (id - exclusive_ < kLane)
+    if (exclusive_)
       wait_fences.set(exclusive_);
     return;
   } else if (shared_.isLastAccess(id)) {
@@ -115,7 +115,7 @@ GenericAccessTracker::accessSharedPreRaster(EncoderId id, FenceSet &wait_fences,
     return;
   }
   shared_.add(id);
-  if (id - exclusive_ < kLane)
+  if (exclusive_)
     wait_fences.set(exclusive_);
   isSharedPreRaster = 1;
   isShared = 0;
@@ -210,7 +210,7 @@ GenericAccessTracker::accessSharedFragment(EncoderId id, FenceSet &wait_fences, 
   if (shared_.isLastAccess(id))
     return;
   bool isVertexLastAccess = shared_.isLastAccess(id - 1);
-  if (id - exclusive_ < kLane)
+  if (exclusive_)
     wait_fences.set(exclusive_);
   shared_.add(id);
   isShared = 1;
@@ -280,28 +280,6 @@ GenericAccessTracker::accessExclusiveFragment(
   isSharedPreRaster = 0;
 }
 
-class WeakFenceMaskLTO {
-public:
-  constexpr WeakFenceMaskLTO() {
-    int i = 0;
-    for (int p = 0; p < kParity; ++p) {
-      for (int l = 0; l < kLane; ++l) {
-        weak_fences_lto[i++].fillGenerationBefore(p, l);
-      }
-    }
-  }
-
-  const FenceSet &
-  operator[](EncoderId i) const {
-    return weak_fences_lto[i % kParityLane];
-  }
-
-private:
-  FenceSet weak_fences_lto[kParityLane];
-};
-
-constexpr auto WEAK_FENCE_MASK = WeakFenceMaskLTO();
-
 FenceSet
 FenceLocalityCheck::collectAndSimplifyWaits(
     FenceSet strong_fences,
@@ -312,26 +290,34 @@ FenceLocalityCheck::collectAndSimplifyWaits(
     strong_fences.set(id - 1);
 
   FenceSet full_fences(strong_fences);
-  if (!strong_fences.empty())
-    full_fences.mergeWithLaneMaskOff(WEAK_FENCE_MASK[id], strong_fences.laneMask());
 
   FenceSet minimal_fences;
   FenceSet accessible_fences;
 
-  constexpr auto start_offset = kParityLane == 1 ? 0 : 1;
+  // The rolling summaries below can only prove transitive coverage inside
+  // their generation window. A strong dependency outside that window must be
+  // kept explicitly; otherwise a correctly tracked distant producer silently
+  // disappears before Metal fence encoding.
+  strong_fences.forEach([&](EncoderId producer_id) {
+    if (producer_id < id && id - producer_id >= kParityLane)
+      minimal_fences.set(producer_id);
+  });
 
-  for (auto offset = start_offset; offset < kParityLane; offset++) {
+  for (EncoderId offset = 1; offset < kParityLane && offset <= id; offset++) {
     EncoderId prev_encoder_id = id - offset;
 
     if (full_fences.test(prev_encoder_id) && !accessible_fences.testAndSet(prev_encoder_id))
       minimal_fences.set(prev_encoder_id);
-    if (accessible_fences.test(prev_encoder_id))
+    if (accessible_fences.test(prev_encoder_id) &&
+        summary_generation_[prev_encoder_id % kParityLane] ==
+            prev_encoder_id)
       accessible_fences.merge(summary_[prev_encoder_id % kParityLane]);
     if (accessible_fences.contains(full_fences))
       break;
   }
 
   summary_[id % kParityLane] = full_fences;
+  summary_generation_[id % kParityLane] = id;
 
   if (implicit_pre_raster_wait)
     minimal_fences.unset(id - 1);
