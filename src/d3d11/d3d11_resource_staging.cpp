@@ -121,7 +121,14 @@ HRESULT CreateStagingTextureInternal(MTLD3D11Device *pDevice,
     if (pInitialData) {
       auto mapped = buffer->mappedImmediateMemory();
       auto bpi_read = is_3d_tex ? pInitialData[sub.SubresourceId].SysMemSlicePitch : 0;
-      auto bpr_read = is_1d_tex ? 0 : pInitialData[sub.SubresourceId].SysMemPitch;
+      auto bpr_read = pInitialData[sub.SubresourceId].SysMemPitch;
+      if (is_1d_tex) {
+        uint32_t source_bpi = 0, source_size = 0;
+        if (FAILED(GetLinearTextureLayout(
+                pDevice, finalDesc, sub.MipLevel, bpr_read, source_bpi,
+                source_size, false)))
+          return E_FAIL;
+      }
       for (auto image = 0u; image < d; image++) {
         for (auto row = 0u; row < (bpi / bpr); row++) {
           auto dst_data = ptr_add(mapped, image * bpi + row * bpr);

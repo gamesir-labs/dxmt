@@ -448,9 +448,54 @@ TEST_F(D3D11ResourceSpec, PreservesTexture1DArraySubresources) {
       EXPECT_EQ(std::memcmp(mapped.pData, contents[subresource].data(),
                             mip_width * sizeof(uint32_t)),
                 0)
-          << "slice " << slice << ", mip " << mip;
+          << "slice " << slice << ", mip " << mip
+          << ", first actual=0x" << std::hex
+          << static_cast<const uint32_t *>(mapped.pData)[0]
+          << ", expected=0x" << contents[subresource][0];
       context_.context()->Unmap(staging.get(), subresource);
     }
+  }
+}
+
+TEST_F(D3D11ResourceSpec, PreservesStagingTexture1DArraySubresources) {
+  constexpr UINT width = 8;
+  constexpr UINT mip_levels = 2;
+  constexpr UINT array_size = 3;
+  constexpr UINT subresource_count = mip_levels * array_size;
+  std::array<std::array<uint32_t, width>, subresource_count> contents = {};
+  std::array<D3D11_SUBRESOURCE_DATA, subresource_count> initial = {};
+  for (UINT slice = 0; slice < array_size; ++slice) {
+    for (UINT mip = 0; mip < mip_levels; ++mip) {
+      const UINT subresource = D3D11CalcSubresource(mip, slice, mip_levels);
+      const UINT mip_width = width >> mip;
+      for (UINT x = 0; x < mip_width; ++x)
+        contents[subresource][x] = 0x20000000u | subresource << 8 | x;
+      initial[subresource].pSysMem = contents[subresource].data();
+      initial[subresource].SysMemPitch = mip_width * sizeof(uint32_t);
+    }
+  }
+
+  D3D11_TEXTURE1D_DESC desc = {};
+  desc.Width = width;
+  desc.MipLevels = mip_levels;
+  desc.ArraySize = array_size;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture1D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture1D(
+      &desc, initial.data(), texture.put())));
+
+  for (UINT subresource = 0; subresource < subresource_count; ++subresource) {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+        texture.get(), subresource, D3D11_MAP_READ, 0, &mapped)));
+    const UINT mip_width = width >> (subresource % mip_levels);
+    EXPECT_EQ(std::memcmp(mapped.pData, contents[subresource].data(),
+                          mip_width * sizeof(uint32_t)),
+              0)
+        << "subresource " << subresource;
+    context_.context()->Unmap(texture.get(), subresource);
   }
 }
 
