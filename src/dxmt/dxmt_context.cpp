@@ -3741,6 +3741,29 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
   cpu_buffer_offset_ = 0;
   seq_id_ = seq_id;
   frame_id_ = frame_id;
+  sparse_access_diagnostic_ = {};
+}
+
+void
+ArgumentEncodingContext::noteSparseTextureAccess(
+    TextureAllocation *allocation, unsigned level, unsigned slice,
+    int flags) {
+  if (!allocation ||
+      !allocation->flags().test(TextureAllocationFlag::PlacementSparse))
+    return;
+  sparse_access_diagnostic_.sparse_access_count++;
+  sparse_access_diagnostic_.sparse_access_flags |= uint32_t(flags);
+  sparse_access_diagnostic_.sparse_access_level = level;
+  sparse_access_diagnostic_.sparse_access_slice = slice;
+  sparse_access_diagnostic_.sparse_access_descriptor =
+      uint64_t(allocation->descriptor);
+  sparse_access_diagnostic_.sparse_access_resource_identity =
+      allocation->descriptor->diagnosticIdentity();
+  sparse_access_diagnostic_.sparse_access_texture_handle =
+      uint64_t(allocation->texture().handle);
+  sparse_access_diagnostic_.sparse_access_gpu_resource_id =
+      allocation->gpuResourceID;
+  sparse_access_diagnostic_.sparse_access_encoder_id = currentEncoderId();
 }
 
 constexpr unsigned kEncoderOptimizerThreshold = 64;
@@ -4771,6 +4794,24 @@ ArgumentEncodingContext::flushCommands(
         perf.encodedBlit;
     diagnostic_info->fence_wait_count = perf.fenceWaits;
     diagnostic_info->fence_update_count = perf.fenceUpdates;
+    diagnostic_info->sparse_access_count =
+        sparse_access_diagnostic_.sparse_access_count;
+    diagnostic_info->sparse_access_flags =
+        sparse_access_diagnostic_.sparse_access_flags;
+    diagnostic_info->sparse_access_level =
+        sparse_access_diagnostic_.sparse_access_level;
+    diagnostic_info->sparse_access_slice =
+        sparse_access_diagnostic_.sparse_access_slice;
+    diagnostic_info->sparse_access_descriptor =
+        sparse_access_diagnostic_.sparse_access_descriptor;
+    diagnostic_info->sparse_access_resource_identity =
+        sparse_access_diagnostic_.sparse_access_resource_identity;
+    diagnostic_info->sparse_access_texture_handle =
+        sparse_access_diagnostic_.sparse_access_texture_handle;
+    diagnostic_info->sparse_access_gpu_resource_id =
+        sparse_access_diagnostic_.sparse_access_gpu_resource_id;
+    diagnostic_info->sparse_access_encoder_id =
+        sparse_access_diagnostic_.sparse_access_encoder_id;
   }
   {
     auto &stats = currentFrameStatistics();
@@ -4983,9 +5024,11 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       if (result.src) {
         result.src->store_action = WMTStoreActionStoreAndMultisampleResolve;
         result.src->resolve_attachment = result.dst;
-        render->fence_update.merge(resolve->fence_update);
-        render->fence_wait.merge(resolve->fence_wait);
-        render->fence_wait.subtract(resolve->fence_update);
+        auto fence_merge = BuildRenderResolveFenceMergePlan(
+            render->fence_wait, render->fence_update,
+            resolve->fence_wait, resolve->fence_update);
+        render->fence_wait = std::move(fence_merge.fragment_waits);
+        render->fence_update = std::move(fence_merge.fragment_updates);
 
         currentFrameStatistics().resolve_pass_optimized++;
         resolve->~ResolveEncoderData();
@@ -5001,8 +5044,16 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     auto r1 = reinterpret_cast<RenderEncoderData *>(latter);
     auto r0 = reinterpret_cast<RenderEncoderData *>(former);
 
-    if (isEncoderSignatureMatched(r0, r1) &&
-        !r1->fence_wait_vertex.intersectedWith(r0->fence_update)) {
+    std::optional<RenderFenceMergePlan> fence_merge;
+    if (isEncoderSignatureMatched(r0, r1)) {
+      fence_merge = BuildRenderFenceMergePlan(
+          r1->fence_wait, r1->fence_wait_vertex,
+          r1->fence_update, r1->fence_update_vertex,
+          r0->fence_wait, r0->fence_wait_vertex,
+          r0->fence_update, r0->fence_update_vertex);
+    }
+
+    if (fence_merge && fence_merge->valid()) {
       for (unsigned i = 0; i < r0->render_target_count; i++) {
         auto &a0 = r0->colors[i];
         auto &a1 = r1->colors[i];
@@ -5059,19 +5110,10 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->ts_arg_marshal_tasks = std::move(r0->ts_arg_marshal_tasks);
       r1->use_visibility_result = r0->use_visibility_result || r1->use_visibility_result;
 
-      r1->fence_update.merge(r0->fence_update);
-      r1->fence_wait.merge(r0->fence_wait);
-      r1->fence_wait.subtract(r0->fence_update);
-      r1->fence_update_vertex.merge(r0->fence_update_vertex);
-      r1->fence_wait_vertex.merge(r0->fence_wait_vertex);
-      r1->fence_wait_vertex.subtract(r0->fence_update_vertex);
-
-      // just in case
-      r1->fence_wait.subtract(r0->fence_update_vertex);
-      /* 
-      r1->fence_wait_vertex.subtract(r0->fence_update);
-      does not make sense
-      */
+      r1->fence_wait = std::move(fence_merge->fragment_waits);
+      r1->fence_wait_vertex = std::move(fence_merge->pre_raster_waits);
+      r1->fence_update = std::move(fence_merge->fragment_updates);
+      r1->fence_update_vertex = std::move(fence_merge->pre_raster_updates);
 
       // r0's commands are prepended into r1, but r0 itself will not be encoded after this point.
       // On 32-bit builds the argument buffer writes live in a shadow allocation until explicitly flushed.

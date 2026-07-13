@@ -2,6 +2,7 @@
 
 #include "d3d12_resource.hpp"
 #include "d3d12_device.hpp"
+#include "d3d12_descriptor_shape.hpp"
 #include "com/com_pointer.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "dxmt_descriptor_revision.hpp"
@@ -77,6 +78,22 @@ struct DescriptorRecord {
   } desc = {};
   bool has_desc = false;
 };
+
+inline DescriptorTextureViewShape
+GetDescriptorTextureViewShape(const DescriptorRecord &record) {
+  if (!record.has_desc)
+    return DescriptorTextureViewShape::Unknown;
+
+  if (record.type == DescriptorRecordType::ShaderResourceView) {
+    return GetSrvTextureViewShape(record.desc.srv.ViewDimension);
+  }
+
+  if (record.type == DescriptorRecordType::UnorderedAccessView) {
+    return GetUavTextureViewShape(record.desc.uav.ViewDimension);
+  }
+
+  return DescriptorTextureViewShape::NotTexture;
+}
 
 class DescriptorHeap {
 public:

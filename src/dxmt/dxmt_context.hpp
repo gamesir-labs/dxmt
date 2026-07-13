@@ -33,6 +33,26 @@ constexpr size_t kEncodingContextCPUHeapLifetime = 600;
 
 constexpr auto kIntrapassControlBitIgnoreUAVWaW = 1ull << 1;
 
+constexpr uint32_t kCommandBufferFenceEdgeCapacity = 8;
+
+enum CommandBufferFenceEdgeFlag : uint32_t {
+  CommandBufferFenceEdgePreRaster = 1u << 0,
+  CommandBufferFenceEdgeFragment = 1u << 1,
+  CommandBufferFenceEdgeCompute = 1u << 2,
+  CommandBufferFenceEdgeBlit = 1u << 3,
+  CommandBufferFenceEdgeOther = 1u << 4,
+  CommandBufferFenceEdgePending = 1u << 5,
+};
+
+struct CommandBufferFenceEdgeDiagnostic {
+  uint64_t producer_id = 0;
+  uint64_t consumer_id = 0;
+  uint32_t producer_index = 0;
+  uint32_t consumer_index = 0;
+  uint32_t slot = 0;
+  uint32_t flags = 0;
+};
+
 struct CommandBufferDiagnosticInfo {
   uint64_t frame_id = 0;
   uint64_t chunk_id = 0;
@@ -45,9 +65,54 @@ struct CommandBufferDiagnosticInfo {
   uint32_t compute_encoder_count = 0;
   uint32_t blit_encoder_count = 0;
   uint32_t other_encoder_count = 0;
+  uint32_t present_encoder_count = 0;
+  uint32_t clear_encoder_count = 0;
+  uint32_t resolve_encoder_count = 0;
+  uint32_t scaler_encoder_count = 0;
+  uint32_t signal_event_count = 0;
+  uint32_t wait_event_count = 0;
+  uint32_t timestamp_encoder_count = 0;
   uint32_t barrier_only_pass_count = 0;
   uint32_t fence_wait_count = 0;
   uint32_t fence_update_count = 0;
+  uint32_t prior_local_fence_wait_count = 0;
+  uint32_t future_local_fence_wait_count = 0;
+  uint32_t same_encoder_fence_wait_count = 0;
+  uint32_t external_fence_wait_count = 0;
+  uint32_t repeated_fence_update_count = 0;
+  uint32_t render_valid_cross_stage_count = 0;
+  uint32_t render_same_stage_wait_count = 0;
+  uint32_t render_reverse_stage_wait_count = 0;
+  uint32_t local_fence_id_count = 0;
+  uint32_t bound_fence_slot_count = 0;
+  uint32_t encoded_fence_wait_count = 0;
+  uint32_t skipped_external_fence_wait_count = 0;
+  uint32_t fence_edge_count = 0;
+  uint32_t fence_edge_overflow_count = 0;
+  uint32_t sparse_mapping_call_count = 0;
+  uint32_t sparse_mapping_operation_count = 0;
+  uint32_t sparse_mapping_map_count = 0;
+  uint32_t sparse_mapping_unmap_count = 0;
+  uint32_t sparse_mapping_failure_count = 0;
+  uint32_t sparse_mapping_barrier_count = 0;
+  uint64_t sparse_resource_identity = 0;
+  uint64_t sparse_texture_handle = 0;
+  uint64_t sparse_heap_handle = 0;
+  uint64_t sparse_gpu_resource_id = 0;
+  uint64_t sparse_mapping_generation_begin = 0;
+  uint64_t sparse_mapping_generation_end = 0;
+  uint32_t sparse_access_count = 0;
+  uint32_t sparse_access_flags = 0;
+  uint32_t sparse_access_level = 0;
+  uint32_t sparse_access_slice = 0;
+  uint64_t sparse_access_descriptor = 0;
+  uint64_t sparse_access_resource_identity = 0;
+  uint64_t sparse_access_texture_handle = 0;
+  uint64_t sparse_access_gpu_resource_id = 0;
+  uint64_t sparse_access_encoder_id = 0;
+  std::array<CommandBufferFenceEdgeDiagnostic,
+             kCommandBufferFenceEdgeCapacity>
+      fence_edges = {};
 };
 
 inline std::size_t
@@ -336,15 +401,22 @@ struct BlitEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
 };
 
-struct ClearEncoderData : EncoderData {
-  union {
-    WMTClearColor color;
-    std::pair<float, uint8_t> depth_stencil;
-  };
+struct ClearColorAttachmentData {
+  WMTClearColor color = {};
   TextureViewRef attachment;
   Rc<Buffer> buffer_attachment;
   WMT::Reference<WMT::Texture> buffer_texture;
   uint64_t buffer_view_id = 0;
+  uint16_t level = 0;
+  uint16_t slice = 0;
+  uint32_t depth_plane = 0;
+  bool has_rects = false;
+};
+
+struct ClearEncoderData : EncoderData {
+  std::array<ClearColorAttachmentData, 8> colors = {};
+  std::pair<float, uint8_t> depth_stencil = {};
+  TextureViewRef attachment;
   unsigned clear_dsv;
   unsigned array_length;
   unsigned width;
@@ -354,6 +426,8 @@ struct ClearEncoderData : EncoderData {
   uint16_t slice = 0;
   uint32_t depth_plane = 0;
   uint32_t stencil_depth_plane = 0;
+  bool has_rects = false;
+  uint8_t color_attachment_count = 0;
 
   ClearEncoderData() {}
 };
@@ -483,6 +557,8 @@ struct AllocatedArgumentBufferSlice {
 class ArgumentEncodingContext {
 private:
   template <PipelineStage stage> void track(GenericAccessTracker &tracker, int flags);
+  void noteSparseTextureAccess(TextureAllocation *allocation, unsigned level,
+                               unsigned slice, int flags);
 
 public:
   /**
@@ -525,6 +601,7 @@ public:
   access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
     auto allocation = texture->current();
     retainAllocation(allocation);
+    noteSparseTextureAccess(allocation, level, slice, flags);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
         track<stage>(allocation->fenceTrackers[0], flags);
@@ -553,11 +630,12 @@ public:
     auto allocation = texture->current();
     retainAllocation(allocation);
     auto &view = texture->view(viewId, allocation);
+    TextureViewKey key = viewId;
+    noteSparseTextureAccess(allocation, key.mip_start, key.array_start, flags);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
         track<stage>(allocation->fenceTrackers[0], flags);
       } else {
-        TextureViewKey key = viewId;
         const auto mip_count = allocation->descriptor->miplevelCount();
         for (unsigned slice = key.array_start; slice < key.array_end; slice++) {
           for (unsigned level = key.mip_start; level < key.mip_end; level++) {
@@ -691,7 +769,7 @@ public:
   template <PipelineStage stage, PipelineKind kind>
   void encodeConstantBuffers(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-      uint64_t argument_buffer_offset
+      uint64_t argument_buffer_offset, const std::string &shader_hash
   );
   template <PipelineStage stage, PipelineKind kind>
   void encodeConstantBuffers(
@@ -754,7 +832,8 @@ public:
                     uint64_t verify_draw_serial = 0,
                     const BindlessBufferTableSnapshot *bindings = nullptr,
                     uint64_t demote_msaa_srv_mask_lo = 0,
-                    uint64_t demote_msaa_srv_mask_hi = 0);
+                    uint64_t demote_msaa_srv_mask_hi = 0,
+                    const char *diagnostic_path = "bindless-live");
 
   // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
   // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null
@@ -775,6 +854,14 @@ public:
   void bindNativeArgumentBuffer(WMT::Buffer buffer, uint64_t offset,
                                 uint32_t bind_index, bool compute,
                                 WMTRenderStages render_stages = {});
+  void bindNativeNullConstantBuffer(bool compute,
+                                    WMTRenderStages render_stages = {});
+  void bindNativeNullBuffer(bool compute,
+                            WMTRenderStages render_stages = {});
+  void diagnoseNativeShaderBinding(
+      PipelineStage stage, const std::string &shader_hash, const char *path,
+      const AllocatedArgumentBufferSlice &cbuffer_root_bases,
+      const AllocatedArgumentBufferSlice &resource_root_bases);
   void invalidateNativeArgumentBuffers(bool compute,
                                        WMTRenderStages render_stages = {});
 
@@ -944,10 +1031,13 @@ public:
     return encoder_id_++;
   };
 
-  void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, WMTClearColor color);
-  void clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width, WMTClearColor color);
+  void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength,
+                  WMTClearColor color, bool has_rects = false);
+  void clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width,
+                  WMTClearColor color, bool has_rects = false);
   void clearDepthStencil(
-      Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
+      Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag,
+      float depth, uint8_t stencil, bool has_rects = false
   );
   void resolveTexture(
       Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
@@ -1183,8 +1273,17 @@ public:
 private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
+  bool tryMergeClearEncoders(ClearEncoderData* former, ClearEncoderData* latter);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
+  WMT::Fence fenceForEncoder(EncoderId id);
+  void prepareFencePool(EncoderData **encoders, unsigned encoder_count,
+                        CommandBufferDiagnosticInfo *diagnostic_info);
+  template <typename Fn>
+  void withFence(EncoderId id, Fn &&fn) {
+    if (auto fence = fenceForEncoder(id))
+      fn(fence);
+  }
   bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);
   void appendPendingFenceOnlyBlitPass();
   void mergePendingFenceOnlyBlitPassInto(EncoderData* encoder);
@@ -1227,11 +1326,14 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
-  std::array<WMT::Reference<WMT::Fence>, kParityLane> fence_pool_;
+  std::vector<WMT::Reference<WMT::Fence>> fence_pool_;
+  CommandBufferFenceBindingTable fence_bindings_;
+  uint32_t created_fence_count_ = 0;
   FenceLocalityCheck fence_locality_;
 
   uint64_t seq_id_;
   uint64_t frame_id_;
+  CommandBufferDiagnosticInfo sparse_access_diagnostic_ = {};
 
   struct chunk {
     void *ptr;

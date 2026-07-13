@@ -23,6 +23,10 @@ DXMT_SLOW_TEST_F(TestSchedulerSlowFixture, DISABLED_CompilesFixtureMacro) {
   SUCCEED();
 }
 
+DXMT_SERIAL_TEST_F(TestSchedulerSlowFixture, DISABLED_CompilesSerialMacro) {
+  SUCCEED();
+}
+
 TEST(TestSchedulerGlob, MatchesGoogleTestWildcards) {
   EXPECT_TRUE(
       dxmt::test::GlobMatches("Pipeline*.*Cache?", "PipelineState.DiskCache1"));
@@ -84,6 +88,20 @@ TEST(TestSchedulerPlan, AmortizesDefaultWorkerLaunches) {
 
   tests.resize(100, {"Suite.Fast", dxmt::test::kNormalTestCost});
   EXPECT_EQ(dxmt::test::SelectWorkerCount(tests, 16), 16u);
+}
+
+TEST(TestSchedulerPlan, ExtractsSerialTestsIntoAnExclusiveWave) {
+  std::vector<dxmt::test::ScheduledTest> tests = {
+      {"Suite.Parallel", dxmt::test::kNormalTestCost, false},
+      {"Suite.Serial", dxmt::test::kNormalTestCost, true},
+      {"Suite.AlsoParallel", dxmt::test::kNormalTestCost, false},
+  };
+  const auto serial = dxmt::test::ExtractSerialTests(tests);
+  ASSERT_EQ(serial.size(), 1u);
+  EXPECT_EQ(serial[0].name, "Suite.Serial");
+  ASSERT_EQ(tests.size(), 2u);
+  EXPECT_FALSE(tests[0].serial);
+  EXPECT_FALSE(tests[1].serial);
 }
 
 TEST(TestSchedulerWorker, PropagatesConditionalFailure) {

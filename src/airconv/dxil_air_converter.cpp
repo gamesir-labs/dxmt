@@ -91,6 +91,7 @@ struct DxilAirContext {
   uint32_t base_instance_arg = UINT32_MAX;
   AllocaInst *return_value = nullptr;
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  bool dual_source_blending = false;
   bool diag_force_fullscreen_position = false;
 };
 
@@ -2234,11 +2235,17 @@ BuildSignature(const dxil::DxilTranslationInfo &translation,
         else if (IsSystemSemantic(sig, "SV_Coverage"))
           ctx.output_indices[sig.element_id] =
               signature.DefineOutput(air::OutputCoverageMask{});
-        else
+        else {
+          const bool dual_source_output =
+              ctx.dual_source_blending &&
+              IsSystemSemantic(sig, "SV_Target") &&
+              sig.semantic_index <= 1;
           ctx.output_indices[sig.element_id] = signature.DefineOutput(
-              air::OutputRenderTarget{.dual_source_blending = false,
+              air::OutputRenderTarget{.dual_source_blending =
+                                          dual_source_output,
                                       .index = sig.semantic_index,
                                       .type = ToAirSignatureType(sig.component_type, mask)});
+        }
       }
     }
   }
@@ -2389,6 +2396,9 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
   dxbc::args_get_data<SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION,
                       SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA>(
       args, &diag_fullscreen);
+  SM50_SHADER_PSO_PIXEL_SHADER_DATA *pixel_pso = nullptr;
+  dxbc::args_get_data<SM50_SHADER_PSO_PIXEL_SHADER,
+                      SM50_SHADER_PSO_PIXEL_SHADER_DATA>(args, &pixel_pso);
 
   air::FunctionSignatureBuilder signature;
   air::AirType types(context);
@@ -2408,6 +2418,8 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
       .source_function = source,
       .shader_info = std::move(shader_info),
       .metal_version = metal_version,
+      .dual_source_blending =
+          pixel_pso && pixel_pso->dual_source_blending,
       .diag_force_fullscreen_position =
           diag_fullscreen && diag_fullscreen->enabled,
   };

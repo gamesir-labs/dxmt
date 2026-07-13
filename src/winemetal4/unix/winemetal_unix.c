@@ -52,6 +52,130 @@ typedef int NTSTATUS;
 
 static NSObject *dxmt_metal4_compiler_lock;
 
+struct DXMTSparseTextureTileKey {
+  uint32_t level;
+  uint32_t slice;
+  uint32_t x;
+  uint32_t y;
+  uint32_t z;
+};
+
+@interface DXMTSparseTextureResidency : NSObject {
+  NSLock *_lock;
+  NSMutableDictionary *_tileHeaps;
+  NSCountedSet *_mappedHeaps;
+}
+- (void)applyOperations:(const struct WMTSparseTextureMappingOperation *)operations
+                  count:(uint64_t)count
+                   heap:(id<MTLHeap>)heap;
+- (void)addMappedHeapsToResidencySet:(id<MTLResidencySet>)residencySet;
+- (NSArray *)mappedHeapsSnapshot;
+@end
+
+static NSLock *dxmt_sparse_texture_residency_lock;
+static NSMapTable *dxmt_sparse_texture_residency;
+static pthread_once_t dxmt_sparse_texture_residency_once = PTHREAD_ONCE_INIT;
+
+static void
+dxmt_sparse_texture_residency_init(void) {
+  dxmt_sparse_texture_residency_lock = [[NSLock alloc] init];
+  dxmt_sparse_texture_residency = [[NSMapTable alloc]
+      initWithKeyOptions:NSPointerFunctionsWeakMemory |
+                         NSPointerFunctionsObjectPointerPersonality
+      valueOptions:NSPointerFunctionsStrongMemory
+      capacity:0];
+}
+
+static DXMTSparseTextureResidency *
+dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
+                                          bool create) {
+  if (!texture)
+    return nil;
+  pthread_once(&dxmt_sparse_texture_residency_once,
+               dxmt_sparse_texture_residency_init);
+  [dxmt_sparse_texture_residency_lock lock];
+  DXMTSparseTextureResidency *residency =
+      [dxmt_sparse_texture_residency objectForKey:texture];
+  if (!residency && create) {
+    residency = [[DXMTSparseTextureResidency alloc] init];
+    [dxmt_sparse_texture_residency setObject:residency forKey:texture];
+    [residency release];
+  }
+  [residency retain];
+  [dxmt_sparse_texture_residency_lock unlock];
+  return [residency autorelease];
+}
+
+@implementation DXMTSparseTextureResidency
+- (instancetype)init {
+  self = [super init];
+  if (!self)
+    return nil;
+  _lock = [[NSLock alloc] init];
+  _tileHeaps = [[NSMutableDictionary alloc] init];
+  _mappedHeaps = [[NSCountedSet alloc] init];
+  return self;
+}
+
+- (void)dealloc {
+  [_mappedHeaps release];
+  [_tileHeaps release];
+  [_lock release];
+  [super dealloc];
+}
+
+- (void)applyOperations:(const struct WMTSparseTextureMappingOperation *)operations
+                  count:(uint64_t)count
+                   heap:(id<MTLHeap>)heap {
+  [_lock lock];
+  for (uint64_t i = 0; i < count; ++i) {
+    const struct WMTSparseTextureMappingOperation *operation = &operations[i];
+    for (uint32_t z = 0; z < operation->depth; ++z) {
+      for (uint32_t y = 0; y < operation->height; ++y) {
+        for (uint32_t x = 0; x < operation->width; ++x) {
+          const struct DXMTSparseTextureTileKey tile = {
+              .level = operation->level,
+              .slice = operation->slice,
+              .x = operation->x + x,
+              .y = operation->y + y,
+              .z = operation->z + z,
+          };
+          NSData *key = [NSData dataWithBytes:&tile length:sizeof(tile)];
+          id<MTLHeap> oldHeap = [_tileHeaps objectForKey:key];
+          id<MTLHeap> newHeap =
+              operation->mode == WMTSparseTextureMappingModeMap ? heap : nil;
+          if (oldHeap == newHeap)
+            continue;
+          if (oldHeap) {
+            [_mappedHeaps removeObject:oldHeap];
+            [_tileHeaps removeObjectForKey:key];
+          }
+          if (newHeap) {
+            [_tileHeaps setObject:newHeap forKey:key];
+            [_mappedHeaps addObject:newHeap];
+          }
+        }
+      }
+    }
+  }
+  [_lock unlock];
+}
+
+- (void)addMappedHeapsToResidencySet:(id<MTLResidencySet>)residencySet {
+  [_lock lock];
+  for (id<MTLHeap> heap in _mappedHeaps)
+    [residencySet addAllocation:(id<MTLAllocation>)heap];
+  [_lock unlock];
+}
+
+- (NSArray *)mappedHeapsSnapshot {
+  [_lock lock];
+  NSArray *snapshot = [[_mappedHeaps allObjects] retain];
+  [_lock unlock];
+  return [snapshot autorelease];
+}
+@end
+
 static bool
 dxmt_truthy_env_value(const char *value) {
   if (!value || !value[0])
@@ -142,6 +266,54 @@ dxmt_metal4_perf_stats_enabled(void) {
 }
 
 static bool
+dxmt_metal4_pso_labels_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS")) ||
+              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static bool
+dxmt_metal4_residency_diag_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_RESIDENCY"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static id<MTLAllocation>
+dxmt_metal4_backing_allocation(id<MTLAllocation> allocation) {
+  if (!allocation || ![(id)allocation conformsToProtocol:@protocol(MTLTexture)])
+    return allocation;
+
+  id<MTLTexture> texture = (id<MTLTexture>)allocation;
+  for (unsigned depth = 0; depth < 64 && texture.parentTexture; depth++)
+    texture = texture.parentTexture;
+  if (texture.buffer)
+    return (id<MTLAllocation>)texture.buffer;
+  return (id<MTLAllocation>)texture;
+}
+
+static bool
+dxmt_metal4_dense_hang_diagnostics_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE")) ||
+              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static bool
 dxmt_metal4_test_feedback_error_enabled(void) {
   return dxmt_truthy_env_value(
              getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")) ||
@@ -182,6 +354,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) id<MTLResidencySet> residencySet;
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
+@property(nonatomic, retain) NSMutableArray *sparseResidencyAllocations;
 @property(nonatomic, retain) id<MTLDrawable> pendingDrawable;
 @property(nonatomic, assign) BOOL hasPresentDuration;
 @property(nonatomic, assign) double presentDuration;
@@ -190,6 +363,8 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) NSError *feedbackError;
 @property(nonatomic, assign) double feedbackGPUStartTime;
 @property(nonatomic, assign) double feedbackGPUEndTime;
+@property(nonatomic, assign) uint64_t completionCurrentBeforeThrottle;
+@property(nonatomic, assign) uint64_t completionCurrentAtCommit;
 @property(nonatomic, assign) struct WMTCommandBufferDiagnosticInfo diagnosticInfo;
 - (instancetype)initWithQueue:(DXMTMetal4CommandQueue *)queue;
 - (id<MTL4CommandBuffer>)commandBuffer;
@@ -203,6 +378,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 - (void)commit;
 - (uint64_t)commitLocked;
 - (void)waitUntilCompleted;
+- (void)releaseSparseResidencyAllocations;
 - (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
 - (id)logs;
@@ -672,6 +848,9 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, assign) uint64_t maxCommandBufferCount;
 @property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
 @property(nonatomic, retain) NSError *firstError;
+@property(nonatomic, retain) id<MTLResidencySet> sparseResidencySet;
+@property(nonatomic, retain) NSMutableArray *pendingSparseResidencyAllocations;
+@property(nonatomic, retain) NSCountedSet *sparseResidencyAllocationRefs;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
@@ -695,17 +874,40 @@ dxmt_metal4_is_buffer(id object) {
   _presentEventValue = 0;
   _maxCommandBufferCount = maxCommandBufferCount;
   _commandBufferThrottleWaitCount = 0;
+  MTLResidencySetDescriptor *sparseResidencyDescriptor =
+      [[MTLResidencySetDescriptor alloc] init];
+  sparseResidencyDescriptor.label = @"DXMT sparse queue residency";
+  sparseResidencyDescriptor.initialCapacity = 1024;
+  NSError *sparseResidencyError = nil;
+  _sparseResidencySet = [device
+      newResidencySetWithDescriptor:sparseResidencyDescriptor
+                              error:&sparseResidencyError];
+  [sparseResidencyDescriptor release];
+  _pendingSparseResidencyAllocations = [[NSMutableArray alloc] init];
+  _sparseResidencyAllocationRefs = [[NSCountedSet alloc] init];
 
-  if (!_metal4Queue || !_compiler || !_event || !_presentEvent) {
+  if (!_metal4Queue || !_compiler || !_event || !_presentEvent ||
+      !_sparseResidencySet || !_pendingSparseResidencyAllocations ||
+      !_sparseResidencyAllocationRefs) {
     [self release];
     return nil;
   }
+
+  [_sparseResidencySet commit];
+  [_sparseResidencySet requestResidency];
+  [_metal4Queue addResidencySet:_sparseResidencySet];
 
   dxmt_metal4_register_compiler(device, _compiler);
   return self;
 }
 
 - (void)dealloc {
+  if (_metal4Queue && _sparseResidencySet)
+    [_metal4Queue removeResidencySet:_sparseResidencySet];
+  [_sparseResidencySet endResidency];
+  [_pendingSparseResidencyAllocations release];
+  [_sparseResidencyAllocationRefs release];
+  [_sparseResidencySet release];
   [_device release];
   [_metal4Queue release];
   [_compiler release];
@@ -756,6 +958,7 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
   _pendingWaitEvents = [[NSMutableArray alloc] init];
   _pendingSignalEvents = [[NSMutableArray alloc] init];
+  _sparseResidencyAllocations = [[NSMutableArray alloc] init];
   MTLResidencySetDescriptor *residencyDesc = [[MTLResidencySetDescriptor alloc] init];
   residencyDesc.initialCapacity = 1024;
   NSError *residencyError = nil;
@@ -767,7 +970,8 @@ dxmt_metal4_is_buffer(id object) {
   _feedbackGPUEndTime = 0.0;
   memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
-  if (!_allocator || !_metal4Buffer || !_pendingWaitEvents || !_pendingSignalEvents || !_residencySet) {
+  if (!_allocator || !_metal4Buffer || !_pendingWaitEvents ||
+      !_pendingSignalEvents || !_sparseResidencyAllocations || !_residencySet) {
     [self release];
     return nil;
   }
@@ -780,6 +984,7 @@ dxmt_metal4_is_buffer(id object) {
   [_feedbackError release];
   [_pendingWaitEvents release];
   [_pendingSignalEvents release];
+  [_sparseResidencyAllocations release];
   [_residencySet release];
   [_metal4Buffer release];
   [_allocator release];
@@ -802,7 +1007,14 @@ dxmt_metal4_is_buffer(id object) {
 - (void)useResidencyAllocation:(id<MTLAllocation>)allocation {
   if (!allocation)
     return;
-  [_residencySet addAllocation:allocation];
+  id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
+  [_residencySet addAllocation:backing];
+  if ([(id)backing conformsToProtocol:@protocol(MTLTexture)]) {
+    DXMTSparseTextureResidency *sparseResidency =
+        dxmt_sparse_texture_residency_for_texture((id<MTLTexture>)backing,
+                                                  false);
+    [sparseResidency addMappedHeapsToResidencySet:_residencySet];
+  }
 }
 
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label {
@@ -892,6 +1104,10 @@ dxmt_metal4_is_buffer(id object) {
     return 0;
   }
 
+  [_sparseResidencyAllocations
+      addObjectsFromArray:_owner.pendingSparseResidencyAllocations];
+  [_owner.pendingSparseResidencyAllocations removeAllObjects];
+
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
       APITRACE_METAL_COMMAND_BUFFER_COMMIT_BEGIN,
@@ -941,9 +1157,14 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValueLocked];
+  _completionCurrentBeforeThrottle = _owner.event.signaledValue;
   [_owner waitForCommandBufferSlotLocked:_completionValue];
+  _completionCurrentAtCommit = _owner.event.signaledValue;
 
-  const BOOL perfFeedback = dxmt_metal4_perf_stats_enabled();
+  const BOOL denseHangDiagnostics =
+      dxmt_metal4_dense_hang_diagnostics_enabled();
+  const BOOL perfFeedback =
+      dxmt_metal4_perf_stats_enabled() || denseHangDiagnostics;
   if (perfFeedback && !_metal4Buffer.label) {
     NSString *label = [[NSString alloc]
         initWithFormat:@"DXMT queue=%p depth=%" PRIu64 " completion=%" PRIu64,
@@ -971,6 +1192,17 @@ dxmt_metal4_is_buffer(id object) {
     const obj_handle_t feedbackQueue = (obj_handle_t)_owner.metal4Queue;
     const uint64_t feedbackQueueDepth = _owner.maxCommandBufferCount;
     const uint64_t feedbackCompletionValue = _completionValue;
+    const uint64_t feedbackCompletionBeforeThrottle =
+        _completionCurrentBeforeThrottle;
+    const uint64_t feedbackCompletionAtCommit = _completionCurrentAtCommit;
+    const uint64_t feedbackInflightBeforeThrottle =
+        feedbackCompletionValue > feedbackCompletionBeforeThrottle
+            ? feedbackCompletionValue - feedbackCompletionBeforeThrottle
+            : 0;
+    const uint64_t feedbackInflightAtCommit =
+        feedbackCompletionValue > feedbackCompletionAtCommit
+            ? feedbackCompletionValue - feedbackCompletionAtCommit
+            : 0;
     const BOOL feedbackHasDrawable = _pendingDrawable != nil;
     const struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic =
         _diagnosticInfo;
@@ -1015,10 +1247,34 @@ dxmt_metal4_is_buffer(id object) {
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
                 " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
                 " completionCurrent=%" PRIu64 " waitCount=%lu signalCount=%lu drawable=%d"
+                " completionBeforeThrottle=%" PRIu64
+                " completionAtCommit=%" PRIu64
+                " inflightBeforeThrottle=%" PRIu64
+                " inflightAtCommit=%" PRIu64
                 " frame=%" PRIu64 " chunk=%" PRIu64
                 " d3dSeq=%" PRIu64 "-%" PRIu64
                 " encoders=%u/%u render=%u compute=%u blit=%u other=%u"
+                " present=%u clear=%u resolve=%u scaler=%u"
+                " signal=%u wait=%u timestamp=%u"
                 " barrierOnly=%u fenceWait=%u fenceUpdate=%u initEvent=%" PRIu64
+                " priorLocalWait=%u futureLocalWait=%u sameEncoderWait=%u"
+                " externalWait=%u repeatedUpdate=%u"
+                " renderValidCrossStage=%u renderSameStage=%u renderReverseStage=%u"
+                " localFenceIds=%u boundFenceSlots=%u"
+                " encodedFenceWait=%u skippedExternalFenceWait=%u"
+                " fenceEdgeCount=%u fenceEdgeOverflow=%u"
+                " sparseCalls=%u sparseOps=%u sparseMap=%u sparseUnmap=%u"
+                " sparseFailures=%u sparseBarriers=%u"
+                " sparseResource=%" PRIu64 " sparseTexture=0x%" PRIx64
+                " sparseHeap=0x%" PRIx64 " sparseGpuResource=%" PRIu64
+                " sparseGeneration=%" PRIu64 "-%" PRIu64
+                " sparseAccess=%u sparseAccessFlags=0x%x"
+                " sparseAccessSubresource=%u:%u"
+                " sparseAccessDescriptor=0x%" PRIx64
+                " sparseAccessResource=%" PRIu64
+                " sparseAccessTexture=0x%" PRIx64
+                " sparseAccessGpuResource=%" PRIu64
+                " sparseAccessEncoder=%" PRIu64
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
                 (void *)(uintptr_t)feedbackMetalBuffer,
@@ -1029,6 +1285,10 @@ dxmt_metal4_is_buffer(id object) {
                 (unsigned long)feedbackWaitEvents.count,
                 (unsigned long)feedbackSignalEvents.count,
                 feedbackHasDrawable,
+                feedbackCompletionBeforeThrottle,
+                feedbackCompletionAtCommit,
+                feedbackInflightBeforeThrottle,
+                feedbackInflightAtCommit,
                 feedbackDiagnostic.frame_id,
                 feedbackDiagnostic.chunk_id,
                 feedbackDiagnostic.d3d_sequence_begin,
@@ -1039,16 +1299,84 @@ dxmt_metal4_is_buffer(id object) {
                 feedbackDiagnostic.compute_encoder_count,
                 feedbackDiagnostic.blit_encoder_count,
                 feedbackDiagnostic.other_encoder_count,
+                feedbackDiagnostic.present_encoder_count,
+                feedbackDiagnostic.clear_encoder_count,
+                feedbackDiagnostic.resolve_encoder_count,
+                feedbackDiagnostic.scaler_encoder_count,
+                feedbackDiagnostic.signal_event_count,
+                feedbackDiagnostic.wait_event_count,
+                feedbackDiagnostic.timestamp_encoder_count,
                 feedbackDiagnostic.barrier_only_pass_count,
                 feedbackDiagnostic.fence_wait_count,
                 feedbackDiagnostic.fence_update_count,
                 feedbackDiagnostic.resource_initializer_event_id,
+                feedbackDiagnostic.prior_local_fence_wait_count,
+                feedbackDiagnostic.future_local_fence_wait_count,
+                feedbackDiagnostic.same_encoder_fence_wait_count,
+                feedbackDiagnostic.external_fence_wait_count,
+                feedbackDiagnostic.repeated_fence_update_count,
+                feedbackDiagnostic.render_valid_cross_stage_count,
+                feedbackDiagnostic.render_same_stage_wait_count,
+                feedbackDiagnostic.render_reverse_stage_wait_count,
+                feedbackDiagnostic.local_fence_id_count,
+                feedbackDiagnostic.bound_fence_slot_count,
+                feedbackDiagnostic.encoded_fence_wait_count,
+                feedbackDiagnostic.skipped_external_fence_wait_count,
+                feedbackDiagnostic.fence_edge_count,
+                feedbackDiagnostic.fence_edge_overflow_count,
+                feedbackDiagnostic.sparse_mapping_call_count,
+                feedbackDiagnostic.sparse_mapping_operation_count,
+                feedbackDiagnostic.sparse_mapping_map_count,
+                feedbackDiagnostic.sparse_mapping_unmap_count,
+                feedbackDiagnostic.sparse_mapping_failure_count,
+                feedbackDiagnostic.sparse_mapping_barrier_count,
+                feedbackDiagnostic.sparse_resource_identity,
+                feedbackDiagnostic.sparse_texture_handle,
+                feedbackDiagnostic.sparse_heap_handle,
+                feedbackDiagnostic.sparse_gpu_resource_id,
+                feedbackDiagnostic.sparse_mapping_generation_begin,
+                feedbackDiagnostic.sparse_mapping_generation_end,
+                feedbackDiagnostic.sparse_access_count,
+                feedbackDiagnostic.sparse_access_flags,
+                feedbackDiagnostic.sparse_access_level,
+                feedbackDiagnostic.sparse_access_slice,
+                feedbackDiagnostic.sparse_access_descriptor,
+                feedbackDiagnostic.sparse_access_resource_identity,
+                feedbackDiagnostic.sparse_access_texture_handle,
+                feedbackDiagnostic.sparse_access_gpu_resource_id,
+                feedbackDiagnostic.sparse_access_encoder_id,
                 feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
                 feedback.GPUStartTime, feedback.GPUEndTime,
                 error.domain ? error.domain.UTF8String : "<no domain>",
                 (long)error.code,
                 error.localizedDescription ? error.localizedDescription.UTF8String
                                            : "<no description>");
+
+        if (denseHangDiagnostics) {
+          for (uint32_t edge_index = 0;
+               edge_index < feedbackDiagnostic.fence_edge_count &&
+               edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+               edge_index++) {
+            const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+                &feedbackDiagnostic.fence_edges[edge_index];
+            fprintf(stderr,
+                    "err:   DXMT Metal4 feedback fence edge: commandBuffer=%p"
+                    " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
+                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+                    (void *)(uintptr_t)feedbackCommandBuffer, edge_index,
+                    edge->producer_id, edge->consumer_id,
+                    edge->producer_index, edge->consumer_index, edge->slot,
+                    edge->flags);
+          }
+          NSString *debugDescription = error.debugDescription;
+          NSString *userInfoDescription = error.userInfo.description;
+          fprintf(stderr,
+                  "err:   DXMT Metal4 dense feedback error: commandBuffer=%p"
+                  " debug=%s userInfo=%s\n",
+                  (void *)(uintptr_t)feedbackCommandBuffer,
+                  debugDescription ? debugDescription.UTF8String : "<none>",
+                  userInfoDescription ? userInfoDescription.UTF8String : "<none>");
+        }
 
         NSUInteger waitIndex = 0;
         for (DXMTMetal4QueueEvent *wait in feedbackWaitEvents) {
@@ -1148,7 +1476,8 @@ dxmt_metal4_is_buffer(id object) {
   if (_internalStatus == DXMTMetal4CommandBufferStateNotEnqueued)
     [self commit];
   if (_completionValue) {
-    if (!dxmt_metal4_perf_stats_enabled()) {
+    if (!dxmt_metal4_perf_stats_enabled() &&
+        !dxmt_metal4_dense_hang_diagnostics_enabled()) {
       [_owner.event waitUntilSignaledValue:_completionValue timeoutMS:UINT64_MAX];
     } else {
       uint64_t wait_begin_us = dxmt_monotonic_us();
@@ -1170,6 +1499,59 @@ dxmt_metal4_is_buffer(id object) {
                   (unsigned long)_pendingSignalEvents.count,
                   _pendingDrawable != nil, _owner.presentEventValue,
                   present_current);
+          const struct WMTCommandBufferDiagnosticInfo *diag = &_diagnosticInfo;
+          fprintf(stderr,
+                  "warn:  DXMT Metal4 completion diagnostic: commandBuffer=%p label=%s"
+                  " frame=%" PRIu64 " chunk=%" PRIu64
+                  " d3dSequence=%" PRIu64 "..%" PRIu64
+                  " inputEncoders=%u encodedEncoders=%u render=%u compute=%u blit=%u other=%u"
+                  " present=%u clear=%u resolve=%u scaler=%u timestamps=%u"
+                  " barrierOnly=%u fenceWait=%u fenceUpdate=%u"
+                  " priorLocal=%u futureLocal=%u sameEncoder=%u external=%u"
+                  " repeatedUpdate=%u renderCrossStage=%u renderSameStage=%u"
+                  " renderReverseStage=%u localFenceIds=%u boundFenceSlots=%u"
+                  " encodedFenceWait=%u skippedExternalFenceWait=%u"
+                  " fenceEdgeCount=%u fenceEdgeOverflow=%u"
+                  " resourceInitializerEvent=%" PRIu64 "\n",
+                  self,
+                  _metal4Buffer.label ? _metal4Buffer.label.UTF8String : "<none>",
+                  diag->frame_id, diag->chunk_id,
+                  diag->d3d_sequence_begin, diag->d3d_sequence_end,
+                  diag->input_encoder_count, diag->encoded_encoder_count,
+                  diag->render_encoder_count, diag->compute_encoder_count,
+                  diag->blit_encoder_count, diag->other_encoder_count,
+                  diag->present_encoder_count, diag->clear_encoder_count,
+                  diag->resolve_encoder_count, diag->scaler_encoder_count,
+                  diag->timestamp_encoder_count, diag->barrier_only_pass_count,
+                  diag->fence_wait_count, diag->fence_update_count,
+                  diag->prior_local_fence_wait_count,
+                  diag->future_local_fence_wait_count,
+                  diag->same_encoder_fence_wait_count,
+                  diag->external_fence_wait_count,
+                  diag->repeated_fence_update_count,
+                  diag->render_valid_cross_stage_count,
+                  diag->render_same_stage_wait_count,
+                  diag->render_reverse_stage_wait_count,
+                  diag->local_fence_id_count, diag->bound_fence_slot_count,
+                  diag->encoded_fence_wait_count,
+                  diag->skipped_external_fence_wait_count,
+                  diag->fence_edge_count,
+                  diag->fence_edge_overflow_count,
+                  diag->resource_initializer_event_id);
+          for (uint32_t edge_index = 0;
+               edge_index < diag->fence_edge_count &&
+               edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+               edge_index++) {
+            const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+                &diag->fence_edges[edge_index];
+            fprintf(stderr,
+                    "warn:  DXMT Metal4 completion fence edge: commandBuffer=%p"
+                    " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
+                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+                    self, edge_index, edge->producer_id, edge->consumer_id,
+                    edge->producer_index, edge->consumer_index, edge->slot,
+                    edge->flags);
+          }
           NSUInteger wait_index = 0;
           for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
             uint64_t wait_current = dxmt_metal4_shared_event_value(wait.event);
@@ -1204,6 +1586,24 @@ dxmt_metal4_is_buffer(id object) {
       _internalStatus = DXMTMetal4CommandBufferStateCompleted;
   }
 
+  [self releaseSparseResidencyAllocations];
+
+}
+
+- (void)releaseSparseResidencyAllocations {
+  @synchronized(_owner) {
+    BOOL changed = NO;
+    for (id<MTLAllocation> allocation in _sparseResidencyAllocations) {
+      [_owner.sparseResidencyAllocationRefs removeObject:allocation];
+      if ([_owner.sparseResidencyAllocationRefs countForObject:allocation] == 0) {
+        [_owner.sparseResidencySet removeAllocation:allocation];
+        changed = YES;
+      }
+    }
+    if (changed)
+      [_owner.sparseResidencySet commit];
+    [_sparseResidencyAllocations removeAllObjects];
+  }
 }
 
 - (enum WMTCommandBufferStatus)status {
@@ -1273,12 +1673,57 @@ dxmt_metal4_is_buffer(id object) {
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
   [_pendingDrawable release];
   _pendingDrawable = [drawable retain];
+  if ([drawable conformsToProtocol:@protocol(CAMetalDrawable)]) {
+    id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
+    CAMetalLayer *layer = metalDrawable.layer;
+    id<MTLResidencySet> layerSet = layer.residencySet;
+    if (layerSet)
+      [_metal4Buffer useResidencySet:layerSet];
+    if (dxmt_metal4_residency_diag_enabled()) {
+      static atomic_uint_fast64_t occurrence = 0;
+      const uint64_t index = atomic_fetch_add_explicit(
+                                 &occurrence, 1, memory_order_relaxed) +
+                             1;
+      id<MTLTexture> texture = metalDrawable.texture;
+      if (texture && !texture.label) {
+        texture.label = [NSString
+            stringWithFormat:@"DXMT drawable texture=%p layer=%p", texture,
+                             layer];
+      }
+      if (index <= 8 || (index & (index - 1)) == 0) {
+        fprintf(stderr,
+                "info:  DXMT Metal4 drawable residency: index=%" PRIu64
+                " drawable=%p texture=%p layer=%p set=%p contains=%u allocations=%lu\n",
+                index, drawable, texture, layer, layerSet,
+                layerSet && texture
+                    ? [layerSet containsAllocation:(id<MTLAllocation>)texture]
+                    : 0,
+                layerSet ? (unsigned long)layerSet.allocationCount : 0ul);
+        fflush(stderr);
+      }
+    }
+  }
   _hasPresentDuration = NO;
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(double)duration {
   [_pendingDrawable release];
   _pendingDrawable = [drawable retain];
+  if ([drawable conformsToProtocol:@protocol(CAMetalDrawable)]) {
+    id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
+    CAMetalLayer *layer = metalDrawable.layer;
+    id<MTLResidencySet> layerSet = layer.residencySet;
+    if (layerSet)
+      [_metal4Buffer useResidencySet:layerSet];
+    if (dxmt_metal4_residency_diag_enabled()) {
+      id<MTLTexture> texture = metalDrawable.texture;
+      if (texture && !texture.label) {
+        texture.label = [NSString
+            stringWithFormat:@"DXMT drawable texture=%p layer=%p", texture,
+                             layer];
+      }
+    }
+  }
   _presentDuration = duration;
   _hasPresentDuration = YES;
 }
@@ -4415,15 +4860,37 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
   if (@available(macOS 26.0, *)) {
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     id<MTLSharedEvent> event = [device newSharedEvent];
-    if (!queue || !event) {
+    MTLResidencySetDescriptor *residencyDescriptor =
+        [[MTLResidencySetDescriptor alloc] init];
+    residencyDescriptor.initialCapacity = 2;
+    NSError *residencyError = nil;
+    id<MTLResidencySet> residencySet =
+        [device newResidencySetWithDescriptor:residencyDescriptor
+                                        error:&residencyError];
+    [residencyDescriptor release];
+    if (!queue || !event || !residencySet) {
       [queue release];
       [event release];
+      [residencySet release];
       return STATUS_SUCCESS;
     }
+
+    [residencySet addAllocation:(id<MTLAllocation>)texture];
+    DXMTSparseTextureResidency *residency =
+        dxmt_sparse_texture_residency_for_texture(texture, true);
+    [residency addMappedHeapsToResidencySet:residencySet];
+    if (heap)
+      [residencySet addAllocation:(id<MTLAllocation>)heap];
+    [residencySet commit];
+    [residencySet requestResidency];
+    [queue addResidencySet:residencySet];
 
     MTL4UpdateSparseTextureMappingOperation *mtl_ops =
         calloc((size_t)params->operation_count, sizeof(*mtl_ops));
     if (!mtl_ops) {
+      [queue removeResidencySet:residencySet];
+      [residencySet endResidency];
+      [residencySet release];
       [queue release];
       [event release];
       return STATUS_SUCCESS;
@@ -4448,9 +4915,86 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
     [queue signalEvent:event value:1];
     params->ret = [event waitUntilSignaledValue:1 timeoutMS:UINT64_MAX] ? 1 : 0;
 
+    if (params->ret) {
+      [residency applyOperations:operations
+                           count:params->operation_count
+                            heap:heap];
+    }
+
+    [queue removeResidencySet:residencySet];
+    [residencySet endResidency];
+    [residencySet release];
     free(mtl_ops);
     [queue release];
     [event release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandQueue_updateSparseTextureMappings(void *obj) {
+  struct unixcall_mtldevice_updatesparsetexturemappings *params = obj;
+  DXMTMetal4CommandQueue *queue =
+      (DXMTMetal4CommandQueue *)params->device;
+  id<MTLTexture> texture = (id<MTLTexture>)params->texture;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  const struct WMTSparseTextureMappingOperation *operations =
+      params->operations.ptr;
+  params->ret = 0;
+  if (!queue || !texture || !operations || !params->operation_count)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *)) {
+    MTL4UpdateSparseTextureMappingOperation *mtl_ops =
+        calloc((size_t)params->operation_count, sizeof(*mtl_ops));
+    if (!mtl_ops)
+      return STATUS_SUCCESS;
+
+    for (uint64_t i = 0; i < params->operation_count; ++i) {
+      const struct WMTSparseTextureMappingOperation *src = &operations[i];
+      mtl_ops[i].mode = to_metal_sparse_texture_mapping_mode(src->mode);
+      mtl_ops[i].textureRegion =
+          MTLRegionMake3D(src->x, src->y, src->z, src->width, src->height,
+                          src->depth);
+      mtl_ops[i].textureLevel = src->level;
+      mtl_ops[i].textureSlice = src->slice;
+      mtl_ops[i].heapOffset =
+          src->heap_offset / WMT_SPARSE_TILE_SIZE_IN_BYTES;
+    }
+
+    DXMTSparseTextureResidency *residency =
+        dxmt_sparse_texture_residency_for_texture(texture, true);
+    NSArray *mappedHeaps = [residency mappedHeapsSnapshot];
+
+    @synchronized(queue) {
+      if (!queue.firstError) {
+        NSMutableArray *allocations = [NSMutableArray arrayWithCapacity:
+            mappedHeaps.count + (heap ? 2 : 1)];
+        [allocations addObject:(id<MTLAllocation>)texture];
+        [allocations addObjectsFromArray:mappedHeaps];
+        if (heap)
+          [allocations addObject:(id<MTLAllocation>)heap];
+
+        for (id<MTLAllocation> allocation in allocations) {
+          if ([queue.sparseResidencyAllocationRefs
+                  countForObject:allocation] == 0)
+            [queue.sparseResidencySet addAllocation:allocation];
+          [queue.sparseResidencyAllocationRefs addObject:allocation];
+          [queue.pendingSparseResidencyAllocations addObject:allocation];
+        }
+        [queue.sparseResidencySet commit];
+        [queue.metal4Queue updateTextureMappings:texture
+                                             heap:heap
+                                       operations:mtl_ops
+                                            count:(NSUInteger)params->operation_count];
+        [residency applyOperations:operations
+                             count:params->operation_count
+                              heap:heap];
+        params->ret = 1;
+      }
+    }
+
+    free(mtl_ops);
   }
   return STATUS_SUCCESS;
 }
@@ -4809,6 +5353,60 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static void
+dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
+                                  id<MTLTexture> texture,
+                                  const char *role,
+                                  unsigned attachment_index) {
+  if (!texture)
+    return;
+
+  [owner useResidencyAllocation:(id<MTLAllocation>)texture];
+  if (!dxmt_metal4_residency_diag_enabled())
+    return;
+
+  const BOOL was_unlabelled = texture.label == nil;
+  if (was_unlabelled) {
+    texture.label = [NSString
+        stringWithFormat:@"DXMT attachment %s[%u] texture=%p", role,
+                         attachment_index, texture];
+  }
+  id<MTLAllocation> backing = dxmt_metal4_backing_allocation(
+      (id<MTLAllocation>)texture);
+  if (backing != (id<MTLAllocation>)texture &&
+      [(id)backing conformsToProtocol:@protocol(MTLResource)] &&
+      ![(id<MTLResource>)backing label]) {
+    [(id<MTLResource>)backing setLabel:[NSString
+        stringWithFormat:@"DXMT backing for %s[%u] allocation=%p", role,
+                         attachment_index, backing]];
+  }
+
+  static atomic_uint_fast64_t occurrence = 0;
+  const uint64_t index = atomic_fetch_add_explicit(
+                             &occurrence, 1, memory_order_relaxed) +
+                         1;
+  if (was_unlabelled && (index <= 32 || (index & (index - 1)) == 0)) {
+    fprintf(stderr,
+            "info:  DXMT Metal4 render attachment: index=%" PRIu64
+            " role=%s slot=%u texture=%p class=%s label=%s parent=%p buffer=%p"
+            " heap=%p storage=%lu type=%lu format=%lu size=%lux%lu samples=%lu"
+            " framebufferOnly=%u backing=%p setContainsView=%u"
+            " setContainsBacking=%u setAllocations=%lu\n",
+            index, role, attachment_index, texture,
+            class_getName(object_getClass(texture)), texture.label.UTF8String,
+            texture.parentTexture, texture.buffer, texture.heap,
+            (unsigned long)texture.storageMode,
+            (unsigned long)texture.textureType,
+            (unsigned long)texture.pixelFormat, (unsigned long)texture.width,
+            (unsigned long)texture.height, (unsigned long)texture.sampleCount,
+            texture.framebufferOnly, backing,
+            [owner.residencySet containsAllocation:(id<MTLAllocation>)texture],
+            [owner.residencySet containsAllocation:backing],
+            (unsigned long)owner.residencySet.allocationCount);
+    fflush(stderr);
+  }
+}
+
 static NTSTATUS
 _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
@@ -4816,6 +5414,10 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   DXMTMetal4CommandBuffer *owner = (DXMTMetal4CommandBuffer *)params->handle;
   MTL4RenderPassDescriptor *descriptor = [[MTL4RenderPassDescriptor alloc] init];
   for (unsigned i = 0; i < 8; i++) {
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->colors[i].texture, "color", i);
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->colors[i].resolve_texture, "resolve", i);
     descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
         info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
         info->colors[i].clear_color.a
@@ -4830,11 +5432,11 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.colorAttachments[i].resolveLevel = info->colors[i].resolve_level;
     descriptor.colorAttachments[i].resolveSlice = info->colors[i].resolve_slice;
     descriptor.colorAttachments[i].resolveDepthPlane = info->colors[i].resolve_depth_plane;
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->colors[i].texture];
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->colors[i].resolve_texture];
   }
 
   if (info->depth.texture) {
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->depth.texture, "depth", 0);
     descriptor.depthAttachment.clearDepth = info->depth.clear_depth;
     descriptor.depthAttachment.depthPlane = info->depth.depth_plane;
     descriptor.depthAttachment.level = info->depth.level;
@@ -4842,10 +5444,11 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.depthAttachment.texture = (id<MTLTexture>)info->depth.texture;
     descriptor.depthAttachment.loadAction = (MTLLoadAction)info->depth.load_action;
     descriptor.depthAttachment.storeAction = (MTLStoreAction)info->depth.store_action;
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->depth.texture];
   }
 
   if (info->stencil.texture) {
+    dxmt_metal4_use_render_attachment(
+        owner, (id<MTLTexture>)info->stencil.texture, "stencil", 0);
     descriptor.stencilAttachment.clearStencil = info->stencil.clear_stencil;
     descriptor.stencilAttachment.depthPlane = info->stencil.depth_plane;
     descriptor.stencilAttachment.level = info->stencil.level;
@@ -4853,7 +5456,6 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.stencilAttachment.texture = (id<MTLTexture>)info->stencil.texture;
     descriptor.stencilAttachment.loadAction = (MTLLoadAction)info->stencil.load_action;
     descriptor.stencilAttachment.storeAction = (MTLStoreAction)info->stencil.store_action;
-    [owner useResidencyAllocation:(id<MTLAllocation>)info->stencil.texture];
   }
 
   descriptor.defaultRasterSampleCount = info->default_raster_sample_count;
@@ -4988,6 +5590,8 @@ _MTLDevice_newRenderPipelineState(void *obj) {
 
   descriptor.vertexFunction = (id<MTLFunction>)info->vertex_function;
   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
+  if (dxmt_metal4_pso_labels_enabled() && info->debug_label[0])
+    descriptor.label = [NSString stringWithUTF8String:info->debug_label];
 
   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
@@ -5119,6 +5723,8 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   if (info->rasterization_enabled && !fragment_function)
     fragment_function = DXMTGetNullFragmentFunction(device);
   descriptor.fragmentFunction = fragment_function;
+  if (dxmt_metal4_pso_labels_enabled() && info->debug_label[0])
+    descriptor.label = [NSString stringWithUTF8String:info->debug_label];
   descriptor.payloadMemoryLength = info->payload_memory_length;
 
   if (info->rasterization_enabled && !info->fragment_function) {
@@ -8336,6 +8942,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLCommandBuffer_setDiagnosticInfo,
+    &_MTLCommandQueue_updateSparseTextureMappings,
 };
 
 #ifndef DXMT_NATIVE
@@ -8517,5 +9124,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLCommandBuffer_setDiagnosticInfo,
+    &_MTLCommandQueue_updateSparseTextureMappings,
 };
 #endif

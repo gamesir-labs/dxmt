@@ -177,6 +177,8 @@ The following environment variables can be used for **debugging** purposes.
 - `MTL_SHADER_VALIDATION=1` Enable Metal shader validation layer
 - `MTL_DEBUG_LAYER=1` Enable Metal API validation layer
 - `MTL_CAPTURE_ENABLED=1` Enable Metal frame capture
+- `DXMT_DIAG_METAL_PSO_LABELS=1`: Labels Metal render/mesh PSOs with the stable DXMT pipeline key so shader-validation errors can be mapped back to pipeline dumps.
+- `DXMT_DIAG_METAL_RESIDENCY=1`: Emits bounded drawable/layer residency diagnostics and labels otherwise unnamed drawable textures.
 - `DXMT_CAPTURE_EXECUTABLE="the executable name without extension"` Must be set to enable Metal frame capture. Press F10 to generate a capture. The captured result will be stored in the same directory as the executable.
 - `DXMT_CAPTURE_FRAME=n` Automatically capture n-th frame. Useful for debugging a replay.
 - `DXMT_LOG_LEVEL=none|error|warn|info|debug` Controls message logging.

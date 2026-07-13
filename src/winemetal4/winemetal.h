@@ -114,6 +114,17 @@ WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
     obj_handle_t cmdbuf, uint64_t *residency_submit_us);
 
+#define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 8
+
+struct WMTCommandBufferFenceEdgeDiagnostic {
+  uint64_t producer_id;
+  uint64_t consumer_id;
+  uint32_t producer_index;
+  uint32_t consumer_index;
+  uint32_t slot;
+  uint32_t flags;
+};
+
 struct WMTCommandBufferDiagnosticInfo {
   uint64_t frame_id;
   uint64_t chunk_id;
@@ -126,13 +137,57 @@ struct WMTCommandBufferDiagnosticInfo {
   uint32_t compute_encoder_count;
   uint32_t blit_encoder_count;
   uint32_t other_encoder_count;
+  uint32_t present_encoder_count;
+  uint32_t clear_encoder_count;
+  uint32_t resolve_encoder_count;
+  uint32_t scaler_encoder_count;
+  uint32_t signal_event_count;
+  uint32_t wait_event_count;
+  uint32_t timestamp_encoder_count;
   uint32_t barrier_only_pass_count;
   uint32_t fence_wait_count;
   uint32_t fence_update_count;
-  uint32_t reserved[3];
+  uint32_t prior_local_fence_wait_count;
+  uint32_t future_local_fence_wait_count;
+  uint32_t same_encoder_fence_wait_count;
+  uint32_t external_fence_wait_count;
+  uint32_t repeated_fence_update_count;
+  uint32_t render_valid_cross_stage_count;
+  uint32_t render_same_stage_wait_count;
+  uint32_t render_reverse_stage_wait_count;
+  uint32_t local_fence_id_count;
+  uint32_t bound_fence_slot_count;
+  uint32_t encoded_fence_wait_count;
+  uint32_t skipped_external_fence_wait_count;
+  uint32_t fence_edge_count;
+  uint32_t fence_edge_overflow_count;
+  uint32_t sparse_mapping_call_count;
+  uint32_t sparse_mapping_operation_count;
+  uint32_t sparse_mapping_map_count;
+  uint32_t sparse_mapping_unmap_count;
+  uint32_t sparse_mapping_failure_count;
+  uint32_t sparse_mapping_barrier_count;
+  uint64_t sparse_resource_identity;
+  uint64_t sparse_texture_handle;
+  uint64_t sparse_heap_handle;
+  uint64_t sparse_gpu_resource_id;
+  uint64_t sparse_mapping_generation_begin;
+  uint64_t sparse_mapping_generation_end;
+  uint32_t sparse_access_count;
+  uint32_t sparse_access_flags;
+  uint32_t sparse_access_level;
+  uint32_t sparse_access_slice;
+  uint64_t sparse_access_descriptor;
+  uint64_t sparse_access_resource_identity;
+  uint64_t sparse_access_texture_handle;
+  uint64_t sparse_access_gpu_resource_id;
+  uint64_t sparse_access_encoder_id;
+  struct WMTCommandBufferFenceEdgeDiagnostic
+      fence_edges[WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY];
 };
 
-STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 88);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferFenceEdgeDiagnostic) == 32);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 544);
 
 WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,
@@ -651,6 +706,12 @@ struct WMTSparseTextureMappingOperation {
   uint64_t heap_offset; // bytes
 };
 
+WINEMETAL_API bool MTLCommandQueue_updateSparseTextureMappings(
+    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap,
+    const struct WMTSparseTextureMappingOperation *operations,
+    uint64_t operation_count
+);
+
 WINEMETAL_API obj_handle_t MTLDevice_newTexture(obj_handle_t device, struct WMTTextureInfo *info);
 
 WINEMETAL_API bool MTLDevice_supportsPlacementSparse(obj_handle_t device);
@@ -990,6 +1051,7 @@ struct WMTRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   uint8_t padding[6];
+  char debug_label[64];
 };
 
 struct WMTMeshRenderPipelineInfo {
@@ -1015,6 +1077,7 @@ struct WMTMeshRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   uint8_t padding[6];
+  char debug_label[64];
 };
 
 WINEMETAL_API obj_handle_t

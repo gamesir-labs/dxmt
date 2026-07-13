@@ -1,6 +1,7 @@
 #include <dxmt_test.hpp>
 
 #include "d3d12_test_context.hpp"
+#include "shaders/runtime_test_shaders.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,15 @@ using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
+using dxmt::test::TextureUavPixelShader;
+
+void SetUnixEnvironment(const char *name, const char *value) {
+  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
+  auto set_unix_env = reinterpret_cast<SetUnixEnvProc>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
+  ASSERT_NE(set_unix_env, nullptr);
+  EXPECT_EQ(set_unix_env(name, value), 0);
+}
 
 void SetUnixEnvironment(const char *name, const char *value) {
   using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
@@ -71,6 +81,105 @@ protected:
 
   D3D12TestContext context_;
 };
+
+TEST_F(D3D12QueueSpec, CompiledZeroInstanceDrawIsANoOp) {
+  auto render_target = context_.CreateTexture2D(
+      32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(render_target);
+  ASSERT_TRUE(rtv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(render_target.get(), nullptr, rtv);
+
+  D3D12_DESCRIPTOR_RANGE uav_range = {};
+  uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  uav_range.NumDescriptors = 1;
+  uav_range.BaseShaderRegister = 1;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[0].DescriptorTable.pDescriptorRanges = &uav_range;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants.ShaderRegister = 0;
+  parameters[1].Constants.Num32BitValues = 1;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  auto pipeline = context_.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+      TextureUavPixelShader());
+  ASSERT_TRUE(root_signature);
+  ASSERT_TRUE(pipeline);
+
+  const float uav_value = 1.0f;
+  auto uav_texture = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(uav_texture);
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      uav_texture.get(), &uav_value, sizeof(uav_value), sizeof(uav_value))));
+  D3D12TestContext::Transition(
+      context_.list(), uav_texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto uav_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  ASSERT_TRUE(uav_heap);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+  uav_desc.Format = DXGI_FORMAT_R32_FLOAT;
+  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  context_.device()->CreateUnorderedAccessView(
+      uav_texture.get(), nullptr, &uav_desc,
+      uav_heap->GetCPUDescriptorHandleForHeapStart());
+
+  const float clear_color[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  ID3D12DescriptorHeap *heaps[] = {uav_heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetGraphicsRootDescriptorTable(
+      0, uav_heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetGraphicsRoot32BitConstant(1, 0, 0);
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, 32, 32};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+
+  // D3D12 defines this as a no-op. The compiled path must not turn it into an
+  // invalid Metal draw, and the following valid draw must still render.
+  context_.list()->DrawInstanced(3, 0, 0, 0);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(
+      context_.list(), render_target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackTexture(render_target.get(), &readback)));
+  ASSERT_EQ(readback.width, 32u);
+  ASSERT_EQ(readback.height, 32u);
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      std::uint32_t pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      ASSERT_TRUE(ColorsMatch(pixel, 0xffffffff, 0))
+          << "pixel (" << x << ", " << y << ") was 0x" << std::hex
+          << pixel;
+    }
+  }
+}
 
 struct ScopedBarrierOnlyMarker {
   explicit ScopedBarrierOnlyMarker(const char *suffix) {
@@ -134,6 +243,52 @@ struct ScopedCommandBufferErrorMarker {
       Sleep(10);
     }
     return Count() >= expected;
+  }
+
+  std::string path;
+};
+
+struct CommandBufferDiagnosticTotals {
+  std::uint64_t input_encoders = 0;
+  std::uint64_t encoded_encoders = 0;
+  std::uint64_t encoded_blit = 0;
+  std::uint64_t barrier_only = 0;
+  std::uint64_t fence_waits = 0;
+  std::uint64_t fence_updates = 0;
+};
+
+struct ScopedCommandBufferDiagnosticMarker {
+  ScopedCommandBufferDiagnosticMarker() {
+    std::ostringstream name;
+    name << "C:\\dxmt-command-buffer-diagnostic-" << GetCurrentProcessId()
+         << "-" << GetTickCount64() << ".txt";
+    path = name.str();
+    std::ofstream(path, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
+                            path.c_str());
+  }
+
+  ~ScopedCommandBufferDiagnosticMarker() {
+    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
+                            nullptr);
+    DeleteFileA(path.c_str());
+  }
+
+  CommandBufferDiagnosticTotals Read() const {
+    std::ifstream input(path);
+    CommandBufferDiagnosticTotals totals = {};
+    CommandBufferDiagnosticTotals line = {};
+    while (input >> line.input_encoders >> line.encoded_encoders >>
+           line.encoded_blit >> line.barrier_only >> line.fence_waits >>
+           line.fence_updates) {
+      totals.input_encoders += line.input_encoders;
+      totals.encoded_encoders += line.encoded_encoders;
+      totals.encoded_blit += line.encoded_blit;
+      totals.barrier_only += line.barrier_only;
+      totals.fence_waits += line.fence_waits;
+      totals.fence_updates += line.fence_updates;
+    }
+    return totals;
   }
 
   std::string path;
@@ -490,6 +645,63 @@ TEST_F(D3D12QueueSpec, ClearsRenderTargetViewsAcrossMipChain) {
                       x * sizeof(pixel),
                   sizeof(pixel));
       EXPECT_EQ(pixel, kPackedWhite)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(D3D12QueueSpec,
+       LargeClearDependencyStormCompletesWithoutFenceAmplification) {
+  constexpr UINT kResourceCount = 64;
+  constexpr UINT kClearCount = 600;
+  ScopedCommandBufferDiagnosticMarker diagnostic;
+
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResourceCount, false);
+  ASSERT_TRUE(rtv_heap);
+
+  std::array<ComPtr<ID3D12Resource>, kResourceCount> textures;
+  for (UINT i = 0; i < kResourceCount; i++) {
+    textures[i] = context_.CreateTexture2D(
+        64, 64, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ASSERT_TRUE(textures[i]);
+    context_.device()->CreateRenderTargetView(
+        textures[i].get(), nullptr,
+        context_.CpuDescriptorHandle(rtv_heap.get(), i));
+  }
+
+  constexpr FLOAT kClearColor[] = {0.25f, 0.5f, 0.75f, 1.0f};
+  for (UINT i = 0; i < kClearCount; i++) {
+    context_.list()->ClearRenderTargetView(
+        context_.CpuDescriptorHandle(rtv_heap.get(), i % kResourceCount),
+        kClearColor, 0, nullptr);
+  }
+
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+  const auto totals = diagnostic.Read();
+  EXPECT_GE(totals.input_encoders, kClearCount);
+  EXPECT_LE(totals.fence_waits, kClearCount);
+  EXPECT_LE(totals.fence_updates, kClearCount + kResourceCount);
+  EXPECT_EQ(totals.barrier_only, 0u);
+
+  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+  D3D12TestContext::Transition(
+      context_.list(), textures[0].get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  ASSERT_TRUE(
+      SUCCEEDED(context_.ReadbackTexture(textures[0].get(), &readback)));
+  ASSERT_EQ(readback.width, 64u);
+  ASSERT_EQ(readback.height, 64u);
+
+  const std::array<std::uint8_t, 4> expected = {64, 128, 191, 255};
+  for (UINT y = 0; y < readback.height; y++) {
+    for (UINT x = 0; x < readback.width; x++) {
+      const auto *pixel = readback.data.data() + y * readback.row_pitch +
+                          x * expected.size();
+      EXPECT_TRUE(std::equal(expected.begin(), expected.end(), pixel))
           << "pixel (" << x << ", " << y << ")";
     }
   }

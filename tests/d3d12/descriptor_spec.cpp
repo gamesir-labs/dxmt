@@ -2,6 +2,7 @@
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
+#include "../../src/d3d12/d3d12_descriptor_shape.hpp"
 
 #include <array>
 #include <atomic>
@@ -14,6 +15,10 @@
 
 namespace {
 
+using dxmt::d3d12::DescriptorTextureViewShape;
+using dxmt::d3d12::GetSrvTextureViewShape;
+using dxmt::d3d12::GetUavTextureViewShape;
+
 using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
@@ -21,6 +26,63 @@ using dxmt::test::DescriptorTablePixelShader;
 using dxmt::test::CopyTextureComputeShader;
 using dxmt::test::TextureReadback;
 using dxmt::test::TextureUavPixelShader;
+
+// Reads a typed buffer SRV at t0 and writes input[0] + 0x12345678 to a typed
+// buffer UAV at u0. Keeping the compiled SM5 bytecode in the test avoids
+// cross-process D3DCompile cache noise in the parallel Wine test scheduler.
+inline constexpr DWORD kNullBufferSrvComputeShader[] = {
+    0x43425844, 0x3a97a165, 0x991f089a, 0x7ac9a64e, 0xd12295a5,
+    0x00000001, 0x00000264, 0x00000005, 0x00000034, 0x00000044,
+    0x00000054, 0x0000011c, 0x000001c8, 0x4e475349, 0x00000008,
+    0x00000000, 0x00000008, 0x4e47534f, 0x00000008, 0x00000000,
+    0x00000008, 0x46454452, 0x000000c0, 0x00000000, 0x0000009c,
+    0x00000002, 0x0000003c, 0x43530500, 0x00000000, 0x0000009c,
+    0x31314452, 0x0000003c, 0x00000018, 0x00000020, 0x00000028,
+    0x00000024, 0x0000000c, 0x00000000, 0x0000007c, 0x00000002,
+    0x00000004, 0x00000001, 0xffffffff, 0x00000000, 0x00000001,
+    0x00000001, 0x0000008c, 0x00000004, 0x00000004, 0x00000001,
+    0xffffffff, 0x00000000, 0x00000001, 0x00000001, 0x75706e69,
+    0x75625f74, 0x72656666, 0xababab00, 0x7074756f, 0x625f7475,
+    0x65666675, 0xabab0072, 0x33646b76, 0x68732d64, 0x72656461,
+    0x312e3120, 0x57282038, 0x20656e69, 0x646e7562, 0x2964656c,
+    0xababab00, 0x52444853, 0x000000a4, 0x00050050, 0x00000029,
+    0x0400009b, 0x00000001, 0x00000001, 0x00000001, 0x02000068,
+    0x00000001, 0x04000858, 0x00107001, 0x00000000, 0x00004444,
+    0x0400089c, 0x0011e001, 0x00000000, 0x00004444, 0x0a00002d,
+    0x00100012, 0x00000000, 0x00004002, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00107006, 0x00000000, 0x0700001e,
+    0x00100012, 0x00000000, 0x00100006, 0x00000000, 0x00004001,
+    0x12345678, 0x070000a4, 0x0011e0f2, 0x00000000, 0x00004001,
+    0x00000000, 0x00100006, 0x00000000, 0x0100003e, 0x54415453,
+    0x00000094, 0x00000008, 0x00000001, 0x00000000, 0x00000000,
+    0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001,
+};
+
+TEST(D3D12DescriptorShape, ClassifiesShaderResourceViewArrayness) {
+  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_TEXTURE2D),
+            DescriptorTextureViewShape::NonArray);
+  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_TEXTURE2DARRAY),
+            DescriptorTextureViewShape::Array);
+  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_TEXTURECUBEARRAY),
+            DescriptorTextureViewShape::Array);
+  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_BUFFER),
+            DescriptorTextureViewShape::NotTexture);
+}
+
+TEST(D3D12DescriptorShape, ClassifiesUnorderedAccessViewArrayness) {
+  EXPECT_EQ(GetUavTextureViewShape(D3D12_UAV_DIMENSION_TEXTURE2D),
+            DescriptorTextureViewShape::NonArray);
+  EXPECT_EQ(GetUavTextureViewShape(D3D12_UAV_DIMENSION_TEXTURE2DARRAY),
+            DescriptorTextureViewShape::Array);
+  EXPECT_EQ(GetUavTextureViewShape(D3D12_UAV_DIMENSION_BUFFER),
+            DescriptorTextureViewShape::NotTexture);
+}
 
 struct RenderTarget {
   ComPtr<ID3D12Resource> texture;
@@ -101,10 +163,21 @@ protected:
   D3D12TestContext context_;
 };
 
+bool TestInjectionEnabled(const char *name) {
+  char value[8] = {};
+  const DWORD length = GetEnvironmentVariableA(
+      name, value, static_cast<DWORD>(std::size(value)));
+  return length && length < std::size(value) &&
+         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "yes") == 0);
+}
+
 struct DescriptorTableDrawOptions {
   bool execute_indirect = false;
   bool test_occlusion_queries = false;
   UINT overwrite_count = 0;
+  bool null_cbv = false;
+  bool null_other_heap_cbv = false;
   bool write_unused_slots_concurrently = false;
   bool write_other_heap_concurrently = false;
   bool copy_from_released_cpu_heaps = false;
@@ -294,7 +367,8 @@ void RunDescriptorTableDraw(
   }
   if (!other_resource_heap) {
     context.device()->CreateConstantBufferView(
-        &cbv_desc, context.CpuDescriptorHandle(resource_write_heap, 5));
+        options.null_cbv ? nullptr : &cbv_desc,
+        context.CpuDescriptorHandle(resource_write_heap, 5));
   }
 
   // D3D12 permits independent descriptor slots in one heap to be populated by
@@ -444,7 +518,7 @@ void RunDescriptorTableDraw(
     std::barrier publish_barrier(3);
     auto publish_used_descriptors =
         [&](ID3D12DescriptorHeap *heap,
-            D3D12_CONSTANT_BUFFER_VIEW_DESC descriptor) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC descriptor, bool null_cbv) {
       publish_barrier.arrive_and_wait();
       for (UINT i = 0; i < textures.size(); ++i) {
         context.device()->CreateShaderResourceView(
@@ -452,12 +526,14 @@ void RunDescriptorTableDraw(
             context.CpuDescriptorHandle(heap, i + 1));
       }
       context.device()->CreateConstantBufferView(
-          &descriptor, context.CpuDescriptorHandle(heap, 5));
+          null_cbv ? nullptr : &descriptor,
+          context.CpuDescriptorHandle(heap, 5));
     };
     std::thread first_heap_writer(publish_used_descriptors,
-                                  resource_heap.get(), cbv_desc);
+                                  resource_heap.get(), cbv_desc, false);
     std::thread second_heap_writer(publish_used_descriptors,
-                                   other_resource_heap.get(), other_cbv_desc);
+                                   other_resource_heap.get(), other_cbv_desc,
+                                   options.null_other_heap_cbv);
     publish_barrier.arrive_and_wait();
     first_heap_writer.join();
     second_heap_writer.join();
@@ -595,10 +671,14 @@ void RunDescriptorTableDraw(
     for (auto &writer : writers)
       writer.join();
   ASSERT_TRUE(SUCCEEDED(readback_hr));
-  if (other_resource_heap)
-    ExpectSplitColor(readback, 0xb2664c19, 0xff00ff00, 2);
-  else
-    ExpectSolidColor(readback, 0xb2664c19, 2);
+  if (other_resource_heap) {
+    ExpectSplitColor(readback, 0xb2664c19,
+                     options.null_other_heap_cbv ? 0x00000000 : 0xff00ff00,
+                     2);
+  } else {
+    ExpectSolidColor(readback,
+                     options.null_cbv ? 0x00000000 : 0xb2664c19, 2);
+  }
 
   if (query_results) {
     void *mapped = nullptr;
@@ -626,6 +706,189 @@ TEST_F(D3D12DescriptorSpec, ResolvesOcclusionAcrossBatchedDrawBoundaries) {
 
 TEST_F(D3D12DescriptorSpec, ReusesBackendEntriesWhenDescriptorsAreOverwritten) {
   RunDescriptorTableDraw(context_, {.overwrite_count = 32});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       NullCbvReadsAsZeroThroughCompiledNativeDescriptorTable) {
+  RunDescriptorTableDraw(context_, {.null_cbv = true});
+}
+
+DXMT_SERIAL_TEST_F(
+    D3D12DescriptorSpec,
+    NullBufferSrvReadsAsZeroThroughCompiledNativeDescriptorTable) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].BaseShaderRegister = 0;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].BaseShaderRegister = 0;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const D3D12_SHADER_BYTECODE bytecode = {kNullBufferSrvComputeShader,
+                                          sizeof(kNullBufferSrvComputeShader)};
+  auto pipeline =
+      context_.CreateComputePipeline(root_signature.get(), bytecode);
+  ASSERT_TRUE(pipeline);
+
+  auto output = context_.CreateBuffer(
+      sizeof(uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(output);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(heap);
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC null_srv = {};
+  null_srv.Format = DXGI_FORMAT_R32_UINT;
+  null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  null_srv.Buffer.NumElements = 1;
+  context_.device()->CreateShaderResourceView(
+      nullptr, &null_srv, context_.CpuDescriptorHandle(heap.get(), 0));
+  D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav = {};
+  output_uav.Format = DXGI_FORMAT_R32_UINT;
+  output_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  output_uav.Buffer.NumElements = 1;
+  context_.device()->CreateUnorderedAccessView(
+      output.get(), nullptr, &output_uav,
+      context_.CpuDescriptorHandle(heap.get(), 1));
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<uint8_t> readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackBuffer(output.get(), sizeof(uint32_t), &readback)));
+  ASSERT_EQ(readback.size(), sizeof(uint32_t));
+  uint32_t value = 0;
+  std::memcpy(&value, readback.data(), sizeof(value));
+  EXPECT_EQ(value, 0x12345678u);
+}
+
+TEST_F(D3D12DescriptorSpec,
+       NullTextureSrvReadsAsZeroThroughCompiledDescriptorTable) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].BaseShaderRegister = 0;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].BaseShaderRegister = 0;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(), CopyTextureComputeShader());
+  auto output = context_.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(root_signature);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(output);
+  ASSERT_TRUE(heap);
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC null_srv = {};
+  null_srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  null_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  null_srv.Texture2D.MipLevels = 1;
+  context_.device()->CreateShaderResourceView(
+      nullptr, &null_srv, context_.CpuDescriptorHandle(heap.get(), 0));
+  context_.device()->CreateUnorderedAccessView(
+      output.get(), nullptr, nullptr,
+      context_.CpuDescriptorHandle(heap.get(), 1));
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackTexture(output.get(), &readback)));
+  const std::array<float, 4> zero = {};
+  for (UINT y = 0; y < 4; ++y) {
+    for (UINT x = 0; x < 4; ++x) {
+      std::array<float, 4> actual = {};
+      std::memcpy(actual.data(),
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(actual),
+                  sizeof(actual));
+      EXPECT_EQ(actual, zero) << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(D3D12DescriptorSpec,
+       AlternatesValidAndNullCbvAcrossCompiledNativeDescriptorHeaps) {
+  RunDescriptorTableDraw(
+      context_, {.null_other_heap_cbv = true,
+                 .write_other_heap_concurrently = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       PreservesValidCbvWhenNativeResourceLookupIsUnavailable) {
+  if (!TestInjectionEnabled(
+          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS"))
+    GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
+
+  RunDescriptorTableDraw(context_);
+}
+
+TEST_F(D3D12DescriptorSpec,
+       PreservesCopiedValidCbvWhenNativeResourceLookupIsUnavailable) {
+  if (!TestInjectionEnabled(
+          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS"))
+    GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
+
+  RunDescriptorTableDraw(context_, {.copy_from_released_cpu_heaps = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution) {
+  if (!TestInjectionEnabled(
+          "DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY"))
+    GTEST_SKIP() << "stale native CBV resource-table injection is disabled";
+
+  RunDescriptorTableDraw(context_);
 }
 
 TEST_F(D3D12DescriptorSpec, PopulatesIndependentDescriptorSlotsConcurrently) {
@@ -752,6 +1015,226 @@ TEST_F(D3D12DescriptorSpec, CopiesTextureThroughComputeDescriptorTable) {
       EXPECT_EQ(actual, expected) << "pixel (" << x << ", " << y << ")";
     }
   }
+}
+
+TEST_F(D3D12DescriptorSpec,
+       AdaptsArrayResourceToTexture2DForCompiledDescriptorTable) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].BaseShaderRegister = 0;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].BaseShaderRegister = 0;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(), CopyTextureComputeShader());
+  ASSERT_TRUE(root_signature);
+  ASSERT_TRUE(pipeline);
+
+  D3D12_HEAP_PROPERTIES heap_properties = {};
+  heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC source_desc = {};
+  source_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  source_desc.Width = 4;
+  source_desc.Height = 4;
+  source_desc.DepthOrArraySize = 2;
+  source_desc.MipLevels = 1;
+  source_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  source_desc.SampleDesc.Count = 1;
+  source_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  ComPtr<ID3D12Resource> source;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommittedResource(
+      &heap_properties, D3D12_HEAP_FLAG_NONE, &source_desc,
+      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(source.put()))));
+  auto destination = context_.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  const std::array<float, 4> expected = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::array<std::array<float, 4>, 16> input;
+  input.fill(expected);
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      source.get(), input.data(), 4 * sizeof(input[0]), sizeof(input), 0)));
+  D3D12TestContext::Transition(
+      context_.list(), source.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(heap);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Texture2D.MipLevels = 1;
+  context_.device()->CreateShaderResourceView(
+      source.get(), &srv_desc, context_.CpuDescriptorHandle(heap.get(), 0));
+  context_.device()->CreateUnorderedAccessView(
+      destination.get(), nullptr, nullptr,
+      context_.CpuDescriptorHandle(heap.get(), 1));
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), destination.get(),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackTexture(destination.get(), &readback)));
+  for (UINT y = 0; y < 4; ++y) {
+    for (UINT x = 0; x < 4; ++x) {
+      std::array<float, 4> actual = {};
+      std::memcpy(actual.data(),
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(actual),
+                  sizeof(actual));
+      EXPECT_EQ(actual, expected) << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(D3D12DescriptorSpec,
+       PreservesNativeDescriptorDependencyAcrossCommandLists) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].BaseShaderRegister = 0;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].BaseShaderRegister = 0;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const D3D12_SHADER_BYTECODE bytecode = {kNullBufferSrvComputeShader,
+                                          sizeof(kNullBufferSrvComputeShader)};
+  auto pipeline = context_.CreateComputePipeline(root_signature.get(), bytecode);
+  ASSERT_TRUE(pipeline);
+
+  constexpr uint32_t increment = 0x12345678u;
+  constexpr uint32_t expected = increment + increment;
+  auto intermediate = context_.CreateBuffer(
+      sizeof(uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto output = context_.CreateBuffer(
+      sizeof(uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(intermediate);
+  ASSERT_TRUE(output);
+
+  auto producer_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  auto consumer_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(producer_heap);
+  ASSERT_TRUE(consumer_heap);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_UINT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Buffer.NumElements = 1;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_UINT;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = 1;
+  context_.device()->CreateShaderResourceView(
+      nullptr, &srv,
+      context_.CpuDescriptorHandle(producer_heap.get(), 0));
+  context_.device()->CreateUnorderedAccessView(
+      intermediate.get(), nullptr, &uav,
+      context_.CpuDescriptorHandle(producer_heap.get(), 1));
+  context_.device()->CreateShaderResourceView(
+      intermediate.get(), &srv,
+      context_.CpuDescriptorHandle(consumer_heap.get(), 0));
+  context_.device()->CreateUnorderedAccessView(
+      output.get(), nullptr, &uav,
+      context_.CpuDescriptorHandle(consumer_heap.get(), 1));
+
+  ComPtr<ID3D12CommandAllocator> producer_allocator;
+  ComPtr<ID3D12GraphicsCommandList> producer_list;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE_DIRECT,
+      IID_PPV_ARGS(producer_allocator.put()))));
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
+      0, D3D12_COMMAND_LIST_TYPE_DIRECT, producer_allocator.get(), nullptr,
+      IID_PPV_ARGS(producer_list.put()))));
+  ID3D12DescriptorHeap *producer_heaps[] = {producer_heap.get()};
+  producer_list->SetDescriptorHeaps(1, producer_heaps);
+  producer_list->SetComputeRootSignature(root_signature.get());
+  producer_list->SetPipelineState(pipeline.get());
+  producer_list->SetComputeRootDescriptorTable(
+      0, producer_heap->GetGPUDescriptorHandleForHeapStart());
+  producer_list->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      producer_list.get(), intermediate.get(),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  ASSERT_TRUE(SUCCEEDED(producer_list->Close()));
+
+  ComPtr<ID3D12CommandAllocator> consumer_allocator;
+  ComPtr<ID3D12GraphicsCommandList> consumer_list;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE_DIRECT,
+      IID_PPV_ARGS(consumer_allocator.put()))));
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
+      0, D3D12_COMMAND_LIST_TYPE_DIRECT, consumer_allocator.get(), nullptr,
+      IID_PPV_ARGS(consumer_list.put()))));
+  ID3D12DescriptorHeap *consumer_heaps[] = {consumer_heap.get()};
+  consumer_list->SetDescriptorHeaps(1, consumer_heaps);
+  consumer_list->SetComputeRootSignature(root_signature.get());
+  consumer_list->SetPipelineState(pipeline.get());
+  consumer_list->SetComputeRootDescriptorTable(
+      0, consumer_heap->GetGPUDescriptorHandleForHeapStart());
+  consumer_list->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      consumer_list.get(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ASSERT_TRUE(SUCCEEDED(consumer_list->Close()));
+
+  ID3D12CommandList *lists[] = {producer_list.get(), consumer_list.get()};
+  context_.queue()->ExecuteCommandLists(2, lists);
+  ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+
+  std::vector<uint8_t> readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackBuffer(output.get(), sizeof(uint32_t), &readback)));
+  ASSERT_EQ(readback.size(), sizeof(uint32_t));
+  uint32_t actual = 0;
+  std::memcpy(&actual, readback.data(), sizeof(actual));
+  EXPECT_EQ(actual, expected);
 }
 
 TEST_F(D3D12DescriptorSpec, CopiesTextureUavIntoFallbackDescriptorTable) {

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <vector>
 
 namespace {
 
@@ -25,13 +26,54 @@ enum class SparseCase {
   CopyToMapped,
 };
 
+class ScopedMetal4FeedbackErrorInjection {
+public:
+  ScopedMetal4FeedbackErrorInjection() {
+    using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
+    set_unix_env_ = reinterpret_cast<SetUnixEnvProc>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
+    windows_active_ = SetEnvironmentVariableA(
+        "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", "1");
+    unix_active_ = set_unix_env_ &&
+                   set_unix_env_("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
+                                 "1") == 0;
+  }
+
+  ~ScopedMetal4FeedbackErrorInjection() { Clear(); }
+
+  bool active() const { return windows_active_ && unix_active_; }
+
+  void Clear() {
+    if (windows_active_) {
+      SetEnvironmentVariableA("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
+                              nullptr);
+      windows_active_ = false;
+    }
+    if (unix_active_) {
+      set_unix_env_("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr);
+      unix_active_ = false;
+    }
+  }
+
+private:
+  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
+  SetUnixEnvProc set_unix_env_ = nullptr;
+  bool windows_active_ = false;
+  bool unix_active_ = false;
+};
+
 class D3D12SparseResourceSpec : public ::testing::Test {
 protected:
+  struct SparseBacking {
+    ComPtr<ID3D12Heap> heap;
+    UINT tile_count = 0;
+  };
+
   void SetUp() override {
     ASSERT_TRUE(SUCCEEDED(context_.Initialize()));
   }
 
-  ComPtr<ID3D12Heap> MapAllTiles(ID3D12Resource *resource) {
+  SparseBacking CreateAllTilesBacking(ID3D12Resource *resource) {
     D3D12_PACKED_MIP_INFO packed_mip_info = {};
     D3D12_TILE_SHAPE tile_shape = {};
     D3D12_SUBRESOURCE_TILING tiling = {};
@@ -58,15 +100,30 @@ protected:
     if (FAILED(hr))
       return {};
 
+    return {std::move(heap), total_tile_count};
+  }
+
+  void QueueAllTilesMapping(ID3D12Resource *resource,
+                            const SparseBacking &backing) {
+    ASSERT_TRUE(backing.heap);
+    ASSERT_NE(backing.tile_count, 0u);
     D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
     D3D12_TILE_REGION_SIZE region_size = {};
-    region_size.NumTiles = total_tile_count;
+    region_size.NumTiles = backing.tile_count;
     D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
     UINT heap_range_offset = 0;
     context_.queue()->UpdateTileMappings(
-        resource, 1, &coordinate, &region_size, heap.get(), 1, &range_flag,
-        &heap_range_offset, &total_tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
-    return heap;
+        resource, 1, &coordinate, &region_size, backing.heap.get(), 1,
+        &range_flag, &heap_range_offset, &backing.tile_count,
+        D3D12_TILE_MAPPING_FLAG_NONE);
+  }
+
+  ComPtr<ID3D12Heap> MapAllTiles(ID3D12Resource *resource) {
+    SparseBacking backing = CreateAllTilesBacking(resource);
+    if (!backing.heap)
+      return {};
+    QueueAllTilesMapping(resource, backing);
+    return std::move(backing.heap);
   }
 
   void SampleTexture(ID3D12DescriptorHeap *descriptor_heap,
@@ -277,6 +334,198 @@ TEST_F(D3D12SparseResourceSpec, CopiesIntoUnmappedReservedTexture) {
 
 TEST_F(D3D12SparseResourceSpec, CopiesIntoMappedReservedTexture) {
   RunCase(SparseCase::CopyToMapped);
+}
+
+TEST_F(D3D12SparseResourceSpec, WritesMappedDeepPackedMipTail) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 256;
+  desc.Height = 256;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 9;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource),
+      reinterpret_cast<void **>(texture.put()))));
+  ASSERT_TRUE(texture);
+
+  D3D12_PACKED_MIP_INFO packed = {};
+  D3D12_TILE_SHAPE shape = {};
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
+                                       &shape, nullptr, 0, nullptr);
+  ASSERT_GT(packed.NumPackedMips, 0u);
+  const UINT packed_subresource = desc.MipLevels - 1;
+  ASSERT_GE(packed_subresource, packed.NumStandardMips);
+
+  auto backing_heap = MapAllTiles(texture.get());
+  ASSERT_TRUE(backing_heap);
+
+  constexpr std::uint32_t expected = 0x89abcdefu;
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      texture.get(), &expected, sizeof(expected), sizeof(expected),
+      packed_subresource)));
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = texture.get();
+  barrier.Transition.Subresource = packed_subresource;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  context_.list()->ResourceBarrier(1, &barrier);
+
+  dxmt::test::TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackTexture(texture.get(), &readback, packed_subresource)));
+  ASSERT_GE(readback.data.size(), sizeof(expected));
+  std::uint32_t actual = 0;
+  std::memcpy(&actual, readback.data.data(), sizeof(actual));
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(D3D12SparseResourceSpec,
+       WritesPackedMipAfterMoreThanThirtyTwoQueuedMappings) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  // Metal 4 permits at most 32 residency sets on a command queue. D3D12 does
+  // not expose that implementation limit, so a burst of mapping updates must
+  // remain valid until the following queue work consumes the mapped texture.
+  constexpr std::size_t mapping_burst_size = 40;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 256;
+  desc.Height = 256;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 9;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+
+  std::vector<ComPtr<ID3D12Resource>> textures;
+  std::vector<ComPtr<ID3D12Heap>> backing_heaps;
+  textures.reserve(mapping_burst_size);
+  backing_heaps.reserve(mapping_burst_size);
+  for (std::size_t i = 0; i < mapping_burst_size; ++i) {
+    ComPtr<ID3D12Resource> texture;
+    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+        &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        __uuidof(ID3D12Resource),
+        reinterpret_cast<void **>(texture.put()))));
+    ASSERT_TRUE(texture);
+
+    ComPtr<ID3D12Heap> backing_heap = MapAllTiles(texture.get());
+    ASSERT_TRUE(backing_heap);
+    textures.push_back(std::move(texture));
+    backing_heaps.push_back(std::move(backing_heap));
+  }
+
+  D3D12_PACKED_MIP_INFO packed = {};
+  D3D12_TILE_SHAPE shape = {};
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(textures.back().get(), &total_tiles,
+                                       &packed, &shape, nullptr, 0, nullptr);
+  ASSERT_GT(packed.NumPackedMips, 0u);
+  const UINT packed_subresource = desc.MipLevels - 1;
+  ASSERT_GE(packed_subresource, packed.NumStandardMips);
+
+  constexpr std::uint32_t expected = 0x13579bdfu;
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      textures.back().get(), &expected, sizeof(expected), sizeof(expected),
+      packed_subresource)));
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = textures.back().get();
+  barrier.Transition.Subresource = packed_subresource;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  context_.list()->ResourceBarrier(1, &barrier);
+
+  dxmt::test::TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackTexture(
+      textures.back().get(), &readback, packed_subresource)));
+  ASSERT_GE(readback.data.size(), sizeof(expected));
+  std::uint32_t actual = 0;
+  std::memcpy(&actual, readback.data.data(), sizeof(actual));
+  EXPECT_EQ(actual, expected);
+}
+
+DXMT_SERIAL_TEST_F(D3D12SparseResourceSpec,
+                   DoesNotAccumulateSparseResidencySetsAfterQueueFailure) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  constexpr std::size_t mapping_burst_size = 40;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 256;
+  desc.Height = 256;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 9;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+
+  std::vector<ComPtr<ID3D12Resource>> textures;
+  std::vector<SparseBacking> backings;
+  textures.reserve(mapping_burst_size);
+  backings.reserve(mapping_burst_size);
+  for (std::size_t i = 0; i < mapping_burst_size; ++i) {
+    ComPtr<ID3D12Resource> texture;
+    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+        &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        __uuidof(ID3D12Resource),
+        reinterpret_cast<void **>(texture.put()))));
+    ASSERT_TRUE(texture);
+    SparseBacking backing = CreateAllTilesBacking(texture.get());
+    ASSERT_TRUE(backing.heap);
+    textures.push_back(std::move(texture));
+    backings.push_back(std::move(backing));
+  }
+
+  const std::uint32_t initial_value = 0x01020304u;
+  auto upload = context_.CreateUploadBuffer(
+      sizeof(initial_value), &initial_value, sizeof(initial_value));
+  auto destination = context_.CreateBuffer(
+      sizeof(initial_value), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(destination);
+  context_.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
+                                    sizeof(initial_value));
+
+  ScopedMetal4FeedbackErrorInjection injection;
+  ASSERT_TRUE(injection.active());
+  ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+
+  // Queue the burst before feedback from the first command buffer arrives.
+  // Once that feedback latches the error, the already queued mapping calls
+  // must not accumulate residency sets that rejected command buffers cannot
+  // retire. The regression used to abort around the 33rd update.
+  for (std::size_t i = 0; i < mapping_burst_size; ++i)
+    QueueAllTilesMapping(textures[i].get(), backings[i]);
+  EXPECT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(),
+            DXGI_ERROR_DEVICE_REMOVED);
+  injection.Clear();
 }
 
 TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {

@@ -861,6 +861,14 @@ public:
   removeResidencySet(ResidencySet set) {
     MTLCommandQueue_removeResidencySet(handle, set.handle);
   }
+
+  bool
+  updateSparseTextureMappings(Object texture, Object heap,
+                              const WMTSparseTextureMappingOperation *operations,
+                              uint64_t operation_count) {
+    return MTLCommandQueue_updateSparseTextureMappings(
+        handle, texture.handle, heap.handle, operations, operation_count);
+  }
 };
 
 class Function : public Object {};
@@ -1367,6 +1375,7 @@ InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
   info.binary_archives_for_lookup.set(nullptr);
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
+  info.debug_label[0] = '\0';
 }
 
 inline void
@@ -1414,6 +1423,7 @@ InitializeMeshRenderPipelineInfo(WMTMeshRenderPipelineInfo &info) {
   info.binary_archives_for_lookup.set(nullptr);
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
+  info.debug_label[0] = '\0';
 }
 
 inline void

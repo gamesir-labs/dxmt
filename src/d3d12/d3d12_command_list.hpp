@@ -443,6 +443,12 @@ struct CompiledNativeStageBinding {
   uint64_t resource_root_base_offset = 0;
   uint32_t cbuffer_root_base_count = 0;
   uint32_t resource_root_base_count = 0;
+  // CPU copies are retained for bounded diagnostics. The GPU consumes the
+  // packed native_root_base_buffer; keeping the source words lets a hang log
+  // identify the exact descriptor-table bases without a synchronizing GPU
+  // readback that would perturb command scheduling.
+  std::vector<uint32_t> cbuffer_root_bases;
+  std::vector<uint32_t> resource_root_bases;
   bool ready = false;
 };
 

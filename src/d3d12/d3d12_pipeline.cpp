@@ -53,6 +53,25 @@ D3D12PipelineDiagEnabled() {
 }
 
 static bool
+D3D12MetalPsoLabelsEnabled() {
+  static const bool enabled =
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_METAL_PSO_LABELS") ||
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE") ||
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE");
+  return enabled;
+}
+
+template <typename PipelineInfo>
+void SetMetalPsoDebugLabel(PipelineInfo &info, std::string_view kind,
+                           std::string_view shader_cache_key) {
+  if (!D3D12MetalPsoLabelsEnabled())
+    return;
+  const auto label = dxmt::BuildMetalPsoDebugLabel(
+      kind, shader_cache_key, sizeof(info.debug_label));
+  std::memcpy(info.debug_label, label.c_str(), label.size() + 1);
+}
+
+static bool
 D3D12PipelineDiagShouldLog() {
   static std::atomic<uint32_t> count = 0;
   if (!D3D12PipelineDiagEnabled())
@@ -179,7 +198,8 @@ static uint32_t
 NativeDescriptorImmutableBufferMask(const PipelineDxilShader &shader) {
   uint32_t mask = 0;
   if (shader.reflection().NumConstantBuffers)
-    mask |= BufferBindingBit(
+    mask |= BufferBindingBit(DXMT12_MTL4_NATIVE_NULL_CBUFFER_BIND_INDEX) |
+            BufferBindingBit(
                 DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX) |
             BufferBindingBit(
                 DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX) |
@@ -204,6 +224,10 @@ NativeDescriptorImmutableBufferMask(const PipelineDxilShader &shader) {
                     DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX) |
                 BufferBindingBit(
                     DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX);
+        if (arg.Type == SM50BindingType::SRV &&
+            (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER))
+          mask |= BufferBindingBit(
+              DXMT12_MTL4_NATIVE_NULL_BUFFER_BIND_INDEX);
       }
     }
   }
@@ -1609,6 +1633,12 @@ bool HashShaderCompilationArguments(
           reinterpret_cast<SM50_SHADER_PSO_PIXEL_SHADER_DATA *>(node);
       HashValue(hash, value->sample_mask);
       HashValue(hash, uint8_t(value->dual_source_blending));
+      if (value->dual_source_blending) {
+        // AIR produced before dual-source output indices were propagated is
+        // incompatible, so invalidate only affected persistent cache entries.
+        constexpr uint8_t kDualSourceOutputAbiVersion = 1;
+        HashValue(hash, kDualSourceOutputAbiVersion);
+      }
       HashValue(hash, uint8_t(value->disable_depth_output));
       HashValue(hash, value->unorm_output_reg_mask);
       HashValue(hash, value->demote_msaa_srv_mask_lo);
@@ -2219,6 +2249,7 @@ void
 ApplyBlendState(PipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
                 uint32_t render_target_count,
+                uint32_t pixel_shader_render_target_mask,
                 const FormatCapabilityInspector &format_capabilities) {
   for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
     const auto &src =
@@ -2227,7 +2258,8 @@ ApplyBlendState(PipelineInfo &info,
     dst.write_mask =
         Lookup(kColorWriteMaskMap, uint32_t(src.RenderTargetWriteMask),
                kColorWriteMaskMap[15]);
-    if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid)
+    if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid ||
+        !(pixel_shader_render_target_mask & (1u << rt)))
       continue;
 
     const auto format_capability =
@@ -2502,6 +2534,15 @@ GetNativeShaderAbiEligibilityImpl(
     const auto *arguments = shader.resourceArgumentInfo();
     for (uint32_t i = 0; arguments && i < shader.reflection().NumArguments;
          i++) {
+      // The native descriptor table indexes a heap-global texture-view slot.
+      // Metal texture arrayness is part of the shader-visible texture type, so
+      // it must be specialized per shader rather than written into shared heap
+      // state. Texture-bearing shaders use the per-draw bindless window until
+      // native tables gain an equivalent shader-specific view indirection.
+      if ((arguments[i].Type == SM50BindingType::SRV ||
+           arguments[i].Type == SM50BindingType::UAV) &&
+          (arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE))
+        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
       if (!NativeShaderArgumentHasSingleTableRange(*root_signature,
                                                    shader.stage,
                                                    arguments[i]))
@@ -2718,6 +2759,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
       WMTMeshRenderPipelineInfo info = {};
       WMT::InitializeMeshRenderPipelineInfo(info);
+      SetMetalPsoDebugLabel(info, prefix, shader_cache_key);
       info.object_function = out.tessellation_vertex_hull[variant].function;
       info.mesh_function = out.tessellation_domain.function;
       info.fragment_function = out.pixel.function;
@@ -2738,6 +2780,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
           info.colors[i].pixel_format = rtv_formats[i];
       }
       ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      ps ? ps->reflection().PSValidRenderTargets : 0,
                       format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
@@ -2822,6 +2865,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
       WMTMeshRenderPipelineInfo info = {};
       WMT::InitializeMeshRenderPipelineInfo(info);
+      SetMetalPsoDebugLabel(
+          info, strip_topology ? "mesh-gs-strip" : "mesh-gs",
+          shader_cache_key);
       info.object_function = object_shader.function;
       info.mesh_function = mesh_shader.function;
       info.fragment_function = out.pixel.function;
@@ -2838,6 +2884,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
           info.colors[i].pixel_format = rtv_formats[i];
       }
       ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                      ps ? ps->reflection().PSValidRenderTargets : 0,
                       format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
@@ -2892,6 +2939,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   WMTRenderPipelineInfo info = {};
   WMT::InitializeRenderPipelineInfo(info);
+  SetMetalPsoDebugLabel(info, "graphics", shader_cache_key);
   info.vertex_function = out.vertex.function;
   info.fragment_function = out.pixel.function;
   info.rasterization_enabled = true;
@@ -2921,6 +2969,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       info.colors[i].pixel_format = rtv_formats[i];
   }
   ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
+                  ps ? ps->reflection().PSValidRenderTargets : 0,
                   format_capabilities);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
