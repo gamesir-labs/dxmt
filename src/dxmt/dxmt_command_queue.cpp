@@ -241,13 +241,14 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
       env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");
   if (!diagnostic_marker.empty()) {
     if (FILE *marker = fopen(diagnostic_marker.c_str(), "a")) {
-      fprintf(marker, "%u %u %u %u %u %u\n",
+      fprintf(marker, "%u %u %u %u %u %u %u\n",
               diagnostic.input_encoder_count,
               diagnostic.encoded_encoder_count,
               diagnostic.blit_encoder_count,
               diagnostic.barrier_only_pass_count,
               diagnostic.fence_wait_count,
-              diagnostic.fence_update_count);
+              diagnostic.fence_update_count,
+              diagnostic.external_fence_wait_count);
       fclose(marker);
     }
   }

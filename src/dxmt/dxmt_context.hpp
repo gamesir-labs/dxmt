@@ -1265,8 +1265,8 @@ private:
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
   WMT::Fence fenceForEncoder(EncoderId id);
-  void prepareFencePool(EncoderData **encoders, unsigned encoder_count,
-                        CommandBufferDiagnosticInfo *diagnostic_info);
+  uint32_t prepareFencePool(EncoderData **encoders, unsigned encoder_count,
+                            CommandBufferDiagnosticInfo *diagnostic_info);
   template <typename Fn>
   void withFence(EncoderId id, Fn &&fn) {
     if (auto fence = fenceForEncoder(id))

@@ -224,7 +224,7 @@ ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
   return fence;
 }
 
-void
+uint32_t
 ArgumentEncodingContext::prepareFencePool(
     EncoderData **encoders, unsigned encoder_count,
     CommandBufferDiagnosticInfo *diagnostic_info) {
@@ -333,8 +333,8 @@ ArgumentEncodingContext::prepareFencePool(
     retain_bound(pending_fence_only_blit_update_);
   }
 
+  const auto &order = dependency_order.analysis();
   if (diagnostic_info) {
-    const auto &order = dependency_order.analysis();
     diagnostic_info->prior_local_fence_wait_count = order.prior_local_waits;
     diagnostic_info->future_local_fence_wait_count = order.future_local_waits;
     diagnostic_info->same_encoder_fence_wait_count = order.same_encoder_waits;
@@ -344,6 +344,7 @@ ArgumentEncodingContext::prepareFencePool(
         static_cast<uint32_t>(intervals.size());
     diagnostic_info->bound_fence_slot_count = used_slot_count;
   }
+  return order.external_waits;
 }
 
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Ordinary>(uint32_t slot_mask, uint64_t argument_buffer_offset);
@@ -4221,7 +4222,15 @@ ArgumentEncodingContext::flushCommands(
     perf.timestamp += clock::now() - t0;
   }
 
-  prepareFencePool(encoders, encoder_count, diagnostic_info);
+  const auto external_fence_waits =
+      prepareFencePool(encoders, encoder_count, diagnostic_info);
+  if (external_fence_waits && event_seq_id > 1) {
+    // Fence objects are allocated only for dependencies contained in this
+    // command buffer. Preserve dependencies on producers from an earlier
+    // submission with the queue's per-chunk completion event instead of
+    // silently dropping them or keeping a fixed cross-submit fence pool.
+    cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
+  }
 
   // Report and benchmark only the fence operations that will reach Metal.
   // Encoder construction gives every producer a logical update, but an update
