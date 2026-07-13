@@ -7,6 +7,7 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <string>
 #include <vector>
 
 namespace {
@@ -32,11 +33,13 @@ public:
     using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
     set_unix_env_ = reinterpret_cast<SetUnixEnvProc>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
+    token_ = std::to_string(GetCurrentProcessId()) + "-" +
+             std::to_string(GetTickCount64());
     windows_active_ = SetEnvironmentVariableA(
-        "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", "1");
+        "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", token_.c_str());
     unix_active_ = set_unix_env_ &&
                    set_unix_env_("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
-                                 "1") == 0;
+                                 token_.c_str()) == 0;
   }
 
   ~ScopedMetal4FeedbackErrorInjection() { Clear(); }
@@ -58,6 +61,7 @@ public:
 private:
   using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
   SetUnixEnvProc set_unix_env_ = nullptr;
+  std::string token_;
   bool windows_active_ = false;
   bool unix_active_ = false;
 };

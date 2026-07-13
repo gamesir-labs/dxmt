@@ -16517,41 +16517,6 @@ private:
     }
   };
 
-  static std::vector<ConstantBufferBindingSnapshot>
-  BuildSnapshotConstantBufferBindings(const GraphicsBindingSnapshot &snapshot,
-                                      PipelineStage want_stage,
-                                      const MTL_SM50_SHADER_ARGUMENT *cbuffers,
-                                      uint32_t num_cbuffers) {
-    std::vector<ConstantBufferBindingSnapshot> bindings(14 * kStages);
-    if (!cbuffers || !num_cbuffers)
-      return bindings;
-
-    for (uint32_t i = 0; i < num_cbuffers; i++) {
-      const auto &arg = cbuffers[i];
-      const auto slot = 14 * unsigned(want_stage) + arg.SM50BindingSlot;
-      if (slot >= bindings.size())
-        continue;
-      for (const auto &entry : snapshot.entries) {
-        if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
-            !entry.has_descriptor || entry.stage != want_stage ||
-            entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV)
-          continue;
-        const auto &entry_arg = entry.argument;
-        if (entry_arg.Type != SM50BindingType::ConstantBuffer)
-          continue;
-        if (entry_arg.RegisterSpace != arg.RegisterSpace ||
-            entry.shader_register != arg.RegisterLowerBound)
-          continue;
-        bindings[slot].valid =
-            MakeConstantBufferBindingFromDescriptor(entry.descriptor,
-                                                    bindings[slot].binding);
-        break;
-      }
-    }
-
-    return bindings;
-  }
-
   BindlessBufferTableSnapshotStorage
   BuildSnapshotBindlessBufferTableBindings(
       const GraphicsBindingSnapshot &snapshot, PipelineStage want_stage) {
@@ -16563,22 +16528,24 @@ private:
       if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
         const auto slot = 14 * unsigned(want_stage) + entry.slot;
         if (slot < bindings.constant_buffers.size()) {
-          bindings.constant_buffers[slot].valid =
-              MakeConstantBufferBindingFromDescriptor(
-                  entry.descriptor, bindings.constant_buffers[slot].binding);
+          bindings.constant_buffers[slot].captured = true;
+          MakeConstantBufferBindingFromDescriptor(
+              entry.descriptor, bindings.constant_buffers[slot].binding);
         }
       } else if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
         const auto slot = kSRVBindings * unsigned(want_stage) + entry.slot;
         if (slot < bindings.resources.size()) {
           auto &binding = bindings.resources[slot];
-          binding.srv_valid = MakeShaderResourceBindingFromDescriptor(
+          binding.srv_captured = true;
+          MakeShaderResourceBindingFromDescriptor(
               device_->GetMTLDevice(), entry.descriptor, &entry.argument,
               binding.srv);
         }
       } else if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
         if (entry.slot < kUAVBindings) {
           auto &binding = bindings.resources[entry.slot];
-          binding.uav_valid = MakeUnorderedAccessBindingFromDescriptor(
+          binding.uav_captured = true;
+          MakeUnorderedAccessBindingFromDescriptor(
               device_->GetMTLDevice(), entry.descriptor, &entry.argument,
               binding.uav);
         }
@@ -17153,21 +17120,23 @@ private:
       if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
         const auto slot = 14 * unsigned(want_stage) + binding_slot;
         if (slot < bindings.constant_buffers.size()) {
-          bindings.constant_buffers[slot].valid =
-              MakeConstantBufferBindingFromDescriptor(
-                  *descriptor, bindings.constant_buffers[slot].binding);
+          bindings.constant_buffers[slot].captured = true;
+          MakeConstantBufferBindingFromDescriptor(
+              *descriptor, bindings.constant_buffers[slot].binding);
         }
       } else if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
         const auto slot = kSRVBindings * unsigned(want_stage) + binding_slot;
         if (slot < bindings.resources.size()) {
           auto &binding = bindings.resources[slot];
-          binding.srv_valid = MakeShaderResourceBindingFromDescriptor(
+          binding.srv_captured = true;
+          MakeShaderResourceBindingFromDescriptor(
               device_->GetMTLDevice(), *descriptor, &argument, binding.srv);
         }
       } else if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
         if (binding_slot < kUAVBindings) {
           auto &binding = bindings.resources[binding_slot];
-          binding.uav_valid = MakeUnorderedAccessBindingFromDescriptor(
+          binding.uav_captured = true;
+          MakeUnorderedAccessBindingFromDescriptor(
               device_->GetMTLDevice(), *descriptor, &argument, binding.uav);
         }
       }

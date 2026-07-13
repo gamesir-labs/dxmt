@@ -40,6 +40,15 @@ static void DebugLogNullShaderBinding(
     bool has_counter_binding, uint64_t encoder_id, const char *action = "zero"
 );
 
+template <PipelineStage stage, PipelineKind kind>
+static void DebugLogConstantBufferBinding(
+    const std::string &shader_hash, const MTL_SM50_SHADER_ARGUMENT &arg,
+    const ConstantBufferBinding &binding, uint64_t encoded_address,
+    uint64_t valid_length, uint64_t encoder_id, bool dummy
+);
+
+static bool DebugShouldLogBinding(const std::string &shader_hash);
+
 static bool
 BindlessMirrorVerifyEnabled() {
   return false;
@@ -179,8 +188,8 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
   dummy_cbuffer_info_.memory.set(dummy_cbuffer_host_);
   dummy_cbuffer_info_.options = WMTResourceOptionCPUCacheModeWriteCombined | WMTResourceStorageModeShared |
                                 WMTResourceHazardTrackingModeUntracked;
-  dummy_cbuffer_ = device.newBuffer(dummy_cbuffer_info_);
   std::memset(dummy_cbuffer_info_.memory.get(), 0, 65536);
+  dummy_cbuffer_ = device.newBuffer(dummy_cbuffer_info_);
   cpu_buffer_chunks_.emplace_back();
   barrier_event_ = device_.newEvent();
   for (unsigned i = 0; i < kParityLane; i++) {
@@ -252,43 +261,43 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
 
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Ordinary>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Ordinary>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Tessellation>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Tessellation>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Hull, PipelineKind::Tessellation>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Domain, PipelineKind::Tessellation>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Compute, PipelineKind::Ordinary>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Geometry>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Geometry, PipelineKind::Geometry>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Geometry>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-    uint64_t argument_buffer_offset
+    uint64_t argument_buffer_offset, const std::string &shader_hash
 );
 
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Ordinary>(
@@ -334,8 +343,12 @@ template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixe
 
 template <PipelineStage stage, PipelineKind kind>
 void
-ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset) {
+ArgumentEncodingContext::encodeConstantBuffers(
+    const MTL_SHADER_REFLECTION *reflection,
+    const MTL_SM50_SHADER_ARGUMENT *constant_buffers, uint64_t offset,
+    const std::string &shader_hash) {
   small_vector<uint64_t, 16> encoded_table(reflection->NumConstantBuffers, 0);
+  const auto encoder_id = currentEncoderId();
 
   for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
     auto &arg = constant_buffers[i];
@@ -343,8 +356,24 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     switch (arg.Type) {
     case SM50BindingType::ConstantBuffer: {
       auto &cbuf = cbuf_[slot];
+      if (cbuf.direct_buffer) {
+        encoded_table[arg.StructurePtrOffset] =
+            cbuf.direct_gpu_address + cbuf.offset;
+        DebugLogConstantBufferBinding<stage, kind>(
+            shader_hash, arg, cbuf, encoded_table[arg.StructurePtrOffset],
+            cbuf.direct_length > cbuf.offset
+                ? cbuf.direct_length - cbuf.offset
+                : 0,
+            encoder_id, false);
+        makeResident<stage, kind>(cbuf.direct_buffer,
+                                  GetResidencyMask<kind>(stage, true, false));
+        continue;
+      }
       if (!cbuf.buffer.ptr()) {
         encoded_table[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
+        DebugLogConstantBufferBinding<stage, kind>(
+            shader_hash, arg, cbuf, dummy_cbuffer_info_.gpu_address, 0,
+            encoder_id, true);
         makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
         continue;
       }
@@ -352,6 +381,9 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
       auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
       auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
       encoded_table[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+      DebugLogConstantBufferBinding<stage, kind>(
+          shader_hash, arg, cbuf, encoded_table[arg.StructurePtrOffset],
+          valid_length, encoder_id, false);
       makeResident<stage, kind>(argbuf.ptr());
       break;
     }
@@ -534,7 +566,8 @@ ArgumentEncodingContext::packBindlessCBuffers(
         if (local_slot >= 14 * (unsigned(stage) + 1))
           break;
         const auto &snapshot = bindings[local_slot];
-        write_cbv(local, snapshot.valid ? snapshot.binding : cbuf_[local_slot]);
+        write_cbv(local,
+                  snapshot.captured ? snapshot.binding : cbuf_[local_slot]);
       }
       continue;
     }
@@ -602,8 +635,8 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
-          const auto &srv = snapshot.srv_valid ? snapshot.srv
-                                               : resview_[local_slot];
+          const auto &srv = snapshot.srv_captured ? snapshot.srv
+                                                  : resview_[local_slot];
           const uint32_t dst = compact + local * kBufferTableQwordsPerDescriptor;
           if (srv.buffer.ptr()) {
             auto [srv_alloc, offset] = access<stage>(
@@ -630,8 +663,8 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
-          const auto &srv = snapshot.srv_valid ? snapshot.srv
-                                               : resview_[local_slot];
+          const auto &srv = snapshot.srv_captured ? snapshot.srv
+                                                  : resview_[local_slot];
           if (srv.buffer.ptr()) {
             assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
             auto allocation = srv.buffer->current();
@@ -680,8 +713,9 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
-          const auto &uav = snapshot.uav_valid ? snapshot.uav
-                                               : UAVBindingSet[local_slot];
+          const auto &uav = snapshot.uav_captured
+                                ? snapshot.uav
+                                : UAVBindingSet[local_slot];
           const uint32_t dst = compact + local * kBufferTableQwordsPerDescriptor;
           if (uav.buffer.ptr()) {
             auto [uav_alloc, offset] = access<stage>(
@@ -706,8 +740,9 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
-          const auto &uav = snapshot.uav_valid ? snapshot.uav
-                                               : UAVBindingSet[local_slot];
+          const auto &uav = snapshot.uav_captured
+                                ? snapshot.uav
+                                : UAVBindingSet[local_slot];
           if (uav.buffer.ptr()) {
             assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
             auto allocation = uav.buffer->current();
@@ -736,8 +771,9 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
-          const auto &uav = snapshot.uav_valid ? snapshot.uav
-                                               : UAVBindingSet[local_slot];
+          const auto &uav = snapshot.uav_captured
+                                ? snapshot.uav
+                                : UAVBindingSet[local_slot];
           const uint32_t dst =
               compact + local * kBufferTableQwordsPerDescriptor + 2;
           if (uav.counter) {
@@ -935,7 +971,8 @@ ArgumentEncodingContext::packBindlessStage(
     uint64_t verify_draw_id, uint64_t verify_draw_serial,
     const BindlessBufferTableSnapshot *bindings,
     uint64_t demote_msaa_srv_mask_lo,
-    uint64_t demote_msaa_srv_mask_hi
+    uint64_t demote_msaa_srv_mask_hi,
+    const char *diagnostic_path
 ) {
   const uint32_t num_cbuffers = reflection->NumConstantBuffers;
   const uint32_t num_arguments = reflection->NumArguments;
@@ -948,6 +985,19 @@ ArgumentEncodingContext::packBindlessStage(
       constant_buffers, num_cbuffers, arguments, num_arguments, cb_bases.data(), res_bases.data()
   );
 
+  const auto log_binding = [&](const char *result) {
+    if (!DebugShouldLogBinding(shader_hash))
+      return;
+    INFO("DXMT diagnostic: bindless shader binding",
+         " stage=", BindlessVerifyStageName(stage),
+         " kind=", uint32_t(kind),
+         " shader=", shader_hash,
+         " encoder=", currentEncoderId(),
+         " path=", diagnostic_path ? diagnostic_path : "unknown",
+         " qwords=", qword_count,
+         " result=", result);
+  };
+
   if (!qword_count) {
     // No buffer fields in this stage; tex/sampler still need residency tracked. Run the
     // packers anyway (with a null/zero-size buf_table) so the access<>()/makeResident for
@@ -958,12 +1008,15 @@ ArgumentEncodingContext::packBindlessStage(
                                            res_bases.data(), bindings,
                                            demote_msaa_srv_mask_lo,
                                            demote_msaa_srv_mask_hi);
+    log_binding("empty");
     return {};
   }
 
   auto bt = queue_.AllocateArgumentBuffer(currentSeqId(), uint64_t(qword_count) * sizeof(uint64_t));
-  if (!bt.mapped || !bt.gpu_buffer)
+  if (!bt.mapped || !bt.gpu_buffer) {
+    log_binding("allocation-failed");
     return {};
+  }
   auto *buf_table = static_cast<uint64_t *>(bt.mapped);
   std::memset(buf_table, 0, bt.length);
 
@@ -982,6 +1035,7 @@ ArgumentEncodingContext::packBindlessStage(
 
   if (bt.needs_flush)
     bt.gpu_buffer.updateContents(bt.offset, bt.mapped, bt.length);
+  log_binding("bound");
   return bt;
 }
 
@@ -1159,6 +1213,44 @@ ArgumentEncodingContext::bindNativeArgumentBuffer(
 }
 
 void
+ArgumentEncodingContext::bindNativeNullConstantBuffer(
+    bool compute, WMTRenderStages render_stages) {
+  bindNativeArgumentBuffer(
+      dummy_cbuffer_, 0, DXMT12_MTL4_NATIVE_NULL_CBUFFER_BIND_INDEX,
+      compute, render_stages);
+}
+
+void
+ArgumentEncodingContext::bindNativeNullBuffer(
+    bool compute, WMTRenderStages render_stages) {
+  bindNativeArgumentBuffer(
+      dummy_cbuffer_, 0, DXMT12_MTL4_NATIVE_NULL_BUFFER_BIND_INDEX,
+      compute, render_stages);
+}
+
+void
+ArgumentEncodingContext::diagnoseNativeShaderBinding(
+    PipelineStage stage, const std::string &shader_hash, const char *path,
+    const AllocatedArgumentBufferSlice &cbuffer_root_bases,
+    const AllocatedArgumentBufferSlice &resource_root_bases) {
+  if (!DebugShouldLogBinding(shader_hash))
+    return;
+
+  INFO("DXMT diagnostic: native shader binding",
+       " stage=", BindlessVerifyStageName(stage),
+       " shader=", shader_hash,
+       " encoder=", currentEncoderId(),
+       " path=", path ? path : "unknown",
+       " cbufferGpuAddress=0x", std::hex,
+       cbuffer_root_bases.gpu_address,
+       " cbufferOffset=0x", cbuffer_root_bases.offset,
+       " cbufferLength=0x", cbuffer_root_bases.length,
+       " resourceGpuAddress=0x", resource_root_bases.gpu_address,
+       " resourceOffset=0x", resource_root_bases.offset,
+       " resourceLength=0x", resource_root_bases.length, std::dec);
+}
+
+void
 ArgumentEncodingContext::invalidateNativeArgumentBuffers(
     bool compute, WMTRenderStages render_stages) {
   if (compute) {
@@ -1245,9 +1337,9 @@ ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound() {
   }
 }
 
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
-template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
@@ -3148,7 +3240,9 @@ ArgumentEncodingContext::retainAllocation(Allocation* allocation) {
 }
 
 void
-ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, WMTClearColor color) {
+ArgumentEncodingContext::clearColor(
+    Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength,
+    WMTClearColor color, bool has_rects) {
   assert(!encoder_current);
   auto encoder_info = allocate<ClearEncoderData>();
   encoder_info->type = EncoderType::Clear;
@@ -3157,6 +3251,7 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_info->fence_update = {encoder_info->id};
   encoder_info->clear_dsv = 0;
   encoder_info->color = color;
+  encoder_info->has_rects = has_rects;
   encoder_info->array_length = arrayLength;
   TextureViewKey view = viewId;
   encoder_info->width = texture->width(view);
@@ -3176,7 +3271,9 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
 }
 
 void
-ArgumentEncodingContext::clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width, WMTClearColor color) {
+ArgumentEncodingContext::clearColor(
+    Rc<Buffer> &&buffer, uint64_t viewId, unsigned width,
+    WMTClearColor color, bool has_rects) {
   assert(!encoder_current);
   auto encoder_info = allocate<ClearEncoderData>();
   encoder_info->type = EncoderType::Clear;
@@ -3185,6 +3282,7 @@ ArgumentEncodingContext::clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsign
   encoder_info->fence_update = {encoder_info->id};
   encoder_info->clear_dsv = 0;
   encoder_info->color = color;
+  encoder_info->has_rects = has_rects;
   encoder_info->array_length = 0;
   encoder_info->width = width;
   encoder_info->height = 1;
@@ -3205,7 +3303,8 @@ ArgumentEncodingContext::clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsign
 
 void
 ArgumentEncodingContext::clearDepthStencil(
-    Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
+    Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag,
+    float depth, uint8_t stencil, bool has_rects
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<ClearEncoderData>();
@@ -3215,6 +3314,7 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->fence_update = {encoder_info->id};
   encoder_info->clear_dsv = flag & DepthStencilPlanarFlags(texture->pixelFormat());
   encoder_info->depth_stencil = {depth, stencil};
+  encoder_info->has_rects = has_rects;
   encoder_info->array_length = arrayLength;
   TextureViewKey view = viewId;
   encoder_info->width = texture->width(view);
@@ -4960,6 +5060,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       auto render = reinterpret_cast<RenderEncoderData *>(latter);
       auto clear = reinterpret_cast<ClearEncoderData *>(former);
 
+      if (clear->has_rects)
+        break;
       if (render->render_target_array_length != clear->array_length)
         break;
 
@@ -5012,9 +5114,11 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
 
       // DontCare can be used because it's going to be cleared anyway
       // just keep in mind DontCare != DontStore
-      if (clear->clear_dsv & 1 && render->depth.attachment == clear->attachment)
+      if (!clear->has_rects && clear->clear_dsv & 1 &&
+          render->depth.attachment == clear->attachment)
         render->depth.store_action = WMTStoreActionDontCare;
-      if (clear->clear_dsv & 2 && render->stencil.attachment == clear->attachment)
+      if (!clear->has_rects && clear->clear_dsv & 2 &&
+          render->stencil.attachment == clear->attachment)
         render->stencil.store_action = WMTStoreActionDontCare;
     }
     if (former->type == EncoderType::Render && latter->type == EncoderType::Resolve) {

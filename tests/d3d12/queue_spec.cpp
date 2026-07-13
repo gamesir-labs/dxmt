@@ -33,14 +33,6 @@ void SetUnixEnvironment(const char *name, const char *value) {
   EXPECT_EQ(set_unix_env(name, value), 0);
 }
 
-void SetUnixEnvironment(const char *name, const char *value) {
-  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
-  auto set_unix_env = reinterpret_cast<SetUnixEnvProc>(
-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
-  ASSERT_NE(set_unix_env, nullptr);
-  EXPECT_EQ(set_unix_env(name, value), 0);
-}
-
 class LifetimeProbe final : public IUnknown {
 public:
   explicit LifetimeProbe(std::shared_ptr<std::atomic_bool> destroyed)
@@ -1046,9 +1038,14 @@ TEST(D3D12QueueErrorSpec,
   ScopedMetal4RejectionMarker rejection_marker;
   D3D12TestContext context;
   ASSERT_TRUE(SUCCEEDED(context.Initialize()));
+  const auto injection_token =
+      std::to_string(GetCurrentProcessId()) + "-" +
+      std::to_string(GetTickCount64());
   ASSERT_TRUE(SetEnvironmentVariableA(
-      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", "1"));
-  SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", "1");
+      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
+      injection_token.c_str()));
+  SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
+                     injection_token.c_str());
 
   const std::array<std::uint32_t, 4> expected = {
       0x01020304, 0x11223344, 0x55667788, 0x99aabbcc};

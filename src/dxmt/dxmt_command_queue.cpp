@@ -135,20 +135,6 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
       fclose(marker);
     }
   }
-  const auto diagnostic_marker =
-      env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");
-  if (!diagnostic_marker.empty()) {
-    if (FILE *marker = fopen(diagnostic_marker.c_str(), "a")) {
-      fprintf(marker, "%u %u %u %u %u %u\n",
-              diagnostic.input_encoder_count,
-              diagnostic.encoded_encoder_count,
-              diagnostic.blit_encoder_count,
-              diagnostic.barrier_only_pass_count,
-              diagnostic.fence_wait_count,
-              diagnostic.fence_update_count);
-      fclose(marker);
-    }
-  }
   const uint64_t d3d_sequence = dxmt::apitrace::d3d_enabled()
                                     ? dxmt::apitrace::current_d3d_sequence()
                                     : chunk_id;
@@ -255,21 +241,13 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
       env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER");
   if (!diagnostic_marker.empty()) {
     if (FILE *marker = fopen(diagnostic_marker.c_str(), "a")) {
-      fprintf(marker, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u\n",
+      fprintf(marker, "%u %u %u %u %u %u\n",
               diagnostic.input_encoder_count,
               diagnostic.encoded_encoder_count,
               diagnostic.blit_encoder_count,
               diagnostic.barrier_only_pass_count,
               diagnostic.fence_wait_count,
-              diagnostic.fence_update_count,
-              diagnostic.other_encoder_count,
-              diagnostic.present_encoder_count,
-              diagnostic.clear_encoder_count,
-              diagnostic.resolve_encoder_count,
-              diagnostic.scaler_encoder_count,
-              diagnostic.signal_event_count,
-              diagnostic.wait_event_count,
-              diagnostic.timestamp_encoder_count);
+              diagnostic.fence_update_count);
       fclose(marker);
     }
   }

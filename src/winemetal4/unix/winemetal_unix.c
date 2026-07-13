@@ -315,22 +315,12 @@ dxmt_metal4_dense_hang_diagnostics_enabled(void) {
 
 static bool
 dxmt_metal4_test_feedback_error_enabled(void) {
+  const char *once =
+      getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
   return dxmt_truthy_env_value(
              getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")) ||
-         dxmt_truthy_env_value(
-             getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE"));
-}
-
-static bool
-dxmt_metal4_test_inject_feedback_error(void) {
-  if (dxmt_truthy_env_value(
-          getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")))
-    return true;
-  if (!dxmt_truthy_env_value(
-          getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE")))
-    return false;
-  static atomic_bool injected = false;
-  return !atomic_exchange_explicit(&injected, true, memory_order_acq_rel);
+         (once && once[0] && strcmp(once, "0") && strcmp(once, "false") &&
+          strcmp(once, "no") && strcmp(once, "off"));
 }
 
 static uint64_t
@@ -847,6 +837,7 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, assign) uint64_t presentEventValue;
 @property(nonatomic, assign) uint64_t maxCommandBufferCount;
 @property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
+@property(nonatomic, copy) NSString *testFeedbackErrorToken;
 @property(nonatomic, retain) NSError *firstError;
 @property(nonatomic, retain) id<MTLResidencySet> sparseResidencySet;
 @property(nonatomic, retain) NSMutableArray *pendingSparseResidencyAllocations;
@@ -913,6 +904,7 @@ dxmt_metal4_is_buffer(id object) {
   [_compiler release];
   [_event release];
   [_presentEvent release];
+  [_testFeedbackErrorToken release];
   [_firstError release];
   [super dealloc];
 }
@@ -1213,7 +1205,29 @@ dxmt_metal4_is_buffer(id object) {
     __block DXMTMetal4CommandBuffer *feedbackOwner = [self retain];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
       NSError *error = feedback.error;
-      if (!error && dxmt_metal4_test_inject_feedback_error()) {
+      BOOL injectTestError = NO;
+      if (!error) {
+        @synchronized(feedbackOwner.owner) {
+          if (dxmt_truthy_env_value(
+                  getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"))) {
+            injectTestError = YES;
+          } else {
+            const char *token =
+                getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
+            if (token && token[0] && strcmp(token, "0") &&
+                strcmp(token, "false") && strcmp(token, "no") &&
+                strcmp(token, "off")) {
+              NSString *value = [NSString stringWithUTF8String:token];
+              if (![feedbackOwner.owner.testFeedbackErrorToken
+                      isEqualToString:value]) {
+                feedbackOwner.owner.testFeedbackErrorToken = value;
+                injectTestError = YES;
+              }
+            }
+          }
+        }
+      }
+      if (injectTestError) {
         error = [NSError errorWithDomain:@"DXMTMetal4TestErrorDomain"
                                     code:1
                                 userInfo:@{

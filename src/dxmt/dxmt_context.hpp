@@ -151,7 +151,7 @@ struct ConstantBufferBinding {
 };
 
 struct ConstantBufferBindingSnapshot {
-  bool valid = false;
+  bool captured = false;
   ConstantBufferBinding binding;
 };
 
@@ -175,9 +175,8 @@ struct UnorderedAccessViewBinding {
 };
 
 struct ShaderResourceBindingSnapshot {
-  bool sampler_valid = false;
-  bool srv_valid = false;
-  bool uav_valid = false;
+  bool srv_captured = false;
+  bool uav_captured = false;
   Sampler *sampler = nullptr;
   ResourceViewBinding srv;
   UnorderedAccessViewBinding uav;
@@ -401,22 +400,13 @@ struct BlitEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
 };
 
-struct ClearColorAttachmentData {
+struct ClearEncoderData : EncoderData {
   WMTClearColor color = {};
+  std::pair<float, uint8_t> depth_stencil = {};
   TextureViewRef attachment;
   Rc<Buffer> buffer_attachment;
   WMT::Reference<WMT::Texture> buffer_texture;
   uint64_t buffer_view_id = 0;
-  uint16_t level = 0;
-  uint16_t slice = 0;
-  uint32_t depth_plane = 0;
-  bool has_rects = false;
-};
-
-struct ClearEncoderData : EncoderData {
-  std::array<ClearColorAttachmentData, 8> colors = {};
-  std::pair<float, uint8_t> depth_stencil = {};
-  TextureViewRef attachment;
   unsigned clear_dsv;
   unsigned array_length;
   unsigned width;
@@ -427,7 +417,6 @@ struct ClearEncoderData : EncoderData {
   uint32_t depth_plane = 0;
   uint32_t stencil_depth_plane = 0;
   bool has_rects = false;
-  uint8_t color_attachment_count = 0;
 
   ClearEncoderData() {}
 };
@@ -1273,17 +1262,8 @@ public:
 private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
-  bool tryMergeClearEncoders(ClearEncoderData* former, ClearEncoderData* latter);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
-  WMT::Fence fenceForEncoder(EncoderId id);
-  void prepareFencePool(EncoderData **encoders, unsigned encoder_count,
-                        CommandBufferDiagnosticInfo *diagnostic_info);
-  template <typename Fn>
-  void withFence(EncoderId id, Fn &&fn) {
-    if (auto fence = fenceForEncoder(id))
-      fn(fence);
-  }
   bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);
   void appendPendingFenceOnlyBlitPass();
   void mergePendingFenceOnlyBlitPassInto(EncoderData* encoder);
@@ -1326,9 +1306,7 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
-  std::vector<WMT::Reference<WMT::Fence>> fence_pool_;
-  CommandBufferFenceBindingTable fence_bindings_;
-  uint32_t created_fence_count_ = 0;
+  std::array<WMT::Reference<WMT::Fence>, kParityLane> fence_pool_;
   FenceLocalityCheck fence_locality_;
 
   uint64_t seq_id_;

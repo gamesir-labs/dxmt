@@ -197,6 +197,76 @@ private:
   small_vector<EncoderId, 4> entries_;
 };
 
+struct RenderFenceMergePlan {
+  FenceSet fragment_waits;
+  FenceSet pre_raster_waits;
+  FenceSet fragment_updates;
+  FenceSet pre_raster_updates;
+  bool mergeable = true;
+
+  bool valid() const { return mergeable; }
+};
+
+inline RenderFenceMergePlan
+BuildRenderResolveFenceMergePlan(
+    const FenceSet &render_waits, const FenceSet &render_updates,
+    const FenceSet &resolve_waits, const FenceSet &resolve_updates) {
+  RenderFenceMergePlan plan;
+  plan.fragment_waits = render_waits.unionOf(resolve_waits);
+  plan.fragment_updates = render_updates.unionOf(resolve_updates);
+  plan.fragment_waits.subtract(plan.fragment_updates);
+  return plan;
+}
+
+inline RenderFenceMergePlan
+BuildRenderFenceMergePlan(
+    const FenceSet &latter_fragment_waits,
+    const FenceSet &latter_pre_raster_waits,
+    const FenceSet &latter_fragment_updates,
+    const FenceSet &latter_pre_raster_updates,
+    const FenceSet &former_fragment_waits,
+    const FenceSet &former_pre_raster_waits,
+    const FenceSet &former_fragment_updates,
+    const FenceSet &former_pre_raster_updates) {
+  RenderFenceMergePlan plan;
+
+  const auto former_waits =
+      former_fragment_waits.unionOf(former_pre_raster_waits);
+  const auto latter_updates =
+      latter_fragment_updates.unionOf(latter_pre_raster_updates);
+  if (former_waits.intersectedWith(latter_updates)) {
+    plan.mergeable = false;
+    return plan;
+  }
+
+  plan.fragment_waits =
+      former_fragment_waits.unionOf(latter_fragment_waits);
+  plan.pre_raster_waits =
+      former_pre_raster_waits.unionOf(latter_pre_raster_waits);
+  plan.fragment_updates =
+      former_fragment_updates.unionOf(latter_fragment_updates);
+  plan.pre_raster_updates =
+      former_pre_raster_updates.unionOf(latter_pre_raster_updates);
+
+  // The encoder emits duplicate waits at pre-raster and duplicate updates at
+  // fragment. Normalize the sets before classifying internal dependencies.
+  plan.fragment_waits.subtract(plan.pre_raster_waits);
+  plan.pre_raster_updates.subtract(plan.fragment_updates);
+
+  const auto all_updates =
+      plan.fragment_updates.unionOf(plan.pre_raster_updates);
+  if (plan.pre_raster_waits.intersectedWith(all_updates) ||
+      plan.fragment_waits.intersectedWith(plan.fragment_updates)) {
+    plan.mergeable = false;
+    return plan;
+  }
+
+  // A fragment wait on a pre-raster update is already ordered by the render
+  // pass. Keeping the fence edge would turn it into a self-wait after merging.
+  plan.fragment_waits.subtract(plan.pre_raster_updates);
+  return plan;
+}
+
 template <size_t Sz = kLane, size_t Forward = 1> class TrackingSet {
 public:
   TrackingSet() {

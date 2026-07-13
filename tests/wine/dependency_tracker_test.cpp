@@ -65,6 +65,44 @@ TEST(FenceSet, RetainsOnlyLatestGenerationForEachMetalFenceSlot) {
   EXPECT_TRUE(fences.test(512));
 }
 
+TEST(RenderFenceMerge, RemovesNaturallyOrderedCrossStageWait) {
+  dxmt::FenceSet latter_fragment_waits(256);
+  dxmt::FenceSet former_pre_raster_updates(256);
+
+  const auto plan = dxmt::BuildRenderFenceMergePlan(
+      latter_fragment_waits, {}, {}, {}, {}, {}, {},
+      former_pre_raster_updates);
+
+  EXPECT_TRUE(plan.valid());
+  EXPECT_TRUE(plan.fragment_waits.empty());
+  EXPECT_TRUE(plan.pre_raster_updates.test(256));
+}
+
+TEST(RenderFenceMerge, RejectsSameStageAndReverseDependencies) {
+  const auto same_stage = dxmt::BuildRenderFenceMergePlan(
+      dxmt::FenceSet(256), {}, {}, {}, {}, {}, dxmt::FenceSet(256), {});
+  EXPECT_FALSE(same_stage.valid());
+
+  const auto reverse_stage = dxmt::BuildRenderFenceMergePlan(
+      {}, dxmt::FenceSet(257), {}, {}, {}, {}, dxmt::FenceSet(257), {});
+  EXPECT_FALSE(reverse_stage.valid());
+}
+
+TEST(RenderFenceMerge, RejectsDependencyOnLatterPassUpdate) {
+  const auto plan = dxmt::BuildRenderFenceMergePlan(
+      {}, {}, dxmt::FenceSet(258), {}, dxmt::FenceSet(258), {}, {}, {});
+  EXPECT_FALSE(plan.valid());
+}
+
+TEST(RenderFenceMerge, ResolveMergeRemovesInternalWaits) {
+  const auto plan = dxmt::BuildRenderResolveFenceMergePlan(
+      {}, dxmt::FenceSet(259), dxmt::FenceSet(259), dxmt::FenceSet(260));
+  EXPECT_TRUE(plan.valid());
+  EXPECT_TRUE(plan.fragment_waits.empty());
+  EXPECT_TRUE(plan.fragment_updates.test(259));
+  EXPECT_TRUE(plan.fragment_updates.test(260));
+}
+
 TEST(TrackingSet, RetainsOnlyTheRecentEncoderWindow) {
   dxmt::TrackingSet<4> tracking;
   EXPECT_TRUE(tracking.add(65));
