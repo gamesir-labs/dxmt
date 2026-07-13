@@ -499,6 +499,51 @@ TEST_F(D3D11ResourceSpec, PreservesStagingTexture1DArraySubresources) {
   }
 }
 
+TEST_F(D3D11ResourceSpec,
+       PreservesOddWidthStagingTexture1DMipsWithSourcePadding) {
+  constexpr UINT width = 7;
+  constexpr UINT mip_levels = 3;
+  constexpr UINT array_size = 2;
+  constexpr UINT source_pitch = 32;
+  constexpr UINT subresource_count = mip_levels * array_size;
+  std::array<std::array<std::uint8_t, source_pitch>, subresource_count>
+      contents = {};
+  std::array<D3D11_SUBRESOURCE_DATA, subresource_count> initial = {};
+  for (UINT subresource = 0; subresource < subresource_count; ++subresource) {
+    const UINT mip = subresource % mip_levels;
+    const UINT mip_width = std::max(1u, width >> mip);
+    contents[subresource].fill(0xee);
+    for (UINT x = 0; x < mip_width; ++x)
+      contents[subresource][x] =
+          static_cast<std::uint8_t>(0x20u + subresource * 8u + x);
+    initial[subresource].pSysMem = contents[subresource].data();
+    initial[subresource].SysMemPitch = source_pitch;
+  }
+
+  D3D11_TEXTURE1D_DESC desc = {};
+  desc.Width = width;
+  desc.MipLevels = mip_levels;
+  desc.ArraySize = array_size;
+  desc.Format = DXGI_FORMAT_R8_UINT;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture1D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture1D(
+      &desc, initial.data(), texture.put())));
+
+  for (UINT subresource = 0; subresource < subresource_count; ++subresource) {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+        texture.get(), subresource, D3D11_MAP_READ, 0, &mapped)));
+    const UINT mip_width =
+        std::max(1u, width >> (subresource % mip_levels));
+    EXPECT_EQ(std::memcmp(mapped.pData, contents[subresource].data(), mip_width),
+              0)
+        << "subresource " << subresource << ", width " << mip_width;
+    context_.context()->Unmap(texture.get(), subresource);
+  }
+}
+
 TEST_F(D3D11ResourceSpec, CopiesOneTexture2DArraySliceInIsolation) {
   constexpr UINT width = 4;
   constexpr UINT height = 3;

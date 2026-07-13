@@ -65,6 +65,21 @@ TEST(FenceSet, KeepsExactEncoderIdsBeyondLegacySlotCapacity) {
   EXPECT_TRUE(fences.test(512));
 }
 
+TEST(FenceSet, IteratesExactIdsInAscendingOrderAfterSetOperations) {
+  dxmt::FenceSet fences;
+  for (const auto id : {1024u, 3u, 512u, 256u, 1024u})
+    fences.set(id);
+
+  dxmt::FenceSet removed;
+  removed.set(512);
+  fences.subtract(removed);
+  fences.merge(dxmt::FenceSet(768));
+
+  std::vector<dxmt::EncoderId> ids;
+  fences.forEach([&](auto id) { ids.push_back(id); });
+  EXPECT_EQ(ids, (std::vector<dxmt::EncoderId>{3, 256, 768, 1024}));
+}
+
 TEST(CommandBufferFenceBindingTable,
      DropsPriorCommandBufferIdsBeforeReusingTheirSlots) {
   dxmt::CommandBufferFenceBindingTable bindings;
@@ -88,6 +103,29 @@ TEST(CommandBufferFenceBindingTable,
   EXPECT_EQ(bindings.bind(302, 5, 8), 0u);
   EXPECT_EQ(bindings.bind(303, 7, 9), 1u);
   EXPECT_EQ(bindings.slotCount(), 2u);
+}
+
+TEST(CommandBufferFenceBindingTable,
+     KeepsTouchingIntervalsSeparateAndReusesTheNextAvailableSlot) {
+  dxmt::CommandBufferFenceBindingTable bindings;
+  bindings.reset(0);
+
+  EXPECT_EQ(bindings.bind(400, 0, 4), 0u);
+  EXPECT_EQ(bindings.bind(401, 4, 5), 1u);
+  EXPECT_EQ(bindings.bind(402, 5, 6), 0u);
+  EXPECT_EQ(bindings.slotCount(), 2u);
+}
+
+TEST(CommandBufferFenceBindingTable, ReusesPreallocatedSlotsAfterReset) {
+  dxmt::CommandBufferFenceBindingTable bindings;
+  bindings.reset(3);
+  EXPECT_EQ(bindings.bind(500, 0, 1), 0u);
+  EXPECT_EQ(bindings.slotCount(), 3u);
+
+  bindings.reset(bindings.slotCount());
+  EXPECT_FALSE(bindings.find(500).has_value());
+  EXPECT_EQ(bindings.bind(501, 0, 1), 0u);
+  EXPECT_EQ(bindings.slotCount(), 3u);
 }
 
 TEST(CommandBufferFenceBindingTable,
@@ -125,6 +163,22 @@ TEST(FenceDependencyOrderTracker,
   EXPECT_EQ(analysis.future_local_waits, 1u);
   EXPECT_EQ(analysis.same_encoder_waits, 1u);
   EXPECT_EQ(analysis.external_waits, 1u);
+}
+
+TEST(FenceDependencyOrderTracker, CountsRepeatedUpdatesByExactId) {
+  dxmt::FenceDependencyOrderTracker tracker;
+  dxmt::FenceSet first;
+  first.set(256);
+  first.set(512);
+  tracker.recordUpdates(first);
+
+  dxmt::FenceSet repeated;
+  repeated.set(256);
+  repeated.set(768);
+  tracker.recordUpdates(repeated);
+  tracker.recordUpdates(dxmt::FenceSet(256));
+
+  EXPECT_EQ(tracker.analysis().repeated_updates, 2u);
 }
 
 TEST(RenderFenceMerge, RemovesNaturallyOrderedCrossStageWait) {

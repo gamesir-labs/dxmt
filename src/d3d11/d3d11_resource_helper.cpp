@@ -303,6 +303,7 @@ CreateMTLTextureDescriptorInternal(
     UINT Height, UINT Depth, UINT ArraySize, UINT SampleCount, UINT BindFlags,
     UINT CPUAccessFlags, UINT MiscFlags, D3D11_USAGE Usage, UINT MipLevels,
     DXGI_FORMAT Format, WMTTextureInfo *pDescOut) {
+  *pDescOut = {};
   if (Width == 0 || Height == 0 || Depth == 0 || ArraySize == 0 || SampleCount == 0)
     return E_INVALIDARG;
 
