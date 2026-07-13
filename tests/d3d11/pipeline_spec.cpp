@@ -82,6 +82,36 @@ bool ColorMatches(uint32_t actual, uint32_t expected, unsigned tolerance) {
   return true;
 }
 
+HRESULT ReadTexturePixel(ID3D11Device *device, ID3D11DeviceContext *context,
+                         ID3D11Texture2D *texture, UINT x, UINT y,
+                         uint32_t *pixel) {
+  if (!device || !context || !texture || !pixel)
+    return E_INVALIDARG;
+  D3D11_TEXTURE2D_DESC desc = {};
+  texture->GetDesc(&desc);
+  if (x >= desc.Width || y >= desc.Height)
+    return E_INVALIDARG;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.BindFlags = 0;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  desc.MiscFlags = 0;
+  ComPtr<ID3D11Texture2D> staging;
+  HRESULT hr = device->CreateTexture2D(&desc, nullptr, staging.put());
+  if (FAILED(hr))
+    return hr;
+  context->CopyResource(staging.get(), texture);
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  hr = context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+    return hr;
+  std::memcpy(pixel,
+              static_cast<const uint8_t *>(mapped.pData) + y * mapped.RowPitch +
+                  x * sizeof(*pixel),
+              sizeof(*pixel));
+  context->Unmap(staging.get(), 0);
+  return S_OK;
+}
+
 class D3D11PipelineSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -243,25 +273,183 @@ TEST_F(D3D11PipelineSpec, DrawsWithInputLayoutAndVertexBuffer) {
   context_.context()->Draw(3, 0);
   context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
 
-  D3D11_TEXTURE2D_DESC staging_desc = target_desc;
-  staging_desc.Usage = D3D11_USAGE_STAGING;
-  staging_desc.BindFlags = 0;
-  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  ComPtr<ID3D11Texture2D> staging;
-  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
-      &staging_desc, nullptr, staging.put())));
-  context_.context()->CopyResource(staging.get(), target.get());
-  D3D11_MAPPED_SUBRESOURCE mapped = {};
-  ASSERT_TRUE(HResultSucceeded(
-      context_.context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)));
   uint32_t center = 0;
-  std::memcpy(&center,
-              static_cast<const uint8_t *>(mapped.pData) + 8 * mapped.RowPitch +
-                  8 * sizeof(center),
-              sizeof(center));
+  ASSERT_TRUE(HResultSucceeded(ReadTexturePixel(
+      context_.device(), context_.context(), target.get(), 8, 8, &center)));
   EXPECT_TRUE(ColorMatches(center, 0xff0000ff, 2))
       << "center pixel was 0x" << std::hex << center;
-  context_.context()->Unmap(staging.get(), 0);
+}
+
+TEST_F(D3D11PipelineSpec, DrawsIndexedWithStartIndexAndBaseVertex) {
+  const auto vertex = CompileShader(kVertexColorVertexShader, "vs_5_0");
+  const auto pixel = CompileShader(kVertexColorPixelShader, "ps_5_0");
+  ASSERT_TRUE(HResultSucceeded(vertex.result)) << vertex.diagnostic_text();
+  ASSERT_TRUE(HResultSucceeded(pixel.result)) << pixel.diagnostic_text();
+
+  ComPtr<ID3D11VertexShader> vertex_shader;
+  ComPtr<ID3D11PixelShader> pixel_shader;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateVertexShader(
+      vertex.bytecode->GetBufferPointer(), vertex.bytecode->GetBufferSize(),
+      nullptr, vertex_shader.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreatePixelShader(
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
+      nullptr, pixel_shader.put())));
+
+  const D3D11_INPUT_ELEMENT_DESC elements[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+       D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8,
+       D3D11_INPUT_PER_VERTEX_DATA, 0},
+  };
+  ComPtr<ID3D11InputLayout> input_layout;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateInputLayout(
+      elements, ARRAYSIZE(elements), vertex.bytecode->GetBufferPointer(),
+      vertex.bytecode->GetBufferSize(), input_layout.put())));
+
+  struct Vertex {
+    float position[2];
+    float color[4];
+  };
+  constexpr std::array<Vertex, 4> vertices = {
+      {{{2.0f, 2.0f}, {0.0f, 0.0f, 1.0f, 1.0f}},
+       {{-1.0f, -1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+       {{0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+       {{1.0f, -1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}}}};
+  constexpr std::array<uint16_t, 4> indices = {0xffff, 0, 1, 2};
+
+  D3D11_BUFFER_DESC vertex_desc = {};
+  vertex_desc.ByteWidth = sizeof(vertices);
+  vertex_desc.Usage = D3D11_USAGE_DEFAULT;
+  vertex_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA vertex_initial = {};
+  vertex_initial.pSysMem = vertices.data();
+  ComPtr<ID3D11Buffer> vertex_buffer;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
+      &vertex_desc, &vertex_initial, vertex_buffer.put())));
+
+  D3D11_BUFFER_DESC index_desc = {};
+  index_desc.ByteWidth = sizeof(indices);
+  index_desc.Usage = D3D11_USAGE_DEFAULT;
+  index_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA index_initial = {};
+  index_initial.pSysMem = indices.data();
+  ComPtr<ID3D11Buffer> index_buffer;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
+      &index_desc, &index_initial, index_buffer.put())));
+
+  D3D11_TEXTURE2D_DESC target_desc = {};
+  target_desc.Width = 16;
+  target_desc.Height = 16;
+  target_desc.MipLevels = 1;
+  target_desc.ArraySize = 1;
+  target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  target_desc.SampleDesc.Count = 1;
+  target_desc.Usage = D3D11_USAGE_DEFAULT;
+  target_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> target;
+  ComPtr<ID3D11RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateTexture2D(&target_desc, nullptr, target.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRenderTargetView(
+      target.get(), nullptr, target_view.put())));
+
+  D3D11_VIEWPORT viewport = {};
+  viewport.Width = static_cast<float>(target_desc.Width);
+  viewport.Height = static_cast<float>(target_desc.Height);
+  viewport.MaxDepth = 1.0f;
+  UINT stride = sizeof(Vertex);
+  UINT offset = 0;
+  ID3D11Buffer *vertex_buffers[] = {vertex_buffer.get()};
+  ID3D11RenderTargetView *targets[] = {target_view.get()};
+  context_.context()->OMSetRenderTargets(1, targets, nullptr);
+  context_.context()->RSSetViewports(1, &viewport);
+  context_.context()->IASetInputLayout(input_layout.get());
+  context_.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride,
+                                         &offset);
+  context_.context()->IASetIndexBuffer(index_buffer.get(), DXGI_FORMAT_R16_UINT,
+                                       0);
+  context_.context()->IASetPrimitiveTopology(
+      D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.context()->VSSetShader(vertex_shader.get(), nullptr, 0);
+  context_.context()->PSSetShader(pixel_shader.get(), nullptr, 0);
+  context_.context()->DrawIndexed(3, 1, 1);
+  context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
+
+  uint32_t center = 0;
+  ASSERT_TRUE(HResultSucceeded(ReadTexturePixel(
+      context_.device(), context_.context(), target.get(), 8, 8, &center)));
+  EXPECT_TRUE(ColorMatches(center, 0xff00ff00, 2))
+      << "center pixel was 0x" << std::hex << center;
+}
+
+TEST_F(D3D11PipelineSpec, AppliesScissorRectangleDuringRasterization) {
+  const auto vertex = CompileShader(kFullscreenVertexShader, "vs_5_0");
+  const auto pixel = CompileShader(kSolidPixelShader, "ps_5_0");
+  ASSERT_TRUE(HResultSucceeded(vertex.result)) << vertex.diagnostic_text();
+  ASSERT_TRUE(HResultSucceeded(pixel.result)) << pixel.diagnostic_text();
+
+  ComPtr<ID3D11VertexShader> vertex_shader;
+  ComPtr<ID3D11PixelShader> pixel_shader;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateVertexShader(
+      vertex.bytecode->GetBufferPointer(), vertex.bytecode->GetBufferSize(),
+      nullptr, vertex_shader.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreatePixelShader(
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
+      nullptr, pixel_shader.put())));
+
+  D3D11_TEXTURE2D_DESC target_desc = {};
+  target_desc.Width = 16;
+  target_desc.Height = 16;
+  target_desc.MipLevels = 1;
+  target_desc.ArraySize = 1;
+  target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  target_desc.SampleDesc.Count = 1;
+  target_desc.Usage = D3D11_USAGE_DEFAULT;
+  target_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> target;
+  ComPtr<ID3D11RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateTexture2D(&target_desc, nullptr, target.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRenderTargetView(
+      target.get(), nullptr, target_view.put())));
+
+  D3D11_RASTERIZER_DESC rasterizer_desc = {};
+  rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+  rasterizer_desc.CullMode = D3D11_CULL_NONE;
+  rasterizer_desc.DepthClipEnable = TRUE;
+  rasterizer_desc.ScissorEnable = TRUE;
+  ComPtr<ID3D11RasterizerState> rasterizer;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRasterizerState(
+      &rasterizer_desc, rasterizer.put())));
+
+  constexpr float clear_color[4] = {};
+  context_.context()->ClearRenderTargetView(target_view.get(), clear_color);
+  D3D11_VIEWPORT viewport = {};
+  viewport.Width = static_cast<float>(target_desc.Width);
+  viewport.Height = static_cast<float>(target_desc.Height);
+  viewport.MaxDepth = 1.0f;
+  D3D11_RECT scissor = {0, 0, 8, 16};
+  ID3D11RenderTargetView *targets[] = {target_view.get()};
+  context_.context()->OMSetRenderTargets(1, targets, nullptr);
+  context_.context()->RSSetViewports(1, &viewport);
+  context_.context()->RSSetScissorRects(1, &scissor);
+  context_.context()->RSSetState(rasterizer.get());
+  context_.context()->IASetPrimitiveTopology(
+      D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.context()->VSSetShader(vertex_shader.get(), nullptr, 0);
+  context_.context()->PSSetShader(pixel_shader.get(), nullptr, 0);
+  context_.context()->Draw(3, 0);
+  context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
+
+  uint32_t inside = 0;
+  uint32_t outside = 0;
+  ASSERT_TRUE(HResultSucceeded(ReadTexturePixel(
+      context_.device(), context_.context(), target.get(), 4, 8, &inside)));
+  ASSERT_TRUE(HResultSucceeded(ReadTexturePixel(
+      context_.device(), context_.context(), target.get(), 12, 8, &outside)));
+  EXPECT_TRUE(ColorMatches(inside, 0xffbf8040, 2))
+      << "inside pixel was 0x" << std::hex << inside;
+  EXPECT_EQ(outside, 0u) << "outside pixel was 0x" << std::hex << outside;
 }
 
 TEST_F(D3D11PipelineSpec, ReportsSamplesForAnOcclusionQuery) {
