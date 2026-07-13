@@ -323,10 +323,14 @@ IntegrationError RunFh4SynchronizationScenario(
 
   std::ifstream marker(marker_path);
   CommandBufferDiagnosticTotals measured = {};
-  CommandBufferDiagnosticTotals line = {};
-  while (marker >> line.input_encoders >> line.encoded_encoders >>
-         line.encoded_blit >> line.barrier_only >> line.fence_waits >>
-         line.fence_updates) {
+  std::string record;
+  while (std::getline(marker, record)) {
+    std::istringstream fields(record);
+    CommandBufferDiagnosticTotals line = {};
+    if (!(fields >> line.input_encoders >> line.encoded_encoders >>
+          line.encoded_blit >> line.barrier_only >> line.fence_waits >>
+          line.fence_updates))
+      continue;
     measured.input_encoders += line.input_encoders;
     measured.encoded_encoders += line.encoded_encoders;
     measured.encoded_blit += line.encoded_blit;
@@ -339,8 +343,14 @@ IntegrationError RunFh4SynchronizationScenario(
   if (measured.barrier_only)
     return "FH4 synchronization workload encoded standalone barriers";
   if (measured.fence_waits + measured.fence_updates >
-      kFh4BaselineFenceEntries / 4)
-    return "FH4 synchronization workload did not reduce fence entries by 75 percent";
+      kFh4BaselineFenceEntries / 4) {
+    std::ostringstream error;
+    error << "FH4 synchronization workload did not reduce fence entries by "
+             "75 percent (waits="
+          << measured.fence_waits << ", updates=" << measured.fence_updates
+          << ", limit=" << kFh4BaselineFenceEntries / 4 << ")";
+    return error.str();
+  }
 
   if (auto error = HResultError("FH4 empty command-list close",
                                 context.list()->Close()))

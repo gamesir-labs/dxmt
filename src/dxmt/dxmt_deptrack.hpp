@@ -1,7 +1,12 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include "util_bit.hpp"
 #include "util_svector.hpp"
 
@@ -48,31 +53,23 @@ public:
 
   bool
   set(EncoderId id) {
-    for (auto &entry : entries_) {
-      if (entry == id)
-        return false;
-      if ((entry % kParityLane) == (id % kParityLane)) {
-        entry = std::max(entry, id);
-        return false;
-      }
-    }
-    entries_.push_back(id);
+    auto entry = std::lower_bound(entries_.begin(), entries_.end(), id);
+    if (entry != entries_.end() && *entry == id)
+      return false;
+    entries_.insert(entry, id);
     return true;
   }
 
   void
   unset(EncoderId id) {
-    for (size_t i = 0; i < entries_.size(); i++) {
-      if (entries_[i] == id) {
-        entries_.erase(i);
-        return;
-      }
-    }
+    auto entry = std::lower_bound(entries_.begin(), entries_.end(), id);
+    if (entry != entries_.end() && *entry == id)
+      entries_.erase(entry);
   }
 
   bool
   test(EncoderId id) const {
-    return std::find(entries_.begin(), entries_.end(), id) != entries_.end();
+    return std::binary_search(entries_.begin(), entries_.end(), id);
   }
 
   bool
@@ -177,14 +174,14 @@ public:
 
   template <typename Fn>
   void
-  forEach(Fn &&fn) {
+  forEach(Fn &&fn) const {
     for (auto id : entries_)
       fn(id);
   }
 
   template <typename Fn, typename FnPrior>
   void
-  forEach(const FenceSet &prior, FnPrior &&fnPrior, Fn &&fn) {
+  forEach(const FenceSet &prior, FnPrior &&fnPrior, Fn &&fn) const {
     for (auto id : prior.entries_)
       fnPrior(id);
     for (auto id : entries_) {
@@ -266,6 +263,86 @@ BuildRenderFenceMergePlan(
   plan.fragment_waits.subtract(plan.pre_raster_updates);
   return plan;
 }
+
+/**
+ * Maps exact logical encoder dependency IDs to reusable Metal fence objects
+ * for one command buffer. Bindings never survive reset: ordering between
+ * command buffers on the same queue already provides that dependency.
+ */
+class CommandBufferFenceBindingTable {
+public:
+  void reset(uint32_t reusable_slot_count) {
+    bindings_.clear();
+    slot_last_use_.assign(reusable_slot_count, -1);
+  }
+
+  uint32_t bind(EncoderId id, uint32_t first, uint32_t last) {
+    uint32_t slot = 0;
+    while (slot < slot_last_use_.size() &&
+           slot_last_use_[slot] >= static_cast<int64_t>(first))
+      slot++;
+    if (slot == slot_last_use_.size())
+      slot_last_use_.push_back(-1);
+    slot_last_use_[slot] = last;
+    bindings_.insert_or_assign(id, slot);
+    return slot;
+  }
+
+  std::optional<uint32_t> find(EncoderId id) const {
+    const auto binding = bindings_.find(id);
+    if (binding == bindings_.end())
+      return std::nullopt;
+    return binding->second;
+  }
+
+  uint32_t slotCount() const {
+    return static_cast<uint32_t>(slot_last_use_.size());
+  }
+
+private:
+  std::unordered_map<EncoderId, uint32_t> bindings_;
+  std::vector<int64_t> slot_last_use_;
+};
+
+struct FenceDependencyOrderAnalysis {
+  uint32_t prior_local_waits = 0;
+  uint32_t future_local_waits = 0;
+  uint32_t same_encoder_waits = 0;
+  uint32_t external_waits = 0;
+  uint32_t repeated_updates = 0;
+};
+
+class FenceDependencyOrderTracker {
+public:
+  void recordUpdates(const FenceSet &updates) {
+    updates.forEach([&](EncoderId id) {
+      analysis_.repeated_updates += !total_updates_.insert(id).second;
+    });
+  }
+
+  void analyzeEncoder(const FenceSet &waits, const FenceSet &updates) {
+    waits.forEach([&](EncoderId id) {
+      if (seen_updates_.contains(id))
+        analysis_.prior_local_waits++;
+      else if (updates.test(id))
+        analysis_.same_encoder_waits++;
+      else if (total_updates_.contains(id))
+        analysis_.future_local_waits++;
+      else
+        analysis_.external_waits++;
+    });
+    updates.forEach([&](EncoderId id) { seen_updates_.insert(id); });
+  }
+
+  const FenceDependencyOrderAnalysis &analysis() const {
+    return analysis_;
+  }
+
+private:
+  std::unordered_set<EncoderId> total_updates_;
+  std::unordered_set<EncoderId> seen_updates_;
+  FenceDependencyOrderAnalysis analysis_;
+};
 
 template <size_t Sz = kLane, size_t Forward = 1> class TrackingSet {
 public:

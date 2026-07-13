@@ -269,10 +269,14 @@ struct ScopedCommandBufferDiagnosticMarker {
   CommandBufferDiagnosticTotals Read() const {
     std::ifstream input(path);
     CommandBufferDiagnosticTotals totals = {};
-    CommandBufferDiagnosticTotals line = {};
-    while (input >> line.input_encoders >> line.encoded_encoders >>
-           line.encoded_blit >> line.barrier_only >> line.fence_waits >>
-           line.fence_updates) {
+    std::string record;
+    while (std::getline(input, record)) {
+      std::istringstream fields(record);
+      CommandBufferDiagnosticTotals line = {};
+      if (!(fields >> line.input_encoders >> line.encoded_encoders >>
+            line.encoded_blit >> line.barrier_only >> line.fence_waits >>
+            line.fence_updates))
+        continue;
       totals.input_encoders += line.input_encoders;
       totals.encoded_encoders += line.encoded_encoders;
       totals.encoded_blit += line.encoded_blit;
@@ -285,6 +289,40 @@ struct ScopedCommandBufferDiagnosticMarker {
 
   std::string path;
 };
+
+struct ScopedFenceCreationMarker {
+  ScopedFenceCreationMarker() {
+    std::ostringstream name;
+    name << "C:\\dxmt-fence-creation-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << ".txt";
+    path = name.str();
+    std::ofstream(path, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_TEST_FENCE_CREATION_MARKER", path.c_str());
+  }
+
+  ~ScopedFenceCreationMarker() {
+    SetEnvironmentVariableA("DXMT_TEST_FENCE_CREATION_MARKER", nullptr);
+    DeleteFileA(path.c_str());
+  }
+
+  std::vector<unsigned> Slots() const {
+    std::ifstream input(path);
+    return {std::istream_iterator<unsigned>(input),
+            std::istream_iterator<unsigned>()};
+  }
+
+  std::string path;
+};
+
+TEST(D3D12FencePoolSpec, DoesNotCreateMetalFencesForEmptyExecute) {
+  ScopedFenceCreationMarker marker;
+  D3D12TestContext context;
+  ASSERT_TRUE(SUCCEEDED(context.Initialize()));
+  EXPECT_TRUE(marker.Slots().empty());
+
+  ASSERT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
+  EXPECT_TRUE(marker.Slots().empty());
+}
 
 struct ScopedMetal4RejectionMarker {
   ScopedMetal4RejectionMarker() {
@@ -640,6 +678,76 @@ TEST_F(D3D12QueueSpec, ClearsRenderTargetViewsAcrossMipChain) {
           << "pixel (" << x << ", " << y << ")";
     }
   }
+}
+
+TEST_F(D3D12QueueSpec,
+       PreservesMoreThan256IndependentClearToCopyDependencies) {
+  constexpr UINT kResourceCount = 300;
+  constexpr UINT64 kPlacedFootprintStride = 512;
+  constexpr UINT kRowPitch = 256;
+  ScopedFenceCreationMarker fence_creation;
+  ScopedCommandBufferDiagnosticMarker diagnostic;
+
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResourceCount, false);
+  auto readback = context_.CreateBuffer(
+      kResourceCount * kPlacedFootprintStride, D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(rtv_heap);
+  ASSERT_TRUE(readback);
+
+  std::vector<ComPtr<ID3D12Resource>> textures(kResourceCount);
+  constexpr FLOAT color[] = {1.0f, 0.0f, 0.0f, 1.0f};
+  constexpr D3D12_RECT rect = {0, 0, 1, 1};
+  for (UINT i = 0; i < kResourceCount; i++) {
+    textures[i] = context_.CreateTexture2D(
+        1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ASSERT_TRUE(textures[i]);
+    const auto rtv = context_.CpuDescriptorHandle(rtv_heap.get(), i);
+    context_.device()->CreateRenderTargetView(textures[i].get(), nullptr, rtv);
+    context_.list()->ClearRenderTargetView(rtv, color, 1, &rect);
+  }
+
+  for (UINT i = 0; i < kResourceCount; i++) {
+    D3D12TestContext::Transition(
+        context_.list(), textures[i].get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = textures[i].get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = readback.get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Offset = i * kPlacedFootprintStride;
+    destination.PlacedFootprint.Footprint = {
+        DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, kRowPitch};
+    context_.list()->CopyTextureRegion(
+        &destination, 0, 0, 0, &source, nullptr);
+  }
+
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+  EXPECT_GT(fence_creation.Slots().size(), 256u);
+  const auto totals = diagnostic.Read();
+  EXPECT_GE(totals.fence_waits, kResourceCount);
+  EXPECT_GE(totals.fence_updates, kResourceCount);
+
+  void *mapping = nullptr;
+  const D3D12_RANGE read_range = {
+      0, kResourceCount * kPlacedFootprintStride};
+  ASSERT_TRUE(SUCCEEDED(readback->Map(0, &read_range, &mapping)));
+  const auto *bytes = static_cast<const std::uint8_t *>(mapping);
+  for (UINT i : {0u, kResourceCount / 2, kResourceCount - 1}) {
+    const auto *pixel = bytes + i * kPlacedFootprintStride;
+    EXPECT_EQ(pixel[0], 255u);
+    EXPECT_EQ(pixel[1], 0u);
+    EXPECT_EQ(pixel[2], 0u);
+    EXPECT_EQ(pixel[3], 255u);
+  }
+  const D3D12_RANGE written_range = {0, 0};
+  readback->Unmap(0, &written_range);
 }
 
 TEST_F(D3D12QueueSpec,

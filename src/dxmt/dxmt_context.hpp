@@ -1264,6 +1264,14 @@ private:
   bool hasDataDependency(EncoderData* from, EncoderData* to);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
+  WMT::Fence fenceForEncoder(EncoderId id);
+  void prepareFencePool(EncoderData **encoders, unsigned encoder_count,
+                        CommandBufferDiagnosticInfo *diagnostic_info);
+  template <typename Fn>
+  void withFence(EncoderId id, Fn &&fn) {
+    if (auto fence = fenceForEncoder(id))
+      fn(fence);
+  }
   bool tryDeferFenceOnlyBlitPass(EncoderData* encoder);
   void appendPendingFenceOnlyBlitPass();
   void mergePendingFenceOnlyBlitPassInto(EncoderData* encoder);
@@ -1306,7 +1314,8 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
-  std::array<WMT::Reference<WMT::Fence>, kParityLane> fence_pool_;
+  std::vector<WMT::Reference<WMT::Fence>> fence_pool_;
+  CommandBufferFenceBindingTable fence_bindings_;
   FenceLocalityCheck fence_locality_;
 
   uint64_t seq_id_;

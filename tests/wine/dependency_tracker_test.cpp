@@ -56,13 +56,75 @@ TEST(FenceSet, EnumeratesCurrentAndPriorEntriesDeterministically) {
   EXPECT_EQ(current_ids, (std::vector<dxmt::EncoderId>{3}));
 }
 
-TEST(FenceSet, RetainsOnlyLatestGenerationForEachMetalFenceSlot) {
+TEST(FenceSet, KeepsExactEncoderIdsBeyondLegacySlotCapacity) {
   dxmt::FenceSet fences;
   EXPECT_TRUE(fences.set(256));
-  EXPECT_FALSE(fences.set(512));
-  EXPECT_EQ(fences.count(), 1u);
-  EXPECT_FALSE(fences.test(256));
+  EXPECT_TRUE(fences.set(512));
+  EXPECT_EQ(fences.count(), 2u);
+  EXPECT_TRUE(fences.test(256));
   EXPECT_TRUE(fences.test(512));
+}
+
+TEST(CommandBufferFenceBindingTable,
+     DropsPriorCommandBufferIdsBeforeReusingTheirSlots) {
+  dxmt::CommandBufferFenceBindingTable bindings;
+  bindings.reset(0);
+  EXPECT_EQ(bindings.bind(1024, 0, 8), 0u);
+  ASSERT_TRUE(bindings.find(1024).has_value());
+
+  bindings.reset(bindings.slotCount());
+  EXPECT_FALSE(bindings.find(1024).has_value());
+  EXPECT_EQ(bindings.bind(2048, 0, 4), 0u);
+  EXPECT_EQ(*bindings.find(2048), 0u);
+}
+
+TEST(CommandBufferFenceBindingTable,
+     ReusesOnlyNonOverlappingIntervalsWithinOneCommandBuffer) {
+  dxmt::CommandBufferFenceBindingTable bindings;
+  bindings.reset(0);
+
+  EXPECT_EQ(bindings.bind(300, 0, 4), 0u);
+  EXPECT_EQ(bindings.bind(301, 2, 6), 1u);
+  EXPECT_EQ(bindings.bind(302, 5, 8), 0u);
+  EXPECT_EQ(bindings.bind(303, 7, 9), 1u);
+  EXPECT_EQ(bindings.slotCount(), 2u);
+}
+
+TEST(CommandBufferFenceBindingTable,
+     DoesNotBindExternalOnlyWaitsToFutureLocalUpdates) {
+  dxmt::CommandBufferFenceBindingTable bindings;
+  bindings.reset(2);
+
+  constexpr dxmt::EncoderId kExternalWait = 900;
+  constexpr dxmt::EncoderId kFutureLocalUpdate = 1200;
+  EXPECT_FALSE(bindings.find(kExternalWait).has_value());
+  EXPECT_EQ(bindings.bind(kFutureLocalUpdate, 5, 7), 0u);
+  EXPECT_FALSE(bindings.find(kExternalWait).has_value());
+  EXPECT_EQ(*bindings.find(kFutureLocalUpdate), 0u);
+}
+
+TEST(FenceDependencyOrderTracker,
+     ClassifiesPriorFutureSameAndExternalWaitsByExactId) {
+  dxmt::FenceDependencyOrderTracker tracker;
+  tracker.recordUpdates(dxmt::FenceSet(1024));
+  tracker.recordUpdates(dxmt::FenceSet(2048));
+  tracker.recordUpdates(dxmt::FenceSet(3072));
+
+  dxmt::FenceSet first_waits;
+  first_waits.set(2048);
+  first_waits.set(4096);
+  tracker.analyzeEncoder(first_waits, dxmt::FenceSet(1024));
+
+  dxmt::FenceSet second_waits;
+  second_waits.set(1024);
+  second_waits.set(3072);
+  tracker.analyzeEncoder(second_waits, dxmt::FenceSet(3072));
+
+  const auto &analysis = tracker.analysis();
+  EXPECT_EQ(analysis.prior_local_waits, 1u);
+  EXPECT_EQ(analysis.future_local_waits, 1u);
+  EXPECT_EQ(analysis.same_encoder_waits, 1u);
+  EXPECT_EQ(analysis.external_waits, 1u);
 }
 
 TEST(RenderFenceMerge, RemovesNaturallyOrderedCrossStageWait) {

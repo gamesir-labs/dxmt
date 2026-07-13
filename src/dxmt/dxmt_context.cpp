@@ -192,14 +192,159 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
   dummy_cbuffer_ = device.newBuffer(dummy_cbuffer_info_);
   cpu_buffer_chunks_.emplace_back();
   barrier_event_ = device_.newEvent();
-  for (unsigned i = 0; i < kParityLane; i++) {
-    fence_pool_[i] = device.newFence();
-  }
 };
 
 ArgumentEncodingContext::~ArgumentEncodingContext() {
   wsi::aligned_free(dummy_cbuffer_host_);
 };
+
+WMT::Fence
+ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
+  const auto mapping = fence_bindings_.find(id);
+  if (!mapping)
+    return {};
+
+  const auto slot = *mapping;
+  if (slot >= fence_pool_.size())
+    fence_pool_.resize(slot + 1);
+  auto &fence = fence_pool_[slot];
+  if (fence)
+    return fence;
+
+  fence = device_.newFence();
+  assert(fence);
+
+  const auto marker = env::getEnvVar("DXMT_TEST_FENCE_CREATION_MARKER");
+  if (!marker.empty()) {
+    if (FILE *file = fopen(marker.c_str(), "a")) {
+      fprintf(file, "%u\n", slot);
+      fclose(file);
+    }
+  }
+  return fence;
+}
+
+void
+ArgumentEncodingContext::prepareFencePool(
+    EncoderData **encoders, unsigned encoder_count,
+    CommandBufferDiagnosticInfo *diagnostic_info) {
+  struct FenceInterval {
+    EncoderId id;
+    uint32_t first;
+    uint32_t last;
+  };
+  std::vector<FenceInterval> intervals;
+  std::unordered_map<EncoderId, size_t> interval_by_id;
+  std::unordered_set<EncoderId> consumed_updates;
+  FenceDependencyOrderTracker dependency_order;
+
+  auto add_updates = [&](const FenceSet &updates, uint32_t index) {
+    updates.forEach([&](EncoderId id) {
+      if (interval_by_id.contains(id))
+        return;
+      interval_by_id.emplace(id, intervals.size());
+      intervals.push_back({id, index, index});
+    });
+  };
+  auto extend_waits = [&](const FenceSet &waits, uint32_t index) {
+    waits.forEach([&](EncoderId id) {
+      const auto interval = interval_by_id.find(id);
+      if (interval != interval_by_id.end()) {
+        intervals[interval->second].last =
+            std::max(intervals[interval->second].last, index);
+        consumed_updates.insert(id);
+      }
+    });
+  };
+
+  for (unsigned i = 0; i < encoder_count; i++) {
+    const auto *encoder = encoders[i];
+    if (encoder->type == EncoderType::Null)
+      continue;
+    FenceSet updates = encoder->fence_update;
+    if (encoder->type == EncoderType::Render)
+      updates.merge(
+          static_cast<const RenderEncoderData *>(encoder)->fence_update_vertex);
+    add_updates(updates, i);
+    dependency_order.recordUpdates(updates);
+  }
+  if (has_pending_fence_only_blit_) {
+    add_updates(pending_fence_only_blit_update_, encoder_count);
+    dependency_order.recordUpdates(pending_fence_only_blit_update_);
+  }
+
+  for (unsigned i = 0; i < encoder_count; i++) {
+    const auto *encoder = encoders[i];
+    if (encoder->type == EncoderType::Null)
+      continue;
+    FenceSet waits = encoder->fence_wait;
+    FenceSet updates = encoder->fence_update;
+    if (encoder->type == EncoderType::Render) {
+      const auto *render = static_cast<const RenderEncoderData *>(encoder);
+      waits.merge(render->fence_wait_vertex);
+      updates.merge(render->fence_update_vertex);
+    }
+    extend_waits(waits, i);
+    dependency_order.analyzeEncoder(waits, updates);
+  }
+  if (has_pending_fence_only_blit_) {
+    extend_waits(pending_fence_only_blit_wait_, encoder_count);
+    dependency_order.analyzeEncoder(pending_fence_only_blit_wait_,
+                                    pending_fence_only_blit_update_);
+  }
+
+  std::sort(intervals.begin(), intervals.end(), [](const auto &lhs,
+                                                   const auto &rhs) {
+    return lhs.first != rhs.first ? lhs.first < rhs.first : lhs.id < rhs.id;
+  });
+  std::erase_if(intervals, [&](const auto &interval) {
+    return !consumed_updates.contains(interval.id);
+  });
+  fence_bindings_.reset(static_cast<uint32_t>(fence_pool_.size()));
+  uint32_t used_slot_count = 0;
+  for (const auto &interval : intervals) {
+    const auto slot =
+        fence_bindings_.bind(interval.id, interval.first, interval.last);
+    used_slot_count = std::max(used_slot_count, slot + 1);
+  }
+
+  auto retain_bound = [&](FenceSet &fences) {
+    FenceSet retained;
+    fences.forEach([&](EncoderId id) {
+      if (fence_bindings_.find(id))
+        retained.set(id);
+    });
+    fences = std::move(retained);
+  };
+  for (unsigned i = 0; i < encoder_count; i++) {
+    auto *encoder = encoders[i];
+    if (encoder->type == EncoderType::Null)
+      continue;
+    retain_bound(encoder->fence_wait);
+    retain_bound(encoder->fence_update);
+    if (encoder->type == EncoderType::Render) {
+      auto *render = static_cast<RenderEncoderData *>(encoder);
+      retain_bound(render->fence_wait_vertex);
+      retain_bound(render->fence_update_vertex);
+    }
+  }
+  if (has_pending_fence_only_blit_) {
+    retain_bound(pending_fence_only_blit_wait_);
+    retain_bound(pending_fence_only_blit_update_);
+  }
+
+  if (diagnostic_info) {
+    const auto &order = dependency_order.analysis();
+    diagnostic_info->prior_local_fence_wait_count = order.prior_local_waits;
+    diagnostic_info->future_local_fence_wait_count = order.future_local_waits;
+    diagnostic_info->same_encoder_fence_wait_count = order.same_encoder_waits;
+    diagnostic_info->external_fence_wait_count = order.external_waits;
+    diagnostic_info->repeated_fence_update_count = order.repeated_updates;
+    diagnostic_info->local_fence_id_count =
+        static_cast<uint32_t>(intervals.size());
+    diagnostic_info->bound_fence_slot_count = used_slot_count;
+  }
+}
 
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Ordinary>(uint32_t slot_mask, uint64_t argument_buffer_offset);
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Tessellation>(uint32_t slot_mask, uint64_t argument_buffer_offset);
@@ -4076,6 +4221,33 @@ ArgumentEncodingContext::flushCommands(
     perf.timestamp += clock::now() - t0;
   }
 
+  prepareFencePool(encoders, encoder_count, diagnostic_info);
+
+  // Report and benchmark only the fence operations that will reach Metal.
+  // Encoder construction gives every producer a logical update, but an update
+  // with no consumer in this command buffer carries no dependency.
+  perf.fenceWaits = 0;
+  perf.fenceUpdates = 0;
+  for (unsigned i = 0; i < encoder_count; i++) {
+    auto *encoder = encoders[i];
+    if (encoder->type == EncoderType::Null)
+      continue;
+    if (encoder->type == EncoderType::Render) {
+      auto *render = static_cast<RenderEncoderData *>(encoder);
+      render->fence_wait.forEach(
+          render->fence_wait_vertex,
+          [&](auto) { perf.fenceWaits++; },
+          [&](auto) { perf.fenceWaits++; });
+      render->fence_update.forEach(
+          render->fence_update_vertex,
+          [&](auto) { perf.fenceUpdates++; },
+          [&](auto) { perf.fenceUpdates++; });
+    } else {
+      perf.fenceWaits += encoder->fence_wait.count();
+      perf.fenceUpdates += encoder->fence_update.count();
+    }
+  }
+
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
     const auto encoder_type = current->type;
@@ -4169,8 +4341,8 @@ ArgumentEncodingContext::flushCommands(
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
-          [&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStagePreRaster); },
-          [&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); }
+          [&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStagePreRaster); }); },
+          [&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); }); }
       );
       if (data->allocated_argbuf_size) {
         encoder.setArgumentBuffer(gpu_buffer_, 0, 16, WMTRenderStageVertex);
@@ -4197,10 +4369,10 @@ ArgumentEncodingContext::flushCommands(
         data->fence_update_vertex.forEach(
             data->fence_update,
             [&](auto id) {
-              encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment);
+              withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); });
             },
             [&](auto id) {
-              encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStagePreRaster);
+              withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStagePreRaster); });
             });
         encoder.endEncoding();
         data->~RenderEncoderData();
@@ -4317,8 +4489,8 @@ ArgumentEncodingContext::flushCommands(
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update_vertex.forEach(
           data->fence_update, // if a fence is updated at fragment, no need to update again pre-raster
-          [&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); },
-          [&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStagePreRaster); }
+          [&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); }); },
+          [&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStagePreRaster); }); }
       );
       encoder.endEncoding();
       DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
@@ -4397,7 +4569,7 @@ ArgumentEncodingContext::flushCommands(
              " waitFence=", command_summary.wait_fences + data->fence_wait.count(),
              " updateFence=", command_summary.update_fences + data->fence_update.count());
       }
-      data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane]); });
+      data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence); }); });
       if (data->allocated_argbuf_size) {
         struct wmtcmd_compute_setargumentbuffer setcmd;
         setcmd.type = WMTComputeCommandSetArgumentBuffer;
@@ -4410,7 +4582,7 @@ ArgumentEncodingContext::flushCommands(
         encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
       }
       encoder.encodeCommands(&data->cmd_head);
-      data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane]); });
+      data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence); }); });
       encoder.endEncoding();
       data->~ComputeEncoderData();
       perf.encodedCompute++;
@@ -4434,9 +4606,9 @@ ArgumentEncodingContext::flushCommands(
           " mip=" + std::to_string(command_summary.generate_mipmaps) +
           " wf=" + std::to_string(command_summary.wait_fences + data->fence_wait.count()) +
           " uf=" + std::to_string(command_summary.update_fences + data->fence_update.count())));
-      data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane]); });
+      data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence); }); });
       encoder.encodeCommands(&data->cmd_head);
-      data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane]); });
+      data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence); }); });
       encoder.endEncoding();
       data->~BlitEncoderData();
       perf.encodedBlit++;
@@ -4459,10 +4631,10 @@ ArgumentEncodingContext::flushCommands(
       auto drawable = data->presenter->encodeCommands(
           cmdbuf, data->backbuffer, data->metadata,
           [&](WMT::RenderCommandEncoder encoder) {
-            data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
+            data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); }); });
           },
           [&](WMT::RenderCommandEncoder encoder) {
-            data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
+            data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); }); });
           }
       );
       auto t1 = clock::now();
@@ -4555,8 +4727,8 @@ ArgumentEncodingContext::flushCommands(
         }
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
-        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
-        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
+        data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); }); });
+        data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); }); });
         encoder.endEncoding();
       }
       data->~ClearEncoderData();
@@ -4612,7 +4784,7 @@ ArgumentEncodingContext::flushCommands(
         }
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
-        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
+        data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); }); });
         if (data->pso) {
           struct ResolveMetadata {
             uint32_t src_origin[2];
@@ -4637,7 +4809,7 @@ ArgumentEncodingContext::flushCommands(
               double(metadata.size[0]), double(metadata.size[1]), 0.0, 1.0});
           encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
         }
-        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane], WMTRenderStageFragment); });
+        data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); }); });
         encoder.endEncoding();
       }
       data->~ResolveEncoderData();
@@ -4649,7 +4821,7 @@ ArgumentEncodingContext::flushCommands(
 
       auto begin_scaler = cmdbuf.blitCommandEncoder();
       begin_scaler.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
-      data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id % kParityLane]); });
+      data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { begin_scaler.waitForFence(fence); }); });
       begin_scaler.updateFence(data->scaler->fence());
       begin_scaler.endEncoding();
 
@@ -4658,7 +4830,7 @@ ArgumentEncodingContext::flushCommands(
       auto end_scaler = cmdbuf.blitCommandEncoder();
       end_scaler.waitForFence(data->scaler->fence());
       end_scaler.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
-      data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id % kParityLane]); });
+      data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { end_scaler.updateFence(fence); }); });
       end_scaler.endEncoding();
 
       data->~SpatialUpscaleData();
@@ -4684,7 +4856,7 @@ ArgumentEncodingContext::flushCommands(
 
       auto begin_scaler = cmdbuf.blitCommandEncoder();
       begin_scaler.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
-      data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id % kParityLane]); });
+      data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { begin_scaler.waitForFence(fence); }); });
       begin_scaler.updateFence(data->scaler->fence());
       begin_scaler.endEncoding();
 
@@ -4696,7 +4868,7 @@ ArgumentEncodingContext::flushCommands(
       auto end_scaler = cmdbuf.blitCommandEncoder();
       end_scaler.waitForFence(data->scaler->fence());
       end_scaler.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
-      data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id % kParityLane]); });
+      data->fence_update.forEach([&](auto id) { withFence(id, [&](auto fence) { end_scaler.updateFence(fence); }); });
       end_scaler.endEncoding();
       data->~TemporalUpscaleData();
       perf.encodedScaler++;
@@ -4844,8 +5016,8 @@ ArgumentEncodingContext::flushCommands(
     perf.fenceWaits += perf.pendingFenceWaits;
     perf.fenceUpdates += perf.pendingFenceUpdates;
     auto encoder = cmdbuf.blitCommandEncoder();
-    pending_fence_only_blit_wait_.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id % kParityLane]); });
-    pending_fence_only_blit_update_.forEach([&](auto id) { encoder.updateFence(fence_pool_[id % kParityLane]); });
+    pending_fence_only_blit_wait_.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence); }); });
+    pending_fence_only_blit_update_.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence); }); });
     encoder.endEncoding();
     pending_fence_only_blit_wait_ = {};
     pending_fence_only_blit_update_ = {};
