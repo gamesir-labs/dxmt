@@ -114,6 +114,17 @@ WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
     obj_handle_t cmdbuf, uint64_t *residency_submit_us);
 
+#define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 8
+
+struct WMTCommandBufferFenceEdgeDiagnostic {
+  uint64_t producer_id;
+  uint64_t consumer_id;
+  uint32_t producer_index;
+  uint32_t consumer_index;
+  uint32_t slot;
+  uint32_t flags;
+};
+
 struct WMTCommandBufferDiagnosticInfo {
   uint64_t frame_id;
   uint64_t chunk_id;
@@ -146,9 +157,16 @@ struct WMTCommandBufferDiagnosticInfo {
   uint32_t render_reverse_stage_wait_count;
   uint32_t local_fence_id_count;
   uint32_t bound_fence_slot_count;
+  uint32_t encoded_fence_wait_count;
+  uint32_t skipped_external_fence_wait_count;
+  uint32_t fence_edge_count;
+  uint32_t fence_edge_overflow_count;
+  struct WMTCommandBufferFenceEdgeDiagnostic
+      fence_edges[WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY];
 };
 
-STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 144);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferFenceEdgeDiagnostic) == 32);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 416);
 
 WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,

@@ -56,7 +56,8 @@ static bool
 D3D12MetalPsoLabelsEnabled() {
   static const bool enabled =
       D3D12PipelineDiagEnabledEnv("DXMT_DIAG_METAL_PSO_LABELS") ||
-      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE") ||
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE");
   return enabled;
 }
 

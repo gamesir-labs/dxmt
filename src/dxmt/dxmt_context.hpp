@@ -33,6 +33,26 @@ constexpr size_t kEncodingContextCPUHeapLifetime = 600;
 
 constexpr auto kIntrapassControlBitIgnoreUAVWaW = 1ull << 1;
 
+constexpr uint32_t kCommandBufferFenceEdgeCapacity = 8;
+
+enum CommandBufferFenceEdgeFlag : uint32_t {
+  CommandBufferFenceEdgePreRaster = 1u << 0,
+  CommandBufferFenceEdgeFragment = 1u << 1,
+  CommandBufferFenceEdgeCompute = 1u << 2,
+  CommandBufferFenceEdgeBlit = 1u << 3,
+  CommandBufferFenceEdgeOther = 1u << 4,
+  CommandBufferFenceEdgePending = 1u << 5,
+};
+
+struct CommandBufferFenceEdgeDiagnostic {
+  uint64_t producer_id = 0;
+  uint64_t consumer_id = 0;
+  uint32_t producer_index = 0;
+  uint32_t consumer_index = 0;
+  uint32_t slot = 0;
+  uint32_t flags = 0;
+};
+
 struct CommandBufferDiagnosticInfo {
   uint64_t frame_id = 0;
   uint64_t chunk_id = 0;
@@ -65,6 +85,13 @@ struct CommandBufferDiagnosticInfo {
   uint32_t render_reverse_stage_wait_count = 0;
   uint32_t local_fence_id_count = 0;
   uint32_t bound_fence_slot_count = 0;
+  uint32_t encoded_fence_wait_count = 0;
+  uint32_t skipped_external_fence_wait_count = 0;
+  uint32_t fence_edge_count = 0;
+  uint32_t fence_edge_overflow_count = 0;
+  std::array<CommandBufferFenceEdgeDiagnostic,
+             kCommandBufferFenceEdgeCapacity>
+      fence_edges = {};
 };
 
 inline std::size_t

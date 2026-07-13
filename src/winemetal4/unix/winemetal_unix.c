@@ -1095,6 +1095,8 @@ dxmt_metal4_is_buffer(id object) {
                 " externalWait=%u repeatedUpdate=%u"
                 " renderValidCrossStage=%u renderSameStage=%u renderReverseStage=%u"
                 " localFenceIds=%u boundFenceSlots=%u"
+                " encodedFenceWait=%u skippedExternalFenceWait=%u"
+                " fenceEdgeCount=%u fenceEdgeOverflow=%u"
                 " label=%s gpuStart=%.9f gpuEnd=%.9f domain=%s code=%ld description=%s\n",
                 (void *)(uintptr_t)feedbackCommandBuffer,
                 (void *)(uintptr_t)feedbackMetalBuffer,
@@ -1140,6 +1142,10 @@ dxmt_metal4_is_buffer(id object) {
                 feedbackDiagnostic.render_reverse_stage_wait_count,
                 feedbackDiagnostic.local_fence_id_count,
                 feedbackDiagnostic.bound_fence_slot_count,
+                feedbackDiagnostic.encoded_fence_wait_count,
+                feedbackDiagnostic.skipped_external_fence_wait_count,
+                feedbackDiagnostic.fence_edge_count,
+                feedbackDiagnostic.fence_edge_overflow_count,
                 feedbackLabel ? feedbackLabel.UTF8String : "<unnamed>",
                 feedback.GPUStartTime, feedback.GPUEndTime,
                 error.domain ? error.domain.UTF8String : "<no domain>",
@@ -1148,6 +1154,21 @@ dxmt_metal4_is_buffer(id object) {
                                            : "<no description>");
 
         if (denseHangDiagnostics) {
+          for (uint32_t edge_index = 0;
+               edge_index < feedbackDiagnostic.fence_edge_count &&
+               edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+               edge_index++) {
+            const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+                &feedbackDiagnostic.fence_edges[edge_index];
+            fprintf(stderr,
+                    "err:   DXMT Metal4 feedback fence edge: commandBuffer=%p"
+                    " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
+                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+                    (void *)(uintptr_t)feedbackCommandBuffer, edge_index,
+                    edge->producer_id, edge->consumer_id,
+                    edge->producer_index, edge->consumer_index, edge->slot,
+                    edge->flags);
+          }
           NSString *debugDescription = error.debugDescription;
           NSString *userInfoDescription = error.userInfo.description;
           fprintf(stderr,
@@ -1290,6 +1311,8 @@ dxmt_metal4_is_buffer(id object) {
                   " priorLocal=%u futureLocal=%u sameEncoder=%u external=%u"
                   " repeatedUpdate=%u renderCrossStage=%u renderSameStage=%u"
                   " renderReverseStage=%u localFenceIds=%u boundFenceSlots=%u"
+                  " encodedFenceWait=%u skippedExternalFenceWait=%u"
+                  " fenceEdgeCount=%u fenceEdgeOverflow=%u"
                   " resourceInitializerEvent=%" PRIu64 "\n",
                   self,
                   _metal4Buffer.label ? _metal4Buffer.label.UTF8String : "<none>",
@@ -1311,7 +1334,25 @@ dxmt_metal4_is_buffer(id object) {
                   diag->render_same_stage_wait_count,
                   diag->render_reverse_stage_wait_count,
                   diag->local_fence_id_count, diag->bound_fence_slot_count,
+                  diag->encoded_fence_wait_count,
+                  diag->skipped_external_fence_wait_count,
+                  diag->fence_edge_count,
+                  diag->fence_edge_overflow_count,
                   diag->resource_initializer_event_id);
+          for (uint32_t edge_index = 0;
+               edge_index < diag->fence_edge_count &&
+               edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+               edge_index++) {
+            const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+                &diag->fence_edges[edge_index];
+            fprintf(stderr,
+                    "warn:  DXMT Metal4 completion fence edge: commandBuffer=%p"
+                    " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
+                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+                    self, edge_index, edge->producer_id, edge->consumer_id,
+                    edge->producer_index, edge->consumer_index, edge->slot,
+                    edge->flags);
+          }
           NSUInteger wait_index = 0;
           for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
             uint64_t wait_current = dxmt_metal4_shared_event_value(wait.event);
