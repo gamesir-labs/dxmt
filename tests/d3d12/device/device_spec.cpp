@@ -232,58 +232,6 @@ TEST(D3D12DeviceCreationSpec, RejectsFeatureLevel93) {
   release_object(device);
 }
 
-TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
-  ScopedArchiveTestEnvironment environment("attached");
-  ID3D12Device *device = nullptr;
-  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
-      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-      reinterpret_cast<void **>(&device))));
-  ASSERT_NE(device, nullptr);
-
-  auto *pipeline = CreateBasicGraphicsPipeline(device);
-  ASSERT_NE(pipeline, nullptr);
-  release_object(pipeline);
-  release_object(device);
-
-  const auto marker = environment.ReadMarker();
-  if (marker.find("serialize reason=periodic count=1") == std::string::npos)
-    GTEST_SKIP() << "D3D12 device was reused after archive state was fixed: "
-                 << marker;
-  EXPECT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
-            std::string::npos)
-      << marker;
-}
-
-TEST(D3D12PipelineArchiveSpec, RejectsCorruptArchiveAndFallsBackToCompilation) {
-  ScopedArchiveTestEnvironment environment("corrupt");
-  const auto archive_dir =
-      environment.windows_cache_root + "\\com.apple.metal4";
-  ASSERT_TRUE(CreateDirectoryA(archive_dir.c_str(), nullptr) ||
-              GetLastError() == ERROR_ALREADY_EXISTS);
-  const auto archive_path = archive_dir + "\\dxmt_pso.binaryarchive";
-  {
-    std::ofstream corrupt(archive_path, std::ios::binary | std::ios::trunc);
-    ASSERT_TRUE(corrupt.good());
-    corrupt << "not-a-metal-binary-archive";
-  }
-
-  ID3D12Device *device = nullptr;
-  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
-      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-      reinterpret_cast<void **>(&device))));
-  ASSERT_NE(device, nullptr);
-  auto *pipeline = CreateBasicGraphicsPipeline(device);
-  EXPECT_NE(pipeline, nullptr);
-  release_object(pipeline);
-  release_object(device);
-
-  const auto marker = environment.ReadMarker();
-  if (marker.find("create cold=0") == std::string::npos)
-    GTEST_SKIP() << "D3D12 device was reused after archive state was fixed: "
-                 << marker;
-  EXPECT_NE(marker.find("create cold=0 ok=0"), std::string::npos) << marker;
-}
-
 TEST(D3D12PersistentAirCacheSpec, ReusesAirAcrossIrrelevantPsoState) {
   ScopedAirCacheTestEnvironment environment("irrelevant-state");
   ID3D12Device *device = nullptr;

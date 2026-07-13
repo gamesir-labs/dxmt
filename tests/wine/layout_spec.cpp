@@ -25,7 +25,7 @@ TEST(TestLayout, KeepsWineInfrastructureInStableLocations) {
       "tests/d3d11/capability_spec.cpp",
       "tests/d3d11/d3d11_test_context.hpp",
       "tests/d3d12/meson.build",
-      "tests/d3d12/capability_spec.cpp",
+      "tests/d3d12/capability/capability_spec.cpp",
       "tests/include/dxmt_test_com.hpp",
       "tests/include/dxmt_test.hpp",
       "tests/include/dxmt_test_scheduler.hpp",

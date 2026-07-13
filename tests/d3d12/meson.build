@@ -17,29 +17,26 @@ d3d12_runtime_support_dep = declare_dependency(
 d3d12_unit_suites = {
   'device': {
     'sources': files(
-      'device_spec.cpp',
-      'capability_spec.cpp',
+      'device/device_spec.cpp',
     ),
+  },
+  'cache': {
+    'sources': files('cache/cache_spec.cpp'),
+  },
+  'capability': {
+    'sources': files('capability/capability_spec.cpp'),
   },
   'descriptor': {
-    'sources': files(
-      'descriptor_spec.cpp',
-    ),
+    'sources': files('descriptor/descriptor_spec.cpp'),
   },
   'queue': {
-    'sources': files(
-      'queue_spec.cpp',
-    ),
+    'sources': files('queue/queue_spec.cpp'),
   },
   'resource': {
-    'sources': files(
-      'resource_spec.cpp',
-    ),
+    'sources': files('resource/resource_spec.cpp'),
   },
   'sparse-resource': {
-    'sources': files(
-      'sparse_resource_spec.cpp',
-    ),
+    'sources': files('resource/sparse_resource_spec.cpp'),
   },
 }
 
