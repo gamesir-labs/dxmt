@@ -69,6 +69,7 @@ struct DXMTSparseTextureTileKey {
                   count:(uint64_t)count
                    heap:(id<MTLHeap>)heap;
 - (void)addMappedHeapsToResidencySet:(id<MTLResidencySet>)residencySet;
+- (NSArray *)mappedHeapsSnapshot;
 @end
 
 static NSLock *dxmt_sparse_texture_residency_lock;
@@ -165,6 +166,13 @@ dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
   for (id<MTLHeap> heap in _mappedHeaps)
     [residencySet addAllocation:(id<MTLAllocation>)heap];
   [_lock unlock];
+}
+
+- (NSArray *)mappedHeapsSnapshot {
+  [_lock lock];
+  NSArray *snapshot = [[_mappedHeaps allObjects] retain];
+  [_lock unlock];
+  return [snapshot autorelease];
 }
 @end
 
@@ -346,7 +354,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 @property(nonatomic, retain) id<MTLResidencySet> residencySet;
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
-@property(nonatomic, retain) NSMutableArray *sparseResidencySets;
+@property(nonatomic, retain) NSMutableArray *sparseResidencyAllocations;
 @property(nonatomic, retain) id<MTLDrawable> pendingDrawable;
 @property(nonatomic, assign) BOOL hasPresentDuration;
 @property(nonatomic, assign) double presentDuration;
@@ -370,7 +378,7 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
 - (void)commit;
 - (uint64_t)commitLocked;
 - (void)waitUntilCompleted;
-- (void)releaseSparseResidencySets;
+- (void)releaseSparseResidencyAllocations;
 - (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
 - (id)logs;
@@ -840,7 +848,9 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, assign) uint64_t maxCommandBufferCount;
 @property(nonatomic, assign) uint64_t commandBufferThrottleWaitCount;
 @property(nonatomic, retain) NSError *firstError;
-@property(nonatomic, retain) NSMutableArray *pendingSparseResidencySets;
+@property(nonatomic, retain) id<MTLResidencySet> sparseResidencySet;
+@property(nonatomic, retain) NSMutableArray *pendingSparseResidencyAllocations;
+@property(nonatomic, retain) NSCountedSet *sparseResidencyAllocationRefs;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
@@ -864,24 +874,40 @@ dxmt_metal4_is_buffer(id object) {
   _presentEventValue = 0;
   _maxCommandBufferCount = maxCommandBufferCount;
   _commandBufferThrottleWaitCount = 0;
-  _pendingSparseResidencySets = [[NSMutableArray alloc] init];
+  MTLResidencySetDescriptor *sparseResidencyDescriptor =
+      [[MTLResidencySetDescriptor alloc] init];
+  sparseResidencyDescriptor.label = @"DXMT sparse queue residency";
+  sparseResidencyDescriptor.initialCapacity = 1024;
+  NSError *sparseResidencyError = nil;
+  _sparseResidencySet = [device
+      newResidencySetWithDescriptor:sparseResidencyDescriptor
+                              error:&sparseResidencyError];
+  [sparseResidencyDescriptor release];
+  _pendingSparseResidencyAllocations = [[NSMutableArray alloc] init];
+  _sparseResidencyAllocationRefs = [[NSCountedSet alloc] init];
 
   if (!_metal4Queue || !_compiler || !_event || !_presentEvent ||
-      !_pendingSparseResidencySets) {
+      !_sparseResidencySet || !_pendingSparseResidencyAllocations ||
+      !_sparseResidencyAllocationRefs) {
     [self release];
     return nil;
   }
+
+  [_sparseResidencySet commit];
+  [_sparseResidencySet requestResidency];
+  [_metal4Queue addResidencySet:_sparseResidencySet];
 
   dxmt_metal4_register_compiler(device, _compiler);
   return self;
 }
 
 - (void)dealloc {
-  for (id<MTLResidencySet> residencySet in _pendingSparseResidencySets) {
-    [_metal4Queue removeResidencySet:residencySet];
-    [residencySet endResidency];
-  }
-  [_pendingSparseResidencySets release];
+  if (_metal4Queue && _sparseResidencySet)
+    [_metal4Queue removeResidencySet:_sparseResidencySet];
+  [_sparseResidencySet endResidency];
+  [_pendingSparseResidencyAllocations release];
+  [_sparseResidencyAllocationRefs release];
+  [_sparseResidencySet release];
   [_device release];
   [_metal4Queue release];
   [_compiler release];
@@ -932,7 +958,7 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
   _pendingWaitEvents = [[NSMutableArray alloc] init];
   _pendingSignalEvents = [[NSMutableArray alloc] init];
-  _sparseResidencySets = [[NSMutableArray alloc] init];
+  _sparseResidencyAllocations = [[NSMutableArray alloc] init];
   MTLResidencySetDescriptor *residencyDesc = [[MTLResidencySetDescriptor alloc] init];
   residencyDesc.initialCapacity = 1024;
   NSError *residencyError = nil;
@@ -945,7 +971,7 @@ dxmt_metal4_is_buffer(id object) {
   memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
   if (!_allocator || !_metal4Buffer || !_pendingWaitEvents ||
-      !_pendingSignalEvents || !_sparseResidencySets || !_residencySet) {
+      !_pendingSignalEvents || !_sparseResidencyAllocations || !_residencySet) {
     [self release];
     return nil;
   }
@@ -958,7 +984,7 @@ dxmt_metal4_is_buffer(id object) {
   [_feedbackError release];
   [_pendingWaitEvents release];
   [_pendingSignalEvents release];
-  [_sparseResidencySets release];
+  [_sparseResidencyAllocations release];
   [_residencySet release];
   [_metal4Buffer release];
   [_allocator release];
@@ -1078,8 +1104,9 @@ dxmt_metal4_is_buffer(id object) {
     return 0;
   }
 
-  [_sparseResidencySets addObjectsFromArray:_owner.pendingSparseResidencySets];
-  [_owner.pendingSparseResidencySets removeAllObjects];
+  [_sparseResidencyAllocations
+      addObjectsFromArray:_owner.pendingSparseResidencyAllocations];
+  [_owner.pendingSparseResidencyAllocations removeAllObjects];
 
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
@@ -1559,17 +1586,23 @@ dxmt_metal4_is_buffer(id object) {
       _internalStatus = DXMTMetal4CommandBufferStateCompleted;
   }
 
-  [self releaseSparseResidencySets];
+  [self releaseSparseResidencyAllocations];
 
 }
 
-- (void)releaseSparseResidencySets {
+- (void)releaseSparseResidencyAllocations {
   @synchronized(_owner) {
-    for (id<MTLResidencySet> residencySet in _sparseResidencySets) {
-      [_owner.metal4Queue removeResidencySet:residencySet];
-      [residencySet endResidency];
+    BOOL changed = NO;
+    for (id<MTLAllocation> allocation in _sparseResidencyAllocations) {
+      [_owner.sparseResidencyAllocationRefs removeObject:allocation];
+      if ([_owner.sparseResidencyAllocationRefs countForObject:allocation] == 0) {
+        [_owner.sparseResidencySet removeAllocation:allocation];
+        changed = YES;
+      }
     }
-    [_sparseResidencySets removeAllObjects];
+    if (changed)
+      [_owner.sparseResidencySet commit];
+    [_sparseResidencyAllocations removeAllObjects];
   }
 }
 
@@ -4929,41 +4962,38 @@ _MTLCommandQueue_updateSparseTextureMappings(void *obj) {
           src->heap_offset / WMT_SPARSE_TILE_SIZE_IN_BYTES;
     }
 
-    MTLResidencySetDescriptor *descriptor =
-        [[MTLResidencySetDescriptor alloc] init];
-    descriptor.initialCapacity = 2;
-    NSError *error = nil;
-    id<MTLResidencySet> residencySet =
-        [queue.device newResidencySetWithDescriptor:descriptor error:&error];
-    [descriptor release];
-    if (!residencySet) {
-      free(mtl_ops);
-      return STATUS_SUCCESS;
-    }
-
-    [residencySet addAllocation:(id<MTLAllocation>)texture];
     DXMTSparseTextureResidency *residency =
         dxmt_sparse_texture_residency_for_texture(texture, true);
-    [residency addMappedHeapsToResidencySet:residencySet];
-    if (heap)
-      [residencySet addAllocation:(id<MTLAllocation>)heap];
-    [residencySet commit];
-    [residencySet requestResidency];
+    NSArray *mappedHeaps = [residency mappedHeapsSnapshot];
 
     @synchronized(queue) {
-      [queue.metal4Queue addResidencySet:residencySet];
-      [queue.metal4Queue updateTextureMappings:texture
-                                           heap:heap
-                                     operations:mtl_ops
-                                          count:(NSUInteger)params->operation_count];
-      [queue.pendingSparseResidencySets addObject:residencySet];
-      [residency applyOperations:operations
-                           count:params->operation_count
-                            heap:heap];
-      params->ret = 1;
+      if (!queue.firstError) {
+        NSMutableArray *allocations = [NSMutableArray arrayWithCapacity:
+            mappedHeaps.count + (heap ? 2 : 1)];
+        [allocations addObject:(id<MTLAllocation>)texture];
+        [allocations addObjectsFromArray:mappedHeaps];
+        if (heap)
+          [allocations addObject:(id<MTLAllocation>)heap];
+
+        for (id<MTLAllocation> allocation in allocations) {
+          if ([queue.sparseResidencyAllocationRefs
+                  countForObject:allocation] == 0)
+            [queue.sparseResidencySet addAllocation:allocation];
+          [queue.sparseResidencyAllocationRefs addObject:allocation];
+          [queue.pendingSparseResidencyAllocations addObject:allocation];
+        }
+        [queue.sparseResidencySet commit];
+        [queue.metal4Queue updateTextureMappings:texture
+                                             heap:heap
+                                       operations:mtl_ops
+                                            count:(NSUInteger)params->operation_count];
+        [residency applyOperations:operations
+                             count:params->operation_count
+                              heap:heap];
+        params->ret = 1;
+      }
     }
 
-    [residencySet release];
     free(mtl_ops);
   }
   return STATUS_SUCCESS;
