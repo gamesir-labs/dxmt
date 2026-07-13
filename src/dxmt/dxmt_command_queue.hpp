@@ -383,6 +383,7 @@ public:
   uint64_t
   FlushPersistentResidency();
 
+#if DXMT_DX12_METAL4
   bool
   UpdateSparseTextureMappings(
       WMT::Texture texture, WMT::Heap heap,
@@ -391,6 +392,7 @@ public:
     return commandQueue.updateSparseTextureMappings(texture, heap, operations,
                                                     operation_count);
   }
+#endif
 
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {
