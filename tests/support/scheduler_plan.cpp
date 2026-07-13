@@ -86,6 +86,16 @@ std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,
                    std::max<std::size_t>(1, amortized_worker_count)});
 }
 
+std::vector<ScheduledTest>
+ExtractSerialTests(std::vector<ScheduledTest> &tests) {
+  std::vector<ScheduledTest> serial;
+  for (auto &test : tests)
+    if (test.serial)
+      serial.push_back(std::move(test));
+  std::erase_if(tests, [](const auto &test) { return test.serial; });
+  return serial;
+}
+
 std::vector<TestShard> BuildTestShards(std::vector<ScheduledTest> tests,
                                        std::size_t worker_count) {
   if (tests.empty() || worker_count == 0)

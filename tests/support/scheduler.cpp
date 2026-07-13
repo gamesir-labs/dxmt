@@ -26,8 +26,17 @@ struct CostHint {
   std::uint32_t cost;
 };
 
+struct SerialHint {
+  std::string pattern;
+};
+
 std::vector<CostHint> &CostHints() {
   static std::vector<CostHint> hints;
+  return hints;
+}
+
+std::vector<SerialHint> &SerialHints() {
+  static std::vector<SerialHint> hints;
   return hints;
 }
 
@@ -139,6 +148,12 @@ std::uint32_t TestCost(std::string_view name) {
   return cost;
 }
 
+bool TestMustRunSerially(std::string_view name) {
+  return std::ranges::any_of(SerialHints(), [&](const auto &hint) {
+    return GlobMatches(hint.pattern, name);
+  });
+}
+
 std::vector<ScheduledTest> CollectRunnableTests() {
   std::vector<ScheduledTest> tests;
   const auto filter = std::string_view(GTEST_FLAG_GET(filter));
@@ -156,7 +171,8 @@ std::vector<ScheduledTest> CollectRunnableTests() {
       const bool disabled =
           IsDisabledName(suite->name()) || IsDisabledName(test->name());
       if ((!disabled || run_disabled) && FilterMatches(filter, full_name))
-        tests.push_back({full_name, TestCost(full_name)});
+        tests.push_back(
+            {full_name, TestCost(full_name), TestMustRunSerially(full_name)});
     }
   }
   return tests;
@@ -318,6 +334,10 @@ TestCostRegistration::TestCostRegistration(std::string_view pattern,
   CostHints().push_back({std::string(pattern), cost});
 }
 
+SerialTestRegistration::SerialTestRegistration(std::string_view pattern) {
+  SerialHints().push_back({std::string(pattern)});
+}
+
 int RunScheduledTests(int argc, char **argv) {
   std::vector<std::string> original_arguments;
   original_arguments.reserve(static_cast<std::size_t>(argc));
@@ -349,13 +369,18 @@ int RunScheduledTests(int argc, char **argv) {
 
   const auto plan_start = Clock::now();
   auto tests = CollectRunnableTests();
+  auto serial_tests = ExtractSerialTests(tests);
   worker_count = options->jobs_were_set
                      ? std::min(worker_count, tests.size())
                      : SelectWorkerCount(tests, worker_count);
-  if (worker_count <= 1)
+  if (serial_tests.empty() && worker_count <= 1)
     return RunTestsAndReport();
 
-  auto shards = BuildTestShards(std::move(tests), worker_count);
+  auto shards = BuildTestShards(
+      std::move(tests), std::max<std::size_t>(1, worker_count));
+  const auto parallel_shard_count = shards.size();
+  for (auto &test : serial_tests)
+    shards.push_back({{std::move(test.name)}, test.cost});
   const auto executable = WineExecutablePath();
   if (executable.empty()) {
     std::fprintf(stderr, "failed to resolve Wine test executable path: %s\n",
@@ -374,7 +399,8 @@ int RunScheduledTests(int argc, char **argv) {
                            .count();
 
   std::printf(
-      "[ DXMT     ] scheduling %zu tests on %zu Wine workers "
+      "[ DXMT     ] scheduling %zu tests on %zu parallel and %zu serial "
+      "Wine workers "
       "(plan %lld us)\n",
       [&shards] {
         std::size_t count = 0;
@@ -382,64 +408,72 @@ int RunScheduledTests(int argc, char **argv) {
           count += shard.tests.size();
         return count;
       }(),
-      shards.size(), static_cast<long long>(plan_us));
+      parallel_shard_count, serial_tests.size(),
+      static_cast<long long>(plan_us));
   std::fflush(stdout);
 
-  std::vector<WineProcess> children;
-  children.reserve(shards.size());
-  std::size_t spawn_failures = 0;
   std::string scheduler_errors;
+  std::size_t failed_workers = 0;
+  std::int64_t launch_us = 0;
 
   std::fflush(nullptr);
   const auto run_start = Clock::now();
-  for (std::size_t index = 0; index < shards.size(); ++index) {
-    const auto arguments = BuildWorkerArguments(
-        original_arguments, shards[index], report_paths[index]);
-    DWORD error = ERROR_SUCCESS;
-    auto child = StartWineProcess(executable, arguments, &error);
-    if (!child) {
-      scheduler_errors += "failed to start Wine unit-test worker: ";
-      scheduler_errors += WineErrorMessage(error);
-      scheduler_errors += '\n';
-      ++spawn_failures;
-    } else {
-      children.push_back(*child);
+  auto run_wave = [&](std::size_t begin, std::size_t end) {
+    std::vector<WineProcess> children;
+    children.reserve(end - begin);
+    const auto launch_start = Clock::now();
+    for (std::size_t index = begin; index < end; ++index) {
+      const auto arguments = BuildWorkerArguments(
+          original_arguments, shards[index], report_paths[index]);
+      DWORD error = ERROR_SUCCESS;
+      auto child = StartWineProcess(executable, arguments, &error);
+      if (!child) {
+        scheduler_errors += "failed to start Wine unit-test worker: ";
+        scheduler_errors += WineErrorMessage(error);
+        scheduler_errors += '\n';
+        ++failed_workers;
+      } else {
+        children.push_back(*child);
+      }
     }
-  }
-  const auto spawn_end = Clock::now();
+    launch_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                     Clock::now() - launch_start)
+                     .count();
 
-  std::size_t failed_workers = spawn_failures;
-  for (const auto &child : children) {
-    const DWORD wait_result = WaitForSingleObject(child.handle, INFINITE);
-    DWORD exit_code = 1;
-    if (wait_result != WAIT_OBJECT_0) {
-      scheduler_errors += "failed to wait for Wine unit-test worker ";
-      scheduler_errors += std::to_string(child.id);
-      scheduler_errors += ": ";
-      scheduler_errors += WineErrorMessage(GetLastError());
-      scheduler_errors += '\n';
-      ++failed_workers;
-    } else if (!GetExitCodeProcess(child.handle, &exit_code)) {
-      scheduler_errors += "failed to read Wine unit-test worker status ";
-      scheduler_errors += std::to_string(child.id);
-      scheduler_errors += ": ";
-      scheduler_errors += WineErrorMessage(GetLastError());
-      scheduler_errors += '\n';
-      ++failed_workers;
-    } else if (exit_code != 0) {
-      ++failed_workers;
+    for (const auto &child : children) {
+      const DWORD wait_result = WaitForSingleObject(child.handle, INFINITE);
+      DWORD exit_code = 1;
+      if (wait_result != WAIT_OBJECT_0) {
+        scheduler_errors += "failed to wait for Wine unit-test worker ";
+        scheduler_errors += std::to_string(child.id);
+        scheduler_errors += ": ";
+        scheduler_errors += WineErrorMessage(GetLastError());
+        scheduler_errors += '\n';
+        ++failed_workers;
+      } else if (!GetExitCodeProcess(child.handle, &exit_code)) {
+        scheduler_errors += "failed to read Wine unit-test worker status ";
+        scheduler_errors += std::to_string(child.id);
+        scheduler_errors += ": ";
+        scheduler_errors += WineErrorMessage(GetLastError());
+        scheduler_errors += '\n';
+        ++failed_workers;
+      } else if (exit_code != 0) {
+        ++failed_workers;
+      }
+      CloseHandle(child.handle);
     }
-    CloseHandle(child.handle);
-  }
+  };
+
+  if (parallel_shard_count)
+    run_wave(0, parallel_shard_count);
+  for (std::size_t index = parallel_shard_count; index < shards.size(); ++index)
+    run_wave(index, index + 1);
 
   std::string failure_reports;
   for (const auto &path : report_paths)
     failure_reports += ReadAndRemoveReport(path);
   const auto run_end = Clock::now();
 
-  const auto launch_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                             spawn_end - run_start)
-                             .count();
   const auto run_ms =
       std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
           run_end - run_start)
