@@ -1633,6 +1633,12 @@ bool HashShaderCompilationArguments(
           reinterpret_cast<SM50_SHADER_PSO_PIXEL_SHADER_DATA *>(node);
       HashValue(hash, value->sample_mask);
       HashValue(hash, uint8_t(value->dual_source_blending));
+      if (value->dual_source_blending) {
+        // AIR produced before dual-source output indices were propagated is
+        // incompatible, so invalidate only affected persistent cache entries.
+        constexpr uint8_t kDualSourceOutputAbiVersion = 1;
+        HashValue(hash, kDualSourceOutputAbiVersion);
+      }
       HashValue(hash, uint8_t(value->disable_depth_output));
       HashValue(hash, value->unorm_output_reg_mask);
       HashValue(hash, value->demote_msaa_srv_mask_lo);
