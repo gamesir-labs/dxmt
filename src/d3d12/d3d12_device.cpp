@@ -50,6 +50,21 @@ namespace {
 constexpr D3D_FEATURE_LEVEL kSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
 constexpr uint32_t kRepeatedDescriptorWarningLimit = 8;
 
+// Test-only fault injection used by the D3D12 descriptor conformance suite.
+// This deliberately leaves the legacy descriptor GPU VA intact while making
+// only the native resource sidecar lookup unavailable.
+const bool kTestForceNativeCbvResourceLookupMiss = [] {
+  const auto value =
+      env::getEnvVar("DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS");
+  return value == "1" || value == "true" || value == "yes";
+}();
+
+const bool kTestForceNativeCbvStaleResourceTableEntry = [] {
+  const auto value =
+      env::getEnvVar("DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY");
+  return value == "1" || value == "true" || value == "yes";
+}();
+
 static bool
 ShouldLogRepeatedDescriptorWarning(std::atomic<uint32_t> &counter) {
   auto previous = counter.fetch_add(1, std::memory_order_relaxed);
@@ -68,6 +83,15 @@ D3D12DeviceDiagEnabled() {
   auto enabled = env::getEnvVar("DXMT_DIAG_D3D12_DEVICE");
   if (enabled.empty())
     enabled = env::getEnvVar("DXMT_DIAG_COMMAND_QUEUE");
+  if (enabled.empty())
+    enabled = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_DENSE");
+  return enabled == "1" || enabled == "true" || enabled == "yes" ||
+         enabled == "trace";
+}
+
+static bool
+D3D12RootCauseDenseDiagEnabled() {
+  const auto enabled = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled == "1" || enabled == "true" || enabled == "yes" ||
          enabled == "trace";
 }
@@ -2162,13 +2186,48 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
     mirror->WriteBufferTableEntry(slot, record.desc.cbv.BufferLocation,
                                   record.desc.cbv.SizeInBytes, false);
     UINT64 offset = 0;
-    auto *resource = LookupBufferResourceByGpuVirtualAddress(
-        record.desc.cbv.BufferLocation, &offset);
+    auto *resource = kTestForceNativeCbvResourceLookupMiss
+                         ? nullptr
+                         : LookupBufferResourceByGpuVirtualAddress(
+                               record.desc.cbv.BufferLocation, &offset);
     BufferDescriptorMaterialization native = {};
     native.view_offset = offset;
     native.byte_size = record.desc.cbv.SizeInBytes;
-    WriteNativeBufferDescriptorRecord(*mirror, slot, resource, native,
-                                      DescriptorRecordType::ConstantBufferView);
+    if (WriteNativeBufferDescriptorRecord(
+            *mirror, slot, resource, native,
+            DescriptorRecordType::ConstantBufferView) &&
+        kTestForceNativeCbvStaleResourceTableEntry) {
+      const auto record = mirror->bufferDescriptorRecord(slot);
+      if (record)
+        mirror->InvalidateBufferResourceTableEntryForTesting(
+            record->resource_index);
+    }
+    if (D3D12RootCauseDenseDiagEnabled()) {
+      const auto native_record = mirror->bufferDescriptorRecord(slot);
+      const auto backend = native_record
+                               ? mirror->backendResourceRecord(
+                                     native_record->resource_index)
+                               : std::nullopt;
+      const auto diag_flags = native_record
+                                  ? DiagnoseNativeBufferDescriptor(
+                                        *native_record, backend)
+                                  : NativeDescriptorDiagnosticMissingResource;
+      WARN_FILE_ONLY(
+          "D3D12 root-cause: materialize CBV",
+          " slot=", slot,
+          " d3dGpuVa=", record.desc.cbv.BufferLocation,
+          " d3dSize=", record.desc.cbv.SizeInBytes,
+          " lookupResource=", reinterpret_cast<uintptr_t>(resource),
+          " lookupOffset=", offset,
+          " resourceIndex=", native_record ? native_record->resource_index : 0,
+          " nativeOffset=", native_record ? native_record->byte_offset : 0,
+          " nativeSize=", native_record ? native_record->byte_size : 0,
+          " resourceGpuAddress=", backend ? backend->gpu_address : 0,
+          " resourceSize=", backend ? backend->byte_size : 0,
+          " resourceGeneration=", backend ? backend->generation : 0,
+          " tableGeneration=", mirror->backendResourceTableGeneration(),
+          " diagFlags=0x", std::hex, diag_flags, std::dec);
+    }
     finish();
     return;
   }
@@ -2220,6 +2279,24 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       mirror->WriteNullTableEntry(slot);
       finish();
       return;
+    }
+    if (D3D12RootCauseDenseDiagEnabled()) {
+      WARN_FILE_ONLY(
+          "D3D12 root-cause: materialize texture SRV",
+          " slot=", slot,
+          " resource=", reinterpret_cast<uintptr_t>(resource),
+          " resourceDimension=", uint32_t(resource->GetResourceDesc().Dimension),
+          " resourceFormat=", uint32_t(resource->GetResourceDesc().Format),
+          " srvDimension=", record.has_desc ? uint32_t(record.desc.srv.ViewDimension) : 0,
+          " srvFormat=", record.has_desc ? uint32_t(record.desc.srv.Format) : 0,
+          " metalResourceType=", uint32_t(binding.texture->textureType()),
+          " metalViewType=", uint32_t(binding.texture->textureType(binding.view)),
+          " metalView=", uint64_t(binding.view),
+          " gpuResourceId=", gpu_resource_id,
+          " arrayLength=", binding.texture->arrayLength(binding.view),
+          " sampleCount=", binding.texture->sampleCount(),
+          " slotGeneration=", record.slot_version.sequence,
+          " tableGeneration=", mirror->backendResourceTableGeneration());
     }
     const uint32_t array_length =
         binding.texture->arrayLength(binding.view);

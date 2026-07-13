@@ -146,7 +146,8 @@ dxmt_metal4_pso_labels_enabled(void) {
   static bool initialized = false;
   static bool enabled = false;
   if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS"));
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS")) ||
+              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
     initialized = true;
   }
   return enabled;
@@ -181,7 +182,8 @@ dxmt_metal4_dense_hang_diagnostics_enabled(void) {
   static bool initialized = false;
   static bool enabled = false;
   if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE"));
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE")) ||
+              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
     initialized = true;
   }
   return enabled;
@@ -1254,7 +1256,8 @@ dxmt_metal4_is_buffer(id object) {
   if (_internalStatus == DXMTMetal4CommandBufferStateNotEnqueued)
     [self commit];
   if (_completionValue) {
-    if (!dxmt_metal4_perf_stats_enabled()) {
+    if (!dxmt_metal4_perf_stats_enabled() &&
+        !dxmt_metal4_dense_hang_diagnostics_enabled()) {
       [_owner.event waitUntilSignaledValue:_completionValue timeoutMS:UINT64_MAX];
     } else {
       uint64_t wait_begin_us = dxmt_monotonic_us();
@@ -1276,6 +1279,39 @@ dxmt_metal4_is_buffer(id object) {
                   (unsigned long)_pendingSignalEvents.count,
                   _pendingDrawable != nil, _owner.presentEventValue,
                   present_current);
+          const struct WMTCommandBufferDiagnosticInfo *diag = &_diagnosticInfo;
+          fprintf(stderr,
+                  "warn:  DXMT Metal4 completion diagnostic: commandBuffer=%p label=%s"
+                  " frame=%" PRIu64 " chunk=%" PRIu64
+                  " d3dSequence=%" PRIu64 "..%" PRIu64
+                  " inputEncoders=%u encodedEncoders=%u render=%u compute=%u blit=%u other=%u"
+                  " present=%u clear=%u resolve=%u scaler=%u timestamps=%u"
+                  " barrierOnly=%u fenceWait=%u fenceUpdate=%u"
+                  " priorLocal=%u futureLocal=%u sameEncoder=%u external=%u"
+                  " repeatedUpdate=%u renderCrossStage=%u renderSameStage=%u"
+                  " renderReverseStage=%u localFenceIds=%u boundFenceSlots=%u"
+                  " resourceInitializerEvent=%" PRIu64 "\n",
+                  self,
+                  _metal4Buffer.label ? _metal4Buffer.label.UTF8String : "<none>",
+                  diag->frame_id, diag->chunk_id,
+                  diag->d3d_sequence_begin, diag->d3d_sequence_end,
+                  diag->input_encoder_count, diag->encoded_encoder_count,
+                  diag->render_encoder_count, diag->compute_encoder_count,
+                  diag->blit_encoder_count, diag->other_encoder_count,
+                  diag->present_encoder_count, diag->clear_encoder_count,
+                  diag->resolve_encoder_count, diag->scaler_encoder_count,
+                  diag->timestamp_encoder_count, diag->barrier_only_pass_count,
+                  diag->fence_wait_count, diag->fence_update_count,
+                  diag->prior_local_fence_wait_count,
+                  diag->future_local_fence_wait_count,
+                  diag->same_encoder_fence_wait_count,
+                  diag->external_fence_wait_count,
+                  diag->repeated_fence_update_count,
+                  diag->render_valid_cross_stage_count,
+                  diag->render_same_stage_wait_count,
+                  diag->render_reverse_stage_wait_count,
+                  diag->local_fence_id_count, diag->bound_fence_slot_count,
+                  diag->resource_initializer_event_id);
           NSUInteger wait_index = 0;
           for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
             uint64_t wait_current = dxmt_metal4_shared_event_value(wait.event);

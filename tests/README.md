@@ -140,6 +140,41 @@ scripts/dxmt-builder test --profile gcc-x64-release-full unit \
   --suite d3d12 --test-args='--gtest_filter=D3D12*'
 ```
 
+The native CBV materialization tests also provide a targeted fault injection.
+The CBV keeps a valid GPU virtual address backed by a live upload resource, but
+the native-only resource lookup is forced to miss. The legacy descriptor entry
+is left untouched. A correct implementation must preserve the CBV value or
+fall back before executing the native shader:
+
+```sh
+DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS=1 \
+MTL_SHADER_VALIDATION=1 \
+MTL_SHADER_VALIDATION_DEFAULT_STATE=all \
+MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
+DXMT_TEST_FAIL_ON_METAL_VALIDATION=1 \
+scripts/dxmt-builder test --profile gcc-x64-release-full unit \
+  --suite d3d12 \
+  --test-args='--gtest_filter=D3D12DescriptorSpec.*NativeResourceLookupIsUnavailable'
+```
+
+These tests are skipped unless the fault injection is explicitly enabled.
+
+The complementary stale-entry test keeps the descriptor's non-zero resource
+index but clears the indexed resource-table entry. It verifies that native
+shader execution rejects or falls back from a stale zero-base entry instead of
+dereferencing it:
+
+```sh
+DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY=1 \
+MTL_SHADER_VALIDATION=1 \
+MTL_SHADER_VALIDATION_DEFAULT_STATE=all \
+MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
+DXMT_TEST_FAIL_ON_METAL_VALIDATION=1 \
+scripts/dxmt-builder test --profile gcc-x64-release-full unit \
+  --suite d3d12 \
+  --test-args='--gtest_filter=D3D12DescriptorSpec.RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution'
+```
+
 `run-wine-tests.sh` compiles and stages the current DXMT DLLs, initializes the
 dedicated prefix when needed, and injects the staged runtime before starting the
 coordinator. Do not run the PE directly when validating DXMT behavior, because

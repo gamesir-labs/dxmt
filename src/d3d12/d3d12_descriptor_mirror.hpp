@@ -79,6 +79,47 @@ struct DescriptorBackendResourceRecord {
   uint64_t generation = 0;
 };
 
+enum NativeDescriptorDiagnosticFlag : uint32_t {
+  NativeDescriptorDiagnosticNone = 0,
+  NativeDescriptorDiagnosticInvalidFlags = 1u << 0,
+  NativeDescriptorDiagnosticMissingResource = 1u << 1,
+  NativeDescriptorDiagnosticMissingAllocation = 1u << 2,
+  NativeDescriptorDiagnosticZeroGpuAddress = 1u << 3,
+  NativeDescriptorDiagnosticZeroGeneration = 1u << 4,
+  NativeDescriptorDiagnosticOffsetOutOfBounds = 1u << 5,
+  NativeDescriptorDiagnosticSizeOutOfBounds = 1u << 6,
+};
+
+inline uint32_t DiagnoseNativeBufferDescriptor(
+    const BufferDescriptorRecord &descriptor,
+    const std::optional<DescriptorBackendResourceRecord> &resource) {
+  // A completely zero record is the canonical null descriptor.
+  if (descriptor.resource_index == kNullDescriptorResourceIndex &&
+      descriptor.flags == 0)
+    return NativeDescriptorDiagnosticNone;
+
+  uint32_t result = NativeDescriptorDiagnosticNone;
+  if (!(descriptor.flags & BufferDescriptorRecordFlagValid))
+    result |= NativeDescriptorDiagnosticInvalidFlags;
+  if (descriptor.resource_index == kNullDescriptorResourceIndex || !resource) {
+    result |= NativeDescriptorDiagnosticMissingResource;
+    return result;
+  }
+  if (!resource->allocation)
+    result |= NativeDescriptorDiagnosticMissingAllocation;
+  if (!resource->gpu_address)
+    result |= NativeDescriptorDiagnosticZeroGpuAddress;
+  if (!resource->generation)
+    result |= NativeDescriptorDiagnosticZeroGeneration;
+  if (descriptor.byte_offset > resource->byte_size) {
+    result |= NativeDescriptorDiagnosticOffsetOutOfBounds;
+  } else if (descriptor.byte_size >
+             resource->byte_size - descriptor.byte_offset) {
+    result |= NativeDescriptorDiagnosticSizeOutOfBounds;
+  }
+  return result;
+}
+
 struct DescriptorSlotMeta {
   DescriptorBackendSlotKind kind = DescriptorBackendSlotKind::Empty;
   uint32_t flags = 0;
@@ -259,6 +300,9 @@ public:
                              WMT::Resource allocation,
                              uint64_t gpu_address,
                              uint64_t byte_size);
+  void InvalidateBufferResourceTableEntryForTesting(uint32_t resource_index) {
+    ClearBufferResource(resource_index);
+  }
   std::optional<DescriptorBackendResourceRecord>
   backendResourceRecord(uint32_t index) const {
     std::lock_guard lock(mutex_);

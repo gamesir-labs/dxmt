@@ -101,10 +101,21 @@ protected:
   D3D12TestContext context_;
 };
 
+bool TestInjectionEnabled(const char *name) {
+  char value[8] = {};
+  const DWORD length = GetEnvironmentVariableA(
+      name, value, static_cast<DWORD>(std::size(value)));
+  return length && length < std::size(value) &&
+         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "yes") == 0);
+}
+
 struct DescriptorTableDrawOptions {
   bool execute_indirect = false;
   bool test_occlusion_queries = false;
   UINT overwrite_count = 0;
+  bool null_cbv = false;
+  bool null_other_heap_cbv = false;
   bool write_unused_slots_concurrently = false;
   bool write_other_heap_concurrently = false;
   bool copy_from_released_cpu_heaps = false;
@@ -294,7 +305,8 @@ void RunDescriptorTableDraw(
   }
   if (!other_resource_heap) {
     context.device()->CreateConstantBufferView(
-        &cbv_desc, context.CpuDescriptorHandle(resource_write_heap, 5));
+        options.null_cbv ? nullptr : &cbv_desc,
+        context.CpuDescriptorHandle(resource_write_heap, 5));
   }
 
   // D3D12 permits independent descriptor slots in one heap to be populated by
@@ -444,7 +456,7 @@ void RunDescriptorTableDraw(
     std::barrier publish_barrier(3);
     auto publish_used_descriptors =
         [&](ID3D12DescriptorHeap *heap,
-            D3D12_CONSTANT_BUFFER_VIEW_DESC descriptor) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC descriptor, bool null_cbv) {
       publish_barrier.arrive_and_wait();
       for (UINT i = 0; i < textures.size(); ++i) {
         context.device()->CreateShaderResourceView(
@@ -452,12 +464,14 @@ void RunDescriptorTableDraw(
             context.CpuDescriptorHandle(heap, i + 1));
       }
       context.device()->CreateConstantBufferView(
-          &descriptor, context.CpuDescriptorHandle(heap, 5));
+          null_cbv ? nullptr : &descriptor,
+          context.CpuDescriptorHandle(heap, 5));
     };
     std::thread first_heap_writer(publish_used_descriptors,
-                                  resource_heap.get(), cbv_desc);
+                                  resource_heap.get(), cbv_desc, false);
     std::thread second_heap_writer(publish_used_descriptors,
-                                   other_resource_heap.get(), other_cbv_desc);
+                                   other_resource_heap.get(), other_cbv_desc,
+                                   options.null_other_heap_cbv);
     publish_barrier.arrive_and_wait();
     first_heap_writer.join();
     second_heap_writer.join();
@@ -595,10 +609,14 @@ void RunDescriptorTableDraw(
     for (auto &writer : writers)
       writer.join();
   ASSERT_TRUE(SUCCEEDED(readback_hr));
-  if (other_resource_heap)
-    ExpectSplitColor(readback, 0xb2664c19, 0xff00ff00, 2);
-  else
-    ExpectSolidColor(readback, 0xb2664c19, 2);
+  if (other_resource_heap) {
+    ExpectSplitColor(readback, 0xb2664c19,
+                     options.null_other_heap_cbv ? 0x00000000 : 0xff00ff00,
+                     2);
+  } else {
+    ExpectSolidColor(readback,
+                     options.null_cbv ? 0x00000000 : 0xb2664c19, 2);
+  }
 
   if (query_results) {
     void *mapped = nullptr;
@@ -626,6 +644,45 @@ TEST_F(D3D12DescriptorSpec, ResolvesOcclusionAcrossBatchedDrawBoundaries) {
 
 TEST_F(D3D12DescriptorSpec, ReusesBackendEntriesWhenDescriptorsAreOverwritten) {
   RunDescriptorTableDraw(context_, {.overwrite_count = 32});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       NullCbvReadsAsZeroThroughCompiledNativeDescriptorTable) {
+  RunDescriptorTableDraw(context_, {.null_cbv = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       AlternatesValidAndNullCbvAcrossCompiledNativeDescriptorHeaps) {
+  RunDescriptorTableDraw(
+      context_, {.null_other_heap_cbv = true,
+                 .write_other_heap_concurrently = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       PreservesValidCbvWhenNativeResourceLookupIsUnavailable) {
+  if (!TestInjectionEnabled(
+          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS"))
+    GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
+
+  RunDescriptorTableDraw(context_);
+}
+
+TEST_F(D3D12DescriptorSpec,
+       PreservesCopiedValidCbvWhenNativeResourceLookupIsUnavailable) {
+  if (!TestInjectionEnabled(
+          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS"))
+    GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
+
+  RunDescriptorTableDraw(context_, {.copy_from_released_cpu_heaps = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution) {
+  if (!TestInjectionEnabled(
+          "DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY"))
+    GTEST_SKIP() << "stale native CBV resource-table injection is disabled";
+
+  RunDescriptorTableDraw(context_);
 }
 
 TEST_F(D3D12DescriptorSpec, PopulatesIndependentDescriptorSlotsConcurrently) {

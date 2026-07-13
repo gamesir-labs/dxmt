@@ -847,7 +847,8 @@ D3D12DiagTextureCopyEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_TEXTURE_COPY") ||
       D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_VIEWS") ||
-      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -855,7 +856,8 @@ static bool
 D3D12DiagViewEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_VIEWS") ||
-      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -864,7 +866,8 @@ D3D12DiagDrawStateEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE") ||
       D3D12DiagEnabledEnv("DXMT_DIAG_RENDER_COMMANDS") ||
-      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -872,7 +875,8 @@ static bool
 D3D12DiagSwapChainEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_SWAPCHAIN") ||
-      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -888,7 +892,8 @@ static bool
 D3D12DiagBindingsEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_BINDINGS") ||
-      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -914,6 +919,183 @@ D3D12DiagCBVReadbackEnabled() {
       D3D12DiagEnabledEnv("DXMT_DIAG_CBV_READBACK") ||
       D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE_READBACK");
   return enabled;
+}
+
+static bool
+D3D12DiagRootCauseDenseEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
+  return enabled;
+}
+
+static uint32_t
+D3D12DiagRootCauseDenseMaxSlots() {
+  static const uint32_t value = [] {
+    const auto text = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_MAX_SLOTS");
+    if (text.empty())
+      return 65536u;
+    char *end = nullptr;
+    const auto parsed = std::strtoul(text.c_str(), &end, 10);
+    return end == text.c_str()
+               ? 65536u
+               : static_cast<uint32_t>(
+                     std::clamp<unsigned long>(parsed, 1024, 1048576));
+  }();
+  return value;
+}
+
+static std::string
+D3D12DiagRootBaseWords(const std::vector<uint32_t> &words) {
+  std::ostringstream out;
+  out << '[';
+  for (size_t i = 0; i < words.size(); i++) {
+    if (i)
+      out << ',';
+    out << words[i];
+  }
+  out << ']';
+  return out.str();
+}
+
+static void
+D3D12DiagLogNativePacket(
+    const char *kind, uint64_t frame, uint64_t sequence,
+    uint64_t record_serial, const PipelineState &pipeline,
+    obj_handle_t metal_pso,
+    const std::vector<CompiledCommandRootDescriptorTable> &tables,
+    std::initializer_list<std::pair<const char *,
+                                    const CompiledNativeStageBinding *>> stages) {
+  if (!D3D12DiagRootCauseDenseEnabled())
+    return;
+
+  static std::atomic<uint64_t> packet_count = 0;
+  static std::atomic<uint64_t> anomalous_packet_count = 0;
+  const auto packet_id = packet_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint64_t scanned = 0;
+  uint64_t null_records = 0;
+  uint64_t buffer_records = 0;
+  uint64_t texture_records = 0;
+  uint64_t sampler_records = 0;
+  uint64_t anomalous_records = 0;
+  uint64_t truncated_tables = 0;
+  const auto max_slots = D3D12DiagRootCauseDenseMaxSlots();
+
+  for (const auto &table : tables) {
+    if (!table.mirror)
+      continue;
+    const auto current_generation =
+        table.mirror->backendResourceTableGeneration();
+    const auto available = table.heap_index < table.heap_count
+                               ? table.heap_count - table.heap_index
+                               : 0u;
+    const auto requested = std::min(table.descriptor_count, available);
+    const auto remaining = scanned < max_slots ? max_slots - scanned : 0;
+    const auto count = std::min<uint64_t>(requested, remaining);
+    if (count < requested)
+      truncated_tables++;
+
+    for (uint32_t local = 0; local < count; local++) {
+      const uint32_t slot = table.heap_index + local;
+      const auto meta = table.mirror->slotMeta(slot);
+      if (!meta || meta->kind == DescriptorBackendSlotKind::Empty) {
+        null_records++;
+        scanned++;
+        continue;
+      }
+      if (meta->kind == DescriptorBackendSlotKind::Texture) {
+        texture_records++;
+        scanned++;
+        continue;
+      }
+      if (meta->kind == DescriptorBackendSlotKind::Sampler) {
+        sampler_records++;
+        scanned++;
+        continue;
+      }
+
+      buffer_records++;
+      scanned++;
+      const auto descriptor = table.mirror->bufferDescriptorRecord(slot);
+      if (!descriptor) {
+        anomalous_records++;
+        WARN_FILE_ONLY(
+            "D3D12 root-cause: native descriptor anomaly",
+            " packet=", packet_id, " kind=", kind, " frame=", frame,
+            " sequence=", sequence, " recordSerial=", record_serial,
+            " pso=", pipeline.GetShaderCacheKey(),
+            " tableRoot=", table.root_parameter_index, " slot=", slot,
+            " reason=missing-buffer-record");
+        continue;
+      }
+      const auto resource =
+          table.mirror->backendResourceRecord(descriptor->resource_index);
+      const auto flags = DiagnoseNativeBufferDescriptor(*descriptor, resource);
+      if (!flags)
+        continue;
+      anomalous_records++;
+      WARN_FILE_ONLY(
+          "D3D12 root-cause: native descriptor anomaly",
+          " packet=", packet_id, " kind=", kind, " frame=", frame,
+          " sequence=", sequence, " recordSerial=", record_serial,
+          " pso=", pipeline.GetShaderCacheKey(),
+          " metalPso=", uint64_t(metal_pso),
+          " tableRoot=", table.root_parameter_index,
+          " tableBase=", table.heap_index, " tableCount=", table.descriptor_count,
+          " slot=", slot, " diagFlags=0x", std::hex, flags, std::dec,
+          " descriptorFlags=0x", std::hex, descriptor->flags, std::dec,
+          " resourceIndex=", descriptor->resource_index,
+          " byteOffset=", descriptor->byte_offset,
+          " byteSize=", descriptor->byte_size,
+          " resourceGpuAddress=", resource ? resource->gpu_address : 0,
+          " resourceByteSize=", resource ? resource->byte_size : 0,
+          " resourceGeneration=", resource ? resource->generation : 0,
+          " capturedTableGeneration=", table.buffer_resource_table_generation,
+          " currentTableGeneration=", current_generation,
+          " allocation=", resource ? uint64_t(resource->allocation.handle) : 0);
+    }
+
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: native table",
+        " packet=", packet_id, " kind=", kind, " frame=", frame,
+        " sequence=", sequence, " recordSerial=", record_serial,
+        " pso=", pipeline.GetShaderCacheKey(),
+        " root=", table.root_parameter_index,
+        " heapType=", uint32_t(table.heap_type),
+        " base=", table.heap_index, " count=", table.descriptor_count,
+        " heapCount=", table.heap_count,
+        " descriptorTableGpuAddress=", table.descriptor_table_gpu_address,
+        " bufferRecordGpuAddress=", table.buffer_descriptor_record_gpu_address,
+        " resourceTableGpuAddress=", table.buffer_resource_table_gpu_address,
+        " capturedGeneration=", table.buffer_resource_table_generation,
+        " currentGeneration=", current_generation);
+  }
+
+  for (const auto &[stage, binding] : stages) {
+    if (!binding)
+      continue;
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: native root bases",
+        " packet=", packet_id, " kind=", kind, " frame=", frame,
+        " sequence=", sequence, " recordSerial=", record_serial,
+        " pso=", pipeline.GetShaderCacheKey(), " stage=", stage,
+        " cbuffer=", D3D12DiagRootBaseWords(binding->cbuffer_root_bases),
+        " resource=", D3D12DiagRootBaseWords(binding->resource_root_bases));
+  }
+
+  if (anomalous_records)
+    anomalous_packet_count.fetch_add(1, std::memory_order_relaxed);
+  WARN_FILE_ONLY(
+      "D3D12 root-cause: native packet",
+      " packet=", packet_id, " kind=", kind, " frame=", frame,
+      " sequence=", sequence, " recordSerial=", record_serial,
+      " pso=", pipeline.GetShaderCacheKey(), " metalPso=", uint64_t(metal_pso),
+      " tables=", tables.size(), " scanned=", scanned,
+      " null=", null_records, " buffer=", buffer_records,
+      " texture=", texture_records, " sampler=", sampler_records,
+      " anomalies=", anomalous_records,
+      " truncatedTables=", truncated_tables,
+      " totalAnomalousPackets=",
+      anomalous_packet_count.load(std::memory_order_relaxed));
 }
 
 static bool
@@ -964,7 +1146,8 @@ static bool
 D3D12DiagExecuteIndirectEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_EXECUTE_INDIRECT") ||
-      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -1102,6 +1285,196 @@ D3D12DiagIndexWords(const uint8_t *bytes, size_t size,
     out << value;
   }
   return out.str();
+}
+
+static bool
+D3D12DiagRootCauseTargetMatches(const std::string &key) {
+  if (!D3D12DiagRootCauseDenseEnabled())
+    return false;
+  const auto filters = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_TARGET_PSO");
+  if (filters.empty())
+    return false;
+  for (const auto filter : str::split(filters, ",; "))
+    if (!filter.empty() && key.starts_with(filter))
+      return true;
+  return false;
+}
+
+static uint32_t
+D3D12DiagRootCauseTargetSampleLimit() {
+  static const uint32_t limit = [] {
+    const auto value = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_TARGET_SAMPLES");
+    if (value.empty())
+      return 8u;
+    char *end = nullptr;
+    const auto parsed = std::strtoul(value.c_str(), &end, 10);
+    return end == value.c_str()
+               ? 8u
+               : static_cast<uint32_t>(
+                     std::clamp<unsigned long>(parsed, 1, 64));
+  }();
+  return limit;
+}
+
+static const uint8_t *
+D3D12DiagMappedAllocationBytes(BufferAllocation *allocation,
+                               uint64_t offset, uint64_t requested,
+                               uint64_t &available) {
+  available = 0;
+  if (!allocation ||
+      allocation->flags().test(BufferAllocationFlag::CpuInvisible) ||
+      offset >= allocation->length())
+    return nullptr;
+  auto *base = static_cast<const uint8_t *>(
+      allocation->mappedMemory(allocation->currentSuballocation()));
+  if (!base)
+    return nullptr;
+  available = std::min<uint64_t>(requested, allocation->length() - offset);
+  return base + offset;
+}
+
+static void
+D3D12DiagLogCompiledTargetInputs(const CompiledGraphicsPacket &packet,
+                                 const PipelineState &pipeline,
+                                 uint64_t frame, uint64_t record_serial) {
+  const auto &key = pipeline.GetShaderCacheKey();
+  if (!D3D12DiagRootCauseTargetMatches(key))
+    return;
+  static std::atomic<uint32_t> sample_count = 0;
+  const auto sample = sample_count.fetch_add(1, std::memory_order_relaxed);
+  if (sample >= D3D12DiagRootCauseTargetSampleLimit())
+    return;
+
+  const auto *graphics = pipeline.GetGraphicsState();
+  const auto draw_vertex_count =
+      packet.draw ? packet.draw->vertex_count_per_instance : 0;
+  const auto draw_start_vertex =
+      packet.draw ? packet.draw->start_vertex_location : 0;
+  const auto index_count =
+      packet.draw_indexed ? packet.draw_indexed->index_count_per_instance : 0;
+  const auto start_index =
+      packet.draw_indexed ? packet.draw_indexed->start_index_location : 0;
+  const auto base_vertex =
+      packet.draw_indexed ? packet.draw_indexed->base_vertex_location : 0;
+  WARN_FILE_ONLY(
+      "D3D12 root-cause: compiled target draw",
+      " sample=", sample, " frame=", frame,
+      " sequence=", packet.d3d_sequence,
+      " recordSerial=", record_serial, " pso=", key,
+      " recordIndex=", packet.record_index,
+      " topology=", uint32_t(packet.render_state.topology),
+      " inputElements=", graphics ? graphics->input_elements.size() : 0,
+      " drawVertexCount=", draw_vertex_count,
+      " drawStartVertex=", draw_start_vertex,
+      " indexCount=", index_count, " startIndex=", start_index,
+      " baseVertex=", base_vertex,
+      " instanceCount=", packet.draw ? packet.draw->instance_count
+                                      : packet.draw_indexed
+                                            ? packet.draw_indexed->instance_count
+                                            : 0);
+
+  if (graphics) {
+    for (size_t i = 0; i < graphics->input_elements.size(); i++) {
+      const auto &element = graphics->input_elements[i];
+      WARN_FILE_ONLY(
+          "D3D12 root-cause: compiled target input element",
+          " sample=", sample, " pso=", key, " index=", i,
+          " semantic=", element.SemanticName ? element.SemanticName : "<null>",
+          " semanticIndex=", element.SemanticIndex,
+          " format=", uint32_t(element.Format),
+          " slot=", element.InputSlot,
+          " alignedOffset=", element.AlignedByteOffset,
+          " slotClass=", uint32_t(element.InputSlotClass),
+          " stepRate=", element.InstanceDataStepRate);
+    }
+  }
+
+  for (const auto &vb : packet.input_assembler.vertex_buffers) {
+    UINT64 resource_offset = 0;
+    auto *resource = LookupBufferResourceByGpuVirtualAddress(
+        vb.view.BufferLocation, &resource_offset);
+    auto allocation = resource ? resource->GetBufferAllocation() : nullptr;
+    const uint64_t allocation_offset =
+        resource ? resource->GetHeapOffset() + resource_offset : 0;
+    uint64_t mapped_size = 0;
+    const auto *mapped = D3D12DiagMappedAllocationBytes(
+        allocation, allocation_offset,
+        std::min<uint64_t>(vb.view.SizeInBytes, 256), mapped_size);
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: compiled target vertex buffer",
+        " sample=", sample, " pso=", key, " slot=", vb.slot,
+        " gpuVa=", vb.view.BufferLocation,
+        " stride=", vb.view.StrideInBytes,
+        " viewSize=", vb.view.SizeInBytes,
+        " resource=", uint64_t(resource ? resource->GetD3D12Resource() : nullptr),
+        " resourceOffset=", resource_offset,
+        " resourceWidth=", resource ? resource->GetResourceDesc().Width : 0,
+        " heapOffset=", resource ? resource->GetHeapOffset() : 0,
+        " allocation=", allocation ? uint64_t(allocation->buffer().handle) : 0,
+        " allocationGpuAddress=", allocation ? allocation->gpuAddress() : 0,
+        " allocationLength=", allocation ? allocation->length() : 0,
+        " currentSuballocation=", allocation ? allocation->currentSuballocation() : 0,
+        " cpuMapped=", mapped != nullptr,
+        " sampleBytes=", mapped_size,
+        " floats=", mapped ? D3D12DiagFloatWords(mapped, mapped_size) : "-",
+        " hex=", mapped ? D3D12DiagHexBytes(mapped, mapped_size) : "-");
+  }
+
+  if (packet.input_assembler.index_buffer) {
+    const auto &view = *packet.input_assembler.index_buffer;
+    UINT64 resource_offset = 0;
+    auto *resource = LookupBufferResourceByGpuVirtualAddress(
+        view.BufferLocation, &resource_offset);
+    auto allocation = resource ? resource->GetBufferAllocation() : nullptr;
+    const uint64_t index_size = view.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+    const uint64_t allocation_offset =
+        (resource ? resource->GetHeapOffset() + resource_offset : 0) +
+        uint64_t(start_index) * index_size;
+    const uint64_t max_index_bytes =
+        view.SizeInBytes > uint64_t(start_index) * index_size
+            ? view.SizeInBytes - uint64_t(start_index) * index_size
+            : 0;
+    uint64_t mapped_size = 0;
+    const auto *mapped = D3D12DiagMappedAllocationBytes(
+        allocation, allocation_offset,
+        std::min<uint64_t>(max_index_bytes, 256), mapped_size);
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: compiled target index buffer",
+        " sample=", sample, " pso=", key,
+        " gpuVa=", view.BufferLocation, " format=", uint32_t(view.Format),
+        " viewSize=", view.SizeInBytes,
+        " resourceOffset=", resource_offset,
+        " heapOffset=", resource ? resource->GetHeapOffset() : 0,
+        " allocation=", allocation ? uint64_t(allocation->buffer().handle) : 0,
+        " cpuMapped=", mapped != nullptr, " sampleBytes=", mapped_size,
+        " indices=", mapped ? D3D12DiagIndexWords(mapped, mapped_size, view.Format) : "-",
+        " hex=", mapped ? D3D12DiagHexBytes(mapped, mapped_size) : "-");
+  }
+
+  for (const auto &root : packet.root_descriptors) {
+    UINT64 resource_offset = 0;
+    auto *resource = LookupBufferResourceByGpuVirtualAddress(
+        root.address, &resource_offset);
+    auto allocation = resource ? resource->GetBufferAllocation() : nullptr;
+    const uint64_t allocation_offset =
+        resource ? resource->GetHeapOffset() + resource_offset : 0;
+    uint64_t mapped_size = 0;
+    const auto *mapped = D3D12DiagMappedAllocationBytes(
+        allocation, allocation_offset, 256, mapped_size);
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: compiled target root descriptor",
+        " sample=", sample, " pso=", key,
+        " root=", root.root_parameter_index,
+        " type=", uint32_t(root.parameter_type), " gpuVa=", root.address,
+        " resource=", uint64_t(resource ? resource->GetD3D12Resource() : nullptr),
+        " resourceOffset=", resource_offset,
+        " resourceWidth=", resource ? resource->GetResourceDesc().Width : 0,
+        " heapOffset=", resource ? resource->GetHeapOffset() : 0,
+        " allocation=", allocation ? uint64_t(allocation->buffer().handle) : 0,
+        " cpuMapped=", mapped != nullptr, " sampleBytes=", mapped_size,
+        " floats=", mapped ? D3D12DiagFloatWords(mapped, mapped_size) : "-",
+        " hex=", mapped ? D3D12DiagHexBytes(mapped, mapped_size) : "-");
+  }
 }
 
 static const char *
@@ -7975,6 +8348,20 @@ private:
           if (!primitive)
             return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
 
+          D3D12DiagLogCompiledTargetInputs(
+              packet, *pipeline, queue.CurrentFrameSeq(),
+              replay_record_serial);
+
+          if (native_packet) {
+            D3D12DiagLogNativePacket(
+                packet.draw ? "draw" : "draw-indexed",
+                queue.CurrentFrameSeq(), packet.d3d_sequence,
+                replay_record_serial, *pipeline, metal_pso.handle,
+                packet.root_tables,
+                {{"vertex", &packet.native_vertex},
+                 {"pixel", &packet.native_pixel}});
+          }
+
           const auto vertex_buffer_reason =
               ValidateCompiledVertexBufferResources(
                   packet, pipeline->GetGraphicsState());
@@ -8200,6 +8587,12 @@ private:
           auto *metal = pipeline->GetMetalComputeState();
           if (!metal || !metal->pso)
             return CompiledCommandFallbackReason::MissingPipelineState;
+          if (native_packet) {
+            D3D12DiagLogNativePacket(
+                "dispatch", queue.CurrentFrameSeq(), packet.d3d_sequence,
+                replay_record_serial, *pipeline, metal->pso.handle,
+                packet.root_tables, {{"compute", &packet.native_compute}});
+          }
           if (!ValidateComputeDispatch(metal->threadgroup_size,
                                        packet.dispatch.x, packet.dispatch.y,
                                        packet.dispatch.z))
@@ -15493,7 +15886,7 @@ private:
           AllocateArgumentBuffer(argbuf_offset,
                                  reflection.NumConstantBuffers << 3);
       enc.encodeConstantBuffers<Stage, Kind>(
-          &reflection, shader.constantBufferInfo(), offset);
+          &reflection, shader.constantBufferInfo(), offset, shader_key);
     }
     if (reflection.NumArguments && shader.resourceArgumentInfo()) {
       const auto offset =
@@ -15551,10 +15944,20 @@ private:
                                             BindlessMirrorDrawDiag *draw_diag = nullptr) {
     if (pipeline.GetShaderAbiVersion() ==
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
+      constexpr WMTRenderStages render_stages =
+          Stage == PipelineStage::Vertex
+              ? WMTRenderStageVertex
+              : Stage == PipelineStage::Pixel ? WMTRenderStageFragment
+                                               : WMTRenderStages{};
+      if (shader.reflection().NumConstantBuffers)
+        enc.bindNativeNullConstantBuffer(compute, render_stages);
       auto cbuffer_root_bases = BuildNativeRootTableBases(
           enc, state, pipeline, root, Stage, compute, /*cbuffer=*/true);
       auto resource_root_bases = BuildNativeRootTableBases(
           enc, state, pipeline, root, Stage, compute, /*cbuffer=*/false);
+      enc.diagnoseNativeShaderBinding(
+          Stage, shader_key, "native-live", cbuffer_root_bases,
+          resource_root_bases);
       enc.bindNativeRootTableBases<Stage>(
           cbuffer_root_bases,
           DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX);
@@ -15573,7 +15976,8 @@ private:
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
         DiagCurrentReplayRecordSerial(), nullptr,
-        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
+        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi,
+        "bindless-live");
     BindlessMirrorWindow window = {};
     auto root_offsets =
         BuildBindlessRootOffsets(enc, state, pipeline, root, Stage, compute,
@@ -15943,7 +16347,8 @@ private:
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
         DiagCurrentReplayRecordSerial(), &bindings_view,
-        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
+        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi,
+        "bindless-snapshot");
     if (draw_diag)
       AddBindlessMirrorDiagBufTable(
           *draw_diag, Stage, shader.constantBufferInfo(),
@@ -16630,11 +17035,26 @@ private:
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
       if (!native_binding || !native_binding->ready)
         return;
+      const AllocatedArgumentBufferSlice cbuffer_root_bases = {
+          nullptr, native_root_base_buffer,
+          native_binding->cbuffer_root_base_offset, 0,
+          uint64_t(native_binding->cbuffer_root_base_count) * sizeof(uint32_t),
+          false};
+      const AllocatedArgumentBufferSlice resource_root_bases = {
+          nullptr, native_root_base_buffer,
+          native_binding->resource_root_base_offset, 0,
+          uint64_t(native_binding->resource_root_base_count) * sizeof(uint32_t),
+          false};
+      enc.diagnoseNativeShaderBinding(
+          Stage, shader_key, "native-compiled", cbuffer_root_bases,
+          resource_root_bases);
       constexpr WMTRenderStages render_stages =
           Stage == PipelineStage::Vertex
               ? WMTRenderStageVertex
               : Stage == PipelineStage::Pixel ? WMTRenderStageFragment
                                                : WMTRenderStages{};
+      if (shader.reflection().NumConstantBuffers)
+        enc.bindNativeNullConstantBuffer(compute, render_stages);
       if (native_binding->cbuffer_root_base_count) {
         enc.bindNativeArgumentBuffer(
             native_root_base_buffer,
@@ -16665,7 +17085,8 @@ private:
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
         DiagCurrentReplayRecordSerial(), &bindings_view,
-        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
+        demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi,
+        "bindless-compiled");
     if (draw_diag)
       AddBindlessMirrorDiagBufTable(
           *draw_diag, Stage, shader.constantBufferInfo(),

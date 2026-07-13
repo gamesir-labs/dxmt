@@ -55,7 +55,8 @@ D3D12PipelineDiagEnabled() {
 static bool
 D3D12MetalPsoLabelsEnabled() {
   static const bool enabled =
-      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_METAL_PSO_LABELS");
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_METAL_PSO_LABELS") ||
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
   return enabled;
 }
 
@@ -196,7 +197,8 @@ static uint32_t
 NativeDescriptorImmutableBufferMask(const PipelineDxilShader &shader) {
   uint32_t mask = 0;
   if (shader.reflection().NumConstantBuffers)
-    mask |= BufferBindingBit(
+    mask |= BufferBindingBit(DXMT12_MTL4_NATIVE_NULL_CBUFFER_BIND_INDEX) |
+            BufferBindingBit(
                 DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX) |
             BufferBindingBit(
                 DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX) |

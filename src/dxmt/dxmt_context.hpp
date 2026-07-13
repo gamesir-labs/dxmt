@@ -717,7 +717,7 @@ public:
   template <PipelineStage stage, PipelineKind kind>
   void encodeConstantBuffers(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
-      uint64_t argument_buffer_offset
+      uint64_t argument_buffer_offset, const std::string &shader_hash
   );
   template <PipelineStage stage, PipelineKind kind>
   void encodeConstantBuffers(
@@ -780,7 +780,8 @@ public:
                     uint64_t verify_draw_serial = 0,
                     const BindlessBufferTableSnapshot *bindings = nullptr,
                     uint64_t demote_msaa_srv_mask_lo = 0,
-                    uint64_t demote_msaa_srv_mask_hi = 0);
+                    uint64_t demote_msaa_srv_mask_hi = 0,
+                    const char *diagnostic_path = "bindless-live");
 
   // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
   // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null
@@ -801,6 +802,12 @@ public:
   void bindNativeArgumentBuffer(WMT::Buffer buffer, uint64_t offset,
                                 uint32_t bind_index, bool compute,
                                 WMTRenderStages render_stages = {});
+  void bindNativeNullConstantBuffer(bool compute,
+                                    WMTRenderStages render_stages = {});
+  void diagnoseNativeShaderBinding(
+      PipelineStage stage, const std::string &shader_hash, const char *path,
+      const AllocatedArgumentBufferSlice &cbuffer_root_bases,
+      const AllocatedArgumentBufferSlice &resource_root_bases);
   void invalidateNativeArgumentBuffers(bool compute,
                                        WMTRenderStages render_stages = {});
 

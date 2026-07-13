@@ -10,6 +10,7 @@
 #include "dxmt_format.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
 #include <algorithm>
 #include <array>
@@ -23,6 +24,16 @@
 #include <utility>
 
 namespace dxmt::d3d12 {
+
+static bool
+CompiledRootCauseDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const auto value = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_DENSE");
+    return value == "1" || value == "true" || value == "yes" ||
+           value == "trace";
+  }();
+  return enabled;
+}
 
 const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind) {
   switch (kind) {
@@ -1225,6 +1236,10 @@ BuildCompiledNativeStageBinding(
       payloads.Append(cbuffer_bases);
   std::tie(out.resource_root_base_offset, out.resource_root_base_count) =
       payloads.Append(resource_bases);
+  if (CompiledRootCauseDiagnosticsEnabled()) {
+    out.cbuffer_root_bases = std::move(cbuffer_bases);
+    out.resource_root_bases = std::move(resource_bases);
+  }
   out.ready = true;
   payloads.StoreStageBinding(pipeline, root, stage, tables, out);
   return CompiledCommandFallbackReason::None;

@@ -529,8 +529,8 @@ static auto get_native_buffer_in_descriptor_record(
 
 static auto get_native_cbuffer_in_descriptor_record(
     uint32_t buffer_record_index, uint32_t resource_table_index,
-    uint32_t root_table_base_index, uint32_t arg_index,
-    uint32_t range_lower_bound) {
+    uint32_t null_cbuffer_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound) {
   return [=](pvalue dyn_index) {
     return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
       auto resource_word = get_native_buffer_record_qword(
@@ -551,10 +551,14 @@ static auto get_native_cbuffer_in_descriptor_record(
       auto base = native_resource_table_qword(ctx, resource_table_index,
                                              resource_index, 0);
       auto address = ctx.builder.CreateAdd(base, byte_offset.get());
-      return ctx.builder.CreateIntToPtr(
+      auto descriptor_ptr = ctx.builder.CreateIntToPtr(
           address,
           ctx.types._int4->getPointerTo(
               static_cast<unsigned>(air::AddressSpace::constant)));
+      auto is_null = ctx.builder.CreateICmpEQ(
+          resource_index, ctx.builder.getInt32(0));
+      return ctx.builder.CreateSelect(
+          is_null, ctx.function->getArg(null_cbuffer_index), descriptor_ptr);
     });
   };
 }
@@ -1021,6 +1025,7 @@ void setup_binding_table(
   uint32_t native_sampler_heap_index = ~0u;
   uint32_t native_resource_table_index = ~0u;
   uint32_t native_buffer_record_index = ~0u;
+  uint32_t native_null_cbuffer_index = ~0u;
   uint32_t native_cbuffer_root_table_base_index = ~0u;
   uint32_t native_root_table_base_index = ~0u;
   if (gNativeDescriptorTable) {
@@ -1079,6 +1084,17 @@ void setup_binding_table(
           });
     }
     if (!shader_info->cbufferMap.empty()) {
+      native_null_cbuffer_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index = DXMT12_MTL4_NATIVE_NULL_CBUFFER_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint4,
+            .arg_name = "native_null_cbuffer",
+            .raster_order_group = std::nullopt,
+          });
       native_cbuffer_root_table_base_index =
           func_signature.DefineInput(air::ArgumentBindingBuffer{
             .buffer_size = std::nullopt,
@@ -1180,6 +1196,7 @@ void setup_binding_table(
       resource_map.cb_range_map[range_id] =
           get_native_cbuffer_in_descriptor_record(
               native_buffer_record_index, native_resource_table_index,
+              native_null_cbuffer_index,
               native_cbuffer_root_table_base_index, cbv.arg_index,
               cbv.range.lower_bound);
     } else if (gBindlessMirror) {
