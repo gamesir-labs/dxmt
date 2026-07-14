@@ -53,6 +53,15 @@ TextureDescSampleCount(const desc_t &desc) {
   }
 }
 
+static bool
+IsTextureViewRangeValid(const TextureViewDescriptor &view, UINT mip_levels,
+                        UINT array_size) {
+  return view.miplevelCount && view.firstMiplevel < mip_levels &&
+         view.miplevelCount <= mip_levels - view.firstMiplevel &&
+         view.arraySize && view.firstArraySlice < array_size &&
+         view.arraySize <= array_size - view.firstArraySlice;
+}
+
 static constexpr SIZE_T kD3DKMTExistingHeapPageSize = 0x1000;
 
 static SIZE_T
@@ -341,6 +350,8 @@ public:
         ))) {
       return E_FAIL;
     }
+    if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
+      return E_INVALIDARG;
     if (!(this->texture_->usage() & WMTTextureUsageRenderTarget)) {
       LogRenderTargetViewFailure("texture usage missing WMTTextureUsageRenderTarget", finalDesc);
       return E_FAIL;
@@ -373,6 +384,8 @@ public:
         ))) {
       return E_FAIL;
     }
+    if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
+      return E_INVALIDARG;
     if (!ppView) {
       return S_FALSE;
     }
@@ -403,6 +416,8 @@ public:
       ERR("DeviceTexture: Failed to create texture SRV");
       return E_FAIL;
     }
+    if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
+      return E_INVALIDARG;
     if (!ppView) {
       return S_FALSE;
     }
@@ -432,6 +447,8 @@ public:
       ERR("DeviceTexture: Failed to create texture UAV");
       return E_FAIL;
     }
+    if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
+      return E_INVALIDARG;
     if (!ppView) {
       return S_FALSE;
     }

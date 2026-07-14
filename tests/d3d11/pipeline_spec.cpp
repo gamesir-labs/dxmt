@@ -913,6 +913,223 @@ TEST_F(D3D11PipelineSpec, CreatesStateObjectsWithRequestedDescriptions) {
   EXPECT_FLOAT_EQ(actual_sampler.BorderColor[0], 0.25f);
 }
 
+TEST_F(D3D11PipelineSpec, ClearStateResetsBindingsAndDynamicState) {
+  D3D11_BUFFER_DESC buffer_desc = {};
+  buffer_desc.ByteWidth = 64;
+  buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  ComPtr<ID3D11Buffer> vertex_buffer;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
+      &buffer_desc, nullptr, vertex_buffer.put())));
+
+  D3D11_TEXTURE2D_DESC texture_desc = {};
+  texture_desc.Width = 4;
+  texture_desc.Height = 4;
+  texture_desc.MipLevels = 1;
+  texture_desc.ArraySize = 1;
+  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Usage = D3D11_USAGE_DEFAULT;
+  texture_desc.BindFlags =
+      D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> texture;
+  ComPtr<ID3D11ShaderResourceView> resource_view;
+  ComPtr<ID3D11RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &texture_desc, nullptr, texture.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateShaderResourceView(
+      texture.get(), nullptr, resource_view.put())));
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRenderTargetView(
+      texture.get(), nullptr, target_view.put())));
+
+  D3D11_SAMPLER_DESC sampler_desc = {};
+  sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.MaxAnisotropy = 1;
+  sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+  ComPtr<ID3D11SamplerState> sampler;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateSamplerState(
+      &sampler_desc, sampler.put())));
+
+  D3D11_BLEND_DESC blend_desc = {};
+  blend_desc.RenderTarget[0].RenderTargetWriteMask =
+      D3D11_COLOR_WRITE_ENABLE_ALL;
+  ComPtr<ID3D11BlendState> blend;
+  ASSERT_TRUE(HResultSucceeded(
+      context_.device()->CreateBlendState(&blend_desc, blend.put())));
+  D3D11_RASTERIZER_DESC rasterizer_desc = {};
+  rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+  rasterizer_desc.CullMode = D3D11_CULL_BACK;
+  rasterizer_desc.DepthClipEnable = TRUE;
+  ComPtr<ID3D11RasterizerState> rasterizer;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRasterizerState(
+      &rasterizer_desc, rasterizer.put())));
+
+  constexpr UINT stride = 16;
+  constexpr UINT offset = 4;
+  ID3D11Buffer *vertex_buffers[] = {vertex_buffer.get()};
+  ID3D11ShaderResourceView *resource_views[] = {resource_view.get()};
+  ID3D11SamplerState *samplers[] = {sampler.get()};
+  ID3D11RenderTargetView *target_views[] = {target_view.get()};
+  const FLOAT blend_factor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+  const D3D11_VIEWPORT viewport = {1.0f, 2.0f, 3.0f, 4.0f, 0.0f, 1.0f};
+  context_.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride,
+                                         &offset);
+  context_.context()->IASetPrimitiveTopology(
+      D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.context()->PSSetShaderResources(0, 1, resource_views);
+  context_.context()->PSSetSamplers(0, 1, samplers);
+  context_.context()->OMSetRenderTargets(1, target_views, nullptr);
+  context_.context()->OMSetBlendState(blend.get(), blend_factor, 0x13579bdf);
+  context_.context()->RSSetState(rasterizer.get());
+  context_.context()->RSSetViewports(1, &viewport);
+
+  ComPtr<ID3D11Buffer> queried_vertex;
+  UINT queried_stride = 0;
+  UINT queried_offset = 0;
+  context_.context()->IAGetVertexBuffers(0, 1, queried_vertex.put(),
+                                         &queried_stride, &queried_offset);
+  EXPECT_EQ(queried_vertex.get(), vertex_buffer.get());
+  EXPECT_EQ(queried_stride, stride);
+  EXPECT_EQ(queried_offset, offset);
+  ComPtr<ID3D11RenderTargetView> queried_target;
+  context_.context()->OMGetRenderTargets(1, queried_target.put(), nullptr);
+  EXPECT_EQ(queried_target.get(), target_view.get());
+
+  context_.context()->ClearState();
+
+  queried_vertex.reset();
+  queried_stride = ~UINT{0};
+  queried_offset = ~UINT{0};
+  context_.context()->IAGetVertexBuffers(0, 1, queried_vertex.put(),
+                                         &queried_stride, &queried_offset);
+  EXPECT_FALSE(queried_vertex);
+  EXPECT_EQ(queried_stride, 0u);
+  EXPECT_EQ(queried_offset, 0u);
+  D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  context_.context()->IAGetPrimitiveTopology(&topology);
+  EXPECT_EQ(topology, D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED);
+
+  ComPtr<ID3D11ShaderResourceView> queried_resource;
+  ComPtr<ID3D11SamplerState> queried_sampler;
+  context_.context()->PSGetShaderResources(0, 1, queried_resource.put());
+  context_.context()->PSGetSamplers(0, 1, queried_sampler.put());
+  EXPECT_FALSE(queried_resource);
+  EXPECT_FALSE(queried_sampler);
+  queried_target.reset();
+  context_.context()->OMGetRenderTargets(1, queried_target.put(), nullptr);
+  EXPECT_FALSE(queried_target);
+
+  ComPtr<ID3D11BlendState> queried_blend;
+  FLOAT queried_factor[4] = {};
+  UINT queried_mask = 0;
+  context_.context()->OMGetBlendState(queried_blend.put(), queried_factor,
+                                      &queried_mask);
+  EXPECT_FALSE(queried_blend);
+  for (FLOAT component : queried_factor)
+    EXPECT_FLOAT_EQ(component, 1.0f);
+  EXPECT_EQ(queried_mask, ~UINT{0});
+  ComPtr<ID3D11RasterizerState> queried_rasterizer;
+  context_.context()->RSGetState(queried_rasterizer.put());
+  EXPECT_FALSE(queried_rasterizer);
+  UINT viewport_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+  context_.context()->RSGetViewports(&viewport_count, nullptr);
+  EXPECT_EQ(viewport_count, 0u);
+}
+
+TEST_F(D3D11PipelineSpec, CreatesSelectedTexture2DArrayMipAndSliceViews) {
+  D3D11_TEXTURE2D_DESC texture_desc = {};
+  texture_desc.Width = 16;
+  texture_desc.Height = 8;
+  texture_desc.MipLevels = 4;
+  texture_desc.ArraySize = 3;
+  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Usage = D3D11_USAGE_DEFAULT;
+  texture_desc.BindFlags =
+      D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &texture_desc, nullptr, texture.put())));
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = texture_desc.Format;
+  srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  srv_desc.Texture2DArray.MostDetailedMip = 1;
+  srv_desc.Texture2DArray.MipLevels = 2;
+  srv_desc.Texture2DArray.FirstArraySlice = 1;
+  srv_desc.Texture2DArray.ArraySize = 2;
+  ComPtr<ID3D11ShaderResourceView> srv;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateShaderResourceView(
+      texture.get(), &srv_desc, srv.put())));
+
+  D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = texture_desc.Format;
+  rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+  rtv_desc.Texture2DArray.MipSlice = 2;
+  rtv_desc.Texture2DArray.FirstArraySlice = 2;
+  rtv_desc.Texture2DArray.ArraySize = 1;
+  ComPtr<ID3D11RenderTargetView> rtv;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRenderTargetView(
+      texture.get(), &rtv_desc, rtv.put())));
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC actual_srv = {};
+  D3D11_RENDER_TARGET_VIEW_DESC actual_rtv = {};
+  srv->GetDesc(&actual_srv);
+  rtv->GetDesc(&actual_rtv);
+  EXPECT_EQ(actual_srv.ViewDimension, D3D11_SRV_DIMENSION_TEXTURE2DARRAY);
+  EXPECT_EQ(actual_srv.Texture2DArray.MostDetailedMip, 1u);
+  EXPECT_EQ(actual_srv.Texture2DArray.MipLevels, 2u);
+  EXPECT_EQ(actual_srv.Texture2DArray.FirstArraySlice, 1u);
+  EXPECT_EQ(actual_srv.Texture2DArray.ArraySize, 2u);
+  EXPECT_EQ(actual_rtv.ViewDimension, D3D11_RTV_DIMENSION_TEXTURE2DARRAY);
+  EXPECT_EQ(actual_rtv.Texture2DArray.MipSlice, 2u);
+  EXPECT_EQ(actual_rtv.Texture2DArray.FirstArraySlice, 2u);
+  EXPECT_EQ(actual_rtv.Texture2DArray.ArraySize, 1u);
+}
+
+TEST_F(D3D11PipelineSpec, RejectsOutOfRangeTextureArrayViewsAndClearsOutputs) {
+  D3D11_TEXTURE2D_DESC texture_desc = {};
+  texture_desc.Width = 8;
+  texture_desc.Height = 8;
+  texture_desc.MipLevels = 3;
+  texture_desc.ArraySize = 2;
+  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Usage = D3D11_USAGE_DEFAULT;
+  texture_desc.BindFlags =
+      D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &texture_desc, nullptr, texture.put())));
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = texture_desc.Format;
+  srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  srv_desc.Texture2DArray.MostDetailedMip = 2;
+  srv_desc.Texture2DArray.MipLevels = 2;
+  srv_desc.Texture2DArray.ArraySize = 1;
+  ID3D11ShaderResourceView *srv =
+      reinterpret_cast<ID3D11ShaderResourceView *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateShaderResourceView(
+      texture.get(), &srv_desc, &srv)));
+  EXPECT_EQ(srv, nullptr);
+
+  D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = texture_desc.Format;
+  rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+  rtv_desc.Texture2DArray.MipSlice = 3;
+  rtv_desc.Texture2DArray.ArraySize = 1;
+  ID3D11RenderTargetView *rtv =
+      reinterpret_cast<ID3D11RenderTargetView *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateRenderTargetView(
+      texture.get(), &rtv_desc, &rtv)));
+  EXPECT_EQ(rtv, nullptr);
+}
+
 TEST_F(D3D11PipelineSpec, CreatesCompatibleViewsOfTypelessDepthTexture) {
   D3D11_TEXTURE2D_DESC texture_desc = {};
   texture_desc.Width = 8;

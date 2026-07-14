@@ -123,7 +123,7 @@ struct D3D11OutputMergerStageState {
   UINT StencilRef;
 
   IMTLD3D11BlendState* BlendState;
-  FLOAT BlendFactor[4];
+  FLOAT BlendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
   UINT SampleMask = 0xffffffff;
 
