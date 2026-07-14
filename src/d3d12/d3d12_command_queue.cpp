@@ -21210,33 +21210,25 @@ private:
             offset += first_element * format.BytesPerTexel;
             byte_size = UINT64(uav.Buffer.NumElements) *
                         format.BytesPerTexel;
-            auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         uav.Format, offset, byte_size,
-                                         WMTTextureUsageShaderRead |
-                                             WMTTextureUsageShaderWrite);
-            if (view) {
-              view_id = view->key;
-              view_first_element_bias = view->firstElementBias;
-              has_buffer_view = true;
+            if (format.BytesPerTexel == sizeof(uint32_t)) {
+              raw_buffer = true;
+            } else {
+              auto view = CreateBufferView(
+                  device_->GetMTLDevice(), *resource, uav.Format, offset,
+                  byte_size, WMTTextureUsageShaderRead |
+                                 WMTTextureUsageShaderWrite);
+              if (view) {
+                view_id = view->key;
+                view_first_element_bias = view->firstElementBias;
+                has_buffer_view = true;
+              }
             }
           }
         } else if (uav.Buffer.StructureByteStride) {
           offset += first_element * uav.Buffer.StructureByteStride;
           byte_size = UINT64(uav.Buffer.NumElements) *
                       uav.Buffer.StructureByteStride;
-          if (const auto view_format =
-                  UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
-              view_format != DXGI_FORMAT_UNKNOWN) {
-            auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         view_format, offset, byte_size,
-                                         WMTTextureUsageShaderRead |
-                                             WMTTextureUsageShaderWrite);
-            if (view) {
-              view_id = view->key;
-              view_first_element_bias = view->firstElementBias;
-              has_buffer_view = true;
-            }
-          }
+          raw_buffer = !(uav.Buffer.StructureByteStride % sizeof(uint32_t));
         }
       } else {
         raw_buffer = true;

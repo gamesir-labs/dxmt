@@ -48,6 +48,15 @@ d3d12_unit_suites = {
       'root_signature/serialization_spec.cpp',
     ),
   },
+  'sync': {
+    'sources': files('sync/legacy_transition_spec.cpp'),
+  },
+  'transfer': {
+    'sources': files(
+      'transfer/clear_uav_spec.cpp',
+      'transfer/copy_resource_spec.cpp',
+    ),
+  },
   'resource': {
     'sources': files('resource/resource_spec.cpp'),
   },
