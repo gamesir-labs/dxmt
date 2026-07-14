@@ -1866,9 +1866,10 @@ CreateMetalFunctionFromBitcode(IMTLD3D12Device *device,
                                PipelineShaderStage stage,
                                const char *function_name,
                                sm50_bitcode_t bitcode_handle,
-                               PipelineMetalShader &out) {
+                               PipelineMetalShader &out,
+                               DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   return CreateCachedMetalFunction(device, stage, function_name, bitcode_handle,
-                                   out, DXMT12_MTL4_SHADER_ABI_LEGACY);
+                                   out, shader_abi_version);
 }
 
 template <typename Compile>
@@ -1878,10 +1879,10 @@ bool CompileCombinedMetalFunction(
     std::initializer_list<const PipelineDxilShader *> shaders,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     PipelineMetalShader &out, const char *failure_description,
-    Compile &&compile) {
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version, Compile &&compile) {
   const auto persistent_key_result = BuildPersistentAirCacheKey(
       device, stage, compile_kind, shaders, args,
-      DXMT12_MTL4_SHADER_ABI_LEGACY);
+      shader_abi_version);
   const bool persistent =
       PersistentAirCacheEnabled() && persistent_key_result.has_value();
   Sha1Digest persistent_key = {};
@@ -1952,14 +1953,16 @@ bool CompileCombinedMetalFunction(
   }
 
   return CreateMetalFunctionFromBitcode(device, stage, air_function_name,
-                                        bitcode_handle, out);
+                                        bitcode_handle, out,
+                                        shader_abi_version);
 }
 
 bool
 CompileGeometryPipelineVertexFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-    PipelineMetalShader &out) {
+    PipelineMetalShader &out,
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   if (vs.kind() != PipelineShaderBytecodeKind::Dxbc ||
       gs.kind() != PipelineShaderBytecodeKind::Dxbc) {
     WARN("D3D12PipelineState: DXIL geometry shader mesh lowering is unsupported");
@@ -1970,6 +1973,7 @@ CompileGeometryPipelineVertexFunction(
       device, PipelineShaderStage::Vertex, "geometry-vertex", {&vs, &gs},
       function_name, args, out,
       "failed to compile DXBC geometry vertex shader",
+      shader_abi_version,
       [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
         return DXMT12SM50CompileGeometryPipelineVertex(
             vs.shaderHandle(), gs.shaderHandle(), args, name, bitcode, error);
@@ -1980,7 +1984,8 @@ bool
 CompileGeometryPipelineGeometryFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-    PipelineMetalShader &out) {
+    PipelineMetalShader &out,
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   if (vs.kind() != PipelineShaderBytecodeKind::Dxbc ||
       gs.kind() != PipelineShaderBytecodeKind::Dxbc) {
     WARN("D3D12PipelineState: DXIL geometry shader mesh lowering is unsupported");
@@ -1990,6 +1995,7 @@ CompileGeometryPipelineGeometryFunction(
   return CompileCombinedMetalFunction(
       device, PipelineShaderStage::Geometry, "geometry-mesh", {&vs, &gs},
       function_name, args, out, "failed to compile DXBC geometry shader",
+      shader_abi_version,
       [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
         return DXMT12SM50CompileGeometryPipelineGeometry(
             vs.shaderHandle(), gs.shaderHandle(), args, name, bitcode, error);
@@ -2000,7 +2006,8 @@ bool
 CompileTessellationPipelineHullFunction(
     IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &hs,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-    PipelineMetalShader &out) {
+    PipelineMetalShader &out,
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   if (vs.kind() != PipelineShaderBytecodeKind::Dxbc ||
       hs.kind() != PipelineShaderBytecodeKind::Dxbc) {
     // TODO(d3d12): add DXIL tessellation lowering once airconv exposes it.
@@ -2012,6 +2019,7 @@ CompileTessellationPipelineHullFunction(
       device, PipelineShaderStage::Hull, "tessellation-hull", {&vs, &hs},
       function_name, args, out,
       "failed to compile DXBC tessellation hull shader",
+      shader_abi_version,
       [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
         return DXMT12SM50CompileTessellationPipelineHull(
             vs.shaderHandle(), hs.shaderHandle(), args, name, bitcode, error);
@@ -2022,7 +2030,8 @@ bool
 CompileTessellationPipelineDomainFunction(
     IMTLD3D12Device *device, PipelineDxilShader &hs, PipelineDxilShader &ds,
     const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-    PipelineMetalShader &out) {
+    PipelineMetalShader &out,
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   if (hs.kind() != PipelineShaderBytecodeKind::Dxbc ||
       ds.kind() != PipelineShaderBytecodeKind::Dxbc) {
     // TODO(d3d12): add DXIL tessellation lowering once airconv exposes it.
@@ -2034,6 +2043,7 @@ CompileTessellationPipelineDomainFunction(
       device, PipelineShaderStage::Domain, "tessellation-domain", {&hs, &ds},
       function_name, args, out,
       "failed to compile DXBC tessellation domain shader",
+      shader_abi_version,
       [&](const char *name, sm50_bitcode_t *bitcode, sm50_error_t *error) {
         return DXMT12SM50CompileTessellationPipelineDomain(
             hs.shaderHandle(), ds.shaderHandle(), args, name, bitcode, error);
@@ -2406,32 +2416,6 @@ CreateDepthStencilState(IMTLD3D12Device *device,
   return device->GetMTLDevice().newDepthStencilState(info);
 }
 
-// Single source of truth for whether a PSO may use the descriptor-mirror path.
-// Consumed by PsoShaderAbiVersion below, so compile-time args, shader cache
-// keys, and runtime draw-path gates all agree on the selected shader ABI.
-bool
-PsoBindlessEligible(const std::vector<PipelineDxilShader> &shaders,
-                    const RootSignature *root_signature) {
-  if (root_signature && !root_signature->GetStaticSamplers().empty())
-    return false;
-  for (const auto &shader : shaders) {
-    // Stage-1 covers SM5/DXBC single-stage VS/PS/CS only. DXIL (SM6) airconv
-    // path does not thread the bindless flag; HS/DS/GS use separate compile
-    // entries (CompileTessellation*/CompileGeometry*) that also don't thread it,
-    // and the slot-28 root_offsets binding collides with the tessellation VS
-    // argbuf slots. A PSO marked bindless but compiled through one of those
-    // paths would bind as bindless yet read a legacy layout -> garbage. So
-    // exclude any DXIL shader or any HS/DS/GS stage.
-    if (shader.kind() == PipelineShaderBytecodeKind::Dxil)
-      return false;
-    if (shader.stage == PipelineShaderStage::Hull ||
-        shader.stage == PipelineShaderStage::Domain ||
-        shader.stage == PipelineShaderStage::Geometry)
-      return false;
-  }
-  return true;
-}
-
 static bool
 NativeRootParameterVisibleToShader(const RootSignatureParameter &parameter,
                                    PipelineShaderStage stage) {
@@ -2566,15 +2550,6 @@ GetNativeShaderAbiEligibilityImpl(
     const auto *arguments = shader.resourceArgumentInfo();
     for (uint32_t i = 0; arguments && i < shader.reflection().NumArguments;
          i++) {
-      // The native descriptor table indexes a heap-global texture-view slot.
-      // Metal texture arrayness is part of the shader-visible texture type, so
-      // it must be specialized per shader rather than written into shared heap
-      // state. Texture-bearing shaders use the per-draw bindless window until
-      // native tables gain an equivalent shader-specific view indirection.
-      if ((arguments[i].Type == SM50BindingType::SRV ||
-           arguments[i].Type == SM50BindingType::UAV) &&
-          (arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE))
-        return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
       if (!NativeShaderArgumentHasSingleTableRange(*root_signature,
                                                    shader.stage,
                                                    arguments[i]))
@@ -2591,9 +2566,7 @@ PsoShaderAbiVersion(const std::vector<PipelineDxilShader> &shaders,
   if (GetNativeShaderAbiEligibilityImpl(shaders, root_signature) ==
       NativeShaderAbiEligibilityReason::None)
     return DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
-  return PsoBindlessEligible(shaders, root_signature)
-             ? DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR
-             : DXMT12_MTL4_SHADER_ABI_LEGACY;
+  return DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
 }
 
 bool
@@ -2630,9 +2603,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   common.flags = GetShaderFlags();
   common.next = nullptr;
 
-  // Table-only SM50 PSOs use the native descriptor-table ABI. Root payload,
-  // static-sampler, DXIL, geometry, and tessellation cases retain the existing
-  // bindless/legacy fallbacks until their native ABI is complete.
+  // Table-only PSOs use the direct heap ABI. Root payload, static sampler,
+  // geometry and tessellation cases use the bindless mirror ABI. DXIL and DXBC
+  // use the same selection and neither path emits packed descriptor tables.
   const auto shader_abi_version =
       PsoShaderAbiVersion(shaders, root_signature);
   const bool pso_bindless = ShaderAbiUsesBindlessMirror(shader_abi_version);
@@ -2761,7 +2734,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
     SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess = {};
     pso_tess.type = SM50_SHADER_PSO_TESSELLATOR;
-    pso_tess.next = &common;
+    pso_tess.next = base_shader_args;
     pso_tess.max_potential_tess_factor = max_potential_factor;
 
     SM50_SHADER_GS_PASS_THROUGH_DATA gs_passthrough = {};
@@ -2776,7 +2749,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
             device, *hs, *ds, ds_name.c_str(),
             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
                 &gs_passthrough),
-            out.tessellation_domain))
+            out.tessellation_domain, shader_abi_version))
       return false;
 
     auto create_tessellation_variant =
@@ -2789,7 +2762,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
               device, *vs, *hs, hs_name.c_str(),
               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
                   &ia_layout),
-              out.tessellation_vertex_hull[variant]))
+              out.tessellation_vertex_hull[variant], shader_abi_version))
         return false;
 
       WMTMeshRenderPipelineInfo info = {};
@@ -2803,10 +2776,12 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       if (!device->GetMTLDevice().supportsFamily(WMTGPUFamilyApple7))
         info.payload_memory_length = 16384;
       info.immutable_object_buffers =
-          (1 << 16) | (1 << 21) | (1 << 27) | (1 << 28) |
-          (1 << 29) | (1 << 30);
-      info.immutable_mesh_buffers = (1 << 29) | (1 << 30);
-      info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+          BufferBindingBit(16) | BufferBindingBit(21) |
+          BindlessImmutableBufferMask(*vs) |
+          BindlessImmutableBufferMask(*hs);
+      info.immutable_mesh_buffers = BindlessImmutableBufferMask(*ds);
+      info.immutable_fragment_buffers =
+          ps ? BindlessImmutableBufferMask(*ps) : 0;
       info.mesh_tgsize_is_multiple_of_sgwidth = true;
       info.object_tgsize_is_multiple_of_sgwidth = true;
 
@@ -2886,17 +2861,17 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
               device, *vs, *gs, vsgs_name.c_str(),
               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
                   &geometry_args),
-              object_shader))
+              object_shader, shader_abi_version))
         return false;
 
-      geometry_args.next = &common;
+      geometry_args.next = base_shader_args;
       const auto gs_name = BuildFunctionName(
           strip_topology ? "gs_strip" : "gs", shader_cache_key);
       if (!CompileGeometryPipelineGeometryFunction(
               device, *vs, *gs, gs_name.c_str(),
               reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
                   &geometry_args),
-              mesh_shader))
+              mesh_shader, shader_abi_version))
         return false;
 
       WMTMeshRenderPipelineInfo info = {};
@@ -2911,9 +2886,11 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       info.rasterization_enabled = true;
       info.raster_sample_count = state.desc.SampleDesc.Count;
       info.immutable_object_buffers =
-          (1 << 16) | (1 << 21) | (1 << 29) | (1 << 30);
-      info.immutable_mesh_buffers = (1 << 29) | (1 << 30);
-      info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+          BufferBindingBit(16) | BufferBindingBit(21) |
+          BindlessImmutableBufferMask(*vs);
+      info.immutable_mesh_buffers = BindlessImmutableBufferMask(*gs);
+      info.immutable_fragment_buffers =
+          ps ? BindlessImmutableBufferMask(*ps) : 0;
 
       for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
         if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
@@ -4069,7 +4046,7 @@ private:
   std::mutex metal_mutex_;
   bool uses_bindless_mirror_ = false;
   DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version_ =
-      DXMT12_MTL4_SHADER_ABI_LEGACY;
+      DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
   bool metal_graphics_ready_ = false;
   bool metal_compute_ready_ = false;
   PipelineMetalGraphicsState metal_graphics_;

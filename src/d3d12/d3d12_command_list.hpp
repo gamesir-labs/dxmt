@@ -349,7 +349,7 @@ struct CompiledCommandPipelineMetadata {
   const PipelineMetalComputeState *metal_compute = nullptr;
   PipelineStateType type = PipelineStateType::Graphics;
   DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
-      DXMT12_MTL4_SHADER_ABI_LEGACY;
+      DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
   NativeShaderAbiEligibilityReason native_eligibility_reason =
       NativeShaderAbiEligibilityReason::UnsupportedRootSignature;
   dxmt::CompiledFallbackReason perf_fallback_reason =

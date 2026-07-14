@@ -2,7 +2,9 @@
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
+#include "shaders/bindless_dxil_shaders.hpp"
 #include "../../src/d3d12/d3d12_descriptor_shape.hpp"
+#include "../../src/d3d12/d3d12_descriptor_journal.hpp"
 
 #include <array>
 #include <atomic>
@@ -18,6 +20,41 @@ namespace {
 using dxmt::d3d12::DescriptorTextureViewShape;
 using dxmt::d3d12::GetSrvTextureViewShape;
 using dxmt::d3d12::GetUavTextureViewShape;
+
+TEST(D3D12DescriptorJournal, ReportsOrderedChangesFromCursor) {
+  dxmt::d3d12::DescriptorChangeJournal journal(4);
+  const auto initial = journal.cursor();
+  journal.Record(7, 1);
+  journal.Record(2, 3);
+
+  const auto delta = journal.ChangesSince(initial);
+  ASSERT_TRUE(delta.complete);
+  ASSERT_EQ(delta.changes.size(), 2u);
+  EXPECT_EQ(delta.changes[0].slot, 7u);
+  EXPECT_EQ(delta.changes[0].generation, 1u);
+  EXPECT_EQ(delta.changes[1].slot, 2u);
+  EXPECT_EQ(delta.changes[1].generation, 3u);
+  EXPECT_EQ(delta.cursor, journal.cursor());
+}
+
+TEST(D3D12DescriptorJournal, ForcesFullScanAfterHistoryOverflow) {
+  dxmt::d3d12::DescriptorChangeJournal journal(2);
+  const auto stale_cursor = journal.cursor();
+  journal.Record(0, 1);
+  journal.Record(1, 1);
+  journal.Record(2, 1);
+
+  const auto stale = journal.ChangesSince(stale_cursor);
+  EXPECT_FALSE(stale.complete);
+  EXPECT_TRUE(stale.changes.empty());
+
+  const auto current = journal.cursor();
+  journal.Record(3, 1);
+  const auto recent = journal.ChangesSince(current);
+  ASSERT_TRUE(recent.complete);
+  ASSERT_EQ(recent.changes.size(), 1u);
+  EXPECT_EQ(recent.changes[0].slot, 3u);
+}
 
 using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
@@ -182,6 +219,7 @@ struct DescriptorTableDrawOptions {
   bool write_other_heap_concurrently = false;
   bool copy_from_released_cpu_heaps = false;
   bool release_bound_heaps_after_submit = false;
+  bool use_static_sampler = false;
 };
 
 void RunDescriptorTableDraw(
@@ -216,18 +254,39 @@ void RunDescriptorTableDraw(
   parameters[0].DescriptorTable.NumDescriptorRanges = 1;
   parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
   parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
-  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[2].DescriptorTable.NumDescriptorRanges = 2;
-  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[2];
-  parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  const UINT resource_tail_parameter = options.use_static_sampler ? 1 : 2;
+  if (!options.use_static_sampler) {
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  }
+  parameters[resource_tail_parameter].ParameterType =
+      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[resource_tail_parameter].DescriptorTable.NumDescriptorRanges = 2;
+  parameters[resource_tail_parameter].DescriptorTable.pDescriptorRanges =
+      &ranges[2];
+  parameters[resource_tail_parameter].ShaderVisibility =
+      D3D12_SHADER_VISIBILITY_PIXEL;
+
+  D3D12_STATIC_SAMPLER_DESC static_sampler = {};
+  static_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  static_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  static_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  static_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  static_sampler.MaxAnisotropy = 1;
+  static_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  static_sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+  static_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  static_sampler.ShaderRegister = 0;
+  static_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.NumParameters = 3;
+  root_desc.NumParameters = options.use_static_sampler ? 2 : 3;
   root_desc.pParameters = parameters;
+  root_desc.NumStaticSamplers = options.use_static_sampler ? 1 : 0;
+  root_desc.pStaticSamplers =
+      options.use_static_sampler ? &static_sampler : nullptr;
   ComPtr<ID3D12RootSignature> root_signature =
       context.CreateRootSignature(root_desc);
   ASSERT_TRUE(root_signature);
@@ -429,10 +488,11 @@ void RunDescriptorTableDraw(
     context.list()->SetDescriptorHeaps(2, heaps);
     context.list()->SetGraphicsRootDescriptorTable(
         0, context.GpuDescriptorHandle(heap, 0));
+    if (!options.use_static_sampler)
+      context.list()->SetGraphicsRootDescriptorTable(
+          1, sampler_heap->GetGPUDescriptorHandleForHeapStart());
     context.list()->SetGraphicsRootDescriptorTable(
-        1, sampler_heap->GetGPUDescriptorHandleForHeapStart());
-    context.list()->SetGraphicsRootDescriptorTable(
-        2, context.GpuDescriptorHandle(heap, 3));
+        resource_tail_parameter, context.GpuDescriptorHandle(heap, 3));
   };
   bind_resource_heap(resource_heap.get());
   context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -694,6 +754,176 @@ void RunDescriptorTableDraw(
 
 TEST_F(D3D12DescriptorSpec, DrawsWithSplitDescriptorTables) {
   RunDescriptorTableDraw(context_);
+}
+
+TEST_F(D3D12DescriptorSpec, DrawsWithBindlessStaticSampler) {
+  RunDescriptorTableDraw(context_, {.use_static_sampler = true});
+}
+
+DXMT_SERIAL_TEST_F(D3D12DescriptorSpec,
+                   DrawsWithResourceBearingDxilBindlessPipeline) {
+  D3D12_DESCRIPTOR_RANGE srv_range = {};
+  srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_range.NumDescriptors = 1;
+  srv_range.BaseShaderRegister = 0;
+  srv_range.RegisterSpace = 1;
+  D3D12_DESCRIPTOR_RANGE sampler_range = {};
+  sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+  sampler_range.NumDescriptors = 1;
+  sampler_range.BaseShaderRegister = 0;
+  sampler_range.RegisterSpace = 2;
+  D3D12_ROOT_PARAMETER parameters[3] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[0].Descriptor.ShaderRegister = 0;
+  parameters[0].Descriptor.RegisterSpace = 0;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[1].DescriptorTable.pDescriptorRanges = &srv_range;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[2].DescriptorTable.pDescriptorRanges = &sampler_range;
+  parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = std::size(parameters);
+  root_desc.pParameters = parameters;
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+
+  D3D12_INPUT_ELEMENT_DESC elements[2] = {};
+  elements[0] = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+  elements[1] = {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
+  pso_desc.pRootSignature = root_signature.get();
+  pso_desc.VS = D3D12_SHADER_BYTECODE{
+      dxmt::test::kBindlessDxilPresentVs,
+      dxmt::test::kBindlessDxilPresentVs_len};
+  pso_desc.PS = D3D12_SHADER_BYTECODE{
+      dxmt::test::kBindlessDxilPresentPs,
+      dxmt::test::kBindlessDxilPresentPs_len};
+  pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso_desc.SampleMask = UINT_MAX;
+  pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso_desc.NumRenderTargets = 1;
+  pso_desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  pso_desc.SampleDesc.Count = 1;
+  pso_desc.InputLayout = {elements, std::size(elements)};
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateGraphicsPipelineState(
+      &pso_desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(pipeline.put()))));
+
+  auto target = context_.CreateTexture2D(
+      32, 32, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(rtv_heap);
+  auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  auto source = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  const std::array<float, 4> source_pixel = {0.25f, 0.5f, 0.75f, 1.0f};
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      source.get(), source_pixel.data(), sizeof(source_pixel),
+      sizeof(source_pixel))));
+  D3D12TestContext::Transition(
+      context_.list(), source.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+  struct FrameData {
+    float projection[16];
+    float max_edr;
+    float brightness;
+    float current_edr_bias;
+    float padding;
+  } frame = {};
+  frame.projection[0] = frame.projection[5] = frame.projection[10] =
+      frame.projection[15] = 1.0f;
+  frame.max_edr = 1.0f;
+  frame.brightness = 1.0f;
+  auto frame_buffer = context_.CreateUploadBuffer(
+      D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, &frame, sizeof(frame));
+  ASSERT_TRUE(frame_buffer);
+
+  struct Vertex {
+    float position[4];
+    float texcoord[4];
+  };
+  const Vertex vertices[3] = {
+      {{-1.0f, -1.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 0.0f}},
+      {{-1.0f, 3.0f, 0.0f, 1.0f}, {0.0f, -1.0f, 0.0f, 0.0f}},
+      {{3.0f, -1.0f, 0.0f, 1.0f}, {2.0f, 1.0f, 0.0f, 0.0f}},
+  };
+  auto vertex_buffer = context_.CreateUploadBuffer(
+      sizeof(vertices), vertices, sizeof(vertices));
+  ASSERT_TRUE(vertex_buffer);
+
+  auto resource_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto sampler_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  ASSERT_TRUE(resource_heap);
+  ASSERT_TRUE(sampler_heap);
+  context_.device()->CreateShaderResourceView(
+      source.get(), nullptr,
+      resource_heap->GetCPUDescriptorHandleForHeapStart());
+  D3D12_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  sampler.AddressU = sampler.AddressV = sampler.AddressW =
+      D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  context_.device()->CreateSampler(
+      &sampler, sampler_heap->GetCPUDescriptorHandleForHeapStart());
+
+  ID3D12DescriptorHeap *heaps[] = {resource_heap.get(), sampler_heap.get()};
+  context_.list()->SetDescriptorHeaps(std::size(heaps), heaps);
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetGraphicsRootConstantBufferView(
+      0, frame_buffer->GetGPUVirtualAddress());
+  context_.list()->SetGraphicsRootDescriptorTable(
+      1, resource_heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetGraphicsRootDescriptorTable(
+      2, sampler_heap->GetGPUDescriptorHandleForHeapStart());
+  D3D12_VERTEX_BUFFER_VIEW vertex_view = {};
+  vertex_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+  vertex_view.SizeInBytes = sizeof(vertices);
+  vertex_view.StrideInBytes = sizeof(Vertex);
+  context_.list()->IASetVertexBuffers(0, 1, &vertex_view);
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  D3D12_VIEWPORT viewport = {0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f};
+  D3D12_RECT scissor = {0, 0, 32, 32};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(
+      context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackTexture(target.get(), &readback)));
+  std::array<float, 4> center = {};
+  std::memcpy(center.data(),
+              readback.data.data() + 16 * readback.row_pitch +
+                  16 * sizeof(center),
+              sizeof(center));
+  EXPECT_GT(center[0], 0.01f);
+  EXPECT_GT(center[1], 0.01f);
+  EXPECT_GT(center[2], 0.01f);
+  EXPECT_NEAR(center[3], 1.0f, 0.01f);
 }
 
 TEST_F(D3D12DescriptorSpec, DrawsIndirectWithSplitDescriptorTables) {

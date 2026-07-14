@@ -63,7 +63,8 @@ NullSamplerInfo() {
 } // namespace
 
 DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_descriptors, bool sampler_heap)
-    : num_descriptors_(num_descriptors), sampler_heap_(sampler_heap) {
+    : num_descriptors_(num_descriptors), sampler_heap_(sampler_heap),
+      change_journal_(std::max<uint64_t>(256, uint64_t(num_descriptors) * 2)) {
   const uint32_t plane_count = sampler_heap_ ? 3 : 2;
   const uint64_t length =
       uint64_t(num_descriptors_) * plane_count * sizeof(uint64_t);
@@ -377,6 +378,7 @@ DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
   meta.generation++;
   if (!meta.generation)
     meta.generation = 1;
+  change_journal_.Record(index, meta.generation);
 }
 
 void

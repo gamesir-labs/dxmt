@@ -357,10 +357,6 @@ struct RenderEncoderData : EncoderData {
   bool use_visibility_result = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
-  // Bindless-mirror (③.3) mixed-PSO guard: true after a bindless draw rebinds
-  // argument-buffer slots used by legacy shaders; a following legacy draw
-  // restores the per-pass argbuf there first.
-  bool bindless_mirror_bound_29_30 = false;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
   uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
@@ -386,9 +382,6 @@ struct ComputeEncoderData : EncoderData {
   uint64_t allocated_argbuf_size;
   void *allocated_argbuf_mapping;
   bool allocated_argbuf_needs_flush;
-  // Bindless-mirror (③.3) mixed-PSO guard: true after a bindless dispatch rebinds slots 29/30 to
-  // the persistent mirrors; a following legacy dispatch restores the per-pass argbuf there first.
-  bool bindless_mirror_bound_29_30 = false;
   ArgumentTableSliceCache argument_table_cache;
   std::array<ComputeArgumentBufferOffsetState, 8> argument_buffer_offsets = {};
   std::array<NativeArgumentBufferBindingState, 31>
@@ -827,9 +820,8 @@ public:
   // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
   // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null
   // buffer (e.g. no samplers → sampler_mirror null; no buffer fields → buf_table null). Sets the
-  // encoder's bindless_mirror_bound_29_30 flag so a FOLLOWING legacy draw restores the per-pass
-  // argbuf at 29/30 (mixed-PSO guard). Vertex→WMTRenderStageVertex, Pixel→WMTRenderStageFragment,
-  // Compute uses the compute setargumentbuffer (no stages).
+  // Vertex maps to WMTRenderStageVertex, Pixel to WMTRenderStageFragment,
+  // and Compute uses the compute setargumentbuffer command.
   template <PipelineStage stage>
   void bindBindlessTables(const AllocatedArgumentBufferSlice &buf_table,
                           const AllocatedArgumentBufferSlice &root_offsets,
@@ -853,12 +845,6 @@ public:
       const AllocatedArgumentBufferSlice &resource_root_bases);
   void invalidateNativeArgumentBuffers(bool compute,
                                        WMTRenderStages render_stages = {});
-
-  // Bindless-mirror (Stage-1 sub-step ③.3) mixed-PSO guard: if the current encoder's bindless
-  // draw rebound legacy argument-buffer slots, restore the per-pass argbuf before a following
-  // legacy draw emits setArgumentBufferOffset commands. `compute` selects render-vs-compute.
-  template <bool compute>
-  bool restorePerPassArgbufIfMirrorBound();
 
   void retainAllocation(Allocation* allocation);
 

@@ -291,10 +291,6 @@ private:
 
 } // namespace
 
-bool IsBindlessMirrorEnabled() {
-  return true;
-}
-
 DescriptorRecordLease::DescriptorRecordLease(
     DescriptorRecordLease &&other) noexcept
     : record_(other.record_), owner_(other.owner_) {

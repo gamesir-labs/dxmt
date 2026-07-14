@@ -22,6 +22,9 @@ namespace dxmt::dxbc {
 
 void set_bindless_mirror_texture_srv_prototype(bool enabled);
 void set_bindless_mirror(bool enabled);
+bool get_bindless_mirror();
+void set_native_descriptor_table(bool enabled);
+bool get_native_descriptor_table();
 
 struct ResourceRange {
   uint32_t range_id;

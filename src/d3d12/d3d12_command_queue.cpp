@@ -5876,6 +5876,16 @@ private:
     bool bindless_compiled_candidate = false;
   };
 
+  struct ReplayRootConstantsSlot {
+    bool valid = false;
+    std::vector<UINT> values;
+  };
+
+  struct ReplayRootDescriptorSlot {
+    bool valid = false;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+  };
+
   struct GraphicsBindingSnapshotEntry {
     enum class Kind : uint8_t { Descriptor, RootConstants };
 
@@ -5915,12 +5925,18 @@ private:
     D3D12_VERTEX_BUFFER_VIEW view = {};
   };
 
+  struct NativeStageBindingToken {
+    std::vector<uint32_t> cbuffer_root_bases;
+    std::vector<uint32_t> resource_root_bases;
+  };
+
   struct GraphicsBindingSnapshot {
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
     Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
     Com<ID3D12DescriptorHeap> sampler_heap;
     RootSignature *root_signature_impl = nullptr;
+    RootSignature *graphics_root_signature_impl = nullptr;
     std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 64> graphics_tables = {};
     std::vector<GraphicsBindingSnapshotEntry> entries;
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
@@ -5928,11 +5944,10 @@ private:
     uint64_t content_fingerprint = 0;
     uint64_t resource_access_fingerprint = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
-    std::array<bool, 64> root_constants_valid = {};
-    std::array<std::vector<UINT>, 64> root_constants;
-    std::array<GraphicsRootDescriptorBindingIdentity, 64> cbv_roots = {};
-    std::array<GraphicsRootDescriptorBindingIdentity, 64> srv_roots = {};
-    std::array<GraphicsRootDescriptorBindingIdentity, 64> uav_roots = {};
+    std::array<ReplayRootConstantsSlot, 64> graphics_root_constants = {};
+    std::array<ReplayRootDescriptorSlot, 64> graphics_cbv_roots = {};
+    std::array<ReplayRootDescriptorSlot, 64> graphics_srv_roots = {};
+    std::array<ReplayRootDescriptorSlot, 64> graphics_uav_roots = {};
     std::array<GraphicsVertexBufferBindingIdentity, 32> vertex_buffer_views =
         {};
     // Bindless-mirror snapshot replay rebuilds root offsets and compact mirror
@@ -5940,6 +5955,8 @@ private:
     // access to the live ReplayState.
     bool bindless = false;
     bool native = false;
+    NativeStageBindingToken native_vertex;
+    NativeStageBindingToken native_pixel;
     AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
     AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
@@ -6174,16 +6191,6 @@ private:
     Rc<BufferAllocation> allocation;
   };
 
-  struct ReplayRootConstantsSlot {
-    bool valid = false;
-    std::vector<UINT> values;
-  };
-
-  struct ReplayRootDescriptorSlot {
-    bool valid = false;
-    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
-  };
-
   struct ReplayState {
     // Root parameter index is bounded by the D3D12 root-signature 64-DWORD
     // limit, so the hottest root bindings use a fixed array indexed by parameter
@@ -6260,6 +6267,14 @@ private:
     // hit proves "same bindings, frozen state" → the hazard result is identical.
     uint64_t access_epoch = 0;
     std::unordered_map<uint64_t, uint64_t> da_cache;
+    struct DescriptorJournalAccessCache {
+      uint64_t binding_identity = 0;
+      uint64_t access_epoch = 0;
+      DescriptorHeapMirror *mirror = nullptr;
+      uint64_t cursor = 0;
+      std::unordered_map<uint32_t, std::vector<uint32_t>> entries_by_slot;
+      bool valid = false;
+    } descriptor_journal_access_cache;
     Com<ID3D12Resource> predication_buffer;
     UINT64 predication_buffer_offset = 0;
     D3D12_PREDICATION_OP predication_operation =
@@ -8124,8 +8139,9 @@ private:
     hash = mix(hash,
                reinterpret_cast<uintptr_t>(state.cbv_srv_uav_heap.ptr()));
     hash = mix(hash, reinterpret_cast<uintptr_t>(state.sampler_heap.ptr()));
-    hash = mix(hash, descriptor_content_revision.epoch);
-    hash = mix(hash, descriptor_content_revision.sequence);
+    // Both D3D12 shader ABIs dereference persistent descriptor heaps at
+    // execution time. Descriptor writes therefore invalidate the heap journal,
+    // not the lightweight token that owns heap/root/table identities.
     const UINT root_count = state.graphics_root_signature_impl
                                 ? std::min<UINT>(
                                       state.graphics_root_signature_impl
@@ -8181,8 +8197,7 @@ private:
     if (snapshot.pipeline_state.ptr() != state.pipeline_state.ptr() ||
         snapshot.root_signature.ptr() != state.graphics_root_signature.ptr() ||
         snapshot.cbv_srv_uav_heap.ptr() != state.cbv_srv_uav_heap.ptr() ||
-        snapshot.sampler_heap.ptr() != state.sampler_heap.ptr() ||
-        snapshot.descriptor_content_revision != descriptor_content_revision)
+        snapshot.sampler_heap.ptr() != state.sampler_heap.ptr())
       return false;
     const UINT root_count = state.graphics_root_signature_impl
                                 ? std::min<UINT>(
@@ -8203,15 +8218,18 @@ private:
       }
       return true;
     };
-    if (!roots_match(snapshot.cbv_roots, state.graphics_cbv_roots) ||
-        !roots_match(snapshot.srv_roots, state.graphics_srv_roots) ||
-        !roots_match(snapshot.uav_roots, state.graphics_uav_roots))
+    if (!roots_match(snapshot.graphics_cbv_roots,
+                     state.graphics_cbv_roots) ||
+        !roots_match(snapshot.graphics_srv_roots,
+                     state.graphics_srv_roots) ||
+        !roots_match(snapshot.graphics_uav_roots,
+                     state.graphics_uav_roots))
       return false;
     for (UINT i = 0; i < root_count; ++i) {
       const auto &constants = state.graphics_root_constants[i];
-      if (snapshot.root_constants_valid[i] != constants.valid ||
-          (constants.valid &&
-           snapshot.root_constants[i] != constants.values))
+      const auto &captured = snapshot.graphics_root_constants[i];
+      if (captured.valid != constants.valid ||
+          (constants.valid && captured.values != constants.values))
         return false;
     }
     for (UINT i = 0; i < state.vertex_buffers.size(); ++i) {
@@ -10884,6 +10902,7 @@ private:
     state.last_snapshot_request_graphics_generation = 0;
     state.last_snapshot_request_descriptor_revision = {};
     state.da_cache.clear();
+    state.descriptor_journal_access_cache = {};
     state.predication_buffer = nullptr;
     state.predication_buffer_offset = 0;
     state.predication_operation = D3D12_PREDICATION_OP_EQUAL_ZERO;
@@ -12972,6 +12991,63 @@ private:
     auto *smp_heap = resolve_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
     const auto parameters = root->GetParameters();
+    const bool cache_on = DescAccessCacheEnabled() && !compute;
+    auto *resource_mirror = cbv_heap ? cbv_heap->GetMirror() : nullptr;
+    const uint64_t binding_identity =
+        cache_on ? HashGraphicsBindingFull(state) : 0;
+
+    // Fast path for persistent bindless heaps. Table/root identity is cheap to
+    // hash and descriptor contents are tracked by the per-heap journal. When
+    // both the binding identity and resource-state epoch are stable, only the
+    // slots written since the preceding draw can introduce new hazards.
+    if (cache_on && !DescAccessVerify()) {
+      auto &journal_cache = state.descriptor_journal_access_cache;
+      if (journal_cache.valid &&
+          journal_cache.binding_identity == binding_identity &&
+          journal_cache.access_epoch == state.access_epoch &&
+          journal_cache.mirror == resource_mirror) {
+        const auto changes = resource_mirror
+                                 ? resource_mirror->changesSince(
+                                       journal_cache.cursor)
+                                 : DescriptorChangeSet{};
+        if (changes.complete) {
+          if (changes.changes.empty()) {
+            if (ReplayPerfEnabled())
+              perDrawSubTimers().descAccessHits++;
+            return;
+          }
+
+          for (const auto &change : changes.changes) {
+            const auto mapped =
+                journal_cache.entries_by_slot.find(change.slot);
+            if (mapped == journal_cache.entries_by_slot.end())
+              continue;
+            for (const auto entry_index : mapped->second) {
+              if (entry_index >= plan.entries.size())
+                continue;
+              const auto &entry = plan.entries[entry_index];
+              const auto base =
+                  GetTableHandle(state, compute, entry.root_index);
+              if (!base.ptr)
+                continue;
+              const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+                  cbv_heap, base, entry.range_offset, entry.descriptor_index,
+                  entry.count, entry.heap_type);
+              if (!descriptor)
+                continue;
+              RecordDescriptorResourceAccess(
+                  chunk, state, entry.stage, entry.range_type, *descriptor,
+                  DescriptorRangeTypeName(entry.range_type));
+            }
+          }
+          journal_cache.cursor = changes.cursor;
+          journal_cache.access_epoch = state.access_epoch;
+          if (ReplayPerfEnabled())
+            perDrawSubTimers().descAccessHits++;
+          return;
+        }
+      }
+    }
 
     // descAccess content-fingerprint cache: read each binding's resolved CONTENT
     // (resource pointer + type) — this sees through ring-buffer handle churn
@@ -12982,8 +13058,8 @@ private:
     // + RecordReplayResourceAccess hazard work is what's elided. Touch is NOT
     // needed on a hit: the first miss with this fp already Touched the same
     // resources into the per-list (accumulated) touched set.
-    const bool cache_on = DescAccessCacheEnabled() && !compute;
     uint64_t fp = 0;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> entries_by_slot;
     if (cache_on) {
       auto mix = [](uint64_t h, uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -12992,7 +13068,9 @@ private:
       fp = 1469598103934665603ull;
       fp = mix(fp, reinterpret_cast<uintptr_t>(root));
       fp = mix(fp, reinterpret_cast<uintptr_t>(&pipeline));
-      for (const auto &e : plan.entries) {
+      for (uint32_t entry_index = 0; entry_index < plan.entries.size();
+           ++entry_index) {
+        const auto &e = plan.entries[entry_index];
         if (e.kind == BindingEntryKind::Table) {
           const auto base = GetTableHandle(state, compute, e.root_index);
           std::optional<DescriptorRecord> descriptor =
@@ -13012,6 +13090,9 @@ private:
                                       reinterpret_cast<uintptr_t>(
                                           descriptor->counter_resource.ptr())
                                 : 0));
+          if (e.heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+              descriptor)
+            entries_by_slot[descriptor->heap_index].push_back(entry_index);
         } else {
           fp = mix(fp, GetRootBufferAddressForFingerprint(
                            state, compute, e.root_index, e.buffer_type));
@@ -13022,6 +13103,14 @@ private:
       const bool hit =
           cit != state.da_cache.end() && cit->second == state.access_epoch;
       if (hit && !DescAccessVerify()) {
+        auto &journal_cache = state.descriptor_journal_access_cache;
+        journal_cache.binding_identity = binding_identity;
+        journal_cache.access_epoch = state.access_epoch;
+        journal_cache.mirror = resource_mirror;
+        journal_cache.cursor =
+            resource_mirror ? resource_mirror->changeJournalCursor() : 0;
+        journal_cache.entries_by_slot = std::move(entries_by_slot);
+        journal_cache.valid = true;
         if (ReplayPerfEnabled())
           perDrawSubTimers().descAccessHits++;
         return; // identical bindings + frozen state -> hazard result unchanged
@@ -13050,8 +13139,17 @@ private:
                                          parameters[e.root_index], e.buffer_type);
       }
     }
-    if (cache_on)
+    if (cache_on) {
       state.da_cache[fp] = state.access_epoch; // fp -> epoch after the hazard pass
+      auto &journal_cache = state.descriptor_journal_access_cache;
+      journal_cache.binding_identity = binding_identity;
+      journal_cache.access_epoch = state.access_epoch;
+      journal_cache.mirror = resource_mirror;
+      journal_cache.cursor =
+          resource_mirror ? resource_mirror->changeJournalCursor() : 0;
+      journal_cache.entries_by_slot = std::move(entries_by_slot);
+      journal_cache.valid = true;
+    }
   }
 
   void RecordPipelineDescriptorAccess(CommandChunk *chunk, ReplayState &state,
@@ -14856,7 +14954,6 @@ private:
 	    std::atomic<uint64_t> total_graphics_draws = 0;
 	    std::atomic<uint64_t> compute_dispatches = 0;
 	    std::atomic<uint64_t> bindless_bound = 0;
-	    std::atomic<uint64_t> legacy_bound = 0;
 	    std::atomic<uint64_t> uses_bindless_mirror = 0;
     std::atomic<uint64_t> mismatch = 0;
     std::atomic<uint64_t> ps_tex_null = 0;
@@ -14875,7 +14972,7 @@ private:
   };
 
   struct BindlessMirrorDrawDiag {
-    const char *path = "legacy";
+    const char *path = "bindless-unbound";
     bool uses_bindless_mirror = false;
     bool bindless_bound = false;
     uint32_t ps_tex = 0;
@@ -14909,7 +15006,7 @@ private:
   BindlessMirrorDiagPathName(bool bindless_bound, bool snapshot) {
     if (bindless_bound)
       return snapshot ? "bindless-snapshot" : "bindless-live";
-    return "legacy";
+    return "bindless-unbound";
   }
 
   static const std::filesystem::path &
@@ -15005,7 +15102,6 @@ private:
 	         " totalGraphicsDraws=", total,
 	         " computeDispatches=", dispatches,
 	         " bindlessBound=", stats.bindless_bound.load(std::memory_order_relaxed),
-	         " legacyBound=", stats.legacy_bound.load(std::memory_order_relaxed),
 	         " usesBindlessMirror=",
          stats.uses_bindless_mirror.load(std::memory_order_relaxed),
          " mismatch=", stats.mismatch.load(std::memory_order_relaxed),
@@ -15068,8 +15164,6 @@ private:
         stats.total_graphics_draws.fetch_add(1, std::memory_order_relaxed) + 1;
     if (diag.bindless_bound)
       stats.bindless_bound.fetch_add(1, std::memory_order_relaxed);
-    else
-      stats.legacy_bound.fetch_add(1, std::memory_order_relaxed);
     if (diag.uses_bindless_mirror)
       stats.uses_bindless_mirror.fetch_add(1, std::memory_order_relaxed);
     const bool mismatch = diag.uses_bindless_mirror != diag.bindless_bound;
@@ -15826,6 +15920,163 @@ private:
     return plan;
   }
 
+  template <PipelineStage Stage>
+  void TrackNativeDescriptorAccess(
+      ArgumentEncodingContext &enc, const DescriptorRecord &descriptor,
+      D3D12_DESCRIPTOR_RANGE_TYPE range_type,
+      const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: {
+      ConstantBufferBinding binding = {};
+      if (!MakeConstantBufferBindingFromDescriptor(descriptor, binding) ||
+          !binding.buffer)
+        return;
+      const auto length = descriptor.has_desc
+                              ? descriptor.desc.cbv.SizeInBytes
+                              : 0u;
+      if (length)
+        enc.access<Stage>(binding.buffer, binding.offset, length,
+                          ResourceAccess::Read);
+      return;
+    }
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: {
+      ResourceViewBinding binding = {};
+      if (!MakeShaderResourceBindingFromDescriptor(
+              device_->GetMTLDevice(), descriptor, argument, binding))
+        return;
+      if (binding.buffer) {
+        if (binding.viewId)
+          enc.access<Stage>(binding.buffer, binding.viewId,
+                            ResourceAccess::Read);
+        else
+          enc.access<Stage>(binding.buffer, binding.slice.byteOffset,
+                            binding.slice.byteLength, ResourceAccess::Read);
+      } else if (binding.texture && binding.viewId) {
+        enc.access<Stage>(binding.texture, binding.viewId,
+                          ResourceAccess::Read);
+      }
+      return;
+    }
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: {
+      UnorderedAccessViewBinding binding = {};
+      if (!MakeUnorderedAccessBindingFromDescriptor(
+              device_->GetMTLDevice(), descriptor, argument, binding))
+        return;
+      bool read = argument && ((argument->Flags >> 10) & 1);
+      bool write = argument && ((argument->Flags >> 10) & 2);
+      if (!read && !write) {
+        read = true;
+        write = true;
+      }
+      const int flags = (read ? ResourceAccess::Read : 0) |
+                        (write ? ResourceAccess::Write : 0) |
+                        ResourceAccess::UAV;
+      if (binding.buffer) {
+        if (binding.viewId)
+          enc.access<Stage>(binding.buffer, binding.viewId, flags);
+        else
+          enc.access<Stage>(binding.buffer, binding.slice.byteOffset,
+                            binding.slice.byteLength, flags);
+      } else if (binding.texture && binding.viewId) {
+        enc.access<Stage>(binding.texture, binding.viewId, flags);
+      }
+      if (binding.counter)
+        enc.access<Stage>(binding.counter, 0, sizeof(uint32_t),
+                          ResourceAccess::All);
+      return;
+    }
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      return;
+    }
+  }
+
+  template <PipelineStage Stage, typename State>
+  void TrackNativeStageDescriptorAccesses(
+      ArgumentEncodingContext &enc, const State &state,
+      const PipelineState &pipeline, const RootSignature &root, bool compute) {
+    const auto plan =
+        GetNativeRootBaseStagePlan(pipeline, root, Stage, compute);
+    const auto *shader = FindShaderForStage(pipeline, Stage);
+    if (!plan || !shader)
+      return;
+
+    const auto *cbuffers = shader->constantBufferInfo();
+    const auto cbuffer_count = shader->reflection().NumConstantBuffers;
+    const auto *arguments = shader->resourceArgumentInfo();
+    const auto argument_count = shader->reflection().NumArguments;
+    for (const auto &entry : plan->entries) {
+      const auto *argument =
+          entry.cbuffer
+              ? (cbuffers && entry.argument_index < cbuffer_count
+                     ? &cbuffers[entry.argument_index]
+                     : nullptr)
+              : (arguments && entry.argument_index < argument_count
+                     ? &arguments[entry.argument_index]
+                     : nullptr);
+      if (!argument)
+        continue;
+      const auto base = GetTableHandle(state, compute, entry.root_index);
+      auto *heap = GetBoundDescriptorHeap(state, entry.heap_type);
+      if (!base.ptr || !heap)
+        continue;
+      for (uint32_t local = 0; local < entry.range_count; ++local) {
+        if (entry.descriptor_index + local >= entry.descriptor_count)
+          break;
+        const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+            heap, base, entry.range_offset, entry.descriptor_index + local,
+            entry.descriptor_count, entry.heap_type);
+        if (descriptor)
+          TrackNativeDescriptorAccess<Stage>(enc, *descriptor,
+                                             entry.range_type, argument);
+      }
+    }
+  }
+
+  template <PipelineStage Stage>
+  void TrackCompiledNativeStageDescriptorAccesses(
+      ArgumentEncodingContext &enc,
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      const PipelineState &pipeline, const RootSignature &root, bool compute) {
+    const auto plan =
+        GetNativeRootBaseStagePlan(pipeline, root, Stage, compute);
+    const auto *shader = FindShaderForStage(pipeline, Stage);
+    if (!plan || !shader)
+      return;
+
+    const auto *cbuffers = shader->constantBufferInfo();
+    const auto cbuffer_count = shader->reflection().NumConstantBuffers;
+    const auto *arguments = shader->resourceArgumentInfo();
+    const auto argument_count = shader->reflection().NumArguments;
+    for (const auto &entry : plan->entries) {
+      const auto *argument =
+          entry.cbuffer
+              ? (cbuffers && entry.argument_index < cbuffer_count
+                     ? &cbuffers[entry.argument_index]
+                     : nullptr)
+              : (arguments && entry.argument_index < argument_count
+                     ? &arguments[entry.argument_index]
+                     : nullptr);
+      const auto *table =
+          FindCompiledRootTable(tables, entry.root_index, entry.heap_type);
+      auto *heap = table
+                       ? dynamic_cast<DescriptorHeap *>(table->owning_heap.ptr())
+                       : nullptr;
+      if (!argument || !table || !heap)
+        continue;
+      for (uint32_t local = 0; local < entry.range_count; ++local) {
+        if (entry.descriptor_index + local >= entry.descriptor_count)
+          break;
+        const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
+            heap, table->base_descriptor, entry.range_offset,
+            entry.descriptor_index + local, entry.descriptor_count,
+            entry.heap_type);
+        if (descriptor)
+          TrackNativeDescriptorAccess<Stage>(enc, *descriptor,
+                                             entry.range_type, argument);
+      }
+    }
+  }
+
   static uint32_t DescriptorViewDimension(const DescriptorRecord &descriptor) {
     if (!descriptor.has_desc)
       return 0;
@@ -15969,12 +16220,12 @@ private:
   }
 
   template <typename State>
-  AllocatedArgumentBufferSlice
-  BuildNativeRootTableBases(ArgumentEncodingContext &enc, const State &state,
-                            const PipelineState &pipeline,
-                            const RootSignature &root,
-                            PipelineStage want_stage, bool compute,
-                            bool cbuffer) {
+  std::vector<uint32_t>
+  BuildNativeRootTableBaseWords(const State &state,
+                                const PipelineState &pipeline,
+                                const RootSignature &root,
+                                PipelineStage want_stage, bool compute,
+                                bool cbuffer) {
     const auto plan =
         GetNativeRootBaseStagePlan(pipeline, root, want_stage, compute);
     const uint32_t max_key_plus_one =
@@ -15983,13 +16234,7 @@ private:
     if (!max_key_plus_one)
       return {};
 
-    auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
-        enc.currentSeqId(), uint64_t(max_key_plus_one) * sizeof(uint32_t));
-    if (!slice.mapped || !slice.gpu_buffer)
-      return {};
-
-    auto *root_bases = static_cast<uint32_t *>(slice.mapped);
-    std::memset(root_bases, 0, slice.length);
+    std::vector<uint32_t> root_bases(max_key_plus_one, 0);
     for (const auto &entry : plan->entries) {
       if (entry.cbuffer != cbuffer || entry.root_base_key >= max_key_plus_one)
         continue;
@@ -16005,10 +16250,34 @@ private:
       root_bases[entry.root_base_key] =
           descriptor->heap_index - entry.argument_local_start;
     }
+    return root_bases;
+  }
+
+  AllocatedArgumentBufferSlice UploadNativeRootTableBases(
+      ArgumentEncodingContext &enc, const std::vector<uint32_t> &root_bases) {
+    if (root_bases.empty())
+      return {};
+    auto slice = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), uint64_t(root_bases.size()) * sizeof(uint32_t));
+    if (!slice.mapped || !slice.gpu_buffer)
+      return {};
+    std::memcpy(slice.mapped, root_bases.data(), slice.length);
     if (slice.needs_flush)
       slice.gpu_buffer.updateContents(slice.offset, slice.mapped,
                                       slice.length);
     return slice;
+  }
+
+  template <typename State>
+  AllocatedArgumentBufferSlice
+  BuildNativeRootTableBases(ArgumentEncodingContext &enc, const State &state,
+                            const PipelineState &pipeline,
+                            const RootSignature &root,
+                            PipelineStage want_stage, bool compute,
+                            bool cbuffer) {
+    return UploadNativeRootTableBases(
+        enc, BuildNativeRootTableBaseWords(state, pipeline, root, want_stage,
+                                           compute, cbuffer));
   }
 
   // Bindless-mirror: build the per-draw slot-28 root_offsets for ONE shader
@@ -16840,6 +17109,8 @@ private:
     snapshot.pipeline_state = state.pipeline_state;
     snapshot.root_signature = state.graphics_root_signature;
     snapshot.root_signature_impl = state.graphics_root_signature_impl;
+    snapshot.graphics_root_signature_impl =
+        state.graphics_root_signature_impl;
     // Captured DescriptorRecord values contain non-owning pointers to their
     // heap-owned mirrors. Keep both bound heaps alive for every deferred
     // snapshot path, not only the native descriptor-table ABI.
@@ -16847,16 +17118,11 @@ private:
     snapshot.sampler_heap = state.sampler_heap;
     snapshot.graphics_tables = state.graphics_tables;
     for (UINT i = 0; i < state.graphics_root_constants.size(); ++i) {
-      snapshot.root_constants_valid[i] =
-          state.graphics_root_constants[i].valid;
-      if (state.graphics_root_constants[i].valid)
-        snapshot.root_constants[i] = state.graphics_root_constants[i].values;
-      snapshot.cbv_roots[i] = {state.graphics_cbv_roots[i].valid,
-                               state.graphics_cbv_roots[i].address};
-      snapshot.srv_roots[i] = {state.graphics_srv_roots[i].valid,
-                               state.graphics_srv_roots[i].address};
-      snapshot.uav_roots[i] = {state.graphics_uav_roots[i].valid,
-                               state.graphics_uav_roots[i].address};
+      snapshot.graphics_root_constants[i] =
+          state.graphics_root_constants[i];
+      snapshot.graphics_cbv_roots[i] = state.graphics_cbv_roots[i];
+      snapshot.graphics_srv_roots[i] = state.graphics_srv_roots[i];
+      snapshot.graphics_uav_roots[i] = state.graphics_uav_roots[i];
     }
     for (UINT i = 0; i < state.vertex_buffers.size(); ++i) {
       snapshot.vertex_buffer_views[i].valid =
@@ -16885,37 +17151,57 @@ private:
     }
 
     auto *root = state.graphics_root_signature_impl;
+    if (root && snapshot.native) {
+      snapshot.native_vertex.cbuffer_root_bases =
+          BuildNativeRootTableBaseWords(
+              state, pipeline, *root, PipelineStage::Vertex, false, true);
+      snapshot.native_vertex.resource_root_bases =
+          BuildNativeRootTableBaseWords(
+              state, pipeline, *root, PipelineStage::Vertex, false, false);
+      snapshot.native_pixel.cbuffer_root_bases =
+          BuildNativeRootTableBaseWords(
+              state, pipeline, *root, PipelineStage::Pixel, false, true);
+      snapshot.native_pixel.resource_root_bases =
+          BuildNativeRootTableBaseWords(
+              state, pipeline, *root, PipelineStage::Pixel, false, false);
+    }
     if (root && !snapshot.native) {
-      // Bindless snapshots rebuild root offsets and mirror windows from the
-      // captured descriptors because deferred draws have no live ReplayState.
       snapshot.bindless = pipeline.UsesBindlessMirror();
 
-      CaptureDescriptorTableBindings(
-          snapshot, state, pipeline,
-          GetDescriptorTableBindingRecipe(pipeline, *root, false), false);
+      // A bindless submission token owns the heaps and table addresses, not a
+      // copy of every DescriptorRecord. Descriptor contents are read from the
+      // persistent heap mirror on the submission worker. Keep the legacy
+      // capture only until all remaining shader ABIs are removed below.
+      if (!snapshot.bindless) {
+        CaptureDescriptorTableBindings(
+            snapshot, state, pipeline,
+            GetDescriptorTableBindingRecipe(pipeline, *root, false), false);
+      }
 
-      const auto parameters = root->GetParameters();
-      for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
-        const auto &parameter = parameters[root_index];
-        if (parameter.parameter_type ==
-            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-          continue;
-        if (parameter.parameter_type ==
-            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-          CaptureGraphicsRootConstants(snapshot, state, pipeline, root_index,
-                                       parameter);
-        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
-          CaptureGraphicsRootDescriptor(
-              snapshot, state, pipeline, root_index, parameter,
-              DescriptorRecordType::ConstantBufferView);
-        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
-          CaptureGraphicsRootDescriptor(
-              snapshot, state, pipeline, root_index, parameter,
-              DescriptorRecordType::ShaderResourceView);
-        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
-          CaptureGraphicsRootDescriptor(
-              snapshot, state, pipeline, root_index, parameter,
-              DescriptorRecordType::UnorderedAccessView);
+      if (!snapshot.bindless) {
+        const auto parameters = root->GetParameters();
+        for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+          const auto &parameter = parameters[root_index];
+          if (parameter.parameter_type ==
+              D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+            continue;
+          if (parameter.parameter_type ==
+              D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+            CaptureGraphicsRootConstants(snapshot, state, pipeline, root_index,
+                                         parameter);
+          } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+            CaptureGraphicsRootDescriptor(
+                snapshot, state, pipeline, root_index, parameter,
+                DescriptorRecordType::ConstantBufferView);
+          } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+            CaptureGraphicsRootDescriptor(
+                snapshot, state, pipeline, root_index, parameter,
+                DescriptorRecordType::ShaderResourceView);
+          } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+            CaptureGraphicsRootDescriptor(
+                snapshot, state, pipeline, root_index, parameter,
+                DescriptorRecordType::UnorderedAccessView);
+          }
         }
       }
     }
@@ -17312,70 +17598,6 @@ private:
     return {mask_lo, mask_hi};
   }
 
-  template <PipelineStage Stage, PipelineKind Kind>
-  void EncodeShaderBindingsForStage(ArgumentEncodingContext &enc,
-                                    const PipelineDxilShader &shader,
-                                    const std::string &shader_key,
-                                    uint64_t &argbuf_offset) {
-    if (D3D12DiagBindingsEnabled() && D3D12DiagShaderFilterConfigured() &&
-        D3D12DiagShaderKeySelected(shader_key)) {
-      const char *stage_name = "unknown";
-      if constexpr (Stage == PipelineStage::Vertex)
-        stage_name = "vs";
-      else if constexpr (Stage == PipelineStage::Pixel)
-        stage_name = "ps";
-      else if constexpr (Stage == PipelineStage::Geometry)
-        stage_name = "gs";
-      else if constexpr (Stage == PipelineStage::Hull)
-        stage_name = "hs";
-      else if constexpr (Stage == PipelineStage::Domain)
-        stage_name = "ds";
-      else if constexpr (Stage == PipelineStage::Compute)
-        stage_name = "cs";
-      DumpBindlessMirrorShaderDxbc(stage_name, shader);
-    }
-
-    if constexpr (Stage == PipelineStage::Compute) {
-      enc.invalidateNativeArgumentBuffers(true);
-    } else if constexpr (Stage == PipelineStage::Vertex) {
-      enc.invalidateNativeArgumentBuffers(false, WMTRenderStageVertex);
-    } else if constexpr (Stage == PipelineStage::Pixel) {
-      enc.invalidateNativeArgumentBuffers(false, WMTRenderStageFragment);
-    }
-    const auto &reflection = shader.reflection();
-    if (reflection.NumConstantBuffers && shader.constantBufferInfo()) {
-      const auto offset =
-          AllocateArgumentBuffer(argbuf_offset,
-                                 reflection.NumConstantBuffers << 3);
-      enc.encodeConstantBuffers<Stage, Kind>(
-          &reflection, shader.constantBufferInfo(), offset, shader_key);
-    }
-    if (reflection.NumArguments && shader.resourceArgumentInfo()) {
-      const auto offset =
-          AllocateArgumentBuffer(argbuf_offset,
-                                 reflection.ArgumentTableQwords << 3);
-      uint64_t demote_msaa_srv_mask_lo = 0;
-      uint64_t demote_msaa_srv_mask_hi = 0;
-      if constexpr (Stage == PipelineStage::Pixel) {
-        auto *render_encoder = enc.currentRenderEncoder();
-        demote_msaa_srv_mask_lo =
-            render_encoder->pixel_shader_demote_msaa_srv_mask_lo;
-        demote_msaa_srv_mask_hi =
-            render_encoder->pixel_shader_demote_msaa_srv_mask_hi;
-      }
-      enc.encodeShaderResources<Stage, Kind>(
-          &reflection, shader.resourceArgumentInfo(), offset, shader_key,
-          nullptr, demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
-    }
-  }
-
-  // Descriptor mirroring is a runtime capability rather than an environment
-  // selected architecture. Unsupported PSOs still use the legacy binding path,
-  // so legacy-side guard re-binds remain required after a mirrored draw.
-  static bool DescriptorMirrorRuntimeEnabled() {
-    return true;
-  }
-
   template <PipelineStage Stage>
   static std::pair<uint64_t, uint64_t>
   CurrentPixelShaderMsaaSrvDemoteMasks(ArgumentEncodingContext &enc) {
@@ -17400,14 +17622,11 @@ private:
     return false;
   }
 
-  // Bindless-mirror (③.3) live/compute per-stage wiring: for the bindless path, replace the
-  // legacy encodeConstantBuffers/encodeShaderResources with (1) pack the slot-27 buf_table via the
-  // ③.1 packers and (2) emit the per-draw deferred binds of buf_table(27) + root_offsets(28, ③.2)
-  // + sampler mirror(29) + texture mirror(30). `state`/`root` are reachable here (live path clones
-  // replay_state into the lambda; compute path has state). Only the Ordinary Vertex/Pixel/Compute
-  // stages are wired — the bindless off-gate guarantees no GS/HS/DS, so the geometry/tess branches
-  // stay on the LEGACY EncodeShaderBindingsForStage.
-  template <PipelineStage Stage, typename State>
+  // Bindless live/compute per-stage wiring. The mirror ABI packs the slot-27
+  // buffer table and binds root offsets plus the persistent sampler/texture
+  // heaps. The native ABI binds the persistent descriptor heap directly.
+  template <PipelineStage Stage, PipelineKind Kind = PipelineKind::Ordinary,
+            typename State>
   void EncodeShaderBindingsForStageBindless(ArgumentEncodingContext &enc,
                                             const State &state,
                                             const PipelineState &pipeline,
@@ -17415,9 +17634,12 @@ private:
                                             const PipelineDxilShader &shader,
                                             const std::string &shader_key,
                                             bool compute,
-                                            BindlessMirrorDrawDiag *draw_diag = nullptr) {
+                                            BindlessMirrorDrawDiag *draw_diag = nullptr,
+                                            const NativeStageBindingToken *native_token = nullptr) {
     if (pipeline.GetShaderAbiVersion() ==
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
+      TrackNativeStageDescriptorAccesses<Stage>(enc, state, pipeline, root,
+                                                compute);
       constexpr WMTRenderStages render_stages =
           Stage == PipelineStage::Vertex
               ? WMTRenderStageVertex
@@ -17427,10 +17649,18 @@ private:
         enc.bindNativeNullConstantBuffer(compute, render_stages);
       if (NativeShaderUsesBufferSrv(shader))
         enc.bindNativeNullBuffer(compute, render_stages);
-      auto cbuffer_root_bases = BuildNativeRootTableBases(
-          enc, state, pipeline, root, Stage, compute, /*cbuffer=*/true);
-      auto resource_root_bases = BuildNativeRootTableBases(
-          enc, state, pipeline, root, Stage, compute, /*cbuffer=*/false);
+      auto cbuffer_root_bases =
+          native_token
+              ? UploadNativeRootTableBases(enc,
+                                           native_token->cbuffer_root_bases)
+              : BuildNativeRootTableBases(enc, state, pipeline, root, Stage,
+                                          compute, /*cbuffer=*/true);
+      auto resource_root_bases =
+          native_token
+              ? UploadNativeRootTableBases(enc,
+                                           native_token->resource_root_bases)
+              : BuildNativeRootTableBases(enc, state, pipeline, root, Stage,
+                                          compute, /*cbuffer=*/false);
       enc.diagnoseNativeShaderBinding(
           Stage, shader_key, "native-live", cbuffer_root_bases,
           resource_root_bases);
@@ -17448,7 +17678,7 @@ private:
     const auto &reflection = shader.reflection();
     const auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
         CurrentPixelShaderMsaaSrvDemoteMasks<Stage>(enc);
-    auto bt = enc.packBindlessStage<Stage, PipelineKind::Ordinary>(
+    auto bt = enc.packBindlessStage<Stage, Kind>(
         &reflection, shader.constantBufferInfo(), shader.resourceArgumentInfo(),
         shader_key, DiagCurrentReplayRecordSequence(),
         DiagCurrentReplayRecordSerial(), nullptr,
@@ -18573,6 +18803,8 @@ private:
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
       if (!native_binding || !native_binding->ready)
         return;
+      TrackCompiledNativeStageDescriptorAccesses<Stage>(
+          enc, tables, pipeline, root, compute);
       const AllocatedArgumentBufferSlice cbuffer_root_bases = {
           nullptr, native_root_base_buffer,
           native_binding->cbuffer_root_base_offset, 0,
@@ -18895,7 +19127,10 @@ private:
       dxmt::perf::ScopedFrameDuration static_sampler_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_static_samplers_interval);
-      ApplyStaticSamplers(enc, pipeline, *root, false);
+      if (snapshot.bindless)
+        ApplyRootDescriptorTables(enc, snapshot, pipeline, false);
+      else
+        ApplyStaticSamplers(enc, pipeline, *root, false);
     }
 
     {
@@ -19052,41 +19287,72 @@ private:
         if (shader.stage == PipelineShaderStage::Vertex) {
           EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
               enc, snapshot, pipeline, *snapshot.root_signature_impl, shader,
-              key, false, &diag);
+              key, false, &diag, &snapshot.native_vertex);
         } else if (shader.stage == PipelineShaderStage::Pixel) {
           EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
               enc, snapshot, pipeline, *snapshot.root_signature_impl, shader,
-              key, false, &diag);
+              key, false, &diag, &snapshot.native_pixel);
         }
       }
       return;
     }
     diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
-    // Bindless-mirror (③.3) snapshot path: root_offsets and compact mirror windows
-    // are rebuilt per stage from captured descriptors. A bindless PSO is never
-    // geometry/tess (off-gate), so only Ordinary Vertex/Pixel branch.
-    const bool snapshot_bindless =
-        snapshot.bindless && !use_geometry && !use_tessellation;
+    // The submission-owned bindless token retains the heaps and root state.
+    // Resolve descriptor tables directly from that token instead of rebuilding
+    // them from a per-draw DescriptorRecord snapshot.
+    const bool snapshot_bindless = snapshot.bindless;
     diag.bindless_bound = snapshot_bindless;
     diag.path = BindlessMirrorDiagPathName(snapshot_bindless, true);
-    // Mixed-PSO guard (③.3 STEP D): a legacy snapshot draw after a bindless draw restores the
-    // per-pass argbuf at 29/30. (snapshot.bindless==false ⇒ this is a legacy draw.)
-    if (!snapshot.bindless && DescriptorMirrorRuntimeEnabled()) {
-      dxmt::perf::ScopedFrameDuration restore_argbuf_scope(
-          perf_stats,
-          &dxmt::FrameStatistics::frame_compiled_snapshot_restore_argbuf_interval);
-      if (enc.restorePerPassArgbufIfMirrorBound<false>())
-        dxmt::perf::addFrameCounter(
-            perf_stats,
-            &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_argbuf_restores);
-    }
+    if (!snapshot_bindless || !snapshot.root_signature_impl)
+      return;
     {
       dxmt::perf::ScopedFrameDuration shader_bindings_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings_interval);
       for (const auto &shader : shaders) {
-        if (snapshot_bindless) {
-          if (shader.stage == PipelineShaderStage::Vertex) {
+        if (use_geometry && shader.stage == PipelineShaderStage::Vertex) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Vertex, PipelineKind::Geometry>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (use_geometry &&
+                     shader.stage == PipelineShaderStage::Geometry) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Geometry, PipelineKind::Geometry>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (use_geometry &&
+                     shader.stage == PipelineShaderStage::Pixel) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Pixel, PipelineKind::Geometry>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (use_tessellation &&
+                     shader.stage == PipelineShaderStage::Vertex) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Vertex, PipelineKind::Tessellation>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (use_tessellation &&
+                     shader.stage == PipelineShaderStage::Hull) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Hull, PipelineKind::Tessellation>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (use_tessellation &&
+                     shader.stage == PipelineShaderStage::Domain) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Domain, PipelineKind::Tessellation>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (use_tessellation &&
+                     shader.stage == PipelineShaderStage::Pixel) {
+            EncodeShaderBindingsForStageBindless<
+                PipelineStage::Pixel, PipelineKind::Tessellation>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (!use_geometry && !use_tessellation &&
+                     shader.stage == PipelineShaderStage::Vertex) {
             dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
@@ -19096,9 +19362,11 @@ private:
             dxmt::perf::ScopedFrameDuration bindless_shader_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings_interval);
-            EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Vertex>(
-                enc, shader, key, snapshot, &diag);
-          } else if (shader.stage == PipelineShaderStage::Pixel) {
+            EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
+          } else if (!use_geometry && !use_tessellation &&
+                     shader.stage == PipelineShaderStage::Pixel) {
             dxmt::perf::addFrameCounter(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
@@ -19108,149 +19376,9 @@ private:
             dxmt::perf::ScopedFrameDuration bindless_shader_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_bindless_shader_bindings_interval);
-            EncodeShaderBindingsForStageBindlessSnapshot<PipelineStage::Pixel>(
-                enc, shader, key, snapshot, &diag);
-          }
-          continue;
-        }
-        if (use_geometry) {
-          if (shader.stage == PipelineShaderStage::Vertex)
-            {
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-              EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                           PipelineKind::Geometry>(
-                  enc, shader, key, argbuf_offset);
-            }
-          else if (shader.stage == PipelineShaderStage::Geometry)
-            {
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-              EncodeShaderBindingsForStage<PipelineStage::Geometry,
-                                           PipelineKind::Geometry>(
-                  enc, shader, key, argbuf_offset);
-            }
-          else if (shader.stage == PipelineShaderStage::Pixel)
-            {
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-              EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                           PipelineKind::Geometry>(
-                  enc, shader, key, argbuf_offset);
-            }
-        } else {
-          if (use_tessellation) {
-            if (shader.stage == PipelineShaderStage::Vertex)
-              {
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-                EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                             PipelineKind::Tessellation>(
-                    enc, shader, key, argbuf_offset);
-              }
-            else if (shader.stage == PipelineShaderStage::Hull)
-              {
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-                EncodeShaderBindingsForStage<PipelineStage::Hull,
-                                             PipelineKind::Tessellation>(
-                    enc, shader, key, argbuf_offset);
-              }
-            else if (shader.stage == PipelineShaderStage::Domain)
-              {
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-                EncodeShaderBindingsForStage<PipelineStage::Domain,
-                                             PipelineKind::Tessellation>(
-                    enc, shader, key, argbuf_offset);
-              }
-            else if (shader.stage == PipelineShaderStage::Pixel)
-              {
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-                dxmt::perf::addFrameCounter(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-                dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                    perf_stats,
-                    &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-                EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                             PipelineKind::Tessellation>(
-                    enc, shader, key, argbuf_offset);
-              }
-          } else if (shader.stage == PipelineShaderStage::Vertex)
-            {
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-              EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                           PipelineKind::Ordinary>(
-                  enc, shader, key, argbuf_offset);
-            }
-          else if (shader.stage == PipelineShaderStage::Pixel)
-            {
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_shader_bindings);
-              dxmt::perf::addFrameCounter(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings);
-              dxmt::perf::ScopedFrameDuration legacy_shader_scope(
-                  perf_stats,
-                  &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_shader_bindings_interval);
-              EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                           PipelineKind::Ordinary>(
-                  enc, shader, key, argbuf_offset);
-            }
+            EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
+                enc, snapshot, pipeline, *snapshot.root_signature_impl,
+                shader, key, false, &diag);
         }
       }
     }
@@ -19336,14 +19464,10 @@ private:
                         argbuf_offset, pipeline_kind);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
-    // Bindless-mirror (③.3): a bindless PSO is never geometry/tessellation (the off-gate
-    // excludes GS/HS/DS), so only the Ordinary Vertex/Pixel stages need the bindless wiring.
     const bool bindless = pipeline.UsesBindlessMirror();
-    const RootSignature *binding_root =
-        (bindless || native) ? state.graphics_root_signature_impl : nullptr;
+    const RootSignature *binding_root = state.graphics_root_signature_impl;
     const RootSignature *bindless_root = bindless ? binding_root : nullptr;
-    const bool bindless_path =
-        bindless_root && !use_geometry && !use_tessellation;
+    const bool bindless_path = bindless_root != nullptr;
     const bool native_path =
         native && binding_root && !use_geometry && !use_tessellation;
     BindlessMirrorDrawDiag diag = {};
@@ -19374,59 +19498,52 @@ private:
         RecordBindlessMirrorDiagDraw(&pipeline, diag);
       return;
     }
-    // Mixed-PSO guard (③.3 STEP D): a legacy draw after a mirrored draw must
-    // restore the per-pass argbuf at slots 29/30.
-    if (!bindless && DescriptorMirrorRuntimeEnabled())
-      enc.restorePerPassArgbufIfMirrorBound<false>();
+    if (!bindless_path)
+      return;
     for (const auto &shader : shaders) {
-      if (bindless_path) {
-        if (shader.stage == PipelineShaderStage::Vertex)
-          EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
-              enc, state, pipeline, *bindless_root, shader, key, false, &diag);
-        else if (shader.stage == PipelineShaderStage::Pixel)
-          EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
-              enc, state, pipeline, *bindless_root, shader, key, false, &diag);
-        continue;
-      }
       if (use_geometry) {
         if (shader.stage == PipelineShaderStage::Vertex)
-          EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                       PipelineKind::Geometry>(
-              enc, shader, key, argbuf_offset);
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Vertex, PipelineKind::Geometry>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
         else if (shader.stage == PipelineShaderStage::Geometry)
-          EncodeShaderBindingsForStage<PipelineStage::Geometry,
-                                       PipelineKind::Geometry>(
-              enc, shader, key, argbuf_offset);
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Geometry, PipelineKind::Geometry>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
         else if (shader.stage == PipelineShaderStage::Pixel)
-          EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                       PipelineKind::Geometry>(
-              enc, shader, key, argbuf_offset);
-      } else {
-        if (use_tessellation) {
-          if (shader.stage == PipelineShaderStage::Vertex)
-            EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-          else if (shader.stage == PipelineShaderStage::Hull)
-            EncodeShaderBindingsForStage<PipelineStage::Hull,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-          else if (shader.stage == PipelineShaderStage::Domain)
-            EncodeShaderBindingsForStage<PipelineStage::Domain,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-          else if (shader.stage == PipelineShaderStage::Pixel)
-            EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                         PipelineKind::Tessellation>(
-                enc, shader, key, argbuf_offset);
-        } else if (shader.stage == PipelineShaderStage::Vertex)
-          EncodeShaderBindingsForStage<PipelineStage::Vertex,
-                                       PipelineKind::Ordinary>(
-              enc, shader, key, argbuf_offset);
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Pixel, PipelineKind::Geometry>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
+      } else if (use_tessellation) {
+        if (shader.stage == PipelineShaderStage::Vertex)
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Vertex, PipelineKind::Tessellation>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
+        else if (shader.stage == PipelineShaderStage::Hull)
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Hull, PipelineKind::Tessellation>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
+        else if (shader.stage == PipelineShaderStage::Domain)
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Domain, PipelineKind::Tessellation>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
         else if (shader.stage == PipelineShaderStage::Pixel)
-          EncodeShaderBindingsForStage<PipelineStage::Pixel,
-                                       PipelineKind::Ordinary>(
-              enc, shader, key, argbuf_offset);
+          EncodeShaderBindingsForStageBindless<
+              PipelineStage::Pixel, PipelineKind::Tessellation>(
+              enc, state, pipeline, *bindless_root, shader, key, false,
+              &diag);
+      } else if (shader.stage == PipelineShaderStage::Vertex) {
+        EncodeShaderBindingsForStageBindless<PipelineStage::Vertex>(
+            enc, state, pipeline, *bindless_root, shader, key, false, &diag);
+      } else if (shader.stage == PipelineShaderStage::Pixel) {
+        EncodeShaderBindingsForStageBindless<PipelineStage::Pixel>(
+            enc, state, pipeline, *bindless_root, shader, key, false, &diag);
       }
     }
     if (out_diag)
@@ -19446,10 +19563,8 @@ private:
       ApplyRootDescriptorTables(enc, state, pipeline, true);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
-    // Bindless-mirror (③.3): compute bindless wiring (slot-27 buf_table + 28/29/30 binds).
     const bool bindless = pipeline.UsesBindlessMirror();
-    const RootSignature *bindless_root =
-        (bindless || native) ? state.compute_root_signature_impl : nullptr;
+    const RootSignature *bindless_root = state.compute_root_signature_impl;
     if (native) {
       if (!bindless_root)
         return;
@@ -19461,20 +19576,12 @@ private:
       }
       return;
     }
-    // Mixed-PSO guard (③.3 STEP D): restore the per-pass argbuf at 29/30 if a prior bindless
-    // dispatch rebound them. Compute analog of the graphics guard.
-    if (!bindless && DescriptorMirrorRuntimeEnabled())
-      enc.restorePerPassArgbufIfMirrorBound<true>();
+    if (!bindless || !bindless_root)
+      return;
     for (const auto &shader : shaders) {
-      if (shader.stage == PipelineShaderStage::Compute) {
-        if (bindless && bindless_root)
-          EncodeShaderBindingsForStageBindless<PipelineStage::Compute>(
-              enc, state, pipeline, *bindless_root, shader, key, true);
-        else
-          EncodeShaderBindingsForStage<PipelineStage::Compute,
-                                       PipelineKind::Ordinary>(
-              enc, shader, key, argbuf_offset);
-      }
+      if (shader.stage == PipelineShaderStage::Compute)
+        EncodeShaderBindingsForStageBindless<PipelineStage::Compute>(
+            enc, state, pipeline, *bindless_root, shader, key, true);
     }
   }
 
@@ -20609,7 +20716,10 @@ private:
   bool RecordGraphicsSnapshotDescriptorAccess(
       CommandChunk *chunk, ReplayState &state,
       const GraphicsBindingSnapshot *snapshot) {
-    if (!snapshot || snapshot->native)
+    // Bindless snapshots are state tokens: they deliberately do not own a
+    // DescriptorRecord copy. Their resources must be resolved by the live
+    // binding plan (which can then consume the heap change journal safely).
+    if (!snapshot || snapshot->native || snapshot->bindless)
       return false;
 
     const bool cache_on = DescAccessCacheEnabled();
@@ -20961,7 +21071,6 @@ private:
     bool fingerprint_hit = false;
     bool bindless_snapshot = false;
     BindlessMirrorDrawDiag bindless_diag = {};
-    bool restored_legacy_argbuf = false;
     bool skip_binding_snapshot = false;
     {
       dxmt::perf::ScopedFrameDuration binding_gate_scope(
@@ -21012,20 +21121,8 @@ private:
       bindless_diag.path =
           BindlessMirrorDiagPathName(bindless_diag.bindless_bound,
                                      true);
-      if (!bindless_diag.bindless_bound && DescriptorMirrorRuntimeEnabled()) {
-        dxmt::perf::ScopedFrameDuration restore_argbuf_scope(
-            perf_stats,
-            &dxmt::FrameStatistics::frame_compiled_snapshot_restore_argbuf_interval);
-        restored_legacy_argbuf =
-            enc.restorePerPassArgbufIfMirrorBound<false>();
-        if (restored_legacy_argbuf)
-          dxmt::perf::addFrameCounter(
-              perf_stats,
-              &dxmt::FrameStatistics::frame_compiled_snapshot_legacy_argbuf_restores);
-      }
       skip_binding_snapshot =
-          !bindless_snapshot && !restored_legacy_argbuf &&
-          (generation_hit || fingerprint_hit);
+          !bindless_snapshot && (generation_hit || fingerprint_hit);
       if (skip_binding_snapshot)
         dxmt::perf::addFrameCounter(
             perf_stats,

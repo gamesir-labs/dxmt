@@ -211,12 +211,8 @@ public:
   GetMetalGraphicsState(uint64_t pixel_shader_demote_msaa_srv_mask_lo,
                         uint64_t pixel_shader_demote_msaa_srv_mask_hi) = 0;
   virtual const PipelineMetalComputeState *GetMetalComputeState() = 0;
-  // Runtime draw-path gate for the Stage-1 bindless descriptor-mirror path.
-  // Mirrors PsoBindlessEligible(shaders) computed at PSO-create time.
-  virtual bool UsesBindlessMirror() const { return false; }
-  virtual DXMT12_MTL4_SHADER_ABI_VERSION GetShaderAbiVersion() const {
-    return DXMT12_MTL4_SHADER_ABI_LEGACY;
-  }
+  virtual bool UsesBindlessMirror() const = 0;
+  virtual DXMT12_MTL4_SHADER_ABI_VERSION GetShaderAbiVersion() const = 0;
 };
 
 NativeShaderAbiEligibilityReason

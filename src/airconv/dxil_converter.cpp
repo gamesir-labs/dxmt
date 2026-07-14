@@ -316,6 +316,39 @@ DXMT12DXILCompile(dxmt12_airconv_shader_t pShader, SM50_SHADER_COMPILATION_ARGUM
   auto module = std::make_unique<llvm::Module>("dxil.air", context);
   dxmt::initializeModule(*module);
 
+  DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
+      DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
+  DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *native_abi = nullptr;
+  if (dxmt::dxbc::args_get_data<
+          SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI,
+          DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA>(pArgs, &native_abi) &&
+      native_abi && native_abi->enabled)
+    shader_abi_version = native_abi->version;
+
+  SM50_SHADER_BINDLESS_MIRROR_DATA *bindless = nullptr;
+  if (dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR,
+                                SM50_SHADER_BINDLESS_MIRROR_DATA>(
+          pArgs, &bindless) &&
+      bindless && bindless->enabled)
+    shader_abi_version = DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
+
+  struct ShaderAbiScope {
+    explicit ShaderAbiScope(DXMT12_MTL4_SHADER_ABI_VERSION version)
+        : previous_bindless(dxmt::dxbc::get_bindless_mirror()),
+          previous_native(dxmt::dxbc::get_native_descriptor_table()) {
+      dxmt::dxbc::set_bindless_mirror(
+          version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR);
+      dxmt::dxbc::set_native_descriptor_table(
+          version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE);
+    }
+    ~ShaderAbiScope() {
+      dxmt::dxbc::set_bindless_mirror(previous_bindless);
+      dxmt::dxbc::set_native_descriptor_table(previous_native);
+    }
+    bool previous_bindless;
+    bool previous_native;
+  } shader_abi_scope(shader_abi_version);
+
   auto *shader = (DXILShaderInternal *)pShader;
   if (auto err = dxmt::airconv::ConvertDxilToAir(
           shader->parser, FunctionName, context, *module, pArgs)) {

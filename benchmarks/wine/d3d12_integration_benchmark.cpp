@@ -1,6 +1,7 @@
 #include <dxmt_benchmark.hpp>
 
 #include "d3d12_test_context.hpp"
+#include "../../src/d3d12/d3d12_descriptor_journal.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 
 #include <d3dcompiler.h>
@@ -42,6 +43,24 @@ float4 main(float4 position : SV_Position) : SV_Target {
   return result / 32.0;
 }
 )hlsl";
+
+constexpr const char kDescriptorReplayScalingPixelShader[] = R"hlsl(
+StructuredBuffer<float4> buffers[DESCRIPTOR_COUNT] : register(t0);
+
+float4 main(float4 position : SV_Position) : SV_Target {
+  float4 result = 0.0;
+  [unroll]
+  for (uint i = 0; i < DESCRIPTOR_COUNT; ++i)
+    result += buffers[i][0];
+  return result / DESCRIPTOR_COUNT;
+}
+)hlsl";
+
+enum class DescriptorReplayPattern {
+  StableTable,
+  RotatingTableStableContent,
+  RotatingTableDistinctContent,
+};
 
 using IntegrationError = std::optional<std::string>;
 
@@ -521,7 +540,7 @@ IntegrationError RunPendingBarrierBlitAmplificationScenario(
 }
 
 IntegrationError RunOversizedDescriptorRangeDrawScenario(bool indexed,
-                                                          double *submit_ms) {
+                                                           double *submit_ms) {
   D3D12TestContext context;
   if (auto error = HResultError("D3D12 context initialization",
                                 context.Initialize()))
@@ -690,6 +709,210 @@ IntegrationError RunOversizedDescriptorRangeDrawScenario(bool indexed,
   return std::nullopt;
 }
 
+IntegrationError RunDescriptorReplayScalingScenario(
+    unsigned int draw_count, unsigned int descriptors_per_draw,
+    DescriptorReplayPattern pattern, double *submit_ms) {
+  if (!draw_count || !descriptors_per_draw)
+    return "descriptor replay scaling requires non-zero dimensions";
+
+  const unsigned int table_count =
+      pattern == DescriptorReplayPattern::StableTable ? 1 : draw_count;
+  const std::uint64_t heap_descriptor_count =
+      std::uint64_t(table_count) * descriptors_per_draw;
+  if (heap_descriptor_count > 1000000)
+    return "descriptor replay scaling exceeds the shader-visible heap limit";
+
+  D3D12TestContext context;
+  if (auto error = HResultError("D3D12 context initialization",
+                                context.Initialize()))
+    return error;
+
+  auto render_target = context.CreateTexture2D(
+      32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  if (!render_target || !rtv_heap)
+    return "failed to create descriptor replay scaling render target";
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(render_target.get(), nullptr, rtv);
+
+  D3D12_DESCRIPTOR_RANGE srv_range = {};
+  srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_range.NumDescriptors = descriptors_per_draw;
+  srv_range.BaseShaderRegister = 0;
+  D3D12_ROOT_PARAMETER parameters[1] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[0].DescriptorTable.pDescriptorRanges = &srv_range;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = parameters;
+  auto root_signature = context.CreateRootSignature(root_desc);
+  if (!root_signature)
+    return "failed to create descriptor replay scaling root signature";
+
+  const std::string descriptor_count =
+      std::to_string(descriptors_per_draw);
+  const D3D_SHADER_MACRO shader_macros[] = {
+      {"DESCRIPTOR_COUNT", descriptor_count.c_str()}, {nullptr, nullptr}};
+  ComPtr<ID3DBlob> pixel_shader;
+  ComPtr<ID3DBlob> compile_errors;
+  const HRESULT compile_hr = D3DCompile(
+      kDescriptorReplayScalingPixelShader,
+      sizeof(kDescriptorReplayScalingPixelShader) - 1,
+      "descriptor_replay_scaling.hlsl", shader_macros, nullptr, "main",
+      "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, pixel_shader.put(),
+      compile_errors.put());
+  if (FAILED(compile_hr)) {
+    std::string message =
+        "failed to compile descriptor replay scaling pixel shader";
+    if (compile_errors && compile_errors->GetBufferPointer()) {
+      message += ": ";
+      message.append(static_cast<const char *>(
+                         compile_errors->GetBufferPointer()),
+                     compile_errors->GetBufferSize());
+    }
+    return message;
+  }
+  const D3D12_SHADER_BYTECODE pixel_bytecode = {
+      pixel_shader->GetBufferPointer(), pixel_shader->GetBufferSize()};
+  auto pipeline = context.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM, pixel_bytecode);
+  if (!pipeline)
+    return "failed to create descriptor replay scaling pipeline";
+
+  const std::array<float, 4> buffer_value = {1.0f, 1.0f, 1.0f, 1.0f};
+  auto buffer = context.CreateUploadBuffer(
+      sizeof(buffer_value), buffer_value.data(), sizeof(buffer_value));
+  std::vector<ComPtr<ID3D12Resource>> distinct_buffers;
+  if (pattern == DescriptorReplayPattern::RotatingTableDistinctContent) {
+    distinct_buffers.reserve(table_count);
+    for (unsigned int table = 0; table < table_count; ++table) {
+      auto distinct_buffer = context.CreateUploadBuffer(
+          sizeof(buffer_value), buffer_value.data(), sizeof(buffer_value));
+      if (!distinct_buffer)
+        return "failed to create distinct descriptor replay buffer";
+      distinct_buffers.push_back(std::move(distinct_buffer));
+    }
+  }
+  const std::array<std::uint16_t, 3> indices = {0, 1, 2};
+  auto index_buffer = context.CreateUploadBuffer(
+      sizeof(indices), indices.data(), sizeof(indices));
+  auto srv_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+      static_cast<UINT>(heap_descriptor_count), true);
+  if (!buffer || !index_buffer || !srv_heap)
+    return "failed to create descriptor replay scaling resources";
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Buffer.FirstElement = 0;
+  srv_desc.Buffer.NumElements = 1;
+  srv_desc.Buffer.StructureByteStride = sizeof(buffer_value);
+  for (unsigned int table = 0; table < table_count; ++table) {
+    const unsigned int table_base = table * descriptors_per_draw;
+    for (unsigned int descriptor = 0; descriptor < descriptors_per_draw;
+         ++descriptor) {
+      ID3D12Resource *descriptor_resource =
+          pattern == DescriptorReplayPattern::RotatingTableDistinctContent &&
+                  descriptor == 0
+              ? distinct_buffers[table].get()
+              : buffer.get();
+      context.device()->CreateShaderResourceView(
+          descriptor_resource, &srv_desc,
+          context.CpuDescriptorHandle(srv_heap.get(),
+                                      table_base + descriptor));
+    }
+  }
+
+  D3D12_INDEX_BUFFER_VIEW index_view = {};
+  index_view.BufferLocation = index_buffer->GetGPUVirtualAddress();
+  index_view.SizeInBytes = sizeof(indices);
+  index_view.Format = DXGI_FORMAT_R16_UINT;
+  const D3D12_VIEWPORT viewport = {0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, 32, 32};
+  const float clear_color[4] = {};
+  ID3D12DescriptorHeap *heaps[] = {srv_heap.get()};
+  auto record_draws = [&](unsigned int count, bool warmup) {
+    context.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+    context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    context.list()->SetGraphicsRootSignature(root_signature.get());
+    context.list()->SetPipelineState(pipeline.get());
+    context.list()->SetDescriptorHeaps(1, heaps);
+    context.list()->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context.list()->IASetIndexBuffer(&index_view);
+    context.list()->RSSetViewports(1, &viewport);
+    context.list()->RSSetScissorRects(1, &scissor);
+    for (unsigned int draw = 0; draw < count; ++draw) {
+      const unsigned int table =
+          warmup || pattern == DescriptorReplayPattern::StableTable ? 0
+                                                                     : draw;
+      context.list()->SetGraphicsRootDescriptorTable(
+          0, context.GpuDescriptorHandle(
+                 srv_heap.get(), table * descriptors_per_draw));
+      context.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
+    }
+  };
+
+  record_draws(1, true);
+  if (auto error = HResultError("descriptor replay warm-up list close",
+                                context.list()->Close()))
+    return error;
+  ID3D12CommandList *warmup_lists[] = {context.list()};
+  context.queue()->ExecuteCommandLists(1, warmup_lists);
+  if (auto error = HResultError("descriptor replay warm-up completion",
+                                context.SignalAndWait()))
+    return error;
+  if (auto error = HResultError("descriptor replay measured list reset",
+                                context.ResetCommandList()))
+    return error;
+
+  record_draws(draw_count, false);
+
+  const auto start = std::chrono::steady_clock::now();
+  if (auto error = HResultError("descriptor replay scaling list close",
+                                context.list()->Close()))
+    return error;
+  ID3D12CommandList *lists[] = {context.list()};
+  context.queue()->ExecuteCommandLists(1, lists);
+  if (auto error = HResultError("descriptor replay scaling queue completion",
+                                context.SignalAndWait()))
+    return error;
+  const auto end = std::chrono::steady_clock::now();
+  if (submit_ms)
+    *submit_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+
+  if (auto error = HResultError("descriptor replay scaling list reset",
+                                context.ResetCommandList()))
+    return error;
+  D3D12TestContext::Transition(
+      context.list(), render_target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  if (auto error = HResultError(
+          "descriptor replay scaling readback",
+          context.ReadbackTexture(render_target.get(), &readback)))
+    return error;
+  if (readback.data.size() < sizeof(std::uint32_t))
+    return "descriptor replay scaling readback was empty";
+  std::uint32_t pixel = 0;
+  std::memcpy(&pixel, readback.data.data(), sizeof(pixel));
+  if (pixel != 0xffffffffu) {
+    std::ostringstream message;
+    message << "descriptor replay scaling readback was 0x" << std::hex
+            << pixel;
+    return message.str();
+  }
+  return std::nullopt;
+}
+
 template <typename Scenario>
 void RunIntegrationBenchmark(benchmark::State &state, Scenario scenario,
                              std::int64_t item_count) {
@@ -802,6 +1025,123 @@ void BI_D3D12IndexedDescriptorSnapshotReuse(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * kOversizedDescriptorRangeDraws);
 }
 
+void RunDescriptorReplayScalingBenchmark(benchmark::State &state,
+                                         DescriptorReplayPattern pattern) {
+  const auto draw_count = static_cast<unsigned int>(state.range(0));
+  const auto descriptors_per_draw =
+      static_cast<unsigned int>(state.range(1));
+  for (auto _ : state) {
+    double submit_ms = 0.0;
+    if (IntegrationError error = RunDescriptorReplayScalingScenario(
+            draw_count, descriptors_per_draw, pattern, &submit_ms)) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+    state.counters["submit_ms"] = submit_ms;
+    state.counters["submit_us_per_draw"] =
+        submit_ms * 1000.0 / draw_count;
+    state.counters["draws"] = draw_count;
+    state.counters["descriptors_per_draw"] = descriptors_per_draw;
+    state.counters["unique_table_states"] =
+        pattern == DescriptorReplayPattern::StableTable ? 1 : draw_count;
+    state.counters["unique_content_states"] =
+        pattern == DescriptorReplayPattern::RotatingTableDistinctContent
+            ? draw_count
+            : 1;
+    state.counters["full_snapshot_entries"] =
+        static_cast<double>(draw_count) * descriptors_per_draw;
+    state.counters["journal_changed_entries"] =
+        pattern == DescriptorReplayPattern::RotatingTableDistinctContent
+            ? descriptors_per_draw + draw_count - 1
+            : descriptors_per_draw;
+  }
+  state.SetItemsProcessed(state.iterations() * draw_count);
+}
+
+void BI_D3D12BindlessReplayStable(benchmark::State &state) {
+  RunDescriptorReplayScalingBenchmark(state,
+                                      DescriptorReplayPattern::StableTable);
+}
+
+void BI_D3D12BindlessReplayTableChurn(benchmark::State &state) {
+  RunDescriptorReplayScalingBenchmark(
+      state, DescriptorReplayPattern::RotatingTableStableContent);
+}
+
+void BI_D3D12BindlessReplayDescriptorChurn(benchmark::State &state) {
+  RunDescriptorReplayScalingBenchmark(
+      state, DescriptorReplayPattern::RotatingTableDistinctContent);
+}
+
+struct DescriptorHazardBenchRecord {
+  std::uint64_t resource = 0;
+  std::uint64_t allocation = 0;
+  std::uint32_t state = 0;
+  std::uint32_t stage = 0;
+};
+
+void AccumulateDescriptorHazard(const DescriptorHazardBenchRecord &record,
+                                std::uint64_t *checksum) {
+  auto value = *checksum ^ record.resource;
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+  value ^= record.allocation + (std::uint64_t(record.state) << 32) +
+           record.stage;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+  *checksum = value ^ (value >> 31);
+}
+
+std::vector<DescriptorHazardBenchRecord>
+MakeDescriptorHazardRecords(unsigned int count) {
+  std::vector<DescriptorHazardBenchRecord> records(count);
+  for (unsigned int i = 0; i < count; ++i) {
+    records[i] = {0x10000000ull + i * 0x1000ull,
+                  0x20000000ull + i * 0x2000ull, i & 7u, i & 3u};
+  }
+  return records;
+}
+
+void BI_D3D12DescriptorFullSnapshotScan(benchmark::State &state) {
+  const auto draw_count = static_cast<unsigned int>(state.range(0));
+  const auto descriptors_per_draw =
+      static_cast<unsigned int>(state.range(1));
+  const auto descriptors = MakeDescriptorHazardRecords(descriptors_per_draw);
+  for (auto _ : state) {
+    std::uint64_t checksum = 0;
+    for (unsigned int draw = 0; draw < draw_count; ++draw) {
+      for (const auto &descriptor : descriptors)
+        AccumulateDescriptorHazard(descriptor, &checksum);
+    }
+    benchmark::DoNotOptimize(checksum);
+  }
+  state.counters["visited_entries"] =
+      static_cast<double>(draw_count) * descriptors_per_draw;
+  state.SetItemsProcessed(state.iterations() * draw_count *
+                          descriptors_per_draw);
+}
+
+void BI_D3D12DescriptorJournalDeltaScan(benchmark::State &state) {
+  const auto draw_count = static_cast<unsigned int>(state.range(0));
+  const auto descriptors_per_draw =
+      static_cast<unsigned int>(state.range(1));
+  const auto descriptors = MakeDescriptorHazardRecords(descriptors_per_draw);
+  for (auto _ : state) {
+    dxmt::d3d12::DescriptorChangeJournal journal(
+        std::max<unsigned int>(256, descriptors_per_draw * 2));
+    auto cursor = journal.cursor();
+    std::uint64_t checksum = 0;
+    for (unsigned int draw = 0; draw < draw_count; ++draw) {
+      journal.Record(draw % descriptors_per_draw, draw + 1);
+      const auto changes = journal.ChangesSince(cursor);
+      for (const auto &change : changes.changes)
+        AccumulateDescriptorHazard(descriptors[change.slot], &checksum);
+      cursor = changes.cursor;
+    }
+    benchmark::DoNotOptimize(checksum);
+  }
+  state.counters["visited_entries"] = draw_count;
+  state.SetItemsProcessed(state.iterations() * draw_count);
+}
+
 BENCHMARK(BI_D3D12MixedEncoderBarrierOnly)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12MixedEncoderCopyTransitions)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12FenceOnlyBarrierChain)->Iterations(1)->UseRealTime();
@@ -821,5 +1161,44 @@ BENCHMARK(BI_D3D12OversizedDescriptorRangeDraws)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12IndexedDescriptorSnapshotReuse)
     ->Iterations(1)
     ->UseRealTime();
+BENCHMARK(BI_D3D12BindlessReplayStable)
+    ->Args({128, 32})
+    ->Args({512, 4})
+    ->Args({512, 16})
+    ->Args({512, 32})
+    ->Args({2048, 32})
+    ->ArgNames({"draws", "descriptors"})
+    ->Iterations(1)
+    ->UseRealTime();
+BENCHMARK(BI_D3D12BindlessReplayTableChurn)
+    ->Args({128, 32})
+    ->Args({512, 4})
+    ->Args({512, 16})
+    ->Args({512, 32})
+    ->Args({2048, 32})
+    ->ArgNames({"draws", "descriptors"})
+    ->Iterations(1)
+    ->UseRealTime();
+BENCHMARK(BI_D3D12BindlessReplayDescriptorChurn)
+    ->Args({128, 32})
+    ->Args({512, 4})
+    ->Args({512, 16})
+    ->Args({512, 32})
+    ->Args({2048, 32})
+    ->ArgNames({"draws", "descriptors"})
+    ->Iterations(1)
+    ->UseRealTime();
+BENCHMARK(BI_D3D12DescriptorFullSnapshotScan)
+    ->Args({128, 32})
+    ->Args({512, 32})
+    ->Args({2048, 32})
+    ->Args({8192, 32})
+    ->ArgNames({"draws", "descriptors"});
+BENCHMARK(BI_D3D12DescriptorJournalDeltaScan)
+    ->Args({128, 32})
+    ->Args({512, 32})
+    ->Args({2048, 32})
+    ->Args({8192, 32})
+    ->ArgNames({"draws", "descriptors"});
 
 } // namespace

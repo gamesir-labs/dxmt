@@ -4,6 +4,7 @@
 #include "winemetal.h"
 #include "dxmt_descriptor_mirror.hpp"
 #include "dxmt_descriptor_revision.hpp"
+#include "d3d12_descriptor_journal.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <cstdint>
 #include <mutex>
@@ -154,8 +155,8 @@ struct DescriptorSamplerSlotPayload {
  *
  * A D3D12 descriptor heap has a single type, so each shader-visible heap backs exactly
  * one mirror array:
- *   - CBV_SRV_UAV heap -> a planar TEXTURE mirror for the legacy fallback plus
- *     the native three-qword descriptor table, buffer descriptor records, and
+ *   - CBV_SRV_UAV heap -> a planar TEXTURE mirror for the bindless-mirror ABI
+ *     plus the native three-qword descriptor table, buffer descriptor records, and
  *     resource table. Native buffer descriptors are materialized on write and
  *     resolve allocation identity through the resource table.
  *   - SAMPLER heap -> a planar SAMPLER mirror: typed sampler handles, cube
@@ -175,8 +176,8 @@ struct DescriptorSamplerSlotPayload {
  *     write/copy time using the pool slot resource ID.
  *
  * The runtime allocates this for shader-visible CBV/SRV/UAV and SAMPLER heaps.
- * Unsupported shader paths may still fall back to legacy bindings, but descriptor
- * heap mirroring itself is not selected by an environment variable.
+ * Every D3D12 shader-visible heap owns this backing; descriptor architecture is
+ * not selected by an environment variable.
  */
 class DescriptorHeapMirror {
 public:
@@ -320,6 +321,16 @@ public:
     return buffer_resource_table_generation_;
   }
 
+  uint64_t changeJournalCursor() const {
+    std::lock_guard lock(mutex_);
+    return change_journal_.cursor();
+  }
+
+  DescriptorChangeSet changesSince(uint64_t cursor) const {
+    std::lock_guard lock(mutex_);
+    return change_journal_.ChangesSince(cursor);
+  }
+
   void WriteNullTableEntry(uint32_t index);
   void WriteBufferTableEntry(uint32_t index, uint64_t gpu_va, uint64_t size,
                              bool typed, uint32_t texture_view_offset = 0);
@@ -389,8 +400,7 @@ public:
   /**
    * Fill a TEXTURE slot with an already-resolved (gpuResourceID, arrayLength, minLOD).
    * Texture pool resource IDs may be written on the app thread; typed buffer view
-   * payloads are still resolved on the encode thread. Byte-identical to the legacy DXBC
-   * resource writer.
+   * payloads are still resolved on the encode thread.
    */
   bool FillTextureSlot(
       uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
@@ -520,6 +530,7 @@ private:
   // Every write sets this flag and every completed fill clears it under
   // mutex_. The epoch+sequence pair also prevents finite-width ABA.
   std::vector<uint8_t> needs_fill_;
+  DescriptorChangeJournal change_journal_;
   mutable std::recursive_mutex mutex_;
 };
 

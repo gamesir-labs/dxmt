@@ -25,13 +25,6 @@ class Sampler;
 
 namespace dxmt::d3d12 {
 
-/**
- * Whether shader-visible D3D12 descriptor heaps use the unified descriptor
- * mirror backing. This is an implementation capability, not a user-selectable
- * architecture switch.
- */
-bool IsBindlessMirrorEnabled();
-
 enum class DescriptorRecordType {
   Empty,
   ConstantBufferView,

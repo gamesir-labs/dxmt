@@ -1284,12 +1284,10 @@ ArgumentEncodingContext::bindBindlessTables(
       if (state.valid && state.index >= 27 && state.index <= 30)
         state.valid = false;
     }
-    static_cast<ComputeEncoderData *>(encoder_current)->bindless_mirror_bound_29_30 = true;
   } else {
-    static_assert(stage == PipelineStage::Vertex || stage == PipelineStage::Pixel,
-                  "bindless-mirror render binds support only Vertex/Pixel (no GS/HS/DS)");
     constexpr WMTRenderStages stages =
-        stage == PipelineStage::Vertex ? WMTRenderStageVertex : WMTRenderStageFragment;
+        stage == PipelineStage::Pixel ? WMTRenderStageFragment
+                                      : WMTRenderStageVertex;
     invalidateNativeArgumentBuffers(false, stages);
     auto bind = [&](WMT::Buffer buffer, uint64_t offset, uint8_t index) {
       if (!buffer)
@@ -1310,7 +1308,6 @@ ArgumentEncodingContext::bindBindlessTables(
           state.index >= 27 && state.index <= 30)
         state.valid = false;
     }
-    currentRenderEncoder()->bindless_mirror_bound_29_30 = true;
   }
 }
 
@@ -1325,12 +1322,9 @@ ArgumentEncodingContext::bindNativeRootTableBases(
     bindNativeArgumentBuffer(root_bases.gpu_buffer, root_bases.offset,
                              bind_index, true);
   } else {
-    static_assert(stage == PipelineStage::Vertex ||
-                      stage == PipelineStage::Pixel,
-                  "native root table base binds support only Vertex/Pixel/Compute");
     constexpr WMTRenderStages stages =
-        stage == PipelineStage::Vertex ? WMTRenderStageVertex
-                                       : WMTRenderStageFragment;
+        stage == PipelineStage::Pixel ? WMTRenderStageFragment
+                                      : WMTRenderStageVertex;
     bindNativeArgumentBuffer(root_bases.gpu_buffer, root_bases.offset,
                              bind_index, false, stages);
   }
@@ -1463,82 +1457,28 @@ ArgumentEncodingContext::invalidateNativeArgumentBuffers(
   }
 }
 
-// restorePerPassArgbufIfMirrorBound (mixed-PSO guard): a bindless draw rebinds
-// argument-buffer slots to per-draw tables and mirrors. A following legacy draw
-// may emit only setArgumentBufferOffset commands, so restore the per-pass
-// argbuf at every legacy slot the bindless path may have overwritten.
-template <bool compute>
-bool
-ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound() {
-  if constexpr (compute) {
-    auto *data = static_cast<ComputeEncoderData *>(encoder_current);
-    if (!data->bindless_mirror_bound_29_30)
-      return false;
-    auto argbuf = data->allocated_argbuf;
-    auto bind = [&](uint8_t index) {
-      auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbuffer>();
-      cmd.type = WMTComputeCommandSetArgumentBuffer;
-      cmd.buffer = argbuf;
-      cmd.offset = 0;
-      cmd.index = index;
-    };
-    bind(27);
-    bind(28);
-    bind(29);
-    bind(30);
-    for (auto &state : data->argument_buffer_offsets) {
-      if (state.valid && state.index >= 27 && state.index <= 30)
-        state.valid = false;
-    }
-    data->bindless_mirror_bound_29_30 = false;
-    return true;
-  } else {
-    auto *data = currentRenderEncoder();
-    if (!data->bindless_mirror_bound_29_30)
-      return false;
-    auto argbuf = data->allocated_argbuf;
-    auto bind = [&](WMTRenderStages stages, uint8_t index) {
-      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbuffer>();
-      cmd.type = WMTRenderCommandSetArgumentBuffer;
-      cmd.buffer = argbuf;
-      cmd.offset = 0;
-      cmd.index = index;
-      cmd.stages = stages;
-    };
-    bind(WMTRenderStageVertex, 16);
-    bind(WMTRenderStageVertex, 27);
-    bind(WMTRenderStageVertex, 28);
-    bind(WMTRenderStageVertex, 29);
-    bind(WMTRenderStageVertex, 30);
-    bind(WMTRenderStageFragment, 27);
-    bind(WMTRenderStageFragment, 28);
-    bind(WMTRenderStageFragment, 29);
-    bind(WMTRenderStageFragment, 30);
-    for (auto &state : data->argument_buffer_offsets) {
-      if (!state.valid)
-        continue;
-      const bool restored_stage = state.stages & (WMTRenderStageVertex |
-                                                  WMTRenderStageFragment);
-      if (restored_stage &&
-          (state.index == 16 || (state.index >= 27 && state.index <= 30)))
-        state.valid = false;
-    }
-    data->bindless_mirror_bound_29_30 = false;
-    return true;
-  }
-}
-
 template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
 template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
 template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Compute, PipelineKind::Ordinary>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Geometry, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Geometry>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Vertex, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Hull, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Domain, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
+template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Geometry>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Hull>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Domain>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, uint32_t);
 template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, uint32_t);
 template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, uint32_t);
-template bool ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound<false>();
-template bool ArgumentEncodingContext::restorePerPassArgbufIfMirrorBound<true>();
+template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Geometry>(const AllocatedArgumentBufferSlice &, uint32_t);
+template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Hull>(const AllocatedArgumentBufferSlice &, uint32_t);
+template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Domain>(const AllocatedArgumentBufferSlice &, uint32_t);
 
 inline uint64_t
 TextureMetadata(uint32_t array_length, float min_lod) {
