@@ -432,6 +432,7 @@ struct CompiledCommandBuildState {
   std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
   std::uint64_t vertex_buffer_dirty_mask = 0;
   bool index_buffer_dirty = false;
+  bool predication_active = false;
   CompiledCommandRenderState render_state;
 };
 
@@ -776,6 +777,8 @@ UpdateCompiledCommandBuildState(CompiledCommandBuildState &state,
     auto &descriptors = record->compute ? state.compute_root_descriptors
                                         : state.graphics_root_descriptors;
     UpsertCompiledRootDescriptor(descriptors, *record);
+  } else if (const auto *record = std::get_if<PredicationRecord>(&payload)) {
+    state.predication_active = record->buffer.ptr() != nullptr;
   } else if (const auto *record = std::get_if<VertexBuffersRecord>(&payload)) {
     for (UINT i = 0;
          i < record->view_count &&
@@ -1410,8 +1413,10 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     if (std::holds_alternative<DrawInstancedRecord>(record.payload) ||
         std::holds_alternative<DrawIndexedInstancedRecord>(record.payload)) {
       const auto &metadata = GetCompiledPipelineMetadata(state, false);
-      const auto reason =
-          CompiledPipelineFallbackReasonFromMetadata(metadata, false);
+      const auto reason = state.predication_active
+                              ? CompiledCommandFallbackReason::QueryOrPredication
+                              : CompiledPipelineFallbackReasonFromMetadata(
+                                    metadata, false);
       if (reason == CompiledCommandFallbackReason::None) {
         auto packet = BuildCompiledGraphicsPacket(record, record_index, state,
                                                   metadata);
@@ -1436,8 +1441,10 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
       }
     } else if (std::holds_alternative<DispatchRecord>(record.payload)) {
       const auto &metadata = GetCompiledPipelineMetadata(state, true);
-      const auto reason =
-          CompiledPipelineFallbackReasonFromMetadata(metadata, true);
+      const auto reason = state.predication_active
+                              ? CompiledCommandFallbackReason::QueryOrPredication
+                              : CompiledPipelineFallbackReasonFromMetadata(
+                                    metadata, true);
       if (reason == CompiledCommandFallbackReason::None) {
         auto packet = BuildCompiledComputePacket(record, record_index, state,
                                                  metadata);

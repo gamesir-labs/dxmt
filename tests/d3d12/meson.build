@@ -38,6 +38,12 @@ d3d12_unit_suites = {
   'pipeline': {
     'sources': files('pipeline/stream_spec.cpp'),
   },
+  'query': {
+    'sources': files(
+      'query/indirect_spec.cpp',
+      'query/predication_spec.cpp',
+    ),
+  },
   'queue': {
     'sources': files('queue/queue_spec.cpp'),
   },
