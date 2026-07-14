@@ -48,6 +48,41 @@ TEST(CheckedArithmetic, AlignsWithoutWrapping) {
   EXPECT_EQ(result, 31u);
 }
 
+TEST(CheckedArithmetic, RejectsNegativeAndNarrowingOperandsWithoutMutation) {
+  std::uint8_t result = 19;
+
+  EXPECT_FALSE(dxmt::CheckedAdd(-1, 1, result));
+  EXPECT_EQ(result, 19u);
+  EXPECT_FALSE(dxmt::CheckedMultiply(1, -1, result));
+  EXPECT_EQ(result, 19u);
+  EXPECT_FALSE(dxmt::CheckedAlign(256, 16, result));
+  EXPECT_EQ(result, 19u);
+  EXPECT_FALSE(dxmt::CheckedAlign(1, -2, result));
+  EXPECT_EQ(result, 19u);
+}
+
+TEST(CheckedArithmetic, HandlesMixedWidthsAndNonPowerOfTwoAlignment) {
+  std::uint16_t wide_result = 0;
+  EXPECT_TRUE(dxmt::CheckedAdd(std::uint8_t{250}, std::uint64_t{5},
+                               wide_result));
+  EXPECT_EQ(wide_result, 255u);
+  EXPECT_TRUE(dxmt::CheckedMultiply(std::uint32_t{15}, std::uint8_t{17},
+                                    wide_result));
+  EXPECT_EQ(wide_result, 255u);
+  EXPECT_TRUE(dxmt::CheckedAlign(std::uint8_t{255}, std::uint32_t{24},
+                                 wide_result));
+  EXPECT_EQ(wide_result, 264u);
+  EXPECT_TRUE(dxmt::CheckedAlign(std::uint16_t{240}, std::uint8_t{24},
+                                 wide_result));
+  EXPECT_EQ(wide_result, 240u);
+
+  std::uint8_t narrow_result = 7;
+  EXPECT_TRUE(dxmt::CheckedAdd(250, 5, narrow_result));
+  EXPECT_EQ(narrow_result, 255u);
+  EXPECT_FALSE(dxmt::CheckedAdd(250, 6, narrow_result));
+  EXPECT_EQ(narrow_result, 255u);
+}
+
 TEST(LegacyBufferSlice, RejectsRangesThatTheShaderAbiWouldTruncate) {
   constexpr auto maximum = std::numeric_limits<std::uint32_t>::max();
   EXPECT_TRUE(dxmt::LegacyBufferSliceRepresentable(maximum, maximum));

@@ -80,4 +80,69 @@ TEST(ResourceSubset, DepthAndStencilPlanesCanBeTrackedIndependently) {
   EXPECT_TRUE(stencil_only.overlapWith(both));
 }
 
+TEST(ResourceSubset, DifferentSubsetKindsNeverOverlap) {
+  const dxmt::ResourceSubsetState buffer(0, 16);
+  const auto view =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 1, 0, 1);
+  const dxmt::ResourceSubsetState texture(&view, 1, 1);
+
+  EXPECT_FALSE(buffer.overlapWith(texture));
+  EXPECT_FALSE(texture.overlapWith(buffer));
+}
+
+TEST(ResourceSubset, EmptyTextureRangesNeverOverlap) {
+  const auto compact_full =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 1, 0, 1);
+  const auto compact_empty_mips =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 0, 0, 1);
+  const auto large_full =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 1, 0, 1);
+  const auto large_empty_slices =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 1, 0, 0);
+
+  const dxmt::ResourceSubsetState compact(&compact_full, 4, 4);
+  const dxmt::ResourceSubsetState compact_empty(&compact_empty_mips, 4, 4);
+  const dxmt::ResourceSubsetState large(&large_full, 16, 4);
+  const dxmt::ResourceSubsetState large_empty(&large_empty_slices, 16, 4);
+  EXPECT_FALSE(compact.overlapWith(compact_empty));
+  EXPECT_FALSE(compact_empty.overlapWith(compact));
+  EXPECT_FALSE(large.overlapWith(large_empty));
+  EXPECT_FALSE(large_empty.overlapWith(large));
+}
+
+TEST(ResourceSubset, PreservesSemanticsAcrossCompactMaskBoundary) {
+  const auto last_mip =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 14, 1, 3, 1);
+  const auto adjacent_mip =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 13, 1, 3, 1);
+  const auto other_slice =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 14, 1, 2, 1);
+
+  const dxmt::ResourceSubsetState compact(&last_mip, 15, 4);
+  const dxmt::ResourceSubsetState compact_adjacent(&adjacent_mip, 15, 4);
+  const dxmt::ResourceSubsetState compact_other_slice(&other_slice, 15, 4);
+  EXPECT_TRUE(compact.overlapWith(compact));
+  EXPECT_FALSE(compact.overlapWith(compact_adjacent));
+  EXPECT_FALSE(compact.overlapWith(compact_other_slice));
+
+  const dxmt::ResourceSubsetState ranged(&last_mip, 15, 5);
+  const dxmt::ResourceSubsetState ranged_adjacent(&adjacent_mip, 15, 5);
+  const dxmt::ResourceSubsetState ranged_other_slice(&other_slice, 15, 5);
+  EXPECT_TRUE(ranged.overlapWith(ranged));
+  EXPECT_FALSE(ranged.overlapWith(ranged_adjacent));
+  EXPECT_FALSE(ranged.overlapWith(ranged_other_slice));
+}
+
+TEST(ResourceSubset, LargeRangesKeepDepthAndStencilPlanesIndependent) {
+  const auto view =
+      MakeTextureView(WMTPixelFormatDepth32Float_Stencil8, 3, 2, 1, 1);
+  const dxmt::ResourceSubsetState depth_only(&view, 16, 2, 0b10);
+  const dxmt::ResourceSubsetState stencil_only(&view, 16, 2, 0b01);
+  const dxmt::ResourceSubsetState both(&view, 16, 2);
+
+  EXPECT_FALSE(depth_only.overlapWith(stencil_only));
+  EXPECT_TRUE(depth_only.overlapWith(both));
+  EXPECT_TRUE(stencil_only.overlapWith(both));
+}
+
 } // namespace

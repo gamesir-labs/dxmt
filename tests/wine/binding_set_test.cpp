@@ -112,4 +112,34 @@ TEST(BindingSet, MoveMarksEveryBoundSlotDirty) {
   EXPECT_EQ(moved[4].value, 42);
 }
 
+TEST(BindingSet, MoveAssignmentReplacesAllStateAndMarksBindingsDirty) {
+  dxmt::BindingSet<dxmt::TestBinding, 130> source;
+  bool replaced = false;
+  source.bind(0, dxmt::TestBinding{10}, replaced, false);
+  source.bind(65, dxmt::TestBinding{20}, replaced, true);
+  source.bind(129, dxmt::TestBinding{30}, replaced, false);
+  source.clear_dirty();
+
+  dxmt::BindingSet<dxmt::TestBinding, 130> destination;
+  destination.bind(1, dxmt::TestBinding{99}, replaced, true);
+  destination = std::move(source);
+
+  EXPECT_FALSE(destination.test_bound(1));
+  for (const auto slot : {0u, 65u, 129u}) {
+    EXPECT_TRUE(destination.test_bound(slot));
+    EXPECT_TRUE(destination.test_dirty(slot));
+  }
+
+  std::vector<size_t> hazards;
+  for (auto it = destination.hazard_begin(); it != destination.hazard_end();
+       ++it)
+    hazards.push_back((*it).first);
+  EXPECT_EQ(hazards, (std::vector<size_t>{65}));
+
+  std::vector<int> values;
+  for (const auto [slot, value] : destination)
+    values.push_back(value.value);
+  EXPECT_EQ(values, (std::vector<int>{10, 20, 30}));
+}
+
 } // namespace
