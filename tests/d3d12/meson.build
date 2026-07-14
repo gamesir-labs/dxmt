@@ -75,6 +75,7 @@ d3d12_unit_suites = {
   },
   'transfer': {
     'sources': files(
+      'transfer/clear_rtv_spec.cpp',
       'transfer/clear_uav_spec.cpp',
       'transfer/copy_resource_spec.cpp',
     ),

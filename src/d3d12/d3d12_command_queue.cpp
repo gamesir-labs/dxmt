@@ -21168,10 +21168,24 @@ private:
     const UINT array_length = GetRenderTargetArrayLength(record.descriptor);
     WMTClearColor color = {record.color[0], record.color[1], record.color[2],
                            record.color[3]};
-    const bool has_rects = !record.rects.empty();
-    chunk->emitcc([texture = std::move(texture), view, array_length,
-                   color, has_rects](ArgumentEncodingContext &enc) mutable {
-      enc.clearColor(std::move(texture), view, array_length, color, has_rects);
+    if (record.rects.empty()) {
+      chunk->emitcc([texture = std::move(texture), view, array_length,
+                     color](ArgumentEncodingContext &enc) mutable {
+        enc.clearColor(std::move(texture), view, array_length, color);
+      });
+      return;
+    }
+
+    chunk->emitcc([texture = std::move(texture), view, color = record.color,
+                   rects = record.rects](ArgumentEncodingContext &enc) mutable {
+      enc.clear_rt_cmd.begin(std::move(texture), view);
+      for (const auto &rect : rects) {
+        if (rect.right <= rect.left || rect.bottom <= rect.top)
+          continue;
+        enc.clear_rt_cmd.clear(rect.left, rect.top, rect.right - rect.left,
+                               rect.bottom - rect.top, color);
+      }
+      enc.clear_rt_cmd.end();
     });
   }
 
