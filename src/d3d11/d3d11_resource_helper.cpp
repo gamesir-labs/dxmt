@@ -403,7 +403,8 @@ CreateMTLTextureDescriptorInternal(
   pDescOut->options = options;
 
   if (MipLevels == 0) {
-    pDescOut->mipmap_level_count = 32 - __builtin_clz(Width | Height);
+    pDescOut->mipmap_level_count =
+        32 - __builtin_clz(Width | Height | Depth);
   } else {
     pDescOut->mipmap_level_count = MipLevels;
   }

@@ -852,4 +852,130 @@ TEST_F(D3D11ResourceSpec, RejectsZeroSizedBufferAndClearsOutput) {
   EXPECT_EQ(buffer, nullptr);
 }
 
+TEST_F(D3D11ResourceSpec, RejectsZeroSizedTexturesAndClearsOutputs) {
+  D3D11_TEXTURE1D_DESC desc1d = {};
+  desc1d.ArraySize = 1;
+  desc1d.MipLevels = 1;
+  desc1d.Format = DXGI_FORMAT_R8_UINT;
+  desc1d.Usage = D3D11_USAGE_DEFAULT;
+  ID3D11Texture1D *texture1d =
+      reinterpret_cast<ID3D11Texture1D *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateTexture1D(
+      &desc1d, nullptr, &texture1d)));
+  EXPECT_EQ(texture1d, nullptr);
+
+  D3D11_TEXTURE2D_DESC desc2d = {};
+  desc2d.Width = 1;
+  desc2d.MipLevels = 1;
+  desc2d.ArraySize = 1;
+  desc2d.Format = DXGI_FORMAT_R8_UINT;
+  desc2d.SampleDesc.Count = 1;
+  desc2d.Usage = D3D11_USAGE_DEFAULT;
+  ID3D11Texture2D *texture2d =
+      reinterpret_cast<ID3D11Texture2D *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateTexture2D(
+      &desc2d, nullptr, &texture2d)));
+  EXPECT_EQ(texture2d, nullptr);
+
+  D3D11_TEXTURE3D_DESC desc3d = {};
+  desc3d.Width = 1;
+  desc3d.Height = 1;
+  desc3d.MipLevels = 1;
+  desc3d.Format = DXGI_FORMAT_R8_UINT;
+  desc3d.Usage = D3D11_USAGE_DEFAULT;
+  ID3D11Texture3D *texture3d =
+      reinterpret_cast<ID3D11Texture3D *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateTexture3D(
+      &desc3d, nullptr, &texture3d)));
+  EXPECT_EQ(texture3d, nullptr);
+}
+
+TEST_F(D3D11ResourceSpec, RejectsBindFlagsForEveryStagingTextureDimension) {
+  D3D11_TEXTURE1D_DESC desc1d = {};
+  desc1d.Width = 4;
+  desc1d.MipLevels = 1;
+  desc1d.ArraySize = 1;
+  desc1d.Format = DXGI_FORMAT_R8_UINT;
+  desc1d.Usage = D3D11_USAGE_STAGING;
+  desc1d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  desc1d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Texture1D *texture1d =
+      reinterpret_cast<ID3D11Texture1D *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateTexture1D(
+      &desc1d, nullptr, &texture1d)));
+  EXPECT_EQ(texture1d, nullptr);
+
+  D3D11_TEXTURE2D_DESC desc2d = {};
+  desc2d.Width = 4;
+  desc2d.Height = 4;
+  desc2d.MipLevels = 1;
+  desc2d.ArraySize = 1;
+  desc2d.Format = DXGI_FORMAT_R8_UINT;
+  desc2d.SampleDesc.Count = 1;
+  desc2d.Usage = D3D11_USAGE_STAGING;
+  desc2d.BindFlags = D3D11_BIND_RENDER_TARGET;
+  desc2d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Texture2D *texture2d =
+      reinterpret_cast<ID3D11Texture2D *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateTexture2D(
+      &desc2d, nullptr, &texture2d)));
+  EXPECT_EQ(texture2d, nullptr);
+
+  D3D11_TEXTURE3D_DESC desc3d = {};
+  desc3d.Width = 4;
+  desc3d.Height = 4;
+  desc3d.Depth = 4;
+  desc3d.MipLevels = 1;
+  desc3d.Format = DXGI_FORMAT_R8_UINT;
+  desc3d.Usage = D3D11_USAGE_STAGING;
+  desc3d.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  desc3d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  ID3D11Texture3D *texture3d =
+      reinterpret_cast<ID3D11Texture3D *>(uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateTexture3D(
+      &desc3d, nullptr, &texture3d)));
+  EXPECT_EQ(texture3d, nullptr);
+}
+
+TEST_F(D3D11ResourceSpec, ExpandsAutomaticMipChainsFromTheLargestDimension) {
+  D3D11_TEXTURE1D_DESC desc1d = {};
+  desc1d.Width = 7;
+  desc1d.ArraySize = 1;
+  desc1d.Format = DXGI_FORMAT_R8_UINT;
+  desc1d.Usage = D3D11_USAGE_DEFAULT;
+  desc1d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  ComPtr<ID3D11Texture1D> texture1d;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture1D(
+      &desc1d, nullptr, texture1d.put())));
+  texture1d->GetDesc(&desc1d);
+  EXPECT_EQ(desc1d.MipLevels, 3u);
+
+  D3D11_TEXTURE2D_DESC desc2d = {};
+  desc2d.Width = 3;
+  desc2d.Height = 9;
+  desc2d.ArraySize = 1;
+  desc2d.Format = DXGI_FORMAT_R8_UINT;
+  desc2d.SampleDesc.Count = 1;
+  desc2d.Usage = D3D11_USAGE_DEFAULT;
+  desc2d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  ComPtr<ID3D11Texture2D> texture2d;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &desc2d, nullptr, texture2d.put())));
+  texture2d->GetDesc(&desc2d);
+  EXPECT_EQ(desc2d.MipLevels, 4u);
+
+  D3D11_TEXTURE3D_DESC desc3d = {};
+  desc3d.Width = 2;
+  desc3d.Height = 3;
+  desc3d.Depth = 17;
+  desc3d.Format = DXGI_FORMAT_R8_UINT;
+  desc3d.Usage = D3D11_USAGE_DEFAULT;
+  desc3d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  ComPtr<ID3D11Texture3D> texture3d;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture3D(
+      &desc3d, nullptr, texture3d.put())));
+  texture3d->GetDesc(&desc3d);
+  EXPECT_EQ(desc3d.MipLevels, 5u);
+}
+
 } // namespace
