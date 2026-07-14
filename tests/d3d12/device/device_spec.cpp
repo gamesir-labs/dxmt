@@ -177,28 +177,6 @@ std::vector<std::string> ExtractAirCacheKeys(std::string_view marker,
   return keys;
 }
 
-ID3D12PipelineState *CreateBasicGraphicsPipeline(ID3D12Device *device) {
-  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.Flags =
-      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-  auto *root_signature = CreateRootSignature(device, root_desc);
-  if (!root_signature)
-    return nullptr;
-  auto desc = BasicGraphicsPipelineDesc(root_signature);
-  ID3D12PipelineState *pipeline = nullptr;
-  const auto hr = device->CreateGraphicsPipelineState(
-      &desc, __uuidof(ID3D12PipelineState),
-      reinterpret_cast<void **>(&pipeline));
-  release_object(root_signature);
-  return SUCCEEDED(hr) ? pipeline : nullptr;
-}
-
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
-struct alignas(void *) ShaderPipelineSubobject {
-  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
-  D3D12_SHADER_BYTECODE shader = {};
-};
-
 class D3D12DeviceSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -526,31 +504,6 @@ TEST_F(D3D12DeviceSpec, RejectsStateChangingIndirectSignatures) {
   release_object(signature);
 }
 
-TEST(D3D12RootSignatureSpec, AcceptsTheFull64DwordRootConstantBudget) {
-  D3D12_ROOT_PARAMETER parameter = {};
-  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  parameter.Constants.Num32BitValues = D3D12_MAX_ROOT_COST;
-  D3D12_ROOT_SIGNATURE_DESC desc = {};
-  desc.NumParameters = 1;
-  desc.pParameters = &parameter;
-
-  ID3DBlob *blob = nullptr;
-  ID3DBlob *error = nullptr;
-  HRESULT hr = D3D12SerializeRootSignature(
-      &desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
-  EXPECT_EQ(hr, S_OK);
-  EXPECT_NE(blob, nullptr);
-  release_object(blob);
-  release_object(error);
-
-  parameter.Constants.Num32BitValues = D3D12_MAX_ROOT_COST + 1;
-  hr = D3D12SerializeRootSignature(
-      &desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
-  EXPECT_EQ(hr, E_INVALIDARG);
-  EXPECT_EQ(blob, nullptr);
-  release_object(error);
-}
-
 TEST_F(D3D12DeviceSpec, RejectsUnadvertisedRootSignature12Inputs) {
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {};
   desc.Version = static_cast<D3D_ROOT_SIGNATURE_VERSION>(3);
@@ -769,29 +722,3 @@ TEST_F(D3D12DeviceSpec, IgnoresBlendStateForUnwrittenPixelShaderTarget) {
   release_object(pipeline);
   release_object(root_signature);
 }
-
-#ifdef __ID3D12Device2_INTERFACE_DEFINED__
-TEST_F(D3D12DeviceSpec, RejectsPipelineStreamMixingComputeAndPixelShaders) {
-  ID3D12Device2 *device2 = nullptr;
-  ASSERT_EQ(device_->QueryInterface(__uuidof(ID3D12Device2),
-                                    reinterpret_cast<void **>(&device2)),
-            S_OK);
-  ASSERT_NE(device2, nullptr);
-
-  struct PipelineStream {
-    ShaderPipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS> compute;
-    ShaderPipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> pixel;
-  } stream;
-  stream.compute.shader = dxmt::test::CopyTextureComputeShader();
-  stream.pixel.shader = dxmt::test::TextureUavPixelShader();
-  D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {sizeof(stream), &stream};
-
-  ID3D12PipelineState *pipeline = nullptr;
-  EXPECT_EQ(device2->CreatePipelineState(
-                &stream_desc, __uuidof(ID3D12PipelineState),
-                reinterpret_cast<void **>(&pipeline)),
-            E_INVALIDARG);
-  EXPECT_EQ(pipeline, nullptr);
-  release_object(device2);
-}
-#endif

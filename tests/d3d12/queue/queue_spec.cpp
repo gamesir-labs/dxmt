@@ -502,26 +502,6 @@ TEST_F(D3D12QueueSpec, RejectsClosingAlreadyClosedCommandList) {
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
 }
 
-TEST_F(D3D12QueueSpec, EnforcesCommandListAndAllocatorRecordingLifecycle) {
-  ComPtr<ID3D12CommandAllocator> allocator;
-  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
-      D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
-      reinterpret_cast<void **>(allocator.put()))));
-  ComPtr<ID3D12GraphicsCommandList> list;
-  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
-      0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
-      __uuidof(ID3D12GraphicsCommandList),
-      reinterpret_cast<void **>(list.put()))));
-
-  EXPECT_EQ(allocator->Reset(), E_FAIL);
-  EXPECT_EQ(list->Reset(allocator.get(), nullptr), E_FAIL);
-  ASSERT_TRUE(SUCCEEDED(list->Close()));
-  ASSERT_TRUE(SUCCEEDED(allocator->Reset()));
-  ASSERT_TRUE(SUCCEEDED(list->Reset(allocator.get(), nullptr)));
-  EXPECT_EQ(allocator->Reset(), E_FAIL);
-  EXPECT_TRUE(SUCCEEDED(list->Close()));
-}
-
 TEST_F(D3D12QueueSpec, ExecutesDependentCommandListsInArrayOrder) {
   const std::array<std::uint32_t, 8> expected = {
       0x01020304, 0x11121314, 0x21222324, 0x31323334,

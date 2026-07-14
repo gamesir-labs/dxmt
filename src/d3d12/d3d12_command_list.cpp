@@ -2016,6 +2016,8 @@ public:
   void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature *root_signature) override {
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, true, root_signature);
+    if (compute_root_signature_.ptr() == root_signature)
+      return;
     compute_root_signature_ = root_signature;
     ClearComputeRootParameterCache();
     AddRecord(RootSignatureRecord{true, root_signature});
@@ -2024,6 +2026,8 @@ public:
   void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature *root_signature) override {
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, false, root_signature);
+    if (graphics_root_signature_.ptr() == root_signature)
+      return;
     graphics_root_signature_ = root_signature;
     ClearGraphicsRootParameterCache();
     AddRecord(RootSignatureRecord{false, root_signature});

@@ -26,11 +26,27 @@ d3d12_unit_suites = {
   'capability': {
     'sources': files('capability/capability_spec.cpp'),
   },
+  'command': {
+    'sources': files(
+      'command/allocator_lifecycle_spec.cpp',
+      'command/list_lifecycle_spec.cpp',
+    ),
+  },
   'descriptor': {
     'sources': files('descriptor/descriptor_spec.cpp'),
   },
+  'pipeline': {
+    'sources': files('pipeline/stream_spec.cpp'),
+  },
   'queue': {
     'sources': files('queue/queue_spec.cpp'),
+  },
+  'root-signature': {
+    'sources': files(
+      'root_signature/layout_validation_spec.cpp',
+      'root_signature/runtime_state_spec.cpp',
+      'root_signature/serialization_spec.cpp',
+    ),
   },
   'resource': {
     'sources': files('resource/resource_spec.cpp'),

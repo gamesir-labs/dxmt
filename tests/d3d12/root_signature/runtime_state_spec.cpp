@@ -1,0 +1,155 @@
+#include <dxmt_test.hpp>
+
+#include "d3d12_test_context.hpp"
+#include "shaders/runtime_test_shaders.hpp"
+
+#include <cstring>
+#include <vector>
+
+namespace {
+
+using dxmt::test::ClearBufferComputeShader;
+using dxmt::test::ComPtr;
+using dxmt::test::D3D12TestContext;
+
+struct RootStateResources {
+  ComPtr<ID3D12RootSignature> signature;
+  ComPtr<ID3D12PipelineState> pipeline;
+  ComPtr<ID3D12Resource> output;
+  ComPtr<ID3D12DescriptorHeap> heap;
+};
+
+class RootSignatureRuntimeStateSpec : public ::testing::Test {
+protected:
+  void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
+
+  ComPtr<ID3D12RootSignature> CreateSignature() {
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 1;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &range;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC desc = {};
+    desc.NumParameters = 2;
+    desc.pParameters = parameters;
+    return context_.CreateRootSignature(desc);
+  }
+
+  RootStateResources CreateResources() {
+    RootStateResources resources;
+    resources.signature = CreateSignature();
+    if (!resources.signature)
+      return resources;
+    resources.pipeline = context_.CreateComputePipeline(
+        resources.signature.get(), ClearBufferComputeShader());
+    resources.output = context_.CreateBuffer(
+        64 * sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    resources.heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+    if (!resources.output || !resources.heap)
+      return resources;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = 64;
+    context_.device()->CreateUnorderedAccessView(
+        resources.output.get(), nullptr, &uav,
+        resources.heap->GetCPUDescriptorHandleForHeapStart());
+    return resources;
+  }
+
+  void BindComputeState(const RootStateResources &resources,
+                        std::uint32_t value) {
+    ID3D12DescriptorHeap *heaps[] = {resources.heap.get()};
+    context_.list()->SetDescriptorHeaps(1, heaps);
+    context_.list()->SetPipelineState(resources.pipeline.get());
+    context_.list()->SetComputeRootSignature(resources.signature.get());
+    context_.list()->SetComputeRoot32BitConstant(0, value, 0);
+    context_.list()->SetComputeRootDescriptorTable(
+        1, resources.heap->GetGPUDescriptorHandleForHeapStart());
+  }
+
+  void ExpectDispatchOutput(const RootStateResources &resources,
+                            std::uint32_t expected) {
+    context_.list()->Dispatch(1, 1, 1);
+    D3D12TestContext::Transition(
+        context_.list(), resources.output.get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<std::uint8_t> readback;
+    ASSERT_TRUE(SUCCEEDED(context_.ReadbackBuffer(
+        resources.output.get(), 64 * sizeof(expected), &readback)));
+    ASSERT_EQ(readback.size(), 64 * sizeof(expected));
+    for (std::size_t index = 0; index < 64; ++index) {
+      std::uint32_t actual = 0;
+      std::memcpy(&actual, readback.data() + index * sizeof(actual),
+                  sizeof(actual));
+      EXPECT_EQ(actual, expected) << "element " << index;
+    }
+  }
+
+  D3D12TestContext context_;
+};
+
+TEST_F(RootSignatureRuntimeStateSpec,
+       SameComputeRootSignaturePreservesComputeArguments) {
+  auto resources = CreateResources();
+  ASSERT_TRUE(resources.signature);
+  ASSERT_TRUE(resources.pipeline);
+  ASSERT_TRUE(resources.output);
+  ASSERT_TRUE(resources.heap);
+  constexpr std::uint32_t expected = 0x13579bdf;
+  BindComputeState(resources, expected);
+
+  context_.list()->SetComputeRootSignature(resources.signature.get());
+
+  ExpectDispatchOutput(resources, expected);
+}
+
+TEST_F(RootSignatureRuntimeStateSpec,
+       DifferentComputeRootSignatureAllowsAllArgumentsToBeRebound) {
+  auto resources = CreateResources();
+  auto replacement = CreateSignature();
+  ASSERT_TRUE(resources.signature);
+  ASSERT_TRUE(resources.pipeline);
+  ASSERT_TRUE(resources.output);
+  ASSERT_TRUE(resources.heap);
+  ASSERT_TRUE(replacement);
+  constexpr std::uint32_t expected = 0x2468ace0;
+  BindComputeState(resources, expected);
+
+  context_.list()->SetComputeRootSignature(replacement.get());
+  context_.list()->SetComputeRoot32BitConstant(0, expected, 0);
+  context_.list()->SetComputeRootDescriptorTable(
+      1, resources.heap->GetGPUDescriptorHandleForHeapStart());
+
+  ExpectDispatchOutput(resources, expected);
+}
+
+TEST_F(RootSignatureRuntimeStateSpec,
+       GraphicsRootChangeDoesNotAffectComputeRootState) {
+  auto resources = CreateResources();
+  auto graphics_signature = CreateSignature();
+  ASSERT_TRUE(resources.signature);
+  ASSERT_TRUE(resources.pipeline);
+  ASSERT_TRUE(resources.output);
+  ASSERT_TRUE(resources.heap);
+  ASSERT_TRUE(graphics_signature);
+  constexpr std::uint32_t expected = 0x89abcdef;
+  BindComputeState(resources, expected);
+
+  context_.list()->SetGraphicsRootSignature(graphics_signature.get());
+
+  ExpectDispatchOutput(resources, expected);
+}
+
+} // namespace
