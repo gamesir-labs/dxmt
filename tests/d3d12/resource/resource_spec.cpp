@@ -79,6 +79,108 @@ protected:
   D3D12TestContext context_;
 };
 
+TEST_F(D3D12ResourceSpec, ComputesArrayMipCopyableFootprintsExactly) {
+  D3D12_RESOURCE_DESC desc = Texture2DDesc(
+      17, 9, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+  desc.DepthOrArraySize = 2;
+  desc.MipLevels = 3;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 6> layouts = {};
+  std::array<UINT, 6> rows = {};
+  std::array<UINT64, 6> row_sizes = {};
+  UINT64 total_bytes = 0;
+
+  context_.device()->GetCopyableFootprints(
+      &desc, 0, static_cast<UINT>(layouts.size()), 0, layouts.data(),
+      rows.data(), row_sizes.data(), &total_bytes);
+
+  constexpr std::array<UINT64, 6> expected_offsets = {
+      0, 2560, 3584, 4096, 6656, 7680};
+  constexpr std::array<UINT, 6> expected_widths = {17, 8, 4, 17, 8, 4};
+  constexpr std::array<UINT, 6> expected_heights = {9, 4, 2, 9, 4, 2};
+  constexpr std::array<UINT64, 6> expected_row_sizes = {68, 32, 16,
+                                                        68, 32, 16};
+  for (std::size_t i = 0; i < layouts.size(); ++i) {
+    EXPECT_EQ(layouts[i].Offset, expected_offsets[i]) << "subresource " << i;
+    EXPECT_EQ(layouts[i].Footprint.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+    EXPECT_EQ(layouts[i].Footprint.Width, expected_widths[i]);
+    EXPECT_EQ(layouts[i].Footprint.Height, expected_heights[i]);
+    EXPECT_EQ(layouts[i].Footprint.Depth, 1u);
+    EXPECT_EQ(layouts[i].Footprint.RowPitch,
+              D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    EXPECT_EQ(rows[i], expected_heights[i]);
+    EXPECT_EQ(row_sizes[i], expected_row_sizes[i]);
+  }
+  EXPECT_EQ(total_bytes, 7952u);
+}
+
+TEST_F(D3D12ResourceSpec,
+       ComputesBlockCompressedThreeDimensionalFootprintsExactly) {
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  desc.Width = 7;
+  desc.Height = 5;
+  desc.DepthOrArraySize = 3;
+  desc.MipLevels = 3;
+  desc.Format = DXGI_FORMAT_BC1_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 3> layouts = {};
+  std::array<UINT, 3> rows = {};
+  std::array<UINT64, 3> row_sizes = {};
+  UINT64 total_bytes = 0;
+
+  context_.device()->GetCopyableFootprints(
+      &desc, 0, static_cast<UINT>(layouts.size()), 0, layouts.data(),
+      rows.data(), row_sizes.data(), &total_bytes);
+
+  constexpr std::array<UINT64, 3> expected_offsets = {0, 1536, 2048};
+  constexpr std::array<UINT, 3> expected_widths = {8, 4, 4};
+  constexpr std::array<UINT, 3> expected_heights = {8, 4, 4};
+  constexpr std::array<UINT, 3> expected_depths = {3, 1, 1};
+  constexpr std::array<UINT, 3> expected_rows = {2, 1, 1};
+  constexpr std::array<UINT64, 3> expected_row_sizes = {16, 8, 8};
+  for (std::size_t i = 0; i < layouts.size(); ++i) {
+    EXPECT_EQ(layouts[i].Offset, expected_offsets[i]) << "mip " << i;
+    EXPECT_EQ(layouts[i].Footprint.Format, DXGI_FORMAT_BC1_UNORM);
+    EXPECT_EQ(layouts[i].Footprint.Width, expected_widths[i]);
+    EXPECT_EQ(layouts[i].Footprint.Height, expected_heights[i]);
+    EXPECT_EQ(layouts[i].Footprint.Depth, expected_depths[i]);
+    EXPECT_EQ(layouts[i].Footprint.RowPitch,
+              D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    EXPECT_EQ(rows[i], expected_rows[i]);
+    EXPECT_EQ(row_sizes[i], expected_row_sizes[i]);
+  }
+  EXPECT_EQ(total_bytes, 2056u);
+}
+
+TEST_F(D3D12ResourceSpec,
+       InvalidCopyableFootprintRangeFillsEveryOutputWithSentinels) {
+  D3D12_RESOURCE_DESC desc = Texture2DDesc(
+      16, 8, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+  desc.DepthOrArraySize = 2;
+  desc.MipLevels = 3;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> layouts = {};
+  std::array<UINT, 2> rows = {};
+  std::array<UINT64, 2> row_sizes = {};
+  UINT64 total_bytes = 0;
+
+  context_.device()->GetCopyableFootprints(
+      &desc, 5, static_cast<UINT>(layouts.size()), 0, layouts.data(),
+      rows.data(), row_sizes.data(), &total_bytes);
+
+  for (std::size_t i = 0; i < layouts.size(); ++i) {
+    EXPECT_EQ(layouts[i].Offset, UINT64_MAX);
+    EXPECT_EQ(static_cast<UINT>(layouts[i].Footprint.Format), ~UINT{0});
+    EXPECT_EQ(layouts[i].Footprint.Width, ~UINT{0});
+    EXPECT_EQ(layouts[i].Footprint.Height, ~UINT{0});
+    EXPECT_EQ(layouts[i].Footprint.Depth, ~UINT{0});
+    EXPECT_EQ(layouts[i].Footprint.RowPitch, ~UINT{0});
+    EXPECT_EQ(rows[i], ~UINT{0});
+    EXPECT_EQ(row_sizes[i], UINT64_MAX);
+  }
+  EXPECT_EQ(total_bytes, UINT64_MAX);
+}
+
 TEST_F(D3D12ResourceSpec, CopiesPaddedThreeDimensionalSubresourceRows) {
   D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
   if (FAILED(context_.device()->CheckFeatureSupport(

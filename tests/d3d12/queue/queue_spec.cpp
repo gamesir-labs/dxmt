@@ -437,6 +437,65 @@ TEST_F(D3D12QueueSpec, CompletesFenceSignalsInValueOrder) {
   EXPECT_GE(fence->GetCompletedValue(), 7ull);
 }
 
+TEST_F(D3D12QueueSpec, SignalsFenceEventsForCompletedAndFutureValues) {
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateFence(
+      4, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+      reinterpret_cast<void **>(fence.put()))));
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+
+  ASSERT_TRUE(SUCCEEDED(fence->SetEventOnCompletion(3, event)));
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+  ASSERT_TRUE(SUCCEEDED(fence->SetEventOnCompletion(6, event)));
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+  ASSERT_TRUE(SUCCEEDED(context_.queue()->Signal(fence.get(), 6)));
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+  EXPECT_GE(fence->GetCompletedValue(), 6u);
+
+  CloseHandle(event);
+}
+
+TEST_F(D3D12QueueSpec, PreservesPartialBufferCopiesAcrossSubmissions) {
+  std::array<std::uint8_t, 64> source_data = {};
+  std::array<std::uint8_t, 64> expected = {};
+  for (std::size_t i = 0; i < source_data.size(); ++i)
+    source_data[i] = static_cast<std::uint8_t>(i * 3u + 1u);
+  expected.fill(0xcc);
+
+  auto source = context_.CreateUploadBuffer(
+      source_data.size(), source_data.data(), source_data.size());
+  auto initial = context_.CreateUploadBuffer(
+      expected.size(), expected.data(), expected.size());
+  auto destination = context_.CreateBuffer(
+      expected.size(), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(initial);
+  ASSERT_TRUE(destination);
+
+  context_.list()->CopyBufferRegion(destination.get(), 0, initial.get(), 0,
+                                    expected.size());
+  context_.list()->CopyBufferRegion(destination.get(), 7, source.get(), 5, 9);
+  std::copy(source_data.begin() + 5, source_data.begin() + 14,
+            expected.begin() + 7);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+
+  context_.list()->CopyBufferRegion(destination.get(), 40, source.get(), 30,
+                                    11);
+  std::copy(source_data.begin() + 30, source_data.begin() + 41,
+            expected.begin() + 40);
+  D3D12TestContext::Transition(
+      context_.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> actual;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackBuffer(
+      destination.get(), expected.size(), &actual)));
+  EXPECT_EQ(actual, (std::vector<std::uint8_t>(expected.begin(),
+                                                expected.end())));
+}
+
 TEST_F(D3D12QueueSpec, RejectsClosingAlreadyClosedCommandList) {
   ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
   EXPECT_EQ(context_.list()->Close(), E_FAIL);
