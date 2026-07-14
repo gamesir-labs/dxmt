@@ -29,6 +29,7 @@ constexpr unsigned int kFh4BlitPasses = 810;
 constexpr unsigned int kFh4BarrierPasses = 121;
 constexpr unsigned int kFh4BaselineFenceEntries = 1861;
 constexpr unsigned int kOversizedDescriptorRangeDraws = 1500;
+constexpr unsigned int kBarrierAmplificationArraySlices = 256;
 
 constexpr const char kOversizedDescriptorRangePixelShader[] = R"hlsl(
 StructuredBuffer<float4> buffers[32] : register(t0);
@@ -428,6 +429,97 @@ IntegrationError RunInitializerLifetimeScenario() {
                       context.WaitForFence(fence.get(), submitted_batches));
 }
 
+IntegrationError RunPendingBarrierBlitAmplificationScenario(
+    unsigned int barrier_array_count, unsigned int copy_count,
+    double *submit_ms) {
+  D3D12TestContext context;
+  if (auto error = HResultError("D3D12 context initialization",
+                                context.Initialize()))
+    return error;
+
+  const std::array<std::uint32_t, 64> expected = [] {
+    std::array<std::uint32_t, 64> values = {};
+    for (std::uint32_t i = 0; i < values.size(); ++i)
+      values[i] = 0x5a170000u + i;
+    return values;
+  }();
+  auto source = context.CreateUploadBuffer(
+      sizeof(expected), expected.data(), sizeof(expected));
+  auto destination = context.CreateBuffer(
+      sizeof(expected), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (!source || !destination)
+    return "failed to create barrier-amplification copy buffers";
+  D3D12TestContext::Transition(
+      context.list(), destination.get(),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+
+  D3D12_HEAP_PROPERTIES heap_properties = {};
+  heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC texture_desc = {};
+  texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture_desc.Width = 1;
+  texture_desc.Height = 1;
+  texture_desc.DepthOrArraySize = kBarrierAmplificationArraySlices;
+  texture_desc.MipLevels = 1;
+  texture_desc.Format = DXGI_FORMAT_R32_UINT;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+  std::vector<ComPtr<ID3D12Resource>> barrier_resources;
+  barrier_resources.reserve(barrier_array_count);
+  for (unsigned int i = 0; i < barrier_array_count; ++i) {
+    ComPtr<ID3D12Resource> resource;
+    const HRESULT hr = context.device()->CreateCommittedResource(
+        &heap_properties, D3D12_HEAP_FLAG_NONE, &texture_desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void **>(resource.put()));
+    if (auto error = HResultError("barrier-amplification texture creation",
+                                  hr))
+      return error;
+    D3D12TestContext::UavBarrier(context.list(), resource.get());
+    barrier_resources.push_back(std::move(resource));
+  }
+
+  for (unsigned int i = 0; i < copy_count; ++i) {
+    context.list()->CopyBufferRegion(destination.get(), 0, source.get(), 0,
+                                     sizeof(expected));
+  }
+
+  if (auto error = HResultError("barrier-amplification command-list close",
+                                context.list()->Close()))
+    return error;
+  ID3D12CommandList *lists[] = {context.list()};
+  const auto start = std::chrono::steady_clock::now();
+  context.queue()->ExecuteCommandLists(1, lists);
+  if (auto error = HResultError("barrier-amplification queue completion",
+                                context.SignalAndWait()))
+    return error;
+  const auto end = std::chrono::steady_clock::now();
+  if (submit_ms)
+    *submit_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+  if (auto error = HResultError("barrier-amplification readback list reset",
+                                context.ResetCommandList()))
+    return error;
+  D3D12TestContext::Transition(
+      context.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> readback;
+  if (auto error = HResultError(
+          "barrier-amplification readback",
+          context.ReadbackBuffer(destination.get(), sizeof(expected),
+                                 &readback)))
+    return error;
+  if (readback.size() != sizeof(expected) ||
+      std::memcmp(readback.data(), expected.data(), sizeof(expected)) != 0)
+    return "barrier-amplification readback mismatch";
+  return std::nullopt;
+}
+
 IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
   D3D12TestContext context;
   if (auto error = HResultError("D3D12 context initialization",
@@ -611,6 +703,29 @@ void BI_D3D12ResourceInitializerLifetime(benchmark::State &state) {
       kInitializerBatches * kTexturesPerInitializerBatch);
 }
 
+void BI_D3D12PendingBarrierBlitAmplification(benchmark::State &state) {
+  const auto barrier_array_count =
+      static_cast<unsigned int>(state.range(0));
+  const auto copy_count = static_cast<unsigned int>(state.range(1));
+  for (auto _ : state) {
+    double submit_ms = 0.0;
+    if (IntegrationError error = RunPendingBarrierBlitAmplificationScenario(
+            barrier_array_count, copy_count, &submit_ms)) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+    const auto pending_entries =
+        barrier_array_count * kBarrierAmplificationArraySlices;
+    state.counters["pending_entries"] = pending_entries;
+    state.counters["copies"] = copy_count;
+    state.counters["naive_scan_entries"] =
+        static_cast<double>(pending_entries) *
+        static_cast<double>(copy_count > 0 ? copy_count - 1 : 0);
+    state.counters["submit_ms"] = submit_ms;
+  }
+  state.SetItemsProcessed(state.iterations() * copy_count);
+}
+
 void BI_D3D12OversizedDescriptorRangeDraws(benchmark::State &state) {
   for (auto _ : state) {
     double submit_ms = 0.0;
@@ -634,6 +749,14 @@ BENCHMARK(BI_D3D12Fh4SynchronizationAmplification)
     ->Iterations(1)
     ->UseRealTime();
 BENCHMARK(BI_D3D12ResourceInitializerLifetime)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12PendingBarrierBlitAmplification)
+    ->Args({1, 1})
+    ->Args({1, 512})
+    ->Args({16, 1})
+    ->Args({16, 512})
+    ->ArgNames({"barrier_arrays", "copies"})
+    ->Iterations(1)
+    ->UseRealTime();
 BENCHMARK(BI_D3D12OversizedDescriptorRangeDraws)->Iterations(1)->UseRealTime();
 
 } // namespace

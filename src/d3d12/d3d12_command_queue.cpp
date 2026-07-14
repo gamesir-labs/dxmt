@@ -6058,6 +6058,10 @@ private:
     std::unordered_map<ResourceAccessBarrierKey, size_t,
                        ResourceAccessBarrierKeyHash>
         entry_index;
+    // Stable keys keep resource lookups valid while entries are swap-removed.
+    std::unordered_map<ID3D12Resource *,
+                       std::vector<ResourceAccessBarrierKey>>
+        resource_entry_keys;
     bool needs_separator = false;
   };
 
@@ -6101,8 +6105,13 @@ private:
   RebuildResourceAccessBarrierIndex(ResourceAccessBarrierBatch &batch) {
     batch.entry_index.clear();
     batch.entry_index.reserve(batch.entries.size());
-    for (size_t i = 0; i < batch.entries.size(); i++)
-      batch.entry_index.emplace(MakeResourceAccessBarrierKey(batch.entries[i]), i);
+    batch.resource_entry_keys.clear();
+    for (size_t i = 0; i < batch.entries.size(); i++) {
+      auto key = MakeResourceAccessBarrierKey(batch.entries[i]);
+      batch.entry_index.emplace(key, i);
+      if (auto *resource = batch.entries[i].d3d_resource.ptr())
+        batch.resource_entry_keys[resource].push_back(key);
+    }
   }
 
   struct PendingTimestampResolve {
@@ -6799,19 +6808,94 @@ private:
       ReplayState &state,
       const std::unordered_set<ID3D12Resource *> &reads,
       const std::unordered_set<ID3D12Resource *> &writes) {
-    ResourceAccessBarrierBatch matched;
-    ResourceAccessBarrierBatch remaining;
-    for (auto &entry : state.pending_resource_barriers.entries) {
-      auto *resource = entry.d3d_resource.ptr();
-      if (resource && (reads.count(resource) || writes.count(resource)))
-        matched.entries.push_back(std::move(entry));
-      else
-        remaining.entries.push_back(std::move(entry));
+    const bool perf_enabled = ReplayPerfEnabled();
+    const auto take_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
+    auto &timers = perDrawSubTimers();
+    if (perf_enabled) {
+      const auto pending = state.pending_resource_barriers.entries.size();
+      timers.blitBarrierPendingEntries += pending;
+      timers.blitBarrierPendingEntriesMax =
+          std::max<uint64_t>(timers.blitBarrierPendingEntriesMax, pending);
     }
-    matched.needs_separator = state.pending_resource_barriers.needs_separator;
-    RebuildResourceAccessBarrierIndex(matched);
-    RebuildResourceAccessBarrierIndex(remaining);
-    state.pending_resource_barriers = std::move(remaining);
+    auto &pending = state.pending_resource_barriers;
+    ResourceAccessBarrierBatch matched;
+    matched.needs_separator = pending.needs_separator;
+    pending.needs_separator = false;
+
+    const bool use_resource_index = !pending.entry_index.empty();
+    if (!use_resource_index) {
+      ResourceAccessBarrierBatch remaining;
+      remaining.entries.reserve(pending.entries.size());
+      for (auto &entry : pending.entries) {
+        auto *resource = entry.d3d_resource.ptr();
+        if (resource && (reads.count(resource) || writes.count(resource)))
+          matched.entries.push_back(std::move(entry));
+        else
+          remaining.entries.push_back(std::move(entry));
+      }
+      pending.entries = std::move(remaining.entries);
+    } else {
+      auto take_resource = [&](ID3D12Resource *resource) {
+        auto resource_it = pending.resource_entry_keys.find(resource);
+        if (resource_it == pending.resource_entry_keys.end())
+          return;
+
+        auto keys = std::move(resource_it->second);
+        pending.resource_entry_keys.erase(resource_it);
+        matched.entries.reserve(matched.entries.size() + keys.size());
+        for (const auto &key : keys) {
+          auto entry_it = pending.entry_index.find(key);
+          if (entry_it == pending.entry_index.end())
+            continue;
+
+          const size_t index = entry_it->second;
+          pending.entry_index.erase(entry_it);
+          matched.entries.push_back(std::move(pending.entries[index]));
+
+          const size_t last_index = pending.entries.size() - 1;
+          if (index != last_index) {
+            pending.entries[index] = std::move(pending.entries[last_index]);
+            auto moved_key =
+                MakeResourceAccessBarrierKey(pending.entries[index]);
+            auto moved_it = pending.entry_index.find(moved_key);
+            if (moved_it != pending.entry_index.end())
+              moved_it->second = index;
+          }
+          pending.entries.pop_back();
+        }
+      };
+
+      for (auto *resource : reads)
+        take_resource(resource);
+      for (auto *resource : writes)
+        take_resource(resource);
+    }
+    const auto scan_end = perf_enabled ? clock::now() : clock::time_point{};
+    const auto matched_rebuild_end =
+        perf_enabled ? clock::now() : clock::time_point{};
+    const auto remaining_rebuild_end =
+        perf_enabled ? clock::now() : clock::time_point{};
+    if (perf_enabled) {
+      const auto assign_end = clock::now();
+      const auto us = [](auto duration) -> uint64_t {
+        return std::chrono::duration_cast<std::chrono::microseconds>(duration)
+            .count();
+      };
+      timers.blitBarrierTakeUs += us(assign_end - take_begin);
+      if (use_resource_index)
+        timers.blitBarrierLookupUs += us(scan_end - take_begin);
+      else
+        timers.blitBarrierScanUs += us(scan_end - take_begin);
+      timers.blitBarrierRebuildMatchedUs +=
+          us(matched_rebuild_end - scan_end);
+      timers.blitBarrierRebuildRemainingUs +=
+          us(remaining_rebuild_end - matched_rebuild_end);
+      timers.blitBarrierAssignUs += us(assign_end - remaining_rebuild_end);
+      timers.blitBarrierMatchedEntries += matched.entries.size();
+      timers.blitBarrierRemainingEntries +=
+          pending.entries.size();
+    }
     return matched;
   }
 
@@ -6824,10 +6908,28 @@ private:
     ScopeAccum _rbacc{_rb, _rb ? clock::now() : clock::time_point{},
                       &perDrawSubTimers().flushBlitUs};
 
+    if (_rb) {
+      auto &timers = perDrawSubTimers();
+      timers.blitBatchCommands += batch.commands.size();
+      timers.blitBatchCommandsMax =
+          std::max<uint64_t>(timers.blitBatchCommandsMax,
+                             batch.commands.size());
+      timers.blitBatchReads += batch.reads.size();
+      timers.blitBatchWrites += batch.writes.size();
+    }
+
     auto barriers = TakeMatchingPendingResourceBarriers(
         state, batch.reads, batch.writes);
+    const auto separator_begin = _rb ? clock::now() : clock::time_point{};
     RecordSeparatorOnlyBarrier(barriers);
+    if (_rb) {
+      perDrawSubTimers().blitSeparatorUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - separator_begin)
+              .count();
+    }
 
+    const auto emit_begin = _rb ? clock::now() : clock::time_point{};
     chunk->emitcc([commands = std::move(batch.commands),
                    barrier_entries = std::move(barriers.entries)](
                       ArgumentEncodingContext &enc) mutable {
@@ -6840,8 +6942,21 @@ private:
       }
       enc.endPass();
     });
+    if (_rb) {
+      perDrawSubTimers().blitEmitCommandUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - emit_begin)
+              .count();
+    }
 
+    const auto reset_begin = _rb ? clock::now() : clock::time_point{};
     batch = {};
+    if (_rb) {
+      perDrawSubTimers().blitBatchResetUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - reset_begin)
+              .count();
+    }
   }
 
   void FlushReplayRenderComputeTimestampBatches(CommandChunk *chunk,
@@ -6910,17 +7025,48 @@ private:
                         std::initializer_list<ID3D12Resource *> reads,
                         std::initializer_list<ID3D12Resource *> writes,
                         Fn &&fn) {
+    const bool perf_enabled = ReplayPerfEnabled();
+    if (perf_enabled)
+      perDrawSubTimers().queueBlitCalls++;
     if (HasPendingComputePass(state) || HasPendingGraphicsPass(state) ||
         !state.pending_timestamp_markers.empty())
       FlushReplayRenderComputeTimestampBatches(
           chunk, state);
-    if (ReplayBlitBatchHasHazard(state.blit_batch, reads, writes))
+    const auto hazard_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
+    const bool has_hazard =
+        ReplayBlitBatchHasHazard(state.blit_batch, reads, writes);
+    if (perf_enabled) {
+      perDrawSubTimers().queueBlitHazardUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - hazard_begin)
+              .count();
+      if (has_hazard)
+        perDrawSubTimers().queueBlitHazardFlushes++;
+    }
+    if (has_hazard)
       FlushBlitBatch(chunk, state);
 
+    const auto track_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
     ReplayBlitBatchTrackAccess(state.blit_batch, reads, writes);
+    if (perf_enabled) {
+      perDrawSubTimers().queueBlitTrackUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - track_begin)
+              .count();
+    }
+    const auto append_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
     state.blit_batch.commands.push_back(
         {std::function<void(ArgumentEncodingContext &)>(std::forward<Fn>(fn)),
          dxmt::apitrace::current_d3d_sequence()});
+    if (perf_enabled) {
+      perDrawSubTimers().queueBlitAppendUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - append_begin)
+              .count();
+    }
   }
 
   void SyncTimestampSampleAllocator() {
@@ -7707,6 +7853,27 @@ private:
              flushBarrierUs = 0, emitTsMarkersUs = 0, buildPlanUs = 0;
     uint64_t flushBlitCalls = 0, flushComputeCalls = 0, flushGraphicsCalls = 0,
              flushBarrierCalls = 0, emitTsMarkersCalls = 0;
+    // CPU attribution for the CopyTextureRegion -> QueueBlitCommand ->
+    // FlushBlitBatch path. These aggregate counters intentionally avoid
+    // per-copy logging so the diagnostic does not reshape the workload.
+    uint64_t blitBarrierTakeUs = 0, blitBarrierLookupUs = 0,
+             blitBarrierScanUs = 0,
+             blitBarrierRebuildMatchedUs = 0,
+             blitBarrierRebuildRemainingUs = 0,
+             blitBarrierAssignUs = 0, blitSeparatorUs = 0,
+             blitEmitCommandUs = 0, blitBatchResetUs = 0;
+    uint64_t queueBlitHazardUs = 0, queueBlitTrackUs = 0,
+             queueBlitAppendUs = 0;
+    uint64_t copyTextureLookupUs = 0, copyTextureEnsureAllocationUs = 0,
+             copyTexturePrepareUs = 0, copyTextureQueueUs = 0;
+    uint64_t queueBlitCalls = 0, queueBlitHazardFlushes = 0,
+             copyTextureCalls = 0, copyTextureQueued = 0;
+    uint64_t blitBarrierPendingEntries = 0,
+             blitBarrierMatchedEntries = 0,
+             blitBarrierRemainingEntries = 0,
+             blitBarrierPendingEntriesMax = 0;
+    uint64_t blitBatchCommands = 0, blitBatchCommandsMax = 0,
+             blitBatchReads = 0, blitBatchWrites = 0;
     uint64_t flushPassBatchesCalls = 0, flushPassBatchesEmpty = 0;
     uint64_t resAccessCalls = 0, resAccessSteadyNoop = 0;
     uint64_t descAccessHits = 0, descAccessMiss = 0;
@@ -9151,6 +9318,44 @@ private:
              " drawCloneUs=", perDrawSubTimers().clone,
              " flushBlitUs=", perDrawSubTimers().flushBlitUs,
              " flushBlitCalls=", perDrawSubTimers().flushBlitCalls,
+             " blitBarrierTakeUs=", perDrawSubTimers().blitBarrierTakeUs,
+             " blitBarrierLookupUs=", perDrawSubTimers().blitBarrierLookupUs,
+             " blitBarrierScanUs=", perDrawSubTimers().blitBarrierScanUs,
+             " blitBarrierRebuildMatchedUs=",
+             perDrawSubTimers().blitBarrierRebuildMatchedUs,
+             " blitBarrierRebuildRemainingUs=",
+             perDrawSubTimers().blitBarrierRebuildRemainingUs,
+             " blitBarrierAssignUs=", perDrawSubTimers().blitBarrierAssignUs,
+             " blitSeparatorUs=", perDrawSubTimers().blitSeparatorUs,
+             " blitEmitCommandUs=", perDrawSubTimers().blitEmitCommandUs,
+             " blitBatchResetUs=", perDrawSubTimers().blitBatchResetUs,
+             " blitPendingEntries=",
+             perDrawSubTimers().blitBarrierPendingEntries,
+             " blitMatchedEntries=",
+             perDrawSubTimers().blitBarrierMatchedEntries,
+             " blitRemainingEntries=",
+             perDrawSubTimers().blitBarrierRemainingEntries,
+             " blitPendingEntriesMax=",
+             perDrawSubTimers().blitBarrierPendingEntriesMax,
+             " blitBatchCommands=", perDrawSubTimers().blitBatchCommands,
+             " blitBatchCommandsMax=",
+             perDrawSubTimers().blitBatchCommandsMax,
+             " blitBatchReads=", perDrawSubTimers().blitBatchReads,
+             " blitBatchWrites=", perDrawSubTimers().blitBatchWrites,
+             " queueBlitCalls=", perDrawSubTimers().queueBlitCalls,
+             " queueBlitHazardFlushes=",
+             perDrawSubTimers().queueBlitHazardFlushes,
+             " queueBlitHazardUs=", perDrawSubTimers().queueBlitHazardUs,
+             " queueBlitTrackUs=", perDrawSubTimers().queueBlitTrackUs,
+             " queueBlitAppendUs=", perDrawSubTimers().queueBlitAppendUs,
+             " copyTextureCalls=", perDrawSubTimers().copyTextureCalls,
+             " copyTextureQueued=", perDrawSubTimers().copyTextureQueued,
+             " copyTextureLookupUs=",
+             perDrawSubTimers().copyTextureLookupUs,
+             " copyTextureEnsureAllocationUs=",
+             perDrawSubTimers().copyTextureEnsureAllocationUs,
+             " copyTexturePrepareUs=", perDrawSubTimers().copyTexturePrepareUs,
+             " copyTextureQueueUs=", perDrawSubTimers().copyTextureQueueUs,
              " flushComputeUs=", perDrawSubTimers().flushComputeUs,
              " flushComputeCalls=", perDrawSubTimers().flushComputeCalls,
              " flushGraphicsUs=", perDrawSubTimers().flushGraphicsUs,
@@ -10387,6 +10592,8 @@ private:
           return;
         }
         batch.entry_index.emplace(key, batch.entries.size());
+        if (auto *resource = entry.d3d_resource.ptr())
+          batch.resource_entry_keys[resource].push_back(key);
       }
 
       batch.entries.push_back(std::move(entry));
@@ -10459,6 +10666,8 @@ private:
       }
 
       dst.entry_index.emplace(key, dst.entries.size());
+      if (auto *resource = entry.d3d_resource.ptr())
+        dst.resource_entry_keys[resource].push_back(key);
       dst.entries.push_back(std::move(entry));
     }
     dst.needs_separator = dst.needs_separator || src.needs_separator;
@@ -11847,6 +12056,49 @@ private:
     return nullptr;
   }
 
+  static std::string
+  ShaderDigestForStage(const PipelineState &pipeline, PipelineStage stage) {
+    const auto *shader = FindShaderForStage(pipeline, stage);
+    if (!shader || !shader->cached_shader)
+      return {};
+    struct CachedDigest {
+      std::weak_ptr<PipelineCachedShader> owner;
+      std::string digest;
+    };
+    static std::mutex digest_mutex;
+    static std::unordered_map<const PipelineCachedShader *, CachedDigest>
+        digest_cache;
+    const auto owner = shader->cached_shader;
+    {
+      std::lock_guard lock(digest_mutex);
+      const auto it = digest_cache.find(owner.get());
+      if (it != digest_cache.end()) {
+        const auto live_owner = it->second.owner.lock();
+        if (live_owner && live_owner.get() == owner.get())
+          return it->second.digest;
+      }
+    }
+    const auto &bytecode = shader->bytecode();
+    const auto digest =
+        Sha1HashState::compute(bytecode.data(), bytecode.size()).string();
+    {
+      std::lock_guard lock(digest_mutex);
+      digest_cache[owner.get()] = CachedDigest{owner, digest};
+    }
+    return digest;
+  }
+
+  static bool
+  D3D12DiagPipelineStageSelected(const PipelineState &pipeline,
+                                 PipelineStage stage,
+                                 std::string *shader_digest = nullptr) {
+    const auto digest = ShaderDigestForStage(pipeline, stage);
+    if (shader_digest)
+      *shader_digest = digest;
+    return D3D12DiagShaderKeySelected(pipeline.GetShaderCacheKey()) ||
+           (!digest.empty() && D3D12DiagShaderKeySelected(digest));
+  }
+
   static SM50BindingType
   BindingTypeForRange(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
     switch (range_type) {
@@ -12685,18 +12937,261 @@ private:
     return resource ? resource->GetResourceDesc().Width : 0;
   }
 
+  struct SelectedDescriptorConsistency {
+    uint32_t flags = 0;
+    bool legal_null = false;
+    bool needs_fill = false;
+    DescriptorBackendSlotKind expected_kind = DescriptorBackendSlotKind::Empty;
+    DescriptorBackendSlotKind actual_kind = DescriptorBackendSlotKind::Empty;
+    dxmt::DescriptorSlotVersion stale_version = {};
+    dxmt::DescriptorSlotVersion filled_version = {};
+    DescriptorTableEntry table = {};
+    BufferDescriptorRecord native = {};
+    DescriptorTextureSlotPayload texture = {};
+    uint32_t native_diag_flags = 0;
+    std::string reasons;
+  };
+
+  static void AddSelectedDescriptorReason(SelectedDescriptorConsistency &diag,
+                                          uint32_t flag,
+                                          const char *reason) {
+    diag.flags |= flag;
+    if (!diag.reasons.empty())
+      diag.reasons += ',';
+    diag.reasons += reason;
+  }
+
+  static SelectedDescriptorConsistency DiagnoseSelectedDescriptor(
+      const DescriptorRecord &descriptor,
+      const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
+    SelectedDescriptorConsistency diag = {};
+    constexpr uint32_t kMissingMirror = 1u << 0;
+    constexpr uint32_t kSlotOutOfRange = 1u << 1;
+    constexpr uint32_t kArgumentTypeMismatch = 1u << 2;
+    constexpr uint32_t kRecordVersionMismatch = 1u << 3;
+    constexpr uint32_t kSlotStillPending = 1u << 4;
+    constexpr uint32_t kFilledVersionMismatch = 1u << 5;
+    constexpr uint32_t kBackendKindMismatch = 1u << 6;
+    constexpr uint32_t kMissingBackendPayload = 1u << 7;
+    constexpr uint32_t kInvalidNativeBuffer = 1u << 8;
+    constexpr uint32_t kNullPayloadNotCleared = 1u << 9;
+    constexpr uint32_t kShaderShapeMismatch = 1u << 10;
+
+    auto descriptor_matches_argument = [&] {
+      if (!argument)
+        return true;
+      switch (argument->Type) {
+      case SM50BindingType::ConstantBuffer:
+        return descriptor.type == DescriptorRecordType::ConstantBufferView;
+      case SM50BindingType::SRV:
+        return descriptor.type == DescriptorRecordType::ShaderResourceView ||
+               descriptor.type == DescriptorRecordType::Empty;
+      case SM50BindingType::UAV:
+        return descriptor.type == DescriptorRecordType::UnorderedAccessView ||
+               descriptor.type == DescriptorRecordType::Empty;
+      case SM50BindingType::Sampler:
+        return descriptor.type == DescriptorRecordType::Sampler ||
+               descriptor.type == DescriptorRecordType::Empty;
+      default:
+        return true;
+      }
+    };
+    if (!descriptor_matches_argument())
+      AddSelectedDescriptorReason(diag, kArgumentTypeMismatch,
+                                  "shader-argument-type-mismatch");
+
+    auto *resource = GetResource(descriptor.resource.ptr());
+    diag.legal_null =
+        descriptor.type == DescriptorRecordType::Empty ||
+        ((descriptor.type == DescriptorRecordType::ShaderResourceView ||
+          descriptor.type == DescriptorRecordType::UnorderedAccessView) &&
+         !resource) ||
+        (descriptor.type == DescriptorRecordType::ConstantBufferView &&
+         (!descriptor.has_desc ||
+          (!descriptor.desc.cbv.BufferLocation &&
+           !descriptor.desc.cbv.SizeInBytes))) ||
+        (descriptor.type == DescriptorRecordType::Sampler &&
+         !descriptor.has_desc);
+
+    if (!diag.legal_null) {
+      if (descriptor.type == DescriptorRecordType::Sampler) {
+        diag.expected_kind = DescriptorBackendSlotKind::Sampler;
+      } else if (descriptor.type == DescriptorRecordType::ConstantBufferView ||
+                 (resource && resource->GetBuffer())) {
+        diag.expected_kind = DescriptorBackendSlotKind::Buffer;
+      } else if (resource && resource->GetTexture()) {
+        diag.expected_kind = DescriptorBackendSlotKind::Texture;
+      }
+    }
+
+    if (argument && !diag.legal_null &&
+        (descriptor.type == DescriptorRecordType::ShaderResourceView ||
+         descriptor.type == DescriptorRecordType::UnorderedAccessView)) {
+      const bool shader_expects_texture =
+          argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+      const bool resource_is_texture = resource && resource->GetTexture();
+      const bool resource_is_buffer = resource && resource->GetBuffer();
+      if ((!shader_expects_texture && resource_is_texture) ||
+          (!resource_is_texture && !resource_is_buffer)) {
+        AddSelectedDescriptorReason(diag, kShaderShapeMismatch,
+                                    "shader-resource-shape-mismatch");
+      }
+    }
+
+    auto *mirror = descriptor.mirror;
+    if (!mirror) {
+      if (descriptor.shader_visible)
+        AddSelectedDescriptorReason(diag, kMissingMirror,
+                                    "shader-visible-mirror-missing");
+      return diag;
+    }
+    if (descriptor.heap_index >= mirror->numDescriptors()) {
+      AddSelectedDescriptorReason(diag, kSlotOutOfRange,
+                                  "mirror-slot-out-of-range");
+      return diag;
+    }
+
+    const auto slot = descriptor.heap_index;
+    diag.stale_version = mirror->slotStaleVersion(slot);
+    diag.filled_version = mirror->slotFilledVersion(slot);
+    diag.needs_fill = mirror->SlotNeedsFill(slot);
+    if (diag.stale_version != descriptor.slot_version)
+      AddSelectedDescriptorReason(diag, kRecordVersionMismatch,
+                                  "record-stale-version-mismatch");
+    if (diag.needs_fill)
+      AddSelectedDescriptorReason(diag, kSlotStillPending,
+                                  "mirror-fill-still-pending-at-bind");
+    if (!diag.needs_fill && diag.filled_version != descriptor.slot_version)
+      AddSelectedDescriptorReason(diag, kFilledVersionMismatch,
+                                  "record-filled-version-mismatch");
+
+    const auto meta = mirror->slotMeta(slot);
+    if (meta)
+      diag.actual_kind = meta->kind;
+    if (!meta || diag.actual_kind != diag.expected_kind)
+      AddSelectedDescriptorReason(diag, kBackendKindMismatch,
+                                  "descriptor-backend-kind-mismatch");
+
+    const auto table = mirror->descriptorTableEntry(slot);
+    if (table)
+      diag.table = *table;
+    const auto native = mirror->bufferDescriptorRecord(slot);
+    if (native)
+      diag.native = *native;
+    const auto texture =
+        mirror->textureSlotPayload(slot, descriptor.slot_version);
+    if (texture)
+      diag.texture = *texture;
+
+    if (diag.legal_null && !mirror->isSamplerHeap()) {
+      if (diag.table.gpu_va || diag.table.texture_view_id ||
+          diag.table.metadata || diag.native.resource_index ||
+          diag.native.flags || diag.native.byte_offset ||
+          diag.native.byte_size || diag.texture.handle ||
+          diag.texture.metadata) {
+        AddSelectedDescriptorReason(diag, kNullPayloadNotCleared,
+                                    "legal-null-retains-backend-payload");
+      }
+    } else if (diag.expected_kind == DescriptorBackendSlotKind::Texture) {
+      if (!diag.table.texture_view_id || !diag.texture.handle)
+        AddSelectedDescriptorReason(diag, kMissingBackendPayload,
+                                    "texture-backend-payload-missing");
+    } else if (diag.expected_kind == DescriptorBackendSlotKind::Buffer) {
+      const auto backend = diag.native.resource_index
+                               ? mirror->backendResourceRecord(
+                                     diag.native.resource_index)
+                               : std::nullopt;
+      diag.native_diag_flags =
+          DiagnoseNativeBufferDescriptor(diag.native, backend);
+      if (diag.native_diag_flags)
+        AddSelectedDescriptorReason(diag, kInvalidNativeBuffer,
+                                    "native-buffer-record-invalid");
+
+      const bool shader_expects_texture =
+          argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+      if (shader_expects_texture &&
+          (!diag.table.texture_view_id || !diag.texture.handle)) {
+        AddSelectedDescriptorReason(diag, kMissingBackendPayload,
+                                    "texture-buffer-payload-missing");
+      }
+    }
+    return diag;
+  }
+
   void DebugLogRootBinding(const char *kind, const PipelineState &pipeline,
                            bool compute, PipelineStage stage, UINT root_index,
                            UINT slot, UINT shader_register,
                            UINT register_space, UINT64 size,
                            D3D12_GPU_VIRTUAL_ADDRESS address,
-                           const DescriptorRecord *descriptor = nullptr) {
-    const auto &cache_key = pipeline.GetShaderCacheKey();
-    if (!D3D12DiagShaderKeySelected(cache_key))
+                           const DescriptorRecord *descriptor = nullptr,
+                           const DXMT12_MTL4_SHADER_ARGUMENT *argument = nullptr) {
+    if (!D3D12DiagBindingsEnabled())
       return;
 
+    const auto &cache_key = pipeline.GetShaderCacheKey();
+    std::string shader_digest;
+    if (!D3D12DiagPipelineStageSelected(pipeline, stage, &shader_digest))
+      return;
+
+    static std::atomic<uint64_t> consistency_sample_count = 0;
+    const auto consistency_occurrence =
+        consistency_sample_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool periodic_consistency_sample =
+        consistency_occurrence <= 64 ||
+        (consistency_occurrence & (consistency_occurrence - 1)) == 0 ||
+        (consistency_occurrence % 4096) == 0;
+    // A stale-version mismatch is the highest-value transient and only costs
+    // one mirror lock to test. Deep payload inspection is otherwise sampled.
+    const bool version_mismatch =
+        descriptor && descriptor->mirror &&
+        descriptor->heap_index < descriptor->mirror->numDescriptors() &&
+        descriptor->mirror->slotStaleVersion(descriptor->heap_index) !=
+            descriptor->slot_version;
+    const bool consistency_sampled =
+        descriptor && (periodic_consistency_sample || version_mismatch);
+    const auto consistency =
+        consistency_sampled
+            ? DiagnoseSelectedDescriptor(*descriptor, argument)
+            : SelectedDescriptorConsistency{};
+    if (consistency_sampled && consistency.flags) {
+      static std::atomic<uint32_t> anomaly_log_count = 0;
+      if (D3D12DiagShouldLog(anomaly_log_count, true)) {
+        WARN("D3D12 diagnostic: selected descriptor inconsistency",
+             " pso=", pipeline.GetShaderCacheKey(),
+             " shader=", shader_digest,
+             " stage=", PipelineStageName(stage),
+             " kind=", kind,
+             " root=", root_index,
+             " slot=", slot,
+             " register=", shader_register,
+             " heapIndex=", descriptor->heap_index,
+             " flags=0x", std::hex, consistency.flags, std::dec,
+             " reasons=", consistency.reasons,
+             " legalNull=", consistency.legal_null,
+             " recordVersion=", descriptor->slot_version.epoch, ":",
+             descriptor->slot_version.sequence,
+             " staleVersion=", consistency.stale_version.epoch, ":",
+             consistency.stale_version.sequence,
+             " filledVersion=", consistency.filled_version.epoch, ":",
+             consistency.filled_version.sequence,
+             " needsFill=", consistency.needs_fill,
+             " expectedKind=", uint32_t(consistency.expected_kind),
+             " actualKind=", uint32_t(consistency.actual_kind),
+             " tableGpuVa=", consistency.table.gpu_va,
+             " tableTexture=", consistency.table.texture_view_id,
+             " tableMetadata=", consistency.table.metadata,
+             " textureHandle=", consistency.texture.handle,
+             " textureMetadata=", consistency.texture.metadata,
+             " nativeResource=", consistency.native.resource_index,
+             " nativeFlags=0x", std::hex, consistency.native.flags,
+             " nativeDiag=0x", consistency.native_diag_flags, std::dec,
+             " nativeOffset=", consistency.native.byte_offset,
+             " nativeSize=", consistency.native.byte_size);
+      }
+    }
+
     static std::atomic<uint32_t> log_count = 0;
-    if (!D3D12DiagShouldLog(log_count, D3D12DiagBindingsEnabled()))
+    if (!D3D12DiagShouldLog(log_count, true))
       return;
 
     const auto key_size = std::min<size_t>(cache_key.size(), 16);
@@ -12704,6 +13199,7 @@ private:
     INFO("D3D12 diagnostic: root binding",
          " kind=", kind,
          " pso=", key_prefix,
+         " shader=", shader_digest,
          " pipeline=", compute ? "compute" : "graphics",
          " stage=", PipelineStageName(stage),
          " root=", root_index,
@@ -12721,6 +13217,15 @@ private:
          " slotVersion=",
          descriptor ? descriptor->slot_version.epoch : 0, ":",
          descriptor ? descriptor->slot_version.sequence : 0,
+         " classification=",
+         descriptor ? (!consistency_sampled
+                           ? "not-sampled"
+                           : consistency.legal_null
+                                 ? "legal-null"
+                                 : consistency.flags ? "anomalous"
+                                                     : "consistent")
+                    : "not-descriptor",
+         " consistencyFlags=0x", std::hex, consistency.flags, std::dec,
          " resource=",
          descriptor ? static_cast<const void *>(descriptor->resource.ptr())
                     : nullptr,
@@ -15758,18 +16263,21 @@ private:
     };
 
     for (const auto &entry : recipe.entries) {
+      const auto stage = static_cast<PipelineStage>(entry.stage);
       const auto base = get_table(entry.root_index);
       if (!base.ptr) {
+        std::string shader_digest;
         if (D3D12DiagBindingsEnabled() &&
             D3D12DiagShaderFilterConfigured() &&
-            D3D12DiagShaderKeySelected(pipeline.GetShaderCacheKey())) {
+            D3D12DiagPipelineStageSelected(pipeline, stage,
+                                           &shader_digest)) {
           static std::atomic<uint32_t> missing_table_count = 0;
           if (D3D12DiagShouldLog(missing_table_count, true)) {
             WARN("D3D12 diagnostic: selected binding unresolved",
                  " reason=missing-table",
                  " pso=", pipeline.GetShaderCacheKey(),
-                 " stage=", PipelineStageName(
-                     static_cast<PipelineStage>(entry.stage)),
+                 " shader=", shader_digest,
+                 " stage=", PipelineStageName(stage),
                  " root=", entry.root_index,
                  " range=", entry.range_index,
                  " slot=", entry.slot,
@@ -15789,16 +16297,18 @@ private:
       const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           heap, base, entry.range_offset, entry.descriptor_index,
           entry.descriptor_count, heap_type);
-      const auto stage = static_cast<PipelineStage>(entry.stage);
       if (!descriptor) {
+        std::string shader_digest;
         if (D3D12DiagBindingsEnabled() &&
             D3D12DiagShaderFilterConfigured() &&
-            D3D12DiagShaderKeySelected(pipeline.GetShaderCacheKey())) {
+            D3D12DiagPipelineStageSelected(pipeline, stage,
+                                           &shader_digest)) {
           static std::atomic<uint32_t> missing_descriptor_count = 0;
           if (D3D12DiagShouldLog(missing_descriptor_count, true)) {
             WARN("D3D12 diagnostic: selected binding unresolved",
                  " reason=missing-descriptor",
                  " pso=", pipeline.GetShaderCacheKey(),
+                 " shader=", shader_digest,
                  " stage=", PipelineStageName(stage),
                  " root=", entry.root_index,
                  " range=", entry.range_index,
@@ -15815,12 +16325,14 @@ private:
         cleared++;
         continue;
       }
-      DebugLogRootBinding(
-          DescriptorRangeTypeName(range_type), pipeline, compute, stage,
-          entry.root_index, entry.slot, 0, 0,
-          DescriptorRecordSizeBytes(*descriptor), 0, &*descriptor);
       MaybeFillBindlessMirrorSlot(enc, range_type, *descriptor, stage,
                                   &entry.argument);
+      DebugLogRootBinding(
+          DescriptorRangeTypeName(range_type), pipeline, compute, stage,
+          entry.root_index, entry.slot, entry.shader_register,
+          entry.argument.RegisterCount ? entry.argument.RegisterSpace : 0,
+          DescriptorRecordSizeBytes(*descriptor), 0,
+          &*descriptor, &entry.argument);
       BindDescriptor(enc, stage, range_type, entry.slot, *descriptor,
                      &entry.argument);
       bound++;
@@ -16476,7 +16988,8 @@ private:
           pipeline, compute, stage, root_index, argument->SM50BindingSlot,
           parameter.descriptor.ShaderRegister,
           parameter.descriptor.RegisterSpace,
-          resource->GetResourceDesc().Width - offset, slot.address);
+          resource->GetResourceDesc().Width - offset, slot.address,
+          &descriptor, argument);
       BindDescriptor(enc, stage, range_type, argument->SM50BindingSlot,
                      descriptor, argument);
     });
@@ -17499,7 +18012,8 @@ private:
                           root_index, argument->SM50BindingSlot,
                           parameter.descriptor.ShaderRegister,
                           parameter.descriptor.RegisterSpace,
-                          DescriptorRecordSizeBytes(descriptor), 0);
+                          DescriptorRecordSizeBytes(descriptor), 0,
+                          &descriptor, argument);
       BindDescriptor(enc, stage, range_type, argument->SM50BindingSlot,
                      descriptor, argument);
     });
@@ -18218,11 +18732,6 @@ private:
           dxmt::perf::addFrameCounter(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors);
-          DebugLogRootBinding(
-              entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
-              entry.stage, entry.root_index, entry.slot, entry.shader_register,
-              entry.register_space, entry.debug_size, entry.debug_address,
-              &entry.descriptor);
           // Bindless-mirror (③.3): the snapshot path does not run ApplyDescriptorTableBindingRecipe,
           // so fill the persistent mirror here from the captured descriptor (record.mirror travels
           // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
@@ -18268,6 +18777,11 @@ private:
               }
             }
           }
+          DebugLogRootBinding(
+              entry.debug_kind ? entry.debug_kind : "snapshot", pipeline,
+              false, entry.stage, entry.root_index, entry.slot,
+              entry.shader_register, entry.register_space, entry.debug_size,
+              entry.debug_address, &entry.descriptor, &entry.argument);
           {
             dxmt::perf::ScopedFrameDuration descriptor_scope(
                 perf_stats,
@@ -19125,7 +19639,15 @@ private:
     const auto &desc = graphics->desc;
     const auto slot_mask = InputSlotMask(graphics);
     const auto &cache_key = pipeline.GetShaderCacheKey();
-    const bool target_pso = DiagIsTargetCompositePso(cache_key);
+    const bool target_shader =
+        D3D12DiagShaderFilterConfigured() &&
+        (D3D12DiagPipelineStageSelected(pipeline, PipelineStage::Vertex) ||
+         D3D12DiagPipelineStageSelected(pipeline, PipelineStage::Pixel) ||
+         D3D12DiagPipelineStageSelected(pipeline, PipelineStage::Geometry) ||
+         D3D12DiagPipelineStageSelected(pipeline, PipelineStage::Hull) ||
+         D3D12DiagPipelineStageSelected(pipeline, PipelineStage::Domain));
+    const bool target_pso =
+        DiagIsTargetCompositePso(cache_key) || target_shader;
     const auto target_occurrence =
         target_pso && D3D12DiagDrawStateEnabled()
             ? target_log_count.fetch_add(1, std::memory_order_relaxed) + 1
@@ -19150,6 +19672,138 @@ private:
     const bool color0_write =
         desc.NumRenderTargets &&
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask != 0;
+
+    uint32_t anomaly_flags = 0;
+    std::string anomaly_reasons;
+    auto add_anomaly = [&](uint32_t flag, const char *reason) {
+      anomaly_flags |= flag;
+      if (!anomaly_reasons.empty())
+        anomaly_reasons += ',';
+      anomaly_reasons += reason;
+    };
+    constexpr uint32_t kMissingColorAttachment = 1u << 0;
+    constexpr uint32_t kColorFormatMismatch = 1u << 1;
+    constexpr uint32_t kDepthFormatMismatch = 1u << 2;
+    constexpr uint32_t kMissingVertexView = 1u << 3;
+    constexpr uint32_t kUnresolvedVertexView = 1u << 4;
+    constexpr uint32_t kVertexViewOutOfBounds = 1u << 5;
+    constexpr uint32_t kVertexFetchOutOfBounds = 1u << 6;
+    constexpr uint32_t kMissingIndexView = 1u << 7;
+    constexpr uint32_t kUnresolvedIndexView = 1u << 8;
+    constexpr uint32_t kIndexFetchOutOfBounds = 1u << 9;
+
+    for (UINT slot = 0; slot < desc.NumRenderTargets && slot < 8; slot++) {
+      const auto &blend = desc.BlendState.RenderTarget[
+          desc.BlendState.IndependentBlendEnable ? slot : 0];
+      if (!blend.RenderTargetWriteMask)
+        continue;
+      const auto attachment = std::find_if(
+          attachments.colors.begin(), attachments.colors.end(),
+          [slot](const auto &color) { return color.slot == slot; });
+      if (attachment == attachments.colors.end()) {
+        add_anomaly(kMissingColorAttachment,
+                    "writable-render-target-not-attached");
+      } else {
+        MTL_DXGI_FORMAT_DESC expected_format = {};
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
+                                      desc.RTVFormats[slot],
+                                      expected_format)) ||
+            attachment->format != expected_format.PixelFormat) {
+          add_anomaly(kColorFormatMismatch,
+                      "pipeline-rtv-format-mismatch");
+        }
+      }
+    }
+    if (desc.DepthStencilState.DepthEnable &&
+        desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+      MTL_DXGI_FORMAT_DESC expected_format = {};
+      if (!attachments.depth_stencil ||
+          FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc.DSVFormat,
+                                    expected_format)) ||
+          attachments.depth_stencil->format != expected_format.PixelFormat) {
+        add_anomaly(kDepthFormatMismatch, "pipeline-dsv-format-mismatch");
+      }
+    }
+
+    for (UINT slot = 0; slot < 32; slot++) {
+      if (!(slot_mask & (1u << slot)))
+        continue;
+      if (!state.vertex_buffers[slot]) {
+        add_anomaly(kMissingVertexView, "required-vertex-view-missing");
+        continue;
+      }
+      const auto &view = *state.vertex_buffers[slot];
+      UINT64 resource_offset = 0;
+      auto *resource = LookupBufferResourceByGpuVirtualAddress(
+          view.BufferLocation, &resource_offset);
+      if (!resource || !resource->GetBuffer()) {
+        add_anomaly(kUnresolvedVertexView,
+                    "required-vertex-view-unresolved");
+        continue;
+      }
+      const auto resource_width = resource->GetResourceDesc().Width;
+      if (resource_offset > resource_width ||
+          view.SizeInBytes > resource_width - resource_offset) {
+        add_anomaly(kVertexViewOutOfBounds,
+                    "vertex-view-exceeds-resource");
+      }
+
+      if (draw && view.StrideInBytes && draw->vertex_count_per_instance) {
+        const uint64_t last_vertex =
+            uint64_t(draw->start_vertex_location) +
+            draw->vertex_count_per_instance - 1;
+        const uint64_t required =
+            (last_vertex + 1) * uint64_t(view.StrideInBytes);
+        if (required > view.SizeInBytes)
+          add_anomaly(kVertexFetchOutOfBounds,
+                      "nonindexed-vertex-fetch-exceeds-view");
+      }
+    }
+
+    if (indexed_draw) {
+      if (!state.index_buffer) {
+        add_anomaly(kMissingIndexView, "indexed-draw-index-view-missing");
+      } else {
+        UINT64 resolved_offset = 0;
+        auto *resource = LookupBufferResourceByGpuVirtualAddress(
+            state.index_buffer->BufferLocation, &resolved_offset);
+        if (!resource || !resource->GetBuffer()) {
+          add_anomaly(kUnresolvedIndexView,
+                      "indexed-draw-index-view-unresolved");
+        }
+        const auto index_size = GetIndexSize(state.index_buffer->Format);
+        const uint64_t required =
+            (uint64_t(indexed_draw->start_index_location) +
+             indexed_draw->index_count_per_instance) *
+            index_size;
+        if (!index_size || required > state.index_buffer->SizeInBytes)
+          add_anomaly(kIndexFetchOutOfBounds,
+                      "indexed-draw-fetch-exceeds-view");
+      }
+    }
+
+    if (target_pso && anomaly_flags) {
+      static std::atomic<uint32_t> anomaly_log_count = 0;
+      if (D3D12DiagShouldLog(anomaly_log_count, true)) {
+        WARN("D3D12 diagnostic: selected draw state anomaly",
+             " sequence=", DiagCurrentReplayRecordSequence(),
+             " recordSerial=", DiagCurrentReplayRecordSerial(),
+             " pso=", cache_key,
+             " flags=0x", std::hex, anomaly_flags, std::dec,
+             " reasons=", anomaly_reasons,
+             " drawVertexCount=", draw ? draw->vertex_count_per_instance : 0,
+             " drawStartVertex=", draw ? draw->start_vertex_location : 0,
+             " indexCount=",
+             indexed_draw ? indexed_draw->index_count_per_instance : 0,
+             " startIndex=",
+             indexed_draw ? indexed_draw->start_index_location : 0,
+             " indexViewSize=",
+             state.index_buffer ? state.index_buffer->SizeInBytes : 0,
+             " inputSlotMask=0x", std::hex, slot_mask, std::dec,
+             " colorAttachments=", attachments.colors.size(),
+             " hasDepthStencil=", attachments.depth_stencil.has_value());
+      }
+    }
 
     INFO("D3D12 diagnostic: draw state",
          " kind=", kind,
@@ -21205,8 +21859,21 @@ private:
 
   void ReplayCopyTextureRegion(CommandChunk *chunk, ReplayState &state,
                                const CopyTextureRegionRecord &record) {
+    const bool perf_enabled = ReplayPerfEnabled();
+    const auto lookup_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
+    if (perf_enabled)
+      perDrawSubTimers().copyTextureCalls++;
     auto *dst = GetResource(record.dst.resource.ptr());
     auto *src = GetResource(record.src.resource.ptr());
+    const auto lookup_end =
+        perf_enabled ? clock::now() : clock::time_point{};
+    if (perf_enabled) {
+      perDrawSubTimers().copyTextureLookupUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(lookup_end -
+                                                                lookup_begin)
+              .count();
+    }
     if (!dst || !src)
       return;
 
@@ -21219,10 +21886,20 @@ private:
             ? record.dst.subresource_index
             : 0;
 
+    const auto ensure_begin =
+        perf_enabled ? clock::now() : clock::time_point{};
     if (dst->IsReservedTexture())
       dst->EnsureTextureAllocation("CopyTextureRegion dst");
     if (src->IsReservedTexture())
       src->EnsureTextureAllocation("CopyTextureRegion src");
+    const auto ensure_end =
+        perf_enabled ? clock::now() : clock::time_point{};
+    if (perf_enabled) {
+      perDrawSubTimers().copyTextureEnsureAllocationUs +=
+          std::chrono::duration_cast<std::chrono::microseconds>(ensure_end -
+                                                                ensure_begin)
+              .count();
+    }
     if (dst->GetTextureAllocation() && src->GetTextureAllocation() &&
         dst->GetTexture() && src->GetTexture()) {
       dst->SetPresentSourceView({});
@@ -21297,6 +21974,14 @@ private:
                " src_format=", uint32_t(src->GetResourceDesc().Format));
         }
       }
+      const auto queue_begin =
+          perf_enabled ? clock::now() : clock::time_point{};
+      if (perf_enabled) {
+        perDrawSubTimers().copyTexturePrepareUs +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                queue_begin - ensure_end)
+                .count();
+      }
       QueueBlitCommand(
           chunk, state, {record.src.resource.ptr()}, {record.dst.resource.ptr()},
           [dst_texture = std::move(dst_texture),
@@ -21338,6 +22023,13 @@ private:
           }
         }
       });
+      if (perf_enabled) {
+        perDrawSubTimers().copyTextureQueueUs +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                clock::now() - queue_begin)
+                .count();
+        perDrawSubTimers().copyTextureQueued++;
+      }
       return;
     }
 
