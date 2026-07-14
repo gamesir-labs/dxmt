@@ -20,6 +20,12 @@ d3d12_unit_suites = {
       'device/device_spec.cpp',
     ),
   },
+  'object': {
+    'sources': files(
+      'object/com_identity_spec.cpp',
+      'object/private_data_spec.cpp',
+    ),
+  },
   'cache': {
     'sources': files('cache/cache_spec.cpp'),
   },
