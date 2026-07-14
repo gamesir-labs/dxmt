@@ -2182,22 +2182,48 @@ Lookup(const T (&table)[N], uint32_t index, const T &fallback) {
 }
 
 bool
-IsDualSourceBlend(const D3D12_RENDER_TARGET_BLEND_DESC &desc) {
-  return desc.BlendEnable &&
-         (desc.SrcBlend >= D3D12_BLEND_SRC1_COLOR ||
-          desc.DestBlend >= D3D12_BLEND_SRC1_COLOR ||
-          desc.SrcBlendAlpha >= D3D12_BLEND_SRC1_COLOR ||
-          desc.DestBlendAlpha >= D3D12_BLEND_SRC1_COLOR);
+IsDualSourceBlendFactor(D3D12_BLEND factor) {
+  return factor >= D3D12_BLEND_SRC1_COLOR &&
+         factor <= D3D12_BLEND_INV_SRC1_ALPHA;
 }
 
 bool
-UsesDualSourceBlending(const D3D12_BLEND_DESC &desc) {
-  const auto count = desc.IndependentBlendEnable ? 8u : 1u;
+IsDualSourceBlend(const D3D12_RENDER_TARGET_BLEND_DESC &desc) {
+  return desc.BlendEnable &&
+         (IsDualSourceBlendFactor(desc.SrcBlend) ||
+          IsDualSourceBlendFactor(desc.DestBlend) ||
+          IsDualSourceBlendFactor(desc.SrcBlendAlpha) ||
+          IsDualSourceBlendFactor(desc.DestBlendAlpha));
+}
+
+bool
+UsesDualSourceBlending(const D3D12_BLEND_DESC &desc,
+                       uint32_t render_target_count) {
+  const auto count = desc.IndependentBlendEnable
+                         ? std::min(render_target_count, 8u)
+                         : std::min(render_target_count, 1u);
   for (UINT i = 0; i < count; i++) {
     if (IsDualSourceBlend(desc.RenderTarget[i]))
       return true;
   }
   return false;
+}
+
+bool
+CanLowerD3D12DualSourceBlending(const PipelineGraphicsState &state,
+                                uint32_t pixel_shader_render_target_mask) {
+  if (!UsesDualSourceBlending(state.desc.BlendState,
+                              state.desc.NumRenderTargets))
+    return false;
+
+  // D3D dual-source blending consumes o0 and o1 for the single render target
+  // at slot 0. Metal represents those values as color(0), index(0) and
+  // color(0), index(1), and rejects Source1 factors when the second output is
+  // absent. D3D leaves missing pixel-shader outputs undefined, so omit the
+  // incompatible blend state instead of submitting an invalid Metal pipeline.
+  return state.desc.NumRenderTargets == 1 &&
+         IsDualSourceBlend(state.desc.BlendState.RenderTarget[0]) &&
+         (pixel_shader_render_target_mask & 0x3u) == 0x3u;
 }
 
 bool
@@ -2250,6 +2276,7 @@ ApplyBlendState(PipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
                 uint32_t render_target_count,
                 uint32_t pixel_shader_render_target_mask,
+                bool metal_dual_source_blending,
                 const FormatCapabilityInspector &format_capabilities) {
   for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
     const auto &src =
@@ -2260,6 +2287,8 @@ ApplyBlendState(PipelineInfo &info,
                kColorWriteMaskMap[15]);
     if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid ||
         !(pixel_shader_render_target_mask & (1u << rt)))
+      continue;
+    if (IsDualSourceBlend(src) && !metal_dual_source_blending)
       continue;
 
     const auto format_capability =
@@ -2668,13 +2697,16 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     if (IsUnorm8RenderTargetFormat(rtv_formats[i]))
       unorm_output_reg_mask |= 1u << i;
   }
+  const uint32_t pixel_shader_render_target_mask =
+      ps ? ps->reflection().PSValidRenderTargets : 0;
+  const bool metal_dual_source_blending = CanLowerD3D12DualSourceBlending(
+      state, pixel_shader_render_target_mask);
   if (ps) {
     SM50_SHADER_PSO_PIXEL_SHADER_DATA ps_args = {};
     ps_args.type = SM50_SHADER_PSO_PIXEL_SHADER;
     ps_args.next = base_shader_args;
     ps_args.sample_mask = state.desc.SampleMask;
-    ps_args.dual_source_blending =
-        UsesDualSourceBlending(state.desc.BlendState);
+    ps_args.dual_source_blending = metal_dual_source_blending;
     ps_args.disable_depth_output = state.desc.DSVFormat == DXGI_FORMAT_UNKNOWN;
     ps_args.unorm_output_reg_mask = unorm_output_reg_mask;
     ps_args.demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
@@ -2780,7 +2812,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
           info.colors[i].pixel_format = rtv_formats[i];
       }
       ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
-                      ps ? ps->reflection().PSValidRenderTargets : 0,
+                      pixel_shader_render_target_mask,
+                      metal_dual_source_blending,
                       format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
@@ -2884,7 +2917,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
           info.colors[i].pixel_format = rtv_formats[i];
       }
       ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
-                      ps ? ps->reflection().PSValidRenderTargets : 0,
+                      pixel_shader_render_target_mask,
+                      metal_dual_source_blending,
                       format_capabilities);
 
       if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
@@ -2969,7 +3003,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       info.colors[i].pixel_format = rtv_formats[i];
   }
   ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets,
-                  ps ? ps->reflection().PSValidRenderTargets : 0,
+                  pixel_shader_render_target_mask,
+                  metal_dual_source_blending,
                   format_capabilities);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
