@@ -46,6 +46,25 @@ HRESULT CreateMsaaRenderTarget(ID3D12Device *device, DXGI_FORMAT format,
       reinterpret_cast<void **>(texture->put()));
 }
 
+HRESULT CreateReservedMsaaRenderTarget(ID3D12Device *device,
+                                       DXGI_FORMAT format,
+                                       UINT sample_count,
+                                       ComPtr<ID3D12Resource> *texture) {
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 64;
+  desc.Height = 64;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = sample_count;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  return device->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+      __uuidof(ID3D12Resource), reinterpret_cast<void **>(texture->put()));
+}
+
 D3D_FEATURE_LEVEL ResolveFeatureLevel(HRESULT query_result,
                                       D3D_FEATURE_LEVEL reported,
                                       D3D_FEATURE_LEVEL minimum) {
@@ -734,6 +753,110 @@ TEST_F(D3D12UnrealCapabilitySpec,
                           << "x MSAA returned a resource after rejection";
   }
   EXPECT_TRUE(found_unsupported);
+}
+
+TEST_F(D3D12UnrealCapabilitySpec,
+       InitializesUnsupportedMultisampleQualityQueries) {
+  for (const UINT sample_count : {0u, 3u, 16u, 32u}) {
+    SCOPED_TRACE(::testing::Message() << "sample_count=" << sample_count);
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    levels.SampleCount = sample_count;
+    levels.NumQualityLevels = UINT_MAX;
+    const HRESULT hr = device_->CheckFeatureSupport(
+        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels));
+    EXPECT_EQ(hr, sample_count == 0 ? E_FAIL : S_OK);
+    EXPECT_EQ(levels.NumQualityLevels, 0u);
+  }
+}
+
+TEST_F(D3D12UnrealCapabilitySpec,
+       ReportsConsistentMultisamplingAcrossTypelessFormatFamily) {
+  constexpr std::array formats = {
+      DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+      DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UINT,
+      DXGI_FORMAT_R8G8B8A8_SNORM, DXGI_FORMAT_R8G8B8A8_SINT,
+  };
+
+  for (const UINT sample_count : {2u, 4u, 8u}) {
+    UINT reference_quality_levels = UINT_MAX;
+    for (const DXGI_FORMAT format : formats) {
+      SCOPED_TRACE(::testing::Message()
+                   << "format=" << static_cast<UINT>(format)
+                   << " sample_count=" << sample_count);
+      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+      levels.Format = format;
+      levels.SampleCount = sample_count;
+      ASSERT_EQ(device_->CheckFeatureSupport(
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                    sizeof(levels)),
+                S_OK);
+      if (reference_quality_levels == UINT_MAX)
+        reference_quality_levels = levels.NumQualityLevels;
+      EXPECT_EQ(levels.NumQualityLevels, reference_quality_levels);
+    }
+  }
+}
+
+TEST_F(D3D12UnrealCapabilitySpec,
+       MatchesMsaaReportToCommittedRenderTargetCreation) {
+  constexpr std::array formats = {
+      DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+      DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+      DXGI_FORMAT_R32G32B32A32_FLOAT,
+  };
+
+  for (const DXGI_FORMAT format : formats) {
+    for (const UINT sample_count : {2u, 4u, 8u}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "format=" << static_cast<UINT>(format)
+                   << " sample_count=" << sample_count);
+      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+      levels.Format = format;
+      levels.SampleCount = sample_count;
+      ASSERT_EQ(device_->CheckFeatureSupport(
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                    sizeof(levels)),
+                S_OK);
+
+      ComPtr<ID3D12Resource> texture;
+      const HRESULT create_hr = CreateMsaaRenderTarget(
+          device_.get(), format, sample_count, &texture);
+      if (levels.NumQualityLevels) {
+        EXPECT_TRUE(SUCCEEDED(create_hr));
+        EXPECT_TRUE(texture);
+      } else {
+        EXPECT_TRUE(FAILED(create_hr));
+        EXPECT_FALSE(texture);
+      }
+    }
+  }
+}
+
+TEST_F(D3D12UnrealCapabilitySpec,
+       MatchesTiledMsaaReportToReservedResourceCreation) {
+  for (const UINT sample_count : {2u, 4u, 8u}) {
+    SCOPED_TRACE(::testing::Message() << "sample_count=" << sample_count);
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    levels.SampleCount = sample_count;
+    levels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE;
+    ASSERT_EQ(device_->CheckFeatureSupport(
+                  D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                  sizeof(levels)),
+              S_OK);
+
+    ComPtr<ID3D12Resource> texture;
+    const HRESULT create_hr = CreateReservedMsaaRenderTarget(
+        device_.get(), levels.Format, sample_count, &texture);
+    if (levels.NumQualityLevels) {
+      EXPECT_TRUE(SUCCEEDED(create_hr));
+      EXPECT_TRUE(texture);
+    } else {
+      EXPECT_TRUE(FAILED(create_hr));
+      EXPECT_FALSE(texture);
+    }
+  }
 }
 
 TEST_F(D3D12UnrealCapabilitySpec, ReportsEveryUnrealMsaaFallbackCandidate) {

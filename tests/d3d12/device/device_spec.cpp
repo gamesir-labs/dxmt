@@ -617,6 +617,42 @@ TEST_F(D3D12DeviceSpec, RejectsStreamOutputAtPipelineCreation) {
   release_object(root_signature);
 }
 
+TEST_F(D3D12DeviceSpec, RejectsEveryUnreportedMsaaPso) {
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ID3D12RootSignature *root_signature =
+      CreateRootSignature(device_, root_desc);
+  ASSERT_NE(root_signature, nullptr);
+
+  bool found_unsupported = false;
+  for (const UINT sample_count : {2u, 4u, 8u, 16u}) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
+    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    levels.SampleCount = sample_count;
+    ASSERT_EQ(device_->CheckFeatureSupport(
+                  D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                  sizeof(levels)),
+              S_OK);
+    if (levels.NumQualityLevels)
+      continue;
+    found_unsupported = true;
+
+    SCOPED_TRACE(::testing::Message() << "sample_count=" << sample_count);
+    auto desc = BasicGraphicsPipelineDesc(root_signature);
+    desc.SampleDesc.Count = sample_count;
+    ID3D12PipelineState *pipeline = nullptr;
+    EXPECT_EQ(device_->CreateGraphicsPipelineState(
+                  &desc, __uuidof(ID3D12PipelineState),
+                  reinterpret_cast<void **>(&pipeline)),
+              E_INVALIDARG);
+    EXPECT_EQ(pipeline, nullptr);
+    release_object(pipeline);
+  }
+  EXPECT_TRUE(found_unsupported);
+  release_object(root_signature);
+}
+
 TEST_F(D3D12DeviceSpec, IgnoresSharedBlendStateForReportedNonBlendableTarget) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;

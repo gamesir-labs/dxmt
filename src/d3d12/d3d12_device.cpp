@@ -2999,6 +2999,13 @@ public:
         return S_OK;
       }
 
+      // Reserved MSAA textures are not implemented. Keep tiled-resource
+      // queries separate from ordinary texture support so applications do not
+      // select a configuration that CreateReservedResource must reject.
+      if (data->Flags &
+          D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE)
+        return S_OK;
+
       MTL_DXGI_FORMAT_DESC format = {};
       const auto query_format =
           ResolveDepthTypelessFormatForD3D12Caps(data->Format);
