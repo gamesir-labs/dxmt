@@ -768,14 +768,31 @@ ClearResourceKernelContext::ClearResourceKernelContext(
     ctx_(ctx),
     device_(device) {
   auto library = lib.getLibrary();
-  cs_clear_buffer_uint_ = library.newFunction("cs_clear_buffer_uint");
-  cs_clear_buffer_float_ = library.newFunction("cs_clear_buffer_float");
-  cs_clear_tbuffer_uint_ = library.newFunction("cs_clear_tbuffer_uint");
-  cs_clear_tbuffer_float_ = library.newFunction("cs_clear_tbuffer_float");
-  cs_clear_texture2d_uint_ = library.newFunction("cs_clear_texture2d_uint");
-  cs_clear_texture2d_float_ = library.newFunction("cs_clear_texture2d_float");
-  cs_clear_texture2d_array_uint_ = library.newFunction("cs_clear_texture2d_array_uint");
-  cs_clear_texture2d_array_float_ = library.newFunction("cs_clear_texture2d_array_float");
+  auto create_pipeline = [&](const char *name) {
+    auto function = library.newFunction(name);
+    if (!function) {
+      ERR("Failed to find internal clear function: ", name);
+      abort();
+    }
+    WMT::Reference<WMT::Error> error;
+    auto pipeline = device_.newComputePipelineState(function, error);
+    if (!pipeline) {
+      ERR("Failed to create internal clear pipeline: ", name, ": ",
+          error ? error.description().getUTF8String() : "unknown error");
+      abort();
+    }
+    return pipeline;
+  };
+  cs_clear_buffer_uint_ = create_pipeline("cs_clear_buffer_uint");
+  cs_clear_buffer_float_ = create_pipeline("cs_clear_buffer_float");
+  cs_clear_tbuffer_uint_ = create_pipeline("cs_clear_tbuffer_uint");
+  cs_clear_tbuffer_float_ = create_pipeline("cs_clear_tbuffer_float");
+  cs_clear_texture2d_uint_ = create_pipeline("cs_clear_texture2d_uint");
+  cs_clear_texture2d_float_ = create_pipeline("cs_clear_texture2d_float");
+  cs_clear_texture2d_array_uint_ =
+      create_pipeline("cs_clear_texture2d_array_uint");
+  cs_clear_texture2d_array_float_ =
+      create_pipeline("cs_clear_texture2d_array_float");
 }
 
 void

@@ -382,14 +382,14 @@ private:
 
   ArgumentEncodingContext &ctx_;
   WMT::Device device_;
-  WMT::Reference<WMT::Function> cs_clear_buffer_uint_;
-  WMT::Reference<WMT::Function> cs_clear_buffer_float_;
-  WMT::Reference<WMT::Function> cs_clear_tbuffer_uint_;
-  WMT::Reference<WMT::Function> cs_clear_tbuffer_float_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_uint_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_float_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_array_uint_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_array_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_buffer_uint_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_buffer_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_tbuffer_uint_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_tbuffer_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_uint_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_uint_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_float_;
   Rc<Texture> clearing_texture_;
   Rc<Buffer> clearing_buffer_;
   TextureViewKey clearing_view_ = 0; // type compatible with BufferViewKey
