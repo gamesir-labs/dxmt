@@ -898,6 +898,26 @@ D3D12DiagBindingsEnabled() {
 }
 
 static bool
+D3D12DiagShaderFilterConfigured() {
+  const auto filters = env::getEnvVar("DXMT_DIAG_SHADER_HASHES");
+  return !filters.empty() && filters != "all";
+}
+
+static bool
+D3D12DiagShaderKeySelected(std::string_view shader_key) {
+  const auto filters = env::getEnvVar("DXMT_DIAG_SHADER_HASHES");
+  if (filters.empty() || filters == "all")
+    return true;
+
+  for (const auto filter : str::split(filters, ",; ")) {
+    if (filter == "all" || shader_key == filter ||
+        shader_key.starts_with(filter))
+      return true;
+  }
+  return false;
+}
+
+static bool
 D3D12DiagBindingRecipeCacheEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_BINDING_RECIPE_CACHE") ||
@@ -1195,8 +1215,8 @@ static bool
 D3D12DiagShouldLog(std::atomic<uint32_t> &counter, bool enabled) {
   if (!enabled)
     return false;
-  counter.fetch_add(1, std::memory_order_relaxed);
-  return true;
+  const auto occurrence = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  return occurrence <= 16 || (occurrence & (occurrence - 1)) == 0;
 }
 
 static std::string
@@ -12669,12 +12689,16 @@ private:
                            bool compute, PipelineStage stage, UINT root_index,
                            UINT slot, UINT shader_register,
                            UINT register_space, UINT64 size,
-                           D3D12_GPU_VIRTUAL_ADDRESS address) {
+                           D3D12_GPU_VIRTUAL_ADDRESS address,
+                           const DescriptorRecord *descriptor = nullptr) {
+    const auto &cache_key = pipeline.GetShaderCacheKey();
+    if (!D3D12DiagShaderKeySelected(cache_key))
+      return;
+
     static std::atomic<uint32_t> log_count = 0;
     if (!D3D12DiagShouldLog(log_count, D3D12DiagBindingsEnabled()))
       return;
 
-    const auto &cache_key = pipeline.GetShaderCacheKey();
     const auto key_size = std::min<size_t>(cache_key.size(), 16);
     std::string key_prefix(cache_key.c_str(), cache_key.c_str() + key_size);
     INFO("D3D12 diagnostic: root binding",
@@ -12687,7 +12711,22 @@ private:
          " register=", shader_register,
          " space=", register_space,
          " size=", uint64_t(size),
-         " address=", uint64_t(address));
+         " address=", uint64_t(address),
+         " descriptor=", static_cast<const void *>(descriptor),
+         " descriptorType=",
+         descriptor ? uint32_t(descriptor->type) : uint32_t(UINT_MAX),
+         " hasDesc=", descriptor && descriptor->has_desc ? 1 : 0,
+         " heapIndex=", descriptor ? descriptor->heap_index : UINT_MAX,
+         " heapCount=", descriptor ? descriptor->heap_count : 0,
+         " slotVersion=",
+         descriptor ? descriptor->slot_version.epoch : 0, ":",
+         descriptor ? descriptor->slot_version.sequence : 0,
+         " resource=",
+         descriptor ? static_cast<const void *>(descriptor->resource.ptr())
+                    : nullptr,
+         " format=",
+         descriptor ? uint32_t(D3D12DiagDescriptorFormat(*descriptor))
+                    : uint32_t(DXGI_FORMAT_UNKNOWN));
   }
 
   void ClearShaderResourceBinding(ArgumentEncodingContext &enc,
@@ -14166,13 +14205,15 @@ private:
   }
 
   static bool BindlessMirrorDiagEnabled() {
-    return false;
+    return D3D12DiagBindingsEnabled();
   }
 
   static bool BindlessMirrorDiagShouldLog() {
     static std::atomic<uint32_t> count = 0;
-    return BindlessMirrorDiagEnabled() &&
-           count.fetch_add(1, std::memory_order_relaxed) < 300;
+    if (!BindlessMirrorDiagEnabled())
+      return false;
+    const auto occurrence = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    return occurrence <= 16 || (occurrence & (occurrence - 1)) == 0;
   }
 
 	  struct BindlessMirrorDiagStats {
@@ -14185,6 +14226,13 @@ private:
     std::atomic<uint64_t> ps_tex_null = 0;
     std::atomic<uint64_t> vs_tex_null = 0;
     std::atomic<uint64_t> buf_table_null = 0;
+    std::atomic<uint64_t> texture_payload_mismatch = 0;
+    std::atomic<uint64_t> texture_source_missing = 0;
+    std::atomic<uint64_t> texture_window_missing = 0;
+    std::atomic<uint64_t> sampler_payload_mismatch = 0;
+    std::atomic<uint64_t> sampler_source_missing = 0;
+    std::atomic<uint64_t> sampler_window_missing = 0;
+    std::atomic<uint64_t> root_offset_missing = 0;
     std::mutex mutex;
     std::unordered_map<std::string, uint64_t> bindless_shader_pairs;
     std::unordered_set<std::string> dumped_shader_blobs;
@@ -14203,6 +14251,16 @@ private:
     uint32_t buf_table_null_gpu_addr = 0;
     PipelineStage example_buf_stage = PipelineStage::Vertex;
     uint32_t example_buf_qword = 0;
+    uint32_t texture_payload_mismatch = 0;
+    uint32_t texture_source_missing = 0;
+    uint32_t texture_window_missing = 0;
+    uint32_t sampler_payload_mismatch = 0;
+    uint32_t sampler_source_missing = 0;
+    uint32_t sampler_window_missing = 0;
+    uint32_t root_offset_missing = 0;
+    uint64_t binding_generation = 0;
+    dxmt::DescriptorContentRevision descriptor_revision = {};
+    uint64_t binding_fingerprint = 0;
   };
 
   static BindlessMirrorDiagStats &
@@ -14221,7 +14279,13 @@ private:
   static const std::filesystem::path &
   BindlessMirrorDiagShaderDumpDir() {
     static const std::filesystem::path path = []() {
-      const std::filesystem::path dump_dir("/tmp/fh4-cg-shaders");
+      auto root = env::getEnvVar("DXMT_DUMP_PATH");
+      if (root.empty())
+        root = env::getEnvVar("DXMT_LOG_PATH");
+      const std::filesystem::path dump_dir =
+          root.empty() || root == "none"
+              ? std::filesystem::path("/tmp/dxmt-bindless-shaders")
+              : std::filesystem::path(root) / "bindless-shaders";
       try {
         std::filesystem::create_directories(dump_dir);
       } catch (...) {
@@ -14284,6 +14348,14 @@ private:
     if (!BindlessMirrorDiagEnabled())
       return;
 
+    if (std::strcmp(reason, "present") == 0) {
+      static std::atomic<uint32_t> present_count = 0;
+      const auto occurrence =
+          present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (occurrence > 4 && (occurrence & (occurrence - 1)) != 0)
+        return;
+    }
+
 	    auto &stats = BindlessMirrorDiagStatsInstance();
 	    const auto total =
 	        stats.total_graphics_draws.load(std::memory_order_relaxed);
@@ -14303,8 +14375,22 @@ private:
          " mismatch=", stats.mismatch.load(std::memory_order_relaxed),
          " psTexNull=", stats.ps_tex_null.load(std::memory_order_relaxed),
          " vsTexNull=", stats.vs_tex_null.load(std::memory_order_relaxed),
-         " bufTableNull=",
-         stats.buf_table_null.load(std::memory_order_relaxed));
+         " bufRangeBaseNull=",
+         stats.buf_table_null.load(std::memory_order_relaxed),
+         " texturePayloadMismatch=",
+         stats.texture_payload_mismatch.load(std::memory_order_relaxed),
+         " textureSourceMissing=",
+         stats.texture_source_missing.load(std::memory_order_relaxed),
+         " textureWindowMissing=",
+         stats.texture_window_missing.load(std::memory_order_relaxed),
+         " samplerPayloadMismatch=",
+         stats.sampler_payload_mismatch.load(std::memory_order_relaxed),
+         " samplerSourceMissing=",
+         stats.sampler_source_missing.load(std::memory_order_relaxed),
+         " samplerWindowMissing=",
+         stats.sampler_window_missing.load(std::memory_order_relaxed),
+         " rootOffsetMissing=",
+         stats.root_offset_missing.load(std::memory_order_relaxed));
 
     if (std::strcmp(reason, "command-queue-destroy") != 0)
       return;
@@ -14329,7 +14415,7 @@ private:
       const auto ps_sha1 = sep == std::string::npos ? std::string()
                                                     : entry.first.substr(sep + 1);
       INFO("DXMT bindless-mirror DIAG shader-pair"
-           " draws=", entry.second,
+           " samples=", entry.second,
            " vs=", vs_sha1,
            " ps=", ps_sha1);
     }
@@ -14357,13 +14443,35 @@ private:
     stats.vs_tex_null.fetch_add(diag.vs_tex_null, std::memory_order_relaxed);
     stats.buf_table_null.fetch_add(diag.buf_table_null_gpu_addr,
                                    std::memory_order_relaxed);
+    stats.texture_payload_mismatch.fetch_add(
+        diag.texture_payload_mismatch, std::memory_order_relaxed);
+    stats.texture_source_missing.fetch_add(
+        diag.texture_source_missing, std::memory_order_relaxed);
+    stats.texture_window_missing.fetch_add(
+        diag.texture_window_missing, std::memory_order_relaxed);
+    stats.sampler_payload_mismatch.fetch_add(
+        diag.sampler_payload_mismatch, std::memory_order_relaxed);
+    stats.sampler_source_missing.fetch_add(
+        diag.sampler_source_missing, std::memory_order_relaxed);
+    stats.sampler_window_missing.fetch_add(
+        diag.sampler_window_missing, std::memory_order_relaxed);
+    stats.root_offset_missing.fetch_add(diag.root_offset_missing,
+                                        std::memory_order_relaxed);
 
-    if (diag.uses_bindless_mirror && pipeline) {
-      const auto *vs_shader = FindShaderForStage(*pipeline, PipelineStage::Vertex);
-      const auto *ps_shader = FindShaderForStage(*pipeline, PipelineStage::Pixel);
-      if (vs_shader || ps_shader) {
-        const auto vs_sha1 = vs_shader ? BindlessMirrorShaderSha1(*vs_shader) : "";
-        const auto ps_sha1 = ps_shader ? BindlessMirrorShaderSha1(*ps_shader) : "";
+    const bool sample = BindlessMirrorDiagShouldLog();
+    if (!sample)
+      return;
+
+    std::string vs_sha1;
+    std::string ps_sha1;
+    if (pipeline) {
+      const auto *vs_shader =
+          FindShaderForStage(*pipeline, PipelineStage::Vertex);
+      const auto *ps_shader =
+          FindShaderForStage(*pipeline, PipelineStage::Pixel);
+      vs_sha1 = vs_shader ? BindlessMirrorShaderSha1(*vs_shader) : "";
+      ps_sha1 = ps_shader ? BindlessMirrorShaderSha1(*ps_shader) : "";
+      if (diag.uses_bindless_mirror && (vs_shader || ps_shader)) {
         if (vs_shader)
           DumpBindlessMirrorShaderDxbc("vs", *vs_shader);
         if (ps_shader)
@@ -14373,22 +14481,33 @@ private:
       }
     }
 
-    if (!BindlessMirrorDiagShouldLog())
-      return;
-
     INFO("DXMT bindless-mirror DIAG draw"
          " draw=", draw,
          " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
          " d3dSeq=", DiagCurrentReplayRecordSequence(),
          " serial=", DiagCurrentReplayRecordSerial(),
+         " vs=", vs_sha1,
+         " ps=", ps_sha1,
+         " bindingGeneration=", diag.binding_generation,
+         " descriptorRevision=", diag.descriptor_revision.epoch, ":",
+         diag.descriptor_revision.sequence,
+         " bindingFingerprint=0x", std::hex, diag.binding_fingerprint,
+         std::dec,
          " psoBindless=", diag.uses_bindless_mirror ? 1 : 0,
          " path=", diag.path,
          mismatch ? " MISMATCH" : "",
          " psTex=", diag.ps_tex,
          " vsTex=", diag.vs_tex,
          " texNull=", diag.tex_null,
-         " bufEntries=", diag.buf_table_entries,
-         " bufNullGpuAddr=", diag.buf_table_null_gpu_addr,
+         " bufRangeBases=", diag.buf_table_entries,
+         " bufRangeBaseNullGpuAddr=", diag.buf_table_null_gpu_addr,
+         " texturePayloadMismatch=", diag.texture_payload_mismatch,
+         " textureSourceMissing=", diag.texture_source_missing,
+         " textureWindowMissing=", diag.texture_window_missing,
+         " samplerPayloadMismatch=", diag.sampler_payload_mismatch,
+         " samplerSourceMissing=", diag.sampler_source_missing,
+         " samplerWindowMissing=", diag.sampler_window_missing,
+         " rootOffsetMissing=", diag.root_offset_missing,
          " exampleBufStage=",
          diag.buf_table_null_gpu_addr
              ? PipelineStageName(diag.example_buf_stage)
@@ -14437,16 +14556,66 @@ private:
 
   struct BindlessMirrorDiagProbe {
     const char *path = nullptr;
+    const PipelineState *pipeline = nullptr;
+    const BindlessMirrorWindow *window = nullptr;
     PipelineStage stage = PipelineStage::Pixel;
     const DXMT12_MTL4_SHADER_ARGUMENT *arg = nullptr;
     UINT shader_register = 0;
     UINT lower_bound = 0;
     uint32_t root_offset = 0;
     uint32_t absolute_slot = 0;
-    uint32_t live_base = 0;
-    bool has_live_base = false;
     std::optional<DescriptorRecord> descriptor;
   };
+
+  enum BindlessRootOffsetIssue : uint32_t {
+    BindlessRootOffsetIssueMissingPlanCoverage = 1u << 0,
+    BindlessRootOffsetIssueMissingTable = 1u << 1,
+    BindlessRootOffsetIssueMissingDescriptor = 1u << 2,
+    BindlessRootOffsetIssueMissingMirror = 1u << 3,
+    BindlessRootOffsetIssueMissingWindow = 1u << 4,
+    BindlessRootOffsetIssueMissingSnapshotEntry = 1u << 5,
+  };
+
+  void DiagnoseBindlessRootOffsetGap(
+      const char *path, const PipelineState *pipeline, PipelineStage stage,
+      const DXMT12_MTL4_SHADER_ARGUMENT &arg, uint32_t issue_flags,
+      BindlessMirrorDrawDiag *draw_diag) {
+    if (!BindlessMirrorDiagEnabled())
+      return;
+    if (draw_diag)
+      draw_diag->root_offset_missing++;
+
+    static std::atomic<uint32_t> occurrence_count = 0;
+    const auto occurrence =
+        occurrence_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (occurrence > 64 && (occurrence & (occurrence - 1)) != 0)
+      return;
+
+    std::string pso;
+    std::string shader_hash;
+    if (pipeline) {
+      const auto &cache_key = pipeline->GetShaderCacheKey();
+      pso.assign(cache_key.c_str(),
+                 cache_key.c_str() + std::min<size_t>(cache_key.size(), 16));
+      if (const auto *shader = FindShaderForStage(*pipeline, stage))
+        shader_hash = BindlessMirrorShaderSha1(*shader);
+    }
+    WARN("DXMT bindless-window DIAG root-offset-gap",
+         " occurrence=", occurrence,
+         " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
+         " recordSerial=", DiagCurrentReplayRecordSerial(),
+         " path=", path ? path : "unknown",
+         " pso=", pso,
+         " shader=", shader_hash,
+         " stage=", PipelineStageName(stage),
+         " argKey=", arg.StructurePtrOffset,
+         " type=", uint32_t(arg.Type),
+         " slot=", arg.SM50BindingSlot,
+         " lower=", arg.RegisterLowerBound,
+         " count=", arg.RegisterCount,
+         " flags=0x", std::hex, uint32_t(arg.Flags),
+         " issueFlags=0x", issue_flags, std::dec);
+  }
 
   bool ProbeBindlessMirrorTextureBinding(const BindlessMirrorDiagProbe &probe,
                                          BindlessMirrorDrawDiag *draw_diag) {
@@ -14454,55 +14623,120 @@ private:
       return false;
 
     auto *mirror = probe.descriptor->mirror;
-    const bool sampler_heap = mirror && mirror->isSamplerHeap();
-    const auto sampler_payload =
-        sampler_heap ? mirror->samplerSlotPayload(probe.absolute_slot)
-                     : std::nullopt;
-    const auto texture_payload =
-        mirror && !sampler_heap
-            ? mirror->textureSlotPayload(probe.absolute_slot)
-            : std::nullopt;
-    const uint64_t handle = sampler_payload
-                                ? sampler_payload->handle
-                                : texture_payload ? texture_payload->handle : 0;
-    const uint64_t meta = sampler_payload
-                              ? sampler_payload->lod_bias
-                              : texture_payload ? texture_payload->metadata : 0;
+    auto source_payload =
+        BuildBindlessTextureWindowPayload(*probe.descriptor, *probe.arg);
+    if (!source_payload && mirror && !mirror->isSamplerHeap())
+      source_payload = mirror->textureSlotPayload(
+          probe.descriptor->heap_index, probe.descriptor->slot_version);
+
+    std::optional<DescriptorTextureSlotPayload> window_payload;
+    uint32_t pair_mismatches = 0;
+    bool window_in_bounds = false;
+    if (probe.window && probe.window->texture.mapped &&
+        probe.window->texture_field_pairs &&
+        probe.absolute_slot < dxmt::kBindlessMirrorCapacity) {
+      const auto *qwords =
+          static_cast<const uint64_t *>(probe.window->texture.mapped);
+      const auto qword_count =
+          probe.window->texture.length / sizeof(uint64_t);
+      for (uint32_t pair = 0; pair < probe.window->texture_field_pairs;
+           pair++) {
+        const uint64_t pair_base =
+            uint64_t(pair) * dxmt::kMirrorTextureQwords *
+            dxmt::kBindlessMirrorCapacity;
+        const uint64_t handle_index = pair_base + probe.absolute_slot;
+        const uint64_t meta_index =
+            pair_base + dxmt::kBindlessMirrorCapacity + probe.absolute_slot;
+        if (meta_index >= qword_count)
+          break;
+        window_in_bounds = true;
+        const DescriptorTextureSlotPayload payload{
+            qwords[handle_index], qwords[meta_index]};
+        if (!window_payload)
+          window_payload = payload;
+        else if (payload.handle != window_payload->handle ||
+                 payload.metadata != window_payload->metadata)
+          pair_mismatches++;
+      }
+    }
+
     const auto filled_version =
-        mirror ? mirror->slotFilledVersion(probe.absolute_slot)
+        mirror ? mirror->slotFilledVersion(probe.descriptor->heap_index)
                : dxmt::DescriptorSlotVersion{};
     const auto stale_version =
-        mirror ? mirror->slotStaleVersion(probe.absolute_slot)
+        mirror ? mirror->slotStaleVersion(probe.descriptor->heap_index)
                : dxmt::DescriptorSlotVersion{};
-    const bool snapshot_base_diverged =
-        probe.has_live_base && probe.root_offset != probe.live_base;
-    const bool null_handle = handle == 0;
+    auto *resource = GetResource(probe.descriptor->resource.ptr());
+    const auto resource_desc =
+        resource ? resource->GetResourceDesc() : D3D12_RESOURCE_DESC{};
+    auto *texture = resource ? resource->GetTexture() : nullptr;
+    auto *allocation = resource ? resource->GetTextureAllocation() : nullptr;
+    const bool source_missing =
+        !source_payload && resource && texture && probe.descriptor->has_desc;
+    const bool window_missing =
+        source_payload && (!window_in_bounds || !window_payload);
+    const bool payload_mismatch =
+        source_payload && window_payload &&
+        (source_payload->handle != window_payload->handle ||
+         source_payload->metadata != window_payload->metadata ||
+         pair_mismatches != 0);
+    const bool invalid = source_missing || window_missing || payload_mismatch;
+    UINT view_dimension = 0;
+    if (probe.descriptor->has_desc &&
+        probe.descriptor->type == DescriptorRecordType::ShaderResourceView)
+      view_dimension = UINT(probe.descriptor->desc.srv.ViewDimension);
+    else if (probe.descriptor->has_desc &&
+             probe.descriptor->type ==
+                 DescriptorRecordType::UnorderedAccessView)
+      view_dimension = UINT(probe.descriptor->desc.uav.ViewDimension);
     if (draw_diag) {
       if (probe.stage == PipelineStage::Pixel)
         draw_diag->ps_tex++;
       else if (probe.stage == PipelineStage::Vertex)
         draw_diag->vs_tex++;
-      if (null_handle) {
+      if (invalid) {
         draw_diag->tex_null++;
         if (probe.stage == PipelineStage::Pixel)
           draw_diag->ps_tex_null++;
         else if (probe.stage == PipelineStage::Vertex)
           draw_diag->vs_tex_null++;
       }
+      draw_diag->texture_payload_mismatch += payload_mismatch;
+      draw_diag->texture_source_missing += source_missing;
+      draw_diag->texture_window_missing += window_missing;
     }
-    const bool sample = BindlessMirrorDiagShouldLog();
-    if (!null_handle && !snapshot_base_diverged && !sample)
+    static std::atomic<uint32_t> invalid_count = 0;
+    const auto invalid_occurrence =
+        invalid ? invalid_count.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    const bool log_invalid =
+        invalid_occurrence &&
+        (invalid_occurrence <= 64 ||
+         (invalid_occurrence & (invalid_occurrence - 1)) == 0);
+    const bool sample = !invalid && BindlessMirrorDiagShouldLog();
+    if (!log_invalid && !sample)
       return false;
-    if (!sample)
-      return null_handle;
     const char *fill_state = filled_version == stale_version
                                  ? (filled_version ? "filled" : "never-filled")
                                  : "stale";
 
-    INFO("DXMT bindless-mirror DIAG"
+    std::string pso;
+    std::string shader_hash;
+    if (probe.pipeline) {
+      const auto &cache_key = probe.pipeline->GetShaderCacheKey();
+      pso.assign(cache_key.c_str(),
+                 cache_key.c_str() + std::min<size_t>(cache_key.size(), 16));
+      if (const auto *shader =
+              FindShaderForStage(*probe.pipeline, probe.stage))
+        shader_hash = BindlessMirrorShaderSha1(*shader);
+    }
+
+    INFO("DXMT bindless-window DIAG"
+         " invalidOccurrence=", invalid_occurrence,
          " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
          " draw=", DiagCurrentReplayRecordSequence(),
          " drawSerial=", DiagCurrentReplayRecordSerial(),
+         " pso=", pso,
+         " shader=", shader_hash,
          " stage=", PipelineStageName(probe.stage),
          " argKey=", probe.arg->StructurePtrOffset,
          " register=", probe.shader_register,
@@ -14515,15 +14749,147 @@ private:
          " filledSequence=", filled_version.sequence,
          " staleEpoch=", stale_version.epoch,
          " staleSequence=", stale_version.sequence,
-         " handle=", handle,
-         " meta=", meta,
-         " liveBase=", probe.has_live_base ? probe.live_base : UINT32_MAX,
+         " sourceHandle=", source_payload ? source_payload->handle : 0,
+         " sourceMeta=", source_payload ? source_payload->metadata : 0,
+         " windowHandle=", window_payload ? window_payload->handle : 0,
+         " windowMeta=", window_payload ? window_payload->metadata : 0,
+         " windowInBounds=", window_in_bounds ? 1 : 0,
+         " windowPairs=",
+         probe.window ? probe.window->texture_field_pairs : 0,
+         " pairMismatches=", pair_mismatches,
          " descriptorSlot=", probe.descriptor->heap_index,
+         " descriptorVersion=", probe.descriptor->slot_version.epoch, ":",
+         probe.descriptor->slot_version.sequence,
          " descriptorType=", uint32_t(probe.descriptor->type),
          " hasDesc=", probe.descriptor->has_desc ? 1 : 0,
-         " reason=", snapshot_base_diverged ? "snapshot-base-diverged"
-                                            : null_handle ? "null-handle" : "sample");
-    return null_handle;
+         " viewDimension=", view_dimension,
+         " descriptorFormat=",
+         uint32_t(D3D12DiagDescriptorFormat(*probe.descriptor)),
+         " d3dResource=", uint64_t(probe.descriptor->resource.ptr()),
+         " resource=",
+         uint64_t(resource ? resource->GetD3D12Resource() : nullptr),
+         " resourceDimension=", uint32_t(resource_desc.Dimension),
+         " resourceSize=", uint64_t(resource_desc.Width), "x",
+         uint32_t(resource_desc.Height), "x",
+         uint32_t(resource_desc.DepthOrArraySize),
+         " resourceMips=", uint32_t(resource_desc.MipLevels),
+         " resourceFormat=", uint32_t(resource_desc.Format),
+         " resourceSamples=", uint32_t(resource_desc.SampleDesc.Count),
+         " textureDescriptor=", uint64_t(texture),
+         " textureIdentity=", texture ? texture->diagnosticIdentity() : 0,
+         " allocation=", uint64_t(allocation),
+         " metalTexture=",
+         texture && texture->current()
+             ? uint64_t(texture->current()->texture())
+             : 0,
+         " reason=", source_missing
+                         ? "source-payload-missing"
+                         : window_missing
+                               ? "window-payload-missing"
+                               : payload_mismatch ? "payload-mismatch"
+                                                  : "sample-valid");
+    return invalid;
+  }
+
+  bool ProbeBindlessMirrorSamplerBinding(const BindlessMirrorDiagProbe &probe,
+                                         BindlessMirrorDrawDiag *draw_diag) {
+    if (!BindlessMirrorDiagEnabled() || !probe.arg || !probe.descriptor)
+      return false;
+
+    auto *mirror = probe.descriptor->mirror;
+    const auto source_payload =
+        mirror && mirror->isSamplerHeap()
+            ? mirror->samplerSlotPayload(probe.descriptor->heap_index,
+                                         probe.descriptor->slot_version)
+            : std::nullopt;
+    std::optional<DescriptorSamplerSlotPayload> window_payload;
+    bool window_in_bounds = false;
+    if (probe.window && probe.window->sampler.mapped &&
+        probe.absolute_slot < dxmt::kBindlessMirrorCapacity) {
+      const auto *qwords =
+          static_cast<const uint64_t *>(probe.window->sampler.mapped);
+      const auto qword_count = probe.window->sampler.length / sizeof(uint64_t);
+      const uint64_t handle_index = probe.absolute_slot;
+      const uint64_t cube_index =
+          uint64_t(dxmt::kBindlessMirrorCapacity) + probe.absolute_slot;
+      const uint64_t lod_index =
+          uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + probe.absolute_slot;
+      if (lod_index < qword_count) {
+        window_in_bounds = true;
+        window_payload = DescriptorSamplerSlotPayload{
+            qwords[handle_index], qwords[cube_index], qwords[lod_index]};
+      }
+    }
+
+    const bool source_missing =
+        !source_payload && mirror && probe.descriptor->has_desc;
+    const bool window_missing =
+        source_payload && (!window_in_bounds || !window_payload);
+    const bool payload_mismatch =
+        source_payload && window_payload &&
+        (source_payload->handle != window_payload->handle ||
+         source_payload->cube_handle != window_payload->cube_handle ||
+         source_payload->lod_bias != window_payload->lod_bias);
+    const bool invalid = source_missing || window_missing || payload_mismatch;
+    if (draw_diag) {
+      draw_diag->sampler_payload_mismatch += payload_mismatch;
+      draw_diag->sampler_source_missing += source_missing;
+      draw_diag->sampler_window_missing += window_missing;
+    }
+
+    static std::atomic<uint32_t> invalid_count = 0;
+    const auto invalid_occurrence =
+        invalid ? invalid_count.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    const bool log_invalid =
+        invalid_occurrence &&
+        (invalid_occurrence <= 64 ||
+         (invalid_occurrence & (invalid_occurrence - 1)) == 0);
+    const bool sample = !invalid && BindlessMirrorDiagShouldLog();
+    if (!log_invalid && !sample)
+      return false;
+
+    std::string pso;
+    std::string shader_hash;
+    if (probe.pipeline) {
+      const auto &cache_key = probe.pipeline->GetShaderCacheKey();
+      pso.assign(cache_key.c_str(),
+                 cache_key.c_str() + std::min<size_t>(cache_key.size(), 16));
+      if (const auto *shader = FindShaderForStage(*probe.pipeline, probe.stage))
+        shader_hash = BindlessMirrorShaderSha1(*shader);
+    }
+    INFO("DXMT bindless-sampler-window DIAG",
+         " invalidOccurrence=", invalid_occurrence,
+         " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
+         " draw=", DiagCurrentReplayRecordSequence(),
+         " drawSerial=", DiagCurrentReplayRecordSerial(),
+         " pso=", pso,
+         " shader=", shader_hash,
+         " stage=", PipelineStageName(probe.stage),
+         " argKey=", probe.arg->StructurePtrOffset,
+         " register=", probe.shader_register,
+         " lower=", probe.lower_bound,
+         " rootOffset=", probe.root_offset,
+         " absoluteSlot=", probe.absolute_slot,
+         " path=", probe.path ? probe.path : "unknown",
+         " sourceHandle=", source_payload ? source_payload->handle : 0,
+         " sourceCube=", source_payload ? source_payload->cube_handle : 0,
+         " sourceLodBias=", source_payload ? source_payload->lod_bias : 0,
+         " windowHandle=", window_payload ? window_payload->handle : 0,
+         " windowCube=", window_payload ? window_payload->cube_handle : 0,
+         " windowLodBias=", window_payload ? window_payload->lod_bias : 0,
+         " windowInBounds=", window_in_bounds ? 1 : 0,
+         " descriptorSlot=", probe.descriptor->heap_index,
+         " descriptorVersion=", probe.descriptor->slot_version.epoch, ":",
+         probe.descriptor->slot_version.sequence,
+         " descriptorType=", uint32_t(probe.descriptor->type),
+         " hasDesc=", probe.descriptor->has_desc ? 1 : 0,
+         " reason=", source_missing
+                         ? "source-payload-missing"
+                         : window_missing
+                               ? "window-payload-missing"
+                               : payload_mismatch ? "payload-mismatch"
+                                                  : "sample-valid");
+    return invalid;
   }
 
   BindlessMirrorStagePlan
@@ -15043,6 +15409,11 @@ private:
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
     std::memset(root_offsets, 0, slice.length);
+    const bool bindless_diag_enabled = BindlessMirrorDiagEnabled();
+    std::vector<uint8_t> root_offset_assigned(
+        bindless_diag_enabled ? plan->max_key_plus_one : 0, 0);
+    std::vector<uint32_t> root_offset_issues(
+        bindless_diag_enabled ? plan->max_key_plus_one : 0, 0);
     if (window) {
       if (plan->texture_count) {
         const uint64_t qwords =
@@ -15071,16 +15442,26 @@ private:
         continue;
       const auto &argument = arguments[entry.argument_index];
       const auto base_handle = GetTableHandle(state, compute, entry.root_index);
-      if (!base_handle.ptr)
+      if (!base_handle.ptr) {
+        if (bindless_diag_enabled)
+          root_offset_issues[entry.root_offset_key] |=
+              BindlessRootOffsetIssueMissingTable;
         continue;
+      }
 
       auto *heap = GetBoundDescriptorHeap(state, entry.heap_type);
       const auto descriptor = GetBoundDescriptorRecordInRangeFromHeap(
           heap, base_handle, entry.range_offset, entry.descriptor_index,
           entry.descriptor_count, entry.heap_type);
-      if (!descriptor)
+      if (!descriptor) {
+        if (bindless_diag_enabled)
+          root_offset_issues[entry.root_offset_key] |=
+              BindlessRootOffsetIssueMissingDescriptor;
         continue;
+      }
       root_offsets[entry.root_offset_key] = entry.compact_base;
+      if (bindless_diag_enabled)
+        root_offset_assigned[entry.root_offset_key] = 1;
       if (window) {
         for (UINT local = 0;
              local < entry.range_count &&
@@ -15144,8 +15525,7 @@ private:
                                                   want_stage, &argument);
         }
       }
-      if (BindlessMirrorDiagEnabled() &&
-          entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+      if (bindless_diag_enabled && (entry.texture || entry.sampler)) {
         for (UINT local = 0;
              local < entry.range_count &&
              entry.descriptor_index + local < entry.descriptor_count;
@@ -15158,9 +15538,9 @@ private:
             continue;
           const auto dst_local = entry.argument_local_start + local;
           bindless_diag_probes.push_back(BindlessMirrorDiagProbe{
-              "live", want_stage, &argument,
+              "live", &pipeline, window, want_stage, &argument,
               entry.shader_register_lower_bound + dst_local,
-              entry.shader_register_lower_bound, 0, 0, 0, false,
+              entry.shader_register_lower_bound, 0, 0,
               slot_descriptor});
         }
       }
@@ -15177,6 +15557,8 @@ private:
         uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
         EncodeMirrorSamplerSlot(encoded, *sampler);
         root_offsets[entry.root_offset_key] = entry.compact_base;
+        if (bindless_diag_enabled)
+          root_offset_assigned[entry.root_offset_key] = 1;
         dst[entry.compact_slot] = encoded[0];
         dst[dxmt::kBindlessMirrorCapacity + entry.compact_slot] = encoded[1];
         dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + entry.compact_slot] =
@@ -15189,7 +15571,29 @@ private:
       const auto local = probe.shader_register - probe.lower_bound;
       probe.root_offset = root_offsets[probe.arg->StructurePtrOffset];
       probe.absolute_slot = probe.root_offset + local;
-      ProbeBindlessMirrorTextureBinding(probe, draw_diag);
+      if (probe.arg->Type == SM50BindingType::Sampler)
+        ProbeBindlessMirrorSamplerBinding(probe, draw_diag);
+      else
+        ProbeBindlessMirrorTextureBinding(probe, draw_diag);
+    }
+    if (bindless_diag_enabled) {
+      std::vector<uint8_t> diagnosed(plan->max_key_plus_one, 0);
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &argument = arguments[i];
+        const bool tracked = argument.Type == SM50BindingType::Sampler ||
+                             (argument.Flags &
+                              MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+        const auto key = argument.StructurePtrOffset;
+        if (!tracked || key >= plan->max_key_plus_one || diagnosed[key] ||
+            root_offset_assigned[key])
+          continue;
+        diagnosed[key] = 1;
+        DiagnoseBindlessRootOffsetGap(
+            "live", &pipeline, want_stage, argument,
+            root_offset_issues[key] |
+                BindlessRootOffsetIssueMissingPlanCoverage,
+            draw_diag);
+      }
     }
     if (slice.needs_flush)
       slice.gpu_buffer.updateContents(slice.offset, slice.mapped, slice.length);
@@ -15356,6 +15760,25 @@ private:
     for (const auto &entry : recipe.entries) {
       const auto base = get_table(entry.root_index);
       if (!base.ptr) {
+        if (D3D12DiagBindingsEnabled() &&
+            D3D12DiagShaderFilterConfigured() &&
+            D3D12DiagShaderKeySelected(pipeline.GetShaderCacheKey())) {
+          static std::atomic<uint32_t> missing_table_count = 0;
+          if (D3D12DiagShouldLog(missing_table_count, true)) {
+            WARN("D3D12 diagnostic: selected binding unresolved",
+                 " reason=missing-table",
+                 " pso=", pipeline.GetShaderCacheKey(),
+                 " stage=", PipelineStageName(
+                     static_cast<PipelineStage>(entry.stage)),
+                 " root=", entry.root_index,
+                 " range=", entry.range_index,
+                 " slot=", entry.slot,
+                 " register=", entry.shader_register,
+                 " lower=", entry.register_lower_bound,
+                 " descriptorIndex=", entry.descriptor_index,
+                 " descriptorCount=", entry.descriptor_count);
+          }
+        }
         missing_tables++;
         continue;
       }
@@ -15368,6 +15791,26 @@ private:
           entry.descriptor_count, heap_type);
       const auto stage = static_cast<PipelineStage>(entry.stage);
       if (!descriptor) {
+        if (D3D12DiagBindingsEnabled() &&
+            D3D12DiagShaderFilterConfigured() &&
+            D3D12DiagShaderKeySelected(pipeline.GetShaderCacheKey())) {
+          static std::atomic<uint32_t> missing_descriptor_count = 0;
+          if (D3D12DiagShouldLog(missing_descriptor_count, true)) {
+            WARN("D3D12 diagnostic: selected binding unresolved",
+                 " reason=missing-descriptor",
+                 " pso=", pipeline.GetShaderCacheKey(),
+                 " stage=", PipelineStageName(stage),
+                 " root=", entry.root_index,
+                 " range=", entry.range_index,
+                 " slot=", entry.slot,
+                 " register=", entry.shader_register,
+                 " lower=", entry.register_lower_bound,
+                 " table=", uint64_t(base.ptr),
+                 " heap=", static_cast<const void *>(heap),
+                 " descriptorIndex=", entry.descriptor_index,
+                 " descriptorCount=", entry.descriptor_count);
+          }
+        }
         ClearDescriptorBinding(enc, stage, range_type, entry.slot);
         cleared++;
         continue;
@@ -15375,7 +15818,7 @@ private:
       DebugLogRootBinding(
           DescriptorRangeTypeName(range_type), pipeline, compute, stage,
           entry.root_index, entry.slot, 0, 0,
-          DescriptorRecordSizeBytes(*descriptor), 0);
+          DescriptorRecordSizeBytes(*descriptor), 0, &*descriptor);
       MaybeFillBindlessMirrorSlot(enc, range_type, *descriptor, stage,
                                   &entry.argument);
       BindDescriptor(enc, stage, range_type, entry.slot, *descriptor,
@@ -16174,6 +16617,24 @@ private:
                                     const PipelineDxilShader &shader,
                                     const std::string &shader_key,
                                     uint64_t &argbuf_offset) {
+    if (D3D12DiagBindingsEnabled() && D3D12DiagShaderFilterConfigured() &&
+        D3D12DiagShaderKeySelected(shader_key)) {
+      const char *stage_name = "unknown";
+      if constexpr (Stage == PipelineStage::Vertex)
+        stage_name = "vs";
+      else if constexpr (Stage == PipelineStage::Pixel)
+        stage_name = "ps";
+      else if constexpr (Stage == PipelineStage::Geometry)
+        stage_name = "gs";
+      else if constexpr (Stage == PipelineStage::Hull)
+        stage_name = "hs";
+      else if constexpr (Stage == PipelineStage::Domain)
+        stage_name = "ds";
+      else if constexpr (Stage == PipelineStage::Compute)
+        stage_name = "cs";
+      DumpBindlessMirrorShaderDxbc(stage_name, shader);
+    }
+
     if constexpr (Stage == PipelineStage::Compute) {
       enc.invalidateNativeArgumentBuffers(true);
     } else if constexpr (Stage == PipelineStage::Vertex) {
@@ -16528,6 +16989,16 @@ private:
           entry.root_offset_key < max_key_plus_one) {
         VerifyBindlessMirrorSamplerDescriptor(enc, entry.descriptor, want_stage,
                                               &arg);
+        const auto lower = entry.register_lower_bound;
+        if (entry.shader_register >= lower) {
+          const auto local = entry.shader_register - lower;
+          ProbeBindlessMirrorSamplerBinding(BindlessMirrorDiagProbe{
+              "snapshot", pipeline, window, want_stage, &arg,
+              entry.shader_register, lower,
+              root_offsets[entry.root_offset_key],
+              root_offsets[entry.root_offset_key] + local,
+              entry.descriptor}, draw_diag);
+        }
         continue;
       }
       if (!(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) ||
@@ -16539,12 +17010,31 @@ private:
       const auto local = entry.shader_register - lower;
       if (entry.descriptor.heap_index < local)
         continue;
-      const auto live_base = entry.descriptor.heap_index - local;
       ProbeBindlessMirrorTextureBinding(BindlessMirrorDiagProbe{
-          "snapshot", want_stage, &arg, entry.shader_register, lower,
+          "snapshot", pipeline, window, want_stage, &arg,
+          entry.shader_register, lower,
           root_offsets[entry.root_offset_key],
-          root_offsets[entry.root_offset_key] + local, live_base, true,
+          root_offsets[entry.root_offset_key] + local,
           entry.descriptor}, draw_diag);
+    }
+    if (BindlessMirrorDiagEnabled() && arguments) {
+      std::vector<uint8_t> diagnosed(max_key_plus_one, 0);
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &argument = arguments[i];
+        const bool tracked = argument.Type == SM50BindingType::Sampler ||
+                             (argument.Flags &
+                              MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+        const auto key = argument.StructurePtrOffset;
+        if (!tracked || key >= max_key_plus_one || diagnosed[key] ||
+            root_offsets[key] != UINT32_MAX)
+          continue;
+        diagnosed[key] = 1;
+        DiagnoseBindlessRootOffsetGap(
+            "snapshot", pipeline, want_stage, argument,
+            BindlessRootOffsetIssueMissingSnapshotEntry |
+                BindlessRootOffsetIssueMissingPlanCoverage,
+            draw_diag);
+      }
     }
     for (uint32_t i = 0; i < max_key_plus_one; i++)
       if (root_offsets[i] == UINT32_MAX)
@@ -16746,9 +17236,11 @@ private:
           !table.mirror->descriptorTableBackendReady())
         return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
 
-      if (table.heap_index > table.mirror->numDescriptors() ||
-          table.descriptor_count >
-              table.mirror->numDescriptors() - table.heap_index)
+      // Shader-reflected descriptor spans are validated while the native root
+      // bases are built. Requiring the complete root-signature-declared range
+      // to fit after the table base rejects valid tables whose unused tail
+      // extends beyond the heap and forces every draw through snapshot replay.
+      if (table.heap_index >= table.mirror->numDescriptors())
         return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
 
       if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
@@ -17018,7 +17510,8 @@ private:
       const std::vector<CompiledCommandRootDescriptorTable> &tables,
       const PipelineState &pipeline, const RootSignature &root,
       PipelineStage want_stage, bool compute,
-      BindlessMirrorWindow *window = nullptr) {
+      BindlessMirrorWindow *window = nullptr,
+      BindlessMirrorDrawDiag *draw_diag = nullptr) {
     const auto plan =
         GetBindlessMirrorStagePlan(pipeline, root, want_stage, compute);
     if (!plan || !plan->max_key_plus_one)
@@ -17035,6 +17528,11 @@ private:
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
     std::memset(root_offsets, 0, slice.length);
+    const bool bindless_diag_enabled = BindlessMirrorDiagEnabled();
+    std::vector<uint8_t> root_offset_assigned(
+        bindless_diag_enabled ? plan->max_key_plus_one : 0, 0);
+    std::vector<uint32_t> root_offset_issues(
+        bindless_diag_enabled ? plan->max_key_plus_one : 0, 0);
     if (window) {
       if (plan->texture_count) {
         const uint64_t qwords =
@@ -17062,12 +17560,28 @@ private:
         continue;
       const auto *table =
           FindCompiledRootTable(tables, entry.root_index, entry.heap_type);
-      if (!table || !table->mirror)
+      if (!table) {
+        if (bindless_diag_enabled)
+          root_offset_issues[entry.root_offset_key] |=
+              BindlessRootOffsetIssueMissingTable;
         continue;
+      }
+      if (!table->mirror) {
+        if (bindless_diag_enabled)
+          root_offset_issues[entry.root_offset_key] |=
+              BindlessRootOffsetIssueMissingMirror;
+        continue;
+      }
       auto *heap = dynamic_cast<DescriptorHeap *>(table->owning_heap.ptr());
-      if (!heap)
+      if (!heap) {
+        if (bindless_diag_enabled)
+          root_offset_issues[entry.root_offset_key] |=
+              BindlessRootOffsetIssueMissingTable;
         continue;
+      }
       root_offsets[entry.root_offset_key] = entry.compact_base;
+      if (bindless_diag_enabled)
+        root_offset_assigned[entry.root_offset_key] = 1;
       if (!window)
         continue;
       for (UINT local = 0;
@@ -17117,11 +17631,25 @@ private:
             }
           }
         }
+        if (bindless_diag_enabled && (entry.texture || entry.sampler)) {
+          const BindlessMirrorDiagProbe probe{
+              "compiled", &pipeline, window, want_stage, &argument,
+              entry.shader_register_lower_bound + dst_local,
+              entry.shader_register_lower_bound, entry.compact_base,
+              entry.compact_base + dst_local, slot_descriptor};
+          if (entry.sampler)
+            ProbeBindlessMirrorSamplerBinding(probe, draw_diag);
+          else
+            ProbeBindlessMirrorTextureBinding(probe, draw_diag);
+        }
       }
     }
     for (const auto &entry : plan->static_samplers) {
       if (entry.root_offset_key < plan->max_key_plus_one)
         root_offsets[entry.root_offset_key] = entry.compact_base;
+      if (bindless_diag_enabled &&
+          entry.root_offset_key < plan->max_key_plus_one)
+        root_offset_assigned[entry.root_offset_key] = 1;
       if (!window || !window->sampler.mapped ||
           entry.compact_slot >= dxmt::kBindlessMirrorCapacity)
         continue;
@@ -17135,6 +17663,25 @@ private:
       dst[dxmt::kBindlessMirrorCapacity + entry.compact_slot] = encoded[1];
       dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + entry.compact_slot] =
           encoded[2];
+    }
+    if (bindless_diag_enabled) {
+      std::vector<uint8_t> diagnosed(plan->max_key_plus_one, 0);
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &argument = arguments[i];
+        const bool tracked = argument.Type == SM50BindingType::Sampler ||
+                             (argument.Flags &
+                              MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+        const auto key = argument.StructurePtrOffset;
+        if (!tracked || key >= plan->max_key_plus_one || diagnosed[key] ||
+            root_offset_assigned[key])
+          continue;
+        diagnosed[key] = 1;
+        DiagnoseBindlessRootOffsetGap(
+            "compiled", &pipeline, want_stage, argument,
+            root_offset_issues[key] |
+                BindlessRootOffsetIssueMissingPlanCoverage,
+            draw_diag);
+      }
     }
     if (slice.needs_flush)
       slice.gpu_buffer.updateContents(slice.offset, slice.mapped,
@@ -17386,7 +17933,7 @@ private:
           reflection.NumArguments, bt);
     BindlessMirrorWindow window = {};
     auto root_offsets = BuildCompiledBindlessRootOffsets(
-        enc, tables, pipeline, root, Stage, compute, &window);
+        enc, tables, pipeline, root, Stage, compute, &window, draw_diag);
     enc.bindBindlessTables<Stage>(bt, root_offsets, window.texture,
                                   window.sampler);
     (void)argbuf_offset;
@@ -17674,7 +18221,8 @@ private:
           DebugLogRootBinding(
               entry.debug_kind ? entry.debug_kind : "snapshot", pipeline, false,
               entry.stage, entry.root_index, entry.slot, entry.shader_register,
-              entry.register_space, entry.debug_size, entry.debug_address);
+              entry.register_space, entry.debug_size, entry.debug_address,
+              &entry.descriptor);
           // Bindless-mirror (③.3): the snapshot path does not run ApplyDescriptorTableBindingRecipe,
           // so fill the persistent mirror here from the captured descriptor (record.mirror travels
           // with the DescriptorRecord). The live path fills it in ApplyDescriptorTableBindingRecipe.
@@ -18571,14 +19119,28 @@ private:
                          UINT64 index_resource_offset,
                          UINT64 index_offset) {
     static std::atomic<uint32_t> log_count = 0;
+    static std::atomic<uint32_t> target_log_count = 0;
 
     const auto *graphics = pipeline.GetGraphicsState();
     const auto &desc = graphics->desc;
     const auto slot_mask = InputSlotMask(graphics);
     const auto &cache_key = pipeline.GetShaderCacheKey();
     const bool target_pso = DiagIsTargetCompositePso(cache_key);
-    if (!target_pso && !D3D12DiagShouldLog(log_count, D3D12DiagDrawStateEnabled()))
+    const auto target_occurrence =
+        target_pso && D3D12DiagDrawStateEnabled()
+            ? target_log_count.fetch_add(1, std::memory_order_relaxed) + 1
+            : 0;
+    const bool sample_target =
+        target_occurrence &&
+        (target_occurrence <= 8 ||
+         (target_occurrence & (target_occurrence - 1)) == 0);
+    if (target_pso) {
+      if (!sample_target)
+        return;
+    } else if (!D3D12DiagShouldLog(log_count,
+                                   D3D12DiagDrawStateEnabled())) {
       return;
+    }
 
     const auto *key = cache_key.c_str();
     const auto key_size = std::min<size_t>(cache_key.size(), 16);
@@ -19767,6 +20329,11 @@ private:
         draw.instance_count = packet.instance_count;
         draw.base_instance = packet.base_instance;
       }
+      common.bindless_diag.binding_generation = common.binding_generation;
+      common.bindless_diag.descriptor_revision =
+          common.descriptor_content_revision;
+      common.bindless_diag.binding_fingerprint =
+          common.binding_content_fingerprint;
       RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
     }
 
@@ -19934,6 +20501,11 @@ private:
         draw.base_vertex = packet.base_vertex;
         draw.base_instance = packet.base_instance;
       }
+      common.bindless_diag.binding_generation = common.binding_generation;
+      common.bindless_diag.descriptor_revision =
+          common.descriptor_content_revision;
+      common.bindless_diag.binding_fingerprint =
+          common.binding_content_fingerprint;
       RecordBindlessMirrorDiagDraw(common.pipeline, common.bindless_diag);
     }
 

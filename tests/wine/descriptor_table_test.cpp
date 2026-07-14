@@ -1,5 +1,7 @@
 #include <dxmt_test.hpp>
 
+#include "../../src/d3d12/d3d12_compiled_descriptor_range.hpp"
+
 #include "dxmt_bindless_buffer_table.hpp"
 #include "dxmt_descriptor_mirror.hpp"
 
@@ -42,6 +44,32 @@ INSTANTIATE_TEST_SUITE_P(
                       DescriptorRangeCase{4, 12},
                       DescriptorRangeCase{std::numeric_limits<uint32_t>::max(),
                                           dxmt::kBindlessMirrorCapacity * 3}));
+
+TEST(DescriptorTable, AcceptsOnlyTheReflectedSpanAtTheEndOfAHeap) {
+  std::uint32_t resolved_base = 0;
+
+  EXPECT_TRUE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      63, 64, 0, 0, 1, &resolved_base));
+  EXPECT_EQ(resolved_base, 63u);
+
+  // A root signature may declare many descriptors after this base. That
+  // unused declaration is deliberately absent from the helper: only the
+  // shader-reflected access span controls native eligibility.
+  EXPECT_FALSE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      63, 64, 0, 0, 2, &resolved_base));
+  EXPECT_FALSE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      63, 64, 1, 0, 1, &resolved_base));
+}
+
+TEST(DescriptorTable, RejectsOverflowWhileResolvingAReflectedSpan) {
+  std::uint32_t resolved_base = 0;
+  EXPECT_FALSE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      std::numeric_limits<std::uint32_t>::max(),
+      std::numeric_limits<std::uint32_t>::max(), 1, 0, 1, &resolved_base));
+  EXPECT_FALSE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      1, std::numeric_limits<std::uint32_t>::max(),
+      std::numeric_limits<std::uint32_t>::max(), 1, 1, &resolved_base));
+}
 
 TEST(DescriptorTable, MapsBindingTypesToDisjointArgumentRanges) {
   EXPECT_EQ(GetArgumentIndex(SM50BindingType::ConstantBuffer, 7), 7u);

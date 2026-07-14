@@ -23,6 +23,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <deque>
+#if !defined(_WIN32)
+#include <execinfo.h>
+#endif
 #include <fstream>
 #include <limits>
 #include <map>
@@ -76,8 +79,8 @@ D3D12PipelineDiagShouldLog() {
   static std::atomic<uint32_t> count = 0;
   if (!D3D12PipelineDiagEnabled())
     return false;
-  count.fetch_add(1, std::memory_order_relaxed);
-  return true;
+  const auto occurrence = count.fetch_add(1, std::memory_order_relaxed) + 1;
+  return occurrence <= 32 || (occurrence & (occurrence - 1)) == 0;
 }
 
 static bool
@@ -4242,6 +4245,72 @@ LogGraphicsPipelineDesc(const char *where,
                   uint64_t(desc.CachedPSO.CachedBlobSizeInBytes)));
 }
 
+std::string
+PipelineShaderBytecodeDigest(const D3D12_SHADER_BYTECODE &bytecode) {
+  if (!HasBytecode(bytecode))
+    return {};
+  return Sha1HashState::compute(
+             static_cast<const uint8_t *>(bytecode.pShaderBytecode),
+             bytecode.BytecodeLength)
+      .string();
+}
+
+void
+LogUnsupportedSampleCount(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc) {
+  static std::atomic<uint32_t> count = 0;
+  const auto occurrence = count.fetch_add(1, std::memory_order_relaxed) + 1;
+  const bool sampled = occurrence <= 4 ||
+                       (occurrence & (occurrence - 1)) == 0;
+  if (!sampled)
+    return;
+
+  if (!D3D12PipelineDiagEnabled()) {
+    WARN("D3D12PipelineState: unsupported Metal sample count ",
+         desc.SampleDesc.Count, " occurrence=", occurrence);
+    return;
+  }
+
+  void *frames[12] = {};
+#if defined(_WIN32)
+  const auto frame_count =
+      RtlCaptureStackBackTrace(0, std::size(frames), frames, nullptr);
+#else
+  const auto frame_count = backtrace(frames, std::size(frames));
+#endif
+  std::ostringstream stack;
+  stack << std::hex;
+  for (uint32_t i = 0; i < uint32_t(frame_count); i++) {
+    if (i)
+      stack << ',';
+    stack << reinterpret_cast<uintptr_t>(frames[i]);
+  }
+
+  std::ostringstream formats;
+  for (UINT i = 0; i < desc.NumRenderTargets && i < 8; i++) {
+    if (i)
+      formats << ',';
+    formats << uint32_t(desc.RTVFormats[i]);
+  }
+
+  WARN("D3D12 diagnostic: unsupported MSAA PSO",
+       " occurrence=", occurrence,
+       " thread=", dxmt::this_thread::get_id(),
+       " sampleCount=", uint32_t(desc.SampleDesc.Count),
+       " sampleQuality=", uint32_t(desc.SampleDesc.Quality),
+       " topologyType=", uint32_t(desc.PrimitiveTopologyType),
+       " numRT=", uint32_t(desc.NumRenderTargets),
+       " rtvFormats=", formats.str(),
+       " dsvFormat=", uint32_t(desc.DSVFormat),
+       " rootSignature=", reinterpret_cast<uintptr_t>(desc.pRootSignature),
+       " vs=", PipelineShaderBytecodeDigest(desc.VS),
+       " ps=", PipelineShaderBytecodeDigest(desc.PS),
+       " gs=", PipelineShaderBytecodeDigest(desc.GS),
+       " hs=", PipelineShaderBytecodeDigest(desc.HS),
+       " ds=", PipelineShaderBytecodeDigest(desc.DS),
+       " stack=", stack.str(),
+       " hr=", E_INVALIDARG);
+}
+
 uint64_t
 ElapsedUs(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -4278,8 +4347,7 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   }
   if (!device->GetMTLDevice().supportsTextureSampleCount(
           graphics_state.desc.SampleDesc.Count)) {
-    WARN("D3D12PipelineState: unsupported Metal sample count ",
-         graphics_state.desc.SampleDesc.Count);
+    LogUnsupportedSampleCount(graphics_state.desc);
     dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;

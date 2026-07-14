@@ -37,8 +37,17 @@ template <PipelineStage stage, PipelineKind kind>
 static void DebugLogNullShaderBinding(
     const char *binding_type, const char *expected, const std::string &shader_hash,
     const MTL_SM50_SHADER_ARGUMENT &arg, bool has_buffer_binding, bool has_texture_binding,
-    bool has_counter_binding, uint64_t encoder_id, const char *action = "zero"
+    bool has_counter_binding, uint64_t encoder_id, const char *action = "zero",
+    uint32_t resolved_slot = UINT32_MAX, uint32_t range_local = 0,
+    bool snapshot_supplied = false, bool snapshot_captured = false
 );
+
+template <PipelineStage stage, PipelineKind kind>
+static void DebugLogSnapshotBindingFallback(
+    const char *binding_type, const std::string &shader_hash,
+    const MTL_SM50_SHADER_ARGUMENT &arg, uint32_t resolved_slot,
+    uint32_t range_local, bool has_buffer_binding, bool has_texture_binding,
+    bool has_counter_binding, uint64_t encoder_id);
 
 template <PipelineStage stage, PipelineKind kind>
 static void DebugLogConstantBufferBinding(
@@ -712,6 +721,10 @@ ArgumentEncodingContext::packBindlessCBuffers(
         if (local_slot >= 14 * (unsigned(stage) + 1))
           break;
         const auto &snapshot = bindings[local_slot];
+        // Root constants are restored into cbuf_ immediately before this
+        // packer runs. They intentionally do not have a descriptor snapshot,
+        // so treating that live read as a snapshot fallback produces a hot
+        // path false positive without identifying stale state.
         write_cbv(local,
                   snapshot.captured ? snapshot.binding : cbuf_[local_slot]);
       }
@@ -781,6 +794,13 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
+          if (bindings && bindings->resources && !snapshot.srv_captured) {
+            const auto &live = resview_[local_slot];
+            DebugLogSnapshotBindingFallback<stage, kind>(
+                "SRV", shader_hash, arg, local_slot, local,
+                bool(live.buffer.ptr()), bool(live.texture.ptr()), false,
+                encoder_id);
+          }
           const auto &srv = snapshot.srv_captured ? snapshot.srv
                                                   : resview_[local_slot];
           const uint32_t dst = compact + local * kBufferTableQwordsPerDescriptor;
@@ -794,7 +814,8 @@ ArgumentEncodingContext::packBindlessBufferTable(
           } else {
             DebugLogNullShaderBinding<stage, kind>(
                 "SRV", "buffer", shader_hash, arg, bool(srv.buffer.ptr()),
-                bool(srv.texture.ptr()), false, encoder_id);
+                bool(srv.texture.ptr()), false, encoder_id, "zero",
+                local_slot, local, bool(bindings), snapshot.srv_captured);
             write_slot(dst, 0, 0);
           }
         }
@@ -809,6 +830,13 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
+          if (bindings && bindings->resources && !snapshot.srv_captured) {
+            const auto &live = resview_[local_slot];
+            DebugLogSnapshotBindingFallback<stage, kind>(
+                "SRV_TEXTURE", shader_hash, arg, local_slot, local,
+                bool(live.buffer.ptr()), bool(live.texture.ptr()), false,
+                encoder_id);
+          }
           const auto &srv = snapshot.srv_captured ? snapshot.srv
                                                   : resview_[local_slot];
           if (srv.buffer.ptr()) {
@@ -859,6 +887,13 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
+          if (bindings && bindings->resources && !snapshot.uav_captured) {
+            const auto &live = UAVBindingSet[local_slot];
+            DebugLogSnapshotBindingFallback<stage, kind>(
+                "UAV", shader_hash, arg, local_slot, local,
+                bool(live.buffer.ptr()), bool(live.texture.ptr()),
+                bool(live.counter.ptr()), encoder_id);
+          }
           const auto &uav = snapshot.uav_captured
                                 ? snapshot.uav
                                 : UAVBindingSet[local_slot];
@@ -873,7 +908,9 @@ ArgumentEncodingContext::packBindlessBufferTable(
           } else {
             DebugLogNullShaderBinding<stage, kind>(
                 "UAV", "buffer", shader_hash, arg, bool(uav.buffer.ptr()),
-                bool(uav.texture.ptr()), bool(uav.counter.ptr()), encoder_id);
+                bool(uav.texture.ptr()), bool(uav.counter.ptr()), encoder_id,
+                "zero", local_slot, local, bool(bindings),
+                snapshot.uav_captured);
             write_slot(dst, 0, 0);
           }
         }
@@ -886,6 +923,13 @@ ArgumentEncodingContext::packBindlessBufferTable(
               bindings && bindings->resources
                   ? bindings->resources[local_slot]
                   : ShaderResourceBindingSnapshot{};
+          if (bindings && bindings->resources && !snapshot.uav_captured) {
+            const auto &live = UAVBindingSet[local_slot];
+            DebugLogSnapshotBindingFallback<stage, kind>(
+                "UAV_TEXTURE", shader_hash, arg, local_slot, local,
+                bool(live.buffer.ptr()), bool(live.texture.ptr()),
+                bool(live.counter.ptr()), encoder_id);
+          }
           const auto &uav = snapshot.uav_captured
                                 ? snapshot.uav
                                 : UAVBindingSet[local_slot];
@@ -932,7 +976,8 @@ ArgumentEncodingContext::packBindlessBufferTable(
             DebugLogNullShaderBinding<stage, kind>(
                 "UAV_COUNTER", "counter", shader_hash, arg,
                 bool(uav.buffer.ptr()), bool(uav.texture.ptr()),
-                bool(uav.counter.ptr()), encoder_id);
+                bool(uav.counter.ptr()), encoder_id, "zero", local_slot,
+                local, bool(bindings), snapshot.uav_captured);
             if (dst < buf_table_qwords)
               buf_table[dst] = 0;
           }
@@ -1838,14 +1883,37 @@ DebugShaderHashSelected(const std::string &shader_hash) {
 }
 
 static bool
-DebugShouldLogBinding(const std::string &shader_hash) {
+DebugBindingDiagnosticsEnabled() {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_BINDINGS");
-  return enabled && (shader_hash.empty() || DebugShaderHashSelected(shader_hash));
+  return enabled;
+}
+
+static bool
+DebugShouldLogBinding(const std::string &shader_hash) {
+  if (!DebugBindingDiagnosticsEnabled() ||
+      (!shader_hash.empty() && !DebugShaderHashSelected(shader_hash)))
+    return false;
+
+  static std::atomic<uint32_t> count = 0;
+  const auto occurrence = count.fetch_add(1, std::memory_order_relaxed) + 1;
+  return occurrence <= 32 || (occurrence & (occurrence - 1)) == 0;
+}
+
+static bool
+DebugShouldLogBindingAnomaly(const std::string &shader_hash,
+                             std::atomic<uint32_t> &counter,
+                             uint32_t &occurrence) {
+  if (!DebugBindingDiagnosticsEnabled() ||
+      (!shader_hash.empty() && !DebugShaderHashSelected(shader_hash)))
+    return false;
+  occurrence = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  return occurrence <= 128 || (occurrence & (occurrence - 1)) == 0;
 }
 
 static bool
 DebugShouldLogRenderPasses() {
-  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_PASS");
+  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_PASS") ||
+                              DebugEnabledEnv("DXMT_DIAG_DRAW_STATE");
   return enabled;
 }
 
@@ -2700,10 +2768,14 @@ DebugLogRenderPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
     return;
 
   static std::atomic<uint32_t> log_count = 0;
-  log_count.fetch_add(1, std::memory_order_relaxed);
+  const auto occurrence =
+      log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (occurrence > 32 && (occurrence & (occurrence - 1)) != 0)
+    return;
 
   INFO(
       "DXMT diagnostic: render pass",
+      " occurrence=", occurrence,
       " frame=", frame_id,
       " seq=", seq_id,
       " encoder=", encoder_id,
@@ -2733,13 +2805,29 @@ DebugLogRenderPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
     auto *descriptor = allocation ? allocation->descriptor : nullptr;
     INFO(
         "DXMT diagnostic: render color attachment",
+        " occurrence=", occurrence,
         " frame=", frame_id,
+        " seq=", seq_id,
         " encoder=", encoder_id,
         " slot=", i,
         " texture=", uint64_t(texture),
         " texture_descriptor=", uint64_t(descriptor),
+        " resource_identity=", descriptor ? descriptor->diagnosticIdentity() : 0,
         " allocation=", uint64_t(allocation),
         " allocation_texture=", allocation ? uint64_t(allocation->texture()) : 0,
+        " allocation_matches_view=",
+        allocation && allocation->texture() == texture ? 1 : 0,
+        " descriptor_size=", descriptor ? descriptor->width() : 0, "x",
+        descriptor ? descriptor->height() : 0, "x",
+        descriptor ? descriptor->depth() : 0,
+        " descriptor_array=", descriptor ? descriptor->arrayLength() : 0,
+        " descriptor_mips=", descriptor ? descriptor->miplevelCount() : 0,
+        " descriptor_samples=", descriptor ? descriptor->sampleCount() : 0,
+        " descriptor_format=",
+        descriptor ? uint32_t(descriptor->pixelFormat()) : 0,
+        " descriptor_type=",
+        descriptor ? uint32_t(descriptor->textureType()) : 0,
+        " descriptor_usage=", descriptor ? uint32_t(descriptor->usage()) : 0,
         " view=", color.attachment ? uint64_t(color.attachment->key) : color.buffer_view_id,
         " load=", uint32_t(color.load_action),
         " store=", uint32_t(color.store_action),
@@ -2748,6 +2836,85 @@ DebugLogRenderPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
         " slice=", uint32_t(color.slice),
         " resolve=", uint64_t(color.resolve_attachment ? color.resolve_attachment.texture() : WMT::Texture{})
     );
+  }
+
+  if (data->depth.attachment) {
+    const auto &depth = data->depth;
+    auto *allocation = depth.attachment->allocation;
+    auto *descriptor = allocation ? allocation->descriptor : nullptr;
+    INFO("DXMT diagnostic: render depth attachment",
+         " occurrence=", occurrence,
+         " frame=", frame_id,
+         " seq=", seq_id,
+         " encoder=", encoder_id,
+         " texture=", uint64_t(depth.attachment.texture()),
+         " texture_descriptor=", uint64_t(descriptor),
+         " resource_identity=",
+         descriptor ? descriptor->diagnosticIdentity() : 0,
+         " allocation=", uint64_t(allocation),
+         " allocation_texture=",
+         allocation ? uint64_t(allocation->texture()) : 0,
+         " allocation_matches_view=",
+         allocation && allocation->texture() == depth.attachment.texture() ? 1
+                                                                          : 0,
+         " descriptor_size=", descriptor ? descriptor->width() : 0, "x",
+         descriptor ? descriptor->height() : 0, "x",
+         descriptor ? descriptor->depth() : 0,
+         " descriptor_array=", descriptor ? descriptor->arrayLength() : 0,
+         " descriptor_mips=", descriptor ? descriptor->miplevelCount() : 0,
+         " descriptor_samples=", descriptor ? descriptor->sampleCount() : 0,
+         " descriptor_format=",
+         descriptor ? uint32_t(descriptor->pixelFormat()) : 0,
+         " descriptor_type=",
+         descriptor ? uint32_t(descriptor->textureType()) : 0,
+         " descriptor_usage=", descriptor ? uint32_t(descriptor->usage()) : 0,
+         " view=", uint64_t(depth.attachment->key),
+         " load=", uint32_t(depth.load_action),
+         " store=", uint32_t(depth.store_action),
+         " clear=", depth.clear_depth,
+         " level=", uint32_t(depth.level),
+         " slice=", uint32_t(depth.slice),
+         " depth_plane=", depth.depth_plane);
+  }
+
+  if (data->stencil.attachment) {
+    const auto &stencil = data->stencil;
+    auto *allocation = stencil.attachment->allocation;
+    auto *descriptor = allocation ? allocation->descriptor : nullptr;
+    INFO("DXMT diagnostic: render stencil attachment",
+         " occurrence=", occurrence,
+         " frame=", frame_id,
+         " seq=", seq_id,
+         " encoder=", encoder_id,
+         " texture=", uint64_t(stencil.attachment.texture()),
+         " texture_descriptor=", uint64_t(descriptor),
+         " resource_identity=",
+         descriptor ? descriptor->diagnosticIdentity() : 0,
+         " allocation=", uint64_t(allocation),
+         " allocation_texture=",
+         allocation ? uint64_t(allocation->texture()) : 0,
+         " allocation_matches_view=",
+         allocation && allocation->texture() == stencil.attachment.texture()
+             ? 1
+             : 0,
+         " descriptor_size=", descriptor ? descriptor->width() : 0, "x",
+         descriptor ? descriptor->height() : 0, "x",
+         descriptor ? descriptor->depth() : 0,
+         " descriptor_array=", descriptor ? descriptor->arrayLength() : 0,
+         " descriptor_mips=", descriptor ? descriptor->miplevelCount() : 0,
+         " descriptor_samples=", descriptor ? descriptor->sampleCount() : 0,
+         " descriptor_format=",
+         descriptor ? uint32_t(descriptor->pixelFormat()) : 0,
+         " descriptor_type=",
+         descriptor ? uint32_t(descriptor->textureType()) : 0,
+         " descriptor_usage=", descriptor ? uint32_t(descriptor->usage()) : 0,
+         " view=", uint64_t(stencil.attachment->key),
+         " load=", uint32_t(stencil.load_action),
+         " store=", uint32_t(stencil.store_action),
+         " clear=", uint32_t(stencil.clear_stencil),
+         " level=", uint32_t(stencil.level),
+         " slice=", uint32_t(stencil.slice),
+         " depth_plane=", stencil.depth_plane);
   }
 }
 
@@ -2758,16 +2925,22 @@ DebugLogClearPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
     return;
 
   static std::atomic<uint32_t> log_count = 0;
-  log_count.fetch_add(1, std::memory_order_relaxed);
+  const auto occurrence =
+      log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (occurrence > 16 && (occurrence & (occurrence - 1)) != 0)
+    return;
 
   WMT::Texture texture;
   if (data->attachment)
     texture = data->attachment.texture();
   else
     texture = data->buffer_texture;
+  auto *allocation = data->attachment ? data->attachment->allocation : nullptr;
+  auto *descriptor = allocation ? allocation->descriptor : nullptr;
 
   INFO(
       "DXMT diagnostic: clear pass",
+      " occurrence=", occurrence,
       " frame=", frame_id,
       " seq=", seq_id,
       " encoder=", encoder_id,
@@ -2779,6 +2952,21 @@ DebugLogClearPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
       " depth_plane=", uint32_t(data->depth_plane),
       " stencil_depth_plane=", uint32_t(data->stencil_depth_plane),
       " texture=", uint64_t(texture),
+      " texture_descriptor=", uint64_t(descriptor),
+      " resource_identity=", descriptor ? descriptor->diagnosticIdentity() : 0,
+      " allocation=", uint64_t(allocation),
+      " allocation_texture=", allocation ? uint64_t(allocation->texture()) : 0,
+      " allocation_matches_view=",
+      allocation && allocation->texture() == texture ? 1 : 0,
+      " descriptor_size=", descriptor ? descriptor->width() : 0, "x",
+      descriptor ? descriptor->height() : 0, "x",
+      descriptor ? descriptor->depth() : 0,
+      " descriptor_array=", descriptor ? descriptor->arrayLength() : 0,
+      " descriptor_mips=", descriptor ? descriptor->miplevelCount() : 0,
+      " descriptor_samples=", descriptor ? descriptor->sampleCount() : 0,
+      " descriptor_format=", descriptor ? uint32_t(descriptor->pixelFormat()) : 0,
+      " descriptor_type=", descriptor ? uint32_t(descriptor->textureType()) : 0,
+      " descriptor_usage=", descriptor ? uint32_t(descriptor->usage()) : 0,
       " view=", data->attachment ? uint64_t(data->attachment->key) : data->buffer_view_id,
       " color=", data->color.r, ",", data->color.g, ",", data->color.b, ",", data->color.a,
       " depth=", data->depth_stencil.first,
@@ -2978,15 +3166,18 @@ static void
 DebugLogNullShaderBinding(
     const char *binding_type, const char *expected, const std::string &shader_hash,
     const MTL_SM50_SHADER_ARGUMENT &arg, bool has_buffer_binding, bool has_texture_binding,
-    bool has_counter_binding, uint64_t encoder_id, const char *action
+    bool has_counter_binding, uint64_t encoder_id, const char *action,
+    uint32_t resolved_slot, uint32_t range_local, bool snapshot_supplied,
+    bool snapshot_captured
 ) {
-  if (!DebugShouldLogBinding(shader_hash))
+  static std::atomic<uint32_t> count = 0;
+  uint32_t occurrence = 0;
+  if (!DebugShouldLogBindingAnomaly(shader_hash, count, occurrence))
     return;
 
-  static std::atomic<uint32_t> log_count = 0;
-  log_count.fetch_add(1, std::memory_order_relaxed);
   WARN(
       "DXMT diagnostic: null shader binding",
+      " occurrence=", occurrence,
       " stage=", DebugPipelineStageName(stage),
       " kind=", DebugPipelineKindName(kind),
       " shader=", shader_hash,
@@ -2994,14 +3185,49 @@ DebugLogNullShaderBinding(
       " binding=", binding_type,
       " expected=", expected,
       " slot=", arg.SM50BindingSlot,
+      " resolved_slot=", resolved_slot,
+      " range_local=", range_local,
       " arg_index=", GetArgumentIndex(arg.Type, arg.SM50BindingSlot),
       " struct_qword=", arg.StructurePtrOffset,
       " flags=0x", std::hex, arg.Flags, std::dec,
       " has_buffer=", has_buffer_binding,
       " has_texture=", has_texture_binding,
       " has_counter=", has_counter_binding,
+      " snapshot_supplied=", snapshot_supplied,
+      " snapshot_captured=", snapshot_captured,
       " action=", action
   );
+}
+
+template <PipelineStage stage, PipelineKind kind>
+static void
+DebugLogSnapshotBindingFallback(
+    const char *binding_type, const std::string &shader_hash,
+    const MTL_SM50_SHADER_ARGUMENT &arg, uint32_t resolved_slot,
+    uint32_t range_local, bool has_buffer_binding, bool has_texture_binding,
+    bool has_counter_binding, uint64_t encoder_id) {
+  static std::atomic<uint32_t> count = 0;
+  uint32_t occurrence = 0;
+  if (!DebugShouldLogBindingAnomaly(shader_hash, count, occurrence))
+    return;
+
+  WARN("DXMT diagnostic: bindless snapshot binding fallback",
+       " occurrence=", occurrence,
+       " stage=", DebugPipelineStageName(stage),
+       " kind=", DebugPipelineKindName(kind),
+       " shader=", shader_hash,
+       " encoder=", encoder_id,
+       " binding=", binding_type,
+       " slot=", arg.SM50BindingSlot,
+       " resolved_slot=", resolved_slot,
+       " range_local=", range_local,
+       " lower=", arg.RegisterLowerBound,
+       " count=", arg.RegisterCount,
+       " struct_qword=", arg.StructurePtrOffset,
+       " flags=0x", std::hex, arg.Flags, std::dec,
+       " live_has_buffer=", has_buffer_binding,
+       " live_has_texture=", has_texture_binding,
+       " live_has_counter=", has_counter_binding);
 }
 
 template <PipelineStage stage, PipelineKind kind>
@@ -3055,8 +3281,7 @@ DebugLogShaderTextureBinding(
   if (!DebugShouldLogBinding(shader_hash))
     return;
 
-  static std::atomic<uint32_t> log_count = 0;
-  log_count.fetch_add(1, std::memory_order_relaxed);
+  auto *allocation = texture->current();
 
   INFO(
       "DXMT diagnostic: shader texture binding",
@@ -3069,7 +3294,13 @@ DebugLogShaderTextureBinding(
       " arg_index=", GetArgumentIndex(arg.Type, arg.SM50BindingSlot),
       " struct_qword=", arg.StructurePtrOffset,
       " flags=0x", std::hex, arg.Flags, std::dec,
+      " texture_identity=", texture->diagnosticIdentity(),
       " view=", uint64_t(view_id),
+      " view_index=", uint32_t(view_id.index),
+      " view_mip=", uint32_t(view_id.mip_start), "..",
+      uint32_t(view_id.mip_end),
+      " view_array_slice=", uint32_t(view_id.array_start), "..",
+      uint32_t(view_id.array_end),
       " view_format=", uint32_t(texture->pixelFormat(view_id)),
       " view_type=", DebugTextureTypeName(texture->textureType(view_id)), "(", uint32_t(texture->textureType(view_id)), ")",
       " view_size=", texture->width(view_id), "x", texture->height(view_id),
@@ -3077,7 +3308,12 @@ DebugLogShaderTextureBinding(
       " resource_format=", uint32_t(texture->pixelFormat()),
       " resource_type=", DebugTextureTypeName(texture->textureType()), "(", uint32_t(texture->textureType()), ")",
       " resource_size=", texture->width(), "x", texture->height(), "x", texture->depth(),
-      " sample_count=", texture->sampleCount()
+      " resource_mips=", texture->miplevelCount(),
+      " resource_usage=0x", std::hex, uint32_t(texture->usage()), std::dec,
+      " sample_count=", texture->sampleCount(),
+      " allocation=", uint64_t(allocation),
+      " allocation_gpu_id=", allocation ? allocation->gpuResourceID : 0,
+      " metal_texture=", allocation ? uint64_t(allocation->texture()) : 0
   );
 }
 

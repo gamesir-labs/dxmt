@@ -3,7 +3,10 @@
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 
+#include <d3dcompiler.h>
+
 #include <cstdint>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -16,6 +19,7 @@ namespace {
 using dxmt::test::ClearBufferComputeShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::TextureReadback;
 
 constexpr unsigned int kMixedEncoderIterations = 384;
 constexpr unsigned int kBarrierCount = 384;
@@ -24,6 +28,19 @@ constexpr unsigned int kTexturesPerInitializerBatch = 4;
 constexpr unsigned int kFh4BlitPasses = 810;
 constexpr unsigned int kFh4BarrierPasses = 121;
 constexpr unsigned int kFh4BaselineFenceEntries = 1861;
+constexpr unsigned int kOversizedDescriptorRangeDraws = 1500;
+
+constexpr const char kOversizedDescriptorRangePixelShader[] = R"hlsl(
+StructuredBuffer<float4> buffers[32] : register(t0);
+
+float4 main(float4 position : SV_Position) : SV_Target {
+  float4 result = 0.0;
+  [unroll]
+  for (uint i = 0; i < 32; ++i)
+    result += buffers[i][0];
+  return result / 32.0;
+}
+)hlsl";
 
 using IntegrationError = std::optional<std::string>;
 
@@ -411,6 +428,136 @@ IntegrationError RunInitializerLifetimeScenario() {
                       context.WaitForFence(fence.get(), submitted_batches));
 }
 
+IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
+  D3D12TestContext context;
+  if (auto error = HResultError("D3D12 context initialization",
+                                context.Initialize()))
+    return error;
+
+  auto render_target = context.CreateTexture2D(
+      32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  if (!render_target || !rtv_heap)
+    return "failed to create oversized-range render target";
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(render_target.get(), nullptr, rtv);
+
+  D3D12_DESCRIPTOR_RANGE srv_range = {};
+  srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_range.NumDescriptors = 128;
+  srv_range.BaseShaderRegister = 0;
+  D3D12_ROOT_PARAMETER parameters[1] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[0].DescriptorTable.pDescriptorRanges = &srv_range;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = parameters;
+  auto root_signature = context.CreateRootSignature(root_desc);
+  ComPtr<ID3DBlob> pixel_shader;
+  ComPtr<ID3DBlob> compile_errors;
+  const HRESULT compile_hr = D3DCompile(
+      kOversizedDescriptorRangePixelShader,
+      sizeof(kOversizedDescriptorRangePixelShader) - 1,
+      "oversized_descriptor_range.hlsl", nullptr, nullptr, "main", "ps_5_0",
+      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, pixel_shader.put(),
+      compile_errors.put());
+  if (FAILED(compile_hr)) {
+    std::string message = "failed to compile oversized-range pixel shader";
+    if (compile_errors && compile_errors->GetBufferPointer()) {
+      message += ": ";
+      message.append(static_cast<const char *>(compile_errors->GetBufferPointer()),
+                     compile_errors->GetBufferSize());
+    }
+    return message;
+  }
+  const D3D12_SHADER_BYTECODE pixel_bytecode = {
+      pixel_shader->GetBufferPointer(), pixel_shader->GetBufferSize()};
+  auto pipeline = context.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+      pixel_bytecode);
+  if (!root_signature || !pipeline)
+    return "failed to create oversized-range graphics pipeline";
+
+  const std::array<float, 4> buffer_value = {1.0f, 1.0f, 1.0f, 1.0f};
+  auto buffer = context.CreateUploadBuffer(
+      sizeof(buffer_value), buffer_value.data(), sizeof(buffer_value));
+  if (!buffer)
+    return "failed to create oversized-range structured buffer";
+  auto srv_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 33, true);
+  if (!srv_heap)
+    return "failed to create oversized-range descriptor heap";
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Buffer.FirstElement = 0;
+  srv_desc.Buffer.NumElements = 1;
+  srv_desc.Buffer.StructureByteStride = sizeof(buffer_value);
+  for (UINT i = 0; i < 33; ++i) {
+    context.device()->CreateShaderResourceView(
+        buffer.get(), &srv_desc, context.CpuDescriptorHandle(srv_heap.get(), i));
+  }
+
+  const float clear_color[4] = {};
+  context.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context.list()->SetGraphicsRootSignature(root_signature.get());
+  context.list()->SetPipelineState(pipeline.get());
+  ID3D12DescriptorHeap *heaps[] = {srv_heap.get()};
+  context.list()->SetDescriptorHeaps(1, heaps);
+  context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, 32, 32};
+  context.list()->RSSetViewports(1, &viewport);
+  context.list()->RSSetScissorRects(1, &scissor);
+  for (unsigned int i = 0; i < kOversizedDescriptorRangeDraws; ++i) {
+    context.list()->SetGraphicsRootDescriptorTable(
+        0, context.GpuDescriptorHandle(srv_heap.get(), i & 1));
+    context.list()->DrawInstanced(3, 1, 0, 0);
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  if (auto error = HResultError("oversized-range command-list close",
+                                context.list()->Close()))
+    return error;
+  ID3D12CommandList *lists[] = {context.list()};
+  context.queue()->ExecuteCommandLists(1, lists);
+  if (auto error = HResultError("oversized-range queue completion",
+                                context.SignalAndWait()))
+    return error;
+  const auto end = std::chrono::steady_clock::now();
+  if (submit_ms)
+    *submit_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+  if (auto error = HResultError("oversized-range command-list reset",
+                                context.ResetCommandList()))
+    return error;
+  D3D12TestContext::Transition(
+      context.list(), render_target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  if (auto error = HResultError(
+          "oversized-range readback",
+          context.ReadbackTexture(render_target.get(), &readback)))
+    return error;
+  if (readback.data.size() < sizeof(std::uint32_t))
+    return "oversized-range readback was empty";
+  std::uint32_t pixel = 0;
+  std::memcpy(&pixel, readback.data.data(), sizeof(pixel));
+  if (pixel != 0xffffffffu) {
+    std::ostringstream message;
+    message << "oversized-range readback was 0x" << std::hex << pixel;
+    return message.str();
+  }
+  return std::nullopt;
+}
+
 template <typename Scenario>
 void RunIntegrationBenchmark(benchmark::State &state, Scenario scenario,
                              std::int64_t item_count) {
@@ -464,6 +611,22 @@ void BI_D3D12ResourceInitializerLifetime(benchmark::State &state) {
       kInitializerBatches * kTexturesPerInitializerBatch);
 }
 
+void BI_D3D12OversizedDescriptorRangeDraws(benchmark::State &state) {
+  for (auto _ : state) {
+    double submit_ms = 0.0;
+    if (IntegrationError error =
+            RunOversizedDescriptorRangeDrawScenario(&submit_ms)) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+    state.counters["submit_ms"] = submit_ms;
+    state.counters["draws"] = kOversizedDescriptorRangeDraws;
+    state.counters["submit_us_per_draw"] =
+        submit_ms * 1000.0 / kOversizedDescriptorRangeDraws;
+  }
+  state.SetItemsProcessed(state.iterations() * kOversizedDescriptorRangeDraws);
+}
+
 BENCHMARK(BI_D3D12MixedEncoderBarrierOnly)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12MixedEncoderCopyTransitions)->Iterations(1)->UseRealTime();
 BENCHMARK(BI_D3D12FenceOnlyBarrierChain)->Iterations(1)->UseRealTime();
@@ -471,5 +634,6 @@ BENCHMARK(BI_D3D12Fh4SynchronizationAmplification)
     ->Iterations(1)
     ->UseRealTime();
 BENCHMARK(BI_D3D12ResourceInitializerLifetime)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12OversizedDescriptorRangeDraws)->Iterations(1)->UseRealTime();
 
 } // namespace

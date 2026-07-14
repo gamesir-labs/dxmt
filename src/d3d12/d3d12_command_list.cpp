@@ -1,4 +1,5 @@
 #include "d3d12_command_list.hpp"
+#include "d3d12_compiled_descriptor_range.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
@@ -1184,10 +1185,16 @@ BuildCompiledNativeRootBasesForArguments(
             tables, root_index, heap_type);
         if (!table)
           return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
-        if (range_offset > UINT_MAX - local ||
-            table->heap_index > UINT_MAX - range_offset - local)
+        // A descriptor table may legally be based near the end of a heap even
+        // when its root-signature range is larger than the remaining heap.
+        // Only descriptors that the shader can actually access need to fit.
+        // The reflected argument count includes dynamically-indexed arrays, so
+        // validating that span preserves the native path without permitting an
+        // out-of-bounds shader access.
+        if (!dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+                table->heap_index, table->heap_count, range_offset, local,
+                count, &resolved_base))
           return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
-        resolved_base = table->heap_index + range_offset + local;
         matches++;
       }
     }
