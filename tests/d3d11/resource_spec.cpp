@@ -544,6 +544,187 @@ TEST_F(D3D11ResourceSpec,
   }
 }
 
+TEST_F(D3D11ResourceSpec,
+       PreservesPaddedStagingTexture2DArrayMipRows) {
+  constexpr UINT width = 7;
+  constexpr UINT height = 5;
+  constexpr UINT mip_levels = 3;
+  constexpr UINT array_size = 2;
+  constexpr UINT source_pitch = 16;
+  constexpr UINT subresource_count = mip_levels * array_size;
+  std::array<std::array<std::uint8_t, source_pitch * height>,
+             subresource_count>
+      contents = {};
+  std::array<D3D11_SUBRESOURCE_DATA, subresource_count> initial = {};
+  for (UINT slice = 0; slice < array_size; ++slice) {
+    for (UINT mip = 0; mip < mip_levels; ++mip) {
+      const UINT subresource = D3D11CalcSubresource(mip, slice, mip_levels);
+      const UINT mip_width = std::max(1u, width >> mip);
+      const UINT mip_height = std::max(1u, height >> mip);
+      contents[subresource].fill(0xee);
+      for (UINT y = 0; y < mip_height; ++y) {
+        for (UINT x = 0; x < mip_width; ++x) {
+          contents[subresource][y * source_pitch + x] =
+              static_cast<std::uint8_t>(0x20u + subresource * 16u + y * 4u +
+                                        x);
+        }
+      }
+      initial[subresource].pSysMem = contents[subresource].data();
+      initial[subresource].SysMemPitch = source_pitch;
+    }
+  }
+
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = width;
+  desc.Height = height;
+  desc.MipLevels = mip_levels;
+  desc.ArraySize = array_size;
+  desc.Format = DXGI_FORMAT_R8_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture2D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &desc, initial.data(), texture.put())));
+
+  for (UINT subresource = 0; subresource < subresource_count; ++subresource) {
+    const UINT mip = subresource % mip_levels;
+    const UINT mip_width = std::max(1u, width >> mip);
+    const UINT mip_height = std::max(1u, height >> mip);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+        texture.get(), subresource, D3D11_MAP_READ, 0, &mapped)));
+    for (UINT y = 0; y < mip_height; ++y) {
+      const auto *actual = static_cast<const std::uint8_t *>(mapped.pData) +
+                           y * mapped.RowPitch;
+      const auto *expected =
+          contents[subresource].data() + y * source_pitch;
+      EXPECT_EQ(std::memcmp(actual, expected, mip_width), 0)
+          << "subresource " << subresource << ", row " << y;
+    }
+    context_.context()->Unmap(texture.get(), subresource);
+  }
+}
+
+TEST_F(D3D11ResourceSpec,
+       PreservesPaddedStagingTexture3DMipRowsAndSlices) {
+  constexpr UINT width = 5;
+  constexpr UINT height = 3;
+  constexpr UINT depth = 3;
+  constexpr UINT mip_levels = 2;
+  constexpr UINT source_pitch = 8;
+  constexpr UINT source_slice_pitch = 32;
+  std::array<std::array<std::uint8_t, source_slice_pitch * depth>, mip_levels>
+      contents = {};
+  std::array<D3D11_SUBRESOURCE_DATA, mip_levels> initial = {};
+  for (UINT mip = 0; mip < mip_levels; ++mip) {
+    const UINT mip_width = std::max(1u, width >> mip);
+    const UINT mip_height = std::max(1u, height >> mip);
+    const UINT mip_depth = std::max(1u, depth >> mip);
+    contents[mip].fill(0xee);
+    for (UINT z = 0; z < mip_depth; ++z) {
+      for (UINT y = 0; y < mip_height; ++y) {
+        for (UINT x = 0; x < mip_width; ++x) {
+          contents[mip][z * source_slice_pitch + y * source_pitch + x] =
+              static_cast<std::uint8_t>(0x30u + mip * 32u + z * 8u + y * 2u +
+                                        x);
+        }
+      }
+    }
+    initial[mip].pSysMem = contents[mip].data();
+    initial[mip].SysMemPitch = source_pitch;
+    initial[mip].SysMemSlicePitch = source_slice_pitch;
+  }
+
+  D3D11_TEXTURE3D_DESC desc = {};
+  desc.Width = width;
+  desc.Height = height;
+  desc.Depth = depth;
+  desc.MipLevels = mip_levels;
+  desc.Format = DXGI_FORMAT_R8_UINT;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture3D> texture;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture3D(
+      &desc, initial.data(), texture.put())));
+
+  for (UINT mip = 0; mip < mip_levels; ++mip) {
+    const UINT mip_width = std::max(1u, width >> mip);
+    const UINT mip_height = std::max(1u, height >> mip);
+    const UINT mip_depth = std::max(1u, depth >> mip);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+        texture.get(), mip, D3D11_MAP_READ, 0, &mapped)));
+    for (UINT z = 0; z < mip_depth; ++z) {
+      for (UINT y = 0; y < mip_height; ++y) {
+        const auto *actual = static_cast<const std::uint8_t *>(mapped.pData) +
+                             z * mapped.DepthPitch + y * mapped.RowPitch;
+        const auto *expected = contents[mip].data() + z * source_slice_pitch +
+                               y * source_pitch;
+        EXPECT_EQ(std::memcmp(actual, expected, mip_width), 0)
+            << "mip " << mip << ", depth " << z << ", row " << y;
+      }
+    }
+    context_.context()->Unmap(texture.get(), mip);
+  }
+}
+
+TEST_F(D3D11ResourceSpec, CopiesCpuWrittenStagingTexture2DToDefaultTexture) {
+  constexpr UINT width = 6;
+  constexpr UINT height = 4;
+  std::array<std::uint32_t, width * height> expected = {};
+
+  D3D11_TEXTURE2D_DESC staging_desc = {};
+  staging_desc.Width = width;
+  staging_desc.Height = height;
+  staging_desc.MipLevels = 1;
+  staging_desc.ArraySize = 1;
+  staging_desc.Format = DXGI_FORMAT_R32_UINT;
+  staging_desc.SampleDesc.Count = 1;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  ComPtr<ID3D11Texture2D> source;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &staging_desc, nullptr, source.put())));
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+      source.get(), 0, D3D11_MAP_WRITE, 0, &mapped)));
+  for (UINT y = 0; y < height; ++y) {
+    auto *row = reinterpret_cast<std::uint32_t *>(
+        static_cast<std::uint8_t *>(mapped.pData) + y * mapped.RowPitch);
+    for (UINT x = 0; x < width; ++x)
+      row[x] = expected[y * width + x] = 0x40000000u | y << 8 | x;
+  }
+  context_.context()->Unmap(source.get(), 0);
+
+  D3D11_TEXTURE2D_DESC default_desc = staging_desc;
+  default_desc.Usage = D3D11_USAGE_DEFAULT;
+  default_desc.CPUAccessFlags = 0;
+  ComPtr<ID3D11Texture2D> destination;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &default_desc, nullptr, destination.put())));
+  context_.context()->CopyResource(destination.get(), source.get());
+
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Texture2D> readback;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateTexture2D(
+      &staging_desc, nullptr, readback.put())));
+  context_.context()->CopyResource(readback.get(), destination.get());
+  mapped = {};
+  ASSERT_TRUE(HResultSucceeded(context_.context()->Map(
+      readback.get(), 0, D3D11_MAP_READ, 0, &mapped)));
+  for (UINT y = 0; y < height; ++y) {
+    const auto *actual = static_cast<const std::uint8_t *>(mapped.pData) +
+                         y * mapped.RowPitch;
+    EXPECT_EQ(std::memcmp(actual, expected.data() + y * width,
+                          width * sizeof(std::uint32_t)),
+              0)
+        << "row " << y;
+  }
+  context_.context()->Unmap(readback.get(), 0);
+}
+
 TEST_F(D3D11ResourceSpec, CopiesOneTexture2DArraySliceInIsolation) {
   constexpr UINT width = 4;
   constexpr UINT height = 3;
