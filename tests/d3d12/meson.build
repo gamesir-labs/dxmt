@@ -57,9 +57,12 @@ d3d12_unit_suites = {
   },
   'sync': {
     'sources': files(
+      'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/promotion_decay_spec.cpp',
       'sync/split_transition_spec.cpp',
+      'sync/transition_sequence_spec.cpp',
+      'sync/uav_barrier_spec.cpp',
     ),
   },
   'transfer': {
