@@ -520,7 +520,8 @@ IntegrationError RunPendingBarrierBlitAmplificationScenario(
   return std::nullopt;
 }
 
-IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
+IntegrationError RunOversizedDescriptorRangeDrawScenario(bool indexed,
+                                                          double *submit_ms) {
   D3D12TestContext context;
   if (auto error = HResultError("D3D12 context initialization",
                                 context.Initialize()))
@@ -549,6 +550,20 @@ IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   root_desc.NumParameters = 1;
   root_desc.pParameters = parameters;
+  // Static samplers deliberately select the deferred legacy draw path used by
+  // the FH4 hotspot instead of the native compiled descriptor-table path.
+  D3D12_STATIC_SAMPLER_DESC static_sampler = {};
+  static_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  static_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  static_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  static_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  static_sampler.ShaderRegister = 0;
+  static_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  static_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  if (indexed) {
+    root_desc.NumStaticSamplers = 1;
+    root_desc.pStaticSamplers = &static_sampler;
+  }
   auto root_signature = context.CreateRootSignature(root_desc);
   ComPtr<ID3DBlob> pixel_shader;
   ComPtr<ID3DBlob> compile_errors;
@@ -576,12 +591,24 @@ IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
     return "failed to create oversized-range graphics pipeline";
 
   const std::array<float, 4> buffer_value = {1.0f, 1.0f, 1.0f, 1.0f};
+  const std::array<float, 4> alternate_buffer_value = {};
   auto buffer = context.CreateUploadBuffer(
       sizeof(buffer_value), buffer_value.data(), sizeof(buffer_value));
-  if (!buffer)
-    return "failed to create oversized-range structured buffer";
+  auto alternate_buffer = indexed
+                              ? context.CreateUploadBuffer(
+                                    sizeof(alternate_buffer_value),
+                                    alternate_buffer_value.data(),
+                                    sizeof(alternate_buffer_value))
+                              : ComPtr<ID3D12Resource>{};
+  if (!buffer || (indexed && !alternate_buffer))
+    return "failed to create descriptor-snapshot structured buffers";
+  const std::array<std::uint16_t, 3> indices = {0, 1, 2};
+  auto index_buffer = context.CreateUploadBuffer(
+      sizeof(indices), indices.data(), sizeof(indices));
+  if (!index_buffer)
+    return "failed to create descriptor-snapshot index buffer";
   auto srv_heap = context.CreateDescriptorHeap(
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 33, true);
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, indexed ? 64 : 33, true);
   if (!srv_heap)
     return "failed to create oversized-range descriptor heap";
   D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -591,9 +618,11 @@ IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
   srv_desc.Buffer.FirstElement = 0;
   srv_desc.Buffer.NumElements = 1;
   srv_desc.Buffer.StructureByteStride = sizeof(buffer_value);
-  for (UINT i = 0; i < 33; ++i) {
+  const UINT descriptor_count = indexed ? 64 : 33;
+  for (UINT i = 0; i < descriptor_count; ++i) {
     context.device()->CreateShaderResourceView(
-        buffer.get(), &srv_desc, context.CpuDescriptorHandle(srv_heap.get(), i));
+        !indexed || i < 32 ? buffer.get() : alternate_buffer.get(), &srv_desc,
+        context.CpuDescriptorHandle(srv_heap.get(), i));
   }
 
   const float clear_color[4] = {};
@@ -604,14 +633,24 @@ IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
   ID3D12DescriptorHeap *heaps[] = {srv_heap.get()};
   context.list()->SetDescriptorHeaps(1, heaps);
   context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  D3D12_INDEX_BUFFER_VIEW index_view = {};
+  index_view.BufferLocation = index_buffer->GetGPUVirtualAddress();
+  index_view.SizeInBytes = sizeof(indices);
+  index_view.Format = DXGI_FORMAT_R16_UINT;
+  if (indexed)
+    context.list()->IASetIndexBuffer(&index_view);
   const D3D12_VIEWPORT viewport = {0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f};
   const D3D12_RECT scissor = {0, 0, 32, 32};
   context.list()->RSSetViewports(1, &viewport);
   context.list()->RSSetScissorRects(1, &scissor);
   for (unsigned int i = 0; i < kOversizedDescriptorRangeDraws; ++i) {
     context.list()->SetGraphicsRootDescriptorTable(
-        0, context.GpuDescriptorHandle(srv_heap.get(), i & 1));
-    context.list()->DrawInstanced(3, 1, 0, 0);
+        0, context.GpuDescriptorHandle(
+               srv_heap.get(), indexed ? (i & 1) * 32 : i & 1));
+    if (indexed)
+      context.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
+    else
+      context.list()->DrawInstanced(3, 1, 0, 0);
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -642,7 +681,8 @@ IntegrationError RunOversizedDescriptorRangeDrawScenario(double *submit_ms) {
     return "oversized-range readback was empty";
   std::uint32_t pixel = 0;
   std::memcpy(&pixel, readback.data.data(), sizeof(pixel));
-  if (pixel != 0xffffffffu) {
+  const std::uint32_t expected_pixel = indexed ? 0x00000000u : 0xffffffffu;
+  if (pixel != expected_pixel) {
     std::ostringstream message;
     message << "oversized-range readback was 0x" << std::hex << pixel;
     return message.str();
@@ -730,12 +770,32 @@ void BI_D3D12OversizedDescriptorRangeDraws(benchmark::State &state) {
   for (auto _ : state) {
     double submit_ms = 0.0;
     if (IntegrationError error =
-            RunOversizedDescriptorRangeDrawScenario(&submit_ms)) {
+            RunOversizedDescriptorRangeDrawScenario(false, &submit_ms)) {
       state.SkipWithError(error->c_str());
       return;
     }
     state.counters["submit_ms"] = submit_ms;
     state.counters["draws"] = kOversizedDescriptorRangeDraws;
+    state.counters["submit_us_per_draw"] =
+        submit_ms * 1000.0 / kOversizedDescriptorRangeDraws;
+  }
+  state.SetItemsProcessed(state.iterations() * kOversizedDescriptorRangeDraws);
+}
+
+void BI_D3D12IndexedDescriptorSnapshotReuse(benchmark::State &state) {
+  for (auto _ : state) {
+    double submit_ms = 0.0;
+    if (IntegrationError error =
+            RunOversizedDescriptorRangeDrawScenario(true, &submit_ms)) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+    state.counters["submit_ms"] = submit_ms;
+    state.counters["draws"] = kOversizedDescriptorRangeDraws;
+    state.counters["descriptors_per_draw"] = 32;
+    state.counters["descriptor_references"] =
+        kOversizedDescriptorRangeDraws * 32;
+    state.counters["unique_table_states"] = 2;
     state.counters["submit_us_per_draw"] =
         submit_ms * 1000.0 / kOversizedDescriptorRangeDraws;
   }
@@ -758,5 +818,8 @@ BENCHMARK(BI_D3D12PendingBarrierBlitAmplification)
     ->Iterations(1)
     ->UseRealTime();
 BENCHMARK(BI_D3D12OversizedDescriptorRangeDraws)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12IndexedDescriptorSnapshotReuse)
+    ->Iterations(1)
+    ->UseRealTime();
 
 } // namespace
