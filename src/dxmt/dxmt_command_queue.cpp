@@ -296,7 +296,6 @@ CommandQueue::CommandQueue(WMT::Device device) :
   const auto initial_frame_time = clock::now();
   statistics.at(frame_count).begin_time = initial_frame_time;
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
-  perf::resetCurrentFrameApiGapMarker(initial_frame_time);
   event = device.newSharedEvent();
   persistent_residency_set_.requestResidency();
   commandQueue.addResidencySet(persistent_residency_set_);
@@ -333,6 +332,8 @@ CommandQueue::~CommandQueue() {
   if (apitrace_enabled_)
     dxmt::apitrace::shutdown();
   perf::flushFinal(frame_count);
+  if (perf::currentFrameStatistics() == &statistics.at(frame_count))
+    perf::setCurrentFrameStatistics(nullptr);
   TRACE("Destructed command queue");
 }
 
@@ -352,7 +353,6 @@ CommandQueue::FlushFinalFrameStatistics() {
     return;
 
   const auto boundary_time = clock::now();
-  perf::recordFrameBoundaryApiGap(&frame, boundary_time);
   statistics.compute(frame_count);
   const auto frame_wall_us = frame.begin_time == clock::time_point{}
                                  ? 0
@@ -431,7 +431,6 @@ void
 CommandQueue::PresentBoundary() {
   const auto frame_begin_time = statistics.at(frame_count).begin_time;
   const auto boundary_time = clock::now();
-  perf::recordFrameBoundaryApiGap(&statistics.at(frame_count), boundary_time);
   statistics.compute(frame_count);
   if (DxmtQueueDiagEnabled()) {
     const auto &frame = statistics.at(frame_count);
@@ -550,7 +549,6 @@ CommandQueue::PresentBoundary() {
   const auto next_frame_begin_time = clock::now();
   statistics.at(frame_count).begin_time = next_frame_begin_time;
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
-  perf::resetCurrentFrameApiGapMarker(next_frame_begin_time);
   statistics.at(frame_count).latency = max_latency_;
 }
 

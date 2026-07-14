@@ -58,6 +58,125 @@ enum class CompiledFallbackReason : uint32_t {
 constexpr size_t kCompiledFallbackReasonCount =
     static_cast<size_t>(CompiledFallbackReason::Count);
 
+// Exclusive CPU time for concrete D3D12 implementation paths. Nested scopes
+// subtract their elapsed time from their parent, so every instruction executed
+// below an instrumented entry point belongs to exactly one code path.
+enum class PerfCodePath : uint32_t {
+  CommandListCloseControl,
+  CommandListCloseBuildCompiled,
+  CommandListCloseAllocatorRelease,
+  CommandListCloseApitrace,
+  CommandListResetControl,
+  CommandListResetAllocator,
+  CommandListResetStateClear,
+  CommandListResetInitialPipeline,
+  CommandListResetApitrace,
+  CommandListReferenceCount,
+  CommandListObjectApi,
+  CommandListFeatureSupport,
+  CommandListDrawInstanced,
+  CommandListDrawIndexedInstanced,
+  CommandListDispatch,
+  CommandListCopyBuffer,
+  CommandListCopyTexture,
+  CommandListCopyResource,
+  CommandListCopyTiles,
+  CommandListResolve,
+  CommandListClearState,
+  CommandListPipelineState,
+  CommandListResourceBarrier,
+  CommandListDescriptorHeaps,
+  CommandListRootSignature,
+  CommandListRootDescriptorTable,
+  CommandListRootConstants,
+  CommandListRootDescriptor,
+  CommandListPrimitiveTopology,
+  CommandListViewports,
+  CommandListScissors,
+  CommandListBlendFactor,
+  CommandListStencilRef,
+  CommandListExecuteBundle,
+  CommandListIndexBuffer,
+  CommandListVertexBuffers,
+  CommandListStreamOutput,
+  CommandListRenderTargets,
+  CommandListClearDepthStencil,
+  CommandListClearRenderTarget,
+  CommandListClearUav,
+  CommandListDiscard,
+  CommandListQueryBeginEnd,
+  CommandListQueryResolve,
+  CommandListPredication,
+  CommandListExecuteIndirect,
+  CommandListMarkerEvent,
+  CommandListDepthBounds,
+  CommandListSamplePositions,
+  CommandListViewInstanceMask,
+  CommandListWriteBufferImmediate,
+  CommandListProtectedSession,
+  CommandListRenderPassBegin,
+  CommandListRenderPassEnd,
+  CommandListTemporalUpscale,
+  CommandListUnsupportedFeature,
+  CommandListSnapshotCapture,
+  CommandListRecordVectorAppend,
+  DeviceCreateDescriptorHeap,
+  DeviceGetDescriptorHandleIncrementSize,
+  DeviceCreateConstantBufferView,
+  DeviceCreateShaderResourceView,
+  DeviceCreateUnorderedAccessView,
+  DeviceCreateRenderTargetView,
+  DeviceCreateDepthStencilView,
+  DeviceCreateSampler,
+  DeviceCopyDescriptors,
+  DeviceCopyDescriptorsSimple,
+  DeviceCreateSamplerFeedbackUav,
+  DescriptorHandleResolve,
+  DescriptorLockAcquire,
+  DescriptorRecordReset,
+  DescriptorRecordCopy,
+  DescriptorSlotBeginWrite,
+  DescriptorRevisionCommit,
+  DescriptorSamplerMirrorMaterialize,
+  DescriptorTableMaterializeControl,
+  DescriptorTableMirrorMutation,
+  DescriptorTableTextureViewCreate,
+  DescriptorTableBufferTextureView,
+  DescriptorTableNativeBufferRecord,
+  DescriptorTableResidencyUpdate,
+  DescriptorTableDenseDiagnostic,
+  QueueExecuteControl,
+  QueueExecuteValidation,
+  QueueExecuteApitrace,
+  QueueExecuteCollect,
+  QueueEnqueueControl,
+  QueueEnqueueFrameTag,
+  QueueEnqueueLock,
+  QueueEnqueueNotify,
+  CompiledBuildLoopDispatch,
+  CompiledBuildPipelineMetadata,
+  CompiledBuildPacketStateCopy,
+  CompiledBuildRootTableMaterialize,
+  CompiledBuildNativeBindingDispatch,
+  CompiledBuildNativeStageCacheKey,
+  CompiledBuildNativeStageCacheLookup,
+  CompiledBuildNativeShaderLookup,
+  CompiledBuildNativeRootBaseLayout,
+  CompiledBuildNativeRootBaseRangeScan,
+  CompiledBuildNativePayloadAppend,
+  CompiledBuildNativeDiagnosticCopy,
+  CompiledBuildNativeStageCacheStore,
+  CompiledBuildSegmentAppend,
+  CompiledBuildStateUpdate,
+  CompiledBuildPayloadBufferCreate,
+  CompiledBuildPayloadBufferCopy,
+  CompiledBuildFallbackRewrite,
+  Count,
+};
+
+constexpr size_t kPerfCodePathCount =
+    static_cast<size_t>(PerfCodePath::Count);
+
 struct ScalerInfo {
   ScalerType type = ScalerType::None;
   uint32_t input_width;
@@ -192,19 +311,8 @@ struct FrameStatistics {
   clock::duration frame_create_reserved_resource_interval{};
   clock::duration frame_create_heap_interval{};
   clock::duration frame_create_pipeline_interval{};
-  clock::duration frame_other_d3d12_interval{};
+  clock::duration frame_tile_mapping_interval{};
   clock::duration frame_cmdlist_record_interval{};
-  clock::duration frame_api_gap_before_execute_command_lists_interval{};
-  clock::duration frame_api_gap_before_present_interval{};
-  clock::duration frame_api_gap_before_queue_signal_interval{};
-  clock::duration frame_api_gap_before_queue_wait_interval{};
-  clock::duration frame_api_gap_before_create_resource_interval{};
-  clock::duration frame_api_gap_before_create_reserved_resource_interval{};
-  clock::duration frame_api_gap_before_create_heap_interval{};
-  clock::duration frame_api_gap_before_create_pipeline_interval{};
-  clock::duration frame_api_gap_before_unscoped_d3d12_api_interval{};
-  clock::duration frame_api_gap_before_cmdlist_record_interval{};
-  clock::duration frame_api_gap_before_frame_boundary_interval{};
   clock::duration frame_execute_validate_interval{};
   clock::duration frame_execute_collect_interval{};
   clock::duration frame_execute_enqueue_interval{};
@@ -285,6 +393,9 @@ struct FrameStatistics {
   clock::duration frame_pso_cache_lookup_interval{};
   clock::duration frame_pso_materialize_interval{};
   clock::duration frame_pso_compile_wait_interval{};
+  std::array<clock::duration, kPerfCodePathCount> frame_code_path_intervals{};
+  std::array<clock::duration, kPerfCodePathCount> frame_code_path_max_intervals{};
+  std::array<uint64_t, kPerfCodePathCount> frame_code_path_counts{};
   uint64_t frame_replay_draw_count = 0;
   uint64_t frame_replay_record_draw_count = 0;
   uint64_t frame_replay_record_draw_indexed_count = 0;
@@ -526,19 +637,8 @@ struct FrameStatistics {
     frame_create_reserved_resource_interval = {};
     frame_create_heap_interval = {};
     frame_create_pipeline_interval = {};
-    frame_other_d3d12_interval = {};
+    frame_tile_mapping_interval = {};
     frame_cmdlist_record_interval = {};
-    frame_api_gap_before_execute_command_lists_interval = {};
-    frame_api_gap_before_present_interval = {};
-    frame_api_gap_before_queue_signal_interval = {};
-    frame_api_gap_before_queue_wait_interval = {};
-    frame_api_gap_before_create_resource_interval = {};
-    frame_api_gap_before_create_reserved_resource_interval = {};
-    frame_api_gap_before_create_heap_interval = {};
-    frame_api_gap_before_create_pipeline_interval = {};
-    frame_api_gap_before_unscoped_d3d12_api_interval = {};
-    frame_api_gap_before_cmdlist_record_interval = {};
-    frame_api_gap_before_frame_boundary_interval = {};
     frame_execute_validate_interval = {};
     frame_execute_collect_interval = {};
     frame_execute_enqueue_interval = {};
@@ -619,6 +719,9 @@ struct FrameStatistics {
     frame_pso_cache_lookup_interval = {};
     frame_pso_materialize_interval = {};
     frame_pso_compile_wait_interval = {};
+    frame_code_path_intervals.fill({});
+    frame_code_path_max_intervals.fill({});
+    frame_code_path_counts.fill(0);
     frame_replay_draw_count = 0;
     frame_replay_record_draw_count = 0;
     frame_replay_record_draw_indexed_count = 0;
@@ -909,19 +1012,8 @@ public:
       average_.frame_create_reserved_resource_interval += frames_[i].frame_create_reserved_resource_interval;
       average_.frame_create_heap_interval += frames_[i].frame_create_heap_interval;
       average_.frame_create_pipeline_interval += frames_[i].frame_create_pipeline_interval;
-      average_.frame_other_d3d12_interval += frames_[i].frame_other_d3d12_interval;
+      average_.frame_tile_mapping_interval += frames_[i].frame_tile_mapping_interval;
       average_.frame_cmdlist_record_interval += frames_[i].frame_cmdlist_record_interval;
-      average_.frame_api_gap_before_execute_command_lists_interval += frames_[i].frame_api_gap_before_execute_command_lists_interval;
-      average_.frame_api_gap_before_present_interval += frames_[i].frame_api_gap_before_present_interval;
-      average_.frame_api_gap_before_queue_signal_interval += frames_[i].frame_api_gap_before_queue_signal_interval;
-      average_.frame_api_gap_before_queue_wait_interval += frames_[i].frame_api_gap_before_queue_wait_interval;
-      average_.frame_api_gap_before_create_resource_interval += frames_[i].frame_api_gap_before_create_resource_interval;
-      average_.frame_api_gap_before_create_reserved_resource_interval += frames_[i].frame_api_gap_before_create_reserved_resource_interval;
-      average_.frame_api_gap_before_create_heap_interval += frames_[i].frame_api_gap_before_create_heap_interval;
-      average_.frame_api_gap_before_create_pipeline_interval += frames_[i].frame_api_gap_before_create_pipeline_interval;
-      average_.frame_api_gap_before_unscoped_d3d12_api_interval += frames_[i].frame_api_gap_before_unscoped_d3d12_api_interval;
-      average_.frame_api_gap_before_cmdlist_record_interval += frames_[i].frame_api_gap_before_cmdlist_record_interval;
-      average_.frame_api_gap_before_frame_boundary_interval += frames_[i].frame_api_gap_before_frame_boundary_interval;
       average_.frame_execute_validate_interval += frames_[i].frame_execute_validate_interval;
       average_.frame_execute_collect_interval += frames_[i].frame_execute_collect_interval;
       average_.frame_execute_enqueue_interval += frames_[i].frame_execute_enqueue_interval;
@@ -1002,6 +1094,15 @@ public:
       average_.frame_pso_cache_lookup_interval += frames_[i].frame_pso_cache_lookup_interval;
       average_.frame_pso_materialize_interval += frames_[i].frame_pso_materialize_interval;
       average_.frame_pso_compile_wait_interval += frames_[i].frame_pso_compile_wait_interval;
+      for (size_t path = 0; path < kPerfCodePathCount; path++) {
+        average_.frame_code_path_intervals[path] +=
+            frames_[i].frame_code_path_intervals[path];
+        average_.frame_code_path_max_intervals[path] = std::max(
+            average_.frame_code_path_max_intervals[path],
+            frames_[i].frame_code_path_max_intervals[path]);
+        average_.frame_code_path_counts[path] +=
+            frames_[i].frame_code_path_counts[path];
+      }
       average_.frame_replay_draw_count += frames_[i].frame_replay_draw_count;
       average_.frame_replay_record_draw_count += frames_[i].frame_replay_record_draw_count;
       average_.frame_replay_record_draw_indexed_count += frames_[i].frame_replay_record_draw_indexed_count;
@@ -1225,19 +1326,8 @@ public:
     average_.frame_create_reserved_resource_interval /= (kFrameStatisticsCount - 1);
     average_.frame_create_heap_interval /= (kFrameStatisticsCount - 1);
     average_.frame_create_pipeline_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_other_d3d12_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_tile_mapping_interval /= (kFrameStatisticsCount - 1);
     average_.frame_cmdlist_record_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_execute_command_lists_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_present_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_queue_signal_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_queue_wait_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_create_resource_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_create_reserved_resource_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_create_heap_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_create_pipeline_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_unscoped_d3d12_api_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_cmdlist_record_interval /= (kFrameStatisticsCount - 1);
-    average_.frame_api_gap_before_frame_boundary_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_validate_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_collect_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_enqueue_interval /= (kFrameStatisticsCount - 1);
@@ -1318,6 +1408,12 @@ public:
     average_.frame_pso_cache_lookup_interval /= (kFrameStatisticsCount - 1);
     average_.frame_pso_materialize_interval /= (kFrameStatisticsCount - 1);
     average_.frame_pso_compile_wait_interval /= (kFrameStatisticsCount - 1);
+    for (size_t path = 0; path < kPerfCodePathCount; path++) {
+      average_.frame_code_path_intervals[path] /=
+          (kFrameStatisticsCount - 1);
+      average_.frame_code_path_counts[path] /=
+          (kFrameStatisticsCount - 1);
+    }
     average_.frame_replay_draw_count /= (kFrameStatisticsCount - 1);
     average_.frame_replay_record_draw_count /= (kFrameStatisticsCount - 1);
     average_.frame_replay_record_draw_indexed_count /= (kFrameStatisticsCount - 1);

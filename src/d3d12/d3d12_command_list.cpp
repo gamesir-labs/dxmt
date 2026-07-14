@@ -992,6 +992,8 @@ class NativeRootBasePayloadBuilder {
 public:
   std::pair<uint64_t, uint32_t>
   Append(const std::vector<uint32_t> &values) {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CompiledBuildNativePayloadAppend);
     if (values.empty())
       return {};
     if (const auto found = offsets_.find(values); found != offsets_.end())
@@ -1010,6 +1012,8 @@ public:
       PipelineShaderStage stage,
       const std::vector<CompiledCommandRootDescriptorTable> &tables,
       CompiledNativeStageBinding &out) const {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CompiledBuildNativeStageCacheLookup);
     const auto key = StageKey(pipeline, root, stage, tables);
     const auto found = stage_bindings_.find(key);
     if (found == stage_bindings_.end())
@@ -1023,6 +1027,8 @@ public:
       PipelineShaderStage stage,
       const std::vector<CompiledCommandRootDescriptorTable> &tables,
       const CompiledNativeStageBinding &binding) {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CompiledBuildNativeStageCacheStore);
     stage_bindings_.emplace(StageKey(pipeline, root, stage, tables), binding);
   }
 
@@ -1035,13 +1041,21 @@ public:
     info.options = static_cast<WMTResourceOptions>(
         WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
     info.memory.set(nullptr);
-    compiled.native_root_base_buffer = device.newBuffer(info);
+    {
+      dxmt::perf::ScopedCodeTimer perf_timer(
+          dxmt::PerfCodePath::CompiledBuildPayloadBufferCreate);
+      compiled.native_root_base_buffer = device.newBuffer(info);
+    }
     auto *mapped = info.memory.get_accessible_or_null();
     if (!compiled.native_root_base_buffer || !mapped) {
       compiled.native_root_base_buffer = nullptr;
       return false;
     }
-    std::memcpy(mapped, words_.data(), info.length);
+    {
+      dxmt::perf::ScopedCodeTimer perf_timer(
+          dxmt::PerfCodePath::CompiledBuildPayloadBufferCopy);
+      std::memcpy(mapped, words_.data(), info.length);
+    }
     return true;
   }
 
@@ -1050,6 +1064,8 @@ private:
       const PipelineState &pipeline, const RootSignature &root,
       PipelineShaderStage stage,
       const std::vector<CompiledCommandRootDescriptorTable> &tables) {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CompiledBuildNativeStageCacheKey);
     std::vector<uint64_t> key = {
         reinterpret_cast<uintptr_t>(&pipeline),
         reinterpret_cast<uintptr_t>(&root), static_cast<uint64_t>(stage)};
@@ -1132,15 +1148,21 @@ BuildCompiledNativeRootBasesForArguments(
   if (!arguments || !argument_count)
     return CompiledCommandFallbackReason::None;
 
-  for (uint32_t i = 0; i < argument_count; i++) {
-    if (arguments[i].StructurePtrOffset >= 4096)
-      return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
-    out.resize(std::max<size_t>(out.size(),
-                                arguments[i].StructurePtrOffset + 1),
-               0);
+  {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CompiledBuildNativeRootBaseLayout);
+    for (uint32_t i = 0; i < argument_count; i++) {
+      if (arguments[i].StructurePtrOffset >= 4096)
+        return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
+      out.resize(std::max<size_t>(out.size(),
+                                  arguments[i].StructurePtrOffset + 1),
+                 0);
+    }
   }
 
   const auto parameters = root.GetParameters();
+  dxmt::perf::ScopedCodeTimer range_scan_timer(
+      dxmt::PerfCodePath::CompiledBuildNativeRootBaseRangeScan);
   for (uint32_t i = 0; i < argument_count; i++) {
     const auto &argument = arguments[i];
     const auto wanted_type = CompiledNativeRangeType(argument.Type);
@@ -1220,10 +1242,17 @@ BuildCompiledNativeStageBinding(
     const PipelineState &pipeline, const RootSignature &root,
     PipelineShaderStage stage, NativeRootBasePayloadBuilder &payloads,
     CompiledNativeStageBinding &out) {
+  dxmt::perf::ScopedCodeTimer perf_timer(
+      dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
   out = {};
   if (payloads.FindStageBinding(pipeline, root, stage, tables, out))
     return CompiledCommandFallbackReason::None;
-  const auto *shader = FindCompiledNativeShader(pipeline, stage);
+  const PipelineDxilShader *shader = nullptr;
+  {
+    dxmt::perf::ScopedCodeTimer shader_timer(
+        dxmt::PerfCodePath::CompiledBuildNativeShaderLookup);
+    shader = FindCompiledNativeShader(pipeline, stage);
+  }
   if (!shader) {
     out.ready = true;
     payloads.StoreStageBinding(pipeline, root, stage, tables, out);
@@ -1249,6 +1278,8 @@ BuildCompiledNativeStageBinding(
   std::tie(out.resource_root_base_offset, out.resource_root_base_count) =
       payloads.Append(resource_bases);
   if (CompiledRootCauseDiagnosticsEnabled()) {
+    dxmt::perf::ScopedCodeTimer diagnostic_copy_timer(
+        dxmt::PerfCodePath::CompiledBuildNativeDiagnosticCopy);
     out.cbuffer_root_bases = std::move(cbuffer_bases);
     out.resource_root_bases = std::move(resource_bases);
   }
@@ -1412,6 +1443,8 @@ AppendCompiledComputeSegment(CompiledCommandList &compiled, UINT record_index,
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                          WMT::Device device) {
+  dxmt::perf::ScopedCodeTimer loop_timer(
+      dxmt::PerfCodePath::CompiledBuildLoopDispatch);
   auto compiled = std::make_shared<CompiledCommandList>();
   compiled->record_count = static_cast<UINT>(records.size());
   NativeRootBasePayloadBuilder native_payloads;
@@ -1421,69 +1454,135 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     const auto &record = records[record_index];
     if (std::holds_alternative<DrawInstancedRecord>(record.payload) ||
         std::holds_alternative<DrawIndexedInstancedRecord>(record.payload)) {
-      const auto &metadata = GetCompiledPipelineMetadata(state, false);
+      const CompiledCommandPipelineMetadata *metadata_ptr = nullptr;
+      {
+        dxmt::perf::ScopedCodeTimer metadata_timer(
+            dxmt::PerfCodePath::CompiledBuildPipelineMetadata);
+        metadata_ptr = &GetCompiledPipelineMetadata(state, false);
+      }
+      const auto &metadata = *metadata_ptr;
       const auto reason = state.predication_active
                               ? CompiledCommandFallbackReason::QueryOrPredication
                               : CompiledPipelineFallbackReasonFromMetadata(
                                     metadata, false);
       if (reason == CompiledCommandFallbackReason::None) {
-        auto packet = BuildCompiledGraphicsPacket(record, record_index, state,
-                                                  metadata);
-        const auto table_reason =
-            MaterializeCompiledGraphicsRootTables(packet);
+        CompiledGraphicsPacket packet;
+        {
+          dxmt::perf::ScopedCodeTimer packet_timer(
+              dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+          packet = BuildCompiledGraphicsPacket(record, record_index, state,
+                                               metadata);
+        }
+        CompiledCommandFallbackReason table_reason;
+        {
+          dxmt::perf::ScopedCodeTimer table_timer(
+              dxmt::PerfCodePath::CompiledBuildRootTableMaterialize);
+          table_reason = MaterializeCompiledGraphicsRootTables(packet);
+        }
         if (table_reason == CompiledCommandFallbackReason::None) {
-          const auto native_reason =
-              BuildCompiledGraphicsNativeBindings(packet, native_payloads);
+          CompiledCommandFallbackReason native_reason;
+          {
+            dxmt::perf::ScopedCodeTimer native_timer(
+                dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
+            native_reason =
+                BuildCompiledGraphicsNativeBindings(packet, native_payloads);
+          }
           if (native_reason == CompiledCommandFallbackReason::None) {
-            AppendCompiledGraphicsSegment(*compiled, record_index,
-                                          std::move(packet));
+            {
+              dxmt::perf::ScopedCodeTimer append_timer(
+                  dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+              AppendCompiledGraphicsSegment(*compiled, record_index,
+                                            std::move(packet));
+            }
             ClearCompiledInputAssemblerDirtyState(state);
           } else {
+            dxmt::perf::ScopedCodeTimer append_timer(
+                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
             AppendCompiledFallbackSegment(*compiled, record_index,
                                           native_reason);
           }
         } else {
+          dxmt::perf::ScopedCodeTimer append_timer(
+              dxmt::PerfCodePath::CompiledBuildSegmentAppend);
           AppendCompiledFallbackSegment(*compiled, record_index, table_reason);
         }
       } else {
+        dxmt::perf::ScopedCodeTimer append_timer(
+            dxmt::PerfCodePath::CompiledBuildSegmentAppend);
         AppendCompiledFallbackSegment(*compiled, record_index, reason);
       }
     } else if (std::holds_alternative<DispatchRecord>(record.payload)) {
-      const auto &metadata = GetCompiledPipelineMetadata(state, true);
+      const CompiledCommandPipelineMetadata *metadata_ptr = nullptr;
+      {
+        dxmt::perf::ScopedCodeTimer metadata_timer(
+            dxmt::PerfCodePath::CompiledBuildPipelineMetadata);
+        metadata_ptr = &GetCompiledPipelineMetadata(state, true);
+      }
+      const auto &metadata = *metadata_ptr;
       const auto reason = state.predication_active
                               ? CompiledCommandFallbackReason::QueryOrPredication
                               : CompiledPipelineFallbackReasonFromMetadata(
                                     metadata, true);
       if (reason == CompiledCommandFallbackReason::None) {
-        auto packet = BuildCompiledComputePacket(record, record_index, state,
-                                                 metadata);
-        const auto table_reason =
-            MaterializeCompiledComputeRootTables(packet);
+        CompiledComputePacket packet;
+        {
+          dxmt::perf::ScopedCodeTimer packet_timer(
+              dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+          packet = BuildCompiledComputePacket(record, record_index, state,
+                                              metadata);
+        }
+        CompiledCommandFallbackReason table_reason;
+        {
+          dxmt::perf::ScopedCodeTimer table_timer(
+              dxmt::PerfCodePath::CompiledBuildRootTableMaterialize);
+          table_reason = MaterializeCompiledComputeRootTables(packet);
+        }
         if (table_reason == CompiledCommandFallbackReason::None) {
-          const auto native_reason =
-              BuildCompiledComputeNativeBindings(packet, native_payloads);
+          CompiledCommandFallbackReason native_reason;
+          {
+            dxmt::perf::ScopedCodeTimer native_timer(
+                dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
+            native_reason =
+                BuildCompiledComputeNativeBindings(packet, native_payloads);
+          }
           if (native_reason == CompiledCommandFallbackReason::None) {
+            dxmt::perf::ScopedCodeTimer append_timer(
+                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
             AppendCompiledComputeSegment(*compiled, record_index,
                                          std::move(packet));
           } else {
+            dxmt::perf::ScopedCodeTimer append_timer(
+                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
             AppendCompiledFallbackSegment(*compiled, record_index,
                                           native_reason);
           }
         } else {
+          dxmt::perf::ScopedCodeTimer append_timer(
+              dxmt::PerfCodePath::CompiledBuildSegmentAppend);
           AppendCompiledFallbackSegment(*compiled, record_index, table_reason);
         }
       } else {
+        dxmt::perf::ScopedCodeTimer append_timer(
+            dxmt::PerfCodePath::CompiledBuildSegmentAppend);
         AppendCompiledFallbackSegment(*compiled, record_index, reason);
       }
     } else {
+      dxmt::perf::ScopedCodeTimer append_timer(
+          dxmt::PerfCodePath::CompiledBuildSegmentAppend);
       AppendCompiledFallbackSegment(
           *compiled, record_index,
           FallbackReasonForCommandRecord(record.payload));
     }
-    UpdateCompiledCommandBuildState(state, record.payload);
+    {
+      dxmt::perf::ScopedCodeTimer state_timer(
+          dxmt::PerfCodePath::CompiledBuildStateUpdate);
+      UpdateCompiledCommandBuildState(state, record.payload);
+    }
   }
 
   if (!native_payloads.Finalize(device, *compiled)) {
+    dxmt::perf::ScopedCodeTimer fallback_timer(
+        dxmt::PerfCodePath::CompiledBuildFallbackRewrite);
     for (auto &segment : compiled->segments) {
       bool native = false;
       if (segment.kind == CompiledCommandSegmentKind::Graphics &&
@@ -1532,10 +1631,14 @@ class GraphicsCommandListImpl final
       public IMTLD3D12GraphicsCommandListExt {
 public:
   ULONG STDMETHODCALLTYPE AddRef() override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListReferenceCount);
     return ComObjectWithInitialRef<GraphicsCommandListComBase>::AddRef();
   }
 
   ULONG STDMETHODCALLTYPE Release() override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListReferenceCount);
     return ComObjectWithInitialRef<GraphicsCommandListComBase>::Release();
   }
 
@@ -1571,6 +1674,8 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     if (!ppvObject)
       return E_POINTER;
 
@@ -1638,40 +1743,64 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size, void *data) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     return private_data_.getData(guid, data_size, data);
   }
 
   HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size, const void *data) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     return private_data_.setData(guid, data_size, data);
   }
 
   HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown *data) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     return private_data_.setInterface(guid, data);
   }
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     name_ = name ? str::fromws(name) : std::string();
     return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     return device_->QueryInterface(riid, device);
   }
 
-  D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override { return type_; }
+  D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
+    return type_;
+  }
 
   HRESULT STDMETHODCALLTYPE Close() override {
+    dxmt::perf::ScopedCodeTimer control_timer(
+        dxmt::PerfCodePath::CommandListCloseControl);
     if (closed_)
       return E_FAIL;
-    if (!recording_error_)
+    if (!recording_error_) {
+      dxmt::perf::ScopedCodeTimer build_timer(
+          dxmt::PerfCodePath::CommandListCloseBuildCompiled);
       compiled_commands_ = BuildCompiledCommandList(records_,
                                                      device_->GetMTLDevice());
+    }
     closed_ = true;
-    if (allocator_)
+    if (allocator_) {
+      dxmt::perf::ScopedCodeTimer allocator_timer(
+          dxmt::PerfCodePath::CommandListCloseAllocatorRelease);
       allocator_->EndCommandListRecording(this);
+    }
     HRESULT hr = recording_error_ ? recording_error_ : S_OK;
     if (apitrace_lifecycle_recording_enabled_ &&
         dxmt::apitrace::d3d_enabled()) {
+      dxmt::perf::ScopedCodeTimer apitrace_timer(
+          dxmt::PerfCodePath::CommandListCloseApitrace);
       dxmt::apitrace::record_close_command_list(this, hr);
     }
     if (recording_error_)
@@ -1681,6 +1810,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator *allocator,
                                   ID3D12PipelineState *initial_state) override {
+    dxmt::perf::ScopedCodeTimer control_timer(
+        dxmt::PerfCodePath::CommandListResetControl);
     if (!closed_)
       return E_FAIL;
     if (recording_error_)
@@ -1694,63 +1825,94 @@ public:
     if (!IsPipelineStateCompatible(initial_state))
       return WARN_E_INVALIDARG(__func__);
 
-    if (allocator_.ptr() == allocator_state) {
-      allocator_->EndCommandListRecording(this);
-      if (!allocator_state->BeginCommandListRecording(this))
-        return WARN_E_INVALIDARG(__func__);
-    } else {
-      if (!allocator_state->BeginCommandListRecording(this))
-        return WARN_E_INVALIDARG(__func__);
-      if (allocator_)
+    {
+      dxmt::perf::ScopedCodeTimer allocator_timer(
+          dxmt::PerfCodePath::CommandListResetAllocator);
+      if (allocator_.ptr() == allocator_state) {
         allocator_->EndCommandListRecording(this);
+        if (!allocator_state->BeginCommandListRecording(this))
+          return WARN_E_INVALIDARG(__func__);
+      } else {
+        if (!allocator_state->BeginCommandListRecording(this))
+          return WARN_E_INVALIDARG(__func__);
+        if (allocator_)
+          allocator_->EndCommandListRecording(this);
+      }
     }
     allocator_ = allocator_state;
     initial_pipeline_state_ = initial_state;
     current_pipeline_state_ = initial_pipeline_state_;
     compute_root_signature_ = nullptr;
     graphics_root_signature_ = nullptr;
-    records_.clear();
-    compiled_commands_.reset();
-    pending_render_pass_resolves_.clear();
-    ClearRecordedStateCache();
+    {
+      dxmt::perf::ScopedCodeTimer state_clear_timer(
+          dxmt::PerfCodePath::CommandListResetStateClear);
+      records_.clear();
+      compiled_commands_.reset();
+      pending_render_pass_resolves_.clear();
+      ClearRecordedStateCache();
+    }
     closed_ = false;
     submitted_ = false;
     recording_error_ = S_OK;
     if (current_pipeline_state_) {
       if (apitrace_lifecycle_recording_enabled_) {
+        dxmt::perf::ScopedCodeTimer apitrace_timer(
+            dxmt::PerfCodePath::CommandListResetApitrace);
         g_current_command_record_d3d_sequence =
             dxmt::apitrace::record_reset_command_list(
                 this, allocator, initial_state, S_OK);
       }
-      if (current_pipeline_state_)
+      if (current_pipeline_state_) {
+        dxmt::perf::ScopedCodeTimer pipeline_timer(
+            dxmt::PerfCodePath::CommandListResetInitialPipeline);
         RecordPipelineState(current_pipeline_state_.ptr(), true);
+      }
     } else if (apitrace_lifecycle_recording_enabled_) {
+      dxmt::perf::ScopedCodeTimer apitrace_timer(
+          dxmt::PerfCodePath::CommandListResetApitrace);
       dxmt::apitrace::record_reset_command_list(
           this, allocator, initial_state, S_OK);
     }
     return S_OK;
   }
 
-  bool IsClosed() const override { return closed_; }
+  bool IsClosed() const override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
+    return closed_;
+  }
 
-  D3D12_COMMAND_LIST_TYPE GetCommandListType() const override { return type_; }
+  D3D12_COMMAND_LIST_TYPE GetCommandListType() const override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
+    return type_;
+  }
 
   const std::vector<CommandRecord> &GetCommandRecords() const override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     return records_;
   }
 
   std::shared_ptr<const CompiledCommandList> GetCompiledCommands()
       const override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     return compiled_commands_;
   }
 
   void SetApitraceLifecycleRecordingEnabled(bool enabled) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     apitrace_lifecycle_recording_enabled_ = enabled;
   }
 
   HRESULT MarkSubmittedToQueue(
       D3D12_COMMAND_LIST_TYPE queue_type,
       std::vector<SubmittedCommandAllocatorUse> &allocator_uses) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListObjectApi);
     if (!closed_ || type_ != queue_type)
       return WARN_E_INVALIDARG(__func__);
 
@@ -1764,6 +1926,8 @@ public:
 
   void STDMETHODCALLTYPE
   TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *desc) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListTemporalUpscale);
     if (!desc || !desc->Color || !desc->Depth || !desc->MotionVector ||
         !desc->Output)
       return;
@@ -1802,6 +1966,8 @@ public:
   HRESULT STDMETHODCALLTYPE CheckFeatureSupport(MTL_D3D12_FEATURE feature,
                                                 void *feature_support_data,
                                                 UINT feature_support_data_size) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListFeatureSupport);
     if (!feature_support_data)
       return E_INVALIDARG;
 
@@ -1818,6 +1984,8 @@ public:
   }
 
   void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pipeline_state) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListClearState);
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     g_current_command_record_d3d_sequence =
@@ -1831,6 +1999,8 @@ public:
   }
   void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count,
                                        UINT start_vertex_location, UINT start_instance_location) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListDrawInstanced);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_draw_instanced(
             this, vertex_count_per_instance, instance_count,
@@ -1842,6 +2012,8 @@ public:
   void STDMETHODCALLTYPE DrawIndexedInstanced(UINT index_count_per_instance, UINT instance_count,
                                               UINT start_vertex_location, INT base_vertex_location,
                                               UINT start_instance_location) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListDrawIndexedInstanced);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_draw_indexed_instanced(
             this, index_count_per_instance, instance_count,
@@ -1851,6 +2023,8 @@ public:
         base_vertex_location, start_instance_location});
   }
   void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListDispatch);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_dispatch(this, x, y, z);
     AddRecord(DispatchRecord{x, y, z});
@@ -1858,6 +2032,8 @@ public:
   void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource *dst_buffer, UINT64 dst_offset,
                                           ID3D12Resource *src_buffer, UINT64 src_offset,
                                           UINT64 byte_count) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListCopyBuffer);
     RecordCopyBufferRegion("CopyBufferRegion", dst_buffer, dst_offset, src_buffer,
                            src_offset, byte_count);
   }
@@ -1865,6 +2041,8 @@ public:
                                            UINT dst_y, UINT dst_z,
                                            const D3D12_TEXTURE_COPY_LOCATION *src,
                                            const D3D12_BOX *src_box) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListCopyTexture);
     if (!dst || !src || !dst->pResource || !src->pResource)
       return;
     SnapshotCopyTextureSourceBuffer(src, src_box);
@@ -1883,6 +2061,8 @@ public:
   }
   void STDMETHODCALLTYPE CopyResource(ID3D12Resource *dst_resource,
                                       ID3D12Resource *src_resource) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListCopyResource);
     if (!dst_resource || !src_resource)
       return;
     g_current_command_record_d3d_sequence =
@@ -1894,6 +2074,8 @@ public:
                                    const D3D12_TILE_REGION_SIZE *tile_region_size,
                                    ID3D12Resource *buffer, UINT64 buffer_offset,
                                    D3D12_TILE_COPY_FLAGS flags) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListCopyTiles);
     if (!tiled_resource || !tile_region_start_coordinate || !tile_region_size ||
         !buffer)
       return;
@@ -1929,6 +2111,8 @@ public:
   void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource *dst_resource, UINT dst_sub_resource,
                                             ID3D12Resource *src_resource, UINT src_sub_resource,
                                             DXGI_FORMAT format) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListResolve);
     if (!dst_resource || !src_resource)
       return;
     g_current_command_record_d3d_sequence =
@@ -1944,12 +2128,16 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListPrimitiveTopology);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_ia_set_primitive_topology(
             this, static_cast<uint32_t>(primitive_topology));
     AddRecord(PrimitiveTopologyRecord{primitive_topology});
   }
   void STDMETHODCALLTYPE RSSetViewports(UINT viewport_count, const D3D12_VIEWPORT *viewports) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListViewports);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_rs_set_viewports(this, viewport_count, viewports);
     ViewportRecord record = {};
@@ -1958,6 +2146,8 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE RSSetScissorRects(UINT rect_count, const D3D12_RECT *rects) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListScissors);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_rs_set_scissor_rects(this, rect_count, rects);
     ScissorRecord record = {};
@@ -1966,6 +2156,8 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT blend_factor[4]) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListBlendFactor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_om_set_blend_factor(this, blend_factor);
     BlendFactorRecord record = {};
@@ -1974,11 +2166,15 @@ public:
     AddRecord(record);
   }
   void STDMETHODCALLTYPE OMSetStencilRef(UINT stencil_ref) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListStencilRef);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_om_set_stencil_ref(this, stencil_ref);
     AddRecord(StencilRefRecord{stencil_ref});
   }
   void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListPipelineState);
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     g_current_command_record_d3d_sequence =
@@ -1987,6 +2183,8 @@ public:
     RecordPipelineState(current_pipeline_state_.ptr(), false);
   }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListResourceBarrier);
     if (!barriers || !barrier_count)
       return;
 
@@ -2003,6 +2201,8 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListExecuteBundle);
     auto *bundle = dynamic_cast<GraphicsCommandList *>(command_list);
     if (!bundle || bundle->GetCommandListType() != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
       WARN("D3D12GraphicsCommandList: ExecuteBundle called with non-bundle command list");
@@ -2020,6 +2220,8 @@ public:
     current_pipeline_state_ = nullptr;
   }
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT heap_count, ID3D12DescriptorHeap *const *heaps) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListDescriptorHeaps);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_descriptor_heaps(
             this, heap_count, reinterpret_cast<const void *const *>(heaps));
@@ -2033,6 +2235,8 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature *root_signature) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootSignature);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, true, root_signature);
     if (compute_root_signature_.ptr() == root_signature)
@@ -2043,6 +2247,8 @@ public:
   }
 
   void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature *root_signature) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootSignature);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, false, root_signature);
     if (graphics_root_signature_.ptr() == root_signature)
@@ -2053,6 +2259,8 @@ public:
   }
   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT root_parameter_index,
                                                        D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptorTable);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor_table(
             this, true, root_parameter_index, base_descriptor);
@@ -2064,6 +2272,8 @@ public:
   }
   void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT root_parameter_index,
                                                         D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptorTable);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor_table(
             this, false, root_parameter_index, base_descriptor);
@@ -2075,6 +2285,8 @@ public:
   }
   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT root_parameter_index, UINT data,
                                                      UINT dst_offset) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootConstants);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, true, root_parameter_index, 1, &data, dst_offset);
@@ -2089,6 +2301,8 @@ public:
   }
   void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT root_parameter_index, UINT data,
                                                       UINT dst_offset) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootConstants);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, false, root_parameter_index, 1, &data, dst_offset);
@@ -2103,6 +2317,8 @@ public:
   }
   void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT root_parameter_index, UINT constant_count,
                                                       const void *data, UINT dst_offset) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootConstants);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, true, root_parameter_index, constant_count,
@@ -2121,6 +2337,8 @@ public:
   }
   void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT root_parameter_index, UINT constant_count,
                                                        const void *data, UINT dst_offset) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootConstants);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, false, root_parameter_index, constant_count,
@@ -2139,6 +2357,8 @@ public:
   }
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT root_parameter_index,
                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, true, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address);
@@ -2148,6 +2368,8 @@ public:
   }
   void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT root_parameter_index,
                                                            D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, false, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address);
@@ -2157,6 +2379,8 @@ public:
   }
   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT root_parameter_index,
                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, true, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address);
@@ -2166,6 +2390,8 @@ public:
   }
   void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT root_parameter_index,
                                                            D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, false, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address);
@@ -2175,6 +2401,8 @@ public:
   }
   void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT root_parameter_index,
                                                            D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, true, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address);
@@ -2184,6 +2412,8 @@ public:
   }
   void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT root_parameter_index,
                                                             D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRootDescriptor);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_descriptor(
             this, false, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address);
@@ -2192,6 +2422,8 @@ public:
         false, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address});
   }
   void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *view) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListIndexBuffer);
     if (view)
       SnapshotGpuVirtualBufferRange(view->BufferLocation, view->SizeInBytes);
     g_current_command_record_d3d_sequence =
@@ -2205,6 +2437,8 @@ public:
   }
   void STDMETHODCALLTYPE IASetVertexBuffers(UINT start_slot, UINT view_count,
                                             const D3D12_VERTEX_BUFFER_VIEW *views) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListVertexBuffers);
     for (UINT index = 0; views && index < view_count; ++index)
       SnapshotGpuVirtualBufferRange(views[index].BufferLocation, views[index].SizeInBytes);
     g_current_command_record_d3d_sequence =
@@ -2221,6 +2455,8 @@ public:
   }
   void STDMETHODCALLTYPE SOSetTargets(UINT start_slot, UINT view_count,
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListStreamOutput);
     if (!view_count)
       return;
 
@@ -2233,6 +2469,8 @@ public:
                                             const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors,
                                             WINBOOL single_descriptor_handle,
                                             const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRenderTargets);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_om_set_render_targets(
             this, render_target_descriptor_count, render_target_descriptors,
@@ -2271,6 +2509,8 @@ public:
   void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags,
                                                FLOAT depth, UINT8 stencil, UINT rect_count,
                                                const D3D12_RECT *rects) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListClearDepthStencil);
     auto descriptor = GetDescriptorRecordFromCpuHandle(
         dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     if (!descriptor)
@@ -2289,6 +2529,8 @@ public:
   }
   void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4],
                                                UINT rect_count, const D3D12_RECT *rects) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListClearRenderTarget);
     auto descriptor = GetDescriptorRecordFromCpuHandle(
         rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     if (!descriptor)
@@ -2308,6 +2550,8 @@ public:
                                                       D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle,
                                                       ID3D12Resource *resource, const UINT values[4],
                                                       UINT rect_count, const D3D12_RECT *rects) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListClearUav);
     if (!resource || !values)
       return;
     auto descriptor =
@@ -2340,6 +2584,8 @@ public:
                                                        D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle,
                                                        ID3D12Resource *resource, const float values[4],
                                                        UINT rect_count, const D3D12_RECT *rects) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListClearUav);
     if (!resource || !values)
       return;
     auto descriptor =
@@ -2368,6 +2614,8 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListDiscard);
     if (!resource)
       return;
     g_current_command_record_d3d_sequence =
@@ -2387,6 +2635,8 @@ public:
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListQueryBeginEnd);
     if (!heap)
       return;
     g_current_command_record_d3d_sequence =
@@ -2395,6 +2645,8 @@ public:
     AddRecord(BeginQueryRecord{heap, type, index});
   }
   void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListQueryBeginEnd);
     if (!heap)
       return;
     g_current_command_record_d3d_sequence =
@@ -2406,6 +2658,8 @@ public:
                                           UINT start_index, UINT query_count,
                                           ID3D12Resource *dst_buffer,
                                           UINT64 aligned_dst_buffer_offset) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListQueryResolve);
     if (!heap || !dst_buffer || !query_count)
       return;
     g_current_command_record_d3d_sequence =
@@ -2418,18 +2672,31 @@ public:
   }
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *buffer, UINT64 aligned_buffer_offset,
                                         D3D12_PREDICATION_OP operation) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListPredication);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_predication(
             this, buffer, aligned_buffer_offset, static_cast<uint32_t>(operation));
     AddRecord(PredicationRecord{buffer, aligned_buffer_offset, operation});
   }
-  void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) override {}
-  void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void *data, UINT size) override {}
-  void STDMETHODCALLTYPE EndEvent() override {}
+  void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListMarkerEvent);
+  }
+  void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void *data, UINT size) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListMarkerEvent);
+  }
+  void STDMETHODCALLTYPE EndEvent() override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListMarkerEvent);
+  }
   void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature *command_signature,
                                          UINT max_command_count, ID3D12Resource *arg_buffer,
                                          UINT64 arg_buffer_offset, ID3D12Resource *count_buffer,
                                          UINT64 count_buffer_offset) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListExecuteIndirect);
     if (!command_signature || !arg_buffer || !max_command_count)
       return;
     g_current_command_record_d3d_sequence =
@@ -2448,6 +2715,8 @@ public:
       UINT dependent_resource_count,
       ID3D12Resource *const *dependent_resources,
       const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     // A normal blit copy cannot provide AtomicCopy's dependent-range ordering
     // and atomic publication contract. Fail Close explicitly rather than
     // recording a semantically different CopyBufferRegion.
@@ -2461,11 +2730,15 @@ public:
       UINT dependent_resource_count,
       ID3D12Resource *const *dependent_resources,
       const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: AtomicCopyBufferUINT64 is unsupported");
   }
 
   void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListDepthBounds);
     depth_bounds_min_ = min;
     depth_bounds_max_ = max;
     if (min == 0.0f && max == 1.0f)
@@ -2480,6 +2753,8 @@ public:
   void STDMETHODCALLTYPE SetSamplePositions(
       UINT sample_count, UINT pixel_count,
       D3D12_SAMPLE_POSITION *sample_positions) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListSamplePositions);
     const bool reset = sample_count == 0 && pixel_count == 0 && !sample_positions;
     if (!reset) {
       WARN("D3D12GraphicsCommandList: programmable sample positions are unsupported");
@@ -2491,6 +2766,8 @@ public:
       ID3D12Resource *dst_resource, UINT dst_sub_resource_idx, UINT dst_x,
       UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx,
       D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListResolve);
     if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) {
       recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion decompress mode is unsupported");
@@ -2518,6 +2795,8 @@ public:
   }
 
   void STDMETHODCALLTYPE SetViewInstanceMask(UINT mask) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListViewInstanceMask);
     view_instance_mask_ = mask;
   }
 #endif
@@ -2526,6 +2805,8 @@ public:
   void STDMETHODCALLTYPE WriteBufferImmediate(
       UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters,
       const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListWriteBufferImmediate);
     if (!count || !parameters)
       return;
 
@@ -2543,6 +2824,8 @@ public:
 #ifdef __ID3D12GraphicsCommandList3_INTERFACE_DEFINED__
   void STDMETHODCALLTYPE SetProtectedResourceSession(
       ID3D12ProtectedResourceSession *protected_resource_session) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListProtectedSession);
     if (protected_resource_session)
       WARN("D3D12GraphicsCommandList: protected resource sessions are "
            "unsupported");
@@ -2555,6 +2838,8 @@ public:
       const D3D12_RENDER_PASS_RENDER_TARGET_DESC *render_targets,
       const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *depth_stencil,
       D3D12_RENDER_PASS_FLAGS flags) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRenderPassBegin);
     pending_render_pass_resolves_.clear();
     if (flags & ~(D3D12_RENDER_PASS_FLAG_NONE |
                   D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES)) {
@@ -2619,6 +2904,8 @@ public:
   }
 
   void STDMETHODCALLTYPE EndRenderPass() override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListRenderPassEnd);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_end_render_pass(this);
     for (const auto &resolve : pending_render_pass_resolves_) {
@@ -2641,12 +2928,16 @@ public:
       ID3D12MetaCommand *meta_command,
       const void *initialization_parameters_data,
       SIZE_T initialization_parameters_data_size_in_bytes) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: meta commands are unsupported");
   }
 
   void STDMETHODCALLTYPE ExecuteMetaCommand(
       ID3D12MetaCommand *meta_command, const void *execution_parameters_data,
       SIZE_T execution_parameters_data_size_in_bytes) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: meta commands are unsupported");
   }
 
@@ -2654,6 +2945,8 @@ public:
       const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc,
       UINT postbuild_info_descs_count,
       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
          "unsupported");
   }
@@ -2662,6 +2955,8 @@ public:
       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
       UINT src_acceleration_structures_count,
       const D3D12_GPU_VIRTUAL_ADDRESS *src_acceleration_structure_data) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
          "unsupported");
   }
@@ -2670,16 +2965,22 @@ public:
       D3D12_GPU_VIRTUAL_ADDRESS dst_acceleration_structure_data,
       D3D12_GPU_VIRTUAL_ADDRESS src_acceleration_structure_data,
       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
          "unsupported");
   }
 
   void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject *state_object) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListPipelineState);
     if (state_object)
       WARN("D3D12GraphicsCommandList: state objects are unsupported");
   }
 
   void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC *desc) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: ray dispatch is unsupported");
   }
 #endif
@@ -2688,12 +2989,16 @@ public:
   void STDMETHODCALLTYPE RSSetShadingRate(
       D3D12_SHADING_RATE base_shading_rate,
       const D3D12_SHADING_RATE_COMBINER *combiners) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     if (base_shading_rate != D3D12_SHADING_RATE_1X1 || combiners)
       WARN("D3D12GraphicsCommandList: variable rate shading is unsupported");
   }
 
   void STDMETHODCALLTYPE RSSetShadingRateImage(
       ID3D12Resource *shading_rate_image) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     if (shading_rate_image)
       WARN("D3D12GraphicsCommandList: shading rate images are unsupported");
   }
@@ -2704,6 +3009,8 @@ public:
       UINT thread_group_count_x,
       UINT thread_group_count_y,
       UINT thread_group_count_z) override {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListUnsupportedFeature);
     WARN("D3D12GraphicsCommandList: mesh shaders are unsupported");
   }
 #endif
@@ -2891,6 +3198,8 @@ private:
   // Unmapped just before this copy. This covers persistently mapped upload buffers that are written
   // directly and later consumed by copy commands. No-op for non-CPU-mapped sources.
   void SnapshotCopySourceBuffer(ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListSnapshotCapture);
     if (!src_buffer || byte_count == 0 || !dxmt::apitrace::d3d_enabled())
       return;
     auto *res = dynamic_cast<Resource *>(src_buffer);
@@ -2933,6 +3242,8 @@ private:
 
   void SnapshotCopyTextureSourceBuffer(const D3D12_TEXTURE_COPY_LOCATION *src,
                                        const D3D12_BOX *src_box) {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListSnapshotCapture);
     if (!src || !src->pResource ||
         src->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
       return;
@@ -2993,6 +3304,8 @@ private:
   }
 
   void SnapshotGpuVirtualBufferRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 byte_count) {
+    dxmt::perf::ScopedCodeTimer perf_timer(
+        dxmt::PerfCodePath::CommandListSnapshotCapture);
     if (address == 0 || byte_count == 0 || !dxmt::apitrace::d3d_enabled())
       return;
     UINT64 offset = 0;
@@ -3026,6 +3339,8 @@ private:
     // contributes to the measured frame wall.
     dxmt::perf::ScopedFrameTimer perf_timer(
         dxmt::perf::FrameTimeBucket::CommandListRecord);
+    dxmt::perf::ScopedCodeTimer code_timer(
+        dxmt::PerfCodePath::CommandListRecordVectorAppend);
     records_.push_back(CommandRecord{
         g_current_command_record_d3d_sequence, std::forward<T>(payload)});
   }

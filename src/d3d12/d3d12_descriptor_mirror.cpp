@@ -1,5 +1,6 @@
 #include "d3d12_descriptor_mirror.hpp"
 
+#include "dxmt_perf_stats.hpp"
 #include "dxmt_sampler.hpp"
 #include "dxmt_texture.hpp"
 #include "log/log.hpp"
@@ -304,6 +305,8 @@ DescriptorHeapMirror::RefreshBufferResource(uint32_t resource_index,
 
 void
 DescriptorHeapMirror::ClearBufferResource(uint32_t resource_index) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (resource_index == kNullDescriptorResourceIndex ||
       resource_index >= buffer_resources_.size())
@@ -321,6 +324,8 @@ void
 DescriptorHeapMirror::ClearBufferResourcesForSlot(uint32_t descriptor_index,
                                                   bool clear_primary,
                                                   bool clear_counter) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (clear_primary)
     ClearBufferResource(BufferResourceIndex(descriptor_index, false));
@@ -330,6 +335,8 @@ DescriptorHeapMirror::ClearBufferResourcesForSlot(uint32_t descriptor_index,
 
 void
 DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (index >= table_entries_.size())
     return;
@@ -341,6 +348,8 @@ DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry
 void
 DescriptorHeapMirror::WriteBufferResourceTableEntry(
     uint32_t index, const DescriptorBackendResourceRecord &record) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (!buffer_resource_table_mapped_ ||
       index >= buffer_resource_table_capacity_)
@@ -357,6 +366,8 @@ void
 DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
                                     DescriptorBackendSlotKind kind,
                                     uint32_t flags) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (index >= slot_meta_.size())
     return;
@@ -370,6 +381,8 @@ DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
 
 void
 DescriptorHeapMirror::WriteNullTableEntry(uint32_t index) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (sampler_heap_) {
     WriteTableEntry(index, {null_sampler_handle_, null_sampler_handle_,
@@ -388,6 +401,8 @@ void
 DescriptorHeapMirror::WriteBufferTableEntry(uint32_t index, uint64_t gpu_va,
                                             uint64_t size, bool typed,
                                             uint32_t texture_view_offset) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   WriteTableEntry(index, {gpu_va, 0,
                           BufferDescriptorMetadata(size, typed,
@@ -403,6 +418,8 @@ DescriptorHeapMirror::WriteBufferTextureTableEntry(
     uint32_t index, uint64_t gpu_va, uint64_t size,
     uint64_t texture_view_id, uint32_t element_count,
     uint32_t first_element, uint32_t flags) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   const uint64_t metadata =
       (uint64_t(element_count) << 32) | uint64_t(first_element);
@@ -415,6 +432,8 @@ DescriptorHeapMirror::WriteBufferTextureTableEntry(
 void
 DescriptorHeapMirror::WriteBufferDescriptorRecord(
     uint32_t index, const BufferDescriptorRecord &record) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (!buffer_record_mapped_ || index >= num_descriptors_)
     return;
@@ -430,6 +449,8 @@ DescriptorHeapMirror::WriteTextureTableEntry(uint32_t index,
                                              uint64_t gpu_resource_id,
                                              uint32_t array_length,
                                              float min_lod) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   WriteTableEntry(index,
                   {0, gpu_resource_id,
@@ -442,6 +463,8 @@ void
 DescriptorHeapMirror::WriteTexturePoolTableEntry(uint32_t index,
                                                  uint32_t array_length,
                                                  float min_lod) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   const uint64_t resource_id = textureViewPoolSlotResourceID(index);
   WriteTextureTableEntry(index, resource_id, array_length, min_lod);
@@ -452,6 +475,8 @@ DescriptorHeapMirror::WriteTexturePoolTableEntry(uint32_t index,
 void
 DescriptorHeapMirror::WriteSamplerTableEntry(uint32_t index,
                                              const Sampler *sampler) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   const uint64_t sampler_handle = sampler ? sampler->sampler_state_handle : 0;
   const uint64_t sampler_cube_handle =
@@ -467,6 +492,8 @@ uint64_t
 DescriptorHeapMirror::SetTexturePoolSlot(uint32_t index, Texture *texture,
                                          TextureViewKey view,
                                          TextureAllocation *allocation) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (sampler_heap_ || !texture_view_pool_ || index >= num_descriptors_ ||
       !texture || !allocation)
@@ -479,6 +506,8 @@ DescriptorHeapMirror::SetTexturePoolBufferSlot(
     uint32_t index, WMT::Buffer buffer,
     const WMTTextureBufferViewDescriptor &descriptor, uint64_t offset,
     uint64_t bytes_per_row) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (sampler_heap_ || !texture_view_pool_ || index >= num_descriptors_ ||
       !buffer)
@@ -491,6 +520,8 @@ uint64_t
 DescriptorHeapMirror::CopyTexturePoolSlotFrom(uint32_t dst_index,
                                               const DescriptorHeapMirror &src,
                                               uint32_t src_index) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   if (this == &src) {
     std::lock_guard lock(mutex_);
     if (sampler_heap_ || !texture_view_pool_ ||
@@ -511,6 +542,8 @@ DescriptorHeapMirror::CopyTexturePoolSlotFrom(uint32_t dst_index,
 DescriptorResidencyTarget
 DescriptorHeapMirror::ReplaceResidencyTarget(
     uint32_t index, DescriptorResidencyTarget target) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (index >= residency_targets_.size())
     return {};
@@ -611,6 +644,8 @@ bool
 DescriptorHeapMirror::FillSamplerSlot(
     uint32_t index, const Sampler *sampler, uint64_t null_handle,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
@@ -636,6 +671,8 @@ DescriptorHeapMirror::FillTextureSlot(
     uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
     float min_lod,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
@@ -655,6 +692,8 @@ bool
 DescriptorHeapMirror::FillTextureSlotPayload(
     uint32_t index, uint64_t handle_payload, uint64_t metadata_payload,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
@@ -672,6 +711,8 @@ bool
 DescriptorHeapMirror::ClearTextureSlot(
     uint32_t index,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
@@ -687,6 +728,8 @@ DescriptorHeapMirror::ClearTextureSlot(
 
 dxmt::DescriptorSlotVersion
 DescriptorHeapMirror::BeginSlotWrite(uint32_t index) {
+  dxmt::perf::ScopedCodeTimer timer(
+      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
   if (index >= stale_versions_.size())
     return {};

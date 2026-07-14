@@ -4227,7 +4227,7 @@ public:
                                             const UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {
     dxmt::perf::ScopedFrameTimer perf_timer(
-        dxmt::perf::FrameTimeBucket::UnscopedD3D12Api);
+        dxmt::perf::FrameTimeBucket::TileMapping);
     UpdateTileMappingsImpl(resource, region_count, region_start_coordinates,
                            region_sizes, heap, range_count, range_flags,
                            heap_range_offsets, range_tile_counts, flags);
@@ -4242,7 +4242,7 @@ public:
                                             UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {
     dxmt::perf::ScopedFrameTimer perf_timer(
-        dxmt::perf::FrameTimeBucket::UnscopedD3D12Api);
+        dxmt::perf::FrameTimeBucket::TileMapping);
     UpdateTileMappingsImpl(resource, region_count, region_start_coordinates,
                            region_sizes, nullptr, range_count, range_flags,
                            heap_range_offsets, range_tile_counts, flags);
@@ -4256,7 +4256,7 @@ public:
                                           const D3D12_TILE_REGION_SIZE *region_size,
                                           D3D12_TILE_MAPPING_FLAGS flags) override {
     dxmt::perf::ScopedFrameTimer perf_timer(
-        dxmt::perf::FrameTimeBucket::UnscopedD3D12Api);
+        dxmt::perf::FrameTimeBucket::TileMapping);
     CopyTileMappingsImpl(dst_resource, dst_region_start_coordinate,
                          src_resource, src_region_start_coordinate,
                          region_size, flags);
@@ -4732,6 +4732,8 @@ public:
 
   void STDMETHODCALLTYPE ExecuteCommandLists(UINT command_list_count,
                                              ID3D12CommandList *const *command_lists) override {
+    dxmt::perf::ScopedCodeTimer code_timer(
+        dxmt::PerfCodePath::QueueExecuteControl);
     dxmt::perf::ScopedFrameTimer perf_timer(
         dxmt::perf::FrameTimeBucket::ExecuteCommandLists);
     static std::atomic<uint32_t> diag_execute_log_count = 0;
@@ -4746,15 +4748,19 @@ public:
     auto *perf_stats = dxmt::perf::currentFrameStatistics();
     auto perf_mark = clock::now();
 
-    if (D3D12DiagShouldLog(diag_execute_log_count,
-                           D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_DEVICE") ||
-                               D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN_FILE_ONLY("D3D12 diagnostic: ExecuteCommandLists"
-           " queueType=", desc_.Type,
-           " listCount=", command_list_count,
-           " queue=", reinterpret_cast<uintptr_t>(this),
-           " submittedBatches=", submitted_batches_.load(std::memory_order_relaxed),
-           " pendingOps=", PendingOperationCountForDiag());
+    {
+      dxmt::perf::ScopedCodeTimer phase_timer(
+          dxmt::PerfCodePath::QueueExecuteValidation);
+      if (D3D12DiagShouldLog(diag_execute_log_count,
+                             D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_DEVICE") ||
+                                 D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+        WARN_FILE_ONLY("D3D12 diagnostic: ExecuteCommandLists"
+             " queueType=", desc_.Type,
+             " listCount=", command_list_count,
+             " queue=", reinterpret_cast<uintptr_t>(this),
+             " submittedBatches=", submitted_batches_.load(std::memory_order_relaxed),
+             " pendingOps=", PendingOperationCountForDiag());
+      }
     }
 
     dxmt::perf::recordExecuteTime(
@@ -4762,40 +4768,48 @@ public:
         clock::now() - perf_mark);
     perf_mark = clock::now();
 
-    for (UINT i = 0; i < command_list_count; i++) {
-      if (command_lists[i])
-        dxmt::apitrace::on_d3d12_execute_command_lists(this, command_lists[i]);
+    {
+      dxmt::perf::ScopedCodeTimer phase_timer(
+          dxmt::PerfCodePath::QueueExecuteApitrace);
+      for (UINT i = 0; i < command_list_count; i++) {
+        if (command_lists[i])
+          dxmt::apitrace::on_d3d12_execute_command_lists(this, command_lists[i]);
+      }
     }
 
     PendingOperation op;
     op.type = PendingOperationType::Execute;
-    for (UINT i = 0; i < command_list_count; i++) {
-      auto *command_list = command_lists[i];
-      if (!command_list) {
-        Logger::err(str::format("D3D12CommandQueue: null command list at index ", i));
-        continue;
-      }
+    {
+      dxmt::perf::ScopedCodeTimer phase_timer(
+          dxmt::PerfCodePath::QueueExecuteCollect);
+      for (UINT i = 0; i < command_list_count; i++) {
+        auto *command_list = command_lists[i];
+        if (!command_list) {
+          Logger::err(str::format("D3D12CommandQueue: null command list at index ", i));
+          continue;
+        }
 
-      auto *state = dynamic_cast<GraphicsCommandList *>(command_list);
-      if (!state) {
-        Logger::err(str::format("D3D12CommandQueue: foreign command list at index ", i));
-        continue;
-      }
+        auto *state = dynamic_cast<GraphicsCommandList *>(command_list);
+        if (!state) {
+          Logger::err(str::format("D3D12CommandQueue: foreign command list at index ", i));
+          continue;
+        }
 
-      if (state->GetCommandListType() != desc_.Type) {
-        Logger::err(str::format("D3D12CommandQueue: command list type ", state->GetCommandListType(),
-                                " does not match queue type ", desc_.Type));
-        continue;
-      }
+        if (state->GetCommandListType() != desc_.Type) {
+          Logger::err(str::format("D3D12CommandQueue: command list type ", state->GetCommandListType(),
+                                  " does not match queue type ", desc_.Type));
+          continue;
+        }
 
-      if (!state->IsClosed()) {
-        Logger::err(str::format("D3D12CommandQueue: command list at index ", i, " is not closed"));
-        continue;
-      }
+        if (!state->IsClosed()) {
+          Logger::err(str::format("D3D12CommandQueue: command list at index ", i, " is not closed"));
+          continue;
+        }
 
-      if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
-        op.command_records.emplace_back(state->GetCommandRecords());
-        op.compiled_command_lists.emplace_back(state->GetCompiledCommands());
+        if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
+          op.command_records.emplace_back(state->GetCommandRecords());
+          op.compiled_command_lists.emplace_back(state->GetCompiledCommands());
+        }
       }
     }
 
@@ -8493,11 +8507,10 @@ private:
     std::unordered_map<const char *, std::pair<uint64_t, uint64_t>> rb_by_type;
     // Perf replay sub-phase aggregation. DXMT_PERF_STATS enables aggregate
     // timers; DXMT_DIAG_STALL only adds the slow-record detail log.
-    // Sums EVERY record's psoSelect/descAccess/
-    // attach/emit + per-record total, so the breakdown line below shows what
-    // dominates recordLoop in the heavy scene and — crucially — how much is
-    // stallUnaccounted: the ~85% that is none of those named phases (SelectPSO +
-    // binding snapshot + packet build + GetResource, or a pure first-use stall).
+    // Sums every concrete replay-record body and its named draw/dispatch
+    // sub-phases. Record body totals remain attributed to the exact
+    // CommandRecord overload through RecordReplayRecordPerfBucket; only named
+    // implementation paths are emitted.
     // Serial replay (intra-pass gate off) → no lock needed.
     StallProbe rb_stall_accum = {};
     uint64_t rb_stall_total_us = 0;
@@ -8562,10 +8575,6 @@ private:
             return n ? n : 500;
           }();
           if (stall_log && uint64_t(rec_us) >= thresh) {
-            const uint64_t accounted =
-                p.getPipelineUs + p.psoSelectUs + p.selectPsoUs +
-                p.descAccessUs + p.attachUs + p.bindSnapUs + p.estimateUs +
-                p.packetUs + p.queueUs + p.emitUs;
             static std::atomic<uint32_t> stall_log_count = 0;
             if (stall_log_count.fetch_add(1, std::memory_order_relaxed) < 4000)
               WARN_FILE_ONLY("DXMT stall record:"
@@ -8581,8 +8590,7 @@ private:
                    " estimateUs=", p.estimateUs,
                    " packetUs=", p.packetUs,
                    " queueUs=", p.queueUs,
-                   " emitUs=", p.emitUs,
-                   " unaccountedUs=", (uint64_t(rec_us) > accounted ? uint64_t(rec_us) - accounted : 0));
+                   " emitUs=", p.emitUs);
           }
         }
         if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
@@ -9392,20 +9400,12 @@ private:
       const uint64_t flush_pass_us = us(rb_t2 - rb_t1);
       const uint64_t timestamp_resolve_us = us(rb_t3 - rb_t2);
       const uint64_t cpu_query_resolve_us = us(rb_t4 - rb_t3);
-      const uint64_t stall_accounted_us =
-          rb_stall_accum.getPipelineUs + rb_stall_accum.psoSelectUs +
-          rb_stall_accum.selectPsoUs + rb_stall_accum.descAccessUs +
-          rb_stall_accum.attachUs + rb_stall_accum.bindSnapUs +
-          rb_stall_accum.estimateUs + rb_stall_accum.packetUs +
-          rb_stall_accum.queueUs + rb_stall_accum.emitUs;
-      const uint64_t stall_unaccounted_us =
-          rb_stall_total_us > stall_accounted_us
-              ? rb_stall_total_us - stall_accounted_us
-              : 0;
       static const uint64_t rb_threshold_us = []() {
         auto v = env::getEnvVar("DXMT_DIAG_REPLAY_BREAKDOWN_US");
         return v.empty() ? uint64_t(50000) : strtoull(v.c_str(), nullptr, 10);
       }();
+      // This threshold controls verbose per-type diagnostics only. The worker
+      // frame ledger above records every replay batch regardless of duration.
       if (uint64_t(total) > rb_threshold_us) { // env-tunable; default 50ms explosion frames
         // Find the top-3 record types by accumulated time.
         std::vector<std::pair<const char *, std::pair<uint64_t, uint64_t>>>
@@ -9440,7 +9440,6 @@ private:
              " stallPacketUs=", rb_stall_accum.packetUs,
              " stallQueueUs=", rb_stall_accum.queueUs,
              " stallEmitUs=", rb_stall_accum.emitUs,
-             " stallUnaccountedUs=", stall_unaccounted_us,
              " drawCount=", perDrawSubTimers().drawCount,
              " psoRootUnchanged=", perDrawSubTimers().psoRootUnchanged,
              " fullBindUnchanged=", perDrawSubTimers().fullBindUnchanged,
@@ -22960,7 +22959,6 @@ private:
     std::function<bool(CommandChunk *)> queue_work;
     Fence *fence = nullptr;
     UINT64 value = 0;
-    dxmt::FrameStatistics *perf_stats = nullptr;
     uint64_t frame_id = ~0ull;
     bool wait_callback_armed = false;
     std::shared_ptr<std::atomic_bool> wait_completion;
@@ -22976,7 +22974,6 @@ private:
           queue_work(std::move(other.queue_work)),
           fence(other.fence),
           value(other.value),
-          perf_stats(other.perf_stats),
           frame_id(other.frame_id),
           wait_callback_armed(other.wait_callback_armed),
           wait_completion(std::move(other.wait_completion)) {
@@ -22992,7 +22989,6 @@ private:
         queue_work = std::move(other.queue_work);
         fence = other.fence;
         value = other.value;
-        perf_stats = other.perf_stats;
         frame_id = other.frame_id;
         wait_callback_armed = other.wait_callback_armed;
         wait_completion = std::move(other.wait_completion);
@@ -23032,11 +23028,19 @@ private:
 
   void EnqueuePendingOperation(PendingOperation &&operation,
                                dxmt::FrameStatistics *perf_stats) {
+    dxmt::perf::ScopedCodeTimer code_timer(
+        dxmt::PerfCodePath::QueueEnqueueControl);
     auto t0 = clock::now();
-    if (operation.frame_id == ~0ull)
-      operation.frame_id =
-          device_->GetDXMTDevice().queue().CurrentFrameSeq() - 1;
     {
+      dxmt::perf::ScopedCodeTimer phase_timer(
+          dxmt::PerfCodePath::QueueEnqueueFrameTag);
+      if (operation.frame_id == ~0ull)
+        operation.frame_id =
+            device_->GetDXMTDevice().queue().CurrentFrameSeq() - 1;
+    }
+    {
+      dxmt::perf::ScopedCodeTimer phase_timer(
+          dxmt::PerfCodePath::QueueEnqueueLock);
       std::lock_guard lock(mutex_);
       if (operation.type == PendingOperationType::Wait)
         has_waited_.store(true, std::memory_order_relaxed);
@@ -23045,12 +23049,39 @@ private:
     dxmt::perf::recordExecuteTime(
         perf_stats, dxmt::perf::ExecuteTimeBucket::Enqueue,
         clock::now() - t0);
-    submission_wake_state_->condition.notify_one();
+    {
+      dxmt::perf::ScopedCodeTimer phase_timer(
+          dxmt::PerfCodePath::QueueEnqueueNotify);
+      submission_wake_state_->condition.notify_one();
+    }
   }
 
   size_t PendingOperationCountForDiag() {
     std::lock_guard lock(mutex_);
     return pending_operations_.size();
+  }
+
+  dxmt::FrameStatistics *BeginReplayPerfFrame(uint64_t frame_id) {
+    if (!dxmt::perf::enabled())
+      return nullptr;
+    if (replay_perf_frame_id_ != frame_id) {
+      FlushReplayPerfFrame();
+      replay_perf_stats_.reset();
+      replay_perf_frame_id_ = frame_id;
+    }
+    replay_perf_execute_batches_++;
+    return &replay_perf_stats_;
+  }
+
+  void FlushReplayPerfFrame() {
+    if (replay_perf_frame_id_ == ~0ull || !replay_perf_execute_batches_)
+      return;
+    dxmt::perf::recordReplayWorkerFrame(
+        replay_perf_frame_id_, reinterpret_cast<uintptr_t>(this), desc_.Type,
+        replay_perf_execute_batches_, replay_perf_stats_);
+    replay_perf_stats_.reset();
+    replay_perf_frame_id_ = ~0ull;
+    replay_perf_execute_batches_ = 0;
   }
 
   void FlushPendingOperations() {
@@ -23173,7 +23204,6 @@ private:
         }
 
         auto &front = pending_operations_.front();
-        operation_perf_stats = front.perf_stats;
         const bool callback_completed =
             front.wait_completion &&
             front.wait_completion->load(std::memory_order_acquire);
@@ -23218,15 +23248,12 @@ private:
         } else {
           submission_worker_waiting_for_wait_ = false;
           operation = std::move(front);
-          operation_perf_stats = operation.perf_stats;
           pending_operations_.pop_front();
           has_operation = true;
         }
       }
       const auto lock_end = clock::now();
-      RecordExecuteDrainTime(
-          operation_perf_stats,
-          dxmt::perf::ExecuteTimeBucket::DrainLock, lock_end - lock_begin);
+      const auto dequeue_lock_interval = lock_end - lock_begin;
 
       if (arm_wait_callback) {
         const auto arm_begin = clock::now();
@@ -23280,8 +23307,16 @@ private:
 
       switch (operation.type) {
       case PendingOperationType::Stop:
+        FlushReplayPerfFrame();
         return;
       case PendingOperationType::Execute: {
+        operation_perf_stats = BeginReplayPerfFrame(operation.frame_id);
+        dxmt::perf::ScopedFrameStatisticsBinding perf_stats_binding(
+            operation_perf_stats);
+        RecordExecuteDrainTime(
+            operation_perf_stats,
+            dxmt::perf::ExecuteTimeBucket::DrainLock,
+            dequeue_lock_interval);
         static std::atomic<uint32_t> log_count = 0;
         if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
           WARN_FILE_ONLY("D3D12 queue diagnostic: drain execute"
@@ -23670,6 +23705,12 @@ private:
       native_stage_plan_cache_;
   std::mutex native_stage_plan_cache_mutex_;
   std::deque<PendingOperation> pending_operations_;
+  // Replay runs on the submission worker, not on the Present thread. Keep its
+  // performance ledger worker-owned and flush one aggregate per frame so the
+  // Present ring can be reset without racing replay writes.
+  dxmt::FrameStatistics replay_perf_stats_;
+  uint64_t replay_perf_frame_id_ = ~0ull;
+  uint64_t replay_perf_execute_batches_ = 0;
   dxmt::mutex mutex_;
   bool submission_worker_active_ = false;
   bool submission_worker_waiting_for_wait_ = false;
