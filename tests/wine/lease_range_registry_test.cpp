@@ -179,4 +179,65 @@ TEST(LeaseRangeRegistry,
   EXPECT_TRUE(owner.destroyed.load(std::memory_order_acquire));
 }
 
+TEST(LeaseRangeRegistry, AcceptsAdjacentRangesAndRejectsEveryOverlap) {
+  Registry registry;
+  LeaseOwner first_owner;
+  LeaseOwner second_owner;
+  std::array<LeaseRecord, 6> records = {};
+  ASSERT_TRUE(registry.Register(records.data(), 3, &first_owner));
+  ASSERT_TRUE(registry.Register(records.data() + 3, 3, &second_owner));
+
+  EXPECT_FALSE(registry.Register(records.data() + 1, 2, &second_owner));
+  EXPECT_FALSE(registry.Register(records.data() + 2, 2, &second_owner));
+  EXPECT_FALSE(registry.Register(records.data() + 4, 2, &first_owner));
+
+  auto acquire = [](LeaseRecord *record, LeaseOwner *owner) {
+    return TestLease::Acquire(record, owner);
+  };
+  auto first = registry.Lookup(reinterpret_cast<uintptr_t>(&records[2]),
+                               ValidRecord, acquire);
+  auto second = registry.Lookup(reinterpret_cast<uintptr_t>(&records[3]),
+                                ValidRecord, acquire);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(first.get(), &records[2]);
+  EXPECT_EQ(second.get(), &records[3]);
+  first.Reset();
+  second.Reset();
+
+  EXPECT_TRUE(registry.Unregister(records.data(), &first_owner));
+  EXPECT_TRUE(registry.Unregister(records.data() + 3, &second_owner));
+  first_owner.Release();
+  first_owner.Release();
+  second_owner.Release();
+  second_owner.Release();
+}
+
+TEST(LeaseRangeRegistry, ReusesAnUnregisteredAddressWithANewOwner) {
+  Registry registry;
+  LeaseOwner first_owner;
+  LeaseOwner second_owner;
+  std::array<LeaseRecord, 2> records = {};
+  ASSERT_TRUE(registry.Register(records.data(), records.size(), &first_owner));
+  ASSERT_TRUE(registry.Unregister(records.data(), &first_owner));
+  ASSERT_TRUE(
+      registry.Register(records.data(), records.size(), &second_owner));
+  EXPECT_FALSE(registry.Unregister(records.data(), &first_owner));
+
+  auto lease = registry.Lookup(
+      reinterpret_cast<uintptr_t>(&records[1]), ValidRecord,
+      [](LeaseRecord *record, LeaseOwner *owner) {
+        return TestLease::Acquire(record, owner);
+      });
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease.get(), &records[1]);
+  lease.Reset();
+
+  EXPECT_TRUE(registry.Unregister(records.data(), &second_owner));
+  first_owner.Release();
+  first_owner.Release();
+  second_owner.Release();
+  second_owner.Release();
+}
+
 } // namespace

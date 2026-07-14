@@ -100,3 +100,58 @@ TEST(TaskScheduler, ResumesTaskAfterDependencyCompletes) {
   ASSERT_TRUE(dependent.waitUntilDone());
   EXPECT_GE(dependent.runs(), 2u);
 }
+
+TEST(TaskScheduler, ResumesEveryTaskWaitingOnTheSameDependency) {
+  ScheduledTask prerequisite;
+  std::array<ScheduledTask, 6> dependents = {
+      ScheduledTask(&prerequisite), ScheduledTask(&prerequisite),
+      ScheduledTask(&prerequisite), ScheduledTask(&prerequisite),
+      ScheduledTask(&prerequisite), ScheduledTask(&prerequisite),
+  };
+  dxmt::task_scheduler<ScheduledTask *> scheduler;
+
+  for (auto &dependent : dependents)
+    scheduler.submit(&dependent);
+  for (auto &dependent : dependents) {
+    ASSERT_TRUE(dependent.waitForRuns(1));
+    EXPECT_FALSE(dependent.done());
+  }
+
+  scheduler.submit(&prerequisite);
+  ASSERT_TRUE(prerequisite.waitUntilDone());
+  for (auto &dependent : dependents) {
+    ASSERT_TRUE(dependent.waitUntilDone());
+    EXPECT_GE(dependent.runs(), 2u);
+  }
+}
+
+TEST(TaskScheduler, ResolvesDependencyChainsFromLeafToRoot) {
+  ScheduledTask leaf;
+  ScheduledTask middle(&leaf);
+  ScheduledTask root(&middle);
+  dxmt::task_scheduler<ScheduledTask *> scheduler;
+
+  scheduler.submit(&root);
+  ASSERT_TRUE(root.waitForRuns(1));
+  scheduler.submit(&middle);
+  ASSERT_TRUE(middle.waitForRuns(1));
+  scheduler.submit(&leaf);
+
+  ASSERT_TRUE(leaf.waitUntilDone());
+  ASSERT_TRUE(middle.waitUntilDone());
+  ASSERT_TRUE(root.waitUntilDone());
+  EXPECT_EQ(leaf.runs(), 1u);
+  EXPECT_GE(middle.runs(), 2u);
+  EXPECT_GE(root.runs(), 2u);
+}
+
+TEST(TaskScheduler, CompletesImmediatelyWhenDependencyIsAlreadyDone) {
+  ScheduledTask prerequisite;
+  prerequisite.complete();
+  ScheduledTask dependent(&prerequisite);
+  dxmt::task_scheduler<ScheduledTask *> scheduler;
+
+  scheduler.submit(&dependent);
+  ASSERT_TRUE(dependent.waitUntilDone());
+  EXPECT_EQ(dependent.runs(), 1u);
+}
