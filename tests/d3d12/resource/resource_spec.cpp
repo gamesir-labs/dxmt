@@ -523,6 +523,49 @@ TEST_F(D3D12ResourceSpec, MapsPlacedUploadBufferAtNonzeroHeapOffset) {
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
 }
 
+TEST_F(D3D12ResourceSpec, ReportsCommittedBufferHeapPropertiesAndMapRules) {
+  struct HeapCase {
+    D3D12_HEAP_TYPE type;
+    D3D12_RESOURCE_STATES state;
+    bool mappable;
+  };
+  constexpr std::array cases = {
+      HeapCase{D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, false},
+      HeapCase{D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+               true},
+      HeapCase{D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+               true},
+  };
+
+  for (const auto &test_case : cases) {
+    auto resource = context_.CreateBuffer(
+        4096, test_case.type, D3D12_RESOURCE_FLAG_NONE, test_case.state);
+    ASSERT_TRUE(resource) << "heap type " << test_case.type;
+    D3D12_HEAP_PROPERTIES properties = {};
+    D3D12_HEAP_FLAGS flags = static_cast<D3D12_HEAP_FLAGS>(~UINT{0});
+    ASSERT_TRUE(SUCCEEDED(resource->GetHeapProperties(&properties, &flags)));
+    EXPECT_EQ(properties.Type, test_case.type);
+    EXPECT_EQ(properties.CreationNodeMask, 0u);
+    EXPECT_EQ(properties.VisibleNodeMask, 0u);
+    EXPECT_EQ(flags, D3D12_HEAP_FLAG_NONE);
+
+    void *mapping = reinterpret_cast<void *>(uintptr_t{1});
+    const HRESULT map_result = resource->Map(0, nullptr, &mapping);
+    if (test_case.mappable) {
+      EXPECT_TRUE(SUCCEEDED(map_result));
+      EXPECT_NE(mapping, nullptr);
+      resource->Unmap(0, nullptr);
+    } else {
+      EXPECT_TRUE(FAILED(map_result));
+      EXPECT_EQ(mapping, nullptr);
+    }
+
+    mapping = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(resource->Map(1, nullptr, &mapping), E_INVALIDARG);
+    EXPECT_EQ(mapping, nullptr);
+  }
+}
+
 TEST_F(D3D12ResourceSpec, RoundsPlacedHeapBackendSizeToHeapAlignment) {
   constexpr UINT64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
   constexpr UINT64 heap_size = 2 * alignment - 1;

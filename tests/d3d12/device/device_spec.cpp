@@ -318,6 +318,93 @@ TEST_F(D3D12DeviceSpec, ReportsAtLeastOneNode) {
   EXPECT_GE(device_->GetNodeCount(), 1u);
 }
 
+TEST_F(D3D12DeviceSpec, ReportsDescriptorHeapVisibilityAndStableHandles) {
+  struct HeapCase {
+    D3D12_DESCRIPTOR_HEAP_TYPE type;
+    D3D12_DESCRIPTOR_HEAP_FLAGS flags;
+  };
+  constexpr std::array cases = {
+      HeapCase{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+               D3D12_DESCRIPTOR_HEAP_FLAG_NONE},
+      HeapCase{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+      HeapCase{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+               D3D12_DESCRIPTOR_HEAP_FLAG_NONE},
+      HeapCase{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+      HeapCase{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+               D3D12_DESCRIPTOR_HEAP_FLAG_NONE},
+      HeapCase{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+               D3D12_DESCRIPTOR_HEAP_FLAG_NONE},
+  };
+
+  for (const auto &test_case : cases) {
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+    desc.Type = test_case.type;
+    desc.NumDescriptors = 3;
+    desc.Flags = test_case.flags;
+    ID3D12DescriptorHeap *heap = nullptr;
+    ASSERT_TRUE(HResultSucceeded(device_->CreateDescriptorHeap(
+        &desc, __uuidof(ID3D12DescriptorHeap),
+        reinterpret_cast<void **>(&heap))));
+    ASSERT_NE(heap, nullptr);
+
+    const auto actual = heap->GetDesc();
+    EXPECT_EQ(actual.Type, desc.Type);
+    EXPECT_EQ(actual.NumDescriptors, desc.NumDescriptors);
+    EXPECT_EQ(actual.Flags, desc.Flags);
+    EXPECT_EQ(actual.NodeMask, 0u);
+    const UINT increment =
+        device_->GetDescriptorHandleIncrementSize(test_case.type);
+    EXPECT_GT(increment, 0u);
+    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    EXPECT_NE(cpu.ptr, 0u);
+    EXPECT_EQ(heap->GetCPUDescriptorHandleForHeapStart().ptr, cpu.ptr);
+    const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    if (test_case.flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+      EXPECT_NE(gpu.ptr, 0u);
+    else
+      EXPECT_EQ(gpu.ptr, 0u);
+    EXPECT_EQ(heap->GetGPUDescriptorHandleForHeapStart().ptr, gpu.ptr);
+
+    ID3D12Device *owner = nullptr;
+    ASSERT_TRUE(HResultSucceeded(heap->GetDevice(
+        __uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))));
+    EXPECT_EQ(owner, device_);
+    release_object(owner);
+    release_object(heap);
+  }
+}
+
+TEST_F(D3D12DeviceSpec,
+       RejectsInvalidDescriptorHeapDescriptionsAndClearsOutputs) {
+  D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  auto expect_rejected = [&] {
+    ID3D12DescriptorHeap *heap =
+        reinterpret_cast<ID3D12DescriptorHeap *>(uintptr_t{1});
+    EXPECT_EQ(device_->CreateDescriptorHeap(
+                  &desc, __uuidof(ID3D12DescriptorHeap),
+                  reinterpret_cast<void **>(&heap)),
+              E_INVALIDARG);
+    EXPECT_EQ(heap, nullptr);
+  };
+
+  expect_rejected();
+  desc.NumDescriptors = 1;
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  expect_rejected();
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  expect_rejected();
+  desc.Type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(~UINT{0});
+  desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+  expect_rejected();
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+  desc.NodeMask = 2;
+  expect_rejected();
+}
+
 TEST_F(D3D12DeviceSpec, CreatesDirectCommandQueue) {
   D3D12_COMMAND_QUEUE_DESC desc = {};
   desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
