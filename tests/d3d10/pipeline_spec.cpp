@@ -36,6 +36,12 @@ float4 main() : SV_Target {
 }
 )";
 
+constexpr std::string_view kTranslucentRedPixelShader = R"(
+float4 main() : SV_Target {
+  return float4(1.0, 0.0, 0.0, 0.25);
+}
+)";
+
 ::testing::AssertionResult HResultSucceeded(HRESULT hr) {
   if (SUCCEEDED(hr))
     return ::testing::AssertionSuccess();
@@ -52,6 +58,35 @@ bool ColorMatches(uint32_t actual, uint32_t expected, unsigned tolerance) {
       return false;
   }
   return true;
+}
+
+HRESULT ReadTexturePixel(ID3D10Device *device, ID3D10Texture2D *texture, UINT x,
+                         UINT y, uint32_t *pixel) {
+  if (!device || !texture || !pixel)
+    return E_INVALIDARG;
+  D3D10_TEXTURE2D_DESC desc = {};
+  texture->GetDesc(&desc);
+  if (x >= desc.Width || y >= desc.Height)
+    return E_INVALIDARG;
+  desc.Usage = D3D10_USAGE_STAGING;
+  desc.BindFlags = 0;
+  desc.CPUAccessFlags = D3D10_CPU_ACCESS_READ;
+  desc.MiscFlags = 0;
+  ComPtr<ID3D10Texture2D> staging;
+  HRESULT hr = device->CreateTexture2D(&desc, nullptr, staging.put());
+  if (FAILED(hr))
+    return hr;
+  device->CopyResource(staging.get(), texture);
+  D3D10_MAPPED_TEXTURE2D mapped = {};
+  hr = staging->Map(0, D3D10_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+    return hr;
+  std::memcpy(pixel,
+              static_cast<const uint8_t *>(mapped.pData) + y * mapped.RowPitch +
+                  x * sizeof(*pixel),
+              sizeof(*pixel));
+  staging->Unmap(0);
+  return S_OK;
 }
 
 class D3D10PipelineSpec : public ::testing::Test {
@@ -138,6 +173,142 @@ TEST_F(D3D10PipelineSpec, DrawsFullscreenTriangleIntoRenderTarget) {
     }
   }
   staging->Unmap(0);
+}
+
+TEST_F(D3D10PipelineSpec, AppliesScissorRectangleDuringRasterization) {
+  const auto vertex = CompileShader(kFullscreenVertexShader, "vs_4_0");
+  const auto pixel = CompileShader(kSolidPixelShader, "ps_4_0");
+  ASSERT_TRUE(HResultSucceeded(vertex.result)) << vertex.diagnostic_text();
+  ASSERT_TRUE(HResultSucceeded(pixel.result)) << pixel.diagnostic_text();
+
+  ComPtr<ID3D10VertexShader> vertex_shader;
+  ComPtr<ID3D10PixelShader> pixel_shader;
+  ASSERT_TRUE(HResultSucceeded(device_->CreateVertexShader(
+      vertex.bytecode->GetBufferPointer(), vertex.bytecode->GetBufferSize(),
+      vertex_shader.put())));
+  ASSERT_TRUE(HResultSucceeded(device_->CreatePixelShader(
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
+      pixel_shader.put())));
+
+  D3D10_TEXTURE2D_DESC target_desc = {};
+  target_desc.Width = 16;
+  target_desc.Height = 16;
+  target_desc.MipLevels = 1;
+  target_desc.ArraySize = 1;
+  target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  target_desc.SampleDesc.Count = 1;
+  target_desc.Usage = D3D10_USAGE_DEFAULT;
+  target_desc.BindFlags = D3D10_BIND_RENDER_TARGET;
+  ComPtr<ID3D10Texture2D> target;
+  ComPtr<ID3D10RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(
+      device_->CreateTexture2D(&target_desc, nullptr, target.put())));
+  ASSERT_TRUE(HResultSucceeded(device_->CreateRenderTargetView(
+      target.get(), nullptr, target_view.put())));
+
+  D3D10_RASTERIZER_DESC rasterizer_desc = {};
+  rasterizer_desc.FillMode = D3D10_FILL_SOLID;
+  rasterizer_desc.CullMode = D3D10_CULL_NONE;
+  rasterizer_desc.DepthClipEnable = TRUE;
+  rasterizer_desc.ScissorEnable = TRUE;
+  ComPtr<ID3D10RasterizerState> rasterizer;
+  ASSERT_TRUE(HResultSucceeded(device_->CreateRasterizerState(
+      &rasterizer_desc, rasterizer.put())));
+
+  constexpr float clear_color[4] = {};
+  device_->ClearRenderTargetView(target_view.get(), clear_color);
+  D3D10_VIEWPORT viewport = {};
+  viewport.Width = target_desc.Width;
+  viewport.Height = target_desc.Height;
+  viewport.MaxDepth = 1.0f;
+  D3D10_RECT scissor = {0, 0, 8, 16};
+  ID3D10RenderTargetView *targets[] = {target_view.get()};
+  device_->OMSetRenderTargets(1, targets, nullptr);
+  device_->RSSetViewports(1, &viewport);
+  device_->RSSetScissorRects(1, &scissor);
+  device_->RSSetState(rasterizer.get());
+  device_->IASetPrimitiveTopology(D3D10_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  device_->VSSetShader(vertex_shader.get());
+  device_->PSSetShader(pixel_shader.get());
+  device_->Draw(3, 0);
+  device_->OMSetRenderTargets(0, nullptr, nullptr);
+
+  uint32_t inside = 0;
+  uint32_t outside = 0;
+  ASSERT_TRUE(HResultSucceeded(
+      ReadTexturePixel(device_.get(), target.get(), 4, 8, &inside)));
+  ASSERT_TRUE(HResultSucceeded(
+      ReadTexturePixel(device_.get(), target.get(), 12, 8, &outside)));
+  EXPECT_TRUE(ColorMatches(inside, 0xffbf8040, 2))
+      << "inside pixel was 0x" << std::hex << inside;
+  EXPECT_EQ(outside, 0u) << "outside pixel was 0x" << std::hex << outside;
+}
+
+TEST_F(D3D10PipelineSpec, BlendsSourceAndDestinationColors) {
+  const auto vertex = CompileShader(kFullscreenVertexShader, "vs_4_0");
+  const auto pixel = CompileShader(kTranslucentRedPixelShader, "ps_4_0");
+  ASSERT_TRUE(HResultSucceeded(vertex.result)) << vertex.diagnostic_text();
+  ASSERT_TRUE(HResultSucceeded(pixel.result)) << pixel.diagnostic_text();
+
+  ComPtr<ID3D10VertexShader> vertex_shader;
+  ComPtr<ID3D10PixelShader> pixel_shader;
+  ASSERT_TRUE(HResultSucceeded(device_->CreateVertexShader(
+      vertex.bytecode->GetBufferPointer(), vertex.bytecode->GetBufferSize(),
+      vertex_shader.put())));
+  ASSERT_TRUE(HResultSucceeded(device_->CreatePixelShader(
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
+      pixel_shader.put())));
+
+  D3D10_TEXTURE2D_DESC target_desc = {};
+  target_desc.Width = 16;
+  target_desc.Height = 16;
+  target_desc.MipLevels = 1;
+  target_desc.ArraySize = 1;
+  target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  target_desc.SampleDesc.Count = 1;
+  target_desc.Usage = D3D10_USAGE_DEFAULT;
+  target_desc.BindFlags = D3D10_BIND_RENDER_TARGET;
+  ComPtr<ID3D10Texture2D> target;
+  ComPtr<ID3D10RenderTargetView> target_view;
+  ASSERT_TRUE(HResultSucceeded(
+      device_->CreateTexture2D(&target_desc, nullptr, target.put())));
+  ASSERT_TRUE(HResultSucceeded(device_->CreateRenderTargetView(
+      target.get(), nullptr, target_view.put())));
+
+  D3D10_BLEND_DESC blend_desc = {};
+  blend_desc.BlendEnable[0] = TRUE;
+  blend_desc.SrcBlend = D3D10_BLEND_SRC_ALPHA;
+  blend_desc.DestBlend = D3D10_BLEND_INV_SRC_ALPHA;
+  blend_desc.BlendOp = D3D10_BLEND_OP_ADD;
+  blend_desc.SrcBlendAlpha = D3D10_BLEND_ONE;
+  blend_desc.DestBlendAlpha = D3D10_BLEND_ZERO;
+  blend_desc.BlendOpAlpha = D3D10_BLEND_OP_ADD;
+  blend_desc.RenderTargetWriteMask[0] = D3D10_COLOR_WRITE_ENABLE_ALL;
+  ComPtr<ID3D10BlendState> blend;
+  ASSERT_TRUE(HResultSucceeded(
+      device_->CreateBlendState(&blend_desc, blend.put())));
+
+  constexpr float clear_color[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  device_->ClearRenderTargetView(target_view.get(), clear_color);
+  D3D10_VIEWPORT viewport = {};
+  viewport.Width = target_desc.Width;
+  viewport.Height = target_desc.Height;
+  viewport.MaxDepth = 1.0f;
+  ID3D10RenderTargetView *targets[] = {target_view.get()};
+  device_->OMSetRenderTargets(1, targets, nullptr);
+  device_->OMSetBlendState(blend.get(), nullptr, 0xffffffff);
+  device_->RSSetViewports(1, &viewport);
+  device_->IASetPrimitiveTopology(D3D10_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  device_->VSSetShader(vertex_shader.get());
+  device_->PSSetShader(pixel_shader.get());
+  device_->Draw(3, 0);
+  device_->OMSetRenderTargets(0, nullptr, nullptr);
+
+  uint32_t center = 0;
+  ASSERT_TRUE(HResultSucceeded(
+      ReadTexturePixel(device_.get(), target.get(), 8, 8, &center)));
+  EXPECT_TRUE(ColorMatches(center, 0x40bf0040, 2))
+      << "center pixel was 0x" << std::hex << center;
 }
 
 TEST_F(D3D10PipelineSpec, CreatesStateObjectsWithRequestedDescriptions) {
