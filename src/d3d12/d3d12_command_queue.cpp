@@ -5912,6 +5912,7 @@ private:
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
     uint64_t content_fingerprint = 0;
+    uint64_t resource_access_fingerprint = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
     std::array<bool, 64> root_constants_valid = {};
     std::array<std::vector<UINT>, 64> root_constants;
@@ -16921,6 +16922,25 @@ private:
     }
 
     CaptureGraphicsVertexBuffers(snapshot, state, pipeline.GetGraphicsState());
+    snapshot.resource_access_fingerprint =
+        kGraphicsBindingFingerprintOffset;
+    HashGraphicsBindingPointer(snapshot.resource_access_fingerprint,
+                               snapshot.root_signature.ptr());
+    HashGraphicsBindingPointer(snapshot.resource_access_fingerprint,
+                               snapshot.pipeline_state.ptr());
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor)
+        continue;
+      HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                               entry.stage);
+      HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                               entry.range_type);
+      HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                               entry.has_descriptor);
+      if (entry.has_descriptor)
+        HashGraphicsBindingDescriptor(snapshot.resource_access_fingerprint,
+                                      entry.descriptor);
+    }
     if (capture_stats) {
       capture_stats->entries += snapshot.entries.size();
       capture_stats->vertex_buffers += snapshot.vertex_buffers.size();
@@ -20587,13 +20607,50 @@ private:
       }
     }
 
-  void RecordGraphicsPipelineResourceAccess(CommandChunk *chunk,
-                                            ReplayState &state,
-                                            PipelineState &pipeline,
-                                            Resource *index_resource) {
+  bool RecordGraphicsSnapshotDescriptorAccess(
+      CommandChunk *chunk, ReplayState &state,
+      const GraphicsBindingSnapshot *snapshot) {
+    if (!snapshot || snapshot->native)
+      return false;
+
+    const bool cache_on = DescAccessCacheEnabled();
+    const auto fingerprint = snapshot->resource_access_fingerprint;
+    if (cache_on) {
+      const auto cached = state.da_cache.find(fingerprint);
+      const bool hit = cached != state.da_cache.end() &&
+                       cached->second == state.access_epoch;
+      if (hit && !DescAccessVerify()) {
+        if (ReplayPerfEnabled())
+          perDrawSubTimers().descAccessHits++;
+        return true;
+      }
+      if (ReplayPerfEnabled())
+        perDrawSubTimers().descAccessMiss++;
+    }
+
+    for (const auto &entry : snapshot->entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor ||
+          entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+        continue;
+      RecordDescriptorResourceAccess(
+          chunk, state, entry.stage, entry.range_type, entry.descriptor,
+          DescriptorRangeTypeName(entry.range_type));
+    }
+    if (cache_on)
+      state.da_cache[fingerprint] = state.access_epoch;
+    return true;
+  }
+
+  void RecordGraphicsPipelineResourceAccess(
+      CommandChunk *chunk, ReplayState &state, PipelineState &pipeline,
+      Resource *index_resource,
+      const GraphicsBindingSnapshot *binding_snapshot = nullptr) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().descAccessUs);
     RecordRenderAttachmentAccess(chunk, state, pipeline.GetGraphicsState());
-    RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
+    if (!RecordGraphicsSnapshotDescriptorAccess(chunk, state,
+                                                binding_snapshot))
+      RecordPipelineDescriptorAccess(chunk, state, pipeline, false);
     RecordVertexBufferAccess(chunk, state, pipeline.GetGraphicsState());
     if (index_resource) {
       RecordReplayResourceAccess(chunk, state, index_resource->GetD3D12Resource(),
@@ -21431,7 +21488,8 @@ private:
         FindCachedGraphicsBindingSnapshot(state, *pipeline,
                                           descriptor_content_revision);
     const auto rb_desc0 = rb_draw ? clock::now() : clock::time_point{};
-    RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline, nullptr);
+    RecordGraphicsPipelineResourceAccess(
+        chunk, state, *pipeline, nullptr, binding_snapshot.get());
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
         !metal->use_tessellation;
@@ -21648,8 +21706,8 @@ private:
         FindCachedGraphicsBindingSnapshot(state, *pipeline,
                                           descriptor_content_revision);
     const auto rb_ra0 = rb_draw ? clock::now() : clock::time_point{};
-    RecordGraphicsPipelineResourceAccess(chunk, state, *pipeline,
-                                         index_resource);
+    RecordGraphicsPipelineResourceAccess(
+        chunk, state, *pipeline, index_resource, binding_snapshot.get());
     const bool bindless_replay_path =
         pipeline->UsesBindlessMirror() && !metal->use_geometry &&
         !metal->use_tessellation;
