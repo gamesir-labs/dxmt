@@ -4849,12 +4849,16 @@ public:
     if (!gpu_timestamp || !cpu_timestamp)
       return WARN_E_INVALIDARG(__func__);
 
+    LARGE_INTEGER cpu_counter = {};
+    if (!QueryPerformanceCounter(&cpu_counter))
+      return E_FAIL;
+
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const auto timestamp =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     const auto monotonic = timestamp < 0 ? 0 : static_cast<UINT64>(timestamp);
     *gpu_timestamp = monotonic;
-    *cpu_timestamp = monotonic;
+    *cpu_timestamp = static_cast<UINT64>(cpu_counter.QuadPart);
     return S_OK;
   }
 

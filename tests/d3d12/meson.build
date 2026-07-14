@@ -42,6 +42,7 @@ d3d12_unit_suites = {
     'sources': files(
       'query/indirect_spec.cpp',
       'query/predication_spec.cpp',
+      'query/timestamp_spec.cpp',
     ),
   },
   'queue': {
@@ -55,7 +56,11 @@ d3d12_unit_suites = {
     ),
   },
   'sync': {
-    'sources': files('sync/legacy_transition_spec.cpp'),
+    'sources': files(
+      'sync/legacy_transition_spec.cpp',
+      'sync/promotion_decay_spec.cpp',
+      'sync/split_transition_spec.cpp',
+    ),
   },
   'transfer': {
     'sources': files(
