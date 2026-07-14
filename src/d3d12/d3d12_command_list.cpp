@@ -1665,6 +1665,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator *allocator,
                                   ID3D12PipelineState *initial_state) override {
+    if (!closed_)
+      return E_FAIL;
     if (!allocator)
       return WARN_E_INVALIDARG(__func__);
 

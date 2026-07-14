@@ -502,6 +502,79 @@ TEST_F(D3D12QueueSpec, RejectsClosingAlreadyClosedCommandList) {
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
 }
 
+TEST_F(D3D12QueueSpec, EnforcesCommandListAndAllocatorRecordingLifecycle) {
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+      reinterpret_cast<void **>(allocator.put()))));
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
+      0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+      __uuidof(ID3D12GraphicsCommandList),
+      reinterpret_cast<void **>(list.put()))));
+
+  EXPECT_EQ(allocator->Reset(), E_FAIL);
+  EXPECT_EQ(list->Reset(allocator.get(), nullptr), E_FAIL);
+  ASSERT_TRUE(SUCCEEDED(list->Close()));
+  ASSERT_TRUE(SUCCEEDED(allocator->Reset()));
+  ASSERT_TRUE(SUCCEEDED(list->Reset(allocator.get(), nullptr)));
+  EXPECT_EQ(allocator->Reset(), E_FAIL);
+  EXPECT_TRUE(SUCCEEDED(list->Close()));
+}
+
+TEST_F(D3D12QueueSpec, ExecutesDependentCommandListsInArrayOrder) {
+  const std::array<std::uint32_t, 8> expected = {
+      0x01020304, 0x11121314, 0x21222324, 0x31323334,
+      0x41424344, 0x51525354, 0x61626364, 0x71727374,
+  };
+  auto upload = context_.CreateUploadBuffer(sizeof(expected), expected.data(),
+                                             sizeof(expected));
+  auto intermediate = context_.CreateBuffer(
+      sizeof(expected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto destination = context_.CreateBuffer(
+      sizeof(expected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(intermediate);
+  ASSERT_TRUE(destination);
+
+  std::array<ComPtr<ID3D12CommandAllocator>, 2> allocators;
+  std::array<ComPtr<ID3D12GraphicsCommandList>, 2> lists;
+  for (UINT index = 0; index < lists.size(); ++index) {
+    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+        reinterpret_cast<void **>(allocators[index].put()))));
+    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[index].get(), nullptr,
+        __uuidof(ID3D12GraphicsCommandList),
+        reinterpret_cast<void **>(lists[index].put()))));
+  }
+
+  lists[0]->CopyBufferRegion(intermediate.get(), 0, upload.get(), 0,
+                             sizeof(expected));
+  D3D12TestContext::Transition(
+      lists[0].get(), intermediate.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  lists[1]->CopyBufferRegion(destination.get(), 0, intermediate.get(), 0,
+                             sizeof(expected));
+  D3D12TestContext::Transition(
+      lists[1].get(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ASSERT_TRUE(SUCCEEDED(lists[0]->Close()));
+  ASSERT_TRUE(SUCCEEDED(lists[1]->Close()));
+
+  ID3D12CommandList *submission[] = {lists[0].get(), lists[1].get()};
+  context_.queue()->ExecuteCommandLists(ARRAYSIZE(submission), submission);
+  ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+
+  std::vector<std::uint8_t> actual;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackBuffer(
+      destination.get(), sizeof(expected), &actual)));
+  ASSERT_EQ(actual.size(), sizeof(expected));
+  EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
+}
+
 TEST_F(D3D12QueueSpec, CopiesTextureRegionAtNonZeroOffsets) {
   constexpr UINT source_width = 5;
   constexpr UINT source_height = 4;
