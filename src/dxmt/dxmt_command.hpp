@@ -254,7 +254,8 @@ class ClearRenderTargetContext {
 public:
   ClearRenderTargetContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
 
-  void begin(Rc<Texture> texture, TextureViewKey view);
+  void begin(Rc<Texture> texture, TextureViewKey view,
+             unsigned depth_stencil_flags = 0, uint8_t stencil = 0);
 
   void clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, const std::array<float, 4>& color);
 
@@ -268,8 +269,8 @@ private:
   WMT::Reference<WMT::Function> fs_clear_uint_;
   WMT::Reference<WMT::Function> fs_clear_sint_;
   WMT::Reference<WMT::Function> fs_clear_depth_;
-  WMT::Reference<WMT::DepthStencilState> depth_write_state_;
-  WMT::Reference<WMT::DepthStencilState> depth_readonly_state_;
+  std::array<WMT::Reference<WMT::DepthStencilState>, 4>
+      depth_stencil_states_;
   std::unordered_map<WMTPixelFormat, WMT::Reference<WMT::RenderPipelineState>> pso_cache_;
   Rc<Texture> clearing_texture_;
   TextureViewKey clearing_texture_view_;

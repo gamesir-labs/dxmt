@@ -146,30 +146,36 @@ ClearRenderTargetContext::ClearRenderTargetContext(
   fs_clear_sint_ = library.newFunction("fs_clear_rt_sint");
   fs_clear_uint_ = library.newFunction("fs_clear_rt_uint");
 
-  WMTDepthStencilInfo ds_info;
-  ds_info.front_stencil.enabled = false;
-  ds_info.back_stencil.enabled = false;
-  ds_info.depth_compare_function = WMTCompareFunctionAlways;
-  ds_info.depth_write_enabled = false;
-
-  depth_readonly_state_ = device.newDepthStencilState(ds_info);
-
-  ds_info.depth_write_enabled = true;
-
-  depth_write_state_ = device.newDepthStencilState(ds_info);
+  for (unsigned flags = 0; flags < depth_stencil_states_.size(); ++flags) {
+    WMTDepthStencilInfo ds_info = {};
+    ds_info.depth_compare_function = WMTCompareFunctionAlways;
+    ds_info.depth_write_enabled = flags & 1;
+    ds_info.front_stencil.enabled = flags & 2;
+    ds_info.back_stencil.enabled = flags & 2;
+    for (auto *stencil : {&ds_info.front_stencil, &ds_info.back_stencil}) {
+      stencil->stencil_compare_function = WMTCompareFunctionAlways;
+      stencil->depth_stencil_pass_op = WMTStencilOperationReplace;
+      stencil->depth_fail_op = WMTStencilOperationReplace;
+      stencil->stencil_fail_op = WMTStencilOperationReplace;
+      stencil->write_mask = 0xff;
+    }
+    depth_stencil_states_[flags] = device.newDepthStencilState(ds_info);
+  }
 }
 
 void
-ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
+ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view,
+                                unsigned depth_stencil_flags,
+                                uint8_t stencil) {
   assert(!clearing_texture_);
 
   WMT::Reference<WMT::Error> err;
 
   auto format = texture->pixelFormat(view);
   auto dsv_flag = DepthStencilPlanarFlags(format);
-
-  if (dsv_flag & ~1u)
-    return; // stencil clear is not supported
+  if (dsv_flag && !depth_stencil_flags)
+    depth_stencil_flags = 1;
+  depth_stencil_flags &= dsv_flag;
 
   // enforce array render target for now
   view = texture->checkViewUseArray(view, true);
@@ -182,6 +188,8 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
     if (dsv_flag) {
       pipeline_info.fragment_function = fs_clear_depth_;
       pipeline_info.depth_pixel_format = format;
+      if (dsv_flag & 2)
+        pipeline_info.stencil_pixel_format = format;
     } else if (IsIntegerFormat(format)) {
       pipeline_info.colors[0].pixel_format = format;
       if (MTLGetUnsignedIntegerFormat(format) == format) {
@@ -210,14 +218,26 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
   auto width = texture->width(view);
   auto height = texture->height(view);
   auto array_length = texture->arrayLength(view);
-  auto &pass_info = *ctx_.startRenderPass(dsv_flag, 0, 1, 0);
+  auto &pass_info = *ctx_.startRenderPass(
+      dsv_flag, dsv_flag & ~depth_stencil_flags, 1, 0);
 
   if (dsv_flag) {
-    auto &depth = pass_info.depth;
-    depth.attachment = ctx_.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
-    depth.depth_plane = 0;
-    depth.load_action = WMTLoadActionLoad;
-    depth.store_action = WMTStoreActionStore;
+    if (dsv_flag & 1) {
+      auto &depth = pass_info.depth;
+      depth.attachment = ctx_.access<PipelineStage::Pixel>(
+          texture, view, ResourceAccess::Write);
+      depth.depth_plane = 0;
+      depth.load_action = WMTLoadActionLoad;
+      depth.store_action = WMTStoreActionStore;
+    }
+    if (dsv_flag & 2) {
+      auto &stencil_attachment = pass_info.stencil;
+      stencil_attachment.attachment = ctx_.access<PipelineStage::Pixel>(
+          texture, view, ResourceAccess::Write);
+      stencil_attachment.depth_plane = 0;
+      stencil_attachment.load_action = WMTLoadActionLoad;
+      stencil_attachment.store_action = WMTStoreActionStore;
+    }
   } else {
     auto &color = pass_info.colors[0];
     color.attachment = ctx_.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
@@ -241,8 +261,8 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
 
   auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
   setdsso.type = WMTRenderCommandSetDSSO;
-  setdsso.dsso = dsv_flag ? depth_write_state_.handle : depth_readonly_state_.handle;
-  setdsso.stencil_ref = 0;
+  setdsso.dsso = depth_stencil_states_[depth_stencil_flags].handle;
+  setdsso.stencil_ref = stencil;
 
   clearing_texture_ = std::move(texture);
   clearing_texture_view_ = view;

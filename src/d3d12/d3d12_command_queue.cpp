@@ -21213,14 +21213,30 @@ private:
       flags |= 1;
     if (record.flags & D3D12_CLEAR_FLAG_STENCIL)
       flags |= 2;
-    const bool has_rects = !record.rects.empty();
-    chunk->emitcc([texture = std::move(texture), view, array_length, flags,
-                   depth = record.depth,
-                   stencil = record.stencil,
-                   has_rects](ArgumentEncodingContext &enc) mutable {
-      enc.clearDepthStencil(std::move(texture), view, array_length, flags,
-                            depth, stencil, has_rects);
-    });
+    if (record.rects.empty()) {
+      chunk->emitcc([texture = std::move(texture), view, array_length, flags,
+                     depth = record.depth,
+                     stencil = record.stencil](ArgumentEncodingContext &enc) mutable {
+        enc.clearDepthStencil(std::move(texture), view, array_length, flags,
+                              depth, stencil);
+      });
+      return;
+    }
+
+    chunk->emitcc(
+        [texture = std::move(texture), view, flags, depth = record.depth,
+         stencil = record.stencil,
+         rects = record.rects](ArgumentEncodingContext &enc) mutable {
+          enc.clear_rt_cmd.begin(std::move(texture), view, flags, stencil);
+          const std::array<float, 4> value = {depth, 0.0f, 0.0f, 0.0f};
+          for (const auto &rect : rects) {
+            if (rect.right <= rect.left || rect.bottom <= rect.top)
+              continue;
+            enc.clear_rt_cmd.clear(rect.left, rect.top, rect.right - rect.left,
+                                   rect.bottom - rect.top, value);
+          }
+          enc.clear_rt_cmd.end();
+        });
   }
 
   void ReplayClearUnorderedAccess(CommandChunk *chunk,
