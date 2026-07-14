@@ -10850,7 +10850,7 @@ private:
     Rc<Buffer> count_buffer;
     UINT64 count_offset = 0;
     UINT64 count_heap_offset = 0;
-    WMT::Reference<WMT::Buffer> counted_args;
+    Rc<Buffer> counted_args;
     if (record.count_buffer) {
       auto *count_resource = GetResource(record.count_buffer.ptr());
       if (!ValidateBufferRange(count_resource, record.count_buffer_offset,
@@ -10859,18 +10859,19 @@ private:
 
       count_buffer = count_resource->GetBuffer();
       count_heap_offset = count_resource->GetHeapOffset();
-      count_offset = count_resource->GetHeapOffset() + record.count_buffer_offset;
+      count_offset =
+          count_resource->GetHeapOffset() + record.count_buffer_offset;
 
-      WMTBufferInfo counted_info = {};
-      counted_info.length = UINT64(command_count) * argument_size;
-      counted_info.options = WMTResourceStorageModePrivate |
-                             WMTResourceHazardTrackingModeTracked;
-      counted_args =
-          device_->GetDXMTDevice().device().newBuffer(counted_info);
-      if (!counted_args) {
+      counted_args = new Buffer(UINT64(command_count) * argument_size,
+                                device_->GetDXMTDevice().device());
+      auto counted_allocation = counted_args->allocate(
+          BufferAllocationFlag::CpuInvisible |
+          BufferAllocationFlag::GpuPrivate);
+      if (!counted_allocation) {
         WARN("D3D12CommandQueue: ExecuteIndirect failed to allocate counted argument buffer");
         return true;
       }
+      counted_args->rename(std::move(counted_allocation));
     }
 
     static std::atomic<uint32_t> execute_indirect_log_count = 0;
@@ -11092,7 +11093,7 @@ private:
   void PrepareCountedIndirectArguments(
       ArgumentEncodingContext &enc, const Rc<Buffer> &arg_buffer,
       UINT64 arg_offset, const Rc<Buffer> &count_buffer, UINT64 count_offset,
-      WMT::Buffer counted_args, UINT64 counted_offset, UINT argument_size,
+      const Rc<Buffer> &counted_args, UINT64 counted_offset, UINT argument_size,
       UINT command_index) {
     enc.startComputePass(0);
     auto [arg_allocation, arg_sub_offset] =
@@ -11101,17 +11102,22 @@ private:
     auto [count_allocation, count_sub_offset] =
         enc.access<PipelineStage::Compute>(count_buffer, count_offset,
                                            sizeof(UINT), ResourceAccess::Read);
+    auto [counted_allocation, counted_sub_offset] =
+        enc.access<PipelineStage::Compute>(counted_args, counted_offset,
+                                           argument_size,
+                                           ResourceAccess::Write);
     enc.emulated_cmd.PrepareCountedIndirectArguments(
         count_allocation->buffer(), count_sub_offset + count_offset,
-        arg_allocation->buffer(), arg_sub_offset + arg_offset, counted_args,
-        counted_offset, argument_size, command_index);
+        arg_allocation->buffer(), arg_sub_offset + arg_offset,
+        counted_allocation->buffer(), counted_sub_offset + counted_offset,
+        argument_size, command_index);
     enc.endPass();
   }
 
   void ReplayDrawInstancedIndirect(
       CommandChunk *chunk, ReplayState &state, Rc<Buffer> arg_buffer,
       UINT64 arg_offset, Rc<Buffer> count_buffer, UINT64 count_offset,
-      WMT::Reference<WMT::Buffer> counted_args, UINT64 counted_offset,
+      Rc<Buffer> counted_args, UINT64 counted_offset,
       UINT argument_size, UINT command_index) {
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
     if (!pipeline) {
@@ -11287,9 +11293,16 @@ private:
         draw.indirect_args_offset = arg_sub_offset + arg_offset;
         draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
       } else {
-        WMT::Buffer indirect_buffer = counted_args;
-        UINT64 indirect_offset = counted_offset;
-        if (!count_buffer.ptr()) {
+        WMT::Buffer indirect_buffer;
+        UINT64 indirect_offset;
+        if (count_buffer.ptr()) {
+          auto [counted_allocation, counted_sub_offset] =
+              enc.access<PipelineStage::Vertex>(
+                  counted_args, counted_offset, argument_size,
+                  ResourceAccess::Read);
+          indirect_buffer = counted_allocation->buffer();
+          indirect_offset = counted_sub_offset + counted_offset;
+        } else {
           auto [arg_allocation, arg_sub_offset] =
               enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
                                                 argument_size,
@@ -11343,7 +11356,7 @@ private:
   void ReplayDrawIndexedInstancedIndirect(
       CommandChunk *chunk, ReplayState &state, Rc<Buffer> arg_buffer,
       UINT64 arg_offset, Rc<Buffer> count_buffer, UINT64 count_offset,
-      WMT::Reference<WMT::Buffer> counted_args, UINT64 counted_offset,
+      Rc<Buffer> counted_args, UINT64 counted_offset,
       UINT argument_size, UINT command_index) {
     if (!state.index_buffer)
       return;
@@ -11547,9 +11560,16 @@ private:
         draw.index_buffer_offset = index_offset;
         draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
       } else {
-        WMT::Buffer indirect_buffer = counted_args;
-        UINT64 indirect_offset = counted_offset;
-        if (!count_buffer.ptr()) {
+        WMT::Buffer indirect_buffer;
+        UINT64 indirect_offset;
+        if (count_buffer.ptr()) {
+          auto [counted_allocation, counted_sub_offset] =
+              enc.access<PipelineStage::Vertex>(
+                  counted_args, counted_offset, argument_size,
+                  ResourceAccess::Read);
+          indirect_buffer = counted_allocation->buffer();
+          indirect_offset = counted_sub_offset + counted_offset;
+        } else {
           auto [arg_allocation, arg_sub_offset] =
               enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
                                                 argument_size,
@@ -11607,7 +11627,7 @@ private:
   void ReplayDispatchIndirect(
       CommandChunk *chunk, ReplayState &state, Rc<Buffer> arg_buffer,
       UINT64 arg_offset, Rc<Buffer> count_buffer, UINT64 count_offset,
-      WMT::Reference<WMT::Buffer> counted_args, UINT64 counted_offset,
+      Rc<Buffer> counted_args, UINT64 counted_offset,
       UINT argument_size, UINT command_index) {
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
     if (!pipeline) {
@@ -11646,9 +11666,16 @@ private:
              argument_buffer_size, " actual=", argbuf_offset - argbuf_base);
       }
 
-      WMT::Buffer indirect_buffer = counted_args;
-      UINT64 indirect_offset = counted_offset;
-      if (!count_buffer.ptr()) {
+      WMT::Buffer indirect_buffer;
+      UINT64 indirect_offset;
+      if (count_buffer.ptr()) {
+        auto [counted_allocation, counted_sub_offset] =
+            enc.access<PipelineStage::Compute>(
+                counted_args, counted_offset, argument_size,
+                ResourceAccess::Read);
+        indirect_buffer = counted_allocation->buffer();
+        indirect_offset = counted_sub_offset + counted_offset;
+      } else {
         auto [arg_allocation, arg_sub_offset] =
             enc.access<PipelineStage::Compute>(arg_buffer, arg_offset,
                                                argument_size,

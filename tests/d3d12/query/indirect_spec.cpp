@@ -17,26 +17,59 @@ class ExecuteIndirectSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
 
-  void ExpectDispatch(UINT max_command_count, bool executes) {
+  void ExpectDispatch(UINT max_command_count, bool executes,
+                      UINT64 argument_offset = 0,
+                      const UINT *count_value = nullptr,
+                      bool default_count_buffer = false) {
     constexpr std::uint32_t sentinel = 0xdeadbeef;
     constexpr std::uint32_t dispatch_value = 0x2468ace0;
     std::array<std::uint32_t, 64> initial;
     initial.fill(sentinel);
     auto initial_upload = context_.CreateUploadBuffer(
         sizeof(initial), initial.data(), sizeof(initial));
-    auto output = context_.CreateBuffer(
-        sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto output =
+        context_.CreateBuffer(sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COPY_DEST);
     auto heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
     const D3D12_DISPATCH_ARGUMENTS dispatch = {1, 1, 1};
+    std::array<std::uint8_t, 64> argument_data = {};
+    ASSERT_LE(argument_offset + sizeof(dispatch), argument_data.size());
+    std::memcpy(argument_data.data() + argument_offset, &dispatch,
+                sizeof(dispatch));
     auto arguments = context_.CreateUploadBuffer(
-        sizeof(dispatch), &dispatch, sizeof(dispatch));
+        argument_data.size(), argument_data.data(), argument_data.size());
+    ComPtr<ID3D12Resource> count_buffer;
+    ComPtr<ID3D12Resource> count_upload;
+    constexpr UINT64 count_offset = sizeof(UINT);
+    if (count_value) {
+      const std::array<UINT, 2> count_data = {0xdeadbeef, *count_value};
+      if (default_count_buffer) {
+        count_upload = context_.CreateUploadBuffer(
+            sizeof(count_data), count_data.data(), sizeof(count_data));
+        count_buffer = context_.CreateBuffer(
+            sizeof(count_data), D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (count_upload && count_buffer) {
+          context_.list()->CopyBufferRegion(count_buffer.get(), count_offset,
+                                            count_upload.get(), sizeof(UINT),
+                                            sizeof(*count_value));
+          D3D12TestContext::Transition(context_.list(), count_buffer.get(),
+                                       D3D12_RESOURCE_STATE_COPY_DEST,
+                                       D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        }
+      } else {
+        count_buffer = context_.CreateUploadBuffer(
+            sizeof(count_data), count_data.data(), sizeof(count_data));
+      }
+    }
     ASSERT_TRUE(initial_upload);
     ASSERT_TRUE(output);
     ASSERT_TRUE(heap);
     ASSERT_TRUE(arguments);
+    ASSERT_TRUE(!count_value || count_buffer);
+    ASSERT_TRUE(!default_count_buffer || count_upload);
 
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -51,8 +84,8 @@ protected:
     root_desc.NumParameters = 2;
     root_desc.pParameters = parameters;
     auto root_signature = context_.CreateRootSignature(root_desc);
-    auto pipeline = context_.CreateComputePipeline(
-        root_signature.get(), ClearBufferComputeShader());
+    auto pipeline = context_.CreateComputePipeline(root_signature.get(),
+                                                   ClearBufferComputeShader());
     ASSERT_TRUE(root_signature);
     ASSERT_TRUE(pipeline);
 
@@ -76,9 +109,9 @@ protected:
         heap->GetCPUDescriptorHandleForHeapStart());
     context_.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
                                       sizeof(initial));
-    D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12TestContext::Transition(context_.list(), output.get(),
+                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ID3D12DescriptorHeap *heaps[] = {heap.get()};
     context_.list()->SetDescriptorHeaps(1, heaps);
     context_.list()->SetPipelineState(pipeline.get());
@@ -87,10 +120,11 @@ protected:
     context_.list()->SetComputeRootDescriptorTable(
         1, heap->GetGPUDescriptorHandleForHeapStart());
     context_.list()->ExecuteIndirect(signature.get(), max_command_count,
-                                     arguments.get(), 0, nullptr, 0);
-    D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                                     arguments.get(), argument_offset,
+                                     count_buffer.get(), count_offset);
+    D3D12TestContext::Transition(context_.list(), output.get(),
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     std::vector<std::uint8_t> bytes;
     ASSERT_TRUE(SUCCEEDED(
@@ -111,5 +145,24 @@ protected:
 TEST_F(ExecuteIndirectSpec, Dispatch) { ExpectDispatch(1, true); }
 
 TEST_F(ExecuteIndirectSpec, ZeroCount) { ExpectDispatch(0, false); }
+
+TEST_F(ExecuteIndirectSpec, ArgumentAtNonzeroOffset) {
+  ExpectDispatch(1, true, 16);
+}
+
+TEST_F(ExecuteIndirectSpec, CountBufferZeroSkipsDispatch) {
+  const UINT count = 0;
+  ExpectDispatch(1, false, 0, &count);
+}
+
+TEST_F(ExecuteIndirectSpec, CountBufferOneExecutesDispatch) {
+  const UINT count = 1;
+  ExpectDispatch(1, true, 0, &count);
+}
+
+TEST_F(ExecuteIndirectSpec, DefaultCountBufferOneExecutesDispatch) {
+  const UINT count = 1;
+  ExpectDispatch(1, true, 0, &count, true);
+}
 
 } // namespace

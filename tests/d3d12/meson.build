@@ -40,8 +40,10 @@ d3d12_unit_suites = {
   },
   'query': {
     'sources': files(
+      'query/indirect_draw_spec.cpp',
       'query/indirect_spec.cpp',
       'query/predication_spec.cpp',
+      'query/query_heap_spec.cpp',
       'query/timestamp_spec.cpp',
     ),
   },
