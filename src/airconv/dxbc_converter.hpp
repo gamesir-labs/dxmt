@@ -306,29 +306,21 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
   BasicBlock *entry, context &ctx, llvm::BasicBlock *return_bb
 );
 
-inline air::MSLScalerOrVectorType
-to_msl_type(RegisterComponentType type, uint32_t mask = 0xf) {
-  const uint32_t component_count =
-      std::max(1u, uint32_t(std::popcount(mask & 0xfu)));
-  auto make_type = [component_count](air::MSLScalerType scalar,
-                                     air::MSLScalerOrVectorType scalar_type) {
-    if (component_count == 1)
-      return scalar_type;
-    return air::MSLScalerOrVectorType(
-        air::MSLVector{component_count, std::move(scalar)});
-  };
-
+// D3D links stage interfaces by semantic and permits the consumer mask to be a
+// subset of the producer mask. Metal requires an exact type match, so retain a
+// canonical register-width type on both sides of every stage boundary.
+constexpr air::MSLScalerOrVectorType to_msl_type(RegisterComponentType type) {
   switch (type) {
   case RegisterComponentType::Unknown: {
     assert(0 && "unknown component type");
     break;
   }
   case RegisterComponentType::Uint:
-    return make_type(air::msl_uint, air::msl_uint);
+    return air::msl_uint4;
   case RegisterComponentType::Int:
-    return make_type(air::msl_int, air::msl_int);
+    return air::msl_int4;
   case RegisterComponentType::Float:
-    return make_type(air::msl_float, air::msl_float);
+    return air::msl_float4;
   }
   return air::msl_float4;
 }

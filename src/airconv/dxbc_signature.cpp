@@ -238,7 +238,7 @@ void handle_signature_vs(
       if (sig.mask() == 0) break;
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
         .user = sig.fullSemanticString(),
-        .type = to_msl_type(sig.componentType(), sig.mask() & mask),
+        .type = to_msl_type(sig.componentType()),
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
@@ -424,7 +424,7 @@ void handle_signature_ps(
     (SignatureContext &ctx) {
       bool pull_mode = bool(ctx.pull_mode_reg_mask & (1 << reg)) && interpolation != air::Interpolation::flat;
       auto assigned_index = ctx.func_signature.DefineInput(InputFragmentStageIn{
-        .user = name, .type = to_msl_type(type, sig.mask() & mask),
+        .user = name, .type = to_msl_type(type),
         .interpolation = interpolation, .pull_mode = pull_mode
       });
       if (pull_mode) {
@@ -916,7 +916,7 @@ void handle_signature_ds(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
-      auto const type = to_msl_type(sig.componentType(), sig.mask() & mask);
+      auto const type = to_msl_type(sig.componentType());
       func_signature.DefineMeshVertexOutput(OutputMeshData{
         .user = sig.fullSemanticString(),
         .type = type,
@@ -1146,7 +1146,7 @@ handle_signature_gs(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
-      auto const type = to_msl_type(sig.componentType(), sig.mask() & mask);
+      auto const type = to_msl_type(sig.componentType());
       func_signature.DefineMeshVertexOutput(OutputMeshData{
         .user = sig.fullSemanticString(),
         .type = type,

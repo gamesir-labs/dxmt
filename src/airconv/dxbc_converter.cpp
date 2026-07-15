@@ -1898,7 +1898,7 @@ llvm::Error convert_dxbc_vertex_shader(
       if(out.isSystemValue()) continue;
       func_signature.DefineOutput(air::OutputVertex{
         .user = out.fullSemanticString(),
-        .type = to_msl_type(out.componentType(), out.mask()),
+        .type = to_msl_type(out.componentType()),
       });
     }
   }
