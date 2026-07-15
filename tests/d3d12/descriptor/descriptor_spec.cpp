@@ -220,6 +220,8 @@ struct DescriptorTableDrawOptions {
   bool copy_from_released_cpu_heaps = false;
   bool release_bound_heaps_after_submit = false;
   bool use_static_sampler = false;
+  bool repeat_graphics_root_signature = false;
+  bool set_compute_root_signature = false;
 };
 
 void RunDescriptorTableDraw(
@@ -495,6 +497,10 @@ void RunDescriptorTableDraw(
         resource_tail_parameter, context.GpuDescriptorHandle(heap, 3));
   };
   bind_resource_heap(resource_heap.get());
+  if (options.repeat_graphics_root_signature)
+    context.list()->SetGraphicsRootSignature(root_signature.get());
+  if (options.set_compute_root_signature)
+    context.list()->SetComputeRootSignature(root_signature.get());
   context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   context.list()->RSSetViewports(1, &render_target.viewport);
   context.list()->RSSetScissorRects(1, &render_target.scissor);
@@ -758,6 +764,17 @@ TEST_F(D3D12DescriptorSpec, DrawsWithSplitDescriptorTables) {
 
 TEST_F(D3D12DescriptorSpec, DrawsWithBindlessStaticSampler) {
   RunDescriptorTableDraw(context_, {.use_static_sampler = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       SameGraphicsRootSignaturePreservesGraphicsArguments) {
+  RunDescriptorTableDraw(
+      context_, {.repeat_graphics_root_signature = true});
+}
+
+TEST_F(D3D12DescriptorSpec,
+       ComputeRootChangeDoesNotAffectGraphicsRootState) {
+  RunDescriptorTableDraw(context_, {.set_compute_root_signature = true});
 }
 
 DXMT_SERIAL_TEST_F(D3D12DescriptorSpec,
