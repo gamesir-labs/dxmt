@@ -50,6 +50,7 @@ d3d12_unit_suites = {
     'sources': files(
       'descriptor/bindless_graphics_stage_spec.cpp',
       'descriptor/binding_hotspot_spec.cpp',
+      'descriptor/buffer_view_spec.cpp',
       'descriptor/descriptor_spec.cpp',
       'descriptor/table_binding_spec.cpp',
     ),
