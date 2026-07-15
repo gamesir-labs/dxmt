@@ -1682,18 +1682,23 @@ public:
         initial_pipeline_state_(initial_pipeline_state) {
     if (status)
       *status = S_OK;
-    if (auto allocator_state = dynamic_cast<CommandAllocatorObject *>(command_allocator)) {
-      if (allocator_state->GetCommandListType() == type_) {
-        if (!allocator_state->BeginCommandListRecording(this)) {
-          if (status)
-            *status = E_INVALIDARG;
-          return;
-        }
-        allocator_ = allocator_state;
+    if (command_allocator) {
+      auto *allocator_state =
+          dynamic_cast<CommandAllocatorObject *>(command_allocator);
+      if (!allocator_state || allocator_state->GetParentDevice() != device ||
+          allocator_state->GetCommandListType() != type_ ||
+          !allocator_state->BeginCommandListRecording(this)) {
+        if (status)
+          *status = E_INVALIDARG;
+        return;
       }
+      allocator_ = allocator_state;
     }
-    if (!IsPipelineStateCompatible(initial_pipeline_state_.ptr()))
-      initial_pipeline_state_ = nullptr;
+    if (!IsPipelineStateCompatible(initial_pipeline_state_.ptr())) {
+      if (status)
+        *status = E_INVALIDARG;
+      return;
+    }
     current_pipeline_state_ = initial_pipeline_state_;
     if (current_pipeline_state_)
       RecordPipelineState(current_pipeline_state_.ptr(), true);
@@ -1846,7 +1851,8 @@ public:
       return WARN_E_INVALIDARG(__func__);
 
     auto allocator_state = dynamic_cast<CommandAllocatorObject *>(allocator);
-    if (!allocator_state || allocator_state->GetCommandListType() != type_)
+    if (!allocator_state || allocator_state->GetParentDevice() != device_.ptr() ||
+        allocator_state->GetCommandListType() != type_)
       return WARN_E_INVALIDARG(__func__);
     if (!IsPipelineStateCompatible(initial_state))
       return WARN_E_INVALIDARG(__func__);
@@ -3205,7 +3211,7 @@ private:
       return true;
 
     const auto *state = dynamic_cast<PipelineState *>(pipeline_state);
-    if (!state)
+    if (!state || state->GetParentDevice() != device_.ptr())
       return false;
 
     switch (type_) {

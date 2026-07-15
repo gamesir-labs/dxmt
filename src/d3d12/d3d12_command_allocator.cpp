@@ -66,6 +66,10 @@ public:
     return S_OK;
   }
 
+  IMTLD3D12Device *GetParentDevice() const override {
+    return device_.ptr();
+  }
+
   D3D12_COMMAND_LIST_TYPE GetCommandListType() const override {
     return type_;
   }

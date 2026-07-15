@@ -2891,7 +2891,10 @@ public:
     }
 
     auto allocator_state = dynamic_cast<d3d12::CommandAllocator *>(command_allocator);
-    if (!allocator_state || allocator_state->GetCommandListType() != type)
+    if (!allocator_state ||
+        allocator_state->GetParentDevice() !=
+            static_cast<IMTLD3D12Device *>(this) ||
+        allocator_state->GetCommandListType() != type)
       return WARN_E_INVALIDARG(__func__);
 
     HRESULT status = S_OK;

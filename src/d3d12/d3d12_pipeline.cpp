@@ -3941,6 +3941,10 @@ public:
     return S_OK;
   }
 
+  IMTLD3D12Device *GetParentDevice() const override {
+    return device_.ptr();
+  }
+
   PipelineStateType GetType() const override {
     return type_;
   }

@@ -199,6 +199,7 @@ class PipelineState {
 public:
   virtual ~PipelineState() = default;
 
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual PipelineStateType GetType() const = 0;
   virtual ID3D12RootSignature *GetRootSignature() const = 0;
   virtual const std::vector<PipelineDxilShader> &GetDxilShaders() const = 0;

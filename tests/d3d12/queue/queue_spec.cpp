@@ -595,12 +595,6 @@ TEST_F(D3D12QueueSpec, PreservesPartialBufferCopiesAcrossSubmissions) {
                                                 expected.end())));
 }
 
-TEST_F(D3D12QueueSpec, RejectsClosingAlreadyClosedCommandList) {
-  ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
-  EXPECT_EQ(context_.list()->Close(), E_FAIL);
-  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
-}
-
 TEST_F(D3D12QueueSpec, ExecutesDependentCommandListsInArrayOrder) {
   const std::array<std::uint32_t, 8> expected = {
       0x01020304, 0x11121314, 0x21222324, 0x31323334,

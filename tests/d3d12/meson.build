@@ -43,6 +43,7 @@ d3d12_unit_suites = {
       'command/allocator_lifecycle_spec.cpp',
       'command/list_lifecycle_spec.cpp',
       'command/list_state_spec.cpp',
+      'command/state_machine_spec.cpp',
     ),
   },
   'descriptor': {

@@ -9,6 +9,7 @@ class CommandAllocator {
 public:
   virtual ~CommandAllocator() = default;
 
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual D3D12_COMMAND_LIST_TYPE GetCommandListType() const = 0;
   virtual bool BeginCommandListRecording(void *command_list) = 0;
   virtual void EndCommandListRecording(void *command_list) = 0;
