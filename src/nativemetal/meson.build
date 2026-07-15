@@ -38,6 +38,7 @@ winemetal4_src = [
   '../winemetal4/airconv_thunks.c',
   '../winemetal4/winemetal_thunks.c',
   '../winemetal4/unix/winemetal_unix.c',
+  '../winemetal4/unix/iogpu_diagnostics.c',
   '../winemetal4/unix/metal4_cpp.cpp',
   '../winemetal4/unix/cache.c',
 ]
