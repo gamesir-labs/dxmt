@@ -33,7 +33,10 @@ d3d12_unit_suites = {
     'sources': files('cache/cache_spec.cpp'),
   },
   'capability': {
-    'sources': files('capability/capability_spec.cpp'),
+    'sources': files(
+      'capability/capability_spec.cpp',
+      'capability/format_operation_spec.cpp',
+    ),
   },
   'command': {
     'sources': files(
