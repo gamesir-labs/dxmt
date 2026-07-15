@@ -36,10 +36,14 @@ d3d12_unit_suites = {
     'sources': files(
       'command/allocator_lifecycle_spec.cpp',
       'command/list_lifecycle_spec.cpp',
+      'command/list_state_spec.cpp',
     ),
   },
   'descriptor': {
-    'sources': files('descriptor/descriptor_spec.cpp'),
+    'sources': files(
+      'descriptor/descriptor_spec.cpp',
+      'descriptor/table_binding_spec.cpp',
+    ),
   },
   'pipeline': {
     'sources': files('pipeline/stream_spec.cpp'),
@@ -96,4 +100,8 @@ foreach suite_name, suite_config : d3d12_unit_suites
   d3d12_unit_dependencies += suite_config.get('dependencies', [])
 endforeach
 
-d3d12_unit_dependencies += [d3d12_runtime_support_dep, dxgi_dep]
+d3d12_unit_dependencies += [
+  d3d12_runtime_support_dep,
+  d3dcompiler_test_dep,
+  dxgi_dep,
+]

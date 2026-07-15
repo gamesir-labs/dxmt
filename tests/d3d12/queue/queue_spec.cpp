@@ -1100,10 +1100,28 @@ TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
 }
 
 TEST_F(D3D12QueueSpec, FailsCloseForUnadvertisedCommandFeatures) {
-  ComPtr<ID3D12GraphicsCommandList1> list1;
-  ASSERT_TRUE(SUCCEEDED(
-      context_.list()->QueryInterface(__uuidof(ID3D12GraphicsCommandList1),
-                                      reinterpret_cast<void **>(list1.put()))));
+  struct RecordingList {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12GraphicsCommandList1> list1;
+  };
+  auto create_list = [&] {
+    RecordingList result;
+    if (FAILED(context_.device()->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            __uuidof(ID3D12CommandAllocator),
+            reinterpret_cast<void **>(result.allocator.put()))))
+      return result;
+    if (FAILED(context_.device()->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, result.allocator.get(),
+            nullptr, __uuidof(ID3D12GraphicsCommandList),
+            reinterpret_cast<void **>(result.list.put()))))
+      return result;
+    result.list->QueryInterface(
+        __uuidof(ID3D12GraphicsCommandList1),
+        reinterpret_cast<void **>(result.list1.put()));
+    return result;
+  };
 
   std::array<std::uint32_t, 64> atomic_data = {};
   auto atomic_source = context_.CreateUploadBuffer(
@@ -1121,23 +1139,27 @@ TEST_F(D3D12QueueSpec, FailsCloseForUnadvertisedCommandFeatures) {
   ASSERT_TRUE(atomic_dependent);
   ID3D12Resource *dependent_resources[] = {atomic_dependent.get()};
   D3D12_SUBRESOURCE_RANGE_UINT64 dependent_ranges[] = {{0, {0, sizeof(UINT)}}};
-  list1->AtomicCopyBufferUINT(atomic_destination.get(), 0, atomic_source.get(),
-                              0, 1, dependent_resources, dependent_ranges);
-  EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
-  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+  auto atomic_list = create_list();
+  ASSERT_TRUE(atomic_list.list1);
+  atomic_list.list1->AtomicCopyBufferUINT(
+      atomic_destination.get(), 0, atomic_source.get(), 0, 1,
+      dependent_resources, dependent_ranges);
+  EXPECT_EQ(atomic_list.list->Close(), E_NOTIMPL);
 
   D3D12_STREAM_OUTPUT_BUFFER_VIEW stream_output = {};
   stream_output.BufferLocation = atomic_destination->GetGPUVirtualAddress();
   stream_output.SizeInBytes = sizeof(atomic_data);
   stream_output.BufferFilledSizeLocation =
       atomic_dependent->GetGPUVirtualAddress();
-  context_.list()->SOSetTargets(0, 1, &stream_output);
-  EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
-  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+  auto stream_output_list = create_list();
+  ASSERT_TRUE(stream_output_list.list);
+  stream_output_list.list->SOSetTargets(0, 1, &stream_output);
+  EXPECT_EQ(stream_output_list.list->Close(), E_NOTIMPL);
 
-  list1->OMSetDepthBounds(0.25f, 0.75f);
-  EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
-  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+  auto depth_bounds_list = create_list();
+  ASSERT_TRUE(depth_bounds_list.list1);
+  depth_bounds_list.list1->OMSetDepthBounds(0.25f, 0.75f);
+  EXPECT_EQ(depth_bounds_list.list->Close(), E_NOTIMPL);
 
   auto decompress_source =
       context_.CreateTexture2D(16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1148,16 +1170,19 @@ TEST_F(D3D12QueueSpec, FailsCloseForUnadvertisedCommandFeatures) {
       D3D12_RESOURCE_STATE_RESOLVE_DEST);
   ASSERT_TRUE(decompress_source);
   ASSERT_TRUE(decompress_destination);
-  list1->ResolveSubresourceRegion(
+  auto resolve_list = create_list();
+  ASSERT_TRUE(resolve_list.list1);
+  resolve_list.list1->ResolveSubresourceRegion(
       decompress_destination.get(), 0, 0, 0, decompress_source.get(), 0,
       nullptr, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOLVE_MODE_DECOMPRESS);
-  EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
-  ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+  EXPECT_EQ(resolve_list.list->Close(), E_NOTIMPL);
 
   // The default depth-bounds state remains a valid no-op when the feature is
   // not advertised.
-  list1->OMSetDepthBounds(0.0f, 1.0f);
-  EXPECT_EQ(context_.list()->Close(), S_OK);
+  auto default_depth_bounds_list = create_list();
+  ASSERT_TRUE(default_depth_bounds_list.list1);
+  default_depth_bounds_list.list1->OMSetDepthBounds(0.0f, 1.0f);
+  EXPECT_EQ(default_depth_bounds_list.list->Close(), S_OK);
 }
 
 TEST_F(D3D12QueueSpec, ResolveQueryRecordDoesNotRetainItsCommandList) {

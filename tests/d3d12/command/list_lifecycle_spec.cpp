@@ -44,8 +44,7 @@ TEST_F(CommandListLifecycleSpec, CreateCommandList1StartsClosed) {
 TEST_F(CommandListLifecycleSpec, ResetClosedListSucceeds) {
   ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
 
-  EXPECT_TRUE(SUCCEEDED(
-      context_.list()->Reset(context_.allocator(), nullptr)));
+  EXPECT_TRUE(SUCCEEDED(context_.list()->Reset(context_.allocator(), nullptr)));
 }
 
 TEST_F(CommandListLifecycleSpec, ResetRecordingListFails) {
@@ -58,8 +57,7 @@ TEST_F(CommandListLifecycleSpec, ResetWithNullAllocatorFails) {
   EXPECT_TRUE(FAILED(context_.list()->Reset(nullptr, nullptr)));
 }
 
-TEST_F(CommandListLifecycleSpec,
-       ResetWithAllocatorUsedByRecordingListFails) {
+TEST_F(CommandListLifecycleSpec, ResetWithAllocatorUsedByRecordingListFails) {
   ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
   ComPtr<ID3D12CommandAllocator> occupied_allocator;
   ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
@@ -71,8 +69,19 @@ TEST_F(CommandListLifecycleSpec,
       __uuidof(ID3D12GraphicsCommandList),
       reinterpret_cast<void **>(recording_list.put()))));
 
-  EXPECT_TRUE(FAILED(
-      context_.list()->Reset(occupied_allocator.get(), nullptr)));
+  EXPECT_TRUE(
+      FAILED(context_.list()->Reset(occupied_allocator.get(), nullptr)));
+}
+
+TEST_F(CommandListLifecycleSpec, FailedCloseCannotBeReset) {
+  D3D12_RESOURCE_BARRIER invalid = {};
+  invalid.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  invalid.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  invalid.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  context_.list()->ResourceBarrier(1, &invalid);
+
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+  EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
 }
 
 } // namespace

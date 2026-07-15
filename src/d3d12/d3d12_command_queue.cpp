@@ -9254,6 +9254,8 @@ private:
       // heap changes do not need to close an otherwise mergeable pass.
       state.cbv_srv_uav_heap = nullptr;
       state.sampler_heap = nullptr;
+      state.graphics_tables = {};
+      state.compute_tables = {};
       for (const auto &heap : record.heaps) {
         auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
         if (!descriptor_heap)
@@ -17380,6 +17382,11 @@ private:
     if (!slot_mask)
       return;
 
+    const auto max_slot = 32u - __builtin_clz(slot_mask);
+    for (UINT slot = 0; slot < max_slot; ++slot) {
+      if (slot_mask & (1u << slot))
+        enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
+    }
     for (const auto &vb : input_assembler.vertex_buffers) {
       if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
         continue;
@@ -17719,6 +17726,13 @@ private:
       dxmt::perf::ScopedFrameDuration vertex_buffers_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_vertex_buffers_interval);
+      const auto max_slot = snapshot.vertex_slot_mask
+                                ? 32u - __builtin_clz(snapshot.vertex_slot_mask)
+                                : 0u;
+      for (UINT slot = 0; slot < max_slot; ++slot) {
+        if (snapshot.vertex_slot_mask & (1u << slot))
+          enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
+      }
       for (const auto &binding : snapshot.vertex_buffers) {
         auto buffer = binding.buffer;
         enc.bindVertexBuffer(binding.slot, binding.offset, binding.stride,
@@ -18002,7 +18016,10 @@ private:
 
     const auto max_slot = 32u - __builtin_clz(slot_mask);
     for (UINT slot = 0; slot < max_slot; slot++) {
-      if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
+      if (!(slot_mask & (1u << slot)))
+        continue;
+      enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
+      if (!state.vertex_buffers[slot])
         continue;
       const auto &view = *state.vertex_buffers[slot];
       const auto &resolved = state.resolved_vertex_buffers[slot];

@@ -655,6 +655,8 @@ static void
 SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
                            const DescriptorHeapsRecord &record) {
   state.descriptor_heaps = {};
+  state.compute_root_tables.clear();
+  state.graphics_root_tables.clear();
   state.descriptor_heaps.all = record.heaps;
   for (const auto &heap : record.heaps) {
     auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
@@ -1674,6 +1676,8 @@ public:
                                   ID3D12PipelineState *initial_state) override {
     if (!closed_)
       return E_FAIL;
+    if (recording_error_)
+      return E_FAIL;
     if (!allocator)
       return WARN_E_INVALIDARG(__func__);
 
@@ -1700,6 +1704,7 @@ public:
     graphics_root_signature_ = nullptr;
     records_.clear();
     compiled_commands_.reset();
+    pending_render_pass_resolves_.clear();
     ClearRecordedStateCache();
     closed_ = false;
     submitted_ = false;
