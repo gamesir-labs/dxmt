@@ -84,6 +84,7 @@ d3d12_unit_suites = {
   'root-signature': {
     'sources': files(
       'root_signature/layout_validation_spec.cpp',
+      'root_signature/root_descriptor_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
     ),
