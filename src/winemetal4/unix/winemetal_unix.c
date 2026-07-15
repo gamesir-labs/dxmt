@@ -24,6 +24,7 @@
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #include "objc/objc-runtime.h"
+#include "iogpu_diagnostics.h"
 #include <bootstrap.h>
 #include <mach/mach_port.h>
 #include <pthread.h>
@@ -335,6 +336,65 @@ typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
   DXMTMetal4CommandBufferStateCommitted = 2,
   DXMTMetal4CommandBufferStateCompleted = 4,
   DXMTMetal4CommandBufferStateError = 5,
+};
+
+enum { DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY = 32 };
+
+/*
+ * Scalar-only snapshot of the presentation hand-off.  Keeping Objective-C
+ * objects in this ring would extend their lifetime and could hide the MMU
+ * fault we are trying to diagnose, so every object is recorded as an address
+ * and is never dereferenced after capture.
+ */
+struct DXMTMetal4PresentDiagnostic {
+  uint64_t serial;
+  uint64_t capture_us;
+  uintptr_t command_buffer;
+  uintptr_t metal_buffer;
+  uintptr_t drawable;
+  uintptr_t texture;
+  uintptr_t parent_texture;
+  uintptr_t buffer;
+  uintptr_t heap;
+  uintptr_t backing_allocation;
+  uintptr_t layer;
+  uintptr_t layer_device;
+  uintptr_t layer_residency_set;
+  uint64_t texture_gpu_resource_id;
+  uint64_t completion_value;
+  uint64_t previous_present_value;
+  uint64_t current_present_value;
+  uint64_t frame_id;
+  uint64_t chunk_id;
+  uint64_t d3d_sequence_begin;
+  uint64_t d3d_sequence_end;
+  uint64_t width;
+  uint64_t height;
+  uint64_t depth;
+  uint64_t array_length;
+  uint64_t mipmap_level_count;
+  uint64_t sample_count;
+  uint64_t pixel_format;
+  uint64_t texture_type;
+  uint64_t usage;
+  uint64_t storage_mode;
+  uint64_t hazard_tracking_mode;
+  uint64_t layer_pixel_format;
+  uint64_t layer_maximum_drawable_count;
+  uint64_t layer_allocation_count;
+  uint64_t command_buffer_allocation_count;
+  double layer_width;
+  double layer_height;
+  double present_duration;
+  uint8_t texture_framebuffer_only;
+  uint8_t layer_framebuffer_only;
+  uint8_t layer_contains_texture;
+  uint8_t layer_contains_backing;
+  uint8_t command_buffer_contains_texture;
+  uint8_t command_buffer_contains_backing;
+  uint8_t wait_for_drawable;
+  uint8_t present_ordering;
+  uint8_t has_present_duration;
 };
 
 @interface DXMTMetal4CommandBuffer : NSObject
@@ -827,7 +887,11 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 
-@interface DXMTMetal4CommandQueue : NSObject
+@interface DXMTMetal4CommandQueue : NSObject {
+  struct DXMTMetal4PresentDiagnostic
+      _presentDiagnostics[DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY];
+  uint64_t _presentDiagnosticSerial;
+}
 @property(nonatomic, retain) id<MTLDevice> device;
 @property(nonatomic, retain) id<MTL4CommandQueue> metal4Queue;
 @property(nonatomic, retain) id<MTL4Compiler> compiler;
@@ -845,6 +909,13 @@ dxmt_metal4_is_buffer(id object) {
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
+- (void)recordPresentDiagnosticForCommandBuffer:
+            (DXMTMetal4CommandBuffer *)commandBuffer
+                            previousValue:(uint64_t)previousValue
+                             currentValue:(uint64_t)currentValue
+                          waitForDrawable:(BOOL)waitForDrawable
+                          presentOrdering:(BOOL)presentOrdering;
+- (void)dumpPresentDiagnosticsForErrorCommandBuffer:(obj_handle_t)commandBuffer;
 @end
 
 @implementation DXMTMetal4CommandQueue
@@ -888,6 +959,7 @@ dxmt_metal4_is_buffer(id object) {
   [_sparseResidencySet requestResidency];
   [_metal4Queue addResidencySet:_sparseResidencySet];
 
+  dxmt_iogpu_diagnostics_install();
   dxmt_metal4_register_compiler(device, _compiler);
   return self;
 }
@@ -934,6 +1006,163 @@ dxmt_metal4_is_buffer(id object) {
             _metal4Queue, _maxCommandBufferCount, waitValue, currentValue,
             (double)waitElapsedUs / 1000.0, waitIndex);
     fflush(stderr);
+  }
+}
+
+- (void)recordPresentDiagnosticForCommandBuffer:
+            (DXMTMetal4CommandBuffer *)commandBuffer
+                            previousValue:(uint64_t)previousValue
+                             currentValue:(uint64_t)currentValue
+                          waitForDrawable:(BOOL)waitForDrawable
+                          presentOrdering:(BOOL)presentOrdering {
+  id<MTLDrawable> drawable = commandBuffer.pendingDrawable;
+  if (!drawable ||
+      ![drawable conformsToProtocol:@protocol(CAMetalDrawable)])
+    return;
+
+  id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
+  id<MTLTexture> texture = metalDrawable.texture;
+  CAMetalLayer *layer = metalDrawable.layer;
+  id<MTLResidencySet> layerSet = layer.residencySet;
+  id<MTLResidencySet> commandBufferSet = commandBuffer.residencySet;
+  id<MTLAllocation> backing = texture
+                                  ? dxmt_metal4_backing_allocation(
+                                        (id<MTLAllocation>)texture)
+                                  : nil;
+
+  const uint64_t serial = ++_presentDiagnosticSerial;
+  struct DXMTMetal4PresentDiagnostic *diag =
+      &_presentDiagnostics[(serial - 1) %
+                           DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY];
+  memset(diag, 0, sizeof(*diag));
+  diag->serial = serial;
+  diag->capture_us = dxmt_monotonic_us();
+  diag->command_buffer = (uintptr_t)commandBuffer;
+  diag->metal_buffer = (uintptr_t)commandBuffer.metal4Buffer;
+  diag->drawable = (uintptr_t)drawable;
+  diag->texture = (uintptr_t)texture;
+  diag->parent_texture = (uintptr_t)texture.parentTexture;
+  diag->buffer = (uintptr_t)texture.buffer;
+  diag->heap = (uintptr_t)texture.heap;
+  diag->backing_allocation = (uintptr_t)backing;
+  diag->layer = (uintptr_t)layer;
+  diag->layer_device = (uintptr_t)layer.device;
+  diag->layer_residency_set = (uintptr_t)layerSet;
+  diag->texture_gpu_resource_id = texture ? texture.gpuResourceID._impl : 0;
+  diag->completion_value = commandBuffer.completionValue;
+  diag->previous_present_value = previousValue;
+  diag->current_present_value = currentValue;
+  const struct WMTCommandBufferDiagnosticInfo info =
+      commandBuffer.diagnosticInfo;
+  diag->frame_id = info.frame_id;
+  diag->chunk_id = info.chunk_id;
+  diag->d3d_sequence_begin = info.d3d_sequence_begin;
+  diag->d3d_sequence_end = info.d3d_sequence_end;
+  diag->width = texture.width;
+  diag->height = texture.height;
+  diag->depth = texture.depth;
+  diag->array_length = texture.arrayLength;
+  diag->mipmap_level_count = texture.mipmapLevelCount;
+  diag->sample_count = texture.sampleCount;
+  diag->pixel_format = texture.pixelFormat;
+  diag->texture_type = texture.textureType;
+  diag->usage = texture.usage;
+  diag->storage_mode = texture.storageMode;
+  diag->hazard_tracking_mode = texture.hazardTrackingMode;
+  diag->layer_pixel_format = layer.pixelFormat;
+  diag->layer_maximum_drawable_count = layer.maximumDrawableCount;
+  diag->layer_allocation_count = layerSet ? layerSet.allocationCount : 0;
+  diag->command_buffer_allocation_count =
+      commandBufferSet ? commandBufferSet.allocationCount : 0;
+  const CGSize drawableSize = layer.drawableSize;
+  diag->layer_width = drawableSize.width;
+  diag->layer_height = drawableSize.height;
+  diag->present_duration = commandBuffer.presentDuration;
+  diag->texture_framebuffer_only = texture.framebufferOnly;
+  diag->layer_framebuffer_only = layer.framebufferOnly;
+  diag->layer_contains_texture =
+      layerSet && texture
+          ? [layerSet containsAllocation:(id<MTLAllocation>)texture]
+          : NO;
+  diag->layer_contains_backing =
+      layerSet && backing ? [layerSet containsAllocation:backing] : NO;
+  diag->command_buffer_contains_texture =
+      commandBufferSet && texture
+          ? [commandBufferSet containsAllocation:(id<MTLAllocation>)texture]
+          : NO;
+  diag->command_buffer_contains_backing =
+      commandBufferSet && backing
+          ? [commandBufferSet containsAllocation:backing]
+          : NO;
+  diag->wait_for_drawable = waitForDrawable;
+  diag->present_ordering = presentOrdering;
+  diag->has_present_duration = commandBuffer.hasPresentDuration;
+}
+
+- (void)dumpPresentDiagnosticsForErrorCommandBuffer:
+    (obj_handle_t)commandBuffer {
+  const uint64_t newest = _presentDiagnosticSerial;
+  if (!newest) {
+    fprintf(stderr,
+            "err:   DXMT Metal4 recent present diagnostics: errorCommandBuffer=%p count=0\n",
+            (void *)(uintptr_t)commandBuffer);
+    return;
+  }
+
+  const uint64_t oldest =
+      newest > DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY
+          ? newest - DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY + 1
+          : 1;
+  fprintf(stderr,
+          "err:   DXMT Metal4 recent present diagnostics: errorCommandBuffer=%p"
+          " oldest=%" PRIu64 " newest=%" PRIu64 " count=%" PRIu64 "\n",
+          (void *)(uintptr_t)commandBuffer, oldest, newest,
+          newest - oldest + 1);
+  for (uint64_t serial = oldest; serial <= newest; serial++) {
+    const struct DXMTMetal4PresentDiagnostic *diag =
+        &_presentDiagnostics[(serial - 1) %
+                             DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY];
+    if (diag->serial != serial)
+      continue;
+    fprintf(stderr,
+            "err:   DXMT Metal4 recent present: serial=%" PRIu64
+            " ageUs=%" PRIu64 " commandBuffer=%p metalBuffer=%p"
+            " completion=%" PRIu64 " presentValue=%" PRIu64 "->%" PRIu64
+            " frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
+            " drawable=%p texture=%p gpuResource=%" PRIu64
+            " parent=%p buffer=%p heap=%p backing=%p"
+            " size=%" PRIu64 "x%" PRIu64 "x%" PRIu64
+            " array=%" PRIu64 " mips=%" PRIu64 " samples=%" PRIu64
+            " format=%" PRIu64 " type=%" PRIu64 " usage=0x%" PRIx64
+            " storage=%" PRIu64 " hazard=%" PRIu64 " framebufferOnly=%u"
+            " layer=%p layerDevice=%p layerSize=%.0fx%.0f"
+            " layerFormat=%" PRIu64 " layerFramebufferOnly=%u maxDrawables=%" PRIu64
+            " layerSet=%p layerContains=%u/%u layerAllocations=%" PRIu64
+            " commandSetContains=%u/%u commandAllocations=%" PRIu64
+            " waitForDrawable=%u ordering=%u duration=%u/%.6f\n",
+            diag->serial, dxmt_monotonic_us() - diag->capture_us,
+            (void *)diag->command_buffer, (void *)diag->metal_buffer,
+            diag->completion_value, diag->previous_present_value,
+            diag->current_present_value, diag->frame_id, diag->chunk_id,
+            diag->d3d_sequence_begin, diag->d3d_sequence_end,
+            (void *)diag->drawable, (void *)diag->texture,
+            diag->texture_gpu_resource_id, (void *)diag->parent_texture,
+            (void *)diag->buffer, (void *)diag->heap,
+            (void *)diag->backing_allocation, diag->width, diag->height,
+            diag->depth, diag->array_length, diag->mipmap_level_count,
+            diag->sample_count, diag->pixel_format, diag->texture_type,
+            diag->usage, diag->storage_mode, diag->hazard_tracking_mode,
+            diag->texture_framebuffer_only, (void *)diag->layer,
+            (void *)diag->layer_device, diag->layer_width, diag->layer_height,
+            diag->layer_pixel_format, diag->layer_framebuffer_only,
+            diag->layer_maximum_drawable_count,
+            (void *)diag->layer_residency_set, diag->layer_contains_texture,
+            diag->layer_contains_backing, diag->layer_allocation_count,
+            diag->command_buffer_contains_texture,
+            diag->command_buffer_contains_backing,
+            diag->command_buffer_allocation_count, diag->wait_for_drawable,
+            diag->present_ordering, diag->has_present_duration,
+            diag->present_duration);
   }
 }
 @end
@@ -1157,6 +1386,15 @@ dxmt_metal4_is_buffer(id object) {
       dxmt_metal4_dense_hang_diagnostics_enabled();
   const BOOL perfFeedback =
       dxmt_metal4_perf_stats_enabled() || denseHangDiagnostics;
+  const BOOL residencyDiagnostics = dxmt_metal4_residency_diag_enabled();
+  const BOOL errorDiagnostics = perfFeedback || residencyDiagnostics;
+  if (hasDrawable && errorDiagnostics) {
+    [_owner recordPresentDiagnosticForCommandBuffer:self
+                                      previousValue:previousPresentValue
+                                       currentValue:currentPresentValue
+                                    waitForDrawable:waitForDrawable
+                                    presentOrdering:presentOrdering];
+  }
   if (perfFeedback && !_metal4Buffer.label) {
     NSString *label = [[NSString alloc]
         initWithFormat:@"DXMT queue=%p depth=%" PRIu64 " completion=%" PRIu64,
@@ -1243,10 +1481,13 @@ dxmt_metal4_is_buffer(id object) {
           feedbackOwner.internalStatus = DXMTMetal4CommandBufferStateError;
         }
       }
+      BOOL firstQueueError = NO;
       if (error) {
         @synchronized(feedbackOwner.owner) {
-          if (!feedbackOwner.owner.firstError)
+          if (!feedbackOwner.owner.firstError) {
             feedbackOwner.owner.firstError = error;
+            firstQueueError = YES;
+          }
         }
       }
       if (error && feedbackCompletionEvent.signaledValue <
@@ -1256,7 +1497,7 @@ dxmt_metal4_is_buffer(id object) {
         // advancing it is safe and releases waiters/resource retirement.
         feedbackCompletionEvent.signaledValue = feedbackCompletionValue;
       }
-      if (perfFeedback && error) {
+      if (errorDiagnostics && error) {
         fprintf(stderr,
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
                 " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
@@ -1365,6 +1606,11 @@ dxmt_metal4_is_buffer(id object) {
                 (long)error.code,
                 error.localizedDescription ? error.localizedDescription.UTF8String
                                            : "<no description>");
+
+        if (firstQueueError)
+          [feedbackOwner.owner
+              dumpPresentDiagnosticsForErrorCommandBuffer:
+                  feedbackCommandBuffer];
 
         if (denseHangDiagnostics) {
           for (uint32_t edge_index = 0;

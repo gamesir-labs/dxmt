@@ -1317,12 +1317,20 @@ D3D12DiagIndexWords(const uint8_t *bytes, size_t size,
 
 static bool
 D3D12DiagRootCauseTargetMatches(const std::string &key) {
-  if (!D3D12DiagRootCauseDenseEnabled())
-    return false;
-  const auto filters = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_TARGET_PSO");
+  static const std::vector<std::string> filters = [] {
+    auto configured = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_TARGET_PSO");
+    if (configured.empty())
+      configured = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
+
+    std::vector<std::string> parsed;
+    for (const auto filter : str::split(configured, ",; "))
+      if (!filter.empty())
+        parsed.emplace_back(filter);
+    return parsed;
+  }();
   if (filters.empty())
     return false;
-  for (const auto filter : str::split(filters, ",; "))
+  for (const auto &filter : filters)
     if (!filter.empty() && key.starts_with(filter))
       return true;
   return false;
@@ -1400,6 +1408,62 @@ D3D12DiagLogCompiledTargetInputs(const CompiledGraphicsPacket &packet,
                                       : packet.draw_indexed
                                             ? packet.draw_indexed->instance_count
                                             : 0);
+
+  for (const auto &table : packet.root_tables) {
+    const auto current_generation =
+        table.mirror ? table.mirror->backendResourceTableGeneration() : 0;
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: compiled target root table",
+        " sample=", sample, " pso=", key,
+        " root=", table.root_parameter_index,
+        " heapType=", uint32_t(table.heap_type),
+        " base=0x", std::hex, table.base_descriptor.ptr, std::dec,
+        " heapIndex=", table.heap_index,
+        " descriptorCount=", table.descriptor_count,
+        " heapCount=", table.heap_count,
+        " tableOffset=", table.table_offset,
+        " tableStride=", table.table_entry_stride,
+        " rootTableBase=", table.root_table_base_descriptor_index,
+        " descriptorTableGpu=0x", std::hex,
+        table.descriptor_table_gpu_address,
+        " descriptorEntryGpu=0x", table.descriptor_table_entry_gpu_address,
+        " bufferRecordGpu=0x", table.buffer_descriptor_record_gpu_address,
+        " bufferResourceGpu=0x", table.buffer_resource_table_gpu_address,
+        std::dec,
+        " capturedGeneration=", table.buffer_resource_table_generation,
+        " currentGeneration=", current_generation,
+        " resolved=", table.resolved,
+        " tableBackendReady=", table.descriptor_table_backend_ready,
+        " recordStorageReady=", table.native_descriptor_record_storage_ready,
+        " resourceTableReady=", table.native_buffer_resource_table_ready,
+        " rootBaseReady=", table.native_root_table_base_ready);
+  }
+
+  for (const auto &constants : packet.root_constants) {
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: compiled target root constants",
+        " sample=", sample, " pso=", key,
+        " root=", constants.root_parameter_index,
+        " dstOffset=", constants.dst_offset,
+        " count=", constants.values.size(),
+        " values=", D3D12DiagRootBaseWords(constants.values));
+  }
+
+  auto log_native_stage = [&](const char *stage,
+                              const CompiledNativeStageBinding &binding) {
+    WARN_FILE_ONLY(
+        "D3D12 root-cause: compiled target native roots",
+        " sample=", sample, " pso=", key, " stage=", stage,
+        " ready=", binding.ready,
+        " cbufferOffset=", binding.cbuffer_root_base_offset,
+        " cbufferCount=", binding.cbuffer_root_base_count,
+        " cbufferBases=", D3D12DiagRootBaseWords(binding.cbuffer_root_bases),
+        " resourceOffset=", binding.resource_root_base_offset,
+        " resourceCount=", binding.resource_root_base_count,
+        " resourceBases=", D3D12DiagRootBaseWords(binding.resource_root_bases));
+  };
+  log_native_stage("vertex", packet.native_vertex);
+  log_native_stage("pixel", packet.native_pixel);
 
   if (graphics) {
     for (size_t i = 0; i < graphics->input_elements.size(); i++) {

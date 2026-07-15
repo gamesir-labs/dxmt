@@ -1,5 +1,6 @@
 winemetal4_unix_src = [
   'winemetal_unix.c',
+  'iogpu_diagnostics.c',
   'metal4_cpp.cpp',
   'cache.c',
 ]
