@@ -100,7 +100,9 @@ d3d12_unit_suites = {
       'transfer/clear_dsv_spec.cpp',
       'transfer/clear_rtv_spec.cpp',
       'transfer/clear_uav_spec.cpp',
+      'transfer/copy_footprint_spec.cpp',
       'transfer/copy_resource_spec.cpp',
+      'transfer/copy_texture_spec.cpp',
     ),
   },
   'resource': {
