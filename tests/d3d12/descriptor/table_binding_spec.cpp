@@ -120,4 +120,14 @@ TEST_F(DescriptorTableBindingSpec, RebindingAfterHeapSwitchRestoresAccess) {
   ExpectOutput(1, kValue);
 }
 
+TEST_F(DescriptorTableBindingSpec, SettingSameHeapAgainPreservesTables) {
+  BindPipelineAndArguments();
+  BindTable(0);
+  ID3D12DescriptorHeap *same[] = {heaps_[0].get()};
+  context_.list()->SetDescriptorHeaps(1, same);
+  context_.list()->Dispatch(1, 1, 1);
+
+  ExpectOutput(0, kValue);
+}
+
 } // namespace

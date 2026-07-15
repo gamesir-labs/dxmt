@@ -657,22 +657,10 @@ GetCompiledPipelineMetadata(CompiledCommandBuildState &state, bool compute) {
 }
 
 static void
-InvalidateCompiledRootDescriptorTable(
-    CompiledCommandRootDescriptorTable &table) {
-  const auto root_parameter_index = table.root_parameter_index;
-  const auto base_descriptor = table.base_descriptor;
-  table = {};
-  table.root_parameter_index = root_parameter_index;
-  table.base_descriptor = base_descriptor;
-}
-
-static void
 SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
                            const DescriptorHeapsRecord &record) {
-  state.descriptor_heaps = {};
-  state.compute_root_tables.clear();
-  state.graphics_root_tables.clear();
-  state.descriptor_heaps.all = record.heaps;
+  CompiledCommandDescriptorHeaps next = {};
+  next.all = record.heaps;
   for (const auto &heap : record.heaps) {
     auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
     if (!descriptor_heap)
@@ -681,14 +669,18 @@ SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
     if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
       continue;
     if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-      state.descriptor_heaps.cbv_srv_uav = heap;
+      next.cbv_srv_uav = heap;
     else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
-      state.descriptor_heaps.sampler = heap;
+      next.sampler = heap;
   }
-  for (auto &table : state.compute_root_tables)
-    InvalidateCompiledRootDescriptorTable(table);
-  for (auto &table : state.graphics_root_tables)
-    InvalidateCompiledRootDescriptorTable(table);
+  if (next.cbv_srv_uav.ptr() == state.descriptor_heaps.cbv_srv_uav.ptr() &&
+      next.sampler.ptr() == state.descriptor_heaps.sampler.ptr()) {
+    state.descriptor_heaps.all = std::move(next.all);
+    return;
+  }
+  state.descriptor_heaps = std::move(next);
+  state.compute_root_tables.clear();
+  state.graphics_root_tables.clear();
   state.compute_root_table_materialization.reset();
   state.graphics_root_table_materialization.reset();
 }
