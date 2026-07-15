@@ -6,6 +6,7 @@
 
 #include "shaders/runtime_test_shaders.hpp"
 
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -38,6 +39,10 @@ struct ScopedArchiveTestEnvironment {
     unix_cache_root = "/tmp/" + name.str();
     windows_cache_root = "Z:\\tmp\\" + name.str();
     marker = root + "\\marker.txt";
+    archive_directory = windows_cache_root + "\\com.apple.metal4";
+    archive = archive_directory + "\\dxmt_pso.binaryarchive";
+    unavailable_marker =
+        archive_directory + "\\dxmt_pso_archive_unavailable.txt";
     CreateDirectoryA(root.c_str(), nullptr);
     std::ofstream(marker, std::ios::trunc).close();
     CreateDirectoryA(windows_cache_root.c_str(), nullptr);
@@ -53,13 +58,36 @@ struct ScopedArchiveTestEnvironment {
     SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", nullptr);
     SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", nullptr);
     SetEnvironmentVariableA("DXMT_SHADER_CACHE", nullptr);
+    DeleteFileA(archive.c_str());
+    DeleteFileA(unavailable_marker.c_str());
+    RemoveDirectoryA(archive_directory.c_str());
+    RemoveDirectoryA(windows_cache_root.c_str());
+    DeleteFileA(marker.c_str());
+    RemoveDirectoryA(root.c_str());
   }
   std::string ReadMarker() const {
     std::ifstream input(marker);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
   }
+  void ResetMarker() const { std::ofstream(marker, std::ios::trunc).close(); }
+
   std::string root, unix_cache_root, windows_cache_root, marker;
+  std::string archive_directory, archive, unavailable_marker;
 };
+
+ID3D12Device *CreateIsolatedDevice() {
+  using CreateDeviceProc = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL,
+                                              REFIID, void **);
+  const auto create_device = reinterpret_cast<CreateDeviceProc>(GetProcAddress(
+      GetModuleHandleW(L"d3d12.dll"), "DXMTCreateD3D12DeviceFromFactory"));
+  if (!create_device)
+    return nullptr;
+  ID3D12Device *device = nullptr;
+  const HRESULT hr =
+      create_device(nullptr, D3D_FEATURE_LEVEL_11_0,
+                    __uuidof(ID3D12Device), reinterpret_cast<void **>(&device));
+  return SUCCEEDED(hr) ? device : nullptr;
+}
 
 ID3D12RootSignature *CreateRootSignature(ID3D12Device *device,
                                          const D3D12_ROOT_SIGNATURE_DESC &desc) {
@@ -115,42 +143,79 @@ ID3D12PipelineState *CreateBasicGraphicsPipeline(ID3D12Device *device) {
 
 TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
   ScopedArchiveTestEnvironment environment("attached");
-  ID3D12Device *device = nullptr;
-  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
-      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-      reinterpret_cast<void **>(&device))));
+  ID3D12Device *device = CreateIsolatedDevice();
   ASSERT_NE(device, nullptr);
   auto *pipeline = CreateBasicGraphicsPipeline(device);
   ASSERT_NE(pipeline, nullptr);
   release_object(pipeline);
   release_object(device);
   const auto marker = environment.ReadMarker();
-  if (marker.find("serialize reason=periodic count=1") == std::string::npos)
-    GTEST_SKIP() << "D3D12 device was reused after archive state was fixed: " << marker;
+  EXPECT_NE(marker.find("create cold=1 ok=1"), std::string::npos) << marker;
   EXPECT_NE(marker.find("serialize reason=periodic count=1 ok=1"), std::string::npos)
       << marker;
+  EXPECT_NE(GetFileAttributesA(environment.archive.c_str()),
+            INVALID_FILE_ATTRIBUTES);
 }
 
 TEST(D3D12PipelineArchiveSpec, RejectsCorruptArchiveAndFallsBackToCompilation) {
   ScopedArchiveTestEnvironment environment("corrupt");
-  const auto archive_dir = environment.windows_cache_root + "\\com.apple.metal4";
-  ASSERT_TRUE(CreateDirectoryA(archive_dir.c_str(), nullptr) ||
-              GetLastError() == ERROR_ALREADY_EXISTS);
-  const auto archive_path = archive_dir + "\\dxmt_pso.binaryarchive";
-  std::ofstream corrupt(archive_path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(
+      CreateDirectoryA(environment.archive_directory.c_str(), nullptr) ||
+      GetLastError() == ERROR_ALREADY_EXISTS);
+  std::ofstream corrupt(environment.archive,
+                        std::ios::binary | std::ios::trunc);
   ASSERT_TRUE(corrupt.good());
   corrupt << "not-a-metal-binary-archive";
   corrupt.close();
-  ID3D12Device *device = nullptr;
-  ASSERT_TRUE(HResultSucceeded(D3D12CreateDevice(
-      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-      reinterpret_cast<void **>(&device))));
+  ID3D12Device *device = CreateIsolatedDevice();
+  ASSERT_NE(device, nullptr);
   auto *pipeline = CreateBasicGraphicsPipeline(device);
-  EXPECT_NE(pipeline, nullptr);
+  ASSERT_NE(pipeline, nullptr);
   release_object(pipeline);
   release_object(device);
   const auto marker = environment.ReadMarker();
-  if (marker.find("create cold=0") == std::string::npos)
-    GTEST_SKIP() << "D3D12 device was reused after archive state was fixed: " << marker;
   EXPECT_NE(marker.find("create cold=0 ok=0"), std::string::npos) << marker;
+}
+
+TEST(D3D12PipelineArchiveSpec, ColdAndWarmPipelinesHaveIdenticalCachedBlobs) {
+  ScopedArchiveTestEnvironment environment("cold-warm");
+  ID3DBlob *cold_blob = nullptr;
+  {
+    ID3D12Device *device = CreateIsolatedDevice();
+    ASSERT_NE(device, nullptr);
+    auto *pipeline = CreateBasicGraphicsPipeline(device);
+    ASSERT_NE(pipeline, nullptr);
+    ASSERT_TRUE(HResultSucceeded(pipeline->GetCachedBlob(&cold_blob)));
+    ASSERT_NE(cold_blob, nullptr);
+    ASSERT_GT(cold_blob->GetBufferSize(), 0u);
+    release_object(pipeline);
+    release_object(device);
+  }
+  auto marker = environment.ReadMarker();
+  ASSERT_NE(marker.find("create cold=1 ok=1"), std::string::npos) << marker;
+  ASSERT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
+            std::string::npos)
+      << marker;
+  environment.ResetMarker();
+
+  ID3DBlob *warm_blob = nullptr;
+  {
+    ID3D12Device *device = CreateIsolatedDevice();
+    ASSERT_NE(device, nullptr);
+    auto *pipeline = CreateBasicGraphicsPipeline(device);
+    ASSERT_NE(pipeline, nullptr);
+    ASSERT_TRUE(HResultSucceeded(pipeline->GetCachedBlob(&warm_blob)));
+    ASSERT_NE(warm_blob, nullptr);
+    release_object(pipeline);
+    release_object(device);
+  }
+  marker = environment.ReadMarker();
+  EXPECT_NE(marker.find("create cold=0 ok=1"), std::string::npos) << marker;
+  ASSERT_EQ(warm_blob->GetBufferSize(), cold_blob->GetBufferSize());
+  EXPECT_EQ(std::memcmp(warm_blob->GetBufferPointer(),
+                        cold_blob->GetBufferPointer(),
+                        cold_blob->GetBufferSize()),
+            0);
+  release_object(warm_blob);
+  release_object(cold_blob);
 }
