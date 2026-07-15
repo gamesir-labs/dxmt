@@ -23,10 +23,18 @@ protected:
     Native,
     PredicatedFallback,
     NativeFallbackNative,
+    NativeCopyNative,
   };
 
-  void RunDescriptorDispatch(DispatchPath path,
-                             std::vector<std::uint32_t> *values) {
+  enum class DrawSequence {
+    Single,
+    BarrierBetweenDraws,
+    QueryAroundDraw,
+  };
+
+  void
+  RunDescriptorDispatch(DispatchPath path, std::vector<std::uint32_t> *values,
+                        std::vector<std::uint32_t> *copied_values = nullptr) {
     D3D12TestContext context;
     ASSERT_TRUE(SUCCEEDED(context.Initialize()));
 
@@ -66,8 +74,8 @@ protected:
         context.CreateComputePipeline(root_signature.get(), bytecode);
     ASSERT_TRUE(pipeline);
 
-    auto upload = context.CreateUploadBuffer(kInput.size() * sizeof(kInput[0]),
-                                             kInput.data(), sizeof(kInput));
+    auto upload = context.CreateUploadBuffer(sizeof(kInput), kInput.data(),
+                                             sizeof(kInput));
     auto input = context.CreateBuffer(sizeof(kInput), D3D12_HEAP_TYPE_DEFAULT,
                                       D3D12_RESOURCE_FLAG_NONE,
                                       D3D12_RESOURCE_STATE_COPY_DEST);
@@ -75,11 +83,18 @@ protected:
         context.CreateBuffer(sizeof(kInput), D3D12_HEAP_TYPE_DEFAULT,
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ComPtr<ID3D12Resource> copy;
+    if (path == DispatchPath::NativeCopyNative) {
+      copy = context.CreateBuffer(sizeof(kInput), D3D12_HEAP_TYPE_DEFAULT,
+                                  D3D12_RESOURCE_FLAG_NONE,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     auto heap = context.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
     ASSERT_TRUE(upload);
     ASSERT_TRUE(input);
     ASSERT_TRUE(output);
+    ASSERT_TRUE(path != DispatchPath::NativeCopyNative || copy);
     ASSERT_TRUE(heap);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
@@ -130,17 +145,179 @@ protected:
     } else if (path == DispatchPath::NativeFallbackNative) {
       D3D12TestContext::UavBarrier(context.list(), output.get());
       context.list()->Dispatch(1, 1, 1);
+    } else if (path == DispatchPath::NativeCopyNative) {
+      D3D12TestContext::Transition(context.list(), output.get(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+      context.list()->CopyBufferRegion(copy.get(), 0, output.get(), 0,
+                                       sizeof(kInput));
+      D3D12TestContext::Transition(context.list(), output.get(),
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      context.list()->Dispatch(1, 1, 1);
     }
 
     D3D12TestContext::Transition(context.list(), output.get(),
                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (copy) {
+      ASSERT_NE(copied_values, nullptr);
+      D3D12TestContext::Transition(context.list(), copy.get(),
+                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+      std::vector<std::uint8_t> bytes;
+      ASSERT_EQ(context.ReadbackBuffer(copy.get(), sizeof(kInput), &bytes),
+                S_OK);
+      ASSERT_EQ(bytes.size(), sizeof(kInput));
+      copied_values->resize(kInput.size());
+      std::memcpy(copied_values->data(), bytes.data(), bytes.size());
+      ASSERT_EQ(context.ResetCommandList(), S_OK);
+    }
     std::vector<std::uint8_t> bytes;
     ASSERT_EQ(context.ReadbackBuffer(output.get(), sizeof(kInput), &bytes),
               S_OK);
     ASSERT_EQ(bytes.size(), sizeof(kInput));
     values->resize(kInput.size());
     std::memcpy(values->data(), bytes.data(), bytes.size());
+  }
+
+  void RunAdditiveDraws(DrawSequence sequence, TextureReadback *readback,
+                        UINT64 *query_samples = nullptr) {
+    D3D12TestContext context;
+    ASSERT_TRUE(SUCCEEDED(context.Initialize()));
+
+    const auto pixel_shader = CompileShader(R"(
+      cbuffer Color : register(b0) { float value; };
+      float4 main() : SV_Target { return value.xxxx; }
+    )",
+                                            "ps_5_0");
+    ASSERT_TRUE(SUCCEEDED(pixel_shader.result))
+        << pixel_shader.diagnostic_text();
+
+    D3D12_ROOT_PARAMETER parameter = {};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.ShaderRegister = 0;
+    parameter.Constants.Num32BitValues = 1;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = &parameter;
+    root_desc.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    auto root_signature = context.CreateRootSignature(root_desc);
+    ASSERT_TRUE(root_signature);
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+    pipeline_desc.pRootSignature = root_signature.get();
+    pipeline_desc.VS = FullscreenVertexShader();
+    pipeline_desc.PS = {pixel_shader.bytecode->GetBufferPointer(),
+                        pixel_shader.bytecode->GetBufferSize()};
+    auto &blend = pipeline_desc.BlendState.RenderTarget[0];
+    blend.BlendEnable = TRUE;
+    blend.SrcBlend = D3D12_BLEND_ONE;
+    blend.DestBlend = D3D12_BLEND_ONE;
+    blend.BlendOp = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend.DestBlendAlpha = D3D12_BLEND_ONE;
+    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pipeline_desc.SampleMask = UINT_MAX;
+    pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipeline_desc.PrimitiveTopologyType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline_desc.NumRenderTargets = 1;
+    pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pipeline_desc.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pipeline;
+    ASSERT_EQ(context.device()->CreateGraphicsPipelineState(
+                  &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
+              S_OK);
+
+    constexpr UINT kSize = 8;
+    auto target =
+        context.CreateTexture2D(kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto heap =
+        context.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(heap);
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    context.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+    ComPtr<ID3D12QueryHeap> query_heap;
+    ComPtr<ID3D12Resource> query_result;
+    if (sequence == DrawSequence::QueryAroundDraw) {
+      ASSERT_NE(query_samples, nullptr);
+      D3D12_QUERY_HEAP_DESC query_desc = {};
+      query_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+      query_desc.Count = 1;
+      ASSERT_EQ(context.device()->CreateQueryHeap(
+                    &query_desc, IID_PPV_ARGS(query_heap.put())),
+                S_OK);
+      query_result = context.CreateBuffer(
+          sizeof(*query_samples), D3D12_HEAP_TYPE_READBACK,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+      ASSERT_TRUE(query_result);
+    }
+
+    const FLOAT clear[4] = {};
+    context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    context.list()->SetGraphicsRootSignature(root_signature.get());
+    context.list()->SetPipelineState(pipeline.get());
+    context.list()->SetGraphicsRoot32BitConstant(0, 0x3e800000, 0);
+    context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport = {0.0f, 0.0f, kSize, kSize, 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0, kSize, kSize};
+    context.list()->RSSetViewports(1, &viewport);
+    context.list()->RSSetScissorRects(1, &scissor);
+
+    if (sequence == DrawSequence::QueryAroundDraw) {
+      context.list()->BeginQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                 0);
+    }
+    context.list()->DrawInstanced(3, 1, 0, 0);
+    if (sequence == DrawSequence::BarrierBetweenDraws) {
+      D3D12TestContext::UavBarrier(context.list(), nullptr);
+      context.list()->DrawInstanced(3, 1, 0, 0);
+    } else if (sequence == DrawSequence::QueryAroundDraw) {
+      context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+      context.list()->ResolveQueryData(query_heap.get(),
+                                       D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
+                                       query_result.get(), 0);
+    }
+    D3D12TestContext::Transition(context.list(), target.get(),
+                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ASSERT_EQ(context.ReadbackTexture(target.get(), readback), S_OK);
+
+    if (query_result) {
+      UINT64 *mapped = nullptr;
+      const D3D12_RANGE read_range = {0, sizeof(*query_samples)};
+      ASSERT_EQ(
+          query_result->Map(0, &read_range, reinterpret_cast<void **>(&mapped)),
+          S_OK);
+      *query_samples = *mapped;
+      const D3D12_RANGE no_write = {0, 0};
+      query_result->Unmap(0, &no_write);
+    }
+  }
+
+  void ExpectSolidColor(const TextureReadback &readback,
+                        std::uint32_t expected) {
+    for (UINT y = 0; y < readback.height; ++y) {
+      for (UINT x = 0; x < readback.width; ++x) {
+        std::uint32_t pixel = 0;
+        std::memcpy(&pixel,
+                    readback.data.data() + y * readback.row_pitch +
+                        x * sizeof(pixel),
+                    sizeof(pixel));
+        EXPECT_TRUE(ColorsMatch(pixel, expected, 1))
+            << "pixel (" << x << ", " << y << ") was 0x" << std::hex << pixel;
+      }
+    }
   }
 
   static constexpr std::array<std::uint32_t, 8> kInput = {1,  3,  7,   15,
@@ -179,101 +356,129 @@ TEST_F(ExecutionPathBoundarySpec, FlushesPendingBarriers) {
   EXPECT_EQ(actual, (std::vector<std::uint32_t>(kInput.begin(), kInput.end())));
 }
 
-TEST_F(ExecutionPathBoundarySpec, DoesNotReplayDrawTwice) {
+TEST_F(ExecutionPathBoundarySpec, DoesNotDropCopy) {
+  std::vector<std::uint32_t> actual;
+  std::vector<std::uint32_t> copied;
+  ASSERT_NO_FATAL_FAILURE(
+      RunDescriptorDispatch(DispatchPath::NativeCopyNative, &actual, &copied));
+
+  EXPECT_EQ(copied, (std::vector<std::uint32_t>(kInput.begin(), kInput.end())));
+  std::vector<std::uint32_t> expected;
+  expected.reserve(kInput.size());
+  for (const auto value : kInput)
+    expected.push_back(value * 2);
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(ExecutionPathBoundarySpec, PreservesComputeRootState) {
   D3D12TestContext context;
   ASSERT_TRUE(SUCCEEDED(context.Initialize()));
 
-  const auto pixel_shader = CompileShader(R"(
-    cbuffer Color : register(b0) { float value; };
-    float4 main() : SV_Target { return value.xxxx; }
-  )",
-                                          "ps_5_0");
-  ASSERT_TRUE(SUCCEEDED(pixel_shader.result)) << pixel_shader.diagnostic_text();
-
-  D3D12_ROOT_PARAMETER parameter = {};
-  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  parameter.Constants.ShaderRegister = 0;
-  parameter.Constants.Num32BitValues = 1;
-  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = 1;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.Num32BitValues = 1;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[1].DescriptorTable.pDescriptorRanges = &range;
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.NumParameters = 1;
-  root_desc.pParameters = &parameter;
-  root_desc.Flags =
-      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
   auto root_signature = context.CreateRootSignature(root_desc);
   ASSERT_TRUE(root_signature);
+  auto pipeline = context.CreateComputePipeline(
+      root_signature.get(), dxmt::test::ClearBufferComputeShader());
+  ASSERT_TRUE(pipeline);
 
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
-  pipeline_desc.pRootSignature = root_signature.get();
-  pipeline_desc.VS = FullscreenVertexShader();
-  pipeline_desc.PS = {pixel_shader.bytecode->GetBufferPointer(),
-                      pixel_shader.bytecode->GetBufferSize()};
-  auto &blend = pipeline_desc.BlendState.RenderTarget[0];
-  blend.BlendEnable = TRUE;
-  blend.SrcBlend = D3D12_BLEND_ONE;
-  blend.DestBlend = D3D12_BLEND_ONE;
-  blend.BlendOp = D3D12_BLEND_OP_ADD;
-  blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-  blend.DestBlendAlpha = D3D12_BLEND_ONE;
-  blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-  blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  pipeline_desc.SampleMask = UINT_MAX;
-  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  pipeline_desc.NumRenderTargets = 1;
-  pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-  pipeline_desc.SampleDesc.Count = 1;
-  ComPtr<ID3D12PipelineState> pipeline;
-  ASSERT_EQ(context.device()->CreateGraphicsPipelineState(
-                &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
-            S_OK);
-
-  constexpr UINT kSize = 8;
-  auto target =
-      context.CreateTexture2D(kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
-                              D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                              D3D12_RESOURCE_STATE_RENDER_TARGET);
+  constexpr UINT kElementCount = 64;
+  constexpr UINT kValue = 0x13579bdf;
+  constexpr UINT64 kBufferSize = kElementCount * sizeof(UINT);
+  std::array<ComPtr<ID3D12Resource>, 2> outputs;
   auto heap =
-      context.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
-  ASSERT_TRUE(target);
+      context.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                   static_cast<UINT>(outputs.size()), true);
   ASSERT_TRUE(heap);
-  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
-  context.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
-
-  const FLOAT clear[4] = {};
-  context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
-  context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-  context.list()->SetGraphicsRootSignature(root_signature.get());
-  context.list()->SetPipelineState(pipeline.get());
-  context.list()->SetGraphicsRoot32BitConstant(0, 0x3e800000, 0);
-  context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  const D3D12_VIEWPORT viewport = {0.0f, 0.0f, kSize, kSize, 0.0f, 1.0f};
-  const D3D12_RECT scissor = {0, 0, kSize, kSize};
-  context.list()->RSSetViewports(1, &viewport);
-  context.list()->RSSetScissorRects(1, &scissor);
-
-  // State and clear records form a fallback segment, the draw is compiled,
-  // and the transition returns to fallback. Additive blending exposes replay.
-  context.list()->DrawInstanced(3, 1, 0, 0);
-  D3D12TestContext::Transition(context.list(), target.get(),
-                               D3D12_RESOURCE_STATE_RENDER_TARGET,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
-
-  TextureReadback readback;
-  ASSERT_EQ(context.ReadbackTexture(target.get(), &readback), S_OK);
-  constexpr std::uint32_t kQuarterGray = 0x40404040;
-  for (UINT y = 0; y < kSize; ++y) {
-    for (UINT x = 0; x < kSize; ++x) {
-      std::uint32_t pixel = 0;
-      std::memcpy(&pixel,
-                  readback.data.data() + y * readback.row_pitch +
-                      x * sizeof(pixel),
-                  sizeof(pixel));
-      EXPECT_TRUE(ColorsMatch(pixel, kQuarterGray, 1))
-          << "pixel (" << x << ", " << y << ") was 0x" << std::hex << pixel;
-    }
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_UINT;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = kElementCount;
+  for (UINT index = 0; index < outputs.size(); ++index) {
+    outputs[index] =
+        context.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ASSERT_TRUE(outputs[index]);
+    context.device()->CreateUnorderedAccessView(
+        outputs[index].get(), nullptr, &uav,
+        context.CpuDescriptorHandle(heap.get(), index));
   }
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context.list()->SetDescriptorHeaps(1, heaps);
+  const UINT clear[4] = {};
+  for (UINT index = 0; index < outputs.size(); ++index) {
+    context.list()->ClearUnorderedAccessViewUint(
+        context.GpuDescriptorHandle(heap.get(), index),
+        context.CpuDescriptorHandle(heap.get(), index), outputs[index].get(),
+        clear, 0, nullptr);
+  }
+  context.list()->SetComputeRootSignature(root_signature.get());
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->SetComputeRoot32BitConstant(0, kValue, 0);
+  context.list()->SetComputeRootDescriptorTable(
+      1, context.GpuDescriptorHandle(heap.get(), 0));
+  context.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(context.list(), outputs[0].get());
+  context.list()->SetComputeRootDescriptorTable(
+      1, context.GpuDescriptorHandle(heap.get(), 1));
+  context.list()->Dispatch(1, 1, 1);
+
+  auto readback = context.CreateBuffer(
+      2 * kBufferSize, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(readback);
+  for (UINT index = 0; index < outputs.size(); ++index) {
+    D3D12TestContext::Transition(context.list(), outputs[index].get(),
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+    context.list()->CopyBufferRegion(readback.get(), index * kBufferSize,
+                                     outputs[index].get(), 0, kBufferSize);
+  }
+  ASSERT_EQ(context.ExecuteAndWait(), S_OK);
+
+  UINT *mapped = nullptr;
+  const D3D12_RANGE read_range = {0, 2 * kBufferSize};
+  ASSERT_EQ(readback->Map(0, &read_range, reinterpret_cast<void **>(&mapped)),
+            S_OK);
+  for (UINT index = 0; index < 2 * kElementCount; ++index)
+    EXPECT_EQ(mapped[index], kValue) << "element " << index;
+  const D3D12_RANGE no_write = {0, 0};
+  readback->Unmap(0, &no_write);
+}
+
+TEST_F(ExecutionPathBoundarySpec, DoesNotReplayDrawTwice) {
+  TextureReadback readback;
+  ASSERT_NO_FATAL_FAILURE(RunAdditiveDraws(DrawSequence::Single, &readback));
+  ExpectSolidColor(readback, 0x40404040);
+}
+
+TEST_F(ExecutionPathBoundarySpec, PreservesGraphicsRootState) {
+  TextureReadback readback;
+  ASSERT_NO_FATAL_FAILURE(
+      RunAdditiveDraws(DrawSequence::BarrierBetweenDraws, &readback));
+  ExpectSolidColor(readback, 0x80808080);
+}
+
+TEST_F(ExecutionPathBoundarySpec, PreservesQueryState) {
+  TextureReadback readback;
+  UINT64 samples = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RunAdditiveDraws(DrawSequence::QueryAroundDraw, &readback, &samples));
+
+  EXPECT_GT(samples, 0ull);
+  ExpectSolidColor(readback, 0x40404040);
 }
 
 } // namespace
