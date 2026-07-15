@@ -45,6 +45,9 @@ d3d12_unit_suites = {
       'descriptor/table_binding_spec.cpp',
     ),
   },
+  'execution': {
+    'sources': files('execution/path_boundary_spec.cpp'),
+  },
   'pipeline': {
     'sources': files('pipeline/stream_spec.cpp'),
   },
@@ -87,6 +90,12 @@ d3d12_unit_suites = {
   },
   'resource': {
     'sources': files('resource/resource_spec.cpp'),
+  },
+  'shader': {
+    'sources': files(
+      'shader/container_corruption_spec.cpp',
+      'shader/wave_spec.cpp',
+    ),
   },
   'sparse-resource': {
     'sources': files('resource/sparse_resource_spec.cpp'),
