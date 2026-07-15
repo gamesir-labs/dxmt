@@ -1123,6 +1123,7 @@ public:
   bool UpdateTileMapping(UINT subresource, UINT x, UINT y, UINT z,
                          ID3D12Heap *heap, bool mapped,
                          UINT64 heap_tile) override {
+    std::lock_guard lock(tile_mapping_mutex_);
     if (!has_tiling_ || subresource >= tiling_.subresources.size())
       return false;
     const auto &tile = tiling_.subresources[subresource];
@@ -1148,6 +1149,7 @@ public:
 
   bool UpdateTileMappingByIndex(UINT tile_index, ID3D12Heap *heap,
                                 bool mapped, UINT64 heap_tile) override {
+    std::lock_guard lock(tile_mapping_mutex_);
     if (!has_tiling_ || tile_index >= tile_map_.size())
       return false;
     if (mapped) {
@@ -1163,6 +1165,7 @@ public:
 
   bool GetTileMapping(UINT subresource, UINT x, UINT y, UINT z,
                       ResourceTileMapping &mapping) const override {
+    std::lock_guard lock(tile_mapping_mutex_);
     mapping = {};
     mapping.heap_tile = -1;
     if (!has_tiling_ || subresource >= tiling_.subresources.size())
@@ -1183,6 +1186,7 @@ public:
 
   bool GetTileMappingByIndex(UINT tile_index,
                              ResourceTileMapping &mapping) const override {
+    std::lock_guard lock(tile_mapping_mutex_);
     mapping = {};
     mapping.heap_tile = -1;
     if (!has_tiling_ || tile_index >= tile_map_.size())
@@ -2109,6 +2113,7 @@ private:
   bool ReplayReservedTextureMappings() {
     if (!uses_placement_sparse_)
       return true;
+    std::lock_guard lock(tile_mapping_mutex_);
     if (!has_tiling_ || tile_map_.empty() || !texture_allocation_)
       return true;
 
@@ -2418,6 +2423,7 @@ private:
   bool has_tiling_ = false;
   bool uses_placement_sparse_ = false;
   ResourceTiling tiling_ = {};
+  mutable dxmt::mutex tile_mapping_mutex_;
   std::vector<ResourceTileMapping> tile_map_;
   std::atomic<uint64_t> tile_mapping_generation_ = {0};
   Rc<dxmt::Buffer> buffer_;

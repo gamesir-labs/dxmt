@@ -4407,22 +4407,8 @@ public:
       dxmt::apitrace::record_sparse_texture_mapping_ops(
           this, resource, heap, "UpdateTileMappings fully-backed fallback",
           ops.data(), ops.size());
-      Com<ID3D12Resource> resource_ref = resource;
-      Com<ID3D12Heap> heap_ref = heap;
-      auto tiling_copy = *tiling;
-      PendingOperation op = {};
-      op.type = PendingOperationType::QueueWork;
-      op.queue_work = [resource_ref, heap_ref,
-                       tiling_copy = std::move(tiling_copy),
-                       ops = std::move(ops)](CommandChunk *) mutable {
-        if (auto *resource_object =
-                dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
-          ApplySparseTileMappingOpsToResource(
-              *resource_object, tiling_copy, heap_ref.ptr(), ops);
-        }
-        return false;
-      };
-      EnqueuePendingOperation(std::move(op), nullptr);
+      ApplySparseTileMappingOpsToResource(*resource_object, *tiling, heap,
+                                          ops);
       dxmt::perf::recordTileMapping(
           perf_delta.standard_ops, perf_delta.packed_ops,
           perf_delta.map_ops, perf_delta.unmap_ops, 0, 0, 0);
@@ -4492,21 +4478,8 @@ public:
       }
     }
 
+    ApplySparseTileMappingOpsToResource(*resource_object, *tiling, heap, ops);
     if (!has_map && !resource_object->GetTextureAllocation()) {
-      Com<ID3D12Resource> resource_ref = resource;
-      auto tiling_copy = *tiling;
-      PendingOperation op = {};
-      op.type = PendingOperationType::QueueWork;
-      op.queue_work = [resource_ref, tiling_copy = std::move(tiling_copy),
-                       ops = std::move(ops)](CommandChunk *) mutable {
-        if (auto *resource_object =
-                dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
-          ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
-                                              nullptr, ops);
-        }
-        return false;
-      };
-      EnqueuePendingOperation(std::move(op), nullptr);
       dxmt::perf::recordTileMapping(
           perf_delta.standard_ops, perf_delta.packed_ops,
           perf_delta.map_ops, perf_delta.unmap_ops, 0, 0, 0);
@@ -4533,14 +4506,13 @@ public:
         this, resource, heap, "UpdateTileMappings", ops.data(), ops.size());
     Com<ID3D12Resource> resource_ref = resource;
     Com<ID3D12Heap> heap_ref = heap;
-    auto tiling_copy = *tiling;
     Rc<Texture> barrier_texture = Rc<Texture>(resource_object->GetTexture());
     PendingOperation op = {};
     op.type = PendingOperationType::QueueWork;
     op.queue_work = [texture, placement_heap,
                      ops = std::move(ops), resource_ref,
-                     tiling_copy = std::move(tiling_copy), heap_ref,
-                     has_map, barrier_texture = std::move(barrier_texture),
+                     heap_ref, has_map,
+                     barrier_texture = std::move(barrier_texture),
                      barrier_subresources = std::move(barrier_subresources),
                      sparse_resource_identity, sparse_gpu_resource_id,
                      sparse_mapping_generation, sparse_operation_count,
@@ -4552,9 +4524,8 @@ public:
           sparse_mapping_generation, sparse_operation_count, sparse_map_count,
           sparse_unmap_count, barrier_subresources.empty() ? 0 : 1);
       chunk->emitcc([texture, placement_heap,
-                     ops = std::move(ops), resource_ref,
-                     tiling_copy = std::move(tiling_copy), heap_ref,
-                     has_map, chunk](
+                     ops = std::move(ops), resource_ref, heap_ref, has_map,
+                     chunk](
                         ArgumentEncodingContext &enc) mutable {
         if (!enc.queue().UpdateSparseTextureMappings(
                 texture, placement_heap, ops.data(), ops.size())) {
@@ -4575,8 +4546,6 @@ public:
         }
         if (auto *resource_object =
                 dynamic_cast<d3d12::Resource *>(resource_ref.ptr())) {
-          ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
-                                              heap_ref.ptr(), ops);
           chunk->completeSparseMappingDiagnostic(
               resource_object->GetTileMappingGeneration(), true);
         } else {
@@ -4650,30 +4619,51 @@ public:
       return;
     }
 
-    std::unordered_map<ID3D12Heap *, std::vector<WMTSparseTextureMappingOperation>> map_ops;
+    std::vector<SparseTileCoordinate> src_coordinates;
+    std::vector<SparseTileCoordinate> dst_coordinates;
+    const bool src_ok = ForEachLogicalTileInRegion(
+        *src_tiling, *src_start, region_size,
+        [&](const SparseTileCoordinate &coordinate) {
+          src_coordinates.push_back(coordinate);
+          return true;
+        });
+    const bool dst_ok = ForEachLogicalTileInRegion(
+        *dst_tiling, *dst_start, region_size,
+        [&](const SparseTileCoordinate &coordinate) {
+          dst_coordinates.push_back(coordinate);
+          return true;
+        });
+    if (!src_ok || !dst_ok || src_coordinates.size() != dst_coordinates.size()) {
+      WARN("D3D12CommandQueue: TODO CopyTileMappings invalid or incompatible region"
+           " dst=", dst_resource,
+           " src=", src_resource,
+           " dstSubresource=", dst_start->Subresource,
+           " srcSubresource=", src_start->Subresource,
+           " useBox=", region_size ? region_size->UseBox : 0,
+           " numTiles=", region_size ? region_size->NumTiles : 1);
+      return;
+    }
+    std::unordered_map<ID3D12Heap *,
+                       std::vector<WMTSparseTextureMappingOperation>> map_ops;
     std::vector<WMTSparseTextureMappingOperation> unmap_ops;
-    D3D12_TILED_RESOURCE_COORDINATE dst_cursor = *dst_start;
-    bool ok = ForEachLogicalTileInRegion(*src_tiling, *src_start, region_size,
-                                  [&](const SparseTileCoordinate &src_coord) {
-      SparseTileCoordinate dst_coord = {};
-      if (!ResolveSparseTileCoordinate(*dst_tiling, dst_cursor, dst_coord))
-        return false;
-      const auto &dst_sub = dst_tiling->subresources[dst_coord.subresource];
-
+    for (size_t i = 0; i < src_coordinates.size(); ++i) {
       ResourceTileMapping mapping = {};
-      if (!GetSparseTileMapping(*src, src_coord, mapping))
-        return false;
-
+      if (!GetSparseTileMapping(*src, src_coordinates[i], mapping))
+        return;
+      const auto &coordinate = dst_coordinates[i];
+      const auto &subresource =
+          dst_tiling->subresources[coordinate.subresource];
       WMTSparseTextureMappingOperation op = {};
       op.mode = mapping.heap && mapping.heap_tile >= 0
                     ? WMTSparseTextureMappingModeMap
                     : WMTSparseTextureMappingModeUnmap;
-      op.level = dst_coord.packed ? dst_tiling->packed_mip_info.NumStandardMips
-                                  : dst_sub.mip_level;
-      op.slice = dst_sub.array_slice;
-      op.x = dst_coord.packed ? 0 : dst_coord.x;
-      op.y = dst_coord.packed ? 0 : dst_coord.y;
-      op.z = dst_coord.packed ? 0 : dst_coord.z;
+      op.level = coordinate.packed
+                     ? dst_tiling->packed_mip_info.NumStandardMips
+                     : subresource.mip_level;
+      op.slice = subresource.array_slice;
+      op.x = coordinate.packed ? 0 : coordinate.x;
+      op.y = coordinate.packed ? 0 : coordinate.y;
+      op.z = coordinate.packed ? 0 : coordinate.z;
       op.width = 1;
       op.height = 1;
       op.depth = 1;
@@ -4685,20 +4675,6 @@ public:
         map_ops[mapping.heap.ptr()].push_back(op);
       else
         unmap_ops.push_back(op);
-
-      if (!AdvanceLogicalTileCoordinate(*dst_tiling, dst_cursor))
-        dst_cursor.Subresource = UINT(dst_tiling->subresources.size());
-      return true;
-    });
-    if (!ok) {
-      WARN("D3D12CommandQueue: TODO CopyTileMappings invalid or incompatible region"
-           " dst=", dst_resource,
-           " src=", src_resource,
-           " dstSubresource=", dst_start->Subresource,
-           " srcSubresource=", src_start->Subresource,
-           " useBox=", region_size ? region_size->UseBox : 0,
-           " numTiles=", region_size ? region_size->NumTiles : 1);
-      return;
     }
 
     if (!map_ops.empty() && !dst->EnsureTextureAllocation("CopyTileMappings")) {
@@ -4707,86 +4683,78 @@ public:
            " src=", src_resource);
       return;
     }
-    if (map_ops.empty() && !dst->GetTextureAllocation()) {
-      Com<ID3D12Resource> dst_ref = dst_resource;
-      auto tiling_copy = *dst_tiling;
-      PendingOperation op = {};
-      op.type = PendingOperationType::QueueWork;
-      op.queue_work = [dst_ref, tiling_copy = std::move(tiling_copy),
-                       ops = std::move(unmap_ops)](CommandChunk *) mutable {
-        if (auto *dst = dynamic_cast<d3d12::Resource *>(dst_ref.ptr()))
-          ApplySparseTileMappingOpsToResource(*dst, tiling_copy, nullptr, ops);
-        return false;
-      };
-      EnqueuePendingOperation(std::move(op), nullptr);
-      return;
+    std::unordered_map<ID3D12Heap *, WMT::Heap> placement_heaps;
+    for (const auto &entry : map_ops) {
+      auto *heap_object = dynamic_cast<d3d12::Heap *>(entry.first);
+      WMT::Heap placement_heap = {};
+      if (!heap_object ||
+          !(placement_heap = heap_object->GetPlacementHeap())) {
+        WARN("D3D12CommandQueue: TODO CopyTileMappings failed to get placement heap"
+             " heap=", entry.first,
+             " dst=", dst_resource,
+             " ops=", entry.second.size());
+        return;
+      }
+      placement_heaps.emplace(entry.first, placement_heap);
     }
+    if (!unmap_ops.empty())
+      ApplySparseTileMappingOpsToResource(*dst, *dst_tiling, nullptr,
+                                          unmap_ops);
+    for (const auto &entry : map_ops)
+      ApplySparseTileMappingOpsToResource(*dst, *dst_tiling, entry.first,
+                                          entry.second);
+    if (map_ops.empty() && !dst->GetTextureAllocation())
+      return;
 
     auto texture = dst->GetTextureAllocation()->texture();
     Com<ID3D12Resource> dst_ref = dst_resource;
-    auto tiling_copy = *dst_tiling;
     std::vector<std::function<void(CommandChunk *)>> sparse_groups;
-    auto emit_ops = [&](ID3D12Heap *heap, std::vector<WMTSparseTextureMappingOperation> ops) {
+    auto emit_ops = [&](ID3D12Heap *heap, WMT::Heap placement_heap,
+                        std::vector<WMTSparseTextureMappingOperation> ops) {
+      Com<ID3D12Heap> heap_ref = heap;
       dxmt::apitrace::record_sparse_texture_mapping_ops(
           this, dst_resource, heap, "CopyTileMappings", ops.data(), ops.size());
-      Com<ID3D12Heap> heap_ref = heap;
-      WMT::Heap placement_heap = {};
       auto barrier_subresources = CollectSparseTileBarrierSubresources(ops);
-      if (heap) {
-        auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
-        if (!heap_object || !(placement_heap = heap_object->GetPlacementHeap())) {
-          WARN("D3D12CommandQueue: TODO CopyTileMappings failed to get placement heap"
-               " heap=", heap,
-               " dst=", dst_resource,
-               " ops=", ops.size());
-          return;
-        }
-      }
       Rc<Texture> barrier_texture = Rc<Texture>(dst->GetTexture());
       sparse_groups.push_back(
-          [texture, placement_heap,
-           dst_ref, heap_ref, tiling_copy, ops = std::move(ops),
+          [texture, placement_heap, dst_ref, heap_ref,
+           ops = std::move(ops),
            barrier_texture = std::move(barrier_texture),
            barrier_subresources = std::move(barrier_subresources)](
               CommandChunk *chunk) mutable {
-            chunk->emitcc([texture, placement_heap, dst_ref, heap_ref,
-                           tiling_copy, ops = std::move(ops)](
-                              ArgumentEncodingContext &enc) mutable {
-              if (!enc.queue().UpdateSparseTextureMappings(
-                      texture, placement_heap, ops.data(), ops.size())) {
-                WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
-                     " dst=", dst_ref.ptr(),
-                     " heap=", heap_ref.ptr(),
-                     " ops=", ops.size());
-                return;
-              }
-              if (auto *dst =
-                      dynamic_cast<d3d12::Resource *>(dst_ref.ptr())) {
-                ApplySparseTileMappingOpsToResource(*dst, tiling_copy,
-                                                    heap_ref.ptr(), ops);
-              }
-            });
-            EmitSparseTextureMappingBarrier(
-                chunk, std::move(barrier_texture),
-                std::move(barrier_subresources));
-          });
+        chunk->emitcc([texture, placement_heap, dst_ref, heap_ref,
+                       ops = std::move(ops)](
+                          ArgumentEncodingContext &enc) mutable {
+          if (!enc.queue().UpdateSparseTextureMappings(
+                  texture, placement_heap, ops.data(), ops.size())) {
+            WARN("D3D12CommandQueue: TODO Metal4 CopyTileMappings failed"
+                 " dst=", dst_ref.ptr(),
+                 " heap=", heap_ref.ptr(),
+                 " ops=", ops.size());
+          }
+        });
+        EmitSparseTextureMappingBarrier(
+            chunk, std::move(barrier_texture),
+            std::move(barrier_subresources));
+      });
     };
 
     if (!unmap_ops.empty())
-      emit_ops(nullptr, std::move(unmap_ops));
+      emit_ops(nullptr, {}, std::move(unmap_ops));
     for (auto &entry : map_ops)
-      emit_ops(entry.first, std::move(entry.second));
-    if (!sparse_groups.empty()) {
-      PendingOperation op = {};
-      op.type = PendingOperationType::QueueWork;
-      op.queue_work = [sparse_groups = std::move(sparse_groups)](
-                          CommandChunk *chunk) mutable {
-        for (auto &emit_group : sparse_groups)
-          emit_group(chunk);
-        return true;
-      };
-      EnqueuePendingOperation(std::move(op), nullptr);
-    }
+      emit_ops(entry.first, placement_heaps.at(entry.first),
+               std::move(entry.second));
+    if (sparse_groups.empty())
+      return;
+    PendingOperation pending = {};
+    pending.type = PendingOperationType::QueueWork;
+    pending.queue_work = [sparse_groups = std::move(sparse_groups)](
+                             CommandChunk *chunk) mutable {
+      for (auto &emit_group : sparse_groups)
+        emit_group(chunk);
+      return true;
+    };
+    EnqueuePendingOperation(std::move(pending), nullptr);
   }
 
   void STDMETHODCALLTYPE ExecuteCommandLists(UINT command_list_count,
