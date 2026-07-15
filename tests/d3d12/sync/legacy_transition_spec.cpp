@@ -68,4 +68,12 @@ TEST_F(LegacyBarrierSpec, EntryBoundary32) { TestEntryBoundary(32); }
 
 TEST_F(LegacyBarrierSpec, EntryBoundary33) { TestEntryBoundary(33); }
 
+TEST_F(LegacyBarrierSpec, EntryBoundary64) { TestEntryBoundary(64); }
+
+TEST_F(LegacyBarrierSpec, EntryBoundary255) { TestEntryBoundary(255); }
+
+TEST_F(LegacyBarrierSpec, EntryBoundary256) { TestEntryBoundary(256); }
+
+TEST_F(LegacyBarrierSpec, EntryBoundary257) { TestEntryBoundary(257); }
+
 } // namespace
