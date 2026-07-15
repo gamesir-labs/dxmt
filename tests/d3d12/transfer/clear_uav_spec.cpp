@@ -169,6 +169,39 @@ TEST_F(ClearUavSpec, ClearTypedBufferFloat) {
   EXPECT_EQ(std::memcmp(bytes.data(), expected.data(), bytes.size()), 0);
 }
 
+TEST_F(ClearUavSpec, ClearTypedFloat2Buffer) {
+  std::array<std::uint32_t, 8> expected;
+  expected.fill(std::bit_cast<std::uint32_t>(9.0f));
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+  desc.Format = DXGI_FORMAT_R32G32_FLOAT;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  desc.Buffer.FirstElement = 1;
+  desc.Buffer.NumElements = 2;
+  auto uav = CreateBufferUav(desc, expected);
+  ASSERT_TRUE(uav.resource);
+  ASSERT_TRUE(uav.heap);
+  constexpr std::array<FLOAT, 4> clear = {0.25f, -2.0f, 3.0f, 4.0f};
+  for (UINT element = 1; element < 3; ++element) {
+    expected[element * 2] = std::bit_cast<std::uint32_t>(clear[0]);
+    expected[element * 2 + 1] = std::bit_cast<std::uint32_t>(clear[1]);
+  }
+  ID3D12DescriptorHeap *heaps[] = {uav.heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->ClearUnorderedAccessViewFloat(
+      uav.heap->GetGPUDescriptorHandleForHeapStart(),
+      uav.heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
+      clear.data(), 0, nullptr);
+  D3D12TestContext::Transition(context_.list(), uav.resource.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> bytes;
+  ASSERT_TRUE(SUCCEEDED(context_.ReadbackBuffer(
+      uav.resource.get(), expected.size() * sizeof(expected[0]), &bytes)));
+  ASSERT_EQ(bytes.size(), expected.size() * sizeof(expected[0]));
+  EXPECT_EQ(std::memcmp(bytes.data(), expected.data(), bytes.size()), 0);
+}
+
 TEST_F(ClearUavSpec, ClearRawBuffer) {
   std::array<std::uint32_t, 8> expected;
   expected.fill(0xdeadbeef);
@@ -388,6 +421,37 @@ TEST_F(ClearUavSpec, ClearWithDistinctCpuAndGpuDescriptors) {
     for (UINT x = 0; x < readback.width; ++x)
       EXPECT_EQ(UintPixel(readback, x, y), clear[0]);
   }
+}
+
+TEST_F(ClearUavSpec, RejectsDescriptorResourceMismatch) {
+  std::array<std::uint32_t, 8> initial;
+  initial.fill(0xdeadbeef);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  desc.Buffer.NumElements = initial.size();
+  auto descriptor_resource = CreateBufferUav(desc, initial);
+  auto target_resource = CreateBufferUav(desc, initial);
+  ASSERT_TRUE(descriptor_resource.resource);
+  ASSERT_TRUE(descriptor_resource.heap);
+  ASSERT_TRUE(target_resource.resource);
+  ID3D12DescriptorHeap *heaps[] = {descriptor_resource.heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  constexpr std::array<UINT, 4> clear = {0x10203040, 2, 3, 4};
+  context_.list()->ClearUnorderedAccessViewUint(
+      descriptor_resource.heap->GetGPUDescriptorHandleForHeapStart(),
+      descriptor_resource.heap->GetCPUDescriptorHandleForHeapStart(),
+      target_resource.resource.get(), clear.data(), 0, nullptr);
+  D3D12TestContext::Transition(context_.list(), target_resource.resource.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> bytes;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.ReadbackBuffer(target_resource.resource.get(),
+                              initial.size() * sizeof(initial[0]), &bytes)));
+  ASSERT_EQ(bytes.size(), initial.size() * sizeof(initial[0]));
+  EXPECT_EQ(std::memcmp(bytes.data(), initial.data(), bytes.size()), 0);
 }
 
 } // namespace

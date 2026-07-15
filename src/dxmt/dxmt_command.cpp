@@ -922,7 +922,7 @@ void
 ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer) {
 
   clearing_buffer_ = buffer;
-  clearing_view_ = 0;
+  clearing_view_.reset();
   ctx_.startComputePass(0);
 
   setClearColor(color, raw_buffer_is_integer);
@@ -937,7 +937,7 @@ void
 ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, bool) {
 
   clearing_buffer_ = buffer;
-  clearing_view_ = 0;
+  clearing_view_.reset();
   ctx_.startComputePass(0);
 
   setClearColor(color);
@@ -956,14 +956,14 @@ ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t
   meta_temp_.size[1] = height;
 
   if (clearing_texture_) {
-    auto &dst_ = ctx_.access(clearing_texture_, clearing_view_, ResourceAccess::Write);
+    auto &dst_ = ctx_.access(clearing_texture_, *clearing_view_, ResourceAccess::Write);
     auto &settex = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
     settex.type = WMTComputeCommandSetTexture;
     settex.texture = dst_.texture;
     settex.index = 0;
   } else if (clearing_buffer_) {
     if (clearing_view_) {
-      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, clearing_view_, ResourceAccess::Write);
+      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, *clearing_view_, ResourceAccess::Write);
       auto &settexbuf = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
       settexbuf.type = WMTComputeCommandSetTexture;
       settexbuf.texture = dst_.texture;
@@ -1004,7 +1004,7 @@ ClearResourceKernelContext::end() {
   ctx_.endPass();
   clearing_texture_ = nullptr;
   clearing_buffer_ = nullptr;
-  clearing_view_ = 0;
+  clearing_view_.reset();
   dispatch_depth_ = 1;
 };
 

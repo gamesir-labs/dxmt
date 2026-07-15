@@ -392,7 +392,7 @@ private:
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_float_;
   Rc<Texture> clearing_texture_;
   Rc<Buffer> clearing_buffer_;
-  TextureViewKey clearing_view_ = 0; // type compatible with BufferViewKey
+  std::optional<TextureViewKey> clearing_view_;
   uint32_t dispatch_depth_ = 1;
 
   struct DXMTClearMetadata {

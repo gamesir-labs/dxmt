@@ -21252,6 +21252,7 @@ private:
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
       UINT view_first_element_bias = 0;
+      UINT view_element_count = 0;
       bool has_buffer_view = false;
       bool raw_buffer = false;
 
@@ -21281,6 +21282,8 @@ private:
               if (view) {
                 view_id = view->key;
                 view_first_element_bias = view->firstElementBias;
+                view_element_count = UINT(std::min<UINT64>(
+                    byte_size / format.BytesPerTexel, UINT_MAX));
                 has_buffer_view = true;
               }
             }
@@ -21303,8 +21306,11 @@ private:
       }
 
       Rc<Buffer> buffer = resource->GetBuffer();
-      const UINT element_count =
-          UINT(std::min<UINT64>(byte_size / sizeof(uint32_t), UINT_MAX));
+      const UINT element_count = has_buffer_view
+                                     ? view_element_count
+                                     : UINT(std::min<UINT64>(
+                                           byte_size / sizeof(uint32_t),
+                                           UINT_MAX));
       if (!element_count)
         return;
       chunk->emitcc([buffer = std::move(buffer), view_id,

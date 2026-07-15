@@ -2307,6 +2307,10 @@ public:
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (!descriptor || descriptor->type != DescriptorRecordType::UnorderedAccessView)
       return;
+    if (descriptor->resource.ptr() != resource) {
+      WARN("D3D12CommandList: ClearUnorderedAccessViewUint resource does not match descriptor");
+      return;
+    }
 
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_clear_unordered_access_view_uint(
@@ -2335,6 +2339,10 @@ public:
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (!descriptor || descriptor->type != DescriptorRecordType::UnorderedAccessView)
       return;
+    if (descriptor->resource.ptr() != resource) {
+      WARN("D3D12CommandList: ClearUnorderedAccessViewFloat resource does not match descriptor");
+      return;
+    }
 
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_clear_unordered_access_view_float(
