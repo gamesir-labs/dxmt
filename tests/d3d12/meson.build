@@ -48,6 +48,13 @@ d3d12_unit_suites = {
   'execution': {
     'sources': files('execution/path_boundary_spec.cpp'),
   },
+  'graphics': {
+    'sources': files(
+      'graphics/blend_spec.cpp',
+      'graphics/depth_stencil_spec.cpp',
+      'graphics/input_assembler_spec.cpp',
+    ),
+  },
   'pipeline': {
     'sources': files('pipeline/stream_spec.cpp'),
   },
