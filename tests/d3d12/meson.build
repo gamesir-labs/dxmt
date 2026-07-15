@@ -53,6 +53,7 @@ d3d12_unit_suites = {
       'graphics/blend_spec.cpp',
       'graphics/depth_stencil_spec.cpp',
       'graphics/input_assembler_spec.cpp',
+      'graphics/output_merger_spec.cpp',
     ),
   },
   'pipeline': {
