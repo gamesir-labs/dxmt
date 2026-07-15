@@ -46,6 +46,9 @@ d3d12_unit_suites = {
       'command/state_machine_spec.cpp',
     ),
   },
+  'compute': {
+    'sources': files('compute/dispatch_spec.cpp'),
+  },
   'descriptor': {
     'sources': files(
       'descriptor/bindless_graphics_stage_spec.cpp',
