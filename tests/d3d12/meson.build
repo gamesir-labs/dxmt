@@ -68,6 +68,7 @@ d3d12_unit_suites = {
     'sources': files(
       'query/indirect_draw_spec.cpp',
       'query/indirect_spec.cpp',
+      'query/occlusion_spec.cpp',
       'query/predication_spec.cpp',
       'query/query_heap_spec.cpp',
       'query/timestamp_spec.cpp',
@@ -85,6 +86,7 @@ d3d12_unit_suites = {
   },
   'sync': {
     'sources': files(
+      'sync/aliasing_barrier_spec.cpp',
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/promotion_decay_spec.cpp',

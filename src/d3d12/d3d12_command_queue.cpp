@@ -6905,9 +6905,10 @@ private:
           std::max<uint64_t>(timers.blitBarrierPendingEntriesMax, pending);
     }
     auto &pending = state.pending_resource_barriers;
+    if (pending.needs_separator)
+      return TakePendingResourceBarrierBatch(state);
+
     ResourceAccessBarrierBatch matched;
-    matched.needs_separator = pending.needs_separator;
-    pending.needs_separator = false;
 
     const bool use_resource_index = !pending.entry_index.empty();
     if (!use_resource_index) {
@@ -10785,12 +10786,10 @@ private:
   void ReplayAliasingBarrier(ReplayState &state,
                              const StoredResourceBarrier &barrier,
                              ResourceAccessBarrierBatch &batch) {
-    bool touched = false;
     if (auto *before = GetResource(barrier.resource_before.ptr())) {
       AddResourceAccessBarrier(batch, *before, 0,
                                GetSubresourceCount(*before),
                                ResourceAccess::All);
-      touched = true;
     } else if (barrier.resource_before) {
       WARN("D3D12CommandQueue: aliasing barrier has foreign before resource");
     }
@@ -10800,13 +10799,11 @@ private:
       TouchReplayResource(state, after->GetD3D12Resource());
       AddResourceAccessBarrier(batch, *after, 0, GetSubresourceCount(*after),
                                ResourceAccess::All);
-      touched = true;
     } else if (barrier.resource_after) {
       WARN("D3D12CommandQueue: aliasing barrier has foreign after resource");
     }
 
-    if (!touched)
-      batch.needs_separator = true;
+    batch.needs_separator = true;
   }
 
   void AddResourceAccessBarrier(ResourceAccessBarrierBatch &batch,

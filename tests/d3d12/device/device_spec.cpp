@@ -5,6 +5,7 @@
 #include <d3d12.h>
 #include <dxgi.h>
 
+#include "d3d12_pipeline_stream.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 
 #include <array>
@@ -15,6 +16,8 @@
 #include <string>
 
 namespace {
+
+using dxmt::test::ShaderPipelineSubobject;
 
 template <typename T> void release_object(T*& object) {
   if (object) {
