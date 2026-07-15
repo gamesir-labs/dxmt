@@ -237,8 +237,8 @@ void handle_signature_vs(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
-        .user = sig.consistentAttributeName(),
-        .type = to_msl_type(sig.componentType()),
+        .user = sig.fullSemanticString(),
+        .type = to_msl_type(sig.componentType(), sig.mask() & mask),
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
@@ -420,11 +420,12 @@ void handle_signature_ps(
     });
     max_input_register = std::max(reg + 1, max_input_register);
     if (sig.mask() == 0) break;
-    signature_handlers.push_back([=, type = sig.componentType(), name = sig.consistentAttributeName()]
+    signature_handlers.push_back([=, type = sig.componentType(), name = sig.fullSemanticString()]
     (SignatureContext &ctx) {
       bool pull_mode = bool(ctx.pull_mode_reg_mask & (1 << reg)) && interpolation != air::Interpolation::flat;
       auto assigned_index = ctx.func_signature.DefineInput(InputFragmentStageIn{
-        .user = name, .type = to_msl_type(type), .interpolation = interpolation, .pull_mode = pull_mode
+        .user = name, .type = to_msl_type(type, sig.mask() & mask),
+        .interpolation = interpolation, .pull_mode = pull_mode
       });
       if (pull_mode) {
         assert(type == RegisterComponentType::Float && "otherwise the input register contains mixed data type");
@@ -915,9 +916,9 @@ void handle_signature_ds(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
-      auto const type = to_msl_type(sig.componentType());
+      auto const type = to_msl_type(sig.componentType(), sig.mask() & mask);
       func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.consistentAttributeName(),
+        .user = sig.fullSemanticString(),
         .type = type,
         .index = mesh_vertex_data_index
       });
@@ -1145,9 +1146,9 @@ handle_signature_gs(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
-      auto const type = to_msl_type(sig.componentType());
+      auto const type = to_msl_type(sig.componentType(), sig.mask() & mask);
       func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.consistentAttributeName(),
+        .user = sig.fullSemanticString(),
         .type = type,
         .index = mesh_vertex_data_index
       });

@@ -66,67 +66,40 @@ auto get_float4_splat(float value) -> IRValue {
   });
 };
 
-auto extend_to_vec4(pvalue value) {
-  return make_irvalue([=](context ctx) {
-    auto ty = value->getType();
-    if (ty->isVectorTy()) {
-      auto vecTy = llvm::cast<llvm::FixedVectorType>(ty);
-      if (vecTy->getNumElements() == 4)
-        return ctx.builder.CreateShuffleVector(value, {0, 1, 2, 3});
-      if (vecTy->getNumElements() == 3)
-        return ctx.builder.CreateShuffleVector(value, {0, 1, 2, 2});
-      if (vecTy->getNumElements() == 2)
-        return ctx.builder.CreateShuffleVector(value, {0, 1, 1, 1});
-      if (vecTy->getNumElements() == 1)
-        return ctx.builder.CreateShuffleVector(value, {0, 0, 0, 0});
-      assert(0 && "?");
-    } else {
-      return ctx.builder.CreateVectorSplat(4, value);
-    }
-  });
-}
-
 auto to_desired_type_from_int_vec4(pvalue vec4, llvm::Type *desired, uint32_t mask) {
   return make_irvalue([=](context ctx) {
     assert(vec4->getType() == ctx.types._int4);
-    std::function<pvalue(pvalue, llvm::Type *)> convert =
-      [&ctx, &convert, mask](pvalue vec4, llvm::Type *desired) {
-        auto masked = [mask](int i) {
-          return (mask & (1 << i)) ? i : llvm::UndefMaskElem;
-        };
-        if (desired == ctx.types._int4)
-          return ctx.builder.CreateShuffleVector(
-            vec4, {masked(0), masked(1), masked(2), masked(3)}
-          );
-        if (desired == ctx.types._float4)
-          return ctx.builder.CreateShuffleVector(
-            ctx.builder.CreateBitCast(vec4, ctx.types._float4),
-            {masked(0), masked(1), masked(2), masked(3)}
-          );
-        // FIXME: 3d/2d vector implementations are unused and probably wrong!
-        if (desired == ctx.types._int3)
-          return ctx.builder.CreateShuffleVector(
-            vec4, {masked(0), masked(1), masked(2)}
-          );
-        if (desired == ctx.types._float3)
-          return ctx.builder.CreateShuffleVector(
-            convert(vec4, ctx.types._float4), {masked(0), masked(1), masked(2)}
-          );
-        if (desired == ctx.types._int2)
-          return ctx.builder.CreateShuffleVector(vec4, {masked(0), masked(1)});
-        if (desired == ctx.types._float2)
-          return ctx.builder.CreateShuffleVector(
-            convert(vec4, ctx.types._float4), {masked(0), masked(1)}
-          );
-        if (desired == ctx.types._int)
-          return ctx.builder.CreateExtractElement(vec4, (uint64_t)__builtin_ctz(mask));
-        if (desired == ctx.types._float)
-          return ctx.builder.CreateExtractElement(
-            ctx.builder.CreateBitCast(vec4, ctx.types._float4), (uint64_t)__builtin_ctz(mask)
-          );
-        assert(0 && "unhandled vec4");
-      };
-    return convert(vec4, desired);
+    assert(mask && "output signature mask must not be empty");
+
+    pvalue source = vec4;
+    if (desired->getScalarType() == ctx.types._float)
+      source = ctx.builder.CreateBitCast(vec4, ctx.types._float4);
+    else
+      assert(desired->getScalarType() == ctx.types._int &&
+             "unhandled output component type");
+
+    if (!desired->isVectorTy())
+      return ctx.builder.CreateExtractElement(
+          source, uint64_t(std::countr_zero(mask & 0xfu)));
+
+    const auto desired_components =
+        llvm::cast<llvm::FixedVectorType>(desired)->getNumElements();
+    pvalue result = llvm::ConstantAggregateZero::get(desired);
+    uint32_t packed_component = 0;
+    for (uint32_t register_component = 0; register_component < 4;
+         register_component++) {
+      if (!(mask & (1u << register_component)))
+        continue;
+      const uint32_t destination_component =
+          desired_components == 4 ? register_component : packed_component++;
+      if (destination_component >= desired_components)
+        break;
+      result = ctx.builder.CreateInsertElement(
+          result,
+          ctx.builder.CreateExtractElement(source, register_component),
+          destination_component);
+    }
+    return result;
   });
 };
 
@@ -182,26 +155,37 @@ auto store_to_array_at(
 IREffect store_at_vec4_array_masked(
   llvm::Value *array, pvalue index, pvalue maybe_vec4, uint32_t mask
 ) {
-  return extend_to_vec4(maybe_vec4) >>= [=](pvalue vec4) {
-    if (mask == 0b1111) {
-      return store_to_array_at(array, index, vec4);
-    }
-    return make_effect([=](context ctx) {
-      for (unsigned i = 0; i < 4; i++) {
-        if ((mask & (1 << i)) == 0)
-          continue;
-        auto component_ptr =  ctx.builder.CreateGEP(
-          llvm::cast<llvm::PointerType>(array->getType())
-            ->getNonOpaquePointerElementType(),
-          array, {ctx.builder.getInt32(0), index, ctx.builder.getInt32(i)}
-        );
-        ctx.builder.CreateStore(
-          ctx.builder.CreateExtractElement(vec4, i), component_ptr
-        );
+  return make_effect([=](context ctx) {
+    const auto array_type = llvm::cast<llvm::PointerType>(array->getType())
+                                ->getNonOpaquePointerElementType();
+    const auto source_vector_type =
+        llvm::dyn_cast<llvm::FixedVectorType>(maybe_vec4->getType());
+    const uint32_t source_components =
+        source_vector_type ? source_vector_type->getNumElements() : 1;
+    assert((source_components == 1 || source_components == 4 ||
+            source_components == std::popcount(mask & 0xfu)) &&
+           "packed input does not match its signature mask");
+
+    uint32_t packed_component = 0;
+    for (uint32_t register_component = 0; register_component < 4;
+         register_component++) {
+      if (!(mask & (1u << register_component)))
+        continue;
+      auto component_ptr = ctx.builder.CreateGEP(
+          array_type, array,
+          {ctx.builder.getInt32(0), index,
+           ctx.builder.getInt32(register_component)});
+      pvalue component = maybe_vec4;
+      if (source_vector_type) {
+        const uint32_t source_component =
+            source_components == 4 ? register_component : packed_component++;
+        component =
+            ctx.builder.CreateExtractElement(maybe_vec4, source_component);
       }
-      return std::monostate();
-    });
-  };
+      ctx.builder.CreateStore(component, component_ptr);
+    }
+    return std::monostate();
+  });
 };
 
 IREffect init_input_reg(

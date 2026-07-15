@@ -80,7 +80,11 @@ d3d12_unit_suites = {
     ),
   },
   'pipeline': {
-    'sources': files('pipeline/stream_spec.cpp'),
+    'sources': files(
+      'pipeline/scalar_varying_spec.cpp',
+      'pipeline/stream_spec.cpp',
+    ),
+    'dependencies': [d3dcompiler_test_dep],
   },
   'query': {
     'sources': files(

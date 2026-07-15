@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -305,20 +306,31 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
   BasicBlock *entry, context &ctx, llvm::BasicBlock *return_bb
 );
 
-constexpr air::MSLScalerOrVectorType to_msl_type(RegisterComponentType type) {
+inline air::MSLScalerOrVectorType
+to_msl_type(RegisterComponentType type, uint32_t mask = 0xf) {
+  const uint32_t component_count =
+      std::max(1u, uint32_t(std::popcount(mask & 0xfu)));
+  auto make_type = [component_count](air::MSLScalerType scalar,
+                                     air::MSLScalerOrVectorType scalar_type) {
+    if (component_count == 1)
+      return scalar_type;
+    return air::MSLScalerOrVectorType(
+        air::MSLVector{component_count, std::move(scalar)});
+  };
+
   switch (type) {
   case RegisterComponentType::Unknown: {
     assert(0 && "unknown component type");
     break;
   }
   case RegisterComponentType::Uint:
-    return air::msl_uint4;
+    return make_type(air::msl_uint, air::msl_uint);
   case RegisterComponentType::Int:
-    return air::msl_int4;
+    return make_type(air::msl_int, air::msl_int);
   case RegisterComponentType::Float:
-    return air::msl_float4;
-    break;
+    return make_type(air::msl_float, air::msl_float);
   }
+  return air::msl_float4;
 }
 
 struct ScalarInfo {

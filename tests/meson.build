@@ -149,6 +149,20 @@ test(
   workdir: meson.project_source_root(),
 )
 
+airconv_scalar_varying_test = find_program(
+  'airconv/scalar-varying-ir-test.sh',
+)
+test(
+  'airconv-scalar-varying-ir',
+  airconv_scalar_varying_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/scalar-varying-vs.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
 alias_target(
   'dxmt-wine-tests',
   dxmt_wine_test_scheduler,
