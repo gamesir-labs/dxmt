@@ -226,6 +226,105 @@ protected:
     ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
   }
 
+  void ExpectCopyTilesRoundTrip(UINT x, UINT y, UINT width, UINT height,
+                                UINT64 buffer_offset) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+    if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+      GTEST_SKIP() << "Tiled resources are not supported";
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 512;
+    desc.Height = 512;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R32_UINT;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    ComPtr<ID3D12Resource> texture;
+    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
+        &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        __uuidof(ID3D12Resource),
+        reinterpret_cast<void **>(texture.put()))));
+    ASSERT_TRUE(texture);
+
+    D3D12_SUBRESOURCE_TILING tiling = {};
+    UINT subresource_count = 1;
+    UINT total_tiles = 0;
+    context_.device()->GetResourceTiling(
+        texture.get(), &total_tiles, nullptr, nullptr, &subresource_count, 0,
+        &tiling);
+    ASSERT_EQ(subresource_count, 1u);
+    ASSERT_GT(total_tiles, 0u);
+    ASSERT_LE(x + width, tiling.WidthInTiles);
+    ASSERT_LE(y + height, tiling.HeightInTiles);
+
+    auto backing_heap = MapAllTiles(texture.get());
+    ASSERT_TRUE(backing_heap);
+
+    const UINT tile_count = width * height;
+    const UINT64 copy_size =
+        UINT64(tile_count) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    constexpr UINT64 guard_size = 256;
+    const UINT64 buffer_size = buffer_offset + copy_size + guard_size;
+    std::vector<std::uint8_t> source(buffer_size, 0x5a);
+    std::vector<std::uint8_t> expected(buffer_size, 0xa5);
+    for (UINT64 i = 0; i < copy_size; ++i) {
+      source[buffer_offset + i] =
+          static_cast<std::uint8_t>((i * 37 + (i >> 8) + 19) & 0xff);
+      expected[buffer_offset + i] = source[buffer_offset + i];
+    }
+
+    auto upload = context_.CreateUploadBuffer(buffer_size, source.data(),
+                                               source.size());
+    auto initial = context_.CreateUploadBuffer(buffer_size, expected.data(),
+                                                expected.size());
+    auto output = context_.CreateBuffer(
+        buffer_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(upload);
+    ASSERT_TRUE(initial);
+    ASSERT_TRUE(output);
+    context_.list()->CopyBufferRegion(output.get(), 0, initial.get(), 0,
+                                      buffer_size);
+
+    D3D12_TILED_RESOURCE_COORDINATE coordinate = {x, y, 0, 0};
+    D3D12_TILE_REGION_SIZE region = {};
+    region.NumTiles = tile_count;
+    region.UseBox = tile_count > 1;
+    if (region.UseBox) {
+      region.Width = width;
+      region.Height = height;
+      region.Depth = 1;
+    }
+    context_.list()->CopyTiles(
+        texture.get(), &coordinate, &region, upload.get(), buffer_offset,
+        D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+    D3D12TestContext::Transition(
+        context_.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    context_.list()->CopyTiles(
+        texture.get(), &coordinate, &region, output.get(), buffer_offset,
+        D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    D3D12TestContext::Transition(
+        context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    std::vector<std::uint8_t> actual;
+    ASSERT_TRUE(SUCCEEDED(
+        context_.ReadbackBuffer(output.get(), buffer_size, &actual)));
+    ASSERT_EQ(actual.size(), expected.size());
+    const auto mismatch =
+        std::mismatch(actual.begin(), actual.end(), expected.begin());
+    if (mismatch.first != actual.end()) {
+      ADD_FAILURE() << "byte " << std::distance(actual.begin(), mismatch.first)
+                    << ": expected " << static_cast<UINT>(*mismatch.second)
+                    << ", got " << static_cast<UINT>(*mismatch.first);
+    }
+  }
+
   void RunCase(SparseCase sparse_case);
 
   D3D12TestContext context_;
@@ -338,6 +437,21 @@ TEST_F(D3D12SparseResourceSpec, CopiesIntoUnmappedReservedTexture) {
 
 TEST_F(D3D12SparseResourceSpec, CopiesIntoMappedReservedTexture) {
   RunCase(SparseCase::CopyToMapped);
+}
+
+TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsSingleMappedTile) {
+  ExpectCopyTilesRoundTrip(0, 0, 1, 1, 0);
+}
+
+TEST_F(D3D12SparseResourceSpec,
+       CopyTilesHonorsBufferOffsetAndNonzeroCoordinate) {
+  ExpectCopyTilesRoundTrip(1, 1, 1, 1,
+                           D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+}
+
+TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsMappedTileBox) {
+  ExpectCopyTilesRoundTrip(1, 0, 2, 2,
+                           D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
 }
 
 TEST_F(D3D12SparseResourceSpec, WritesMappedDeepPackedMipTail) {
