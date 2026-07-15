@@ -939,7 +939,8 @@ add_texture_argument_flags(
 void setup_binding_table(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
   air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
-  uint32_t argbuffer_constant_slot, uint32_t argbuffer_slot
+  uint32_t argbuffer_constant_slot, uint32_t argbuffer_slot,
+  BindlessBindingSlots bindless_slots
 ) {
   uint32_t binding_table_index = ~0u;
   uint32_t cbuf_table_index = ~0u;
@@ -978,7 +979,7 @@ void setup_binding_table(
         shader_info, module.getContext(), module.getDataLayout());
     texture_mirror_index =
       func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
-        .location_index = kBindlessTextureMirrorBindIndex, // 30
+        .location_index = bindless_slots.texture_mirror,
         .array_size = 1,
         .memory_access = air::MemoryAccess::read,
         .address_space = air::AddressSpace::constant,
@@ -992,7 +993,7 @@ void setup_binding_table(
         build_flat_sampler_mirror_struct(module.getContext(), module.getDataLayout());
     sampler_mirror_index =
       func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
-        .location_index = kBindlessSamplerMirrorBindIndex, // 29
+        .location_index = bindless_slots.sampler_mirror,
         .array_size = 1,
         .memory_access = air::MemoryAccess::read,
         .address_space = air::AddressSpace::constant,
@@ -1025,7 +1026,7 @@ void setup_binding_table(
   if (gBindlessMirror && bindless_buffer_table_qword_count(shader_info)) {
     buffer_table_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
       .buffer_size = std::nullopt,
-      .location_index = kBindlessBufferTableBindIndex,
+      .location_index = bindless_slots.buffer_table,
       .array_size = 1,
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
@@ -1159,7 +1160,7 @@ void setup_binding_table(
   if (gBindlessMirror) {
     root_offset_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
       .buffer_size = std::nullopt,
-      .location_index = kBindlessRootOffsetBindIndex,
+      .location_index = bindless_slots.root_offsets,
       .array_size = 1,
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
@@ -2148,6 +2149,52 @@ llvm::Error convertDXBC(
 };
 } // namespace dxmt::dxbc
 
+namespace {
+
+class SM50ShaderAbiScope {
+public:
+  explicit SM50ShaderAbiScope(SM50_SHADER_COMPILATION_ARGUMENT_DATA *args)
+      : previous_bindless_(dxmt::dxbc::get_bindless_mirror()),
+        previous_native_(dxmt::dxbc::get_native_descriptor_table()) {
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
+        DXMT12_MTL4_SHADER_ABI_LEGACY;
+
+    DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *native_abi = nullptr;
+    if (dxmt::dxbc::args_get_data<
+            SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI,
+            DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA>(args, &native_abi) &&
+        native_abi && native_abi->enabled)
+      shader_abi_version = native_abi->version;
+
+    SM50_SHADER_BINDLESS_MIRROR_DATA *bindless = nullptr;
+    if (shader_abi_version == DXMT12_MTL4_SHADER_ABI_LEGACY &&
+        dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR,
+                                  SM50_SHADER_BINDLESS_MIRROR_DATA>(
+            args, &bindless) &&
+        bindless && bindless->enabled)
+      shader_abi_version = DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
+
+    dxmt::dxbc::set_bindless_mirror(
+        shader_abi_version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR);
+    dxmt::dxbc::set_native_descriptor_table(
+        shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE);
+  }
+
+  ~SM50ShaderAbiScope() {
+    dxmt::dxbc::set_bindless_mirror(previous_bindless_);
+    dxmt::dxbc::set_native_descriptor_table(previous_native_);
+  }
+
+  SM50ShaderAbiScope(const SM50ShaderAbiScope &) = delete;
+  SM50ShaderAbiScope &operator=(const SM50ShaderAbiScope &) = delete;
+
+private:
+  bool previous_bindless_;
+  bool previous_native_;
+};
+
+} // namespace
+
 bool CheckGSBBIsPassThrough(dxmt::dxbc::BasicBlock *bb) {
   using namespace dxmt::dxbc;
   if (bb->instructions.any(patterns{
@@ -2684,43 +2731,7 @@ AIRCONV_API int SM50Compile(
     return 1;
   }
 
-  DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
-      DXMT12_MTL4_SHADER_ABI_LEGACY;
-  {
-    DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *native_abi = nullptr;
-    if (dxmt::dxbc::args_get_data<
-            SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI,
-            DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA>(pArgs, &native_abi) &&
-        native_abi && native_abi->enabled)
-      shader_abi_version = native_abi->version;
-
-    SM50_SHADER_BINDLESS_MIRROR_DATA *bm = nullptr;
-    if (shader_abi_version == DXMT12_MTL4_SHADER_ABI_LEGACY &&
-        dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR,
-                                  SM50_SHADER_BINDLESS_MIRROR_DATA>(
-            pArgs, &bm) &&
-        bm && bm->enabled)
-      shader_abi_version = DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
-  }
-
-  const bool bindless_requested =
-      shader_abi_version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
-  const bool native_requested =
-      shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
-  struct ShaderAbiScope {
-    ShaderAbiScope(bool bindless, bool native)
-        : previous(dxmt::dxbc::get_bindless_mirror()) {
-      previous_native = dxmt::dxbc::get_native_descriptor_table();
-      dxmt::dxbc::set_bindless_mirror(bindless);
-      dxmt::dxbc::set_native_descriptor_table(native);
-    }
-    ~ShaderAbiScope() {
-      dxmt::dxbc::set_bindless_mirror(previous);
-      dxmt::dxbc::set_native_descriptor_table(previous_native);
-    }
-    bool previous;
-    bool previous_native;
-  } shader_abi_scope(bindless_requested, native_requested);
+  SM50ShaderAbiScope shader_abi_scope(pArgs);
 
   LLVMContext context;
 
@@ -2782,7 +2793,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     return 1;
   }
 
-  // pArgs is ignored for now
+  SM50ShaderAbiScope shader_abi_scope(pHullShaderArgs);
   LLVMContext context;
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
@@ -2846,7 +2857,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
     return 1;
   }
 
-  // pArgs is ignored for now
+  SM50ShaderAbiScope shader_abi_scope(pDomainShaderArgs);
   LLVMContext context;
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
@@ -2911,7 +2922,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     return 1;
   }
 
-  // pArgs is ignored for now
+  SM50ShaderAbiScope shader_abi_scope(pVertexShaderArgs);
   LLVMContext context;
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
@@ -2974,7 +2985,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     return 1;
   }
 
-  // pArgs is ignored for now
+  SM50ShaderAbiScope shader_abi_scope(pGeometryShaderArgs);
   LLVMContext context;
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...

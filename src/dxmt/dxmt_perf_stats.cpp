@@ -884,6 +884,7 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
   const auto replay_timed_us =
       replay_record_loop_us + replay_flush_pass_us + replay_timestamp_resolve_us +
       replay_cpu_query_resolve_us;
+  const auto replay_worker_summary = summarizeReplayWorkerFrame(frame_stats);
   const auto replay_get_pipeline_us =
       durationUs(frame_stats.frame_replay_get_pipeline_interval);
   const auto replay_get_metal_pso_us =
@@ -1217,6 +1218,28 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " replayTimestampResolveUs=", replay_timestamp_resolve_us,
                   " replayCpuQueryResolveUs=", replay_cpu_query_resolve_us,
                   " replayTimedUs=", replay_timed_us,
+                  " replaySupersededMaskUs=",
+                  replay_worker_summary.superseded_mask_us,
+                  " replayCompiledGraphicsUs=",
+                  replay_worker_summary.compiled_graphics_us,
+                  " replayCompiledGraphicsPackets=",
+                  frame_stats.frame_replay_compiled_graphics_packet_count,
+                  " replayCompiledComputeUs=",
+                  replay_worker_summary.compiled_compute_us,
+                  " replayCompiledComputePackets=",
+                  frame_stats.frame_replay_compiled_compute_packet_count,
+                  " replayFallbackClassificationUs=",
+                  replay_worker_summary.fallback_classification_us,
+                  " replayFallbackClassificationRanges=",
+                  frame_stats.frame_replay_fallback_classification_count,
+                  " replayFallbackRecordUs=",
+                  replay_worker_summary.typed_record_us,
+                  " replayRecordControlUs=",
+                  replay_worker_summary.record_control_us,
+                  " replayClassifiedRecordUs=",
+                  replay_worker_summary.classified_record_us,
+                  " replayRecordCoveragePermille=",
+                  replay_worker_summary.record_coverage_permille,
                   " replayGetPipelineUs=", replay_get_pipeline_us,
                   " replayGetMetalPsoUs=", replay_get_metal_pso_us,
                   " replaySelectPsoUs=", replay_select_pso_us,
@@ -1762,6 +1785,14 @@ summarizeReplayWorkerFrame(const FrameStatistics &stats) {
       durationUs(stats.frame_execute_replay_interval);
   summary.record_loop_us =
       durationUs(stats.frame_replay_record_loop_interval);
+  summary.superseded_mask_us =
+      durationUs(stats.frame_replay_superseded_mask_interval);
+  summary.compiled_graphics_us =
+      durationUs(stats.frame_replay_compiled_graphics_interval);
+  summary.compiled_compute_us =
+      durationUs(stats.frame_replay_compiled_compute_interval);
+  summary.fallback_classification_us =
+      durationUs(stats.frame_replay_fallback_classification_interval);
   summary.replay_timed_us =
       summary.record_loop_us +
       durationUs(stats.frame_replay_flush_pass_interval) +
@@ -1784,13 +1815,27 @@ summarizeReplayWorkerFrame(const FrameStatistics &stats) {
       durationUs(stats.frame_replay_record_query_interval) +
       durationUs(stats.frame_replay_record_execute_indirect_interval) +
       durationUs(stats.frame_replay_record_temporal_upscale_interval);
+  const uint64_t named_record_us =
+      summary.superseded_mask_us + summary.compiled_graphics_us +
+      summary.compiled_compute_us + summary.fallback_classification_us +
+      summary.typed_record_us;
+  // This is the exclusive cost of ReplayCommandRecords control flow: segment
+  // validation/dispatch, record visitation, counters and timer bookkeeping.
+  // It is intentionally named as executable logic rather than an API gap.
+  summary.record_control_us =
+      summary.record_loop_us > named_record_us
+          ? summary.record_loop_us - named_record_us
+          : 0;
+  summary.classified_record_us =
+      std::min(summary.record_loop_us,
+               named_record_us + summary.record_control_us);
   const auto coverage_permille = [](uint64_t value, uint64_t total) {
     return total ? std::min<uint64_t>(1000, value * 1000 / total) : 0;
   };
   summary.replay_coverage_permille = coverage_permille(
       summary.replay_timed_us, summary.execute_replay_us);
   summary.record_coverage_permille = coverage_permille(
-      summary.typed_record_us, summary.record_loop_us);
+      summary.classified_record_us, summary.record_loop_us);
   return summary;
 }
 
@@ -1822,8 +1867,21 @@ void recordReplayWorkerFrame(uint64_t frame, uintptr_t queue,
       durationUs(stats.frame_replay_cpu_query_resolve_interval),
       " replayTimedUs=", summary.replay_timed_us,
       " replayCoveragePermille=", summary.replay_coverage_permille,
+      " replaySupersededMaskUs=", summary.superseded_mask_us,
+      " replayCompiledGraphicsUs=", summary.compiled_graphics_us,
+      " replayCompiledGraphicsPackets=",
+      stats.frame_replay_compiled_graphics_packet_count,
+      " replayCompiledComputeUs=", summary.compiled_compute_us,
+      " replayCompiledComputePackets=",
+      stats.frame_replay_compiled_compute_packet_count,
+      " replayFallbackClassificationUs=",
+      summary.fallback_classification_us,
+      " replayFallbackClassificationRanges=",
+      stats.frame_replay_fallback_classification_count,
       " typedRecordUs=", summary.typed_record_us,
-      " typedRecordCoveragePermille=", summary.record_coverage_permille);
+      " replayRecordControlUs=", summary.record_control_us,
+      " replayClassifiedRecordUs=", summary.classified_record_us,
+      " replayRecordCoveragePermille=", summary.record_coverage_permille);
   timing_log += str::format(
       " replayRecordDrawUs=",
       durationUs(stats.frame_replay_record_draw_interval),

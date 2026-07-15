@@ -324,6 +324,10 @@ struct FrameStatistics {
   clock::duration frame_execute_commit_interval{};
   clock::duration frame_execute_wait_arm_interval{};
   clock::duration frame_replay_record_loop_interval{};
+  clock::duration frame_replay_superseded_mask_interval{};
+  clock::duration frame_replay_compiled_graphics_interval{};
+  clock::duration frame_replay_compiled_compute_interval{};
+  clock::duration frame_replay_fallback_classification_interval{};
   clock::duration frame_replay_flush_pass_interval{};
   clock::duration frame_replay_timestamp_resolve_interval{};
   clock::duration frame_replay_cpu_query_resolve_interval{};
@@ -397,6 +401,9 @@ struct FrameStatistics {
   std::array<clock::duration, kPerfCodePathCount> frame_code_path_max_intervals{};
   std::array<uint64_t, kPerfCodePathCount> frame_code_path_counts{};
   uint64_t frame_replay_draw_count = 0;
+  uint64_t frame_replay_compiled_graphics_packet_count = 0;
+  uint64_t frame_replay_compiled_compute_packet_count = 0;
+  uint64_t frame_replay_fallback_classification_count = 0;
   uint64_t frame_replay_record_draw_count = 0;
   uint64_t frame_replay_record_draw_indexed_count = 0;
   uint64_t frame_replay_record_dispatch_count = 0;
@@ -650,6 +657,10 @@ struct FrameStatistics {
     frame_execute_commit_interval = {};
     frame_execute_wait_arm_interval = {};
     frame_replay_record_loop_interval = {};
+    frame_replay_superseded_mask_interval = {};
+    frame_replay_compiled_graphics_interval = {};
+    frame_replay_compiled_compute_interval = {};
+    frame_replay_fallback_classification_interval = {};
     frame_replay_flush_pass_interval = {};
     frame_replay_timestamp_resolve_interval = {};
     frame_replay_cpu_query_resolve_interval = {};
@@ -723,6 +734,9 @@ struct FrameStatistics {
     frame_code_path_max_intervals.fill({});
     frame_code_path_counts.fill(0);
     frame_replay_draw_count = 0;
+    frame_replay_compiled_graphics_packet_count = 0;
+    frame_replay_compiled_compute_packet_count = 0;
+    frame_replay_fallback_classification_count = 0;
     frame_replay_record_draw_count = 0;
     frame_replay_record_draw_indexed_count = 0;
     frame_replay_record_dispatch_count = 0;
@@ -1025,6 +1039,10 @@ public:
       average_.frame_execute_commit_interval += frames_[i].frame_execute_commit_interval;
       average_.frame_execute_wait_arm_interval += frames_[i].frame_execute_wait_arm_interval;
       average_.frame_replay_record_loop_interval += frames_[i].frame_replay_record_loop_interval;
+      average_.frame_replay_superseded_mask_interval += frames_[i].frame_replay_superseded_mask_interval;
+      average_.frame_replay_compiled_graphics_interval += frames_[i].frame_replay_compiled_graphics_interval;
+      average_.frame_replay_compiled_compute_interval += frames_[i].frame_replay_compiled_compute_interval;
+      average_.frame_replay_fallback_classification_interval += frames_[i].frame_replay_fallback_classification_interval;
       average_.frame_replay_flush_pass_interval += frames_[i].frame_replay_flush_pass_interval;
       average_.frame_replay_timestamp_resolve_interval += frames_[i].frame_replay_timestamp_resolve_interval;
       average_.frame_replay_cpu_query_resolve_interval += frames_[i].frame_replay_cpu_query_resolve_interval;
@@ -1104,6 +1122,9 @@ public:
             frames_[i].frame_code_path_counts[path];
       }
       average_.frame_replay_draw_count += frames_[i].frame_replay_draw_count;
+      average_.frame_replay_compiled_graphics_packet_count += frames_[i].frame_replay_compiled_graphics_packet_count;
+      average_.frame_replay_compiled_compute_packet_count += frames_[i].frame_replay_compiled_compute_packet_count;
+      average_.frame_replay_fallback_classification_count += frames_[i].frame_replay_fallback_classification_count;
       average_.frame_replay_record_draw_count += frames_[i].frame_replay_record_draw_count;
       average_.frame_replay_record_draw_indexed_count += frames_[i].frame_replay_record_draw_indexed_count;
       average_.frame_replay_record_dispatch_count += frames_[i].frame_replay_record_dispatch_count;
@@ -1339,6 +1360,10 @@ public:
     average_.frame_execute_commit_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_wait_arm_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_record_loop_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_superseded_mask_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_compiled_graphics_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_compiled_compute_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_fallback_classification_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_flush_pass_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_timestamp_resolve_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_cpu_query_resolve_interval /= (kFrameStatisticsCount - 1);
@@ -1415,6 +1440,9 @@ public:
           (kFrameStatisticsCount - 1);
     }
     average_.frame_replay_draw_count /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_compiled_graphics_packet_count /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_compiled_compute_packet_count /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_fallback_classification_count /= (kFrameStatisticsCount - 1);
     average_.frame_replay_record_draw_count /= (kFrameStatisticsCount - 1);
     average_.frame_replay_record_draw_indexed_count /= (kFrameStatisticsCount - 1);
     average_.frame_replay_record_dispatch_count /= (kFrameStatisticsCount - 1);

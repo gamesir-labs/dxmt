@@ -112,4 +112,26 @@ TEST(PerfStats, ReplayWorkerSummaryIncludesSubFiftyMillisecondBatches) {
   EXPECT_EQ(summary.record_coverage_permille, 1000u);
 }
 
+TEST(PerfStats, ReplayWorkerSummaryClassifiesCompiledPacketAndControlTime) {
+  dxmt::FrameStatistics stats;
+  stats.frame_execute_replay_interval = 42ms;
+  stats.frame_replay_record_loop_interval = 40ms;
+  stats.frame_replay_superseded_mask_interval = 2ms;
+  stats.frame_replay_compiled_graphics_interval = 18ms;
+  stats.frame_replay_compiled_compute_interval = 7ms;
+  stats.frame_replay_fallback_classification_interval = 1ms;
+  stats.frame_replay_record_draw_interval = 5ms;
+  stats.frame_replay_record_dispatch_interval = 3ms;
+
+  const auto summary = dxmt::perf::summarizeReplayWorkerFrame(stats);
+  EXPECT_EQ(summary.superseded_mask_us, 2000u);
+  EXPECT_EQ(summary.compiled_graphics_us, 18000u);
+  EXPECT_EQ(summary.compiled_compute_us, 7000u);
+  EXPECT_EQ(summary.fallback_classification_us, 1000u);
+  EXPECT_EQ(summary.typed_record_us, 8000u);
+  EXPECT_EQ(summary.record_control_us, 4000u);
+  EXPECT_EQ(summary.classified_record_us, 40000u);
+  EXPECT_EQ(summary.record_coverage_permille, 1000u);
+}
+
 } // namespace

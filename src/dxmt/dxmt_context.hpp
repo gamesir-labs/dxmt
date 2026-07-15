@@ -817,12 +817,13 @@ public:
                     uint64_t demote_msaa_srv_mask_hi = 0,
                     const char *diagnostic_path = "bindless-live");
 
-  // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds —
-  // buf_table(27) + root_offsets(28) + sampler mirror(29) + texture mirror(30). Skips any null
-  // buffer (e.g. no samplers → sampler_mirror null; no buffer fields → buf_table null). Sets the
-  // Vertex maps to WMTRenderStageVertex, Pixel to WMTRenderStageFragment,
-  // and Compute uses the compute setargumentbuffer command.
-  template <PipelineStage stage>
+  // Bindless-mirror (Stage-1 sub-step ③.3): emit this draw's deferred per-stage slot binds.
+  // The standard layout uses 27..30; tessellation VS uses 23..26 so its tables remain distinct
+  // from HS in the same object function. Null buffers are skipped. Sets the
+  // Ordinary vertex work maps to the vertex stage. Geometry/tessellation
+  // emulation maps D3D vertex/hull work to object and geometry/domain work to
+  // mesh. Pixel maps to fragment, and compute uses its dedicated command.
+  template <PipelineStage stage, PipelineKind kind = PipelineKind::Ordinary>
   void bindBindlessTables(const AllocatedArgumentBufferSlice &buf_table,
                           const AllocatedArgumentBufferSlice &root_offsets,
                           const AllocatedArgumentBufferSlice &tex_mirror,

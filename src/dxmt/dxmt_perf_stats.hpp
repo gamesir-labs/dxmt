@@ -92,7 +92,13 @@ struct ReplayWorkerSummary {
   uint64_t execute_replay_us = 0;
   uint64_t replay_timed_us = 0;
   uint64_t record_loop_us = 0;
+  uint64_t superseded_mask_us = 0;
+  uint64_t compiled_graphics_us = 0;
+  uint64_t compiled_compute_us = 0;
+  uint64_t fallback_classification_us = 0;
   uint64_t typed_record_us = 0;
+  uint64_t record_control_us = 0;
+  uint64_t classified_record_us = 0;
   uint64_t replay_coverage_permille = 0;
   uint64_t record_coverage_permille = 0;
 };

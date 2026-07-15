@@ -8,6 +8,7 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 #include <utility>
 
 namespace dxmt::d3d12 {
@@ -213,9 +214,9 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
   needs_fill_.assign(num_descriptors_, 0);
   if (sampler_heap_) {
     for (uint32_t i = 0; i < num_descriptors_; i++) {
-      WriteTableEntry(i, {null_sampler_handle_, null_sampler_handle_,
-                          FloatMetadata(0.0f)});
-      FillSamplerSlot(i, nullptr, null_sampler_handle_);
+      WriteTableEntryUnlocked(i, {null_sampler_handle_, null_sampler_handle_,
+                                  FloatMetadata(0.0f)});
+      FillSamplerSlotUnlocked(i, nullptr, null_sampler_handle_, std::nullopt);
     }
   }
 }
@@ -233,8 +234,7 @@ DescriptorHeapMirror::BufferResourceIndex(uint32_t descriptor_index,
 }
 
 uint64_t
-DescriptorHeapMirror::NextBufferResourceTableGeneration() {
-  std::lock_guard lock(mutex_);
+DescriptorHeapMirror::NextBufferResourceTableGenerationUnlocked() {
   if (buffer_resource_table_generation_ ==
       std::numeric_limits<uint64_t>::max())
     buffer_resource_table_generation_ = 1;
@@ -250,7 +250,18 @@ DescriptorHeapMirror::RegisterBufferResource(uint32_t descriptor_index,
                                              WMT::Resource allocation,
                                              uint64_t gpu_address,
                                              uint64_t byte_size) {
-  std::lock_guard lock(mutex_);
+  auto lock = AcquireLock();
+  return RegisterBufferResource(lock, descriptor_index, counter_resource,
+                                resource_identity, allocation, gpu_address,
+                                byte_size);
+}
+
+uint32_t
+DescriptorHeapMirror::RegisterBufferResource(
+    const ScopedLock &lock, uint32_t descriptor_index, bool counter_resource,
+    uint64_t resource_identity, WMT::Resource allocation,
+    uint64_t gpu_address, uint64_t byte_size) {
+  ValidateLock(lock);
   if (sampler_heap_ || !resource_identity || !allocation ||
       !buffer_resource_table_mapped_)
     return kNullDescriptorResourceIndex;
@@ -273,8 +284,8 @@ DescriptorHeapMirror::RegisterBufferResource(uint32_t descriptor_index,
   record.gpu_address = gpu_address;
   record.byte_size = byte_size;
   record.allocation_handle = allocation_handle;
-  record.generation = NextBufferResourceTableGeneration();
-  WriteBufferResourceTableEntry(index, record);
+  record.generation = NextBufferResourceTableGenerationUnlocked();
+  WriteBufferResourceTableEntryUnlocked(index, record);
   return index;
 }
 
@@ -299,16 +310,20 @@ DescriptorHeapMirror::RefreshBufferResource(uint32_t resource_index,
   record.allocation_handle = allocation_handle;
   record.gpu_address = gpu_address;
   record.byte_size = byte_size;
-  record.generation = NextBufferResourceTableGeneration();
-  WriteBufferResourceTableEntry(resource_index, record);
+  record.generation = NextBufferResourceTableGenerationUnlocked();
+  WriteBufferResourceTableEntryUnlocked(resource_index, record);
   return true;
 }
 
 void
-DescriptorHeapMirror::ClearBufferResource(uint32_t resource_index) {
-  dxmt::perf::ScopedCodeTimer timer(
-      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
+DescriptorHeapMirror::InvalidateBufferResourceTableEntryForTesting(
+    uint32_t resource_index) {
   std::lock_guard lock(mutex_);
+  ClearBufferResourceUnlocked(resource_index);
+}
+
+void
+DescriptorHeapMirror::ClearBufferResourceUnlocked(uint32_t resource_index) {
   if (resource_index == kNullDescriptorResourceIndex ||
       resource_index >= buffer_resources_.size())
     return;
@@ -317,28 +332,22 @@ DescriptorHeapMirror::ClearBufferResource(uint32_t resource_index) {
       !record.allocation_handle && !record.gpu_address && !record.byte_size)
     return;
   record = {};
-  record.generation = NextBufferResourceTableGeneration();
-  WriteBufferResourceTableEntry(resource_index, record);
+  record.generation = NextBufferResourceTableGenerationUnlocked();
+  WriteBufferResourceTableEntryUnlocked(resource_index, record);
 }
 
 void
-DescriptorHeapMirror::ClearBufferResourcesForSlot(uint32_t descriptor_index,
-                                                  bool clear_primary,
-                                                  bool clear_counter) {
-  dxmt::perf::ScopedCodeTimer timer(
-      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+DescriptorHeapMirror::ClearBufferResourcesForSlotUnlocked(
+    uint32_t descriptor_index, bool clear_primary, bool clear_counter) {
   if (clear_primary)
-    ClearBufferResource(BufferResourceIndex(descriptor_index, false));
+    ClearBufferResourceUnlocked(BufferResourceIndex(descriptor_index, false));
   if (clear_counter)
-    ClearBufferResource(BufferResourceIndex(descriptor_index, true));
+    ClearBufferResourceUnlocked(BufferResourceIndex(descriptor_index, true));
 }
 
 void
-DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry) {
-  dxmt::perf::ScopedCodeTimer timer(
-      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+DescriptorHeapMirror::WriteTableEntryUnlocked(
+    uint32_t index, const DescriptorTableEntry &entry) {
   if (index >= table_entries_.size())
     return;
   table_entries_[index] = entry;
@@ -347,11 +356,8 @@ DescriptorHeapMirror::WriteTableEntry(uint32_t index, const DescriptorTableEntry
 }
 
 void
-DescriptorHeapMirror::WriteBufferResourceTableEntry(
+DescriptorHeapMirror::WriteBufferResourceTableEntryUnlocked(
     uint32_t index, const DescriptorBackendResourceRecord &record) {
-  dxmt::perf::ScopedCodeTimer timer(
-      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
   if (!buffer_resource_table_mapped_ ||
       index >= buffer_resource_table_capacity_)
     return;
@@ -364,12 +370,9 @@ DescriptorHeapMirror::WriteBufferResourceTableEntry(
 }
 
 void
-DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
-                                    DescriptorBackendSlotKind kind,
-                                    uint32_t flags) {
-  dxmt::perf::ScopedCodeTimer timer(
-      dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+DescriptorHeapMirror::WriteSlotMetaUnlocked(uint32_t index,
+                                            DescriptorBackendSlotKind kind,
+                                            uint32_t flags) {
   if (index >= slot_meta_.size())
     return;
   auto &meta = slot_meta_[index];
@@ -383,36 +386,54 @@ DescriptorHeapMirror::WriteSlotMeta(uint32_t index,
 
 void
 DescriptorHeapMirror::WriteNullTableEntry(uint32_t index) {
+  auto lock = AcquireLock();
+  WriteNullTableEntry(lock, index);
+}
+
+void
+DescriptorHeapMirror::WriteNullTableEntry(const ScopedLock &lock,
+                                          uint32_t index) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   if (sampler_heap_) {
-    WriteTableEntry(index, {null_sampler_handle_, null_sampler_handle_,
-                            FloatMetadata(0.0f)});
-    WriteSlotMeta(index, DescriptorBackendSlotKind::Empty);
-    FillSamplerSlot(index, nullptr, null_sampler_handle_);
+    WriteTableEntryUnlocked(index,
+                            {null_sampler_handle_, null_sampler_handle_,
+                             FloatMetadata(0.0f)});
+    WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Empty);
+    FillSamplerSlotUnlocked(index, nullptr, null_sampler_handle_, std::nullopt);
     return;
   }
-  WriteTableEntry(index, {});
-  WriteBufferDescriptorRecord(index, {});
-  WriteSlotMeta(index, DescriptorBackendSlotKind::Empty);
-  ClearTextureSlot(index);
+  WriteTableEntryUnlocked(index, {});
+  WriteBufferDescriptorRecordUnlocked(index, {});
+  WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Empty);
+  ClearTextureSlotUnlocked(index, std::nullopt);
 }
 
 void
 DescriptorHeapMirror::WriteBufferTableEntry(uint32_t index, uint64_t gpu_va,
                                             uint64_t size, bool typed,
                                             uint32_t texture_view_offset) {
+  auto lock = AcquireLock();
+  WriteBufferTableEntry(lock, index, gpu_va, size, typed,
+                        texture_view_offset);
+}
+
+void
+DescriptorHeapMirror::WriteBufferTableEntry(
+    const ScopedLock &lock, uint32_t index, uint64_t gpu_va, uint64_t size,
+    bool typed, uint32_t texture_view_offset) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
-  WriteTableEntry(index, {gpu_va, 0,
-                          BufferDescriptorMetadata(size, typed,
-                                                   texture_view_offset)});
-  WriteSlotMeta(index, DescriptorBackendSlotKind::Buffer,
-                typed ? BufferDescriptorRecordFlagTyped : 0u);
+  ValidateLock(lock);
+  WriteTableEntryUnlocked(index,
+                          {gpu_va, 0,
+                           BufferDescriptorMetadata(size, typed,
+                                                    texture_view_offset)});
+  WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Buffer,
+                        typed ? BufferDescriptorRecordFlagTyped : 0u);
   if (!typed)
-    ClearTextureSlot(index);
+    ClearTextureSlotUnlocked(index, std::nullopt);
 }
 
 void
@@ -420,29 +441,54 @@ DescriptorHeapMirror::WriteBufferTextureTableEntry(
     uint32_t index, uint64_t gpu_va, uint64_t size,
     uint64_t texture_view_id, uint32_t element_count,
     uint32_t first_element, uint32_t flags) {
+  auto lock = AcquireLock();
+  WriteBufferTextureTableEntry(lock, index, gpu_va, size, texture_view_id,
+                               element_count, first_element, flags);
+}
+
+void
+DescriptorHeapMirror::WriteBufferTextureTableEntry(
+    const ScopedLock &lock, uint32_t index, uint64_t gpu_va, uint64_t size,
+    uint64_t texture_view_id, uint32_t element_count,
+    uint32_t first_element, uint32_t flags) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   const uint64_t metadata =
       (uint64_t(element_count) << 32) | uint64_t(first_element);
-  WriteTableEntry(index, {gpu_va, texture_view_id, metadata});
-  WriteSlotMeta(index, DescriptorBackendSlotKind::Buffer,
-                flags | BufferDescriptorRecordFlagTextureView);
-  FillTextureSlotPayload(index, texture_view_id, metadata);
+  WriteTableEntryUnlocked(index, {gpu_va, texture_view_id, metadata});
+  WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Buffer,
+                        flags | BufferDescriptorRecordFlagTextureView);
+  FillTextureSlotPayloadUnlocked(index, texture_view_id, metadata,
+                                 std::nullopt);
 }
 
 void
 DescriptorHeapMirror::WriteBufferDescriptorRecord(
     uint32_t index, const BufferDescriptorRecord &record) {
+  auto lock = AcquireLock();
+  WriteBufferDescriptorRecord(lock, index, record);
+}
+
+void
+DescriptorHeapMirror::WriteBufferDescriptorRecord(
+    const ScopedLock &lock, uint32_t index,
+    const BufferDescriptorRecord &record) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
+  WriteBufferDescriptorRecordUnlocked(index, record);
+}
+
+void
+DescriptorHeapMirror::WriteBufferDescriptorRecordUnlocked(
+    uint32_t index, const BufferDescriptorRecord &record) {
   if (!buffer_record_mapped_ || index >= num_descriptors_)
     return;
   if (!(record.flags & BufferDescriptorRecordFlagValid))
-    ClearBufferResourcesForSlot(index, true, true);
+    ClearBufferResourcesForSlotUnlocked(index, true, true);
   else if (!(record.flags & BufferDescriptorRecordFlagCounter))
-    ClearBufferResourcesForSlot(index, false, true);
+    ClearBufferResourcesForSlotUnlocked(index, false, true);
   buffer_record_mapped_[index] = record;
 }
 
@@ -451,14 +497,22 @@ DescriptorHeapMirror::WriteTextureTableEntry(uint32_t index,
                                              uint64_t gpu_resource_id,
                                              uint32_t array_length,
                                              float min_lod) {
+  auto lock = AcquireLock();
+  WriteTextureTableEntry(lock, index, gpu_resource_id, array_length, min_lod);
+}
+
+void
+DescriptorHeapMirror::WriteTextureTableEntry(
+    const ScopedLock &lock, uint32_t index, uint64_t gpu_resource_id,
+    uint32_t array_length, float min_lod) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
-  WriteTableEntry(index,
-                  {0, gpu_resource_id,
-                   MirrorTextureMetadata(array_length, min_lod)});
-  WriteBufferDescriptorRecord(index, {});
-  WriteSlotMeta(index, DescriptorBackendSlotKind::Texture);
+  ValidateLock(lock);
+  WriteTableEntryUnlocked(index,
+                          {0, gpu_resource_id,
+                           MirrorTextureMetadata(array_length, min_lod)});
+  WriteBufferDescriptorRecordUnlocked(index, {});
+  WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Texture);
 }
 
 void
@@ -468,35 +522,59 @@ DescriptorHeapMirror::WriteTexturePoolTableEntry(uint32_t index,
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
-  const uint64_t resource_id = textureViewPoolSlotResourceID(index);
-  WriteTextureTableEntry(index, resource_id, array_length, min_lod);
+  const uint64_t resource_id =
+      texture_view_pool_base_resource_id_ && index < num_descriptors_
+          ? texture_view_pool_base_resource_id_ + index
+          : 0;
+  WriteTableEntryUnlocked(index,
+                          {0, resource_id,
+                           MirrorTextureMetadata(array_length, min_lod)});
+  WriteBufferDescriptorRecordUnlocked(index, {});
+  WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Texture);
   if (resource_id)
-    FillTextureSlot(index, resource_id, array_length, min_lod);
+    FillTextureSlotUnlocked(index, resource_id, array_length, min_lod,
+                            std::nullopt);
 }
 
 void
 DescriptorHeapMirror::WriteSamplerTableEntry(uint32_t index,
                                              const Sampler *sampler) {
+  auto lock = AcquireLock();
+  WriteSamplerTableEntry(lock, index, sampler);
+}
+
+void
+DescriptorHeapMirror::WriteSamplerTableEntry(const ScopedLock &lock,
+                                             uint32_t index,
+                                             const Sampler *sampler) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   const uint64_t sampler_handle = sampler ? sampler->sampler_state_handle : 0;
   const uint64_t sampler_cube_handle =
       sampler ? sampler->sampler_state_cube_handle : 0;
   const float lod_bias = sampler ? sampler->lod_bias : 0.0f;
-  WriteTableEntry(index,
-                  {sampler_handle, sampler_cube_handle,
-                   FloatMetadata(lod_bias)});
-  WriteSlotMeta(index, DescriptorBackendSlotKind::Sampler);
+  WriteTableEntryUnlocked(index,
+                          {sampler_handle, sampler_cube_handle,
+                           FloatMetadata(lod_bias)});
+  WriteSlotMetaUnlocked(index, DescriptorBackendSlotKind::Sampler);
 }
 
 uint64_t
 DescriptorHeapMirror::SetTexturePoolSlot(uint32_t index, Texture *texture,
                                          TextureViewKey view,
                                          TextureAllocation *allocation) {
+  auto lock = AcquireLock();
+  return SetTexturePoolSlot(lock, index, texture, view, allocation);
+}
+
+uint64_t
+DescriptorHeapMirror::SetTexturePoolSlot(
+    const ScopedLock &lock, uint32_t index, Texture *texture,
+    TextureViewKey view, TextureAllocation *allocation) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   if (sampler_heap_ || !texture_view_pool_ || index >= num_descriptors_ ||
       !texture || !allocation)
     return 0;
@@ -508,9 +586,19 @@ DescriptorHeapMirror::SetTexturePoolBufferSlot(
     uint32_t index, WMT::Buffer buffer,
     const WMTTextureBufferViewDescriptor &descriptor, uint64_t offset,
     uint64_t bytes_per_row) {
+  auto lock = AcquireLock();
+  return SetTexturePoolBufferSlot(lock, index, buffer, descriptor, offset,
+                                  bytes_per_row);
+}
+
+uint64_t
+DescriptorHeapMirror::SetTexturePoolBufferSlot(
+    const ScopedLock &lock, uint32_t index, WMT::Buffer buffer,
+    const WMTTextureBufferViewDescriptor &descriptor, uint64_t offset,
+    uint64_t bytes_per_row) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   if (sampler_heap_ || !texture_view_pool_ || index >= num_descriptors_ ||
       !buffer)
     return 0;
@@ -541,23 +629,88 @@ DescriptorHeapMirror::CopyTexturePoolSlotFrom(uint32_t dst_index,
                                               src_index, 1, dst_index);
 }
 
-DescriptorResidencyTarget
+void
+DescriptorHeapMirror::UpdateResidencyRefCountsUnlocked(
+    const DescriptorResidencyTarget &previous,
+    const DescriptorResidencyTarget &target,
+    DescriptorResidencyTransition &transition) {
+  struct AllocationDelta {
+    WMT::Resource resource = {};
+    int32_t delta = 0;
+  };
+  std::array<AllocationDelta, 6> deltas = {};
+  uint32_t delta_count = 0;
+  const auto record = [&](WMT::Resource resource, int32_t delta) {
+    if (!resource)
+      return;
+    for (uint32_t i = 0; i < delta_count; i++) {
+      if (deltas[i].resource.handle == resource.handle) {
+        deltas[i].delta += delta;
+        return;
+      }
+    }
+    deltas[delta_count++] = {resource, delta};
+  };
+
+  record(previous.allocation, -1);
+  record(previous.secondary_allocation, -1);
+  record(previous.mirror_allocation, -1);
+  record(target.allocation, 1);
+  record(target.secondary_allocation, 1);
+  record(target.mirror_allocation, 1);
+
+  for (uint32_t i = 0; i < delta_count; i++) {
+    const auto resource = deltas[i].resource;
+    const auto current_it =
+        residency_allocation_ref_counts_.find(resource.handle);
+    const uint32_t current =
+        current_it == residency_allocation_ref_counts_.end()
+            ? 0
+            : current_it->second;
+    const int64_t next = int64_t(current) + deltas[i].delta;
+    if (next < 0)
+      std::abort();
+    if (!current && next) {
+      transition.added_allocations[transition.added_count++] = resource;
+    } else if (current && !next) {
+      transition.removed_allocations[transition.removed_count++] = resource;
+    }
+    if (next)
+      residency_allocation_ref_counts_[resource.handle] = uint32_t(next);
+    else
+      residency_allocation_ref_counts_.erase(resource.handle);
+  }
+}
+
+DescriptorResidencyTransition
 DescriptorHeapMirror::ReplaceResidencyTarget(
     uint32_t index, DescriptorResidencyTarget target) {
+  auto lock = AcquireLock();
+  return ReplaceResidencyTarget(lock, index, std::move(target));
+}
+
+DescriptorResidencyTransition
+DescriptorHeapMirror::ReplaceResidencyTarget(
+    const ScopedLock &lock, uint32_t index,
+    DescriptorResidencyTarget target) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   if (index >= residency_targets_.size())
     return {};
-  auto previous = std::move(residency_targets_[index]);
+  DescriptorResidencyTransition transition = {};
+  auto &current = residency_targets_[index];
+  UpdateResidencyRefCountsUnlocked(current, target, transition);
+  transition.previous = std::move(current);
   residency_targets_[index] = std::move(target);
-  return previous;
+  return transition;
 }
 
 bool
 DescriptorHeapMirror::ReplaceMirrorResidencyTargetIfCurrent(
     uint32_t index, dxmt::DescriptorSlotVersion expected_version,
-    DescriptorResidencyTarget target, DescriptorResidencyTarget *previous) {
+    DescriptorResidencyTarget target,
+    DescriptorResidencyTransition *transition) {
   std::lock_guard lock(mutex_);
   if (index >= residency_targets_.size() ||
       index >= filled_versions_.size() ||
@@ -565,9 +718,14 @@ DescriptorHeapMirror::ReplaceMirrorResidencyTargetIfCurrent(
       filled_versions_[index] != expected_version)
     return false;
   auto &current = residency_targets_[index];
-  if (previous) {
-    previous->mirror_allocation = std::move(current.mirror_allocation);
-    previous->sampler = std::move(current.sampler);
+  DescriptorResidencyTarget after = current;
+  after.mirror_allocation = target.mirror_allocation;
+  after.sampler = target.sampler;
+  if (transition) {
+    UpdateResidencyRefCountsUnlocked(current, after, *transition);
+    transition->previous.mirror_allocation =
+        std::move(current.mirror_allocation);
+    transition->previous.sampler = std::move(current.sampler);
   }
   current.mirror_allocation = std::move(target.mirror_allocation);
   current.sampler = std::move(target.sampler);
@@ -579,6 +737,18 @@ DescriptorHeapMirror::DrainResidencyTargets() {
   std::lock_guard lock(mutex_);
   std::vector<DescriptorResidencyTarget> drained;
   drained.swap(residency_targets_);
+  residency_allocation_ref_counts_.clear();
+  std::unordered_set<obj_handle_t> retained_allocations;
+  for (auto &target : drained) {
+    const auto retain_once = [&](WMT::Reference<WMT::Resource> &allocation) {
+      if (allocation &&
+          !retained_allocations.insert(allocation.handle).second)
+        allocation = {};
+    };
+    retain_once(target.allocation);
+    retain_once(target.secondary_allocation);
+    retain_once(target.mirror_allocation);
+  }
   return drained;
 }
 
@@ -646,9 +816,26 @@ bool
 DescriptorHeapMirror::FillSamplerSlot(
     uint32_t index, const Sampler *sampler, uint64_t null_handle,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  auto lock = AcquireLock();
+  return FillSamplerSlot(lock, index, sampler, null_handle, expected_version);
+}
+
+bool
+DescriptorHeapMirror::FillSamplerSlot(
+    const ScopedLock &lock, uint32_t index, const Sampler *sampler,
+    uint64_t null_handle,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
+  return FillSamplerSlotUnlocked(index, sampler, null_handle,
+                                 expected_version);
+}
+
+bool
+DescriptorHeapMirror::FillSamplerSlotUnlocked(
+    uint32_t index, const Sampler *sampler, uint64_t null_handle,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
   auto *handle = SamplerHandlePtrUnlocked(index);
@@ -673,9 +860,28 @@ DescriptorHeapMirror::FillTextureSlot(
     uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
     float min_lod,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  auto lock = AcquireLock();
+  return FillTextureSlot(lock, index, gpu_resource_id, array_length, min_lod,
+                         expected_version);
+}
+
+bool
+DescriptorHeapMirror::FillTextureSlot(
+    const ScopedLock &lock, uint32_t index, uint64_t gpu_resource_id,
+    uint32_t array_length, float min_lod,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
+  return FillTextureSlotUnlocked(index, gpu_resource_id, array_length, min_lod,
+                                 expected_version);
+}
+
+bool
+DescriptorHeapMirror::FillTextureSlotUnlocked(
+    uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
+    float min_lod,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
   auto *handle = TextureHandlePtrUnlocked(index);
@@ -697,6 +903,14 @@ DescriptorHeapMirror::FillTextureSlotPayload(
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
   std::lock_guard lock(mutex_);
+  return FillTextureSlotPayloadUnlocked(index, handle_payload,
+                                        metadata_payload, expected_version);
+}
+
+bool
+DescriptorHeapMirror::FillTextureSlotPayloadUnlocked(
+    uint32_t index, uint64_t handle_payload, uint64_t metadata_payload,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
   auto *handle = TextureHandlePtrUnlocked(index);
@@ -713,9 +927,24 @@ bool
 DescriptorHeapMirror::ClearTextureSlot(
     uint32_t index,
     std::optional<dxmt::DescriptorSlotVersion> expected_version) {
+  auto lock = AcquireLock();
+  return ClearTextureSlot(lock, index, expected_version);
+}
+
+bool
+DescriptorHeapMirror::ClearTextureSlot(
+    const ScopedLock &lock, uint32_t index,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
+  return ClearTextureSlotUnlocked(index, expected_version);
+}
+
+bool
+DescriptorHeapMirror::ClearTextureSlotUnlocked(
+    uint32_t index,
+    std::optional<dxmt::DescriptorSlotVersion> expected_version) {
   if (!CanPublishVersionUnlocked(index, expected_version))
     return false;
   auto *handle = TextureHandlePtrUnlocked(index);
@@ -730,9 +959,15 @@ DescriptorHeapMirror::ClearTextureSlot(
 
 dxmt::DescriptorSlotVersion
 DescriptorHeapMirror::BeginSlotWrite(uint32_t index) {
+  auto lock = AcquireLock();
+  return BeginSlotWrite(lock, index);
+}
+
+dxmt::DescriptorSlotVersion
+DescriptorHeapMirror::BeginSlotWrite(const ScopedLock &lock, uint32_t index) {
   dxmt::perf::ScopedCodeTimer timer(
       dxmt::PerfCodePath::DescriptorTableMirrorMutation);
-  std::lock_guard lock(mutex_);
+  ValidateLock(lock);
   if (index >= stale_versions_.size())
     return {};
 

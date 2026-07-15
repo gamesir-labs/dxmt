@@ -242,7 +242,8 @@ convert_dxbc_vertex_hull_shader(
     }
   }
 
-  setup_binding_table(&vertex_shader_info, resource_map_vs, func_signature, module, 27, 28);
+  setup_binding_table(&vertex_shader_info, resource_map_vs, func_signature,
+                      module, 27, 28, BindlessBindingSlots{23, 24, 25, 26});
   setup_binding_table(&hull_shader_info, resource_map_hs, func_signature, module);
 
   uint32_t threads_per_patch = next_pow2(pHullStage->hull_maximum_threads_per_patch);

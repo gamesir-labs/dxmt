@@ -505,11 +505,19 @@ constexpr uint32_t kBindlessBufferTableBindIndex = 27;
 constexpr uint32_t kBindlessSamplerMirrorBindIndex = 29;
 constexpr uint32_t kBindlessTextureMirrorBindIndex = kArgumentBufferBindIndex; // 30
 
+struct BindlessBindingSlots {
+  uint32_t buffer_table = kBindlessBufferTableBindIndex;
+  uint32_t root_offsets = kBindlessRootOffsetBindIndex;
+  uint32_t sampler_mirror = kBindlessSamplerMirrorBindIndex;
+  uint32_t texture_mirror = kBindlessTextureMirrorBindIndex;
+};
+
 void setup_binding_table(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
   air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
-  uint32_t argbuffer_constant_slot = kConstantBufferBindIndex, 
-  uint32_t argbuffer_slot = kArgumentBufferBindIndex
+  uint32_t argbuffer_constant_slot = kConstantBufferBindIndex,
+  uint32_t argbuffer_slot = kArgumentBufferBindIndex,
+  BindlessBindingSlots bindless_slots = {}
 );
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);

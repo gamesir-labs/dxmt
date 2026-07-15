@@ -186,14 +186,19 @@ BindlessUsesBufferTable(const PipelineDxilShader &shader) {
 }
 
 static uint32_t
-BindlessImmutableBufferMask(const PipelineDxilShader &shader) {
-  uint32_t mask = BufferBindingBit(kBindlessRootOffsetBindIndex);
+BindlessImmutableBufferMask(
+    const PipelineDxilShader &shader,
+    uint32_t buffer_table_index = kBindlessBufferTableBindIndex,
+    uint32_t root_offset_index = kBindlessRootOffsetBindIndex,
+    uint32_t sampler_mirror_index = kBindlessSamplerMirrorBindIndex,
+    uint32_t texture_mirror_index = kBindlessTextureMirrorBindIndex) {
+  uint32_t mask = BufferBindingBit(root_offset_index);
   if (BindlessUsesBufferTable(shader))
-    mask |= BufferBindingBit(kBindlessBufferTableBindIndex);
+    mask |= BufferBindingBit(buffer_table_index);
   if (BindlessUsesSamplerMirror(shader))
-    mask |= BufferBindingBit(kBindlessSamplerMirrorBindIndex);
+    mask |= BufferBindingBit(sampler_mirror_index);
   if (BindlessUsesTextureMirror(shader))
-    mask |= BufferBindingBit(kBindlessTextureMirrorBindIndex);
+    mask |= BufferBindingBit(texture_mirror_index);
   return mask;
 }
 
@@ -1698,7 +1703,7 @@ std::optional<Sha1Digest> BuildPersistentAirCacheKey(
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   Sha1HashState hash;
-  HashString(hash, "dxmt-d3d12-persistent-air-cache-v4");
+  HashString(hash, "dxmt-d3d12-persistent-air-cache-v6");
   // Fold the DXMT build version into the key so the cache auto-invalidates
   // across clean commits and local dirty builds whenever airconv codegen could
   // have changed.
@@ -2777,7 +2782,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
         info.payload_memory_length = 16384;
       info.immutable_object_buffers =
           BufferBindingBit(16) | BufferBindingBit(21) |
-          BindlessImmutableBufferMask(*vs) |
+          BindlessImmutableBufferMask(*vs, 23, 24, 25, 26) |
           BindlessImmutableBufferMask(*hs);
       info.immutable_mesh_buffers = BindlessImmutableBufferMask(*ds);
       info.immutable_fragment_buffers =

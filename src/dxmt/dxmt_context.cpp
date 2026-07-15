@@ -1230,8 +1230,9 @@ ArgumentEncodingContext::packBindlessStage(
   return bt;
 }
 
-// bindBindlessTables: emit this draw's deferred slot binds (27 buf_table / 28 root_offsets /
-// 29 sampler mirror / 30 texture mirror). Null buffers are skipped (the per-pass argbuf or a
+// bindBindlessTables: emit this draw's deferred table binds. The standard layout is 27..30;
+// tessellation VS uses 23..26 to coexist with HS in one object function. Null buffers are
+// skipped (the per-pass argbuf or a
 // prior bind stays at that slot; the shader for this PSO does not read a skipped slot). Sets the
 // mixed-PSO guard flag after binding mirrors.
 //
@@ -1257,7 +1258,29 @@ ArgumentEncodingContext::packBindlessStage(
 // residency for those textures is the packer's makeResident. (Stage-2 may replace the per-resource
 // makeResident with a single useResource over the whole mirror — explicitly deferred, not done
 // here.)
-template <PipelineStage stage>
+template <PipelineStage stage, PipelineKind kind>
+static constexpr WMTRenderStages
+BindlessRenderStages() {
+  if constexpr (stage == PipelineStage::Vertex) {
+    if constexpr (kind == PipelineKind::Ordinary)
+      return WMTRenderStageVertex;
+    else
+      return WMTRenderStageObject;
+  } else if constexpr (stage == PipelineStage::Pixel) {
+    return WMTRenderStageFragment;
+  } else if constexpr (stage == PipelineStage::Hull) {
+    return WMTRenderStageObject;
+  } else if constexpr (stage == PipelineStage::Geometry ||
+                       stage == PipelineStage::Domain) {
+    return WMTRenderStageMesh;
+  } else {
+    static_assert(stage != PipelineStage::Compute,
+                  "compute bindless tables use a compute encoder");
+    return {};
+  }
+}
+
+template <PipelineStage stage, PipelineKind kind>
 void
 ArgumentEncodingContext::bindBindlessTables(
     const AllocatedArgumentBufferSlice &buf_table,
@@ -1285,9 +1308,11 @@ ArgumentEncodingContext::bindBindlessTables(
         state.valid = false;
     }
   } else {
-    constexpr WMTRenderStages stages =
-        stage == PipelineStage::Pixel ? WMTRenderStageFragment
-                                      : WMTRenderStageVertex;
+    constexpr WMTRenderStages stages = BindlessRenderStages<stage, kind>();
+    constexpr uint8_t first_bind_index =
+        stage == PipelineStage::Vertex && kind == PipelineKind::Tessellation
+            ? 23
+            : 27;
     invalidateNativeArgumentBuffers(false, stages);
     auto bind = [&](WMT::Buffer buffer, uint64_t offset, uint8_t index) {
       if (!buffer)
@@ -1299,13 +1324,15 @@ ArgumentEncodingContext::bindBindlessTables(
       cmd.index = index;
       cmd.stages = stages;
     };
-    bind(buf_table.gpu_buffer, buf_table.offset, 27);
-    bind(root_offsets.gpu_buffer, root_offsets.offset, 28);
-    bind(sampler_mirror.gpu_buffer, sampler_mirror.offset, 29);
-    bind(tex_mirror.gpu_buffer, tex_mirror.offset, 30);
+    bind(buf_table.gpu_buffer, buf_table.offset, first_bind_index);
+    bind(root_offsets.gpu_buffer, root_offsets.offset, first_bind_index + 1);
+    bind(sampler_mirror.gpu_buffer, sampler_mirror.offset,
+         first_bind_index + 2);
+    bind(tex_mirror.gpu_buffer, tex_mirror.offset, first_bind_index + 3);
     for (auto &state : currentRenderEncoder()->argument_buffer_offsets) {
       if (state.valid && (state.stages & stages) &&
-          state.index >= 27 && state.index <= 30)
+          state.index >= first_bind_index &&
+          state.index <= first_bind_index + 3)
         state.valid = false;
     }
   }
@@ -1467,12 +1494,16 @@ template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage
 template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Hull, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
 template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Domain, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
 template AllocatedArgumentBufferSlice ArgumentEncodingContext::packBindlessStage<PipelineStage::Pixel, PipelineKind::Tessellation>(const MTL_SHADER_REFLECTION *, const MTL_SM50_SHADER_ARGUMENT *, const MTL_SM50_SHADER_ARGUMENT *, const std::string &, uint64_t, uint64_t, const BindlessBufferTableSnapshot *, uint64_t, uint64_t, const char *);
-template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
-template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
-template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
-template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Geometry>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
-template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Hull>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
-template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Domain>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex, PipelineKind::Ordinary>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel, PipelineKind::Ordinary>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Compute, PipelineKind::Ordinary>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex, PipelineKind::Geometry>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Geometry, PipelineKind::Geometry>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel, PipelineKind::Geometry>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Vertex, PipelineKind::Tessellation>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Hull, PipelineKind::Tessellation>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Domain, PipelineKind::Tessellation>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
+template void ArgumentEncodingContext::bindBindlessTables<PipelineStage::Pixel, PipelineKind::Tessellation>(const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &, const AllocatedArgumentBufferSlice &);
 template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Vertex>(const AllocatedArgumentBufferSlice &, uint32_t);
 template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Pixel>(const AllocatedArgumentBufferSlice &, uint32_t);
 template void ArgumentEncodingContext::bindNativeRootTableBases<PipelineStage::Compute>(const AllocatedArgumentBufferSlice &, uint32_t);

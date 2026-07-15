@@ -1129,10 +1129,12 @@ private:
 
 static void
 BeginDescriptorSlotWrite(
+    const DescriptorHeapMirror::ScopedLock &mirror_lock,
     DescriptorRecord &record,
     DescriptorRecordType write_type = DescriptorRecordType::Empty) {
   if (DescriptorWriteAffectsShaderBinding(record)) {
-    record.slot_version = record.mirror->BeginSlotWrite(record.heap_index);
+    record.slot_version =
+        record.mirror->BeginSlotWrite(mirror_lock, record.heap_index);
     const auto type =
         write_type == DescriptorRecordType::Empty ? record.type : write_type;
     switch (type) {
@@ -1166,6 +1168,7 @@ RecordDescriptorContentCopyPerf() {
 // SAMPLER heap, so non-shader heaps do nothing here.
 static void
 MaterializeSamplerMirrorForWrite(WMT::Device device,
+                                 const DescriptorHeapMirror::ScopedLock &mirror_lock,
                                  DescriptorRecord &record) {
   if (!record.mirror || !record.mirror->isSamplerHeap())
     return;
@@ -1178,7 +1181,7 @@ MaterializeSamplerMirrorForWrite(WMT::Device device,
   if (!sampler)
     return;
   record.materialized_sampler = std::move(sampler);
-  record.mirror->FillSamplerSlot(record.heap_index,
+  record.mirror->FillSamplerSlot(mirror_lock, record.heap_index,
                                  record.materialized_sampler.ptr(), 0);
 }
 
@@ -1949,6 +1952,7 @@ GetBufferResourceTableBinding(Resource *resource, WMT::Resource &allocation,
 
 static bool
 RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror, UINT slot,
+                                 const DescriptorHeapMirror::ScopedLock &mirror_lock,
                                  bool counter_resource,
                                  Resource *resource,
                                  uint32_t &resource_index) {
@@ -1961,17 +1965,20 @@ RegisterBufferDescriptorResource(DescriptorHeapMirror &mirror, UINT slot,
     return false;
   }
 
-  const auto before_generation = mirror.backendResourceTableGeneration();
+  const auto before_generation =
+      mirror.backendResourceTableGeneration(mirror_lock);
   resource_index = mirror.RegisterBufferResource(
-      slot, counter_resource, DescriptorBufferResourceIdentity(resource),
-      allocation, gpu_address, byte_size);
-  if (mirror.backendResourceTableGeneration() != before_generation)
+      mirror_lock, slot, counter_resource,
+      DescriptorBufferResourceIdentity(resource), allocation, gpu_address,
+      byte_size);
+  if (mirror.backendResourceTableGeneration(mirror_lock) != before_generation)
     dxmt::perf::recordNativeDescriptorResourceTableEntry();
   return resource_index != kNullDescriptorResourceIndex;
 }
 
 static bool
 WriteNativeBufferDescriptorRecord(DescriptorHeapMirror &mirror, UINT slot,
+                                  const DescriptorHeapMirror::ScopedLock &mirror_lock,
                                   Resource *resource,
                                   const BufferDescriptorMaterialization &view,
                                   DescriptorRecordType type) {
@@ -1984,15 +1991,15 @@ WriteNativeBufferDescriptorRecord(DescriptorHeapMirror &mirror, UINT slot,
   if (type == DescriptorRecordType::ConstantBufferView)
     native.flags |= BufferDescriptorRecordFlagCBV;
 
-  if (!RegisterBufferDescriptorResource(mirror, slot, false, resource,
+  if (!RegisterBufferDescriptorResource(mirror, slot, mirror_lock, false, resource,
                                         native.resource_index)) {
-    mirror.WriteBufferDescriptorRecord(slot, {});
+    mirror.WriteBufferDescriptorRecord(mirror_lock, slot, {});
     dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
     return false;
   }
 
   native.byte_offset = resource->GetHeapOffset() + view.view_offset;
-  mirror.WriteBufferDescriptorRecord(slot, native);
+  mirror.WriteBufferDescriptorRecord(mirror_lock, slot, native);
 
   switch (type) {
   case DescriptorRecordType::ConstantBufferView:
@@ -2012,12 +2019,13 @@ WriteNativeBufferDescriptorRecord(DescriptorHeapMirror &mirror, UINT slot,
 
 static bool
 WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
+                            const DescriptorHeapMirror::ScopedLock &mirror_lock,
                             const DescriptorRecord &record) {
   if (record.type != DescriptorRecordType::UnorderedAccessView ||
       !record.counter_resource.ptr())
     return false;
 
-  auto current = mirror.bufferDescriptorRecord(slot);
+  auto current = mirror.bufferDescriptorRecord(mirror_lock, slot);
   if (!current || !(current->flags & BufferDescriptorRecordFlagValid)) {
     dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
     return false;
@@ -2025,7 +2033,7 @@ WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
 
   auto native = *current;
   auto *counter = GetResourceFromD3D12(record.counter_resource.ptr());
-  if (!RegisterBufferDescriptorResource(mirror, slot, true, counter,
+  if (!RegisterBufferDescriptorResource(mirror, slot, mirror_lock, true, counter,
                                         native.counter_resource_index)) {
     dxmt::perf::recordNativeDescriptorBufferRecordMissingResource();
     return false;
@@ -2035,7 +2043,7 @@ WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
   native.counter_offset =
       counter->GetHeapOffset() +
       (record.has_desc ? record.desc.uav.Buffer.CounterOffsetInBytes : 0);
-  mirror.WriteBufferDescriptorRecord(slot, native);
+  mirror.WriteBufferDescriptorRecord(mirror_lock, slot, native);
   dxmt::perf::recordNativeDescriptorBufferRecordCounter();
   return true;
 }
@@ -2043,6 +2051,7 @@ WriteNativeUavCounterRecord(DescriptorHeapMirror &mirror, UINT slot,
 static bool
 MaterializeBufferTextureViewForWrite(
     WMT::Device device, DescriptorHeapMirror &mirror, UINT slot,
+    const DescriptorHeapMirror::ScopedLock &mirror_lock,
     Resource &resource, BufferDescriptorMaterialization &view,
     DescriptorRecordType descriptor_type) {
   BufferTextureViewMaterialization texture_view = {};
@@ -2051,16 +2060,17 @@ MaterializeBufferTextureViewForWrite(
     return false;
 
   const auto texture_view_id = mirror.SetTexturePoolBufferSlot(
-      slot, resource.GetBufferAllocation()->buffer(), texture_view.descriptor,
-      texture_view.offset, texture_view.bytes_per_row);
+      mirror_lock, slot, resource.GetBufferAllocation()->buffer(),
+      texture_view.descriptor, texture_view.offset,
+      texture_view.bytes_per_row);
   if (!texture_view_id)
     return false;
 
   view.flags |= BufferDescriptorRecordFlagTextureView;
   mirror.WriteBufferTextureTableEntry(
-      slot, resource.GetGpuVirtualAddress() + view.view_offset, view.byte_size,
-      texture_view_id, texture_view.element_count, texture_view.first_element,
-      view.flags);
+      mirror_lock, slot, resource.GetGpuVirtualAddress() + view.view_offset,
+      view.byte_size, texture_view_id, texture_view.element_count,
+      texture_view.first_element, view.flags);
   return true;
 }
 
@@ -2126,34 +2136,32 @@ GetDescriptorResidencyTarget(const DescriptorRecord &record) {
 
 static void
 ApplyDescriptorResidencyTarget(IMTLD3D12Device *device,
+                               const DescriptorHeapMirror::ScopedLock &mirror_lock,
                                DescriptorRecord &record) {
   if (!device || !record.mirror)
     return;
 
   auto target = GetDescriptorResidencyTarget(record);
   auto &queue = device->GetDXMTDevice().queue();
-  if (target.allocation)
-    queue.AddPersistentResidency(target.allocation);
-  if (target.secondary_allocation)
-    queue.AddPersistentResidency(target.secondary_allocation);
-
-  auto previous =
-      record.mirror->ReplaceResidencyTarget(record.heap_index, std::move(target));
-  if (previous.allocation)
-    queue.RemovePersistentResidencyAfterCompletion(previous.allocation);
-  if (previous.secondary_allocation)
-    queue.RemovePersistentResidencyAfterCompletion(previous.secondary_allocation);
-  if (previous.mirror_allocation)
-    queue.RemovePersistentResidencyAfterCompletion(previous.mirror_allocation);
-  if (previous.sampler)
+  // Keep publication and residency-set insertion atomic with respect to queue
+  // readers. Metal command buffers do not retain these resources.
+  auto transition = record.mirror->ReplaceResidencyTarget(
+      mirror_lock, record.heap_index, std::move(target));
+  for (uint32_t i = 0; i < transition.added_count; i++)
+    queue.AddPersistentResidency(transition.added_allocations[i]);
+  for (uint32_t i = 0; i < transition.removed_count; i++)
+    queue.RemovePersistentResidencyAfterCompletion(
+        transition.removed_allocations[i]);
+  if (transition.previous.sampler)
     queue.RetainUntilGpuComplete(
-        [sampler = std::move(previous.sampler)]() mutable {
+        [sampler = std::move(transition.previous.sampler)]() mutable {
           sampler = nullptr;
         });
 }
 
 static void
 MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
+                                   const DescriptorHeapMirror::ScopedLock &mirror_lock,
                                    DescriptorRecord &record) {
   const auto mtl_device = device->GetMTLDevice();
   const bool perf_enabled = dxmt::perf::enabled();
@@ -2170,7 +2178,7 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
   if (!mirror)
     return;
   auto finish = [&] {
-    ApplyDescriptorResidencyTarget(device, record);
+    ApplyDescriptorResidencyTarget(device, mirror_lock, record);
     record_update_time();
   };
 
@@ -2179,11 +2187,12 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
   case DescriptorRecordType::ConstantBufferView: {
     if (!record.has_desc ||
         (!record.desc.cbv.BufferLocation && !record.desc.cbv.SizeInBytes)) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
-    mirror->WriteBufferTableEntry(slot, record.desc.cbv.BufferLocation,
+    mirror->WriteBufferTableEntry(mirror_lock, slot,
+                                  record.desc.cbv.BufferLocation,
                                   record.desc.cbv.SizeInBytes, false);
     UINT64 offset = 0;
     auto *resource = kTestForceNativeCbvResourceLookupMiss
@@ -2194,19 +2203,20 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
     native.view_offset = offset;
     native.byte_size = record.desc.cbv.SizeInBytes;
     if (WriteNativeBufferDescriptorRecord(
-            *mirror, slot, resource, native,
+            *mirror, slot, mirror_lock, resource, native,
             DescriptorRecordType::ConstantBufferView) &&
         kTestForceNativeCbvStaleResourceTableEntry) {
-      const auto record = mirror->bufferDescriptorRecord(slot);
+      const auto record = mirror->bufferDescriptorRecord(mirror_lock, slot);
       if (record)
         mirror->InvalidateBufferResourceTableEntryForTesting(
             record->resource_index);
     }
     if (D3D12RootCauseDenseDiagEnabled()) {
-      const auto native_record = mirror->bufferDescriptorRecord(slot);
+      const auto native_record =
+          mirror->bufferDescriptorRecord(mirror_lock, slot);
       const auto backend = native_record
                                ? mirror->backendResourceRecord(
-                                     native_record->resource_index)
+                                     mirror_lock, native_record->resource_index)
                                : std::nullopt;
       const auto diag_flags = native_record
                                   ? DiagnoseNativeBufferDescriptor(
@@ -2225,7 +2235,8 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
           " resourceGpuAddress=", backend ? backend->gpu_address : 0,
           " resourceSize=", backend ? backend->byte_size : 0,
           " resourceGeneration=", backend ? backend->generation : 0,
-          " tableGeneration=", mirror->backendResourceTableGeneration(),
+          " tableGeneration=",
+          mirror->backendResourceTableGeneration(mirror_lock),
           " diagFlags=0x", std::hex, diag_flags, std::dec);
     }
     finish();
@@ -2234,7 +2245,7 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
   case DescriptorRecordType::ShaderResourceView: {
     auto *resource = GetResourceFromD3D12(record.resource.ptr());
     if (!resource) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
@@ -2242,27 +2253,33 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       BufferDescriptorMaterialization native = {};
       if (!GetBufferSrvMaterialization(mtl_device, *resource, record,
                                        native)) {
-        mirror->WriteNullTableEntry(slot);
+        mirror->WriteNullTableEntry(mirror_lock, slot);
         finish();
         return;
       }
-      if (!MaterializeBufferTextureViewForWrite(
-              mtl_device, *mirror, slot, *resource, native,
+      // Raw and structured descriptors use native buffer records in both
+      // bindless ABIs. Only typed buffers require a Metal texture-buffer
+      // view; creating one for every structured write needlessly mutates the
+      // texture-view pool and invalidates its descriptor mirror.
+      if (!native.typed || !MaterializeBufferTextureViewForWrite(
+              mtl_device, *mirror, slot, mirror_lock, *resource, native,
               DescriptorRecordType::ShaderResourceView)) {
         mirror->WriteBufferTableEntry(
-            slot, resource->GetGpuVirtualAddress() + native.view_offset,
+            mirror_lock, slot,
+            resource->GetGpuVirtualAddress() + native.view_offset,
             native.byte_size, native.typed);
-        mirror->ClearTextureSlot(slot);
+        if (native.typed)
+          mirror->ClearTextureSlot(mirror_lock, slot);
       }
       WriteNativeBufferDescriptorRecord(
-          *mirror, slot, resource, native,
+          *mirror, slot, mirror_lock, resource, native,
           DescriptorRecordType::ShaderResourceView);
       finish();
       return;
     }
     if (resource->IsReservedTexture() &&
         !resource->EnsureTextureAllocation("DescriptorTableTextureSRV")) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
@@ -2272,11 +2289,12 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
         binding.texture ? binding.texture->current() : nullptr;
     const uint64_t gpu_resource_id =
         binding && allocation
-            ? mirror->SetTexturePoolSlot(slot, binding.texture.ptr(),
-                                         binding.view, allocation)
+            ? mirror->SetTexturePoolSlot(mirror_lock, slot,
+                                         binding.texture.ptr(), binding.view,
+                                         allocation)
             : 0;
     if (!gpu_resource_id) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
@@ -2296,21 +2314,23 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
           " arrayLength=", binding.texture->arrayLength(binding.view),
           " sampleCount=", binding.texture->sampleCount(),
           " slotGeneration=", record.slot_version.sequence,
-          " tableGeneration=", mirror->backendResourceTableGeneration());
+          " tableGeneration=",
+          mirror->backendResourceTableGeneration(mirror_lock));
     }
     const uint32_t array_length =
         binding.texture->arrayLength(binding.view);
     const float min_lod = GetShaderResourceTextureMinLod(record);
-    mirror->WriteTextureTableEntry(slot, gpu_resource_id, array_length,
-                                   min_lod);
-    mirror->FillTextureSlot(slot, gpu_resource_id, array_length, min_lod);
+    mirror->WriteTextureTableEntry(mirror_lock, slot, gpu_resource_id,
+                                   array_length, min_lod);
+    mirror->FillTextureSlot(mirror_lock, slot, gpu_resource_id, array_length,
+                            min_lod);
     finish();
     return;
   }
   case DescriptorRecordType::UnorderedAccessView: {
     auto *resource = GetResourceFromD3D12(record.resource.ptr());
     if (!resource) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
@@ -2318,28 +2338,30 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
       BufferDescriptorMaterialization native = {};
       if (!GetBufferUavMaterialization(mtl_device, *resource, record,
                                        native)) {
-        mirror->WriteNullTableEntry(slot);
+        mirror->WriteNullTableEntry(mirror_lock, slot);
         finish();
         return;
       }
-      if (!MaterializeBufferTextureViewForWrite(
-              mtl_device, *mirror, slot, *resource, native,
+      if (!native.typed || !MaterializeBufferTextureViewForWrite(
+              mtl_device, *mirror, slot, mirror_lock, *resource, native,
               DescriptorRecordType::UnorderedAccessView)) {
         mirror->WriteBufferTableEntry(
-            slot, resource->GetGpuVirtualAddress() + native.view_offset,
+            mirror_lock, slot,
+            resource->GetGpuVirtualAddress() + native.view_offset,
             native.byte_size, native.typed);
-        mirror->ClearTextureSlot(slot);
+        if (native.typed)
+          mirror->ClearTextureSlot(mirror_lock, slot);
       }
       if (WriteNativeBufferDescriptorRecord(
-              *mirror, slot, resource, native,
+              *mirror, slot, mirror_lock, resource, native,
               DescriptorRecordType::UnorderedAccessView))
-        WriteNativeUavCounterRecord(*mirror, slot, record);
+        WriteNativeUavCounterRecord(*mirror, slot, mirror_lock, record);
       finish();
       return;
     }
     if (resource->IsReservedTexture() &&
         !resource->EnsureTextureAllocation("DescriptorTableTextureUAV")) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
@@ -2348,38 +2370,41 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
     auto *allocation =
         binding.texture ? binding.texture->current() : nullptr;
     if (!binding || !allocation) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
     auto &view = binding.texture->view(binding.view, allocation);
     if (!view.texture || !view.gpuResourceID) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
     const uint32_t array_length =
         binding.texture->arrayLength(binding.view);
-    mirror->WriteTextureTableEntry(slot, view.gpuResourceID, array_length);
-    mirror->FillTextureSlot(slot, view.gpuResourceID, array_length);
+    mirror->WriteTextureTableEntry(mirror_lock, slot, view.gpuResourceID,
+                                   array_length);
+    mirror->FillTextureSlot(mirror_lock, slot, view.gpuResourceID,
+                            array_length);
     finish();
     return;
   }
   case DescriptorRecordType::Sampler: {
     if (!mirror->isSamplerHeap() || !record.has_desc) {
-      mirror->WriteNullTableEntry(slot);
+      mirror->WriteNullTableEntry(mirror_lock, slot);
       finish();
       return;
     }
     if (!record.materialized_sampler)
       record.materialized_sampler = CreateD3D12Sampler(mtl_device,
                                                        record.desc.sampler);
-    mirror->WriteSamplerTableEntry(slot, record.materialized_sampler.ptr());
+    mirror->WriteSamplerTableEntry(mirror_lock, slot,
+                                   record.materialized_sampler.ptr());
     finish();
     return;
   }
   default:
-    mirror->WriteNullTableEntry(slot);
+    mirror->WriteNullTableEntry(mirror_lock, slot);
     finish();
     return;
   }
@@ -3368,7 +3393,7 @@ public:
         DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
     BeginDescriptorSlotWrite(
-        *record, DescriptorRecordType::ConstantBufferView);
+        descriptor_lock, *record, DescriptorRecordType::ConstantBufferView);
     record->type = DescriptorRecordType::ConstantBufferView;
     if (desc) {
       const bool null_cbv = !desc->BufferLocation && !desc->SizeInBytes;
@@ -3394,7 +3419,7 @@ public:
       record->desc.cbv = *desc;
       record->has_desc = true;
     }
-    MaterializeDescriptorTableForWrite(this, *record);
+    MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
     if (dxmt::apitrace::d3d_enabled()) {
       UINT64 offset = 0;
       auto *resource = desc ? LookupBufferResourceByGpuVirtualAddress(
@@ -3437,19 +3462,19 @@ public:
         DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
     BeginDescriptorSlotWrite(
-        *record, DescriptorRecordType::ShaderResourceView);
+        descriptor_lock, *record, DescriptorRecordType::ShaderResourceView);
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
       if (!ValidateShaderResourceView(resource, *desc)) {
         ResetDescriptorRecord(*record);
-        MaterializeDescriptorTableForWrite(this, *record);
+        MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
         return;
       }
       record->desc.srv = *desc;
       record->has_desc = true;
     }
-    MaterializeDescriptorTableForWrite(this, *record);
+    MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
     if (dxmt::apitrace::d3d_enabled()) {
       dxmt::apitrace::record_create_shader_resource_view(
           this, resource, desc, descriptor);
@@ -3470,20 +3495,20 @@ public:
         DescriptorWriteAffectsShaderBinding(*record));
     ResetDescriptorRecord(*record);
     BeginDescriptorSlotWrite(
-        *record, DescriptorRecordType::UnorderedAccessView);
+        descriptor_lock, *record, DescriptorRecordType::UnorderedAccessView);
     record->type = DescriptorRecordType::UnorderedAccessView;
     record->resource = resource;
     record->counter_resource = counter_resource;
     if (desc) {
       if (!ValidateUnorderedAccessView(resource, counter_resource, *desc)) {
         ResetDescriptorRecord(*record);
-        MaterializeDescriptorTableForWrite(this, *record);
+        MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
         return;
       }
       record->desc.uav = *desc;
       record->has_desc = true;
     }
-    MaterializeDescriptorTableForWrite(this, *record);
+    MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_unordered_access_view(
           this, resource, counter_resource, desc, descriptor);
@@ -3555,9 +3580,10 @@ public:
       record->desc.sampler = *desc;
       record->has_desc = true;
     }
-    BeginDescriptorSlotWrite(*record, DescriptorRecordType::Sampler);
-    MaterializeSamplerMirrorForWrite(GetMTLDevice(), *record);
-    MaterializeDescriptorTableForWrite(this, *record);
+    BeginDescriptorSlotWrite(descriptor_lock, *record,
+                             DescriptorRecordType::Sampler);
+    MaterializeSamplerMirrorForWrite(GetMTLDevice(), descriptor_lock, *record);
+    MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
     if (dxmt::apitrace::d3d_enabled())
       dxmt::apitrace::record_create_sampler(this, desc, descriptor);
   }
@@ -3654,9 +3680,11 @@ public:
           DescriptorWriteAffectsShaderBinding(*destinations[i]));
       CopyDescriptorRecord(*destinations[i], copied[i]);
       if (DescriptorWriteAffectsShaderBinding(*destinations[i]))
-        BeginDescriptorSlotWrite(*destinations[i]);
-      MaterializeSamplerMirrorForWrite(GetMTLDevice(), *destinations[i]);
-      MaterializeDescriptorTableForWrite(this, *destinations[i]);
+        BeginDescriptorSlotWrite(destination_lock, *destinations[i]);
+      MaterializeSamplerMirrorForWrite(GetMTLDevice(), destination_lock,
+                                       *destinations[i]);
+      MaterializeDescriptorTableForWrite(this, destination_lock,
+                                         *destinations[i]);
     }
 
     if (dxmt::apitrace::d3d_enabled())
@@ -3708,9 +3736,10 @@ public:
           DescriptorWriteAffectsShaderBinding(dst[i]));
       CopyDescriptorRecord(dst[i], copied[i]);
       if (DescriptorWriteAffectsShaderBinding(dst[i]))
-        BeginDescriptorSlotWrite(dst[i]);
-      MaterializeSamplerMirrorForWrite(GetMTLDevice(), dst[i]);
-      MaterializeDescriptorTableForWrite(this, dst[i]);
+        BeginDescriptorSlotWrite(destination_lock, dst[i]);
+      MaterializeSamplerMirrorForWrite(GetMTLDevice(), destination_lock,
+                                       dst[i]);
+      MaterializeDescriptorTableForWrite(this, destination_lock, dst[i]);
     }
 
     if (dxmt::apitrace::d3d_enabled())
@@ -4803,8 +4832,8 @@ public:
           DescriptorWriteAffectsShaderBinding(*record));
       ResetDescriptorRecord(*record);
       BeginDescriptorSlotWrite(
-          *record, DescriptorRecordType::UnorderedAccessView);
-      MaterializeDescriptorTableForWrite(this, *record);
+          descriptor_lock, *record, DescriptorRecordType::UnorderedAccessView);
+      MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
       dxmt::perf::recordDescriptorContentWrite(6);
     }
   }

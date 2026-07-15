@@ -47,6 +47,17 @@ mean, p50, p95, maximum CreatePSO latency, and summed-call-time to wall-time
 ratio; the Google Benchmark entry itself remains serial so Wine benchmark
 suite isolation is preserved.
 
+The `d3d12-binding-hotspots` suite establishes independent pre-optimization
+baselines for the three bindless CPU paths reported by FH4. Argument-table
+update measures only shader-visible descriptor overwrites. Root-table
+materialization measures only the compiled command-list `Close()` interval
+after pipeline warm-up. Descriptor-mirror mutation measures bulk descriptor
+copies into a shader-visible heap. Every case performs a GPU readback after the
+timed interval, so a fast result cannot bypass descriptor publication or root
+table materialization. The argument-table total contains mirror publication by
+design; the mirror benchmark isolates the bulk-copy mutation workload used to
+measure that nested subpath.
+
 `performance` performs repeated serial measurements and validates the median
 against a reviewed JSON budget. Every result must be single-threaded, and
 missing or stale budget entries fail acceptance. Performance budgets are

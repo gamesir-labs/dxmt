@@ -2,8 +2,11 @@ d3d12_test_include_dirs = include_directories('../include', '.')
 
 d3d12_runtime_support_lib = static_library(
   'dxmt-d3d12-runtime-support',
-  files('d3d12_test_context.cpp'),
-  dependencies: [d3d12_dep],
+  files(
+    'd3d12_test_context.cpp',
+    'd3d12_binding_hotspot_scenarios.cpp',
+  ),
+  dependencies: [d3d12_dep, d3dcompiler_test_dep],
   include_directories: [d3d12_test_include_dirs],
   install: false,
 )
@@ -41,6 +44,8 @@ d3d12_unit_suites = {
   },
   'descriptor': {
     'sources': files(
+      'descriptor/bindless_graphics_stage_spec.cpp',
+      'descriptor/binding_hotspot_spec.cpp',
       'descriptor/descriptor_spec.cpp',
       'descriptor/table_binding_spec.cpp',
     ),

@@ -3517,26 +3517,21 @@ static bool ReplaceDescriptorMirrorResidencyTargetForEncode(
   // Metal command buffers do not retain resources. Keep fallback mirror
   // residency independent from native descriptor primary/counter resources,
   // and defer release of the previous payload until encoded GPU work finishes.
-  const auto mirror_allocation = target.mirror_allocation;
-  if (mirror_allocation)
-    enc.queue().AddPersistentResidency(mirror_allocation);
-
-  DescriptorResidencyTarget previous = {};
+  DescriptorResidencyTransition transition = {};
   if (!mirror.ReplaceMirrorResidencyTargetIfCurrent(
-          slot, expected_version, std::move(target), &previous)) {
-    if (mirror_allocation)
-      enc.queue().RemovePersistentResidencyAfterCompletion(
-          mirror_allocation, enc.currentSeqId());
+          slot, expected_version, std::move(target), &transition)) {
     return false;
   }
 
-  if (previous.mirror_allocation)
+  for (uint32_t i = 0; i < transition.added_count; i++)
+    enc.queue().AddPersistentResidency(transition.added_allocations[i]);
+  for (uint32_t i = 0; i < transition.removed_count; i++)
     enc.queue().RemovePersistentResidencyAfterCompletion(
-        previous.mirror_allocation, enc.currentSeqId());
-  if (previous.sampler)
+        transition.removed_allocations[i], enc.currentSeqId());
+  if (transition.previous.sampler)
     enc.queue().RetainUntilGpuComplete(
         enc.currentSeqId(),
-        [sampler = std::move(previous.sampler)]() mutable {
+        [sampler = std::move(transition.previous.sampler)]() mutable {
           sampler = nullptr;
         });
   return true;
@@ -6005,6 +6000,7 @@ private:
   };
 
   struct CompiledDirectGraphicsBindingPayload {
+    Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
     std::vector<CompiledCommandRootDescriptorTable> root_tables;
     CompiledCommandInputAssemblerState input_assembler;
@@ -8532,8 +8528,20 @@ private:
     // Serial replay (intra-pass gate off) → no lock needed.
     StallProbe rb_stall_accum = {};
     uint64_t rb_stall_total_us = 0;
+    clock::duration rb_superseded_mask_interval = {};
+    clock::duration rb_compiled_graphics_interval = {};
+    clock::duration rb_compiled_compute_interval = {};
+    clock::duration rb_fallback_classification_interval = {};
+    uint64_t rb_compiled_graphics_packets = 0;
+    uint64_t rb_compiled_compute_packets = 0;
+    uint64_t rb_fallback_classification_ranges = 0;
+    const auto rb_superseded_mask_begin =
+        replay_perf ? clock::now() : clock::time_point{};
     const auto superseded_state_record_mask =
         BuildSupersededGraphicsStateRecordMask(records);
+    if (replay_perf)
+      rb_superseded_mask_interval +=
+          clock::now() - rb_superseded_mask_begin;
     auto replay_one = [&](const CommandRecord &record) {
       DiagReplayRecordScope diag_record_scope(record.d3d_sequence,
                                               ++replay_record_serial);
@@ -8848,6 +8856,7 @@ private:
             replay_packet.common.compiled_binding_payload.emplace();
             auto &binding_payload =
                 *replay_packet.common.compiled_binding_payload;
+            binding_payload.pipeline_state = packet.pipeline.pipeline_state;
             binding_payload.root_signature = packet.pipeline.root_signature;
             binding_payload.root_tables = packet.root_tables;
             binding_payload.input_assembler = packet.input_assembler;
@@ -8857,10 +8866,6 @@ private:
             binding_payload.native_pixel = packet.native_pixel;
             replay_packet.common.compiled_binding_state = binding_state;
             replay_packet.common.compiled_direct_access = direct_access;
-            RegisterCompiledDirectAccessList(
-                replay_packet.common.compiled_direct_access);
-            ReleaseCompiledDirectAccessListAfterSubmit(
-                replay_packet.common.compiled_direct_access);
             QueueCompiledGraphicsPassCommand(
                 chunk, state, std::move(attachments), argument_buffer_size,
                 std::move(replay_packet), EncodeReplayDrawInstancedCompiled,
@@ -8924,6 +8929,7 @@ private:
             replay_packet.common.compiled_binding_payload.emplace();
             auto &binding_payload =
                 *replay_packet.common.compiled_binding_payload;
+            binding_payload.pipeline_state = packet.pipeline.pipeline_state;
             binding_payload.root_signature = packet.pipeline.root_signature;
             binding_payload.root_tables = packet.root_tables;
             binding_payload.input_assembler = packet.input_assembler;
@@ -8947,10 +8953,6 @@ private:
                 replay_packet.common.compiled_direct_access.buffer_allocations
                     .push_back(index_allocation);
             }
-            RegisterCompiledDirectAccessList(
-                replay_packet.common.compiled_direct_access);
-            ReleaseCompiledDirectAccessListAfterSubmit(
-                replay_packet.common.compiled_direct_access);
             QueueCompiledGraphicsPassCommand(
                 chunk, state, std::move(attachments), argument_buffer_size,
                 std::move(replay_packet),
@@ -9033,8 +9035,6 @@ private:
               packet.root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
-          RegisterCompiledDirectAccessList(direct_access);
-          ReleaseCompiledDirectAccessListAfterSubmit(direct_access);
           const auto argument_buffer_size =
               EstimateComputeArgumentBufferSize(*pipeline);
           ReplayDispatchPacket dispatch_packet = {};
@@ -9068,6 +9068,8 @@ private:
         [&](UINT begin, UINT count, dxmt::CompiledFallbackReason reason) {
           if (!dxmt::perf::enabled())
             return;
+          const auto classification_begin = clock::now();
+          rb_fallback_classification_ranges++;
           uint64_t graphics_packets = 0;
           uint64_t compute_packets = 0;
           const UINT end = std::min<UINT>(
@@ -9111,6 +9113,8 @@ private:
           if (compute_packets)
             dxmt::perf::recordFallbackComputePackets(
                 stats, compute_packets, reason);
+          rb_fallback_classification_interval +=
+              clock::now() - classification_begin;
         };
 
     auto compiled_list_is_valid = [&]() {
@@ -9141,8 +9145,14 @@ private:
           for (UINT i = 0; i < segment.graphics_packet_count; i++) {
             const auto &packet =
                 compiled->graphics_packets[segment.first_graphics_packet + i];
+            const auto packet_begin =
+                replay_perf ? clock::now() : clock::time_point{};
             const auto fallback_reason =
                 queue_compiled_graphics_packet(packet);
+            if (replay_perf) {
+              rb_compiled_graphics_interval += clock::now() - packet_begin;
+              rb_compiled_graphics_packets++;
+            }
             if (fallback_reason != CompiledCommandFallbackReason::None) {
               const auto perf_reason =
                   CompiledCommandFallbackReasonToPerf(fallback_reason);
@@ -9157,7 +9167,13 @@ private:
           for (UINT i = 0; i < segment.compute_packet_count; i++) {
             const auto &packet =
                 compiled->compute_packets[segment.first_compute_packet + i];
+            const auto packet_begin =
+                replay_perf ? clock::now() : clock::time_point{};
             const auto fallback_reason = queue_compiled_compute_packet(packet);
+            if (replay_perf) {
+              rb_compiled_compute_interval += clock::now() - packet_begin;
+              rb_compiled_compute_packets++;
+            }
             if (fallback_reason != CompiledCommandFallbackReason::None) {
               const auto perf_reason =
                   CompiledCommandFallbackReasonToPerf(fallback_reason);
@@ -9203,6 +9219,20 @@ private:
       dxmt::perf::recordReplayBreakdown(
           stats, rb_t1 - rb_t0, rb_t2 - rb_t1, rb_t3 - rb_t2, rb_t4 - rb_t3);
       if (stats) {
+        stats->frame_replay_superseded_mask_interval +=
+            rb_superseded_mask_interval;
+        stats->frame_replay_compiled_graphics_interval +=
+            rb_compiled_graphics_interval;
+        stats->frame_replay_compiled_compute_interval +=
+            rb_compiled_compute_interval;
+        stats->frame_replay_fallback_classification_interval +=
+            rb_fallback_classification_interval;
+        stats->frame_replay_compiled_graphics_packet_count +=
+            rb_compiled_graphics_packets;
+        stats->frame_replay_compiled_compute_packet_count +=
+            rb_compiled_compute_packets;
+        stats->frame_replay_fallback_classification_count +=
+            rb_fallback_classification_ranges;
         const auto &timers = perDrawSubTimers();
         const auto &stall = rb_stall_accum;
         stats->frame_replay_get_pipeline_interval +=
@@ -17622,9 +17652,10 @@ private:
     return false;
   }
 
-  // Bindless live/compute per-stage wiring. The mirror ABI packs the slot-27
+  // Bindless live/compute per-stage wiring. The mirror ABI packs a per-stage
   // buffer table and binds root offsets plus the persistent sampler/texture
-  // heaps. The native ABI binds the persistent descriptor heap directly.
+  // heaps. Tessellation VS uses a distinct slot range so it can coexist with
+  // HS in one object function. The native ABI binds the descriptor heap directly.
   template <PipelineStage Stage, PipelineKind Kind = PipelineKind::Ordinary,
             typename State>
   void EncodeShaderBindingsForStageBindless(ArgumentEncodingContext &enc,
@@ -17693,8 +17724,8 @@ private:
           *draw_diag, Stage, shader.constantBufferInfo(),
           reflection.NumConstantBuffers, shader.resourceArgumentInfo(),
           reflection.NumArguments, bt);
-    enc.bindBindlessTables<Stage>(bt, root_offsets, window.texture,
-                                  window.sampler);
+    enc.bindBindlessTables<Stage, Kind>(bt, root_offsets, window.texture,
+                                        window.sampler);
   }
 
   // Bindless-mirror (③.3) snapshot-path root_offsets: the snapshot replay has no live ReplayState,
@@ -19021,22 +19052,17 @@ private:
     add_roots(state.uav_roots);
   }
 
-  void RegisterCompiledDirectAccessList(const CompiledDirectAccessList &list) {
-    auto &queue = device_->GetDXMTDevice().queue();
+  static void PublishCompiledDirectAccessListForEncode(
+      ArgumentEncodingContext &enc, const CompiledDirectAccessList &list) {
+    auto &queue = enc.queue();
+    const auto sequence = enc.currentSeqId();
     for (const auto &allocation : list.buffer_allocations) {
-      if (allocation)
-        queue.AddPersistentResidency(allocation->buffer());
-    }
-  }
-
-  void ReleaseCompiledDirectAccessListAfterSubmit(
-      const CompiledDirectAccessList &list) {
-    auto &queue = device_->GetDXMTDevice().queue();
-    const auto sequence = queue.CurrentSeqId();
-    for (const auto &allocation : list.buffer_allocations) {
-      if (allocation)
-        queue.RemovePersistentResidencyAfterCompletion(allocation->buffer(),
-                                                        sequence);
+      if (!allocation)
+        continue;
+      enc.retainAllocation(allocation.ptr());
+      queue.AddPersistentResidency(allocation->buffer());
+      queue.RemovePersistentResidencyAfterCompletion(allocation->buffer(),
+                                                      sequence);
     }
   }
 
@@ -19076,8 +19102,7 @@ private:
 
     if (compiled) {
       auto &payload = *packet.compiled_binding_payload;
-      for (const auto &allocation : payload.direct_access.buffer_allocations)
-        enc.retainAllocation(allocation.ptr());
+      PublishCompiledDirectAccessListForEncode(enc, payload.direct_access);
       EncodeCompiledComputeBindings(
           enc, payload.packet, payload.binding_state, *packet.pipeline,
           *payload.root, argbuf_offset, payload.native_root_base_buffer);
@@ -21049,9 +21074,8 @@ private:
         dxmt::perf::ScopedFrameDuration retain_scope(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
-        for (const auto &allocation :
-             packet.compiled_direct_access.buffer_allocations)
-          enc.retainAllocation(allocation.ptr());
+        PublishCompiledDirectAccessListForEncode(
+            enc, packet.compiled_direct_access);
       }
       EncodeCompiledDirectGraphicsBindings(
           enc, *packet.compiled_binding_payload,

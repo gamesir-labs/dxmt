@@ -6,9 +6,12 @@
 #include "dxmt_descriptor_revision.hpp"
 #include "d3d12_descriptor_journal.hpp"
 #include "rc/util_rc_ptr.hpp"
+#include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace dxmt {
@@ -137,6 +140,14 @@ struct DescriptorResidencyTarget {
   // or UAV-counter residency.
   WMT::Reference<WMT::Resource> mirror_allocation;
   Rc<dxmt::Sampler> sampler;
+};
+
+struct DescriptorResidencyTransition {
+  DescriptorResidencyTarget previous;
+  std::array<WMT::Resource, 6> added_allocations = {};
+  std::array<WMT::Resource, 6> removed_allocations = {};
+  uint32_t added_count = 0;
+  uint32_t removed_count = 0;
 };
 
 struct DescriptorTextureSlotPayload {
@@ -277,7 +288,12 @@ public:
 
   std::optional<BufferDescriptorRecord>
   bufferDescriptorRecord(uint32_t index) const {
-    std::lock_guard lock(mutex_);
+    auto lock = AcquireLock();
+    return bufferDescriptorRecord(lock, index);
+  }
+  std::optional<BufferDescriptorRecord>
+  bufferDescriptorRecord(const ScopedLock &lock, uint32_t index) const {
+    ValidateLock(lock);
     return buffer_record_mapped_ && index < num_descriptors_
                ? std::optional<BufferDescriptorRecord>(
                      buffer_record_mapped_[index])
@@ -297,16 +313,26 @@ public:
                                   WMT::Resource allocation,
                                   uint64_t gpu_address,
                                   uint64_t byte_size);
+  uint32_t RegisterBufferResource(const ScopedLock &lock,
+                                  uint32_t descriptor_index,
+                                  bool counter_resource,
+                                  uint64_t resource_identity,
+                                  WMT::Resource allocation,
+                                  uint64_t gpu_address,
+                                  uint64_t byte_size);
   bool RefreshBufferResource(uint32_t resource_index,
                              WMT::Resource allocation,
                              uint64_t gpu_address,
                              uint64_t byte_size);
-  void InvalidateBufferResourceTableEntryForTesting(uint32_t resource_index) {
-    ClearBufferResource(resource_index);
-  }
+  void InvalidateBufferResourceTableEntryForTesting(uint32_t resource_index);
   std::optional<DescriptorBackendResourceRecord>
   backendResourceRecord(uint32_t index) const {
-    std::lock_guard lock(mutex_);
+    auto lock = AcquireLock();
+    return backendResourceRecord(lock, index);
+  }
+  std::optional<DescriptorBackendResourceRecord>
+  backendResourceRecord(const ScopedLock &lock, uint32_t index) const {
+    ValidateLock(lock);
     return index < buffer_resources_.size()
                ? std::optional<DescriptorBackendResourceRecord>(
                      buffer_resources_[index])
@@ -317,7 +343,11 @@ public:
     return static_cast<uint32_t>(buffer_resources_.size());
   }
   uint64_t backendResourceTableGeneration() const {
-    std::lock_guard lock(mutex_);
+    auto lock = AcquireLock();
+    return backendResourceTableGeneration(lock);
+  }
+  uint64_t backendResourceTableGeneration(const ScopedLock &lock) const {
+    ValidateLock(lock);
     return buffer_resource_table_generation_;
   }
 
@@ -332,36 +362,63 @@ public:
   }
 
   void WriteNullTableEntry(uint32_t index);
+  void WriteNullTableEntry(const ScopedLock &lock, uint32_t index);
   void WriteBufferTableEntry(uint32_t index, uint64_t gpu_va, uint64_t size,
                              bool typed, uint32_t texture_view_offset = 0);
+  void WriteBufferTableEntry(const ScopedLock &lock, uint32_t index,
+                             uint64_t gpu_va, uint64_t size, bool typed,
+                             uint32_t texture_view_offset = 0);
   void WriteBufferTextureTableEntry(uint32_t index, uint64_t gpu_va,
                                     uint64_t size, uint64_t texture_view_id,
                                     uint32_t element_count,
                                     uint32_t first_element, uint32_t flags);
+  void WriteBufferTextureTableEntry(
+      const ScopedLock &lock, uint32_t index, uint64_t gpu_va, uint64_t size,
+      uint64_t texture_view_id, uint32_t element_count,
+      uint32_t first_element, uint32_t flags);
   void WriteBufferDescriptorRecord(uint32_t index,
+                                   const BufferDescriptorRecord &record);
+  void WriteBufferDescriptorRecord(const ScopedLock &lock, uint32_t index,
                                    const BufferDescriptorRecord &record);
   void WriteTextureTableEntry(uint32_t index, uint64_t gpu_resource_id,
                               uint32_t array_length,
                               float min_lod = 0.0f);
+  void WriteTextureTableEntry(const ScopedLock &lock, uint32_t index,
+                              uint64_t gpu_resource_id,
+                              uint32_t array_length, float min_lod = 0.0f);
   void WriteTexturePoolTableEntry(uint32_t index, uint32_t array_length,
                                   float min_lod = 0.0f);
   void WriteSamplerTableEntry(uint32_t index, const Sampler *sampler);
+  void WriteSamplerTableEntry(const ScopedLock &lock, uint32_t index,
+                              const Sampler *sampler);
   uint64_t SetTexturePoolSlot(uint32_t index, dxmt::Texture *texture,
+                              dxmt::TextureViewKey view,
+                              dxmt::TextureAllocation *allocation);
+  uint64_t SetTexturePoolSlot(const ScopedLock &lock, uint32_t index,
+                              dxmt::Texture *texture,
                               dxmt::TextureViewKey view,
                               dxmt::TextureAllocation *allocation);
   uint64_t SetTexturePoolBufferSlot(
       uint32_t index, WMT::Buffer buffer,
       const WMTTextureBufferViewDescriptor &descriptor, uint64_t offset,
       uint64_t bytes_per_row);
+  uint64_t SetTexturePoolBufferSlot(
+      const ScopedLock &lock, uint32_t index, WMT::Buffer buffer,
+      const WMTTextureBufferViewDescriptor &descriptor, uint64_t offset,
+      uint64_t bytes_per_row);
   uint64_t CopyTexturePoolSlotFrom(uint32_t dst_index,
                                    const DescriptorHeapMirror &src,
                                    uint32_t src_index);
 
-  DescriptorResidencyTarget ReplaceResidencyTarget(
+  DescriptorResidencyTransition ReplaceResidencyTarget(
       uint32_t index, DescriptorResidencyTarget target);
+  DescriptorResidencyTransition ReplaceResidencyTarget(
+      const ScopedLock &lock, uint32_t index,
+      DescriptorResidencyTarget target);
   bool ReplaceMirrorResidencyTargetIfCurrent(
       uint32_t index, dxmt::DescriptorSlotVersion expected_version,
-      DescriptorResidencyTarget target, DescriptorResidencyTarget *previous);
+      DescriptorResidencyTarget target,
+      DescriptorResidencyTransition *transition);
   std::vector<DescriptorResidencyTarget> DrainResidencyTargets();
   std::optional<DescriptorResidencyTarget>
   residencyTarget(uint32_t index) const {
@@ -396,6 +453,11 @@ public:
       uint32_t index, const Sampler *sampler, uint64_t null_handle,
       std::optional<dxmt::DescriptorSlotVersion> expected_version =
           std::nullopt);
+  bool FillSamplerSlot(
+      const ScopedLock &lock, uint32_t index, const Sampler *sampler,
+      uint64_t null_handle,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
 
   /**
    * Fill a TEXTURE slot with an already-resolved (gpuResourceID, arrayLength, minLOD).
@@ -405,6 +467,11 @@ public:
   bool FillTextureSlot(
       uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
       float min_lod = 0.0f,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
+  bool FillTextureSlot(
+      const ScopedLock &lock, uint32_t index, uint64_t gpu_resource_id,
+      uint32_t array_length, float min_lod = 0.0f,
       std::optional<dxmt::DescriptorSlotVersion> expected_version =
           std::nullopt);
 
@@ -419,9 +486,15 @@ public:
       uint32_t index,
       std::optional<dxmt::DescriptorSlotVersion> expected_version =
           std::nullopt);
+  bool ClearTextureSlot(
+      const ScopedLock &lock, uint32_t index,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version =
+          std::nullopt);
 
   /** Begin one heap-local slot publication while holding the mirror lock. */
   dxmt::DescriptorSlotVersion BeginSlotWrite(uint32_t index);
+  dxmt::DescriptorSlotVersion BeginSlotWrite(const ScopedLock &lock,
+                                             uint32_t index);
 
   std::optional<dxmt::DescriptorSlotVersion>
   slotPendingVersion(uint32_t index) const {
@@ -452,6 +525,10 @@ public:
   }
 
 private:
+  void ValidateLock(const ScopedLock &lock) const {
+    if (!lock.owns_lock() || lock.mutex() != &mutex_)
+      std::abort();
+  }
   bool CanPublishVersionUnlocked(
       uint32_t index,
       const std::optional<dxmt::DescriptorSlotVersion> &expected_version) const {
@@ -488,16 +565,36 @@ private:
   uint64_t *SamplerLodBiasPtrUnlocked(uint32_t index);
   uint32_t BufferResourceIndex(uint32_t descriptor_index,
                                bool counter_resource) const;
-  uint64_t NextBufferResourceTableGeneration();
-  void ClearBufferResource(uint32_t resource_index);
-  void ClearBufferResourcesForSlot(uint32_t descriptor_index,
-                                   bool clear_primary,
-                                   bool clear_counter);
-  void WriteTableEntry(uint32_t index, const DescriptorTableEntry &entry);
-  void WriteBufferResourceTableEntry(uint32_t index,
-                                     const DescriptorBackendResourceRecord &record);
-  void WriteSlotMeta(uint32_t index, DescriptorBackendSlotKind kind,
-                     uint32_t flags = 0);
+  uint64_t NextBufferResourceTableGenerationUnlocked();
+  void ClearBufferResourceUnlocked(uint32_t resource_index);
+  void ClearBufferResourcesForSlotUnlocked(uint32_t descriptor_index,
+                                           bool clear_primary,
+                                           bool clear_counter);
+  void WriteTableEntryUnlocked(uint32_t index,
+                               const DescriptorTableEntry &entry);
+  void WriteBufferResourceTableEntryUnlocked(
+      uint32_t index, const DescriptorBackendResourceRecord &record);
+  void WriteBufferDescriptorRecordUnlocked(
+      uint32_t index, const BufferDescriptorRecord &record);
+  void WriteSlotMetaUnlocked(uint32_t index, DescriptorBackendSlotKind kind,
+                             uint32_t flags = 0);
+  bool FillSamplerSlotUnlocked(
+      uint32_t index, const Sampler *sampler, uint64_t null_handle,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version);
+  bool FillTextureSlotUnlocked(
+      uint32_t index, uint64_t gpu_resource_id, uint32_t array_length,
+      float min_lod,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version);
+  bool FillTextureSlotPayloadUnlocked(
+      uint32_t index, uint64_t handle, uint64_t metadata,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version);
+  bool ClearTextureSlotUnlocked(
+      uint32_t index,
+      std::optional<dxmt::DescriptorSlotVersion> expected_version);
+  void UpdateResidencyRefCountsUnlocked(
+      const DescriptorResidencyTarget &previous,
+      const DescriptorResidencyTarget &target,
+      DescriptorResidencyTransition &transition);
 
   WMT::Reference<WMT::Buffer> buffer_;
   WMT::Reference<WMT::Buffer> table_buffer_;
@@ -523,6 +620,8 @@ private:
   std::vector<DescriptorBackendResourceRecord> buffer_resources_;
   std::vector<DescriptorSlotMeta> slot_meta_;
   std::vector<DescriptorResidencyTarget> residency_targets_;
+  std::unordered_map<obj_handle_t, uint32_t>
+      residency_allocation_ref_counts_;
   // Per-slot version bookkeeping. Each heap advances its slots independently;
   // the process-wide content revision is a separate cache invalidation clock.
   std::vector<dxmt::DescriptorSlotVersion> stale_versions_;

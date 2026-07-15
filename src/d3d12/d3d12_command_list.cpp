@@ -427,6 +427,10 @@ struct CompiledCommandBuildState {
   std::vector<CompiledCommandRootDescriptor> graphics_root_descriptors;
   std::optional<CompiledCommandPipelineMetadata> compute_pipeline_metadata;
   std::optional<CompiledCommandPipelineMetadata> graphics_pipeline_metadata;
+  std::optional<CompiledCommandFallbackReason>
+      compute_root_table_materialization;
+  std::optional<CompiledCommandFallbackReason>
+      graphics_root_table_materialization;
   std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>,
              D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT>
       vertex_buffers;
@@ -653,6 +657,16 @@ GetCompiledPipelineMetadata(CompiledCommandBuildState &state, bool compute) {
 }
 
 static void
+InvalidateCompiledRootDescriptorTable(
+    CompiledCommandRootDescriptorTable &table) {
+  const auto root_parameter_index = table.root_parameter_index;
+  const auto base_descriptor = table.base_descriptor;
+  table = {};
+  table.root_parameter_index = root_parameter_index;
+  table.base_descriptor = base_descriptor;
+}
+
+static void
 SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
                            const DescriptorHeapsRecord &record) {
   state.descriptor_heaps = {};
@@ -671,24 +685,33 @@ SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
     else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
       state.descriptor_heaps.sampler = heap;
   }
+  for (auto &table : state.compute_root_tables)
+    InvalidateCompiledRootDescriptorTable(table);
+  for (auto &table : state.graphics_root_tables)
+    InvalidateCompiledRootDescriptorTable(table);
+  state.compute_root_table_materialization.reset();
+  state.graphics_root_table_materialization.reset();
 }
 
-static void
+static bool
 UpsertCompiledRootDescriptorTable(
     std::vector<CompiledCommandRootDescriptorTable> &tables,
     const RootDescriptorTableRecord &record) {
   for (auto &table : tables) {
     if (table.root_parameter_index == record.root_parameter_index) {
+      if (table.base_descriptor.ptr == record.base_descriptor.ptr)
+        return false;
       table = CompiledCommandRootDescriptorTable();
       table.base_descriptor = record.base_descriptor;
       table.root_parameter_index = record.root_parameter_index;
-      return;
+      return true;
     }
   }
   CompiledCommandRootDescriptorTable table = {};
   table.root_parameter_index = record.root_parameter_index;
   table.base_descriptor = record.base_descriptor;
   tables.push_back(table);
+  return true;
 }
 
 static void
@@ -758,18 +781,25 @@ UpdateCompiledCommandBuildState(CompiledCommandBuildState &state,
       state.compute_root_constants.clear();
       state.compute_root_descriptors.clear();
       state.compute_pipeline_metadata.reset();
+      state.compute_root_table_materialization.reset();
     } else {
       state.graphics_root_signature = record->root_signature;
       state.graphics_root_tables.clear();
       state.graphics_root_constants.clear();
       state.graphics_root_descriptors.clear();
       state.graphics_pipeline_metadata.reset();
+      state.graphics_root_table_materialization.reset();
     }
   } else if (const auto *record =
                  std::get_if<RootDescriptorTableRecord>(&payload)) {
     auto &tables = record->compute ? state.compute_root_tables
                                    : state.graphics_root_tables;
-    UpsertCompiledRootDescriptorTable(tables, *record);
+    if (UpsertCompiledRootDescriptorTable(tables, *record)) {
+      if (record->compute)
+        state.compute_root_table_materialization.reset();
+      else
+        state.graphics_root_table_materialization.reset();
+    }
   } else if (const auto *record =
                  std::get_if<RootConstantsRecord>(&payload)) {
     auto &constants = record->compute ? state.compute_root_constants
@@ -937,55 +967,51 @@ MaterializeCompiledRootDescriptorTable(
 }
 
 static CompiledCommandFallbackReason
-MaterializeCompiledGraphicsRootTables(CompiledGraphicsPacket &packet) {
-  if (!packet.pipeline.root_signature)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
+MaterializeCompiledRootTables(CompiledCommandBuildState &state, bool compute) {
+  auto &cached = compute ? state.compute_root_table_materialization
+                         : state.graphics_root_table_materialization;
+  if (cached)
+    return *cached;
 
-  auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
-  if (!root)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-
-  const auto parameters = root->GetParameters();
-  for (auto &table : packet.root_tables) {
-    if (table.root_parameter_index >= parameters.size())
-      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-    const auto &parameter = parameters[table.root_parameter_index];
-    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
-
-    const auto reason = MaterializeCompiledRootDescriptorTable(
-        table, packet.descriptor_heaps, parameter);
-    if (reason != CompiledCommandFallbackReason::None)
-      return reason;
+  const auto &root_signature =
+      compute ? state.compute_root_signature : state.graphics_root_signature;
+  if (!root_signature) {
+    cached = CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
+    return *cached;
   }
 
-  return CompiledCommandFallbackReason::None;
-}
-
-static CompiledCommandFallbackReason
-MaterializeCompiledComputeRootTables(CompiledComputePacket &packet) {
-  if (!packet.pipeline.root_signature)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-
-  auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
-  if (!root)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-
-  const auto parameters = root->GetParameters();
-  for (auto &table : packet.root_tables) {
-    if (table.root_parameter_index >= parameters.size())
-      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-    const auto &parameter = parameters[table.root_parameter_index];
-    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
-
-    const auto reason = MaterializeCompiledRootDescriptorTable(
-        table, packet.descriptor_heaps, parameter);
-    if (reason != CompiledCommandFallbackReason::None)
-      return reason;
+  auto *root = GetDXMTRootSignature(root_signature.ptr());
+  if (!root) {
+    cached = CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
+    return *cached;
   }
 
-  return CompiledCommandFallbackReason::None;
+  const auto parameters = root->GetParameters();
+  auto &tables =
+      compute ? state.compute_root_tables : state.graphics_root_tables;
+  for (auto &table : tables) {
+    if (table.resolved)
+      continue;
+    if (table.root_parameter_index >= parameters.size()) {
+      cached = CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
+      return *cached;
+    }
+    const auto &parameter = parameters[table.root_parameter_index];
+    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+      cached = CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+      return *cached;
+    }
+
+    const auto reason = MaterializeCompiledRootDescriptorTable(
+        table, state.descriptor_heaps, parameter);
+    if (reason != CompiledCommandFallbackReason::None) {
+      cached = reason;
+      return *cached;
+    }
+  }
+
+  cached = CompiledCommandFallbackReason::None;
+  return *cached;
 }
 
 class NativeRootBasePayloadBuilder {
@@ -1466,20 +1492,20 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                               : CompiledPipelineFallbackReasonFromMetadata(
                                     metadata, false);
       if (reason == CompiledCommandFallbackReason::None) {
-        CompiledGraphicsPacket packet;
-        {
-          dxmt::perf::ScopedCodeTimer packet_timer(
-              dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
-          packet = BuildCompiledGraphicsPacket(record, record_index, state,
-                                               metadata);
-        }
         CompiledCommandFallbackReason table_reason;
         {
           dxmt::perf::ScopedCodeTimer table_timer(
               dxmt::PerfCodePath::CompiledBuildRootTableMaterialize);
-          table_reason = MaterializeCompiledGraphicsRootTables(packet);
+          table_reason = MaterializeCompiledRootTables(state, false);
         }
         if (table_reason == CompiledCommandFallbackReason::None) {
+          CompiledGraphicsPacket packet;
+          {
+            dxmt::perf::ScopedCodeTimer packet_timer(
+                dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+            packet = BuildCompiledGraphicsPacket(record, record_index, state,
+                                                 metadata);
+          }
           CompiledCommandFallbackReason native_reason;
           {
             dxmt::perf::ScopedCodeTimer native_timer(
@@ -1524,20 +1550,20 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                               : CompiledPipelineFallbackReasonFromMetadata(
                                     metadata, true);
       if (reason == CompiledCommandFallbackReason::None) {
-        CompiledComputePacket packet;
-        {
-          dxmt::perf::ScopedCodeTimer packet_timer(
-              dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
-          packet = BuildCompiledComputePacket(record, record_index, state,
-                                              metadata);
-        }
         CompiledCommandFallbackReason table_reason;
         {
           dxmt::perf::ScopedCodeTimer table_timer(
               dxmt::PerfCodePath::CompiledBuildRootTableMaterialize);
-          table_reason = MaterializeCompiledComputeRootTables(packet);
+          table_reason = MaterializeCompiledRootTables(state, true);
         }
         if (table_reason == CompiledCommandFallbackReason::None) {
+          CompiledComputePacket packet;
+          {
+            dxmt::perf::ScopedCodeTimer packet_timer(
+                dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+            packet = BuildCompiledComputePacket(record, record_index, state,
+                                                metadata);
+          }
           CompiledCommandFallbackReason native_reason;
           {
             dxmt::perf::ScopedCodeTimer native_timer(
