@@ -115,7 +115,13 @@ d3d12_unit_suites = {
     ),
   },
   'robustness': {
-    'sources': files('robustness/fuzz_spec.cpp'),
+    'sources': files(
+      'robustness/descriptor_sequence_fuzz_spec.cpp',
+      'robustness/fault_injection_spec.cpp',
+      'robustness/fuzz_spec.cpp',
+      'robustness/resource_desc_fuzz_spec.cpp',
+      'robustness/shader_container_fuzz_spec.cpp',
+    ),
   },
   'sync': {
     'sources': files(
@@ -157,7 +163,10 @@ d3d12_unit_suites = {
     ),
   },
   'sparse-resource': {
-    'sources': files('resource/sparse_resource_spec.cpp'),
+    'sources': files(
+      'resource/sparse_mapping_matrix_spec.cpp',
+      'resource/sparse_resource_spec.cpp',
+    ),
   },
 }
 

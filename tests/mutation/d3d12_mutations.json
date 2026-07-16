@@ -22,6 +22,27 @@
       "find": "\"Dispatch\", kDirectList | kBundleList | kComputeList",
       "replace": "\"Dispatch\", kDirectList | kBundleList",
       "test_filter": "QueueMatrix/CrossQueueUavCopySpec.FencePublishesDescriptorBackedUavWrites/ComputeToDirect"
+    },
+    {
+      "id": "dispatch-rejects-exact-dimension-limit",
+      "file": "src/d3d12/d3d12_command_list.cpp",
+      "find": "if (x > kMaxDispatchDimension || y > kMaxDispatchDimension ||",
+      "replace": "if (x >= kMaxDispatchDimension || y > kMaxDispatchDimension ||",
+      "test_filter": "DimensionMatrix/ComputeDispatchBoundarySpec.EnforcesPerDimensionLimit/MaximumX"
+    },
+    {
+      "id": "sparse-skip-range-is-rejected",
+      "file": "src/d3d12/d3d12_command_queue.cpp",
+      "find": "if (flags == D3D12_TILE_RANGE_FLAG_SKIP)\n      return true;",
+      "replace": "if (flags == D3D12_TILE_RANGE_FLAG_SKIP)\n      flags = D3D12_TILE_RANGE_FLAG_NULL;",
+      "test_filter": "SparseMappingMatrixSpec.SkipRangePreservesExistingMapping"
+    },
+    {
+      "id": "sparse-reuse-range-advances-physical-tile",
+      "file": "src/d3d12/d3d12_command_queue.cpp",
+      "find": "heap_tile = (flags & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE)\n                      ? base\n                      : base + cursor.consumed;",
+      "replace": "heap_tile = base + cursor.consumed;",
+      "test_filter": "SparseMappingMatrixSpec.ReuseSinglePhysicalTileAliasesVirtualTiles"
     }
   ]
 }

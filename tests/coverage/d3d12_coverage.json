@@ -12,6 +12,7 @@
           "src/d3d12/d3d12_pipeline.cpp"
         ],
         "minimum_line_percent": 60.0,
+        "minimum_function_percent": 60.0,
         "minimum_branch_percent": 30.0
       },
       "command-and-sync": {
@@ -23,6 +24,7 @@
           "src/d3d12/d3d12_query.cpp"
         ],
         "minimum_line_percent": 48.0,
+        "minimum_function_percent": 65.0,
         "minimum_branch_percent": 27.0
       },
       "descriptor-binding": {
@@ -32,7 +34,49 @@
           "src/d3d12/d3d12_sampler.cpp"
         ],
         "minimum_line_percent": 62.0,
+        "minimum_function_percent": 70.0,
         "minimum_branch_percent": 33.0
+      }
+    }
+  },
+  "error_path": {
+    "minimum_percent": 100.0,
+    "mappings": {
+      "resource-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_RESOURCE_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "ResourceFailureClearsOutputAndNextCallRecovers"
+      },
+      "descriptor-heap-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "DescriptorHeapFailureClearsOutputAndNextCallRecovers"
+      },
+      "compute-pipeline-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "ComputePipelineFailureClearsOutputAndNextCallRecovers"
+      },
+      "invalid-command-recording-state": {
+        "source_globs": ["src/d3d12/d3d12_command_list.cpp"],
+        "source_regex": "recording_error_\\s*=\\s*E_INVALIDARG",
+        "test_globs": ["tests/d3d12/sync/barrier_matrix_spec.cpp"],
+        "test_regex": "InvalidBarrierFailsClose"
+      },
+      "corrupt-pipeline-archive-fallback": {
+        "source_globs": ["src/d3d12/d3d12_pipeline.cpp"],
+        "source_regex": "AttachPSOBinaryArchive",
+        "test_globs": ["tests/d3d12/cache/cache_spec.cpp"],
+        "test_regex": "RejectsCorruptArchiveAndFallsBackToCompilation"
+      },
+      "queue-feedback-error-latching": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "HasDeviceError\\(\\)\\s*\\?\\s*DXGI_ERROR_DEVICE_REMOVED",
+        "test_globs": ["tests/d3d12/queue/queue_spec.cpp"],
+        "test_regex": "CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions"
       }
     }
   },

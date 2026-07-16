@@ -576,4 +576,109 @@ TEST_F(IntegrationCompositionSpec, ExecutesAliasingFrameGraph) {
   readback->Unmap(0, &no_write);
 }
 
+TEST_F(IntegrationCompositionSpec,
+       ExecutesNativeFallbackNativeCopyInOneFrame) {
+  constexpr UINT kElementCount = 8;
+  constexpr UINT kPassCount = 3;
+  constexpr UINT kOutputCount = kElementCount * kPassCount;
+  constexpr UINT64 kBufferSize = kOutputCount * sizeof(std::uint32_t);
+  const auto shader = CompileShader(R"(
+    cbuffer Parameters : register(b0) {
+      uint value;
+      uint base_element;
+    };
+    RWByteAddressBuffer output : register(u0);
+
+    [numthreads(8, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      output.Store((base_element + id.x) * 4, value);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[0].Constants.Num32BitValues = 2;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[1].Descriptor.ShaderRegister = 0;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+
+  const D3D12_SHADER_BYTECODE bytecode = {
+      shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateComputePipeline(root.get(), bytecode);
+  ASSERT_TRUE(pipeline);
+
+  const std::array<std::uint32_t, kOutputCount> zeros = {};
+  auto upload =
+      context_.CreateUploadBuffer(kBufferSize, zeros.data(), kBufferSize);
+  auto output = context_.CreateBuffer(
+      kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto copied = context_.CreateBuffer(
+      kBufferSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  constexpr UINT64 kExecute = 0;
+  auto predicate =
+      context_.CreateUploadBuffer(sizeof(kExecute), &kExecute, sizeof(kExecute));
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(output);
+  ASSERT_TRUE(copied);
+  ASSERT_TRUE(predicate);
+
+  context_.list()->CopyBufferRegion(output.get(), 0, upload.get(), 0,
+                                     kBufferSize);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  context_.list()->SetComputeRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootUnorderedAccessView(
+      1, output->GetGPUVirtualAddress());
+
+  const UINT first_parameters[2] = {1, 0};
+  context_.list()->SetComputeRoot32BitConstants(0, 2, first_parameters, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(context_.list(), output.get());
+
+  context_.list()->SetPredication(predicate.get(), 0,
+                                   D3D12_PREDICATION_OP_EQUAL_ZERO);
+  const UINT fallback_parameters[2] = {2, kElementCount};
+  context_.list()->SetComputeRoot32BitConstants(0, 2, fallback_parameters, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  context_.list()->SetPredication(nullptr, 0,
+                                   D3D12_PREDICATION_OP_EQUAL_ZERO);
+  D3D12TestContext::UavBarrier(context_.list(), output.get());
+
+  const UINT last_parameters[2] = {4, kElementCount * 2};
+  context_.list()->SetComputeRoot32BitConstants(0, 2, last_parameters, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context_.list()->CopyBufferRegion(copied.get(), 0, output.get(), 0,
+                                     kBufferSize);
+  D3D12TestContext::Transition(context_.list(), copied.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(copied.get(), kBufferSize, &bytes), S_OK);
+  ASSERT_EQ(bytes.size(), kBufferSize);
+  std::array<std::uint32_t, kOutputCount> actual = {};
+  std::memcpy(actual.data(), bytes.data(), bytes.size());
+  for (UINT index = 0; index < actual.size(); ++index) {
+    const UINT expected = index < kElementCount
+                              ? 1
+                              : (index < kElementCount * 2 ? 2 : 4);
+    EXPECT_EQ(actual[index], expected) << "element " << index;
+  }
+}
+
 } // namespace

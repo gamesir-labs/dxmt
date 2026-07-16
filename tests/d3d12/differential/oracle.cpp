@@ -235,6 +235,31 @@ bool RunCopyCase(OracleContext &context,
   return result->size() == kValueCount;
 }
 
+bool RunOffsetCopyCase(OracleContext &context,
+                       const std::array<std::uint32_t, kValueCount> &input,
+                       std::vector<std::uint32_t> *result) {
+  std::array<std::uint32_t, kValueCount> initial = {};
+  initial.fill(0xdeadbeefu);
+  auto initial_upload = context.CreateUpload(initial);
+  auto input_upload = context.CreateUpload(input);
+  auto readback = context.CreateBuffer(
+      sizeof(input), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!initial_upload || !input_upload || !readback)
+    return false;
+  context.list()->CopyBufferRegion(readback.get(), 0, initial_upload.get(), 0,
+                                   sizeof(initial));
+  constexpr UINT first = 3;
+  constexpr UINT count = 9;
+  context.list()->CopyBufferRegion(
+      readback.get(), first * sizeof(std::uint32_t), input_upload.get(),
+      first * sizeof(std::uint32_t), count * sizeof(std::uint32_t));
+  if (!context.ExecuteAndReset())
+    return false;
+  *result = context.Readback(readback.get(), kValueCount);
+  return result->size() == kValueCount;
+}
+
 bool RunComputeCase(OracleContext &context,
                     const std::array<std::uint32_t, kValueCount> &input,
                     std::vector<std::uint32_t> *result) {
@@ -320,8 +345,122 @@ bool RunComputeCase(OracleContext &context,
   return result->size() == kValueCount;
 }
 
+bool RunDescriptorTableCase(
+    OracleContext &context,
+    const std::array<std::uint32_t, kValueCount> &input,
+    std::vector<std::uint32_t> *result) {
+  constexpr std::string_view source = R"(
+    ByteAddressBuffer input : register(t0);
+    RWByteAddressBuffer output : register(u0);
+
+    [numthreads(16, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      uint value = input.Load(id.x * 4);
+      output.Store(id.x * 4, value * 3 + id.x);
+    }
+  )";
+  ComPtr<ID3DBlob> shader;
+  ComPtr<ID3DBlob> diagnostics;
+  if (!Check(D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr,
+                        "main", "cs_5_0",
+                        D3DCOMPILE_ENABLE_STRICTNESS |
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                        0, shader.put(), diagnostics.put()),
+             "D3DCompile(descriptor table)"))
+    return false;
+
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  ComPtr<ID3DBlob> root_blob;
+  if (!Check(D3D12SerializeRootSignature(
+                 &root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, root_blob.put(),
+                 diagnostics.put()),
+             "D3D12SerializeRootSignature(descriptor table)"))
+    return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(context.device()->CreateRootSignature(
+                 0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                 IID_PPV_ARGS(root.put())),
+             "CreateRootSignature(descriptor table)"))
+    return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root.get();
+  pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> pipeline;
+  if (!Check(context.device()->CreateComputePipelineState(
+                 &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
+             "CreateComputePipelineState(descriptor table)"))
+    return false;
+
+  auto upload = context.CreateUpload(input);
+  auto output = context.CreateBuffer(
+      sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = context.CreateBuffer(
+      sizeof(input), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heap_desc.NumDescriptors = 2;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> heap;
+  if (!upload || !output || !readback ||
+      !Check(context.device()->CreateDescriptorHeap(
+                 &heap_desc, IID_PPV_ARGS(heap.put())),
+             "CreateDescriptorHeap(descriptor table)"))
+    return false;
+
+  const UINT increment = context.device()->GetDescriptorHandleIncrementSize(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_TYPELESS;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Buffer.NumElements = kValueCount;
+  srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  context.device()->CreateShaderResourceView(upload.get(), &srv, cpu);
+  cpu.ptr += increment;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = kValueCount;
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  context.device()->CreateUnorderedAccessView(output.get(), nullptr, &uav,
+                                               cpu);
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context.list()->SetDescriptorHeaps(1, heaps);
+  context.list()->SetComputeRootSignature(root.get());
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context.list()->Dispatch(1, 1, 1);
+  Transition(context.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list()->CopyBufferRegion(readback.get(), 0, output.get(), 0,
+                                   sizeof(input));
+  if (!context.ExecuteAndReset())
+    return false;
+  *result = context.Readback(readback.get(), kValueCount);
+  return result->size() == kValueCount;
+}
+
 bool RunClearCase(OracleContext &context,
-                  std::vector<std::uint32_t> *result) {
+                  std::vector<std::uint32_t> *result, bool use_rect) {
   constexpr UINT width = 4;
   constexpr UINT height = 4;
   D3D12_HEAP_PROPERTIES heap = {};
@@ -367,8 +506,15 @@ bool RunClearCase(OracleContext &context,
   if (!readback)
     return false;
 
+  constexpr FLOAT black[4] = {};
   constexpr FLOAT color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
-  context.list()->ClearRenderTargetView(rtv, color, 0, nullptr);
+  if (use_rect) {
+    context.list()->ClearRenderTargetView(rtv, black, 0, nullptr);
+    const D3D12_RECT rect = {1, 1, 4, 3};
+    context.list()->ClearRenderTargetView(rtv, color, 1, &rect);
+  } else {
+    context.list()->ClearRenderTargetView(rtv, color, 0, nullptr);
+  }
   Transition(context.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
              D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12_TEXTURE_COPY_LOCATION source = {};
@@ -440,18 +586,33 @@ int main(int argc, char **argv) {
     input[index] = 0x10203040u + index * 0x01020408u;
 
   std::vector<std::uint32_t> copy;
+  std::vector<std::uint32_t> offset_copy;
   std::vector<std::uint32_t> compute;
+  std::vector<std::uint32_t> descriptor_table;
   std::vector<std::uint32_t> clear;
+  std::vector<std::uint32_t> clear_rect;
   if (!RunCopyCase(context, input, &copy)) {
     std::cerr << "buffer_copy case failed\n";
+    return 1;
+  }
+  if (!RunOffsetCopyCase(context, input, &offset_copy)) {
+    std::cerr << "buffer_copy_offset case failed\n";
     return 1;
   }
   if (!RunComputeCase(context, input, &compute)) {
     std::cerr << "compute_u32 case failed\n";
     return 1;
   }
-  if (!RunClearCase(context, &clear)) {
+  if (!RunDescriptorTableCase(context, input, &descriptor_table)) {
+    std::cerr << "descriptor_table_compute case failed\n";
+    return 1;
+  }
+  if (!RunClearCase(context, &clear, false)) {
     std::cerr << "clear_rgba8 case failed\n";
+    return 1;
+  }
+  if (!RunClearCase(context, &clear_rect, true)) {
+    std::cerr << "clear_rect_rgba8 case failed\n";
     return 1;
   }
 
@@ -474,8 +635,11 @@ int main(int argc, char **argv) {
           << context.device_id() << "},\n"
           << "  \"cases\": {\n";
   WriteValues(*output, "buffer_copy", copy, true);
+  WriteValues(*output, "buffer_copy_offset", offset_copy, true);
   WriteValues(*output, "compute_u32", compute, true);
-  WriteValues(*output, "clear_rgba8", clear, false);
+  WriteValues(*output, "descriptor_table_compute", descriptor_table, true);
+  WriteValues(*output, "clear_rgba8", clear, true);
+  WriteValues(*output, "clear_rect_rgba8", clear_rect, false);
   *output << "  }\n}\n";
   return *output ? 0 : 1;
 }

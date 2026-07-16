@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "profile": "gcc-x64-release-full",
+    "host_class": "self-macos-runner Apple Silicon",
+    "collected_on": "2026-07-16",
+    "repetitions": 3,
+    "requests_per_run": 96,
+    "metric": "real_time",
+    "unit": "ns"
+  },
+  "benchmarks": {
+    "BI_D3D12GraphicsPipelineCreationBurst/workers:1/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 1751000000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12GraphicsPipelineCreationBurst/workers:4/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 559000000,
+      "max_regression_percent": 50
+    }
+  }
+}

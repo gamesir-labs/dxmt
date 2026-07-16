@@ -33,6 +33,48 @@
       "environment": {
         "DXMT_D3D12_TIMESTAMP_GPU_RESOLVE": "0"
       }
+    },
+    {
+      "id": "resource-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.ResourceFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_RESOURCE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "resource-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.ResourceFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_RESOURCE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "descriptor-heap-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.DescriptorHeapFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "descriptor-heap-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.DescriptorHeapFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "compute-pipeline-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.ComputePipelineFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "compute-pipeline-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.ComputePipelineFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT": "2"
+      }
     }
   ]
 }

@@ -65,6 +65,23 @@ const bool kTestForceNativeCbvStaleResourceTableEntry = [] {
   return value == "1" || value == "true" || value == "yes";
 }();
 
+std::atomic<uint64_t> g_test_resource_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_descriptor_heap_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_compute_pipeline_creation_occurrence = 0;
+
+static bool
+ShouldInjectCreationFailure(const char *environment_name,
+                            std::atomic<uint64_t> &occurrence) {
+  const auto value = env::getEnvVar(environment_name);
+  if (value.empty())
+    return false;
+  char *end = nullptr;
+  const auto target = std::strtoull(value.c_str(), &end, 0);
+  if (end == value.c_str() || *end || !target)
+    return false;
+  return occurrence.fetch_add(1, std::memory_order_relaxed) + 1 == target;
+}
+
 static bool
 ShouldLogRepeatedDescriptorWarning(std::atomic<uint32_t> &counter) {
   auto previous = counter.fetch_add(1, std::memory_order_relaxed);
@@ -2834,6 +2851,10 @@ public:
     dxmt::perf::ScopedFrameTimer perf_timer(
         dxmt::perf::FrameTimeBucket::CreatePipeline);
     InitReturnPtr(pipeline_state);
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT",
+            g_test_compute_pipeline_creation_occurrence))
+      return E_OUTOFMEMORY;
     HRESULT status = S_OK;
     auto state = d3d12::CreateComputePipelineState(
         static_cast<IMTLD3D12Device *>(this), desc, &status);
@@ -3414,6 +3435,10 @@ public:
     InitReturnPtr(descriptor_heap);
     if (!descriptor_heap)
       return E_POINTER;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT",
+            g_test_descriptor_heap_creation_occurrence))
+      return E_OUTOFMEMORY;
     if (!desc || desc->NumDescriptors == 0)
       return WARN_E_INVALIDARG(__func__);
     if (desc->NodeMask > 1)
@@ -3930,6 +3955,10 @@ public:
     InitReturnPtr(resource);
     if (!resource)
       return E_POINTER;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_RESOURCE_CREATION_AT",
+            g_test_resource_creation_occurrence))
+      return E_OUTOFMEMORY;
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         optimized_clear_value)
       return WARN_E_INVALIDARG(__func__);
