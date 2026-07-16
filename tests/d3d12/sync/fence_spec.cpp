@@ -2,6 +2,8 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <iterator>
+
 namespace {
 
 using dxmt::test::ComPtr;
@@ -9,7 +11,11 @@ using dxmt::test::D3D12TestContext;
 
 class FenceSpec : public ::testing::Test {
 protected:
-  void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
+  void SetUp() override {
+    ASSERT_TRUE(SUCCEEDED(context_.Initialize()));
+    ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device1_.put())),
+              S_OK);
+  }
 
   ComPtr<ID3D12Fence> CreateFence(UINT64 initial_value = 0) {
     ComPtr<ID3D12Fence> fence;
@@ -19,6 +25,7 @@ protected:
   }
 
   D3D12TestContext context_;
+  ComPtr<ID3D12Device1> device1_;
 };
 
 TEST_F(FenceSpec, CpuSignalUpdatesCompletedValue) {
@@ -64,6 +71,90 @@ TEST_F(FenceSpec, MultipleEventsForDifferentValues) {
 
   CloseHandle(first);
   CloseHandle(second);
+}
+
+TEST_F(FenceSpec, MultipleFenceWaitAllSignalsAfterEveryTarget) {
+  auto first = CreateFence();
+  auto second = CreateFence();
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ID3D12Fence *fences[] = {first.get(), second.get()};
+  const UINT64 values[] = {2, 3};
+
+  ASSERT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                fences, values, std::size(fences),
+                D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event),
+            S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+  ASSERT_EQ(first->Signal(values[0]), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+  ASSERT_EQ(second->Signal(values[1]), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+
+  CloseHandle(event);
+}
+
+TEST_F(FenceSpec, MultipleFenceWaitAnySignalsAfterFirstTarget) {
+  auto first = CreateFence();
+  auto second = CreateFence();
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ID3D12Fence *fences[] = {first.get(), second.get()};
+  const UINT64 values[] = {2, 3};
+
+  ASSERT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                fences, values, std::size(fences),
+                D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, event),
+            S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+  ASSERT_EQ(second->Signal(values[1]), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+  EXPECT_EQ(first->GetCompletedValue(), 0u);
+
+  CloseHandle(event);
+}
+
+TEST_F(FenceSpec, MultipleFenceAlreadySatisfiedSignalsImmediately) {
+  auto first = CreateFence(2);
+  auto second = CreateFence(3);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ID3D12Fence *fences[] = {first.get(), second.get()};
+  const UINT64 values[] = {2, 3};
+
+  ASSERT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                fences, values, std::size(fences),
+                D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event),
+            S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+
+  CloseHandle(event);
+}
+
+TEST_F(FenceSpec, MultipleFenceWaitAllTracksDuplicateFenceTargets) {
+  auto fence = CreateFence();
+  ASSERT_TRUE(fence);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ID3D12Fence *fences[] = {fence.get(), fence.get()};
+  const UINT64 values[] = {2, 5};
+
+  ASSERT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                fences, values, std::size(fences),
+                D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event),
+            S_OK);
+  ASSERT_EQ(fence->Signal(values[0]), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+  ASSERT_EQ(fence->Signal(values[1]), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+
+  CloseHandle(event);
 }
 
 } // namespace
