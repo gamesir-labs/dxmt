@@ -68,4 +68,27 @@ TEST(D3D12BindingHotspot,
   EXPECT_EQ(measurement.actual, measurement.expected);
 }
 
+TEST(D3D12BindingHotspot, BatchesThousandsOfLogicalCasesIntoGpuOracles) {
+  BindingHotspotMeasurement argument_updates;
+  auto error =
+      dxmt::test::RunArgumentTableUpdateScenario(64, 32, &argument_updates);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(argument_updates.operations, 2048u);
+  EXPECT_EQ(argument_updates.actual, argument_updates.expected);
+
+  BindingHotspotMeasurement root_tables;
+  error = dxmt::test::RunRootTableMaterializationScenario(128, 16,
+                                                          &root_tables);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(root_tables.operations, 2048u);
+  EXPECT_EQ(root_tables.actual, root_tables.expected);
+
+  BindingHotspotMeasurement descriptor_copies;
+  error = dxmt::test::RunDescriptorMirrorMutationScenario(
+      64, 32, &descriptor_copies);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(descriptor_copies.operations, 2048u);
+  EXPECT_EQ(descriptor_copies.actual, descriptor_copies.expected);
+}
+
 } // namespace

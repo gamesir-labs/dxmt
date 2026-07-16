@@ -73,7 +73,10 @@ d3d12_unit_suites = {
     ),
   },
   'integration': {
-    'sources': files('integration/frame_spec.cpp'),
+    'sources': files(
+      'integration/batched_matrix_spec.cpp',
+      'integration/frame_spec.cpp',
+    ),
   },
   'pipeline': {
     'sources': files('pipeline/stream_spec.cpp'),
