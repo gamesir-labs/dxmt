@@ -223,6 +223,26 @@ python3 scripts/run-d3d12-mutations.py --minimum-score 100
 
 Both gates are available in the `D3D12 Quality Gates` workflow.
 
+## Deterministic fuzzing and fault injection
+
+The D3D12 robustness suite replays 128 fixed command-lifecycle grammars against
+a reference state model, delta-debugs any mismatch, round-trips 128 generated
+root signatures, and rejects a checked-in structural shader corruption corpus.
+Set `DXMT_D3D12_FUZZ_SEED` to replay one reported command seed.
+
+Fault scenarios are declared in
+`tests/fault_injection/d3d12_faults.json`. The runner gives every scenario a
+fresh Wine process so DLL-level fault switches cannot leak between tests:
+
+```sh
+python3 scripts/run-d3d12-fault-injection.py
+```
+
+The matrix covers native descriptor lookup loss, stale native resources,
+command-buffer feedback errors, sparse-residency cleanup, and timestamp
+fallback behavior. It is enforced by the robustness job in the quality-gates
+workflow.
+
 The managed Wine dependency is fingerprinted below `.cache/managed/deps`.
 
 To use a complete prebuilt Wine cache for a one-off run:

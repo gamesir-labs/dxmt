@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "native-cbv-lookup-miss",
+      "filter": "D3D12DescriptorSpec.FailsClosedWhenNativeCbvResourceLookupIsUnavailable:D3D12DescriptorSpec.FailsClosedForCopiedCbvWhenNativeResourceLookupIsUnavailable",
+      "environment": {
+        "DXMT_TEST_REQUIRE_FAULT_INJECTION": "1",
+        "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS": "1"
+      }
+    },
+    {
+      "id": "stale-native-cbv-resource",
+      "filter": "D3D12DescriptorSpec.RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution",
+      "environment": {
+        "DXMT_TEST_REQUIRE_FAULT_INJECTION": "1",
+        "DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY": "1"
+      }
+    },
+    {
+      "id": "command-buffer-feedback-error",
+      "filter": "D3D12QueueErrorSpec.CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions",
+      "environment": {}
+    },
+    {
+      "id": "sparse-residency-after-feedback-error",
+      "filter": "D3D12SparseResourceSpec.DoesNotAccumulateSparseResidencySetsAfterQueueFailure",
+      "environment": {}
+    },
+    {
+      "id": "timestamp-cpu-resolve-fallback",
+      "filter": "TimestampSpec.*",
+      "environment": {
+        "DXMT_D3D12_TIMESTAMP_GPU_RESOLVE": "0"
+      }
+    }
+  ]
+}

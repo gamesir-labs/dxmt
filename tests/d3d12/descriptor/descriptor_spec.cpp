@@ -209,6 +209,10 @@ bool TestInjectionEnabled(const char *name) {
           std::strcmp(value, "yes") == 0);
 }
 
+bool FaultInjectionRequired() {
+  return TestInjectionEnabled("DXMT_TEST_REQUIRE_FAULT_INJECTION");
+}
+
 struct DescriptorTableDrawOptions {
   bool execute_indirect = false;
   bool test_occlusion_queries = false;
@@ -222,6 +226,7 @@ struct DescriptorTableDrawOptions {
   bool use_static_sampler = false;
   bool repeat_graphics_root_signature = false;
   bool set_compute_root_signature = false;
+  bool expect_cbv_rejected = false;
 };
 
 void RunDescriptorTableDraw(
@@ -743,7 +748,10 @@ void RunDescriptorTableDraw(
                      2);
   } else {
     ExpectSolidColor(readback,
-                     options.null_cbv ? 0x00000000 : 0xb2664c19, 2);
+                     options.null_cbv || options.expect_cbv_rejected
+                         ? 0x00000000
+                         : 0xb2664c19,
+                     2);
   }
 
   if (query_results) {
@@ -1122,30 +1130,40 @@ TEST_F(D3D12DescriptorSpec,
 }
 
 TEST_F(D3D12DescriptorSpec,
-       PreservesValidCbvWhenNativeResourceLookupIsUnavailable) {
+       FailsClosedWhenNativeCbvResourceLookupIsUnavailable) {
   if (!TestInjectionEnabled(
-          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS"))
+          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS")) {
+    ASSERT_FALSE(FaultInjectionRequired())
+        << "required native CBV lookup-miss injection was not propagated";
     GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
+  }
 
-  RunDescriptorTableDraw(context_);
+  RunDescriptorTableDraw(context_, {.expect_cbv_rejected = true});
 }
 
 TEST_F(D3D12DescriptorSpec,
-       PreservesCopiedValidCbvWhenNativeResourceLookupIsUnavailable) {
+       FailsClosedForCopiedCbvWhenNativeResourceLookupIsUnavailable) {
   if (!TestInjectionEnabled(
-          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS"))
+          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS")) {
+    ASSERT_FALSE(FaultInjectionRequired())
+        << "required native CBV lookup-miss injection was not propagated";
     GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
+  }
 
-  RunDescriptorTableDraw(context_, {.copy_from_released_cpu_heaps = true});
+  RunDescriptorTableDraw(context_, {.copy_from_released_cpu_heaps = true,
+                                    .expect_cbv_rejected = true});
 }
 
 TEST_F(D3D12DescriptorSpec,
        RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution) {
   if (!TestInjectionEnabled(
-          "DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY"))
+          "DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY")) {
+    ASSERT_FALSE(FaultInjectionRequired())
+        << "required stale native CBV injection was not propagated";
     GTEST_SKIP() << "stale native CBV resource-table injection is disabled";
+  }
 
-  RunDescriptorTableDraw(context_);
+  RunDescriptorTableDraw(context_, {.expect_cbv_rejected = true});
 }
 
 TEST_F(D3D12DescriptorSpec, PopulatesIndependentDescriptorSlotsConcurrently) {

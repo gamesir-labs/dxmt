@@ -14,12 +14,18 @@ using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 
 enum class ShaderContainerCorruption {
+  EmptyContainer,
   TruncatedHeader,
+  HeaderWithoutPartTable,
   BadMagic,
+  DeclaredSizeBeforeHeader,
   DeclaredSizePastEnd,
+  ZeroPartCount,
   ExcessivePartCount,
   PartOffsetBeforeTable,
   PartOffsetPastEnd,
+  FirstPartTagZero,
+  FirstPartSizeZero,
   PartSizePastEnd,
   TruncatedPartPayload,
 };
@@ -59,15 +65,28 @@ protected:
     constexpr std::size_t kPartCountOffset = 28;
     constexpr std::size_t kPartTableOffset = 32;
     switch (corruption) {
+    case ShaderContainerCorruption::EmptyContainer:
+      bytes_.clear();
+      break;
     case ShaderContainerCorruption::TruncatedHeader:
       bytes_.resize(kPartTableOffset - 1);
+      break;
+    case ShaderContainerCorruption::HeaderWithoutPartTable:
+      bytes_.resize(kPartTableOffset);
+      Store32(kContainerSizeOffset, static_cast<std::uint32_t>(bytes_.size()));
       break;
     case ShaderContainerCorruption::BadMagic:
       Store32(0, 0);
       break;
+    case ShaderContainerCorruption::DeclaredSizeBeforeHeader:
+      Store32(kContainerSizeOffset, kPartTableOffset - 1);
+      break;
     case ShaderContainerCorruption::DeclaredSizePastEnd:
       Store32(kContainerSizeOffset,
               static_cast<std::uint32_t>(bytes_.size() + 1));
+      break;
+    case ShaderContainerCorruption::ZeroPartCount:
+      Store32(kPartCountOffset, 0);
       break;
     case ShaderContainerCorruption::ExcessivePartCount:
       Store32(kPartCountOffset, std::numeric_limits<std::uint32_t>::max());
@@ -77,6 +96,12 @@ protected:
       break;
     case ShaderContainerCorruption::PartOffsetPastEnd:
       Store32(kPartTableOffset, static_cast<std::uint32_t>(bytes_.size()));
+      break;
+    case ShaderContainerCorruption::FirstPartTagZero:
+      Store32(Load32(kPartTableOffset), 0);
+      break;
+    case ShaderContainerCorruption::FirstPartSizeZero:
+      Store32(Load32(kPartTableOffset) + sizeof(std::uint32_t), 0);
       break;
     case ShaderContainerCorruption::PartSizePastEnd:
       Store32(Load32(kPartTableOffset) + sizeof(std::uint32_t),
@@ -93,18 +118,30 @@ public:
   static const char *
   Name(const ::testing::TestParamInfo<ShaderContainerCorruption> &info) {
     switch (info.param) {
+    case ShaderContainerCorruption::EmptyContainer:
+      return "EmptyContainer";
     case ShaderContainerCorruption::TruncatedHeader:
       return "TruncatedHeader";
+    case ShaderContainerCorruption::HeaderWithoutPartTable:
+      return "HeaderWithoutPartTable";
     case ShaderContainerCorruption::BadMagic:
       return "BadMagic";
+    case ShaderContainerCorruption::DeclaredSizeBeforeHeader:
+      return "DeclaredSizeBeforeHeader";
     case ShaderContainerCorruption::DeclaredSizePastEnd:
       return "DeclaredSizePastEnd";
+    case ShaderContainerCorruption::ZeroPartCount:
+      return "ZeroPartCount";
     case ShaderContainerCorruption::ExcessivePartCount:
       return "ExcessivePartCount";
     case ShaderContainerCorruption::PartOffsetBeforeTable:
       return "PartOffsetBeforeTable";
     case ShaderContainerCorruption::PartOffsetPastEnd:
       return "PartOffsetPastEnd";
+    case ShaderContainerCorruption::FirstPartTagZero:
+      return "FirstPartTagZero";
+    case ShaderContainerCorruption::FirstPartSizeZero:
+      return "FirstPartSizeZero";
     case ShaderContainerCorruption::PartSizePastEnd:
       return "PartSizePastEnd";
     case ShaderContainerCorruption::TruncatedPartPayload:
@@ -134,12 +171,18 @@ TEST_P(ShaderContainerSpec, CorruptionCorpusIsRejected) {
 
 INSTANTIATE_TEST_SUITE_P(
     InvalidContainers, ShaderContainerSpec,
-    ::testing::Values(ShaderContainerCorruption::TruncatedHeader,
+    ::testing::Values(ShaderContainerCorruption::EmptyContainer,
+                      ShaderContainerCorruption::TruncatedHeader,
+                      ShaderContainerCorruption::HeaderWithoutPartTable,
                       ShaderContainerCorruption::BadMagic,
+                      ShaderContainerCorruption::DeclaredSizeBeforeHeader,
                       ShaderContainerCorruption::DeclaredSizePastEnd,
+                      ShaderContainerCorruption::ZeroPartCount,
                       ShaderContainerCorruption::ExcessivePartCount,
                       ShaderContainerCorruption::PartOffsetBeforeTable,
                       ShaderContainerCorruption::PartOffsetPastEnd,
+                      ShaderContainerCorruption::FirstPartTagZero,
+                      ShaderContainerCorruption::FirstPartSizeZero,
                       ShaderContainerCorruption::PartSizePastEnd,
                       ShaderContainerCorruption::TruncatedPartPayload),
     ShaderContainerSpec::Name);

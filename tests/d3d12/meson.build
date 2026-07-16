@@ -99,6 +99,9 @@ d3d12_unit_suites = {
       'root_signature/serialization_spec.cpp',
     ),
   },
+  'robustness': {
+    'sources': files('robustness/fuzz_spec.cpp'),
+  },
   'sync': {
     'sources': files(
       'sync/aliasing_barrier_spec.cpp',
