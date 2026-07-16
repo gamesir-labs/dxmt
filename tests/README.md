@@ -180,6 +180,26 @@ dedicated prefix when needed, and injects the staged runtime before starting the
 coordinator. Do not run the PE directly when validating DXMT behavior, because
 that can silently select stale DLLs.
 
+## Windows/WARP differential snapshots
+
+The `D3D12 WARP Differential` workflow builds one self-contained oracle on
+Windows and captures a WARP reference, then runs the same PE against the staged
+DXMT runtime. The versioned JSON snapshot contains exact buffer-copy, compute,
+and render-target-clear results. Adapter metadata and diagnostic hashes do not
+participate in comparison; case names, kinds, and values do. Float cases may
+declare an absolute tolerance in the reference.
+
+Compare a downloaded WARP artifact locally with:
+
+```sh
+scripts/run-d3d12-differential.sh \
+  .cache/managed/profiles/gcc-x64-release-full/build \
+  .cache/differential/warp-reference.json
+```
+
+The runner rebuilds the oracle, stages the current D3D12 runtime, validates the
+candidate JSON, and rejects missing, unexpected, or mismatched cases.
+
 The managed Wine dependency is fingerprinted below `.cache/managed/deps`.
 
 To use a complete prebuilt Wine cache for a one-off run:

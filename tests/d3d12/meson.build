@@ -150,3 +150,11 @@ d3d12_unit_dependencies += [
   d3dcompiler_test_dep,
   dxgi_dep,
 ]
+
+d3d12_differential_oracle = executable(
+  'dxmt-d3d12-differential-oracle',
+  files('differential/oracle.cpp'),
+  dependencies: [d3d12_dep, d3dcompiler_test_dep, dxgi_dep],
+  include_directories: [d3d12_test_include_dirs],
+  install: false,
+)

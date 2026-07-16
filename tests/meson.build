@@ -156,6 +156,7 @@ alias_target(
   dxmt_wine_d3d10_tests,
   dxmt_wine_d3d11_tests,
   dxmt_wine_d3d12_tests,
+  d3d12_differential_oracle,
 )
 
 alias_target(
@@ -177,4 +178,5 @@ alias_target(
   'dxmt-wine-tests-d3d12',
   dxmt_wine_test_scheduler,
   dxmt_wine_d3d12_tests,
+  d3d12_differential_oracle,
 )

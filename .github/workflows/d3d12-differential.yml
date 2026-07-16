@@ -1,0 +1,84 @@
+name: D3D12 WARP Differential
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  warp-reference:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build Oracle
+        shell: cmd
+        run: >-
+          cl /nologo /EHsc /std:c++20 /O2 /W4
+          /I tests\include
+          tests\d3d12\differential\oracle.cpp
+          d3d12.lib dxgi.lib d3dcompiler.lib
+          /Fe:d3d12-differential-oracle.exe
+
+      - name: Capture WARP Snapshot
+        shell: cmd
+        run: >-
+          d3d12-differential-oracle.exe
+          --adapter=warp
+          --output=warp-reference.json
+
+      - name: Validate Snapshot JSON
+        shell: pwsh
+        run: Get-Content warp-reference.json | ConvertFrom-Json | Out-Null
+
+      - name: Upload WARP Snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d12-warp-reference
+          path: warp-reference.json
+
+  dxmt-candidate:
+    runs-on: self-macos-runner
+    needs: warp-reference
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          clean: false
+          submodules: true
+
+      - name: Download WARP Snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: d3d12-warp-reference
+          path: .cache/differential
+
+      - name: Prepare Host and Wine
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
+          WINE_ACCESS_TOKEN: ${{ secrets.WINE_ACCESS_TOKEN }}
+        run: |
+          scripts/ci-self-hosted.sh setup-host
+          scripts/dxmt-builder bootstrap wine-x64
+
+      - name: Build DXMT Oracle
+        run: scripts/dxmt-builder build --profile gcc-x64-release-full tests-d3d12
+
+      - name: Compare DXMT with WARP
+        run: |
+          scripts/run-d3d12-differential.sh \
+            .cache/managed/profiles/gcc-x64-release-full/build \
+            .cache/differential/warp-reference.json \
+            .cache/differential/dxmt-candidate.json
+
+      - name: Upload Differential Snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d12-differential-snapshots
+          path: .cache/differential/*.json
