@@ -2010,6 +2010,8 @@ public:
   void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pipeline_state) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListClearState);
+    if (DropBundleCommand("ClearState"))
+      return;
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     g_current_command_record_d3d_sequence =
@@ -2058,6 +2060,8 @@ public:
                                           UINT64 byte_count) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListCopyBuffer);
+    if (DropBundleCommand("CopyBufferRegion"))
+      return;
     RecordCopyBufferRegion("CopyBufferRegion", dst_buffer, dst_offset, src_buffer,
                            src_offset, byte_count);
   }
@@ -2067,6 +2071,8 @@ public:
                                            const D3D12_BOX *src_box) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListCopyTexture);
+    if (DropBundleCommand("CopyTextureRegion"))
+      return;
     if (!dst || !src || !dst->pResource || !src->pResource)
       return;
     SnapshotCopyTextureSourceBuffer(src, src_box);
@@ -2087,6 +2093,8 @@ public:
                                       ID3D12Resource *src_resource) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListCopyResource);
+    if (DropBundleCommand("CopyResource"))
+      return;
     if (!dst_resource || !src_resource)
       return;
     g_current_command_record_d3d_sequence =
@@ -2100,6 +2108,8 @@ public:
                                    D3D12_TILE_COPY_FLAGS flags) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListCopyTiles);
+    if (DropBundleCommand("CopyTiles"))
+      return;
     if (!tiled_resource || !tile_region_start_coordinate || !tile_region_size ||
         !buffer)
       return;
@@ -2137,6 +2147,8 @@ public:
                                             DXGI_FORMAT format) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListResolve);
+    if (DropBundleCommand("ResolveSubresource"))
+      return;
     if (!dst_resource || !src_resource)
       return;
     g_current_command_record_d3d_sequence =
@@ -2162,6 +2174,8 @@ public:
   void STDMETHODCALLTYPE RSSetViewports(UINT viewport_count, const D3D12_VIEWPORT *viewports) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListViewports);
+    if (DropBundleCommand("RSSetViewports"))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_rs_set_viewports(this, viewport_count, viewports);
     ViewportRecord record = {};
@@ -2172,6 +2186,8 @@ public:
   void STDMETHODCALLTYPE RSSetScissorRects(UINT rect_count, const D3D12_RECT *rects) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListScissors);
+    if (DropBundleCommand("RSSetScissorRects"))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_rs_set_scissor_rects(this, rect_count, rects);
     ScissorRecord record = {};
@@ -2209,6 +2225,8 @@ public:
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListResourceBarrier);
+    if (DropBundleCommand("ResourceBarrier"))
+      return;
     if (!barriers || !barrier_count)
       return;
 
@@ -2488,6 +2506,8 @@ public:
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListStreamOutput);
+    if (DropBundleCommand("SOSetTargets"))
+      return;
     if (!view_count)
       return;
 
@@ -2502,6 +2522,8 @@ public:
                                             const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRenderTargets);
+    if (DropBundleCommand("OMSetRenderTargets"))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_om_set_render_targets(
             this, render_target_descriptor_count, render_target_descriptors,
@@ -2542,6 +2564,8 @@ public:
                                                const D3D12_RECT *rects) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListClearDepthStencil);
+    if (DropBundleCommand("ClearDepthStencilView"))
+      return;
     auto descriptor = GetDescriptorRecordFromCpuHandle(
         dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     if (!descriptor)
@@ -2562,6 +2586,8 @@ public:
                                                UINT rect_count, const D3D12_RECT *rects) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListClearRenderTarget);
+    if (DropBundleCommand("ClearRenderTargetView"))
+      return;
     auto descriptor = GetDescriptorRecordFromCpuHandle(
         rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     if (!descriptor)
@@ -2583,6 +2609,8 @@ public:
                                                       UINT rect_count, const D3D12_RECT *rects) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListClearUav);
+    if (DropBundleCommand("ClearUnorderedAccessViewUint"))
+      return;
     if (!resource || !values)
       return;
     auto descriptor =
@@ -2617,6 +2645,8 @@ public:
                                                        UINT rect_count, const D3D12_RECT *rects) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListClearUav);
+    if (DropBundleCommand("ClearUnorderedAccessViewFloat"))
+      return;
     if (!resource || !values)
       return;
     auto descriptor =
@@ -2647,6 +2677,8 @@ public:
   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListDiscard);
+    if (DropBundleCommand("DiscardResource"))
+      return;
     if (!resource)
       return;
     g_current_command_record_d3d_sequence =
@@ -2668,6 +2700,8 @@ public:
   void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListQueryBeginEnd);
+    if (DropBundleCommand("BeginQuery"))
+      return;
     if (!heap)
       return;
     g_current_command_record_d3d_sequence =
@@ -2678,6 +2712,8 @@ public:
   void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListQueryBeginEnd);
+    if (DropBundleCommand("EndQuery"))
+      return;
     if (!heap)
       return;
     g_current_command_record_d3d_sequence =
@@ -2691,6 +2727,8 @@ public:
                                           UINT64 aligned_dst_buffer_offset) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListQueryResolve);
+    if (DropBundleCommand("ResolveQueryData"))
+      return;
     if (!heap || !dst_buffer || !query_count)
       return;
     g_current_command_record_d3d_sequence =
@@ -2705,6 +2743,8 @@ public:
                                         D3D12_PREDICATION_OP operation) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListPredication);
+    if (DropBundleCommand("SetPredication"))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_predication(
             this, buffer, aligned_buffer_offset, static_cast<uint32_t>(operation));
@@ -2748,6 +2788,8 @@ public:
       const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    if (DropBundleCommand("AtomicCopyBufferUINT"))
+      return;
     // A normal blit copy cannot provide AtomicCopy's dependent-range ordering
     // and atomic publication contract. Fail Close explicitly rather than
     // recording a semantically different CopyBufferRegion.
@@ -2763,6 +2805,8 @@ public:
       const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    if (DropBundleCommand("AtomicCopyBufferUINT64"))
+      return;
     recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: AtomicCopyBufferUINT64 is unsupported");
   }
@@ -2799,6 +2843,8 @@ public:
       D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListResolve);
+    if (DropBundleCommand("ResolveSubresourceRegion"))
+      return;
     if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) {
       recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion decompress mode is unsupported");
@@ -2871,6 +2917,8 @@ public:
       D3D12_RENDER_PASS_FLAGS flags) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRenderPassBegin);
+    if (DropBundleCommand("BeginRenderPass"))
+      return;
     pending_render_pass_resolves_.clear();
     if (flags & ~(D3D12_RENDER_PASS_FLAG_NONE |
                   D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES)) {
@@ -2937,6 +2985,8 @@ public:
   void STDMETHODCALLTYPE EndRenderPass() override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRenderPassEnd);
+    if (DropBundleCommand("EndRenderPass"))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_end_render_pass(this);
     for (const auto &resolve : pending_render_pass_resolves_) {
@@ -3215,9 +3265,8 @@ private:
 
     switch (type_) {
     case D3D12_COMMAND_LIST_TYPE_DIRECT:
-      return true;
     case D3D12_COMMAND_LIST_TYPE_BUNDLE:
-      return state->GetType() == PipelineStateType::Graphics;
+      return true;
     case D3D12_COMMAND_LIST_TYPE_COMPUTE:
       return state->GetType() == PipelineStateType::Compute;
     default:
@@ -3358,6 +3407,14 @@ private:
             byte_count);
     AddRecord(CopyBufferRegionRecord{
         dst_buffer, dst_offset, src_buffer, src_offset, byte_count});
+  }
+
+  bool DropBundleCommand(const char *command) const {
+    if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+      return false;
+    WARN("D3D12GraphicsCommandList: ", command,
+         " is not valid in a bundle and was dropped");
+    return true;
   }
 
   template <typename T>

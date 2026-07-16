@@ -41,6 +41,7 @@ d3d12_unit_suites = {
   'command': {
     'sources': files(
       'command/allocator_lifecycle_spec.cpp',
+      'command/bundle_legality_spec.cpp',
       'command/list_lifecycle_spec.cpp',
       'command/list_state_spec.cpp',
       'command/state_machine_spec.cpp',
@@ -117,7 +118,10 @@ d3d12_unit_suites = {
     ),
   },
   'resource': {
-    'sources': files('resource/resource_spec.cpp'),
+    'sources': files(
+      'resource/residency_spec.cpp',
+      'resource/resource_spec.cpp',
+    ),
   },
   'shader': {
     'sources': files(
