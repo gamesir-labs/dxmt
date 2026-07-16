@@ -73,12 +73,6 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC BasicGraphicsPipelineDesc(
   return desc;
 }
 
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
-struct alignas(void *) ShaderPipelineSubobject {
-  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
-  D3D12_SHADER_BYTECODE shader = {};
-};
-
 struct ScopedArchiveTestEnvironment {
   ScopedArchiveTestEnvironment(const char *suffix) {
     std::ostringstream name;
