@@ -24,7 +24,7 @@ struct CommandListPair {
   ComPtr<ID3D12GraphicsCommandList> list;
 };
 
-class IntegrationFrameSpec : public ::testing::TestWithParam<FramePath> {
+class IntegrationTestBase : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
 
@@ -57,6 +57,10 @@ protected:
 
   D3D12TestContext context_;
 };
+
+class IntegrationFrameSpec
+    : public IntegrationTestBase,
+      public ::testing::WithParamInterface<FramePath> {};
 
 TEST_P(IntegrationFrameSpec, UploadComputeRenderReadback) {
   constexpr UINT kSize = 8;
@@ -323,5 +327,253 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param == FramePath::SingleQueue ? "SingleQueue"
                                                    : "CopyComputeDirect";
     });
+
+class IntegrationCompositionSpec : public IntegrationTestBase {};
+
+TEST_F(IntegrationCompositionSpec, RecyclesDescriptorRingAcrossFrames) {
+  constexpr UINT kFrameCount = 8;
+  constexpr UINT kRingSize = 3;
+  constexpr std::uint32_t kMask = 0x5a5a5a5a;
+  const auto shader = CompileShader(R"(
+    ByteAddressBuffer input : register(t0);
+    RWByteAddressBuffer output : register(u0);
+
+    [numthreads(1, 1, 1)]
+    void main() {
+      output.Store(0, input.Load(0) ^ 0x5a5a5a5a);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+
+  const D3D12_SHADER_BYTECODE bytecode = {
+      shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateComputePipeline(root.get(), bytecode);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRingSize * 2, true);
+  auto readback = context_.CreateBuffer(
+      kFrameCount * sizeof(std::uint32_t), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(heap);
+  ASSERT_TRUE(readback);
+
+  std::array<std::uint32_t, kFrameCount> input_values = {};
+  std::array<ComPtr<ID3D12Resource>, kFrameCount> inputs;
+  std::array<ComPtr<ID3D12Resource>, kFrameCount> outputs;
+  std::array<CommandListPair, kFrameCount> commands;
+  for (UINT frame = 0; frame < kFrameCount; ++frame) {
+    input_values[frame] = 0x10203040u + frame * 0x01010101u;
+    inputs[frame] = context_.CreateUploadBuffer(
+        sizeof(input_values[frame]), &input_values[frame],
+        sizeof(input_values[frame]));
+    outputs[frame] = context_.CreateBuffer(
+        sizeof(input_values[frame]), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ASSERT_TRUE(inputs[frame]);
+    ASSERT_TRUE(outputs[frame]);
+  }
+
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_TYPELESS;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Buffer.NumElements = 1;
+  srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = 1;
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+
+  for (UINT frame = 0; frame < kFrameCount; ++frame) {
+    const UINT slot = frame % kRingSize;
+    if (frame >= kRingSize) {
+      ASSERT_EQ(context_.WaitForFence(fence.get(), frame - kRingSize + 1),
+                S_OK);
+    }
+
+    context_.device()->CreateShaderResourceView(
+        inputs[frame].get(), &srv,
+        context_.CpuDescriptorHandle(heap.get(), slot * 2));
+    context_.device()->CreateUnorderedAccessView(
+        outputs[frame].get(), nullptr, &uav,
+        context_.CpuDescriptorHandle(heap.get(), slot * 2 + 1));
+    commands[frame] = CreateList(D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ASSERT_TRUE(commands[frame].list);
+    ID3D12DescriptorHeap *heaps[] = {heap.get()};
+    commands[frame].list->SetDescriptorHeaps(1, heaps);
+    commands[frame].list->SetPipelineState(pipeline.get());
+    commands[frame].list->SetComputeRootSignature(root.get());
+    commands[frame].list->SetComputeRootDescriptorTable(
+        0, context_.GpuDescriptorHandle(heap.get(), slot * 2));
+    commands[frame].list->Dispatch(1, 1, 1);
+    D3D12TestContext::Transition(
+        commands[frame].list.get(), outputs[frame].get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands[frame].list->CopyBufferRegion(
+        readback.get(), frame * sizeof(std::uint32_t), outputs[frame].get(), 0,
+        sizeof(std::uint32_t));
+    ASSERT_EQ(commands[frame].list->Close(), S_OK);
+    ID3D12CommandList *lists[] = {commands[frame].list.get()};
+    context_.queue()->ExecuteCommandLists(1, lists);
+    ASSERT_EQ(context_.queue()->Signal(fence.get(), frame + 1), S_OK);
+  }
+  ASSERT_EQ(context_.WaitForFence(fence.get(), kFrameCount), S_OK);
+
+  void *mapping = nullptr;
+  const D3D12_RANGE read_range = {0, kFrameCount * sizeof(std::uint32_t)};
+  ASSERT_EQ(readback->Map(0, &read_range, &mapping), S_OK);
+  const auto *actual = static_cast<const std::uint32_t *>(mapping);
+  for (UINT frame = 0; frame < kFrameCount; ++frame)
+    EXPECT_EQ(actual[frame], input_values[frame] ^ kMask) << "frame " << frame;
+  const D3D12_RANGE no_write = {};
+  readback->Unmap(0, &no_write);
+}
+
+TEST_F(IntegrationCompositionSpec, ExecutesAliasingFrameGraph) {
+  constexpr UINT kValueCount = 8;
+  const auto shader = CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+
+    [numthreads(8, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      output.Store(id.x * 4, 0x12340000 + id.x);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameter.Descriptor.ShaderRegister = 0;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const D3D12_SHADER_BYTECODE bytecode = {
+      shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateComputePipeline(root.get(), bytecode);
+  ASSERT_TRUE(pipeline);
+
+  D3D12_RESOURCE_DESC texture_desc = {};
+  texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture_desc.Width = 4;
+  texture_desc.Height = 4;
+  texture_desc.DepthOrArraySize = 1;
+  texture_desc.MipLevels = 1;
+  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_RESOURCE_DESC buffer_desc = {};
+  buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer_desc.Width = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  buffer_desc.Height = 1;
+  buffer_desc.DepthOrArraySize = 1;
+  buffer_desc.MipLevels = 1;
+  buffer_desc.SampleDesc.Count = 1;
+  buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  const auto texture_info =
+      context_.device()->GetResourceAllocationInfo(0, 1, &texture_desc);
+  const auto buffer_info =
+      context_.device()->GetResourceAllocationInfo(0, 1, &buffer_desc);
+
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes = texture_info.SizeInBytes > buffer_info.SizeInBytes
+                              ? texture_info.SizeInBytes
+                              : buffer_info.SizeInBytes;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
+  ComPtr<ID3D12Heap> heap;
+  ASSERT_EQ(context_.device()->CreateHeap(&heap_desc, IID_PPV_ARGS(heap.put())),
+            S_OK);
+
+  ComPtr<ID3D12Resource> target;
+  ComPtr<ID3D12Resource> compute;
+  ComPtr<ID3D12Resource> copy_source;
+  ASSERT_EQ(context_.device()->CreatePlacedResource(
+                heap.get(), 0, &texture_desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                IID_PPV_ARGS(target.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreatePlacedResource(
+                heap.get(), 0, &buffer_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(compute.put())),
+            S_OK);
+  buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  ASSERT_EQ(context_.device()->CreatePlacedResource(
+                heap.get(), 0, &buffer_desc,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                IID_PPV_ARGS(copy_source.put())),
+            S_OK);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  auto readback = context_.CreateBuffer(
+      kValueCount * sizeof(std::uint32_t), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(rtv_heap);
+  ASSERT_TRUE(readback);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  constexpr FLOAT clear_color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+  context_.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  barrier.Aliasing.pResourceBefore = target.get();
+  barrier.Aliasing.pResourceAfter = compute.get();
+  context_.list()->ResourceBarrier(1, &barrier);
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootSignature(root.get());
+  context_.list()->SetComputeRootUnorderedAccessView(
+      0, compute->GetGPUVirtualAddress());
+  context_.list()->Dispatch(1, 1, 1);
+  barrier.Aliasing.pResourceBefore = compute.get();
+  barrier.Aliasing.pResourceAfter = copy_source.get();
+  context_.list()->ResourceBarrier(1, &barrier);
+  context_.list()->CopyBufferRegion(
+      readback.get(), 0, copy_source.get(), 0,
+      kValueCount * sizeof(std::uint32_t));
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+
+  void *mapping = nullptr;
+  const D3D12_RANGE read_range = {0,
+                                  kValueCount * sizeof(std::uint32_t)};
+  ASSERT_EQ(readback->Map(0, &read_range, &mapping), S_OK);
+  const auto *actual = static_cast<const std::uint32_t *>(mapping);
+  for (UINT index = 0; index < kValueCount; ++index)
+    EXPECT_EQ(actual[index], 0x12340000u + index) << "value " << index;
+  const D3D12_RANGE no_write = {};
+  readback->Unmap(0, &no_write);
+}
 
 } // namespace
