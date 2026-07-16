@@ -97,6 +97,7 @@ d3d12_unit_suites = {
   'sync': {
     'sources': files(
       'sync/aliasing_barrier_spec.cpp',
+      'sync/cross_queue_spec.cpp',
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/promotion_decay_spec.cpp',
