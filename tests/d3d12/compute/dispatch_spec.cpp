@@ -217,6 +217,37 @@ TEST_F(ComputeDispatchSpec, GroupSharedMemorySynchronizesAcrossThreads) {
     EXPECT_EQ(actual[word], expected[word]) << "word " << word;
 }
 
+TEST_F(ComputeDispatchSpec, MultipleSharedBarrierPhasesIsolateThreadGroups) {
+  const auto shader = CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+    groupshared uint value;
+    [numthreads(2, 1, 1)]
+    void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+      if (lane == 0u)
+        value = group.x * 100u;
+      GroupMemoryBarrierWithGroupSync();
+      if (lane == 1u)
+        value += 7u;
+      GroupMemoryBarrierWithGroupSync();
+      if (lane == 0u)
+        output.Store(group.x * 4u, value);
+    })",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = CreatePipeline(shader);
+  ASSERT_TRUE(pipeline);
+  constexpr UINT kGroupCount = 4;
+  auto output = CreateOutput(kGroupCount);
+  ASSERT_TRUE(output.buffer);
+  ASSERT_TRUE(output.heap);
+  Bind(output, pipeline.get());
+  context_.list()->Dispatch(kGroupCount, 1, 1);
+  const auto actual = Readback(output, kGroupCount);
+  ASSERT_EQ(actual.size(), kGroupCount);
+  for (UINT group = 0; group < kGroupCount; ++group)
+    EXPECT_EQ(actual[group], group * 100u + 7u) << "group " << group;
+}
+
 struct DispatchBoundaryCase {
   UINT x;
   UINT y;

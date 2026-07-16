@@ -28,6 +28,7 @@ public:
   D3D12TestContext &operator=(const D3D12TestContext &) = delete;
 
   HRESULT Initialize();
+  HRESULT Initialize(ID3D12Device *device);
   HRESULT ResetCommandList();
   HRESULT ExecuteAndWait();
   HRESULT SignalAndWait();

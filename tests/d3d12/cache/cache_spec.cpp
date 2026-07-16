@@ -1,9 +1,11 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
 
+#include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 
 #include <cstdlib>
@@ -140,6 +142,55 @@ ID3D12PipelineState *CreateBasicGraphicsPipeline(ID3D12Device *device) {
   return SUCCEEDED(hr) ? pipeline : nullptr;
 }
 
+bool RunCachedComputeFrame(std::uint32_t *output_value) {
+  auto device = dxmt::test::CreateIsolatedD3D12Device();
+  if (!device)
+    return false;
+  dxmt::test::D3D12TestContext context;
+  if (FAILED(context.Initialize(device.get())))
+    return false;
+  const auto shader = dxmt::test::CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+    [numthreads(1, 1, 1)] void main() {
+      output.Store(0, 0x5a17c0deu);
+    })",
+                                                "cs_5_0");
+  if (FAILED(shader.result))
+    return false;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  auto root = context.CreateRootSignature(root_desc);
+  if (!root)
+    return false;
+  const D3D12_SHADER_BYTECODE bytecode = {shader.bytecode->GetBufferPointer(),
+                                          shader.bytecode->GetBufferSize()};
+  auto pipeline = context.CreateComputePipeline(root.get(), bytecode);
+  auto output =
+      context.CreateBuffer(sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (!pipeline || !output)
+    return false;
+  context.list()->SetComputeRootSignature(root.get());
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->SetComputeRootUnorderedAccessView(
+      0, output->GetGPUVirtualAddress());
+  context.list()->Dispatch(1, 1, 1);
+  dxmt::test::D3D12TestContext::Transition(
+      context.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> bytes;
+  if (FAILED(context.ReadbackBuffer(output.get(), sizeof(*output_value),
+                                    &bytes)) ||
+      bytes.size() != sizeof(*output_value))
+    return false;
+  std::memcpy(output_value, bytes.data(), sizeof(*output_value));
+  return true;
+}
+
 } // namespace
 
 TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
@@ -249,4 +300,25 @@ TEST(D3D12PipelineArchiveSpec, ColdAndWarmPipelinesHaveIdenticalCachedBlobs) {
             0);
   release_object(warm_blob);
   release_object(cold_blob);
+}
+
+TEST(D3D12PipelineArchiveSpec,
+     ColdAndWarmComputeFramesMatchAndWarmRunUsesArchive) {
+  ScopedArchiveTestEnvironment environment("frame-replay");
+  std::uint32_t cold_output = 0;
+  ASSERT_TRUE(RunCachedComputeFrame(&cold_output));
+  EXPECT_EQ(cold_output, 0x5a17c0deu);
+  auto marker = environment.ReadMarker();
+  ASSERT_NE(marker.find("create cold=1 ok=1"), std::string::npos) << marker;
+  ASSERT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
+            std::string::npos)
+      << marker;
+
+  environment.ResetMarker();
+  std::uint32_t warm_output = 0;
+  ASSERT_TRUE(RunCachedComputeFrame(&warm_output));
+  EXPECT_EQ(warm_output, cold_output);
+  marker = environment.ReadMarker();
+  EXPECT_NE(marker.find("create cold=0 ok=1"), std::string::npos) << marker;
+  EXPECT_EQ(marker.find("create cold=1"), std::string::npos) << marker;
 }

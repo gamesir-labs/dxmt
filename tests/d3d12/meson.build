@@ -137,6 +137,7 @@ d3d12_unit_suites = {
       'sync/aliasing_barrier_spec.cpp',
       'sync/barrier_matrix_spec.cpp',
       'sync/cross_queue_spec.cpp',
+      'sync/enhanced_barrier_spec.cpp',
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/promotion_decay_spec.cpp',
@@ -167,6 +168,7 @@ d3d12_unit_suites = {
   'shader': {
     'sources': files(
       'shader/container_corruption_spec.cpp',
+      'shader/geometry_tessellation_spec.cpp',
       'shader/resource_semantic_spec.cpp',
       'shader/semantic_matrix_spec.cpp',
       'shader/wave_spec.cpp',

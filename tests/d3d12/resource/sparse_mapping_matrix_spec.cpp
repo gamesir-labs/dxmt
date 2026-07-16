@@ -70,9 +70,9 @@ TEST_P(SparseTilingMatrixSpec, ReportsCoherentResourceTiling) {
   D3D12_TILE_SHAPE shape = {};
   UINT subresource_count = expected_subresources;
   std::vector<D3D12_SUBRESOURCE_TILING> tilings(expected_subresources);
-  context_.device()->GetResourceTiling(
-      resource.get(), &total_tiles, &packed, &shape, &subresource_count, 0,
-      tilings.data());
+  context_.device()->GetResourceTiling(resource.get(), &total_tiles, &packed,
+                                       &shape, &subresource_count, 0,
+                                       tilings.data());
 
   EXPECT_GT(total_tiles, 0u);
   EXPECT_EQ(subresource_count, expected_subresources);
@@ -106,32 +106,31 @@ TEST_P(SparseTilingMatrixSpec, ReportsCoherentResourceTiling) {
   EXPECT_TRUE(saw_standard);
 }
 
-std::string SparseTilingCaseName(
-    const ::testing::TestParamInfo<SparseTilingCase> &info) {
+std::string
+SparseTilingCaseName(const ::testing::TestParamInfo<SparseTilingCase> &info) {
   return info.param.name;
 }
 
 INSTANTIATE_TEST_SUITE_P(
     ResourceDimensions, SparseTilingMatrixSpec,
     ::testing::Values(
-        SparseTilingCase{D3D12_RESOURCE_DIMENSION_BUFFER, 4ull << 16, 1, 1,
-                         1, DXGI_FORMAT_UNKNOWN, "Buffer"},
+        SparseTilingCase{D3D12_RESOURCE_DIMENSION_BUFFER, 4ull << 16, 1, 1, 1,
+                         DXGI_FORMAT_UNKNOWN, "Buffer"},
         SparseTilingCase{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 512, 256, 1, 1,
                          DXGI_FORMAT_R32_UINT, "Texture2D"},
         SparseTilingCase{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 512, 512, 4, 1,
                          DXGI_FORMAT_R32_UINT, "Texture2DArray"},
         SparseTilingCase{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 512, 512, 1, 10,
                          DXGI_FORMAT_R32_UINT, "MipmappedTexture2D"},
-        SparseTilingCase{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 1024, 1,
-                         11, DXGI_FORMAT_BC7_UNORM, "BlockCompressedTexture"},
+        SparseTilingCase{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 1024, 1, 11,
+                         DXGI_FORMAT_BC7_UNORM, "BlockCompressedTexture"},
         SparseTilingCase{D3D12_RESOURCE_DIMENSION_TEXTURE3D, 256, 128, 32, 8,
                          DXGI_FORMAT_R32_UINT, "Texture3D"}),
     SparseTilingCaseName);
 
 class SparseMappingMatrixSpec : public ::testing::Test {
 protected:
-  static constexpr UINT64 kTileSize =
-      D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  static constexpr UINT64 kTileSize = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
 
   void SetUp() override {
     ASSERT_EQ(context_.Initialize(), S_OK);
@@ -204,9 +203,9 @@ protected:
 
   std::vector<std::uint8_t> ReadTile(ID3D12Resource *resource, UINT x,
                                      D3D12_RESOURCE_STATES before) {
-    auto output = context_.CreateBuffer(
-        kTileSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto output = context_.CreateBuffer(kTileSize, D3D12_HEAP_TYPE_DEFAULT,
+                                        D3D12_RESOURCE_FLAG_NONE,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
     EXPECT_TRUE(output);
     if (!output)
       return {};
@@ -317,6 +316,100 @@ TEST_F(SparseMappingMatrixSpec, RepeatedNullAndMapRangesRecover) {
       ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
   EXPECT_EQ(actual, expected);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(SparseMappingMatrixSpec, CrossQueueMappingIsOrderedBeforeDirectUse) {
+  auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBacking(1);
+  ASSERT_TRUE(texture);
+  ASSERT_TRUE(heap);
+
+  D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+  queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+  ComPtr<ID3D12CommandQueue> copy_queue;
+  ASSERT_EQ(context_.device()->CreateCommandQueue(
+                &queue_desc, IID_PPV_ARGS(copy_queue.put())),
+            S_OK);
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                           IID_PPV_ARGS(fence.put())),
+            S_OK);
+
+  const D3D12_TILED_RESOURCE_COORDINATE coordinate = {0, 0, 0, 0};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = 1;
+  region.UseBox = TRUE;
+  region.Width = 1;
+  region.Height = 1;
+  region.Depth = 1;
+  const D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  const UINT heap_offset = 0;
+  const UINT tile_count = 1;
+  copy_queue->UpdateTileMappings(texture.get(), 1, &coordinate, &region,
+                                 heap.get(), 1, &range_flag, &heap_offset,
+                                 &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+  ASSERT_EQ(copy_queue->Signal(fence.get(), 1), S_OK);
+  ASSERT_EQ(context_.queue()->Wait(fence.get(), 1), S_OK);
+
+  std::vector<std::uint8_t> expected(kTileSize);
+  for (UINT64 index = 0; index < expected.size(); ++index)
+    expected[index] = static_cast<std::uint8_t>((index * 31 + 7) & 0xff);
+  WriteTile(texture.get(), 0, expected);
+  const auto actual =
+      ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(SparseMappingMatrixSpec, MappingRetainsBackingAfterClientHeapRelease) {
+  auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBacking(1);
+  ASSERT_TRUE(texture);
+  ASSERT_TRUE(heap);
+  MapRange(texture.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  heap.reset();
+
+  std::vector<std::uint8_t> expected(kTileSize, 0x5a);
+  WriteTile(texture.get(), 0, expected);
+  const auto actual =
+      ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(SparseMappingMatrixSpec, MultiPlaneTilingMatchesFormatCapability) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {DXGI_FORMAT_NV12};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                                   &support, sizeof(support)),
+            S_OK);
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 256;
+  desc.Height = 256;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_NV12;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  ComPtr<ID3D12Resource> resource;
+  const HRESULT result = context_.device()->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+      IID_PPV_ARGS(resource.put()));
+  if (!(support.Support2 & D3D12_FORMAT_SUPPORT2_TILED)) {
+    EXPECT_TRUE(FAILED(result));
+    EXPECT_FALSE(resource);
+    return;
+  }
+  ASSERT_EQ(result, S_OK);
+  ASSERT_TRUE(resource);
+  UINT subresource_count = 2;
+  std::array<D3D12_SUBRESOURCE_TILING, 2> tilings = {};
+  UINT total_tiles = 0;
+  D3D12_PACKED_MIP_INFO packed = {};
+  D3D12_TILE_SHAPE shape = {};
+  context_.device()->GetResourceTiling(resource.get(), &total_tiles, &packed,
+                                       &shape, &subresource_count, 0,
+                                       tilings.data());
+  EXPECT_EQ(subresource_count, 2u);
+  EXPECT_GT(total_tiles, 0u);
 }
 
 } // namespace

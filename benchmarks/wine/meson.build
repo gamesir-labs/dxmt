@@ -48,6 +48,18 @@ wine_benchmark_suites = {
     'suite': ['wine', 'performance', 'd3d12', 'binding'],
     'timeout': 600,
   },
+  'd3d12-core-micro': {
+    'sources': files('d3d12_core_micro_benchmark.cpp'),
+    'dependencies': [d3d12_runtime_support_dep],
+    'include_directories': [include_directories('../../tests/d3d12')],
+    'mode': 'performance',
+    'budget': files('../budgets/d3d12_core_micro.json'),
+    'repetitions': 3,
+    'min_time': '1x',
+    'warmup_time': '0',
+    'suite': ['wine', 'performance', 'd3d12', 'core'],
+    'timeout': 600,
+  },
   'ue-rhi-initialization': {
     'sources': files('ue_initialization_benchmark.cpp'),
     'include_directories': [include_directories('../../tests/support')],

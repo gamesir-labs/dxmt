@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "profile": "gcc-x64-release-full",
+    "host_class": "self-macos-runner Apple Silicon",
+    "collected_on": "2026-07-16",
+    "repetitions": 3,
+    "metric": "real_time",
+    "unit": "ns"
+  },
+  "benchmarks": {
+    "BI_D3D12RecordBarrierBatch/barriers:1/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 2000, "max_regression_percent": 500},
+    "BI_D3D12RecordBarrierBatch/barriers:16/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 5000, "max_regression_percent": 200},
+    "BI_D3D12RecordBarrierBatch/barriers:31/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 8000, "max_regression_percent": 100},
+    "BI_D3D12RecordBarrierBatch/barriers:32/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 7000, "max_regression_percent": 100},
+    "BI_D3D12RecordBarrierBatch/barriers:33/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 9000, "max_regression_percent": 100},
+    "BI_D3D12RecordBarrierBatch/barriers:256/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 40000, "max_regression_percent": 75},
+    "BI_D3D12ExecuteClosedLists/lists:1/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 489000, "max_regression_percent": 200},
+    "BI_D3D12ExecuteClosedLists/lists:16/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 600000, "max_regression_percent": 100},
+    "BI_D3D12ExecuteClosedLists/lists:64/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 1039000, "max_regression_percent": 100},
+    "BI_D3D12CopyDescriptorRange/descriptors:1/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 2000, "max_regression_percent": 500},
+    "BI_D3D12CopyDescriptorRange/descriptors:16/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 4000, "max_regression_percent": 200},
+    "BI_D3D12CopyDescriptorRange/descriptors:256/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 46000, "max_regression_percent": 75},
+    "BI_D3D12CopyDescriptorRange/descriptors:4096/iterations:1/manual_time": {"metric": "real_time", "baseline_median_ns": 665000, "max_regression_percent": 50}
+  }
+}

@@ -77,6 +77,10 @@ std::atomic<uint64_t> g_test_query_heap_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_descriptor_table_allocation_occurrence = 0;
 std::atomic<uint64_t> g_test_residency_insertion_occurrence = 0;
 std::atomic<uint64_t> g_test_pso_archive_write_occurrence = 0;
+std::atomic<uint64_t> g_test_metal_buffer_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_metal_texture_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_metal_heap_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_metal_graphics_pipeline_occurrence = 0;
 
 static bool
 ShouldInjectCreationFailure(const char *environment_name,
@@ -2937,6 +2941,12 @@ public:
             "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT",
             g_test_graphics_pipeline_creation_occurrence))
       return E_OUTOFMEMORY;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT",
+            g_test_metal_graphics_pipeline_occurrence)) {
+      RecordInjectedFault("DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT");
+      return E_OUTOFMEMORY;
+    }
     HRESULT status = S_OK;
     auto state = d3d12::CreateGraphicsPipelineState(
         static_cast<IMTLD3D12Device *>(this), desc, &status);
@@ -4075,6 +4085,16 @@ public:
     if (!IsValidCommittedResourceDesc(heap_properties, heap_flags, desc,
                                       initial_state))
       return WARN_E_INVALIDARG(__func__);
+    const char *metal_fault = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                  ? "DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT"
+                                  : "DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT";
+    auto &metal_occurrence = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                 ? g_test_metal_buffer_creation_occurrence
+                                 : g_test_metal_texture_creation_occurrence;
+    if (ShouldInjectCreationFailure(metal_fault, metal_occurrence)) {
+      RecordInjectedFault(metal_fault);
+      return E_OUTOFMEMORY;
+    }
 
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), heap_properties, heap_flags,
@@ -4105,6 +4125,12 @@ public:
       return E_OUTOFMEMORY;
     if (!IsValidHeapDesc(desc))
       return WARN_E_INVALIDARG(__func__);
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT",
+            g_test_metal_heap_creation_occurrence)) {
+      RecordInjectedFault("DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT");
+      return E_OUTOFMEMORY;
+    }
 
     auto heap_object = d3d12::CreateHeap(static_cast<IMTLD3D12Device *>(this),
                                          desc);

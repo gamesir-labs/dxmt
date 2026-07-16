@@ -24,6 +24,8 @@ enum class WaveSemantic {
   BallotEvenCount,
   IsFirstLane,
   FirstLaneActiveSum,
+  ActiveProduct,
+  PrefixProduct,
 };
 
 struct WaveSemanticCase {
@@ -69,6 +71,9 @@ protected:
       return lane == 0 ? 1 : 0;
     case WaveSemantic::FirstLaneActiveSum:
       return 1;
+    case WaveSemantic::ActiveProduct:
+    case WaveSemantic::PrefixProduct:
+      return 1;
     }
     return 0;
   }
@@ -100,12 +105,12 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
   ASSERT_TRUE(pipeline);
 
   constexpr UINT kThreadCount = 32;
-  constexpr UINT kWordsPerThread = 14;
+  constexpr UINT kWordsPerThread = 16;
   constexpr UINT kBufferSize = kThreadCount * kWordsPerThread * sizeof(UINT);
-  auto output = context_.CreateBuffer(
-      kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto output =
+      context_.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   auto heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
   ASSERT_TRUE(output);
@@ -125,9 +130,9 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
   context_.list()->SetComputeRootDescriptorTable(
       0, heap->GetGPUDescriptorHandleForHeapStart());
   context_.list()->Dispatch(1, 1, 1);
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
 
   std::vector<std::uint8_t> bytes;
   ASSERT_EQ(context_.ReadbackBuffer(output.get(), kBufferSize, &bytes), S_OK);
@@ -146,17 +151,15 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
     ASSERT_LT(lane, lane_count);
     ASSERT_LE(first_thread, thread);
     EXPECT_EQ(lane, thread - first_thread);
-    EXPECT_EQ(active_count,
-              std::min(lane_count, kThreadCount - first_thread));
+    EXPECT_EQ(active_count, std::min(lane_count, kThreadCount - first_thread));
     ASSERT_LT(test.word, kWordsPerThread);
-    EXPECT_EQ(values[test.word],
-              Expected(test.semantic, thread, lane, active_count,
-                       first_thread));
+    EXPECT_EQ(values[test.word], Expected(test.semantic, thread, lane,
+                                          active_count, first_thread));
   }
 }
 
-std::string WaveSemanticCaseName(
-    const ::testing::TestParamInfo<WaveSemanticCase> &info) {
+std::string
+WaveSemanticCaseName(const ::testing::TestParamInfo<WaveSemanticCase> &info) {
   return info.param.name;
 }
 
@@ -172,8 +175,10 @@ INSTANTIATE_TEST_SUITE_P(
         WaveSemanticCase{"AnyTrue", WaveSemantic::AnyTrue, 10},
         WaveSemanticCase{"BallotEvenCount", WaveSemantic::BallotEvenCount, 11},
         WaveSemanticCase{"IsFirstLane", WaveSemantic::IsFirstLane, 12},
-        WaveSemanticCase{"FirstLaneActiveSum",
-                         WaveSemantic::FirstLaneActiveSum, 13}),
+        WaveSemanticCase{"FirstLaneActiveSum", WaveSemantic::FirstLaneActiveSum,
+                         13},
+        WaveSemanticCase{"ActiveProduct", WaveSemantic::ActiveProduct, 14},
+        WaveSemanticCase{"PrefixProduct", WaveSemantic::PrefixProduct, 15}),
     WaveSemanticCaseName);
 
 } // namespace

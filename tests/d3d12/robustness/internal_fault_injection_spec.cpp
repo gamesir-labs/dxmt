@@ -2,6 +2,7 @@
 #include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
+#include "shaders/runtime_test_shaders.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -23,9 +24,8 @@ UINT ConfiguredInternalOccurrence(const char *name) {
     return 0;
   char *end = nullptr;
   const auto parsed = std::strtoul(value, &end, 0);
-  return end != value && !*end && parsed <= UINT_MAX
-             ? static_cast<UINT>(parsed)
-             : 0;
+  return end != value && !*end && parsed <= UINT_MAX ? static_cast<UINT>(parsed)
+                                                     : 0;
 }
 
 class FaultMarker {
@@ -39,7 +39,8 @@ public:
   bool Initialize() {
     char temporary_path[MAX_PATH + 1] = {};
     char marker_path[MAX_PATH + 1] = {};
-    const DWORD length = GetTempPathA(ARRAYSIZE(temporary_path), temporary_path);
+    const DWORD length =
+        GetTempPathA(ARRAYSIZE(temporary_path), temporary_path);
     if (!length || length >= ARRAYSIZE(temporary_path) ||
         !GetTempFileNameA(temporary_path, "dxf", 0, marker_path))
       return false;
@@ -84,37 +85,39 @@ protected:
     EXPECT_EQ(shader.result, S_OK) << shader.diagnostic_text();
     if (FAILED(shader.result))
       return {};
-    return context_.CreateComputePipeline(
-        root_.get(), {shader.bytecode->GetBufferPointer(),
-                      shader.bytecode->GetBufferSize()});
+    return context_.CreateComputePipeline(root_.get(),
+                                          {shader.bytecode->GetBufferPointer(),
+                                           shader.bytecode->GetBufferSize()});
   }
 
   UINT ExecuteWriter(ID3D12PipelineState *pipeline) {
     const UINT zero = 0;
-    auto upload = context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
-    auto output = context_.CreateBuffer(
-        sizeof(zero), D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto upload =
+        context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
+    auto output =
+        context_.CreateBuffer(sizeof(zero), D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COPY_DEST);
     EXPECT_TRUE(upload);
     EXPECT_TRUE(output);
     if (!upload || !output)
       return UINT_MAX;
     context_.list()->CopyBufferRegion(output.get(), 0, upload.get(), 0,
-                                       sizeof(zero));
-    D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                                      sizeof(zero));
+    D3D12TestContext::Transition(context_.list(), output.get(),
+                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     context_.list()->SetComputeRootSignature(root_.get());
     context_.list()->SetPipelineState(pipeline);
     context_.list()->SetComputeRootUnorderedAccessView(
         0, output->GetGPUVirtualAddress());
     context_.list()->Dispatch(1, 1, 1);
-    D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12TestContext::Transition(context_.list(), output.get(),
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
     std::vector<std::uint8_t> bytes;
-    EXPECT_EQ(context_.ReadbackBuffer(output.get(), sizeof(UINT), &bytes), S_OK);
+    EXPECT_EQ(context_.ReadbackBuffer(output.get(), sizeof(UINT), &bytes),
+              S_OK);
     UINT value = UINT_MAX;
     if (bytes.size() == sizeof(value))
       std::memcpy(&value, bytes.data(), sizeof(value));
@@ -209,8 +212,8 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
        DescriptorFailureFallsBackAndLaterWritesExecute) {
   const UINT allocation_target = ConfiguredInternalOccurrence(
       "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT");
-  const UINT residency_target = ConfiguredInternalOccurrence(
-      "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT");
+  const UINT residency_target =
+      ConfiguredInternalOccurrence("DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT");
   ASSERT_FALSE(allocation_target && residency_target)
       << "configure only one descriptor fault at a time";
   const UINT target = std::max(allocation_target, residency_target);
@@ -221,8 +224,8 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
 
   constexpr UINT input_value = 0x718293a4u;
   const UINT descriptor_count = target + 1;
-  auto input = context_.CreateUploadBuffer(
-      sizeof(input_value), &input_value, sizeof(input_value));
+  auto input = context_.CreateUploadBuffer(sizeof(input_value), &input_value,
+                                           sizeof(input_value));
   auto heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count, true);
   ASSERT_TRUE(input);
@@ -256,30 +259,30 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
     RWByteAddressBuffer output : register(u0);
     [numthreads(1, 1, 1)]
     void main() { output.Store(0, input.Load(0)); }
-  )", "cs_5_0");
+  )",
+                                    "cs_5_0");
   ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
   auto pipeline = context_.CreateComputePipeline(
-      root.get(), {shader.bytecode->GetBufferPointer(),
-                   shader.bytecode->GetBufferSize()});
+      root.get(),
+      {shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()});
   ASSERT_TRUE(root);
   ASSERT_TRUE(pipeline);
 
   std::vector<UINT> initial(descriptor_count, 0);
-  auto initial_upload = context_.CreateUploadBuffer(
-      initial.size() * sizeof(UINT), initial.data(),
-      initial.size() * sizeof(UINT));
+  auto initial_upload =
+      context_.CreateUploadBuffer(initial.size() * sizeof(UINT), initial.data(),
+                                  initial.size() * sizeof(UINT));
   auto output = context_.CreateBuffer(
       initial.size() * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(initial_upload);
   ASSERT_TRUE(output);
-  context_.list()->CopyBufferRegion(
-      output.get(), 0, initial_upload.get(), 0,
-      initial.size() * sizeof(UINT));
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  context_.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
+                                    initial.size() * sizeof(UINT));
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   ID3D12DescriptorHeap *heaps[] = {heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   context_.list()->SetComputeRootSignature(root.get());
@@ -291,19 +294,18 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
         1, output->GetGPUVirtualAddress() + index * sizeof(UINT));
     context_.list()->Dispatch(1, 1, 1);
   }
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   std::vector<std::uint8_t> bytes;
-  ASSERT_EQ(context_.ReadbackBuffer(
-                output.get(), initial.size() * sizeof(UINT), &bytes),
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), initial.size() * sizeof(UINT),
+                                    &bytes),
             S_OK);
   ASSERT_EQ(bytes.size(), initial.size() * sizeof(UINT));
   for (UINT index = 0; index < descriptor_count; ++index) {
     UINT actual = 0;
     std::memcpy(&actual, bytes.data() + index * sizeof(UINT), sizeof(actual));
-    EXPECT_EQ(actual, input_value)
-        << "descriptor occurrence " << index + 1;
+    EXPECT_EQ(actual, input_value) << "descriptor occurrence " << index + 1;
   }
 
   ASSERT_EQ(context_.ResetCommandList(), S_OK);
@@ -311,9 +313,9 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
   context_.device()->CreateShaderResourceView(
       input.get(), &srv,
       context_.CpuDescriptorHandle(heap.get(), recovered_index));
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   context_.list()->SetDescriptorHeaps(1, heaps);
   context_.list()->SetComputeRootSignature(root.get());
   context_.list()->SetPipelineState(pipeline.get());
@@ -322,17 +324,16 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
   context_.list()->SetComputeRootUnorderedAccessView(
       1, output->GetGPUVirtualAddress() + recovered_index * sizeof(UINT));
   context_.list()->Dispatch(1, 1, 1);
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   bytes.clear();
-  ASSERT_EQ(context_.ReadbackBuffer(
-                output.get(), initial.size() * sizeof(UINT), &bytes),
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), initial.size() * sizeof(UINT),
+                                    &bytes),
             S_OK);
   ASSERT_EQ(bytes.size(), initial.size() * sizeof(UINT));
   UINT recovered = 0;
-  std::memcpy(&recovered,
-              bytes.data() + recovered_index * sizeof(UINT),
+  std::memcpy(&recovered, bytes.data() + recovered_index * sizeof(UINT),
               sizeof(recovered));
   EXPECT_EQ(recovered, input_value);
 
@@ -340,6 +341,114 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
                                ? "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT"
                                : "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT";
   EXPECT_EQ(marker.Count(fault_name), 1u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+class D3D12MetalObjectFaultInjectionSpec : public ::testing::Test {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  D3D12TestContext context_;
+};
+
+TEST_F(D3D12MetalObjectFaultInjectionSpec,
+       MetalObjectFailureClearsOutputAndNextOccurrenceRecovers) {
+  struct FaultCase {
+    const char *environment;
+    enum Kind { Buffer, Texture, Heap, GraphicsPipeline } kind;
+  };
+  constexpr FaultCase cases[] = {
+      {"DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT", FaultCase::Buffer},
+      {"DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT", FaultCase::Texture},
+      {"DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT", FaultCase::Heap},
+      {"DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT",
+       FaultCase::GraphicsPipeline},
+  };
+  const FaultCase *active = nullptr;
+  UINT target = 0;
+  for (const auto &test : cases) {
+    const UINT configured = ConfiguredInternalOccurrence(test.environment);
+    if (!configured)
+      continue;
+    ASSERT_EQ(active, nullptr) << "configure only one Metal object fault";
+    active = &test;
+    target = configured;
+  }
+  if (!active)
+    GTEST_SKIP() << "Metal object fault injection is disabled";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const auto pixel =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+
+  for (UINT occurrence = 1; occurrence <= target + 1; ++occurrence) {
+    void *output = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+    HRESULT result = E_FAIL;
+    if (active->kind == FaultCase::Buffer ||
+        active->kind == FaultCase::Texture) {
+      D3D12_HEAP_PROPERTIES heap = {};
+      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      D3D12_RESOURCE_DESC desc = {};
+      desc.Dimension = active->kind == FaultCase::Buffer
+                           ? D3D12_RESOURCE_DIMENSION_BUFFER
+                           : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Width = active->kind == FaultCase::Buffer ? 256 : 4;
+      desc.Height = active->kind == FaultCase::Buffer ? 1 : 4;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = active->kind == FaultCase::Buffer
+                        ? DXGI_FORMAT_UNKNOWN
+                        : DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.Layout = active->kind == FaultCase::Buffer
+                        ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                        : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      result = context_.device()->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+          nullptr, __uuidof(ID3D12Resource), &output);
+    } else if (active->kind == FaultCase::Heap) {
+      D3D12_HEAP_DESC desc = {};
+      desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+      desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+      result =
+          context_.device()->CreateHeap(&desc, __uuidof(ID3D12Heap), &output);
+    } else {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+      desc.pRootSignature = root.get();
+      desc.VS = dxmt::test::FullscreenVertexShader();
+      desc.PS = {pixel.bytecode->GetBufferPointer(),
+                 pixel.bytecode->GetBufferSize()};
+      desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+          D3D12_COLOR_WRITE_ENABLE_ALL;
+      desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      desc.SampleMask = UINT_MAX;
+      desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      desc.NumRenderTargets = 1;
+      desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      result = context_.device()->CreateGraphicsPipelineState(
+          &desc, __uuidof(ID3D12PipelineState), &output);
+    }
+
+    if (occurrence == target) {
+      EXPECT_EQ(result, E_OUTOFMEMORY);
+      EXPECT_EQ(output, nullptr);
+    } else {
+      ASSERT_EQ(result, S_OK);
+      ASSERT_NE(output, nullptr);
+      static_cast<IUnknown *>(output)->Release();
+    }
+  }
+  EXPECT_EQ(marker.Count(active->environment), 1u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

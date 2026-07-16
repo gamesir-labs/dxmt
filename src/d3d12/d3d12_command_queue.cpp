@@ -11258,6 +11258,80 @@ private:
     return pipeline && pipeline->GetType() == PipelineStateType::Compute;
   }
 
+  bool ReadBufferBytesForCpuReplay(CommandChunk *&chunk, ReplayState &state,
+                                   ID3D12Resource *resource, UINT64 offset,
+                                   void *dst, UINT64 size,
+                                   const char *context) {
+    auto *d3d12_resource = GetResource(resource);
+    if (!d3d12_resource || !d3d12_resource->GetBufferAllocation() || !dst)
+      return false;
+    if (offset > d3d12_resource->GetResourceDesc().Width ||
+        size > d3d12_resource->GetResourceDesc().Width - offset) {
+      WARN("D3D12CommandQueue: ", context, " read exceeds buffer bounds");
+      return false;
+    }
+
+    auto allocation = Rc<BufferAllocation>(
+        d3d12_resource->GetBufferAllocation());
+    if (auto *mapped = allocation->mappedMemory(0)) {
+      std::memcpy(dst,
+                  static_cast<const char *>(mapped) +
+                      d3d12_resource->GetHeapOffset() + offset,
+                  size);
+      return true;
+    }
+
+    WMTBufferInfo info = {};
+    info.length = size;
+    info.options = WMTResourceStorageModeShared |
+                   WMTResourceHazardTrackingModeUntracked;
+    info.memory.set(nullptr);
+#ifdef __i386__
+    info.memory.set(wsi::aligned_malloc(size, DXMT_PAGE_SIZE));
+#endif
+    auto staging = device_->GetMTLDevice().newBuffer(info);
+    auto *staging_mapped = info.memory.get_accessible_or_null();
+    if (!staging || !staging_mapped) {
+#ifdef __i386__
+      wsi::aligned_free(info.memory.get_accessible_or_null());
+#endif
+      WARN("D3D12CommandQueue: ", context,
+           " failed to allocate a CPU readback buffer");
+      return false;
+    }
+
+    FlushPassBatches(chunk, state);
+    const UINT64 source_offset =
+        d3d12_resource->GetHeapOffset() + offset;
+    chunk->emitcc(
+        [allocation = std::move(allocation),
+         staging = WMT::Reference<WMT::Buffer>(staging), source_offset,
+         size](ArgumentEncodingContext &enc) {
+          enc.retainAllocation(allocation.ptr());
+          enc.startBlitPass();
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+          copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+          copy.src = allocation->buffer();
+          copy.src_offset = source_offset;
+          copy.dst = staging;
+          copy.dst_offset = 0;
+          copy.copy_length = size;
+          enc.endPass();
+        });
+
+    auto &queue = device_->GetDXMTDevice().queue();
+    const auto sequence = queue.CurrentSeqId();
+    queue.CommitCurrentChunk();
+    queue.WaitCPUFence(sequence);
+    chunk = queue.CurrentChunk();
+    std::memcpy(dst, staging_mapped, size);
+#ifdef __i386__
+    wsi::aligned_free(staging_mapped);
+#endif
+    return true;
+  }
+
   bool PredicationAllows(CommandChunk *&chunk, ReplayState &state) {
     if (!state.predication_buffer)
       return true;
@@ -11266,9 +11340,10 @@ private:
         chunk, state, state.predication_buffer.ptr(),
         state.predication_buffer_offset, sizeof(uint64_t));
     uint64_t value = 0;
-    if (!ReadBufferBytes(state.predication_buffer.ptr(),
-                         state.predication_buffer_offset, &value,
-                         sizeof(value), "predication")) {
+    if (!ReadBufferBytesForCpuReplay(
+            chunk, state, state.predication_buffer.ptr(),
+            state.predication_buffer_offset, &value, sizeof(value),
+            "predication")) {
       WARN("D3D12CommandQueue: predication buffer is unavailable; command will be skipped");
       return false;
     }

@@ -224,6 +224,62 @@
       "environment": {
         "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT": "2"
       }
+    },
+    {
+      "id": "metal-buffer-creation-fail-first",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "metal-buffer-creation-fail-after-one",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "metal-texture-creation-fail-first",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "metal-texture-creation-fail-after-one",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "metal-heap-creation-fail-first",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "metal-heap-creation-fail-after-one",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "metal-graphics-pipeline-fail-first",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT": "1"
+      }
+    },
+    {
+      "id": "metal-graphics-pipeline-fail-after-one",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT": "2"
+      }
     }
   ]
 }

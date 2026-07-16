@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -37,7 +38,7 @@ std::uint32_t NextRandom(std::uint32_t &state) {
 }
 
 std::vector<CommandAction> GenerateCommandGrammar(std::uint32_t seed,
-                                                   std::size_t action_count) {
+                                                  std::size_t action_count) {
   std::vector<CommandAction> actions;
   actions.reserve(action_count);
   for (std::size_t index = 0; index < action_count; ++index) {
@@ -80,12 +81,12 @@ ShrinkFailingSequence(std::vector<CommandAction> actions,
     const std::size_t chunk_size =
         (actions.size() + granularity - 1) / granularity;
     bool reduced = false;
-    for (std::size_t begin = 0; begin < actions.size();
-         begin += chunk_size) {
+    for (std::size_t begin = 0; begin < actions.size(); begin += chunk_size) {
       const std::size_t end = std::min(actions.size(), begin + chunk_size);
       std::vector<CommandAction> candidate;
       candidate.reserve(actions.size() - (end - begin));
-      candidate.insert(candidate.end(), actions.begin(), actions.begin() + begin);
+      candidate.insert(candidate.end(), actions.begin(),
+                       actions.begin() + begin);
       candidate.insert(candidate.end(), actions.begin() + end, actions.end());
       if (!candidate.empty() && still_fails(candidate)) {
         actions = std::move(candidate);
@@ -176,19 +177,45 @@ TEST_F(D3D12CommandGrammarFuzzSpec,
     if (!failure)
       continue;
 
-    const auto minimized = ShrinkFailingSequence(
-        actions, [&](const auto &candidate) {
+    const auto minimized =
+        ShrinkFailingSequence(actions, [&](const auto &candidate) {
           return ReplayCommandGrammar(context_.device(), candidate).has_value();
         });
     ADD_FAILURE() << "seed=0x" << std::hex << seed << std::dec
                   << " action=" << failure->action_index << " ("
                   << CommandActionName(failure->action) << ") expected=0x"
                   << std::hex << static_cast<unsigned long>(failure->expected)
-                  << " actual=0x"
-                  << static_cast<unsigned long>(failure->actual) << std::dec
-                  << " minimized=" << FormatActions(minimized);
+                  << " actual=0x" << static_cast<unsigned long>(failure->actual)
+                  << std::dec << " minimized=" << FormatActions(minimized);
     return;
   }
+}
+
+TEST_F(D3D12CommandGrammarFuzzSpec, TimeBudgetedStressSeedsWhenRequested) {
+  const char *budget_text = std::getenv("DXMT_D3D12_FUZZ_STRESS_MILLISECONDS");
+  if (!budget_text)
+    GTEST_SKIP() << "set DXMT_D3D12_FUZZ_STRESS_MILLISECONDS for stress mode";
+  char *end = nullptr;
+  const auto budget = std::strtoul(budget_text, &end, 10);
+  ASSERT_NE(end, budget_text);
+  ASSERT_EQ(*end, '\0');
+  ASSERT_GT(budget, 0u);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
+  std::uint32_t seed = 0x9e3779b9u;
+  std::size_t replay_count = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const std::size_t action_count = 20 + NextRandom(seed) % 481;
+    const auto actions = GenerateCommandGrammar(seed, action_count);
+    const auto failure = ReplayCommandGrammar(context_.device(), actions);
+    ASSERT_FALSE(failure.has_value())
+        << "seed=0x" << std::hex << seed << std::dec
+        << " actions=" << action_count;
+    seed += 0x9e3779b9u;
+    ++replay_count;
+  }
+  EXPECT_GT(replay_count, 0u);
 }
 
 TEST(D3D12FailureShrinkerSpec, DeltaDebuggingKeepsMinimalTrigger) {
@@ -212,10 +239,56 @@ TEST(D3D12FailureShrinkerSpec, DeltaDebuggingKeepsMinimalTrigger) {
 
   const auto minimized =
       ShrinkFailingSequence(input, requires_close_reset_close);
-  EXPECT_EQ(minimized,
-            (std::vector<CommandAction>{CommandAction::Close,
-                                        CommandAction::ResetList,
-                                        CommandAction::Close}));
+  EXPECT_EQ(minimized, (std::vector<CommandAction>{CommandAction::Close,
+                                                   CommandAction::ResetList,
+                                                   CommandAction::Close}));
+}
+
+struct ScenarioSize {
+  std::size_t buffer_size;
+  std::size_t texture_width;
+  std::size_t texture_height;
+  std::size_t resource_count;
+  std::size_t descriptor_count;
+  std::size_t queue_count;
+  std::size_t barrier_count;
+};
+
+template <typename Predicate>
+ScenarioSize ShrinkScenarioSizes(ScenarioSize sizes, Predicate still_fails) {
+  auto shrink_dimension = [&](std::size_t ScenarioSize::*field) {
+    while (sizes.*field > 1) {
+      ScenarioSize candidate = sizes;
+      candidate.*field = std::max<std::size_t>(1, candidate.*field / 2);
+      if (!still_fails(candidate))
+        break;
+      sizes = candidate;
+    }
+  };
+  shrink_dimension(&ScenarioSize::resource_count);
+  shrink_dimension(&ScenarioSize::descriptor_count);
+  shrink_dimension(&ScenarioSize::queue_count);
+  shrink_dimension(&ScenarioSize::barrier_count);
+  shrink_dimension(&ScenarioSize::texture_width);
+  shrink_dimension(&ScenarioSize::texture_height);
+  shrink_dimension(&ScenarioSize::buffer_size);
+  return sizes;
+}
+
+TEST(D3D12FailureShrinkerSpec, ReducesResourcesDescriptorsQueuesAndDimensions) {
+  const ScenarioSize input = {4096, 128, 64, 8, 64, 4, 32};
+  const auto minimized = ShrinkScenarioSizes(input, [](const ScenarioSize &s) {
+    return s.resource_count >= 2 && s.descriptor_count >= 4 &&
+           s.queue_count >= 2 && s.barrier_count >= 2 && s.texture_width >= 4 &&
+           s.texture_height >= 2 && s.buffer_size >= 16;
+  });
+  EXPECT_EQ(minimized.buffer_size, 16u);
+  EXPECT_EQ(minimized.texture_width, 4u);
+  EXPECT_EQ(minimized.texture_height, 2u);
+  EXPECT_EQ(minimized.resource_count, 2u);
+  EXPECT_EQ(minimized.descriptor_count, 4u);
+  EXPECT_EQ(minimized.queue_count, 2u);
+  EXPECT_EQ(minimized.barrier_count, 2u);
 }
 
 class D3D12RootSignatureFuzzSpec : public ::testing::Test {
@@ -233,20 +306,18 @@ TEST_F(D3D12RootSignatureFuzzSpec,
     const auto bits = NextRandom(random);
 
     D3D12_DESCRIPTOR_RANGE range = {};
-    range.RangeType =
-        static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>((bits >> 3) % 4);
+    range.RangeType = static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>((bits >> 3) % 4);
     range.NumDescriptors = 1 + ((bits >> 7) % 16);
     range.BaseShaderRegister = (bits >> 11) % 16;
     range.RegisterSpace = (bits >> 15) % 4;
-    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    range.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
     D3D12_ROOT_PARAMETER parameter = {};
-    parameter.ParameterType =
-        static_cast<D3D12_ROOT_PARAMETER_TYPE>(bits % 5);
+    parameter.ParameterType = static_cast<D3D12_ROOT_PARAMETER_TYPE>(bits % 5);
     parameter.ShaderVisibility =
         static_cast<D3D12_SHADER_VISIBILITY>((bits >> 20) % 6);
-    if (parameter.ParameterType ==
-        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+    if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
       parameter.DescriptorTable.NumDescriptorRanges = 1;
       parameter.DescriptorTable.pDescriptorRanges = &range;
     } else if (parameter.ParameterType ==
@@ -280,8 +351,8 @@ TEST_F(D3D12RootSignatureFuzzSpec,
 
     ComPtr<ID3DBlob> blob;
     ComPtr<ID3DBlob> error;
-    ASSERT_EQ(D3D12SerializeRootSignature(
-                  &desc, D3D_ROOT_SIGNATURE_VERSION_1_0, blob.put(), error.put()),
+    ASSERT_EQ(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                          blob.put(), error.put()),
               S_OK)
         << (error ? static_cast<const char *>(error->GetBufferPointer()) : "");
     ASSERT_TRUE(blob);

@@ -27,9 +27,9 @@ protected:
            architecture.UMA;
   }
 
-  ComPtr<ID3D12Resource>
-  CreateCpuVisibleBuffer(UINT64 size, D3D12_RESOURCE_FLAGS flags,
-                         D3D12_RESOURCE_STATES state) {
+  ComPtr<ID3D12Resource> CreateCpuVisibleBuffer(UINT64 size,
+                                                D3D12_RESOURCE_FLAGS flags,
+                                                D3D12_RESOURCE_STATES state) {
     D3D12_HEAP_PROPERTIES heap_properties = {};
     heap_properties.Type = D3D12_HEAP_TYPE_CUSTOM;
     heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
@@ -47,29 +47,31 @@ protected:
     desc.Flags = flags;
     ComPtr<ID3D12Resource> buffer;
     EXPECT_EQ(context_.device()->CreateCommittedResource(
-                  &heap_properties, D3D12_HEAP_FLAG_NONE, &desc, state,
-                  nullptr, IID_PPV_ARGS(buffer.put())),
+                  &heap_properties, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                  IID_PPV_ARGS(buffer.put())),
               S_OK);
     return buffer;
   }
 
   void ExpectPredicatedDispatch(UINT64 predicate_value,
-                                D3D12_PREDICATION_OP operation,
-                                bool executes, UINT64 predicate_offset = 0,
-                                bool copy_produced = false) {
+                                D3D12_PREDICATION_OP operation, bool executes,
+                                UINT64 predicate_offset = 0,
+                                bool copy_produced = false,
+                                bool default_predicate = false,
+                                bool dispatch_after_disable = false) {
     constexpr std::uint32_t sentinel = 0xdeadbeef;
     constexpr std::uint32_t dispatch_value = 0x13579bdf;
     std::array<std::uint32_t, 64> initial;
     initial.fill(sentinel);
     auto initial_upload = context_.CreateUploadBuffer(
         sizeof(initial), initial.data(), sizeof(initial));
-    auto output = context_.CreateBuffer(
-        sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto output =
+        context_.CreateBuffer(sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COPY_DEST);
     ASSERT_TRUE(predicate_offset == 0 || predicate_offset == sizeof(UINT64));
     std::array<UINT64, 2> predicate_values = {0xfedcba9876543210ull,
-                                               0xfedcba9876543210ull};
+                                              0xfedcba9876543210ull};
     predicate_values[predicate_offset / sizeof(UINT64)] = predicate_value;
     auto predicate_upload = context_.CreateUploadBuffer(
         sizeof(predicate_values), predicate_values.data(),
@@ -77,17 +79,21 @@ protected:
     ComPtr<ID3D12Resource> copied_predicate;
     ID3D12Resource *predicate = predicate_upload.get();
     if (copy_produced) {
-      copied_predicate = CreateCpuVisibleBuffer(
-          sizeof(predicate_values), D3D12_RESOURCE_FLAG_NONE,
-          D3D12_RESOURCE_STATE_COPY_DEST);
+      copied_predicate =
+          default_predicate
+              ? context_.CreateBuffer(
+                    sizeof(predicate_values), D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)
+              : CreateCpuVisibleBuffer(sizeof(predicate_values),
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
       if (predicate_upload && copied_predicate) {
-        context_.list()->CopyBufferRegion(
-            copied_predicate.get(), 0, predicate_upload.get(), 0,
-            sizeof(predicate_values));
-        D3D12TestContext::Transition(
-            context_.list(), copied_predicate.get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PREDICATION);
+        context_.list()->CopyBufferRegion(copied_predicate.get(), 0,
+                                          predicate_upload.get(), 0,
+                                          sizeof(predicate_values));
+        D3D12TestContext::Transition(context_.list(), copied_predicate.get(),
+                                     D3D12_RESOURCE_STATE_COPY_DEST,
+                                     D3D12_RESOURCE_STATE_PREDICATION);
         EXPECT_EQ(context_.ExecuteAndWait(), S_OK);
         EXPECT_EQ(context_.ResetCommandList(), S_OK);
         predicate = copied_predicate.get();
@@ -114,8 +120,8 @@ protected:
     root_desc.NumParameters = 2;
     root_desc.pParameters = parameters;
     auto root_signature = context_.CreateRootSignature(root_desc);
-    auto pipeline = context_.CreateComputePipeline(
-        root_signature.get(), ClearBufferComputeShader());
+    auto pipeline = context_.CreateComputePipeline(root_signature.get(),
+                                                   ClearBufferComputeShader());
     ASSERT_TRUE(root_signature);
     ASSERT_TRUE(pipeline);
 
@@ -128,9 +134,9 @@ protected:
         heap->GetCPUDescriptorHandleForHeapStart());
     context_.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
                                       sizeof(initial));
-    D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12TestContext::Transition(context_.list(), output.get(),
+                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     ID3D12DescriptorHeap *heaps[] = {heap.get()};
     context_.list()->SetDescriptorHeaps(1, heaps);
@@ -143,15 +149,18 @@ protected:
     context_.list()->Dispatch(1, 1, 1);
     context_.list()->SetPredication(nullptr, 0,
                                     D3D12_PREDICATION_OP_EQUAL_ZERO);
-    D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (dispatch_after_disable)
+      context_.list()->Dispatch(1, 1, 1);
+    D3D12TestContext::Transition(context_.list(), output.get(),
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     std::vector<std::uint8_t> bytes;
     ASSERT_TRUE(SUCCEEDED(
         context_.ReadbackBuffer(output.get(), sizeof(initial), &bytes)));
     ASSERT_EQ(bytes.size(), sizeof(initial));
-    const std::uint32_t expected = executes ? dispatch_value : sentinel;
+    const std::uint32_t expected =
+        executes || dispatch_after_disable ? dispatch_value : sentinel;
     for (std::size_t index = 0; index < initial.size(); ++index) {
       std::uint32_t actual = 0;
       std::memcpy(&actual, bytes.data() + index * sizeof(actual),
@@ -191,6 +200,17 @@ TEST_F(PredicationSpec, PredicateProducedByCopyControlsDispatch) {
                            sizeof(UINT64), true);
 }
 
+TEST_F(PredicationSpec,
+       DefaultPredicateProducedByCopyControlsDispatchAfterGpuCompletion) {
+  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, true,
+                           sizeof(UINT64), true, true);
+}
+
+TEST_F(PredicationSpec, DisablePredicationRestoresUnconditionalDispatch) {
+  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_EQUAL_ZERO, false, 0, false,
+                           false, true);
+}
+
 TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {
   if (!SupportsCpuVisibleCustomHeap())
     GTEST_SKIP() << "GPU-written CPU-visible predicates require UMA";
@@ -199,12 +219,14 @@ TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {
     RWByteAddressBuffer predicate : register(u0);
     [numthreads(1, 1, 1)]
     void main() { predicate.Store2(0, uint2(1, 0)); }
-  )", "cs_5_0");
+  )",
+                                      "cs_5_0");
   const auto consumer = CompileShader(R"(
     RWByteAddressBuffer output : register(u0);
     [numthreads(1, 1, 1)]
     void main() { output.Store(0, 0x31415926u); }
-  )", "cs_5_0");
+  )",
+                                      "cs_5_0");
   ASSERT_EQ(producer.result, S_OK) << producer.diagnostic_text();
   ASSERT_EQ(consumer.result, S_OK) << consumer.diagnostic_text();
 
@@ -216,23 +238,24 @@ TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {
   auto root = context_.CreateRootSignature(root_desc);
   ASSERT_TRUE(root);
   const D3D12_SHADER_BYTECODE producer_bytecode = {
-      producer.bytecode->GetBufferPointer(), producer.bytecode->GetBufferSize()};
+      producer.bytecode->GetBufferPointer(),
+      producer.bytecode->GetBufferSize()};
   const D3D12_SHADER_BYTECODE consumer_bytecode = {
-      consumer.bytecode->GetBufferPointer(), consumer.bytecode->GetBufferSize()};
+      consumer.bytecode->GetBufferPointer(),
+      consumer.bytecode->GetBufferSize()};
   auto producer_pipeline =
       context_.CreateComputePipeline(root.get(), producer_bytecode);
   auto consumer_pipeline =
       context_.CreateComputePipeline(root.get(), consumer_bytecode);
   auto predicate = CreateCpuVisibleBuffer(
-      sizeof(UINT64),
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      sizeof(UINT64), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   auto output_upload = context_.CreateUploadBuffer(
       sizeof(output_sentinel), &output_sentinel, sizeof(output_sentinel));
-  auto output = context_.CreateBuffer(
-      sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto output =
+      context_.CreateBuffer(sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(producer_pipeline);
   ASSERT_TRUE(consumer_pipeline);
   ASSERT_TRUE(predicate);
@@ -240,32 +263,31 @@ TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {
   ASSERT_TRUE(output);
 
   context_.list()->CopyBufferRegion(output.get(), 0, output_upload.get(), 0,
-                                     sizeof(output_sentinel));
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                                    sizeof(output_sentinel));
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   context_.list()->SetComputeRootSignature(root.get());
   context_.list()->SetPipelineState(producer_pipeline.get());
   context_.list()->SetComputeRootUnorderedAccessView(
       0, predicate->GetGPUVirtualAddress());
   context_.list()->Dispatch(1, 1, 1);
-  D3D12TestContext::Transition(
-      context_.list(), predicate.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_PREDICATION);
+  D3D12TestContext::Transition(context_.list(), predicate.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_PREDICATION);
   ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
   ASSERT_EQ(context_.ResetCommandList(), S_OK);
   context_.list()->SetComputeRootSignature(root.get());
   context_.list()->SetPipelineState(consumer_pipeline.get());
   context_.list()->SetComputeRootUnorderedAccessView(
       0, output->GetGPUVirtualAddress());
-  context_.list()->SetPredication(
-      predicate.get(), 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+  context_.list()->SetPredication(predicate.get(), 0,
+                                  D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
   context_.list()->Dispatch(1, 1, 1);
-  context_.list()->SetPredication(nullptr, 0,
-                                  D3D12_PREDICATION_OP_EQUAL_ZERO);
-  D3D12TestContext::Transition(
-      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context_.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   std::vector<std::uint8_t> bytes;
   ASSERT_EQ(context_.ReadbackBuffer(output.get(), sizeof(UINT), &bytes), S_OK);
   ASSERT_EQ(bytes.size(), sizeof(UINT));

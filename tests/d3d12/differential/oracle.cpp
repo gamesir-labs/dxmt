@@ -50,21 +50,19 @@ public:
 
   bool Initialize(bool use_warp) {
     if (!Check(CreateDXGIFactory1(__uuidof(IDXGIFactory4),
-                                 reinterpret_cast<void **>(factory_.put())),
+                                  reinterpret_cast<void **>(factory_.put())),
                "CreateDXGIFactory1"))
       return false;
 
-    if (use_warp &&
-        !Check(factory_->EnumWarpAdapter(
-                   __uuidof(IDXGIAdapter1),
-                   reinterpret_cast<void **>(adapter_.put())),
-               "EnumWarpAdapter"))
+    if (use_warp && !Check(factory_->EnumWarpAdapter(
+                               __uuidof(IDXGIAdapter1),
+                               reinterpret_cast<void **>(adapter_.put())),
+                           "EnumWarpAdapter"))
       return false;
 
-    if (!Check(D3D12CreateDevice(
-                   adapter_.get(), D3D_FEATURE_LEVEL_11_0,
-                   __uuidof(ID3D12Device),
-                   reinterpret_cast<void **>(device_.put())),
+    if (!Check(D3D12CreateDevice(adapter_.get(), D3D_FEATURE_LEVEL_11_0,
+                                 __uuidof(ID3D12Device),
+                                 reinterpret_cast<void **>(device_.put())),
                "D3D12CreateDevice"))
       return false;
 
@@ -98,9 +96,9 @@ public:
                    __uuidof(ID3D12GraphicsCommandList),
                    reinterpret_cast<void **>(list_.put())),
                "CreateCommandList") ||
-        !Check(device_->CreateFence(
-                   0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
-                   reinterpret_cast<void **>(fence_.put())),
+        !Check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                    __uuidof(ID3D12Fence),
+                                    reinterpret_cast<void **>(fence_.put())),
                "CreateFence"))
       return false;
 
@@ -132,11 +130,11 @@ public:
     return resource;
   }
 
-  ComPtr<ID3D12Resource> CreateUpload(
-      const std::array<std::uint32_t, kValueCount> &values) const {
-    auto upload =
-        CreateBuffer(sizeof(values), D3D12_HEAP_TYPE_UPLOAD,
-                     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ComPtr<ID3D12Resource>
+  CreateUpload(const std::array<std::uint32_t, kValueCount> &values) const {
+    auto upload = CreateBuffer(sizeof(values), D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!upload)
       return {};
     void *mapping = nullptr;
@@ -200,8 +198,7 @@ private:
 };
 
 void Transition(ID3D12GraphicsCommandList *list, ID3D12Resource *resource,
-                D3D12_RESOURCE_STATES before,
-                D3D12_RESOURCE_STATES after) {
+                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   barrier.Transition.pResource = resource;
@@ -215,12 +212,12 @@ bool RunCopyCase(OracleContext &context,
                  const std::array<std::uint32_t, kValueCount> &input,
                  std::vector<std::uint32_t> *result) {
   auto upload = context.CreateUpload(input);
-  auto gpu = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  auto readback = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto gpu = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
+                                  D3D12_RESOURCE_FLAG_NONE,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
   if (!upload || !gpu || !readback)
     return false;
   context.list()->CopyBufferRegion(gpu.get(), 0, upload.get(), 0,
@@ -242,9 +239,9 @@ bool RunOffsetCopyCase(OracleContext &context,
   initial.fill(0xdeadbeefu);
   auto initial_upload = context.CreateUpload(initial);
   auto input_upload = context.CreateUpload(input);
-  auto readback = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
   if (!initial_upload || !input_upload || !readback)
     return false;
   context.list()->CopyBufferRegion(readback.get(), 0, initial_upload.get(), 0,
@@ -260,9 +257,41 @@ bool RunOffsetCopyCase(OracleContext &context,
   return result->size() == kValueCount;
 }
 
+bool RunBarrierChainCase(OracleContext &context,
+                         const std::array<std::uint32_t, kValueCount> &input,
+                         std::vector<std::uint32_t> *result) {
+  auto upload = context.CreateUpload(input);
+  auto intermediate = context.CreateBuffer(
+      sizeof(input), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto destination = context.CreateBuffer(
+      sizeof(input), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!upload || !intermediate || !destination || !readback)
+    return false;
+  context.list()->CopyBufferRegion(intermediate.get(), 0, upload.get(), 0,
+                                   sizeof(input));
+  Transition(context.list(), intermediate.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list()->CopyBufferRegion(destination.get(), 0, intermediate.get(), 0,
+                                   sizeof(input));
+  Transition(context.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list()->CopyBufferRegion(readback.get(), 0, destination.get(), 0,
+                                   sizeof(input));
+  if (!context.ExecuteAndReset())
+    return false;
+  *result = context.Readback(readback.get(), kValueCount);
+  return result->size() == kValueCount;
+}
+
 bool RunComputeCase(OracleContext &context,
                     const std::array<std::uint32_t, kValueCount> &input,
-                    std::vector<std::uint32_t> *result) {
+                    std::vector<std::uint32_t> *result,
+                    bool predicated = false) {
   constexpr std::string_view source = R"(
     ByteAddressBuffer input : register(t0);
     RWByteAddressBuffer output : register(u0);
@@ -282,8 +311,9 @@ bool RunComputeCase(OracleContext &context,
                         0, shader.put(), diagnostics.put()),
              "D3DCompile")) {
     if (diagnostics)
-      std::cerr.write(static_cast<const char *>(diagnostics->GetBufferPointer()),
-                      diagnostics->GetBufferSize());
+      std::cerr.write(
+          static_cast<const char *>(diagnostics->GetBufferPointer()),
+          diagnostics->GetBufferSize());
     return false;
   }
 
@@ -296,9 +326,9 @@ bool RunComputeCase(OracleContext &context,
   root_desc.NumParameters = 2;
   root_desc.pParameters = parameters;
   ComPtr<ID3DBlob> root_blob;
-  if (!Check(D3D12SerializeRootSignature(
-                 &root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, root_blob.put(),
-                 diagnostics.put()),
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
              "D3D12SerializeRootSignature"))
     return false;
   ComPtr<ID3D12RootSignature> root;
@@ -319,14 +349,17 @@ bool RunComputeCase(OracleContext &context,
     return false;
 
   auto upload = context.CreateUpload(input);
-  auto output = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  auto readback = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  if (!upload || !output || !readback)
+  auto output = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+  std::array<std::uint32_t, kValueCount> predicate_values = {};
+  predicate_values[0] = 1;
+  auto predicate = predicated ? context.CreateUpload(predicate_values)
+                              : ComPtr<ID3D12Resource>();
+  if (!upload || !output || !readback || (predicated && !predicate))
     return false;
   context.list()->SetPipelineState(pipeline.get());
   context.list()->SetComputeRootSignature(root.get());
@@ -334,8 +367,14 @@ bool RunComputeCase(OracleContext &context,
       0, upload->GetGPUVirtualAddress());
   context.list()->SetComputeRootUnorderedAccessView(
       1, output->GetGPUVirtualAddress());
+  if (predicated)
+    context.list()->SetPredication(predicate.get(), 0,
+                                   D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
   context.list()->Dispatch(1, 1, 1);
-  Transition(context.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+  if (predicated)
+    context.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  Transition(context.list(), output.get(),
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
              D3D12_RESOURCE_STATE_COPY_SOURCE);
   context.list()->CopyBufferRegion(readback.get(), 0, output.get(), 0,
                                    sizeof(input));
@@ -345,11 +384,10 @@ bool RunComputeCase(OracleContext &context,
   return result->size() == kValueCount;
 }
 
-bool RunDescriptorTableCase(
-    OracleContext &context,
-    const std::array<std::uint32_t, kValueCount> &input,
-    std::vector<std::uint32_t> *result,
-    bool overwrite_after_recording = false) {
+bool RunDescriptorTableCase(OracleContext &context,
+                            const std::array<std::uint32_t, kValueCount> &input,
+                            std::vector<std::uint32_t> *result,
+                            bool overwrite_after_recording = false) {
   constexpr std::string_view source = R"(
     ByteAddressBuffer input : register(t0);
     RWByteAddressBuffer output : register(u0);
@@ -385,9 +423,9 @@ bool RunDescriptorTableCase(
   root_desc.NumParameters = 1;
   root_desc.pParameters = &parameter;
   ComPtr<ID3DBlob> root_blob;
-  if (!Check(D3D12SerializeRootSignature(
-                 &root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, root_blob.put(),
-                 diagnostics.put()),
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
              "D3D12SerializeRootSignature(descriptor table)"))
     return false;
   ComPtr<ID3D12RootSignature> root;
@@ -412,13 +450,12 @@ bool RunDescriptorTableCase(
   auto replacement_upload = overwrite_after_recording
                                 ? context.CreateUpload(replacement_values)
                                 : ComPtr<ID3D12Resource>();
-  auto output = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  auto readback = context.CreateBuffer(
-      sizeof(input), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto output = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   heap_desc.NumDescriptors = 2;
@@ -426,8 +463,8 @@ bool RunDescriptorTableCase(
   ComPtr<ID3D12DescriptorHeap> heap;
   if (!upload || (overwrite_after_recording && !replacement_upload) ||
       !output || !readback ||
-      !Check(context.device()->CreateDescriptorHeap(
-                 &heap_desc, IID_PPV_ARGS(heap.put())),
+      !Check(context.device()->CreateDescriptorHeap(&heap_desc,
+                                                    IID_PPV_ARGS(heap.put())),
              "CreateDescriptorHeap(descriptor table)"))
     return false;
 
@@ -448,8 +485,7 @@ bool RunDescriptorTableCase(
   uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   uav.Buffer.NumElements = kValueCount;
   uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-  context.device()->CreateUnorderedAccessView(output.get(), nullptr, &uav,
-                                               cpu);
+  context.device()->CreateUnorderedAccessView(output.get(), nullptr, &uav, cpu);
 
   ID3D12DescriptorHeap *heaps[] = {heap.get()};
   context.list()->SetDescriptorHeaps(1, heaps);
@@ -460,8 +496,9 @@ bool RunDescriptorTableCase(
   context.list()->Dispatch(1, 1, 1);
   if (overwrite_after_recording)
     context.device()->CreateShaderResourceView(replacement_upload.get(), &srv,
-                                                srv_cpu);
-  Transition(context.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               srv_cpu);
+  Transition(context.list(), output.get(),
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
              D3D12_RESOURCE_STATE_COPY_SOURCE);
   context.list()->CopyBufferRegion(readback.get(), 0, output.get(), 0,
                                    sizeof(input));
@@ -497,8 +534,8 @@ bool RunInvalidResourceCase(OracleContext &context,
   desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
   const HRESULT hr = context.device()->CreateCommittedResource(
-      &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
-      nullptr, __uuidof(ID3D12Resource), &output);
+      &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+      __uuidof(ID3D12Resource), &output);
   *result = {static_cast<std::uint32_t>(hr), output == nullptr ? 1u : 0u};
   return FAILED(hr) && output == nullptr;
 }
@@ -520,7 +557,9 @@ bool RunUnsupportedIidCase(OracleContext &context,
   desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   desc.NumDescriptors = 1;
   constexpr GUID unsupported_iid = {
-      0x9b3b8f8a, 0x1468, 0x4ea7,
+      0x9b3b8f8a,
+      0x1468,
+      0x4ea7,
       {0x92, 0xe4, 0x55, 0xe8, 0xa5, 0xf8, 0xe1, 0x3c}};
   void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
   const HRESULT hr =
@@ -529,8 +568,8 @@ bool RunUnsupportedIidCase(OracleContext &context,
   return FAILED(hr) && output == nullptr;
 }
 
-bool RunClearCase(OracleContext &context,
-                  std::vector<std::uint32_t> *result, bool use_rect) {
+bool RunClearCase(OracleContext &context, std::vector<std::uint32_t> *result,
+                  bool use_rect) {
   constexpr UINT width = 4;
   constexpr UINT height = 4;
   D3D12_HEAP_PROPERTIES heap = {};
@@ -570,9 +609,9 @@ bool RunClearCase(OracleContext &context,
   UINT64 total_size = 0;
   context.device()->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows,
                                           &row_size, &total_size);
-  auto readback = context.CreateBuffer(
-      total_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = context.CreateBuffer(total_size, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
   if (!readback)
     return false;
 
@@ -617,9 +656,9 @@ bool RunClearCase(OracleContext &context,
 void WriteValues(std::ostream &output, std::string_view name,
                  const std::vector<std::uint32_t> &values, bool trailing) {
   output << "    \"" << name
-         << "\": {\"kind\": \"u32-array\", \"hash_fnv1a64\": \"0x"
-         << std::hex << std::setw(16) << std::setfill('0') << Hash(values)
-         << std::dec << "\", \"values\": [";
+         << "\": {\"kind\": \"u32-array\", \"hash_fnv1a64\": \"0x" << std::hex
+         << std::setw(16) << std::setfill('0') << Hash(values) << std::dec
+         << "\", \"values\": [";
   for (std::size_t index = 0; index < values.size(); ++index) {
     if (index)
       output << ", ";
@@ -657,7 +696,9 @@ int main(int argc, char **argv) {
 
   std::vector<std::uint32_t> copy;
   std::vector<std::uint32_t> offset_copy;
+  std::vector<std::uint32_t> barrier_chain;
   std::vector<std::uint32_t> compute;
+  std::vector<std::uint32_t> predicated_compute;
   std::vector<std::uint32_t> descriptor_table;
   std::vector<std::uint32_t> descriptor_overwrite;
   std::vector<std::uint32_t> invalid_descriptor_heap;
@@ -674,8 +715,16 @@ int main(int argc, char **argv) {
     std::cerr << "buffer_copy_offset case failed\n";
     return 1;
   }
+  if (!RunBarrierChainCase(context, input, &barrier_chain)) {
+    std::cerr << "barrier_copy_chain case failed\n";
+    return 1;
+  }
   if (!RunComputeCase(context, input, &compute)) {
     std::cerr << "compute_u32 case failed\n";
+    return 1;
+  }
+  if (!RunComputeCase(context, input, &predicated_compute, true)) {
+    std::cerr << "predicated_compute_true case failed\n";
     return 1;
   }
   if (!RunDescriptorTableCase(context, input, &descriptor_table)) {
@@ -724,22 +773,22 @@ int main(int argc, char **argv) {
   *output << "{\n"
           << "  \"schema_version\": 1,\n"
           << "  \"suite\": \"d3d12-core-differential\",\n"
-          << "  \"adapter\": {\"mode\": \""
-          << (use_warp ? "warp" : "default") << "\", \"vendor_id\": "
-          << context.vendor_id() << ", \"device_id\": "
-          << context.device_id() << "},\n"
+          << "  \"adapter\": {\"mode\": \"" << (use_warp ? "warp" : "default")
+          << "\", \"vendor_id\": " << context.vendor_id()
+          << ", \"device_id\": " << context.device_id() << "},\n"
           << "  \"cases\": {\n";
   WriteValues(*output, "buffer_copy", copy, true);
   WriteValues(*output, "buffer_copy_offset", offset_copy, true);
+  WriteValues(*output, "barrier_copy_chain", barrier_chain, true);
   WriteValues(*output, "compute_u32", compute, true);
+  WriteValues(*output, "predicated_compute_true", predicated_compute, true);
   WriteValues(*output, "descriptor_table_compute", descriptor_table, true);
   WriteValues(*output, "descriptor_overwrite_before_submit",
               descriptor_overwrite, true);
   WriteValues(*output, "invalid_descriptor_heap", invalid_descriptor_heap,
               true);
   WriteValues(*output, "invalid_resource", invalid_resource, true);
-  WriteValues(*output, "invalid_root_signature", invalid_root_signature,
-              true);
+  WriteValues(*output, "invalid_root_signature", invalid_root_signature, true);
   WriteValues(*output, "unsupported_iid", unsupported_iid, true);
   WriteValues(*output, "clear_rgba8", clear, true);
   WriteValues(*output, "clear_rect_rgba8", clear_rect, false);

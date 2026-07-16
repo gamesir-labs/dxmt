@@ -31,17 +31,28 @@ D3D12TestContext::~D3D12TestContext() {
 }
 
 HRESULT D3D12TestContext::Initialize() {
+  ComPtr<ID3D12Device> device;
   HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                  __uuidof(ID3D12Device),
-                                 reinterpret_cast<void **>(device_.put()));
+                                 reinterpret_cast<void **>(device.put()));
   if (FAILED(hr))
     return hr;
+
+  return Initialize(device.get());
+}
+
+HRESULT D3D12TestContext::Initialize(ID3D12Device *device) {
+  if (!device)
+    return E_INVALIDARG;
+  device->AddRef();
+  device_.reset(device);
 
   D3D12_COMMAND_QUEUE_DESC queue_desc = {};
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-  hr = device_->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue),
-                                   reinterpret_cast<void **>(queue_.put()));
+  HRESULT hr = device_->CreateCommandQueue(
+      &queue_desc, __uuidof(ID3D12CommandQueue),
+      reinterpret_cast<void **>(queue_.put()));
   if (FAILED(hr))
     return hr;
 

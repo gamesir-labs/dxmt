@@ -11,6 +11,7 @@ from typing import Any
 
 
 REQUIRED_CASES = {
+    "barrier_copy_chain",
     "buffer_copy",
     "buffer_copy_offset",
     "clear_rect_rgba8",
@@ -21,6 +22,7 @@ REQUIRED_CASES = {
     "invalid_descriptor_heap",
     "invalid_resource",
     "invalid_root_signature",
+    "predicated_compute_true",
     "unsupported_iid",
 }
 MICROSOFT_VENDOR_ID = 0x1414

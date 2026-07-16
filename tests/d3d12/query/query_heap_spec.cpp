@@ -2,9 +2,12 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <cstdint>
+
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class QueryHeapSpec : public ::testing::Test {
@@ -58,6 +61,31 @@ TEST_F(QueryHeapSpec, RejectsInvalidType) {
   EXPECT_EQ(context_.device()->CreateQueryHeap(&desc, IID_PPV_ARGS(heap.put())),
             E_INVALIDARG);
   EXPECT_FALSE(heap);
+}
+
+TEST_F(QueryHeapSpec, UnsupportedStatisticsHeapsFailConsistently) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+  for (const auto type : {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                          D3D12_QUERY_HEAP_TYPE_SO_STATISTICS}) {
+    const D3D12_QUERY_HEAP_DESC desc = {type, 4, 0};
+    void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
+    EXPECT_EQ(device->CreateQueryHeap(&desc, __uuidof(ID3D12QueryHeap),
+                                      &output),
+              E_NOTIMPL)
+        << "heap type " << static_cast<unsigned>(type);
+    EXPECT_EQ(output, nullptr);
+  }
+
+  const D3D12_QUERY_HEAP_DESC timestamp_desc = {
+      D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1, 0};
+  ComPtr<ID3D12QueryHeap> timestamp;
+  EXPECT_EQ(device->CreateQueryHeap(&timestamp_desc,
+                                    __uuidof(ID3D12QueryHeap),
+                                    reinterpret_cast<void **>(timestamp.put())),
+            S_OK);
+  EXPECT_TRUE(timestamp) << "statistics rejection must leave the device usable";
+  EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
