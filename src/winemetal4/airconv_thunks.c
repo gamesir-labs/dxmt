@@ -6,6 +6,7 @@
 #endif
 #include "airconv_thunks.h"
 
+#ifndef DXMT_NATIVE
 AIRCONV_API int
 SM50Initialize(
     const void *pBytecode, size_t BytecodeSize, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl,
@@ -172,6 +173,7 @@ AIRCONV_API void SM50GetArgumentsInfo(
   params.arguments = pArguments;
   UNIX_CALL(sm50_get_arguments_info, &params);
 };
+#endif
 
 AIRCONV_API int
 DXMT12SM50Initialize(

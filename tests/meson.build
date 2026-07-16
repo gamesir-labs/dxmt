@@ -76,6 +76,7 @@ dxmt_wine_framework_suites = {
       'wine/utility_math_test.cpp',
       'wine/utility_sha1_test.cpp',
       'wine/utility_string_test.cpp',
+      'wine/wsi_platform_test.cpp',
       '../src/dxmt/dxmt_allocation.cpp',
       '../src/dxmt/dxmt_capture.cpp',
       '../src/dxmt/dxmt_deptrack.cpp',
