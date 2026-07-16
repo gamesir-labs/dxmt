@@ -17,7 +17,7 @@
 
 namespace {
 
-using dxmt::test::ShaderPipelineSubobject;
+using dxmt::test::PipelineSubobject;
 
 template <typename T> void release_object(T*& object) {
   if (object) {
@@ -877,17 +877,21 @@ TEST_F(D3D12DeviceSpec, RejectsPipelineStreamMixingComputeAndPixelShaders) {
   ASSERT_NE(device2, nullptr);
 
   struct PipelineStream {
-    ShaderPipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS> compute;
-    ShaderPipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> pixel;
+    PipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+                      D3D12_SHADER_BYTECODE>
+        compute;
+    PipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+                      D3D12_SHADER_BYTECODE>
+        pixel;
   } stream;
-  stream.compute.shader = dxmt::test::CopyTextureComputeShader();
-  stream.pixel.shader = dxmt::test::TextureUavPixelShader();
+  stream.compute.value = dxmt::test::CopyTextureComputeShader();
+  stream.pixel.value = dxmt::test::TextureUavPixelShader();
   D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {sizeof(stream), &stream};
 
   ID3D12PipelineState *pipeline = nullptr;
-  EXPECT_EQ(device2->CreatePipelineState(
-                &stream_desc, __uuidof(ID3D12PipelineState),
-                reinterpret_cast<void **>(&pipeline)),
+  EXPECT_EQ(device2->CreatePipelineState(&stream_desc,
+                                         __uuidof(ID3D12PipelineState),
+                                         reinterpret_cast<void **>(&pipeline)),
             E_INVALIDARG);
   EXPECT_EQ(pipeline, nullptr);
   release_object(device2);

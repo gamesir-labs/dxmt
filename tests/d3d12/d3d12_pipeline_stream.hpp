@@ -4,10 +4,10 @@
 
 namespace dxmt::test {
 
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
-struct alignas(void *) ShaderPipelineSubobject {
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Payload>
+struct alignas(void *) PipelineSubobject {
   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
-  D3D12_SHADER_BYTECODE shader = {};
+  Payload value = {};
 };
 
 } // namespace dxmt::test
