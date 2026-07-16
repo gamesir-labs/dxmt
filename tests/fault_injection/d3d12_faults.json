@@ -159,6 +159,71 @@
       "environment": {
         "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT": "2"
       }
+    },
+    {
+      "id": "air-initialization-fail-first",
+      "filter": "D3D12InternalFaultInjectionSpec.AirInitializationFailureClearsOutputAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_AIR_INITIALIZATION_AT": "1"
+      }
+    },
+    {
+      "id": "air-initialization-fail-after-one",
+      "filter": "D3D12InternalFaultInjectionSpec.AirInitializationFailureClearsOutputAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_AIR_INITIALIZATION_AT": "2"
+      }
+    },
+    {
+      "id": "metal-compute-pipeline-fail-first",
+      "filter": "D3D12InternalFaultInjectionSpec.MetalPipelineFailureAndLaterPipelineRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT": "always"
+      }
+    },
+    {
+      "id": "pso-archive-lookup-fail-first",
+      "filter": "D3D12InternalFaultInjectionSpec.PipelineArchiveLookupFaultFallsBackAndExecutionContinues",
+      "environment": {
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT": "1"
+      }
+    },
+    {
+      "id": "pso-archive-write-fail-first",
+      "filter": "D3D12PipelineArchiveSpec.InjectedArchiveWriteFailureRecoversOnFreshDevice",
+      "environment": {
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT": "1"
+      }
+    },
+    {
+      "id": "descriptor-table-allocation-fail-first",
+      "filter": "D3D12DescriptorInternalFaultInjectionSpec.DescriptorFailureFallsBackAndLaterWritesExecute",
+      "environment": {
+        "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT": "1"
+      }
+    },
+    {
+      "id": "descriptor-table-allocation-fail-after-one",
+      "filter": "D3D12DescriptorInternalFaultInjectionSpec.DescriptorFailureFallsBackAndLaterWritesExecute",
+      "environment": {
+        "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT": "2"
+      }
+    },
+    {
+      "id": "residency-insertion-fail-first",
+      "filter": "D3D12DescriptorInternalFaultInjectionSpec.DescriptorFailureFallsBackAndLaterWritesExecute",
+      "environment": {
+        "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT": "1"
+      }
+    },
+    {
+      "id": "residency-insertion-fail-after-one",
+      "filter": "D3D12DescriptorInternalFaultInjectionSpec.DescriptorFailureFallsBackAndLaterWritesExecute",
+      "environment": {
+        "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT": "2"
+      }
     }
   ]
 }

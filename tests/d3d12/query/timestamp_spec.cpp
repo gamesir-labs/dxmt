@@ -135,6 +135,44 @@ TEST_F(TimestampSpec, QueryAcrossCommandLists) {
   result->Unmap(0, &no_write);
 }
 
+TEST_F(TimestampSpec, ReusesQueryAfterCompletion) {
+  constexpr UINT64 sentinel = std::numeric_limits<UINT64>::max();
+  auto query_heap = CreateTimestampHeap(1);
+  auto result = context_.CreateBuffer(
+      2 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(query_heap);
+  ASSERT_TRUE(result);
+
+  UINT64 *mapping = nullptr;
+  const D3D12_RANGE no_read = {0, 0};
+  ASSERT_TRUE(
+      SUCCEEDED(result->Map(0, &no_read, reinterpret_cast<void **>(&mapping))));
+  std::fill(mapping, mapping + 2, sentinel);
+  const D3D12_RANGE initialized = {0, 2 * sizeof(UINT64)};
+  result->Unmap(0, &initialized);
+
+  for (UINT iteration = 0; iteration < 2; ++iteration) {
+    context_.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    context_.list()->ResolveQueryData(
+        query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, result.get(),
+        iteration * sizeof(UINT64));
+    ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+    if (iteration == 0) {
+      ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
+    }
+  }
+
+  const D3D12_RANGE read_range = {0, 2 * sizeof(UINT64)};
+  ASSERT_TRUE(SUCCEEDED(
+      result->Map(0, &read_range, reinterpret_cast<void **>(&mapping))));
+  EXPECT_NE(mapping[0], sentinel);
+  EXPECT_NE(mapping[1], sentinel);
+  EXPECT_LE(mapping[0], mapping[1]);
+  const D3D12_RANGE no_write = {0, 0};
+  result->Unmap(0, &no_write);
+}
+
 TEST_F(TimestampSpec, ClockCalibrationUsesPerformanceCounterDomain) {
   LARGE_INTEGER before = {};
   LARGE_INTEGER after = {};

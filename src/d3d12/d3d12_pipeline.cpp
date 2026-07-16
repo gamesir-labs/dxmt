@@ -40,6 +40,39 @@
 namespace dxmt::d3d12 {
 namespace {
 
+std::atomic<uint64_t> g_test_air_initialization_occurrence = 0;
+std::atomic<uint64_t> g_test_metal_compute_pipeline_occurrence = 0;
+std::atomic<uint64_t> g_test_pso_archive_lookup_occurrence = 0;
+
+static bool
+ShouldInjectPipelineFault(const char *environment_name,
+                          std::atomic<uint64_t> &occurrence) {
+  const auto value = env::getEnvVar(environment_name);
+  if (value.empty())
+    return false;
+  if (value == "always" || value == "all") {
+    occurrence.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  char *end = nullptr;
+  const auto target = std::strtoull(value.c_str(), &end, 0);
+  if (end == value.c_str() || *end || !target)
+    return false;
+  return occurrence.fetch_add(1, std::memory_order_relaxed) + 1 == target;
+}
+
+static void
+RecordInjectedPipelineFault(const char *name) {
+  const auto path = env::getEnvVar("DXMT_TEST_FAULT_MARKER");
+  if (path.empty())
+    return;
+  FILE *marker = fopen(path.c_str(), "a");
+  if (!marker)
+    return;
+  fprintf(marker, "%s\n", name);
+  fclose(marker);
+}
+
 static bool
 D3D12PipelineDiagEnabledEnv(const char *name) {
   auto value = env::getEnvVar(name);
@@ -568,6 +601,13 @@ InitializePipelineShaderHandle(PipelineShaderStage stage,
                                DXMT12_MTL4_SHADER_REFLECTION *reflection) {
   if (shader)
     *shader = nullptr;
+  if (ShouldInjectPipelineFault("DXMT_TEST_FAIL_AIR_INITIALIZATION_AT",
+                                g_test_air_initialization_occurrence)) {
+    RecordInjectedPipelineFault("DXMT_TEST_FAIL_AIR_INITIALIZATION_AT");
+    WARN("D3D12PipelineState: injected AIR initialization failure for ",
+         ShaderStageName(stage));
+    return E_OUTOFMEMORY;
+  }
 
   sm50_error_t error = nullptr;
   const bool is_dxil = cached_shader.kind == PipelineShaderBytecodeKind::Dxil;
@@ -1465,6 +1505,12 @@ template <typename PipelineInfo>
 bool AttachPSOBinaryArchive(
     IMTLD3D12Device *device, PipelineInfo &info,
     std::array<obj_handle_t, 1> &lookup_archives) {
+  if (ShouldInjectPipelineFault("DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT",
+                                g_test_pso_archive_lookup_occurrence)) {
+    RecordInjectedPipelineFault("DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT");
+    WARN("D3D12PipelineState: injected PSO binary archive lookup failure");
+    return false;
+  }
   auto *archive = device->GetPSOBinaryArchive();
   if (!archive)
     return false;
@@ -3098,6 +3144,13 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
       AttachPSOBinaryArchive(device, info, lookup_archives);
 
   auto create_pso = [&](std::string &error_desc) {
+    if (ShouldInjectPipelineFault(
+            "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT",
+            g_test_metal_compute_pipeline_occurrence)) {
+      RecordInjectedPipelineFault("DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT");
+      error_desc = "injected Metal compute pipeline creation failure";
+      return false;
+    }
     WMT::Reference<WMT::Error> error;
     uint64_t compile_wait_us = 0;
     auto create_pipeline = [&] {

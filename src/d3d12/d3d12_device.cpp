@@ -74,6 +74,9 @@ std::atomic<uint64_t> g_test_heap_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_root_signature_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_fence_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_query_heap_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_descriptor_table_allocation_occurrence = 0;
+std::atomic<uint64_t> g_test_residency_insertion_occurrence = 0;
+std::atomic<uint64_t> g_test_pso_archive_write_occurrence = 0;
 
 static bool
 ShouldInjectCreationFailure(const char *environment_name,
@@ -81,11 +84,56 @@ ShouldInjectCreationFailure(const char *environment_name,
   const auto value = env::getEnvVar(environment_name);
   if (value.empty())
     return false;
+  if (value == "always" || value == "all") {
+    occurrence.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   char *end = nullptr;
   const auto target = std::strtoull(value.c_str(), &end, 0);
   if (end == value.c_str() || *end || !target)
     return false;
   return occurrence.fetch_add(1, std::memory_order_relaxed) + 1 == target;
+}
+
+struct FaultInjectionConfiguration {
+  uint64_t target = 0;
+  bool always = false;
+};
+
+static FaultInjectionConfiguration
+LoadFaultInjectionConfiguration(const char *environment_name) {
+  const auto value = env::getEnvVar(environment_name);
+  if (value == "always" || value == "all")
+    return {.always = true};
+  if (value.empty())
+    return {};
+  char *end = nullptr;
+  const auto target = std::strtoull(value.c_str(), &end, 0);
+  return end != value.c_str() && !*end && target
+             ? FaultInjectionConfiguration{.target = target}
+             : FaultInjectionConfiguration{};
+}
+
+static bool
+ShouldInjectConfiguredFailure(const FaultInjectionConfiguration &configuration,
+                              std::atomic<uint64_t> &occurrence) {
+  if (!configuration.always && !configuration.target)
+    return false;
+  const auto current =
+      occurrence.fetch_add(1, std::memory_order_relaxed) + 1;
+  return configuration.always || current == configuration.target;
+}
+
+static void
+RecordInjectedFault(const char *name) {
+  const auto path = env::getEnvVar("DXMT_TEST_FAULT_MARKER");
+  if (path.empty())
+    return;
+  FILE *marker = fopen(path.c_str(), "a");
+  if (!marker)
+    return;
+  fprintf(marker, "%s\n", name);
+  fclose(marker);
 }
 
 static bool
@@ -2166,11 +2214,40 @@ GetDescriptorResidencyTarget(const DescriptorRecord &record) {
 }
 
 static void
+ClearDescriptorResidencyTarget(
+    IMTLD3D12Device *device,
+    const DescriptorHeapMirror::ScopedLock &mirror_lock,
+    DescriptorRecord &record) {
+  auto &queue = device->GetDXMTDevice().queue();
+  auto transition = record.mirror->ReplaceResidencyTarget(
+      mirror_lock, record.heap_index, {});
+  for (uint32_t i = 0; i < transition.removed_count; i++)
+    queue.RemovePersistentResidencyAfterCompletion(
+        transition.removed_allocations[i]);
+  if (transition.previous.sampler)
+    queue.RetainUntilGpuComplete(
+        [sampler = std::move(transition.previous.sampler)]() mutable {
+          sampler = nullptr;
+        });
+}
+
+static void
 ApplyDescriptorResidencyTarget(IMTLD3D12Device *device,
                                const DescriptorHeapMirror::ScopedLock &mirror_lock,
                                DescriptorRecord &record) {
   if (!device || !record.mirror)
     return;
+
+  static const auto fault = LoadFaultInjectionConfiguration(
+      "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT");
+  if (ShouldInjectConfiguredFailure(fault,
+                                    g_test_residency_insertion_occurrence)) {
+    RecordInjectedFault("DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT");
+    WARN("D3D12Device: injected descriptor residency-set insertion failure");
+    record.mirror->WriteNullTableEntry(mirror_lock, record.heap_index);
+    ClearDescriptorResidencyTarget(device, mirror_lock, record);
+    return;
+  }
 
   auto target = GetDescriptorResidencyTarget(record);
   auto &queue = device->GetDXMTDevice().queue();
@@ -2208,6 +2285,17 @@ MaterializeDescriptorTableForWrite(IMTLD3D12Device *device,
   auto *mirror = record.mirror;
   if (!mirror)
     return;
+  static const auto fault = LoadFaultInjectionConfiguration(
+      "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT");
+  if (ShouldInjectConfiguredFailure(
+          fault, g_test_descriptor_table_allocation_occurrence)) {
+    RecordInjectedFault("DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT");
+    WARN("D3D12Device: injected descriptor-table allocation failure");
+    mirror->WriteNullTableEntry(mirror_lock, record.heap_index);
+    ClearDescriptorResidencyTarget(device, mirror_lock, record);
+    record_update_time();
+    return;
+  }
   auto finish = [&] {
     ApplyDescriptorResidencyTarget(device, mirror_lock, record);
     record_update_time();
@@ -5171,6 +5259,16 @@ private:
   bool SerializePSOBinaryArchive(const char *reason, uint64_t count) {
     if (!pso_binary_archive_enabled_)
       return false;
+
+    if (ShouldInjectCreationFailure("DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT",
+                                    g_test_pso_archive_write_occurrence)) {
+      RecordInjectedFault("DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT");
+      WARN("D3D12Device: injected PSO binary archive write failure");
+      LogPSOBinaryArchiveMarker(
+          "DXMT_PSO_ARCHIVE: serialize reason=%s count=%llu ok=0 err=injected",
+          reason, static_cast<unsigned long long>(count));
+      return false;
+    }
 
     std::lock_guard lock(pso_binary_archive_mutex_);
     if (!pso_binary_archive_ || pso_binary_archive_unix_path_.empty())

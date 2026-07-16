@@ -6,6 +6,7 @@
 
 #include "shaders/runtime_test_shaders.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -155,6 +156,36 @@ TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
       << marker;
   EXPECT_NE(GetFileAttributesA(environment.archive.c_str()),
             INVALID_FILE_ATTRIBUTES);
+}
+
+TEST(D3D12PipelineArchiveSpec,
+     InjectedArchiveWriteFailureRecoversOnFreshDevice) {
+  if (!std::getenv("DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT"))
+    GTEST_SKIP() << "pipeline archive write fault injection is disabled";
+
+  ScopedArchiveTestEnvironment environment("write-fault");
+  ID3D12Device *device = CreateIsolatedDevice();
+  ASSERT_NE(device, nullptr);
+  auto *pipeline = CreateBasicGraphicsPipeline(device);
+  ASSERT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(device);
+  auto marker = environment.ReadMarker();
+  ASSERT_NE(marker.find("serialize reason=periodic count=1 ok=0 err=injected"),
+            std::string::npos)
+      << marker;
+
+  environment.ResetMarker();
+  device = CreateIsolatedDevice();
+  ASSERT_NE(device, nullptr);
+  pipeline = CreateBasicGraphicsPipeline(device);
+  ASSERT_NE(pipeline, nullptr);
+  release_object(pipeline);
+  release_object(device);
+  marker = environment.ReadMarker();
+  EXPECT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
+            std::string::npos)
+      << marker;
 }
 
 TEST(D3D12PipelineArchiveSpec, RejectsCorruptArchiveAndFallsBackToCompilation) {

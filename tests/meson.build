@@ -187,6 +187,79 @@ test(
   args: [
     airconv_cli_darwin,
     files('airconv/scalar-varying-vs.dxbc.hex'),
+    files('airconv/control-flow-ps.dxbc.hex'),
+    files('airconv/arithmetic-conversion-ps.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
+airconv_control_flow_test = find_program(
+  'airconv/control-flow-ir-test.sh',
+)
+test(
+  'airconv-control-flow-ir',
+  airconv_control_flow_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/control-flow-ps.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
+airconv_tessellation_phi_test = find_program(
+  'airconv/tessellation-phi-ir-test.sh',
+)
+test(
+  'airconv-tessellation-phi-ir',
+  airconv_tessellation_phi_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/phi-hull.dxbc.hex'),
+    files('airconv/phi-domain.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
+airconv_arithmetic_conversion_test = find_program(
+  'airconv/arithmetic-conversion-ir-test.sh',
+)
+test(
+  'airconv-arithmetic-conversion-ir',
+  airconv_arithmetic_conversion_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/arithmetic-conversion-ps.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
+airconv_container_boundary_test = find_program(
+  'airconv/container-boundary-test.py',
+)
+test(
+  'airconv-container-boundary',
+  airconv_container_boundary_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/scalar-varying-vs.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
+airconv_diagnostic_determinism_test = find_program(
+  'airconv/diagnostic-determinism-test.py',
+)
+test(
+  'airconv-diagnostic-determinism',
+  airconv_diagnostic_determinism_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/scalar-varying-vs.dxbc.hex'),
   ],
   suite: ['unit', 'airconv'],
   timeout: 30,

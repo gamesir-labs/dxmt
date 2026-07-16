@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -10,6 +11,7 @@
 namespace {
 
 using dxmt::test::ClearBufferComputeShader;
+using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 
@@ -163,6 +165,181 @@ TEST_F(ExecuteIndirectSpec, CountBufferOneExecutesDispatch) {
 TEST_F(ExecuteIndirectSpec, DefaultCountBufferOneExecutesDispatch) {
   const UINT count = 1;
   ExpectDispatch(1, true, 0, &count, true);
+}
+
+class ExecuteIndirectExtendedSpec : public ::testing::Test {
+protected:
+  void SetUp() override {
+    ASSERT_EQ(context_.Initialize(), S_OK);
+    const auto counter_shader = CompileShader(R"(
+      RWStructuredBuffer<uint> output : register(u0);
+      [numthreads(1, 1, 1)]
+      void main() {
+        uint ignored;
+        InterlockedAdd(output[0], 1, ignored);
+      }
+    )", "cs_5_0");
+    const auto argument_shader = CompileShader(R"(
+      RWByteAddressBuffer arguments : register(u0);
+      [numthreads(1, 1, 1)]
+      void main() {
+        arguments.Store(0, 1);
+        arguments.Store(4, 1);
+        arguments.Store(8, 1);
+      }
+    )", "cs_5_0");
+    ASSERT_EQ(counter_shader.result, S_OK) << counter_shader.diagnostic_text();
+    ASSERT_EQ(argument_shader.result, S_OK)
+        << argument_shader.diagnostic_text();
+
+    D3D12_ROOT_PARAMETER parameter = {};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = &parameter;
+    root_ = context_.CreateRootSignature(root_desc);
+    ASSERT_TRUE(root_);
+    counter_pipeline_ = context_.CreateComputePipeline(
+        root_.get(), {counter_shader.bytecode->GetBufferPointer(),
+                      counter_shader.bytecode->GetBufferSize()});
+    argument_pipeline_ = context_.CreateComputePipeline(
+        root_.get(), {argument_shader.bytecode->GetBufferPointer(),
+                      argument_shader.bytecode->GetBufferSize()});
+    ASSERT_TRUE(counter_pipeline_);
+    ASSERT_TRUE(argument_pipeline_);
+
+    D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC desc = {};
+    desc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    desc.NumArgumentDescs = 1;
+    desc.pArgumentDescs = &argument;
+    ASSERT_EQ(context_.device()->CreateCommandSignature(
+                  &desc, nullptr, IID_PPV_ARGS(signature_.put())),
+              S_OK);
+  }
+
+  ComPtr<ID3D12Resource> CreateCounter() {
+    const UINT zero = 0;
+    auto upload = context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
+    auto counter = context_.CreateBuffer(
+        sizeof(zero), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    EXPECT_TRUE(upload);
+    EXPECT_TRUE(counter);
+    if (upload && counter) {
+      context_.list()->CopyBufferRegion(counter.get(), 0, upload.get(), 0,
+                                         sizeof(zero));
+      D3D12TestContext::Transition(
+          context_.list(), counter.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    return counter;
+  }
+
+  UINT ReadCounter(ID3D12Resource *counter) {
+    D3D12TestContext::Transition(
+        context_.list(), counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<std::uint8_t> bytes;
+    EXPECT_EQ(context_.ReadbackBuffer(counter, sizeof(UINT), &bytes), S_OK);
+    UINT value = 0;
+    if (bytes.size() == sizeof(value))
+      std::memcpy(&value, bytes.data(), sizeof(value));
+    return value;
+  }
+
+  void BindCounter(ID3D12Resource *counter) {
+    context_.list()->SetComputeRootSignature(root_.get());
+    context_.list()->SetPipelineState(counter_pipeline_.get());
+    context_.list()->SetComputeRootUnorderedAccessView(
+        0, counter->GetGPUVirtualAddress());
+  }
+
+  D3D12TestContext context_;
+  ComPtr<ID3D12RootSignature> root_;
+  ComPtr<ID3D12PipelineState> counter_pipeline_;
+  ComPtr<ID3D12PipelineState> argument_pipeline_;
+  ComPtr<ID3D12CommandSignature> signature_;
+};
+
+TEST_F(ExecuteIndirectExtendedSpec, ExecutesMultipleCommands) {
+  const std::array<D3D12_DISPATCH_ARGUMENTS, 2> commands = {
+      D3D12_DISPATCH_ARGUMENTS{1, 1, 1},
+      D3D12_DISPATCH_ARGUMENTS{1, 1, 1}};
+  auto arguments = context_.CreateUploadBuffer(
+      sizeof(commands), commands.data(), sizeof(commands));
+  auto counter = CreateCounter();
+  ASSERT_TRUE(arguments);
+  ASSERT_TRUE(counter);
+  BindCounter(counter.get());
+  context_.list()->ExecuteIndirect(signature_.get(), 2, arguments.get(), 0,
+                                   nullptr, 0);
+  EXPECT_EQ(ReadCounter(counter.get()), 2u);
+}
+
+TEST_F(ExecuteIndirectExtendedSpec, CountBufferClampsMultipleCommands) {
+  const std::array<D3D12_DISPATCH_ARGUMENTS, 2> commands = {
+      D3D12_DISPATCH_ARGUMENTS{1, 1, 1},
+      D3D12_DISPATCH_ARGUMENTS{1, 1, 1}};
+  const UINT count = 1;
+  auto arguments = context_.CreateUploadBuffer(
+      sizeof(commands), commands.data(), sizeof(commands));
+  auto count_buffer =
+      context_.CreateUploadBuffer(sizeof(count), &count, sizeof(count));
+  auto counter = CreateCounter();
+  ASSERT_TRUE(arguments);
+  ASSERT_TRUE(count_buffer);
+  ASSERT_TRUE(counter);
+  BindCounter(counter.get());
+  context_.list()->ExecuteIndirect(signature_.get(), 2, arguments.get(), 0,
+                                   count_buffer.get(), 0);
+  EXPECT_EQ(ReadCounter(counter.get()), 1u);
+}
+
+TEST_F(ExecuteIndirectExtendedSpec, ArgumentBufferProducedByCopyExecutes) {
+  const D3D12_DISPATCH_ARGUMENTS command = {1, 1, 1};
+  auto upload = context_.CreateUploadBuffer(
+      sizeof(command), &command, sizeof(command));
+  auto arguments = context_.CreateBuffer(
+      sizeof(command), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto counter = CreateCounter();
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(arguments);
+  ASSERT_TRUE(counter);
+  context_.list()->CopyBufferRegion(arguments.get(), 0, upload.get(), 0,
+                                     sizeof(command));
+  D3D12TestContext::Transition(
+      context_.list(), arguments.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  BindCounter(counter.get());
+  context_.list()->ExecuteIndirect(signature_.get(), 1, arguments.get(), 0,
+                                   nullptr, 0);
+  EXPECT_EQ(ReadCounter(counter.get()), 1u);
+}
+
+TEST_F(ExecuteIndirectExtendedSpec, ArgumentBufferProducedByComputeExecutes) {
+  auto arguments = context_.CreateBuffer(
+      sizeof(D3D12_DISPATCH_ARGUMENTS), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto counter = CreateCounter();
+  ASSERT_TRUE(arguments);
+  ASSERT_TRUE(counter);
+  context_.list()->SetComputeRootSignature(root_.get());
+  context_.list()->SetPipelineState(argument_pipeline_.get());
+  context_.list()->SetComputeRootUnorderedAccessView(
+      0, arguments->GetGPUVirtualAddress());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), arguments.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  BindCounter(counter.get());
+  context_.list()->ExecuteIndirect(signature_.get(), 1, arguments.get(), 0,
+                                   nullptr, 0);
+  EXPECT_EQ(ReadCounter(counter.get()), 1u);
 }
 
 } // namespace
