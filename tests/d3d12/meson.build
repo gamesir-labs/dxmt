@@ -36,6 +36,7 @@ d3d12_unit_suites = {
     'sources': files(
       'capability/capability_spec.cpp',
       'capability/format_operation_spec.cpp',
+      'capability/optional_feature_gate_spec.cpp',
     ),
   },
   'command': {

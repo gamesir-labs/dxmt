@@ -3119,6 +3119,7 @@ public:
       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
          "unsupported");
   }
@@ -3129,6 +3130,7 @@ public:
       const D3D12_GPU_VIRTUAL_ADDRESS *src_acceleration_structure_data) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
          "unsupported");
   }
@@ -3139,6 +3141,7 @@ public:
       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: raytracing acceleration structures are "
          "unsupported");
   }
@@ -3146,13 +3149,16 @@ public:
   void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject *state_object) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListPipelineState);
-    if (state_object)
+    if (state_object) {
+      recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: state objects are unsupported");
+    }
   }
 
   void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC *desc) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: ray dispatch is unsupported");
   }
 #endif
@@ -3163,16 +3169,20 @@ public:
       const D3D12_SHADING_RATE_COMBINER *combiners) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
-    if (base_shading_rate != D3D12_SHADING_RATE_1X1 || combiners)
+    if (base_shading_rate != D3D12_SHADING_RATE_1X1 || combiners) {
+      recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: variable rate shading is unsupported");
+    }
   }
 
   void STDMETHODCALLTYPE RSSetShadingRateImage(
       ID3D12Resource *shading_rate_image) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
-    if (shading_rate_image)
+    if (shading_rate_image) {
+      recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: shading rate images are unsupported");
+    }
   }
 #endif
 
@@ -3183,6 +3193,10 @@ public:
       UINT thread_group_count_z) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    if (!thread_group_count_x || !thread_group_count_y ||
+        !thread_group_count_z)
+      return;
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: mesh shaders are unsupported");
   }
 #endif
