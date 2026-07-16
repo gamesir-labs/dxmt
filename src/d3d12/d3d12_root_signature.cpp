@@ -175,6 +175,123 @@ RootSignature10RootDescriptorFlags() {
   return D3D12_ROOT_DESCRIPTOR_FLAGS(D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE);
 }
 
+struct RootBindingInterval {
+  D3D12_DESCRIPTOR_RANGE_TYPE type;
+  UINT register_space;
+  uint64_t first_register;
+  uint64_t end_register;
+  D3D12_SHADER_VISIBILITY visibility;
+};
+
+bool ShaderVisibilitiesIntersect(D3D12_SHADER_VISIBILITY lhs,
+                                 D3D12_SHADER_VISIBILITY rhs) {
+  return lhs == D3D12_SHADER_VISIBILITY_ALL ||
+         rhs == D3D12_SHADER_VISIBILITY_ALL || lhs == rhs;
+}
+
+bool AddRootBinding(std::vector<RootBindingInterval> &bindings,
+                    D3D12_DESCRIPTOR_RANGE_TYPE type, UINT register_space,
+                    UINT first_register, UINT descriptor_count,
+                    D3D12_SHADER_VISIBILITY visibility) {
+  if (type < D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+      type > D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER || !descriptor_count)
+    return false;
+  const uint64_t end_register =
+      uint64_t(first_register) + uint64_t(descriptor_count);
+  if (end_register > uint64_t(UINT_MAX) + 1)
+    return false;
+  for (const auto &binding : bindings) {
+    if (binding.type != type || binding.register_space != register_space ||
+        !ShaderVisibilitiesIntersect(binding.visibility, visibility))
+      continue;
+    if (uint64_t(first_register) < binding.end_register &&
+        binding.first_register < end_register)
+      return false;
+  }
+  bindings.push_back(
+      {type, register_space, first_register, end_register, visibility});
+  return true;
+}
+
+D3D12_DESCRIPTOR_RANGE_TYPE
+RootParameterRangeType(D3D12_ROOT_PARAMETER_TYPE type) {
+  switch (type) {
+  case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+  case D3D12_ROOT_PARAMETER_TYPE_CBV:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+  case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  case D3D12_ROOT_PARAMETER_TYPE_UAV:
+    return D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  default:
+    return static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(UINT_MAX);
+  }
+}
+
+template <typename RootSignatureDesc>
+bool ValidateRootBindingLayout(const RootSignatureDesc &desc) {
+  std::vector<RootBindingInterval> bindings;
+  for (UINT parameter_index = 0; parameter_index < desc.NumParameters;
+       parameter_index++) {
+    const auto &parameter = desc.pParameters[parameter_index];
+    if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+      std::vector<std::pair<uint64_t, uint64_t>> table_intervals;
+      uint64_t append_offset = 0;
+      for (UINT range_index = 0;
+           range_index < parameter.DescriptorTable.NumDescriptorRanges;
+           range_index++) {
+        const auto &range =
+            parameter.DescriptorTable.pDescriptorRanges[range_index];
+        const uint64_t table_offset =
+            range.OffsetInDescriptorsFromTableStart ==
+                    D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                ? append_offset
+                : range.OffsetInDescriptorsFromTableStart;
+        const uint64_t table_end = table_offset + uint64_t(range.NumDescriptors);
+        if (table_end > uint64_t(UINT_MAX) + 1)
+          return false;
+        for (const auto &[first, end] : table_intervals) {
+          if (table_offset < end && first < table_end)
+            return false;
+        }
+        table_intervals.emplace_back(table_offset, table_end);
+        append_offset = table_end;
+        if (!AddRootBinding(bindings, range.RangeType, range.RegisterSpace,
+                            range.BaseShaderRegister, range.NumDescriptors,
+                            parameter.ShaderVisibility))
+          return false;
+      }
+      continue;
+    }
+
+    const auto range_type = RootParameterRangeType(parameter.ParameterType);
+    if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+      if (!parameter.Constants.Num32BitValues ||
+          !AddRootBinding(bindings, range_type,
+                          parameter.Constants.RegisterSpace,
+                          parameter.Constants.ShaderRegister, 1,
+                          parameter.ShaderVisibility))
+        return false;
+      continue;
+    }
+    if (!AddRootBinding(bindings, range_type,
+                        parameter.Descriptor.RegisterSpace,
+                        parameter.Descriptor.ShaderRegister, 1,
+                        parameter.ShaderVisibility))
+      return false;
+  }
+
+  for (UINT sampler_index = 0; sampler_index < desc.NumStaticSamplers;
+       sampler_index++) {
+    const auto &sampler = desc.pStaticSamplers[sampler_index];
+    if (!AddRootBinding(bindings, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+                        sampler.RegisterSpace, sampler.ShaderRegister, 1,
+                        sampler.ShaderVisibility))
+      return false;
+  }
+  return true;
+}
+
 void
 BuildBindingParameters(RootSignatureStorage &storage) {
   storage.parameters.clear();
@@ -302,7 +419,7 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
   if (root_cost > D3D12_MAX_ROOT_COST)
     return false;
 
-  return true;
+  return ValidateRootBindingLayout(desc);
 }
 
 bool
@@ -358,7 +475,7 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
   if (root_cost > D3D12_MAX_ROOT_COST)
     return false;
 
-  return true;
+  return ValidateRootBindingLayout(desc);
 }
 
 RootSignatureStorage

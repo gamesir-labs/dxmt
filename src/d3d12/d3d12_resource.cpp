@@ -929,6 +929,8 @@ public:
     return device_->QueryInterface(riid, device);
   }
 
+  IMTLD3D12Device *GetParentDevice() const override { return device_.ptr(); }
+
   HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(
       REFIID riid, void **protected_session) override {
     InitReturnPtr(protected_session);

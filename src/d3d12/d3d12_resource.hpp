@@ -62,6 +62,7 @@ public:
   virtual bool GetTileMappingByIndex(UINT tile_index,
                                      ResourceTileMapping &mapping) const = 0;
   virtual const D3D12_RESOURCE_DESC &GetResourceDesc() const = 0;
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual const D3D12_HEAP_PROPERTIES &GetResourceHeapProperties() const = 0;
   virtual D3D12_HEAP_FLAGS GetResourceHeapFlags() const = 0;
   virtual uint64_t GetDescriptorIdentity() const = 0;

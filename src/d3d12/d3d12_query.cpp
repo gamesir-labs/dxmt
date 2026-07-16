@@ -101,6 +101,8 @@ public:
     return device_->QueryInterface(riid, device);
   }
 
+  IMTLD3D12Device *GetParentDevice() const override { return device_.ptr(); }
+
   const D3D12_QUERY_HEAP_DESC &GetDesc() const override { return desc_; }
 
   Rc<VisibilityResultQuery> BeginVisibility(D3D12_QUERY_TYPE type,
@@ -354,22 +356,7 @@ private:
            " count=", desc_.Count);
       return false;
     }
-    switch (desc_.Type) {
-    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
-      return type == D3D12_QUERY_TYPE_OCCLUSION ||
-             type == D3D12_QUERY_TYPE_BINARY_OCCLUSION;
-    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
-      return type == D3D12_QUERY_TYPE_TIMESTAMP;
-    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
-      return type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
-    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
-      return type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 ||
-             type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1 ||
-             type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2 ||
-             type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3;
-    default:
-      return false;
-    }
+    return IsQueryTypeCompatible(desc_.Type, type);
   }
 
   Com<IMTLD3D12Device> device_;

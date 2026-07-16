@@ -5,8 +5,25 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace dxmt::test {
+
+ComPtr<ID3D12Device> CreateIsolatedD3D12Device() {
+  using CreateDeviceProc = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL,
+                                              REFIID, void **);
+  const auto create_device = reinterpret_cast<CreateDeviceProc>(
+      GetProcAddress(GetModuleHandleW(L"d3d12.dll"),
+                     "DXMTCreateD3D12DeviceFromFactory"));
+  if (!create_device)
+    return {};
+
+  ComPtr<ID3D12Device> device;
+  const HRESULT hr = create_device(
+      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+      reinterpret_cast<void **>(device.put()));
+  return SUCCEEDED(hr) ? std::move(device) : ComPtr<ID3D12Device>{};
+}
 
 D3D12TestContext::~D3D12TestContext() {
   if (fence_event_)

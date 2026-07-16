@@ -1123,6 +1123,95 @@ TEST_F(D3D12DescriptorSpec,
 }
 
 TEST_F(D3D12DescriptorSpec,
+       CrossDeviceTextureSrvFailsClosedAsNullDescriptor) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].BaseShaderRegister = 0;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].BaseShaderRegister = 0;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 2;
+  parameter.DescriptorTable.pDescriptorRanges = ranges;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {1, &parameter, 0, nullptr,
+                                               D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(), CopyTextureComputeShader());
+  auto output = context_.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(root_signature);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(output);
+  ASSERT_TRUE(heap);
+
+  auto foreign_device = dxmt::test::CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12_HEAP_PROPERTIES foreign_heap_properties = {};
+  foreign_heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC foreign_desc = {};
+  foreign_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  foreign_desc.Width = 4;
+  foreign_desc.Height = 4;
+  foreign_desc.DepthOrArraySize = 1;
+  foreign_desc.MipLevels = 1;
+  foreign_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  foreign_desc.SampleDesc.Count = 1;
+  foreign_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  ComPtr<ID3D12Resource> foreign_texture;
+  ASSERT_EQ(foreign_device->CreateCommittedResource(
+                &foreign_heap_properties, D3D12_HEAP_FLAG_NONE, &foreign_desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(foreign_texture.put())),
+            S_OK);
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  context_.device()->CreateShaderResourceView(
+      foreign_texture.get(), &srv, context_.CpuDescriptorHandle(heap.get(), 0));
+  context_.device()->CreateUnorderedAccessView(
+      output.get(), nullptr, nullptr,
+      context_.CpuDescriptorHandle(heap.get(), 1));
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(output.get(), &readback), S_OK);
+  const std::array<float, 4> zero = {};
+  for (UINT y = 0; y < 4; ++y) {
+    for (UINT x = 0; x < 4; ++x) {
+      std::array<float, 4> actual = {};
+      std::memcpy(actual.data(),
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(actual),
+                  sizeof(actual));
+      EXPECT_EQ(actual, zero) << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(D3D12DescriptorSpec,
        AlternatesValidAndNullCbvAcrossCompiledNativeDescriptorHeaps) {
   RunDescriptorTableDraw(
       context_, {.null_other_heap_cbv = true,

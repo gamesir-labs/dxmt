@@ -768,6 +768,14 @@ GetResourceFromD3D12(ID3D12Resource *resource) {
 }
 
 static bool
+ResourceBelongsToDevice(ID3D12Resource *resource, IMTLD3D12Device *device) {
+  if (!resource)
+    return true;
+  auto *state = GetResourceFromD3D12(resource);
+  return state && state->GetParentDevice() == device;
+}
+
+static bool
 IsBufferResource(ID3D12Resource *resource) {
   auto *d3d12_resource = dynamic_cast<Resource *>(resource);
   return d3d12_resource &&
@@ -3511,6 +3519,12 @@ public:
       UINT64 offset = 0;
       auto *resource =
           LookupBufferResourceByGpuVirtualAddress(desc->BufferLocation, &offset);
+      if (!null_cbv && resource &&
+          resource->GetParentDevice() != static_cast<IMTLD3D12Device *>(this)) {
+        ResetDescriptorRecord(*record);
+        MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
+        return;
+      }
       if (!null_cbv && (!resource || !resource->GetBuffer())) {
         static std::atomic<uint32_t> unresolved_cbv_warnings = 0;
         if (ShouldLogRepeatedDescriptorWarning(unresolved_cbv_warnings))
@@ -3566,6 +3580,12 @@ public:
     ResetDescriptorRecord(*record);
     BeginDescriptorSlotWrite(
         descriptor_lock, *record, DescriptorRecordType::ShaderResourceView);
+    if (!ResourceBelongsToDevice(resource,
+                                 static_cast<IMTLD3D12Device *>(this))) {
+      ResetDescriptorRecord(*record);
+      MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
+      return;
+    }
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
@@ -3599,6 +3619,14 @@ public:
     ResetDescriptorRecord(*record);
     BeginDescriptorSlotWrite(
         descriptor_lock, *record, DescriptorRecordType::UnorderedAccessView);
+    if (!ResourceBelongsToDevice(resource,
+                                 static_cast<IMTLD3D12Device *>(this)) ||
+        !ResourceBelongsToDevice(counter_resource,
+                                 static_cast<IMTLD3D12Device *>(this))) {
+      ResetDescriptorRecord(*record);
+      MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
+      return;
+    }
     record->type = DescriptorRecordType::UnorderedAccessView;
     record->resource = resource;
     record->counter_resource = counter_resource;
@@ -3627,6 +3655,9 @@ public:
       return;
     auto descriptor_lock = LockDescriptorRecordForWrite(*record);
     ResetDescriptorRecord(*record);
+    if (!ResourceBelongsToDevice(resource,
+                                 static_cast<IMTLD3D12Device *>(this)))
+      return;
     record->type = DescriptorRecordType::RenderTargetView;
     record->resource = resource;
     if (desc) {
@@ -3649,6 +3680,9 @@ public:
     if (!record)
       return;
     ResetDescriptorRecord(*record);
+    if (!ResourceBelongsToDevice(resource,
+                                 static_cast<IMTLD3D12Device *>(this)))
+      return;
     record->type = DescriptorRecordType::DepthStencilView;
     record->resource = resource;
     if (desc) {

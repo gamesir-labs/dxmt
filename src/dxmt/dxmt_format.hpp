@@ -114,6 +114,8 @@ bool GetDXGIFormatPlaneFootprintLayout(uint32_t format, uint32_t plane,
 bool IsDXGIFormatPlaneCompatible(uint32_t allocation_format, uint32_t view_or_copy_format,
                                  uint32_t plane);
 
+bool AreDXGIFormatsInSameTypeGroup(uint32_t lhs, uint32_t rhs);
+
 int32_t MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description);
 
 uint32_t MTLGetTexelSize(WMTPixelFormat format);

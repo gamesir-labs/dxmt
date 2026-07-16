@@ -59,6 +59,7 @@ d3d12_unit_suites = {
       'descriptor/binding_hotspot_spec.cpp',
       'descriptor/buffer_view_spec.cpp',
       'descriptor/descriptor_spec.cpp',
+      'descriptor/heap_contract_spec.cpp',
       'descriptor/sampler_spec.cpp',
       'descriptor/table_binding_spec.cpp',
     ),
@@ -95,6 +96,7 @@ d3d12_unit_suites = {
       'query/predication_spec.cpp',
       'query/query_heap_spec.cpp',
       'query/timestamp_spec.cpp',
+      'query/validation_spec.cpp',
     ),
   },
   'queue': {
@@ -103,6 +105,7 @@ d3d12_unit_suites = {
   'root-signature': {
     'sources': files(
       'root_signature/layout_validation_spec.cpp',
+      'root_signature/contract_matrix_spec.cpp',
       'root_signature/root_descriptor_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
@@ -130,7 +133,9 @@ d3d12_unit_suites = {
       'transfer/clear_rtv_spec.cpp',
       'transfer/clear_uav_spec.cpp',
       'transfer/copy_footprint_spec.cpp',
+      'transfer/copy_edge_spec.cpp',
       'transfer/copy_resource_spec.cpp',
+      'transfer/resolve_validation_spec.cpp',
       'transfer/copy_texture_spec.cpp',
     ),
   },

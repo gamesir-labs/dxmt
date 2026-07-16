@@ -6,6 +6,7 @@
 #include "com/com_private_data.hpp"
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_descriptor_mirror.hpp"
+#include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
@@ -1881,6 +1882,7 @@ public:
       records_.clear();
       compiled_commands_.reset();
       pending_render_pass_resolves_.clear();
+      active_queries_.clear();
       ClearRecordedStateCache();
     }
     closed_ = false;
@@ -2125,8 +2127,30 @@ public:
     if (RejectCommandListType(
             "CopyResource", kDirectList | kComputeList | kCopyList))
       return;
-    if (!dst_resource || !src_resource)
+    if (!dst_resource || !src_resource) {
+      recording_error_ = E_INVALIDARG;
       return;
+    }
+    const auto *dst = dynamic_cast<Resource *>(dst_resource);
+    const auto *src = dynamic_cast<Resource *>(src_resource);
+    if (!dst || !src || dst->GetParentDevice() != device_.ptr() ||
+        src->GetParentDevice() != device_.ptr()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    const auto &dst_desc = dst->GetResourceDesc();
+    const auto &src_desc = src->GetResourceDesc();
+    if (dst_desc.Dimension != src_desc.Dimension ||
+        dst_desc.Width != src_desc.Width ||
+        dst_desc.Height != src_desc.Height ||
+        dst_desc.DepthOrArraySize != src_desc.DepthOrArraySize ||
+        dst_desc.MipLevels != src_desc.MipLevels ||
+        !AreDXGIFormatsInSameTypeGroup(dst_desc.Format, src_desc.Format) ||
+        dst_desc.SampleDesc.Count != src_desc.SampleDesc.Count ||
+        dst_desc.SampleDesc.Quality != src_desc.SampleDesc.Quality) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_resource(this, dst_resource, src_resource);
     AddRecord(CopyResourceRecord{dst_resource, src_resource});
@@ -2184,8 +2208,12 @@ public:
       return;
     if (RejectCommandListType("ResolveSubresource", kDirectList))
       return;
-    if (!dst_resource || !src_resource)
+    if (!ValidateResolveSubresource(dst_resource, dst_sub_resource, 0, 0,
+                                    src_resource, src_sub_resource, nullptr,
+                                    format, true)) {
+      recording_error_ = E_INVALIDARG;
       return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_resolve_subresource(
             this, dst_resource, dst_sub_resource, src_resource, src_sub_resource,
@@ -2786,8 +2814,20 @@ public:
       return;
     if (RejectCommandListType("BeginQuery", kDirectList))
       return;
-    if (!heap)
+    auto *query_heap = dynamic_cast<QueryHeap *>(heap);
+    if (!query_heap || query_heap->GetParentDevice() != device_.ptr() ||
+        index >= query_heap->GetDesc().Count ||
+        type == D3D12_QUERY_TYPE_TIMESTAMP ||
+        !IsQueryTypeCompatible(query_heap->GetDesc().Type, type)) {
+      recording_error_ = E_INVALIDARG;
       return;
+    }
+    const auto key = std::make_pair(query_heap, index);
+    if (active_queries_.find(key) != active_queries_.end()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    active_queries_.emplace(key, type);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_begin_query(
             this, heap, static_cast<uint32_t>(type), index);
@@ -2801,8 +2841,23 @@ public:
     if (RejectCommandListType(
             "EndQuery", kDirectList | kComputeList | kCopyList))
       return;
-    if (!heap)
+    auto *query_heap = dynamic_cast<QueryHeap *>(heap);
+    if (!query_heap || query_heap->GetParentDevice() != device_.ptr() ||
+        index >= query_heap->GetDesc().Count ||
+        !IsQueryTypeCompatible(query_heap->GetDesc().Type, type)) {
+      recording_error_ = E_INVALIDARG;
       return;
+    }
+    if (type != D3D12_QUERY_TYPE_TIMESTAMP) {
+      const auto key = std::make_pair(query_heap, index);
+      const auto active = active_queries_.find(key);
+      if (active != active_queries_.end() && active->second != type) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+      if (active != active_queries_.end())
+        active_queries_.erase(active);
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_end_query(
             this, heap, static_cast<uint32_t>(type), index);
@@ -2819,8 +2874,28 @@ public:
     if (RejectCommandListType(
             "ResolveQueryData", kDirectList | kComputeList | kCopyList))
       return;
-    if (!heap || !dst_buffer || !query_count)
+    auto *query_heap = dynamic_cast<QueryHeap *>(heap);
+    auto *destination = dynamic_cast<Resource *>(dst_buffer);
+    const bool range_valid =
+        query_heap && query_heap->GetParentDevice() == device_.ptr() &&
+        start_index <= query_heap->GetDesc().Count &&
+        query_count <= query_heap->GetDesc().Count - start_index;
+    const bool destination_valid =
+        destination && destination->GetParentDevice() == device_.ptr() &&
+        destination->GetResourceDesc().Dimension ==
+            D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !(aligned_dst_buffer_offset & (sizeof(UINT64) - 1)) &&
+        aligned_dst_buffer_offset <= destination->GetResourceDesc().Width &&
+        UINT64(query_count) <=
+            (destination->GetResourceDesc().Width - aligned_dst_buffer_offset) /
+                sizeof(UINT64);
+    if (!query_count)
       return;
+    if (!query_heap || !IsQueryTypeCompatible(query_heap->GetDesc().Type, type) ||
+        !range_valid || !destination_valid) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_resolve_query_data(
             this, heap, static_cast<uint32_t>(type), start_index, query_count,
@@ -2949,8 +3024,12 @@ public:
       WARN("D3D12GraphicsCommandList: ResolveSubresourceRegion decompress mode is unsupported");
       return;
     }
-    if (!dst_resource || !src_resource)
+    if (!ValidateResolveSubresource(
+            dst_resource, dst_sub_resource_idx, dst_x, dst_y, src_resource,
+            src_sub_resource_idx, src_rect, format, false)) {
+      recording_error_ = E_INVALIDARG;
       return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_resolve_subresource_region(
             this, dst_resource, dst_sub_resource_idx, dst_x, dst_y,
@@ -3514,11 +3593,82 @@ private:
     SnapshotCopySourceBuffer(resource->GetD3D12Resource(), offset, byte_count);
   }
 
+  bool ValidateResolveSubresource(
+      ID3D12Resource *dst_resource, UINT dst_subresource, UINT dst_x,
+      UINT dst_y, ID3D12Resource *src_resource, UINT src_subresource,
+      const D3D12_RECT *src_rect, DXGI_FORMAT format, bool full_resource) const {
+    auto *dst = dynamic_cast<Resource *>(dst_resource);
+    auto *src = dynamic_cast<Resource *>(src_resource);
+    if (!dst || !src || dst->GetParentDevice() != device_.ptr() ||
+        src->GetParentDevice() != device_.ptr())
+      return false;
+    const auto &dst_desc = dst->GetResourceDesc();
+    const auto &src_desc = src->GetResourceDesc();
+    if (dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        src_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        dst_desc.Dimension != src_desc.Dimension ||
+        dst_desc.SampleDesc.Count != 1 || src_desc.SampleDesc.Count <= 1 ||
+        format == DXGI_FORMAT_UNKNOWN ||
+        (!IsDXGIFormatPlaneCompatible(dst_desc.Format, format, 0) &&
+         !AreDXGIFormatsInSameTypeGroup(dst_desc.Format, format)) ||
+        (!IsDXGIFormatPlaneCompatible(src_desc.Format, format, 0) &&
+         !AreDXGIFormatsInSameTypeGroup(src_desc.Format, format)))
+      return false;
+
+    const auto subresource_count = [](const D3D12_RESOURCE_DESC &desc) {
+      const UINT array_count =
+          desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+              ? 1u
+              : UINT(desc.DepthOrArraySize);
+      const UINT plane_count =
+          std::max(1u, GetDXGIFormatTraits(desc.Format).planeCount);
+      return UINT64(desc.MipLevels) * array_count * plane_count;
+    };
+    if (dst_subresource >= subresource_count(dst_desc) ||
+        src_subresource >= subresource_count(src_desc))
+      return false;
+    const UINT dst_mip = dst_subresource % dst_desc.MipLevels;
+    const UINT src_mip = src_subresource % src_desc.MipLevels;
+    const UINT64 dst_width = std::max<UINT64>(1, dst_desc.Width >> dst_mip);
+    const UINT64 src_width = std::max<UINT64>(1, src_desc.Width >> src_mip);
+    const UINT dst_height = std::max<UINT>(1, dst_desc.Height >> dst_mip);
+    const UINT src_height = std::max<UINT>(1, src_desc.Height >> src_mip);
+    if (full_resource)
+      return dst_width == src_width && dst_height == src_height;
+
+    const int64_t left = src_rect ? src_rect->left : 0;
+    const int64_t top = src_rect ? src_rect->top : 0;
+    const int64_t right = src_rect ? src_rect->right : int64_t(src_width);
+    const int64_t bottom = src_rect ? src_rect->bottom : int64_t(src_height);
+    if (left < 0 || top < 0 || right <= left || bottom <= top ||
+        uint64_t(right) > src_width || uint64_t(bottom) > src_height)
+      return false;
+    const uint64_t width = uint64_t(right - left);
+    const uint64_t height = uint64_t(bottom - top);
+    return uint64_t(dst_x) <= dst_width && width <= dst_width - dst_x &&
+           uint64_t(dst_y) <= dst_height && height <= dst_height - dst_y;
+  }
+
   void RecordCopyBufferRegion(const char *method, ID3D12Resource *dst_buffer,
                               UINT64 dst_offset, ID3D12Resource *src_buffer,
                               UINT64 src_offset, UINT64 byte_count) {
-    if (!dst_buffer || !src_buffer || byte_count == 0)
+    if (!byte_count)
       return;
+    auto *dst = dynamic_cast<Resource *>(dst_buffer);
+    auto *src = dynamic_cast<Resource *>(src_buffer);
+    if (!dst || !src || dst->GetParentDevice() != device_.ptr() ||
+        src->GetParentDevice() != device_.ptr() ||
+        dst->GetResourceDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        src->GetResourceDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        dst_offset > dst->GetResourceDesc().Width ||
+        byte_count > dst->GetResourceDesc().Width - dst_offset ||
+        src_offset > src->GetResourceDesc().Width ||
+        byte_count > src->GetResourceDesc().Width - src_offset ||
+        (dst_buffer == src_buffer && dst_offset < src_offset + byte_count &&
+         src_offset < dst_offset + byte_count)) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     SnapshotCopySourceBuffer(src_buffer, src_offset, byte_count);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_buffer_region(
@@ -3733,6 +3883,7 @@ private:
   FLOAT depth_bounds_max_ = 1.0f;
   UINT view_instance_mask_ = 0xffffffffu;
   std::vector<PendingRenderPassResolve> pending_render_pass_resolves_;
+  std::map<std::pair<QueryHeap *, UINT>, D3D12_QUERY_TYPE> active_queries_;
   bool closed_ = false;
   bool submitted_ = false;
   bool apitrace_lifecycle_recording_enabled_ = true;
