@@ -5772,7 +5772,7 @@ private:
           continue;
         ULONG ref_count = backbuffer->AddRef();
         backbuffer->Release();
-        if (ref_count > 3)
+        if (ref_count > 2)
           return true;
       }
       return false;

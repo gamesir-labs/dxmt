@@ -88,6 +88,7 @@ d3d12_unit_suites = {
     'sources': files(
       'integration/batched_matrix_spec.cpp',
       'integration/frame_spec.cpp',
+      'integration/swapchain_spec.cpp',
     ),
   },
   'pipeline': {
