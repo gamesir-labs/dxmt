@@ -5,7 +5,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 
 if [ "$#" -lt 1 ]; then
-  printf 'usage: %s <meson-build-dir> [all|unit|integration] [meson-test-option...]\n' "$0" >&2
+  printf 'usage: %s <meson-build-dir> [all|unit|integration|performance] [meson-test-option...]\n' "$0" >&2
   exit 2
 fi
 
@@ -17,7 +17,7 @@ shift
 
 mode=${1:-all}
 case $mode in
-  all|unit|integration)
+  all|unit|integration|performance)
     if [ "$#" -gt 0 ]; then
       shift
     fi
@@ -152,9 +152,13 @@ case $mode in
 esac
 
 case $mode in
-  all|integration)
+  all|integration|performance)
     benchmark_suite=wine
-    if [ "$suite" != all ]; then benchmark_suite=$suite; fi
+    if [ "$mode" = performance ]; then
+      benchmark_suite=performance
+    elif [ "$mode" = integration ] && [ "$suite" != all ]; then
+      benchmark_suite=$suite
+    fi
     set --
     if [ -n "$forwarded_args" ]; then
       old_ifs=$IFS

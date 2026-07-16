@@ -47,7 +47,7 @@ mean, p50, p95, maximum CreatePSO latency, and summed-call-time to wall-time
 ratio; the Google Benchmark entry itself remains serial so Wine benchmark
 suite isolation is preserved.
 
-The `d3d12-binding-hotspots` suite establishes independent pre-optimization
+The `d3d12-binding-hotspots` performance suite establishes independent
 baselines for the three bindless CPU paths reported by FH4. Argument-table
 update measures only shader-visible descriptor overwrites. Root-table
 materialization measures only the compiled command-list `Close()` interval
@@ -59,10 +59,12 @@ design; the mirror benchmark isolates the bulk-copy mutation workload used to
 measure that nested subpath.
 
 `performance` performs repeated serial measurements and validates the median
-against a reviewed JSON budget. Every result must be single-threaded, and
-missing or stale budget entries fail acceptance. Performance budgets are
-machine-specific contracts and should only be updated from the designated Wine
-benchmark machine.
+against a reviewed JSON baseline plus an explicit maximum regression
+percentage. Every result must be single-threaded, and missing or stale budget
+entries fail acceptance. Performance budgets are machine-specific contracts
+and should only be updated from the designated Wine benchmark machine. The
+current binding baselines and host metadata live in
+`benchmarks/budgets/d3d12_binding_hotspots.json`.
 
 ## Add a Wine workload
 
@@ -97,9 +99,10 @@ Register an integration suite as follows:
 },
 ```
 
-A future Wine performance suite uses `mode: 'performance'`, adds a budget file,
-and may set `repetitions`, `min_time`, and `warmup_time`. The acceptance runner
-supports `cpu_time` and `real_time` with `max_median_ns` thresholds.
+A Wine performance suite uses `mode: 'performance'`, adds a budget file, and
+may set `repetitions`, `min_time`, and `warmup_time`. The acceptance runner
+supports `cpu_time` and `real_time`, baseline-plus-regression thresholds, and
+legacy absolute `max_median_ns` thresholds.
 
 ## Build and run
 
@@ -108,6 +111,7 @@ Benchmarks are built by the same full profile as the Wine tests:
 ```sh
 scripts/dxmt-builder build --profile gcc-x64-release-full benchmarks
 scripts/dxmt-builder test --profile gcc-x64-release-full integration
+scripts/dxmt-builder test --profile gcc-x64-release-full performance
 ```
 
 The helper compiles and stages the current DXMT runtime before Meson executes

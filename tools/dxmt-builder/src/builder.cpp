@@ -415,7 +415,7 @@ private:
         << "  bootstrap [all|host|wine-x64|llvm-mingw|llvm-project|llvm-darwin-x64|llvm-win]...\n"
         << "  configure [--profile NAME]\n"
         << "  build [--profile NAME] <runtime|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
-        << "  test [--profile NAME] [all|unit|integration] [--suite NAME] [--test-args ARG]\n"
+        << "  test [--profile NAME] [all|unit|integration|performance] [--suite NAME] [--test-args ARG]\n"
         << "  install [--profile NAME] [--component NAME] [--dest PATH]\n"
         << "  cache <status [--json]|verify|prune [--dry-run|--apply]|clean --profile NAME>\n";
   }
@@ -875,7 +875,8 @@ private:
     std::vector<std::string> forwarded;
     for (std::size_t index = 0; index < remaining.size(); ++index) {
       if (remaining[index] == "all" || remaining[index] == "unit" ||
-          remaining[index] == "integration") {
+          remaining[index] == "integration" ||
+          remaining[index] == "performance") {
         mode = remaining[index];
       } else if (remaining[index] == "--suite") {
         if (++index >= remaining.size())

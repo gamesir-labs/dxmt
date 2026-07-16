@@ -87,3 +87,26 @@ jobs:
 
       - name: Run Fault Injection Matrix
         run: python3 scripts/run-d3d12-fault-injection.py
+
+  performance:
+    runs-on: self-macos-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          clean: false
+          submodules: true
+
+      - name: Prepare Toolchains
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
+          WINE_ACCESS_TOKEN: ${{ secrets.WINE_ACCESS_TOKEN }}
+        run: |
+          scripts/ci-self-hosted.sh setup-host
+          scripts/dxmt-builder bootstrap wine-x64
+          scripts/dxmt-builder build --profile gcc-x64-release-full benchmarks
+
+      - name: Enforce D3D12 Performance Budgets
+        run: |
+          scripts/dxmt-builder test \
+            --profile gcc-x64-release-full performance --suite d3d12

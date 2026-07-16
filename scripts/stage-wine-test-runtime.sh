@@ -53,7 +53,8 @@ case $suite in
     ;;
   *) printf 'unsupported Wine test suite: %s\n' "$suite" >&2; exit 2 ;;
 esac
-if [ "$mode" = all ] || [ "$mode" = integration ]; then
+if [ "$mode" = all ] || [ "$mode" = integration ] ||
+   [ "$mode" = performance ]; then
   build_targets="$build_targets dxmt-benchmarks"
 fi
 

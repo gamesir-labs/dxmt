@@ -57,10 +57,23 @@ def load_budget(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(f"budget for {name} must be an object")
         if budget.get("metric", "cpu_time") not in {"cpu_time", "real_time"}:
             raise ValueError(f"budget for {name} has an unsupported metric")
-        if not isinstance(budget.get("max_median_ns"), (int, float)):
-            raise ValueError(f"budget for {name} must define max_median_ns")
-        if budget["max_median_ns"] <= 0:
-            raise ValueError(f"budget for {name} must be positive")
+        baseline = budget.get("baseline_median_ns")
+        regression = budget.get("max_regression_percent")
+        if baseline is not None or regression is not None:
+            if not isinstance(baseline, (int, float)) or baseline <= 0:
+                raise ValueError(
+                    f"budget for {name} must define a positive baseline_median_ns"
+                )
+            if not isinstance(regression, (int, float)) or regression < 0:
+                raise ValueError(
+                    f"budget for {name} must define max_regression_percent"
+                )
+        else:
+            maximum = budget.get("max_median_ns")
+            if not isinstance(maximum, (int, float)) or maximum <= 0:
+                raise ValueError(
+                    f"budget for {name} must define a baseline or max_median_ns"
+                )
 
     return budgets
 
@@ -140,11 +153,21 @@ def validate_performance_results(
             continue
 
         measured_ns = float(result[metric]) * multiplier
-        limit_ns = float(budget["max_median_ns"])
+        if "baseline_median_ns" in budget:
+            baseline_ns = float(budget["baseline_median_ns"])
+            regression_percent = float(budget["max_regression_percent"])
+            limit_ns = baseline_ns * (1.0 + regression_percent / 100.0)
+            budget_detail = (
+                f"baseline {baseline_ns:.3f} ns, "
+                f"allowed regression {regression_percent:.1f}%"
+            )
+        else:
+            limit_ns = float(budget["max_median_ns"])
+            budget_detail = "absolute budget"
         status = "PASS" if measured_ns <= limit_ns else "FAIL"
         print(
             f"[{status}] {name}: median {metric}={measured_ns:.3f} ns "
-            f"(limit {limit_ns:.3f} ns)"
+            f"(limit {limit_ns:.3f} ns; {budget_detail})"
         )
         if measured_ns > limit_ns:
             errors.append(

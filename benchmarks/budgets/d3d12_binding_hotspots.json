@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "profile": "gcc-x64-release-full",
+    "host_class": "self-macos-runner Apple Silicon",
+    "collected_on": "2026-07-16",
+    "repetitions": 3,
+    "metric": "real_time",
+    "unit": "ns"
+  },
+  "benchmarks": {
+    "BI_D3D12ArgumentTableUpdate/descriptors:32/rounds:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 12000,
+      "max_regression_percent": 150
+    },
+    "BI_D3D12ArgumentTableUpdate/descriptors:32/rounds:16/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 226000,
+      "max_regression_percent": 60
+    },
+    "BI_D3D12ArgumentTableUpdate/descriptors:128/rounds:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 42000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12ArgumentTableUpdate/descriptors:128/rounds:16/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 835000,
+      "max_regression_percent": 40
+    },
+    "BI_D3D12ArgumentTableUpdate/descriptors:512/rounds:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 170000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12ArgumentTableUpdate/descriptors:512/rounds:16/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 3395000,
+      "max_regression_percent": 35
+    },
+    "BI_D3D12RootTableMaterialization/draws:128/root_tables:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 111000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12RootTableMaterialization/draws:128/root_tables:4/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 126000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12RootTableMaterialization/draws:128/root_tables:8/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 114000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12RootTableMaterialization/draws:512/root_tables:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 315000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12RootTableMaterialization/draws:512/root_tables:4/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 319000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12RootTableMaterialization/draws:512/root_tables:8/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 356000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12RootTableMaterialization/draws:2048/root_tables:8/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 1660000,
+      "max_regression_percent": 35
+    },
+    "BI_D3D12DescriptorMirrorMutation/descriptors:32/rounds:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 11000,
+      "max_regression_percent": 150
+    },
+    "BI_D3D12DescriptorMirrorMutation/descriptors:32/rounds:16/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 207000,
+      "max_regression_percent": 60
+    },
+    "BI_D3D12DescriptorMirrorMutation/descriptors:128/rounds:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 38000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12DescriptorMirrorMutation/descriptors:128/rounds:16/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 764000,
+      "max_regression_percent": 40
+    },
+    "BI_D3D12DescriptorMirrorMutation/descriptors:512/rounds:1/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 146000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12DescriptorMirrorMutation/descriptors:512/rounds:16/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 3040000,
+      "max_regression_percent": 35
+    }
+  }
+}
