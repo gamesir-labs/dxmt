@@ -3172,6 +3172,11 @@ public:
       std::memset(data, 0, sizeof(*data));
       data->CastingFullyTypedFormatSupported = TRUE;
       data->CopyQueueTimestampQueriesSupported = TRUE;
+      data->WriteBufferImmediateSupportFlags =
+          D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
+          D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
+          D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
+          D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
       data->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
       return S_OK;
     }

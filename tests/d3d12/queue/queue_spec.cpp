@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -20,10 +22,39 @@
 namespace {
 
 using dxmt::test::ColorsMatch;
+using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::FullscreenVertexShader;
 using dxmt::test::TextureReadback;
 using dxmt::test::TextureUavPixelShader;
+
+ComPtr<ID3D12Resource> CreateDefaultTexture2D(
+    D3D12TestContext &context, UINT64 width, UINT height, UINT16 array_size,
+    DXGI_FORMAT format, UINT sample_count, D3D12_RESOURCE_FLAGS flags,
+    D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear_value = nullptr) {
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap.CreationNodeMask = 1;
+  heap.VisibleNodeMask = 1;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = array_size;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = sample_count;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = flags;
+  ComPtr<ID3D12Resource> resource;
+  if (FAILED(context.device()->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &desc, state, clear_value,
+          __uuidof(ID3D12Resource),
+          reinterpret_cast<void **>(resource.put()))))
+    return {};
+  return resource;
+}
 
 void SetUnixEnvironment(const char *name, const char *value) {
   using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
@@ -521,6 +552,364 @@ TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
   ASSERT_EQ(actual.size(), sizeof(expected));
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
   EXPECT_EQ(marker.Count(), 0u);
+}
+
+TEST_F(D3D12QueueSpec, WritesImmediateValuesOnEveryAdvertisedListType) {
+  constexpr UINT kDwordCount = 16;
+  constexpr UINT kSentinel = 0xcccccccc;
+  const std::array<D3D12_COMMAND_LIST_TYPE, 3> list_types = {
+      D3D12_COMMAND_LIST_TYPE_DIRECT,
+      D3D12_COMMAND_LIST_TYPE_COMPUTE,
+      D3D12_COMMAND_LIST_TYPE_COPY,
+  };
+
+  for (const auto type : list_types) {
+    std::array<UINT, kDwordCount> initial;
+    initial.fill(kSentinel);
+    auto upload = context_.CreateUploadBuffer(
+        sizeof(initial), initial.data(), sizeof(initial));
+    auto destination = context_.CreateBuffer(
+        sizeof(initial), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(upload);
+    ASSERT_TRUE(destination);
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12GraphicsCommandList2> list2;
+    ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                  type, __uuidof(ID3D12CommandAllocator),
+                  reinterpret_cast<void **>(allocator.put())),
+              S_OK);
+    ASSERT_EQ(context_.device()->CreateCommandList(
+                  0, type, allocator.get(), nullptr,
+                  __uuidof(ID3D12GraphicsCommandList),
+                  reinterpret_cast<void **>(list.put())),
+              S_OK);
+    ASSERT_EQ(list->QueryInterface(
+                  __uuidof(ID3D12GraphicsCommandList2),
+                  reinterpret_cast<void **>(list2.put())),
+              S_OK);
+
+    list->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
+                           sizeof(initial));
+    const auto base = destination->GetGPUVirtualAddress();
+    const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER default_write = {
+        base, 0x01020304};
+    list2->WriteBufferImmediate(1, &default_write, nullptr);
+    const std::array<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, 3> writes = {{
+        {base + sizeof(UINT), 0x11121314},
+        {base + 5 * sizeof(UINT), 0x51525354},
+        {base + (kDwordCount - 1) * sizeof(UINT), 0xf1f2f3f4},
+    }};
+    const std::array<D3D12_WRITEBUFFERIMMEDIATE_MODE, 3> modes = {
+        D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT,
+        D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+        D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+    };
+    list2->WriteBufferImmediate(static_cast<UINT>(writes.size()),
+                                writes.data(), modes.data());
+    const std::array<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, 2> invalid = {{
+        {base + 1, 0xdead0001},
+        {base + sizeof(initial), 0xdead0002},
+    }};
+    list2->WriteBufferImmediate(static_cast<UINT>(invalid.size()),
+                                invalid.data(), nullptr);
+    ASSERT_EQ(list->Close(), S_OK);
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    queue_desc.Type = type;
+    ComPtr<ID3D12CommandQueue> queue;
+    ASSERT_EQ(context_.device()->CreateCommandQueue(
+                  &queue_desc, __uuidof(ID3D12CommandQueue),
+                  reinterpret_cast<void **>(queue.put())),
+              S_OK);
+    ID3D12CommandList *submission[] = {list.get()};
+    queue->ExecuteCommandLists(1, submission);
+    ComPtr<ID3D12Fence> fence;
+    ASSERT_EQ(context_.device()->CreateFence(
+                  0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                  reinterpret_cast<void **>(fence.put())),
+              S_OK);
+    ASSERT_EQ(queue->Signal(fence.get(), 1), S_OK);
+    ASSERT_EQ(context_.WaitForFence(fence.get(), 1), S_OK);
+
+    D3D12TestContext::Transition(
+        context_.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<std::uint8_t> bytes;
+    ASSERT_EQ(context_.ReadbackBuffer(destination.get(), sizeof(initial),
+                                      &bytes),
+              S_OK);
+    ASSERT_EQ(bytes.size(), sizeof(initial));
+    std::array<UINT, kDwordCount> actual = {};
+    std::memcpy(actual.data(), bytes.data(), bytes.size());
+    initial[0] = default_write.Value;
+    initial[1] = writes[0].Value;
+    initial[5] = writes[1].Value;
+    initial.back() = writes[2].Value;
+    EXPECT_EQ(actual, initial) << "command list type " << type;
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+}
+
+TEST_F(D3D12QueueSpec, ExecutesWriteBufferImmediateFromBundle) {
+  constexpr std::array<UINT, 4> initial = {};
+  auto upload = context_.CreateUploadBuffer(
+      sizeof(initial), initial.data(), sizeof(initial));
+  auto destination = context_.CreateBuffer(
+      sizeof(initial), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(destination);
+  context_.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
+                                    sizeof(initial));
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> bundle;
+  ComPtr<ID3D12GraphicsCommandList2> bundle2;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE, allocator.get(), nullptr,
+                __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(bundle.put())),
+            S_OK);
+  ASSERT_EQ(bundle->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList2),
+                reinterpret_cast<void **>(bundle2.put())),
+            S_OK);
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write = {
+      destination->GetGPUVirtualAddress() + sizeof(UINT), 0xdecafbad};
+  bundle2->WriteBufferImmediate(1, &write, nullptr);
+  ASSERT_EQ(bundle->Close(), S_OK);
+
+  context_.list()->ExecuteBundle(bundle.get());
+  context_.list()->ExecuteBundle(bundle.get());
+  D3D12TestContext::Transition(
+      context_.list(), destination.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(destination.get(), sizeof(initial),
+                                    &bytes),
+            S_OK);
+  std::array<UINT, initial.size()> actual = {};
+  ASSERT_EQ(bytes.size(), sizeof(actual));
+  std::memcpy(actual.data(), bytes.data(), bytes.size());
+  EXPECT_EQ(actual, (std::array<UINT, 4>{0, write.Value, 0, 0}));
+}
+
+TEST_F(D3D12QueueSpec, ReusesBundleWithInheritedAndReturnedGraphicsState) {
+  const auto pixel_shader = CompileShader(R"(
+    cbuffer Color : register(b0) { float value; };
+    float4 main() : SV_Target { return value.xxxx; }
+  )",
+                                          "ps_5_0");
+  ASSERT_EQ(pixel_shader.result, S_OK) << pixel_shader.diagnostic_text();
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameter.Constants.ShaderRegister = 0;
+  parameter.Constants.Num32BitValues = 1;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root_signature.get();
+  pipeline_desc.VS = FullscreenVertexShader();
+  pipeline_desc.PS = {pixel_shader.bytecode->GetBufferPointer(),
+                      pixel_shader.bytecode->GetBufferSize()};
+  auto &blend = pipeline_desc.BlendState.RenderTarget[0];
+  blend.BlendEnable = TRUE;
+  blend.SrcBlend = D3D12_BLEND_ONE;
+  blend.DestBlend = D3D12_BLEND_ONE;
+  blend.BlendOp = D3D12_BLEND_OP_ADD;
+  blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+  blend.DestBlendAlpha = D3D12_BLEND_ONE;
+  blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pipeline_desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_EQ(context_.device()->CreateGraphicsPipelineState(
+                &pipeline_desc, __uuidof(ID3D12PipelineState),
+                reinterpret_cast<void **>(pipeline.put())),
+            S_OK);
+
+  auto target = context_.CreateTexture2D(
+      8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  constexpr std::array<UINT16, 3> indices = {0, 1, 2};
+  auto index_buffer = context_.CreateUploadBuffer(
+      sizeof(indices), indices.data(), sizeof(indices));
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(rtv_heap);
+  ASSERT_TRUE(index_buffer);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  ComPtr<ID3D12CommandAllocator> bundle_allocator;
+  ComPtr<ID3D12GraphicsCommandList> bundle;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(bundle_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.get(),
+                pipeline.get(), __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(bundle.put())),
+            S_OK);
+  bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  bundle->DrawIndexedInstanced(3, 1, 0, 0, 0);
+  ASSERT_EQ(bundle->Close(), S_OK);
+
+  constexpr FLOAT clear[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetGraphicsRoot32BitConstant(
+      0, std::bit_cast<UINT>(0.25f), 0);
+  const D3D12_INDEX_BUFFER_VIEW index_view = {
+      index_buffer->GetGPUVirtualAddress(), sizeof(indices),
+      DXGI_FORMAT_R16_UINT};
+  context_.list()->IASetIndexBuffer(&index_view);
+  const D3D12_VIEWPORT viewport = {0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, 8, 8};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->ExecuteBundle(bundle.get());
+  context_.list()->ExecuteBundle(bundle.get());
+  context_.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
+  bundle.reset();
+  bundle_allocator.reset();
+  D3D12TestContext::Transition(
+      context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      UINT pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      EXPECT_TRUE(ColorsMatch(pixel, 0xbfbfbfbf, 2));
+    }
+  }
+}
+
+TEST_F(D3D12QueueSpec, RejectsInvalidExecuteBundleContractsOnClose) {
+  ComPtr<ID3D12CommandAllocator> open_bundle_allocator;
+  ComPtr<ID3D12GraphicsCommandList> open_bundle;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(open_bundle_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                open_bundle_allocator.get(), nullptr,
+                __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(open_bundle.put())),
+            S_OK);
+  context_.list()->ExecuteBundle(open_bundle.get());
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> closed_bundle_allocator;
+  ComPtr<ID3D12GraphicsCommandList> closed_bundle;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(closed_bundle_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                closed_bundle_allocator.get(), nullptr,
+                __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(closed_bundle.put())),
+            S_OK);
+  ASSERT_EQ(closed_bundle->Close(), S_OK);
+
+  ComPtr<ID3D12CommandAllocator> caller_allocator;
+  ComPtr<ID3D12GraphicsCommandList> caller_bundle;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(caller_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE, caller_allocator.get(),
+                nullptr, __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(caller_bundle.put())),
+            S_OK);
+  caller_bundle->ExecuteBundle(closed_bundle.get());
+  EXPECT_EQ(caller_bundle->Close(), E_INVALIDARG);
+}
+
+TEST_F(D3D12QueueSpec, DiscardAllowsCompleteAndRectangularOverwrite) {
+  constexpr UINT kWidth = 8;
+  constexpr UINT kHeight = 6;
+  auto texture = context_.CreateTexture2D(
+      kWidth, kHeight, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(texture);
+  ASSERT_TRUE(rtv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(texture.get(), nullptr, rtv);
+
+  constexpr float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  constexpr float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+  context_.list()->DiscardResource(texture.get(), nullptr);
+  context_.list()->ClearRenderTargetView(rtv, blue, 0, nullptr);
+
+  const D3D12_RECT rect = {2, 1, 7, 5};
+  const D3D12_DISCARD_REGION region = {1, &rect, 0, 1};
+  context_.list()->DiscardResource(texture.get(), &region);
+  context_.list()->ClearRenderTargetView(rtv, green, 1, &rect);
+  D3D12TestContext::Transition(
+      context_.list(), texture.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(texture.get(), &readback), S_OK);
+  for (UINT y = 0; y < kHeight; ++y) {
+    for (UINT x = 0; x < kWidth; ++x) {
+      UINT pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      const bool overwritten = x >= UINT(rect.left) && x < UINT(rect.right) &&
+                               y >= UINT(rect.top) && y < UINT(rect.bottom);
+      EXPECT_TRUE(ColorsMatch(pixel, overwritten ? 0xff00ff00 : 0xffff0000,
+                              0))
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
 }
 
 TEST_F(D3D12QueueSpec, CompletesFenceSignalsInValueOrder) {
@@ -1202,7 +1591,7 @@ TEST_F(D3D12QueueSpec, ClearsNonzeroMipPlacedRenderTargetView) {
   }
 }
 
-TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
+TEST_F(D3D12QueueSpec, ResolvesSourceRegionAtNonZeroDestination) {
   constexpr UINT kSampleCount = 4;
   D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};
   quality.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1267,8 +1656,9 @@ TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
   ASSERT_TRUE(SUCCEEDED(
       context_.list()->QueryInterface(__uuidof(ID3D12GraphicsCommandList1),
                                       reinterpret_cast<void **>(list1.put()))));
-  list1->ResolveSubresourceRegion(destination.get(), 0, 0, 0, source.get(), 0,
-                                  nullptr, DXGI_FORMAT_R8G8B8A8_UNORM,
+  D3D12_RECT source_rect = {1, 1, 4, 4};
+  list1->ResolveSubresourceRegion(destination.get(), 0, 2, 3, source.get(), 0,
+                                  &source_rect, DXGI_FORMAT_R8G8B8A8_UNORM,
                                   D3D12_RESOLVE_MODE_AVERAGE);
   D3D12TestContext::Transition(context_.list(), destination.get(),
                                D3D12_RESOURCE_STATE_RESOLVE_DEST,
@@ -1279,14 +1669,296 @@ TEST_F(D3D12QueueSpec, ResolvesFullSourceRegionIntoLargerDestination) {
       SUCCEEDED(context_.ReadbackTexture(destination.get(), &readback)));
   ASSERT_EQ(readback.width, 8u);
   ASSERT_EQ(readback.height, 8u);
-  for (UINT y = 0; y < 4; ++y) {
-    for (UINT x = 0; x < 4; ++x) {
+  for (UINT y = 3; y < 6; ++y) {
+    for (UINT x = 2; x < 5; ++x) {
       std::uint32_t pixel = 0;
       std::memcpy(&pixel,
                   readback.data.data() + y * readback.row_pitch +
                       x * sizeof(pixel),
                   sizeof(pixel));
       EXPECT_TRUE(ColorsMatch(pixel, 0xffbf8040, 2));
+    }
+  }
+}
+
+TEST_F(D3D12QueueSpec, ResolvesFullSubresourceForAdvertisedSampleCounts) {
+  constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  constexpr FLOAT kColor[4] = {0.125f, 0.375f, 0.625f, 1.0f};
+  constexpr UINT kExpected = 0xff9f6020;
+
+  for (const UINT sample_count : {2u, 4u, 8u}) {
+    SCOPED_TRACE(::testing::Message() << "sample_count=" << sample_count);
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};
+    quality.Format = kFormat;
+    quality.SampleCount = sample_count;
+    ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                  D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                  sizeof(quality)),
+              S_OK);
+    if (!quality.NumQualityLevels)
+      continue;
+
+    D3D12_CLEAR_VALUE clear_value = {};
+    clear_value.Format = kFormat;
+    std::copy(std::begin(kColor), std::end(kColor), clear_value.Color);
+    auto source = CreateDefaultTexture2D(
+        context_, 7, 5, 1, kFormat, sample_count,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value);
+    auto destination = CreateDefaultTexture2D(
+        context_, 7, 5, 1, kFormat, 1, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    auto rtv_heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(destination);
+    ASSERT_TRUE(rtv_heap);
+    const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    context_.device()->CreateRenderTargetView(source.get(), nullptr, rtv);
+    context_.list()->ClearRenderTargetView(rtv, kColor, 0, nullptr);
+    D3D12TestContext::Transition(
+        context_.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    context_.list()->ResolveSubresource(destination.get(), 0, source.get(), 0,
+                                        kFormat);
+    D3D12TestContext::Transition(
+        context_.list(), destination.get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    TextureReadback readback;
+    ASSERT_EQ(context_.ReadbackTexture(destination.get(), &readback), S_OK);
+    for (const auto [x, y] :
+         {std::pair{0u, 0u}, std::pair{3u, 2u}, std::pair{6u, 4u}}) {
+      UINT pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      EXPECT_TRUE(ColorsMatch(pixel, kExpected, 2));
+    }
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+}
+
+TEST_F(D3D12QueueSpec, ResolvesNonZeroMultisampleArraySlice) {
+  constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  constexpr FLOAT kColor[4] = {0.75f, 0.25f, 0.5f, 1.0f};
+  D3D12_CLEAR_VALUE clear_value = {};
+  clear_value.Format = kFormat;
+  std::copy(std::begin(kColor), std::end(kColor), clear_value.Color);
+  auto source = CreateDefaultTexture2D(
+      context_, 5, 3, 2, kFormat, 4,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value);
+  auto destination = CreateDefaultTexture2D(
+      context_, 5, 3, 2, kFormat, 1, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_RESOLVE_DEST);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+  ASSERT_TRUE(rtv_heap);
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = kFormat;
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+  rtv_desc.Texture2DMSArray.FirstArraySlice = 1;
+  rtv_desc.Texture2DMSArray.ArraySize = 1;
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(source.get(), &rtv_desc, rtv);
+  context_.list()->ClearRenderTargetView(rtv, kColor, 0, nullptr);
+  D3D12TestContext::Transition(
+      context_.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  context_.list()->ResolveSubresource(destination.get(), 1, source.get(), 1,
+                                      kFormat);
+  D3D12TestContext::Transition(
+      context_.list(), destination.get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(destination.get(), &readback, 1), S_OK);
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      UINT pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      EXPECT_TRUE(ColorsMatch(pixel, 0xff8040bf, 2));
+    }
+  }
+}
+
+TEST_F(D3D12QueueSpec, ResolvesFloatAndTypelessColorFormats) {
+  struct ResolveFormatCase {
+    DXGI_FORMAT resource_format;
+    DXGI_FORMAT view_format;
+    UINT bytes_per_pixel;
+  };
+  constexpr std::array cases = {
+      ResolveFormatCase{DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        DXGI_FORMAT_R32G32B32A32_FLOAT, 16},
+      ResolveFormatCase{DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                        DXGI_FORMAT_R8G8B8A8_UNORM, 4},
+  };
+  constexpr FLOAT kColor[4] = {0.125f, 0.375f, 0.625f, 1.0f};
+
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(::testing::Message()
+                 << "resource_format=" << UINT(test_case.resource_format));
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};
+    quality.Format = test_case.view_format;
+    quality.SampleCount = 4;
+    ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                  D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                  sizeof(quality)),
+              S_OK);
+    if (!quality.NumQualityLevels)
+      continue;
+
+    D3D12_CLEAR_VALUE clear_value = {};
+    clear_value.Format = test_case.view_format;
+    std::copy(std::begin(kColor), std::end(kColor), clear_value.Color);
+    auto source = CreateDefaultTexture2D(
+        context_, 3, 2, 1, test_case.resource_format, 4,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value);
+    auto destination = CreateDefaultTexture2D(
+        context_, 3, 2, 1, test_case.resource_format, 1,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    auto rtv_heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(destination);
+    ASSERT_TRUE(rtv_heap);
+    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+    rtv_desc.Format = test_case.view_format;
+    rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+    const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    context_.device()->CreateRenderTargetView(source.get(), &rtv_desc, rtv);
+    context_.list()->ClearRenderTargetView(rtv, kColor, 0, nullptr);
+    D3D12TestContext::Transition(
+        context_.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    context_.list()->ResolveSubresource(destination.get(), 0, source.get(), 0,
+                                        test_case.view_format);
+    D3D12TestContext::Transition(
+        context_.list(), destination.get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    TextureReadback readback;
+    ASSERT_EQ(context_.ReadbackTexture(destination.get(), &readback), S_OK);
+    if (test_case.bytes_per_pixel == sizeof(kColor)) {
+      std::array<FLOAT, 4> actual = {};
+      std::memcpy(actual.data(), readback.data.data(), sizeof(actual));
+      for (UINT channel = 0; channel < actual.size(); ++channel)
+        EXPECT_NEAR(actual[channel], kColor[channel], 0.0001f);
+    } else {
+      UINT pixel = 0;
+      std::memcpy(&pixel, readback.data.data(), sizeof(pixel));
+      EXPECT_TRUE(ColorsMatch(pixel, 0xff9f6020, 2));
+    }
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+}
+
+TEST_F(D3D12QueueSpec, ResolvesPerSampleValuesWithAverageMinAndMax) {
+  const auto pixel_shader = CompileShader(R"(
+    float4 main(uint sample_index : SV_SampleIndex) : SV_Target {
+      return float4(0.2f * (sample_index + 1), 0.0f, 0.0f, 1.0f);
+    })",
+                                          "ps_5_0");
+  ASSERT_EQ(pixel_shader.result, S_OK) << pixel_shader.diagnostic_text();
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root_signature.get();
+  pipeline_desc.VS = FullscreenVertexShader();
+  pipeline_desc.PS = {pixel_shader.bytecode->GetBufferPointer(),
+                      pixel_shader.bytecode->GetBufferSize()};
+  pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pipeline_desc.SampleDesc.Count = 4;
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_EQ(context_.device()->CreateGraphicsPipelineState(
+                &pipeline_desc, __uuidof(ID3D12PipelineState),
+                reinterpret_cast<void **>(pipeline.put())),
+            S_OK);
+
+  constexpr UINT kSize = 4;
+  auto source = CreateDefaultTexture2D(
+      context_, kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 4,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  std::array<ComPtr<ID3D12Resource>, 3> destinations;
+  for (auto &destination : destinations) {
+    destination = CreateDefaultTexture2D(
+        context_, kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 1,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    ASSERT_TRUE(destination);
+  }
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(rtv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(source.get(), nullptr, rtv);
+
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0.0f, 0.0f, float(kSize), float(kSize),
+                                   0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, kSize, kSize};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(
+      context_.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  ComPtr<ID3D12GraphicsCommandList1> list1;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList1),
+                reinterpret_cast<void **>(list1.put())),
+            S_OK);
+  const std::array modes = {D3D12_RESOLVE_MODE_AVERAGE,
+                            D3D12_RESOLVE_MODE_MIN,
+                            D3D12_RESOLVE_MODE_MAX};
+  for (UINT index = 0; index < destinations.size(); ++index) {
+    list1->ResolveSubresourceRegion(
+        destinations[index].get(), 0, 0, 0, source.get(), 0, nullptr,
+        DXGI_FORMAT_R8G8B8A8_UNORM, modes[index]);
+    D3D12TestContext::Transition(
+        context_.list(), destinations[index].get(),
+        D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  }
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  constexpr std::array<UINT, 3> expected = {
+      0xff000080, 0xff000033, 0xff0000cc};
+  for (UINT index = 0; index < destinations.size(); ++index) {
+    TextureReadback readback;
+    ASSERT_EQ(context_.ReadbackTexture(destinations[index].get(), &readback),
+              S_OK);
+    UINT pixel = 0;
+    std::memcpy(&pixel, readback.data.data(), sizeof(pixel));
+    EXPECT_TRUE(ColorsMatch(pixel, expected[index], 2))
+        << "resolve mode " << modes[index];
+    if (index + 1 < destinations.size()) {
+      ASSERT_EQ(context_.ResetCommandList(), S_OK);
     }
   }
 }

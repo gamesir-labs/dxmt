@@ -9960,6 +9960,17 @@ private:
     ops.reserve(record.parameters.size());
 
     for (size_t i = 0; i < record.parameters.size(); i++) {
+      const auto mode = i >= record.modes.size()
+                            ? D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT
+                            : record.modes[i];
+      if (mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT &&
+          mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN &&
+          mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT) {
+        WARN("D3D12CommandQueue: WriteBufferImmediate skipped invalid mode ",
+             uint32_t(mode));
+        continue;
+      }
+
       Resource *resource = nullptr;
       const UINT64 offset =
           ResolveBufferGpuAddress(record.parameters[i].Dest, resource);
@@ -9972,6 +9983,14 @@ private:
       if (!resource->GetBuffer()) {
         WARN("D3D12CommandQueue: WriteBufferImmediate skipped destination "
              "without buffer resource");
+        continue;
+      }
+
+      if ((record.parameters[i].Dest & (sizeof(UINT) - 1)) ||
+          !ValidateBufferRange(resource, offset, sizeof(UINT),
+                               "WriteBufferImmediate")) {
+        WARN("D3D12CommandQueue: WriteBufferImmediate skipped invalid "
+             "destination");
         continue;
       }
 

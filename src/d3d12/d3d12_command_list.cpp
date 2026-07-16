@@ -2227,12 +2227,19 @@ public:
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListExecuteBundle);
+    if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+      recording_error_ = E_INVALIDARG;
+      WARN("D3D12GraphicsCommandList: ExecuteBundle requires a direct command list");
+      return;
+    }
     auto *bundle = dynamic_cast<GraphicsCommandList *>(command_list);
     if (!bundle || bundle->GetCommandListType() != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+      recording_error_ = E_INVALIDARG;
       WARN("D3D12GraphicsCommandList: ExecuteBundle called with non-bundle command list");
       return;
     }
     if (!bundle->IsClosed()) {
+      recording_error_ = E_INVALIDARG;
       WARN("D3D12GraphicsCommandList: ExecuteBundle called with an open bundle");
       return;
     }
