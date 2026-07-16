@@ -1,6 +1,7 @@
 #include <dxmt_test.hpp>
 
 #include "d3d12_test_context.hpp"
+#include "shaders/runtime_test_shaders.hpp"
 
 namespace {
 
@@ -22,6 +23,8 @@ protected:
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
     auto root_signature = context_.CreateRootSignature(root_desc);
+    auto pipeline = context_.CreateComputePipeline(
+        root_signature.get(), dxmt::test::ClearBufferComputeShader());
 
     D3D12_HEAP_DESC heap_desc = {};
     heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -51,6 +54,7 @@ protected:
     ASSERT_TRUE(resource);
     ASSERT_TRUE(descriptor_heap);
     ASSERT_TRUE(root_signature);
+    ASSERT_TRUE(pipeline);
 
     visit("device", static_cast<IUnknown *>(context_.device()), false);
     visit("queue", static_cast<IUnknown *>(context_.queue()), true);
@@ -63,6 +67,7 @@ protected:
           true);
     visit("root signature", static_cast<IUnknown *>(root_signature.get()),
           true);
+    visit("pipeline state", static_cast<IUnknown *>(pipeline.get()), true);
     visit("query heap", static_cast<IUnknown *>(query_heap.get()), true);
     visit("command signature", static_cast<IUnknown *>(command_signature.get()),
           true);

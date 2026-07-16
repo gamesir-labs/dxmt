@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,20 @@ protected:
   void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
 
   ID3D12Object *object() const { return context_.queue(); }
+
+  void ExpectObjectRemainsUsable() {
+    const GUID key = {0xa7ff7cd1,
+                      0xd276,
+                      0x47e8,
+                      {0xaf, 0xd7, 0x68, 0x41, 0xf0, 0xe8, 0x97, 0x3a}};
+    constexpr std::uint32_t expected = 0xc001d00du;
+    ASSERT_EQ(object()->SetPrivateData(key, sizeof(expected), &expected), S_OK);
+    std::uint32_t actual = 0;
+    UINT size = sizeof(actual);
+    ASSERT_EQ(object()->GetPrivateData(key, &size, &actual), S_OK);
+    EXPECT_EQ(size, sizeof(actual));
+    EXPECT_EQ(actual, expected);
+  }
 
   D3D12TestContext context_;
 };
@@ -223,6 +238,29 @@ TEST_F(PrivateDataSpec, ObjectDestructionReleasesPrivateInterface) {
 
   fence.reset();
   EXPECT_TRUE(destroyed->load(std::memory_order_acquire));
+}
+
+TEST_F(PrivateDataSpec, SetNameAcceptsNullAndEmptyNames) {
+  EXPECT_TRUE(SUCCEEDED(object()->SetName(nullptr)));
+  EXPECT_EQ(object()->SetName(L""), S_OK);
+  ExpectObjectRemainsUsable();
+}
+
+TEST_F(PrivateDataSpec, SetNameAcceptsUnicode) {
+  EXPECT_EQ(object()->SetName(L"DXMT 队列 Δ U0001f680"), S_OK);
+  ExpectObjectRemainsUsable();
+}
+
+TEST_F(PrivateDataSpec, SetNameAcceptsLongNames) {
+  const std::wstring name(8192, L'x');
+  EXPECT_EQ(object()->SetName(name.c_str()), S_OK);
+  ExpectObjectRemainsUsable();
+}
+
+TEST_F(PrivateDataSpec, SetNameCanBeReplacedRepeatedly) {
+  for (const wchar_t *name : {L"first", L"second", L"third", L""})
+    ASSERT_EQ(object()->SetName(name), S_OK);
+  ExpectObjectRemainsUsable();
 }
 
 } // namespace

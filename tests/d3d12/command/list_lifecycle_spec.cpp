@@ -3,6 +3,10 @@
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 
+#include <array>
+#include <cstdint>
+#include <cstring>
+
 namespace {
 
 using dxmt::test::ComPtr;
@@ -58,6 +62,28 @@ protected:
                   reinterpret_cast<void **>(pipeline.put())),
               S_OK);
     return pipeline;
+  }
+
+  ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device *device, UINT64 size,
+                                      D3D12_HEAP_TYPE heap_type,
+                                      D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = heap_type;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> resource;
+    EXPECT_EQ(device->CreateCommittedResource(
+                  &heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                  __uuidof(ID3D12Resource),
+                  reinterpret_cast<void **>(resource.put())),
+              S_OK);
+    return resource;
   }
 
   D3D12TestContext context_;
@@ -236,6 +262,90 @@ TEST_F(CommandListLifecycleSpec,
 
   EXPECT_EQ(context_.list()->Reset(context_.allocator(), pipeline.get()),
             E_INVALIDARG);
+}
+
+TEST_F(CommandListLifecycleSpec, CreatePlacedResourceRejectsCrossDeviceHeap) {
+  auto foreign_device = CreateIsolatedDevice();
+  ASSERT_TRUE(foreign_device);
+
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ComPtr<ID3D12Heap> foreign_heap;
+  ASSERT_EQ(foreign_device->CreateHeap(
+                &heap_desc, __uuidof(ID3D12Heap),
+                reinterpret_cast<void **>(foreign_heap.put())),
+            S_OK);
+
+  D3D12_RESOURCE_DESC resource_desc = {};
+  resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  resource_desc.Width = 256;
+  resource_desc.Height = 1;
+  resource_desc.DepthOrArraySize = 1;
+  resource_desc.MipLevels = 1;
+  resource_desc.SampleDesc.Count = 1;
+  resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  void *resource = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(context_.device()->CreatePlacedResource(
+                foreign_heap.get(), 0, &resource_desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                __uuidof(ID3D12Resource), &resource),
+            E_INVALIDARG);
+  EXPECT_EQ(resource, nullptr);
+}
+
+TEST_F(CommandListLifecycleSpec, QueueSkipsCrossDeviceCommandList) {
+  auto foreign_device = CreateIsolatedDevice();
+  ASSERT_TRUE(foreign_device);
+  constexpr std::array<std::uint32_t, 4> expected = {
+      0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
+  auto source = CreateBuffer(foreign_device.get(), sizeof(expected),
+                             D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto destination = CreateBuffer(foreign_device.get(), sizeof(expected),
+                                  D3D12_HEAP_TYPE_READBACK,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  void *mapped = nullptr;
+  ASSERT_EQ(source->Map(0, nullptr, &mapped), S_OK);
+  ASSERT_NE(mapped, nullptr);
+  std::memcpy(mapped, expected.data(), sizeof(expected));
+  source->Unmap(0, nullptr);
+  ASSERT_EQ(destination->Map(0, nullptr, &mapped), S_OK);
+  ASSERT_NE(mapped, nullptr);
+  std::memset(mapped, 0, sizeof(expected));
+  destination->Unmap(0, nullptr);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ASSERT_EQ(foreign_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(allocator.put())),
+            S_OK);
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(foreign_device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(list.put())),
+            S_OK);
+  list->CopyBufferRegion(destination.get(), 0, source.get(), 0,
+                         sizeof(expected));
+  ASSERT_EQ(list->Close(), S_OK);
+
+  ID3D12CommandList *submission[] = {list.get()};
+  context_.queue()->ExecuteCommandLists(1, submission);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  ASSERT_EQ(destination->Map(0, nullptr, &mapped), S_OK);
+  ASSERT_NE(mapped, nullptr);
+  std::array<std::uint32_t, expected.size()> actual = {};
+  std::memcpy(actual.data(), mapped, sizeof(actual));
+  destination->Unmap(0, nullptr);
+  EXPECT_EQ(actual, (std::array<std::uint32_t, expected.size()>{}));
 }
 
 TEST_F(CommandListLifecycleSpec, ResetWithAllocatorUsedByRecordingListFails) {

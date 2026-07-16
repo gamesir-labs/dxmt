@@ -2931,10 +2931,10 @@ public:
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS *>(feature_data);
-      data->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL(0);
-
       if (!data->pFeatureLevelsRequested || !data->NumFeatureLevels)
         return WARN_E_INVALIDARG(__func__);
+
+      data->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL(0);
 
       for (UINT i = 0; i < data->NumFeatureLevels; i++) {
         const auto requested = data->pFeatureLevelsRequested[i];
@@ -2945,7 +2945,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE *>(feature_data);
@@ -2959,7 +2959,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS *>(feature_data);
@@ -2974,7 +2974,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_FORMAT_SUPPORT: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT *>(feature_data);
@@ -3012,7 +3012,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *>(feature_data);
@@ -3051,7 +3051,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_FORMAT_INFO: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_FORMAT_INFO *>(feature_data);
@@ -3080,7 +3080,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT *>(feature_data);
@@ -3089,7 +3089,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_SHADER_MODEL: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(feature_data);
@@ -3100,7 +3100,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(feature_data);
@@ -3108,8 +3108,20 @@ public:
       data->ExpandedComputeResourceStates = TRUE;
       return S_OK;
     }
+    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT: {
+      if (feature_data_size !=
+          sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT))
+        return WARN_E_INVALIDARG(__func__);
+
+      auto *data = static_cast<
+          D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT *>(feature_data);
+      if (data->NodeIndex != 0)
+        return WARN_E_INVALIDARG(__func__);
+      data->Support = D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE;
+      return S_OK;
+    }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE *>(feature_data);
@@ -3122,7 +3134,7 @@ public:
       return WARN_E_INVALIDARG(__func__);
     }
     case D3D12_FEATURE_ARCHITECTURE1: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE1 *>(feature_data);
@@ -3137,7 +3149,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS2: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(feature_data);
@@ -3147,7 +3159,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_SHADER_CACHE: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_SHADER_CACHE *>(feature_data);
@@ -3155,7 +3167,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY *>(feature_data);
@@ -3165,7 +3177,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(feature_data);
@@ -3181,7 +3193,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_EXISTING_HEAPS: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_EXISTING_HEAPS *>(feature_data);
@@ -3189,7 +3201,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS4: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4 *>(feature_data);
@@ -3199,7 +3211,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_SERIALIZATION: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SERIALIZATION))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_SERIALIZATION))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_SERIALIZATION *>(feature_data);
@@ -3209,7 +3221,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_CROSS_NODE: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_CROSS_NODE))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_CROSS_NODE))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_CROSS_NODE *>(feature_data);
@@ -3218,7 +3230,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS5: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(feature_data);
@@ -3227,9 +3239,52 @@ public:
       data->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
       return S_OK;
     }
+    case D3D12_FEATURE_DISPLAYABLE: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_DISPLAYABLE))
+        return WARN_E_INVALIDARG(__func__);
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_DISPLAYABLE *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->SharedResourceCompatibilityTier =
+          D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT: {
+      if (feature_data_size != sizeof(
+                                   D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT))
+        return WARN_E_INVALIDARG(__func__);
+
+      auto *data = static_cast<
+          D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT *>(feature_data);
+      if (data->NodeIndex != 0)
+        return WARN_E_INVALIDARG(__func__);
+      data->Count = 0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES: {
+      if (feature_data_size != sizeof(
+                                   D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES))
+        return WARN_E_INVALIDARG(__func__);
+
+      auto *data = static_cast<
+          D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES *>(feature_data);
+      if (data->NodeIndex != 0 || (data->Count && !data->pTypes))
+        return WARN_E_INVALIDARG(__func__);
+      data->Count = 0;
+      return S_OK;
+    }
 #ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+    case D3D12_FEATURE_QUERY_META_COMMAND: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_QUERY_META_COMMAND))
+        return WARN_E_INVALIDARG(__func__);
+      const auto *data =
+          static_cast<D3D12_FEATURE_DATA_QUERY_META_COMMAND *>(feature_data);
+      if (data->NodeMask > 1)
+        return WARN_E_INVALIDARG(__func__);
+      return DXGI_ERROR_NOT_FOUND;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS6: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(feature_data);
@@ -3239,7 +3294,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS7: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(feature_data);
@@ -3249,7 +3304,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS8: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS8 *>(feature_data);
@@ -3257,7 +3312,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS9: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(feature_data);
@@ -3266,7 +3321,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS10: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS10 *>(feature_data);
@@ -3274,7 +3329,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(feature_data);
@@ -3282,7 +3337,7 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS12: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(feature_data);
@@ -3292,10 +3347,50 @@ public:
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS13: {
-      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
         return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS14: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS14))
+        return WARN_E_INVALIDARG(__func__);
+      auto *data =
+          static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS15: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS15))
+        return WARN_E_INVALIDARG(__func__);
+      auto *data =
+          static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS15 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS16: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16))
+        return WARN_E_INVALIDARG(__func__);
+      auto *data =
+          static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS17: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS17))
+        return WARN_E_INVALIDARG(__func__);
+      auto *data =
+          static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS17 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS18: {
+      if (feature_data_size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18))
+        return WARN_E_INVALIDARG(__func__);
+      auto *data =
+          static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS18 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
       return S_OK;
     }
@@ -3863,7 +3958,9 @@ public:
       return WARN_E_INVALIDARG(__func__);
 
     auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
-    if (!heap_object)
+    if (!heap_object ||
+        heap_object->GetParentDevice() !=
+            static_cast<IMTLD3D12Device *>(this))
       return WARN_E_INVALIDARG(__func__);
 
     if (const char *reason =
@@ -4591,7 +4688,8 @@ public:
     InitReturnPtr(session);
     if (!session)
       return E_POINTER;
-    if (!desc)
+    if (!desc || desc->NodeMask > 1 ||
+        desc->Flags != D3D12_PROTECTED_RESOURCE_SESSION_FLAG_NONE)
       return WARN_E_INVALIDARG(__func__);
     WARN("D3D12Device: protected resource sessions are unsupported");
     return E_NOTIMPL;
@@ -4777,7 +4875,8 @@ public:
     InitReturnPtr(session);
     if (!session)
       return E_POINTER;
-    if (!desc || desc->NodeMask > 1)
+    if (!desc || desc->NodeMask > 1 ||
+        desc->Flags != D3D12_PROTECTED_RESOURCE_SESSION_FLAG_NONE)
       return WARN_E_INVALIDARG(__func__);
     WARN("D3D12Device: protected resource sessions are unsupported");
     return E_NOTIMPL;

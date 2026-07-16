@@ -213,6 +213,60 @@ TEST(D3D12DeviceCreationSpec, RejectsFeatureLevel93) {
   release_object(device);
 }
 
+TEST(D3D12DeviceCreationSpec, SupportsCapabilityProbeWithoutOutput) {
+  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device), nullptr),
+            S_FALSE);
+  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
+                              __uuidof(ID3D12Device), nullptr),
+            S_FALSE);
+}
+
+TEST(D3D12DeviceCreationSpec, CapabilityProbeStillValidatesFeatureLevel) {
+  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_9_3,
+                              __uuidof(ID3D12Device), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_1,
+                              __uuidof(ID3D12Device), nullptr),
+            E_INVALIDARG);
+}
+
+TEST(D3D12DeviceCreationSpec, CreatesAtMaximumAdvertisedFeatureLevel) {
+  ID3D12Device *device = nullptr;
+  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
+                              __uuidof(ID3D12Device),
+                              reinterpret_cast<void **>(&device)),
+            S_OK);
+  EXPECT_NE(device, nullptr);
+  release_object(device);
+}
+
+TEST(D3D12DeviceCreationSpec, UnsupportedInterfaceClearsOutput) {
+  const GUID unsupported = {0xe2696eb4,
+                            0xd9a0,
+                            0x46ab,
+                            {0xb4, 0x21, 0x39, 0xc5, 0xcf, 0x3f, 0xc0, 0x55}};
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, unsupported,
+                              &output),
+            E_NOINTERFACE);
+  EXPECT_EQ(output, nullptr);
+}
+
+TEST(D3D12DeviceCreationSpec, RejectsNonAdapterAndClearsOutput) {
+  ID3D12Device *existing = nullptr;
+  ASSERT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device),
+                              reinterpret_cast<void **>(&existing)),
+            S_OK);
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(D3D12CreateDevice(existing, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+  release_object(existing);
+}
+
 TEST(D3D12PersistentAirCacheSpec, ReusesAirAcrossIrrelevantPsoState) {
   ScopedAirCacheTestEnvironment environment("irrelevant-state");
   ID3D12Device *device = nullptr;

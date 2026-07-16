@@ -4832,6 +4832,12 @@ public:
           continue;
         }
 
+        if (state->GetParentDevice() != device_.ptr()) {
+          Logger::err(str::format(
+              "D3D12CommandQueue: cross-device command list at index ", i));
+          continue;
+        }
+
         if (state->GetCommandListType() != desc_.Type) {
           Logger::err(str::format("D3D12CommandQueue: command list type ", state->GetCommandListType(),
                                   " does not match queue type ", desc_.Type));

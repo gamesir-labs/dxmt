@@ -517,6 +517,7 @@ class GraphicsCommandList {
 public:
   virtual ~GraphicsCommandList() = default;
 
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual bool IsClosed() const = 0;
   virtual D3D12_COMMAND_LIST_TYPE GetCommandListType() const = 0;
   virtual const std::vector<CommandRecord> &GetCommandRecords() const = 0;

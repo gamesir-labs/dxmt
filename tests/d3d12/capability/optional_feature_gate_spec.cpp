@@ -237,4 +237,153 @@ TEST_F(D3D12OptionalFeatureGateSpec, SamplerFeedbackRemainsFeatureGated) {
       << "add a sampler feedback execution oracle before advertising the tier";
 }
 
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnsupportedProgrammableSamplePositionsFailsClose) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS2 options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2, &options, sizeof(options)),
+            S_OK);
+  ASSERT_EQ(options.ProgrammableSamplePositionsTier,
+            D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED);
+
+  ComPtr<ID3D12GraphicsCommandList1> list1;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList1),
+                reinterpret_cast<void **>(list1.put())),
+            S_OK);
+  D3D12_SAMPLE_POSITION position = {};
+  list1->SetSamplePositions(1, 1, &position);
+  EXPECT_EQ(list1->Close(), E_NOTIMPL);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       ResettingProgrammableSamplePositionsIsHarmless) {
+  ComPtr<ID3D12GraphicsCommandList1> list1;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList1),
+                reinterpret_cast<void **>(list1.put())),
+            S_OK);
+  list1->SetSamplePositions(0, 0, nullptr);
+  EXPECT_EQ(list1->Close(), S_OK);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnsupportedProtectedResourceSessionCreationClearsOutput) {
+  D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT support = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT, &support,
+                sizeof(support)),
+            S_OK);
+  ASSERT_EQ(support.Support,
+            D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE);
+
+  ComPtr<ID3D12Device4> device4;
+  ASSERT_EQ(context_.device()->QueryInterface(
+                __uuidof(ID3D12Device4),
+                reinterpret_cast<void **>(device4.put())),
+            S_OK);
+  D3D12_PROTECTED_RESOURCE_SESSION_DESC desc = {};
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device4->CreateProtectedResourceSession(
+                &desc, __uuidof(ID3D12ProtectedResourceSession), &output),
+            E_NOTIMPL);
+  EXPECT_EQ(output, nullptr);
+
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  desc.NodeMask = 2;
+  EXPECT_EQ(device4->CreateProtectedResourceSession(
+                &desc, __uuidof(ID3D12ProtectedResourceSession), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  desc.NodeMask = 0;
+  desc.Flags = static_cast<D3D12_PROTECTED_RESOURCE_SESSION_FLAGS>(1);
+  EXPECT_EQ(device4->CreateProtectedResourceSession(
+                &desc, __uuidof(ID3D12ProtectedResourceSession), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnsupportedMetaCommandEnumerationAndCreationAreConsistent) {
+  ComPtr<ID3D12Device5> device5;
+  ASSERT_EQ(context_.device()->QueryInterface(
+                __uuidof(ID3D12Device5),
+                reinterpret_cast<void **>(device5.put())),
+            S_OK);
+
+  UINT count = 123;
+  EXPECT_EQ(device5->EnumerateMetaCommands(&count, nullptr), S_OK);
+  EXPECT_EQ(count, 0u);
+  EXPECT_EQ(device5->EnumerateMetaCommands(nullptr, nullptr), E_INVALIDARG);
+
+  const GUID command = {0xb61e2259,
+                        0x02e8,
+                        0x4f13,
+                        {0x96, 0x9c, 0xd0, 0x4e, 0xc6, 0xc6, 0x6a, 0x42}};
+  UINT structure_size = 123;
+  count = 123;
+  EXPECT_EQ(device5->EnumerateMetaCommandParameters(
+                command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
+                &structure_size, &count, nullptr),
+            E_INVALIDARG);
+  count = 0;
+  EXPECT_EQ(device5->EnumerateMetaCommandParameters(
+                command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
+                &structure_size, &count, nullptr),
+            DXGI_ERROR_NOT_FOUND);
+  EXPECT_EQ(structure_size, 0u);
+  EXPECT_EQ(count, 0u);
+
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device5->CreateMetaCommand(command, 0, nullptr, 0,
+                                       __uuidof(ID3D12MetaCommand), &output),
+            DXGI_ERROR_NOT_FOUND);
+  EXPECT_EQ(output, nullptr);
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device5->CreateMetaCommand(command, 2, nullptr, 0,
+                                       __uuidof(ID3D12MetaCommand), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnsupportedMetaCommandInitializationFailsClose) {
+  ComPtr<ID3D12GraphicsCommandList4> list4;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList4),
+                reinterpret_cast<void **>(list4.put())),
+            S_OK);
+  list4->InitializeMetaCommand(nullptr, nullptr, 0);
+  EXPECT_EQ(list4->Close(), E_NOTIMPL);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnsupportedMetaCommandExecutionFailsClose) {
+  ComPtr<ID3D12GraphicsCommandList4> list4;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList4),
+                reinterpret_cast<void **>(list4.put())),
+            S_OK);
+  list4->ExecuteMetaCommand(nullptr, nullptr, 0);
+  EXPECT_EQ(list4->Close(), E_NOTIMPL);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       FreshContextExecutesAfterUnsupportedCommandFailure) {
+  ComPtr<ID3D12GraphicsCommandList1> list1;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList1),
+                reinterpret_cast<void **>(list1.put())),
+            S_OK);
+  D3D12_SAMPLE_POSITION position = {};
+  list1->SetSamplePositions(1, 1, &position);
+  ASSERT_EQ(list1->Close(), E_NOTIMPL);
+
+  D3D12TestContext recovered;
+  ASSERT_EQ(recovered.Initialize(), S_OK);
+  EXPECT_EQ(recovered.ExecuteAndWait(), S_OK);
+}
+
 } // namespace

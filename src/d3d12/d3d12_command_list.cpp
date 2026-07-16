@@ -1901,6 +1901,10 @@ public:
     return S_OK;
   }
 
+  IMTLD3D12Device *GetParentDevice() const override {
+    return device_.ptr();
+  }
+
   bool IsClosed() const override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListObjectApi);
@@ -2917,6 +2921,7 @@ public:
         dxmt::PerfCodePath::CommandListSamplePositions);
     const bool reset = sample_count == 0 && pixel_count == 0 && !sample_positions;
     if (!reset) {
+      recording_error_ = E_NOTIMPL;
       WARN("D3D12GraphicsCommandList: programmable sample positions are unsupported");
       return;
     }
@@ -3102,6 +3107,7 @@ public:
       SIZE_T initialization_parameters_data_size_in_bytes) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: meta commands are unsupported");
   }
 
@@ -3110,6 +3116,7 @@ public:
       SIZE_T execution_parameters_data_size_in_bytes) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListUnsupportedFeature);
+    recording_error_ = E_NOTIMPL;
     WARN("D3D12GraphicsCommandList: meta commands are unsupported");
   }
 
