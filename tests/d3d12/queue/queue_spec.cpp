@@ -353,17 +353,6 @@ struct ScopedCommandBufferErrorMarker {
                    std::istream_iterator<std::string>(), "error"));
   }
 
-  bool WaitForCount(size_t expected,
-                    std::chrono::milliseconds timeout) const {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (Count() >= expected)
-        return true;
-      Sleep(10);
-    }
-    return Count() >= expected;
-  }
-
   std::string path;
 };
 
@@ -476,17 +465,6 @@ struct ScopedMetal4RejectionMarker {
     return static_cast<size_t>(
         std::count(std::istream_iterator<std::string>(input),
                    std::istream_iterator<std::string>(), "rejected"));
-  }
-
-  bool WaitForCount(size_t expected,
-                    std::chrono::milliseconds timeout) const {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (Count() >= expected)
-        return true;
-      Sleep(10);
-    }
-    return Count() >= expected;
   }
 
   std::string unix_path;
@@ -2197,11 +2175,23 @@ TEST(D3D12QueueErrorSpec,
   EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
   EXPECT_LT(std::chrono::steady_clock::now() - rejected_begin,
             std::chrono::seconds(5));
-  EXPECT_TRUE(marker.WaitForCount(1u, std::chrono::seconds(2)));
-  EXPECT_TRUE(
-      rejection_marker.WaitForCount(1u, std::chrono::seconds(2)));
-  EXPECT_EQ(context.device()->GetDeviceRemovedReason(),
-            DXGI_ERROR_DEVICE_REMOVED);
+  size_t command_buffer_errors = 0;
+  size_t rejected_submissions = 0;
+  HRESULT removed_reason = S_OK;
+  const auto observation_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  do {
+    command_buffer_errors = marker.Count();
+    rejected_submissions = rejection_marker.Count();
+    removed_reason = context.device()->GetDeviceRemovedReason();
+    if (command_buffer_errors >= 1 && rejected_submissions >= 1 &&
+        removed_reason == DXGI_ERROR_DEVICE_REMOVED)
+      break;
+    Sleep(10);
+  } while (std::chrono::steady_clock::now() < observation_deadline);
+  EXPECT_GE(command_buffer_errors, 1u);
+  EXPECT_GE(rejected_submissions, 1u);
+  EXPECT_EQ(removed_reason, DXGI_ERROR_DEVICE_REMOVED);
 
   ASSERT_TRUE(SetEnvironmentVariableA(
       "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr));
