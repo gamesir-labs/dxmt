@@ -91,4 +91,15 @@ TEST(D3D12BindingHotspot, BatchesThousandsOfLogicalCasesIntoGpuOracles) {
   EXPECT_EQ(descriptor_copies.actual, descriptor_copies.expected);
 }
 
+TEST(D3D12BindingHotspot,
+     SnapshotsCompiledDescriptorGenerationAtQueueSubmission) {
+  BindingHotspotMeasurement measurement;
+  const auto error =
+      dxmt::test::RunCompiledDescriptorSubmissionSnapshotScenario(
+          &measurement);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(measurement.operations, 1u);
+  EXPECT_EQ(measurement.actual, measurement.expected);
+}
+
 } // namespace

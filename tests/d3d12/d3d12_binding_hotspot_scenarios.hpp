@@ -43,4 +43,8 @@ BindingHotspotError
 RunCompiledRootDescriptorResidencyScenario(
     std::uint32_t draw_count, BindingHotspotMeasurement *measurement);
 
+BindingHotspotError
+RunCompiledDescriptorSubmissionSnapshotScenario(
+    BindingHotspotMeasurement *measurement);
+
 } // namespace dxmt::test
