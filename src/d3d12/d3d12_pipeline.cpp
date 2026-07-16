@@ -3498,7 +3498,8 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
     if (!payload_size || !payload_alignment)
       return FailPipelineStreamParse("unknown type", type, type_offset);
     offset = AlignStreamOffset(offset, payload_alignment);
-    if (stream.SizeInBytes - offset < payload_size)
+    if (offset > stream.SizeInBytes ||
+        stream.SizeInBytes - offset < payload_size)
       return FailPipelineStreamParse("truncated payload", type, type_offset);
     const auto type_index = static_cast<uint32_t>(type);
     if (type_index >= std::size(seen_subobjects) || seen_subobjects[type_index])
