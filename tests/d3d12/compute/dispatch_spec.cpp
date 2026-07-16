@@ -2,6 +2,7 @@
 #include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
+#include "shaders/group_shared.hpp"
 
 #include <array>
 #include <cstring>
@@ -12,6 +13,7 @@ namespace {
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::GroupSharedComputeShader;
 
 struct OutputResources {
   ComPtr<ID3D12Resource> buffer;
@@ -68,9 +70,14 @@ protected:
   }
 
   OutputResources CreateOutput(UINT word_count) {
-    std::vector<UINT> zeros(word_count);
+    return CreateOutput(std::vector<UINT>(word_count));
+  }
+
+  OutputResources CreateOutput(const std::vector<UINT> &initial) {
+    const UINT word_count = static_cast<UINT>(initial.size());
     auto upload = context_.CreateUploadBuffer(
-        word_count * sizeof(UINT), zeros.data(), zeros.size() * sizeof(UINT));
+        word_count * sizeof(UINT), initial.data(),
+        initial.size() * sizeof(UINT));
     OutputResources resources;
     resources.buffer = context_.CreateBuffer(
         word_count * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
@@ -168,6 +175,45 @@ TEST_F(ComputeDispatchSpec, DispatchDimensionMatrix) {
         expected[16 + x + 4 * (y + 4 * z)] =
             0x80000000u | x | (y << 8) | (z << 16);
   EXPECT_EQ(actual, expected);
+}
+
+TEST_F(ComputeDispatchSpec, GroupSharedMemorySynchronizesAcrossThreads) {
+  constexpr UINT kGroupCount = 3;
+  constexpr UINT kGroupSize = 32;
+  constexpr UINT kResultBase = kGroupCount * kGroupSize;
+  std::vector<UINT> initial(kResultBase + kGroupCount);
+  for (UINT group = 0; group < kGroupCount; ++group)
+    for (UINT lane = 0; lane < kGroupSize; ++lane)
+      initial[group * kGroupSize + lane] =
+          3 + group * 1000 + lane * lane;
+
+  auto output = CreateOutput(initial);
+  ASSERT_TRUE(output.buffer);
+  ASSERT_TRUE(output.heap);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = static_cast<UINT>(initial.size());
+  uav.Buffer.StructureByteStride = sizeof(UINT);
+  context_.device()->CreateUnorderedAccessView(
+      output.buffer.get(), nullptr, &uav,
+      output.heap->GetCPUDescriptorHandleForHeapStart());
+  auto pipeline = context_.CreateComputePipeline(root_signature_.get(),
+                                                 GroupSharedComputeShader());
+  ASSERT_TRUE(pipeline);
+  Bind(output, pipeline.get());
+  const UINT parameters[] = {kGroupSize, kResultBase};
+  context_.list()->SetComputeRoot32BitConstants(1, 2, parameters, 0);
+  context_.list()->Dispatch(kGroupCount, 1, 1);
+
+  auto expected = initial;
+  for (UINT group = 0; group < kGroupCount; ++group)
+    for (UINT lane = 0; lane < kGroupSize; ++lane)
+      expected[kResultBase + group] +=
+          initial[group * kGroupSize + lane];
+  const auto actual = Readback(output, static_cast<UINT>(expected.size()));
+  ASSERT_EQ(actual.size(), expected.size());
+  for (std::size_t word = 0; word < expected.size(); ++word)
+    EXPECT_EQ(actual[word], expected[word]) << "word " << word;
 }
 
 } // namespace
