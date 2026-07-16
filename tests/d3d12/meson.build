@@ -114,6 +114,7 @@ d3d12_unit_suites = {
   'sync': {
     'sources': files(
       'sync/aliasing_barrier_spec.cpp',
+      'sync/barrier_matrix_spec.cpp',
       'sync/cross_queue_spec.cpp',
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
@@ -137,6 +138,7 @@ d3d12_unit_suites = {
     'sources': files(
       'resource/residency_spec.cpp',
       'resource/resource_spec.cpp',
+      'resource/validation_memory_spec.cpp',
     ),
   },
   'shader': {

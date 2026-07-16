@@ -401,6 +401,13 @@ IsValidTransitionState(D3D12_RESOURCE_STATES state) {
 
 static bool
 IsValidResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
+  const auto flags = static_cast<UINT>(barrier.Flags);
+  const auto split_flags =
+      UINT(D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) |
+      UINT(D3D12_RESOURCE_BARRIER_FLAG_END_ONLY);
+  if (flags & ~split_flags || flags == split_flags)
+    return false;
+
   switch (barrier.Type) {
   case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
     return barrier.Transition.pResource &&
@@ -408,7 +415,7 @@ IsValidResourceBarrier(const D3D12_RESOURCE_BARRIER &barrier) {
            IsValidTransitionState(barrier.Transition.StateAfter);
   case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
   case D3D12_RESOURCE_BARRIER_TYPE_UAV:
-    return true;
+    return barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE;
   default:
     return false;
   }

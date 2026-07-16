@@ -5149,6 +5149,11 @@ private:
   bool GetResourceSizeAndAlignment(const D3D12_RESOURCE_DESC &desc,
                                    UINT64 &size,
                                    UINT64 &alignment) const {
+    if (!IsResourceDescSupportedByDevice(desc) ||
+        (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+         IsBcFormat(device_->device(), desc.Format)))
+      return false;
+
     alignment = desc.Alignment;
     if (!alignment) {
       alignment = desc.SampleDesc.Count > 1
@@ -5162,8 +5167,7 @@ private:
     }
 
     WMTSizeAndAlign metal_size_and_align = {};
-    if (!IsResourceDescSupportedByDevice(desc) ||
-        !d3d12::GetTextureHeapSizeAndAlign(
+    if (!d3d12::GetTextureHeapSizeAndAlign(
             device_->device(), desc, metal_size_and_align))
       return false;
 

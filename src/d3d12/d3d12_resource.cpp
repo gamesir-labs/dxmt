@@ -2649,11 +2649,25 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
   if (!IsSupportedSampleCount(desc.SampleDesc.Count) ||
       desc.SampleDesc.Quality != 0)
     return false;
+  if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+      (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    return false;
+  const bool depth_stencil_format =
+      IsDepthStencilResourceFormat(desc.Format);
+  if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+      depth_stencil_format)
+    return false;
+  if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+      !depth_stencil_format)
+    return false;
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     return desc.Height == 1 && desc.DepthOrArraySize == 1 &&
            desc.MipLevels == 1 && desc.Format == DXGI_FORMAT_UNKNOWN &&
            desc.SampleDesc.Count == 1 && desc.SampleDesc.Quality == 0 &&
-           desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+           desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
+           !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                           D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS));
   }
   if (desc.Format == DXGI_FORMAT_UNKNOWN)
     return false;
