@@ -164,6 +164,34 @@ test(
   timeout: 30,
 )
 
+airconv_container_rejection_test = find_program(
+  'airconv/container-rejection-test.sh',
+)
+test(
+  'airconv-container-rejection',
+  airconv_container_rejection_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/scalar-varying-vs.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
+airconv_determinism_test = find_program(
+  'airconv/determinism-test.sh',
+)
+test(
+  'airconv-determinism',
+  airconv_determinism_test,
+  args: [
+    airconv_cli_darwin,
+    files('airconv/scalar-varying-vs.dxbc.hex'),
+  ],
+  suite: ['unit', 'airconv'],
+  timeout: 30,
+)
+
 alias_target(
   'dxmt-wine-tests',
   dxmt_wine_test_scheduler,

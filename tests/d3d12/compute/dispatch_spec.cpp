@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -215,5 +216,47 @@ TEST_F(ComputeDispatchSpec, GroupSharedMemorySynchronizesAcrossThreads) {
   for (std::size_t word = 0; word < expected.size(); ++word)
     EXPECT_EQ(actual[word], expected[word]) << "word " << word;
 }
+
+struct DispatchBoundaryCase {
+  UINT x;
+  UINT y;
+  UINT z;
+  HRESULT expected_close;
+  const char *name;
+};
+
+class ComputeDispatchBoundarySpec
+    : public ::testing::TestWithParam<DispatchBoundaryCase> {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+
+  D3D12TestContext context_;
+};
+
+TEST_P(ComputeDispatchBoundarySpec, EnforcesPerDimensionLimit) {
+  const auto &test = GetParam();
+  context_.list()->Dispatch(test.x, test.y, test.z);
+  EXPECT_EQ(context_.list()->Close(), test.expected_close);
+}
+
+std::string DispatchBoundaryCaseName(
+    const ::testing::TestParamInfo<DispatchBoundaryCase> &info) {
+  return info.param.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DimensionMatrix, ComputeDispatchBoundarySpec,
+    ::testing::Values(
+        DispatchBoundaryCase{0, 0, 0, S_OK, "ZeroAll"},
+        DispatchBoundaryCase{0, 1, 1, S_OK, "ZeroX"},
+        DispatchBoundaryCase{1, 0, 1, S_OK, "ZeroY"},
+        DispatchBoundaryCase{1, 1, 0, S_OK, "ZeroZ"},
+        DispatchBoundaryCase{65535, 1, 1, S_OK, "MaximumX"},
+        DispatchBoundaryCase{1, 65535, 1, S_OK, "MaximumY"},
+        DispatchBoundaryCase{1, 1, 65535, S_OK, "MaximumZ"},
+        DispatchBoundaryCase{65536, 1, 1, E_INVALIDARG, "BeyondMaximumX"},
+        DispatchBoundaryCase{1, 65536, 1, E_INVALIDARG, "BeyondMaximumY"},
+        DispatchBoundaryCase{1, 1, 65536, E_INVALIDARG, "BeyondMaximumZ"}),
+    DispatchBoundaryCaseName);
 
 } // namespace

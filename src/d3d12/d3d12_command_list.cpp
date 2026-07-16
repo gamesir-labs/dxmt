@@ -1883,6 +1883,7 @@ public:
       compiled_commands_.reset();
       pending_render_pass_resolves_.clear();
       active_queries_.clear();
+      render_pass_active_ = false;
       ClearRecordedStateCache();
     }
     closed_ = false;
@@ -2074,6 +2075,12 @@ public:
     if (RejectCommandListType(
             "Dispatch", kDirectList | kBundleList | kComputeList))
       return;
+    constexpr UINT kMaxDispatchDimension = 65535;
+    if (x > kMaxDispatchDimension || y > kMaxDispatchDimension ||
+        z > kMaxDispatchDimension) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_dispatch(this, x, y, z);
     AddRecord(DispatchRecord{x, y, z});
@@ -3099,7 +3106,12 @@ public:
       return;
     if (RejectCommandListType("BeginRenderPass", kDirectList))
       return;
-    pending_render_pass_resolves_.clear();
+    if (render_pass_active_ ||
+        (render_targets_count && !render_targets) ||
+        render_targets_count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     if (flags & ~(D3D12_RENDER_PASS_FLAG_NONE |
                   D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES)) {
       // TODO(d3d12): model suspended/resumed render passes instead of
@@ -3109,6 +3121,8 @@ public:
       recording_error_ = E_NOTIMPL;
       return;
     }
+    render_pass_active_ = true;
+    pending_render_pass_resolves_.clear();
 
     std::vector<dxmt::apitrace::RenderPassRenderTargetDesc> apitrace_render_targets;
     ApitraceRenderPassResolveSubresources apitrace_render_target_resolves;
@@ -3169,6 +3183,11 @@ public:
       return;
     if (RejectCommandListType("EndRenderPass", kDirectList))
       return;
+    if (!render_pass_active_) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    render_pass_active_ = false;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_end_render_pass(this);
     for (const auto &resolve : pending_render_pass_resolves_) {
@@ -3884,6 +3903,7 @@ private:
   UINT view_instance_mask_ = 0xffffffffu;
   std::vector<PendingRenderPassResolve> pending_render_pass_resolves_;
   std::map<std::pair<QueryHeap *, UINT>, D3D12_QUERY_TYPE> active_queries_;
+  bool render_pass_active_ = false;
   bool closed_ = false;
   bool submitted_ = false;
   bool apitrace_lifecycle_recording_enabled_ = true;
