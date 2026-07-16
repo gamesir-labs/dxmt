@@ -72,6 +72,9 @@ d3d12_unit_suites = {
       'graphics/output_merger_spec.cpp',
     ),
   },
+  'integration': {
+    'sources': files('integration/frame_spec.cpp'),
+  },
   'pipeline': {
     'sources': files('pipeline/stream_spec.cpp'),
   },
