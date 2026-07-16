@@ -2,6 +2,7 @@ build
 .vscode
 .idea
 .DS_Store
+__pycache__/
 wineprefix
 .wine-x86_64-test
 .cache
