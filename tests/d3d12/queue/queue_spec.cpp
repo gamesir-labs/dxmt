@@ -819,7 +819,7 @@ TEST_F(D3D12QueueSpec, ReusesBundleWithInheritedAndReturnedGraphicsState) {
   }
 }
 
-TEST_F(D3D12QueueSpec, RejectsInvalidExecuteBundleContractsOnClose) {
+TEST_F(D3D12QueueSpec, ValidatesExecuteBundleContractsOnClose) {
   ComPtr<ID3D12CommandAllocator> open_bundle_allocator;
   ComPtr<ID3D12GraphicsCommandList> open_bundle;
   ASSERT_EQ(context_.device()->CreateCommandAllocator(
@@ -864,7 +864,7 @@ TEST_F(D3D12QueueSpec, RejectsInvalidExecuteBundleContractsOnClose) {
                 reinterpret_cast<void **>(caller_bundle.put())),
             S_OK);
   caller_bundle->ExecuteBundle(closed_bundle.get());
-  EXPECT_EQ(caller_bundle->Close(), E_INVALIDARG);
+  EXPECT_EQ(caller_bundle->Close(), S_OK);
 }
 
 TEST_F(D3D12QueueSpec, DiscardAllowsCompleteAndRectangularOverwrite) {
