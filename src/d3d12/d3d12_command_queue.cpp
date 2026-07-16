@@ -4347,9 +4347,9 @@ public:
 
     auto *resource_object = dynamic_cast<d3d12::Resource *>(resource);
     const auto *tiling = resource_object ? resource_object->GetTiling() : nullptr;
-    if (!resource_object || !resource_object->IsReservedTexture() || !tiling) {
+    if (!resource_object || !resource_object->IsReserved() || !tiling) {
       if (ShouldLogTileMappingDiag()) {
-        WARN("D3D12CommandQueue: TODO UpdateTileMappings requires reserved texture"
+        WARN("D3D12CommandQueue: UpdateTileMappings requires reserved resource"
              " resource=", resource,
              " regions=", region_count,
              " ranges=", range_count,
@@ -4585,9 +4585,9 @@ public:
     auto *src = dynamic_cast<d3d12::Resource *>(src_resource);
     const auto *dst_tiling = dst ? dst->GetTiling() : nullptr;
     const auto *src_tiling = src ? src->GetTiling() : nullptr;
-    if (!dst || !src || !dst->IsReservedTexture() || !src->IsReservedTexture() ||
+    if (!dst || !src || !dst->IsReserved() || !src->IsReserved() ||
         !dst_tiling || !src_tiling) {
-      WARN("D3D12CommandQueue: TODO CopyTileMappings requires reserved textures"
+      WARN("D3D12CommandQueue: CopyTileMappings requires reserved resources"
            " dst=", dst_resource,
            " src=", src_resource,
            " flags=", flags);
@@ -4675,6 +4675,16 @@ public:
         map_ops[mapping.heap.ptr()].push_back(op);
       else
         unmap_ops.push_back(op);
+    }
+
+    if (!dst->UsesPlacementSparse()) {
+      if (!unmap_ops.empty())
+        ApplySparseTileMappingOpsToResource(*dst, *dst_tiling, nullptr,
+                                            unmap_ops);
+      for (const auto &entry : map_ops)
+        ApplySparseTileMappingOpsToResource(*dst, *dst_tiling, entry.first,
+                                            entry.second);
+      return;
     }
 
     if (!map_ops.empty() && !dst->EnsureTextureAllocation("CopyTileMappings")) {
@@ -22648,13 +22658,67 @@ private:
     });
   }
 
+  void ReplayCopyBufferTiles(CommandChunk *chunk, ReplayState &state,
+                             const CopyTilesRecord &record,
+                             Resource &tiled, Resource &linear,
+                             bool buffer_to_tiled) {
+    const auto *tiling = tiled.GetTiling();
+    if (!tiling || record.start.Subresource >= tiling->subresources.size()) {
+      WARN("D3D12CommandQueue: CopyTiles invalid reserved buffer tiling"
+           " subresource=", record.start.Subresource);
+      return;
+    }
+
+    constexpr UINT64 tile_bytes =
+        D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    std::vector<CopyBufferRegionRecord> copies;
+    UINT linear_tile = 0;
+    const bool valid = ForEachTileInRegion(
+        *tiling, record.start, &record.size,
+        [&](UINT subresource, UINT x, UINT y, UINT z) {
+          if (subresource || y || z)
+            return false;
+          const UINT64 tiled_offset = UINT64(x) * tile_bytes;
+          const UINT64 linear_offset =
+              record.buffer_offset + UINT64(linear_tile++) * tile_bytes;
+          const auto tiled_size = tiled.GetResourceDesc().Width;
+          const auto linear_size = linear.GetResourceDesc().Width;
+          if (tiled_offset >= tiled_size || linear_offset >= linear_size)
+            return false;
+          const UINT64 copy_size =
+              std::min(tile_bytes, tiled_size - tiled_offset);
+          if (copy_size > linear_size - linear_offset)
+            return false;
+
+          CopyBufferRegionRecord copy = {};
+          copy.dst = buffer_to_tiled ? record.tiled_resource : record.buffer;
+          copy.dst_offset = buffer_to_tiled ? tiled_offset : linear_offset;
+          copy.src = buffer_to_tiled ? record.buffer : record.tiled_resource;
+          copy.src_offset = buffer_to_tiled ? linear_offset : tiled_offset;
+          copy.byte_count = copy_size;
+          copies.push_back(std::move(copy));
+          return true;
+        });
+    if (!valid) {
+      WARN("D3D12CommandQueue: CopyTiles invalid reserved buffer region"
+           " x=", record.start.X,
+           " y=", record.start.Y,
+           " z=", record.start.Z,
+           " tiles=", record.size.NumTiles,
+           " bufferOffset=", record.buffer_offset);
+      return;
+    }
+    for (const auto &copy : copies)
+      ReplayCopyBufferRegion(chunk, state, copy);
+  }
+
   void ReplayCopyTiles(CommandChunk *chunk, ReplayState &state,
                        const CopyTilesRecord &record) {
     auto *tiled = GetResource(record.tiled_resource.ptr());
     auto *buffer_resource = GetResource(record.buffer.ptr());
-    if (!tiled || !buffer_resource || !tiled->IsReservedTexture() ||
+    if (!tiled || !buffer_resource || !tiled->IsReserved() ||
         !buffer_resource->GetBuffer()) {
-      WARN("D3D12CommandQueue: TODO CopyTiles requires reserved texture and buffer"
+      WARN("D3D12CommandQueue: CopyTiles requires reserved resource and buffer"
            " tiled=", record.tiled_resource.ptr(),
            " buffer=", record.buffer.ptr(),
            " flags=", record.flags);
@@ -22677,6 +22741,14 @@ private:
            " flags=", record.flags);
       return;
     }
+
+    if (tiled->GetKind() == ResourceKind::ReservedBuffer) {
+      ReplayCopyBufferTiles(chunk, state, record, *tiled, *buffer_resource,
+                            buffer_to_texture);
+      return;
+    }
+    if (!tiled->IsReservedTexture())
+      return;
 
     const auto *tiling = tiled->GetTiling();
     if (!tiling || record.start.Subresource >= tiling->subresources.size()) {

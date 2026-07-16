@@ -14,6 +14,7 @@ namespace dxmt::d3d12 {
 enum class ResourceKind {
   Committed,
   Placed,
+  ReservedBuffer,
   ReservedTexture,
 };
 
@@ -47,6 +48,7 @@ public:
   virtual ~Resource() = default;
 
   virtual ResourceKind GetKind() const = 0;
+  virtual bool IsReserved() const = 0;
   virtual bool IsReservedTexture() const = 0;
   virtual bool UsesPlacementSparse() const = 0;
   virtual const ResourceTiling *GetTiling() const = 0;

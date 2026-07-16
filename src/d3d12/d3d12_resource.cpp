@@ -854,15 +854,22 @@ public:
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !desc_.MipLevels)
       desc_.MipLevels = GetMaxMipLevels(desc_);
 
-    if (kind_ == ResourceKind::ReservedTexture &&
-        desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-      WARN("D3D12Resource: TODO CreateReservedResource(buffer) unsupported"
-           " width=", desc_.Width,
-           " flags=", desc_.Flags,
-           " layout=", desc_.Layout);
-    } else if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      if (kind_ == ResourceKind::ReservedTexture) {
+        WARN("D3D12Resource: reserved texture kind used for buffer");
+        return;
+      }
+      if (kind_ == ResourceKind::ReservedBuffer) {
+        // Metal placement-sparse mappings are texture-only. Keep the logical
+        // D3D12 tile map while using a fully backed buffer for execution.
+        BuildBufferTilingMetadata();
+      }
       CreateBuffer();
     } else {
+      if (kind_ == ResourceKind::ReservedBuffer) {
+        WARN("D3D12Resource: reserved buffer kind used for texture");
+        return;
+      }
       CreateTexture();
     }
   }
@@ -1106,6 +1113,11 @@ public:
 
   ResourceKind GetKind() const override {
     return kind_;
+  }
+
+  bool IsReserved() const override {
+    return kind_ == ResourceKind::ReservedBuffer ||
+           kind_ == ResourceKind::ReservedTexture;
   }
 
   bool IsReservedTexture() const override {
@@ -2332,6 +2344,28 @@ private:
     }
     tiling_.total_tile_count = next_tile;
     tile_map_.assign(next_tile, {});
+    for (auto &mapping : tile_map_)
+      mapping.heap_tile = -1;
+    has_tiling_ = true;
+  }
+
+  void BuildBufferTilingMetadata() {
+    constexpr UINT64 tile_size = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    const UINT64 tile_count = 1 + (desc_.Width - 1) / tile_size;
+    if (tile_count > std::numeric_limits<UINT>::max())
+      return;
+
+    tiling_ = {};
+    tiling_.total_tile_count = static_cast<UINT>(tile_count);
+    tiling_.tile_shape.WidthInTexels = static_cast<UINT>(tile_size);
+    tiling_.tile_shape.HeightInTexels = 1;
+    tiling_.tile_shape.DepthInTexels = 1;
+    SubresourceTiling subresource = {};
+    subresource.width_in_tiles = tiling_.total_tile_count;
+    subresource.height_in_tiles = 1;
+    subresource.depth_in_tiles = 1;
+    tiling_.subresources.push_back(subresource);
+    tile_map_.assign(tiling_.total_tile_count, {});
     for (auto &mapping : tile_map_)
       mapping.heap_tile = -1;
     has_tiling_ = true;

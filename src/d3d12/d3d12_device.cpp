@@ -3959,13 +3959,13 @@ public:
     InitReturnPtr(resource);
     if (!resource)
       return E_POINTER;
-    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-      if (optimized_clear_value)
-        return WARN_E_INVALIDARG(__func__);
-      WARN("D3D12Device: TODO CreateReservedResource(buffer) unsupported"
-           " width=", desc->Width,
-           " flags=", desc->Flags,
-           " layout=", desc->Layout);
+    const bool is_buffer =
+        desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    if (is_buffer && optimized_clear_value)
+      return WARN_E_INVALIDARG(__func__);
+    if (!IsValidReservedResourceDesc(desc, initial_state))
+      return WARN_E_INVALIDARG(__func__);
+    if (!GetDXMTDevice().device().supportsPlacementSparse()) {
       if (dxmt::apitrace::d3d_enabled()) {
         dxmt::apitrace::record_create_reserved_resource(
             this, desc, initial_state, optimized_clear_value, nullptr, 0,
@@ -3973,21 +3973,29 @@ public:
       }
       return E_NOTIMPL;
     }
-    if (!IsValidReservedResourceDesc(desc, initial_state))
-      return WARN_E_INVALIDARG(__func__);
 
     const auto heap_properties = GetDefaultResourceHeapProperties();
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), &heap_properties,
         D3D12_HEAP_FLAG_NONE, desc, initial_state, 0,
-        optimized_clear_value, d3d12::ResourceKind::ReservedTexture);
+        optimized_clear_value,
+        is_buffer ? d3d12::ResourceKind::ReservedBuffer
+                  : d3d12::ResourceKind::ReservedTexture);
     auto *reserved = resource_object.ptr()
                          ? dynamic_cast<d3d12::Resource *>(resource_object.ptr())
                          : nullptr;
-    if (!reserved || !reserved->GetTexture() || !reserved->GetTiling()) {
-      WARN("D3D12Device: TODO CreateReservedResource(texture) unsupported"
-           " format=", desc->Format,
+    const bool resource_ready =
+        reserved && reserved->GetTiling() &&
+        (is_buffer ? reserved->GetBufferAllocation() != nullptr
+                   : reserved->GetTexture() != nullptr);
+    if (!resource_ready) {
+      const HRESULT failure =
+          is_buffer && reserved && reserved->GetTiling()
+              ? E_OUTOFMEMORY
+              : E_NOTIMPL;
+      WARN("D3D12Device: CreateReservedResource backend unavailable"
            " dimension=", desc->Dimension,
+           " format=", desc->Format,
            " width=", desc->Width,
            " height=", desc->Height,
            " depthOrArray=", desc->DepthOrArraySize,
@@ -3998,9 +4006,9 @@ public:
       if (dxmt::apitrace::d3d_enabled()) {
         dxmt::apitrace::record_create_reserved_resource(
             this, desc, initial_state, optimized_clear_value, nullptr, 0,
-            static_cast<int32_t>(E_NOTIMPL));
+            static_cast<int32_t>(failure));
       }
-      return E_NOTIMPL;
+      return failure;
     }
     auto hr = resource_object->QueryInterface(riid, resource);
     if (dxmt::apitrace::d3d_enabled()) {
