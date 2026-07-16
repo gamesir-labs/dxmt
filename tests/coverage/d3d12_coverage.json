@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "compiler_coverage": {
+    "modules": {
+      "object-and-device": {
+        "globs": [
+          "src/d3d12/d3d12.cpp",
+          "src/d3d12/d3d12_device.cpp",
+          "src/d3d12/d3d12_resource.cpp",
+          "src/d3d12/d3d12_heap.cpp",
+          "src/d3d12/d3d12_root_signature.cpp",
+          "src/d3d12/d3d12_pipeline.cpp"
+        ],
+        "minimum_line_percent": 60.0,
+        "minimum_branch_percent": 30.0
+      },
+      "command-and-sync": {
+        "globs": [
+          "src/d3d12/d3d12_command_list.cpp",
+          "src/d3d12/d3d12_command_queue.cpp",
+          "src/d3d12/d3d12_command_allocator.cpp",
+          "src/d3d12/d3d12_fence.cpp",
+          "src/d3d12/d3d12_query.cpp"
+        ],
+        "minimum_line_percent": 48.0,
+        "minimum_branch_percent": 27.0
+      },
+      "descriptor-binding": {
+        "globs": [
+          "src/d3d12/d3d12_descriptor_heap.cpp",
+          "src/d3d12/d3d12_descriptor_mirror.cpp",
+          "src/d3d12/d3d12_sampler.cpp"
+        ],
+        "minimum_line_percent": 62.0,
+        "minimum_branch_percent": 33.0
+      }
+    }
+  },
+  "public_api": {
+    "test_globs": ["tests/d3d12/**/*.cpp"],
+    "categories": {
+      "device-and-memory": {
+        "minimum_percent": 100.0,
+        "apis": [
+          "D3D12CreateDevice",
+          "CheckFeatureSupport",
+          "CreateCommandQueue",
+          "CreateCommandAllocator",
+          "CreateCommandList",
+          "CreateCommandList1",
+          "CreateFence",
+          "CreateCommittedResource",
+          "CreateHeap",
+          "CreatePlacedResource",
+          "CreateReservedResource",
+          "GetResourceAllocationInfo",
+          "GetCopyableFootprints",
+          "GetResourceTiling",
+          "MakeResident",
+          "Evict"
+        ]
+      },
+      "descriptors-and-pipeline": {
+        "minimum_percent": 100.0,
+        "apis": [
+          "CreateDescriptorHeap",
+          "CreateConstantBufferView",
+          "CreateShaderResourceView",
+          "CreateUnorderedAccessView",
+          "CreateRenderTargetView",
+          "CreateDepthStencilView",
+          "CreateSampler",
+          "CopyDescriptors",
+          "CopyDescriptorsSimple",
+          "CreateRootSignature",
+          "CreateGraphicsPipelineState",
+          "CreateComputePipelineState",
+          "CreatePipelineState",
+          "CreateQueryHeap",
+          "CreateCommandSignature"
+        ]
+      },
+      "command-recording": {
+        "minimum_percent": 100.0,
+        "apis": [
+          "Close",
+          "Reset",
+          "ClearState",
+          "DrawInstanced",
+          "DrawIndexedInstanced",
+          "Dispatch",
+          "CopyBufferRegion",
+          "CopyTextureRegion",
+          "CopyResource",
+          "ResolveSubresource",
+          "IASetPrimitiveTopology",
+          "IASetIndexBuffer",
+          "IASetVertexBuffers",
+          "RSSetViewports",
+          "RSSetScissorRects",
+          "OMSetRenderTargets",
+          "OMSetBlendFactor",
+          "OMSetStencilRef",
+          "SetPipelineState",
+          "ResourceBarrier",
+          "ExecuteBundle",
+          "SetDescriptorHeaps",
+          "SetGraphicsRootSignature",
+          "SetComputeRootSignature",
+          "SetGraphicsRootDescriptorTable",
+          "SetComputeRootDescriptorTable",
+          "SetGraphicsRoot32BitConstants",
+          "SetComputeRoot32BitConstants",
+          "SetGraphicsRootConstantBufferView",
+          "SetComputeRootConstantBufferView",
+          "SetGraphicsRootShaderResourceView",
+          "SetComputeRootShaderResourceView",
+          "SetGraphicsRootUnorderedAccessView",
+          "SetComputeRootUnorderedAccessView",
+          "ClearRenderTargetView",
+          "ClearDepthStencilView",
+          "ClearUnorderedAccessViewUint",
+          "ClearUnorderedAccessViewFloat",
+          "BeginQuery",
+          "EndQuery",
+          "ResolveQueryData",
+          "SetPredication",
+          "ExecuteIndirect",
+          "DiscardResource",
+          "WriteBufferImmediate"
+        ]
+      },
+      "queue-and-fence": {
+        "minimum_percent": 100.0,
+        "apis": [
+          "ExecuteCommandLists",
+          "Signal",
+          "Wait",
+          "GetTimestampFrequency",
+          "GetClockCalibration",
+          "UpdateTileMappings",
+          "CopyTileMappings",
+          "GetCompletedValue",
+          "SetEventOnCompletion"
+        ]
+      }
+    }
+  }
+}

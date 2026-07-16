@@ -25,6 +25,10 @@ d3d12core_src = [
 
 d3d12_ld_args      = ['-L' + windows_native_install_dir]
 d3d12_link_depends = []
+d3d12_cpp_args     = ['-DDXMT_DX12_METAL4=1']
+if get_option('b_coverage') and cpp.get_id() == 'gcc'
+  d3d12_cpp_args += ['-Wa,-mbig-obj']
+endif
 
 d3d12_dll = shared_library('d3d12', d3d12_src, d3d12_res,
   name_prefix         : '',
@@ -36,7 +40,7 @@ d3d12_dll = shared_library('d3d12', d3d12_src, d3d12_res,
     airconv_dx12_metal4_forward_dep,
     util_dep ],
   include_directories : [ dxmt_include_path ],
-  cpp_args            : ['-DDXMT_DX12_METAL4=1'],
+  cpp_args            : d3d12_cpp_args,
   install             : true,
   install_dir         : windows_native_install_dir,
   install_tag         : 'runtime-metal4',

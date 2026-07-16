@@ -58,14 +58,17 @@ protected:
         << pixel_shader.diagnostic_text();
     pixel_shader_ = std::move(pixel_shader.bytecode);
 
-    D3D12_ROOT_PARAMETER parameter = {};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameter.Constants.ShaderRegister = 0;
-    parameter.Constants.Num32BitValues = 1;
-    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 1;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[1].Descriptor.ShaderRegister = 1;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-    root_desc.NumParameters = 1;
-    root_desc.pParameters = &parameter;
+    root_desc.NumParameters = ARRAYSIZE(parameters);
+    root_desc.pParameters = parameters;
     root_desc.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     root_signature_ = context_.CreateRootSignature(root_desc);
@@ -154,9 +157,14 @@ protected:
     const UINT64 predicate = 1;
     predicate_ = context_.CreateUploadBuffer(sizeof(predicate), &predicate,
                                              sizeof(predicate));
+    root_uav_ = context_.CreateBuffer(
+        256, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ASSERT_TRUE(vertex_buffer_);
     ASSERT_TRUE(index_buffer_);
     ASSERT_TRUE(predicate_);
+    ASSERT_TRUE(root_uav_);
     vertex_view_ = {vertex_buffer_->GetGPUVirtualAddress(), sizeof(vertices),
                     2 * sizeof(float)};
     index_view_ = {index_buffer_->GetGPUVirtualAddress(), sizeof(indices),
@@ -187,8 +195,12 @@ protected:
       list->SetPipelineState(pipeline_.get());
     if (omitted != GraphicsResetState::RootSignature)
       list->SetGraphicsRootSignature(root_signature_.get());
-    if (omitted != GraphicsResetState::RootArguments)
-      list->SetGraphicsRoot32BitConstant(0, std::bit_cast<UINT>(1.0f), 0);
+    if (omitted != GraphicsResetState::RootArguments) {
+      const UINT value = std::bit_cast<UINT>(1.0f);
+      list->SetGraphicsRoot32BitConstants(0, 1, &value, 0);
+      list->SetGraphicsRootUnorderedAccessView(
+          1, root_uav_->GetGPUVirtualAddress());
+    }
     if (omitted != GraphicsResetState::VertexBuffers)
       list->IASetVertexBuffers(0, 1, &vertex_view_);
     if (omitted != GraphicsResetState::IndexBuffer)
@@ -361,6 +373,7 @@ protected:
   ComPtr<ID3D12Resource> vertex_buffer_;
   ComPtr<ID3D12Resource> index_buffer_;
   ComPtr<ID3D12Resource> predicate_;
+  ComPtr<ID3D12Resource> root_uav_;
   ComPtr<ID3D12QueryHeap> query_heap_;
   ComPtr<ID3D12Resource> query_result_;
   ComPtr<ID3D12GraphicsCommandList4> list4_;

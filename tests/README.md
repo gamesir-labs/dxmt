@@ -200,6 +200,29 @@ scripts/run-d3d12-differential.sh \
 The runner rebuilds the oracle, stages the current D3D12 runtime, validates the
 candidate JSON, and rejects missing, unexpected, or mismatched cases.
 
+## Coverage and mutation gates
+
+`scripts/check-d3d12-coverage.py` always enforces the checked-in public API
+manifest and, when given gcovr JSON, aggregates line and branch coverage by
+D3D12 subsystem. Thresholds live in `tests/coverage/d3d12_coverage.json`; a
+missing source module or API test is a gate failure. Generate instrumented
+coverage with:
+
+```sh
+scripts/run-d3d12-coverage.sh gcc-x64-release-full
+```
+
+`scripts/run-d3d12-mutations.py` applies reviewed, exact source mutations one at
+a time, runs the owning tests, and restores the source in a `finally` block.
+Compilation failures are infrastructure errors rather than killed mutations.
+The checked-in manifest currently requires a 100% score:
+
+```sh
+python3 scripts/run-d3d12-mutations.py --minimum-score 100
+```
+
+Both gates are available in the `D3D12 Quality Gates` workflow.
+
 The managed Wine dependency is fingerprinted below `.cache/managed/deps`.
 
 To use a complete prebuilt Wine cache for a one-off run:

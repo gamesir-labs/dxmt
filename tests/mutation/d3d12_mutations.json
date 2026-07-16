@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "mutations": [
+    {
+      "id": "root-cost-rejects-exact-limit",
+      "file": "src/d3d12/d3d12_root_signature.cpp",
+      "find": "if (root_cost > D3D12_MAX_ROOT_COST)",
+      "replace": "if (root_cost >= D3D12_MAX_ROOT_COST)",
+      "occurrence": 0,
+      "test_filter": "RootSignatureLayoutSpec.Exactly64DwordsAccepted"
+    },
+    {
+      "id": "descriptor-journal-does-not-advance",
+      "file": "src/d3d12/d3d12_descriptor_journal.hpp",
+      "find": "const uint64_t sequence = next_sequence_++;",
+      "replace": "const uint64_t sequence = next_sequence_;",
+      "test_filter": "D3D12DescriptorJournal.*"
+    },
+    {
+      "id": "dispatch-rejects-compute-lists",
+      "file": "src/d3d12/d3d12_command_list.cpp",
+      "find": "\"Dispatch\", kDirectList | kBundleList | kComputeList",
+      "replace": "\"Dispatch\", kDirectList | kBundleList",
+      "test_filter": "QueueMatrix/CrossQueueUavCopySpec.FencePublishesDescriptorBackedUavWrites/ComputeToDirect"
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+name: D3D12 Quality Gates
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: self-macos-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          clean: false
+          submodules: true
+
+      - name: Prepare Toolchains
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
+          WINE_ACCESS_TOKEN: ${{ secrets.WINE_ACCESS_TOKEN }}
+        run: |
+          scripts/ci-self-hosted.sh setup-host
+          scripts/dxmt-builder bootstrap wine-x64
+          scripts/dxmt-builder build --profile gcc-x64-release-full tests-d3d12
+          python3 -m venv .cache/d3d12-coverage-venv
+          .cache/d3d12-coverage-venv/bin/python -m pip install gcovr
+
+      - name: Enforce Coverage Gates
+        run: |
+          DXMT_COVERAGE_PYTHON=.cache/d3d12-coverage-venv/bin/python \
+            scripts/run-d3d12-coverage.sh gcc-x64-release-full
+
+      - name: Upload Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d12-coverage
+          path: .cache/managed/profiles/gcc-x64-release-full/coverage-report
+
+  mutation:
+    runs-on: self-macos-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          clean: false
+          submodules: true
+
+      - name: Prepare Toolchains
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
+          WINE_ACCESS_TOKEN: ${{ secrets.WINE_ACCESS_TOKEN }}
+        run: |
+          scripts/ci-self-hosted.sh setup-host
+          scripts/dxmt-builder bootstrap wine-x64
+          scripts/dxmt-builder build --profile gcc-x64-release-full tests-d3d12
+
+      - name: Enforce Mutation Score
+        run: python3 scripts/run-d3d12-mutations.py --minimum-score 100
