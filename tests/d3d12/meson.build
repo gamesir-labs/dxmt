@@ -20,6 +20,7 @@ d3d12_runtime_support_dep = declare_dependency(
 d3d12_unit_suites = {
   'device': {
     'sources': files(
+      'device/agility_core_spec.cpp',
       'device/device_spec.cpp',
     ),
   },
@@ -73,6 +74,8 @@ d3d12_unit_suites = {
       'graphics/depth_stencil_spec.cpp',
       'graphics/input_assembler_spec.cpp',
       'graphics/output_merger_spec.cpp',
+      'graphics/rasterization_execution_spec.cpp',
+      'graphics/render_pass_execution_spec.cpp',
       'graphics/render_pass_validation_spec.cpp',
       'graphics/viewport_scissor_spec.cpp',
     ),
@@ -158,8 +161,10 @@ d3d12_unit_suites = {
   'shader': {
     'sources': files(
       'shader/container_corruption_spec.cpp',
+      'shader/resource_semantic_spec.cpp',
       'shader/semantic_matrix_spec.cpp',
       'shader/wave_spec.cpp',
+      'shader/wave_semantic_matrix_spec.cpp',
     ),
   },
   'sparse-resource': {

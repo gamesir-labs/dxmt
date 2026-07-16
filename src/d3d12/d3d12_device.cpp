@@ -68,6 +68,12 @@ const bool kTestForceNativeCbvStaleResourceTableEntry = [] {
 std::atomic<uint64_t> g_test_resource_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_descriptor_heap_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_compute_pipeline_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_command_queue_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_graphics_pipeline_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_heap_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_root_signature_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_fence_creation_occurrence = 0;
+std::atomic<uint64_t> g_test_query_heap_creation_occurrence = 0;
 
 static bool
 ShouldInjectCreationFailure(const char *environment_name,
@@ -2783,6 +2789,12 @@ public:
   HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *desc,
                                                REFIID riid, void **command_queue) override {
     InitReturnPtr(command_queue);
+    if (!command_queue)
+      return E_POINTER;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT",
+            g_test_command_queue_creation_occurrence))
+      return E_OUTOFMEMORY;
     auto hr = d3d12::CreateCommandQueue(
         static_cast<IMTLD3D12Device *>(this), desc, riid, command_queue);
     if (dxmt::apitrace::d3d_enabled()) {
@@ -2831,6 +2843,12 @@ public:
     dxmt::perf::ScopedFrameTimer perf_timer(
         dxmt::perf::FrameTimeBucket::CreatePipeline);
     InitReturnPtr(pipeline_state);
+    if (!pipeline_state)
+      return E_POINTER;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT",
+            g_test_graphics_pipeline_creation_occurrence))
+      return E_OUTOFMEMORY;
     HRESULT status = S_OK;
     auto state = d3d12::CreateGraphicsPipelineState(
         static_cast<IMTLD3D12Device *>(this), desc, &status);
@@ -3498,6 +3516,10 @@ public:
     InitReturnPtr(root_signature);
     if (!root_signature)
       return E_POINTER;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT",
+            g_test_root_signature_creation_occurrence))
+      return E_OUTOFMEMORY;
     if (node_mask > 1 || (!bytecode && bytecode_length))
       return WARN_E_INVALIDARG(__func__);
 
@@ -3990,6 +4012,9 @@ public:
     InitReturnPtr(heap);
     if (!heap)
       return E_POINTER;
+    if (ShouldInjectCreationFailure("DXMT_TEST_FAIL_HEAP_CREATION_AT",
+                                    g_test_heap_creation_occurrence))
+      return E_OUTOFMEMORY;
     if (!IsValidHeapDesc(desc))
       return WARN_E_INVALIDARG(__func__);
 
@@ -4475,6 +4500,9 @@ public:
     InitReturnPtr(fence);
     if (!fence)
       return S_FALSE;
+    if (ShouldInjectCreationFailure("DXMT_TEST_FAIL_FENCE_CREATION_AT",
+                                    g_test_fence_creation_occurrence))
+      return E_OUTOFMEMORY;
     if (flags & ~D3D12_FENCE_FLAG_SHARED) {
       WARN("D3D12Device::CreateFence: unsupported fence flags ", flags);
       return E_NOTIMPL;
@@ -4510,6 +4538,10 @@ public:
       InitReturnPtr(heap);
       if (!heap)
         return E_POINTER;
+      if (ShouldInjectCreationFailure(
+              "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT",
+              g_test_query_heap_creation_occurrence))
+        return E_OUTOFMEMORY;
       if (!desc || desc->Count == 0 || desc->NodeMask > 1)
         return WARN_E_INVALIDARG(__func__);
 

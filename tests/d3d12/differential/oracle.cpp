@@ -348,7 +348,8 @@ bool RunComputeCase(OracleContext &context,
 bool RunDescriptorTableCase(
     OracleContext &context,
     const std::array<std::uint32_t, kValueCount> &input,
-    std::vector<std::uint32_t> *result) {
+    std::vector<std::uint32_t> *result,
+    bool overwrite_after_recording = false) {
   constexpr std::string_view source = R"(
     ByteAddressBuffer input : register(t0);
     RWByteAddressBuffer output : register(u0);
@@ -405,6 +406,12 @@ bool RunDescriptorTableCase(
     return false;
 
   auto upload = context.CreateUpload(input);
+  std::array<std::uint32_t, kValueCount> replacement_values = {};
+  for (UINT index = 0; index < replacement_values.size(); ++index)
+    replacement_values[index] = input[index] ^ (0xf00d0000u + index * 31u);
+  auto replacement_upload = overwrite_after_recording
+                                ? context.CreateUpload(replacement_values)
+                                : ComPtr<ID3D12Resource>();
   auto output = context.CreateBuffer(
       sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -417,7 +424,8 @@ bool RunDescriptorTableCase(
   heap_desc.NumDescriptors = 2;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> heap;
-  if (!upload || !output || !readback ||
+  if (!upload || (overwrite_after_recording && !replacement_upload) ||
+      !output || !readback ||
       !Check(context.device()->CreateDescriptorHeap(
                  &heap_desc, IID_PPV_ARGS(heap.put())),
              "CreateDescriptorHeap(descriptor table)"))
@@ -426,6 +434,7 @@ bool RunDescriptorTableCase(
   const UINT increment = context.device()->GetDescriptorHandleIncrementSize(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  const auto srv_cpu = cpu;
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = DXGI_FORMAT_R32_TYPELESS;
   srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -449,6 +458,9 @@ bool RunDescriptorTableCase(
   context.list()->SetComputeRootDescriptorTable(
       0, heap->GetGPUDescriptorHandleForHeapStart());
   context.list()->Dispatch(1, 1, 1);
+  if (overwrite_after_recording)
+    context.device()->CreateShaderResourceView(replacement_upload.get(), &srv,
+                                                srv_cpu);
   Transition(context.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
              D3D12_RESOURCE_STATE_COPY_SOURCE);
   context.list()->CopyBufferRegion(readback.get(), 0, output.get(), 0,
@@ -457,6 +469,64 @@ bool RunDescriptorTableCase(
     return false;
   *result = context.Readback(readback.get(), kValueCount);
   return result->size() == kValueCount;
+}
+
+bool RunInvalidDescriptorHeapCase(OracleContext &context,
+                                  std::vector<std::uint32_t> *result) {
+  D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  desc.NumDescriptors = 0;
+  void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
+  const HRESULT hr = context.device()->CreateDescriptorHeap(
+      &desc, __uuidof(ID3D12DescriptorHeap), &output);
+  *result = {static_cast<std::uint32_t>(hr), output == nullptr ? 1u : 0u};
+  return FAILED(hr) && output == nullptr;
+}
+
+bool RunInvalidResourceCase(OracleContext &context,
+                            std::vector<std::uint32_t> *result) {
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = 0;
+  desc.Height = 1;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
+  const HRESULT hr = context.device()->CreateCommittedResource(
+      &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+      nullptr, __uuidof(ID3D12Resource), &output);
+  *result = {static_cast<std::uint32_t>(hr), output == nullptr ? 1u : 0u};
+  return FAILED(hr) && output == nullptr;
+}
+
+bool RunInvalidRootSignatureCase(OracleContext &context,
+                                 std::vector<std::uint32_t> *result) {
+  constexpr std::array<std::uint8_t, 16> invalid_bytecode = {};
+  void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
+  const HRESULT hr = context.device()->CreateRootSignature(
+      0, invalid_bytecode.data(), invalid_bytecode.size(),
+      __uuidof(ID3D12RootSignature), &output);
+  *result = {static_cast<std::uint32_t>(hr), output == nullptr ? 1u : 0u};
+  return FAILED(hr) && output == nullptr;
+}
+
+bool RunUnsupportedIidCase(OracleContext &context,
+                           std::vector<std::uint32_t> *result) {
+  D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  desc.NumDescriptors = 1;
+  constexpr GUID unsupported_iid = {
+      0x9b3b8f8a, 0x1468, 0x4ea7,
+      {0x92, 0xe4, 0x55, 0xe8, 0xa5, 0xf8, 0xe1, 0x3c}};
+  void *output = reinterpret_cast<void *>(static_cast<std::uintptr_t>(1));
+  const HRESULT hr =
+      context.device()->CreateDescriptorHeap(&desc, unsupported_iid, &output);
+  *result = {static_cast<std::uint32_t>(hr), output == nullptr ? 1u : 0u};
+  return FAILED(hr) && output == nullptr;
 }
 
 bool RunClearCase(OracleContext &context,
@@ -589,6 +659,11 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> offset_copy;
   std::vector<std::uint32_t> compute;
   std::vector<std::uint32_t> descriptor_table;
+  std::vector<std::uint32_t> descriptor_overwrite;
+  std::vector<std::uint32_t> invalid_descriptor_heap;
+  std::vector<std::uint32_t> invalid_resource;
+  std::vector<std::uint32_t> invalid_root_signature;
+  std::vector<std::uint32_t> unsupported_iid;
   std::vector<std::uint32_t> clear;
   std::vector<std::uint32_t> clear_rect;
   if (!RunCopyCase(context, input, &copy)) {
@@ -605,6 +680,26 @@ int main(int argc, char **argv) {
   }
   if (!RunDescriptorTableCase(context, input, &descriptor_table)) {
     std::cerr << "descriptor_table_compute case failed\n";
+    return 1;
+  }
+  if (!RunDescriptorTableCase(context, input, &descriptor_overwrite, true)) {
+    std::cerr << "descriptor_overwrite_before_submit case failed\n";
+    return 1;
+  }
+  if (!RunInvalidDescriptorHeapCase(context, &invalid_descriptor_heap)) {
+    std::cerr << "invalid_descriptor_heap case failed\n";
+    return 1;
+  }
+  if (!RunInvalidResourceCase(context, &invalid_resource)) {
+    std::cerr << "invalid_resource case failed\n";
+    return 1;
+  }
+  if (!RunInvalidRootSignatureCase(context, &invalid_root_signature)) {
+    std::cerr << "invalid_root_signature case failed\n";
+    return 1;
+  }
+  if (!RunUnsupportedIidCase(context, &unsupported_iid)) {
+    std::cerr << "unsupported_iid case failed\n";
     return 1;
   }
   if (!RunClearCase(context, &clear, false)) {
@@ -638,6 +733,14 @@ int main(int argc, char **argv) {
   WriteValues(*output, "buffer_copy_offset", offset_copy, true);
   WriteValues(*output, "compute_u32", compute, true);
   WriteValues(*output, "descriptor_table_compute", descriptor_table, true);
+  WriteValues(*output, "descriptor_overwrite_before_submit",
+              descriptor_overwrite, true);
+  WriteValues(*output, "invalid_descriptor_heap", invalid_descriptor_heap,
+              true);
+  WriteValues(*output, "invalid_resource", invalid_resource, true);
+  WriteValues(*output, "invalid_root_signature", invalid_root_signature,
+              true);
+  WriteValues(*output, "unsupported_iid", unsupported_iid, true);
   WriteValues(*output, "clear_rgba8", clear, true);
   WriteValues(*output, "clear_rect_rgba8", clear_rect, false);
   *output << "  }\n}\n";

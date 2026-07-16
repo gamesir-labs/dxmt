@@ -5,6 +5,7 @@
       "object-and-device": {
         "globs": [
           "src/d3d12/d3d12.cpp",
+          "src/d3d12/d3d12core.cpp",
           "src/d3d12/d3d12_device.cpp",
           "src/d3d12/d3d12_resource.cpp",
           "src/d3d12/d3d12_heap.cpp",
@@ -59,6 +60,42 @@
         "source_regex": "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT",
         "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
         "test_regex": "ComputePipelineFailureClearsOutputAndNextCallRecovers"
+      },
+      "command-queue-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "CommandQueueFailureClearsOutputAndNextCallRecovers"
+      },
+      "graphics-pipeline-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "GraphicsPipelineFailureClearsOutputAndNextCallRecovers"
+      },
+      "heap-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_HEAP_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "HeapFailureClearsOutputAndNextCallRecovers"
+      },
+      "root-signature-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "RootSignatureFailureClearsOutputAndNextCallRecovers"
+      },
+      "fence-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_FENCE_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "FenceFailureClearsOutputAndNextCallRecovers"
+      },
+      "query-heap-creation-oom": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT",
+        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
+        "test_regex": "QueryHeapFailureClearsOutputAndNextCallRecovers"
       },
       "invalid-command-recording-state": {
         "source_globs": ["src/d3d12/d3d12_command_list.cpp"],

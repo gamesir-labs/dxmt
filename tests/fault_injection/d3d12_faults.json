@@ -75,6 +75,90 @@
       "environment": {
         "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT": "2"
       }
+    },
+    {
+      "id": "command-queue-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.CommandQueueFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "command-queue-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.CommandQueueFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "graphics-pipeline-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.GraphicsPipelineFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "graphics-pipeline-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.GraphicsPipelineFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "heap-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.HeapFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_HEAP_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "heap-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.HeapFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_HEAP_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "root-signature-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.RootSignatureFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "root-signature-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.RootSignatureFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "fence-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.FenceFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_FENCE_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "fence-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.FenceFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_FENCE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "query-heap-creation-fail-first",
+      "filter": "D3D12CreationFaultInjectionSpec.QueryHeapFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT": "1"
+      }
+    },
+    {
+      "id": "query-heap-creation-fail-after-one",
+      "filter": "D3D12CreationFaultInjectionSpec.QueryHeapFailureClearsOutputAndNextCallRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT": "2"
+      }
     }
   ]
 }
