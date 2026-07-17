@@ -1836,7 +1836,7 @@ std::optional<Sha1Digest> BuildPersistentAirCacheKey(
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
     DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version) {
   Sha1HashState hash;
-  HashString(hash, "dxmt-d3d12-persistent-air-cache-v7");
+  HashString(hash, "dxmt-d3d12-persistent-air-cache-v8-legacy-ab");
   // Fold the DXMT build version into the key so the cache auto-invalidates
   // across clean commits and local dirty builds whenever airconv codegen could
   // have changed.

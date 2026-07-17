@@ -1,4 +1,5 @@
 #include "d3d12_dxgi_backend.hpp"
+#include <string>
 
 #include "dxmt_format.hpp"
 #include "dxmt_shader_cache.hpp"
@@ -88,9 +89,26 @@ void
 InitializeMetalCachePath() {
   if (env::getEnvVar("DXMT_USE_DEFAULT_METAL_CACHE") == "1")
     return;
-  auto metal_cache_path = dxmt::GetDXMTShaderCacheDirectory() + "com.apple.metal4";
-  if (!SetMetalCachePath(metal_cache_path.c_str()))
-    dxmt::Logger::info("Failed to set Metal4 cache path, fallback to system default");
+  // Prefer the DXMT shader-cache root itself. Appending com.apple.metal4 can
+  // make MTLGetShaderCachePath() report a different active path than we set,
+  // which previously forced every FH4 run onto the shared Wine system Metal
+  // cache under /var/folders/.../org.winehq.wine and poisoned commit A/B.
+  auto metal_cache_path = dxmt::GetDXMTShaderCacheDirectory();
+  if (metal_cache_path.empty())
+    return;
+  if (!SetMetalCachePath(metal_cache_path.c_str())) {
+    auto nested = metal_cache_path + "com.apple.metal4";
+    if (!SetMetalCachePath(nested.c_str()))
+      dxmt::Logger::warn(
+          std::string("Failed to set Metal4 cache path to ") + metal_cache_path +
+          " (and nested " + nested + "); Metal may use system default cache");
+    else
+      dxmt::Logger::info(std::string("Metal4 cache path set to nested ") +
+                         nested);
+  } else {
+    dxmt::Logger::info(std::string("Metal4 cache path set to ") +
+                       metal_cache_path);
+  }
 }
 
 dxmt::DxgiBackendProvider

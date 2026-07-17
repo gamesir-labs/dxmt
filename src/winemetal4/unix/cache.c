@@ -240,8 +240,21 @@ _WMT4SetMetalShaderCachePath(void *obj) {
     [path release];
     return 0;
   }
+  // Metal may rewrite the path (symlink expansion, trailing slash, or mapping
+  // onto a nested com.apple.metal* directory). Treat the set as successful when
+  // the active cache path is under our resolved root so FH4 A/B runs stop
+  // silently sharing /var/folders/.../org.winehq.wine system Metal caches.
   MTLSetShaderCachePath(resolved_path);
-  params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
+  NSString *active = MTLGetShaderCachePath();
+  BOOL exact = active && [active isEqualToString:resolved_path];
+  BOOL nested =
+      active && ([active hasPrefix:resolved_path] ||
+                 [resolved_path hasPrefix:active]);
+  params->ret_success = exact || nested ? 1 : 0;
+  if (!params->ret_success) {
+    NSLog(@"[WMT4] MTLSetShaderCachePath did not stick; requested=%@ active=%@",
+          resolved_path, active ? active : @"(nil)");
+  }
   [path release];
   return 0;
 };
