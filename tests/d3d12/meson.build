@@ -28,6 +28,7 @@ d3d12_unit_suites = {
     'sources': files(
       'object/com_identity_spec.cpp',
       'object/private_data_spec.cpp',
+      'object/shared_handle_spec.cpp',
     ),
   },
   'cache': {
@@ -120,6 +121,7 @@ d3d12_unit_suites = {
       'root_signature/root_descriptor_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
+      'root_signature/volatility_spec.cpp',
     ),
   },
   'robustness': {
@@ -161,6 +163,7 @@ d3d12_unit_suites = {
   },
   'resource': {
     'sources': files(
+      'resource/planar_format_spec.cpp',
       'resource/residency_spec.cpp',
       'resource/resource_spec.cpp',
       'resource/validation_memory_spec.cpp',

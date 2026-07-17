@@ -30,6 +30,8 @@ protected:
     Single,
     BarrierBetweenDraws,
     QueryAroundDraw,
+    IndexedAcrossBarrier,
+    PredicatedIndexed,
   };
 
   void
@@ -274,19 +276,53 @@ protected:
     context.list()->RSSetViewports(1, &viewport);
     context.list()->RSSetScissorRects(1, &scissor);
 
+    ComPtr<ID3D12Resource> index_buffer;
+    ComPtr<ID3D12Resource> predicate;
+    if (sequence == DrawSequence::IndexedAcrossBarrier ||
+        sequence == DrawSequence::PredicatedIndexed) {
+      constexpr std::array<std::uint16_t, 3> indices = {0, 1, 2};
+      index_buffer = context.CreateUploadBuffer(sizeof(indices), indices.data(),
+                                                sizeof(indices));
+      ASSERT_TRUE(index_buffer);
+      const D3D12_INDEX_BUFFER_VIEW view = {
+          index_buffer->GetGPUVirtualAddress(), sizeof(indices),
+          DXGI_FORMAT_R16_UINT};
+      context.list()->IASetIndexBuffer(&view);
+    }
+    if (sequence == DrawSequence::PredicatedIndexed) {
+      constexpr UINT64 execute = 0;
+      predicate = context.CreateUploadBuffer(sizeof(execute), &execute,
+                                             sizeof(execute));
+      ASSERT_TRUE(predicate);
+      context.list()->SetPredication(predicate.get(), 0,
+                                     D3D12_PREDICATION_OP_EQUAL_ZERO);
+    }
+
+    const auto draw = [&]() {
+      if (index_buffer)
+        context.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
+      else
+        context.list()->DrawInstanced(3, 1, 0, 0);
+    };
+
     if (sequence == DrawSequence::QueryAroundDraw) {
       context.list()->BeginQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION,
                                  0);
     }
-    context.list()->DrawInstanced(3, 1, 0, 0);
-    if (sequence == DrawSequence::BarrierBetweenDraws) {
+    draw();
+    if (sequence == DrawSequence::BarrierBetweenDraws ||
+        sequence == DrawSequence::IndexedAcrossBarrier) {
       D3D12TestContext::UavBarrier(context.list(), nullptr);
-      context.list()->DrawInstanced(3, 1, 0, 0);
+      draw();
     } else if (sequence == DrawSequence::QueryAroundDraw) {
       context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
       context.list()->ResolveQueryData(query_heap.get(),
                                        D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
                                        query_result.get(), 0);
+    }
+    if (sequence == DrawSequence::PredicatedIndexed) {
+      context.list()->SetPredication(nullptr, 0,
+                                     D3D12_PREDICATION_OP_EQUAL_ZERO);
     }
     D3D12TestContext::Transition(context.list(), target.get(),
                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -479,6 +515,26 @@ TEST_F(ExecutionPathBoundarySpec, PreservesQueryState) {
 
   EXPECT_GT(samples, 0ull);
   ExpectSolidColor(readback, 0x40404040);
+}
+
+TEST_F(ExecutionPathBoundarySpec, IndexedDrawPreservesStateAcrossBarrier) {
+  TextureReadback readback;
+  ASSERT_NO_FATAL_FAILURE(
+      RunAdditiveDraws(DrawSequence::IndexedAcrossBarrier, &readback));
+  ExpectSolidColor(readback, 0x80808080);
+}
+
+TEST_F(ExecutionPathBoundarySpec, PredicatedIndexedDrawMatchesDirectDraw) {
+  TextureReadback direct;
+  TextureReadback predicated;
+  ASSERT_NO_FATAL_FAILURE(RunAdditiveDraws(DrawSequence::Single, &direct));
+  ASSERT_NO_FATAL_FAILURE(
+      RunAdditiveDraws(DrawSequence::PredicatedIndexed, &predicated));
+  EXPECT_EQ(predicated.width, direct.width);
+  EXPECT_EQ(predicated.height, direct.height);
+  EXPECT_EQ(predicated.row_pitch, direct.row_pitch);
+  EXPECT_EQ(predicated.data, direct.data);
+  ExpectSolidColor(predicated, 0x40404040);
 }
 
 } // namespace

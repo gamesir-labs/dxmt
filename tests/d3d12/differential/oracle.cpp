@@ -653,6 +653,235 @@ bool RunClearCase(OracleContext &context, std::vector<std::uint32_t> *result,
   return true;
 }
 
+bool RunTextureCopyCase(OracleContext &context,
+                        std::vector<std::uint32_t> *result) {
+  constexpr UINT width = 4;
+  constexpr UINT height = 4;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  ComPtr<ID3D12Resource> texture;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                 IID_PPV_ARGS(texture.put())),
+             "CreateCommittedResource(texture copy)"))
+    return false;
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT rows = 0;
+  UINT64 row_size = 0;
+  UINT64 total_size = 0;
+  context.device()->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows,
+                                          &row_size, &total_size);
+  auto upload = context.CreateBuffer(total_size, D3D12_HEAP_TYPE_UPLOAD,
+                                     D3D12_RESOURCE_FLAG_NONE,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto readback = context.CreateBuffer(total_size, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!upload || !readback)
+    return false;
+  std::array<std::uint32_t, width *height> expected = {};
+  for (UINT index = 0; index < expected.size(); ++index)
+    expected[index] = 0xff000000u | ((index * 37u) << 16) |
+                      ((index * 19u) << 8) | (index * 11u);
+  void *mapping = nullptr;
+  const D3D12_RANGE no_read = {};
+  if (!Check(upload->Map(0, &no_read, &mapping), "Map(texture upload)"))
+    return false;
+  for (UINT row = 0; row < height; ++row) {
+    std::memcpy(static_cast<std::uint8_t *>(mapping) + footprint.Offset +
+                    row * footprint.Footprint.RowPitch,
+                expected.data() + row * width, width * sizeof(std::uint32_t));
+  }
+  const D3D12_RANGE written = {0, static_cast<SIZE_T>(total_size)};
+  upload->Unmap(0, &written);
+
+  D3D12_TEXTURE_COPY_LOCATION buffer_location = {};
+  buffer_location.pResource = upload.get();
+  buffer_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  buffer_location.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION texture_location = {};
+  texture_location.pResource = texture.get();
+  texture_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  context.list()->CopyTextureRegion(&texture_location, 0, 0, 0,
+                                    &buffer_location, nullptr);
+  Transition(context.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  buffer_location.pResource = readback.get();
+  context.list()->CopyTextureRegion(&buffer_location, 0, 0, 0,
+                                    &texture_location, nullptr);
+  if (!context.ExecuteAndReset())
+    return false;
+
+  const D3D12_RANGE read = {0, static_cast<SIZE_T>(total_size)};
+  if (!Check(readback->Map(0, &read, &mapping), "Map(texture copy readback)"))
+    return false;
+  result->resize(width * height);
+  for (UINT row = 0; row < height; ++row) {
+    std::memcpy(result->data() + row * width,
+                static_cast<const std::uint8_t *>(mapping) + footprint.Offset +
+                    row * footprint.Footprint.RowPitch,
+                width * sizeof(std::uint32_t));
+  }
+  const D3D12_RANGE no_write = {};
+  readback->Unmap(0, &no_write);
+  return *result ==
+         std::vector<std::uint32_t>(expected.begin(), expected.end());
+}
+
+bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result) {
+  constexpr std::string_view vertex_source = R"(
+    struct Output { float4 position : SV_Position; };
+    Output main(uint id : SV_VertexID) {
+      float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      Output output;
+      output.position = float4(positions[id], 0.0, 1.0);
+      return output;
+    }
+  )";
+  constexpr std::string_view pixel_source = R"(
+    float4 main() : SV_Target { return float4(0.125, 0.5, 0.875, 1.0); }
+  )";
+  ComPtr<ID3DBlob> vertex;
+  ComPtr<ID3DBlob> pixel;
+  ComPtr<ID3DBlob> diagnostics;
+  if (!Check(D3DCompile(vertex_source.data(), vertex_source.size(), nullptr,
+                        nullptr, nullptr, "main", "vs_5_0",
+                        D3DCOMPILE_ENABLE_STRICTNESS, 0, vertex.put(),
+                        diagnostics.put()),
+             "D3DCompile(draw vertex)") ||
+      !Check(D3DCompile(pixel_source.data(), pixel_source.size(), nullptr,
+                        nullptr, nullptr, "main", "ps_5_0",
+                        D3DCOMPILE_ENABLE_STRICTNESS, 0, pixel.put(),
+                        diagnostics.put()),
+             "D3DCompile(draw pixel)"))
+    return false;
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ComPtr<ID3DBlob> root_blob;
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
+             "D3D12SerializeRootSignature(draw)"))
+    return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(context.device()->CreateRootSignature(
+                 0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                 IID_PPV_ARGS(root.put())),
+             "CreateRootSignature(draw)"))
+    return false;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root.get();
+  pipeline_desc.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+  pipeline_desc.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+  pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pipeline_desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  if (!Check(context.device()->CreateGraphicsPipelineState(
+                 &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
+             "CreateGraphicsPipelineState(draw)"))
+    return false;
+
+  constexpr UINT width = 4;
+  constexpr UINT height = 4;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  ComPtr<ID3D12Resource> target;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                 IID_PPV_ARGS(target.put())),
+             "CreateCommittedResource(draw target)"))
+    return false;
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  heap_desc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap;
+  if (!Check(context.device()->CreateDescriptorHeap(
+                 &heap_desc, IID_PPV_ARGS(rtv_heap.put())),
+             "CreateDescriptorHeap(draw RTV)"))
+    return false;
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT64 total_size = 0;
+  context.device()->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr,
+                                          nullptr, &total_size);
+  auto readback = context.CreateBuffer(total_size, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!readback)
+    return false;
+
+  constexpr FLOAT clear[4] = {};
+  context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context.list()->SetGraphicsRootSignature(root.get());
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, width, height, 0, 1};
+  const D3D12_RECT scissor = {0, 0, width, height};
+  context.list()->RSSetViewports(1, &viewport);
+  context.list()->RSSetScissorRects(1, &scissor);
+  context.list()->DrawInstanced(3, 1, 0, 0);
+  Transition(context.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = target.get();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = readback.get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  context.list()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+  if (!context.ExecuteAndReset())
+    return false;
+  void *mapping = nullptr;
+  const D3D12_RANGE read = {0, static_cast<SIZE_T>(total_size)};
+  if (!Check(readback->Map(0, &read, &mapping), "Map(draw readback)"))
+    return false;
+  result->resize(width * height);
+  for (UINT row = 0; row < height; ++row) {
+    std::memcpy(result->data() + row * width,
+                static_cast<const std::uint8_t *>(mapping) + footprint.Offset +
+                    row * footprint.Footprint.RowPitch,
+                width * sizeof(std::uint32_t));
+  }
+  const D3D12_RANGE no_write = {};
+  readback->Unmap(0, &no_write);
+  return true;
+}
+
 void WriteValues(std::ostream &output, std::string_view name,
                  const std::vector<std::uint32_t> &values, bool trailing) {
   output << "    \"" << name
@@ -707,6 +936,8 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> unsupported_iid;
   std::vector<std::uint32_t> clear;
   std::vector<std::uint32_t> clear_rect;
+  std::vector<std::uint32_t> texture_copy;
+  std::vector<std::uint32_t> draw;
   if (!RunCopyCase(context, input, &copy)) {
     std::cerr << "buffer_copy case failed\n";
     return 1;
@@ -759,6 +990,14 @@ int main(int argc, char **argv) {
     std::cerr << "clear_rect_rgba8 case failed\n";
     return 1;
   }
+  if (!RunTextureCopyCase(context, &texture_copy)) {
+    std::cerr << "texture_copy_rgba8 case failed\n";
+    return 1;
+  }
+  if (!RunDrawCase(context, &draw)) {
+    std::cerr << "draw_fullscreen_rgba8 case failed\n";
+    return 1;
+  }
 
   std::ofstream output_file;
   std::ostream *output = &std::cout;
@@ -791,7 +1030,9 @@ int main(int argc, char **argv) {
   WriteValues(*output, "invalid_root_signature", invalid_root_signature, true);
   WriteValues(*output, "unsupported_iid", unsupported_iid, true);
   WriteValues(*output, "clear_rgba8", clear, true);
-  WriteValues(*output, "clear_rect_rgba8", clear_rect, false);
+  WriteValues(*output, "clear_rect_rgba8", clear_rect, true);
+  WriteValues(*output, "texture_copy_rgba8", texture_copy, true);
+  WriteValues(*output, "draw_fullscreen_rgba8", draw, false);
   *output << "  }\n}\n";
   return *output ? 0 : 1;
 }

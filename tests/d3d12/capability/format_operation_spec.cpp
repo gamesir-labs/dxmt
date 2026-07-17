@@ -262,4 +262,95 @@ TEST_F(FeatureCoherenceSpec, EveryAdvertisedFormatOperationExecutes) {
   EXPECT_GT(executed, 0u);
 }
 
+TEST_F(FeatureCoherenceSpec,
+       EveryEnumeratedFormatReportsInternallyCoherentCapabilities) {
+  UINT queried = 0;
+  for (UINT value = DXGI_FORMAT_R32G32B32A32_TYPELESS;
+       value <= DXGI_FORMAT_V408; ++value) {
+    const auto format = static_cast<DXGI_FORMAT>(value);
+    SCOPED_TRACE(::testing::Message() << "format=" << value);
+    const auto support = Support(format);
+    const auto texture_dimensions =
+        D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+        D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE;
+    if (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) {
+      EXPECT_NE(support.Support1 & texture_dimensions, 0u);
+    }
+    if (support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) {
+      EXPECT_NE(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET, 0u);
+    }
+    if (support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE) {
+      EXPECT_NE(support.Support1 &
+                    D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET,
+                0u);
+    }
+    if (support.Support2 & (D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+                            D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+      EXPECT_NE(support.Support1 &
+                    D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+                0u);
+    }
+    ++queried;
+  }
+  EXPECT_EQ(queried, static_cast<UINT>(DXGI_FORMAT_V408));
+}
+
+TEST_F(FeatureCoherenceSpec,
+       EveryAdvertisedTexture2DFormatCreatesAndHasCopyableFootprint) {
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  UINT advertised = 0;
+  UINT unsupported = 0;
+  for (UINT value = DXGI_FORMAT_R32G32B32A32_TYPELESS;
+       value <= DXGI_FORMAT_V408; ++value) {
+    const auto format = static_cast<DXGI_FORMAT>(value);
+    SCOPED_TRACE(::testing::Message() << "format=" << value);
+    const auto support = Support(format);
+    if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D)) {
+      ++unsupported;
+      continue;
+    }
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 8;
+    desc.Height = 8;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    ComPtr<ID3D12Resource> texture;
+    const HRESULT result = context_.device()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(texture.put()));
+
+    ASSERT_EQ(result, S_OK);
+    ASSERT_TRUE(texture);
+    D3D12_FEATURE_DATA_FORMAT_INFO info = {};
+    info.Format = format;
+    ASSERT_EQ(context_.device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,
+                                                     &info, sizeof(info)),
+              S_OK);
+    ASSERT_GT(info.PlaneCount, 0u);
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(info.PlaneCount);
+    std::vector<UINT> rows(info.PlaneCount);
+    std::vector<UINT64> row_sizes(info.PlaneCount);
+    UINT64 total_size = 0;
+    context_.device()->GetCopyableFootprints(&desc, 0, info.PlaneCount, 0,
+                                             footprints.data(), rows.data(),
+                                             row_sizes.data(), &total_size);
+    EXPECT_NE(total_size, 0u);
+    EXPECT_NE(total_size, UINT64_MAX);
+    for (UINT plane = 0; plane < info.PlaneCount; ++plane) {
+      EXPECT_NE(footprints[plane].Offset, UINT64_MAX);
+      EXPECT_GT(footprints[plane].Footprint.Width, 0u);
+      EXPECT_GT(footprints[plane].Footprint.Height, 0u);
+      EXPECT_GT(rows[plane], 0u);
+      EXPECT_GT(row_sizes[plane], 0u);
+    }
+    ++advertised;
+  }
+  EXPECT_GT(advertised, 0u);
+  EXPECT_GT(unsupported, 0u);
+}
+
 } // namespace

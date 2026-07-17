@@ -19,10 +19,12 @@ REQUIRED_CASES = {
     "compute_u32",
     "descriptor_overwrite_before_submit",
     "descriptor_table_compute",
+    "draw_fullscreen_rgba8",
     "invalid_descriptor_heap",
     "invalid_resource",
     "invalid_root_signature",
     "predicated_compute_true",
+    "texture_copy_rgba8",
     "unsupported_iid",
 }
 MICROSOFT_VENDOR_ID = 0x1414
