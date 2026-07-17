@@ -203,6 +203,9 @@ jobs:
       short_sha: ${{ steps.version.outputs.short_sha }}
       package_name: ${{ steps.version.outputs.package_name }}
       artifact_name: ${{ steps.version.outputs.artifact_name }}
+      package_size: ${{ steps.package-metadata.outputs.package_size }}
+      package_sha256: ${{ steps.package-metadata.outputs.package_sha256 }}
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
     steps:
       - name: Disable residual sparse-checkout
         # Self-hosted workspaces with clean:false can keep a previous job's
@@ -328,6 +331,25 @@ jobs:
             echo "reason=skipped_on_push_nightly"
           } > "${package_file}.builder-metadata"
 
+      - name: Compute Component Package Metadata
+        id: package-metadata
+        run: |
+          package_file="${{ steps.version.outputs.package_file }}"
+          package_size="$(wc -c < "${package_file}" | tr -d '[:space:]')"
+          package_sha256="$(awk 'NR == 1 { print $1 }' "${package_file}.sha256")"
+          [[ "${package_size}" =~ ^[0-9]+$ ]] || {
+            echo "::error::invalid package size: ${package_size}"
+            exit 1
+          }
+          [[ "${package_sha256}" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::invalid package SHA256: ${package_sha256}"
+            exit 1
+          }
+          {
+            echo "package_size=${package_size}"
+            echo "package_sha256=${package_sha256}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Stage Nightly Package
         run: |
           scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.artifact_name }}" \
@@ -336,6 +358,7 @@ jobs:
             "${{ steps.version.outputs.package_file }}.builder-metadata"
 
       - name: Upload Nightly Package
+        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.version.outputs.artifact_name }}
@@ -427,13 +450,14 @@ jobs:
           chmod +x .github/scripts/ci-feishu.sh
           run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
           md="$(printf '%s\n' \
-            "**$(.github/scripts/ci-feishu.sh label pkg_name):** ${{ needs.package.outputs.package_name }}" \
-            "**Artifact:** \`${{ needs.package.outputs.artifact_name }}\`" \
-            "**$(.github/scripts/ci-feishu.sh label version_sha):** \`${{ needs.package.outputs.short_sha }}\`" \
-            "**$(.github/scripts/ci-feishu.sh label branch):** ${{ github.ref_name }}" \
+            "**$(.github/scripts/ci-feishu.sh label version):** ${{ needs.package.outputs.package_name }}" \
             "**$(.github/scripts/ci-feishu.sh label commit):** \`${{ github.sha }}\`" \
+            "**$(.github/scripts/ci-feishu.sh label branch):** ${{ github.ref_name }}" \
             "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
-            "**$(.github/scripts/ci-feishu.sh label note):** $(.github/scripts/ci-feishu.sh label nightly_note)" \
+            "" \
+            "**📦 $(.github/scripts/ci-feishu.sh label component_package):** ${{ needs.package.outputs.artifact_url }}" \
+            "**$(.github/scripts/ci-feishu.sh label size):** ${{ needs.package.outputs.package_size }} bytes" \
+            "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`" \
             "" \
             "**$(.github/scripts/ci-feishu.sh label run_link):** [$(.github/scripts/ci-feishu.sh label view_detail)](${run_url})")"
           .github/scripts/ci-feishu.sh send-card-v1 \

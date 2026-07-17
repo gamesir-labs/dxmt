@@ -24,6 +24,9 @@ label() {
     branch) printf '%s' '分支' ;;
     commit) printf '%s' '提交' ;;
     author) printf '%s' '提交者' ;;
+    version) printf '%s' '版本' ;;
+    component_package) printf '%s' '组件包' ;;
+    size) printf '%s' '大小' ;;
     failed_jobs) printf '%s' '失败任务' ;;
     run_link) printf '%s' '运行链接' ;;
     view_detail) printf '%s' '查看详情' ;;
