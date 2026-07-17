@@ -26,6 +26,9 @@ enum class WaveSemantic {
   FirstLaneActiveSum,
   ActiveProduct,
   PrefixProduct,
+  QuadReadAcrossX,
+  QuadReadAcrossY,
+  QuadReadAcrossDiagonal,
 };
 
 struct WaveSemanticCase {
@@ -33,6 +36,25 @@ struct WaveSemanticCase {
   WaveSemantic semantic;
   UINT word;
 };
+
+class ShaderWaveCapabilitySpec : public ::testing::Test {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+
+  D3D12TestContext context_;
+};
+
+TEST_F(ShaderWaveCapabilitySpec,
+       KeepsWaveMatchFailClosedBelowShaderModel65) {
+  D3D12_FEATURE_DATA_SHADER_MODEL shader_model = {
+      D3D_SHADER_MODEL_6_5,
+  };
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL, &shader_model,
+                sizeof(shader_model)),
+            S_OK);
+  EXPECT_LT(shader_model.HighestShaderModel, D3D_SHADER_MODEL_6_5);
+}
 
 class ShaderWaveSemanticMatrixSpec
     : public ::testing::TestWithParam<WaveSemanticCase> {
@@ -74,6 +96,12 @@ protected:
     case WaveSemantic::ActiveProduct:
     case WaveSemantic::PrefixProduct:
       return 1;
+    case WaveSemantic::QuadReadAcrossX:
+      return thread ^ 1u;
+    case WaveSemantic::QuadReadAcrossY:
+      return thread ^ 2u;
+    case WaveSemantic::QuadReadAcrossDiagonal:
+      return thread ^ 3u;
     }
     return 0;
   }
@@ -105,7 +133,7 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
   ASSERT_TRUE(pipeline);
 
   constexpr UINT kThreadCount = 32;
-  constexpr UINT kWordsPerThread = 16;
+  constexpr UINT kWordsPerThread = 19;
   constexpr UINT kBufferSize = kThreadCount * kWordsPerThread * sizeof(UINT);
   auto output =
       context_.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
@@ -178,7 +206,11 @@ INSTANTIATE_TEST_SUITE_P(
         WaveSemanticCase{"FirstLaneActiveSum", WaveSemantic::FirstLaneActiveSum,
                          13},
         WaveSemanticCase{"ActiveProduct", WaveSemantic::ActiveProduct, 14},
-        WaveSemanticCase{"PrefixProduct", WaveSemantic::PrefixProduct, 15}),
+        WaveSemanticCase{"PrefixProduct", WaveSemantic::PrefixProduct, 15},
+        WaveSemanticCase{"QuadReadAcrossX", WaveSemantic::QuadReadAcrossX, 16},
+        WaveSemanticCase{"QuadReadAcrossY", WaveSemantic::QuadReadAcrossY, 17},
+        WaveSemanticCase{"QuadReadAcrossDiagonal",
+                         WaveSemantic::QuadReadAcrossDiagonal, 18}),
     WaveSemanticCaseName);
 
 } // namespace
