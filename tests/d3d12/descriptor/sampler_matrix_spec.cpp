@@ -51,12 +51,33 @@ protected:
             input.SampleCmpLevelZero(input_sampler, uv, reference)));
       }
     )", "cs_5_0");
+    gradient_shader_ = CompileShader(R"(
+      Texture2D<float> input : register(t0);
+      SamplerState input_sampler : register(s0);
+      RWByteAddressBuffer output : register(u0);
+      cbuffer Parameters : register(b0) {
+        float2 uv;
+        float gradient;
+        uint output_index;
+      };
+
+      [numthreads(1, 1, 1)]
+      void main() {
+        output.Store(output_index * 4, asuint(input.SampleGrad(
+            input_sampler, uv, float2(gradient, 0.0f),
+            float2(0.0f, gradient))));
+      }
+    )", "cs_5_0");
     ASSERT_EQ(sample_shader_.result, S_OK) << sample_shader_.diagnostic_text();
     ASSERT_EQ(comparison_shader_.result, S_OK)
         << comparison_shader_.diagnostic_text();
+    ASSERT_EQ(gradient_shader_.result, S_OK)
+        << gradient_shader_.diagnostic_text();
     CreateDynamicPipeline(sample_shader_, &sample_root_, &sample_pipeline_);
     CreateDynamicPipeline(comparison_shader_, &comparison_root_,
                           &comparison_pipeline_);
+    CreateDynamicPipeline(gradient_shader_, &gradient_root_,
+                          &gradient_pipeline_);
   }
 
   void CreateDynamicPipeline(const dxmt::test::ShaderCompilation &shader,
@@ -193,7 +214,10 @@ protected:
     return result;
   }
 
-  float RunMipSample(const D3D12_SAMPLER_DESC &sampler, float lod) {
+  float RunMipSampleWithPipeline(const D3D12_SAMPLER_DESC &sampler,
+                                 float parameter,
+                                 ID3D12RootSignature *root,
+                                 ID3D12PipelineState *pipeline) {
     std::array<float, 16> mip0 = {};
     std::array<float, 4> mip1 = {};
     std::array<float, 1> mip2 = {};
@@ -231,15 +255,15 @@ protected:
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     ID3D12DescriptorHeap *heaps[] = {resources.get(), samplers.get()};
     context_.list()->SetDescriptorHeaps(2, heaps);
-    context_.list()->SetComputeRootSignature(sample_root_.get());
-    context_.list()->SetPipelineState(sample_pipeline_.get());
+    context_.list()->SetComputeRootSignature(root);
+    context_.list()->SetPipelineState(pipeline);
     context_.list()->SetComputeRootDescriptorTable(
         0, resources->GetGPUDescriptorHandleForHeapStart());
     context_.list()->SetComputeRootDescriptorTable(
         1, samplers->GetGPUDescriptorHandleForHeapStart());
     const UINT constants[] = {std::bit_cast<UINT>(0.5f),
                               std::bit_cast<UINT>(0.5f),
-                              std::bit_cast<UINT>(lod), 0};
+                              std::bit_cast<UINT>(parameter), 0};
     context_.list()->SetComputeRoot32BitConstants(2, 4, constants, 0);
     context_.list()->Dispatch(1, 1, 1);
     D3D12TestContext::Transition(
@@ -255,13 +279,27 @@ protected:
     return result;
   }
 
+  float RunMipSample(const D3D12_SAMPLER_DESC &sampler, float lod) {
+    return RunMipSampleWithPipeline(sampler, lod, sample_root_.get(),
+                                    sample_pipeline_.get());
+  }
+
+  float RunMipGradientSample(const D3D12_SAMPLER_DESC &sampler,
+                             float gradient) {
+    return RunMipSampleWithPipeline(sampler, gradient, gradient_root_.get(),
+                                    gradient_pipeline_.get());
+  }
+
   D3D12TestContext context_;
   dxmt::test::ShaderCompilation sample_shader_;
   dxmt::test::ShaderCompilation comparison_shader_;
+  dxmt::test::ShaderCompilation gradient_shader_;
   ComPtr<ID3D12RootSignature> sample_root_;
   ComPtr<ID3D12PipelineState> sample_pipeline_;
   ComPtr<ID3D12RootSignature> comparison_root_;
   ComPtr<ID3D12PipelineState> comparison_pipeline_;
+  ComPtr<ID3D12RootSignature> gradient_root_;
+  ComPtr<ID3D12PipelineState> gradient_pipeline_;
 };
 
 TEST_F(SamplerMatrixSpec, AddressModesSelectExpectedTexelsOrBorder) {
@@ -320,10 +358,27 @@ TEST_F(SamplerMatrixSpec, MinAndMaxLodClampExplicitSampling) {
   EXPECT_NEAR(RunMipSample(sampler, 2.0f), 1.0f, 1.0e-6f);
 }
 
-TEST_F(SamplerMatrixSpec, SamplerMipLodBiasDoesNotAlterExplicitLod) {
+TEST_F(SamplerMatrixSpec, SamplerMipLodBiasOffsetsExplicitLod) {
   auto sampler = PointSampler();
   sampler.MipLODBias = 2.0f;
-  EXPECT_NEAR(RunMipSample(sampler, 0.0f), 1.0f, 1.0e-6f);
+  EXPECT_NEAR(RunMipSample(sampler, 0.0f), 4.0f, 1.0e-6f);
+}
+
+TEST_F(SamplerMatrixSpec, ExplicitGradientsSelectMipLevel) {
+  const auto sampler = PointSampler();
+  EXPECT_NEAR(RunMipGradientSample(sampler, 1.0f / 4.0f), 1.0f,
+              1.0e-6f);
+  EXPECT_NEAR(RunMipGradientSample(sampler, 1.0f), 4.0f,
+              1.0e-6f);
+}
+
+TEST_F(SamplerMatrixSpec, SamplerMipLodBiasOffsetsGradientSelectedMip) {
+  auto sampler = PointSampler();
+  sampler.MipLODBias = 1.0f;
+  EXPECT_NEAR(RunMipGradientSample(sampler, 1.0f / 4.0f), 2.0f,
+              1.0e-6f);
+  EXPECT_NEAR(RunMipGradientSample(sampler, 1.0f / 2.0f), 4.0f,
+              1.0e-6f);
 }
 
 TEST_F(SamplerMatrixSpec, StaticAndDynamicSamplerProduceSameValue) {

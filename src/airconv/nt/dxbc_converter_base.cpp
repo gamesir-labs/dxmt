@@ -1678,6 +1678,7 @@ Converter::operator()(const InstSampleLOD &sample) {
   }
 
   llvm::Value *LOD = LoadOperand(sample.src_lod, kMaskComponentX);
+  LOD = ir.CreateFAdd(LOD, Sampler->Bias);
 
   auto [Value, Residency] =
       air.CreateSample(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_level{LOD});
@@ -1840,6 +1841,16 @@ Converter::operator()(const InstSampleDerivative &sample) {
   default:
     return;
   }
+
+  // D3D sampler MipLODBias is added to the LOD derived from the explicit
+  // gradients. Scaling both gradients by exp2(bias) applies the same shift
+  // while preserving their direction and anisotropic ratio.
+  auto BiasScale = air.CreateFPUnOp(AIRBuilder::exp2, Sampler->Bias);
+  if (auto *GradientType = llvm::dyn_cast<llvm::FixedVectorType>(DDX->getType())) {
+    BiasScale = VectorSplat(GradientType->getNumElements(), BiasScale);
+  }
+  DDX = ir.CreateFMul(DDX, BiasScale);
+  DDY = ir.CreateFMul(DDY, BiasScale);
 
   auto [Value, Residency] = air.CreateSampleGrad(
       Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, DDX, DDY, MinLODClamp, sample.offsets

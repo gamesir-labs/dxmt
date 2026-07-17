@@ -105,6 +105,7 @@ MarkerEventSpec.MarkersDoNotChangeExecutionOrCommandListState
 第九轮：4 个 pipeline cache invalidation/stability case，manifest 保持 165
 第十轮：3 个 pixel depth-output system-value case，manifest 保持 165
 第十一轮：3 个 structured UAV counter/append/decrement case，manifest 保持 165
+第十二轮：2 个 SampleGrad case，并纠正 SampleLevel bias contract，manifest 保持 165
 GetCustomHeapProperties：修正并覆盖 CUSTOM type、UMA page/pool 和 NodeMask
 OpenExistingHeapFromAddress：覆盖有效 VirtualAlloc -> placed buffer -> GPU copy
 OpenExistingHeapFromFileMapping / CreateLifetimeTracker：覆盖 fail-closed 和输出清空
@@ -432,6 +433,18 @@ precise/no-contraction；16-bit、64-bit 和 min precision 按 capability gate
 ```
 
 oracle 采用 exact integer、ULP、分类结果和 DXBC/DXIL metamorphic，不能对所有浮点格式统一使用固定 epsilon。
+
+第十二轮在 `descriptor/sampler_matrix_spec.cpp` 新增 2 个确定性离屏
+compute case：`SampleGrad` 用显式 DDX/DDY 在 3 级 mip 链中选择 mip0/mip2；
+同一梯度在动态 sampler `MipLODBias=1` 时分别偏移到 mip1/mip2。同时根据
+Direct3D 11.3 Functional Specification 对 `sample_l` 的明确要求，纠正原先
+“显式 LOD 忽略 bias”的错误 contract，验证 `SampleLevel` 的 LOD 0 加 bias 2
+后选择 mip2。实现侧为 DXBC `sample_l` 加入 sampler bias，并在 `sample_d`
+提交 Metal 前用 `exp2(bias)` 等比缩放 DDX/DDY，保持梯度方向和各向异性比例。
+三个目标 contract 及 MinLOD/MaxLOD、address-mode 相关回归均逐个通过。
+持久 AIR cache key 已包含 DXMT build version；本地 dirty build 验证 converter
+变化时需使用 `DXMT_SHADER_CACHE=0` 避免复用旧 AIR。尚待补齐 `SampleBias`、
+RGBA gather、`GatherCmp`、immediate/programmable offset，以及更多 texture shape。
 
 ### P1-4. Graphics Fixed-Function 边界
 
