@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
 
@@ -9,6 +10,7 @@
 
 namespace {
 
+using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 
@@ -40,6 +42,60 @@ void ExpectCopyExecution(D3D12TestContext &context) {
   ASSERT_EQ(actual.size(), sizeof(expected));
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
   EXPECT_EQ(context.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+enum class AtomicCopyWidth {
+  Uint32,
+  Uint64,
+};
+
+void ExpectAtomicCopyFailureAndSameDeviceRecovery(D3D12TestContext &context,
+                                                  AtomicCopyWidth width) {
+  ComPtr<ID3D12GraphicsCommandList1> list1;
+  ASSERT_EQ(context.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList1),
+                reinterpret_cast<void **>(list1.put())),
+            S_OK);
+  ASSERT_TRUE(list1);
+
+  constexpr std::array<std::uint64_t, 4> data = {
+      0x1020304050607080ull, 0x90a0b0c0d0e0f001ull,
+      0x13579bdf2468ace0ull, 0xfeedc0de0badf00dull};
+  auto source = context.CreateUploadBuffer(sizeof(data), data.data(),
+                                           sizeof(data));
+  auto destination = context.CreateBuffer(
+      sizeof(data), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto dependent = context.CreateBuffer(
+      sizeof(data), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+  ASSERT_TRUE(dependent);
+
+  ID3D12Resource *dependent_resources[] = {dependent.get()};
+  const UINT64 element_size = width == AtomicCopyWidth::Uint32
+                                  ? sizeof(std::uint32_t)
+                                  : sizeof(std::uint64_t);
+  D3D12_SUBRESOURCE_RANGE_UINT64 dependent_ranges[] = {
+      {0, {0, element_size}}};
+  if (width == AtomicCopyWidth::Uint32) {
+    list1->AtomicCopyBufferUINT(destination.get(), 0, source.get(), 0, 1,
+                                dependent_resources, dependent_ranges);
+  } else {
+    list1->AtomicCopyBufferUINT64(destination.get(), 0, source.get(), 0, 1,
+                                  dependent_resources, dependent_ranges);
+  }
+
+  EXPECT_EQ(list1->Close(), E_NOTIMPL);
+  EXPECT_EQ(list1->Reset(context.allocator(), nullptr), E_FAIL);
+  EXPECT_EQ(context.device()->GetDeviceRemovedReason(), S_OK);
+
+  D3D12TestContext recovered;
+  ASSERT_EQ(recovered.Initialize(context.device()), S_OK);
+  ExpectCopyExecution(recovered);
 }
 
 class OptionalCommandContractSpec : public ::testing::Test {
@@ -246,24 +302,127 @@ TEST_F(OptionalCommandContractSpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(OptionalCommandContractSpec, AtomicCopyUint64FailsClose) {
-  auto list1 = QueryList<ID3D12GraphicsCommandList1>();
-  ASSERT_TRUE(list1);
-  constexpr std::array<std::uint64_t, 4> data = {
-      0x1020304050607080ull, 0x90a0b0c0d0e0f001ull,
-      0x13579bdf2468ace0ull, 0xfeedc0de0badf00dull};
-  auto source = context_.CreateUploadBuffer(sizeof(data), data.data(),
-                                             sizeof(data));
-  auto destination = context_.CreateBuffer(
-      sizeof(data), D3D12_HEAP_TYPE_DEFAULT,
+TEST_F(OptionalCommandContractSpec,
+       SamplerFeedbackDescriptorOverwritesExistingUavWithInertBinding) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7 = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7)),
+            S_OK);
+  ASSERT_EQ(options7.SamplerFeedbackTier,
+            D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED);
+  auto device8 = QueryDevice<ID3D12Device8>();
+  ASSERT_TRUE(device8);
+
+  const auto shader = CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+    [numthreads(1, 1, 1)]
+    void main() { output.Store(0, 0xdeadbeef); }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 1;
+  parameter.DescriptorTable.pDescriptorRanges = &range;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const D3D12_SHADER_BYTECODE bytecode = {
+      shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateComputePipeline(root.get(), bytecode);
+  ASSERT_TRUE(pipeline);
+
+  constexpr std::array<std::uint32_t, 4> initial = {
+      0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f001u};
+  auto upload = context_.CreateUploadBuffer(sizeof(initial), initial.data(),
+                                             sizeof(initial));
+  auto output = context_.CreateBuffer(
+      sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_COPY_DEST);
-  ASSERT_TRUE(source);
-  ASSERT_TRUE(destination);
-  list1->AtomicCopyBufferUINT64(destination.get(), 0, source.get(), 0, 0,
-                                nullptr, nullptr);
-  EXPECT_EQ(list1->Close(), E_NOTIMPL);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(output);
+  ASSERT_TRUE(heap);
+
+  context_.list()->CopyBufferRegion(output.get(), 0, upload.get(), 0,
+                                    sizeof(initial));
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = initial.size();
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateUnorderedAccessView(output.get(), nullptr, &uav,
+                                                cpu);
+
+  device8->CreateSamplerFeedbackUnorderedAccessView(nullptr, nullptr, cpu);
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> actual;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), sizeof(initial), &actual),
+            S_OK);
+  ASSERT_EQ(actual.size(), sizeof(initial));
+  EXPECT_EQ(std::memcmp(actual.data(), initial.data(), sizeof(initial)), 0);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(OptionalCommandContractSpec,
+       AtomicCopyUintFailureIsStickyAndSameDeviceRecovers) {
+  ExpectAtomicCopyFailureAndSameDeviceRecovery(context_,
+                                               AtomicCopyWidth::Uint32);
+}
+
+TEST_F(OptionalCommandContractSpec,
+       AtomicCopyUint64FailureIsStickyAndSameDeviceRecovers) {
+  ExpectAtomicCopyFailureAndSameDeviceRecovery(context_,
+                                               AtomicCopyWidth::Uint64);
+}
+
+TEST_F(OptionalCommandContractSpec,
+       StreamOutputTargetFailureIsStickyAndSameDeviceRecovers) {
+  auto output = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ASSERT_TRUE(output);
+  D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {};
+  view.BufferLocation = output->GetGPUVirtualAddress();
+  view.SizeInBytes = 128;
+  view.BufferFilledSizeLocation = output->GetGPUVirtualAddress() + 128;
+
+  context_.list()->SOSetTargets(0, 1, &view);
+  EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
+  EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+
+  D3D12TestContext recovered;
+  ASSERT_EQ(recovered.Initialize(context_.device()), S_OK);
+  ExpectCopyExecution(recovered);
+}
+
+TEST_F(OptionalCommandContractSpec,
+       EmptyStreamOutputTargetResetIsHarmless) {
+  context_.list()->SOSetTargets(0, 0, nullptr);
+  ExpectCopyExecution(context_);
 }
 
 } // namespace

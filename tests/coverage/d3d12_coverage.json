@@ -300,6 +300,7 @@
           "CreateCommandList",
           "CreateCommandList1",
           "CreateFence",
+          "GetDeviceRemovedReason",
           "CreateCommittedResource",
           "CreateCommittedResource1",
           "CreateCommittedResource2",
@@ -314,14 +315,19 @@
           "GetResourceAllocationInfo2",
           "GetCustomHeapProperties",
           "GetCopyableFootprints",
+          "GetCopyableFootprints1",
           "GetResourceTiling",
           "GetProtectedResourceSession",
           "CreateProtectedResourceSession",
           "CreateProtectedResourceSession1",
           "OpenExistingHeapFromAddress",
           "OpenExistingHeapFromFileMapping",
+          "CreateSharedHandle",
+          "OpenSharedHandle",
+          "OpenSharedHandleByName",
           "MakeResident",
           "Evict",
+          "EnqueueMakeResident",
           "SetStablePowerState",
           "CreateLifetimeTracker",
           "CheckDriverMatchingIdentifier",
@@ -345,6 +351,7 @@
           "CreateGraphicsPipelineState",
           "CreateComputePipelineState",
           "CreatePipelineState",
+          "CreatePipelineLibrary",
           "CreateShaderCacheSession",
           "ShaderCacheControl",
           "CreateQueryHeap",
@@ -353,7 +360,8 @@
           "EnumerateMetaCommandParameters",
           "CreateMetaCommand",
           "CreateStateObject",
-          "AddToStateObject"
+          "AddToStateObject",
+          "CreateSamplerFeedbackUnorderedAccessView"
         ]
       },
       "command-recording": {
@@ -443,7 +451,8 @@
           "UpdateTileMappings",
           "CopyTileMappings",
           "GetCompletedValue",
-          "SetEventOnCompletion"
+          "SetEventOnCompletion",
+          "SetEventOnMultipleFenceCompletion"
         ]
       }
     }
