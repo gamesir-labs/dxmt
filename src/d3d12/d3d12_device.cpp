@@ -661,6 +661,63 @@ GetD3D12FormatCapability(WMT::Device device,
              : entry->second;
 }
 
+static bool IsD3D12TypedUavFormat(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_FLOAT:
+  case DXGI_FORMAT_R32G32B32A32_UINT:
+  case DXGI_FORMAT_R32G32B32A32_SINT:
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+  case DXGI_FORMAT_R16G16B16A16_UNORM:
+  case DXGI_FORMAT_R16G16B16A16_UINT:
+  case DXGI_FORMAT_R16G16B16A16_SNORM:
+  case DXGI_FORMAT_R16G16B16A16_SINT:
+  case DXGI_FORMAT_R32G32_FLOAT:
+  case DXGI_FORMAT_R32G32_UINT:
+  case DXGI_FORMAT_R32G32_SINT:
+  case DXGI_FORMAT_R10G10B10A2_UNORM:
+  case DXGI_FORMAT_R10G10B10A2_UINT:
+  case DXGI_FORMAT_R11G11B10_FLOAT:
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UINT:
+  case DXGI_FORMAT_R8G8B8A8_SNORM:
+  case DXGI_FORMAT_R8G8B8A8_SINT:
+  case DXGI_FORMAT_R16G16_FLOAT:
+  case DXGI_FORMAT_R16G16_UNORM:
+  case DXGI_FORMAT_R16G16_UINT:
+  case DXGI_FORMAT_R16G16_SNORM:
+  case DXGI_FORMAT_R16G16_SINT:
+  case DXGI_FORMAT_R32_FLOAT:
+  case DXGI_FORMAT_R32_UINT:
+  case DXGI_FORMAT_R32_SINT:
+  case DXGI_FORMAT_R8G8_UNORM:
+  case DXGI_FORMAT_R8G8_UINT:
+  case DXGI_FORMAT_R8G8_SNORM:
+  case DXGI_FORMAT_R8G8_SINT:
+  case DXGI_FORMAT_R16_FLOAT:
+  case DXGI_FORMAT_R16_UNORM:
+  case DXGI_FORMAT_R16_UINT:
+  case DXGI_FORMAT_R16_SNORM:
+  case DXGI_FORMAT_R16_SINT:
+  case DXGI_FORMAT_R8_UNORM:
+  case DXGI_FORMAT_R8_UINT:
+  case DXGI_FORMAT_R8_SNORM:
+  case DXGI_FORMAT_R8_SINT:
+  case DXGI_FORMAT_A8_UNORM:
+  case DXGI_FORMAT_B5G6R5_UNORM:
+  case DXGI_FORMAT_B5G5R5A1_UNORM:
+  case DXGI_FORMAT_B4G4R4A4_UNORM:
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool IsD3D12CoreTypedUavLoadFormat(DXGI_FORMAT format) {
+  return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_UINT ||
+         format == DXGI_FORMAT_R32_SINT;
+}
+
 static D3D12_FORMAT_SUPPORT1
 GetD3D12FormatSupport1(FormatCapability caps,
                        const MTL_DXGI_FORMAT_DESC &format) {
@@ -726,6 +783,39 @@ GetD3D12FormatSupport2(FormatCapability caps) {
                D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
                D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
   return support;
+}
+
+static bool SupportsD3D12AdditionalTypedUavLoads(WMT::Device device) {
+  constexpr DXGI_FORMAT formats[] = {
+      DXGI_FORMAT_R32G32B32A32_FLOAT,
+      DXGI_FORMAT_R32G32B32A32_UINT,
+      DXGI_FORMAT_R32G32B32A32_SINT,
+      DXGI_FORMAT_R16G16B16A16_FLOAT,
+      DXGI_FORMAT_R16G16B16A16_UINT,
+      DXGI_FORMAT_R16G16B16A16_SINT,
+      DXGI_FORMAT_R8G8B8A8_UNORM,
+      DXGI_FORMAT_R8G8B8A8_UINT,
+      DXGI_FORMAT_R8G8B8A8_SINT,
+      DXGI_FORMAT_R16_FLOAT,
+      DXGI_FORMAT_R16_UINT,
+      DXGI_FORMAT_R16_SINT,
+      DXGI_FORMAT_R8_UNORM,
+      DXGI_FORMAT_R8_UINT,
+      DXGI_FORMAT_R8_SINT,
+  };
+  FormatCapabilityInspector inspector;
+  inspector.Inspect(device);
+  for (const auto dxgi_format : formats) {
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (FAILED(MTLQueryDXGIFormat(device, dxgi_format, format)))
+      return false;
+    const auto entry = inspector.textureCapabilities.find(format.PixelFormat);
+    if (entry == inspector.textureCapabilities.end() ||
+        !(GetD3D12FormatSupport2(entry->second) &
+          D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
+      return false;
+  }
+  return true;
 }
 
 static bool
@@ -3124,6 +3214,8 @@ public:
       std::memset(data, 0, sizeof(*data));
       data->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
       data->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+      data->TypedUAVLoadAdditionalFormats =
+          SupportsD3D12AdditionalTypedUavLoads(device_->device());
       data->TiledResourcesTier = GetDXMTDevice().device().supportsPlacementSparse()
                                      ? D3D12_TILED_RESOURCES_TIER_1
                                      : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
@@ -3164,6 +3256,29 @@ public:
       const auto caps = GetD3D12FormatCapability(device_->device(), format);
       data->Support1 = GetD3D12FormatSupport1(caps, format);
       data->Support2 = GetD3D12FormatSupport2(caps);
+      if (!IsD3D12TypedUavFormat(data->Format)) {
+        data->Support1 = static_cast<D3D12_FORMAT_SUPPORT1>(
+            data->Support1 &
+            ~D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+        data->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+      }
+      if (!IsD3D12CoreTypedUavLoadFormat(data->Format) &&
+          !SupportsD3D12AdditionalTypedUavLoads(device_->device())) {
+        data->Support2 = static_cast<D3D12_FORMAT_SUPPORT2>(
+            data->Support2 & ~D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD);
+      }
+      constexpr UINT kTypedAtomicOperations =
+          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
+          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
+          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
+          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
+          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+      if (data->Format != DXGI_FORMAT_R32_UINT &&
+          data->Format != DXGI_FORMAT_R32_SINT) {
+        data->Support2 = static_cast<D3D12_FORMAT_SUPPORT2>(
+            static_cast<UINT>(data->Support2) & ~kTypedAtomicOperations);
+      }
       // RGB32 buffer views are represented by three scalar R32 elements in
       // memory, while the Metal texture-buffer view exposes only one channel.
       // Keep Buffer/ShaderLoad for the typed formats, but do not advertise

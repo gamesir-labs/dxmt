@@ -64,6 +64,13 @@
       "find": "      const UINT plane =\n          subresources_per_plane ? subresource / subresources_per_plane : 0;",
       "replace": "      const UINT plane =\n          subresources_per_plane ? subresource % subresources_per_plane : 0;",
       "test_filter": "PlanarFormatSpec.AdvertisedVideoFormatsExposeTwoPlaneFootprints"
+    },
+    {
+      "id": "pipeline-cache-key-omits-sample-mask",
+      "file": "src/d3d12/d3d12_pipeline.cpp",
+      "find": "    HashValue(hash, graphics_state.desc.SampleMask);",
+      "replace": "    (void)graphics_state.desc.SampleMask;",
+      "test_filter": "D3D12PipelineCacheKeySpec.SampleMaskChangesCachedBlobAndSameDescIsStable"
     }
   ]
 }

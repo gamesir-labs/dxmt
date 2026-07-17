@@ -39,8 +39,10 @@ d3d12_unit_suites = {
       'capability/capability_spec.cpp',
       'capability/feature_query_spec.cpp',
       'capability/format_execution_matrix_spec.cpp',
+      'capability/format_msaa_family_matrix_spec.cpp',
       'capability/format_msaa_execution_spec.cpp',
       'capability/format_operation_spec.cpp',
+      'capability/format_texture_uav_execution_spec.cpp',
       'capability/format_uav_execution_spec.cpp',
       'capability/optional_feature_gate_spec.cpp',
     ),
@@ -102,6 +104,7 @@ d3d12_unit_suites = {
   },
   'pipeline': {
     'sources': files(
+      'pipeline/cache_key_spec.cpp',
       'pipeline/scalar_varying_spec.cpp',
       'pipeline/graphics_creation_spec.cpp',
       'pipeline/stream_spec.cpp',
@@ -152,6 +155,7 @@ d3d12_unit_suites = {
       'sync/enhanced_barrier_spec.cpp',
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
+      'sync/legacy_barrier_boundary_execution_spec.cpp',
       'sync/promotion_decay_spec.cpp',
       'sync/producer_consumer_execution_spec.cpp',
       'sync/queue_wait_spec.cpp',
