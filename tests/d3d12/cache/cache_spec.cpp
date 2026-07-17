@@ -33,6 +33,32 @@ template <typename T> void release_object(T *&object) {
       << "HRESULT failed: 0x" << std::hex << static_cast<unsigned long>(hr);
 }
 
+UINT ConfiguredFaultOccurrence(const char *name) {
+  const char *value = std::getenv(name);
+  if (!value || !*value)
+    return 0;
+  char *end = nullptr;
+  const auto parsed = std::strtoul(value, &end, 0);
+  return end != value && !*end && parsed <= UINT_MAX
+             ? static_cast<UINT>(parsed)
+             : 0;
+}
+
+bool ConfiguredFaultAlways(const char *name) {
+  const char *value = std::getenv(name);
+  return value && (std::strcmp(value, "always") == 0 ||
+                   std::strcmp(value, "all") == 0);
+}
+
+std::size_t CountSubstring(std::string_view text, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t offset = 0;
+       (offset = text.find(needle, offset)) != std::string_view::npos;
+       offset += needle.size())
+    ++count;
+  return count;
+}
+
 struct ScopedArchiveTestEnvironment {
   explicit ScopedArchiveTestEnvironment(const char *suffix) {
     std::ostringstream name;
@@ -128,13 +154,15 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC BasicGraphicsPipelineDesc(
   return desc;
 }
 
-ID3D12PipelineState *CreateBasicGraphicsPipeline(ID3D12Device *device) {
+ID3D12PipelineState *CreateBasicGraphicsPipeline(
+    ID3D12Device *device, UINT sample_mask = UINT_MAX) {
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
   auto *root_signature = CreateRootSignature(device, root_desc);
   if (!root_signature)
     return nullptr;
   auto desc = BasicGraphicsPipelineDesc(root_signature);
+  desc.SampleMask = sample_mask;
   ID3D12PipelineState *pipeline = nullptr;
   const auto hr = device->CreateGraphicsPipelineState(
       &desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void **>(&pipeline));
@@ -210,33 +238,49 @@ TEST(D3D12PipelineArchiveSpec, AttachesAndSerializesPipelineArchive) {
 }
 
 TEST(D3D12PipelineArchiveSpec,
-     InjectedArchiveWriteFailureRecoversOnFreshDevice) {
-  if (!std::getenv("DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT"))
+     InjectedArchiveWriteFailuresRecoverOnSameDevice) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT";
+  const UINT target = ConfiguredFaultOccurrence(fault);
+  const bool repeated = ConfiguredFaultAlways(fault);
+  ASSERT_FALSE(target && repeated);
+  if (!target && !repeated)
     GTEST_SKIP() << "pipeline archive write fault injection is disabled";
+  ASSERT_TRUE(repeated || target <= 3u)
+      << "the test defines three archive writes before recovery";
 
   ScopedArchiveTestEnvironment environment("write-fault");
   ID3D12Device *device = CreateIsolatedDevice();
   ASSERT_NE(device, nullptr);
-  auto *pipeline = CreateBasicGraphicsPipeline(device);
-  ASSERT_NE(pipeline, nullptr);
-  release_object(pipeline);
-  release_object(device);
-  auto marker = environment.ReadMarker();
-  ASSERT_NE(marker.find("serialize reason=periodic count=1 ok=0 err=injected"),
-            std::string::npos)
-      << marker;
+  for (UINT occurrence = 1; occurrence <= 3; ++occurrence) {
+    auto *pipeline =
+        CreateBasicGraphicsPipeline(device, UINT_MAX - occurrence);
+    ASSERT_NE(pipeline, nullptr) << "occurrence=" << occurrence;
+    release_object(pipeline);
+  }
 
-  environment.ResetMarker();
-  device = CreateIsolatedDevice();
-  ASSERT_NE(device, nullptr);
-  pipeline = CreateBasicGraphicsPipeline(device);
-  ASSERT_NE(pipeline, nullptr);
-  release_object(pipeline);
-  release_object(device);
+  auto marker = environment.ReadMarker();
+  const std::size_t injected_count = repeated ? 3u : 1u;
+  EXPECT_EQ(CountSubstring(marker, "err=injected"), injected_count) << marker;
+  if (!repeated) {
+    const std::string expected =
+        "serialize reason=periodic count=" + std::to_string(target) +
+        " ok=0 err=injected";
+    EXPECT_NE(marker.find(expected), std::string::npos) << marker;
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  auto *recovery = CreateBasicGraphicsPipeline(device, UINT_MAX - 4u);
+  ASSERT_NE(recovery, nullptr);
+  release_object(recovery);
+
   marker = environment.ReadMarker();
-  EXPECT_NE(marker.find("serialize reason=periodic count=1 ok=1"),
+  EXPECT_EQ(CountSubstring(marker, "err=injected"), injected_count) << marker;
+  EXPECT_NE(marker.find("serialize reason=periodic count=4 ok=1"),
             std::string::npos)
       << marker;
+  EXPECT_NE(GetFileAttributesA(environment.archive.c_str()),
+            INVALID_FILE_ATTRIBUTES);
+  release_object(device);
 }
 
 TEST(D3D12PipelineArchiveSpec, RejectsCorruptArchiveAndFallsBackToCompilation) {

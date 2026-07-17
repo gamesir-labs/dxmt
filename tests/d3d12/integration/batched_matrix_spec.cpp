@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <vector>
 
 namespace {
@@ -12,6 +13,24 @@ namespace {
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+
+constexpr std::uint32_t kCopyCaseCount = 4096;
+const dxmt::test::LogicalCaseFamilyRegistration kShuffledCopyCases(
+    "D3D12BatchedMatrixSpec.Copies4096ShuffledRegionsInOneSubmission",
+    "D3D12.Copy.Buffer.ShuffledRegion.", kCopyCaseCount, 4,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Direct", "CopyBufferRegion"},
+     dxmt::test::kMultiSubmissionTestCost,
+     "4096-word upload source and poison-initialized default output",
+     "copy one or more source dwords to permuted destinations, transition, "
+     "and read back",
+     "every selected destination equals its deterministic source dword",
+     "logical/source/destination offsets, first mismatch, expected/actual, "
+     "and exact replay argument"});
+const dxmt::test::TestCostRegistration kShuffledCopyCost(
+    "D3D12BatchedMatrixSpec.Copies4096ShuffledRegionsInOneSubmission",
+    dxmt::test::kMultiSubmissionTestCost);
 
 class D3D12BatchedMatrixSpec : public ::testing::Test {
 protected:
@@ -21,42 +40,116 @@ protected:
 };
 
 TEST_F(D3D12BatchedMatrixSpec, Copies4096ShuffledRegionsInOneSubmission) {
-  constexpr std::uint32_t kCaseCount = 4096;
-  std::vector<std::uint32_t> source_values(kCaseCount);
-  std::vector<std::uint32_t> expected(kCaseCount);
-  for (std::uint32_t index = 0; index < kCaseCount; ++index)
+  std::vector<std::uint32_t> source_values(kCopyCaseCount);
+  for (std::uint32_t index = 0; index < kCopyCaseCount; ++index)
     source_values[index] = 0x80000000u ^ (index * 0x9e3779b9u);
+  std::vector<std::uint32_t> poison(kCopyCaseCount);
+  for (std::uint32_t logical = 0; logical < kCopyCaseCount; ++logical) {
+    const std::uint32_t destination =
+        (logical * 4051u) & (kCopyCaseCount - 1);
+    poison[destination] = ~source_values[logical];
+  }
 
   auto source = context_.CreateUploadBuffer(
       source_values.size() * sizeof(source_values[0]), source_values.data(),
       source_values.size() * sizeof(source_values[0]));
+  auto poison_upload = context_.CreateUploadBuffer(
+      poison.size() * sizeof(poison[0]), poison.data(),
+      poison.size() * sizeof(poison[0]));
   auto output = context_.CreateBuffer(
-      expected.size() * sizeof(expected[0]), D3D12_HEAP_TYPE_DEFAULT,
+      source_values.size() * sizeof(source_values[0]), D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(source);
+  ASSERT_TRUE(poison_upload);
   ASSERT_TRUE(output);
 
-  for (std::uint32_t logical = 0; logical < kCaseCount; ++logical) {
+  // Single-case replay writes only one destination, so establish and verify a
+  // deterministic non-matching value for every slot in an independent setup
+  // submission. A dropped tested copy can never pass because of uninitialized
+  // default-heap contents.
+  const UINT64 output_size = poison.size() * sizeof(poison[0]);
+  context_.list()->CopyBufferRegion(output.get(), 0, poison_upload.get(), 0,
+                                    output_size);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> setup_bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), output_size, &setup_bytes),
+            S_OK);
+  ASSERT_EQ(setup_bytes.size(), output_size);
+  ASSERT_EQ(std::memcmp(setup_bytes.data(), poison.data(), output_size), 0);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+
+  std::vector<std::uint32_t> selected_cases;
+  selected_cases.reserve(kCopyCaseCount);
+  for (std::uint32_t logical = 0; logical < kCopyCaseCount; ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kShuffledCopyCases.family(), logical))
+      continue;
+    selected_cases.push_back(logical);
     // An odd multiplier is a permutation modulo this power-of-two case count.
-    const std::uint32_t destination = (logical * 4051u) & (kCaseCount - 1);
-    expected[destination] = source_values[logical];
+    const std::uint32_t destination =
+        (logical * 4051u) & (kCopyCaseCount - 1);
     context_.list()->CopyBufferRegion(
         output.get(), std::uint64_t(destination) * sizeof(std::uint32_t),
         source.get(), std::uint64_t(logical) * sizeof(std::uint32_t),
         sizeof(std::uint32_t));
   }
+  ASSERT_FALSE(selected_cases.empty());
+  RecordProperty("logical_cases_executed",
+                 static_cast<int>(selected_cases.size()));
+  RecordProperty("logical_case_prefix",
+                 kShuffledCopyCases.family().case_id_prefix);
   D3D12TestContext::Transition(
       context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
       D3D12_RESOURCE_STATE_COPY_SOURCE);
 
   std::vector<std::uint8_t> bytes;
   ASSERT_EQ(context_.ReadbackBuffer(
-                output.get(), expected.size() * sizeof(expected[0]), &bytes),
+                output.get(),
+                source_values.size() * sizeof(source_values[0]), &bytes),
             S_OK);
-  ASSERT_EQ(bytes.size(), expected.size() * sizeof(expected[0]));
-  std::vector<std::uint32_t> actual(kCaseCount);
+  ASSERT_EQ(bytes.size(), source_values.size() * sizeof(source_values[0]));
+  std::vector<std::uint32_t> actual(kCopyCaseCount);
   std::memcpy(actual.data(), bytes.data(), bytes.size());
-  EXPECT_EQ(actual, expected);
+
+  for (const std::uint32_t logical : selected_cases) {
+    const std::uint32_t destination =
+        (logical * 4051u) & (kCopyCaseCount - 1);
+    const std::uint32_t expected = source_values[logical];
+    if (actual[destination] == expected)
+      continue;
+
+    const dxmt::test::GpuCaseResult result = {
+        1, destination, expected, actual[destination]};
+    const auto case_id =
+        dxmt::test::LogicalCaseId(kShuffledCopyCases.family(), logical);
+    ADD_FAILURE() << "LogicalCaseId: " << case_id << '\n'
+                  << "Class: "
+                  << dxmt::test::TestClassName(
+                         kShuffledCopyCases.family().traits.test_class)
+                  << '\n'
+                  << "Requirements: feature_level=11_0 queue=Direct "
+                     "capability=CopyBufferRegion\n"
+                  << "ExecutionPath: "
+                  << dxmt::test::ExecutionPathName(
+                         kShuffledCopyCases.family().traits.execution_path)
+                  << '\n'
+                  << "Parameters: logical=" << logical
+                  << " source_offset=" << logical * sizeof(std::uint32_t)
+                  << " destination=" << destination
+                  << " destination_offset="
+                  << destination * sizeof(std::uint32_t) << '\n'
+                  << "GpuCaseResult: status=" << result.status
+                  << " first_mismatch_index="
+                  << result.first_mismatch_index << " expected=0x" << std::hex
+                  << result.expected << " actual=0x" << result.actual
+                  << std::dec << '\n'
+                  << "Replay: --dxmt-case-id=" << case_id;
+    break;
+  }
 }
 
 TEST_F(D3D12BatchedMatrixSpec, Dispatches256ParameterCasesInOneSubmission) {

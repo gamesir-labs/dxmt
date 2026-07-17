@@ -192,6 +192,39 @@ TEST_F(D3D12InternalFaultInjectionSpec,
 }
 
 TEST_F(D3D12InternalFaultInjectionSpec,
+       MetalPipelineFailureAtConfiguredOccurrencePreservesOtherPipelines) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT";
+  const UINT target = ConfiguredInternalOccurrence(fault);
+  if (!target)
+    GTEST_SKIP() << "configured Metal pipeline fault injection is disabled";
+  ASSERT_LE(target, 3u) << "the test defines three pipeline occurrences";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  constexpr std::array<UINT, 3> values = {
+      0x10213243u, 0x54657687u, 0x98a9bacbu};
+  for (UINT occurrence = 1; occurrence <= values.size(); ++occurrence) {
+    auto pipeline = CreateWriterPipeline(values[occurrence - 1]);
+    if (occurrence == target) {
+      EXPECT_FALSE(pipeline) << "occurrence=" << occurrence;
+    } else {
+      ASSERT_TRUE(pipeline) << "occurrence=" << occurrence;
+      EXPECT_EQ(ExecuteWriter(pipeline.get()), values[occurrence - 1])
+          << "occurrence=" << occurrence;
+    }
+  }
+
+  // A target occurrence is one-shot. Remove the setting as well so recovery
+  // remains explicit and exercises the same process and device.
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  auto recovery_pipeline = CreateWriterPipeline(0xdcedfe0fu);
+  ASSERT_TRUE(recovery_pipeline);
+  EXPECT_EQ(ExecuteWriter(recovery_pipeline.get()), 0xdcedfe0fu);
+  EXPECT_EQ(marker.Count(fault), 1u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12InternalFaultInjectionSpec,
        RepeatedMetalPipelineFailuresAndLaterPipelineRecovers) {
   const char *configuration =
       std::getenv("DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT");
@@ -218,18 +251,34 @@ TEST_F(D3D12InternalFaultInjectionSpec,
 
 TEST_F(D3D12InternalFaultInjectionSpec,
        PipelineArchiveLookupFaultFallsBackAndExecutionContinues) {
-  if (!ConfiguredInternalOccurrence("DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT"))
+  constexpr const char *fault = "DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT";
+  const UINT target = ConfiguredInternalOccurrence(fault);
+  const bool repeated = ConfiguredInternalAlways(fault);
+  ASSERT_FALSE(target && repeated);
+  if (!target && !repeated)
     GTEST_SKIP() << "pipeline archive lookup fault injection is disabled";
+  ASSERT_TRUE(repeated || target <= 3u)
+      << "the test defines three archive lookup occurrences";
   FaultMarker marker;
   ASSERT_TRUE(marker.Initialize());
 
-  auto first = CreateWriterPipeline(0x51525354u);
-  ASSERT_TRUE(first);
-  EXPECT_EQ(ExecuteWriter(first.get()), 0x51525354u);
-  auto second = CreateWriterPipeline(0x61626364u);
-  ASSERT_TRUE(second);
-  EXPECT_EQ(ExecuteWriter(second.get()), 0x61626364u);
-  EXPECT_EQ(marker.Count("DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT"), 1u);
+  constexpr std::array<UINT, 3> values = {
+      0x51525354u, 0x61626364u, 0x71727374u};
+  for (UINT occurrence = 1; occurrence <= values.size(); ++occurrence) {
+    auto pipeline = CreateWriterPipeline(values[occurrence - 1]);
+    ASSERT_TRUE(pipeline) << "occurrence=" << occurrence;
+    EXPECT_EQ(ExecuteWriter(pipeline.get()), values[occurrence - 1])
+        << "occurrence=" << occurrence;
+  }
+
+  const std::size_t injected_count = repeated ? values.size() : 1u;
+  EXPECT_EQ(marker.Count(fault), injected_count);
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  auto recovery_pipeline = CreateWriterPipeline(0x81828384u);
+  ASSERT_TRUE(recovery_pipeline);
+  EXPECT_EQ(ExecuteWriter(recovery_pipeline.get()), 0x81828384u);
+  EXPECT_EQ(marker.Count(fault), injected_count);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

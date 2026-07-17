@@ -40,6 +40,30 @@ std::vector<SerialHint> &SerialHints() {
   return hints;
 }
 
+std::vector<const LogicalCaseFamily *> &LogicalCaseFamilies() {
+  static std::vector<const LogicalCaseFamily *> families;
+  return families;
+}
+
+std::string &ActiveCaseNamespace() {
+  static std::string value;
+  return value;
+}
+
+std::string &ActiveCaseIdFilter() {
+  static std::string value;
+  return value;
+}
+
+bool TestOwnsMatchingLogicalCase(std::string_view test_name,
+                                 std::string_view case_namespace,
+                                 std::string_view filter) {
+  return std::ranges::any_of(LogicalCaseFamilies(), [&](const auto *family) {
+    return family->owner_test == test_name &&
+           LogicalCaseFamilyMatchesFilter(*family, case_namespace, filter);
+  });
+}
+
 class FailureCollector final : public ::testing::EmptyTestEventListener {
 public:
   explicit FailureCollector(std::string_view case_namespace)
@@ -188,7 +212,9 @@ CollectRunnableTests(std::string_view case_namespace,
       const auto case_id = CaseIdForTest(case_namespace, full_name);
       if ((!disabled || run_disabled) && FilterMatches(filter, full_name) &&
           (case_id_filter.empty() ||
-           FilterMatches(case_id_filter, case_id)))
+           FilterMatches(case_id_filter, case_id) ||
+           TestOwnsMatchingLogicalCase(full_name, case_namespace,
+                                       case_id_filter)))
         tests.push_back(
             {full_name, TestCost(full_name), TestMustRunSerially(full_name)});
     }
@@ -212,6 +238,7 @@ struct SchedulerOptions {
   bool show_help = false;
   bool is_worker = false;
   bool list_case_ids = false;
+  bool list_case_metadata = false;
   std::string case_id_filter;
   std::string report_path;
 };
@@ -253,6 +280,10 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
       options.list_case_ids = true;
       continue;
     }
+    if (argument == "--dxmt-list-case-metadata") {
+      options.list_case_metadata = true;
+      continue;
+    }
     const std::string_view argument_view(argument);
     if (argument_view.starts_with(case_id_prefix)) {
       const auto filter = argument_view.substr(case_id_prefix.size());
@@ -292,7 +323,8 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
     options.jobs_were_set = true;
   }
 
-  if (options.list_case_ids && options.case_id_filter.empty())
+  if ((options.list_case_ids || options.list_case_metadata) &&
+      options.case_id_filter.empty())
     options.case_id_filter = "*";
 
   if (!options.jobs_were_set)
@@ -324,10 +356,9 @@ BuildWorkerArguments(const std::vector<std::string> &original_arguments,
     const std::string_view argument(original_arguments[index]);
     if (!argument.starts_with("--dxmt-test-jobs=") &&
         !argument.starts_with("--dxmt-test-report=") &&
-        !argument.starts_with("--dxmt-case-id=") &&
-        !argument.starts_with("--dxmt_case_id=") &&
         !argument.starts_with("--gtest_filter=") &&
         argument != "--dxmt-list-case-ids" &&
+        argument != "--dxmt-list-case-metadata" &&
         argument != "--dxmt-test-worker") {
       arguments.push_back(original_arguments[index]);
     }
@@ -381,6 +412,31 @@ bool HasUnrecognizedGoogleTestArgument(int argc, char **argv) {
   return false;
 }
 
+void PrintSelectedCaseIdentities(const std::vector<ScheduledTest> &tests,
+                                 std::string_view case_namespace,
+                                 std::string_view case_id_filter,
+                                 bool metadata) {
+  for (const auto &test : tests) {
+    const auto outer_case_id = CaseIdForTest(case_namespace, test.name);
+    if (!metadata && FilterMatches(case_id_filter, outer_case_id))
+      std::printf("%s\n", outer_case_id.c_str());
+
+    for (const auto *family : LogicalCaseFamilies()) {
+      if (family->owner_test != test.name)
+        continue;
+      for (std::size_t index = 0; index < family->case_count; ++index) {
+        if (!LogicalCaseMatchesFilter(*family, index, case_namespace,
+                                      case_id_filter))
+          continue;
+        const auto line = metadata
+                              ? LogicalCaseMetadataJson(*family, index)
+                              : LogicalCaseId(*family, index);
+        std::printf("%s\n", line.c_str());
+      }
+    }
+  }
+}
+
 } // namespace
 
 TestCostRegistration::TestCostRegistration(std::string_view pattern,
@@ -390,6 +446,19 @@ TestCostRegistration::TestCostRegistration(std::string_view pattern,
 
 SerialTestRegistration::SerialTestRegistration(std::string_view pattern) {
   SerialHints().push_back({std::string(pattern)});
+}
+
+LogicalCaseFamilyRegistration::LogicalCaseFamilyRegistration(
+    std::string_view owner_test, std::string_view case_id_prefix,
+    std::size_t case_count, std::size_t index_width, CaseTraits traits)
+    : family_{std::string(owner_test), std::string(case_id_prefix), case_count,
+              index_width, std::move(traits)} {
+  LogicalCaseFamilies().push_back(&family_);
+}
+
+bool LogicalCaseSelected(const LogicalCaseFamily &family, std::size_t index) {
+  return LogicalCaseMatchesFilter(family, index, ActiveCaseNamespace(),
+                                  ActiveCaseIdFilter());
 }
 
 int RunScheduledTests(int argc, char **argv) {
@@ -408,12 +477,14 @@ int RunScheduledTests(int argc, char **argv) {
 
   const auto case_namespace = CaseNamespaceFromExecutable(
       original_arguments.empty() ? std::string_view() : original_arguments[0]);
+  ActiveCaseNamespace() = case_namespace;
+  ActiveCaseIdFilter() = options->case_id_filter;
 
   auto tests =
       CollectRunnableTests(case_namespace, options->case_id_filter);
-  if (options->list_case_ids) {
-    for (const auto &test : tests)
-      std::printf("%s\n", CaseIdForTest(case_namespace, test.name).c_str());
+  if (options->list_case_ids || options->list_case_metadata) {
+    PrintSelectedCaseIdentities(tests, case_namespace, options->case_id_filter,
+                                options->list_case_metadata);
     return 0;
   }
   if (!options->case_id_filter.empty()) {

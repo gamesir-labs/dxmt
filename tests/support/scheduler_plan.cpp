@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -114,6 +116,135 @@ std::string CaseIdForTest(std::string_view case_namespace,
   result.push_back('.');
   result += test_name;
   return result;
+}
+
+const char *TestClassName(TestClass test_class) {
+  switch (test_class) {
+  case TestClass::Conformance:
+    return "Conformance";
+  case TestClass::Differential:
+    return "Differential";
+  case TestClass::Robustness:
+    return "Robustness";
+  case TestClass::Performance:
+    return "Performance";
+  }
+  return "Unknown";
+}
+
+const char *ExecutionPathName(ExecutionPath execution_path) {
+  switch (execution_path) {
+  case ExecutionPath::Auto:
+    return "Auto";
+  case ExecutionPath::NativeCompiled:
+    return "NativeCompiled";
+  case ExecutionPath::Fallback:
+    return "Fallback";
+  case ExecutionPath::Both:
+    return "Both";
+  }
+  return "Unknown";
+}
+
+std::string LogicalCaseId(const LogicalCaseFamily &family,
+                          std::size_t index) {
+  std::ostringstream output;
+  output << family.case_id_prefix << std::setfill('0')
+         << std::setw(static_cast<int>(family.index_width)) << index;
+  return output.str();
+}
+
+bool LogicalCaseMatchesFilter(const LogicalCaseFamily &family,
+                              std::size_t index,
+                              std::string_view case_namespace,
+                              std::string_view filter) {
+  if (filter.empty())
+    return true;
+  return FilterMatches(filter, LogicalCaseId(family, index)) ||
+         FilterMatches(filter,
+                       CaseIdForTest(case_namespace, family.owner_test));
+}
+
+bool LogicalCaseFamilyMatchesFilter(const LogicalCaseFamily &family,
+                                    std::string_view case_namespace,
+                                    std::string_view filter) {
+  if (filter.empty() ||
+      FilterMatches(filter,
+                    CaseIdForTest(case_namespace, family.owner_test)))
+    return true;
+  for (std::size_t index = 0; index < family.case_count; ++index)
+    if (FilterMatches(filter, LogicalCaseId(family, index)))
+      return true;
+  return false;
+}
+
+namespace {
+
+std::string JsonString(std::string_view value) {
+  std::ostringstream output;
+  output << '"';
+  for (const unsigned char character : value) {
+    switch (character) {
+    case '"':
+      output << "\\\"";
+      break;
+    case '\\':
+      output << "\\\\";
+      break;
+    case '\b':
+      output << "\\b";
+      break;
+    case '\f':
+      output << "\\f";
+      break;
+    case '\n':
+      output << "\\n";
+      break;
+    case '\r':
+      output << "\\r";
+      break;
+    case '\t':
+      output << "\\t";
+      break;
+    default:
+      if (character < 0x20) {
+        output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+               << static_cast<unsigned int>(character) << std::dec;
+      } else {
+        output << static_cast<char>(character);
+      }
+      break;
+    }
+  }
+  output << '"';
+  return output.str();
+}
+
+} // namespace
+
+std::string LogicalCaseMetadataJson(const LogicalCaseFamily &family,
+                                    std::size_t index) {
+  std::ostringstream output;
+  output << "{\"CaseId\":" << JsonString(LogicalCaseId(family, index))
+         << ",\"Class\":" << JsonString(TestClassName(family.traits.test_class))
+         << ",\"Requirements\":{\"MinimumFeatureLevel\":"
+         << JsonString(family.traits.requirements.minimum_feature_level)
+         << ",\"MinimumShaderModel\":"
+         << JsonString(family.traits.requirements.minimum_shader_model)
+         << ",\"QueueType\":"
+         << JsonString(family.traits.requirements.queue_type)
+         << ",\"Capabilities\":"
+         << JsonString(family.traits.requirements.required_capabilities)
+         << "},\"ExecutionPath\":"
+         << JsonString(ExecutionPathName(family.traits.execution_path))
+         << ",\"Setup\":" << JsonString(family.traits.setup)
+         << ",\"OperationSequence\":"
+         << JsonString(family.traits.operation_sequence)
+         << ",\"Oracle\":" << JsonString(family.traits.oracle)
+         << ",\"DiagnosticState\":"
+         << JsonString(family.traits.diagnostic_state)
+         << ",\"Cost\":" << family.traits.estimated_cost << '}';
+  return output.str();
 }
 
 std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,

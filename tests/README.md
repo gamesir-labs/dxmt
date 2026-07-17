@@ -156,6 +156,29 @@ GoogleTest filters. `DXMT_TEST_CASE_ID` provides the environment equivalent,
 and the documented replay spelling `--dxmt_case_id=` remains accepted. Worker
 failure summaries print the CaseId before the assertion diagnostic.
 
+Batched tests may register stable logical CaseIds below the outer GoogleTest.
+The copy matrix, for example, exposes
+`D3D12.Copy.Buffer.ShuffledRegion.0000` through `.4095`; selecting one ID
+records and validates only that logical case while keeping the same fixture and
+oracle. Registered logical cases can also emit one JSON object per line with
+their class, requirements, execution path, and scheduler cost:
+
+```sh
+scripts/dxmt-builder test --profile gcc-x64-release-full unit \
+  --suite d3d12 \
+  --test-args='--dxmt-case-id=D3D12.Copy.Buffer.ShuffledRegion.0042'
+
+DXMT_WINE_ROOT=.cache/wine-source/install \
+  DXMT_TEST_VERBOSE_WORKERS=1 scripts/wine-test-wrapper.sh \
+  .cache/managed/profiles/gcc-x64-release-full/build/tests/dxmt-wine-d3d12-tests.exe \
+  --dxmt-list-case-metadata \
+  --dxmt-case-id=D3D12.Copy.Buffer.ShuffledRegion.0042
+```
+
+On a mismatch, the matrix reports the logical CaseId, source and destination
+offsets, first mismatching index, expected and actual values, and an exact
+replay argument.
+
 The native CBV materialization tests also provide a targeted fault injection.
 The CBV keeps a valid GPU virtual address backed by a live upload resource, but
 the native-only resource lookup is forced to miss. The legacy descriptor entry

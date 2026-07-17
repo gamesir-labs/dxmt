@@ -64,6 +64,64 @@ TEST(TestSchedulerCaseIdentity, BuildsGlobFilterableGlobalCaseId) {
   EXPECT_FALSE(dxmt::test::FilterMatches("D3D11.*", case_id));
 }
 
+dxmt::test::LogicalCaseFamily ExampleLogicalFamily() {
+  return {"BatchSpec.CopiesRegions",
+          "D3D12.Copy.Buffer.ShuffledRegion.",
+          4096,
+          4,
+          {dxmt::test::TestClass::Conformance,
+           dxmt::test::ExecutionPath::Both,
+           {"12_0", "5_0", "Direct", "CopyBufferRegion"},
+           dxmt::test::kGpuBatchTestCost,
+           "upload source and output atlas",
+           "copy shuffled regions then read back",
+           "each destination equals its source value",
+           "first mismatch, offsets, expected, actual, replay"}};
+}
+
+TEST(TestSchedulerLogicalCaseIdentity, BuildsStableZeroPaddedIds) {
+  const auto family = ExampleLogicalFamily();
+  EXPECT_EQ(dxmt::test::LogicalCaseId(family, 0),
+            "D3D12.Copy.Buffer.ShuffledRegion.0000");
+  EXPECT_EQ(dxmt::test::LogicalCaseId(family, 42),
+            "D3D12.Copy.Buffer.ShuffledRegion.0042");
+  EXPECT_EQ(dxmt::test::LogicalCaseId(family, 4095),
+            "D3D12.Copy.Buffer.ShuffledRegion.4095");
+}
+
+TEST(TestSchedulerLogicalCaseIdentity, SelectsFamilyByChildOrOwnerId) {
+  const auto family = ExampleLogicalFamily();
+  EXPECT_TRUE(dxmt::test::LogicalCaseMatchesFilter(
+      family, 42, "D3D12", "D3D12.Copy.Buffer.ShuffledRegion.0042"));
+  EXPECT_FALSE(dxmt::test::LogicalCaseMatchesFilter(
+      family, 41, "D3D12", "D3D12.Copy.Buffer.ShuffledRegion.0042"));
+  EXPECT_TRUE(dxmt::test::LogicalCaseFamilyMatchesFilter(
+      family, "D3D12", "D3D12.Copy.Buffer.ShuffledRegion.4095"));
+  EXPECT_TRUE(dxmt::test::LogicalCaseMatchesFilter(
+      family, 41, "D3D12", "D3D12.BatchSpec.CopiesRegions"));
+  EXPECT_FALSE(dxmt::test::LogicalCaseFamilyMatchesFilter(
+      family, "D3D12", "D3D12.Shader.*"));
+}
+
+TEST(TestSchedulerLogicalCaseMetadata, EmitsRequiredTraitsAsJson) {
+  const auto metadata =
+      dxmt::test::LogicalCaseMetadataJson(ExampleLogicalFamily(), 42);
+  EXPECT_NE(metadata.find("\"CaseId\":\"D3D12.Copy.Buffer.ShuffledRegion.0042\""),
+            std::string::npos);
+  EXPECT_NE(metadata.find("\"Class\":\"Conformance\""),
+            std::string::npos);
+  EXPECT_NE(metadata.find("\"ExecutionPath\":\"Both\""),
+            std::string::npos);
+  EXPECT_NE(metadata.find("\"MinimumFeatureLevel\":\"12_0\""),
+            std::string::npos);
+  EXPECT_NE(metadata.find("\"Setup\":\"upload source and output atlas\""),
+            std::string::npos);
+  EXPECT_NE(metadata.find("\"OperationSequence\":"), std::string::npos);
+  EXPECT_NE(metadata.find("\"Oracle\":"), std::string::npos);
+  EXPECT_NE(metadata.find("\"DiagnosticState\":"), std::string::npos);
+  EXPECT_NE(metadata.find("\"Cost\":4"), std::string::npos);
+}
+
 TEST(TestSchedulerPolicy, DisablesFailureShortCircuiting) {
   EXPECT_FALSE(GTEST_FLAG_GET(fail_fast));
   EXPECT_FALSE(GTEST_FLAG_GET(break_on_failure));

@@ -9,8 +9,62 @@
 namespace dxmt::test {
 
 inline constexpr std::uint32_t kNormalTestCost = 1;
+inline constexpr std::uint32_t kResourceTestCost = 2;
+inline constexpr std::uint32_t kGpuBatchTestCost = 4;
+inline constexpr std::uint32_t kMultiSubmissionTestCost = 8;
+inline constexpr std::uint32_t kFreshDeviceTestCost = 16;
+inline constexpr std::uint32_t kProcessIsolationTestCost = 32;
+inline constexpr std::uint32_t kMediumStressTestCost = 64;
+inline constexpr std::uint32_t kLongStressTestCost = 256;
 inline constexpr std::uint32_t kSlowTestCost = 100;
 inline constexpr std::uint32_t kMinimumBatchCost = 4;
+
+enum class TestClass {
+  Conformance,
+  Differential,
+  Robustness,
+  Performance,
+};
+
+enum class ExecutionPath {
+  Auto,
+  NativeCompiled,
+  Fallback,
+  Both,
+};
+
+struct TestRequirements {
+  std::string minimum_feature_level;
+  std::string minimum_shader_model;
+  std::string queue_type;
+  std::string required_capabilities;
+};
+
+struct CaseTraits {
+  TestClass test_class = TestClass::Conformance;
+  ExecutionPath execution_path = ExecutionPath::Auto;
+  TestRequirements requirements;
+  std::uint32_t estimated_cost = kNormalTestCost;
+  std::string setup;
+  std::string operation_sequence;
+  std::string oracle;
+  std::string diagnostic_state;
+};
+
+struct GpuCaseResult {
+  std::uint32_t status = 0;
+  std::uint32_t first_mismatch_index = 0;
+  std::uint64_t expected = 0;
+  std::uint64_t actual = 0;
+};
+
+struct LogicalCaseFamily {
+  std::string owner_test;
+  std::string case_id_prefix;
+  std::size_t case_count = 0;
+  std::size_t index_width = 0;
+  CaseTraits traits;
+};
 
 struct ScheduledTest {
   std::string name;
@@ -33,11 +87,42 @@ public:
   explicit SerialTestRegistration(std::string_view pattern);
 };
 
+class LogicalCaseFamilyRegistration {
+public:
+  LogicalCaseFamilyRegistration(std::string_view owner_test,
+                                std::string_view case_id_prefix,
+                                std::size_t case_count,
+                                std::size_t index_width, CaseTraits traits);
+  LogicalCaseFamilyRegistration(const LogicalCaseFamilyRegistration &) =
+      delete;
+  LogicalCaseFamilyRegistration &
+  operator=(const LogicalCaseFamilyRegistration &) = delete;
+
+  const LogicalCaseFamily &family() const { return family_; }
+
+private:
+  LogicalCaseFamily family_;
+};
+
 bool GlobMatches(std::string_view pattern, std::string_view value);
 bool FilterMatches(std::string_view filter, std::string_view test_name);
 std::string CaseNamespaceFromExecutable(std::string_view executable_path);
 std::string CaseIdForTest(std::string_view case_namespace,
                           std::string_view test_name);
+const char *TestClassName(TestClass test_class);
+const char *ExecutionPathName(ExecutionPath execution_path);
+std::string LogicalCaseId(const LogicalCaseFamily &family,
+                          std::size_t index);
+bool LogicalCaseMatchesFilter(const LogicalCaseFamily &family,
+                              std::size_t index,
+                              std::string_view case_namespace,
+                              std::string_view filter);
+bool LogicalCaseFamilyMatchesFilter(const LogicalCaseFamily &family,
+                                    std::string_view case_namespace,
+                                    std::string_view filter);
+bool LogicalCaseSelected(const LogicalCaseFamily &family, std::size_t index);
+std::string LogicalCaseMetadataJson(const LogicalCaseFamily &family,
+                                    std::size_t index);
 std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,
                               std::size_t maximum_worker_count);
 std::vector<ScheduledTest>

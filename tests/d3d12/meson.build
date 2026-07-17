@@ -74,6 +74,7 @@ d3d12_unit_suites = {
     'sources': files(
       'execution/path_boundary_spec.cpp',
       'execution/path_empty_segment_spec.cpp',
+      'execution/path_root_descriptor_spec.cpp',
     ),
   },
   'graphics': {
@@ -149,6 +150,7 @@ d3d12_unit_suites = {
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/promotion_decay_spec.cpp',
+      'sync/queue_wait_spec.cpp',
       'sync/split_transition_spec.cpp',
       'sync/transition_sequence_spec.cpp',
       'sync/uav_barrier_spec.cpp',

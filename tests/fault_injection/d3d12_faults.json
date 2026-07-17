@@ -245,9 +245,34 @@
       }
     },
     {
+      "id": "metal-compute-pipeline-fail-first",
+      "filter": "D3D12InternalFaultInjectionSpec.MetalPipelineFailureAtConfiguredOccurrencePreservesOtherPipelines",
+      "environment": {
+        "DXMT_SHADER_CACHE": "0",
+        "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT": "1"
+      }
+    },
+    {
+      "id": "metal-compute-pipeline-fail-middle",
+      "filter": "D3D12InternalFaultInjectionSpec.MetalPipelineFailureAtConfiguredOccurrencePreservesOtherPipelines",
+      "environment": {
+        "DXMT_SHADER_CACHE": "0",
+        "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT": "2"
+      }
+    },
+    {
+      "id": "metal-compute-pipeline-fail-last",
+      "filter": "D3D12InternalFaultInjectionSpec.MetalPipelineFailureAtConfiguredOccurrencePreservesOtherPipelines",
+      "environment": {
+        "DXMT_SHADER_CACHE": "0",
+        "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT": "3"
+      }
+    },
+    {
       "id": "metal-compute-pipeline-fail-repeatedly",
       "filter": "D3D12InternalFaultInjectionSpec.RepeatedMetalPipelineFailuresAndLaterPipelineRecovers",
       "environment": {
+        "DXMT_SHADER_CACHE": "0",
         "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT": "always"
       }
     },
@@ -255,16 +280,72 @@
       "id": "pso-archive-lookup-fail-first",
       "filter": "D3D12InternalFaultInjectionSpec.PipelineArchiveLookupFaultFallsBackAndExecutionContinues",
       "environment": {
+        "DXMT_SHADER_CACHE": "1",
+        "DXMT_PSO_BINARY_ARCHIVE": "1",
         "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
         "DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT": "1"
       }
     },
     {
+      "id": "pso-archive-lookup-fail-after-one",
+      "filter": "D3D12InternalFaultInjectionSpec.PipelineArchiveLookupFaultFallsBackAndExecutionContinues",
+      "environment": {
+        "DXMT_SHADER_CACHE": "1",
+        "DXMT_PSO_BINARY_ARCHIVE": "1",
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT": "2"
+      }
+    },
+    {
+      "id": "pso-archive-lookup-fail-last",
+      "filter": "D3D12InternalFaultInjectionSpec.PipelineArchiveLookupFaultFallsBackAndExecutionContinues",
+      "environment": {
+        "DXMT_SHADER_CACHE": "1",
+        "DXMT_PSO_BINARY_ARCHIVE": "1",
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT": "3"
+      }
+    },
+    {
+      "id": "pso-archive-lookup-fail-repeatedly",
+      "filter": "D3D12InternalFaultInjectionSpec.PipelineArchiveLookupFaultFallsBackAndExecutionContinues",
+      "environment": {
+        "DXMT_SHADER_CACHE": "1",
+        "DXMT_PSO_BINARY_ARCHIVE": "1",
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_LOOKUP_AT": "always"
+      }
+    },
+    {
       "id": "pso-archive-write-fail-first",
-      "filter": "D3D12PipelineArchiveSpec.InjectedArchiveWriteFailureRecoversOnFreshDevice",
+      "filter": "D3D12PipelineArchiveSpec.InjectedArchiveWriteFailuresRecoverOnSameDevice",
       "environment": {
         "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
         "DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT": "1"
+      }
+    },
+    {
+      "id": "pso-archive-write-fail-after-one",
+      "filter": "D3D12PipelineArchiveSpec.InjectedArchiveWriteFailuresRecoverOnSameDevice",
+      "environment": {
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT": "2"
+      }
+    },
+    {
+      "id": "pso-archive-write-fail-last",
+      "filter": "D3D12PipelineArchiveSpec.InjectedArchiveWriteFailuresRecoverOnSameDevice",
+      "environment": {
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT": "3"
+      }
+    },
+    {
+      "id": "pso-archive-write-fail-repeatedly",
+      "filter": "D3D12PipelineArchiveSpec.InjectedArchiveWriteFailuresRecoverOnSameDevice",
+      "environment": {
+        "DXMT_PSO_ARCHIVE_SERIALIZE_EVERY": "1",
+        "DXMT_TEST_FAIL_PSO_ARCHIVE_WRITE_AT": "always"
       }
     },
     {
