@@ -348,6 +348,12 @@ ArgumentEncodingContext::prepareFencePool(
     diagnostic_info->future_local_fence_wait_count = order.future_local_waits;
     diagnostic_info->same_encoder_fence_wait_count = order.same_encoder_waits;
     diagnostic_info->external_fence_wait_count = order.external_waits;
+    // Residual external waits cannot be expressed with the local Metal fence
+    // pool (producers live in earlier command buffers). Counting them as
+    // skipped matches pre-60cdc2a7 behavior: same-queue MTL command buffers
+    // already run in commit order, and injecting encodeWaitForEvent(prev)
+    // over-serialized FH4 UI draws (ghost / missing menu boards).
+    diagnostic_info->skipped_external_fence_wait_count = order.external_waits;
     diagnostic_info->repeated_fence_update_count = order.repeated_updates;
     diagnostic_info->local_fence_id_count =
         static_cast<uint32_t>(intervals.size());
@@ -4431,12 +4437,18 @@ ArgumentEncodingContext::flushCommands(
 
   const auto external_fence_waits =
       prepareFencePool(encoders, encoder_count, diagnostic_info);
+  // Opt-in only: 60cdc2a7 always waited on event_seq_id-1 when residual
+  // external fence edges remained. That restored some cross-submit hazards but
+  // regressed FH4 unselected-menu UI. Same-queue MTL command buffers already
+  // execute in commit order, so the wait is redundant for ordinary Execute
+  // ordering. Set DXMT_CROSS_SUBMIT_FENCE_WAIT=1 to restore the old wait.
   if (external_fence_waits && event_seq_id > 1) {
-    // Fence objects are allocated only for dependencies contained in this
-    // command buffer. Preserve dependencies on producers from an earlier
-    // submission with the queue's per-chunk completion event instead of
-    // silently dropping them or keeping a fixed cross-submit fence pool.
-    cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
+    static const bool force_cross_submit_wait = [] {
+      const auto value = env::getEnvVar("DXMT_CROSS_SUBMIT_FENCE_WAIT");
+      return value == "1" || value == "true" || value == "yes" || value == "on";
+    }();
+    if (force_cross_submit_wait)
+      cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
   }
 
   // Report and benchmark only the fence operations that will reach Metal.
