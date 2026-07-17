@@ -1410,6 +1410,92 @@ HashGraphicsStreamOutput(Sha1HashState &hash,
   HashVector(hash, graphics_state.stream_output_strides);
 }
 
+void
+HashBoolean(Sha1HashState &hash, BOOL value) {
+  HashValue(hash, uint8_t(value != FALSE));
+}
+
+void
+HashRenderTargetBlendState(Sha1HashState &hash,
+                           const D3D12_RENDER_TARGET_BLEND_DESC &desc) {
+  HashBoolean(hash, desc.BlendEnable);
+  HashBoolean(hash, desc.LogicOpEnable);
+  if (desc.BlendEnable) {
+    HashValue(hash, desc.SrcBlend);
+    HashValue(hash, desc.DestBlend);
+    HashValue(hash, desc.BlendOp);
+    HashValue(hash, desc.SrcBlendAlpha);
+    HashValue(hash, desc.DestBlendAlpha);
+    HashValue(hash, desc.BlendOpAlpha);
+  }
+  if (desc.LogicOpEnable)
+    HashValue(hash, desc.LogicOp);
+  HashValue(hash, desc.RenderTargetWriteMask);
+}
+
+void
+HashBlendState(Sha1HashState &hash, const D3D12_BLEND_DESC &desc,
+               UINT render_target_count) {
+  HashBoolean(hash, desc.AlphaToCoverageEnable);
+  HashBoolean(hash, desc.IndependentBlendEnable);
+  const UINT state_count = render_target_count
+                               ? (desc.IndependentBlendEnable
+                                      ? render_target_count
+                                      : 1u)
+                               : 0u;
+  HashValue(hash, state_count);
+  for (UINT i = 0; i < state_count; ++i)
+    HashRenderTargetBlendState(hash, desc.RenderTarget[i]);
+}
+
+void
+HashRasterizerState(Sha1HashState &hash,
+                    const D3D12_RASTERIZER_DESC &desc) {
+  HashValue(hash, desc.FillMode);
+  HashValue(hash, desc.CullMode);
+  HashBoolean(hash, desc.FrontCounterClockwise);
+  HashValue(hash, desc.DepthBias);
+  HashValue(hash, desc.DepthBiasClamp);
+  HashValue(hash, desc.SlopeScaledDepthBias);
+  HashBoolean(hash, desc.DepthClipEnable);
+  HashBoolean(hash, desc.MultisampleEnable);
+  HashBoolean(hash, desc.AntialiasedLineEnable);
+  HashValue(hash, desc.ForcedSampleCount);
+  HashValue(hash, desc.ConservativeRaster);
+}
+
+void
+HashDepthStencilFaceState(Sha1HashState &hash,
+                          const D3D12_DEPTH_STENCILOP_DESC &desc) {
+  HashValue(hash, desc.StencilFailOp);
+  HashValue(hash, desc.StencilDepthFailOp);
+  HashValue(hash, desc.StencilPassOp);
+  HashValue(hash, desc.StencilFunc);
+}
+
+void
+HashDepthStencilState(Sha1HashState &hash,
+                      const D3D12_DEPTH_STENCIL_DESC &desc) {
+  HashBoolean(hash, desc.DepthEnable);
+  if (desc.DepthEnable) {
+    HashValue(hash, desc.DepthWriteMask);
+    HashValue(hash, desc.DepthFunc);
+  }
+  HashBoolean(hash, desc.StencilEnable);
+  if (desc.StencilEnable) {
+    HashValue(hash, desc.StencilReadMask);
+    HashValue(hash, desc.StencilWriteMask);
+    HashDepthStencilFaceState(hash, desc.FrontFace);
+    HashDepthStencilFaceState(hash, desc.BackFace);
+  }
+}
+
+void
+HashSampleState(Sha1HashState &hash, const DXGI_SAMPLE_DESC &desc) {
+  HashValue(hash, desc.Count);
+  HashValue(hash, desc.Quality);
+}
+
 std::string
 BuildShaderCacheKey(PipelineStateType type,
                     const std::vector<PipelineDxilShader> &shaders,
@@ -1418,22 +1504,23 @@ BuildShaderCacheKey(PipelineStateType type,
                     ID3D12RootSignature *root_signature) {
   Sha1HashState hash;
   HashString(hash, type == PipelineStateType::Graphics
-                       ? "dxmt-d3d12-graphics-pipeline-cache-v2"
+                       ? "dxmt-d3d12-graphics-pipeline-cache-v3"
                        : "dxmt-d3d12-compute-pipeline-cache-v2");
   HashPipelineShaders(hash, shaders);
   if (type == PipelineStateType::Graphics) {
     HashGraphicsInputElements(hash, graphics_state);
     HashGraphicsStreamOutput(hash, graphics_state);
-    HashValue(hash, graphics_state.desc.BlendState);
+    HashBlendState(hash, graphics_state.desc.BlendState,
+                   graphics_state.desc.NumRenderTargets);
     HashValue(hash, graphics_state.desc.SampleMask);
-    HashValue(hash, graphics_state.desc.RasterizerState);
-    HashValue(hash, graphics_state.desc.DepthStencilState);
+    HashRasterizerState(hash, graphics_state.desc.RasterizerState);
+    HashDepthStencilState(hash, graphics_state.desc.DepthStencilState);
     HashValue(hash, graphics_state.desc.PrimitiveTopologyType);
     HashValue(hash, graphics_state.desc.NumRenderTargets);
     HashBytes(hash, graphics_state.desc.RTVFormats,
               sizeof(graphics_state.desc.RTVFormats));
     HashValue(hash, graphics_state.desc.DSVFormat);
-    HashValue(hash, graphics_state.desc.SampleDesc);
+    HashSampleState(hash, graphics_state.desc.SampleDesc);
     HashValue(hash, graphics_state.desc.Flags);
   } else {
     HashValue(hash, compute_state.desc.Flags);

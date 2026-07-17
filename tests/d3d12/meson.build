@@ -35,7 +35,10 @@ d3d12_unit_suites = {
     ),
   },
   'cache': {
-    'sources': files('cache/cache_spec.cpp'),
+    'sources': files(
+      'cache/cache_spec.cpp',
+      'cache/invalidation_key_spec.cpp',
+    ),
   },
   'capability': {
     'sources': files(
