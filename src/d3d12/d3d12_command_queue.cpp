@@ -6120,6 +6120,10 @@ private:
     NativeStageBindingToken native_pixel;
     bool compiled_compute = false;
     std::vector<CompiledDescriptorTableIdentity> compiled_tables;
+    // Full packet binding identity (tables + root CBV/SRV/UAV + root
+    // constants). Used to prevent reuse across draws that share table bases
+    // but differ in root descriptor addresses or constants.
+    uint64_t compiled_binding_identity_hash = 0;
     std::array<DescriptorJournalSnapshotToken, 2> descriptor_journals = {};
     AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
     AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
@@ -8462,6 +8466,18 @@ private:
       hash = mix(hash, table.heap_type);
       hash = mix(hash, table.base_descriptor.ptr);
     }
+    for (const auto &descriptor : packet.root_descriptors) {
+      hash = mix(hash, descriptor.parameter_type);
+      hash = mix(hash, descriptor.root_parameter_index);
+      hash = mix(hash, descriptor.address);
+    }
+    for (const auto &constants : packet.root_constants) {
+      hash = mix(hash, constants.root_parameter_index);
+      hash = mix(hash, constants.dst_offset);
+      hash = mix(hash, constants.values.size());
+      for (const auto value : constants.values)
+        hash = mix(hash, value);
+    }
     return hash;
   }
 
@@ -8470,6 +8486,8 @@ private:
       const GraphicsBindingSnapshot &snapshot, const Packet &packet,
       bool compute) {
     if (snapshot.compiled_compute != compute ||
+        snapshot.compiled_binding_identity_hash !=
+            HashCompiledDescriptorBindingIdentity(packet, compute) ||
         snapshot.pipeline_state.ptr() != packet.pipeline.pipeline_state.ptr() ||
         snapshot.root_signature.ptr() != packet.pipeline.root_signature.ptr() ||
         snapshot.cbv_srv_uav_heap.ptr() !=
@@ -8570,6 +8588,51 @@ private:
         tables[table.root_parameter_index] = table.base_descriptor;
     }
 
+    for (const auto &constants : packet.root_constants) {
+      if (constants.root_parameter_index >= ReplayState::kMaxRootParameters)
+        continue;
+      auto &slot = compute
+                       ? replay_state.compute_root_constants
+                             [constants.root_parameter_index]
+                       : replay_state.graphics_root_constants
+                             [constants.root_parameter_index];
+      slot.valid = true;
+      const auto required_size =
+          constants.dst_offset + static_cast<UINT>(constants.values.size());
+      if (slot.values.size() < required_size)
+        slot.values.resize(required_size, 0);
+      if (!constants.values.empty()) {
+        std::copy(constants.values.begin(), constants.values.end(),
+                  slot.values.begin() + constants.dst_offset);
+      }
+    }
+
+    for (const auto &descriptor : packet.root_descriptors) {
+      if (descriptor.root_parameter_index >= ReplayState::kMaxRootParameters)
+        continue;
+      ReplayRootDescriptorSlot *slot = nullptr;
+      if (descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        slot = compute ? &replay_state.compute_cbv_roots
+                              [descriptor.root_parameter_index]
+                       : &replay_state.graphics_cbv_roots
+                              [descriptor.root_parameter_index];
+      } else if (descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        slot = compute ? &replay_state.compute_srv_roots
+                              [descriptor.root_parameter_index]
+                       : &replay_state.graphics_srv_roots
+                              [descriptor.root_parameter_index];
+      } else if (descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        slot = compute ? &replay_state.compute_uav_roots
+                              [descriptor.root_parameter_index]
+                       : &replay_state.graphics_uav_roots
+                              [descriptor.root_parameter_index];
+      }
+      if (!slot)
+        continue;
+      slot->valid = true;
+      slot->address = descriptor.address;
+    }
+
     GraphicsBindingSnapshotCaptureStats capture_stats = {};
     auto snapshot = std::make_shared<GraphicsBindingSnapshot>();
     snapshot->content_fingerprint = kGraphicsBindingFingerprintOffset;
@@ -8581,6 +8644,8 @@ private:
     snapshot->sampler_heap = packet.descriptor_heaps.sampler;
     snapshot->bindless = true;
     snapshot->compiled_compute = compute;
+    snapshot->compiled_binding_identity_hash =
+        HashCompiledDescriptorBindingIdentity(packet, compute);
     snapshot->compiled_tables.reserve(packet.root_tables.size());
     for (const auto &table : packet.root_tables) {
       snapshot->compiled_tables.push_back({
@@ -8589,6 +8654,39 @@ private:
     CaptureDescriptorTableBindings(
         *snapshot, replay_state, pipeline,
         GetDescriptorTableBindingRecipe(pipeline, *root, compute), compute);
+    // Root CBV/SRV/UAV and 32-bit constants are part of the submitted binding
+    // state. Capture them into the same snapshot so encode-time packBindless
+    // does not fall back to empty live cbuf_/resview_ slots on the async path.
+    {
+      const auto parameters = root->GetParameters();
+      for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+        const auto &parameter = parameters[root_index];
+        if (parameter.parameter_type ==
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+          continue;
+        if (parameter.parameter_type ==
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+          CaptureGraphicsRootConstants(*snapshot, replay_state, pipeline,
+                                       root_index, parameter, compute);
+          capture_stats.root_constants++;
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+          CaptureGraphicsRootDescriptor(
+              *snapshot, replay_state, pipeline, root_index, parameter,
+              DescriptorRecordType::ConstantBufferView, compute);
+          capture_stats.root_descriptors++;
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+          CaptureGraphicsRootDescriptor(
+              *snapshot, replay_state, pipeline, root_index, parameter,
+              DescriptorRecordType::ShaderResourceView, compute);
+          capture_stats.root_descriptors++;
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+          CaptureGraphicsRootDescriptor(
+              *snapshot, replay_state, pipeline, root_index, parameter,
+              DescriptorRecordType::UnorderedAccessView, compute);
+          capture_stats.root_descriptors++;
+        }
+      }
+    }
     FinalizeCompiledDescriptorSnapshot(*snapshot);
     capture_stats.entries = snapshot->entries.size();
     capture_stats.descriptors = snapshot->entries.size();
@@ -15339,7 +15437,7 @@ private:
     uint32_t entry_count = 0;
   };
 
-  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 3;
+  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 5;
 
   static std::string BuildDescriptorTableBindingRecipeCachePath() {
     return dxmt::GetDXMTShaderCacheDirectory() + "d3d12_binding_recipes.db";
