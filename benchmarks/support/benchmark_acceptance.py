@@ -86,6 +86,8 @@ def canonical_name(result: dict[str, Any]) -> str:
 def run_benchmark(args: argparse.Namespace, output_path: Path) -> int:
     command = [
         str(args.launcher),
+        "wine-exec",
+        "--",
         str(args.executable.resolve()),
         f"--benchmark_out={output_path}",
         "--benchmark_out_format=json",

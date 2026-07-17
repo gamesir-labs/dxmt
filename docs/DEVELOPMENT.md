@@ -77,7 +77,9 @@ Then `./.cache/toolchains/llvm-darwin-local` contains what we need later.
 
 See [winehq.org - MacOS Building](https://gitlab.winehq.org/wine/wine/-/wikis/MacOS-Building)
 
-You should also check the target architecture of Wine build, `--enable-archs=i386,x86_64` is a popular option when you also want x86 (32-bit programs) support in addition to x86_64.
+Wine is built as a **64-bit host with WoW64** for 32-bit Windows apps. DXMT
+does **not** ship native i386 PE DLLs; the product path is x86_64 PE + x86_64
+unixlib. Wine itself may still enable i386 modules for WoW64 loading.
 
 For managed CI and `scripts/dxmt-builder` cross builds, Wine is prepared with:
 
@@ -104,13 +106,8 @@ Build (64-bit) Windows PE+ dlls **and** 64-bit unixlib (a Mach-O library with `.
 scripts/dxmt-builder build --profile gcc-x64-release-full runtime
 ```
 
-(Optional) Build (32-bit) Windows PE dlls
-
-```sh
-scripts/dxmt-builder build --profile gcc-x86-release runtime
-```
-
-> You can't build 32-bit dlls only, they need 64-bit unixlib to be functional
+Only x86_64 Windows PE profiles are supported (`gcc-x64-release-full`,
+`llvm-mingw-x64-*`). Native i386 DXMT builds are not part of the product.
 
 There are other compile options in [meson.options](/meson.options).
 

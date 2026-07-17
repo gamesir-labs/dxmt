@@ -336,6 +336,17 @@ std::string MesonArray(std::initializer_list<fs::path> values) {
   return result;
 }
 
+std::string Join(const std::vector<std::string> &values,
+                 std::string_view separator) {
+  std::ostringstream result;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index != 0)
+      result << separator;
+    result << values[index];
+  }
+  return result.str();
+}
+
 struct ResolvedProfile {
   const Profile *profile = nullptr;
   fs::path root;
@@ -379,6 +390,8 @@ public:
       return BuildCommand(arguments.subspan(1));
     if (arguments.front() == "test")
       return TestCommand(arguments.subspan(1));
+    if (arguments.front() == "wine-exec")
+      return WineExecCommand(arguments.subspan(1));
     if (arguments.front() == "install")
       return InstallCommand(arguments.subspan(1));
     if (arguments.front() == "cache")
@@ -416,6 +429,7 @@ private:
         << "  configure [--profile NAME]\n"
         << "  build [--profile NAME] <runtime|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
         << "  test [--profile NAME] [all|unit|integration|performance] [--suite NAME] [--test-args ARG]\n"
+        << "  wine-exec [--] <wine-args...>   # Meson/benchmark Wine launcher\n"
         << "  install [--profile NAME] [--component NAME] [--dest PATH]\n"
         << "  cache <status [--json]|verify|prune [--dry-run|--apply]|clean --profile NAME>\n";
   }
@@ -541,6 +555,36 @@ private:
     }
     detail << "; run 'scripts/dxmt-builder bootstrap llvm-darwin-x64'";
     throw std::runtime_error(detail.str());
+  }
+
+  std::vector<std::string> NativeLlvmLinkArgs(const fs::path &prefix) const {
+    static constexpr std::array<std::string_view, 2> headers = {
+        "llvm/ADT/StringRef.h", "llvm/IR/Constants.h"};
+    static constexpr std::array<std::string_view, 7> libraries = {
+        "LLVMBitReader", "LLVMCore", "LLVMRemarks", "LLVMBinaryFormat",
+        "LLVMBitstreamReader", "LLVMSupport", "LLVMDemangle"};
+    std::vector<std::string> arguments;
+    for (const auto header : headers) {
+      const auto include = prefix / "include" / header;
+      if (!fs::is_regular_file(include))
+        throw std::runtime_error("native LLVM prefix is incomplete: missing " +
+                                 include.string());
+    }
+    for (const auto library : libraries) {
+      const auto archive =
+          prefix / "lib" / ("lib" + std::string(library) + ".a");
+      if (!fs::is_regular_file(archive))
+        throw std::runtime_error("native LLVM prefix is incomplete: missing " +
+                                 archive.string());
+      arguments.emplace_back("-l" + std::string(library));
+    }
+    arguments.insert(arguments.end(), {"-lm", "-lz"});
+    const auto prefix_string = prefix.string();
+    if (prefix_string.starts_with("/usr/local/opt/") ||
+        prefix_string.starts_with("/opt/homebrew/opt/"))
+      arguments.emplace_back("-lzstd");
+    arguments.insert(arguments.end(), {"-lcurses", "-lxml2"});
+    return arguments;
   }
 
   fs::path ResolveCompiler(const Profile &profile, std::string_view executable) const {
@@ -738,6 +782,13 @@ private:
     }
 
     const auto version = EnvironmentValue("DXMT_BUILDER_DXMT_VERSION");
+    const auto native_llvm_link_args =
+        Join(NativeLlvmLinkArgs(profile.native_llvm), ",");
+    const auto native_llvm_link_args_digest = Sha256(native_llvm_link_args);
+    const bool native_llvm_link_args_compatible =
+        existing.contains("native_llvm_link_args_digest") &&
+        existing.at("native_llvm_link_args_digest") ==
+            native_llvm_link_args_digest;
     if (!fs::is_regular_file(profile.build / "meson-private/coredata.dat")) {
       std::vector<std::string> command = {
           "meson", "setup", profile.build.string(), repo_root_.string(),
@@ -751,6 +802,7 @@ private:
       command.push_back("--prefix");
       command.push_back("/usr/local");
       command.push_back("-Dnative_llvm_path=" + profile.native_llvm.string());
+      command.push_back("-Dnative_llvm_link_args=" + native_llvm_link_args);
       command.push_back("-Denable_tests=" + std::string(profile.profile->tests ? "true" : "false"));
       command.push_back("-Denable_nvapi=" + std::string(profile.profile->nvapi ? "true" : "false"));
       command.push_back("-Denable_nvngx=" + std::string(profile.profile->nvngx ? "true" : "false"));
@@ -772,17 +824,22 @@ private:
       }
       RequireSuccess(RunCommand(command, BuildEnvironment()), "Meson configure");
     } else if (!existing.contains("dxmt_version") ||
-               existing.at("dxmt_version") != version) {
+               existing.at("dxmt_version") != version ||
+               !native_llvm_link_args_compatible) {
       RequireSuccess(
           RunCommand({"meson", "configure", profile.build.string(),
-                      "-Ddxmt_version=" + version}, BuildEnvironment()),
-          "DXMT version reconfigure");
+                      "-Ddxmt_version=" + version,
+                      "-Dnative_llvm_link_args=" + native_llvm_link_args},
+                     BuildEnvironment()),
+          "DXMT option reconfigure");
     }
 
     std::ostringstream properties;
     properties << "schema=1\nprofile=" << profile.profile->name
                << "\nfingerprint=" << profile.fingerprint
                << "\ndxmt_version=" << version
+               << "\nnative_llvm_link_args_digest="
+               << native_llvm_link_args_digest
                << "\nwine_root=" << profile.wine_root.string() << '\n';
     WriteFileAtomic(properties_path, properties.str());
   }
@@ -880,6 +937,291 @@ private:
     return 0;
   }
 
+  static bool PathIsExecutable(const fs::path &path) {
+    return fs::is_regular_file(path) && access(path.c_str(), X_OK) == 0;
+  }
+
+  static std::optional<fs::path> FindWineLauncher(const fs::path &root) {
+    for (const auto &name : {"wine", "wine64"}) {
+      const auto candidate = root / "bin" / name;
+      if (PathIsExecutable(candidate))
+        return candidate;
+    }
+    return std::nullopt;
+  }
+
+  fs::path ResolveWineRootForTests() const {
+    if (const char *path = std::getenv("DXMT_TEST_WINE_ROOT")) {
+      if (fs::is_directory(path))
+        return fs::canonical(path);
+    }
+    if (const char *path = std::getenv("DXMT_WINE_ROOT")) {
+      if (fs::is_directory(path))
+        return fs::canonical(path);
+    }
+    const auto deps = managed_root_ / "deps";
+    if (fs::is_directory(deps)) {
+      std::vector<fs::path> matches;
+      for (const auto &entry : fs::directory_iterator(deps)) {
+        if (!entry.is_directory())
+          continue;
+        if (!entry.path().filename().string().starts_with("wine-x86_64-"))
+          continue;
+        if (FindWineLauncher(entry.path()))
+          matches.push_back(entry.path());
+      }
+      if (!matches.empty()) {
+        std::sort(matches.begin(), matches.end());
+        return fs::canonical(matches.back());
+      }
+    }
+    throw std::runtime_error(
+        "no runnable Wine cache found; bootstrap wine-x64 or set DXMT_WINE_ROOT");
+  }
+
+  static bool WinePrefixReady(const fs::path &prefix) {
+    std::error_code error;
+    const auto non_empty = [&](const fs::path &path) {
+      return fs::is_regular_file(path, error) && fs::file_size(path, error) > 0 &&
+             !error;
+    };
+    return non_empty(prefix / "system.reg") && non_empty(prefix / "user.reg") &&
+           non_empty(prefix / "userdef.reg") &&
+           fs::is_regular_file(prefix / ".update-timestamp", error) &&
+           fs::exists(prefix / "dosdevices/c:", error);
+  }
+
+  Environment WineTestEnvironment(const fs::path &wine_root,
+                                  const fs::path &runtime_root,
+                                  bool require_runtime_deps) const {
+    Environment environment = BuildEnvironment();
+    environment["WINEARCH"] = EnvironmentValue("WINEARCH", "win64");
+    environment["WINEDEBUG"] = EnvironmentValue("WINEDEBUG", "-all");
+    environment["DXMT_EXPERIMENT_DX12_SUPPORT"] =
+        EnvironmentValue("DXMT_EXPERIMENT_DX12_SUPPORT", "1");
+    environment["WINEDLLOVERRIDES"] = EnvironmentValue(
+        "WINEDLLOVERRIDES",
+        "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");
+    environment["DXMT_TEST_WINE_ROOT"] = wine_root.string();
+
+    if (require_runtime_deps) {
+      for (const auto *dylib :
+           {"libfreetype.6.dylib", "libgcrypt.20.dylib", "libgmp.10.dylib",
+            "libgnutls.30.dylib", "libSDL2-2.0.0.dylib", "libMoltenVK.dylib"}) {
+        if (!fs::is_regular_file(wine_root / "lib" / dylib))
+          throw std::runtime_error(std::string("Wine runtime missing ") + dylib +
+                                   " under " + wine_root.string());
+      }
+    }
+
+    std::string library_path =
+        (wine_root / "lib").string() + ":" +
+        (wine_root / "lib/wine/x86_64-unix").string();
+    if (!runtime_root.empty()) {
+      if (!fs::is_directory(runtime_root / "x86_64-windows") ||
+          !fs::is_directory(runtime_root / "x86_64-unix"))
+        throw std::runtime_error("invalid DXMT test runtime root: " +
+                                 runtime_root.string());
+      environment["DXMT_TEST_RUNTIME_ROOT"] = runtime_root.string();
+      const char *existing = std::getenv("WINEDLLPATH");
+      environment["WINEDLLPATH"] =
+          runtime_root.string() +
+          (existing && *existing ? std::string(":") + existing : std::string());
+      library_path =
+          (runtime_root / "x86_64-unix").string() + ":" + library_path;
+    }
+    const char *fallback = std::getenv("DYLD_FALLBACK_LIBRARY_PATH");
+    environment["DYLD_FALLBACK_LIBRARY_PATH"] =
+        library_path +
+        (fallback && *fallback ? std::string(":") + fallback : std::string());
+    if (fs::is_regular_file(wine_root / "lib/libMoltenVK.dylib"))
+      environment["WINE_SONAME_LIBVULKAN"] =
+          (wine_root / "lib/libMoltenVK.dylib").string();
+    return environment;
+  }
+
+  // Wine launcher used by Meson tests and benchmarks:
+  //   scripts/dxmt-builder wine-exec [--] <exe> [args...]
+  int WineExecCommand(std::span<const std::string> arguments) const {
+    std::vector<std::string> wine_args;
+    for (const auto &argument : arguments) {
+      if (argument == "--")
+        continue;
+      wine_args.push_back(argument);
+    }
+    if (wine_args.empty())
+      throw std::runtime_error("wine-exec requires a command to run under Wine");
+
+    fs::path wine_root;
+    fs::path wine_binary;
+    if (const char *explicit_wine = std::getenv("DXMT_TEST_WINE")) {
+      wine_binary = explicit_wine;
+      if (!PathIsExecutable(wine_binary)) {
+        if (const auto resolved = FindExecutable(explicit_wine))
+          wine_binary = *resolved;
+      }
+      if (!PathIsExecutable(wine_binary))
+        throw std::runtime_error("DXMT_TEST_WINE is not executable");
+      wine_root = wine_binary.parent_path().parent_path();
+    } else {
+      wine_root = ResolveWineRootForTests();
+      if (const auto launcher = FindWineLauncher(wine_root))
+        wine_binary = *launcher;
+      else
+        throw std::runtime_error("Wine launcher missing under " +
+                                 wine_root.string());
+    }
+    if (!PathIsExecutable(wine_root / "bin/wineserver"))
+      throw std::runtime_error("incomplete Wine root (no wineserver): " +
+                               wine_root.string());
+
+    fs::path runtime_root;
+    if (const char *path = std::getenv("DXMT_TEST_RUNTIME_ROOT"))
+      runtime_root = path;
+    const bool require_runtime =
+        EnvironmentFlag("DXMT_TEST_REQUIRE_RUNTIME");
+    auto environment =
+        WineTestEnvironment(wine_root, runtime_root, require_runtime);
+    if (const char *prefix = std::getenv("DXMT_TEST_WINEPREFIX"))
+      environment["WINEPREFIX"] = prefix;
+    else if (const char *prefix = std::getenv("WINEPREFIX"))
+      environment["WINEPREFIX"] = prefix;
+
+    std::vector<std::string> command = {wine_binary.string()};
+    command.insert(command.end(), wine_args.begin(), wine_args.end());
+    const auto result = RunCommand(command, environment);
+    return result.status == 0 ? 0 : result.status;
+  }
+
+  fs::path StageWineTestRuntime(const ResolvedProfile &profile,
+                                std::string_view suite,
+                                std::string_view mode) const {
+    std::string build_targets;
+    std::string install_tags;
+    if (suite == "all") {
+      build_targets = "dxmt-runtime dxmt-wine-tests";
+      install_tags = "runtime-common,runtime-metal3,runtime-metal4,nvext";
+    } else if (suite == "framework") {
+      build_targets = "dxmt-wine-tests-framework";
+    } else if (suite == "d3d10") {
+      build_targets = "dxmt-d3d10 dxmt-wine-tests-d3d10";
+      install_tags = "runtime-common,runtime-metal3";
+    } else if (suite == "d3d11") {
+      build_targets = "dxmt-d3d11 dxmt-wine-tests-d3d11";
+      install_tags = "runtime-common,runtime-metal3";
+    } else if (suite == "d3d12") {
+      build_targets = "dxmt-d3d12 dxmt-wine-tests-d3d12";
+      install_tags = "runtime-common,runtime-metal4";
+    } else {
+      throw std::runtime_error("unsupported test suite: " + std::string(suite));
+    }
+    if (mode == "all" || mode == "integration" || mode == "performance")
+      build_targets += " dxmt-benchmarks";
+
+    std::vector<std::string> compile = {"meson", "compile", "-C",
+                                        profile.build.string()};
+    {
+      std::istringstream input{build_targets};
+      std::string target;
+      while (input >> target)
+        compile.push_back(target);
+    }
+    RequireSuccess(RunCommand(compile, BuildEnvironment()),
+                   "compile Wine test targets");
+
+    const auto stage_dir = profile.build / "wine-test-runtime-stage";
+    fs::remove_all(stage_dir);
+    fs::create_directories(stage_dir);
+    if (!install_tags.empty()) {
+      auto install_env = BuildEnvironment();
+      install_env["DESTDIR"] = stage_dir.string();
+      RequireSuccess(
+          RunCommand({"meson", "install", "-C", profile.build.string(),
+                      "--no-rebuild", "--tags", install_tags},
+                     install_env),
+          "stage Wine test runtime");
+    }
+
+    // Resolve Meson prefix (usually /usr/local).
+    const auto prefix_result = RunCommand(
+        {"/bin/sh", "-c",
+         "meson introspect " + ShellQuote(profile.build.string()) +
+             " --buildoptions | python3 -c \""
+             "import json,sys\n"
+             "for o in json.load(sys.stdin):\n"
+             "  if o.get('name')=='prefix':\n"
+             "    print(o.get('value') or ''); break\n"
+             "\""},
+        BuildEnvironment(), true);
+    RequireSuccess(prefix_result, "resolve meson prefix");
+    std::string prefix = Trim(prefix_result.output);
+    if (prefix.empty())
+      prefix = "/usr/local";
+
+    const auto runtime_root = stage_dir / prefix;
+    fs::create_directories(runtime_root / "x86_64-windows");
+    fs::create_directories(runtime_root / "x86_64-unix");
+
+    std::vector<std::string> required;
+    if (suite == "all") {
+      required = {"x86_64-windows/d3d11.dll", "x86_64-windows/d3d12.dll",
+                  "x86_64-windows/dxgi.dll", "x86_64-windows/winemetal.dll",
+                  "x86_64-windows/winemetal4.dll", "x86_64-unix/winemetal.so",
+                  "x86_64-unix/winemetal4.so"};
+    } else if (suite == "d3d10") {
+      required = {"x86_64-windows/d3d10core.dll", "x86_64-windows/d3d11.dll",
+                  "x86_64-windows/dxgi.dll", "x86_64-unix/winemetal.so"};
+    } else if (suite == "d3d11") {
+      required = {"x86_64-windows/d3d11.dll", "x86_64-windows/dxgi.dll",
+                  "x86_64-unix/winemetal.so"};
+    } else if (suite == "d3d12") {
+      required = {"x86_64-windows/d3d12.dll", "x86_64-windows/dxgi.dll",
+                  "x86_64-windows/winemetal4.dll", "x86_64-unix/winemetal4.so"};
+    }
+    for (const auto &relative : required) {
+      if (!fs::is_regular_file(runtime_root / relative))
+        throw std::runtime_error("staged runtime is missing " + relative);
+    }
+    return runtime_root;
+  }
+
+  void EnsureWinePrefix(const fs::path &wine_root, const fs::path &prefix,
+                        const fs::path &runtime_root) const {
+    fs::create_directories(prefix);
+    const auto wine = FindWineLauncher(wine_root);
+    if (!wine)
+      throw std::runtime_error("Wine launcher missing under " +
+                               wine_root.string());
+    const auto version = RunCommand({wine->string(), "--version"},
+                                    {{"WINEPREFIX", prefix.string()}}, true);
+    RequireSuccess(version, "wine --version");
+    const auto identity = Trim(version.output);
+    const auto marker = prefix / ".dxmt-test-ready";
+    std::string previous;
+    if (fs::is_regular_file(marker)) {
+      std::ifstream input(marker);
+      std::getline(input, previous);
+    }
+    if (WinePrefixReady(prefix) && previous == identity) {
+      RunCommand({(wine_root / "bin/wineserver").string(), "-k"},
+                 {{"WINEPREFIX", prefix.string()}}, true);
+      RunCommand({(wine_root / "bin/wineserver").string(), "-w"},
+                 {{"WINEPREFIX", prefix.string()}}, true);
+      return;
+    }
+
+    auto environment = WineTestEnvironment(wine_root, runtime_root, false);
+    environment["WINEPREFIX"] = prefix.string();
+    environment["DXMT_TEST_REQUIRE_RUNTIME"] = "0";
+    // Initialize prefix via wineboot under wine-exec semantics.
+    std::vector<std::string> boot = {wine->string(), "wineboot", "-u"};
+    // Run wineboot synchronously; wineserver stays up for the test suite.
+    RequireSuccess(RunCommand(boot, environment), "wineboot -u");
+    WriteFileAtomic(marker, identity + "\n");
+    RunCommand({(wine_root / "bin/wineserver").string(), "-w"},
+               {{"WINEPREFIX", prefix.string()}}, true);
+  }
+
   int TestCommand(std::span<const std::string> arguments) const {
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::string> remaining;
@@ -912,21 +1254,51 @@ private:
         throw std::runtime_error("unexpected test argument: " + remaining[index]);
       }
     }
-    static const std::set<std::string> suites = {"all", "framework", "d3d10", "d3d11", "d3d12"};
+    static const std::set<std::string> suites = {"all", "framework", "d3d10",
+                                                 "d3d11", "d3d12"};
     if (!suites.contains(suite))
       throw std::runtime_error("unsupported test suite: " + suite);
 
-    std::vector<std::string> command = {
-        (repo_root_ / "scripts/run-wine-tests.sh").string(),
-        profile.build.string(), mode, "--suite=" + suite,
-    };
-    command.insert(command.end(), forwarded.begin(), forwarded.end());
+    const auto runtime_root = StageWineTestRuntime(profile, suite, mode);
+    const auto wine_root =
+        profile.wine_root.empty() ? ResolveWineRootForTests() : profile.wine_root;
+    EnsureWinePrefix(wine_root, profile.prefix, runtime_root);
+
     auto environment = BuildEnvironment();
     environment["DXMT_TEST_WINEPREFIX"] = profile.prefix.string();
-    RequireSuccess(RunCommand(command, environment), "Wine tests");
+    environment["DXMT_TEST_WINE_ROOT"] = wine_root.string();
+    environment["DXMT_TEST_RUNTIME_ROOT"] = runtime_root.string();
+    environment["DXMT_TEST_REQUIRE_RUNTIME"] = "1";
+    environment["WINEPREFIX"] = profile.prefix.string();
+
+    if (mode == "all" || mode == "unit") {
+      std::string scheduler_args = "--dxmt-test-suite=" + suite;
+      for (const auto &argument : forwarded) {
+        if (argument.starts_with("--test-args="))
+          scheduler_args += " " + argument.substr(std::string("--test-args=").size());
+      }
+      std::vector<std::string> command = {
+          "meson", "test", "-C", profile.build.string(), "--no-rebuild",
+          "--suite", "wine", "--print-errorlogs",
+          "--test-args=" + scheduler_args,
+      };
+      RequireSuccess(RunCommand(command, environment), "Wine unit tests");
+    }
+    if (mode == "all" || mode == "integration" || mode == "performance") {
+      std::string benchmark_suite = "wine";
+      if (mode == "performance")
+        benchmark_suite = "performance";
+      else if (mode == "integration" && suite != "all")
+        benchmark_suite = suite;
+      std::vector<std::string> command = {
+          "meson", "test", "-C", profile.build.string(), "--no-rebuild",
+          "--benchmark", "--suite", benchmark_suite, "--print-errorlogs",
+      };
+      command.insert(command.end(), forwarded.begin(), forwarded.end());
+      RequireSuccess(RunCommand(command, environment), "Wine benchmark tests");
+    }
+
     if (mode == "all" && suite == "all") {
-      const auto runtime_root =
-          profile.build / "wine-test-runtime-stage/usr/local";
       const auto commit = RunCommand(
           {"git", "-C", repo_root_.string(), "rev-parse", "HEAD"}, {}, true);
       RequireSuccess(commit, "source commit identity");
@@ -938,8 +1310,8 @@ private:
                  << "\ntests_passed=true\n";
       WriteFileAtomic(profile.meta / "tests-passed.properties", properties.str());
     }
-    RecordTelemetry("test", name + ":" + mode + ":" + suite,
-                    "success", started);
+    RecordTelemetry("test", name + ":" + mode + ":" + suite, "success",
+                    started);
     return 0;
   }
 
@@ -1239,11 +1611,11 @@ private:
 } // namespace
 
 const std::vector<Profile> &Profiles() {
+  // Product policy: Windows PE is x86_64 only (Wine WoW64 for 32-bit apps).
+  // No native i386 DXMT profiles.
   static const std::vector<Profile> profiles = {
       {"gcc-x64-release-full", "x64", "gcc", "release", true, true, true, true, false},
-      {"gcc-x86-release", "x86", "gcc", "release", true, false, false, false, false},
       {"llvm-mingw-x64-release", "x64", "llvm-mingw", "release", true, false, true, true, false},
-      {"llvm-mingw-x86-release", "x86", "llvm-mingw", "release", true, false, false, false, false},
       {"llvm-mingw-x64-debugoptimized", "x64", "llvm-mingw", "debugoptimized", true, false, true, true, true},
       {"apple-clang-x86_64-release", "x86_64", "apple-clang", "release", false, false, false, false, false},
   };
@@ -1316,7 +1688,13 @@ void WithFileLock(const fs::path &path,
 
 Application::Application(fs::path repo_root)
     : repo_root_(fs::canonical(std::move(repo_root))),
-      managed_root_(repo_root_ / ".cache/managed") {}
+      managed_root_([&] {
+        if (const char *root = std::getenv("DXMT_CI_ROOT"); root && *root)
+          return fs::path(root);
+        if (const char *root = std::getenv("DXMT_MANAGED_CACHE_ROOT"); root && *root)
+          return fs::path(root);
+        return repo_root_ / ".cache/managed";
+      }()) {}
 
 int Application::Run(std::span<const std::string> arguments) {
   return Driver(repo_root_, managed_root_).Run(arguments);

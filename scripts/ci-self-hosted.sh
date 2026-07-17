@@ -6,7 +6,7 @@ trap 'printf "[dxmt-ci] error: command failed at line %s: %s (exit %s)\n" "$LINE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CACHE_ROOT="${DXMT_MANAGED_CACHE_ROOT:-${REPO_ROOT}/.cache/managed}"
+CACHE_ROOT="${DXMT_CI_ROOT:-${DXMT_MANAGED_CACHE_ROOT:-${REPO_ROOT}/.cache/managed}}"
 TOOLCHAINS_DIR="${CACHE_ROOT}/deps"
 DOWNLOADS_DIR="${CACHE_ROOT}/downloads"
 ARTIFACTS_DIR="${CACHE_ROOT}/artifacts"
@@ -453,9 +453,7 @@ sync_wine_git_source() {
     log "updating Wine git source ${WINE_GIT_BRANCH} (expect ${expected_commit:0:12})"
     git -C "${source_dir}" remote set-url origin "${remote_url}" ||
       die "failed to set Wine git remote URL"
-    # Drop any local build-script edits from a previous molten-vk bypass so
-    # fetch/reset is clean; those patches are re-applied before each build.
-    git -C "${source_dir}" checkout -- scripts/build_on_m1.sh scripts/build_on_intel.sh 2>/dev/null || true
+    # DXMT never patches Wine sources/scripts; hard-reset keeps the tree stock.
     git -C "${source_dir}" fetch --force --depth=1 origin "${WINE_GIT_BRANCH}" ||
       die "failed to fetch Wine branch ${WINE_GIT_BRANCH}"
     git -C "${source_dir}" checkout -B "${WINE_GIT_BRANCH}" FETCH_HEAD ||
@@ -508,7 +506,6 @@ wine_install_ready() {
   wine_development_install_ready "$1" && wine_runtime_install_ready "$1"
 }
 
-
 patch_wine_build_scripts() {
   local source_dir="$1"
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
@@ -546,7 +543,8 @@ wine_run_make() {
   esac
 }
 
-# Full configure+make via wine-proton scripts (first build or clean rebuild).
+# Full configure+make via wine-proton scripts after removing the broken
+# Rosetta Homebrew molten-vk dependency from their package list.
 build_wine_git_source_full() {
   local source_dir="$1"
   patch_wine_build_scripts "${source_dir}"
@@ -577,7 +575,6 @@ build_wine_git_source() {
 
   if [[ -f "${source_dir}/build/Makefile" && -f "${source_dir}/.generated" ]]; then
     log "incremental Wine make/install in ${source_dir}/build"
-    patch_wine_build_scripts "${source_dir}"
     if wine_run_make "${source_dir}"; then
       return 0
     fi
@@ -586,7 +583,7 @@ build_wine_git_source() {
     rm -f "${source_dir}/.generated"
   fi
 
-  log "full Wine configure+make via build_on_* scripts"
+  log "full Wine configure+make via patched build_on_* scripts"
   build_wine_git_source_full "${source_dir}"
 }
 
@@ -736,17 +733,33 @@ configure_llvm_ccache() {
 
 llvm_install_ready() {
   local prefix="$1"
-  [[ -f "${prefix}/lib/cmake/llvm/LLVMConfig.cmake" ]]
+  local required
+  local required_files=(
+    include/llvm/ADT/StringRef.h
+    include/llvm/IR/Constants.h
+    lib/cmake/llvm/LLVMConfig.cmake
+    lib/libLLVMBitReader.a
+    lib/libLLVMCore.a
+    lib/libLLVMRemarks.a
+    lib/libLLVMBinaryFormat.a
+    lib/libLLVMBitstreamReader.a
+    lib/libLLVMSupport.a
+    lib/libLLVMDemangle.a
+  )
+  for required in "${required_files[@]}"; do
+    [[ -f "${prefix}/${required}" ]] || return 1
+  done
 }
 
-# Publish an install prefix only after it contains LLVMConfig.cmake + marker.
+# Publish an install prefix only after it contains headers, static libraries,
+# LLVMConfig.cmake, and the builder marker.
 # Cancelled jobs often leave *.incomplete-* trees; recover those before rebuilding.
 finalize_llvm_prefix() {
   local source="$1"
   local target="$2"
   local fingerprint="$3"
   llvm_install_ready "${source}" ||
-    die "LLVM install prefix is missing LLVMConfig.cmake: ${source}"
+    die "LLVM install prefix is incomplete: ${source}"
   printf 'schema=1\nfingerprint=%s\n' "${fingerprint}" > "${source}/.dxmt-builder-dependency"
   sync 2>/dev/null || true
   if [[ -e "${target}" ]]; then
@@ -757,7 +770,7 @@ finalize_llvm_prefix() {
   [[ -f "${target}/.dxmt-builder-dependency" ]] ||
     die "LLVM finalize lost dependency marker at ${target}"
   llvm_install_ready "${target}" ||
-    die "LLVM finalize lost LLVMConfig.cmake at ${target}"
+    die "LLVM finalize lost required files at ${target}"
   log "LLVM dependency prepared: ${target}"
 }
 

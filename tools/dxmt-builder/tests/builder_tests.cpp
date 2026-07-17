@@ -34,15 +34,16 @@ int main() {
     Check(Sha256("abc") ==
               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
           "abc SHA-256 vector failed");
-    Check(Profiles().size() == 6, "unexpected profile count");
+    Check(Profiles().size() == 4, "unexpected profile count");
     Check(FindProfile("gcc-x64-release-full") != nullptr,
           "default profile missing");
     Check(FindProfile("apple-clang-x86_64-release") != nullptr,
           "native x86_64 profile missing");
+    Check(FindProfile("gcc-x86-release") == nullptr,
+          "native i386 DXMT profile must not be registered");
     for (const auto &profile : Profiles())
-      Check(profile.target_arch == "x64" || profile.target_arch == "x86" ||
-                profile.target_arch == "x86_64",
-            "non-x86 profile was registered");
+      Check(profile.target_arch == "x64" || profile.target_arch == "x86_64",
+            "only x64 PE / native x86_64 profiles are supported");
     Check(FindProfile("not-a-profile") == nullptr,
           "unknown profile was accepted");
     Check(JsonEscape("a\n\"b") == "a\\n\\\"b", "JSON escaping failed");

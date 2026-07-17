@@ -175,73 +175,32 @@ scripts/dxmt-builder test --profile gcc-x64-release-full unit \
   --test-args='--gtest_filter=D3D12DescriptorSpec.RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution'
 ```
 
-`run-wine-tests.sh` compiles and stages the current DXMT DLLs, initializes the
+`scripts/dxmt-builder test` compiles and stages the current DXMT DLLs, initializes the
 dedicated prefix when needed, and injects the staged runtime before starting the
 coordinator. Do not run the PE directly when validating DXMT behavior, because
 that can silently select stale DLLs.
 
-## Windows/WARP differential snapshots
+## Quality-gate assets (not wired into the CLI yet)
 
-The `D3D12 WARP Differential` workflow builds one self-contained oracle on
-Windows and captures a WARP reference, then runs the same PE against the staged
-DXMT runtime. The versioned JSON snapshot contains exact buffer-copy, compute,
-and render-target-clear results. Adapter metadata and diagnostic hashes do not
-participate in comparison; case names, kinds, and values do. Float cases may
-declare an absolute tolerance in the reference.
-
-Compare a downloaded WARP artifact locally with:
+Standalone runner scripts (`run-d3d12-*.sh/py`, `check-d3d12-coverage.py`,
+`run-wine-tests.sh`, `wine-test-wrapper.sh`, …) were removed. The supported
+test entry point is only:
 
 ```sh
-scripts/run-d3d12-differential.sh \
-  .cache/managed/profiles/gcc-x64-release-full/build \
-  .cache/differential/warp-reference.json
+scripts/dxmt-builder test --profile gcc-x64-release-full unit|integration|performance
 ```
 
-The runner rebuilds the oracle, stages the current D3D12 runtime, validates the
-candidate JSON, and rejects missing, unexpected, or mismatched cases.
+Supporting data and helpers remain in-tree for a future CLI subcommand:
 
-## Coverage and mutation gates
+| Path | Role |
+|------|------|
+| `tests/d3d12/differential/` | WARP oracle PE + snapshot compare |
+| `tests/coverage/d3d12_coverage.json` | Public API / coverage thresholds |
+| `tests/mutation/d3d12_mutations.json` | Reviewed mutation manifest |
+| `tests/fault_injection/d3d12_faults.json` | Fault matrix descriptors |
 
-`scripts/check-d3d12-coverage.py` always enforces the checked-in public API
-manifest and, when given gcovr JSON, aggregates line and branch coverage by
-D3D12 subsystem. Thresholds live in `tests/coverage/d3d12_coverage.json`; a
-missing source module or API test is a gate failure. Generate instrumented
-coverage with:
-
-```sh
-scripts/run-d3d12-coverage.sh gcc-x64-release-full
-```
-
-`scripts/run-d3d12-mutations.py` applies reviewed, exact source mutations one at
-a time, runs the owning tests, and restores the source in a `finally` block.
-Compilation failures are infrastructure errors rather than killed mutations.
-The checked-in manifest currently requires a 100% score:
-
-```sh
-python3 scripts/run-d3d12-mutations.py --minimum-score 100
-```
-
-Both gates are available in the `D3D12 Quality Gates` workflow.
-
-## Deterministic fuzzing and fault injection
-
-The D3D12 robustness suite replays 128 fixed command-lifecycle grammars against
-a reference state model, delta-debugs any mismatch, round-trips 128 generated
-root signatures, and rejects a checked-in structural shader corruption corpus.
-Set `DXMT_D3D12_FUZZ_SEED` to replay one reported command seed.
-
-Fault scenarios are declared in
-`tests/fault_injection/d3d12_faults.json`. The runner gives every scenario a
-fresh Wine process so DLL-level fault switches cannot leak between tests:
-
-```sh
-python3 scripts/run-d3d12-fault-injection.py
-```
-
-The matrix covers native descriptor lookup loss, stale native resources,
-command-buffer feedback errors, sparse-residency cleanup, and timestamp
-fallback behavior. It is enforced by the robustness job in the quality-gates
-workflow.
+Targeted D3D12 fault switches still work via env vars on the unit suite (see
+above). There is no separate coverage/mutation/differential wrapper script.
 
 The managed Wine dependency is fingerprinted below `.cache/managed/deps`.
 

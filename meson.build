@@ -458,7 +458,8 @@ if get_option('enable_tests')
     error('Tests require a Windows cross-build directory and run through Wine')
   endif
 
-  wine_test_launcher = find_program('scripts/wine-test-wrapper.sh')
+  # Prefer the managed builder as the single Wine launcher for tests/benchmarks.
+  wine_test_launcher = find_program('scripts/dxmt-builder')
   subdir('external/googletest')
   subdir('tests')
   subdir('external/google-benchmark')

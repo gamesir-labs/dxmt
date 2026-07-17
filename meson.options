@@ -1,4 +1,17 @@
 option('native_llvm_path', type : 'string', value: '/usr/local/opt/llvm@15')
+option('native_llvm_link_args', type : 'array', value: [
+  '-lLLVMBitReader',
+  '-lLLVMCore',
+  '-lLLVMRemarks',
+  '-lLLVMBinaryFormat',
+  '-lLLVMBitstreamReader',
+  '-lLLVMSupport',
+  '-lLLVMDemangle',
+  '-lm',
+  '-lz',
+  '-lcurses',
+  '-lxml2',
+], description : 'Native LLVM static library closure resolved by dxmt-builder')
 option('windows_llvm_path', type : 'string', value: '', description : 'LLVM Windows libraries used by the optional airconv PE target')
 option('build_airconv_for_windows', type : 'boolean', value : false)
 option('dxmt_debug', type : 'boolean', value : false)

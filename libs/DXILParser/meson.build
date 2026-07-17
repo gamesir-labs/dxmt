@@ -2,22 +2,6 @@ dxil_parser_src = files([
   'DXILParser.cpp',
 ])
 
-dxil_llvm_components = [
-  'bitreader',
-  'core',
-  'remarks',
-  'bitstreamreader',
-  'binaryformat',
-  'support',
-  'demangle',
-]
-
-dxil_llvm_config_link_args = [
-  '--link-static',
-  '--ldflags',
-  '--libs',
-] + dxil_llvm_components + ['--system-libs']
-
 dxil_parser_args = [
   '-Wno-extern-c-compat',
 ]
@@ -39,26 +23,20 @@ dxil_target_link_args = []
 
 if not dxmt_crossbuild
   dxil_target_llvm_path = get_option('native_llvm_path')
-  # Keep an absolute LLVM prefix for llvm-config / link flags. Meson rejects
-  # absolute include_directories that point inside the source tree, so always
-  # re-express the include dir relative to this meson file (supports managed
-  # caches under <source>/.cache/managed as well as Homebrew prefixes).
   if not dxil_target_llvm_path.startswith('/')
     dxil_target_llvm_path = join_paths(meson.project_source_root(), dxil_target_llvm_path)
   endif
-  dxil_target_llvm_include_path = include_directories(fs.relative_to(
-    join_paths(dxil_target_llvm_path, 'include'),
-    meson.current_source_dir(),
-  ))
 
-  dxil_target_include_dirs += dxil_target_llvm_include_path
-  dxil_target_cpp_args += dxil_llvm_args
-  dxil_target_llvm_config = find_program(
-    join_paths(dxil_target_llvm_path, 'bin/llvm-config'))
-  dxil_target_link_args += run_command(
-    dxil_target_llvm_config, dxil_llvm_config_link_args,
-    check: true,
-  ).stdout().strip().split()
+  # Managed LLVM can live outside both Meson's source and build roots.
+  # An absolute compiler argument avoids ambiguous relative include paths.
+  dxil_target_cpp_args += dxil_llvm_args + [
+    '-I' + join_paths(dxil_target_llvm_path, 'include'),
+  ]
+  dxil_target_link_args += [
+    '-L' + join_paths(dxil_target_llvm_path, 'lib'),
+    '-Wl,-search_paths_first',
+    '-Wl,-headerpad_max_install_names',
+  ] + get_option('native_llvm_link_args')
 endif
 
 dxil_parser_lib = static_library('DXILParser', dxil_parser_src,
@@ -79,25 +57,25 @@ dxil_native_llvm_path = get_option('native_llvm_path')
 if not dxil_native_llvm_path.startswith('/')
   dxil_native_llvm_path = join_paths(meson.project_source_root(), dxil_native_llvm_path)
 endif
-dxil_llvm_include_path_native = include_directories(fs.relative_to(
-  join_paths(dxil_native_llvm_path, 'include'),
-  meson.current_source_dir(),
-))
 
-dxil_native_llvm_config = find_program(
-  join_paths(dxil_native_llvm_path, 'bin/llvm-config'))
-dxil_llvm_ld_flags_native = run_command(
-  dxil_native_llvm_config, dxil_llvm_config_link_args,
-  check: true,
-).stdout().strip().split()
+# Keep the native-tool include path absolute for split source/cache layouts.
+dxil_llvm_include_arg_native = '-I' + join_paths(dxil_native_llvm_path, 'include')
+dxil_llvm_ld_flags_native = [
+  '-L' + join_paths(dxil_native_llvm_path, 'lib'),
+  '-Wl,-search_paths_first',
+  '-Wl,-headerpad_max_install_names',
+] + get_option('native_llvm_link_args')
 
 dxil_parser_native_lib = static_library('DXILParserNative', dxil_parser_src,
   include_directories : [
     dxmt_native_include_path,
     include_directories('..'),
-    dxil_llvm_include_path_native,
   ],
-  cpp_args            : [ dxil_parser_args, dxil_llvm_args ],
+  cpp_args            : [
+    dxil_parser_args,
+    dxil_llvm_args,
+    dxil_llvm_include_arg_native,
+  ],
   link_args           : dxil_llvm_ld_flags_native,
   native              : dxmt_crossbuild,
 )

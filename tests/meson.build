@@ -142,7 +142,7 @@ dxmt_wine_test_scheduler = executable(
 test(
   'dxmt-wine-unit-tests',
   wine_test_launcher,
-  args: [dxmt_wine_test_scheduler],
+  args: ['wine-exec', '--', dxmt_wine_test_scheduler],
   suite: ['unit', 'wine'],
   timeout: 120,
   env: wine_test_env,

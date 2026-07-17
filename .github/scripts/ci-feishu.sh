@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Feishu / Lark webhook helpers for macOS self-hosted CI runners.
 # Used by Nightly / Component result notify on self-macos-runner.
-# Push/PR/issue events stay on Windows via scripts/ci-feishu.ps1.
+# Push/PR/issue events stay on Windows via .github/scripts/ci-feishu.ps1.
 #
 # HTTP posts go through curl (macOS Secure Transport / system CA store).
 # Do not use Python urllib.request: Homebrew Python OpenSSL often fails
