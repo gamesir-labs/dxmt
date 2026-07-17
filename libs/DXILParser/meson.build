@@ -39,15 +39,17 @@ dxil_target_link_args = []
 
 if not dxmt_crossbuild
   dxil_target_llvm_path = get_option('native_llvm_path')
-
+  # Keep an absolute LLVM prefix for llvm-config / link flags. Meson rejects
+  # absolute include_directories that point inside the source tree, so always
+  # re-express the include dir relative to this meson file (supports managed
+  # caches under <source>/.cache/managed as well as Homebrew prefixes).
   if not dxil_target_llvm_path.startswith('/')
-    dxil_target_llvm_include_path = include_directories(
-      join_paths('../..', dxil_target_llvm_path, 'include'))
     dxil_target_llvm_path = join_paths(meson.project_source_root(), dxil_target_llvm_path)
-  else
-    dxil_target_llvm_include_path = include_directories(
-      join_paths(dxil_target_llvm_path, 'include'))
   endif
+  dxil_target_llvm_include_path = include_directories(fs.relative_to(
+    join_paths(dxil_target_llvm_path, 'include'),
+    meson.current_source_dir(),
+  ))
 
   dxil_target_include_dirs += dxil_target_llvm_include_path
   dxil_target_cpp_args += dxil_llvm_args
@@ -74,15 +76,13 @@ dxil_parser_dep = declare_dependency(
 if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
 
 dxil_native_llvm_path = get_option('native_llvm_path')
-
 if not dxil_native_llvm_path.startswith('/')
-  dxil_llvm_include_path_native = include_directories(
-    join_paths('../..', dxil_native_llvm_path, 'include'))
   dxil_native_llvm_path = join_paths(meson.project_source_root(), dxil_native_llvm_path)
-else
-  dxil_llvm_include_path_native = include_directories(
-    join_paths(dxil_native_llvm_path, 'include'))
 endif
+dxil_llvm_include_path_native = include_directories(fs.relative_to(
+  join_paths(dxil_native_llvm_path, 'include'),
+  meson.current_source_dir(),
+))
 
 dxil_native_llvm_config = find_program(
   join_paths(dxil_native_llvm_path, 'bin/llvm-config'))

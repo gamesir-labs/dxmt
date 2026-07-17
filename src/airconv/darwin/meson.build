@@ -1,13 +1,14 @@
 native_llvm_path = get_option('native_llvm_path')
-
+# Prefer absolute LLVM prefixes for llvm-config / -L. include_directories() still
+# needs a path relative to this file when the prefix sits inside the source tree
+# (e.g. managed cache under <source>/.cache/managed).
 if not native_llvm_path.startswith('/')
-  # Meson only allows relative include paths in case the toolchains are located inside
-  # of the project source root, so handle that here.
-  llvm_include_path_darwin = include_directories(join_paths('../../..', native_llvm_path, 'include'))
   native_llvm_path = join_paths(meson.project_source_root(), native_llvm_path)
-else
-  llvm_include_path_darwin = include_directories(join_paths(native_llvm_path, 'include'))
 endif
+llvm_include_path_darwin = include_directories(fs.relative_to(
+  join_paths(native_llvm_path, 'include'),
+  meson.current_source_dir(),
+))
 
 llvm_ld_flags_darwin = [
   '-L'+join_paths(native_llvm_path, 'lib'),
