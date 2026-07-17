@@ -205,6 +205,7 @@ d3d12_unit_suites = {
       'shader/resource_semantic_spec.cpp',
       'shader/semantic_matrix_spec.cpp',
       'shader/system_value_spec.cpp',
+      'shader/uav_counter_spec.cpp',
       'shader/wave_spec.cpp',
       'shader/wave_semantic_matrix_spec.cpp',
     ),

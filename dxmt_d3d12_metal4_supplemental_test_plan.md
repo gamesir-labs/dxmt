@@ -10,7 +10,7 @@
 
 原计划对 command list、legacy barrier、descriptor、resource/copy、shader、graphics、query、sparse 和 fault injection 的框架已经很完整。当前仓库也已经从原计划所述的约 118 个测试增长到：
 
-- 120 个已注册的 D3D12 `_spec.cpp` 文件；
+- 121 个已注册的 D3D12 `_spec.cpp` 文件；
 - 700+ 个静态 GoogleTest 声明，另有参数矩阵生成的逻辑 case；
 - 21 个 D3D12 测试目录；
 - public API coverage manifest 审阅时只列出 85 个方法；第一轮扩展到
@@ -104,6 +104,7 @@ MarkerEventSpec.MarkersDoNotChangeExecutionOrCommandListState
 第八轮：5 个 graphics shader system-value case，manifest 保持 165
 第九轮：4 个 pipeline cache invalidation/stability case，manifest 保持 165
 第十轮：3 个 pixel depth-output system-value case，manifest 保持 165
+第十一轮：3 个 structured UAV counter/append/decrement case，manifest 保持 165
 GetCustomHeapProperties：修正并覆盖 CUSTOM type、UMA page/pool 和 NodeMask
 OpenExistingHeapFromAddress：覆盖有效 VirtualAlloc -> placed buffer -> GPU copy
 OpenExistingHeapFromFileMapping / CreateLifetimeTracker：覆盖 fail-closed 和输出清空
@@ -402,6 +403,18 @@ Add / And / Or / Xor / Min / Max / Exchange / CompareExchange
 UAV barrier、cross-list、cross-queue 可见性
 32-bit；64-bit 仅在 capability 宣称时执行
 ```
+
+第十一轮新增 `shader/uav_counter_spec.cpp` 的 3 个确定性离屏 compute case：
+非零初始 counter 从 1 开始执行三次 append，验证写入元素和最终 counter=4；
+在 `D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT`（4096 字节）处绑定独立 counter，
+验证非零 `CounterOffsetInBytes` 生效且 offset 0 标记不被污染；四线程执行
+`DecrementCounter`，验证每个元素恰好被复制一次且 counter 原子递减到 0。
+Append 和 decrement 使用 Wine conformance 测试的预编译 SM5 DXBC，以绕过
+当前 vkd3d HLSL 前端不识别 `AppendStructuredBuffer` 的编译限制。现有
+`resource_semantic_spec.cpp` 已覆盖 structured UAV 的 8 种 32-bit atomic op；
+后续仍需补 source-level `ConsumeStructuredBuffer` 编译路径、counter 最后合法位置/
+非法 offset、同资源组合、contention、cross-list/cross-queue 和 capability-gated
+64-bit atomic 矩阵。
 
 ### P1-3. Texture Sampling 与 Numeric Edge Matrix
 
