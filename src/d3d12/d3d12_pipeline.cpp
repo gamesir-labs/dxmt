@@ -2710,6 +2710,16 @@ GetNativeShaderAbiEligibilityImpl(
 DXMT12_MTL4_SHADER_ABI_VERSION
 PsoShaderAbiVersion(const std::vector<PipelineDxilShader> &shaders,
                     const RootSignature *root_signature) {
+  // FH4 UI A/B: restore the pre-e9c04efc / pre-bindless-only behavior where
+  // eligible PSOs stay on the legacy per-draw binding path. This matches the
+  // 2026-07-13 user-validated "path=legacy" control that avoided the
+  // descriptor-mirror / native ABI cluster. Shader disk caches must also be
+  // cold (or air-cache key bumped) when toggling this flag.
+  static const bool force_legacy =
+      env::getEnvVar("DXMT_FORCE_LEGACY_BINDING") == "1";
+  if (force_legacy)
+    return DXMT12_MTL4_SHADER_ABI_LEGACY;
+
   if (GetNativeShaderAbiEligibilityImpl(shaders, root_signature) ==
       NativeShaderAbiEligibilityReason::None)
     return DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
