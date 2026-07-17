@@ -156,6 +156,10 @@ convert_dxbc_geometry_shader(
   auto mesh_idx = func_signature.DefineInput(air::InputMesh{(uint32_t)max_vertex_out, (uint32_t)max_vertex_out, topology});
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
 
+  if (topology == air::MeshOutputTopology::Point) {
+    func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
+  }
+
   if (pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
@@ -312,13 +316,16 @@ convert_dxbc_geometry_shader(
     resource_map.call_emit = [&]() -> IREffect {
       // only one accumulator to maintain, simple one ~
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
-      builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
+      auto next_point = builder.CreateAdd(one_const, current_write_vertex);
+      builder.CreateStore(next_point, next_write_vertex);
+      builder.CreateStore(next_point, primitive_count);
 
       MeshOutputContext gs_out_ctx{current_write_vertex, current_write_vertex};
       for (auto &h : gs_output_handlers) {
         co_yield h(gs_out_ctx);
       }
       emit_clip_distances(current_write_vertex);
+      air.CreateSetMeshPointSize(current_write_vertex, air.getFloat(1.0));
       air.CreateSetMeshIndex(current_write_vertex, current_write_vertex);
       co_return {};
     };

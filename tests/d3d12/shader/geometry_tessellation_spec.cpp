@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 
 namespace {
 
@@ -43,7 +44,9 @@ protected:
   CreatePipeline(const ShaderCompilation &vs, const ShaderCompilation &ps,
                  const ShaderCompilation *gs = nullptr,
                  const ShaderCompilation *hs = nullptr,
-                 const ShaderCompilation *ds = nullptr) {
+                 const ShaderCompilation *ds = nullptr,
+                 D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type =
+                     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = root_.get();
     desc.VS = {vs.bytecode->GetBufferPointer(), vs.bytecode->GetBufferSize()};
@@ -63,7 +66,7 @@ protected:
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.SampleMask = std::numeric_limits<UINT>::max();
     desc.PrimitiveTopologyType = hs ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH
-                                    : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                                    : topology_type;
     desc.NumRenderTargets = 1;
     desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
@@ -75,7 +78,8 @@ protected:
   }
 
   void DrawAndExpectCenter(ID3D12PipelineState *pipeline,
-                           D3D12_PRIMITIVE_TOPOLOGY topology) {
+                           D3D12_PRIMITIVE_TOPOLOGY topology,
+                           UINT vertex_count = 3) {
     constexpr FLOAT clear[4] = {};
     context_.list()->ClearRenderTargetView(rtv_, clear, 0, nullptr);
     context_.list()->OMSetRenderTargets(1, &rtv_, FALSE, nullptr);
@@ -87,7 +91,7 @@ protected:
     const D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
     context_.list()->RSSetViewports(1, &viewport);
     context_.list()->RSSetScissorRects(1, &scissor);
-    context_.list()->DrawInstanced(3, 1, 0, 0);
+    context_.list()->DrawInstanced(vertex_count, 1, 0, 0);
     D3D12TestContext::Transition(context_.list(), target_.get(),
                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -107,6 +111,132 @@ protected:
   ComPtr<ID3D12DescriptorHeap> rtv_heap_;
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_ = {};
 };
+
+struct GeometryInputCase {
+  const char *name;
+  const char *declaration;
+  D3D12_PRIMITIVE_TOPOLOGY topology;
+  D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+  UINT vertex_count;
+};
+
+class ShaderGeometryInputSpec
+    : public ShaderAdvancedStageSpec,
+      public ::testing::WithParamInterface<GeometryInputCase> {};
+
+TEST_P(ShaderGeometryInputSpec, EmitsTriangleFromInputTopology) {
+  const auto &test = GetParam();
+  const auto vs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    Data main(uint id : SV_VertexID) {
+      Data output;
+      output.position = float4(0.0, 0.0, 0.0, 1.0);
+      return output;
+    })",
+                                "vs_5_0");
+  const std::string geometry_source = std::string(R"(
+    struct Data { float4 position : SV_Position; };
+    [maxvertexcount(3)]
+    void main()") + test.declaration + R"(,
+              inout TriangleStream<Data> stream) {
+      Data output;
+      output.position = float4(-1.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(-1.0, 3.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(3.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+    })";
+  const auto gs = CompileShader(geometry_source.c_str(), "gs_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 test.topology_type);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(), test.topology, test.vertex_count);
+}
+
+std::string GeometryInputCaseName(
+    const ::testing::TestParamInfo<GeometryInputCase> &info) {
+  return info.param.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InputTopology, ShaderGeometryInputSpec,
+    ::testing::Values(
+        GeometryInputCase{"Point", "point Data input[1]",
+                          D3D_PRIMITIVE_TOPOLOGY_POINTLIST,
+                          D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, 1},
+        GeometryInputCase{"Line", "line Data input[2]",
+                          D3D_PRIMITIVE_TOPOLOGY_LINELIST,
+                          D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, 2},
+        GeometryInputCase{"LineAdjacency", "lineadj Data input[4]",
+                          D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ,
+                          D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, 4},
+        GeometryInputCase{"TriangleAdjacency", "triangleadj Data input[6]",
+                          D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ,
+                          D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, 6}),
+    GeometryInputCaseName);
+
+TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsPointPrimitive) {
+  const auto vs = CompileShader(R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      return float4(0.0, 0.0, 0.0, 1.0);
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    [maxvertexcount(1)]
+    void main(point Data input[1], inout PointStream<Data> stream) {
+      Data output;
+      output.position = float4(0.0625, -0.0625, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_POINTLIST, 1);
+}
+
+TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsLineStripPrimitive) {
+  const auto vs = CompileShader(R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      return float4(0.0, 0.0, 0.0, 1.0);
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    [maxvertexcount(2)]
+    void main(point Data input[1], inout LineStream<Data> stream) {
+      Data output;
+      output.position = float4(-1.0, -0.0625, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(1.0, -0.0625, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_POINTLIST, 1);
+}
 
 TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsTrianglePrimitive) {
   const auto vs = CompileShader(R"(
