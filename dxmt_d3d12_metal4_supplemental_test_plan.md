@@ -10,7 +10,7 @@
 
 原计划对 command list、legacy barrier、descriptor、resource/copy、shader、graphics、query、sparse 和 fault injection 的框架已经很完整。当前仓库也已经从原计划所述的约 118 个测试增长到：
 
-- 112 个已注册的 D3D12 `_spec.cpp` 文件；
+- 113 个已注册的 D3D12 `_spec.cpp` 文件；
 - 700+ 个静态 GoogleTest 声明，另有参数矩阵生成的逻辑 case；
 - 21 个 D3D12 测试目录；
 - public API coverage manifest 审阅时只列出 85 个方法；第一轮扩展到
@@ -100,6 +100,7 @@ MarkerEventSpec.MarkersDoNotChangeExecutionOrCommandListState
         AtomicCopy UINT64 lifecycle；manifest 137 -> 146
 第六轮：6 个 Agility factory/DRED/configuration COM case，
         manifest 146 -> 165
+第七轮：4 个 shared-device 合法并发 case，manifest 保持 165
 GetCustomHeapProperties：修正并覆盖 CUSTOM type、UMA page/pool 和 NodeMask
 OpenExistingHeapFromAddress：覆盖有效 VirtualAlloc -> placed buffer -> GPU copy
 OpenExistingHeapFromFileMapping / CreateLifetimeTracker：覆盖 fail-closed 和输出清空
@@ -117,6 +118,7 @@ Stream Output：覆盖非空 target fail-close/recovery 与空 target 合法 no-
 Factory/DRED：覆盖 flags 隔离、独立 identity、脱离 factory 生命周期、全枚举值
 Agility concurrency：覆盖 8 线程并发 GetInterface/CreateDeviceFactory
 Library subobject deserializer：覆盖失败输出清空并修复早期返回残留指针
+Concurrency：覆盖并行对象创建、独立 list 录制、root/query 创建和 fence events
 ```
 
 第四轮运行安全说明：首次 16 条 swapchain 定向运行中，除
@@ -467,6 +469,11 @@ descriptor/resource client ref 已释放但 GPU submission 仍在飞行
 ```
 
 只把规范允许的并发列为 conformance；同对象非法并发归 robustness，断言不崩溃而不是固定结果。
+
+截至第七轮，新增 `device/concurrency_spec.cpp`，覆盖同一 device 上 8 线程
+并行创建 resource/descriptor heap/fence、不同 allocator/list 并行录制与
+Close、并行创建 root signature/query heap，以及同一 fence 的多个完成事件
+并发注册。以上测试只覆盖规范允许的跨对象并发，不执行 command list。
 
 ### P1-7. Cache 跨进程、文件系统错误与失效键
 

@@ -21,6 +21,7 @@ d3d12_unit_suites = {
   'device': {
     'sources': files(
       'device/agility_core_spec.cpp',
+      'device/concurrency_spec.cpp',
       'device/device_control_spec.cpp',
       'device/device_spec.cpp',
       'device/versioned_api_spec.cpp',
