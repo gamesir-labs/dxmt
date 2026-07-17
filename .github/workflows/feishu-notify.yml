@@ -118,12 +118,11 @@ jobs:
 
           if ([string]::IsNullOrWhiteSpace($actionUrl)) { $actionUrl = $repoUrl }
 
-          # Avoid PowerShell here-strings in YAML: unindented @" "@ body breaks the run block.
-          $markdown = $message + "`n`n[" + $actionText + "](" + $actionUrl + ")"
-
           Send-FeishuCard `
             -WebhookUrl $env:FEISHU_WEBHOOK_URL `
             -Title $messageTitle `
             -Subtitle $messageSubTitle `
             -Template $messageTheme `
-            -Markdown $markdown
+            -Markdown $message `
+            -ActionText $actionText `
+            -ActionUrl $actionUrl

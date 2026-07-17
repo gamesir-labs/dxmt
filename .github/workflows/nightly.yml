@@ -455,7 +455,7 @@ jobs:
             "**$(.github/scripts/ci-feishu.sh label branch):** ${{ github.ref_name }}" \
             "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
             "" \
-            "**📦 $(.github/scripts/ci-feishu.sh label component_package):** ${{ needs.package.outputs.artifact_url }}" \
+            "**📦 $(.github/scripts/ci-feishu.sh label component_package):** [$(.github/scripts/ci-feishu.sh label download)](${{ needs.package.outputs.artifact_url }})" \
             "**$(.github/scripts/ci-feishu.sh label size):** ${{ needs.package.outputs.package_size }} bytes" \
             "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`" \
             "" \

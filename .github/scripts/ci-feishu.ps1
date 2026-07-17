@@ -77,7 +77,9 @@ function Send-FeishuCard {
     [Parameter(Mandatory = $true)][string]$Title,
     [Parameter(Mandatory = $true)][string]$Template,
     [Parameter(Mandatory = $true)][string]$Markdown,
-    [string]$Subtitle = ''
+    [string]$Subtitle = '',
+    [string]$ActionText = '',
+    [string]$ActionUrl = ''
   )
 
   if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
@@ -93,6 +95,27 @@ function Send-FeishuCard {
     $header.subtitle = [ordered]@{ tag = 'plain_text'; content = $Subtitle }
   }
 
+  $elements = @(
+    [ordered]@{ tag = 'markdown'; content = $Markdown }
+  )
+  if (-not [string]::IsNullOrWhiteSpace($ActionText) -and
+      -not [string]::IsNullOrWhiteSpace($ActionUrl)) {
+    $elements += [ordered]@{
+      tag       = 'button'
+      text      = [ordered]@{ tag = 'plain_text'; content = $ActionText }
+      type      = 'default'
+      width     = 'default'
+      size      = 'medium'
+      behaviors = @(
+        [ordered]@{
+          type        = 'open_url'
+          default_url = $ActionUrl
+        }
+      )
+      margin    = '12px 0px 0px 0px'
+    }
+  }
+
   $payload = [ordered]@{
     msg_type = 'interactive'
     card     = [ordered]@{
@@ -102,9 +125,7 @@ function Send-FeishuCard {
       body   = [ordered]@{
         direction = 'vertical'
         padding   = '12px 12px 12px 12px'
-        elements  = @(
-          [ordered]@{ tag = 'markdown'; content = $Markdown }
-        )
+        elements  = $elements
       }
     }
   }
