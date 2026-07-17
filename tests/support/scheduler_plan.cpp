@@ -1,6 +1,8 @@
 #include <dxmt_test_scheduler.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -70,6 +72,48 @@ bool FilterMatches(std::string_view filter, std::string_view test_name) {
     positive = "*";
   return MatchesAny(positive, test_name) &&
          (negative.empty() || !MatchesAny(negative, test_name));
+}
+
+std::string CaseNamespaceFromExecutable(std::string_view executable_path) {
+  const auto separator = executable_path.find_last_of("/\\");
+  if (separator != std::string_view::npos)
+    executable_path.remove_prefix(separator + 1);
+
+  constexpr std::string_view prefix = "dxmt-wine-";
+  constexpr std::string_view executable_suffix = ".exe";
+  constexpr std::string_view test_suffix = "-tests";
+  if (executable_path.starts_with(prefix))
+    executable_path.remove_prefix(prefix.size());
+  if (executable_path.ends_with(executable_suffix))
+    executable_path.remove_suffix(executable_suffix.size());
+  if (executable_path.ends_with(test_suffix))
+    executable_path.remove_suffix(test_suffix.size());
+
+  if (executable_path.empty())
+    return "DXMT";
+
+  std::string result(executable_path);
+  for (auto &character : result) {
+    if (character == '-')
+      character = '_';
+    else
+      character = static_cast<char>(
+          std::toupper(static_cast<unsigned char>(character)));
+  }
+  return result;
+}
+
+std::string CaseIdForTest(std::string_view case_namespace,
+                          std::string_view test_name) {
+  std::string result;
+  result.reserve(case_namespace.size() + test_name.size() + 1);
+  if (case_namespace.empty())
+    result = "DXMT";
+  else
+    result = case_namespace;
+  result.push_back('.');
+  result += test_name;
+  return result;
 }
 
 std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,

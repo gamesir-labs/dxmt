@@ -43,6 +43,27 @@ TEST(TestSchedulerFilter, AppliesPositiveAndNegativePatterns) {
   EXPECT_TRUE(dxmt::test::FilterMatches("-*Disabled*", "PipelineState.Fast"));
 }
 
+TEST(TestSchedulerCaseIdentity, DerivesStableNamespaceFromExecutable) {
+  EXPECT_EQ(dxmt::test::CaseNamespaceFromExecutable(
+                "Z:\\build\\dxmt-wine-d3d12-tests.exe"),
+            "D3D12");
+  EXPECT_EQ(dxmt::test::CaseNamespaceFromExecutable(
+                "/tmp/dxmt-wine-framework-tests.exe"),
+            "FRAMEWORK");
+  EXPECT_EQ(dxmt::test::CaseNamespaceFromExecutable("custom-runner"),
+            "CUSTOM_RUNNER");
+  EXPECT_EQ(dxmt::test::CaseNamespaceFromExecutable(""), "DXMT");
+}
+
+TEST(TestSchedulerCaseIdentity, BuildsGlobFilterableGlobalCaseId) {
+  const auto case_id = dxmt::test::CaseIdForTest(
+      "D3D12", "CopyTextureSpec.FullFootprintMatrix");
+  EXPECT_EQ(case_id, "D3D12.CopyTextureSpec.FullFootprintMatrix");
+  EXPECT_TRUE(dxmt::test::FilterMatches(
+      "D3D12.Copy*.*-*.Slow", case_id));
+  EXPECT_FALSE(dxmt::test::FilterMatches("D3D11.*", case_id));
+}
+
 TEST(TestSchedulerPolicy, DisablesFailureShortCircuiting) {
   EXPECT_FALSE(GTEST_FLAG_GET(fail_fast));
   EXPECT_FALSE(GTEST_FLAG_GET(break_on_failure));

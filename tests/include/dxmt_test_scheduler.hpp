@@ -35,6 +35,9 @@ public:
 
 bool GlobMatches(std::string_view pattern, std::string_view value);
 bool FilterMatches(std::string_view filter, std::string_view test_name);
+std::string CaseNamespaceFromExecutable(std::string_view executable_path);
+std::string CaseIdForTest(std::string_view case_namespace,
+                          std::string_view test_name);
 std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,
                               std::size_t maximum_worker_count);
 std::vector<ScheduledTest>

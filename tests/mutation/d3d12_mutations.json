@@ -43,6 +43,27 @@
       "find": "heap_tile = (flags & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE)\n                      ? base\n                      : base + cursor.consumed;",
       "replace": "heap_tile = base + cursor.consumed;",
       "test_filter": "SparseMappingMatrixSpec.ReuseSinglePhysicalTileAliasesVirtualTiles"
+    },
+    {
+      "id": "copyable-footprint-uses-array-slice-as-mip",
+      "file": "src/d3d12/d3d12_device.cpp",
+      "find": "return mip_levels ? sub_resource % mip_levels : 0;",
+      "replace": "return mip_levels ? sub_resource / mip_levels : 0;",
+      "test_filter": "D3D12ResourceSpec.ComputesArrayMipCopyableFootprintsExactly"
+    },
+    {
+      "id": "root-signature-version11-drops-register-space",
+      "file": "src/d3d12/d3d12_root_signature.cpp",
+      "find": "          WriteU32(data, range.BaseShaderRegister);\n          WriteU32(data, range.RegisterSpace);\n          WriteU32(data, uint32_t(range.Flags));",
+      "replace": "          WriteU32(data, range.BaseShaderRegister);\n          WriteU32(data, 0);\n          WriteU32(data, uint32_t(range.Flags));",
+      "test_filter": "RootSignatureSerializationSpec.Version11RoundTrip"
+    },
+    {
+      "id": "copyable-footprint-uses-subresource-modulo-as-plane",
+      "file": "src/d3d12/d3d12_device.cpp",
+      "find": "      const UINT plane =\n          subresources_per_plane ? subresource / subresources_per_plane : 0;",
+      "replace": "      const UINT plane =\n          subresources_per_plane ? subresource % subresources_per_plane : 0;",
+      "test_filter": "PlanarFormatSpec.AdvertisedVideoFormatsExposeTwoPlaneFootprints"
     }
   ]
 }

@@ -42,8 +42,12 @@ std::vector<SerialHint> &SerialHints() {
 
 class FailureCollector final : public ::testing::EmptyTestEventListener {
 public:
+  explicit FailureCollector(std::string_view case_namespace)
+      : case_namespace_(case_namespace) {}
+
   void OnTestStart(const ::testing::TestInfo &test) override {
     current_test_ = std::string(test.test_suite_name()) + "." + test.name();
+    current_case_id_ = CaseIdForTest(case_namespace_, current_test_);
     current_test_reported_ = false;
   }
 
@@ -56,6 +60,11 @@ public:
       report_ +=
           current_test_.empty() ? "global test environment" : current_test_;
       report_ += '\n';
+      if (!current_case_id_.empty()) {
+        report_ += "CaseId: ";
+        report_ += current_case_id_;
+        report_ += '\n';
+      }
       current_test_reported_ = true;
     }
 
@@ -71,6 +80,7 @@ public:
 
   void OnTestEnd(const ::testing::TestInfo &) override {
     current_test_.clear();
+    current_case_id_.clear();
     current_test_reported_ = false;
   }
 
@@ -89,18 +99,20 @@ public:
   }
 
 private:
+  std::string case_namespace_;
   std::string current_test_;
+  std::string current_case_id_;
   std::string report_;
   bool current_test_reported_ = false;
 };
 
-FailureCollector *ConfigureWorkerOutput() {
+FailureCollector *ConfigureWorkerOutput(std::string_view case_namespace) {
   if (std::getenv("DXMT_TEST_VERBOSE_WORKERS") != nullptr)
     return nullptr;
 
   auto &listeners = ::testing::UnitTest::GetInstance()->listeners();
   delete listeners.Release(listeners.default_result_printer());
-  auto *collector = new FailureCollector();
+  auto *collector = new FailureCollector(case_namespace);
   listeners.Append(collector);
   return collector;
 }
@@ -112,8 +124,9 @@ void DisableFailureShortCircuiting() {
   GTEST_FLAG_SET(catch_exceptions, true);
 }
 
-int RunTestsAndReport(std::string_view report_path = {}) {
-  auto *collector = ConfigureWorkerOutput();
+int RunTestsAndReport(std::string_view case_namespace,
+                      std::string_view report_path = {}) {
+  auto *collector = ConfigureWorkerOutput(case_namespace);
   const int result = RUN_ALL_TESTS();
   if (collector == nullptr)
     return result;
@@ -154,7 +167,9 @@ bool TestMustRunSerially(std::string_view name) {
   });
 }
 
-std::vector<ScheduledTest> CollectRunnableTests() {
+std::vector<ScheduledTest>
+CollectRunnableTests(std::string_view case_namespace,
+                     std::string_view case_id_filter = {}) {
   std::vector<ScheduledTest> tests;
   const auto filter = std::string_view(GTEST_FLAG_GET(filter));
   const bool run_disabled = GTEST_FLAG_GET(also_run_disabled_tests);
@@ -170,7 +185,10 @@ std::vector<ScheduledTest> CollectRunnableTests() {
       std::string full_name = std::string(suite->name()) + "." + test->name();
       const bool disabled =
           IsDisabledName(suite->name()) || IsDisabledName(test->name());
-      if ((!disabled || run_disabled) && FilterMatches(filter, full_name))
+      const auto case_id = CaseIdForTest(case_namespace, full_name);
+      if ((!disabled || run_disabled) && FilterMatches(filter, full_name) &&
+          (case_id_filter.empty() ||
+           FilterMatches(case_id_filter, case_id)))
         tests.push_back(
             {full_name, TestCost(full_name), TestMustRunSerially(full_name)});
     }
@@ -193,6 +211,8 @@ struct SchedulerOptions {
   bool jobs_were_set = false;
   bool show_help = false;
   bool is_worker = false;
+  bool list_case_ids = false;
+  std::string case_id_filter;
   std::string report_path;
 };
 
@@ -201,6 +221,8 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
   SchedulerOptions options;
   constexpr std::string_view jobs_prefix = "--dxmt-test-jobs=";
   constexpr std::string_view report_prefix = "--dxmt-test-report=";
+  constexpr std::string_view case_id_prefix = "--dxmt-case-id=";
+  constexpr std::string_view legacy_case_id_prefix = "--dxmt_case_id=";
 
   if (const char *value = std::getenv("DXMT_TEST_JOBS")) {
     const auto parsed = ParsePositiveInteger(value);
@@ -214,6 +236,9 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
     options.jobs_were_set = true;
   }
 
+  if (const char *value = std::getenv("DXMT_TEST_CASE_ID"))
+    options.case_id_filter = value;
+
   for (const auto &argument : arguments) {
     if (argument == "--help" || argument == "-h" ||
         argument == "--gtest_help") {
@@ -224,12 +249,35 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
       options.is_worker = true;
       continue;
     }
+    if (argument == "--dxmt-list-case-ids") {
+      options.list_case_ids = true;
+      continue;
+    }
+    const std::string_view argument_view(argument);
+    if (argument_view.starts_with(case_id_prefix)) {
+      const auto filter = argument_view.substr(case_id_prefix.size());
+      if (filter.empty()) {
+        std::fprintf(stderr, "--dxmt-case-id requires a non-empty filter\n");
+        return std::nullopt;
+      }
+      options.case_id_filter = std::string(filter);
+      continue;
+    }
+    if (argument_view.starts_with(legacy_case_id_prefix)) {
+      const auto filter = argument_view.substr(legacy_case_id_prefix.size());
+      if (filter.empty()) {
+        std::fprintf(stderr, "--dxmt_case_id requires a non-empty filter\n");
+        return std::nullopt;
+      }
+      options.case_id_filter = std::string(filter);
+      continue;
+    }
     if (std::string_view(argument).starts_with(report_prefix)) {
       options.report_path =
           std::string(std::string_view(argument).substr(report_prefix.size()));
       continue;
     }
-    if (!std::string_view(argument).starts_with(jobs_prefix))
+    if (!argument_view.starts_with(jobs_prefix))
       continue;
 
     const auto parsed = ParsePositiveInteger(
@@ -243,6 +291,9 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
     options.jobs = *parsed;
     options.jobs_were_set = true;
   }
+
+  if (options.list_case_ids && options.case_id_filter.empty())
+    options.case_id_filter = "*";
 
   if (!options.jobs_were_set)
     options.jobs = std::max(1u, std::thread::hardware_concurrency());
@@ -273,7 +324,10 @@ BuildWorkerArguments(const std::vector<std::string> &original_arguments,
     const std::string_view argument(original_arguments[index]);
     if (!argument.starts_with("--dxmt-test-jobs=") &&
         !argument.starts_with("--dxmt-test-report=") &&
+        !argument.starts_with("--dxmt-case-id=") &&
+        !argument.starts_with("--dxmt_case_id=") &&
         !argument.starts_with("--gtest_filter=") &&
+        argument != "--dxmt-list-case-ids" &&
         argument != "--dxmt-test-worker") {
       arguments.push_back(original_arguments[index]);
     }
@@ -352,14 +406,37 @@ int RunScheduledTests(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   DisableFailureShortCircuiting();
 
+  const auto case_namespace = CaseNamespaceFromExecutable(
+      original_arguments.empty() ? std::string_view() : original_arguments[0]);
+
+  auto tests =
+      CollectRunnableTests(case_namespace, options->case_id_filter);
+  if (options->list_case_ids) {
+    for (const auto &test : tests)
+      std::printf("%s\n", CaseIdForTest(case_namespace, test.name).c_str());
+    return 0;
+  }
+  if (!options->case_id_filter.empty()) {
+    if (tests.empty()) {
+      std::fprintf(stderr, "no test matches CaseId filter '%s'\n",
+                   options->case_id_filter.c_str());
+      return 2;
+    }
+    TestShard selected;
+    selected.tests.reserve(tests.size());
+    for (const auto &test : tests)
+      selected.tests.push_back(test.name);
+    GTEST_FLAG_SET(filter, BuildFilter(selected));
+  }
+
   if (options->show_help || GTEST_FLAG_GET(list_tests) ||
       HasUnrecognizedGoogleTestArgument(argc, argv)) {
     return RUN_ALL_TESTS();
   }
   if (options->is_worker)
-    return RunTestsAndReport(options->report_path);
+    return RunTestsAndReport(case_namespace, options->report_path);
   if (HasExternalSharding())
-    return RunTestsAndReport();
+    return RunTestsAndReport(case_namespace);
 
   auto worker_count = options->jobs;
   if (!GTEST_FLAG_GET(output).empty() ||
@@ -368,13 +445,12 @@ int RunScheduledTests(int argc, char **argv) {
   }
 
   const auto plan_start = Clock::now();
-  auto tests = CollectRunnableTests();
   auto serial_tests = ExtractSerialTests(tests);
   worker_count = options->jobs_were_set
                      ? std::min(worker_count, tests.size())
                      : SelectWorkerCount(tests, worker_count);
   if (serial_tests.empty() && worker_count <= 1)
-    return RunTestsAndReport();
+    return RunTestsAndReport(case_namespace);
 
   auto shards = BuildTestShards(
       std::move(tests), std::max<std::size_t>(1, worker_count));

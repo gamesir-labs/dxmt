@@ -34,6 +34,16 @@ def valid_snapshot() -> dict:
 
 
 class WarpReferenceValidationTest(unittest.TestCase):
+    def test_requires_gpu_state_and_indirect_cases(self) -> None:
+        self.assertTrue(
+            {
+                "blend_additive_rgba8",
+                "depth_reject_rgba8",
+                "execute_indirect_dispatch",
+                "msaa_resolve_rgba8",
+            }.issubset(VALIDATOR.REQUIRED_CASES)
+        )
+
     def test_accepts_complete_warp_snapshot(self) -> None:
         self.assertEqual(VALIDATOR.validate(valid_snapshot()), [])
 

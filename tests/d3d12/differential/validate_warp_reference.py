@@ -12,6 +12,7 @@ from typing import Any
 
 REQUIRED_CASES = {
     "barrier_copy_chain",
+    "blend_additive_rgba8",
     "buffer_copy",
     "buffer_copy_offset",
     "clear_rect_rgba8",
@@ -19,10 +20,13 @@ REQUIRED_CASES = {
     "compute_u32",
     "descriptor_overwrite_before_submit",
     "descriptor_table_compute",
+    "depth_reject_rgba8",
     "draw_fullscreen_rgba8",
+    "execute_indirect_dispatch",
     "invalid_descriptor_heap",
     "invalid_resource",
     "invalid_root_signature",
+    "msaa_resolve_rgba8",
     "predicated_compute_true",
     "texture_copy_rgba8",
     "unsupported_iid",

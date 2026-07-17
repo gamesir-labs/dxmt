@@ -140,6 +140,22 @@ scripts/dxmt-builder test --profile gcc-x64-release-full unit \
   --suite d3d12 --test-args='--gtest_filter=D3D12*'
 ```
 
+Every discovered test also has a process-independent CaseId formed from the
+API suite and full GoogleTest name. List IDs or replay an exact case with:
+
+```sh
+scripts/dxmt-builder test --profile gcc-x64-release-full unit \
+  --suite d3d12 --test-args='--dxmt-list-case-ids'
+scripts/dxmt-builder test --profile gcc-x64-release-full unit \
+  --suite d3d12 \
+  --test-args='--dxmt-case-id=D3D12.CopyTextureSpec.FullFootprintMatrix'
+```
+
+CaseId filters accept the same `*`, `?`, `:`, and negative-pattern syntax as
+GoogleTest filters. `DXMT_TEST_CASE_ID` provides the environment equivalent,
+and the documented replay spelling `--dxmt_case_id=` remains accepted. Worker
+failure summaries print the CaseId before the assertion diagnostic.
+
 The native CBV materialization tests also provide a targeted fault injection.
 The CBV keeps a valid GPU virtual address backed by a live upload resource, but
 the native-only resource lookup is forced to miss. The legacy descriptor entry

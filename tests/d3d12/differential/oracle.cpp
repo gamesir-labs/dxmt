@@ -208,6 +208,77 @@ void Transition(ID3D12GraphicsCommandList *list, ID3D12Resource *resource,
   list->ResourceBarrier(1, &barrier);
 }
 
+std::uint32_t FloatBits(float value) {
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+bool ReadbackRgba8(OracleContext &context, ID3D12Resource *texture,
+                   D3D12_RESOURCE_STATES state,
+                   std::vector<std::uint32_t> *result,
+                   std::string_view operation) {
+  const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM || desc.SampleDesc.Count != 1 ||
+      desc.DepthOrArraySize != 1)
+    return false;
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT64 total_size = 0;
+  context.device()->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr,
+                                          nullptr, &total_size);
+  auto readback = context.CreateBuffer(total_size, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!readback)
+    return false;
+
+  Transition(context.list(), texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = texture;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = readback.get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  context.list()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+  if (!context.ExecuteAndReset())
+    return false;
+
+  void *mapping = nullptr;
+  const D3D12_RANGE read = {0, static_cast<SIZE_T>(total_size)};
+  if (!Check(readback->Map(0, &read, &mapping), operation))
+    return false;
+  result->resize(static_cast<std::size_t>(desc.Width) * desc.Height);
+  for (UINT row = 0; row < desc.Height; ++row) {
+    std::memcpy(result->data() + row * desc.Width,
+                static_cast<const std::uint8_t *>(mapping) + footprint.Offset +
+                    row * footprint.Footprint.RowPitch,
+                desc.Width * sizeof(std::uint32_t));
+  }
+  const D3D12_RANGE no_write = {};
+  readback->Unmap(0, &no_write);
+  return true;
+}
+
+bool CompileShader(std::string_view source, const char *target,
+                   std::string_view operation, ComPtr<ID3DBlob> *shader) {
+  ComPtr<ID3DBlob> diagnostics;
+  if (Check(D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr,
+                       "main", target,
+                       D3DCOMPILE_ENABLE_STRICTNESS |
+                           D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                       0, shader->put(), diagnostics.put()),
+            operation))
+    return true;
+  if (diagnostics)
+    std::cerr.write(static_cast<const char *>(diagnostics->GetBufferPointer()),
+                    diagnostics->GetBufferSize());
+  return false;
+}
+
 bool RunCopyCase(OracleContext &context,
                  const std::array<std::uint32_t, kValueCount> &input,
                  std::vector<std::uint32_t> *result) {
@@ -689,7 +760,7 @@ bool RunTextureCopyCase(OracleContext &context,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
   if (!upload || !readback)
     return false;
-  std::array<std::uint32_t, width *height> expected = {};
+  std::array<std::uint32_t, width * height> expected = {};
   for (UINT index = 0; index < expected.size(); ++index)
     expected[index] = 0xff000000u | ((index * 37u) << 16) |
                       ((index * 19u) << 8) | (index * 11u);
@@ -882,6 +953,434 @@ bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result) {
   return true;
 }
 
+bool RunBlendCase(OracleContext &context, std::vector<std::uint32_t> *result) {
+  constexpr std::string_view vertex_source = R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      return float4(positions[id], 0.0, 1.0);
+    }
+  )";
+  constexpr std::string_view pixel_source = R"(
+    float4 main() : SV_Target {
+      return float4(0.25, 0.125, 0.0625, 0.25);
+    }
+  )";
+  ComPtr<ID3DBlob> vertex;
+  ComPtr<ID3DBlob> pixel;
+  if (!CompileShader(vertex_source, "vs_5_0", "D3DCompile(blend vertex)",
+                     &vertex) ||
+      !CompileShader(pixel_source, "ps_5_0", "D3DCompile(blend pixel)", &pixel))
+    return false;
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ComPtr<ID3DBlob> root_blob;
+  ComPtr<ID3DBlob> diagnostics;
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
+             "D3D12SerializeRootSignature(blend)"))
+    return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(context.device()->CreateRootSignature(
+                 0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                 IID_PPV_ARGS(root.put())),
+             "CreateRootSignature(blend)"))
+    return false;
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root.get();
+  pipeline_desc.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+  pipeline_desc.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+  auto &blend = pipeline_desc.BlendState.RenderTarget[0];
+  blend.BlendEnable = TRUE;
+  blend.SrcBlend = D3D12_BLEND_ONE;
+  blend.DestBlend = D3D12_BLEND_ONE;
+  blend.BlendOp = D3D12_BLEND_OP_ADD;
+  blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+  blend.DestBlendAlpha = D3D12_BLEND_ONE;
+  blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+  blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pipeline_desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  if (!Check(context.device()->CreateGraphicsPipelineState(
+                 &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
+             "CreateGraphicsPipelineState(blend)"))
+    return false;
+
+  constexpr UINT width = 4;
+  constexpr UINT height = 4;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  ComPtr<ID3D12Resource> target;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                 IID_PPV_ARGS(target.put())),
+             "CreateCommittedResource(blend target)"))
+    return false;
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  heap_desc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap;
+  if (!Check(context.device()->CreateDescriptorHeap(
+                 &heap_desc, IID_PPV_ARGS(rtv_heap.put())),
+             "CreateDescriptorHeap(blend RTV)"))
+    return false;
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  constexpr FLOAT clear[4] = {};
+  context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context.list()->SetGraphicsRootSignature(root.get());
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, width, height, 0, 1};
+  const D3D12_RECT scissor = {0, 0, width, height};
+  context.list()->RSSetViewports(1, &viewport);
+  context.list()->RSSetScissorRects(1, &scissor);
+  context.list()->DrawInstanced(3, 1, 0, 0);
+  context.list()->DrawInstanced(3, 1, 0, 0);
+  return ReadbackRgba8(context, target.get(),
+                       D3D12_RESOURCE_STATE_RENDER_TARGET, result,
+                       "Map(blend readback)");
+}
+
+bool RunDepthCase(OracleContext &context, std::vector<std::uint32_t> *result) {
+  constexpr std::string_view vertex_source = R"(
+    cbuffer Parameters : register(b0) { float depth; };
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      return float4(positions[id], depth, 1.0);
+    }
+  )";
+  constexpr std::string_view green_source = R"(
+    float4 main() : SV_Target { return float4(0.0, 1.0, 0.0, 1.0); }
+  )";
+  constexpr std::string_view red_source = R"(
+    float4 main() : SV_Target { return float4(1.0, 0.0, 0.0, 1.0); }
+  )";
+  ComPtr<ID3DBlob> vertex;
+  ComPtr<ID3DBlob> green;
+  ComPtr<ID3DBlob> red;
+  if (!CompileShader(vertex_source, "vs_5_0", "D3DCompile(depth vertex)",
+                     &vertex) ||
+      !CompileShader(green_source, "ps_5_0", "D3DCompile(depth green)",
+                     &green) ||
+      !CompileShader(red_source, "ps_5_0", "D3DCompile(depth red)", &red))
+    return false;
+
+  D3D12_ROOT_PARAMETER root_parameter = {};
+  root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  root_parameter.Constants.Num32BitValues = 1;
+  root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &root_parameter;
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ComPtr<ID3DBlob> root_blob;
+  ComPtr<ID3DBlob> diagnostics;
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
+             "D3D12SerializeRootSignature(depth)"))
+    return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(context.device()->CreateRootSignature(
+                 0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                 IID_PPV_ARGS(root.put())),
+             "CreateRootSignature(depth)"))
+    return false;
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root.get();
+  pipeline_desc.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+  pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.RasterizerState.DepthClipEnable = TRUE;
+  pipeline_desc.DepthStencilState.DepthEnable = TRUE;
+  pipeline_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  pipeline_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pipeline_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  pipeline_desc.SampleDesc.Count = 1;
+  auto create_pipeline = [&](ID3DBlob *pixel, std::string_view operation,
+                             ComPtr<ID3D12PipelineState> *pipeline) {
+    pipeline_desc.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+    return Check(context.device()->CreateGraphicsPipelineState(
+                     &pipeline_desc, IID_PPV_ARGS(pipeline->put())),
+                 operation);
+  };
+  ComPtr<ID3D12PipelineState> green_pipeline;
+  ComPtr<ID3D12PipelineState> red_pipeline;
+  if (!create_pipeline(green.get(), "CreateGraphicsPipelineState(depth green)",
+                       &green_pipeline) ||
+      !create_pipeline(red.get(), "CreateGraphicsPipelineState(depth red)",
+                       &red_pipeline))
+    return false;
+
+  constexpr UINT width = 4;
+  constexpr UINT height = 4;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC color_desc = {};
+  color_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  color_desc.Width = width;
+  color_desc.Height = height;
+  color_desc.DepthOrArraySize = 1;
+  color_desc.MipLevels = 1;
+  color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  color_desc.SampleDesc.Count = 1;
+  color_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ComPtr<ID3D12Resource> target;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &color_desc,
+                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                 IID_PPV_ARGS(target.put())),
+             "CreateCommittedResource(depth color target)"))
+    return false;
+  D3D12_RESOURCE_DESC depth_desc = color_desc;
+  depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+  depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  ComPtr<ID3D12Resource> depth;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                 D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                 IID_PPV_ARGS(depth.put())),
+             "CreateCommittedResource(depth target)"))
+    return false;
+
+  D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
+  rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  rtv_heap_desc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap;
+  D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {};
+  dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  dsv_heap_desc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> dsv_heap;
+  if (!Check(context.device()->CreateDescriptorHeap(
+                 &rtv_heap_desc, IID_PPV_ARGS(rtv_heap.put())),
+             "CreateDescriptorHeap(depth RTV)") ||
+      !Check(context.device()->CreateDescriptorHeap(
+                 &dsv_heap_desc, IID_PPV_ARGS(dsv_heap.put())),
+             "CreateDescriptorHeap(depth DSV)"))
+    return false;
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+  context.device()->CreateDepthStencilView(depth.get(), nullptr, dsv);
+
+  constexpr FLOAT clear[4] = {};
+  context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context.list()->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0,
+                                        nullptr);
+  context.list()->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+  context.list()->SetGraphicsRootSignature(root.get());
+  context.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, width, height, 0, 1};
+  const D3D12_RECT scissor = {0, 0, width, height};
+  context.list()->RSSetViewports(1, &viewport);
+  context.list()->RSSetScissorRects(1, &scissor);
+  context.list()->SetPipelineState(green_pipeline.get());
+  context.list()->SetGraphicsRoot32BitConstant(0, FloatBits(0.25f), 0);
+  context.list()->DrawInstanced(3, 1, 0, 0);
+  context.list()->SetPipelineState(red_pipeline.get());
+  context.list()->SetGraphicsRoot32BitConstant(0, FloatBits(0.75f), 0);
+  context.list()->DrawInstanced(3, 1, 0, 0);
+  return ReadbackRgba8(context, target.get(),
+                       D3D12_RESOURCE_STATE_RENDER_TARGET, result,
+                       "Map(depth readback)");
+}
+
+bool RunMsaaResolveCase(OracleContext &context,
+                        std::vector<std::uint32_t> *result) {
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};
+  quality.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  quality.SampleCount = 4;
+  quality.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+  if (!Check(context.device()->CheckFeatureSupport(
+                 D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                 sizeof(quality)),
+             "CheckFeatureSupport(4x MSAA)") ||
+      quality.NumQualityLevels == 0)
+    return false;
+
+  constexpr UINT width = 4;
+  constexpr UINT height = 4;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC source_desc = {};
+  source_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  source_desc.Width = width;
+  source_desc.Height = height;
+  source_desc.DepthOrArraySize = 1;
+  source_desc.MipLevels = 1;
+  source_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  source_desc.SampleDesc.Count = 4;
+  source_desc.SampleDesc.Quality = 0;
+  source_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ComPtr<ID3D12Resource> source;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &source_desc,
+                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                 IID_PPV_ARGS(source.put())),
+             "CreateCommittedResource(MSAA source)"))
+    return false;
+  D3D12_RESOURCE_DESC destination_desc = source_desc;
+  destination_desc.SampleDesc.Count = 1;
+  destination_desc.SampleDesc.Quality = 0;
+  destination_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  ComPtr<ID3D12Resource> destination;
+  if (!Check(context.device()->CreateCommittedResource(
+                 &heap, D3D12_HEAP_FLAG_NONE, &destination_desc,
+                 D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                 IID_PPV_ARGS(destination.put())),
+             "CreateCommittedResource(resolve destination)"))
+    return false;
+
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  heap_desc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap;
+  if (!Check(context.device()->CreateDescriptorHeap(
+                 &heap_desc, IID_PPV_ARGS(rtv_heap.put())),
+             "CreateDescriptorHeap(MSAA RTV)"))
+    return false;
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(source.get(), nullptr, rtv);
+
+  constexpr FLOAT magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+  context.list()->ClearRenderTargetView(rtv, magenta, 0, nullptr);
+  Transition(context.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  context.list()->ResolveSubresource(destination.get(), 0, source.get(), 0,
+                                     DXGI_FORMAT_R8G8B8A8_UNORM);
+  return ReadbackRgba8(context, destination.get(),
+                       D3D12_RESOURCE_STATE_RESOLVE_DEST, result,
+                       "Map(MSAA resolve readback)");
+}
+
+bool RunExecuteIndirectCase(OracleContext &context,
+                            std::vector<std::uint32_t> *result) {
+  constexpr std::string_view source = R"(
+    RWByteAddressBuffer output : register(u0);
+    [numthreads(4, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      output.Store(id.x * 4, 0x13579bdfu ^ (id.x * 0x01010101u));
+    }
+  )";
+  ComPtr<ID3DBlob> shader;
+  if (!CompileShader(source, "cs_5_0", "D3DCompile(ExecuteIndirect)", &shader))
+    return false;
+
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameter.Descriptor.ShaderRegister = 0;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  ComPtr<ID3DBlob> root_blob;
+  ComPtr<ID3DBlob> diagnostics;
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
+             "D3D12SerializeRootSignature(ExecuteIndirect)"))
+    return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(context.device()->CreateRootSignature(
+                 0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                 IID_PPV_ARGS(root.put())),
+             "CreateRootSignature(ExecuteIndirect)"))
+    return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root.get();
+  pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> pipeline;
+  if (!Check(context.device()->CreateComputePipelineState(
+                 &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
+             "CreateComputePipelineState(ExecuteIndirect)"))
+    return false;
+
+  D3D12_INDIRECT_ARGUMENT_DESC argument_desc = {};
+  argument_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+  D3D12_COMMAND_SIGNATURE_DESC signature_desc = {};
+  signature_desc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+  signature_desc.NumArgumentDescs = 1;
+  signature_desc.pArgumentDescs = &argument_desc;
+  ComPtr<ID3D12CommandSignature> signature;
+  if (!Check(context.device()->CreateCommandSignature(
+                 &signature_desc, nullptr, IID_PPV_ARGS(signature.put())),
+             "CreateCommandSignature(ExecuteIndirect)"))
+    return false;
+
+  constexpr UINT value_count = 4;
+  auto output = context.CreateBuffer(value_count * sizeof(std::uint32_t),
+                                     D3D12_HEAP_TYPE_DEFAULT,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = context.CreateBuffer(
+      value_count * sizeof(std::uint32_t), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto arguments = context.CreateBuffer(
+      sizeof(D3D12_DISPATCH_ARGUMENTS), D3D12_HEAP_TYPE_UPLOAD,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!output || !readback || !arguments)
+    return false;
+  const D3D12_DISPATCH_ARGUMENTS dispatch = {1, 1, 1};
+  void *mapping = nullptr;
+  const D3D12_RANGE no_read = {};
+  if (!Check(arguments->Map(0, &no_read, &mapping),
+             "Map(ExecuteIndirect arguments)"))
+    return false;
+  std::memcpy(mapping, &dispatch, sizeof(dispatch));
+  const D3D12_RANGE written = {0, sizeof(dispatch)};
+  arguments->Unmap(0, &written);
+
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->SetComputeRootSignature(root.get());
+  context.list()->SetComputeRootUnorderedAccessView(
+      0, output->GetGPUVirtualAddress());
+  context.list()->ExecuteIndirect(signature.get(), 1, arguments.get(), 0,
+                                  nullptr, 0);
+  Transition(context.list(), output.get(),
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list()->CopyBufferRegion(readback.get(), 0, output.get(), 0,
+                                   value_count * sizeof(std::uint32_t));
+  if (!context.ExecuteAndReset())
+    return false;
+  *result = context.Readback(readback.get(), value_count);
+  return result->size() == value_count;
+}
+
 void WriteValues(std::ostream &output, std::string_view name,
                  const std::vector<std::uint32_t> &values, bool trailing) {
   output << "    \"" << name
@@ -938,6 +1437,10 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> clear_rect;
   std::vector<std::uint32_t> texture_copy;
   std::vector<std::uint32_t> draw;
+  std::vector<std::uint32_t> blend;
+  std::vector<std::uint32_t> depth;
+  std::vector<std::uint32_t> msaa_resolve;
+  std::vector<std::uint32_t> execute_indirect;
   if (!RunCopyCase(context, input, &copy)) {
     std::cerr << "buffer_copy case failed\n";
     return 1;
@@ -998,6 +1501,22 @@ int main(int argc, char **argv) {
     std::cerr << "draw_fullscreen_rgba8 case failed\n";
     return 1;
   }
+  if (!RunBlendCase(context, &blend)) {
+    std::cerr << "blend_additive_rgba8 case failed\n";
+    return 1;
+  }
+  if (!RunDepthCase(context, &depth)) {
+    std::cerr << "depth_reject_rgba8 case failed\n";
+    return 1;
+  }
+  if (!RunMsaaResolveCase(context, &msaa_resolve)) {
+    std::cerr << "msaa_resolve_rgba8 case failed\n";
+    return 1;
+  }
+  if (!RunExecuteIndirectCase(context, &execute_indirect)) {
+    std::cerr << "execute_indirect_dispatch case failed\n";
+    return 1;
+  }
 
   std::ofstream output_file;
   std::ostream *output = &std::cout;
@@ -1032,7 +1551,11 @@ int main(int argc, char **argv) {
   WriteValues(*output, "clear_rgba8", clear, true);
   WriteValues(*output, "clear_rect_rgba8", clear_rect, true);
   WriteValues(*output, "texture_copy_rgba8", texture_copy, true);
-  WriteValues(*output, "draw_fullscreen_rgba8", draw, false);
+  WriteValues(*output, "draw_fullscreen_rgba8", draw, true);
+  WriteValues(*output, "blend_additive_rgba8", blend, true);
+  WriteValues(*output, "depth_reject_rgba8", depth, true);
+  WriteValues(*output, "msaa_resolve_rgba8", msaa_resolve, true);
+  WriteValues(*output, "execute_indirect_dispatch", execute_indirect, false);
   *output << "  }\n}\n";
   return *output ? 0 : 1;
 }
