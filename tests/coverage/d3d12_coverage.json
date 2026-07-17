@@ -114,6 +114,18 @@
         "source_regex": "HasDeviceError\\(\\)\\s*\\?\\s*DXGI_ERROR_DEVICE_REMOVED",
         "test_globs": ["tests/d3d12/queue/queue_spec.cpp"],
         "test_regex": "CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions"
+      },
+      "native-packet-allocation-fallback": {
+        "source_globs": ["src/d3d12/d3d12_command_list.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT",
+        "test_globs": ["tests/d3d12/robustness/internal_fault_injection_spec.cpp"],
+        "test_regex": "NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers"
+      },
+      "native-segment-finalization-fallback": {
+        "source_globs": ["src/d3d12/d3d12_command_list.cpp"],
+        "source_regex": "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT",
+        "test_globs": ["tests/d3d12/robustness/internal_fault_injection_spec.cpp"],
+        "test_regex": "NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery"
       }
     }
   },

@@ -5,9 +5,11 @@
 #include "d3d12_interfaces.hpp"
 #include "d3d12_pipeline.hpp"
 #include "com/com_pointer.hpp"
+#include "dxmt_d3d12_test_path.hpp"
 #include "dxmt_statistics.hpp"
 #include <d3d12.h>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -327,6 +329,8 @@ enum class CompiledCommandFallbackReason {
   NativeMissingDescriptorBackend,
   NativeShaderAbiMismatch,
   NativeResidencyUnsupported,
+  InjectedNativePacketAllocationFailure,
+  InjectedNativeSegmentFinalizationFailure,
   UnsupportedRootSignature,
   UnsupportedDescriptorTable,
   UnsupportedRootDescriptor,
@@ -494,12 +498,28 @@ struct CompiledCommandSegment {
       dxmt::CompiledFallbackReason::Unknown;
 };
 
+struct CompiledCommandTestTelemetry {
+  std::atomic<UINT> replayed_graphics_packets = 0;
+  std::atomic<UINT> replayed_compute_packets = 0;
+  std::atomic<UINT> replayed_fallback_ranges = 0;
+  std::atomic<UINT> replayed_fallback_records = 0;
+  std::atomic<UINT> replayed_compiled_packet_fallbacks = 0;
+  std::atomic<UINT> replayed_empty_native_segments = 0;
+  std::atomic<UINT> replayed_empty_fallback_segments = 0;
+};
+
 struct CompiledCommandList {
   UINT record_count = 0;
   WMT::Reference<WMT::Buffer> native_root_base_buffer;
   std::vector<CompiledCommandSegment> segments;
   std::vector<CompiledGraphicsPacket> graphics_packets;
   std::vector<CompiledComputePacket> compute_packets;
+  dxmt::d3d12::test::ExecutionPathMode test_path_mode =
+      dxmt::d3d12::test::ExecutionPathMode::Auto;
+  UINT test_work_record_count = 0;
+  UINT test_compiled_work_record_count = 0;
+  bool test_native_requirement_satisfied = true;
+  std::shared_ptr<CompiledCommandTestTelemetry> test_telemetry;
 };
 
 const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind);

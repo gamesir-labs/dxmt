@@ -71,6 +71,7 @@ d3d12_unit_suites = {
       'descriptor/sampler_matrix_spec.cpp',
       'descriptor/sampler_spec.cpp',
       'descriptor/table_binding_spec.cpp',
+      'descriptor/texture_view_dimension_spec.cpp',
     ),
   },
   'execution': {
@@ -152,6 +153,7 @@ d3d12_unit_suites = {
       'sync/aliasing_barrier_spec.cpp',
       'sync/barrier_matrix_spec.cpp',
       'sync/cross_queue_spec.cpp',
+      'sync/cross_queue_batch_matrix_spec.cpp',
       'sync/enhanced_barrier_spec.cpp',
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',

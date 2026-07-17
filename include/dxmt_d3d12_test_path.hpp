@@ -1,0 +1,76 @@
+#pragma once
+
+#include <d3d12.h>
+
+#include <cstdint>
+
+namespace dxmt::d3d12::test {
+
+// Test-only command-list controls carried through ID3D12Object private data.
+// These controls are deliberately per-list so path tests do not depend on
+// process-global environment variables or leak state into unrelated tests.
+enum class ExecutionPathMode : std::uint32_t {
+  // Normal compiler selection. Runtime packet fallbacks remain observable in
+  // ExecutionPathStats.
+  Auto = 0,
+  // Every compilable Draw/DrawIndexed/Dispatch record must select a compiled
+  // packet at Close. Non-packet records (copy, barrier, query, and similar)
+  // retain their ordinary range replay, and a queue-time packet fallback is
+  // reported by native_requirement_satisfied == 0 after completion.
+  NativeCompiled = 1,
+  // Bypass packet construction, native descriptor materialization, and
+  // payload finalization; replay the complete record stream as fallback.
+  Fallback = 2,
+};
+
+enum ExecutionPathFlags : std::uint32_t {
+  ExecutionPathFlagNone = 0,
+  ExecutionPathFlagInjectEmptyNativeSegment = 1u << 0,
+  ExecutionPathFlagInjectEmptyFallbackSegment = 1u << 1,
+};
+
+struct ExecutionPathConfig {
+  std::uint32_t struct_size = sizeof(ExecutionPathConfig);
+  ExecutionPathMode mode = ExecutionPathMode::Auto;
+  std::uint32_t flags = ExecutionPathFlagNone;
+};
+
+struct ExecutionPathStats {
+  std::uint32_t struct_size = sizeof(ExecutionPathStats);
+  ExecutionPathMode mode = ExecutionPathMode::Auto;
+  std::uint32_t record_count = 0;
+  std::uint32_t work_record_count = 0;
+  std::uint32_t compiled_work_record_count = 0;
+  std::uint32_t native_requirement_satisfied = 0;
+  std::uint32_t graphics_segments = 0;
+  std::uint32_t compute_segments = 0;
+  std::uint32_t fallback_segments = 0;
+  std::uint32_t empty_native_segments = 0;
+  std::uint32_t empty_fallback_segments = 0;
+  std::uint32_t selected_graphics_packets = 0;
+  std::uint32_t selected_compute_packets = 0;
+  std::uint32_t retained_graphics_packets = 0;
+  std::uint32_t retained_compute_packets = 0;
+  std::uint32_t has_native_root_base_buffer = 0;
+  std::uint32_t replayed_graphics_packets = 0;
+  std::uint32_t replayed_compute_packets = 0;
+  std::uint32_t replayed_fallback_ranges = 0;
+  std::uint32_t replayed_fallback_records = 0;
+  std::uint32_t replayed_compiled_packet_fallbacks = 0;
+  std::uint32_t replayed_empty_native_segments = 0;
+  std::uint32_t replayed_empty_fallback_segments = 0;
+};
+
+inline constexpr GUID kExecutionPathConfigGuid = {
+    0x6ca960e8,
+    0xe87f,
+    0x45a8,
+    {0x9f, 0x5e, 0x2a, 0x42, 0x2e, 0xf9, 0xc3, 0x8d}};
+
+inline constexpr GUID kExecutionPathStatsGuid = {
+    0x52cbcfab,
+    0xf833,
+    0x412e,
+    {0x89, 0xcb, 0xd0, 0xa7, 0x8f, 0x35, 0xef, 0x1e}};
+
+} // namespace dxmt::d3d12::test

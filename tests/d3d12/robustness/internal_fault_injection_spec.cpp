@@ -1,5 +1,6 @@
 #include <dxmt_test.hpp>
 #include <dxmt_test_shader.hpp>
+#include <dxmt_d3d12_test_path.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -743,6 +744,268 @@ TEST_F(D3D12MetalObjectFaultInjectionSpec,
   ASSERT_NE(recovered, reinterpret_cast<void *>(uintptr_t{1}));
   static_cast<IUnknown *>(recovered)->Release();
   EXPECT_EQ(marker.Count(active->environment), 3u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+class D3D12CompiledPathFaultInjectionSpec : public ::testing::Test {
+protected:
+  using ExecutionPathConfig = dxmt::d3d12::test::ExecutionPathConfig;
+  using ExecutionPathStats = dxmt::d3d12::test::ExecutionPathStats;
+
+  void SetUp() override {
+    ASSERT_EQ(context_.Initialize(), S_OK);
+
+    D3D12_DESCRIPTOR_RANGE output_range = {};
+    output_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameter = {};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable.NumDescriptorRanges = 1;
+    parameter.DescriptorTable.pDescriptorRanges = &output_range;
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = &parameter;
+    root_ = context_.CreateRootSignature(root_desc);
+    ASSERT_TRUE(root_);
+
+    pipeline_ = CreatePipeline(1);
+    recovery_pipeline_ = CreatePipeline(8);
+    ASSERT_TRUE(pipeline_);
+    ASSERT_TRUE(recovery_pipeline_);
+
+    constexpr UINT zero = 0;
+    zero_upload_ =
+        context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
+    output_ = context_.CreateBuffer(
+        sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    readback_ = context_.CreateBuffer(
+        sizeof(UINT), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    descriptor_heap_ = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+    ASSERT_TRUE(zero_upload_);
+    ASSERT_TRUE(output_);
+    ASSERT_TRUE(readback_);
+    ASSERT_TRUE(descriptor_heap_);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = 1;
+    context_.device()->CreateUnorderedAccessView(
+        output_.get(), nullptr, &uav,
+        descriptor_heap_->GetCPUDescriptorHandleForHeapStart());
+    ASSERT_EQ(context_.device()->CreateFence(
+                  0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                  reinterpret_cast<void **>(completion_.put())),
+              S_OK);
+  }
+
+  ComPtr<ID3D12PipelineState> CreatePipeline(UINT increment) {
+    const std::string source =
+        "RWBuffer<uint> output : register(u0);"
+        "[numthreads(1,1,1)] void main() {"
+        "uint previous; InterlockedAdd(output[0], " +
+        std::to_string(increment) + "u, previous); }";
+    const auto shader = CompileShader(source, "cs_5_0");
+    EXPECT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+    if (shader.result != S_OK)
+      return {};
+    return context_.CreateComputePipeline(
+        root_.get(), {shader.bytecode->GetBufferPointer(),
+                      shader.bytecode->GetBufferSize()});
+  }
+
+  static void ExpectEveryRecordReplayedExactlyOnce(
+      const ExecutionPathStats &stats) {
+    const UINT replayed_packets = stats.replayed_graphics_packets +
+                                  stats.replayed_compute_packets;
+    ASSERT_LE(replayed_packets, stats.record_count);
+    EXPECT_EQ(stats.replayed_fallback_records,
+              stats.record_count - replayed_packets);
+  }
+
+  void SubmitIncrements(UINT dispatch_count, UINT increment, UINT expected,
+                        ExecutionPathStats *stats = nullptr) {
+    ExecutionPathConfig config = {};
+    ASSERT_EQ(context_.list()->SetPrivateData(
+                  dxmt::d3d12::test::kExecutionPathConfigGuid,
+                  sizeof(config), &config),
+              S_OK);
+    if (!initialized_) {
+      context_.list()->CopyBufferRegion(output_.get(), 0, zero_upload_.get(),
+                                        0, sizeof(UINT));
+      D3D12TestContext::Transition(
+          context_.list(), output_.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      initialized_ = true;
+    } else {
+      D3D12TestContext::Transition(
+          context_.list(), output_.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    ID3D12DescriptorHeap *heaps[] = {descriptor_heap_.get()};
+    context_.list()->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
+    context_.list()->SetComputeRootSignature(root_.get());
+    ASSERT_TRUE(increment == 1 || increment == 8);
+    context_.list()->SetPipelineState(
+        increment == 1 ? pipeline_.get() : recovery_pipeline_.get());
+    context_.list()->SetComputeRootDescriptorTable(
+        0, descriptor_heap_->GetGPUDescriptorHandleForHeapStart());
+    for (UINT dispatch = 0; dispatch < dispatch_count; ++dispatch) {
+      context_.list()->Dispatch(1, 1, 1);
+      if (dispatch + 1 != dispatch_count)
+        D3D12TestContext::UavBarrier(context_.list(), output_.get());
+    }
+    D3D12TestContext::Transition(
+        context_.list(), output_.get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    context_.list()->CopyBufferRegion(readback_.get(), 0, output_.get(), 0,
+                                      sizeof(UINT));
+
+    ASSERT_EQ(context_.list()->Close(), S_OK);
+    ID3D12CommandList *lists[] = {context_.list()};
+    context_.queue()->ExecuteCommandLists(ARRAYSIZE(lists), lists);
+    const UINT64 completion_value = ++completion_value_;
+    ASSERT_EQ(context_.queue()->Signal(completion_.get(), completion_value),
+              S_OK);
+    ASSERT_EQ(context_.WaitForFence(completion_.get(), completion_value), S_OK);
+    EXPECT_GE(completion_->GetCompletedValue(), completion_value);
+    if (stats) {
+      UINT stats_size = sizeof(*stats);
+      ASSERT_EQ(context_.list()->GetPrivateData(
+                    dxmt::d3d12::test::kExecutionPathStatsGuid, &stats_size,
+                    stats),
+                S_OK);
+      ASSERT_EQ(stats_size, sizeof(*stats));
+    }
+
+    UINT *mapped = nullptr;
+    const D3D12_RANGE read_range = {0, sizeof(UINT)};
+    ASSERT_EQ(readback_->Map(0, &read_range,
+                             reinterpret_cast<void **>(&mapped)),
+              S_OK);
+    ASSERT_NE(mapped, nullptr);
+    EXPECT_EQ(*mapped, expected);
+    const D3D12_RANGE no_write = {0, 0};
+    readback_->Unmap(0, &no_write);
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+
+  D3D12TestContext context_;
+  ComPtr<ID3D12RootSignature> root_;
+  ComPtr<ID3D12PipelineState> pipeline_;
+  ComPtr<ID3D12PipelineState> recovery_pipeline_;
+  ComPtr<ID3D12Resource> zero_upload_;
+  ComPtr<ID3D12Resource> output_;
+  ComPtr<ID3D12Resource> readback_;
+  ComPtr<ID3D12DescriptorHeap> descriptor_heap_;
+  ComPtr<ID3D12Fence> completion_;
+  UINT64 completion_value_ = 0;
+  bool initialized_ = false;
+};
+
+TEST_F(D3D12CompiledPathFaultInjectionSpec,
+       NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT";
+  const UINT target = ConfiguredInternalOccurrence(fault);
+  const bool repeated = ConfiguredInternalAlways(fault);
+  ASSERT_FALSE(target && repeated);
+  if (!target && !repeated)
+    GTEST_SKIP() << "native packet allocation fault injection is disabled";
+  ASSERT_TRUE(repeated || target <= 3u)
+      << "the test records three native packet allocation occurrences";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  ExecutionPathStats fault_stats = {};
+  ASSERT_NO_FATAL_FAILURE(SubmitIncrements(3, 1, 3, &fault_stats));
+  const std::size_t injected_count = repeated ? 3u : 1u;
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(fault_stats.work_record_count, 3u);
+  EXPECT_EQ(fault_stats.compiled_work_record_count,
+            3u - static_cast<UINT>(injected_count));
+  EXPECT_EQ(fault_stats.replayed_compute_packets,
+            3u - static_cast<UINT>(injected_count));
+  EXPECT_EQ(fault_stats.retained_compute_packets,
+            3u - static_cast<UINT>(injected_count));
+  EXPECT_EQ(fault_stats.replayed_compiled_packet_fallbacks, 0u);
+  EXPECT_GT(fault_stats.replayed_fallback_ranges, 0u);
+  EXPECT_EQ(fault_stats.has_native_root_base_buffer, repeated ? 0u : 1u);
+  ExpectEveryRecordReplayedExactlyOnce(fault_stats);
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ExecutionPathStats recovery_stats = {};
+  ASSERT_NO_FATAL_FAILURE(SubmitIncrements(1, 8, 11, &recovery_stats));
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(recovery_stats.work_record_count, 1u);
+  EXPECT_EQ(recovery_stats.compiled_work_record_count, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compute_packets, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compiled_packet_fallbacks, 0u);
+  EXPECT_EQ(recovery_stats.has_native_root_base_buffer, 1u);
+  ExpectEveryRecordReplayedExactlyOnce(recovery_stats);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CompiledPathFaultInjectionSpec,
+       NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT";
+  const UINT target = ConfiguredInternalOccurrence(fault);
+  const bool repeated = ConfiguredInternalAlways(fault);
+  ASSERT_FALSE(target && repeated);
+  if (!target && !repeated)
+    GTEST_SKIP() << "native segment finalization fault injection is disabled";
+  ASSERT_TRUE(repeated || target <= 3u)
+      << "the test defines at most three finalization occurrences";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  const UINT submissions = repeated ? 3u : target;
+  UINT fallback_submissions = 0;
+  UINT native_submissions = 0;
+  for (UINT submission = 0; submission < submissions; ++submission) {
+    ExecutionPathStats stats = {};
+    ASSERT_NO_FATAL_FAILURE(
+        SubmitIncrements(1, 1, submission + 1, &stats));
+    EXPECT_EQ(stats.work_record_count, 1u);
+    EXPECT_EQ(stats.replayed_compiled_packet_fallbacks, 0u);
+    if (stats.replayed_compute_packets) {
+      EXPECT_EQ(stats.compiled_work_record_count, 1u);
+      EXPECT_EQ(stats.replayed_compute_packets, 1u);
+      EXPECT_EQ(stats.retained_compute_packets, 1u);
+      EXPECT_EQ(stats.has_native_root_base_buffer, 1u);
+      ++native_submissions;
+    } else {
+      EXPECT_EQ(stats.compiled_work_record_count, 0u);
+      EXPECT_EQ(stats.retained_graphics_packets, 0u);
+      EXPECT_EQ(stats.retained_compute_packets, 0u);
+      EXPECT_EQ(stats.has_native_root_base_buffer, 0u);
+      EXPECT_GT(stats.replayed_fallback_ranges, 0u);
+      ++fallback_submissions;
+    }
+    ExpectEveryRecordReplayedExactlyOnce(stats);
+  }
+  const std::size_t injected_count = repeated ? submissions : 1u;
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(fallback_submissions, injected_count);
+  EXPECT_EQ(native_submissions, submissions - injected_count);
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ExecutionPathStats recovery_stats = {};
+  ASSERT_NO_FATAL_FAILURE(
+      SubmitIncrements(1, 8, submissions + 8, &recovery_stats));
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(recovery_stats.compiled_work_record_count, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compute_packets, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compiled_packet_fallbacks, 0u);
+  EXPECT_EQ(recovery_stats.has_native_root_base_buffer, 1u);
+  ExpectEveryRecordReplayedExactlyOnce(recovery_stats);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

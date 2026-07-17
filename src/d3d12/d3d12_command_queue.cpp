@@ -8756,6 +8756,10 @@ private:
     }
     UINT record_index = 0;
     uint64_t replay_record_serial = 0;
+    auto *test_telemetry =
+        compiled && compiled->test_telemetry
+            ? compiled->test_telemetry.get()
+            : nullptr;
     // PERF DIAG (DXMT_DIAG_REPLAY_BREAKDOWN): sub-time the replay stage to
     // attribute the 300-780ms explosion-frame replay to record-loop vs
     // FlushPassBatches vs timestamp/query materialization.
@@ -9334,6 +9338,12 @@ private:
 
     auto record_fallback_range =
         [&](UINT begin, UINT count, dxmt::CompiledFallbackReason reason) {
+          if (test_telemetry && count) {
+            test_telemetry->replayed_fallback_ranges.fetch_add(
+                1, std::memory_order_relaxed);
+            test_telemetry->replayed_fallback_records.fetch_add(
+                count, std::memory_order_relaxed);
+          }
           if (!dxmt::perf::enabled())
             return;
           const auto classification_begin = clock::now();
@@ -9389,9 +9399,11 @@ private:
       if (!compiled || compiled->record_count != records.size())
         return false;
       for (const auto &segment : compiled->segments) {
-        if (segment.record_count == 0 ||
-            segment.first_record_index > records.size() ||
+        if (segment.first_record_index > records.size() ||
             segment.record_count > records.size() - segment.first_record_index)
+          return false;
+        if (!segment.record_count &&
+            (segment.graphics_packet_count || segment.compute_packet_count))
           return false;
         if (segment.kind == CompiledCommandSegmentKind::Graphics &&
             segment.first_graphics_packet + segment.graphics_packet_count >
@@ -9408,6 +9420,15 @@ private:
     if (compiled_list_is_valid() && !compiled->segments.empty()) {
       for (const auto &segment : compiled->segments) {
         record_index = segment.first_record_index;
+        if (!segment.record_count && test_telemetry) {
+          if (segment.kind == CompiledCommandSegmentKind::Fallback) {
+            test_telemetry->replayed_empty_fallback_segments.fetch_add(
+                1, std::memory_order_relaxed);
+          } else {
+            test_telemetry->replayed_empty_native_segments.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+        }
         switch (segment.kind) {
         case CompiledCommandSegmentKind::Graphics:
           for (UINT i = 0; i < segment.graphics_packet_count; i++) {
@@ -9424,6 +9445,15 @@ private:
             const auto fallback_reason =
                 queue_compiled_graphics_packet(packet,
                                                std::move(submitted_snapshot));
+            if (test_telemetry) {
+              if (fallback_reason == CompiledCommandFallbackReason::None) {
+                test_telemetry->replayed_graphics_packets.fetch_add(
+                    1, std::memory_order_relaxed);
+              } else {
+                test_telemetry->replayed_compiled_packet_fallbacks.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
+            }
             if (replay_perf) {
               rb_compiled_graphics_interval += clock::now() - packet_begin;
               rb_compiled_graphics_packets++;
@@ -9452,6 +9482,15 @@ private:
                 replay_perf ? clock::now() : clock::time_point{};
             const auto fallback_reason = queue_compiled_compute_packet(
                 packet, std::move(submitted_snapshot));
+            if (test_telemetry) {
+              if (fallback_reason == CompiledCommandFallbackReason::None) {
+                test_telemetry->replayed_compute_packets.fetch_add(
+                    1, std::memory_order_relaxed);
+              } else {
+                test_telemetry->replayed_compiled_packet_fallbacks.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
+            }
             if (replay_perf) {
               rb_compiled_compute_interval += clock::now() - packet_begin;
               rb_compiled_compute_packets++;

@@ -473,6 +473,55 @@
       "environment": {
         "DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT": "always"
       }
+    },
+    {
+      "id": "native-packet-allocation-fail-first",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT": "1"
+      }
+    },
+    {
+      "id": "native-packet-allocation-fail-last",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT": "3"
+      }
+    },
+    {
+      "id": "native-packet-allocation-fail-repeatedly",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT": "always"
+      }
+    },
+    {
+      "id": "native-segment-finalization-fail-first",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT": "1"
+      }
+    },
+    {
+      "id": "native-segment-finalization-fail-after-one",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT": "2"
+      }
+    },
+    {
+      "id": "native-segment-finalization-fail-last",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT": "3"
+      }
+    },
+    {
+      "id": "native-segment-finalization-fail-repeatedly",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT": "always"
+      }
     }
   ]
 }

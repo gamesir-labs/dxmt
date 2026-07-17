@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -102,6 +103,10 @@ const char *CompiledCommandFallbackReasonName(
     return "native_shader_abi_mismatch";
   case CompiledCommandFallbackReason::NativeResidencyUnsupported:
     return "native_residency_unsupported";
+  case CompiledCommandFallbackReason::InjectedNativePacketAllocationFailure:
+    return "injected_native_packet_allocation_failure";
+  case CompiledCommandFallbackReason::InjectedNativeSegmentFinalizationFailure:
+    return "injected_native_segment_finalization_failure";
   case CompiledCommandFallbackReason::UnsupportedRootSignature:
     return "unsupported_root_signature";
   case CompiledCommandFallbackReason::UnsupportedDescriptorTable:
@@ -155,6 +160,9 @@ CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason) {
     return dxmt::CompiledFallbackReason::NativeShaderAbiMismatch;
   case CompiledCommandFallbackReason::NativeResidencyUnsupported:
     return dxmt::CompiledFallbackReason::NativeResidencyUnsupported;
+  case CompiledCommandFallbackReason::InjectedNativePacketAllocationFailure:
+  case CompiledCommandFallbackReason::InjectedNativeSegmentFinalizationFailure:
+    return dxmt::CompiledFallbackReason::MissingCompiledEncoder;
   case CompiledCommandFallbackReason::LegacyPipelineState:
     return dxmt::CompiledFallbackReason::LegacyPath;
   case CompiledCommandFallbackReason::NonBindlessPipelineState:
@@ -190,6 +198,40 @@ namespace {
 
 std::atomic<uint32_t> g_apitrace_record_diag_log_count = 0;
 thread_local uint64_t g_current_command_record_d3d_sequence = 0;
+
+// Test-only, process-local fault points. The runner launches each scenario in
+// a fresh process, so occurrence counts stay deterministic without affecting
+// production behavior when the variables are absent.
+std::atomic<uint64_t> g_test_native_packet_allocation_occurrence = 0;
+std::atomic<uint64_t> g_test_native_segment_finalization_occurrence = 0;
+
+static bool
+ShouldInjectCompiledCommandFault(const std::string &setting,
+                                 std::atomic<uint64_t> &occurrence) {
+  if (setting.empty())
+    return false;
+  if (setting == "always" || setting == "all") {
+    occurrence.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  char *end = nullptr;
+  const auto target = std::strtoull(setting.c_str(), &end, 0);
+  if (end == setting.c_str() || *end || !target)
+    return false;
+  return occurrence.fetch_add(1, std::memory_order_relaxed) + 1 == target;
+}
+
+static void
+RecordInjectedCompiledCommandFault(const char *name) {
+  const auto path = env::getEnvVar("DXMT_TEST_FAULT_MARKER");
+  if (path.empty())
+    return;
+  FILE *marker = std::fopen(path.c_str(), "a");
+  if (!marker)
+    return;
+  std::fprintf(marker, "%s\n", name);
+  std::fclose(marker);
+}
 
 // --- Copy-source snapshot deduplication (BUG-008 IO blow-up fix) ---
 // SnapshotCopySourceBuffer captures a copy's source-buffer span into the trace when an app keeps
@@ -1468,11 +1510,27 @@ AppendCompiledComputeSegment(CompiledCommandList &compiled, UINT record_index,
 
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
-                         WMT::Device device) {
+                         WMT::Device device, bool force_fallback) {
   dxmt::perf::ScopedCodeTimer loop_timer(
       dxmt::PerfCodePath::CompiledBuildLoopDispatch);
   auto compiled = std::make_shared<CompiledCommandList>();
   compiled->record_count = static_cast<UINT>(records.size());
+  if (force_fallback) {
+    for (UINT record_index = 0; record_index < records.size(); ++record_index) {
+      AppendCompiledFallbackSegment(
+          *compiled, record_index,
+          CompiledCommandFallbackReason::ConservativeCompiler);
+    }
+    return compiled;
+  }
+
+  constexpr const char *packet_fault_name =
+      "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT";
+  const auto packet_fault_setting = env::getEnvVar(packet_fault_name);
+  constexpr const char *finalization_fault_name =
+      "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT";
+  const auto finalization_fault_setting =
+      env::getEnvVar(finalization_fault_name);
   NativeRootBasePayloadBuilder native_payloads;
 
   CompiledCommandBuildState state = {};
@@ -1499,33 +1557,46 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
           table_reason = MaterializeCompiledRootTables(state, false);
         }
         if (table_reason == CompiledCommandFallbackReason::None) {
-          CompiledGraphicsPacket packet;
-          {
-            dxmt::perf::ScopedCodeTimer packet_timer(
-                dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
-            packet = BuildCompiledGraphicsPacket(record, record_index, state,
-                                                 metadata);
-          }
-          CompiledCommandFallbackReason native_reason;
-          {
-            dxmt::perf::ScopedCodeTimer native_timer(
-                dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
-            native_reason =
-                BuildCompiledGraphicsNativeBindings(packet, native_payloads);
-          }
-          if (native_reason == CompiledCommandFallbackReason::None) {
+          if (ShouldInjectCompiledCommandFault(
+                  packet_fault_setting,
+                  g_test_native_packet_allocation_occurrence)) {
+            RecordInjectedCompiledCommandFault(packet_fault_name);
+            WARN("D3D12CommandList: injected native packet allocation "
+                 "failure at graphics record ",
+                 record_index);
+            AppendCompiledFallbackSegment(
+                *compiled, record_index,
+                CompiledCommandFallbackReason::
+                    InjectedNativePacketAllocationFailure);
+          } else {
+            CompiledGraphicsPacket packet;
             {
+              dxmt::perf::ScopedCodeTimer packet_timer(
+                  dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+              packet = BuildCompiledGraphicsPacket(record, record_index, state,
+                                                   metadata);
+            }
+            CompiledCommandFallbackReason native_reason;
+            {
+              dxmt::perf::ScopedCodeTimer native_timer(
+                  dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
+              native_reason = BuildCompiledGraphicsNativeBindings(
+                  packet, native_payloads);
+            }
+            if (native_reason == CompiledCommandFallbackReason::None) {
+              {
+                dxmt::perf::ScopedCodeTimer append_timer(
+                    dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+                AppendCompiledGraphicsSegment(*compiled, record_index,
+                                              std::move(packet));
+              }
+              ClearCompiledInputAssemblerDirtyState(state);
+            } else {
               dxmt::perf::ScopedCodeTimer append_timer(
                   dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-              AppendCompiledGraphicsSegment(*compiled, record_index,
-                                            std::move(packet));
+              AppendCompiledFallbackSegment(*compiled, record_index,
+                                            native_reason);
             }
-            ClearCompiledInputAssemblerDirtyState(state);
-          } else {
-            dxmt::perf::ScopedCodeTimer append_timer(
-                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-            AppendCompiledFallbackSegment(*compiled, record_index,
-                                          native_reason);
           }
         } else {
           dxmt::perf::ScopedCodeTimer append_timer(
@@ -1557,30 +1628,43 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
           table_reason = MaterializeCompiledRootTables(state, true);
         }
         if (table_reason == CompiledCommandFallbackReason::None) {
-          CompiledComputePacket packet;
-          {
-            dxmt::perf::ScopedCodeTimer packet_timer(
-                dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
-            packet = BuildCompiledComputePacket(record, record_index, state,
-                                                metadata);
-          }
-          CompiledCommandFallbackReason native_reason;
-          {
-            dxmt::perf::ScopedCodeTimer native_timer(
-                dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
-            native_reason =
-                BuildCompiledComputeNativeBindings(packet, native_payloads);
-          }
-          if (native_reason == CompiledCommandFallbackReason::None) {
-            dxmt::perf::ScopedCodeTimer append_timer(
-                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-            AppendCompiledComputeSegment(*compiled, record_index,
-                                         std::move(packet));
+          if (ShouldInjectCompiledCommandFault(
+                  packet_fault_setting,
+                  g_test_native_packet_allocation_occurrence)) {
+            RecordInjectedCompiledCommandFault(packet_fault_name);
+            WARN("D3D12CommandList: injected native packet allocation "
+                 "failure at compute record ",
+                 record_index);
+            AppendCompiledFallbackSegment(
+                *compiled, record_index,
+                CompiledCommandFallbackReason::
+                    InjectedNativePacketAllocationFailure);
           } else {
-            dxmt::perf::ScopedCodeTimer append_timer(
-                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-            AppendCompiledFallbackSegment(*compiled, record_index,
-                                          native_reason);
+            CompiledComputePacket packet;
+            {
+              dxmt::perf::ScopedCodeTimer packet_timer(
+                  dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+              packet = BuildCompiledComputePacket(record, record_index, state,
+                                                  metadata);
+            }
+            CompiledCommandFallbackReason native_reason;
+            {
+              dxmt::perf::ScopedCodeTimer native_timer(
+                  dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
+              native_reason = BuildCompiledComputeNativeBindings(
+                  packet, native_payloads);
+            }
+            if (native_reason == CompiledCommandFallbackReason::None) {
+              dxmt::perf::ScopedCodeTimer append_timer(
+                  dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+              AppendCompiledComputeSegment(*compiled, record_index,
+                                           std::move(packet));
+            } else {
+              dxmt::perf::ScopedCodeTimer append_timer(
+                  dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+              AppendCompiledFallbackSegment(*compiled, record_index,
+                                            native_reason);
+            }
           }
         } else {
           dxmt::perf::ScopedCodeTimer append_timer(
@@ -1606,35 +1690,223 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     }
   }
 
-  if (!native_payloads.Finalize(device, *compiled)) {
+  const bool has_compiled_segment = std::any_of(
+      compiled->segments.begin(), compiled->segments.end(),
+      [](const CompiledCommandSegment &segment) {
+        return segment.kind != CompiledCommandSegmentKind::Fallback;
+      });
+  const bool injected_finalization_failure =
+      has_compiled_segment &&
+      ShouldInjectCompiledCommandFault(
+          finalization_fault_setting,
+          g_test_native_segment_finalization_occurrence);
+  if (injected_finalization_failure) {
+    RecordInjectedCompiledCommandFault(finalization_fault_name);
+    WARN("D3D12CommandList: injected native segment finalization failure");
+  }
+
+  const bool native_payloads_ready =
+      !injected_finalization_failure &&
+      native_payloads.Finalize(device, *compiled);
+  if (!native_payloads_ready) {
     dxmt::perf::ScopedCodeTimer fallback_timer(
         dxmt::PerfCodePath::CompiledBuildFallbackRewrite);
     for (auto &segment : compiled->segments) {
-      bool native = false;
-      if (segment.kind == CompiledCommandSegmentKind::Graphics &&
+      bool rewrite = injected_finalization_failure;
+      if (!rewrite &&
+          segment.kind == CompiledCommandSegmentKind::Graphics &&
           segment.graphics_packet_count) {
-        native = compiled
-                     ->graphics_packets[segment.first_graphics_packet]
-                     .pipeline.metadata.uses_native_descriptor_table_abi;
-      } else if (segment.kind == CompiledCommandSegmentKind::Compute &&
+        rewrite = compiled
+                      ->graphics_packets[segment.first_graphics_packet]
+                      .pipeline.metadata.uses_native_descriptor_table_abi;
+      } else if (!rewrite &&
+                 segment.kind == CompiledCommandSegmentKind::Compute &&
                  segment.compute_packet_count) {
-        native = compiled
-                     ->compute_packets[segment.first_compute_packet]
-                     .pipeline.metadata.uses_native_descriptor_table_abi;
+        rewrite = compiled
+                      ->compute_packets[segment.first_compute_packet]
+                      .pipeline.metadata.uses_native_descriptor_table_abi;
       }
-      if (!native)
+      if (!rewrite || segment.kind == CompiledCommandSegmentKind::Fallback)
         continue;
       segment.kind = CompiledCommandSegmentKind::Fallback;
       segment.graphics_packet_count = 0;
       segment.compute_packet_count = 0;
-      segment.fallback_reason =
-          CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+      segment.fallback_reason = injected_finalization_failure
+                                    ? CompiledCommandFallbackReason::
+                                          InjectedNativeSegmentFinalizationFailure
+                                    : CompiledCommandFallbackReason::
+                                          NativeMissingDescriptorBackend;
       segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(
           segment.fallback_reason);
+    }
+    if (injected_finalization_failure) {
+      // Every compiled segment was rewritten above. Retaining unreachable
+      // packets would still let submission snapshot their descriptor state
+      // before fallback replay, which is precisely what this fault path must
+      // avoid.
+      compiled->graphics_packets.clear();
+      compiled->compute_packets.clear();
+      compiled->native_root_base_buffer = {};
     }
   }
 
   return compiled;
+}
+
+static bool
+IsCompiledWorkRecord(const CommandRecordPayload &payload) {
+  return std::holds_alternative<DrawInstancedRecord>(payload) ||
+         std::holds_alternative<DrawIndexedInstancedRecord>(payload) ||
+         std::holds_alternative<DispatchRecord>(payload);
+}
+
+static bool
+SegmentCompilesWorkRecord(const CompiledCommandSegment &segment,
+                          const CommandRecordPayload &payload,
+                          UINT record_index) {
+  if (!segment.record_count ||
+      record_index < segment.first_record_index ||
+      record_index - segment.first_record_index >= segment.record_count)
+    return false;
+  if (std::holds_alternative<DispatchRecord>(payload))
+    return segment.kind == CompiledCommandSegmentKind::Compute &&
+           segment.compute_packet_count != 0;
+  return segment.kind == CompiledCommandSegmentKind::Graphics &&
+         segment.graphics_packet_count != 0;
+}
+
+static void
+ApplyExecutionPathTestConfig(
+    CompiledCommandList &compiled, const std::vector<CommandRecord> &records,
+    const dxmt::d3d12::test::ExecutionPathConfig &config) {
+  using dxmt::d3d12::test::ExecutionPathFlagInjectEmptyFallbackSegment;
+  using dxmt::d3d12::test::ExecutionPathFlagInjectEmptyNativeSegment;
+  using dxmt::d3d12::test::ExecutionPathMode;
+
+  compiled.test_path_mode = config.mode;
+  compiled.test_telemetry =
+      std::make_shared<CompiledCommandTestTelemetry>();
+
+  for (UINT record_index = 0; record_index < records.size(); ++record_index) {
+    const auto &payload = records[record_index].payload;
+    if (!IsCompiledWorkRecord(payload))
+      continue;
+    compiled.test_work_record_count++;
+    const bool selected = std::any_of(
+        compiled.segments.begin(), compiled.segments.end(),
+        [&](const CompiledCommandSegment &segment) {
+          return SegmentCompilesWorkRecord(segment, payload, record_index);
+        });
+    if (selected)
+      compiled.test_compiled_work_record_count++;
+  }
+  compiled.test_native_requirement_satisfied =
+      config.mode != ExecutionPathMode::NativeCompiled ||
+      (compiled.test_work_record_count != 0 &&
+       compiled.test_compiled_work_record_count ==
+           compiled.test_work_record_count);
+
+  UINT empty_record_index = compiled.record_count;
+  UINT work_seen = 0;
+  for (UINT record_index = 0; record_index < records.size(); ++record_index) {
+    if (!IsCompiledWorkRecord(records[record_index].payload))
+      continue;
+    if (++work_seen == 2) {
+      empty_record_index = record_index;
+      break;
+    }
+  }
+  auto insertion = std::find_if(
+      compiled.segments.begin(), compiled.segments.end(),
+      [&](const CompiledCommandSegment &segment) {
+        return segment.first_record_index >= empty_record_index;
+      });
+  if (config.flags & ExecutionPathFlagInjectEmptyNativeSegment) {
+    CompiledCommandSegment segment = {};
+    segment.kind = CompiledCommandSegmentKind::Compute;
+    segment.first_record_index = empty_record_index;
+    segment.record_count = 0;
+    segment.first_compute_packet =
+        static_cast<UINT>(compiled.compute_packets.size());
+    insertion = compiled.segments.insert(insertion, segment);
+    ++insertion;
+  }
+  if (config.flags & ExecutionPathFlagInjectEmptyFallbackSegment) {
+    CompiledCommandSegment segment = {};
+    segment.kind = CompiledCommandSegmentKind::Fallback;
+    segment.first_record_index = empty_record_index;
+    segment.record_count = 0;
+    segment.fallback_reason =
+        CompiledCommandFallbackReason::ConservativeCompiler;
+    segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(
+        segment.fallback_reason);
+    compiled.segments.insert(insertion, segment);
+  }
+}
+
+static dxmt::d3d12::test::ExecutionPathStats
+BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
+  dxmt::d3d12::test::ExecutionPathStats stats = {};
+  stats.mode = compiled.test_path_mode;
+  stats.record_count = compiled.record_count;
+  stats.work_record_count = compiled.test_work_record_count;
+  stats.compiled_work_record_count =
+      compiled.test_compiled_work_record_count;
+  stats.native_requirement_satisfied =
+      compiled.test_native_requirement_satisfied ? 1u : 0u;
+  stats.retained_graphics_packets =
+      static_cast<UINT>(compiled.graphics_packets.size());
+  stats.retained_compute_packets =
+      static_cast<UINT>(compiled.compute_packets.size());
+  stats.has_native_root_base_buffer = compiled.native_root_base_buffer ? 1u : 0u;
+  for (const auto &segment : compiled.segments) {
+    if (!segment.record_count) {
+      if (segment.kind == CompiledCommandSegmentKind::Fallback)
+        stats.empty_fallback_segments++;
+      else
+        stats.empty_native_segments++;
+      continue;
+    }
+    switch (segment.kind) {
+    case CompiledCommandSegmentKind::Graphics:
+      stats.graphics_segments++;
+      stats.selected_graphics_packets += segment.graphics_packet_count;
+      break;
+    case CompiledCommandSegmentKind::Compute:
+      stats.compute_segments++;
+      stats.selected_compute_packets += segment.compute_packet_count;
+      break;
+    case CompiledCommandSegmentKind::Fallback:
+    default:
+      stats.fallback_segments++;
+      break;
+    }
+  }
+  if (compiled.test_telemetry) {
+    const auto &telemetry = *compiled.test_telemetry;
+    stats.replayed_graphics_packets =
+        telemetry.replayed_graphics_packets.load(std::memory_order_acquire);
+    stats.replayed_compute_packets =
+        telemetry.replayed_compute_packets.load(std::memory_order_acquire);
+    stats.replayed_fallback_ranges =
+        telemetry.replayed_fallback_ranges.load(std::memory_order_acquire);
+    stats.replayed_fallback_records =
+        telemetry.replayed_fallback_records.load(std::memory_order_acquire);
+    stats.replayed_compiled_packet_fallbacks =
+        telemetry.replayed_compiled_packet_fallbacks.load(
+            std::memory_order_acquire);
+    if (compiled.test_path_mode ==
+            dxmt::d3d12::test::ExecutionPathMode::NativeCompiled &&
+        stats.replayed_compiled_packet_fallbacks)
+      stats.native_requirement_satisfied = 0;
+    stats.replayed_empty_native_segments =
+        telemetry.replayed_empty_native_segments.load(
+            std::memory_order_acquire);
+    stats.replayed_empty_fallback_segments =
+        telemetry.replayed_empty_fallback_segments.load(
+            std::memory_order_acquire);
+  }
+  return stats;
 }
 
 #ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
@@ -1773,21 +2045,98 @@ public:
     return E_NOINTERFACE;
   }
 
-  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size, void *data) override {
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size,
+                                           void *data) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListObjectApi);
+    if (guid == dxmt::d3d12::test::kExecutionPathConfigGuid) {
+      if (!data_size)
+        return E_INVALIDARG;
+      if (!test_path_configured_) {
+        *data_size = 0;
+        return DXGI_ERROR_NOT_FOUND;
+      }
+      const UINT required = sizeof(test_path_config_);
+      if (!data) {
+        *data_size = required;
+        return S_OK;
+      }
+      if (*data_size < required) {
+        *data_size = required;
+        return DXGI_ERROR_MORE_DATA;
+      }
+      std::memcpy(data, &test_path_config_, required);
+      *data_size = required;
+      return S_OK;
+    }
+    if (guid == dxmt::d3d12::test::kExecutionPathStatsGuid) {
+      if (!data_size)
+        return E_INVALIDARG;
+      if (!test_path_configured_ || !compiled_commands_) {
+        *data_size = 0;
+        return DXGI_ERROR_NOT_FOUND;
+      }
+      const auto stats = BuildExecutionPathTestStats(*compiled_commands_);
+      const UINT required = sizeof(stats);
+      if (!data) {
+        *data_size = required;
+        return S_OK;
+      }
+      if (*data_size < required) {
+        *data_size = required;
+        return DXGI_ERROR_MORE_DATA;
+      }
+      std::memcpy(data, &stats, required);
+      *data_size = required;
+      return S_OK;
+    }
     return private_data_.getData(guid, data_size, data);
   }
 
-  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size, const void *data) override {
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size,
+                                           const void *data) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListObjectApi);
+    if (guid == dxmt::d3d12::test::kExecutionPathConfigGuid) {
+      using dxmt::d3d12::test::ExecutionPathConfig;
+      using dxmt::d3d12::test::ExecutionPathFlagInjectEmptyFallbackSegment;
+      using dxmt::d3d12::test::ExecutionPathFlagInjectEmptyNativeSegment;
+      using dxmt::d3d12::test::ExecutionPathMode;
+      if (closed_)
+        return E_INVALIDARG;
+      if (!data && data_size == 0) {
+        const HRESULT result = test_path_configured_ ? S_OK : S_FALSE;
+        test_path_config_ = {};
+        test_path_configured_ = false;
+        return result;
+      }
+      if (!data || data_size != sizeof(ExecutionPathConfig))
+        return E_INVALIDARG;
+      ExecutionPathConfig config = {};
+      std::memcpy(&config, data, sizeof(config));
+      constexpr UINT kKnownFlags =
+          ExecutionPathFlagInjectEmptyNativeSegment |
+          ExecutionPathFlagInjectEmptyFallbackSegment;
+      if (config.struct_size != sizeof(ExecutionPathConfig) ||
+          static_cast<UINT>(config.mode) >
+              static_cast<UINT>(ExecutionPathMode::Fallback) ||
+          (config.flags & ~kKnownFlags))
+        return E_INVALIDARG;
+      test_path_config_ = config;
+      test_path_configured_ = true;
+      return S_OK;
+    }
+    if (guid == dxmt::d3d12::test::kExecutionPathStatsGuid)
+      return E_INVALIDARG;
     return private_data_.setData(guid, data_size, data);
   }
 
   HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown *data) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListObjectApi);
+    if (guid == dxmt::d3d12::test::kExecutionPathConfigGuid ||
+        guid == dxmt::d3d12::test::kExecutionPathStatsGuid)
+      return E_INVALIDARG;
     return private_data_.setInterface(guid, data);
   }
 
@@ -1818,8 +2167,20 @@ public:
     if (!recording_error_) {
       dxmt::perf::ScopedCodeTimer build_timer(
           dxmt::PerfCodePath::CommandListCloseBuildCompiled);
-      compiled_commands_ = BuildCompiledCommandList(records_,
-                                                     device_->GetMTLDevice());
+      const bool force_fallback =
+          test_path_configured_ &&
+          test_path_config_.mode ==
+              dxmt::d3d12::test::ExecutionPathMode::Fallback;
+      auto compiled = BuildCompiledCommandList(
+          records_, device_->GetMTLDevice(), force_fallback);
+      if (test_path_configured_) {
+        ApplyExecutionPathTestConfig(*compiled, records_, test_path_config_);
+        if (test_path_config_.mode ==
+                dxmt::d3d12::test::ExecutionPathMode::NativeCompiled &&
+            !compiled->test_native_requirement_satisfied)
+          recording_error_ = E_FAIL;
+      }
+      compiled_commands_ = std::move(compiled);
     }
     closed_ = true;
     if (allocator_) {
@@ -1881,6 +2242,8 @@ public:
           dxmt::PerfCodePath::CommandListResetStateClear);
       records_.clear();
       compiled_commands_.reset();
+      test_path_config_ = {};
+      test_path_configured_ = false;
       pending_render_pass_resolves_.clear();
       active_queries_.clear();
       render_pass_active_ = false;
@@ -3898,6 +4261,8 @@ private:
   ComPrivateData private_data_;
   std::vector<CommandRecord> records_;
   std::shared_ptr<const CompiledCommandList> compiled_commands_;
+  dxmt::d3d12::test::ExecutionPathConfig test_path_config_ = {};
+  bool test_path_configured_ = false;
   FLOAT depth_bounds_min_ = 0.0f;
   FLOAT depth_bounds_max_ = 1.0f;
   UINT view_instance_mask_ = 0xffffffffu;
