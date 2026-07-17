@@ -46,6 +46,7 @@ d3d12_unit_suites = {
       'capability/format_operation_spec.cpp',
       'capability/format_texture_uav_execution_spec.cpp',
       'capability/format_uav_execution_spec.cpp',
+      'capability/optional_command_contract_spec.cpp',
       'capability/optional_feature_gate_spec.cpp',
     ),
   },

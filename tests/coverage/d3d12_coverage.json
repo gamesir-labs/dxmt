@@ -310,11 +310,14 @@
           "CreateReservedResource",
           "CreateReservedResource1",
           "GetResourceAllocationInfo",
+          "GetResourceAllocationInfo1",
           "GetResourceAllocationInfo2",
           "GetCustomHeapProperties",
           "GetCopyableFootprints",
           "GetResourceTiling",
           "GetProtectedResourceSession",
+          "CreateProtectedResourceSession",
+          "CreateProtectedResourceSession1",
           "OpenExistingHeapFromAddress",
           "OpenExistingHeapFromFileMapping",
           "MakeResident",
@@ -322,6 +325,7 @@
           "SetStablePowerState",
           "CreateLifetimeTracker",
           "CheckDriverMatchingIdentifier",
+          "GetRaytracingAccelerationStructurePrebuildInfo",
           "SetBackgroundProcessingMode"
         ]
       },
@@ -344,7 +348,12 @@
           "CreateShaderCacheSession",
           "ShaderCacheControl",
           "CreateQueryHeap",
-          "CreateCommandSignature"
+          "CreateCommandSignature",
+          "EnumerateMetaCommands",
+          "EnumerateMetaCommandParameters",
+          "CreateMetaCommand",
+          "CreateStateObject",
+          "AddToStateObject"
         ]
       },
       "command-recording": {
@@ -363,6 +372,7 @@
           "IASetPrimitiveTopology",
           "IASetIndexBuffer",
           "IASetVertexBuffers",
+          "SOSetTargets",
           "RSSetViewports",
           "RSSetScissorRects",
           "OMSetRenderTargets",
@@ -396,10 +406,27 @@
           "BeginEvent",
           "EndEvent",
           "ExecuteIndirect",
+          "AtomicCopyBufferUINT",
+          "AtomicCopyBufferUINT64",
+          "OMSetDepthBounds",
+          "SetSamplePositions",
+          "ResolveSubresourceRegion",
           "DiscardResource",
           "WriteBufferImmediate",
           "SetViewInstanceMask",
-          "SetProtectedResourceSession"
+          "SetProtectedResourceSession",
+          "InitializeMetaCommand",
+          "ExecuteMetaCommand",
+          "BuildRaytracingAccelerationStructure",
+          "EmitRaytracingAccelerationStructurePostbuildInfo",
+          "CopyRaytracingAccelerationStructure",
+          "SetPipelineState1",
+          "DispatchRays",
+          "BeginRenderPass",
+          "EndRenderPass",
+          "RSSetShadingRate",
+          "RSSetShadingRateImage",
+          "DispatchMesh"
         ]
       },
       "queue-and-fence": {
