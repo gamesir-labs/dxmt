@@ -1,3 +1,4 @@
+#include <dxmt_d3d12_test_path.hpp>
 #include <dxmt_test.hpp>
 #include <dxmt_test_shader.hpp>
 
@@ -16,6 +17,10 @@ using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::FullscreenVertexShader;
 using dxmt::test::TextureReadback;
+using dxmt::d3d12::test::ExecutionPathConfig;
+using dxmt::d3d12::test::ExecutionPathMode;
+using dxmt::d3d12::test::ExecutionPathSegmentKind;
+using dxmt::d3d12::test::ExecutionPathStats;
 
 class ExecutionPathBoundarySpec : public ::testing::Test {
 protected:
@@ -535,9 +540,18 @@ protected:
   }
 
   void RunComputeBoundarySequence(ComputeBoundarySequence sequence,
-                                  std::vector<std::uint32_t> *values) {
+                                  std::vector<std::uint32_t> *values,
+                                  ExecutionPathStats *stats = nullptr) {
     D3D12TestContext context;
     ASSERT_EQ(context.Initialize(), S_OK);
+    if (stats) {
+      ExecutionPathConfig config = {};
+      config.mode = ExecutionPathMode::Auto;
+      ASSERT_EQ(context.list()->SetPrivateData(
+                    dxmt::d3d12::test::kExecutionPathConfigGuid,
+                    sizeof(config), &config),
+                S_OK);
+    }
 
     const auto shader = CompileShader(R"(
       Buffer<uint> input : register(t0);
@@ -688,9 +702,31 @@ protected:
 
     std::vector<std::uint8_t> bytes;
     ASSERT_EQ(context.ReadbackBuffer(read_source, kBufferSize, &bytes), S_OK);
+    if (stats) {
+      UINT stats_size = sizeof(*stats);
+      ASSERT_EQ(context.list()->GetPrivateData(
+                    dxmt::d3d12::test::kExecutionPathStatsGuid, &stats_size,
+                    stats),
+                S_OK);
+      ASSERT_EQ(stats_size, sizeof(*stats));
+      ASSERT_EQ(stats->struct_size, sizeof(*stats));
+      ASSERT_EQ(stats->segment_count, stats->traced_segment_count)
+          << "boundary test exceeded the ordered trace capacity";
+    }
     ASSERT_EQ(bytes.size(), kBufferSize);
     values->resize(kElementCount);
     std::memcpy(values->data(), bytes.data(), bytes.size());
+  }
+
+  static std::vector<ExecutionPathSegmentKind>
+  CompressedSegmentKinds(const ExecutionPathStats &stats) {
+    std::vector<ExecutionPathSegmentKind> kinds;
+    for (UINT index = 0; index < stats.traced_segment_count; ++index) {
+      if (!kinds.empty() && kinds.back() == stats.segment_kinds[index])
+        continue;
+      kinds.push_back(stats.segment_kinds[index]);
+    }
+    return kinds;
   }
 
   void ExpectSolidColor(const TextureReadback &readback,
@@ -954,6 +990,44 @@ TEST_F(ExecutionPathBoundarySpec,
   // the following native dispatch uses the table at the new root index.
   EXPECT_EQ(values, (std::vector<std::uint32_t>{
                         0x11111111, 0x22222222, 0x00000000, 0x00000000}));
+}
+
+TEST_F(ExecutionPathBoundarySpec,
+       OrderedTelemetryProvesBoundarySegmentTopologies) {
+  using Kind = ExecutionPathSegmentKind;
+
+  std::vector<std::uint32_t> values;
+  ExecutionPathStats fallback_native_fallback = {};
+  ASSERT_NO_FATAL_FAILURE(RunComputeBoundarySequence(
+      ComputeBoundarySequence::FallbackNativeFallback, &values,
+      &fallback_native_fallback));
+  EXPECT_EQ(CompressedSegmentKinds(fallback_native_fallback),
+            (std::vector<Kind>{Kind::Fallback, Kind::Compute,
+                               Kind::Fallback}));
+  EXPECT_EQ(fallback_native_fallback.replayed_compute_packets, 1u);
+  EXPECT_GT(fallback_native_fallback.replayed_fallback_ranges, 0u);
+
+  ExecutionPathStats descriptor_boundary = {};
+  ASSERT_NO_FATAL_FAILURE(RunComputeBoundarySequence(
+      ComputeBoundarySequence::DescriptorTableUpdate, &values,
+      &descriptor_boundary));
+  EXPECT_EQ(CompressedSegmentKinds(descriptor_boundary),
+            (std::vector<Kind>{Kind::Fallback, Kind::Compute,
+                               Kind::Fallback, Kind::Compute,
+                               Kind::Fallback}));
+  EXPECT_EQ(descriptor_boundary.replayed_compute_packets, 2u);
+  EXPECT_GT(descriptor_boundary.replayed_fallback_ranges, 0u);
+
+  ExecutionPathStats root_signature_boundary = {};
+  ASSERT_NO_FATAL_FAILURE(RunComputeBoundarySequence(
+      ComputeBoundarySequence::RootSignatureChange, &values,
+      &root_signature_boundary));
+  EXPECT_EQ(CompressedSegmentKinds(root_signature_boundary),
+            (std::vector<Kind>{Kind::Fallback, Kind::Compute,
+                               Kind::Fallback, Kind::Compute,
+                               Kind::Fallback}));
+  EXPECT_EQ(root_signature_boundary.replayed_compute_packets, 2u);
+  EXPECT_GT(root_signature_boundary.replayed_fallback_ranges, 0u);
 }
 
 TEST_F(ExecutionPathBoundarySpec,

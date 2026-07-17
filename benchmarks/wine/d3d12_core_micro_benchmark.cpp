@@ -3,9 +3,12 @@
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 
+#include <array>
+#include <barrier>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -14,6 +17,8 @@ using clock_type = std::chrono::steady_clock;
 using dxmt::test::ClearBufferComputeShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::DualSourcePixelShader;
+using dxmt::test::TextureUavPixelShader;
 
 constexpr UINT kSmallCommandCount = 16;
 constexpr UINT kLargeCommandCount = 4096;
@@ -30,6 +35,8 @@ constexpr UINT kEmptyListBatchCount = 64;
 constexpr UINT kSignalBatchCount = 256;
 constexpr UINT kSubMicroBatchCount = 4096;
 constexpr UINT kAllocatorBatchCount = 4096;
+constexpr UINT kDrawTargetSize = 8;
+constexpr UINT kDescriptorValidationElements = 64;
 
 double Seconds(clock_type::duration duration) {
   return std::chrono::duration<double>(duration).count();
@@ -117,6 +124,242 @@ HRESULT SubmitCommandListBatch(D3D12TestContext &context,
   context.queue()->ExecuteCommandLists(
       static_cast<UINT>(batch.submissions.size()), batch.submissions.data());
   return context.SignalAndWait();
+}
+
+struct DrawResources {
+  ComPtr<ID3D12Resource> target;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap;
+  ComPtr<ID3D12RootSignature> root_signature;
+  ComPtr<ID3D12PipelineState> pipeline;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+};
+
+bool CreateDrawResources(benchmark::State &state, D3D12TestContext &context,
+                         const D3D12_ROOT_SIGNATURE_DESC &root_desc,
+                         D3D12_SHADER_BYTECODE pixel_shader,
+                         DrawResources *resources) {
+  resources->target = context.CreateTexture2D(
+      kDrawTargetSize, kDrawTargetSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  resources->rtv_heap =
+      context.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  resources->root_signature = context.CreateRootSignature(root_desc);
+  if (resources->root_signature) {
+    resources->pipeline = context.CreateGraphicsPipeline(
+        resources->root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+        pixel_shader);
+  }
+  if (!resources->target || !resources->rtv_heap ||
+      !resources->root_signature || !resources->pipeline) {
+    state.SkipWithError("draw benchmark setup failed");
+    return false;
+  }
+  resources->rtv = resources->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context.device()->CreateRenderTargetView(resources->target.get(), nullptr,
+                                           resources->rtv);
+  return CheckDeviceHealth(state, context);
+}
+
+void BindDrawResources(ID3D12GraphicsCommandList *list,
+                       const DrawResources &resources) {
+  constexpr D3D12_VIEWPORT viewport = {0.0f,
+                                       0.0f,
+                                       static_cast<float>(kDrawTargetSize),
+                                       static_cast<float>(kDrawTargetSize),
+                                       0.0f,
+                                       1.0f};
+  constexpr D3D12_RECT scissor = {0, 0, kDrawTargetSize, kDrawTargetSize};
+  list->OMSetRenderTargets(1, &resources.rtv, FALSE, nullptr);
+  list->SetGraphicsRootSignature(resources.root_signature.get());
+  list->SetPipelineState(resources.pipeline.get());
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  list->RSSetViewports(1, &viewport);
+  list->RSSetScissorRects(1, &scissor);
+}
+
+bool RunDrawHealthPrecheck(benchmark::State &state, D3D12TestContext &context,
+                           const DrawResources &resources) {
+  D3D12_QUERY_HEAP_DESC query_desc = {};
+  query_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+  query_desc.Count = 1;
+  ComPtr<ID3D12QueryHeap> query_heap;
+  auto query_result = context.CreateBuffer(
+      sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!query_result || FAILED(context.device()->CreateQueryHeap(
+                           &query_desc, IID_PPV_ARGS(query_heap.put())))) {
+    state.SkipWithError("draw benchmark precheck setup failed");
+    return false;
+  }
+
+  BindDrawResources(context.list(), resources);
+  context.list()->BeginQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+  context.list()->DrawInstanced(3, 1, 0, 0);
+  context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+  context.list()->ResolveQueryData(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                   0, 1, query_result.get(), 0);
+  if (FAILED(context.ExecuteAndWait())) {
+    state.SkipWithError("draw benchmark health precheck failed");
+    return false;
+  }
+
+  UINT64 *mapped = nullptr;
+  const D3D12_RANGE read_range = {0, sizeof(UINT64)};
+  if (FAILED(query_result->Map(0, &read_range,
+                               reinterpret_cast<void **>(&mapped))) ||
+      !mapped || *mapped == 0) {
+    if (mapped) {
+      const D3D12_RANGE no_write = {0, 0};
+      query_result->Unmap(0, &no_write);
+    }
+    state.SkipWithError("draw benchmark precheck produced no samples");
+    return false;
+  }
+  const D3D12_RANGE no_write = {0, 0};
+  query_result->Unmap(0, &no_write);
+  if (FAILED(context.ResetCommandList())) {
+    state.SkipWithError("draw benchmark precheck reset failed");
+    return false;
+  }
+  return CheckDeviceHealth(state, context);
+}
+
+enum class DrawRecordMode {
+  NoStateChanges,
+  RootConstants,
+  DescriptorChange,
+};
+
+void RunDrawRecordBenchmark(benchmark::State &state, DrawRecordMode mode) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+
+  D3D12_DESCRIPTOR_RANGE uav_range = {};
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  D3D12_SHADER_BYTECODE pixel_shader = DualSourcePixelShader();
+  if (mode == DrawRecordMode::RootConstants) {
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 1;
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = parameters;
+  } else if (mode == DrawRecordMode::DescriptorChange) {
+    uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav_range.NumDescriptors = 1;
+    uav_range.BaseShaderRegister = 1;
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[0].DescriptorTable.pDescriptorRanges = &uav_range;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.ShaderRegister = 0;
+    parameters[1].Constants.Num32BitValues = 1;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    root_desc.NumParameters = 2;
+    root_desc.pParameters = parameters;
+    pixel_shader = TextureUavPixelShader();
+  }
+
+  DrawResources resources;
+  if (!CreateDrawResources(state, context, root_desc, pixel_shader, &resources))
+    return;
+
+  ComPtr<ID3D12Resource> uav_texture;
+  ComPtr<ID3D12DescriptorHeap> descriptor_heap;
+  if (mode == DrawRecordMode::DescriptorChange) {
+    constexpr float value = 1.0f;
+    uav_texture =
+        context.CreateTexture2D(1, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+    descriptor_heap = context.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+    if (!uav_texture || !descriptor_heap ||
+        FAILED(context.UploadTextureAndReset(uav_texture.get(), &value,
+                                             sizeof(value), sizeof(value)))) {
+      state.SkipWithError("draw descriptor-change setup failed");
+      return;
+    }
+    D3D12TestContext::Transition(context.list(), uav_texture.get(),
+                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+    uav_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    for (UINT index = 0; index < 2; ++index) {
+      context.device()->CreateUnorderedAccessView(
+          uav_texture.get(), nullptr, &uav_desc,
+          context.CpuDescriptorHandle(descriptor_heap.get(), index));
+    }
+    ID3D12DescriptorHeap *heaps[] = {descriptor_heap.get()};
+    context.list()->SetDescriptorHeaps(1, heaps);
+    context.list()->SetGraphicsRootDescriptorTable(
+        0, descriptor_heap->GetGPUDescriptorHandleForHeapStart());
+    context.list()->SetGraphicsRoot32BitConstant(1, 0, 0);
+  }
+  if (!RunDrawHealthPrecheck(state, context, resources))
+    return;
+
+  const auto command_count = static_cast<UINT>(state.range(0));
+  const UINT batch_count = TimedCommandListBatchCount(command_count);
+  CommandListBatch batch;
+  if (FAILED(CreateOpenCommandListBatch(context, batch_count, &batch))) {
+    state.SkipWithError("draw command-list batch setup failed");
+    return;
+  }
+  for (const auto &list : batch.lists) {
+    BindDrawResources(list.get(), resources);
+    if (mode == DrawRecordMode::DescriptorChange) {
+      ID3D12DescriptorHeap *heaps[] = {descriptor_heap.get()};
+      list->SetDescriptorHeaps(1, heaps);
+      list->SetGraphicsRoot32BitConstant(1, 0, 0);
+    }
+  }
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    const auto begin = clock_type::now();
+    for (const auto &list : batch.lists) {
+      for (UINT index = 0; index < command_count; ++index) {
+        if (mode == DrawRecordMode::RootConstants) {
+          list->SetGraphicsRoot32BitConstant(0, index, 0);
+        } else if (mode == DrawRecordMode::DescriptorChange) {
+          list->SetGraphicsRootDescriptorTable(
+              0,
+              context.GpuDescriptorHandle(descriptor_heap.get(), index & 1u));
+        }
+        list->DrawInstanced(3, 1, 0, 0);
+      }
+    }
+    const auto end = clock_type::now();
+    measured_seconds = PerWorkloadSeconds(end - begin, batch_count);
+    state.SetIterationTime(measured_seconds);
+    if (FAILED(CloseCommandListBatch(batch)) ||
+        FAILED(SubmitCommandListBatch(context, batch))) {
+      state.SkipWithError("draw command-list execution failed");
+      return;
+    }
+  }
+  if (!CheckDeviceHealth(state, context))
+    return;
+  PublishOperationCount(state, "commands", command_count, measured_seconds);
+}
+
+void BI_D3D12RecordDrawWithoutStateChanges(benchmark::State &state) {
+  RunDrawRecordBenchmark(state, DrawRecordMode::NoStateChanges);
+}
+
+void BI_D3D12RecordDrawWithRootConstants(benchmark::State &state) {
+  RunDrawRecordBenchmark(state, DrawRecordMode::RootConstants);
+}
+
+void BI_D3D12RecordDrawWithDescriptorChange(benchmark::State &state) {
+  RunDrawRecordBenchmark(state, DrawRecordMode::DescriptorChange);
 }
 
 void RecordCopyCommands(ID3D12GraphicsCommandList *list,
@@ -369,6 +612,102 @@ void BI_D3D12RecordCopyBuffer(benchmark::State &state) {
   PublishOperationCount(state, "commands", command_count, measured_seconds);
 }
 
+void RecordCopyTextureCommands(ID3D12GraphicsCommandList *list,
+                               ID3D12Resource *destination,
+                               ID3D12Resource *source, UINT command_count) {
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination_location = {};
+  destination_location.pResource = destination;
+  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  for (UINT index = 0; index < command_count; ++index) {
+    list->CopyTextureRegion(&destination_location, 0, 0, 0, &source_location,
+                            nullptr);
+  }
+}
+
+void BI_D3D12RecordCopyTexture(benchmark::State &state) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+
+  constexpr UINT kTextureSize = 4;
+  constexpr std::uint32_t kExpected = 0x7f31c5e9u;
+  std::array<std::uint32_t, kTextureSize * kTextureSize> texture_data;
+  texture_data.fill(kExpected);
+  auto source = context.CreateTexture2D(
+      kTextureSize, kTextureSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto destination = context.CreateTexture2D(
+      kTextureSize, kTextureSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto precheck_destination = context.CreateTexture2D(
+      kTextureSize, kTextureSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!source || !destination || !precheck_destination ||
+      FAILED(context.UploadTextureAndReset(source.get(), texture_data.data(),
+                                           kTextureSize * sizeof(std::uint32_t),
+                                           sizeof(texture_data)))) {
+    state.SkipWithError("copy-texture benchmark setup failed");
+    return;
+  }
+
+  D3D12TestContext::Transition(context.list(), source.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  RecordCopyTextureCommands(context.list(), precheck_destination.get(),
+                            source.get(), 1);
+  D3D12TestContext::Transition(context.list(), precheck_destination.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  dxmt::test::TextureReadback readback;
+  if (FAILED(context.ReadbackTexture(precheck_destination.get(), &readback)) ||
+      readback.data.size() < sizeof(kExpected)) {
+    state.SkipWithError("copy-texture benchmark precheck readback failed");
+    return;
+  }
+  std::uint32_t actual = 0;
+  std::memcpy(&actual, readback.data.data(), sizeof(actual));
+  if (actual != kExpected || FAILED(context.ResetCommandList()) ||
+      !CheckDeviceHealth(state, context)) {
+    if (!state.skipped())
+      state.SkipWithError("copy-texture benchmark precheck mismatch");
+    return;
+  }
+
+  const auto command_count = static_cast<UINT>(state.range(0));
+  const UINT batch_count =
+      TimedCommandListBatchCount(command_count, kMinimumTimedCopyLists);
+  CommandListBatch batch;
+  if (FAILED(CreateOpenCommandListBatch(context, batch_count, &batch))) {
+    state.SkipWithError("copy-texture command-list batch setup failed");
+    return;
+  }
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    const auto begin = clock_type::now();
+    for (const auto &list : batch.lists) {
+      RecordCopyTextureCommands(list.get(), destination.get(), source.get(),
+                                command_count);
+    }
+    const auto end = clock_type::now();
+    measured_seconds = PerWorkloadSeconds(end - begin, batch_count);
+    state.SetIterationTime(measured_seconds);
+    if (FAILED(CloseCommandListBatch(batch)) ||
+        FAILED(SubmitCommandListBatch(context, batch))) {
+      state.SkipWithError("copy-texture command-list execution failed");
+      return;
+    }
+  }
+  if (!CheckDeviceHealth(state, context))
+    return;
+  PublishOperationCount(state, "commands", command_count, measured_seconds);
+}
+
 void RunCloseListBenchmark(benchmark::State &state, UINT command_count) {
   D3D12TestContext context;
   if (FAILED(context.Initialize())) {
@@ -509,6 +848,154 @@ void BI_D3D12WaitAlreadyComplete(benchmark::State &state) {
   if (!CheckDeviceHealth(state, context))
     return;
   PublishOperationCount(state, "waits", 1, measured_seconds);
+}
+
+void BI_D3D12CpuWait(benchmark::State &state) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+  ComPtr<ID3D12Fence> fence;
+  if (FAILED(context.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                           IID_PPV_ARGS(fence.put()))) ||
+      FAILED(context.list()->Close())) {
+    state.SkipWithError("CPU-wait benchmark setup failed");
+    return;
+  }
+  ID3D12CommandList *lists[] = {context.list()};
+  UINT64 fence_value = 1;
+  context.queue()->ExecuteCommandLists(1, lists);
+  if (FAILED(context.queue()->Signal(fence.get(), fence_value)) ||
+      FAILED(context.WaitForFence(fence.get(), fence_value)) ||
+      fence->GetCompletedValue() < fence_value ||
+      !CheckDeviceHealth(state, context)) {
+    if (!state.skipped())
+      state.SkipWithError("CPU-wait benchmark health precheck failed");
+    return;
+  }
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    ++fence_value;
+    context.queue()->ExecuteCommandLists(1, lists);
+    if (FAILED(context.queue()->Signal(fence.get(), fence_value))) {
+      state.SkipWithError("CPU-wait benchmark queue signal failed");
+      return;
+    }
+    const auto begin = clock_type::now();
+    const HRESULT result = context.WaitForFence(fence.get(), fence_value);
+    const auto end = clock_type::now();
+    if (FAILED(result) || fence->GetCompletedValue() < fence_value) {
+      state.SkipWithError("CPU fence wait failed");
+      return;
+    }
+    measured_seconds = Seconds(end - begin);
+    state.SetIterationTime(measured_seconds);
+  }
+  if (!CheckDeviceHealth(state, context))
+    return;
+  PublishOperationCount(state, "waits", 1, measured_seconds);
+}
+
+void BI_D3D12CrossQueueHandoff(benchmark::State &state) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+
+  constexpr std::uint32_t kExpected = 0xa1b2c3d4u;
+  auto source = context.CreateUploadBuffer(sizeof(kExpected), &kExpected,
+                                           sizeof(kExpected));
+  auto intermediate = context.CreateBuffer(
+      sizeof(kExpected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  auto readback = context.CreateBuffer(
+      sizeof(kExpected), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12CommandQueue> consumer_queue;
+  ComPtr<ID3D12CommandAllocator> consumer_allocator;
+  ComPtr<ID3D12GraphicsCommandList> consumer_list;
+  ComPtr<ID3D12Fence> fence;
+  D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+  queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+  if (!source || !intermediate || !readback ||
+      FAILED(context.device()->CreateCommandQueue(
+          &queue_desc, IID_PPV_ARGS(consumer_queue.put()))) ||
+      FAILED(context.device()->CreateCommandAllocator(
+          D3D12_COMMAND_LIST_TYPE_COPY,
+          IID_PPV_ARGS(consumer_allocator.put()))) ||
+      FAILED(context.device()->CreateCommandList(
+          0, D3D12_COMMAND_LIST_TYPE_COPY, consumer_allocator.get(), nullptr,
+          IID_PPV_ARGS(consumer_list.put()))) ||
+      FAILED(context.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                           IID_PPV_ARGS(fence.put())))) {
+    state.SkipWithError("cross-queue benchmark setup failed");
+    return;
+  }
+
+  context.list()->CopyBufferRegion(intermediate.get(), 0, source.get(), 0,
+                                   sizeof(kExpected));
+  consumer_list->CopyBufferRegion(readback.get(), 0, intermediate.get(), 0,
+                                  sizeof(kExpected));
+  if (FAILED(context.list()->Close()) || FAILED(consumer_list->Close())) {
+    state.SkipWithError("cross-queue benchmark list recording failed");
+    return;
+  }
+  ID3D12CommandList *producer_lists[] = {context.list()};
+  ID3D12CommandList *consumer_lists[] = {consumer_list.get()};
+  UINT64 fence_value = 0;
+  auto submit_handoff = [&]() -> HRESULT {
+    const UINT64 ready_value = ++fence_value;
+    const UINT64 done_value = ++fence_value;
+    context.queue()->ExecuteCommandLists(1, producer_lists);
+    HRESULT result = context.queue()->Signal(fence.get(), ready_value);
+    if (SUCCEEDED(result))
+      result = consumer_queue->Wait(fence.get(), ready_value);
+    if (SUCCEEDED(result))
+      consumer_queue->ExecuteCommandLists(1, consumer_lists);
+    if (SUCCEEDED(result))
+      result = consumer_queue->Signal(fence.get(), done_value);
+    if (SUCCEEDED(result))
+      result = context.WaitForFence(fence.get(), done_value);
+    return result;
+  };
+
+  if (FAILED(submit_handoff())) {
+    state.SkipWithError("cross-queue benchmark health precheck failed");
+    return;
+  }
+  std::uint32_t *mapped = nullptr;
+  const D3D12_RANGE read_range = {0, sizeof(kExpected)};
+  if (FAILED(
+          readback->Map(0, &read_range, reinterpret_cast<void **>(&mapped))) ||
+      !mapped || *mapped != kExpected) {
+    if (mapped) {
+      const D3D12_RANGE no_write = {0, 0};
+      readback->Unmap(0, &no_write);
+    }
+    state.SkipWithError("cross-queue benchmark precheck mismatch");
+    return;
+  }
+  const D3D12_RANGE no_write = {0, 0};
+  readback->Unmap(0, &no_write);
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    const auto begin = clock_type::now();
+    const HRESULT result = submit_handoff();
+    const auto end = clock_type::now();
+    if (FAILED(result)) {
+      state.SkipWithError("cross-queue handoff failed");
+      return;
+    }
+    measured_seconds = Seconds(end - begin);
+    state.SetIterationTime(measured_seconds);
+  }
+  if (!CheckDeviceHealth(state, context))
+    return;
+  PublishOperationCount(state, "handoffs", 1, measured_seconds);
 }
 
 void BI_D3D12AllocatorReuse(benchmark::State &state) {
@@ -780,6 +1267,286 @@ void BI_D3D12OverwriteSameSlot(benchmark::State &state) {
                         measured_seconds);
 }
 
+struct DescriptorPublicationResources {
+  ComPtr<ID3D12Resource> output;
+  ComPtr<ID3D12RootSignature> root_signature;
+  ComPtr<ID3D12PipelineState> pipeline;
+  UINT slot_count = 0;
+};
+
+bool CreateDescriptorPublicationResources(
+    benchmark::State &state, D3D12TestContext &context, UINT slot_count,
+    DescriptorPublicationResources *resources) {
+  resources->slot_count = slot_count;
+  const UINT64 element_count =
+      static_cast<UINT64>(slot_count) * kDescriptorValidationElements;
+  resources->output = context.CreateBuffer(
+      element_count * sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = 1;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.Num32BitValues = 1;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[1].DescriptorTable.pDescriptorRanges = &range;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
+  resources->root_signature = context.CreateRootSignature(root_desc);
+  if (resources->root_signature) {
+    resources->pipeline = context.CreateComputePipeline(
+        resources->root_signature.get(), ClearBufferComputeShader());
+  }
+  if (!resources->output || !resources->root_signature ||
+      !resources->pipeline) {
+    state.SkipWithError("descriptor publication benchmark setup failed");
+    return false;
+  }
+  return CheckDeviceHealth(state, context);
+}
+
+void WritePublicationUav(D3D12TestContext &context,
+                         const DescriptorPublicationResources &resources,
+                         ID3D12DescriptorHeap *heap, UINT heap_index,
+                         UINT output_slot) {
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_UINT;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.FirstElement =
+      static_cast<UINT64>(output_slot) * kDescriptorValidationElements;
+  uav.Buffer.NumElements = kDescriptorValidationElements;
+  context.device()->CreateUnorderedAccessView(
+      resources.output.get(), nullptr, &uav,
+      context.CpuDescriptorHandle(heap, heap_index));
+}
+
+bool ValidatePublishedDescriptors(
+    benchmark::State &state, D3D12TestContext &context,
+    const DescriptorPublicationResources &resources, ID3D12DescriptorHeap *heap,
+    UINT descriptor_count, UINT output_first_slot, std::uint32_t expected) {
+  ID3D12DescriptorHeap *heaps[] = {heap};
+  context.list()->SetDescriptorHeaps(1, heaps);
+  context.list()->SetPipelineState(resources.pipeline.get());
+  context.list()->SetComputeRootSignature(resources.root_signature.get());
+  context.list()->SetComputeRoot32BitConstant(0, expected, 0);
+  for (UINT index = 0; index < descriptor_count; ++index) {
+    context.list()->SetComputeRootDescriptorTable(
+        1, context.GpuDescriptorHandle(heap, index));
+    context.list()->Dispatch(1, 1, 1);
+  }
+  D3D12TestContext::Transition(context.list(), resources.output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  const UINT64 output_size = static_cast<UINT64>(resources.slot_count) *
+                             kDescriptorValidationElements *
+                             sizeof(std::uint32_t);
+  std::vector<std::uint8_t> readback;
+  if (FAILED(context.ReadbackBuffer(resources.output.get(), output_size,
+                                    &readback)) ||
+      readback.size() != output_size) {
+    state.SkipWithError("descriptor publication validation readback failed");
+    return false;
+  }
+  for (UINT slot = output_first_slot;
+       slot < output_first_slot + descriptor_count; ++slot) {
+    for (UINT element = 0; element < kDescriptorValidationElements; ++element) {
+      std::uint32_t actual = 0;
+      const std::size_t offset =
+          (static_cast<std::size_t>(slot) * kDescriptorValidationElements +
+           element) *
+          sizeof(actual);
+      std::memcpy(&actual, readback.data() + offset, sizeof(actual));
+      if (actual != expected) {
+        state.SkipWithError("descriptor publication validation mismatch");
+        return false;
+      }
+    }
+  }
+  if (FAILED(context.ResetCommandList())) {
+    state.SkipWithError("descriptor publication validation reset failed");
+    return false;
+  }
+  D3D12TestContext::Transition(context.list(), resources.output.get(),
+                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (FAILED(context.ExecuteAndWait()) || FAILED(context.ResetCommandList())) {
+    state.SkipWithError("descriptor publication state restore failed");
+    return false;
+  }
+  return CheckDeviceHealth(state, context);
+}
+
+void BI_D3D12PublishNativeTable(benchmark::State &state) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+  const auto descriptor_count = static_cast<UINT>(state.range(0));
+  const UINT batch_count = TimedBatchCount(descriptor_count);
+  const UINT timed_descriptor_count = descriptor_count * batch_count;
+  DescriptorPublicationResources resources;
+  auto heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, timed_descriptor_count, true);
+  if (!heap || !CreateDescriptorPublicationResources(
+                   state, context, timed_descriptor_count, &resources))
+    return;
+
+  constexpr std::uint32_t kPrecheckValue = 0x19375bdfu;
+  WritePublicationUav(context, resources, heap.get(), 0, 0);
+  if (!ValidatePublishedDescriptors(state, context, resources, heap.get(), 1, 0,
+                                    kPrecheckValue))
+    return;
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    const auto begin = clock_type::now();
+    for (UINT index = 0; index < timed_descriptor_count; ++index)
+      WritePublicationUav(context, resources, heap.get(), index, index);
+    const auto end = clock_type::now();
+    measured_seconds = PerWorkloadSeconds(end - begin, batch_count);
+    state.SetIterationTime(measured_seconds);
+  }
+  constexpr std::uint32_t kExpected = 0x2468ace0u;
+  if (!ValidatePublishedDescriptors(state, context, resources, heap.get(),
+                                    timed_descriptor_count, 0, kExpected))
+    return;
+  PublishOperationCount(state, "descriptors", descriptor_count,
+                        measured_seconds);
+}
+
+void BI_D3D12SwitchHeap(benchmark::State &state) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+  const auto descriptor_count = static_cast<UINT>(state.range(0));
+  DescriptorPublicationResources resources;
+  auto first_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count, true);
+  auto second_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count, true);
+  if (!first_heap || !second_heap ||
+      !CreateDescriptorPublicationResources(state, context,
+                                            2 * descriptor_count, &resources))
+    return;
+  for (UINT index = 0; index < descriptor_count; ++index) {
+    WritePublicationUav(context, resources, first_heap.get(), index, index);
+    WritePublicationUav(context, resources, second_heap.get(), index,
+                        descriptor_count + index);
+  }
+  constexpr std::uint32_t kFirstExpected = 0x11112222u;
+  constexpr std::uint32_t kSecondExpected = 0x33334444u;
+  if (!ValidatePublishedDescriptors(state, context, resources, first_heap.get(),
+                                    descriptor_count, 0, kFirstExpected) ||
+      !ValidatePublishedDescriptors(state, context, resources,
+                                    second_heap.get(), descriptor_count,
+                                    descriptor_count, kSecondExpected))
+    return;
+
+  const UINT batch_count = TimedBatchCount(2);
+  CommandListBatch batch;
+  if (FAILED(CreateOpenCommandListBatch(context, batch_count, &batch))) {
+    state.SkipWithError("heap-switch command-list batch setup failed");
+    return;
+  }
+  for (const auto &list : batch.lists) {
+    list->SetComputeRootSignature(resources.root_signature.get());
+    ID3D12DescriptorHeap *heaps[] = {first_heap.get()};
+    list->SetDescriptorHeaps(1, heaps);
+  }
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    const auto begin = clock_type::now();
+    for (const auto &list : batch.lists) {
+      ID3D12DescriptorHeap *second[] = {second_heap.get()};
+      list->SetDescriptorHeaps(1, second);
+      list->SetComputeRootDescriptorTable(
+          1, second_heap->GetGPUDescriptorHandleForHeapStart());
+      ID3D12DescriptorHeap *first[] = {first_heap.get()};
+      list->SetDescriptorHeaps(1, first);
+      list->SetComputeRootDescriptorTable(
+          1, first_heap->GetGPUDescriptorHandleForHeapStart());
+    }
+    const auto end = clock_type::now();
+    measured_seconds = PerWorkloadSeconds(end - begin, batch_count);
+    state.SetIterationTime(measured_seconds);
+    if (FAILED(CloseCommandListBatch(batch)) ||
+        FAILED(SubmitCommandListBatch(context, batch))) {
+      state.SkipWithError("heap-switch command-list execution failed");
+      return;
+    }
+  }
+  if (!CheckDeviceHealth(state, context))
+    return;
+  PublishOperationCount(state, "switches", 2, measured_seconds);
+  state.counters["descriptors"] = descriptor_count;
+}
+
+void BI_D3D12ConcurrentDisjointPublication(benchmark::State &state) {
+  D3D12TestContext context;
+  if (FAILED(context.Initialize())) {
+    state.SkipWithError("D3D12 initialization failed");
+    return;
+  }
+  const auto descriptor_count = static_cast<UINT>(state.range(0));
+  const UINT batch_count = TimedBatchCount(descriptor_count);
+  const UINT timed_descriptor_count = descriptor_count * batch_count;
+  DescriptorPublicationResources resources;
+  auto heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, timed_descriptor_count, true);
+  if (!heap || !CreateDescriptorPublicationResources(
+                   state, context, timed_descriptor_count, &resources))
+    return;
+
+  std::barrier precheck_barrier(3);
+  auto precheck_publish = [&](UINT index) {
+    precheck_barrier.arrive_and_wait();
+    WritePublicationUav(context, resources, heap.get(), index, index);
+  };
+  std::thread first_precheck(precheck_publish, 0);
+  std::thread second_precheck(precheck_publish, 1);
+  precheck_barrier.arrive_and_wait();
+  first_precheck.join();
+  second_precheck.join();
+  constexpr std::uint32_t kPrecheckValue = 0x10293847u;
+  if (!ValidatePublishedDescriptors(state, context, resources, heap.get(), 2, 0,
+                                    kPrecheckValue))
+    return;
+
+  double measured_seconds = 0.0;
+  for (auto _ : state) {
+    std::barrier start_barrier(3);
+    std::barrier finish_barrier(3);
+    auto publish_parity = [&](UINT parity) {
+      start_barrier.arrive_and_wait();
+      for (UINT index = parity; index < timed_descriptor_count; index += 2)
+        WritePublicationUav(context, resources, heap.get(), index, index);
+      finish_barrier.arrive_and_wait();
+    };
+    std::thread even_writer(publish_parity, 0);
+    std::thread odd_writer(publish_parity, 1);
+    const auto begin = clock_type::now();
+    start_barrier.arrive_and_wait();
+    finish_barrier.arrive_and_wait();
+    const auto end = clock_type::now();
+    even_writer.join();
+    odd_writer.join();
+    measured_seconds = PerWorkloadSeconds(end - begin, batch_count);
+    state.SetIterationTime(measured_seconds);
+  }
+  if (!CheckDeviceHealth(state, context))
+    return;
+  PublishOperationCount(state, "descriptors", descriptor_count,
+                        measured_seconds);
+}
+
 void BI_D3D12RecordBarrierBatch(benchmark::State &state) {
   D3D12TestContext context;
   if (FAILED(context.Initialize())) {
@@ -875,14 +1642,14 @@ void BI_D3D12CopyDescriptorRange(benchmark::State &state) {
   constexpr UINT kValidationExpected = 0x2468ace0u;
   constexpr UINT64 kValidationSize =
       kValidationElementCount * sizeof(std::uint32_t);
-  auto validation_output = context.CreateBuffer(
-      kValidationSize, D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  auto poison_output = context.CreateBuffer(
-      kValidationSize, D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto validation_output =
+      context.CreateBuffer(kValidationSize, D3D12_HEAP_TYPE_DEFAULT,
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto poison_output =
+      context.CreateBuffer(kValidationSize, D3D12_HEAP_TYPE_DEFAULT,
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   D3D12_DESCRIPTOR_RANGE validation_range = {};
   validation_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -933,17 +1700,17 @@ void BI_D3D12CopyDescriptorRange(benchmark::State &state) {
       context.GpuDescriptorHandle(validation_destination.get(), 0);
   ID3D12DescriptorHeap *validation_heaps[] = {validation_destination.get()};
 
-  context.device()->CreateUnorderedAccessView(
-      poison_output.get(), nullptr, &validation_uav, validation_cpu);
+  context.device()->CreateUnorderedAccessView(poison_output.get(), nullptr,
+                                              &validation_uav, validation_cpu);
   context.device()->CreateUnorderedAccessView(
       poison_output.get(), nullptr, &validation_uav,
       context.CpuDescriptorHandle(validation_destination.get(), 0));
   context.list()->SetDescriptorHeaps(1, validation_heaps);
   const UINT clear_values[4] = {kValidationSentinel, kValidationSentinel,
                                 kValidationSentinel, kValidationSentinel};
-  context.list()->ClearUnorderedAccessViewUint(
-      validation_gpu, validation_cpu, poison_output.get(), clear_values, 0,
-      nullptr);
+  context.list()->ClearUnorderedAccessViewUint(validation_gpu, validation_cpu,
+                                               poison_output.get(),
+                                               clear_values, 0, nullptr);
   if (FAILED(context.ExecuteAndWait()) || FAILED(context.ResetCommandList())) {
     state.SkipWithError("descriptor range poison clear failed");
     return;
@@ -958,9 +1725,9 @@ void BI_D3D12CopyDescriptorRange(benchmark::State &state) {
       validation_output.get(), nullptr, &validation_uav,
       context.CpuDescriptorHandle(validation_destination.get(), 0));
   context.list()->SetDescriptorHeaps(1, validation_heaps);
-  context.list()->ClearUnorderedAccessViewUint(
-      validation_gpu, validation_cpu, validation_output.get(), clear_values, 0,
-      nullptr);
+  context.list()->ClearUnorderedAccessViewUint(validation_gpu, validation_cpu,
+                                               validation_output.get(),
+                                               clear_values, 0, nullptr);
   if (FAILED(context.ExecuteAndWait()) || FAILED(context.ResetCommandList())) {
     state.SkipWithError("descriptor range validation clear failed");
     return;
@@ -985,14 +1752,12 @@ void BI_D3D12CopyDescriptorRange(benchmark::State &state) {
         1, context.GpuDescriptorHandle(validation_destination.get(), index));
     context.list()->Dispatch(1, 1, 1);
   }
-  D3D12TestContext::Transition(
-      context.list(), validation_output.get(),
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
-  D3D12TestContext::Transition(
-      context.list(), poison_output.get(),
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context.list(), validation_output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(context.list(), poison_output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   std::vector<std::uint8_t> validation_bytes;
   if (FAILED(context.ReadbackBuffer(validation_output.get(), kValidationSize,
                                     &validation_bytes)) ||
@@ -1023,8 +1788,7 @@ void BI_D3D12CopyDescriptorRange(benchmark::State &state) {
   }
   for (UINT index = 0; index < kValidationElementCount; ++index) {
     std::uint32_t actual = 0;
-    std::memcpy(&actual,
-                poison_bytes.data() + index * sizeof(std::uint32_t),
+    std::memcpy(&actual, poison_bytes.data() + index * sizeof(std::uint32_t),
                 sizeof(actual));
     if (actual != kValidationSentinel) {
       state.SkipWithError("descriptor range copied a poison descriptor");
@@ -1058,6 +1822,36 @@ void BI_D3D12CopyDescriptorRange(benchmark::State &state) {
 
 BENCHMARK(BI_D3D12RecordEmptyList)->Iterations(1)->UseManualTime();
 
+BENCHMARK(BI_D3D12RecordDrawWithoutStateChanges)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("commands")
+    ->Iterations(1)
+    ->UseManualTime();
+
+BENCHMARK(BI_D3D12RecordDrawWithRootConstants)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("commands")
+    ->Iterations(1)
+    ->UseManualTime();
+
+BENCHMARK(BI_D3D12RecordDrawWithDescriptorChange)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("commands")
+    ->Iterations(1)
+    ->UseManualTime();
+
 BENCHMARK(BI_D3D12RecordDispatch)
     ->Arg(1)
     ->Arg(16)
@@ -1078,6 +1872,16 @@ BENCHMARK(BI_D3D12RecordCopyBuffer)
     ->Iterations(1)
     ->UseManualTime();
 
+BENCHMARK(BI_D3D12RecordCopyTexture)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("commands")
+    ->Iterations(1)
+    ->UseManualTime();
+
 BENCHMARK(BI_D3D12CloseSmallList)->Iterations(1)->UseManualTime();
 
 BENCHMARK(BI_D3D12CloseLargeList)->Iterations(1)->UseManualTime();
@@ -1085,6 +1889,10 @@ BENCHMARK(BI_D3D12CloseLargeList)->Iterations(1)->UseManualTime();
 BENCHMARK(BI_D3D12SignalOnly)->Iterations(1)->UseManualTime();
 
 BENCHMARK(BI_D3D12WaitAlreadyComplete)->Iterations(1)->UseManualTime();
+
+BENCHMARK(BI_D3D12CpuWait)->Iterations(1)->UseManualTime();
+
+BENCHMARK(BI_D3D12CrossQueueHandoff)->Iterations(1)->UseManualTime();
 
 BENCHMARK(BI_D3D12AllocatorReuse)->Iterations(1)->UseManualTime();
 
@@ -1119,6 +1927,36 @@ BENCHMARK(BI_D3D12CopySingleDescriptor)
     ->UseManualTime();
 
 BENCHMARK(BI_D3D12OverwriteSameSlot)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("descriptors")
+    ->Iterations(1)
+    ->UseManualTime();
+
+BENCHMARK(BI_D3D12PublishNativeTable)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("descriptors")
+    ->Iterations(1)
+    ->UseManualTime();
+
+BENCHMARK(BI_D3D12SwitchHeap)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(32)
+    ->Arg(256)
+    ->Arg(4096)
+    ->ArgName("descriptors")
+    ->Iterations(1)
+    ->UseManualTime();
+
+BENCHMARK(BI_D3D12ConcurrentDisjointPublication)
     ->Arg(1)
     ->Arg(16)
     ->Arg(32)

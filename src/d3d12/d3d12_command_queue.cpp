@@ -72,6 +72,37 @@ std::unordered_map<IMTLD3D12Device *,
     g_resource_states_by_device;
 std::mutex g_resource_states_mutex;
 
+std::atomic<uint64_t> g_test_native_pipeline_compilation_occurrence = 0;
+std::atomic<uint64_t> g_test_native_descriptor_lookup_occurrence = 0;
+
+static bool
+ShouldInjectQueueReplayFault(const char *name,
+                             std::atomic<uint64_t> &occurrence) {
+  const auto setting = env::getEnvVar(name);
+  if (setting.empty())
+    return false;
+  if (setting == "always" || setting == "all") {
+    occurrence.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  char *end = nullptr;
+  const auto target = std::strtoull(setting.c_str(), &end, 0);
+  if (end == setting.c_str() || *end || !target)
+    return false;
+  return occurrence.fetch_add(1, std::memory_order_relaxed) + 1 == target;
+}
+
+static void
+RecordQueueReplayFault(const char *name) {
+  const auto path = env::getEnvVar("DXMT_TEST_FAULT_MARKER");
+  if (!path.empty()) {
+    if (FILE *marker = std::fopen(path.c_str(), "a")) {
+      std::fprintf(marker, "%s\n", name);
+      std::fclose(marker);
+    }
+  }
+}
+
 static UINT GetPlaneCount(const Resource &resource);
 static UINT GetResourceMipLevelCount(const Resource &resource);
 static UINT GetResourceArraySliceCount(const Resource &resource);
@@ -8987,6 +9018,28 @@ private:
             dxmt::apitrace::set_current_d3d_sequence(packet.d3d_sequence);
           const bool native_packet =
               packet.pipeline.metadata.uses_native_descriptor_table_abi;
+          constexpr const char *pipeline_fault =
+              "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT";
+          if (native_packet && ShouldInjectQueueReplayFault(
+                                   pipeline_fault,
+                                   g_test_native_pipeline_compilation_occurrence)) {
+            RecordQueueReplayFault(pipeline_fault);
+            WARN("D3D12CommandQueue: injected queue-time native graphics "
+                 "pipeline compilation failure");
+            return CompiledCommandFallbackReason::
+                InjectedNativePipelineCompilationFailure;
+          }
+          constexpr const char *descriptor_fault =
+              "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT";
+          if (native_packet && !packet.root_tables.empty() &&
+              ShouldInjectQueueReplayFault(
+                  descriptor_fault,
+                  g_test_native_descriptor_lookup_occurrence)) {
+            RecordQueueReplayFault(descriptor_fault);
+            WARN("D3D12CommandQueue: injected queue-time native graphics "
+                 "descriptor lookup failure");
+            return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+          }
           auto *pipeline = packet.pipeline.metadata.pipeline;
           if (!pipeline)
             pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
@@ -9283,6 +9336,28 @@ private:
             dxmt::apitrace::set_current_d3d_sequence(packet.d3d_sequence);
           const bool native_packet =
               packet.pipeline.metadata.uses_native_descriptor_table_abi;
+          constexpr const char *pipeline_fault =
+              "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT";
+          if (native_packet && ShouldInjectQueueReplayFault(
+                                   pipeline_fault,
+                                   g_test_native_pipeline_compilation_occurrence)) {
+            RecordQueueReplayFault(pipeline_fault);
+            WARN("D3D12CommandQueue: injected queue-time native compute "
+                 "pipeline compilation failure");
+            return CompiledCommandFallbackReason::
+                InjectedNativePipelineCompilationFailure;
+          }
+          constexpr const char *descriptor_fault =
+              "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT";
+          if (native_packet && !packet.root_tables.empty() &&
+              ShouldInjectQueueReplayFault(
+                  descriptor_fault,
+                  g_test_native_descriptor_lookup_occurrence)) {
+            RecordQueueReplayFault(descriptor_fault);
+            WARN("D3D12CommandQueue: injected queue-time native compute "
+                 "descriptor lookup failure");
+            return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+          }
           auto *pipeline = packet.pipeline.metadata.pipeline;
           if (!pipeline)
             pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());

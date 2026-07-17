@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "profile": "gcc-x64-release-full",
+    "host_class": "self-macos-runner Apple Silicon",
+    "collected_on": "2026-07-17",
+    "repetitions": 3,
+    "metric": "real_time",
+    "unit": "ns"
+  },
+  "benchmarks": {
+    "BI_D3D12DxbcParse/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 75000,
+      "max_regression_percent": 150
+    },
+    "BI_D3D12DxilParse/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 3850000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12DxbcIrAirGeneration/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 905000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12DxilIrAirGeneration/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 430000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12MetalLibraryCompile/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 64000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12PersistentAirCacheHit/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 158000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12PersistentAirCacheMiss/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 146000,
+      "max_regression_percent": 50
+    }
+  }
+}

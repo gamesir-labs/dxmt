@@ -15,6 +15,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 enum class CommandAction : std::uint8_t {
@@ -66,6 +67,39 @@ std::string FormatActions(const std::vector<CommandAction> &actions) {
       output << ',';
     output << CommandActionName(actions[index]);
   }
+  return output.str();
+}
+
+std::optional<std::vector<CommandAction>>
+ParseActions(const std::string &text) {
+  if (text.empty())
+    return std::nullopt;
+  std::vector<CommandAction> actions;
+  std::istringstream input(text);
+  std::string token;
+  while (std::getline(input, token, ',')) {
+    if (token == "close")
+      actions.push_back(CommandAction::Close);
+    else if (token == "reset-list")
+      actions.push_back(CommandAction::ResetList);
+    else if (token == "reset-allocator")
+      actions.push_back(CommandAction::ResetAllocator);
+    else
+      return std::nullopt;
+  }
+  return actions.empty()
+             ? std::nullopt
+             : std::optional<std::vector<CommandAction>>(std::move(actions));
+}
+
+std::string FormatReplayArtifact(
+    std::uint32_t seed, const std::vector<CommandAction> &actions) {
+  std::ostringstream output;
+  output << "{\"seed\":\"0x" << std::hex << seed << std::dec
+         << "\",\"actions\":\"" << FormatActions(actions)
+         << "\",\"replay\":\"DXMT_D3D12_FUZZ_SEED=0x" << std::hex
+         << seed << std::dec << " DXMT_D3D12_FUZZ_ACTIONS="
+         << FormatActions(actions) << "\"}";
   return output.str();
 }
 
@@ -149,6 +183,41 @@ ReplayCommandGrammar(ID3D12Device *device,
   return std::nullopt;
 }
 
+std::optional<ReplayFailure>
+ReplayUntilActualApiRejection(ID3D12Device *device,
+                              const std::vector<CommandAction> &actions) {
+  ComPtr<ID3D12CommandAllocator> allocator;
+  HRESULT result = device->CreateCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put()));
+  if (FAILED(result))
+    return ReplayFailure{0, CommandAction::ResetAllocator, S_OK, result};
+
+  ComPtr<ID3D12GraphicsCommandList> list;
+  result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                     allocator.get(), nullptr,
+                                     IID_PPV_ARGS(list.put()));
+  if (FAILED(result))
+    return ReplayFailure{0, CommandAction::ResetList, S_OK, result};
+
+  for (std::size_t index = 0; index < actions.size(); ++index) {
+    const auto action = actions[index];
+    switch (action) {
+    case CommandAction::Close:
+      result = list->Close();
+      break;
+    case CommandAction::ResetList:
+      result = list->Reset(allocator.get(), nullptr);
+      break;
+    case CommandAction::ResetAllocator:
+      result = allocator->Reset();
+      break;
+    }
+    if (FAILED(result))
+      return ReplayFailure{index, action, S_OK, result};
+  }
+  return std::nullopt;
+}
+
 class D3D12CommandGrammarFuzzSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
@@ -168,11 +237,21 @@ TEST_F(D3D12CommandGrammarFuzzSpec,
     first_seed = static_cast<std::uint32_t>(parsed);
     seed_count = 1;
   }
+  std::optional<std::vector<CommandAction>> replay_actions;
+  if (const char *actions_text =
+          std::getenv("DXMT_D3D12_FUZZ_ACTIONS")) {
+    replay_actions = ParseActions(actions_text);
+    ASSERT_TRUE(replay_actions.has_value())
+        << "invalid DXMT_D3D12_FUZZ_ACTIONS; expected a comma-separated "
+           "list of close,reset-list,reset-allocator";
+    seed_count = 1;
+  }
 
   for (std::size_t seed_index = 0; seed_index < seed_count; ++seed_index) {
     const std::uint32_t seed =
         first_seed + static_cast<std::uint32_t>(seed_index * 0x9e3779b9u);
-    const auto actions = GenerateCommandGrammar(seed, 32);
+    const auto actions = replay_actions ? *replay_actions
+                                        : GenerateCommandGrammar(seed, 32);
     const auto failure = ReplayCommandGrammar(context_.device(), actions);
     if (!failure)
       continue;
@@ -186,7 +265,8 @@ TEST_F(D3D12CommandGrammarFuzzSpec,
                   << CommandActionName(failure->action) << ") expected=0x"
                   << std::hex << static_cast<unsigned long>(failure->expected)
                   << " actual=0x" << static_cast<unsigned long>(failure->actual)
-                  << std::dec << " minimized=" << FormatActions(minimized);
+                  << std::dec << " minimized=" << FormatActions(minimized)
+                  << " artifact=" << FormatReplayArtifact(seed, minimized);
     return;
   }
 }
@@ -244,6 +324,142 @@ TEST(D3D12FailureShrinkerSpec, DeltaDebuggingKeepsMinimalTrigger) {
                                                    CommandAction::Close}));
 }
 
+TEST_F(D3D12CommandGrammarFuzzSpec,
+       DeltaDebuggingUsesActualD3D12ReplayPredicate) {
+  const std::vector<CommandAction> input = {
+      CommandAction::Close,          CommandAction::ResetList,
+      CommandAction::Close,          CommandAction::ResetList,
+      CommandAction::ResetAllocator, CommandAction::Close,
+      CommandAction::ResetList,
+  };
+  const auto has_allocator_rejection = [&](const auto &actions) {
+    const auto rejection =
+        ReplayUntilActualApiRejection(context_.device(), actions);
+    return rejection.has_value() &&
+           rejection->action == CommandAction::ResetAllocator;
+  };
+  ASSERT_TRUE(has_allocator_rejection(input));
+
+  const auto minimized =
+      ShrinkFailingSequence(input, has_allocator_rejection);
+  const auto rejection =
+      ReplayUntilActualApiRejection(context_.device(), minimized);
+  ASSERT_TRUE(rejection.has_value());
+  ASSERT_EQ(minimized.size(), 1u)
+      << "artifact=" << FormatReplayArtifact(0, minimized);
+  EXPECT_EQ(minimized[0], CommandAction::ResetAllocator)
+      << "artifact=" << FormatReplayArtifact(0, minimized);
+  EXPECT_EQ(rejection->actual, E_FAIL)
+      << "artifact=" << FormatReplayArtifact(0, minimized);
+}
+
+class D3D12InvalidCommandGrammarSpec : public ::testing::Test {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+
+  D3D12TestContext context_;
+};
+
+TEST_F(D3D12InvalidCommandGrammarSpec,
+       StaleRootTableWithoutBoundHeapReplaysSafely) {
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = 1;
+  range.OffsetInDescriptorsFromTableStart = 0;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 1;
+  parameter.DescriptorTable.pDescriptorRanges = &range;
+  D3D12_ROOT_SIGNATURE_DESC desc = {};
+  desc.NumParameters = 1;
+  desc.pParameters = &parameter;
+  auto first_root = context_.CreateRootSignature(desc);
+  auto second_root = context_.CreateRootSignature(desc);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  ASSERT_TRUE(first_root);
+  ASSERT_TRUE(second_root);
+  ASSERT_TRUE(heap);
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(first_root.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetDescriptorHeaps(0, nullptr);
+  context_.list()->SetComputeRootSignature(second_root.get());
+
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12InvalidCommandGrammarSpec,
+       UnmatchedSplitBeginAndEndReplaySafely) {
+  auto end_only_resource = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto begin_only_resource = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(end_only_resource);
+  ASSERT_TRUE(begin_only_resource);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  barrier.Transition.pResource = end_only_resource.get();
+  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
+  context_.list()->ResourceBarrier(1, &barrier);
+  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  context_.list()->ResourceBarrier(1, &barrier);
+
+  barrier.Transition.pResource = begin_only_resource.get();
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+  context_.list()->ResourceBarrier(1, &barrier);
+  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+  context_.list()->ResourceBarrier(1, &barrier);
+
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12InvalidCommandGrammarSpec,
+       EndOcclusionQueryWithoutBeginReplaysSafely) {
+  const D3D12_QUERY_HEAP_DESC desc = {
+      D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+  ComPtr<ID3D12QueryHeap> heap;
+  ASSERT_EQ(context_.device()->CreateQueryHeap(&desc,
+                                               IID_PPV_ARGS(heap.put())),
+            S_OK);
+  context_.list()->EndQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12InvalidCommandGrammarSpec,
+       CrossDeviceAllocatorIsRejectedWithoutCreatingList) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  ComPtr<ID3D12CommandAllocator> foreign_allocator;
+  ASSERT_EQ(foreign_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(foreign_allocator.put())),
+            S_OK);
+  ComPtr<ID3D12GraphicsCommandList> list;
+  EXPECT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, foreign_allocator.get(),
+                nullptr, IID_PPV_ARGS(list.put())),
+            E_INVALIDARG);
+  EXPECT_FALSE(list);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 struct ScenarioSize {
   std::size_t buffer_size;
   std::size_t texture_width;
@@ -257,9 +473,18 @@ struct ScenarioSize {
 template <typename Predicate>
 ScenarioSize ShrinkScenarioSizes(ScenarioSize sizes, Predicate still_fails) {
   auto shrink_dimension = [&](std::size_t ScenarioSize::*field) {
-    while (sizes.*field > 1) {
+    for (std::size_t step = 0; sizes.*field > 1; ++step) {
+      if (step == 64) {
+        ADD_FAILURE() << "scenario shrinker failed to converge";
+        return;
+      }
+      const auto previous = sizes.*field;
       ScenarioSize candidate = sizes;
       candidate.*field = std::max<std::size_t>(1, candidate.*field / 2);
+      if (candidate.*field >= previous) {
+        ADD_FAILURE() << "scenario shrinker made no progress";
+        return;
+      }
       if (!still_fails(candidate))
         break;
       sizes = candidate;

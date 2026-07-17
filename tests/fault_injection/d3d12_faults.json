@@ -482,6 +482,13 @@
       }
     },
     {
+      "id": "native-packet-allocation-fail-after-one",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT": "2"
+      }
+    },
+    {
       "id": "native-packet-allocation-fail-last",
       "filter": "D3D12CompiledPathFaultInjectionSpec.NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers",
       "environment": {
@@ -521,6 +528,62 @@
       "filter": "D3D12CompiledPathFaultInjectionSpec.NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery",
       "environment": {
         "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT": "always"
+      }
+    },
+    {
+      "id": "native-pipeline-compilation-fail-first",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT": "1"
+      }
+    },
+    {
+      "id": "native-pipeline-compilation-fail-after-one",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT": "2"
+      }
+    },
+    {
+      "id": "native-pipeline-compilation-fail-last",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT": "3"
+      }
+    },
+    {
+      "id": "native-pipeline-compilation-fail-repeatedly",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT": "always"
+      }
+    },
+    {
+      "id": "native-descriptor-lookup-fail-first",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT": "1"
+      }
+    },
+    {
+      "id": "native-descriptor-lookup-fail-after-one",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT": "2"
+      }
+    },
+    {
+      "id": "native-descriptor-lookup-fail-last",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT": "3"
+      }
+    },
+    {
+      "id": "native-descriptor-lookup-fail-repeatedly",
+      "filter": "D3D12CompiledPathFaultInjectionSpec.QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers",
+      "environment": {
+        "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT": "always"
       }
     }
   ]

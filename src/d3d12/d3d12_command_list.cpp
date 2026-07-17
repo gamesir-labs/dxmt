@@ -107,6 +107,8 @@ const char *CompiledCommandFallbackReasonName(
     return "injected_native_packet_allocation_failure";
   case CompiledCommandFallbackReason::InjectedNativeSegmentFinalizationFailure:
     return "injected_native_segment_finalization_failure";
+  case CompiledCommandFallbackReason::InjectedNativePipelineCompilationFailure:
+    return "injected_native_pipeline_compilation_failure";
   case CompiledCommandFallbackReason::UnsupportedRootSignature:
     return "unsupported_root_signature";
   case CompiledCommandFallbackReason::UnsupportedDescriptorTable:
@@ -162,6 +164,7 @@ CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason) {
     return dxmt::CompiledFallbackReason::NativeResidencyUnsupported;
   case CompiledCommandFallbackReason::InjectedNativePacketAllocationFailure:
   case CompiledCommandFallbackReason::InjectedNativeSegmentFinalizationFailure:
+  case CompiledCommandFallbackReason::InjectedNativePipelineCompilationFailure:
     return dxmt::CompiledFallbackReason::MissingCompiledEncoder;
   case CompiledCommandFallbackReason::LegacyPipelineState:
     return dxmt::CompiledFallbackReason::LegacyPath;
@@ -1846,6 +1849,8 @@ ApplyExecutionPathTestConfig(
 
 static dxmt::d3d12::test::ExecutionPathStats
 BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
+  using dxmt::d3d12::test::ExecutionPathSegmentKind;
+  using dxmt::d3d12::test::kExecutionPathMaxTracedSegments;
   dxmt::d3d12::test::ExecutionPathStats stats = {};
   stats.mode = compiled.test_path_mode;
   stats.record_count = compiled.record_count;
@@ -1859,7 +1864,30 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
   stats.retained_compute_packets =
       static_cast<UINT>(compiled.compute_packets.size());
   stats.has_native_root_base_buffer = compiled.native_root_base_buffer ? 1u : 0u;
-  for (const auto &segment : compiled.segments) {
+  stats.segment_count = static_cast<UINT>(compiled.segments.size());
+  stats.traced_segment_count =
+      std::min<UINT>(stats.segment_count, kExecutionPathMaxTracedSegments);
+  for (UINT segment_index = 0; segment_index < compiled.segments.size();
+       ++segment_index) {
+    const auto &segment = compiled.segments[segment_index];
+    if (segment_index < stats.traced_segment_count) {
+      auto &kind = stats.segment_kinds[segment_index];
+      switch (segment.kind) {
+      case CompiledCommandSegmentKind::Graphics:
+        kind = ExecutionPathSegmentKind::Graphics;
+        break;
+      case CompiledCommandSegmentKind::Compute:
+        kind = ExecutionPathSegmentKind::Compute;
+        break;
+      case CompiledCommandSegmentKind::Fallback:
+      default:
+        kind = ExecutionPathSegmentKind::Fallback;
+        break;
+      }
+      stats.segment_first_record_indices[segment_index] =
+          segment.first_record_index;
+      stats.segment_record_counts[segment_index] = segment.record_count;
+    }
     if (!segment.record_count) {
       if (segment.kind == CompiledCommandSegmentKind::Fallback)
         stats.empty_fallback_segments++;

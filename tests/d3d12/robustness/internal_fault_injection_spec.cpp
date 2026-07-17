@@ -896,6 +896,84 @@ protected:
     ASSERT_EQ(context_.ResetCommandList(), S_OK);
   }
 
+  void SubmitAfterDescriptorOverwrite(UINT expected,
+                                      ExecutionPathStats *stats) {
+    constexpr UINT zero = 0;
+    auto zero_upload =
+        context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
+    auto replacement = context_.CreateBuffer(
+        sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto replacement_readback = context_.CreateBuffer(
+        sizeof(UINT), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(zero_upload);
+    ASSERT_TRUE(replacement);
+    ASSERT_TRUE(replacement_readback);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = 1;
+    context_.device()->CreateUnorderedAccessView(
+        replacement.get(), nullptr, &uav,
+        descriptor_heap_->GetCPUDescriptorHandleForHeapStart());
+
+    ExecutionPathConfig config = {};
+    ASSERT_EQ(context_.list()->SetPrivateData(
+                  dxmt::d3d12::test::kExecutionPathConfigGuid,
+                  sizeof(config), &config),
+              S_OK);
+    context_.list()->CopyBufferRegion(replacement.get(), 0, zero_upload.get(),
+                                      0, sizeof(UINT));
+    D3D12TestContext::Transition(
+        context_.list(), replacement.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap *heaps[] = {descriptor_heap_.get()};
+    context_.list()->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
+    context_.list()->SetComputeRootSignature(root_.get());
+    context_.list()->SetPipelineState(recovery_pipeline_.get());
+    context_.list()->SetComputeRootDescriptorTable(
+        0, descriptor_heap_->GetGPUDescriptorHandleForHeapStart());
+    context_.list()->Dispatch(1, 1, 1);
+    D3D12TestContext::Transition(
+        context_.list(), replacement.get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    context_.list()->CopyBufferRegion(replacement_readback.get(), 0,
+                                      replacement.get(), 0, sizeof(UINT));
+
+    ASSERT_EQ(context_.list()->Close(), S_OK);
+    ID3D12CommandList *lists[] = {context_.list()};
+    context_.queue()->ExecuteCommandLists(ARRAYSIZE(lists), lists);
+    const UINT64 completion_value = ++completion_value_;
+    ASSERT_EQ(context_.queue()->Signal(completion_.get(), completion_value),
+              S_OK);
+    ASSERT_EQ(context_.WaitForFence(completion_.get(), completion_value), S_OK);
+    EXPECT_GE(completion_->GetCompletedValue(), completion_value);
+
+    UINT stats_size = sizeof(*stats);
+    ASSERT_EQ(context_.list()->GetPrivateData(
+                  dxmt::d3d12::test::kExecutionPathStatsGuid, &stats_size,
+                  stats),
+              S_OK);
+    ASSERT_EQ(stats_size, sizeof(*stats));
+
+    UINT *mapped = nullptr;
+    const D3D12_RANGE read_range = {0, sizeof(UINT)};
+    ASSERT_EQ(replacement_readback->Map(
+                  0, &read_range, reinterpret_cast<void **>(&mapped)),
+              S_OK);
+    ASSERT_NE(mapped, nullptr);
+    EXPECT_EQ(*mapped, expected)
+        << "recovery must observe the overwritten descriptor generation";
+    const D3D12_RANGE no_write = {0, 0};
+    replacement_readback->Unmap(0, &no_write);
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+
   D3D12TestContext context_;
   ComPtr<ID3D12RootSignature> root_;
   ComPtr<ID3D12PipelineState> pipeline_;
@@ -941,7 +1019,8 @@ TEST_F(D3D12CompiledPathFaultInjectionSpec,
 
   ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
   ExecutionPathStats recovery_stats = {};
-  ASSERT_NO_FATAL_FAILURE(SubmitIncrements(1, 8, 11, &recovery_stats));
+  ASSERT_NO_FATAL_FAILURE(
+      SubmitAfterDescriptorOverwrite(8, &recovery_stats));
   EXPECT_EQ(marker.Count(fault), injected_count);
   EXPECT_EQ(recovery_stats.work_record_count, 1u);
   EXPECT_EQ(recovery_stats.compiled_work_record_count, 1u);
@@ -1000,6 +1079,85 @@ TEST_F(D3D12CompiledPathFaultInjectionSpec,
   ExecutionPathStats recovery_stats = {};
   ASSERT_NO_FATAL_FAILURE(
       SubmitIncrements(1, 8, submissions + 8, &recovery_stats));
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(recovery_stats.compiled_work_record_count, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compute_packets, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compiled_packet_fallbacks, 0u);
+  EXPECT_EQ(recovery_stats.has_native_root_base_buffer, 1u);
+  ExpectEveryRecordReplayedExactlyOnce(recovery_stats);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CompiledPathFaultInjectionSpec,
+       QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT";
+  const UINT target = ConfiguredInternalOccurrence(fault);
+  const bool repeated = ConfiguredInternalAlways(fault);
+  ASSERT_FALSE(target && repeated);
+  if (!target && !repeated)
+    GTEST_SKIP() << "queue-time native pipeline fault injection is disabled";
+  ASSERT_TRUE(repeated || target <= 3u)
+      << "the test submits three native pipeline occurrences";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  ExecutionPathStats fault_stats = {};
+  ASSERT_NO_FATAL_FAILURE(SubmitIncrements(3, 1, 3, &fault_stats));
+  const UINT injected_count = repeated ? 3u : 1u;
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(fault_stats.work_record_count, 3u);
+  EXPECT_EQ(fault_stats.compiled_work_record_count, 3u);
+  EXPECT_EQ(fault_stats.retained_compute_packets, 3u);
+  EXPECT_EQ(fault_stats.replayed_compute_packets, 3u - injected_count);
+  EXPECT_EQ(fault_stats.replayed_compiled_packet_fallbacks, injected_count);
+  EXPECT_GT(fault_stats.replayed_fallback_ranges, 0u);
+  EXPECT_EQ(fault_stats.has_native_root_base_buffer, 1u);
+  ExpectEveryRecordReplayedExactlyOnce(fault_stats);
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ExecutionPathStats recovery_stats = {};
+  ASSERT_NO_FATAL_FAILURE(SubmitIncrements(1, 8, 11, &recovery_stats));
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(recovery_stats.compiled_work_record_count, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compute_packets, 1u);
+  EXPECT_EQ(recovery_stats.replayed_compiled_packet_fallbacks, 0u);
+  EXPECT_EQ(recovery_stats.has_native_root_base_buffer, 1u);
+  ExpectEveryRecordReplayedExactlyOnce(recovery_stats);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CompiledPathFaultInjectionSpec,
+       QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT";
+  const UINT target = ConfiguredInternalOccurrence(fault);
+  const bool repeated = ConfiguredInternalAlways(fault);
+  ASSERT_FALSE(target && repeated);
+  if (!target && !repeated)
+    GTEST_SKIP() << "queue-time native descriptor fault injection is disabled";
+  ASSERT_TRUE(repeated || target <= 3u)
+      << "the test submits three native descriptor lookups";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  ExecutionPathStats fault_stats = {};
+  ASSERT_NO_FATAL_FAILURE(SubmitIncrements(3, 1, 3, &fault_stats));
+  const UINT injected_count = repeated ? 3u : 1u;
+  EXPECT_EQ(marker.Count(fault), injected_count);
+  EXPECT_EQ(fault_stats.work_record_count, 3u);
+  EXPECT_EQ(fault_stats.compiled_work_record_count, 3u);
+  EXPECT_EQ(fault_stats.retained_compute_packets, 3u);
+  EXPECT_EQ(fault_stats.replayed_compute_packets, 3u - injected_count);
+  EXPECT_EQ(fault_stats.replayed_compiled_packet_fallbacks, injected_count);
+  EXPECT_GT(fault_stats.replayed_fallback_ranges, 0u);
+  EXPECT_EQ(fault_stats.has_native_root_base_buffer, 1u);
+  ExpectEveryRecordReplayedExactlyOnce(fault_stats);
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ExecutionPathStats recovery_stats = {};
+  ASSERT_NO_FATAL_FAILURE(
+      SubmitAfterDescriptorOverwrite(8, &recovery_stats));
   EXPECT_EQ(marker.Count(fault), injected_count);
   EXPECT_EQ(recovery_stats.compiled_work_record_count, 1u);
   EXPECT_EQ(recovery_stats.replayed_compute_packets, 1u);

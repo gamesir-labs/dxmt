@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "profile": "gcc-x64-release-full",
+    "host_class": "self-macos-runner Apple Silicon",
+    "collected_on": "2026-07-17",
+    "repetitions": 3,
+    "metric": "real_time",
+    "unit": "ns"
+  },
+  "benchmarks": {
+    "BI_D3D12ColdComputePipeline/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 1430000,
+      "max_regression_percent": 100
+    },
+    "BI_D3D12WarmComputePipeline/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 3050000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12WarmGraphicsPipeline/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 54600000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12AttachmentFormatSpecialization/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 13710000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12BlendStateSpecialization/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 20400000,
+      "max_regression_percent": 50
+    },
+    "BI_D3D12PipelineArchiveMiss/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 11700000,
+      "max_regression_percent": 150
+    },
+    "BI_D3D12PipelineArchiveHit/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 5150000,
+      "max_regression_percent": 75
+    },
+    "BI_D3D12CorruptArchiveFallback/iterations:1/real_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 4950000,
+      "max_regression_percent": 75
+    }
+  }
+}

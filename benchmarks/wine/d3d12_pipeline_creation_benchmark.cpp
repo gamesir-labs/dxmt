@@ -12,10 +12,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -27,6 +30,8 @@ using dxmt::test::ComPtr;
 
 constexpr unsigned int kPipelineRequestCount = 96;
 constexpr unsigned int kUnsupportedRequestStride = 8;
+constexpr unsigned int kWarmPipelineBatch = 16;
+constexpr unsigned int kColdComputeBatch = 8;
 
 constexpr const char kPipelineStressHlsl[] = R"hlsl(
 struct PatchPoint {
@@ -125,6 +130,20 @@ float4 PixelMain(RasterPoint input) : SV_Target {
 }
 )hlsl";
 
+constexpr const char kComputePipelineHlsl[] = R"hlsl(
+#ifndef BENCHMARK_SEED
+#define BENCHMARK_SEED 0
+#endif
+
+RWByteAddressBuffer output_buffer : register(u0);
+
+[numthreads(8, 1, 1)]
+void ComputeMain(uint3 dispatch_id : SV_DispatchThreadID) {
+  uint value = dispatch_id.x * 0x9e3779b9u + BENCHMARK_SEED;
+  output_buffer.Store(dispatch_id.x * 4u, value);
+}
+)hlsl";
+
 struct ShaderSet {
   ComPtr<ID3DBlob> standard_vertex;
   ComPtr<ID3DBlob> patch_vertex;
@@ -191,6 +210,30 @@ std::optional<std::string> CompileShaders(ShaderSet *shaders) {
   return std::nullopt;
 }
 
+std::optional<std::string> CompileComputeShader(unsigned int seed,
+                                                ComPtr<ID3DBlob> *shader) {
+  const std::string seed_string = std::to_string(seed);
+  const D3D_SHADER_MACRO macros[] = {{"BENCHMARK_SEED", seed_string.c_str()},
+                                     {nullptr, nullptr}};
+  ComPtr<ID3DBlob> errors;
+  const HRESULT hr = D3DCompile(
+      kComputePipelineHlsl, sizeof(kComputePipelineHlsl) - 1,
+      "d3d12_pipeline_compute_benchmark.hlsl", macros, nullptr, "ComputeMain",
+      "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader->put(), errors.put());
+  if (SUCCEEDED(hr))
+    return std::nullopt;
+
+  std::ostringstream message;
+  message << HResultMessage("ComputeMain", hr);
+  if (errors && errors->GetBufferPointer() && errors->GetBufferSize()) {
+    message << ": "
+            << std::string(
+                   static_cast<const char *>(errors->GetBufferPointer()),
+                   errors->GetBufferSize());
+  }
+  return message.str();
+}
+
 D3D12_SHADER_BYTECODE ShaderBytecode(ID3DBlob *shader) {
   return {shader->GetBufferPointer(), shader->GetBufferSize()};
 }
@@ -220,6 +263,75 @@ CreateDeviceAndRootSignature(ComPtr<ID3D12Device> *device,
   return FAILED(hr) ? std::optional<std::string>(HResultMessage(
                           "ID3D12Device::CreateRootSignature", hr))
                     : std::nullopt;
+}
+
+std::optional<std::string>
+CreateComputeRootSignature(ID3D12Device *device,
+                           ComPtr<ID3D12RootSignature> *root_signature) {
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameter.Descriptor.ShaderRegister = 0;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+  D3D12_ROOT_SIGNATURE_DESC desc = {};
+  desc.NumParameters = 1;
+  desc.pParameters = &parameter;
+  ComPtr<ID3DBlob> blob;
+  ComPtr<ID3DBlob> errors;
+  HRESULT hr = D3D12SerializeRootSignature(
+      &desc, D3D_ROOT_SIGNATURE_VERSION_1_0, blob.put(), errors.put());
+  if (FAILED(hr))
+    return HResultMessage("D3D12SerializeRootSignature(compute)", hr);
+
+  hr = device->CreateRootSignature(
+      0, blob->GetBufferPointer(), blob->GetBufferSize(),
+      __uuidof(ID3D12RootSignature),
+      reinterpret_cast<void **>(root_signature->put()));
+  return FAILED(hr) ? std::optional<std::string>(HResultMessage(
+                          "ID3D12Device::CreateRootSignature(compute)", hr))
+                    : std::nullopt;
+}
+
+D3D12_GRAPHICS_PIPELINE_STATE_DESC
+BasicGraphicsPipelineDesc(ID3D12RootSignature *root_signature,
+                          const ShaderSet &shaders) {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root_signature;
+  desc.VS = ShaderBytecode(shaders.standard_vertex.get());
+  desc.PS = ShaderBytecode(shaders.pixel.get());
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+  desc.RasterizerState.DepthClipEnable = TRUE;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  return desc;
+}
+
+D3D12_COMPUTE_PIPELINE_STATE_DESC
+BasicComputePipelineDesc(ID3D12RootSignature *root_signature,
+                         ID3DBlob *shader) {
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root_signature;
+  desc.CS = ShaderBytecode(shader);
+  return desc;
+}
+
+std::optional<std::string> ValidatePipeline(ID3D12PipelineState *pipeline) {
+  if (!pipeline)
+    return "pipeline creation returned a null object";
+  ComPtr<ID3DBlob> cached_blob;
+  const HRESULT hr = pipeline->GetCachedBlob(cached_blob.put());
+  if (FAILED(hr))
+    return HResultMessage("ID3D12PipelineState::GetCachedBlob", hr);
+  if (!cached_blob || !cached_blob->GetBufferPointer() ||
+      cached_blob->GetBufferSize() == 0)
+    return "pipeline correctness precheck returned an empty cached blob";
+  return std::nullopt;
 }
 
 bool SupportsSampleCount(ID3D12Device *device, UINT sample_count) {
@@ -447,11 +559,610 @@ void BI_D3D12GraphicsPipelineCreationBurst(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * result.latency_us.size());
 }
 
+void BI_D3D12ColdComputePipeline(benchmark::State &state) {
+  SetEnvironmentVariableA("DXMT_SHADER_CACHE", "0");
+  SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "0");
+
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> unused_graphics_root;
+  if (auto error =
+          CreateDeviceAndRootSignature(&device, &unused_graphics_root)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error = CreateComputeRootSignature(device.get(), &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  std::vector<ComPtr<ID3DBlob>> shaders(kColdComputeBatch);
+  for (unsigned int index = 0; index < kColdComputeBatch; ++index) {
+    if (auto error = CompileComputeShader(0x1000u + index, &shaders[index])) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+  }
+  ComPtr<ID3DBlob> precheck_shader;
+  if (auto error = CompileComputeShader(0x5a17u, &precheck_shader)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  const auto precheck_desc =
+      BasicComputePipelineDesc(root_signature.get(), precheck_shader.get());
+  ComPtr<ID3D12PipelineState> precheck;
+  HRESULT hr = device->CreateComputePipelineState(
+      &precheck_desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(precheck.put()));
+  if (FAILED(hr)) {
+    const auto error = HResultMessage("cold compute precheck", hr);
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  if (auto error = ValidatePipeline(precheck.get())) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  std::vector<ComPtr<ID3D12PipelineState>> pipelines(kColdComputeBatch);
+  for (auto _ : state) {
+    for (unsigned int index = 0; index < kColdComputeBatch; ++index) {
+      const auto desc =
+          BasicComputePipelineDesc(root_signature.get(), shaders[index].get());
+      hr = device->CreateComputePipelineState(
+          &desc, __uuidof(ID3D12PipelineState),
+          reinterpret_cast<void **>(pipelines[index].put()));
+      if (FAILED(hr)) {
+        const auto error =
+            HResultMessage("cold CreateComputePipelineState", hr);
+        state.SkipWithError(error.c_str());
+        return;
+      }
+    }
+  }
+  for (const auto &pipeline : pipelines) {
+    if (auto error = ValidatePipeline(pipeline.get())) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * kColdComputeBatch);
+}
+
+void BI_D3D12WarmComputePipeline(benchmark::State &state) {
+  SetEnvironmentVariableA("DXMT_SHADER_CACHE", "0");
+  SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "0");
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> unused_graphics_root;
+  if (auto error =
+          CreateDeviceAndRootSignature(&device, &unused_graphics_root)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error = CreateComputeRootSignature(device.get(), &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3DBlob> shader;
+  if (auto error = CompileComputeShader(0x6b31u, &shader)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  const auto desc =
+      BasicComputePipelineDesc(root_signature.get(), shader.get());
+  ComPtr<ID3D12PipelineState> precheck;
+  HRESULT hr = device->CreateComputePipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(precheck.put()));
+  if (FAILED(hr)) {
+    const auto error = HResultMessage("warm compute precheck", hr);
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  if (auto error = ValidatePipeline(precheck.get())) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  for (auto _ : state) {
+    for (unsigned int index = 0; index < kWarmPipelineBatch; ++index) {
+      ComPtr<ID3D12PipelineState> pipeline;
+      hr = device->CreateComputePipelineState(
+          &desc, __uuidof(ID3D12PipelineState),
+          reinterpret_cast<void **>(pipeline.put()));
+      if (FAILED(hr) || !pipeline) {
+        const auto error =
+            HResultMessage("warm CreateComputePipelineState", hr);
+        state.SkipWithError(error.c_str());
+        return;
+      }
+      benchmark::DoNotOptimize(pipeline.get());
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * kWarmPipelineBatch);
+}
+
+void BI_D3D12WarmGraphicsPipeline(benchmark::State &state) {
+  SetEnvironmentVariableA("DXMT_SHADER_CACHE", "0");
+  SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "0");
+  ShaderSet shaders;
+  if (auto error = CompileShaders(&shaders)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error = CreateDeviceAndRootSignature(&device, &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  const auto desc = BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+  ComPtr<ID3D12PipelineState> precheck;
+  HRESULT hr = device->CreateGraphicsPipelineState(
+      &desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(precheck.put()));
+  if (FAILED(hr)) {
+    const auto error = HResultMessage("warm graphics precheck", hr);
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  if (auto error = ValidatePipeline(precheck.get())) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  for (auto _ : state) {
+    for (unsigned int index = 0; index < kWarmPipelineBatch; ++index) {
+      ComPtr<ID3D12PipelineState> pipeline;
+      hr = device->CreateGraphicsPipelineState(
+          &desc, __uuidof(ID3D12PipelineState),
+          reinterpret_cast<void **>(pipeline.put()));
+      if (FAILED(hr) || !pipeline) {
+        const auto error =
+            HResultMessage("warm CreateGraphicsPipelineState", hr);
+        state.SkipWithError(error.c_str());
+        return;
+      }
+      benchmark::DoNotOptimize(pipeline.get());
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * kWarmPipelineBatch);
+}
+
+bool SupportsRenderTarget(ID3D12Device *device, DXGI_FORMAT format) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+  support.Format = format;
+  return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                               &support, sizeof(support))) &&
+         (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0;
+}
+
+void BI_D3D12AttachmentFormatSpecialization(benchmark::State &state) {
+  SetEnvironmentVariableA("DXMT_SHADER_CACHE", "0");
+  SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "0");
+  ShaderSet shaders;
+  if (auto error = CompileShaders(&shaders)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error = CreateDeviceAndRootSignature(&device, &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  auto precheck_desc = BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+  ComPtr<ID3D12PipelineState> precheck;
+  HRESULT hr = device->CreateGraphicsPipelineState(
+      &precheck_desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(precheck.put()));
+  if (FAILED(hr)) {
+    const auto error = HResultMessage("attachment specialization precheck", hr);
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  if (auto error = ValidatePipeline(precheck.get())) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  std::vector<D3D12_GRAPHICS_PIPELINE_STATE_DESC> descriptors;
+  for (const auto format :
+       {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB}) {
+    if (!SupportsRenderTarget(device.get(), format))
+      continue;
+    auto desc = BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+    desc.RTVFormats[0] = format;
+    descriptors.push_back(desc);
+  }
+  if (descriptors.size() < 2) {
+    state.SkipWithError("fewer than two attachment formats are supported");
+    return;
+  }
+
+  std::vector<ComPtr<ID3D12PipelineState>> pipelines(descriptors.size());
+  for (auto _ : state) {
+    for (std::size_t index = 0; index < descriptors.size(); ++index) {
+      hr = device->CreateGraphicsPipelineState(
+          &descriptors[index], __uuidof(ID3D12PipelineState),
+          reinterpret_cast<void **>(pipelines[index].put()));
+      if (FAILED(hr)) {
+        const auto error =
+            HResultMessage("attachment format CreateGraphicsPipelineState", hr);
+        state.SkipWithError(error.c_str());
+        return;
+      }
+    }
+  }
+  for (const auto &pipeline : pipelines) {
+    if (auto error = ValidatePipeline(pipeline.get())) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * descriptors.size());
+  state.counters["formats"] = descriptors.size();
+}
+
+void BI_D3D12BlendStateSpecialization(benchmark::State &state) {
+  SetEnvironmentVariableA("DXMT_SHADER_CACHE", "0");
+  SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "0");
+  ShaderSet shaders;
+  if (auto error = CompileShaders(&shaders)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error = CreateDeviceAndRootSignature(&device, &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  auto precheck_desc = BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+  ComPtr<ID3D12PipelineState> precheck;
+  HRESULT hr = device->CreateGraphicsPipelineState(
+      &precheck_desc, __uuidof(ID3D12PipelineState),
+      reinterpret_cast<void **>(precheck.put()));
+  if (FAILED(hr)) {
+    const auto error = HResultMessage("blend specialization precheck", hr);
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  if (auto error = ValidatePipeline(precheck.get())) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+
+  struct BlendVariant {
+    D3D12_BLEND source;
+    D3D12_BLEND destination;
+    D3D12_BLEND_OP operation;
+  };
+  constexpr std::array<BlendVariant, 6> variants = {{
+      {D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD},
+      {D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_OP_ADD},
+      {D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA,
+       D3D12_BLEND_OP_SUBTRACT},
+      {D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+       D3D12_BLEND_OP_REV_SUBTRACT},
+      {D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR,
+       D3D12_BLEND_OP_MIN},
+      {D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ONE, D3D12_BLEND_OP_MAX},
+  }};
+  std::array<D3D12_GRAPHICS_PIPELINE_STATE_DESC, variants.size()> descriptors =
+      {};
+  for (std::size_t index = 0; index < variants.size(); ++index) {
+    descriptors[index] =
+        BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+    auto &blend = descriptors[index].BlendState.RenderTarget[0];
+    blend.BlendEnable = TRUE;
+    blend.SrcBlend = variants[index].source;
+    blend.DestBlend = variants[index].destination;
+    blend.BlendOp = variants[index].operation;
+    blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  }
+
+  std::array<ComPtr<ID3D12PipelineState>, variants.size()> pipelines;
+  for (auto _ : state) {
+    for (std::size_t index = 0; index < descriptors.size(); ++index) {
+      hr = device->CreateGraphicsPipelineState(
+          &descriptors[index], __uuidof(ID3D12PipelineState),
+          reinterpret_cast<void **>(pipelines[index].put()));
+      if (FAILED(hr)) {
+        const auto error =
+            HResultMessage("blend state CreateGraphicsPipelineState", hr);
+        state.SkipWithError(error.c_str());
+        return;
+      }
+    }
+  }
+  for (const auto &pipeline : pipelines) {
+    if (auto error = ValidatePipeline(pipeline.get())) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * variants.size());
+  state.counters["blend_variants"] = variants.size();
+}
+
+struct ScopedArchiveEnvironment {
+  explicit ScopedArchiveEnvironment(const char *suffix) {
+    std::ostringstream name;
+    name << "dxmt-pipeline-benchmark-" << GetCurrentProcessId() << "-"
+         << GetTickCount64() << "-" << suffix;
+    unix_cache_root = "/tmp/" + name.str();
+    windows_cache_root = "Z:\\tmp\\" + name.str();
+    marker = windows_cache_root + "-marker.txt";
+    archive_directory = windows_cache_root + "\\com.apple.metal4";
+    archive = archive_directory + "\\dxmt_pso.binaryarchive";
+    unavailable_marker =
+        archive_directory + "\\dxmt_pso_archive_unavailable.txt";
+    CreateDirectoryA(windows_cache_root.c_str(), nullptr);
+    std::ofstream(marker, std::ios::trunc).close();
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", "1");
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", unix_cache_root.c_str());
+    SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", "1");
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY", "1");
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_MARKER", marker.c_str());
+  }
+
+  ~ScopedArchiveEnvironment() {
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_MARKER", nullptr);
+    SetEnvironmentVariableA("DXMT_PSO_ARCHIVE_SERIALIZE_EVERY", nullptr);
+    SetEnvironmentVariableA("DXMT_PSO_BINARY_ARCHIVE", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", nullptr);
+    SetEnvironmentVariableA("DXMT_SHADER_CACHE", nullptr);
+    DeleteFileA(archive.c_str());
+    DeleteFileA(unavailable_marker.c_str());
+    RemoveDirectoryA(archive_directory.c_str());
+    RemoveDirectoryA(windows_cache_root.c_str());
+    DeleteFileA(marker.c_str());
+  }
+
+  std::string ReadMarker() const {
+    std::ifstream input(marker);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+  }
+
+  void ResetMarker() const { std::ofstream(marker, std::ios::trunc).close(); }
+
+  std::string unix_cache_root;
+  std::string windows_cache_root;
+  std::string marker;
+  std::string archive_directory;
+  std::string archive;
+  std::string unavailable_marker;
+};
+
+std::optional<std::string>
+CreateIsolatedDeviceAndRootSignature(ComPtr<ID3D12Device> *device,
+                                     ComPtr<ID3D12RootSignature> *root) {
+  using CreateDeviceProc =
+      HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+  const auto create_device = reinterpret_cast<CreateDeviceProc>(GetProcAddress(
+      GetModuleHandleW(L"d3d12.dll"), "DXMTCreateD3D12DeviceFromFactory"));
+  if (!create_device)
+    return "DXMTCreateD3D12DeviceFromFactory is unavailable";
+  const HRESULT hr =
+      create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                    reinterpret_cast<void **>(device->put()));
+  if (FAILED(hr))
+    return HResultMessage("DXMTCreateD3D12DeviceFromFactory", hr);
+
+  D3D12_ROOT_SIGNATURE_DESC desc = {};
+  desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ComPtr<ID3DBlob> blob;
+  ComPtr<ID3DBlob> errors;
+  HRESULT serialize_hr = D3D12SerializeRootSignature(
+      &desc, D3D_ROOT_SIGNATURE_VERSION_1_0, blob.put(), errors.put());
+  if (FAILED(serialize_hr))
+    return HResultMessage("archive D3D12SerializeRootSignature", serialize_hr);
+  serialize_hr = (*device)->CreateRootSignature(
+      0, blob->GetBufferPointer(), blob->GetBufferSize(),
+      __uuidof(ID3D12RootSignature), reinterpret_cast<void **>(root->put()));
+  if (FAILED(serialize_hr))
+    return HResultMessage("archive CreateRootSignature", serialize_hr);
+  return std::nullopt;
+}
+
+bool MarkerContains(const ScopedArchiveEnvironment &environment,
+                    std::string_view token, std::string *error) {
+  const std::string marker = environment.ReadMarker();
+  if (marker.find(token) != std::string::npos)
+    return true;
+  *error =
+      "pipeline archive marker lacks '" + std::string(token) + "': " + marker;
+  return false;
+}
+
+void BI_D3D12PipelineArchiveMiss(benchmark::State &state) {
+  ScopedArchiveEnvironment environment("miss");
+  ShaderSet shaders;
+  if (auto error = CompileShaders(&shaders)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error =
+          CreateIsolatedDeviceAndRootSignature(&device, &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  const auto desc = BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+
+  ComPtr<ID3D12PipelineState> pipeline;
+  for (auto _ : state) {
+    const HRESULT hr = device->CreateGraphicsPipelineState(
+        &desc, __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void **>(pipeline.put()));
+    if (FAILED(hr)) {
+      const auto error = HResultMessage("archive-miss pipeline", hr);
+      state.SkipWithError(error.c_str());
+      return;
+    }
+  }
+  std::string error;
+  if (auto validation = ValidatePipeline(pipeline.get()))
+    error = *validation;
+  if (error.empty())
+    MarkerContains(environment, "create cold=1 ok=1", &error);
+  if (!error.empty()) {
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+void BI_D3D12PipelineArchiveHit(benchmark::State &state) {
+  ScopedArchiveEnvironment environment("hit");
+  ShaderSet shaders;
+  if (auto error = CompileShaders(&shaders)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  {
+    ComPtr<ID3D12Device> cold_device;
+    ComPtr<ID3D12RootSignature> cold_root;
+    if (auto error =
+            CreateIsolatedDeviceAndRootSignature(&cold_device, &cold_root)) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+    const auto cold_desc = BasicGraphicsPipelineDesc(cold_root.get(), shaders);
+    ComPtr<ID3D12PipelineState> cold_pipeline;
+    const HRESULT hr = cold_device->CreateGraphicsPipelineState(
+        &cold_desc, __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void **>(cold_pipeline.put()));
+    if (FAILED(hr)) {
+      const auto error = HResultMessage("archive-hit cold setup", hr);
+      state.SkipWithError(error.c_str());
+      return;
+    }
+    if (auto error = ValidatePipeline(cold_pipeline.get())) {
+      state.SkipWithError(error->c_str());
+      return;
+    }
+  }
+  std::string error;
+  if (!MarkerContains(environment, "serialize reason=periodic count=1 ok=1",
+                      &error) ||
+      GetFileAttributesA(environment.archive.c_str()) ==
+          INVALID_FILE_ATTRIBUTES) {
+    if (error.empty())
+      error = "archive-hit setup did not persist a binary archive";
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  environment.ResetMarker();
+
+  ComPtr<ID3D12Device> warm_device;
+  ComPtr<ID3D12RootSignature> warm_root;
+  if (auto setup_error =
+          CreateIsolatedDeviceAndRootSignature(&warm_device, &warm_root)) {
+    state.SkipWithError(setup_error->c_str());
+    return;
+  }
+  const auto warm_desc = BasicGraphicsPipelineDesc(warm_root.get(), shaders);
+  ComPtr<ID3D12PipelineState> warm_pipeline;
+  for (auto _ : state) {
+    const HRESULT hr = warm_device->CreateGraphicsPipelineState(
+        &warm_desc, __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void **>(warm_pipeline.put()));
+    if (FAILED(hr)) {
+      const auto creation_error = HResultMessage("archive-hit pipeline", hr);
+      state.SkipWithError(creation_error.c_str());
+      return;
+    }
+  }
+  if (auto validation = ValidatePipeline(warm_pipeline.get()))
+    error = *validation;
+  if (error.empty())
+    MarkerContains(environment, "create cold=0 ok=1", &error);
+  if (!error.empty()) {
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+void BI_D3D12CorruptArchiveFallback(benchmark::State &state) {
+  ScopedArchiveEnvironment environment("corrupt");
+  if (!CreateDirectoryA(environment.archive_directory.c_str(), nullptr) &&
+      GetLastError() != ERROR_ALREADY_EXISTS) {
+    state.SkipWithError("failed to create corrupt archive directory");
+    return;
+  }
+  std::ofstream corrupt(environment.archive,
+                        std::ios::binary | std::ios::trunc);
+  corrupt << "not-a-metal-binary-archive";
+  corrupt.close();
+
+  ShaderSet shaders;
+  if (auto error = CompileShaders(&shaders)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12RootSignature> root_signature;
+  if (auto error =
+          CreateIsolatedDeviceAndRootSignature(&device, &root_signature)) {
+    state.SkipWithError(error->c_str());
+    return;
+  }
+  const auto desc = BasicGraphicsPipelineDesc(root_signature.get(), shaders);
+
+  ComPtr<ID3D12PipelineState> pipeline;
+  for (auto _ : state) {
+    const HRESULT hr = device->CreateGraphicsPipelineState(
+        &desc, __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void **>(pipeline.put()));
+    if (FAILED(hr)) {
+      const auto error = HResultMessage("corrupt-archive fallback", hr);
+      state.SkipWithError(error.c_str());
+      return;
+    }
+  }
+  std::string error;
+  if (auto validation = ValidatePipeline(pipeline.get()))
+    error = *validation;
+  if (error.empty())
+    MarkerContains(environment, "create cold=0 ok=0", &error);
+  if (!error.empty()) {
+    state.SkipWithError(error.c_str());
+    return;
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+#if !defined(DXMT_PIPELINE_BURST_ONLY)
+BENCHMARK(BI_D3D12ColdComputePipeline)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12WarmComputePipeline)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12WarmGraphicsPipeline)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12AttachmentFormatSpecialization)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12BlendStateSpecialization)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12PipelineArchiveMiss)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12PipelineArchiveHit)->Iterations(1)->UseRealTime();
+BENCHMARK(BI_D3D12CorruptArchiveFallback)->Iterations(1)->UseRealTime();
+#endif
+
+#if !defined(DXMT_PIPELINE_MICRO_ONLY)
 BENCHMARK(BI_D3D12GraphicsPipelineCreationBurst)
     ->ArgName("workers")
     ->Arg(1)
     ->Arg(4)
     ->Iterations(1)
     ->UseRealTime();
+#endif
 
 } // namespace

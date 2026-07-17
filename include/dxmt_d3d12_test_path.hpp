@@ -29,6 +29,17 @@ enum ExecutionPathFlags : std::uint32_t {
   ExecutionPathFlagInjectEmptyFallbackSegment = 1u << 1,
 };
 
+// Ordered test-only view of the segments selected by the compiled command
+// builder.  Keep this independent from the implementation enum so tests can
+// inspect a stable ABI without including private command-list headers.
+enum class ExecutionPathSegmentKind : std::uint32_t {
+  Graphics = 0,
+  Compute = 1,
+  Fallback = 2,
+};
+
+inline constexpr std::uint32_t kExecutionPathMaxTracedSegments = 64;
+
 struct ExecutionPathConfig {
   std::uint32_t struct_size = sizeof(ExecutionPathConfig);
   ExecutionPathMode mode = ExecutionPathMode::Auto;
@@ -59,6 +70,16 @@ struct ExecutionPathStats {
   std::uint32_t replayed_compiled_packet_fallbacks = 0;
   std::uint32_t replayed_empty_native_segments = 0;
   std::uint32_t replayed_empty_fallback_segments = 0;
+  // segment_count always reports the complete count. traced_segment_count is
+  // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
+  // builder order and make N/F boundary topology directly testable.
+  std::uint32_t segment_count = 0;
+  std::uint32_t traced_segment_count = 0;
+  ExecutionPathSegmentKind
+      segment_kinds[kExecutionPathMaxTracedSegments] = {};
+  std::uint32_t
+      segment_first_record_indices[kExecutionPathMaxTracedSegments] = {};
+  std::uint32_t segment_record_counts[kExecutionPathMaxTracedSegments] = {};
 };
 
 inline constexpr GUID kExecutionPathConfigGuid = {

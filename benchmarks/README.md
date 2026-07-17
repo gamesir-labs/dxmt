@@ -15,6 +15,7 @@ benchmarks/
   wine/*_benchmark.cpp             Wine D3D workloads
   wine/d3d12_pipeline_creation_benchmark.cpp
                                    Parallel cold PSO creation burst
+  wine/d3d12_shader_benchmark.cpp  Separately timed shader compiler stages
   wine/ue_*_initialization.cpp     UE-like RHI initialization workload
 ```
 
@@ -36,7 +37,7 @@ keeps D3D11's Metal 3 and D3D12's Metal 4 backends out of the same PE while
 still presenting one serial integration result. The D3D12 probe makes the same
 combined SM6/SM5 decision as UE before the formal device bootstrap continues.
 
-The `d3d12-pipeline-creation` integration suite models an engine loading-screen
+The `d3d12-pipeline-creation` performance suite models an engine loading-screen
 PSO burst. It synchronizes one or four application worker threads before they
 create 96 unique graphics pipelines, mixes regular and tessellation pipelines,
 and includes adversarial sample-count requests when the device reports an
@@ -46,6 +47,28 @@ HLSL compilation is outside the measured interval. Result counters report
 mean, p50, p95, maximum CreatePSO latency, and summed-call-time to wall-time
 ratio; the Google Benchmark entry itself remains serial so Wine benchmark
 suite isolation is preserved.
+
+The separate `d3d12-pipeline-micro` executable is built from the same source
+and keeps cold and warm compute creation, warm graphics creation,
+render-target-format and blend-state specialization, and binary-archive
+miss/hit paths as independent budget rows. Splitting the executables prevents
+global Metal compiler state and sustained cold-burst load from contaminating
+one another. Cold compute uses precompiled shader variants with distinct
+bytecode; warm cases perform an untimed creation first. Archive cases use
+isolated devices and marker evidence to distinguish a real cold archive, a
+serialized archive reload, and corrupt archive rejection followed by successful
+compilation. Every timed family validates a non-empty pipeline cached blob
+outside its measurement loop.
+
+The `d3d12-shader` performance suite calls the same airconv and Metal4 thunk
+interfaces used by D3D12 so stage boundaries stay real. It measures DXBC and
+DXIL initialization (container parsing), IR-to-AIR generation, Metal library
+materialization, and persistent AIR-cache hits and misses independently. Each
+case performs an untimed structural precheck: reflected threadgroup dimensions,
+non-empty AIR, a resolvable Metal function, or byte-for-byte cache payload
+validation. Airconv currently exposes parsing and final AIR generation as two
+public boundaries; LLVM IR construction and AIR serialization cannot be split
+further without adding benchmark-only production hooks.
 
 The `d3d12-binding-hotspots` performance suite establishes independent
 baselines for the three bindless CPU paths reported by FH4. Argument-table

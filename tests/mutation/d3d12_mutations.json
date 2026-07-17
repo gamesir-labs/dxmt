@@ -71,6 +71,41 @@
       "find": "    HashValue(hash, graphics_state.desc.SampleMask);",
       "replace": "    (void)graphics_state.desc.SampleMask;",
       "test_filter": "D3D12PipelineCacheKeySpec.SampleMaskChangesCachedBlobAndSameDescIsStable"
+    },
+    {
+      "id": "recorded-resource-barrier-is-removed",
+      "file": "src/d3d12/d3d12_command_list.cpp",
+      "find": "      record.barriers.push_back(StoreResourceBarrier(barriers[i]));",
+      "replace": "      (void)barriers[i];",
+      "test_filter": "LegacyProducerConsumerExecutionSpec.UavBarrierThenTransitionPublishesArgumentsToExecuteIndirect"
+    },
+    {
+      "id": "descriptor-table-index-is-incremented",
+      "file": "src/d3d12/d3d12_command_queue.cpp",
+      "find": "    const auto total_offset = range_offset + descriptor_index;",
+      "replace": "    const auto total_offset = range_offset + descriptor_index + 1u;",
+      "test_filter": "D3D12DescriptorSpec.DrawsWithSplitDescriptorTables"
+    },
+    {
+      "id": "recording-error-is-cleared-during-reset",
+      "file": "src/d3d12/d3d12_command_list.cpp",
+      "find": "    if (recording_error_)\n      return E_FAIL;\n    if (!allocator)",
+      "replace": "    if (recording_error_)\n      recording_error_ = S_OK;\n    if (!allocator)",
+      "test_filter": "CommandListLifecycleSpec.FailedCloseCannotBeReset"
+    },
+    {
+      "id": "descriptor-residency-addition-is-dropped",
+      "file": "src/d3d12/d3d12_command_queue.cpp",
+      "find": "    enc.queue().AddPersistentResidency(transition.added_allocations[i]);",
+      "replace": "    (void)transition.added_allocations[i];",
+      "test_filter": "D3D12BindingHotspot.RetainsSharedAllocationAfterPartialOverwrite"
+    },
+    {
+      "id": "compiled-descriptor-heap-reference-is-dropped",
+      "file": "src/d3d12/d3d12_command_queue.cpp",
+      "find": "    snapshot->cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;",
+      "replace": "    snapshot->cbv_srv_uav_heap = nullptr;",
+      "test_filter": "D3D12DescriptorSpec.DefensivelyHandlesEarlyDescriptorHeapReleaseAfterSubmission"
     }
   ]
 }

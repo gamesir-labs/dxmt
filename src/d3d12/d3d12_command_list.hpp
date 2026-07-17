@@ -331,6 +331,7 @@ enum class CompiledCommandFallbackReason {
   NativeResidencyUnsupported,
   InjectedNativePacketAllocationFailure,
   InjectedNativeSegmentFinalizationFailure,
+  InjectedNativePipelineCompilationFailure,
   UnsupportedRootSignature,
   UnsupportedDescriptorTable,
   UnsupportedRootDescriptor,
