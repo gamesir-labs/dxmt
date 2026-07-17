@@ -2495,6 +2495,8 @@ AIRCONV_API int SM50Initialize(
     if (srv.read || srv.sampled || srv.compared) {
       flags |= MTL_SM50_SHADER_ARGUMENT_READ_ACCESS;
     }
+    if (srv.requires_typed_sampler)
+      flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_REQUIRES_TYPED_SAMPLER;
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::SRV,
       .SM50BindingSlot = binding_slot,

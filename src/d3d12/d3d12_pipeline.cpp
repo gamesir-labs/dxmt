@@ -2688,12 +2688,14 @@ GetNativeShaderAbiEligibilityImpl(
     const auto *arguments = shader.resourceArgumentInfo();
     for (uint32_t i = 0; arguments && i < shader.reflection().NumArguments;
          i++) {
-      // Comparison sampling requires a typed depth texture and comparison
-      // sampler. Reconstructing those handles from the native descriptor
-      // table's raw qwords loses the comparison operation on Metal, while the
-      // typed bindless mirror preserves it.
+      // Comparison sampling, implicit-LOD bias and LOD calculation require
+      // typed texture/sampler handles. Reconstructing those handles from the
+      // native descriptor table's raw qwords loses those operations on Metal,
+      // while the typed bindless mirror preserves them.
       if (arguments[i].Type == SM50BindingType::SRV &&
-          (arguments[i].Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_DEPTH))
+          (arguments[i].Flags &
+           (MTL_SM50_SHADER_ARGUMENT_TEXTURE_DEPTH |
+            MTL_SM50_SHADER_ARGUMENT_TEXTURE_REQUIRES_TYPED_SAMPLER)))
         return NativeShaderAbiEligibilityReason::ShaderAbiMismatch;
       if (!NativeShaderArgumentHasSingleTableRange(*root_signature,
                                                    shader.stage,

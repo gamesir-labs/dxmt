@@ -645,7 +645,9 @@ Instruction readInstruction(
       .feedback = sparse ? readDstOperand(Inst.m_Operands[sparse], phase, OperandDataType::Integer)
                          : std::optional<DstOperand>(),
     };
-    shader_info.srvMap[inst.src_resource.range_id].sampled = true;
+    auto &srv = shader_info.srvMap[inst.src_resource.range_id];
+    srv.sampled = true;
+    srv.requires_typed_sampler = true;
     return inst;
   };
   case microsoft::D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK:
@@ -666,7 +668,9 @@ Instruction readInstruction(
       .feedback = sparse ? readDstOperand(Inst.m_Operands[sparse], phase, OperandDataType::Integer)
                          : std::optional<DstOperand>(),
     };
-    shader_info.srvMap[inst.src_resource.range_id].sampled = true;
+    auto &srv = shader_info.srvMap[inst.src_resource.range_id];
+    srv.sampled = true;
+    srv.requires_typed_sampler = true;
     return inst;
   };
   case microsoft::D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK:
@@ -1672,12 +1676,16 @@ Instruction readInstruction(
     };
   };
   case microsoft::D3D10_1_SB_OPCODE_LOD: {
-    return InstCalcLOD{
+    auto inst = InstCalcLOD{
       .dst = readDstOperand(Inst.m_Operands[0], phase, OperandDataType::Float),
       .src_address = readSrcOperand(Inst.m_Operands[1], phase, OperandDataType::Float),
       .src_resource = readSrcOperandResource(Inst.m_Operands[2], phase),
       .src_sampler = readSrcOperandSampler(Inst.m_Operands[3], phase),
     };
+    auto &srv = shader_info.srvMap[inst.src_resource.range_id];
+    srv.sampled = true;
+    srv.requires_typed_sampler = true;
+    return inst;
   };
   case microsoft::D3D10_SB_OPCODE_NOP: {
     return InstNop{};

@@ -42,6 +42,7 @@ struct ShaderResourceViewInfo {
   bool read = false;
   bool sampled = false;
   bool compared = false; // therefore we use depth texture!
+  bool requires_typed_sampler = false;
 
   uint32_t structure_stride = 0;
   uint32_t arg_index;
