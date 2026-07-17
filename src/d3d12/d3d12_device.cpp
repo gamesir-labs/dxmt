@@ -637,6 +637,19 @@ ResolveDepthTypelessFormatForD3D12Caps(DXGI_FORMAT format) {
   }
 }
 
+static bool
+IsEmulatedThreeComponentBufferFormat(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32_TYPELESS:
+  case DXGI_FORMAT_R32G32B32_FLOAT:
+  case DXGI_FORMAT_R32G32B32_UINT:
+  case DXGI_FORMAT_R32G32B32_SINT:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static FormatCapability
 GetD3D12FormatCapability(WMT::Device device,
                          const MTL_DXGI_FORMAT_DESC &format) {
@@ -3151,7 +3164,33 @@ public:
       const auto caps = GetD3D12FormatCapability(device_->device(), format);
       data->Support1 = GetD3D12FormatSupport1(caps, format);
       data->Support2 = GetD3D12FormatSupport2(caps);
+      // RGB32 buffer views are represented by three scalar R32 elements in
+      // memory, while the Metal texture-buffer view exposes only one channel.
+      // Keep Buffer/ShaderLoad for the typed formats, but do not advertise
+      // typed UAV load/store or atomics until three-component lowering exists.
+      // Feature-level 12 also disallows Buffer/ShaderLoad for RGB32_TYPELESS
+      // and tiled resources for every 96-bpp RGB32 format.
+      const bool emulated_rgb32 =
+          IsEmulatedThreeComponentBufferFormat(data->Format);
+      if (emulated_rgb32) {
+        data->Support1 = static_cast<D3D12_FORMAT_SUPPORT1>(
+            data->Support1 &
+            ~D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+        if (data->Format == DXGI_FORMAT_R32G32B32_TYPELESS) {
+          constexpr UINT kAllowedTypelessSupport1 =
+              D3D12_FORMAT_SUPPORT1_TEXTURE1D |
+              D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+              D3D12_FORMAT_SUPPORT1_TEXTURE3D |
+              D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+              D3D12_FORMAT_SUPPORT1_MIP |
+              D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+          data->Support1 = static_cast<D3D12_FORMAT_SUPPORT1>(
+              static_cast<UINT>(data->Support1) & kAllowedTypelessSupport1);
+        }
+        data->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+      }
       if (GetDXMTDevice().device().supportsPlacementSparse() &&
+          !emulated_rgb32 &&
           SupportsTiledTextureFormat(device_->device(), data->Format, format))
         data->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;
       return S_OK;

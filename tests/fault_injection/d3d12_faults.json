@@ -112,6 +112,13 @@
       }
     },
     {
+      "id": "command-queue-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedCommandQueueFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "graphics-pipeline-creation-fail-first",
       "filter": "D3D12CreationFaultInjectionSpec.GraphicsPipelineFailureClearsOutputAndNextCallRecovers",
       "environment": {
@@ -123,6 +130,13 @@
       "filter": "D3D12CreationFaultInjectionSpec.GraphicsPipelineFailureClearsOutputAndNextCallRecovers",
       "environment": {
         "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "graphics-pipeline-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedGraphicsPipelineFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT": "always"
       }
     },
     {
@@ -140,6 +154,13 @@
       }
     },
     {
+      "id": "heap-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedHeapFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_HEAP_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "root-signature-creation-fail-first",
       "filter": "D3D12CreationFaultInjectionSpec.RootSignatureFailureClearsOutputAndNextCallRecovers",
       "environment": {
@@ -151,6 +172,13 @@
       "filter": "D3D12CreationFaultInjectionSpec.RootSignatureFailureClearsOutputAndNextCallRecovers",
       "environment": {
         "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "root-signature-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedRootSignatureFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT": "always"
       }
     },
     {
@@ -168,6 +196,13 @@
       }
     },
     {
+      "id": "fence-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedFenceFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_FENCE_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "query-heap-creation-fail-first",
       "filter": "D3D12CreationFaultInjectionSpec.QueryHeapFailureClearsOutputAndNextCallRecovers",
       "environment": {
@@ -179,6 +214,13 @@
       "filter": "D3D12CreationFaultInjectionSpec.QueryHeapFailureClearsOutputAndNextCallRecovers",
       "environment": {
         "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "query-heap-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedQueryHeapFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT": "always"
       }
     },
     {
@@ -196,8 +238,15 @@
       }
     },
     {
-      "id": "metal-compute-pipeline-fail-first",
-      "filter": "D3D12InternalFaultInjectionSpec.MetalPipelineFailureAndLaterPipelineRecovers",
+      "id": "air-initialization-fail-repeatedly",
+      "filter": "D3D12InternalFaultInjectionSpec.RepeatedAirInitializationFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_AIR_INITIALIZATION_AT": "always"
+      }
+    },
+    {
+      "id": "metal-compute-pipeline-fail-repeatedly",
+      "filter": "D3D12InternalFaultInjectionSpec.RepeatedMetalPipelineFailuresAndLaterPipelineRecovers",
       "environment": {
         "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT": "always"
       }
@@ -233,6 +282,13 @@
       }
     },
     {
+      "id": "descriptor-table-allocation-fail-repeatedly",
+      "filter": "D3D12DescriptorInternalFaultInjectionSpec.RepeatedDescriptorFailuresFallBackWithoutPartialPublication",
+      "environment": {
+        "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT": "always"
+      }
+    },
+    {
       "id": "residency-insertion-fail-first",
       "filter": "D3D12DescriptorInternalFaultInjectionSpec.DescriptorFailureFallsBackAndLaterWritesExecute",
       "environment": {
@@ -244,6 +300,13 @@
       "filter": "D3D12DescriptorInternalFaultInjectionSpec.DescriptorFailureFallsBackAndLaterWritesExecute",
       "environment": {
         "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT": "2"
+      }
+    },
+    {
+      "id": "residency-insertion-fail-repeatedly",
+      "filter": "D3D12DescriptorInternalFaultInjectionSpec.RepeatedDescriptorFailuresFallBackWithoutPartialPublication",
+      "environment": {
+        "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT": "always"
       }
     },
     {
@@ -261,6 +324,13 @@
       }
     },
     {
+      "id": "metal-buffer-creation-fail-repeatedly",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.RepeatedMetalObjectFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "metal-texture-creation-fail-first",
       "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
       "environment": {
@@ -272,6 +342,13 @@
       "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
       "environment": {
         "DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "metal-texture-creation-fail-repeatedly",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.RepeatedMetalObjectFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT": "always"
       }
     },
     {
@@ -289,6 +366,13 @@
       }
     },
     {
+      "id": "metal-heap-creation-fail-repeatedly",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.RepeatedMetalObjectFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "metal-graphics-pipeline-fail-first",
       "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
       "environment": {
@@ -300,6 +384,13 @@
       "filter": "D3D12MetalObjectFaultInjectionSpec.MetalObjectFailureClearsOutputAndNextOccurrenceRecovers",
       "environment": {
         "DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT": "2"
+      }
+    },
+    {
+      "id": "metal-graphics-pipeline-fail-repeatedly",
+      "filter": "D3D12MetalObjectFaultInjectionSpec.RepeatedMetalObjectFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT": "always"
       }
     }
   ]

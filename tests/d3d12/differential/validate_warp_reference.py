@@ -29,11 +29,15 @@ REQUIRED_CASES = {
     "invalid_resource",
     "invalid_root_signature",
     "msaa_resolve_rgba8",
+    "predicated_compute_equal_zero_execute",
+    "predicated_compute_equal_zero_skip",
     "predicated_compute_false",
     "predicated_compute_true",
     "predication_disabled_compute",
     "root_constants_uav",
+    "render_pass_flattened_equivalence",
     "texture_copy_rgba8",
+    "timestamp_query_ordering",
     "unsupported_iid",
 }
 MICROSOFT_VENDOR_ID = 0x1414
@@ -47,12 +51,23 @@ COMPUTE_VALUES = [
 PREDICATION_SENTINEL_VALUES = [
     0xC001D00D ^ (index * 0x01010101) for index in range(16)
 ]
+RENDER_PASS_CLEAR_PIXEL = 0xFFFFFF00
 EXACT_CASE_VALUES = {
     "binary_occlusion_nonzero": [1, 0],
     "cross_queue_fence_copy": INPUT_VALUES,
+    "predicated_compute_equal_zero_execute": COMPUTE_VALUES,
+    "predicated_compute_equal_zero_skip": PREDICATION_SENTINEL_VALUES,
     "predicated_compute_false": PREDICATION_SENTINEL_VALUES,
     "predication_disabled_compute": COMPUTE_VALUES,
+    "render_pass_flattened_equivalence": [RENDER_PASS_CLEAR_PIXEL] * 32,
     "root_constants_uav": [0x01234567, 0x98BADCFE, 0x3175B9FD, 0x175B9FD3],
+    "timestamp_query_ordering": [3, 1, 1, 1],
+}
+CASE_VALUE_COUNTS = {
+    "predicated_compute_equal_zero_execute": 16,
+    "predicated_compute_equal_zero_skip": 16,
+    "render_pass_flattened_equivalence": 32,
+    "timestamp_query_ordering": 4,
 }
 
 
@@ -117,6 +132,11 @@ def validate(snapshot: Any) -> list[str]:
         ):
             errors.append(f"{name}: values must contain only uint32 integers")
             continue
+        expected_count = CASE_VALUE_COUNTS.get(name)
+        if expected_count is not None and len(values) != expected_count:
+            errors.append(
+                f"{name}: values must contain exactly {expected_count} entries"
+            )
         expected_hash = fnv1a64(values)
         if case.get("hash_fnv1a64") != expected_hash:
             errors.append(
@@ -126,6 +146,20 @@ def validate(snapshot: Any) -> list[str]:
         exact_values = EXACT_CASE_VALUES.get(name)
         if exact_values is not None and values != exact_values:
             errors.append(f"{name}: values do not match the required oracle contract")
+        if name == "timestamp_query_ordering" and len(values) == 4:
+            if values[0] != 3 or values[1:] != [1, 1, 1]:
+                errors.append(
+                    f"{name}: resolved timestamps must be transitively nondecreasing"
+                )
+        if name == "render_pass_flattened_equivalence" and len(values) == 32:
+            if values[:16] != values[16:]:
+                errors.append(
+                    f"{name}: render-pass and flattened pixels must match"
+                )
+            if any(value != RENDER_PASS_CLEAR_PIXEL for value in values):
+                errors.append(
+                    f"{name}: both paths must produce the required clear color"
+                )
     return errors
 
 

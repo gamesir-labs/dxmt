@@ -485,8 +485,10 @@ bool RunCrossQueueFenceCase(OracleContext &context,
 
 enum class ComputePredication {
   None,
-  Execute,
-  Skip,
+  NotEqualZeroExecute,
+  NotEqualZeroSkip,
+  EqualZeroExecute,
+  EqualZeroSkip,
   DisableBeforeDispatch,
 };
 
@@ -562,8 +564,17 @@ bool RunComputeCase(OracleContext &context,
                                        D3D12_RESOURCE_FLAG_NONE,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
   std::array<std::uint32_t, kValueCount> predicate_values = {};
-  predicate_values[0] = predication == ComputePredication::Execute ? 1u : 0u;
+  const bool predicate_nonzero =
+      predication == ComputePredication::NotEqualZeroExecute ||
+      predication == ComputePredication::EqualZeroSkip;
+  predicate_values[0] = predicate_nonzero ? 1u : 0u;
   const bool uses_predication = predication != ComputePredication::None;
+  const bool uses_equal_zero =
+      predication == ComputePredication::EqualZeroExecute ||
+      predication == ComputePredication::EqualZeroSkip;
+  const D3D12_PREDICATION_OP predication_op =
+      uses_equal_zero ? D3D12_PREDICATION_OP_EQUAL_ZERO
+                      : D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
   auto predicate = uses_predication ? context.CreateUpload(predicate_values)
                                     : ComPtr<ID3D12Resource>();
   if (!upload || !initial_upload || !output || !readback ||
@@ -580,13 +591,14 @@ bool RunComputeCase(OracleContext &context,
   context.list()->SetComputeRootUnorderedAccessView(
       1, output->GetGPUVirtualAddress());
   if (uses_predication)
-    context.list()->SetPredication(predicate.get(), 0,
-                                   D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+    context.list()->SetPredication(predicate.get(), 0, predication_op);
   if (predication == ComputePredication::DisableBeforeDispatch)
     context.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   context.list()->Dispatch(1, 1, 1);
-  if (predication == ComputePredication::Execute ||
-      predication == ComputePredication::Skip)
+  if (predication == ComputePredication::NotEqualZeroExecute ||
+      predication == ComputePredication::NotEqualZeroSkip ||
+      predication == ComputePredication::EqualZeroExecute ||
+      predication == ComputePredication::EqualZeroSkip)
     context.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   Transition(context.list(), output.get(),
              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1630,6 +1642,173 @@ bool RunExecuteIndirectCase(OracleContext &context,
   return result->size() == value_count;
 }
 
+bool RunTimestampOrderingCase(OracleContext &context,
+                              std::vector<std::uint32_t> *result) {
+  constexpr UINT timestamp_count = 3;
+  D3D12_QUERY_HEAP_DESC query_desc = {};
+  query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  query_desc.Count = timestamp_count;
+  ComPtr<ID3D12QueryHeap> query_heap;
+  if (!Check(context.device()->CreateQueryHeap(&query_desc,
+                                               IID_PPV_ARGS(query_heap.put())),
+             "CreateQueryHeap(timestamp ordering)"))
+    return false;
+
+  std::array<std::uint32_t, kValueCount> payload = {};
+  for (UINT index = 0; index < payload.size(); ++index)
+    payload[index] = 0x31415926u ^ (index * 0x01020304u);
+  std::array<std::uint32_t, kValueCount> query_sentinel = {};
+  query_sentinel.fill(0xffffffffu);
+  auto upload = context.CreateUpload(payload);
+  auto sentinel_upload = context.CreateUpload(query_sentinel);
+  auto intermediate = context.CreateBuffer(
+      sizeof(payload), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto copy_readback = context.CreateBuffer(
+      sizeof(payload), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto query_readback = context.CreateBuffer(
+      timestamp_count * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!upload || !sentinel_upload || !intermediate || !copy_readback ||
+      !query_readback)
+    return false;
+
+  context.list()->CopyBufferRegion(query_readback.get(), 0,
+                                   sentinel_upload.get(), 0,
+                                   timestamp_count * sizeof(UINT64));
+  context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  context.list()->CopyBufferRegion(intermediate.get(), 0, upload.get(), 0,
+                                   sizeof(payload));
+  context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+  Transition(context.list(), intermediate.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list()->CopyBufferRegion(copy_readback.get(), 0, intermediate.get(),
+                                   0, sizeof(payload));
+  context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+  context.list()->ResolveQueryData(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                   0, timestamp_count, query_readback.get(), 0);
+  if (!context.ExecuteAndReset())
+    return false;
+
+  const auto copied_payload =
+      context.Readback(copy_readback.get(), kValueCount);
+  if (copied_payload !=
+      std::vector<std::uint32_t>(payload.begin(), payload.end())) {
+    std::cerr << "timestamp ordering payload copy did not execute\n";
+    return false;
+  }
+
+  const auto words =
+      context.Readback(query_readback.get(), timestamp_count * 2);
+  if (words.size() != timestamp_count * 2)
+    return false;
+  auto timestamp = [&](UINT index) {
+    return static_cast<UINT64>(words[index * 2]) |
+           (static_cast<UINT64>(words[index * 2 + 1]) << 32);
+  };
+  const UINT64 first = timestamp(0);
+  const UINT64 middle = timestamp(1);
+  const UINT64 last = timestamp(2);
+  if (first == ~UINT64{0} || middle == ~UINT64{0} || last == ~UINT64{0}) {
+    std::cerr << "timestamp resolve left sentinel values in readback\n";
+    return false;
+  }
+  *result = {timestamp_count, first <= middle ? 1u : 0u,
+             middle <= last ? 1u : 0u, first <= last ? 1u : 0u};
+  return true;
+}
+
+bool RunRenderPassFlattenedEquivalenceCase(OracleContext &context,
+                                           std::vector<std::uint32_t> *result) {
+  constexpr UINT width = 4;
+  constexpr UINT height = 4;
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  constexpr FLOAT clear_color[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+  constexpr std::uint32_t expected_pixel = 0xffffff00u;
+
+  ComPtr<ID3D12GraphicsCommandList4> list4;
+  if (!Check(context.list()->QueryInterface(IID_PPV_ARGS(list4.put())),
+             "QueryInterface(ID3D12GraphicsCommandList4)"))
+    return false;
+
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  auto create_target = [&](std::string_view operation) {
+    ComPtr<ID3D12Resource> target;
+    if (!Check(context.device()->CreateCommittedResource(
+                   &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                   D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                   IID_PPV_ARGS(target.put())),
+               operation))
+      return ComPtr<ID3D12Resource>();
+    return target;
+  };
+  auto render_pass_target =
+      create_target("CreateCommittedResource(render-pass equivalence target)");
+  auto flattened_target =
+      create_target("CreateCommittedResource(flattened equivalence target)");
+
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  heap_desc.NumDescriptors = 2;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap;
+  if (!render_pass_target || !flattened_target ||
+      !Check(context.device()->CreateDescriptorHeap(
+                 &heap_desc, IID_PPV_ARGS(rtv_heap.put())),
+             "CreateDescriptorHeap(render-pass equivalence RTV)"))
+    return false;
+  const UINT rtv_increment = context.device()->GetDescriptorHandleIncrementSize(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  const auto render_pass_rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  auto flattened_rtv = render_pass_rtv;
+  flattened_rtv.ptr += rtv_increment;
+  context.device()->CreateRenderTargetView(render_pass_target.get(), nullptr,
+                                           render_pass_rtv);
+  context.device()->CreateRenderTargetView(flattened_target.get(), nullptr,
+                                           flattened_rtv);
+
+  D3D12_RENDER_PASS_RENDER_TARGET_DESC pass = {};
+  pass.cpuDescriptor = render_pass_rtv;
+  pass.BeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+  pass.BeginningAccess.Clear.ClearValue.Format = format;
+  std::memcpy(pass.BeginningAccess.Clear.ClearValue.Color, clear_color,
+              sizeof(clear_color));
+  pass.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+  list4->BeginRenderPass(1, &pass, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+  list4->EndRenderPass();
+  context.list()->ClearRenderTargetView(flattened_rtv, clear_color, 0, nullptr);
+
+  std::vector<std::uint32_t> render_pass_values;
+  std::vector<std::uint32_t> flattened_values;
+  if (!ReadbackRgba8(context, render_pass_target.get(),
+                     D3D12_RESOURCE_STATE_RENDER_TARGET, &render_pass_values,
+                     "Map(render-pass equivalence readback)") ||
+      !ReadbackRgba8(context, flattened_target.get(),
+                     D3D12_RESOURCE_STATE_RENDER_TARGET, &flattened_values,
+                     "Map(flattened equivalence readback)"))
+    return false;
+
+  result->clear();
+  result->reserve(render_pass_values.size() + flattened_values.size());
+  result->insert(result->end(), render_pass_values.begin(),
+                 render_pass_values.end());
+  result->insert(result->end(), flattened_values.begin(),
+                 flattened_values.end());
+  return render_pass_values == flattened_values &&
+         render_pass_values ==
+             std::vector<std::uint32_t>(width * height, expected_pixel);
+}
+
 void WriteValues(std::ostream &output, std::string_view name,
                  const std::vector<std::uint32_t> &values, bool trailing) {
   output << "    \"" << name
@@ -1675,9 +1854,12 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> offset_copy;
   std::vector<std::uint32_t> barrier_chain;
   std::vector<std::uint32_t> cross_queue_fence;
+  std::vector<std::uint32_t> timestamp_ordering;
   std::vector<std::uint32_t> compute;
   std::vector<std::uint32_t> predicated_compute;
   std::vector<std::uint32_t> predicated_compute_false;
+  std::vector<std::uint32_t> predicated_equal_zero_execute;
+  std::vector<std::uint32_t> predicated_equal_zero_skip;
   std::vector<std::uint32_t> predication_disabled_compute;
   std::vector<std::uint32_t> root_constants;
   std::vector<std::uint32_t> descriptor_table;
@@ -1688,6 +1870,7 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> unsupported_iid;
   std::vector<std::uint32_t> clear;
   std::vector<std::uint32_t> clear_rect;
+  std::vector<std::uint32_t> render_pass_flattened;
   std::vector<std::uint32_t> texture_copy;
   std::vector<std::uint32_t> draw;
   std::vector<std::uint32_t> binary_occlusion;
@@ -1711,18 +1894,32 @@ int main(int argc, char **argv) {
     std::cerr << "cross_queue_fence_copy case failed\n";
     return 1;
   }
+  if (!RunTimestampOrderingCase(context, &timestamp_ordering)) {
+    std::cerr << "timestamp_query_ordering case failed\n";
+    return 1;
+  }
   if (!RunComputeCase(context, input, &compute)) {
     std::cerr << "compute_u32 case failed\n";
     return 1;
   }
   if (!RunComputeCase(context, input, &predicated_compute,
-                      ComputePredication::Execute)) {
+                      ComputePredication::NotEqualZeroExecute)) {
     std::cerr << "predicated_compute_true case failed\n";
     return 1;
   }
   if (!RunComputeCase(context, input, &predicated_compute_false,
-                      ComputePredication::Skip)) {
+                      ComputePredication::NotEqualZeroSkip)) {
     std::cerr << "predicated_compute_false case failed\n";
+    return 1;
+  }
+  if (!RunComputeCase(context, input, &predicated_equal_zero_execute,
+                      ComputePredication::EqualZeroExecute)) {
+    std::cerr << "predicated_compute_equal_zero_execute case failed\n";
+    return 1;
+  }
+  if (!RunComputeCase(context, input, &predicated_equal_zero_skip,
+                      ComputePredication::EqualZeroSkip)) {
+    std::cerr << "predicated_compute_equal_zero_skip case failed\n";
     return 1;
   }
   if (!RunComputeCase(context, input, &predication_disabled_compute,
@@ -1764,6 +1961,10 @@ int main(int argc, char **argv) {
   }
   if (!RunClearCase(context, &clear_rect, true)) {
     std::cerr << "clear_rect_rgba8 case failed\n";
+    return 1;
+  }
+  if (!RunRenderPassFlattenedEquivalenceCase(context, &render_pass_flattened)) {
+    std::cerr << "render_pass_flattened_equivalence case failed\n";
     return 1;
   }
   if (!RunTextureCopyCase(context, &texture_copy)) {
@@ -1812,10 +2013,15 @@ int main(int argc, char **argv) {
   WriteValues(*output, "buffer_copy_offset", offset_copy, true);
   WriteValues(*output, "barrier_copy_chain", barrier_chain, true);
   WriteValues(*output, "cross_queue_fence_copy", cross_queue_fence, true);
+  WriteValues(*output, "timestamp_query_ordering", timestamp_ordering, true);
   WriteValues(*output, "compute_u32", compute, true);
   WriteValues(*output, "predicated_compute_true", predicated_compute, true);
   WriteValues(*output, "predicated_compute_false", predicated_compute_false,
               true);
+  WriteValues(*output, "predicated_compute_equal_zero_execute",
+              predicated_equal_zero_execute, true);
+  WriteValues(*output, "predicated_compute_equal_zero_skip",
+              predicated_equal_zero_skip, true);
   WriteValues(*output, "predication_disabled_compute",
               predication_disabled_compute, true);
   WriteValues(*output, "root_constants_uav", root_constants, true);
@@ -1829,6 +2035,8 @@ int main(int argc, char **argv) {
   WriteValues(*output, "unsupported_iid", unsupported_iid, true);
   WriteValues(*output, "clear_rgba8", clear, true);
   WriteValues(*output, "clear_rect_rgba8", clear_rect, true);
+  WriteValues(*output, "render_pass_flattened_equivalence",
+              render_pass_flattened, true);
   WriteValues(*output, "texture_copy_rgba8", texture_copy, true);
   WriteValues(*output, "draw_fullscreen_rgba8", draw, true);
   WriteValues(*output, "binary_occlusion_nonzero", binary_occlusion, true);

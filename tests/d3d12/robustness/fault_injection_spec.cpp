@@ -28,6 +28,26 @@ bool ConfiguredAlways(const char *name) {
                    std::strcmp(value, "all") == 0);
 }
 
+template <typename Create>
+void ExpectRepeatedFailureThenRecovery(const char *fault, Create create) {
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    void *output = reinterpret_cast<void *>(uintptr_t{1});
+    const HRESULT hr = create(&output);
+    EXPECT_EQ(hr, E_OUTOFMEMORY) << "attempt=" << attempt;
+    EXPECT_EQ(output, nullptr) << "attempt=" << attempt;
+    if (SUCCEEDED(hr) && output &&
+        output != reinterpret_cast<void *>(uintptr_t{1}))
+      static_cast<IUnknown *>(output)->Release();
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  void *recovered = reinterpret_cast<void *>(uintptr_t{1});
+  ASSERT_EQ(create(&recovered), S_OK);
+  ASSERT_NE(recovered, nullptr);
+  ASSERT_NE(recovered, reinterpret_cast<void *>(uintptr_t{1}));
+  static_cast<IUnknown *>(recovered)->Release();
+}
+
 class D3D12CreationFaultInjectionSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -278,6 +298,22 @@ TEST_F(D3D12CreationFaultInjectionSpec,
 }
 
 TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedCommandQueueFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated command queue creation fault is disabled";
+
+  D3D12_COMMAND_QUEUE_DESC desc = {};
+  desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  ExpectRepeatedFailureThenRecovery(fault, [&](void **output) {
+    return device_->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue),
+                                       output);
+  });
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
        GraphicsPipelineFailureClearsOutputAndNextCallRecovers) {
   const UINT target =
       ConfiguredOccurrence("DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT");
@@ -331,6 +367,51 @@ TEST_F(D3D12CreationFaultInjectionSpec,
 }
 
 TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedGraphicsPipelineFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated graphics pipeline creation fault is disabled";
+
+  const auto vertex = CompileShader(R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      const float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      return float4(positions[id], 0.0, 1.0);
+    }
+  )", "vs_5_0");
+  const auto pixel = CompileShader(
+      "float4 main() : SV_Target { return float4(1, 1, 1, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  auto root = CreateEmptyRootSignature();
+  ASSERT_TRUE(root);
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root.get();
+  desc.VS = {vertex.bytecode->GetBufferPointer(),
+             vertex.bytecode->GetBufferSize()};
+  desc.PS = {pixel.bytecode->GetBufferPointer(),
+             pixel.bytecode->GetBufferSize()};
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.SampleMask = UINT_MAX;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  ExpectRepeatedFailureThenRecovery(fault, [&](void **output) {
+    return device_->CreateGraphicsPipelineState(
+        &desc, __uuidof(ID3D12PipelineState), output);
+  });
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
        HeapFailureClearsOutputAndNextCallRecovers) {
   const UINT target = ConfiguredOccurrence("DXMT_TEST_FAIL_HEAP_CREATION_AT");
   if (!target)
@@ -352,6 +433,23 @@ TEST_F(D3D12CreationFaultInjectionSpec,
       EXPECT_TRUE(heap);
     }
   }
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedHeapFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_HEAP_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated heap creation fault is disabled";
+
+  D3D12_HEAP_DESC desc = {};
+  desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ExpectRepeatedFailureThenRecovery(fault, [&](void **output) {
+    return device_->CreateHeap(&desc, __uuidof(ID3D12Heap), output);
+  });
   EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -381,6 +479,23 @@ TEST_F(D3D12CreationFaultInjectionSpec,
 }
 
 TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedRootSignatureFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated root signature creation fault is disabled";
+
+  auto blob = SerializeEmptyRootSignature();
+  ASSERT_TRUE(blob);
+  ExpectRepeatedFailureThenRecovery(fault, [&](void **output) {
+    return device_->CreateRootSignature(
+        0, blob->GetBufferPointer(), blob->GetBufferSize(),
+        __uuidof(ID3D12RootSignature), output);
+  });
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
        FenceFailureClearsOutputAndNextCallRecovers) {
   const UINT target = ConfiguredOccurrence("DXMT_TEST_FAIL_FENCE_CREATION_AT");
   if (!target)
@@ -399,6 +514,19 @@ TEST_F(D3D12CreationFaultInjectionSpec,
       EXPECT_EQ(fence->GetCompletedValue(), occurrence);
     }
   }
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedFenceFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_FENCE_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated fence creation fault is disabled";
+
+  ExpectRepeatedFailureThenRecovery(fault, [&](void **output) {
+    return device_->CreateFence(7, D3D12_FENCE_FLAG_NONE,
+                                __uuidof(ID3D12Fence), output);
+  });
   EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -424,6 +552,21 @@ TEST_F(D3D12CreationFaultInjectionSpec,
       EXPECT_TRUE(heap);
     }
   }
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedQueryHeapFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated query heap creation fault is disabled";
+
+  D3D12_QUERY_HEAP_DESC desc = {};
+  desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  desc.Count = 2;
+  ExpectRepeatedFailureThenRecovery(fault, [&](void **output) {
+    return device_->CreateQueryHeap(&desc, __uuidof(ID3D12QueryHeap), output);
+  });
   EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
 }
 

@@ -5,6 +5,7 @@
 #include "shaders/runtime_test_shaders.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -26,6 +27,12 @@ UINT ConfiguredInternalOccurrence(const char *name) {
   const auto parsed = std::strtoul(value, &end, 0);
   return end != value && !*end && parsed <= UINT_MAX ? static_cast<UINT>(parsed)
                                                      : 0;
+}
+
+bool ConfiguredInternalAlways(const char *name) {
+  const char *value = std::getenv(name);
+  return value && (std::strcmp(value, "always") == 0 ||
+                   std::strcmp(value, "all") == 0);
 }
 
 class FaultMarker {
@@ -163,7 +170,29 @@ TEST_F(D3D12InternalFaultInjectionSpec,
 }
 
 TEST_F(D3D12InternalFaultInjectionSpec,
-       MetalPipelineFailureAndLaterPipelineRecovers) {
+       RepeatedAirInitializationFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_AIR_INITIALIZATION_AT";
+  if (!ConfiguredInternalAlways(fault))
+    GTEST_SKIP() << "repeated AIR initialization fault is disabled";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    auto failed_pipeline =
+        CreateWriterPipeline(0x41424344u + attempt * 0x01010101u);
+    EXPECT_FALSE(failed_pipeline) << "attempt=" << attempt;
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  auto recovery_pipeline = CreateWriterPipeline(0x71727374u);
+  ASSERT_TRUE(recovery_pipeline);
+  EXPECT_EQ(ExecuteWriter(recovery_pipeline.get()), 0x71727374u);
+  EXPECT_EQ(marker.Count(fault), 3u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12InternalFaultInjectionSpec,
+       RepeatedMetalPipelineFailuresAndLaterPipelineRecovers) {
   const char *configuration =
       std::getenv("DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT");
   if (!configuration || std::string_view(configuration) != "always")
@@ -171,8 +200,11 @@ TEST_F(D3D12InternalFaultInjectionSpec,
   FaultMarker marker;
   ASSERT_TRUE(marker.Initialize());
 
-  auto failed_pipeline = CreateWriterPipeline(0x11112222u);
-  EXPECT_FALSE(failed_pipeline);
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    auto failed_pipeline =
+        CreateWriterPipeline(0x11112222u + attempt * 0x01010101u);
+    EXPECT_FALSE(failed_pipeline) << "attempt=" << attempt;
+  }
 
   ASSERT_TRUE(SetEnvironmentVariableA(
       "DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT", nullptr));
@@ -180,7 +212,7 @@ TEST_F(D3D12InternalFaultInjectionSpec,
   auto recovery_pipeline = CreateWriterPipeline(0x33334444u);
   ASSERT_TRUE(recovery_pipeline);
   EXPECT_EQ(ExecuteWriter(recovery_pipeline.get()), 0x33334444u);
-  EXPECT_GE(marker.Count("DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT"), 1u);
+  EXPECT_GE(marker.Count("DXMT_TEST_FAIL_METAL_COMPUTE_PIPELINE_AT"), 3u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -258,7 +290,9 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
     ByteAddressBuffer input : register(t0);
     RWByteAddressBuffer output : register(u0);
     [numthreads(1, 1, 1)]
-    void main() { output.Store(0, input.Load(0)); }
+    void main() {
+      output.Store(0, input.Load(0));
+    }
   )",
                                     "cs_5_0");
   ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
@@ -341,6 +375,115 @@ TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
                                ? "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT"
                                : "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT";
   EXPECT_EQ(marker.Count(fault_name), 1u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12DescriptorInternalFaultInjectionSpec,
+       RepeatedDescriptorFailuresFallBackWithoutPartialPublication) {
+  constexpr const char *allocation_fault =
+      "DXMT_TEST_FAIL_DESCRIPTOR_TABLE_ALLOCATION_AT";
+  constexpr const char *residency_fault =
+      "DXMT_TEST_FAIL_RESIDENCY_INSERTION_AT";
+  const bool allocation_active = ConfiguredInternalAlways(allocation_fault);
+  const bool residency_active = ConfiguredInternalAlways(residency_fault);
+  ASSERT_FALSE(allocation_active && residency_active)
+      << "configure only one repeated descriptor fault";
+  if (!allocation_active && !residency_active)
+    GTEST_SKIP() << "repeated descriptor fault injection is disabled";
+  const char *fault = allocation_active ? allocation_fault : residency_fault;
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  constexpr UINT kDescriptorCount = 3;
+  constexpr UINT kInputValue = 0x91a2b3c4u;
+  auto input = context_.CreateUploadBuffer(sizeof(kInputValue), &kInputValue,
+                                           sizeof(kInputValue));
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kDescriptorCount, true);
+  ASSERT_TRUE(input);
+  ASSERT_TRUE(heap);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_TYPELESS;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Buffer.NumElements = 1;
+  srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  for (UINT index = 0; index < kDescriptorCount; ++index) {
+    context_.device()->CreateShaderResourceView(
+        input.get(), &srv, context_.CpuDescriptorHandle(heap.get(), index));
+  }
+  EXPECT_EQ(marker.Count(fault), kDescriptorCount);
+
+  // Keep the fault active through execution. Each failed native table
+  // publication must leave the legacy descriptor intact so all three
+  // dispatches execute exactly once through the fallback path.
+
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  range.NumDescriptors = 1;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[0].DescriptorTable.pDescriptorRanges = &range;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = ARRAYSIZE(parameters);
+  root_desc.pParameters = parameters;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const auto shader = CompileShader(R"(
+    ByteAddressBuffer input : register(t0);
+    RWStructuredBuffer<uint> output : register(u0);
+    [numthreads(1, 1, 1)]
+    void main() {
+      uint original;
+      InterlockedAdd(output[0], input.Load(0), original);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = context_.CreateComputePipeline(
+      root.get(),
+      {shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+
+  const std::array<UINT, kDescriptorCount> initial = {};
+  auto initial_upload = context_.CreateUploadBuffer(
+      sizeof(initial), initial.data(), sizeof(initial));
+  auto output = context_.CreateBuffer(
+      sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(initial_upload);
+  ASSERT_TRUE(output);
+  context_.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
+                                    sizeof(initial));
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  context_.list()->SetComputeRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  for (UINT index = 0; index < kDescriptorCount; ++index) {
+    context_.list()->SetComputeRootDescriptorTable(
+        0, context_.GpuDescriptorHandle(heap.get(), index));
+    context_.list()->SetComputeRootUnorderedAccessView(
+        1, output->GetGPUVirtualAddress() + index * sizeof(UINT));
+    context_.list()->Dispatch(1, 1, 1);
+  }
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), sizeof(initial), &bytes),
+            S_OK);
+  ASSERT_EQ(bytes.size(), sizeof(initial));
+  std::array<UINT, kDescriptorCount> actual = {};
+  std::memcpy(actual.data(), bytes.data(), sizeof(actual));
+  EXPECT_EQ(actual, (std::array<UINT, kDescriptorCount>{
+                        kInputValue, kInputValue, kInputValue}));
+  EXPECT_EQ(marker.Count(fault), kDescriptorCount);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -449,6 +592,108 @@ TEST_F(D3D12MetalObjectFaultInjectionSpec,
     }
   }
   EXPECT_EQ(marker.Count(active->environment), 1u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12MetalObjectFaultInjectionSpec,
+       RepeatedMetalObjectFailuresRecoverAfterFaultIsDisabled) {
+  struct FaultCase {
+    const char *environment;
+    enum Kind { Buffer, Texture, Heap, GraphicsPipeline } kind;
+  };
+  constexpr FaultCase cases[] = {
+      {"DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT", FaultCase::Buffer},
+      {"DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT", FaultCase::Texture},
+      {"DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT", FaultCase::Heap},
+      {"DXMT_TEST_FAIL_METAL_GRAPHICS_PIPELINE_AT",
+       FaultCase::GraphicsPipeline},
+  };
+  const FaultCase *active = nullptr;
+  for (const auto &test : cases) {
+    if (!ConfiguredInternalAlways(test.environment))
+      continue;
+    ASSERT_EQ(active, nullptr) << "configure only one repeated Metal fault";
+    active = &test;
+  }
+  if (!active)
+    GTEST_SKIP() << "repeated Metal object fault injection is disabled";
+  FaultMarker marker;
+  ASSERT_TRUE(marker.Initialize());
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const auto pixel =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+
+  auto create = [&](void **output) {
+    if (active->kind == FaultCase::Buffer ||
+        active->kind == FaultCase::Texture) {
+      D3D12_HEAP_PROPERTIES heap = {};
+      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      D3D12_RESOURCE_DESC desc = {};
+      desc.Dimension = active->kind == FaultCase::Buffer
+                           ? D3D12_RESOURCE_DIMENSION_BUFFER
+                           : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Width = active->kind == FaultCase::Buffer ? 256 : 4;
+      desc.Height = active->kind == FaultCase::Buffer ? 1 : 4;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = active->kind == FaultCase::Buffer
+                        ? DXGI_FORMAT_UNKNOWN
+                        : DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.Layout = active->kind == FaultCase::Buffer
+                        ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                        : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      return context_.device()->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+          nullptr, __uuidof(ID3D12Resource), output);
+    }
+    if (active->kind == FaultCase::Heap) {
+      D3D12_HEAP_DESC desc = {};
+      desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+      desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+      return context_.device()->CreateHeap(&desc, __uuidof(ID3D12Heap),
+                                           output);
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = root.get();
+    desc.VS = dxmt::test::FullscreenVertexShader();
+    desc.PS = {pixel.bytecode->GetBufferPointer(),
+               pixel.bytecode->GetBufferSize()};
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.SampleMask = UINT_MAX;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    return context_.device()->CreateGraphicsPipelineState(
+        &desc, __uuidof(ID3D12PipelineState), output);
+  };
+
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    void *output = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(create(&output), E_OUTOFMEMORY) << "attempt=" << attempt;
+    EXPECT_EQ(output, nullptr) << "attempt=" << attempt;
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(active->environment, nullptr));
+  void *recovered = reinterpret_cast<void *>(uintptr_t{1});
+  ASSERT_EQ(create(&recovered), S_OK);
+  ASSERT_NE(recovered, nullptr);
+  ASSERT_NE(recovered, reinterpret_cast<void *>(uintptr_t{1}));
+  static_cast<IUnknown *>(recovered)->Release();
+  EXPECT_EQ(marker.Count(active->environment), 3u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

@@ -39,7 +39,9 @@ d3d12_unit_suites = {
       'capability/capability_spec.cpp',
       'capability/feature_query_spec.cpp',
       'capability/format_execution_matrix_spec.cpp',
+      'capability/format_msaa_execution_spec.cpp',
       'capability/format_operation_spec.cpp',
+      'capability/format_uav_execution_spec.cpp',
       'capability/optional_feature_gate_spec.cpp',
     ),
   },
@@ -69,7 +71,10 @@ d3d12_unit_suites = {
     ),
   },
   'execution': {
-    'sources': files('execution/path_boundary_spec.cpp'),
+    'sources': files(
+      'execution/path_boundary_spec.cpp',
+      'execution/path_empty_segment_spec.cpp',
+    ),
   },
   'graphics': {
     'sources': files(

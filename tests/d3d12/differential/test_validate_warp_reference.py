@@ -45,9 +45,13 @@ class WarpReferenceValidationTest(unittest.TestCase):
                 "depth_reject_rgba8",
                 "execute_indirect_dispatch",
                 "msaa_resolve_rgba8",
+                "predicated_compute_equal_zero_execute",
+                "predicated_compute_equal_zero_skip",
                 "predicated_compute_false",
                 "predication_disabled_compute",
+                "render_pass_flattened_equivalence",
                 "root_constants_uav",
+                "timestamp_query_ordering",
             }.issubset(VALIDATOR.REQUIRED_CASES)
         )
 
@@ -84,6 +88,56 @@ class WarpReferenceValidationTest(unittest.TestCase):
             "binary_occlusion_nonzero: values do not match the required oracle contract",
             errors,
         )
+
+    def test_rejects_wrong_new_case_lengths_with_valid_hashes(self) -> None:
+        for name, expected_count in VALIDATOR.CASE_VALUE_COUNTS.items():
+            with self.subTest(case=name):
+                snapshot = valid_snapshot()
+                values = snapshot["cases"][name]["values"][:-1]
+                snapshot["cases"][name]["values"] = values
+                snapshot["cases"][name]["hash_fnv1a64"] = VALIDATOR.fnv1a64(
+                    values
+                )
+                errors = VALIDATOR.validate(snapshot)
+                self.assertIn(
+                    f"{name}: values must contain exactly {expected_count} entries",
+                    errors,
+                )
+
+    def test_rejects_invalid_timestamp_predication_and_render_pass_contracts(
+        self,
+    ) -> None:
+        invalid_cases = {
+            "timestamp_query_ordering": (
+                [3, 1, 0, 1],
+                "timestamp_query_ordering: resolved timestamps must be "
+                "transitively nondecreasing",
+            ),
+            "predicated_compute_equal_zero_execute": (
+                list(VALIDATOR.PREDICATION_SENTINEL_VALUES),
+                "predicated_compute_equal_zero_execute: values do not match "
+                "the required oracle contract",
+            ),
+            "predicated_compute_equal_zero_skip": (
+                list(VALIDATOR.COMPUTE_VALUES),
+                "predicated_compute_equal_zero_skip: values do not match the "
+                "required oracle contract",
+            ),
+            "render_pass_flattened_equivalence": (
+                [VALIDATOR.RENDER_PASS_CLEAR_PIXEL] * 31 + [0],
+                "render_pass_flattened_equivalence: render-pass and flattened "
+                "pixels must match",
+            ),
+        }
+        for name, (values, expected_error) in invalid_cases.items():
+            with self.subTest(case=name):
+                snapshot = valid_snapshot()
+                snapshot["cases"][name]["values"] = values
+                snapshot["cases"][name]["hash_fnv1a64"] = VALIDATOR.fnv1a64(
+                    values
+                )
+                errors = VALIDATOR.validate(snapshot)
+                self.assertIn(expected_error, errors)
 
 
 if __name__ == "__main__":
