@@ -201,6 +201,7 @@ d3d12_unit_suites = {
       'shader/geometry_tessellation_spec.cpp',
       'shader/resource_semantic_spec.cpp',
       'shader/semantic_matrix_spec.cpp',
+      'shader/system_value_spec.cpp',
       'shader/wave_spec.cpp',
       'shader/wave_semantic_matrix_spec.cpp',
     ),
