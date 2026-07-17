@@ -1156,6 +1156,24 @@ ValidateRenderTargetView(ID3D12Resource *resource,
     WARN("D3D12Device: RTV multisample dimension does not match resource sample count");
     return false;
   }
+  if (desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D) {
+    if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+        desc.Texture3D.MipSlice >= resource_desc->MipLevels) {
+      WARN("D3D12Device: 3D RTV dimension or mip does not match resource");
+      return false;
+    }
+    const UINT mip_depth =
+        GetTextureMipDepth(*resource_desc, desc.Texture3D.MipSlice);
+    const UINT first_w = desc.Texture3D.FirstWSlice;
+    const UINT w_size = desc.Texture3D.WSize == UINT_MAX
+                            ? (first_w < mip_depth ? mip_depth - first_w : 0)
+                            : desc.Texture3D.WSize;
+    if (first_w >= mip_depth || w_size == 0 || w_size > mip_depth - first_w) {
+      WARN("D3D12Device: invalid 3D RTV W slice range first=", first_w,
+           " size=", w_size, " mip_depth=", mip_depth);
+      return false;
+    }
+  }
   return true;
 }
 
@@ -3960,8 +3978,10 @@ public:
     record->type = DescriptorRecordType::RenderTargetView;
     record->resource = resource;
     if (desc) {
-      if (!ValidateRenderTargetView(resource, *desc))
+      if (!ValidateRenderTargetView(resource, *desc)) {
+        ResetDescriptorRecord(*record);
         return;
+      }
       record->desc.rtv = *desc;
       record->has_desc = true;
     }

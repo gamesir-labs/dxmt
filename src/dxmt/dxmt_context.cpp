@@ -3595,7 +3595,7 @@ ArgumentEncodingContext::retainAllocation(Allocation* allocation) {
 void
 ArgumentEncodingContext::clearColor(
     Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength,
-    WMTClearColor color, bool has_rects) {
+    WMTClearColor color, bool has_rects, uint32_t depth_plane) {
   assert(!encoder_current);
   auto encoder_info = allocate<ClearEncoderData>();
   encoder_info->type = EncoderType::Clear;
@@ -3615,7 +3615,7 @@ ArgumentEncodingContext::clearColor(
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
   encoder_info->level = 0;
   encoder_info->slice = 0;
-  encoder_info->depth_plane = 0;
+  encoder_info->depth_plane = depth_plane;
   encoder_info->stencil_depth_plane = 0;
 
   currentFrameStatistics().clear_pass_count++;
@@ -5862,7 +5862,10 @@ RenderEncoderColorAttachmentData *
 ArgumentEncodingContext::isClearColorSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   for (unsigned i = 0; i < render->render_target_count; i++) {
     auto &attachment = render->colors[i];
-    if (attachment.attachment == clear->attachment) {
+    if (attachment.attachment == clear->attachment &&
+        attachment.level == clear->level &&
+        attachment.slice == clear->slice &&
+        attachment.depth_plane == clear->depth_plane) {
       return &attachment;
     }
     if (attachment.buffer_attachment.ptr() &&

@@ -84,6 +84,43 @@ CheckedEnd(size_t offset, size_t size, size_t limit, size_t &end) {
   return true;
 }
 
+bool CheckedArraySize(uint32_t count, size_t element_size, size_t &size) {
+  if (count && element_size > std::numeric_limits<size_t>::max() / count)
+    return false;
+  size = size_t(count) * element_size;
+  return true;
+}
+
+struct BlobInterval {
+  size_t begin;
+  size_t end;
+  bool exact_alias_allowed;
+};
+
+bool AddDisjointBlobInterval(std::vector<BlobInterval> &intervals,
+                             size_t offset, size_t size, size_t limit,
+                             bool allow_exact_alias = false) {
+  size_t end = 0;
+  if (!CheckedEnd(offset, size, limit, end))
+    return false;
+  if (!size)
+    return true;
+  bool aliases_existing_interval = false;
+  for (const auto &interval : intervals) {
+    if (offset >= interval.end || interval.begin >= end)
+      continue;
+    // Immutable parameter payloads may be shared, but structural regions never
+    // opt in, and a partial overlap is always rejected.
+    if (!allow_exact_alias || !interval.exact_alias_allowed ||
+        offset != interval.begin || end != interval.end)
+      return false;
+    aliases_existing_interval = true;
+  }
+  if (!aliases_existing_interval)
+    intervals.push_back({offset, end, allow_exact_alias});
+  return true;
+}
+
 uint32_t
 VersionValue(D3D_ROOT_SIGNATURE_VERSION version) {
   if (version == D3D_ROOT_SIGNATURE_VERSION_1_2)
@@ -189,6 +226,11 @@ bool ShaderVisibilitiesIntersect(D3D12_SHADER_VISIBILITY lhs,
          rhs == D3D12_SHADER_VISIBILITY_ALL || lhs == rhs;
 }
 
+bool IsValidShaderVisibility(D3D12_SHADER_VISIBILITY visibility) {
+  return visibility >= D3D12_SHADER_VISIBILITY_ALL &&
+         visibility <= D3D12_SHADER_VISIBILITY_MESH;
+}
+
 bool AddRootBinding(std::vector<RootBindingInterval> &bindings,
                     D3D12_DESCRIPTOR_RANGE_TYPE type, UINT register_space,
                     UINT first_register, UINT descriptor_count,
@@ -197,7 +239,9 @@ bool AddRootBinding(std::vector<RootBindingInterval> &bindings,
       type > D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER || !descriptor_count)
     return false;
   const uint64_t end_register =
-      uint64_t(first_register) + uint64_t(descriptor_count);
+      descriptor_count == UINT_MAX
+          ? uint64_t(UINT_MAX) + 1
+          : uint64_t(first_register) + uint64_t(descriptor_count);
   if (end_register > uint64_t(UINT_MAX) + 1)
     return false;
   for (const auto &binding : bindings) {
@@ -230,32 +274,47 @@ RootParameterRangeType(D3D12_ROOT_PARAMETER_TYPE type) {
 
 template <typename RootSignatureDesc>
 bool ValidateRootBindingLayout(const RootSignatureDesc &desc) {
+  struct TableInterval {
+    D3D12_DESCRIPTOR_RANGE_TYPE type;
+    uint64_t first;
+    uint64_t end;
+  };
   std::vector<RootBindingInterval> bindings;
   for (UINT parameter_index = 0; parameter_index < desc.NumParameters;
        parameter_index++) {
     const auto &parameter = desc.pParameters[parameter_index];
     if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-      std::vector<std::pair<uint64_t, uint64_t>> table_intervals;
+      std::vector<TableInterval> table_intervals;
       uint64_t append_offset = 0;
+      bool has_unbounded_range = false;
       for (UINT range_index = 0;
            range_index < parameter.DescriptorTable.NumDescriptorRanges;
            range_index++) {
         const auto &range =
             parameter.DescriptorTable.pDescriptorRanges[range_index];
+        if (has_unbounded_range &&
+            range.OffsetInDescriptorsFromTableStart ==
+                D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+          return false;
         const uint64_t table_offset =
             range.OffsetInDescriptorsFromTableStart ==
                     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
                 ? append_offset
                 : range.OffsetInDescriptorsFromTableStart;
-        const uint64_t table_end = table_offset + uint64_t(range.NumDescriptors);
+        const uint64_t table_end =
+            range.NumDescriptors == UINT_MAX
+                ? uint64_t(UINT_MAX) + 1
+                : table_offset + uint64_t(range.NumDescriptors);
         if (table_end > uint64_t(UINT_MAX) + 1)
           return false;
-        for (const auto &[first, end] : table_intervals) {
-          if (table_offset < end && first < table_end)
+        for (const auto &interval : table_intervals) {
+          if (interval.type != range.RangeType &&
+              table_offset < interval.end && interval.first < table_end)
             return false;
         }
-        table_intervals.emplace_back(table_offset, table_end);
+        table_intervals.push_back({range.RangeType, table_offset, table_end});
         append_offset = table_end;
+        has_unbounded_range |= range.NumDescriptors == UINT_MAX;
         if (!AddRootBinding(bindings, range.RangeType, range.RegisterSpace,
                             range.BaseShaderRegister, range.NumDescriptors,
                             parameter.ShaderVisibility))
@@ -375,6 +434,8 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
 
   for (UINT i = 0; i < desc.NumParameters; i++) {
     const auto &parameter = desc.pParameters[i];
+    if (!IsValidShaderVisibility(parameter.ShaderVisibility))
+      return false;
     if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
         parameter.DescriptorTable.NumDescriptorRanges &&
         !parameter.DescriptorTable.pDescriptorRanges)
@@ -395,6 +456,11 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
       if (sampler && non_sampler)
         return false;
     }
+  }
+
+  for (UINT i = 0; i < desc.NumStaticSamplers; i++) {
+    if (!IsValidShaderVisibility(desc.pStaticSamplers[i].ShaderVisibility))
+      return false;
   }
 
   uint64_t root_cost = 0;
@@ -431,6 +497,8 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
 
   for (UINT i = 0; i < desc.NumParameters; i++) {
     const auto &parameter = desc.pParameters[i];
+    if (!IsValidShaderVisibility(parameter.ShaderVisibility))
+      return false;
     if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
         parameter.DescriptorTable.NumDescriptorRanges &&
         !parameter.DescriptorTable.pDescriptorRanges)
@@ -451,6 +519,11 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
       if (sampler && non_sampler)
         return false;
     }
+  }
+
+  for (UINT i = 0; i < desc.NumStaticSamplers; i++) {
+    if (!IsValidShaderVisibility(desc.pStaticSamplers[i].ShaderVisibility))
+      return false;
   }
 
   uint64_t root_cost = 0;
@@ -673,18 +746,29 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
   const auto sampler_count = ReadU32(rts0, 12);
   const auto sampler_offset = ReadU32(rts0, 16);
   const auto flags = D3D12_ROOT_SIGNATURE_FLAGS(ReadU32(rts0, 20));
-  size_t end = 0;
+  size_t array_size = 0;
+  std::vector<BlobInterval> intervals;
+  intervals.reserve(3);
+  // Every legal root parameter costs at least one DWORD, so a count above the
+  // architectural root-cost limit can be rejected before any attacker-sized
+  // storage allocation.
+  if (parameter_count > D3D12_MAX_ROOT_COST)
+    return false;
+  if (!AddDisjointBlobInterval(intervals, 0, kRts0HeaderSize, rts0.size()))
+    return false;
 
   if (parameter_count) {
-    if (!CheckedEnd(parameter_offset,
-                    size_t(parameter_count) * kRts0ParameterHeaderSize,
-                    rts0.size(), end))
+    if (!CheckedArraySize(parameter_count, kRts0ParameterHeaderSize,
+                          array_size) ||
+        !AddDisjointBlobInterval(intervals, parameter_offset, array_size,
+                                 rts0.size()))
       return false;
   }
 
   if (sampler_count) {
-    if (!CheckedEnd(sampler_offset, size_t(sampler_count) * kRts0StaticSamplerSize,
-                    rts0.size(), end))
+    if (!CheckedArraySize(sampler_count, kRts0StaticSamplerSize, array_size) ||
+        !AddDisjointBlobInterval(intervals, sampler_offset, array_size,
+                                 rts0.size()))
       return false;
   }
 
@@ -714,15 +798,17 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
 
     switch (parameter_type) {
     case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
-      if (!CheckedEnd(data_offset, kRts0DescriptorTableHeaderSize,
-                      rts0.size(), end))
+      if (!AddDisjointBlobInterval(intervals, data_offset,
+                                   kRts0DescriptorTableHeaderSize, rts0.size(),
+                                   true))
         return false;
       const auto range_count = ReadU32(rts0, data_offset + 0);
       const auto ranges_offset = ReadU32(rts0, data_offset + 4);
       const auto range_size = version_value == 2 ? kRts0DescriptorRange1Size
                                                  : kRts0DescriptorRange0Size;
-      if (!CheckedEnd(ranges_offset, size_t(range_count) * range_size,
-                      rts0.size(), end))
+      if (!CheckedArraySize(range_count, range_size, array_size) ||
+          !AddDisjointBlobInterval(intervals, ranges_offset, array_size,
+                                   rts0.size(), true))
         return false;
 
       storage.ranges_1_0[i].reserve(range_count);
@@ -759,7 +845,8 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
       break;
     }
     case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
-      if (!CheckedEnd(data_offset, kRts0RootConstantsSize, rts0.size(), end))
+      if (!AddDisjointBlobInterval(intervals, data_offset,
+                                   kRts0RootConstantsSize, rts0.size(), true))
         return false;
       param0.Constants.ShaderRegister = ReadU32(rts0, data_offset + 0);
       param0.Constants.RegisterSpace = ReadU32(rts0, data_offset + 4);
@@ -771,7 +858,8 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
     case D3D12_ROOT_PARAMETER_TYPE_UAV: {
       const auto descriptor_size = version_value == 2 ? kRts0RootDescriptor1Size
                                                       : kRts0RootDescriptor0Size;
-      if (!CheckedEnd(data_offset, descriptor_size, rts0.size(), end))
+      if (!AddDisjointBlobInterval(intervals, data_offset, descriptor_size,
+                                   rts0.size(), true))
         return false;
       const auto shader_register = ReadU32(rts0, data_offset + 0);
       const auto register_space = ReadU32(rts0, data_offset + 4);
@@ -810,6 +898,12 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
   }
 
   storage.fixPointers();
+  if (storage.version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+    if (!ValidateDesc0(storage.desc_1_0))
+      return false;
+  } else if (!ValidateDesc1(storage.desc_1_1)) {
+    return false;
+  }
   BuildBindingParameters(storage);
   return true;
 }

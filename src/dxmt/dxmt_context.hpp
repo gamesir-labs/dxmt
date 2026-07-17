@@ -1008,7 +1008,8 @@ public:
   };
 
   void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength,
-                  WMTClearColor color, bool has_rects = false);
+                  WMTClearColor color, bool has_rects = false,
+                  uint32_t depth_plane = 0);
   void clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width,
                   WMTClearColor color, bool has_rects = false);
   void clearDepthStencil(

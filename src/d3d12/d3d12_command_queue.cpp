@@ -77,6 +77,7 @@ static UINT GetResourceMipLevelCount(const Resource &resource);
 static UINT GetResourceArraySliceCount(const Resource &resource);
 static UINT GetSubresourceIndex(const Resource &resource, UINT subresource);
 static UINT GetSubresourcePlane(const Resource &resource, UINT subresource);
+static UINT GetMipDepth(const Resource &resource, UINT mip_slice);
 
 static UINT GetMipLevel(const Resource &resource, UINT subresource);
 static UINT GetArraySlice(const Resource &resource, UINT subresource);
@@ -2830,6 +2831,16 @@ CreateRenderTargetView(WMT::Device device, Resource &resource,
       return {};
 
     switch (rtv.ViewDimension) {
+    case D3D12_RTV_DIMENSION_TEXTURE1D:
+      view.type = WMTTextureType2D;
+      view.firstMiplevel = rtv.Texture1D.MipSlice;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+      view.type = WMTTextureType2DArray;
+      view.firstMiplevel = rtv.Texture1DArray.MipSlice;
+      view.firstArraySlice = rtv.Texture1DArray.FirstArraySlice;
+      view.arraySize = rtv.Texture1DArray.ArraySize;
+      break;
     case D3D12_RTV_DIMENSION_TEXTURE2D:
       view.firstMiplevel = rtv.Texture2D.MipSlice;
       break;
@@ -2846,6 +2857,12 @@ CreateRenderTargetView(WMT::Device device, Resource &resource,
       view.type = WMTTextureType2DMultisampleArray;
       view.firstArraySlice = rtv.Texture2DMSArray.FirstArraySlice;
       view.arraySize = rtv.Texture2DMSArray.ArraySize;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE3D:
+      view.type = WMTTextureType3D;
+      view.firstMiplevel = rtv.Texture3D.MipSlice;
+      view.firstArraySlice = 0;
+      view.arraySize = 1;
       break;
     default:
       break;
@@ -2923,18 +2940,41 @@ CreateDepthStencilView(WMT::Device device, Resource &resource,
 }
 
 static UINT
-GetRenderTargetArrayLength(const DescriptorRecord &descriptor) {
-  if (!descriptor.has_desc)
+GetRenderTargetArrayLength(Resource &resource,
+                           const DescriptorRecord &descriptor) {
+  if (!descriptor.has_desc) {
+    const auto &resource_desc = resource.GetResourceDesc();
+    if (resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+      return GetMipDepth(resource, 0);
+    if (resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+        resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+      return resource_desc.DepthOrArraySize;
     return 1;
+  }
 
   switch (descriptor.desc.rtv.ViewDimension) {
+  case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+    return descriptor.desc.rtv.Texture1DArray.ArraySize;
   case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
     return descriptor.desc.rtv.Texture2DArray.ArraySize;
   case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
     return descriptor.desc.rtv.Texture2DMSArray.ArraySize;
+  case D3D12_RTV_DIMENSION_TEXTURE3D: {
+    const auto &texture3d = descriptor.desc.rtv.Texture3D;
+    const UINT depth = GetMipDepth(resource, texture3d.MipSlice);
+    return NormalizeViewCount(texture3d.WSize, texture3d.FirstWSlice, depth);
+  }
   default:
     return 1;
   }
+}
+
+static UINT
+GetRenderTargetDepthPlane(const DescriptorRecord &descriptor) {
+  return descriptor.has_desc && descriptor.desc.rtv.ViewDimension ==
+                                    D3D12_RTV_DIMENSION_TEXTURE3D
+             ? descriptor.desc.rtv.Texture3D.FirstWSlice
+             : 0;
 }
 
 static bool
@@ -3000,6 +3040,8 @@ GetDepthStencilArrayLength(Resource &resource, const DescriptorRecord &descripto
     return resource.GetTexture() ? resource.GetTexture()->arrayLength() : 1;
 
   switch (descriptor.desc.dsv.ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+    return descriptor.desc.dsv.Texture1DArray.ArraySize;
   case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
     return descriptor.desc.dsv.Texture2DArray.ArraySize;
   case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
@@ -5826,6 +5868,7 @@ private:
     TextureViewKey view = {};
     UINT slot = 0;
     UINT array_length = 1;
+    UINT depth_plane = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     WMTPixelFormat format = WMTPixelFormatInvalid;
@@ -6527,7 +6570,8 @@ private:
       const auto &a = lhs.colors[i];
       const auto &b = rhs.colors[i];
       if (a.slot != b.slot || a.array_length != b.array_length ||
-          a.width != b.width || a.height != b.height || a.format != b.format ||
+          a.depth_plane != b.depth_plane || a.width != b.width ||
+          a.height != b.height || a.format != b.format ||
           a.texture.ptr() != b.texture.ptr() ||
           uint64_t(a.view) != uint64_t(b.view))
         return false;
@@ -20280,7 +20324,8 @@ private:
           .texture = texture,
           .view = view,
           .slot = i,
-          .array_length = GetRenderTargetArrayLength(descriptor),
+          .array_length = GetRenderTargetArrayLength(*resource, descriptor),
+          .depth_plane = GetRenderTargetDepthPlane(descriptor),
           .width = texture->width(view),
           .height = texture->height(view),
           .format = texture->pixelFormat(view),
@@ -20361,7 +20406,7 @@ private:
           rtv.texture, rtv.view, ResourceAccess::ReadWrite);
       color.load_action = WMTLoadActionLoad;
       color.store_action = WMTStoreActionStore;
-      color.depth_plane = 0;
+      color.depth_plane = rtv.depth_plane;
       info.tile_barrier_pso_key.color_formats[rtv.slot] = rtv.format;
     }
 
@@ -20373,9 +20418,8 @@ private:
         depth.attachment = enc.access<PipelineStage::Pixel>(
             attachments.depth_stencil->texture, attachments.depth_stencil->view,
             attachments.depth_stencil->depth_access);
-        TextureViewKey view = attachments.depth_stencil->view;
-        depth.level = view.mip_start;
-        depth.slice = view.array_start;
+        depth.level = 0;
+        depth.slice = 0;
         depth.depth_plane = 0;
         depth.load_action = WMTLoadActionLoad;
         depth.store_action = WMTStoreActionStore;
@@ -20385,9 +20429,8 @@ private:
         stencil.attachment = enc.access<PipelineStage::Pixel>(
             attachments.depth_stencil->texture, attachments.depth_stencil->view,
             attachments.depth_stencil->stencil_access);
-        TextureViewKey view = attachments.depth_stencil->view;
-        stencil.level = view.mip_start;
-        stencil.slice = view.array_start;
+        stencil.level = 0;
+        stencil.slice = 0;
         stencil.depth_plane = 0;
         stencil.load_action = WMTLoadActionLoad;
         stencil.store_action = WMTStoreActionStore;
@@ -23389,20 +23432,25 @@ private:
     auto view = CreateRenderTargetView(device_->GetMTLDevice(), *resource,
                                        record.descriptor);
     TrackPresentSourceRenderTargetView(*resource, view);
-    const UINT array_length = GetRenderTargetArrayLength(record.descriptor);
+    const UINT array_length =
+        GetRenderTargetArrayLength(*resource, record.descriptor);
+    const UINT depth_plane = GetRenderTargetDepthPlane(record.descriptor);
     WMTClearColor color = {record.color[0], record.color[1], record.color[2],
                            record.color[3]};
     if (record.rects.empty()) {
       chunk->emitcc([texture = std::move(texture), view, array_length,
-                     color](ArgumentEncodingContext &enc) mutable {
-        enc.clearColor(std::move(texture), view, array_length, color);
+                     depth_plane, color](ArgumentEncodingContext &enc) mutable {
+        enc.clearColor(std::move(texture), view, array_length, color, false,
+                       depth_plane);
       });
       return;
     }
 
-    chunk->emitcc([texture = std::move(texture), view, color = record.color,
+    chunk->emitcc([texture = std::move(texture), view, array_length,
+                   depth_plane, color = record.color,
                    rects = record.rects](ArgumentEncodingContext &enc) mutable {
-      enc.clear_rt_cmd.begin(std::move(texture), view);
+      enc.clear_rt_cmd.begin(std::move(texture), view, 0, 0, depth_plane,
+                             array_length);
       for (const auto &rect : rects) {
         if (rect.right <= rect.left || rect.bottom <= rect.top)
           continue;

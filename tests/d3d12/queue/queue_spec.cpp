@@ -2136,8 +2136,10 @@ TEST_F(D3D12QueueSpec, QueueDestructionCanRaceFenceWaitCallbackArming) {
   }
 }
 
-TEST(D3D12QueueErrorSpec,
-     CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions) {
+class D3D12QueueErrorSpec : public ::testing::Test {};
+
+DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
+                   CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions) {
   ScopedCommandBufferErrorMarker marker;
   ScopedMetal4RejectionMarker rejection_marker;
   D3D12TestContext context;

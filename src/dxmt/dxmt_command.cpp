@@ -166,7 +166,8 @@ ClearRenderTargetContext::ClearRenderTargetContext(
 void
 ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view,
                                 unsigned depth_stencil_flags,
-                                uint8_t stencil) {
+                                uint8_t stencil, uint32_t depth_plane,
+                                uint32_t render_target_array_length) {
   assert(!clearing_texture_);
 
   WMT::Reference<WMT::Error> err;
@@ -217,7 +218,8 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view,
 
   auto width = texture->width(view);
   auto height = texture->height(view);
-  auto array_length = texture->arrayLength(view);
+  if (!render_target_array_length)
+    render_target_array_length = texture->arrayLength(view);
   auto &pass_info = *ctx_.startRenderPass(
       dsv_flag, dsv_flag & ~depth_stencil_flags, 1, 0);
 
@@ -226,7 +228,7 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view,
       auto &depth = pass_info.depth;
       depth.attachment = ctx_.access<PipelineStage::Pixel>(
           texture, view, ResourceAccess::Write);
-      depth.depth_plane = 0;
+      depth.depth_plane = depth_plane;
       depth.load_action = WMTLoadActionLoad;
       depth.store_action = WMTStoreActionStore;
     }
@@ -234,21 +236,21 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view,
       auto &stencil_attachment = pass_info.stencil;
       stencil_attachment.attachment = ctx_.access<PipelineStage::Pixel>(
           texture, view, ResourceAccess::Write);
-      stencil_attachment.depth_plane = 0;
+      stencil_attachment.depth_plane = depth_plane;
       stencil_attachment.load_action = WMTLoadActionLoad;
       stencil_attachment.store_action = WMTStoreActionStore;
     }
   } else {
     auto &color = pass_info.colors[0];
     color.attachment = ctx_.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
-    color.depth_plane = 0;
+    color.depth_plane = depth_plane;
     color.load_action = WMTLoadActionLoad;
     color.store_action = WMTStoreActionStore;
   }
 
   pass_info.render_target_width = width;
   pass_info.render_target_height = height;
-  pass_info.render_target_array_length = array_length;
+  pass_info.render_target_array_length = render_target_array_length;
   pass_info.default_raster_sample_count = texture->sampleCount();
 
   auto &setpso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();

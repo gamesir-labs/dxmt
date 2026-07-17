@@ -72,12 +72,14 @@ d3d12_unit_suites = {
       'descriptor/sampler_spec.cpp',
       'descriptor/table_binding_spec.cpp',
       'descriptor/texture_view_dimension_spec.cpp',
+      'descriptor/rtv_dsv_dimension_spec.cpp',
     ),
   },
   'execution': {
     'sources': files(
       'execution/path_boundary_spec.cpp',
       'execution/path_empty_segment_spec.cpp',
+      'execution/path_mode_parity_spec.cpp',
       'execution/path_root_descriptor_spec.cpp',
     ),
   },
