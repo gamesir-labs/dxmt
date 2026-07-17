@@ -13,8 +13,8 @@
 - 112 个已注册的 D3D12 `_spec.cpp` 文件；
 - 700+ 个静态 GoogleTest 声明，另有参数矩阵生成的逻辑 case；
 - 21 个 D3D12 测试目录；
-- public API coverage manifest 审阅时只列出 85 个方法；第一轮已扩展到
-  96 个，但距离完整 COM surface 仍有缺口。
+- public API coverage manifest 审阅时只列出 85 个方法；第一轮扩展到
+  96 个，第二轮扩展到 110 个，但距离完整 COM surface 仍有缺口。
 
 下一批不应继续优先堆叠已有的 descriptor/copy 基础 case，而应补以下三类空洞：
 
@@ -26,7 +26,7 @@
 
 ### P0-1. 建立完整 Public API Surface Manifest
 
-`tests/coverage/d3d12_coverage.json` 审阅时只登记 85 个 API，未覆盖大量已经出现在当前 COM vtable 中的方法。第一轮已补入 11 个 versioned device/resource API；后续继续把 manifest 扩展为当前 headers/实现的完整清单，再允许以“API coverage 100%”作为门槛。
+`tests/coverage/d3d12_coverage.json` 审阅时只登记 85 个 API，未覆盖大量已经出现在当前 COM vtable 中的方法。第一轮补入 11 个 versioned device/resource API；第二轮补入 custom/existing heap、device control、marker/event 和 optional command API，当前共 110 个。后续继续把 manifest 扩展为当前 headers/实现的完整清单，再允许以“API coverage 100%”作为门槛。
 
 每个公开方法必须归入原计划定义的 A/B/C 之一：
 
@@ -40,7 +40,8 @@
 tests/d3d12/device/versioned_api_spec.cpp
 tests/d3d12/device/device_control_spec.cpp
 tests/d3d12/resource/versioned_resource_spec.cpp
-tests/d3d12/command/optional_command_contract_spec.cpp
+tests/d3d12/resource/existing_heap_spec.cpp
+tests/d3d12/command/marker_event_spec.cpp
 ```
 
 首批补齐的方法：
@@ -82,6 +83,22 @@ MarkerEventSpec.MarkersDoNotChangeExecutionOrCommandListState
 ```
 
 完成标准：manifest 中当前公开方法 100% 被分类；不能再用“测试源码中出现过方法名”代替行为覆盖。
+
+截至第二轮已完成：
+
+```text
+第一轮：11 个 versioned device/resource API case，manifest 85 -> 96
+第二轮：12 个 custom/existing heap、device control、marker/event case，
+        manifest 96 -> 110
+GetCustomHeapProperties：修正并覆盖 CUSTOM type、UMA page/pool 和 NodeMask
+OpenExistingHeapFromAddress：覆盖有效 VirtualAlloc -> placed buffer -> GPU copy
+OpenExistingHeapFromFileMapping / CreateLifetimeTracker：覆盖 fail-closed 和输出清空
+CheckDriverMatchingIdentifier：与未宣称 Raytracing capability 保持一致
+SetMarker / BeginEvent / EndEvent：list 和 queue 均覆盖执行与 fence 不变
+SetViewInstanceMask / SetProtectedResourceSession(nullptr)：覆盖合法执行不变
+```
+
+`RemoveDevice` 不能按当前 no-op 行为固化；规范要求进入真正的 device-removed 状态并唤醒 monitored fence，因此保留到 P0-4 的完整状态机一并实现和测试。
 
 ### P0-2. Enhanced Barrier 从冒烟测试升级为完整生成矩阵
 

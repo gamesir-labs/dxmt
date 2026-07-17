@@ -21,6 +21,7 @@ d3d12_unit_suites = {
   'device': {
     'sources': files(
       'device/agility_core_spec.cpp',
+      'device/device_control_spec.cpp',
       'device/device_spec.cpp',
       'device/versioned_api_spec.cpp',
     ),
@@ -54,6 +55,7 @@ d3d12_unit_suites = {
       'command/bundle_legality_spec.cpp',
       'command/list_lifecycle_spec.cpp',
       'command/list_state_spec.cpp',
+      'command/marker_event_spec.cpp',
       'command/state_machine_spec.cpp',
       'command/type_legality_spec.cpp',
     ),
@@ -184,6 +186,7 @@ d3d12_unit_suites = {
   'resource': {
     'sources': files(
       'resource/planar_format_spec.cpp',
+      'resource/existing_heap_spec.cpp',
       'resource/residency_spec.cpp',
       'resource/resource_spec.cpp',
       'resource/validation_memory_spec.cpp',

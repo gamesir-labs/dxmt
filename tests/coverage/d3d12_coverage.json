@@ -311,11 +311,17 @@
           "CreateReservedResource1",
           "GetResourceAllocationInfo",
           "GetResourceAllocationInfo2",
+          "GetCustomHeapProperties",
           "GetCopyableFootprints",
           "GetResourceTiling",
           "GetProtectedResourceSession",
+          "OpenExistingHeapFromAddress",
+          "OpenExistingHeapFromFileMapping",
           "MakeResident",
           "Evict",
+          "SetStablePowerState",
+          "CreateLifetimeTracker",
+          "CheckDriverMatchingIdentifier",
           "SetBackgroundProcessingMode"
         ]
       },
@@ -386,9 +392,14 @@
           "EndQuery",
           "ResolveQueryData",
           "SetPredication",
+          "SetMarker",
+          "BeginEvent",
+          "EndEvent",
           "ExecuteIndirect",
           "DiscardResource",
-          "WriteBufferImmediate"
+          "WriteBufferImmediate",
+          "SetViewInstanceMask",
+          "SetProtectedResourceSession"
         ]
       },
       "queue-and-fence": {
@@ -399,6 +410,9 @@
           "Wait",
           "GetTimestampFrequency",
           "GetClockCalibration",
+          "SetMarker",
+          "BeginEvent",
+          "EndEvent",
           "UpdateTileMappings",
           "CopyTileMappings",
           "GetCompletedValue",

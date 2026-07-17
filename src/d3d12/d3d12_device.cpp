@@ -427,12 +427,6 @@ MipSize(UINT64 value, UINT mip_slice) {
 }
 
 static bool
-IsCpuVisibleHeap(D3D12_HEAP_TYPE heap_type) {
-  return heap_type == D3D12_HEAP_TYPE_UPLOAD ||
-         heap_type == D3D12_HEAP_TYPE_READBACK;
-}
-
-static bool
 IsAbstractedCpuVisibleHeap(const D3D12_HEAP_PROPERTIES &properties) {
   return properties.Type == D3D12_HEAP_TYPE_UPLOAD ||
          properties.Type == D3D12_HEAP_TYPE_READBACK;
@@ -5704,15 +5698,31 @@ private:
 #endif
 
   D3D12_HEAP_PROPERTIES
-  GetCustomHeapPropertiesImpl(UINT node_mask, D3D12_HEAP_TYPE heap_type) const {
+  GetCustomHeapPropertiesImpl(UINT node_mask, D3D12_HEAP_TYPE heap_type) {
     D3D12_HEAP_PROPERTIES properties = {};
-    properties.Type = heap_type;
+    const bool unified_memory = GetMTLDevice().hasUnifiedMemory();
+    properties.Type = D3D12_HEAP_TYPE_CUSTOM;
     properties.CreationNodeMask = node_mask ? node_mask : 1;
     properties.VisibleNodeMask = node_mask ? node_mask : 1;
-    properties.CPUPageProperty = IsCpuVisibleHeap(heap_type) ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
-                                                             : D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
-    properties.MemoryPoolPreference = IsCpuVisibleHeap(heap_type) ? D3D12_MEMORY_POOL_L0
-                                                                  : D3D12_MEMORY_POOL_L1;
+    switch (heap_type) {
+    case D3D12_HEAP_TYPE_DEFAULT:
+      properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+      properties.MemoryPoolPreference =
+          unified_memory ? D3D12_MEMORY_POOL_L0 : D3D12_MEMORY_POOL_L1;
+      break;
+    case D3D12_HEAP_TYPE_UPLOAD:
+      properties.CPUPageProperty =
+          unified_memory ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+                         : D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+      properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+      break;
+    case D3D12_HEAP_TYPE_READBACK:
+      properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+      properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+      break;
+    default:
+      break;
+    }
     return properties;
   }
 
