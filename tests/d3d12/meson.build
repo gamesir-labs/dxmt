@@ -106,6 +106,7 @@ d3d12_unit_suites = {
       'integration/batched_matrix_spec.cpp',
       'integration/frame_spec.cpp',
       'integration/logical_case_matrix_spec.cpp',
+      'integration/swapchain_frame_semantics_spec.cpp',
       'integration/swapchain_spec.cpp',
     ),
   },

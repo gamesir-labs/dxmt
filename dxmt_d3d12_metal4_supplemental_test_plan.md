@@ -93,13 +93,27 @@ MarkerEventSpec.MarkersDoNotChangeExecutionOrCommandListState
         manifest 96 -> 110
 第三轮：9 个 raytracing/VRS/protected/state-object fail-closed case，
         manifest 110 -> 137
+第四轮：7 个 swapchain frame/lifecycle/contract case；DXGI 不计入 D3D12
+        public API manifest，manifest 保持 137
 GetCustomHeapProperties：修正并覆盖 CUSTOM type、UMA page/pool 和 NodeMask
 OpenExistingHeapFromAddress：覆盖有效 VirtualAlloc -> placed buffer -> GPU copy
 OpenExistingHeapFromFileMapping / CreateLifetimeTracker：覆盖 fail-closed 和输出清空
 CheckDriverMatchingIdentifier：与未宣称 Raytracing capability 保持一致
 SetMarker / BeginEvent / EndEvent：list 和 queue 均覆盖执行与 fence 不变
 SetViewInstanceMask / SetProtectedResourceSession(nullptr)：覆盖合法执行不变
+Present：覆盖 prior queue rendering 顺序与 3 个在途 back buffer 内容隔离
+ResizeBuffers：覆盖失败原子性及 GPU 完成、引用释放后的完整重建
+Swapchain state：覆盖 source/background/rotation/matrix/fullscreen round-trip
+Occlusion/creation：用测试注入覆盖遮挡不推进，以及 device/非法 descriptor
+fail-closed；真实 SW_MINIMIZE/窗口脱离仅允许在隔离图形会话或 VM 执行
 ```
+
+第四轮运行安全说明：首次 16 条 swapchain 定向运行中，除
+`ResizeAfterGpuCompletionRecreatesAllBuffers` 暴露 trailing barrier 内部引用
+误判外，其余 15 条通过；修复后该失败 case 单独通过。随后聚合重跑在宿主
+WindowServer 的 detached Metal layer/shared-event 路径触发系统组件断言，因此
+不再在当前桌面会话复现。真实窗口最小化已经改为测试注入；最终聚合运行门槛
+保留给隔离登录会话或 VM，宿主机只执行编译、静态检查和非 presentation 测试。
 
 `RemoveDevice` 不能按当前 no-op 行为固化；规范要求进入真正的 device-removed 状态并唤醒 monitored fence，因此保留到 P0-4 的完整状态机一并实现和测试。
 

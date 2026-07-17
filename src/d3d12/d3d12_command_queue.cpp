@@ -2325,6 +2325,12 @@ GetD3D12SwapChainLayerColorSpace(DXGI_FORMAT format,
 static constexpr UINT D3D12SupportedPresentFlags =
     DXGI_PRESENT_TEST | DXGI_PRESENT_ALLOW_TEARING;
 
+static bool IsSwapChainOcclusionForcedForTesting() {
+  // Real window minimization exercises the host WindowServer. Keep the unit
+  // oracle deterministic and leave the production path unchanged by default.
+  return env::getEnvVar("DXMT_TEST_FORCE_SWAPCHAIN_OCCLUDED") == "1";
+}
+
 static constexpr UINT D3D12SupportedSwapChainFlags =
     DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH |
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
@@ -5146,6 +5152,9 @@ public:
   }
 
 private:
+  bool PrepareSwapChainResize(
+      const std::vector<Com<ID3D12Resource>> &backbuffers);
+
   class SwapChainImpl final : public ComObjectWithInitialRef<IDXGISwapChain4> {
   public:
     SwapChainImpl(CommandQueueImpl *queue, IDXGIFactory1 *factory, HWND hWnd,
@@ -5338,15 +5347,15 @@ private:
       }
       const WMTColorSpace new_color_space =
           GetD3D12SwapChainLayerColorSpace(new_format, color_space_);
-      if (HasExternalBackBufferReferences()) {
-        WARN("D3D12SwapChain::ResizeBuffers: backbuffer references are still "
-             "held by the application");
-        return DXGI_ERROR_INVALID_CALL;
-      }
       if (flags & ~D3D12SupportedSwapChainFlags) {
         WARN("D3D12SwapChain::ResizeBuffers: unsupported flags ",
              flags & ~D3D12SupportedSwapChainFlags);
         return DXGI_ERROR_UNSUPPORTED;
+      }
+      if (!queue_->PrepareSwapChainResize(backbuffers_)) {
+        WARN("D3D12SwapChain::ResizeBuffers: backbuffer references are still "
+             "held by the application");
+        return DXGI_ERROR_INVALID_CALL;
       }
 
       desc_.BufferCount = buffer_count;
@@ -5506,7 +5515,8 @@ private:
         return trace_present_return(DXGI_ERROR_UNSUPPORTED);
       }
 
-      bool occluded = wsi::isMinimized(hWnd_);
+      const bool occluded = IsSwapChainOcclusionForcedForTesting() ||
+                            wsi::isMinimized(hWnd_);
       HRESULT hr = occluded ? DXGI_STATUS_OCCLUDED : S_OK;
       if (flags & DXGI_PRESENT_TEST)
         return trace_present_return(hr);
@@ -5837,18 +5847,6 @@ private:
             double(current_mode.refreshRate.numerator) /
             double(current_mode.refreshRate.denominator);
       }
-    }
-
-    bool HasExternalBackBufferReferences() {
-      for (auto &backbuffer : backbuffers_) {
-        if (!backbuffer)
-          continue;
-        ULONG ref_count = backbuffer->AddRef();
-        backbuffer->Release();
-        if (ref_count > 2)
-          return true;
-      }
-      return false;
     }
 
     HRESULT GetOutputFromMonitor(HMONITOR monitor, IDXGIOutput **output) {
@@ -24541,6 +24539,55 @@ private:
   dxmt::thread submission_worker_;
   std::string name_;
 };
+
+bool CommandQueueImpl::PrepareSwapChainResize(
+    const std::vector<Com<ID3D12Resource>> &backbuffers) {
+  std::unique_lock queue_lock(resource_states_->dxmt_queue_mutex);
+
+  std::unordered_set<ID3D12Resource *> backbuffer_set;
+  backbuffer_set.reserve(backbuffers.size());
+  for (const auto &backbuffer : backbuffers) {
+    if (backbuffer)
+      backbuffer_set.insert(backbuffer.ptr());
+  }
+
+  ResourceAccessBarrierBatch detached;
+  ResourceAccessBarrierBatch remaining;
+  remaining.needs_separator = pending_queue_resource_barriers_.needs_separator;
+  for (auto &entry : pending_queue_resource_barriers_.entries) {
+    if (backbuffer_set.count(entry.d3d_resource.ptr()))
+      detached.entries.push_back(std::move(entry));
+    else
+      remaining.entries.push_back(std::move(entry));
+  }
+  pending_queue_resource_barriers_ = std::move(remaining);
+  if (pending_queue_resource_barriers_.entries.size() >=
+      kResourceAccessBarrierLinearEntryLimit) {
+    RebuildResourceAccessBarrierIndex(pending_queue_resource_barriers_);
+  }
+
+  for (const auto &backbuffer : backbuffers) {
+    if (!backbuffer)
+      continue;
+    const ULONG detached_ref_count = static_cast<ULONG>(std::count_if(
+        detached.entries.begin(), detached.entries.end(),
+        [&](const ResourceAccessBarrierEntry &entry) {
+          return entry.d3d_resource.ptr() == backbuffer.ptr();
+        }));
+    const ULONG ref_count = backbuffer->AddRef();
+    backbuffer->Release();
+    if (ref_count > 2 + detached_ref_count) {
+      MergeResourceAccessBarrierBatch(pending_queue_resource_barriers_,
+                                      std::move(detached));
+      return false;
+    }
+  }
+
+  std::lock_guard resource_state_lock(resource_states_->mutex);
+  for (auto *backbuffer : backbuffer_set)
+    resource_states_->resources.erase(backbuffer);
+  return true;
+}
 
 } // namespace
 
