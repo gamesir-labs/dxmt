@@ -3,6 +3,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "dxmt_buffer.hpp"
+#include "dxmt_present_source_view.hpp"
 #include "dxmt_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <d3d12.h>

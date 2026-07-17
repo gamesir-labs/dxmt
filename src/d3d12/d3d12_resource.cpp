@@ -1437,11 +1437,11 @@ public:
   }
 
   void SetPresentSourceView(dxmt::TextureViewKey view) override {
-    present_source_view_ = view;
+    present_source_view_.publish(uint64_t(view));
   }
 
   dxmt::TextureViewKey GetPresentSourceView() const override {
-    return present_source_view_;
+    return dxmt::TextureViewKey(present_source_view_.resolve());
   }
 
   ID3D12Resource *GetD3D12Resource() override {
@@ -2473,7 +2473,7 @@ private:
   dxmt::condition_variable materialization_cond_;
   MaterializationState materialization_state_ =
       MaterializationState::Unmaterialized;
-  dxmt::TextureViewKey present_source_view_ = {};
+  dxmt::PresentSourceViewState present_source_view_;
   std::string name_;
   std::mutex pending_timestamp_resolve_mutex_;
   std::vector<PendingTimestampResolveRange> pending_timestamp_resolves_;

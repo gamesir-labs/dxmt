@@ -64,6 +64,7 @@ dxmt_wine_framework_suites = {
       'wine/names_test.cpp',
       'wine/perf_stats_test.cpp',
       'wine/pipeline_diag_test.cpp',
+      'wine/present_source_view_test.cpp',
       'wine/resource_state_test.cpp',
       'wine/resource_subset_test.cpp',
       'wine/ring_bump_allocator_test.cpp',

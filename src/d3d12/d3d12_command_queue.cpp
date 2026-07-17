@@ -5607,12 +5607,16 @@ private:
 
       auto present_signals = std::make_shared<PresentSemaphoreSignals>(
           present_queue_signal, present_signal);
+      Com<ID3D12Resource> present_resource =
+          backbuffers_[current_backbuffer_];
+      const auto api_thread_present_view = resource->GetPresentSourceView();
       PendingOperation op = {};
       op.type = PendingOperationType::QueueWork;
       op.frame_id = present_frame_id;
       op.queue_work = [
         backbuffer = Rc<Texture>(resource->GetTexture()),
-        present_view = resource->GetPresentSourceView(),
+        present_resource = std::move(present_resource),
+        api_thread_present_view,
         presenter = presenter_,
         present_after,
         apitrace_frame_index,
@@ -5621,13 +5625,26 @@ private:
         state,
         present_signals
       ](CommandChunk *chunk) mutable {
+        auto *resource = GetResource(present_resource.ptr());
+        const auto present_view =
+            resource ? resource->GetPresentSourceView() : TextureViewKey{};
+        static std::atomic<uint32_t> present_view_log_count = 0;
+        if (D3D12DiagShouldLog(present_view_log_count,
+                               D3D12DiagSwapChainEnabled())) {
+          INFO("D3D12 diagnostic: queue-ordered present view",
+               " resource=", uint64_t(present_resource.ptr()),
+               " api_thread_view=", uint64_t(api_thread_present_view),
+               " replay_ordered_view=", uint64_t(present_view),
+               " changed_after_present_call=",
+               uint64_t(api_thread_present_view) != uint64_t(present_view));
+        }
         chunk->addCompletionCallback([state, present_signals]() {
           state->complete();
           present_signals->signal();
         });
         chunk->emitcc([
           backbuffer = std::move(backbuffer),
-          present_view = std::move(present_view),
+          present_view,
           presenter = std::move(presenter),
           present_after,
           apitrace_frame_index,
