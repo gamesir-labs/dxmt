@@ -694,4 +694,113 @@ INSTANTIATE_TEST_SUITE_P(
             "Fwidth", "fwidth(position.x + 2.0 * position.y)", 3.0f}),
     DerivativeSemanticCaseName);
 
+class ShaderDerivativeControlFlowSpec : public ::testing::Test {
+protected:
+  static constexpr UINT kWidth = 8;
+  static constexpr UINT kHeight = 8;
+
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+
+  void RenderPixelShader(const char *source, float clear_value,
+                         TextureReadback *readback) {
+    ASSERT_NE(readback, nullptr);
+    const auto pixel = CompileShader(source, "ps_5_0");
+    ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+    const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    auto root_signature = context_.CreateRootSignature(root_desc);
+    ASSERT_TRUE(root_signature);
+    const D3D12_SHADER_BYTECODE bytecode = {
+        pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()};
+    auto pipeline = context_.CreateGraphicsPipeline(
+        root_signature.get(), DXGI_FORMAT_R32_FLOAT, bytecode);
+    ASSERT_TRUE(pipeline);
+
+    auto target = context_.CreateTexture2D(
+        kWidth, kHeight, 1, DXGI_FORMAT_R32_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(heap);
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+    const FLOAT clear[4] = {clear_value, clear_value, clear_value,
+                            clear_value};
+    context_.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    context_.list()->SetGraphicsRootSignature(root_signature.get());
+    context_.list()->SetPipelineState(pipeline.get());
+    context_.list()->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport = {
+        0, 0, static_cast<FLOAT>(kWidth), static_cast<FLOAT>(kHeight), 0, 1};
+    const D3D12_RECT scissor = {0, 0, kWidth, kHeight};
+    context_.list()->RSSetViewports(1, &viewport);
+    context_.list()->RSSetScissorRects(1, &scissor);
+    context_.list()->DrawInstanced(3, 1, 0, 0);
+    D3D12TestContext::Transition(
+        context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ASSERT_EQ(context_.ReadbackTexture(target.get(), readback), S_OK);
+  }
+
+  static float Pixel(const TextureReadback &readback, UINT x, UINT y) {
+    float value = 0.0f;
+    std::memcpy(&value,
+                readback.data.data() + y * readback.row_pitch +
+                    x * sizeof(value),
+                sizeof(value));
+    return value;
+  }
+
+  D3D12TestContext context_;
+};
+
+TEST_F(ShaderDerivativeControlFlowSpec,
+       PreservesQuadDerivativesAcrossDivergentBranches) {
+  constexpr char kShader[] = R"(
+    float main(float4 position : SV_Position) : SV_Target {
+      float derivative;
+      [branch]
+      if ((((uint)position.x / 2u) & 1u) != 0u)
+        derivative = ddx_fine(position.x);
+      else
+        derivative = ddy_fine(position.y);
+      return derivative;
+    }
+  )";
+  TextureReadback readback;
+  RenderPixelShader(kShader, -17.0f, &readback);
+  ASSERT_FALSE(readback.data.empty());
+  for (UINT y = 1; y + 1 < kHeight; ++y) {
+    for (UINT x = 1; x + 1 < kWidth; ++x)
+      EXPECT_NEAR(Pixel(readback, x, y), 1.0f, 1e-5f)
+          << "pixel (" << x << ", " << y << ")";
+  }
+}
+
+TEST_F(ShaderDerivativeControlFlowSpec,
+       UsesHelperLanesAfterPerPixelDiscard) {
+  constexpr char kShader[] = R"(
+    float main(float4 position : SV_Position) : SV_Target {
+      const uint2 pixel = uint2(position.xy);
+      if ((pixel.x & 1u) == 0u && (pixel.y & 1u) == 0u)
+        discard;
+      return ddx_fine(position.x) + ddy_fine(position.y);
+    }
+  )";
+  constexpr float kClear = -17.0f;
+  TextureReadback readback;
+  RenderPixelShader(kShader, kClear, &readback);
+  ASSERT_FALSE(readback.data.empty());
+  for (UINT y = 1; y + 1 < kHeight; ++y) {
+    for (UINT x = 1; x + 1 < kWidth; ++x) {
+      const bool discarded = (x & 1u) == 0u && (y & 1u) == 0u;
+      EXPECT_NEAR(Pixel(readback, x, y), discarded ? kClear : 2.0f, 1e-5f)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
 } // namespace
