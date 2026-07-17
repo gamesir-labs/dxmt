@@ -47,4 +47,19 @@ BindingHotspotError
 RunCompiledDescriptorSubmissionSnapshotScenario(
     BindingHotspotMeasurement *measurement);
 
+BindingHotspotError
+RunFh4MultiTableSubmissionSnapshotScenario(
+    BindingHotspotMeasurement *measurement);
+
+BindingHotspotError
+RunCompiledDescriptorBacklogScenario(
+    std::uint32_t submission_count, BindingHotspotMeasurement *measurement);
+
+BindingHotspotError
+RunRootCbvFenceReuseScenario(BindingHotspotMeasurement *measurement);
+
+BindingHotspotError
+RunQueuedUiLayerCompositionScenario(
+    std::uint32_t frame_count, BindingHotspotMeasurement *measurement);
+
 } // namespace dxmt::test
