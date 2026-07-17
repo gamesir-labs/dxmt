@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Surface silent set -e aborts (common on bash 3.2 + glob/&& patterns).
+trap 'printf "[dxmt-ci] error: command failed at line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$?" >&2' ERR
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CACHE_ROOT="${DXMT_MANAGED_CACHE_ROOT:-${REPO_ROOT}/.cache/managed}"
@@ -47,7 +50,8 @@ append_path() {
     *) export PATH="${dir}:${PATH}" ;;
   esac
   if [[ -n "${GITHUB_PATH:-}" ]]; then
-    printf '%s\n' "${dir}" >> "${GITHUB_PATH}"
+    printf '%s\n' "${dir}" >> "${GITHUB_PATH}" ||
+      die "failed to append ${dir} to GITHUB_PATH=${GITHUB_PATH}"
   fi
 }
 
@@ -56,17 +60,24 @@ setup_paths() {
   append_path /usr/local/bin
   append_path /opt/homebrew/opt/bison/bin
   append_path /usr/local/opt/bison/bin
+  local pybin llvm_mingw
+  shopt -s nullglob
   for pybin in "${HOME}"/Library/Python/*/bin; do
     append_path "${pybin}"
   done
   for llvm_mingw in "${TOOLCHAINS_DIR}"/llvm-mingw-*; do
-    [[ -d "${llvm_mingw}/bin" ]] && append_path "${llvm_mingw}/bin"
+    if [[ -d "${llvm_mingw}/bin" ]]; then
+      append_path "${llvm_mingw}/bin"
+    fi
   done
+  shopt -u nullglob
 }
 
 ensure_root() {
+  log "ensuring managed cache dirs under ${CACHE_ROOT}"
   mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" \
-    "${ARTIFACTS_DIR}" "${SOURCES_DIR}"
+    "${ARTIFACTS_DIR}" "${SOURCES_DIR}" ||
+    die "failed to create managed cache dirs under ${CACHE_ROOT} (pwd=$(pwd) user=$(id -un 2>/dev/null || true))"
 }
 
 ensure_brew() {
@@ -278,7 +289,8 @@ ensure_meson() {
 
 check_apple_tools() {
   command -v xcrun >/dev/null || die "xcrun is missing; install Apple Command Line Tools"
-  xcrun --sdk macosx --show-sdk-path >/dev/null
+  xcrun --sdk macosx --show-sdk-path >/dev/null ||
+    die "macOS SDK is unavailable via xcrun --sdk macosx --show-sdk-path"
   ensure_metal_toolchain
 }
 
@@ -321,13 +333,22 @@ ensure_metal_toolchain() {
 }
 
 setup_host() {
+  log "setup-host starting on $(uname -m) host=$(hostname 2>/dev/null || true)"
+  log "REPO_ROOT=${REPO_ROOT} CACHE_ROOT=${CACHE_ROOT} GITHUB_PATH=${GITHUB_PATH:-<unset>}"
   ensure_root
+  log "ensure_root done"
   setup_paths
+  log "PATH=${PATH}"
   ensure_homebrew_build_tools
+  log "homebrew build tools ready"
   ensure_wine_rosetta_build_tools
+  log "wine/rosetta tools ready"
   ensure_lunarg_vulkan_sdk
+  log "vulkan sdk ready"
   ensure_meson
+  log "meson ready: $(command -v meson || true) $(meson --version 2>/dev/null || true)"
   check_apple_tools
+  log "setup-host completed"
 }
 
 download_file() {
@@ -476,14 +497,22 @@ wine_install_ready() {
   wine_development_install_ready "$1" && wine_runtime_install_ready "$1"
 }
 
+
 build_wine_git_source() {
   local source_dir="$1"
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
   case "$(uname -m)" in
     arm64)
+      # MoltenVK comes from the LunarG Vulkan SDK. The x86_64 Homebrew formula
+      # currently fails to parse on the self-hosted runner.
+      # Restored from 570f578e / fc708c after accidental CI script overwrite.
+      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*) molten-vk( [^)]*\))/$1$2/' \
+        "${source_dir}/scripts/build_on_m1.sh"
       (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
     x86_64)
+      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*)\n    molten-vk\n([^)]*\))/$1\n$2/' \
+        "${source_dir}/scripts/build_on_intel.sh"
       (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
@@ -602,6 +631,82 @@ llvm_project_dir() {
   printf '%s\n' "${TOOLCHAINS_DIR}/llvm-project-${LLVM_VERSION}"
 }
 
+# Managed ccache for CMake LLVM bootstraps (separate from Meson profile builds).
+configure_llvm_ccache() {
+  ensure_command_or_formula ccache ccache
+  export CCACHE_DIR="${CACHE_ROOT}/ccache/data"
+  export CCACHE_CONFIGPATH="${CACHE_ROOT}/ccache/ccache.conf"
+  mkdir -p "${CCACHE_DIR}" "$(dirname "${CCACHE_CONFIGPATH}")"
+  if [[ ! -f "${CCACHE_CONFIGPATH}" ]]; then
+    {
+      printf 'cache_dir = %s\n' "${CCACHE_DIR}"
+      printf 'max_size = 20G\n'
+      printf 'compression = true\n'
+      printf 'compiler_check = content\n'
+    } > "${CCACHE_CONFIGPATH}"
+  fi
+  log "LLVM ccache enabled: CCACHE_DIR=${CCACHE_DIR}"
+  ccache --zero-stats >/dev/null 2>&1 || true
+}
+
+llvm_install_ready() {
+  local prefix="$1"
+  [[ -f "${prefix}/lib/cmake/llvm/LLVMConfig.cmake" ]]
+}
+
+# Publish an install prefix only after it contains LLVMConfig.cmake + marker.
+# Cancelled jobs often leave *.incomplete-* trees; recover those before rebuilding.
+finalize_llvm_prefix() {
+  local source="$1"
+  local target="$2"
+  local fingerprint="$3"
+  llvm_install_ready "${source}" ||
+    die "LLVM install prefix is missing LLVMConfig.cmake: ${source}"
+  printf 'schema=1\nfingerprint=%s\n' "${fingerprint}" > "${source}/.dxmt-builder-dependency"
+  sync 2>/dev/null || true
+  if [[ -e "${target}" ]]; then
+    log "replacing incomplete LLVM target without valid marker: ${target}"
+    rm -rf "${target}"
+  fi
+  mv "${source}" "${target}"
+  [[ -f "${target}/.dxmt-builder-dependency" ]] ||
+    die "LLVM finalize lost dependency marker at ${target}"
+  llvm_install_ready "${target}" ||
+    die "LLVM finalize lost LLVMConfig.cmake at ${target}"
+  log "LLVM dependency prepared: ${target}"
+}
+
+recover_abandoned_llvm_prefix() {
+  local target="$1"
+  local fingerprint="$2"
+  local pattern="$3"
+  local abandoned
+
+  if [[ -f "${target}/.dxmt-builder-dependency" ]] && llvm_install_ready "${target}"; then
+    return 1
+  fi
+
+  shopt -s nullglob
+  for abandoned in ${pattern}; do
+    [[ -d "${abandoned}" ]] || continue
+    if llvm_install_ready "${abandoned}"; then
+      log "finalizing abandoned LLVM install: ${abandoned}"
+      finalize_llvm_prefix "${abandoned}" "${target}" "${fingerprint}"
+      shopt -u nullglob
+      return 0
+    fi
+    log "removing unusable incomplete LLVM tree: ${abandoned}"
+    rm -rf "${abandoned}"
+  done
+  shopt -u nullglob
+
+  if [[ -e "${target}" ]]; then
+    log "removing incomplete LLVM target: ${target}"
+    rm -rf "${target}"
+  fi
+  return 1
+}
+
 ensure_llvm_darwin() {
   local arch="$1"
   [[ "${arch}" == "x86_64" ]] || die "only x86_64 LLVM Darwin dependencies are supported"
@@ -614,15 +719,22 @@ ensure_llvm_darwin() {
   target="${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-${fingerprint}-${arch}"
   temporary="${target}.incomplete-$$"
   build="${temporary}-build"
-  if [[ -f "${target}/.dxmt-builder-dependency" ]]; then
+  if [[ -f "${target}/.dxmt-builder-dependency" ]] && llvm_install_ready "${target}"; then
     log "LLVM Darwin ${arch} already prepared: ${target}"
     return
   fi
+  if recover_abandoned_llvm_prefix "${target}" "${fingerprint}" \
+      "${TOOLCHAINS_DIR}/llvm-darwin-${LLVM_VERSION}-${fingerprint}-${arch}.incomplete-*"; then
+    return
+  fi
   ensure_llvm_project
+  configure_llvm_ccache
   rm -rf "${build}" "${temporary}"
   mkdir -p "${build}"
   cmake -B "${build}" -S "$(llvm_project_dir)/llvm" \
     -DCMAKE_INSTALL_PREFIX="${temporary}" \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DCMAKE_OSX_ARCHITECTURES="${arch}" \
     -DLLVM_HOST_TRIPLE="${arch}-apple-darwin" \
     -DLLVM_ENABLE_ASSERTIONS=On \
@@ -638,9 +750,13 @@ ensure_llvm_darwin() {
     -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
     -G Ninja
   cmake --build "${build}" --target install --parallel "$(sysctl -n hw.ncpu)"
-  printf 'schema=1\nfingerprint=%s\n' "${fingerprint}" > "${temporary}/.dxmt-builder-dependency"
-  mv "${temporary}" "${target}"
+  log "LLVM Darwin cmake install finished; finalizing ${temporary}"
+  finalize_llvm_prefix "${temporary}" "${target}" "${fingerprint}"
   rm -rf "${build}"
+  if command -v ccache >/dev/null 2>&1; then
+    log "LLVM Darwin ccache stats:"
+    ccache --show-stats 2>&1 | sed 's/^/[dxmt-ci] ccache: /' >&2 || true
+  fi
 }
 
 ensure_llvm_win() {
@@ -654,12 +770,17 @@ ensure_llvm_win() {
   target="${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-${fingerprint}-x86_64-w64-mingw32"
   temporary="${target}.incomplete-$$"
   build="${temporary}-build"
-  if [[ -f "${target}/.dxmt-builder-dependency" ]]; then
+  if [[ -f "${target}/.dxmt-builder-dependency" ]] && llvm_install_ready "${target}"; then
     log "LLVM Windows already prepared: ${target}"
+    return
+  fi
+  if recover_abandoned_llvm_prefix "${target}" "${fingerprint}" \
+      "${TOOLCHAINS_DIR}/llvm-win-${LLVM_VERSION}-${fingerprint}-x86_64-w64-mingw32.incomplete-*"; then
     return
   fi
   ensure_llvm_project
   ensure_llvm_mingw
+  configure_llvm_ccache
   llvm_mingw="$(find "${TOOLCHAINS_DIR}" -maxdepth 1 -type d -name 'llvm-mingw-*' | sort | tail -1)"
   [[ -n "${llvm_mingw}" ]] || die "managed LLVM-MinGW dependency was not found"
   rm -rf "${build}" "${temporary}"
@@ -667,6 +788,8 @@ ensure_llvm_win() {
   append_path "${llvm_mingw}/bin"
   cmake -B "${build}" -S "$(llvm_project_dir)/llvm" -DCMAKE_SYSTEM_NAME=Windows \
     -DCMAKE_INSTALL_PREFIX="${temporary}" \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32 \
     -DLLVM_ENABLE_ASSERTIONS=On \
     -DLLVM_ENABLE_ZSTD=Off \
@@ -683,9 +806,13 @@ ensure_llvm_win() {
     -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
     -G Ninja
   cmake --build "${build}" --target install --parallel "$(sysctl -n hw.ncpu)"
-  printf 'schema=1\nfingerprint=%s\n' "${fingerprint}" > "${temporary}/.dxmt-builder-dependency"
-  mv "${temporary}" "${target}"
+  log "LLVM Windows cmake install finished; finalizing ${temporary}"
+  finalize_llvm_prefix "${temporary}" "${target}" "${fingerprint}"
   rm -rf "${build}"
+  if command -v ccache >/dev/null 2>&1; then
+    log "LLVM Windows ccache stats:"
+    ccache --show-stats 2>&1 | sed 's/^/[dxmt-ci] ccache: /' >&2 || true
+  fi
 }
 
 prepare_job() {

@@ -504,12 +504,18 @@ private:
     const auto deps = managed_root_ / "deps";
     constexpr std::string_view arch = "x86_64";
     std::vector<fs::path> matches;
+    std::vector<std::string> seen;
     if (fs::is_directory(deps)) {
       for (const auto &entry : fs::directory_iterator(deps)) {
         const auto name = entry.path().filename().string();
-        if (entry.is_directory() && name.starts_with("llvm-darwin-") &&
-            name.ends_with("-" + std::string(arch)) &&
-            fs::is_regular_file(entry.path() / ".dxmt-builder-dependency"))
+        if (!entry.is_directory() || !name.starts_with("llvm-darwin-"))
+          continue;
+        seen.push_back(name);
+        if (IsIncompleteCacheName(name))
+          continue;
+        if (name.ends_with("-" + std::string(arch)) &&
+            fs::is_regular_file(entry.path() / ".dxmt-builder-dependency") &&
+            fs::is_regular_file(entry.path() / "lib/cmake/llvm/LLVMConfig.cmake"))
           matches.push_back(entry.path());
       }
     }
@@ -522,7 +528,19 @@ private:
       // Keep the stable Homebrew opt path: the main Meson project uses this
       // prefix to add the matching zstd and unwind static dependencies.
       return homebrew;
-    throw std::runtime_error("LLVM 15 native libraries were not found for " + std::string(arch));
+    std::ostringstream detail;
+    detail << "LLVM 15 native libraries were not found for " << arch
+           << " under " << deps.string();
+    if (seen.empty()) {
+      detail << " (no llvm-darwin-* directories)";
+    } else {
+      detail << " (found:";
+      for (const auto &name : seen)
+        detail << ' ' << name;
+      detail << ')';
+    }
+    detail << "; run 'scripts/dxmt-builder bootstrap llvm-darwin-x64'";
+    throw std::runtime_error(detail.str());
   }
 
   fs::path ResolveCompiler(const Profile &profile, std::string_view executable) const {

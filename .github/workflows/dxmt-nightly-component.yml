@@ -47,6 +47,21 @@ jobs:
       upload_matrix: ${{ steps.upload-targets.outputs.upload_matrix }}
       upload_target_names: ${{ steps.upload-targets.outputs.upload_target_names }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout Source Ref
         uses: actions/checkout@v6
         with:
@@ -136,6 +151,21 @@ jobs:
     needs: resolve-source
     if: ${{ needs.resolve-source.outputs.reusable_local_artifact != 'true' }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -154,6 +184,21 @@ jobs:
     needs: [resolve-source, setup-host]
     if: ${{ needs.resolve-source.outputs.reusable_local_artifact != 'true' }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -178,6 +223,21 @@ jobs:
     needs: [resolve-source, setup-host]
     if: ${{ needs.resolve-source.outputs.reusable_local_artifact != 'true' }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -194,6 +254,21 @@ jobs:
     needs: [resolve-source, setup-llvm-project]
     if: ${{ needs.resolve-source.outputs.reusable_local_artifact != 'true' }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -210,6 +285,21 @@ jobs:
     needs: [resolve-source, setup-wine, setup-llvm-darwin]
     if: ${{ needs.resolve-source.outputs.reusable_local_artifact != 'true' }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -240,9 +330,25 @@ jobs:
 
   build-x86-windows:
     runs-on: self-macos-runner
-    needs: [resolve-source, setup-wine]
+    # Native LLVM is required by dxmt-builder for both x86 and x86_64 profiles.
+    needs: [resolve-source, setup-wine, setup-llvm-darwin]
     if: ${{ needs.resolve-source.outputs.reusable_local_artifact != 'true' }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -277,6 +383,21 @@ jobs:
       artifact_name: ${{ steps.package.outputs.artifact_name }}
       package_file: ${{ steps.package.outputs.package_file }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -649,6 +770,21 @@ jobs:
     needs: [package, upload-backend-component]
     if: ${{ always() }}
     steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -656,3 +792,70 @@ jobs:
 
       - name: Prune Runner Artifacts
         run: scripts/ci-self-hosted.sh prune-artifact-runs 3
+
+  notify:
+    name: Notify Feishu
+    # Stay on the Component macOS runner pool; do not hop to Windows.
+    runs-on: self-macos-runner
+    needs: [resolve-source, package, upload-backend-component]
+    if: ${{ always() }}
+    env:
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+    steps:
+      - name: Checkout notify helper
+        uses: actions/checkout@v6
+        with:
+          # Full tree; avoid sparse residue on the shared macOS runner.
+          clean: true
+
+      - name: Notify Feishu on failure
+        if: ${{ needs.package.result != 'success' || needs.upload-backend-component.result != 'success' }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci-feishu.sh
+          failed=()
+          [[ '${{ needs.resolve-source.result }}' == 'success' ]] || failed+=('resolve-source')
+          [[ '${{ needs.package.result }}' == 'success' ]] || failed+=('package')
+          [[ '${{ needs.upload-backend-component.result }}' == 'success' ]] || failed+=('upload-backend-component')
+          if ((${#failed[@]} > 0)); then
+            failed_jobs=$(IFS=', '; echo "${failed[*]}")
+          else
+            failed_jobs='unknown'
+          fi
+          run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          md="$(printf '%s\n' \
+            "**$(scripts/ci-feishu.sh label repo):** ${{ github.repository }}" \
+            "**$(scripts/ci-feishu.sh label trigger_ref):** ${{ inputs.source_ref }}" \
+            "**$(scripts/ci-feishu.sh label publish_env):** ${{ inputs.api_environment }}" \
+            "**$(scripts/ci-feishu.sh label source_sha):** \`${{ needs.resolve-source.outputs.source_sha }}\`" \
+            "**$(scripts/ci-feishu.sh label pkg_name):** ${{ needs.resolve-source.outputs.package_name }}" \
+            "**$(scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
+            "**$(scripts/ci-feishu.sh label failed_jobs):** ${failed_jobs}" \
+            "**$(scripts/ci-feishu.sh label run_link):** [$(scripts/ci-feishu.sh label view_detail)](${run_url})")"
+          scripts/ci-feishu.sh send-card-v1 \
+            "${FEISHU_WEBHOOK_URL}" \
+            "$(scripts/ci-feishu.sh label pub_fail)" \
+            red \
+            "${md}"
+
+      - name: Notify Feishu on success
+        if: ${{ needs.package.result == 'success' && needs.upload-backend-component.result == 'success' }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci-feishu.sh
+          run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          md="$(printf '%s\n' \
+            "**$(scripts/ci-feishu.sh label pkg_name):** ${{ needs.resolve-source.outputs.package_name }}" \
+            "**Artifact:** \`${{ needs.resolve-source.outputs.artifact_name }}\`" \
+            "**$(scripts/ci-feishu.sh label trigger_ref):** ${{ inputs.source_ref }}" \
+            "**$(scripts/ci-feishu.sh label source_sha):** \`${{ needs.resolve-source.outputs.source_sha }}\`" \
+            "**$(scripts/ci-feishu.sh label publish_env):** ${{ needs.resolve-source.outputs.upload_target_names }}" \
+            "**$(scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
+            "**$(scripts/ci-feishu.sh label note):** $(scripts/ci-feishu.sh label component_note)" \
+            "" \
+            "**$(scripts/ci-feishu.sh label run_link):** [$(scripts/ci-feishu.sh label view_detail)](${run_url})")"
+          scripts/ci-feishu.sh send-card-v1 \
+            "${FEISHU_WEBHOOK_URL}" \
+            "$(scripts/ci-feishu.sh label pub_ok)" \
+            green \
+            "${md}"

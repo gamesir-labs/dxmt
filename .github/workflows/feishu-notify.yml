@@ -2,12 +2,12 @@ name: Notify Feishu on GitHub Events
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ["**"]
   pull_request:
-    branches: [ "**" ]
-    types: [ opened, closed, reopened, edited, synchronize ]
+    branches: ["**"]
+    types: [opened, closed, reopened, edited, synchronize]
   issues:
-    types: [ opened, closed, reopened ]
+    types: [opened, closed, reopened]
 
 permissions:
   contents: read
@@ -18,156 +18,112 @@ env:
 
 jobs:
   notify:
-    runs-on: ubuntu-latest
+    # Org Windows self-hosted runner (no GitHub-hosted minutes).
+    runs-on: [self-hosted, Windows, X64]
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/ci-feishu.ps1
+          sparse-checkout-cone-mode: false
+
       - name: Send notification to Feishu
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command ". '{0}'"
         run: |
-          if [ -z "$FEISHU_WEBHOOK_URL" ]; then
-            echo "FEISHU_WEBHOOK_URL is not configured; skipping notification."
+          . .\scripts\ci-feishu.ps1
+
+          if ([string]::IsNullOrWhiteSpace($env:FEISHU_WEBHOOK_URL)) {
+            Write-Host 'FEISHU_WEBHOOK_URL is not configured; skipping notification.'
             exit 0
-          fi
+          }
 
-          EVENT_NAME="$GITHUB_EVENT_NAME"
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          REPO_URL="https://github.com/$GITHUB_REPOSITORY"
+          $eventName = $env:GITHUB_EVENT_NAME
+          $repoFull = $env:GITHUB_REPOSITORY
+          $repoName = ($repoFull -split '/')[-1]
+          $repoUrl = "https://github.com/$repoFull"
+          $refName = $env:GITHUB_REF_NAME
+          $actor = $env:GITHUB_ACTOR
+          # Event payload is UTF-8 JSON from GitHub.
+          $event = Get-Content -Raw -Encoding UTF8 -Path $env:GITHUB_EVENT_PATH | ConvertFrom-Json
 
-          case "$EVENT_NAME" in
-            push)
-              commitCount=$(jq -r '.size // (.commits | length)' "$GITHUB_EVENT_PATH")
-              messageTitle="$commitCount commits pushed"
-              [ "$commitCount" = "1" ] && messageTitle="1 commit pushed"
-              messageSubTitle="$REPO_NAME · $GITHUB_REF_NAME · pushed by $GITHUB_ACTOR"
-              messageTheme="blue"
-              actionText="View changes"
-              actionUrl=$(jq -r '.compare // empty' "$GITHUB_EVENT_PATH")
+          $messageTitle = 'Other Event'
+          $messageSubTitle = "$repoName | $refName"
+          $message = "Event $eventName triggered"
+          $messageTheme = 'blue'
+          $actionText = 'Open repository'
+          $actionUrl = $repoUrl
 
-              commitSummary=$(jq -c --arg repo "$GITHUB_REPOSITORY" '
-                def display_units:
-                  explode | map(if . > 127 then 2 else 1 end) | add // 0;
-                def subject:
-                  (.message // "Untitled commit")
-                  | split("\n")[0]
-                  | gsub("[\r\t]"; " ")
-                  | if length > 180 then .[0:177] + "..." else . end;
-                def author:
-                  (.author.name // "Unknown author") | gsub("[\r\n\t]"; " ");
-                def line:
-                  "[" + (.id[0:7]) + "](https://github.com/" + $repo + "/commit/" + .id + ")  "
-                  + subject + " · " + author;
-
-                reduce .commits[] as $commit (
-                  { text: "", shown: 0, full: false };
-                  if .full then .
-                  else
-                    ($commit | line) as $line
-                    | (if .text == "" then $line else .text + "\n" + $line end) as $next
-                    | if (($next | display_units) <= 3600 and ($next | utf8bytelength) <= 18000)
-                      then { text: $next, shown: (.shown + 1), full: false }
-                      else .full = true
-                      end
-                  end
-                )
-                | {
-                    text: (if .text == "" then "No commits in push payload." else .text end),
-                    shown
-                  }
-              ' "$GITHUB_EVENT_PATH")
-              message=$(printf '%s' "$commitSummary" | jq -r '.text')
-              shownCount=$(printf '%s' "$commitSummary" | jq -r '.shown')
-
-              if [ "$commitCount" -gt "$shownCount" ]; then
-                message=$(printf '%s\n\n+%d more commits' \
-                  "$message" "$((commitCount - shownCount))")
-              fi
-              ;;
-
-            pull_request)
-              action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
-              number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
-              title=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH")
-              user=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
-              headRef=$(jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")
-              baseRef=$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")
-              actionUrl=$(jq -r '.pull_request.html_url' "$GITHUB_EVENT_PATH")
-
-              messageTitle="Pull request $action"
-              messageSubTitle="$REPO_NAME · $headRef → $baseRef"
-              message=$(printf '[#%s](%s)  %s\n\nOpened by %s' \
-                "$number" "$actionUrl" "$title" "$user")
-              messageTheme="turquoise"
-              actionText="View pull request"
-              ;;
-
-            issues)
-              action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
-              number=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
-              title=$(jq -r '.issue.title' "$GITHUB_EVENT_PATH")
-              user=$(jq -r '.issue.user.login' "$GITHUB_EVENT_PATH")
-              actionUrl=$(jq -r '.issue.html_url' "$GITHUB_EVENT_PATH")
-
-              messageTitle="Issue $action"
-              messageSubTitle="$REPO_NAME · #$number · $user"
-              message="[#$number]($actionUrl)  $title"
-              messageTheme="orange"
-              actionText="View issue"
-              ;;
-
-            *)
-              messageTitle="Other Event"
-              messageSubTitle="$REPO_NAME · $GITHUB_REF_NAME"
-              message="Event $EVENT_NAME triggered"
-              messageTheme="grey"
-              actionText="Open repository"
-              actionUrl="$REPO_URL"
-              ;;
-          esac
-
-          [ -n "$actionUrl" ] || actionUrl="$REPO_URL"
-
-          PAYLOAD=$(jq -n \
-            --arg mt "$messageTitle" \
-            --arg ms "$messageSubTitle" \
-            --arg mc "$message" \
-            --arg theme "$messageTheme" \
-            --arg action_text "$actionText" \
-            --arg action_url "$actionUrl" \
-            '{
-              msg_type: "interactive",
-              card: {
-                schema: "2.0",
-                config: { update_multi: true },
-                header: {
-                  title: { tag: "plain_text", content: $mt },
-                  subtitle: { tag: "plain_text", content: $ms },
-                  template: $theme
-                },
-                body: {
-                  direction: "vertical",
-                  padding: "12px 12px 12px 12px",
-                  elements: [
-                    {
-                      tag: "markdown",
-                      content: $mc
-                    },
-                    {
-                      tag: "hr"
-                    },
-                    {
-                      tag: "button",
-                      text: { tag: "plain_text", content: $action_text },
-                      type: "primary",
-                      width: "default",
-                      size: "medium",
-                      behaviors: [
-                        { type: "open_url", default_url: $action_url }
-                      ]
-                    }
-                  ]
-                }
+          switch ($eventName) {
+            'push' {
+              # StrictMode throws on missing NoteProperties; read via helper.
+              $commits = @(Get-NotePropertyValue $event 'commits' @())
+              $sizeValue = Get-NotePropertyValue $event 'size'
+              $commitCount = if ($null -ne $sizeValue) { [int]$sizeValue } else { $commits.Count }
+              $messageTitle = if ($commitCount -eq 1) { '1 commit pushed' } else { "$commitCount commits pushed" }
+              $messageSubTitle = "$repoName | $refName | pushed by $actor"
+              $messageTheme = 'blue'
+              $actionText = 'View changes'
+              $compareUrl = Get-NotePropertyValue $event 'compare'
+              if (-not [string]::IsNullOrWhiteSpace([string]$compareUrl)) {
+                $actionUrl = [string]$compareUrl
               }
-            }'
-          )
 
-          curl --fail-with-body --silent --show-error "$FEISHU_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+              $lines = New-Object System.Collections.Generic.List[string]
+              foreach ($commit in $commits) {
+                $id = [string](Get-NotePropertyValue $commit 'id' '')
+                $sha = $id.Substring(0, [Math]::Min(7, $id.Length))
+                $rawMessage = [string](Get-NotePropertyValue $commit 'message' '')
+                $subject = ($rawMessage -split "`n")[0] -replace "[\r\t]", ' '
+                if ($subject.Length -gt 180) { $subject = $subject.Substring(0, 177) + '...' }
+                $authorObj = Get-NotePropertyValue $commit 'author'
+                $authorName = Get-NotePropertyValue $authorObj 'name'
+                $author = if ($authorName) { [string]$authorName } else { 'Unknown author' }
+                $author = $author -replace "[\r\n\t]", ' '
+                $lines.Add("[$sha](https://github.com/$repoFull/commit/$id)  $subject - $author") | Out-Null
+              }
+              if ($lines.Count -eq 0) {
+                $message = 'No commits in push payload.'
+              } else {
+                $message = ($lines -join "`n")
+              }
+            }
+            'pull_request' {
+              $action = [string]$event.action
+              $number = [string]$event.pull_request.number
+              $title = [string]$event.pull_request.title
+              $user = [string]$event.pull_request.user.login
+              $headRef = [string]$event.pull_request.head.ref
+              $baseRef = [string]$event.pull_request.base.ref
+              $actionUrl = [string]$event.pull_request.html_url
+              $messageTitle = "Pull request $action"
+              $messageSubTitle = "$repoName | $headRef -> $baseRef"
+              $message = "[#$number]($actionUrl)  $title`n`nOpened by $user"
+              $messageTheme = 'turquoise'
+              $actionText = 'View pull request'
+            }
+            'issues' {
+              $action = [string]$event.action
+              $number = [string]$event.issue.number
+              $title = [string]$event.issue.title
+              $user = [string]$event.issue.user.login
+              $actionUrl = [string]$event.issue.html_url
+              $messageTitle = "Issue $action"
+              $messageSubTitle = "$repoName | #$number | $user"
+              $message = "[#$number]($actionUrl)  $title"
+              $messageTheme = 'orange'
+              $actionText = 'View issue'
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($actionUrl)) { $actionUrl = $repoUrl }
+
+          # Avoid PowerShell here-strings in YAML: unindented @" "@ body breaks the run block.
+          $markdown = $message + "`n`n[" + $actionText + "](" + $actionUrl + ")"
+
+          Send-FeishuCard `
+            -WebhookUrl $env:FEISHU_WEBHOOK_URL `
+            -Title $messageTitle `
+            -Subtitle $messageSubTitle `
+            -Template $messageTheme `
+            -Markdown $markdown
