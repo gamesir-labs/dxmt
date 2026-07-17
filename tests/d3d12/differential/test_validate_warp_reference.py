@@ -15,7 +15,9 @@ SPEC.loader.exec_module(VALIDATOR)
 def valid_snapshot() -> dict:
     cases = {}
     for index, name in enumerate(sorted(VALIDATOR.REQUIRED_CASES)):
-        values = [index, index + 1]
+        values = list(
+            VALIDATOR.EXACT_CASE_VALUES.get(name, [index, index + 1])
+        )
         cases[name] = {
             "kind": "u32-array",
             "hash_fnv1a64": VALIDATOR.fnv1a64(values),
@@ -34,13 +36,18 @@ def valid_snapshot() -> dict:
 
 
 class WarpReferenceValidationTest(unittest.TestCase):
-    def test_requires_gpu_state_and_indirect_cases(self) -> None:
+    def test_requires_gpu_state_indirect_and_ordering_cases(self) -> None:
         self.assertTrue(
             {
                 "blend_additive_rgba8",
+                "binary_occlusion_nonzero",
+                "cross_queue_fence_copy",
                 "depth_reject_rgba8",
                 "execute_indirect_dispatch",
                 "msaa_resolve_rgba8",
+                "predicated_compute_false",
+                "predication_disabled_compute",
+                "root_constants_uav",
             }.issubset(VALIDATOR.REQUIRED_CASES)
         )
 
@@ -63,6 +70,19 @@ class WarpReferenceValidationTest(unittest.TestCase):
         self.assertTrue(any("buffer_copy: hash_fnv1a64" in error for error in errors))
         self.assertIn(
             "compute_u32: values must contain only uint32 integers", errors
+        )
+
+    def test_rejects_semantically_invalid_new_case_with_valid_hash(self) -> None:
+        snapshot = valid_snapshot()
+        values = snapshot["cases"]["binary_occlusion_nonzero"]["values"]
+        values[0] = 0
+        snapshot["cases"]["binary_occlusion_nonzero"]["hash_fnv1a64"] = (
+            VALIDATOR.fnv1a64(values)
+        )
+        errors = VALIDATOR.validate(snapshot)
+        self.assertIn(
+            "binary_occlusion_nonzero: values do not match the required oracle contract",
+            errors,
         )
 
 

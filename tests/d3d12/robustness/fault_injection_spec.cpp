@@ -4,6 +4,7 @@
 #include <d3d12.h>
 
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -19,6 +20,12 @@ UINT ConfiguredOccurrence(const char *name) {
   return end != value && !*end && parsed <= UINT_MAX
              ? static_cast<UINT>(parsed)
              : 0;
+}
+
+bool ConfiguredAlways(const char *name) {
+  const char *value = std::getenv(name);
+  return value && (std::strcmp(value, "always") == 0 ||
+                   std::strcmp(value, "all") == 0);
 }
 
 class D3D12CreationFaultInjectionSpec : public ::testing::Test {
@@ -89,6 +96,44 @@ TEST_F(D3D12CreationFaultInjectionSpec,
 }
 
 TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedResourceFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault = "DXMT_TEST_FAIL_RESOURCE_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP() << "repeated resource creation fault injection is disabled";
+
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = 4096;
+  desc.Height = 1;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    void *output = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(device_->CreateCommittedResource(
+                  &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                  D3D12_RESOURCE_STATE_COMMON, nullptr,
+                  __uuidof(ID3D12Resource), &output),
+              E_OUTOFMEMORY)
+        << "attempt=" << attempt;
+    EXPECT_EQ(output, nullptr) << "attempt=" << attempt;
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ComPtr<ID3D12Resource> recovered;
+  EXPECT_EQ(device_->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(recovered.put())),
+            S_OK);
+  EXPECT_TRUE(recovered);
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
        DescriptorHeapFailureClearsOutputAndNextCallRecovers) {
   const UINT target =
       ConfiguredOccurrence("DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT");
@@ -110,6 +155,35 @@ TEST_F(D3D12CreationFaultInjectionSpec,
       EXPECT_TRUE(heap);
     }
   }
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedDescriptorHeapFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP()
+        << "repeated descriptor heap creation fault injection is disabled";
+
+  D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+  desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  desc.NumDescriptors = 4;
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    void *output = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(device_->CreateDescriptorHeap(
+                  &desc, __uuidof(ID3D12DescriptorHeap), &output),
+              E_OUTOFMEMORY)
+        << "attempt=" << attempt;
+    EXPECT_EQ(output, nullptr) << "attempt=" << attempt;
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ComPtr<ID3D12DescriptorHeap> recovered;
+  EXPECT_EQ(device_->CreateDescriptorHeap(&desc,
+                                           IID_PPV_ARGS(recovered.put())),
+            S_OK);
+  EXPECT_TRUE(recovered);
   EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -141,6 +215,41 @@ TEST_F(D3D12CreationFaultInjectionSpec,
       EXPECT_TRUE(pipeline);
     }
   }
+  EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12CreationFaultInjectionSpec,
+       RepeatedComputePipelineFailuresRecoverAfterFaultIsDisabled) {
+  constexpr const char *fault =
+      "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT";
+  if (!ConfiguredAlways(fault))
+    GTEST_SKIP()
+        << "repeated compute pipeline creation fault injection is disabled";
+
+  const auto shader =
+      CompileShader("[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto root = CreateEmptyRootSignature();
+  ASSERT_TRUE(root);
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root.get();
+  desc.CS = {shader.bytecode->GetBufferPointer(),
+             shader.bytecode->GetBufferSize()};
+  for (UINT attempt = 0; attempt < 3; ++attempt) {
+    void *output = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(device_->CreateComputePipelineState(
+                  &desc, __uuidof(ID3D12PipelineState), &output),
+              E_OUTOFMEMORY)
+        << "attempt=" << attempt;
+    EXPECT_EQ(output, nullptr) << "attempt=" << attempt;
+  }
+
+  ASSERT_TRUE(SetEnvironmentVariableA(fault, nullptr));
+  ComPtr<ID3D12PipelineState> recovered;
+  EXPECT_EQ(device_->CreateComputePipelineState(
+                &desc, IID_PPV_ARGS(recovered.put())),
+            S_OK);
+  EXPECT_TRUE(recovered);
   EXPECT_EQ(device_->GetDeviceRemovedReason(), S_OK);
 }
 

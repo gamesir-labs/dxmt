@@ -13,6 +13,7 @@ namespace {
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::TextureReadback;
 
 enum class ShaderValueType {
   Float,
@@ -152,6 +153,171 @@ protected:
     const D3D12_SHADER_BYTECODE bytecode = {
         shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
     return context_.CreateComputePipeline(root_.get(), bytecode);
+  }
+
+  ComPtr<ID3D12PipelineState>
+  CompileGraphicsPipeline(DXGI_FORMAT render_target_format, UINT sample_count,
+                          DXGI_FORMAT depth_stencil_format =
+                              DXGI_FORMAT_UNKNOWN) {
+    const auto vertex = CompileShader(R"(
+      float4 main(uint vertex_id : SV_VertexID) : SV_Position {
+        const float2 positions[3] = {
+          float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+        };
+        return float4(positions[vertex_id], 0.25, 1.0);
+      }
+    )",
+                                      "vs_5_0");
+    if (vertex.result != S_OK) {
+      ADD_FAILURE() << vertex.diagnostic_text();
+      return {};
+    }
+    const auto pixel = CompileShader(R"(
+      float4 main() : SV_Target {
+        return float4(0.25, 0.5, 0.75, 1.0);
+      }
+    )",
+                                     "ps_5_0");
+    if (pixel.result != S_OK) {
+      ADD_FAILURE() << pixel.diagnostic_text();
+      return {};
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = root_.get();
+    desc.VS = {vertex.bytecode->GetBufferPointer(),
+               vertex.bytecode->GetBufferSize()};
+    desc.PS = {pixel.bytecode->GetBufferPointer(),
+               pixel.bytecode->GetBufferSize()};
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    if (depth_stencil_format != DXGI_FORMAT_UNKNOWN) {
+      desc.DepthStencilState.DepthEnable = TRUE;
+      desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+      desc.DSVFormat = depth_stencil_format;
+    }
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = render_target_format;
+    desc.SampleDesc.Count = sample_count;
+    ComPtr<ID3D12PipelineState> pipeline;
+    const HRESULT hr = context_.device()->CreateGraphicsPipelineState(
+        &desc, IID_PPV_ARGS(pipeline.put()));
+    EXPECT_EQ(hr, S_OK);
+    return pipeline;
+  }
+
+  ComPtr<ID3D12Resource>
+  CreateTexture2D(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
+                  D3D12_RESOURCE_STATES state, UINT sample_count = 1) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = sample_count;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = flags;
+    ComPtr<ID3D12Resource> texture;
+    const HRESULT hr = context_.device()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+        IID_PPV_ARGS(texture.put()));
+    EXPECT_EQ(hr, S_OK);
+    return texture;
+  }
+
+  void DrawFullscreen(ID3D12PipelineState *pipeline,
+                      D3D12_CPU_DESCRIPTOR_HANDLE render_target,
+                      const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil =
+                          nullptr) {
+    context_.list()->OMSetRenderTargets(1, &render_target, FALSE,
+                                        depth_stencil);
+    context_.list()->SetGraphicsRootSignature(root_.get());
+    context_.list()->SetPipelineState(pipeline);
+    context_.list()->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport = {0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0, 4, 4};
+    context_.list()->RSSetViewports(1, &viewport);
+    context_.list()->RSSetScissorRects(1, &scissor);
+    context_.list()->DrawInstanced(3, 1, 0, 0);
+  }
+
+  template <typename T>
+  void ExecuteTypedUav(DXGI_FORMAT format,
+                       const std::array<T, 4> &initial,
+                       const std::array<T, 4> &expected) {
+    auto pipeline = CompilePipeline(R"(
+      RWBuffer<uint> target : register(u0);
+      [numthreads(1, 1, 1)] void main() {
+        uint first = target[0];
+        uint fourth = target[3];
+        target[1] = first + 7;
+        target[2] = fourth + 3;
+      }
+    )");
+    ASSERT_TRUE(pipeline);
+    auto upload = context_.CreateUploadBuffer(sizeof(initial), initial.data(),
+                                               sizeof(initial));
+    auto target = context_.CreateBuffer(
+        sizeof(initial), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+    ASSERT_TRUE(upload);
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(heap);
+    context_.list()->CopyBufferRegion(target.get(), 0, upload.get(), 0,
+                                      sizeof(initial));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC unused_srv = {};
+    unused_srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    unused_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    unused_srv.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    unused_srv.Buffer.NumElements = sizeof(initial) / sizeof(std::uint32_t);
+    unused_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    context_.device()->CreateShaderResourceView(
+        target.get(), &unused_srv, context_.CpuDescriptorHandle(heap.get(), 0));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = initial.size();
+    context_.device()->CreateUnorderedAccessView(
+        target.get(), nullptr, &uav,
+        context_.CpuDescriptorHandle(heap.get(), 1));
+
+    D3D12TestContext::Transition(
+        context_.list(), target.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap *heaps[] = {heap.get()};
+    context_.list()->SetDescriptorHeaps(1, heaps);
+    context_.list()->SetComputeRootSignature(root_.get());
+    context_.list()->SetPipelineState(pipeline.get());
+    context_.list()->SetComputeRootDescriptorTable(
+        0, heap->GetGPUDescriptorHandleForHeapStart());
+    context_.list()->Dispatch(1, 1, 1);
+    D3D12TestContext::Transition(
+        context_.list(), target.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    std::vector<std::uint8_t> bytes;
+    ASSERT_EQ(context_.ReadbackBuffer(target.get(), sizeof(expected), &bytes),
+              S_OK);
+    ASSERT_EQ(bytes.size(), sizeof(expected));
+    std::array<T, 4> actual = {};
+    std::memcpy(actual.data(), bytes.data(), sizeof(actual));
+    EXPECT_EQ(actual, expected);
   }
 
   void ExecuteAndExpect(
@@ -482,6 +648,247 @@ TEST_F(FormatExecutionMatrixSpec,
 }
 
 TEST_F(FormatExecutionMatrixSpec,
+       AdvertisedR8UintTypedUavLoadsStoresAndReadsBack) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R8_UINT;
+  const auto support = Support(format);
+  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+      D3D12_FORMAT_SUPPORT1_BUFFER |
+      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+  if ((support.Support1 & required1) != required1 ||
+      (support.Support2 & required2) != required2)
+    GTEST_SKIP() << "R8_UINT typed UAV load/store is not advertised";
+
+  ExecuteTypedUav<std::uint8_t>(format, {12, 2, 3, 40}, {12, 19, 43, 40});
+}
+
+TEST_F(FormatExecutionMatrixSpec,
+       AdvertisedR16UintTypedUavLoadsStoresAndReadsBack) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R16_UINT;
+  const auto support = Support(format);
+  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+      D3D12_FORMAT_SUPPORT1_BUFFER |
+      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+  if ((support.Support1 & required1) != required1 ||
+      (support.Support2 & required2) != required2)
+    GTEST_SKIP() << "R16_UINT typed UAV load/store is not advertised";
+
+  ExecuteTypedUav<std::uint16_t>(format, {1000, 2, 3, 4000},
+                                 {1000, 1007, 4003, 4000});
+}
+
+TEST_F(FormatExecutionMatrixSpec,
+       AdvertisedR32UintTypedUavLoadsStoresAndReadsBack) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_UINT;
+  const auto support = Support(format);
+  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+      D3D12_FORMAT_SUPPORT1_BUFFER |
+      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+  if ((support.Support1 & required1) != required1 ||
+      (support.Support2 & required2) != required2)
+    GTEST_SKIP() << "R32_UINT typed UAV load/store is not advertised";
+
+  ExecuteTypedUav<std::uint32_t>(
+      format, {0x10203040u, 2, 3, 0x55667700u},
+      {0x10203040u, 0x10203047u, 0x55667703u, 0x55667700u});
+}
+
+TEST_F(FormatExecutionMatrixSpec,
+       AdvertisedMsaaRenderTargetDrawsResolvesAndReadsBack) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  const auto support = Support(format);
+  constexpr D3D12_FORMAT_SUPPORT1 required =
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+      D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+      D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
+      D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+  if ((support.Support1 & required) != required)
+    GTEST_SKIP() << "R8G8B8A8_UNORM MSAA resolve is not advertised";
+
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};
+  quality.Format = format;
+  quality.SampleCount = 4;
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                sizeof(quality)),
+            S_OK);
+  if (!quality.NumQualityLevels)
+    GTEST_SKIP() << "4x R8G8B8A8_UNORM MSAA is not advertised";
+
+  auto pipeline = CompileGraphicsPipeline(format, 4);
+  auto source = CreateTexture2D(
+      format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET, 4);
+  auto destination = CreateTexture2D(format, D3D12_RESOURCE_FLAG_NONE,
+                                     D3D12_RESOURCE_STATE_RESOLVE_DEST);
+  auto heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(source.get(), nullptr, rtv);
+  constexpr FLOAT black[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, black, 0, nullptr);
+  DrawFullscreen(pipeline.get(), rtv);
+  D3D12TestContext::Transition(
+      context_.list(), source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  context_.list()->ResolveSubresource(destination.get(), 0, source.get(), 0,
+                                      format);
+  D3D12TestContext::Transition(
+      context_.list(), destination.get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(destination.get(), &readback), S_OK);
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      const auto *pixel = readback.data.data() + y * readback.row_pitch + x * 4;
+      EXPECT_NEAR(pixel[0], 64, 1) << "red at (" << x << ", " << y << ")";
+      EXPECT_NEAR(pixel[1], 128, 1) << "green at (" << x << ", " << y
+                                    << ")";
+      EXPECT_NEAR(pixel[2], 191, 1) << "blue at (" << x << ", " << y << ")";
+      EXPECT_EQ(pixel[3], 255) << "alpha at (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(FormatExecutionMatrixSpec,
+       AdvertisedRgba16FloatRenderTargetDrawsAndReadsBack) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  const auto support = Support(format);
+  constexpr D3D12_FORMAT_SUPPORT1 required =
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+      D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+  if ((support.Support1 & required) != required)
+    GTEST_SKIP() << "R16G16B16A16_FLOAT render targets are not advertised";
+
+  auto pipeline = CompileGraphicsPipeline(format, 1);
+  auto target = CreateTexture2D(format,
+                                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_RENDER_TARGET_VIEW_DESC view = {};
+  view.Format = format;
+  view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  context_.device()->CreateRenderTargetView(target.get(), &view, rtv);
+  constexpr FLOAT black[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, black, 0, nullptr);
+  DrawFullscreen(pipeline.get(), rtv);
+  D3D12TestContext::Transition(
+      context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  constexpr std::array<std::uint16_t, 4> expected = {
+      0x3400, 0x3800, 0x3a00, 0x3c00};
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      std::array<std::uint16_t, 4> actual = {};
+      std::memcpy(actual.data(),
+                  readback.data.data() + y * readback.row_pitch + x * 8,
+                  sizeof(actual));
+      EXPECT_EQ(actual, expected) << "pixel (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(FormatExecutionMatrixSpec,
+       AdvertisedD32DepthTargetTestsWritesAndReadsBack) {
+  constexpr DXGI_FORMAT color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  constexpr DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT;
+  const auto color_support = Support(color_format);
+  const auto depth_support = Support(depth_format);
+  constexpr D3D12_FORMAT_SUPPORT1 color_required =
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+      D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+  constexpr D3D12_FORMAT_SUPPORT1 depth_required =
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+      D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
+  if ((color_support.Support1 & color_required) != color_required ||
+      (depth_support.Support1 & depth_required) != depth_required)
+    GTEST_SKIP() << "R8G8B8A8_UNORM RTV or D32_FLOAT DSV is not advertised";
+
+  auto pipeline = CompileGraphicsPipeline(color_format, 1, depth_format);
+  auto color = CreateTexture2D(color_format,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto depth = CreateTexture2D(depth_format,
+                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                               D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  auto rtv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  auto dsv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(color);
+  ASSERT_TRUE(depth);
+  ASSERT_TRUE(rtv_heap);
+  ASSERT_TRUE(dsv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(color.get(), nullptr, rtv);
+  D3D12_DEPTH_STENCIL_VIEW_DESC view = {};
+  view.Format = depth_format;
+  view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  context_.device()->CreateDepthStencilView(depth.get(), &view, dsv);
+  constexpr FLOAT black[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, black, 0, nullptr);
+  context_.list()->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0,
+                                         0, nullptr);
+  DrawFullscreen(pipeline.get(), rtv, &dsv);
+  D3D12TestContext::Transition(
+      context_.list(), color.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(
+      context_.list(), depth.get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback color_readback;
+  ASSERT_EQ(context_.ReadbackTexture(color.get(), &color_readback), S_OK);
+  for (UINT y = 0; y < color_readback.height; ++y) {
+    for (UINT x = 0; x < color_readback.width; ++x) {
+      const auto *pixel = color_readback.data.data() +
+                          y * color_readback.row_pitch + x * 4;
+      EXPECT_NEAR(pixel[0], 64, 1);
+      EXPECT_NEAR(pixel[1], 128, 1);
+      EXPECT_NEAR(pixel[2], 191, 1);
+      EXPECT_EQ(pixel[3], 255);
+    }
+  }
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  TextureReadback depth_readback;
+  ASSERT_EQ(context_.ReadbackTexture(depth.get(), &depth_readback), S_OK);
+  for (UINT y = 0; y < depth_readback.height; ++y) {
+    for (UINT x = 0; x < depth_readback.width; ++x) {
+      float actual = 0.0f;
+      std::memcpy(&actual,
+                  depth_readback.data.data() + y * depth_readback.row_pitch +
+                      x * sizeof(actual),
+                  sizeof(actual));
+      EXPECT_NEAR(actual, 0.25f, 1.0e-6f)
+          << "depth at (" << x << ", " << y << ")";
+    }
+  }
+}
+
+TEST_F(FormatExecutionMatrixSpec,
        AdvertisedTextureCubeSampleCreatesViewExecutesAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT;
   constexpr D3D12_FORMAT_SUPPORT1 required =
@@ -557,6 +964,50 @@ TEST_F(FormatExecutionMatrixSpec,
   ExecuteAndExpect(texture.get(), D3D12_RESOURCE_STATE_COPY_DEST, valid,
                    Pipeline(ShaderValueType::Uint).get(),
                    {0x12345678u, 0, 0, 1}, &invalid);
+}
+
+TEST_F(FormatExecutionMatrixSpec,
+       UnadvertisedMsaaConfigurationRejectsAndClearsOutput) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  const auto support = Support(format);
+  if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
+    GTEST_SKIP() << "R8G8B8A8_UNORM render targets are not advertised";
+
+  UINT unsupported_sample_count = 0;
+  for (const UINT sample_count : {2u, 4u, 8u, 16u}) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality = {};
+    quality.Format = format;
+    quality.SampleCount = sample_count;
+    ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                  D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                  sizeof(quality)),
+              S_OK);
+    if (!quality.NumQualityLevels) {
+      unsupported_sample_count = sample_count;
+      break;
+    }
+  }
+  if (!unsupported_sample_count)
+    GTEST_SKIP() << "all tested MSAA sample counts are advertised";
+
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 4;
+  desc.Height = 4;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = unsupported_sample_count;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_TRUE(FAILED(context_.device()->CreateCommittedResource(
+      &heap, D3D12_HEAP_FLAG_NONE, &desc,
+      D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, __uuidof(ID3D12Resource),
+      &output)));
+  EXPECT_EQ(output, nullptr);
 }
 
 TEST_F(FormatExecutionMatrixSpec,

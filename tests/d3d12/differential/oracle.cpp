@@ -180,6 +180,7 @@ public:
 
   ID3D12Device *device() const { return device_.get(); }
   ID3D12GraphicsCommandList *list() const { return list_.get(); }
+  ID3D12CommandQueue *queue() const { return queue_.get(); }
   UINT vendor_id() const { return vendor_id_; }
   UINT device_id() const { return device_id_; }
 
@@ -359,10 +360,140 @@ bool RunBarrierChainCase(OracleContext &context,
   return result->size() == kValueCount;
 }
 
+bool RunCrossQueueFenceCase(OracleContext &context,
+                            const std::array<std::uint32_t, kValueCount> &input,
+                            std::vector<std::uint32_t> *result) {
+  D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+  queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+  ComPtr<ID3D12CommandQueue> copy_queue;
+  ComPtr<ID3D12CommandAllocator> copy_allocator;
+  ComPtr<ID3D12GraphicsCommandList> copy_list;
+  ComPtr<ID3D12CommandAllocator> direct_allocator;
+  ComPtr<ID3D12GraphicsCommandList> direct_list;
+  ComPtr<ID3D12Fence> producer_gate;
+  ComPtr<ID3D12Fence> copy_fence;
+  ComPtr<ID3D12Fence> direct_fence;
+  if (!Check(context.device()->CreateCommandQueue(
+                 &queue_desc, IID_PPV_ARGS(copy_queue.put())),
+             "CreateCommandQueue(cross queue copy)") ||
+      !Check(
+          context.device()->CreateCommandAllocator(
+              D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(copy_allocator.put())),
+          "CreateCommandAllocator(cross queue copy)") ||
+      !Check(context.device()->CreateCommandList(
+                 0, D3D12_COMMAND_LIST_TYPE_COPY, copy_allocator.get(), nullptr,
+                 IID_PPV_ARGS(copy_list.put())),
+             "CreateCommandList(cross queue copy)") ||
+      !Check(context.device()->CreateCommandAllocator(
+                 D3D12_COMMAND_LIST_TYPE_DIRECT,
+                 IID_PPV_ARGS(direct_allocator.put())),
+             "CreateCommandAllocator(cross queue direct)") ||
+      !Check(context.device()->CreateCommandList(
+                 0, D3D12_COMMAND_LIST_TYPE_DIRECT, direct_allocator.get(),
+                 nullptr, IID_PPV_ARGS(direct_list.put())),
+             "CreateCommandList(cross queue direct)") ||
+      !Check(context.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                           IID_PPV_ARGS(producer_gate.put())),
+             "CreateFence(cross queue producer gate)") ||
+      !Check(context.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                           IID_PPV_ARGS(copy_fence.put())),
+             "CreateFence(cross queue copy completion)") ||
+      !Check(context.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                           IID_PPV_ARGS(direct_fence.put())),
+             "CreateFence(cross queue direct completion)"))
+    return false;
+
+  auto upload = context.CreateUpload(input);
+  auto gpu = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
+                                  D3D12_RESOURCE_FLAG_NONE,
+                                  D3D12_RESOURCE_STATE_COMMON);
+  auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!upload || !gpu || !readback)
+    return false;
+
+  copy_list->CopyBufferRegion(gpu.get(), 0, upload.get(), 0, sizeof(input));
+  direct_list->CopyBufferRegion(readback.get(), 0, gpu.get(), 0,
+                                sizeof(input));
+  if (!Check(copy_list->Close(), "Close(cross queue copy list)") ||
+      !Check(direct_list->Close(), "Close(cross queue direct list)"))
+    return false;
+
+  // Keep the producer blocked until the consumer and its queue wait have both
+  // been submitted. A broken no-op Queue::Wait then completes the consumer
+  // while the producer is still gated, instead of winning a timing race.
+  if (!Check(copy_queue->Wait(producer_gate.get(), 1),
+             "Wait(cross queue producer gate)"))
+    return false;
+  ID3D12CommandList *copy_lists[] = {copy_list.get()};
+  copy_queue->ExecuteCommandLists(1, copy_lists);
+  constexpr UINT64 copy_complete = 1;
+  if (!Check(copy_queue->Signal(copy_fence.get(), copy_complete),
+             "Signal(cross queue copy)") ||
+      !Check(context.queue()->Wait(copy_fence.get(), copy_complete),
+             "Wait(cross queue direct)"))
+    return false;
+  ID3D12CommandList *direct_lists[] = {direct_list.get()};
+  context.queue()->ExecuteCommandLists(1, direct_lists);
+  constexpr UINT64 direct_complete = 1;
+  if (!Check(context.queue()->Signal(direct_fence.get(), direct_complete),
+             "Signal(cross queue direct)"))
+    return false;
+
+  const ULONGLONG probe_deadline = GetTickCount64() + 200;
+  while (direct_fence->GetCompletedValue() < direct_complete &&
+         GetTickCount64() < probe_deadline)
+    Sleep(1);
+  const bool bypassed_wait =
+      direct_fence->GetCompletedValue() >= direct_complete;
+
+  if (!Check(producer_gate->Signal(1), "Signal(cross queue producer gate)"))
+    return false;
+
+  auto wait_for_fence = [](ID3D12Fence *fence, UINT64 value,
+                           const char *label) {
+    if (fence->GetCompletedValue() >= value)
+      return true;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) {
+      std::cerr << label << " CreateEvent failed\n";
+      return false;
+    }
+    const bool scheduled = Check(fence->SetEventOnCompletion(value, event),
+                                 label);
+    const bool completed =
+        scheduled && WaitForSingleObject(event, 30000) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    if (!completed)
+      std::cerr << label << " timed out\n";
+    return completed;
+  };
+  if (!wait_for_fence(copy_fence.get(), copy_complete,
+                      "WaitForFence(cross queue copy)") ||
+      !wait_for_fence(direct_fence.get(), direct_complete,
+                      "WaitForFence(cross queue direct)"))
+    return false;
+  if (bypassed_wait) {
+    std::cerr << "cross queue direct work completed while producer was gated\n";
+    return false;
+  }
+
+  *result = context.Readback(readback.get(), kValueCount);
+  return result->size() == kValueCount;
+}
+
+enum class ComputePredication {
+  None,
+  Execute,
+  Skip,
+  DisableBeforeDispatch,
+};
+
 bool RunComputeCase(OracleContext &context,
                     const std::array<std::uint32_t, kValueCount> &input,
                     std::vector<std::uint32_t> *result,
-                    bool predicated = false) {
+                    ComputePredication predication = ComputePredication::None) {
   constexpr std::string_view source = R"(
     ByteAddressBuffer input : register(t0);
     RWByteAddressBuffer output : register(u0);
@@ -420,29 +551,42 @@ bool RunComputeCase(OracleContext &context,
     return false;
 
   auto upload = context.CreateUpload(input);
+  std::array<std::uint32_t, kValueCount> initial_values = {};
+  for (UINT index = 0; index < initial_values.size(); ++index)
+    initial_values[index] = 0xc001d00du ^ (index * 0x01010101u);
+  auto initial_upload = context.CreateUpload(initial_values);
   auto output = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_DEFAULT,
                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                                     D3D12_RESOURCE_STATE_COPY_DEST);
   auto readback = context.CreateBuffer(sizeof(input), D3D12_HEAP_TYPE_READBACK,
                                        D3D12_RESOURCE_FLAG_NONE,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
   std::array<std::uint32_t, kValueCount> predicate_values = {};
-  predicate_values[0] = 1;
-  auto predicate = predicated ? context.CreateUpload(predicate_values)
-                              : ComPtr<ID3D12Resource>();
-  if (!upload || !output || !readback || (predicated && !predicate))
+  predicate_values[0] = predication == ComputePredication::Execute ? 1u : 0u;
+  const bool uses_predication = predication != ComputePredication::None;
+  auto predicate = uses_predication ? context.CreateUpload(predicate_values)
+                                    : ComPtr<ID3D12Resource>();
+  if (!upload || !initial_upload || !output || !readback ||
+      (uses_predication && !predicate))
     return false;
+  context.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
+                                   sizeof(initial_values));
+  Transition(context.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   context.list()->SetPipelineState(pipeline.get());
   context.list()->SetComputeRootSignature(root.get());
   context.list()->SetComputeRootShaderResourceView(
       0, upload->GetGPUVirtualAddress());
   context.list()->SetComputeRootUnorderedAccessView(
       1, output->GetGPUVirtualAddress());
-  if (predicated)
+  if (uses_predication)
     context.list()->SetPredication(predicate.get(), 0,
                                    D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+  if (predication == ComputePredication::DisableBeforeDispatch)
+    context.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   context.list()->Dispatch(1, 1, 1);
-  if (predicated)
+  if (predication == ComputePredication::Execute ||
+      predication == ComputePredication::Skip)
     context.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   Transition(context.list(), output.get(),
              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -453,6 +597,81 @@ bool RunComputeCase(OracleContext &context,
     return false;
   *result = context.Readback(readback.get(), kValueCount);
   return result->size() == kValueCount;
+}
+
+bool RunRootConstantsCase(OracleContext &context,
+                          std::vector<std::uint32_t> *result) {
+  constexpr std::string_view source = R"(
+    cbuffer Constants : register(b0) { uint4 values; };
+    RWByteAddressBuffer output : register(u0);
+
+    [numthreads(4, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      output.Store(id.x * 4, values[id.x] ^ (id.x * 0x11111111u));
+    }
+  )";
+  ComPtr<ID3DBlob> shader;
+  if (!CompileShader(source, "cs_5_0", "D3DCompile(root constants)", &shader))
+    return false;
+
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[0].Constants.Num32BitValues = 4;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[1].Descriptor.ShaderRegister = 0;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
+  ComPtr<ID3DBlob> root_blob;
+  ComPtr<ID3DBlob> diagnostics;
+  if (!Check(D3D12SerializeRootSignature(&root_desc,
+                                         D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                         root_blob.put(), diagnostics.put()),
+             "D3D12SerializeRootSignature(root constants)"))
+    return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(context.device()->CreateRootSignature(
+                 0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                 IID_PPV_ARGS(root.put())),
+             "CreateRootSignature(root constants)"))
+    return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = root.get();
+  pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> pipeline;
+  if (!Check(context.device()->CreateComputePipelineState(
+                 &pipeline_desc, IID_PPV_ARGS(pipeline.put())),
+             "CreateComputePipelineState(root constants)"))
+    return false;
+
+  constexpr std::array<std::uint32_t, 4> constants = {0x01234567u, 0x89abcdefu,
+                                                      0x13579bdfu, 0x2468ace0u};
+  auto output = context.CreateBuffer(sizeof(constants), D3D12_HEAP_TYPE_DEFAULT,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = context.CreateBuffer(
+      sizeof(constants), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!output || !readback)
+    return false;
+
+  context.list()->SetPipelineState(pipeline.get());
+  context.list()->SetComputeRootSignature(root.get());
+  context.list()->SetComputeRoot32BitConstants(0, constants.size(),
+                                               constants.data(), 0);
+  context.list()->SetComputeRootUnorderedAccessView(
+      1, output->GetGPUVirtualAddress());
+  context.list()->Dispatch(1, 1, 1);
+  Transition(context.list(), output.get(),
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list()->CopyBufferRegion(readback.get(), 0, output.get(), 0,
+                                   sizeof(constants));
+  if (!context.ExecuteAndReset())
+    return false;
+  *result = context.Readback(readback.get(), constants.size());
+  return result->size() == constants.size();
 }
 
 bool RunDescriptorTableCase(OracleContext &context,
@@ -809,7 +1028,8 @@ bool RunTextureCopyCase(OracleContext &context,
          std::vector<std::uint32_t>(expected.begin(), expected.end());
 }
 
-bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result) {
+bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result,
+                 std::vector<std::uint32_t> *binary_query_result = nullptr) {
   constexpr std::string_view vertex_source = R"(
     struct Output { float4 position : SV_Position; };
     Output main(uint id : SV_VertexID) {
@@ -913,6 +1133,21 @@ bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result) {
                                        D3D12_RESOURCE_STATE_COPY_DEST);
   if (!readback)
     return false;
+  ComPtr<ID3D12QueryHeap> query_heap;
+  ComPtr<ID3D12Resource> query_readback;
+  if (binary_query_result) {
+    const D3D12_QUERY_HEAP_DESC query_desc = {
+        D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+    if (!Check(context.device()->CreateQueryHeap(
+                   &query_desc, IID_PPV_ARGS(query_heap.put())),
+               "CreateQueryHeap(binary occlusion)"))
+      return false;
+    query_readback = context.CreateBuffer(
+        sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!query_readback)
+      return false;
+  }
 
   constexpr FLOAT clear[4] = {};
   context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
@@ -924,7 +1159,17 @@ bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result) {
   const D3D12_RECT scissor = {0, 0, width, height};
   context.list()->RSSetViewports(1, &viewport);
   context.list()->RSSetScissorRects(1, &scissor);
+  if (binary_query_result)
+    context.list()->BeginQuery(query_heap.get(),
+                               D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
   context.list()->DrawInstanced(3, 1, 0, 0);
+  if (binary_query_result) {
+    context.list()->EndQuery(query_heap.get(),
+                             D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
+    context.list()->ResolveQueryData(query_heap.get(),
+                                     D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 1,
+                                     query_readback.get(), 0);
+  }
   Transition(context.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
              D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12_TEXTURE_COPY_LOCATION source = {};
@@ -950,6 +1195,10 @@ bool RunDrawCase(OracleContext &context, std::vector<std::uint32_t> *result) {
   }
   const D3D12_RANGE no_write = {};
   readback->Unmap(0, &no_write);
+  if (binary_query_result) {
+    *binary_query_result = context.Readback(query_readback.get(), 2);
+    return binary_query_result->size() == 2;
+  }
   return true;
 }
 
@@ -1425,8 +1674,12 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> copy;
   std::vector<std::uint32_t> offset_copy;
   std::vector<std::uint32_t> barrier_chain;
+  std::vector<std::uint32_t> cross_queue_fence;
   std::vector<std::uint32_t> compute;
   std::vector<std::uint32_t> predicated_compute;
+  std::vector<std::uint32_t> predicated_compute_false;
+  std::vector<std::uint32_t> predication_disabled_compute;
+  std::vector<std::uint32_t> root_constants;
   std::vector<std::uint32_t> descriptor_table;
   std::vector<std::uint32_t> descriptor_overwrite;
   std::vector<std::uint32_t> invalid_descriptor_heap;
@@ -1437,6 +1690,7 @@ int main(int argc, char **argv) {
   std::vector<std::uint32_t> clear_rect;
   std::vector<std::uint32_t> texture_copy;
   std::vector<std::uint32_t> draw;
+  std::vector<std::uint32_t> binary_occlusion;
   std::vector<std::uint32_t> blend;
   std::vector<std::uint32_t> depth;
   std::vector<std::uint32_t> msaa_resolve;
@@ -1453,12 +1707,31 @@ int main(int argc, char **argv) {
     std::cerr << "barrier_copy_chain case failed\n";
     return 1;
   }
+  if (!RunCrossQueueFenceCase(context, input, &cross_queue_fence)) {
+    std::cerr << "cross_queue_fence_copy case failed\n";
+    return 1;
+  }
   if (!RunComputeCase(context, input, &compute)) {
     std::cerr << "compute_u32 case failed\n";
     return 1;
   }
-  if (!RunComputeCase(context, input, &predicated_compute, true)) {
+  if (!RunComputeCase(context, input, &predicated_compute,
+                      ComputePredication::Execute)) {
     std::cerr << "predicated_compute_true case failed\n";
+    return 1;
+  }
+  if (!RunComputeCase(context, input, &predicated_compute_false,
+                      ComputePredication::Skip)) {
+    std::cerr << "predicated_compute_false case failed\n";
+    return 1;
+  }
+  if (!RunComputeCase(context, input, &predication_disabled_compute,
+                      ComputePredication::DisableBeforeDispatch)) {
+    std::cerr << "predication_disabled_compute case failed\n";
+    return 1;
+  }
+  if (!RunRootConstantsCase(context, &root_constants)) {
+    std::cerr << "root_constants_uav case failed\n";
     return 1;
   }
   if (!RunDescriptorTableCase(context, input, &descriptor_table)) {
@@ -1497,7 +1770,7 @@ int main(int argc, char **argv) {
     std::cerr << "texture_copy_rgba8 case failed\n";
     return 1;
   }
-  if (!RunDrawCase(context, &draw)) {
+  if (!RunDrawCase(context, &draw, &binary_occlusion)) {
     std::cerr << "draw_fullscreen_rgba8 case failed\n";
     return 1;
   }
@@ -1538,8 +1811,14 @@ int main(int argc, char **argv) {
   WriteValues(*output, "buffer_copy", copy, true);
   WriteValues(*output, "buffer_copy_offset", offset_copy, true);
   WriteValues(*output, "barrier_copy_chain", barrier_chain, true);
+  WriteValues(*output, "cross_queue_fence_copy", cross_queue_fence, true);
   WriteValues(*output, "compute_u32", compute, true);
   WriteValues(*output, "predicated_compute_true", predicated_compute, true);
+  WriteValues(*output, "predicated_compute_false", predicated_compute_false,
+              true);
+  WriteValues(*output, "predication_disabled_compute",
+              predication_disabled_compute, true);
+  WriteValues(*output, "root_constants_uav", root_constants, true);
   WriteValues(*output, "descriptor_table_compute", descriptor_table, true);
   WriteValues(*output, "descriptor_overwrite_before_submit",
               descriptor_overwrite, true);
@@ -1552,6 +1831,7 @@ int main(int argc, char **argv) {
   WriteValues(*output, "clear_rect_rgba8", clear_rect, true);
   WriteValues(*output, "texture_copy_rgba8", texture_copy, true);
   WriteValues(*output, "draw_fullscreen_rgba8", draw, true);
+  WriteValues(*output, "binary_occlusion_nonzero", binary_occlusion, true);
   WriteValues(*output, "blend_additive_rgba8", blend, true);
   WriteValues(*output, "depth_reject_rgba8", depth, true);
   WriteValues(*output, "msaa_resolve_rgba8", msaa_resolve, true);

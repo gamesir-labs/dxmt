@@ -12,12 +12,14 @@ from typing import Any
 
 REQUIRED_CASES = {
     "barrier_copy_chain",
+    "binary_occlusion_nonzero",
     "blend_additive_rgba8",
     "buffer_copy",
     "buffer_copy_offset",
     "clear_rect_rgba8",
     "clear_rgba8",
     "compute_u32",
+    "cross_queue_fence_copy",
     "descriptor_overwrite_before_submit",
     "descriptor_table_compute",
     "depth_reject_rgba8",
@@ -27,11 +29,31 @@ REQUIRED_CASES = {
     "invalid_resource",
     "invalid_root_signature",
     "msaa_resolve_rgba8",
+    "predicated_compute_false",
     "predicated_compute_true",
+    "predication_disabled_compute",
+    "root_constants_uav",
     "texture_copy_rgba8",
     "unsupported_iid",
 }
 MICROSOFT_VENDOR_ID = 0x1414
+INPUT_VALUES = [
+    (0x10203040 + index * 0x01020408) & 0xFFFFFFFF for index in range(16)
+]
+COMPUTE_VALUES = [
+    ((value ^ 0xA5A5A5A5) + index * 17) & 0xFFFFFFFF
+    for index, value in enumerate(INPUT_VALUES)
+]
+PREDICATION_SENTINEL_VALUES = [
+    0xC001D00D ^ (index * 0x01010101) for index in range(16)
+]
+EXACT_CASE_VALUES = {
+    "binary_occlusion_nonzero": [1, 0],
+    "cross_queue_fence_copy": INPUT_VALUES,
+    "predicated_compute_false": PREDICATION_SENTINEL_VALUES,
+    "predication_disabled_compute": COMPUTE_VALUES,
+    "root_constants_uav": [0x01234567, 0x98BADCFE, 0x3175B9FD, 0x175B9FD3],
+}
 
 
 def fnv1a64(values: list[int]) -> str:
@@ -101,6 +123,9 @@ def validate(snapshot: Any) -> list[str]:
                 f"{name}: hash_fnv1a64 {case.get('hash_fnv1a64')!r} "
                 f"!= {expected_hash}"
             )
+        exact_values = EXACT_CASE_VALUES.get(name)
+        if exact_values is not None and values != exact_values:
+            errors.append(f"{name}: values do not match the required oracle contract")
     return errors
 
 

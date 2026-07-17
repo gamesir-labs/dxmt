@@ -26,6 +26,12 @@ protected:
     NativeCopyNative,
   };
 
+  enum class ComputeBoundarySequence {
+    FallbackNativeFallback,
+    DescriptorTableUpdate,
+    RootSignatureChange,
+  };
+
   enum class DrawSequence {
     Single,
     BarrierBetweenDraws,
@@ -34,6 +40,8 @@ protected:
     PredicatedIndexed,
     ClearBetweenDraws,
     TextureCopyBetweenDraws,
+    QueryBetweenDraws,
+    RenderPassAcrossDraws,
   };
 
   void
@@ -261,7 +269,8 @@ protected:
 
     ComPtr<ID3D12QueryHeap> query_heap;
     ComPtr<ID3D12Resource> query_result;
-    if (sequence == DrawSequence::QueryAroundDraw) {
+    if (sequence == DrawSequence::QueryAroundDraw ||
+        sequence == DrawSequence::QueryBetweenDraws) {
       ASSERT_NE(query_samples, nullptr);
       D3D12_QUERY_HEAP_DESC query_desc = {};
       query_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
@@ -275,9 +284,25 @@ protected:
       ASSERT_TRUE(query_result);
     }
 
+    ComPtr<ID3D12GraphicsCommandList4> list4;
+    D3D12_RENDER_PASS_RENDER_TARGET_DESC render_pass_target = {};
+    if (sequence == DrawSequence::RenderPassAcrossDraws) {
+      ASSERT_EQ(context.list()->QueryInterface(IID_PPV_ARGS(list4.put())),
+                S_OK);
+      render_pass_target.cpuDescriptor = rtv;
+      render_pass_target.BeginningAccess.Type =
+          D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+      render_pass_target.EndingAccess.Type =
+          D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+    }
+
     const FLOAT clear[4] = {};
     context.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
-    context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    if (list4)
+      list4->BeginRenderPass(1, &render_pass_target, nullptr,
+                             D3D12_RENDER_PASS_FLAG_NONE);
+    else
+      context.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     context.list()->SetGraphicsRootSignature(root_signature.get());
     context.list()->SetPipelineState(pipeline.get());
     context.list()->SetGraphicsRoot32BitConstant(0, 0x3e800000, 0);
@@ -348,6 +373,22 @@ protected:
                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
                                    D3D12_RESOURCE_STATE_RENDER_TARGET);
       draw();
+    } else if (sequence == DrawSequence::QueryBetweenDraws) {
+      context.list()->BeginQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                 0);
+      draw();
+      context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION,
+                               0);
+      context.list()->ResolveQueryData(query_heap.get(),
+                                       D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
+                                       query_result.get(), 0);
+      draw();
+    } else if (sequence == DrawSequence::RenderPassAcrossDraws) {
+      list4->EndRenderPass();
+      list4->BeginRenderPass(1, &render_pass_target, nullptr,
+                             D3D12_RENDER_PASS_FLAG_NONE);
+      draw();
+      list4->EndRenderPass();
     } else if (sequence == DrawSequence::QueryAroundDraw) {
       context.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
       context.list()->ResolveQueryData(query_heap.get(),
@@ -488,6 +529,165 @@ protected:
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
     std::vector<std::uint8_t> bytes;
     ASSERT_EQ(context.ReadbackBuffer(output.get(), kBufferSize, &bytes), S_OK);
+    ASSERT_EQ(bytes.size(), kBufferSize);
+    values->resize(kElementCount);
+    std::memcpy(values->data(), bytes.data(), bytes.size());
+  }
+
+  void RunComputeBoundarySequence(ComputeBoundarySequence sequence,
+                                  std::vector<std::uint32_t> *values) {
+    D3D12TestContext context;
+    ASSERT_EQ(context.Initialize(), S_OK);
+
+    const auto shader = CompileShader(R"(
+      Buffer<uint> input : register(t0);
+      RWBuffer<uint> output : register(u0);
+
+      [numthreads(1, 1, 1)]
+      void main() {
+        output[input[0]] = input[1];
+      }
+    )",
+                                      "cs_5_0");
+    ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER first_parameter = {};
+    first_parameter.ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    first_parameter.DescriptorTable.NumDescriptorRanges = 2;
+    first_parameter.DescriptorTable.pDescriptorRanges = ranges;
+    D3D12_ROOT_SIGNATURE_DESC first_root_desc = {};
+    first_root_desc.NumParameters = 1;
+    first_root_desc.pParameters = &first_parameter;
+    auto first_root = context.CreateRootSignature(first_root_desc);
+    ASSERT_TRUE(first_root);
+
+    D3D12_ROOT_PARAMETER second_parameters[2] = {};
+    second_parameters[0].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    second_parameters[0].Constants.ShaderRegister = 7;
+    second_parameters[0].Constants.Num32BitValues = 1;
+    second_parameters[1] = first_parameter;
+    D3D12_ROOT_SIGNATURE_DESC second_root_desc = {};
+    second_root_desc.NumParameters = 2;
+    second_root_desc.pParameters = second_parameters;
+    ComPtr<ID3D12RootSignature> second_root;
+    if (sequence == ComputeBoundarySequence::RootSignatureChange) {
+      second_root = context.CreateRootSignature(second_root_desc);
+      ASSERT_TRUE(second_root);
+    }
+
+    const D3D12_SHADER_BYTECODE bytecode = {shader.bytecode->GetBufferPointer(),
+                                            shader.bytecode->GetBufferSize()};
+    auto first_pipeline =
+        context.CreateComputePipeline(first_root.get(), bytecode);
+    ASSERT_TRUE(first_pipeline);
+    ComPtr<ID3D12PipelineState> second_pipeline;
+    if (second_root) {
+      second_pipeline =
+          context.CreateComputePipeline(second_root.get(), bytecode);
+      ASSERT_TRUE(second_pipeline);
+    }
+
+    constexpr std::array<std::uint32_t, 2> kFirstInput = {0, 0x11111111};
+    constexpr std::array<std::uint32_t, 2> kSecondInput = {1, 0x22222222};
+    auto first_input = context.CreateUploadBuffer(
+        sizeof(kFirstInput), kFirstInput.data(), sizeof(kFirstInput));
+    auto second_input = context.CreateUploadBuffer(
+        sizeof(kSecondInput), kSecondInput.data(), sizeof(kSecondInput));
+    constexpr UINT kElementCount = 4;
+    constexpr UINT64 kBufferSize = kElementCount * sizeof(std::uint32_t);
+    auto output =
+        context.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto heap = context.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, true);
+    ASSERT_TRUE(first_input);
+    ASSERT_TRUE(second_input);
+    ASSERT_TRUE(output);
+    ASSERT_TRUE(heap);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = DXGI_FORMAT_R32_UINT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = kFirstInput.size();
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = kElementCount;
+    const std::array<ID3D12Resource *, 2> inputs = {first_input.get(),
+                                                   second_input.get()};
+    for (UINT table = 0; table < inputs.size(); ++table) {
+      const UINT base = table * 2;
+      context.device()->CreateShaderResourceView(
+          inputs[table], &srv, context.CpuDescriptorHandle(heap.get(), base));
+      context.device()->CreateUnorderedAccessView(
+          output.get(), nullptr, &uav,
+          context.CpuDescriptorHandle(heap.get(), base + 1));
+    }
+
+    ComPtr<ID3D12Resource> snapshot;
+    if (sequence == ComputeBoundarySequence::FallbackNativeFallback) {
+      snapshot = context.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
+                                      D3D12_RESOURCE_FLAG_NONE,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+      ASSERT_TRUE(snapshot);
+    }
+
+    ID3D12DescriptorHeap *heaps[] = {heap.get()};
+    context.list()->SetDescriptorHeaps(1, heaps);
+    const UINT clear[4] = {};
+    context.list()->ClearUnorderedAccessViewUint(
+        context.GpuDescriptorHandle(heap.get(), 1),
+        context.CpuDescriptorHandle(heap.get(), 1), output.get(), clear, 0,
+        nullptr);
+    D3D12TestContext::UavBarrier(context.list(), output.get());
+    context.list()->SetComputeRootSignature(first_root.get());
+    context.list()->SetPipelineState(first_pipeline.get());
+    context.list()->SetComputeRootDescriptorTable(
+        0, context.GpuDescriptorHandle(heap.get(), 0));
+    context.list()->Dispatch(1, 1, 1);
+
+    ID3D12Resource *read_source = output.get();
+    if (sequence == ComputeBoundarySequence::FallbackNativeFallback) {
+      D3D12TestContext::Transition(context.list(), output.get(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+      context.list()->CopyBufferRegion(snapshot.get(), 0, output.get(), 0,
+                                       kBufferSize);
+      D3D12TestContext::Transition(context.list(), snapshot.get(),
+                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+      read_source = snapshot.get();
+    } else if (sequence == ComputeBoundarySequence::DescriptorTableUpdate) {
+      context.list()->SetComputeRootDescriptorTable(
+          0, context.GpuDescriptorHandle(heap.get(), 2));
+      context.list()->Dispatch(1, 1, 1);
+      D3D12TestContext::Transition(context.list(), output.get(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+    } else {
+      context.list()->SetComputeRootSignature(second_root.get());
+      context.list()->SetPipelineState(second_pipeline.get());
+      context.list()->SetComputeRootDescriptorTable(
+          1, context.GpuDescriptorHandle(heap.get(), 2));
+      context.list()->Dispatch(1, 1, 1);
+      D3D12TestContext::Transition(context.list(), output.get(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+
+    std::vector<std::uint8_t> bytes;
+    ASSERT_EQ(context.ReadbackBuffer(read_source, kBufferSize, &bytes), S_OK);
     ASSERT_EQ(bytes.size(), kBufferSize);
     values->resize(kElementCount);
     std::memcpy(values->data(), bytes.data(), bytes.size());
@@ -717,6 +917,67 @@ TEST_F(ExecutionPathBoundarySpec,
 
   EXPECT_EQ(values, (std::vector<std::uint32_t>{
                         0x11111111, 0x22222222, 0x33333333, 0x00000000}));
+}
+
+TEST_F(ExecutionPathBoundarySpec,
+       ClearDispatchCopyExecutesFallbackNativeFallback) {
+  std::vector<std::uint32_t> values;
+  ASSERT_NO_FATAL_FAILURE(RunComputeBoundarySequence(
+      ComputeBoundarySequence::FallbackNativeFallback, &values));
+
+  // ClearUnorderedAccessViewUint is the leading fallback segment, Dispatch is
+  // native, and the transition plus CopyBufferRegion form the trailing
+  // fallback segment whose snapshot is read back here.
+  EXPECT_EQ(values, (std::vector<std::uint32_t>{
+                        0x11111111, 0x00000000, 0x00000000, 0x00000000}));
+}
+
+TEST_F(ExecutionPathBoundarySpec,
+       DescriptorTableOnlyUpdateSelectsNextNativeDispatchInput) {
+  std::vector<std::uint32_t> values;
+  ASSERT_NO_FATAL_FAILURE(RunComputeBoundarySequence(
+      ComputeBoundarySequence::DescriptorTableUpdate, &values));
+
+  // The only state mutation between native dispatches is the fallback
+  // SetComputeRootDescriptorTable record selecting the second SRV/UAV table.
+  EXPECT_EQ(values, (std::vector<std::uint32_t>{
+                        0x11111111, 0x22222222, 0x00000000, 0x00000000}));
+}
+
+TEST_F(ExecutionPathBoundarySpec,
+       RootSignatureChangeRebuildsBindingsForNextNativeDispatch) {
+  std::vector<std::uint32_t> values;
+  ASSERT_NO_FATAL_FAILURE(RunComputeBoundarySequence(
+      ComputeBoundarySequence::RootSignatureChange, &values));
+
+  // SetComputeRootSignature and SetPipelineState are fallback state records;
+  // the following native dispatch uses the table at the new root index.
+  EXPECT_EQ(values, (std::vector<std::uint32_t>{
+                        0x11111111, 0x22222222, 0x00000000, 0x00000000}));
+}
+
+TEST_F(ExecutionPathBoundarySpec,
+       RenderPassRebindPreservesStateAcrossNativeDraws) {
+  TextureReadback readback;
+  ASSERT_NO_FATAL_FAILURE(
+      RunAdditiveDraws(DrawSequence::RenderPassAcrossDraws, &readback));
+
+  // Each BeginRenderPass emits a fallback RenderTargets record. The native
+  // draw on each side must retain the pipeline, roots and additive blend state.
+  ExpectSolidColor(readback, 0x80808080);
+}
+
+TEST_F(ExecutionPathBoundarySpec,
+       QueryBeginEndFallbacksPreserveSurroundingNativeDrawState) {
+  TextureReadback readback;
+  UINT64 samples = 0;
+  ASSERT_NO_FATAL_FAILURE(RunAdditiveDraws(
+      DrawSequence::QueryBetweenDraws, &readback, &samples));
+
+  // BeginQuery, EndQuery and ResolveQueryData are fallback records between
+  // three native draws. Only the middle draw contributes to the query.
+  EXPECT_GT(samples, 0ull);
+  ExpectSolidColor(readback, 0xc0c0c0c0);
 }
 
 } // namespace

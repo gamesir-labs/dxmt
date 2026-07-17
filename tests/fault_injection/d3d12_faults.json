@@ -49,6 +49,13 @@
       }
     },
     {
+      "id": "resource-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedResourceFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_RESOURCE_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "descriptor-heap-creation-fail-first",
       "filter": "D3D12CreationFaultInjectionSpec.DescriptorHeapFailureClearsOutputAndNextCallRecovers",
       "environment": {
@@ -63,6 +70,13 @@
       }
     },
     {
+      "id": "descriptor-heap-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedDescriptorHeapFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT": "always"
+      }
+    },
+    {
       "id": "compute-pipeline-creation-fail-first",
       "filter": "D3D12CreationFaultInjectionSpec.ComputePipelineFailureClearsOutputAndNextCallRecovers",
       "environment": {
@@ -74,6 +88,13 @@
       "filter": "D3D12CreationFaultInjectionSpec.ComputePipelineFailureClearsOutputAndNextCallRecovers",
       "environment": {
         "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT": "2"
+      }
+    },
+    {
+      "id": "compute-pipeline-creation-fail-repeatedly",
+      "filter": "D3D12CreationFaultInjectionSpec.RepeatedComputePipelineFailuresRecoverAfterFaultIsDisabled",
+      "environment": {
+        "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT": "always"
       }
     },
     {
