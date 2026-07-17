@@ -202,6 +202,7 @@ d3d12_unit_suites = {
     'sources': files(
       'shader/container_corruption_spec.cpp',
       'shader/geometry_tessellation_spec.cpp',
+      'shader/gather_semantic_spec.cpp',
       'shader/resource_semantic_spec.cpp',
       'shader/semantic_matrix_spec.cpp',
       'shader/system_value_spec.cpp',
