@@ -426,44 +426,55 @@ PY
   fi
 }
 
-download_wine_source_tarball() {
-  local source_dir="$1"
-  local repo archive
+wine_git_auth_url() {
+  local repo
   repo="$(wine_github_repo)"
-  archive="${DOWNLOADS_DIR}/wine-${WINE_GIT_BRANCH}-${WINE_SOURCE_COMMIT}.tar.gz"
-
-  if [[ ! -f "${archive}" ]]; then
-    log "downloading Wine source tarball ${repo}@${WINE_SOURCE_COMMIT}"
-    gh_wine api \
-      -H "Accept: application/vnd.github+json" \
-      "/repos/${repo}/tarball/${WINE_GIT_BRANCH}" > "${archive}" ||
-      die "failed to download Wine source tarball"
-  fi
-
-  rm -rf "${source_dir}"
-  mkdir -p "${source_dir}"
-  tar -zxf "${archive}" --strip-components 1 -C "${source_dir}"
-  printf '%s\n' "${WINE_SOURCE_COMMIT}" > "${source_dir}/.dxmt-ci-source-commit"
+  [[ -n "${WINE_ACCESS_TOKEN:-}" ]] || die "WINE_ACCESS_TOKEN is empty"
+  printf 'https://x-access-token:%s@github.com/%s.git\n' \
+    "${WINE_ACCESS_TOKEN}" "${repo}"
 }
 
+# Keep a persistent git worktree under SOURCES_DIR and fast-forward to the
+# remote branch tip on every bootstrap (depth-1 fetch, no full history).
 sync_wine_git_source() {
   local source_dir="$1"
-  local source_stamp
+  local source_stamp remote_url expected_commit actual_commit
   export GIT_TERMINAL_PROMPT=0
   ensure_gh_wine
+  ensure_root
   WINE_SOURCE_COMMIT=""
   check_wine_access
+  expected_commit="${WINE_SOURCE_COMMIT}"
+  [[ -n "${expected_commit}" ]] || die "Wine source commit is empty"
   source_stamp="${source_dir}/.dxmt-ci-source-commit"
+  remote_url="$(wine_git_auth_url)"
 
-  if [[ -d "${source_dir}" &&
-        -f "${source_stamp}" &&
-        "$(cat "${source_stamp}")" == "${WINE_SOURCE_COMMIT}" ]]; then
-    log "Wine source already prepared from ${WINE_SOURCE_COMMIT}: ${source_dir}"
-    return
+  if [[ -d "${source_dir}/.git" ]]; then
+    log "updating Wine git source ${WINE_GIT_BRANCH} (expect ${expected_commit:0:12})"
+    git -C "${source_dir}" remote set-url origin "${remote_url}" ||
+      die "failed to set Wine git remote URL"
+    # Drop any local build-script edits from a previous molten-vk bypass so
+    # fetch/reset is clean; those patches are re-applied before each build.
+    git -C "${source_dir}" checkout -- scripts/build_on_m1.sh scripts/build_on_intel.sh 2>/dev/null || true
+    git -C "${source_dir}" fetch --force --depth=1 origin "${WINE_GIT_BRANCH}" ||
+      die "failed to fetch Wine branch ${WINE_GIT_BRANCH}"
+    git -C "${source_dir}" checkout -B "${WINE_GIT_BRANCH}" FETCH_HEAD ||
+      die "failed to checkout Wine FETCH_HEAD"
+    git -C "${source_dir}" reset --hard FETCH_HEAD ||
+      die "failed to hard-reset Wine tree to FETCH_HEAD"
+  else
+    log "cloning Wine git source ${WINE_GIT_BRANCH}@${expected_commit:0:12}"
+    rm -rf "${source_dir}"
+    mkdir -p "$(dirname "${source_dir}")"
+    git clone --depth=1 --branch "${WINE_GIT_BRANCH}" "${remote_url}" "${source_dir}" ||
+      die "failed to clone Wine repository"
   fi
 
-  log "preparing Wine source ${WINE_GIT_BRANCH}@${WINE_SOURCE_COMMIT}"
-  download_wine_source_tarball "${source_dir}"
+  actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
+  [[ -n "${actual_commit}" ]] || die "Wine git HEAD is empty after sync"
+  WINE_SOURCE_COMMIT="${actual_commit}"
+  printf '%s\n' "${actual_commit}" > "${source_stamp}"
+  log "Wine source at ${actual_commit} (${source_dir})"
 }
 
 wine_development_install_ready() {
@@ -498,27 +509,85 @@ wine_install_ready() {
 }
 
 
-build_wine_git_source() {
+patch_wine_build_scripts() {
   local source_dir="$1"
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
+  # MoltenVK comes from the LunarG Vulkan SDK. The x86_64 Homebrew formula
+  # currently fails to parse on the self-hosted runner (Rosetta brew).
   case "$(uname -m)" in
     arm64)
-      # MoltenVK comes from the LunarG Vulkan SDK. The x86_64 Homebrew formula
-      # currently fails to parse on the self-hosted runner.
-      # Restored from 570f578e / fc708c after accidental CI script overwrite.
       perl -0pi -e 's/(BREW_PACKAGES=\([^)]*) molten-vk( [^)]*\))/$1$2/' \
         "${source_dir}/scripts/build_on_m1.sh"
-      (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
     x86_64)
       perl -0pi -e 's/(BREW_PACKAGES=\([^)]*)\n    molten-vk\n([^)]*\))/$1\n$2/' \
         "${source_dir}/scripts/build_on_intel.sh"
+      ;;
+  esac
+}
+
+wine_run_make() {
+  local source_dir="$1"
+  local jobs
+  jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  [[ -f "${source_dir}/build/Makefile" ]] || return 1
+  case "$(uname -m)" in
+    arm64)
+      (cd "${source_dir}/build" && arch -x86_64 make -j"${jobs}") || return 1
+      (cd "${source_dir}/build" && arch -x86_64 make install -j"${jobs}") || return 1
+      ;;
+    x86_64)
+      (cd "${source_dir}/build" && make -j"${jobs}") || return 1
+      (cd "${source_dir}/build" && make install -j"${jobs}") || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Full configure+make via wine-proton scripts (first build or clean rebuild).
+build_wine_git_source_full() {
+  local source_dir="$1"
+  patch_wine_build_scripts "${source_dir}"
+  case "$(uname -m)" in
+    arm64)
+      (cd "${source_dir}" && ./scripts/build_on_m1.sh)
+      ;;
+    x86_64)
       (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
       die "unsupported host architecture for Wine build: $(uname -m)"
       ;;
   esac
+}
+
+# Prefer incremental make/install when an out-of-tree build already exists.
+# Set DXMT_WINE_CLEAN=1 to wipe build/install and force a full rebuild.
+build_wine_git_source() {
+  local source_dir="$1"
+  local install_dir="${source_dir}/install"
+
+  if [[ "${DXMT_WINE_CLEAN:-}" == "1" || "${DXMT_WINE_CLEAN:-}" == "true" ]]; then
+    log "DXMT_WINE_CLEAN set: wiping Wine build/install for a full rebuild"
+    rm -rf "${source_dir}/build" "${install_dir}"
+    rm -f "${source_dir}/.generated"
+  fi
+
+  if [[ -f "${source_dir}/build/Makefile" && -f "${source_dir}/.generated" ]]; then
+    log "incremental Wine make/install in ${source_dir}/build"
+    patch_wine_build_scripts "${source_dir}"
+    if wine_run_make "${source_dir}"; then
+      return 0
+    fi
+    log "incremental Wine make failed; falling back to full configure+make"
+    rm -rf "${source_dir}/build" "${install_dir}"
+    rm -f "${source_dir}/.generated"
+  fi
+
+  log "full Wine configure+make via build_on_* scripts"
+  build_wine_git_source_full "${source_dir}"
 }
 
 prepare_dxmt_wine_runtime_cache() {
@@ -532,13 +601,15 @@ prepare_dxmt_wine_runtime_cache() {
 ensure_wine_x86_64() {
   ensure_root
   local source_dir target install_dir commit stamp fingerprint temporary
+  local prev_commit=""
   source_dir="${SOURCES_DIR}/wine-proton-macos-$(safe_name "${WINE_GIT_BRANCH}")"
   WINE_SOURCE_COMMIT=""
+  # Always contact the remote branch tip, then git fetch/reset the worktree.
   sync_wine_git_source "${source_dir}"
   commit="${WINE_SOURCE_COMMIT}"
   [[ -n "${commit}" ]] || die "Wine source commit is empty"
   fingerprint="$(printf '%s\n' \
-    "schema=1" "version=${WINE_VERSION}" "commit=${commit}" \
+    "schema=2" "version=${WINE_VERSION}" "commit=${commit}" \
     "build_m1=$(shasum -a 256 "${source_dir}/scripts/build_on_m1.sh" | awk '{print $1}')" \
     "build_intel=$(shasum -a 256 "${source_dir}/scripts/build_on_intel.sh" | awk '{print $1}')" \
     "runtime=$(shasum -a 256 "${REPO_ROOT}/scripts/prepare-wine-runtime-cache.sh" | awk '{print $1}')" \
@@ -550,15 +621,22 @@ ensure_wine_x86_64() {
   fi
   install_dir="${source_dir}/install"
   stamp="${install_dir}/.dxmt-ci-source-commit"
+  if [[ -f "${stamp}" ]]; then
+    prev_commit="$(cat "${stamp}" 2>/dev/null || true)"
+  fi
 
   if wine_development_install_ready "${install_dir}" &&
      [[ -f "${stamp}" ]] &&
-     [[ "$(cat "${stamp}")" == "${commit}" ]]; then
-    log "Wine x86_64 development artifacts already prepared from ${commit}: ${install_dir}"
+     [[ "${prev_commit}" == "${commit}" ]]; then
+    log "Wine x86_64 development install already matches ${commit:0:12}"
   else
-    log "building Wine x86_64 from ${commit}"
-    rm -rf "${source_dir}/build" "${source_dir}/install"
-    rm -f "${source_dir}/.generated"
+    if [[ -n "${prev_commit}" && "${prev_commit}" != "${commit}" ]]; then
+      log "Wine tip moved ${prev_commit:0:12} -> ${commit:0:12}; incremental rebuild"
+    else
+      log "building Wine x86_64 at ${commit:0:12}"
+    fi
+    # Keep source_dir/build across tip updates for incremental make. Only a
+    # failed incremental build or DXMT_WINE_CLEAN=1 wipes the tree.
     build_wine_git_source "${source_dir}"
     wine_development_install_ready "${install_dir}" ||
       die "Wine build finished but required install artifacts are missing: ${install_dir}"
@@ -573,10 +651,17 @@ ensure_wine_x86_64() {
   temporary="${target}.incomplete-$$"
   rm -rf "${temporary}"
   mkdir -p "${temporary}"
-  cp -a "${install_dir}/." "${temporary}/"
-  printf 'schema=1\nfingerprint=%s\nsource_commit=%s\n' \
+  # Prefer rsync when available (faster refresh of an existing install tree).
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "${install_dir}/" "${temporary}/"
+  else
+    cp -a "${install_dir}/." "${temporary}/"
+  fi
+  printf 'schema=2\nfingerprint=%s\nsource_commit=%s\n' \
     "${fingerprint}" "${commit}" > "${temporary}/.dxmt-builder-dependency"
+  rm -rf "${target}"
   mv "${temporary}" "${target}"
+  log "Wine x86_64 dependency published: ${target}"
 }
 
 ensure_wine() {

@@ -25,9 +25,16 @@ scripts/dxmt-builder build --profile gcc-x64-release-full runtime
 scripts/dxmt-builder test --profile gcc-x64-release-full all
 ```
 
+`bootstrap wine-x64` keeps a git worktree of the remote Wine branch under
+`.cache/managed/sources/`, always fetches the branch tip, and builds with
+**incremental `make`/`make install`** when an out-of-tree `build/` already
+exists. Set `DXMT_WINE_CLEAN=1` to wipe `build/`/`install/` and force a full
+configure. Published install trees live under `.cache/managed/deps/wine-x86_64-*`
+for later DXMT builds to consume without recompiling Wine.
+
 All state owned by the builder lives under `.cache/managed`: stable Meson/Ninja
-profile directories, ccache, Metal and apitrace CAS entries, immutable Wine and
-LLVM dependencies, staged artifacts, locks, and telemetry. Existing directories
+profile directories, ccache, Metal and apitrace CAS entries, Wine and LLVM
+dependencies, staged artifacts, locks, and telemetry. Existing directories
 outside `.cache/managed` are legacy state; the builder neither reads, prunes,
 nor deletes them.
 
@@ -72,11 +79,20 @@ See [winehq.org - MacOS Building](https://gitlab.winehq.org/wine/wine/-/wikis/Ma
 
 You should also check the target architecture of Wine build, `--enable-archs=i386,x86_64` is a popular option when you also want x86 (32-bit programs) support in addition to x86_64.
 
-DXMT uses the `external/wine` submodule as the default Wine source tree for
-cross builds. Meson builds Wine automatically into
-`.cache/wine/build/x86_64` before linking the Wine-facing DXMT binaries. The
-default Wine configure arguments are defined by `wine_configure_args` in
-[meson.options](/meson.options).
+For managed CI and `scripts/dxmt-builder` cross builds, Wine is prepared with:
+
+```sh
+scripts/dxmt-builder bootstrap wine-x64
+```
+
+That pulls the configured remote Wine branch (see `WINE_GIT_URL` /
+`WINE_GIT_BRANCH` / `WINE_ACCESS_TOKEN`), incrementally rebuilds when possible,
+and publishes an install tree under `.cache/managed/deps/`. DXMT `build` then
+links against that tree (`ResolveWine`); it does not recompile Wine.
+
+The `external/wine` submodule remains available for local meson workflows. The
+default Wine configure arguments for that path are defined by
+`wine_configure_args` in [meson.options](/meson.options).
 
 ## Build DXMT
 

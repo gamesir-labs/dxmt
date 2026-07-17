@@ -87,6 +87,7 @@ jobs:
             "") echo "::error::WINE_ACCESS_TOKEN is empty"; exit 1 ;;
             *) echo "Wine token kind: unknown" ;;
           esac
+          # Same build-cli path as local: fetch remote Wine tip + incremental make.
           scripts/dxmt-builder bootstrap wine-x64
 
   setup-llvm-project:
