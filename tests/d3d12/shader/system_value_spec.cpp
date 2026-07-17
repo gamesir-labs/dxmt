@@ -3,6 +3,7 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -392,6 +393,209 @@ TEST_F(D3D12ShaderSystemValueSpec, ClipDistanceRejectsNegativePrimitive) {
   EXPECT_GT(counts.left_red, 20u);
   EXPECT_EQ(counts.right_red, 0u);
   EXPECT_EQ(counts.left_green + counts.right_green, 0u);
+}
+
+class D3D12PixelDepthSystemValueSpec : public ::testing::Test {
+protected:
+  void SetUp() override {
+    ASSERT_EQ(context_.Initialize(), S_OK);
+    auto vertex = CompileShader(R"(
+      cbuffer VertexDepth : register(b1) { float vertex_depth; };
+      float4 main(uint vertex_id : SV_VertexID) : SV_Position {
+        const float2 positions[3] = {
+          float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+        };
+        return float4(positions[vertex_id], vertex_depth, 1.0);
+      })",
+                                      "vs_5_0");
+    ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
+    vertex_ = std::move(vertex.bytecode);
+
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 1;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.ShaderRegister = 1;
+    parameters[1].Constants.Num32BitValues = 1;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.NumParameters = 2;
+    root_desc.pParameters = parameters;
+    root_ = context_.CreateRootSignature(root_desc);
+    ASSERT_TRUE(root_);
+
+    target_ = context_.CreateTexture2D(
+        kSize, kSize, 1, kFormat,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    depth_ = context_.CreateTexture2D(
+        kSize, kSize, 1, DXGI_FORMAT_D32_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    rtv_heap_ = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+    dsv_heap_ = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+    ASSERT_TRUE(target_);
+    ASSERT_TRUE(depth_);
+    ASSERT_TRUE(rtv_heap_);
+    ASSERT_TRUE(dsv_heap_);
+    rtv_ = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    dsv_ = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    context_.device()->CreateRenderTargetView(target_.get(), nullptr, rtv_);
+    context_.device()->CreateDepthStencilView(depth_.get(), nullptr, dsv_);
+  }
+
+  ComPtr<ID3D12PipelineState>
+  CreatePipeline(D3D12_SHADER_BYTECODE pixel,
+                 D3D12_COMPARISON_FUNC depth_function) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = root_.get();
+    desc.VS = {vertex_->GetBufferPointer(), vertex_->GetBufferSize()};
+    desc.PS = pixel;
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.DepthStencilState.DepthEnable = TRUE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = depth_function;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = kFormat;
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pipeline;
+    EXPECT_EQ(context_.device()->CreateGraphicsPipelineState(
+                  &desc, __uuidof(ID3D12PipelineState),
+                  reinterpret_cast<void **>(pipeline.put())),
+              S_OK);
+    return pipeline;
+  }
+
+  void ExpectDrawPasses(ID3D12PipelineState *pipeline, float vertex_depth,
+                        float pixel_depth, float clear_depth) {
+    constexpr FLOAT kBlack[4] = {};
+    context_.list()->ClearRenderTargetView(rtv_, kBlack, 0, nullptr);
+    context_.list()->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_DEPTH,
+                                           clear_depth, 0, 0, nullptr);
+    context_.list()->OMSetRenderTargets(1, &rtv_, FALSE, &dsv_);
+    context_.list()->SetGraphicsRootSignature(root_.get());
+    context_.list()->SetPipelineState(pipeline);
+    context_.list()->SetGraphicsRoot32BitConstant(
+        0, std::bit_cast<UINT>(pixel_depth), 0);
+    context_.list()->SetGraphicsRoot32BitConstant(
+        1, std::bit_cast<UINT>(vertex_depth), 0);
+    context_.list()->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport = {
+        0.0f, 0.0f, float(kSize), float(kSize), 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
+    context_.list()->RSSetViewports(1, &viewport);
+    context_.list()->RSSetScissorRects(1, &scissor);
+    context_.list()->DrawInstanced(3, 1, 0, 0);
+    D3D12TestContext::Transition(context_.list(), target_.get(),
+                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+    TextureReadback readback;
+    ASSERT_EQ(context_.ReadbackTexture(target_.get(), &readback), S_OK);
+    ASSERT_FALSE(readback.data.empty());
+    for (UINT y = 0; y < kSize; ++y) {
+      for (UINT x = 0; x < kSize; ++x) {
+        EXPECT_TRUE(ColorsMatch(PixelAt(readback, x, y), kGreen, 1))
+            << "pixel (" << x << ", " << y << ")";
+      }
+    }
+  }
+
+  D3D12TestContext context_;
+  ComPtr<ID3DBlob> vertex_;
+  ComPtr<ID3D12RootSignature> root_;
+  ComPtr<ID3D12Resource> target_;
+  ComPtr<ID3D12Resource> depth_;
+  ComPtr<ID3D12DescriptorHeap> rtv_heap_;
+  ComPtr<ID3D12DescriptorHeap> dsv_heap_;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv_ = {};
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv_ = {};
+};
+
+TEST_F(D3D12PixelDepthSystemValueSpec,
+       DepthOutputOverridesInterpolatedDepth) {
+  const auto pixel = CompileShader(R"(
+    cbuffer PixelDepth : register(b0) { float pixel_depth; };
+    struct Output {
+      float4 color : SV_Target;
+      float depth : SV_Depth;
+    };
+    Output main() {
+      Output output;
+      output.color = float4(0, 1, 0, 1);
+      output.depth = pixel_depth;
+      return output;
+    })",
+                                   "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  auto pipeline = CreatePipeline(
+      {pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()},
+      D3D12_COMPARISON_FUNC_LESS);
+  ASSERT_TRUE(pipeline);
+  ExpectDrawPasses(pipeline.get(), 0.8f, 0.2f, 0.5f);
+}
+
+TEST_F(D3D12PixelDepthSystemValueSpec,
+       DepthLessEqualPreservesConservativeQualifier) {
+  // Precompiled SM5 DXBC from Wine's conservative-depth conformance test.
+  static constexpr DWORD kPixelShader[] = {
+      0x43425844, 0x045c8d00, 0xc49e2ebe, 0x76f6022a, 0xf6996ecc,
+      0x00000001, 0x00000108, 0x00000003, 0x0000002c, 0x0000003c,
+      0x00000098, 0x4e475349, 0x00000008, 0x00000000, 0x00000008,
+      0x4e47534f, 0x00000054, 0x00000002, 0x00000008, 0x00000038,
+      0x00000000, 0x00000000, 0x00000003, 0x00000000, 0x0000000f,
+      0x00000042, 0x00000000, 0x00000000, 0x00000003, 0xffffffff,
+      0x00000e01, 0x545f5653, 0x65677261, 0x56530074, 0x7065445f,
+      0x654c6874, 0x71457373, 0x006c6175, 0x58454853, 0x00000068,
+      0x00000050, 0x0000001a, 0x0100086a, 0x04000059, 0x00208e46,
+      0x00000000, 0x00000001, 0x03000065, 0x001020f2, 0x00000000,
+      0x02000065, 0x00027001, 0x08000036, 0x001020f2, 0x00000000,
+      0x00004002, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000,
+      0x05000036, 0x00027001, 0x0020800a, 0x00000000, 0x00000000,
+      0x0100003e,
+  };
+  auto pipeline = CreatePipeline({kPixelShader, sizeof(kPixelShader)},
+                                 D3D12_COMPARISON_FUNC_LESS);
+  ASSERT_TRUE(pipeline);
+  ExpectDrawPasses(pipeline.get(), 0.7f, 0.4f, 0.5f);
+}
+
+TEST_F(D3D12PixelDepthSystemValueSpec,
+       DepthGreaterEqualPreservesConservativeQualifier) {
+  // Precompiled SM5 DXBC from Wine's conservative-depth conformance test.
+  static constexpr DWORD kPixelShader[] = {
+      0x43425844, 0xd17af83e, 0xa32c01cc, 0x0d8e9665, 0xe6dc17c2,
+      0x00000001, 0x0000010c, 0x00000003, 0x0000002c, 0x0000003c,
+      0x0000009c, 0x4e475349, 0x00000008, 0x00000000, 0x00000008,
+      0x4e47534f, 0x00000058, 0x00000002, 0x00000008, 0x00000038,
+      0x00000000, 0x00000000, 0x00000003, 0x00000000, 0x0000000f,
+      0x00000042, 0x00000000, 0x00000000, 0x00000003, 0xffffffff,
+      0x00000e01, 0x545f5653, 0x65677261, 0x56530074, 0x7065445f,
+      0x72476874, 0x65746165, 0x75714572, 0xab006c61, 0x58454853,
+      0x00000068, 0x00000050, 0x0000001a, 0x0100086a, 0x04000059,
+      0x00208e46, 0x00000000, 0x00000001, 0x03000065, 0x001020f2,
+      0x00000000, 0x02000065, 0x00026001, 0x08000036, 0x001020f2,
+      0x00000000, 0x00004002, 0x00000000, 0x3f800000, 0x00000000,
+      0x3f800000, 0x05000036, 0x00026001, 0x0020800a, 0x00000000,
+      0x00000000, 0x0100003e,
+  };
+  auto pipeline = CreatePipeline({kPixelShader, sizeof(kPixelShader)},
+                                 D3D12_COMPARISON_FUNC_GREATER);
+  ASSERT_TRUE(pipeline);
+  ExpectDrawPasses(pipeline.get(), 0.3f, 0.6f, 0.5f);
 }
 
 } // namespace
