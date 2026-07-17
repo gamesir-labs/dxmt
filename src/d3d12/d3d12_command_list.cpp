@@ -1013,50 +1013,45 @@ MaterializeCompiledRootDescriptorTable(
 
 static CompiledCommandFallbackReason
 MaterializeCompiledRootTables(CompiledCommandBuildState &state, bool compute) {
+  // Do not cache success/failure across draws. 8a538c8a introduced an optional
+  // sticky result that (1) kept a one-time materialize failure for the rest of
+  // the command list and (2) skipped rematerialization of already-resolved
+  // tables, leaving stale mirror GPU addresses / resource-table generations.
+  // Pre-8a rematerialized every compiled packet; restore that correctness while
+  // still writing through the same state-owned table storage.
   auto &cached = compute ? state.compute_root_table_materialization
                          : state.graphics_root_table_materialization;
-  if (cached)
-    return *cached;
+  cached.reset();
 
   const auto &root_signature =
       compute ? state.compute_root_signature : state.graphics_root_signature;
-  if (!root_signature) {
-    cached = CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-    return *cached;
-  }
+  if (!root_signature)
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
 
   auto *root = GetDXMTRootSignature(root_signature.ptr());
-  if (!root) {
-    cached = CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-    return *cached;
-  }
+  if (!root)
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
 
   const auto parameters = root->GetParameters();
   auto &tables =
       compute ? state.compute_root_tables : state.graphics_root_tables;
   for (auto &table : tables) {
-    if (table.resolved)
-      continue;
-    if (table.root_parameter_index >= parameters.size()) {
-      cached = CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-      return *cached;
-    }
+    if (table.root_parameter_index >= parameters.size())
+      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
     const auto &parameter = parameters[table.root_parameter_index];
-    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-      cached = CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
-      return *cached;
-    }
+    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
 
+    // Always rematerialize so mirror backend addresses and generations track
+    // the live descriptor heap, matching pre-8a packet materialization.
+    table.resolved = false;
     const auto reason = MaterializeCompiledRootDescriptorTable(
         table, state.descriptor_heaps, parameter);
-    if (reason != CompiledCommandFallbackReason::None) {
-      cached = reason;
-      return *cached;
-    }
+    if (reason != CompiledCommandFallbackReason::None)
+      return reason;
   }
 
-  cached = CompiledCommandFallbackReason::None;
-  return *cached;
+  return CompiledCommandFallbackReason::None;
 }
 
 class NativeRootBasePayloadBuilder {
