@@ -157,11 +157,14 @@ and the documented replay spelling `--dxmt_case_id=` remains accepted. Worker
 failure summaries print the CaseId before the assertion diagnostic.
 
 Batched tests may register stable logical CaseIds below the outer GoogleTest.
-The copy matrix, for example, exposes
-`D3D12.Copy.Buffer.ShuffledRegion.0000` through `.4095`; selecting one ID
-records and validates only that logical case while keeping the same fixture and
-oracle. Registered logical cases can also emit one JSON object per line with
-their class, requirements, execution path, and scheduler cost:
+The copy matrix exposes `D3D12.Copy.Buffer.ShuffledRegion.0000` through
+`.4095`, and the uint arithmetic matrix exposes
+`D3D12.Shader.Arithmetic.Uint32.00000` through `.16383`. Together they provide
+20,480 deterministic logical cases while using only two batched outer tests.
+Selecting one ID records and validates only that logical case, while also
+checking that every unselected output remains poison. Registered logical cases
+can emit one JSON object per line with their class, requirements, execution
+path, setup, operation sequence, oracle, diagnostic state, and scheduler cost:
 
 ```sh
 scripts/dxmt-builder test --profile gcc-x64-release-full unit \
@@ -172,12 +175,11 @@ DXMT_WINE_ROOT=.cache/wine-source/install \
   DXMT_TEST_VERBOSE_WORKERS=1 scripts/wine-test-wrapper.sh \
   .cache/managed/profiles/gcc-x64-release-full/build/tests/dxmt-wine-d3d12-tests.exe \
   --dxmt-list-case-metadata \
-  --dxmt-case-id=D3D12.Copy.Buffer.ShuffledRegion.0042
+  --dxmt-case-id=D3D12.Shader.Arithmetic.Uint32.00042
 ```
 
-On a mismatch, the matrix reports the logical CaseId, source and destination
-offsets, first mismatching index, expected and actual values, and an exact
-replay argument.
+On a mismatch, a matrix reports the logical CaseId and parameters, first
+mismatching index, expected and actual values, and an exact replay argument.
 
 The native CBV materialization tests also provide a targeted fault injection.
 The CBV keeps a valid GPU virtual address backed by a live upload resource, but

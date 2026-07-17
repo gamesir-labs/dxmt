@@ -61,6 +61,7 @@ d3d12_unit_suites = {
   'descriptor': {
     'sources': files(
       'descriptor/bindless_graphics_stage_spec.cpp',
+      'descriptor/boundary_execution_spec.cpp',
       'descriptor/binding_hotspot_spec.cpp',
       'descriptor/buffer_view_spec.cpp',
       'descriptor/descriptor_spec.cpp',
@@ -95,6 +96,7 @@ d3d12_unit_suites = {
     'sources': files(
       'integration/batched_matrix_spec.cpp',
       'integration/frame_spec.cpp',
+      'integration/logical_case_matrix_spec.cpp',
       'integration/swapchain_spec.cpp',
     ),
   },
@@ -127,6 +129,7 @@ d3d12_unit_suites = {
       'root_signature/root_descriptor_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
+      'root_signature/version11_mixed_binding_spec.cpp',
       'root_signature/volatility_spec.cpp',
     ),
   },
@@ -150,6 +153,7 @@ d3d12_unit_suites = {
       'sync/fence_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/promotion_decay_spec.cpp',
+      'sync/producer_consumer_execution_spec.cpp',
       'sync/queue_wait_spec.cpp',
       'sync/split_transition_spec.cpp',
       'sync/transition_sequence_spec.cpp',
