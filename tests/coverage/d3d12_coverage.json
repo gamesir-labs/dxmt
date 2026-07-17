@@ -295,19 +295,28 @@
           "D3D12CreateDevice",
           "CheckFeatureSupport",
           "CreateCommandQueue",
+          "CreateCommandQueue1",
           "CreateCommandAllocator",
           "CreateCommandList",
           "CreateCommandList1",
           "CreateFence",
           "CreateCommittedResource",
+          "CreateCommittedResource1",
+          "CreateCommittedResource2",
           "CreateHeap",
+          "CreateHeap1",
           "CreatePlacedResource",
+          "CreatePlacedResource1",
           "CreateReservedResource",
+          "CreateReservedResource1",
           "GetResourceAllocationInfo",
+          "GetResourceAllocationInfo2",
           "GetCopyableFootprints",
           "GetResourceTiling",
+          "GetProtectedResourceSession",
           "MakeResident",
-          "Evict"
+          "Evict",
+          "SetBackgroundProcessingMode"
         ]
       },
       "descriptors-and-pipeline": {
@@ -326,6 +335,8 @@
           "CreateGraphicsPipelineState",
           "CreateComputePipelineState",
           "CreatePipelineState",
+          "CreateShaderCacheSession",
+          "ShaderCacheControl",
           "CreateQueryHeap",
           "CreateCommandSignature"
         ]
