@@ -19677,11 +19677,10 @@ private:
     if (!slot_mask)
       return;
 
-    const auto max_slot = 32u - __builtin_clz(slot_mask);
-    for (UINT slot = 0; slot < max_slot; ++slot) {
-      if (slot_mask & (1u << slot))
-        enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
-    }
+    // FH4 UI ghost fix: do not null-prebind all PSO layout slots (site A from
+    // 47f14b14). Empty compiled IA packets rely on sticky ArgumentEncodingContext
+    // vbuf_ across ClearState; prebinding null yields buffer_handle=0 and missing
+    // menu boards. Site B/C null-prebind paths intentionally kept.
     for (const auto &vb : input_assembler.vertex_buffers) {
       if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
         continue;
