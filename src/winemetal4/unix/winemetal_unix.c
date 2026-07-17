@@ -315,6 +315,19 @@ dxmt_metal4_dense_hang_diagnostics_enabled(void) {
 }
 
 static bool
+dxmt_metal4_queue_monitor_enabled(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(
+                  getenv("DXMT_DIAG_METAL4_QUEUE_MONITOR")) ||
+              dxmt_metal4_dense_hang_diagnostics_enabled();
+    initialized = true;
+  }
+  return enabled;
+}
+
+static bool
 dxmt_metal4_test_feedback_error_enabled(void) {
   const char *once =
       getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
@@ -329,6 +342,483 @@ dxmt_monotonic_us(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+typedef NS_ENUM(uint32_t, DXMTMetal4QueueMonitorPhase) {
+  DXMTMetal4QueueMonitorPhaseIdle = 0,
+  DXMTMetal4QueueMonitorPhaseCommitPreflight,
+  DXMTMetal4QueueMonitorPhasePendingSparseResidency,
+  DXMTMetal4QueueMonitorPhaseEnqueueWaitEvents,
+  DXMTMetal4QueueMonitorPhaseWaitForDrawable,
+  DXMTMetal4QueueMonitorPhasePresentOrderingWait,
+  DXMTMetal4QueueMonitorPhasePrepareResidency,
+  DXMTMetal4QueueMonitorPhaseCommitResidencySet,
+  DXMTMetal4QueueMonitorPhaseRequestResidency,
+  DXMTMetal4QueueMonitorPhaseUseResidencySet,
+  DXMTMetal4QueueMonitorPhaseEndCommandBuffer,
+  DXMTMetal4QueueMonitorPhaseCommandBufferThrottle,
+  DXMTMetal4QueueMonitorPhaseFeedbackSetup,
+  DXMTMetal4QueueMonitorPhaseMetalQueueCommit,
+  DXMTMetal4QueueMonitorPhasePresent,
+  DXMTMetal4QueueMonitorPhaseSignalEvents,
+  DXMTMetal4QueueMonitorPhaseFinalize,
+  DXMTMetal4QueueMonitorPhaseFeedbackInjection,
+  DXMTMetal4QueueMonitorPhaseFeedbackErrorLatch,
+  DXMTMetal4QueueMonitorPhaseReleaseSparseResidency,
+  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyRefs,
+  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyCommit,
+  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyClear,
+  DXMTMetal4QueueMonitorPhaseSparseMappingPreflight,
+  DXMTMetal4QueueMonitorPhaseSparseMappingResidencyRefs,
+  DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit,
+  DXMTMetal4QueueMonitorPhaseSparseMappingMetalUpdate,
+  DXMTMetal4QueueMonitorPhaseSparseMappingApply,
+};
+
+typedef NS_ENUM(uint32_t, DXMTMetal4QueueMonitorSource) {
+  DXMTMetal4QueueMonitorSourceNone = 0,
+  DXMTMetal4QueueMonitorSourceCommandBufferCommit,
+  DXMTMetal4QueueMonitorSourceUnixCommitThunk,
+  DXMTMetal4QueueMonitorSourceFeedbackInjection,
+  DXMTMetal4QueueMonitorSourceFeedbackErrorLatch,
+  DXMTMetal4QueueMonitorSourceReleaseSparseResidency,
+  DXMTMetal4QueueMonitorSourceSparseTextureMappings,
+};
+
+enum {
+  DXMT_METAL4_QUEUE_MONITOR_DIAGNOSTIC_CAPACITY = 16,
+  DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY = 8,
+};
+
+struct DXMTMetal4QueueMonitorWaiterDiagnostic {
+  atomic_uint_fast64_t thread;
+  atomic_uint_fast64_t since_us;
+  atomic_uint source;
+  atomic_uintptr_t command_buffer;
+};
+
+/*
+ * This tracker intentionally contains scalars only.  The watchdog must be able
+ * to report a stuck Objective-C monitor without retaining or messaging the
+ * queue, command buffer, or drawable that may be involved in the stall.
+ */
+struct DXMTMetal4QueueMonitorDiagnostic {
+  atomic_uintptr_t queue;
+  atomic_uintptr_t metal_queue;
+  atomic_uint_fast64_t sequence;
+  atomic_uint_fast64_t owner_thread;
+  atomic_uint owner_depth;
+  atomic_uint_fast64_t acquired_us;
+  atomic_uint_fast64_t phase_us;
+  atomic_uint phase;
+  atomic_uint source;
+  atomic_uintptr_t command_buffer;
+  atomic_uintptr_t metal_buffer;
+  atomic_uint_fast64_t completion_value;
+  atomic_uint_fast64_t frame_id;
+  atomic_uint_fast64_t chunk_id;
+  atomic_uint_fast64_t d3d_sequence_begin;
+  atomic_uint_fast64_t d3d_sequence_end;
+  atomic_uintptr_t subject;
+  atomic_uintptr_t subject_aux;
+  atomic_uint_fast64_t subject_count;
+  atomic_uint_fast64_t subject_flags;
+  atomic_uint_fast64_t last_owner_thread;
+  atomic_uint last_source;
+  atomic_uint last_phase;
+  atomic_uint_fast64_t last_duration_us;
+  atomic_uint_fast64_t last_released_us;
+  atomic_uint active_waiters;
+  atomic_uint waiter_overflow;
+  struct DXMTMetal4QueueMonitorWaiterDiagnostic
+      waiters[DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY];
+  atomic_uint report_count;
+  atomic_uint_fast64_t last_report_us;
+};
+
+static struct DXMTMetal4QueueMonitorDiagnostic
+    dxmt_metal4_queue_monitor_diagnostics
+        [DXMT_METAL4_QUEUE_MONITOR_DIAGNOSTIC_CAPACITY];
+static pthread_once_t dxmt_metal4_queue_monitor_watchdog_once =
+    PTHREAD_ONCE_INIT;
+
+static const char *
+dxmt_metal4_queue_monitor_phase_name(uint32_t phase) {
+  switch ((DXMTMetal4QueueMonitorPhase)phase) {
+  case DXMTMetal4QueueMonitorPhaseCommitPreflight:
+    return "commit-preflight";
+  case DXMTMetal4QueueMonitorPhasePendingSparseResidency:
+    return "pending-sparse-residency";
+  case DXMTMetal4QueueMonitorPhaseEnqueueWaitEvents:
+    return "enqueue-wait-events";
+  case DXMTMetal4QueueMonitorPhaseWaitForDrawable:
+    return "wait-for-drawable";
+  case DXMTMetal4QueueMonitorPhasePresentOrderingWait:
+    return "present-ordering-wait";
+  case DXMTMetal4QueueMonitorPhasePrepareResidency:
+    return "prepare-residency";
+  case DXMTMetal4QueueMonitorPhaseCommitResidencySet:
+    return "commit-residency-set";
+  case DXMTMetal4QueueMonitorPhaseRequestResidency:
+    return "request-residency";
+  case DXMTMetal4QueueMonitorPhaseUseResidencySet:
+    return "use-residency-set";
+  case DXMTMetal4QueueMonitorPhaseEndCommandBuffer:
+    return "end-command-buffer";
+  case DXMTMetal4QueueMonitorPhaseCommandBufferThrottle:
+    return "command-buffer-throttle";
+  case DXMTMetal4QueueMonitorPhaseFeedbackSetup:
+    return "feedback-setup";
+  case DXMTMetal4QueueMonitorPhaseMetalQueueCommit:
+    return "metal-queue-commit";
+  case DXMTMetal4QueueMonitorPhasePresent:
+    return "present";
+  case DXMTMetal4QueueMonitorPhaseSignalEvents:
+    return "signal-events";
+  case DXMTMetal4QueueMonitorPhaseFinalize:
+    return "finalize";
+  case DXMTMetal4QueueMonitorPhaseFeedbackInjection:
+    return "feedback-injection";
+  case DXMTMetal4QueueMonitorPhaseFeedbackErrorLatch:
+    return "feedback-error-latch";
+  case DXMTMetal4QueueMonitorPhaseReleaseSparseResidency:
+    return "release-sparse-residency";
+  case DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyRefs:
+    return "release-sparse-residency-refs";
+  case DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyCommit:
+    return "release-sparse-residency-commit";
+  case DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyClear:
+    return "release-sparse-residency-clear";
+  case DXMTMetal4QueueMonitorPhaseSparseMappingPreflight:
+    return "sparse-mapping-preflight";
+  case DXMTMetal4QueueMonitorPhaseSparseMappingResidencyRefs:
+    return "sparse-mapping-residency-refs";
+  case DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit:
+    return "sparse-mapping-residency-commit";
+  case DXMTMetal4QueueMonitorPhaseSparseMappingMetalUpdate:
+    return "sparse-mapping-metal-update";
+  case DXMTMetal4QueueMonitorPhaseSparseMappingApply:
+    return "sparse-mapping-apply";
+  default:
+    return "idle-or-unknown";
+  }
+}
+
+static const char *
+dxmt_metal4_queue_monitor_source_name(uint32_t source) {
+  switch ((DXMTMetal4QueueMonitorSource)source) {
+  case DXMTMetal4QueueMonitorSourceCommandBufferCommit:
+    return "command-buffer-commit";
+  case DXMTMetal4QueueMonitorSourceUnixCommitThunk:
+    return "unix-commit-thunk";
+  case DXMTMetal4QueueMonitorSourceFeedbackInjection:
+    return "feedback-injection";
+  case DXMTMetal4QueueMonitorSourceFeedbackErrorLatch:
+    return "feedback-error-latch";
+  case DXMTMetal4QueueMonitorSourceReleaseSparseResidency:
+    return "release-sparse-residency";
+  case DXMTMetal4QueueMonitorSourceSparseTextureMappings:
+    return "sparse-texture-mappings";
+  default:
+    return "none-or-unknown";
+  }
+}
+
+static void *
+dxmt_metal4_queue_monitor_watchdog(void *unused) {
+  (void)unused;
+  for (;;) {
+    usleep(100000);
+    const uint64_t now_us = dxmt_monotonic_us();
+    for (uint32_t i = 0;
+         i < DXMT_METAL4_QUEUE_MONITOR_DIAGNOSTIC_CAPACITY; i++) {
+      struct DXMTMetal4QueueMonitorDiagnostic *diag =
+          &dxmt_metal4_queue_monitor_diagnostics[i];
+      const uintptr_t queue =
+          atomic_load_explicit(&diag->queue, memory_order_acquire);
+      if (!queue || queue == UINTPTR_MAX)
+        continue;
+      const uint64_t owner_thread = atomic_load_explicit(
+          &diag->owner_thread, memory_order_acquire);
+      const uint64_t acquired_us = atomic_load_explicit(
+          &diag->acquired_us, memory_order_relaxed);
+      uint64_t oldest_waiter_thread = 0;
+      uint64_t oldest_waiter_since_us = 0;
+      uint32_t oldest_waiter_source = DXMTMetal4QueueMonitorSourceNone;
+      uintptr_t oldest_waiter_command_buffer = 0;
+      uint32_t observed_waiters = 0;
+      for (uint32_t waiter_index = 0;
+           waiter_index < DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY;
+           waiter_index++) {
+        struct DXMTMetal4QueueMonitorWaiterDiagnostic *waiter =
+            &diag->waiters[waiter_index];
+        const uint64_t waiter_thread = atomic_load_explicit(
+            &waiter->thread, memory_order_acquire);
+        if (!waiter_thread || waiter_thread == UINT64_MAX)
+          continue;
+        const uint64_t waiter_since_us = atomic_load_explicit(
+            &waiter->since_us, memory_order_relaxed);
+        observed_waiters++;
+        if (!oldest_waiter_since_us ||
+            (waiter_since_us && waiter_since_us < oldest_waiter_since_us)) {
+          oldest_waiter_thread = waiter_thread;
+          oldest_waiter_since_us = waiter_since_us;
+          oldest_waiter_source = atomic_load_explicit(
+              &waiter->source, memory_order_relaxed);
+          oldest_waiter_command_buffer = atomic_load_explicit(
+              &waiter->command_buffer, memory_order_relaxed);
+        }
+      }
+
+      const bool tracked_holder = owner_thread && acquired_us;
+      const uint64_t blocked_since_us =
+          tracked_holder ? acquired_us : oldest_waiter_since_us;
+      if (!blocked_since_us || now_us <= blocked_since_us)
+        continue;
+
+      const uint64_t held_us = now_us - blocked_since_us;
+      if (held_us < 250000)
+        continue;
+
+      const uint32_t report_count = atomic_load_explicit(
+          &diag->report_count, memory_order_relaxed);
+      const uint64_t last_report_us = atomic_load_explicit(
+          &diag->last_report_us, memory_order_relaxed);
+      if ((report_count == 1 && held_us < 1000000) ||
+          (report_count >= 2 &&
+           (held_us < 5000000 || now_us - last_report_us < 5000000)))
+        continue;
+
+      const uint64_t phase_us = atomic_load_explicit(
+          &diag->phase_us, memory_order_relaxed);
+      const uint32_t phase =
+          atomic_load_explicit(&diag->phase, memory_order_relaxed);
+      const uint32_t source =
+          atomic_load_explicit(&diag->source, memory_order_relaxed);
+      const uint64_t sequence = atomic_load_explicit(
+          &diag->sequence, memory_order_relaxed);
+
+      fprintf(stderr,
+              "err:   DXMT Metal4 queue monitor blocked: queueObject=%p metalQueue=%p"
+              " sequence=%" PRIu64 " holderTracked=%u holderTid=%" PRIu64
+              " ownerDepth=%u"
+              " source=%s phase=%s heldMs=%.3f phaseMs=%.3f"
+              " commandBuffer=%p metalBuffer=%p completion=%" PRIu64
+              " frame=%" PRIu64 " chunk=%" PRIu64
+              " d3dSeq=%" PRIu64 "-%" PRIu64
+              " subject=%p subjectAux=%p subjectCount=%" PRIu64
+              " subjectFlags=0x%" PRIx64
+              " waiterCount=%u waiterOverflow=%u"
+              " oldestWaiterTid=%" PRIu64 " oldestWaiterSource=%s"
+              " oldestWaiterMs=%.3f oldestWaiterCommandBuffer=%p"
+              " lastHolderTid=%" PRIu64 " lastSource=%s lastPhase=%s"
+              " lastDurationMs=%.3f lastReleasedAgoMs=%.3f report=%u\n",
+              (void *)queue,
+              (void *)atomic_load_explicit(&diag->metal_queue,
+                                           memory_order_relaxed),
+              sequence, tracked_holder, owner_thread,
+              atomic_load_explicit(&diag->owner_depth,
+                                   memory_order_relaxed),
+              dxmt_metal4_queue_monitor_source_name(source),
+              dxmt_metal4_queue_monitor_phase_name(phase),
+              (double)held_us / 1000.0,
+              phase_us && now_us > phase_us
+                  ? (double)(now_us - phase_us) / 1000.0
+                  : 0.0,
+              (void *)atomic_load_explicit(&diag->command_buffer,
+                                           memory_order_relaxed),
+              (void *)atomic_load_explicit(&diag->metal_buffer,
+                                           memory_order_relaxed),
+              atomic_load_explicit(&diag->completion_value,
+                                   memory_order_relaxed),
+              atomic_load_explicit(&diag->frame_id, memory_order_relaxed),
+              atomic_load_explicit(&diag->chunk_id, memory_order_relaxed),
+              atomic_load_explicit(&diag->d3d_sequence_begin,
+                                   memory_order_relaxed),
+              atomic_load_explicit(&diag->d3d_sequence_end,
+                                   memory_order_relaxed),
+              (void *)atomic_load_explicit(&diag->subject,
+                                           memory_order_relaxed),
+              (void *)atomic_load_explicit(&diag->subject_aux,
+                                           memory_order_relaxed),
+              atomic_load_explicit(&diag->subject_count,
+                                   memory_order_relaxed),
+              atomic_load_explicit(&diag->subject_flags,
+                                   memory_order_relaxed),
+              observed_waiters,
+              atomic_load_explicit(&diag->waiter_overflow,
+                                   memory_order_relaxed),
+              oldest_waiter_thread,
+              dxmt_metal4_queue_monitor_source_name(oldest_waiter_source),
+              oldest_waiter_thread && oldest_waiter_since_us &&
+                      now_us > oldest_waiter_since_us
+                  ? (double)(now_us - oldest_waiter_since_us) / 1000.0
+                  : 0.0,
+              (void *)oldest_waiter_command_buffer,
+              atomic_load_explicit(&diag->last_owner_thread,
+                                   memory_order_relaxed),
+              dxmt_metal4_queue_monitor_source_name(atomic_load_explicit(
+                  &diag->last_source, memory_order_relaxed)),
+              dxmt_metal4_queue_monitor_phase_name(atomic_load_explicit(
+                  &diag->last_phase, memory_order_relaxed)),
+              (double)atomic_load_explicit(&diag->last_duration_us,
+                                           memory_order_relaxed) /
+                  1000.0,
+              atomic_load_explicit(&diag->last_released_us,
+                                   memory_order_relaxed) &&
+                      now_us > atomic_load_explicit(
+                                   &diag->last_released_us,
+                                   memory_order_relaxed)
+                  ? (double)(now_us - atomic_load_explicit(
+                                          &diag->last_released_us,
+                                          memory_order_relaxed)) /
+                        1000.0
+                  : 0.0,
+              report_count + 1);
+      for (uint32_t waiter_index = 0;
+           waiter_index < DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY;
+           waiter_index++) {
+        struct DXMTMetal4QueueMonitorWaiterDiagnostic *waiter =
+            &diag->waiters[waiter_index];
+        const uint64_t waiter_thread = atomic_load_explicit(
+            &waiter->thread, memory_order_acquire);
+        if (!waiter_thread || waiter_thread == UINT64_MAX)
+          continue;
+        const uint64_t waiter_since_us = atomic_load_explicit(
+            &waiter->since_us, memory_order_relaxed);
+        fprintf(stderr,
+                "err:   DXMT Metal4 queue monitor waiter: queueObject=%p"
+                " slot=%u tid=%" PRIu64 " source=%s waitedMs=%.3f"
+                " commandBuffer=%p\n",
+                (void *)queue, waiter_index, waiter_thread,
+                dxmt_metal4_queue_monitor_source_name(atomic_load_explicit(
+                    &waiter->source, memory_order_relaxed)),
+                waiter_since_us && now_us > waiter_since_us
+                    ? (double)(now_us - waiter_since_us) / 1000.0
+                    : 0.0,
+                (void *)atomic_load_explicit(&waiter->command_buffer,
+                                             memory_order_relaxed));
+      }
+      fflush(stderr);
+      atomic_store_explicit(&diag->last_report_us, now_us,
+                            memory_order_relaxed);
+      atomic_store_explicit(&diag->report_count, report_count + 1,
+                            memory_order_relaxed);
+    }
+  }
+  return NULL;
+}
+
+static void
+dxmt_metal4_queue_monitor_start_watchdog(void) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, dxmt_metal4_queue_monitor_watchdog,
+                     NULL) == 0)
+    pthread_detach(thread);
+}
+
+static struct DXMTMetal4QueueMonitorDiagnostic *
+dxmt_metal4_queue_monitor_register(uintptr_t queue, uintptr_t metal_queue) {
+  if (!dxmt_metal4_queue_monitor_enabled())
+    return NULL;
+  pthread_once(&dxmt_metal4_queue_monitor_watchdog_once,
+               dxmt_metal4_queue_monitor_start_watchdog);
+  for (uint32_t i = 0;
+       i < DXMT_METAL4_QUEUE_MONITOR_DIAGNOSTIC_CAPACITY; i++) {
+    struct DXMTMetal4QueueMonitorDiagnostic *diag =
+        &dxmt_metal4_queue_monitor_diagnostics[i];
+    uintptr_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &diag->queue, &expected, UINTPTR_MAX, memory_order_acq_rel,
+            memory_order_relaxed))
+      continue;
+    atomic_store_explicit(&diag->metal_queue, metal_queue,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->sequence, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->owner_thread, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->owner_depth, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->acquired_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->phase_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->phase,
+                          DXMTMetal4QueueMonitorPhaseIdle,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->source,
+                          DXMTMetal4QueueMonitorSourceNone,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->command_buffer, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->metal_buffer, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->completion_value, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->frame_id, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->chunk_id, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->d3d_sequence_begin, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->d3d_sequence_end, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->subject, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->subject_aux, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->subject_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->subject_flags, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->last_owner_thread, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->last_source,
+                          DXMTMetal4QueueMonitorSourceNone,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->last_phase,
+                          DXMTMetal4QueueMonitorPhaseIdle,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->last_duration_us, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->last_released_us, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->active_waiters, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&diag->waiter_overflow, 0,
+                          memory_order_relaxed);
+    for (uint32_t waiter_index = 0;
+         waiter_index < DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY;
+         waiter_index++) {
+      struct DXMTMetal4QueueMonitorWaiterDiagnostic *waiter =
+          &diag->waiters[waiter_index];
+      atomic_store_explicit(&waiter->thread, 0, memory_order_relaxed);
+      atomic_store_explicit(&waiter->since_us, 0, memory_order_relaxed);
+      atomic_store_explicit(&waiter->source,
+                            DXMTMetal4QueueMonitorSourceNone,
+                            memory_order_relaxed);
+      atomic_store_explicit(&waiter->command_buffer, 0,
+                            memory_order_relaxed);
+    }
+    atomic_store_explicit(&diag->report_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->last_report_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&diag->queue, queue, memory_order_release);
+    return diag;
+  }
+  fprintf(stderr,
+          "warn:  DXMT Metal4 queue monitor diagnostics capacity exhausted:"
+          " queueObject=%p metalQueue=%p capacity=%u\n",
+          (void *)queue, (void *)metal_queue,
+          DXMT_METAL4_QUEUE_MONITOR_DIAGNOSTIC_CAPACITY);
+  fflush(stderr);
+  return NULL;
+}
+
+static void
+dxmt_metal4_queue_monitor_unregister(
+    struct DXMTMetal4QueueMonitorDiagnostic *diag) {
+  if (!diag)
+    return;
+  atomic_store_explicit(&diag->queue, UINTPTR_MAX, memory_order_release);
+  atomic_store_explicit(&diag->owner_thread, 0, memory_order_relaxed);
+  atomic_store_explicit(&diag->owner_depth, 0, memory_order_relaxed);
+  atomic_store_explicit(&diag->active_waiters, 0, memory_order_relaxed);
+  atomic_store_explicit(&diag->metal_queue, 0, memory_order_relaxed);
+  atomic_store_explicit(&diag->queue, 0, memory_order_release);
+}
+
+static uint64_t
+dxmt_metal4_current_thread_id(void) {
+  uint64_t thread_id = 0;
+  pthread_threadid_np(NULL, &thread_id);
+  return thread_id;
 }
 
 typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
@@ -891,6 +1381,7 @@ dxmt_metal4_is_buffer(id object) {
   struct DXMTMetal4PresentDiagnostic
       _presentDiagnostics[DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY];
   uint64_t _presentDiagnosticSerial;
+  struct DXMTMetal4QueueMonitorDiagnostic *_monitorDiagnostic;
 }
 @property(nonatomic, retain) id<MTLDevice> device;
 @property(nonatomic, retain) id<MTL4CommandQueue> metal4Queue;
@@ -909,6 +1400,20 @@ dxmt_metal4_is_buffer(id object) {
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
+- (void)monitorWaitBegin:(DXMTMetal4QueueMonitorSource)source
+           commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer;
+- (void)monitorWaitEnd:(DXMTMetal4QueueMonitorSource)source
+         commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer;
+- (void)monitorAcquired:(DXMTMetal4QueueMonitorSource)source
+                  phase:(DXMTMetal4QueueMonitorPhase)phase
+          commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer;
+- (void)monitorSetPhase:(DXMTMetal4QueueMonitorPhase)phase
+          commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer;
+- (void)monitorSetSubject:(uintptr_t)subject
+                      aux:(uintptr_t)subjectAux
+                    count:(uint64_t)subjectCount
+                    flags:(uint64_t)subjectFlags;
+- (void)monitorReleased;
 - (void)recordPresentDiagnosticForCommandBuffer:
             (DXMTMetal4CommandBuffer *)commandBuffer
                             previousValue:(uint64_t)previousValue
@@ -936,6 +1441,8 @@ dxmt_metal4_is_buffer(id object) {
   _presentEventValue = 0;
   _maxCommandBufferCount = maxCommandBufferCount;
   _commandBufferThrottleWaitCount = 0;
+  _monitorDiagnostic = dxmt_metal4_queue_monitor_register(
+      (uintptr_t)self, (uintptr_t)_metal4Queue);
   MTLResidencySetDescriptor *sparseResidencyDescriptor =
       [[MTLResidencySetDescriptor alloc] init];
   sparseResidencyDescriptor.label = @"DXMT sparse queue residency";
@@ -965,6 +1472,8 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)dealloc {
+  dxmt_metal4_queue_monitor_unregister(_monitorDiagnostic);
+  _monitorDiagnostic = NULL;
   if (_metal4Queue && _sparseResidencySet)
     [_metal4Queue removeResidencySet:_sparseResidencySet];
   [_sparseResidencySet endResidency];
@@ -983,6 +1492,223 @@ dxmt_metal4_is_buffer(id object) {
 
 - (uint64_t)nextEventValueLocked {
   return ++_eventValue;
+}
+
+- (void)monitorWaitBegin:(DXMTMetal4QueueMonitorSource)source
+           commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer {
+  if (!_monitorDiagnostic)
+    return;
+  const uint64_t thread_id = dxmt_metal4_current_thread_id();
+  for (uint32_t waiter_index = 0;
+       waiter_index < DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY;
+       waiter_index++) {
+    struct DXMTMetal4QueueMonitorWaiterDiagnostic *waiter =
+        &_monitorDiagnostic->waiters[waiter_index];
+    uint64_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &waiter->thread, &expected, UINT64_MAX, memory_order_acq_rel,
+            memory_order_relaxed))
+      continue;
+    atomic_store_explicit(&waiter->source, source, memory_order_relaxed);
+    atomic_store_explicit(&waiter->command_buffer,
+                          (uintptr_t)commandBuffer,
+                          memory_order_relaxed);
+    atomic_store_explicit(&waiter->since_us, dxmt_monotonic_us(),
+                          memory_order_relaxed);
+    const uint32_t prior_waiters = atomic_fetch_add_explicit(
+        &_monitorDiagnostic->active_waiters, 1, memory_order_relaxed);
+    if (!prior_waiters && !atomic_load_explicit(
+                              &_monitorDiagnostic->owner_thread,
+                              memory_order_acquire)) {
+      atomic_store_explicit(&_monitorDiagnostic->report_count, 0,
+                            memory_order_relaxed);
+      atomic_store_explicit(&_monitorDiagnostic->last_report_us, 0,
+                            memory_order_relaxed);
+    }
+    atomic_store_explicit(&waiter->thread, thread_id,
+                          memory_order_release);
+    return;
+  }
+  atomic_fetch_add_explicit(&_monitorDiagnostic->waiter_overflow, 1,
+                            memory_order_relaxed);
+}
+
+- (void)monitorWaitEnd:(DXMTMetal4QueueMonitorSource)source
+         commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer {
+  if (!_monitorDiagnostic)
+    return;
+  const uint64_t thread_id = dxmt_metal4_current_thread_id();
+  for (uint32_t waiter_index = 0;
+       waiter_index < DXMT_METAL4_QUEUE_MONITOR_WAITER_CAPACITY;
+       waiter_index++) {
+    struct DXMTMetal4QueueMonitorWaiterDiagnostic *waiter =
+        &_monitorDiagnostic->waiters[waiter_index];
+    if (atomic_load_explicit(&waiter->thread, memory_order_acquire) !=
+            thread_id ||
+        atomic_load_explicit(&waiter->source, memory_order_relaxed) !=
+            source ||
+        atomic_load_explicit(&waiter->command_buffer,
+                             memory_order_relaxed) !=
+            (uintptr_t)commandBuffer)
+      continue;
+    atomic_store_explicit(&waiter->since_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&waiter->source,
+                          DXMTMetal4QueueMonitorSourceNone,
+                          memory_order_relaxed);
+    atomic_store_explicit(&waiter->command_buffer, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&waiter->thread, 0, memory_order_release);
+    atomic_fetch_sub_explicit(&_monitorDiagnostic->active_waiters, 1,
+                              memory_order_relaxed);
+    return;
+  }
+}
+
+- (void)monitorAcquired:(DXMTMetal4QueueMonitorSource)source
+                  phase:(DXMTMetal4QueueMonitorPhase)phase
+          commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer {
+  if (!_monitorDiagnostic)
+    return;
+  struct WMTCommandBufferDiagnosticInfo info = {0};
+  if (commandBuffer)
+    info = commandBuffer.diagnosticInfo;
+  const uint64_t now_us = dxmt_monotonic_us();
+  const uint64_t thread_id = dxmt_metal4_current_thread_id();
+  const uint64_t existing_owner = atomic_load_explicit(
+      &_monitorDiagnostic->owner_thread, memory_order_acquire);
+  if (existing_owner == thread_id &&
+      atomic_load_explicit(&_monitorDiagnostic->owner_depth,
+                           memory_order_relaxed)) {
+    atomic_fetch_add_explicit(&_monitorDiagnostic->owner_depth, 1,
+                              memory_order_relaxed);
+    atomic_store_explicit(&_monitorDiagnostic->source, source,
+                          memory_order_relaxed);
+    atomic_store_explicit(&_monitorDiagnostic->phase, phase,
+                          memory_order_relaxed);
+    atomic_store_explicit(&_monitorDiagnostic->phase_us, now_us,
+                          memory_order_release);
+    return;
+  }
+  atomic_fetch_add_explicit(&_monitorDiagnostic->sequence, 1,
+                            memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->source, source,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->phase, phase,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->phase_us, now_us,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->acquired_us, now_us,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->command_buffer,
+                        (uintptr_t)commandBuffer, memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->metal_buffer,
+                        commandBuffer
+                            ? (uintptr_t)commandBuffer.metal4Buffer
+                            : 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->completion_value,
+                        commandBuffer ? commandBuffer.completionValue : 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->frame_id,
+                        info.frame_id, memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->chunk_id,
+                        info.chunk_id, memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->d3d_sequence_begin,
+                        info.d3d_sequence_begin,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->d3d_sequence_end,
+                        info.d3d_sequence_end,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject_aux, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject_count, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject_flags, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->report_count, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->last_report_us, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->owner_depth, 1,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->owner_thread, thread_id,
+                        memory_order_release);
+}
+
+- (void)monitorSetPhase:(DXMTMetal4QueueMonitorPhase)phase
+          commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer {
+  if (!_monitorDiagnostic)
+    return;
+  atomic_store_explicit(&_monitorDiagnostic->phase, phase,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->phase_us, dxmt_monotonic_us(),
+                        memory_order_release);
+  if (commandBuffer) {
+    atomic_store_explicit(&_monitorDiagnostic->completion_value,
+                          commandBuffer.completionValue,
+                          memory_order_relaxed);
+  }
+}
+
+- (void)monitorSetSubject:(uintptr_t)subject
+                      aux:(uintptr_t)subjectAux
+                    count:(uint64_t)subjectCount
+                    flags:(uint64_t)subjectFlags {
+  if (!_monitorDiagnostic)
+    return;
+  atomic_store_explicit(&_monitorDiagnostic->subject, subject,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject_aux, subjectAux,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject_count, subjectCount,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->subject_flags, subjectFlags,
+                        memory_order_release);
+}
+
+- (void)monitorReleased {
+  if (!_monitorDiagnostic)
+    return;
+  const uint64_t thread_id = dxmt_metal4_current_thread_id();
+  if (atomic_load_explicit(&_monitorDiagnostic->owner_thread,
+                           memory_order_acquire) != thread_id)
+    return;
+  const uint32_t depth = atomic_load_explicit(
+      &_monitorDiagnostic->owner_depth, memory_order_relaxed);
+  if (depth > 1) {
+    atomic_fetch_sub_explicit(&_monitorDiagnostic->owner_depth, 1,
+                              memory_order_relaxed);
+    return;
+  }
+  const uint64_t now_us = dxmt_monotonic_us();
+  const uint64_t acquired_us = atomic_load_explicit(
+      &_monitorDiagnostic->acquired_us, memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->last_owner_thread,
+                        thread_id, memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->last_source,
+                        atomic_load_explicit(&_monitorDiagnostic->source,
+                                             memory_order_relaxed),
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->last_phase,
+                        atomic_load_explicit(&_monitorDiagnostic->phase,
+                                             memory_order_relaxed),
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->last_duration_us,
+                        acquired_us && now_us > acquired_us
+                            ? now_us - acquired_us
+                            : 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->last_released_us, now_us,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->owner_depth, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->phase,
+                        DXMTMetal4QueueMonitorPhaseIdle,
+                        memory_order_relaxed);
+  atomic_store_explicit(&_monitorDiagnostic->owner_thread, 0,
+                        memory_order_release);
 }
 
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue {
@@ -1270,8 +1996,14 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)prepareResidencyForCommit {
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommitResidencySet
+            commandBuffer:self];
   [_residencySet commit];
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseRequestResidency
+            commandBuffer:self];
   [_residencySet requestResidency];
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseUseResidencySet
+            commandBuffer:self];
   [_metal4Buffer useResidencySet:_residencySet];
 }
 
@@ -1283,12 +2015,25 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)commit {
+  [_owner monitorWaitBegin:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+             commandBuffer:self];
   @synchronized(_owner) {
-    [self commitLocked];
+    [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+             commandBuffer:self];
+    [_owner monitorAcquired:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+                      phase:DXMTMetal4QueueMonitorPhaseCommitPreflight
+              commandBuffer:self];
+    @try {
+      [self commitLocked];
+    } @finally {
+      [_owner monitorReleased];
+    }
   }
 }
 
 - (uint64_t)commitLocked {
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommitPreflight
+            commandBuffer:self];
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
     return 0;
 
@@ -1325,6 +2070,8 @@ dxmt_metal4_is_buffer(id object) {
     return 0;
   }
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePendingSparseResidency
+            commandBuffer:self];
   [_sparseResidencyAllocations
       addObjectsFromArray:_owner.pendingSparseResidencyAllocations];
   [_owner.pendingSparseResidencyAllocations removeAllObjects];
@@ -1349,6 +2096,8 @@ dxmt_metal4_is_buffer(id object) {
     currentPresentValue = ++_owner.presentEventValue;
   }
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseEnqueueWaitEvents
+            commandBuffer:self];
   for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
     dxmt_apitrace_record_command_buffer_event(
         (obj_handle_t)self,
@@ -1359,9 +2108,13 @@ dxmt_metal4_is_buffer(id object) {
     [_owner.metal4Queue waitForEvent:wait.event value:wait.value];
   }
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseWaitForDrawable
+            commandBuffer:self];
   if (waitForDrawable)
     [_owner.metal4Queue waitForDrawable:_pendingDrawable];
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePresentOrderingWait
+            commandBuffer:self];
   if (presentOrdering && previousPresentValue) {
 #if DXMT_APITRACE_METAL
     dxmt_apitrace_record_command_buffer_event(
@@ -1374,11 +2127,17 @@ dxmt_metal4_is_buffer(id object) {
     [_owner.metal4Queue waitForEvent:_owner.presentEvent value:previousPresentValue];
   }
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePrepareResidency
+            commandBuffer:self];
   uint64_t residency_submit_us = [self prepareResidencyForCommitAndMeasure];
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseEndCommandBuffer
+            commandBuffer:self];
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValueLocked];
   _completionCurrentBeforeThrottle = _owner.event.signaledValue;
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommandBufferThrottle
+            commandBuffer:self];
   [_owner waitForCommandBufferSlotLocked:_completionValue];
   _completionCurrentAtCommit = _owner.event.signaledValue;
 
@@ -1404,6 +2163,8 @@ dxmt_metal4_is_buffer(id object) {
     [label release];
   }
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseFeedbackSetup
+            commandBuffer:self];
   MTL4CommitOptions *options = nil;
   BOOL traceFeedback = NO;
 #if DXMT_APITRACE_METAL
@@ -1445,23 +2206,38 @@ dxmt_metal4_is_buffer(id object) {
       NSError *error = feedback.error;
       BOOL injectTestError = NO;
       if (!error) {
-        @synchronized(feedbackOwner.owner) {
-          if (dxmt_truthy_env_value(
-                  getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"))) {
-            injectTestError = YES;
-          } else {
-            const char *token =
-                getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
-            if (token && token[0] && strcmp(token, "0") &&
-                strcmp(token, "false") && strcmp(token, "no") &&
-                strcmp(token, "off")) {
-              NSString *value = [NSString stringWithUTF8String:token];
-              if (![feedbackOwner.owner.testFeedbackErrorToken
-                      isEqualToString:value]) {
-                feedbackOwner.owner.testFeedbackErrorToken = value;
-                injectTestError = YES;
+        DXMTMetal4CommandQueue *feedbackQueueOwner = feedbackOwner.owner;
+        [feedbackQueueOwner
+            monitorWaitBegin:DXMTMetal4QueueMonitorSourceFeedbackInjection
+               commandBuffer:feedbackOwner];
+        @synchronized(feedbackQueueOwner) {
+          [feedbackQueueOwner
+              monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackInjection
+               commandBuffer:feedbackOwner];
+          [feedbackQueueOwner
+              monitorAcquired:DXMTMetal4QueueMonitorSourceFeedbackInjection
+                        phase:DXMTMetal4QueueMonitorPhaseFeedbackInjection
+                commandBuffer:feedbackOwner];
+          @try {
+            if (dxmt_truthy_env_value(
+                    getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"))) {
+              injectTestError = YES;
+            } else {
+              const char *token =
+                  getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
+              if (token && token[0] && strcmp(token, "0") &&
+                  strcmp(token, "false") && strcmp(token, "no") &&
+                  strcmp(token, "off")) {
+                NSString *value = [NSString stringWithUTF8String:token];
+                if (![feedbackQueueOwner.testFeedbackErrorToken
+                        isEqualToString:value]) {
+                  feedbackQueueOwner.testFeedbackErrorToken = value;
+                  injectTestError = YES;
+                }
               }
             }
+          } @finally {
+            [feedbackQueueOwner monitorReleased];
           }
         }
       }
@@ -1483,10 +2259,25 @@ dxmt_metal4_is_buffer(id object) {
       }
       BOOL firstQueueError = NO;
       if (error) {
-        @synchronized(feedbackOwner.owner) {
-          if (!feedbackOwner.owner.firstError) {
-            feedbackOwner.owner.firstError = error;
-            firstQueueError = YES;
+        DXMTMetal4CommandQueue *feedbackQueueOwner = feedbackOwner.owner;
+        [feedbackQueueOwner
+            monitorWaitBegin:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
+               commandBuffer:feedbackOwner];
+        @synchronized(feedbackQueueOwner) {
+          [feedbackQueueOwner
+              monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
+               commandBuffer:feedbackOwner];
+          [feedbackQueueOwner
+              monitorAcquired:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
+                        phase:DXMTMetal4QueueMonitorPhaseFeedbackErrorLatch
+                commandBuffer:feedbackOwner];
+          @try {
+            if (!feedbackQueueOwner.firstError) {
+              feedbackQueueOwner.firstError = error;
+              firstQueueError = YES;
+            }
+          } @finally {
+            [feedbackQueueOwner monitorReleased];
           }
         }
       }
@@ -1682,6 +2473,8 @@ dxmt_metal4_is_buffer(id object) {
 
   id<MTL4CommandBuffer> commandBuffers[1] = {_metal4Buffer};
   _internalStatus = DXMTMetal4CommandBufferStateCommitted;
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseMetalQueueCommit
+            commandBuffer:self];
   if (options)
     [_owner.metal4Queue commit:commandBuffers count:1 options:options];
   else
@@ -1696,6 +2489,8 @@ dxmt_metal4_is_buffer(id object) {
       _completionValue,
       0);
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePresent
+            commandBuffer:self];
   if (_pendingDrawable) {
     [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
     [_owner.metal4Queue signalDrawable:_pendingDrawable];
@@ -1716,6 +2511,8 @@ dxmt_metal4_is_buffer(id object) {
     }
   }
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseSignalEvents
+            commandBuffer:self];
   for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents) {
     dxmt_apitrace_record_command_buffer_event(
         (obj_handle_t)self,
@@ -1728,6 +2525,8 @@ dxmt_metal4_is_buffer(id object) {
   if (!_pendingDrawable)
     [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
 
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseFinalize
+            commandBuffer:self];
   dxmt_apitrace_finalize_command_buffer((obj_handle_t)self);
   return residency_submit_us;
 }
@@ -1851,18 +2650,41 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)releaseSparseResidencyAllocations {
+  [_owner
+      monitorWaitBegin:DXMTMetal4QueueMonitorSourceReleaseSparseResidency
+         commandBuffer:self];
   @synchronized(_owner) {
-    BOOL changed = NO;
-    for (id<MTLAllocation> allocation in _sparseResidencyAllocations) {
-      [_owner.sparseResidencyAllocationRefs removeObject:allocation];
-      if ([_owner.sparseResidencyAllocationRefs countForObject:allocation] == 0) {
-        [_owner.sparseResidencySet removeAllocation:allocation];
-        changed = YES;
+    [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceReleaseSparseResidency
+             commandBuffer:self];
+    [_owner
+        monitorAcquired:DXMTMetal4QueueMonitorSourceReleaseSparseResidency
+                  phase:DXMTMetal4QueueMonitorPhaseReleaseSparseResidency
+          commandBuffer:self];
+    @try {
+      BOOL changed = NO;
+      [_owner monitorSetPhase:
+                  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyRefs
+                commandBuffer:self];
+      for (id<MTLAllocation> allocation in _sparseResidencyAllocations) {
+        [_owner.sparseResidencyAllocationRefs removeObject:allocation];
+        if ([_owner.sparseResidencyAllocationRefs countForObject:allocation] == 0) {
+          [_owner.sparseResidencySet removeAllocation:allocation];
+          changed = YES;
+        }
       }
+      if (changed) {
+        [_owner monitorSetPhase:
+                    DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyCommit
+                  commandBuffer:self];
+        [_owner.sparseResidencySet commit];
+      }
+      [_owner monitorSetPhase:
+                  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyClear
+                commandBuffer:self];
+      [_sparseResidencyAllocations removeAllObjects];
+    } @finally {
+      [_owner monitorReleased];
     }
-    if (changed)
-      [_owner.sparseResidencySet commit];
-    [_sparseResidencyAllocations removeAllObjects];
   }
 }
 
@@ -4622,9 +5444,21 @@ static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_mtlcommandbuffer_commit_stats *params = obj;
   DXMTMetal4CommandBuffer *cmdbuf = (DXMTMetal4CommandBuffer *)params->handle;
+  DXMTMetal4CommandQueue *owner = cmdbuf.owner;
   params->ret_residency_submit_us = 0;
-  @synchronized(cmdbuf.owner) {
-    params->ret_residency_submit_us = [cmdbuf commitLocked];
+  [owner monitorWaitBegin:DXMTMetal4QueueMonitorSourceUnixCommitThunk
+            commandBuffer:cmdbuf];
+  @synchronized(owner) {
+    [owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
+            commandBuffer:cmdbuf];
+    [owner monitorAcquired:DXMTMetal4QueueMonitorSourceUnixCommitThunk
+                     phase:DXMTMetal4QueueMonitorPhaseCommitPreflight
+             commandBuffer:cmdbuf];
+    @try {
+      params->ret_residency_submit_us = [cmdbuf commitLocked];
+    } @finally {
+      [owner monitorReleased];
+    }
   }
   return STATUS_SUCCESS;
 }
@@ -5222,35 +6056,72 @@ _MTLCommandQueue_updateSparseTextureMappings(void *obj) {
           src->heap_offset / WMT_SPARSE_TILE_SIZE_IN_BYTES;
     }
 
+    uint64_t map_count = 0;
+    uint64_t unmap_count = 0;
+    for (uint64_t i = 0; i < params->operation_count; ++i) {
+      if (operations[i].mode == WMTSparseTextureMappingModeMap)
+        map_count++;
+      else
+        unmap_count++;
+    }
+
     DXMTSparseTextureResidency *residency =
         dxmt_sparse_texture_residency_for_texture(texture, true);
     NSArray *mappedHeaps = [residency mappedHeapsSnapshot];
 
+    [queue monitorWaitBegin:DXMTMetal4QueueMonitorSourceSparseTextureMappings
+              commandBuffer:nil];
     @synchronized(queue) {
-      if (!queue.firstError) {
-        NSMutableArray *allocations = [NSMutableArray arrayWithCapacity:
-            mappedHeaps.count + (heap ? 2 : 1)];
-        [allocations addObject:(id<MTLAllocation>)texture];
-        [allocations addObjectsFromArray:mappedHeaps];
-        if (heap)
-          [allocations addObject:(id<MTLAllocation>)heap];
+      [queue monitorWaitEnd:DXMTMetal4QueueMonitorSourceSparseTextureMappings
+              commandBuffer:nil];
+      [queue monitorAcquired:DXMTMetal4QueueMonitorSourceSparseTextureMappings
+                       phase:DXMTMetal4QueueMonitorPhaseSparseMappingPreflight
+               commandBuffer:nil];
+      [queue monitorSetSubject:(uintptr_t)texture
+                           aux:(uintptr_t)heap
+                         count:params->operation_count
+                         flags:(map_count & 0xffffffffull) |
+                               (unmap_count << 32)];
+      @try {
+        if (!queue.firstError) {
+          [queue monitorSetPhase:
+                     DXMTMetal4QueueMonitorPhaseSparseMappingResidencyRefs
+                   commandBuffer:nil];
+          NSMutableArray *allocations = [NSMutableArray arrayWithCapacity:
+              mappedHeaps.count + (heap ? 2 : 1)];
+          [allocations addObject:(id<MTLAllocation>)texture];
+          [allocations addObjectsFromArray:mappedHeaps];
+          if (heap)
+            [allocations addObject:(id<MTLAllocation>)heap];
 
-        for (id<MTLAllocation> allocation in allocations) {
-          if ([queue.sparseResidencyAllocationRefs
-                  countForObject:allocation] == 0)
-            [queue.sparseResidencySet addAllocation:allocation];
-          [queue.sparseResidencyAllocationRefs addObject:allocation];
-          [queue.pendingSparseResidencyAllocations addObject:allocation];
+          for (id<MTLAllocation> allocation in allocations) {
+            if ([queue.sparseResidencyAllocationRefs
+                    countForObject:allocation] == 0)
+              [queue.sparseResidencySet addAllocation:allocation];
+            [queue.sparseResidencyAllocationRefs addObject:allocation];
+            [queue.pendingSparseResidencyAllocations addObject:allocation];
+          }
+          [queue monitorSetPhase:
+                     DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit
+                   commandBuffer:nil];
+          [queue.sparseResidencySet commit];
+          [queue monitorSetPhase:
+                     DXMTMetal4QueueMonitorPhaseSparseMappingMetalUpdate
+                   commandBuffer:nil];
+          [queue.metal4Queue updateTextureMappings:texture
+                                               heap:heap
+                                         operations:mtl_ops
+                                              count:(NSUInteger)params->operation_count];
+          [queue monitorSetPhase:
+                     DXMTMetal4QueueMonitorPhaseSparseMappingApply
+                   commandBuffer:nil];
+          [residency applyOperations:operations
+                               count:params->operation_count
+                                heap:heap];
+          params->ret = 1;
         }
-        [queue.sparseResidencySet commit];
-        [queue.metal4Queue updateTextureMappings:texture
-                                             heap:heap
-                                       operations:mtl_ops
-                                            count:(NSUInteger)params->operation_count];
-        [residency applyOperations:operations
-                             count:params->operation_count
-                              heap:heap];
-        params->ret = 1;
+      } @finally {
+        [queue monitorReleased];
       }
     }
 
