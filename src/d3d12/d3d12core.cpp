@@ -215,6 +215,9 @@ public:
   CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(
       const void *library_blob, SIZE_T size, LPCWSTR subobject_name,
       REFIID riid, void **deserializer) override {
+    InitReturnPtr(deserializer);
+    if (!deserializer)
+      return E_POINTER;
     auto create_deserializer =
         GetD3D12Proc<PFN_D3D12CreateRootSignatureDeserializerFromSubobjectInLibrary>(
             "DXMTCreateRootSignatureDeserializerFromSubobjectInLibrary");

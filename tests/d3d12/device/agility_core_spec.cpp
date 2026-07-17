@@ -7,8 +7,12 @@
 
 #include "../../../src/d3d12/d3d12_agility.hpp"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -241,6 +245,24 @@ TEST(D3D12AgilityCoreSpec, FactoryFlagsRoundTripAndGlobalReset) {
   EXPECT_EQ(factory->GetFlags(), D3D12_DEVICE_FACTORY_FLAG_NONE);
 }
 
+TEST(D3D12AgilityCoreSpec, FactoriesKeepFlagsIndependent) {
+  auto first = CreateDeviceFactory();
+  auto second = CreateDeviceFactory();
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+
+  const auto first_flags = static_cast<D3D12_DEVICE_FACTORY_FLAGS>(
+      D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_EXISTING_DEVICE |
+      D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON);
+  const auto second_flags = static_cast<D3D12_DEVICE_FACTORY_FLAGS>(
+      D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_INCOMPATIBLE_EXISTING_DEVICE);
+  ASSERT_EQ(first->SetFlags(first_flags), S_OK);
+  EXPECT_EQ(second->GetFlags(), D3D12_DEVICE_FACTORY_FLAG_NONE);
+  ASSERT_EQ(second->SetFlags(second_flags), S_OK);
+  EXPECT_EQ(first->GetFlags(), first_flags);
+  EXPECT_EQ(second->GetFlags(), second_flags);
+}
+
 TEST(D3D12AgilityCoreSpec, DeviceConfigurationDescAdvertisesAgilitySdk) {
   auto factory = CreateDeviceFactory();
   ASSERT_TRUE(factory);
@@ -330,6 +352,88 @@ TEST(D3D12AgilityCoreSpec, FactoryProvidesBothDredSettingsVersions) {
   dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 }
 
+TEST(D3D12AgilityCoreSpec,
+     DredSettingsOutliveFactoryAndAcceptEveryEnablementValue) {
+  auto factory = CreateDeviceFactory();
+  ASSERT_TRUE(factory);
+
+  ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dred1;
+  ASSERT_EQ(factory->GetConfigurationInterface(
+                dxmt::d3d12::kCLSID_D3D12DeviceRemovedExtendedData,
+                __uuidof(ID3D12DeviceRemovedExtendedDataSettings1),
+                reinterpret_cast<void **>(dred1.put())),
+            S_OK);
+  ASSERT_TRUE(dred1);
+  factory.reset();
+
+  ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+  ASSERT_EQ(dred1->QueryInterface(
+                __uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                reinterpret_cast<void **>(dred.put())),
+            S_OK);
+  ASSERT_TRUE(dred);
+  for (const auto enablement :
+       std::array{D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED,
+                  D3D12_DRED_ENABLEMENT_FORCED_OFF,
+                  D3D12_DRED_ENABLEMENT_FORCED_ON}) {
+    dred->SetAutoBreadcrumbsEnablement(enablement);
+    dred->SetPageFaultEnablement(enablement);
+    dred->SetWatsonDumpEnablement(enablement);
+    dred1->SetBreadcrumbContextEnablement(enablement);
+  }
+}
+
+TEST(D3D12AgilityCoreSpec, DredSettingsRequestsReturnIndependentObjects) {
+  auto factory = CreateDeviceFactory();
+  ASSERT_TRUE(factory);
+
+  ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> first;
+  ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> second;
+  ASSERT_EQ(factory->GetConfigurationInterface(
+                dxmt::d3d12::kCLSID_D3D12DeviceRemovedExtendedData,
+                __uuidof(ID3D12DeviceRemovedExtendedDataSettings1),
+                reinterpret_cast<void **>(first.put())),
+            S_OK);
+  ASSERT_EQ(factory->GetConfigurationInterface(
+                dxmt::d3d12::kCLSID_D3D12DeviceRemovedExtendedData,
+                __uuidof(ID3D12DeviceRemovedExtendedDataSettings1),
+                reinterpret_cast<void **>(second.put())),
+            S_OK);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+
+  ComPtr<IUnknown> first_identity;
+  ComPtr<IUnknown> second_identity;
+  ASSERT_EQ(first->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(first_identity.put())),
+            S_OK);
+  ASSERT_EQ(second->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(second_identity.put())),
+            S_OK);
+  EXPECT_NE(first_identity.get(), second_identity.get());
+}
+
+TEST(D3D12AgilityCoreSpec, DredSettingsRejectUnknownInterfaceAndClearOutput) {
+  auto factory = CreateDeviceFactory();
+  ASSERT_TRUE(factory);
+
+  ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dred1;
+  ASSERT_EQ(factory->GetConfigurationInterface(
+                dxmt::d3d12::kCLSID_D3D12DeviceRemovedExtendedData,
+                __uuidof(ID3D12DeviceRemovedExtendedDataSettings1),
+                reinterpret_cast<void **>(dred1.put())),
+            S_OK);
+  ASSERT_TRUE(dred1);
+
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(dred1->QueryInterface(kUnsupportedInterface, &output),
+            E_NOINTERFACE);
+  EXPECT_EQ(output, nullptr);
+  EXPECT_EQ(dred1->QueryInterface(__uuidof(IUnknown), nullptr), E_POINTER);
+}
+
 TEST(D3D12AgilityCoreSpec, FactoryRejectsUnknownConfigurationRequests) {
   auto factory = CreateDeviceFactory();
   ASSERT_TRUE(factory);
@@ -398,6 +502,59 @@ TEST(D3D12AgilityCoreSpec, DeviceConfigurationProxiesRootSignatureHelpers) {
   EXPECT_EQ(round_trip->Desc_1_0.NumParameters, 0u);
   EXPECT_EQ(round_trip->Desc_1_0.NumStaticSamplers, 0u);
   EXPECT_EQ(round_trip->Desc_1_0.Flags, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+}
+
+TEST(D3D12AgilityCoreSpec,
+     LibrarySubobjectDeserializerFailuresClearOutput) {
+  auto factory = CreateDeviceFactory();
+  ASSERT_TRUE(factory);
+
+  ComPtr<ID3D12DeviceConfiguration1> configuration1;
+  ASSERT_EQ(factory->QueryInterface(
+                __uuidof(ID3D12DeviceConfiguration1),
+                reinterpret_cast<void **>(configuration1.put())),
+            S_OK);
+  ASSERT_TRUE(configuration1);
+
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(
+      configuration1->CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(
+          nullptr, 1, L"MissingRootSignature",
+          __uuidof(ID3D12VersionedRootSignatureDeserializer), &output),
+      E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  const std::array<std::uint8_t, 4> invalid_library = {0xde, 0xad, 0xbe, 0xef};
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(
+      configuration1->CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(
+          invalid_library.data(), invalid_library.size(),
+          L"MissingRootSignature",
+          __uuidof(ID3D12VersionedRootSignatureDeserializer), &output),
+      E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+}
+
+TEST(D3D12AgilityCoreSpec, ConcurrentInterfaceAndFactoryCreationIsStable) {
+  constexpr unsigned int kThreadCount = 8;
+  constexpr unsigned int kIterations = 16;
+  std::atomic_uint failures = 0;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (unsigned int thread_index = 0; thread_index < kThreadCount;
+       ++thread_index) {
+    threads.emplace_back([&] {
+      for (unsigned int iteration = 0; iteration < kIterations; ++iteration) {
+        auto configuration = CreateSdkConfiguration();
+        auto factory = CreateDeviceFactory();
+        if (!configuration || !factory)
+          ++failures;
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  EXPECT_EQ(failures.load(), 0u);
 }
 
 } // namespace

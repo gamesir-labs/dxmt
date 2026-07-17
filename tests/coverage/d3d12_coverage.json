@@ -454,6 +454,30 @@
           "SetEventOnCompletion",
           "SetEventOnMultipleFenceCompletion"
         ]
+      },
+      "agility-and-configuration": {
+        "minimum_percent": 100.0,
+        "apis": [
+          "SetSDKVersion",
+          "CreateDeviceFactory",
+          "FreeUnusedSDKs",
+          "InitializeFromGlobalState",
+          "ApplyToGlobalState",
+          "SetFlags",
+          "GetFlags",
+          "GetConfigurationInterface",
+          "EnableExperimentalFeatures",
+          "CreateDevice",
+          "GetDesc",
+          "GetEnabledExperimentalFeatures",
+          "SerializeVersionedRootSignature",
+          "CreateVersionedRootSignatureDeserializer",
+          "CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary",
+          "SetAutoBreadcrumbsEnablement",
+          "SetPageFaultEnablement",
+          "SetWatsonDumpEnablement",
+          "SetBreadcrumbContextEnablement"
+        ]
       }
     }
   }

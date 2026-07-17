@@ -16,7 +16,7 @@
 - public API coverage manifest 审阅时只列出 85 个方法；第一轮扩展到
   96 个，第二轮扩展到 110 个，第三轮扩展到 137 个，但距离完整
   COM surface 仍有缺口；第五轮补入已有行为测试支撑的 9 个漏项，
-  当前为 146 个。
+  第六轮加入 Agility/configuration 分类，当前为 165 个。
 
 下一批不应继续优先堆叠已有的 descriptor/copy 基础 case，而应补以下三类空洞：
 
@@ -28,7 +28,7 @@
 
 ### P0-1. 建立完整 Public API Surface Manifest
 
-`tests/coverage/d3d12_coverage.json` 审阅时只登记 85 个 API，未覆盖大量已经出现在当前 COM vtable 中的方法。第一轮补入 11 个 versioned device/resource API；第二轮补入 custom/existing heap、device control 和 marker/event API；第三轮补入 protected session、state/meta/raytracing device 面和 versioned optional command 面，当前共 137 个。后续继续把 manifest 扩展为当前 headers/实现的完整清单，再允许以“API coverage 100%”作为门槛。
+`tests/coverage/d3d12_coverage.json` 审阅时只登记 85 个 API，未覆盖大量已经出现在当前 COM vtable 中的方法。第一轮补入 11 个 versioned device/resource API；第二轮补入 custom/existing heap、device control 和 marker/event API；第三轮补入 protected session、state/meta/raytracing device 面和 versioned optional command 面；第五、六轮继续补入漏项和 Agility/configuration 分类，当前共 165 个。后续继续把 manifest 扩展为当前 headers/实现的完整清单，再允许以“API coverage 100%”作为门槛。
 
 每个公开方法必须归入原计划定义的 A/B/C 之一：
 
@@ -98,6 +98,8 @@ MarkerEventSpec.MarkersDoNotChangeExecutionOrCommandListState
         public API manifest，manifest 保持 137
 第五轮：4 个 sampler-feedback/atomic-copy/stream-output case，并强化
         AtomicCopy UINT64 lifecycle；manifest 137 -> 146
+第六轮：6 个 Agility factory/DRED/configuration COM case，
+        manifest 146 -> 165
 GetCustomHeapProperties：修正并覆盖 CUSTOM type、UMA page/pool 和 NodeMask
 OpenExistingHeapFromAddress：覆盖有效 VirtualAlloc -> placed buffer -> GPU copy
 OpenExistingHeapFromFileMapping / CreateLifetimeTracker：覆盖 fail-closed 和输出清空
@@ -112,6 +114,9 @@ fail-closed；真实 SW_MINIMIZE/窗口脱离仅允许在隔离图形会话或 V
 Sampler Feedback：覆盖旧 UAV 被明确替换为 inert/null binding，GPU 写入无效
 AtomicCopy UINT/UINT64：覆盖 E_NOTIMPL 锁存、Reset 拒绝及同 device 新 list 恢复
 Stream Output：覆盖非空 target fail-close/recovery 与空 target 合法 no-op
+Factory/DRED：覆盖 flags 隔离、独立 identity、脱离 factory 生命周期、全枚举值
+Agility concurrency：覆盖 8 线程并发 GetInterface/CreateDeviceFactory
+Library subobject deserializer：覆盖失败输出清空并修复早期返回残留指针
 ```
 
 第四轮运行安全说明：首次 16 条 swapchain 定向运行中，除
@@ -500,6 +505,13 @@ InitializeFromGlobalState / ApplyToGlobalState 顺序和重复调用
 DRED settings object 的 COM contract 和 factory/global 隔离；将来接入
   device-removed 数据后再增加创建前后的生效边界
 ```
+
+截至第六轮，已覆盖多 factory flags 隔离、DRED settings 两个接口的共同
+identity、不同请求的独立 identity、factory 释放后的对象生命周期、所有
+`D3D12_DRED_ENABLEMENT` 值、未知 IID 输出清空，以及并发 interface/factory
+创建。`CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary` 的无效
+输入输出清空也已纳入配置接口 contract；真正的 DRED 数据仍随 P0-4 的
+device-removal 状态机后续启用。
 
 ## 4. P2：兼容性、可观测性与长期压力
 

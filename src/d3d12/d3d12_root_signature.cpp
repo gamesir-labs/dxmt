@@ -1414,6 +1414,9 @@ extern "C" HRESULT __stdcall
 DXMTCreateRootSignatureDeserializerFromSubobjectInLibrary(
     const void *library_blob, SIZE_T size, LPCWSTR subobject_name,
     REFIID iid, void **deserializer) {
+  dxmt::InitReturnPtr(deserializer);
+  if (!deserializer)
+    return E_POINTER;
   if (!library_blob && size)
     return WARN_E_INVALIDARG(__func__);
   return dxmt::d3d12::CreateRootSignatureDeserializerFromSubobjectInLibrary(
