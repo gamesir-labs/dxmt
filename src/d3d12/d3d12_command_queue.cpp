@@ -18557,7 +18557,7 @@ private:
       }
     }
 
-	    for (const auto &entry : snapshot.entries) {
+    for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor || entry.stage != want_stage)
         continue;
@@ -18571,9 +18571,16 @@ private:
         continue;
       if (entry.shader_register < entry.register_lower_bound)
         continue;
-      const auto local = entry.shader_register - entry.register_lower_bound;
-      if (entry.descriptor.heap_index < local)
-        continue;
+      // Prefer the shader argument's own lower bound when present so the
+      // compact window slot matches the bindless plan used by the non-snapshot
+      // compiled path. Recipe register_lower_bound is the D3D12 range base and
+      // can disagree with SM50 RegisterLowerBound for multi-range arguments.
+      const auto argument_lower =
+          arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
+      const auto local =
+          entry.shader_register >= argument_lower
+              ? entry.shader_register - argument_lower
+              : entry.shader_register - entry.register_lower_bound;
       uint32_t compact_base = UINT_MAX;
       if (arguments) {
         for (UINT i = 0; i < argument_count; i++) {
@@ -18593,9 +18600,14 @@ private:
         const auto dst_slot = compact_base + local;
         if (dst_slot >= dxmt::kBindlessMirrorCapacity)
           continue;
+        // Keep mirror residency/slot materialization in sync with the compiled
+        // non-snapshot path before reading any heap-local payload fallback.
+        MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
+                                    want_stage, &arg);
         if (arg.Type == SM50BindingType::Sampler && window->sampler.mapped) {
           auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
           uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
+          bool wrote = false;
           auto sampler = entry.descriptor.materialized_sampler;
           if (!sampler &&
               entry.descriptor.type == DescriptorRecordType::Sampler &&
@@ -18603,9 +18615,22 @@ private:
             sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
                                          entry.descriptor.desc.sampler);
           }
-          if (sampler)
+          if (sampler) {
             EncodeMirrorSamplerSlot(encoded, *sampler);
-          else
+            wrote = true;
+          } else if (entry.descriptor.mirror) {
+            // 0940cf21 dropped this fallback when switching to submission
+            // snapshots; restore it so samplers that only exist as heap-local
+            // mirror payloads still bind on the async encode path.
+            if (const auto payload = entry.descriptor.mirror->samplerSlotPayload(
+                    entry.descriptor.heap_index, entry.descriptor.slot_version)) {
+              encoded[0] = payload->handle;
+              encoded[1] = payload->cube_handle;
+              encoded[2] = payload->lod_bias;
+              wrote = true;
+            }
+          }
+          if (!wrote)
             EncodeMirrorSamplerSlotNull(encoded, enc.dummySamplerHandle());
           dst[dst_slot] = encoded[0];
           dst[dxmt::kBindlessMirrorCapacity + dst_slot] = encoded[1];
@@ -18616,6 +18641,13 @@ private:
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
           auto payload = BuildBindlessTextureWindowPayloadFromSnapshot(
               enc, entry.descriptor, arg, want_stage);
+          // Same fallback as BuildCompiledBindlessRootOffsets: encode-time view
+          // creation can fail for reserved/partially-backed textures while the
+          // heap mirror still holds a valid GPU resource id written earlier.
+          if (!payload && entry.descriptor.mirror) {
+            payload = entry.descriptor.mirror->textureSlotPayload(
+                entry.descriptor.heap_index, entry.descriptor.slot_version);
+          }
           if (payload) {
             for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
               const uint64_t pair_base =
@@ -18791,6 +18823,14 @@ private:
       ArgumentEncodingContext &enc, const PipelineDxilShader &shader,
       const std::string &shader_key, const GraphicsBindingSnapshot &snapshot,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
+    // Restore root 32-bit constants into cbuf_ before packBindless so any CBV
+    // slot not present as a captured descriptor entry still reads the values
+    // that belonged to this submission.
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind == GraphicsBindingSnapshotEntry::Kind::RootConstants &&
+          entry.stage == Stage)
+        BindRootConstantsSnapshot(enc, entry);
+    }
     const auto &reflection = shader.reflection();
     auto bindings =
         BuildSnapshotBindlessBufferTableBindings(snapshot, Stage);
