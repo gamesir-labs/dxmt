@@ -261,4 +261,66 @@ TEST_F(CopyFootprintSpec, Device8MatchesBaseFailureAndZeroCountContracts) {
   EXPECT_EQ(extended_total, 0u);
 }
 
+TEST_F(CopyFootprintSpec, BaseOffsetOverflowFailsAtomicallyAcrossVersions) {
+  ComPtr<ID3D12Device8> device8;
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device8.put())),
+            S_OK);
+  const auto desc = TextureDesc();
+  const auto desc1 = TextureDesc1(desc);
+  constexpr UINT subresource_count = 2;
+  constexpr UINT64 base_offset = UINT64_MAX - 255;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, subresource_count>
+      base_layouts = {};
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, subresource_count>
+      extended_layouts = {};
+  std::array<UINT, subresource_count> base_rows = {};
+  std::array<UINT, subresource_count> extended_rows = {};
+  std::array<UINT64, subresource_count> base_row_sizes = {};
+  std::array<UINT64, subresource_count> extended_row_sizes = {};
+  UINT64 base_total = 0;
+  UINT64 extended_total = 0;
+
+  context_.device()->GetCopyableFootprints(
+      &desc, 0, subresource_count, base_offset, base_layouts.data(),
+      base_rows.data(), base_row_sizes.data(), &base_total);
+  device8->GetCopyableFootprints1(
+      &desc1, 0, subresource_count, base_offset, extended_layouts.data(),
+      extended_rows.data(), extended_row_sizes.data(), &extended_total);
+
+  EXPECT_EQ(std::memcmp(base_layouts.data(), extended_layouts.data(),
+                        sizeof(base_layouts)),
+            0);
+  EXPECT_EQ(base_rows, extended_rows);
+  EXPECT_EQ(base_row_sizes, extended_row_sizes);
+  EXPECT_EQ(base_total, UINT64_MAX);
+  EXPECT_EQ(extended_total, UINT64_MAX);
+  for (UINT index = 0; index < subresource_count; ++index) {
+    EXPECT_EQ(base_layouts[index].Offset, UINT64_MAX);
+    EXPECT_EQ(static_cast<UINT>(base_layouts[index].Footprint.Format),
+              UINT_MAX);
+    EXPECT_EQ(base_layouts[index].Footprint.Width, UINT_MAX);
+    EXPECT_EQ(base_layouts[index].Footprint.Height, UINT_MAX);
+    EXPECT_EQ(base_layouts[index].Footprint.Depth, UINT_MAX);
+    EXPECT_EQ(base_layouts[index].Footprint.RowPitch, UINT_MAX);
+    EXPECT_EQ(base_rows[index], UINT_MAX);
+    EXPECT_EQ(base_row_sizes[index], UINT64_MAX);
+  }
+
+  UINT64 reference_total = 0;
+  UINT64 base_total_only = 0;
+  UINT64 extended_total_only = 0;
+  context_.device()->GetCopyableFootprints(
+      &desc, 0, subresource_count, 0, nullptr, nullptr, nullptr,
+      &reference_total);
+  context_.device()->GetCopyableFootprints(
+      &desc, 0, subresource_count, UINT64_MAX, nullptr, nullptr, nullptr,
+      &base_total_only);
+  device8->GetCopyableFootprints1(
+      &desc1, 0, subresource_count, UINT64_MAX, nullptr, nullptr, nullptr,
+      &extended_total_only);
+  EXPECT_NE(reference_total, UINT64_MAX);
+  EXPECT_EQ(base_total_only, reference_total);
+  EXPECT_EQ(extended_total_only, reference_total);
+}
+
 } // namespace

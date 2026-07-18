@@ -6470,6 +6470,11 @@ private:
             depth > 1 ? (depth - 1) * slice_pitch + row_span : row_span;
       }
 
+      if ((layouts && base_offset > UINT64_MAX - offset) ||
+          subresource_size > UINT64_MAX - offset) {
+        set_invalid();
+        return;
+      }
       if (layouts) {
         layouts[i].Offset = base_offset + offset;
         layouts[i].Footprint = footprint;
@@ -6480,7 +6485,14 @@ private:
         row_size[i] = unpadded_row_size;
 
       total = offset + subresource_size;
-      offset = Align(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      if (i + 1 < sub_resource_count) {
+        if (total >
+            UINT64_MAX - (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1)) {
+          set_invalid();
+          return;
+        }
+        offset = Align(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      }
     }
 
     if (total_bytes)
