@@ -58,7 +58,10 @@ template <typename T, typename J> T cast(const J &src) {
 }
 
 template <typename T> T extract(T value, uint32_t fst, uint32_t lst) {
-  return (value >> fst) & ~(~T(0) << (lst - fst + 1));
+  constexpr uint32_t Bits = 8 * sizeof(T);
+  const uint32_t count = lst - fst + 1;
+  const T mask = count == Bits ? ~T(0) : (T(1) << count) - 1;
+  return (value >> fst) & mask;
 }
 
 inline uint32_t popcntStep(uint32_t n, uint32_t mask, uint32_t shift) {
@@ -174,6 +177,19 @@ inline uint32_t lzcnt(uint32_t n) {
 #endif
 }
 
+inline uint32_t lzcnt(uint64_t n) {
+#if defined(DXMT_ARCH_X86_64) && defined(_MSC_VER) && !defined(__clang__)
+  return (uint32_t)_lzcnt_u64(n);
+#elif defined(DXMT_ARCH_X86_64) && defined(__LZCNT__)
+  return (uint32_t)_lzcnt_u64(n);
+#elif defined(__GNUC__) || defined(__clang__)
+  return n != 0 ? __builtin_clzll(n) : 64;
+#else
+  const uint32_t hi = uint32_t(n >> 32);
+  return hi ? lzcnt(hi) : lzcnt(uint32_t(n)) + 32;
+#endif
+}
+
 template <typename T>
 uint32_t pack(T &dst, uint32_t &shift, T src, uint32_t count) {
   constexpr uint32_t Bits = 8 * sizeof(T);
@@ -186,8 +202,10 @@ uint32_t pack(T &dst, uint32_t &shift, T src, uint32_t count) {
 template <typename T>
 uint32_t unpack(T &dst, T src, uint32_t &shift, uint32_t count) {
   constexpr uint32_t Bits = 8 * sizeof(T);
-  if (likely(shift < Bits))
-    dst = (src >> shift) & ((T(1) << count) - 1);
+  if (likely(shift < Bits)) {
+    const T mask = count == Bits ? ~T(0) : (T(1) << count) - 1;
+    dst = (src >> shift) & mask;
+  }
   shift += count;
   return shift > Bits ? shift - Bits : 0;
 }

@@ -38,6 +38,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST(BitOperations, ExtractsAndPacksFields) {
   EXPECT_EQ(dxmt::bit::extract<uint32_t>(0xd6u, 1, 4), 0xbu);
+  EXPECT_EQ(dxmt::bit::extract<uint32_t>(0xdeadbeefu, 0, 31),
+            0xdeadbeefu);
 
   uint32_t packed = 0;
   uint32_t shift = 0;
@@ -51,6 +53,20 @@ TEST(BitOperations, ExtractsAndPacksFields) {
   EXPECT_EQ(unpacked, 5u);
   EXPECT_EQ(dxmt::bit::unpack(unpacked, packed, shift, 2), 0u);
   EXPECT_EQ(unpacked, 2u);
+
+  uint32_t whole = 0;
+  shift = 0;
+  EXPECT_EQ(dxmt::bit::unpack(whole, 0x89abcdefu, shift, 32), 0u);
+  EXPECT_EQ(whole, 0x89abcdefu);
+  EXPECT_EQ(shift, 32u);
+}
+
+TEST(BitOperations, CountsZeroesAcrossEntireQwords) {
+  EXPECT_EQ(dxmt::bit::tzcnt(uint64_t{0}), 64u);
+  EXPECT_EQ(dxmt::bit::lzcnt(uint64_t{0}), 64u);
+  EXPECT_EQ(dxmt::bit::tzcnt(uint64_t{1} << 47), 47u);
+  EXPECT_EQ(dxmt::bit::lzcnt(uint64_t{1} << 47), 16u);
+  EXPECT_EQ(dxmt::bit::lzcnt(uint64_t{1} << 63), 0u);
 }
 
 TEST(BitOperations, PreservesObjectRepresentationWhenCasting) {
