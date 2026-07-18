@@ -841,6 +841,54 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
   ASSERT_TRUE(stage_parser.dxilTranslation().has_value());
   EXPECT_EQ(stage_parser.dxilTranslation()->shader_kind, 1u);
   EXPECT_EQ(stage_parser.dxilTranslation()->shader_stage_name, "Vertex");
+
+  constexpr size_t rdef_resource_offset = kResourceDefHeaderSize;
+  constexpr size_t rdef_name_offset =
+      rdef_resource_offset + kResourceDefResourceBindingExtendedSize;
+  std::vector<uint8_t> resource_def(rdef_name_offset + 5);
+  Store<uint32_t>(resource_def, 8, 1u);
+  Store<uint32_t>(resource_def, 12, rdef_resource_offset);
+  Store<uint32_t>(resource_def, 16, 0x51u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 0,
+                  rdef_name_offset);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 4, 3u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 8, 1u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 12, 6u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 16, 1u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 20, 4u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 24, 4u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 28, 9u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 32, 2u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 36, 3u);
+  std::memcpy(resource_def.data() + rdef_name_offset, "rdef", 5);
+  const auto rdef_container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::ResourceDef, resource_def)
+          .add(fourcc::PipelineStateValidation, psv)
+          .build();
+
+  Parser rdef_parser;
+  ASSERT_EQ(rdef_parser.parse(rdef_container), ParseStatus::Ok);
+  ASSERT_TRUE(rdef_parser.shaderReflection().has_value());
+  const auto &rdef_reflection = *rdef_parser.shaderReflection();
+  EXPECT_TRUE(rdef_reflection.has_resource_def);
+  EXPECT_FALSE(rdef_reflection.has_runtime_data);
+  ASSERT_EQ(rdef_reflection.resources.size(), 1u);
+  EXPECT_EQ(rdef_reflection.resources[0].name, "rdef");
+  EXPECT_TRUE(rdef_reflection.resources[0].from_resource_def);
+  EXPECT_FALSE(rdef_reflection.resources[0].from_psv);
+  EXPECT_EQ(rdef_reflection.resources[0].id, 3u);
+  EXPECT_EQ(rdef_reflection.resources[0].space, 2u);
+  EXPECT_EQ(rdef_reflection.resources[0].lower_bound, 4u);
+  EXPECT_EQ(rdef_reflection.resources[0].upper_bound, 7u);
+  EXPECT_EQ(rdef_reflection.resources[0].bind_count, 4u);
+  ASSERT_TRUE(rdef_parser.dxilValidation().has_value());
+  EXPECT_TRUE(rdef_parser.dxilValidation()->valid);
+  ASSERT_TRUE(rdef_parser.dxilTranslation().has_value());
+  ASSERT_EQ(rdef_parser.dxilTranslation()->resources.size(), 1u);
+  EXPECT_EQ(rdef_parser.dxilTranslation()->resources[0].source_mask,
+            DxilTranslationSourceResourceDef);
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
