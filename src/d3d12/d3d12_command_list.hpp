@@ -116,9 +116,16 @@ struct PendingRenderPassResolve {
   D3D12_RESOLVE_MODE mode = D3D12_RESOLVE_MODE_AVERAGE;
 };
 
+struct WriteBufferImmediateOperation {
+  Com<ID3D12Resource> resource;
+  UINT64 offset = 0;
+  UINT value = 0;
+  D3D12_WRITEBUFFERIMMEDIATE_MODE mode =
+      D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+};
+
 struct WriteBufferImmediateRecord {
-  std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> parameters;
-  std::vector<D3D12_WRITEBUFFERIMMEDIATE_MODE> modes;
+  std::vector<WriteBufferImmediateOperation> operations;
 };
 
 struct ResourceBarrierRecord {

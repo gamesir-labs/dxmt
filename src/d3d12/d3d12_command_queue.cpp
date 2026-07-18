@@ -10371,6 +10371,11 @@ private:
         ReplaySetPredication(state, record);
       } else if constexpr (std::is_same_v<T, WriteBufferImmediateRecord>) {
         FlushPassBatches(chunk, state);
+        for (const auto &operation : record.operations) {
+          RecordReplayResourceAccess(chunk, state, operation.resource.ptr(),
+                                     D3D12_RESOURCE_STATE_COPY_DEST,
+                                     "WriteBufferImmediate");
+        }
         ReplayWriteBufferImmediate(chunk, record);
       } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
         RecordReplayResourceAccess(chunk, state, record.arg_buffer.ptr(),
@@ -10487,23 +10492,10 @@ private:
       UINT value;
     };
     std::vector<WriteBufferImmediateOp> ops;
-    ops.reserve(record.parameters.size());
+    ops.reserve(record.operations.size());
 
-    for (size_t i = 0; i < record.parameters.size(); i++) {
-      const auto mode = i >= record.modes.size()
-                            ? D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT
-                            : record.modes[i];
-      if (mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT &&
-          mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN &&
-          mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT) {
-        WARN("D3D12CommandQueue: WriteBufferImmediate skipped invalid mode ",
-             uint32_t(mode));
-        continue;
-      }
-
-      Resource *resource = nullptr;
-      const UINT64 offset =
-          ResolveBufferGpuAddress(record.parameters[i].Dest, resource);
+    for (const auto &operation : record.operations) {
+      auto *resource = GetResource(operation.resource.ptr());
       if (!resource || !resource->GetBufferAllocation()) {
         WARN("D3D12CommandQueue: WriteBufferImmediate skipped unknown "
              "destination");
@@ -10516,8 +10508,7 @@ private:
         continue;
       }
 
-      if ((record.parameters[i].Dest & (sizeof(UINT) - 1)) ||
-          !ValidateBufferRange(resource, offset, sizeof(UINT),
+      if (!ValidateBufferRange(resource, operation.offset, sizeof(UINT),
                                "WriteBufferImmediate")) {
         WARN("D3D12CommandQueue: WriteBufferImmediate skipped invalid "
              "destination");
@@ -10525,8 +10516,8 @@ private:
       }
 
       ops.push_back({Rc<Buffer>(resource->GetBuffer()),
-                     resource->GetHeapOffset() + offset,
-                     record.parameters[i].Value});
+                     resource->GetHeapOffset() + operation.offset,
+                     operation.value});
     }
 
     if (ops.empty())

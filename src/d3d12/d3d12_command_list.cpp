@@ -3684,16 +3684,44 @@ public:
       const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListWriteBufferImmediate);
-    if (!count || !parameters)
+    if (!count)
       return;
+    if (!parameters) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
 
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_write_buffer_immediate(
             this, count, parameters, modes);
     WriteBufferImmediateRecord record = {};
-    record.parameters.assign(parameters, parameters + count);
-    if (modes)
-      record.modes.assign(modes, modes + count);
+    record.operations.reserve(count);
+    for (UINT index = 0; index < count; ++index) {
+      const auto mode = modes ? modes[index]
+                              : D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+      if (mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT &&
+          mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN &&
+          mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+
+      const auto address = parameters[index].Dest;
+      UINT64 offset = 0;
+      auto *resource =
+          LookupBufferResourceByGpuVirtualAddress(address, &offset);
+      if ((address & (sizeof(UINT) - 1)) || !resource ||
+          resource->GetParentDevice() != device_.ptr() ||
+          resource->GetResourceDesc().Dimension !=
+              D3D12_RESOURCE_DIMENSION_BUFFER ||
+          offset > resource->GetResourceDesc().Width ||
+          sizeof(UINT) > resource->GetResourceDesc().Width - offset) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+      record.operations.push_back({resource->GetD3D12Resource(), offset,
+                                   parameters[index].Value, mode});
+    }
     AddRecord(std::move(record));
   }
 #endif
