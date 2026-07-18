@@ -2713,16 +2713,45 @@ public:
     if (!barriers || !barrier_count)
       return;
 
+    const auto belongs_to_device = [this](ID3D12Resource *resource) {
+      if (!resource)
+        return true;
+      const auto *state = dynamic_cast<Resource *>(resource);
+      return state && state->GetParentDevice() == device_.ptr();
+    };
+    for (UINT i = 0; i < barrier_count; i++) {
+      const auto &barrier = barriers[i];
+      bool resources_valid = false;
+      if (IsValidResourceBarrier(barrier)) {
+        switch (barrier.Type) {
+        case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+          resources_valid = belongs_to_device(barrier.Transition.pResource);
+          break;
+        case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
+          resources_valid =
+              belongs_to_device(barrier.Aliasing.pResourceBefore) &&
+              belongs_to_device(barrier.Aliasing.pResourceAfter);
+          break;
+        case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+          resources_valid = belongs_to_device(barrier.UAV.pResource);
+          break;
+        default:
+          break;
+        }
+      }
+      if (!resources_valid) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+    }
+
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_resource_barrier(this, barrier_count, barriers);
 
     ResourceBarrierRecord record = {};
     record.barriers.reserve(barrier_count);
-    for (UINT i = 0; i < barrier_count; i++) {
-      if (!IsValidResourceBarrier(barriers[i]))
-        recording_error_ = E_INVALIDARG;
+    for (UINT i = 0; i < barrier_count; i++)
       record.barriers.push_back(StoreResourceBarrier(barriers[i]));
-    }
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {

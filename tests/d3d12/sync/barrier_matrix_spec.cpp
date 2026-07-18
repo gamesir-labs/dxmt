@@ -12,6 +12,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 D3D12_RESOURCE_DESC BufferDesc(UINT64 size = 4096) {
@@ -411,5 +412,109 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<InvalidBarrierCase> &info) {
       return std::string(info.param.name);
     });
+
+enum class ForeignBarrierResource {
+  Transition,
+  Uav,
+  AliasingBefore,
+  AliasingAfter,
+};
+
+class ForeignLegacyBarrierSpec
+    : public ::testing::TestWithParam<ForeignBarrierResource> {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  D3D12TestContext context_;
+};
+
+TEST_P(ForeignLegacyBarrierSpec,
+       RejectsWholeBatchAndAllowsFreshListRecovery) {
+  auto local = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(local);
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign = foreign_context.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(foreign);
+
+  std::array<D3D12_RESOURCE_BARRIER, 2> barriers = {};
+  barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  switch (GetParam()) {
+  case ForeignBarrierResource::Transition:
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = foreign.get();
+    barriers[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    break;
+  case ForeignBarrierResource::Uav:
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[1].UAV.pResource = foreign.get();
+    break;
+  case ForeignBarrierResource::AliasingBefore:
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    barriers[1].Aliasing.pResourceBefore = foreign.get();
+    barriers[1].Aliasing.pResourceAfter = local.get();
+    break;
+  case ForeignBarrierResource::AliasingAfter:
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    barriers[1].Aliasing.pResourceBefore = local.get();
+    barriers[1].Aliasing.pResourceAfter = foreign.get();
+    break;
+  }
+  context_.list()->ResourceBarrier(static_cast<UINT>(barriers.size()),
+                                   barriers.data());
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> recovery_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recovery_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recovery_allocator.get(),
+                nullptr, IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  D3D12_RESOURCE_BARRIER local_transition = {};
+  local_transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  local_transition.Transition.pResource = local.get();
+  local_transition.Transition.Subresource =
+      D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  local_transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  local_transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  recovery_list->ResourceBarrier(1, &local_transition);
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string ForeignBarrierResourceName(
+    const ::testing::TestParamInfo<ForeignBarrierResource> &info) {
+  switch (info.param) {
+  case ForeignBarrierResource::Transition:
+    return "Transition";
+  case ForeignBarrierResource::Uav:
+    return "Uav";
+  case ForeignBarrierResource::AliasingBefore:
+    return "AliasingBefore";
+  case ForeignBarrierResource::AliasingAfter:
+    return "AliasingAfter";
+  }
+  return "Unknown";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CrossDeviceMatrix, ForeignLegacyBarrierSpec,
+    ::testing::Values(ForeignBarrierResource::Transition,
+                      ForeignBarrierResource::Uav,
+                      ForeignBarrierResource::AliasingBefore,
+                      ForeignBarrierResource::AliasingAfter),
+    ForeignBarrierResourceName);
 
 } // namespace
