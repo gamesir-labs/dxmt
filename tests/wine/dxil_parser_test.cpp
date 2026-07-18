@@ -2037,6 +2037,84 @@ TEST(DxilValidation, ReportsReachableRdatPsvAndCrossSourceDiagnostics) {
           .add(fourcc::PipelineStateValidation, invalid_stage_psv)
           .build(),
       {"invalid-psv-shader-stage", "psv-stage-mismatch"});
+
+  const std::vector<uint8_t> compute_strings = {'m', 'a', 'i', 'n', 0};
+  std::vector<uint8_t> compute_indices(4u * sizeof(uint32_t));
+  Store<uint32_t>(compute_indices, 0, 3u);
+  Store<uint32_t>(compute_indices, 4, 8u);
+  Store<uint32_t>(compute_indices, 8, 4u);
+  Store<uint32_t>(compute_indices, 12, 2u);
+  std::vector<uint8_t> compute_info(kRuntimeDataTableHeaderSize +
+                                    kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute_info, 0, 1u);
+  Store<uint32_t>(compute_info, 4, kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute_info, kRuntimeDataTableHeaderSize, 0u);
+  std::vector<uint8_t> compute_function(kRuntimeDataTableHeaderSize +
+                                        kRdatFunctionRecord2Size);
+  Store<uint32_t>(compute_function, 0, 1u);
+  Store<uint32_t>(compute_function, 4, kRdatFunctionRecord2Size);
+  Store<uint32_t>(compute_function, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(compute_function, kRuntimeDataTableHeaderSize + 4, 0u);
+  Store<uint32_t>(compute_function, kRuntimeDataTableHeaderSize + 8,
+                  kRdatNullRef);
+  Store<uint32_t>(compute_function, kRuntimeDataTableHeaderSize + 12,
+                  kRdatNullRef);
+  Store<uint32_t>(compute_function, kRuntimeDataTableHeaderSize + 16, 5u);
+  Store<uint32_t>(compute_function, kRuntimeDataTableHeaderSize + 48, 0u);
+  const auto compute_runtime_data =
+      DxilRuntimeDataBuilder()
+          .add(rdat::StringBuffer, compute_strings)
+          .add(rdat::IndexArrays, compute_indices)
+          .add(rdat::CSInfoTable, compute_info)
+          .add(rdat::FunctionTable, compute_function)
+          .build();
+  constexpr size_t psv2_resource_count_offset =
+      sizeof(uint32_t) + kPsvRuntimeInfo2Size;
+  std::vector<uint8_t> mismatched_thread_psv(
+      psv2_resource_count_offset + 3u * sizeof(uint32_t));
+  Store<uint32_t>(mismatched_thread_psv, 0, kPsvRuntimeInfo2Size);
+  mismatched_thread_psv[sizeof(uint32_t) + 24] = 5u;
+  Store<uint32_t>(mismatched_thread_psv, sizeof(uint32_t) + 36, 4u);
+  Store<uint32_t>(mismatched_thread_psv, sizeof(uint32_t) + 40, 4u);
+  Store<uint32_t>(mismatched_thread_psv, sizeof(uint32_t) + 44, 2u);
+  expect_diagnostics(
+      "RDAT and PSV thread group mismatch",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, compute_runtime_data)
+          .add(fourcc::PipelineStateValidation, mismatched_thread_psv)
+          .build(),
+      {"thread-group-size-mismatch"});
+
+  constexpr size_t psv_resource_count_offset =
+      sizeof(uint32_t) + kPsvRuntimeInfo1Size;
+  constexpr size_t psv_resource_stride_offset =
+      psv_resource_count_offset + sizeof(uint32_t);
+  constexpr size_t psv_resource_offset =
+      psv_resource_stride_offset + sizeof(uint32_t);
+  constexpr size_t psv_string_size_offset =
+      psv_resource_offset + kPsvResourceBindInfo0Size;
+  std::vector<uint8_t> unmatched_resource_psv(
+      psv_string_size_offset + 2u * sizeof(uint32_t));
+  Store<uint32_t>(unmatched_resource_psv, 0, kPsvRuntimeInfo1Size);
+  unmatched_resource_psv[sizeof(uint32_t) + 24] = 5u;
+  Store<uint32_t>(unmatched_resource_psv, psv_resource_count_offset, 1u);
+  Store<uint32_t>(unmatched_resource_psv, psv_resource_stride_offset,
+                  kPsvResourceBindInfo0Size);
+  Store<uint32_t>(unmatched_resource_psv, psv_resource_offset + 0, 3u);
+  Store<uint32_t>(unmatched_resource_psv, psv_resource_offset + 4, 9u);
+  Store<uint32_t>(unmatched_resource_psv, psv_resource_offset + 8, 1u);
+  Store<uint32_t>(unmatched_resource_psv, psv_resource_offset + 12, 2u);
+  const auto metadata_free_bitcode =
+      DecodeHex(dxmt::test::kDxilMissingMetadataBitcodeHex);
+  expect_diagnostics(
+      "unmatched PSV resource",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, BuildDxilProgram(metadata_free_bitcode))
+          .add(fourcc::RuntimeData, empty_runtime_data)
+          .add(fourcc::PipelineStateValidation, unmatched_resource_psv)
+          .build(),
+      {"unmatched-psv-resource"});
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {

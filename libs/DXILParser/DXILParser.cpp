@@ -5123,31 +5123,6 @@ ValidateContainerInfo(const Parser &parser, DxilValidationInfo &info) {
     }
   }
 
-  struct PartRange {
-    uint32_t fourcc = 0;
-    uint32_t begin = 0;
-    uint32_t end = 0;
-  };
-  std::vector<PartRange> ranges;
-  ranges.reserve(container.parts.size());
-  for (const auto &part : container.parts) {
-    ranges.push_back({
-        .fourcc = part.fourcc,
-        .begin = part.offset,
-        .end = uint32_t(part.offset + kPartHeaderSize + part.data.size()),
-    });
-  }
-  std::sort(ranges.begin(), ranges.end(),
-            [](const PartRange &lhs, const PartRange &rhs) {
-              return lhs.begin < rhs.begin;
-            });
-  for (size_t i = 1; i < ranges.size(); i++) {
-    if (ranges[i].begin < ranges[i - 1].end) {
-      AddError(info, DxilValidationCategory::Container, "overlapping-parts",
-               FourCCString(ranges[i - 1].fourcc) + " overlaps " +
-                   FourCCString(ranges[i].fourcc));
-    }
-  }
 }
 
 void
@@ -5475,14 +5450,6 @@ ValidateRuntimeDataInfo(const Parser &parser, DxilValidationInfo &info) {
                "RDAT function '" + function.name +
                    "' has an unknown shader kind");
     }
-    if (function.has_shader_info &&
-        !runtime_data->findShaderInfo(function.shader_info_table_type,
-                                      function.shader_info_index)) {
-      AddError(info, DxilValidationCategory::RuntimeData,
-               "missing-rdat-shader-info",
-               "RDAT function '" + function.name +
-                   "' references a missing shader info record");
-    }
     if (function.minimum_expected_wave_lane_count &&
         function.maximum_expected_wave_lane_count &&
         function.minimum_expected_wave_lane_count >
@@ -5519,11 +5486,6 @@ ValidateRuntimeDataInfo(const Parser &parser, DxilValidationInfo &info) {
       }
     }
   }
-}
-
-bool
-ThreadGroupSizePresent(const ShaderReflectionInfo &info) {
-  return info.num_threads_x || info.num_threads_y || info.num_threads_z;
 }
 
 void
@@ -5679,20 +5641,24 @@ ValidateReflectionConsistency(const Parser &parser, DxilValidationInfo &info) {
   }
 
   if (const auto &psv = parser.pipelineStateValidation()) {
-    if (psv->has_runtime_info_1 &&
-        psv->shader_stage != reflection->shader_kind) {
-      AddError(info, DxilValidationCategory::Reflection,
-               "reflection-psv-stage-mismatch",
-               "Reflected shader stage does not match PSV0 shader stage");
-    }
-    if (psv->has_runtime_info_2 && ThreadGroupSizePresent(*reflection) &&
-        (psv->num_threads_x || psv->num_threads_y || psv->num_threads_z) &&
-        (psv->num_threads_x != reflection->num_threads_x ||
-         psv->num_threads_y != reflection->num_threads_y ||
-         psv->num_threads_z != reflection->num_threads_z)) {
-      AddError(info, DxilValidationCategory::Reflection,
-               "thread-group-size-mismatch",
-               "Reflected thread group size does not match PSV0");
+    if (psv->has_runtime_info_2 && parser.runtimeData()) {
+      const auto *rdat_function = FindReflectionRdatFunction(
+          *parser.runtimeData(), reflection->entry_point_name,
+          reflection->function_name);
+      const auto *rdat_shader_info =
+          rdat_function && rdat_function->has_shader_info
+              ? parser.runtimeData()->findShaderInfo(
+                    rdat_function->shader_info_table_type,
+                    rdat_function->shader_info_index)
+              : nullptr;
+      if (rdat_shader_info &&
+          (psv->num_threads_x != rdat_shader_info->num_threads_x ||
+           psv->num_threads_y != rdat_shader_info->num_threads_y ||
+           psv->num_threads_z != rdat_shader_info->num_threads_z)) {
+        AddError(info, DxilValidationCategory::Reflection,
+                 "thread-group-size-mismatch",
+                 "RDAT thread group size does not match PSV0");
+      }
     }
   }
 
