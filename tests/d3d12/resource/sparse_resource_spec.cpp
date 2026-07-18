@@ -134,6 +134,91 @@ protected:
     return std::move(backing.heap);
   }
 
+  ComPtr<ID3D12Resource>
+  CreateSingleTileReservedBuffer(D3D12TestContext &context,
+                                 D3D12_RESOURCE_STATES initial_state) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> resource;
+    EXPECT_EQ(context.device()->CreateReservedResource(
+                  &desc, initial_state, nullptr, IID_PPV_ARGS(resource.put())),
+              S_OK);
+    return resource;
+  }
+
+  SparseBacking CreateSingleTileBacking(D3D12TestContext &context) {
+    D3D12_HEAP_DESC desc = {};
+    desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.SizeInBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ComPtr<ID3D12Heap> heap;
+    EXPECT_EQ(context.device()->CreateHeap(&desc, IID_PPV_ARGS(heap.put())),
+              S_OK);
+    return {std::move(heap), 1};
+  }
+
+  void QueueSingleTileMapping(D3D12TestContext &context,
+                              ID3D12Resource *resource,
+                              const SparseBacking &backing) {
+    ASSERT_TRUE(resource);
+    ASSERT_TRUE(backing.heap);
+    D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+    D3D12_TILE_REGION_SIZE region = {};
+    region.NumTiles = 1;
+    D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT heap_offset = 0;
+    UINT tile_count = 1;
+    context.queue()->UpdateTileMappings(
+        resource, 1, &coordinate, &region, backing.heap.get(), 1,
+        &range_flag, &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+  }
+
+  void ExpectSingleTileAlias(D3D12TestContext &context,
+                             ID3D12Resource *write_resource,
+                             ID3D12Resource *read_resource) {
+    constexpr UINT64 size = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    std::vector<std::uint8_t> expected(size);
+    for (UINT64 i = 0; i < size; ++i)
+      expected[i] =
+          static_cast<std::uint8_t>((i * 43 + (i >> 7) + 23) & 0xff);
+    auto upload =
+        context.CreateUploadBuffer(size, expected.data(), expected.size());
+    auto output = context.CreateBuffer(
+        size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(upload);
+    ASSERT_TRUE(output);
+
+    D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+    D3D12_TILE_REGION_SIZE region = {};
+    region.NumTiles = 1;
+    context.list()->CopyTiles(
+        write_resource, &coordinate, &region, upload.get(), 0,
+        D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+    D3D12_RESOURCE_BARRIER aliasing = {};
+    aliasing.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    aliasing.Aliasing.pResourceBefore = write_resource;
+    aliasing.Aliasing.pResourceAfter = read_resource;
+    context.list()->ResourceBarrier(1, &aliasing);
+    context.list()->CopyTiles(
+        read_resource, &coordinate, &region, output.get(), 0,
+        D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    D3D12TestContext::Transition(
+        context.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    std::vector<std::uint8_t> actual;
+    ASSERT_EQ(context.ReadbackBuffer(output.get(), size, &actual), S_OK);
+    ExpectBytesEqual(actual, expected);
+  }
+
   void ExpectBytesEqual(const std::vector<std::uint8_t> &actual,
                         const std::vector<std::uint8_t> &expected) {
     ASSERT_EQ(actual.size(), expected.size());
@@ -928,6 +1013,142 @@ TEST_F(D3D12SparseResourceSpec,
   ASSERT_EQ(context_.ReadbackBuffer(output.get(), copy_size, &actual), S_OK);
   ExpectBytesEqual(actual, expected);
 }
+
+enum class ForeignTileMappingCase {
+  UpdateForeignResource,
+  UpdateForeignHeap,
+  CopyForeignSource,
+  CopyForeignDestination,
+};
+
+class ForeignTileMappingSpec
+    : public D3D12SparseResourceSpec,
+      public ::testing::WithParamInterface<ForeignTileMappingCase> {};
+
+TEST_P(ForeignTileMappingSpec,
+       RejectsForeignObjectsAndPreservesExistingMapping) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS local_options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &local_options,
+                sizeof(local_options)),
+            S_OK);
+  if (local_options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  D3D12_FEATURE_DATA_D3D12_OPTIONS foreign_options = {};
+  ASSERT_EQ(foreign_context.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &foreign_options,
+                sizeof(foreign_options)),
+            S_OK);
+  if (foreign_options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Foreign device does not support tiled resources";
+
+  auto local_target = CreateSingleTileReservedBuffer(
+      context_, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto local_probe = CreateSingleTileReservedBuffer(
+      context_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto foreign_target = CreateSingleTileReservedBuffer(
+      foreign_context, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto foreign_probe = CreateSingleTileReservedBuffer(
+      foreign_context, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ASSERT_TRUE(local_target);
+  ASSERT_TRUE(local_probe);
+  ASSERT_TRUE(foreign_target);
+  ASSERT_TRUE(foreign_probe);
+  auto local_backing = CreateSingleTileBacking(context_);
+  auto foreign_backing = CreateSingleTileBacking(foreign_context);
+  ASSERT_TRUE(local_backing.heap);
+  ASSERT_TRUE(foreign_backing.heap);
+  QueueSingleTileMapping(context_, local_target.get(), local_backing);
+  QueueSingleTileMapping(context_, local_probe.get(), local_backing);
+  QueueSingleTileMapping(foreign_context, foreign_target.get(),
+                         foreign_backing);
+  QueueSingleTileMapping(foreign_context, foreign_probe.get(),
+                         foreign_backing);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  ASSERT_EQ(foreign_context.SignalAndWait(), S_OK);
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = 1;
+  D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_offset = 0;
+  UINT tile_count = 1;
+  D3D12TestContext *protected_context = nullptr;
+  ID3D12Resource *protected_target = nullptr;
+  ID3D12Resource *protected_probe = nullptr;
+  switch (GetParam()) {
+  case ForeignTileMappingCase::UpdateForeignResource:
+    context_.queue()->UpdateTileMappings(
+        foreign_target.get(), 1, &coordinate, &region,
+        local_backing.heap.get(), 1, &range_flag, &heap_offset, &tile_count,
+        D3D12_TILE_MAPPING_FLAG_NONE);
+    protected_context = &foreign_context;
+    protected_target = foreign_target.get();
+    protected_probe = foreign_probe.get();
+    break;
+  case ForeignTileMappingCase::UpdateForeignHeap:
+    context_.queue()->UpdateTileMappings(
+        local_target.get(), 1, &coordinate, &region,
+        foreign_backing.heap.get(), 1, &range_flag, &heap_offset, &tile_count,
+        D3D12_TILE_MAPPING_FLAG_NONE);
+    protected_context = &context_;
+    protected_target = local_target.get();
+    protected_probe = local_probe.get();
+    break;
+  case ForeignTileMappingCase::CopyForeignSource:
+    context_.queue()->CopyTileMappings(
+        local_target.get(), &coordinate, foreign_target.get(), &coordinate,
+        &region, D3D12_TILE_MAPPING_FLAG_NONE);
+    protected_context = &context_;
+    protected_target = local_target.get();
+    protected_probe = local_probe.get();
+    break;
+  case ForeignTileMappingCase::CopyForeignDestination:
+    context_.queue()->CopyTileMappings(
+        foreign_target.get(), &coordinate, local_target.get(), &coordinate,
+        &region, D3D12_TILE_MAPPING_FLAG_NONE);
+    protected_context = &foreign_context;
+    protected_target = foreign_target.get();
+    protected_probe = foreign_probe.get();
+    break;
+  }
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  ASSERT_NE(protected_context, nullptr);
+  ASSERT_NE(protected_target, nullptr);
+  ASSERT_NE(protected_probe, nullptr);
+  ExpectSingleTileAlias(*protected_context, protected_target, protected_probe);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(foreign_context.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string ForeignTileMappingCaseName(
+    const ::testing::TestParamInfo<ForeignTileMappingCase> &info) {
+  switch (info.param) {
+  case ForeignTileMappingCase::UpdateForeignResource:
+    return "UpdateForeignResource";
+  case ForeignTileMappingCase::UpdateForeignHeap:
+    return "UpdateForeignHeap";
+  case ForeignTileMappingCase::CopyForeignSource:
+    return "CopyForeignSource";
+  case ForeignTileMappingCase::CopyForeignDestination:
+    return "CopyForeignDestination";
+  }
+  return "Unknown";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CrossDeviceMatrix, ForeignTileMappingSpec,
+    ::testing::Values(
+        ForeignTileMappingCase::UpdateForeignResource,
+        ForeignTileMappingCase::UpdateForeignHeap,
+        ForeignTileMappingCase::CopyForeignSource,
+        ForeignTileMappingCase::CopyForeignDestination),
+    ForeignTileMappingCaseName);
 
 TEST_F(D3D12SparseResourceSpec, WritesMappedDeepPackedMipTail) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};

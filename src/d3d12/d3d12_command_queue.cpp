@@ -4420,11 +4420,17 @@ public:
     }
 
     auto *resource_object = dynamic_cast<d3d12::Resource *>(resource);
+    auto *heap_object = heap ? dynamic_cast<d3d12::Heap *>(heap) : nullptr;
     const auto *tiling = resource_object ? resource_object->GetTiling() : nullptr;
-    if (!resource_object || !resource_object->IsReserved() || !tiling) {
+    if (!resource_object ||
+        resource_object->GetParentDevice() != device_.ptr() ||
+        !resource_object->IsReserved() || !tiling ||
+        (heap && (!heap_object ||
+                  heap_object->GetParentDevice() != device_.ptr()))) {
       if (ShouldLogTileMappingDiag()) {
-        WARN("D3D12CommandQueue: UpdateTileMappings requires reserved resource"
+        WARN("D3D12CommandQueue: UpdateTileMappings requires local reserved resource and heap"
              " resource=", resource,
+             " heap=", heap,
              " regions=", region_count,
              " ranges=", range_count,
              " flags=", flags);
@@ -4507,7 +4513,6 @@ public:
             perf_delta.map_ops, perf_delta.unmap_ops, 0, 1, 0);
         return;
       }
-      auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
       if (!heap_object) {
         if (ShouldLogTileMappingDiag())
           WARN("D3D12CommandQueue: TODO UpdateTileMappings map requires D3D12 heap"
@@ -4659,9 +4664,11 @@ public:
     auto *src = dynamic_cast<d3d12::Resource *>(src_resource);
     const auto *dst_tiling = dst ? dst->GetTiling() : nullptr;
     const auto *src_tiling = src ? src->GetTiling() : nullptr;
-    if (!dst || !src || !dst->IsReserved() || !src->IsReserved() ||
+    if (!dst || !src || dst->GetParentDevice() != device_.ptr() ||
+        src->GetParentDevice() != device_.ptr() ||
+        !dst->IsReserved() || !src->IsReserved() ||
         !dst_tiling || !src_tiling) {
-      WARN("D3D12CommandQueue: CopyTileMappings requires reserved resources"
+      WARN("D3D12CommandQueue: CopyTileMappings requires local reserved resources"
            " dst=", dst_resource,
            " src=", src_resource,
            " flags=", flags);
