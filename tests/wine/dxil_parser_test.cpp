@@ -445,6 +445,60 @@ TEST(DxilParser, DistinguishesContainerOnlyAndFullParsing) {
   EXPECT_FALSE(parser.dxilProgram().has_value());
 }
 
+TEST(DxilDerivedInfo, HandlesContainerOnlyParserState) {
+  using namespace dxmt::dxil;
+  const std::vector<uint8_t> root_signature = {1, 2, 3, 4};
+  const auto bytes =
+      DxilContainerBuilder()
+          .add(fourcc::RootSignature, root_signature)
+          .add(fourcc::FeatureInfo, std::vector<uint8_t>(kFeatureInfoSize))
+          .add(fourcc::FeatureInfo, std::vector<uint8_t>(kFeatureInfoSize))
+          .build();
+  Parser parser;
+  ASSERT_EQ(parser.parseContainerOnly(bytes), ParseStatus::Ok);
+
+  ShaderReflectionInfo reflection;
+  ASSERT_EQ(BuildShaderReflection(parser, reflection), ParseStatus::Ok);
+  EXPECT_FALSE(reflection.valid);
+  EXPECT_FALSE(reflection.has_llvm_module);
+  EXPECT_FALSE(reflection.has_runtime_data);
+  EXPECT_FALSE(reflection.has_pipeline_state_validation);
+  EXPECT_FALSE(reflection.has_resource_def);
+  EXPECT_TRUE(reflection.has_root_signature);
+  EXPECT_GT(reflection.root_signature_offset, 0u);
+  EXPECT_TRUE(std::equal(reflection.root_signature.begin(),
+                         reflection.root_signature.end(),
+                         root_signature.begin()));
+  EXPECT_TRUE(reflection.resources.empty());
+
+  DxilTranslationInfo translation;
+  translation.valid = true;
+  ASSERT_EQ(BuildDxilTranslationInfo(parser, translation), ParseStatus::Ok);
+  EXPECT_FALSE(translation.valid);
+  EXPECT_TRUE(translation.resources.empty());
+  EXPECT_TRUE(translation.signatures.empty());
+  EXPECT_TRUE(translation.operations.empty());
+
+  DxilValidationInfo validation;
+  ASSERT_EQ(ValidateDxil(parser, validation), ParseStatus::Ok);
+  EXPECT_FALSE(validation.valid);
+  EXPECT_EQ(validation.error_count, 2u);
+  EXPECT_EQ(validation.warning_count, 2u);
+  EXPECT_EQ(validation.info_count, 0u);
+  ASSERT_EQ(validation.diagnostics.size(), 4u);
+  const auto has_code = [&](std::string_view code) {
+    return std::any_of(validation.diagnostics.begin(),
+                       validation.diagnostics.end(),
+                       [&](const DxilValidationDiagnostic &diagnostic) {
+                         return diagnostic.code == code;
+                       });
+  };
+  EXPECT_TRUE(has_code("dxil-part-count"));
+  EXPECT_TRUE(has_code("duplicate-singleton-part"));
+  EXPECT_TRUE(has_code("missing-dxil-program"));
+  EXPECT_TRUE(has_code("llvm-module-unavailable"));
+}
+
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
   using namespace dxmt::dxil;
   BitcodeInfo info;
