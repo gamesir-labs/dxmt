@@ -98,6 +98,62 @@ struct SignatureParameter4 {
 
 static_assert(sizeof(SignatureParameter4) == 24);
 
+struct SignatureParameter5 {
+  uint32_t stream;
+  uint32_t semantic_name;
+  uint32_t semantic_index;
+  D3D10_NAME system_value;
+  D3D10_REGISTER_COMPONENT_TYPE component_type;
+  uint32_t register_index;
+  uint8_t mask;
+  uint8_t read_write_mask;
+  uint16_t padding = 0;
+};
+
+static_assert(sizeof(SignatureParameter5) == 28);
+
+struct SignatureParameter11_1 {
+  uint32_t stream;
+  uint32_t semantic_name;
+  uint32_t semantic_index;
+  D3D10_NAME system_value;
+  D3D10_REGISTER_COMPONENT_TYPE component_type;
+  uint32_t register_index;
+  uint8_t mask;
+  uint8_t read_write_mask;
+  uint16_t padding = 0;
+  D3D_MIN_PRECISION min_precision;
+};
+
+static_assert(sizeof(SignatureParameter11_1) == 32);
+
+template <typename Parameter>
+std::vector<uint8_t>
+BuildStreamSignature(std::vector<Parameter> parameters,
+                     const std::vector<std::string> &names) {
+  if (parameters.size() != names.size())
+    return {};
+
+  constexpr size_t header_size = 2 * sizeof(uint32_t);
+  const size_t strings_offset = header_size + parameters.size() * sizeof(Parameter);
+  size_t total_size = strings_offset;
+  for (const auto &name : names)
+    total_size += name.size() + 1;
+
+  std::vector<uint8_t> bytes(total_size);
+  Store<uint32_t>(bytes, 0, parameters.size());
+  Store<uint32_t>(bytes, 4, header_size);
+
+  size_t name_offset = strings_offset;
+  for (size_t i = 0; i < parameters.size(); ++i) {
+    parameters[i].semantic_name = name_offset;
+    Store(bytes, header_size + i * sizeof(Parameter), parameters[i]);
+    std::copy(names[i].begin(), names[i].end(), bytes.begin() + name_offset);
+    name_offset += names[i].size() + 1;
+  }
+  return bytes;
+}
+
 class SignatureBuilder {
 public:
   SignatureBuilder &add(std::string name, uint32_t register_index,
@@ -425,6 +481,156 @@ TEST(DxbcSignature, AcceptsAnEmptySignature) {
   microsoft::CSignatureParser parser;
   EXPECT_EQ(parser.ReadSignature4(bytes.data(), bytes.size()), S_OK);
   EXPECT_EQ(parser.GetNumParameters(), 0u);
+}
+
+TEST(DxbcSignature, ParsesSignature5IntoIndependentStreams) {
+  const auto bytes = BuildStreamSignature<SignatureParameter5>(
+      {
+          {.stream = 0,
+           .semantic_index = 0,
+           .system_value = D3D10_NAME_UNDEFINED,
+           .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+           .register_index = 1,
+           .mask = 0xf,
+           .read_write_mask = 1},
+          {.stream = 1,
+           .semantic_index = 2,
+           .system_value = D3D10_NAME_PRIMITIVE_ID,
+           .component_type = D3D10_REGISTER_COMPONENT_UINT32,
+           .register_index = 0,
+           .mask = 1,
+           .read_write_mask = 1},
+          {.stream = 3,
+           .semantic_index = 0,
+           .system_value = D3D10_NAME_UNDEFINED,
+           .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+           .register_index = 4,
+           .mask = 3,
+           .read_write_mask = 2},
+      },
+      {"POSITION", "PRIMITIVE", "COLOR"});
+
+  microsoft::CSignatureParser5 parser;
+  ASSERT_EQ(parser.ReadSignature5(bytes.data(), bytes.size()), S_OK);
+  EXPECT_EQ(parser.NumStreams(), 4u);
+  EXPECT_EQ(parser.GetTotalParameters(), 3u);
+  EXPECT_EQ(parser.Signature(0)->GetNumParameters(), 1u);
+  EXPECT_EQ(parser.Signature(1)->GetNumParameters(), 1u);
+  EXPECT_EQ(parser.Signature(2)->GetNumParameters(), 0u);
+  EXPECT_EQ(parser.Signature(3)->GetNumParameters(), 1u);
+
+  const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+  ASSERT_EQ(parser.Signature(1)->GetParameters(&parameters), 1u);
+  ASSERT_NE(parameters, nullptr);
+  EXPECT_EQ(parameters[0].Stream, 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "PRIMITIVE");
+  EXPECT_EQ(parameters[0].SemanticIndex, 2u);
+  EXPECT_EQ(parameters[0].Register, 0u);
+  EXPECT_EQ(parameters[0].SystemValue,
+            microsoft::D3D10_SB_NAME_PRIMITIVE_ID);
+  EXPECT_EQ(parameters[0].MinPrecision, D3D_MIN_PRECISION_DEFAULT);
+
+  EXPECT_EQ(parser.RasterizedStream(), 0u);
+  parser.SetRasterizedStream(3);
+  EXPECT_EQ(parser.RastSignature(), parser.Signature(3));
+  parser.SetRasterizedStream(D3D11_SO_STREAM_COUNT);
+  EXPECT_EQ(parser.RastSignature(), nullptr);
+}
+
+TEST(DxbcSignature, PreservesSignature11_1MinimumPrecision) {
+  const auto bytes = BuildStreamSignature<SignatureParameter11_1>(
+      {
+          {.stream = 0,
+           .semantic_index = 0,
+           .system_value = D3D10_NAME_UNDEFINED,
+           .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+           .register_index = 0,
+           .mask = 0xf,
+           .read_write_mask = 0xf,
+           .min_precision = D3D_MIN_PRECISION_FLOAT_16},
+          {.stream = 0,
+           .semantic_index = 1,
+           .system_value = D3D10_NAME_UNDEFINED,
+           .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+           .register_index = 1,
+           .mask = 0x3,
+           .read_write_mask = 0x1,
+           .min_precision = D3D_MIN_PRECISION_DEFAULT},
+      },
+      {"TEXCOORD", "TEXCOORD"});
+
+  microsoft::CSignatureParser5 parser;
+  ASSERT_EQ(parser.ReadSignature11_1(bytes.data(), bytes.size()), S_OK);
+  EXPECT_EQ(parser.NumStreams(), 1u);
+  EXPECT_EQ(parser.GetTotalParameters(), 2u);
+  const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+  ASSERT_EQ(parser.Signature(0)->GetParameters(&parameters), 2u);
+  ASSERT_NE(parameters, nullptr);
+  EXPECT_EQ(parameters[0].MinPrecision, D3D_MIN_PRECISION_FLOAT_16);
+  EXPECT_EQ(parameters[1].MinPrecision, D3D_MIN_PRECISION_DEFAULT);
+  EXPECT_EQ(parameters[1].SemanticIndex, 1u);
+}
+
+TEST(DxbcSignature, RejectsMalformedMultiStreamSignatures) {
+  const auto make_signature = [](uint32_t first_stream,
+                                 uint32_t second_stream,
+                                 uint32_t first_register,
+                                 uint32_t second_register) {
+    return BuildStreamSignature<SignatureParameter5>(
+        {
+            {.stream = first_stream,
+             .system_value = D3D10_NAME_UNDEFINED,
+             .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+             .register_index = first_register,
+             .mask = 0xf},
+            {.stream = second_stream,
+             .system_value = D3D10_NAME_UNDEFINED,
+             .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+             .register_index = second_register,
+             .mask = 0xf},
+        },
+        {"A", "B"});
+  };
+
+  microsoft::CSignatureParser5 parser;
+  auto bytes = make_signature(4, 4, 0, 1);
+  EXPECT_EQ(parser.ReadSignature5(bytes.data(), bytes.size()), E_FAIL);
+
+  bytes = make_signature(1, 0, 0, 1);
+  EXPECT_EQ(parser.ReadSignature5(bytes.data(), bytes.size()), E_FAIL);
+
+  bytes = make_signature(0, 0, 2, 1);
+  EXPECT_EQ(parser.ReadSignature5(bytes.data(), bytes.size()), E_FAIL);
+
+  bytes = make_signature(0, 1, 0, 0);
+  bytes.resize(2 * sizeof(uint32_t) + 2 * sizeof(SignatureParameter5) - 1);
+  EXPECT_EQ(parser.ReadSignature5(bytes.data(), bytes.size()), E_FAIL);
+
+  bytes = make_signature(0, 1, 0, 0);
+  bytes.pop_back();
+  EXPECT_EQ(parser.ReadSignature5(bytes.data(), bytes.size()), E_FAIL);
+}
+
+TEST(DxbcSignature, ExtractsSignature11_1OutputFromContainer) {
+  const auto signature = BuildStreamSignature<SignatureParameter11_1>(
+      {{.stream = 2,
+        .semantic_index = 0,
+        .system_value = D3D10_NAME_UNDEFINED,
+        .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+        .register_index = 0,
+        .mask = 0xf,
+        .min_precision = D3D_MIN_PRECISION_FLOAT_16}},
+      {"COLOR"});
+  const auto container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_OutputSignature11_1, signature)
+          .build();
+
+  microsoft::CSignatureParser5 parser;
+  ASSERT_EQ(microsoft::DXBCGetOutputSignature(container.data(), &parser),
+            S_OK);
+  EXPECT_EQ(parser.NumStreams(), 3u);
+  EXPECT_EQ(parser.Signature(2)->GetNumParameters(), 1u);
 }
 
 TEST_P(DxbcInvalidSignatureTest, RejectsMalformedTableAndStringRanges) {
