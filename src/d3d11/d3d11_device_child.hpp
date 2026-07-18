@@ -24,7 +24,8 @@ public:
                                            const void *pData) final {
     if (guid == WKPDID_D3DDebugObjectName) {
       auto pool = WMT::MakeAutoreleasePool();
-      std::string str((char *)pData, DataSize);
+      const auto *name = static_cast<const char *>(pData);
+      std::string str(name ? name : "", name ? DataSize : 0);
       OnSetDebugObjectName(str.c_str());
     }
     return m_privateData.setData(guid, DataSize, pData);

@@ -88,6 +88,30 @@ TEST_F(D3D11DeviceSpec, CreatesDefaultVertexBuffer) {
   release_object(buffer);
 }
 
+TEST_F(D3D11DeviceSpec, RemovesDebugNameWithNullData) {
+  D3D11_BUFFER_DESC desc = {};
+  desc.ByteWidth = 256;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+  ID3D11Buffer *buffer = nullptr;
+  ASSERT_TRUE(HResultSucceeded(device_->CreateBuffer(&desc, nullptr, &buffer)));
+  ASSERT_NE(buffer, nullptr);
+
+  constexpr char name[] = "buffer";
+  EXPECT_EQ(buffer->SetPrivateData(WKPDID_D3DDebugObjectName,
+                                   sizeof(name) - 1, name),
+            S_OK);
+  EXPECT_EQ(buffer->SetPrivateData(WKPDID_D3DDebugObjectName,
+                                   sizeof(name) - 1, nullptr),
+            S_OK);
+
+  UINT size = 0;
+  EXPECT_EQ(buffer->GetPrivateData(WKPDID_D3DDebugObjectName, &size, nullptr),
+            DXGI_ERROR_NOT_FOUND);
+  release_object(buffer);
+}
+
 TEST_F(D3D11DeviceSpec, RejectsUnsupportedPipelineStatisticsQuery) {
   D3D11_QUERY_DESC desc = {};
   desc.Query = D3D11_QUERY_PIPELINE_STATISTICS;
