@@ -203,17 +203,128 @@ TEST(DxilNames, PreservesAllFourBytesAndMapsKnownEnums) {
   EXPECT_EQ(FourCCString(fourcc::Dxil), "DXIL");
   EXPECT_EQ(FourCCString(MakeFourCC('A', '\0', 'B', 'C')),
             std::string("A\0BC", 4));
-  EXPECT_STREQ(StatusName(ParseStatus::InvalidPartSize), "invalid part size");
+
+  constexpr std::array status_names = {
+      "ok",
+      "invalid argument",
+      "truncated",
+      "bad container magic",
+      "invalid container size",
+      "invalid part offset",
+      "invalid part size",
+      "missing DXIL part",
+      "invalid DXIL program",
+      "invalid DXIL magic",
+      "invalid DXIL bitcode range",
+      "invalid signature",
+      "invalid feature info",
+      "invalid runtime data",
+      "invalid pipeline state validation",
+      "invalid shader hash",
+      "invalid compiler version",
+      "invalid shader debug name",
+      "invalid source info",
+      "invalid shader PDB info",
+      "invalid shader statistics",
+      "invalid resource definition",
+      "invalid bitcode",
+      "invalid LLVM module",
+  };
+  for (size_t i = 0; i < status_names.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_STREQ(StatusName(static_cast<ParseStatus>(i)), status_names[i]);
+  }
   EXPECT_STREQ(StatusName(static_cast<ParseStatus>(999)), "unknown");
-  EXPECT_STREQ(RuntimeDataPartTypeName(rdat::ResourceTable), "ResourceTable");
+
+  constexpr std::array runtime_data_part_names = {
+      "Invalid",
+      "StringBuffer",
+      "IndexArrays",
+      "ResourceTable",
+      "FunctionTable",
+      "RawBytes",
+      "SubobjectTable",
+      "NodeIDTable",
+      "NodeShaderIOAttribTable",
+      "NodeShaderFuncAttribTable",
+      "IONodeTable",
+      "NodeShaderInfoTable",
+      "ReservedMeshNodesPreviewInfoTable",
+      "SignatureElementTable",
+      "VSInfoTable",
+      "PSInfoTable",
+      "HSInfoTable",
+      "DSInfoTable",
+      "GSInfoTable",
+      "CSInfoTable",
+      "MSInfoTable",
+      "ASInfoTable",
+  };
+  for (size_t i = 0; i < runtime_data_part_names.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_STREQ(RuntimeDataPartTypeName(i), runtime_data_part_names[i]);
+  }
+  EXPECT_STREQ(RuntimeDataPartTypeName(rdat::DxilPdbInfoTable),
+               "DxilPdbInfoTable");
+  EXPECT_STREQ(RuntimeDataPartTypeName(rdat::DxilPdbInfoSourceTable),
+               "DxilPdbInfoSourceTable");
+  EXPECT_STREQ(RuntimeDataPartTypeName(rdat::DxilPdbInfoLibraryTable),
+               "DxilPdbInfoLibraryTable");
   EXPECT_STREQ(RuntimeDataPartTypeName(0xffff), "Unknown");
-  EXPECT_STREQ(PsvShaderKindName(13), "Mesh");
+
+  constexpr std::array shader_kind_names = {
+      "Pixel",         "Vertex",       "Geometry",     "Hull",
+      "Domain",        "Compute",      "Library",      "RayGeneration",
+      "Intersection",  "AnyHit",       "ClosestHit",   "Miss",
+      "Callable",      "Mesh",         "Amplification", "Node",
+  };
+  for (size_t i = 0; i < shader_kind_names.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_STREQ(PsvShaderKindName(i), shader_kind_names[i]);
+  }
   EXPECT_STREQ(PsvShaderKindName(0xff), "Invalid");
-  EXPECT_STREQ(DxilValidationSeverityName(DxilValidationSeverity::Warning),
-               "warning");
+
+  constexpr std::array validation_severity_names = {"info", "warning",
+                                                     "error"};
+  for (size_t i = 0; i < validation_severity_names.size(); ++i)
+    EXPECT_STREQ(DxilValidationSeverityName(
+                     static_cast<DxilValidationSeverity>(i)),
+                 validation_severity_names[i]);
+  EXPECT_STREQ(DxilValidationSeverityName(
+                   static_cast<DxilValidationSeverity>(999)),
+               "unknown");
+
+  constexpr std::array validation_category_names = {
+      "container", "program", "metadata", "runtime-data",
+      "pipeline-state-validation", "instruction", "reflection",
+  };
+  for (size_t i = 0; i < validation_category_names.size(); ++i)
+    EXPECT_STREQ(DxilValidationCategoryName(
+                     static_cast<DxilValidationCategory>(i)),
+                 validation_category_names[i]);
   EXPECT_STREQ(DxilValidationCategoryName(
-                   DxilValidationCategory::PipelineStateValidation),
-               "pipeline-state-validation");
+                   static_cast<DxilValidationCategory>(999)),
+               "unknown");
+}
+
+TEST(DxilValueObjects, ReportsHashAndNamedMetadataState) {
+  using namespace dxmt::dxil;
+  ShaderHashInfo hash;
+  EXPECT_FALSE(hash.includes_source());
+  EXPECT_FALSE(hash.is_populated());
+  hash.flags = 1u;
+  hash.digest.back() = 0x80;
+  EXPECT_TRUE(hash.includes_source());
+  EXPECT_TRUE(hash.is_populated());
+
+  LlvmModuleInfo module;
+  EXPECT_FALSE(module.hasNamedMetadata("dx.entryPoints"));
+  module.named_metadata.push_back({"dx.entryPoints", 2u});
+  module.named_metadata.push_back({"dx.resources", 0u});
+  EXPECT_TRUE(module.hasNamedMetadata("dx.entryPoints"));
+  EXPECT_TRUE(module.hasNamedMetadata("dx.resources"));
+  EXPECT_FALSE(module.hasNamedMetadata("DX.ENTRYPOINTS"));
+  EXPECT_FALSE(module.hasNamedMetadata({}));
 }
 
 TEST(DxilOpcode, ExposesStableMetadataAndRejectsUnknownOpcodes) {
