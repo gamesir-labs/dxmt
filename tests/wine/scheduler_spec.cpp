@@ -37,12 +37,32 @@ TEST(TestSchedulerGlob, MatchesGoogleTestWildcards) {
       dxmt::test::GlobMatches("Pipeline?.Cache", "PipelineState.Cache"));
 }
 
+TEST(TestSchedulerGlob, HandlesEmptyAndBacktrackingPatterns) {
+  EXPECT_TRUE(dxmt::test::GlobMatches("", ""));
+  EXPECT_TRUE(dxmt::test::GlobMatches("*", ""));
+  EXPECT_TRUE(dxmt::test::GlobMatches("*ab?d", "prefix-abcd"));
+  EXPECT_TRUE(dxmt::test::GlobMatches("a**c", "abbbc"));
+  EXPECT_FALSE(dxmt::test::GlobMatches("?", ""));
+  EXPECT_FALSE(dxmt::test::GlobMatches("*ab?d", "prefix-abd"));
+}
+
 TEST(TestSchedulerFilter, AppliesPositiveAndNegativePatterns) {
   EXPECT_TRUE(
       dxmt::test::FilterMatches("Pipeline*.*-*.Slow", "PipelineState.Fast"));
   EXPECT_FALSE(
       dxmt::test::FilterMatches("Pipeline*.*-*.Slow", "PipelineState.Slow"));
   EXPECT_TRUE(dxmt::test::FilterMatches("-*Disabled*", "PipelineState.Fast"));
+}
+
+TEST(TestSchedulerFilter, SupportsColonListsAndEmptyPositivePatterns) {
+  EXPECT_TRUE(dxmt::test::FilterMatches(
+      "D3D11.*:D3D12.Copy*-*.Slow:*.Disabled",
+      "D3D12.CopyTexture.Fast"));
+  EXPECT_FALSE(dxmt::test::FilterMatches(
+      "D3D11.*:D3D12.Copy*-*.Slow:*.Disabled",
+      "D3D12.CopyTexture.Slow"));
+  EXPECT_FALSE(dxmt::test::FilterMatches("D3D11.*:", "D3D12.Copy.Fast"));
+  EXPECT_TRUE(dxmt::test::FilterMatches("", "Any.Test"));
 }
 
 TEST(TestSchedulerCaseIdentity, DerivesStableNamespaceFromExecutable) {
@@ -124,6 +144,46 @@ TEST(TestSchedulerLogicalCaseMetadata, EmitsRequiredTraitsAsJson) {
   EXPECT_NE(metadata.find("\"Cost\":4"), std::string::npos);
 }
 
+TEST(TestSchedulerLogicalCaseMetadata, EscapesEveryJsonControlClass) {
+  auto family = ExampleLogicalFamily();
+  family.traits.setup = "quote\" slash\\ back\b form\f line\n return\r tab\t";
+  family.traits.setup.push_back('\x01');
+
+  const auto metadata = dxmt::test::LogicalCaseMetadataJson(family, 0);
+  EXPECT_NE(metadata.find(
+                "\"Setup\":\"quote\\\" slash\\\\ back\\b form\\f "
+                "line\\n return\\r tab\\t\\u0001\""),
+            std::string::npos);
+}
+
+TEST(TestSchedulerLogicalCaseMetadata, NamesAllEnumValuesAndUnknowns) {
+  EXPECT_STREQ(dxmt::test::TestClassName(dxmt::test::TestClass::Conformance),
+               "Conformance");
+  EXPECT_STREQ(dxmt::test::TestClassName(dxmt::test::TestClass::Differential),
+               "Differential");
+  EXPECT_STREQ(dxmt::test::TestClassName(dxmt::test::TestClass::Robustness),
+               "Robustness");
+  EXPECT_STREQ(dxmt::test::TestClassName(dxmt::test::TestClass::Performance),
+               "Performance");
+  EXPECT_STREQ(dxmt::test::TestClassName(
+                   static_cast<dxmt::test::TestClass>(99)),
+               "Unknown");
+
+  EXPECT_STREQ(dxmt::test::ExecutionPathName(dxmt::test::ExecutionPath::Auto),
+               "Auto");
+  EXPECT_STREQ(dxmt::test::ExecutionPathName(
+                   dxmt::test::ExecutionPath::NativeCompiled),
+               "NativeCompiled");
+  EXPECT_STREQ(dxmt::test::ExecutionPathName(
+                   dxmt::test::ExecutionPath::Fallback),
+               "Fallback");
+  EXPECT_STREQ(dxmt::test::ExecutionPathName(dxmt::test::ExecutionPath::Both),
+               "Both");
+  EXPECT_STREQ(dxmt::test::ExecutionPathName(
+                   static_cast<dxmt::test::ExecutionPath>(99)),
+               "Unknown");
+}
+
 TEST(TestSchedulerPolicy, DisablesFailureShortCircuiting) {
   EXPECT_FALSE(GTEST_FLAG_GET(fail_fast));
   EXPECT_FALSE(GTEST_FLAG_GET(break_on_failure));
@@ -171,6 +231,16 @@ TEST(TestSchedulerPlan, AmortizesDefaultWorkerLaunches) {
   EXPECT_EQ(dxmt::test::SelectWorkerCount(tests, 16), 16u);
 }
 
+TEST(TestSchedulerPlan, HandlesEmptyZeroWorkerAndZeroCostInputs) {
+  EXPECT_EQ(dxmt::test::SelectWorkerCount({}, 8), 0u);
+  const std::vector<dxmt::test::ScheduledTest> tests = {
+      {"Suite.First", 0}, {"Suite.Second", 0}, {"Suite.Third", 0}};
+  EXPECT_EQ(dxmt::test::SelectWorkerCount(tests, 0), 0u);
+  EXPECT_EQ(dxmt::test::SelectWorkerCount(tests, 8), 1u);
+  EXPECT_TRUE(dxmt::test::BuildTestShards({}, 4).empty());
+  EXPECT_TRUE(dxmt::test::BuildTestShards(tests, 0).empty());
+}
+
 TEST(TestSchedulerPlan, ExtractsSerialTestsIntoAnExclusiveWave) {
   std::vector<dxmt::test::ScheduledTest> tests = {
       {"Suite.Parallel", dxmt::test::kNormalTestCost, false},
@@ -209,6 +279,20 @@ TEST(TestSchedulerPlan, ReusesWorkersWithinNamedSerialGroups) {
             (std::vector<std::string>{"Suite.IsolatedSecond"}));
 }
 
+TEST(TestSchedulerPlan, ClearsAGroupedShardWithConflictingSerialDomains) {
+  std::vector<dxmt::test::ScheduledTest> tests = {
+      {"Suite.First", 2, true, "shared", "swapchain"},
+      {"Suite.Second", 3, true, "shared", "descriptor"},
+  };
+
+  const auto shards = dxmt::test::BuildSerialTestShards(std::move(tests));
+  ASSERT_EQ(shards.size(), 1u);
+  EXPECT_EQ(shards[0].tests,
+            (std::vector<std::string>{"Suite.First", "Suite.Second"}));
+  EXPECT_EQ(shards[0].estimated_cost, 5u);
+  EXPECT_TRUE(shards[0].serial_domain.empty());
+}
+
 TEST(TestSchedulerPlan, RunsDistinctSerialDomainsInBoundedWaves) {
   const std::vector<dxmt::test::TestShard> shards = {
       {{"Suite.Swapchain"}, 10, "swapchain"},
@@ -224,6 +308,38 @@ TEST(TestSchedulerPlan, RunsDistinctSerialDomainsInBoundedWaves) {
   EXPECT_EQ(waves[0], (std::vector<std::size_t>{0, 1}));
   EXPECT_EQ(waves[1], (std::vector<std::size_t>{2, 4}));
   EXPECT_EQ(waves[2], (std::vector<std::size_t>{3}));
+}
+
+TEST(TestSchedulerPlan, KeepsDomainlessShardsInExclusiveWaves) {
+  const std::vector<dxmt::test::TestShard> shards = {
+      {{"Suite.Isolated"}, 1, {}},
+      {{"Suite.Swapchain"}, 1, "swapchain"},
+      {{"Suite.Descriptor"}, 1, "descriptor"},
+  };
+
+  EXPECT_TRUE(dxmt::test::BuildSerialShardWaves({}, 2).empty());
+  EXPECT_TRUE(dxmt::test::BuildSerialShardWaves(shards, 0).empty());
+  const auto waves = dxmt::test::BuildSerialShardWaves(shards, 3);
+  ASSERT_EQ(waves.size(), 2u);
+  EXPECT_EQ(waves[0], (std::vector<std::size_t>{0}));
+  EXPECT_EQ(waves[1], (std::vector<std::size_t>{1, 2}));
+}
+
+TEST(TestSchedulerPlan, DistributesTiesDeterministically) {
+  std::vector<dxmt::test::ScheduledTest> tests = {
+      {"Suite.Expensive", 8}, {"Suite.FirstMedium", 4},
+      {"Suite.SecondMedium", 4}, {"Suite.Fast", 1},
+  };
+
+  const auto shards = dxmt::test::BuildTestShards(std::move(tests), 2);
+  ASSERT_EQ(shards.size(), 2u);
+  EXPECT_EQ(shards[0].tests,
+            (std::vector<std::string>{"Suite.Expensive", "Suite.Fast"}));
+  EXPECT_EQ(shards[0].estimated_cost, 9u);
+  EXPECT_EQ(shards[1].tests,
+            (std::vector<std::string>{"Suite.FirstMedium",
+                                      "Suite.SecondMedium"}));
+  EXPECT_EQ(shards[1].estimated_cost, 8u);
 }
 
 TEST(TestSchedulerWorker, PropagatesConditionalFailure) {
