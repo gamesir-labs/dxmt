@@ -8,12 +8,12 @@ namespace dxmt {
 
 void
 Allocation::incRef() {
-  refcount_.fetch_add(1u, std::memory_order_acquire);
+  refcount_.fetch_add(1u, std::memory_order_relaxed);
 };
 
 void
 Allocation::decRef() {
-  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
+  if (refcount_.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
     delete this;
 };
 

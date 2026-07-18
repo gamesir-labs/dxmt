@@ -5,8 +5,11 @@
 #include "dxmt_residency.hpp"
 
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -31,6 +34,33 @@ TEST(Allocation, DetectsRepeatedRetentionSequence) {
   EXPECT_TRUE(allocation.checkRetained(7));
   EXPECT_FALSE(allocation.checkRetained(8));
   EXPECT_TRUE(allocation.checkRetained(8));
+}
+
+TEST(Allocation, DeduplicatesRetentionAcrossConcurrentRecorders) {
+  constexpr size_t thread_count = 8;
+  constexpr uint64_t sequence_count = 256;
+  uint32_t destructions = 0;
+  ProbeAllocation allocation(destructions);
+  std::barrier phase(thread_count);
+  std::atomic<uint64_t> first_retention_count = 0;
+  std::vector<std::thread> recorders;
+  recorders.reserve(thread_count);
+
+  for (size_t thread = 0; thread < thread_count; ++thread) {
+    recorders.emplace_back([&] {
+      for (uint64_t sequence = 1; sequence <= sequence_count; ++sequence) {
+        phase.arrive_and_wait();
+        if (!allocation.checkRetained(sequence))
+          first_retention_count.fetch_add(1, std::memory_order_relaxed);
+        phase.arrive_and_wait();
+      }
+    });
+  }
+  for (auto &recorder : recorders)
+    recorder.join();
+
+  EXPECT_EQ(first_retention_count.load(std::memory_order_relaxed),
+            sequence_count);
 }
 
 TEST(AllocationRefTracking, ClearsOutstandingReferencesOnDestruction) {

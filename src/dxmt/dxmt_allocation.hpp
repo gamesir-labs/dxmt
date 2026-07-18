@@ -15,16 +15,13 @@ public:
 
   bool
   checkRetained(uint64_t seq_id) {
-    // FIXME: is a compare-and-swap necessary?
-    if (seq_id == last_retained_seq_id)
-      return true;
-    last_retained_seq_id = seq_id;
-    return false;
+    return last_retained_seq_id.exchange(seq_id, std::memory_order_relaxed) ==
+           seq_id;
   }
 
 private:
   std::atomic<uint32_t> refcount_ = {0u};
-  uint64_t last_retained_seq_id = 0;
+  std::atomic<uint64_t> last_retained_seq_id = {0};
 };
 
 class AllocationRefTracking {
