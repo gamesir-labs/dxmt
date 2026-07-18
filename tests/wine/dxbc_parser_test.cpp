@@ -871,6 +871,109 @@ TEST(DxbcSignature, ChecksEveryLinkageCompatibilityField) {
   EXPECT_FALSE(short_source.CanOutputTo(&long_target));
 }
 
+TEST(DxbcSignature, MapsEverySupportedSystemValueAndComponentType) {
+  struct SystemValueCase {
+    D3D10_NAME value;
+    uint32_t semantic_index;
+    microsoft::D3D10_SB_NAME expected;
+  };
+  constexpr std::array system_values = {
+      SystemValueCase{D3D10_NAME_TARGET, 0,
+                      microsoft::D3D10_SB_NAME_UNDEFINED},
+      SystemValueCase{D3D10_NAME_DEPTH, 0,
+                      microsoft::D3D10_SB_NAME_UNDEFINED},
+      SystemValueCase{D3D10_NAME_COVERAGE, 0,
+                      microsoft::D3D10_SB_NAME_UNDEFINED},
+      SystemValueCase{D3D10_NAME_UNDEFINED, 0,
+                      microsoft::D3D10_SB_NAME_UNDEFINED},
+      SystemValueCase{D3D10_NAME_POSITION, 0,
+                      microsoft::D3D10_SB_NAME_POSITION},
+      SystemValueCase{D3D10_NAME_CLIP_DISTANCE, 0,
+                      microsoft::D3D10_SB_NAME_CLIP_DISTANCE},
+      SystemValueCase{D3D10_NAME_CULL_DISTANCE, 0,
+                      microsoft::D3D10_SB_NAME_CULL_DISTANCE},
+      SystemValueCase{D3D10_NAME_RENDER_TARGET_ARRAY_INDEX, 0,
+                      microsoft::D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX},
+      SystemValueCase{D3D10_NAME_VIEWPORT_ARRAY_INDEX, 0,
+                      microsoft::D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX},
+      SystemValueCase{D3D10_NAME_VERTEX_ID, 0,
+                      microsoft::D3D10_SB_NAME_VERTEX_ID},
+      SystemValueCase{D3D10_NAME_PRIMITIVE_ID, 0,
+                      microsoft::D3D10_SB_NAME_PRIMITIVE_ID},
+      SystemValueCase{D3D10_NAME_INSTANCE_ID, 0,
+                      microsoft::D3D10_SB_NAME_INSTANCE_ID},
+      SystemValueCase{D3D10_NAME_IS_FRONT_FACE, 0,
+                      microsoft::D3D10_SB_NAME_IS_FRONT_FACE},
+      SystemValueCase{D3D10_NAME_SAMPLE_INDEX, 0,
+                      microsoft::D3D10_SB_NAME_SAMPLE_INDEX},
+      SystemValueCase{D3D11_NAME_FINAL_QUAD_EDGE_TESSFACTOR, 0,
+                      microsoft::D3D11_SB_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_QUAD_EDGE_TESSFACTOR, 1,
+                      microsoft::D3D11_SB_NAME_FINAL_QUAD_V_EQ_0_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_QUAD_EDGE_TESSFACTOR, 2,
+                      microsoft::D3D11_SB_NAME_FINAL_QUAD_U_EQ_1_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_QUAD_EDGE_TESSFACTOR, 3,
+                      microsoft::D3D11_SB_NAME_FINAL_QUAD_V_EQ_1_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_QUAD_INSIDE_TESSFACTOR, 0,
+                      microsoft::D3D11_SB_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_QUAD_INSIDE_TESSFACTOR, 1,
+                      microsoft::D3D11_SB_NAME_FINAL_QUAD_V_INSIDE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_TRI_EDGE_TESSFACTOR, 0,
+                      microsoft::D3D11_SB_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_TRI_EDGE_TESSFACTOR, 1,
+                      microsoft::D3D11_SB_NAME_FINAL_TRI_V_EQ_0_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_TRI_EDGE_TESSFACTOR, 2,
+                      microsoft::D3D11_SB_NAME_FINAL_TRI_W_EQ_0_EDGE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_TRI_INSIDE_TESSFACTOR, 0,
+                      microsoft::D3D11_SB_NAME_FINAL_TRI_INSIDE_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_LINE_DETAIL_TESSFACTOR, 1,
+                      microsoft::D3D11_SB_NAME_FINAL_LINE_DETAIL_TESSFACTOR},
+      SystemValueCase{D3D11_NAME_FINAL_LINE_DENSITY_TESSFACTOR, 0,
+                      microsoft::D3D11_SB_NAME_FINAL_LINE_DENSITY_TESSFACTOR},
+  };
+  constexpr std::array component_types = {
+      std::pair{D3D10_REGISTER_COMPONENT_UNKNOWN,
+                microsoft::D3D10_SB_REGISTER_COMPONENT_UNKNOWN},
+      std::pair{D3D10_REGISTER_COMPONENT_UINT32,
+                microsoft::D3D10_SB_REGISTER_COMPONENT_UINT32},
+      std::pair{D3D10_REGISTER_COMPONENT_SINT32,
+                microsoft::D3D10_SB_REGISTER_COMPONENT_SINT32},
+      std::pair{D3D10_REGISTER_COMPONENT_FLOAT32,
+                microsoft::D3D10_SB_REGISTER_COMPONENT_FLOAT32},
+  };
+
+  std::vector<SignatureParameter4> encoded;
+  std::vector<std::string> names;
+  encoded.reserve(system_values.size());
+  names.reserve(system_values.size());
+  for (size_t i = 0; i < system_values.size(); ++i) {
+    encoded.push_back({
+        .semantic_index = system_values[i].semantic_index,
+        .system_value = system_values[i].value,
+        .component_type = component_types[i % component_types.size()].first,
+        .register_index = static_cast<uint32_t>(i),
+        .mask = 0xf,
+    });
+    names.push_back("SEMANTIC" + std::to_string(i));
+  }
+
+  const auto bytes =
+      BuildStreamSignature<SignatureParameter4>(encoded, names);
+  microsoft::CSignatureParser parser;
+  ASSERT_EQ(parser.ReadSignature4(bytes.data(), bytes.size()), S_OK);
+  const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+  ASSERT_EQ(parser.GetParameters(&parameters), system_values.size());
+  ASSERT_NE(parameters, nullptr);
+  for (size_t i = 0; i < system_values.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(parameters[i].SystemValue, system_values[i].expected);
+    EXPECT_EQ(parameters[i].ComponentType,
+              component_types[i % component_types.size()].second);
+    EXPECT_EQ(parameters[i].SemanticIndex,
+              system_values[i].semantic_index);
+  }
+}
+
 TEST_P(DxbcInvalidSignatureTest, RejectsMalformedTableAndStringRanges) {
   auto bytes = SignatureBuilder().add("A", 0).add("B", 1).build();
 
