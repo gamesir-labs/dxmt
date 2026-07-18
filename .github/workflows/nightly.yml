@@ -14,7 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DXMT_CI_ROOT: /opt/dxmt-ci
   LLVM_VERSION: llvmorg-15.0.7
   WINE_VERSION: proton-11.0-macos
   WINE_GIT_URL: https://github.com/gamesir123/wine-proton-macos.git
@@ -50,8 +49,8 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
-          scripts/ci-self-hosted.sh setup-host
-          scripts/dxmt-builder --help
+          scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json setup-host
+          scripts/dxmt-builder --config .github/dxmt-builder-config.json --help
 
   setup-wine:
     runs-on: self-macos-runner
@@ -89,7 +88,7 @@ jobs:
             *) echo "Wine token kind: unknown" ;;
           esac
           # Same build-cli path as local: fetch remote Wine tip + incremental make.
-          scripts/dxmt-builder bootstrap wine-x64
+          scripts/dxmt-builder --config .github/dxmt-builder-config.json bootstrap wine-x64
 
   setup-llvm-project:
     runs-on: self-macos-runner
@@ -118,7 +117,7 @@ jobs:
       - name: Prepare LLVM Source
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/dxmt-builder bootstrap llvm-project
+        run: scripts/dxmt-builder --config .github/dxmt-builder-config.json bootstrap llvm-project
 
   setup-llvm-darwin:
     runs-on: self-macos-runner
@@ -147,7 +146,7 @@ jobs:
       - name: Prepare LLVM Darwin x86_64
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
-        run: scripts/dxmt-builder bootstrap llvm-darwin-x64
+        run: scripts/dxmt-builder --config .github/dxmt-builder-config.json bootstrap llvm-darwin-x64
 
   build-x86_64-windows:
     runs-on: self-macos-runner
@@ -181,18 +180,21 @@ jobs:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
         run: |
           profile=gcc-x64-release-full
-          install_dir="${DXMT_CI_ROOT}/profiles/${profile}/install"
-          rm -rf "${install_dir}"
+          install_dir="$(scripts/dxmt-builder --config .github/dxmt-builder-config.json \
+            config profile-path --profile "${profile}" install)"
           short_sha="$(git rev-parse --short=7 HEAD)"
-          scripts/ci-self-hosted.sh prepare-job
+          scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json prepare-job
           # Push nightlies only build/package runtime. Full tests stay in
           # "DXMT Nightly Component" (manual backend publish workflow).
-          DXMT_BUILDER_DXMT_VERSION="${short_sha}" scripts/dxmt-builder build \
+          DXMT_BUILDER_DXMT_VERSION="${short_sha}" scripts/dxmt-builder \
+            --config .github/dxmt-builder-config.json build \
             --profile "${profile}" runtime
-          DXMT_BUILDER_DXMT_VERSION="${short_sha}" scripts/dxmt-builder install \
+          DXMT_BUILDER_DXMT_VERSION="${short_sha}" scripts/dxmt-builder \
+            --config .github/dxmt-builder-config.json install \
             --profile "${profile}" --component runtime
           find "${install_dir}/usr/local" -name '*.a' -delete
-          scripts/ci-self-hosted.sh stage-artifact nightly-x86_64-runtime "${install_dir}/usr/local"
+          scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json \
+            stage-artifact nightly-x86_64-runtime "${install_dir}/usr/local"
 
   package:
     runs-on: self-macos-runner
@@ -250,7 +252,8 @@ jobs:
           rm -rf .cache/package/combined ./dist
           mkdir -p "${package_root}/wine" ./dist
 
-          scripts/ci-self-hosted.sh copy-artifact nightly-x86_64-runtime "${package_root}/wine"
+          scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json \
+            copy-artifact nightly-x86_64-runtime "${package_root}/wine"
           find "${package_root}" -name '*.a' -delete
 
           python3 - "${package_root}/manifest.json" "${package_root_name}" "${package_name}" "${short_sha}" <<'PY'
@@ -352,7 +355,8 @@ jobs:
 
       - name: Stage Nightly Package
         run: |
-          scripts/ci-self-hosted.sh stage-files "${{ steps.version.outputs.artifact_name }}" \
+          scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json \
+            stage-files "${{ steps.version.outputs.artifact_name }}" \
             "${{ steps.version.outputs.package_file }}" \
             "${{ steps.version.outputs.package_file }}.sha256" \
             "${{ steps.version.outputs.package_file }}.builder-metadata"
@@ -395,7 +399,7 @@ jobs:
           clean: false
 
       - name: Prune Runner Artifacts
-        run: scripts/ci-self-hosted.sh prune-artifact-runs 3
+        run: scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json prune-artifact-runs 3
 
   notify:
     name: Notify Feishu

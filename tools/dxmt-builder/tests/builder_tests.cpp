@@ -56,6 +56,20 @@ int main() {
     Check(properties.at("schema") == "1" &&
               properties.at("profile") == "gcc-x64-release-full",
           "metadata parsing failed");
+    const auto config = testing::ParseJsonStringObject(
+        "{\n  \"cache_root\": \"../cache\",\n"
+        "  \"profile_namespace\": \"feature\\/cache\"\n}\n");
+    Check(config.at("cache_root") == "../cache" &&
+              config.at("profile_namespace") == "feature/cache",
+          "builder config JSON parsing failed");
+    bool rejected_non_string = false;
+    try {
+      static_cast<void>(testing::ParseJsonStringObject(
+          "{\"cache_root\": 1}"));
+    } catch (const std::runtime_error &) {
+      rejected_non_string = true;
+    }
+    Check(rejected_non_string, "non-string builder config value was accepted");
 
     const auto temp = std::filesystem::temp_directory_path() /
                       ("dxmt-builder-tests-" + std::to_string(getpid()));

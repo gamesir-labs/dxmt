@@ -32,11 +32,33 @@ exists. Set `DXMT_WINE_CLEAN=1` to wipe `build/`/`install/` and force a full
 configure. Published install trees live under `.cache/managed/deps/wine-x86_64-*`
 for later DXMT builds to consume without recompiling Wine.
 
-All state owned by the builder lives under `.cache/managed`: stable Meson/Ninja
-profile directories, ccache, Metal and apitrace CAS entries, Wine and LLVM
-dependencies, staged artifacts, locks, and telemetry. Existing directories
-outside `.cache/managed` are legacy state; the builder neither reads, prunes,
-nor deletes them.
+Builder storage is controlled by `tools/dxmt-builder/config.json`. With the
+bundled default config, all state lives under `.cache/managed`: stable
+Meson/Ninja profile directories, ccache, Metal and apitrace CAS entries, Wine
+and LLVM dependencies, staged artifacts, locks, and telemetry. Existing
+directories outside the configured root are legacy state; the builder neither
+reads, prunes, nor deletes them.
+
+The launcher and builder accept an explicit `--config <config.json>`. Without
+that option, they look for `.dxmt-builder/config.json` from the repository root
+up through its parent directories, then fall back to the bundled config. This
+allows sibling Git worktrees to share one parent configuration without adding
+machine-local paths to Git. Relative `cache_root` values are resolved from the
+active repository root.
+
+```json
+{
+  "cache_root": "../cache",
+  "profile_namespace": "git"
+}
+```
+
+`profile_namespace: "git"` uses the attached branch name, a matching remote
+branch, or the commit SHA for a detached checkout. Only mutable profile state
+(`build`, `install`, `stage`, `prefix`, and `meta`) is namespaced. Dependencies,
+downloads, ccache, CAS entries, artifacts, and telemetry remain globally shared
+under `cache_root`. Use `"none"` to retain the legacy unnamespaced profile
+layout. CI uses `.github/dxmt-builder-config.json` explicitly.
 
 Use `scripts/dxmt-builder cache status`, `cache verify`, and `cache prune
 --dry-run` to inspect managed state. There is no automatic capacity eviction in

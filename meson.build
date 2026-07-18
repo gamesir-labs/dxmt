@@ -231,13 +231,18 @@ endif
 xcrun = find_program('xcrun')
 xxd = find_program('xxd')
 dxmt_builder_path = get_option('dxmt_builder_path')
+dxmt_builder_config_path = get_option('dxmt_builder_config_path')
 dxmt_cache_root = get_option('dxmt_cache_root')
 
 if dxmt_builder_path != ''
   dxmt_builder = find_program(dxmt_builder_path)
+  dxmt_builder_arguments = []
+  if dxmt_builder_config_path != ''
+    dxmt_builder_arguments += [ '--config', dxmt_builder_config_path ]
+  endif
   metalir_generator = generator(dxmt_builder,
     output: ['@BASENAME@.air'],
-    arguments: [
+    arguments: dxmt_builder_arguments + [
       'internal', 'cache-command', '--namespace', 'metal',
       '--output', '@OUTPUT@', '--input', '@INPUT@', '--',
       xcrun.full_path(), '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@',
@@ -245,7 +250,7 @@ if dxmt_builder_path != ''
   )
   metallib_generator = generator(dxmt_builder,
     output: ['@BASENAME@.metallib'],
-    arguments: [
+    arguments: dxmt_builder_arguments + [
       'internal', 'cache-command', '--namespace', 'metal',
       '--output', '@OUTPUT@', '--input', '@INPUT@', '--',
       xcrun.full_path(), '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@',
@@ -253,7 +258,7 @@ if dxmt_builder_path != ''
   )
   hexdump_generator = generator(dxmt_builder,
     output: ['@BASENAME@.h'],
-    arguments: [
+    arguments: dxmt_builder_arguments + [
       'internal', 'cache-command', '--namespace', 'metal',
       '--output', '@OUTPUT@', '--input', '@INPUT@', '--',
       xxd.full_path(), '-n', '@BASENAME@', '-i', '@INPUT@', '@OUTPUT@',

@@ -11,7 +11,7 @@ GAMEHUB_DXMT_ROOT="${GAMEHUB_DXMT_ROOT:-${HOME}/Library/Application Support/${GA
 GAMEHUB_VERSION_MODE="${DXMT_GAMEHUB_VERSION_MODE:-auto}"
 GAMEHUB_VERSION_OVERRIDE="${DXMT_GAMEHUB_VERSION:-}"
 BACKUP_ROOT="${DXMT_GAMEHUB_BACKUP_ROOT:-${HOME}/Library/Caches/dxmt-runtime-smoke}"
-STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-${REPO_ROOT}/.cache/managed/profiles/${BUILDER_PROFILE}/stage/gamehub-test}"
+STAGE_DIR="${DXMT_GAMEHUB_STAGE_DIR:-}"
 BACKUP_TAG="${DXMT_GAMEHUB_BACKUP_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BACKUP_DIR="${BACKUP_ROOT}/gamehub-${GAMEHUB_DXMT_PACKAGE}-backup-${BACKUP_TAG}"
 ENABLE_APITRACE="${DXMT_GAMEHUB_ENABLE_APITRACE:-0}"
@@ -254,6 +254,10 @@ main() {
   export RUNTIME_VERSION_MODE RUNTIME_VERSION
 
   setup_tool_path
+  if [[ -z "${STAGE_DIR}" ]]; then
+    STAGE_DIR="$("${REPO_ROOT}/scripts/dxmt-builder" config profile-path \
+      --profile "${BUILDER_PROFILE}" stage)/gamehub-test"
+  fi
   install_to_stage
 
   local stage_prefix

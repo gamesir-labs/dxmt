@@ -3,9 +3,77 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
-build_dir="$repo_root/.cache/managed/bootstrap/dxmt-builder"
-lock_dir="$repo_root/.cache/managed/locks"
-lock_path="$lock_dir/dxmt-builder-bootstrap.lock"
+config_path=
+expect_config_path=false
+for argument in "$@"; do
+  if [ "$expect_config_path" = true ]; then
+    config_path=$argument
+    expect_config_path=false
+    continue
+  fi
+  case $argument in
+    --config) expect_config_path=true ;;
+    --config=*) config_path=${argument#--config=} ;;
+    *) break ;;
+  esac
+done
+if [ "$expect_config_path" = true ]; then
+  printf '%s\n' 'dxmt-builder: --config requires a value' >&2
+  exit 2
+fi
+if [ -z "$config_path" ]; then
+  search_dir=$repo_root
+  while :; do
+    candidate="$search_dir/.dxmt-builder/config.json"
+    if [ -f "$candidate" ]; then
+      config_path=$candidate
+      break
+    fi
+    parent_dir=$(dirname -- "$search_dir")
+    [ "$parent_dir" != "$search_dir" ] || break
+    search_dir=$parent_dir
+  done
+fi
+if [ -z "$config_path" ] && [ -f "$repo_root/tools/dxmt-builder/config.json" ]; then
+  config_path="$repo_root/tools/dxmt-builder/config.json"
+fi
+
+managed_root="$repo_root/.cache/managed"
+if [ -n "$config_path" ]; then
+  case $config_path in
+    /*) ;;
+    *) config_path="$PWD/$config_path" ;;
+  esac
+  if [ ! -f "$config_path" ]; then
+    printf 'dxmt-builder: config does not exist: %s\n' "$config_path" >&2
+    exit 2
+  fi
+  configured_root=$(python3 - "$config_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    value = json.load(config_file).get("cache_root")
+if not isinstance(value, str) or not value:
+    raise SystemExit(2)
+print(value)
+PY
+  ) || {
+    printf 'dxmt-builder: config must contain a string cache_root: %s\n' "$config_path" >&2
+    exit 2
+  }
+  case $configured_root in
+    /*) managed_root=$configured_root ;;
+    *) managed_root="$repo_root/$configured_root" ;;
+  esac
+fi
+
+mkdir -p "$managed_root"
+managed_root=$(CDPATH='' cd -- "$managed_root" && pwd -P)
+repo_key=$(printf '%s' "$repo_root" | shasum -a 256 | awk '{print substr($1, 1, 16)}')
+build_dir="$managed_root/bootstrap/dxmt-builder/$repo_key"
+lock_dir="$managed_root/locks"
+lock_path="$lock_dir/dxmt-builder-bootstrap-$repo_key.lock"
 owner_path="$lock_path/owner"
 
 for tool in meson ninja; do

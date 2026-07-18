@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -212,6 +213,137 @@ std::string ReadFile(const fs::path &path) {
                      std::istreambuf_iterator<char>());
 }
 
+class JsonStringObjectParser {
+public:
+  explicit JsonStringObjectParser(std::string_view contents)
+      : contents_(contents) {}
+
+  std::map<std::string, std::string> Parse() {
+    std::map<std::string, std::string> result;
+    SkipWhitespace();
+    Expect('{');
+    SkipWhitespace();
+    if (Consume('}')) {
+      RequireEnd();
+      return result;
+    }
+    while (true) {
+      const auto key = ParseString();
+      SkipWhitespace();
+      Expect(':');
+      SkipWhitespace();
+      const auto value = ParseString();
+      if (!result.emplace(key, value).second)
+        Fail("duplicate key: " + key);
+      SkipWhitespace();
+      if (Consume('}'))
+        break;
+      Expect(',');
+      SkipWhitespace();
+    }
+    RequireEnd();
+    return result;
+  }
+
+private:
+  [[noreturn]] void Fail(const std::string &message) const {
+    throw std::runtime_error("invalid builder config JSON at byte " +
+                             std::to_string(position_) + ": " + message);
+  }
+
+  void SkipWhitespace() {
+    while (position_ < contents_.size() &&
+           std::isspace(static_cast<unsigned char>(contents_[position_])) != 0)
+      ++position_;
+  }
+
+  bool Consume(char expected) {
+    if (position_ >= contents_.size() || contents_[position_] != expected)
+      return false;
+    ++position_;
+    return true;
+  }
+
+  void Expect(char expected) {
+    if (!Consume(expected))
+      Fail(std::string("expected '") + expected + "'");
+  }
+
+  static unsigned HexDigit(char character) {
+    if (character >= '0' && character <= '9')
+      return static_cast<unsigned>(character - '0');
+    if (character >= 'a' && character <= 'f')
+      return static_cast<unsigned>(character - 'a' + 10);
+    if (character >= 'A' && character <= 'F')
+      return static_cast<unsigned>(character - 'A' + 10);
+    return 16;
+  }
+
+  void AppendUnicode(std::string &result) {
+    unsigned codepoint = 0;
+    for (int index = 0; index < 4; ++index) {
+      if (position_ >= contents_.size())
+        Fail("incomplete Unicode escape");
+      const auto digit = HexDigit(contents_[position_++]);
+      if (digit >= 16)
+        Fail("invalid Unicode escape");
+      codepoint = codepoint * 16 + digit;
+    }
+    if (codepoint >= 0xd800 && codepoint <= 0xdfff)
+      Fail("UTF-16 surrogate escapes are not supported");
+    if (codepoint <= 0x7f) {
+      result.push_back(static_cast<char>(codepoint));
+    } else if (codepoint <= 0x7ff) {
+      result.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+      result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+    } else {
+      result.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+      result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+      result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+    }
+  }
+
+  std::string ParseString() {
+    Expect('"');
+    std::string result;
+    while (position_ < contents_.size()) {
+      const char character = contents_[position_++];
+      if (character == '"')
+        return result;
+      if (static_cast<unsigned char>(character) < 0x20)
+        Fail("unescaped control character");
+      if (character != '\\') {
+        result.push_back(character);
+        continue;
+      }
+      if (position_ >= contents_.size())
+        Fail("incomplete escape sequence");
+      switch (contents_[position_++]) {
+      case '"': result.push_back('"'); break;
+      case '\\': result.push_back('\\'); break;
+      case '/': result.push_back('/'); break;
+      case 'b': result.push_back('\b'); break;
+      case 'f': result.push_back('\f'); break;
+      case 'n': result.push_back('\n'); break;
+      case 'r': result.push_back('\r'); break;
+      case 't': result.push_back('\t'); break;
+      case 'u': AppendUnicode(result); break;
+      default: Fail("unsupported escape sequence");
+      }
+    }
+    Fail("unterminated string");
+  }
+
+  void RequireEnd() {
+    SkipWhitespace();
+    if (position_ != contents_.size())
+      Fail("trailing content");
+  }
+
+  std::string_view contents_;
+  std::size_t position_ = 0;
+};
+
 std::map<std::string, std::string> ReadProperties(const fs::path &path) {
   if (!fs::is_regular_file(path))
     return {};
@@ -251,6 +383,122 @@ std::string Trim(std::string value) {
          (value.back() == '\n' || value.back() == '\r' || value.back() == ' '))
     value.pop_back();
   return value;
+}
+
+struct BuilderConfiguration {
+  fs::path source;
+  fs::path managed_root;
+  std::string profile_namespace;
+};
+
+void ValidateProfileNamespace(std::string_view value) {
+  if (value.empty())
+    return;
+  const fs::path path(value);
+  if (path.is_absolute() || path.has_root_path())
+    throw std::runtime_error("profile_namespace must be a relative path");
+  for (const auto &component : path) {
+    if (component.empty() || component == "." || component == "..")
+      throw std::runtime_error(
+          "profile_namespace contains an unsafe path component");
+  }
+}
+
+std::string ResolveGitProfileNamespace(const fs::path &repo_root) {
+  const auto symbolic = RunCommand(
+      {"git", "-C", repo_root.string(), "symbolic-ref", "--quiet", "--short",
+       "HEAD"},
+      {}, true);
+  if (symbolic.status == 0 && !Trim(symbolic.output).empty())
+    return Trim(symbolic.output);
+
+  const auto remote_refs = RunCommand(
+      {"git", "-C", repo_root.string(), "for-each-ref",
+       "--format=%(refname:short)", "--points-at=HEAD", "refs/remotes/origin"},
+      {}, true);
+  if (remote_refs.status == 0) {
+    std::istringstream lines(remote_refs.output);
+    std::vector<std::string> matches;
+    for (std::string line; std::getline(lines, line);) {
+      line = Trim(line);
+      if (line.empty() || line == "origin/HEAD")
+        continue;
+      constexpr std::string_view prefix = "origin/";
+      if (line.starts_with(prefix))
+        line.erase(0, prefix.size());
+      matches.push_back(std::move(line));
+    }
+    if (!matches.empty()) {
+      std::sort(matches.begin(), matches.end());
+      return matches.front();
+    }
+  }
+
+  const auto commit = RunCommand(
+      {"git", "-C", repo_root.string(), "rev-parse", "HEAD"}, {}, true);
+  RequireSuccess(commit, "Git profile namespace resolution");
+  const auto result = Trim(commit.output);
+  if (result.empty())
+    throw std::runtime_error("Git profile namespace resolved to an empty value");
+  return result;
+}
+
+std::optional<fs::path> DiscoverConfigPath(
+    const fs::path &repo_root,
+    const std::optional<fs::path> &requested) {
+  if (requested) {
+    const auto path = fs::absolute(*requested).lexically_normal();
+    if (!fs::is_regular_file(path))
+      throw std::runtime_error("builder config does not exist: " + path.string());
+    return path;
+  }
+  for (auto directory = repo_root;; directory = directory.parent_path()) {
+    const auto candidate = directory / ".dxmt-builder/config.json";
+    if (fs::is_regular_file(candidate))
+      return fs::absolute(candidate).lexically_normal();
+    const auto parent = directory.parent_path();
+    if (parent == directory)
+      break;
+  }
+  const auto bundled = repo_root / "tools/dxmt-builder/config.json";
+  if (fs::is_regular_file(bundled))
+    return fs::absolute(bundled).lexically_normal();
+  return std::nullopt;
+}
+
+BuilderConfiguration LoadBuilderConfiguration(
+    const fs::path &repo_root,
+    const std::optional<fs::path> &requested) {
+  BuilderConfiguration result;
+  result.managed_root = repo_root / ".cache/managed";
+  const auto config_path = DiscoverConfigPath(repo_root, requested);
+  if (!config_path)
+    return result;
+
+  result.source = *config_path;
+  const auto values =
+      testing::ParseJsonStringObject(ReadFile(result.source));
+  for (const auto &[name, value] : values) {
+    if (name != "cache_root" && name != "profile_namespace")
+      throw std::runtime_error("unknown builder config key: " + name);
+  }
+  if (const auto found = values.find("cache_root"); found != values.end()) {
+    if (found->second.empty())
+      throw std::runtime_error("cache_root must not be empty");
+    const fs::path configured_root(found->second);
+    result.managed_root = configured_root.is_absolute()
+                              ? configured_root.lexically_normal()
+                              : (repo_root / configured_root).lexically_normal();
+  }
+  if (const auto found = values.find("profile_namespace");
+      found != values.end()) {
+    if (found->second == "git")
+      result.profile_namespace = ResolveGitProfileNamespace(repo_root);
+    else if (found->second != "none")
+      result.profile_namespace = found->second;
+  }
+  ValidateProfileNamespace(result.profile_namespace);
+  return result;
 }
 
 std::string EnvironmentValue(std::string_view name,
@@ -373,8 +621,11 @@ struct ResolvedProfile {
 
 class Driver {
 public:
-  Driver(fs::path repo_root, fs::path managed_root)
-      : repo_root_(std::move(repo_root)), managed_root_(std::move(managed_root)) {}
+  Driver(fs::path repo_root, fs::path managed_root,
+         std::string profile_namespace, fs::path config_path)
+      : repo_root_(std::move(repo_root)), managed_root_(std::move(managed_root)),
+        profile_namespace_(std::move(profile_namespace)),
+        config_path_(std::move(config_path)) {}
 
   int Run(std::span<const std::string> arguments) {
     if (arguments.empty() || arguments.front() == "help" ||
@@ -394,6 +645,8 @@ public:
       return WineExecCommand(arguments.subspan(1));
     if (arguments.front() == "install")
       return InstallCommand(arguments.subspan(1));
+    if (arguments.front() == "config")
+      return ConfigCommand(arguments.subspan(1));
     if (arguments.front() == "cache")
       return CacheCommand(arguments.subspan(1));
     if (arguments.front() == "internal")
@@ -423,7 +676,7 @@ private:
 
   void PrintUsage() const {
     std::cout
-        << "usage: scripts/dxmt-builder <command> [options]\n\n"
+        << "usage: scripts/dxmt-builder [--config FILE] <command> [options]\n\n"
         << "commands:\n"
         << "  bootstrap [all|host|wine-x64|llvm-mingw|llvm-project|llvm-darwin-x64|llvm-win]...\n"
         << "  configure [--profile NAME]\n"
@@ -431,7 +684,82 @@ private:
         << "  test [--profile NAME] [all|unit|integration|performance] [--suite NAME] [--test-args ARG]\n"
         << "  wine-exec [--] <wine-args...>   # Meson/benchmark Wine launcher\n"
         << "  install [--profile NAME] [--component NAME] [--dest PATH]\n"
+        << "  config <cache-root|namespace|profile-path --profile NAME KIND>\n"
         << "  cache <status [--json]|verify|prune [--dry-run|--apply]|clean --profile NAME>\n";
+  }
+
+  fs::path ProfilesRoot() const {
+    auto root = managed_root_ / "profiles";
+    if (!profile_namespace_.empty())
+      root /= profile_namespace_;
+    return root;
+  }
+
+  fs::path ProfileRoot(std::string_view name) const {
+    return ProfilesRoot() / name;
+  }
+
+  fs::path ProfileLockPath(std::string_view name) const {
+    if (profile_namespace_.empty())
+      return managed_root_ / "locks" / (std::string(name) + ".lock");
+    return managed_root_ / "locks" /
+           ("profile-" + Sha256(profile_namespace_).substr(0, 16) + "-" +
+            std::string(name) + ".lock");
+  }
+
+  int ConfigCommand(std::span<const std::string> arguments) const {
+    if (arguments.empty())
+      throw std::runtime_error("config requires a subcommand");
+    if (arguments.front() == "cache-root") {
+      if (arguments.size() != 1)
+        throw std::runtime_error("config cache-root does not accept arguments");
+      std::cout << managed_root_.string() << '\n';
+      return 0;
+    }
+    if (arguments.front() == "namespace") {
+      if (arguments.size() != 1)
+        throw std::runtime_error("config namespace does not accept arguments");
+      std::cout << profile_namespace_ << '\n';
+      return 0;
+    }
+    if (arguments.front() == "profile-path") {
+      std::string profile;
+      std::string kind;
+      for (std::size_t index = 1; index < arguments.size(); ++index) {
+        if (arguments[index] == "--profile") {
+          if (++index >= arguments.size())
+            throw std::runtime_error("--profile requires a value");
+          profile = arguments[index];
+        } else if (arguments[index].starts_with("--profile=")) {
+          profile = arguments[index].substr(std::string("--profile=").size());
+        } else if (kind.empty()) {
+          kind = arguments[index];
+        } else {
+          throw std::runtime_error("unexpected config profile-path argument: " +
+                                   arguments[index]);
+        }
+      }
+      if (FindProfile(profile) == nullptr)
+        throw std::runtime_error("config profile-path requires a valid --profile");
+      auto path = ProfileRoot(profile);
+      if (kind == "root" || kind.empty()) {
+      } else if (kind == "build") {
+        path /= "build";
+      } else if (kind == "install") {
+        path /= "install";
+      } else if (kind == "stage") {
+        path /= "stage";
+      } else if (kind == "prefix") {
+        path /= "prefix";
+      } else if (kind == "meta") {
+        path /= "meta";
+      } else {
+        throw std::runtime_error("unknown profile path kind: " + kind);
+      }
+      std::cout << path.string() << '\n';
+      return 0;
+    }
+    throw std::runtime_error("unknown config subcommand: " + arguments.front());
   }
 
   std::string ParseProfile(std::span<const std::string> arguments,
@@ -455,7 +783,7 @@ private:
 
   Environment BuildEnvironment() const {
     const auto config = managed_root_ / "ccache/ccache.conf";
-    return {
+    Environment environment = {
         {"CCACHE_CONFIGPATH", config.string()},
         {"CCACHE_DIR", (managed_root_ / "ccache/data").string()},
         {"CCACHE_BASEDIR", repo_root_.string()},
@@ -463,6 +791,7 @@ private:
         {"DXMT_MANAGED_CACHE_ROOT", managed_root_.string()},
         {"DXMT_APITRACE_CAS", (managed_root_ / "cas/apitrace").string()},
     };
+    return environment;
   }
 
   void EnsureManagedLayout() const {
@@ -633,7 +962,7 @@ private:
 
     ResolvedProfile result;
     result.profile = profile;
-    result.root = managed_root_ / "profiles" / profile->name;
+    result.root = ProfileRoot(profile->name);
     result.build = result.root / "build";
     result.install = result.root / "install";
     result.stage = result.root / "stage";
@@ -766,8 +1095,6 @@ private:
   }
 
   void Configure(const ResolvedProfile &profile) const {
-    FileLock lock(managed_root_ / "locks" /
-                  (std::string(profile.profile->name) + ".lock"));
     WriteMachineFiles(profile);
 
     const auto properties_path = profile.meta / "profile.properties";
@@ -817,6 +1144,7 @@ private:
                           (repo_root_ / "external/apitrace").string());
       command.push_back("-Ddxmt_version=" + version);
       command.push_back("-Ddxmt_builder_path=" + BuilderBinary().string());
+      command.push_back("-Ddxmt_builder_config_path=" + config_path_.string());
       command.push_back("-Ddxmt_cache_root=" + managed_root_.string());
       if (profile.profile->cross) {
         command.push_back("-Dwine_build_path=");
@@ -825,11 +1153,14 @@ private:
       RequireSuccess(RunCommand(command, BuildEnvironment()), "Meson configure");
     } else if (!existing.contains("dxmt_version") ||
                existing.at("dxmt_version") != version ||
-               !native_llvm_link_args_compatible) {
+               !native_llvm_link_args_compatible ||
+               !existing.contains("builder_config_path") ||
+               existing.at("builder_config_path") != config_path_.string()) {
       RequireSuccess(
           RunCommand({"meson", "configure", profile.build.string(),
                       "-Ddxmt_version=" + version,
-                      "-Dnative_llvm_link_args=" + native_llvm_link_args},
+                      "-Dnative_llvm_link_args=" + native_llvm_link_args,
+                      "-Ddxmt_builder_config_path=" + config_path_.string()},
                      BuildEnvironment()),
           "DXMT option reconfigure");
     }
@@ -840,6 +1171,7 @@ private:
                << "\ndxmt_version=" << version
                << "\nnative_llvm_link_args_digest="
                << native_llvm_link_args_digest
+               << "\nbuilder_config_path=" << config_path_.string()
                << "\nwine_root=" << profile.wine_root.string() << '\n';
     WriteFileAtomic(properties_path, properties.str());
   }
@@ -880,6 +1212,10 @@ private:
         command = {helper, "ensure-llvm-win"};
       else
         throw std::runtime_error("unknown bootstrap component: " + component);
+      if (!config_path_.empty()) {
+        command.insert(command.begin() + 1, config_path_.string());
+        command.insert(command.begin() + 1, "--config");
+      }
       RequireSuccess(RunCommand(command, environment), "bootstrap " + component);
     }
     return 0;
@@ -890,6 +1226,7 @@ private:
     const auto name = ParseProfile(arguments, &remaining);
     if (!remaining.empty())
       throw std::runtime_error("unexpected configure argument: " + remaining.front());
+    FileLock lock(ProfileLockPath(name));
     const auto profile = EnsureConfigured(name);
     std::cout << "configured " << name << " at " << profile.build << '\n';
     return 0;
@@ -928,6 +1265,7 @@ private:
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::string> targets;
     const auto name = ParseProfile(arguments, &targets);
+    FileLock lock(ProfileLockPath(name));
     const auto profile = EnsureConfigured(name);
     auto command = std::vector<std::string>{"meson", "compile", "-C", profile.build.string()};
     const auto mapped = MapTargets(targets);
@@ -1226,6 +1564,7 @@ private:
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::string> remaining;
     const auto name = ParseProfile(arguments, &remaining);
+    FileLock lock(ProfileLockPath(name));
     const auto profile = EnsureConfigured(name);
     if (!profile.profile->tests)
       throw std::runtime_error("profile does not enable tests: " + name);
@@ -1319,6 +1658,7 @@ private:
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::string> remaining;
     const auto name = ParseProfile(arguments, &remaining);
+    FileLock lock(ProfileLockPath(name));
     auto profile = EnsureConfigured(name);
     std::string component = "runtime";
     std::optional<fs::path> destination;
@@ -1385,7 +1725,7 @@ private:
              << "\nruntime_sha256=" << runtime_digest << '\n';
     WriteFileAtomic(artifact_meta, artifact.str());
     RecordTelemetry("install", name + ":" + component, "success", started);
-    std::cout << dest / "usr/local" << '\n';
+    std::cout << (dest / "usr/local").string() << '\n';
     return 0;
   }
 
@@ -1398,21 +1738,25 @@ private:
       const auto managed = DirectorySize(managed_root_);
       if (json) {
         std::cout << "{\"managed_bytes\":" << managed
-                  << ",\"scope\":\".cache/managed\",\"profiles\":[";
+                  << ",\"scope\":\"" << JsonEscape(managed_root_.string())
+                  << "\",\"profile_namespace\":\""
+                  << JsonEscape(profile_namespace_) << "\",\"profiles\":[";
         bool first = true;
         for (const auto &profile : Profiles()) {
           if (!first)
             std::cout << ',';
           first = false;
-          const auto size = DirectorySize(managed_root_ / "profiles" / profile.name);
+          const auto size = DirectorySize(ProfileRoot(profile.name));
           std::cout << "{\"name\":\"" << JsonEscape(profile.name)
                     << "\",\"bytes\":" << size << '}';
         }
         std::cout << "]}\n";
       } else {
         std::cout << "managed cache: " << HumanSize(managed) << '\n';
+        if (!profile_namespace_.empty())
+          std::cout << "profile namespace: " << profile_namespace_ << '\n';
         for (const auto &profile : Profiles()) {
-          const auto size = DirectorySize(managed_root_ / "profiles" / profile.name);
+          const auto size = DirectorySize(ProfileRoot(profile.name));
           if (size != 0)
             std::cout << "  " << profile.name << ": " << HumanSize(size) << '\n';
         }
@@ -1476,10 +1820,10 @@ private:
       }
       if (FindProfile(profile) == nullptr)
         throw std::runtime_error("cache clean requires a valid --profile");
-      const auto path = managed_root_ / "profiles" / profile;
+      const auto path = ProfileRoot(profile);
       if (!IsPathWithin(path, managed_root_))
         throw std::runtime_error("refusing to clean an unmanaged path");
-      FileLock lock(managed_root_ / "locks" / (profile + ".lock"));
+      FileLock lock(ProfileLockPath(profile));
       fs::remove_all(path);
       std::cout << "removed managed profile " << profile << '\n';
       return 0;
@@ -1606,6 +1950,8 @@ private:
 
   fs::path repo_root_;
   fs::path managed_root_;
+  std::string profile_namespace_;
+  fs::path config_path_;
 };
 
 } // namespace
@@ -1674,6 +2020,11 @@ std::map<std::string, std::string> ParseProperties(std::string_view contents) {
   return values;
 }
 
+std::map<std::string, std::string> ParseJsonStringObject(
+    std::string_view contents) {
+  return JsonStringObjectParser(contents).Parse();
+}
+
 void WriteFileAtomic(const fs::path &path, std::string_view contents) {
   dxmt::builder::WriteFileAtomic(path, contents);
 }
@@ -1687,17 +2038,32 @@ void WithFileLock(const fs::path &path,
 } // namespace testing
 
 Application::Application(fs::path repo_root)
-    : repo_root_(fs::canonical(std::move(repo_root))),
-      managed_root_([&] {
-        if (const char *root = std::getenv("DXMT_CI_ROOT"); root && *root)
-          return fs::path(root);
-        if (const char *root = std::getenv("DXMT_MANAGED_CACHE_ROOT"); root && *root)
-          return fs::path(root);
-        return repo_root_ / ".cache/managed";
-      }()) {}
+    : repo_root_(fs::canonical(std::move(repo_root))) {}
 
 int Application::Run(std::span<const std::string> arguments) {
-  return Driver(repo_root_, managed_root_).Run(arguments);
+  std::optional<fs::path> requested_config;
+  std::size_t index = 0;
+  while (index < arguments.size()) {
+    if (arguments[index] == "--config") {
+      if (++index >= arguments.size())
+        throw std::runtime_error("--config requires a value");
+      if (requested_config)
+        throw std::runtime_error("--config may only be provided once");
+      requested_config = arguments[index++];
+    } else if (arguments[index].starts_with("--config=")) {
+      if (requested_config)
+        throw std::runtime_error("--config may only be provided once");
+      requested_config =
+          arguments[index++].substr(std::string("--config=").size());
+    } else {
+      break;
+    }
+  }
+  const auto configuration =
+      LoadBuilderConfiguration(repo_root_, requested_config);
+  return Driver(repo_root_, configuration.managed_root,
+                configuration.profile_namespace, configuration.source)
+      .Run(arguments.subspan(index));
 }
 
 } // namespace dxmt::builder

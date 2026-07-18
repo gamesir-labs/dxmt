@@ -6,7 +6,64 @@ trap 'printf "[dxmt-ci] error: command failed at line %s: %s (exit %s)\n" "$LINE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG_PATH=""
+case "${1:-}" in
+  --config)
+    [[ $# -ge 2 ]] || { echo "ci-self-hosted.sh: --config requires a value" >&2; exit 2; }
+    CONFIG_PATH="$2"
+    shift 2
+    ;;
+  --config=*)
+    CONFIG_PATH="${1#--config=}"
+    shift
+    ;;
+esac
+if [[ -z "${CONFIG_PATH}" ]]; then
+  search_dir="${REPO_ROOT}"
+  while :; do
+    candidate="${search_dir}/.dxmt-builder/config.json"
+    if [[ -f "${candidate}" ]]; then
+      CONFIG_PATH="${candidate}"
+      break
+    fi
+    parent_dir="$(dirname "${search_dir}")"
+    [[ "${parent_dir}" != "${search_dir}" ]] || break
+    search_dir="${parent_dir}"
+  done
+fi
+if [[ -z "${CONFIG_PATH}" && -f "${REPO_ROOT}/tools/dxmt-builder/config.json" ]]; then
+  CONFIG_PATH="${REPO_ROOT}/tools/dxmt-builder/config.json"
+fi
+
 CACHE_ROOT="${DXMT_CI_ROOT:-${DXMT_MANAGED_CACHE_ROOT:-${REPO_ROOT}/.cache/managed}}"
+if [[ -n "${CONFIG_PATH}" ]]; then
+  if [[ "${CONFIG_PATH}" != /* ]]; then
+    CONFIG_PATH="${PWD}/${CONFIG_PATH}"
+  fi
+  [[ -f "${CONFIG_PATH}" ]] || {
+    echo "ci-self-hosted.sh: config does not exist: ${CONFIG_PATH}" >&2
+    exit 2
+  }
+  configured_root="$(python3 - "${CONFIG_PATH}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    value = json.load(config_file).get("cache_root")
+if not isinstance(value, str) or not value:
+    raise SystemExit(2)
+print(value)
+PY
+  )" || {
+    echo "ci-self-hosted.sh: config must contain a string cache_root: ${CONFIG_PATH}" >&2
+    exit 2
+  }
+  if [[ "${configured_root}" == /* ]]; then
+    CACHE_ROOT="${configured_root}"
+  else
+    CACHE_ROOT="${REPO_ROOT}/${configured_root}"
+  fi
+fi
 TOOLCHAINS_DIR="${CACHE_ROOT}/deps"
 DOWNLOADS_DIR="${CACHE_ROOT}/downloads"
 ARTIFACTS_DIR="${CACHE_ROOT}/artifacts"
@@ -1067,7 +1124,7 @@ prune_artifact_runs() {
 
 usage() {
   cat <<'EOF'
-usage: ci-self-hosted.sh <command> [args]
+usage: ci-self-hosted.sh [--config FILE] <command> [args]
 
 commands:
   setup-host
