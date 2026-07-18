@@ -1686,6 +1686,104 @@ TEST(DxilRuntimeData, ParsesWorkGraphNodeRecords) {
             (std::vector<uint32_t>{0}));
 }
 
+TEST(DxilRuntimeData, ParsesEveryWorkGraphAttributeKind) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> indices(4 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 3u);
+  Store<uint32_t>(indices, 4, 8u);
+  Store<uint32_t>(indices, 8, 4u);
+  Store<uint32_t>(indices, 12, 2u);
+
+  std::vector<uint8_t> node_ids(kRuntimeDataTableHeaderSize +
+                                kRdatNodeIdRecordSize);
+  Store<uint32_t>(node_ids, 0, 1u);
+  Store<uint32_t>(node_ids, 4, kRdatNodeIdRecordSize);
+  Store<uint32_t>(node_ids, kRuntimeDataTableHeaderSize + 0, kRdatNullRef);
+  Store<uint32_t>(node_ids, kRuntimeDataTableHeaderSize + 4, 11u);
+
+  constexpr size_t function_attribute_count = 10;
+  std::vector<uint8_t> function_attributes(
+      kRuntimeDataTableHeaderSize +
+      function_attribute_count * kRdatNodeShaderFuncAttribRecordSize);
+  Store<uint32_t>(function_attributes, 0, function_attribute_count);
+  Store<uint32_t>(function_attributes, 4,
+                  kRdatNodeShaderFuncAttribRecordSize);
+  for (size_t i = 0; i < function_attribute_count; ++i) {
+    const uint32_t kind = i < 9 ? uint32_t(i + 1) : 99u;
+    const size_t record = kRuntimeDataTableHeaderSize +
+                          i * kRdatNodeShaderFuncAttribRecordSize;
+    Store<uint32_t>(function_attributes, record + 0, kind);
+    Store<uint32_t>(function_attributes, record + 4, 100u + kind);
+  }
+  for (size_t i : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(6)}) {
+    const size_t record = kRuntimeDataTableHeaderSize +
+                          i * kRdatNodeShaderFuncAttribRecordSize;
+    Store<uint32_t>(function_attributes, record + 4, 0u);
+  }
+
+  constexpr size_t io_attribute_count = 9;
+  std::vector<uint8_t> io_attributes(
+      kRuntimeDataTableHeaderSize +
+      io_attribute_count * kRdatNodeShaderIoAttribRecordSize);
+  Store<uint32_t>(io_attributes, 0, io_attribute_count);
+  Store<uint32_t>(io_attributes, 4, kRdatNodeShaderIoAttribRecordSize);
+  for (size_t i = 0; i < io_attribute_count; ++i) {
+    const uint32_t kind = i < 8 ? uint32_t(i + 1) : 99u;
+    const size_t record = kRuntimeDataTableHeaderSize +
+                          i * kRdatNodeShaderIoAttribRecordSize;
+    Store<uint32_t>(io_attributes, record + 0, kind);
+    Store<uint32_t>(io_attributes, record + 4, 200u + kind);
+  }
+  Store<uint32_t>(io_attributes, kRuntimeDataTableHeaderSize + 4, 0u);
+  const size_t dispatch_record =
+      kRuntimeDataTableHeaderSize + 4 * kRdatNodeShaderIoAttribRecordSize;
+  Store<uint16_t>(io_attributes, dispatch_record + 4, 12u);
+  Store<uint16_t>(io_attributes, dispatch_record + 6, (5u << 2) | 3u);
+
+  const auto bytes =
+      DxilRuntimeDataBuilder()
+          .add(rdat::IndexArrays, indices)
+          .add(rdat::NodeIDTable, node_ids)
+          .add(rdat::NodeShaderFuncAttribTable, function_attributes)
+          .add(rdat::NodeShaderIOAttribTable, io_attributes)
+          .build();
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+
+  ASSERT_EQ(info.node_function_attributes.size(), function_attribute_count);
+  EXPECT_EQ(info.node_function_attributes[0].node_id_index, 0u);
+  EXPECT_EQ(info.node_function_attributes[1].values,
+            (std::vector<uint32_t>{8, 4, 2}));
+  EXPECT_EQ(info.node_function_attributes[2].node_id_index, 0u);
+  EXPECT_EQ(info.node_function_attributes[3].values,
+            (std::vector<uint32_t>{8, 4, 2}));
+  EXPECT_EQ(info.node_function_attributes[4].value, 105u);
+  EXPECT_EQ(info.node_function_attributes[5].value, 106u);
+  EXPECT_EQ(info.node_function_attributes[6].values,
+            (std::vector<uint32_t>{8, 4, 2}));
+  EXPECT_EQ(info.node_function_attributes[7].value, 108u);
+  EXPECT_EQ(info.node_function_attributes[8].value, 109u);
+  EXPECT_EQ(info.node_function_attributes[9].kind, 99u);
+  EXPECT_EQ(info.node_function_attributes[9].value, 0u);
+
+  ASSERT_EQ(info.node_io_attributes.size(), io_attribute_count);
+  EXPECT_EQ(info.node_io_attributes[0].node_id_index, 0u);
+  EXPECT_EQ(info.node_io_attributes[1].value, 202u);
+  EXPECT_EQ(info.node_io_attributes[2].value, 203u);
+  EXPECT_EQ(info.node_io_attributes[3].value, 204u);
+  EXPECT_EQ(info.node_io_attributes[4].record_dispatch_grid.byte_offset, 12u);
+  EXPECT_EQ(info.node_io_attributes[4].record_dispatch_grid.component_count,
+            3u);
+  EXPECT_EQ(info.node_io_attributes[4].record_dispatch_grid.component_type,
+            5u);
+  EXPECT_EQ(info.node_io_attributes[5].value, 206u);
+  EXPECT_EQ(info.node_io_attributes[6].value, 207u);
+  EXPECT_EQ(info.node_io_attributes[7].value, 208u);
+  EXPECT_EQ(info.node_io_attributes[8].kind, 99u);
+  EXPECT_EQ(info.node_io_attributes[8].value, 0u);
+}
+
 TEST(DxilRuntimeData, RejectsInvalidWorkGraphNodeLinks) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> strings = {'n', 'o', 'd', 'e', 0};
