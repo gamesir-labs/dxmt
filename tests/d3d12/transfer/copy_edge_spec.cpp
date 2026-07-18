@@ -267,6 +267,49 @@ protected:
     ASSERT_TRUE(source);
     context_.list()->CopyResource(destination, source);
     EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+    auto recovery_source = context_.CreateBuffer(
+        16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto recovery_destination = context_.CreateBuffer(
+        16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(recovery_source);
+    ASSERT_TRUE(recovery_destination);
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                  D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  IID_PPV_ARGS(allocator.put())),
+              S_OK);
+    ASSERT_EQ(context_.device()->CreateCommandList(
+                  0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                  IID_PPV_ARGS(list.put())),
+              S_OK);
+    list->CopyResource(recovery_destination.get(), recovery_source.get());
+    EXPECT_EQ(list->Close(), S_OK);
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  }
+
+  ComPtr<ID3D12Resource> CreateTexture(UINT sample_count,
+                                       D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = sample_count;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    ComPtr<ID3D12Resource> resource;
+    if (FAILED(context_.device()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+            IID_PPV_ARGS(resource.put()))))
+      return {};
+    return resource;
   }
 
   D3D12TestContext context_;
@@ -332,6 +375,22 @@ TEST_F(CopyResourceCompatibilitySpec, RejectsDifferentMipCounts) {
   auto destination = context_.CreateTexture2D(
       8, 8, 2, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
       D3D12_RESOURCE_STATE_COPY_DEST);
+  ExpectRejected(destination.get(), source.get());
+}
+
+TEST_F(CopyResourceCompatibilitySpec, RejectsDifferentSampleCounts) {
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS support = {};
+  support.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  support.SampleCount = 4;
+  support.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &support,
+                sizeof(support)),
+            S_OK);
+  if (!support.NumQualityLevels)
+    GTEST_SKIP() << "4x MSAA is unavailable";
+  auto source = CreateTexture(4, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto destination = CreateTexture(1, D3D12_RESOURCE_STATE_COPY_DEST);
   ExpectRejected(destination.get(), source.get());
 }
 
