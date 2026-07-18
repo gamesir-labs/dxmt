@@ -109,6 +109,67 @@ private:
   std::vector<Part> parts_;
 };
 
+class BitcodeBuilder {
+public:
+  BitcodeBuilder &bits(uint64_t value, uint32_t width) {
+    for (uint32_t i = 0; i < width; ++i) {
+      if ((bit_offset_ & 7u) == 0)
+        bytes_.push_back(0);
+      bytes_.back() |= uint8_t(((value >> i) & 1u) << (bit_offset_ & 7u));
+      ++bit_offset_;
+    }
+    return *this;
+  }
+
+  BitcodeBuilder &vbr(uint64_t value, uint32_t width) {
+    const auto payload_width = width - 1;
+    const auto payload_mask = (uint64_t(1) << payload_width) - 1;
+    do {
+      auto piece = value & payload_mask;
+      value >>= payload_width;
+      if (value)
+        piece |= uint64_t(1) << payload_width;
+      bits(piece, width);
+    } while (value);
+    return *this;
+  }
+
+  BitcodeBuilder &align32() {
+    while (bit_offset_ & 31u)
+      bits(0, 1);
+    return *this;
+  }
+
+  std::vector<uint8_t> build() const { return bytes_; }
+
+private:
+  std::vector<uint8_t> bytes_;
+  uint64_t bit_offset_ = 0;
+};
+
+std::vector<uint8_t> BuildBitcodeWithAbbreviatedRecord() {
+  using namespace dxmt::dxil;
+  BitcodeBuilder builder;
+  builder.bits(kBitcodeMagicValue, 32)
+      .bits(bitc::EnterSubblock, 2)
+      .vbr(8, 8)
+      .vbr(3, 4)
+      .align32()
+      .bits(2, 32)
+      .bits(bitc::DefineAbbrev, 3)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(7, 8)
+      .bits(0, 1)
+      .bits(1, 3)
+      .vbr(5, 5)
+      .bits(bitc::FirstApplicationAbbrev, 3)
+      .bits(17, 5)
+      .bits(bitc::EndBlock, 3)
+      .align32();
+  return builder.build();
+}
+
 dxmt::dxil::BlobPart Part(uint32_t fourcc, const std::vector<uint8_t> &bytes) {
   return {.fourcc = fourcc, .data = bytes};
 }
@@ -387,6 +448,83 @@ TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
   Store<uint32_t>(wrapper, 8, wrapper.size());
   Store<uint32_t>(wrapper, 12, 4u);
   EXPECT_EQ(ParseBitcode(wrapper, info), ParseStatus::InvalidBitcode);
+}
+
+TEST(DxilBitcode, ParsesNestedAbbreviatedRecordsAndWrappers) {
+  using namespace dxmt::dxil;
+  const auto bitcode = BuildBitcodeWithAbbreviatedRecord();
+
+  BitcodeInfo info;
+  ASSERT_EQ(ParseBitcode(bitcode, info), ParseStatus::Ok);
+  EXPECT_EQ(info.magic, kBitcodeMagicValue);
+  EXPECT_FALSE(info.has_wrapper);
+  ASSERT_EQ(info.blocks.size(), 2u);
+  EXPECT_EQ(info.blocks[0].id, std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(info.blocks[0].abbreviation_id_width, 2u);
+  EXPECT_EQ(info.blocks[0].depth, 0u);
+  EXPECT_EQ(info.blocks[0].start_bit, 32u);
+  EXPECT_EQ(info.blocks[0].end_bit, bitcode.size() * 8u);
+  EXPECT_EQ(info.blocks[0].record_count, 0u);
+  EXPECT_EQ(info.blocks[1].id, 8u);
+  EXPECT_EQ(info.blocks[1].abbreviation_id_width, 3u);
+  EXPECT_EQ(info.blocks[1].depth, 1u);
+  EXPECT_EQ(info.blocks[1].start_bit, 96u);
+  EXPECT_EQ(info.blocks[1].end_bit, bitcode.size() * 8u);
+  EXPECT_EQ(info.blocks[1].record_count, 1u);
+  ASSERT_EQ(info.records.size(), 1u);
+  EXPECT_EQ(info.records[0].block_id, 8u);
+  EXPECT_EQ(info.records[0].code, 7u);
+  EXPECT_EQ(info.records[0].operand_count, 1u);
+  EXPECT_TRUE(info.records[0].abbreviated);
+
+  std::vector<uint8_t> wrapper(kBitcodeWrapperHeaderSize + bitcode.size());
+  Store<uint32_t>(wrapper, 0, kBitcodeWrapperMagicValue);
+  Store<uint32_t>(wrapper, 4, 3u);
+  Store<uint32_t>(wrapper, 8, kBitcodeWrapperHeaderSize);
+  Store<uint32_t>(wrapper, 12, bitcode.size());
+  Store<uint32_t>(wrapper, 16, 0x0100000cu);
+  std::copy(bitcode.begin(), bitcode.end(),
+            wrapper.begin() + kBitcodeWrapperHeaderSize);
+
+  ASSERT_EQ(ParseBitcode(wrapper, info), ParseStatus::Ok);
+  EXPECT_TRUE(info.has_wrapper);
+  EXPECT_EQ(info.wrapper_version, 3u);
+  EXPECT_EQ(info.wrapper_offset, kBitcodeWrapperHeaderSize);
+  EXPECT_EQ(info.wrapper_size, bitcode.size());
+  EXPECT_EQ(info.wrapper_cpu_type, 0x0100000cu);
+  ASSERT_EQ(info.records.size(), 1u);
+  EXPECT_EQ(info.records[0].code, 7u);
+}
+
+TEST(DxilBitcode, RejectsInvalidSubblockHeadersAndAbbreviations) {
+  using namespace dxmt::dxil;
+  BitcodeInfo info;
+
+  auto malformed = BuildBitcodeWithAbbreviatedRecord();
+  Store<uint32_t>(malformed, 8, 3u);
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+
+  malformed = BitcodeBuilder()
+                  .bits(kBitcodeMagicValue, 32)
+                  .bits(bitc::EnterSubblock, 2)
+                  .vbr(8, 8)
+                  .vbr(0, 4)
+                  .align32()
+                  .bits(0, 32)
+                  .build();
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+
+  malformed = BitcodeBuilder()
+                  .bits(kBitcodeMagicValue, 32)
+                  .bits(bitc::EnterSubblock, 2)
+                  .vbr(8, 8)
+                  .vbr(3, 4)
+                  .align32()
+                  .bits(1, 32)
+                  .bits(bitc::FirstApplicationAbbrev, 3)
+                  .align32()
+                  .build();
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
 }
 
 TEST(DxilParts, ParsesSignatureElementsAndValidatesStringOffsets) {
