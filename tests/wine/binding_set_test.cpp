@@ -119,6 +119,16 @@ TEST(BindingSet, AppliesDirtyAndBoundMasks) {
   EXPECT_TRUE(bindings.test_dirty(65));
 }
 
+TEST(BindingSet, IgnoresTheHighMaskForSingleQwordSets) {
+  dxmt::BindingSet<dxmt::TestBinding, 64> bindings;
+  bool replaced = false;
+  bindings.bind(63, dxmt::TestBinding{1}, replaced);
+
+  EXPECT_FALSE(bindings.any_dirty_masked(~uint64_t{0}, uint64_t{0}));
+  EXPECT_TRUE(
+      bindings.any_dirty_masked(uint64_t{0}, uint64_t{1} << 63));
+}
+
 TEST(BindingSet, ReportsTheHighestDirtySlotInTheFirstQword) {
   dxmt::BindingSet<dxmt::TestBinding, 64> bindings;
   EXPECT_EQ(bindings.max_binding_64(), 0u);

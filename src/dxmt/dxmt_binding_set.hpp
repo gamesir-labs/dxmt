@@ -73,7 +73,9 @@ public:
 
   constexpr bool
   any_dirty_masked(uint64_t mask_hi, uint64_t mask_lo) const noexcept {
-    return ((dirty.qword(0) & mask_lo) | (dirty.qword(1) & mask_hi)) != 0;
+    if constexpr (NumElements > 64)
+      return ((dirty.qword(0) & mask_lo) | (dirty.qword(1) & mask_hi)) != 0;
+    return (dirty.qword(0) & mask_lo) != 0;
   }
 
   constexpr bool
