@@ -5791,8 +5791,12 @@ private:
     D3D12_RESOURCE_ALLOCATION_INFO info = {};
     info.Alignment = 1;
 
-    if (!resource_desc_count || !resource_descs)
+    if (!resource_desc_count)
       return info;
+    if (visible_mask > 1 || !resource_descs) {
+      info.SizeInBytes = UINT64_MAX;
+      return info;
+    }
 
     UINT64 offset = 0;
     for (UINT i = 0; i < resource_desc_count; i++) {
@@ -5869,9 +5873,6 @@ private:
     D3D12_RESOURCE_ALLOCATION_INFO info = {};
     info.Alignment = 1;
 
-    if (!resource_desc_count || !resource_descs)
-      return info;
-
     auto invalidate_resource_info = [&](UINT first, UINT64 alignment) {
       if (!resource_info)
         return;
@@ -5882,6 +5883,14 @@ private:
       }
       resource_info[first].Alignment = alignment;
     };
+
+    if (!resource_desc_count)
+      return info;
+    if (visible_mask > 1 || !resource_descs) {
+      info.SizeInBytes = UINT64_MAX;
+      invalidate_resource_info(0, 0);
+      return info;
+    }
 
     UINT64 offset = 0;
     for (UINT i = 0; i < resource_desc_count; i++) {

@@ -425,6 +425,67 @@ TEST_F(VersionedApiSpec,
 }
 
 TEST_F(VersionedApiSpec,
+       AllocationInfoValidatesVisibleNodesAndDescriptorArrays) {
+  auto device4 = QueryDevice<ID3D12Device4>();
+  auto device8 = QueryDevice<ID3D12Device8>();
+  ASSERT_TRUE(device4);
+  ASSERT_TRUE(device8);
+  const auto desc = BufferDesc(1024);
+  const auto desc1 = BufferDesc1(1024);
+
+  const auto base_node0 = context_.device()->GetResourceAllocationInfo(
+      0, 1, &desc);
+  const auto base_node1 = context_.device()->GetResourceAllocationInfo(
+      1, 1, &desc);
+  EXPECT_EQ(base_node1.SizeInBytes, base_node0.SizeInBytes);
+  EXPECT_EQ(base_node1.Alignment, base_node0.Alignment);
+
+  D3D12_RESOURCE_ALLOCATION_INFO1 entry1 = {};
+  const auto info1 = device4->GetResourceAllocationInfo1(
+      1, 1, &desc, &entry1);
+  D3D12_RESOURCE_ALLOCATION_INFO1 entry2 = {};
+  const auto info2 = device8->GetResourceAllocationInfo2(
+      1, 1, &desc1, &entry2);
+  EXPECT_EQ(info1.SizeInBytes, base_node0.SizeInBytes);
+  EXPECT_EQ(info1.Alignment, base_node0.Alignment);
+  EXPECT_EQ(info2.SizeInBytes, base_node0.SizeInBytes);
+  EXPECT_EQ(info2.Alignment, base_node0.Alignment);
+  EXPECT_EQ(entry2.Offset, entry1.Offset);
+  EXPECT_EQ(entry2.Alignment, entry1.Alignment);
+  EXPECT_EQ(entry2.SizeInBytes, entry1.SizeInBytes);
+
+  EXPECT_EQ(context_.device()
+                ->GetResourceAllocationInfo(2, 1, &desc)
+                .SizeInBytes,
+            UINT64_MAX);
+  EXPECT_EQ(context_.device()
+                ->GetResourceAllocationInfo(0, 1, nullptr)
+                .SizeInBytes,
+            UINT64_MAX);
+
+  auto expect_invalid_entry = [](const D3D12_RESOURCE_ALLOCATION_INFO1 &entry) {
+    EXPECT_EQ(entry.Offset, UINT64_MAX);
+    EXPECT_EQ(entry.Alignment, 0u);
+    EXPECT_EQ(entry.SizeInBytes, UINT64_MAX);
+  };
+  for (const bool null_desc : {false, true}) {
+    entry1 = {7, 9, 11};
+    const auto invalid_info1 = device4->GetResourceAllocationInfo1(
+        null_desc ? 0 : 2, 1, null_desc ? nullptr : &desc, &entry1);
+    EXPECT_EQ(invalid_info1.SizeInBytes, UINT64_MAX);
+    EXPECT_EQ(invalid_info1.Alignment, 1u);
+    expect_invalid_entry(entry1);
+
+    entry2 = {7, 9, 11};
+    const auto invalid_info2 = device8->GetResourceAllocationInfo2(
+        null_desc ? 0 : 2, 1, null_desc ? nullptr : &desc1, &entry2);
+    EXPECT_EQ(invalid_info2.SizeInBytes, UINT64_MAX);
+    EXPECT_EQ(invalid_info2.Alignment, 1u);
+    expect_invalid_entry(entry2);
+  }
+}
+
+TEST_F(VersionedApiSpec,
        ResourceCreationCapabilityProbesMatchBaseApis) {
   auto device4 = QueryDevice<ID3D12Device4>();
   auto device8 = QueryDevice<ID3D12Device8>();
