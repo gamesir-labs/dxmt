@@ -149,6 +149,16 @@ TEST(SmallVector, GrowsPastEmbeddedStorageAndPreservesOrder) {
   EXPECT_EQ(values.capacity(), 2u);
 }
 
+TEST(SmallVector, GrowsFromZeroEmbeddedCapacity) {
+  dxmt::small_vector<int, 0> values;
+  EXPECT_EQ(values.capacity(), 0u);
+
+  values.push_back(7);
+  ASSERT_EQ(values.size(), 1u);
+  EXPECT_GE(values.capacity(), 1u);
+  EXPECT_EQ(values.front(), 7);
+}
+
 TEST(SmallVector, MovesNonCopyableAllocatedStorage) {
   dxmt::small_vector<std::unique_ptr<int>, 2> source;
   source.reserve(4);
@@ -177,6 +187,38 @@ TEST(SmallVector, CopiesAllocatedStorageAndMovesEmbeddedElements) {
   EXPECT_TRUE(embedded.empty());
   ASSERT_EQ(moved.size(), 1u);
   EXPECT_EQ(*moved.front(), 7);
+}
+
+TEST(SmallVector, PreservesAliasedCopiesAcrossGrowthAndInsertion) {
+  const std::string first(80, 'a');
+  const std::string second(80, 'b');
+  const std::string third(80, 'c');
+
+  dxmt::small_vector<std::string, 2> growing = {first, second};
+  growing.push_back(growing.front());
+  EXPECT_EQ(std::vector<std::string>(growing.begin(), growing.end()),
+            (std::vector<std::string>{first, second, first}));
+
+  dxmt::small_vector<std::string, 4> inserting = {first, second, third};
+  inserting.insert(inserting.begin() + 1, inserting.back());
+  EXPECT_EQ(std::vector<std::string>(inserting.begin(), inserting.end()),
+            (std::vector<std::string>{first, third, second, third}));
+}
+
+TEST(SmallVector, PreservesAliasedMovesAcrossGrowthAndInsertion) {
+  const std::string first(80, 'a');
+  const std::string second(80, 'b');
+  const std::string third(80, 'c');
+
+  dxmt::small_vector<std::string, 2> growing = {first, second};
+  growing.emplace_back(std::move(growing.front()));
+  EXPECT_EQ(std::vector<std::string>(growing.begin(), growing.end()),
+            (std::vector<std::string>{std::string(), second, first}));
+
+  dxmt::small_vector<std::string, 4> inserting = {first, second, third};
+  inserting.insert(inserting.begin(), std::move(inserting.back()));
+  EXPECT_EQ(std::vector<std::string>(inserting.begin(), inserting.end()),
+            (std::vector<std::string>{third, first, second, std::string()}));
 }
 
 struct RefCountProbe {

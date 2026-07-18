@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <initializer_list>
+#include <limits>
 #include <type_traits>
 #include <utility>
 
@@ -222,14 +223,40 @@ public:
 
   /** Appends an element. */
   void push_back(const T& object) {
+    if (contains_reference(object)) {
+      T copy(object);
+      reserve(m_state.size + 1);
+      new (ptr(m_state.size++)) T(std::move(copy));
+      return;
+    }
+
     reserve(m_state.size + 1);
     new (ptr(m_state.size++)) T(object);
   }
 
   /** Appends an element with move semantics. */
   void push_back(T&& object) {
+    if (contains_reference(object)) {
+      T moved(std::move(object));
+      reserve(m_state.size + 1);
+      new (ptr(m_state.size++)) T(std::move(moved));
+      return;
+    }
+
     reserve(m_state.size + 1);
     new (ptr(m_state.size++)) T(std::move(object));
+  }
+
+  /** Appends an existing element in-place without invalidating an aliased argument. */
+  T& emplace_back(const T& object) {
+    push_back(object);
+    return back();
+  }
+
+  /** Move-appends an existing element in-place without invalidating an aliased argument. */
+  T& emplace_back(T&& object) {
+    push_back(std::move(object));
+    return back();
   }
 
   /** Constructs an element in-place at the end of the array. */
@@ -261,13 +288,27 @@ public:
 
   /** Inserts element at given iterator */
   iterator insert(const_iterator iter, const T& element) {
-    auto ptr = insert(std::distance(cbegin(), iter));
+    const auto index = std::distance(cbegin(), iter);
+    if (contains_reference(element)) {
+      T copy(element);
+      auto ptr = insert(index);
+      return new (ptr) T(std::move(copy));
+    }
+
+    auto ptr = insert(index);
     return new (ptr) T(element);
   }
 
   /** Move-inserts element at given iterator */
   iterator insert(const_iterator iter, T&& element) {
-    auto ptr = insert(std::distance(cbegin(), iter));
+    const auto index = std::distance(cbegin(), iter);
+    if (contains_reference(element)) {
+      T moved(std::move(element));
+      auto ptr = insert(index);
+      return new (ptr) T(std::move(moved));
+    }
+
+    auto ptr = insert(index);
     return new (ptr) T(std::move(element));
   }
 
@@ -346,15 +387,26 @@ private:
 
   union {
     T*      m_ptr;
-    storage m_data[N];
+    storage m_data[N ? N : 1];
   } u;
+
+  /** Checks whether an element reference points into the vector's live range. */
+  bool contains_reference(const T& object) const {
+    const auto address = reinterpret_cast<uintptr_t>(std::addressof(object));
+    const auto first = reinterpret_cast<uintptr_t>(begin());
+    const auto last = reinterpret_cast<uintptr_t>(end());
+    return address >= first && address < last;
+  }
 
   /** Computes ideal capacity for given size. */
   size_t pick_capacity(size_t n) {
-    size_t newCapacity = capacity();
+    size_t newCapacity = std::max(capacity(), size_t(1));
 
-    while (newCapacity < n)
+    while (newCapacity < n) {
+      if (newCapacity > std::numeric_limits<size_t>::max() / 2)
+        return n;
       newCapacity *= 2;
+    }
 
     return newCapacity;
   }
