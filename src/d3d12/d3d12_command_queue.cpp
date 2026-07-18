@@ -4859,6 +4859,47 @@ public:
       return;
     }
 
+    std::vector<GraphicsCommandList *> validated_lists;
+    validated_lists.reserve(command_list_count);
+    for (UINT i = 0; i < command_list_count; i++) {
+      auto *command_list = command_lists[i];
+      if (!command_list) {
+        Logger::err(str::format(
+            "D3D12CommandQueue: null command list at index ", i));
+        return;
+      }
+
+      auto *state = dynamic_cast<GraphicsCommandList *>(command_list);
+      if (!state) {
+        Logger::err(str::format(
+            "D3D12CommandQueue: foreign command list at index ", i));
+        return;
+      }
+
+      if (state->GetParentDevice() != device_.ptr()) {
+        Logger::err(str::format(
+            "D3D12CommandQueue: cross-device command list at index ", i));
+        return;
+      }
+
+      if (state->GetCommandListType() != desc_.Type) {
+        Logger::err(str::format(
+            "D3D12CommandQueue: command list type ",
+            state->GetCommandListType(), " does not match queue type ",
+            desc_.Type));
+        return;
+      }
+
+      if (!state->IsClosed()) {
+        Logger::err(str::format(
+            "D3D12CommandQueue: command list at index ", i,
+            " is not closed"));
+        return;
+      }
+
+      validated_lists.push_back(state);
+    }
+
     auto *perf_stats = dxmt::perf::currentFrameStatistics();
     auto perf_mark = clock::now();
 
@@ -4885,10 +4926,9 @@ public:
     {
       dxmt::perf::ScopedCodeTimer phase_timer(
           dxmt::PerfCodePath::QueueExecuteApitrace);
-      for (UINT i = 0; i < command_list_count; i++) {
-        if (command_lists[i])
-          dxmt::apitrace::on_d3d12_execute_command_lists(this, command_lists[i]);
-      }
+      for (UINT i = 0; i < command_list_count; i++)
+        dxmt::apitrace::on_d3d12_execute_command_lists(this,
+                                                       command_lists[i]);
     }
 
     PendingOperation op;
@@ -4896,36 +4936,7 @@ public:
     {
       dxmt::perf::ScopedCodeTimer phase_timer(
           dxmt::PerfCodePath::QueueExecuteCollect);
-      for (UINT i = 0; i < command_list_count; i++) {
-        auto *command_list = command_lists[i];
-        if (!command_list) {
-          Logger::err(str::format("D3D12CommandQueue: null command list at index ", i));
-          continue;
-        }
-
-        auto *state = dynamic_cast<GraphicsCommandList *>(command_list);
-        if (!state) {
-          Logger::err(str::format("D3D12CommandQueue: foreign command list at index ", i));
-          continue;
-        }
-
-        if (state->GetParentDevice() != device_.ptr()) {
-          Logger::err(str::format(
-              "D3D12CommandQueue: cross-device command list at index ", i));
-          continue;
-        }
-
-        if (state->GetCommandListType() != desc_.Type) {
-          Logger::err(str::format("D3D12CommandQueue: command list type ", state->GetCommandListType(),
-                                  " does not match queue type ", desc_.Type));
-          continue;
-        }
-
-        if (!state->IsClosed()) {
-          Logger::err(str::format("D3D12CommandQueue: command list at index ", i, " is not closed"));
-          continue;
-        }
-
+      for (auto *state : validated_lists) {
         if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
           op.command_records.emplace_back(state->GetCommandRecords());
           auto compiled = state->GetCompiledCommands();

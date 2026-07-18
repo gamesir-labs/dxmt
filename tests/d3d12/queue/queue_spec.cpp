@@ -24,6 +24,7 @@ namespace {
 using dxmt::test::ColorsMatch;
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::FullscreenVertexShader;
 using dxmt::test::TextureReadback;
@@ -896,6 +897,77 @@ TEST_F(D3D12QueueSpec, SignalsFenceEventsForCompletedAndFutureValues) {
   EXPECT_GE(fence->GetCompletedValue(), 6u);
 
   CloseHandle(event);
+}
+
+TEST_F(D3D12QueueSpec, InvalidExecuteBatchesAreAtomicAndRecoverable) {
+  constexpr UINT sentinel = 0x13579bdfu;
+  constexpr UINT expected = 0xdeadbeefu;
+  auto source = context_.CreateUploadBuffer(
+      sizeof(expected), &expected, sizeof(expected));
+  auto destination = context_.CreateBuffer(
+      sizeof(sentinel), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  void *mapped = nullptr;
+  D3D12_RANGE empty_read = {0, 0};
+  ASSERT_EQ(destination->Map(0, &empty_read, &mapped), S_OK);
+  ASSERT_NE(mapped, nullptr);
+  std::memcpy(mapped, &sentinel, sizeof(sentinel));
+  D3D12_RANGE written = {0, sizeof(sentinel)};
+  destination->Unmap(0, &written);
+
+  context_.list()->CopyBufferRegion(destination.get(), 0, source.get(), 0,
+                                    sizeof(expected));
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  ASSERT_EQ(foreign_context.list()->Close(), S_OK);
+
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.put())),
+            S_OK);
+  ASSERT_TRUE(fence);
+  UINT64 fence_value = 0;
+  auto flush_queue = [&] {
+    const HRESULT signal =
+        context_.queue()->Signal(fence.get(), ++fence_value);
+    return FAILED(signal) ? signal
+                          : context_.WaitForFence(fence.get(), fence_value);
+  };
+  auto read_destination = [&] {
+    UINT value = 0;
+    void *data = nullptr;
+    D3D12_RANGE read = {0, sizeof(value)};
+    if (FAILED(destination->Map(0, &read, &data)) || !data)
+      return UINT_MAX;
+    std::memcpy(&value, data, sizeof(value));
+    D3D12_RANGE no_write = {0, 0};
+    destination->Unmap(0, &no_write);
+    return value;
+  };
+
+  ID3D12CommandList *with_null[] = {context_.list(), nullptr};
+  context_.queue()->ExecuteCommandLists(std::size(with_null), with_null);
+  ASSERT_EQ(flush_queue(), S_OK);
+  EXPECT_EQ(read_destination(), sentinel);
+
+  ID3D12CommandList *with_foreign[] = {context_.list(),
+                                       foreign_context.list()};
+  context_.queue()->ExecuteCommandLists(std::size(with_foreign), with_foreign);
+  ASSERT_EQ(flush_queue(), S_OK);
+  EXPECT_EQ(read_destination(), sentinel);
+
+  ID3D12CommandList *valid[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(std::size(valid), valid);
+  ASSERT_EQ(flush_queue(), S_OK);
+  EXPECT_EQ(read_destination(), expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(D3D12QueueSpec, PreservesPartialBufferCopiesAcrossSubmissions) {
