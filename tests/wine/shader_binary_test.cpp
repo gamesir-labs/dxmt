@@ -37,6 +37,29 @@ constexpr CShaderToken InstructionToken(D3D10_SB_OPCODE_TYPE opcode,
                                    controls);
 }
 
+constexpr CShaderToken IndexedOperandToken(
+    D3D10_SB_OPERAND_TYPE type,
+    D3D10_SB_OPERAND_INDEX_DIMENSION dimension = D3D10_SB_OPERAND_INDEX_1D,
+    UINT mask = D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL) {
+  CShaderToken token =
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) |
+      ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(
+          D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+      ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(mask) |
+      ENCODE_D3D10_SB_OPERAND_TYPE(type) |
+      ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(dimension);
+  if (dimension > D3D10_SB_OPERAND_INDEX_0D)
+    token |= ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+        0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  if (dimension > D3D10_SB_OPERAND_INDEX_1D)
+    token |= ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+        1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  if (dimension > D3D10_SB_OPERAND_INDEX_2D)
+    token |= ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+        2, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  return token;
+}
+
 void ParseSingleInstruction(
     std::initializer_list<CShaderToken> tokens, CInstruction *instruction,
     D3D10_SB_TOKENIZED_PROGRAM_TYPE type = D3D11_SB_COMPUTE_SHADER,
@@ -711,6 +734,162 @@ TEST(ShaderBinary, DecodesTessellationAndThreadGroupDeclarations) {
   EXPECT_EQ(instruction.m_ThreadGroupDecl.x, 8u);
   EXPECT_EQ(instruction.m_ThreadGroupDecl.y, 4u);
   EXPECT_EQ(instruction.m_ThreadGroupDecl.z, 2u);
+}
+
+TEST(ShaderBinary, DecodesRegisterAndSystemValueDeclarations) {
+  CInstruction instruction;
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_INPUT, 3),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT,
+                           D3D10_SB_OPERAND_INDEX_1D,
+                           D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+                               D3D10_SB_OPERAND_4_COMPONENT_MASK_Z),
+       4},
+      &instruction, D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(instruction.Operand(0).OperandType(),
+            D3D10_SB_OPERAND_TYPE_INPUT);
+  EXPECT_EQ(instruction.Operand(0).RegIndex(), 4u);
+  EXPECT_EQ(instruction.Operand(0).WriteMask(),
+            D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+                D3D10_SB_OPERAND_4_COMPONENT_MASK_Z);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_OUTPUT, 3),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_OUTPUT), 6},
+      &instruction, D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(instruction.Operand(0).OperandType(),
+            D3D10_SB_OPERAND_TYPE_OUTPUT);
+  EXPECT_EQ(instruction.Operand(0).RegIndex(), 6u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_INPUT_SIV, 4),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT), 1,
+       ENCODE_D3D10_SB_NAME(D3D10_SB_NAME_VERTEX_ID)},
+      &instruction, D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(instruction.m_InputDeclSIV.Name, D3D10_SB_NAME_VERTEX_ID);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_INPUT_SGV, 4),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT), 2,
+       ENCODE_D3D10_SB_NAME(D3D10_SB_NAME_INSTANCE_ID)},
+      &instruction, D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(instruction.m_InputDeclSGV.Name, D3D10_SB_NAME_INSTANCE_ID);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D10_SB_OPCODE_DCL_INPUT_PS, 3,
+           ENCODE_D3D10_SB_INPUT_INTERPOLATION_MODE(
+               D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_SAMPLE)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT), 3},
+      &instruction, D3D10_SB_PIXEL_SHADER);
+  EXPECT_EQ(instruction.m_InputPSDecl.InterpolationMode,
+            D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_SAMPLE);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_INPUT_PS_SIV, 4,
+                        ENCODE_D3D10_SB_INPUT_INTERPOLATION_MODE(
+                            D3D10_SB_INTERPOLATION_LINEAR_CENTROID)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT), 4,
+       ENCODE_D3D10_SB_NAME(D3D10_SB_NAME_SAMPLE_INDEX)},
+      &instruction, D3D10_SB_PIXEL_SHADER);
+  EXPECT_EQ(instruction.m_InputPSDeclSIV.InterpolationMode,
+            D3D10_SB_INTERPOLATION_LINEAR_CENTROID);
+  EXPECT_EQ(instruction.m_InputPSDeclSIV.Name, D3D10_SB_NAME_SAMPLE_INDEX);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_INPUT_PS_SGV, 4,
+                        ENCODE_D3D10_SB_INPUT_INTERPOLATION_MODE(
+                            D3D10_SB_INTERPOLATION_CONSTANT)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT), 5,
+       ENCODE_D3D10_SB_NAME(D3D10_SB_NAME_IS_FRONT_FACE)},
+      &instruction, D3D10_SB_PIXEL_SHADER);
+  EXPECT_EQ(instruction.m_InputPSDeclSGV.InterpolationMode,
+            D3D10_SB_INTERPOLATION_CONSTANT);
+  EXPECT_EQ(instruction.m_InputPSDeclSGV.Name, D3D10_SB_NAME_IS_FRONT_FACE);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, 4),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_OUTPUT), 7,
+       ENCODE_D3D10_SB_NAME(D3D10_SB_NAME_CLIP_DISTANCE)},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.m_OutputDeclSIV.Name, D3D10_SB_NAME_CLIP_DISTANCE);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_OUTPUT_SGV, 4),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_OUTPUT), 8,
+       ENCODE_D3D10_SB_NAME(D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX)},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.m_OutputDeclSGV.Name,
+            D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_INDEX_RANGE, 4),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_INPUT), 9, 12},
+      &instruction, D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(instruction.m_IndexRangeDecl.RegCount, 12u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_STREAM, 3),
+       IndexedOperandToken(D3D11_SB_OPERAND_TYPE_STREAM), 2},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.Operand(0).OperandType(),
+            D3D11_SB_OPERAND_TYPE_STREAM);
+  EXPECT_EQ(instruction.Operand(0).RegIndex(), 2u);
+}
+
+TEST(ShaderBinary, DecodesShaderModelFiveResourceDeclarations) {
+  CInstruction instruction;
+  constexpr CShaderToken return_types =
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_UNORM, 0) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_SNORM, 1) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_SINT, 2) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 3);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D10_SB_OPCODE_DCL_RESOURCE, 4,
+           ENCODE_D3D10_SB_RESOURCE_DIMENSION(
+               D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DMSARRAY) |
+               ENCODE_D3D10_SB_RESOURCE_SAMPLE_COUNT(8)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_RESOURCE), 5, return_types},
+      &instruction, D3D10_SB_PIXEL_SHADER);
+  EXPECT_EQ(instruction.m_ResourceDecl.Dimension,
+            D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DMSARRAY);
+  EXPECT_EQ(instruction.m_ResourceDecl.SampleCount, 8u);
+  EXPECT_EQ(instruction.m_ResourceDecl.ReturnType[0],
+            D3D10_SB_RETURN_TYPE_UNORM);
+  EXPECT_EQ(instruction.m_ResourceDecl.ReturnType[1],
+            D3D10_SB_RETURN_TYPE_SNORM);
+  EXPECT_EQ(instruction.m_ResourceDecl.ReturnType[2],
+            D3D10_SB_RETURN_TYPE_SINT);
+  EXPECT_EQ(instruction.m_ResourceDecl.ReturnType[3],
+            D3D10_SB_RETURN_TYPE_FLOAT);
+  EXPECT_EQ(instruction.m_ResourceDecl.Space, 0u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_SAMPLER, 3,
+                        ENCODE_D3D10_SB_SAMPLER_MODE(
+                            D3D10_SB_SAMPLER_MODE_COMPARISON)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_SAMPLER), 3},
+      &instruction, D3D10_SB_PIXEL_SHADER);
+  EXPECT_EQ(instruction.m_SamplerDecl.SamplerMode,
+            D3D10_SB_SAMPLER_MODE_COMPARISON);
+  EXPECT_EQ(instruction.m_SamplerDecl.Space, 0u);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER, 4,
+           ENCODE_D3D10_SB_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(
+               D3D10_SB_CONSTANT_BUFFER_DYNAMIC_INDEXED)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER,
+                           D3D10_SB_OPERAND_INDEX_2D),
+       2, 96},
+      &instruction, D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(instruction.m_ConstantBufferDecl.AccessPattern,
+            D3D10_SB_CONSTANT_BUFFER_DYNAMIC_INDEXED);
+  EXPECT_EQ(instruction.m_ConstantBufferDecl.Size, 96u);
+  EXPECT_EQ(instruction.m_ConstantBufferDecl.Space, 0u);
 }
 
 } // namespace
