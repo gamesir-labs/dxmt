@@ -152,7 +152,14 @@ CompleteFenceForDeviceRemoval(
   RunCompletionCallbacksAsync(std::move(callbacks_to_run));
 }
 
-class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
+#ifdef __ID3D12Fence1_INTERFACE_DEFINED__
+using FenceComInterface = ID3D12Fence1;
+#else
+using FenceComInterface = ID3D12Fence;
+#endif
+
+class FenceImpl final : public ComObjectWithInitialRef<FenceComInterface>,
+                        public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
       : device_(device), event_(device->GetMTLDevice().newSharedEvent()), flags_(flags),
@@ -207,7 +214,8 @@ public:
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
-        riid == __uuidof(ID3D12Fence)) {
+        riid == __uuidof(ID3D12Fence) ||
+        riid == __uuidof(FenceComInterface)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -348,14 +356,20 @@ public:
     return S_OK;
   }
 
+#ifdef __ID3D12Fence1_INTERFACE_DEFINED__
+  D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override {
+    return flags_;
+  }
+#endif
+
   WMT::Reference<WMT::SharedEvent> GetSharedEvent() const override { return event_; }
 
   void AddRefPrivate() override {
-    ComObjectWithInitialRef<ID3D12Fence>::AddRefPrivate();
+    ComObjectWithInitialRef<FenceComInterface>::AddRefPrivate();
   }
 
   void ReleasePrivate() override {
-    ComObjectWithInitialRef<ID3D12Fence>::ReleasePrivate();
+    ComObjectWithInitialRef<FenceComInterface>::ReleasePrivate();
   }
 
   void SetCompletedValue(UINT64 value) override {

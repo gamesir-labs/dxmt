@@ -499,6 +499,7 @@
           "UpdateTileMappings",
           "CopyTileMappings",
           "GetCompletedValue",
+          "GetCreationFlags",
           "SetEventOnCompletion",
           "SetEventOnMultipleFenceCompletion"
         ]

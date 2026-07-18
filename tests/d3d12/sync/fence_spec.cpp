@@ -56,6 +56,45 @@ TEST_F(FenceSpec, CpuSignalUpdatesCompletedValue) {
   EXPECT_EQ(fence->GetCompletedValue(), 7ull);
 }
 
+#ifdef __ID3D12Fence1_INTERFACE_DEFINED__
+TEST_F(FenceSpec, VersionedInterfacePreservesInitialValueAndCreationFlags) {
+  for (const auto flags : {D3D12_FENCE_FLAG_NONE, D3D12_FENCE_FLAG_SHARED}) {
+    ComPtr<ID3D12Fence> fence;
+    ASSERT_EQ(context_.device()->CreateFence(
+                  13, flags, IID_PPV_ARGS(fence.put())),
+              S_OK)
+        << "flags " << static_cast<UINT>(flags);
+    ASSERT_TRUE(fence);
+    EXPECT_EQ(fence->GetCompletedValue(), 13u);
+
+    ComPtr<ID3D12Fence1> fence1;
+    ASSERT_EQ(fence->QueryInterface(IID_PPV_ARGS(fence1.put())), S_OK);
+    ASSERT_TRUE(fence1);
+    EXPECT_EQ(fence1->GetCreationFlags(), flags);
+
+    ComPtr<IUnknown> base_identity;
+    ComPtr<IUnknown> versioned_identity;
+    ASSERT_EQ(fence->QueryInterface(IID_PPV_ARGS(base_identity.put())), S_OK);
+    ASSERT_EQ(fence1->QueryInterface(IID_PPV_ARGS(versioned_identity.put())),
+              S_OK);
+    EXPECT_EQ(base_identity.get(), versioned_identity.get());
+  }
+}
+#endif
+
+TEST_F(FenceSpec, DestructionSignalsPendingCompletionEvent) {
+  auto fence = CreateFence();
+  ASSERT_TRUE(fence);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ASSERT_EQ(fence->SetEventOnCompletion(1, event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+
+  fence.reset();
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+  CloseHandle(event);
+}
+
 TEST_F(FenceSpec, MultipleEventsForSameValue) {
   auto fence = CreateFence();
   ASSERT_TRUE(fence);
