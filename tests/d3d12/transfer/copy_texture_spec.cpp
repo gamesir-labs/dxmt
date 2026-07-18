@@ -6,11 +6,13 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
@@ -105,6 +107,75 @@ protected:
 
   D3D12TestContext context_;
 };
+
+enum class ForeignCopyTextureResource { Source, Destination };
+
+class CopyTextureForeignResourceSpec
+    : public CopyTextureSpec,
+      public ::testing::WithParamInterface<ForeignCopyTextureResource> {};
+
+TEST_P(CopyTextureForeignResourceSpec,
+       RejectsForeignResourceAndAllowsFreshListRecovery) {
+  auto local_source = context_.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto local_destination = context_.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(local_source);
+  ASSERT_TRUE(local_destination);
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign_texture = foreign_context.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+      GetParam() == ForeignCopyTextureResource::Source
+          ? D3D12_RESOURCE_STATE_COPY_SOURCE
+          : D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(foreign_texture);
+
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = GetParam() == ForeignCopyTextureResource::Source
+                         ? foreign_texture.get()
+                         : local_source.get();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = GetParam() == ForeignCopyTextureResource::Destination
+                              ? foreign_texture.get()
+                              : local_destination.get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  context_.list()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> recovery_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recovery_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recovery_allocator.get(),
+                nullptr, IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  source.pResource = local_source.get();
+  destination.pResource = local_destination.get();
+  recovery_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string ForeignCopyTextureResourceName(
+    const ::testing::TestParamInfo<ForeignCopyTextureResource> &info) {
+  return info.param == ForeignCopyTextureResource::Source ? "Source"
+                                                           : "Destination";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CrossDeviceMatrix, CopyTextureForeignResourceSpec,
+    ::testing::Values(ForeignCopyTextureResource::Source,
+                      ForeignCopyTextureResource::Destination),
+    ForeignCopyTextureResourceName);
 
 TEST_F(CopyTextureSpec, FullFootprintMatrix) {
   constexpr std::array cases = {

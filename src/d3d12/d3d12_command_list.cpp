@@ -2497,6 +2497,14 @@ public:
       return;
     if (!dst || !src || !dst->pResource || !src->pResource)
       return;
+    const auto *dst_resource = dynamic_cast<Resource *>(dst->pResource);
+    const auto *src_resource = dynamic_cast<Resource *>(src->pResource);
+    if (!dst_resource || !src_resource ||
+        dst_resource->GetParentDevice() != device_.ptr() ||
+        src_resource->GetParentDevice() != device_.ptr()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     SnapshotCopyTextureSourceBuffer(src, src_box);
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_texture_region(

@@ -13,6 +13,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 struct CopyBufferCase {
@@ -91,6 +92,8 @@ enum class InvalidCopyBufferCase {
   NullSource,
   TextureDestination,
   TextureSource,
+  ForeignDestination,
+  ForeignSource,
   ExactSelfOverlap,
   PartialSelfOverlap,
 };
@@ -121,6 +124,25 @@ TEST_P(CopyBufferInvalidSpec, FailsCommandListClose) {
   ASSERT_TRUE(destination);
   ASSERT_TRUE(source_texture);
   ASSERT_TRUE(destination_texture);
+
+  ComPtr<ID3D12Device> foreign_device;
+  D3D12TestContext foreign_context;
+  ComPtr<ID3D12Resource> foreign_source;
+  ComPtr<ID3D12Resource> foreign_destination;
+  if (GetParam() == InvalidCopyBufferCase::ForeignDestination ||
+      GetParam() == InvalidCopyBufferCase::ForeignSource) {
+    foreign_device = CreateIsolatedD3D12Device();
+    ASSERT_TRUE(foreign_device);
+    ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+    foreign_source = foreign_context.CreateBuffer(
+        kSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    foreign_destination = foreign_context.CreateBuffer(
+        kSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(foreign_source);
+    ASSERT_TRUE(foreign_destination);
+  }
 
   switch (GetParam()) {
   case InvalidCopyBufferCase::DestinationOffsetAtEnd:
@@ -163,6 +185,14 @@ TEST_P(CopyBufferInvalidSpec, FailsCommandListClose) {
     context_.list()->CopyBufferRegion(destination.get(), 0,
                                       source_texture.get(), 0, 1);
     break;
+  case InvalidCopyBufferCase::ForeignDestination:
+    context_.list()->CopyBufferRegion(foreign_destination.get(), 0,
+                                      source.get(), 0, 1);
+    break;
+  case InvalidCopyBufferCase::ForeignSource:
+    context_.list()->CopyBufferRegion(destination.get(), 0,
+                                      foreign_source.get(), 0, 1);
+    break;
   case InvalidCopyBufferCase::ExactSelfOverlap:
     context_.list()->CopyBufferRegion(source.get(), 0, source.get(), 0, 16);
     break;
@@ -197,6 +227,10 @@ std::string InvalidCopyBufferCaseName(
     return "TextureDestination";
   case InvalidCopyBufferCase::TextureSource:
     return "TextureSource";
+  case InvalidCopyBufferCase::ForeignDestination:
+    return "ForeignDestination";
+  case InvalidCopyBufferCase::ForeignSource:
+    return "ForeignSource";
   case InvalidCopyBufferCase::ExactSelfOverlap:
     return "ExactSelfOverlap";
   case InvalidCopyBufferCase::PartialSelfOverlap:
@@ -218,6 +252,8 @@ INSTANTIATE_TEST_SUITE_P(
         InvalidCopyBufferCase::NullSource,
         InvalidCopyBufferCase::TextureDestination,
         InvalidCopyBufferCase::TextureSource,
+        InvalidCopyBufferCase::ForeignDestination,
+        InvalidCopyBufferCase::ForeignSource,
         InvalidCopyBufferCase::ExactSelfOverlap,
         InvalidCopyBufferCase::PartialSelfOverlap),
     InvalidCopyBufferCaseName);
@@ -295,6 +331,34 @@ TEST_F(CopyResourceCompatibilitySpec, RejectsDifferentMipCounts) {
       D3D12_RESOURCE_STATE_COPY_SOURCE);
   auto destination = context_.CreateTexture2D(
       8, 8, 2, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ExpectRejected(destination.get(), source.get());
+}
+
+TEST_F(CopyResourceCompatibilitySpec, RejectsForeignSource) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto source = foreign_context.CreateBuffer(
+      64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto destination = context_.CreateBuffer(
+      64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ExpectRejected(destination.get(), source.get());
+}
+
+TEST_F(CopyResourceCompatibilitySpec, RejectsForeignDestination) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto source = context_.CreateBuffer(
+      64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto destination = foreign_context.CreateBuffer(
+      64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
       D3D12_RESOURCE_STATE_COPY_DEST);
   ExpectRejected(destination.get(), source.get());
 }
