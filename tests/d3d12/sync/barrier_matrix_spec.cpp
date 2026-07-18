@@ -369,6 +369,27 @@ TEST_P(InvalidLegacyBarrierSpec, InvalidBarrierFailsClose) {
     barrier.Transition.pResource = resource.get();
   context_.list()->ResourceBarrier(1, &barrier);
   EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> recovery_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recovery_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recovery_allocator.get(),
+                nullptr, IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  D3D12_RESOURCE_BARRIER recovery = {};
+  recovery.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  recovery.Transition.pResource = resource.get();
+  recovery.Transition.Subresource =
+      D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  recovery.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  recovery.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  recovery_list->ResourceBarrier(1, &recovery);
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 std::vector<InvalidBarrierCase> BuildInvalidBarrierCases() {
