@@ -13,6 +13,7 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <version.h>
+#include <DXBCParser/d3d12tokenizedprogramformat.hpp>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -543,6 +544,152 @@ ExpectedDxbcShaderType(PipelineShaderStage stage) {
 }
 
 bool
+IsReservedDxbcOpcode(uint32_t opcode) {
+  using namespace microsoft;
+  return opcode == D3D10_SB_OPCODE_RESERVED0 ||
+         opcode == D3D10_1_SB_OPCODE_RESERVED1 ||
+         opcode == D3D11_SB_OPCODE_RESERVED0 ||
+         opcode == D3D11_1_SB_OPCODE_RESERVED0 ||
+         opcode == D3DWDDM1_3_SB_OPCODE_RESERVED0;
+}
+
+bool
+IsGeometryOnlyDxbcOpcode(uint32_t opcode) {
+  using namespace microsoft;
+  switch (opcode) {
+  case D3D10_SB_OPCODE_CUT:
+  case D3D10_SB_OPCODE_EMIT:
+  case D3D10_SB_OPCODE_EMITTHENCUT:
+  case D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY:
+  case D3D10_SB_OPCODE_DCL_GS_INPUT_PRIMITIVE:
+  case D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT:
+  case D3D11_SB_OPCODE_EMIT_STREAM:
+  case D3D11_SB_OPCODE_CUT_STREAM:
+  case D3D11_SB_OPCODE_EMITTHENCUT_STREAM:
+  case D3D11_SB_OPCODE_DCL_STREAM:
+  case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool
+HasExactDxbcInstructionLength(uint32_t opcode, uint32_t length) {
+  using namespace microsoft;
+  switch (opcode) {
+  case D3D10_SB_OPCODE_BREAK:
+  case D3D10_SB_OPCODE_CONTINUE:
+  case D3D10_SB_OPCODE_CUT:
+  case D3D10_SB_OPCODE_DEFAULT:
+  case D3D10_SB_OPCODE_ELSE:
+  case D3D10_SB_OPCODE_EMIT:
+  case D3D10_SB_OPCODE_EMITTHENCUT:
+  case D3D10_SB_OPCODE_ENDIF:
+  case D3D10_SB_OPCODE_ENDLOOP:
+  case D3D10_SB_OPCODE_ENDSWITCH:
+  case D3D10_SB_OPCODE_LOOP:
+  case D3D10_SB_OPCODE_RET:
+    return length == 1;
+  case D3D11_SB_OPCODE_DCL_THREAD_GROUP:
+    return length == 4;
+  default:
+    return true;
+  }
+}
+
+bool
+ValidateDxbcInstructionStream(PipelineShaderStage stage,
+                              const uint8_t *shader_blob,
+                              uint32_t shader_blob_size) {
+  using namespace microsoft;
+  if (!shader_blob || shader_blob_size < 3 * sizeof(uint32_t) ||
+      shader_blob_size % sizeof(uint32_t))
+    return false;
+
+  const auto version = ReadLe32(shader_blob);
+  const auto major = (version >> 4) & 0xf;
+  const auto minor = version & 0xf;
+  if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1)))
+    return false;
+
+  const auto token_count = ReadLe32(shader_blob + sizeof(uint32_t));
+  if (token_count < 3 || token_count != shader_blob_size / sizeof(uint32_t))
+    return false;
+
+  enum class FlowKind : uint8_t { IfThen, IfElse, Loop, Switch };
+  std::vector<FlowKind> flow;
+  constexpr size_t kMaximumFlowDepth = 64;
+  for (uint32_t index = 2; index < token_count;) {
+    const auto token = ReadLe32(shader_blob + index * sizeof(uint32_t));
+    const auto opcode = token & D3D10_SB_OPCODE_TYPE_MASK;
+    if (opcode >= D3D10_SB_NUM_OPCODES || IsReservedDxbcOpcode(opcode) ||
+        (IsGeometryOnlyDxbcOpcode(opcode) &&
+         stage != PipelineShaderStage::Geometry))
+      return false;
+
+    uint32_t length =
+        (token & D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH_MASK) >>
+        D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH_SHIFT;
+    if (opcode == D3D10_SB_OPCODE_CUSTOMDATA) {
+      if (index + 1 >= token_count)
+        return false;
+      length = ReadLe32(shader_blob + (index + 1) * sizeof(uint32_t));
+      if (length < 2)
+        return false;
+    }
+    if (!length || length > token_count - index ||
+        !HasExactDxbcInstructionLength(opcode, length))
+      return false;
+
+    switch (opcode) {
+    case D3D10_SB_OPCODE_IF:
+      flow.push_back(FlowKind::IfThen);
+      break;
+    case D3D10_SB_OPCODE_ELSE:
+      if (flow.empty() || flow.back() != FlowKind::IfThen)
+        return false;
+      flow.back() = FlowKind::IfElse;
+      break;
+    case D3D10_SB_OPCODE_ENDIF:
+      if (flow.empty() ||
+          (flow.back() != FlowKind::IfThen &&
+           flow.back() != FlowKind::IfElse))
+        return false;
+      flow.pop_back();
+      break;
+    case D3D10_SB_OPCODE_LOOP:
+      flow.push_back(FlowKind::Loop);
+      break;
+    case D3D10_SB_OPCODE_ENDLOOP:
+      if (flow.empty() || flow.back() != FlowKind::Loop)
+        return false;
+      flow.pop_back();
+      break;
+    case D3D10_SB_OPCODE_SWITCH:
+      flow.push_back(FlowKind::Switch);
+      break;
+    case D3D10_SB_OPCODE_CASE:
+    case D3D10_SB_OPCODE_DEFAULT:
+      if (flow.empty() || flow.back() != FlowKind::Switch)
+        return false;
+      break;
+    case D3D10_SB_OPCODE_ENDSWITCH:
+      if (flow.empty() || flow.back() != FlowKind::Switch)
+        return false;
+      flow.pop_back();
+      break;
+    default:
+      break;
+    }
+    if (flow.size() > kMaximumFlowDepth)
+      return false;
+    index += length;
+  }
+  return flow.empty();
+}
+
+bool
 ValidateDxbcShaderStage(PipelineShaderStage stage,
                         const D3D12_SHADER_BYTECODE &bytecode) {
   const uint8_t *shader_blob = nullptr;
@@ -555,7 +702,8 @@ ValidateDxbcShaderStage(PipelineShaderStage stage,
   const auto token = ReadLe32(shader_blob);
   const auto actual_type = token >> 16;
   const auto expected_type = ExpectedDxbcShaderType(stage);
-  return expected_type == UINT32_MAX || actual_type == expected_type;
+  return (expected_type == UINT32_MAX || actual_type == expected_type) &&
+         ValidateDxbcInstructionStream(stage, shader_blob, shader_blob_size);
 }
 
 D3D12_ROOT_SIGNATURE_FLAGS
