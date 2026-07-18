@@ -7,6 +7,18 @@
 
 namespace {
 
+TEST(PresentSourceViewState, StartsEmptyAndKeepsTheLatestPublishedValue) {
+  dxmt::PresentSourceViewState state;
+
+  EXPECT_EQ(state.resolve(), 0u);
+  state.publish(0x1111u);
+  state.publish(0x2222u);
+  EXPECT_EQ(state.resolve(), 0x2222u);
+
+  state.publish(0u);
+  EXPECT_EQ(state.resolve(), 0u);
+}
+
 TEST(PresentSourceViewState, ResolvesTheValuePublishedBeforeQueuedWorkRuns) {
   dxmt::PresentSourceViewState state;
   constexpr uint64_t kValueAtPresentCall = 0x1111;

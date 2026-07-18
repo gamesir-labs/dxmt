@@ -60,4 +60,24 @@ TEST(CaptureState, CapturesExactlyOneFrameAndReturnsToIdle) {
             dxmt::CaptureState::NextAction::StopCapture);
 }
 
+TEST(CaptureState, KeepsTheFirstPendingScheduleAndSupportsFrameZero) {
+  ScopedEnvironmentVariable capture_enabled("MTL_CAPTURE_ENABLED", "1");
+  dxmt::CaptureState state;
+
+  state.scheduleNextFrameCapture();
+  state.scheduleNextFrameCapture(4);
+  EXPECT_FALSE(state.shouldCaptureNextFrame());
+  EXPECT_EQ(state.getNextAction(0),
+            dxmt::CaptureState::NextAction::StartCapture);
+  EXPECT_EQ(state.getNextAction(1),
+            dxmt::CaptureState::NextAction::StopCapture);
+
+  state.scheduleNextFrameCapture(8);
+  state.scheduleNextFrameCapture(9);
+  EXPECT_EQ(state.getNextAction(8),
+            dxmt::CaptureState::NextAction::StartCapture);
+  EXPECT_EQ(state.getNextAction(9),
+            dxmt::CaptureState::NextAction::StopCapture);
+}
+
 } // namespace
