@@ -4150,17 +4150,12 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
 static HRESULT
 NormalizeQueueDesc(const D3D12_COMMAND_QUEUE_DESC *desc,
                    D3D12_COMMAND_QUEUE_DESC &normalized) {
-  normalized = {};
-  normalized.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  normalized.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-  normalized.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-  normalized.NodeMask = 1;
+  if (!desc)
+    return WARN_E_INVALIDARG(__func__);
 
-  if (desc) {
-    normalized = *desc;
-    if (!normalized.NodeMask)
-      normalized.NodeMask = 1;
-  }
+  normalized = *desc;
+  if (!normalized.NodeMask)
+    normalized.NodeMask = 1;
 
   if (!IsSupportedQueueType(normalized.Type)) {
     Logger::err(str::format("D3D12CommandQueue: unsupported queue type ", normalized.Type));

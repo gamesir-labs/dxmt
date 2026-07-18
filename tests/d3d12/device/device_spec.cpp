@@ -487,6 +487,40 @@ TEST_F(D3D12DeviceSpec, CreatesDirectCommandQueue) {
   release_object(queue);
 }
 
+TEST_F(D3D12DeviceSpec,
+       RejectsInvalidCommandQueueDescriptionsAndClearsOutputs) {
+  D3D12_COMMAND_QUEUE_DESC desc = {};
+  desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+
+  auto expect_rejected = [&](const D3D12_COMMAND_QUEUE_DESC *candidate) {
+    ID3D12CommandQueue *queue =
+        reinterpret_cast<ID3D12CommandQueue *>(uintptr_t{1});
+    EXPECT_EQ(device_->CreateCommandQueue(
+                  candidate, __uuidof(ID3D12CommandQueue),
+                  reinterpret_cast<void **>(&queue)),
+              E_INVALIDARG);
+    EXPECT_EQ(queue, nullptr);
+  };
+
+  expect_rejected(nullptr);
+  desc.Type = D3D12_COMMAND_LIST_TYPE_BUNDLE;
+  expect_rejected(&desc);
+  desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  desc.Priority = INT_MAX;
+  expect_rejected(&desc);
+  desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+  desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(2);
+  expect_rejected(&desc);
+  desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+  desc.NodeMask = 2;
+  expect_rejected(&desc);
+
+  EXPECT_EQ(device_->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue),
+                                        nullptr),
+            E_POINTER);
+}
+
 TEST_F(D3D12DeviceSpec, CreatesDirectCommandAllocator) {
   ID3D12CommandAllocator* allocator = nullptr;
 

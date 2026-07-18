@@ -604,17 +604,32 @@ TEST_F(VersionedApiSpec, CreateCommandQueue1FailureClearsOutput) {
   ASSERT_TRUE(device9);
   D3D12_COMMAND_QUEUE_DESC desc = {};
   desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  desc.NodeMask = 2;
+  desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
   const GUID creator = {0x51810ec4,
                         0x962d,
                         0x48fd,
                         {0x89, 0x30, 0x19, 0xb7, 0x4b, 0xc3, 0x77, 0xc5}};
-  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
 
-  EXPECT_EQ(device9->CreateCommandQueue1(
-                &desc, creator, __uuidof(ID3D12CommandQueue), &output),
-            E_INVALIDARG);
-  EXPECT_EQ(output, nullptr);
+  auto expect_rejected = [&](const D3D12_COMMAND_QUEUE_DESC *candidate) {
+    void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+    EXPECT_EQ(device9->CreateCommandQueue1(
+                  candidate, creator, __uuidof(ID3D12CommandQueue), &output),
+              E_INVALIDARG);
+    EXPECT_EQ(output, nullptr);
+  };
+
+  expect_rejected(nullptr);
+  desc.Type = D3D12_COMMAND_LIST_TYPE_BUNDLE;
+  expect_rejected(&desc);
+  desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  desc.Priority = INT_MAX;
+  expect_rejected(&desc);
+  desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+  desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(2);
+  expect_rejected(&desc);
+  desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+  desc.NodeMask = 2;
+  expect_rejected(&desc);
 }
 
 TEST_F(VersionedApiSpec,
