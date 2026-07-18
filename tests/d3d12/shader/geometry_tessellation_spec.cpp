@@ -676,6 +676,120 @@ INSTANTIATE_TEST_SUITE_P(
                                  "64.0", 0xffffffffu}),
     TriangleTessellationCaseName);
 
+TEST_F(ShaderAdvancedStageSpec, DomainShaderReceivesIncrementingPrimitiveId) {
+  const auto vs = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    Control main(uint id : SV_VertexID) {
+      const float2 positions[6] = {
+        float2(-0.9, -0.7), float2(-0.5, 0.7), float2(-0.1, -0.7),
+        float2( 0.1, -0.7), float2( 0.5, 0.7), float2( 0.9, -0.7)
+      };
+      Control output;
+      output.position = positions[id];
+      return output;
+    })",
+                                "vs_5_0");
+  const auto hs = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    struct Constants {
+      float edges[3] : SV_TessFactor;
+      float inside : SV_InsideTessFactor;
+    };
+    Constants PatchConstants(InputPatch<Control, 3> patch) {
+      Constants output;
+      output.edges[0] = 1.0;
+      output.edges[1] = 1.0;
+      output.edges[2] = 1.0;
+      output.inside = 1.0;
+      return output;
+    }
+    [domain("tri")]
+    [partitioning("integer")]
+    [outputtopology("triangle_cw")]
+    [outputcontrolpoints(3)]
+    [patchconstantfunc("PatchConstants")]
+    Control main(InputPatch<Control, 3> patch,
+                 uint id : SV_OutputControlPointID) {
+      return patch[id];
+    })",
+                                "hs_5_0");
+  const auto ds = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    struct Constants {
+      float edges[3] : SV_TessFactor;
+      float inside : SV_InsideTessFactor;
+    };
+    struct Output {
+      float4 position : SV_Position;
+      nointerpolation uint primitive_id : TEXCOORD0;
+    };
+    [domain("tri")]
+    Output main(Constants constants, float3 bary : SV_DomainLocation,
+                const OutputPatch<Control, 3> patch,
+                uint primitive_id : SV_PrimitiveID) {
+      Output output;
+      float2 position = patch[0].position * bary.x +
+                        patch[1].position * bary.y +
+                        patch[2].position * bary.z;
+      output.position = float4(position, 0.0, 1.0);
+      output.primitive_id = primitive_id;
+      return output;
+    })",
+                                "ds_5_0");
+  const auto ps = CompileShader(R"(
+    float4 main(nointerpolation uint primitive_id : TEXCOORD0) : SV_Target {
+      return primitive_id == 0 ? float4(1, 0, 0, 1)
+                               : float4(0, 1, 0, 1);
+    })",
+                                "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(hs.result, S_OK) << hs.diagnostic_text();
+  ASSERT_EQ(ds.result, S_OK) << ds.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, nullptr, &hs, &ds);
+  ASSERT_TRUE(pipeline);
+
+  constexpr FLOAT clear[4] = {};
+  context_.list()->ClearRenderTargetView(rtv_, clear, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv_, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root_.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(
+      D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+  const D3D12_VIEWPORT viewport = {0.0f,         0.0f, float(kSize),
+                                   float(kSize), 0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawInstanced(6, 1, 0, 0);
+  D3D12TestContext::Transition(context_.list(), target_.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target_.get(), &readback), S_OK);
+
+  UINT left_red = 0;
+  UINT left_green = 0;
+  UINT right_red = 0;
+  UINT right_green = 0;
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      const auto pixel = PixelAt(readback, x, y);
+      if (x < kSize / 2) {
+        left_red += ColorsMatch(pixel, 0xff0000ffu, 1);
+        left_green += ColorsMatch(pixel, 0xff00ff00u, 1);
+      } else {
+        right_red += ColorsMatch(pixel, 0xff0000ffu, 1);
+        right_green += ColorsMatch(pixel, 0xff00ff00u, 1);
+      }
+    }
+  }
+  EXPECT_GT(left_red, 20u);
+  EXPECT_EQ(left_green, 0u);
+  EXPECT_EQ(right_red, 0u);
+  EXPECT_GT(right_green, 20u);
+}
+
 TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateQuad) {
   const auto vs = CompileShader(R"(
     struct Control { float2 position : POSITION; };
