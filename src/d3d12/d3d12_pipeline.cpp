@@ -3569,6 +3569,12 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
       return WARN_E_INVALIDARG(__func__);
     if (rt.LogicOpEnable && desc.BlendState.IndependentBlendEnable)
       return WARN_E_INVALIDARG(__func__);
+#ifdef DXMT_NO_PRIVATE_API
+    if (rt.LogicOpEnable) {
+      WARN("D3D12PipelineState: output-merger logic operations are unsupported");
+      return E_NOTIMPL;
+    }
+#endif
   }
   if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED) {
     WARN("D3D12PipelineState: unsupported primitive topology type ",

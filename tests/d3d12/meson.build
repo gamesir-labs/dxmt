@@ -97,6 +97,7 @@ d3d12_unit_suites = {
       'graphics/depth_stencil_spec.cpp',
       'graphics/graphics_edge_semantics_spec.cpp',
       'graphics/input_assembler_spec.cpp',
+      'graphics/logic_op_spec.cpp',
       'graphics/output_merger_spec.cpp',
       'graphics/rasterization_execution_spec.cpp',
       'graphics/render_pass_execution_spec.cpp',

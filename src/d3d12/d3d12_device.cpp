@@ -763,6 +763,10 @@ GetD3D12FormatSupport1(FormatCapability caps,
 static D3D12_FORMAT_SUPPORT2
 GetD3D12FormatSupport2(FormatCapability caps) {
   D3D12_FORMAT_SUPPORT2 support = D3D12_FORMAT_SUPPORT2_NONE;
+#ifndef DXMT_NO_PRIVATE_API
+  if (HasFormatCapability(caps, FormatCapability::Blend))
+    support |= D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP;
+#endif
   if (HasFormatCapability(caps, FormatCapability::TextureBufferRead) ||
       HasFormatCapability(caps, FormatCapability::TextureBufferReadWrite))
     support |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
@@ -3249,6 +3253,9 @@ public:
       std::memset(data, 0, sizeof(*data));
       data->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
       data->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+#ifndef DXMT_NO_PRIVATE_API
+      data->OutputMergerLogicOp = TRUE;
+#endif
       data->TypedUAVLoadAdditionalFormats =
           SupportsD3D12AdditionalTypedUavLoads(device_->device());
       data->TiledResourcesTier = GetDXMTDevice().device().supportsPlacementSparse()
