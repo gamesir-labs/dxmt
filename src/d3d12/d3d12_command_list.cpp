@@ -2803,6 +2803,10 @@ public:
   void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature *root_signature) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRootSignature);
+    auto *state = GetDXMTRootSignature(root_signature);
+    if (root_signature &&
+        (!state || state->GetParentDevice() != device_.ptr()))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, true, root_signature);
     if (compute_root_signature_.ptr() == root_signature)
@@ -2815,6 +2819,10 @@ public:
   void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature *root_signature) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRootSignature);
+    auto *state = GetDXMTRootSignature(root_signature);
+    if (root_signature &&
+        (!state || state->GetParentDevice() != device_.ptr()))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_signature(this, false, root_signature);
     if (graphics_root_signature_.ptr() == root_signature)

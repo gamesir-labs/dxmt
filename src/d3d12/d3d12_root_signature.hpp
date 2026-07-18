@@ -33,6 +33,7 @@ public:
 
   virtual ULONG STDMETHODCALLTYPE AddRefPrivate() = 0;
   virtual void STDMETHODCALLTYPE ReleasePrivate() = 0;
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &GetVersionedDesc() const = 0;
   virtual std::span<const std::byte> GetSerializedBlob() const = 0;
   virtual std::span<const RootSignatureParameter> GetParameters() const = 0;

@@ -1170,6 +1170,8 @@ public:
     return device_->QueryInterface(riid, device);
   }
 
+  IMTLD3D12Device *GetParentDevice() const override { return device_.ptr(); }
+
   const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &GetVersionedDesc() const override {
     return storage_.versioned_desc;
   }
