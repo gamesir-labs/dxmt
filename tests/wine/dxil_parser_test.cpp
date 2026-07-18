@@ -1455,6 +1455,53 @@ TEST(DxilRuntimeData, ParsesRaytracingSubobjectRecords) {
   EXPECT_EQ(info.subobjects[3].intersection, "intersect");
 }
 
+TEST(DxilRuntimeData, ParsesRemainingRaytracingSubobjectKinds) {
+  using namespace dxmt::dxil;
+  constexpr std::array<uint32_t, 5> kinds = {2, 9, 10, 12, 99};
+  std::vector<uint8_t> subobjects(
+      kRuntimeDataTableHeaderSize + kinds.size() * kRdatSubobjectRecordSize);
+  Store<uint32_t>(subobjects, 0, kinds.size());
+  Store<uint32_t>(subobjects, 4, kRdatSubobjectRecordSize);
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    const size_t record =
+        kRuntimeDataTableHeaderSize + i * kRdatSubobjectRecordSize;
+    Store<uint32_t>(subobjects, record + 0, kinds[i]);
+    Store<uint32_t>(subobjects, record + 4, kRdatNullRef);
+  }
+
+  size_t record = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(subobjects, record + 8, kRdatNullRef);
+  Store<uint32_t>(subobjects, record + 12, 0u);
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 8, 64u);
+  Store<uint32_t>(subobjects, record + 12, 32u);
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 8, 7u);
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 8, 9u);
+  Store<uint32_t>(subobjects, record + 12, 0xa5u);
+  record += kRdatSubobjectRecordSize;
+  for (size_t offset : {size_t(8), size_t(12), size_t(16), size_t(20)})
+    Store<uint32_t>(subobjects, record + offset, 0xffffffffu);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::SubobjectTable, subobjects)
+                         .build();
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.subobjects.size(), kinds.size());
+  EXPECT_TRUE(info.subobjects[0].root_signature.empty());
+  EXPECT_EQ(info.subobjects[1].max_payload_size_in_bytes, 64u);
+  EXPECT_EQ(info.subobjects[1].max_attribute_size_in_bytes, 32u);
+  EXPECT_EQ(info.subobjects[2].max_trace_recursion_depth, 7u);
+  EXPECT_EQ(info.subobjects[3].max_trace_recursion_depth, 9u);
+  EXPECT_EQ(info.subobjects[3].raytracing_pipeline_flags, 0xa5u);
+  EXPECT_EQ(info.subobjects[4].kind, 99u);
+  EXPECT_EQ(info.subobjects[4].state_object_flags, 0u);
+  EXPECT_TRUE(info.subobjects[4].root_signature.empty());
+}
+
 TEST(DxilRuntimeData, RejectsInvalidSubobjectPayloadReferences) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> strings = {
