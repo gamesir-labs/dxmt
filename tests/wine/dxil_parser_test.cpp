@@ -2723,6 +2723,65 @@ TEST(DxilPipelineStateValidation, ParsesStageSpecificDependencyTables) {
   expect_truncated(mesh);
 }
 
+TEST(DxilPipelineStateValidation, ParsesMultiStreamVectorMaskBoundaries) {
+  using namespace dxmt::dxil;
+  constexpr size_t runtime_offset = sizeof(uint32_t);
+  constexpr size_t dependency_offset = runtime_offset +
+                                       kPsvRuntimeInfo1Size +
+                                       3 * sizeof(uint32_t);
+  constexpr size_t dependency_word_count = 36;
+  std::vector<uint8_t> bytes(dependency_offset +
+                             dependency_word_count * sizeof(uint32_t));
+  Store<uint32_t>(bytes, 0, kPsvRuntimeInfo1Size);
+  bytes[runtime_offset + 24] = 2;
+  bytes[runtime_offset + 25] = 1;
+  bytes[runtime_offset + 31] = 2;
+  bytes[runtime_offset + 32] = 1;
+  bytes[runtime_offset + 33] = 9;
+  bytes[runtime_offset + 34] = 0;
+  bytes[runtime_offset + 35] = 2;
+  for (size_t i = 0; i < dependency_word_count; ++i)
+    Store<uint32_t>(bytes, dependency_offset + i * sizeof(uint32_t),
+                    0x100u + uint32_t(i));
+
+  PipelineStateValidationInfo info;
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.view_id_output_masks[0].vector_count, 1u);
+  EXPECT_EQ(info.view_id_output_masks[0].mask_words,
+            (std::vector<uint32_t>{0x100u}));
+  EXPECT_EQ(info.view_id_output_masks[1].vector_count, 9u);
+  EXPECT_EQ(info.view_id_output_masks[1].mask_words,
+            (std::vector<uint32_t>{0x101u, 0x102u}));
+  EXPECT_TRUE(info.view_id_output_masks[2].mask_words.empty());
+  EXPECT_EQ(info.view_id_output_masks[3].vector_count, 2u);
+  EXPECT_EQ(info.view_id_output_masks[3].mask_words,
+            (std::vector<uint32_t>{0x103u}));
+
+  EXPECT_EQ(info.input_to_output_tables[0].input_vectors, 2u);
+  EXPECT_EQ(info.input_to_output_tables[0].output_vectors, 1u);
+  ASSERT_EQ(info.input_to_output_tables[0].mask_words.size(), 8u);
+  EXPECT_EQ(info.input_to_output_tables[0].mask_words.front(), 0x104u);
+  EXPECT_EQ(info.input_to_output_tables[0].mask_words.back(), 0x10bu);
+  EXPECT_EQ(info.input_to_output_tables[1].input_vectors, 2u);
+  EXPECT_EQ(info.input_to_output_tables[1].output_vectors, 9u);
+  ASSERT_EQ(info.input_to_output_tables[1].mask_words.size(), 16u);
+  EXPECT_EQ(info.input_to_output_tables[1].mask_words.front(), 0x10cu);
+  EXPECT_EQ(info.input_to_output_tables[1].mask_words.back(), 0x11bu);
+  EXPECT_TRUE(info.input_to_output_tables[2].mask_words.empty());
+  ASSERT_EQ(info.input_to_output_tables[3].mask_words.size(), 8u);
+  EXPECT_EQ(info.input_to_output_tables[3].mask_words.front(), 0x11cu);
+  EXPECT_EQ(info.input_to_output_tables[3].mask_words.back(), 0x123u);
+  EXPECT_EQ(info.dependency_payload.size(),
+            dependency_word_count * sizeof(uint32_t));
+
+  bytes.resize(bytes.size() - sizeof(uint32_t));
+  EXPECT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::InvalidPipelineStateValidation);
+}
+
 TEST(DxilSourceInfo, ParsesAlignedSections) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(kSourceInfoHeaderSize + 12 + 8);
