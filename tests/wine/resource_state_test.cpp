@@ -104,6 +104,14 @@ TEST(ResourceResidency, ConvertsMaskToUsageAndRenderStages) {
                 WMTRenderStageObject | WMTRenderStageMesh);
   EXPECT_EQ(dxmt::GetUsageFromResidencyMask(dxmt::DXMT_RESOURCE_RESIDENCY_NULL),
             WMTResourceUsage(0));
+
+  const auto geometry_masks =
+      dxmt::DXMT_RESOURCE_RESIDENCY_OBJECT_GS_WRITE |
+      dxmt::DXMT_RESOURCE_RESIDENCY_MESH_GS_READ;
+  EXPECT_EQ(dxmt::GetUsageFromResidencyMask(geometry_masks),
+            WMTResourceUsageRead | WMTResourceUsageWrite);
+  EXPECT_EQ(dxmt::GetStagesFromResidencyMask(geometry_masks),
+            WMTRenderStageObject | WMTRenderStageMesh);
 }
 
 TEST(VisibilityOffsetState, AdvancesOnlyAfterWrittenVisibilityData) {
@@ -148,6 +156,21 @@ TEST(VisibilityQuery, AccumulatesReadbackAcrossCommandSequences) {
   query->end(20, 3);
   EXPECT_TRUE(query->getValue(&value));
   EXPECT_EQ(value, 0u);
+}
+
+TEST(VisibilityQuery, AccumulatesAHalfOpenRangeWithinOneSequence) {
+  dxmt::Rc<dxmt::VisibilityResultQuery> query(
+      new dxmt::VisibilityResultQuery());
+  query->begin(30, 1);
+  query->end(30, 4);
+  EXPECT_EQ(query->queryEndAt(), 30u);
+
+  uint64_t value = 0;
+  EXPECT_FALSE(query->getValue(&value));
+  const std::array<uint64_t, 5> readback = {100, 2, 3, 5, 100};
+  query->issue(30, readback.data(), readback.size());
+  EXPECT_TRUE(query->getValue(&value));
+  EXPECT_EQ(value, 10u);
 }
 
 TEST(TimestampQuery, TracksSampleLocationAndResolvedValue) {

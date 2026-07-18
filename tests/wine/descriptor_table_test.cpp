@@ -71,6 +71,19 @@ TEST(DescriptorTable, RejectsOverflowWhileResolvingAReflectedSpan) {
       std::numeric_limits<std::uint32_t>::max(), 1, 1, &resolved_base));
 }
 
+TEST(DescriptorTable, RejectsEmptySpansAndAllowsAnOmittedResultPointer) {
+  std::uint32_t resolved_base = 0xccccccccu;
+  EXPECT_FALSE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      0, 4, 0, 0, 0, &resolved_base));
+  EXPECT_EQ(resolved_base, 0xccccccccu);
+
+  EXPECT_TRUE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      1, 4, 1, 0, 2, nullptr));
+  EXPECT_TRUE(dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
+      0, 4, 1, 1, 2, &resolved_base));
+  EXPECT_EQ(resolved_base, 2u);
+}
+
 TEST(DescriptorTable, MapsBindingTypesToDisjointArgumentRanges) {
   EXPECT_EQ(GetArgumentIndex(SM50BindingType::ConstantBuffer, 7), 7u);
   EXPECT_EQ(GetArgumentIndex(SM50BindingType::Sampler, 7), 39u);
@@ -133,6 +146,19 @@ TEST(DescriptorTable, BuildsPerReflectionCompactBases) {
   EXPECT_EQ(resource_bases,
             (std::array<uint32_t, 3>{6, dxmt::kNotABufferTableField, 3}));
   EXPECT_EQ(total, 12u);
+}
+
+TEST(DescriptorTable, HandlesAnEmptyReflectionWithoutOutputStorage) {
+  uint32_t callbacks = 0;
+  EXPECT_EQ(dxmt::ForEachBufferTableField(
+                nullptr, 0, nullptr, 0,
+                [&](const auto &, uint32_t) { ++callbacks; }),
+            0u);
+  EXPECT_EQ(callbacks, 0u);
+  EXPECT_EQ(dxmt::BufferTableQwordCount(nullptr, 0, nullptr, 0), 0u);
+  EXPECT_EQ(dxmt::BuildBufferTableCompactBases(nullptr, 0, nullptr, 0,
+                                               nullptr, nullptr),
+            0u);
 }
 
 TEST(DescriptorTable, WritesAddressMetadataAndCounterWithoutAliasing) {

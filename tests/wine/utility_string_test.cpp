@@ -131,6 +131,28 @@ TEST(UnicodeDecoding, RejectsUnpairedUtf16Surrogates) {
   EXPECT_EQ(decoded, uint32_t('?'));
 }
 
+TEST(UnicodeDecoding, HandlesEmptyAndInvalidUtf32Input) {
+  std::array<uint8_t, 1> utf8 = {};
+  std::array<uint16_t, 1> utf16 = {};
+  const std::array<uint32_t, 2> utf32 = {0xd800, 0x110000};
+  uint32_t decoded = 0;
+
+  EXPECT_EQ(dxmt::str::decodeChar(utf8.data(), utf8.data(), decoded),
+            utf8.data());
+  EXPECT_EQ(decoded, uint32_t('?'));
+  EXPECT_EQ(dxmt::str::decodeChar(utf16.data(), utf16.data(), decoded),
+            utf16.data());
+  EXPECT_EQ(decoded, uint32_t('?'));
+
+  auto *next =
+      dxmt::str::decodeChar(utf32.data(), utf32.data() + utf32.size(), decoded);
+  EXPECT_EQ(next, utf32.data() + 1);
+  EXPECT_EQ(decoded, uint32_t('?'));
+  EXPECT_EQ(dxmt::str::decodeChar(next, utf32.data() + utf32.size(), decoded),
+            utf32.data() + 2);
+  EXPECT_EQ(decoded, uint32_t('?'));
+}
+
 TEST(UnicodeTranscoding, ReportsRequiredLengthAndWritesWholeCharacters) {
   const std::array<uint8_t, 5> source = {'A', 0xf0, 0x9f, 0x98, 0x80};
   const auto required = dxmt::str::transcodeString<uint16_t>(
@@ -150,6 +172,20 @@ TEST(UnicodeTranscoding, ReportsRequiredLengthAndWritesWholeCharacters) {
   EXPECT_EQ(truncated, (std::array<uint16_t, 2>{'A', 0xaaaa}));
 }
 
+TEST(UnicodeTranscoding, StopsAfterAnEmbeddedNullTerminator) {
+  const std::array<uint8_t, 3> source = {'A', 0, 'B'};
+  EXPECT_EQ(dxmt::str::transcodeString<uint16_t>(nullptr, 0, source.data(),
+                                                 source.size()),
+            2u);
+
+  std::array<uint16_t, 4> destination = {0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa};
+  EXPECT_EQ(dxmt::str::transcodeString(destination.data(), destination.size(),
+                                       source.data(), source.size()),
+            2u);
+  EXPECT_EQ(destination,
+            (std::array<uint16_t, 4>{'A', 0, 0xaaaa, 0xaaaa}));
+}
+
 TEST(StringUtilities, FormatsCopiesAndSplitsText) {
   EXPECT_EQ(dxmt::str::format("dx", 12, '-', 3.5), "dx12-3.5");
 
@@ -160,6 +196,16 @@ TEST(StringUtilities, FormatsCopiesAndSplitsText) {
   EXPECT_EQ(dxmt::str::split(" alpha,,beta;gamma ", " ,;"),
             (std::vector<std::string_view>{"alpha", "beta", "gamma"}));
   EXPECT_TRUE(dxmt::str::split("", ",").empty());
+
+  std::array<char, 2> untouched = {'x', 'y'};
+  dxmt::str::strlcpy(untouched.data(), "value", 0);
+  EXPECT_EQ(untouched, (std::array<char, 2>{'x', 'y'}));
+  dxmt::str::strlcpy(untouched.data(), "value", 1);
+  EXPECT_EQ(untouched, (std::array<char, 2>{'\0', 'y'}));
+
+  EXPECT_EQ(dxmt::str::length("dxmt"), 4u);
+  EXPECT_EQ(dxmt::str::split("no delimiters", ""),
+            (std::vector<std::string_view>{"no delimiters"}));
 }
 
 } // namespace
