@@ -2441,6 +2441,8 @@ ParseDxilProgram(const BlobPart &part, DxilProgramInfo &info) {
   size_t bitcode_start = 0;
   if (!CheckedEnd(kDxilBitcodeHeaderOffset, bitcode_offset, program_size, bitcode_start))
     return ParseStatus::InvalidDxilBitcodeRange;
+  if (bitcode_start < kDxilProgramHeaderSize)
+    return ParseStatus::InvalidDxilBitcodeRange;
 
   size_t bitcode_end = 0;
   if (!CheckedEnd(bitcode_start, bitcode_size, program_size, bitcode_end))
@@ -2679,6 +2681,8 @@ ParseSignature(const BlobPart &part, SignatureInfo &info) {
 
   const auto count = ReadU32(data, 0);
   const auto offset = ReadU32(data, 4);
+  if (count && (offset < kDxilSignatureHeaderSize || (offset & 3)))
+    return ParseStatus::InvalidSignature;
   size_t elements_end = 0;
   if (!CheckedEnd(offset, size_t(count) * kDxilSignatureElementSize, data.size(), elements_end))
     return ParseStatus::InvalidSignature;

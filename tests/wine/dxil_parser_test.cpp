@@ -343,6 +343,27 @@ TEST(DxilProgram, RejectsMalformedProgramHeaderAndBitcodeBounds) {
             ParseStatus::InvalidDxilBitcodeRange);
 }
 
+TEST(DxilProgram, RejectsBitcodeRangesThatOverlapTheProgramHeader) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> bytes(kDxilProgramHeaderSize + 4);
+  Store<uint32_t>(bytes, 4, bytes.size() / sizeof(uint32_t));
+  Store<uint32_t>(bytes, 8, kDxilMagicValue);
+  Store<uint32_t>(bytes, 20, 4u);
+
+  DxilProgramInfo info;
+  for (uint32_t offset : {0u, 4u, 15u}) {
+    SCOPED_TRACE(offset);
+    Store<uint32_t>(bytes, 16, offset);
+    EXPECT_EQ(ParseDxilProgram(Part(fourcc::Dxil, bytes), info),
+              ParseStatus::InvalidDxilBitcodeRange);
+  }
+
+  Store<uint32_t>(bytes, 16,
+                  kDxilProgramHeaderSize - kDxilBitcodeHeaderOffset);
+  EXPECT_EQ(ParseDxilProgram(Part(fourcc::Dxil, bytes), info),
+            ParseStatus::Ok);
+}
+
 TEST(DxilParser, DistinguishesContainerOnlyAndFullParsing) {
   using namespace dxmt::dxil;
   const auto bytes = DxilContainerBuilder().build();
@@ -407,6 +428,44 @@ TEST(DxilParts, ParsesSignatureElementsAndValidatesStringOffsets) {
             ParseStatus::InvalidSignature);
 }
 
+TEST(DxilParts, RejectsMalformedSignatureTableAndStringRanges) {
+  using namespace dxmt::dxil;
+  constexpr size_t element_offset = kDxilSignatureHeaderSize;
+  constexpr size_t name_offset = element_offset + kDxilSignatureElementSize;
+  std::vector<uint8_t> valid(name_offset + 2);
+  Store<uint32_t>(valid, 0, 1u);
+  Store<uint32_t>(valid, 4, element_offset);
+  Store<uint32_t>(valid, element_offset + 4, name_offset);
+  valid[name_offset] = 'X';
+
+  SignatureInfo info;
+  ASSERT_EQ(ParseSignature(Part(fourcc::InputSignature, valid), info),
+            ParseStatus::Ok);
+
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  std::vector<uint8_t> bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParseSignature(Part(fourcc::InputSignature, bytes), info),
+              ParseStatus::InvalidSignature);
+  };
+
+  auto malformed = valid;
+  Store<uint32_t>(malformed, 4, kDxilSignatureHeaderSize - 4);
+  expect_invalid("table overlaps header", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 4, kDxilSignatureHeaderSize + 1);
+  expect_invalid("unaligned table", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 0, std::numeric_limits<uint32_t>::max());
+  expect_invalid("element count overflow", malformed);
+
+  malformed = valid;
+  malformed.pop_back();
+  expect_invalid("unterminated semantic name", malformed);
+}
+
 TEST(DxilParts, ParsesFeatureAndShaderHash) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> feature_bytes(kFeatureInfoSize);
@@ -461,6 +520,65 @@ TEST(DxilParts, ParsesCompilerVersionAndDebugName) {
             ParseStatus::Ok);
   EXPECT_EQ(debug_name.flags, 7u);
   EXPECT_EQ(debug_name.name, name);
+}
+
+TEST(DxilParts, RejectsMalformedCompilerVersionStringLists) {
+  using namespace dxmt::dxil;
+  CompilerVersionInfo info;
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  std::vector<uint8_t> bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParseCompilerVersion(Part(fourcc::CompilerVersion, bytes), info),
+              ParseStatus::InvalidCompilerVersion);
+  };
+
+  std::vector<uint8_t> bytes(kCompilerVersionHeaderSize);
+  Store<uint32_t>(bytes, 12, std::numeric_limits<uint32_t>::max());
+  expect_invalid("string list size overflow", bytes);
+
+  bytes.resize(kCompilerVersionHeaderSize + 1);
+  Store<uint32_t>(bytes, 12, 1u);
+  bytes[kCompilerVersionHeaderSize] = 0;
+  expect_invalid("missing aligned padding", bytes);
+
+  bytes.assign(kCompilerVersionHeaderSize + 4, 0);
+  Store<uint32_t>(bytes, 12, 3u);
+  bytes[kCompilerVersionHeaderSize + 0] = 'a';
+  bytes[kCompilerVersionHeaderSize + 1] = 'b';
+  bytes[kCompilerVersionHeaderSize + 2] = 'c';
+  expect_invalid("unterminated string", bytes);
+
+  Store<uint32_t>(bytes, 12, 4u);
+  bytes[kCompilerVersionHeaderSize + 0] = 'a';
+  bytes[kCompilerVersionHeaderSize + 1] = 0;
+  bytes[kCompilerVersionHeaderSize + 2] = 'b';
+  bytes[kCompilerVersionHeaderSize + 3] = 'c';
+  expect_invalid("unterminated second string", bytes);
+}
+
+TEST(DxilParts, HandlesEmptyDebugNameAndRejectsMissingTerminator) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> bytes(kShaderDebugNameHeaderSize + 1);
+  Store<uint16_t>(bytes, 0, 9u);
+  Store<uint16_t>(bytes, 2, 0u);
+
+  ShaderDebugNameInfo info;
+  ASSERT_EQ(ParseShaderDebugName(Part(fourcc::ShaderDebugName, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.flags, 9u);
+  EXPECT_TRUE(info.name.empty());
+
+  bytes[kShaderDebugNameHeaderSize] = 'x';
+  EXPECT_EQ(ParseShaderDebugName(Part(fourcc::ShaderDebugName, bytes), info),
+            ParseStatus::InvalidShaderDebugName);
+
+  Store<uint16_t>(bytes, 2, 1u);
+  EXPECT_EQ(ParseShaderDebugName(Part(fourcc::ShaderDebugName, bytes), info),
+            ParseStatus::InvalidShaderDebugName);
+
+  bytes.push_back('y');
+  EXPECT_EQ(ParseShaderDebugName(Part(fourcc::ShaderDebugName, bytes), info),
+            ParseStatus::InvalidShaderDebugName);
 }
 
 TEST(DxilParts, RejectsTruncatedFixedLayoutParts) {
