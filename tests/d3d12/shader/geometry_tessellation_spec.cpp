@@ -46,7 +46,8 @@ protected:
                  const ShaderCompilation *hs = nullptr,
                  const ShaderCompilation *ds = nullptr,
                  D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type =
-                     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+                     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                 HRESULT *result_out = nullptr) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = root_.get();
     desc.VS = {vs.bytecode->GetBufferPointer(), vs.bytecode->GetBufferSize()};
@@ -71,15 +72,19 @@ protected:
     desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
-    EXPECT_EQ(context_.device()->CreateGraphicsPipelineState(
-                  &desc, IID_PPV_ARGS(pipeline.put())),
-              S_OK);
+    const HRESULT result = context_.device()->CreateGraphicsPipelineState(
+        &desc, IID_PPV_ARGS(pipeline.put()));
+    if (result_out)
+      *result_out = result;
+    else
+      EXPECT_EQ(result, S_OK);
     return pipeline;
   }
 
   void DrawAndExpectCenter(ID3D12PipelineState *pipeline,
                            D3D12_PRIMITIVE_TOPOLOGY topology,
-                           UINT vertex_count = 3) {
+                           UINT vertex_count = 3,
+                           std::uint32_t expected = 0xffffffffu) {
     constexpr FLOAT clear[4] = {};
     context_.list()->ClearRenderTargetView(rtv_, clear, 0, nullptr);
     context_.list()->OMSetRenderTargets(1, &rtv_, FALSE, nullptr);
@@ -102,7 +107,7 @@ protected:
                 readback.data.data() + (kSize / 2) * readback.row_pitch +
                     (kSize / 2) * sizeof(center),
                 sizeof(center));
-    EXPECT_TRUE(ColorsMatch(center, 0xffffffffu, 1));
+    EXPECT_TRUE(ColorsMatch(center, expected, 1));
   }
 
   D3D12TestContext context_;
@@ -373,7 +378,21 @@ TEST_F(ShaderAdvancedStageSpec, GeometryShaderAcceptsMetalVertexLimit) {
   DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_POINTLIST, 1);
 }
 
-TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateTriangle) {
+struct TriangleTessellationCase {
+  const char *name;
+  const char *partitioning;
+  const char *edge0;
+  const char *edge12;
+  const char *inside;
+  std::uint32_t expected;
+};
+
+class ShaderTriangleTessellationSpec
+    : public ShaderAdvancedStageSpec,
+      public ::testing::WithParamInterface<TriangleTessellationCase> {};
+
+TEST_P(ShaderTriangleTessellationSpec, RendersExpectedCenter) {
+  const auto &test = GetParam();
   const auto vs = CompileShader(R"(
     struct Control { float2 position : POSITION; };
     Control main(uint id : SV_VertexID) {
@@ -385,7 +404,10 @@ TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateTriangle) {
       return output;
     })",
                                 "vs_5_0");
-  const auto hs = CompileShader(R"(
+  const std::string hull_source =
+      std::string("#define PARTITIONING \"") + test.partitioning +
+      "\"\n#define EDGE0 " + test.edge0 + "\n#define EDGE12 " +
+      test.edge12 + "\n#define INSIDE " + test.inside + R"(
     struct Control { float2 position : POSITION; };
     struct Constants {
       float edges[3] : SV_TessFactor;
@@ -393,22 +415,22 @@ TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateTriangle) {
     };
     Constants PatchConstants(InputPatch<Control, 3> patch) {
       Constants output;
-      output.edges[0] = 1.0;
-      output.edges[1] = 1.0;
-      output.edges[2] = 1.0;
-      output.inside = 1.0;
+      output.edges[0] = EDGE0;
+      output.edges[1] = EDGE12;
+      output.edges[2] = EDGE12;
+      output.inside = INSIDE;
       return output;
     }
     [domain("tri")]
-    [partitioning("integer")]
+    [partitioning(PARTITIONING)]
     [outputtopology("triangle_cw")]
     [outputcontrolpoints(3)]
     [patchconstantfunc("PatchConstants")]
     Control main(InputPatch<Control, 3> patch,
                  uint id : SV_OutputControlPointID) {
       return patch[id];
-    })",
-                                "hs_5_0");
+    })";
+  const auto hs = CompileShader(hull_source.c_str(), "hs_5_0");
   const auto ds = CompileShader(R"(
     struct Control { float2 position : POSITION; };
     struct Constants {
@@ -433,7 +455,144 @@ TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateTriangle) {
   auto pipeline = CreatePipeline(vs, ps, nullptr, &hs, &ds);
   ASSERT_TRUE(pipeline);
   DrawAndExpectCenter(pipeline.get(),
-                      D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+                      D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST, 3,
+                      test.expected);
+}
+
+std::string TriangleTessellationCaseName(
+    const ::testing::TestParamInfo<TriangleTessellationCase> &info) {
+  return info.param.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    PartitionAndFactor, ShaderTriangleTessellationSpec,
+    ::testing::Values(
+        TriangleTessellationCase{"Integer", "integer", "1.0", "1.0",
+                                 "1.0", 0xffffffffu},
+        TriangleTessellationCase{"FractionalEven", "fractional_even", "3.25",
+                                 "3.25", "3.25", 0xffffffffu},
+        TriangleTessellationCase{"FractionalOdd", "fractional_odd", "3.25",
+                                 "3.25", "3.25", 0xffffffffu},
+        TriangleTessellationCase{"ZeroEdge", "integer", "0.0", "4.0",
+                                 "4.0", 0x00000000u},
+        TriangleTessellationCase{"MaximumFactor", "integer", "64.0", "64.0",
+                                 "64.0", 0xffffffffu}),
+    TriangleTessellationCaseName);
+
+TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateQuad) {
+  const auto vs = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    Control main(uint id : SV_VertexID) {
+      float2 positions[4] = {
+        float2(-1.0, -1.0), float2(-1.0, 1.0),
+        float2(1.0, -1.0), float2(1.0, 1.0)
+      };
+      Control output;
+      output.position = positions[id];
+      return output;
+    })",
+                                "vs_5_0");
+  const auto hs = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    struct Constants {
+      float edges[4] : SV_TessFactor;
+      float inside[2] : SV_InsideTessFactor;
+    };
+    Constants PatchConstants(InputPatch<Control, 4> patch) {
+      Constants output;
+      output.edges[0] = 2.0;
+      output.edges[1] = 3.0;
+      output.edges[2] = 4.0;
+      output.edges[3] = 5.0;
+      output.inside[0] = 3.0;
+      output.inside[1] = 4.0;
+      return output;
+    }
+    [domain("quad")]
+    [partitioning("integer")]
+    [outputtopology("triangle_cw")]
+    [outputcontrolpoints(4)]
+    [patchconstantfunc("PatchConstants")]
+    Control main(InputPatch<Control, 4> patch,
+                 uint id : SV_OutputControlPointID) {
+      return patch[id];
+    })",
+                                "hs_5_0");
+  const auto ds = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    struct Constants {
+      float edges[4] : SV_TessFactor;
+      float inside[2] : SV_InsideTessFactor;
+    };
+    [domain("quad")]
+    float4 main(Constants constants, float2 uv : SV_DomainLocation,
+                const OutputPatch<Control, 4> patch) : SV_Position {
+      float2 bottom = lerp(patch[0].position, patch[2].position, uv.x);
+      float2 top = lerp(patch[1].position, patch[3].position, uv.x);
+      return float4(lerp(bottom, top, uv.y), 0.0, 1.0);
+    })",
+                                "ds_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(hs.result, S_OK) << hs.diagnostic_text();
+  ASSERT_EQ(ds.result, S_OK) << ds.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, nullptr, &hs, &ds);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(),
+                      D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST, 4);
+}
+
+TEST_F(ShaderAdvancedStageSpec, IsolineTessellationFailsClosed) {
+  const auto vs = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    Control main(uint id : SV_VertexID) {
+      Control output;
+      output.position = id == 0 ? float2(-1.0, 0.0) : float2(1.0, 0.0);
+      return output;
+    })",
+                                "vs_5_0");
+  const auto hs = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    struct Constants { float edges[2] : SV_TessFactor; };
+    Constants PatchConstants(InputPatch<Control, 2> patch) {
+      Constants output;
+      output.edges[0] = 1.0;
+      output.edges[1] = 4.0;
+      return output;
+    }
+    [domain("isoline")]
+    [partitioning("integer")]
+    [outputtopology("line")]
+    [outputcontrolpoints(2)]
+    [patchconstantfunc("PatchConstants")]
+    Control main(InputPatch<Control, 2> patch,
+                 uint id : SV_OutputControlPointID) {
+      return patch[id];
+    })",
+                                "hs_5_0");
+  const auto ds = CompileShader(R"(
+    struct Control { float2 position : POSITION; };
+    struct Constants { float edges[2] : SV_TessFactor; };
+    [domain("isoline")]
+    float4 main(Constants constants, float2 uv : SV_DomainLocation,
+                const OutputPatch<Control, 2> patch) : SV_Position {
+      return float4(lerp(patch[0].position, patch[1].position, uv.x),
+                    0.0, 1.0);
+    })",
+                                "ds_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(hs.result, S_OK) << hs.diagnostic_text();
+  ASSERT_EQ(ds.result, S_OK) << ds.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  HRESULT result = S_OK;
+  auto pipeline = CreatePipeline(vs, ps, nullptr, &hs, &ds,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, &result);
+  EXPECT_TRUE(FAILED(result));
+  EXPECT_FALSE(pipeline);
 }
 
 } // namespace
