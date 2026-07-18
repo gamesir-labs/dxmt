@@ -184,6 +184,18 @@ dxmt::dxil::BlobPart Part(uint32_t fourcc, const std::vector<uint8_t> &bytes) {
   return {.fourcc = fourcc, .data = bytes};
 }
 
+std::vector<uint8_t> DecodeHex(std::string_view text) {
+  const auto nibble = [](char value) -> uint8_t {
+    return value >= 'a' ? uint8_t(value - 'a' + 10)
+                        : uint8_t(value - '0');
+  };
+  std::vector<uint8_t> bytes;
+  bytes.reserve(text.size() / 2);
+  for (size_t i = 0; i + 1 < text.size(); i += 2)
+    bytes.push_back(uint8_t((nibble(text[i]) << 4) | nibble(text[i + 1])));
+  return bytes;
+}
+
 } // namespace
 
 TEST(DxilNames, PreservesAllFourBytesAndMapsKnownEnums) {
@@ -497,6 +509,95 @@ TEST(DxilDerivedInfo, HandlesContainerOnlyParserState) {
   EXPECT_TRUE(has_code("duplicate-singleton-part"));
   EXPECT_TRUE(has_code("missing-dxil-program"));
   EXPECT_TRUE(has_code("llvm-module-unavailable"));
+}
+
+TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
+  using namespace dxmt::dxil;
+  constexpr std::string_view bitcode_hex =
+      "4243c0de3514000005000000620c30244a59be669dfbb4bf0b51804c01000000210c00004d010000"
+      "0b02210002000000160000000781239141c80449061032399201840c250508191e048b62800c4502"
+      "42920b42641032143808184b0a3232884870c421234412878c1041920264c808b1142043468820c9"
+      "01323284182a282a90317cb05c9120c3c8000000892000000b0000003222c80820624600212b2498"
+      "0c212524980c19270c85a4906032645c20246382a0a81100136420608e000c00131472c087746087"
+      "36688779680372c0078d102687076f4e27a7ddbe211540080000000000000000000000000420b141"
+      "a06854000040160806000000321e980c19114c908c092647c6044362318c009440410000b1180000"
+      "ac0000003308801cc4e11c6614013d88433884c38c4280077978077398710ce6000fed100ef4800e"
+      "330c421ec2c11dcea11c6630053d88433884831bcc033dc8433d8c033dcc788c7470077b08077948"
+      "877070077a700376788770208719cc110eec900ee1300f6e300fe3f00ef0500e3310c41dde211cd8"
+      "211dc2611e6630893bbc833bd04339b4033cbc833c84033bccf0147660077b680737688772680737"
+      "808770908770600776280776f8057678877780875f08877118877298877998812ceef00eeee00ef5"
+      "c00eec300362c8a11ce4a11ccca11ce4a11cdc611cca211cc4811dca6106d6904339c84339984339"
+      "c84339b8c33894433888033b94c32fbc833cfc823bd4033bb0c30cc7698770588772708374680778"
+      "608774188774a08719ce530fee000ff2500ee4900ee3400fe1200eec500e3320281ddcc11ec2411e"
+      "d2211cdc811edce01ce4e11dea011e66185138b0433a9c833bcc50247660077b6807376087777807"
+      "7898514cf4900ff0500e331e6a1eca611ce8211ddec11d7e011ee4a11ccc211df0610654858338cc"
+      "c33bb0433dd04339fcc23ce4433b88c33bb0c38cc50a877998877718877408077a28077298815ce3"
+      "100eecc00ee5500ef33023c1d2411ee4e117d8e11dde011e6648193bb0833db4831b84c3388c4339"
+      "ccc33cb8c139c8c33bd4033ccc48b471080776600771088771588719dbc60eec600fede006f0200f"
+      "e5300fe5200ff6500e6e100ee3300ee5300ff3e006e9e00ee4500ef83023e2ec611cc2811dd8e117"
+      "ec211de6211dc4211dd8211de8211f66209d3bbc433db80339948339cc58bc7070077778077a0807"
+      "7a488777708719cbe70eef300fe1e00ee9400fe9a00fe530c3010373a8077718875f988770708774"
+      "a08774d087729881844139e0c338b0433d904339cc40c4a01dcaa11de0411edec11c662463300ee1"
+      "c00eec300fe9400fe50000007920000025000000721e482043880c19097232482023818c9191d144"
+      "a01028643c3132428e9021a328100a000201000063736d61696e0000230844308240082308c43082"
+      "401023080030c3100cc40c4241cc2014c60cc221c8486082d221c37399430b232b936b7a232b631b"
+      "25385221c373b12b939b4b7b731b25403221c373b10b63b32b931b2548d221c3732973a393cb837a"
+      "4b73a39b1b255000a9180000250000000b0a7228877780077a587098433db8c338b04339d0c382e6"
+      "1cc6a10de8411ec2c11de6211de8211ddec11d1634e3600ee7500fe1200fe4400fe1200fe7500ef4"
+      "b08081077928877060077678877108077a28077258709cc338b4013ba4833d94c3026b1cd8211cdc"
+      "e11cdc201ce4611cdc201ce8811ec2611cd0a11cc8611cc2811dd861c1010ff4200fe1500ff4800e"
+      "00000000d11000000600000007cc3ca4833b9c033b94033da0833c94433890c30100000061200000"
+      "06000000130481860301000002000000075010cd14610000000000007120000003000000320e1022"
+      "8400c90200000000000000005d0c0000090000001203941b6d61696e31352e302e376478696c2d6d"
+      "732d64783c737464696e3e0000000000";
+  ASSERT_EQ(bitcode_hex.size() % 2, 0u);
+  const auto bitcode = DecodeHex(bitcode_hex);
+  ASSERT_EQ(bitcode.size(), 1416u);
+
+  std::vector<uint8_t> program(kDxilProgramHeaderSize + bitcode.size());
+  Store<uint32_t>(program, 0, (5u << 16) | (6u << 4));
+  Store<uint32_t>(program, 4, program.size() / sizeof(uint32_t));
+  Store<uint32_t>(program, 8, kDxilMagicValue);
+  Store<uint32_t>(program, 12, 0x00010000u);
+  Store<uint32_t>(program, 16,
+                  kDxilProgramHeaderSize - kDxilBitcodeHeaderOffset);
+  Store<uint32_t>(program, 20, bitcode.size());
+  std::copy(bitcode.begin(), bitcode.end(),
+            program.begin() + kDxilProgramHeaderSize);
+  const auto container =
+      DxilContainerBuilder().add(fourcc::Dxil, program).build();
+
+  Parser parser;
+  ASSERT_EQ(parser.parse(container), ParseStatus::Ok);
+  ASSERT_TRUE(parser.dxilProgram().has_value());
+  EXPECT_EQ(parser.dxilProgram()->shader_kind(), 5u);
+  ASSERT_TRUE(parser.bitcode().has_value());
+  EXPECT_FALSE(parser.bitcode()->blocks.empty());
+  ASSERT_TRUE(parser.llvmModule().has_value());
+  EXPECT_EQ(parser.llvmModule()->target_triple, "dxil-ms-dx");
+  ASSERT_TRUE(parser.llvmModule()->shader_model.has_value());
+  EXPECT_EQ(parser.llvmModule()->shader_model->kind, "cs");
+  ASSERT_EQ(parser.llvmModule()->entry_points.size(), 1u);
+  EXPECT_EQ(parser.llvmModule()->entry_points[0].function_name, "main");
+  EXPECT_EQ(parser.llvmModule()->entry_points[0].name, "main");
+
+  ASSERT_TRUE(parser.shaderReflection().has_value());
+  EXPECT_TRUE(parser.shaderReflection()->valid);
+  EXPECT_EQ(parser.shaderReflection()->entry_point_name, "main");
+  EXPECT_EQ(parser.shaderReflection()->function_name, "main");
+  EXPECT_EQ(parser.shaderReflection()->shader_stage_name, "Compute");
+  EXPECT_EQ(parser.shaderReflection()->shader_model_major, 6u);
+  EXPECT_EQ(parser.shaderReflection()->shader_model_minor, 0u);
+
+  ASSERT_TRUE(parser.dxilValidation().has_value());
+  EXPECT_TRUE(parser.dxilValidation()->valid);
+  EXPECT_EQ(parser.dxilValidation()->error_count, 0u);
+  ASSERT_TRUE(parser.dxilTranslation().has_value());
+  EXPECT_TRUE(parser.dxilTranslation()->valid);
+  EXPECT_TRUE(parser.dxilTranslation()->has_metadata);
+  EXPECT_EQ(parser.dxilTranslation()->entry_point_name, "main");
+  EXPECT_EQ(parser.dxilTranslation()->function_name, "main");
+  EXPECT_EQ(parser.dxilTranslation()->shader_stage_name, "Compute");
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
