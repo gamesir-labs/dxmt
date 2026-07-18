@@ -188,6 +188,7 @@ d3d12_unit_suites = {
       'transfer/copy_resource_spec.cpp',
       'transfer/resolve_validation_spec.cpp',
       'transfer/copy_texture_spec.cpp',
+      'transfer/write_buffer_immediate_spec.cpp',
     ),
   },
   'resource': {

@@ -340,7 +340,8 @@ TEST_F(RtvDsvDimensionSpec, Texture3DRtvClearHonorsWSliceRange) {
   ExpectHealthyAfterFence();
 }
 
-TEST_F(RtvDsvDimensionSpec, Texture3DClearDoesNotMergeAcrossWSlices) {
+DXMT_SERIAL_TEST_F(RtvDsvDimensionSpec,
+                   Texture3DClearDoesNotMergeAcrossWSlices) {
   constexpr auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))

@@ -1,0 +1,140 @@
+#include <dxmt_test.hpp>
+
+#include "d3d12_test_context.hpp"
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+using dxmt::test::ComPtr;
+using dxmt::test::D3D12TestContext;
+
+class WriteBufferImmediateSpec : public ::testing::Test {
+protected:
+  void SetUp() override {
+    ASSERT_EQ(context_.Initialize(), S_OK);
+    ASSERT_EQ(context_.list()->QueryInterface(
+                  __uuidof(ID3D12GraphicsCommandList2),
+                  reinterpret_cast<void **>(list2_.put())),
+              S_OK);
+  }
+
+  std::vector<UINT> Readback(ID3D12Resource *buffer, UINT word_count) {
+    D3D12TestContext::Transition(
+        context_.list(), buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<std::uint8_t> bytes;
+    EXPECT_EQ(context_.ReadbackBuffer(buffer, word_count * sizeof(UINT),
+                                      &bytes),
+              S_OK);
+    std::vector<UINT> words(word_count);
+    if (bytes.size() == words.size() * sizeof(UINT))
+      std::memcpy(words.data(), bytes.data(), bytes.size());
+    return words;
+  }
+
+  D3D12TestContext context_;
+  ComPtr<ID3D12GraphicsCommandList2> list2_;
+};
+
+TEST_F(WriteBufferImmediateSpec, PreservesOrderRelativeToCopiesInSameList) {
+  constexpr std::array<UINT, 2> source_values = {
+      0x10203040u,
+      0x50607080u,
+  };
+  auto source = context_.CreateUploadBuffer(
+      sizeof(source_values), source_values.data(), sizeof(source_values));
+  auto destination = context_.CreateBuffer(
+      3 * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  const auto base = destination->GetGPUVirtualAddress();
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER before_copy = {
+      base, 0x11111111u};
+  list2_->WriteBufferImmediate(1, &before_copy, nullptr);
+  context_.list()->CopyBufferRegion(destination.get(), 0, source.get(), 0,
+                                    sizeof(UINT));
+
+  context_.list()->CopyBufferRegion(destination.get(), sizeof(UINT),
+                                    source.get(), sizeof(UINT), sizeof(UINT));
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER after_copy = {
+      base + sizeof(UINT), 0x22222222u};
+  list2_->WriteBufferImmediate(1, &after_copy, nullptr);
+
+  const std::array<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, 2> same_address = {{
+      {base + 2 * sizeof(UINT), 0x33333333u},
+      {base + 2 * sizeof(UINT), 0x44444444u},
+  }};
+  list2_->WriteBufferImmediate(static_cast<UINT>(same_address.size()),
+                               same_address.data(), nullptr);
+
+  EXPECT_EQ(Readback(destination.get(), 3),
+            (std::vector<UINT>{source_values[0], after_copy.Value,
+                               same_address.back().Value}));
+}
+
+TEST_F(WriteBufferImmediateSpec,
+       PreservesOrderRelativeToCopiesAcrossSeparateExecutes) {
+  constexpr std::array<UINT, 2> source_values = {
+      0x89abcdefu,
+      0x76543210u,
+  };
+  auto source = context_.CreateUploadBuffer(
+      sizeof(source_values), source_values.data(), sizeof(source_values));
+  auto destination = context_.CreateBuffer(
+      sizeof(source_values), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  std::array<ComPtr<ID3D12CommandAllocator>, 2> allocators;
+  std::array<ComPtr<ID3D12GraphicsCommandList>, 2> lists;
+  std::array<ComPtr<ID3D12GraphicsCommandList2>, 2> lists2;
+  for (UINT index = 0; index < lists.size(); ++index) {
+    ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                  D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  __uuidof(ID3D12CommandAllocator),
+                  reinterpret_cast<void **>(allocators[index].put())),
+              S_OK);
+    ASSERT_EQ(context_.device()->CreateCommandList(
+                  0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[index].get(),
+                  nullptr, __uuidof(ID3D12GraphicsCommandList),
+                  reinterpret_cast<void **>(lists[index].put())),
+              S_OK);
+    ASSERT_EQ(lists[index]->QueryInterface(
+                  __uuidof(ID3D12GraphicsCommandList2),
+                  reinterpret_cast<void **>(lists2[index].put())),
+              S_OK);
+  }
+
+  const auto base = destination->GetGPUVirtualAddress();
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER first_write = {
+      base, 0x13579bdfu};
+  lists2[0]->WriteBufferImmediate(1, &first_write, nullptr);
+  lists[0]->CopyBufferRegion(destination.get(), sizeof(UINT), source.get(),
+                             sizeof(UINT), sizeof(UINT));
+  ASSERT_EQ(lists[0]->Close(), S_OK);
+
+  lists[1]->CopyBufferRegion(destination.get(), 0, source.get(), 0,
+                             sizeof(UINT));
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER second_write = {
+      base + sizeof(UINT), 0x2468ace0u};
+  lists2[1]->WriteBufferImmediate(1, &second_write, nullptr);
+  ASSERT_EQ(lists[1]->Close(), S_OK);
+
+  ID3D12CommandList *first = lists[0].get();
+  context_.queue()->ExecuteCommandLists(1, &first);
+  ID3D12CommandList *second = lists[1].get();
+  context_.queue()->ExecuteCommandLists(1, &second);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  EXPECT_EQ(Readback(destination.get(), 2),
+            (std::vector<UINT>{source_values[0], second_write.Value}));
+}
+
+} // namespace

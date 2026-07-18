@@ -280,8 +280,8 @@ TEST_F(RenderPassMrtSemanticsSpec,
   }
 }
 
-TEST_F(RenderPassMrtSemanticsSpec,
-       AllowUavWritesPassExecutesPixelShaderAtomics) {
+DXMT_SERIAL_TEST_F(RenderPassMrtSemanticsSpec,
+                   AllowUavWritesPassExecutesPixelShaderAtomics) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   range.NumDescriptors = 1;

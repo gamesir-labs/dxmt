@@ -217,6 +217,68 @@ TEST_F(ComputeDispatchSpec, GroupSharedMemorySynchronizesAcrossThreads) {
     EXPECT_EQ(actual[word], expected[word]) << "word " << word;
 }
 
+TEST_F(ComputeDispatchSpec,
+       WriteBufferImmediateBetweenDispatchesPreservesOrder) {
+  auto shader = CompileShader(R"(
+    RWBuffer<uint> output : register(u0);
+    cbuffer Parameters : register(b0) {
+      uint source_index;
+      uint destination_index;
+      uint unused;
+    };
+
+    [numthreads(1, 1, 1)]
+    void main() {
+      output[destination_index] = output[source_index];
+    }
+  )",
+                              "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = CreatePipeline(shader);
+  ASSERT_TRUE(pipeline);
+
+  constexpr UINT kFirstValue = 0x11223344u;
+  constexpr UINT kSecondValue = 0xaabbccddu;
+  auto output = CreateOutput({kFirstValue, 0u, 0u});
+  ASSERT_TRUE(output.buffer);
+  ASSERT_TRUE(output.heap);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_UINT;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = 3;
+  context_.device()->CreateUnorderedAccessView(
+      output.buffer.get(), nullptr, &uav,
+      output.heap->GetCPUDescriptorHandleForHeapStart());
+  Bind(output, pipeline.get());
+
+  const UINT first_dispatch[] = {0, 1, 0};
+  context_.list()->SetComputeRoot32BitConstants(1, 3, first_dispatch, 0);
+  context_.list()->Dispatch(1, 1, 1);
+
+  D3D12TestContext::Transition(
+      context_.list(), output.buffer.get(),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12GraphicsCommandList2> list2;
+  ASSERT_EQ(context_.list()->QueryInterface(
+                __uuidof(ID3D12GraphicsCommandList2),
+                reinterpret_cast<void **>(list2.put())),
+            S_OK);
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write = {
+      output.buffer->GetGPUVirtualAddress(), kSecondValue};
+  list2->WriteBufferImmediate(1, &write, nullptr);
+  D3D12TestContext::Transition(
+      context_.list(), output.buffer.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+  const UINT second_dispatch[] = {0, 2, 0};
+  context_.list()->SetComputeRoot32BitConstants(1, 3, second_dispatch, 0);
+  context_.list()->Dispatch(1, 1, 1);
+
+  EXPECT_EQ(Readback(output, 3),
+            (std::vector<UINT>{kSecondValue, kFirstValue, kSecondValue}));
+}
+
 TEST_F(ComputeDispatchSpec, MultipleSharedBarrierPhasesIsolateThreadGroups) {
   const auto shader = CompileShader(R"(
     RWByteAddressBuffer output : register(u0);
