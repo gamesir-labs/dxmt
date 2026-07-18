@@ -71,6 +71,20 @@ Use `scripts/dxmt-builder cache status`, `cache verify`, and `cache prune
 --dry-run` to inspect managed state. There is no automatic capacity eviction in
 the initial implementation.
 
+## Git hooks
+
+Enable the tracked DXMT hooks once per clone:
+
+```sh
+scripts/setup-git-hooks.sh
+```
+
+The `commit-msg` hook validates new commits immediately. The `pre-push` hook
+validates every commit included in the outgoing ref updates, so commits created
+through amend, rebase, cherry-pick, or a bypassed commit hook are checked before
+they reach the remote. Subjects must use `type(scope): subject`, for example
+`fix(builder): validate commit messages before push`.
+
 ## Setup LLVM
 
 First of all, you need to build LLVM (or use a pre-built LLVM package) no matter if you want to use DXMT with Wine or as a native library. DXMT currently standardizes Wine, test helpers, native tools, and native libraries on `x86_64`; the supported Windows targets are x86 and x86_64.
