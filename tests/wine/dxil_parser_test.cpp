@@ -140,6 +140,8 @@ public:
     return *this;
   }
 
+  size_t byteSize() const { return bytes_.size(); }
+
   std::vector<uint8_t> build() const { return bytes_; }
 
 private:
@@ -649,6 +651,79 @@ TEST(DxilBitcode, RejectsMalformedAbbreviationEncodings) {
       .vbr(63, 6);
   malformed = FinishSingleBitcodeBlock(builder, 3);
   EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+}
+
+TEST(DxilBitcode, InheritsMultipleBlockInfoAbbreviations) {
+  using namespace dxmt::dxil;
+  BitcodeBuilder builder;
+  builder.bits(kBitcodeMagicValue, 32)
+      .bits(bitc::EnterSubblock, 2)
+      .vbr(bitc::BlockInfoBlockId, 8)
+      .vbr(2, 4)
+      .align32();
+  const size_t block_info_word_offset = builder.byteSize();
+  builder.bits(0, 32);
+  const size_t block_info_start = builder.byteSize();
+  builder.bits(bitc::UnabbrevRecord, 2)
+      .vbr(bitc::BlockInfoSetBid, 6)
+      .vbr(1, 6)
+      .vbr(8, 6)
+      .bits(bitc::DefineAbbrev, 2)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(21, 8)
+      .bits(0, 1)
+      .bits(1, 3)
+      .vbr(5, 5)
+      .bits(bitc::DefineAbbrev, 2)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(22, 8)
+      .bits(0, 1)
+      .bits(2, 3)
+      .vbr(6, 5)
+      .bits(bitc::EndBlock, 2)
+      .align32();
+  const size_t block_info_end = builder.byteSize();
+
+  builder.bits(bitc::EnterSubblock, 2).vbr(8, 8).vbr(3, 4).align32();
+  const size_t target_word_offset = builder.byteSize();
+  builder.bits(0, 32);
+  const size_t target_start = builder.byteSize();
+  builder.bits(bitc::FirstApplicationAbbrev, 3)
+      .bits(17, 5)
+      .bits(bitc::FirstApplicationAbbrev + 1, 3)
+      .vbr(300, 6)
+      .bits(bitc::EndBlock, 3)
+      .align32();
+  const size_t target_end = builder.byteSize();
+
+  auto bitcode = builder.build();
+  Store<uint32_t>(bitcode, block_info_word_offset,
+                  (block_info_end - block_info_start) / sizeof(uint32_t));
+  Store<uint32_t>(bitcode, target_word_offset,
+                  (target_end - target_start) / sizeof(uint32_t));
+
+  BitcodeInfo info;
+  ASSERT_EQ(ParseBitcode(bitcode, info), ParseStatus::Ok);
+  ASSERT_EQ(info.blocks.size(), 3u);
+  EXPECT_EQ(info.blocks[1].id, bitc::BlockInfoBlockId);
+  EXPECT_EQ(info.blocks[1].record_count, 1u);
+  EXPECT_EQ(info.blocks[2].id, 8u);
+  EXPECT_EQ(info.blocks[2].record_count, 2u);
+  ASSERT_EQ(info.records.size(), 3u);
+  EXPECT_EQ(info.records[0].block_id, bitc::BlockInfoBlockId);
+  EXPECT_EQ(info.records[0].code, bitc::BlockInfoSetBid);
+  EXPECT_EQ(info.records[0].operand_count, 1u);
+  EXPECT_FALSE(info.records[0].abbreviated);
+  EXPECT_EQ(info.records[1].block_id, 8u);
+  EXPECT_EQ(info.records[1].code, 21u);
+  EXPECT_EQ(info.records[1].operand_count, 1u);
+  EXPECT_TRUE(info.records[1].abbreviated);
+  EXPECT_EQ(info.records[2].block_id, 8u);
+  EXPECT_EQ(info.records[2].code, 22u);
+  EXPECT_EQ(info.records[2].operand_count, 1u);
+  EXPECT_TRUE(info.records[2].abbreviated);
 }
 
 TEST(DxilParts, ParsesSignatureElementsAndValidatesStringOffsets) {
