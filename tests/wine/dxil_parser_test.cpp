@@ -2384,6 +2384,94 @@ TEST(DxilPipelineStateValidation, RejectsInvalidSignatureReferencesAndDependenci
   expect_invalid("truncated dependency table", malformed);
 }
 
+TEST(DxilPipelineStateValidation, ParsesStageSpecificDependencyTables) {
+  using namespace dxmt::dxil;
+  constexpr size_t runtime_offset = sizeof(uint32_t);
+  constexpr size_t resource_count_offset =
+      runtime_offset + kPsvRuntimeInfo1Size;
+  constexpr size_t string_size_offset =
+      resource_count_offset + sizeof(uint32_t);
+  constexpr size_t semantic_count_offset =
+      string_size_offset + sizeof(uint32_t);
+  constexpr size_t dependency_offset =
+      semantic_count_offset + sizeof(uint32_t);
+  const auto make_psv = [](uint8_t shader_stage, bool uses_view_id,
+                           uint8_t input_vectors, uint8_t output_vectors,
+                           uint8_t patch_vectors,
+                           std::initializer_list<uint32_t> dependency_words) {
+    std::vector<uint8_t> bytes(dependency_offset +
+                               dependency_words.size() * sizeof(uint32_t));
+    Store<uint32_t>(bytes, 0, kPsvRuntimeInfo1Size);
+    bytes[runtime_offset + 24] = shader_stage;
+    bytes[runtime_offset + 25] = uses_view_id ? 1 : 0;
+    bytes[runtime_offset + 26] = patch_vectors;
+    bytes[runtime_offset + 31] = input_vectors;
+    bytes[runtime_offset + 32] = output_vectors;
+    size_t offset = dependency_offset;
+    for (const auto word : dependency_words) {
+      Store<uint32_t>(bytes, offset, word);
+      offset += sizeof(uint32_t);
+    }
+    return bytes;
+  };
+
+  const auto hull = make_psv(
+      3, true, 1, 1, 1,
+      {0x10u, 0x20u, 0x31u, 0x32u, 0x33u, 0x34u, 0x41u, 0x42u,
+       0x43u, 0x44u});
+  PipelineStateValidationInfo info;
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, hull), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.view_id_output_masks[0].mask_words.size(), 1u);
+  EXPECT_EQ(info.view_id_output_masks[0].mask_words[0], 0x10u);
+  ASSERT_EQ(
+      info.view_id_patch_constant_or_primitive_output_mask.mask_words.size(),
+      1u);
+  EXPECT_EQ(info.view_id_patch_constant_or_primitive_output_mask.mask_words[0],
+            0x20u);
+  EXPECT_EQ(info.input_to_output_tables[0].mask_words,
+            (std::vector<uint32_t>{0x31u, 0x32u, 0x33u, 0x34u}));
+  EXPECT_EQ(info.input_to_patch_constant_output_table.mask_words,
+            (std::vector<uint32_t>{0x41u, 0x42u, 0x43u, 0x44u}));
+  EXPECT_TRUE(info.patch_constant_input_to_output_table.mask_words.empty());
+
+  const auto domain =
+      make_psv(4, false, 1, 1, 1,
+               {0x51u, 0x52u, 0x53u, 0x54u, 0x61u, 0x62u, 0x63u,
+                0x64u});
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, domain), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.input_to_output_tables[0].mask_words,
+            (std::vector<uint32_t>{0x51u, 0x52u, 0x53u, 0x54u}));
+  EXPECT_EQ(info.patch_constant_input_to_output_table.mask_words,
+            (std::vector<uint32_t>{0x61u, 0x62u, 0x63u, 0x64u}));
+  EXPECT_TRUE(info.input_to_patch_constant_output_table.mask_words.empty());
+
+  const auto mesh = make_psv(13, true, 1, 1, 1, {0x70u, 0x80u});
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, mesh), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.view_id_output_masks[0].mask_words,
+            (std::vector<uint32_t>{0x70u}));
+  EXPECT_EQ(info.view_id_patch_constant_or_primitive_output_mask.mask_words,
+            (std::vector<uint32_t>{0x80u}));
+  EXPECT_TRUE(info.input_to_output_tables[0].mask_words.empty());
+  EXPECT_TRUE(info.input_to_patch_constant_output_table.mask_words.empty());
+  EXPECT_TRUE(info.patch_constant_input_to_output_table.mask_words.empty());
+
+  const auto expect_truncated = [&](std::vector<uint8_t> bytes) {
+    bytes.resize(bytes.size() - sizeof(uint32_t));
+    EXPECT_EQ(ParsePipelineStateValidation(
+                  Part(fourcc::PipelineStateValidation, bytes), info),
+              ParseStatus::InvalidPipelineStateValidation);
+  };
+  expect_truncated(hull);
+  expect_truncated(domain);
+  expect_truncated(mesh);
+}
+
 TEST(DxilSourceInfo, ParsesAlignedSections) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(kSourceInfoHeaderSize + 12 + 8);
