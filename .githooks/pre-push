@@ -9,15 +9,12 @@ pending=$(mktemp "${TMPDIR:-/tmp}/dxmt-pre-push.XXXXXX")
 unique=$(mktemp "${TMPDIR:-/tmp}/dxmt-pre-push.XXXXXX")
 trap 'rm -f "$pending" "$unique"' EXIT HUP INT TERM
 
-while read -r _local_ref local_oid _remote_ref remote_oid; do
+while read -r _local_ref local_oid _remote_ref _remote_oid; do
   if [ "$local_oid" = "$zero" ]; then
     continue
   fi
 
-  if [ "$remote_oid" != "$zero" ] &&
-      git cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
-    git rev-list "$remote_oid..$local_oid" >> "$pending"
-  elif [ -n "$remote_name" ]; then
+  if [ -n "$remote_name" ]; then
     git rev-list "$local_oid" --not --remotes="$remote_name" >> "$pending"
   else
     git rev-list "$local_oid" --not --remotes >> "$pending"
