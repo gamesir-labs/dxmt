@@ -84,6 +84,16 @@ TEST(MetalFormat, ClassifiesBlockCompressionAndDepthStencilPlanes) {
   EXPECT_EQ(dxmt::DepthStencilPlanarFlags(WMTPixelFormatRGBA8Unorm), 0u);
 }
 
+TEST(MetalFormat, LeavesFormatsWithoutAnSrgbPairUnchanged) {
+  EXPECT_EQ(dxmt::Forget_sRGB(WMTPixelFormatInvalid),
+            WMTPixelFormatInvalid);
+  EXPECT_EQ(dxmt::Recall_sRGB(WMTPixelFormatInvalid),
+            WMTPixelFormatInvalid);
+  EXPECT_EQ(dxmt::Recall_sRGB(WMTPixelFormatRGBA16Float),
+            WMTPixelFormatRGBA16Float);
+  EXPECT_FALSE(dxmt::Is_sRGBVariant(WMTPixelFormatRGBA16Float));
+}
+
 TEST_P(FormatQueryTest, MapsDxgiFormatToExpectedMetalRecord) {
   const auto &[dxgi, metal, element_size, required_flags] = GetParam();
   dxmt::MTL_DXGI_FORMAT_DESC description = {};
@@ -186,6 +196,28 @@ TEST(DxgiFormatTraits, ComputesWholeAndPerPlaneFootprints) {
       DXGI_FORMAT_R8G8B8A8_UNORM, 1, plane));
 }
 
+TEST(DxgiFormatTraits, ResetsFootprintOutputsOnFailure) {
+  dxmt::DXGIFormatFootprintLayout footprint = {99, 98, 97};
+  EXPECT_FALSE(
+      dxmt::GetDXGIFormatFootprintLayout(DXGI_FORMAT_UNKNOWN, footprint));
+  EXPECT_EQ(footprint.blockWidth, 1u);
+  EXPECT_EQ(footprint.blockHeight, 1u);
+  EXPECT_EQ(footprint.elementSize, 0u);
+
+  dxmt::DXGIFormatPlaneFootprintLayout plane = {99, 98, 97};
+  EXPECT_FALSE(
+      dxmt::GetDXGIFormatPlaneFootprintLayout(DXGI_FORMAT_NV12, 2, plane));
+  EXPECT_EQ(plane.blockWidth, 1u);
+  EXPECT_EQ(plane.blockHeight, 1u);
+  EXPECT_EQ(plane.elementSize, 0u);
+
+  ASSERT_TRUE(dxmt::GetDXGIFormatPlaneFootprintLayout(DXGI_FORMAT_BC1_UNORM,
+                                                      0, plane));
+  EXPECT_EQ(plane.blockWidth, 4u);
+  EXPECT_EQ(plane.blockHeight, 4u);
+  EXPECT_EQ(plane.elementSize, 8u);
+}
+
 TEST(DxgiFormatTraits, ValidatesVideoAndDepthStencilPlaneViews) {
   EXPECT_TRUE(dxmt::IsDXGIFormatPlaneCompatible(DXGI_FORMAT_NV12,
                                                 DXGI_FORMAT_R8_UNORM, 0));
@@ -206,6 +238,21 @@ TEST(DxgiFormatTraits, ValidatesVideoAndDepthStencilPlaneViews) {
       DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R8_TYPELESS, 1));
   EXPECT_FALSE(dxmt::IsDXGIFormatPlaneCompatible(DXGI_FORMAT_UNKNOWN,
                                                  DXGI_FORMAT_UNKNOWN, 0));
+}
+
+TEST(DxgiFormatTraits, ComparesTypelessFormatFamilies) {
+  EXPECT_TRUE(dxmt::AreDXGIFormatsInSameTypeGroup(
+      DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB));
+  EXPECT_TRUE(dxmt::AreDXGIFormatsInSameTypeGroup(
+      DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_UINT));
+  EXPECT_TRUE(dxmt::AreDXGIFormatsInSameTypeGroup(
+      DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB));
+  EXPECT_FALSE(dxmt::AreDXGIFormatsInSameTypeGroup(DXGI_FORMAT_R8_UNORM,
+                                                   DXGI_FORMAT_R8G8_UNORM));
+  EXPECT_FALSE(dxmt::AreDXGIFormatsInSameTypeGroup(DXGI_FORMAT_D16_UNORM,
+                                                   DXGI_FORMAT_D32_FLOAT));
+  EXPECT_TRUE(dxmt::AreDXGIFormatsInSameTypeGroup(DXGI_FORMAT_UNKNOWN,
+                                                  DXGI_FORMAT_UNKNOWN));
 }
 
 TEST(MetalFormat, ReportsTexelSizeIntegerClassAndUnsignedEquivalent) {

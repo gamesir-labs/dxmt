@@ -18,3 +18,12 @@ TEST(EnumNames, FormatsUnknownValueNumerically) {
   output << static_cast<DXGI_FORMAT>(-7);
   EXPECT_EQ(output.str(), "<unknown enum: -7>");
 }
+
+TEST(EnumNames, FormatsUnknownValuesForEverySupportedEnumType) {
+  std::ostringstream output;
+  output << static_cast<D3D_FEATURE_LEVEL>(99) << ' '
+         << static_cast<D3D11_RESOURCE_DIMENSION>(99) << ' '
+         << static_cast<WMTPixelFormat>(99);
+  EXPECT_EQ(output.str(),
+            "<unknown enum: 99> <unknown enum: 99> <unknown enum: 99>");
+}

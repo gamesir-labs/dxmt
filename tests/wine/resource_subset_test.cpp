@@ -145,4 +145,22 @@ TEST(ResourceSubset, LargeRangesKeepDepthAndStencilPlanesIndependent) {
   EXPECT_TRUE(stencil_only.overlapWith(both));
 }
 
+TEST(ResourceSubset, PreservesPlaneMasksAtTheCompactRangeBoundary) {
+  const auto view =
+      MakeTextureView(WMTPixelFormatDepth32Float_Stencil8, 30, 1, 0, 1);
+  const dxmt::ResourceSubsetState compact_depth(&view, 31, 1, 0b10);
+  const dxmt::ResourceSubsetState compact_stencil(&view, 31, 1, 0b01);
+  const dxmt::ResourceSubsetState compact_both(&view, 31, 1);
+  EXPECT_FALSE(compact_depth.overlapWith(compact_stencil));
+  EXPECT_TRUE(compact_depth.overlapWith(compact_both));
+  EXPECT_TRUE(compact_stencil.overlapWith(compact_both));
+
+  const dxmt::ResourceSubsetState ranged_depth(&view, 32, 1, 0b10);
+  const dxmt::ResourceSubsetState ranged_stencil(&view, 32, 1, 0b01);
+  const dxmt::ResourceSubsetState ranged_both(&view, 32, 1);
+  EXPECT_FALSE(ranged_depth.overlapWith(ranged_stencil));
+  EXPECT_TRUE(ranged_depth.overlapWith(ranged_both));
+  EXPECT_TRUE(ranged_stencil.overlapWith(ranged_both));
+}
+
 } // namespace
