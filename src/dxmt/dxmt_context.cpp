@@ -233,7 +233,7 @@ ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
   return fence;
 }
 
-uint32_t
+FencePoolPreparationResult
 ArgumentEncodingContext::prepareFencePool(
     EncoderData **encoders, unsigned encoder_count,
     CommandBufferDiagnosticInfo *diagnostic_info) {
@@ -246,6 +246,7 @@ ArgumentEncodingContext::prepareFencePool(
   std::unordered_map<EncoderId, size_t> interval_by_id;
   std::unordered_set<EncoderId> consumed_updates;
   FenceDependencyOrderTracker dependency_order;
+  FencePoolPreparationResult result = {};
 
   auto add_updates = [&](const FenceSet &updates, uint32_t index) {
     updates.forEach([&](EncoderId id) {
@@ -293,10 +294,18 @@ ArgumentEncodingContext::prepareFencePool(
       waits.merge(render->fence_wait_vertex);
       updates.merge(render->fence_update_vertex);
     }
+    if (encoder->type == EncoderType::Blit) {
+      waits.forEach([&](EncoderId id) {
+        result.external_blit_wait_count += !interval_by_id.contains(id);
+      });
+    }
     extend_waits(waits, i);
     dependency_order.analyzeEncoder(waits, updates);
   }
   if (has_pending_fence_only_blit_) {
+    pending_fence_only_blit_wait_.forEach([&](EncoderId id) {
+      result.external_blit_wait_count += !interval_by_id.contains(id);
+    });
     extend_waits(pending_fence_only_blit_wait_, encoder_count);
     dependency_order.analyzeEncoder(pending_fence_only_blit_wait_,
                                     pending_fence_only_blit_update_);
@@ -343,23 +352,18 @@ ArgumentEncodingContext::prepareFencePool(
   }
 
   const auto &order = dependency_order.analysis();
+  result.external_wait_count = order.external_waits;
   if (diagnostic_info) {
     diagnostic_info->prior_local_fence_wait_count = order.prior_local_waits;
     diagnostic_info->future_local_fence_wait_count = order.future_local_waits;
     diagnostic_info->same_encoder_fence_wait_count = order.same_encoder_waits;
     diagnostic_info->external_fence_wait_count = order.external_waits;
-    // Residual external waits cannot be expressed with the local Metal fence
-    // pool (producers live in earlier command buffers). Counting them as
-    // skipped matches pre-60cdc2a7 behavior: same-queue MTL command buffers
-    // already run in commit order, and injecting encodeWaitForEvent(prev)
-    // over-serialized FH4 UI draws (ghost / missing menu boards).
-    diagnostic_info->skipped_external_fence_wait_count = order.external_waits;
     diagnostic_info->repeated_fence_update_count = order.repeated_updates;
     diagnostic_info->local_fence_id_count =
         static_cast<uint32_t>(intervals.size());
     diagnostic_info->bound_fence_slot_count = used_slot_count;
   }
-  return order.external_waits;
+  return result;
 }
 
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Ordinary>(uint32_t slot_mask, uint64_t argument_buffer_offset);
@@ -4435,20 +4439,26 @@ ArgumentEncodingContext::flushCommands(
     perf.timestamp += clock::now() - t0;
   }
 
-  const auto external_fence_waits =
+  const auto fence_preparation =
       prepareFencePool(encoders, encoder_count, diagnostic_info);
-  // Opt-in only: 60cdc2a7 always waited on event_seq_id-1 when residual
-  // external fence edges remained. That restored some cross-submit hazards but
-  // regressed FH4 unselected-menu UI. Same-queue MTL command buffers already
-  // execute in commit order, so the wait is redundant for ordinary Execute
-  // ordering. Set DXMT_CROSS_SUBMIT_FENCE_WAIT=1 to restore the old wait.
-  if (external_fence_waits && event_seq_id > 1) {
-    static const bool force_cross_submit_wait = [] {
-      const auto value = env::getEnvVar("DXMT_CROSS_SUBMIT_FENCE_WAIT");
-      return value == "1" || value == "true" || value == "yes" || value == "on";
-    }();
-    if (force_cross_submit_wait)
-      cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
+  static const bool force_cross_submit_wait = [] {
+    const auto value = env::getEnvVar("DXMT_CROSS_SUBMIT_FENCE_WAIT");
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+  }();
+  // Blit consumers require an explicit event edge when their producer lives in
+  // an earlier command buffer; relying on commit order alone loses render-to-
+  // copy results under concurrent execution. Keep render/compute-only external
+  // edges on the non-serializing default path that avoids the FH4 UI regression
+  // which motivated 8a8f1d1a. The environment override retains the former
+  // all-external-edge behavior for diagnostics.
+  const bool encode_cross_submit_wait =
+      fence_preparation.external_blit_wait_count ||
+      (force_cross_submit_wait && fence_preparation.external_wait_count);
+  if (encode_cross_submit_wait && event_seq_id > 1)
+    cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
+  if (diagnostic_info) {
+    diagnostic_info->skipped_external_fence_wait_count =
+        encode_cross_submit_wait ? 0 : fence_preparation.external_wait_count;
   }
 
   // Report and benchmark only the fence operations that will reach Metal.

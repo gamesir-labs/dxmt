@@ -389,6 +389,11 @@ TEST_P(GraphicsResetStateSpec, ResetClearsBoundState) {
   ExpectResetState(GetParam());
 }
 
+static const ::dxmt::test::SerialTestRegistration
+    kVertexBufferResetStateSerial(
+        "GraphicsState/GraphicsResetStateSpec."
+        "ResetClearsBoundState/VertexBuffers");
+
 INSTANTIATE_TEST_SUITE_P(
     GraphicsState, GraphicsResetStateSpec,
     ::testing::Values(

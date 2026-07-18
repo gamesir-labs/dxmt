@@ -115,6 +115,11 @@ struct CommandBufferDiagnosticInfo {
       fence_edges = {};
 };
 
+struct FencePoolPreparationResult {
+  uint32_t external_wait_count = 0;
+  uint32_t external_blit_wait_count = 0;
+};
+
 inline std::size_t
 align_forward_adjustment(const void *const ptr, const std::size_t &alignment) noexcept {
   const auto iptr = reinterpret_cast<std::uintptr_t>(ptr);
@@ -1253,8 +1258,9 @@ private:
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool tryMergeComputeEncoders(ComputeEncoderData* former, ComputeEncoderData* latter);
   WMT::Fence fenceForEncoder(EncoderId id);
-  uint32_t prepareFencePool(EncoderData **encoders, unsigned encoder_count,
-                            CommandBufferDiagnosticInfo *diagnostic_info);
+  FencePoolPreparationResult
+  prepareFencePool(EncoderData **encoders, unsigned encoder_count,
+                   CommandBufferDiagnosticInfo *diagnostic_info);
   template <typename Fn>
   void withFence(EncoderId id, Fn &&fn) {
     if (auto fence = fenceForEncoder(id))

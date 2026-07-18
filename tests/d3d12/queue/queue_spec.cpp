@@ -364,6 +364,7 @@ struct CommandBufferDiagnosticTotals {
   std::uint64_t fence_waits = 0;
   std::uint64_t fence_updates = 0;
   std::uint64_t external_fence_waits = 0;
+  std::uint64_t skipped_external_fence_waits = 0;
 };
 
 struct ScopedCommandBufferDiagnosticMarker {
@@ -395,6 +396,7 @@ struct ScopedCommandBufferDiagnosticMarker {
             line.fence_updates))
         continue;
       fields >> line.external_fence_waits;
+      fields >> line.skipped_external_fence_waits;
       totals.input_encoders += line.input_encoders;
       totals.encoded_encoders += line.encoded_encoders;
       totals.encoded_blit += line.encoded_blit;
@@ -402,6 +404,8 @@ struct ScopedCommandBufferDiagnosticMarker {
       totals.fence_waits += line.fence_waits;
       totals.fence_updates += line.fence_updates;
       totals.external_fence_waits += line.external_fence_waits;
+      totals.skipped_external_fence_waits +=
+          line.skipped_external_fence_waits;
     }
     return totals;
   }
@@ -1168,17 +1172,16 @@ TEST_F(D3D12QueueSpec, CarriesBarriersAcrossSeparateExecutes) {
   EXPECT_EQ(marker.Count(), 0u);
 }
 
-TEST_F(D3D12QueueSpec,
-       PreservesRenderToCopyDependenciesAcrossSeparateExecutes) {
-  constexpr UINT kResourceCount = 64;
+void ExpectRenderToCopyDependenciesAcrossSeparateExecutes(
+    D3D12TestContext &context, UINT resource_count) {
   constexpr UINT64 kReadbackStride = 512;
   constexpr UINT kRowPitch = 256;
   ScopedCommandBufferDiagnosticMarker diagnostic;
 
-  auto rtv_heap = context_.CreateDescriptorHeap(
-      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResourceCount, false);
-  auto readback = context_.CreateBuffer(
-      kResourceCount * kReadbackStride, D3D12_HEAP_TYPE_READBACK,
+  auto rtv_heap = context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, resource_count, false);
+  auto readback = context.CreateBuffer(
+      resource_count * kReadbackStride, D3D12_HEAP_TYPE_READBACK,
       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(rtv_heap);
   ASSERT_TRUE(readback);
@@ -1186,27 +1189,27 @@ TEST_F(D3D12QueueSpec,
   std::vector<ComPtr<ID3D12Resource>> textures;
   std::vector<ComPtr<ID3D12CommandAllocator>> allocators;
   std::vector<ComPtr<ID3D12GraphicsCommandList>> lists;
-  textures.reserve(kResourceCount);
-  allocators.reserve(kResourceCount * 2);
-  lists.reserve(kResourceCount * 2);
+  textures.reserve(resource_count);
+  allocators.reserve(resource_count * 2);
+  lists.reserve(resource_count * 2);
   constexpr FLOAT clear_color[] = {1.0f, 0.0f, 0.0f, 1.0f};
 
-  for (UINT index = 0; index < kResourceCount; ++index) {
-    auto texture = context_.CreateTexture2D(
+  for (UINT index = 0; index < resource_count; ++index) {
+    auto texture = context.CreateTexture2D(
         1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
         D3D12_RESOURCE_STATE_RENDER_TARGET);
     ASSERT_TRUE(texture);
-    const auto rtv = context_.CpuDescriptorHandle(rtv_heap.get(), index);
-    context_.device()->CreateRenderTargetView(texture.get(), nullptr, rtv);
+    const auto rtv = context.CpuDescriptorHandle(rtv_heap.get(), index);
+    context.device()->CreateRenderTargetView(texture.get(), nullptr, rtv);
 
     ComPtr<ID3D12CommandAllocator> producer_allocator;
     ComPtr<ID3D12GraphicsCommandList> producer;
-    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
+    ASSERT_TRUE(SUCCEEDED(context.device()->CreateCommandAllocator(
         D3D12_COMMAND_LIST_TYPE_DIRECT,
         __uuidof(ID3D12CommandAllocator),
         reinterpret_cast<void **>(producer_allocator.put()))));
-    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
+    ASSERT_TRUE(SUCCEEDED(context.device()->CreateCommandList(
         0, D3D12_COMMAND_LIST_TYPE_DIRECT, producer_allocator.get(), nullptr,
         __uuidof(ID3D12GraphicsCommandList),
         reinterpret_cast<void **>(producer.put()))));
@@ -1218,11 +1221,11 @@ TEST_F(D3D12QueueSpec,
 
     ComPtr<ID3D12CommandAllocator> consumer_allocator;
     ComPtr<ID3D12GraphicsCommandList> consumer;
-    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandAllocator(
+    ASSERT_TRUE(SUCCEEDED(context.device()->CreateCommandAllocator(
         D3D12_COMMAND_LIST_TYPE_DIRECT,
         __uuidof(ID3D12CommandAllocator),
         reinterpret_cast<void **>(consumer_allocator.put()))));
-    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateCommandList(
+    ASSERT_TRUE(SUCCEEDED(context.device()->CreateCommandList(
         0, D3D12_COMMAND_LIST_TYPE_DIRECT, consumer_allocator.get(), nullptr,
         __uuidof(ID3D12GraphicsCommandList),
         reinterpret_cast<void **>(consumer.put()))));
@@ -1239,9 +1242,9 @@ TEST_F(D3D12QueueSpec,
     ASSERT_TRUE(SUCCEEDED(consumer->Close()));
 
     ID3D12CommandList *producer_list = producer.get();
-    context_.queue()->ExecuteCommandLists(1, &producer_list);
+    context.queue()->ExecuteCommandLists(1, &producer_list);
     ID3D12CommandList *consumer_list = consumer.get();
-    context_.queue()->ExecuteCommandLists(1, &consumer_list);
+    context.queue()->ExecuteCommandLists(1, &consumer_list);
 
     textures.push_back(std::move(texture));
     allocators.push_back(std::move(producer_allocator));
@@ -1250,21 +1253,39 @@ TEST_F(D3D12QueueSpec,
     lists.push_back(std::move(consumer));
   }
 
-  ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
+  ASSERT_TRUE(SUCCEEDED(context.SignalAndWait()));
   const auto totals = diagnostic.Read();
   EXPECT_GT(totals.external_fence_waits, 0u);
+  EXPECT_EQ(totals.skipped_external_fence_waits, 0u);
 
   void *mapping = nullptr;
-  const D3D12_RANGE read_range = {0, kResourceCount * kReadbackStride};
+  const D3D12_RANGE read_range = {0, resource_count * kReadbackStride};
   ASSERT_TRUE(SUCCEEDED(readback->Map(0, &read_range, &mapping)));
   const auto *bytes = static_cast<const std::uint8_t *>(mapping);
-  for (UINT index = 0; index < kResourceCount; ++index) {
+  for (UINT index = 0; index < resource_count; ++index) {
     std::uint32_t pixel = 0;
     std::memcpy(&pixel, bytes + index * kReadbackStride, sizeof(pixel));
     EXPECT_EQ(pixel, 0xff0000ffu) << "resource " << index;
   }
   const D3D12_RANGE written_range = {0, 0};
   readback->Unmap(0, &written_range);
+}
+
+DXMT_SERIAL_TEST_F(D3D12QueueSpec,
+                   PreservesRenderToCopyDependenciesAcrossSeparateExecutes) {
+  ExpectRenderToCopyDependenciesAcrossSeparateExecutes(context_, 64);
+}
+
+DXMT_SERIAL_TEST_F(D3D12QueueSpec, RenderToCopySeparateExecuteBoundary31) {
+  ExpectRenderToCopyDependenciesAcrossSeparateExecutes(context_, 31);
+}
+
+DXMT_SERIAL_TEST_F(D3D12QueueSpec, RenderToCopySeparateExecuteBoundary32) {
+  ExpectRenderToCopyDependenciesAcrossSeparateExecutes(context_, 32);
+}
+
+DXMT_SERIAL_TEST_F(D3D12QueueSpec, RenderToCopySeparateExecuteBoundary33) {
+  ExpectRenderToCopyDependenciesAcrossSeparateExecutes(context_, 33);
 }
 
 TEST_F(D3D12QueueSpec, PreservesTextureUploadAcrossSubmissions) {
