@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -59,6 +60,7 @@ TEST(D3D12DescriptorJournal, ForcesFullScanAfterHistoryOverflow) {
 
 using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::DescriptorTablePixelShader;
 using dxmt::test::CopyTextureComputeShader;
@@ -200,6 +202,133 @@ protected:
 
   D3D12TestContext context_;
 };
+
+enum class ForeignDescriptorCopyCase {
+  SimpleForeignSource,
+  RangedForeignSource,
+  SimpleForeignDestination,
+  RangedForeignDestination,
+};
+
+class ForeignDescriptorCopySpec
+    : public D3D12DescriptorSpec,
+      public ::testing::WithParamInterface<ForeignDescriptorCopyCase> {};
+
+TEST_P(ForeignDescriptorCopySpec,
+       LeavesForeignEndpointUnchangedAndAllowsLocalRecovery) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto local_destination = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto local_source = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto foreign_destination = foreign_context.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto foreign_source = foreign_context.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto local_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
+  auto foreign_heap = foreign_context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
+  ASSERT_TRUE(local_destination);
+  ASSERT_TRUE(local_source);
+  ASSERT_TRUE(foreign_destination);
+  ASSERT_TRUE(foreign_source);
+  ASSERT_TRUE(local_heap);
+  ASSERT_TRUE(foreign_heap);
+  const auto local_destination_handle =
+      context_.CpuDescriptorHandle(local_heap.get(), 0);
+  const auto local_source_handle =
+      context_.CpuDescriptorHandle(local_heap.get(), 1);
+  const auto foreign_destination_handle =
+      foreign_context.CpuDescriptorHandle(foreign_heap.get(), 0);
+  const auto foreign_source_handle =
+      foreign_context.CpuDescriptorHandle(foreign_heap.get(), 1);
+  context_.device()->CreateRenderTargetView(
+      local_destination.get(), nullptr, local_destination_handle);
+  context_.device()->CreateRenderTargetView(local_source.get(), nullptr,
+                                            local_source_handle);
+  foreign_device->CreateRenderTargetView(
+      foreign_destination.get(), nullptr, foreign_destination_handle);
+  foreign_device->CreateRenderTargetView(foreign_source.get(), nullptr,
+                                         foreign_source_handle);
+
+  const bool foreign_source_case =
+      GetParam() == ForeignDescriptorCopyCase::SimpleForeignSource ||
+      GetParam() == ForeignDescriptorCopyCase::RangedForeignSource;
+  const bool simple =
+      GetParam() == ForeignDescriptorCopyCase::SimpleForeignSource ||
+      GetParam() == ForeignDescriptorCopyCase::SimpleForeignDestination;
+  const auto destination = foreign_source_case ? local_destination_handle
+                                               : foreign_destination_handle;
+  const auto source =
+      foreign_source_case ? foreign_source_handle : local_source_handle;
+  if (simple) {
+    context_.device()->CopyDescriptorsSimple(
+        1, destination, source, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  } else {
+    constexpr UINT range_size = 1;
+    context_.device()->CopyDescriptors(
+        1, &destination, &range_size, 1, &source, &range_size,
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  }
+
+  constexpr FLOAT color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+  auto *verification_list =
+      foreign_source_case ? context_.list() : foreign_context.list();
+  verification_list->ClearRenderTargetView(destination, color, 0, nullptr);
+  EXPECT_EQ(verification_list->Close(), S_OK);
+
+  context_.device()->CopyDescriptorsSimple(
+      1, local_destination_handle, local_source_handle,
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+  list->ClearRenderTargetView(local_destination_handle, color, 0, nullptr);
+  EXPECT_EQ(list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(foreign_device->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string ForeignDescriptorCopyCaseName(
+    const ::testing::TestParamInfo<ForeignDescriptorCopyCase> &info) {
+  switch (info.param) {
+  case ForeignDescriptorCopyCase::SimpleForeignSource:
+    return "SimpleForeignSource";
+  case ForeignDescriptorCopyCase::RangedForeignSource:
+    return "RangedForeignSource";
+  case ForeignDescriptorCopyCase::SimpleForeignDestination:
+    return "SimpleForeignDestination";
+  case ForeignDescriptorCopyCase::RangedForeignDestination:
+    return "RangedForeignDestination";
+  }
+  return "Unknown";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Validation, ForeignDescriptorCopySpec,
+    ::testing::Values(ForeignDescriptorCopyCase::SimpleForeignSource,
+                      ForeignDescriptorCopyCase::RangedForeignSource,
+                      ForeignDescriptorCopyCase::SimpleForeignDestination,
+                      ForeignDescriptorCopyCase::RangedForeignDestination),
+    ForeignDescriptorCopyCaseName);
 
 bool TestInjectionEnabled(const char *name) {
   char value[8] = {};

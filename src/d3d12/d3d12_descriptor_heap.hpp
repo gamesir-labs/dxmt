@@ -133,6 +133,7 @@ public:
                                        DescriptorHeap *owner);
 
   DescriptorRecord *get() const { return record_; }
+  DescriptorHeap *owner() const { return owner_; }
   DescriptorRecord *operator->() const { return record_; }
   DescriptorRecord &operator*() const { return *record_; }
   explicit operator bool() const { return record_ != nullptr; }

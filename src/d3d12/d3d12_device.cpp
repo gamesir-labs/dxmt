@@ -4283,7 +4283,9 @@ public:
       auto dst_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
           dst_descriptor_range_offsets[dst_range], descriptor_heap_type,
           dst_count, "CopyDescriptors destination");
-      if (!dst_lease)
+      if (!dst_lease || !dst_lease.owner() ||
+          dst_lease.owner()->GetParentDevice() !=
+              static_cast<IMTLD3D12Device *>(this))
         return;
       auto *dst = dst_lease.get();
       if (dst_total > UINT_MAX - dst_count) {
@@ -4310,7 +4312,9 @@ public:
       auto src_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
           src_descriptor_range_offsets[src_range], descriptor_heap_type,
           src_count, "CopyDescriptors source");
-      if (!src_lease)
+      if (!src_lease || !src_lease.owner() ||
+          src_lease.owner()->GetParentDevice() !=
+              static_cast<IMTLD3D12Device *>(this))
         return;
       auto *src = src_lease.get();
       if (src[0].shader_visible) {
@@ -4380,7 +4384,12 @@ public:
     auto src_lease = d3d12::GetDescriptorRecordRangeFromCpuHandle(
         src_descriptor_range_offset, descriptor_heap_type, descriptor_count,
         "CopyDescriptorsSimple source");
-    if (!dst_lease || !src_lease)
+    if (!dst_lease || !src_lease || !dst_lease.owner() ||
+        !src_lease.owner() ||
+        dst_lease.owner()->GetParentDevice() !=
+            static_cast<IMTLD3D12Device *>(this) ||
+        src_lease.owner()->GetParentDevice() !=
+            static_cast<IMTLD3D12Device *>(this))
       return;
     auto *dst = dst_lease.get();
     auto *src = src_lease.get();
