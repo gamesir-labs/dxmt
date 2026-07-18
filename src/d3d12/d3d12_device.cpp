@@ -4647,8 +4647,6 @@ public:
         dxmt::perf::FrameTimeBucket::CreateReservedResource);
     BeginDeviceCall("CreateReservedResource");
     InitReturnPtr(resource);
-    if (!resource)
-      return E_POINTER;
     const bool is_buffer =
         desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     if (is_buffer && optimized_clear_value)
@@ -4663,6 +4661,8 @@ public:
       }
       return E_NOTIMPL;
     }
+    if (!resource)
+      return S_FALSE;
 
     const auto heap_properties = GetDefaultResourceHeapProperties();
     auto resource_object = d3d12::CreateResource(

@@ -253,6 +253,32 @@ TEST_F(VersionedApiSpec,
 }
 
 TEST_F(VersionedApiSpec,
+       ReservedResourceCapabilityProbesMatchBaseApi) {
+  auto device4 = QueryDevice<ID3D12Device4>();
+  ASSERT_TRUE(device4);
+  auto desc = BufferDesc(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+
+  const HRESULT base_hr = context_.device()->CreateReservedResource(
+      &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+      __uuidof(ID3D12Resource), nullptr);
+  const HRESULT versioned_hr = device4->CreateReservedResource1(
+      &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
+      __uuidof(ID3D12Resource), nullptr);
+  EXPECT_TRUE(base_hr == S_FALSE || base_hr == E_NOTIMPL);
+  EXPECT_EQ(versioned_hr, base_hr);
+
+  desc.Width = 0;
+  EXPECT_EQ(context_.device()->CreateReservedResource(
+                &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(device4->CreateReservedResource1(
+                &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+}
+
+TEST_F(VersionedApiSpec,
        CreateCommittedResource2PreservesDesc1AndExecutes) {
   auto device8 = QueryDevice<ID3D12Device8>();
   ASSERT_TRUE(device8);
