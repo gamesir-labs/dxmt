@@ -40,7 +40,7 @@ inline float fclamp(float value, float min, float max) {
 }
 
 template <typename T> inline T divCeil(T dividend, T divisor) {
-  return (dividend + divisor - 1) / divisor;
+  return dividend / divisor + T(dividend % divisor != 0);
 }
 
 } // namespace dxmt

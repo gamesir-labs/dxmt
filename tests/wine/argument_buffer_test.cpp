@@ -23,6 +23,7 @@ class FakeArgumentBufferContext {
 public:
   template <typename T, bool ComputeCommandEncoder = false>
   T *getMappedArgumentBuffer(std::size_t offset) {
+    used_compute_command_encoder_ = ComputeCommandEncoder;
     if (!mapping_available_ || offset != 64)
       return nullptr;
     return reinterpret_cast<T *>(&storage_);
@@ -30,9 +31,13 @@ public:
 
   void setMappingAvailable(bool available) { mapping_available_ = available; }
   DrawArguments &storage() { return storage_; }
+  bool usedComputeCommandEncoder() const {
+    return used_compute_command_encoder_;
+  }
 
 private:
   bool mapping_available_ = false;
+  bool used_compute_command_encoder_ = false;
   DrawArguments storage_ = {};
 };
 
@@ -70,6 +75,14 @@ TEST(ArgumentBufferMapping, RejectsElementCountOverflow) {
   EXPECT_EQ(size, 19u);
 }
 
+TEST(ArgumentBufferMapping, ComputesSuccessfulByteSizesIncludingZero) {
+  std::size_t size = 19;
+  EXPECT_TRUE(dxmt::ArgumentBufferByteSize<DrawArguments>(0, size));
+  EXPECT_EQ(size, 0u);
+  EXPECT_TRUE(dxmt::ArgumentBufferByteSize<DrawArguments>(3, size));
+  EXPECT_EQ(size, 3u * sizeof(DrawArguments));
+}
+
 TEST(ArgumentBufferMapping, InvokesWriterOnlyForAValidContextMapping) {
   FakeArgumentBufferContext context;
   bool writer_called = false;
@@ -85,4 +98,10 @@ TEST(ArgumentBufferMapping, InvokesWriterOnlyForAValidContextMapping) {
       }));
   EXPECT_TRUE(writer_called);
   EXPECT_EQ(context.storage().vertex_count, 7u);
+
+  EXPECT_TRUE((dxmt::TryWriteMappedArgumentBuffer<DrawArguments, true>(
+      context, 64,
+      [](DrawArguments &arguments) { arguments.instance_count = 5; })));
+  EXPECT_TRUE(context.usedComputeCommandEncoder());
+  EXPECT_EQ(context.storage().instance_count, 5u);
 }

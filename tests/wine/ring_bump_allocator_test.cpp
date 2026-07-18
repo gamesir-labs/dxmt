@@ -97,4 +97,27 @@ TEST(RingBumpAllocator, DoesNotReuseBlocksStillInFlight) {
   EXPECT_EQ(second_offset, 0u);
 }
 
+TEST(RingBumpAllocator, TracksTheLastSequenceThatUsedAStandardBlock) {
+  auto state = std::make_shared<FakeAllocatorState>();
+  TestRing ring{FakeAllocator(state)};
+
+  const auto [first, first_offset] = ring.allocate(10, 0, 1, 1);
+  const auto first_id = first.id;
+  const auto [same, exact_fit_offset] = ring.allocate(11, 0, 48, 16);
+  EXPECT_EQ(first_offset, 0u);
+  EXPECT_EQ(exact_fit_offset, 16u);
+  EXPECT_EQ(same.id, first_id);
+
+  ring.free_blocks(10);
+  const auto [second, second_offset] = ring.allocate(12, 11, 64, 1);
+  EXPECT_NE(second.id, first_id);
+  EXPECT_EQ(second_offset, 0u);
+
+  ring.free_blocks(11);
+  const auto [reused, reused_offset] = ring.allocate(13, 12, 64, 1);
+  EXPECT_EQ(reused.id, first_id);
+  EXPECT_EQ(reused_offset, 0u);
+  EXPECT_EQ(state->allocated_sizes.size(), 2u);
+}
+
 } // namespace

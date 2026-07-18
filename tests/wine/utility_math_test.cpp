@@ -55,6 +55,11 @@ TEST(MathUtilities, IntegerDivisionRoundsUp) {
   EXPECT_EQ(dxmt::divCeil(1u, 4u), 1u);
   EXPECT_EQ(dxmt::divCeil(4u, 4u), 1u);
   EXPECT_EQ(dxmt::divCeil(5u, 4u), 2u);
+  EXPECT_EQ(dxmt::divCeil(std::numeric_limits<uint32_t>::max(), 2u),
+            uint32_t{1} << 31);
+  EXPECT_EQ(dxmt::divCeil(std::numeric_limits<uint64_t>::max(),
+                          std::numeric_limits<uint64_t>::max()),
+            1u);
 }
 
 } // namespace

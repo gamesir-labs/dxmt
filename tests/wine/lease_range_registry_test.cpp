@@ -120,6 +120,28 @@ TEST(LeaseRangeRegistry, RejectsForeignMisalignedAndInvalidRecords) {
   foreign_owner.Release();
 }
 
+TEST(LeaseRangeRegistry, RejectsNullEmptyAndOverflowingRegistrations) {
+  Registry registry;
+  LeaseOwner owner;
+  LeaseRecord record;
+
+  EXPECT_FALSE(registry.Register(nullptr, 1, &owner));
+  EXPECT_FALSE(registry.Register(&record, 0, &owner));
+  EXPECT_FALSE(registry.Register(&record, 1, nullptr));
+  EXPECT_FALSE(registry.Unregister(nullptr, &owner));
+  EXPECT_FALSE(registry.Unregister(&record, nullptr));
+  EXPECT_FALSE(registry.TryUnregister(nullptr, &owner));
+  EXPECT_FALSE(registry.TryUnregister(&record, nullptr));
+
+  const auto overflowing_count =
+      std::size_t{UINTPTR_MAX / sizeof(LeaseRecord)} + 1u;
+  EXPECT_FALSE(registry.Register(reinterpret_cast<LeaseRecord *>(1),
+                                 overflowing_count, &owner));
+  auto *wrapping_range = reinterpret_cast<LeaseRecord *>(
+      UINTPTR_MAX - sizeof(LeaseRecord) + 1u);
+  EXPECT_FALSE(registry.Register(wrapping_range, 1, &owner));
+}
+
 TEST(LeaseRangeRegistry,
      LeaseAcquisitionExcludesUnregistrationUntilOwnerIsRetained) {
   Registry registry;
