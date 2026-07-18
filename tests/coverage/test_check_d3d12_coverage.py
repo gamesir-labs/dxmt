@@ -69,6 +69,110 @@ class PublicApiEvidenceTest(unittest.TestCase):
             self.assertEqual(result["missing"], ["MissingMethod"])
             self.assertEqual(len(errors), 1)
 
+    def test_discovers_implemented_method_declared_in_idl(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "include").mkdir()
+            (root / "src").mkdir()
+            (root / "include/api.idl").write_text(
+                "interface ID3D12Sample : IUnknown\n"
+                "{\n"
+                "    HRESULT IdlMethod(UINT value);\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "src/api.cpp").write_text(
+                "HRESULT STDMETHODCALLTYPE IdlMethod(UINT value) override {}",
+                encoding="utf-8",
+            )
+            config = {
+                "public_api": {
+                    "interface_globs": ["include/*.idl"],
+                    "implementation_globs": ["src/*.cpp"],
+                    "categories": {"sample": {"apis": []}},
+                }
+            }
+            result, errors = COVERAGE.scan_public_api_surface(config, root)
+            self.assertEqual(result["missing"], ["IdlMethod"])
+            self.assertEqual(len(errors), 1)
+
+    def test_accepts_promotion_gate_with_negative_test_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "include").mkdir()
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "include/api.idl").write_text(
+                "interface ID3D12Sample : IUnknown\n"
+                "{\n"
+                "    HRESULT GatedMethod();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "src/api.cpp").write_text(
+                "HRESULT STDMETHODCALLTYPE GatedMethod() override {}",
+                encoding="utf-8",
+            )
+            (root / "tests/gate.cpp").write_text(
+                "TEST(PromotionGate, RemainsUnavailable)", encoding="utf-8"
+            )
+            config = {
+                "public_api": {
+                    "interface_globs": ["include/*.idl"],
+                    "implementation_globs": ["src/*.cpp"],
+                    "categories": {"sample": {"apis": []}},
+                    "promotion_gates": {
+                        "sample-gate": {
+                            "apis": ["GatedMethod"],
+                            "test_globs": ["tests/*.cpp"],
+                            "test_regex": "RemainsUnavailable",
+                        }
+                    },
+                }
+            }
+            result, errors = COVERAGE.scan_public_api_surface(config, root)
+            self.assertFalse(errors)
+            self.assertFalse(result["missing"])
+            self.assertEqual(result["promotion_gated"], 1)
+
+    def test_rejects_promotion_gate_without_test_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "include").mkdir()
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "include/api.idl").write_text(
+                "interface ID3D12Sample : IUnknown\n"
+                "{\n"
+                "    HRESULT GatedMethod();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "src/api.cpp").write_text(
+                "HRESULT STDMETHODCALLTYPE GatedMethod() override {}",
+                encoding="utf-8",
+            )
+            (root / "tests/gate.cpp").write_text(
+                "TEST(PromotionGate, OtherCase)", encoding="utf-8"
+            )
+            config = {
+                "public_api": {
+                    "interface_globs": ["include/*.idl"],
+                    "implementation_globs": ["src/*.cpp"],
+                    "categories": {"sample": {"apis": []}},
+                    "promotion_gates": {
+                        "sample-gate": {
+                            "apis": ["GatedMethod"],
+                            "test_globs": ["tests/*.cpp"],
+                            "test_regex": "RemainsUnavailable",
+                        }
+                    },
+                }
+            }
+            result, errors = COVERAGE.scan_public_api_surface(config, root)
+            self.assertFalse(result["missing"])
+            self.assertEqual(len(errors), 1)
+
 
 class ErrorEvidenceTest(unittest.TestCase):
     def test_checks_every_declared_evidence_category(self):

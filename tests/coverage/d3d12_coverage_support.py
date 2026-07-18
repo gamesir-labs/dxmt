@@ -68,6 +68,7 @@ def scan_public_api_surface(
     interface_globs = public_api.get("interface_globs", [])
     implementation_globs = public_api.get("implementation_globs", [])
     categories = public_api.get("categories", {})
+    promotion_gates = public_api.get("promotion_gates", {})
     if not interface_globs or not implementation_globs or not categories:
         raise ValueError(
             "coverage config must define public_api interface, implementation, "
@@ -79,6 +80,18 @@ def scan_public_api_surface(
     declared = set(
         re.findall(r"STDMETHODCALLTYPE\s+([A-Za-z_]\w*)\s*\(", interface_text)
     )
+    for interface_body in re.findall(
+        r"interface\s+ID3D12[A-Za-z0-9_]*[^\{;]*\{(.*?)\n\}",
+        interface_text,
+        re.DOTALL,
+    ):
+        declared.update(
+            re.findall(
+                r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;",
+                interface_body,
+                re.DOTALL,
+            )
+        )
     implemented = set(
         re.findall(
             r"STDMETHODCALLTYPE\s+([A-Za-z_]\w*)\s*\([^;{}]*?\)\s*"
@@ -88,20 +101,52 @@ def scan_public_api_surface(
         )
     )
     discovered = declared & implemented
-    listed = {
+    category_methods = {
         name
         for category in categories.values()
         for name in category.get("apis", [])
     }
+    gated_methods: set[str] = set()
+    errors: list[str] = []
+    for gate_name, gate in promotion_gates.items():
+        api_names = gate.get("apis", [])
+        test_globs = gate.get("test_globs", [])
+        test_regex = gate.get("test_regex", "")
+        if not api_names or not test_globs or not test_regex:
+            raise ValueError(
+                f"public-api/promotion-gate/{gate_name}: apis, test_globs, "
+                "and test_regex are required"
+            )
+        overlap = sorted(set(api_names) & category_methods)
+        if overlap:
+            raise ValueError(
+                f"public-api/promotion-gate/{gate_name}: methods are already "
+                f"in public categories: {', '.join(overlap)}"
+            )
+        stale = sorted(set(api_names) - discovered)
+        if stale:
+            errors.append(
+                f"public-api/promotion-gate/{gate_name}: methods are not "
+                f"implemented public surface: {', '.join(stale)}"
+            )
+        test_text = read_globs(repo_root, test_globs)
+        if not re.search(test_regex, test_text):
+            errors.append(
+                f"public-api/promotion-gate/{gate_name}: missing gate test "
+                f"evidence matching {test_regex}"
+            )
+        gated_methods.update(api_names)
+
+    listed = category_methods | gated_methods
     missing = sorted(discovered - listed)
     result = {
         "declared": len(declared),
         "implemented": len(implemented),
         "discovered": len(discovered),
         "listed": len(listed),
+        "promotion_gated": len(gated_methods),
         "missing": missing,
     }
-    errors = []
     if missing:
         errors.append(
             "public-api/surface: implemented public methods missing from "

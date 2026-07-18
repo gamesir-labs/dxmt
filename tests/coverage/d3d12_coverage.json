@@ -290,9 +290,24 @@
     "test_globs": ["tests/d3d12/**/*.cpp"],
     "interface_globs": [
       "include/native/directx/d3d12.h",
-      "src/d3d12/d3d12_agility.hpp"
+      "src/d3d12/d3d12_agility.hpp",
+      "external/wine/include/d3d12.idl"
     ],
     "implementation_globs": ["src/d3d12/*.cpp"],
+    "promotion_gates": {
+      "pipeline-library": {
+        "apis": [
+          "StorePipeline",
+          "LoadGraphicsPipeline",
+          "LoadComputePipeline",
+          "LoadPipeline",
+          "GetSerializedSize",
+          "Serialize"
+        ],
+        "test_globs": ["tests/d3d12/device/device_spec.cpp"],
+        "test_regex": "PipelineLibraryResultMatchesShaderCacheCapability"
+      }
+    },
     "categories": {
       "device-and-memory": {
         "minimum_percent": 100.0,
