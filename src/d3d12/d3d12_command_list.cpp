@@ -2571,6 +2571,81 @@ public:
     if (!tiled_resource || !tile_region_start_coordinate || !tile_region_size ||
         !buffer)
       return;
+    const auto *tiled = dynamic_cast<Resource *>(tiled_resource);
+    const auto *linear = dynamic_cast<Resource *>(buffer);
+    const auto *tiling = tiled ? tiled->GetTiling() : nullptr;
+    constexpr UINT kDirectionFlags =
+        static_cast<UINT>(
+            D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE) |
+        static_cast<UINT>(
+            D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    constexpr UINT kAllowedFlags =
+        kDirectionFlags |
+        static_cast<UINT>(D3D12_TILE_COPY_FLAG_NO_HAZARD);
+    const UINT flag_bits = static_cast<UINT>(flags);
+    const bool buffer_to_tiled =
+        flag_bits & static_cast<UINT>(
+                        D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+    const bool tiled_to_buffer =
+        flag_bits & static_cast<UINT>(
+                        D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+    if (!tiled || !linear || tiled->GetParentDevice() != device_.ptr() ||
+        linear->GetParentDevice() != device_.ptr() || !tiled->IsReserved() ||
+        !tiling || linear->IsReserved() ||
+        linear->GetResourceDesc().Dimension !=
+            D3D12_RESOURCE_DIMENSION_BUFFER ||
+        (flag_bits & ~kAllowedFlags) || buffer_to_tiled == tiled_to_buffer ||
+        tile_region_start_coordinate->Subresource >=
+            tiling->subresources.size()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    const auto &subresource =
+        tiling->subresources[tile_region_start_coordinate->Subresource];
+    if (subresource.start_tile_index == D3D12_PACKED_TILE ||
+        tile_region_start_coordinate->X >= subresource.width_in_tiles ||
+        tile_region_start_coordinate->Y >= subresource.height_in_tiles ||
+        tile_region_start_coordinate->Z >= subresource.depth_in_tiles) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    UINT64 tile_count = tile_region_size->NumTiles;
+    if (tile_region_size->UseBox) {
+      if (!tile_region_size->Width || !tile_region_size->Height ||
+          !tile_region_size->Depth ||
+          tile_region_size->Width >
+              subresource.width_in_tiles - tile_region_start_coordinate->X ||
+          tile_region_size->Height >
+              subresource.height_in_tiles - tile_region_start_coordinate->Y ||
+          tile_region_size->Depth >
+              subresource.depth_in_tiles - tile_region_start_coordinate->Z) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+      tile_count = UINT64(tile_region_size->Width) *
+                   tile_region_size->Height * tile_region_size->Depth;
+    } else {
+      const UINT64 start_tile =
+          UINT64(subresource.start_tile_index) +
+          (UINT64(tile_region_start_coordinate->Z) *
+               subresource.height_in_tiles +
+           tile_region_start_coordinate->Y) *
+              subresource.width_in_tiles +
+          tile_region_start_coordinate->X;
+      if (!tile_count || start_tile >= tiling->total_tile_count ||
+          tile_count > tiling->total_tile_count - start_tile) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+    }
+    const UINT64 buffer_width = linear->GetResourceDesc().Width;
+    if (buffer_offset > buffer_width ||
+        tile_count >
+            (buffer_width - buffer_offset) /
+                D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_copy_tiles(
             this, tiled_resource, tile_region_start_coordinate,
