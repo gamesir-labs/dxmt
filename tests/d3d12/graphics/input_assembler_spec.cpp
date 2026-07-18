@@ -580,4 +580,176 @@ TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
   }
 }
 
+struct StripCutCase {
+  DXGI_FORMAT format;
+  D3D12_INDEX_BUFFER_STRIP_CUT_VALUE cut_value;
+  const char *name;
+};
+
+class GraphicsStripCutSpec : public ::testing::TestWithParam<StripCutCase> {
+public:
+  static const char *Name(const ::testing::TestParamInfo<StripCutCase> &info) {
+    return info.param.name;
+  }
+
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+
+  D3D12TestContext context_;
+};
+
+TEST_P(GraphicsStripCutSpec, RestartIndexSeparatesTriangleStrips) {
+  const auto vertex = CompileShader(R"(
+    struct Input {
+      float2 position : POSITION;
+      float4 color : COLOR;
+    };
+    struct Output {
+      float4 position : SV_Position;
+      nointerpolation float4 color : COLOR;
+    };
+    Output main(Input input) {
+      Output output;
+      output.position = float4(input.position, 0.0, 1.0);
+      output.color = input.color;
+      return output;
+    })",
+                                    "vs_5_0");
+  const auto pixel = CompileShader(R"(
+    float4 main(nointerpolation float4 color : COLOR) : SV_Target {
+      return color;
+    })",
+                                   "ps_5_0");
+  ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const D3D12_INPUT_ELEMENT_DESC inputs[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
+       D3D12_APPEND_ALIGNED_ELEMENT,
+       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+  };
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root.get();
+  desc.VS = {vertex.bytecode->GetBufferPointer(),
+             vertex.bytecode->GetBufferSize()};
+  desc.PS = {pixel.bytecode->GetBufferPointer(),
+             pixel.bytecode->GetBufferSize()};
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.InputLayout = {inputs, 2};
+  desc.IBStripCutValue = GetParam().cut_value;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_EQ(context_.device()->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(pipeline.put())),
+            S_OK);
+
+  struct Vertex {
+    std::array<float, 2> position;
+    std::array<float, 4> color;
+  };
+  constexpr std::array<Vertex, 8> vertices = {{
+      {{-1.0f, -1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+      {{-1.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+      {{-0.25f, -1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+      {{-0.25f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
+      {{0.25f, -1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+      {{0.25f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+      {{1.0f, -1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+      {{1.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+  }};
+  auto vertex_buffer = context_.CreateUploadBuffer(
+      sizeof(vertices), vertices.data(), sizeof(vertices));
+  ASSERT_TRUE(vertex_buffer);
+  const D3D12_VERTEX_BUFFER_VIEW vertex_view = {
+      vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+
+  std::vector<std::uint8_t> index_bytes;
+  if (GetParam().format == DXGI_FORMAT_R16_UINT) {
+    constexpr std::array<std::uint16_t, 9> indices = {
+        0, 1, 2, 3, UINT16_MAX, 4, 5, 6, 7};
+    index_bytes.resize(sizeof(indices));
+    std::memcpy(index_bytes.data(), indices.data(), sizeof(indices));
+  } else {
+    constexpr std::array<std::uint32_t, 9> indices = {
+        0, 1, 2, 3, UINT32_MAX, 4, 5, 6, 7};
+    index_bytes.resize(sizeof(indices));
+    std::memcpy(index_bytes.data(), indices.data(), sizeof(indices));
+  }
+  auto index_buffer = context_.CreateUploadBuffer(
+      index_bytes.size(), index_bytes.data(), index_bytes.size());
+  ASSERT_TRUE(index_buffer);
+  const D3D12_INDEX_BUFFER_VIEW index_view = {
+      index_buffer->GetGPUVirtualAddress(),
+      static_cast<UINT>(index_bytes.size()), GetParam().format};
+
+  constexpr UINT kSize = 8;
+  auto target =
+      context_.CreateTexture2D(kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(rtv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  constexpr FLOAT clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  context_.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetVertexBuffers(0, 1, &vertex_view);
+  context_.list()->IASetIndexBuffer(&index_view);
+  context_.list()->IASetPrimitiveTopology(
+      D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+  const D3D12_VIEWPORT viewport = {0, 0, float(kSize), float(kSize), 0, 1};
+  const D3D12_RECT scissor = {0, 0, kSize, kSize};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawIndexedInstanced(9, 1, 0, 0, 0);
+  D3D12TestContext::Transition(context_.list(), target.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      std::uint32_t value = 0;
+      std::memcpy(&value,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(value),
+                  sizeof(value));
+      const std::uint32_t expected =
+          x < 3 ? 0xff0000ffu : x > 4 ? 0xff00ff00u : 0xff000000u;
+      EXPECT_TRUE(ColorsMatch(value, expected, 0))
+          << "pixel (" << x << ", " << y << ") was 0x" << std::hex << value;
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    IndexFormats, GraphicsStripCutSpec,
+    ::testing::Values(
+        StripCutCase{DXGI_FORMAT_R16_UINT,
+                     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, "Uint16"},
+        StripCutCase{DXGI_FORMAT_R32_UINT,
+                     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF, "Uint32"}),
+    GraphicsStripCutSpec::Name);
+
 } // namespace
