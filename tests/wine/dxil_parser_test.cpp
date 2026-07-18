@@ -927,6 +927,61 @@ TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   EXPECT_EQ(info.resources[0].resource_flags, 8u);
 }
 
+TEST(DxilPipelineStateValidation, ParsesRuntimeInfoVersionsAndLegacyBindings) {
+  using namespace dxmt::dxil;
+  constexpr size_t runtime_offset = sizeof(uint32_t);
+  constexpr size_t resource_count_offset = runtime_offset + kPsvRuntimeInfo4Size;
+  constexpr size_t resource_stride_offset = resource_count_offset + sizeof(uint32_t);
+  constexpr size_t resource_offset = resource_stride_offset + sizeof(uint32_t);
+  constexpr size_t string_size_offset = resource_offset + kPsvResourceBindInfo0Size;
+  constexpr size_t string_offset = string_size_offset + sizeof(uint32_t);
+  constexpr size_t semantic_count_offset = string_offset + 8;
+  std::vector<uint8_t> bytes(semantic_count_offset + sizeof(uint32_t));
+  Store<uint32_t>(bytes, 0, kPsvRuntimeInfo4Size);
+  bytes[runtime_offset + 24] = 5;
+  Store<uint32_t>(bytes, runtime_offset + 36, 8u);
+  Store<uint32_t>(bytes, runtime_offset + 40, 4u);
+  Store<uint32_t>(bytes, runtime_offset + 44, 2u);
+  Store<uint32_t>(bytes, runtime_offset + 48, 0u);
+  Store<uint32_t>(bytes, runtime_offset + 52, 1024u);
+  Store<uint32_t>(bytes, resource_count_offset, 1u);
+  Store<uint32_t>(bytes, resource_stride_offset, kPsvResourceBindInfo0Size);
+  Store<uint32_t>(bytes, resource_offset + 0, 3u);
+  Store<uint32_t>(bytes, resource_offset + 4, 4u);
+  Store<uint32_t>(bytes, resource_offset + 8, 5u);
+  Store<uint32_t>(bytes, resource_offset + 12, 6u);
+  Store<uint32_t>(bytes, string_size_offset, 8u);
+  std::memcpy(bytes.data() + string_offset, "main\0\0\0", 8);
+  Store<uint32_t>(bytes, semantic_count_offset, 0u);
+
+  PipelineStateValidationInfo info;
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_TRUE(info.has_runtime_info_1);
+  EXPECT_TRUE(info.has_runtime_info_2);
+  EXPECT_TRUE(info.has_runtime_info_3);
+  EXPECT_TRUE(info.has_runtime_info_4);
+  EXPECT_EQ(info.shader_stage, 5u);
+  EXPECT_EQ(info.num_threads_x, 8u);
+  EXPECT_EQ(info.num_threads_y, 4u);
+  EXPECT_EQ(info.num_threads_z, 2u);
+  EXPECT_EQ(info.entry_function_name, "main");
+  EXPECT_EQ(info.num_bytes_group_shared_memory, 1024u);
+  ASSERT_EQ(info.resources.size(), 1u);
+  EXPECT_EQ(info.resources[0].resource_type, 3u);
+  EXPECT_EQ(info.resources[0].space, 4u);
+  EXPECT_EQ(info.resources[0].lower_bound, 5u);
+  EXPECT_EQ(info.resources[0].upper_bound, 6u);
+  EXPECT_EQ(info.resources[0].resource_kind, 0u);
+  EXPECT_EQ(info.resources[0].resource_flags, 0u);
+
+  Store<uint32_t>(bytes, runtime_offset + 48, 100u);
+  EXPECT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::InvalidPipelineStateValidation);
+}
+
 TEST(DxilPipelineStateValidation, RejectsMalformedVariableLengthSections) {
   using namespace dxmt::dxil;
   PipelineStateValidationInfo info;
