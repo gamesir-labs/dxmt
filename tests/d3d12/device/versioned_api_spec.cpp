@@ -202,6 +202,31 @@ TEST_F(VersionedApiSpec, CreateHeap1WithoutSessionBacksPlacedResource) {
   WritePatternAndExpectReadback(context_, resource.get());
 }
 
+TEST_F(VersionedApiSpec, HeapCreationCapabilityProbesMatchBaseApi) {
+  auto device4 = QueryDevice<ID3D12Device4>();
+  ASSERT_TRUE(device4);
+  D3D12_HEAP_DESC desc = {};
+  desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Properties = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+  desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+
+  EXPECT_EQ(context_.device()->CreateHeap(
+                &desc, __uuidof(ID3D12Heap), nullptr),
+            S_FALSE);
+  EXPECT_EQ(device4->CreateHeap1(
+                &desc, nullptr, __uuidof(ID3D12Heap), nullptr),
+            S_FALSE);
+
+  desc.SizeInBytes = 0;
+  EXPECT_EQ(context_.device()->CreateHeap(
+                &desc, __uuidof(ID3D12Heap), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(device4->CreateHeap1(
+                &desc, nullptr, __uuidof(ID3D12Heap), nullptr),
+            E_INVALIDARG);
+}
+
 TEST_F(VersionedApiSpec,
        CreateReservedResource1WithoutSessionMatchesBaseCapability) {
   auto device4 = QueryDevice<ID3D12Device4>();

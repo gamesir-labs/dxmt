@@ -4502,13 +4502,13 @@ public:
         dxmt::perf::FrameTimeBucket::CreateHeap);
     BeginDeviceCall("CreateHeap");
     InitReturnPtr(heap);
+    if (!IsValidHeapDesc(desc))
+      return WARN_E_INVALIDARG(__func__);
     if (!heap)
-      return E_POINTER;
+      return S_FALSE;
     if (ShouldInjectCreationFailure("DXMT_TEST_FAIL_HEAP_CREATION_AT",
                                     g_test_heap_creation_occurrence))
       return E_OUTOFMEMORY;
-    if (!IsValidHeapDesc(desc))
-      return WARN_E_INVALIDARG(__func__);
     if (ShouldInjectCreationFailure(
             "DXMT_TEST_FAIL_METAL_HEAP_CREATION_AT",
             g_test_metal_heap_creation_occurrence)) {
