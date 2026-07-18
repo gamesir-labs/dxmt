@@ -2878,6 +2878,11 @@ ParseResourceDef(const BlobPart &part, ResourceDefInfo &info) {
   if (creator_offset && !ReadString(data, creator_offset, info.creator))
     return ParseStatus::InvalidResourceDef;
 
+  if (info.constant_buffer_count &&
+      (info.constant_buffer_offset < kResourceDefHeaderSize ||
+       (info.constant_buffer_offset & 3)))
+    return ParseStatus::InvalidResourceDef;
+
   size_t cbuffers_end = 0;
   if (!CheckedEnd(info.constant_buffer_offset,
                   size_t(info.constant_buffer_count) *
@@ -2892,10 +2897,20 @@ ParseResourceDef(const BlobPart &part, ResourceDefInfo &info) {
           ? kResourceDefResourceBindingExtendedSize
           : kResourceDefResourceBindingSize;
 
+  if (info.bound_resource_count &&
+      (info.bound_resource_offset < kResourceDefHeaderSize ||
+       (info.bound_resource_offset & 3)))
+    return ParseStatus::InvalidResourceDef;
+
   size_t resources_end = 0;
   if (!CheckedEnd(info.bound_resource_offset,
                   size_t(info.bound_resource_count) * resource_stride,
                   data.size(), resources_end))
+    return ParseStatus::InvalidResourceDef;
+
+  if (info.constant_buffer_count && info.bound_resource_count &&
+      info.constant_buffer_offset < resources_end &&
+      info.bound_resource_offset < cbuffers_end)
     return ParseStatus::InvalidResourceDef;
 
   info.constant_buffers.reserve(info.constant_buffer_count);

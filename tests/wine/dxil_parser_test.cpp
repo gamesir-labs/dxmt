@@ -660,3 +660,255 @@ TEST(DxilPipelineStateValidation, RejectsMalformedVariableLengthSections) {
                   kPsvSignatureElement0Size);
   expect_invalid("truncated signature array", bytes);
 }
+
+TEST(DxilSourceInfo, ParsesAlignedSections) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> bytes(kSourceInfoHeaderSize + 12 + 8);
+  Store<uint32_t>(bytes, 0, bytes.size());
+  Store<uint16_t>(bytes, 4, 3u);
+  Store<uint16_t>(bytes, 6, 2u);
+  Store<uint32_t>(bytes, kSourceInfoHeaderSize, 12u);
+  Store<uint16_t>(bytes, kSourceInfoHeaderSize + 4, 4u);
+  Store<uint16_t>(bytes, kSourceInfoHeaderSize + 6, 5u);
+  bytes[kSourceInfoHeaderSize + kSourceInfoSectionHeaderSize + 0] = 10;
+  bytes[kSourceInfoHeaderSize + kSourceInfoSectionHeaderSize + 1] = 11;
+  bytes[kSourceInfoHeaderSize + kSourceInfoSectionHeaderSize + 2] = 12;
+  bytes[kSourceInfoHeaderSize + kSourceInfoSectionHeaderSize + 3] = 13;
+  Store<uint32_t>(bytes, kSourceInfoHeaderSize + 12, 8u);
+  Store<uint16_t>(bytes, kSourceInfoHeaderSize + 16, 6u);
+  Store<uint16_t>(bytes, kSourceInfoHeaderSize + 18, 7u);
+
+  SourceInfo info;
+  ASSERT_EQ(ParseSourceInfo(Part(fourcc::ShaderSourceInfo, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.aligned_size, bytes.size());
+  EXPECT_EQ(info.flags, 3u);
+  ASSERT_EQ(info.sections.size(), 2u);
+  EXPECT_EQ(info.sections[0].flags, 4u);
+  EXPECT_EQ(info.sections[0].type, 5u);
+  EXPECT_TRUE(std::equal(info.sections[0].data.begin(),
+                         info.sections[0].data.end(),
+                         std::array<uint8_t, 4>{10, 11, 12, 13}.begin()));
+  EXPECT_EQ(info.sections[1].flags, 6u);
+  EXPECT_EQ(info.sections[1].type, 7u);
+  EXPECT_TRUE(info.sections[1].data.empty());
+}
+
+TEST(DxilSourceInfo, RejectsMalformedSectionBounds) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> valid(kSourceInfoHeaderSize +
+                             kSourceInfoSectionHeaderSize);
+  Store<uint32_t>(valid, 0, valid.size());
+  Store<uint16_t>(valid, 6, 1u);
+  Store<uint32_t>(valid, kSourceInfoHeaderSize,
+                  kSourceInfoSectionHeaderSize);
+
+  SourceInfo info;
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  std::vector<uint8_t> bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParseSourceInfo(Part(fourcc::ShaderSourceInfo, bytes), info),
+              ParseStatus::InvalidSourceInfo);
+  };
+
+  auto malformed = valid;
+  Store<uint32_t>(malformed, 0, kSourceInfoHeaderSize - 1);
+  expect_invalid("outer size before header", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 0, valid.size() - 2);
+  expect_invalid("unaligned outer size", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 0, valid.size() + 4);
+  expect_invalid("outer size past payload", malformed);
+
+  malformed = valid;
+  Store<uint16_t>(malformed, 6, 2u);
+  expect_invalid("truncated section table", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, kSourceInfoHeaderSize,
+                  kSourceInfoSectionHeaderSize - 4);
+  expect_invalid("section size before header", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, kSourceInfoHeaderSize,
+                  kSourceInfoSectionHeaderSize + 2);
+  expect_invalid("unaligned section size", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, kSourceInfoHeaderSize,
+                  kSourceInfoSectionHeaderSize + 4);
+  expect_invalid("section past outer payload", malformed);
+}
+
+TEST(DxilAuxiliaryParts, ParsesPdbPayloadAndStatistics) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> pdb_bytes(kShaderPdbInfoHeaderSize + 3);
+  Store<uint16_t>(pdb_bytes, 0, 1u);
+  Store<uint16_t>(pdb_bytes, 2, 2u);
+  Store<uint32_t>(pdb_bytes, 4, 3u);
+  Store<uint32_t>(pdb_bytes, 8, 10u);
+  pdb_bytes[12] = 7;
+  pdb_bytes[13] = 8;
+  pdb_bytes[14] = 9;
+
+  ShaderPdbInfo pdb;
+  ASSERT_EQ(ParseShaderPdbInfo(Part(fourcc::ShaderPdbInfo, pdb_bytes), pdb),
+            ParseStatus::Ok);
+  EXPECT_EQ(pdb.version, 1u);
+  EXPECT_EQ(pdb.compression_type, 2u);
+  EXPECT_EQ(pdb.uncompressed_size_in_bytes, 10u);
+  EXPECT_TRUE(std::equal(pdb.payload.begin(), pdb.payload.end(),
+                         std::array<uint8_t, 3>{7, 8, 9}.begin()));
+
+  Store<uint32_t>(pdb_bytes, 4, 4u);
+  EXPECT_EQ(ParseShaderPdbInfo(Part(fourcc::ShaderPdbInfo, pdb_bytes), pdb),
+            ParseStatus::InvalidShaderPdbInfo);
+
+  std::vector<uint8_t> statistics(2 * sizeof(uint32_t));
+  Store<uint32_t>(statistics, 0, 0x12345678u);
+  Store<uint32_t>(statistics, 4, 0x90abcdefu);
+  ShaderStatisticsInfo stats;
+  ASSERT_EQ(
+      ParseShaderStatistics(Part(fourcc::ShaderStatistics, statistics), stats),
+      ParseStatus::Ok);
+  EXPECT_EQ(stats.values,
+            (std::vector<uint32_t>{0x12345678u, 0x90abcdefu}));
+
+  statistics.push_back(0);
+  EXPECT_EQ(
+      ParseShaderStatistics(Part(fourcc::ShaderStatistics, statistics), stats),
+      ParseStatus::InvalidShaderStatistics);
+}
+
+TEST(DxilResourceDef, ParsesLegacyAndExtendedResourceRecords) {
+  using namespace dxmt::dxil;
+  constexpr size_t cbuffer_offset = kResourceDefHeaderSize;
+  constexpr size_t resource_offset =
+      cbuffer_offset + kResourceDefConstantBufferSize;
+  constexpr size_t creator_offset =
+      resource_offset + kResourceDefResourceBindingExtendedSize;
+  constexpr size_t cbuffer_name_offset = creator_offset + 4;
+  constexpr size_t resource_name_offset = cbuffer_name_offset + 8;
+  std::vector<uint8_t> bytes(resource_name_offset + 9);
+  Store<uint32_t>(bytes, 0, 1u);
+  Store<uint32_t>(bytes, 4, cbuffer_offset);
+  Store<uint32_t>(bytes, 8, 1u);
+  Store<uint32_t>(bytes, 12, resource_offset);
+  Store<uint32_t>(bytes, 16, 0x51u);
+  Store<uint32_t>(bytes, 20, 42u);
+  Store<uint32_t>(bytes, 24, creator_offset);
+  Store<uint32_t>(bytes, cbuffer_offset + 0, cbuffer_name_offset);
+  Store<uint32_t>(bytes, cbuffer_offset + 4, 2u);
+  Store<uint32_t>(bytes, cbuffer_offset + 8, 200u);
+  Store<uint32_t>(bytes, cbuffer_offset + 12, 64u);
+  Store<uint32_t>(bytes, cbuffer_offset + 16, 5u);
+  Store<uint32_t>(bytes, cbuffer_offset + 20, 6u);
+  Store<uint32_t>(bytes, resource_offset + 0, resource_name_offset);
+  Store<uint32_t>(bytes, resource_offset + 4, 7u);
+  Store<uint32_t>(bytes, resource_offset + 8, 8u);
+  Store<uint32_t>(bytes, resource_offset + 12, 9u);
+  Store<uint32_t>(bytes, resource_offset + 16, 10u);
+  Store<uint32_t>(bytes, resource_offset + 20, 11u);
+  Store<uint32_t>(bytes, resource_offset + 24, 12u);
+  Store<uint32_t>(bytes, resource_offset + 28, 13u);
+  Store<uint32_t>(bytes, resource_offset + 32, 14u);
+  Store<uint32_t>(bytes, resource_offset + 36, 15u);
+  std::memcpy(bytes.data() + creator_offset, "dxc", 4);
+  std::memcpy(bytes.data() + cbuffer_name_offset, "Globals", 8);
+  std::memcpy(bytes.data() + resource_name_offset, "texture0", 9);
+
+  ResourceDefInfo info;
+  ASSERT_EQ(ParseResourceDef(Part(fourcc::ResourceDef, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.creator, "dxc");
+  ASSERT_EQ(info.constant_buffers.size(), 1u);
+  EXPECT_EQ(info.constant_buffers[0].name, "Globals");
+  EXPECT_EQ(info.constant_buffers[0].variable_count, 2u);
+  EXPECT_EQ(info.constant_buffers[0].variable_offset, 200u);
+  EXPECT_EQ(info.constant_buffers[0].size, 64u);
+  EXPECT_EQ(info.constant_buffers[0].flags, 5u);
+  EXPECT_EQ(info.constant_buffers[0].type, 6u);
+  ASSERT_EQ(info.resources.size(), 1u);
+  EXPECT_EQ(info.resources[0].name, "texture0");
+  EXPECT_EQ(info.resources[0].type, 7u);
+  EXPECT_EQ(info.resources[0].return_type, 8u);
+  EXPECT_EQ(info.resources[0].dimension, 9u);
+  EXPECT_EQ(info.resources[0].num_samples, 10u);
+  EXPECT_EQ(info.resources[0].bind_point, 11u);
+  EXPECT_EQ(info.resources[0].bind_count, 12u);
+  EXPECT_EQ(info.resources[0].flags, 13u);
+  EXPECT_EQ(info.resources[0].space, 14u);
+  EXPECT_EQ(info.resources[0].id, 15u);
+
+  Store<uint32_t>(bytes, 16, 0x50u);
+  ASSERT_EQ(ParseResourceDef(Part(fourcc::ResourceDef, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.resources.size(), 1u);
+  EXPECT_EQ(info.resources[0].space, 0u);
+  EXPECT_EQ(info.resources[0].id, 0u);
+}
+
+TEST(DxilResourceDef, RejectsMalformedTableAndStringRanges) {
+  using namespace dxmt::dxil;
+  constexpr size_t cbuffer_offset = kResourceDefHeaderSize;
+  constexpr size_t resource_offset =
+      cbuffer_offset + kResourceDefConstantBufferSize;
+  std::vector<uint8_t> valid(resource_offset +
+                             kResourceDefResourceBindingExtendedSize + 4);
+  Store<uint32_t>(valid, 0, 1u);
+  Store<uint32_t>(valid, 4, cbuffer_offset);
+  Store<uint32_t>(valid, 8, 1u);
+  Store<uint32_t>(valid, 12, resource_offset);
+  Store<uint32_t>(valid, 16, 0x51u);
+
+  ResourceDefInfo info;
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  std::vector<uint8_t> bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParseResourceDef(Part(fourcc::ResourceDef, bytes), info),
+              ParseStatus::InvalidResourceDef);
+  };
+
+  auto malformed = valid;
+  Store<uint32_t>(malformed, 24, malformed.size());
+  expect_invalid("unterminated creator", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 0, std::numeric_limits<uint32_t>::max());
+  expect_invalid("constant buffer count overflow", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 8, std::numeric_limits<uint32_t>::max());
+  expect_invalid("resource count overflow", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 4, 0u);
+  expect_invalid("constant buffer offset before header", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 4, cbuffer_offset + 1);
+  expect_invalid("unaligned constant buffer offset", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 12, 0u);
+  expect_invalid("resource offset before header", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 12, resource_offset + 1);
+  expect_invalid("unaligned resource offset", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 12, cbuffer_offset + 4);
+  expect_invalid("overlapping tables", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, cbuffer_offset, malformed.size());
+  expect_invalid("unterminated constant buffer name", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, resource_offset, malformed.size());
+  expect_invalid("unterminated resource name", malformed);
+}
