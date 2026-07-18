@@ -376,4 +376,167 @@ TEST(ShaderBinary, DecodesEverySynchronizationScope) {
   EXPECT_FALSE(instruction.m_SyncFlags.bUnorderedAccessViewMemoryGroup);
 }
 
+TEST(ShaderBinary, DecodesChainedResourceExtensionTokens) {
+  constexpr std::array<CShaderToken, 5> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D11_SB_COMPUTE_SHADER,
+                                                      5, 0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(5),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3) |
+          ENCODE_D3D10_SB_OPCODE_EXTENDED(true),
+      ENCODE_D3D10_SB_EXTENDED_OPCODE_TYPE(
+          D3D11_SB_EXTENDED_OPCODE_RESOURCE_DIM) |
+          ENCODE_D3D11_SB_EXTENDED_RESOURCE_DIMENSION(
+              D3D11_SB_RESOURCE_DIMENSION_STRUCTURED_BUFFER) |
+          ENCODE_D3D11_SB_EXTENDED_RESOURCE_DIMENSION_STRUCTURE_STRIDE(48) |
+          ENCODE_D3D10_SB_OPCODE_EXTENDED(true),
+      ENCODE_D3D10_SB_EXTENDED_OPCODE_TYPE(
+          D3D11_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE) |
+          ENCODE_D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE(
+              D3D10_SB_RETURN_TYPE_UNORM, 0) |
+          ENCODE_D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE(
+              D3D10_SB_RETURN_TYPE_SNORM, 1) |
+          ENCODE_D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE(
+              D3D10_SB_RETURN_TYPE_SINT, 2) |
+          ENCODE_D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE(
+              D3D11_SB_RETURN_TYPE_DOUBLE, 3),
+  };
+
+  CShaderCodeParser parser(shader.data());
+  CInstruction instruction;
+  parser.ParseInstruction(&instruction);
+
+  EXPECT_EQ(instruction.m_ExtendedOpCodeCount, 2u);
+  EXPECT_EQ(instruction.m_OpCodeEx[0], D3D11_SB_EXTENDED_OPCODE_RESOURCE_DIM);
+  EXPECT_EQ(instruction.m_OpCodeEx[1],
+            D3D11_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE);
+  EXPECT_EQ(instruction.m_ResourceDimEx,
+            D3D11_SB_RESOURCE_DIMENSION_STRUCTURED_BUFFER);
+  EXPECT_EQ(instruction.m_ResourceDimStructureStrideEx, 48u);
+  EXPECT_EQ(instruction.m_ResourceReturnTypeEx[0],
+            D3D10_SB_RETURN_TYPE_UNORM);
+  EXPECT_EQ(instruction.m_ResourceReturnTypeEx[1],
+            D3D10_SB_RETURN_TYPE_SNORM);
+  EXPECT_EQ(instruction.m_ResourceReturnTypeEx[2],
+            D3D10_SB_RETURN_TYPE_SINT);
+  EXPECT_EQ(instruction.m_ResourceReturnTypeEx[3],
+            D3D11_SB_RETURN_TYPE_DOUBLE);
+  EXPECT_TRUE(parser.EndOfShader());
+}
+
+TEST(ShaderBinary, DecodesInstructionTestsAndReturnTypes) {
+  constexpr CShaderToken immediate =
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT) |
+      ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+  constexpr std::array<D3D10_SB_OPCODE_TYPE, 5> conditional_opcodes = {
+      D3D10_SB_OPCODE_IF, D3D10_SB_OPCODE_BREAKC, D3D10_SB_OPCODE_CONTINUEC,
+      D3D10_SB_OPCODE_RETC, D3D10_SB_OPCODE_DISCARD,
+  };
+
+  for (const auto opcode : conditional_opcodes) {
+    const std::array<CShaderToken, 5> shader = {
+        ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER,
+                                                        5, 0),
+        ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(5),
+        static_cast<CShaderToken>(
+            ENCODE_D3D10_SB_OPCODE_TYPE(opcode) |
+            ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3) |
+            ENCODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(
+                D3D10_SB_INSTRUCTION_TEST_NONZERO)),
+        immediate,
+        17,
+    };
+    CShaderCodeParser parser(shader.data());
+    CInstruction instruction;
+    parser.ParseInstruction(&instruction);
+    EXPECT_EQ(instruction.OpCode(), opcode);
+    EXPECT_EQ(instruction.Test(), D3D10_SB_INSTRUCTION_TEST_NONZERO);
+    EXPECT_EQ(instruction.Operand(0).Imm32(), 17u);
+  }
+
+  constexpr std::array<CShaderToken, 7> callc_shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
+                                                      0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(7),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_CALLC) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5) |
+          ENCODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(
+              D3D10_SB_INSTRUCTION_TEST_ZERO),
+      immediate,
+      1,
+      immediate,
+      2,
+  };
+  CShaderCodeParser callc_parser(callc_shader.data());
+  CInstruction callc;
+  callc_parser.ParseInstruction(&callc);
+  EXPECT_EQ(callc.Test(), D3D10_SB_INSTRUCTION_TEST_ZERO);
+  EXPECT_EQ(callc.Operand(0).Imm32(), 1u);
+  EXPECT_EQ(callc.Operand(1).Imm32(), 2u);
+
+  constexpr std::array<CShaderToken, 9> resinfo_shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
+                                                      0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(9),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RESINFO) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7) |
+          ENCODE_D3D10_SB_RESINFO_INSTRUCTION_RETURN_TYPE(
+              D3D10_SB_RESINFO_INSTRUCTION_RETURN_UINT),
+      immediate,
+      3,
+      immediate,
+      4,
+      immediate,
+      5,
+  };
+  CShaderCodeParser resinfo_parser(resinfo_shader.data());
+  CInstruction resinfo;
+  resinfo_parser.ParseInstruction(&resinfo);
+  EXPECT_EQ(resinfo.m_ResInfoReturnType,
+            D3D10_SB_RESINFO_INSTRUCTION_RETURN_UINT);
+
+  constexpr std::array<CShaderToken, 7> sample_info_shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
+                                                      0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(7),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_1_SB_OPCODE_SAMPLE_INFO) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5) |
+          ENCODE_D3D10_SB_INSTRUCTION_RETURN_TYPE(
+              D3D10_SB_INSTRUCTION_RETURN_UINT),
+      immediate,
+      6,
+      immediate,
+      7,
+  };
+  CShaderCodeParser sample_info_parser(sample_info_shader.data());
+  CInstruction sample_info;
+  sample_info_parser.ParseInstruction(&sample_info);
+  EXPECT_EQ(sample_info.m_InstructionReturnType,
+            D3D10_SB_INSTRUCTION_RETURN_UINT);
+}
+
+TEST(ShaderBinary, RepositionsTheInstructionCursor) {
+  constexpr std::array<CShaderToken, 4> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_VERTEX_SHADER,
+                                                      4, 1),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(4),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_NOP) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1),
+  };
+  CShaderCodeParser parser;
+  parser.SetShader(shader.data());
+  parser.SetCurrentTokenOffset(3);
+
+  EXPECT_EQ(parser.CurrentTokenOffset(), 3u);
+  EXPECT_EQ(parser.ShaderType(), D3D10_SB_VERTEX_SHADER);
+  EXPECT_EQ(parser.ShaderMajorVersion(), 4u);
+  EXPECT_EQ(parser.ShaderMinorVersion(), 1u);
+  CInstruction instruction;
+  parser.ParseInstruction(&instruction);
+  EXPECT_EQ(instruction.OpCode(), D3D10_SB_OPCODE_RET);
+  EXPECT_TRUE(parser.EndOfShader());
+}
+
 } // namespace
