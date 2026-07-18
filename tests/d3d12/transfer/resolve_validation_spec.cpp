@@ -50,6 +50,9 @@ enum class InvalidResolveCase {
   DestinationXOutOfRange,
   DestinationYOutOfRange,
   ForeignSource,
+  ForeignDestination,
+  ForeignRegionSource,
+  ForeignRegionDestination,
 };
 
 class ResolveValidationSpec
@@ -178,9 +181,59 @@ TEST_P(ResolveValidationSpec, InvalidResolveFailsCommandListClose) {
                                         DXGI_FORMAT_R8G8B8A8_UNORM);
     break;
   }
+  case InvalidResolveCase::ForeignDestination: {
+    auto foreign_device = CreateIsolatedD3D12Device();
+    ASSERT_TRUE(foreign_device);
+    auto foreign_destination = CreateResolveTexture(
+        foreign_device.get(), 8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    ASSERT_TRUE(foreign_destination);
+    context_.list()->ResolveSubresource(
+        foreign_destination.get(), 0, source.get(), 0,
+        DXGI_FORMAT_R8G8B8A8_UNORM);
+    break;
+  }
+  case InvalidResolveCase::ForeignRegionSource: {
+    auto foreign_device = CreateIsolatedD3D12Device();
+    ASSERT_TRUE(foreign_device);
+    auto foreign_source = CreateResolveTexture(
+        foreign_device.get(), 8, 8, 4, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    ASSERT_TRUE(foreign_source);
+    list1->ResolveSubresourceRegion(
+        destination.get(), 0, 0, 0, foreign_source.get(), 0, &rect,
+        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOLVE_MODE_AVERAGE);
+    break;
+  }
+  case InvalidResolveCase::ForeignRegionDestination: {
+    auto foreign_device = CreateIsolatedD3D12Device();
+    ASSERT_TRUE(foreign_device);
+    auto foreign_destination = CreateResolveTexture(
+        foreign_device.get(), 8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    ASSERT_TRUE(foreign_destination);
+    list1->ResolveSubresourceRegion(
+        foreign_destination.get(), 0, 0, 0, source.get(), 0, &rect,
+        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOLVE_MODE_AVERAGE);
+    break;
+  }
   }
 
   EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  recovery_list->ResolveSubresource(destination.get(), 0, source.get(), 0,
+                                    DXGI_FORMAT_R8G8B8A8_UNORM);
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 std::string InvalidResolveCaseName(
@@ -220,6 +273,12 @@ std::string InvalidResolveCaseName(
     return "DestinationYOutOfRange";
   case InvalidResolveCase::ForeignSource:
     return "ForeignSource";
+  case InvalidResolveCase::ForeignDestination:
+    return "ForeignDestination";
+  case InvalidResolveCase::ForeignRegionSource:
+    return "ForeignRegionSource";
+  case InvalidResolveCase::ForeignRegionDestination:
+    return "ForeignRegionDestination";
   }
   return "Unknown";
 }
@@ -241,7 +300,10 @@ INSTANTIATE_TEST_SUITE_P(
         InvalidResolveCase::SourceRectOutOfRange,
         InvalidResolveCase::DestinationXOutOfRange,
         InvalidResolveCase::DestinationYOutOfRange,
-        InvalidResolveCase::ForeignSource),
+        InvalidResolveCase::ForeignSource,
+        InvalidResolveCase::ForeignDestination,
+        InvalidResolveCase::ForeignRegionSource,
+        InvalidResolveCase::ForeignRegionDestination),
     InvalidResolveCaseName);
 
 } // namespace
