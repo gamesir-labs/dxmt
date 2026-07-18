@@ -210,6 +210,68 @@ TEST(ShaderBinary, ParsesExtendedRegisterOperandWithoutChangingParserState) {
   EXPECT_TRUE(operand.m_Nonuniform);
 }
 
+TEST(ShaderBinary, RejectsInvalidOperandEncodings) {
+  CShaderCodeParser parser;
+  COperandIndex index;
+  EXPECT_ANY_THROW(parser.ParseIndex(
+      &index, static_cast<D3D10_SB_OPERAND_INDEX_REPRESENTATION>(3)));
+
+  constexpr std::array<CShaderToken, 1> invalid_component_selection = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_4_COMPONENT) |
+      ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(
+          static_cast<D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE>(3)) |
+      ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP) |
+      ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(
+          D3D10_SB_OPERAND_INDEX_0D),
+  };
+  COperand operand;
+  EXPECT_ANY_THROW(parser.ParseOperandAt(
+      &operand, invalid_component_selection.data(),
+      invalid_component_selection.data() + invalid_component_selection.size()));
+}
+
+TEST(ShaderBinary, IgnoresUnknownOperandAndInstructionExtensions) {
+  constexpr std::array<CShaderToken, 2> operand_tokens = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_0_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(
+              D3D10_SB_OPERAND_INDEX_0D) |
+          ENCODE_D3D10_SB_OPERAND_EXTENDED(true),
+      static_cast<CShaderToken>(3),
+  };
+  CShaderCodeParser parser;
+  COperand operand;
+  const auto *end = parser.ParseOperandAt(
+      &operand, operand_tokens.data(),
+      operand_tokens.data() + operand_tokens.size());
+  EXPECT_EQ(end, operand_tokens.data() + operand_tokens.size());
+  EXPECT_EQ(operand.m_ExtendedOperandType,
+            static_cast<D3D10_SB_EXTENDED_OPERAND_TYPE>(3));
+  EXPECT_EQ(operand.Modifier(), D3D10_SB_OPERAND_MODIFIER_NONE);
+  EXPECT_EQ(operand.m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT);
+
+  constexpr std::array<CShaderToken, 4> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
+                                                      0),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(4),
+      ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(2) |
+          ENCODE_D3D10_SB_OPCODE_EXTENDED(true),
+      ENCODE_D3D10_SB_EXTENDED_OPCODE_TYPE(
+          static_cast<D3D10_SB_EXTENDED_OPCODE_TYPE>(63)),
+  };
+  CShaderCodeParser instruction_parser(shader.data());
+  CInstruction instruction;
+  instruction_parser.ParseInstruction(&instruction);
+  EXPECT_EQ(instruction.m_ExtendedOpCodeCount, 1u);
+  EXPECT_EQ(instruction.m_OpCodeEx[0],
+            static_cast<D3D10_SB_EXTENDED_OPCODE_TYPE>(63));
+  EXPECT_TRUE(instruction_parser.EndOfShader());
+}
+
 TEST(ShaderBinary, ParsesEveryOperandIndexRepresentation) {
   constexpr CShaderToken kNestedIndexableTemp =
       ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
