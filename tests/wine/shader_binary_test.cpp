@@ -230,6 +230,70 @@ TEST(ShaderBinary, ParsesEveryOperandIndexRepresentation) {
             D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
 }
 
+TEST(ShaderBinary, ParsesScalarDoubleAndSwizzledOperands) {
+  CShaderCodeParser parser;
+
+  constexpr std::array<CShaderToken, 2> scalar = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_1_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(
+              D3D10_SB_OPERAND_TYPE_IMMEDIATE32),
+      0xdeadbeef,
+  };
+  COperand scalar_operand;
+  auto *end = parser.ParseOperandAt(&scalar_operand, scalar.data(),
+                                    scalar.data() + scalar.size());
+  EXPECT_EQ(end, scalar.data() + scalar.size());
+  EXPECT_EQ(scalar_operand.NumComponents(), D3D10_SB_OPERAND_1_COMPONENT);
+  EXPECT_EQ(scalar_operand.OperandType(), D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+  EXPECT_EQ(scalar_operand.Imm32(), 0xdeadbeefu);
+
+  constexpr std::array<CShaderToken, 5> doubles = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_4_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(
+              D3D10_SB_OPERAND_TYPE_IMMEDIATE64),
+      0x89abcdef,
+      0x01234567,
+      0x76543210,
+      0xfedcba98,
+  };
+  COperand double_operand;
+  end = parser.ParseOperandAt(&double_operand, doubles.data(),
+                              doubles.data() + doubles.size());
+  EXPECT_EQ(end, doubles.data() + doubles.size());
+  EXPECT_EQ(double_operand.OperandType(), D3D10_SB_OPERAND_TYPE_IMMEDIATE64);
+  EXPECT_EQ(double_operand.m_Value[0], 0x89abcdefu);
+  EXPECT_EQ(double_operand.m_Value[1], 0x01234567u);
+  EXPECT_EQ(double_operand.m_Value[2], 0x76543210u);
+  EXPECT_EQ(double_operand.m_Value[3], 0xfedcba98u);
+
+  constexpr std::array<CShaderToken, 2> swizzled = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_4_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(
+              D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(
+              D3D10_SB_4_COMPONENT_W, D3D10_SB_4_COMPONENT_Z,
+              D3D10_SB_4_COMPONENT_Y, D3D10_SB_4_COMPONENT_X) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(
+              D3D10_SB_OPERAND_INDEX_1D) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+              0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32),
+      9,
+  };
+  COperand swizzled_operand;
+  end = parser.ParseOperandAt(&swizzled_operand, swizzled.data(),
+                              swizzled.data() + swizzled.size());
+  EXPECT_EQ(end, swizzled.data() + swizzled.size());
+  EXPECT_EQ(swizzled_operand.RegIndex(), 9u);
+  EXPECT_EQ(swizzled_operand.SwizzleComponent(0), D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(swizzled_operand.SwizzleComponent(1), D3D10_SB_4_COMPONENT_Z);
+  EXPECT_EQ(swizzled_operand.SwizzleComponent(2), D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(swizzled_operand.SwizzleComponent(3), D3D10_SB_4_COMPONENT_X);
+}
+
 TEST(ShaderBinary, ParsesSignedExtendedSampleOffsets) {
   constexpr std::array<CShaderToken, 4> shader = {
       ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
