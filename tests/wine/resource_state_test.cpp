@@ -220,3 +220,32 @@ TEST(TimestampQuery, TracksSampleLocationAndResolvedValue) {
   EXPECT_TRUE(query->getValue(&value));
   EXPECT_EQ(value, 23u);
 }
+
+TEST(QueryResults, PublishResolvedValuesAcrossThreads) {
+  dxmt::Rc<dxmt::VisibilityResultQuery> visibility(
+      new dxmt::VisibilityResultQuery());
+  dxmt::Rc<dxmt::TimestampQuery> timestamp(new dxmt::TimestampQuery());
+  visibility->begin(40, 0);
+  visibility->end(40, 3);
+
+  std::atomic<bool> reader_started = false;
+  uint64_t visibility_value = 0;
+  uint64_t timestamp_value = 0;
+  std::thread reader([&] {
+    reader_started.store(true, std::memory_order_release);
+    while (!visibility->getValue(&visibility_value))
+      std::this_thread::yield();
+    while (!timestamp->getValue(&timestamp_value))
+      std::this_thread::yield();
+  });
+
+  while (!reader_started.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  const std::array<uint64_t, 3> samples = {2, 3, 5};
+  visibility->issue(40, samples.data(), samples.size());
+  timestamp->issue(0x123456789abcdef0ull);
+  reader.join();
+
+  EXPECT_EQ(visibility_value, 10u);
+  EXPECT_EQ(timestamp_value, 0x123456789abcdef0ull);
+}

@@ -86,17 +86,17 @@ class VisibilityResultQuery {
 public:
   void
   incRef() {
-    refcount_.fetch_add(1u, std::memory_order_acquire);
+    refcount_.fetch_add(1u, std::memory_order_relaxed);
   }
   void
   decRef() {
-    if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
+    if (refcount_.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
       delete this;
   }
 
   void
   begin(uint64_t seqId, unsigned offset) {
-    accumulated_value_ = 0;
+    accumulated_value_.store(0, std::memory_order_relaxed);
     seq_id_begin = seqId;
     occlusion_counter_begin = offset;
     seq_id_end = ~0uLL;
@@ -108,7 +108,7 @@ public:
     seq_id_end = seqId;
     occlusion_counter_end = offset;
     if (seq_id_begin == seq_id_end && occlusion_counter_begin == occlusion_counter_end) {
-      seq_id_issued = seq_id_end;
+      seq_id_issued.store(seq_id_end, std::memory_order_release);
     }
   }
 
@@ -123,17 +123,17 @@ public:
     uint64_t const *start = seqId == seq_id_begin ? readbackBuffer + occlusion_counter_begin : readbackBuffer;
     uint64_t const *end = seqId == seq_id_end ? readbackBuffer + occlusion_counter_end : readbackBuffer + numResults;
     assert(start <= end);
-    while (start != end) {
-      accumulated_value_ += *start;
-      start++;
-    }
-    seq_id_issued = seqId;
+    uint64_t issued_value = 0;
+    while (start != end)
+      issued_value += *start++;
+    accumulated_value_.fetch_add(issued_value, std::memory_order_relaxed);
+    seq_id_issued.store(seqId, std::memory_order_release);
   }
 
   bool
   getValue(uint64_t *value) {
-    if (seq_id_end <= seq_id_issued) {
-      *value = accumulated_value_;
+    if (seq_id_end <= seq_id_issued.load(std::memory_order_acquire)) {
+      *value = accumulated_value_.load(std::memory_order_relaxed);
       return true;
     }
     return false;
@@ -141,21 +141,21 @@ public:
 
   void
   reset() {
-    accumulated_value_ = 0;
+    accumulated_value_.store(0, std::memory_order_relaxed);
     seq_id_begin = ~0uLL;
     occlusion_counter_begin = ~0uLL;
     seq_id_end = ~0uLL;
     occlusion_counter_end = ~0uLL;
-    seq_id_issued = 0;
+    seq_id_issued.store(0, std::memory_order_relaxed);
   };
 
 private:
-  uint64_t accumulated_value_ = 0;
+  std::atomic<uint64_t> accumulated_value_ = {0};
   uint64_t seq_id_begin = ~0uLL;
   uint64_t occlusion_counter_begin = ~0uLL;
   uint64_t seq_id_end = ~0uLL;
   uint64_t occlusion_counter_end = ~0uLL;
-  uint64_t seq_id_issued = 0;
+  std::atomic<uint64_t> seq_id_issued = {0};
   std::atomic<uint32_t> refcount_ = {0u};
 };
 
@@ -209,26 +209,27 @@ public:
 
   void
   incRef() {
-    refcount_.fetch_add(1u, std::memory_order_acquire);
+    refcount_.fetch_add(1u, std::memory_order_relaxed);
   }
   void
   decRef() {
-    if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
+    if (refcount_.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
       delete this;
   }
 
   bool
   getValue(uint64_t *value) {
-    if (cached_value_ == ~0ull)
+    const auto cached_value = cached_value_.load(std::memory_order_acquire);
+    if (cached_value == ~0ull)
       return false;
 
-    *value = cached_value_;
+    *value = cached_value;
     return true;
   }
 
   void
   issue(uint64_t sampled_data) {
-    cached_value_ = sampled_data;
+    cached_value_.store(sampled_data, std::memory_order_release);
   }
 
   uint64_t
@@ -279,7 +280,7 @@ public:
 #endif
 
 private:
-  uint64_t cached_value_ = ~0ull;
+  std::atomic<uint64_t> cached_value_ = {~0ull};
   uint64_t sample_sequence_ = ~0ull;
   uint64_t sample_index_ = ~0ull;
 #if DXMT_DX12_METAL4
