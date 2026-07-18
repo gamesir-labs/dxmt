@@ -16,7 +16,9 @@ namespace {
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::DualSourcePixelShader;
 using dxmt::test::FullscreenVertexShader;
+using dxmt::test::TextureReadback;
 
 class GraphicsOutputMergerSpec : public ::testing::Test {
 protected:
@@ -350,6 +352,71 @@ TEST_F(GraphicsOutputMergerSpec, AppliesIndependentBlendStates) {
   const std::vector formats(2, DXGI_FORMAT_R8G8B8A8_UNORM);
   Run(formats, {kColors[5], kColors[0]}, {kColors[2], kColors[0]},
       {additive, preserve_destination});
+}
+
+// Keep the dual-source fixed-function path out of the concurrent Metal wave.
+DXMT_SERIAL_TEST_F(GraphicsOutputMergerSpec, AppliesDualSourceBlendFactors) {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root_signature_.get();
+  desc.VS = FullscreenVertexShader();
+  desc.PS = DualSourcePixelShader();
+  auto &blend = desc.BlendState.RenderTarget[0];
+  blend.BlendEnable = TRUE;
+  blend.SrcBlend = D3D12_BLEND_SRC1_COLOR;
+  blend.DestBlend = D3D12_BLEND_INV_SRC1_COLOR;
+  blend.BlendOp = D3D12_BLEND_OP_ADD;
+  blend.SrcBlendAlpha = D3D12_BLEND_SRC1_ALPHA;
+  blend.DestBlendAlpha = D3D12_BLEND_INV_SRC1_ALPHA;
+  blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_EQ(context_.device()->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(pipeline.put())),
+            S_OK);
+
+  auto target =
+      context_.CreateTexture2D(kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  // The DXIL shader outputs red as source 0 and 0.25 in every source-1
+  // channel. Blending that over blue exercises all four source-1 factors.
+  constexpr std::array<float, 4> destination = {0.0f, 0.0f, 1.0f, 0.0f};
+  constexpr std::array<float, 4> expected = {0.25f, 0.0f, 0.75f, 0.25f};
+  context_.list()->ClearRenderTargetView(rtv, destination.data(), 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  RecordFullscreenDraw(pipeline.get());
+  D3D12TestContext::Transition(context_.list(), target.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  const auto expected_pixel =
+      ExpectedPixel(DXGI_FORMAT_R8G8B8A8_UNORM, expected);
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      const auto *actual = readback.data.data() + y * readback.row_pitch +
+                           x * expected_pixel.size();
+      EXPECT_EQ(std::vector<std::uint8_t>(actual,
+                                          actual + expected_pixel.size()),
+                expected_pixel)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
 }
 
 TEST_F(GraphicsOutputMergerSpec, LeavesUnwrittenTargetUnchanged) {
