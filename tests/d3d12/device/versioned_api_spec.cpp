@@ -721,14 +721,42 @@ TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
                 nullptr, __uuidof(ID3D12ShaderCacheSession), &output),
             E_INVALIDARG);
   EXPECT_EQ(output, nullptr);
+
+  constexpr auto kinds = static_cast<D3D12_SHADER_CACHE_KIND_FLAGS>(
+      D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER |
+      D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS |
+      D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED |
+      D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED);
+  constexpr std::array valid_controls = {
+      D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
+      D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE,
+      D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR,
+      static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(
+          D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE |
+          D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR),
+      static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(
+          D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE |
+          D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR),
+  };
+  for (const auto control : valid_controls)
+    EXPECT_EQ(device9->ShaderCacheControl(kinds, control), S_OK)
+        << "control=" << control;
+
+  constexpr std::array invalid_controls = {
+      static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(0),
+      static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(
+          D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE |
+          D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE),
+      static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(8),
+  };
+  for (const auto control : invalid_controls)
+    EXPECT_EQ(device9->ShaderCacheControl(kinds, control), E_INVALIDARG)
+        << "control=" << control;
+
+  const auto unknown_kind = static_cast<D3D12_SHADER_CACHE_KIND_FLAGS>(16);
   EXPECT_EQ(device9->ShaderCacheControl(
-                D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
-                D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE),
-            S_OK);
-  EXPECT_EQ(device9->ShaderCacheControl(
-                D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
-                D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE),
-            S_OK);
+                unknown_kind, D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR),
+            E_INVALIDARG);
 }
 
 TEST_F(VersionedApiSpec,

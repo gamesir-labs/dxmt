@@ -5586,6 +5586,21 @@ public:
   HRESULT STDMETHODCALLTYPE
   ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds,
                      D3D12_SHADER_CACHE_CONTROL_FLAGS control) override {
+    constexpr UINT known_kinds =
+        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER |
+        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS |
+        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED |
+        D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED;
+    constexpr UINT known_control = D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE |
+                                   D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE |
+                                   D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR;
+    const UINT kind_bits = static_cast<UINT>(kinds);
+    const UINT control_bits = static_cast<UINT>(control);
+    if ((kind_bits & ~known_kinds) || !control_bits ||
+        (control_bits & ~known_control) ||
+        (control_bits & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE &&
+         control_bits & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE))
+      return WARN_E_INVALIDARG(__func__);
     return S_OK;
   }
 
