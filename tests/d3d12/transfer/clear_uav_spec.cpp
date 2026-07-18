@@ -92,12 +92,46 @@ protected:
     return SUCCEEDED(hr) ? std::move(resource) : ComPtr<ID3D12Resource>();
   }
 
+  ComPtr<ID3D12Resource> CreateTexture3D(UINT width, UINT height, UINT16 depth,
+                                         DXGI_FORMAT format) {
+    D3D12_HEAP_PROPERTIES heap_properties = {};
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = depth;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> resource;
+    HRESULT hr = context_.device()->CreateCommittedResource(
+        &heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(resource.put()));
+    return SUCCEEDED(hr) ? std::move(resource) : ComPtr<ID3D12Resource>();
+  }
+
   std::uint32_t UintPixel(const TextureReadback &readback, UINT x, UINT y) {
     std::uint32_t value = 0;
     std::memcpy(&value,
                 readback.data.data() + y * readback.row_pitch +
                     x * sizeof(value),
                 sizeof(value));
+    return value;
+  }
+
+  std::uint32_t UintVoxel(const TextureReadback &readback, UINT x, UINT y,
+                          UINT z) {
+    std::uint32_t value = 0;
+    const std::size_t offset =
+        std::size_t(z) * readback.row_pitch * readback.height +
+        std::size_t(y) * readback.row_pitch + x * sizeof(value);
+    EXPECT_LE(offset + sizeof(value), readback.data.size());
+    if (offset + sizeof(value) <= readback.data.size())
+      std::memcpy(&value, readback.data.data() + offset, sizeof(value));
     return value;
   }
 
@@ -348,6 +382,59 @@ TEST_F(ClearUavSpec, ClearTextureArraySlice) {
     for (UINT x = 0; x < first.width; ++x) {
       EXPECT_EQ(UintPixel(first, x, y), first_clear[0]);
       EXPECT_EQ(UintPixel(second, x, y), second_clear[0]);
+    }
+  }
+}
+
+TEST_F(ClearUavSpec, ClearTexture3DSliceRange) {
+  constexpr UINT kWidth = 3;
+  constexpr UINT kHeight = 2;
+  constexpr UINT16 kDepth = 4;
+  auto texture =
+      CreateTexture3D(kWidth, kHeight, kDepth, DXGI_FORMAT_R32_UINT);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(texture);
+  ASSERT_TRUE(heap);
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+  desc.Texture3D.WSize = kDepth;
+  const auto full_cpu = context_.CpuDescriptorHandle(heap.get(), 0);
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               full_cpu);
+  desc.Texture3D.FirstWSlice = 1;
+  desc.Texture3D.WSize = 2;
+  const auto middle_cpu = context_.CpuDescriptorHandle(heap.get(), 1);
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               middle_cpu);
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  context_.list()->SetDescriptorHeaps(1, heaps);
+  constexpr std::array<UINT, 4> baseline = {7, 0, 0, 0};
+  constexpr std::array<UINT, 4> selected = {42, 0, 0, 0};
+  context_.list()->ClearUnorderedAccessViewUint(
+      context_.GpuDescriptorHandle(heap.get(), 0), full_cpu, texture.get(),
+      baseline.data(), 0, nullptr);
+  context_.list()->ClearUnorderedAccessViewUint(
+      context_.GpuDescriptorHandle(heap.get(), 1), middle_cpu, texture.get(),
+      selected.data(), 0, nullptr);
+  D3D12TestContext::Transition(context_.list(), texture.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_TRUE(SUCCEEDED(ReadbackAndReset(texture.get(), &readback)));
+  ASSERT_EQ(readback.width, kWidth);
+  ASSERT_EQ(readback.height, kHeight);
+  for (UINT z = 0; z < kDepth; ++z) {
+    for (UINT y = 0; y < kHeight; ++y) {
+      for (UINT x = 0; x < kWidth; ++x) {
+        const UINT expected = z == 1 || z == 2 ? selected[0] : baseline[0];
+        EXPECT_EQ(UintVoxel(readback, x, y, z), expected)
+            << "voxel (" << x << ", " << y << ", " << z << ")";
+      }
     }
   }
 }
