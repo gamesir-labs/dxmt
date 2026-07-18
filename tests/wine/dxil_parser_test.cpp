@@ -598,6 +598,78 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
   EXPECT_EQ(parser.dxilTranslation()->entry_point_name, "main");
   EXPECT_EQ(parser.dxilTranslation()->function_name, "main");
   EXPECT_EQ(parser.dxilTranslation()->shader_stage_name, "Compute");
+
+  constexpr size_t runtime_offset = sizeof(uint32_t);
+  constexpr size_t resource_count_offset = runtime_offset + kPsvRuntimeInfo4Size;
+  constexpr size_t resource_stride_offset =
+      resource_count_offset + sizeof(uint32_t);
+  constexpr size_t resource_offset =
+      resource_stride_offset + sizeof(uint32_t);
+  constexpr size_t string_size_offset =
+      resource_offset + kPsvResourceBindInfo1Size;
+  constexpr size_t string_offset = string_size_offset + sizeof(uint32_t);
+  constexpr size_t semantic_count_offset = string_offset + 8;
+  std::vector<uint8_t> psv(semantic_count_offset + sizeof(uint32_t));
+  Store<uint32_t>(psv, 0, kPsvRuntimeInfo4Size);
+  psv[runtime_offset + 24] = 5;
+  Store<uint32_t>(psv, runtime_offset + 36, 8u);
+  Store<uint32_t>(psv, runtime_offset + 40, 4u);
+  Store<uint32_t>(psv, runtime_offset + 44, 2u);
+  Store<uint32_t>(psv, runtime_offset + 48, 0u);
+  Store<uint32_t>(psv, runtime_offset + 52, 1024u);
+  Store<uint32_t>(psv, resource_count_offset, 1u);
+  Store<uint32_t>(psv, resource_stride_offset, kPsvResourceBindInfo1Size);
+  Store<uint32_t>(psv, resource_offset + 0, 3u);
+  Store<uint32_t>(psv, resource_offset + 4, 2u);
+  Store<uint32_t>(psv, resource_offset + 8, 4u);
+  Store<uint32_t>(psv, resource_offset + 12, 7u);
+  Store<uint32_t>(psv, resource_offset + 16, 6u);
+  Store<uint32_t>(psv, resource_offset + 20, 9u);
+  Store<uint32_t>(psv, string_size_offset, 8u);
+  std::memcpy(psv.data() + string_offset, "main", 5);
+  Store<uint32_t>(psv, semantic_count_offset, 0u);
+  const std::vector<uint8_t> root_signature = {9, 8, 7, 6};
+  const auto integrated_container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::PipelineStateValidation, psv)
+          .add(fourcc::RootSignature, root_signature)
+          .build();
+
+  Parser integrated_parser;
+  ASSERT_EQ(integrated_parser.parse(integrated_container), ParseStatus::Ok);
+  ASSERT_TRUE(integrated_parser.shaderReflection().has_value());
+  const auto &integrated_reflection = *integrated_parser.shaderReflection();
+  EXPECT_TRUE(integrated_reflection.has_pipeline_state_validation);
+  EXPECT_TRUE(integrated_reflection.has_root_signature);
+  EXPECT_EQ(integrated_reflection.entry_point_name, "main");
+  EXPECT_EQ(integrated_reflection.num_threads_x, 8u);
+  EXPECT_EQ(integrated_reflection.num_threads_y, 4u);
+  EXPECT_EQ(integrated_reflection.num_threads_z, 2u);
+  EXPECT_EQ(integrated_reflection.group_shared_bytes_used, 1024u);
+  EXPECT_TRUE(std::equal(integrated_reflection.root_signature.begin(),
+                         integrated_reflection.root_signature.end(),
+                         root_signature.begin()));
+  ASSERT_EQ(integrated_reflection.resources.size(), 1u);
+  EXPECT_TRUE(integrated_reflection.resources[0].from_psv);
+  EXPECT_EQ(integrated_reflection.resources[0].space, 2u);
+  EXPECT_EQ(integrated_reflection.resources[0].lower_bound, 4u);
+  EXPECT_EQ(integrated_reflection.resources[0].upper_bound, 7u);
+  EXPECT_EQ(integrated_reflection.resources[0].bind_count, 4u);
+
+  ASSERT_TRUE(integrated_parser.dxilValidation().has_value());
+  EXPECT_TRUE(integrated_parser.dxilValidation()->valid);
+  EXPECT_EQ(integrated_parser.dxilValidation()->error_count, 0u);
+  ASSERT_TRUE(integrated_parser.dxilTranslation().has_value());
+  const auto &integrated_translation = *integrated_parser.dxilTranslation();
+  EXPECT_TRUE(integrated_translation.has_pipeline_state_validation);
+  EXPECT_TRUE(integrated_translation.has_root_signature);
+  EXPECT_EQ(integrated_translation.num_threads_x, 8u);
+  EXPECT_EQ(integrated_translation.group_shared_bytes_used, 1024u);
+  ASSERT_EQ(integrated_translation.resources.size(), 1u);
+  EXPECT_EQ(integrated_translation.resources[0].source_mask,
+            DxilTranslationSourcePipelineStateValidation);
+  EXPECT_EQ(integrated_translation.resources[0].bind_count, 4u);
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
