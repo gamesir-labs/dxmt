@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -134,6 +135,14 @@ TEST(FixedBitset, MasksUnusedBitsAndSupportsBulkOperations) {
   EXPECT_TRUE(bits.get(65));
 }
 
+TEST(FixedBitset, ClampsPrefixWritesToItsLogicalSize) {
+  dxmt::bit::bitset<70> bits;
+  bits.setN(std::numeric_limits<uint64_t>::max());
+
+  EXPECT_EQ(bits.qword(0), std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(bits.qword(1), 0x3fu);
+}
+
 TEST(DynamicBitvector, BulkOperationsRespectLogicalSize) {
   dxmt::bit::bitvector bits;
   bits.setN(35);
@@ -146,6 +155,18 @@ TEST(DynamicBitvector, BulkOperationsRespectLogicalSize) {
   bits.setAll();
   EXPECT_EQ(bits.dword(0), std::numeric_limits<uint32_t>::max());
   EXPECT_EQ(bits.dword(1), 0x7u);
+}
+
+TEST(DynamicBitvector, RejectsAnUnrepresentableMaximumIndex) {
+  dxmt::bit::bitvector bits;
+  constexpr auto invalid = std::numeric_limits<uint32_t>::max();
+
+  EXPECT_THROW(bits.set(invalid, true), std::length_error);
+  EXPECT_THROW(bits.exchange(invalid, true), std::length_error);
+  EXPECT_THROW(bits.flip(invalid), std::length_error);
+  EXPECT_EQ(bits.bitCount(), 0u);
+  EXPECT_EQ(bits.dwordCount(), 0u);
+  EXPECT_FALSE(bits.any());
 }
 
 TEST(BitMask, IteratesSetBitsInAscendingOrder) {

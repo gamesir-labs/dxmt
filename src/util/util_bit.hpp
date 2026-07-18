@@ -39,9 +39,11 @@
 #include "util_likely.hpp"
 #include "util_math.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -353,6 +355,7 @@ public:
   constexpr bool operator[](uint64_t idx) const { return get(idx); }
 
   constexpr void setN(uint64_t bits) {
+    bits = std::min<uint64_t>(bits, Bits);
     uint64_t fullqwords = bits / 64;
     uint64_t offset = bits % 64;
 
@@ -387,7 +390,7 @@ public:
   }
 
   void set(uint32_t idx, bool value) {
-    ensureSize(idx + 1);
+    ensureIndex(idx);
 
     uint32_t dword = idx / 32;
     uint32_t bit = idx % 32;
@@ -399,7 +402,7 @@ public:
   }
 
   bool exchange(uint32_t idx, bool value) {
-    ensureSize(idx + 1);
+    ensureIndex(idx);
 
     bool oldValue = get(idx);
     set(idx, value);
@@ -407,7 +410,7 @@ public:
   }
 
   void flip(uint32_t idx) {
-    ensureSize(idx + 1);
+    ensureIndex(idx);
 
     uint32_t dword = idx / 32;
     uint32_t bit = idx % 32;
@@ -463,6 +466,12 @@ public:
   }
 
 private:
+  void ensureIndex(uint32_t idx) {
+    if (unlikely(idx == std::numeric_limits<uint32_t>::max()))
+      throw std::length_error("bitvector index exceeds representable size");
+    ensureSize(idx + 1);
+  }
+
   std::vector<uint32_t> m_dwords;
   uint32_t m_bitCount = 0;
 };
