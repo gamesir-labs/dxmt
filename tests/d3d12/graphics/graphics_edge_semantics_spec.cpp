@@ -479,6 +479,75 @@ TEST_F(GraphicsEdgeSemanticsSpec,
   EXPECT_GT(green_pixels, 0u);
 }
 
+DXMT_SERIAL_TEST_F(GraphicsEdgeSemanticsSpec,
+                   SampleInterpolationUsesPerSampleLocations) {
+  if (!Supports4xMsaa())
+    GTEST_SKIP() << "4x MSAA is unavailable";
+  auto vertex = CompileShader(R"(
+    struct Output {
+      float4 position : SV_Position;
+      noperspective float ndc_x : TEXCOORD0;
+    };
+    Output main(uint id : SV_VertexID) {
+      const float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      Output output;
+      output.position = float4(positions[id], 0.5, 1.0);
+      output.ndc_x = positions[id].x;
+      return output;
+    })",
+                              "vs_5_0");
+  auto pixel = CompileShader(R"(
+    float4 main(sample noperspective float ndc_x : TEXCOORD0) : SV_Target {
+      const float threshold = 1.0 / 32.0;
+      return float4(ndc_x >= threshold, 0.0, 0.0, 1.0);
+    })",
+                             "ps_5_0");
+  ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  auto pipeline = CreatePipeline(vertex.bytecode.get(), pixel.bytecode.get(),
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, 4);
+  auto source = CreateColorTarget(4);
+  auto destination = CreateTexture(kColorFormat, 1, D3D12_RESOURCE_FLAG_NONE,
+                                   D3D12_RESOURCE_STATE_RESOLVE_DEST);
+  auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                             false);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(source.get(), nullptr, rtv);
+  constexpr FLOAT kBlack[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, kBlack, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  SetDrawState(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(context_.list(), source.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  context_.list()->ResolveSubresource(destination.get(), 0, source.get(), 0,
+                                      kColorFormat);
+  D3D12TestContext::Transition(context_.list(), destination.get(),
+                               D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(destination.get(), &readback), S_OK);
+
+  UINT mixed_pixels = 0;
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      const std::uint32_t value = PixelAt(readback, x, y);
+      EXPECT_GE((value >> 24) & 0xffu, 250u)
+          << "incomplete coverage at (" << x << ", " << y << ")";
+      const UINT red = value & 0xffu;
+      mixed_pixels += red > 16u && red < 239u;
+    }
+  }
+  EXPECT_GT(mixed_pixels, kSize / 2);
+}
+
 // Keep the MSAA fixed-function path out of the concurrent Metal worker wave.
 DXMT_SERIAL_TEST_F(GraphicsEdgeSemanticsSpec,
                    AlphaToCoverageRejectsZeroAndPreservesOpaqueAlpha) {
