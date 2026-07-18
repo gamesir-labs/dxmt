@@ -64,6 +64,36 @@ TEST(ConditionVariable, WaitUntilUsesTheFutureDeadline) {
   EXPECT_EQ(status, std::cv_status::timeout);
 }
 
+TEST(ConditionVariable, NonPositiveDurationTimesOutImmediately) {
+  dxmt::mutex mutex;
+  dxmt::condition_variable condition;
+  std::unique_lock lock(mutex);
+
+  EXPECT_EQ(condition.wait_for(lock, -1ms), std::cv_status::timeout);
+  EXPECT_EQ(condition.wait_for(lock, 0ms), std::cv_status::timeout);
+}
+
+TEST(ConditionVariable, PredicateWaitSurvivesSpuriousNotification) {
+  dxmt::mutex mutex;
+  dxmt::condition_variable condition;
+  bool ready = false;
+  dxmt::thread notifier([&] {
+    std::this_thread::sleep_for(10ms);
+    condition.notify_all();
+    std::this_thread::sleep_for(20ms);
+    {
+      std::lock_guard lock(mutex);
+      ready = true;
+    }
+    condition.notify_all();
+  });
+
+  std::unique_lock lock(mutex);
+  EXPECT_TRUE(condition.wait_for(lock, 500ms, [&] { return ready; }));
+  lock.unlock();
+  notifier.join();
+}
+
 TEST(ThreadWrapper, MoveTransfersJoinableOwnership) {
   std::atomic<bool> ran = false;
   dxmt::thread source([&] { ran = true; });

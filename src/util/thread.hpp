@@ -299,20 +299,28 @@ public:
   bool wait_until(std::unique_lock<dxmt::mutex> &lock,
                   const std::chrono::time_point<Clock, Duration> &time,
                   Predicate pred) {
-    if (pred())
-      return true;
-
-    auto now = Clock::now();
-    return now < time && wait_for(lock, time - now, pred);
+    while (!pred()) {
+      const auto now = Clock::now();
+      if (now >= time ||
+          wait_for(lock, time - now) == std::cv_status::timeout)
+        return pred();
+    }
+    return true;
   }
 
   template <typename Rep, typename Period>
   std::cv_status wait_for(std::unique_lock<dxmt::mutex> &lock,
                           const std::chrono::duration<Rep, Period> &timeout) {
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+    if (timeout <= std::chrono::duration<Rep, Period>::zero())
+      return std::cv_status::timeout;
+
+    const auto ms = std::chrono::ceil<std::chrono::milliseconds>(timeout);
+    const auto timeout_ms = static_cast<uint64_t>(ms.count()) >= INFINITE
+                                ? INFINITE - 1
+                                : static_cast<DWORD>(ms.count());
     auto srw = lock.mutex()->native_handle();
 
-    return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
+    return SleepConditionVariableSRW(&m_cond, srw, timeout_ms, 0)
                ? std::cv_status::no_timeout
                : std::cv_status::timeout;
   }
@@ -321,12 +329,8 @@ public:
   bool wait_for(std::unique_lock<dxmt::mutex> &lock,
                 const std::chrono::duration<Rep, Period> &timeout,
                 Predicate pred) {
-    bool result = pred();
-
-    if (!result && wait_for(lock, timeout) == std::cv_status::no_timeout)
-      result = pred();
-
-    return result;
+    return wait_until(lock, std::chrono::steady_clock::now() + timeout,
+                      std::move(pred));
   }
 
   native_handle_type native_handle() { return &m_cond; }
