@@ -3,6 +3,7 @@
 #include "DXILParser/DXILFormatConstants.hpp"
 #include "DXILParser/DXILParser.hpp"
 #include "dxil_llvm_coverage_fixture.hpp"
+#include "dxil_metadata_translation_fixture.hpp"
 #include "dxil_typed_operations_fixture.hpp"
 
 #include <algorithm>
@@ -1473,6 +1474,255 @@ TEST(DxilLlvmModule, ParsesEveryTypedOperationKindAndSystemValue) {
     ASSERT_NE(operation, nullptr);
     EXPECT_EQ(operation->semantic_kind, semantic_kind);
   }
+}
+
+TEST(DxilLlvmModule, ParsesMetadataAndPropagatesTranslationResourceUses) {
+  using namespace dxmt::dxil;
+  const auto bitcode =
+      DecodeHex(dxmt::test::kDxilMetadataTranslationBitcodeHex);
+  ASSERT_EQ(bitcode.size(), 2832u);
+
+  LlvmModuleInfo module;
+  ASSERT_EQ(ParseLlvmModule(bitcode, module), ParseStatus::Ok);
+  ASSERT_EQ(module.resources.size(), 5u);
+  const auto find_module_resource = [&](uint32_t id) {
+    const auto resource = std::find_if(
+        module.resources.begin(), module.resources.end(),
+        [id](const DxilMetadataResourceInfo &candidate) {
+          return candidate.id == id;
+        });
+    return resource == module.resources.end() ? nullptr : &*resource;
+  };
+
+  const auto *srv_metadata = find_module_resource(3u);
+  ASSERT_NE(srv_metadata, nullptr);
+  EXPECT_EQ(srv_metadata->resource_class, DxilMetadataResourceClass::Srv);
+  EXPECT_EQ(srv_metadata->global_name, "srv");
+  EXPECT_EQ(srv_metadata->name, "srvTex");
+  EXPECT_EQ(srv_metadata->space, 1u);
+  EXPECT_EQ(srv_metadata->lower_bound, 2u);
+  EXPECT_EQ(srv_metadata->range_size, 4u);
+  EXPECT_EQ(srv_metadata->upper_bound, 5u);
+  EXPECT_EQ(srv_metadata->kind, 2u);
+  EXPECT_EQ(srv_metadata->element_type, 7u);
+  EXPECT_EQ(srv_metadata->flags, 9u);
+  EXPECT_EQ(srv_metadata->numeric_operands,
+            (std::vector<uint32_t>{2u, 7u, 9u}));
+  ASSERT_EQ(srv_metadata->tags.size(), 2u);
+  EXPECT_EQ(srv_metadata->tags[0].tag, 1u);
+  EXPECT_TRUE(srv_metadata->tags[0].has_uint_value);
+  EXPECT_EQ(srv_metadata->tags[0].uint_value, 64u);
+  EXPECT_EQ(srv_metadata->tags[1].tag, 7u);
+  EXPECT_EQ(srv_metadata->tags[1].string_value, "coherent");
+
+  const auto *uav_metadata = find_module_resource(4u);
+  ASSERT_NE(uav_metadata, nullptr);
+  EXPECT_EQ(uav_metadata->resource_class, DxilMetadataResourceClass::Uav);
+  EXPECT_EQ(uav_metadata->upper_bound,
+            std::numeric_limits<uint32_t>::max());
+  ASSERT_EQ(uav_metadata->tags.size(), 1u);
+  EXPECT_EQ(uav_metadata->tags[0].uint_value, 4294967297ull);
+  EXPECT_EQ(find_module_resource(5u)->resource_class,
+            DxilMetadataResourceClass::Cbv);
+  EXPECT_EQ(find_module_resource(6u)->resource_class,
+            DxilMetadataResourceClass::Sampler);
+  EXPECT_EQ(find_module_resource(7u)->resource_class,
+            DxilMetadataResourceClass::Unknown);
+
+  ASSERT_EQ(module.entry_points.size(), 1u);
+  const auto &entry = module.entry_points[0];
+  EXPECT_TRUE(entry.has_signature);
+  EXPECT_EQ(entry.signature_operand_count, 3u);
+  EXPECT_TRUE(entry.has_resources);
+  EXPECT_EQ(entry.resource_operand_count, 5u);
+  EXPECT_TRUE(entry.has_properties);
+  EXPECT_EQ(entry.property_operand_count, 2u);
+  EXPECT_TRUE(entry.properties.empty());
+  ASSERT_EQ(entry.property_tags.size(), 2u);
+  EXPECT_EQ(entry.property_tags[0].tag, 4u);
+  EXPECT_EQ(entry.property_tags[0].uint_value, 8u);
+  EXPECT_EQ(entry.property_tags[1].tag, 9u);
+  EXPECT_EQ(entry.property_tags[1].string_value, "property");
+
+  ASSERT_EQ(entry.input_signature.size(), 1u);
+  const auto &input = entry.input_signature[0];
+  EXPECT_EQ(input.id, 10u);
+  EXPECT_EQ(input.semantic_name, "POSITION");
+  EXPECT_EQ(input.semantic_indices, (std::vector<uint32_t>{0u, 1u}));
+  EXPECT_EQ(input.rows, 1u);
+  EXPECT_EQ(input.cols, 4u);
+  EXPECT_EQ(input.component_type, 3u);
+  EXPECT_EQ(input.semantic_kind, 0u);
+  EXPECT_EQ(input.interpolation_mode, 2u);
+  ASSERT_EQ(input.tags.size(), 1u);
+  EXPECT_EQ(input.tags[0].tag, 11u);
+
+  ASSERT_EQ(entry.output_signature.size(), 1u);
+  const auto &output = entry.output_signature[0];
+  EXPECT_EQ(output.id, 20u);
+  EXPECT_EQ(output.semantic_name, "SV_Target");
+  EXPECT_EQ(output.semantic_indices, (std::vector<uint32_t>{0u}));
+  EXPECT_EQ(output.rows, 1u);
+  EXPECT_EQ(output.cols, 4u);
+  EXPECT_EQ(output.start_row, 1u);
+  EXPECT_EQ(output.start_col, 0u);
+  EXPECT_EQ(output.semantic_kind, 9u);
+  EXPECT_EQ(output.component_type, 3u);
+  EXPECT_EQ(output.interpolation_mode, 4u);
+  EXPECT_EQ(output.dynamic_index_mask, 5u);
+  EXPECT_EQ(output.stream, 2u);
+  ASSERT_EQ(output.tags.size(), 1u);
+  EXPECT_EQ(output.tags[0].string_value, "output-tag");
+
+  ASSERT_EQ(entry.patch_constant_signature.size(), 1u);
+  const auto &patch = entry.patch_constant_signature[0];
+  EXPECT_EQ(patch.id, 30u);
+  EXPECT_EQ(patch.semantic_indices, (std::vector<uint32_t>{1u}));
+  EXPECT_EQ(patch.rows, 2u);
+  EXPECT_EQ(patch.cols, 2u);
+  EXPECT_EQ(patch.start_col, 2u);
+  EXPECT_EQ(module.signature_elements.size(), 3u);
+
+  std::vector<uint8_t> program(kDxilProgramHeaderSize + bitcode.size());
+  Store<uint32_t>(program, 0, (5u << 16) | (6u << 4) | 8u);
+  Store<uint32_t>(program, 4, program.size() / sizeof(uint32_t));
+  Store<uint32_t>(program, 8, kDxilMagicValue);
+  Store<uint32_t>(program, 12, 0x00010008u);
+  Store<uint32_t>(program, 16,
+                  kDxilProgramHeaderSize - kDxilBitcodeHeaderOffset);
+  Store<uint32_t>(program, 20, bitcode.size());
+  std::copy(bitcode.begin(), bitcode.end(),
+            program.begin() + kDxilProgramHeaderSize);
+  const auto container =
+      DxilContainerBuilder().add(fourcc::Dxil, program).build();
+
+  Parser parser;
+  ASSERT_EQ(parser.parse(container), ParseStatus::Ok);
+  ASSERT_TRUE(parser.shaderReflection().has_value());
+  const auto &reflection = *parser.shaderReflection();
+  EXPECT_TRUE(reflection.valid);
+  EXPECT_EQ(reflection.entry_point_name, "main");
+  EXPECT_EQ(reflection.function_name, "main");
+  EXPECT_EQ(reflection.shader_model_kind, "cs");
+  ASSERT_EQ(reflection.resources.size(), 5u);
+  EXPECT_TRUE(std::all_of(
+      reflection.resources.begin(), reflection.resources.end(),
+      [](const ShaderReflectionResourceInfo &resource) {
+        return resource.from_metadata && !resource.from_runtime_data &&
+               !resource.from_resource_def && !resource.from_psv;
+      }));
+  EXPECT_EQ(reflection.resources[0].element_stride, 64u);
+  EXPECT_EQ(reflection.resources[1].element_stride,
+            std::numeric_limits<uint32_t>::max());
+  ASSERT_EQ(reflection.input_signature.size(), 1u);
+  ASSERT_EQ(reflection.output_signature.size(), 1u);
+  ASSERT_EQ(reflection.patch_constant_signature.size(), 1u);
+  EXPECT_EQ(reflection.input_signature[0].semantic_name, "POSITION");
+  EXPECT_EQ(reflection.output_signature[0].semantic_name, "SV_Target");
+  EXPECT_EQ(reflection.patch_constant_signature[0].semantic_name, "PATCH");
+
+  ASSERT_TRUE(parser.dxilTranslation().has_value());
+  const auto &translation = *parser.dxilTranslation();
+  EXPECT_TRUE(translation.valid);
+  EXPECT_TRUE(translation.has_metadata);
+  ASSERT_EQ(translation.resources.size(), 5u);
+  const auto find_translation_resource = [&](uint32_t id) {
+    const auto resource = std::find_if(
+        translation.resources.begin(), translation.resources.end(),
+        [id](const DxilTranslationResourceInfo &candidate) {
+          return candidate.id == id;
+        });
+    return resource == translation.resources.end() ? nullptr : &*resource;
+  };
+
+  const auto *srv = find_translation_resource(3u);
+  ASSERT_NE(srv, nullptr);
+  EXPECT_EQ(srv->resource_class, DxilTranslationResourceClass::Srv);
+  EXPECT_EQ(srv->source_mask, DxilTranslationSourceMetadata);
+  EXPECT_TRUE(srv->referenced_by_handle);
+  EXPECT_TRUE(srv->read);
+  EXPECT_FALSE(srv->written);
+  EXPECT_TRUE(srv->sampled);
+  EXPECT_TRUE(srv->compared);
+  EXPECT_TRUE(srv->queried);
+  EXPECT_FALSE(srv->counter);
+  EXPECT_EQ(srv->element_stride, 64u);
+
+  const auto *uav = find_translation_resource(4u);
+  ASSERT_NE(uav, nullptr);
+  EXPECT_EQ(uav->resource_class, DxilTranslationResourceClass::Uav);
+  EXPECT_TRUE(uav->unbounded);
+  EXPECT_TRUE(uav->referenced_by_handle);
+  EXPECT_TRUE(uav->read);
+  EXPECT_TRUE(uav->written);
+  EXPECT_FALSE(uav->sampled);
+  EXPECT_TRUE(uav->counter);
+
+  const auto *cbv = find_translation_resource(5u);
+  ASSERT_NE(cbv, nullptr);
+  EXPECT_EQ(cbv->resource_class, DxilTranslationResourceClass::Cbv);
+  EXPECT_TRUE(cbv->referenced_by_handle);
+  EXPECT_TRUE(cbv->read);
+  EXPECT_FALSE(cbv->written);
+  const auto *sampler = find_translation_resource(6u);
+  ASSERT_NE(sampler, nullptr);
+  EXPECT_EQ(sampler->resource_class, DxilTranslationResourceClass::Sampler);
+  EXPECT_TRUE(sampler->referenced_by_handle);
+  const auto *future = find_translation_resource(7u);
+  ASSERT_NE(future, nullptr);
+  EXPECT_EQ(future->resource_class, DxilTranslationResourceClass::Unknown);
+  EXPECT_FALSE(future->referenced_by_handle);
+
+  ASSERT_EQ(translation.operations.size(), 13u);
+  EXPECT_TRUE(std::all_of(
+      translation.operations.begin(), translation.operations.end(),
+      [](const DxilTranslationOperationInfo &operation) {
+        return operation.function_name == "main" &&
+               operation.basic_block_name == "entry";
+      }));
+  const auto translated_sample = std::find_if(
+      translation.operations.begin(), translation.operations.end(),
+      [](const DxilTranslationOperationInfo &operation) {
+        return operation.opcode == 64u;
+      });
+  ASSERT_NE(translated_sample, translation.operations.end());
+  EXPECT_TRUE(translated_sample->has_resource_id);
+  EXPECT_EQ(translated_sample->resource_id, 3u);
+  EXPECT_TRUE(translated_sample->typed.has_resource_class);
+  EXPECT_EQ(translated_sample->typed.resource_class, 0u);
+
+  ASSERT_EQ(translation.signatures.size(), 3u);
+  const auto find_signature = [&](DxilTranslationSignatureKind kind) {
+    const auto signature = std::find_if(
+        translation.signatures.begin(), translation.signatures.end(),
+        [kind](const DxilTranslationSignatureElementInfo &candidate) {
+          return candidate.kind == kind;
+        });
+    return signature == translation.signatures.end() ? nullptr : &*signature;
+  };
+  const auto *translated_input =
+      find_signature(DxilTranslationSignatureKind::Input);
+  const auto *translated_output =
+      find_signature(DxilTranslationSignatureKind::Output);
+  const auto *translated_patch =
+      find_signature(DxilTranslationSignatureKind::PatchConstant);
+  ASSERT_NE(translated_input, nullptr);
+  ASSERT_NE(translated_output, nullptr);
+  ASSERT_NE(translated_patch, nullptr);
+  EXPECT_EQ(translated_input->source_mask, DxilTranslationSourceMetadata);
+  EXPECT_EQ(translated_input->semantic_key, "POSITION0");
+  EXPECT_EQ(translated_input->component_mask, 0xfu);
+  EXPECT_TRUE(translated_input->has_element_id);
+  EXPECT_EQ(translated_input->element_id, 10u);
+  EXPECT_EQ(translated_output->semantic_key, "SV_TARGET0");
+  EXPECT_EQ(translated_output->component_mask, 0xfu);
+  EXPECT_EQ(translated_patch->semantic_key, "PATCH1");
+  EXPECT_EQ(translated_patch->component_start, 2u);
+  EXPECT_EQ(translated_patch->component_mask, 0xcu);
+
+  ASSERT_TRUE(parser.dxilValidation().has_value());
+  EXPECT_TRUE(parser.dxilValidation()->valid);
+  EXPECT_EQ(parser.dxilValidation()->error_count, 0u);
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
