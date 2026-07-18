@@ -2174,6 +2174,10 @@ DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
                 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
                 reinterpret_cast<void **>(rejected_fence.put())),
             S_OK);
+  HANDLE pending_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ASSERT_NE(pending_event, nullptr);
+  ASSERT_EQ(rejected_fence->SetEventOnCompletion(9, pending_event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(pending_event, 0), WAIT_TIMEOUT);
   const auto injection_token =
       std::to_string(GetCurrentProcessId()) + "-" +
       std::to_string(GetTickCount64());
@@ -2217,6 +2221,26 @@ DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
   } while (std::chrono::steady_clock::now() < observation_deadline);
   EXPECT_GE(command_buffer_errors, 1u);
   EXPECT_EQ(removed_reason, DXGI_ERROR_DEVICE_REMOVED);
+  EXPECT_EQ(rejected_fence->GetCompletedValue(), UINT64_MAX);
+  EXPECT_EQ(WaitForSingleObject(pending_event, 1000), WAIT_OBJECT_0);
+
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+  ComPtr<ID3D12DeviceRemovedExtendedData2> dred;
+  ASSERT_EQ(context.device()->QueryInterface(
+                __uuidof(ID3D12DeviceRemovedExtendedData2),
+                reinterpret_cast<void **>(dred.put())),
+            S_OK);
+  ASSERT_TRUE(dred);
+  EXPECT_EQ(dred->GetDeviceState(), D3D12_DRED_DEVICE_STATE_FAULT);
+  D3D12_DRED_PAGE_FAULT_OUTPUT2 page_fault = {};
+  page_fault.PageFaultVA = 1;
+  page_fault.pHeadExistingAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
+  EXPECT_EQ(dred->GetPageFaultAllocationOutput2(&page_fault),
+            DXGI_ERROR_UNSUPPORTED);
+  EXPECT_EQ(page_fault.PageFaultVA, 0u);
+  EXPECT_EQ(page_fault.pHeadExistingAllocationNode, nullptr);
+#endif
 
   ASSERT_TRUE(SetEnvironmentVariableA(
       "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr));
@@ -2231,6 +2255,22 @@ DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
             DXGI_ERROR_DEVICE_REMOVED);
   EXPECT_EQ(context.queue()->Wait(rejected_fence.get(), 1),
             DXGI_ERROR_DEVICE_REMOVED);
+
+  D3D12TestContext recovered;
+  ASSERT_EQ(recovered.Initialize(), S_OK);
+  EXPECT_EQ(recovered.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(recovered.ExecuteAndWait(), S_OK);
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+  ComPtr<ID3D12DeviceRemovedExtendedData2> recovered_dred;
+  ASSERT_EQ(recovered.device()->QueryInterface(
+                __uuidof(ID3D12DeviceRemovedExtendedData2),
+                reinterpret_cast<void **>(recovered_dred.put())),
+            S_OK);
+  EXPECT_EQ(recovered_dred->GetDeviceState(),
+            D3D12_DRED_DEVICE_STATE_UNKNOWN);
+#endif
+
+  CloseHandle(pending_event);
 }
 
 } // namespace
