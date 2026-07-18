@@ -928,6 +928,29 @@ TEST_F(D3D12QueueSpec, InvalidExecuteBatchesAreAtomicAndRecoverable) {
   ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
   ASSERT_EQ(foreign_context.list()->Close(), S_OK);
 
+  ComPtr<ID3D12CommandAllocator> compute_allocator;
+  ComPtr<ID3D12GraphicsCommandList> compute_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                IID_PPV_ARGS(compute_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_allocator.get(),
+                nullptr, IID_PPV_ARGS(compute_list.put())),
+            S_OK);
+  ASSERT_EQ(compute_list->Close(), S_OK);
+
+  ComPtr<ID3D12CommandAllocator> recording_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recording_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recording_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recording_allocator.get(),
+                nullptr, IID_PPV_ARGS(recording_list.put())),
+            S_OK);
+
   ComPtr<ID3D12Fence> fence;
   ASSERT_EQ(context_.device()->CreateFence(
                 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.put())),
@@ -960,6 +983,19 @@ TEST_F(D3D12QueueSpec, InvalidExecuteBatchesAreAtomicAndRecoverable) {
   ID3D12CommandList *with_foreign[] = {context_.list(),
                                        foreign_context.list()};
   context_.queue()->ExecuteCommandLists(std::size(with_foreign), with_foreign);
+  ASSERT_EQ(flush_queue(), S_OK);
+  EXPECT_EQ(read_destination(), sentinel);
+
+  ID3D12CommandList *with_wrong_type[] = {context_.list(), compute_list.get()};
+  context_.queue()->ExecuteCommandLists(std::size(with_wrong_type),
+                                        with_wrong_type);
+  ASSERT_EQ(flush_queue(), S_OK);
+  EXPECT_EQ(read_destination(), sentinel);
+
+  ID3D12CommandList *with_recording[] = {context_.list(),
+                                         recording_list.get()};
+  context_.queue()->ExecuteCommandLists(std::size(with_recording),
+                                        with_recording);
   ASSERT_EQ(flush_queue(), S_OK);
   EXPECT_EQ(read_destination(), sentinel);
 
