@@ -2667,12 +2667,105 @@ using DeviceComBase = ID3D12Device2;
 using DeviceComBase = ID3D12Device1;
 #endif
 
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+class DredDataImpl final : public ID3D12DeviceRemovedExtendedData2 {
+public:
+  explicit DredDataImpl(IMTLD3D12Device *device) : device_(device) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
+    InitReturnPtr(object);
+    if (!object)
+      return E_POINTER;
+
+    if (riid == __uuidof(ID3D12DeviceRemovedExtendedData)) {
+      *object = static_cast<ID3D12DeviceRemovedExtendedData *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(ID3D12DeviceRemovedExtendedData1)) {
+      *object = static_cast<ID3D12DeviceRemovedExtendedData1 *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(ID3D12DeviceRemovedExtendedData2)) {
+      *object = static_cast<ID3D12DeviceRemovedExtendedData2 *>(this);
+      AddRef();
+      return S_OK;
+    }
+    return device_->QueryInterface(riid, object);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return device_->AddRef(); }
+
+  ULONG STDMETHODCALLTYPE Release() override { return device_->Release(); }
+
+  HRESULT STDMETHODCALLTYPE GetAutoBreadcrumbsOutput(
+      D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT *output) override {
+    if (!output)
+      return E_INVALIDARG;
+    *output = {};
+    return ReportStatus();
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput(
+      D3D12_DRED_PAGE_FAULT_OUTPUT *output) override {
+    if (!output)
+      return E_INVALIDARG;
+    *output = {};
+    return ReportStatus();
+  }
+
+  HRESULT STDMETHODCALLTYPE GetAutoBreadcrumbsOutput1(
+      D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 *output) override {
+    if (!output)
+      return E_INVALIDARG;
+    *output = {};
+    return ReportStatus();
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput1(
+      D3D12_DRED_PAGE_FAULT_OUTPUT1 *output) override {
+    if (!output)
+      return E_INVALIDARG;
+    *output = {};
+    return ReportStatus();
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput2(
+      D3D12_DRED_PAGE_FAULT_OUTPUT2 *output) override {
+    if (!output)
+      return E_INVALIDARG;
+    *output = {};
+    return ReportStatus();
+  }
+
+  D3D12_DRED_DEVICE_STATE STDMETHODCALLTYPE GetDeviceState() override {
+    return device_->GetDXMTDevice().queue().HasDeviceError()
+               ? D3D12_DRED_DEVICE_STATE_FAULT
+               : D3D12_DRED_DEVICE_STATE_UNKNOWN;
+  }
+
+private:
+  HRESULT ReportStatus() const {
+    return device_->GetDXMTDevice().queue().HasDeviceError()
+               ? DXGI_ERROR_UNSUPPORTED
+               : DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+  }
+
+  IMTLD3D12Device *device_;
+};
+#endif
+
 class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device,
                                                         DeviceComBase,
                                                         ID3D12DeviceConfiguration1> {
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
-      : adapter_(adapter), device_(std::move(device)) {
+      : adapter_(adapter), device_(std::move(device))
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+        , dred_(static_cast<IMTLD3D12Device *>(this))
+#endif
+  {
     const auto archive_setting = env::getEnvVar("DXMT_PSO_BINARY_ARCHIVE");
     pso_binary_archive_enabled_ =
         env::getEnvVar("DXMT_SHADER_CACHE") != "0" &&
@@ -2824,6 +2917,13 @@ public:
       *ppvObject = ref(static_cast<ID3D12DeviceConfiguration1 *>(this));
       return S_OK;
     }
+
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12DeviceRemovedExtendedData) ||
+        riid == __uuidof(ID3D12DeviceRemovedExtendedData1) ||
+        riid == __uuidof(ID3D12DeviceRemovedExtendedData2))
+      return dred_.QueryInterface(riid, ppvObject);
+#endif
 
     if (logQueryInterfaceError(__uuidof(ID3D12Device), riid))
       WARN("D3D12Device: unknown interface query ", str::format(riid));
@@ -6301,6 +6401,9 @@ private:
 
   Com<IMTLDXGIAdapter> adapter_;
   std::unique_ptr<dxmt::Device> device_;
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+  DredDataImpl dred_;
+#endif
   ComPrivateData private_data_;
   WMT::Reference<WMT::SharedEvent> enqueue_set_event_signal_;
   WMT::Reference<WMT::SharedEvent> multiple_fence_wait_signal_;

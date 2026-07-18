@@ -237,4 +237,123 @@ TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
   CloseHandle(pending_event);
 }
 
+#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
+TEST(DeviceDredSpec, UnavailableReportsTrackExplicitRemovalState) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+
+  ComPtr<ID3D12DeviceRemovedExtendedData2> dred2;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(ID3D12DeviceRemovedExtendedData2),
+                reinterpret_cast<void **>(dred2.put())),
+            S_OK);
+  ASSERT_TRUE(dred2);
+
+  ComPtr<ID3D12DeviceRemovedExtendedData1> dred1;
+  ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+  ASSERT_EQ(dred2->QueryInterface(
+                __uuidof(ID3D12DeviceRemovedExtendedData1),
+                reinterpret_cast<void **>(dred1.put())),
+            S_OK);
+  ASSERT_EQ(dred2->QueryInterface(
+                __uuidof(ID3D12DeviceRemovedExtendedData),
+                reinterpret_cast<void **>(dred.put())),
+            S_OK);
+
+  ComPtr<IUnknown> device_identity;
+  ComPtr<IUnknown> dred_identity;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(device_identity.put())),
+            S_OK);
+  ASSERT_EQ(dred2->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(dred_identity.put())),
+            S_OK);
+  EXPECT_EQ(device_identity.get(), dred_identity.get());
+
+  EXPECT_EQ(dred->GetAutoBreadcrumbsOutput(nullptr), E_INVALIDARG);
+  EXPECT_EQ(dred->GetPageFaultAllocationOutput(nullptr), E_INVALIDARG);
+  EXPECT_EQ(dred1->GetAutoBreadcrumbsOutput1(nullptr), E_INVALIDARG);
+  EXPECT_EQ(dred1->GetPageFaultAllocationOutput1(nullptr), E_INVALIDARG);
+  EXPECT_EQ(dred2->GetPageFaultAllocationOutput2(nullptr), E_INVALIDARG);
+
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+  breadcrumbs.pHeadAutoBreadcrumbNode =
+      reinterpret_cast<const D3D12_AUTO_BREADCRUMB_NODE *>(uintptr_t{1});
+  EXPECT_EQ(dred->GetAutoBreadcrumbsOutput(&breadcrumbs),
+            DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+  EXPECT_EQ(breadcrumbs.pHeadAutoBreadcrumbNode, nullptr);
+
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs1 = {};
+  breadcrumbs1.pHeadAutoBreadcrumbNode =
+      reinterpret_cast<const D3D12_AUTO_BREADCRUMB_NODE1 *>(uintptr_t{1});
+  EXPECT_EQ(dred1->GetAutoBreadcrumbsOutput1(&breadcrumbs1),
+            DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+  EXPECT_EQ(breadcrumbs1.pHeadAutoBreadcrumbNode, nullptr);
+
+  D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
+  page_fault.PageFaultVA = 1;
+  page_fault.pHeadExistingAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE *>(uintptr_t{1});
+  page_fault.pHeadRecentFreedAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE *>(uintptr_t{1});
+  EXPECT_EQ(dred->GetPageFaultAllocationOutput(&page_fault),
+            DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+  EXPECT_EQ(page_fault.PageFaultVA, 0u);
+  EXPECT_EQ(page_fault.pHeadExistingAllocationNode, nullptr);
+  EXPECT_EQ(page_fault.pHeadRecentFreedAllocationNode, nullptr);
+
+  D3D12_DRED_PAGE_FAULT_OUTPUT1 page_fault1 = {};
+  page_fault1.PageFaultVA = 1;
+  page_fault1.pHeadExistingAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
+  page_fault1.pHeadRecentFreedAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
+  EXPECT_EQ(dred1->GetPageFaultAllocationOutput1(&page_fault1),
+            DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+  EXPECT_EQ(page_fault1.PageFaultVA, 0u);
+  EXPECT_EQ(page_fault1.pHeadExistingAllocationNode, nullptr);
+  EXPECT_EQ(page_fault1.pHeadRecentFreedAllocationNode, nullptr);
+
+  D3D12_DRED_PAGE_FAULT_OUTPUT2 page_fault2 = {};
+  page_fault2.PageFaultVA = 1;
+  page_fault2.pHeadExistingAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
+  page_fault2.pHeadRecentFreedAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
+  page_fault2.PageFaultFlags =
+      static_cast<D3D12_DRED_PAGE_FAULT_FLAGS>(UINT_MAX);
+  EXPECT_EQ(dred2->GetPageFaultAllocationOutput2(&page_fault2),
+            DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+  EXPECT_EQ(page_fault2.PageFaultVA, 0u);
+  EXPECT_EQ(page_fault2.pHeadExistingAllocationNode, nullptr);
+  EXPECT_EQ(page_fault2.pHeadRecentFreedAllocationNode, nullptr);
+  EXPECT_EQ(page_fault2.PageFaultFlags, D3D12_DRED_PAGE_FAULT_FLAGS_NONE);
+  EXPECT_EQ(dred2->GetDeviceState(), D3D12_DRED_DEVICE_STATE_UNKNOWN);
+
+  ComPtr<ID3D12Device5> device5;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(ID3D12Device5),
+                reinterpret_cast<void **>(device5.put())),
+            S_OK);
+  device5->RemoveDevice();
+  EXPECT_EQ(dred2->GetDeviceState(), D3D12_DRED_DEVICE_STATE_FAULT);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED);
+
+  breadcrumbs.pHeadAutoBreadcrumbNode =
+      reinterpret_cast<const D3D12_AUTO_BREADCRUMB_NODE *>(uintptr_t{1});
+  EXPECT_EQ(dred->GetAutoBreadcrumbsOutput(&breadcrumbs),
+            DXGI_ERROR_UNSUPPORTED);
+  EXPECT_EQ(breadcrumbs.pHeadAutoBreadcrumbNode, nullptr);
+  page_fault2.PageFaultVA = 1;
+  page_fault2.pHeadExistingAllocationNode =
+      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
+  EXPECT_EQ(dred2->GetPageFaultAllocationOutput2(&page_fault2),
+            DXGI_ERROR_UNSUPPORTED);
+  EXPECT_EQ(page_fault2.PageFaultVA, 0u);
+  EXPECT_EQ(page_fault2.pHeadExistingAllocationNode, nullptr);
+}
+#endif
+
 } // namespace
