@@ -4,7 +4,9 @@
 #include "DXILParser/DXILParser.hpp"
 #include "dxil_llvm_coverage_fixture.hpp"
 #include "dxil_metadata_translation_fixture.hpp"
+#include "dxil_missing_metadata_fixture.hpp"
 #include "dxil_typed_operations_fixture.hpp"
+#include "dxil_validation_errors_fixture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -197,6 +199,31 @@ std::vector<uint8_t> DecodeHex(std::string_view text) {
   for (size_t i = 0; i + 1 < text.size(); i += 2)
     bytes.push_back(uint8_t((nibble(text[i]) << 4) | nibble(text[i + 1])));
   return bytes;
+}
+
+std::vector<uint8_t>
+BuildDxilProgram(std::span<const uint8_t> bitcode, uint32_t shader_kind = 5u,
+                 uint32_t shader_model_major = 6u,
+                 uint32_t shader_model_minor = 0u,
+                 uint32_t dxil_version = 0x00010000u,
+                 size_t trailing_padding = 0u) {
+  using namespace dxmt::dxil;
+  const auto program_size =
+      (kDxilProgramHeaderSize + bitcode.size() + trailing_padding + 3u) &
+      ~size_t(3u);
+  std::vector<uint8_t> program(program_size);
+  Store<uint32_t>(program, 0, (shader_kind << 16) |
+                                  (shader_model_major << 4) |
+                                  shader_model_minor);
+  Store<uint32_t>(program, 4, program.size() / sizeof(uint32_t));
+  Store<uint32_t>(program, 8, kDxilMagicValue);
+  Store<uint32_t>(program, 12, dxil_version);
+  Store<uint32_t>(program, 16,
+                  kDxilProgramHeaderSize - kDxilBitcodeHeaderOffset);
+  Store<uint32_t>(program, 20, bitcode.size());
+  std::copy(bitcode.begin(), bitcode.end(),
+            program.begin() + kDxilProgramHeaderSize);
+  return program;
 }
 
 } // namespace
@@ -1723,6 +1750,149 @@ TEST(DxilLlvmModule, ParsesMetadataAndPropagatesTranslationResourceUses) {
   ASSERT_TRUE(parser.dxilValidation().has_value());
   EXPECT_TRUE(parser.dxilValidation()->valid);
   EXPECT_EQ(parser.dxilValidation()->error_count, 0u);
+}
+
+TEST(DxilValidation, ReportsMissingMetadataAndReflectionParts) {
+  using namespace dxmt::dxil;
+  const auto bitcode = DecodeHex(dxmt::test::kDxilMissingMetadataBitcodeHex);
+  ASSERT_EQ(bitcode.size(), 1264u);
+  const auto container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, BuildDxilProgram(bitcode))
+          .build();
+  Parser parser;
+  ASSERT_EQ(parser.parse(container), ParseStatus::Ok);
+  ASSERT_TRUE(parser.dxilValidation().has_value());
+  const auto &validation = *parser.dxilValidation();
+  EXPECT_FALSE(validation.valid);
+  const auto find_diagnostic = [&](std::string_view code) {
+    const auto diagnostic = std::find_if(
+        validation.diagnostics.begin(), validation.diagnostics.end(),
+        [code](const DxilValidationDiagnostic &candidate) {
+          return candidate.code == code;
+        });
+    return diagnostic == validation.diagnostics.end() ? nullptr
+                                                       : &*diagnostic;
+  };
+  for (std::string_view code : {"missing-shader-model",
+                                "missing-dxil-version",
+                                "missing-entry-points",
+                                "missing-validator-version", "missing-rdat",
+                                "missing-psv"}) {
+    SCOPED_TRACE(code);
+    EXPECT_NE(find_diagnostic(code), nullptr);
+  }
+  EXPECT_EQ(find_diagnostic("missing-shader-model")->severity,
+            DxilValidationSeverity::Error);
+  EXPECT_EQ(find_diagnostic("missing-validator-version")->severity,
+            DxilValidationSeverity::Warning);
+  EXPECT_EQ(find_diagnostic("missing-rdat")->category,
+            DxilValidationCategory::Reflection);
+}
+
+TEST(DxilValidation, ReportsInstructionFlowAndMetadataFailures) {
+  using namespace dxmt::dxil;
+  const auto bitcode = DecodeHex(dxmt::test::kDxilValidationErrorsBitcodeHex);
+  ASSERT_EQ(bitcode.size(), 2216u);
+  const auto container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, BuildDxilProgram(bitcode))
+          .build();
+  Parser parser;
+  ASSERT_EQ(parser.parse(container), ParseStatus::Ok);
+  ASSERT_TRUE(parser.dxilValidation().has_value());
+  const auto &validation = *parser.dxilValidation();
+  EXPECT_FALSE(validation.valid);
+  const auto find_diagnostic = [&](std::string_view code) {
+    const auto diagnostic = std::find_if(
+        validation.diagnostics.begin(), validation.diagnostics.end(),
+        [code](const DxilValidationDiagnostic &candidate) {
+          return candidate.code == code;
+        });
+    return diagnostic == validation.diagnostics.end() ? nullptr
+                                                       : &*diagnostic;
+  };
+  for (std::string_view code : {
+           "unknown-shader-model-kind", "shader-model-mismatch",
+           "dxil-version-mismatch", "missing-validator-version",
+           "missing-entry-function", "indirect-call", "recursive-call",
+           "unreachable-function", "defined-dx-intrinsic",
+           "missing-constant-opcode", "unknown-opcode", "reserved-opcode",
+           "opcode-function-mismatch", "opcode-shader-model",
+           "invalid-signature-reference", "invalid-resource-reference",
+           "missing-rdat", "missing-psv"}) {
+    SCOPED_TRACE(code);
+    EXPECT_NE(find_diagnostic(code), nullptr);
+  }
+
+  const auto *unknown = find_diagnostic("unknown-opcode");
+  ASSERT_NE(unknown, nullptr);
+  EXPECT_EQ(unknown->severity, DxilValidationSeverity::Error);
+  EXPECT_EQ(unknown->category, DxilValidationCategory::Instruction);
+  EXPECT_EQ(unknown->function_name, "main");
+  EXPECT_TRUE(unknown->has_instruction);
+  EXPECT_TRUE(unknown->has_opcode);
+  EXPECT_EQ(unknown->opcode, 999u);
+  EXPECT_FALSE(unknown->message.empty());
+
+  const auto *dynamic = find_diagnostic("missing-constant-opcode");
+  ASSERT_NE(dynamic, nullptr);
+  EXPECT_EQ(dynamic->function_name, "main");
+  EXPECT_TRUE(dynamic->has_instruction);
+  EXPECT_FALSE(dynamic->has_opcode);
+  const auto *indirect = find_diagnostic("indirect-call");
+  ASSERT_NE(indirect, nullptr);
+  EXPECT_EQ(indirect->severity, DxilValidationSeverity::Warning);
+}
+
+TEST(DxilValidation, ReportsEveryProgramHeaderMismatch) {
+  using namespace dxmt::dxil;
+  const auto bitcode =
+      DecodeHex(dxmt::test::kDxilMetadataTranslationBitcodeHex);
+  ASSERT_EQ(bitcode.size(), 2832u);
+
+  const auto expect_diagnostic = [&](std::string_view case_name,
+                                     std::vector<uint8_t> program,
+                                     std::string_view code) {
+    SCOPED_TRACE(case_name);
+    const auto container =
+        DxilContainerBuilder().add(fourcc::Dxil, std::move(program)).build();
+    Parser parser;
+    ASSERT_EQ(parser.parse(container), ParseStatus::Ok);
+    ASSERT_TRUE(parser.dxilValidation().has_value());
+    EXPECT_TRUE(std::any_of(
+        parser.dxilValidation()->diagnostics.begin(),
+        parser.dxilValidation()->diagnostics.end(),
+        [code](const DxilValidationDiagnostic &diagnostic) {
+          return diagnostic.code == code;
+        }));
+  };
+
+  expect_diagnostic("invalid shader kind",
+                    BuildDxilProgram(bitcode, 16u, 6u, 8u, 0x00010008u),
+                    "invalid-shader-kind");
+  expect_diagnostic("shader kind mismatch",
+                    BuildDxilProgram(bitcode, 1u, 6u, 8u, 0x00010008u),
+                    "shader-kind-mismatch");
+  expect_diagnostic("invalid shader model",
+                    BuildDxilProgram(bitcode, 5u, 5u, 0u, 0x00010008u),
+                    "invalid-shader-model");
+  expect_diagnostic("shader model mismatch",
+                    BuildDxilProgram(bitcode, 5u, 6u, 7u, 0x00010008u),
+                    "shader-model-mismatch");
+  expect_diagnostic("invalid DXIL version",
+                    BuildDxilProgram(bitcode, 5u, 6u, 8u, 0u),
+                    "invalid-dxil-version");
+  expect_diagnostic("DXIL version mismatch",
+                    BuildDxilProgram(bitcode, 5u, 6u, 8u, 0x00010007u),
+                    "dxil-version-mismatch");
+
+  auto padded =
+      BuildDxilProgram(bitcode, 5u, 6u, 8u, 0x00010008u, 4u);
+  Store<uint32_t>(padded, 4,
+                  (padded.size() - 4u) / sizeof(uint32_t));
+  expect_diagnostic("part padding", std::move(padded),
+                    "dxil-size-mismatch");
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
