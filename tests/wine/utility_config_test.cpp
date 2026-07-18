@@ -121,6 +121,21 @@ TEST(Config, ParsesTristateAndAppliesOverrides) {
   EXPECT_TRUE(value);
 }
 
+TEST(Config, InvalidTristateKeepsFallbackAndLowercasingIsAsciiOnly) {
+  dxmt::Config config;
+  config.setOption("invalid", "sometimes");
+  EXPECT_EQ(config.getOption<dxmt::Tristate>("invalid", dxmt::Tristate::True),
+            dxmt::Tristate::True);
+  EXPECT_EQ(dxmt::Config::toLower("DxMT-123_"), "dxmt-123_");
+
+  std::string bytes = "A";
+  bytes.push_back(static_cast<char>(0xff));
+  const auto lowered = dxmt::Config::toLower(bytes);
+  ASSERT_EQ(lowered.size(), 2u);
+  EXPECT_EQ(lowered[0], 'a');
+  EXPECT_EQ(static_cast<unsigned char>(lowered[1]), 0xffu);
+}
+
 TEST(Config, MatchesBuiltInProfilesWithoutCaseSensitivity) {
   const auto config = dxmt::Config::getAppConfig("C:\\Games\\yuanshen.exe");
   EXPECT_EQ(config.getOption<std::string>("dxgi.customVendorId"), "1002");

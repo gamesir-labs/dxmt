@@ -45,6 +45,14 @@ TEST(Sha1, IncrementalUpdatesMatchOneShotBinaryInput) {
             dxmt::Sha1HashState::compute(bytes.data(), bytes.size()));
 }
 
+TEST(Sha1, ObjectUpdateHashesTheCompleteObjectRepresentation) {
+  constexpr uint32_t value = 0x12345678u;
+  dxmt::Sha1HashState object_hash;
+  object_hash.update(value);
+  EXPECT_EQ(object_hash.final(),
+            dxmt::Sha1HashState::compute(&value, sizeof(value)));
+}
+
 TEST(Sha1, HandlesMillionByteBoundaryAcrossUnevenChunks) {
   const std::string input(1'000'000, 'a');
   dxmt::Sha1HashState hash;

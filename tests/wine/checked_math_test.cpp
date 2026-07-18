@@ -83,6 +83,19 @@ TEST(CheckedArithmetic, HandlesMixedWidthsAndNonPowerOfTwoAlignment) {
   EXPECT_EQ(narrow_result, 255u);
 }
 
+TEST(CheckedArithmetic, PreservesNarrowResultsAcrossMultiplyAndAlignFailure) {
+  std::uint8_t result = 13;
+  EXPECT_FALSE(dxmt::CheckedMultiply(16, 16, result));
+  EXPECT_EQ(result, 13u);
+  EXPECT_FALSE(dxmt::CheckedMultiply(-1, 0, result));
+  EXPECT_EQ(result, 13u);
+  EXPECT_FALSE(dxmt::CheckedAlign(250, 8, result));
+  EXPECT_EQ(result, 13u);
+
+  EXPECT_TRUE(dxmt::CheckedAlign(0, 8, result));
+  EXPECT_EQ(result, 0u);
+}
+
 TEST(LegacyBufferSlice, RejectsRangesThatTheShaderAbiWouldTruncate) {
   constexpr auto maximum = std::numeric_limits<std::uint32_t>::max();
   EXPECT_TRUE(dxmt::LegacyBufferSliceRepresentable(maximum, maximum));

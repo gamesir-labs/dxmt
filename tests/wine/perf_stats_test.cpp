@@ -61,6 +61,26 @@ TEST(PerfStats, ExclusiveCodeTimingClampsClockSkewInsteadOfUnderflowing) {
   EXPECT_EQ(stats.frame_code_path_counts[index], 1u);
 }
 
+TEST(PerfStats, IgnoresMissingSinksAndOutOfRangeCodePaths) {
+  dxmt::FrameStatistics stats;
+  dxmt::perf::addExclusiveCodeTiming(
+      nullptr, dxmt::PerfCodePath::QueueExecuteControl, 10us, 0us);
+  dxmt::perf::addExclusiveCodeTiming(
+      &stats, static_cast<dxmt::PerfCodePath>(dxmt::kPerfCodePathCount),
+      10us, 0us);
+  EXPECT_TRUE(std::ranges::all_of(stats.frame_code_path_counts,
+                                  [](uint64_t count) { return count == 0; }));
+
+  dxmt::perf::addFrameCounter(nullptr,
+                              &dxmt::FrameStatistics::frame_state_records_elided,
+                              3);
+  dxmt::perf::addFrameCounter(&stats, dxmt::perf::FrameCounterMember{}, 3);
+  EXPECT_EQ(stats.frame_state_records_elided, 0u);
+  dxmt::perf::addFrameCounter(
+      &stats, &dxmt::FrameStatistics::frame_state_records_elided, 3);
+  EXPECT_EQ(stats.frame_state_records_elided, 3u);
+}
+
 TEST(PerfStats, FrameStatisticsBindingCrossesWorkerThreadAndRestoresTls) {
   dxmt::FrameStatistics present_stats;
   dxmt::FrameStatistics worker_stats;
