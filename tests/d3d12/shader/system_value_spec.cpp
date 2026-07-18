@@ -279,7 +279,8 @@ TEST_F(D3D12ShaderSystemValueSpec,
   EXPECT_GT(counts.right_green, 20u);
 }
 
-TEST_F(D3D12ShaderSystemValueSpec, ClipDistanceRejectsNegativePrimitive) {
+TEST_F(D3D12ShaderSystemValueSpec,
+       ClipAndCullDistanceArraysRejectNegativePrimitives) {
   // The Wine/vkd3d HLSL frontend used by CompileShader does not yet accept
   // SV_ClipDistance. This vertex shader is the precompiled SM4 DXBC from
   // Wine's d3d10core clip/cull-distance test. It copies four input clip
@@ -339,12 +340,15 @@ TEST_F(D3D12ShaderSystemValueSpec, ClipDistanceRejectsNegativePrimitive) {
     float cull_distance[4];
   };
   static constexpr Vertex kVertices[] = {
-      {{-0.9f, -0.7f}, {1, 1, 1, 1}, {1, 1, 1, 1}},
-      {{-0.5f, 0.7f}, {1, 1, 1, 1}, {1, 1, 1, 1}},
-      {{-0.1f, -0.7f}, {1, 1, 1, 1}, {1, 1, 1, 1}},
-      {{0.1f, -0.7f}, {-1, -1, -1, -1}, {1, 1, 1, 1}},
-      {{0.5f, 0.7f}, {-1, -1, -1, -1}, {1, 1, 1, 1}},
-      {{0.9f, -0.7f}, {-1, -1, -1, -1}, {1, 1, 1, 1}},
+      {{-0.95f, -0.7f}, {1, 1, 1, 1}, {1, 1, 1, 1}},
+      {{-0.65f, 0.7f}, {1, 1, 1, 1}, {1, 1, 1, 1}},
+      {{-0.35f, -0.7f}, {1, 1, 1, 1}, {1, 1, 1, 1}},
+      {{-0.3f, -0.7f}, {-1, -1, -1, -1}, {1, 1, 1, 1}},
+      {{0.0f, 0.7f}, {-1, -1, -1, -1}, {1, 1, 1, 1}},
+      {{0.3f, -0.7f}, {-1, -1, -1, -1}, {1, 1, 1, 1}},
+      {{0.35f, -0.7f}, {1, 1, 1, 1}, {-1, -1, -1, -1}},
+      {{0.65f, 0.7f}, {1, 1, 1, 1}, {-1, -1, -1, -1}},
+      {{0.95f, -0.7f}, {1, 1, 1, 1}, {-1, -1, -1, -1}},
   };
   static constexpr D3D12_INPUT_ELEMENT_DESC kInputElements[] = {
       {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
@@ -387,12 +391,26 @@ TEST_F(D3D12ShaderSystemValueSpec, ClipDistanceRejectsNegativePrimitive) {
   ASSERT_TRUE(vertex_buffer);
   const D3D12_VERTEX_BUFFER_VIEW view = {
       vertex_buffer->GetGPUVirtualAddress(), sizeof(kVertices), sizeof(Vertex)};
-  const auto readback = DrawAndRead(pipeline.get(), 6, 1, 0, 0, &view, 1);
+  const auto readback = DrawAndRead(pipeline.get(), 9, 1, 0, 0, &view, 1);
   ASSERT_FALSE(readback.data.empty());
-  const auto counts = CountHalfColors(readback);
-  EXPECT_GT(counts.left_red, 20u);
-  EXPECT_EQ(counts.right_red, 0u);
-  EXPECT_EQ(counts.left_green + counts.right_green, 0u);
+  UINT valid_pixels = 0;
+  UINT clip_rejected_pixels = 0;
+  UINT cull_rejected_pixels = 0;
+  for (UINT y = 0; y < readback.height; ++y) {
+    for (UINT x = 0; x < readback.width; ++x) {
+      if (!ColorsMatch(PixelAt(readback, x, y), kRed, 1))
+        continue;
+      if (x < readback.width / 3)
+        ++valid_pixels;
+      else if (x < 2 * readback.width / 3)
+        ++clip_rejected_pixels;
+      else
+        ++cull_rejected_pixels;
+    }
+  }
+  EXPECT_GT(valid_pixels, 5u);
+  EXPECT_EQ(clip_rejected_pixels, 0u);
+  EXPECT_EQ(cull_rejected_pixels, 0u);
 }
 
 class D3D12PixelDepthSystemValueSpec : public ::testing::Test {
