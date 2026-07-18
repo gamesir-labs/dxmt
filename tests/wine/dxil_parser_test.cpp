@@ -728,6 +728,165 @@ TEST(DxilRuntimeData, RejectsOverlappingPartRanges) {
             ParseStatus::InvalidRuntimeData);
 }
 
+TEST(DxilRuntimeData, ParsesResourceAndExtendedFunctionRecords) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {
+      't', 'e', 'x', 't', 'u', 'r', 'e', 0,
+      'm', 'a', 'i', 'n', 0,
+      'h', 'e', 'l', 'p', 'e', 'r', 0,
+  };
+  std::vector<uint8_t> indices(4 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 1u);
+  Store<uint32_t>(indices, 4, 0u);
+  Store<uint32_t>(indices, 8, 1u);
+  Store<uint32_t>(indices, 12, 13u);
+
+  std::vector<uint8_t> resources(kRuntimeDataTableHeaderSize +
+                                 kRdatResourceRecordSize);
+  Store<uint32_t>(resources, 0, 1u);
+  Store<uint32_t>(resources, 4, kRdatResourceRecordSize);
+  const size_t resource = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(resources, resource + 0, 1u);
+  Store<uint32_t>(resources, resource + 4, 2u);
+  Store<uint32_t>(resources, resource + 8, 3u);
+  Store<uint32_t>(resources, resource + 12, 4u);
+  Store<uint32_t>(resources, resource + 16, 5u);
+  Store<uint32_t>(resources, resource + 20, 6u);
+  Store<uint32_t>(resources, resource + 24, 0u);
+  Store<uint32_t>(resources, resource + 28, 7u);
+
+  std::vector<uint8_t> functions(kRuntimeDataTableHeaderSize +
+                                 kRdatFunctionRecord2Size);
+  Store<uint32_t>(functions, 0, 1u);
+  Store<uint32_t>(functions, 4, kRdatFunctionRecord2Size);
+  const size_t function = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(functions, function + 0, 8u);
+  Store<uint32_t>(functions, function + 4, kRdatNullRef);
+  Store<uint32_t>(functions, function + 8, 0u);
+  Store<uint32_t>(functions, function + 12, 2u);
+  Store<uint32_t>(functions, function + 16, 5u);
+  Store<uint32_t>(functions, function + 20, 16u);
+  Store<uint32_t>(functions, function + 24, 32u);
+  Store<uint32_t>(functions, function + 28, 0x89abcdefu);
+  Store<uint32_t>(functions, function + 32, 0x01234567u);
+  Store<uint32_t>(functions, function + 36, 0x20u);
+  Store<uint32_t>(functions, function + 40, 0x65u);
+  functions[function + 44] = 4;
+  functions[function + 45] = 32;
+  Store<uint16_t>(functions, function + 46, 9u);
+  Store<uint32_t>(functions, function + 48, kRdatNullRef);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::StringBuffer, strings)
+                         .add(rdat::IndexArrays, indices)
+                         .add(rdat::ResourceTable, resources)
+                         .add(rdat::FunctionTable, functions)
+                         .build();
+
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.resources.size(), 1u);
+  EXPECT_EQ(info.resources[0].name, "texture");
+  EXPECT_EQ(info.resources[0].resource_class, 1u);
+  EXPECT_EQ(info.resources[0].kind, 2u);
+  EXPECT_EQ(info.resources[0].id, 3u);
+  EXPECT_EQ(info.resources[0].space, 4u);
+  EXPECT_EQ(info.resources[0].lower_bound, 5u);
+  EXPECT_EQ(info.resources[0].upper_bound, 6u);
+  EXPECT_EQ(info.resources[0].flags, 7u);
+
+  ASSERT_EQ(info.functions.size(), 1u);
+  EXPECT_EQ(info.functions[0].name, "main");
+  EXPECT_TRUE(info.functions[0].unmangled_name.empty());
+  EXPECT_EQ(info.functions[0].resource_indices,
+            (std::vector<uint32_t>{0}));
+  EXPECT_EQ(info.functions[0].function_dependencies,
+            (std::vector<std::string>{"helper"}));
+  EXPECT_EQ(info.functions[0].shader_kind, 5u);
+  EXPECT_EQ(info.functions[0].feature_flags(), 0x0123456789abcdefull);
+  EXPECT_EQ(info.functions[0].minimum_expected_wave_lane_count, 4u);
+  EXPECT_EQ(info.functions[0].maximum_expected_wave_lane_count, 32u);
+  EXPECT_EQ(info.functions[0].shader_flags, 9u);
+  EXPECT_FALSE(info.functions[0].has_shader_info);
+}
+
+TEST(DxilRuntimeData, RejectsInvalidCoreTableReferencesAndStrides) {
+  using namespace dxmt::dxil;
+  const auto build = [](uint32_t resource_name_offset,
+                        uint32_t resource_index,
+                        uint32_t dependency_name_offset,
+                        uint32_t shader_info_index) {
+    std::vector<uint8_t> strings = {
+        't', 'e', 'x', 't', 'u', 'r', 'e', 0,
+        'm', 'a', 'i', 'n', 0,
+        'h', 'e', 'l', 'p', 'e', 'r', 0,
+    };
+    std::vector<uint8_t> indices(4 * sizeof(uint32_t));
+    Store<uint32_t>(indices, 0, 1u);
+    Store<uint32_t>(indices, 4, resource_index);
+    Store<uint32_t>(indices, 8, 1u);
+    Store<uint32_t>(indices, 12, dependency_name_offset);
+
+    std::vector<uint8_t> resources(kRuntimeDataTableHeaderSize +
+                                   kRdatResourceRecordSize);
+    Store<uint32_t>(resources, 0, 1u);
+    Store<uint32_t>(resources, 4, kRdatResourceRecordSize);
+    Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 24,
+                    resource_name_offset);
+
+    std::vector<uint8_t> functions(kRuntimeDataTableHeaderSize +
+                                   kRdatFunctionRecord2Size);
+    Store<uint32_t>(functions, 0, 1u);
+    Store<uint32_t>(functions, 4, kRdatFunctionRecord2Size);
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 0, 8u);
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 4,
+                    kRdatNullRef);
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 8, 0u);
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 12, 2u);
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 16, 5u);
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 48,
+                    shader_info_index);
+
+    return DxilRuntimeDataBuilder()
+        .add(rdat::StringBuffer, strings)
+        .add(rdat::IndexArrays, indices)
+        .add(rdat::ResourceTable, resources)
+        .add(rdat::FunctionTable, functions)
+        .build();
+  };
+
+  RuntimeDataInfo info;
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  const std::vector<uint8_t> &bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+              ParseStatus::InvalidRuntimeData);
+  };
+
+  expect_invalid("resource name out of bounds",
+                 build(100u, 0u, 13u, kRdatNullRef));
+  expect_invalid("resource index out of bounds",
+                 build(0u, 1u, 13u, kRdatNullRef));
+  expect_invalid("dependency name out of bounds",
+                 build(0u, 0u, 100u, kRdatNullRef));
+  expect_invalid("missing shader info record", build(0u, 0u, 13u, 0u));
+
+  std::vector<uint8_t> short_resources(kRuntimeDataTableHeaderSize + 28);
+  Store<uint32_t>(short_resources, 0, 1u);
+  Store<uint32_t>(short_resources, 4, 28u);
+  expect_invalid(
+      "short resource record",
+      DxilRuntimeDataBuilder().add(rdat::ResourceTable, short_resources).build());
+
+  std::vector<uint8_t> short_functions(kRuntimeDataTableHeaderSize + 40);
+  Store<uint32_t>(short_functions, 0, 1u);
+  Store<uint32_t>(short_functions, 4, 40u);
+  expect_invalid(
+      "short function record",
+      DxilRuntimeDataBuilder().add(rdat::FunctionTable, short_functions).build());
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
