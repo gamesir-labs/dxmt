@@ -670,6 +670,104 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
   EXPECT_EQ(integrated_translation.resources[0].source_mask,
             DxilTranslationSourcePipelineStateValidation);
   EXPECT_EQ(integrated_translation.resources[0].bind_count, 4u);
+
+  std::vector<uint8_t> strings = {'m', 'a', 'i', 'n', 0,
+                                  't', 'e', 'x', 0};
+  std::vector<uint8_t> indices(6 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 3u);
+  Store<uint32_t>(indices, 4, 8u);
+  Store<uint32_t>(indices, 8, 4u);
+  Store<uint32_t>(indices, 12, 2u);
+  Store<uint32_t>(indices, 16, 1u);
+  Store<uint32_t>(indices, 20, 0u);
+
+  std::vector<uint8_t> resources(kRuntimeDataTableHeaderSize +
+                                 kRdatResourceRecordSize);
+  Store<uint32_t>(resources, 0, 1u);
+  Store<uint32_t>(resources, 4, kRdatResourceRecordSize);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 4, 6u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 8, 3u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 12, 2u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 16, 4u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 20, 7u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 24, 5u);
+  Store<uint32_t>(resources, kRuntimeDataTableHeaderSize + 28, 9u);
+
+  std::vector<uint8_t> compute(kRuntimeDataTableHeaderSize +
+                               kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute, 0, 1u);
+  Store<uint32_t>(compute, 4, kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(compute, kRuntimeDataTableHeaderSize + 4, 512u);
+
+  std::vector<uint8_t> functions(kRuntimeDataTableHeaderSize +
+                                 kRdatFunctionRecord2Size);
+  Store<uint32_t>(functions, 0, 1u);
+  Store<uint32_t>(functions, 4, kRdatFunctionRecord2Size);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 4, 0u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 8, 16u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 12,
+                  kRdatNullRef);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 16, 5u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 28, 0x11u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 32, 0x22u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 40, 0x60u);
+  functions[kRuntimeDataTableHeaderSize + 44] = 16;
+  functions[kRuntimeDataTableHeaderSize + 45] = 32;
+  Store<uint16_t>(functions, kRuntimeDataTableHeaderSize + 46, 0x1234u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 48, 0u);
+
+  const auto runtime_data =
+      DxilRuntimeDataBuilder()
+          .add(rdat::StringBuffer, strings)
+          .add(rdat::IndexArrays, indices)
+          .add(rdat::ResourceTable, resources)
+          .add(rdat::CSInfoTable, compute)
+          .add(rdat::FunctionTable, functions)
+          .build();
+  const auto runtime_container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, runtime_data)
+          .add(fourcc::PipelineStateValidation, psv)
+          .add(fourcc::RootSignature, root_signature)
+          .build();
+
+  Parser runtime_parser;
+  ASSERT_EQ(runtime_parser.parse(runtime_container), ParseStatus::Ok);
+  ASSERT_TRUE(runtime_parser.shaderReflection().has_value());
+  const auto &runtime_reflection = *runtime_parser.shaderReflection();
+  EXPECT_TRUE(runtime_reflection.has_runtime_data);
+  EXPECT_TRUE(runtime_reflection.has_pipeline_state_validation);
+  EXPECT_EQ(runtime_reflection.entry_point_name, "main");
+  EXPECT_EQ(runtime_reflection.function_name, "main");
+  EXPECT_EQ(runtime_reflection.num_threads_x, 8u);
+  EXPECT_EQ(runtime_reflection.num_threads_y, 4u);
+  EXPECT_EQ(runtime_reflection.num_threads_z, 2u);
+  EXPECT_EQ(runtime_reflection.group_shared_bytes_used, 1024u);
+  EXPECT_EQ(runtime_reflection.feature_flags, 0x0000002200000011ull);
+  EXPECT_EQ(runtime_reflection.min_shader_target, 0x60u);
+  EXPECT_EQ(runtime_reflection.shader_flags, 0x1234u);
+  ASSERT_EQ(runtime_reflection.resources.size(), 1u);
+  EXPECT_EQ(runtime_reflection.resources[0].name, "tex");
+  EXPECT_TRUE(runtime_reflection.resources[0].from_runtime_data);
+  EXPECT_FALSE(runtime_reflection.resources[0].from_psv);
+  EXPECT_EQ(runtime_reflection.resources[0].bind_count, 4u);
+
+  ASSERT_TRUE(runtime_parser.dxilValidation().has_value());
+  EXPECT_TRUE(runtime_parser.dxilValidation()->valid);
+  EXPECT_EQ(runtime_parser.dxilValidation()->error_count, 0u);
+  ASSERT_TRUE(runtime_parser.dxilTranslation().has_value());
+  const auto &runtime_translation = *runtime_parser.dxilTranslation();
+  EXPECT_TRUE(runtime_translation.has_runtime_data);
+  ASSERT_EQ(runtime_translation.resources.size(), 1u);
+  EXPECT_EQ(runtime_translation.resources[0].name, "tex");
+  EXPECT_EQ(runtime_translation.resources[0].source_mask,
+            DxilTranslationSourceRuntimeData);
+  EXPECT_EQ(runtime_translation.feature_flags, 0x0000002200000011ull);
+  EXPECT_EQ(runtime_translation.shader_flags, 0x1234u);
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
