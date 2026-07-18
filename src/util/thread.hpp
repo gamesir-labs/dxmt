@@ -53,7 +53,9 @@ public:
     this->incRef();
 
     m_handle = ::CreateThread(nullptr, 0x100000, ThreadFn::threadProc, this,
-                              STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+                              STACK_SIZE_PARAM_IS_A_RESERVATION |
+                                  CREATE_SUSPENDED,
+                              nullptr);
 
     if (m_handle == nullptr)
       throw MTLD3DError("Failed to create thread");
@@ -62,6 +64,15 @@ public:
   ~ThreadFn() {
     if (this->joinable())
       std::terminate();
+  }
+
+  void start() {
+    if (::ResumeThread(m_handle) == static_cast<DWORD>(-1)) {
+      ::CloseHandle(m_handle);
+      m_handle = nullptr;
+      this->decRef();
+      throw MTLD3DError("Failed to start thread");
+    }
   }
 
   void detach() {
@@ -115,7 +126,9 @@ public:
   thread() {}
 
   explicit thread(std::function<void()> &&func)
-      : m_thread(new ThreadFn(std::move(func))) {}
+      : m_thread(new ThreadFn(std::move(func))) {
+    m_thread->start();
+  }
 
   thread(thread &&other) : m_thread(std::move(other.m_thread)) {}
 

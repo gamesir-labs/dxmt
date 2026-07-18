@@ -9,6 +9,7 @@
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -74,6 +75,20 @@ TEST(ThreadWrapper, MoveTransfersJoinableOwnership) {
   EXPECT_TRUE(ran.load());
 }
 
+TEST(ThreadWrapper, StartsShortTasksAfterEstablishingOwnership) {
+  constexpr size_t thread_count = 128;
+  std::atomic<size_t> completed = 0;
+  std::vector<dxmt::thread> threads;
+  threads.reserve(thread_count);
+
+  for (size_t index = 0; index < thread_count; ++index)
+    threads.emplace_back([&] { completed.fetch_add(1); });
+  for (auto &thread : threads)
+    thread.join();
+
+  EXPECT_EQ(completed.load(), thread_count);
+}
+
 TEST(Threadpool, ExecutesQueuedWorkAndMakesWaitIdempotent) {
   dxmt::threadpool<ThreadpoolTrait> pool;
   std::atomic<uint32_t> completed = 0;
@@ -96,11 +111,22 @@ TEST(Threadpool, ExecutesQueuedWorkAndMakesWaitIdempotent) {
 
 TEST(Threadpool, RejectsMissingWorkOrOutputHandle) {
   dxmt::threadpool<ThreadpoolTrait> pool;
-  ThreadpoolWork work{};
+  std::atomic<uint32_t> completed = 0;
+  ThreadpoolWork work{&completed};
   dxmt::threadpool<ThreadpoolTrait>::work_handle handle;
 
   EXPECT_EQ(pool.enqueue(nullptr, &handle), E_POINTER);
   EXPECT_EQ(pool.enqueue(&work, nullptr), E_POINTER);
+
+  pool.wait(nullptr);
+  pool.wait(&handle);
+  EXPECT_TRUE(handle.done);
+  EXPECT_EQ(handle.work, nullptr);
+
+  ASSERT_EQ(pool.enqueue(&work, &handle), S_OK);
+  EXPECT_EQ(pool.enqueue(&work, &handle), E_INVALIDARG);
+  pool.wait(&handle);
+  EXPECT_EQ(completed.load(), 1u);
 }
 
 } // namespace

@@ -3,6 +3,8 @@
 #include "log/log.hpp"
 #include "util_error.hpp"
 
+#include <algorithm>
+
 namespace dxmt {
 
 #ifdef __WIN32__
@@ -38,7 +40,8 @@ public:
       throw MTLD3DError("Failed to create threadpool");
     }
 
-    SetThreadpoolThreadMaximum(pool_, dxmt::thread::hardware_concurrency());
+    SetThreadpoolThreadMaximum(
+        pool_, std::max(1u, dxmt::thread::hardware_concurrency()));
 
     cleanup_ = CreateThreadpoolCleanupGroup();
     if (!cleanup_) {
@@ -67,6 +70,8 @@ public:
                   work_handle *pHandle) {
     if (!Work || !pHandle)
       return E_POINTER;
+    if (pHandle->work)
+      return E_INVALIDARG;
 
     auto work = CreateThreadpoolWork(&WorkCallback, Work, &env_);
     if (!work)
@@ -79,8 +84,12 @@ public:
   }
 
   void wait(work_handle *handle) {
-    if (handle->done)
+    if (!handle || handle->done)
       return;
+    if (!handle->work) {
+      handle->done = true;
+      return;
+    }
     WaitForThreadpoolWorkCallbacks(handle->work, FALSE);
     CloseThreadpoolWork(handle->work);
     handle->done = true;
