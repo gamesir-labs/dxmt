@@ -4860,15 +4860,19 @@ public:
         ~static_cast<UINT>(D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
       return WARN_E_INVALIDARG(__func__);
 
+    for (UINT i = 0; i < fence_count; i++) {
+      if (!fences[i] ||
+          !DeviceChildBelongsToDevice(
+              fences[i], static_cast<IMTLD3D12Device *>(this)) ||
+          !dynamic_cast<Fence *>(fences[i]))
+        return WARN_E_INVALIDARG(__func__);
+    }
+
     std::vector<Fence *> wait_fences;
     wait_fences.reserve(fence_count);
     std::vector<UINT64> wait_values(values, values + fence_count);
     for (UINT i = 0; i < fence_count; i++) {
-      if (!fences[i])
-        return WARN_E_INVALIDARG(__func__);
       auto *fence = dynamic_cast<Fence *>(fences[i]);
-      if (!fence)
-        return WARN_E_INVALIDARG(__func__);
       fence->AddRefPrivate();
       wait_fences.push_back(fence);
     }

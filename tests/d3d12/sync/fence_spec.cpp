@@ -2,13 +2,52 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <iterator>
+#include <memory>
+#include <utility>
 
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
+
+class LifetimeProbe final : public IUnknown {
+public:
+  explicit LifetimeProbe(std::shared_ptr<std::atomic_bool> destroyed)
+      : destroyed_(std::move(destroyed)) {}
+
+  ~LifetimeProbe() { destroyed_->store(true, std::memory_order_release); }
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
+    if (iid != __uuidof(IUnknown))
+      return E_NOINTERFACE;
+    *object = this;
+    AddRef();
+    return S_OK;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return references_.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG references =
+        references_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (!references)
+      delete this;
+    return references;
+  }
+
+private:
+  std::atomic_ulong references_{1};
+  std::shared_ptr<std::atomic_bool> destroyed_;
+};
 
 class FenceSpec : public ::testing::Test {
 protected:
@@ -213,6 +252,65 @@ TEST_F(FenceSpec, MultipleFenceWaitAllTracksDuplicateFenceTargets) {
   ASSERT_EQ(fence->Signal(values[1]), S_OK);
   EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
 
+  CloseHandle(event);
+}
+
+TEST_F(FenceSpec, MultipleFenceFailuresAreAtomicAndRecoverable) {
+  auto first = CreateFence();
+  ASSERT_TRUE(first);
+  auto destroyed = std::make_shared<std::atomic_bool>(false);
+  auto *probe = new LifetimeProbe(destroyed);
+  ASSERT_EQ(first->SetPrivateDataInterface(__uuidof(IUnknown), probe), S_OK);
+  probe->Release();
+
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  const UINT64 values[] = {0, 1};
+  ID3D12Fence *partial[] = {first.get(), nullptr};
+  EXPECT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                nullptr, values, 1, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+                event),
+            E_INVALIDARG);
+  EXPECT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                partial, nullptr, 1, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+                event),
+            E_INVALIDARG);
+  EXPECT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                nullptr, nullptr, 0, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+                event),
+            E_INVALIDARG);
+  EXPECT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                partial, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+                event),
+            E_INVALIDARG);
+  EXPECT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                partial, values, 1,
+                static_cast<D3D12_MULTIPLE_FENCE_WAIT_FLAGS>(2), event),
+            E_INVALIDARG);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  ComPtr<ID3D12Fence> foreign_fence;
+  ASSERT_EQ(foreign_device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(foreign_fence.put())),
+            S_OK);
+  ID3D12Fence *foreign[] = {foreign_fence.get()};
+  EXPECT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                foreign, values, 1, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+                event),
+            E_INVALIDARG);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+
+  ID3D12Fence *valid[] = {first.get()};
+  ASSERT_EQ(device1_->SetEventOnMultipleFenceCompletion(
+                valid, values, 1, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event),
+            S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+
+  first.reset();
+  EXPECT_TRUE(destroyed->load(std::memory_order_acquire));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   CloseHandle(event);
 }
 
