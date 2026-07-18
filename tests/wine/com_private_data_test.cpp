@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -212,4 +213,15 @@ TEST(ComPointer, NullCastsAndQueriesRemainEmpty) {
   const dxmt::Com<IUnknown> empty;
   EXPECT_FALSE(empty.as<IUnknown>());
   EXPECT_FALSE(dxmt::Com<IUnknown>::queryFrom(nullptr));
+}
+
+TEST(ComPointer, QueryAlwaysReturnsAPublicReference) {
+  CountingUnknown object;
+  {
+    auto queried = dxmt::Com<IUnknown, false>::queryFrom(&object);
+    static_assert(std::is_same_v<decltype(queried), dxmt::Com<IUnknown>>);
+    EXPECT_EQ(queried.ptr(), &object);
+    EXPECT_EQ(object.references(), 2u);
+  }
+  EXPECT_EQ(object.references(), 1u);
 }

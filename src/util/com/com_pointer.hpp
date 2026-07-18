@@ -164,7 +164,7 @@ public:
   static Com<T> queryFrom(IUnknown *object) {
     if (object == nullptr)
       return nullptr;
-    Com<T, Public> ret(nullptr);
+    Com<T> ret(nullptr);
     if (SUCCEEDED(object->QueryInterface(__uuidof(T), (void **)&ret.m_ptr))) {
     }
     return ret;
