@@ -43,7 +43,18 @@ ResourceSubsetState::ResourceSubsetState(
 ) {
   auto total_planar = getPlanarCount(desc->format);
   auto planar_mask = getPlanarMask(desc->format) & ~ignore_planar_mask;
-  if (total_planar * total_mip_count * total_array_size <= 62) {
+  const uint64_t mip_end =
+      uint64_t(desc->firstMiplevel) + desc->miplevelCount;
+  const uint64_t array_end =
+      uint64_t(desc->firstArraySlice) + desc->arraySize;
+  if (mip_end > total_mip_count || array_end > total_array_size) {
+    encoded_tag = 0;
+    return;
+  }
+
+  const uint64_t total_subresources = uint64_t(total_planar) *
+                                      total_mip_count * total_array_size;
+  if (total_subresources <= 62) {
     encoded_tag = 0b11;
     uint64_t bits = 0;
     for (auto planar = 0u; planar < total_planar; planar++) {
@@ -57,12 +68,17 @@ ResourceSubsetState::ResourceSubsetState(
     }
     texture_bitmask.mask = bits;
   } else {
+    if (desc->firstMiplevel > 31 || mip_end > 31 ||
+        desc->firstArraySlice > 4095 || array_end > 4095) {
+      encoded_tag = 0;
+      return;
+    }
     encoded_tag = 0b10;
 
     texture.mip_start = desc->firstMiplevel;
-    texture.mip_end = desc->firstMiplevel + desc->miplevelCount;
+    texture.mip_end = mip_end;
     texture.array_start = desc->firstArraySlice;
-    texture.array_end = desc->firstArraySlice + desc->arraySize;
+    texture.array_end = array_end;
     texture.planar_mask = planar_mask;
   }
 }

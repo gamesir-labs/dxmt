@@ -21,12 +21,13 @@ public:
   };
 
   struct TextureSubset {
-    uint64_t tag          : 2;
-    uint64_t planar_mask  : 30;
-    uint64_t mip_start    : 4;
-    uint64_t array_start  : 12;
-    uint64_t mip_end    : 4;
-    uint64_t array_end : 12;
+    uint64_t tag         : 2;
+    uint64_t planar_mask : 2;
+    uint64_t mip_start   : 5;
+    uint64_t array_start : 12;
+    uint64_t mip_end     : 5;
+    uint64_t array_end   : 12;
+    uint64_t reserved    : 26;
   };
 
   inline bool
@@ -40,8 +41,11 @@ public:
     if (encoded_tag == 0b01) {
       if (!buffer.length || !other.buffer.length)
         return false;
-      return (buffer.offset < other.buffer.offset + other.buffer.length) &&
-             (other.buffer.offset < buffer.offset + buffer.length);
+      const uint64_t end = uint64_t(buffer.offset) + buffer.length;
+      const uint64_t other_end =
+          uint64_t(other.buffer.offset) + other.buffer.length;
+      return uint64_t(buffer.offset) < other_end &&
+             uint64_t(other.buffer.offset) < end;
     } else if (encoded_tag == 0b11) {
       return texture_bitmask.mask & other.texture_bitmask.mask;
     } else if (encoded_tag == 0b10) {
@@ -60,6 +64,10 @@ public:
   }
 
   ResourceSubsetState(uint32_t buffer_offset, uint32_t buffer_length) {
+    if (buffer_offset > 0x7fffffffu || buffer_length > 0x7fffffffu) {
+      encoded_tag = 0;
+      return;
+    }
     encoded_tag = 0b01;
     buffer.offset = buffer_offset;
     buffer.length = buffer_length;

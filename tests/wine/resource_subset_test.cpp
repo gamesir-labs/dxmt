@@ -27,6 +27,21 @@ TEST(ResourceSubset, BufferRangesUseHalfOpenIntervals) {
   EXPECT_FALSE(empty.overlapWith(first));
 }
 
+TEST(ResourceSubset, HandlesLargeBufferSumsAndConservativelyWidensOverflow) {
+  const dxmt::ResourceSubsetState large(0x70000000u, 0x20000000u);
+  const dxmt::ResourceSubsetState overlapping(0x78000000u, 1u);
+  EXPECT_TRUE(large.overlapWith(overlapping));
+  EXPECT_TRUE(overlapping.overlapWith(large));
+
+  const dxmt::ResourceSubsetState unencodable_offset(0x80000000u, 1u);
+  const dxmt::ResourceSubsetState unencodable_length(0u, 0x80000000u);
+  const dxmt::ResourceSubsetState ordinary(16u, 4u);
+  EXPECT_TRUE(unencodable_offset.overlapWith(ordinary));
+  EXPECT_TRUE(ordinary.overlapWith(unencodable_offset));
+  EXPECT_TRUE(unencodable_length.overlapWith(ordinary));
+  EXPECT_TRUE(ordinary.overlapWith(unencodable_length));
+}
+
 dxmt::TextureViewDescriptor
 MakeTextureView(WMTPixelFormat format, uint32_t first_mip, uint32_t mip_count,
                 uint32_t first_slice, uint32_t slice_count) {
@@ -143,6 +158,28 @@ TEST(ResourceSubset, LargeRangesKeepDepthAndStencilPlanesIndependent) {
   EXPECT_FALSE(depth_only.overlapWith(stencil_only));
   EXPECT_TRUE(depth_only.overlapWith(both));
   EXPECT_TRUE(stencil_only.overlapWith(both));
+}
+
+TEST(ResourceSubset, RepresentsTheLastMipAndArraySliceWithoutTruncation) {
+  const auto last_mip =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 15, 1, 0, 1);
+  const auto prior_mip =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 14, 1, 0, 1);
+  const dxmt::ResourceSubsetState mip(&last_mip, 16, 16);
+  const dxmt::ResourceSubsetState same_mip(&last_mip, 16, 16);
+  const dxmt::ResourceSubsetState adjacent_mip(&prior_mip, 16, 16);
+  EXPECT_TRUE(mip.overlapWith(same_mip));
+  EXPECT_FALSE(mip.overlapWith(adjacent_mip));
+
+  const auto last_slice =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 1, 2047, 1);
+  const auto prior_slice =
+      MakeTextureView(WMTPixelFormatRGBA8Unorm, 0, 1, 2046, 1);
+  const dxmt::ResourceSubsetState slice(&last_slice, 1, 2048);
+  const dxmt::ResourceSubsetState same_slice(&last_slice, 1, 2048);
+  const dxmt::ResourceSubsetState adjacent_slice(&prior_slice, 1, 2048);
+  EXPECT_TRUE(slice.overlapWith(same_slice));
+  EXPECT_FALSE(slice.overlapWith(adjacent_slice));
 }
 
 TEST(ResourceSubset, PreservesPlaneMasksAtTheCompactRangeBoundary) {
