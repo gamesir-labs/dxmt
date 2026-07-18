@@ -6,8 +6,10 @@
 #include "util_env.hpp"
 #include "util_math.hpp"
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 
 namespace dxmt {
 
@@ -265,18 +267,30 @@ std::pair<typename Allocator::Block &, uint64_t>
 RingBumpState<Allocator, BlockSize, mutex>::allocate(
     uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment
 ) {
+  if (!alignment || (alignment & (alignment - 1)))
+    throw std::invalid_argument("RingBumpState alignment must be a power of two");
+
   std::lock_guard<mutex> lock(mutex_);
   const auto guard_bytes =
       RingBumpGuardEnabled() && RingBumpAllocatorSupportsGuard<Allocator>()
           ? kRingBumpGuardBytes
           : 0;
+  if (size > std::numeric_limits<size_t>::max() - guard_bytes)
+    throw std::overflow_error("RingBumpState allocation size overflow");
+
   while (!fifo.empty()) {
     auto &latest = fifo.back();
     check_guard(latest, "allocate_latest");
-    if ((align(latest.allocated_size, alignment) + size) >
-        latest.total_size - guard_bytes) {
+    if (latest.total_size < guard_bytes ||
+        latest.allocated_size >
+            std::numeric_limits<size_t>::max() - (alignment - 1)) {
       break;
     }
+    const auto offset = align(latest.allocated_size, alignment);
+    const auto available = latest.total_size - guard_bytes;
+    if (offset > available || size > available - offset)
+      break;
+
     latest.last_used_seq_id = seq_id;
     return suballocate(latest, size, alignment);
   }

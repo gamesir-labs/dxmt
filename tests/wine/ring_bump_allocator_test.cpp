@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -118,6 +120,31 @@ TEST(RingBumpAllocator, TracksTheLastSequenceThatUsedAStandardBlock) {
   EXPECT_EQ(reused.id, first_id);
   EXPECT_EQ(reused_offset, 0u);
   EXPECT_EQ(state->allocated_sizes.size(), 2u);
+}
+
+TEST(RingBumpAllocator, OverflowingFitCheckStartsANewBlock) {
+  auto state = std::make_shared<FakeAllocatorState>();
+  TestRing ring{FakeAllocator(state)};
+
+  const auto [first, first_offset] = ring.allocate(1, 0, 1, 1);
+  const auto first_id = first.id;
+  const auto [huge, huge_offset] = ring.allocate(
+      2, 0, std::numeric_limits<size_t>::max(), 1);
+
+  EXPECT_EQ(first_offset, 0u);
+  EXPECT_NE(huge.id, first_id);
+  EXPECT_EQ(huge_offset, 0u);
+  EXPECT_EQ(state->allocated_sizes,
+            (std::vector<size_t>{64, std::numeric_limits<size_t>::max()}));
+}
+
+TEST(RingBumpAllocator, RejectsInvalidAlignmentBeforeAllocating) {
+  auto state = std::make_shared<FakeAllocatorState>();
+  TestRing ring{FakeAllocator(state)};
+
+  EXPECT_THROW(ring.allocate(1, 0, 1, 0), std::invalid_argument);
+  EXPECT_THROW(ring.allocate(1, 0, 1, 3), std::invalid_argument);
+  EXPECT_TRUE(state->allocated_sizes.empty());
 }
 
 } // namespace
