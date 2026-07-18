@@ -7,6 +7,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class ResidencySpec : public ::testing::Test {
@@ -102,6 +103,27 @@ TEST_F(ResidencySpec, EnqueueMakeResidentSignalsFenceValuesInOrder) {
   EXPECT_GE(fence->GetCompletedValue(), 7u);
 }
 
+TEST_F(ResidencySpec, EnqueueMakeResidentAcceptsDenyOverbudgetFlag) {
+  ComPtr<ID3D12Device3> device3;
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device3.put())),
+            S_OK);
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.put())),
+            S_OK);
+  ASSERT_TRUE(resource);
+  ID3D12Pageable *objects[] = {resource.get()};
+
+  ASSERT_EQ(device3->EnqueueMakeResident(
+                D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 1, objects,
+                fence.get(), 5),
+            S_OK);
+  EXPECT_GE(fence->GetCompletedValue(), 5u);
+}
+
 TEST_F(ResidencySpec, AcceptsPriorityBucketsAndApplicationValues) {
   ComPtr<ID3D12Device1> device1;
   ASSERT_EQ(context_.device()->QueryInterface(
@@ -124,6 +146,121 @@ TEST_F(ResidencySpec, AcceptsPriorityBucketsAndApplicationValues) {
                 static_cast<UINT>(objects.size()), objects.data(),
                 priorities.data()),
             S_OK);
+}
+
+TEST_F(ResidencySpec, RejectsInvalidAndForeignObjectsAndRecovers) {
+  ComPtr<ID3D12Device1> device1;
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device1.put())),
+            S_OK);
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ASSERT_TRUE(resource);
+  ID3D12Pageable *valid_objects[] = {resource.get()};
+  ID3D12Pageable *null_objects[] = {nullptr};
+  const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
+
+  EXPECT_EQ(context_.device()->MakeResident(1, nullptr), E_INVALIDARG);
+  EXPECT_EQ(context_.device()->Evict(1, null_objects), E_INVALIDARG);
+  EXPECT_EQ(device1->SetResidencyPriority(1, valid_objects, nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(device1->SetResidencyPriority(1, null_objects, &priority),
+            E_INVALIDARG);
+
+  ComPtr<ID3D12Pageable> allocator_pageable;
+  ASSERT_EQ(context_.allocator()->QueryInterface(
+                IID_PPV_ARGS(allocator_pageable.put())),
+            S_OK);
+  ID3D12Pageable *unsupported_objects[] = {allocator_pageable.get()};
+  EXPECT_EQ(context_.device()->MakeResident(1, unsupported_objects),
+            E_INVALIDARG);
+  EXPECT_EQ(context_.device()->Evict(1, unsupported_objects), E_INVALIDARG);
+  EXPECT_EQ(device1->SetResidencyPriority(1, unsupported_objects, &priority),
+            E_INVALIDARG);
+
+  auto placed_heap = CreateBufferHeap();
+  ASSERT_TRUE(placed_heap);
+  D3D12_RESOURCE_DESC placed_desc = {};
+  placed_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  placed_desc.Width = 4096;
+  placed_desc.Height = 1;
+  placed_desc.DepthOrArraySize = 1;
+  placed_desc.MipLevels = 1;
+  placed_desc.SampleDesc.Count = 1;
+  placed_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ComPtr<ID3D12Resource> placed_resource;
+  ASSERT_EQ(context_.device()->CreatePlacedResource(
+                placed_heap.get(), 0, &placed_desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(placed_resource.put())),
+            S_OK);
+  ID3D12Pageable *placed_objects[] = {placed_resource.get()};
+  EXPECT_EQ(context_.device()->MakeResident(1, placed_objects), E_INVALIDARG);
+  EXPECT_EQ(context_.device()->Evict(1, placed_objects), E_INVALIDARG);
+  EXPECT_EQ(device1->SetResidencyPriority(1, placed_objects, &priority),
+            E_INVALIDARG);
+
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign_resource = foreign_context.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ASSERT_TRUE(foreign_resource);
+  ID3D12Pageable *foreign_objects[] = {foreign_resource.get()};
+  EXPECT_EQ(context_.device()->MakeResident(1, foreign_objects), E_INVALIDARG);
+  EXPECT_EQ(context_.device()->Evict(1, foreign_objects), E_INVALIDARG);
+  EXPECT_EQ(device1->SetResidencyPriority(1, foreign_objects, &priority),
+            E_INVALIDARG);
+
+  EXPECT_EQ(context_.device()->MakeResident(1, valid_objects), S_OK);
+  EXPECT_EQ(context_.device()->Evict(1, valid_objects), S_OK);
+  EXPECT_EQ(device1->SetResidencyPriority(1, valid_objects, &priority), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(ResidencySpec, EnqueueFailureDoesNotSignalFenceAndRecovers) {
+  ComPtr<ID3D12Device3> device3;
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device3.put())),
+            S_OK);
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                2, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.put())),
+            S_OK);
+  ASSERT_TRUE(resource);
+  ID3D12Pageable *valid_objects[] = {resource.get()};
+  ID3D12Pageable *null_objects[] = {nullptr};
+
+  EXPECT_EQ(device3->EnqueueMakeResident(
+                static_cast<D3D12_RESIDENCY_FLAGS>(2), 1, valid_objects,
+                fence.get(), 7),
+            E_INVALIDARG);
+  EXPECT_EQ(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1,
+                                         null_objects, fence.get(), 7),
+            E_INVALIDARG);
+  EXPECT_EQ(fence->GetCompletedValue(), 2u);
+
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  ComPtr<ID3D12Fence> foreign_fence;
+  ASSERT_EQ(foreign_device->CreateFence(
+                3, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(foreign_fence.put())),
+            S_OK);
+  EXPECT_EQ(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1,
+                                         valid_objects, foreign_fence.get(),
+                                         9),
+            E_INVALIDARG);
+  EXPECT_EQ(foreign_fence->GetCompletedValue(), 3u);
+
+  EXPECT_EQ(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1,
+                                         valid_objects, fence.get(), 11),
+            S_OK);
+  EXPECT_GE(fence->GetCompletedValue(), 11u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace

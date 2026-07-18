@@ -953,6 +953,46 @@ ResourceBelongsToDevice(ID3D12Resource *resource, IMTLD3D12Device *device) {
 }
 
 static bool
+DeviceChildBelongsToDevice(ID3D12DeviceChild *object,
+                           IMTLD3D12Device *device) {
+  if (!object)
+    return false;
+  IMTLD3D12Device *parent = nullptr;
+  const HRESULT hr = object->GetDevice(
+      __uuidof(IMTLD3D12Device), reinterpret_cast<void **>(&parent));
+  const bool belongs = SUCCEEDED(hr) && parent == device;
+  if (parent)
+    parent->Release();
+  return belongs;
+}
+
+static bool
+IsSupportedResidencyObject(ID3D12Pageable *object,
+                           IMTLD3D12Device *device) {
+  if (!DeviceChildBelongsToDevice(object, device))
+    return false;
+  if (auto *resource = dynamic_cast<Resource *>(object))
+    return resource->GetKind() == ResourceKind::Committed;
+  return dynamic_cast<DescriptorHeap *>(object) ||
+         dynamic_cast<Heap *>(object) || dynamic_cast<QueryHeap *>(object);
+}
+
+static bool
+ValidateResidencyObjects(UINT object_count,
+                         ID3D12Pageable *const *objects,
+                         IMTLD3D12Device *device) {
+  if (!object_count)
+    return true;
+  if (!objects)
+    return false;
+  for (UINT i = 0; i < object_count; ++i) {
+    if (!IsSupportedResidencyObject(objects[i], device))
+      return false;
+  }
+  return true;
+}
+
+static bool
 IsBufferResource(ID3D12Resource *resource) {
   auto *d3d12_resource = dynamic_cast<Resource *>(resource);
   return d3d12_resource &&
@@ -4698,11 +4738,17 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE MakeResident(UINT object_count, ID3D12Pageable *const *objects) override {
-    return S_OK;
+    return ValidateResidencyObjects(object_count, objects,
+                                    static_cast<IMTLD3D12Device *>(this))
+               ? S_OK
+               : WARN_E_INVALIDARG(__func__);
   }
 
   HRESULT STDMETHODCALLTYPE Evict(UINT object_count, ID3D12Pageable *const *objects) override {
-    return S_OK;
+    return ValidateResidencyObjects(object_count, objects,
+                                    static_cast<IMTLD3D12Device *>(this))
+               ? S_OK
+               : WARN_E_INVALIDARG(__func__);
   }
 
 #ifdef __ID3D12Device3_INTERFACE_DEFINED__
@@ -4776,9 +4822,10 @@ public:
                                                 ID3D12Pageable *const *objects,
                                                 ID3D12Fence *fence,
                                                 UINT64 fence_value) override {
-    if (flags)
+    if (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)
       return WARN_E_INVALIDARG(__func__);
-    if (!fence)
+    if (!DeviceChildBelongsToDevice(
+            fence, static_cast<IMTLD3D12Device *>(this)))
       return WARN_E_INVALIDARG(__func__);
     HRESULT hr = MakeResident(object_count, objects);
     if (FAILED(hr))
@@ -4944,13 +4991,12 @@ public:
   HRESULT STDMETHODCALLTYPE
   SetResidencyPriority(UINT object_count, ID3D12Pageable *const *objects,
                        const D3D12_RESIDENCY_PRIORITY *priorities) override {
-    if (object_count && (!objects || !priorities))
+    if (object_count && !priorities)
       return WARN_E_INVALIDARG(__func__);
-    for (UINT i = 0; i < object_count; i++) {
-      if (!objects[i])
-        return WARN_E_INVALIDARG(__func__);
-    }
-    return S_OK;
+    return ValidateResidencyObjects(object_count, objects,
+                                    static_cast<IMTLD3D12Device *>(this))
+               ? S_OK
+               : WARN_E_INVALIDARG(__func__);
   }
 
   HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial_value, D3D12_FENCE_FLAGS flags,
