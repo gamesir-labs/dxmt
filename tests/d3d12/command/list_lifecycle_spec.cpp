@@ -103,17 +103,96 @@ TEST_F(CommandListLifecycleSpec, CreateCommandListStartsRecording) {
   EXPECT_TRUE(SUCCEEDED(list->Close()));
 }
 
-TEST_F(CommandListLifecycleSpec, CreateCommandList1StartsClosed) {
+TEST_F(CommandListLifecycleSpec, CreateCommandList1StartsClosedForCoreTypes) {
   ComPtr<ID3D12Device4> device4;
-  ASSERT_TRUE(SUCCEEDED(context_.device()->QueryInterface(
-      __uuidof(ID3D12Device4), reinterpret_cast<void **>(device4.put()))));
-  ComPtr<ID3D12GraphicsCommandList> list;
-  ASSERT_TRUE(SUCCEEDED(device4->CreateCommandList1(
-      0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE,
-      __uuidof(ID3D12GraphicsCommandList),
-      reinterpret_cast<void **>(list.put()))));
+  ASSERT_EQ(context_.device()->QueryInterface(
+                __uuidof(ID3D12Device4),
+                reinterpret_cast<void **>(device4.put())),
+            S_OK);
+  constexpr std::array<D3D12_COMMAND_LIST_TYPE, 4> types = {
+      D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_BUNDLE,
+      D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY};
 
-  EXPECT_EQ(list->Close(), E_FAIL);
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ASSERT_EQ(device4->CreateCommandList1(
+                  static_cast<UINT>(i & 1), types[i],
+                  D3D12_COMMAND_LIST_FLAG_NONE,
+                  __uuidof(ID3D12GraphicsCommandList),
+                  reinterpret_cast<void **>(list.put())),
+              S_OK)
+        << "type=" << types[i];
+    ASSERT_TRUE(list) << "type=" << types[i];
+    EXPECT_EQ(list->GetType(), types[i]);
+    EXPECT_EQ(list->Close(), E_FAIL) << "type=" << types[i];
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                  types[i], IID_PPV_ARGS(allocator.put())),
+              S_OK)
+        << "type=" << types[i];
+    EXPECT_EQ(list->Reset(allocator.get(), nullptr), S_OK)
+        << "type=" << types[i];
+    EXPECT_EQ(list->Close(), S_OK) << "type=" << types[i];
+  }
+}
+
+TEST_F(CommandListLifecycleSpec,
+       CreateCommandList1RejectsInvalidInputsAndRecovers) {
+  ComPtr<ID3D12Device4> device4;
+  ASSERT_EQ(context_.device()->QueryInterface(
+                __uuidof(ID3D12Device4),
+                reinterpret_cast<void **>(device4.put())),
+            S_OK);
+  const GUID unsupported = {0x47de88d6,
+                            0xd32f,
+                            0x4129,
+                            {0xb3, 0xca, 0xf7, 0x6a, 0x6e, 0x7c, 0x84, 0xc4}};
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+
+  EXPECT_EQ(device4->CreateCommandList1(
+                2, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_LIST_FLAG_NONE,
+                __uuidof(ID3D12GraphicsCommandList), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device4->CreateCommandList1(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                static_cast<D3D12_COMMAND_LIST_FLAGS>(1),
+                __uuidof(ID3D12GraphicsCommandList), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device4->CreateCommandList1(
+                0, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+                D3D12_COMMAND_LIST_FLAG_NONE,
+                __uuidof(ID3D12GraphicsCommandList), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device4->CreateCommandList1(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_LIST_FLAG_NONE, unsupported, &output),
+            E_NOINTERFACE);
+  EXPECT_EQ(output, nullptr);
+  EXPECT_EQ(device4->CreateCommandList1(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_LIST_FLAG_NONE,
+                __uuidof(ID3D12GraphicsCommandList), nullptr),
+            E_POINTER);
+
+  ComPtr<ID3D12CommandList> list;
+  ASSERT_EQ(device4->CreateCommandList1(
+                1, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(list.put())),
+            S_OK);
+  ASSERT_TRUE(list);
+  EXPECT_EQ(list->GetType(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(CommandListLifecycleSpec, SecondCloseFails) {
