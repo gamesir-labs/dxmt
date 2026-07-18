@@ -34,6 +34,8 @@ Sha1HashState::Sha1HashState() {
 
 Sha1HashState &
 Sha1HashState::update(const void *data, size_t size) {
+  if (!size)
+    return *this;
   SHA1Update(&ctx, reinterpret_cast<const uint8_t *>(data), size);
   return *this;
 }

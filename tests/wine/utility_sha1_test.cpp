@@ -45,6 +45,11 @@ TEST(Sha1, IncrementalUpdatesMatchOneShotBinaryInput) {
             dxmt::Sha1HashState::compute(bytes.data(), bytes.size()));
 }
 
+TEST(Sha1, AcceptsANullPointerForEmptyInput) {
+  EXPECT_EQ(dxmt::Sha1HashState::compute(nullptr, 0).string(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+}
+
 TEST(Sha1, ObjectUpdateHashesTheCompleteObjectRepresentation) {
   constexpr uint32_t value = 0x12345678u;
   dxmt::Sha1HashState object_hash;
