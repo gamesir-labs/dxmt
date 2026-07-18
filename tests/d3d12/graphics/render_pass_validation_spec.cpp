@@ -63,6 +63,25 @@ TEST_P(RenderPassValidationSpec, InvalidStateFailsAtClose) {
     break;
   }
   EXPECT_EQ(context_.list()->Close(), expected);
+
+  ComPtr<ID3D12CommandAllocator> recovery_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ComPtr<ID3D12GraphicsCommandList4> recovery_list4;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recovery_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recovery_allocator.get(),
+                nullptr, IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  ASSERT_EQ(recovery_list->QueryInterface(IID_PPV_ARGS(recovery_list4.put())),
+            S_OK);
+  recovery_list4->BeginRenderPass(0, nullptr, nullptr,
+                                  D3D12_RENDER_PASS_FLAG_NONE);
+  recovery_list4->EndRenderPass();
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 std::string InvalidRenderPassCaseName(
