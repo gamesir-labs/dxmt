@@ -447,34 +447,6 @@ TEST(D3D12FencePoolSpec, DoesNotCreateMetalFencesForEmptyExecute) {
   EXPECT_TRUE(marker.Slots().empty());
 }
 
-struct ScopedMetal4RejectionMarker {
-  ScopedMetal4RejectionMarker() {
-    std::ostringstream name;
-    name << "dxmt-metal4-rejection-" << GetCurrentProcessId() << "-"
-         << GetTickCount64() << ".txt";
-    unix_path = "/tmp/" + name.str();
-    windows_path = "Z:\\tmp\\" + name.str();
-    std::ofstream(windows_path, std::ios::trunc).close();
-    SetUnixEnvironment("DXMT_TEST_METAL4_REJECTION_MARKER",
-                       unix_path.c_str());
-  }
-
-  ~ScopedMetal4RejectionMarker() {
-    SetUnixEnvironment("DXMT_TEST_METAL4_REJECTION_MARKER", nullptr);
-    DeleteFileA(windows_path.c_str());
-  }
-
-  size_t Count() const {
-    std::ifstream input(windows_path);
-    return static_cast<size_t>(
-        std::count(std::istream_iterator<std::string>(input),
-                   std::istream_iterator<std::string>(), "rejected"));
-  }
-
-  std::string unix_path;
-  std::string windows_path;
-};
-
 std::vector<ComPtr<ID3D12GraphicsCommandList>> CreateBarrierOnlyLists(
     D3D12TestContext &context, ID3D12Resource *resource, UINT count,
     std::vector<ComPtr<ID3D12CommandAllocator>> *allocators) {
@@ -2166,9 +2138,13 @@ DXMT_SERIAL_TEST_DOMAIN(
 DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
                    CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions) {
   ScopedCommandBufferErrorMarker marker;
-  ScopedMetal4RejectionMarker rejection_marker;
   D3D12TestContext context;
   ASSERT_TRUE(SUCCEEDED(context.Initialize()));
+  ComPtr<ID3D12Fence> rejected_fence;
+  ASSERT_EQ(context.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                reinterpret_cast<void **>(rejected_fence.put())),
+            S_OK);
   const auto injection_token =
       std::to_string(GetCurrentProcessId()) + "-" +
       std::to_string(GetTickCount64());
@@ -2198,37 +2174,34 @@ DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
   ASSERT_TRUE(SUCCEEDED(context.ResetCommandList()));
   context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
                                    sizeof(expected));
-  const auto rejected_begin = std::chrono::steady_clock::now();
-  EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
-  EXPECT_LT(std::chrono::steady_clock::now() - rejected_begin,
-            std::chrono::seconds(5));
   size_t command_buffer_errors = 0;
-  size_t rejected_submissions = 0;
   HRESULT removed_reason = S_OK;
   const auto observation_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
   do {
     command_buffer_errors = marker.Count();
-    rejected_submissions = rejection_marker.Count();
     removed_reason = context.device()->GetDeviceRemovedReason();
-    if (command_buffer_errors >= 1 && rejected_submissions >= 1 &&
+    if (command_buffer_errors >= 1 &&
         removed_reason == DXGI_ERROR_DEVICE_REMOVED)
       break;
     Sleep(10);
   } while (std::chrono::steady_clock::now() < observation_deadline);
   EXPECT_GE(command_buffer_errors, 1u);
-  EXPECT_GE(rejected_submissions, 1u);
   EXPECT_EQ(removed_reason, DXGI_ERROR_DEVICE_REMOVED);
 
   ASSERT_TRUE(SetEnvironmentVariableA(
       "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr));
   SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr);
 
-  ASSERT_TRUE(SUCCEEDED(context.ResetCommandList()));
-  context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
-                                   sizeof(expected));
-  EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
-  EXPECT_EQ(rejection_marker.Count(), 1u);
+  ASSERT_EQ(context.list()->Close(), S_OK);
+  ID3D12CommandList *lists[] = {context.list()};
+  context.queue()->ExecuteCommandLists(1, lists);
+  EXPECT_EQ(context.allocator()->Reset(), S_OK);
+
+  EXPECT_EQ(context.queue()->Signal(rejected_fence.get(), 1),
+            DXGI_ERROR_DEVICE_REMOVED);
+  EXPECT_EQ(context.queue()->Wait(rejected_fence.get(), 1),
+            DXGI_ERROR_DEVICE_REMOVED);
 }
 
 } // namespace

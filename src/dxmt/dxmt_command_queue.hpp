@@ -290,6 +290,10 @@ public:
     return device_error_.load(std::memory_order_acquire);
   }
 
+  void MarkDeviceError() {
+    device_error_.store(true, std::memory_order_release);
+  }
+
   CommandChunk *
   CurrentChunk() {
     auto id = ready_for_encode.load(std::memory_order_relaxed);

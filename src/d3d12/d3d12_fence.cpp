@@ -374,7 +374,8 @@ public:
   }
 
   bool HasReached(UINT64 value) const override {
-    return MTLSharedEvent_signaledValue(event_.handle) >= value;
+    return device_->GetDXMTDevice().queue().HasDeviceError() ||
+           MTLSharedEvent_signaledValue(event_.handle) >= value;
   }
 
   void RegisterQueueSignal(const FenceGpuSignal &signal) override {
@@ -451,6 +452,8 @@ private:
   };
 
   UINT64 GetCompletedValueLocked() const {
+    if (device_->GetDXMTDevice().queue().HasDeviceError())
+      return UINT64_MAX;
     if (has_manual_completed_value_)
       return completed_value_;
     return MTLSharedEvent_signaledValue(event_.handle);

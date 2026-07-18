@@ -11,6 +11,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class LifetimeOwner final : public ID3D12LifetimeOwner {
@@ -173,6 +174,60 @@ TEST_F(DeviceControlSpec,
                 &identifier),
             D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+
+  D3D12TestContext context;
+  ASSERT_EQ(context.Initialize(device.get()), S_OK);
+  ASSERT_EQ(context.list()->Close(), S_OK);
+
+  ComPtr<ID3D12Device5> device5;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(ID3D12Device5),
+                reinterpret_cast<void **>(device5.put())),
+            S_OK);
+  ASSERT_TRUE(device5);
+
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  ASSERT_TRUE(fence);
+
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+
+  EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
+  device5->RemoveDevice();
+  device5->RemoveDevice();
+  EXPECT_EQ(device->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED);
+  EXPECT_EQ(fence->GetCompletedValue(), UINT64_MAX);
+  EXPECT_EQ(fence->SetEventOnCompletion(1, event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+  EXPECT_EQ(context.queue()->Signal(fence.get(), 1),
+            DXGI_ERROR_DEVICE_REMOVED);
+  EXPECT_EQ(context.queue()->Wait(fence.get(), 1),
+            DXGI_ERROR_DEVICE_REMOVED);
+
+  ID3D12CommandList *lists[] = {context.list()};
+  context.queue()->ExecuteCommandLists(1, lists);
+  EXPECT_EQ(context.allocator()->Reset(), S_OK);
+
+  auto fresh_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(fresh_device);
+  EXPECT_EQ(fresh_device->GetDeviceRemovedReason(), S_OK);
+  ComPtr<ID3D12Fence> fresh_fence;
+  EXPECT_EQ(fresh_device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                reinterpret_cast<void **>(fresh_fence.put())),
+            S_OK);
+  EXPECT_TRUE(fresh_fence);
+
+  CloseHandle(event);
 }
 
 } // namespace

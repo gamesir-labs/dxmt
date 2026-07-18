@@ -5181,7 +5181,7 @@ public:
   }
 
   void STDMETHODCALLTYPE RemoveDevice() override {
-    WARN("D3D12Device: RemoveDevice is unsupported");
+    device_->queue().MarkDeviceError();
   }
 
   HRESULT STDMETHODCALLTYPE EnumerateMetaCommands(UINT *meta_command_count,

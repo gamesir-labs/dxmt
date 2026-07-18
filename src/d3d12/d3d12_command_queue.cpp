@@ -4856,6 +4856,9 @@ public:
     if (!command_list_count)
       return;
 
+    if (device_->GetDXMTDevice().queue().HasDeviceError())
+      return;
+
     if (!command_lists) {
       Logger::err("D3D12CommandQueue: ExecuteCommandLists called with null command list array");
       return;
@@ -4973,6 +4976,9 @@ public:
     if (!state)
       return WARN_E_INVALIDARG(__func__);
 
+    if (device_->GetDXMTDevice().queue().HasDeviceError())
+      return DXGI_ERROR_DEVICE_REMOVED;
+
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: Signal enqueue"
@@ -5003,6 +5009,9 @@ public:
     auto *state = dynamic_cast<Fence *>(fence);
     if (!state)
       return WARN_E_INVALIDARG(__func__);
+
+    if (device_->GetDXMTDevice().queue().HasDeviceError())
+      return DXGI_ERROR_DEVICE_REMOVED;
 
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {

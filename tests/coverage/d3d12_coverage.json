@@ -306,6 +306,7 @@
           "CreateCommandList1",
           "CreateFence",
           "GetDeviceRemovedReason",
+          "RemoveDevice",
           "CreateCommittedResource",
           "CreateCommittedResource1",
           "CreateCommittedResource2",

@@ -1076,7 +1076,7 @@ CommandQueue::WaitForFinishThread() {
     }
     chunk.finish_complete_time = clock::now();
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
-      device_error_.store(true, std::memory_order_release);
+      MarkDeviceError();
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
       const auto error_marker =
           env::getEnvVar("DXMT_TEST_COMMAND_BUFFER_ERROR_MARKER");
