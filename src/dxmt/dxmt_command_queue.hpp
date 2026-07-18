@@ -361,6 +361,10 @@ public:
   void
   AddPersistentResidency(WMT::Resource resource);
 
+  // Test-only synchronized accounting used by the D3D12 residency oracle.
+  std::pair<uint32_t, uint64_t>
+  PersistentResidencyStatsForTesting();
+
   // App-thread retirement: waits only for work that has actually been
   // published. This avoids pinning descriptor history to an empty next chunk.
   void

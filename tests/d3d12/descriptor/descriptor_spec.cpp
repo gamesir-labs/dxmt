@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_d3d12_test_path.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -227,7 +228,13 @@ struct DescriptorTableDrawOptions {
   bool repeat_graphics_root_signature = false;
   bool set_compute_root_signature = false;
   bool expect_cbv_rejected = false;
+  bool force_fallback = false;
 };
+
+ULONG PublicRefCount(IUnknown *object) {
+  object->AddRef();
+  return object->Release();
+}
 
 void RunDescriptorTableDraw(
     D3D12TestContext &context,
@@ -485,6 +492,14 @@ void RunDescriptorTableDraw(
   }
 
   const float clear_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  if (options.force_fallback) {
+    dxmt::d3d12::test::ExecutionPathConfig path = {};
+    path.mode = dxmt::d3d12::test::ExecutionPathMode::Fallback;
+    ASSERT_EQ(context.list()->SetPrivateData(
+                  dxmt::d3d12::test::kExecutionPathConfigGuid, sizeof(path),
+                  &path),
+              S_OK);
+  }
   context.list()->ClearRenderTargetView(render_target.view, clear_color, 0,
                                         nullptr);
   context.list()->OMSetRenderTargets(1, &render_target.view, FALSE, nullptr);
@@ -707,7 +722,18 @@ void RunDescriptorTableDraw(
     ASSERT_TRUE(SUCCEEDED(context.list()->Close()));
     ASSERT_TRUE(SUCCEEDED(context.queue()->Wait(blocker.get(), 1)));
     ID3D12CommandList *lists[] = {context.list()};
+    const ULONG resource_refs_before = PublicRefCount(resource_heap.get());
+    const ULONG sampler_refs_before = PublicRefCount(sampler_heap.get());
     context.queue()->ExecuteCommandLists(1, lists);
+    const ULONG resource_refs_after = PublicRefCount(resource_heap.get());
+    const ULONG sampler_refs_after = PublicRefCount(sampler_heap.get());
+    ASSERT_GE(resource_refs_after, resource_refs_before);
+    ASSERT_GE(sampler_refs_after, sampler_refs_before);
+    const ULONG resource_ref_delta =
+        resource_refs_after - resource_refs_before;
+    const ULONG sampler_ref_delta = sampler_refs_after - sampler_refs_before;
+    EXPECT_EQ(resource_ref_delta, 2u);
+    EXPECT_EQ(sampler_ref_delta, 2u);
 
     // Resetting with a different allocator is legal after submission and
     // releases the command list's recorded descriptor-heap references while
@@ -767,7 +793,7 @@ void RunDescriptorTableDraw(
 }
 
 TEST_F(D3D12DescriptorSpec, DrawsWithSplitDescriptorTables) {
-  RunDescriptorTableDraw(context_);
+  RunDescriptorTableDraw(context_, {.force_fallback = true});
 }
 
 TEST_F(D3D12DescriptorSpec, DrawsWithBindlessStaticSampler) {
@@ -1272,7 +1298,8 @@ TEST_F(D3D12DescriptorSpec, CopiesDescriptorsFromReleasedCpuHeaps) {
 
 TEST_F(D3D12DescriptorSpec,
        DefensivelyHandlesEarlyDescriptorHeapReleaseAfterSubmission) {
-  RunDescriptorTableDraw(context_, {.release_bound_heaps_after_submit = true});
+  RunDescriptorTableDraw(context_, {.release_bound_heaps_after_submit = true,
+                                    .use_static_sampler = true});
 }
 
 TEST_F(D3D12DescriptorSpec, IgnoresInvalidAndStaleCpuDescriptorHandles) {

@@ -19,6 +19,7 @@
 #include "d3d12_sampler.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_checked_math.hpp"
+#include "dxmt_d3d12_test_path.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_perf_stats.hpp"
@@ -2827,6 +2828,28 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size, void *data) override {
+    if (guid == dxmt::d3d12::test::kPersistentResidencyStatsGuid) {
+      using dxmt::d3d12::test::PersistentResidencyStats;
+      if (!data_size)
+        return E_INVALIDARG;
+      const UINT required = sizeof(PersistentResidencyStats);
+      if (!data) {
+        *data_size = required;
+        return S_OK;
+      }
+      if (*data_size < required) {
+        *data_size = required;
+        return DXGI_ERROR_MORE_DATA;
+      }
+      const auto [entry_count, total_ref_count] =
+          device_->queue().PersistentResidencyStatsForTesting();
+      PersistentResidencyStats stats = {};
+      stats.entry_count = entry_count;
+      stats.total_ref_count = total_ref_count;
+      std::memcpy(data, &stats, required);
+      *data_size = required;
+      return S_OK;
+    }
     return private_data_.getData(guid, data_size, data);
   }
 

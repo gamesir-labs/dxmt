@@ -2,6 +2,7 @@
 #include "d3d12_descriptor_mirror.hpp"
 
 #include "dxmt_lease_range_registry.hpp"
+#include "dxmt_d3d12_test_path.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
@@ -163,6 +164,21 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size,
                                            const void *data) override {
+    if (guid == dxmt::d3d12::test::kDescriptorHeapSlotRepairGuid) {
+      using dxmt::d3d12::test::DescriptorHeapSlotRepairConfig;
+      if (!data || data_size != sizeof(DescriptorHeapSlotRepairConfig) ||
+          !mirror_)
+        return E_INVALIDARG;
+      const auto &config =
+          *static_cast<const DescriptorHeapSlotRepairConfig *>(data);
+      if (config.struct_size != sizeof(config) ||
+          config.slot >= records_.size())
+        return E_INVALIDARG;
+      auto lock = mirror_->AcquireLock();
+      records_[config.slot].slot_version =
+          mirror_->BeginSlotWrite(lock, config.slot);
+      return records_[config.slot].slot_version ? S_OK : E_FAIL;
+    }
     return private_data_.setData(guid, data_size, data);
   }
 

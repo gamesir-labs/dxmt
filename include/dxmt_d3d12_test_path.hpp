@@ -82,6 +82,22 @@ struct ExecutionPathStats {
   std::uint32_t segment_record_counts[kExecutionPathMaxTracedSegments] = {};
 };
 
+// Marks an already-published shader-visible descriptor slot as requiring one
+// encode-time mirror repair. This lets the residency tests exercise the exact
+// deferred typed-buffer path without relying on scheduling races.
+struct DescriptorHeapSlotRepairConfig {
+  std::uint32_t struct_size = sizeof(DescriptorHeapSlotRepairConfig);
+  std::uint32_t slot = 0;
+};
+
+// Read-only queue residency accounting exposed through ID3D12Device private
+// data. The values are sampled under the queue's residency lock.
+struct PersistentResidencyStats {
+  std::uint32_t struct_size = sizeof(PersistentResidencyStats);
+  std::uint32_t entry_count = 0;
+  std::uint64_t total_ref_count = 0;
+};
+
 inline constexpr GUID kExecutionPathConfigGuid = {
     0x6ca960e8,
     0xe87f,
@@ -93,5 +109,17 @@ inline constexpr GUID kExecutionPathStatsGuid = {
     0xf833,
     0x412e,
     {0x89, 0xcb, 0xd0, 0xa7, 0x8f, 0x35, 0xef, 0x1e}};
+
+inline constexpr GUID kDescriptorHeapSlotRepairGuid = {
+    0x6389fa37,
+    0x0efe,
+    0x4725,
+    {0xab, 0xd4, 0xe5, 0xc7, 0xad, 0x78, 0x0e, 0xe8}};
+
+inline constexpr GUID kPersistentResidencyStatsGuid = {
+    0x16d2bca8,
+    0x0347,
+    0x407f,
+    {0xaa, 0x72, 0x04, 0x5f, 0x65, 0xed, 0xb7, 0x90}};
 
 } // namespace dxmt::d3d12::test

@@ -1,5 +1,7 @@
 #include "d3d12_binding_hotspot_scenarios.hpp"
 
+#include <dxmt_d3d12_test_path.hpp>
+
 #include "d3d12_test_context.hpp"
 #include "shaders/bindless_dxil_shaders.hpp"
 
@@ -536,18 +538,25 @@ RunSharedDescriptorResidencyScenario(BindingHotspotMeasurement *measurement) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   range.NumDescriptors = 2;
-  std::array<D3D12_ROOT_PARAMETER, 1> parameters = {};
+  std::array<D3D12_ROOT_PARAMETER, 2> parameters = {};
   parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   parameters[0].DescriptorTable.NumDescriptorRanges = 1;
   parameters[0].DescriptorTable.pDescriptorRanges = &range;
   parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  // Any root payload selects the bindless-mirror ABI. The constant itself is
+  // intentionally unused; it makes this scenario exercise deferred typed
+  // buffer mirror repair instead of the direct native descriptor-table ABI.
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants.ShaderRegister = 0;
+  parameters[1].Constants.Num32BitValues = 1;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
   GraphicsScenarioResources resources;
   if (auto error = CreateGraphicsScenarioResources(
           context,
           std::vector<D3D12_ROOT_PARAMETER>(parameters.begin(),
                                             parameters.end()),
-          2, &resources))
+          2, &resources, true))
     return error;
 
   constexpr InputValue kValueA = {1.0f, 0.0f, 0.0f, 1.0f};
@@ -560,15 +569,55 @@ RunSharedDescriptorResidencyScenario(BindingHotspotMeasurement *measurement) {
   if (!input_a || !input_b || !heap)
     return "failed to create shared-residency descriptor resources";
 
-  WriteStructuredBufferSrv(context, input_a.get(),
-                           context.CpuDescriptorHandle(heap.get(), 0));
-  WriteStructuredBufferSrv(context, input_a.get(),
-                           context.CpuDescriptorHandle(heap.get(), 1));
-  WriteStructuredBufferSrv(context, input_b.get(),
-                           context.CpuDescriptorHandle(heap.get(), 0));
+  WriteTypedBufferSrv(context, input_a.get(),
+                      context.CpuDescriptorHandle(heap.get(), 0));
+  WriteTypedBufferSrv(context, input_a.get(),
+                      context.CpuDescriptorHandle(heap.get(), 1));
+  WriteTypedBufferSrv(context, input_b.get(),
+                      context.CpuDescriptorHandle(heap.get(), 0));
+
+  dxmt::d3d12::test::DescriptorHeapSlotRepairConfig repair = {};
+  repair.slot = 1;
+  if (auto error = HResultError(
+          "mark shared descriptor slot for encode-time repair",
+          heap->SetPrivateData(
+              dxmt::d3d12::test::kDescriptorHeapSlotRepairGuid,
+              sizeof(repair), &repair)))
+    return error;
+
+  dxmt::d3d12::test::PersistentResidencyStats before = {};
+  UINT before_size = sizeof(before);
+  if (auto error = HResultError(
+          "read persistent residency stats before draw",
+          context.device()->GetPrivateData(
+              dxmt::d3d12::test::kPersistentResidencyStatsGuid,
+              &before_size, &before)))
+    return error;
 
   RecordSingleTableDraw(context, resources, heap.get());
-  return ExecuteAndValidate(context, resources, kExpectedPixel, measurement);
+  if (auto error = ExecuteAndValidate(context, resources, kExpectedPixel,
+                                      measurement))
+    return error;
+
+  dxmt::d3d12::test::PersistentResidencyStats after = {};
+  UINT after_size = sizeof(after);
+  if (auto error = HResultError(
+          "read persistent residency stats after draw",
+          context.device()->GetPrivateData(
+              dxmt::d3d12::test::kPersistentResidencyStatsGuid,
+              &after_size, &after)))
+    return error;
+  if (after.entry_count == before.entry_count + 1 &&
+      after.total_ref_count == before.total_ref_count + 1)
+    return std::nullopt;
+
+  std::ostringstream message;
+  message << "encode-time descriptor repair changed persistent residency "
+             "entries/ref-count from "
+          << before.entry_count << "/" << before.total_ref_count << " to "
+          << after.entry_count << "/" << after.total_ref_count
+          << ", expected exactly one added allocation";
+  return message.str();
 }
 
 BindingHotspotError
@@ -2366,5 +2415,4 @@ BindingHotspotError RunQueuedUiLayerCompositionScenario(
   }
   return std::nullopt;
 }
-
 } // namespace dxmt::test

@@ -588,6 +588,18 @@ CommandQueue::AddPersistentResidency(WMT::Resource allocation) {
   entry.remove_after_seq = 0;
 }
 
+std::pair<uint32_t, uint64_t>
+CommandQueue::PersistentResidencyStatsForTesting() {
+  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+  uint64_t total_ref_count = 0;
+  for (const auto &[handle, entry] : persistent_residency_entries_) {
+    (void)handle;
+    total_ref_count += entry.ref_count;
+  }
+  return {static_cast<uint32_t>(persistent_residency_entries_.size()),
+          total_ref_count};
+}
+
 void
 CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Resource allocation) {
   // Descriptor writes happen independently of queue submission. Retire against
