@@ -1597,6 +1597,156 @@ TEST(DxilRuntimeData, RejectsInvalidPdbRecordReferences) {
             ParseStatus::InvalidRuntimeData);
 }
 
+TEST(DxilRuntimeData, ParsesEveryGraphicsAndMeshShaderInfoTable) {
+  using namespace dxmt::dxil;
+  const auto make_table = [](size_t stride) {
+    std::vector<uint8_t> table(kRuntimeDataTableHeaderSize + stride);
+    Store<uint32_t>(table, 0, 1u);
+    Store<uint32_t>(table, 4, stride);
+    return table;
+  };
+
+  auto vertex = make_table(kRdatVSInfoRecordSize);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8)})
+    Store<uint32_t>(vertex, kRuntimeDataTableHeaderSize + offset,
+                    kRdatNullRef);
+
+  auto pixel = make_table(kRdatPSInfoRecordSize);
+  Store<uint32_t>(pixel, kRuntimeDataTableHeaderSize + 0, kRdatNullRef);
+  Store<uint32_t>(pixel, kRuntimeDataTableHeaderSize + 4, kRdatNullRef);
+
+  auto hull = make_table(kRdatHSInfoRecordSize);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(12),
+                        size_t(20), size_t(28), size_t(36)})
+    Store<uint32_t>(hull, kRuntimeDataTableHeaderSize + offset, kRdatNullRef);
+  hull[kRuntimeDataTableHeaderSize + 44] = 3;
+  hull[kRuntimeDataTableHeaderSize + 45] = 4;
+  hull[kRuntimeDataTableHeaderSize + 46] = 5;
+  hull[kRuntimeDataTableHeaderSize + 47] = 6;
+
+  constexpr size_t domain_stride = 40;
+  auto domain = make_table(domain_stride);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(12),
+                        size_t(20), size_t(28)})
+    Store<uint32_t>(domain, kRuntimeDataTableHeaderSize + offset,
+                    kRdatNullRef);
+  domain[kRuntimeDataTableHeaderSize + 36] = 7;
+  domain[kRuntimeDataTableHeaderSize + 37] = 8;
+
+  auto geometry = make_table(kRdatGSInfoRecordSize);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(16)})
+    Store<uint32_t>(geometry, kRuntimeDataTableHeaderSize + offset,
+                    kRdatNullRef);
+  geometry[kRuntimeDataTableHeaderSize + 24] = 9;
+  geometry[kRuntimeDataTableHeaderSize + 25] = 10;
+  geometry[kRuntimeDataTableHeaderSize + 26] = 11;
+  geometry[kRuntimeDataTableHeaderSize + 27] = 12;
+
+  constexpr size_t mesh_stride = 48;
+  auto mesh = make_table(mesh_stride);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(16),
+                        size_t(24)})
+    Store<uint32_t>(mesh, kRuntimeDataTableHeaderSize + offset,
+                    kRdatNullRef);
+  Store<uint32_t>(mesh, kRuntimeDataTableHeaderSize + 28, 128u);
+  Store<uint32_t>(mesh, kRuntimeDataTableHeaderSize + 32, 64u);
+  Store<uint32_t>(mesh, kRuntimeDataTableHeaderSize + 36, 32u);
+  Store<uint16_t>(mesh, kRuntimeDataTableHeaderSize + 40, 16u);
+  Store<uint16_t>(mesh, kRuntimeDataTableHeaderSize + 42, 8u);
+  mesh[kRuntimeDataTableHeaderSize + 44] = 13;
+
+  auto amplification = make_table(kRdatASInfoRecordSize);
+  Store<uint32_t>(amplification, kRuntimeDataTableHeaderSize + 0,
+                  kRdatNullRef);
+  Store<uint32_t>(amplification, kRuntimeDataTableHeaderSize + 4, 256u);
+  Store<uint32_t>(amplification, kRuntimeDataTableHeaderSize + 8, 512u);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::VSInfoTable, vertex)
+                         .add(rdat::PSInfoTable, pixel)
+                         .add(rdat::HSInfoTable, hull)
+                         .add(rdat::DSInfoTable, domain)
+                         .add(rdat::GSInfoTable, geometry)
+                         .add(rdat::MSInfoTable, mesh)
+                         .add(rdat::ASInfoTable, amplification)
+                         .build();
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.shader_infos.size(), 7u);
+
+  const auto *vs = info.findShaderInfo(rdat::VSInfoTable, 0);
+  ASSERT_NE(vs, nullptr);
+  EXPECT_TRUE(vs->input_signature_indices.empty());
+  EXPECT_TRUE(vs->output_signature_indices.empty());
+
+  const auto *ps = info.findShaderInfo(rdat::PSInfoTable, 0);
+  ASSERT_NE(ps, nullptr);
+  EXPECT_TRUE(ps->input_signature_indices.empty());
+  EXPECT_TRUE(ps->output_signature_indices.empty());
+
+  const auto *hs = info.findShaderInfo(rdat::HSInfoTable, 0);
+  ASSERT_NE(hs, nullptr);
+  EXPECT_EQ(hs->input_control_point_count, 3u);
+  EXPECT_EQ(hs->output_control_point_count, 4u);
+  EXPECT_EQ(hs->tessellator_domain, 5u);
+  EXPECT_EQ(hs->tessellator_output_primitive, 6u);
+
+  const auto *ds = info.findShaderInfo(rdat::DSInfoTable, 0);
+  ASSERT_NE(ds, nullptr);
+  EXPECT_EQ(ds->input_control_point_count, 7u);
+  EXPECT_EQ(ds->tessellator_domain, 8u);
+
+  const auto *gs = info.findShaderInfo(rdat::GSInfoTable, 0);
+  ASSERT_NE(gs, nullptr);
+  EXPECT_EQ(gs->input_primitive, 9u);
+  EXPECT_EQ(gs->output_topology, 10u);
+  EXPECT_EQ(gs->max_vertex_count, 11u);
+  EXPECT_EQ(gs->output_stream_mask, 12u);
+
+  const auto *ms = info.findShaderInfo(rdat::MSInfoTable, 0);
+  ASSERT_NE(ms, nullptr);
+  EXPECT_EQ(ms->num_threads_x, 1u);
+  EXPECT_EQ(ms->num_threads_y, 1u);
+  EXPECT_EQ(ms->num_threads_z, 1u);
+  EXPECT_EQ(ms->group_shared_bytes_used, 128u);
+  EXPECT_EQ(ms->group_shared_bytes_dependent_on_view_id, 64u);
+  EXPECT_EQ(ms->payload_size_in_bytes, 32u);
+  EXPECT_EQ(ms->max_output_vertices, 16u);
+  EXPECT_EQ(ms->max_output_primitives, 8u);
+  EXPECT_EQ(ms->mesh_output_topology, 13u);
+
+  const auto *as = info.findShaderInfo(rdat::ASInfoTable, 0);
+  ASSERT_NE(as, nullptr);
+  EXPECT_EQ(as->num_threads_x, 1u);
+  EXPECT_EQ(as->group_shared_bytes_used, 256u);
+  EXPECT_EQ(as->payload_size_in_bytes, 512u);
+  EXPECT_EQ(info.findShaderInfo(rdat::CSInfoTable, 0), nullptr);
+}
+
+TEST(DxilRuntimeData, RejectsShortStageSpecificShaderRecords) {
+  using namespace dxmt::dxil;
+  const auto expect_invalid = [](uint32_t table_type, size_t stride) {
+    std::vector<uint8_t> table(kRuntimeDataTableHeaderSize + stride);
+    Store<uint32_t>(table, 0, 1u);
+    Store<uint32_t>(table, 4, stride);
+    const auto bytes =
+        DxilRuntimeDataBuilder().add(table_type, table).build();
+    RuntimeDataInfo info;
+    EXPECT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+              ParseStatus::InvalidRuntimeData);
+  };
+
+  expect_invalid(rdat::VSInfoTable, kRdatVSInfoRecordSize - 1);
+  expect_invalid(rdat::PSInfoTable, kRdatPSInfoRecordSize - 1);
+  expect_invalid(rdat::HSInfoTable, kRdatHSInfoRecordSize - 1);
+  expect_invalid(rdat::DSInfoTable, kRdatDSInfoRecordSize - 1);
+  expect_invalid(rdat::GSInfoTable, kRdatGSInfoRecordSize - 1);
+  expect_invalid(rdat::CSInfoTable, kRdatCSInfoRecordSize - 1);
+  expect_invalid(rdat::MSInfoTable, 44u);
+  expect_invalid(rdat::ASInfoTable, kRdatASInfoRecordSize - 1);
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
