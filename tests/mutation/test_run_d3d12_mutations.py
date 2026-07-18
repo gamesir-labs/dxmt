@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +77,38 @@ class MutationValidationTest(unittest.TestCase):
                 "[  FAILED  ] SampleSpec.DetectsMutation\nFail: 1"
             )
         )
+
+    def test_distinguishes_infrastructure_failure_from_test_failure(self):
+        self.assertTrue(
+            MUTATIONS.output_is_infrastructure_failure(
+                "dxmt-builder: no managed Wine development cache is available"
+            )
+        )
+        self.assertTrue(
+            MUTATIONS.output_is_infrastructure_failure(
+                "wine: invalid directory relative/prefix in WINEPREFIX"
+            )
+        )
+        self.assertFalse(
+            MUTATIONS.output_is_infrastructure_failure(
+                "[  FAILED  ] SampleSpec.DetectsMutation\nFail: 1"
+            )
+        )
+
+    def test_run_command_reports_timeout_without_counting_a_kill(self):
+        timeout = subprocess.TimeoutExpired(
+            cmd=["fake-test"], timeout=1.0, output=b"partial output"
+        )
+        with mock.patch.object(MUTATIONS.subprocess, "run", side_effect=timeout):
+            status, output, timed_out = MUTATIONS.run_command(
+                "fake-test --filter={filter}",
+                "SampleSpec.DetectsMutation",
+                REPO_ROOT,
+                1.0,
+            )
+        self.assertEqual(status, 124)
+        self.assertEqual(output, "partial output")
+        self.assertTrue(timed_out)
 
 
 if __name__ == "__main__":
