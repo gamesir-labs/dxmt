@@ -887,6 +887,165 @@ TEST(DxilRuntimeData, RejectsInvalidCoreTableReferencesAndStrides) {
       DxilRuntimeDataBuilder().add(rdat::FunctionTable, short_functions).build());
 }
 
+TEST(DxilRuntimeData, ParsesSignatureComputeAndFunctionTableLinks) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {
+      'T', 'E', 'X', 'C', 'O', 'O', 'R', 'D', 0,
+  };
+  std::vector<uint8_t> indices(7 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 2u);
+  Store<uint32_t>(indices, 4, 0u);
+  Store<uint32_t>(indices, 8, 1u);
+  Store<uint32_t>(indices, 12, 3u);
+  Store<uint32_t>(indices, 16, 8u);
+  Store<uint32_t>(indices, 20, 4u);
+  Store<uint32_t>(indices, 24, 2u);
+
+  constexpr size_t signature_stride = 16;
+  std::vector<uint8_t> signatures(kRuntimeDataTableHeaderSize +
+                                  signature_stride);
+  Store<uint32_t>(signatures, 0, 1u);
+  Store<uint32_t>(signatures, 4, signature_stride);
+  const size_t signature = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(signatures, signature + 0, 0u);
+  Store<uint32_t>(signatures, signature + 4, 0u);
+  signatures[signature + 8] = 2;
+  signatures[signature + 9] = 3;
+  signatures[signature + 10] = 4;
+  signatures[signature + 11] = 5;
+  signatures[signature + 12] = 0x26;
+  signatures[signature + 13] = 0xab;
+
+  std::vector<uint8_t> compute(kRuntimeDataTableHeaderSize +
+                               kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute, 0, 1u);
+  Store<uint32_t>(compute, 4, kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute, kRuntimeDataTableHeaderSize + 0, 3u);
+  Store<uint32_t>(compute, kRuntimeDataTableHeaderSize + 4, 256u);
+
+  std::vector<uint8_t> functions(kRuntimeDataTableHeaderSize +
+                                 kRdatFunctionRecord2Size);
+  Store<uint32_t>(functions, 0, 1u);
+  Store<uint32_t>(functions, 4, kRdatFunctionRecord2Size);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(12)})
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + offset,
+                    kRdatNullRef);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 16, 5u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 48, 0u);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::StringBuffer, strings)
+                         .add(rdat::IndexArrays, indices)
+                         .add(rdat::SignatureElementTable, signatures)
+                         .add(rdat::CSInfoTable, compute)
+                         .add(rdat::FunctionTable, functions)
+                         .build();
+
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.signature_elements.size(), 1u);
+  const auto &element = info.signature_elements[0];
+  EXPECT_EQ(element.semantic_name, "TEXCOORD");
+  EXPECT_EQ(element.semantic_indices, (std::vector<uint32_t>{0, 1}));
+  EXPECT_EQ(element.semantic_kind, 2u);
+  EXPECT_EQ(element.component_type, 3u);
+  EXPECT_EQ(element.interpolation_mode, 4u);
+  EXPECT_EQ(element.start_row, 5u);
+  EXPECT_EQ(element.cols, 3u);
+  EXPECT_EQ(element.start_col, 1u);
+  EXPECT_EQ(element.output_stream, 2u);
+  EXPECT_EQ(element.usage_mask, 0xbu);
+  EXPECT_EQ(element.dynamic_index_mask, 0xau);
+
+  ASSERT_EQ(info.shader_infos.size(), 1u);
+  EXPECT_EQ(info.shader_infos[0].table_type, rdat::CSInfoTable);
+  EXPECT_EQ(info.shader_infos[0].num_threads_x, 8u);
+  EXPECT_EQ(info.shader_infos[0].num_threads_y, 4u);
+  EXPECT_EQ(info.shader_infos[0].num_threads_z, 2u);
+  EXPECT_EQ(info.shader_infos[0].group_shared_bytes_used, 256u);
+  ASSERT_EQ(info.functions.size(), 1u);
+  EXPECT_TRUE(info.functions[0].has_shader_info);
+  EXPECT_EQ(info.functions[0].shader_info_table_type, rdat::CSInfoTable);
+  EXPECT_EQ(info.functions[0].shader_info_index, 0u);
+}
+
+TEST(DxilRuntimeData, RejectsInvalidSignatureAndShaderInfoLinks) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {'S', 'E', 'M', 0};
+  std::vector<uint8_t> indices(4 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 1u);
+  Store<uint32_t>(indices, 4, 0u);
+  Store<uint32_t>(indices, 8, 1u);
+  Store<uint32_t>(indices, 12, 1u);
+
+  std::vector<uint8_t> signatures(kRuntimeDataTableHeaderSize + 16);
+  Store<uint32_t>(signatures, 0, 1u);
+  Store<uint32_t>(signatures, 4, 16u);
+  Store<uint32_t>(signatures, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(signatures, kRuntimeDataTableHeaderSize + 4, 0u);
+
+  std::vector<uint8_t> compute(kRuntimeDataTableHeaderSize +
+                               kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute, 0, 1u);
+  Store<uint32_t>(compute, 4, kRdatCSInfoRecordSize);
+  Store<uint32_t>(compute, kRuntimeDataTableHeaderSize + 0, 2u);
+
+  std::vector<uint8_t> functions(kRuntimeDataTableHeaderSize +
+                                 kRdatFunctionRecord2Size);
+  Store<uint32_t>(functions, 0, 1u);
+  Store<uint32_t>(functions, 4, kRdatFunctionRecord2Size);
+  for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(12)})
+    Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + offset,
+                    kRdatNullRef);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 16, 5u);
+  Store<uint32_t>(functions, kRuntimeDataTableHeaderSize + 48, 0u);
+
+  const auto build = [&](const std::vector<uint8_t> &signature_table,
+                         const std::vector<uint8_t> &compute_table,
+                         const std::vector<uint8_t> &function_table) {
+    return DxilRuntimeDataBuilder()
+        .add(rdat::StringBuffer, strings)
+        .add(rdat::IndexArrays, indices)
+        .add(rdat::SignatureElementTable, signature_table)
+        .add(rdat::CSInfoTable, compute_table)
+        .add(rdat::FunctionTable, function_table)
+        .build();
+  };
+
+  RuntimeDataInfo info;
+  auto malformed = signatures;
+  Store<uint32_t>(malformed, kRuntimeDataTableHeaderSize + 0, 100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, build(malformed, compute, functions)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  malformed.assign(kRuntimeDataTableHeaderSize + 12, 0);
+  Store<uint32_t>(malformed, 0, 1u);
+  Store<uint32_t>(malformed, 4, 12u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, build(malformed, compute, functions)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_compute = compute;
+  Store<uint32_t>(malformed_compute, kRuntimeDataTableHeaderSize + 0, 100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(signatures, malformed_compute, functions)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_functions = functions;
+  Store<uint32_t>(malformed_functions, kRuntimeDataTableHeaderSize + 48, 1u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(signatures, compute, malformed_functions)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
