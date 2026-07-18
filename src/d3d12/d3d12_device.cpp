@@ -5579,6 +5579,13 @@ public:
       return E_POINTER;
     if (!desc)
       return WARN_E_INVALIDARG(__func__);
+    if (desc->Mode != D3D12_SHADER_CACHE_MODE_MEMORY &&
+        desc->Mode != D3D12_SHADER_CACHE_MODE_DISK)
+      return WARN_E_INVALIDARG(__func__);
+    constexpr UINT known_flags = D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED |
+                                 D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+    if (static_cast<UINT>(desc->Flags) & ~known_flags)
+      return WARN_E_INVALIDARG(__func__);
     WARN("D3D12Device: shader cache sessions are unsupported");
     return E_NOTIMPL;
   }

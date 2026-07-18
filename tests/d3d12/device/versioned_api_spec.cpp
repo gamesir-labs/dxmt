@@ -710,15 +710,51 @@ TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
                      {0xa7, 0x82, 0x36, 0xb8, 0x5e, 0x82, 0x77, 0xd8}};
   desc.Mode = D3D12_SHADER_CACHE_MODE_MEMORY;
   desc.Flags = D3D12_SHADER_CACHE_FLAG_NONE;
+  constexpr std::array modes = {D3D12_SHADER_CACHE_MODE_MEMORY,
+                                D3D12_SHADER_CACHE_MODE_DISK};
+  constexpr std::array flags = {
+      D3D12_SHADER_CACHE_FLAG_NONE,
+      D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED,
+      D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR,
+      static_cast<D3D12_SHADER_CACHE_FLAGS>(
+          D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED |
+          D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR),
+  };
+  for (const auto mode : modes) {
+    for (const auto session_flags : flags) {
+      SCOPED_TRACE(::testing::Message()
+                   << "mode=" << mode << " flags=" << session_flags);
+      desc.Mode = mode;
+      desc.Flags = session_flags;
+      void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+      EXPECT_EQ(device9->CreateShaderCacheSession(
+                    &desc, __uuidof(ID3D12ShaderCacheSession), &output),
+                E_NOTIMPL);
+      EXPECT_EQ(output, nullptr);
+    }
+  }
+
   void *output = reinterpret_cast<void *>(std::uintptr_t{1});
   EXPECT_EQ(device9->CreateShaderCacheSession(
-                &desc, __uuidof(ID3D12ShaderCacheSession), &output),
-            E_NOTIMPL);
+                nullptr, __uuidof(ID3D12ShaderCacheSession), &output),
+            E_INVALIDARG);
   EXPECT_EQ(output, nullptr);
+  EXPECT_EQ(device9->CreateShaderCacheSession(
+                &desc, __uuidof(ID3D12ShaderCacheSession), nullptr),
+            E_POINTER);
 
+  desc.Mode = static_cast<D3D12_SHADER_CACHE_MODE>(UINT_MAX);
   output = reinterpret_cast<void *>(std::uintptr_t{1});
   EXPECT_EQ(device9->CreateShaderCacheSession(
-                nullptr, __uuidof(ID3D12ShaderCacheSession), &output),
+                &desc, __uuidof(ID3D12ShaderCacheSession), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  desc.Mode = D3D12_SHADER_CACHE_MODE_MEMORY;
+  desc.Flags = static_cast<D3D12_SHADER_CACHE_FLAGS>(4);
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(device9->CreateShaderCacheSession(
+                &desc, __uuidof(ID3D12ShaderCacheSession), &output),
             E_INVALIDARG);
   EXPECT_EQ(output, nullptr);
 
