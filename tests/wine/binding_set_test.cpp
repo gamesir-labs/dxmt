@@ -36,7 +36,7 @@ TEST(BindingSet, TracksReplacementBoundAndDirtyState) {
   EXPECT_TRUE(bindings.test_dirty(3));
 
   bindings.clear_dirty();
-  replaced = false;
+  replaced = true;
   auto &same = bindings.bind(3, dxmt::TestBinding{7}, replaced);
   EXPECT_FALSE(replaced);
   EXPECT_EQ(&same, &stored);
@@ -46,6 +46,25 @@ TEST(BindingSet, TracksReplacementBoundAndDirtyState) {
   EXPECT_TRUE(replaced);
   EXPECT_EQ(bindings[3].value, 9);
   EXPECT_TRUE(bindings.test_dirty(3));
+}
+
+TEST(BindingSet, ReplacementRefreshesHazardClassification) {
+  dxmt::BindingSet<dxmt::TestBinding, 8> bindings;
+  bool replaced = false;
+  bindings.bind(2, dxmt::TestBinding{1}, replaced, true);
+  ASSERT_NE(bindings.hazard_begin(), bindings.hazard_end());
+
+  bindings.bind(2, dxmt::TestBinding{2}, replaced, false);
+  EXPECT_TRUE(replaced);
+  EXPECT_EQ(bindings[2].value, 2);
+  EXPECT_FALSE(bindings.hazard_begin() != bindings.hazard_end());
+
+  bindings.clear_dirty();
+  bindings.bind(2, dxmt::TestBinding{2}, replaced, true);
+  EXPECT_FALSE(replaced);
+  EXPECT_FALSE(bindings.test_dirty(2));
+  ASSERT_NE(bindings.hazard_begin(), bindings.hazard_end());
+  EXPECT_EQ((*bindings.hazard_begin()).first, 2u);
 }
 
 TEST(BindingSet, UnbindIsIdempotentAndClearsStorage) {
@@ -98,6 +117,22 @@ TEST(BindingSet, AppliesDirtyAndBoundMasks) {
   bindings.clear_dirty_mask(uint32_t(1) << 1);
   EXPECT_FALSE(bindings.test_dirty(1));
   EXPECT_TRUE(bindings.test_dirty(65));
+}
+
+TEST(BindingSet, ReportsTheHighestDirtySlotInTheFirstQword) {
+  dxmt::BindingSet<dxmt::TestBinding, 64> bindings;
+  EXPECT_EQ(bindings.max_binding_64(), 0u);
+
+  bool replaced = false;
+  bindings.bind(1, dxmt::TestBinding{1}, replaced);
+  bindings.bind(47, dxmt::TestBinding{2}, replaced);
+  EXPECT_EQ(bindings.max_binding_64(), 48u);
+  EXPECT_TRUE(bindings.any_bound_masked(uint64_t{1} << 47));
+
+  bindings.clear_dirty(47);
+  EXPECT_EQ(bindings.max_binding_64(), 2u);
+  bindings.clear_dirty();
+  EXPECT_EQ(bindings.max_binding_64(), 0u);
 }
 
 TEST(BindingSet, MoveMarksEveryBoundSlotDirty) {

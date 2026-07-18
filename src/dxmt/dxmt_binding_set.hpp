@@ -94,7 +94,7 @@ public:
   constexpr uint32_t
   max_binding_64() const noexcept {
     uint64_t qword = dirty.qword(0);
-    return 64u - bit::tzcnt(qword);
+    return 64u - bit::lzcnt(qword);
   }
 
   inline void
@@ -130,14 +130,16 @@ public:
   */
   inline Element &
   bind(size_t slot, Element &&element, bool &replacement, bool hazard = true) {
+    replacement = false;
     if (bound.get(slot)) {
       if (redundant_binding_trait<Element>::is_redundant(storage[slot], element)) {
+        this->hazard.set(slot, hazard);
         return storage[slot];
       }
     } else {
       bound.set(slot, true);
-      this->hazard.set(slot, hazard);
     }
+    this->hazard.set(slot, hazard);
     // new (storage.data() + slot) Element(std::forward<Element>(element));
     // std::construct_at(storage.data() + slot, std::forward<Element>(element));
     // idk why placement construction kills performance
