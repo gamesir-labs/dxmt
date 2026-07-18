@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,11 +9,37 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
-    "check_d3d12_coverage", REPO_ROOT / "scripts/check-d3d12-coverage.py"
+    "d3d12_coverage_support",
+    Path(__file__).with_name("d3d12_coverage_support.py"),
 )
 assert SPEC and SPEC.loader
 COVERAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COVERAGE)
+
+
+class PublicApiEvidenceTest(unittest.TestCase):
+    def test_reports_declared_api_without_test_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            (root / "tests/path.cpp").write_text(
+                "CoveredMethod();", encoding="utf-8"
+            )
+            config = {
+                "public_api": {
+                    "test_globs": ["tests/*.cpp"],
+                    "categories": {
+                        "sample": {
+                            "minimum_percent": 100,
+                            "apis": ["CoveredMethod", "MissingMethod"],
+                        }
+                    },
+                }
+            }
+            results, errors = COVERAGE.scan_public_api(config, root)
+            self.assertEqual(results[0]["covered"], 1)
+            self.assertEqual(results[0]["missing"], ["MissingMethod"])
+            self.assertEqual(len(errors), 1)
 
 
 class ErrorEvidenceTest(unittest.TestCase):
@@ -66,6 +93,30 @@ class ErrorEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing required evidence"):
             COVERAGE.normalize_error_evidence("sample", mapping)
 
+    def test_legacy_mapping_requires_both_source_and_test_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src/path.cpp").write_text("FAULT_POINT", encoding="utf-8")
+            (root / "tests/path.cpp").write_text("OtherCase", encoding="utf-8")
+            config = {
+                "error_path": {
+                    "minimum_percent": 100,
+                    "mappings": {
+                        "sample": {
+                            "source_globs": ["src/path.cpp"],
+                            "source_regex": "FAULT_POINT",
+                            "test_globs": ["tests/path.cpp"],
+                            "test_regex": "ExpectedCase",
+                        }
+                    },
+                }
+            }
+            results, errors = COVERAGE.scan_error_paths(config, root)
+            self.assertFalse(results[0]["mapped"])
+            self.assertEqual(len(errors), 1)
+
 
 class CompilerModuleTest(unittest.TestCase):
     def test_independent_module_threshold_is_enforced(self):
@@ -102,6 +153,55 @@ class CompilerModuleTest(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(results[0]["module"], "parser-ir")
         self.assertEqual(results[0]["line_percent"], 50.0)
+
+    def test_function_threshold_fails_independently(self):
+        config = {
+            "compiler_coverage": {
+                "modules": {
+                    "parser-ir": {
+                        "globs": ["src/parser.cpp"],
+                        "minimum_line_percent": 100,
+                        "minimum_function_percent": 100,
+                        "minimum_branch_percent": 100,
+                    }
+                }
+            }
+        }
+        report = {
+            "files": [
+                {
+                    "file": "src/parser.cpp",
+                    "lines": [{"count": 1, "branches": [{"count": 1}]}],
+                    "functions": [
+                        {"execution_count": 1},
+                        {"execution_count": 0},
+                    ],
+                }
+            ]
+        }
+        results, errors = COVERAGE.scan_compiler_coverage(
+            config, report, REPO_ROOT
+        )
+        self.assertEqual(results[0]["line_percent"], 100.0)
+        self.assertEqual(results[0]["branch_percent"], 100.0)
+        self.assertEqual(results[0]["function_percent"], 50.0)
+        self.assertEqual(len(errors), 1)
+
+
+class RepositoryManifestTest(unittest.TestCase):
+    def test_current_manifest_evidence_is_consistent(self):
+        config_path = REPO_ROOT / "tests/coverage/d3d12_coverage.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        public_results, public_errors = COVERAGE.scan_public_api(
+            config, REPO_ROOT
+        )
+        error_results, error_errors = COVERAGE.scan_error_paths(
+            config, REPO_ROOT
+        )
+        self.assertFalse(public_errors)
+        self.assertFalse(error_errors)
+        self.assertTrue(all(not result["missing"] for result in public_results))
+        self.assertTrue(all(result["mapped"] for result in error_results))
 
 
 if __name__ == "__main__":

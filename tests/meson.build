@@ -1,5 +1,14 @@
 dxmt_test_include_dirs = include_directories('include')
 d3dcompiler_test_dep = cpp.find_library('d3dcompiler_47')
+python3_native = find_program('python3', native: true)
+
+test(
+  'd3d12-coverage-validator-tests',
+  python3_native,
+  args: [files('coverage/test_check_d3d12_coverage.py')],
+  suite: ['unit', 'coverage'],
+  timeout: 30,
+)
 
 dxmt_test_main_lib = static_library(
   'dxmt-wine-test-main',
