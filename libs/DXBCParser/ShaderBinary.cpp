@@ -660,16 +660,18 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
         }
 
         CONST CShaderToken *pOperands = (CShaderToken *)&pData[5];
-        for (UINT i = 0; i < NumOperands; i++) {
+        UINT ParsedOperands = 0;
+        for (; ParsedOperands < NumOperands; ParsedOperands++) {
           if (pOperands >= pOpEnd) {
             break;
           }
 
-          pMessage->pOperands[i].Clear();
+          pMessage->pOperands[ParsedOperands].Clear();
           pOperands =
-              ParseOperandAt(&pMessage->pOperands[i], pOperands, pOpEnd);
+              ParseOperandAt(&pMessage->pOperands[ParsedOperands], pOperands,
+                             pOpEnd);
         }
-        if (pOperands != pOpEnd) {
+        if (ParsedOperands != NumOperands || pOperands != pOpEnd) {
           free(pMessage->pOperands);
           pMessage->pOperands = NULL;
           break;

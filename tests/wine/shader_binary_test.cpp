@@ -1030,4 +1030,157 @@ TEST(ShaderBinary, DecodesUavSrvAndSharedMemoryDeclarations) {
   EXPECT_EQ(instruction.m_StructuredTGSMDecl.StructCount, 128u);
 }
 
+TEST(ShaderBinary, DecodesFunctionTablesInterfacesAndCalls) {
+  CInstruction instruction;
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_FUNCTION_TABLE, 5), 7, 2, 31, 32},
+      &instruction);
+  EXPECT_EQ(instruction.m_FunctionTableDecl.FunctionTableNumber, 7u);
+  ASSERT_EQ(instruction.m_FunctionTableDecl.TableLength, 2u);
+  ASSERT_NE(instruction.m_FunctionTableDecl.pFunctionIdentifiers, nullptr);
+  EXPECT_EQ(instruction.m_FunctionTableDecl.pFunctionIdentifiers[0], 31u);
+  EXPECT_EQ(instruction.m_FunctionTableDecl.pFunctionIdentifiers[1], 32u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_FUNCTION_TABLE, 0,
+                        ENCODE_D3D10_SB_OPCODE_EXTENDED(true)),
+       6, 8, 2, 41, 42},
+      &instruction);
+  EXPECT_EQ(instruction.m_ExtendedOpCodeCount, 1u);
+  EXPECT_EQ(instruction.m_FunctionTableDecl.FunctionTableNumber, 8u);
+  ASSERT_EQ(instruction.m_FunctionTableDecl.TableLength, 2u);
+  EXPECT_EQ(instruction.m_FunctionTableDecl.pFunctionIdentifiers[0], 41u);
+  EXPECT_EQ(instruction.m_FunctionTableDecl.pFunctionIdentifiers[1], 42u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_INTERFACE, 6,
+                        ENCODE_D3D11_SB_INTERFACE_INDEXED_BIT(true)),
+       12, 4,
+       ENCODE_D3D11_SB_INTERFACE_TABLE_LENGTH(2) |
+           ENCODE_D3D11_SB_INTERFACE_ARRAY_LENGTH(3),
+       51, 52},
+      &instruction);
+  EXPECT_TRUE(instruction.m_InterfaceDecl.bDynamicallyIndexed);
+  EXPECT_EQ(instruction.m_InterfaceDecl.InterfaceNumber, 12u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.ExpectedTableSize, 4u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.TableLength, 2u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.ArrayLength, 3u);
+  ASSERT_NE(instruction.m_InterfaceDecl.pFunctionTableIdentifiers, nullptr);
+  EXPECT_EQ(instruction.m_InterfaceDecl.pFunctionTableIdentifiers[0], 51u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.pFunctionTableIdentifiers[1], 52u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_INTERFACE, 0,
+                        ENCODE_D3D10_SB_OPCODE_EXTENDED(true)),
+       7, 13, 5,
+       ENCODE_D3D11_SB_INTERFACE_TABLE_LENGTH(2) |
+           ENCODE_D3D11_SB_INTERFACE_ARRAY_LENGTH(6),
+       61, 62},
+      &instruction);
+  EXPECT_FALSE(instruction.m_InterfaceDecl.bDynamicallyIndexed);
+  EXPECT_EQ(instruction.m_InterfaceDecl.InterfaceNumber, 13u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.ExpectedTableSize, 5u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.TableLength, 2u);
+  EXPECT_EQ(instruction.m_InterfaceDecl.ArrayLength, 6u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_INTERFACE_CALL, 4), 9,
+       IndexedOperandToken(D3D11_SB_OPERAND_TYPE_INTERFACE,
+                           D3D10_SB_OPERAND_INDEX_1D),
+       14},
+      &instruction);
+  EXPECT_EQ(instruction.m_InterfaceCall.FunctionIndex, 9u);
+  ASSERT_EQ(instruction.m_InterfaceCall.pInterfaceOperand,
+            &instruction.m_Operands[0]);
+  EXPECT_EQ(instruction.m_InterfaceCall.pInterfaceOperand->OperandType(),
+            D3D11_SB_OPERAND_TYPE_INTERFACE);
+  EXPECT_EQ(instruction.m_InterfaceCall.pInterfaceOperand->RegIndex(), 14u);
+}
+
+TEST(ShaderBinary, DecodesValidShaderMessages) {
+  CInstruction instruction;
+  constexpr CShaderToken immediate =
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT) |
+      ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+
+  ParseSingleInstruction(
+      {ENCODE_D3D10_SB_CUSTOMDATA_CLASS(D3D11_SB_CUSTOMDATA_SHADER_MESSAGE),
+       11, D3D11_SB_SHADER_MESSAGE_ID_MESSAGE,
+       D3D11_SB_SHADER_MESSAGE_FORMAT_ANSI_PRINTF, 4, 1, 2, immediate, 99,
+       0x25753d76, 0},
+      &instruction, D3D10_SB_PIXEL_SHADER);
+
+  EXPECT_EQ(instruction.m_CustomData.Type,
+            D3D11_SB_CUSTOMDATA_SHADER_MESSAGE);
+  EXPECT_EQ(instruction.m_CustomData.DataSizeInBytes, 36u);
+  const auto &message = instruction.m_CustomData.ShaderMessage;
+  EXPECT_EQ(message.MessageID, D3D11_SB_SHADER_MESSAGE_ID_MESSAGE);
+  EXPECT_EQ(message.FormatStyle, D3D11_SB_SHADER_MESSAGE_FORMAT_ANSI_PRINTF);
+  EXPECT_STREQ(message.pFormatString, "v=%u");
+  ASSERT_EQ(message.NumOperands, 1u);
+  ASSERT_NE(message.pOperands, nullptr);
+  EXPECT_EQ(message.pOperands[0].OperandType(),
+            D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+  EXPECT_EQ(message.pOperands[0].Imm32(), 99u);
+
+  ParseSingleInstruction({InstructionToken(D3D10_SB_OPCODE_RET, 1)},
+                         &instruction, D3D10_SB_PIXEL_SHADER);
+  EXPECT_EQ(instruction.OpCode(), D3D10_SB_OPCODE_RET);
+}
+
+TEST(ShaderBinary, RejectsMalformedShaderMessageHeadersAndOperandCounts) {
+  CInstruction instruction;
+  constexpr CShaderToken immediate =
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT) |
+      ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+
+  ParseSingleInstruction(
+      {ENCODE_D3D10_SB_CUSTOMDATA_CLASS(D3D11_SB_CUSTOMDATA_SHADER_MESSAGE),
+       7, 1, 2, 3, 4, 5},
+      &instruction);
+  EXPECT_EQ(instruction.m_CustomData.ShaderMessage.NumOperands, 0u);
+  EXPECT_EQ(instruction.m_CustomData.ShaderMessage.pOperands, nullptr);
+
+  ParseSingleInstruction(
+      {ENCODE_D3D10_SB_CUSTOMDATA_CLASS(D3D11_SB_CUSTOMDATA_SHADER_MESSAGE),
+       8, D3D11_SB_SHADER_MESSAGE_ID_ERROR,
+       D3D11_SB_SHADER_MESSAGE_FORMAT_ANSI_TEXT, 0, 1, 0x10000, 0},
+      &instruction);
+  EXPECT_EQ(instruction.m_CustomData.ShaderMessage.NumOperands, 0u);
+  EXPECT_EQ(instruction.m_CustomData.ShaderMessage.pOperands, nullptr);
+
+  ParseSingleInstruction(
+      {ENCODE_D3D10_SB_CUSTOMDATA_CLASS(D3D11_SB_CUSTOMDATA_SHADER_MESSAGE),
+       11, D3D11_SB_SHADER_MESSAGE_ID_ERROR,
+       D3D11_SB_SHADER_MESSAGE_FORMAT_ANSI_PRINTF, 4, 2, 2, immediate, 7,
+       0x25753d76, 0},
+      &instruction);
+  EXPECT_EQ(instruction.m_CustomData.ShaderMessage.NumOperands, 0u);
+  EXPECT_EQ(instruction.m_CustomData.ShaderMessage.pOperands, nullptr);
+
+  ParseSingleInstruction(
+      {ENCODE_D3D10_SB_CUSTOMDATA_CLASS(D3D10_SB_CUSTOMDATA_OPAQUE), 1},
+      &instruction);
+  EXPECT_EQ(instruction.m_CustomData.DataSizeInBytes, 0u);
+  EXPECT_EQ(instruction.m_CustomData.pData, nullptr);
+}
+
+TEST(ShaderBinary, PreservesOpaqueCustomDataBytes) {
+  CInstruction instruction;
+  ParseSingleInstruction(
+      {ENCODE_D3D10_SB_CUSTOMDATA_CLASS(
+           D3D10_SB_CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER),
+       5, 0x11223344, 0x55667788, 0x99aabbcc},
+      &instruction);
+  EXPECT_EQ(instruction.m_CustomData.Type,
+            D3D10_SB_CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER);
+  ASSERT_EQ(instruction.m_CustomData.DataSizeInBytes, 12u);
+  ASSERT_NE(instruction.m_CustomData.pData, nullptr);
+  const auto *data = static_cast<const UINT *>(instruction.m_CustomData.pData);
+  EXPECT_EQ(data[0], 0x11223344u);
+  EXPECT_EQ(data[1], 0x55667788u);
+  EXPECT_EQ(data[2], 0x99aabbccu);
+}
+
 } // namespace
