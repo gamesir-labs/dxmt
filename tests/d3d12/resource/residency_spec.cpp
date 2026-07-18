@@ -3,12 +3,50 @@
 #include "d3d12_test_context.hpp"
 
 #include <array>
+#include <atomic>
+#include <memory>
+#include <utility>
 
 namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
+
+class LifetimeProbe final : public IUnknown {
+public:
+  explicit LifetimeProbe(std::shared_ptr<std::atomic_bool> destroyed)
+      : destroyed_(std::move(destroyed)) {}
+
+  ~LifetimeProbe() { destroyed_->store(true, std::memory_order_release); }
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
+    if (iid != __uuidof(IUnknown))
+      return E_NOINTERFACE;
+    *object = this;
+    AddRef();
+    return S_OK;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return references_.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG references =
+        references_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (!references)
+      delete this;
+    return references;
+  }
+
+private:
+  std::atomic_ulong references_{1};
+  std::shared_ptr<std::atomic_bool> destroyed_;
+};
 
 class ResidencySpec : public ::testing::Test {
 protected:
@@ -146,6 +184,57 @@ TEST_F(ResidencySpec, AcceptsPriorityBucketsAndApplicationValues) {
                 static_cast<UINT>(objects.size()), objects.data(),
                 priorities.data()),
             S_OK);
+}
+
+TEST_F(ResidencySpec,
+       DuplicateEntriesCompleteWithoutRetainingPageableObjects) {
+  ComPtr<ID3D12Device1> device1;
+  ComPtr<ID3D12Device3> device3;
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device1.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device3.put())),
+            S_OK);
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.put())),
+            S_OK);
+  ASSERT_TRUE(resource);
+
+  auto destroyed = std::make_shared<std::atomic_bool>(false);
+  auto *probe = new LifetimeProbe(destroyed);
+  ASSERT_EQ(resource->SetPrivateDataInterface(__uuidof(IUnknown), probe),
+            S_OK);
+  probe->Release();
+  ASSERT_FALSE(destroyed->load(std::memory_order_acquire));
+
+  std::array<ID3D12Pageable *, 3> duplicates = {
+      resource.get(), resource.get(), resource.get()};
+  constexpr std::array priorities = {
+      D3D12_RESIDENCY_PRIORITY_LOW, D3D12_RESIDENCY_PRIORITY_NORMAL,
+      D3D12_RESIDENCY_PRIORITY_HIGH};
+  EXPECT_EQ(context_.device()->MakeResident(
+                static_cast<UINT>(duplicates.size()), duplicates.data()),
+            S_OK);
+  EXPECT_EQ(device1->SetResidencyPriority(
+                static_cast<UINT>(duplicates.size()), duplicates.data(),
+                priorities.data()),
+            S_OK);
+  EXPECT_EQ(context_.device()->Evict(
+                static_cast<UINT>(duplicates.size()), duplicates.data()),
+            S_OK);
+  EXPECT_EQ(device3->EnqueueMakeResident(
+                D3D12_RESIDENCY_FLAG_NONE,
+                static_cast<UINT>(duplicates.size()), duplicates.data(),
+                fence.get(), 9),
+            S_OK);
+  EXPECT_GE(fence->GetCompletedValue(), 9u);
+
+  resource.reset();
+  EXPECT_TRUE(destroyed->load(std::memory_order_acquire));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(ResidencySpec, RejectsInvalidAndForeignObjectsAndRecovers) {
