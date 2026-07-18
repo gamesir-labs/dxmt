@@ -752,7 +752,8 @@ ClassifyDxilOperation(std::string_view name,
   if (semantic_flags & (DxilOpcodeSemanticDerivative |
                         DxilOpcodeSemanticGradient))
     return DxilSemanticOperationKind::Derivative;
-  if (category.find("Ray") != std::string_view::npos ||
+  if (name.find("Ray") != std::string_view::npos ||
+      category.find("Ray") != std::string_view::npos ||
       category.find("HitObject") != std::string_view::npos ||
       opcode_class.find("RayQuery") != std::string_view::npos)
     return DxilSemanticOperationKind::Raytracing;

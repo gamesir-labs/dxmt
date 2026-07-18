@@ -3,6 +3,7 @@
 #include "DXILParser/DXILFormatConstants.hpp"
 #include "DXILParser/DXILParser.hpp"
 #include "dxil_llvm_coverage_fixture.hpp"
+#include "dxil_typed_operations_fixture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1241,6 +1242,237 @@ TEST(DxilLlvmModule, ParsesTypesControlFlowCallsAndGlobals) {
   EXPECT_EQ(module.call_graph.unused_dx_intrinsic_declarations,
             (std::vector<std::string>{
                 "dx.op.flattenedThreadIdInGroup.i32"}));
+}
+
+TEST(DxilLlvmModule, ParsesEveryTypedOperationKindAndSystemValue) {
+  using namespace dxmt::dxil;
+  const auto bitcode =
+      DecodeHex(dxmt::test::kDxilTypedOperationsBitcodeHex);
+  ASSERT_EQ(bitcode.size(), 4804u);
+  LlvmModuleInfo module;
+  ASSERT_EQ(ParseLlvmModule(bitcode, module), ParseStatus::Ok);
+
+  const auto function = std::find_if(
+      module.functions.begin(), module.functions.end(),
+      [](const LlvmFunctionInfo &candidate) { return candidate.name == "ops"; });
+  ASSERT_NE(function, module.functions.end());
+  ASSERT_EQ(function->dxil_operations.size(), 52u);
+  const auto find_operation = [&](uint32_t opcode)
+      -> const LlvmDxilOperationInfo * {
+    const auto operation = std::find_if(
+        function->dxil_operations.begin(), function->dxil_operations.end(),
+        [opcode](const LlvmDxilOperationInfo &candidate) {
+          return candidate.opcode == opcode;
+        });
+    return operation == function->dxil_operations.end() ? nullptr
+                                                         : &*operation;
+  };
+  const auto expect_kind = [&](uint32_t opcode, DxilTypedOperationKind kind) {
+    const auto *operation = find_operation(opcode);
+    ASSERT_NE(operation, nullptr) << opcode;
+    EXPECT_TRUE(operation->opcode_known) << opcode;
+    EXPECT_EQ(operation->typed.kind, kind) << opcode;
+  };
+
+  expect_kind(57u, DxilTypedOperationKind::CreateHandle);
+  expect_kind(217u, DxilTypedOperationKind::CreateHandleFromBinding);
+  expect_kind(218u, DxilTypedOperationKind::CreateHandleFromHeap);
+  expect_kind(216u, DxilTypedOperationKind::AnnotateHandle);
+  expect_kind(58u, DxilTypedOperationKind::CBufferLoad);
+  expect_kind(59u, DxilTypedOperationKind::CBufferLoad);
+  expect_kind(66u, DxilTypedOperationKind::TextureLoad);
+  expect_kind(67u, DxilTypedOperationKind::TextureStore);
+  expect_kind(68u, DxilTypedOperationKind::BufferLoad);
+  expect_kind(69u, DxilTypedOperationKind::BufferStore);
+  expect_kind(139u, DxilTypedOperationKind::RawBufferLoad);
+  expect_kind(140u, DxilTypedOperationKind::RawBufferStore);
+  expect_kind(60u, DxilTypedOperationKind::Sample);
+  expect_kind(73u, DxilTypedOperationKind::Gather);
+  expect_kind(78u, DxilTypedOperationKind::Atomic);
+  expect_kind(79u, DxilTypedOperationKind::Atomic);
+  expect_kind(70u, DxilTypedOperationKind::BufferStore);
+  expect_kind(4u, DxilTypedOperationKind::LoadInput);
+  expect_kind(103u, DxilTypedOperationKind::LoadInput);
+  expect_kind(104u, DxilTypedOperationKind::LoadInput);
+  expect_kind(5u, DxilTypedOperationKind::StoreOutput);
+  expect_kind(106u, DxilTypedOperationKind::StoreOutput);
+  expect_kind(171u, DxilTypedOperationKind::StoreOutput);
+  expect_kind(172u, DxilTypedOperationKind::StoreOutput);
+
+  const auto *create = find_operation(57u);
+  ASSERT_NE(create, nullptr);
+  EXPECT_TRUE(create->typed.has_resource_class);
+  EXPECT_EQ(create->typed.resource_class, 2u);
+  EXPECT_TRUE(create->typed.has_resource_range_id);
+  EXPECT_EQ(create->typed.resource_range_id, 3u);
+  EXPECT_TRUE(create->typed.has_resource_index);
+  EXPECT_EQ(create->typed.resource_index, 4u);
+  EXPECT_TRUE(create->typed.has_non_uniform);
+  EXPECT_TRUE(create->typed.non_uniform);
+  ASSERT_EQ(create->typed.operands.size(), 4u);
+  EXPECT_EQ(create->typed.operands[0].name, "resource_class");
+  EXPECT_EQ(create->typed.operands[3].name, "non_uniform_index");
+
+  const auto *binding = find_operation(217u);
+  ASSERT_NE(binding, nullptr);
+  EXPECT_TRUE(binding->typed.has_resource_binding);
+  EXPECT_EQ(binding->typed.resource_lower_bound, 4u);
+  EXPECT_EQ(binding->typed.resource_space, 2u);
+  EXPECT_TRUE(binding->typed.has_resource_class);
+  EXPECT_EQ(binding->typed.resource_class, 1u);
+  EXPECT_TRUE(binding->typed.has_resource_index);
+  EXPECT_EQ(binding->typed.resource_index, 9u);
+  EXPECT_TRUE(binding->typed.non_uniform);
+  ASSERT_FALSE(binding->typed.operands.empty());
+  EXPECT_EQ(binding->typed.operands[0].aggregate_integer_values,
+            (std::vector<uint64_t>{4u, 7u, 2u, 1u}));
+
+  const auto *heap = find_operation(218u);
+  ASSERT_NE(heap, nullptr);
+  EXPECT_EQ(heap->typed.resource_class, 1u);
+  EXPECT_EQ(heap->typed.resource_index, 5u);
+  EXPECT_TRUE(heap->typed.has_non_uniform);
+  EXPECT_FALSE(heap->typed.non_uniform);
+
+  const auto *cbuffer = find_operation(58u);
+  ASSERT_NE(cbuffer, nullptr);
+  EXPECT_TRUE(cbuffer->typed.is_read);
+  EXPECT_EQ(cbuffer->typed.resource_index, 11u);
+  const auto *texture_load = find_operation(66u);
+  ASSERT_NE(texture_load, nullptr);
+  EXPECT_TRUE(texture_load->typed.is_read);
+  EXPECT_EQ(texture_load->typed.operands.size(), 8u);
+  const auto *texture_store = find_operation(67u);
+  ASSERT_NE(texture_store, nullptr);
+  EXPECT_TRUE(texture_store->typed.is_write);
+  EXPECT_TRUE(texture_store->typed.has_mask);
+  EXPECT_EQ(texture_store->typed.mask, 15u);
+
+  const auto *buffer_load = find_operation(68u);
+  ASSERT_NE(buffer_load, nullptr);
+  EXPECT_TRUE(buffer_load->typed.is_read);
+  EXPECT_EQ(buffer_load->typed.resource_index, 21u);
+  const auto *buffer_store = find_operation(69u);
+  ASSERT_NE(buffer_store, nullptr);
+  EXPECT_TRUE(buffer_store->typed.is_write);
+  EXPECT_EQ(buffer_store->typed.resource_index, 22u);
+  EXPECT_EQ(buffer_store->typed.mask, 13u);
+
+  const auto *raw_load = find_operation(139u);
+  ASSERT_NE(raw_load, nullptr);
+  EXPECT_EQ(raw_load->typed.resource_index, 23u);
+  EXPECT_EQ(raw_load->typed.mask, 7u);
+  EXPECT_EQ(raw_load->typed.alignment, 16u);
+  const auto *raw_store = find_operation(140u);
+  ASSERT_NE(raw_store, nullptr);
+  EXPECT_EQ(raw_store->typed.resource_index, 24u);
+  EXPECT_EQ(raw_store->typed.mask, 11u);
+  EXPECT_EQ(raw_store->typed.alignment, 32u);
+
+  const auto *sample = find_operation(60u);
+  ASSERT_NE(sample, nullptr);
+  EXPECT_TRUE(sample->typed.is_read);
+  EXPECT_TRUE(sample->typed.is_sample);
+  ASSERT_EQ(sample->typed.operands.size(), 4u);
+  EXPECT_EQ(sample->typed.operands[2].name, "sample_operand0");
+  const auto *gather = find_operation(73u);
+  ASSERT_NE(gather, nullptr);
+  EXPECT_TRUE(gather->typed.is_read);
+  EXPECT_TRUE(gather->typed.is_gather);
+  ASSERT_EQ(gather->typed.operands.size(), 4u);
+  EXPECT_EQ(gather->typed.operands[2].name, "gather_operand0");
+
+  const auto *atomic = find_operation(78u);
+  ASSERT_NE(atomic, nullptr);
+  EXPECT_TRUE(atomic->typed.is_write);
+  EXPECT_TRUE(atomic->typed.is_atomic);
+  EXPECT_TRUE(atomic->typed.has_atomic_operation);
+  EXPECT_EQ(atomic->typed.atomic_operation, 6u);
+  const auto *compare_exchange = find_operation(79u);
+  ASSERT_NE(compare_exchange, nullptr);
+  EXPECT_TRUE(compare_exchange->typed.is_atomic);
+  EXPECT_FALSE(compare_exchange->typed.has_atomic_operation);
+  const auto *counter = find_operation(70u);
+  ASSERT_NE(counter, nullptr);
+  EXPECT_TRUE(counter->typed.is_read);
+  EXPECT_TRUE(counter->typed.is_write);
+
+  for (uint32_t opcode : {4u, 103u, 104u}) {
+    const auto *load = find_operation(opcode);
+    ASSERT_NE(load, nullptr);
+    EXPECT_TRUE(load->typed.is_read);
+    EXPECT_TRUE(load->typed.has_signature_element_id);
+    EXPECT_TRUE(load->typed.has_row_index);
+    EXPECT_TRUE(load->typed.has_column_index);
+  }
+  EXPECT_EQ(find_operation(4u)->typed.signature_element_id, 31u);
+  EXPECT_EQ(find_operation(4u)->typed.row_index, 2u);
+  EXPECT_EQ(find_operation(4u)->typed.column_index, 3u);
+  for (uint32_t opcode : {5u, 106u, 171u, 172u}) {
+    const auto *store = find_operation(opcode);
+    ASSERT_NE(store, nullptr);
+    EXPECT_TRUE(store->typed.is_write);
+    EXPECT_TRUE(store->typed.has_signature_element_id);
+    EXPECT_TRUE(store->typed.has_row_index);
+    EXPECT_TRUE(store->typed.has_column_index);
+  }
+  EXPECT_EQ(find_operation(5u)->typed.signature_element_id, 41u);
+  EXPECT_EQ(find_operation(5u)->typed.row_index, 5u);
+  EXPECT_EQ(find_operation(5u)->typed.column_index, 2u);
+
+  constexpr std::array system_values = {
+      std::pair{90u, DxilSystemValueKind::SampleIndex},
+      std::pair{91u, DxilSystemValueKind::Coverage},
+      std::pair{92u, DxilSystemValueKind::InnerCoverage},
+      std::pair{93u, DxilSystemValueKind::ThreadId},
+      std::pair{94u, DxilSystemValueKind::GroupId},
+      std::pair{95u, DxilSystemValueKind::ThreadIdInGroup},
+      std::pair{96u, DxilSystemValueKind::FlattenedThreadIdInGroup},
+      std::pair{100u, DxilSystemValueKind::GSInstanceID},
+      std::pair{105u, DxilSystemValueKind::DomainLocation},
+      std::pair{107u, DxilSystemValueKind::OutputControlPointID},
+      std::pair{108u, DxilSystemValueKind::PrimitiveID},
+      std::pair{138u, DxilSystemValueKind::ViewID},
+      std::pair{141u, DxilSystemValueKind::InstanceID},
+      std::pair{142u, DxilSystemValueKind::InstanceIndex},
+      std::pair{143u, DxilSystemValueKind::HitKind},
+      std::pair{144u, DxilSystemValueKind::RayFlags},
+      std::pair{145u, DxilSystemValueKind::DispatchRaysIndex},
+      std::pair{146u, DxilSystemValueKind::DispatchRaysDimensions},
+      std::pair{161u, DxilSystemValueKind::PrimitiveIndex},
+      std::pair{213u, DxilSystemValueKind::GeometryIndex},
+  };
+  for (const auto &[opcode, system_value] : system_values) {
+    SCOPED_TRACE(opcode);
+    const auto *operation = find_operation(opcode);
+    ASSERT_NE(operation, nullptr);
+    EXPECT_EQ(operation->typed.kind, DxilTypedOperationKind::SystemValue);
+    EXPECT_EQ(operation->typed.system_value, system_value);
+    EXPECT_TRUE(operation->typed.has_component_index);
+  }
+
+  constexpr std::array semantic_kinds = {
+      std::pair{4u, DxilSemanticOperationKind::SignatureInput},
+      std::pair{5u, DxilSemanticOperationKind::SignatureOutput},
+      std::pair{57u, DxilSemanticOperationKind::ResourceHandle},
+      std::pair{60u, DxilSemanticOperationKind::ResourceSample},
+      std::pair{67u, DxilSemanticOperationKind::ResourceWrite},
+      std::pair{58u, DxilSemanticOperationKind::ResourceRead},
+      std::pair{72u, DxilSemanticOperationKind::ResourceQuery},
+      std::pair{80u, DxilSemanticOperationKind::Barrier},
+      std::pair{110u, DxilSemanticOperationKind::Wave},
+      std::pair{83u, DxilSemanticOperationKind::Derivative},
+      std::pair{157u, DxilSemanticOperationKind::Raytracing},
+      std::pair{168u, DxilSemanticOperationKind::Mesh},
+      std::pair{238u, DxilSemanticOperationKind::Node},
+      std::pair{6u, DxilSemanticOperationKind::Math},
+  };
+  for (const auto &[opcode, semantic_kind] : semantic_kinds) {
+    SCOPED_TRACE(opcode);
+    const auto *operation = find_operation(opcode);
+    ASSERT_NE(operation, nullptr);
+    EXPECT_EQ(operation->semantic_kind, semantic_kind);
+  }
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
