@@ -61,9 +61,12 @@ std::string getEnvVar(const char *name) {
 }
 
 size_t matchFileExtension(const std::string &name, const char *ext) {
+  if (!ext)
+    return std::string::npos;
+
   auto pos = name.find_last_of('.');
 
-  if (pos == std::string::npos || !ext)
+  if (pos == std::string::npos)
     return pos;
 
   const std::string_view expected(ext);

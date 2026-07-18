@@ -169,6 +169,11 @@ INSTANTIATE_TEST_SUITE_P(
                       ExtensionCase{"game", "exe", false},
                       ExtensionCase{"game.exe", "ex", false}));
 
+TEST(Environment, RejectsANullFileExtension) {
+  EXPECT_EQ(dxmt::env::matchFileExtension("game.exe", nullptr),
+            std::string::npos);
+}
+
 TEST(Environment, ReportsTheRunningExecutable) {
   const auto path = dxmt::env::getExePath();
   EXPECT_FALSE(path.empty());
