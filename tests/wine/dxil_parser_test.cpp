@@ -768,6 +768,50 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
             DxilTranslationSourceRuntimeData);
   EXPECT_EQ(runtime_translation.feature_flags, 0x0000002200000011ull);
   EXPECT_EQ(runtime_translation.shader_flags, 0x1234u);
+
+  auto invalid_functions = functions;
+  invalid_functions[kRuntimeDataTableHeaderSize + 44] = 64;
+  invalid_functions[kRuntimeDataTableHeaderSize + 45] = 32;
+  auto invalid_resources = resources;
+  Store<uint32_t>(invalid_resources, kRuntimeDataTableHeaderSize + 16, 8u);
+  Store<uint32_t>(invalid_resources, kRuntimeDataTableHeaderSize + 20, 7u);
+  const auto invalid_runtime_data =
+      DxilRuntimeDataBuilder()
+          .add(rdat::StringBuffer, strings)
+          .add(rdat::IndexArrays, indices)
+          .add(rdat::ResourceTable, invalid_resources)
+          .add(rdat::CSInfoTable, compute)
+          .add(rdat::FunctionTable, invalid_functions)
+          .build();
+  auto invalid_psv = psv;
+  Store<uint32_t>(invalid_psv, runtime_offset + 36, 0u);
+  Store<uint32_t>(invalid_psv, resource_offset + 8, 8u);
+  Store<uint32_t>(invalid_psv, resource_offset + 12, 7u);
+  const auto invalid_container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, invalid_runtime_data)
+          .add(fourcc::PipelineStateValidation, invalid_psv)
+          .build();
+
+  Parser invalid_parser;
+  ASSERT_EQ(invalid_parser.parse(invalid_container), ParseStatus::Ok);
+  ASSERT_TRUE(invalid_parser.dxilValidation().has_value());
+  const auto &validation = *invalid_parser.dxilValidation();
+  EXPECT_FALSE(validation.valid);
+  EXPECT_EQ(validation.error_count, 4u);
+  const auto has_error = [&](std::string_view code) {
+    return std::any_of(
+        validation.diagnostics.begin(), validation.diagnostics.end(),
+        [&](const DxilValidationDiagnostic &diagnostic) {
+          return diagnostic.severity == DxilValidationSeverity::Error &&
+                 diagnostic.code == code;
+        });
+  };
+  EXPECT_TRUE(has_error("invalid-wave-lane-range"));
+  EXPECT_TRUE(has_error("invalid-rdat-resource-range"));
+  EXPECT_TRUE(has_error("invalid-thread-group-size"));
+  EXPECT_TRUE(has_error("invalid-psv-resource-range"));
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
