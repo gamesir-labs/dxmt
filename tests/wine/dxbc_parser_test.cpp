@@ -633,6 +633,244 @@ TEST(DxbcSignature, ExtractsSignature11_1OutputFromContainer) {
   EXPECT_EQ(parser.Signature(2)->GetNumParameters(), 1u);
 }
 
+TEST(DxbcSignature, ExtractsEveryContainerVariantAndHonorsPrecedence) {
+  const auto signature4 =
+      SignatureBuilder().add("LEGACY", 1).build();
+  const auto signature5 = BuildStreamSignature<SignatureParameter5>(
+      {{.stream = 2,
+        .semantic_index = 5,
+        .system_value = D3D10_NAME_UNDEFINED,
+        .component_type = D3D10_REGISTER_COMPONENT_UINT32,
+        .register_index = 3,
+        .mask = 0x3}},
+      {"STREAM"});
+  const auto signature11 = BuildStreamSignature<SignatureParameter11_1>(
+      {{.stream = 0,
+        .semantic_index = 7,
+        .system_value = D3D10_NAME_UNDEFINED,
+        .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+        .register_index = 4,
+        .mask = 0xf,
+        .min_precision = D3D_MIN_PRECISION_FLOAT_16}},
+      {"MODERN"});
+
+  const auto input_container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_InputSignature, signature4)
+          .add(microsoft::DXBC_InputSignature11_1, signature11)
+          .build();
+  microsoft::CSignatureParser input;
+  ASSERT_EQ(microsoft::DXBCGetInputSignature(input_container.data(), &input),
+            S_OK);
+  const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+  ASSERT_EQ(input.GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "MODERN");
+  EXPECT_EQ(parameters[0].SemanticIndex, 7u);
+  EXPECT_EQ(parameters[0].MinPrecision, D3D_MIN_PRECISION_FLOAT_16);
+
+  const auto output_container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_OutputSignature, signature4)
+          .add(microsoft::DXBC_OutputSignature5, signature5)
+          .add(microsoft::DXBC_OutputSignature11_1, signature11)
+          .build();
+  microsoft::CSignatureParser5 output;
+  ASSERT_EQ(microsoft::DXBCGetOutputSignature(output_container.data(),
+                                               &output),
+            S_OK);
+  EXPECT_EQ(output.NumStreams(), 1u);
+  ASSERT_EQ(output.Signature(0)->GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "MODERN");
+
+  const auto output5_container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_OutputSignature5, signature5)
+          .build();
+  ASSERT_EQ(microsoft::DXBCGetOutputSignature(output5_container.data(),
+                                               &output),
+            S_OK);
+  EXPECT_EQ(output.NumStreams(), 3u);
+  ASSERT_EQ(output.Signature(2)->GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "STREAM");
+  EXPECT_EQ(parameters[0].Stream, 2u);
+
+  const auto output4_container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_OutputSignature, signature4)
+          .build();
+  ASSERT_EQ(microsoft::DXBCGetOutputSignature(output4_container.data(),
+                                               &output),
+            S_OK);
+  EXPECT_EQ(output.NumStreams(), 1u);
+  ASSERT_EQ(output.Signature(0)->GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "LEGACY");
+
+  microsoft::CSignatureParser flat_output;
+  ASSERT_EQ(microsoft::DXBCGetOutputSignature(output_container.data(),
+                                               &flat_output),
+            S_OK);
+  ASSERT_EQ(flat_output.GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "MODERN");
+  ASSERT_EQ(microsoft::DXBCGetOutputSignature(output4_container.data(),
+                                               &flat_output),
+            S_OK);
+  ASSERT_EQ(flat_output.GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "LEGACY");
+  EXPECT_EQ(microsoft::DXBCGetOutputSignature(output5_container.data(),
+                                               &flat_output),
+            E_FAIL);
+
+  const auto patch_container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_PatchConstantSignature, signature4)
+          .add(microsoft::DXBC_PatchConstantSignature11_1, signature11)
+          .build();
+  microsoft::CSignatureParser patch;
+  ASSERT_EQ(microsoft::DXBCGetPatchConstantSignature(patch_container.data(),
+                                                      &patch),
+            S_OK);
+  ASSERT_EQ(patch.GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "MODERN");
+  const auto legacy_patch_container =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_PatchConstantSignature, signature4)
+          .build();
+  ASSERT_EQ(microsoft::DXBCGetPatchConstantSignature(
+                legacy_patch_container.data(), &patch),
+            S_OK);
+  ASSERT_EQ(patch.GetParameters(&parameters), 1u);
+  EXPECT_STREQ(parameters[0].SemanticName, "LEGACY");
+
+  const auto empty_container = DxbcContainerBuilder().build();
+  EXPECT_EQ(microsoft::DXBCGetInputSignature(empty_container.data(), &input),
+            E_FAIL);
+  EXPECT_EQ(microsoft::DXBCGetOutputSignature(empty_container.data(), &output),
+            E_FAIL);
+  EXPECT_EQ(microsoft::DXBCGetPatchConstantSignature(empty_container.data(),
+                                                      &patch),
+            E_FAIL);
+  const auto empty_input_blob =
+      DxbcContainerBuilder()
+          .add(microsoft::DXBC_InputSignature, {})
+          .build();
+  EXPECT_EQ(microsoft::DXBCGetInputSignature(empty_input_blob.data(), &input),
+            E_FAIL);
+}
+
+TEST(DxbcSignature, SupportsReferencedStringsAndExternalParameterStorage) {
+  auto signature = SignatureBuilder().add("REFERENCE", 6).build();
+  const auto string_offset =
+      2u * sizeof(uint32_t) + sizeof(SignatureParameter4);
+  microsoft::CSignatureParser parser;
+  ASSERT_EQ(parser.ReadSignature4(signature.data(), signature.size(), true),
+            S_OK);
+  const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+  ASSERT_EQ(parser.GetParameters(&parameters), 1u);
+  ASSERT_NE(parameters, nullptr);
+  EXPECT_EQ(parameters[0].SemanticName,
+            reinterpret_cast<char *>(signature.data() + string_offset));
+  signature[string_offset] = 'X';
+  EXPECT_STREQ(parameters[0].SemanticName, "XEFERENCE");
+  EXPECT_EQ(parser.GetParameters(nullptr), 1u);
+
+  std::array<char, 4> name0 = {'T', 'E', 'X', 0};
+  std::array<char, 4> name1 = {'C', 'O', 'L', 0};
+  std::array<microsoft::D3D11_SIGNATURE_PARAMETER, 2> external = {{
+      {.SemanticName = name0.data(),
+       .SemanticIndex = 0,
+       .ComponentType = microsoft::D3D10_SB_REGISTER_COMPONENT_FLOAT32,
+       .Register = 2,
+       .Mask = 0xf},
+      {.SemanticName = name1.data(),
+       .SemanticIndex = 1,
+       .ComponentType = microsoft::D3D10_SB_REGISTER_COMPONENT_UINT32,
+       .Register = 3,
+       .Mask = 0x3},
+  }};
+  const auto char_sum = [](std::string_view text) {
+    UINT sum = 0;
+    for (const auto value : text)
+      sum += static_cast<unsigned char>(value >= 'A' && value <= 'Z'
+                                            ? value - 'A' + 'a'
+                                            : value);
+    return sum;
+  };
+  std::array<UINT, 2> sums = {char_sum("TEX"), char_sum("COL")};
+  ASSERT_EQ(parser.ReadSignature5(external.data(), sums.data(),
+                                  external.size()),
+            S_OK);
+  ASSERT_EQ(parser.GetParameters(&parameters), external.size());
+  EXPECT_EQ(parameters, external.data());
+  microsoft::D3D11_SIGNATURE_PARAMETER *found = nullptr;
+  EXPECT_EQ(parser.FindParameter("col", 1, &found), S_OK);
+  EXPECT_EQ(found, &external[1]);
+  EXPECT_EQ(parser.ReadSignature11_1(nullptr, nullptr, 0), S_OK);
+  EXPECT_EQ(parser.GetNumParameters(), 0u);
+  name0[0] = 'Y';
+  EXPECT_EQ(name0[0], 'Y');
+}
+
+TEST(DxbcSignature, ChecksEveryLinkageCompatibilityField) {
+  const auto can_link = [](SignatureParameter4 source_parameter,
+                           SignatureParameter4 target_parameter,
+                           std::string source_name = "VALUE",
+                           std::string target_name = "VALUE") {
+    const auto source_bytes = BuildStreamSignature<SignatureParameter4>(
+        {source_parameter}, {std::move(source_name)});
+    const auto target_bytes = BuildStreamSignature<SignatureParameter4>(
+        {target_parameter}, {std::move(target_name)});
+    microsoft::CSignatureParser source;
+    microsoft::CSignatureParser target;
+    if (source.ReadSignature4(source_bytes.data(), source_bytes.size()) != S_OK ||
+        target.ReadSignature4(target_bytes.data(), target_bytes.size()) != S_OK)
+      return false;
+    return source.CanOutputTo(&target);
+  };
+  const SignatureParameter4 base = {
+      .semantic_index = 1,
+      .system_value = D3D10_NAME_POSITION,
+      .component_type = D3D10_REGISTER_COMPONENT_FLOAT32,
+      .register_index = 2,
+      .mask = 0xf,
+  };
+  EXPECT_TRUE(can_link(base, base));
+  EXPECT_FALSE(can_link(base, base, "VALUE", "OTHER"));
+
+  auto target = base;
+  target.semantic_index = 2;
+  EXPECT_FALSE(can_link(base, target));
+  target = base;
+  target.register_index = 3;
+  EXPECT_FALSE(can_link(base, target));
+  target = base;
+  target.system_value = D3D10_NAME_PRIMITIVE_ID;
+  EXPECT_FALSE(can_link(base, target));
+  target = base;
+  target.component_type = D3D10_REGISTER_COMPONENT_UINT32;
+  EXPECT_FALSE(can_link(base, target));
+  target = base;
+  target.mask = 0x1;
+  auto source = base;
+  source.mask = 0x2;
+  EXPECT_FALSE(can_link(source, target));
+  source = base;
+  target = base;
+  source.read_write_mask = 0x4;
+  target.read_write_mask = 0x4;
+  EXPECT_FALSE(can_link(source, target));
+
+  const auto one = BuildStreamSignature<SignatureParameter4>({base}, {"A"});
+  auto second = base;
+  second.register_index = 3;
+  const auto two = BuildStreamSignature<SignatureParameter4>({base, second},
+                                                              {"A", "B"});
+  microsoft::CSignatureParser short_source;
+  microsoft::CSignatureParser long_target;
+  ASSERT_EQ(short_source.ReadSignature4(one.data(), one.size()), S_OK);
+  ASSERT_EQ(long_target.ReadSignature4(two.data(), two.size()), S_OK);
+  EXPECT_FALSE(short_source.CanOutputTo(&long_target));
+}
+
 TEST_P(DxbcInvalidSignatureTest, RejectsMalformedTableAndStringRanges) {
   auto bytes = SignatureBuilder().add("A", 0).add("B", 1).build();
 
