@@ -889,6 +889,57 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
   ASSERT_EQ(rdef_parser.dxilTranslation()->resources.size(), 1u);
   EXPECT_EQ(rdef_parser.dxilTranslation()->resources[0].source_mask,
             DxilTranslationSourceResourceDef);
+
+  const auto make_legacy_signature = [](std::string_view semantic,
+                                        uint32_t register_index) {
+    constexpr size_t element_offset = kDxilSignatureHeaderSize;
+    constexpr size_t name_offset =
+        element_offset + kDxilSignatureElementSize;
+    std::vector<uint8_t> signature(name_offset + semantic.size() + 1);
+    Store<uint32_t>(signature, 0, 1u);
+    Store<uint32_t>(signature, 4, element_offset);
+    Store<uint32_t>(signature, element_offset + 4, name_offset);
+    Store<uint32_t>(signature, element_offset + 8, register_index);
+    Store<uint32_t>(signature, element_offset + 16, 3u);
+    Store<uint32_t>(signature, element_offset + 20, register_index);
+    signature[element_offset + 24] = 0xf;
+    std::copy(semantic.begin(), semantic.end(),
+              signature.begin() + name_offset);
+    return signature;
+  };
+  const auto input_signature = make_legacy_signature("INPUT", 0);
+  const auto output_signature = make_legacy_signature("OUTPUT", 1);
+  const auto patch_signature = make_legacy_signature("PATCH", 2);
+  const auto legacy_container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::InputSignature, input_signature)
+          .add(fourcc::OutputSignature, output_signature)
+          .add(fourcc::PatchConstantSignature, patch_signature)
+          .build();
+
+  Parser legacy_parser;
+  ASSERT_EQ(legacy_parser.parse(legacy_container), ParseStatus::Ok);
+  ASSERT_TRUE(legacy_parser.shaderReflection().has_value());
+  EXPECT_EQ(legacy_parser.shaderReflection()->legacy_signatures.size(), 3u);
+  ASSERT_TRUE(legacy_parser.dxilTranslation().has_value());
+  const auto &legacy_translation = *legacy_parser.dxilTranslation();
+  ASSERT_EQ(legacy_translation.signatures.size(), 3u);
+  EXPECT_EQ(legacy_translation.signatures[0].kind,
+            DxilTranslationSignatureKind::Input);
+  EXPECT_EQ(legacy_translation.signatures[0].semantic_name, "INPUT");
+  EXPECT_EQ(legacy_translation.signatures[0].source_mask,
+            DxilTranslationSourceLegacySignature);
+  EXPECT_EQ(legacy_translation.signatures[1].kind,
+            DxilTranslationSignatureKind::Output);
+  EXPECT_EQ(legacy_translation.signatures[1].semantic_name, "OUTPUT");
+  EXPECT_EQ(legacy_translation.signatures[1].source_mask,
+            DxilTranslationSourceLegacySignature);
+  EXPECT_EQ(legacy_translation.signatures[2].kind,
+            DxilTranslationSignatureKind::PatchConstant);
+  EXPECT_EQ(legacy_translation.signatures[2].semantic_name, "PATCH");
+  EXPECT_EQ(legacy_translation.signatures[2].source_mask,
+            DxilTranslationSourceLegacySignature);
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
