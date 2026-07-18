@@ -101,6 +101,27 @@ TEST(AllocationRefTracking, ExtendsCapacityAndTransfersInInsertionOrder) {
   EXPECT_EQ(destructions, 1u);
 }
 
+TEST(AllocationRefTracking, RejectsInvalidExtensionStorage) {
+  uint32_t destructions = 0;
+  auto *allocation = new ProbeAllocation(destructions);
+  dxmt::AllocationRefTracking tracking;
+
+  for (size_t i = 0; i < 29; ++i)
+    ASSERT_TRUE(tracking.track(allocation));
+  ASSERT_FALSE(tracking.track(allocation));
+
+  alignas(std::max_align_t) std::array<std::byte, 128> storage = {};
+  tracking.addStorage(nullptr, storage.size());
+  EXPECT_FALSE(tracking.track(allocation));
+  tracking.addStorage(storage.data(), 1);
+  EXPECT_FALSE(tracking.track(allocation));
+  tracking.addStorage(storage.data() + 1, storage.size() - 1);
+  EXPECT_FALSE(tracking.track(allocation));
+
+  tracking.clear();
+  EXPECT_EQ(destructions, 1u);
+}
+
 TEST(ResourceResidency, MergesRequestsWithinEncoderAndResetsOnNewEncoder) {
   dxmt::DXMT_RESOURCE_RESIDENCY_STATE state;
   auto requested = dxmt::DXMT_RESOURCE_RESIDENCY_VERTEX_READ;

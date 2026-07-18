@@ -1,6 +1,5 @@
 #include "dxmt_allocation.hpp"
 #include "util_likely.hpp"
-#include <cassert>
 #include <iterator>
 #include <new>
 
@@ -40,11 +39,15 @@ AllocationRefTracking::track(Allocation *allocation) {
 
 void
 AllocationRefTracking::addStorage(void *ptr, size_t length) {
+  constexpr size_t header_size = offsetof(RefAddChunk<>, allocations);
+  if (!ptr || reinterpret_cast<uintptr_t>(ptr) % alignof(RefAddChunk<>) ||
+      length < header_size + sizeof(Allocation *))
+    return;
+
   RefAddChunk<> *new_chunk = std::launder(reinterpret_cast<RefAddChunk<> *>(ptr));
   new_chunk->next_chunk = nullptr;
   new_chunk->size = 0;
-  assert(length > sizeof(RefAddChunk<>) && "No enough space for allocation reference tracking");
-  new_chunk->capacity = (length - offsetof(RefAddChunk<>, allocations)) / sizeof(Allocation *);
+  new_chunk->capacity = (length - header_size) / sizeof(Allocation *);
   chunk_last->next_chunk = new_chunk;
   chunk_last = new_chunk;
 }
