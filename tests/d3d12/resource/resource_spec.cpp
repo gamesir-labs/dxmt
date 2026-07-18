@@ -566,6 +566,83 @@ TEST_F(D3D12ResourceSpec, ReportsCommittedBufferHeapPropertiesAndMapRules) {
   }
 }
 
+TEST_F(D3D12ResourceSpec, HeapPropertiesOutputsAreIndependentlyOptional) {
+  auto resource = context_.CreateBuffer(
+      4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_GENERIC_READ);
+  ASSERT_TRUE(resource);
+
+  D3D12_HEAP_PROPERTIES properties = {};
+  EXPECT_EQ(resource->GetHeapProperties(&properties, nullptr), S_OK);
+  EXPECT_EQ(properties.Type, D3D12_HEAP_TYPE_UPLOAD);
+
+  D3D12_HEAP_FLAGS flags = static_cast<D3D12_HEAP_FLAGS>(UINT_MAX);
+  EXPECT_EQ(resource->GetHeapProperties(nullptr, &flags), S_OK);
+  EXPECT_EQ(flags, D3D12_HEAP_FLAG_NONE);
+  EXPECT_EQ(resource->GetHeapProperties(nullptr, nullptr), S_OK);
+}
+
+TEST_F(D3D12ResourceSpec, PlacedResourceReportsOwningHeapProperties) {
+  auto heap = CreateHeap(
+      context_.device(), D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+      D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS);
+  ASSERT_TRUE(heap);
+  auto resource = CreatePlacedResource(
+      context_.device(), heap.get(), 0, BufferDesc(4096),
+      D3D12_RESOURCE_STATE_GENERIC_READ);
+  ASSERT_TRUE(resource);
+
+  D3D12_HEAP_PROPERTIES properties = {};
+  D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
+  ASSERT_EQ(resource->GetHeapProperties(&properties, &flags), S_OK);
+  const auto heap_desc = heap->GetDesc();
+  EXPECT_EQ(properties.Type, heap_desc.Properties.Type);
+  EXPECT_EQ(properties.CPUPageProperty,
+            heap_desc.Properties.CPUPageProperty);
+  EXPECT_EQ(properties.MemoryPoolPreference,
+            heap_desc.Properties.MemoryPoolPreference);
+  EXPECT_EQ(properties.CreationNodeMask,
+            heap_desc.Properties.CreationNodeMask);
+  EXPECT_EQ(properties.VisibleNodeMask,
+            heap_desc.Properties.VisibleNodeMask);
+  EXPECT_EQ(flags, heap_desc.Flags);
+}
+
+TEST_F(D3D12ResourceSpec, ReservedResourceRejectsHeapPropertyQueries) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+            S_OK);
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  auto desc = BufferDesc(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+  ComPtr<ID3D12Resource> resource;
+  ASSERT_EQ(context_.device()->CreateReservedResource(
+                &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(resource.put())),
+            S_OK);
+  ASSERT_TRUE(resource);
+
+  D3D12_HEAP_PROPERTIES properties = {};
+  properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+  properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  properties.CreationNodeMask = 0x1234;
+  properties.VisibleNodeMask = 0x5678;
+  D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_SHARED;
+
+  EXPECT_EQ(resource->GetHeapProperties(&properties, &flags), E_INVALIDARG);
+  EXPECT_EQ(properties.Type, D3D12_HEAP_TYPE_CUSTOM);
+  EXPECT_EQ(properties.CPUPageProperty,
+            D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
+  EXPECT_EQ(properties.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
+  EXPECT_EQ(properties.CreationNodeMask, 0x1234u);
+  EXPECT_EQ(properties.VisibleNodeMask, 0x5678u);
+  EXPECT_EQ(flags, D3D12_HEAP_FLAG_SHARED);
+  EXPECT_EQ(resource->GetHeapProperties(nullptr, nullptr), E_INVALIDARG);
+}
+
 TEST_F(D3D12ResourceSpec, RoundsPlacedHeapBackendSizeToHeapAlignment) {
   constexpr UINT64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
   constexpr UINT64 heap_size = 2 * alignment - 1;

@@ -1106,10 +1106,12 @@ public:
   HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *heap_properties,
                     D3D12_HEAP_FLAGS *flags) override {
-    if (!heap_properties || !flags)
-      return E_POINTER;
-    *heap_properties = heap_properties_;
-    *flags = heap_flags_;
+    if (IsReserved())
+      return WARN_E_INVALIDARG(__func__);
+    if (heap_properties)
+      *heap_properties = heap_properties_;
+    if (flags)
+      *flags = heap_flags_;
     return S_OK;
   }
 
