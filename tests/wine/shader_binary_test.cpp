@@ -125,6 +125,111 @@ TEST(ShaderBinary, ParsesExtendedRegisterOperandWithoutChangingParserState) {
   EXPECT_TRUE(operand.m_Nonuniform);
 }
 
+TEST(ShaderBinary, ParsesEveryOperandIndexRepresentation) {
+  constexpr CShaderToken kNestedIndexableTemp =
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_4_COMPONENT) |
+      ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(
+          D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+      ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(
+          D3D10_SB_4_COMPONENT_W) |
+      ENCODE_D3D10_SB_OPERAND_TYPE(
+          D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP) |
+      ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) |
+      ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+          0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) |
+      ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+          1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  constexpr std::array<CShaderToken, 8> mixed_indices = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_0_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(
+              D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(
+              D3D10_SB_OPERAND_INDEX_3D) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+              0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+              1, D3D10_SB_OPERAND_INDEX_IMMEDIATE64) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+              2, D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE),
+      11,
+      0x89abcdef,
+      0x01234567,
+      22,
+      kNestedIndexableTemp,
+      3,
+      4,
+  };
+
+  CShaderCodeParser parser;
+  COperand operand;
+  const auto *end =
+      parser.ParseOperandAt(&operand, mixed_indices.data(),
+                            mixed_indices.data() + mixed_indices.size());
+  EXPECT_EQ(end, mixed_indices.data() + mixed_indices.size());
+  EXPECT_EQ(operand.OperandType(), D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER);
+  EXPECT_EQ(operand.OperandIndexDimension(), D3D10_SB_OPERAND_INDEX_3D);
+  EXPECT_EQ(operand.OperandIndexType(0),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  EXPECT_EQ(operand.OperandIndex(0)->m_RegIndex, 11u);
+  EXPECT_EQ(operand.OperandIndexType(1),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE64);
+  EXPECT_EQ(operand.OperandIndex(1)->m_RegIndexA[0], 0x89abcdefu);
+  EXPECT_EQ(operand.OperandIndex(1)->m_RegIndexA[1], 0x01234567u);
+  EXPECT_EQ(operand.OperandIndexType(2),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE);
+  EXPECT_EQ(operand.OperandIndex(2)->m_RegIndex, 22u);
+  EXPECT_EQ(operand.OperandIndex(2)->m_RelRegType,
+            D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP);
+  EXPECT_EQ(operand.OperandIndex(2)->m_IndexDimension,
+            D3D10_SB_OPERAND_INDEX_2D);
+  EXPECT_EQ(operand.OperandIndex(2)->m_RelIndex, 3u);
+  EXPECT_EQ(operand.OperandIndex(2)->m_RelIndex1, 4u);
+  EXPECT_EQ(operand.OperandIndex(2)->m_ComponentName,
+            D3D10_SB_4_COMPONENT_W);
+
+  constexpr std::array<CShaderToken, 4> relative_index = {
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_0_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_RESOURCE) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(
+              D3D10_SB_OPERAND_INDEX_1D) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+              0, D3D10_SB_OPERAND_INDEX_RELATIVE),
+      ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(
+          D3D10_SB_OPERAND_4_COMPONENT) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(
+              D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(
+              D3D10_SB_4_COMPONENT_Y) |
+          ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(
+              D3D10_SB_OPERAND_INDEX_1D) |
+          ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(
+              0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) |
+          ENCODE_D3D10_SB_OPERAND_EXTENDED(true),
+      ENCODE_D3D10_SB_EXTENDED_OPERAND_MODIFIER(
+          D3D10_SB_OPERAND_MODIFIER_NONE) |
+          ENCODE_D3D11_SB_OPERAND_MIN_PRECISION(
+              D3D11_SB_OPERAND_MIN_PRECISION_UINT_16),
+      7,
+  };
+  COperand relative_operand;
+  end = parser.ParseOperandAt(&relative_operand, relative_index.data(),
+                              relative_index.data() + relative_index.size());
+  EXPECT_EQ(end, relative_index.data() + relative_index.size());
+  EXPECT_EQ(relative_operand.OperandIndexType(0),
+            D3D10_SB_OPERAND_INDEX_RELATIVE);
+  EXPECT_EQ(relative_operand.OperandIndex(0)->m_RelRegType,
+            D3D10_SB_OPERAND_TYPE_TEMP);
+  EXPECT_EQ(relative_operand.OperandIndex(0)->m_RelIndex, 7u);
+  EXPECT_EQ(relative_operand.OperandIndex(0)->m_ComponentName,
+            D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(relative_operand.OperandIndex(0)->m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+}
+
 TEST(ShaderBinary, ParsesSignedExtendedSampleOffsets) {
   constexpr std::array<CShaderToken, 4> shader = {
       ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 5,
