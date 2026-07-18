@@ -1895,6 +1895,150 @@ TEST(DxilValidation, ReportsEveryProgramHeaderMismatch) {
                     "dxil-size-mismatch");
 }
 
+TEST(DxilValidation, ReportsReachableRdatPsvAndCrossSourceDiagnostics) {
+  using namespace dxmt::dxil;
+  const auto bitcode =
+      DecodeHex(dxmt::test::kDxilMetadataTranslationBitcodeHex);
+  const auto program =
+      BuildDxilProgram(bitcode, 5u, 6u, 8u, 0x00010008u);
+
+  const auto expect_diagnostics =
+      [&](std::string_view case_name, std::vector<uint8_t> container,
+          std::initializer_list<std::string_view> codes) {
+        SCOPED_TRACE(case_name);
+        Parser parser;
+        ASSERT_EQ(parser.parse(container), ParseStatus::Ok);
+        ASSERT_TRUE(parser.dxilValidation().has_value());
+        for (const auto code : codes) {
+          SCOPED_TRACE(code);
+          EXPECT_TRUE(std::any_of(
+              parser.dxilValidation()->diagnostics.begin(),
+              parser.dxilValidation()->diagnostics.end(),
+              [code](const DxilValidationDiagnostic &diagnostic) {
+                return diagnostic.code == code;
+              }));
+        }
+      };
+
+  std::vector<uint8_t> empty_runtime_data(kRuntimeDataHeaderSize);
+  Store<uint32_t>(empty_runtime_data, 0, 1u);
+  expect_diagnostics(
+      "empty RDAT",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, empty_runtime_data)
+          .build(),
+      {"missing-rdat-functions"});
+
+  const std::vector<uint8_t> invalid_kind_strings = {'b', 'a', 'd', 0};
+  std::vector<uint8_t> invalid_kind_functions(
+      kRuntimeDataTableHeaderSize + kRdatFunctionRecordSize);
+  Store<uint32_t>(invalid_kind_functions, 0, 1u);
+  Store<uint32_t>(invalid_kind_functions, 4, kRdatFunctionRecordSize);
+  Store<uint32_t>(invalid_kind_functions, kRuntimeDataTableHeaderSize + 0,
+                  0u);
+  Store<uint32_t>(invalid_kind_functions, kRuntimeDataTableHeaderSize + 4,
+                  kRdatNullRef);
+  Store<uint32_t>(invalid_kind_functions, kRuntimeDataTableHeaderSize + 8,
+                  kRdatNullRef);
+  Store<uint32_t>(invalid_kind_functions, kRuntimeDataTableHeaderSize + 12,
+                  kRdatNullRef);
+  Store<uint32_t>(invalid_kind_functions, kRuntimeDataTableHeaderSize + 16,
+                  16u);
+  const auto invalid_kind_runtime_data =
+      DxilRuntimeDataBuilder()
+          .add(rdat::StringBuffer, invalid_kind_strings)
+          .add(rdat::FunctionTable, invalid_kind_functions)
+          .build();
+  expect_diagnostics(
+      "invalid RDAT shader kind",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, invalid_kind_runtime_data)
+          .build(),
+      {"invalid-rdat-shader-kind"});
+
+  const std::vector<uint8_t> resource_strings = {'a', 0, 'b', 0};
+  std::vector<uint8_t> resources(
+      kRuntimeDataTableHeaderSize + 2u * kRdatResourceRecordSize);
+  Store<uint32_t>(resources, 0, 2u);
+  Store<uint32_t>(resources, 4, kRdatResourceRecordSize);
+  const auto store_resource = [&](size_t record, uint32_t name_offset,
+                                  uint32_t id, uint32_t lower_bound,
+                                  uint32_t upper_bound) {
+    const auto offset = kRuntimeDataTableHeaderSize +
+                        record * kRdatResourceRecordSize;
+    Store<uint32_t>(resources, offset + 0, name_offset);
+    Store<uint32_t>(resources, offset + 4, 0u);
+    Store<uint32_t>(resources, offset + 8, 2u);
+    Store<uint32_t>(resources, offset + 12, id);
+    Store<uint32_t>(resources, offset + 16, 1u);
+    Store<uint32_t>(resources, offset + 20, lower_bound);
+    Store<uint32_t>(resources, offset + 24, upper_bound);
+  };
+  store_resource(0, 0u, 3u, 0u, 5u);
+  store_resource(1, 2u, 99u, 4u, 8u);
+  const auto mismatched_runtime_data =
+      DxilRuntimeDataBuilder()
+          .add(rdat::StringBuffer, resource_strings)
+          .add(rdat::ResourceTable, resources)
+          .build();
+  expect_diagnostics(
+      "overlapping and mismatched RDAT resources",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, mismatched_runtime_data)
+          .build(),
+      {"missing-rdat-functions", "overlapping-rdat-resources",
+       "metadata-rdat-resource-mismatch"});
+
+  constexpr size_t rdef_resource_offset = kResourceDefHeaderSize;
+  constexpr size_t rdef_name_offset =
+      rdef_resource_offset + kResourceDefResourceBindingExtendedSize;
+  std::vector<uint8_t> resource_def(rdef_name_offset + 5u);
+  Store<uint32_t>(resource_def, 8, 1u);
+  Store<uint32_t>(resource_def, 12, rdef_resource_offset);
+  Store<uint32_t>(resource_def, 16, 0x68u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 0,
+                  rdef_name_offset);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 4, 1u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 20, 2u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 24, 2u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 32, 1u);
+  Store<uint32_t>(resource_def, rdef_resource_offset + 36, 3u);
+  std::memcpy(resource_def.data() + rdef_name_offset, "rdef", 5u);
+  expect_diagnostics(
+      "metadata and RDEF range mismatch",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::ResourceDef, resource_def)
+          .build(),
+      {"metadata-rdef-resource-mismatch"});
+
+  std::vector<uint8_t> old_psv(2u * sizeof(uint32_t));
+  expect_diagnostics(
+      "old PSV runtime info",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::PipelineStateValidation, old_psv)
+          .build(),
+      {"old-psv-runtime-info"});
+
+  constexpr size_t invalid_psv_resource_count_offset =
+      sizeof(uint32_t) + kPsvRuntimeInfo1Size;
+  std::vector<uint8_t> invalid_stage_psv(
+      invalid_psv_resource_count_offset + 3u * sizeof(uint32_t));
+  Store<uint32_t>(invalid_stage_psv, 0, kPsvRuntimeInfo1Size);
+  invalid_stage_psv[sizeof(uint32_t) + 24] = 0xff;
+  expect_diagnostics(
+      "invalid PSV shader stage",
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::PipelineStateValidation, invalid_stage_psv)
+          .build(),
+      {"invalid-psv-shader-stage", "psv-stage-mismatch"});
+}
+
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
   using namespace dxmt::dxil;
   BitcodeInfo info;
