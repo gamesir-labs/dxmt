@@ -3119,6 +3119,14 @@ public:
         dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     if (!descriptor)
       return;
+    if (descriptor->resource) {
+      const auto *resource =
+          dynamic_cast<Resource *>(descriptor->resource.ptr());
+      if (!resource || resource->GetParentDevice() != device_.ptr()) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_clear_depth_stencil_view(
             this, dsv, flags, depth, stencil, rect_count, rects);
@@ -3143,6 +3151,14 @@ public:
         rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     if (!descriptor)
       return;
+    if (descriptor->resource) {
+      const auto *resource =
+          dynamic_cast<Resource *>(descriptor->resource.ptr());
+      if (!resource || resource->GetParentDevice() != device_.ptr()) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_clear_render_target_view(
             this, rtv, color, rect_count, rects);

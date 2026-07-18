@@ -11,6 +11,7 @@ namespace {
 
 using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
@@ -264,6 +265,49 @@ TEST_F(ClearRtvSpec, PreservesFloatColorComponents) {
   std::memcpy(actual.data(), readback.data.data(), sizeof(actual));
   for (std::size_t index = 0; index < expected.size(); ++index)
     EXPECT_FLOAT_EQ(actual[index], expected[index]) << "component " << index;
+}
+
+TEST_F(ClearRtvSpec, RejectsForeignDescriptorAndAllowsFreshListRecovery) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign_target = foreign_context.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto foreign_heap = foreign_context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(foreign_target);
+  ASSERT_TRUE(foreign_heap);
+  const auto foreign_rtv = foreign_heap->GetCPUDescriptorHandleForHeapStart();
+  foreign_device->CreateRenderTargetView(foreign_target.get(), nullptr,
+                                         foreign_rtv);
+  constexpr FLOAT color[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+
+  context_.list()->ClearRenderTargetView(foreign_rtv, color, 0, nullptr);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  auto local_target = CreateRenderTarget(4, 4);
+  auto local_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(local_target);
+  ASSERT_TRUE(local_heap);
+  const auto local_rtv = local_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(local_target.get(), nullptr,
+                                            local_rtv);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+  list->ClearRenderTargetView(local_rtv, color, 0, nullptr);
+  EXPECT_EQ(list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace

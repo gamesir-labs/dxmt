@@ -10,6 +10,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
@@ -467,6 +468,52 @@ TEST_F(ClearDsvSpec, ClearsPlacedDepthStencilResource) {
   TextureReadback readback;
   ASSERT_TRUE(SUCCEEDED(ReadbackAndReset(texture.get(), &readback)));
   ExpectDepth32Solid(readback, 0.375f);
+}
+
+TEST_F(ClearDsvSpec, RejectsForeignDescriptorAndAllowsFreshListRecovery) {
+  constexpr DXGI_FORMAT format = DXGI_FORMAT_D32_FLOAT;
+  if (!Supports(format))
+    GTEST_SKIP() << "D32_FLOAT is unavailable";
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign_target = foreign_context.CreateTexture2D(
+      4, 4, 1, format, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+      D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  auto foreign_heap = foreign_context.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+  ASSERT_TRUE(foreign_target);
+  ASSERT_TRUE(foreign_heap);
+  const auto foreign_dsv = foreign_heap->GetCPUDescriptorHandleForHeapStart();
+  foreign_device->CreateDepthStencilView(foreign_target.get(), nullptr,
+                                         foreign_dsv);
+
+  context_.list()->ClearDepthStencilView(
+      foreign_dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  auto local_target = CreateTexture(format);
+  auto local_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+  ASSERT_TRUE(local_target);
+  ASSERT_TRUE(local_heap);
+  const auto local_dsv = local_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateDepthStencilView(local_target.get(), nullptr,
+                                            local_dsv);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+  list->ClearDepthStencilView(local_dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0,
+                              nullptr);
+  EXPECT_EQ(list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
