@@ -1410,6 +1410,193 @@ TEST(DxilRuntimeData, RejectsInvalidWorkGraphNodeLinks) {
             ParseStatus::InvalidRuntimeData);
 }
 
+TEST(DxilRuntimeData, ParsesPdbSourceLibraryAndInfoRecords) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {
+      's', 'r', 'c', '.', 'h', 0,
+      'c', 'o', 'd', 'e', 0,
+      'l', 'i', 'b', '.', 'd', 'x', 'i', 'l', 0,
+      '-', 'O', '3', 0,
+      '1', 0,
+      's', 'h', 'a', 'd', 'e', 'r', '.', 'p', 'd', 'b', 0,
+  };
+  std::vector<uint8_t> indices(7 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 1u);
+  Store<uint32_t>(indices, 4, 0u);
+  Store<uint32_t>(indices, 8, 1u);
+  Store<uint32_t>(indices, 12, 0u);
+  Store<uint32_t>(indices, 16, 2u);
+  Store<uint32_t>(indices, 20, 20u);
+  Store<uint32_t>(indices, 24, 24u);
+  std::vector<uint8_t> raw = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+
+  std::vector<uint8_t> sources(kRuntimeDataTableHeaderSize +
+                               kRdatPdbInfoSourceRecordSize);
+  Store<uint32_t>(sources, 0, 1u);
+  Store<uint32_t>(sources, 4, kRdatPdbInfoSourceRecordSize);
+  Store<uint32_t>(sources, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(sources, kRuntimeDataTableHeaderSize + 4, 6u);
+
+  std::vector<uint8_t> libraries(kRuntimeDataTableHeaderSize +
+                                 kRdatPdbInfoLibraryRecordSize);
+  Store<uint32_t>(libraries, 0, 1u);
+  Store<uint32_t>(libraries, 4, kRdatPdbInfoLibraryRecordSize);
+  Store<uint32_t>(libraries, kRuntimeDataTableHeaderSize + 0, 11u);
+  Store<uint32_t>(libraries, kRuntimeDataTableHeaderSize + 4, 0u);
+  Store<uint32_t>(libraries, kRuntimeDataTableHeaderSize + 8, 3u);
+
+  std::vector<uint8_t> pdb_infos(kRuntimeDataTableHeaderSize +
+                                 kRdatPdbInfoRecordSize);
+  Store<uint32_t>(pdb_infos, 0, 1u);
+  Store<uint32_t>(pdb_infos, 4, kRdatPdbInfoRecordSize);
+  const size_t pdb = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(pdb_infos, pdb + 0, 0u);
+  Store<uint32_t>(pdb_infos, pdb + 4, 2u);
+  Store<uint32_t>(pdb_infos, pdb + 8, 4u);
+  Store<uint32_t>(pdb_infos, pdb + 12, 3u);
+  Store<uint32_t>(pdb_infos, pdb + 16, 4u);
+  Store<uint32_t>(pdb_infos, pdb + 20, 26u);
+  Store<uint32_t>(pdb_infos, pdb + 24, 42u);
+  Store<uint32_t>(pdb_infos, pdb + 28, 7u);
+  Store<uint32_t>(pdb_infos, pdb + 32, 2u);
+  Store<uint32_t>(pdb_infos, pdb + 36, 9u);
+  Store<uint32_t>(pdb_infos, pdb + 40, 3u);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::StringBuffer, strings)
+                         .add(rdat::IndexArrays, indices)
+                         .add(rdat::RawBytes, raw)
+                         .add(rdat::DxilPdbInfoSourceTable, sources)
+                         .add(rdat::DxilPdbInfoLibraryTable, libraries)
+                         .add(rdat::DxilPdbInfoTable, pdb_infos)
+                         .build();
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.pdb_sources.size(), 1u);
+  EXPECT_EQ(info.pdb_sources[0].name, "src.h");
+  EXPECT_EQ(info.pdb_sources[0].content, "code");
+  ASSERT_EQ(info.pdb_libraries.size(), 1u);
+  EXPECT_EQ(info.pdb_libraries[0].name, "lib.dxil");
+  EXPECT_TRUE(std::equal(info.pdb_libraries[0].data.begin(),
+                         info.pdb_libraries[0].data.end(), raw.begin()));
+  ASSERT_EQ(info.pdb_infos.size(), 1u);
+  EXPECT_EQ(info.pdb_infos[0].source_indices,
+            (std::vector<uint32_t>{0}));
+  EXPECT_EQ(info.pdb_infos[0].library_indices,
+            (std::vector<uint32_t>{0}));
+  EXPECT_EQ(info.pdb_infos[0].arg_pairs,
+            (std::vector<std::string>{"-O3", "1"}));
+  EXPECT_EQ(info.pdb_infos[0].pdb_name, "shader.pdb");
+  EXPECT_EQ(info.pdb_infos[0].custom_toolchain_id, 42u);
+  EXPECT_TRUE(std::equal(info.pdb_infos[0].hash.begin(),
+                         info.pdb_infos[0].hash.end(), raw.begin() + 3));
+  EXPECT_TRUE(std::equal(info.pdb_infos[0].custom_toolchain_data.begin(),
+                         info.pdb_infos[0].custom_toolchain_data.end(),
+                         raw.begin() + 7));
+  EXPECT_TRUE(std::equal(info.pdb_infos[0].whole_dxil.begin(),
+                         info.pdb_infos[0].whole_dxil.end(), raw.begin() + 9));
+}
+
+TEST(DxilRuntimeData, RejectsInvalidPdbRecordReferences) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {
+      's', 0, 'c', 0, 'l', 0, 'a', 0, 'p', 0,
+  };
+  std::vector<uint8_t> indices(7 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 1u);
+  Store<uint32_t>(indices, 4, 0u);
+  Store<uint32_t>(indices, 8, 1u);
+  Store<uint32_t>(indices, 12, 0u);
+  Store<uint32_t>(indices, 16, 2u);
+  Store<uint32_t>(indices, 20, 6u);
+  Store<uint32_t>(indices, 24, 8u);
+  std::vector<uint8_t> raw = {1, 2, 3, 4};
+
+  std::vector<uint8_t> sources(kRuntimeDataTableHeaderSize +
+                               kRdatPdbInfoSourceRecordSize);
+  Store<uint32_t>(sources, 0, 1u);
+  Store<uint32_t>(sources, 4, kRdatPdbInfoSourceRecordSize);
+  Store<uint32_t>(sources, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(sources, kRuntimeDataTableHeaderSize + 4, 2u);
+
+  std::vector<uint8_t> libraries(kRuntimeDataTableHeaderSize +
+                                 kRdatPdbInfoLibraryRecordSize);
+  Store<uint32_t>(libraries, 0, 1u);
+  Store<uint32_t>(libraries, 4, kRdatPdbInfoLibraryRecordSize);
+  Store<uint32_t>(libraries, kRuntimeDataTableHeaderSize + 0, 4u);
+  Store<uint32_t>(libraries, kRuntimeDataTableHeaderSize + 4, 0u);
+  Store<uint32_t>(libraries, kRuntimeDataTableHeaderSize + 8, raw.size());
+
+  std::vector<uint8_t> pdb_infos(kRuntimeDataTableHeaderSize +
+                                 kRdatPdbInfoRecordSize);
+  Store<uint32_t>(pdb_infos, 0, 1u);
+  Store<uint32_t>(pdb_infos, 4, kRdatPdbInfoRecordSize);
+  Store<uint32_t>(pdb_infos, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(pdb_infos, kRuntimeDataTableHeaderSize + 4, 2u);
+  Store<uint32_t>(pdb_infos, kRuntimeDataTableHeaderSize + 8, 4u);
+  Store<uint32_t>(pdb_infos, kRuntimeDataTableHeaderSize + 12, 0u);
+  Store<uint32_t>(pdb_infos, kRuntimeDataTableHeaderSize + 16, raw.size());
+  Store<uint32_t>(pdb_infos, kRuntimeDataTableHeaderSize + 20, 8u);
+
+  const auto build = [&](const std::vector<uint8_t> &index_data,
+                         const std::vector<uint8_t> &source_table,
+                         const std::vector<uint8_t> &library_table,
+                         const std::vector<uint8_t> &pdb_table) {
+    return DxilRuntimeDataBuilder()
+        .add(rdat::StringBuffer, strings)
+        .add(rdat::IndexArrays, index_data)
+        .add(rdat::RawBytes, raw)
+        .add(rdat::DxilPdbInfoSourceTable, source_table)
+        .add(rdat::DxilPdbInfoLibraryTable, library_table)
+        .add(rdat::DxilPdbInfoTable, pdb_table)
+        .build();
+  };
+  RuntimeDataInfo info;
+
+  auto malformed_sources = sources;
+  Store<uint32_t>(malformed_sources, kRuntimeDataTableHeaderSize + 4, 100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(indices, malformed_sources, libraries, pdb_infos)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_libraries = libraries;
+  Store<uint32_t>(malformed_libraries, kRuntimeDataTableHeaderSize + 8,
+                  raw.size() + 1);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(indices, sources, malformed_libraries, pdb_infos)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_indices = indices;
+  Store<uint32_t>(malformed_indices, 4, 1u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(malformed_indices, sources, libraries, pdb_infos)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  malformed_indices = indices;
+  Store<uint32_t>(malformed_indices, 20, 100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(malformed_indices, sources, libraries, pdb_infos)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_pdb = pdb_infos;
+  Store<uint32_t>(malformed_pdb, kRuntimeDataTableHeaderSize + 16,
+                  raw.size() + 1);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(indices, sources, libraries, malformed_pdb)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
