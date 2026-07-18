@@ -4968,7 +4968,7 @@ public:
       return WARN_E_INVALIDARG(__func__);
 
     auto *state = dynamic_cast<Fence *>(fence);
-    if (!state)
+    if (!state || state->GetParentDevice() != device_.ptr())
       return WARN_E_INVALIDARG(__func__);
 
     if (device_->GetDXMTDevice().queue().HasDeviceError())
@@ -5002,7 +5002,7 @@ public:
       return WARN_E_INVALIDARG(__func__);
 
     auto *state = dynamic_cast<Fence *>(fence);
-    if (!state)
+    if (!state || state->GetParentDevice() != device_.ptr())
       return WARN_E_INVALIDARG(__func__);
 
     if (device_->GetDXMTDevice().queue().HasDeviceError())

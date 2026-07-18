@@ -31,6 +31,7 @@ class Fence {
 public:
   virtual ~Fence() = default;
 
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual WMT::Reference<WMT::SharedEvent> GetSharedEvent() const = 0;
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;

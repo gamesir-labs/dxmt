@@ -362,6 +362,10 @@ public:
   }
 #endif
 
+  IMTLD3D12Device *GetParentDevice() const override {
+    return device_.ptr();
+  }
+
   WMT::Reference<WMT::SharedEvent> GetSharedEvent() const override { return event_; }
 
   void AddRefPrivate() override {

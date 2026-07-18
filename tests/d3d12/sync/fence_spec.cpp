@@ -314,4 +314,27 @@ TEST_F(FenceSpec, MultipleFenceFailuresAreAtomicAndRecoverable) {
   CloseHandle(event);
 }
 
+TEST_F(FenceSpec, QueueRejectsForeignFenceAndRecovers) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  ComPtr<ID3D12Fence> foreign_fence;
+  ASSERT_EQ(foreign_device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(foreign_fence.put())),
+            S_OK);
+  ASSERT_TRUE(foreign_fence);
+
+  EXPECT_EQ(context_.queue()->Signal(nullptr, 1), E_INVALIDARG);
+  EXPECT_EQ(context_.queue()->Wait(nullptr, 1), E_INVALIDARG);
+  EXPECT_EQ(context_.queue()->Signal(foreign_fence.get(), 2), E_INVALIDARG);
+  EXPECT_EQ(context_.queue()->Wait(foreign_fence.get(), 2), E_INVALIDARG);
+  EXPECT_EQ(foreign_fence->GetCompletedValue(), 0u);
+
+  auto local_fence = CreateFence();
+  ASSERT_TRUE(local_fence);
+  ASSERT_EQ(context_.queue()->Signal(local_fence.get(), 3), S_OK);
+  EXPECT_EQ(context_.WaitForFence(local_fence.get(), 3), S_OK);
+  EXPECT_GE(local_fence->GetCompletedValue(), 3u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 } // namespace
