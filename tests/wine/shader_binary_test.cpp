@@ -2,6 +2,7 @@
 
 #include "DXBCParser/ShaderBinary.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -82,6 +83,41 @@ TEST(ShaderBinary, InitializesInstructionMetadataAndRejectsUnknownOpcodes) {
   EXPECT_EQ(g_InstructionInfo[D3D10_SB_OPCODE_MOV].m_OpClass,
             D3D10_SB_FLOAT_OP);
   EXPECT_ANY_THROW(GetNumInstructionOperands(D3D10_SB_NUM_OPCODES));
+  EXPECT_ANY_THROW(GetNumInstructionOperands(
+      static_cast<D3D10_SB_OPCODE_TYPE>(-1)));
+}
+
+TEST(ShaderBinary, InitializesEveryNonReservedOpcodeEntry) {
+  constexpr std::array reserved = {
+      D3D10_SB_OPCODE_RESERVED0,
+      D3D10_1_SB_OPCODE_RESERVED1,
+      D3D11_SB_OPCODE_RESERVED0,
+      D3D11_1_SB_OPCODE_RESERVED0,
+      D3DWDDM1_3_SB_OPCODE_RESERVED0,
+  };
+  const auto is_reserved = [&](D3D10_SB_OPCODE_TYPE opcode) {
+    return std::find(reserved.begin(), reserved.end(), opcode) !=
+           reserved.end();
+  };
+
+  for (UINT value = 0; value < D3D10_SB_NUM_OPCODES; ++value) {
+    const auto opcode = static_cast<D3D10_SB_OPCODE_TYPE>(value);
+    SCOPED_TRACE(value);
+    if (is_reserved(opcode)) {
+      EXPECT_EQ(g_InstructionInfo[value].m_Name[0], '\0');
+      continue;
+    }
+    EXPECT_NE(g_InstructionInfo[value].m_Name[0], '\0');
+    EXPECT_NE(std::memchr(g_InstructionInfo[value].m_Name, '\0',
+                          sizeof(g_InstructionInfo[value].m_Name)),
+              nullptr);
+    EXPECT_LE(g_InstructionInfo[value].m_NumOperands,
+              D3D10_SB_MAX_INSTRUCTION_OPERANDS);
+    EXPECT_EQ(GetNumInstructionOperands(opcode),
+              g_InstructionInfo[value].m_NumOperands);
+    EXPECT_GE(g_InstructionInfo[value].m_OpClass, D3D10_SB_FLOAT_OP);
+    EXPECT_LE(g_InstructionInfo[value].m_OpClass, D3D11_SB_DEBUG_OP);
+  }
 }
 
 TEST(ShaderBinary, ParsesProgramHeaderRegisterAndImmediateOperands) {
