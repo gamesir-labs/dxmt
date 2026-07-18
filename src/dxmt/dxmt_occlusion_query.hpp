@@ -219,17 +219,17 @@ public:
 
   bool
   getValue(uint64_t *value) {
-    const auto cached_value = cached_value_.load(std::memory_order_acquire);
-    if (cached_value == ~0ull)
+    if (!cached_value_ready_.load(std::memory_order_acquire))
       return false;
 
-    *value = cached_value;
+    *value = cached_value_.load(std::memory_order_relaxed);
     return true;
   }
 
   void
   issue(uint64_t sampled_data) {
-    cached_value_.store(sampled_data, std::memory_order_release);
+    cached_value_.store(sampled_data, std::memory_order_relaxed);
+    cached_value_ready_.store(true, std::memory_order_release);
   }
 
   uint64_t
@@ -280,7 +280,8 @@ public:
 #endif
 
 private:
-  std::atomic<uint64_t> cached_value_ = {~0ull};
+  std::atomic<uint64_t> cached_value_ = {0};
+  std::atomic<bool> cached_value_ready_ = {false};
   uint64_t sample_sequence_ = ~0ull;
   uint64_t sample_index_ = ~0ull;
 #if DXMT_DX12_METAL4

@@ -9,6 +9,7 @@
 #include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -219,6 +220,15 @@ TEST(TimestampQuery, TracksSampleLocationAndResolvedValue) {
   query->issue(23);
   EXPECT_TRUE(query->getValue(&value));
   EXPECT_EQ(value, 23u);
+}
+
+TEST(TimestampQuery, PublishesTheMaximumTimestampValue) {
+  dxmt::Rc<dxmt::TimestampQuery> query(new dxmt::TimestampQuery());
+  uint64_t value = 0;
+
+  query->issue(std::numeric_limits<uint64_t>::max());
+  EXPECT_TRUE(query->getValue(&value));
+  EXPECT_EQ(value, std::numeric_limits<uint64_t>::max());
 }
 
 TEST(QueryResults, PublishResolvedValuesAcrossThreads) {
