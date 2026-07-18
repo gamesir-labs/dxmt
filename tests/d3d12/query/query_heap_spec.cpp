@@ -35,6 +35,39 @@ TEST_F(QueryHeapSpec, CreatesLargeOcclusionHeap) {
   EXPECT_TRUE(heap);
 }
 
+TEST_F(QueryHeapSpec, CapabilityProbeValidatesWithoutCreatingObjects) {
+  for (const auto type : {D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                          D3D12_QUERY_HEAP_TYPE_OCCLUSION}) {
+    const D3D12_QUERY_HEAP_DESC desc = {type, 4, 0};
+    EXPECT_EQ(context_.device()->CreateQueryHeap(
+                  &desc, __uuidof(ID3D12QueryHeap), nullptr),
+              S_FALSE)
+        << "heap type " << static_cast<UINT>(type);
+  }
+
+  EXPECT_EQ(context_.device()->CreateQueryHeap(
+                nullptr, __uuidof(ID3D12QueryHeap), nullptr),
+            E_INVALIDARG);
+  for (const D3D12_QUERY_HEAP_DESC desc : {
+           D3D12_QUERY_HEAP_DESC{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 0, 0},
+           D3D12_QUERY_HEAP_DESC{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1, 2},
+           D3D12_QUERY_HEAP_DESC{
+               static_cast<D3D12_QUERY_HEAP_TYPE>(0x7fffffff), 1, 0},
+       }) {
+    EXPECT_EQ(context_.device()->CreateQueryHeap(
+                  &desc, __uuidof(ID3D12QueryHeap), nullptr),
+              E_INVALIDARG);
+  }
+  for (const auto type : {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                          D3D12_QUERY_HEAP_TYPE_SO_STATISTICS}) {
+    const D3D12_QUERY_HEAP_DESC desc = {type, 1, 0};
+    EXPECT_EQ(context_.device()->CreateQueryHeap(
+                  &desc, __uuidof(ID3D12QueryHeap), nullptr),
+              E_NOTIMPL)
+        << "heap type " << static_cast<UINT>(type);
+  }
+}
+
 TEST_F(QueryHeapSpec, RejectsZeroCount) {
   const D3D12_QUERY_HEAP_DESC desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 0, 0};
   ComPtr<ID3D12QueryHeap> heap;

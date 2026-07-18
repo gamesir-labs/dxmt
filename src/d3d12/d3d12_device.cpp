@@ -5042,12 +5042,6 @@ public:
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *desc,
                                               REFIID riid, void **heap) override {
       InitReturnPtr(heap);
-      if (!heap)
-        return E_POINTER;
-      if (ShouldInjectCreationFailure(
-              "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT",
-              g_test_query_heap_creation_occurrence))
-        return E_OUTOFMEMORY;
       if (!desc || desc->Count == 0 || desc->NodeMask > 1)
         return WARN_E_INVALIDARG(__func__);
 
@@ -5063,6 +5057,12 @@ public:
       default:
         return WARN_E_INVALIDARG(__func__);
       }
+      if (!heap)
+        return S_FALSE;
+      if (ShouldInjectCreationFailure(
+              "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT",
+              g_test_query_heap_creation_occurrence))
+        return E_OUTOFMEMORY;
 
       auto query_heap = d3d12::CreateQueryHeap(
           static_cast<IMTLD3D12Device *>(this), desc);
