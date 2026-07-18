@@ -17,6 +17,15 @@ using dxmt::test::D3D12TestContext;
 using dxmt::test::ShaderCompilation;
 using dxmt::test::TextureReadback;
 
+std::uint32_t PixelAt(const TextureReadback &readback, UINT x, UINT y) {
+  std::uint32_t pixel = 0;
+  std::memcpy(&pixel,
+              readback.data.data() + y * readback.row_pitch +
+                  x * sizeof(pixel),
+              sizeof(pixel));
+  return pixel;
+}
+
 class ShaderAdvancedStageSpec : public ::testing::Test {
 protected:
   static constexpr UINT kSize = 16;
@@ -306,6 +315,194 @@ TEST_F(ShaderAdvancedStageSpec, GeometryShaderUsesPrimitiveIdAcrossInputs) {
   auto pipeline = CreatePipeline(vs, ps, &gs);
   ASSERT_TRUE(pipeline);
   DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 6);
+}
+
+TEST_F(ShaderAdvancedStageSpec,
+       GeometryShaderRoutesPrimitivesToRenderTargetArraySlices) {
+  const auto vs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    Data main(uint id : SV_VertexID) {
+      Data output;
+      output.position = 0.0.xxxx;
+      return output;
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    struct Output {
+      float4 position : SV_Position;
+      nointerpolation uint selector : TEXCOORD0;
+      uint target_index : SV_RenderTargetArrayIndex;
+    };
+    [maxvertexcount(3)]
+    void main(point Data input[1], uint primitive_id : SV_PrimitiveID,
+              inout TriangleStream<Output> stream) {
+      const float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      Output output;
+      output.selector = primitive_id;
+      output.target_index = primitive_id;
+      for (uint i = 0; i < 3; ++i) {
+        output.position = float4(positions[i], 0.0, 1.0);
+        stream.Append(output);
+      }
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps = CompileShader(R"(
+    float4 main(nointerpolation uint selector : TEXCOORD0) : SV_Target {
+      return selector == 0 ? float4(1, 0, 0, 1)
+                           : float4(0, 1, 0, 1);
+    })",
+                                "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+  ASSERT_TRUE(pipeline);
+
+  D3D12_HEAP_PROPERTIES heap_properties = {};
+  heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC resource_desc = {};
+  resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  resource_desc.Width = kSize;
+  resource_desc.Height = kSize;
+  resource_desc.DepthOrArraySize = 2;
+  resource_desc.MipLevels = 1;
+  resource_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  resource_desc.SampleDesc.Count = 1;
+  resource_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ComPtr<ID3D12Resource> target;
+  ASSERT_EQ(context_.device()->CreateCommittedResource(
+                &heap_properties, D3D12_HEAP_FLAG_NONE, &resource_desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                IID_PPV_ARGS(target.put())),
+            S_OK);
+  auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                             false);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+  rtv_desc.Texture2DArray.ArraySize = 2;
+  context_.device()->CreateRenderTargetView(target.get(), &rtv_desc, rtv);
+
+  constexpr FLOAT clear[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root_.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+  const D3D12_VIEWPORT viewport = {0.0f,         0.0f, float(kSize),
+                                   float(kSize), 0.0f, 1.0f};
+  const D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawInstanced(2, 1, 0, 0);
+  D3D12TestContext::Transition(context_.list(), target.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback first;
+  TextureReadback second;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &first, 0), S_OK);
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &second, 1), S_OK);
+  EXPECT_TRUE(ColorsMatch(PixelAt(first, kSize / 2, kSize / 2),
+                          0xff0000ffu, 1));
+  EXPECT_TRUE(ColorsMatch(PixelAt(second, kSize / 2, kSize / 2),
+                          0xff00ff00u, 1));
+}
+
+TEST_F(ShaderAdvancedStageSpec,
+       GeometryShaderRoutesPrimitivesToViewportArrayEntries) {
+  const auto vs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    Data main(uint id : SV_VertexID) {
+      Data output;
+      output.position = 0.0.xxxx;
+      return output;
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    struct Output {
+      float4 position : SV_Position;
+      nointerpolation uint selector : TEXCOORD0;
+      uint viewport_index : SV_ViewportArrayIndex;
+    };
+    [maxvertexcount(3)]
+    void main(point Data input[1], uint primitive_id : SV_PrimitiveID,
+              inout TriangleStream<Output> stream) {
+      const float2 positions[3] = {
+        float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0)
+      };
+      Output output;
+      output.selector = primitive_id;
+      output.viewport_index = primitive_id;
+      for (uint i = 0; i < 3; ++i) {
+        output.position = float4(positions[i], 0.0, 1.0);
+        stream.Append(output);
+      }
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps = CompileShader(R"(
+    float4 main(nointerpolation uint selector : TEXCOORD0) : SV_Target {
+      return selector == 0 ? float4(1, 0, 0, 1)
+                           : float4(0, 1, 0, 1);
+    })",
+                                "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+  ASSERT_TRUE(pipeline);
+
+  constexpr FLOAT clear[4] = {};
+  context_.list()->ClearRenderTargetView(rtv_, clear, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv_, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root_.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+  const D3D12_VIEWPORT viewports[2] = {
+      {0.0f, 0.0f, float(kSize / 2), float(kSize), 0.0f, 1.0f},
+      {float(kSize / 2), 0.0f, float(kSize / 2), float(kSize), 0.0f, 1.0f},
+  };
+  const D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
+  context_.list()->RSSetViewports(2, viewports);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawInstanced(2, 1, 0, 0);
+  D3D12TestContext::Transition(context_.list(), target_.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target_.get(), &readback), S_OK);
+
+  UINT left_red = 0;
+  UINT left_green = 0;
+  UINT right_red = 0;
+  UINT right_green = 0;
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      const auto pixel = PixelAt(readback, x, y);
+      if (x < kSize / 2) {
+        left_red += ColorsMatch(pixel, 0xff0000ffu, 1);
+        left_green += ColorsMatch(pixel, 0xff00ff00u, 1);
+      } else {
+        right_red += ColorsMatch(pixel, 0xff0000ffu, 1);
+        right_green += ColorsMatch(pixel, 0xff00ff00u, 1);
+      }
+    }
+  }
+  EXPECT_GT(left_red, 100u);
+  EXPECT_EQ(left_green, 0u);
+  EXPECT_EQ(right_red, 0u);
+  EXPECT_GT(right_green, 100u);
 }
 
 TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsAfterRestartStrip) {
