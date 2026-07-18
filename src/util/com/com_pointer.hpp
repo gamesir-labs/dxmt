@@ -156,8 +156,8 @@ public:
 
   template <typename T2> Com<T2, Public> as() const {
     Com<T2, Public> ret(nullptr);
-    if (SUCCEEDED(m_ptr->QueryInterface(__uuidof(T2), (void **)&ret.m_ptr))) {
-    }
+    if (m_ptr != nullptr)
+      m_ptr->QueryInterface(__uuidof(T2), (void **)&ret.m_ptr);
     return ret;
   }
 

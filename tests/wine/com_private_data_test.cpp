@@ -207,3 +207,9 @@ TEST(ComPointer, SameRawPointerAndSelfMoveKeepTheOwnedReferenceAlive) {
   EXPECT_FALSE(state.resurrected);
   EXPECT_EQ(state.references, 0u);
 }
+
+TEST(ComPointer, NullCastsAndQueriesRemainEmpty) {
+  const dxmt::Com<IUnknown> empty;
+  EXPECT_FALSE(empty.as<IUnknown>());
+  EXPECT_FALSE(dxmt::Com<IUnknown>::queryFrom(nullptr));
+}

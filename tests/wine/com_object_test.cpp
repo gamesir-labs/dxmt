@@ -1,9 +1,13 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_com.hpp>
 
 #include "com/com_aggregatable.hpp"
 #include "com/com_object.hpp"
 
+#include <barrier>
 #include <cstdint>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -94,6 +98,41 @@ TEST(ComObjectClamp, ReleaseAtZeroDoesNotUnderflow) {
   EXPECT_FALSE(state.destroyed);
 
   object->ReleasePrivate();
+  EXPECT_TRUE(state.destroyed);
+}
+
+TEST(ComObjectClamp, ConcurrentFinalReleasesDestroyExactlyOnce) {
+  constexpr size_t thread_count = 32;
+  ObjectState state;
+  auto *object = new ClampedUnknown(state);
+  for (size_t reference = 0; reference < thread_count; ++reference)
+    EXPECT_EQ(object->AddRef(), reference + 1);
+
+  std::barrier phase(thread_count);
+  std::vector<std::thread> releasers;
+  releasers.reserve(thread_count);
+  for (size_t thread = 0; thread < thread_count; ++thread) {
+    releasers.emplace_back([&] {
+      phase.arrive_and_wait();
+      object->Release();
+    });
+  }
+  for (auto &releaser : releasers)
+    releaser.join();
+
+  EXPECT_TRUE(state.destroyed);
+}
+
+TEST(TestComPointer, ResettingTheOwnedPointerToItselfKeepsOwnership) {
+  ObjectState state;
+  auto *object = new DeferredUnknown(state);
+  ASSERT_EQ(object->AddRef(), 1u);
+  {
+    dxmt::test::ComPtr<IUnknown> pointer(object);
+    pointer.reset(object);
+    EXPECT_EQ(pointer.get(), object);
+    EXPECT_FALSE(state.destroyed);
+  }
   EXPECT_TRUE(state.destroyed);
 }
 

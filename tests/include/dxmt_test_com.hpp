@@ -37,6 +37,8 @@ public:
   }
 
   void reset(T *object = nullptr) {
+    if (object_ == object)
+      return;
     if (object_)
       object_->Release();
     object_ = object;

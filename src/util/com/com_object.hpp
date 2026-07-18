@@ -122,16 +122,18 @@ template <typename Base> class ComObjectClamp : public ComObject<Base> {
 
 public:
   ULONG STDMETHODCALLTYPE Release() {
-    ULONG refCount = this->m_refCount;
-    if (likely(refCount != 0ul)) {
-      this->m_refCount--;
-      refCount--;
-
-      if (refCount == 0ul)
-        this->ReleasePrivate();
+    uint32_t refCount = this->m_refCount.load(std::memory_order_relaxed);
+    while (likely(refCount != 0u)) {
+      if (this->m_refCount.compare_exchange_weak(
+              refCount, refCount - 1, std::memory_order_acq_rel,
+              std::memory_order_relaxed)) {
+        if (refCount == 1u)
+          this->ReleasePrivate();
+        return refCount - 1;
+      }
     }
 
-    return refCount;
+    return 0;
   }
 };
 
