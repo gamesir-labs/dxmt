@@ -1046,6 +1046,154 @@ TEST(DxilRuntimeData, RejectsInvalidSignatureAndShaderInfoLinks) {
             ParseStatus::InvalidRuntimeData);
 }
 
+TEST(DxilRuntimeData, ParsesRaytracingSubobjectRecords) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {
+      's', 't', 'a', 't', 'e', 0,
+      'r', 'o', 'o', 't', 0,
+      'a', 's', 's', 'o', 'c', 0,
+      't', 'a', 'r', 'g', 'e', 't', 0,
+      'e', 'x', 'p', 'o', 'r', 't', 'A', 0,
+      'h', 'i', 't', 0,
+      'a', 'n', 'y', 0,
+      'c', 'l', 'o', 's', 'e', 's', 't', 0,
+      'i', 'n', 't', 'e', 'r', 's', 'e', 'c', 't', 0,
+  };
+  std::vector<uint8_t> indices(2 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 1u);
+  Store<uint32_t>(indices, 4, 24u);
+  std::vector<uint8_t> raw = {1, 2, 3, 4};
+
+  constexpr size_t record_count = 4;
+  std::vector<uint8_t> subobjects(kRuntimeDataTableHeaderSize +
+                                  record_count * kRdatSubobjectRecordSize);
+  Store<uint32_t>(subobjects, 0, record_count);
+  Store<uint32_t>(subobjects, 4, kRdatSubobjectRecordSize);
+  size_t record = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(subobjects, record + 0, 0u);
+  Store<uint32_t>(subobjects, record + 4, 0u);
+  Store<uint32_t>(subobjects, record + 8, 9u);
+
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 0, 1u);
+  Store<uint32_t>(subobjects, record + 4, 6u);
+  Store<uint32_t>(subobjects, record + 8, 0u);
+  Store<uint32_t>(subobjects, record + 12, raw.size());
+
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 0, 8u);
+  Store<uint32_t>(subobjects, record + 4, 11u);
+  Store<uint32_t>(subobjects, record + 8, 17u);
+  Store<uint32_t>(subobjects, record + 12, 0u);
+
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 0, 11u);
+  Store<uint32_t>(subobjects, record + 4, 32u);
+  Store<uint32_t>(subobjects, record + 8, 2u);
+  Store<uint32_t>(subobjects, record + 12, 36u);
+  Store<uint32_t>(subobjects, record + 16, 40u);
+  Store<uint32_t>(subobjects, record + 20, 48u);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::StringBuffer, strings)
+                         .add(rdat::IndexArrays, indices)
+                         .add(rdat::RawBytes, raw)
+                         .add(rdat::SubobjectTable, subobjects)
+                         .build();
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.subobjects.size(), record_count);
+  EXPECT_EQ(info.subobjects[0].name, "state");
+  EXPECT_EQ(info.subobjects[0].state_object_flags, 9u);
+  EXPECT_EQ(info.subobjects[1].name, "root");
+  EXPECT_TRUE(std::equal(info.subobjects[1].root_signature.begin(),
+                         info.subobjects[1].root_signature.end(), raw.begin()));
+  EXPECT_EQ(info.subobjects[2].associated_subobject, "target");
+  EXPECT_EQ(info.subobjects[2].associated_exports,
+            (std::vector<std::string>{"exportA"}));
+  EXPECT_EQ(info.subobjects[3].hit_group_type, 2u);
+  EXPECT_EQ(info.subobjects[3].any_hit, "any");
+  EXPECT_EQ(info.subobjects[3].closest_hit, "closest");
+  EXPECT_EQ(info.subobjects[3].intersection, "intersect");
+}
+
+TEST(DxilRuntimeData, RejectsInvalidSubobjectPayloadReferences) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {
+      'r', 'o', 'o', 't', 0,
+      'a', 's', 's', 'o', 'c', 0,
+      't', 'a', 'r', 'g', 'e', 't', 0,
+      'e', 'x', 'p', 'o', 'r', 't', 0,
+      'h', 'i', 't', 0,
+  };
+  std::vector<uint8_t> indices(2 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 1u);
+  Store<uint32_t>(indices, 4, 18u);
+  std::vector<uint8_t> raw = {1, 2, 3, 4};
+
+  std::vector<uint8_t> subobjects(kRuntimeDataTableHeaderSize +
+                                  3 * kRdatSubobjectRecordSize);
+  Store<uint32_t>(subobjects, 0, 3u);
+  Store<uint32_t>(subobjects, 4, kRdatSubobjectRecordSize);
+  size_t record = kRuntimeDataTableHeaderSize;
+  Store<uint32_t>(subobjects, record + 0, 1u);
+  Store<uint32_t>(subobjects, record + 4, 0u);
+  Store<uint32_t>(subobjects, record + 8, 0u);
+  Store<uint32_t>(subobjects, record + 12, raw.size());
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 0, 8u);
+  Store<uint32_t>(subobjects, record + 4, 5u);
+  Store<uint32_t>(subobjects, record + 8, 11u);
+  Store<uint32_t>(subobjects, record + 12, 0u);
+  record += kRdatSubobjectRecordSize;
+  Store<uint32_t>(subobjects, record + 0, 11u);
+  Store<uint32_t>(subobjects, record + 4, 25u);
+  Store<uint32_t>(subobjects, record + 8, 0u);
+  for (size_t offset : {size_t(12), size_t(16), size_t(20)})
+    Store<uint32_t>(subobjects, record + offset, kRdatNullRef);
+
+  const auto build = [&](const std::vector<uint8_t> &table) {
+    return DxilRuntimeDataBuilder()
+        .add(rdat::StringBuffer, strings)
+        .add(rdat::IndexArrays, indices)
+        .add(rdat::RawBytes, raw)
+        .add(rdat::SubobjectTable, table)
+        .build();
+  };
+  RuntimeDataInfo info;
+
+  auto malformed = subobjects;
+  Store<uint32_t>(malformed, kRuntimeDataTableHeaderSize + 12, raw.size() + 1);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, build(malformed)), info),
+            ParseStatus::InvalidRuntimeData);
+
+  malformed = subobjects;
+  Store<uint32_t>(malformed,
+                  kRuntimeDataTableHeaderSize + kRdatSubobjectRecordSize + 12,
+                  100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, build(malformed)), info),
+            ParseStatus::InvalidRuntimeData);
+
+  malformed = subobjects;
+  Store<uint32_t>(malformed,
+                  kRuntimeDataTableHeaderSize +
+                      2 * kRdatSubobjectRecordSize + 20,
+                  100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, build(malformed)), info),
+            ParseStatus::InvalidRuntimeData);
+
+  malformed.assign(kRuntimeDataTableHeaderSize + 20, 0);
+  Store<uint32_t>(malformed, 0, 1u);
+  Store<uint32_t>(malformed, 4, 20u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, build(malformed)), info),
+            ParseStatus::InvalidRuntimeData);
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
