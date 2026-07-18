@@ -1062,6 +1062,35 @@ TEST_F(D3D12QueueSpec, ReportsTimestampFrequency) {
   EXPECT_GT(frequency, 0ull);
 }
 
+TEST_F(D3D12QueueSpec, ClockCalibrationRejectsNullAndIsMonotonic) {
+  EXPECT_EQ(context_.queue()->GetTimestampFrequency(nullptr), E_INVALIDARG);
+
+  constexpr UINT64 sentinel = 0xdeadbeefcafef00dull;
+  UINT64 gpu_timestamp = sentinel;
+  UINT64 cpu_timestamp = sentinel;
+  EXPECT_EQ(context_.queue()->GetClockCalibration(nullptr, &cpu_timestamp),
+            E_INVALIDARG);
+  EXPECT_EQ(cpu_timestamp, sentinel);
+  EXPECT_EQ(context_.queue()->GetClockCalibration(&gpu_timestamp, nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(gpu_timestamp, sentinel);
+  EXPECT_EQ(context_.queue()->GetClockCalibration(nullptr, nullptr),
+            E_INVALIDARG);
+
+  UINT64 first_gpu = 0;
+  UINT64 first_cpu = 0;
+  UINT64 second_gpu = 0;
+  UINT64 second_cpu = 0;
+  ASSERT_EQ(context_.queue()->GetClockCalibration(&first_gpu, &first_cpu),
+            S_OK);
+  ASSERT_EQ(context_.queue()->GetClockCalibration(&second_gpu, &second_cpu),
+            S_OK);
+  EXPECT_GT(first_gpu, 0u);
+  EXPECT_GT(first_cpu, 0u);
+  EXPECT_GE(second_gpu, first_gpu);
+  EXPECT_GE(second_cpu, first_cpu);
+}
+
 TEST_F(D3D12QueueSpec, PreservesLongBlitDependencyChainAcrossEncoders) {
   constexpr UINT kLinkCount = 32;
   const std::array<std::uint32_t, 16> expected = {
