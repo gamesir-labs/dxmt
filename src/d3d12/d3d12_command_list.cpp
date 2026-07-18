@@ -3205,6 +3205,11 @@ public:
       return;
     if (!resource || !values)
       return;
+    auto *clear_resource = dynamic_cast<Resource *>(resource);
+    if (!clear_resource || clear_resource->GetParentDevice() != device_.ptr()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     auto descriptor =
         GetDescriptorRecordFromGpuHandle(gpu_handle,
                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -3244,6 +3249,11 @@ public:
       return;
     if (!resource || !values)
       return;
+    auto *clear_resource = dynamic_cast<Resource *>(resource);
+    if (!clear_resource || clear_resource->GetParentDevice() != device_.ptr()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     auto descriptor =
         GetDescriptorRecordFromGpuHandle(gpu_handle,
                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -3279,6 +3289,12 @@ public:
       return;
     if (!resource)
       return;
+    auto *discard_resource = dynamic_cast<Resource *>(resource);
+    if (!discard_resource ||
+        discard_resource->GetParentDevice() != device_.ptr()) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_discard_resource(
             this, resource, region ? region->FirstSubresource : 0,

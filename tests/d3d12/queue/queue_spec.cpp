@@ -867,6 +867,37 @@ TEST_F(D3D12QueueSpec, DiscardAllowsCompleteAndRectangularOverwrite) {
   }
 }
 
+TEST_F(D3D12QueueSpec, RejectsForeignDiscardAndAllowsFreshListRecovery) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign_resource = foreign_context.CreateBuffer(
+      16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ASSERT_TRUE(foreign_resource);
+
+  context_.list()->DiscardResource(foreign_resource.get(), nullptr);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  auto local_resource = context_.CreateBuffer(
+      16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ASSERT_TRUE(local_resource);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+  list->DiscardResource(local_resource.get(), nullptr);
+  EXPECT_EQ(list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(D3D12QueueSpec, CompletesFenceSignalsInValueOrder) {
   ComPtr<ID3D12Fence> fence;
   ASSERT_TRUE(SUCCEEDED(context_.device()->CreateFence(
