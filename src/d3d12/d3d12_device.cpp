@@ -5003,7 +5003,7 @@ public:
                                         REFIID riid, void **fence) override {
     InitReturnPtr(fence);
     if (!fence)
-      return S_FALSE;
+      return E_POINTER;
     if (ShouldInjectCreationFailure("DXMT_TEST_FAIL_FENCE_CREATION_AT",
                                     g_test_fence_creation_occurrence))
       return E_OUTOFMEMORY;
