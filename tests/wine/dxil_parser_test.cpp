@@ -2,6 +2,7 @@
 
 #include "DXILParser/DXILFormatConstants.hpp"
 #include "DXILParser/DXILParser.hpp"
+#include "dxil_llvm_coverage_fixture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1051,6 +1052,195 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
   EXPECT_EQ(legacy_translation.signatures[2].semantic_name, "PATCH");
   EXPECT_EQ(legacy_translation.signatures[2].source_mask,
             DxilTranslationSourceLegacySignature);
+}
+
+TEST(DxilLlvmModule, ParsesTypesControlFlowCallsAndGlobals) {
+  using namespace dxmt::dxil;
+  LlvmModuleInfo module;
+  EXPECT_EQ(ParseLlvmModule({}, module), ParseStatus::InvalidLlvmModule);
+  EXPECT_EQ(ParseLlvmModule(std::array<uint8_t, 4>{1, 2, 3, 4}, module),
+            ParseStatus::InvalidLlvmModule);
+
+  const auto bitcode =
+      DecodeHex(dxmt::test::kDxilLlvmCoverageBitcodeHex);
+  ASSERT_EQ(bitcode.size(), 3036u);
+  ASSERT_EQ(ParseLlvmModule(bitcode, module), ParseStatus::Ok);
+  EXPECT_EQ(module.source_file_name, "dxil-llvm-coverage.ll");
+  EXPECT_EQ(module.target_triple, "dxil-ms-dx");
+  EXPECT_EQ(module.data_layout, "e-p:32:32-i64:64-n8:16:32:64");
+  EXPECT_TRUE(module.hasNamedMetadata("custom.metadata"));
+  ASSERT_TRUE(module.shader_model.has_value());
+  EXPECT_EQ(module.shader_model->kind, "cs");
+  EXPECT_EQ(module.shader_model->major, 6u);
+  EXPECT_EQ(module.shader_model->minor, 7u);
+  EXPECT_EQ(module.dxil_version, (std::vector<uint32_t>{1u, 8u}));
+  EXPECT_EQ(module.validator_version, (std::vector<uint32_t>{1u, 9u}));
+  ASSERT_EQ(module.entry_points.size(), 1u);
+  EXPECT_EQ(module.entry_points[0].function_name, "entry");
+  EXPECT_EQ(module.entry_points[0].name, "main");
+  ASSERT_EQ(module.module_flags.size(), 1u);
+  EXPECT_EQ(module.module_flags[0].behavior, 2u);
+  EXPECT_EQ(module.module_flags[0].key, "coverage-flag");
+  EXPECT_EQ(module.module_flags[0].value, "i32 7");
+
+  const auto find_global = [&](std::string_view name) {
+    const auto global = std::find_if(
+        module.globals.begin(), module.globals.end(),
+        [name](const LlvmGlobalInfo &candidate) {
+          return candidate.name == name;
+        });
+    return global == module.globals.end() ? nullptr : &*global;
+  };
+  const auto expect_global_kind = [&](std::string_view name,
+                                      LlvmTypeKind kind) {
+    const auto *global = find_global(name);
+    ASSERT_NE(global, nullptr) << name;
+    EXPECT_EQ(global->value_type_info.kind, kind) << name;
+  };
+  expect_global_kind("named_value", LlvmTypeKind::Struct);
+  expect_global_kind("opaque_value", LlvmTypeKind::Struct);
+  expect_global_kind("array_value", LlvmTypeKind::Array);
+  expect_global_kind("vector_value", LlvmTypeKind::Vector);
+  expect_global_kind("half_value", LlvmTypeKind::Half);
+  expect_global_kind("bfloat_value", LlvmTypeKind::BFloat);
+  expect_global_kind("double_value", LlvmTypeKind::Double);
+  expect_global_kind("x86_fp80_value", LlvmTypeKind::X86Fp80);
+  expect_global_kind("fp128_value", LlvmTypeKind::Fp128);
+  expect_global_kind("ppc_fp128_value", LlvmTypeKind::PpcFp128);
+  expect_global_kind("x86_mmx_value", LlvmTypeKind::X86Mmx);
+
+  const auto *named = find_global("named_value");
+  ASSERT_NE(named, nullptr);
+  EXPECT_EQ(named->value_type_info.name, "named");
+  EXPECT_FALSE(named->value_type_info.is_opaque);
+  ASSERT_EQ(named->value_type_info.contained_types.size(), 2u);
+  EXPECT_EQ(named->value_type_info.contained_types[0].kind,
+            LlvmTypeKind::Integer);
+  EXPECT_EQ(named->value_type_info.contained_types[0].bit_width, 32u);
+  EXPECT_EQ(named->value_type_info.contained_types[1].kind,
+            LlvmTypeKind::Array);
+  EXPECT_EQ(named->value_type_info.contained_types[1].element_count, 2u);
+  ASSERT_EQ(named->value_type_info.contained_types[1].contained_types.size(),
+            1u);
+  EXPECT_EQ(named->value_type_info.contained_types[1].contained_types[0].kind,
+            LlvmTypeKind::Float);
+
+  const auto *opaque = find_global("opaque_value");
+  ASSERT_NE(opaque, nullptr);
+  EXPECT_EQ(opaque->value_type_info.name, "opaque");
+  EXPECT_TRUE(opaque->value_type_info.is_opaque);
+  EXPECT_TRUE(opaque->is_declaration);
+  const auto *array = find_global("array_value");
+  ASSERT_NE(array, nullptr);
+  EXPECT_TRUE(array->is_constant);
+  EXPECT_EQ(array->value_type_info.element_count, 3u);
+  const auto *vector = find_global("vector_value");
+  ASSERT_NE(vector, nullptr);
+  EXPECT_EQ(vector->value_type_info.element_count, 4u);
+  EXPECT_FALSE(vector->value_type_info.is_scalable);
+
+  const auto find_function = [&](std::string_view name) {
+    const auto function = std::find_if(
+        module.functions.begin(), module.functions.end(),
+        [name](const LlvmFunctionInfo &candidate) {
+          return candidate.name == name;
+        });
+    return function == module.functions.end() ? nullptr : &*function;
+  };
+  const auto *scalable = find_function("scalable_vector_user");
+  ASSERT_NE(scalable, nullptr);
+  ASSERT_EQ(scalable->argument_type_infos.size(), 1u);
+  EXPECT_EQ(scalable->argument_type_infos[0].kind, LlvmTypeKind::Vector);
+  EXPECT_EQ(scalable->argument_type_infos[0].element_count, 2u);
+  EXPECT_TRUE(scalable->argument_type_infos[0].is_scalable);
+
+  const auto *entry = find_function("entry");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_FALSE(entry->is_declaration);
+  EXPECT_TRUE(entry->is_entry_reachable);
+  EXPECT_TRUE(entry->has_indirect_calls);
+  ASSERT_EQ(entry->argument_type_infos.size(), 2u);
+  EXPECT_EQ(entry->argument_type_infos[0].kind, LlvmTypeKind::Integer);
+  EXPECT_EQ(entry->argument_type_infos[1].kind, LlvmTypeKind::Pointer);
+  EXPECT_EQ(entry->argument_type_infos[1].address_space, 0u);
+  EXPECT_TRUE(entry->argument_type_infos[1].is_opaque);
+  EXPECT_EQ(entry->called_functions,
+            (std::vector<std::string>{"helper", "recursive"}));
+  ASSERT_EQ(entry->basic_blocks.size(), 5u);
+
+  const auto find_block = [&](std::string_view name) {
+    const auto block = std::find_if(
+        entry->basic_blocks.begin(), entry->basic_blocks.end(),
+        [name](const LlvmBasicBlockInfo &candidate) {
+          return candidate.name == name;
+        });
+    return block == entry->basic_blocks.end() ? nullptr : &*block;
+  };
+  const auto *entry_block = find_block("entry");
+  const auto *left_block = find_block("left");
+  const auto *dead_block = find_block("dead");
+  const auto *right_block = find_block("right");
+  const auto *join_block = find_block("join");
+  ASSERT_NE(entry_block, nullptr);
+  ASSERT_NE(left_block, nullptr);
+  ASSERT_NE(dead_block, nullptr);
+  ASSERT_NE(right_block, nullptr);
+  ASSERT_NE(join_block, nullptr);
+  EXPECT_TRUE(entry_block->has_branch);
+  EXPECT_EQ(entry_block->successors,
+            (std::vector<std::string>{"left", "right"}));
+  EXPECT_TRUE(left_block->has_switch);
+  EXPECT_EQ(left_block->successors,
+            (std::vector<std::string>{"join", "dead"}));
+  EXPECT_TRUE(dead_block->has_unreachable);
+  EXPECT_TRUE(dead_block->successors.empty());
+  EXPECT_TRUE(right_block->has_branch);
+  EXPECT_EQ(right_block->successors,
+            (std::vector<std::string>{"join"}));
+  EXPECT_TRUE(join_block->has_return);
+
+  ASSERT_EQ(entry->dxil_operations.size(), 2u);
+  const auto thread_id = std::find_if(
+      entry->dxil_operations.begin(), entry->dxil_operations.end(),
+      [](const LlvmDxilOperationInfo &operation) {
+        return operation.opcode == 93u;
+      });
+  ASSERT_NE(thread_id, entry->dxil_operations.end());
+  EXPECT_TRUE(thread_id->opcode_known);
+  EXPECT_EQ(thread_id->opcode_name, "ThreadId");
+  EXPECT_EQ(thread_id->typed.kind, DxilTypedOperationKind::SystemValue);
+  EXPECT_EQ(thread_id->typed.system_value, DxilSystemValueKind::ThreadId);
+  EXPECT_TRUE(thread_id->typed.has_component_index);
+  EXPECT_EQ(thread_id->typed.component_index, 2u);
+
+  const auto unknown = std::find_if(
+      entry->dxil_operations.begin(), entry->dxil_operations.end(),
+      [](const LlvmDxilOperationInfo &operation) {
+        return operation.opcode == 999u;
+      });
+  ASSERT_NE(unknown, entry->dxil_operations.end());
+  EXPECT_FALSE(unknown->opcode_known);
+  EXPECT_EQ(unknown->opcode_name, "unknown");
+  EXPECT_EQ(unknown->semantic_kind, DxilSemanticOperationKind::Unknown);
+  EXPECT_EQ(unknown->typed.kind, DxilTypedOperationKind::Unknown);
+
+  const auto *recursive = find_function("recursive");
+  ASSERT_NE(recursive, nullptr);
+  EXPECT_TRUE(recursive->is_recursive);
+  EXPECT_TRUE(recursive->is_entry_reachable);
+  EXPECT_EQ(recursive->called_functions,
+            (std::vector<std::string>{"recursive"}));
+  EXPECT_TRUE(module.call_graph.has_indirect_calls);
+  EXPECT_TRUE(module.call_graph.has_recursion);
+  EXPECT_NE(std::find(module.call_graph.entry_reachable_functions.begin(),
+                      module.call_graph.entry_reachable_functions.end(),
+                      "helper"),
+            module.call_graph.entry_reachable_functions.end());
+  EXPECT_EQ(module.call_graph.recursive_functions,
+            (std::vector<std::string>{"recursive"}));
+  EXPECT_EQ(module.call_graph.unused_dx_intrinsic_declarations,
+            (std::vector<std::string>{
+                "dx.op.flattenedThreadIdInGroup.i32"}));
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
