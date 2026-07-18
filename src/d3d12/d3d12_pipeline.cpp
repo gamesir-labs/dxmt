@@ -926,7 +926,7 @@ IsSystemGeneratedValue(const dxil::DxilTranslationSignatureElementInfo &sig) {
          sig.semantic_key == "SV_COVERAGE0";
 }
 
-void
+bool
 AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
                      PipelineShaderStage producer_stage,
                      PipelineShaderStage consumer_stage,
@@ -938,12 +938,12 @@ AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
   const auto *consumer =
       FindShader(shaders, consumer_stage, &consumer_shader_index);
   if (!producer || !consumer)
-    return;
+    return true;
 
   const auto *producer_info = producer->translation();
   const auto *consumer_info = consumer->translation();
   if (!producer_info || !consumer_info)
-    return;
+    return true;
 
   for (uint32_t consumer_sig_index = 0;
        consumer_sig_index < consumer_info->signatures.size();
@@ -960,13 +960,17 @@ AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
                      dxil::DxilTranslationSignatureKind::Output &&
                  producer_sig.output_stream == consumer_sig.output_stream &&
                  producer_sig.semantic_key == consumer_sig.semantic_key &&
+                 producer_sig.component_type == consumer_sig.component_type &&
                  (producer_sig.component_mask & consumer_sig.component_mask) ==
                      consumer_sig.component_mask;
         });
     if (match == producer_info->signatures.end()) {
       WARN("D3D12PipelineState: unmatched ", ShaderStageName(consumer_stage),
-           " input signature ", consumer_sig.semantic_key);
-      continue;
+           " input signature ", consumer_sig.semantic_key,
+           " type=", uint32_t(consumer_sig.component_type),
+           " mask=0x", std::hex, uint32_t(consumer_sig.component_mask),
+           std::dec);
+      return false;
     }
 
     links.push_back({
@@ -980,33 +984,40 @@ AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
         .consumer_component_mask = consumer_sig.component_mask,
     });
   }
+
+  return true;
 }
 
-std::vector<PipelineSignatureLink>
-BuildSignatureLinks(const std::vector<PipelineDxilShader> &shaders) {
-  std::vector<PipelineSignatureLink> links;
+bool
+BuildSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
+                    std::vector<PipelineSignatureLink> &links) {
+  links.clear();
 
-  if (FindShader(shaders, PipelineShaderStage::Hull))
-    AppendSignatureLinks(shaders, PipelineShaderStage::Vertex,
-                         PipelineShaderStage::Hull, links);
-  if (FindShader(shaders, PipelineShaderStage::Domain))
-    AppendSignatureLinks(shaders, PipelineShaderStage::Hull,
-                         PipelineShaderStage::Domain, links);
+  if (FindShader(shaders, PipelineShaderStage::Hull) &&
+      !AppendSignatureLinks(shaders, PipelineShaderStage::Vertex,
+                            PipelineShaderStage::Hull, links))
+    return false;
+  if (FindShader(shaders, PipelineShaderStage::Domain) &&
+      !AppendSignatureLinks(shaders, PipelineShaderStage::Hull,
+                            PipelineShaderStage::Domain, links))
+    return false;
 
   const auto raster_producer = FindShader(shaders, PipelineShaderStage::Domain)
                                    ? PipelineShaderStage::Domain
                                    : PipelineShaderStage::Vertex;
   if (FindShader(shaders, PipelineShaderStage::Geometry)) {
-    AppendSignatureLinks(shaders, raster_producer,
-                         PipelineShaderStage::Geometry, links);
-    AppendSignatureLinks(shaders, PipelineShaderStage::Geometry,
-                         PipelineShaderStage::Pixel, links);
+    if (!AppendSignatureLinks(shaders, raster_producer,
+                              PipelineShaderStage::Geometry, links) ||
+        !AppendSignatureLinks(shaders, PipelineShaderStage::Geometry,
+                              PipelineShaderStage::Pixel, links))
+      return false;
   } else {
-    AppendSignatureLinks(shaders, raster_producer,
-                         PipelineShaderStage::Pixel, links);
+    if (!AppendSignatureLinks(shaders, raster_producer,
+                              PipelineShaderStage::Pixel, links))
+      return false;
   }
 
-  return links;
+  return true;
 }
 
 void
@@ -4499,7 +4510,9 @@ CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
                           std::vector<PipelineDxilShader> &&shaders,
                           PipelineGraphicsState &&graphics_state,
                           PipelineComputeState &&compute_state) {
-  auto signature_links = BuildSignatureLinks(shaders);
+  std::vector<PipelineSignatureLink> signature_links;
+  if (!BuildSignatureLinks(shaders, signature_links))
+    return nullptr;
   auto resolved_root_signature =
       ResolveRootSignature(device, root_signature, shaders);
   const auto shader_cache_key =
