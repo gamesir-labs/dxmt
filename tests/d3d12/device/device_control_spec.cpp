@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -316,6 +317,75 @@ TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
 
   CloseHandle(post_removal_event);
   CloseHandle(pending_event);
+}
+
+TEST(DeviceRemovalSpec,
+     ConcurrentRemovalSignalsAllFenceRegistrationsAndReleasesCleanly) {
+  constexpr UINT kFenceCount = 8;
+  constexpr UINT kRemovalThreadCount = 4;
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+
+  ComPtr<ID3D12Device5> device5;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(ID3D12Device5),
+                reinterpret_cast<void **>(device5.put())),
+            S_OK);
+  ASSERT_TRUE(device5);
+
+  std::array<ComPtr<ID3D12Fence>, kFenceCount> fences;
+  std::array<HANDLE, kFenceCount> events = {};
+  std::array<HRESULT, kFenceCount> registrations = {};
+  for (UINT index = 0; index < kFenceCount; ++index) {
+    ASSERT_EQ(device->CreateFence(
+                  index, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                  reinterpret_cast<void **>(fences[index].put())),
+              S_OK);
+    events[index] = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(events[index], nullptr);
+  }
+
+  std::atomic_bool start = false;
+  std::vector<std::thread> threads;
+  threads.reserve(kFenceCount + kRemovalThreadCount);
+  for (UINT index = 0; index < kFenceCount; ++index) {
+    threads.emplace_back([&, index] {
+      while (!start.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      registrations[index] =
+          fences[index]->SetEventOnCompletion(UINT64_MAX - index,
+                                               events[index]);
+    });
+  }
+  for (UINT index = 0; index < kRemovalThreadCount; ++index) {
+    threads.emplace_back([&] {
+      while (!start.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      device5->RemoveDevice();
+    });
+  }
+
+  start.store(true, std::memory_order_release);
+  for (auto &thread : threads)
+    thread.join();
+  for (const HRESULT registration : registrations)
+    EXPECT_EQ(registration, S_OK);
+  EXPECT_EQ(WaitForMultipleObjects(kFenceCount, events.data(), TRUE, 5000),
+            WAIT_OBJECT_0);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED);
+  for (const auto &fence : fences)
+    EXPECT_EQ(fence->GetCompletedValue(), UINT64_MAX);
+
+  threads.clear();
+  threads.reserve(kFenceCount);
+  for (UINT index = 0; index < kFenceCount; ++index)
+    threads.emplace_back([&, index] { fences[index].reset(); });
+  for (auto &thread : threads)
+    thread.join();
+
+  for (const HANDLE event : events)
+    CloseHandle(event);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED);
 }
 
 #ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
