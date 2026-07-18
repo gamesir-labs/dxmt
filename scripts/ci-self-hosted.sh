@@ -18,21 +18,8 @@ case "${1:-}" in
     shift
     ;;
 esac
-if [[ -z "${CONFIG_PATH}" ]]; then
-  search_dir="${REPO_ROOT}"
-  while :; do
-    candidate="${search_dir}/.dxmt-builder/config.json"
-    if [[ -f "${candidate}" ]]; then
-      CONFIG_PATH="${candidate}"
-      break
-    fi
-    parent_dir="$(dirname "${search_dir}")"
-    [[ "${parent_dir}" != "${search_dir}" ]] || break
-    search_dir="${parent_dir}"
-  done
-fi
-if [[ -z "${CONFIG_PATH}" && -f "${REPO_ROOT}/tools/dxmt-builder/config.json" ]]; then
-  CONFIG_PATH="${REPO_ROOT}/tools/dxmt-builder/config.json"
+if [[ -z "${CONFIG_PATH}" && -f "${REPO_ROOT}/.dxmt-builder/config.json" ]]; then
+  CONFIG_PATH="${REPO_ROOT}/.dxmt-builder/config.json"
 fi
 
 CACHE_ROOT="${DXMT_CI_ROOT:-${DXMT_MANAGED_CACHE_ROOT:-${REPO_ROOT}/.cache/managed}}"

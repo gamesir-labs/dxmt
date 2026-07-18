@@ -26,3 +26,4 @@ ref.sh
 releases
 prefixes
 AGENTS.md
+/.dxmt-builder/config.json

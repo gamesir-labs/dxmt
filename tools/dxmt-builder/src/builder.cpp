@@ -452,17 +452,9 @@ std::optional<fs::path> DiscoverConfigPath(
       throw std::runtime_error("builder config does not exist: " + path.string());
     return path;
   }
-  for (auto directory = repo_root;; directory = directory.parent_path()) {
-    const auto candidate = directory / ".dxmt-builder/config.json";
-    if (fs::is_regular_file(candidate))
-      return fs::absolute(candidate).lexically_normal();
-    const auto parent = directory.parent_path();
-    if (parent == directory)
-      break;
-  }
-  const auto bundled = repo_root / "tools/dxmt-builder/config.json";
-  if (fs::is_regular_file(bundled))
-    return fs::absolute(bundled).lexically_normal();
+  const auto local = repo_root / ".dxmt-builder/config.json";
+  if (fs::is_regular_file(local))
+    return fs::absolute(local).lexically_normal();
   return std::nullopt;
 }
 
@@ -2023,6 +2015,12 @@ std::map<std::string, std::string> ParseProperties(std::string_view contents) {
 std::map<std::string, std::string> ParseJsonStringObject(
     std::string_view contents) {
   return JsonStringObjectParser(contents).Parse();
+}
+
+std::optional<std::filesystem::path> DiscoverConfigPath(
+    const std::filesystem::path &repo_root,
+    const std::optional<std::filesystem::path> &requested) {
+  return dxmt::builder::DiscoverConfigPath(repo_root, requested);
 }
 
 void WriteFileAtomic(const fs::path &path, std::string_view contents) {

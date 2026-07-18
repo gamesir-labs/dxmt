@@ -21,21 +21,8 @@ if [ "$expect_config_path" = true ]; then
   printf '%s\n' 'dxmt-builder: --config requires a value' >&2
   exit 2
 fi
-if [ -z "$config_path" ]; then
-  search_dir=$repo_root
-  while :; do
-    candidate="$search_dir/.dxmt-builder/config.json"
-    if [ -f "$candidate" ]; then
-      config_path=$candidate
-      break
-    fi
-    parent_dir=$(dirname -- "$search_dir")
-    [ "$parent_dir" != "$search_dir" ] || break
-    search_dir=$parent_dir
-  done
-fi
-if [ -z "$config_path" ] && [ -f "$repo_root/tools/dxmt-builder/config.json" ]; then
-  config_path="$repo_root/tools/dxmt-builder/config.json"
+if [ -z "$config_path" ] && [ -f "$repo_root/.dxmt-builder/config.json" ]; then
+  config_path="$repo_root/.dxmt-builder/config.json"
 fi
 
 managed_root="$repo_root/.cache/managed"

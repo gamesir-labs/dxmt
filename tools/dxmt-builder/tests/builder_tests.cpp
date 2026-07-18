@@ -74,7 +74,22 @@ int main() {
     const auto temp = std::filesystem::temp_directory_path() /
                       ("dxmt-builder-tests-" + std::to_string(getpid()));
     std::filesystem::remove_all(temp);
-    std::filesystem::create_directories(temp);
+    const auto repo = temp / "parent/worktree";
+    std::filesystem::create_directories(repo / ".dxmt-builder");
+    testing::WriteFileAtomic(temp / "parent/.dxmt-builder/config.json", "{}");
+    Check(!testing::DiscoverConfigPath(repo),
+          "parent worktree config leaked into the current checkout");
+    const auto local_config = repo / ".dxmt-builder/config.json";
+    testing::WriteFileAtomic(local_config, "{}");
+    Check(testing::DiscoverConfigPath(repo) ==
+              std::filesystem::absolute(local_config).lexically_normal(),
+          "checkout-local builder config was not discovered");
+    const auto explicit_config = temp / "explicit-config.json";
+    testing::WriteFileAtomic(explicit_config, "{}");
+    Check(testing::DiscoverConfigPath(repo, explicit_config) ==
+              std::filesystem::absolute(explicit_config).lexically_normal(),
+          "explicit builder config did not override the checkout default");
+
     const auto atomic_file = temp / "atomic.txt";
     testing::WriteFileAtomic(atomic_file, "complete");
     Check(ReadFile(atomic_file) == "complete", "atomic publication failed");

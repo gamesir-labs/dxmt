@@ -26,25 +26,31 @@ scripts/dxmt-builder test --profile gcc-x64-release-full all
 ```
 
 `bootstrap wine-x64` keeps a git worktree of the remote Wine branch under
-`.cache/managed/sources/`, always fetches the branch tip, and builds with
+`<cache_root>/sources/`, always fetches the branch tip, and builds with
 **incremental `make`/`make install`** when an out-of-tree `build/` already
 exists. Set `DXMT_WINE_CLEAN=1` to wipe `build/`/`install/` and force a full
-configure. Published install trees live under `.cache/managed/deps/wine-x86_64-*`
+configure. Published install trees live under `<cache_root>/deps/wine-x86_64-*`
 for later DXMT builds to consume without recompiling Wine.
 
-Builder storage is controlled by `tools/dxmt-builder/config.json`. With the
-bundled default config, all state lives under `.cache/managed`: stable
-Meson/Ninja profile directories, ccache, Metal and apitrace CAS entries, Wine
-and LLVM dependencies, staged artifacts, locks, and telemetry. Existing
+Without local configuration, all builder state lives under `.cache/managed`:
+stable Meson/Ninja profile directories, ccache, Metal and apitrace CAS entries,
+Wine and LLVM dependencies, staged artifacts, locks, and telemetry. Existing
 directories outside the configured root are legacy state; the builder neither
 reads, prunes, nor deletes them.
 
-The launcher and builder accept an explicit `--config <config.json>`. Without
-that option, they look for `.dxmt-builder/config.json` from the repository root
-up through its parent directories, then fall back to the bundled config. This
-allows sibling Git worktrees to share one parent configuration without adding
-machine-local paths to Git. Relative `cache_root` values are resolved from the
-active repository root.
+For machine-local configuration, copy the tracked template and edit the local
+file as needed:
+
+```sh
+cp .dxmt-builder/config.json.example .dxmt-builder/config.json
+```
+
+The local `config.json` is ignored by Git. Without an explicit configuration
+path, the launcher and builder read only `.dxmt-builder/config.json` from the
+active checkout root. They never search parent directories, so sibling Git
+worktrees cannot inherit one another's machine-local configuration. An
+explicit `--config <path>` remains available for CI or exceptional commands.
+Relative `cache_root` values are resolved from the active checkout root.
 
 ```json
 {
@@ -57,8 +63,8 @@ active repository root.
 branch, or the commit SHA for a detached checkout. Only mutable profile state
 (`build`, `install`, `stage`, `prefix`, and `meta`) is namespaced. Dependencies,
 downloads, ccache, CAS entries, artifacts, and telemetry remain globally shared
-under `cache_root`. Use `"none"` to retain the legacy unnamespaced profile
-layout. CI uses `.github/dxmt-builder-config.json` explicitly.
+under `cache_root`. Use `"none"` for an unnamespaced profile layout. CI uses
+`.github/dxmt-builder-config.json` explicitly.
 
 Use `scripts/dxmt-builder cache status`, `cache verify`, and `cache prune
 --dry-run` to inspect managed state. There is no automatic capacity eviction in

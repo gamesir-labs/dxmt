@@ -33,6 +33,9 @@ namespace testing {
 std::map<std::string, std::string> ParseProperties(std::string_view contents);
 std::map<std::string, std::string> ParseJsonStringObject(
     std::string_view contents);
+std::optional<std::filesystem::path> DiscoverConfigPath(
+    const std::filesystem::path &repo_root,
+    const std::optional<std::filesystem::path> &requested = std::nullopt);
 void WriteFileAtomic(const std::filesystem::path &path, std::string_view contents);
 void WithFileLock(const std::filesystem::path &path,
                   const std::function<void()> &operation);
