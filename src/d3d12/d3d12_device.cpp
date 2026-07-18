@@ -3279,7 +3279,7 @@ public:
         data->Support2 = static_cast<D3D12_FORMAT_SUPPORT2>(
             data->Support2 & ~D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD);
       }
-      constexpr UINT kTypedAtomicOperations =
+      const UINT kTypedAtomicOperations =
           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
@@ -3304,7 +3304,7 @@ public:
             data->Support1 &
             ~D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
         if (data->Format == DXGI_FORMAT_R32G32B32_TYPELESS) {
-          constexpr UINT kAllowedTypelessSupport1 =
+          const UINT kAllowedTypelessSupport1 =
               D3D12_FORMAT_SUPPORT1_TEXTURE1D |
               D3D12_FORMAT_SUPPORT1_TEXTURE2D |
               D3D12_FORMAT_SUPPORT1_TEXTURE3D |
