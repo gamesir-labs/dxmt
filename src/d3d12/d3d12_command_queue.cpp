@@ -6225,6 +6225,7 @@ private:
     UINT level = 0;
     UINT slice = 0;
     int access = 0;
+    bool requires_cross_submit_wait = false;
   };
 
   struct ResourceAccessBarrierKey {
@@ -6302,6 +6303,8 @@ private:
                                   ResourceAccessBarrierEntry &&src) {
     dst.buffer_length = std::max(dst.buffer_length, src.buffer_length);
     dst.access |= src.access;
+    dst.requires_cross_submit_wait = dst.requires_cross_submit_wait ||
+                                     src.requires_cross_submit_wait;
   }
 
   static void
@@ -6811,6 +6814,8 @@ private:
       ArgumentEncodingContext &enc,
       std::vector<ResourceAccessBarrierEntry> &entries) {
     for (auto &entry : entries) {
+      if (entry.requires_cross_submit_wait)
+        enc.requireCrossSubmitWait();
       if (entry.buffer) {
         enc.access<stage>(entry.buffer, 0, entry.buffer_length, entry.access);
       } else if (entry.texture) {
@@ -11283,7 +11288,7 @@ private:
       }
       AddResourceAccessBarrier(batch, *resource, 0,
                                GetSubresourceCount(*resource),
-                               ResourceAccess::All);
+                               ResourceAccess::All, true);
       return;
     }
 
@@ -11315,7 +11320,8 @@ private:
 
   void AddResourceAccessBarrier(ResourceAccessBarrierBatch &batch,
                                 Resource &resource, UINT first_subresource,
-                                UINT subresource_count, int access) {
+                                UINT subresource_count, int access,
+                                bool requires_cross_submit_wait = false) {
     auto add_or_merge_entry = [&](ResourceAccessBarrierEntry entry) {
       if (batch.entry_index.empty()) {
         if (batch.entries.size() < kResourceAccessBarrierLinearEntryLimit) {
@@ -11350,7 +11356,8 @@ private:
       Rc<Buffer> buffer = resource.GetBuffer();
       const UINT64 length = resource.GetResourceDesc().Width;
       add_or_merge_entry({Com<ID3D12Resource>(resource.GetD3D12Resource()),
-                          std::move(buffer), {}, length, 0, 0, access});
+                          std::move(buffer), {}, length, 0, 0, access,
+                          requires_cross_submit_wait});
       return;
     }
 
@@ -11367,7 +11374,8 @@ private:
         const UINT level = GetMipLevel(resource, subresource);
         const UINT slice = GetArraySlice(resource, subresource);
         add_or_merge_entry({Com<ID3D12Resource>(resource.GetD3D12Resource()),
-                            {}, std::move(texture), 0, level, slice, access});
+                            {}, std::move(texture), 0, level, slice, access,
+                            requires_cross_submit_wait});
         added = true;
       }
       if (subresource_count && !added)

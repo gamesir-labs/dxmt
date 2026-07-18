@@ -299,6 +299,12 @@ ArgumentEncodingContext::prepareFencePool(
         result.external_blit_wait_count += !interval_by_id.contains(id);
       });
     }
+    if (encoder->requires_cross_submit_wait) {
+      waits.forEach([&](EncoderId id) {
+        result.external_explicit_barrier_wait_count +=
+            !interval_by_id.contains(id);
+      });
+    }
     extend_waits(waits, i);
     dependency_order.analyzeEncoder(waits, updates);
   }
@@ -4445,14 +4451,16 @@ ArgumentEncodingContext::flushCommands(
     const auto value = env::getEnvVar("DXMT_CROSS_SUBMIT_FENCE_WAIT");
     return value == "1" || value == "true" || value == "yes" || value == "on";
   }();
-  // Blit consumers require an explicit event edge when their producer lives in
-  // an earlier command buffer; relying on commit order alone loses render-to-
-  // copy results under concurrent execution. Keep render/compute-only external
-  // edges on the non-serializing default path that avoids the FH4 UI regression
-  // which motivated 8a8f1d1a. The environment override retains the former
-  // all-external-edge behavior for diagnostics.
+  // Blit consumers and encoders carrying an explicit cross-submit UAV barrier
+  // require an event edge when their producer lives in an earlier command
+  // buffer. Relying on commit order alone can lose either copied results or UAV
+  // visibility under concurrent execution. Keep ordinary render/compute-only
+  // external edges on the non-serializing default path that avoids the FH4 UI
+  // regression which motivated 8a8f1d1a. The environment override retains the
+  // former all-external-edge behavior for diagnostics.
   const bool encode_cross_submit_wait =
       fence_preparation.external_blit_wait_count ||
+      fence_preparation.external_explicit_barrier_wait_count ||
       (force_cross_submit_wait && fence_preparation.external_wait_count);
   if (encode_cross_submit_wait && event_seq_id > 1)
     cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
@@ -5628,6 +5636,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->fence_wait_vertex = std::move(fence_merge->pre_raster_waits);
       r1->fence_update = std::move(fence_merge->fragment_updates);
       r1->fence_update_vertex = std::move(fence_merge->pre_raster_updates);
+      r1->requires_cross_submit_wait = r0->requires_cross_submit_wait ||
+                                       r1->requires_cross_submit_wait;
 
       // r0's commands are prepended into r1, but r0 itself will not be encoded after this point.
       // On 32-bit builds the argument buffer writes live in a shadow allocation until explicitly flushed.
@@ -5669,6 +5679,8 @@ ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncod
   latter->fence_update.merge(former->fence_update);
   latter->fence_wait.merge(former->fence_wait);
   latter->fence_wait.subtract(former->fence_update);
+  latter->requires_cross_submit_wait = former->requires_cross_submit_wait ||
+                                       latter->requires_cross_submit_wait;
 
   former->~BlitEncoderData();
   former->next = nullptr;
@@ -5713,6 +5725,8 @@ ArgumentEncodingContext::tryMergeComputeEncoders(ComputeEncoderData *former, Com
   latter->fence_update.merge(former->fence_update);
   latter->fence_wait.merge(former->fence_wait);
   latter->fence_wait.subtract(former->fence_update);
+  latter->requires_cross_submit_wait = former->requires_cross_submit_wait ||
+                                       latter->requires_cross_submit_wait;
 
   currentFrameStatistics().compute_pass_optimized++;
   former->~ComputeEncoderData();

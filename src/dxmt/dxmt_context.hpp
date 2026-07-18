@@ -118,6 +118,7 @@ struct CommandBufferDiagnosticInfo {
 struct FencePoolPreparationResult {
   uint32_t external_wait_count = 0;
   uint32_t external_blit_wait_count = 0;
+  uint32_t external_explicit_barrier_wait_count = 0;
 };
 
 inline std::size_t
@@ -222,6 +223,7 @@ struct EncoderData {
   FenceSet fence_wait;
   FenceSet fence_update;
   EncoderBarrierState barrier_state;
+  bool requires_cross_submit_wait = false;
 };
 
 struct GSDispatchArgumentsMarshal {
@@ -1224,6 +1226,11 @@ public:
   void resolveComputePassBarrier();
 
   void resolveRenderPassBarrier();
+
+  void requireCrossSubmitWait() {
+    assert(encoder_current);
+    encoder_current->requires_cross_submit_wait = true;
+  }
 
   FrameStatistics&
   currentFrameStatistics();
