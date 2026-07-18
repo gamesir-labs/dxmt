@@ -1194,6 +1194,222 @@ TEST(DxilRuntimeData, RejectsInvalidSubobjectPayloadReferences) {
             ParseStatus::InvalidRuntimeData);
 }
 
+TEST(DxilRuntimeData, ParsesWorkGraphNodeRecords) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {'n', 'o', 'd', 'e', 0};
+  std::vector<uint8_t> indices(12 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 3u);
+  Store<uint32_t>(indices, 4, 8u);
+  Store<uint32_t>(indices, 8, 4u);
+  Store<uint32_t>(indices, 12, 2u);
+  for (size_t offset : {size_t(16), size_t(24), size_t(32), size_t(40)}) {
+    Store<uint32_t>(indices, offset, 1u);
+    Store<uint32_t>(indices, offset + 4, 0u);
+  }
+
+  std::vector<uint8_t> node_ids(kRuntimeDataTableHeaderSize +
+                                kRdatNodeIdRecordSize);
+  Store<uint32_t>(node_ids, 0, 1u);
+  Store<uint32_t>(node_ids, 4, kRdatNodeIdRecordSize);
+  Store<uint32_t>(node_ids, kRuntimeDataTableHeaderSize + 0, 0u);
+  Store<uint32_t>(node_ids, kRuntimeDataTableHeaderSize + 4, 7u);
+
+  std::vector<uint8_t> function_attributes(
+      kRuntimeDataTableHeaderSize + 2 * kRdatNodeShaderFuncAttribRecordSize);
+  Store<uint32_t>(function_attributes, 0, 2u);
+  Store<uint32_t>(function_attributes, 4,
+                  kRdatNodeShaderFuncAttribRecordSize);
+  Store<uint32_t>(function_attributes, kRuntimeDataTableHeaderSize + 0, 1u);
+  Store<uint32_t>(function_attributes, kRuntimeDataTableHeaderSize + 4, 0u);
+  Store<uint32_t>(function_attributes,
+                  kRuntimeDataTableHeaderSize +
+                      kRdatNodeShaderFuncAttribRecordSize + 0,
+                  2u);
+  Store<uint32_t>(function_attributes,
+                  kRuntimeDataTableHeaderSize +
+                      kRdatNodeShaderFuncAttribRecordSize + 4,
+                  0u);
+
+  std::vector<uint8_t> io_attributes(
+      kRuntimeDataTableHeaderSize + 2 * kRdatNodeShaderIoAttribRecordSize);
+  Store<uint32_t>(io_attributes, 0, 2u);
+  Store<uint32_t>(io_attributes, 4, kRdatNodeShaderIoAttribRecordSize);
+  Store<uint32_t>(io_attributes, kRuntimeDataTableHeaderSize + 0, 1u);
+  Store<uint32_t>(io_attributes, kRuntimeDataTableHeaderSize + 4, 0u);
+  const size_t dispatch_attribute =
+      kRuntimeDataTableHeaderSize + kRdatNodeShaderIoAttribRecordSize;
+  Store<uint32_t>(io_attributes, dispatch_attribute + 0, 5u);
+  Store<uint16_t>(io_attributes, dispatch_attribute + 4, 12u);
+  Store<uint16_t>(io_attributes, dispatch_attribute + 6, (5u << 2) | 3u);
+
+  std::vector<uint8_t> io_nodes(kRuntimeDataTableHeaderSize +
+                                kRdatIoNodeRecordSize);
+  Store<uint32_t>(io_nodes, 0, 1u);
+  Store<uint32_t>(io_nodes, 4, kRdatIoNodeRecordSize);
+  Store<uint32_t>(io_nodes, kRuntimeDataTableHeaderSize + 0, 9u);
+  Store<uint32_t>(io_nodes, kRuntimeDataTableHeaderSize + 4, 4u);
+
+  std::vector<uint8_t> shader_nodes(kRuntimeDataTableHeaderSize +
+                                    kRdatNodeShaderInfoRecordSize);
+  Store<uint32_t>(shader_nodes, 0, 1u);
+  Store<uint32_t>(shader_nodes, 4, kRdatNodeShaderInfoRecordSize);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 0, 2u);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 4, 128u);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 8, 6u);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 12, 8u);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 16, 10u);
+
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::StringBuffer, strings)
+                         .add(rdat::IndexArrays, indices)
+                         .add(rdat::NodeIDTable, node_ids)
+                         .add(rdat::NodeShaderFuncAttribTable,
+                              function_attributes)
+                         .add(rdat::NodeShaderIOAttribTable, io_attributes)
+                         .add(rdat::IONodeTable, io_nodes)
+                         .add(rdat::NodeShaderInfoTable, shader_nodes)
+                         .build();
+
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.node_ids.size(), 1u);
+  EXPECT_EQ(info.node_ids[0].name, "node");
+  EXPECT_EQ(info.node_ids[0].index, 7u);
+  ASSERT_EQ(info.node_function_attributes.size(), 2u);
+  EXPECT_EQ(info.node_function_attributes[0].node_id_index, 0u);
+  EXPECT_EQ(info.node_function_attributes[1].values,
+            (std::vector<uint32_t>{8, 4, 2}));
+  ASSERT_EQ(info.node_io_attributes.size(), 2u);
+  EXPECT_EQ(info.node_io_attributes[0].node_id_index, 0u);
+  EXPECT_EQ(info.node_io_attributes[1].record_dispatch_grid.byte_offset, 12u);
+  EXPECT_EQ(info.node_io_attributes[1].record_dispatch_grid.component_count,
+            3u);
+  EXPECT_EQ(info.node_io_attributes[1].record_dispatch_grid.component_type,
+            5u);
+  ASSERT_EQ(info.io_nodes.size(), 1u);
+  EXPECT_EQ(info.io_nodes[0].io_flags_and_kind, 9u);
+  EXPECT_EQ(info.io_nodes[0].attribute_indices,
+            (std::vector<uint32_t>{0}));
+  ASSERT_EQ(info.node_shader_infos.size(), 1u);
+  EXPECT_EQ(info.node_shader_infos[0].launch_type, 2u);
+  EXPECT_EQ(info.node_shader_infos[0].group_shared_bytes_used, 128u);
+  EXPECT_EQ(info.node_shader_infos[0].attribute_indices,
+            (std::vector<uint32_t>{0}));
+  EXPECT_EQ(info.node_shader_infos[0].output_indices,
+            (std::vector<uint32_t>{0}));
+  EXPECT_EQ(info.node_shader_infos[0].input_indices,
+            (std::vector<uint32_t>{0}));
+}
+
+TEST(DxilRuntimeData, RejectsInvalidWorkGraphNodeLinks) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> strings = {'n', 'o', 'd', 'e', 0};
+  std::vector<uint8_t> indices(8 * sizeof(uint32_t));
+  for (size_t offset : {size_t(0), size_t(8), size_t(16), size_t(24)}) {
+    Store<uint32_t>(indices, offset, 1u);
+    Store<uint32_t>(indices, offset + 4, 0u);
+  }
+
+  std::vector<uint8_t> node_ids(kRuntimeDataTableHeaderSize +
+                                kRdatNodeIdRecordSize);
+  Store<uint32_t>(node_ids, 0, 1u);
+  Store<uint32_t>(node_ids, 4, kRdatNodeIdRecordSize);
+  Store<uint32_t>(node_ids, kRuntimeDataTableHeaderSize + 0, 0u);
+
+  std::vector<uint8_t> function_attributes(
+      kRuntimeDataTableHeaderSize + kRdatNodeShaderFuncAttribRecordSize);
+  Store<uint32_t>(function_attributes, 0, 1u);
+  Store<uint32_t>(function_attributes, 4,
+                  kRdatNodeShaderFuncAttribRecordSize);
+  Store<uint32_t>(function_attributes, kRuntimeDataTableHeaderSize + 0, 1u);
+  Store<uint32_t>(function_attributes, kRuntimeDataTableHeaderSize + 4, 0u);
+
+  std::vector<uint8_t> io_attributes(
+      kRuntimeDataTableHeaderSize + kRdatNodeShaderIoAttribRecordSize);
+  Store<uint32_t>(io_attributes, 0, 1u);
+  Store<uint32_t>(io_attributes, 4, kRdatNodeShaderIoAttribRecordSize);
+  Store<uint32_t>(io_attributes, kRuntimeDataTableHeaderSize + 0, 1u);
+  Store<uint32_t>(io_attributes, kRuntimeDataTableHeaderSize + 4, 0u);
+
+  std::vector<uint8_t> io_nodes(kRuntimeDataTableHeaderSize +
+                                kRdatIoNodeRecordSize);
+  Store<uint32_t>(io_nodes, 0, 1u);
+  Store<uint32_t>(io_nodes, 4, kRdatIoNodeRecordSize);
+  Store<uint32_t>(io_nodes, kRuntimeDataTableHeaderSize + 4, 1u);
+
+  std::vector<uint8_t> shader_nodes(kRuntimeDataTableHeaderSize +
+                                    kRdatNodeShaderInfoRecordSize);
+  Store<uint32_t>(shader_nodes, 0, 1u);
+  Store<uint32_t>(shader_nodes, 4, kRdatNodeShaderInfoRecordSize);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 8, 2u);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 12, 3u);
+  Store<uint32_t>(shader_nodes, kRuntimeDataTableHeaderSize + 16, 3u);
+
+  const auto build = [&](const std::vector<uint8_t> &ids,
+                         const std::vector<uint8_t> &function_attrs,
+                         const std::vector<uint8_t> &io_attrs,
+                         const std::vector<uint8_t> &nodes,
+                         const std::vector<uint8_t> &shader_info) {
+    return DxilRuntimeDataBuilder()
+        .add(rdat::StringBuffer, strings)
+        .add(rdat::IndexArrays, indices)
+        .add(rdat::NodeIDTable, ids)
+        .add(rdat::NodeShaderFuncAttribTable, function_attrs)
+        .add(rdat::NodeShaderIOAttribTable, io_attrs)
+        .add(rdat::IONodeTable, nodes)
+        .add(rdat::NodeShaderInfoTable, shader_info)
+        .build();
+  };
+
+  RuntimeDataInfo info;
+  auto malformed_ids = node_ids;
+  Store<uint32_t>(malformed_ids, kRuntimeDataTableHeaderSize, 100u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(malformed_ids, function_attributes, io_attributes,
+                           io_nodes, shader_nodes)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_functions = function_attributes;
+  Store<uint32_t>(malformed_functions, kRuntimeDataTableHeaderSize + 4, 1u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(node_ids, malformed_functions, io_attributes,
+                           io_nodes, shader_nodes)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_io = io_attributes;
+  Store<uint32_t>(malformed_io, kRuntimeDataTableHeaderSize + 4, 1u);
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData,
+                     build(node_ids, function_attributes, malformed_io,
+                           io_nodes, shader_nodes)),
+                info),
+            ParseStatus::InvalidRuntimeData);
+
+  auto malformed_indices = indices;
+  Store<uint32_t>(malformed_indices, 12, 1u);
+  const auto invalid_index_bytes = DxilRuntimeDataBuilder()
+                                       .add(rdat::StringBuffer, strings)
+                                       .add(rdat::IndexArrays,
+                                            malformed_indices)
+                                       .add(rdat::NodeIDTable, node_ids)
+                                       .add(rdat::NodeShaderFuncAttribTable,
+                                            function_attributes)
+                                       .add(rdat::NodeShaderIOAttribTable,
+                                            io_attributes)
+                                       .add(rdat::IONodeTable, io_nodes)
+                                       .add(rdat::NodeShaderInfoTable,
+                                            shader_nodes)
+                                       .build();
+  EXPECT_EQ(ParseRuntimeData(
+                Part(fourcc::RuntimeData, invalid_index_bytes), info),
+            ParseStatus::InvalidRuntimeData);
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
