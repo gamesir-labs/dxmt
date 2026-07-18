@@ -81,6 +81,22 @@ table materialization. The argument-table total contains mirror publication by
 design; the mirror benchmark isolates the bulk-copy mutation workload used to
 measure that nested subpath.
 
+The `d3d12-gpu-throughput` performance suite measures buffer-copy and
+texture-copy bandwidth, render-target clear rate, minimal compute-dispatch and
+draw-call rate, and full-screen render-target fill. Every case executes an
+untimed representative submission first and treats that submission as a
+correctness precheck. Copy cases sample the destination, dispatch and draw
+cases use an exact GPU atomic counter, and clear/fill cases read back a target
+pixel. Buffer copy, texture copy, clear, dispatch, and draw-call intervals are
+bounded by D3D12 timestamp queries; submission, fence waiting, query resolve,
+and correctness readback remain outside those GPU intervals. RT fill uses
+queue-submit-to-fence wall time because a timestamp boundary before the RT-only
+segment currently suppresses its observable color-attachment store. A red
+sentinel and pixel readback keep that fallback from reporting a false fast
+result. Result counters report bytes, pixels, dispatches, or draws processed,
+and the dedicated budget records the designated machine, OS, GPU, and Metal
+feature set.
+
 `performance` performs repeated serial measurements and validates the median
 against a reviewed JSON baseline plus an explicit maximum regression
 percentage. Every result must be single-threaded, and missing or stale budget

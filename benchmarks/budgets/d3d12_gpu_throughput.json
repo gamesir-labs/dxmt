@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "profile": "gcc-x64-release-full",
+    "host_class": "self-macos-runner Apple Silicon",
+    "machine": "Mac16,12",
+    "os": "macOS 26.5.2 (25F84)",
+    "gpu": "Apple M4 8-core GPU",
+    "metal_feature_set": "Metal 4",
+    "collected_on": "2026-07-17",
+    "repetitions": 5,
+    "metric": "real_time",
+    "unit": "ns",
+    "timing_source": "D3D12 timestamp query; queue submit-to-fence wall time for RT fill"
+  },
+  "benchmarks": {
+    "BI_D3D12BufferCopyBandwidth/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 175000,
+      "max_regression_percent": 100
+    },
+    "BI_D3D12TextureCopyBandwidth/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 90000,
+      "max_regression_percent": 100
+    },
+    "BI_D3D12ClearRenderTargetThroughput/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 45000,
+      "max_regression_percent": 100
+    },
+    "BI_D3D12ComputeDispatchThroughput/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 26000,
+      "max_regression_percent": 150
+    },
+    "BI_D3D12DrawCallThroughput/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 215000,
+      "max_regression_percent": 100
+    },
+    "BI_D3D12RenderTargetFill/iterations:1/manual_time": {
+      "metric": "real_time",
+      "baseline_median_ns": 1300000,
+      "max_regression_percent": 150
+    }
+  }
+}
