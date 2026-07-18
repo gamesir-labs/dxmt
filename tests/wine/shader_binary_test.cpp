@@ -892,4 +892,142 @@ TEST(ShaderBinary, DecodesShaderModelFiveResourceDeclarations) {
   EXPECT_EQ(instruction.m_ConstantBufferDecl.Space, 0u);
 }
 
+TEST(ShaderBinary, DecodesShaderModelFiveOneRegisterSpaces) {
+  CInstruction instruction;
+  constexpr CShaderToken return_types =
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_UINT, 0) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_SINT, 1) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 2) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D11_SB_RETURN_TYPE_DOUBLE, 3);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_RESOURCE, 7,
+                        ENCODE_D3D10_SB_RESOURCE_DIMENSION(
+                            D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBEARRAY)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_RESOURCE,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       101, 4, 15, return_types, 8},
+      &instruction, D3D10_SB_PIXEL_SHADER, 5, 1);
+  EXPECT_EQ(instruction.Operand(0).OperandIndexDimension(),
+            D3D10_SB_OPERAND_INDEX_3D);
+  EXPECT_EQ(instruction.Operand(0).OperandIndex(0)->m_RegIndex, 101u);
+  EXPECT_EQ(instruction.Operand(0).OperandIndex(1)->m_RegIndex, 4u);
+  EXPECT_EQ(instruction.Operand(0).OperandIndex(2)->m_RegIndex, 15u);
+  EXPECT_EQ(instruction.m_ResourceDecl.Space, 8u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_SAMPLER, 6,
+                        ENCODE_D3D10_SB_SAMPLER_MODE(
+                            D3D10_SB_SAMPLER_MODE_MONO)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_SAMPLER,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       102, 1, 3, 9},
+      &instruction, D3D10_SB_PIXEL_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_SamplerDecl.SamplerMode,
+            D3D10_SB_SAMPLER_MODE_MONO);
+  EXPECT_EQ(instruction.m_SamplerDecl.Space, 9u);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER, 7,
+           ENCODE_D3D10_SB_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(
+               D3D10_SB_CONSTANT_BUFFER_IMMEDIATE_INDEXED)),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       103, 2, 6, 256, 10},
+      &instruction, D3D10_SB_VERTEX_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_ConstantBufferDecl.Size, 256u);
+  EXPECT_EQ(instruction.m_ConstantBufferDecl.Space, 10u);
+}
+
+TEST(ShaderBinary, DecodesUavSrvAndSharedMemoryDeclarations) {
+  CInstruction instruction;
+  constexpr UINT resource_flags =
+      D3D11_SB_GLOBALLY_COHERENT_ACCESS |
+      D3D11_SB_RASTERIZER_ORDERED_ACCESS |
+      D3D11_SB_UAV_HAS_ORDER_PRESERVING_COUNTER;
+  constexpr CShaderToken return_types =
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_UNORM, 0) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_UINT, 1) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_SINT, 2) |
+      ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 3);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED, 7,
+           ENCODE_D3D10_SB_RESOURCE_DIMENSION(
+               D3D10_SB_RESOURCE_DIMENSION_TEXTURE3D) |
+               ENCODE_D3D11_SB_RESOURCE_FLAGS(resource_flags)),
+       IndexedOperandToken(D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       201, 0, 7, return_types, 11},
+      &instruction, D3D11_SB_COMPUTE_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_TypedUAVDecl.Dimension,
+            D3D10_SB_RESOURCE_DIMENSION_TEXTURE3D);
+  EXPECT_EQ(instruction.m_TypedUAVDecl.Flags, resource_flags);
+  EXPECT_EQ(instruction.m_TypedUAVDecl.ReturnType[0],
+            D3D10_SB_RETURN_TYPE_UNORM);
+  EXPECT_EQ(instruction.m_TypedUAVDecl.ReturnType[3],
+            D3D10_SB_RETURN_TYPE_FLOAT);
+  EXPECT_EQ(instruction.m_TypedUAVDecl.Space, 11u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW, 6,
+                        ENCODE_D3D11_SB_RESOURCE_FLAGS(resource_flags)),
+       IndexedOperandToken(D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       202, 8, 9, 12},
+      &instruction, D3D11_SB_COMPUTE_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_RawUAVDecl.Flags, resource_flags);
+  EXPECT_EQ(instruction.m_RawUAVDecl.Space, 12u);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED, 7,
+           ENCODE_D3D11_SB_RESOURCE_FLAGS(resource_flags)),
+       IndexedOperandToken(D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       203, 10, 20, 64, 13},
+      &instruction, D3D11_SB_COMPUTE_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_StructuredUAVDecl.Flags, resource_flags);
+  EXPECT_EQ(instruction.m_StructuredUAVDecl.ByteStride, 64u);
+  EXPECT_EQ(instruction.m_StructuredUAVDecl.Space, 13u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_RESOURCE_RAW, 6),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_RESOURCE,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       204, 21, 30, 14},
+      &instruction, D3D11_SB_COMPUTE_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_RawSRVDecl.Space, 14u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED, 7),
+       IndexedOperandToken(D3D10_SB_OPERAND_TYPE_RESOURCE,
+                           D3D10_SB_OPERAND_INDEX_3D),
+       205, 31, 40, 80, 15},
+      &instruction, D3D11_SB_COMPUTE_SHADER, 5, 1);
+  EXPECT_EQ(instruction.m_StructuredSRVDecl.ByteStride, 80u);
+  EXPECT_EQ(instruction.m_StructuredSRVDecl.Space, 15u);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_RAW, 4),
+       IndexedOperandToken(
+           D3D11_SB_OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY),
+       3, 4096},
+      &instruction);
+  EXPECT_EQ(instruction.m_RawTGSMDecl.ByteCount, 4096u);
+
+  ParseSingleInstruction(
+      {InstructionToken(
+           D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED, 5),
+       IndexedOperandToken(
+           D3D11_SB_OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY),
+       4, 32, 128},
+      &instruction);
+  EXPECT_EQ(instruction.m_StructuredTGSMDecl.StructByteStride, 32u);
+  EXPECT_EQ(instruction.m_StructuredTGSMDecl.StructCount, 128u);
+}
+
 } // namespace
