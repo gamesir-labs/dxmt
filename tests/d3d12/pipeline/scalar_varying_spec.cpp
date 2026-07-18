@@ -1,6 +1,8 @@
 #include <dxmt_test.hpp>
 #include <dxmt_test_shader.hpp>
 
+#include <d3d12shader.h>
+
 #include "d3d12_test_context.hpp"
 
 #include <cstring>
@@ -125,6 +127,41 @@ constexpr char kReversedVaryingPixelShader[] = R"(
 float4 main(float2 second : TEXCOORD1,
             float2 first : TEXCOORD0) : SV_Target {
   return float4(first, second);
+}
+)";
+
+constexpr char kPackedVaryingVertexShader[] = R"(
+struct Output {
+  float4 position : SV_Position;
+  float3 first : TEXCOORD0;
+  float packed : COLOR0;
+  float2 boundary : TEXCOORD1;
+};
+
+Output main(uint vertex_id : SV_VertexID) {
+  const float2 positions[3] = {
+    float2(-1.0, -1.0),
+    float2(-1.0,  3.0),
+    float2( 3.0, -1.0)
+  };
+  Output output;
+  output.position = float4(positions[vertex_id], 0.0, 1.0);
+  output.first = float3(0.125, 0.25, 0.5);
+  output.packed = 0.75;
+  output.boundary = float2(0.375, 0.625);
+  return output;
+}
+)";
+
+constexpr char kPackedVaryingPixelShader[] = R"(
+struct Input {
+  float3 first : TEXCOORD0;
+  float packed : COLOR0;
+  float2 boundary : TEXCOORD1;
+};
+
+float4 main(Input input) : SV_Target {
+  return float4(input.first.x, input.packed, input.boundary);
 }
 )";
 
@@ -280,6 +317,55 @@ TEST_F(D3D12ScalarVaryingSpec, RejectsConsumerComponentTypeMismatch) {
 TEST_F(D3D12ScalarVaryingSpec, RejectsReorderedConsumerSignature) {
   ExpectLinkageRejected(kOrderedVaryingVertexShader,
                         kReversedVaryingPixelShader);
+}
+
+TEST_F(D3D12ScalarVaryingSpec,
+       PreservesPackedSemanticsAcrossRegisterBoundary) {
+  const auto vertex = CompileShader(kPackedVaryingVertexShader, "vs_5_0");
+  ASSERT_TRUE(SUCCEEDED(vertex.result)) << vertex.diagnostic_text();
+
+  dxmt::test::ComPtr<ID3D12ShaderReflection> reflection;
+  ASSERT_EQ(D3DReflect(vertex.bytecode->GetBufferPointer(),
+                       vertex.bytecode->GetBufferSize(),
+                       __uuidof(ID3D12ShaderReflection),
+                       reinterpret_cast<void **>(reflection.put())),
+            S_OK);
+  D3D12_SHADER_DESC shader_desc = {};
+  ASSERT_EQ(reflection->GetDesc(&shader_desc), S_OK);
+
+  D3D12_SIGNATURE_PARAMETER_DESC first = {};
+  D3D12_SIGNATURE_PARAMETER_DESC packed = {};
+  D3D12_SIGNATURE_PARAMETER_DESC boundary = {};
+  bool found_first = false;
+  bool found_packed = false;
+  bool found_boundary = false;
+  for (UINT index = 0; index < shader_desc.OutputParameters; ++index) {
+    D3D12_SIGNATURE_PARAMETER_DESC parameter = {};
+    ASSERT_EQ(reflection->GetOutputParameterDesc(index, &parameter), S_OK);
+    if (!std::strcmp(parameter.SemanticName, "TEXCOORD") &&
+        parameter.SemanticIndex == 0) {
+      first = parameter;
+      found_first = true;
+    } else if (!std::strcmp(parameter.SemanticName, "COLOR") &&
+               parameter.SemanticIndex == 0) {
+      packed = parameter;
+      found_packed = true;
+    } else if (!std::strcmp(parameter.SemanticName, "TEXCOORD") &&
+               parameter.SemanticIndex == 1) {
+      boundary = parameter;
+      found_boundary = true;
+    }
+  }
+  ASSERT_TRUE(found_first);
+  ASSERT_TRUE(found_packed);
+  ASSERT_TRUE(found_boundary);
+  EXPECT_EQ(first.Register, packed.Register);
+  EXPECT_EQ(first.Mask & packed.Mask, 0u);
+  EXPECT_EQ(first.Mask | packed.Mask, 0xfu);
+  EXPECT_NE(boundary.Register, first.Register);
+
+  RenderAndExpectCenter(kPackedVaryingVertexShader,
+                        kPackedVaryingPixelShader, 0x9f60bf20u);
 }
 
 } // namespace
