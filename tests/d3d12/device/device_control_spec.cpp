@@ -2,6 +2,8 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <dxgi1_3.h>
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -173,6 +175,85 @@ TEST_F(DeviceControlSpec,
                 D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
                 &identifier),
             D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(DeviceControlSpec, DxgiGpuPriorityRoundTripsAndRejectsInvalidValues) {
+  auto dxgi_device = QueryDevice<IDXGIDevice>();
+  ASSERT_TRUE(dxgi_device);
+
+  INT priority = INT_MAX;
+  EXPECT_EQ(dxgi_device->GetGPUThreadPriority(nullptr), E_POINTER);
+  ASSERT_EQ(dxgi_device->GetGPUThreadPriority(&priority), S_OK);
+  EXPECT_EQ(priority, 0);
+
+  for (const INT valid_priority : {-7, 7, 0}) {
+    ASSERT_EQ(dxgi_device->SetGPUThreadPriority(valid_priority), S_OK);
+    priority = INT_MAX;
+    ASSERT_EQ(dxgi_device->GetGPUThreadPriority(&priority), S_OK);
+    EXPECT_EQ(priority, valid_priority);
+  }
+
+  for (const INT invalid_priority : {-8, 8}) {
+    EXPECT_EQ(dxgi_device->SetGPUThreadPriority(invalid_priority),
+              E_INVALIDARG);
+    priority = INT_MAX;
+    ASSERT_EQ(dxgi_device->GetGPUThreadPriority(&priority), S_OK);
+    EXPECT_EQ(priority, 0);
+  }
+}
+
+TEST_F(DeviceControlSpec, DxgiFrameLatencyEnforcesBoundsAndResetValue) {
+  auto dxgi_device = QueryDevice<IDXGIDevice1>();
+  ASSERT_TRUE(dxgi_device);
+
+  UINT latency = UINT_MAX;
+  EXPECT_EQ(dxgi_device->GetMaximumFrameLatency(nullptr),
+            DXGI_ERROR_INVALID_CALL);
+  ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
+  EXPECT_EQ(latency, 3u);
+
+  for (const UINT valid_latency : {1u, 16u}) {
+    ASSERT_EQ(dxgi_device->SetMaximumFrameLatency(valid_latency), S_OK);
+    latency = UINT_MAX;
+    ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
+    EXPECT_EQ(latency, valid_latency);
+  }
+
+  EXPECT_EQ(dxgi_device->SetMaximumFrameLatency(17),
+            DXGI_ERROR_INVALID_CALL);
+  latency = UINT_MAX;
+  ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
+  EXPECT_EQ(latency, 16u);
+
+  ASSERT_EQ(dxgi_device->SetMaximumFrameLatency(0), S_OK);
+  latency = UINT_MAX;
+  ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
+  EXPECT_EQ(latency, 3u);
+}
+
+TEST_F(DeviceControlSpec, DxgiResourceControlsRejectInvalidInputs) {
+  auto dxgi_device = QueryDevice<IDXGIDevice3>();
+  ASSERT_TRUE(dxgi_device);
+
+  DXGI_RESIDENCY residency = DXGI_RESIDENCY_EVICTED_TO_DISK;
+  IUnknown *unknown = context_.device();
+  EXPECT_EQ(dxgi_device->QueryResourceResidency(nullptr, &residency, 1),
+            E_INVALIDARG);
+  EXPECT_EQ(residency, DXGI_RESIDENCY_EVICTED_TO_DISK);
+  EXPECT_EQ(dxgi_device->QueryResourceResidency(&unknown, nullptr, 1),
+            E_INVALIDARG);
+
+  EXPECT_EQ(dxgi_device->OfferResources(
+                0, nullptr, static_cast<DXGI_OFFER_RESOURCE_PRIORITY>(0)),
+            E_INVALIDARG);
+  EXPECT_EQ(dxgi_device->OfferResources(
+                1, nullptr, DXGI_OFFER_RESOURCE_PRIORITY_NORMAL),
+            E_INVALIDARG);
+  EXPECT_EQ(dxgi_device->ReclaimResources(1, nullptr, nullptr), E_INVALIDARG);
+  EXPECT_EQ(dxgi_device->EnqueueSetEvent(nullptr), E_INVALIDARG);
+
+  dxgi_device->Trim();
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

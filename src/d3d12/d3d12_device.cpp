@@ -3009,20 +3009,26 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT *priority) override {
     if (!priority)
-      return WARN_E_INVALIDARG(__func__);
+      return E_POINTER;
 
     *priority = gpu_thread_priority_;
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
-    maximum_frame_latency_ = max_latency;
+    constexpr UINT kDefaultMaximumFrameLatency = 3;
+    constexpr UINT kMaximumFrameLatency = 16;
+    if (max_latency > kMaximumFrameLatency)
+      return DXGI_ERROR_INVALID_CALL;
+
+    maximum_frame_latency_ = max_latency ? max_latency
+                                         : kDefaultMaximumFrameLatency;
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *max_latency) override {
     if (!max_latency)
-      return WARN_E_INVALIDARG(__func__);
+      return DXGI_ERROR_INVALID_CALL;
 
     *max_latency = maximum_frame_latency_;
     return S_OK;
@@ -3031,11 +3037,25 @@ public:
   HRESULT STDMETHODCALLTYPE
   OfferResources(UINT resource_count, IDXGIResource *const *resources,
                  DXGI_OFFER_RESOURCE_PRIORITY priority) override {
+    if (priority < DXGI_OFFER_RESOURCE_PRIORITY_LOW ||
+        priority > DXGI_OFFER_RESOURCE_PRIORITY_HIGH ||
+        (resource_count && !resources))
+      return WARN_E_INVALIDARG(__func__);
+    for (UINT i = 0; i < resource_count; i++) {
+      if (!resources[i])
+        return WARN_E_INVALIDARG(__func__);
+    }
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE ReclaimResources(UINT resource_count, IDXGIResource *const *resources,
                                              WINBOOL *discarded) override {
+    if (resource_count && !resources)
+      return WARN_E_INVALIDARG(__func__);
+    for (UINT i = 0; i < resource_count; i++) {
+      if (!resources[i])
+        return WARN_E_INVALIDARG(__func__);
+    }
     if (discarded) {
       for (UINT i = 0; i < resource_count; i++)
         discarded[i] = FALSE;
