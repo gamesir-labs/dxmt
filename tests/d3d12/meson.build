@@ -151,6 +151,7 @@ d3d12_unit_suites = {
   'robustness': {
     'sources': files(
       'robustness/descriptor_sequence_fuzz_spec.cpp',
+      'robustness/cross_queue_state_model_spec.cpp',
       'robustness/fault_injection_spec.cpp',
       'robustness/fuzz_spec.cpp',
       'robustness/internal_fault_injection_spec.cpp',
