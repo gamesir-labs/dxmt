@@ -667,6 +667,12 @@ GetTextureSubresourceLayout(WMT::Device device,
 }
 
 static bool
+IsTextureBoxEmpty(const D3D12_BOX &box) {
+  return box.left >= box.right || box.top >= box.bottom ||
+         box.front >= box.back;
+}
+
+static bool
 NormalizeTextureBox(const D3D12_RESOURCE_DESC &desc,
                     const TextureSubresourceLayout &layout,
                     const D3D12_BOX *box, D3D12_BOX &normalized) {
@@ -681,8 +687,7 @@ NormalizeTextureBox(const D3D12_RESOURCE_DESC &desc,
     normalized.back = layout.depth;
   }
 
-  if (normalized.left >= normalized.right || normalized.top >= normalized.bottom ||
-      normalized.front >= normalized.back)
+  if (IsTextureBoxEmpty(normalized))
     return false;
   if (normalized.right > layout.width || normalized.bottom > layout.height ||
       normalized.back > layout.depth)
@@ -1493,6 +1498,8 @@ private:
                                              desc_, dst_sub_resource, layout);
     if (FAILED(hr))
       return hr;
+    if (dst_box && IsTextureBoxEmpty(*dst_box))
+      return S_OK;
 
     D3D12_BOX box = {};
     if (!NormalizeTextureBox(desc_, layout, dst_box, box))
@@ -1533,6 +1540,8 @@ private:
                                              desc_, src_sub_resource, layout);
     if (FAILED(hr))
       return hr;
+    if (src_box && IsTextureBoxEmpty(*src_box))
+      return S_OK;
 
     D3D12_BOX box = {};
     if (!NormalizeTextureBox(desc_, layout, src_box, box))

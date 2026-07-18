@@ -246,6 +246,108 @@ TEST_F(D3D12ResourceSpec, CopiesPaddedThreeDimensionalSubresourceRows) {
 }
 
 TEST_F(D3D12ResourceSpec,
+       HonorsEmptyBoxesAndRejectsInvalidSubresourceCopies) {
+  D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
+  if (FAILED(context_.device()->CheckFeatureSupport(
+          D3D12_FEATURE_ARCHITECTURE, &architecture,
+          sizeof(architecture))) ||
+      !architecture.UMA)
+    GTEST_SKIP() << "CPU-visible custom textures require UMA";
+
+  D3D12_HEAP_PROPERTIES heap_properties = {};
+  heap_properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+  heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  heap_properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  heap_properties.CreationNodeMask = 1;
+  heap_properties.VisibleNodeMask = 1;
+  constexpr UINT width = 4;
+  constexpr UINT height = 3;
+  const D3D12_RESOURCE_DESC desc = Texture2DDesc(
+      width, height, DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE);
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_EQ(context_.device()->CreateCommittedResource(
+                &heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                __uuidof(ID3D12Resource),
+                reinterpret_cast<void **>(texture.put())),
+            S_OK);
+  ASSERT_TRUE(texture);
+  ASSERT_EQ(texture->Map(0, nullptr, nullptr), S_OK);
+
+  std::array<std::uint8_t, width * height> baseline = {};
+  for (UINT i = 0; i < baseline.size(); ++i)
+    baseline[i] = static_cast<std::uint8_t>(i + 1);
+  ASSERT_EQ(texture->WriteToSubresource(
+                0, nullptr, baseline.data(), width, baseline.size()),
+            S_OK);
+
+  std::array<std::uint8_t, width * height> poison = {};
+  poison.fill(0xff);
+  constexpr std::array<D3D12_BOX, 3> empty_boxes = {
+      D3D12_BOX{1, 0, 0, 1, height, 1},
+      D3D12_BOX{0, 2, 0, width, 2, 1},
+      D3D12_BOX{0, 0, 0, width, height, 0},
+  };
+  for (const D3D12_BOX &box : empty_boxes) {
+    EXPECT_EQ(texture->WriteToSubresource(
+                  0, &box, poison.data(), width, poison.size()),
+              S_OK);
+    std::array<std::uint8_t, width * height> empty_read = {};
+    empty_read.fill(0xa5);
+    const auto expected_empty_read = empty_read;
+    EXPECT_EQ(texture->ReadFromSubresource(
+                  empty_read.data(), width, empty_read.size(), 0, &box),
+              S_OK);
+    EXPECT_EQ(empty_read, expected_empty_read);
+  }
+
+  constexpr D3D12_BOX out_of_bounds = {0, 0, 0, width + 1, height, 1};
+  EXPECT_EQ(texture->WriteToSubresource(
+                0, nullptr, nullptr, width, baseline.size()),
+            E_POINTER);
+  EXPECT_EQ(texture->ReadFromSubresource(
+                nullptr, width, baseline.size(), 0, nullptr),
+            E_POINTER);
+  EXPECT_EQ(texture->WriteToSubresource(
+                1, nullptr, poison.data(), width, poison.size()),
+            E_INVALIDARG);
+  EXPECT_EQ(texture->ReadFromSubresource(
+                poison.data(), width, poison.size(), 1, nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(texture->WriteToSubresource(
+                0, &out_of_bounds, poison.data(), width, poison.size()),
+            E_INVALIDARG);
+  EXPECT_EQ(texture->WriteToSubresource(
+                0, nullptr, poison.data(), width - 1, poison.size()),
+            E_INVALIDARG);
+  EXPECT_EQ(texture->WriteToSubresource(
+                0, nullptr, poison.data(), width, baseline.size() - 1),
+            E_INVALIDARG);
+
+  std::array<std::uint8_t, width * height> readback = {};
+  readback.fill(0xa5);
+  const auto failed_read_sentinel = readback;
+  EXPECT_EQ(texture->ReadFromSubresource(
+                readback.data(), width, readback.size(), 0, &out_of_bounds),
+            E_INVALIDARG);
+  EXPECT_EQ(readback, failed_read_sentinel);
+  EXPECT_EQ(texture->ReadFromSubresource(
+                readback.data(), width - 1, readback.size(), 0, nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(readback, failed_read_sentinel);
+  EXPECT_EQ(texture->ReadFromSubresource(
+                readback.data(), width, readback.size() - 1, 0, nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(readback, failed_read_sentinel);
+
+  ASSERT_EQ(texture->ReadFromSubresource(
+                readback.data(), width, readback.size(), 0, nullptr),
+            S_OK);
+  EXPECT_EQ(readback, baseline);
+  texture->Unmap(0, nullptr);
+}
+
+TEST_F(D3D12ResourceSpec,
        CopiesSubresourcesWhileUnrelatedQueueSubmissionsProgress) {
   D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
   if (FAILED(context_.device()->CheckFeatureSupport(
