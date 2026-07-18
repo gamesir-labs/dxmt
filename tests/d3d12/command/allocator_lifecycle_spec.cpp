@@ -2,6 +2,8 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <cstdint>
+
 namespace {
 
 using dxmt::test::ComPtr;
@@ -21,6 +23,39 @@ TEST_F(CommandAllocatorLifecycleSpec, ResetAfterCreationSucceeds) {
       reinterpret_cast<void **>(allocator.put()))));
 
   EXPECT_TRUE(SUCCEEDED(allocator->Reset()));
+}
+
+TEST_F(CommandAllocatorLifecycleSpec,
+       CreationRejectsInvalidInputsAndRecovers) {
+  const GUID unsupported = {0x2d810dee,
+                            0xa9d1,
+                            0x4d0d,
+                            {0x9f, 0xe4, 0x88, 0xa8, 0x70, 0x27, 0xd9, 0xb3}};
+  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(context_.device()->CreateCommandAllocator(
+                static_cast<D3D12_COMMAND_LIST_TYPE>(UINT_MAX),
+                __uuidof(ID3D12CommandAllocator), &output),
+            E_INVALIDARG);
+  EXPECT_EQ(output, nullptr);
+
+  output = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, unsupported, &output),
+            E_NOINTERFACE);
+  EXPECT_EQ(output, nullptr);
+  EXPECT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                __uuidof(ID3D12CommandAllocator), nullptr),
+            E_POINTER);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_TRUE(allocator);
+  EXPECT_EQ(allocator->Reset(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(CommandAllocatorLifecycleSpec, ResetWhileRecordingFails) {
