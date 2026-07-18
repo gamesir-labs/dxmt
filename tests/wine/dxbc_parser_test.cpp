@@ -245,8 +245,11 @@ TEST(DxbcContainer, EnumeratesAndSearchesContiguousParts) {
   microsoft::CDXBCParser parser;
   ASSERT_EQ(parser.ReadDXBC(bytes.data(), bytes.size()), S_OK);
   ASSERT_NE(parser.GetVersion(), nullptr);
+  ASSERT_NE(parser.GetHash(), nullptr);
   EXPECT_EQ(parser.GetVersion()->Major, DXBC_MAJOR_VERSION);
   EXPECT_EQ(parser.GetVersion()->Minor, DXBC_MINOR_VERSION);
+  EXPECT_EQ(microsoft::DXBCGetSizeAssumingValidPointer(bytes.data()),
+            bytes.size());
   EXPECT_EQ(parser.GetBlobCount(), 3u);
   EXPECT_EQ(parser.GetBlobFourCC(1), microsoft::DXBC_ShaderFeatureInfo);
   EXPECT_EQ(parser.GetBlobSize(0), 4u);
@@ -808,6 +811,101 @@ TEST(DxbcSignature, SupportsReferencedStringsAndExternalParameterStorage) {
   EXPECT_EQ(parser.GetNumParameters(), 0u);
   name0[0] = 'Y';
   EXPECT_EQ(name0[0], 'Y');
+}
+
+TEST(DxbcSignature, CoversPublicLookupAndExternalStorageBoundaries) {
+  std::array<char, 6> name = {'V', 'A', 'L', 'U', 'E', 0};
+  std::array<microsoft::D3D11_SIGNATURE_PARAMETER, 1> external = {{
+      {.Stream = 2,
+       .SemanticName = name.data(),
+       .SemanticIndex = 3,
+       .SystemValue = microsoft::D3D10_SB_NAME_POSITION,
+       .ComponentType = microsoft::D3D10_SB_REGISTER_COMPONENT_FLOAT32,
+       .Register = 7,
+       .Mask = 0xf,
+       .NeverWrites_Mask = 0,
+       .MinPrecision = D3D_MIN_PRECISION_FLOAT_16},
+  }};
+  constexpr UINT value_sum = 'v' + 'a' + 'l' + 'u' + 'e';
+  std::array<UINT, 1> sums = {value_sum};
+
+  microsoft::CSignatureParser parser;
+  ASSERT_EQ(parser.ReadSignature11_1(external.data(), sums.data(),
+                                     external.size()),
+            S_OK);
+  const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+  ASSERT_EQ(parser.GetParameters(&parameters), 1u);
+  EXPECT_EQ(parameters, external.data());
+  EXPECT_EQ(parser.GetSemanticNameCharSum(0), value_sum);
+
+  microsoft::D3D11_SIGNATURE_PARAMETER *found =
+      reinterpret_cast<microsoft::D3D11_SIGNATURE_PARAMETER *>(1);
+  EXPECT_EQ(parser.FindParameter("missing", 3, &found), E_FAIL);
+  EXPECT_EQ(found, nullptr);
+  EXPECT_EQ(parser.FindParameter("value", 99, nullptr), E_FAIL);
+  EXPECT_EQ(parser.FindParameter("value", 3, nullptr), S_OK);
+
+  UINT found_register = 0;
+  EXPECT_EQ(parser.FindParameterRegister("missing", 3, &found_register),
+            E_FAIL);
+  EXPECT_EQ(parser.FindParameterRegister(nullptr, 3, &found_register), E_FAIL);
+  EXPECT_EQ(parser.FindParameterRegister("value", 3, nullptr), S_OK);
+
+  microsoft::CSignatureParser5 streams;
+  const auto signature = SignatureBuilder().add("POSITION", 1).build();
+  ASSERT_EQ(streams.ReadSignature4(signature.data(), signature.size()), S_OK);
+  EXPECT_EQ(streams.GetTotalParameters(), 1u);
+  EXPECT_EQ(streams.ReadSignature4(nullptr, 0), E_FAIL);
+  EXPECT_EQ(streams.GetTotalParameters(), 0u);
+  EXPECT_EQ(streams.NumStreams(), 0u);
+}
+
+TEST(DxbcSignature, RejectsNullContainersAndEveryEmptySignaturePart) {
+  microsoft::CSignatureParser flat;
+  microsoft::CSignatureParser5 streams;
+  EXPECT_EQ(microsoft::DXBCGetInputSignature(nullptr, &flat), E_FAIL);
+  EXPECT_EQ(microsoft::DXBCGetOutputSignature(nullptr, &flat), E_FAIL);
+  EXPECT_EQ(microsoft::DXBCGetOutputSignature(nullptr, &streams), E_FAIL);
+  EXPECT_EQ(microsoft::DXBCGetPatchConstantSignature(nullptr, &flat), E_FAIL);
+
+  constexpr std::array<microsoft::DXBCFourCC, 7> signature_parts = {
+      microsoft::DXBC_InputSignature11_1,
+      microsoft::DXBC_InputSignature,
+      microsoft::DXBC_OutputSignature11_1,
+      microsoft::DXBC_OutputSignature,
+      microsoft::DXBC_OutputSignature5,
+      microsoft::DXBC_PatchConstantSignature11_1,
+      microsoft::DXBC_PatchConstantSignature,
+  };
+  for (const auto part : signature_parts) {
+    const auto container = DxbcContainerBuilder().add(part, {}).build();
+    switch (part) {
+    case microsoft::DXBC_InputSignature11_1:
+    case microsoft::DXBC_InputSignature:
+      EXPECT_EQ(microsoft::DXBCGetInputSignature(container.data(), &flat),
+                E_FAIL);
+      break;
+    case microsoft::DXBC_OutputSignature11_1:
+    case microsoft::DXBC_OutputSignature:
+      EXPECT_EQ(microsoft::DXBCGetOutputSignature(container.data(), &flat),
+                E_FAIL);
+      EXPECT_EQ(microsoft::DXBCGetOutputSignature(container.data(), &streams),
+                E_FAIL);
+      break;
+    case microsoft::DXBC_OutputSignature5:
+      EXPECT_EQ(microsoft::DXBCGetOutputSignature(container.data(), &streams),
+                E_FAIL);
+      break;
+    case microsoft::DXBC_PatchConstantSignature11_1:
+    case microsoft::DXBC_PatchConstantSignature:
+      EXPECT_EQ(microsoft::DXBCGetPatchConstantSignature(container.data(),
+                                                          &flat),
+                E_FAIL);
+      break;
+    default:
+      FAIL();
+    }
+  }
 }
 
 TEST(DxbcSignature, ChecksEveryLinkageCompatibilityField) {
