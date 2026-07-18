@@ -39,6 +39,9 @@ std::optional<std::filesystem::path> DiscoverConfigPath(
 std::filesystem::path CcacheRoot(
     const std::filesystem::path &managed_root,
     std::string_view profile_namespace);
+std::filesystem::path StagedInstallRoot(
+    const std::filesystem::path &stage_dir,
+    const std::filesystem::path &install_prefix);
 void WriteFileAtomic(const std::filesystem::path &path, std::string_view contents);
 void WithFileLock(const std::filesystem::path &path,
                   const std::function<void()> &operation);

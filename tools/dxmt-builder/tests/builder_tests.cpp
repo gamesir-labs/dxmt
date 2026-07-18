@@ -97,6 +97,13 @@ int main() {
     Check(testing::DiscoverConfigPath(repo, explicit_config) ==
               std::filesystem::absolute(explicit_config).lexically_normal(),
           "explicit builder config did not override the checkout default");
+    const auto stage = temp / "runtime-stage";
+    Check(testing::StagedInstallRoot(stage, "/usr/local") ==
+              stage / "usr/local",
+          "absolute Meson prefix escaped the runtime stage");
+    Check(testing::StagedInstallRoot(stage, "custom/prefix") ==
+              stage / "custom/prefix",
+          "relative Meson prefix was not preserved under the runtime stage");
 
     const auto atomic_file = temp / "atomic.txt";
     testing::WriteFileAtomic(atomic_file, "complete");

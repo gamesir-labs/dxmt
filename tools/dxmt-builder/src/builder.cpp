@@ -1494,7 +1494,7 @@ private:
     if (prefix.empty())
       prefix = "/usr/local";
 
-    const auto runtime_root = stage_dir / prefix;
+    const auto runtime_root = testing::StagedInstallRoot(stage_dir, prefix);
     fs::create_directories(runtime_root / "x86_64-windows");
     fs::create_directories(runtime_root / "x86_64-unix");
 
@@ -2035,6 +2035,15 @@ std::optional<std::filesystem::path> DiscoverConfigPath(
     const std::filesystem::path &repo_root,
     const std::optional<std::filesystem::path> &requested) {
   return dxmt::builder::DiscoverConfigPath(repo_root, requested);
+}
+
+std::filesystem::path StagedInstallRoot(
+    const std::filesystem::path &stage_dir,
+    const std::filesystem::path &install_prefix) {
+  const auto relative_prefix = install_prefix.is_absolute()
+                                   ? install_prefix.relative_path()
+                                   : install_prefix;
+  return (stage_dir / relative_prefix).lexically_normal();
 }
 
 void WriteFileAtomic(const fs::path &path, std::string_view contents) {
