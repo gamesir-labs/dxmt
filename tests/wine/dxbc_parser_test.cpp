@@ -8,7 +8,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -207,6 +209,71 @@ TEST(DxbcContainer, AcceptsAnEmptyContainer) {
   microsoft::CDXBCParser parser;
   EXPECT_EQ(parser.ReadDXBCAssumingValidSize(bytes.data()), S_OK);
   EXPECT_EQ(parser.GetBlobCount(), 0u);
+}
+
+TEST(DxbcContainer, AcceptsUnknownAndDuplicatePartKinds) {
+  constexpr auto unknown =
+      static_cast<microsoft::DXBCFourCC>(0x5a5a5a5au);
+  const auto bytes = DxbcContainerBuilder()
+                         .add(unknown, {1, 2})
+                         .add(microsoft::DXBC_ShaderFeatureInfo, {3})
+                         .add(microsoft::DXBC_ShaderFeatureInfo, {4, 5})
+                         .build();
+
+  microsoft::CDXBCParser parser;
+  ASSERT_EQ(parser.ReadDXBC(bytes.data(), bytes.size()), S_OK);
+  ASSERT_EQ(parser.GetBlobCount(), 3u);
+  EXPECT_EQ(parser.GetBlobFourCC(0), static_cast<uint32_t>(unknown));
+  EXPECT_EQ(parser.FindNextMatchingBlob(microsoft::DXBC_ShaderFeatureInfo),
+            1u);
+  EXPECT_EQ(
+      parser.FindNextMatchingBlob(microsoft::DXBC_ShaderFeatureInfo, 2), 2u);
+}
+
+TEST(DxbcContainer, RejectsAliasedAndOverflowingBlobRanges) {
+  const auto seed = DxbcContainerBuilder().build();
+  microsoft::CDXBCParser parser;
+  const auto expect_rejected = [&](std::string_view case_name,
+                                   const std::vector<uint8_t> &bytes) {
+    SCOPED_TRACE(case_name);
+    ASSERT_EQ(parser.ReadDXBC(seed.data(), seed.size()), S_OK);
+    EXPECT_EQ(parser.ReadDXBC(bytes.data(), bytes.size()), E_FAIL);
+    EXPECT_EQ(parser.GetBlobCount(), 0u);
+    EXPECT_EQ(parser.GetVersion(), nullptr);
+  };
+
+  auto bytes = DxbcContainerBuilder()
+                   .add(microsoft::DXBC_GenericShader, {1, 2, 3, 4})
+                   .add(microsoft::DXBC_ShaderFeatureInfo, {5, 6, 7, 8})
+                   .build();
+  uint32_t first_offset = 0;
+  std::memcpy(&first_offset, bytes.data() + sizeof(microsoft::DXBCHeader),
+              sizeof(first_offset));
+  Store<uint32_t>(bytes, sizeof(microsoft::DXBCHeader) + sizeof(uint32_t),
+                  first_offset);
+  expect_rejected("aliased blob", bytes);
+
+  bytes = DxbcContainerBuilder()
+              .add(microsoft::DXBC_GenericShader, {1, 2, 3, 4})
+              .build();
+  std::memcpy(&first_offset, bytes.data() + sizeof(microsoft::DXBCHeader),
+              sizeof(first_offset));
+  Store<uint32_t>(bytes,
+                  first_offset + offsetof(microsoft::DXBCBlobHeader, BlobSize),
+                  std::numeric_limits<uint32_t>::max());
+  expect_rejected("blob size overflow", bytes);
+
+  bytes = DxbcContainerBuilder()
+              .add(microsoft::DXBC_GenericShader, {1, 2, 3, 4})
+              .build();
+  Store<uint32_t>(bytes, sizeof(microsoft::DXBCHeader),
+                  std::numeric_limits<uint32_t>::max());
+  expect_rejected("blob offset overflow", bytes);
+
+  bytes = DxbcContainerBuilder().build();
+  Store<uint32_t>(bytes, offsetof(microsoft::DXBCHeader, BlobCount),
+                  std::numeric_limits<uint32_t>::max());
+  expect_rejected("blob count overflow", bytes);
 }
 
 TEST(DxbcContainer, RelocatesPointersWhenBackingStorageMoves) {

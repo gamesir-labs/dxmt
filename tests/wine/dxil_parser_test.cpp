@@ -230,6 +230,59 @@ TEST(DxilContainer, ResetsStateBeforeRejectingMalformedInput) {
   EXPECT_TRUE(parser.container().parts.empty());
 }
 
+TEST(DxilContainer, RejectsEveryTruncatedHeaderAndIndexOverflow) {
+  using namespace dxmt::dxil;
+  const auto valid = DxilContainerBuilder().build();
+  for (size_t size = 0; size < kContainerHeaderSize; ++size) {
+    SCOPED_TRACE(size);
+    Parser parser;
+    EXPECT_EQ(parser.parseContainerOnly(valid.data(), size),
+              ParseStatus::Truncated);
+  }
+
+  auto malformed = valid;
+  Store<uint32_t>(malformed, 24, kContainerHeaderSize - 1);
+  Parser parser;
+  EXPECT_EQ(parser.parseContainerOnly(malformed),
+            ParseStatus::InvalidContainerSize);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, 28,
+                  std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(parser.parseContainerOnly(malformed),
+            ParseStatus::InvalidContainerSize);
+}
+
+TEST(DxilContainer, AcceptsReorderedPartsAndRejectsPartialOverlap) {
+  using namespace dxmt::dxil;
+  auto bytes = DxilContainerBuilder()
+                   .add(fourcc::PrivateData, std::vector<uint8_t>(16))
+                   .add(fourcc::FeatureInfo, std::vector<uint8_t>(8))
+                   .build();
+  uint32_t first_offset = 0;
+  uint32_t second_offset = 0;
+  std::memcpy(&first_offset, bytes.data() + kContainerHeaderSize,
+              sizeof(first_offset));
+  std::memcpy(&second_offset,
+              bytes.data() + kContainerHeaderSize + sizeof(uint32_t),
+              sizeof(second_offset));
+  Store<uint32_t>(bytes, kContainerHeaderSize, second_offset);
+  Store<uint32_t>(bytes, kContainerHeaderSize + sizeof(uint32_t),
+                  first_offset);
+
+  ContainerInfo info;
+  ASSERT_EQ(ParseContainer(bytes.data(), bytes.size(), info), ParseStatus::Ok);
+  ASSERT_EQ(info.parts.size(), 2u);
+  EXPECT_EQ(info.parts[0].fourcc, fourcc::FeatureInfo);
+  EXPECT_EQ(info.parts[1].fourcc, fourcc::PrivateData);
+
+  Store<uint32_t>(bytes, kContainerHeaderSize, first_offset);
+  Store<uint32_t>(bytes, kContainerHeaderSize + sizeof(uint32_t),
+                  first_offset + kPartHeaderSize);
+  EXPECT_EQ(ParseContainer(bytes.data(), bytes.size(), info),
+            ParseStatus::InvalidPartOffset);
+}
+
 TEST(DxilProgram, ParsesShaderVersionAndBitcodeRange) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(kDxilProgramHeaderSize + 4);
