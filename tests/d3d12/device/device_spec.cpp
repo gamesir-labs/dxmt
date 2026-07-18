@@ -636,6 +636,9 @@ TEST_F(D3D12DeviceSpec, PipelineLibraryResultMatchesShaderCacheCapability) {
                 reinterpret_cast<void **>(&library)),
             DXGI_ERROR_UNSUPPORTED);
   EXPECT_EQ(library, nullptr);
+  EXPECT_EQ(device1->CreatePipelineLibrary(
+                nullptr, 0, __uuidof(ID3D12PipelineLibrary), nullptr),
+            DXGI_ERROR_UNSUPPORTED);
 
   const std::array<std::uint8_t, 8> invalid_blob = {
       0x44, 0x58, 0x4d, 0x54, 0xde, 0xad, 0xbe, 0xef};
@@ -645,6 +648,10 @@ TEST_F(D3D12DeviceSpec, PipelineLibraryResultMatchesShaderCacheCapability) {
                 reinterpret_cast<void **>(&library)),
             DXGI_ERROR_UNSUPPORTED);
   EXPECT_EQ(library, nullptr);
+  EXPECT_EQ(device1->CreatePipelineLibrary(
+                invalid_blob.data(), invalid_blob.size(),
+                __uuidof(ID3D12PipelineLibrary), nullptr),
+            DXGI_ERROR_UNSUPPORTED);
   release_object(device1);
 #endif
 }

@@ -4841,8 +4841,6 @@ public:
                                                   REFIID iid,
                                                   void **lib) override {
     InitReturnPtr(lib);
-    if (!lib)
-      return E_POINTER;
     (void)blob;
     (void)blob_size;
     (void)iid;
