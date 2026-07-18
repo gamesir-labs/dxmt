@@ -270,6 +270,109 @@ TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsTrianglePrimitive) {
   DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
+TEST_F(ShaderAdvancedStageSpec, GeometryShaderUsesPrimitiveIdAcrossInputs) {
+  const auto vs = CompileShader(R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      return float4(0.0, 0.0, 0.0, 1.0);
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    [maxvertexcount(3)]
+    void main(triangle Data input[3], uint primitive_id : SV_PrimitiveID,
+              inout TriangleStream<Data> stream) {
+      if (primitive_id != 1)
+        return;
+      Data output;
+      output.position = float4(-1.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(-1.0, 3.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(3.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 6);
+}
+
+TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsAfterRestartStrip) {
+  const auto vs = CompileShader(R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      return float4(0.0, 0.0, 0.0, 1.0);
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    [maxvertexcount(6)]
+    void main(point Data input[1], inout TriangleStream<Data> stream) {
+      Data output;
+      output.position = float4(2.0, 2.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(2.0, 3.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(3.0, 2.0, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+
+      output.position = float4(-1.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(-1.0, 3.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(3.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_POINTLIST, 1);
+}
+
+TEST_F(ShaderAdvancedStageSpec, GeometryShaderAcceptsMetalVertexLimit) {
+  const auto vs = CompileShader(R"(
+    float4 main(uint id : SV_VertexID) : SV_Position {
+      return float4(0.0, 0.0, 0.0, 1.0);
+    })",
+                                "vs_5_0");
+  const auto gs = CompileShader(R"(
+    struct Data { float4 position : SV_Position; };
+    [maxvertexcount(256)]
+    void main(point Data input[1], inout TriangleStream<Data> stream) {
+      Data output;
+      output.position = float4(-1.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(-1.0, 3.0, 0.0, 1.0);
+      stream.Append(output);
+      output.position = float4(3.0, -1.0, 0.0, 1.0);
+      stream.Append(output);
+      stream.RestartStrip();
+    })",
+                                "gs_5_0");
+  const auto ps =
+      CompileShader("float4 main() : SV_Target { return 1.0.xxxx; }", "ps_5_0");
+  ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
+  ASSERT_EQ(gs.result, S_OK) << gs.diagnostic_text();
+  ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
+  auto pipeline = CreatePipeline(vs, ps, &gs, nullptr, nullptr,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+  ASSERT_TRUE(pipeline);
+  DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_POINTLIST, 1);
+}
+
 TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateTriangle) {
   const auto vs = CompileShader(R"(
     struct Control { float2 position : POSITION; };
