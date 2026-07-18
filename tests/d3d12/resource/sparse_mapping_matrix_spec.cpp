@@ -170,6 +170,43 @@ protected:
     return heap;
   }
 
+  ComPtr<ID3D12Resource> CreateBuffer(UINT tile_count,
+                                     D3D12_RESOURCE_STATES state) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = UINT64(tile_count) * kTileSize;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> resource;
+    EXPECT_EQ(context_.device()->CreateReservedResource(
+                  &desc, state, nullptr, IID_PPV_ARGS(resource.put())),
+              S_OK);
+    return resource;
+  }
+
+  ComPtr<ID3D12Heap> CreateBufferBacking(UINT tile_count) {
+    D3D12_HEAP_DESC desc = {};
+    desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.SizeInBytes = UINT64(tile_count) * kTileSize;
+    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ComPtr<ID3D12Heap> heap;
+    EXPECT_EQ(context_.device()->CreateHeap(&desc, IID_PPV_ARGS(heap.put())),
+              S_OK);
+    return heap;
+  }
+
+  void AliasingBarrier(ID3D12Resource *before, ID3D12Resource *after) {
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    barrier.Aliasing.pResourceBefore = before;
+    barrier.Aliasing.pResourceAfter = after;
+    context_.list()->ResourceBarrier(1, &barrier);
+  }
+
   void MapRange(ID3D12Resource *resource, ID3D12Heap *heap, UINT x,
                 UINT tile_count, D3D12_TILE_RANGE_FLAGS flag,
                 UINT heap_offset = 0) {
@@ -277,6 +314,159 @@ TEST_F(SparseMappingMatrixSpec, ReuseSinglePhysicalTileAliasesVirtualTiles) {
   const auto actual =
       ReadTile(texture.get(), 1, D3D12_RESOURCE_STATE_COPY_DEST);
   EXPECT_EQ(actual, expected);
+}
+
+TEST_F(SparseMappingMatrixSpec,
+       MapsDisjointFirstAndLastBufferTilesInSingleUpdate) {
+  constexpr UINT tile_count = 8;
+  auto buffer = CreateBuffer(tile_count, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(2);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+
+  const std::array<D3D12_TILED_RESOURCE_COORDINATE, 2> coordinates = {
+      D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0},
+      D3D12_TILED_RESOURCE_COORDINATE{tile_count - 1, 0, 0, 0}};
+  std::array<D3D12_TILE_REGION_SIZE, 2> regions = {};
+  regions[0].NumTiles = 1;
+  regions[1].NumTiles = 1;
+  const std::array<D3D12_TILE_RANGE_FLAGS, 2> range_flags = {
+      D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_RANGE_FLAG_NONE};
+  const std::array<UINT, 2> heap_offsets = {0, 1};
+  const std::array<UINT, 2> range_counts = {1, 1};
+  context_.queue()->UpdateTileMappings(
+      buffer.get(), coordinates.size(), coordinates.data(), regions.data(),
+      heap.get(), range_flags.size(), range_flags.data(), heap_offsets.data(),
+      range_counts.data(), D3D12_TILE_MAPPING_FLAG_NONE);
+
+  std::vector<std::uint8_t> first(kTileSize);
+  std::vector<std::uint8_t> last(kTileSize);
+  for (UINT64 i = 0; i < kTileSize; ++i) {
+    first[i] = static_cast<std::uint8_t>((i * 11 + 3) & 0xff);
+    last[i] = static_cast<std::uint8_t>((i * 47 + 19) & 0xff);
+  }
+  WriteTile(buffer.get(), 0, first);
+  WriteTile(buffer.get(), tile_count - 1, last);
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST), first);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), tile_count - 1,
+                     D3D12_RESOURCE_STATE_COPY_SOURCE),
+            last);
+}
+
+TEST_F(SparseMappingMatrixSpec, MapsMoreThanThirtyTwoDisjointRanges) {
+  constexpr UINT tile_count = 40;
+  constexpr UINT observed_tile = tile_count - 1;
+  auto target = CreateBuffer(tile_count, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto probe = CreateBuffer(tile_count, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto baseline = CreateBufferBacking(tile_count);
+  auto replacement = CreateBufferBacking(tile_count);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(probe);
+  ASSERT_TRUE(baseline);
+  ASSERT_TRUE(replacement);
+  MapRange(target.get(), baseline.get(), 0, tile_count,
+           D3D12_TILE_RANGE_FLAG_NONE);
+  MapRange(probe.get(), replacement.get(), 0, tile_count,
+           D3D12_TILE_RANGE_FLAG_NONE);
+
+  std::vector<std::uint8_t> initial(kTileSize, 0x2d);
+  WriteTile(probe.get(), observed_tile, initial);
+  D3D12TestContext::Transition(
+      context_.list(), probe.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::array<D3D12_TILED_RESOURCE_COORDINATE, tile_count> coordinates = {};
+  std::array<D3D12_TILE_RANGE_FLAGS, tile_count> range_flags = {};
+  std::array<UINT, tile_count> heap_offsets = {};
+  std::array<UINT, tile_count> range_counts = {};
+  for (UINT i = 0; i < tile_count; ++i) {
+    coordinates[i].X = i;
+    range_flags[i] = D3D12_TILE_RANGE_FLAG_NONE;
+    heap_offsets[i] = i;
+    range_counts[i] = 1;
+  }
+  context_.queue()->UpdateTileMappings(
+      target.get(), tile_count, coordinates.data(), nullptr,
+      replacement.get(), tile_count, range_flags.data(), heap_offsets.data(),
+      range_counts.data(), D3D12_TILE_MAPPING_FLAG_NONE);
+
+  std::vector<std::uint8_t> expected(kTileSize);
+  for (UINT64 i = 0; i < kTileSize; ++i)
+    expected[i] = static_cast<std::uint8_t>((i * 67 + 31) & 0xff);
+  WriteTile(target.get(), observed_tile, expected);
+  AliasingBarrier(target.get(), probe.get());
+  EXPECT_EQ(ReadTile(probe.get(), observed_tile,
+                     D3D12_RESOURCE_STATE_COPY_SOURCE),
+            expected);
+}
+
+TEST_F(SparseMappingMatrixSpec,
+       RemapsTileAcrossHeapOffsetsWithoutLosingPhysicalContents) {
+  auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(2);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+
+  std::vector<std::uint8_t> first(kTileSize);
+  std::vector<std::uint8_t> second(kTileSize);
+  for (UINT64 i = 0; i < kTileSize; ++i) {
+    first[i] = static_cast<std::uint8_t>((i * 13 + 7) & 0xff);
+    second[i] = static_cast<std::uint8_t>((i * 59 + 41) & 0xff);
+  }
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE, 0);
+  WriteTile(buffer.get(), 0, first);
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE, 1);
+  WriteTile(buffer.get(), 0, second);
+
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE, 0);
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST), first);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE, 1);
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            second);
+}
+
+TEST_F(SparseMappingMatrixSpec,
+       InvalidLaterRegionDoesNotPublishEarlierRemap) {
+  auto target = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto probe = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto original = CreateBufferBacking(1);
+  auto replacement = CreateBufferBacking(2);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(probe);
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(replacement);
+  MapRange(target.get(), original.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  MapRange(probe.get(), original.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+
+  std::vector<std::uint8_t> initial(kTileSize, 0x6b);
+  WriteTile(target.get(), 0, initial);
+
+  const std::array<D3D12_TILED_RESOURCE_COORDINATE, 2> coordinates = {
+      D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0},
+      D3D12_TILED_RESOURCE_COORDINATE{1, 0, 0, 0}};
+  std::array<D3D12_TILE_REGION_SIZE, 2> regions = {};
+  regions[0].NumTiles = 1;
+  regions[1].NumTiles = 1;
+  const std::array<D3D12_TILE_RANGE_FLAGS, 2> range_flags = {
+      D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_RANGE_FLAG_NONE};
+  const std::array<UINT, 2> heap_offsets = {0, 1};
+  const std::array<UINT, 2> range_counts = {1, 1};
+  context_.queue()->UpdateTileMappings(
+      target.get(), coordinates.size(), coordinates.data(), regions.data(),
+      replacement.get(), range_flags.size(), range_flags.data(),
+      heap_offsets.data(), range_counts.data(),
+      D3D12_TILE_MAPPING_FLAG_NONE);
+
+  std::vector<std::uint8_t> expected(kTileSize);
+  for (UINT64 i = 0; i < kTileSize; ++i)
+    expected[i] = static_cast<std::uint8_t>((i * 71 + 37) & 0xff);
+  WriteTile(target.get(), 0, expected);
+  AliasingBarrier(target.get(), probe.get());
+  EXPECT_EQ(ReadTile(probe.get(), 0, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(SparseMappingMatrixSpec, SkipRangePreservesExistingMapping) {
