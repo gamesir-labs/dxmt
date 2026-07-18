@@ -30,6 +30,52 @@ protected:
   D3D12TestContext context_;
 };
 
+TEST(DescriptorHeapCapabilitySpec, ValidatesWithoutCreatingObjects) {
+  D3D12TestContext context;
+  ASSERT_EQ(context.InitializeSharedDevice("descriptor-heap-capability"),
+            S_OK);
+
+  constexpr std::array valid_cases = {
+      D3D12_DESCRIPTOR_HEAP_DESC{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                 D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0},
+      D3D12_DESCRIPTOR_HEAP_DESC{
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1},
+      D3D12_DESCRIPTOR_HEAP_DESC{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1,
+                                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0},
+      D3D12_DESCRIPTOR_HEAP_DESC{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                 D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0},
+      D3D12_DESCRIPTOR_HEAP_DESC{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
+                                 D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1},
+  };
+  for (const auto &desc : valid_cases) {
+    EXPECT_EQ(context.device()->CreateDescriptorHeap(
+                  &desc, __uuidof(ID3D12DescriptorHeap), nullptr),
+              S_FALSE)
+        << "type " << static_cast<UINT>(desc.Type) << " flags "
+        << static_cast<UINT>(desc.Flags);
+  }
+
+  EXPECT_EQ(context.device()->CreateDescriptorHeap(
+                nullptr, __uuidof(ID3D12DescriptorHeap), nullptr),
+            E_INVALIDARG);
+  auto invalid = valid_cases[0];
+  invalid.NumDescriptors = 0;
+  EXPECT_EQ(context.device()->CreateDescriptorHeap(
+                &invalid, __uuidof(ID3D12DescriptorHeap), nullptr),
+            E_INVALIDARG);
+  invalid = valid_cases[0];
+  invalid.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(2);
+  EXPECT_EQ(context.device()->CreateDescriptorHeap(
+                &invalid, __uuidof(ID3D12DescriptorHeap), nullptr),
+            E_INVALIDARG);
+  invalid.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  invalid.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  EXPECT_EQ(context.device()->CreateDescriptorHeap(
+                &invalid, __uuidof(ID3D12DescriptorHeap), nullptr),
+            E_INVALIDARG);
+}
+
 TEST_P(DescriptorHeapContractSpec, PreservesDescriptionAndBoundaryHandles) {
   const auto &test = GetParam();
   const D3D12_DESCRIPTOR_HEAP_DESC desc = {test.type, test.count, test.flags,

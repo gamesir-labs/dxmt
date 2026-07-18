@@ -3926,15 +3926,11 @@ public:
   HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC *desc,
                                                  REFIID riid, void **descriptor_heap) override {
     InitReturnPtr(descriptor_heap);
-    if (!descriptor_heap)
-      return E_POINTER;
-    if (ShouldInjectCreationFailure(
-            "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT",
-            g_test_descriptor_heap_creation_occurrence))
-      return E_OUTOFMEMORY;
     if (!desc || desc->NumDescriptors == 0)
       return WARN_E_INVALIDARG(__func__);
-    if (desc->NodeMask > 1)
+    if (desc->NodeMask > 1 ||
+        (static_cast<UINT>(desc->Flags) &
+         ~static_cast<UINT>(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)))
       return WARN_E_INVALIDARG(__func__);
 
     switch (desc->Type) {
@@ -3950,6 +3946,12 @@ public:
     default:
       return WARN_E_INVALIDARG(__func__);
     }
+    if (!descriptor_heap)
+      return S_FALSE;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT",
+            g_test_descriptor_heap_creation_occurrence))
+      return E_OUTOFMEMORY;
 
     auto heap = d3d12::CreateDescriptorHeap(
         static_cast<IMTLD3D12Device *>(this), desc);
