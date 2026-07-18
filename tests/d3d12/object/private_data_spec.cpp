@@ -1,6 +1,7 @@
 #include <dxmt_test.hpp>
 
 #include "d3d12_test_context.hpp"
+#include "shaders/runtime_test_shaders.hpp"
 
 #include <array>
 #include <atomic>
@@ -69,6 +70,72 @@ protected:
     ASSERT_EQ(object()->GetPrivateData(key, &size, &actual), S_OK);
     EXPECT_EQ(size, sizeof(actual));
     EXPECT_EQ(actual, expected);
+  }
+
+  struct ObjectCase {
+    const wchar_t *name;
+    ID3D12Object *object;
+    std::uint32_t value;
+  };
+
+  template <std::size_t Size>
+  void ExpectObjectsKeepMetadataIsolated(
+      const std::array<ObjectCase, Size> &objects) {
+    const GUID value_key = {
+        0xbff8d24f,
+        0x479b,
+        0x44fe,
+        {0xb7, 0xad, 0x47, 0x77, 0x73, 0xce, 0xb8, 0xa1}};
+    const GUID interface_key = {
+        0xe57f9866,
+        0x4828,
+        0x4832,
+        {0x86, 0x74, 0x81, 0xda, 0x5a, 0xbe, 0xc2, 0xd9}};
+
+    for (const auto &test : objects) {
+      SCOPED_TRACE(test.value);
+      ASSERT_EQ(test.object->SetName(test.name), S_OK);
+      ASSERT_EQ(test.object->SetPrivateData(value_key, sizeof(test.value),
+                                            &test.value),
+                S_OK);
+      ASSERT_EQ(test.object->SetPrivateDataInterface(interface_key,
+                                                     context_.device()),
+                S_OK);
+    }
+
+    for (const auto &test : objects) {
+      SCOPED_TRACE(test.value);
+      std::uint32_t actual = 0;
+      UINT value_size = sizeof(actual);
+      ASSERT_EQ(test.object->GetPrivateData(value_key, &value_size, &actual),
+                S_OK);
+      EXPECT_EQ(value_size, sizeof(actual));
+      EXPECT_EQ(actual, test.value);
+
+      IUnknown *stored_interface = nullptr;
+      UINT interface_size = sizeof(stored_interface);
+      ASSERT_EQ(test.object->GetPrivateData(interface_key, &interface_size,
+                                            &stored_interface),
+                S_OK);
+      ASSERT_NE(stored_interface, nullptr);
+      EXPECT_EQ(interface_size, sizeof(stored_interface));
+      ComPtr<IUnknown> stored_identity;
+      ComPtr<IUnknown> device_identity;
+      EXPECT_EQ(stored_interface->QueryInterface(
+                    __uuidof(IUnknown),
+                    reinterpret_cast<void **>(stored_identity.put())),
+                S_OK);
+      EXPECT_EQ(context_.device()->QueryInterface(
+                    __uuidof(IUnknown),
+                    reinterpret_cast<void **>(device_identity.put())),
+                S_OK);
+      EXPECT_EQ(stored_identity.get(), device_identity.get());
+      stored_interface->Release();
+
+      EXPECT_EQ(test.object->SetPrivateData(value_key, 0, nullptr), S_OK);
+      EXPECT_EQ(test.object->SetPrivateDataInterface(interface_key, nullptr),
+                S_OK);
+    }
   }
 
   D3D12TestContext context_;
@@ -278,73 +345,70 @@ TEST_F(PrivateDataSpec, CommandObjectsKeepMetadataAndInterfacesIsolated) {
             S_OK);
   ASSERT_TRUE(signature);
 
-  struct CommandObjectCase {
-    const wchar_t *name;
-    ID3D12Object *object;
-    std::uint32_t value;
-  };
   const std::array objects = {
-      CommandObjectCase{L"allocator metadata", context_.allocator(),
-                        0xa110ca7eu},
-      CommandObjectCase{L"command list metadata", context_.list(),
-                        0xc0111570u},
-      CommandObjectCase{L"signature metadata", signature.get(),
-                        0x519a7e00u},
+      ObjectCase{L"allocator metadata", context_.allocator(), 0xa110ca7eu},
+      ObjectCase{L"command list metadata", context_.list(), 0xc0111570u},
+      ObjectCase{L"signature metadata", signature.get(), 0x519a7e00u},
   };
-  const GUID value_key = {0xbff8d24f,
-                          0x479b,
-                          0x44fe,
-                          {0xb7, 0xad, 0x47, 0x77, 0x73, 0xce, 0xb8, 0xa1}};
-  const GUID interface_key = {
-      0xe57f9866,
-      0x4828,
-      0x4832,
-      {0x86, 0x74, 0x81, 0xda, 0x5a, 0xbe, 0xc2, 0xd9}};
+  ExpectObjectsKeepMetadataIsolated(objects);
+}
 
-  for (const auto &test : objects) {
-    SCOPED_TRACE(test.value);
-    ASSERT_EQ(test.object->SetName(test.name), S_OK);
-    ASSERT_EQ(test.object->SetPrivateData(value_key, sizeof(test.value),
-                                          &test.value),
-              S_OK);
-    ASSERT_EQ(test.object->SetPrivateDataInterface(interface_key,
-                                                   context_.device()),
-              S_OK);
-  }
+TEST_F(PrivateDataSpec, DeviceResourceObjectsKeepMetadataIsolated) {
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  auto resource = context_.CreateBuffer(256, D3D12_HEAP_TYPE_DEFAULT,
+                                         D3D12_RESOURCE_FLAG_NONE,
+                                         D3D12_RESOURCE_STATE_COMMON);
+  auto descriptor_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(), dxmt::test::ClearBufferComputeShader());
 
-  for (const auto &test : objects) {
-    SCOPED_TRACE(test.value);
-    std::uint32_t actual = 0;
-    UINT value_size = sizeof(actual);
-    ASSERT_EQ(test.object->GetPrivateData(value_key, &value_size, &actual),
-              S_OK);
-    EXPECT_EQ(value_size, sizeof(actual));
-    EXPECT_EQ(actual, test.value);
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ComPtr<ID3D12Heap> heap;
+  ASSERT_EQ(context_.device()->CreateHeap(
+                &heap_desc, __uuidof(ID3D12Heap),
+                reinterpret_cast<void **>(heap.put())),
+            S_OK);
 
-    IUnknown *stored_interface = nullptr;
-    UINT interface_size = sizeof(stored_interface);
-    ASSERT_EQ(test.object->GetPrivateData(interface_key, &interface_size,
-                                          &stored_interface),
-              S_OK);
-    ASSERT_NE(stored_interface, nullptr);
-    EXPECT_EQ(interface_size, sizeof(stored_interface));
-    ComPtr<IUnknown> stored_identity;
-    ComPtr<IUnknown> device_identity;
-    EXPECT_EQ(stored_interface->QueryInterface(
-                  __uuidof(IUnknown),
-                  reinterpret_cast<void **>(stored_identity.put())),
-              S_OK);
-    EXPECT_EQ(context_.device()->QueryInterface(
-                  __uuidof(IUnknown),
-                  reinterpret_cast<void **>(device_identity.put())),
-              S_OK);
-    EXPECT_EQ(stored_identity.get(), device_identity.get());
-    stored_interface->Release();
+  const D3D12_QUERY_HEAP_DESC query_desc = {
+      D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1, 0};
+  ComPtr<ID3D12QueryHeap> query_heap;
+  ASSERT_EQ(context_.device()->CreateQueryHeap(
+                &query_desc, __uuidof(ID3D12QueryHeap),
+                reinterpret_cast<void **>(query_heap.put())),
+            S_OK);
 
-    EXPECT_EQ(test.object->SetPrivateData(value_key, 0, nullptr), S_OK);
-    EXPECT_EQ(test.object->SetPrivateDataInterface(interface_key, nullptr),
-              S_OK);
-  }
+  ASSERT_TRUE(fence);
+  ASSERT_TRUE(resource);
+  ASSERT_TRUE(descriptor_heap);
+  ASSERT_TRUE(root_signature);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(heap);
+  ASSERT_TRUE(query_heap);
+
+  const std::array objects = {
+      ObjectCase{L"device metadata", context_.device(), 0xde71ce00u},
+      ObjectCase{L"fence metadata", fence.get(), 0xfeace000u},
+      ObjectCase{L"heap metadata", heap.get(), 0x4ea90000u},
+      ObjectCase{L"resource metadata", resource.get(), 0xae500aceu},
+      ObjectCase{L"descriptor heap metadata", descriptor_heap.get(),
+                 0xde5c0001u},
+      ObjectCase{L"root signature metadata", root_signature.get(),
+                 0xa0075190u},
+      ObjectCase{L"pipeline metadata", pipeline.get(), 0x050ca5e0u},
+      ObjectCase{L"query heap metadata", query_heap.get(), 0x0aee7000u},
+  };
+  ExpectObjectsKeepMetadataIsolated(objects);
 }
 
 } // namespace
