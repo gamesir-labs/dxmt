@@ -10,6 +10,7 @@ namespace {
 
 using dxmt::test::ClearBufferComputeShader;
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 struct RootStateResources {
@@ -23,7 +24,7 @@ class RootSignatureRuntimeStateSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
 
-  ComPtr<ID3D12RootSignature> CreateSignature() {
+  ComPtr<ID3D12RootSignature> CreateSignature(D3D12TestContext &context) {
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     range.NumDescriptors = 1;
@@ -38,7 +39,11 @@ protected:
     D3D12_ROOT_SIGNATURE_DESC desc = {};
     desc.NumParameters = 2;
     desc.pParameters = parameters;
-    return context_.CreateRootSignature(desc);
+    return context.CreateRootSignature(desc);
+  }
+
+  ComPtr<ID3D12RootSignature> CreateSignature() {
+    return CreateSignature(context_);
   }
 
   RootStateResources CreateResources() {
@@ -150,6 +155,39 @@ TEST_F(RootSignatureRuntimeStateSpec,
   context_.list()->SetGraphicsRootSignature(graphics_signature.get());
 
   ExpectDispatchOutput(resources, expected);
+}
+
+TEST_F(RootSignatureRuntimeStateSpec,
+       ForeignPipelineUpdatesPreserveBoundComputeState) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  auto foreign_signature = CreateSignature(foreign_context);
+  ASSERT_TRUE(foreign_signature);
+  auto foreign_pipeline = foreign_context.CreateComputePipeline(
+      foreign_signature.get(), ClearBufferComputeShader());
+  ASSERT_TRUE(foreign_pipeline);
+
+  for (const bool clear_state : {false, true}) {
+    SCOPED_TRACE(clear_state ? "ClearState" : "SetPipelineState");
+    auto resources = CreateResources();
+    ASSERT_TRUE(resources.signature);
+    ASSERT_TRUE(resources.pipeline);
+    ASSERT_TRUE(resources.output);
+    ASSERT_TRUE(resources.heap);
+    constexpr std::uint32_t expected = 0xc001d00d;
+    BindComputeState(resources, expected);
+
+    if (clear_state)
+      context_.list()->ClearState(foreign_pipeline.get());
+    else
+      context_.list()->SetPipelineState(foreign_pipeline.get());
+
+    ExpectDispatchOutput(resources, expected);
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
