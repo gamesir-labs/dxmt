@@ -3071,10 +3071,13 @@ public:
       return;
     if (RejectCommandListType("OMSetRenderTargets", kDirectList))
       return;
-    g_current_command_record_d3d_sequence =
-        dxmt::apitrace::record_om_set_render_targets(
-            this, render_target_descriptor_count, render_target_descriptors,
-            single_descriptor_handle, depth_stencil_descriptor);
+    const auto belongs_to_device = [this](const DescriptorRecord &descriptor) {
+      if (!descriptor.resource)
+        return true;
+      const auto *resource =
+          dynamic_cast<Resource *>(descriptor.resource.ptr());
+      return resource && resource->GetParentDevice() == device_.ptr();
+    };
     RenderTargetsRecord record = {};
     if (render_target_descriptors && render_target_descriptor_count) {
       record.render_targets.reserve(render_target_descriptor_count);
@@ -3083,8 +3086,13 @@ public:
             render_target_descriptors[0], D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
             render_target_descriptor_count, "OMSetRenderTargets");
         if (base) {
-          for (UINT i = 0; i < render_target_descriptor_count; i++)
+          for (UINT i = 0; i < render_target_descriptor_count; i++) {
+            if (!belongs_to_device(base.get()[i])) {
+              recording_error_ = E_INVALIDARG;
+              return;
+            }
             record.render_targets.push_back(base.get()[i]);
+          }
         }
       } else {
         for (UINT i = 0; i < render_target_descriptor_count; i++) {
@@ -3092,8 +3100,13 @@ public:
               GetDescriptorRecordFromCpuHandle(
                   render_target_descriptors[i],
                   D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-          if (descriptor)
+          if (descriptor) {
+            if (!belongs_to_device(*descriptor)) {
+              recording_error_ = E_INVALIDARG;
+              return;
+            }
             record.render_targets.push_back(*descriptor);
+          }
         }
       }
     }
@@ -3101,9 +3114,18 @@ public:
       if (auto descriptor =
               GetDescriptorRecordFromCpuHandle(
                   *depth_stencil_descriptor,
-                  D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
+                  D3D12_DESCRIPTOR_HEAP_TYPE_DSV)) {
+        if (!belongs_to_device(*descriptor)) {
+          recording_error_ = E_INVALIDARG;
+          return;
+        }
         record.depth_stencil = *descriptor;
+      }
     }
+    g_current_command_record_d3d_sequence =
+        dxmt::apitrace::record_om_set_render_targets(
+            this, render_target_descriptor_count, render_target_descriptors,
+            single_descriptor_handle, depth_stencil_descriptor);
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags,

@@ -15,6 +15,7 @@ namespace {
 
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::DualSourcePixelShader;
 using dxmt::test::FullscreenVertexShader;
@@ -442,5 +443,99 @@ TEST_F(GraphicsOutputMergerSpec, AcceptsZeroRenderTargets) {
   RecordFullscreenDraw(pipeline.get());
   EXPECT_EQ(context_.ExecuteAndWait(), S_OK);
 }
+
+enum class ForeignOutputBinding { RenderTargetArray, DepthStencil };
+
+class ForeignOutputBindingSpec
+    : public GraphicsOutputMergerSpec,
+      public ::testing::WithParamInterface<ForeignOutputBinding> {};
+
+TEST_P(ForeignOutputBindingSpec,
+       RejectsWholeBindingAndAllowsFreshListRecovery) {
+  if (GetParam() == ForeignOutputBinding::DepthStencil) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+    support.Format = DXGI_FORMAT_D32_FLOAT;
+    ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                  D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
+              S_OK);
+    if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL))
+      GTEST_SKIP() << "D32_FLOAT depth-stencil is unavailable";
+  }
+
+  auto local_target =
+      context_.CreateTexture2D(kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto local_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(local_target);
+  ASSERT_TRUE(local_heap);
+  ASSERT_TRUE(foreign_device);
+  const auto local_rtv = local_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(local_target.get(), nullptr,
+                                            local_rtv);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+
+  if (GetParam() == ForeignOutputBinding::RenderTargetArray) {
+    auto foreign_target = foreign_context.CreateTexture2D(
+        kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto foreign_heap = foreign_context.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+    ASSERT_TRUE(foreign_target);
+    ASSERT_TRUE(foreign_heap);
+    const auto foreign_rtv =
+        foreign_heap->GetCPUDescriptorHandleForHeapStart();
+    foreign_device->CreateRenderTargetView(foreign_target.get(), nullptr,
+                                           foreign_rtv);
+    const D3D12_CPU_DESCRIPTOR_HANDLE handles[] = {local_rtv, foreign_rtv};
+    context_.list()->OMSetRenderTargets(static_cast<UINT>(std::size(handles)),
+                                        handles, FALSE, nullptr);
+  } else {
+    auto foreign_depth = foreign_context.CreateTexture2D(
+        kSize, kSize, 1, DXGI_FORMAT_D32_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    auto foreign_heap = foreign_context.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
+    ASSERT_TRUE(foreign_depth);
+    ASSERT_TRUE(foreign_heap);
+    const auto foreign_dsv =
+        foreign_heap->GetCPUDescriptorHandleForHeapStart();
+    foreign_device->CreateDepthStencilView(foreign_depth.get(), nullptr,
+                                           foreign_dsv);
+    context_.list()->OMSetRenderTargets(1, &local_rtv, FALSE, &foreign_dsv);
+  }
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+  list->OMSetRenderTargets(1, &local_rtv, FALSE, nullptr);
+  EXPECT_EQ(list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string ForeignOutputBindingName(
+    const ::testing::TestParamInfo<ForeignOutputBinding> &info) {
+  return info.param == ForeignOutputBinding::RenderTargetArray
+             ? "RenderTargetArray"
+             : "DepthStencil";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CrossDeviceMatrix, ForeignOutputBindingSpec,
+    ::testing::Values(ForeignOutputBinding::RenderTargetArray,
+                      ForeignOutputBinding::DepthStencil),
+    ForeignOutputBindingName);
 
 } // namespace
