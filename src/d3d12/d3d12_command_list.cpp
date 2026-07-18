@@ -3417,6 +3417,21 @@ public:
     if (RejectCommandListType(
             "SetPredication", kDirectList | kComputeList))
       return;
+    if (buffer) {
+      const auto *predicate = dynamic_cast<Resource *>(buffer);
+      if (!predicate || predicate->GetParentDevice() != device_.ptr() ||
+          predicate->GetResourceDesc().Dimension !=
+              D3D12_RESOURCE_DIMENSION_BUFFER ||
+          (aligned_buffer_offset & (sizeof(UINT64) - 1)) ||
+          aligned_buffer_offset > predicate->GetResourceDesc().Width ||
+          sizeof(UINT64) >
+              predicate->GetResourceDesc().Width - aligned_buffer_offset ||
+          (operation != D3D12_PREDICATION_OP_EQUAL_ZERO &&
+           operation != D3D12_PREDICATION_OP_NOT_EQUAL_ZERO)) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_predication(
             this, buffer, aligned_buffer_offset, static_cast<uint32_t>(operation));
@@ -3445,6 +3460,34 @@ public:
       return;
     if (!command_signature || !arg_buffer || !max_command_count)
       return;
+    const auto *signature =
+        dynamic_cast<CommandSignature *>(command_signature);
+    const auto *arguments = dynamic_cast<Resource *>(arg_buffer);
+    const auto *count = dynamic_cast<Resource *>(count_buffer);
+    const bool arguments_valid =
+        signature && arguments &&
+        arguments->GetParentDevice() == device_.ptr() &&
+        arguments->GetResourceDesc().Dimension ==
+            D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !(arg_buffer_offset & (sizeof(UINT) - 1)) &&
+        arg_buffer_offset <= arguments->GetResourceDesc().Width &&
+        UINT64(max_command_count) <=
+            (arguments->GetResourceDesc().Width - arg_buffer_offset) /
+                signature->GetDesc().ByteStride;
+    const bool count_valid =
+        !count_buffer ||
+        (count && count->GetParentDevice() == device_.ptr() &&
+         count->GetResourceDesc().Dimension ==
+             D3D12_RESOURCE_DIMENSION_BUFFER &&
+         !(count_buffer_offset & (sizeof(UINT) - 1)) &&
+         count_buffer_offset <= count->GetResourceDesc().Width &&
+         sizeof(UINT) <= count->GetResourceDesc().Width - count_buffer_offset);
+    if (!signature || signature->GetParentDevice() != device_.ptr() ||
+        !arguments_valid || !count_valid ||
+        (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE && count_buffer)) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_execute_indirect(
             this, command_signature, max_command_count, arg_buffer,
@@ -4466,6 +4509,8 @@ public:
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
     return device_->QueryInterface(riid, device);
   }
+
+  IMTLD3D12Device *GetParentDevice() const override { return device_.ptr(); }
 
   const D3D12_COMMAND_SIGNATURE_DESC &GetDesc() const override {
     return desc_;

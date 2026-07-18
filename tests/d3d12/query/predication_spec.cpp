@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -13,6 +14,7 @@ namespace {
 using dxmt::test::ClearBufferComputeShader;
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class PredicationSpec : public ::testing::Test {
@@ -295,5 +297,102 @@ TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {
   std::memcpy(&value, bytes.data(), sizeof(value));
   EXPECT_EQ(value, 0x31415926u);
 }
+
+enum class InvalidPredicationCase {
+  ForeignBuffer,
+  Texture,
+  MisalignedOffset,
+  OutOfBoundsOffset,
+  InvalidOperation,
+};
+
+class InvalidPredicationSpec
+    : public PredicationSpec,
+      public ::testing::WithParamInterface<InvalidPredicationCase> {};
+
+TEST_P(InvalidPredicationSpec, RejectsInvalidArgumentsAndAllowsFreshRecovery) {
+  auto local_buffer = context_.CreateBuffer(
+      16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_PREDICATION);
+  ASSERT_TRUE(local_buffer);
+  ComPtr<ID3D12Resource> alternate_buffer;
+  ID3D12Resource *selected_buffer = local_buffer.get();
+  UINT64 offset = 0;
+  D3D12_PREDICATION_OP operation = D3D12_PREDICATION_OP_EQUAL_ZERO;
+  ComPtr<ID3D12Device> foreign_device;
+  D3D12TestContext foreign_context;
+
+  switch (GetParam()) {
+  case InvalidPredicationCase::ForeignBuffer:
+    foreign_device = CreateIsolatedD3D12Device();
+    ASSERT_TRUE(foreign_device);
+    ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+    alternate_buffer = foreign_context.CreateBuffer(
+        16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_PREDICATION);
+    selected_buffer = alternate_buffer.get();
+    break;
+  case InvalidPredicationCase::Texture:
+    alternate_buffer = context_.CreateTexture2D(
+        1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COMMON);
+    selected_buffer = alternate_buffer.get();
+    break;
+  case InvalidPredicationCase::MisalignedOffset:
+    offset = 4;
+    break;
+  case InvalidPredicationCase::OutOfBoundsOffset:
+    offset = 16;
+    break;
+  case InvalidPredicationCase::InvalidOperation:
+    operation = static_cast<D3D12_PREDICATION_OP>(2);
+    break;
+  }
+  ASSERT_NE(selected_buffer, nullptr);
+
+  context_.list()->SetPredication(selected_buffer, offset, operation);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+  list->SetPredication(local_buffer.get(), 8,
+                       D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+  list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  EXPECT_EQ(list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string InvalidPredicationCaseName(
+    const ::testing::TestParamInfo<InvalidPredicationCase> &info) {
+  switch (info.param) {
+  case InvalidPredicationCase::ForeignBuffer:
+    return "ForeignBuffer";
+  case InvalidPredicationCase::Texture:
+    return "Texture";
+  case InvalidPredicationCase::MisalignedOffset:
+    return "MisalignedOffset";
+  case InvalidPredicationCase::OutOfBoundsOffset:
+    return "OutOfBoundsOffset";
+  case InvalidPredicationCase::InvalidOperation:
+    return "InvalidOperation";
+  }
+  return "Unknown";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Validation, InvalidPredicationSpec,
+    ::testing::Values(InvalidPredicationCase::ForeignBuffer,
+                      InvalidPredicationCase::Texture,
+                      InvalidPredicationCase::MisalignedOffset,
+                      InvalidPredicationCase::OutOfBoundsOffset,
+                      InvalidPredicationCase::InvalidOperation),
+    InvalidPredicationCaseName);
 
 } // namespace
