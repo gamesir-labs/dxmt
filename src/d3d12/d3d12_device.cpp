@@ -5445,6 +5445,11 @@ public:
   SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE mode,
                               D3D12_MEASUREMENTS_ACTION action, HANDLE event,
                               WINBOOL *further_measurements_desired) override {
+    if (mode < D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED ||
+        mode > D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_PROFILING_BY_SYSTEM ||
+        action < D3D12_MEASUREMENTS_ACTION_KEEP_ALL ||
+        action > D3D12_MEASUREMENTS_ACTION_DISCARD_PREVIOUS)
+      return WARN_E_INVALIDARG(__func__);
     if (further_measurements_desired)
       *further_measurements_desired = FALSE;
     if (event)

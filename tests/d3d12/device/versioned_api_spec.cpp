@@ -638,23 +638,60 @@ TEST_F(VersionedApiSpec,
   ASSERT_TRUE(device6);
   constexpr std::array modes = {
       D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
-      D3D12_BACKGROUND_PROCESSING_MODE_ALLOW_INTRUSIVE_MEASUREMENTS};
+      D3D12_BACKGROUND_PROCESSING_MODE_ALLOW_INTRUSIVE_MEASUREMENTS,
+      D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
+      D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_PROFILING_BY_SYSTEM};
   constexpr std::array actions = {
       D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
-      D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS};
+      D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
+      D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS_HIGH_PRIORITY,
+      D3D12_MEASUREMENTS_ACTION_DISCARD_PREVIOUS};
 
-  for (std::size_t i = 0; i < modes.size(); ++i) {
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    ASSERT_NE(event, nullptr);
-    BOOL further_measurements_desired = TRUE;
-    EXPECT_EQ(device6->SetBackgroundProcessingMode(
-                  modes[i], actions[i], event, &further_measurements_desired),
-              S_OK)
-        << i;
-    EXPECT_FALSE(further_measurements_desired) << i;
-    EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0) << i;
-    CloseHandle(event);
+  for (const auto mode : modes) {
+    for (const auto action : actions) {
+      SCOPED_TRACE(::testing::Message()
+                   << "mode=" << mode << " action=" << action);
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      ASSERT_NE(event, nullptr);
+      BOOL further_measurements_desired = TRUE;
+      EXPECT_EQ(device6->SetBackgroundProcessingMode(
+                    mode, action, event, &further_measurements_desired),
+                S_OK);
+      EXPECT_FALSE(further_measurements_desired);
+      EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+      CloseHandle(event);
+    }
   }
+
+  EXPECT_EQ(device6->SetBackgroundProcessingMode(
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr),
+            S_OK);
+}
+
+TEST_F(VersionedApiSpec, BackgroundProcessingRejectsInvalidEnumsAtomically) {
+  auto device6 = QueryDevice<ID3D12Device6>();
+  ASSERT_TRUE(device6);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+
+  BOOL further_measurements_desired = TRUE;
+  EXPECT_EQ(device6->SetBackgroundProcessingMode(
+                static_cast<D3D12_BACKGROUND_PROCESSING_MODE>(UINT_MAX),
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL, event,
+                &further_measurements_desired),
+            E_INVALIDARG);
+  EXPECT_TRUE(further_measurements_desired);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+
+  EXPECT_EQ(device6->SetBackgroundProcessingMode(
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                static_cast<D3D12_MEASUREMENTS_ACTION>(UINT_MAX), event,
+                &further_measurements_desired),
+            E_INVALIDARG);
+  EXPECT_TRUE(further_measurements_desired);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+  CloseHandle(event);
 }
 
 TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
