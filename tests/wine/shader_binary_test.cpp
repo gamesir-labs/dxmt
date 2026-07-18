@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
+#include <vector>
 
 namespace {
 
@@ -25,6 +27,30 @@ constexpr CShaderToken kDestinationOperand =
 constexpr CShaderToken kImmediateOperand =
     ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) |
     ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+
+constexpr CShaderToken InstructionToken(D3D10_SB_OPCODE_TYPE opcode,
+                                        UINT length,
+                                        CShaderToken controls = 0) {
+  return static_cast<CShaderToken>(ENCODE_D3D10_SB_OPCODE_TYPE(opcode) |
+                                   ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(
+                                       length) |
+                                   controls);
+}
+
+void ParseSingleInstruction(
+    std::initializer_list<CShaderToken> tokens, CInstruction *instruction,
+    D3D10_SB_TOKENIZED_PROGRAM_TYPE type = D3D11_SB_COMPUTE_SHADER,
+    UINT major = 5, UINT minor = 0) {
+  std::vector<CShaderToken> shader = {
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(type, major, minor),
+      ENCODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(
+          static_cast<UINT>(tokens.size() + 2)),
+  };
+  shader.insert(shader.end(), tokens.begin(), tokens.end());
+  CShaderCodeParser parser(shader.data());
+  parser.ParseInstruction(instruction);
+  EXPECT_TRUE(parser.EndOfShader());
+}
 
 TEST(ShaderBinary, InitializesInstructionMetadataAndRejectsUnknownOpcodes) {
   EXPECT_EQ(GetNumInstructionOperands(D3D10_SB_OPCODE_MOV), 2u);
@@ -537,6 +563,154 @@ TEST(ShaderBinary, RepositionsTheInstructionCursor) {
   parser.ParseInstruction(&instruction);
   EXPECT_EQ(instruction.OpCode(), D3D10_SB_OPCODE_RET);
   EXPECT_TRUE(parser.EndOfShader());
+}
+
+TEST(ShaderBinary, DecodesFixedPayloadDeclarations) {
+  CInstruction instruction;
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_FUNCTION_BODY, 2), 37},
+      &instruction);
+  EXPECT_EQ(instruction.m_FunctionBodyDecl.FunctionBodyNumber, 37u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_TEMPS, 2), 19}, &instruction);
+  EXPECT_EQ(instruction.m_TempsDecl.NumTemps, 19u);
+
+  struct IndexableTempCase {
+    UINT component_count;
+    UINT expected_mask;
+  };
+  constexpr std::array<IndexableTempCase, 4> indexable_temp_cases = {{
+      {0, D3D10_SB_OPERAND_4_COMPONENT_MASK_X},
+      {2, D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+              D3D10_SB_OPERAND_4_COMPONENT_MASK_Y},
+      {3, D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+              D3D10_SB_OPERAND_4_COMPONENT_MASK_Y |
+              D3D10_SB_OPERAND_4_COMPONENT_MASK_Z},
+      {9, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL},
+  }};
+  for (const auto &test_case : indexable_temp_cases) {
+    ParseSingleInstruction(
+        {InstructionToken(D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP, 4), 7, 23,
+         test_case.component_count},
+        &instruction);
+    EXPECT_EQ(instruction.m_IndexableTempDecl.IndexableTempNumber, 7u);
+    EXPECT_EQ(instruction.m_IndexableTempDecl.NumRegisters, 23u);
+    EXPECT_EQ(instruction.m_IndexableTempDecl.Mask, test_case.expected_mask);
+  }
+
+  ParseSingleInstruction(
+      {InstructionToken(
+          D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY, 1,
+          ENCODE_D3D10_SB_GS_OUTPUT_PRIMITIVE_TOPOLOGY(
+              D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ))},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.m_OutputTopologyDecl.Topology,
+            D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_GS_INPUT_PRIMITIVE, 1,
+                        ENCODE_D3D10_SB_GS_INPUT_PRIMITIVE(
+                            D3D10_SB_PRIMITIVE_TRIANGLE_ADJ))},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.m_InputPrimitiveDecl.Primitive,
+            D3D10_SB_PRIMITIVE_TRIANGLE_ADJ);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT, 2), 64},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.m_GSMaxOutputVertexCountDecl.MaxOutputVertexCount,
+            64u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT, 2), 5},
+      &instruction, D3D10_SB_GEOMETRY_SHADER);
+  EXPECT_EQ(instruction.m_GSInstanceCountDecl.InstanceCount, 5u);
+
+  constexpr UINT global_flags =
+      D3D10_SB_GLOBAL_FLAG_REFACTORING_ALLOWED |
+      D3D11_SB_GLOBAL_FLAG_ENABLE_DOUBLE_PRECISION_FLOAT_OPS |
+      D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL |
+      D3D11_SB_GLOBAL_FLAG_ENABLE_RAW_AND_STRUCTURED_BUFFERS |
+      D3D11_1_SB_GLOBAL_FLAG_SKIP_OPTIMIZATION |
+      D3D11_1_SB_GLOBAL_FLAG_ENABLE_MINIMUM_PRECISION |
+      D3D11_1_SB_GLOBAL_FLAG_ENABLE_DOUBLE_EXTENSIONS |
+      D3D11_1_SB_GLOBAL_FLAG_ENABLE_SHADER_EXTENSIONS |
+      D3D12_SB_GLOBAL_FLAG_ALL_RESOURCES_BOUND;
+  ParseSingleInstruction(
+      {InstructionToken(D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS, 1,
+                        ENCODE_D3D10_SB_GLOBAL_FLAGS(global_flags))},
+      &instruction);
+  EXPECT_EQ(instruction.m_GlobalFlagsDecl.Flags, global_flags);
+}
+
+TEST(ShaderBinary, DecodesTessellationAndThreadGroupDeclarations) {
+  CInstruction instruction;
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT, 1,
+                        ENCODE_D3D11_SB_INPUT_CONTROL_POINT_COUNT(13))},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(
+      instruction.m_InputControlPointCountDecl.InputControlPointCount, 13u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT, 1,
+                        ENCODE_D3D11_SB_OUTPUT_CONTROL_POINT_COUNT(29))},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(
+      instruction.m_OutputControlPointCountDecl.OutputControlPointCount, 29u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_TESS_DOMAIN, 1,
+                        ENCODE_D3D11_SB_TESS_DOMAIN(
+                            D3D11_SB_TESSELLATOR_DOMAIN_QUAD))},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(instruction.m_TessellatorDomainDecl.TessellatorDomain,
+            D3D11_SB_TESSELLATOR_DOMAIN_QUAD);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_TESS_PARTITIONING, 1,
+                        ENCODE_D3D11_SB_TESS_PARTITIONING(
+                            D3D11_SB_TESSELLATOR_PARTITIONING_FRACTIONAL_EVEN))},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(instruction.m_TessellatorPartitioningDecl.TessellatorPartitioning,
+            D3D11_SB_TESSELLATOR_PARTITIONING_FRACTIONAL_EVEN);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE, 1,
+                        ENCODE_D3D11_SB_TESS_OUTPUT_PRIMITIVE(
+                            D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW))},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(
+      instruction.m_TessellatorOutputPrimitiveDecl.TessellatorOutputPrimitive,
+      D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_HS_MAX_TESSFACTOR, 2),
+       0x40b00000},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(instruction.m_HSMaxTessFactorDecl.MaxTessFactor, 5.5f);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT, 2),
+       7},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(instruction.m_HSForkPhaseInstanceCountDecl.InstanceCount, 7u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT, 2),
+       11},
+      &instruction, D3D11_SB_HULL_SHADER);
+  EXPECT_EQ(instruction.m_HSJoinPhaseInstanceCountDecl.InstanceCount, 11u);
+
+  ParseSingleInstruction(
+      {InstructionToken(D3D11_SB_OPCODE_DCL_THREAD_GROUP, 4), 8, 4, 2},
+      &instruction);
+  EXPECT_EQ(instruction.m_ThreadGroupDecl.x, 8u);
+  EXPECT_EQ(instruction.m_ThreadGroupDecl.y, 4u);
+  EXPECT_EQ(instruction.m_ThreadGroupDecl.z, 2u);
 }
 
 } // namespace
