@@ -2665,8 +2665,8 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
   if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
       (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     return false;
-  const bool depth_stencil_format =
-      IsDepthStencilResourceFormat(desc.Format);
+  const bool depth_stencil_format = IsDepthStencilResourceFormat(
+      ResolveTextureBackingFormat(desc));
   if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
       depth_stencil_format)
     return false;

@@ -99,6 +99,10 @@ std::vector<InvalidResourceCase> BuildInvalidResourceCases() {
   add_texture("ColorFormatDepthStencilFlag", [](auto &d) {
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   });
+  add_texture("TypedR32FormatDepthStencilFlag", [](auto &d) {
+    d.Format = DXGI_FORMAT_R32_FLOAT;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  });
   add_texture("Texture1DHeight", [](auto &d) {
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     d.Height = 2;
@@ -374,6 +378,40 @@ TEST_F(D3D12MemoryContractSpec, HeapCategoryRestrictionsAreEnforced) {
                            &output),
               E_INVALIDARG);
     EXPECT_EQ(output, nullptr);
+  }
+}
+
+TEST_F(D3D12MemoryContractSpec,
+       PlacedTypelessDepthResourcesUseDepthStencilBacking) {
+  constexpr std::array formats = {
+      DXGI_FORMAT_R16_TYPELESS,
+      DXGI_FORMAT_R32_TYPELESS,
+  };
+  constexpr auto initial_state = static_cast<D3D12_RESOURCE_STATES>(
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+  for (const auto format : formats) {
+    auto desc = TextureDesc();
+    desc.Format = format;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const auto allocation =
+        context_.device()->GetResourceAllocationInfo(0, 1, &desc);
+    ASSERT_NE(allocation.SizeInBytes, UINT64_MAX);
+
+    auto heap = CreateHeap(allocation.SizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                           D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES,
+                           allocation.Alignment);
+    ASSERT_TRUE(heap);
+
+    ComPtr<ID3D12Resource> resource;
+    ASSERT_EQ(CreatePlaced(heap.get(), 0, desc, initial_state,
+                           reinterpret_cast<void **>(resource.put())),
+              S_OK);
+    ASSERT_TRUE(resource);
+    EXPECT_EQ(resource->GetDesc().Format, format);
+    EXPECT_EQ(resource->GetDesc().Flags,
+              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
   }
 }
 
