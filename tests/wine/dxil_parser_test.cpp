@@ -170,6 +170,14 @@ std::vector<uint8_t> BuildBitcodeWithAbbreviatedRecord() {
   return builder.build();
 }
 
+std::vector<uint8_t> FinishSingleBitcodeBlock(BitcodeBuilder &builder,
+                                               uint32_t abbrev_width) {
+  builder.bits(dxmt::dxil::bitc::EndBlock, abbrev_width).align32();
+  auto bytes = builder.build();
+  Store<uint32_t>(bytes, 8, (bytes.size() - 12) / sizeof(uint32_t));
+  return bytes;
+}
+
 dxmt::dxil::BlobPart Part(uint32_t fourcc, const std::vector<uint8_t> &bytes) {
   return {.fourcc = fourcc, .data = bytes};
 }
@@ -524,6 +532,122 @@ TEST(DxilBitcode, RejectsInvalidSubblockHeadersAndAbbreviations) {
                   .bits(bitc::FirstApplicationAbbrev, 3)
                   .align32()
                   .build();
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+}
+
+TEST(DxilBitcode, ParsesEveryAbbreviationEncoding) {
+  using namespace dxmt::dxil;
+  BitcodeBuilder builder;
+  builder.bits(kBitcodeMagicValue, 32)
+      .bits(bitc::EnterSubblock, 2)
+      .vbr(8, 8)
+      .vbr(3, 4)
+      .align32()
+      .bits(0, 32)
+      .bits(bitc::DefineAbbrev, 3)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(10, 8)
+      .bits(0, 1)
+      .bits(2, 3)
+      .vbr(6, 5)
+      .bits(bitc::FirstApplicationAbbrev, 3)
+      .vbr(300, 6)
+      .bits(bitc::DefineAbbrev, 3)
+      .vbr(3, 5)
+      .bits(1, 1)
+      .vbr(11, 8)
+      .bits(0, 1)
+      .bits(3, 3)
+      .bits(0, 1)
+      .bits(4, 3)
+      .bits(bitc::FirstApplicationAbbrev + 1, 3)
+      .vbr(3, 6)
+      .bits(1, 6)
+      .bits(2, 6)
+      .bits(3, 6)
+      .bits(bitc::DefineAbbrev, 3)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(12, 8)
+      .bits(0, 1)
+      .bits(5, 3)
+      .bits(bitc::FirstApplicationAbbrev + 2, 3)
+      .vbr(3, 6)
+      .align32()
+      .bits(0x00ccbbaau, 24)
+      .align32();
+  const auto bitcode = FinishSingleBitcodeBlock(builder, 3);
+
+  BitcodeInfo info;
+  ASSERT_EQ(ParseBitcode(bitcode, info), ParseStatus::Ok);
+  ASSERT_EQ(info.records.size(), 3u);
+  EXPECT_EQ(info.records[0].code, 10u);
+  EXPECT_EQ(info.records[0].operand_count, 1u);
+  EXPECT_TRUE(info.records[0].abbreviated);
+  EXPECT_EQ(info.records[1].code, 11u);
+  EXPECT_EQ(info.records[1].operand_count, 3u);
+  EXPECT_TRUE(info.records[1].abbreviated);
+  EXPECT_EQ(info.records[2].code, 12u);
+  EXPECT_EQ(info.records[2].operand_count, 1u);
+  EXPECT_TRUE(info.records[2].abbreviated);
+}
+
+TEST(DxilBitcode, RejectsMalformedAbbreviationEncodings) {
+  using namespace dxmt::dxil;
+  const auto begin_block = [] {
+    BitcodeBuilder builder;
+    builder.bits(kBitcodeMagicValue, 32)
+        .bits(bitc::EnterSubblock, 2)
+        .vbr(8, 8)
+        .vbr(3, 4)
+        .align32()
+        .bits(0, 32);
+    return builder;
+  };
+  BitcodeInfo info;
+
+  auto builder = begin_block();
+  builder.bits(bitc::DefineAbbrev, 3)
+      .vbr(1, 5)
+      .bits(0, 1)
+      .bits(0, 3);
+  auto malformed = FinishSingleBitcodeBlock(builder, 3);
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+
+  builder = begin_block();
+  builder.bits(bitc::DefineAbbrev, 3)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(13, 8)
+      .bits(0, 1)
+      .bits(3, 3)
+      .bits(bitc::FirstApplicationAbbrev, 3);
+  malformed = FinishSingleBitcodeBlock(builder, 3);
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+
+  builder = begin_block();
+  builder.bits(bitc::DefineAbbrev, 3)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(14, 8)
+      .bits(0, 1)
+      .bits(2, 3)
+      .vbr(1, 5)
+      .bits(bitc::FirstApplicationAbbrev, 3);
+  malformed = FinishSingleBitcodeBlock(builder, 3);
+  EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
+
+  builder = begin_block();
+  builder.bits(bitc::DefineAbbrev, 3)
+      .vbr(2, 5)
+      .bits(1, 1)
+      .vbr(15, 8)
+      .bits(0, 1)
+      .bits(5, 3)
+      .bits(bitc::FirstApplicationAbbrev, 3)
+      .vbr(63, 6);
+  malformed = FinishSingleBitcodeBlock(builder, 3);
   EXPECT_EQ(ParseBitcode(malformed, info), ParseStatus::InvalidBitcode);
 }
 
