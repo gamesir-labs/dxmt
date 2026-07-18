@@ -1014,6 +1014,97 @@ TEST_F(D3D12SparseResourceSpec,
   ExpectBytesEqual(actual, expected);
 }
 
+TEST_F(D3D12SparseResourceSpec,
+       CopyTileMappingsAliasesPackedMipOnNonzeroArraySlice) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+            S_OK);
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  constexpr UINT16 array_size = 2;
+  constexpr UINT16 mip_levels = 10;
+  constexpr UINT array_slice = 1;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 512;
+  desc.Height = 512;
+  desc.DepthOrArraySize = array_size;
+  desc.MipLevels = mip_levels;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  ComPtr<ID3D12Resource> source;
+  ComPtr<ID3D12Resource> destination;
+  ASSERT_EQ(context_.device()->CreateReservedResource(
+                &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                IID_PPV_ARGS(source.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateReservedResource(
+                &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(destination.put())),
+            S_OK);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  D3D12_PACKED_MIP_INFO packed = {};
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(source.get(), &total_tiles, &packed,
+                                       nullptr, nullptr, 0, nullptr);
+  ASSERT_GT(packed.NumPackedMips, 0u);
+  ASSERT_GE(packed.NumTilesForPackedMips, array_size);
+  const UINT first_packed_subresource =
+      packed.NumStandardMips + array_slice * mip_levels;
+  const UINT deepest_packed_subresource =
+      mip_levels - 1 + array_slice * mip_levels;
+
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.SizeInBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> heap;
+  ASSERT_EQ(context_.device()->CreateHeap(&heap_desc,
+                                           IID_PPV_ARGS(heap.put())),
+            S_OK);
+  ASSERT_TRUE(heap);
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  coordinate.Subresource = first_packed_subresource;
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = 1;
+  D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_offset = 0;
+  UINT tile_count = 1;
+  context_.queue()->UpdateTileMappings(
+      source.get(), 1, &coordinate, &region, heap.get(), 1, &range_flag,
+      &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+  context_.queue()->CopyTileMappings(
+      destination.get(), &coordinate, source.get(), &coordinate, &region,
+      D3D12_TILE_MAPPING_FLAG_NONE);
+
+  constexpr std::uint32_t expected = 0x4a93d27eu;
+  ASSERT_EQ(context_.UploadTextureAndReset(
+                destination.get(), &expected, sizeof(expected),
+                sizeof(expected), deepest_packed_subresource),
+            S_OK);
+  D3D12_RESOURCE_BARRIER aliasing = {};
+  aliasing.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  aliasing.Aliasing.pResourceBefore = destination.get();
+  aliasing.Aliasing.pResourceAfter = source.get();
+  context_.list()->ResourceBarrier(1, &aliasing);
+
+  dxmt::test::TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(source.get(), &readback,
+                                     deepest_packed_subresource),
+            S_OK);
+  ASSERT_GE(readback.data.size(), sizeof(expected));
+  std::uint32_t actual = 0;
+  std::memcpy(&actual, readback.data.data(), sizeof(actual));
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 enum class ForeignTileMappingCase {
   UpdateForeignResource,
   UpdateForeignHeap,
