@@ -29,7 +29,13 @@ GetBackendHeapSize(const D3D12_HEAP_DESC &desc) {
   return (desc.SizeInBytes + alignment - 1) & ~(alignment - 1);
 }
 
-class HeapImpl final : public ComObjectWithInitialRef<ID3D12Heap>,
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+using HeapComInterface = ID3D12Heap1;
+#else
+using HeapComInterface = ID3D12Heap;
+#endif
+
+class HeapImpl final : public ComObjectWithInitialRef<HeapComInterface>,
                        public Heap {
 public:
   HeapImpl(IMTLD3D12Device *device, const D3D12_HEAP_DESC &desc)
@@ -59,7 +65,8 @@ public:
     *ppvObject = nullptr;
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) ||
-        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Heap)) {
+        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Heap) ||
+        riid == __uuidof(HeapComInterface)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -106,6 +113,16 @@ public:
 #else
   D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
     return desc_;
+  }
+#endif
+
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(
+      REFIID riid, void **protected_session) override {
+    InitReturnPtr(protected_session);
+    if (!protected_session)
+      return E_POINTER;
+    return DXGI_ERROR_NOT_FOUND;
   }
 #endif
 

@@ -178,9 +178,15 @@ TEST_F(VersionedApiSpec, CreateHeap1WithoutSessionBacksPlacedResource) {
   heap_desc.Properties = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
   heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
   heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
-  ComPtr<ID3D12Heap> heap;
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+  using HeapInterface = ID3D12Heap1;
+#else
+  using HeapInterface = ID3D12Heap;
+#endif
+  ComPtr<HeapInterface> heap;
 
-  ASSERT_EQ(device4->CreateHeap1(&heap_desc, nullptr, __uuidof(ID3D12Heap),
+  ASSERT_EQ(device4->CreateHeap1(&heap_desc, nullptr,
+                                 __uuidof(HeapInterface),
                                  reinterpret_cast<void **>(heap.put())),
             S_OK);
   ASSERT_TRUE(heap);
@@ -189,6 +195,28 @@ TEST_F(VersionedApiSpec, CreateHeap1WithoutSessionBacksPlacedResource) {
   EXPECT_EQ(observed_heap.Properties.Type, heap_desc.Properties.Type);
   EXPECT_EQ(observed_heap.Alignment, heap_desc.Alignment);
   EXPECT_EQ(observed_heap.Flags, heap_desc.Flags);
+
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+  void *protected_session =
+      reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(heap->GetProtectedResourceSession(
+                __uuidof(ID3D12ProtectedResourceSession),
+                &protected_session),
+            DXGI_ERROR_NOT_FOUND);
+  EXPECT_EQ(protected_session, nullptr);
+  EXPECT_EQ(heap->GetProtectedResourceSession(
+                __uuidof(ID3D12ProtectedResourceSession), nullptr),
+            E_POINTER);
+
+  ComPtr<IUnknown> heap_identity;
+  ComPtr<ID3D12Heap> base_heap;
+  ComPtr<IUnknown> base_identity;
+  ASSERT_EQ(heap->QueryInterface(IID_PPV_ARGS(heap_identity.put())), S_OK);
+  ASSERT_EQ(heap->QueryInterface(IID_PPV_ARGS(base_heap.put())), S_OK);
+  ASSERT_EQ(base_heap->QueryInterface(IID_PPV_ARGS(base_identity.put())),
+            S_OK);
+  EXPECT_EQ(heap_identity.get(), base_identity.get());
+#endif
 
   const auto resource_desc = BufferDesc();
   ComPtr<ID3D12Resource> resource;
