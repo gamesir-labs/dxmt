@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cassert>
 #include <debugapi.h>
+#include <memory>
 
 namespace dxmt {
 
@@ -41,6 +42,8 @@ public:
   }
 
   Obj &operator=(T *object) {
+    if (m_ptr == object)
+      return *this;
     this->decRef();
     m_ptr = object;
     this->incRef();
@@ -55,9 +58,11 @@ public:
   }
 
   Obj &operator=(Obj &&other) {
-    this->decRef();
-    this->m_ptr = other.m_ptr;
-    other.m_ptr = nullptr;
+    if (this != std::addressof(other)) {
+      this->decRef();
+      this->m_ptr = other.m_ptr;
+      other.m_ptr = nullptr;
+    }
     return *this;
   }
 

@@ -8,6 +8,7 @@
 #include "util_flags.hpp"
 #include "util_hash.hpp"
 #include "util_svector.hpp"
+#include "objc_pointer.hpp"
 
 #include <array>
 #include <cstdint>
@@ -271,6 +272,54 @@ TEST(ReferenceCountedPointer, ConvertsDerivedCopiesAndMovesWithoutLeaks) {
     EXPECT_EQ(object.references, 2);
   }
   EXPECT_EQ(object.references, 0);
+}
+
+struct ObjcProbeState {
+  uint32_t references = 1;
+  bool reached_zero = false;
+  bool resurrected = false;
+};
+
+class ObjcProbe {
+public:
+  explicit ObjcProbe(ObjcProbeState &state) : state_(state) {}
+
+  void retain() {
+    if (state_.reached_zero)
+      state_.resurrected = true;
+    ++state_.references;
+  }
+
+  void release() {
+    if (!--state_.references)
+      state_.reached_zero = true;
+  }
+
+  uint32_t retainCount() const { return state_.references; }
+
+private:
+  ObjcProbeState &state_;
+};
+
+TEST(ObjectiveCPointer, SameRawPointerAndSelfMovePreserveOwnership) {
+  ObjcProbeState state;
+  ObjcProbe object(state);
+  {
+    auto pointer = dxmt::transfer(&object);
+    pointer = pointer.ptr();
+    EXPECT_EQ(pointer.ptr(), &object);
+    EXPECT_EQ(state.references, 1u);
+    EXPECT_FALSE(state.reached_zero);
+
+    auto &alias = pointer;
+    pointer = std::move(alias);
+    EXPECT_EQ(pointer.ptr(), &object);
+    EXPECT_EQ(state.references, 1u);
+  }
+
+  EXPECT_TRUE(state.reached_zero);
+  EXPECT_FALSE(state.resurrected);
+  EXPECT_EQ(state.references, 0u);
 }
 
 } // namespace
