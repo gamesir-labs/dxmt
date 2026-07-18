@@ -19692,6 +19692,10 @@ private:
     for (const auto &vb : input_assembler.vertex_buffers) {
       if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
         continue;
+      if (!vb.view.BufferLocation || !vb.view.SizeInBytes) {
+        enc.bindVertexBuffer(vb.slot, 0, 0, Rc<Buffer>());
+        continue;
+      }
       Resource *resource = nullptr;
       const auto offset =
           ResolveBufferGpuAddress(vb.view.BufferLocation, resource);

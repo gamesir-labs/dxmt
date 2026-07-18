@@ -456,4 +456,128 @@ TEST_F(GraphicsInstancingSpec,
   }
 }
 
+TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
+  const auto vertex = CompileShader(R"(
+    struct Input {
+      float2 position : POSITION;
+      float4 marker : MARKER;
+    };
+    struct Output {
+      float4 position : SV_Position;
+      nointerpolation float marker : MARKER;
+    };
+    Output main(Input input) {
+      Output output;
+      output.position = float4(input.position, 0.0, 1.0);
+      output.marker = input.marker.r;
+      return output;
+    })",
+                                    "vs_5_0");
+  const auto pixel = CompileShader(R"(
+    float4 main(nointerpolation float marker : MARKER) : SV_Target {
+      return float4(marker, 0.0, 0.0, 1.0);
+    })",
+                                   "ps_5_0");
+  ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  const D3D12_INPUT_ELEMENT_DESC inputs[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"MARKER", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0,
+       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+  };
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root.get();
+  desc.VS = {vertex.bytecode->GetBufferPointer(),
+             vertex.bytecode->GetBufferSize()};
+  desc.PS = {pixel.bytecode->GetBufferPointer(),
+             pixel.bytecode->GetBufferSize()};
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.InputLayout = {inputs, 2};
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_EQ(context_.device()->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(pipeline.put())),
+            S_OK);
+
+  constexpr std::array<std::array<float, 2>, 3> positions = {
+      {{-1.0f, -1.0f}, {-1.0f, 3.0f}, {3.0f, -1.0f}}};
+  constexpr std::array<std::array<float, 4>, 3> markers = {{
+      {1.0f, 0.0f, 0.0f, 1.0f},
+      {1.0f, 0.0f, 0.0f, 1.0f},
+      {1.0f, 0.0f, 0.0f, 1.0f},
+  }};
+  auto position_buffer = context_.CreateUploadBuffer(
+      sizeof(positions), positions.data(), sizeof(positions));
+  auto marker_buffer = context_.CreateUploadBuffer(
+      sizeof(markers), markers.data(), sizeof(markers));
+  ASSERT_TRUE(position_buffer);
+  ASSERT_TRUE(marker_buffer);
+  const D3D12_VERTEX_BUFFER_VIEW views[] = {
+      {position_buffer->GetGPUVirtualAddress(), sizeof(positions),
+       sizeof(positions[0])},
+      {marker_buffer->GetGPUVirtualAddress(), sizeof(markers),
+       sizeof(markers[0])},
+  };
+
+  constexpr UINT kSize = 8;
+  auto target =
+      context_.CreateTexture2D(kSize, kSize, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(rtv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  constexpr FLOAT clear[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, clear, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetVertexBuffers(0, 2, views);
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, float(kSize), float(kSize), 0, 1};
+  const D3D12_RECT scissor = {0, 0, kSize, kSize};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawInstanced(positions.size(), 1, 0, 0);
+
+  const D3D12_VERTEX_BUFFER_VIEW empty_view = {};
+  context_.list()->IASetVertexBuffers(1, 1, &empty_view);
+  context_.list()->DrawInstanced(positions.size(), 1, 0, 0);
+  D3D12TestContext::Transition(context_.list(), target.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      std::uint32_t value = 0;
+      std::memcpy(&value,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(value),
+                  sizeof(value));
+      EXPECT_TRUE(ColorsMatch(value, 0xff000000u, 0))
+          << "pixel (" << x << ", " << y << ") was 0x" << std::hex << value;
+    }
+  }
+}
+
 } // namespace
