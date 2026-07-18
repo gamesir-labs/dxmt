@@ -324,6 +324,81 @@ TEST_F(VersionedApiSpec,
   }
 }
 
+TEST_F(VersionedApiSpec,
+       ResourceCreationCapabilityProbesMatchBaseApis) {
+  auto device4 = QueryDevice<ID3D12Device4>();
+  auto device8 = QueryDevice<ID3D12Device8>();
+  ASSERT_TRUE(device4);
+  ASSERT_TRUE(device8);
+  const auto properties = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+  const auto desc = BufferDesc();
+  const auto desc1 = BufferDesc1();
+
+  EXPECT_EQ(context_.device()->CreateCommittedResource(
+                &properties, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            S_FALSE);
+  EXPECT_EQ(device4->CreateCommittedResource1(
+                &properties, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            S_FALSE);
+  EXPECT_EQ(device8->CreateCommittedResource2(
+                &properties, D3D12_HEAP_FLAG_NONE, &desc1,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            S_FALSE);
+
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Properties = properties;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ComPtr<ID3D12Heap> heap;
+  ASSERT_EQ(context_.device()->CreateHeap(
+                &heap_desc, __uuidof(ID3D12Heap),
+                reinterpret_cast<void **>(heap.put())),
+            S_OK);
+  ASSERT_TRUE(heap);
+  EXPECT_EQ(context_.device()->CreatePlacedResource(
+                heap.get(), 0, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, __uuidof(ID3D12Resource), nullptr),
+            S_FALSE);
+  EXPECT_EQ(device8->CreatePlacedResource1(
+                heap.get(), 0, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, __uuidof(ID3D12Resource), nullptr),
+            S_FALSE);
+
+  auto invalid_desc = desc;
+  invalid_desc.Width = 0;
+  auto invalid_desc1 = desc1;
+  invalid_desc1.Width = 0;
+  EXPECT_EQ(context_.device()->CreateCommittedResource(
+                &properties, D3D12_HEAP_FLAG_NONE, &invalid_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(device4->CreateCommittedResource1(
+                &properties, D3D12_HEAP_FLAG_NONE, &invalid_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(device8->CreateCommittedResource2(
+                &properties, D3D12_HEAP_FLAG_NONE, &invalid_desc1,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, nullptr,
+                __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(context_.device()->CreatePlacedResource(
+                heap.get(), 1, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+  EXPECT_EQ(device8->CreatePlacedResource1(
+                heap.get(), 1, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, __uuidof(ID3D12Resource), nullptr),
+            E_INVALIDARG);
+}
+
 TEST_F(VersionedApiSpec, CreateCommandQueue1ExecutesFenceSignal) {
   auto device9 = QueryDevice<ID3D12Device9>();
   ASSERT_TRUE(device9);

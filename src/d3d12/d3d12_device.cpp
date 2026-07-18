@@ -4457,18 +4457,18 @@ public:
         dxmt::perf::FrameTimeBucket::CreateResource);
     BeginDeviceCall("CreateCommittedResource");
     InitReturnPtr(resource);
-    if (!resource)
-      return E_POINTER;
-    if (ShouldInjectCreationFailure(
-            "DXMT_TEST_FAIL_RESOURCE_CREATION_AT",
-            g_test_resource_creation_occurrence))
-      return E_OUTOFMEMORY;
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         optimized_clear_value)
       return WARN_E_INVALIDARG(__func__);
     if (!IsValidCommittedResourceDesc(heap_properties, heap_flags, desc,
                                       initial_state))
       return WARN_E_INVALIDARG(__func__);
+    if (!resource)
+      return S_FALSE;
+    if (ShouldInjectCreationFailure(
+            "DXMT_TEST_FAIL_RESOURCE_CREATION_AT",
+            g_test_resource_creation_occurrence))
+      return E_OUTOFMEMORY;
     const char *metal_fault = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
                                   ? "DXMT_TEST_FAIL_METAL_BUFFER_CREATION_AT"
                                   : "DXMT_TEST_FAIL_METAL_TEXTURE_CREATION_AT";
@@ -4535,8 +4535,6 @@ public:
         dxmt::perf::FrameTimeBucket::CreateResource);
     BeginDeviceCall("CreatePlacedResource");
     InitReturnPtr(resource);
-    if (!resource)
-      return E_POINTER;
     if (!heap || !desc)
       return WARN_E_INVALIDARG(__func__);
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
@@ -4595,6 +4593,8 @@ public:
            " dimension=", desc->Dimension);
       return E_NOTIMPL;
     }
+    if (!resource)
+      return S_FALSE;
     dxmt::Buffer *placed_buffer =
         desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !placement_heap
             ? heap_object->GetBuffer()
