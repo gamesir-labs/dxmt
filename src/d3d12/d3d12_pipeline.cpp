@@ -945,6 +945,7 @@ AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
   if (!producer_info || !consumer_info)
     return true;
 
+  size_t producer_search_start = 0;
   for (uint32_t consumer_sig_index = 0;
        consumer_sig_index < consumer_info->signatures.size();
        consumer_sig_index++) {
@@ -954,7 +955,8 @@ AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
       continue;
 
     auto match = std::find_if(
-        producer_info->signatures.begin(), producer_info->signatures.end(),
+        producer_info->signatures.begin() + producer_search_start,
+        producer_info->signatures.end(),
         [&](const dxil::DxilTranslationSignatureElementInfo &producer_sig) {
           return producer_sig.kind ==
                      dxil::DxilTranslationSignatureKind::Output &&
@@ -973,6 +975,8 @@ AppendSignatureLinks(const std::vector<PipelineDxilShader> &shaders,
       return false;
     }
 
+    producer_search_start =
+        size_t(match - producer_info->signatures.begin()) + 1;
     links.push_back({
         .producer_shader_index = producer_shader_index,
         .producer_signature_index =

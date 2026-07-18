@@ -100,6 +100,34 @@ float4 main(nointerpolation uint4 varying : TEXCOORD0) : SV_Target {
 }
 )";
 
+constexpr char kOrderedVaryingVertexShader[] = R"(
+struct Output {
+  float4 position : SV_Position;
+  float2 first : TEXCOORD0;
+  float2 second : TEXCOORD1;
+};
+
+Output main(uint vertex_id : SV_VertexID) {
+  const float2 positions[3] = {
+    float2(-1.0, -1.0),
+    float2(-1.0,  3.0),
+    float2( 3.0, -1.0)
+  };
+  Output output;
+  output.position = float4(positions[vertex_id], 0.0, 1.0);
+  output.first = float2(0.25, 0.5);
+  output.second = float2(0.75, 1.0);
+  return output;
+}
+)";
+
+constexpr char kReversedVaryingPixelShader[] = R"(
+float4 main(float2 second : TEXCOORD1,
+            float2 first : TEXCOORD0) : SV_Target {
+  return float4(first, second);
+}
+)";
+
 class D3D12ScalarVaryingSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -247,6 +275,11 @@ TEST_F(D3D12ScalarVaryingSpec, RejectsConsumerSemanticMissingFromProducer) {
 TEST_F(D3D12ScalarVaryingSpec, RejectsConsumerComponentTypeMismatch) {
   ExpectLinkageRejected(kWideVaryingVertexShader,
                         kIntegerVaryingPixelShader);
+}
+
+TEST_F(D3D12ScalarVaryingSpec, RejectsReorderedConsumerSignature) {
+  ExpectLinkageRejected(kOrderedVaryingVertexShader,
+                        kReversedVaryingPixelShader);
 }
 
 } // namespace
