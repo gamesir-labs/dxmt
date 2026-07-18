@@ -325,6 +325,55 @@ TEST_F(VersionedApiSpec,
 }
 
 TEST_F(VersionedApiSpec,
+       GetResourceAllocationInfo2InvalidatesFromFirstInvalidDescription) {
+  auto device4 = QueryDevice<ID3D12Device4>();
+  auto device8 = QueryDevice<ID3D12Device8>();
+  ASSERT_TRUE(device4);
+  ASSERT_TRUE(device8);
+  std::array<D3D12_RESOURCE_DESC, 3> legacy_descs = {
+      BufferDesc(1024), BufferDesc(2048), BufferDesc(4096)};
+  std::array<D3D12_RESOURCE_DESC1, 3> descs1 = {
+      BufferDesc1(1024), BufferDesc1(2048), BufferDesc1(4096)};
+  legacy_descs[1].Width = 0;
+  descs1[1].Width = 0;
+
+  std::array<D3D12_RESOURCE_ALLOCATION_INFO1, 3> legacy_entries = {};
+  std::array<D3D12_RESOURCE_ALLOCATION_INFO1, 3> entries2 = {};
+  for (auto *entries : {&legacy_entries, &entries2}) {
+    for (auto &entry : *entries) {
+      entry.Offset = 7;
+      entry.Alignment = 9;
+      entry.SizeInBytes = 11;
+    }
+  }
+
+  const auto legacy_info = device4->GetResourceAllocationInfo1(
+      0, legacy_descs.size(), legacy_descs.data(), legacy_entries.data());
+  const auto info2 = device8->GetResourceAllocationInfo2(
+      0, descs1.size(), descs1.data(), entries2.data());
+
+  EXPECT_EQ(info2.SizeInBytes, UINT64_MAX);
+  EXPECT_EQ(info2.Alignment, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+  EXPECT_EQ(info2.SizeInBytes, legacy_info.SizeInBytes);
+  EXPECT_EQ(info2.Alignment, legacy_info.Alignment);
+  for (std::size_t i = 0; i < entries2.size(); ++i) {
+    EXPECT_EQ(entries2[i].Offset, legacy_entries[i].Offset) << i;
+    EXPECT_EQ(entries2[i].Alignment, legacy_entries[i].Alignment) << i;
+    EXPECT_EQ(entries2[i].SizeInBytes, legacy_entries[i].SizeInBytes) << i;
+  }
+  EXPECT_EQ(entries2[0].Offset, 0u);
+  EXPECT_EQ(entries2[0].Alignment,
+            D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+  EXPECT_EQ(entries2[0].SizeInBytes,
+            D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+  for (std::size_t i = 1; i < entries2.size(); ++i) {
+    EXPECT_EQ(entries2[i].Offset, UINT64_MAX) << i;
+    EXPECT_EQ(entries2[i].Alignment, 0u) << i;
+    EXPECT_EQ(entries2[i].SizeInBytes, UINT64_MAX) << i;
+  }
+}
+
+TEST_F(VersionedApiSpec,
        ResourceCreationCapabilityProbesMatchBaseApis) {
   auto device4 = QueryDevice<ID3D12Device4>();
   auto device8 = QueryDevice<ID3D12Device8>();
