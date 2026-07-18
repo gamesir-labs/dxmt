@@ -12,6 +12,7 @@ namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::CompileShader;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 UINT ReadUint(const std::vector<std::uint8_t> &bytes, UINT64 offset) {
@@ -353,6 +354,7 @@ enum class InvalidUavCounterKind {
   OutOfRangeOffset,
   OffsetWithoutResource,
   TextureCounter,
+  ForeignCounter,
   MissingDescription,
 };
 
@@ -409,6 +411,8 @@ TEST_P(D3D12InvalidUavCounterSpec, InvalidDescriptorMaterializesAsInertUav) {
   uav.Buffer.StructureByteStride = sizeof(UINT);
   ID3D12Resource *counter_resource = counter.get();
   const D3D12_UNORDERED_ACCESS_VIEW_DESC *uav_desc = &uav;
+  ComPtr<ID3D12Device> foreign_device;
+  ComPtr<ID3D12Resource> foreign_counter;
   switch (GetParam().kind) {
   case InvalidUavCounterKind::MisalignedOffset:
     uav.Buffer.CounterOffsetInBytes = sizeof(UINT);
@@ -425,6 +429,29 @@ TEST_P(D3D12InvalidUavCounterSpec, InvalidDescriptorMaterializesAsInertUav) {
   case InvalidUavCounterKind::TextureCounter:
     counter_resource = texture_counter.get();
     break;
+  case InvalidUavCounterKind::ForeignCounter: {
+    foreign_device = CreateIsolatedD3D12Device();
+    ASSERT_TRUE(foreign_device);
+    D3D12_HEAP_PROPERTIES heap_properties = {};
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kCounterSize;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ASSERT_EQ(foreign_device->CreateCommittedResource(
+                  &heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                  IID_PPV_ARGS(foreign_counter.put())),
+              S_OK);
+    ASSERT_TRUE(foreign_counter);
+    counter_resource = foreign_counter.get();
+    break;
+  }
   case InvalidUavCounterKind::MissingDescription:
     uav_desc = nullptr;
     break;
@@ -462,6 +489,8 @@ INSTANTIATE_TEST_SUITE_P(
                               "OffsetWithoutResource"},
         InvalidUavCounterCase{InvalidUavCounterKind::TextureCounter,
                               "TextureCounter"},
+        InvalidUavCounterCase{InvalidUavCounterKind::ForeignCounter,
+                              "ForeignCounter"},
         InvalidUavCounterCase{InvalidUavCounterKind::MissingDescription,
                               "MissingDescription"}),
     InvalidUavCounterCaseName);
