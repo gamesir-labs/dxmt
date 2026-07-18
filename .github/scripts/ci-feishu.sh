@@ -112,7 +112,6 @@ send_card_v1() {
   local webhook="${1:-}"
   local title="${2:-}"
   local template="${3:-}"
-  local markdown="${4:-}"
   local tmp
 
   if [[ -z "${webhook}" ]]; then
@@ -120,14 +119,26 @@ send_card_v1() {
     return 0
   fi
 
+  shift 3
+  (($# > 0)) || die 'send-card-v1 requires at least one markdown section'
+
   tmp="$(mktemp "${TMPDIR:-/tmp}/dxmt-feishu.XXXXXX.json")"
   # shellcheck disable=SC2064
   trap 'rm -f "'"${tmp}"'"' RETURN
 
-  python3 - "$title" "$template" "$markdown" >"${tmp}" <<'PY'
+  python3 - "$title" "$template" "$@" >"${tmp}" <<'PY'
 import json, sys
 
-title, template, markdown = sys.argv[1:4]
+title, template, *sections = sys.argv[1:]
+elements = []
+for section in sections:
+    if elements:
+        elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": section},
+    })
+
 payload = {
     "msg_type": "interactive",
     "card": {
@@ -135,12 +146,7 @@ payload = {
             "title": {"tag": "plain_text", "content": title},
             "template": template,
         },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": markdown},
-            }
-        ],
+        "elements": elements,
     },
 }
 json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
@@ -155,7 +161,7 @@ usage: ci-feishu.sh <command> [args]
 
 commands:
   send-card <webhook> <title> <template> <markdown> [subtitle]
-  send-card-v1 <webhook> <title> <template> <markdown>
+  send-card-v1 <webhook> <title> <template> <markdown-section> [markdown-section...]
   label <name>
 EOF
 }

@@ -103,7 +103,7 @@ function Send-FeishuCard {
     $elements += [ordered]@{
       tag       = 'button'
       text      = [ordered]@{ tag = 'plain_text'; content = $ActionText }
-      type      = 'default'
+      type      = 'primary'
       width     = 'default'
       size      = 'medium'
       behaviors = @(

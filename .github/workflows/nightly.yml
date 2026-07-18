@@ -449,19 +449,20 @@ jobs:
           set -euo pipefail
           chmod +x .github/scripts/ci-feishu.sh
           run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          md="$(printf '%s\n' \
+          identity_md="$(printf '%s\n' \
             "**$(.github/scripts/ci-feishu.sh label version):** ${{ needs.package.outputs.package_name }}" \
             "**$(.github/scripts/ci-feishu.sh label commit):** \`${{ github.sha }}\`" \
             "**$(.github/scripts/ci-feishu.sh label branch):** ${{ github.ref_name }}" \
-            "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
-            "" \
+            "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}")"
+          package_md="$(printf '%s\n' \
             "**📦 $(.github/scripts/ci-feishu.sh label component_package):** [$(.github/scripts/ci-feishu.sh label download)](${{ needs.package.outputs.artifact_url }})" \
             "**$(.github/scripts/ci-feishu.sh label size):** ${{ needs.package.outputs.package_size }} bytes" \
-            "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`" \
-            "" \
-            "**$(.github/scripts/ci-feishu.sh label run_link):** [$(.github/scripts/ci-feishu.sh label view_detail)](${run_url})")"
+            "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`")"
+          run_md="**$(.github/scripts/ci-feishu.sh label run_link):** [$(.github/scripts/ci-feishu.sh label view_detail)](${run_url})"
           .github/scripts/ci-feishu.sh send-card-v1 \
             "${FEISHU_WEBHOOK_URL}" \
             "$(.github/scripts/ci-feishu.sh label build_ok)" \
             green \
-            "${md}"
+            "${identity_md}" \
+            "${package_md}" \
+            "${run_md}"
