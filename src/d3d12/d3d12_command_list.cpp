@@ -2770,6 +2770,11 @@ public:
       WARN("D3D12GraphicsCommandList: ExecuteBundle called with non-bundle command list");
       return;
     }
+    if (bundle->GetParentDevice() != device_.ptr()) {
+      recording_error_ = E_INVALIDARG;
+      WARN("D3D12GraphicsCommandList: ExecuteBundle called with cross-device bundle");
+      return;
+    }
     if (!bundle->IsClosed()) {
       recording_error_ = E_INVALIDARG;
       WARN("D3D12GraphicsCommandList: ExecuteBundle called with an open bundle");

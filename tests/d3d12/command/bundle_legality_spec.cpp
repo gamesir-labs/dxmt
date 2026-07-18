@@ -11,6 +11,7 @@ namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::CompileShader;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class BundleLegalitySpec : public ::testing::Test {
@@ -164,6 +165,52 @@ TEST_F(BundleLegalitySpec, ExecutesDispatchAndDropsClearState) {
   UINT actual = 0;
   std::memcpy(&actual, bytes.data(), sizeof(actual));
   EXPECT_EQ(actual, expected);
+}
+
+TEST_F(BundleLegalitySpec, RejectsForeignBundleAndAllowsFreshListRecovery) {
+  auto foreign_device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(foreign_device);
+  D3D12TestContext foreign_context;
+  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
+  ComPtr<ID3D12CommandAllocator> foreign_allocator;
+  ComPtr<ID3D12GraphicsCommandList> foreign_bundle;
+  ASSERT_EQ(foreign_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                IID_PPV_ARGS(foreign_allocator.put())),
+            S_OK);
+  ASSERT_EQ(foreign_device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE, foreign_allocator.get(),
+                nullptr, IID_PPV_ARGS(foreign_bundle.put())),
+            S_OK);
+  ASSERT_EQ(foreign_bundle->Close(), S_OK);
+
+  context_.list()->ExecuteBundle(foreign_bundle.get());
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> bundle_allocator;
+  ComPtr<ID3D12GraphicsCommandList> bundle;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                IID_PPV_ARGS(bundle_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.get(),
+                nullptr, IID_PPV_ARGS(bundle.put())),
+            S_OK);
+  ASSERT_EQ(bundle->Close(), S_OK);
+  ComPtr<ID3D12CommandAllocator> recovery_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recovery_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recovery_allocator.get(),
+                nullptr, IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  recovery_list->ExecuteBundle(bundle.get());
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
