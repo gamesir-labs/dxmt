@@ -812,6 +812,35 @@ TEST(DxilParser, ParsesMinimalLlvmModuleEndToEnd) {
   EXPECT_TRUE(has_error("invalid-rdat-resource-range"));
   EXPECT_TRUE(has_error("invalid-thread-group-size"));
   EXPECT_TRUE(has_error("invalid-psv-resource-range"));
+
+  auto stage_psv = psv;
+  stage_psv[runtime_offset + 24] = 1;
+  const auto stage_container =
+      DxilContainerBuilder()
+          .add(fourcc::Dxil, program)
+          .add(fourcc::RuntimeData, runtime_data)
+          .add(fourcc::PipelineStateValidation, stage_psv)
+          .build();
+  Parser stage_parser;
+  ASSERT_EQ(stage_parser.parse(stage_container), ParseStatus::Ok);
+  ASSERT_TRUE(stage_parser.dxilValidation().has_value());
+  const auto &stage_validation = *stage_parser.dxilValidation();
+  EXPECT_FALSE(stage_validation.valid);
+  EXPECT_EQ(stage_validation.error_count, 2u);
+  const auto has_stage_error = [&](std::string_view code) {
+    return std::any_of(
+        stage_validation.diagnostics.begin(),
+        stage_validation.diagnostics.end(),
+        [&](const DxilValidationDiagnostic &diagnostic) {
+          return diagnostic.severity == DxilValidationSeverity::Error &&
+                 diagnostic.code == code;
+        });
+  };
+  EXPECT_TRUE(has_stage_error("psv-stage-mismatch"));
+  EXPECT_TRUE(has_stage_error("reflection-stage-mismatch"));
+  ASSERT_TRUE(stage_parser.dxilTranslation().has_value());
+  EXPECT_EQ(stage_parser.dxilTranslation()->shader_kind, 1u);
+  EXPECT_EQ(stage_parser.dxilTranslation()->shader_stage_name, "Vertex");
 }
 
 TEST(DxilBitcode, RejectsTruncatedStreamsAndWrappers) {
