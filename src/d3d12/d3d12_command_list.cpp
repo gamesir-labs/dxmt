@@ -2788,6 +2788,13 @@ public:
     if (RejectCommandListType(
             "SetDescriptorHeaps", kDirectList | kBundleList | kComputeList))
       return;
+    if (heaps && heap_count) {
+      for (UINT i = 0; i < heap_count; i++) {
+        const auto *heap = dynamic_cast<DescriptorHeap *>(heaps[i]);
+        if (!heap || heap->GetParentDevice() != device_.ptr())
+          return;
+      }
+    }
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_descriptor_heaps(
             this, heap_count, reinterpret_cast<const void *const *>(heaps));

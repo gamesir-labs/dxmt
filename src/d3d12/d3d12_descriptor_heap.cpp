@@ -196,6 +196,8 @@ public:
     return device_->QueryInterface(riid, device);
   }
 
+  IMTLD3D12Device *GetParentDevice() const override { return device_.ptr(); }
+
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
   D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE
   GetDesc(D3D12_DESCRIPTOR_HEAP_DESC *__ret) override {

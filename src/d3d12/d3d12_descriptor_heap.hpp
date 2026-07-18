@@ -90,6 +90,7 @@ GetDescriptorTextureViewShape(const DescriptorRecord &record) {
 
 class DescriptorHeap {
 public:
+  virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual const D3D12_DESCRIPTOR_HEAP_DESC &GetDescriptorHeapDesc() const = 0;
   virtual DescriptorRecord *GetDescriptorRecord(D3D12_CPU_DESCRIPTOR_HANDLE handle) = 0;
   virtual const DescriptorRecord *GetDescriptorRecord(D3D12_CPU_DESCRIPTOR_HANDLE handle) const = 0;
