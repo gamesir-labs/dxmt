@@ -202,6 +202,20 @@ TEST_P(CopyBufferInvalidSpec, FailsCommandListClose) {
   }
 
   EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+
+  ComPtr<ID3D12CommandAllocator> recovery_allocator;
+  ComPtr<ID3D12GraphicsCommandList> recovery_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(recovery_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, recovery_allocator.get(),
+                nullptr, IID_PPV_ARGS(recovery_list.put())),
+            S_OK);
+  recovery_list->CopyBufferRegion(destination.get(), 0, source.get(), 0, 1);
+  EXPECT_EQ(recovery_list->Close(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 std::string InvalidCopyBufferCaseName(
