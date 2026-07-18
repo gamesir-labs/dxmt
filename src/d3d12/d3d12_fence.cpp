@@ -111,6 +111,47 @@ D3D12FenceDiagDurationMs(D3D12FenceDiagClock::duration duration) {
   return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(duration).count();
 }
 
+struct FencePendingEvent {
+  UINT64 value;
+  HANDLE event;
+  D3D12FenceDiagClock::time_point registered_time;
+};
+
+struct FencePendingCallback {
+  UINT64 value;
+  std::function<void()> callback;
+  D3D12FenceDiagClock::time_point registered_time;
+};
+
+struct FenceCompletionState {
+  mutable std::mutex mutex;
+  std::vector<FencePendingEvent> pending_events;
+  std::vector<FencePendingCallback> pending_callbacks;
+  bool device_removed = false;
+};
+
+static void
+CompleteFenceForDeviceRemoval(
+    const std::shared_ptr<FenceCompletionState> &state) {
+  std::vector<HANDLE> events_to_signal;
+  std::vector<std::function<void()>> callbacks_to_run;
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->device_removed)
+      return;
+    state->device_removed = true;
+    for (const auto &pending : state->pending_events)
+      events_to_signal.push_back(pending.event);
+    state->pending_events.clear();
+    for (auto &pending : state->pending_callbacks)
+      callbacks_to_run.push_back(std::move(pending.callback));
+    state->pending_callbacks.clear();
+  }
+  for (HANDLE event : events_to_signal)
+    SetEvent(event);
+  RunCompletionCallbacksAsync(std::move(callbacks_to_run));
+}
+
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
@@ -118,6 +159,13 @@ public:
         completed_value_(initial_value), has_manual_completed_value_(false),
         last_signal_was_cpu_(false) {
     event_.signalValue(initial_value);
+    device_error_callback_ = std::make_shared<std::function<void()>>(
+        [state = completion_state_]() {
+          CompleteFenceForDeviceRemoval(state);
+        });
+    device_error_callback_id_ =
+        device_->GetDXMTDevice().queue().RegisterDeviceErrorCallback(
+            device_error_callback_);
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
       WARN_FILE_ONLY("D3D12 fence diagnostic: CreateFence"
@@ -129,19 +177,21 @@ public:
   }
 
   ~FenceImpl() override {
+    device_->GetDXMTDevice().queue().UnregisterDeviceErrorCallback(
+        device_error_callback_id_);
     std::vector<HANDLE> events_to_signal;
     std::vector<std::function<void()>> callbacks_to_run;
     {
-      std::lock_guard lock(mutex_);
+      std::lock_guard lock(completion_state_->mutex);
       completed_value_ = UINT64_MAX;
       has_manual_completed_value_ = true;
-      for (const auto &pending : pending_events_)
+      for (const auto &pending : completion_state_->pending_events)
         events_to_signal.push_back(pending.event);
-      pending_events_.clear();
-      for (auto &pending : pending_callbacks_) {
+      completion_state_->pending_events.clear();
+      for (auto &pending : completion_state_->pending_callbacks) {
         callbacks_to_run.push_back(std::move(pending.callback));
       }
-      pending_callbacks_.clear();
+      completion_state_->pending_callbacks.clear();
     }
     for (HANDLE event : events_to_signal)
       SetEvent(event);
@@ -190,7 +240,7 @@ public:
   }
 
   UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(completion_state_->mutex);
     const UINT64 value = GetCompletedValueLocked();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
@@ -198,14 +248,14 @@ public:
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value,
            " manual=", has_manual_completed_value_,
-           " pendingEvents=", pending_events_.size(),
-           " pendingCallbacks=", pending_callbacks_.size());
+           " pendingEvents=", completion_state_->pending_events.size(),
+           " pendingCallbacks=", completion_state_->pending_callbacks.size());
     }
     return value;
   }
 
   UINT64 GetCompletedValue() const override {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(completion_state_->mutex);
     const UINT64 value = GetCompletedValueLocked();
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
@@ -213,8 +263,8 @@ public:
            " fence=", reinterpret_cast<uintptr_t>(this),
            " value=", value,
            " manual=", has_manual_completed_value_,
-           " pendingEvents=", pending_events_.size(),
-           " pendingCallbacks=", pending_callbacks_.size());
+           " pendingEvents=", completion_state_->pending_events.size(),
+           " pendingCallbacks=", completion_state_->pending_callbacks.size());
     }
     return value;
   }
@@ -232,7 +282,7 @@ public:
       const auto wait_begin_time = D3D12FenceDiagClock::now();
       while (true) {
         {
-          std::lock_guard lock(mutex_);
+          std::lock_guard lock(completion_state_->mutex);
           if (GetCompletedValueLocked() >= value) {
             const auto wait_end_time = D3D12FenceDiagClock::now();
             static std::atomic<uint32_t> wait_log_count = 0;
@@ -251,11 +301,12 @@ public:
 
     bool signal_now = false;
     {
-      std::lock_guard lock(mutex_);
+      std::lock_guard lock(completion_state_->mutex);
       if (GetCompletedValueLocked() >= value) {
         signal_now = true;
       } else {
-        pending_events_.push_back({value, event, register_time});
+        completion_state_->pending_events.push_back(
+            {value, event, register_time});
       }
     }
 
@@ -283,7 +334,7 @@ public:
     std::vector<HANDLE> events_to_signal;
     std::vector<std::function<void()>> callbacks_to_run;
     {
-      std::lock_guard lock(mutex_);
+      std::lock_guard lock(completion_state_->mutex);
       completed_value_ = value;
       has_manual_completed_value_ = true;
       last_signal_was_cpu_ = true;
@@ -317,7 +368,7 @@ public:
     std::vector<HANDLE> events_to_signal;
     std::vector<std::function<void()>> callbacks_to_run;
     {
-      std::lock_guard lock(mutex_);
+      std::lock_guard lock(completion_state_->mutex);
       completed_value_ = value;
       has_manual_completed_value_ = true;
       last_signal_was_cpu_ = false;
@@ -350,11 +401,12 @@ public:
     }
     bool run_now = false;
     {
-      std::lock_guard lock(mutex_);
+      std::lock_guard lock(completion_state_->mutex);
       if (GetCompletedValueLocked() >= value) {
         run_now = true;
       } else {
-        pending_callbacks_.push_back({value, std::move(callback), register_time});
+        completion_state_->pending_callbacks.push_back(
+            {value, std::move(callback), register_time});
       }
     }
 
@@ -379,7 +431,7 @@ public:
   }
 
   void RegisterQueueSignal(const FenceGpuSignal &signal) override {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(completion_state_->mutex);
     if (flags_ & D3D12_FENCE_FLAG_SHARED)
       return;
 
@@ -417,7 +469,7 @@ public:
   }
 
   FenceGpuWaitStatus TryResolveGpuWait(UINT64 value, FenceGpuSignal &signal) const override {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(completion_state_->mutex);
     if (GetCompletedValueLocked() >= value)
       return FenceGpuWaitStatus::Resolved;
     if (last_signal_was_cpu_)
@@ -439,20 +491,9 @@ public:
   }
 
 private:
-  struct PendingEvent {
-    UINT64 value;
-    HANDLE event;
-    D3D12FenceDiagClock::time_point registered_time;
-  };
-
-  struct PendingCallback {
-    UINT64 value;
-    std::function<void()> callback;
-    D3D12FenceDiagClock::time_point registered_time;
-  };
-
   UINT64 GetCompletedValueLocked() const {
-    if (device_->GetDXMTDevice().queue().HasDeviceError())
+    if (completion_state_->device_removed ||
+        device_->GetDXMTDevice().queue().HasDeviceError())
       return UINT64_MAX;
     if (has_manual_completed_value_)
       return completed_value_;
@@ -464,8 +505,9 @@ private:
       std::vector<std::function<void()>> &callbacks) {
     const UINT64 completed_value = GetCompletedValueLocked();
     const auto completed_time = D3D12FenceDiagClock::now();
-    auto it = std::remove_if(pending_events_.begin(), pending_events_.end(),
-                             [&](const PendingEvent &pending) {
+    auto it = std::remove_if(completion_state_->pending_events.begin(),
+                             completion_state_->pending_events.end(),
+                             [&](const FencePendingEvent &pending) {
                                if (completed_value < pending.value)
                                  return false;
                                events.push_back(pending.event);
@@ -479,10 +521,12 @@ private:
                                }
                                return true;
                              });
-    pending_events_.erase(it, pending_events_.end());
+    completion_state_->pending_events.erase(
+        it, completion_state_->pending_events.end());
     auto callback_it = std::remove_if(
-        pending_callbacks_.begin(), pending_callbacks_.end(),
-        [&](PendingCallback &pending) {
+        completion_state_->pending_callbacks.begin(),
+        completion_state_->pending_callbacks.end(),
+        [&](FencePendingCallback &pending) {
           if (completed_value < pending.value)
             return false;
           callbacks.push_back(std::move(pending.callback));
@@ -496,7 +540,8 @@ private:
           }
           return true;
         });
-    pending_callbacks_.erase(callback_it, pending_callbacks_.end());
+    completion_state_->pending_callbacks.erase(
+        callback_it, completion_state_->pending_callbacks.end());
   }
 
   void pruneGpuSignalsLocked(UINT64 completed_value) {
@@ -512,9 +557,10 @@ private:
   ComPrivateData private_data_;
   WMT::Reference<WMT::SharedEvent> event_;
   D3D12_FENCE_FLAGS flags_;
-  mutable std::mutex mutex_;
-  std::vector<PendingEvent> pending_events_;
-  std::vector<PendingCallback> pending_callbacks_;
+  std::shared_ptr<FenceCompletionState> completion_state_ =
+      std::make_shared<FenceCompletionState>();
+  std::shared_ptr<std::function<void()>> device_error_callback_;
+  uint64_t device_error_callback_id_ = 0;
   std::vector<FenceGpuSignal> pending_gpu_signals_;
   UINT64 completed_value_;
   bool has_manual_completed_value_;

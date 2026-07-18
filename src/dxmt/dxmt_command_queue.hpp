@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -217,6 +218,10 @@ private:
   CpuFence frame_latency_fence_;
   std::atomic_bool stopped = false;
   std::atomic_bool device_error_ = false;
+  dxmt::mutex device_error_callbacks_mutex_;
+  uint64_t next_device_error_callback_id_ = 1;
+  std::unordered_map<uint64_t, std::weak_ptr<std::function<void()>>>
+      device_error_callbacks_;
   dxmt::mutex readback_mutex_;
   dxmt::condition_variable readback_cond_;
   std::vector<std::function<void()>> pending_readbacks_;
@@ -290,9 +295,12 @@ public:
     return device_error_.load(std::memory_order_acquire);
   }
 
-  void MarkDeviceError() {
-    device_error_.store(true, std::memory_order_release);
-  }
+  void MarkDeviceError();
+
+  uint64_t RegisterDeviceErrorCallback(
+      const std::shared_ptr<std::function<void()>> &callback);
+
+  void UnregisterDeviceErrorCallback(uint64_t callback_id);
 
   CommandChunk *
   CurrentChunk() {

@@ -339,6 +339,58 @@ CommandQueue::~CommandQueue() {
 }
 
 void
+CommandQueue::MarkDeviceError() {
+  if (device_error_.exchange(true, std::memory_order_acq_rel))
+    return;
+
+  std::vector<std::shared_ptr<std::function<void()>>> callbacks;
+  {
+    std::lock_guard<dxmt::mutex> lock(device_error_callbacks_mutex_);
+    callbacks.reserve(device_error_callbacks_.size());
+    for (auto &[callback_id, weak_callback] : device_error_callbacks_) {
+      (void)callback_id;
+      if (auto callback = weak_callback.lock())
+        callbacks.push_back(std::move(callback));
+    }
+    device_error_callbacks_.clear();
+  }
+
+  for (const auto &callback : callbacks)
+    (*callback)();
+}
+
+uint64_t
+CommandQueue::RegisterDeviceErrorCallback(
+    const std::shared_ptr<std::function<void()>> &callback) {
+  if (!callback)
+    return 0;
+
+  bool invoke_now = false;
+  uint64_t callback_id = 0;
+  {
+    std::lock_guard<dxmt::mutex> lock(device_error_callbacks_mutex_);
+    if (HasDeviceError())
+      invoke_now = true;
+    else {
+      callback_id = next_device_error_callback_id_++;
+      device_error_callbacks_.emplace(callback_id, callback);
+    }
+  }
+
+  if (invoke_now)
+    (*callback)();
+  return callback_id;
+}
+
+void
+CommandQueue::UnregisterDeviceErrorCallback(uint64_t callback_id) {
+  if (!callback_id)
+    return;
+  std::lock_guard<dxmt::mutex> lock(device_error_callbacks_mutex_);
+  device_error_callbacks_.erase(callback_id);
+}
+
+void
 CommandQueue::FlushFinalFrameStatistics() {
   if (!perf::enabled())
     return;

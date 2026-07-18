@@ -198,16 +198,22 @@ TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
             S_OK);
   ASSERT_TRUE(fence);
 
-  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  ASSERT_NE(event, nullptr);
+  HANDLE pending_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  HANDLE post_removal_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(pending_event, nullptr);
+  ASSERT_NE(post_removal_event, nullptr);
 
   EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(fence->SetEventOnCompletion(7, pending_event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(pending_event, 0), WAIT_TIMEOUT);
+  EXPECT_EQ(context.queue()->Wait(fence.get(), 7), S_OK);
   device5->RemoveDevice();
   device5->RemoveDevice();
   EXPECT_EQ(device->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED);
   EXPECT_EQ(fence->GetCompletedValue(), UINT64_MAX);
-  EXPECT_EQ(fence->SetEventOnCompletion(1, event), S_OK);
-  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+  EXPECT_EQ(WaitForSingleObject(pending_event, 0), WAIT_OBJECT_0);
+  EXPECT_EQ(fence->SetEventOnCompletion(1, post_removal_event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(post_removal_event, 0), WAIT_OBJECT_0);
   EXPECT_EQ(context.queue()->Signal(fence.get(), 1),
             DXGI_ERROR_DEVICE_REMOVED);
   EXPECT_EQ(context.queue()->Wait(fence.get(), 1),
@@ -227,7 +233,8 @@ TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
             S_OK);
   EXPECT_TRUE(fresh_fence);
 
-  CloseHandle(event);
+  CloseHandle(post_removal_event);
+  CloseHandle(pending_event);
 }
 
 } // namespace
