@@ -13,6 +13,7 @@
 
 namespace {
 
+using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 
 class LifetimeProbe final : public IUnknown {
@@ -261,6 +262,89 @@ TEST_F(PrivateDataSpec, SetNameCanBeReplacedRepeatedly) {
   for (const wchar_t *name : {L"first", L"second", L"third", L""})
     ASSERT_EQ(object()->SetName(name), S_OK);
   ExpectObjectRemainsUsable();
+}
+
+TEST_F(PrivateDataSpec, CommandObjectsKeepMetadataAndInterfacesIsolated) {
+  D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+  argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+  D3D12_COMMAND_SIGNATURE_DESC signature_desc = {};
+  signature_desc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+  signature_desc.NumArgumentDescs = 1;
+  signature_desc.pArgumentDescs = &argument;
+  ComPtr<ID3D12CommandSignature> signature;
+  ASSERT_EQ(context_.device()->CreateCommandSignature(
+                &signature_desc, nullptr, __uuidof(ID3D12CommandSignature),
+                reinterpret_cast<void **>(signature.put())),
+            S_OK);
+  ASSERT_TRUE(signature);
+
+  struct CommandObjectCase {
+    const wchar_t *name;
+    ID3D12Object *object;
+    std::uint32_t value;
+  };
+  const std::array objects = {
+      CommandObjectCase{L"allocator metadata", context_.allocator(),
+                        0xa110ca7eu},
+      CommandObjectCase{L"command list metadata", context_.list(),
+                        0xc0111570u},
+      CommandObjectCase{L"signature metadata", signature.get(),
+                        0x519a7e00u},
+  };
+  const GUID value_key = {0xbff8d24f,
+                          0x479b,
+                          0x44fe,
+                          {0xb7, 0xad, 0x47, 0x77, 0x73, 0xce, 0xb8, 0xa1}};
+  const GUID interface_key = {
+      0xe57f9866,
+      0x4828,
+      0x4832,
+      {0x86, 0x74, 0x81, 0xda, 0x5a, 0xbe, 0xc2, 0xd9}};
+
+  for (const auto &test : objects) {
+    SCOPED_TRACE(test.value);
+    ASSERT_EQ(test.object->SetName(test.name), S_OK);
+    ASSERT_EQ(test.object->SetPrivateData(value_key, sizeof(test.value),
+                                          &test.value),
+              S_OK);
+    ASSERT_EQ(test.object->SetPrivateDataInterface(interface_key,
+                                                   context_.device()),
+              S_OK);
+  }
+
+  for (const auto &test : objects) {
+    SCOPED_TRACE(test.value);
+    std::uint32_t actual = 0;
+    UINT value_size = sizeof(actual);
+    ASSERT_EQ(test.object->GetPrivateData(value_key, &value_size, &actual),
+              S_OK);
+    EXPECT_EQ(value_size, sizeof(actual));
+    EXPECT_EQ(actual, test.value);
+
+    IUnknown *stored_interface = nullptr;
+    UINT interface_size = sizeof(stored_interface);
+    ASSERT_EQ(test.object->GetPrivateData(interface_key, &interface_size,
+                                          &stored_interface),
+              S_OK);
+    ASSERT_NE(stored_interface, nullptr);
+    EXPECT_EQ(interface_size, sizeof(stored_interface));
+    ComPtr<IUnknown> stored_identity;
+    ComPtr<IUnknown> device_identity;
+    EXPECT_EQ(stored_interface->QueryInterface(
+                  __uuidof(IUnknown),
+                  reinterpret_cast<void **>(stored_identity.put())),
+              S_OK);
+    EXPECT_EQ(context_.device()->QueryInterface(
+                  __uuidof(IUnknown),
+                  reinterpret_cast<void **>(device_identity.put())),
+              S_OK);
+    EXPECT_EQ(stored_identity.get(), device_identity.get());
+    stored_interface->Release();
+
+    EXPECT_EQ(test.object->SetPrivateData(value_key, 0, nullptr), S_OK);
+    EXPECT_EQ(test.object->SetPrivateDataInterface(interface_key, nullptr),
+              S_OK);
+  }
 }
 
 } // namespace
