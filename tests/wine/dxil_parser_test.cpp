@@ -66,6 +66,49 @@ private:
   std::vector<Part> parts_;
 };
 
+class DxilRuntimeDataBuilder {
+public:
+  DxilRuntimeDataBuilder &add(uint32_t type, std::vector<uint8_t> data) {
+    parts_.push_back({type, std::move(data)});
+    return *this;
+  }
+
+  std::vector<uint8_t> build() const {
+    size_t total_size = dxmt::dxil::kRuntimeDataHeaderSize +
+                        parts_.size() * sizeof(uint32_t);
+    for (const auto &part : parts_)
+      total_size += dxmt::dxil::kRuntimeDataPartHeaderSize +
+                    ((part.data.size() + 3u) & ~size_t(3u));
+
+    std::vector<uint8_t> bytes(total_size);
+    Store<uint32_t>(bytes, 0, 1u);
+    Store<uint32_t>(bytes, 4, parts_.size());
+
+    size_t offset = dxmt::dxil::kRuntimeDataHeaderSize +
+                    parts_.size() * sizeof(uint32_t);
+    for (size_t i = 0; i < parts_.size(); ++i) {
+      Store<uint32_t>(bytes,
+                      dxmt::dxil::kRuntimeDataHeaderSize + i * sizeof(uint32_t),
+                      offset);
+      Store<uint32_t>(bytes, offset, parts_[i].type);
+      Store<uint32_t>(bytes, offset + 4, parts_[i].data.size());
+      std::copy(parts_[i].data.begin(), parts_[i].data.end(),
+                bytes.begin() + offset + dxmt::dxil::kRuntimeDataPartHeaderSize);
+      offset += dxmt::dxil::kRuntimeDataPartHeaderSize +
+                ((parts_[i].data.size() + 3u) & ~size_t(3u));
+    }
+    return bytes;
+  }
+
+private:
+  struct Part {
+    uint32_t type;
+    std::vector<uint8_t> data;
+  };
+
+  std::vector<Part> parts_;
+};
+
 dxmt::dxil::BlobPart Part(uint32_t fourcc, const std::vector<uint8_t> &bytes) {
   return {.fourcc = fourcc, .data = bytes};
 }
@@ -169,6 +212,22 @@ TEST(DxilContainer, RejectsAliasedPartRanges) {
   ContainerInfo info;
   EXPECT_EQ(ParseContainer(bytes.data(), bytes.size(), info),
             ParseStatus::InvalidPartOffset);
+}
+
+TEST(DxilContainer, ResetsStateBeforeRejectingMalformedInput) {
+  using namespace dxmt::dxil;
+  const auto valid =
+      DxilContainerBuilder().add(fourcc::PrivateData, {1, 2, 3}).build();
+  Parser parser;
+  ASSERT_EQ(parser.parseContainerOnly(valid), ParseStatus::Ok);
+  ASSERT_EQ(parser.container().parts.size(), 1u);
+
+  auto malformed = valid;
+  Store<uint32_t>(malformed, 0, 0u);
+  EXPECT_EQ(parser.parseContainerOnly(malformed),
+            ParseStatus::BadContainerMagic);
+  EXPECT_EQ(parser.container().container_size, 0u);
+  EXPECT_TRUE(parser.container().parts.empty());
 }
 
 TEST(DxilProgram, ParsesShaderVersionAndBitcodeRange) {
@@ -371,4 +430,233 @@ TEST(DxilParts, RejectsTruncatedFixedLayoutParts) {
   EXPECT_EQ(
       ParseShaderDebugName(Part(fourcc::ShaderDebugName, name_bytes), name),
       ParseStatus::InvalidShaderDebugName);
+}
+
+TEST(DxilRuntimeData, ParsesRawPartsAndTypedViews) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> empty(kRuntimeDataHeaderSize);
+  Store<uint32_t>(empty, 0, 1u);
+  RuntimeDataInfo empty_info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, empty), empty_info),
+            ParseStatus::Ok);
+  EXPECT_EQ(empty_info.version, 1u);
+  EXPECT_TRUE(empty_info.parts.empty());
+
+  std::vector<uint8_t> indices(3 * sizeof(uint32_t));
+  Store<uint32_t>(indices, 0, 2u);
+  Store<uint32_t>(indices, 4, 4u);
+  Store<uint32_t>(indices, 8, 9u);
+  const auto bytes = DxilRuntimeDataBuilder()
+                         .add(rdat::StringBuffer, {'m', 'a', 'i', 'n', 0})
+                         .add(rdat::IndexArrays, indices)
+                         .add(rdat::RawBytes, {10, 11, 12})
+                         .add(rdat::ResourceTable,
+                              std::vector<uint8_t>(kRuntimeDataTableHeaderSize))
+                         .build();
+
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_EQ(info.version, 1u);
+  EXPECT_EQ(info.part_count, 4u);
+  ASSERT_EQ(info.parts.size(), 4u);
+  EXPECT_EQ(info.findPart(rdat::RawBytes), &info.parts[2]);
+  EXPECT_TRUE(info.parts[3].is_table);
+  EXPECT_EQ(info.parts[3].record_count, 0u);
+
+  std::string name;
+  EXPECT_TRUE(info.readString(0, name));
+  EXPECT_EQ(name, "main");
+  EXPECT_FALSE(info.readString(5, name));
+
+  std::vector<uint32_t> values;
+  EXPECT_TRUE(info.readIndexArray(0, values));
+  EXPECT_EQ(values, (std::vector<uint32_t>{4, 9}));
+  EXPECT_FALSE(info.readIndexArray(kRdatNullRef, values));
+
+  std::span<const uint8_t> raw;
+  ASSERT_TRUE(info.readBytes(1, 2, raw));
+  EXPECT_TRUE(std::equal(raw.begin(), raw.end(),
+                         std::array<uint8_t, 2>{11, 12}.begin()));
+  EXPECT_FALSE(info.readBytes(2, 2, raw));
+}
+
+TEST(DxilRuntimeData, RejectsMalformedOffsetsSizesAndTables) {
+  using namespace dxmt::dxil;
+  RuntimeDataInfo info;
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  const std::vector<uint8_t> &bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+              ParseStatus::InvalidRuntimeData);
+  };
+
+  expect_invalid("truncated header",
+                 std::vector<uint8_t>(kRuntimeDataHeaderSize - 1));
+
+  std::vector<uint8_t> truncated_index(kRuntimeDataHeaderSize);
+  Store<uint32_t>(truncated_index, 4, 1u);
+  expect_invalid("truncated offset table", truncated_index);
+
+  const auto valid = DxilRuntimeDataBuilder().add(rdat::RawBytes, {1}).build();
+  auto malformed = valid;
+  Store<uint32_t>(malformed, kRuntimeDataHeaderSize,
+                  kRuntimeDataHeaderSize + sizeof(uint32_t) + 1);
+  expect_invalid("misaligned part offset", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, kRuntimeDataHeaderSize, kRuntimeDataHeaderSize);
+  expect_invalid("part offset inside table", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, kRuntimeDataHeaderSize, malformed.size());
+  expect_invalid("truncated part header", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed,
+                  kRuntimeDataHeaderSize + sizeof(uint32_t) + 4,
+                  std::numeric_limits<uint32_t>::max());
+  expect_invalid("part size overflow", malformed);
+
+  expect_invalid("unaligned index array",
+                 DxilRuntimeDataBuilder().add(rdat::IndexArrays, {1}).build());
+  expect_invalid(
+      "truncated table header",
+      DxilRuntimeDataBuilder().add(rdat::ResourceTable,
+                                   std::vector<uint8_t>(
+                                       kRuntimeDataTableHeaderSize - 1))
+          .build());
+
+  std::vector<uint8_t> table(kRuntimeDataTableHeaderSize);
+  Store<uint32_t>(table, 4, 2u);
+  expect_invalid(
+      "unaligned record stride",
+      DxilRuntimeDataBuilder().add(rdat::ResourceTable, table).build());
+
+  Store<uint32_t>(table, 0, 1u);
+  Store<uint32_t>(table, 4, kRdatResourceRecordSize);
+  expect_invalid(
+      "truncated record array",
+      DxilRuntimeDataBuilder().add(rdat::ResourceTable, table).build());
+}
+
+TEST(DxilRuntimeData, RejectsOverlappingPartRanges) {
+  using namespace dxmt::dxil;
+  auto bytes = DxilRuntimeDataBuilder()
+                   .add(rdat::RawBytes, {1, 2, 3, 4})
+                   .add(rdat::StringBuffer, {'x', 0})
+                   .build();
+  uint32_t first_offset = 0;
+  std::memcpy(&first_offset, bytes.data() + kRuntimeDataHeaderSize,
+              sizeof(first_offset));
+  Store<uint32_t>(bytes, kRuntimeDataHeaderSize + sizeof(uint32_t),
+                  first_offset);
+
+  RuntimeDataInfo info;
+  EXPECT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::InvalidRuntimeData);
+}
+
+TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
+  using namespace dxmt::dxil;
+  std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
+  Store<uint32_t>(bytes, 0, kPsvRuntimeInfo1Size);
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size, 0u);
+  Store<uint32_t>(bytes, 8 + kPsvRuntimeInfo1Size, 0u);
+  Store<uint32_t>(bytes, 12 + kPsvRuntimeInfo1Size, 0u);
+
+  PipelineStateValidationInfo info;
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::Ok);
+  EXPECT_TRUE(info.has_runtime_info_1);
+  EXPECT_FALSE(info.has_runtime_info_2);
+  EXPECT_TRUE(info.resources.empty());
+  EXPECT_TRUE(info.dependency_payload.empty());
+
+  bytes.assign(4 + 4 + 4 + kPsvResourceBindInfo1Size, 0);
+  Store<uint32_t>(bytes, 0, 0u);
+  Store<uint32_t>(bytes, 4, 1u);
+  Store<uint32_t>(bytes, 8, kPsvResourceBindInfo1Size);
+  Store<uint32_t>(bytes, 12, 3u);
+  Store<uint32_t>(bytes, 16, 4u);
+  Store<uint32_t>(bytes, 20, 5u);
+  Store<uint32_t>(bytes, 24, 6u);
+  Store<uint32_t>(bytes, 28, 7u);
+  Store<uint32_t>(bytes, 32, 8u);
+
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.resources.size(), 1u);
+  EXPECT_EQ(info.resources[0].resource_type, 3u);
+  EXPECT_EQ(info.resources[0].space, 4u);
+  EXPECT_EQ(info.resources[0].lower_bound, 5u);
+  EXPECT_EQ(info.resources[0].upper_bound, 6u);
+  EXPECT_EQ(info.resources[0].resource_kind, 7u);
+  EXPECT_EQ(info.resources[0].resource_flags, 8u);
+}
+
+TEST(DxilPipelineStateValidation, RejectsMalformedVariableLengthSections) {
+  using namespace dxmt::dxil;
+  PipelineStateValidationInfo info;
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  const std::vector<uint8_t> &bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParsePipelineStateValidation(
+                  Part(fourcc::PipelineStateValidation, bytes), info),
+              ParseStatus::InvalidPipelineStateValidation);
+  };
+
+  expect_invalid("truncated size field",
+                 std::vector<uint8_t>(sizeof(uint32_t) - 1));
+
+  std::vector<uint8_t> bytes(sizeof(uint32_t));
+  Store<uint32_t>(bytes, 0, 1u);
+  expect_invalid("truncated runtime info", bytes);
+
+  Store<uint32_t>(bytes, 0, 0u);
+  expect_invalid("missing resource count", bytes);
+
+  bytes.resize(2 * sizeof(uint32_t));
+  Store<uint32_t>(bytes, 4, 1u);
+  expect_invalid("missing resource stride", bytes);
+
+  bytes.resize(3 * sizeof(uint32_t));
+  Store<uint32_t>(bytes, 8, kPsvResourceBindInfo0Size - 4);
+  expect_invalid("short resource stride", bytes);
+  Store<uint32_t>(bytes, 8, kPsvResourceBindInfo0Size + 2);
+  expect_invalid("unaligned resource stride", bytes);
+  Store<uint32_t>(bytes, 8, kPsvResourceBindInfo0Size);
+  expect_invalid("truncated resource array", bytes);
+
+  bytes.assign(4 + kPsvRuntimeInfo1Size + 4, 0);
+  Store<uint32_t>(bytes, 0, kPsvRuntimeInfo1Size);
+  expect_invalid("missing string table size", bytes);
+
+  bytes.resize(bytes.size() + sizeof(uint32_t) + 1);
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 4, 1u);
+  expect_invalid("unaligned string table", bytes);
+
+  bytes.assign(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4, 0);
+  Store<uint32_t>(bytes, 0, kPsvRuntimeInfo1Size);
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 4, 0u);
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 8,
+                  std::numeric_limits<uint32_t>::max());
+  expect_invalid("truncated semantic index table", bytes);
+
+  bytes[4 + 28] = 1;
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 8, 0u);
+  expect_invalid("missing signature stride", bytes);
+
+  bytes.resize(bytes.size() + sizeof(uint32_t));
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 12,
+                  kPsvSignatureElement0Size - 4);
+  expect_invalid("short signature stride", bytes);
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 12,
+                  kPsvSignatureElement0Size + 2);
+  expect_invalid("unaligned signature stride", bytes);
+  Store<uint32_t>(bytes, 4 + kPsvRuntimeInfo1Size + 12,
+                  kPsvSignatureElement0Size);
+  expect_invalid("truncated signature array", bytes);
 }

@@ -3769,6 +3769,8 @@ ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info) {
   info.version = version;
   info.part_count = part_count;
   info.parts.reserve(part_count);
+  std::vector<std::pair<size_t, size_t>> part_ranges;
+  part_ranges.reserve(part_count);
 
   for (uint32_t i = 0; i < part_count; i++) {
     const auto part_offset = ReadU32(data, kRuntimeDataHeaderSize + size_t(i) * sizeof(uint32_t));
@@ -3787,6 +3789,12 @@ ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info) {
     size_t part_end = 0;
     if (!CheckedEnd(part_header_end, aligned_size, data.size(), part_end))
       return ParseStatus::InvalidRuntimeData;
+
+    for (const auto &[existing_begin, existing_end] : part_ranges) {
+      if (part_offset < existing_end && existing_begin < part_end)
+        return ParseStatus::InvalidRuntimeData;
+    }
+    part_ranges.emplace_back(part_offset, part_end);
 
     part_info.data = std::span<const uint8_t>(data.data() + part_header_end, part_info.size);
     if (part_info.type == rdat::IndexArrays && (part_info.size & 3))
