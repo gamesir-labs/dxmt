@@ -23,7 +23,7 @@ CaptureState::getNextAction(uint64_t frame) {
   case State::Idle:
     break;
   case State::WillCapture:
-    if (frame == next_capture_frame) {
+    if (frame >= next_capture_frame) {
       state = State::Capturing;
       return NextAction::StartCapture;
     }

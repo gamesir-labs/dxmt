@@ -163,11 +163,29 @@ TEST(SmallVector, MovesNonCopyableAllocatedStorage) {
   EXPECT_EQ(*moved[1], 2);
 }
 
+TEST(SmallVector, CopiesAllocatedStorageAndMovesEmbeddedElements) {
+  dxmt::small_vector<std::string, 2> allocated = {"a", "b", "c"};
+  ASSERT_FALSE(allocated.is_embedded());
+  dxmt::small_vector<std::string, 4> copied(allocated);
+  EXPECT_TRUE(copied.is_embedded());
+  EXPECT_EQ(std::vector<std::string>(copied.begin(), copied.end()),
+            (std::vector<std::string>{"a", "b", "c"}));
+
+  dxmt::small_vector<std::unique_ptr<int>, 2> embedded;
+  embedded.emplace_back(std::make_unique<int>(7));
+  dxmt::small_vector<std::unique_ptr<int>, 4> moved(std::move(embedded));
+  EXPECT_TRUE(embedded.empty());
+  ASSERT_EQ(moved.size(), 1u);
+  EXPECT_EQ(*moved.front(), 7);
+}
+
 struct RefCountProbe {
   void incRef() { ++references; }
   void decRef() { --references; }
   int references = 0;
 };
+
+struct DerivedRefCountProbe : RefCountProbe {};
 
 TEST(ReferenceCountedPointer, BalancesCopyMoveAndReset) {
   RefCountProbe object;
@@ -196,6 +214,21 @@ TEST(ReferenceCountedPointer, SelfMovePreservesOwnership) {
   pointer = std::move(alias);
   EXPECT_EQ(pointer.ptr(), &object);
   EXPECT_EQ(object.references, 1);
+}
+
+TEST(ReferenceCountedPointer, ConvertsDerivedCopiesAndMovesWithoutLeaks) {
+  DerivedRefCountProbe object;
+  {
+    dxmt::Rc<DerivedRefCountProbe> derived(&object);
+    dxmt::Rc<RefCountProbe> copied(derived);
+    EXPECT_EQ(object.references, 2);
+
+    dxmt::Rc<RefCountProbe> moved(std::move(derived));
+    EXPECT_FALSE(derived);
+    EXPECT_EQ(moved.ptr(), &object);
+    EXPECT_EQ(object.references, 2);
+  }
+  EXPECT_EQ(object.references, 0);
 }
 
 } // namespace

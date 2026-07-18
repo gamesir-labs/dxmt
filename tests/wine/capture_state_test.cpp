@@ -80,4 +80,16 @@ TEST(CaptureState, KeepsTheFirstPendingScheduleAndSupportsFrameZero) {
             dxmt::CaptureState::NextAction::StopCapture);
 }
 
+TEST(CaptureState, StartsOnTheFirstObservedFrameAfterASkippedTarget) {
+  ScopedEnvironmentVariable capture_enabled("MTL_CAPTURE_ENABLED", "1");
+  dxmt::CaptureState state;
+
+  state.scheduleNextFrameCapture(5);
+  EXPECT_EQ(state.getNextAction(7),
+            dxmt::CaptureState::NextAction::StartCapture);
+  EXPECT_EQ(state.getNextAction(7), dxmt::CaptureState::NextAction::Nothing);
+  EXPECT_EQ(state.getNextAction(8),
+            dxmt::CaptureState::NextAction::StopCapture);
+}
+
 } // namespace
