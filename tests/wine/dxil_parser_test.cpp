@@ -2084,6 +2084,112 @@ TEST(DxilRuntimeData, RejectsShortStageSpecificShaderRecords) {
   expect_invalid(rdat::ASInfoTable, kRdatASInfoRecordSize - 1);
 }
 
+TEST(DxilRuntimeData, LinksEveryFunctionShaderKindToItsInfoTable) {
+  using namespace dxmt::dxil;
+  const auto make_table = [](size_t stride) {
+    std::vector<uint8_t> table(kRuntimeDataTableHeaderSize + stride);
+    Store<uint32_t>(table, 0, 1u);
+    Store<uint32_t>(table, 4, stride);
+    return table;
+  };
+  const auto set_null_refs = [](std::vector<uint8_t> &table,
+                                std::initializer_list<size_t> offsets) {
+    for (const auto offset : offsets)
+      Store<uint32_t>(table, kRuntimeDataTableHeaderSize + offset,
+                      kRdatNullRef);
+  };
+
+  auto vertex = make_table(kRdatVSInfoRecordSize);
+  set_null_refs(vertex, {0, 4, 8});
+  auto pixel = make_table(kRdatPSInfoRecordSize);
+  set_null_refs(pixel, {0, 4});
+  auto hull = make_table(kRdatHSInfoRecordSize);
+  set_null_refs(hull, {0, 4, 8, 12, 20, 28, 36});
+  auto domain = make_table(40);
+  set_null_refs(domain, {0, 4, 8, 12, 20, 28});
+  auto geometry = make_table(kRdatGSInfoRecordSize);
+  set_null_refs(geometry, {0, 4, 8, 16});
+  auto compute = make_table(kRdatCSInfoRecordSize);
+  set_null_refs(compute, {0});
+  auto mesh = make_table(48);
+  set_null_refs(mesh, {0, 4, 8, 16, 24});
+  auto amplification = make_table(kRdatASInfoRecordSize);
+  set_null_refs(amplification, {0});
+  auto node = make_table(kRdatNodeShaderInfoRecordSize);
+  set_null_refs(node, {8, 12, 16});
+
+  constexpr std::array<uint32_t, 9> shader_kinds = {0, 1, 2, 3, 4,
+                                                    5, 13, 14, 15};
+  constexpr std::array<uint32_t, 9> table_types = {
+      rdat::PSInfoTable, rdat::VSInfoTable, rdat::GSInfoTable,
+      rdat::HSInfoTable, rdat::DSInfoTable, rdat::CSInfoTable,
+      rdat::MSInfoTable, rdat::ASInfoTable, rdat::NodeShaderInfoTable,
+  };
+  constexpr size_t function_count = shader_kinds.size() + 2;
+  std::vector<uint8_t> functions(
+      kRuntimeDataTableHeaderSize + function_count * kRdatFunctionRecord2Size);
+  Store<uint32_t>(functions, 0, function_count);
+  Store<uint32_t>(functions, 4, kRdatFunctionRecord2Size);
+  for (size_t i = 0; i < function_count; ++i) {
+    const size_t record =
+        kRuntimeDataTableHeaderSize + i * kRdatFunctionRecord2Size;
+    for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(12)})
+      Store<uint32_t>(functions, record + offset, kRdatNullRef);
+    Store<uint32_t>(functions, record + 48, 0u);
+  }
+  for (size_t i = 0; i < shader_kinds.size(); ++i) {
+    const size_t record =
+        kRuntimeDataTableHeaderSize + i * kRdatFunctionRecord2Size;
+    Store<uint32_t>(functions, record + 16, shader_kinds[i]);
+  }
+  const size_t library_record = kRuntimeDataTableHeaderSize +
+                                shader_kinds.size() * kRdatFunctionRecord2Size;
+  Store<uint32_t>(functions, library_record + 16, 6u);
+  const size_t null_record = library_record + kRdatFunctionRecord2Size;
+  Store<uint32_t>(functions, null_record + 16, 0u);
+  Store<uint32_t>(functions, null_record + 48, kRdatNullRef);
+
+  const auto build = [&](const std::vector<uint8_t> &function_table) {
+    return DxilRuntimeDataBuilder()
+        .add(rdat::VSInfoTable, vertex)
+        .add(rdat::PSInfoTable, pixel)
+        .add(rdat::HSInfoTable, hull)
+        .add(rdat::DSInfoTable, domain)
+        .add(rdat::GSInfoTable, geometry)
+        .add(rdat::CSInfoTable, compute)
+        .add(rdat::MSInfoTable, mesh)
+        .add(rdat::ASInfoTable, amplification)
+        .add(rdat::NodeShaderInfoTable, node)
+        .add(rdat::FunctionTable, function_table)
+        .build();
+  };
+
+  auto bytes = build(functions);
+  RuntimeDataInfo info;
+  ASSERT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.functions.size(), function_count);
+  for (size_t i = 0; i < shader_kinds.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_TRUE(info.functions[i].has_shader_info);
+    EXPECT_EQ(info.functions[i].shader_info_table_type, table_types[i]);
+    EXPECT_EQ(info.functions[i].shader_info_index, 0u);
+  }
+  EXPECT_FALSE(info.functions[shader_kinds.size()].has_shader_info);
+  EXPECT_FALSE(info.functions[shader_kinds.size() + 1].has_shader_info);
+
+  for (size_t i = 0; i < shader_kinds.size(); ++i) {
+    SCOPED_TRACE(i);
+    auto malformed = functions;
+    const size_t record =
+        kRuntimeDataTableHeaderSize + i * kRdatFunctionRecord2Size;
+    Store<uint32_t>(malformed, record + 48, 1u);
+    bytes = build(malformed);
+    EXPECT_EQ(ParseRuntimeData(Part(fourcc::RuntimeData, bytes), info),
+              ParseStatus::InvalidRuntimeData);
+  }
+}
+
 TEST(DxilPipelineStateValidation, ParsesMinimalRuntimeAndResourceRecords) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(4 + kPsvRuntimeInfo1Size + 4 + 4 + 4);
