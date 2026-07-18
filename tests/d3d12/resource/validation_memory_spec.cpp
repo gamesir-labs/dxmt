@@ -452,6 +452,44 @@ TEST_F(D3D12MemoryContractSpec, BufferGpuVirtualAddressesAreStableAndDisjoint) {
   }
 }
 
+TEST_F(D3D12MemoryContractSpec,
+       GpuVirtualAddressesRespectResourceKindAndAlignment) {
+  struct BufferCase {
+    D3D12_HEAP_TYPE heap_type;
+    D3D12_RESOURCE_STATES initial_state;
+    const char *name;
+  };
+  constexpr std::array cases = {
+      BufferCase{D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                 "Default"},
+      BufferCase{D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                 "Upload"},
+      BufferCase{D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+                 "Readback"},
+  };
+
+  const auto buffer_desc = BufferDesc(4096);
+  const auto allocation = context_.device()->GetResourceAllocationInfo(
+      0, 1, &buffer_desc);
+  ASSERT_NE(allocation.Alignment, 0u);
+  ASSERT_NE(allocation.Alignment, UINT64_MAX);
+  for (const auto &test_case : cases) {
+    auto buffer = context_.CreateBuffer(
+        buffer_desc.Width, test_case.heap_type, D3D12_RESOURCE_FLAG_NONE,
+        test_case.initial_state);
+    ASSERT_TRUE(buffer) << test_case.name;
+    const auto address = buffer->GetGPUVirtualAddress();
+    EXPECT_NE(address, 0u) << test_case.name;
+    EXPECT_EQ(address % allocation.Alignment, 0u) << test_case.name;
+  }
+
+  auto texture = context_.CreateTexture2D(
+      16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COMMON);
+  ASSERT_TRUE(texture);
+  EXPECT_EQ(texture->GetGPUVirtualAddress(), 0u);
+}
+
 TEST_F(D3D12MemoryContractSpec, PlacedBufferGpuVaIncludesHeapOffset) {
   constexpr UINT64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
   auto heap = CreateHeap(2 * alignment, D3D12_HEAP_TYPE_DEFAULT,
