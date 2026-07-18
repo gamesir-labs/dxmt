@@ -101,6 +101,15 @@ tail worker.
   each worker receives at least four normal-test cost units.
 - Every worker is created inside Wine with `CreateProcessW`, receives one
   `--gtest_filter` batch, and is awaited by the coordinator.
+- `DXMT_SERIAL_TEST_F` removes a test from the parallel wave. It keeps a
+  dedicated worker by default; `DXMT_GROUP_SERIAL_TESTS(pattern, group)` may
+  reuse one worker for a reviewed set of serial tests that safely share
+  process-global, device, and window state. `DXMT_SERIAL_TEST_DOMAIN` identifies
+  groups that conflict with themselves but may share a bounded two-worker wave
+  with another domain. Untagged serial workers remain globally exclusive.
+- Workers record per-test elapsed time in the managed Wine prefix. Later runs
+  use an exponential moving average of those measurements as LPT shard costs;
+  source annotations remain the cold-run fallback and minimum cost.
 - Meson registers only the suite scheduler with `is_parallel: false` because
   all unit parallelism is owned inside the Wine process tree.
 - Workers print failures only by default. Set `DXMT_TEST_VERBOSE_WORKERS=1` for

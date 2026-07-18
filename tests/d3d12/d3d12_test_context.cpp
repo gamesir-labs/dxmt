@@ -5,9 +5,25 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace dxmt::test {
+namespace {
+
+std::mutex &SharedDeviceMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, ComPtr<ID3D12Device>> &SharedDevices() {
+  static std::unordered_map<std::string, ComPtr<ID3D12Device>> devices;
+  return devices;
+}
+
+} // namespace
 
 ComPtr<ID3D12Device> CreateIsolatedD3D12Device() {
   using CreateDeviceProc = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL,
@@ -39,6 +55,25 @@ HRESULT D3D12TestContext::Initialize() {
     return hr;
 
   return Initialize(device.get());
+}
+
+HRESULT D3D12TestContext::InitializeSharedDevice(std::string_view domain) {
+  if (domain.empty())
+    return E_INVALIDARG;
+
+  std::scoped_lock lock(SharedDeviceMutex());
+  auto &devices = SharedDevices();
+  auto existing = devices.find(std::string(domain));
+  if (existing == devices.end()) {
+    ComPtr<ID3D12Device> device;
+    const HRESULT hr = D3D12CreateDevice(
+        nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+        reinterpret_cast<void **>(device.put()));
+    if (FAILED(hr))
+      return hr;
+    existing = devices.emplace(std::string(domain), std::move(device)).first;
+  }
+  return Initialize(existing->second.get());
 }
 
 HRESULT D3D12TestContext::Initialize(ID3D12Device *device) {

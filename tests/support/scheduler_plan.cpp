@@ -271,6 +271,81 @@ ExtractSerialTests(std::vector<ScheduledTest> &tests) {
   return serial;
 }
 
+std::vector<TestShard>
+BuildSerialTestShards(std::vector<ScheduledTest> tests) {
+  std::vector<TestShard> shards;
+  std::vector<std::pair<std::string, std::size_t>> groups;
+
+  for (auto &test : tests) {
+    if (test.serial_group.empty()) {
+      shards.push_back(
+          {{std::move(test.name)}, test.cost, std::move(test.serial_domain)});
+      continue;
+    }
+
+    const auto existing = std::ranges::find_if(
+        groups,
+        [&](const auto &group) { return group.first == test.serial_group; });
+    if (existing == groups.end()) {
+      const auto index = shards.size();
+      groups.emplace_back(std::move(test.serial_group), index);
+      shards.push_back(
+          {{std::move(test.name)}, test.cost, std::move(test.serial_domain)});
+      continue;
+    }
+
+    auto &shard = shards[existing->second];
+    if (shard.serial_domain != test.serial_domain)
+      shard.serial_domain.clear();
+    shard.estimated_cost += test.cost;
+    shard.tests.push_back(std::move(test.name));
+  }
+  return shards;
+}
+
+std::vector<std::vector<std::size_t>>
+BuildSerialShardWaves(const std::vector<TestShard> &shards,
+                      std::size_t maximum_concurrency) {
+  std::vector<std::vector<std::size_t>> waves;
+  if (shards.empty() || maximum_concurrency == 0)
+    return waves;
+
+  std::vector<bool> scheduled(shards.size(), false);
+  std::size_t remaining = shards.size();
+  while (remaining) {
+    std::vector<std::size_t> wave;
+    for (std::size_t index = 0; index < shards.size(); ++index) {
+      if (scheduled[index])
+        continue;
+
+      if (shards[index].serial_domain.empty()) {
+        if (wave.empty()) {
+          wave.push_back(index);
+          break;
+        }
+        continue;
+      }
+
+      const bool domain_in_use = std::ranges::any_of(
+          wave, [&](std::size_t selected) {
+            return shards[selected].serial_domain ==
+                   shards[index].serial_domain;
+          });
+      if (!domain_in_use)
+        wave.push_back(index);
+      if (wave.size() == maximum_concurrency)
+        break;
+    }
+
+    for (const auto index : wave) {
+      scheduled[index] = true;
+      --remaining;
+    }
+    waves.push_back(std::move(wave));
+  }
+  return waves;
+}
+
 std::vector<TestShard> BuildTestShards(std::vector<ScheduledTest> tests,
                                        std::size_t worker_count) {
   if (tests.empty() || worker_count == 0)

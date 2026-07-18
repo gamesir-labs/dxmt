@@ -8,6 +8,7 @@
 #include "d3d12_test_context.hpp"
 
 #include <array>
+#include <memory>
 
 namespace {
 
@@ -43,12 +44,21 @@ private:
 
 class D3D12SwapChainSpec : public ::testing::Test {
 protected:
-  void SetUp() override {
-    ASSERT_TRUE(window_.get());
-    ASSERT_EQ(context_.Initialize(), S_OK);
+  static void SetUpTestSuite() {
+    window_ = std::make_unique<TestWindow>();
+    ASSERT_TRUE(window_->get());
     ASSERT_EQ(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4),
                                  reinterpret_cast<void **>(factory_.put())),
               S_OK);
+  }
+
+  static void TearDownTestSuite() {
+    factory_.reset();
+    window_.reset();
+  }
+
+  void SetUp() override {
+    ASSERT_EQ(context_.InitializeSharedDevice("d3d12-swapchain"), S_OK);
   }
 
   ComPtr<IDXGISwapChain3> CreateSwapChain(UINT buffer_count, UINT flags = 0) {
@@ -65,7 +75,7 @@ protected:
     desc.Flags = flags;
 
     ComPtr<IDXGISwapChain1> base;
-    EXPECT_EQ(factory_->CreateSwapChainForHwnd(context_.queue(), window_.get(),
+    EXPECT_EQ(factory_->CreateSwapChainForHwnd(context_.queue(), window_->get(),
                                                &desc, nullptr, nullptr,
                                                base.put()),
               S_OK);
@@ -81,10 +91,13 @@ protected:
 
   static constexpr UINT kWidth = 32;
   static constexpr UINT kHeight = 24;
-  TestWindow window_;
+  inline static std::unique_ptr<TestWindow> window_;
+  inline static ComPtr<IDXGIFactory4> factory_;
   D3D12TestContext context_;
-  ComPtr<IDXGIFactory4> factory_;
 };
+
+DXMT_GROUP_SERIAL_TESTS("D3D12SwapChainSpec.*", "d3d12-swapchain");
+DXMT_SERIAL_TEST_DOMAIN("D3D12SwapChainSpec.*", "swapchain");
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec, CreatesRequestedBackBuffers) {
   constexpr UINT kBufferCount = 3;

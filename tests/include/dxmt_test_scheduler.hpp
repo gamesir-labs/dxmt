@@ -70,11 +70,14 @@ struct ScheduledTest {
   std::string name;
   std::uint32_t cost = kNormalTestCost;
   bool serial = false;
+  std::string serial_group;
+  std::string serial_domain;
 };
 
 struct TestShard {
   std::vector<std::string> tests;
   std::uint64_t estimated_cost = 0;
+  std::string serial_domain;
 };
 
 class TestCostRegistration {
@@ -85,6 +88,18 @@ public:
 class SerialTestRegistration {
 public:
   explicit SerialTestRegistration(std::string_view pattern);
+};
+
+class SerialTestGroupRegistration {
+public:
+  SerialTestGroupRegistration(std::string_view pattern,
+                              std::string_view group);
+};
+
+class SerialTestDomainRegistration {
+public:
+  SerialTestDomainRegistration(std::string_view pattern,
+                               std::string_view domain);
 };
 
 class LogicalCaseFamilyRegistration {
@@ -127,6 +142,11 @@ std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,
                               std::size_t maximum_worker_count);
 std::vector<ScheduledTest>
 ExtractSerialTests(std::vector<ScheduledTest> &tests);
+std::vector<TestShard>
+BuildSerialTestShards(std::vector<ScheduledTest> tests);
+std::vector<std::vector<std::size_t>>
+BuildSerialShardWaves(const std::vector<TestShard> &shards,
+                      std::size_t maximum_concurrency);
 std::vector<TestShard> BuildTestShards(std::vector<ScheduledTest> tests,
                                        std::size_t worker_count);
 int RunScheduledTests(int argc, char **argv);
@@ -156,3 +176,11 @@ int RunScheduledTests(int argc, char **argv);
   static const ::dxmt::test::SerialTestRegistration DXMT_TEST_CONCAT_(         \
       dxmt_serial_test_fixture_, __LINE__)(#test_fixture "." #test_name);      \
   TEST_F(test_fixture, test_name)
+
+#define DXMT_GROUP_SERIAL_TESTS(pattern, group)                                \
+  static const ::dxmt::test::SerialTestGroupRegistration DXMT_TEST_CONCAT_(    \
+      dxmt_serial_test_group_, __LINE__)(pattern, group)
+
+#define DXMT_SERIAL_TEST_DOMAIN(pattern, domain)                               \
+  static const ::dxmt::test::SerialTestDomainRegistration DXMT_TEST_CONCAT_(   \
+      dxmt_serial_test_domain_, __LINE__)(pattern, domain)

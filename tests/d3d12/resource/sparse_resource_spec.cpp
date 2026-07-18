@@ -860,6 +860,9 @@ TEST_F(D3D12SparseResourceSpec,
   EXPECT_EQ(actual, expected);
 }
 
+DXMT_GROUP_SERIAL_TESTS("D3D12SparseResourceSpec.*", "d3d12-sparse");
+DXMT_SERIAL_TEST_DOMAIN("D3D12SparseResourceSpec.*", "sparse");
+
 DXMT_SERIAL_TEST_F(
     D3D12SparseResourceSpec,
     PreservesCompressedPackedMipWritesAcrossSeparateExecutes) {

@@ -101,6 +101,14 @@ protected:
 const dxmt::test::SerialTestRegistration kFutureQueueWaitSerial(
     "QueueDirections/QueueWaitSpec."
     "WaitSubmittedBeforeFutureSignalOrdersConsumer/*");
+DXMT_GROUP_SERIAL_TESTS(
+    "QueueDirections/QueueWaitSpec."
+    "WaitSubmittedBeforeFutureSignalOrdersConsumer/*",
+    "d3d12-queue-wait");
+DXMT_SERIAL_TEST_DOMAIN(
+    "QueueDirections/QueueWaitSpec."
+    "WaitSubmittedBeforeFutureSignalOrdersConsumer/*",
+    "queue-wait");
 
 TEST_P(QueueWaitSpec, WaitSubmittedBeforeFutureSignalOrdersConsumer) {
   constexpr UINT kElementCount = 16;

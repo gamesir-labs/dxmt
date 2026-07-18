@@ -303,6 +303,10 @@ protected:
   ComPtr<ID3D12Resource> input_;
 };
 
+DXMT_GROUP_SERIAL_TESTS("PathEmptySegmentSpec.*",
+                        "d3d12-execution-path-empty");
+DXMT_GROUP_SERIAL_TESTS("ForcedExecutionPathSpec.*",
+                        "d3d12-execution-path-empty");
 DXMT_SERIAL_TEST_F(PathEmptySegmentSpec, EmptyNativeSegmentIsNoOp) {
   DispatchRealWork();
   D3D12TestContext::UavBarrier(context_.list(), output_.get());

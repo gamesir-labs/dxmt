@@ -22,7 +22,10 @@ struct DescriptorHeapCase {
 class DescriptorHeapContractSpec
     : public ::testing::TestWithParam<DescriptorHeapCase> {
 protected:
-  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  void SetUp() override {
+    ASSERT_EQ(context_.InitializeSharedDevice("descriptor-heap-contract"),
+              S_OK);
+  }
 
   D3D12TestContext context_;
 };

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 namespace {
 
@@ -52,12 +53,21 @@ struct CommandRecording {
 
 class D3D12SwapChainFrameSpec : public ::testing::Test {
 protected:
-  void SetUp() override {
-    ASSERT_TRUE(window_.get());
-    ASSERT_EQ(context_.Initialize(), S_OK);
+  static void SetUpTestSuite() {
+    window_ = std::make_unique<TestWindow>();
+    ASSERT_TRUE(window_->get());
     ASSERT_EQ(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4),
                                  reinterpret_cast<void **>(factory_.put())),
               S_OK);
+  }
+
+  static void TearDownTestSuite() {
+    factory_.reset();
+    window_.reset();
+  }
+
+  void SetUp() override {
+    ASSERT_EQ(context_.InitializeSharedDevice("d3d12-swapchain"), S_OK);
   }
 
   void TearDown() override {
@@ -87,7 +97,7 @@ protected:
     const auto desc = ValidDesc(buffer_count, swap_effect);
     ComPtr<IDXGISwapChain1> base;
     EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                  context_.queue(), window_.get(), &desc, nullptr, nullptr,
+                  context_.queue(), window_->get(), &desc, nullptr, nullptr,
                   base.put()),
               S_OK);
     ComPtr<IDXGISwapChain3> swapchain;
@@ -165,10 +175,13 @@ protected:
 
   static constexpr UINT kWidth = 32;
   static constexpr UINT kHeight = 24;
-  TestWindow window_;
+  inline static std::unique_ptr<TestWindow> window_;
+  inline static ComPtr<IDXGIFactory4> factory_;
   D3D12TestContext context_;
-  ComPtr<IDXGIFactory4> factory_;
 };
+
+DXMT_GROUP_SERIAL_TESTS("D3D12SwapChainFrameSpec.*", "d3d12-swapchain");
+DXMT_SERIAL_TEST_DOMAIN("D3D12SwapChainFrameSpec.*", "swapchain");
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
                    PresentWaitsForPriorQueueRendering) {
@@ -346,7 +359,7 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
 
   HWND hwnd = nullptr;
   ASSERT_EQ(swapchain->GetHwnd(&hwnd), S_OK);
-  EXPECT_EQ(hwnd, window_.get());
+  EXPECT_EQ(hwnd, window_->get());
   ASSERT_EQ(swapchain->SetFullscreenState(TRUE, nullptr), S_OK);
   BOOL fullscreen = FALSE;
   ASSERT_EQ(swapchain->GetFullscreenState(&fullscreen, nullptr), S_OK);
@@ -379,7 +392,7 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   auto desc = ValidDesc(2);
   IDXGISwapChain1 *result = reinterpret_cast<IDXGISwapChain1 *>(1);
   EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.device(), window_.get(), &desc, nullptr, nullptr,
+                context_.device(), window_->get(), &desc, nullptr, nullptr,
                 &result),
             DXGI_ERROR_UNSUPPORTED);
   EXPECT_EQ(result, nullptr);
@@ -387,7 +400,7 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   desc.Format = DXGI_FORMAT_UNKNOWN;
   result = reinterpret_cast<IDXGISwapChain1 *>(1);
   EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.queue(), window_.get(), &desc, nullptr, nullptr,
+                context_.queue(), window_->get(), &desc, nullptr, nullptr,
                 &result),
             DXGI_ERROR_INVALID_CALL);
   EXPECT_EQ(result, nullptr);
@@ -395,7 +408,7 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   desc = ValidDesc(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1);
   result = reinterpret_cast<IDXGISwapChain1 *>(1);
   EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.queue(), window_.get(), &desc, nullptr, nullptr,
+                context_.queue(), window_->get(), &desc, nullptr, nullptr,
                 &result),
             DXGI_ERROR_INVALID_CALL);
   EXPECT_EQ(result, nullptr);
@@ -404,7 +417,7 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   desc.SwapEffect = static_cast<DXGI_SWAP_EFFECT>(UINT_MAX);
   result = reinterpret_cast<IDXGISwapChain1 *>(1);
   EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.queue(), window_.get(), &desc, nullptr, nullptr,
+                context_.queue(), window_->get(), &desc, nullptr, nullptr,
                 &result),
             DXGI_ERROR_INVALID_CALL);
   EXPECT_EQ(result, nullptr);

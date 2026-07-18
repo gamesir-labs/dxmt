@@ -25,7 +25,9 @@ struct ShaderSemanticCase {
 class ShaderSemanticMatrixSpec
     : public ::testing::TestWithParam<ShaderSemanticCase> {
 protected:
-  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  void SetUp() override {
+    ASSERT_EQ(context_.InitializeSharedDevice("shader-semantic-matrix"), S_OK);
+  }
 
   D3D12TestContext context_;
 };

@@ -198,7 +198,9 @@ class D3D12FeatureQueryContractSpec
     : public ::testing::Test,
       public ::testing::WithParamInterface<FeatureQueryCase> {
 protected:
-  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  void SetUp() override {
+    ASSERT_EQ(context_.InitializeSharedDevice("feature-query-contract"), S_OK);
+  }
 
   static constexpr std::uint8_t kSentinel = 0xa5;
   static constexpr UINT kGuardSize = 16;

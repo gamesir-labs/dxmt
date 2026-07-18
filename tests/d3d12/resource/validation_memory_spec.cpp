@@ -115,7 +115,10 @@ class InvalidResourceDescriptionSpec
     : public ::testing::Test,
       public ::testing::WithParamInterface<InvalidResourceCase> {
 protected:
-  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  void SetUp() override {
+    ASSERT_EQ(context_.InitializeSharedDevice("invalid-resource-description"),
+              S_OK);
+  }
   D3D12TestContext context_;
 };
 

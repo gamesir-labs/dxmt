@@ -19,6 +19,9 @@ protected:
   D3D12TestContext context_;
 };
 
+DXMT_SERIAL_TEST_DOMAIN("ExecutionPathRootDescriptorSpec.*",
+                        "root-descriptor");
+
 DXMT_SERIAL_TEST_F(
     ExecutionPathRootDescriptorSpec,
     RootDescriptorsAndConstantsSurviveCopyFallbackExactlyOnce) {

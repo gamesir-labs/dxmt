@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace dxmt::test {
@@ -29,6 +30,7 @@ public:
 
   HRESULT Initialize();
   HRESULT Initialize(ID3D12Device *device);
+  HRESULT InitializeSharedDevice(std::string_view domain);
   HRESULT ResetCommandList();
   HRESULT ExecuteAndWait();
   HRESULT SignalAndWait();

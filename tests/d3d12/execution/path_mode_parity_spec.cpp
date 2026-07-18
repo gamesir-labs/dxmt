@@ -835,6 +835,8 @@ protected:
   ComPtr<ID3D12PipelineState> root_binding_pipeline_;
 };
 
+DXMT_GROUP_SERIAL_TESTS("PathModeParitySpec.*",
+                        "d3d12-execution-path-parity");
 DXMT_SERIAL_TEST_F(PathModeParitySpec, DrawIsEquivalentAcrossModes) {
   std::array<PathRunResult, 3> results;
   ASSERT_NO_FATAL_FAILURE(RunGraphicsModes(false, &results));

@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -30,6 +31,16 @@ struct SerialHint {
   std::string pattern;
 };
 
+struct SerialGroupHint {
+  std::string pattern;
+  std::string group;
+};
+
+struct SerialDomainHint {
+  std::string pattern;
+  std::string domain;
+};
+
 std::vector<CostHint> &CostHints() {
   static std::vector<CostHint> hints;
   return hints;
@@ -38,6 +49,21 @@ std::vector<CostHint> &CostHints() {
 std::vector<SerialHint> &SerialHints() {
   static std::vector<SerialHint> hints;
   return hints;
+}
+
+std::vector<SerialGroupHint> &SerialGroupHints() {
+  static std::vector<SerialGroupHint> hints;
+  return hints;
+}
+
+std::vector<SerialDomainHint> &SerialDomainHints() {
+  static std::vector<SerialDomainHint> hints;
+  return hints;
+}
+
+std::unordered_map<std::string, std::uint64_t> &HistoricalTestMicros() {
+  static std::unordered_map<std::string, std::uint64_t> timings;
+  return timings;
 }
 
 std::vector<const LogicalCaseFamily *> &LogicalCaseFamilies() {
@@ -130,6 +156,41 @@ private:
   bool current_test_reported_ = false;
 };
 
+class TimingCollector final : public ::testing::EmptyTestEventListener {
+public:
+  void OnTestStart(const ::testing::TestInfo &) override {
+    started_ = Clock::now();
+  }
+
+  void OnTestEnd(const ::testing::TestInfo &test) override {
+    const auto micros = std::max<std::int64_t>(
+        1, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                started_)
+               .count());
+    timings_.push_back({std::string(test.test_suite_name()) + "." + test.name(),
+                        static_cast<std::uint64_t>(micros)});
+  }
+
+  bool WriteReport(std::string_view path) const {
+    auto *file = std::fopen(std::string(path).c_str(), "w");
+    if (file == nullptr)
+      return false;
+    bool ok = true;
+    for (const auto &[name, micros] : timings_) {
+      if (std::fprintf(file, "%s\t%llu\n", name.c_str(),
+                       static_cast<unsigned long long>(micros)) < 0) {
+        ok = false;
+        break;
+      }
+    }
+    return std::fclose(file) == 0 && ok;
+  }
+
+private:
+  Clock::time_point started_;
+  std::vector<std::pair<std::string, std::uint64_t>> timings_;
+};
+
 FailureCollector *ConfigureWorkerOutput(std::string_view case_namespace) {
   if (std::getenv("DXMT_TEST_VERBOSE_WORKERS") != nullptr)
     return nullptr;
@@ -149,18 +210,30 @@ void DisableFailureShortCircuiting() {
 }
 
 int RunTestsAndReport(std::string_view case_namespace,
-                      std::string_view report_path = {}) {
+                      std::string_view report_path = {},
+                      std::string_view timing_report_path = {}) {
   auto *collector = ConfigureWorkerOutput(case_namespace);
+  auto *timing_collector = new TimingCollector();
+  ::testing::UnitTest::GetInstance()->listeners().Append(timing_collector);
   const int result = RUN_ALL_TESTS();
+  bool report_error = false;
+
+  if (!timing_report_path.empty() &&
+      !timing_collector->WriteReport(timing_report_path)) {
+    std::fprintf(stderr, "failed to write unit-test timing report '%s': %s\n",
+                 std::string(timing_report_path).c_str(), std::strerror(errno));
+    report_error = true;
+  }
+
   if (collector == nullptr)
-    return result;
+    return result == 0 && report_error ? 2 : result;
 
   if (!report_path.empty()) {
     if (!collector->WriteReport(report_path)) {
       std::fprintf(stderr,
                    "failed to write unit-test failure report '%s': %s\n",
                    std::string(report_path).c_str(), std::strerror(errno));
-      return result == 0 ? 2 : result;
+      report_error = true;
     }
   } else if (collector->has_failures()) {
     std::fprintf(stderr, "[ DXMT     ] failure summary\n%s",
@@ -168,12 +241,61 @@ int RunTestsAndReport(std::string_view case_namespace,
   } else {
     std::printf("[ DXMT     ] all selected tests passed\n");
   }
-  return result;
+  return result == 0 && report_error ? 2 : result;
 }
 
 bool IsDisabledName(std::string_view name) {
   return name.starts_with("DISABLED_") ||
          name.find("/DISABLED_") != std::string_view::npos;
+}
+
+std::string TimingDatabasePath(std::string_view case_namespace) {
+  std::vector<char> buffer(32768);
+  const DWORD size =
+      GetTempPathA(static_cast<DWORD>(buffer.size()), buffer.data());
+  std::string path;
+  if (size == 0 || size >= buffer.size()) {
+    path = ".\\";
+  } else {
+    path.assign(buffer.data(), size);
+    if (!path.empty() && path.back() != '\\' && path.back() != '/')
+      path.push_back('\\');
+  }
+  path += "dxmt-gtest-timings-";
+  for (const char character : case_namespace)
+    path.push_back((character >= 'a' && character <= 'z') ||
+                           (character >= 'A' && character <= 'Z') ||
+                           (character >= '0' && character <= '9')
+                       ? character
+                       : '_');
+  path += ".tsv";
+  return path;
+}
+
+void LoadTimingDatabase(std::string_view path) {
+  auto &timings = HistoricalTestMicros();
+  timings.clear();
+  auto *file = std::fopen(std::string(path).c_str(), "r");
+  if (file == nullptr)
+    return;
+
+  char line[8192];
+  while (std::fgets(line, sizeof(line), file) != nullptr) {
+    std::string_view record(line);
+    if (!record.empty() && record.back() == '\n')
+      record.remove_suffix(1);
+    const auto separator = record.rfind('\t');
+    if (separator == std::string_view::npos)
+      continue;
+    std::uint64_t micros = 0;
+    const auto value = record.substr(separator + 1);
+    const auto parse =
+        std::from_chars(value.data(), value.data() + value.size(), micros);
+    if (parse.ec == std::errc() && parse.ptr == value.data() + value.size() &&
+        micros != 0)
+      timings[std::string(record.substr(0, separator))] = micros;
+  }
+  std::fclose(file);
 }
 
 std::uint32_t TestCost(std::string_view name) {
@@ -182,6 +304,14 @@ std::uint32_t TestCost(std::string_view name) {
     if (GlobMatches(hint.pattern, name))
       cost = std::max(cost, hint.cost);
   }
+  if (const auto timing = HistoricalTestMicros().find(std::string(name));
+      timing != HistoricalTestMicros().end()) {
+    constexpr std::uint64_t kCostQuantumMicros = 1000;
+    const auto measured = std::min<std::uint64_t>(
+        UINT32_MAX,
+        (timing->second + kCostQuantumMicros - 1) / kCostQuantumMicros);
+    cost = std::max(cost, static_cast<std::uint32_t>(measured));
+  }
   return cost;
 }
 
@@ -189,6 +319,20 @@ bool TestMustRunSerially(std::string_view name) {
   return std::ranges::any_of(SerialHints(), [&](const auto &hint) {
     return GlobMatches(hint.pattern, name);
   });
+}
+
+std::string TestSerialGroup(std::string_view name) {
+  for (const auto &hint : SerialGroupHints())
+    if (GlobMatches(hint.pattern, name))
+      return hint.group;
+  return {};
+}
+
+std::string TestSerialDomain(std::string_view name) {
+  for (const auto &hint : SerialDomainHints())
+    if (GlobMatches(hint.pattern, name))
+      return hint.domain;
+  return {};
 }
 
 std::vector<ScheduledTest>
@@ -215,8 +359,10 @@ CollectRunnableTests(std::string_view case_namespace,
            FilterMatches(case_id_filter, case_id) ||
            TestOwnsMatchingLogicalCase(full_name, case_namespace,
                                        case_id_filter)))
-        tests.push_back(
-            {full_name, TestCost(full_name), TestMustRunSerially(full_name)});
+        tests.push_back({full_name, TestCost(full_name),
+                         TestMustRunSerially(full_name),
+                         TestSerialGroup(full_name),
+                         TestSerialDomain(full_name)});
     }
   }
   return tests;
@@ -241,6 +387,7 @@ struct SchedulerOptions {
   bool list_case_metadata = false;
   std::string case_id_filter;
   std::string report_path;
+  std::string timing_report_path;
 };
 
 std::optional<SchedulerOptions>
@@ -248,6 +395,8 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
   SchedulerOptions options;
   constexpr std::string_view jobs_prefix = "--dxmt-test-jobs=";
   constexpr std::string_view report_prefix = "--dxmt-test-report=";
+  constexpr std::string_view timing_report_prefix =
+      "--dxmt-test-timing-report=";
   constexpr std::string_view case_id_prefix = "--dxmt-case-id=";
   constexpr std::string_view legacy_case_id_prefix = "--dxmt_case_id=";
 
@@ -308,6 +457,11 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
           std::string(std::string_view(argument).substr(report_prefix.size()));
       continue;
     }
+    if (argument_view.starts_with(timing_report_prefix)) {
+      options.timing_report_path =
+          std::string(argument_view.substr(timing_report_prefix.size()));
+      continue;
+    }
     if (!argument_view.starts_with(jobs_prefix))
       continue;
 
@@ -349,13 +503,15 @@ std::string BuildFilter(const TestShard &shard) {
 
 std::vector<std::string>
 BuildWorkerArguments(const std::vector<std::string> &original_arguments,
-                     const TestShard &shard, std::string_view report_path) {
+                     const TestShard &shard, std::string_view report_path,
+                     std::string_view timing_report_path) {
   std::vector<std::string> arguments;
   arguments.reserve(original_arguments.size() + 2);
   for (std::size_t index = 1; index < original_arguments.size(); ++index) {
     const std::string_view argument(original_arguments[index]);
     if (!argument.starts_with("--dxmt-test-jobs=") &&
         !argument.starts_with("--dxmt-test-report=") &&
+        !argument.starts_with("--dxmt-test-timing-report=") &&
         !argument.starts_with("--gtest_filter=") &&
         argument != "--dxmt-list-case-ids" &&
         argument != "--dxmt-list-case-metadata" &&
@@ -366,6 +522,8 @@ BuildWorkerArguments(const std::vector<std::string> &original_arguments,
   arguments.push_back("--dxmt-test-worker");
   arguments.push_back("--gtest_filter=" + BuildFilter(shard));
   arguments.push_back("--dxmt-test-report=" + std::string(report_path));
+  arguments.push_back("--dxmt-test-timing-report=" +
+                      std::string(timing_report_path));
   return arguments;
 }
 
@@ -397,6 +555,68 @@ std::string ReadAndRemoveReport(std::string_view path) {
   }
   DeleteFileA(std::string(path).c_str());
   return report;
+}
+
+void MergeTimingReport(std::string_view path) {
+  auto *file = std::fopen(std::string(path).c_str(), "r");
+  if (file == nullptr)
+    return;
+
+  auto &timings = HistoricalTestMicros();
+  char line[8192];
+  while (std::fgets(line, sizeof(line), file) != nullptr) {
+    std::string_view record(line);
+    if (!record.empty() && record.back() == '\n')
+      record.remove_suffix(1);
+    const auto separator = record.rfind('\t');
+    if (separator == std::string_view::npos)
+      continue;
+    const auto value = record.substr(separator + 1);
+    std::uint64_t observed = 0;
+    const auto parse =
+        std::from_chars(value.data(), value.data() + value.size(), observed);
+    if (parse.ec != std::errc() || parse.ptr != value.data() + value.size() ||
+        observed == 0)
+      continue;
+
+    auto [timing, inserted] = timings.try_emplace(
+        std::string(record.substr(0, separator)), observed);
+    if (!inserted)
+      timing->second = (timing->second * 3 + observed) / 4;
+  }
+  std::fclose(file);
+  DeleteFileA(std::string(path).c_str());
+}
+
+bool WriteTimingDatabase(std::string_view path) {
+  std::vector<std::pair<std::string, std::uint64_t>> sorted(
+      HistoricalTestMicros().begin(), HistoricalTestMicros().end());
+  std::ranges::sort(sorted, {}, &decltype(sorted)::value_type::first);
+
+  const std::string temporary = std::string(path) + ".tmp-" +
+                                std::to_string(GetCurrentProcessId());
+  auto *file = std::fopen(temporary.c_str(), "w");
+  if (file == nullptr)
+    return false;
+  bool ok = true;
+  for (const auto &[name, micros] : sorted) {
+    if (std::fprintf(file, "%s\t%llu\n", name.c_str(),
+                     static_cast<unsigned long long>(micros)) < 0) {
+      ok = false;
+      break;
+    }
+  }
+  ok = std::fclose(file) == 0 && ok;
+  if (!ok) {
+    DeleteFileA(temporary.c_str());
+    return false;
+  }
+  if (!MoveFileExA(temporary.c_str(), std::string(path).c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileA(temporary.c_str());
+    return false;
+  }
+  return true;
 }
 
 bool HasExternalSharding() {
@@ -448,6 +668,16 @@ SerialTestRegistration::SerialTestRegistration(std::string_view pattern) {
   SerialHints().push_back({std::string(pattern)});
 }
 
+SerialTestGroupRegistration::SerialTestGroupRegistration(
+    std::string_view pattern, std::string_view group) {
+  SerialGroupHints().push_back({std::string(pattern), std::string(group)});
+}
+
+SerialTestDomainRegistration::SerialTestDomainRegistration(
+    std::string_view pattern, std::string_view domain) {
+  SerialDomainHints().push_back({std::string(pattern), std::string(domain)});
+}
+
 LogicalCaseFamilyRegistration::LogicalCaseFamilyRegistration(
     std::string_view owner_test, std::string_view case_id_prefix,
     std::size_t case_count, std::size_t index_width, CaseTraits traits)
@@ -479,6 +709,8 @@ int RunScheduledTests(int argc, char **argv) {
       original_arguments.empty() ? std::string_view() : original_arguments[0]);
   ActiveCaseNamespace() = case_namespace;
   ActiveCaseIdFilter() = options->case_id_filter;
+  const auto timing_database_path = TimingDatabasePath(case_namespace);
+  LoadTimingDatabase(timing_database_path);
 
   auto tests =
       CollectRunnableTests(case_namespace, options->case_id_filter);
@@ -505,7 +737,8 @@ int RunScheduledTests(int argc, char **argv) {
     return RUN_ALL_TESTS();
   }
   if (options->is_worker)
-    return RunTestsAndReport(case_namespace, options->report_path);
+    return RunTestsAndReport(case_namespace, options->report_path,
+                             options->timing_report_path);
   if (HasExternalSharding())
     return RunTestsAndReport(case_namespace);
 
@@ -517,17 +750,21 @@ int RunScheduledTests(int argc, char **argv) {
 
   const auto plan_start = Clock::now();
   auto serial_tests = ExtractSerialTests(tests);
+  auto serial_shards = BuildSerialTestShards(std::move(serial_tests));
+  constexpr std::size_t kMaximumSerialConcurrency = 2;
+  const auto serial_waves =
+      BuildSerialShardWaves(serial_shards, kMaximumSerialConcurrency);
   worker_count = options->jobs_were_set
                      ? std::min(worker_count, tests.size())
                      : SelectWorkerCount(tests, worker_count);
-  if (serial_tests.empty() && worker_count <= 1)
+  if (serial_shards.empty() && worker_count <= 1)
     return RunTestsAndReport(case_namespace);
 
   auto shards = BuildTestShards(
       std::move(tests), std::max<std::size_t>(1, worker_count));
   const auto parallel_shard_count = shards.size();
-  for (auto &test : serial_tests)
-    shards.push_back({{std::move(test.name)}, test.cost});
+  for (auto &shard : serial_shards)
+    shards.push_back(std::move(shard));
   const auto executable = WineExecutablePath();
   if (executable.empty()) {
     std::fprintf(stderr, "failed to resolve Wine test executable path: %s\n",
@@ -537,9 +774,14 @@ int RunScheduledTests(int argc, char **argv) {
 
   std::vector<std::string> report_paths;
   report_paths.reserve(shards.size());
+  std::vector<std::string> timing_report_paths;
+  timing_report_paths.reserve(shards.size());
   const auto report_prefix = BuildReportPrefix();
-  for (std::size_t index = 0; index < shards.size(); ++index)
+  for (std::size_t index = 0; index < shards.size(); ++index) {
     report_paths.push_back(report_prefix + "-" + std::to_string(index));
+    timing_report_paths.push_back(report_prefix + "-timing-" +
+                                  std::to_string(index));
+  }
   const auto plan_end = Clock::now();
   const auto plan_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            plan_end - plan_start)
@@ -547,7 +789,7 @@ int RunScheduledTests(int argc, char **argv) {
 
   std::printf(
       "[ DXMT     ] scheduling %zu tests on %zu parallel and %zu serial "
-      "Wine workers "
+      "Wine workers in %zu serial waves "
       "(plan %lld us)\n",
       [&shards] {
         std::size_t count = 0;
@@ -555,7 +797,7 @@ int RunScheduledTests(int argc, char **argv) {
           count += shard.tests.size();
         return count;
       }(),
-      parallel_shard_count, serial_tests.size(),
+      parallel_shard_count, serial_shards.size(), serial_waves.size(),
       static_cast<long long>(plan_us));
   std::fflush(stdout);
 
@@ -565,13 +807,14 @@ int RunScheduledTests(int argc, char **argv) {
 
   std::fflush(nullptr);
   const auto run_start = Clock::now();
-  auto run_wave = [&](std::size_t begin, std::size_t end) {
+  auto run_wave = [&](const std::vector<std::size_t> &indexes) {
     std::vector<WineProcess> children;
-    children.reserve(end - begin);
+    children.reserve(indexes.size());
     const auto launch_start = Clock::now();
-    for (std::size_t index = begin; index < end; ++index) {
+    for (const auto index : indexes) {
       const auto arguments = BuildWorkerArguments(
-          original_arguments, shards[index], report_paths[index]);
+          original_arguments, shards[index], report_paths[index],
+          timing_report_paths[index]);
       DWORD error = ERROR_SUCCESS;
       auto child = StartWineProcess(executable, arguments, &error);
       if (!child) {
@@ -611,14 +854,31 @@ int RunScheduledTests(int argc, char **argv) {
     }
   };
 
-  if (parallel_shard_count)
-    run_wave(0, parallel_shard_count);
-  for (std::size_t index = parallel_shard_count; index < shards.size(); ++index)
-    run_wave(index, index + 1);
+  if (parallel_shard_count) {
+    std::vector<std::size_t> parallel_indexes(parallel_shard_count);
+    for (std::size_t index = 0; index < parallel_shard_count; ++index)
+      parallel_indexes[index] = index;
+    run_wave(parallel_indexes);
+  }
+  for (const auto &wave : serial_waves) {
+    std::vector<std::size_t> indexes;
+    indexes.reserve(wave.size());
+    for (const auto index : wave)
+      indexes.push_back(parallel_shard_count + index);
+    run_wave(indexes);
+  }
 
   std::string failure_reports;
   for (const auto &path : report_paths)
     failure_reports += ReadAndRemoveReport(path);
+  for (const auto &path : timing_report_paths)
+    MergeTimingReport(path);
+  if (!WriteTimingDatabase(timing_database_path)) {
+    scheduler_errors += "failed to update unit-test timing database: ";
+    scheduler_errors += WineErrorMessage(GetLastError());
+    scheduler_errors += '\n';
+    ++failed_workers;
+  }
   const auto run_end = Clock::now();
 
   const auto run_ms =

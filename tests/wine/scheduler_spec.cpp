@@ -27,6 +27,8 @@ DXMT_SERIAL_TEST_F(TestSchedulerSlowFixture, DISABLED_CompilesSerialMacro) {
   SUCCEED();
 }
 
+DXMT_GROUP_SERIAL_TESTS("TestSchedulerSlowFixture.*", "scheduler-fixture");
+
 TEST(TestSchedulerGlob, MatchesGoogleTestWildcards) {
   EXPECT_TRUE(
       dxmt::test::GlobMatches("Pipeline*.*Cache?", "PipelineState.DiskCache1"));
@@ -181,6 +183,47 @@ TEST(TestSchedulerPlan, ExtractsSerialTestsIntoAnExclusiveWave) {
   ASSERT_EQ(tests.size(), 2u);
   EXPECT_FALSE(tests[0].serial);
   EXPECT_FALSE(tests[1].serial);
+}
+
+TEST(TestSchedulerPlan, ReusesWorkersWithinNamedSerialGroups) {
+  std::vector<dxmt::test::ScheduledTest> tests = {
+      {"Suite.GroupAFirst", 2, true, "group-a"},
+      {"Suite.IsolatedFirst", 3, true},
+      {"Suite.GroupB", 5, true, "group-b"},
+      {"Suite.GroupASecond", 7, true, "group-a"},
+      {"Suite.IsolatedSecond", 11, true},
+  };
+
+  const auto shards = dxmt::test::BuildSerialTestShards(std::move(tests));
+
+  ASSERT_EQ(shards.size(), 4u);
+  EXPECT_EQ(shards[0].tests,
+            (std::vector<std::string>{"Suite.GroupAFirst",
+                                      "Suite.GroupASecond"}));
+  EXPECT_EQ(shards[0].estimated_cost, 9u);
+  EXPECT_EQ(shards[1].tests,
+            (std::vector<std::string>{"Suite.IsolatedFirst"}));
+  EXPECT_EQ(shards[2].tests,
+            (std::vector<std::string>{"Suite.GroupB"}));
+  EXPECT_EQ(shards[3].tests,
+            (std::vector<std::string>{"Suite.IsolatedSecond"}));
+}
+
+TEST(TestSchedulerPlan, RunsDistinctSerialDomainsInBoundedWaves) {
+  const std::vector<dxmt::test::TestShard> shards = {
+      {{"Suite.Swapchain"}, 10, "swapchain"},
+      {{"Suite.PathFirst"}, 8, "execution-path"},
+      {{"Suite.PathSecond"}, 7, "execution-path"},
+      {{"Suite.Isolated"}, 6, {}},
+      {{"Suite.Descriptor"}, 5, "descriptor"},
+  };
+
+  const auto waves = dxmt::test::BuildSerialShardWaves(shards, 2);
+
+  ASSERT_EQ(waves.size(), 3u);
+  EXPECT_EQ(waves[0], (std::vector<std::size_t>{0, 1}));
+  EXPECT_EQ(waves[1], (std::vector<std::size_t>{2, 4}));
+  EXPECT_EQ(waves[2], (std::vector<std::size_t>{3}));
 }
 
 TEST(TestSchedulerWorker, PropagatesConditionalFailure) {

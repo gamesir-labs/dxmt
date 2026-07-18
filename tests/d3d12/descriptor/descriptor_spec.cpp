@@ -811,6 +811,9 @@ TEST_F(D3D12DescriptorSpec,
   RunDescriptorTableDraw(context_, {.set_compute_root_signature = true});
 }
 
+DXMT_GROUP_SERIAL_TESTS("D3D12DescriptorSpec.*", "d3d12-descriptor");
+DXMT_SERIAL_TEST_DOMAIN("D3D12DescriptorSpec.*", "descriptor");
+
 DXMT_SERIAL_TEST_F(D3D12DescriptorSpec,
                    DrawsWithResourceBearingDxilBindlessPipeline) {
   D3D12_DESCRIPTOR_RANGE srv_range = {};
