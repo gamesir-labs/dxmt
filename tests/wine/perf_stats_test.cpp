@@ -134,4 +134,84 @@ TEST(PerfStats, ReplayWorkerSummaryClassifiesCompiledPacketAndControlTime) {
   EXPECT_EQ(summary.record_coverage_permille, 1000u);
 }
 
+TEST(PerfStats, ReplayWorkerSummaryClampsCoverageAndHandlesEmptyFrames) {
+  dxmt::FrameStatistics empty;
+  const auto empty_summary = dxmt::perf::summarizeReplayWorkerFrame(empty);
+  EXPECT_EQ(empty_summary.replay_coverage_permille, 0u);
+  EXPECT_EQ(empty_summary.record_coverage_permille, 0u);
+
+  dxmt::FrameStatistics overclassified;
+  overclassified.frame_execute_replay_interval = 10us;
+  overclassified.frame_replay_record_loop_interval = 5us;
+  overclassified.frame_replay_flush_pass_interval = 20us;
+  overclassified.frame_replay_compiled_graphics_interval = 9us;
+  overclassified.frame_replay_record_draw_interval = 7us;
+  const auto summary =
+      dxmt::perf::summarizeReplayWorkerFrame(overclassified);
+  EXPECT_EQ(summary.record_control_us, 0u);
+  EXPECT_EQ(summary.classified_record_us, 5u);
+  EXPECT_EQ(summary.replay_coverage_permille, 1000u);
+  EXPECT_EQ(summary.record_coverage_permille, 1000u);
+}
+
+TEST(PerfStats, FrameStatisticsContainerExcludesCurrentFrameAndAveragesAllPasses) {
+  dxmt::FrameStatisticsContainer statistics;
+  for (uint32_t index = 0; index < dxmt::kFrameStatisticsCount; ++index) {
+    auto &frame = statistics.at(index);
+    const uint32_t value = index + 1;
+    frame.command_buffer_count = value;
+    frame.sync_count = value * 2;
+    frame.event_stall = value * 3;
+    frame.commit_interval = std::chrono::microseconds(value);
+    frame.sync_interval = std::chrono::microseconds(value * 2);
+    frame.encode_prepare_interval = std::chrono::microseconds(value * 3);
+    frame.encode_flush_interval = std::chrono::microseconds(value * 4);
+    frame.drawable_blocking_interval = std::chrono::microseconds(value * 5);
+    frame.present_latency_interval = std::chrono::microseconds(value * 6);
+    frame.present_pass_count = value;
+    frame.clear_pass_count = value;
+    frame.clear_pass_optimized = value;
+    frame.resolve_pass_optimized = value;
+    frame.compute_pass_count = value;
+    frame.blit_pass_count = value;
+    frame.latency = value;
+    frame.shader_binding_upload_count = value;
+    frame.shader_binding_dirty_cbuffer_count = value;
+    frame.shader_binding_dirty_sampler_count = value;
+    frame.shader_binding_dirty_srv_count = value;
+    frame.shader_binding_dirty_uav_count = value;
+    frame.shader_binding_clean_uav_count = value;
+  }
+
+  statistics.compute(dxmt::kFrameStatisticsCount - 1);
+
+  EXPECT_EQ(statistics.min().command_buffer_count, 1u);
+  EXPECT_EQ(statistics.min().sync_count, 2u);
+  EXPECT_EQ(statistics.min().event_stall, 3u);
+  EXPECT_EQ(statistics.min().commit_interval, 1us);
+  EXPECT_EQ(statistics.max().command_buffer_count, 15u);
+  EXPECT_EQ(statistics.max().sync_count, 30u);
+  EXPECT_EQ(statistics.max().event_stall, 45u);
+  EXPECT_EQ(statistics.max().present_latency_interval, 90us);
+
+  const auto &average = statistics.average();
+  EXPECT_EQ(average.command_buffer_count, 8u);
+  EXPECT_EQ(average.sync_count, 16u);
+  EXPECT_EQ(average.event_stall, 24u);
+  EXPECT_EQ(average.commit_interval, 8us);
+  EXPECT_EQ(average.present_pass_count, 8u);
+  EXPECT_EQ(average.clear_pass_count, 8u);
+  EXPECT_EQ(average.clear_pass_optimized, 8u);
+  EXPECT_EQ(average.resolve_pass_optimized, 8u);
+  EXPECT_EQ(average.compute_pass_count, 8u);
+  EXPECT_EQ(average.blit_pass_count, 8u);
+  EXPECT_EQ(average.latency, 8u);
+  EXPECT_EQ(average.shader_binding_upload_count, 8u);
+  EXPECT_EQ(average.shader_binding_dirty_cbuffer_count, 8u);
+  EXPECT_EQ(average.shader_binding_dirty_sampler_count, 8u);
+  EXPECT_EQ(average.shader_binding_dirty_srv_count, 8u);
+  EXPECT_EQ(average.shader_binding_dirty_uav_count, 8u);
+  EXPECT_EQ(average.shader_binding_clean_uav_count, 8u);
+}
+
 } // namespace

@@ -892,12 +892,25 @@ public:
     max_.reset();
     average_.reset();
     current_frame = current_frame % kFrameStatisticsCount;
+    bool first_sample = true;
     for(unsigned i = 0; i < kFrameStatisticsCount; i++) {
       if (i == current_frame)
         continue; // deliberately exclude current frame since it
+      if (first_sample) {
+        min_.command_buffer_count = frames_[i].command_buffer_count;
+        min_.sync_count = frames_[i].sync_count;
+        min_.event_stall = frames_[i].event_stall;
+        min_.commit_interval = frames_[i].commit_interval;
+        min_.sync_interval = frames_[i].sync_interval;
+        min_.encode_prepare_interval = frames_[i].encode_prepare_interval;
+        min_.encode_flush_interval = frames_[i].encode_flush_interval;
+        min_.drawable_blocking_interval = frames_[i].drawable_blocking_interval;
+        min_.present_latency_interval = frames_[i].present_latency_interval;
+        first_sample = false;
+      }
       min_.command_buffer_count = std::min(min_.command_buffer_count, frames_[i].command_buffer_count);
       min_.sync_count = std::min(min_.sync_count, frames_[i].sync_count);
-      min_.event_stall = std::min(min_.sync_count, frames_[i].event_stall);
+      min_.event_stall = std::min(min_.event_stall, frames_[i].event_stall);
       min_.commit_interval = std::min(min_.commit_interval, frames_[i].commit_interval);
       min_.sync_interval = std::min(min_.sync_interval, frames_[i].sync_interval);
       min_.encode_prepare_interval = std::min(min_.encode_prepare_interval, frames_[i].encode_prepare_interval);
@@ -940,6 +953,11 @@ public:
       average_.encoder_switch_render_compute_count += frames_[i].encoder_switch_render_compute_count;
       average_.encoder_switch_compute_render_count += frames_[i].encoder_switch_compute_render_count;
       average_.encoder_switch_to_other_count += frames_[i].encoder_switch_to_other_count;
+      average_.present_pass_count += frames_[i].present_pass_count;
+      average_.clear_pass_count += frames_[i].clear_pass_count;
+      average_.clear_pass_optimized += frames_[i].clear_pass_optimized;
+      average_.resolve_pass_optimized += frames_[i].resolve_pass_optimized;
+      average_.compute_pass_count += frames_[i].compute_pass_count;
       average_.compute_pass_optimized += frames_[i].compute_pass_optimized;
       average_.compute_pass_with_dispatch_count += frames_[i].compute_pass_with_dispatch_count;
       average_.compute_pass_without_dispatch_count += frames_[i].compute_pass_without_dispatch_count;
@@ -954,6 +972,7 @@ public:
       average_.compute_memory_barrier_count += frames_[i].compute_memory_barrier_count;
       average_.compute_fence_wait_count += frames_[i].compute_fence_wait_count;
       average_.compute_fence_update_count += frames_[i].compute_fence_update_count;
+      average_.blit_pass_count += frames_[i].blit_pass_count;
       average_.blit_pass_optimized += frames_[i].blit_pass_optimized;
       average_.blit_pass_with_commands_count += frames_[i].blit_pass_with_commands_count;
       average_.blit_pass_empty_count += frames_[i].blit_pass_empty_count;
@@ -980,6 +999,7 @@ public:
       average_.blit_resolve_counters_count += frames_[i].blit_resolve_counters_count;
       average_.sync_count += frames_[i].sync_count;
       average_.event_stall += frames_[i].event_stall;
+      average_.latency += frames_[i].latency;
       average_.flush_chunk_count += frames_[i].flush_chunk_count;
       average_.flush_empty_chunk_count += frames_[i].flush_empty_chunk_count;
       average_.flush_event_only_chunk_count += frames_[i].flush_event_only_chunk_count;
@@ -1018,6 +1038,12 @@ public:
       average_.encode_flush_interval += frames_[i].encode_flush_interval;
       average_.drawable_blocking_interval += frames_[i].drawable_blocking_interval;
       average_.present_latency_interval += frames_[i].present_latency_interval;
+      average_.shader_binding_upload_count += frames_[i].shader_binding_upload_count;
+      average_.shader_binding_dirty_cbuffer_count += frames_[i].shader_binding_dirty_cbuffer_count;
+      average_.shader_binding_dirty_sampler_count += frames_[i].shader_binding_dirty_sampler_count;
+      average_.shader_binding_dirty_srv_count += frames_[i].shader_binding_dirty_srv_count;
+      average_.shader_binding_dirty_uav_count += frames_[i].shader_binding_dirty_uav_count;
+      average_.shader_binding_clean_uav_count += frames_[i].shader_binding_clean_uav_count;
       average_.frame_execute_command_lists_interval += frames_[i].frame_execute_command_lists_interval;
       average_.frame_present_interval += frames_[i].frame_present_interval;
       average_.frame_queue_signal_interval += frames_[i].frame_queue_signal_interval;
@@ -1263,6 +1289,11 @@ public:
     average_.encoder_switch_render_compute_count /= (kFrameStatisticsCount - 1);
     average_.encoder_switch_compute_render_count /= (kFrameStatisticsCount - 1);
     average_.encoder_switch_to_other_count /= (kFrameStatisticsCount - 1);
+    average_.present_pass_count /= (kFrameStatisticsCount - 1);
+    average_.clear_pass_count /= (kFrameStatisticsCount - 1);
+    average_.clear_pass_optimized /= (kFrameStatisticsCount - 1);
+    average_.resolve_pass_optimized /= (kFrameStatisticsCount - 1);
+    average_.compute_pass_count /= (kFrameStatisticsCount - 1);
     average_.compute_pass_optimized /= (kFrameStatisticsCount - 1);
     average_.compute_pass_with_dispatch_count /= (kFrameStatisticsCount - 1);
     average_.compute_pass_without_dispatch_count /= (kFrameStatisticsCount - 1);
@@ -1277,6 +1308,7 @@ public:
     average_.compute_memory_barrier_count /= (kFrameStatisticsCount - 1);
     average_.compute_fence_wait_count /= (kFrameStatisticsCount - 1);
     average_.compute_fence_update_count /= (kFrameStatisticsCount - 1);
+    average_.blit_pass_count /= (kFrameStatisticsCount - 1);
     average_.blit_pass_optimized /= (kFrameStatisticsCount - 1);
     average_.blit_pass_with_commands_count /= (kFrameStatisticsCount - 1);
     average_.blit_pass_empty_count /= (kFrameStatisticsCount - 1);
@@ -1303,6 +1335,7 @@ public:
     average_.blit_resolve_counters_count /= (kFrameStatisticsCount - 1);
     average_.sync_count /= (kFrameStatisticsCount - 1);
     average_.event_stall /= (kFrameStatisticsCount - 1);
+    average_.latency /= (kFrameStatisticsCount - 1);
     average_.flush_chunk_count /= (kFrameStatisticsCount - 1);
     average_.flush_empty_chunk_count /= (kFrameStatisticsCount - 1);
     average_.flush_event_only_chunk_count /= (kFrameStatisticsCount - 1);
@@ -1339,6 +1372,12 @@ public:
     average_.encode_flush_interval /= (kFrameStatisticsCount - 1);
     average_.drawable_blocking_interval /= (kFrameStatisticsCount - 1);
     average_.present_latency_interval /= (kFrameStatisticsCount - 1);
+    average_.shader_binding_upload_count /= (kFrameStatisticsCount - 1);
+    average_.shader_binding_dirty_cbuffer_count /= (kFrameStatisticsCount - 1);
+    average_.shader_binding_dirty_sampler_count /= (kFrameStatisticsCount - 1);
+    average_.shader_binding_dirty_srv_count /= (kFrameStatisticsCount - 1);
+    average_.shader_binding_dirty_uav_count /= (kFrameStatisticsCount - 1);
+    average_.shader_binding_clean_uav_count /= (kFrameStatisticsCount - 1);
     average_.frame_execute_command_lists_interval /= (kFrameStatisticsCount - 1);
     average_.frame_present_interval /= (kFrameStatisticsCount - 1);
     average_.frame_queue_signal_interval /= (kFrameStatisticsCount - 1);
