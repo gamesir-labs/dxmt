@@ -991,6 +991,147 @@ TEST(DxilPipelineStateValidation, RejectsMalformedVariableLengthSections) {
   expect_invalid("truncated signature array", bytes);
 }
 
+TEST(DxilPipelineStateValidation, ParsesSignaturesAndDependencyTables) {
+  using namespace dxmt::dxil;
+  constexpr size_t runtime_offset = sizeof(uint32_t);
+  constexpr size_t resource_count_offset = runtime_offset + kPsvRuntimeInfo1Size;
+  constexpr size_t string_size_offset = resource_count_offset + sizeof(uint32_t);
+  constexpr size_t string_offset = string_size_offset + sizeof(uint32_t);
+  constexpr size_t semantic_count_offset = string_offset + 8;
+  constexpr size_t semantic_table_offset = semantic_count_offset + sizeof(uint32_t);
+  constexpr size_t signature_size_offset = semantic_table_offset + 8;
+  constexpr size_t signature_offset = signature_size_offset + sizeof(uint32_t);
+  constexpr size_t dependency_offset = signature_offset +
+                                       2 * kPsvSignatureElement0Size;
+  std::vector<uint8_t> bytes(dependency_offset + 5 * sizeof(uint32_t));
+  Store<uint32_t>(bytes, 0, kPsvRuntimeInfo1Size);
+  bytes[runtime_offset + 25] = 1;
+  bytes[runtime_offset + 28] = 1;
+  bytes[runtime_offset + 29] = 1;
+  bytes[runtime_offset + 31] = 1;
+  bytes[runtime_offset + 32] = 1;
+  Store<uint32_t>(bytes, resource_count_offset, 0u);
+  Store<uint32_t>(bytes, string_size_offset, 8u);
+  std::memcpy(bytes.data() + string_offset, "POS\0COL", 8);
+  Store<uint32_t>(bytes, semantic_count_offset, 2u);
+  Store<uint32_t>(bytes, semantic_table_offset + 0, 3u);
+  Store<uint32_t>(bytes, semantic_table_offset + 4, 7u);
+  Store<uint32_t>(bytes, signature_size_offset, kPsvSignatureElement0Size);
+
+  Store<uint32_t>(bytes, signature_offset + 0, 0u);
+  Store<uint32_t>(bytes, signature_offset + 4, 0u);
+  bytes[signature_offset + 8] = 1;
+  bytes[signature_offset + 9] = 2;
+  bytes[signature_offset + 10] = 0x52;
+  bytes[signature_offset + 11] = 4;
+  bytes[signature_offset + 12] = 5;
+  bytes[signature_offset + 13] = 6;
+  bytes[signature_offset + 14] = 0x21;
+
+  const size_t output_signature = signature_offset + kPsvSignatureElement0Size;
+  Store<uint32_t>(bytes, output_signature + 0, 4u);
+  Store<uint32_t>(bytes, output_signature + 4, 1u);
+  bytes[output_signature + 8] = 1;
+  bytes[output_signature + 9] = 3;
+  bytes[output_signature + 10] = 0x01;
+  bytes[output_signature + 11] = 8;
+  bytes[output_signature + 12] = 9;
+  bytes[output_signature + 13] = 10;
+  bytes[output_signature + 14] = 0x12;
+
+  Store<uint32_t>(bytes, dependency_offset + 0, 0x5u);
+  Store<uint32_t>(bytes, dependency_offset + 4, 0x11u);
+  Store<uint32_t>(bytes, dependency_offset + 8, 0x22u);
+  Store<uint32_t>(bytes, dependency_offset + 12, 0x33u);
+  Store<uint32_t>(bytes, dependency_offset + 16, 0x44u);
+
+  PipelineStateValidationInfo info;
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, bytes), info),
+            ParseStatus::Ok);
+  ASSERT_EQ(info.input_signature_elements.size(), 1u);
+  EXPECT_EQ(info.input_signature_elements[0].semantic_name, "POS");
+  EXPECT_EQ(info.input_signature_elements[0].semantic_indexes,
+            (std::vector<uint32_t>{3}));
+  EXPECT_EQ(info.input_signature_elements[0].rows, 1u);
+  EXPECT_EQ(info.input_signature_elements[0].start_row, 2u);
+  EXPECT_EQ(info.input_signature_elements[0].cols, 2u);
+  EXPECT_EQ(info.input_signature_elements[0].start_col, 1u);
+  EXPECT_TRUE(info.input_signature_elements[0].allocated);
+  EXPECT_EQ(info.input_signature_elements[0].dynamic_index_mask, 1u);
+  EXPECT_EQ(info.input_signature_elements[0].output_stream, 2u);
+
+  ASSERT_EQ(info.output_signature_elements.size(), 1u);
+  EXPECT_EQ(info.output_signature_elements[0].semantic_name, "COL");
+  EXPECT_EQ(info.output_signature_elements[0].semantic_indexes,
+            (std::vector<uint32_t>{7}));
+  ASSERT_EQ(info.view_id_output_masks[0].mask_words.size(), 1u);
+  EXPECT_EQ(info.view_id_output_masks[0].mask_words[0], 0x5u);
+  EXPECT_EQ(info.input_to_output_tables[0].input_vectors, 1u);
+  EXPECT_EQ(info.input_to_output_tables[0].output_vectors, 1u);
+  EXPECT_EQ(info.input_to_output_tables[0].mask_words,
+            (std::vector<uint32_t>{0x11u, 0x22u, 0x33u, 0x44u}));
+  EXPECT_EQ(info.dependency_payload.size(), 5 * sizeof(uint32_t));
+}
+
+TEST(DxilPipelineStateValidation, RejectsInvalidSignatureReferencesAndDependencies) {
+  using namespace dxmt::dxil;
+  constexpr size_t runtime_offset = sizeof(uint32_t);
+  constexpr size_t resource_count_offset = runtime_offset + kPsvRuntimeInfo1Size;
+  constexpr size_t string_size_offset = resource_count_offset + sizeof(uint32_t);
+  constexpr size_t string_offset = string_size_offset + sizeof(uint32_t);
+  constexpr size_t semantic_count_offset = string_offset + 8;
+  constexpr size_t semantic_table_offset = semantic_count_offset + sizeof(uint32_t);
+  constexpr size_t signature_size_offset = semantic_table_offset + 8;
+  constexpr size_t signature_offset = signature_size_offset + sizeof(uint32_t);
+  constexpr size_t dependency_offset = signature_offset + kPsvSignatureElement0Size;
+  std::vector<uint8_t> valid(dependency_offset + 5 * sizeof(uint32_t));
+  Store<uint32_t>(valid, 0, kPsvRuntimeInfo1Size);
+  valid[runtime_offset + 25] = 1;
+  valid[runtime_offset + 28] = 1;
+  valid[runtime_offset + 31] = 1;
+  valid[runtime_offset + 32] = 1;
+  Store<uint32_t>(valid, string_size_offset, 8u);
+  std::memcpy(valid.data() + string_offset, "POSITION", 8);
+  valid[string_offset + 7] = 0;
+  Store<uint32_t>(valid, semantic_count_offset, 2u);
+  Store<uint32_t>(valid, semantic_table_offset + 0, 3u);
+  Store<uint32_t>(valid, semantic_table_offset + 4, 7u);
+  Store<uint32_t>(valid, signature_size_offset, kPsvSignatureElement0Size);
+  Store<uint32_t>(valid, signature_offset + 0, 0u);
+  Store<uint32_t>(valid, signature_offset + 4, 0u);
+  valid[signature_offset + 8] = 1;
+
+  PipelineStateValidationInfo info;
+  ASSERT_EQ(ParsePipelineStateValidation(
+                Part(fourcc::PipelineStateValidation, valid), info),
+            ParseStatus::Ok);
+
+  const auto expect_invalid = [&](std::string_view case_name,
+                                  std::vector<uint8_t> bytes) {
+    SCOPED_TRACE(case_name);
+    EXPECT_EQ(ParsePipelineStateValidation(
+                  Part(fourcc::PipelineStateValidation, bytes), info),
+              ParseStatus::InvalidPipelineStateValidation);
+  };
+
+  auto malformed = valid;
+  malformed[string_offset + 7] = 'x';
+  expect_invalid("unterminated string table", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, signature_offset + 0, 100u);
+  expect_invalid("semantic name out of bounds", malformed);
+
+  malformed = valid;
+  Store<uint32_t>(malformed, signature_offset + 4, 2u);
+  expect_invalid("semantic index out of bounds", malformed);
+
+  malformed = valid;
+  malformed.pop_back();
+  expect_invalid("truncated dependency table", malformed);
+}
+
 TEST(DxilSourceInfo, ParsesAlignedSections) {
   using namespace dxmt::dxil;
   std::vector<uint8_t> bytes(kSourceInfoHeaderSize + 12 + 8);
