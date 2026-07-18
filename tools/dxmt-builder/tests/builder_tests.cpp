@@ -62,6 +62,14 @@ int main() {
     Check(config.at("cache_root") == "../cache" &&
               config.at("profile_namespace") == "feature/cache",
           "builder config JSON parsing failed");
+    Check(testing::CcacheRoot("/tmp/cache", "test-dev") ==
+              "/tmp/cache/ccache/test-dev",
+          "namespaced ccache root is incorrect");
+    Check(testing::CcacheRoot("/tmp/cache", "feature/cache") ==
+              "/tmp/cache/ccache/feature/cache",
+          "nested branch ccache root is incorrect");
+    Check(testing::CcacheRoot("/tmp/cache", "") == "/tmp/cache/ccache",
+          "unnamespaced ccache root is incorrect");
     bool rejected_non_string = false;
     try {
       static_cast<void>(testing::ParseJsonStringObject(

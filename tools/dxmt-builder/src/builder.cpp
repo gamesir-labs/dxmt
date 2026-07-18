@@ -699,6 +699,10 @@ private:
             std::string(name) + ".lock");
   }
 
+  fs::path CcacheRoot() const {
+    return testing::CcacheRoot(managed_root_, profile_namespace_);
+  }
+
   int ConfigCommand(std::span<const std::string> arguments) const {
     if (arguments.empty())
       throw std::runtime_error("config requires a subcommand");
@@ -774,10 +778,11 @@ private:
   }
 
   Environment BuildEnvironment() const {
-    const auto config = managed_root_ / "ccache/ccache.conf";
+    const auto ccache_root = CcacheRoot();
+    const auto config = ccache_root / "ccache.conf";
     Environment environment = {
         {"CCACHE_CONFIGPATH", config.string()},
-        {"CCACHE_DIR", (managed_root_ / "ccache/data").string()},
+        {"CCACHE_DIR", (ccache_root / "data").string()},
         {"CCACHE_BASEDIR", repo_root_.string()},
         {"DXMT_REPO_ROOT", repo_root_.string()},
         {"DXMT_MANAGED_CACHE_ROOT", managed_root_.string()},
@@ -787,19 +792,20 @@ private:
   }
 
   void EnsureManagedLayout() const {
+    const auto ccache_root = CcacheRoot();
     for (const auto &path : {
-             managed_root_ / "profiles", managed_root_ / "ccache/data",
+             managed_root_ / "profiles", ccache_root / "data",
              managed_root_ / "cas/metal", managed_root_ / "cas/apitrace",
              managed_root_ / "deps", managed_root_ / "artifacts",
              managed_root_ / "locks", managed_root_ / "telemetry"})
       fs::create_directories(path);
     std::ostringstream config;
-    config << "cache_dir = " << (managed_root_ / "ccache/data").string() << '\n'
+    config << "cache_dir = " << (ccache_root / "data").string() << '\n'
            << "base_dir = " << repo_root_.string() << '\n'
            << "compression = true\n"
            << "compiler_check = content\n"
            << "hash_dir = false\n";
-    WriteFileAtomic(managed_root_ / "ccache/ccache.conf", config.str());
+    WriteFileAtomic(ccache_root / "ccache.conf", config.str());
   }
 
   fs::path ResolveWine(const Profile &profile) const {
@@ -1997,6 +2003,14 @@ bool IsPathWithin(const fs::path &path, const fs::path &root) {
 }
 
 namespace testing {
+
+fs::path CcacheRoot(const fs::path &managed_root,
+                    std::string_view profile_namespace) {
+  auto root = managed_root / "ccache";
+  if (!profile_namespace.empty())
+    root /= fs::path(profile_namespace);
+  return root;
+}
 
 std::map<std::string, std::string> ParseProperties(std::string_view contents) {
   std::map<std::string, std::string> values;

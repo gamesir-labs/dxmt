@@ -36,6 +36,9 @@ std::map<std::string, std::string> ParseJsonStringObject(
 std::optional<std::filesystem::path> DiscoverConfigPath(
     const std::filesystem::path &repo_root,
     const std::optional<std::filesystem::path> &requested = std::nullopt);
+std::filesystem::path CcacheRoot(
+    const std::filesystem::path &managed_root,
+    std::string_view profile_namespace);
 void WriteFileAtomic(const std::filesystem::path &path, std::string_view contents);
 void WithFileLock(const std::filesystem::path &path,
                   const std::function<void()> &operation);

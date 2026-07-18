@@ -61,10 +61,11 @@ Relative `cache_root` values are resolved from the active checkout root.
 
 `profile_namespace: "git"` uses the attached branch name, a matching remote
 branch, or the commit SHA for a detached checkout. Only mutable profile state
-(`build`, `install`, `stage`, `prefix`, and `meta`) is namespaced. Dependencies,
-downloads, ccache, CAS entries, artifacts, and telemetry remain globally shared
-under `cache_root`. Use `"none"` for an unnamespaced profile layout. CI uses
-`.github/dxmt-builder-config.json` explicitly.
+(`build`, `install`, `stage`, `prefix`, and `meta`) and ccache are namespaced.
+This keeps compiler-cache capacity and statistics independent between branches.
+Dependencies, downloads, CAS entries, artifacts, and telemetry remain globally
+shared under `cache_root`. Use `"none"` for an unnamespaced profile layout. CI
+uses `.github/dxmt-builder-config.json` explicitly.
 
 Use `scripts/dxmt-builder cache status`, `cache verify`, and `cache prune
 --dry-run` to inspect managed state. There is no automatic capacity eviction in
