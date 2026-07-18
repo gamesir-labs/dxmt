@@ -2976,7 +2976,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetAdapter(IDXGIAdapter **pAdapter) override {
     if (!pAdapter)
-      return DXGI_ERROR_INVALID_CALL;
+      return WARN_E_INVALIDARG(__func__);
 
     return adapter_->QueryInterface(IID_PPV_ARGS(pAdapter));
   }

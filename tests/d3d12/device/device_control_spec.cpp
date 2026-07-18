@@ -204,6 +204,96 @@ TEST_F(DeviceControlSpec, DxgiGpuPriorityRoundTripsAndRejectsInvalidValues) {
   }
 }
 
+TEST_F(DeviceControlSpec, DxgiObjectSharesIdentityStateAndAdapterParent) {
+  auto dxgi_object = QueryDevice<IDXGIObject>();
+  auto dxgi_device = QueryDevice<IDXGIDevice3>();
+  ASSERT_TRUE(dxgi_object);
+  ASSERT_TRUE(dxgi_device);
+
+  ComPtr<IUnknown> d3d_identity;
+  ComPtr<IUnknown> dxgi_identity;
+  ASSERT_EQ(context_.device()->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(d3d_identity.put())),
+            S_OK);
+  ASSERT_EQ(dxgi_device->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(dxgi_identity.put())),
+            S_OK);
+  EXPECT_EQ(d3d_identity.get(), dxgi_identity.get());
+
+  constexpr GUID data_key = {
+      0xb0499ce9,
+      0x5f91,
+      0x44fb,
+      {0x86, 0x60, 0xef, 0x37, 0x17, 0x78, 0xe3, 0x1a}};
+  constexpr std::uint32_t expected = 0x10203040u;
+  ASSERT_EQ(dxgi_object->SetPrivateData(data_key, sizeof(expected), &expected),
+            S_OK);
+  std::uint32_t actual = 0;
+  UINT actual_size = sizeof(actual);
+  ASSERT_EQ(context_.device()->GetPrivateData(data_key, &actual_size, &actual),
+            S_OK);
+  EXPECT_EQ(actual_size, sizeof(actual));
+  EXPECT_EQ(actual, expected);
+
+  EXPECT_EQ(dxgi_device->GetAdapter(nullptr), E_INVALIDARG);
+  ComPtr<IDXGIAdapter> adapter;
+  ASSERT_EQ(dxgi_device->GetAdapter(adapter.put()), S_OK);
+  ASSERT_TRUE(adapter);
+  ComPtr<IDXGIAdapter> parent;
+  ASSERT_EQ(dxgi_object->GetParent(
+                __uuidof(IDXGIAdapter),
+                reinterpret_cast<void **>(parent.put())),
+            S_OK);
+  ASSERT_TRUE(parent);
+
+  ComPtr<IUnknown> adapter_identity;
+  ComPtr<IUnknown> parent_identity;
+  ASSERT_EQ(adapter->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(adapter_identity.put())),
+            S_OK);
+  ASSERT_EQ(parent->QueryInterface(
+                __uuidof(IUnknown),
+                reinterpret_cast<void **>(parent_identity.put())),
+            S_OK);
+  EXPECT_EQ(adapter_identity.get(), parent_identity.get());
+
+  ComPtr<IDXGIAdapter1> adapter1;
+  ASSERT_EQ(adapter->QueryInterface(
+                __uuidof(IDXGIAdapter1),
+                reinterpret_cast<void **>(adapter1.put())),
+            S_OK);
+  DXGI_ADAPTER_DESC1 adapter_desc = {};
+  ASSERT_EQ(adapter1->GetDesc1(&adapter_desc), S_OK);
+  const LUID device_luid = context_.device()->GetAdapterLuid();
+  EXPECT_EQ(adapter_desc.AdapterLuid.LowPart, device_luid.LowPart);
+  EXPECT_EQ(adapter_desc.AdapterLuid.HighPart, device_luid.HighPart);
+
+  void *unsupported = reinterpret_cast<void *>(uintptr_t{1});
+  EXPECT_EQ(dxgi_object->GetParent(__uuidof(ID3D12Fence), &unsupported),
+            E_NOINTERFACE);
+  EXPECT_EQ(unsupported, nullptr);
+}
+
+TEST_F(DeviceControlSpec, DxgiSurfaceFailureClearsOutput) {
+  auto dxgi_device = QueryDevice<IDXGIDevice>();
+  ASSERT_TRUE(dxgi_device);
+
+  DXGI_SURFACE_DESC desc = {};
+  desc.Width = 4;
+  desc.Height = 4;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  auto *surface = reinterpret_cast<IDXGISurface *>(uintptr_t{1});
+  EXPECT_EQ(dxgi_device->CreateSurface(
+                &desc, 1, DXGI_USAGE_RENDER_TARGET_OUTPUT, nullptr, &surface),
+            DXGI_ERROR_UNSUPPORTED);
+  EXPECT_EQ(surface, nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(DeviceControlSpec, DxgiFrameLatencyEnforcesBoundsAndResetValue) {
   auto dxgi_device = QueryDevice<IDXGIDevice1>();
   ASSERT_TRUE(dxgi_device);
