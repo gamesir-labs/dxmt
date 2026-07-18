@@ -598,6 +598,41 @@ TEST(DxilParser, DistinguishesContainerOnlyAndFullParsing) {
   EXPECT_FALSE(parser.dxilProgram().has_value());
 }
 
+TEST(DxilParser, ResetClearsEveryPublishedParserView) {
+  using namespace dxmt::dxil;
+  const auto bytes =
+      DxilContainerBuilder()
+          .add(fourcc::FeatureInfo, std::vector<uint8_t>(kFeatureInfoSize))
+          .add(fourcc::ShaderHash, std::vector<uint8_t>(kShaderHashSize))
+          .build();
+  Parser parser;
+  ASSERT_EQ(parser.parseContainerOnly(bytes.data(), bytes.size()),
+            ParseStatus::Ok);
+  EXPECT_EQ(parser.container().parts.size(), 2u);
+  EXPECT_NE(parser.findPart(fourcc::FeatureInfo), nullptr);
+
+  parser.reset();
+  EXPECT_TRUE(parser.container().parts.empty());
+  EXPECT_EQ(parser.findPart(fourcc::FeatureInfo), nullptr);
+  EXPECT_FALSE(parser.dxilProgram().has_value());
+  EXPECT_FALSE(parser.bitcode().has_value());
+  EXPECT_FALSE(parser.llvmModule().has_value());
+  EXPECT_TRUE(parser.signatures().empty());
+  EXPECT_FALSE(parser.featureInfo().has_value());
+  EXPECT_FALSE(parser.shaderHash().has_value());
+  EXPECT_FALSE(parser.compilerVersion().has_value());
+  EXPECT_FALSE(parser.shaderDebugName().has_value());
+  EXPECT_FALSE(parser.sourceInfo().has_value());
+  EXPECT_FALSE(parser.shaderPdbInfo().has_value());
+  EXPECT_FALSE(parser.shaderStatistics().has_value());
+  EXPECT_FALSE(parser.resourceDef().has_value());
+  EXPECT_FALSE(parser.runtimeData().has_value());
+  EXPECT_FALSE(parser.pipelineStateValidation().has_value());
+  EXPECT_FALSE(parser.shaderReflection().has_value());
+  EXPECT_FALSE(parser.dxilValidation().has_value());
+  EXPECT_FALSE(parser.dxilTranslation().has_value());
+}
+
 TEST(DxilDerivedInfo, HandlesContainerOnlyParserState) {
   using namespace dxmt::dxil;
   const std::vector<uint8_t> root_signature = {1, 2, 3, 4};
