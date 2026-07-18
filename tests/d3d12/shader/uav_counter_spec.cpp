@@ -1,14 +1,17 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 #include "d3d12_test_context.hpp"
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CompileShader;
 using dxmt::test::D3D12TestContext;
 
 UINT ReadUint(const std::vector<std::uint8_t> &bytes, UINT64 offset) {
@@ -129,7 +132,8 @@ protected:
     context_.list()->Dispatch(1, 1, 1);
   }
 
-  void RunAppendCase(UINT64 counter_offset) {
+  void RunAppendCase(UINT64 counter_offset,
+                     bool counter_in_data_resource = false) {
     constexpr UINT kSentinel = 0xaaaaaaaau;
     constexpr std::array<UINT, 15> kInitialData = {
         kSentinel, kSentinel, kSentinel, kSentinel, kSentinel,
@@ -147,18 +151,31 @@ protected:
     auto root = CreateRootSignature(1);
     auto pipeline =
         CreatePipeline(root.get(), kAppendShader, sizeof(kAppendShader));
+    const UINT64 data_size = counter_in_data_resource
+                                 ? counter_size
+                                 : sizeof(kInitialData);
+    std::vector<std::uint8_t> initial_data(data_size);
+    std::memcpy(initial_data.data(), kInitialData.data(),
+                sizeof(kInitialData));
+    if (counter_in_data_resource) {
+      std::memcpy(initial_data.data() + counter_offset, &kInitialCounter,
+                  sizeof(kInitialCounter));
+    }
     auto data = CreateInitializedBuffer(
-        kInitialData.data(), sizeof(kInitialData),
+        initial_data.data(), initial_data.size(),
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    auto counter = CreateInitializedBuffer(
-        initial_counter.data(), initial_counter.size(),
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    ComPtr<ID3D12Resource> counter;
+    if (!counter_in_data_resource) {
+      counter = CreateInitializedBuffer(
+          initial_counter.data(), initial_counter.size(),
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    }
     auto heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
     ASSERT_TRUE(root);
     ASSERT_TRUE(pipeline);
     ASSERT_TRUE(data);
-    ASSERT_TRUE(counter);
+    ASSERT_TRUE(counter_in_data_resource || counter);
     ASSERT_TRUE(heap);
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -168,35 +185,43 @@ protected:
     uav.Buffer.StructureByteStride = 3 * sizeof(UINT);
     uav.Buffer.CounterOffsetInBytes = counter_offset;
     context_.device()->CreateUnorderedAccessView(
-        data.get(), counter.get(), &uav,
+        data.get(), counter_in_data_resource ? data.get() : counter.get(), &uav,
         heap->GetCPUDescriptorHandleForHeapStart());
     TransitionToUav(data.get());
-    TransitionToUav(counter.get());
+    if (!counter_in_data_resource)
+      TransitionToUav(counter.get());
     Dispatch(root.get(), pipeline.get(), heap.get());
     D3D12TestContext::Transition(
         context_.list(), data.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12TestContext::Transition(
-        context_.list(), counter.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (!counter_in_data_resource) {
+      D3D12TestContext::Transition(
+          context_.list(), counter.get(),
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+          D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
 
     auto data_readback = context_.CreateBuffer(
-        sizeof(kInitialData), D3D12_HEAP_TYPE_READBACK,
+        data_size, D3D12_HEAP_TYPE_READBACK,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    auto counter_readback = context_.CreateBuffer(
-        counter_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-        D3D12_RESOURCE_STATE_COPY_DEST);
+    ComPtr<ID3D12Resource> counter_readback;
+    if (!counter_in_data_resource) {
+      counter_readback = context_.CreateBuffer(
+          counter_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+          D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     ASSERT_TRUE(data_readback);
-    ASSERT_TRUE(counter_readback);
+    ASSERT_TRUE(counter_in_data_resource || counter_readback);
     context_.list()->CopyBufferRegion(data_readback.get(), 0, data.get(), 0,
-                                      sizeof(kInitialData));
-    context_.list()->CopyBufferRegion(counter_readback.get(), 0, counter.get(),
-                                      0, counter_size);
+                                      data_size);
+    if (!counter_in_data_resource) {
+      context_.list()->CopyBufferRegion(
+          counter_readback.get(), 0, counter.get(), 0, counter_size);
+    }
     ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
 
     std::vector<std::uint8_t> data_bytes;
-    ASSERT_EQ(MapReadbackBuffer(data_readback.get(), sizeof(kInitialData),
-                                &data_bytes),
+    ASSERT_EQ(MapReadbackBuffer(data_readback.get(), data_size, &data_bytes),
               S_OK);
     EXPECT_EQ(ReadUint(data_bytes, 0), kSentinel);
     EXPECT_EQ(ReadUint(data_bytes, sizeof(UINT)), kSentinel);
@@ -213,11 +238,15 @@ protected:
     EXPECT_EQ(ReadUint(data_bytes, 14 * sizeof(UINT)), kSentinel);
 
     std::vector<std::uint8_t> counter_bytes;
-    ASSERT_EQ(MapReadbackBuffer(counter_readback.get(), counter_size,
-                                &counter_bytes),
-              S_OK);
+    if (counter_in_data_resource) {
+      counter_bytes = data_bytes;
+    } else {
+      ASSERT_EQ(MapReadbackBuffer(counter_readback.get(), counter_size,
+                                  &counter_bytes),
+                S_OK);
+    }
     EXPECT_EQ(ReadUint(counter_bytes, counter_offset), 4u);
-    if (counter_offset) {
+    if (counter_offset && !counter_in_data_resource) {
       EXPECT_EQ(ReadUint(counter_bytes, 0), kOffsetZeroMarker);
     }
   }
@@ -232,6 +261,10 @@ TEST_F(D3D12UavCounterSpec, AppendUsesInitialCounterAndUpdatesResource) {
 
 TEST_F(D3D12UavCounterSpec, AppendHonorsNonzeroAlignedCounterOffset) {
   RunAppendCase(D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT);
+}
+
+TEST_F(D3D12UavCounterSpec, AppendSupportsCounterInDataResource) {
+  RunAppendCase(D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT, true);
 }
 
 TEST_F(D3D12UavCounterSpec, DecrementCounterCopiesAllValuesAndReachesZero) {
@@ -314,5 +347,123 @@ TEST_F(D3D12UavCounterSpec, DecrementCounterCopiesAllValuesAndReachesZero) {
             S_OK);
   EXPECT_EQ(ReadUint(counter_bytes, 0), 0u);
 }
+
+enum class InvalidUavCounterKind {
+  MisalignedOffset,
+  OutOfRangeOffset,
+  OffsetWithoutResource,
+  TextureCounter,
+  MissingDescription,
+};
+
+struct InvalidUavCounterCase {
+  InvalidUavCounterKind kind;
+  const char *name;
+};
+
+class D3D12InvalidUavCounterSpec
+    : public D3D12UavCounterSpec,
+      public ::testing::WithParamInterface<InvalidUavCounterCase> {};
+
+TEST_P(D3D12InvalidUavCounterSpec, InvalidDescriptorMaterializesAsInertUav) {
+  constexpr UINT kSentinel = 0x13579bdfu;
+  const auto shader = CompileShader(R"(
+    RWStructuredBuffer<uint> output : register(u0);
+    [numthreads(1, 1, 1)]
+    void main() {
+      output[0] = 0xdeadbeef;
+    }
+  )", "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  auto root = CreateRootSignature(1);
+  auto pipeline = context_.CreateComputePipeline(
+      root.get(), {shader.bytecode->GetBufferPointer(),
+                   shader.bytecode->GetBufferSize()});
+  auto data = CreateInitializedBuffer(
+      &kSentinel, sizeof(kSentinel),
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  constexpr UINT64 kCounterSize =
+      D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT + sizeof(UINT);
+  std::vector<std::uint8_t> counter_data(kCounterSize);
+  auto counter = CreateInitializedBuffer(
+      counter_data.data(), counter_data.size(),
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto texture_counter = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R32_UINT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  ASSERT_TRUE(root);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(data);
+  ASSERT_TRUE(counter);
+  ASSERT_TRUE(texture_counter);
+  ASSERT_TRUE(heap);
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_UNKNOWN;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = 1;
+  uav.Buffer.StructureByteStride = sizeof(UINT);
+  ID3D12Resource *counter_resource = counter.get();
+  const D3D12_UNORDERED_ACCESS_VIEW_DESC *uav_desc = &uav;
+  switch (GetParam().kind) {
+  case InvalidUavCounterKind::MisalignedOffset:
+    uav.Buffer.CounterOffsetInBytes = sizeof(UINT);
+    break;
+  case InvalidUavCounterKind::OutOfRangeOffset:
+    uav.Buffer.CounterOffsetInBytes =
+        2 * D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT;
+    break;
+  case InvalidUavCounterKind::OffsetWithoutResource:
+    uav.Buffer.CounterOffsetInBytes =
+        D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT;
+    counter_resource = nullptr;
+    break;
+  case InvalidUavCounterKind::TextureCounter:
+    counter_resource = texture_counter.get();
+    break;
+  case InvalidUavCounterKind::MissingDescription:
+    uav_desc = nullptr;
+    break;
+  }
+
+  context_.device()->CreateUnorderedAccessView(
+      data.get(), counter_resource, uav_desc,
+      heap->GetCPUDescriptorHandleForHeapStart());
+  TransitionToUav(data.get());
+  Dispatch(root.get(), pipeline.get(), heap.get());
+  D3D12TestContext::Transition(
+      context_.list(), data.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(data.get(), sizeof(kSentinel), &bytes),
+            S_OK);
+  EXPECT_EQ(ReadUint(bytes, 0), kSentinel);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+std::string InvalidUavCounterCaseName(
+    const ::testing::TestParamInfo<InvalidUavCounterCase> &info) {
+  return info.param.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ValidationMatrix, D3D12InvalidUavCounterSpec,
+    ::testing::Values(
+        InvalidUavCounterCase{InvalidUavCounterKind::MisalignedOffset,
+                              "MisalignedOffset"},
+        InvalidUavCounterCase{InvalidUavCounterKind::OutOfRangeOffset,
+                              "OutOfRangeOffset"},
+        InvalidUavCounterCase{InvalidUavCounterKind::OffsetWithoutResource,
+                              "OffsetWithoutResource"},
+        InvalidUavCounterCase{InvalidUavCounterKind::TextureCounter,
+                              "TextureCounter"},
+        InvalidUavCounterCase{InvalidUavCounterKind::MissingDescription,
+                              "MissingDescription"}),
+    InvalidUavCounterCaseName);
 
 } // namespace

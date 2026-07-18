@@ -1089,8 +1089,29 @@ ValidateUnorderedAccessView(ID3D12Resource *resource,
       WARN("D3D12Device: ambiguous buffer UAV typed/raw/structured descriptor");
       return false;
     }
-    if (counter_resource && !structured) {
-      WARN("D3D12Device: UAV counter resource is only valid for structured buffer UAVs");
+    if (counter_resource) {
+      if (!resource || !structured || !IsBufferResource(counter_resource)) {
+        WARN("D3D12Device: UAV counters require data and counter buffers with a structured view");
+        return false;
+      }
+      if (desc.Buffer.CounterOffsetInBytes %
+          D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) {
+        WARN("D3D12Device: UAV counter offset is not aligned offset=",
+             desc.Buffer.CounterOffsetInBytes);
+        return false;
+      }
+      const auto *counter_desc = GetResourceDesc(counter_resource);
+      if (!counter_desc ||
+          desc.Buffer.CounterOffsetInBytes > counter_desc->Width ||
+          counter_desc->Width - desc.Buffer.CounterOffsetInBytes <
+              sizeof(UINT)) {
+        WARN("D3D12Device: UAV counter offset is outside the counter buffer offset=",
+             desc.Buffer.CounterOffsetInBytes,
+             " size=", counter_desc ? counter_desc->Width : 0);
+        return false;
+      }
+    } else if (desc.Buffer.CounterOffsetInBytes) {
+      WARN("D3D12Device: UAV counter offset requires a counter resource");
       return false;
     }
     return true;
@@ -4091,6 +4112,11 @@ public:
     record->type = DescriptorRecordType::UnorderedAccessView;
     record->resource = resource;
     record->counter_resource = counter_resource;
+    if (counter_resource && !desc) {
+      ResetDescriptorRecord(*record);
+      MaterializeDescriptorTableForWrite(this, descriptor_lock, *record);
+      return;
+    }
     if (desc) {
       if (!ValidateUnorderedAccessView(resource, counter_resource, *desc)) {
         ResetDescriptorRecord(*record);
