@@ -27,6 +27,22 @@ protected:
     return desc;
   }
 
+  static D3D12_RESOURCE_DESC1 TextureDesc1(
+      const D3D12_RESOURCE_DESC &desc) {
+    D3D12_RESOURCE_DESC1 desc1 = {};
+    desc1.Dimension = desc.Dimension;
+    desc1.Alignment = desc.Alignment;
+    desc1.Width = desc.Width;
+    desc1.Height = desc.Height;
+    desc1.DepthOrArraySize = desc.DepthOrArraySize;
+    desc1.MipLevels = desc.MipLevels;
+    desc1.Format = desc.Format;
+    desc1.SampleDesc = desc.SampleDesc;
+    desc1.Layout = desc.Layout;
+    desc1.Flags = desc.Flags;
+    return desc1;
+  }
+
   D3D12TestContext context_;
 };
 
@@ -140,17 +156,7 @@ TEST_F(CopyFootprintSpec, Device8MatchesBaseFunction) {
       context_.device()->QueryInterface(IID_PPV_ARGS(device8.put()))));
   ASSERT_TRUE(device8);
   const auto desc = TextureDesc();
-  D3D12_RESOURCE_DESC1 desc1 = {};
-  desc1.Dimension = desc.Dimension;
-  desc1.Alignment = desc.Alignment;
-  desc1.Width = desc.Width;
-  desc1.Height = desc.Height;
-  desc1.DepthOrArraySize = desc.DepthOrArraySize;
-  desc1.MipLevels = desc.MipLevels;
-  desc1.Format = desc.Format;
-  desc1.SampleDesc = desc.SampleDesc;
-  desc1.Layout = desc.Layout;
-  desc1.Flags = desc.Flags;
+  const auto desc1 = TextureDesc1(desc);
   constexpr UINT first_subresource = 1;
   constexpr UINT subresource_count = 4;
   constexpr UINT64 base_offset = 777;
@@ -176,6 +182,83 @@ TEST_F(CopyFootprintSpec, Device8MatchesBaseFunction) {
   EXPECT_EQ(base_rows, extended_rows);
   EXPECT_EQ(base_row_sizes, extended_row_sizes);
   EXPECT_EQ(base_total, extended_total);
+}
+
+TEST_F(CopyFootprintSpec, Device8MatchesBaseFailureAndZeroCountContracts) {
+  ComPtr<ID3D12Device8> device8;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.device()->QueryInterface(IID_PPV_ARGS(device8.put()))));
+  ASSERT_TRUE(device8);
+
+  auto expect_invalid_match = [&](const D3D12_RESOURCE_DESC &desc,
+                                  UINT first_subresource,
+                                  UINT subresource_count) {
+    SCOPED_TRACE(::testing::Message()
+                 << "first_subresource=" << first_subresource
+                 << " subresource_count=" << subresource_count);
+    ASSERT_LE(subresource_count, 2u);
+    const auto desc1 = TextureDesc1(desc);
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> base_layouts = {};
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> extended_layouts = {};
+    std::array<UINT, 2> base_rows = {};
+    std::array<UINT, 2> extended_rows = {};
+    std::array<UINT64, 2> base_row_sizes = {};
+    std::array<UINT64, 2> extended_row_sizes = {};
+    UINT64 base_total = 0;
+    UINT64 extended_total = 0;
+
+    context_.device()->GetCopyableFootprints(
+        &desc, first_subresource, subresource_count, 0, base_layouts.data(),
+        base_rows.data(), base_row_sizes.data(), &base_total);
+    device8->GetCopyableFootprints1(
+        &desc1, first_subresource, subresource_count, 0,
+        extended_layouts.data(), extended_rows.data(),
+        extended_row_sizes.data(), &extended_total);
+
+    EXPECT_EQ(std::memcmp(base_layouts.data(), extended_layouts.data(),
+                          sizeof(base_layouts)),
+              0);
+    EXPECT_EQ(base_rows, extended_rows);
+    EXPECT_EQ(base_row_sizes, extended_row_sizes);
+    EXPECT_EQ(base_total, extended_total);
+    EXPECT_EQ(base_total, UINT64_MAX);
+    for (UINT index = 0; index < subresource_count; ++index) {
+      EXPECT_EQ(base_layouts[index].Offset, UINT64_MAX);
+      EXPECT_EQ(base_rows[index], UINT_MAX);
+      EXPECT_EQ(base_row_sizes[index], UINT64_MAX);
+    }
+  };
+
+  auto invalid_desc = TextureDesc();
+  invalid_desc.Width = 0;
+  expect_invalid_match(invalid_desc, 0, 2);
+  expect_invalid_match(TextureDesc(), 5, 2);
+
+  const auto desc = TextureDesc();
+  const auto desc1 = TextureDesc1(desc);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT base_layout;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT extended_layout;
+  std::memset(&base_layout, 0x5a, sizeof(base_layout));
+  std::memset(&extended_layout, 0x5a, sizeof(extended_layout));
+  UINT base_rows = 0x5a5a5a5au;
+  UINT extended_rows = 0x5a5a5a5au;
+  UINT64 base_row_size = 0x5a5a5a5a5a5a5a5aull;
+  UINT64 extended_row_size = 0x5a5a5a5a5a5a5a5aull;
+  UINT64 base_total = UINT64_MAX;
+  UINT64 extended_total = UINT64_MAX;
+
+  context_.device()->GetCopyableFootprints(
+      &desc, 0, 0, 0, &base_layout, &base_rows, &base_row_size, &base_total);
+  device8->GetCopyableFootprints1(&desc1, 0, 0, 0, &extended_layout,
+                                  &extended_rows, &extended_row_size,
+                                  &extended_total);
+
+  EXPECT_EQ(std::memcmp(&base_layout, &extended_layout, sizeof(base_layout)),
+            0);
+  EXPECT_EQ(base_rows, extended_rows);
+  EXPECT_EQ(base_row_size, extended_row_size);
+  EXPECT_EQ(base_total, 0u);
+  EXPECT_EQ(extended_total, 0u);
 }
 
 } // namespace
