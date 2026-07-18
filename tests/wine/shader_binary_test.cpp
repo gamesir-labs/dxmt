@@ -1183,4 +1183,372 @@ TEST(ShaderBinary, PreservesOpaqueCustomDataBytes) {
   EXPECT_EQ(data[2], 0x99aabbccu);
 }
 
+TEST(ShaderBinary, AppliesOperandMutatorsAndCopiesState) {
+  COperand operand(D3D10_SB_OPERAND_TYPE_TEMP, 7u);
+  operand.SetModifier(D3D10_SB_OPERAND_MODIFIER_ABSNEG);
+  operand.SetMinPrecision(D3D11_SB_OPERAND_MIN_PRECISION_SINT_16);
+  operand.SetNonuniform(true);
+  operand.SetSwizzle(D3D10_SB_4_COMPONENT_W, D3D10_SB_4_COMPONENT_Z,
+                     D3D10_SB_4_COMPONENT_Y, D3D10_SB_4_COMPONENT_X);
+  operand.SetIndex(0, 5, D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 11, 13,
+                   D3D10_SB_4_COMPONENT_Z,
+                   D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+
+  EXPECT_EQ(operand.Modifier(), D3D10_SB_OPERAND_MODIFIER_ABSNEG);
+  EXPECT_TRUE(operand.m_bExtendedOperand);
+  EXPECT_EQ(operand.m_ExtendedOperandType,
+            D3D10_SB_EXTENDED_OPERAND_MODIFIER);
+  EXPECT_EQ(operand.m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_SINT_16);
+  EXPECT_TRUE(operand.m_Nonuniform);
+  EXPECT_EQ(operand.SwizzleComponent(0), D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(operand.SwizzleComponent(3), D3D10_SB_4_COMPONENT_X);
+  EXPECT_EQ(operand.OperandIndexType(0),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE);
+  EXPECT_EQ(operand.OperandIndex(0)->m_RegIndex, 5u);
+  EXPECT_EQ(operand.OperandIndex(0)->m_RelRegType,
+            D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP);
+  EXPECT_EQ(operand.OperandIndex(0)->m_IndexDimension,
+            D3D10_SB_OPERAND_INDEX_2D);
+  EXPECT_EQ(operand.OperandIndex(0)->m_RelIndex, 11u);
+  EXPECT_EQ(operand.OperandIndex(0)->m_RelIndex1, 13u);
+  EXPECT_EQ(operand.OperandIndex(0)->m_ComponentName,
+            D3D10_SB_4_COMPONENT_Z);
+  EXPECT_EQ(operand.OperandIndex(0)->m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+
+  COperandBase copied(operand);
+  COperandBase assigned;
+  assigned = copied;
+  assigned = assigned;
+  EXPECT_EQ(assigned.OperandType(), D3D10_SB_OPERAND_TYPE_TEMP);
+  EXPECT_EQ(assigned.OperandIndex(0)->m_RelIndex1, 13u);
+  EXPECT_EQ(assigned.Modifier(), D3D10_SB_OPERAND_MODIFIER_ABSNEG);
+
+  assigned.SelectComponent(D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(assigned.m_ComponentSelection,
+            D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE);
+  EXPECT_EQ(assigned.m_ComponentName, D3D10_SB_4_COMPONENT_Y);
+  assigned.SetMask(D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+                   D3D10_SB_OPERAND_4_COMPONENT_MASK_W);
+  EXPECT_EQ(assigned.WriteMask(), D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+                                      D3D10_SB_OPERAND_4_COMPONENT_MASK_W);
+
+  COperandIndex index;
+  index.SetMinPrecision(D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+  index.SetNonuniformIndex(true);
+  EXPECT_TRUE(index.m_bExtendedOperand);
+  EXPECT_EQ(index.m_ExtendedOperandType,
+            D3D10_SB_EXTENDED_OPERAND_MODIFIER);
+  EXPECT_EQ(index.m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+  EXPECT_TRUE(index.m_Nonuniform);
+
+  assigned.Clear();
+  EXPECT_EQ(assigned.OperandType(), D3D10_SB_OPERAND_TYPE_TEMP);
+  EXPECT_EQ(assigned.NumComponents(), D3D10_SB_OPERAND_0_COMPONENT);
+  EXPECT_FALSE(assigned.m_bExtendedOperand);
+}
+
+TEST(ShaderBinary, ConstructsImmediateAndRegisterOperands) {
+  COperand unsigned_value(0xfeedbeefu);
+  EXPECT_EQ(unsigned_value.OperandType(), D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+  EXPECT_EQ(unsigned_value.Imm32(), 0xfeedbeefu);
+
+  COperand signed_value(-7);
+  EXPECT_EQ(signed_value.Imm32(), static_cast<UINT>(-7));
+
+  COperand float_value(1.25f);
+  EXPECT_EQ(float_value.m_Valuef[0], 1.25f);
+
+  COperand int64_value(static_cast<INT64>(-1234567890123ll));
+  EXPECT_EQ(int64_value.OperandType(), D3D10_SB_OPERAND_TYPE_IMMEDIATE64);
+  EXPECT_EQ(int64_value.m_Value64[0], -1234567890123ll);
+
+  COperand float_vector(1.0f, 2.0f, 3.0f, 4.0f);
+  EXPECT_EQ(float_vector.m_Valuef[0], 1.0f);
+  EXPECT_EQ(float_vector.m_Valuef[3], 4.0f);
+
+  COperand double_vector(2.5, -3.5);
+  EXPECT_EQ(double_vector.m_Valued[0], 2.5);
+  EXPECT_EQ(double_vector.m_Valued[1], -3.5);
+
+  COperand float_swizzle(1.0f, 2.0f, 3.0f, 4.0f,
+                         D3D10_SB_4_COMPONENT_Z, D3D10_SB_4_COMPONENT_Z,
+                         D3D10_SB_4_COMPONENT_X, D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(float_swizzle.SwizzleComponent(0), D3D10_SB_4_COMPONENT_Z);
+  EXPECT_EQ(float_swizzle.SwizzleComponent(3), D3D10_SB_4_COMPONENT_Y);
+
+  COperand int_vector(1, -2, 3, -4);
+  EXPECT_EQ(int_vector.m_Value[1], static_cast<UINT>(-2));
+  EXPECT_EQ(int_vector.m_Value[3], static_cast<UINT>(-4));
+
+  COperand int_swizzle(1, 2, 3, 4, D3D10_SB_4_COMPONENT_Y,
+                       D3D10_SB_4_COMPONENT_X, D3D10_SB_4_COMPONENT_W,
+                       D3D10_SB_4_COMPONENT_Z);
+  EXPECT_EQ(int_swizzle.SwizzleComponent(2), D3D10_SB_4_COMPONENT_W);
+
+  COperand int64_vector(static_cast<INT64>(11), static_cast<INT64>(22));
+  EXPECT_EQ(int64_vector.m_Value64[0], 11);
+  EXPECT_EQ(int64_vector.m_Value64[1], 22);
+
+  COperand register_swizzle(
+      D3D10_SB_OPERAND_TYPE_TEMP, 9, D3D10_SB_4_COMPONENT_W,
+      D3D10_SB_4_COMPONENT_W, D3D10_SB_4_COMPONENT_X,
+      D3D10_SB_4_COMPONENT_Y, D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+  EXPECT_EQ(register_swizzle.RegIndex(), 9u);
+  EXPECT_EQ(register_swizzle.SwizzleComponent(2), D3D10_SB_4_COMPONENT_X);
+  EXPECT_EQ(register_swizzle.m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+
+  COperand scalar_builtin(D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID);
+  EXPECT_EQ(scalar_builtin.NumComponents(), D3D10_SB_OPERAND_1_COMPONENT);
+  COperand vector_builtin(D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID);
+  EXPECT_EQ(vector_builtin.NumComponents(), D3D10_SB_OPERAND_4_COMPONENT);
+  COperand empty_builtin(D3D10_SB_OPERAND_TYPE_NULL);
+  EXPECT_EQ(empty_builtin.NumComponents(), D3D10_SB_OPERAND_0_COMPONENT);
+
+  COperand relative(D3D10_SB_OPERAND_TYPE_RESOURCE, 4,
+                    D3D10_SB_OPERAND_TYPE_TEMP, 8,
+                    D3D10_SB_4_COMPONENT_Y,
+                    D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT,
+                    D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+  EXPECT_EQ(relative.OperandIndexType(0),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE);
+  EXPECT_EQ(relative.OperandIndex(0)->m_RelIndex, 8u);
+  EXPECT_EQ(relative.OperandIndex(0)->m_MinPrecision,
+            D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+}
+
+TEST(ShaderBinary, ConstructsInstructionsAndTracksExtensionState) {
+  COperandDst destination(D3D10_SB_OPERAND_TYPE_TEMP, 1u);
+  COperand first(1.0f);
+  COperand second(2.0f);
+  COperand third(3.0f);
+
+  CInstruction empty(D3D10_SB_OPCODE_NOP);
+  EXPECT_EQ(empty.OpCode(), D3D10_SB_OPCODE_NOP);
+  EXPECT_EQ(empty.NumOperands(), 0u);
+
+  CInstruction conditional(D3D10_SB_OPCODE_IF, first,
+                           D3D10_SB_INSTRUCTION_TEST_NONZERO);
+  EXPECT_EQ(conditional.NumOperands(), 1u);
+  EXPECT_EQ(conditional.Test(), D3D10_SB_INSTRUCTION_TEST_NONZERO);
+
+  CInstruction binary(D3D10_SB_OPCODE_MOV, destination, first);
+  EXPECT_EQ(binary.NumOperands(), 2u);
+  EXPECT_EQ(binary.Operand(0).RegIndex(), 1u);
+
+  CInstruction ternary(D3D10_SB_OPCODE_ADD, destination, first, second);
+  EXPECT_EQ(ternary.NumOperands(), 3u);
+
+  CInstruction quaternary(D3D10_SB_OPCODE_MAD, destination, first, second,
+                          third);
+  EXPECT_EQ(quaternary.NumOperands(), 4u);
+  EXPECT_EQ(quaternary.m_TexelOffset[0], 0);
+  EXPECT_EQ(quaternary.m_TexelOffset[2], 0);
+
+  quaternary.SetNumOperands(3);
+  quaternary.SetTest(D3D10_SB_INSTRUCTION_TEST_ZERO);
+  quaternary.SetPreciseMask(0b1010);
+  quaternary.SetPrivateData(17, 0);
+  quaternary.SetPrivateData(23, 1);
+  quaternary.SetPrivateData(99, 2);
+  EXPECT_EQ(quaternary.NumOperands(), 3u);
+  EXPECT_EQ(quaternary.Test(), D3D10_SB_INSTRUCTION_TEST_ZERO);
+  EXPECT_EQ(quaternary.GetPreciseMask(), 0b1010u);
+  EXPECT_EQ(quaternary.PrivateData(0), 17u);
+  EXPECT_EQ(quaternary.PrivateData(1), 23u);
+  EXPECT_EQ(quaternary.PrivateData(2), 0xffffffffu);
+
+  CInstruction offset(D3D10_SB_OPCODE_SAMPLE);
+  offset.SetTexelOffset(-1, 2, -3);
+  EXPECT_EQ(offset.m_ExtendedOpCodeCount, 1u);
+  EXPECT_EQ(offset.m_OpCodeEx[0], D3D10_SB_EXTENDED_OPCODE_SAMPLE_CONTROLS);
+  EXPECT_EQ(offset.m_TexelOffset[0], -1);
+  EXPECT_EQ(offset.m_TexelOffset[2], -3);
+
+  CInstruction array_offset(D3D10_SB_OPCODE_SAMPLE);
+  constexpr INT8 offsets[3] = {4, -5, 6};
+  array_offset.SetTexelOffset(offsets);
+  EXPECT_EQ(array_offset.m_TexelOffset[0], 4);
+  EXPECT_EQ(array_offset.m_TexelOffset[1], -5);
+  EXPECT_EQ(array_offset.m_TexelOffset[2], 6);
+
+  CInstruction resource(D3D10_SB_OPCODE_LD);
+  D3D10_SB_RESOURCE_RETURN_TYPE return_types[4] = {
+      D3D10_SB_RETURN_TYPE_UINT, D3D10_SB_RETURN_TYPE_SINT,
+      D3D10_SB_RETURN_TYPE_FLOAT, D3D11_SB_RETURN_TYPE_DOUBLE};
+  resource.SetResourceDim(D3D11_SB_RESOURCE_DIMENSION_STRUCTURED_BUFFER,
+                          return_types, 24);
+  EXPECT_EQ(resource.m_ExtendedOpCodeCount, 2u);
+  EXPECT_EQ(resource.m_ResourceDimEx,
+            D3D11_SB_RESOURCE_DIMENSION_STRUCTURED_BUFFER);
+  EXPECT_EQ(resource.m_ResourceDimStructureStrideEx, 24u);
+  EXPECT_EQ(resource.m_ResourceReturnTypeEx[3],
+            D3D11_SB_RETURN_TYPE_DOUBLE);
+}
+
+TEST(ShaderBinary, ConstructsEveryFourComponentOperandForm) {
+  COperand4 basic(D3D10_SB_OPERAND_TYPE_TEMP, 1,
+                  D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+  EXPECT_EQ(basic.RegIndex(), 1u);
+  EXPECT_EQ(basic.m_ComponentSelection,
+            D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE);
+
+  COperand4 selected(D3D10_SB_OPERAND_TYPE_INPUT, 2,
+                     D3D10_SB_4_COMPONENT_Z);
+  EXPECT_EQ(selected.m_ComponentSelection,
+            D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE);
+  EXPECT_EQ(selected.m_ComponentName, D3D10_SB_4_COMPONENT_Z);
+
+  COperand4 selected_relative(
+      D3D10_SB_OPERAND_TYPE_RESOURCE, 3, D3D10_SB_4_COMPONENT_W,
+      D3D10_SB_OPERAND_TYPE_TEMP, 4, D3D10_SB_4_COMPONENT_Y,
+      D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT,
+      D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+  EXPECT_EQ(selected_relative.OperandIndexType(0),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE);
+  EXPECT_EQ(selected_relative.OperandIndex(0)->m_RelIndex, 4u);
+
+  COperand4 relative(D3D10_SB_OPERAND_TYPE_RESOURCE, 5,
+                     D3D10_SB_OPERAND_TYPE_TEMP, 6,
+                     D3D10_SB_4_COMPONENT_X);
+  EXPECT_EQ(relative.OperandIndex(0)->m_RelIndex, 6u);
+
+  COperand4 indexable_relative(
+      D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER, 7,
+      D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 8, 9,
+      D3D10_SB_4_COMPONENT_Z);
+  EXPECT_EQ(indexable_relative.OperandIndex(0)->m_RelIndex, 8u);
+  EXPECT_EQ(indexable_relative.OperandIndex(0)->m_RelIndex1, 9u);
+  EXPECT_EQ(indexable_relative.OperandIndex(0)->m_IndexDimension,
+            D3D10_SB_OPERAND_INDEX_2D);
+
+  COperand4 swizzled(D3D10_SB_OPERAND_TYPE_TEMP, 10,
+                     D3D10_SB_4_COMPONENT_W, D3D10_SB_4_COMPONENT_Z,
+                     D3D10_SB_4_COMPONENT_Y, D3D10_SB_4_COMPONENT_X);
+  EXPECT_EQ(swizzled.SwizzleComponent(0), D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(swizzled.SwizzleComponent(3), D3D10_SB_4_COMPONENT_X);
+
+  COperand4 swizzled_relative(
+      D3D10_SB_OPERAND_TYPE_RESOURCE, 11, D3D10_SB_4_COMPONENT_Y,
+      D3D10_SB_4_COMPONENT_X, D3D10_SB_4_COMPONENT_W,
+      D3D10_SB_4_COMPONENT_Z, D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 12, 13,
+      D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(swizzled_relative.SwizzleComponent(2), D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(swizzled_relative.OperandIndex(0)->m_RelIndex1, 13u);
+}
+
+TEST(ShaderBinary, ConstructsEveryDestinationOperandForm) {
+  COperandDst basic(D3D10_SB_OPERAND_TYPE_TEMP, 1,
+                    D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+  EXPECT_EQ(basic.WriteMask(), D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL);
+
+  constexpr UINT xz_mask = D3D10_SB_OPERAND_4_COMPONENT_MASK_X |
+                           D3D10_SB_OPERAND_4_COMPONENT_MASK_Z;
+  COperandDst masked(D3D10_SB_OPERAND_TYPE_OUTPUT, 2, xz_mask);
+  EXPECT_EQ(masked.WriteMask(), xz_mask);
+
+  COperandDst relative(
+      D3D10_SB_OPERAND_TYPE_OUTPUT, 3, xz_mask,
+      D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 4, 5,
+      D3D10_SB_4_COMPONENT_Y, D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT,
+      D3D11_SB_OPERAND_MIN_PRECISION_SINT_16);
+  EXPECT_EQ(relative.OperandIndex(0)->m_RelIndex, 4u);
+  EXPECT_EQ(relative.OperandIndex(0)->m_RelIndex1, 5u);
+
+  COperandDst relative_second_dimension(
+      D3D10_SB_OPERAND_TYPE_OUTPUT, 6, xz_mask,
+      D3D10_SB_OPERAND_TYPE_TEMP, 7, 8, D3D10_SB_4_COMPONENT_Z, 0,
+      D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT,
+      D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+  EXPECT_EQ(relative_second_dimension.OperandIndexDimension(),
+            D3D10_SB_OPERAND_INDEX_2D);
+  EXPECT_EQ(relative_second_dimension.RegIndex(0), 6u);
+  EXPECT_EQ(relative_second_dimension.OperandIndex(1)->m_RegIndex, 7u);
+  EXPECT_EQ(relative_second_dimension.OperandIndex(1)->m_RelIndex, 8u);
+
+  COperandDst two_dimensional(D3D10_SB_OPERAND_TYPE_OUTPUT, 9, 10, xz_mask);
+  EXPECT_EQ(two_dimensional.RegIndexForMinorDimension(), 10u);
+
+  COperandDst depth(D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH);
+  EXPECT_EQ(depth.NumComponents(), D3D10_SB_OPERAND_1_COMPONENT);
+  COperandDst no_indices(D3D10_SB_OPERAND_TYPE_NULL);
+  EXPECT_EQ(no_indices.NumComponents(), D3D10_SB_OPERAND_0_COMPONENT);
+
+  COperandDst mask_without_index(
+      D3D10_SB_OPERAND_4_COMPONENT_MASK_Y,
+      D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID);
+  EXPECT_EQ(mask_without_index.OperandIndexDimension(),
+            D3D10_SB_OPERAND_INDEX_0D);
+  EXPECT_EQ(mask_without_index.WriteMask(),
+            D3D10_SB_OPERAND_4_COMPONENT_MASK_Y);
+}
+
+TEST(ShaderBinary, ConstructsEveryMultidimensionalOperandForm) {
+  COperand2D basic(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER, 1, 2);
+  EXPECT_EQ(basic.RegIndex(0), 1u);
+  EXPECT_EQ(basic.RegIndexForMinorDimension(), 2u);
+
+  COperand2D selected(D3D11_SB_OPERAND_TYPE_INPUT_CONTROL_POINT, 3, 4,
+                      D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(selected.m_ComponentName, D3D10_SB_4_COMPONENT_W);
+
+  COperand2D indexable_relative(
+      D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER, 5, 6,
+      D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 7, 8,
+      D3D10_SB_4_COMPONENT_Z, D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT,
+      D3D11_SB_OPERAND_MIN_PRECISION_UINT_16);
+  EXPECT_EQ(indexable_relative.OperandIndex(1)->m_RelIndex, 7u);
+  EXPECT_EQ(indexable_relative.OperandIndex(1)->m_RelIndex1, 8u);
+
+  COperand2D temp_relative(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER, 9, 10,
+                           D3D10_SB_OPERAND_TYPE_TEMP, 11,
+                           D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(temp_relative.OperandIndex(1)->m_RelIndex, 11u);
+  EXPECT_EQ(temp_relative.OperandIndex(1)->m_RelIndex1, 0u);
+
+  COperand2D both_relative(
+      D3D10_SB_OPERAND_TYPE_RESOURCE, TRUE, TRUE, 12, 13,
+      D3D10_SB_OPERAND_TYPE_TEMP, 14, 15, D3D10_SB_4_COMPONENT_X,
+      D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 16, 17,
+      D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(both_relative.OperandIndex(0)->m_RelIndex, 14u);
+  EXPECT_EQ(both_relative.OperandIndex(1)->m_RelIndex, 16u);
+
+  COperand2D mixed_relative(
+      D3D10_SB_OPERAND_TYPE_RESOURCE, FALSE, TRUE, 18, 19,
+      D3D10_SB_OPERAND_TYPE_TEMP, 20, 21, D3D10_SB_4_COMPONENT_X,
+      D3D10_SB_OPERAND_TYPE_TEMP, 22, 23, D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(mixed_relative.OperandIndexType(0),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  EXPECT_EQ(mixed_relative.OperandIndexType(1),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE);
+
+  COperand2D swizzled(D3D10_SB_OPERAND_TYPE_RESOURCE, 24, 25,
+                      D3D10_SB_4_COMPONENT_Z, D3D10_SB_4_COMPONENT_W,
+                      D3D10_SB_4_COMPONENT_X, D3D10_SB_4_COMPONENT_Y);
+  EXPECT_EQ(swizzled.SwizzleComponent(0), D3D10_SB_4_COMPONENT_Z);
+
+  COperand2D swizzled_relative(
+      D3D10_SB_OPERAND_TYPE_RESOURCE, D3D10_SB_4_COMPONENT_W,
+      D3D10_SB_4_COMPONENT_Z, D3D10_SB_4_COMPONENT_Y,
+      D3D10_SB_4_COMPONENT_X, TRUE, FALSE, 26,
+      D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP, 27, 28,
+      D3D10_SB_4_COMPONENT_Z, 29, D3D10_SB_OPERAND_TYPE_TEMP, 30, 31,
+      D3D10_SB_4_COMPONENT_W);
+  EXPECT_EQ(swizzled_relative.OperandIndex(0)->m_RelIndex, 27u);
+  EXPECT_EQ(swizzled_relative.OperandIndexType(1),
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+  EXPECT_EQ(swizzled_relative.SwizzleComponent(3),
+            D3D10_SB_4_COMPONENT_X);
+
+  COperand3D three_dimensional(D3D10_SB_OPERAND_TYPE_RESOURCE, 32, 33, 34,
+                               D3D11_SB_OPERAND_MIN_PRECISION_FLOAT_16);
+  EXPECT_EQ(three_dimensional.OperandIndexDimension(),
+            D3D10_SB_OPERAND_INDEX_3D);
+  EXPECT_EQ(three_dimensional.RegIndexForMinorDimension(), 34u);
+}
+
 } // namespace
