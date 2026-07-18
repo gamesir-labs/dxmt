@@ -268,6 +268,70 @@ TEST(D3D12DeviceCreationSpec, RejectsNonAdapterAndClearsOutput) {
   release_object(existing);
 }
 
+TEST(D3D12DeviceCreationSpec,
+     RepeatedAndExplicitCreationPreserveAdapterIdentity) {
+  ID3D12Device *first = nullptr;
+  ID3D12Device *repeated = nullptr;
+  ASSERT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device),
+                              reinterpret_cast<void **>(&first)),
+            S_OK);
+  ASSERT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device),
+                              reinterpret_cast<void **>(&repeated)),
+            S_OK);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(repeated, nullptr);
+
+  const LUID expected_luid = first->GetAdapterLuid();
+  const LUID repeated_luid = repeated->GetAdapterLuid();
+  EXPECT_EQ(repeated_luid.HighPart, expected_luid.HighPart);
+  EXPECT_EQ(repeated_luid.LowPart, expected_luid.LowPart);
+  EXPECT_EQ(first->GetNodeCount(), 1u);
+  EXPECT_EQ(repeated->GetNodeCount(), 1u);
+
+  IDXGIFactory1 *factory = nullptr;
+  ASSERT_EQ(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                               reinterpret_cast<void **>(&factory)),
+            S_OK);
+  ASSERT_NE(factory, nullptr);
+  IDXGIAdapter1 *matching_adapter = nullptr;
+  for (UINT index = 0;; ++index) {
+    IDXGIAdapter1 *candidate = nullptr;
+    const HRESULT hr = factory->EnumAdapters1(index, &candidate);
+    if (hr == DXGI_ERROR_NOT_FOUND)
+      break;
+    ASSERT_EQ(hr, S_OK);
+    ASSERT_NE(candidate, nullptr);
+    DXGI_ADAPTER_DESC1 desc = {};
+    ASSERT_EQ(candidate->GetDesc1(&desc), S_OK);
+    if (desc.AdapterLuid.HighPart == expected_luid.HighPart &&
+        desc.AdapterLuid.LowPart == expected_luid.LowPart) {
+      matching_adapter = candidate;
+      break;
+    }
+    release_object(candidate);
+  }
+  ASSERT_NE(matching_adapter, nullptr);
+
+  ID3D12Device *explicit_device = nullptr;
+  ASSERT_EQ(D3D12CreateDevice(matching_adapter, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device),
+                              reinterpret_cast<void **>(&explicit_device)),
+            S_OK);
+  ASSERT_NE(explicit_device, nullptr);
+  const LUID explicit_luid = explicit_device->GetAdapterLuid();
+  EXPECT_EQ(explicit_luid.HighPart, expected_luid.HighPart);
+  EXPECT_EQ(explicit_luid.LowPart, expected_luid.LowPart);
+  EXPECT_EQ(explicit_device->GetNodeCount(), 1u);
+
+  release_object(explicit_device);
+  release_object(matching_adapter);
+  release_object(factory);
+  release_object(repeated);
+  release_object(first);
+}
+
 TEST(D3D12PersistentAirCacheSpec, ReusesAirAcrossIrrelevantPsoState) {
   ScopedAirCacheTestEnvironment environment("irrelevant-state");
   ID3D12Device *device = nullptr;
