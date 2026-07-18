@@ -1,6 +1,7 @@
 #include <dxmt_test.hpp>
 
 #include "config/config.hpp"
+#include "log/log.hpp"
 #include "util_env.hpp"
 
 #include <cstdint>
@@ -187,6 +188,13 @@ TEST(Environment, ReportsTheRunningExecutable) {
 #else
   EXPECT_EQ(dxmt::env::getUnixPath(path), path);
 #endif
+}
+
+TEST(Logger, IgnoresDisabledAndInvalidLevels) {
+  EXPECT_NO_THROW(
+      dxmt::Logger::log(dxmt::LogLevel::None, "disabled log message"));
+  EXPECT_NO_THROW(dxmt::Logger::log(static_cast<dxmt::LogLevel>(UINT32_MAX),
+                                    "invalid log message"));
 }
 
 } // namespace

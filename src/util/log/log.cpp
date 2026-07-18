@@ -53,6 +53,9 @@ void Logger::logFileOnly(LogLevel level, const std::string &message) {
 
 void Logger::emitMsg(LogLevel level, const std::string &message,
                      bool wineOutput) {
+  if (level >= LogLevel::None)
+    return;
+
   if (level >= m_minLevel) {
     std::lock_guard<dxmt::mutex> lock(m_mutex);
 
