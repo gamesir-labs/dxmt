@@ -288,6 +288,11 @@
   },
   "public_api": {
     "test_globs": ["tests/d3d12/**/*.cpp"],
+    "interface_globs": [
+      "include/native/directx/d3d12.h",
+      "src/d3d12/d3d12_agility.hpp"
+    ],
+    "implementation_globs": ["src/d3d12/*.cpp"],
     "categories": {
       "device-and-memory": {
         "minimum_percent": 100.0,
@@ -332,7 +337,18 @@
           "CreateLifetimeTracker",
           "CheckDriverMatchingIdentifier",
           "GetRaytracingAccelerationStructurePrebuildInfo",
-          "SetBackgroundProcessingMode"
+          "SetBackgroundProcessingMode",
+          "GetAdapterLuid",
+          "GetDescriptorHandleIncrementSize",
+          "GetNodeCount",
+          "SetResidencyPriority",
+          "Map",
+          "Unmap",
+          "GetGPUVirtualAddress",
+          "GetHeapProperties",
+          "ReadFromSubresource",
+          "WriteToSubresource",
+          "GetDesc1"
         ]
       },
       "descriptors-and-pipeline": {
@@ -361,7 +377,13 @@
           "CreateMetaCommand",
           "CreateStateObject",
           "AddToStateObject",
-          "CreateSamplerFeedbackUnorderedAccessView"
+          "CreateSamplerFeedbackUnorderedAccessView",
+          "GetCPUDescriptorHandleForHeapStart",
+          "GetGPUDescriptorHandleForHeapStart",
+          "GetCachedBlob",
+          "GetRootSignatureDesc",
+          "GetRootSignatureDescAtVersion",
+          "GetUnconvertedRootSignatureDesc"
         ]
       },
       "command-recording": {
@@ -376,6 +398,7 @@
           "CopyBufferRegion",
           "CopyTextureRegion",
           "CopyResource",
+          "CopyTiles",
           "ResolveSubresource",
           "IASetPrimitiveTopology",
           "IASetIndexBuffer",
@@ -396,6 +419,8 @@
           "SetComputeRootDescriptorTable",
           "SetGraphicsRoot32BitConstants",
           "SetComputeRoot32BitConstants",
+          "SetGraphicsRoot32BitConstant",
+          "SetComputeRoot32BitConstant",
           "SetGraphicsRootConstantBufferView",
           "SetComputeRootConstantBufferView",
           "SetGraphicsRootShaderResourceView",
@@ -434,7 +459,8 @@
           "EndRenderPass",
           "RSSetShadingRate",
           "RSSetShadingRateImage",
-          "DispatchMesh"
+          "DispatchMesh",
+          "GetType"
         ]
       },
       "queue-and-fence": {
@@ -477,6 +503,16 @@
           "SetPageFaultEnablement",
           "SetWatsonDumpEnablement",
           "SetBreadcrumbContextEnablement"
+        ]
+      },
+      "object-contract": {
+        "minimum_percent": 100.0,
+        "apis": [
+          "GetDevice",
+          "GetPrivateData",
+          "SetPrivateData",
+          "SetPrivateDataInterface",
+          "SetName"
         ]
       }
     }

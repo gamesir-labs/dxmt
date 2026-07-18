@@ -41,6 +41,34 @@ class PublicApiEvidenceTest(unittest.TestCase):
             self.assertEqual(results[0]["missing"], ["MissingMethod"])
             self.assertEqual(len(errors), 1)
 
+    def test_reports_implemented_public_method_missing_from_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "include").mkdir()
+            (root / "src").mkdir()
+            (root / "include/api.hpp").write_text(
+                "virtual void STDMETHODCALLTYPE MissingMethod() = 0;",
+                encoding="utf-8",
+            )
+            (root / "src/api.cpp").write_text(
+                "void STDMETHODCALLTYPE MissingMethod() override {}",
+                encoding="utf-8",
+            )
+            config = {
+                "public_api": {
+                    "interface_globs": ["include/*.hpp"],
+                    "implementation_globs": ["src/*.cpp"],
+                    "categories": {
+                        "sample": {
+                            "apis": ["OtherMethod"],
+                        }
+                    },
+                }
+            }
+            result, errors = COVERAGE.scan_public_api_surface(config, root)
+            self.assertEqual(result["missing"], ["MissingMethod"])
+            self.assertEqual(len(errors), 1)
+
 
 class ErrorEvidenceTest(unittest.TestCase):
     def test_checks_every_declared_evidence_category(self):
@@ -195,11 +223,16 @@ class RepositoryManifestTest(unittest.TestCase):
         public_results, public_errors = COVERAGE.scan_public_api(
             config, REPO_ROOT
         )
+        surface_result, surface_errors = COVERAGE.scan_public_api_surface(
+            config, REPO_ROOT
+        )
         error_results, error_errors = COVERAGE.scan_error_paths(
             config, REPO_ROOT
         )
         self.assertFalse(public_errors)
+        self.assertFalse(surface_errors)
         self.assertFalse(error_errors)
+        self.assertFalse(surface_result["missing"])
         self.assertTrue(all(not result["missing"] for result in public_results))
         self.assertTrue(all(result["mapped"] for result in error_results))
 

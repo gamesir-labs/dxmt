@@ -71,6 +71,19 @@ TEST_F(CommandTypeLegalitySpec, RejectsGraphicsCommandsOnComputeAndCopyLists) {
   }
 }
 
+TEST_F(CommandTypeLegalitySpec, ReportsCreationTypeForEveryListKind) {
+  for (const auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT,
+                          D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                          D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                          D3D12_COMMAND_LIST_TYPE_COPY}) {
+    SCOPED_TRACE(static_cast<UINT>(type));
+    auto pair = CreateList(type);
+    ASSERT_TRUE(pair.list);
+    EXPECT_EQ(pair.list->GetType(), type);
+    EXPECT_EQ(pair.list->Close(), S_OK);
+  }
+}
+
 TEST_F(CommandTypeLegalitySpec, RejectsComputeAndBindingCommandsOnCopyLists) {
   auto dispatch = CreateList(D3D12_COMMAND_LIST_TYPE_COPY);
   ASSERT_TRUE(dispatch.list);

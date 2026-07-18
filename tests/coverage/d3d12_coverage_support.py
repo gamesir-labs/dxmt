@@ -61,6 +61,55 @@ def scan_public_api(
     return results, errors
 
 
+def scan_public_api_surface(
+    config: dict[str, Any], repo_root: Path
+) -> tuple[dict[str, Any], list[str]]:
+    public_api = config.get("public_api", {})
+    interface_globs = public_api.get("interface_globs", [])
+    implementation_globs = public_api.get("implementation_globs", [])
+    categories = public_api.get("categories", {})
+    if not interface_globs or not implementation_globs or not categories:
+        raise ValueError(
+            "coverage config must define public_api interface, implementation, "
+            "and category mappings"
+        )
+
+    interface_text = read_globs(repo_root, interface_globs)
+    implementation_text = read_globs(repo_root, implementation_globs)
+    declared = set(
+        re.findall(r"STDMETHODCALLTYPE\s+([A-Za-z_]\w*)\s*\(", interface_text)
+    )
+    implemented = set(
+        re.findall(
+            r"STDMETHODCALLTYPE\s+([A-Za-z_]\w*)\s*\([^;{}]*?\)\s*"
+            r"(?:const\s*)?override",
+            implementation_text,
+            re.DOTALL,
+        )
+    )
+    discovered = declared & implemented
+    listed = {
+        name
+        for category in categories.values()
+        for name in category.get("apis", [])
+    }
+    missing = sorted(discovered - listed)
+    result = {
+        "declared": len(declared),
+        "implemented": len(implemented),
+        "discovered": len(discovered),
+        "listed": len(listed),
+        "missing": missing,
+    }
+    errors = []
+    if missing:
+        errors.append(
+            "public-api/surface: implemented public methods missing from "
+            f"manifest: {', '.join(missing)}"
+        )
+    return result, errors
+
+
 def compiler_counts(
     file_entry: dict[str, Any],
 ) -> tuple[int, int, int, int, int, int]:

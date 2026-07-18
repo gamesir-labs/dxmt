@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 
 #include "d3d12_pipeline_stream.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -351,6 +352,33 @@ TEST(D3D12PersistentAirCacheSpec, SeparatesAirWhenStageArgumentsChange) {
 
 TEST_F(D3D12DeviceSpec, ReportsAtLeastOneNode) {
   EXPECT_GE(device_->GetNodeCount(), 1u);
+}
+
+TEST_F(D3D12DeviceSpec, AdapterLuidMatchesEnumeratedDxgiAdapter) {
+  IDXGIFactory1 *factory = nullptr;
+  ASSERT_EQ(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                               reinterpret_cast<void **>(&factory)),
+            S_OK);
+  ASSERT_NE(factory, nullptr);
+
+  const LUID device_luid = device_->GetAdapterLuid();
+  bool matched = false;
+  for (UINT index = 0;; ++index) {
+    IDXGIAdapter1 *adapter = nullptr;
+    const HRESULT hr = factory->EnumAdapters1(index, &adapter);
+    if (hr == DXGI_ERROR_NOT_FOUND)
+      break;
+    ASSERT_EQ(hr, S_OK);
+    ASSERT_NE(adapter, nullptr);
+    DXGI_ADAPTER_DESC1 desc = {};
+    EXPECT_EQ(adapter->GetDesc1(&desc), S_OK);
+    matched = matched ||
+              (desc.AdapterLuid.HighPart == device_luid.HighPart &&
+               desc.AdapterLuid.LowPart == device_luid.LowPart);
+    release_object(adapter);
+  }
+  EXPECT_TRUE(matched);
+  release_object(factory);
 }
 
 TEST_F(D3D12DeviceSpec, ReportsDescriptorHeapVisibilityAndStableHandles) {
