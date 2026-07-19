@@ -47,7 +47,8 @@ CreateDeviceFactory(ID3D12SDKConfiguration1 *configuration) {
   return SUCCEEDED(hr) ? std::move(factory) : ComPtr<ID3D12DeviceFactory>{};
 }
 
-TEST(D3D12AgilityPublicApiSpec, ConfigurationAndFactoryUsePublicInterfaces) {
+DXMT_SERIAL_TEST(D3D12AgilityPublicApiSpec,
+                 ConfigurationAndFactoryUsePublicInterfaces) {
   const auto get_interface = GetInterfaceProc();
   if (!get_interface)
     GTEST_SKIP() << "D3D12GetInterface is unavailable";
@@ -67,16 +68,19 @@ TEST(D3D12AgilityPublicApiSpec, ConfigurationAndFactoryUsePublicInterfaces) {
             S_OK);
   ASSERT_TRUE(base_configuration);
 
+  const HRESULT set_version =
+      base_configuration->SetSDKVersion(kAgilitySdkVersion, ".\\D3D12\\");
   auto factory = CreateDeviceFactory(configuration.get());
-  if (!factory)
+  if (FAILED(set_version) || !factory)
     GTEST_SKIP() << "an app-local Agility SDK is not staged";
 
-  ASSERT_EQ(factory->InitializeFromGlobalState(), S_OK);
   const auto flags = static_cast<D3D12_DEVICE_FACTORY_FLAGS>(
       D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_EXISTING_DEVICE |
       D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON);
   ASSERT_EQ(factory->SetFlags(flags), S_OK);
   EXPECT_EQ(factory->GetFlags(), flags);
+  EXPECT_EQ(factory->ApplyToGlobalState(), S_OK);
+  EXPECT_EQ(factory->InitializeFromGlobalState(), S_OK);
 
   const HRESULT feature_hr =
       factory->EnableExperimentalFeatures(0, nullptr, nullptr, nullptr);
@@ -94,8 +98,8 @@ TEST(D3D12AgilityPublicApiSpec, ConfigurationAndFactoryUsePublicInterfaces) {
   configuration->FreeUnusedSDKs();
 }
 
-TEST(D3D12AgilityPublicApiSpec,
-     DeviceConfigurationExposesRootSignatureAndDredContracts) {
+DXMT_SERIAL_TEST(D3D12AgilityPublicApiSpec,
+                 DeviceConfigurationExposesRootSignatureAndDredContracts) {
   auto sdk_configuration = CreateSdkConfiguration();
   if (!sdk_configuration)
     GTEST_SKIP() << "ID3D12SDKConfiguration1 is unavailable";
