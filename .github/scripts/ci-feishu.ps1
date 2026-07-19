@@ -34,6 +34,9 @@ function Get-FeishuLabels {
     Commit     = (Get-UnicodeString 0x63D0, 0x4EA4)                         # 
     Author     = (Get-UnicodeString 0x63D0, 0x4EA4, 0x8005)                 # 
     FailedJobs = (Get-UnicodeString 0x5931, 0x8D25, 0x4EFB, 0x52A1)         # 
+    TestResult = (Get-UnicodeString 0x6D4B, 0x8BD5, 0x7ED3, 0x679C)         # test result
+    Passed     = (Get-UnicodeString 0x901A, 0x8FC7)                         # passed
+    Failed     = (Get-UnicodeString 0x5931, 0x8D25)                         # failed
     RunLink    = (Get-UnicodeString 0x8FD0, 0x884C, 0x94FE, 0x63A5)         # 
     ViewDetail = (Get-UnicodeString 0x67E5, 0x770B, 0x8BE6, 0x60C5)         # 
     PkgName    = (Get-UnicodeString 0x5305, 0x540D)                         # 
@@ -50,6 +53,14 @@ function Get-FeishuLabels {
       [string][char]0x2705 + ' DXMT Nightly ' +
       (Get-UnicodeString 0x6784, 0x5EFA, 0x6210, 0x529F)
     )                                                                       #  DXMT Nightly 
+    ConformanceFail = (
+      [string][char]0x274C + ' DXMT Windows D3D ' +
+      (Get-UnicodeString 0x4E00, 0x81F4, 0x6027, 0x6D4B, 0x8BD5, 0x5931, 0x8D25)
+    )                                                                       # DXMT Windows D3D conformance failure
+    ConformanceOk = (
+      [string][char]0x2705 + ' DXMT Windows D3D ' +
+      (Get-UnicodeString 0x4E00, 0x81F4, 0x6027, 0x6D4B, 0x8BD5, 0x901A, 0x8FC7)
+    )                                                                       # DXMT Windows D3D conformance passed
     PubFail    = (
       [string][char]0x274C + ' DXMT ' +
       (Get-UnicodeString 0x7EC4, 0x4EF6, 0x53D1, 0x5E03, 0x5931, 0x8D25)
