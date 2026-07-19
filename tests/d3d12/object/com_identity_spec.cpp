@@ -1,7 +1,7 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
-#include "shaders/runtime_test_shaders.hpp"
 
 namespace {
 
@@ -23,8 +23,13 @@ protected:
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
     auto root_signature = context_.CreateRootSignature(root_desc);
+    const auto shader = dxmt::test::CompileShader(
+        "[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+    ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+    const D3D12_SHADER_BYTECODE bytecode = {
+        shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
     auto pipeline = context_.CreateComputePipeline(
-        root_signature.get(), dxmt::test::ClearBufferComputeShader());
+        root_signature.get(), bytecode);
 
     D3D12_HEAP_DESC heap_desc = {};
     heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
