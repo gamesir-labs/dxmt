@@ -12,6 +12,11 @@ set "ORACLE_D3D12_ONLY=0"
 set "ORACLE_CASES=*"
 set "ORACLE_WORKER_ARG="
 
+if defined DXMT_CI_D3D12_CASE_FILTER (
+  set "ORACLE_CASES=%DXMT_CI_D3D12_CASE_FILTER%"
+  set "ORACLE_D3D12_ONLY=1"
+)
+
 :parse_args
 if "%~1"=="" goto run_oracle
 if /I "%~1"=="--debug" (

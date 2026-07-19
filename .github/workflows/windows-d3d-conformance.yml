@@ -3,6 +3,11 @@ name: Windows D3D Public API Conformance
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      d3d12_case_filter:
+        description: Optional D3D12 CaseId filter for an isolated oracle run
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -36,6 +41,8 @@ jobs:
       - name: Build and run complete native Windows suites with builder
         id: oracle
         shell: cmd
+        env:
+          DXMT_CI_D3D12_CASE_FILTER: ${{ inputs.d3d12_case_filter }}
         run: call scripts\dxmt-builder.bat test --profile gcc-x64-release-full unit
 
       - name: Upload Windows oracle logs
