@@ -27,7 +27,7 @@ protected:
       Buffer<uint> typed_input : register(t0);
       ByteAddressBuffer raw_input : register(t1);
       StructuredBuffer<uint> structured_input : register(t2);
-      RWStructuredBuffer<uint> output : register(u0);
+      RWBuffer<uint> output : register(u0);
 
       [numthreads(1, 1, 1)]
       void main() {
@@ -93,10 +93,9 @@ protected:
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    uav.Format = DXGI_FORMAT_UNKNOWN;
+    uav.Format = DXGI_FORMAT_R32_UINT;
     uav.Buffer.FirstElement = 2;
     uav.Buffer.NumElements = 3;
-    uav.Buffer.StructureByteStride = sizeof(UINT);
     context_.device()->CreateUnorderedAccessView(
         output, nullptr, &uav,
         context_.CpuDescriptorHandle(heap, base + 3));
