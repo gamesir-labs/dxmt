@@ -889,10 +889,14 @@ int RunScheduledTests(int argc, char **argv) {
   }
 
   std::string failure_reports;
-  for (const auto &path : report_paths)
-    failure_reports += ReadAndRemoveReport(path);
-  if (failure_reports.empty()) {
-    for (const auto index : failed_shard_indexes) {
+  std::vector<bool> shard_reported_failure(shards.size(), false);
+  for (std::size_t index = 0; index < report_paths.size(); ++index) {
+    auto report = ReadAndRemoveReport(report_paths[index]);
+    shard_reported_failure[index] = !report.empty();
+    failure_reports += report;
+  }
+  for (const auto index : failed_shard_indexes) {
+    if (!shard_reported_failure[index]) {
       scheduler_errors += "tests assigned to failed shard ";
       scheduler_errors += std::to_string(index);
       scheduler_errors += ":\n";
