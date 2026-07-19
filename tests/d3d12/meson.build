@@ -189,6 +189,7 @@ d3d12_unit_suites = {
       'transfer/clear_dsv_spec.cpp',
       'transfer/clear_rtv_spec.cpp',
       'transfer/clear_uav_spec.cpp',
+      'transfer/clear_uav_value_matrix_spec.cpp',
       'transfer/copy_buffer_region_matrix_spec.cpp',
       'transfer/copy_footprint_spec.cpp',
       'transfer/copy_edge_spec.cpp',
@@ -201,6 +202,7 @@ d3d12_unit_suites = {
   'resource': {
     'sources': files(
       'resource/buffer_size_matrix_spec.cpp',
+      'resource/texture2d_size_matrix_spec.cpp',
       'resource/planar_format_spec.cpp',
       'resource/existing_heap_spec.cpp',
       'resource/residency_spec.cpp',
