@@ -444,7 +444,8 @@ TEST_F(GraphicsEdgeSemanticsSpec,
   auto pixel = CompileShader(R"(
     float4 main(linear centroid float4 barycentric : TEXCOORD0) : SV_Target {
       bool inside = all(barycentric.xy >= -0.001) &&
-                    barycentric.x + barycentric.y <= 1.001;
+                    barycentric.x + barycentric.y <= 1.001 &&
+                    all(abs(barycentric.zw) <= 0.001);
       return inside ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
     })",
                              "ps_5_0");
