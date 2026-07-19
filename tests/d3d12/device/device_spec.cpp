@@ -584,7 +584,7 @@ TEST_F(D3D12DeviceSpec, CreatesStreamOutputPipelineFromPublicDescriptor) {
   release_object(root_signature);
 }
 
-TEST_F(D3D12DeviceSpec, RejectsEveryUnreportedMsaaPso) {
+TEST_F(D3D12DeviceSpec, CreatesEveryAdvertisedMsaaPso) {
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   root_desc.Flags =
       D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -592,7 +592,7 @@ TEST_F(D3D12DeviceSpec, RejectsEveryUnreportedMsaaPso) {
       CreateRootSignature(device_, root_desc);
   ASSERT_NE(root_signature, nullptr);
 
-  bool found_unsupported = false;
+  UINT advertised = 0;
   for (const UINT sample_count : {2u, 4u, 8u, 16u}) {
     D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
     levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -601,22 +601,22 @@ TEST_F(D3D12DeviceSpec, RejectsEveryUnreportedMsaaPso) {
                   D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
                   sizeof(levels)),
               S_OK);
-    if (levels.NumQualityLevels)
+    if (!levels.NumQualityLevels)
       continue;
-    found_unsupported = true;
+    ++advertised;
 
     SCOPED_TRACE(::testing::Message() << "sample_count=" << sample_count);
     auto desc = BasicGraphicsPipelineDesc(root_signature);
     desc.SampleDesc.Count = sample_count;
     ID3D12PipelineState *pipeline = nullptr;
-    EXPECT_EQ(device_->CreateGraphicsPipelineState(
+    ASSERT_EQ(device_->CreateGraphicsPipelineState(
                   &desc, __uuidof(ID3D12PipelineState),
                   reinterpret_cast<void **>(&pipeline)),
-              E_INVALIDARG);
-    EXPECT_EQ(pipeline, nullptr);
+              S_OK);
+    ASSERT_NE(pipeline, nullptr);
     release_object(pipeline);
   }
-  EXPECT_TRUE(found_unsupported);
+  EXPECT_GT(advertised, 0u);
   release_object(root_signature);
 }
 

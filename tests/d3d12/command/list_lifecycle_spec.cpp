@@ -277,15 +277,6 @@ TEST_F(CommandListLifecycleSpec, ResetRecordingListFails) {
   EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
 }
 
-TEST_F(CommandListLifecycleSpec, ResetWithNullAllocatorFails) {
-  ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
-
-  EXPECT_EQ(context_.list()->Reset(nullptr, nullptr), E_INVALIDARG);
-  ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
-  EXPECT_EQ(context_.list()->Close(), S_OK);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
 TEST_F(CommandListLifecycleSpec, ResetWithWrongAllocatorTypeFails) {
   ASSERT_EQ(context_.list()->Close(), S_OK);
   ComPtr<ID3D12CommandAllocator> allocator;

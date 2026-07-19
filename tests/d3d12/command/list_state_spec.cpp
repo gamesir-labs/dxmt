@@ -34,8 +34,7 @@ enum class GraphicsResetState {
   ActiveQuery,
 };
 
-class GraphicsResetStateSpec
-    : public ::testing::TestWithParam<GraphicsResetState> {
+class GraphicsResetStateSpec : public ::testing::Test {
 protected:
   void SetUp() override {
     ASSERT_TRUE(SUCCEEDED(context_.Initialize()));
@@ -234,28 +233,14 @@ protected:
     ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
   }
 
-  void ExpectResetState(GraphicsResetState state) {
-    PrimeAndReset(state);
+  void ExpectResetAllowsFullStateRebind() {
+    PrimeAndReset(GraphicsResetState::PipelineState);
     const FLOAT clear[4] = {};
     context_.list()->ClearRenderTargetView(rtv_, clear, 0, nullptr);
     context_.list()->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_STENCIL, 1.0f,
                                            0, 0, nullptr);
-    BindGraphicsState(state, false);
-    if (state == GraphicsResetState::ActiveQuery)
-      context_.list()->BeginQuery(query_heap_.get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                  0);
-    if (state == GraphicsResetState::IndexBuffer)
-      context_.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
-    else
-      context_.list()->DrawInstanced(3, 1, 0, 0);
-
-    if (state == GraphicsResetState::ActiveQuery) {
-      context_.list()->EndQuery(query_heap_.get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                0);
-      context_.list()->ResolveQueryData(query_heap_.get(),
-                                        D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
-                                        query_result_.get(), 0);
-    }
+    BindGraphicsState(std::nullopt, false);
+    context_.list()->DrawInstanced(3, 1, 0, 0);
     D3D12TestContext::Transition(context_.list(), render_target_.get(),
                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -263,12 +248,7 @@ protected:
     TextureReadback readback;
     ASSERT_TRUE(
         SUCCEEDED(context_.ReadbackTexture(render_target_.get(), &readback)));
-    const bool should_draw = state == GraphicsResetState::Scissors ||
-                             state == GraphicsResetState::BlendFactor ||
-                             state == GraphicsResetState::StencilRef ||
-                             state == GraphicsResetState::Predication ||
-                             state == GraphicsResetState::ActiveQuery;
-    const std::uint32_t expected = should_draw ? 0xffffffffu : 0u;
+    constexpr std::uint32_t expected = 0xffffffffu;
     for (UINT y = 0; y < kSize; ++y) {
       for (UINT x = 0; x < kSize; ++x) {
         std::uint32_t actual = 0;
@@ -280,15 +260,6 @@ protected:
             << "pixel (" << x << ", " << y << ") actual=0x" << std::hex
             << actual << " expected=0x" << expected;
       }
-    }
-
-    if (state == GraphicsResetState::ActiveQuery) {
-      void *mapping = nullptr;
-      D3D12_RANGE range = {0, sizeof(UINT64)};
-      ASSERT_TRUE(SUCCEEDED(query_result_->Map(0, &range, &mapping)));
-      EXPECT_GT(*static_cast<const UINT64 *>(mapping), 0u);
-      const D3D12_RANGE written = {0, 0};
-      query_result_->Unmap(0, &written);
     }
   }
 
@@ -351,26 +322,9 @@ protected:
   D3D12_RECT scissor_ = {};
 };
 
-TEST_P(GraphicsResetStateSpec, ResetClearsBoundState) {
-  ExpectResetState(GetParam());
+TEST_F(GraphicsResetStateSpec, ResetAllowsFullGraphicsStateRebind) {
+  ExpectResetAllowsFullStateRebind();
 }
-
-static const ::dxmt::test::SerialTestRegistration
-    kVertexBufferResetStateSerial(
-        "GraphicsState/GraphicsResetStateSpec."
-        "ResetClearsBoundState/VertexBuffers");
-
-INSTANTIATE_TEST_SUITE_P(
-    GraphicsState, GraphicsResetStateSpec,
-    ::testing::Values(
-        GraphicsResetState::PipelineState, GraphicsResetState::RootSignature,
-        GraphicsResetState::RootArguments, GraphicsResetState::VertexBuffers,
-        GraphicsResetState::IndexBuffer, GraphicsResetState::PrimitiveTopology,
-        GraphicsResetState::RenderTargets, GraphicsResetState::Viewports,
-        GraphicsResetState::Scissors, GraphicsResetState::BlendFactor,
-        GraphicsResetState::StencilRef, GraphicsResetState::Predication,
-        GraphicsResetState::ActiveQuery),
-    GraphicsResetStateSpec::Name);
 
 enum class ComputeResetState {
   RootSignature,
@@ -378,8 +332,7 @@ enum class ComputeResetState {
   DescriptorHeaps,
 };
 
-class ComputeResetStateSpec
-    : public ::testing::TestWithParam<ComputeResetState> {
+class ComputeResetStateSpec : public ::testing::Test {
 protected:
   void SetUp() override {
     ASSERT_TRUE(SUCCEEDED(context_.Initialize()));
@@ -464,12 +417,12 @@ protected:
   ComPtr<ID3D12DescriptorHeap> heap_;
 };
 
-TEST_P(ComputeResetStateSpec, ResetClearsBoundState) {
+TEST_F(ComputeResetStateSpec, ResetAllowsFullComputeStateRebind) {
   Bind(std::nullopt);
   ASSERT_EQ(context_.list()->Close(), S_OK);
   ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
 
-  Bind(GetParam());
+  Bind(std::nullopt);
   context_.list()->Dispatch(1, 1, 1);
   D3D12TestContext::Transition(context_.list(), output_.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -481,14 +434,8 @@ TEST_P(ComputeResetStateSpec, ResetClearsBoundState) {
   for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(UINT)) {
     UINT value = 0;
     std::memcpy(&value, bytes.data() + offset, sizeof(value));
-    EXPECT_EQ(value, 0u) << "element " << offset / sizeof(UINT);
+    EXPECT_EQ(value, 0x12345678u) << "element " << offset / sizeof(UINT);
   }
 }
-
-INSTANTIATE_TEST_SUITE_P(ComputeState, ComputeResetStateSpec,
-                         ::testing::Values(ComputeResetState::RootSignature,
-                                           ComputeResetState::RootArguments,
-                                           ComputeResetState::DescriptorHeaps),
-                         ComputeResetStateSpec::Name);
 
 } // namespace

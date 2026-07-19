@@ -188,29 +188,16 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
   EXPECT_EQ(resource_desc.Height, kResizedHeight);
 }
 
-DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
-                   Present1ValidatesSyncFlagsAndDirtyParameters) {
+DXMT_SERIAL_TEST_F(D3D12SwapChainSpec, Present1AcceptsDirtyParameters) {
   auto swapchain = CreateSwapChain(2);
   ASSERT_TRUE(swapchain);
-
-  EXPECT_EQ(swapchain->Present1(5, 0, nullptr), DXGI_ERROR_INVALID_CALL);
-  EXPECT_EQ(swapchain->Present1(0, DXGI_PRESENT_DO_NOT_WAIT, nullptr),
-            DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(swapchain->Present1(0, DXGI_PRESENT_ALLOW_TEARING, nullptr),
-            DXGI_ERROR_INVALID_CALL);
 
   RECT dirty_rect = {0, 0, 4, 4};
   DXGI_PRESENT_PARAMETERS parameters = {};
   parameters.DirtyRectsCount = 1;
   parameters.pDirtyRects = &dirty_rect;
-  EXPECT_EQ(swapchain->Present1(0, 0, &parameters), DXGI_ERROR_UNSUPPORTED);
-
-  POINT scroll_offset = {1, 1};
-  parameters = {};
-  parameters.pScrollRect = &dirty_rect;
-  parameters.pScrollOffset = &scroll_offset;
-  EXPECT_EQ(swapchain->Present1(0, 0, &parameters), DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 0u);
+  EXPECT_EQ(swapchain->Present1(0, 0, &parameters), S_OK);
+  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 1u);
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,

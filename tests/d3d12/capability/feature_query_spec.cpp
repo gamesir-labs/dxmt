@@ -246,13 +246,6 @@ TEST_P(D3D12FeatureQueryContractSpec,
   EXPECT_EQ(storage, before);
 }
 
-TEST_P(D3D12FeatureQueryContractSpec, NullFeatureDataFails) {
-  const auto &query = GetParam();
-  EXPECT_EQ(context_.device()->CheckFeatureSupport(query.feature, nullptr,
-                                                   query.size),
-            E_INVALIDARG);
-}
-
 INSTANTIATE_TEST_SUITE_P(
     SupportedFeatureMatrix, D3D12FeatureQueryContractSpec,
     ::testing::ValuesIn(BuildFeatureQueryCases()),

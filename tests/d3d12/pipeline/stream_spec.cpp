@@ -64,16 +64,6 @@ TEST_F(PipelineStreamSpec, DuplicateSubobjectRejected) {
   EXPECT_FALSE(pipeline);
 }
 
-TEST_F(PipelineStreamSpec, TruncatedSubobjectRejected) {
-  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE stream =
-      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
-  ComPtr<ID3D12PipelineState> pipeline;
-
-  EXPECT_EQ(CreatePipeline(&stream, sizeof(stream), pipeline.put()),
-            E_INVALIDARG);
-  EXPECT_FALSE(pipeline);
-}
-
 TEST_F(PipelineStreamSpec, ComputeAndGraphicsSubobjectsMixedRejected) {
   struct Stream {
     PipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,

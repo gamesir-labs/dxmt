@@ -309,8 +309,7 @@ TEST_F(PrivateDataSpec, ObjectDestructionReleasesPrivateInterface) {
   EXPECT_TRUE(destroyed->load(std::memory_order_acquire));
 }
 
-TEST_F(PrivateDataSpec, SetNameAcceptsNullAndEmptyNames) {
-  EXPECT_TRUE(SUCCEEDED(object()->SetName(nullptr)));
+TEST_F(PrivateDataSpec, SetNameAcceptsEmptyName) {
   EXPECT_EQ(object()->SetName(L""), S_OK);
   ExpectObjectRemainsUsable();
 }

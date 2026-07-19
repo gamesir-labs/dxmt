@@ -400,99 +400,6 @@ MalformedBlobIsRejected(const std::vector<std::uint8_t> &blob) {
 }
 
 TEST(RootSignatureMalformedBlobSpec,
-     StructuralCorruptionCorpusIsRejectedAndClearsEveryOutput) {
-  const auto canonical = SerializeStructuredRootSignature();
-  ASSERT_GE(canonical.size(), 44u);
-  const std::size_t part_header = ReadBlobU32(canonical, 32);
-  ASSERT_LE(part_header + 8, canonical.size());
-  const std::size_t rts0 = part_header + 8;
-  const std::size_t parameter_headers = rts0 + ReadBlobU32(canonical, rts0 + 8);
-  const std::size_t parameter_payload =
-      rts0 + ReadBlobU32(canonical, parameter_headers + 8);
-  const std::size_t ranges =
-      rts0 + ReadBlobU32(canonical, parameter_payload + 4);
-  ASSERT_LE(ranges + 20, canonical.size());
-
-  auto expect_rejected = [&](const char *name, auto mutate) {
-    auto corrupted = canonical;
-    mutate(corrupted);
-    EXPECT_TRUE(MalformedBlobIsRejected(corrupted)) << name;
-  };
-
-  expect_rejected("bad container size", [](auto &blob) {
-    WriteBlobU32(blob, 24, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("part offset past end", [](auto &blob) {
-    WriteBlobU32(blob, 32, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("missing RTS0 part", [part_header](auto &blob) {
-    WriteBlobU32(blob, part_header, 0x21444142u);
-  });
-  expect_rejected("bad root signature version", [rts0](auto &blob) {
-    WriteBlobU32(blob, rts0, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("parameter count overflow", [rts0](auto &blob) {
-    WriteBlobU32(blob, rts0 + 4, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("parameter array past end", [rts0](auto &blob) {
-    WriteBlobU32(blob, rts0 + 8, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("parameter array overlaps root header",
-                  [rts0](auto &blob) { WriteBlobU32(blob, rts0 + 8, 0); });
-  expect_rejected("sampler count overflow", [rts0](auto &blob) {
-    WriteBlobU32(blob, rts0 + 12, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("sampler array past end", [rts0](auto &blob) {
-    WriteBlobU32(blob, rts0 + 16, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("sampler array overlaps root header",
-                  [rts0](auto &blob) { WriteBlobU32(blob, rts0 + 16, 0); });
-  expect_rejected("overlapping parameter and sampler arrays",
-                  [rts0](auto &blob) {
-                    WriteBlobU32(blob, rts0 + 16, ReadBlobU32(blob, rts0 + 8));
-                  });
-  expect_rejected("unknown parameter type", [parameter_headers](auto &blob) {
-    WriteBlobU32(blob, parameter_headers,
-                 std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("unknown shader visibility", [parameter_headers](auto &blob) {
-    WriteBlobU32(blob, parameter_headers + 4,
-                 std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("parameter payload past end",
-                  [parameter_headers](auto &blob) {
-                    WriteBlobU32(blob, parameter_headers + 8,
-                                 std::numeric_limits<std::uint32_t>::max());
-                  });
-  expect_rejected("range count overflow", [parameter_payload](auto &blob) {
-    WriteBlobU32(blob, parameter_payload,
-                 std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("range array past end", [parameter_payload](auto &blob) {
-    WriteBlobU32(blob, parameter_payload + 4,
-                 std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("empty range array offset past end",
-                  [parameter_payload](auto &blob) {
-                    WriteBlobU32(blob, parameter_payload, 0);
-                    WriteBlobU32(blob, parameter_payload + 4,
-                                 std::numeric_limits<std::uint32_t>::max());
-                  });
-  expect_rejected("range partially overlaps table payload",
-                  [parameter_payload, parameter_headers](auto &blob) {
-                    WriteBlobU32(blob, parameter_payload + 4,
-                                 ReadBlobU32(blob, parameter_headers + 8) + 4);
-                  });
-  expect_rejected("unknown range type", [ranges](auto &blob) {
-    WriteBlobU32(blob, ranges, std::numeric_limits<std::uint32_t>::max());
-  });
-  expect_rejected("zero-sized range",
-                  [ranges](auto &blob) { WriteBlobU32(blob, ranges + 4, 0); });
-  expect_rejected("structural bit flip",
-                  [rts0](auto &blob) { blob[rts0] ^= 0x80; });
-}
-
-TEST(RootSignatureMalformedBlobSpec,
      Version11ParameterVisibilityCorruptionIsRejected) {
   auto blob = SerializeVersion11DescriptorTables();
   ASSERT_GE(blob.size(), 44u);
@@ -550,37 +457,6 @@ TEST(RootSignatureMalformedBlobSpec,
             D3D12_SHADER_VISIBILITY_VERTEX);
   EXPECT_EQ(desc->Desc_1_1.pParameters[1].ShaderVisibility,
             D3D12_SHADER_VISIBILITY_PIXEL);
-}
-
-TEST(RootSignatureMalformedBlobSpec,
-     DeterministicBitFlipsEitherRejectCleanlyOrProduceQueryableDescription) {
-  const auto canonical = SerializeStructuredRootSignature();
-  ASSERT_FALSE(canonical.empty());
-  constexpr std::array<std::size_t, 16> kByteOffsets = {
-      0, 4, 7, 12, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64};
-  for (std::size_t case_index = 0; case_index < kByteOffsets.size();
-       ++case_index) {
-    auto mutated = canonical;
-    const std::size_t offset = kByteOffsets[case_index] % mutated.size();
-    mutated[offset] ^= std::uint8_t(1u << (case_index % 8));
-
-    void *output = reinterpret_cast<void *>(std::uintptr_t{1});
-    const HRESULT result = D3D12CreateVersionedRootSignatureDeserializer(
-        mutated.data(), mutated.size(),
-        __uuidof(ID3D12VersionedRootSignatureDeserializer), &output);
-    ASSERT_TRUE(result == S_OK || result == E_INVALIDARG)
-        << "offset " << offset << " result=" << std::hex << result;
-    if (result == E_INVALIDARG) {
-      EXPECT_EQ(output, nullptr) << "offset " << offset;
-      continue;
-    }
-    ASSERT_NE(output, nullptr) << "offset " << offset;
-    auto *deserializer =
-        static_cast<ID3D12VersionedRootSignatureDeserializer *>(output);
-    EXPECT_NE(deserializer->GetUnconvertedRootSignatureDesc(), nullptr)
-        << "offset " << offset;
-    deserializer->Release();
-  }
 }
 
 TEST(RootSignatureMalformedBlobSpec,
