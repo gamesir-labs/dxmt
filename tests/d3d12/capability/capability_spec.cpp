@@ -438,6 +438,22 @@ TEST_F(D3D12UnrealCapabilitySpec, ReportsShaderWaveOperationContract) {
   }
 }
 
+TEST_F(D3D12UnrealCapabilitySpec,
+       DoesNotAdvertiseAtomicInt64UntilCapabilityEnabled) {
+  // Plan P1-2 gates 64-bit atomic execution on capability advertisement.
+  // OPTIONS9 is currently zero-initialized, so every AtomicInt64 field must
+  // remain FALSE until a promotion change enables the feature suite.
+  D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9 = {};
+  ASSERT_EQ(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9,
+                                         &options9, sizeof(options9)),
+            S_OK);
+  EXPECT_EQ(options9.AtomicInt64OnTypedResourceSupported, FALSE);
+  EXPECT_EQ(options9.AtomicInt64OnGroupSharedSupported, FALSE);
+  EXPECT_EQ(options9.MeshShaderPipelineStatsSupported, FALSE);
+  EXPECT_EQ(options9.MeshShaderSupportsFullRangeRenderTargetArrayIndex, FALSE);
+  EXPECT_EQ(options9.DerivativesInMeshAndAmplificationShadersSupported, FALSE);
+}
+
 TEST_F(D3D12UnrealCapabilitySpec, NegotiatesRootSignatureVersion) {
   D3D12_FEATURE_DATA_ROOT_SIGNATURE root_signature = {};
   root_signature.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;

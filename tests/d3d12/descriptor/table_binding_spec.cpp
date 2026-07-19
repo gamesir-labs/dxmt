@@ -171,4 +171,55 @@ TEST_F(DescriptorTableBindingSpec, MixedForeignSamplerBatchIsAtomic) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST_F(DescriptorTableBindingSpec,
+       SwitchingOnlySamplerHeapDoesNotCorruptCbvSrvUavHeap) {
+  auto sampler_a = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  auto sampler_b = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  ASSERT_TRUE(sampler_a);
+  ASSERT_TRUE(sampler_b);
+
+  BindPipelineAndArguments();
+  ID3D12DescriptorHeap *first[] = {heaps_[0].get(), sampler_a.get()};
+  context_.list()->SetDescriptorHeaps(2, first);
+  context_.list()->SetComputeRootDescriptorTable(
+      1, heaps_[0]->GetGPUDescriptorHandleForHeapStart());
+
+  // Replace only the sampler heap while keeping the same CBV/SRV/UAV heap.
+  // After rebinding the resource table, the UAV path must still execute.
+  ID3D12DescriptorHeap *second[] = {heaps_[0].get(), sampler_b.get()};
+  context_.list()->SetDescriptorHeaps(2, second);
+  context_.list()->SetComputeRootDescriptorTable(
+      1, heaps_[0]->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+
+  ExpectOutput(0, kValue);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(DescriptorTableBindingSpec,
+       SwitchingOnlyCbvSrvUavHeapDoesNotCorruptSamplerHeap) {
+  auto sampler = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  ASSERT_TRUE(sampler);
+
+  BindPipelineAndArguments();
+  ID3D12DescriptorHeap *first[] = {heaps_[0].get(), sampler.get()};
+  context_.list()->SetDescriptorHeaps(2, first);
+  context_.list()->SetComputeRootDescriptorTable(
+      1, heaps_[0]->GetGPUDescriptorHandleForHeapStart());
+
+  // Replace only the resource heap. After rebinding onto heap 1 the sampler
+  // heap remains usable for subsequent sampler-table rebinds.
+  ID3D12DescriptorHeap *second[] = {heaps_[1].get(), sampler.get()};
+  context_.list()->SetDescriptorHeaps(2, second);
+  context_.list()->SetComputeRootDescriptorTable(
+      1, heaps_[1]->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+
+  ExpectOutput(1, kValue);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 } // namespace

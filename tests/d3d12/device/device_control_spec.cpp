@@ -348,6 +348,24 @@ TEST_F(DeviceControlSpec, DxgiResourceControlsRejectInvalidInputs) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST(DeviceRemovalSpec, InitialReasonIsSuccess) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
+  D3D12TestContext context;
+  ASSERT_EQ(context.Initialize(device.get()), S_OK);
+  EXPECT_EQ(context.device()->GetDeviceRemovedReason(), S_OK);
+  // Queue remains healthy for ordinary fence work before any removal.
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  ASSERT_EQ(context.queue()->Signal(fence.get(), 1), S_OK);
+  ASSERT_EQ(context.SignalAndWait(), S_OK);
+  EXPECT_GE(fence->GetCompletedValue(), 1ull);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
@@ -407,6 +425,63 @@ TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
 
   CloseHandle(post_removal_event);
   CloseHandle(pending_event);
+}
+
+TEST(DeviceRemovalSpec, PendingFenceWaitDoesNotHangAfterRemoval) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+  D3D12TestContext context;
+  ASSERT_EQ(context.Initialize(device.get()), S_OK);
+
+  ComPtr<ID3D12Device5> device5;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(ID3D12Device5),
+                reinterpret_cast<void **>(device5.put())),
+            S_OK);
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ASSERT_EQ(fence->SetEventOnCompletion(100, event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+
+  device5->RemoveDevice();
+  EXPECT_EQ(device->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED);
+  EXPECT_EQ(fence->GetCompletedValue(), UINT64_MAX);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+  CloseHandle(event);
+}
+
+TEST(DeviceRemovalSpec, DeviceAndQueueDestructionDoNotDeadlock) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+  ComPtr<ID3D12Device5> device5;
+  ASSERT_EQ(device->QueryInterface(
+                __uuidof(ID3D12Device5),
+                reinterpret_cast<void **>(device5.put())),
+            S_OK);
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+
+  {
+    D3D12TestContext context;
+    ASSERT_EQ(context.Initialize(device.get()), S_OK);
+    ASSERT_EQ(fence->SetEventOnCompletion(42, event), S_OK);
+    device5->RemoveDevice();
+    EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+    // Context/queue destructor runs at scope exit after removal.
+  }
+
+  fence.reset();
+  device5.reset();
+  device.reset();
+  CloseHandle(event);
 }
 
 TEST(DeviceRemovalSpec,

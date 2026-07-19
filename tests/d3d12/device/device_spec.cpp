@@ -359,6 +359,30 @@ TEST_F(D3D12DeviceSpec, CreatesDirectCommandQueue) {
   release_object(queue);
 }
 
+TEST_F(D3D12DeviceSpec, SingleNodeAcceptsNodeMaskZeroAndOne) {
+  ASSERT_EQ(device_->GetNodeCount(), 1u);
+  for (const UINT node_mask : {0u, 1u}) {
+    SCOPED_TRACE(node_mask);
+    D3D12_COMMAND_QUEUE_DESC desc = {};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    desc.NodeMask = node_mask;
+    ID3D12CommandQueue *queue = nullptr;
+    ASSERT_EQ(device_->CreateCommandQueue(
+                  &desc, __uuidof(ID3D12CommandQueue),
+                  reinterpret_cast<void **>(&queue)),
+              S_OK);
+    ASSERT_NE(queue, nullptr);
+    const auto actual = queue->GetDesc();
+    EXPECT_EQ(actual.Type, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    // NodeMask 0 means "default node" on a single-node device and may be
+    // reported back as either 0 or the concrete node bit 0x1.
+    EXPECT_TRUE(actual.NodeMask == 0u || actual.NodeMask == 1u);
+    release_object(queue);
+  }
+}
+
 TEST_F(D3D12DeviceSpec,
        RejectsInvalidCommandQueueDescriptionsAndClearsOutputs) {
   D3D12_COMMAND_QUEUE_DESC desc = {};

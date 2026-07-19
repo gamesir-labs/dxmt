@@ -301,12 +301,14 @@ class PrimitiveRasterEdgeSpec
 
 TEST_P(PrimitiveRasterEdgeSpec, PrimitiveRasterizationHasStableCoverage) {
   const auto &test_case = GetParam();
-  const std::string source = std::string(R"(
-    float4 main(uint id : SV_VertexID) : SV_Position {
-      const float2 positions[3] = {)") +
-                             test_case.positions + R"(};
-      return float4(positions[id], 0.5, 1.0);
-    })";
+  const std::string source =
+      std::string("float4 main(uint id : SV_VertexID) : SV_Position {\n"
+                  "  const float2 positions[") +
+      std::to_string(std::max<UINT>(test_case.vertex_count, 1u)) +
+      "] = {" + test_case.positions +
+      "};\n"
+      "  return float4(positions[id], 0.5, 1.0);\n"
+      "}\n";
   auto vertex = CompileShader(source, "vs_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
   auto pipeline = CreatePipeline(vertex.bytecode.get(),
@@ -327,10 +329,19 @@ INSTANTIATE_TEST_SUITE_P(
                       "float2(-0.8, 0.0), float2(0.0, 0.0), "
                       "float2(0.8, 0.0)",
                       3, false, "DegenerateTriangle"},
+        PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                      D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                      "float2(-1.0, -1.0), float2(-1.0, 1.0), "
+                      "float2(1.0, -1.0), float2(1.0, 1.0)",
+                      4, true, "TriangleStrip"},
         PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
                       D3D_PRIMITIVE_TOPOLOGY_LINELIST,
                       "float2(-0.8, 0.0), float2(0.8, 0.0), float2(0, 0)",
                       2, true, "Line"},
+        PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+                      D3D_PRIMITIVE_TOPOLOGY_LINESTRIP,
+                      "float2(-0.8, -0.4), float2(0.0, 0.4), float2(0.8, -0.4)",
+                      3, true, "LineStrip"},
         PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
                       D3D_PRIMITIVE_TOPOLOGY_POINTLIST,
                       "float2(0.0, 0.0), float2(0, 0), float2(0, 0)",

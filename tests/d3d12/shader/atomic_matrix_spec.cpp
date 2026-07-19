@@ -362,4 +362,67 @@ TEST_F(D3D12AtomicMatrixSpec,
   EXPECT_EQ(Readback(target.get(), 2), (std::vector<UINT>{528u, 528u}));
 }
 
+TEST_F(D3D12AtomicMatrixSpec,
+       GroupsharedAtomicContentionReturnsEachOriginalValueExactlyOnce) {
+  constexpr char kShader[] = R"(
+    RWStructuredBuffer<uint> target : register(u0);
+    RWByteAddressBuffer originals : register(u1);
+    groupshared uint shared_counter;
+    [numthreads(32, 1, 1)]
+    void main(uint3 group_thread : SV_GroupThreadID,
+              uint3 dispatch_thread : SV_DispatchThreadID) {
+      if (group_thread.x == 0)
+        shared_counter = 0;
+      GroupMemoryBarrierWithGroupSync();
+      uint original;
+      InterlockedAdd(shared_counter, 1u, original);
+      originals.Store(dispatch_thread.x * 4u, original);
+      GroupMemoryBarrierWithGroupSync();
+      if (group_thread.x == 0) {
+        uint ignored;
+        InterlockedExchange(target[0], shared_counter, ignored);
+      }
+    }
+  )";
+  constexpr UINT kThreadCount = 32;
+  auto root = CreateRootSignature(2);
+  auto pipeline = CreatePipeline(root.get(), kShader);
+  auto target = CreateInitializedBuffer(std::vector<UINT>(kThreadCount + 1));
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(root);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_UNKNOWN;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = 1;
+  uav.Buffer.StructureByteStride = sizeof(UINT);
+  context_.device()->CreateUnorderedAccessView(
+      target.get(), nullptr, &uav,
+      context_.CpuDescriptorHandle(heap.get(), 0));
+  uav = {};
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.FirstElement = 1;
+  uav.Buffer.NumElements = kThreadCount;
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  context_.device()->CreateUnorderedAccessView(
+      target.get(), nullptr, &uav,
+      context_.CpuDescriptorHandle(heap.get(), 1));
+  Bind(context_.list(), root.get(), pipeline.get(), heap.get());
+  context_.list()->Dispatch(1, 1, 1);
+
+  auto actual = Readback(target.get(), kThreadCount + 1);
+  ASSERT_EQ(actual.size(), kThreadCount + 1);
+  EXPECT_EQ(actual[0], kThreadCount);
+  std::vector<UINT> original_values(actual.begin() + 1, actual.end());
+  std::sort(original_values.begin(), original_values.end());
+  std::vector<UINT> expected(kThreadCount);
+  std::iota(expected.begin(), expected.end(), 0u);
+  EXPECT_EQ(original_values, expected);
+}
+
 } // namespace

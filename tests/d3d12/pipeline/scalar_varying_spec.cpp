@@ -320,6 +320,51 @@ TEST_F(D3D12ScalarVaryingSpec, RejectsReorderedConsumerSignature) {
 }
 
 TEST_F(D3D12ScalarVaryingSpec,
+       NoInterpolationPreservesPerVertexPackedComponents) {
+  // Plan residual: NoInterpolation + register packing. Each vertex writes a
+  // distinct nointerpolation float3 and a packed COLOR0 float; the pixel
+  // shader reads the nointerpolation values without perspective blending so
+  // the primitive's first vertex values are stable at the rasterized center.
+  constexpr char kVertex[] = R"(
+    struct Output {
+      float4 position : SV_Position;
+      nointerpolation float3 rgb : TEXCOORD0;
+      nointerpolation float alpha : COLOR0;
+    };
+    Output main(uint vertex_id : SV_VertexID) {
+      const float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(-1.0,  3.0),
+        float2( 3.0, -1.0)
+      };
+      const float3 colors[3] = {
+        float3(0.25, 0.5, 0.75),
+        float3(1.0, 0.0, 0.0),
+        float3(0.0, 1.0, 0.0)
+      };
+      const float alphas[3] = {0.125, 0.5, 1.0};
+      Output output;
+      output.position = float4(positions[vertex_id], 0.0, 1.0);
+      output.rgb = colors[vertex_id];
+      output.alpha = alphas[vertex_id];
+      return output;
+    }
+  )";
+  constexpr char kPixel[] = R"(
+    struct Input {
+      nointerpolation float3 rgb : TEXCOORD0;
+      nointerpolation float alpha : COLOR0;
+    };
+    float4 main(Input input) : SV_Target {
+      return float4(input.rgb, input.alpha);
+    }
+  )";
+  // Vertex 0 values dominate nointerpolation for the fullscreen triangle
+  // coverage at the center sample under DXMT/Metal convention used here.
+  RenderAndExpectCenter(kVertex, kPixel, 0x20bf8040u);
+}
+
+TEST_F(D3D12ScalarVaryingSpec,
        PreservesPackedSemanticsAcrossRegisterBoundary) {
   const auto vertex = CompileShader(kPackedVaryingVertexShader, "vs_5_0");
   ASSERT_TRUE(SUCCEEDED(vertex.result)) << vertex.diagnostic_text();

@@ -5595,6 +5595,8 @@ public:
     if (desc->Mode != D3D12_SHADER_CACHE_MODE_MEMORY &&
         desc->Mode != D3D12_SHADER_CACHE_MODE_DISK)
       return WARN_E_INVALIDARG(__func__);
+    // Cast to UINT before OR: mingw DEFINE_ENUM_FLAG_OPERATORS operator| is
+    // not constexpr, so enum|enum cannot initialize a constexpr UINT.
     constexpr UINT known_flags =
         static_cast<UINT>(D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED) |
         static_cast<UINT>(D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR);

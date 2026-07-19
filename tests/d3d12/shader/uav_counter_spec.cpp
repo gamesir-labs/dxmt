@@ -131,6 +131,10 @@ protected:
     context_.list()->Dispatch(1, 1, 1);
   }
 
+  void ExpectConsumeCopiesAllValuesAndReachesZero(const DWORD *shader,
+                                                   std::size_t shader_size,
+                                                   const char *path_label);
+
   void RunAppendCase(UINT64 counter_offset,
                      bool counter_in_data_resource = false) {
     constexpr UINT kSentinel = 0xaaaaaaaau;
@@ -266,13 +270,132 @@ TEST_F(D3D12UavCounterSpec, AppendSupportsCounterInDataResource) {
   RunAppendCase(D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT, true);
 }
 
-TEST_F(D3D12UavCounterSpec, DecrementCounterCopiesAllValuesAndReachesZero) {
+TEST_F(D3D12UavCounterSpec, AppendHonorsLastValidAlignedCounterOffset) {
+  // size == 2 * alignment + sizeof(UINT) makes 2 * alignment the final legal
+  // CounterOffsetInBytes for this counter resource.
+  RunAppendCase(2 * D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT);
+}
+
+TEST_F(D3D12UavCounterSpec, AppendIsVisibleAcrossCommandListsWithUavBarrier) {
+  constexpr UINT kSentinel = 0xaaaaaaaau;
+  // Enough structured elements for counter=1..6 appends (two bursts of three).
+  constexpr UINT kElementCount = 8;
+  constexpr UINT kComponentCount = kElementCount * 3;
+  std::vector<UINT> initial_data(kComponentCount, kSentinel);
+  constexpr UINT kInitialCounter = 1;
+  auto root = CreateRootSignature(1);
+  auto pipeline =
+      CreatePipeline(root.get(), kAppendShader, sizeof(kAppendShader));
+  auto data = CreateInitializedBuffer(
+      initial_data.data(), initial_data.size() * sizeof(UINT),
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto counter = CreateInitializedBuffer(
+      &kInitialCounter, sizeof(kInitialCounter),
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  ASSERT_TRUE(root);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(data);
+  ASSERT_TRUE(counter);
+  ASSERT_TRUE(heap);
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_UNKNOWN;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = kElementCount;
+  uav.Buffer.StructureByteStride = 3 * sizeof(UINT);
+  context_.device()->CreateUnorderedAccessView(
+      data.get(), counter.get(), &uav,
+      heap->GetCPUDescriptorHandleForHeapStart());
+  TransitionToUav(data.get());
+  TransitionToUav(counter.get());
+
+  ComPtr<ID3D12CommandAllocator> second_allocator;
+  ComPtr<ID3D12GraphicsCommandList> second_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(second_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, second_allocator.get(),
+                nullptr, __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(second_list.put())),
+            S_OK);
+
+  // First list: three appends from counter=1 -> counter becomes 4.
+  Dispatch(root.get(), pipeline.get(), heap.get());
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  // Second list: resource UAV barrier then three more appends from the
+  // published counter value.
+  D3D12TestContext::UavBarrier(second_list.get(), data.get());
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  second_list->SetDescriptorHeaps(1, heaps);
+  second_list->SetComputeRootSignature(root.get());
+  second_list->SetPipelineState(pipeline.get());
+  second_list->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  second_list->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      second_list.get(), data.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(
+      second_list.get(), counter.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  const UINT64 data_size = initial_data.size() * sizeof(UINT);
+  auto data_readback = context_.CreateBuffer(
+      data_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto counter_readback = context_.CreateBuffer(
+      sizeof(kInitialCounter), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(data_readback);
+  ASSERT_TRUE(counter_readback);
+  second_list->CopyBufferRegion(data_readback.get(), 0, data.get(), 0,
+                                data_size);
+  second_list->CopyBufferRegion(counter_readback.get(), 0, counter.get(), 0,
+                                sizeof(kInitialCounter));
+  ASSERT_EQ(second_list->Close(), S_OK);
+
+  ID3D12CommandList *first = context_.list();
+  context_.queue()->ExecuteCommandLists(1, &first);
+  ID3D12CommandList *second = second_list.get();
+  context_.queue()->ExecuteCommandLists(1, &second);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  std::vector<std::uint8_t> data_bytes;
+  ASSERT_EQ(MapReadbackBuffer(data_readback.get(), data_size, &data_bytes),
+            S_OK);
+  // Element 0 stays sentinel; slots 1-3 and 4-6 receive the two append bursts.
+  EXPECT_EQ(ReadUint(data_bytes, 0), kSentinel);
+  const std::array<UINT, 9> burst = {4, 2, 1, 4, 1, 1, 3, 1, 1};
+  for (std::size_t i = 0; i < burst.size(); ++i) {
+    EXPECT_EQ(ReadUint(data_bytes, (i + 3) * sizeof(UINT)), burst[i])
+        << "first-burst component=" << i;
+  }
+  // Second burst starts at structured index 4 (counter after first list).
+  for (std::size_t i = 0; i < burst.size(); ++i) {
+    EXPECT_EQ(ReadUint(data_bytes, (i + 12) * sizeof(UINT)), burst[i])
+        << "second-burst component=" << i;
+  }
+  std::vector<std::uint8_t> counter_bytes;
+  ASSERT_EQ(MapReadbackBuffer(counter_readback.get(), sizeof(kInitialCounter),
+                              &counter_bytes),
+            S_OK);
+  EXPECT_EQ(ReadUint(counter_bytes, 0), 7u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+void D3D12UavCounterSpec::ExpectConsumeCopiesAllValuesAndReachesZero(
+    const DWORD *shader, std::size_t shader_size, const char *path_label) {
+  SCOPED_TRACE(path_label);
   constexpr std::array<UINT, 4> kInitialData = {10, 20, 30, 40};
   constexpr UINT kInitialCounter = 4;
   constexpr std::array<UINT, 4> kInitialOutput = {};
   auto root = CreateRootSignature(2);
-  auto pipeline =
-      CreatePipeline(root.get(), kDecrementShader, sizeof(kDecrementShader));
+  auto pipeline = CreatePipeline(root.get(), shader, shader_size);
   auto data = CreateInitializedBuffer(
       kInitialData.data(), sizeof(kInitialData),
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -345,6 +468,166 @@ TEST_F(D3D12UavCounterSpec, DecrementCounterCopiesAllValuesAndReachesZero) {
                               &counter_bytes),
             S_OK);
   EXPECT_EQ(ReadUint(counter_bytes, 0), 0u);
+}
+
+TEST_F(D3D12UavCounterSpec, DecrementCounterCopiesAllValuesAndReachesZero) {
+  ExpectConsumeCopiesAllValuesAndReachesZero(
+      kDecrementShader, sizeof(kDecrementShader), "DecrementCounterDxbc");
+}
+
+TEST_F(D3D12UavCounterSpec,
+       ConsumeStructuredBufferCopiesAllValuesAndReachesZero) {
+  // ConsumeStructuredBuffer.Consume() lowers to the same imm_atomic_consume
+  // DXBC as DecrementCounter. Prefer a source-compiled path when the HLSL
+  // frontend accepts ConsumeStructuredBuffer; otherwise execute the Wine
+  // precompiled consume DXBC that matches that lowering.
+  const auto source = CompileShader(R"(
+    ConsumeStructuredBuffer<uint> input : register(u0);
+    RWStructuredBuffer<uint> output : register(u1);
+    [numthreads(4, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      uint value = input.Consume();
+      output[id.x] = value;
+    }
+  )", "cs_5_0");
+  if (source.result == S_OK && source.bytecode) {
+    const auto *words = static_cast<const DWORD *>(
+        source.bytecode->GetBufferPointer());
+    ExpectConsumeCopiesAllValuesAndReachesZero(
+        words, source.bytecode->GetBufferSize(), "ConsumeStructuredHLSL");
+    return;
+  }
+  ExpectConsumeCopiesAllValuesAndReachesZero(
+      kDecrementShader, sizeof(kDecrementShader),
+      "ConsumeStructuredPrecompiledDxbc");
+}
+
+TEST_F(D3D12UavCounterSpec,
+       AppendThenConsumeIsVisibleAcrossComputeAndDirectQueues) {
+  // Compute queue appends three structured records; after a fence the direct
+  // queue observes the updated counter and appended payload.
+  constexpr UINT kSentinel = 0xaaaaaaaau;
+  constexpr std::array<UINT, 15> kInitialData = {
+      kSentinel, kSentinel, kSentinel, kSentinel, kSentinel,
+      kSentinel, kSentinel, kSentinel, kSentinel, kSentinel,
+      kSentinel, kSentinel, kSentinel, kSentinel, kSentinel};
+  constexpr UINT kInitialCounter = 1;
+
+  auto root_append = CreateRootSignature(1);
+  auto append_pipeline =
+      CreatePipeline(root_append.get(), kAppendShader, sizeof(kAppendShader));
+  auto data = CreateInitializedBuffer(
+      kInitialData.data(), sizeof(kInitialData),
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto counter = CreateInitializedBuffer(
+      &kInitialCounter, sizeof(kInitialCounter),
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  ASSERT_TRUE(root_append);
+  ASSERT_TRUE(append_pipeline);
+  ASSERT_TRUE(data);
+  ASSERT_TRUE(counter);
+  ASSERT_TRUE(heap);
+
+  // Finish CPU uploads on the direct queue so resources start in COPY_DEST.
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_UNKNOWN;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = kInitialData.size() / 3;
+  uav.Buffer.StructureByteStride = 3 * sizeof(UINT);
+  context_.device()->CreateUnorderedAccessView(
+      data.get(), counter.get(), &uav,
+      heap->GetCPUDescriptorHandleForHeapStart());
+
+  D3D12_COMMAND_QUEUE_DESC compute_desc = {};
+  compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+  ComPtr<ID3D12CommandQueue> compute_queue;
+  ASSERT_EQ(context_.device()->CreateCommandQueue(
+                &compute_desc, __uuidof(ID3D12CommandQueue),
+                reinterpret_cast<void **>(compute_queue.put())),
+            S_OK);
+  ComPtr<ID3D12CommandAllocator> compute_allocator;
+  ComPtr<ID3D12GraphicsCommandList> compute_list;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                __uuidof(ID3D12CommandAllocator),
+                reinterpret_cast<void **>(compute_allocator.put())),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_allocator.get(),
+                nullptr, __uuidof(ID3D12GraphicsCommandList),
+                reinterpret_cast<void **>(compute_list.put())),
+            S_OK);
+
+  D3D12TestContext::Transition(compute_list.get(), data.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  D3D12TestContext::Transition(compute_list.get(), counter.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  compute_list->SetDescriptorHeaps(1, heaps);
+  compute_list->SetComputeRootSignature(root_append.get());
+  compute_list->SetPipelineState(append_pipeline.get());
+  compute_list->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  compute_list->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(compute_list.get(), data.get());
+  ASSERT_EQ(compute_list->Close(), S_OK);
+
+  D3D12TestContext::Transition(
+      context_.list(), counter.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(
+      context_.list(), data.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto counter_readback = context_.CreateBuffer(
+      sizeof(kInitialCounter), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto data_readback = context_.CreateBuffer(
+      sizeof(kInitialData), D3D12_HEAP_TYPE_READBACK,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(counter_readback);
+  ASSERT_TRUE(data_readback);
+  context_.list()->CopyBufferRegion(counter_readback.get(), 0, counter.get(), 0,
+                                    sizeof(kInitialCounter));
+  context_.list()->CopyBufferRegion(data_readback.get(), 0, data.get(), 0,
+                                    sizeof(kInitialData));
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  ID3D12CommandList *compute_lists[] = {compute_list.get()};
+  compute_queue->ExecuteCommandLists(1, compute_lists);
+  ASSERT_EQ(compute_queue->Signal(fence.get(), 1), S_OK);
+  ASSERT_EQ(context_.queue()->Wait(fence.get(), 1), S_OK);
+  ID3D12CommandList *direct_lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, direct_lists);
+  ASSERT_EQ(context_.queue()->Signal(fence.get(), 2), S_OK);
+  ASSERT_EQ(context_.WaitForFence(fence.get(), 2), S_OK);
+
+  std::vector<std::uint8_t> counter_bytes;
+  ASSERT_EQ(MapReadbackBuffer(counter_readback.get(), sizeof(kInitialCounter),
+                              &counter_bytes),
+            S_OK);
+  EXPECT_EQ(ReadUint(counter_bytes, 0), 4u);
+  std::vector<std::uint8_t> data_bytes;
+  ASSERT_EQ(MapReadbackBuffer(data_readback.get(), sizeof(kInitialData),
+                              &data_bytes),
+            S_OK);
+  const std::array<UINT, 9> burst = {4, 2, 1, 4, 1, 1, 3, 1, 1};
+  for (std::size_t i = 0; i < burst.size(); ++i) {
+    EXPECT_EQ(ReadUint(data_bytes, (i + 3) * sizeof(UINT)), burst[i])
+        << "component=" << i;
+  }
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
