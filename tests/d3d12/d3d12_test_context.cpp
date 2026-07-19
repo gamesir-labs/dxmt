@@ -495,8 +495,10 @@ HRESULT D3D12TestContext::ReadbackBuffer(
   ComPtr<ID3D12Resource> readback =
       CreateBuffer(size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
                    D3D12_RESOURCE_STATE_COPY_DEST);
-  if (!readback)
-    return E_OUTOFMEMORY;
+  if (!readback) {
+    const HRESULT removed_reason = device_->GetDeviceRemovedReason();
+    return FAILED(removed_reason) ? removed_reason : E_OUTOFMEMORY;
+  }
 
   list_->CopyBufferRegion(readback.get(), 0, buffer, 0, size);
   HRESULT hr = ExecuteAndWait();

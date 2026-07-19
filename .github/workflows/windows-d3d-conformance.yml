@@ -8,11 +8,6 @@ on:
         description: Optional D3D12 CaseId filter for an isolated oracle run
         required: false
         type: string
-      d3d12_debug:
-        description: Enable the D3D12 debug layer for an isolated oracle run
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -48,7 +43,6 @@ jobs:
         shell: cmd
         env:
           DXMT_CI_D3D12_CASE_FILTER: ${{ inputs.d3d12_case_filter }}
-          DXMT_CI_D3D12_DEBUG: ${{ inputs.d3d12_debug }}
         run: call scripts\dxmt-builder.bat test --profile gcc-x64-release-full unit
 
       - name: Upload Windows oracle logs

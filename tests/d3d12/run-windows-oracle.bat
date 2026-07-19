@@ -16,14 +16,6 @@ if defined DXMT_CI_D3D12_CASE_FILTER (
   set "ORACLE_CASES=%DXMT_CI_D3D12_CASE_FILTER%"
   set "ORACLE_D3D12_ONLY=1"
 )
-if /I "%DXMT_CI_D3D12_DEBUG%"=="true" (
-  set "ORACLE_DEBUG=1"
-  set "ORACLE_D3D12_ONLY=1"
-)
-if /I "%DXMT_CI_D3D12_DEBUG%"=="1" (
-  set "ORACLE_DEBUG=1"
-  set "ORACLE_D3D12_ONLY=1"
-)
 
 :parse_args
 if "%~1"=="" goto run_oracle
@@ -86,6 +78,10 @@ if not exist "%ORACLE_OUTPUT%" (
     exit /b 2
   )
 )
+del /q "%ORACLE_OUTPUT%\d3d10-oracle-*.log" >nul 2>&1
+del /q "%ORACLE_OUTPUT%\d3d11-oracle-*.log" >nul 2>&1
+del /q "%ORACLE_OUTPUT%\d3d12-oracle-*.log" >nul 2>&1
+del /q "%ORACLE_OUTPUT%\windows-oracle-*.txt" >nul 2>&1
 
 if /I "%ORACLE_ADAPTER%"=="warp" (
   set "DXMT_TEST_WINDOWS_ADAPTER=warp"
