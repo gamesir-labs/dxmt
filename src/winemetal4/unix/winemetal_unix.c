@@ -5346,6 +5346,40 @@ _MTLDevice_currentAllocatedSize(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_queryTimestampFrequency(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->handle;
+  params->ret = 0;
+  if (!device)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 26.0, *))
+    params->ret = [device queryTimestampFrequency];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_sampleTimestamps(void *obj) {
+  struct unixcall_mtldevice_sampletimestamps *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  params->cpu_timestamp = 0;
+  params->gpu_timestamp = 0;
+  params->ret_success = 0;
+  if (!device)
+    return STATUS_SUCCESS;
+
+  if (@available(macOS 10.15, *)) {
+    MTLTimestamp cpu_timestamp = 0;
+    MTLTimestamp gpu_timestamp = 0;
+    [device sampleTimestamps:&cpu_timestamp gpuTimestamp:&gpu_timestamp];
+    params->cpu_timestamp = cpu_timestamp;
+    params->gpu_timestamp = gpu_timestamp;
+    params->ret_success = 1;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_name(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
   params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle name];
@@ -10074,6 +10108,8 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLCommandBuffer_setDiagnosticInfo,
     &_MTLCommandQueue_updateSparseTextureMappings,
+    &_MTLDevice_queryTimestampFrequency,
+    &_MTLDevice_sampleTimestamps,
 };
 
 #ifndef DXMT_NATIVE
@@ -10256,5 +10292,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLCommandBuffer_setDiagnosticInfo,
     &_MTLCommandQueue_updateSparseTextureMappings,
+    &_MTLDevice_queryTimestampFrequency,
+    &_MTLDevice_sampleTimestamps,
 };
 #endif

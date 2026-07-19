@@ -5049,7 +5049,12 @@ public:
     if (!frequency)
       return WARN_E_INVALIDARG(__func__);
 
-    *frequency = 1'000'000'000ull;
+    const auto timestamp_frequency =
+        device_->GetMTLDevice().queryTimestampFrequency();
+    if (!timestamp_frequency)
+      return E_FAIL;
+
+    *frequency = timestamp_frequency;
     return S_OK;
   }
 
@@ -5057,20 +5062,41 @@ public:
     if (!gpu_timestamp || !cpu_timestamp)
       return WARN_E_INVALIDARG(__func__);
 
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    const auto timestamp =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-    const auto monotonic = timestamp < 0 ? 0 : static_cast<UINT64>(timestamp);
-    *gpu_timestamp = monotonic;
 #ifdef _WIN32
-    LARGE_INTEGER cpu_counter = {};
-    if (!QueryPerformanceCounter(&cpu_counter))
+    LARGE_INTEGER cpu_before = {};
+    if (!QueryPerformanceCounter(&cpu_before))
       return E_FAIL;
-    *cpu_timestamp = static_cast<UINT64>(cpu_counter.QuadPart);
+#endif
+
+    UINT64 metal_cpu_timestamp = 0;
+    UINT64 metal_gpu_timestamp = 0;
+    if (!device_->GetMTLDevice().sampleTimestamps(
+            &metal_cpu_timestamp, &metal_gpu_timestamp))
+      return E_FAIL;
+
+    const auto timestamp_frequency =
+        device_->GetMTLDevice().queryTimestampFrequency();
+    if (!timestamp_frequency)
+      return E_FAIL;
+
+    constexpr UINT64 nanoseconds_per_second = 1000000000ull;
+    const auto scaled_gpu_timestamp =
+        static_cast<unsigned __int128>(metal_gpu_timestamp) *
+        timestamp_frequency;
+    *gpu_timestamp = static_cast<UINT64>(
+        scaled_gpu_timestamp / nanoseconds_per_second);
+
+#ifdef _WIN32
+    LARGE_INTEGER cpu_after = {};
+    if (!QueryPerformanceCounter(&cpu_after))
+      return E_FAIL;
+    const auto before = static_cast<UINT64>(cpu_before.QuadPart);
+    const auto after = static_cast<UINT64>(cpu_after.QuadPart);
+    *cpu_timestamp = before + (after - before) / 2;
 #else
-    // Native retrace has no Win32 QPC domain. Keep both values in the same
-    // monotonic nanosecond domain used by the native queue implementation.
-    *cpu_timestamp = monotonic;
+    // Native retrace has no Win32 QPC domain. Use Metal's synchronously
+    // sampled CPU timestamp while keeping the GPU value in query tick units.
+    *cpu_timestamp = metal_cpu_timestamp;
 #endif
     return S_OK;
   }

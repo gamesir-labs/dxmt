@@ -189,4 +189,41 @@ TEST_F(TimestampSpec, ClockCalibrationUsesPerformanceCounterDomain) {
   EXPECT_LE(cpu_timestamp, static_cast<UINT64>(after.QuadPart));
 }
 
+TEST_F(TimestampSpec, ClockCalibrationMatchesTimestampQueryDomain) {
+  UINT64 gpu_before = 0;
+  UINT64 cpu_before = 0;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.queue()->GetClockCalibration(&gpu_before, &cpu_before)));
+
+  auto query_heap = CreateTimestampHeap(1);
+  auto result = context_.CreateBuffer(
+      sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(query_heap);
+  ASSERT_TRUE(result);
+
+  context_.list()->EndQuery(query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  context_.list()->ResolveQueryData(query_heap.get(),
+                                    D3D12_QUERY_TYPE_TIMESTAMP, 0, 1,
+                                    result.get(), 0);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+
+  UINT64 gpu_after = 0;
+  UINT64 cpu_after = 0;
+  ASSERT_TRUE(SUCCEEDED(
+      context_.queue()->GetClockCalibration(&gpu_after, &cpu_after)));
+
+  UINT64 *mapping = nullptr;
+  const D3D12_RANGE read_range = {0, sizeof(UINT64)};
+  ASSERT_TRUE(SUCCEEDED(
+      result->Map(0, &read_range, reinterpret_cast<void **>(&mapping))));
+  EXPECT_GE(mapping[0], gpu_before);
+  EXPECT_LE(mapping[0], gpu_after);
+  const D3D12_RANGE no_write = {0, 0};
+  result->Unmap(0, &no_write);
+
+  EXPECT_LE(gpu_before, gpu_after);
+  EXPECT_LE(cpu_before, cpu_after);
+}
+
 } // namespace

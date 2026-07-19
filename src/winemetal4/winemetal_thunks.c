@@ -1730,3 +1730,29 @@ MTLResidencySet_requestResidency(obj_handle_t set) {
   params.handle = set;
   UNIX_CALL(166, &params);
 }
+
+WINEMETAL_API uint64_t
+MTLDevice_queryTimestampFrequency(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(178, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_sampleTimestamps(
+    obj_handle_t device, uint64_t *cpu_timestamp, uint64_t *gpu_timestamp
+) {
+  struct unixcall_mtldevice_sampletimestamps params;
+  params.device = device;
+  params.cpu_timestamp = 0;
+  params.gpu_timestamp = 0;
+  params.ret_success = 0;
+  UNIX_CALL(179, &params);
+  if (cpu_timestamp)
+    *cpu_timestamp = params.cpu_timestamp;
+  if (gpu_timestamp)
+    *gpu_timestamp = params.gpu_timestamp;
+  return params.ret_success != 0;
+}

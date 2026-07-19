@@ -501,6 +501,13 @@ struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers {
   obj_handle_t ret;
 };
 
+struct unixcall_mtldevice_sampletimestamps {
+  obj_handle_t device;
+  uint64_t cpu_timestamp;
+  uint64_t gpu_timestamp;
+  uint32_t ret_success;
+};
+
 struct unixcall_mtl4counterheap_newtimestampheap {
   obj_handle_t device;
   uint64_t count;

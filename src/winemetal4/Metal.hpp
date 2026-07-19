@@ -920,6 +920,16 @@ public:
     return MTLDevice_registryID(handle);
   }
 
+  uint64_t
+  queryTimestampFrequency() const {
+    return MTLDevice_queryTimestampFrequency(handle);
+  }
+
+  bool
+  sampleTimestamps(uint64_t *cpu_timestamp, uint64_t *gpu_timestamp) const {
+    return MTLDevice_sampleTimestamps(handle, cpu_timestamp, gpu_timestamp);
+  }
+
   Reference<CommandQueue>
   newCommandQueue(uint64_t maxCommandBufferCount) {
     return Reference<CommandQueue>(MTLDevice_newCommandQueue(handle, maxCommandBufferCount));

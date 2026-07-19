@@ -2271,6 +2271,12 @@ enum WMTCommandBufferProperty : uint32_t {
 
 WINEMETAL_API uint64_t MTLCommandBuffer_property(obj_handle_t cmdbuf, enum WMTCommandBufferProperty prop);
 
+WINEMETAL_API uint64_t MTLDevice_queryTimestampFrequency(obj_handle_t device);
+
+WINEMETAL_API bool MTLDevice_sampleTimestamps(
+    obj_handle_t device, uint64_t *cpu_timestamp, uint64_t *gpu_timestamp
+);
+
 struct WMTTileRenderPipelineInfo {
   enum WMTPixelFormat color_formats[8];
   obj_handle_t tile_function;
