@@ -60,6 +60,7 @@ d3d12_unit_suites = {
   'command': {
     'sources': files(
       'command/allocator_lifecycle_spec.cpp',
+      'command/bundle_execution_matrix_spec.cpp',
       'command/bundle_legality_spec.cpp',
       'command/list_lifecycle_spec.cpp',
       'command/list_state_spec.cpp',
@@ -78,6 +79,7 @@ d3d12_unit_suites = {
       'descriptor/boundary_execution_spec.cpp',
       'descriptor/binding_hotspot_spec.cpp',
       'descriptor/buffer_view_spec.cpp',
+      'descriptor/copy_descriptor_matrix_spec.cpp',
       'descriptor/descriptor_spec.cpp',
       'descriptor/heap_contract_spec.cpp',
       'descriptor/heap_size_matrix_spec.cpp',
@@ -154,6 +156,7 @@ d3d12_unit_suites = {
       'root_signature/root_constant_count_matrix_spec.cpp',
       'root_signature/static_sampler_matrix_spec.cpp',
       'root_signature/root_descriptor_spec.cpp',
+      'root_signature/root_descriptor_offset_matrix_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
       'root_signature/version11_mixed_binding_spec.cpp',
@@ -202,6 +205,7 @@ d3d12_unit_suites = {
       'transfer/copy_footprint_spec.cpp',
       'transfer/copy_edge_spec.cpp',
       'transfer/copy_resource_spec.cpp',
+      'transfer/discard_matrix_spec.cpp',
       'transfer/resolve_validation_spec.cpp',
       'transfer/copy_texture_spec.cpp',
       'transfer/write_buffer_immediate_spec.cpp',
@@ -211,7 +215,9 @@ d3d12_unit_suites = {
     'sources': files(
       'resource/buffer_size_matrix_spec.cpp',
       'resource/depth_format_matrix_spec.cpp',
+      'resource/gpu_va_matrix_spec.cpp',
       'resource/heap_type_matrix_spec.cpp',
+      'resource/map_matrix_spec.cpp',
       'resource/texture2d_size_matrix_spec.cpp',
       'resource/planar_format_spec.cpp',
       'resource/existing_heap_spec.cpp',
