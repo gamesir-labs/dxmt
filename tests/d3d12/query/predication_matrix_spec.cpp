@@ -32,13 +32,14 @@ std::vector<PredicationCase> BuildPredicationCases() {
   const UINT64 values[] = {0ull, 1ull, 2ull, 0xffffffffull, 42ull, 100ull,
                            0x80000000ull};
   for (const UINT64 value : values) {
-    cases.push_back({value, D3D12_PREDICATION_OP_EQUAL_ZERO, value == 0, 0});
+    // A true predication comparison suppresses the following commands.
+    cases.push_back({value, D3D12_PREDICATION_OP_EQUAL_ZERO, value != 0, 0});
     cases.push_back(
-        {value, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, value != 0, 0});
+        {value, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, value == 0, 0});
     // Offset into a two-slot predicate buffer.
     cases.push_back(
-        {value, D3D12_PREDICATION_OP_EQUAL_ZERO, value == 0, sizeof(UINT64)});
-    cases.push_back({value, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, value != 0,
+        {value, D3D12_PREDICATION_OP_EQUAL_ZERO, value != 0, sizeof(UINT64)});
+    cases.push_back({value, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, value == 0,
                      sizeof(UINT64)});
   }
   return cases;

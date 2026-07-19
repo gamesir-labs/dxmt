@@ -173,42 +173,42 @@ protected:
   D3D12TestContext context_;
 };
 
-TEST_F(PredicationSpec, EqualZeroExecutes) {
-  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_EQUAL_ZERO, true);
-}
-
 TEST_F(PredicationSpec, EqualZeroSkips) {
-  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_EQUAL_ZERO, false);
+  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_EQUAL_ZERO, false);
 }
 
-TEST_F(PredicationSpec, NotEqualZeroExecutes) {
-  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, true);
+TEST_F(PredicationSpec, EqualZeroExecutes) {
+  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_EQUAL_ZERO, true);
 }
 
 TEST_F(PredicationSpec, NotEqualZeroSkips) {
-  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, false);
+  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, false);
+}
+
+TEST_F(PredicationSpec, NotEqualZeroExecutes) {
+  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, true);
 }
 
 TEST_F(PredicationSpec, ReadsPredicateAtNonzeroOffset) {
-  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_EQUAL_ZERO, true,
+  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_EQUAL_ZERO, false,
                            sizeof(UINT64));
 }
 
 TEST_F(PredicationSpec, PredicateProducedByCopyControlsDispatch) {
   if (!SupportsCpuVisibleCustomHeap())
     GTEST_SKIP() << "GPU-written CPU-visible predicates require UMA";
-  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, true,
+  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_EQUAL_ZERO, true,
                            sizeof(UINT64), true);
 }
 
 TEST_F(PredicationSpec,
        DefaultPredicateProducedByCopyControlsDispatchAfterGpuCompletion) {
-  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, true,
+  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_EQUAL_ZERO, true,
                            sizeof(UINT64), true, true);
 }
 
 TEST_F(PredicationSpec, DisablePredicationRestoresUnconditionalDispatch) {
-  ExpectPredicatedDispatch(1, D3D12_PREDICATION_OP_EQUAL_ZERO, false, 0, false,
+  ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_EQUAL_ZERO, false, 0, false,
                            false, true);
 }
 
@@ -283,7 +283,7 @@ TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {
   context_.list()->SetComputeRootUnorderedAccessView(
       0, output->GetGPUVirtualAddress());
   context_.list()->SetPredication(predicate.get(), 0,
-                                  D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+                                  D3D12_PREDICATION_OP_EQUAL_ZERO);
   context_.list()->Dispatch(1, 1, 1);
   context_.list()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   D3D12TestContext::Transition(context_.list(), output.get(),
