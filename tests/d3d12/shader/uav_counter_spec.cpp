@@ -2,6 +2,7 @@
 #include <dxmt_test_shader.hpp>
 #include "d3d12_test_context.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -459,10 +460,14 @@ void D3D12UavCounterSpec::ExpectConsumeCopiesAllValuesAndReachesZero(
   ASSERT_EQ(MapReadbackBuffer(output_readback.get(), sizeof(kInitialOutput),
                               &output_bytes),
             S_OK);
+  std::array<UINT, kInitialData.size()> consumed = {};
   for (std::size_t i = 0; i < kInitialData.size(); ++i) {
-    EXPECT_EQ(ReadUint(output_bytes, i * sizeof(UINT)), kInitialData[i])
-        << "element=" << i;
+    consumed[i] = ReadUint(output_bytes, i * sizeof(UINT));
   }
+  std::ranges::sort(consumed);
+  auto expected = kInitialData;
+  std::ranges::sort(expected);
+  EXPECT_EQ(consumed, expected);
   std::vector<std::uint8_t> counter_bytes;
   ASSERT_EQ(MapReadbackBuffer(counter_readback.get(), sizeof(kInitialCounter),
                               &counter_bytes),

@@ -35,13 +35,12 @@ class PlanarFormatSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
 
-  D3D12_FEATURE_DATA_FORMAT_SUPPORT Support(DXGI_FORMAT format) {
+  bool SupportsTexture2D(DXGI_FORMAT format) {
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
     support.Format = format;
-    EXPECT_EQ(context_.device()->CheckFeatureSupport(
-                  D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
-              S_OK);
-    return support;
+    return SUCCEEDED(context_.device()->CheckFeatureSupport(
+               D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+           (support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
   }
 
   D3D12_RESOURCE_DESC Desc(DXGI_FORMAT format) {
@@ -88,7 +87,7 @@ TEST_F(PlanarFormatSpec, AdvertisedVideoFormatsExposeTwoPlaneFootprints) {
   UINT executed = 0;
   for (const auto &test : kPlanarCases) {
     SCOPED_TRACE(test.name);
-    if (!(Support(test.format).Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+    if (!SupportsTexture2D(test.format))
       continue;
 
     D3D12_FEATURE_DATA_FORMAT_INFO info = {};
@@ -130,7 +129,7 @@ TEST_F(PlanarFormatSpec, PlaneCopiesRoundTripWithIndependentSubresourceState) {
   UINT executed = 0;
   for (const auto &test : kPlanarCases) {
     SCOPED_TRACE(test.name);
-    if (!(Support(test.format).Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+    if (!SupportsTexture2D(test.format))
       continue;
     auto texture = CreateTexture(test.format);
     ASSERT_TRUE(texture);
@@ -175,7 +174,7 @@ TEST_F(PlanarFormatSpec, PlaneCopiesRoundTripWithIndependentSubresourceState) {
 }
 
 TEST_F(PlanarFormatSpec, Nv12PlaneSliceSrvsReadLumaAndChroma) {
-  if (!(Support(DXGI_FORMAT_NV12).Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+  if (!SupportsTexture2D(DXGI_FORMAT_NV12))
     GTEST_SKIP() << "NV12 textures are unsupported";
 
   auto texture = CreateTexture(DXGI_FORMAT_NV12);

@@ -17,7 +17,7 @@ protected:
   D3D12TestContext context_;
 };
 
-TEST_F(TransitionSequenceSpec, RedundantSameStatePreservesData) {
+TEST_F(TransitionSequenceSpec, CommonStateRoundTripPreservesData) {
   const std::array<std::uint32_t, 8> expected = {
       0x01234567, 0x89abcdef, 0x13579bdf, 0x2468ace0,
       0x55aa55aa, 0xaa55aa55, 0x10203040, 0x50607080,
@@ -37,6 +37,9 @@ TEST_F(TransitionSequenceSpec, RedundantSameStatePreservesData) {
                                D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12TestContext::Transition(context_.list(), resource.get(),
                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_COMMON);
+  D3D12TestContext::Transition(context_.list(), resource.get(),
+                               D3D12_RESOURCE_STATE_COMMON,
                                D3D12_RESOURCE_STATE_COPY_SOURCE);
 
   std::vector<std::uint8_t> actual;

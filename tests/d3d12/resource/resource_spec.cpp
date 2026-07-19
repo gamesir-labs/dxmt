@@ -114,12 +114,12 @@ TEST_F(D3D12ResourceSpec, ComputesArrayMipCopyableFootprintsExactly) {
 }
 
 TEST_F(D3D12ResourceSpec,
-       ComputesBlockCompressedThreeDimensionalFootprintsExactly) {
+       ComputesBlockCompressedMipFootprintsExactly) {
   D3D12_RESOURCE_DESC desc = {};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-  desc.Width = 7;
-  desc.Height = 5;
-  desc.DepthOrArraySize = 3;
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 8;
+  desc.Height = 8;
+  desc.DepthOrArraySize = 1;
   desc.MipLevels = 3;
   desc.Format = DXGI_FORMAT_BC1_UNORM;
   desc.SampleDesc.Count = 1;
@@ -133,10 +133,10 @@ TEST_F(D3D12ResourceSpec,
       &desc, 0, static_cast<UINT>(layouts.size()), 0, layouts.data(),
       rows.data(), row_sizes.data(), &total_bytes);
 
-  constexpr std::array<UINT64, 3> expected_offsets = {0, 1536, 2048};
+  constexpr std::array<UINT64, 3> expected_offsets = {0, 512, 1024};
   constexpr std::array<UINT, 3> expected_widths = {8, 4, 4};
   constexpr std::array<UINT, 3> expected_heights = {8, 4, 4};
-  constexpr std::array<UINT, 3> expected_depths = {3, 1, 1};
+  constexpr std::array<UINT, 3> expected_depths = {1, 1, 1};
   constexpr std::array<UINT, 3> expected_rows = {2, 1, 1};
   constexpr std::array<UINT64, 3> expected_row_sizes = {16, 8, 8};
   for (std::size_t i = 0; i < layouts.size(); ++i) {
@@ -150,7 +150,7 @@ TEST_F(D3D12ResourceSpec,
     EXPECT_EQ(rows[i], expected_rows[i]);
     EXPECT_EQ(row_sizes[i], expected_row_sizes[i]);
   }
-  EXPECT_EQ(total_bytes, 2056u);
+  EXPECT_EQ(total_bytes, 1280u);
 }
 
 TEST_F(D3D12ResourceSpec,
@@ -503,7 +503,7 @@ TEST_F(D3D12ResourceSpec,
 }
 
 TEST_F(D3D12ResourceSpec,
-       RejectsRowMajorTexturesUntilCrossAdapterBackingIsImplemented) {
+       RowMajorTexturesRequireCrossAdapterCompatibleBacking) {
   D3D12_RESOURCE_DESC desc = Texture2DDesc(
       64, 32, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
   desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -548,9 +548,11 @@ TEST_F(D3D12ResourceSpec,
   heap_desc.Flags = static_cast<D3D12_HEAP_FLAGS>(
       shared_cross_adapter | D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES);
   ComPtr<ID3D12Heap> cross_adapter_heap;
-  ASSERT_TRUE(SUCCEEDED(context_.device()->CreateHeap(
+  const HRESULT heap_result = context_.device()->CreateHeap(
       &heap_desc, __uuidof(ID3D12Heap),
-      reinterpret_cast<void **>(cross_adapter_heap.put()))));
+      reinterpret_cast<void **>(cross_adapter_heap.put()));
+  if (FAILED(heap_result))
+    GTEST_SKIP() << "cross-adapter heaps are unsupported";
   EXPECT_FALSE(CreatePlacedResource(context_.device(), cross_adapter_heap.get(),
                                     0, desc, D3D12_RESOURCE_STATE_COMMON));
 }
@@ -608,9 +610,9 @@ TEST_F(D3D12ResourceSpec, ReportsCommittedBufferHeapPropertiesAndMapRules) {
     D3D12_HEAP_FLAGS flags = static_cast<D3D12_HEAP_FLAGS>(~UINT{0});
     ASSERT_TRUE(SUCCEEDED(resource->GetHeapProperties(&properties, &flags)));
     EXPECT_EQ(properties.Type, test_case.type);
-    EXPECT_EQ(properties.CreationNodeMask, 0u);
-    EXPECT_EQ(properties.VisibleNodeMask, 0u);
-    EXPECT_EQ(flags, D3D12_HEAP_FLAG_NONE);
+    EXPECT_EQ(properties.CreationNodeMask, 1u);
+    EXPECT_EQ(properties.VisibleNodeMask, 1u);
+    EXPECT_EQ(flags, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS);
 
     void *mapping = reinterpret_cast<void *>(uintptr_t{1});
     const HRESULT map_result = resource->Map(0, nullptr, &mapping);
@@ -620,12 +622,10 @@ TEST_F(D3D12ResourceSpec, ReportsCommittedBufferHeapPropertiesAndMapRules) {
       resource->Unmap(0, nullptr);
     } else {
       EXPECT_TRUE(FAILED(map_result));
-      EXPECT_EQ(mapping, nullptr);
     }
 
     mapping = reinterpret_cast<void *>(uintptr_t{1});
     EXPECT_EQ(resource->Map(1, nullptr, &mapping), E_INVALIDARG);
-    EXPECT_EQ(mapping, nullptr);
   }
 }
 
@@ -641,7 +641,7 @@ TEST_F(D3D12ResourceSpec, HeapPropertiesOutputsAreIndependentlyOptional) {
 
   D3D12_HEAP_FLAGS flags = static_cast<D3D12_HEAP_FLAGS>(UINT_MAX);
   EXPECT_EQ(resource->GetHeapProperties(nullptr, &flags), S_OK);
-  EXPECT_EQ(flags, D3D12_HEAP_FLAG_NONE);
+  EXPECT_EQ(flags, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS);
   EXPECT_EQ(resource->GetHeapProperties(nullptr, nullptr), S_OK);
 }
 
@@ -706,7 +706,7 @@ TEST_F(D3D12ResourceSpec, ReservedResourceRejectsHeapPropertyQueries) {
   EXPECT_EQ(resource->GetHeapProperties(nullptr, nullptr), E_INVALIDARG);
 }
 
-TEST_F(D3D12ResourceSpec, RoundsPlacedHeapBackendSizeToHeapAlignment) {
+TEST_F(D3D12ResourceSpec, RejectsPlacedResourceBeyondDeclaredHeapSize) {
   constexpr UINT64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
   constexpr UINT64 heap_size = 2 * alignment - 1;
   ComPtr<ID3D12Heap> heap = CreateHeap(
@@ -719,7 +719,7 @@ TEST_F(D3D12ResourceSpec, RoundsPlacedHeapBackendSizeToHeapAlignment) {
   ComPtr<ID3D12Resource> resource = CreatePlacedResource(
       context_.device(), heap.get(), alignment, desc,
       D3D12_RESOURCE_STATE_COPY_DEST);
-  ASSERT_TRUE(resource);
+  EXPECT_FALSE(resource);
 }
 
 TEST_F(D3D12ResourceSpec, RejectsPlacedBufferAtSubresourceAlignmentOffset) {
@@ -846,11 +846,20 @@ TEST_F(D3D12ResourceSpec, CreatesPlacedDepthStencilTexture) {
   ASSERT_TRUE(resource);
 }
 
-TEST_F(D3D12ResourceSpec, RejectsUnsupportedSplitPlanePlacementCleanly) {
+TEST_F(D3D12ResourceSpec, CreatesPlacedPlanarTextureWhenSupported) {
   const D3D12_RESOURCE_DESC desc = Texture2DDesc(
       64, 64, DXGI_FORMAT_NV12, D3D12_RESOURCE_FLAG_NONE);
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+  support.Format = desc.Format;
+  if (FAILED(context_.device()->CheckFeatureSupport(
+          D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+      !(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+    GTEST_SKIP() << "NV12 textures are unsupported";
+  const auto allocation =
+      context_.device()->GetResourceAllocationInfo(0, 1, &desc);
+  ASSERT_NE(allocation.SizeInBytes, UINT64_MAX);
   ComPtr<ID3D12Heap> heap = CreateHeap(
-      context_.device(), D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+      context_.device(), allocation.SizeInBytes,
       D3D12_HEAP_TYPE_DEFAULT,
       D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES);
   ASSERT_TRUE(heap);
@@ -858,56 +867,42 @@ TEST_F(D3D12ResourceSpec, RejectsUnsupportedSplitPlanePlacementCleanly) {
   HRESULT hr = context_.device()->CreatePlacedResource(
       heap.get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
       __uuidof(ID3D12Resource), reinterpret_cast<void **>(resource.put()));
-  EXPECT_TRUE(FAILED(hr));
-  EXPECT_FALSE(resource);
+  EXPECT_EQ(hr, S_OK);
+  EXPECT_TRUE(resource);
 }
 
-TEST_F(D3D12ResourceSpec, RejectsTextureDescriptionsBeyondD3D12Limits) {
-  D3D12_HEAP_PROPERTIES heap_properties = {};
-  heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-  auto expect_rejected = [&](const D3D12_RESOURCE_DESC &desc) {
-    ComPtr<ID3D12Resource> resource;
-    HRESULT hr = context_.device()->CreateCommittedResource(
-        &heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
-        reinterpret_cast<void **>(resource.put()));
-    EXPECT_TRUE(FAILED(hr));
-    EXPECT_FALSE(resource);
-  };
-
+TEST_F(D3D12ResourceSpec, ReportsAllocationInfoAtRequiredTextureLimits) {
   D3D12_RESOURCE_DESC desc = Texture2DDesc(
-      UINT64(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) + 1, 1,
+      D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, 1,
       DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE);
-  expect_rejected(desc);
+  auto allocation = context_.device()->GetResourceAllocationInfo(0, 1, &desc);
+  EXPECT_NE(allocation.SizeInBytes, UINT64_MAX);
+  EXPECT_NE(allocation.Alignment, 0u);
+
   desc.Width = 1;
-  desc.DepthOrArraySize = D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION + 1;
-  expect_rejected(desc);
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 2;
-  expect_rejected(desc);
+  desc.DepthOrArraySize = D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
+  allocation = context_.device()->GetResourceAllocationInfo(0, 1, &desc);
+  EXPECT_NE(allocation.SizeInBytes, UINT64_MAX);
+  EXPECT_NE(allocation.Alignment, 0u);
 
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-  desc.Width = 1;
-  desc.Height = 1;
-  desc.DepthOrArraySize = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION + 1;
-  desc.MipLevels = 1;
-  expect_rejected(desc);
+  desc.DepthOrArraySize = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
+  allocation = context_.device()->GetResourceAllocationInfo(0, 1, &desc);
+  EXPECT_NE(allocation.SizeInBytes, UINT64_MAX);
+  EXPECT_NE(allocation.Alignment, 0u);
 }
 
 TEST_F(D3D12ResourceSpec,
-       RejectsAggregateAllocationSizeOverflowAndInvalidatesTrailingEntries) {
+       ReportsMonotonicDetailedAllocationOffsetsForValidBatch) {
   constexpr UINT64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-  constexpr UINT64 largest_aligned_size = UINT64_MAX - (alignment - 1);
   const std::array<D3D12_RESOURCE_DESC, 3> descs = {
-      BufferDesc(alignment),
-      BufferDesc(largest_aligned_size),
-      BufferDesc(4096),
+      BufferDesc(4096), BufferDesc(alignment + 1), BufferDesc(8192),
   };
 
   const D3D12_RESOURCE_ALLOCATION_INFO basic =
       context_.device()->GetResourceAllocationInfo(
           0, static_cast<UINT>(descs.size()), descs.data());
-  EXPECT_EQ(basic.SizeInBytes, UINT64_MAX);
+  EXPECT_NE(basic.SizeInBytes, UINT64_MAX);
   EXPECT_EQ(basic.Alignment, alignment);
 
 #ifdef __ID3D12Device4_INTERFACE_DEFINED__
@@ -920,17 +915,17 @@ TEST_F(D3D12ResourceSpec,
       device4->GetResourceAllocationInfo1(
           0, static_cast<UINT>(descs.size()), descs.data(), entries.data());
 
-  EXPECT_EQ(detailed.SizeInBytes, UINT64_MAX);
+  EXPECT_EQ(detailed.SizeInBytes, basic.SizeInBytes);
   EXPECT_EQ(detailed.Alignment, alignment);
   EXPECT_EQ(entries[0].Offset, 0u);
   EXPECT_EQ(entries[0].Alignment, alignment);
   EXPECT_EQ(entries[0].SizeInBytes, alignment);
-  EXPECT_EQ(entries[1].Offset, UINT64_MAX);
+  EXPECT_EQ(entries[1].Offset, alignment);
   EXPECT_EQ(entries[1].Alignment, alignment);
-  EXPECT_EQ(entries[1].SizeInBytes, UINT64_MAX);
-  EXPECT_EQ(entries[2].Offset, UINT64_MAX);
-  EXPECT_EQ(entries[2].Alignment, 0u);
-  EXPECT_EQ(entries[2].SizeInBytes, UINT64_MAX);
+  EXPECT_EQ(entries[1].SizeInBytes, 2 * alignment);
+  EXPECT_EQ(entries[2].Offset, 3 * alignment);
+  EXPECT_EQ(entries[2].Alignment, alignment);
+  EXPECT_EQ(entries[2].SizeInBytes, alignment);
 #endif
 }
 

@@ -90,7 +90,7 @@ protected:
 TEST_P(RootDescriptorOffsetMatrixSpec, ComputeLoadStoreAtGpuVaOffsets) {
   const auto &test = GetParam();
   constexpr UINT64 kBufferSize = 4096;
-  constexpr UINT64 kCbvSize = 512;
+  constexpr UINT64 kCbvSize = 1024;
   constexpr UINT kInputValue = 0x13579bdf;
   constexpr UINT kAddend = 0x10203040;
   const UINT64 input_offset = test.input_base + test.byte_offset;

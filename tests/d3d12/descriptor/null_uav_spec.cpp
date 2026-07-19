@@ -28,12 +28,15 @@ TEST_F(D3D12NullUavSpec, NullTypedUavReadReturnsZeroAndWriteIsDiscarded) {
   const auto shader = CompileShader(R"(
     RWBuffer<uint> target : register(u0);
     RWBuffer<uint> probe : register(u1);
+    cbuffer Parameters : register(b0) { uint operation; };
     [numthreads(1, 1, 1)]
     void main() {
-      uint loaded = target[0];
-      probe[0] = loaded;
-      target[0] = 0xdeadbeefu;
-      probe[1] = target[0];
+      if (operation == 0)
+        probe[0] = target[0];
+      else if (operation == 1)
+        target[0] = 0xdeadbeefu;
+      else
+        probe[1] = target[0];
     }
   )", "cs_5_0");
   ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
@@ -41,13 +44,16 @@ TEST_F(D3D12NullUavSpec, NullTypedUavReadReturnsZeroAndWriteIsDiscarded) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   range.NumDescriptors = 2;
-  D3D12_ROOT_PARAMETER parameter = {};
-  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameter.DescriptorTable.NumDescriptorRanges = 1;
-  parameter.DescriptorTable.pDescriptorRanges = &range;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.Num32BitValues = 1;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[1].DescriptorTable.pDescriptorRanges = &range;
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.NumParameters = 1;
-  root_desc.pParameters = &parameter;
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
   auto root_signature = context_.CreateRootSignature(root_desc);
   const D3D12_SHADER_BYTECODE bytecode = {
       shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
@@ -102,7 +108,14 @@ TEST_F(D3D12NullUavSpec, NullTypedUavReadReturnsZeroAndWriteIsDiscarded) {
   context_.list()->SetComputeRootSignature(root_signature.get());
   context_.list()->SetPipelineState(pipeline.get());
   context_.list()->SetComputeRootDescriptorTable(
-      0, heap->GetGPUDescriptorHandleForHeapStart());
+      1, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetComputeRoot32BitConstant(0, 0, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(context_.list(), nullptr);
+  context_.list()->SetComputeRoot32BitConstant(0, 1, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(context_.list(), nullptr);
+  context_.list()->SetComputeRoot32BitConstant(0, 2, 0);
   context_.list()->Dispatch(1, 1, 1);
   D3D12TestContext::Transition(
       context_.list(), probe.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -124,12 +137,15 @@ TEST_F(D3D12NullUavSpec, NullTexture2dUavWriteIsDiscardedWhereDefined) {
   const auto shader = CompileShader(R"(
     RWTexture2D<uint> target : register(u0);
     RWBuffer<uint> probe : register(u1);
+    cbuffer Parameters : register(b0) { uint operation; };
     [numthreads(1, 1, 1)]
     void main() {
-      uint loaded = target[uint2(0, 0)];
-      probe[0] = loaded;
-      target[uint2(0, 0)] = 0xdeadbeefu;
-      probe[1] = target[uint2(0, 0)];
+      if (operation == 0)
+        probe[0] = target[uint2(0, 0)];
+      else if (operation == 1)
+        target[uint2(0, 0)] = 0xdeadbeefu;
+      else
+        probe[1] = target[uint2(0, 0)];
     }
   )", "cs_5_0");
   ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
@@ -137,13 +153,16 @@ TEST_F(D3D12NullUavSpec, NullTexture2dUavWriteIsDiscardedWhereDefined) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   range.NumDescriptors = 2;
-  D3D12_ROOT_PARAMETER parameter = {};
-  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameter.DescriptorTable.NumDescriptorRanges = 1;
-  parameter.DescriptorTable.pDescriptorRanges = &range;
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.Num32BitValues = 1;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+  parameters[1].DescriptorTable.pDescriptorRanges = &range;
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.NumParameters = 1;
-  root_desc.pParameters = &parameter;
+  root_desc.NumParameters = 2;
+  root_desc.pParameters = parameters;
   auto root_signature = context_.CreateRootSignature(root_desc);
   const D3D12_SHADER_BYTECODE bytecode = {
       shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
@@ -189,7 +208,14 @@ TEST_F(D3D12NullUavSpec, NullTexture2dUavWriteIsDiscardedWhereDefined) {
   context_.list()->SetComputeRootSignature(root_signature.get());
   context_.list()->SetPipelineState(pipeline.get());
   context_.list()->SetComputeRootDescriptorTable(
-      0, heap->GetGPUDescriptorHandleForHeapStart());
+      1, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetComputeRoot32BitConstant(0, 0, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(context_.list(), nullptr);
+  context_.list()->SetComputeRoot32BitConstant(0, 1, 0);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::UavBarrier(context_.list(), nullptr);
+  context_.list()->SetComputeRoot32BitConstant(0, 2, 0);
   context_.list()->Dispatch(1, 1, 1);
   D3D12TestContext::Transition(
       context_.list(), probe.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

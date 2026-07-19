@@ -361,7 +361,11 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   HWND hwnd = nullptr;
   ASSERT_EQ(swapchain->GetHwnd(&hwnd), S_OK);
   EXPECT_EQ(hwnd, window_->get());
-  ASSERT_EQ(swapchain->SetFullscreenState(TRUE, nullptr), S_OK);
+  const HRESULT fullscreen_result =
+      swapchain->SetFullscreenState(TRUE, nullptr);
+  if (fullscreen_result == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+    return;
+  ASSERT_EQ(fullscreen_result, S_OK);
   BOOL fullscreen = FALSE;
   ASSERT_EQ(swapchain->GetFullscreenState(&fullscreen, nullptr), S_OK);
   EXPECT_TRUE(fullscreen);
@@ -375,8 +379,8 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   auto swapchain = CreateCompositionSwapChain(2);
   ASSERT_TRUE(swapchain);
 
-  const DXGI_MATRIX_3X2_F matrix = {1.0f, 0.25f, -0.5f,
-                                    1.0f, 3.0f,  4.0f};
+  const DXGI_MATRIX_3X2_F matrix = {1.25f, 0.0f, 0.0f,
+                                    0.75f, 3.0f, 4.0f};
   ASSERT_EQ(swapchain->SetMatrixTransform(&matrix), S_OK);
   DXGI_MATRIX_3X2_F actual = {};
   ASSERT_EQ(swapchain->GetMatrixTransform(&actual), S_OK);

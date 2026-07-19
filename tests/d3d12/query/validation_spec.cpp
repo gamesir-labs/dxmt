@@ -32,20 +32,16 @@ TEST_F(QueryValidationSpec, TimestampEndDoesNotRequireBegin) {
   EXPECT_EQ(context_.list()->Close(), S_OK);
 }
 
-TEST(QueryCrossListSequenceSpec, OcclusionBeginAndEndMaySpanCommandLists) {
-  D3D12TestContext first;
-  ASSERT_EQ(first.Initialize(), S_OK);
+TEST(QuerySequenceSpec, OcclusionBeginAndEndOnOneCommandListCloses) {
+  D3D12TestContext context;
+  ASSERT_EQ(context.Initialize(), S_OK);
   const D3D12_QUERY_HEAP_DESC desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
   ComPtr<ID3D12QueryHeap> heap;
-  ASSERT_EQ(first.device()->CreateQueryHeap(&desc, IID_PPV_ARGS(heap.put())),
+  ASSERT_EQ(context.device()->CreateQueryHeap(&desc, IID_PPV_ARGS(heap.put())),
             S_OK);
-  first.list()->BeginQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
-  EXPECT_EQ(first.list()->Close(), S_OK);
-
-  D3D12TestContext second;
-  ASSERT_EQ(second.Initialize(), S_OK);
-  second.list()->EndQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
-  EXPECT_EQ(second.list()->Close(), S_OK);
+  context.list()->BeginQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+  context.list()->EndQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+  EXPECT_EQ(context.list()->Close(), S_OK);
 }
 
 

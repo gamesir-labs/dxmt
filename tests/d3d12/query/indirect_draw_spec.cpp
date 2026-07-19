@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -9,9 +10,9 @@
 namespace {
 
 using dxmt::test::ColorsMatch;
+using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
-using dxmt::test::DualSourcePixelShader;
 using dxmt::test::TextureReadback;
 
 class ExecuteIndirectDrawSpec : public ::testing::Test {
@@ -38,9 +39,15 @@ protected:
     root_desc.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     auto root_signature = context_.CreateRootSignature(root_desc);
+    const auto pixel = CompileShader(
+        "float4 main() : SV_Target { return float4(1, 0, 0, 1); }",
+        "ps_5_0");
+    ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+    const D3D12_SHADER_BYTECODE pixel_bytecode = {
+        pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()};
     auto pipeline = context_.CreateGraphicsPipeline(root_signature.get(),
                                                     DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                    DualSourcePixelShader());
+                                                    pixel_bytecode);
     ASSERT_TRUE(root_signature);
     ASSERT_TRUE(pipeline);
 

@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
@@ -10,8 +11,8 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CompileShader;
 using dxmt::test::D3D12TestContext;
-using dxmt::test::DualSourcePixelShader;
 
 class OcclusionSpec : public ::testing::Test {
 protected:
@@ -27,9 +28,15 @@ protected:
     root_desc.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     root_signature_ = context_.CreateRootSignature(root_desc);
+    const auto pixel = CompileShader(
+        "float4 main() : SV_Target { return float4(1, 1, 1, 1); }",
+        "ps_5_0");
+    ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+    const D3D12_SHADER_BYTECODE pixel_bytecode = {
+        pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()};
     pipeline_ = context_.CreateGraphicsPipeline(root_signature_.get(),
                                                 DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                DualSourcePixelShader());
+                                                pixel_bytecode);
     ASSERT_TRUE(target_);
     ASSERT_TRUE(rtv_heap_);
     ASSERT_TRUE(root_signature_);

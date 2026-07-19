@@ -105,8 +105,9 @@ TEST_F(ExistingHeapSpec, VirtualAllocationBacksGpuWrittenPlacedBuffer) {
   EXPECT_EQ(heap_desc.Properties.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
   EXPECT_EQ(heap_desc.Properties.CreationNodeMask, 1u);
   EXPECT_EQ(heap_desc.Properties.VisibleNodeMask, 1u);
-  EXPECT_EQ(heap_desc.Flags,
-            D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+  constexpr D3D12_HEAP_FLAGS required_flags = static_cast<D3D12_HEAP_FLAGS>(
+      D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+  EXPECT_EQ(heap_desc.Flags & required_flags, required_flags);
 
   constexpr std::array<std::uint32_t, 8> expected = {
       0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f001u,

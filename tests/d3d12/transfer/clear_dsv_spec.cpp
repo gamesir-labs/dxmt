@@ -62,6 +62,15 @@ protected:
     return value;
   }
 
+  float Depth24(const TextureReadback &readback, UINT x, UINT y) {
+    std::uint32_t value = 0;
+    std::memcpy(&value,
+                readback.data.data() + y * readback.row_pitch +
+                    x * sizeof(value),
+                sizeof(value));
+    return float(value & 0x00ffffffu) / float(0x00ffffffu);
+  }
+
   std::uint16_t Depth16(const TextureReadback &readback, UINT x, UINT y) {
     std::uint16_t value = 0;
     std::memcpy(&value,
@@ -367,7 +376,12 @@ TEST_F(ClearDsvSpec, ClearsD24S8) {
 
   TextureReadback depth;
   ASSERT_TRUE(SUCCEEDED(ReadbackAndReset(texture.get(), &depth, 0)));
-  ExpectDepth32Solid(depth, 0.375f);
+  for (UINT y = 0; y < depth.height; ++y) {
+    for (UINT x = 0; x < depth.width; ++x) {
+      EXPECT_NEAR(Depth24(depth, x, y), 0.375f, 1.0f / 0x00ffffffu)
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
   TextureReadback stencil;
   ASSERT_TRUE(SUCCEEDED(ReadbackAndReset(texture.get(), &stencil, 1)));
   ExpectStencilSolid(stencil, 0xe7);
