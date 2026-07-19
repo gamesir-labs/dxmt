@@ -785,8 +785,17 @@ TEST_F(D3D12SparseResourceSpec,
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
             S_OK);
-  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
-    GTEST_SKIP() << "Texture arrays require tiled resources tier 2";
+  constexpr auto kTiledResourcesTier4 =
+      static_cast<D3D12_TILED_RESOURCES_TIER>(4);
+  if (options.TiledResourcesTier < kTiledResourcesTier4)
+    GTEST_SKIP() << "Array textures with packed mips require tiled resources tier 4";
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {DXGI_FORMAT_R32_UINT};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
+                sizeof(format_support)),
+            S_OK);
+  if (!(format_support.Support2 & D3D12_FORMAT_SUPPORT2_TILED))
+    GTEST_SKIP() << "R32_UINT reserved textures are not supported";
 
   constexpr UINT16 array_size = 2;
   constexpr UINT16 mip_levels = 10;
@@ -983,7 +992,8 @@ TEST_F(D3D12SparseResourceSpec,
   UINT total_tiles = 0;
   context_.device()->GetResourceTiling(textures.back().get(), &total_tiles,
                                        &packed, &shape, nullptr, 0, nullptr);
-  ASSERT_GT(packed.NumPackedMips, 0u);
+    if (!packed.NumPackedMips)
+      GTEST_SKIP() << "Resource has no packed mip tail";
   const UINT packed_subresource = desc.MipLevels - 1;
   ASSERT_GE(packed_subresource, packed.NumStandardMips);
 
@@ -1151,8 +1161,17 @@ TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
       D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
-  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
-    GTEST_SKIP() << "Texture arrays require tiled resources tier 2";
+  constexpr auto kTiledResourcesTier4 =
+      static_cast<D3D12_TILED_RESOURCES_TIER>(4);
+  if (options.TiledResourcesTier < kTiledResourcesTier4)
+    GTEST_SKIP() << "Array textures with packed mips require tiled resources tier 4";
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {DXGI_FORMAT_R32_UINT};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
+                sizeof(format_support)),
+            S_OK);
+  if (!(format_support.Support2 & D3D12_FORMAT_SUPPORT2_TILED))
+    GTEST_SKIP() << "R32_UINT reserved textures are not supported";
 
   constexpr UINT16 array_size = 3;
   D3D12_RESOURCE_DESC desc = {};

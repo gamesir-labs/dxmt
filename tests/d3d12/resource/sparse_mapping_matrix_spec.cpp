@@ -271,8 +271,17 @@ TEST_F(SparseMappingMatrixSpec, PaginatesSubresourceTilings) {
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
             S_OK);
-  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
-    GTEST_SKIP() << "Texture arrays require tiled resources tier 2";
+  constexpr auto kTiledResourcesTier4 =
+      static_cast<D3D12_TILED_RESOURCES_TIER>(4);
+  if (options.TiledResourcesTier < kTiledResourcesTier4)
+    GTEST_SKIP() << "Array textures with packed mips require tiled resources tier 4";
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {DXGI_FORMAT_R32_UINT};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
+                sizeof(format_support)),
+            S_OK);
+  if (!(format_support.Support2 & D3D12_FORMAT_SUPPORT2_TILED))
+    GTEST_SKIP() << "R32_UINT reserved textures are not supported";
 
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

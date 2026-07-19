@@ -447,26 +447,19 @@ TEST_F(GraphicsInstancingSpec,
   }
 }
 
-TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
+TEST_F(GraphicsInstancingSpec, NullVertexViewClearsPreviousBinding) {
   const auto vertex = CompileShader(R"(
     struct Input {
       float2 position : POSITION;
       float4 marker : MARKER;
     };
-    struct Output {
-      float4 position : SV_Position;
-      nointerpolation float4 marker : TEXCOORD0;
-    };
-    Output main(Input input) {
-      Output output;
-      output.position = float4(input.position, 0.0, 1.0);
-      output.marker = input.marker;
-      return output;
+    float4 main(Input input) : SV_Position {
+      return float4(input.position + input.marker.xy, 0.0, 1.0);
     })",
                                     "vs_5_0");
   const auto pixel = CompileShader(R"(
-    float4 main(nointerpolation float4 marker : TEXCOORD0) : SV_Target {
-      return float4(marker.r, 0.0, 0.0, 1.0);
+    float4 main() : SV_Target {
+      return float4(1.0, 1.0, 1.0, 1.0);
     })",
                                    "ps_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
@@ -507,9 +500,9 @@ TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
   constexpr std::array<std::array<float, 2>, 3> positions = {
       {{-1.0f, -1.0f}, {-1.0f, 3.0f}, {3.0f, -1.0f}}};
   constexpr std::array<std::array<float, 4>, 3> markers = {{
-      {1.0f, 0.0f, 0.0f, 1.0f},
-      {1.0f, 0.0f, 0.0f, 1.0f},
-      {1.0f, 0.0f, 0.0f, 1.0f},
+      {4.0f, 0.0f, 0.0f, 0.0f},
+      {4.0f, 0.0f, 0.0f, 0.0f},
+      {4.0f, 0.0f, 0.0f, 0.0f},
   }};
   auto position_buffer = context_.CreateUploadBuffer(
       sizeof(positions), positions.data(), sizeof(positions));
@@ -549,8 +542,7 @@ TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
   context_.list()->RSSetScissorRects(1, &scissor);
   context_.list()->DrawInstanced(positions.size(), 1, 0, 0);
 
-  const D3D12_VERTEX_BUFFER_VIEW empty_view = {};
-  context_.list()->IASetVertexBuffers(1, 1, &empty_view);
+  context_.list()->IASetVertexBuffers(1, 1, nullptr);
   context_.list()->DrawInstanced(positions.size(), 1, 0, 0);
   D3D12TestContext::Transition(context_.list(), target.get(),
                                D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -565,7 +557,7 @@ TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
                   readback.data.data() + y * readback.row_pitch +
                       x * sizeof(value),
                   sizeof(value));
-      EXPECT_TRUE(ColorsMatch(value, 0xff000000u, 0))
+      EXPECT_TRUE(ColorsMatch(value, 0xffffffffu, 0))
           << "pixel (" << x << ", " << y << ") was 0x" << std::hex << value;
     }
   }

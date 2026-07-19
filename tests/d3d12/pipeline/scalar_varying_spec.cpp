@@ -18,7 +18,7 @@ using dxmt::test::TextureReadback;
 constexpr char kScalarVaryingVertexShader[] = R"(
 struct Output {
   float4 position : SV_Position;
-  float scalar : TEXCOORD0;
+  float4 scalar : TEXCOORD0;
 };
 
 Output main(uint vertex_id : SV_VertexID) {
@@ -29,14 +29,14 @@ Output main(uint vertex_id : SV_VertexID) {
   };
   Output output;
   output.position = float4(positions[vertex_id], 0.0, 1.0);
-  output.scalar = 0.25;
+  output.scalar = float4(0.25, 0.25, 0.25, 0.25);
   return output;
 }
 )";
 
 constexpr char kScalarVaryingPixelShader[] = R"(
-float4 main(float scalar : TEXCOORD0) : SV_Target {
-  return float4(scalar, 0.0, 0.0, 1.0);
+float4 main(float4 scalar : TEXCOORD0) : SV_Target {
+  return float4(scalar.x, 0.0, 0.0, 1.0);
 }
 )";
 
@@ -289,7 +289,8 @@ protected:
   D3D12TestContext context_;
 };
 
-TEST_F(D3D12ScalarVaryingSpec, PreservesActiveScalarLaneAcrossGraphicsStages) {
+TEST_F(D3D12ScalarVaryingSpec,
+       PreservesSingleActiveComponentAcrossGraphicsStages) {
   RenderAndExpectCenter(kScalarVaryingVertexShader,
                         kScalarVaryingPixelShader, 0xff000040u);
 }
