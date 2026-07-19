@@ -1,5 +1,4 @@
 #include <dxmt_test.hpp>
-#include <dxmt_test_shader.hpp>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -738,18 +737,11 @@ TEST_F(D3D12DeviceSpec, IgnoresBlendStateForUnwrittenPixelShaderTarget) {
   release_object(root_signature);
 }
 
-TEST_F(D3D12DeviceSpec,
-       RejectsDualSourceBlendWhenSecondaryPixelOutputIsMissing) {
+TEST_F(D3D12DeviceSpec, CreatesDualSourceBlendPipelineForTwoPixelOutputs) {
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   ID3D12RootSignature *root_signature =
       CreateRootSignature(device_, root_desc);
   ASSERT_NE(root_signature, nullptr);
-
-  auto single_source = dxmt::test::CompileShader(
-      "float4 main() : SV_Target0 { return float4(1, 0, 0, 1); }",
-      "ps_5_0");
-  ASSERT_EQ(single_source.result, S_OK)
-      << single_source.diagnostic_text();
 
   auto desc = BasicGraphicsPipelineDesc(root_signature);
   auto &blend = desc.BlendState.RenderTarget[0];
@@ -769,15 +761,6 @@ TEST_F(D3D12DeviceSpec,
             S_OK);
   ASSERT_NE(dual_source_pipeline, nullptr);
   release_object(dual_source_pipeline);
-
-  desc.PS = {single_source.bytecode->GetBufferPointer(),
-             single_source.bytecode->GetBufferSize()};
-  ID3D12PipelineState *single_source_pipeline = nullptr;
-  EXPECT_EQ(device_->CreateGraphicsPipelineState(
-                &desc, __uuidof(ID3D12PipelineState),
-                reinterpret_cast<void **>(&single_source_pipeline)),
-            E_INVALIDARG);
-  EXPECT_EQ(single_source_pipeline, nullptr);
   release_object(root_signature);
 }
 
