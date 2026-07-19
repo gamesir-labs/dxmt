@@ -91,7 +91,7 @@ protected:
     } else if (view_index == 1) {
       srv.Format = DXGI_FORMAT_R32_TYPELESS;
       srv.Buffer.FirstElement = 5;
-      srv.Buffer.NumElements = 2;
+      srv.Buffer.NumElements = 3;
       srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     } else {
       srv.Format = DXGI_FORMAT_UNKNOWN;
