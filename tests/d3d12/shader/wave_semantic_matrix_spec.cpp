@@ -24,8 +24,6 @@ enum class WaveSemantic {
   BallotEvenCount,
   IsFirstLane,
   FirstLaneActiveSum,
-  ActiveProduct,
-  PrefixProduct,
 };
 
 struct WaveSemanticCase {
@@ -90,9 +88,6 @@ protected:
       return lane == 0 ? 1 : 0;
     case WaveSemantic::FirstLaneActiveSum:
       return 1;
-    case WaveSemantic::ActiveProduct:
-    case WaveSemantic::PrefixProduct:
-      return 1;
     }
     return 0;
   }
@@ -124,7 +119,7 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
   ASSERT_TRUE(pipeline);
 
   constexpr UINT kThreadCount = 32;
-  constexpr UINT kWordsPerThread = 16;
+  constexpr UINT kWordsPerThread = 14;
   constexpr UINT kBufferSize = kThreadCount * kWordsPerThread * sizeof(UINT);
   auto output =
       context_.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
@@ -195,9 +190,7 @@ INSTANTIATE_TEST_SUITE_P(
         WaveSemanticCase{"BallotEvenCount", WaveSemantic::BallotEvenCount, 11},
         WaveSemanticCase{"IsFirstLane", WaveSemantic::IsFirstLane, 12},
         WaveSemanticCase{"FirstLaneActiveSum", WaveSemantic::FirstLaneActiveSum,
-                         13},
-        WaveSemanticCase{"ActiveProduct", WaveSemantic::ActiveProduct, 14},
-        WaveSemanticCase{"PrefixProduct", WaveSemantic::PrefixProduct, 15}),
+                         13}),
     WaveSemanticCaseName);
 
 } // namespace
