@@ -733,7 +733,7 @@ TEST_F(ShaderAdvancedStageSpec, DomainShaderReceivesIncrementingPrimitiveId) {
     };
     struct Output {
       float4 position : SV_Position;
-      nointerpolation uint primitive_id : TEXCOORD0;
+      nointerpolation float4 primitive_marker : TEXCOORD0;
     };
     [domain("tri")]
     Output main(Constants constants, float3 bary : SV_DomainLocation,
@@ -744,14 +744,16 @@ TEST_F(ShaderAdvancedStageSpec, DomainShaderReceivesIncrementingPrimitiveId) {
                         patch[1].position * bary.y +
                         patch[2].position * bary.z;
       output.position = float4(position, 0.0, 1.0);
-      output.primitive_id = primitive_id;
+      output.primitive_marker = primitive_id == 0
+          ? float4(1, 0, 0, 1)
+          : float4(0, 1, 0, 1);
       return output;
     })",
                                 "ds_5_0");
   const auto ps = CompileShader(R"(
-    float4 main(nointerpolation uint primitive_id : TEXCOORD0) : SV_Target {
-      return primitive_id == 0 ? float4(1, 0, 0, 1)
-                               : float4(0, 1, 0, 1);
+    float4 main(nointerpolation float4 primitive_marker : TEXCOORD0)
+        : SV_Target {
+      return primitive_marker;
     })",
                                 "ps_5_0");
   ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();

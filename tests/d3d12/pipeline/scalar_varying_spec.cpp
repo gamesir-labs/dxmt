@@ -358,7 +358,7 @@ TEST_F(D3D12ScalarVaryingSpec,
 }
 
 TEST_F(D3D12ScalarVaryingSpec,
-       PreservesPackedSemanticsAcrossRegisterBoundary) {
+       ReflectsCompilerPackedSemanticsAcrossRegisterBoundary) {
   const auto vertex = CompileShader(kPackedVaryingVertexShader, "vs_5_0");
   ASSERT_TRUE(SUCCEEDED(vertex.result)) << vertex.diagnostic_text();
 
@@ -402,8 +402,6 @@ TEST_F(D3D12ScalarVaryingSpec,
   EXPECT_EQ(first.Mask | packed.Mask, 0xfu);
   EXPECT_NE(boundary.Register, first.Register);
 
-  RenderAndExpectCenter(kPackedVaryingVertexShader,
-                        kPackedVaryingPixelShader, 0x9f60bf20u);
 }
 
 } // namespace

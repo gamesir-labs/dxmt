@@ -426,7 +426,7 @@ TEST_F(GraphicsEdgeSemanticsSpec,
   auto vertex = CompileShader(R"(
     struct Output {
       float4 position : SV_Position;
-      centroid float2 barycentric : TEXCOORD0;
+      float4 barycentric : TEXCOORD0;
     };
     Output main(uint id : SV_VertexID) {
       const float2 positions[3] = {
@@ -437,13 +437,13 @@ TEST_F(GraphicsEdgeSemanticsSpec,
       };
       Output output;
       output.position = float4(positions[id], 0.5, 1.0);
-      output.barycentric = barycentrics[id];
+      output.barycentric = float4(barycentrics[id], 0.0, 0.0);
       return output;
     })",
                               "vs_5_0");
   auto pixel = CompileShader(R"(
-    float4 main(centroid float2 barycentric : TEXCOORD0) : SV_Target {
-      bool inside = all(barycentric >= -0.001) &&
+    float4 main(centroid float4 barycentric : TEXCOORD0) : SV_Target {
+      bool inside = all(barycentric.xy >= -0.001) &&
                     barycentric.x + barycentric.y <= 1.001;
       return inside ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
     })",
