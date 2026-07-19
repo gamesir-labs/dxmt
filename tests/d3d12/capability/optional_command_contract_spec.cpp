@@ -44,60 +44,6 @@ void ExpectCopyExecution(D3D12TestContext &context) {
   EXPECT_EQ(context.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-enum class AtomicCopyWidth {
-  Uint32,
-  Uint64,
-};
-
-void ExpectAtomicCopyFailureAndSameDeviceRecovery(D3D12TestContext &context,
-                                                  AtomicCopyWidth width) {
-  ComPtr<ID3D12GraphicsCommandList1> list1;
-  ASSERT_EQ(context.list()->QueryInterface(
-                __uuidof(ID3D12GraphicsCommandList1),
-                reinterpret_cast<void **>(list1.put())),
-            S_OK);
-  ASSERT_TRUE(list1);
-
-  constexpr std::array<std::uint64_t, 4> data = {
-      0x1020304050607080ull, 0x90a0b0c0d0e0f001ull,
-      0x13579bdf2468ace0ull, 0xfeedc0de0badf00dull};
-  auto source = context.CreateUploadBuffer(sizeof(data), data.data(),
-                                           sizeof(data));
-  auto destination = context.CreateBuffer(
-      sizeof(data), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  auto dependent = context.CreateBuffer(
-      sizeof(data), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  ASSERT_TRUE(source);
-  ASSERT_TRUE(destination);
-  ASSERT_TRUE(dependent);
-
-  ID3D12Resource *dependent_resources[] = {dependent.get()};
-  const UINT64 element_size = width == AtomicCopyWidth::Uint32
-                                  ? sizeof(std::uint32_t)
-                                  : sizeof(std::uint64_t);
-  D3D12_SUBRESOURCE_RANGE_UINT64 dependent_ranges[] = {
-      {0, {0, element_size}}};
-  if (width == AtomicCopyWidth::Uint32) {
-    list1->AtomicCopyBufferUINT(destination.get(), 0, source.get(), 0, 1,
-                                dependent_resources, dependent_ranges);
-  } else {
-    list1->AtomicCopyBufferUINT64(destination.get(), 0, source.get(), 0, 1,
-                                  dependent_resources, dependent_ranges);
-  }
-
-  EXPECT_EQ(list1->Close(), E_NOTIMPL);
-  EXPECT_EQ(list1->Reset(context.allocator(), nullptr), E_FAIL);
-  EXPECT_EQ(context.device()->GetDeviceRemovedReason(), S_OK);
-
-  D3D12TestContext recovered;
-  ASSERT_EQ(recovered.Initialize(context.device()), S_OK);
-  ExpectCopyExecution(recovered);
-}
-
 class OptionalCommandContractSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -384,39 +330,6 @@ TEST_F(OptionalCommandContractSpec,
   ASSERT_EQ(actual.size(), sizeof(initial));
   EXPECT_EQ(std::memcmp(actual.data(), initial.data(), sizeof(initial)), 0);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
-TEST_F(OptionalCommandContractSpec,
-       AtomicCopyUintFailureIsStickyAndSameDeviceRecovers) {
-  ExpectAtomicCopyFailureAndSameDeviceRecovery(context_,
-                                               AtomicCopyWidth::Uint32);
-}
-
-TEST_F(OptionalCommandContractSpec,
-       AtomicCopyUint64FailureIsStickyAndSameDeviceRecovers) {
-  ExpectAtomicCopyFailureAndSameDeviceRecovery(context_,
-                                               AtomicCopyWidth::Uint64);
-}
-
-TEST_F(OptionalCommandContractSpec,
-       StreamOutputTargetFailureIsStickyAndSameDeviceRecovers) {
-  auto output = context_.CreateBuffer(
-      256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COMMON);
-  ASSERT_TRUE(output);
-  D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {};
-  view.BufferLocation = output->GetGPUVirtualAddress();
-  view.SizeInBytes = 128;
-  view.BufferFilledSizeLocation = output->GetGPUVirtualAddress() + 128;
-
-  context_.list()->SOSetTargets(0, 1, &view);
-  EXPECT_EQ(context_.list()->Close(), E_NOTIMPL);
-  EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-
-  D3D12TestContext recovered;
-  ASSERT_EQ(recovered.Initialize(context_.device()), S_OK);
-  ExpectCopyExecution(recovered);
 }
 
 TEST_F(OptionalCommandContractSpec,

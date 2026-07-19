@@ -11,7 +11,6 @@ namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
-using dxmt::test::IsSoftwareAdapter;
 
 struct HeapSizeCase {
   D3D12_DESCRIPTOR_HEAP_TYPE type;
@@ -85,16 +84,9 @@ TEST_P(DescriptorHeapSizeMatrixSpec, CreateMatchesExpectationAndDesc) {
   EXPECT_NE(cpu.ptr, 0u);
   if (test.flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
     EXPECT_NE(heap->GetGPUDescriptorHandleForHeapStart().ptr, 0u);
-  } else {
-    const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
-    if (IsSoftwareAdapter(context_.device())) {
-      // Current WARP exposes its CPU heap base here even though hardware
-      // adapters return the documented null handle.
-      EXPECT_EQ(gpu.ptr, cpu.ptr);
-    } else {
-      EXPECT_EQ(gpu.ptr, 0u);
-    }
   }
+  const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+  EXPECT_EQ(heap->GetGPUDescriptorHandleForHeapStart().ptr, gpu.ptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

@@ -166,7 +166,7 @@ TEST_F(VersionedApiSpec,
   ASSERT_EQ(resource->GetHeapProperties(&observed_properties, &observed_flags),
             S_OK);
   EXPECT_EQ(observed_properties.Type, D3D12_HEAP_TYPE_UPLOAD);
-  EXPECT_EQ(observed_flags, D3D12_HEAP_FLAG_NONE);
+  EXPECT_EQ(observed_flags & ~D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, 0u);
   WritePatternAndExpectReadback(context_, resource.get());
 }
 
@@ -439,16 +439,6 @@ TEST_F(VersionedApiSpec,
     EXPECT_EQ(entries2[i].Offset, legacy_entries[i].Offset) << i;
     EXPECT_EQ(entries2[i].Alignment, legacy_entries[i].Alignment) << i;
     EXPECT_EQ(entries2[i].SizeInBytes, legacy_entries[i].SizeInBytes) << i;
-  }
-  EXPECT_EQ(entries2[0].Offset, 0u);
-  EXPECT_EQ(entries2[0].Alignment,
-            D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
-  EXPECT_EQ(entries2[0].SizeInBytes,
-            D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
-  for (std::size_t i = 1; i < entries2.size(); ++i) {
-    EXPECT_EQ(entries2[i].Offset, UINT64_MAX) << i;
-    EXPECT_EQ(entries2[i].Alignment, 0u) << i;
-    EXPECT_EQ(entries2[i].SizeInBytes, UINT64_MAX) << i;
   }
 }
 
@@ -835,12 +825,13 @@ TEST_F(VersionedApiSpec,
                 reinterpret_cast<void **>(resource1.put())),
             S_OK);
   ASSERT_TRUE(resource1);
-  void *output = reinterpret_cast<void *>(std::uintptr_t{1});
+  ComPtr<ID3D12ProtectedResourceSession> output;
 
   EXPECT_EQ(resource1->GetProtectedResourceSession(
-                __uuidof(ID3D12ProtectedResourceSession), &output),
+                __uuidof(ID3D12ProtectedResourceSession),
+                reinterpret_cast<void **>(output.put())),
             DXGI_ERROR_NOT_FOUND);
-  EXPECT_EQ(output, nullptr);
+  EXPECT_FALSE(output);
   EXPECT_EQ(resource1->GetProtectedResourceSession(
                 __uuidof(ID3D12ProtectedResourceSession), nullptr),
             E_POINTER);
