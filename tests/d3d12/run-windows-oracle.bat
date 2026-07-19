@@ -11,11 +11,13 @@ set "ORACLE_DEBUG=0"
 set "ORACLE_D3D12_ONLY=0"
 set "ORACLE_CASES=*"
 set "ORACLE_WORKER_ARG="
+set "ORACLE_D3D12_JOBS=4"
 
 if defined DXMT_CI_D3D12_CASE_FILTER (
   set "ORACLE_CASES=%DXMT_CI_D3D12_CASE_FILTER%"
   set "ORACLE_D3D12_ONLY=1"
 )
+if defined DXMT_CI_D3D12_JOBS set "ORACLE_D3D12_JOBS=%DXMT_CI_D3D12_JOBS%"
 
 :parse_args
 if "%~1"=="" goto run_oracle
@@ -124,6 +126,7 @@ echo.
   echo d3d12_adapter=%ORACLE_ADAPTER%
   echo d3d12_debug_layer=%ORACLE_DEBUG%
   echo d3d12_case_filter=%ORACLE_CASES%
+  echo d3d12_jobs=%ORACLE_D3D12_JOBS%
   ver
   certutil -hashfile "%ORACLE_D3D10_EXE%" SHA256
   certutil -hashfile "%ORACLE_D3D11_EXE%" SHA256
@@ -148,7 +151,7 @@ echo.
 
 :run_d3d12
 echo [ D3D12 ] Running complete suite...
-"%ORACLE_D3D12_EXE%" %ORACLE_WORKER_ARG% --dxmt-test-jobs=4 "--dxmt-case-id=%ORACLE_CASES%" > "%ORACLE_D3D12_LOG%" 2>&1
+"%ORACLE_D3D12_EXE%" %ORACLE_WORKER_ARG% --dxmt-test-jobs=%ORACLE_D3D12_JOBS% "--dxmt-case-id=%ORACLE_CASES%" > "%ORACLE_D3D12_LOG%" 2>&1
 set "ORACLE_D3D12_EXIT=%ERRORLEVEL%"
 type "%ORACLE_D3D12_LOG%"
 if not "%ORACLE_D3D12_EXIT%"=="0" set "ORACLE_EXIT=1"
