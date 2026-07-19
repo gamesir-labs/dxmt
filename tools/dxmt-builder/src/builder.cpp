@@ -1984,6 +1984,12 @@ private:
     environment["WINEPREFIX"] = profile.prefix.string();
 
     if (mode == "all" || mode == "unit") {
+      RequireSuccess(
+          RunCommand({"meson", "test", "-C", profile.build.string(),
+                      "--no-rebuild", "--suite", "repository",
+                      "--print-errorlogs"}),
+          "repository policy tests");
+
       std::string scheduler_args = "--dxmt-test-suite=" + suite;
       for (const auto &argument : forwarded) {
         if (argument.starts_with("--test-args="))

@@ -170,6 +170,15 @@ if get_option('windows_oracle_only')
   subdir_done()
 endif
 
+commit_message_policy_test = find_program('../scripts/check-commit-message.sh')
+test(
+  'commit-message-policy',
+  commit_message_policy_test,
+  args: ['--self-test'],
+  suite: ['unit', 'repository'],
+  timeout: 30,
+)
+
 python3_native = find_program('python3', native: true)
 
 test(
