@@ -31,6 +31,7 @@ label() {
     failed_jobs) printf '%s' '失败任务' ;;
     commit_types) printf '%s' '提交类型' ;;
     commits) printf '%s' '本次提交' ;;
+    ci_runs) printf '%s' '本次运行 CI' ;;
     conventional_result) printf '%s' '提交规范校验' ;;
     nightly_result) printf '%s' 'Nightly 构建' ;;
     d3d_result) printf '%s' 'Windows D3D 测试' ;;

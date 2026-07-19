@@ -123,6 +123,11 @@ class CiRoutingPolicyTest(unittest.TestCase):
         notify_job = nightly.split("  notify:\n", 1)[1]
         self.assertIn("if: ${{ always() }}", notify_job)
         self.assertIn("${COMMIT_MARKDOWN}", notify_job)
+        self.assertIn("label ci_runs", notify_job)
+        self.assertIn("linked_status", notify_job)
+        self.assertIn('if [[ "${RUN_NIGHTLY}" == \'true\' ]]', notify_job)
+        self.assertIn('if [[ "${RUN_WINDOWS_D3D}" == \'true\' ]]', notify_job)
+        self.assertIn("needs.package.outputs.package_name", notify_job)
 
     def test_test_type_routes_to_reusable_windows_conformance(self) -> None:
         nightly = read_repository_file(".github/workflows/nightly.yml")

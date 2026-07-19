@@ -481,6 +481,10 @@ jobs:
             esac
           }
 
+          linked_status() {
+            printf '[%s](%s)' "$(status_label "$1")" "$2"
+          }
+
           failed=()
           [[ '${{ needs.classify-commits.result }}' == 'success' ]] || failed+=('commit-policy')
           if [[ "${RUN_NIGHTLY}" == 'true' ]]; then
@@ -514,14 +518,23 @@ jobs:
           commits_md="$(printf '%s\n' \
             "**$(.github/scripts/ci-feishu.sh label commits):**" \
             "${COMMIT_MARKDOWN}")"
+          ci_lines=(
+            "**$(.github/scripts/ci-feishu.sh label conventional_result):** $(linked_status '${{ needs.classify-commits.result }}' "${run_url}")"
+          )
+          if [[ "${RUN_NIGHTLY}" == 'true' ]]; then
+            ci_lines+=("**$(.github/scripts/ci-feishu.sh label nightly_result):** $(linked_status '${{ needs.package.result }}' "${run_url}")")
+          fi
+          if [[ "${RUN_WINDOWS_D3D}" == 'true' ]]; then
+            ci_lines+=("**$(.github/scripts/ci-feishu.sh label d3d_result):** $(linked_status '${{ needs.windows-d3d-conformance.result }}' "${run_url}")")
+          fi
           results_md="$(printf '%s\n' \
-            "**$(.github/scripts/ci-feishu.sh label conventional_result):** $(status_label '${{ needs.classify-commits.result }}')" \
-            "**$(.github/scripts/ci-feishu.sh label nightly_result):** $(status_label '${{ needs.package.result }}')" \
-            "**$(.github/scripts/ci-feishu.sh label d3d_result):** $(status_label '${{ needs.windows-d3d-conformance.result }}')")"
+            "**$(.github/scripts/ci-feishu.sh label ci_runs):**" \
+            "${ci_lines[@]}")"
           sections=("${identity_md}" "${commits_md}" "${results_md}")
 
           if [[ '${{ needs.package.result }}' == 'success' ]]; then
             package_md="$(printf '%s\n' \
+              "**$(.github/scripts/ci-feishu.sh label version):** ${{ needs.package.outputs.package_name }}" \
               "**📦 $(.github/scripts/ci-feishu.sh label component_package):** [$(.github/scripts/ci-feishu.sh label download)](${{ needs.package.outputs.artifact_url }})" \
               "**$(.github/scripts/ci-feishu.sh label size):** ${{ needs.package.outputs.package_size }} bytes" \
               "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`")"
