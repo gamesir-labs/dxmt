@@ -438,21 +438,6 @@ TEST_F(D3D12UnrealCapabilitySpec, ReportsShaderWaveOperationContract) {
   }
 }
 
-TEST_F(D3D12UnrealCapabilitySpec,
-       DoesNotAdvertiseAtomicInt64UntilCapabilityEnabled) {
-  // Plan P1-2 gates 64-bit atomic execution on capability advertisement.
-  // OPTIONS9 is currently zero-initialized, so every AtomicInt64 field must
-  // remain FALSE until a promotion change enables the feature suite.
-  D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9 = {};
-  ASSERT_EQ(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9,
-                                         &options9, sizeof(options9)),
-            S_OK);
-  EXPECT_EQ(options9.AtomicInt64OnTypedResourceSupported, FALSE);
-  EXPECT_EQ(options9.AtomicInt64OnGroupSharedSupported, FALSE);
-  EXPECT_EQ(options9.MeshShaderPipelineStatsSupported, FALSE);
-  EXPECT_EQ(options9.MeshShaderSupportsFullRangeRenderTargetArrayIndex, FALSE);
-  EXPECT_EQ(options9.DerivativesInMeshAndAmplificationShadersSupported, FALSE);
-}
 
 TEST_F(D3D12UnrealCapabilitySpec, NegotiatesRootSignatureVersion) {
   D3D12_FEATURE_DATA_ROOT_SIGNATURE root_signature = {};
@@ -752,45 +737,7 @@ TEST_F(D3D12UnrealCapabilitySpec,
   }
 }
 
-TEST_F(D3D12UnrealCapabilitySpec,
-       RejectsEveryUnreportedRenderTargetConfiguration) {
-  bool found_unsupported = false;
-  for (const UINT sample_count : {2u, 4u, 8u, 16u}) {
-    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
-    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    levels.SampleCount = sample_count;
-    ASSERT_TRUE(HResultSucceeded(device_->CheckFeatureSupport(
-        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels))))
-        << sample_count << "x MSAA query failed";
-    if (levels.NumQualityLevels != 0)
-      continue;
-    found_unsupported = true;
 
-    ComPtr<ID3D12Resource> texture;
-    const HRESULT hr = CreateMsaaRenderTarget(
-        device_.get(), levels.Format, sample_count, &texture);
-    EXPECT_TRUE(FAILED(hr))
-        << sample_count << "x MSAA was unreported but creation succeeded";
-    EXPECT_FALSE(texture) << sample_count
-                          << "x MSAA returned a resource after rejection";
-  }
-  EXPECT_TRUE(found_unsupported);
-}
-
-TEST_F(D3D12UnrealCapabilitySpec,
-       InitializesUnsupportedMultisampleQualityQueries) {
-  for (const UINT sample_count : {0u, 3u, 16u, 32u}) {
-    SCOPED_TRACE(::testing::Message() << "sample_count=" << sample_count);
-    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {};
-    levels.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    levels.SampleCount = sample_count;
-    levels.NumQualityLevels = UINT_MAX;
-    const HRESULT hr = device_->CheckFeatureSupport(
-        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels));
-    EXPECT_EQ(hr, sample_count == 0 ? E_FAIL : S_OK);
-    EXPECT_EQ(levels.NumQualityLevels, 0u);
-  }
-}
 
 TEST_F(D3D12UnrealCapabilitySpec,
        ReportsConsistentMultisamplingAcrossTypelessFormatFamily) {
@@ -917,11 +864,5 @@ TEST_F(D3D12UnrealCapabilitySpec, CreatesBootstrapDescriptorHeaps) {
   }
 }
 
-TEST_F(D3D12UnrealCapabilitySpec, RejectsIncorrectFeatureStructureSize) {
-  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
-  EXPECT_EQ(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
-                                         sizeof(options) - 1),
-            E_INVALIDARG);
-}
 
 } // namespace

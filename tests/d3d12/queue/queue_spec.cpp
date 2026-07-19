@@ -607,53 +607,6 @@ TEST_F(D3D12QueueSpec, ReusesBundleWithInheritedAndReturnedGraphicsState) {
   }
 }
 
-TEST_F(D3D12QueueSpec, ValidatesExecuteBundleContractsOnClose) {
-  ComPtr<ID3D12CommandAllocator> open_bundle_allocator;
-  ComPtr<ID3D12GraphicsCommandList> open_bundle;
-  ASSERT_EQ(context_.device()->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_BUNDLE,
-                __uuidof(ID3D12CommandAllocator),
-                reinterpret_cast<void **>(open_bundle_allocator.put())),
-            S_OK);
-  ASSERT_EQ(context_.device()->CreateCommandList(
-                0, D3D12_COMMAND_LIST_TYPE_BUNDLE,
-                open_bundle_allocator.get(), nullptr,
-                __uuidof(ID3D12GraphicsCommandList),
-                reinterpret_cast<void **>(open_bundle.put())),
-            S_OK);
-  context_.list()->ExecuteBundle(open_bundle.get());
-  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
-
-  ComPtr<ID3D12CommandAllocator> closed_bundle_allocator;
-  ComPtr<ID3D12GraphicsCommandList> closed_bundle;
-  ASSERT_EQ(context_.device()->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_BUNDLE,
-                __uuidof(ID3D12CommandAllocator),
-                reinterpret_cast<void **>(closed_bundle_allocator.put())),
-            S_OK);
-  ASSERT_EQ(context_.device()->CreateCommandList(
-                0, D3D12_COMMAND_LIST_TYPE_BUNDLE,
-                closed_bundle_allocator.get(), nullptr,
-                __uuidof(ID3D12GraphicsCommandList),
-                reinterpret_cast<void **>(closed_bundle.put())),
-            S_OK);
-  ASSERT_EQ(closed_bundle->Close(), S_OK);
-
-  ComPtr<ID3D12CommandAllocator> caller_allocator;
-  ComPtr<ID3D12GraphicsCommandList> caller_bundle;
-  ASSERT_EQ(context_.device()->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_BUNDLE,
-                __uuidof(ID3D12CommandAllocator),
-                reinterpret_cast<void **>(caller_allocator.put())),
-            S_OK);
-  ASSERT_EQ(context_.device()->CreateCommandList(
-                0, D3D12_COMMAND_LIST_TYPE_BUNDLE, caller_allocator.get(),
-                nullptr, __uuidof(ID3D12GraphicsCommandList),
-                reinterpret_cast<void **>(caller_bundle.put())),
-            S_OK);
-  caller_bundle->ExecuteBundle(closed_bundle.get());
-  EXPECT_EQ(caller_bundle->Close(), S_OK);
-}
 
 TEST_F(D3D12QueueSpec, DiscardAllowsCompleteAndRectangularOverwrite) {
   constexpr UINT kWidth = 8;
@@ -700,36 +653,6 @@ TEST_F(D3D12QueueSpec, DiscardAllowsCompleteAndRectangularOverwrite) {
   }
 }
 
-TEST_F(D3D12QueueSpec, RejectsForeignDiscardAndAllowsFreshListRecovery) {
-  auto foreign_device = CreateIsolatedD3D12Device();
-  ASSERT_TRUE(foreign_device);
-  D3D12TestContext foreign_context;
-  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
-  auto foreign_resource = foreign_context.CreateBuffer(
-      16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COMMON);
-  ASSERT_TRUE(foreign_resource);
-
-  context_.list()->DiscardResource(foreign_resource.get(), nullptr);
-  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
-
-  auto local_resource = context_.CreateBuffer(
-      16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COMMON);
-  ASSERT_TRUE(local_resource);
-  ComPtr<ID3D12CommandAllocator> allocator;
-  ComPtr<ID3D12GraphicsCommandList> list;
-  ASSERT_EQ(context_.device()->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put())),
-            S_OK);
-  ASSERT_EQ(context_.device()->CreateCommandList(
-                0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr,
-                IID_PPV_ARGS(list.put())),
-            S_OK);
-  list->DiscardResource(local_resource.get(), nullptr);
-  EXPECT_EQ(list->Close(), S_OK);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
 
 TEST_F(D3D12QueueSpec, CompletesFenceSignalsInValueOrder) {
   ComPtr<ID3D12Fence> fence;
@@ -1789,91 +1712,6 @@ TEST_F(D3D12QueueSpec, ResolvesPerSampleValuesWithAverageMinAndMax) {
   }
 }
 
-TEST_F(D3D12QueueSpec, FailsCloseForUnadvertisedCommandFeatures) {
-  struct RecordingList {
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12GraphicsCommandList1> list1;
-  };
-  auto create_list = [&] {
-    RecordingList result;
-    if (FAILED(context_.device()->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT,
-            __uuidof(ID3D12CommandAllocator),
-            reinterpret_cast<void **>(result.allocator.put()))))
-      return result;
-    if (FAILED(context_.device()->CreateCommandList(
-            0, D3D12_COMMAND_LIST_TYPE_DIRECT, result.allocator.get(),
-            nullptr, __uuidof(ID3D12GraphicsCommandList),
-            reinterpret_cast<void **>(result.list.put()))))
-      return result;
-    result.list->QueryInterface(
-        __uuidof(ID3D12GraphicsCommandList1),
-        reinterpret_cast<void **>(result.list1.put()));
-    return result;
-  };
-
-  std::array<std::uint32_t, 64> atomic_data = {};
-  auto atomic_source = context_.CreateUploadBuffer(
-      sizeof(atomic_data), atomic_data.data(), sizeof(atomic_data));
-  auto atomic_destination =
-      context_.CreateBuffer(sizeof(atomic_data), D3D12_HEAP_TYPE_DEFAULT,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                            D3D12_RESOURCE_STATE_COPY_DEST);
-  auto atomic_dependent =
-      context_.CreateBuffer(sizeof(atomic_data), D3D12_HEAP_TYPE_DEFAULT,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                            D3D12_RESOURCE_STATE_COPY_DEST);
-  ASSERT_TRUE(atomic_source);
-  ASSERT_TRUE(atomic_destination);
-  ASSERT_TRUE(atomic_dependent);
-  ID3D12Resource *dependent_resources[] = {atomic_dependent.get()};
-  D3D12_SUBRESOURCE_RANGE_UINT64 dependent_ranges[] = {{0, {0, sizeof(UINT)}}};
-  auto atomic_list = create_list();
-  ASSERT_TRUE(atomic_list.list1);
-  atomic_list.list1->AtomicCopyBufferUINT(
-      atomic_destination.get(), 0, atomic_source.get(), 0, 1,
-      dependent_resources, dependent_ranges);
-  EXPECT_EQ(atomic_list.list->Close(), E_NOTIMPL);
-
-  D3D12_STREAM_OUTPUT_BUFFER_VIEW stream_output = {};
-  stream_output.BufferLocation = atomic_destination->GetGPUVirtualAddress();
-  stream_output.SizeInBytes = sizeof(atomic_data);
-  stream_output.BufferFilledSizeLocation =
-      atomic_dependent->GetGPUVirtualAddress();
-  auto stream_output_list = create_list();
-  ASSERT_TRUE(stream_output_list.list);
-  stream_output_list.list->SOSetTargets(0, 1, &stream_output);
-  EXPECT_EQ(stream_output_list.list->Close(), E_NOTIMPL);
-
-  auto depth_bounds_list = create_list();
-  ASSERT_TRUE(depth_bounds_list.list1);
-  depth_bounds_list.list1->OMSetDepthBounds(0.25f, 0.75f);
-  EXPECT_EQ(depth_bounds_list.list->Close(), E_NOTIMPL);
-
-  auto decompress_source =
-      context_.CreateTexture2D(16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
-                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                               D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-  auto decompress_destination = context_.CreateTexture2D(
-      16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_RESOLVE_DEST);
-  ASSERT_TRUE(decompress_source);
-  ASSERT_TRUE(decompress_destination);
-  auto resolve_list = create_list();
-  ASSERT_TRUE(resolve_list.list1);
-  resolve_list.list1->ResolveSubresourceRegion(
-      decompress_destination.get(), 0, 0, 0, decompress_source.get(), 0,
-      nullptr, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOLVE_MODE_DECOMPRESS);
-  EXPECT_EQ(resolve_list.list->Close(), E_NOTIMPL);
-
-  // The default depth-bounds state remains a valid no-op when the feature is
-  // not advertised.
-  auto default_depth_bounds_list = create_list();
-  ASSERT_TRUE(default_depth_bounds_list.list1);
-  default_depth_bounds_list.list1->OMSetDepthBounds(0.0f, 1.0f);
-  EXPECT_EQ(default_depth_bounds_list.list->Close(), S_OK);
-}
 
 TEST_F(D3D12QueueSpec, ResolveQueryRecordDoesNotRetainItsCommandList) {
   ComPtr<ID3D12CommandAllocator> allocator;

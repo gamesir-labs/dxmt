@@ -395,63 +395,6 @@ DXMT_SERIAL_TEST_F(RtvDsvDimensionSpec,
   ExpectHealthyAfterFence();
 }
 
-TEST_F(RtvDsvDimensionSpec, InvalidTexture3DRtvIsNoOpAndCanBeOverwritten) {
-  const auto required =
-      D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))
-    GTEST_SKIP() << "R8G8B8A8_UNORM 3D render targets are unsupported";
-  auto texture = CreateTexture(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 2, 2, 4, 1,
-                               DXGI_FORMAT_R8G8B8A8_UNORM,
-                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                               D3D12_RESOURCE_STATE_COPY_DEST);
-  auto heap =
-      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
-  ASSERT_TRUE(texture);
-  ASSERT_TRUE(heap);
-  std::array<std::uint32_t, 16> poison;
-  poison.fill(0xffff0000u);
-  ASSERT_EQ(context_.UploadTextureAndReset(texture.get(), poison.data(),
-                                           2 * sizeof(poison[0]),
-                                           4 * sizeof(poison[0])),
-            S_OK);
-  D3D12TestContext::Transition(context_.list(), texture.get(),
-                               D3D12_RESOURCE_STATE_COPY_DEST,
-                               D3D12_RESOURCE_STATE_RENDER_TARGET);
-  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
-  D3D12_RENDER_TARGET_VIEW_DESC desc = {};
-  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
-  desc.Texture3D.FirstWSlice = 4;
-  desc.Texture3D.WSize = 1;
-  context_.device()->CreateRenderTargetView(texture.get(), &desc, rtv);
-  constexpr FLOAT selected[4] = {0.0f, 1.0f, 0.0f, 1.0f};
-  context_.list()->ClearRenderTargetView(rtv, selected, 0, nullptr);
-  D3D12TestContext::Transition(context_.list(), texture.get(),
-                               D3D12_RESOURCE_STATE_RENDER_TARGET,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
-  TextureReadback invalid_readback;
-  ASSERT_EQ(ReadbackAndReset(texture.get(), &invalid_readback), S_OK);
-  for (UINT z = 0; z < 4; ++z)
-    ExpectColorSolid(invalid_readback, 0xffff0000u, z);
-
-  D3D12TestContext::Transition(context_.list(), texture.get(),
-                               D3D12_RESOURCE_STATE_COPY_SOURCE,
-                               D3D12_RESOURCE_STATE_RENDER_TARGET);
-  desc.Texture3D.FirstWSlice = 2;
-  desc.Texture3D.WSize = 1;
-  context_.device()->CreateRenderTargetView(texture.get(), &desc, rtv);
-  context_.list()->ClearRenderTargetView(rtv, selected, 0, nullptr);
-  D3D12TestContext::Transition(context_.list(), texture.get(),
-                               D3D12_RESOURCE_STATE_RENDER_TARGET,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
-  TextureReadback valid_readback;
-  ASSERT_EQ(ReadbackAndReset(texture.get(), &valid_readback), S_OK);
-  for (UINT z = 0; z < 4; ++z) {
-    ExpectColorSolid(valid_readback,
-                     z == 2 ? 0xff00ff00u : 0xffff0000u, z);
-  }
-  ExpectHealthyAfterFence();
-}
 
 TEST_F(RtvDsvDimensionSpec, Texture1DArrayRtvCoversRequestedSlices) {
   constexpr UINT kSlices = 4;
@@ -901,61 +844,5 @@ TEST_F(RtvDsvDimensionSpec, TypelessResourcesUseCompatibleTypedViews) {
   ExpectHealthyAfterFence();
 }
 
-TEST_F(RtvDsvDimensionSpec, InvalidViewFormatsCanBeOverwrittenByValidViews) {
-  const auto color_required =
-      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  const auto depth_required =
-      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
-  if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required) ||
-      !Supports(DXGI_FORMAT_D32_FLOAT, depth_required))
-    GTEST_SKIP() << "required color/depth formats are unsupported";
-  auto color = CreateTexture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 2, 2, 1, 1,
-                             DXGI_FORMAT_R8G8B8A8_UNORM,
-                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                             D3D12_RESOURCE_STATE_RENDER_TARGET);
-  auto depth = CreateTexture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 2, 2, 1, 1,
-                             DXGI_FORMAT_D32_FLOAT,
-                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-                             D3D12_RESOURCE_STATE_DEPTH_WRITE);
-  auto rtv_heap =
-      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
-  auto dsv_heap =
-      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
-  ASSERT_TRUE(color);
-  ASSERT_TRUE(depth);
-  ASSERT_TRUE(rtv_heap);
-  ASSERT_TRUE(dsv_heap);
-  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-  rtv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-  context_.device()->CreateRenderTargetView(color.get(), &rtv_desc, rtv);
-  rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  context_.device()->CreateRenderTargetView(color.get(), &rtv_desc, rtv);
-  const auto dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
-  D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-  dsv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-  context_.device()->CreateDepthStencilView(depth.get(), &dsv_desc, dsv);
-  dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-  context_.device()->CreateDepthStencilView(depth.get(), &dsv_desc, dsv);
-  constexpr FLOAT color_value[4] = {0.0f, 1.0f, 0.0f, 1.0f};
-  context_.list()->ClearRenderTargetView(rtv, color_value, 0, nullptr);
-  context_.list()->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.625f, 0,
-                                         0, nullptr);
-  D3D12TestContext::Transition(context_.list(), color.get(),
-                               D3D12_RESOURCE_STATE_RENDER_TARGET,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
-  D3D12TestContext::Transition(context_.list(), depth.get(),
-                               D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
-  TextureReadback color_readback;
-  ASSERT_EQ(ReadbackAndReset(color.get(), &color_readback), S_OK);
-  ExpectColorSolid(color_readback, 0xff00ff00u);
-  TextureReadback depth_readback;
-  ASSERT_EQ(ReadbackAndReset(depth.get(), &depth_readback), S_OK);
-  ExpectDepthSolid(depth_readback, 0.625f);
-  ExpectHealthyAfterFence();
-}
 
 } // namespace

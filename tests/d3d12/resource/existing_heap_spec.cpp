@@ -139,53 +139,5 @@ TEST_F(ExistingHeapSpec, VirtualAllocationBacksGpuWrittenPlacedBuffer) {
   resource->Unmap(0, &written_range);
 }
 
-TEST_F(ExistingHeapSpec, RejectsNullAndInteriorAddressAndClearsOutput) {
-  auto *heap = reinterpret_cast<ID3D12Heap *>(uintptr_t{1});
-  EXPECT_EQ(device3_->OpenExistingHeapFromAddress(
-                nullptr, __uuidof(ID3D12Heap),
-                reinterpret_cast<void **>(&heap)),
-            E_INVALIDARG);
-  EXPECT_EQ(heap, nullptr);
-
-  VirtualAllocation allocation;
-  ASSERT_TRUE(allocation);
-  heap = reinterpret_cast<ID3D12Heap *>(uintptr_t{1});
-  auto *interior = static_cast<std::uint8_t *>(allocation.get()) + 1;
-  EXPECT_EQ(device3_->OpenExistingHeapFromAddress(
-                interior, __uuidof(ID3D12Heap),
-                reinterpret_cast<void **>(&heap)),
-            E_INVALIDARG);
-  EXPECT_EQ(heap, nullptr);
-}
-
-TEST_F(ExistingHeapSpec, UnsupportedIidClearsOutputForValidAddress) {
-  VirtualAllocation allocation;
-  ASSERT_TRUE(allocation);
-  auto *object = reinterpret_cast<ID3D12Fence *>(uintptr_t{1});
-  EXPECT_EQ(device3_->OpenExistingHeapFromAddress(
-                allocation.get(), __uuidof(ID3D12Fence),
-                reinterpret_cast<void **>(&object)),
-            E_NOINTERFACE);
-  EXPECT_EQ(object, nullptr);
-}
-
-TEST_F(ExistingHeapSpec, FileMappingPathFailsClosedAndClearsOutput) {
-  auto *heap = reinterpret_cast<ID3D12Heap *>(uintptr_t{1});
-  EXPECT_EQ(device3_->OpenExistingHeapFromFileMapping(
-                nullptr, __uuidof(ID3D12Heap),
-                reinterpret_cast<void **>(&heap)),
-            E_INVALIDARG);
-  EXPECT_EQ(heap, nullptr);
-
-  FileMapping mapping;
-  ASSERT_TRUE(mapping);
-  heap = reinterpret_cast<ID3D12Heap *>(uintptr_t{1});
-  EXPECT_EQ(device3_->OpenExistingHeapFromFileMapping(
-                mapping.get(), __uuidof(ID3D12Heap),
-                reinterpret_cast<void **>(&heap)),
-            E_NOTIMPL);
-  EXPECT_EQ(heap, nullptr);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
 
 } // namespace

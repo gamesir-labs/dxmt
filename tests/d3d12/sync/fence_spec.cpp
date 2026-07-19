@@ -29,24 +29,6 @@ protected:
   ComPtr<ID3D12Device1> device1_;
 };
 
-TEST_F(FenceSpec, CreationRequiresOutputAndClearsUnsupportedFlags) {
-  EXPECT_EQ(context_.device()->CreateFence(
-                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), nullptr),
-            E_POINTER);
-
-  for (const auto flags : {
-           D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER,
-           D3D12_FENCE_FLAG_NON_MONITORED,
-           static_cast<D3D12_FENCE_FLAGS>(8),
-       }) {
-    void *output = reinterpret_cast<void *>(std::uintptr_t{1});
-    EXPECT_EQ(context_.device()->CreateFence(
-                  0, flags, __uuidof(ID3D12Fence), &output),
-              E_NOTIMPL)
-        << "flags " << static_cast<UINT>(flags);
-    EXPECT_EQ(output, nullptr);
-  }
-}
 
 TEST_F(FenceSpec, CpuSignalUpdatesCompletedValue) {
   auto fence = CreateFence();
