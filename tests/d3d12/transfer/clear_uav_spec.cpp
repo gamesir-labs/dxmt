@@ -12,13 +12,13 @@
 namespace {
 
 using dxmt::test::ComPtr;
-using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
 struct BufferUav {
   ComPtr<ID3D12Resource> resource;
-  ComPtr<ID3D12DescriptorHeap> heap;
+  ComPtr<ID3D12DescriptorHeap> gpu_heap;
+  ComPtr<ID3D12DescriptorHeap> cpu_heap;
 };
 
 class ClearUavSpec : public ::testing::Test {
@@ -34,13 +34,18 @@ protected:
         context_.CreateBuffer(initial.size_bytes(), D3D12_HEAP_TYPE_DEFAULT,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                               D3D12_RESOURCE_STATE_COPY_DEST);
-    result.heap = context_.CreateDescriptorHeap(
+    result.gpu_heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
-    if (!upload || !result.resource || !result.heap)
+    result.cpu_heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
+    if (!upload || !result.resource || !result.gpu_heap || !result.cpu_heap)
       return {};
     context_.device()->CreateUnorderedAccessView(
         result.resource.get(), nullptr, &desc,
-        result.heap->GetCPUDescriptorHandleForHeapStart());
+        result.gpu_heap->GetCPUDescriptorHandleForHeapStart());
+    context_.device()->CreateUnorderedAccessView(
+        result.resource.get(), nullptr, &desc,
+        result.cpu_heap->GetCPUDescriptorHandleForHeapStart());
     context_.list()->CopyBufferRegion(result.resource.get(), 0, upload.get(), 0,
                                       initial.size_bytes());
     D3D12TestContext::Transition(context_.list(), result.resource.get(),
@@ -52,11 +57,11 @@ protected:
   void ClearAndReadback(const BufferUav &uav,
                         const std::array<UINT, 4> &clear_value,
                         std::vector<std::uint32_t> *actual) {
-    ID3D12DescriptorHeap *heaps[] = {uav.heap.get()};
+    ID3D12DescriptorHeap *heaps[] = {uav.gpu_heap.get()};
     context_.list()->SetDescriptorHeaps(1, heaps);
     context_.list()->ClearUnorderedAccessViewUint(
-        uav.heap->GetGPUDescriptorHandleForHeapStart(),
-        uav.heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
+        uav.gpu_heap->GetGPUDescriptorHandleForHeapStart(),
+        uav.cpu_heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
         clear_value.data(), 0, nullptr);
     D3D12TestContext::Transition(context_.list(), uav.resource.get(),
                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -163,7 +168,8 @@ TEST_F(ClearUavSpec, ClearTypedBufferUint) {
   desc.Buffer.NumElements = 4;
   auto uav = CreateBufferUav(desc, expected);
   ASSERT_TRUE(uav.resource);
-  ASSERT_TRUE(uav.heap);
+  ASSERT_TRUE(uav.gpu_heap);
+  ASSERT_TRUE(uav.cpu_heap);
   constexpr std::array<UINT, 4> clear = {0x10203040, 2, 3, 4};
   std::fill(expected.begin() + 2, expected.begin() + 6, clear[0]);
 
@@ -183,15 +189,16 @@ TEST_F(ClearUavSpec, ClearTypedBufferFloat) {
   desc.Buffer.NumElements = 4;
   auto uav = CreateBufferUav(desc, expected);
   ASSERT_TRUE(uav.resource);
-  ASSERT_TRUE(uav.heap);
+  ASSERT_TRUE(uav.gpu_heap);
+  ASSERT_TRUE(uav.cpu_heap);
   constexpr std::array<FLOAT, 4> clear = {0.25f, 2.0f, 3.0f, 4.0f};
   std::fill(expected.begin() + 2, expected.begin() + 6,
             std::bit_cast<std::uint32_t>(clear[0]));
-  ID3D12DescriptorHeap *heaps[] = {uav.heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {uav.gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   context_.list()->ClearUnorderedAccessViewFloat(
-      uav.heap->GetGPUDescriptorHandleForHeapStart(),
-      uav.heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
+      uav.gpu_heap->GetGPUDescriptorHandleForHeapStart(),
+      uav.cpu_heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
       clear.data(), 0, nullptr);
   D3D12TestContext::Transition(context_.list(), uav.resource.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -214,17 +221,18 @@ TEST_F(ClearUavSpec, ClearTypedFloat2Buffer) {
   desc.Buffer.NumElements = 2;
   auto uav = CreateBufferUav(desc, expected);
   ASSERT_TRUE(uav.resource);
-  ASSERT_TRUE(uav.heap);
+  ASSERT_TRUE(uav.gpu_heap);
+  ASSERT_TRUE(uav.cpu_heap);
   constexpr std::array<FLOAT, 4> clear = {0.25f, -2.0f, 3.0f, 4.0f};
   for (UINT element = 1; element < 3; ++element) {
     expected[element * 2] = std::bit_cast<std::uint32_t>(clear[0]);
     expected[element * 2 + 1] = std::bit_cast<std::uint32_t>(clear[1]);
   }
-  ID3D12DescriptorHeap *heaps[] = {uav.heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {uav.gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   context_.list()->ClearUnorderedAccessViewFloat(
-      uav.heap->GetGPUDescriptorHandleForHeapStart(),
-      uav.heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
+      uav.gpu_heap->GetGPUDescriptorHandleForHeapStart(),
+      uav.cpu_heap->GetCPUDescriptorHandleForHeapStart(), uav.resource.get(),
       clear.data(), 0, nullptr);
   D3D12TestContext::Transition(context_.list(), uav.resource.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -248,7 +256,8 @@ TEST_F(ClearUavSpec, ClearRawBuffer) {
   desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   auto uav = CreateBufferUav(desc, expected);
   ASSERT_TRUE(uav.resource);
-  ASSERT_TRUE(uav.heap);
+  ASSERT_TRUE(uav.gpu_heap);
+  ASSERT_TRUE(uav.cpu_heap);
   constexpr std::array<UINT, 4> clear = {0x50607080, 2, 3, 4};
   std::fill(expected.begin() + 1, expected.begin() + 5, clear[0]);
 
@@ -269,7 +278,8 @@ TEST_F(ClearUavSpec, ClearStructuredBuffer) {
   desc.Buffer.StructureByteStride = 4 * sizeof(std::uint32_t);
   auto uav = CreateBufferUav(desc, expected);
   ASSERT_TRUE(uav.resource);
-  ASSERT_TRUE(uav.heap);
+  ASSERT_TRUE(uav.gpu_heap);
+  ASSERT_TRUE(uav.cpu_heap);
   constexpr std::array<UINT, 4> clear = {0x11223344, 0x55667788, 0x99aabbcc,
                                          0xddeeff00};
   std::fill(expected.begin() + 4, expected.begin() + 12, clear[0]);
@@ -282,22 +292,28 @@ TEST_F(ClearUavSpec, ClearStructuredBuffer) {
 
 TEST_F(ClearUavSpec, ClearTextureMip) {
   auto texture = CreateTexture(8, 8, 3);
-  auto heap = context_.CreateDescriptorHeap(
+  auto gpu_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
   ASSERT_TRUE(texture);
-  ASSERT_TRUE(heap);
+  ASSERT_TRUE(gpu_heap);
+  ASSERT_TRUE(cpu_heap);
   D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
   desc.Format = DXGI_FORMAT_R32_UINT;
   desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
   desc.Texture2D.MipSlice = 2;
-  const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  const auto gpu_cpu = gpu_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto cpu = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                cpu);
-  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   constexpr std::array<UINT, 4> clear = {0x10203040, 2, 3, 4};
   context_.list()->ClearUnorderedAccessViewUint(
-      heap->GetGPUDescriptorHandleForHeapStart(), cpu, texture.get(),
+      gpu_heap->GetGPUDescriptorHandleForHeapStart(), cpu, texture.get(),
       clear.data(), 0, nullptr);
   D3D12TestContext::Transition(context_.list(), texture.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -315,21 +331,27 @@ TEST_F(ClearUavSpec, ClearTextureMip) {
 
 TEST_F(ClearUavSpec, ClearFloatTexture) {
   auto texture = CreateTexture(4, 4, 1, 1, DXGI_FORMAT_R32_FLOAT);
-  auto heap = context_.CreateDescriptorHeap(
+  auto gpu_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
   ASSERT_TRUE(texture);
-  ASSERT_TRUE(heap);
+  ASSERT_TRUE(gpu_heap);
+  ASSERT_TRUE(cpu_heap);
   D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
   desc.Format = DXGI_FORMAT_R32_FLOAT;
   desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  const auto gpu_cpu = gpu_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto cpu = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                cpu);
-  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   constexpr std::array<FLOAT, 4> clear = {0.375f, -2.0f, 3.0f, 4.0f};
   context_.list()->ClearUnorderedAccessViewFloat(
-      heap->GetGPUDescriptorHandleForHeapStart(), cpu, texture.get(),
+      gpu_heap->GetGPUDescriptorHandleForHeapStart(), cpu, texture.get(),
       clear.data(), 0, nullptr);
   D3D12TestContext::Transition(context_.list(), texture.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -345,30 +367,41 @@ TEST_F(ClearUavSpec, ClearFloatTexture) {
 
 TEST_F(ClearUavSpec, ClearTextureArraySlice) {
   auto texture = CreateTexture(4, 4, 1, 2);
-  auto heap = context_.CreateDescriptorHeap(
+  auto gpu_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  auto cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, false);
   ASSERT_TRUE(texture);
-  ASSERT_TRUE(heap);
+  ASSERT_TRUE(gpu_heap);
+  ASSERT_TRUE(cpu_heap);
   D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
   desc.Format = DXGI_FORMAT_R32_UINT;
   desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
   desc.Texture2DArray.ArraySize = 1;
-  const auto first_cpu = context_.CpuDescriptorHandle(heap.get(), 0);
+  const auto first_gpu_cpu = context_.CpuDescriptorHandle(gpu_heap.get(), 0);
+  const auto first_cpu = context_.CpuDescriptorHandle(cpu_heap.get(), 0);
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               first_gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                first_cpu);
   desc.Texture2DArray.FirstArraySlice = 1;
-  const auto second_cpu = context_.CpuDescriptorHandle(heap.get(), 1);
+  const auto second_gpu_cpu = context_.CpuDescriptorHandle(gpu_heap.get(), 1);
+  const auto second_cpu = context_.CpuDescriptorHandle(cpu_heap.get(), 1);
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               second_gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                second_cpu);
-  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   constexpr std::array<UINT, 4> first_clear = {11, 0, 0, 0};
   constexpr std::array<UINT, 4> second_clear = {22, 0, 0, 0};
   context_.list()->ClearUnorderedAccessViewUint(
-      context_.GpuDescriptorHandle(heap.get(), 0), first_cpu, texture.get(),
+      context_.GpuDescriptorHandle(gpu_heap.get(), 0), first_cpu,
+      texture.get(),
       first_clear.data(), 0, nullptr);
   context_.list()->ClearUnorderedAccessViewUint(
-      context_.GpuDescriptorHandle(heap.get(), 1), second_cpu, texture.get(),
+      context_.GpuDescriptorHandle(gpu_heap.get(), 1), second_cpu,
+      texture.get(),
       second_clear.data(), 0, nullptr);
   D3D12TestContext::Transition(context_.list(), texture.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -392,33 +425,44 @@ TEST_F(ClearUavSpec, ClearTexture3DSliceRange) {
   constexpr UINT16 kDepth = 4;
   auto texture =
       CreateTexture3D(kWidth, kHeight, kDepth, DXGI_FORMAT_R32_UINT);
-  auto heap = context_.CreateDescriptorHeap(
+  auto gpu_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  auto cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, false);
   ASSERT_TRUE(texture);
-  ASSERT_TRUE(heap);
+  ASSERT_TRUE(gpu_heap);
+  ASSERT_TRUE(cpu_heap);
 
   D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
   desc.Format = DXGI_FORMAT_R32_UINT;
   desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
   desc.Texture3D.WSize = kDepth;
-  const auto full_cpu = context_.CpuDescriptorHandle(heap.get(), 0);
+  const auto full_gpu_cpu = context_.CpuDescriptorHandle(gpu_heap.get(), 0);
+  const auto full_cpu = context_.CpuDescriptorHandle(cpu_heap.get(), 0);
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               full_gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                full_cpu);
   desc.Texture3D.FirstWSlice = 1;
   desc.Texture3D.WSize = 2;
-  const auto middle_cpu = context_.CpuDescriptorHandle(heap.get(), 1);
+  const auto middle_gpu_cpu = context_.CpuDescriptorHandle(gpu_heap.get(), 1);
+  const auto middle_cpu = context_.CpuDescriptorHandle(cpu_heap.get(), 1);
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               middle_gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                middle_cpu);
 
-  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   constexpr std::array<UINT, 4> baseline = {7, 0, 0, 0};
   constexpr std::array<UINT, 4> selected = {42, 0, 0, 0};
   context_.list()->ClearUnorderedAccessViewUint(
-      context_.GpuDescriptorHandle(heap.get(), 0), full_cpu, texture.get(),
+      context_.GpuDescriptorHandle(gpu_heap.get(), 0), full_cpu,
+      texture.get(),
       baseline.data(), 0, nullptr);
   context_.list()->ClearUnorderedAccessViewUint(
-      context_.GpuDescriptorHandle(heap.get(), 1), middle_cpu, texture.get(),
+      context_.GpuDescriptorHandle(gpu_heap.get(), 1), middle_cpu,
+      texture.get(),
       selected.data(), 0, nullptr);
   D3D12TestContext::Transition(context_.list(), texture.get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -441,22 +485,28 @@ TEST_F(ClearUavSpec, ClearTexture3DSliceRange) {
 
 TEST_F(ClearUavSpec, ClearTextureRectDoesNotAffectOutside) {
   auto texture = CreateTexture(8, 6);
-  auto heap = context_.CreateDescriptorHeap(
+  auto gpu_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
   ASSERT_TRUE(texture);
-  ASSERT_TRUE(heap);
+  ASSERT_TRUE(gpu_heap);
+  ASSERT_TRUE(cpu_heap);
   D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
   desc.Format = DXGI_FORMAT_R32_UINT;
   desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  const auto gpu_cpu = gpu_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto cpu = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
+                                               gpu_cpu);
   context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &desc,
                                                cpu);
-  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+  ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   constexpr std::array<UINT, 4> baseline = {7, 0, 0, 0};
   constexpr std::array<UINT, 4> clear = {42, 0, 0, 0};
   constexpr D3D12_RECT rect = {2, 1, 6, 5};
-  const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+  const auto gpu = gpu_heap->GetGPUDescriptorHandleForHeapStart();
   context_.list()->ClearUnorderedAccessViewUint(gpu, cpu, texture.get(),
                                                 baseline.data(), 0, nullptr);
   context_.list()->ClearUnorderedAccessViewUint(gpu, cpu, texture.get(),

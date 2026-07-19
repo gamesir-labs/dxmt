@@ -43,8 +43,11 @@ protected:
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       heaps_[index] = context_.CreateDescriptorHeap(
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+      cpu_heaps_[index] = context_.CreateDescriptorHeap(
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
       ASSERT_TRUE(outputs_[index]);
       ASSERT_TRUE(heaps_[index]);
+      ASSERT_TRUE(cpu_heaps_[index]);
       D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
       uav.Format = DXGI_FORMAT_R32_UINT;
       uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -52,12 +55,15 @@ protected:
       context_.device()->CreateUnorderedAccessView(
           outputs_[index].get(), nullptr, &uav,
           heaps_[index]->GetCPUDescriptorHandleForHeapStart());
+      context_.device()->CreateUnorderedAccessView(
+          outputs_[index].get(), nullptr, &uav,
+          cpu_heaps_[index]->GetCPUDescriptorHandleForHeapStart());
       ID3D12DescriptorHeap *bound[] = {heaps_[index].get()};
       context_.list()->SetDescriptorHeaps(1, bound);
       const UINT clear[4] = {};
       context_.list()->ClearUnorderedAccessViewUint(
           heaps_[index]->GetGPUDescriptorHandleForHeapStart(),
-          heaps_[index]->GetCPUDescriptorHandleForHeapStart(),
+          cpu_heaps_[index]->GetCPUDescriptorHandleForHeapStart(),
           outputs_[index].get(), clear, 0, nullptr);
     }
     ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
@@ -100,6 +106,7 @@ protected:
   ComPtr<ID3D12PipelineState> pipeline_;
   std::array<ComPtr<ID3D12Resource>, 2> outputs_;
   std::array<ComPtr<ID3D12DescriptorHeap>, 2> heaps_;
+  std::array<ComPtr<ID3D12DescriptorHeap>, 2> cpu_heaps_;
 };
 
 TEST_F(DescriptorTableBindingSpec, SwitchingHeapStalesTables) {

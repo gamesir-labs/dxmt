@@ -323,13 +323,17 @@ DXMT_SERIAL_TEST_F(RenderPassMrtSemanticsSpec,
       D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
   auto uav_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto uav_cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
   ASSERT_TRUE(pipeline);
   ASSERT_TRUE(target);
   ASSERT_TRUE(counter);
   ASSERT_TRUE(rtv_heap);
   ASSERT_TRUE(uav_heap);
+  ASSERT_TRUE(uav_cpu_heap);
   const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-  const auto uav_cpu = uav_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto uav_gpu_cpu = uav_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto uav_cpu = uav_cpu_heap->GetCPUDescriptorHandleForHeapStart();
   const auto uav_gpu = uav_heap->GetGPUDescriptorHandleForHeapStart();
   context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
@@ -337,6 +341,8 @@ DXMT_SERIAL_TEST_F(RenderPassMrtSemanticsSpec,
   uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   uav_desc.Buffer.NumElements = 1;
   uav_desc.Buffer.StructureByteStride = sizeof(std::uint32_t);
+  context_.device()->CreateUnorderedAccessView(counter.get(), nullptr,
+                                               &uav_desc, uav_gpu_cpu);
   context_.device()->CreateUnorderedAccessView(counter.get(), nullptr,
                                                &uav_desc, uav_cpu);
   ID3D12DescriptorHeap *descriptor_heaps[] = {uav_heap.get()};

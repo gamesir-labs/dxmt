@@ -21,12 +21,15 @@ protected:
     std::array<ComPtr<ID3D12Resource>, 2> resources;
     ASSERT_LE(resource_count, resources.size());
 
-    auto heap = context_.CreateDescriptorHeap(
+    auto gpu_heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * resource_count, true);
+    auto cpu_heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * resource_count, false);
     auto readback = context_.CreateBuffer(
         resource_count * buffer_size, D3D12_HEAP_TYPE_READBACK,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    ASSERT_TRUE(heap);
+    ASSERT_TRUE(gpu_heap);
+    ASSERT_TRUE(cpu_heap);
     ASSERT_TRUE(readback);
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -41,32 +44,38 @@ protected:
       ASSERT_TRUE(resources[index]);
       context_.device()->CreateUnorderedAccessView(
           resources[index].get(), nullptr, &uav,
-          context_.CpuDescriptorHandle(heap.get(), 2 * index));
+          context_.CpuDescriptorHandle(gpu_heap.get(), 2 * index));
+      context_.device()->CreateUnorderedAccessView(
+          resources[index].get(), nullptr, &uav,
+          context_.CpuDescriptorHandle(cpu_heap.get(), 2 * index));
       uav.Buffer.FirstElement = element_count / 2;
       uav.Buffer.NumElements = element_count / 2;
       context_.device()->CreateUnorderedAccessView(
           resources[index].get(), nullptr, &uav,
-          context_.CpuDescriptorHandle(heap.get(), 2 * index + 1));
+          context_.CpuDescriptorHandle(gpu_heap.get(), 2 * index + 1));
+      context_.device()->CreateUnorderedAccessView(
+          resources[index].get(), nullptr, &uav,
+          context_.CpuDescriptorHandle(cpu_heap.get(), 2 * index + 1));
       uav.Buffer.FirstElement = 0;
       uav.Buffer.NumElements = element_count;
     }
 
-    ID3D12DescriptorHeap *heaps[] = {heap.get()};
+    ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
     context_.list()->SetDescriptorHeaps(1, heaps);
     const std::array<UINT, 4> first_clear = {first_value, 0, 0, 0};
     const std::array<UINT, 4> second_clear = {second_value, 0, 0, 0};
     for (UINT index = 0; index < resource_count; ++index) {
       context_.list()->ClearUnorderedAccessViewUint(
-          context_.GpuDescriptorHandle(heap.get(), 2 * index),
-          context_.CpuDescriptorHandle(heap.get(), 2 * index),
+          context_.GpuDescriptorHandle(gpu_heap.get(), 2 * index),
+          context_.CpuDescriptorHandle(cpu_heap.get(), 2 * index),
           resources[index].get(), first_clear.data(), 0, nullptr);
     }
     D3D12TestContext::UavBarrier(context_.list(),
                                  global_barrier ? nullptr : resources[0].get());
     for (UINT index = 0; index < resource_count; ++index) {
       context_.list()->ClearUnorderedAccessViewUint(
-          context_.GpuDescriptorHandle(heap.get(), 2 * index + 1),
-          context_.CpuDescriptorHandle(heap.get(), 2 * index + 1),
+          context_.GpuDescriptorHandle(gpu_heap.get(), 2 * index + 1),
+          context_.CpuDescriptorHandle(cpu_heap.get(), 2 * index + 1),
           resources[index].get(), second_clear.data(), 0, nullptr);
       D3D12TestContext::Transition(context_.list(), resources[index].get(),
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

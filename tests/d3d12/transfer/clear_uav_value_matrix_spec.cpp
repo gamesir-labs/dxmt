@@ -45,22 +45,28 @@ TEST_P(ClearUavValueMatrixSpec, ClearsTypedUintBufferToRequestedValue) {
       kCount * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  auto heap = context_.CreateDescriptorHeap(
+  auto gpu_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
   ASSERT_TRUE(buffer);
-  ASSERT_TRUE(heap);
+  ASSERT_TRUE(gpu_heap);
+  ASSERT_TRUE(cpu_heap);
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
   uav.Format = DXGI_FORMAT_R32_UINT;
   uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   uav.Buffer.NumElements = kCount;
   context_.device()->CreateUnorderedAccessView(
       buffer.get(), nullptr, &uav,
-      heap->GetCPUDescriptorHandleForHeapStart());
-  ID3D12DescriptorHeap *heaps[] = {heap.get()};
+      gpu_heap->GetCPUDescriptorHandleForHeapStart());
+  context_.device()->CreateUnorderedAccessView(
+      buffer.get(), nullptr, &uav,
+      cpu_heap->GetCPUDescriptorHandleForHeapStart());
+  ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
   context_.list()->SetDescriptorHeaps(1, heaps);
   context_.list()->ClearUnorderedAccessViewUint(
-      heap->GetGPUDescriptorHandleForHeapStart(),
-      heap->GetCPUDescriptorHandleForHeapStart(), buffer.get(),
+      gpu_heap->GetGPUDescriptorHandleForHeapStart(),
+      cpu_heap->GetCPUDescriptorHandleForHeapStart(), buffer.get(),
       test.values.data(), 0, nullptr);
   D3D12TestContext::Transition(
       context_.list(), buffer.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

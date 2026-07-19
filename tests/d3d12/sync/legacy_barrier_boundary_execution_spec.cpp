@@ -78,8 +78,11 @@ TEST_P(LegacyBarrierEntryBoundaryExecutionSpec,
       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   auto uav_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+  auto uav_cpu_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
   ASSERT_TRUE(uav_resource);
   ASSERT_TRUE(uav_heap);
+  ASSERT_TRUE(uav_cpu_heap);
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
   uav.Format = DXGI_FORMAT_R32_UINT;
   uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -87,12 +90,15 @@ TEST_P(LegacyBarrierEntryBoundaryExecutionSpec,
   context_.device()->CreateUnorderedAccessView(
       uav_resource.get(), nullptr, &uav,
       uav_heap->GetCPUDescriptorHandleForHeapStart());
+  context_.device()->CreateUnorderedAccessView(
+      uav_resource.get(), nullptr, &uav,
+      uav_cpu_heap->GetCPUDescriptorHandleForHeapStart());
   ID3D12DescriptorHeap *bound_heaps[] = {uav_heap.get()};
   context_.list()->SetDescriptorHeaps(1, bound_heaps);
   const std::array<UINT, 4> first_clear = {kFirstUavValue, 0, 0, 0};
   context_.list()->ClearUnorderedAccessViewUint(
       uav_heap->GetGPUDescriptorHandleForHeapStart(),
-      uav_heap->GetCPUDescriptorHandleForHeapStart(), uav_resource.get(),
+      uav_cpu_heap->GetCPUDescriptorHandleForHeapStart(), uav_resource.get(),
       first_clear.data(), 0, nullptr);
 
   std::vector<D3D12_RESOURCE_BARRIER> barriers;
@@ -145,7 +151,7 @@ TEST_P(LegacyBarrierEntryBoundaryExecutionSpec,
   const std::array<UINT, 4> final_clear = {kFinalUavValue, 0, 0, 0};
   context_.list()->ClearUnorderedAccessViewUint(
       uav_heap->GetGPUDescriptorHandleForHeapStart(),
-      uav_heap->GetCPUDescriptorHandleForHeapStart(), uav_resource.get(),
+      uav_cpu_heap->GetCPUDescriptorHandleForHeapStart(), uav_resource.get(),
       final_clear.data(), 0, nullptr);
   D3D12TestContext::Transition(
       context_.list(), uav_resource.get(),

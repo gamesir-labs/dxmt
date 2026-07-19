@@ -119,19 +119,25 @@ protected:
     auto texture = CreateTexture(operation.format,
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                  D3D12_RESOURCE_STATE_COPY_DEST);
-    auto heap = context_.CreateDescriptorHeap(
+    auto gpu_heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
+    auto cpu_heap = context_.CreateDescriptorHeap(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
     ASSERT_TRUE(texture);
-    ASSERT_TRUE(heap);
+    ASSERT_TRUE(gpu_heap);
+    ASSERT_TRUE(cpu_heap);
     ASSERT_TRUE(SUCCEEDED(InitializeTexture(texture.get())));
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = operation.format;
     view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-    const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    const auto gpu_cpu = gpu_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto cpu = cpu_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto gpu = gpu_heap->GetGPUDescriptorHandleForHeapStart();
+    context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &view,
+                                                 gpu_cpu);
     context_.device()->CreateUnorderedAccessView(texture.get(), nullptr, &view,
                                                  cpu);
-    ID3D12DescriptorHeap *heaps[] = {heap.get()};
+    ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
     context_.list()->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
     D3D12TestContext::Transition(context_.list(), texture.get(),
                                  D3D12_RESOURCE_STATE_COPY_DEST,
