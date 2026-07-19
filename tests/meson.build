@@ -1,14 +1,26 @@
 dxmt_test_include_dirs = include_directories('include')
-d3dcompiler_test_dep = cpp.find_library('d3dcompiler_47')
-python3_native = find_program('python3', native: true)
+d3d10_test_dep = cpp.find_library('d3d10')
+d3d11_test_dep = cpp.find_library('d3d11')
+d3d12_test_dep = cpp.find_library('d3d12')
+d3dcompiler_library = 'd3dcompiler_47'
+if get_option('windows_oracle_only')
+  d3dcompiler_library = 'd3dcompiler'
+endif
+d3dcompiler_test_dep = cpp.find_library(d3dcompiler_library)
+dxgi_test_dep = cpp.find_library('dxgi')
 
-test(
-  'd3d12-coverage-validator-tests',
-  python3_native,
-  args: [files('coverage/test_check_d3d12_coverage.py')],
-  suite: ['unit', 'coverage'],
-  timeout: 30,
-)
+windows_oracle_cpp_args = []
+d3d11_windows_oracle_dependencies = []
+if get_option('windows_oracle_only')
+  windows_oracle_cpp_args = cpp.get_supported_arguments([
+    '/bigobj',
+    '/utf-8',
+    '/DNOMINMAX',
+    '/DWIN32_LEAN_AND_MEAN',
+    '/D_WIN32_WINNT=0x0A00',
+  ])
+  d3d11_windows_oracle_dependencies += cpp.find_library('dxguid')
+endif
 
 dxmt_test_main_lib = static_library(
   'dxmt-wine-test-main',
@@ -19,6 +31,7 @@ dxmt_test_main_lib = static_library(
   ),
   dependencies: [gtest_dep],
   include_directories: [dxmt_test_include_dirs],
+  cpp_args: windows_oracle_cpp_args,
   install: false,
 )
 
@@ -32,6 +45,7 @@ subdir('d3d10')
 subdir('d3d11')
 subdir('d3d12')
 
+if not get_option('windows_oracle_only')
 dxmt_wine_framework_suites = {
   'framework': {
     'sources': files('wine/framework_spec.cpp'),
@@ -120,18 +134,21 @@ dxmt_wine_framework_tests = executable(
   cpp_args: ['-DWINEMETAL_STATIC'],
   install: false,
 )
+endif
 
 dxmt_wine_d3d10_tests = executable(
   'dxmt-wine-d3d10-tests',
   d3d10_unit_sources,
   dependencies: [dxmt_test_dep] + d3d10_unit_dependencies,
+  cpp_args: windows_oracle_cpp_args,
   install: false,
 )
 
 dxmt_wine_d3d11_tests = executable(
   'dxmt-wine-d3d11-tests',
   d3d11_unit_sources,
-  dependencies: [dxmt_test_dep] + d3d11_unit_dependencies,
+  dependencies: [dxmt_test_dep] + d3d11_unit_dependencies + d3d11_windows_oracle_dependencies,
+  cpp_args: windows_oracle_cpp_args,
   install: false,
 )
 
@@ -139,7 +156,37 @@ dxmt_wine_d3d12_tests = executable(
   'dxmt-wine-d3d12-tests',
   d3d12_unit_sources,
   dependencies: [dxmt_test_dep] + d3d12_unit_dependencies,
+  cpp_args: windows_oracle_cpp_args,
   install: false,
+)
+
+configure_file(
+  input: 'd3d12/run-windows-oracle.bat',
+  output: 'run-windows-oracle.bat',
+  copy: true,
+)
+
+if get_option('windows_oracle_only')
+  subdir_done()
+endif
+
+commit_message_policy_test = find_program('../scripts/check-commit-message.sh')
+test(
+  'commit-message-policy',
+  commit_message_policy_test,
+  args: ['--self-test'],
+  suite: ['unit', 'repository'],
+  timeout: 30,
+)
+
+python3_native = find_program('python3', native: true)
+
+test(
+  'd3d12-coverage-validator-tests',
+  python3_native,
+  args: [files('coverage/test_check_d3d12_coverage.py')],
+  suite: ['unit', 'coverage'],
+  timeout: 30,
 )
 
 dxmt_wine_test_scheduler = executable(

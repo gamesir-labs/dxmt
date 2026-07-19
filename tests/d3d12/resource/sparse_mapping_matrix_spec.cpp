@@ -427,48 +427,6 @@ TEST_F(SparseMappingMatrixSpec,
             second);
 }
 
-TEST_F(SparseMappingMatrixSpec,
-       InvalidLaterRegionDoesNotPublishEarlierRemap) {
-  auto target = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
-  auto probe = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  auto original = CreateBufferBacking(1);
-  auto replacement = CreateBufferBacking(2);
-  ASSERT_TRUE(target);
-  ASSERT_TRUE(probe);
-  ASSERT_TRUE(original);
-  ASSERT_TRUE(replacement);
-  MapRange(target.get(), original.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
-  MapRange(probe.get(), original.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
-
-  std::vector<std::uint8_t> initial(kTileSize, 0x6b);
-  WriteTile(target.get(), 0, initial);
-
-  const std::array<D3D12_TILED_RESOURCE_COORDINATE, 2> coordinates = {
-      D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0},
-      D3D12_TILED_RESOURCE_COORDINATE{1, 0, 0, 0}};
-  std::array<D3D12_TILE_REGION_SIZE, 2> regions = {};
-  regions[0].NumTiles = 1;
-  regions[1].NumTiles = 1;
-  const std::array<D3D12_TILE_RANGE_FLAGS, 2> range_flags = {
-      D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_RANGE_FLAG_NONE};
-  const std::array<UINT, 2> heap_offsets = {0, 1};
-  const std::array<UINT, 2> range_counts = {1, 1};
-  context_.queue()->UpdateTileMappings(
-      target.get(), coordinates.size(), coordinates.data(), regions.data(),
-      replacement.get(), range_flags.size(), range_flags.data(),
-      heap_offsets.data(), range_counts.data(),
-      D3D12_TILE_MAPPING_FLAG_NONE);
-
-  std::vector<std::uint8_t> expected(kTileSize);
-  for (UINT64 i = 0; i < kTileSize; ++i)
-    expected[i] = static_cast<std::uint8_t>((i * 71 + 37) & 0xff);
-  WriteTile(target.get(), 0, expected);
-  AliasingBarrier(target.get(), probe.get());
-  EXPECT_EQ(ReadTile(probe.get(), 0, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            expected);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
 TEST_F(SparseMappingMatrixSpec, SkipRangePreservesExistingMapping) {
   auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBacking(1);

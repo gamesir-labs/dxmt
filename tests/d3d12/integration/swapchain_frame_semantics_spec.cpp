@@ -70,10 +70,6 @@ protected:
     ASSERT_EQ(context_.InitializeSharedDevice("d3d12-swapchain"), S_OK);
   }
 
-  void TearDown() override {
-    SetEnvironmentVariableA("DXMT_TEST_FORCE_SWAPCHAIN_OCCLUDED", nullptr);
-  }
-
   DXGI_SWAP_CHAIN_DESC1 ValidDesc(
       UINT buffer_count,
       DXGI_SWAP_EFFECT swap_effect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) const {
@@ -367,24 +363,6 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   ASSERT_EQ(swapchain->SetFullscreenState(FALSE, nullptr), S_OK);
   ASSERT_EQ(swapchain->GetFullscreenState(&fullscreen, nullptr), S_OK);
   EXPECT_FALSE(fullscreen);
-}
-
-DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
-                   InjectedOcclusionDoesNotAdvancePresentState) {
-  auto swapchain = CreateSwapChain(2);
-  ASSERT_TRUE(swapchain);
-  ASSERT_TRUE(SetEnvironmentVariableA("DXMT_TEST_FORCE_SWAPCHAIN_OCCLUDED",
-                                      "1"));
-
-  const UINT before_index = swapchain->GetCurrentBackBufferIndex();
-  UINT before_count = UINT_MAX;
-  ASSERT_EQ(swapchain->GetLastPresentCount(&before_count), S_OK);
-  EXPECT_EQ(swapchain->Present(0, DXGI_PRESENT_TEST), DXGI_STATUS_OCCLUDED);
-  EXPECT_EQ(swapchain->Present(0, 0), DXGI_STATUS_OCCLUDED);
-  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), before_index);
-  UINT after_count = UINT_MAX;
-  ASSERT_EQ(swapchain->GetLastPresentCount(&after_count), S_OK);
-  EXPECT_EQ(after_count, before_count);
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,

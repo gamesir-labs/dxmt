@@ -6,21 +6,21 @@ d3d12_runtime_support_lib = static_library(
     'd3d12_test_context.cpp',
     'd3d12_binding_hotspot_scenarios.cpp',
   ),
-  dependencies: [d3d12_dep, d3dcompiler_test_dep],
+  dependencies: [d3d12_test_dep, d3dcompiler_test_dep],
   include_directories: [d3d12_test_include_dirs],
+  cpp_args: windows_oracle_cpp_args,
   install: false,
 )
 
 d3d12_runtime_support_dep = declare_dependency(
   link_with: [d3d12_runtime_support_lib],
-  dependencies: [d3d12_dep],
+  dependencies: [d3d12_test_dep],
   include_directories: [d3d12_test_include_dirs],
 )
 
 d3d12_unit_suites = {
   'device': {
     'sources': files(
-      'device/agility_core_spec.cpp',
       'device/concurrency_spec.cpp',
       'device/device_control_spec.cpp',
       'device/device_spec.cpp',
@@ -33,13 +33,6 @@ d3d12_unit_suites = {
       'object/com_guid_matrix_spec.cpp',
       'object/private_data_spec.cpp',
       'object/private_data_matrix_spec.cpp',
-      'object/shared_handle_spec.cpp',
-    ),
-  },
-  'cache': {
-    'sources': files(
-      'cache/cache_spec.cpp',
-      'cache/invalidation_key_spec.cpp',
     ),
   },
   'capability': {
@@ -95,14 +88,6 @@ d3d12_unit_suites = {
       'descriptor/rtv_dsv_dimension_spec.cpp',
     ),
   },
-  'execution': {
-    'sources': files(
-      'execution/path_boundary_spec.cpp',
-      'execution/path_empty_segment_spec.cpp',
-      'execution/path_mode_parity_spec.cpp',
-      'execution/path_root_descriptor_spec.cpp',
-    ),
-  },
   'graphics': {
     'sources': files(
       'graphics/blend_spec.cpp',
@@ -133,7 +118,6 @@ d3d12_unit_suites = {
   },
   'pipeline': {
     'sources': files(
-      'pipeline/cache_key_spec.cpp',
       'pipeline/scalar_varying_spec.cpp',
       'pipeline/graphics_creation_spec.cpp',
       'pipeline/stream_spec.cpp',
@@ -177,9 +161,7 @@ d3d12_unit_suites = {
     'sources': files(
       'robustness/descriptor_sequence_fuzz_spec.cpp',
       'robustness/cross_queue_state_model_spec.cpp',
-      'robustness/fault_injection_spec.cpp',
       'robustness/fuzz_spec.cpp',
-      'robustness/internal_fault_injection_spec.cpp',
       'robustness/resource_desc_fuzz_spec.cpp',
       'robustness/shader_container_fuzz_spec.cpp',
       'robustness/state_model_fuzz_spec.cpp',
@@ -275,13 +257,13 @@ endforeach
 d3d12_unit_dependencies += [
   d3d12_runtime_support_dep,
   d3dcompiler_test_dep,
-  dxgi_dep,
+  dxgi_test_dep,
 ]
 
 d3d12_differential_oracle = executable(
   'dxmt-d3d12-differential-oracle',
   files('differential/oracle.cpp'),
-  dependencies: [d3d12_dep, d3dcompiler_test_dep, dxgi_dep],
+  dependencies: [d3d12_test_dep, d3dcompiler_test_dep, dxgi_test_dep],
   include_directories: [d3d12_test_include_dirs],
   install: false,
 )

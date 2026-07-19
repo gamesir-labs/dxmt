@@ -185,7 +185,7 @@ protected:
 
 TEST_F(FormatMsaaExecutionSpec,
        EveryAdvertisedTwoFourAndEightSampleModeUsesPerSampleOutput) {
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
       D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
       D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;

@@ -165,6 +165,57 @@ GoogleTest filters. `DXMT_TEST_CASE_ID` provides the environment equivalent,
 and the documented replay spelling `--dxmt_case_id=` remains accepted. Worker
 failure summaries print the CaseId before the assertion diagnostic.
 
+### Native Windows behavior oracle
+
+The D3D10, D3D11, and D3D12 test executables are standalone x86-64 Windows
+PEs. Copy them without any DXMT runtime DLLs so the loader selects the system
+Direct3D and DXGI implementations. The scheduler uses Win32 `CreateProcessW`
+and therefore works unchanged outside Wine.
+
+Run one public D3D12 behavior case against the default adapter with:
+
+```powershell
+.\dxmt-wine-d3d12-tests.exe --dxmt-test-jobs=1 `
+  --dxmt-case-id=D3D12.SparseMappingMatrixSpec.MapsMoreThanThirtyTwoDisjointRanges
+```
+
+Set `DXMT_TEST_WINDOWS_ADAPTER=warp` before launching to select Microsoft WARP.
+Set `DXMT_TEST_WINDOWS_DEBUG_LAYER=1` to enable the D3D12 debug layer before
+device creation; this requires the Windows Graphics Tools optional feature.
+If the requested debug layer is unavailable, device initialization fails
+instead of silently running without validation. Debug-layer messages are copied
+from `ID3D12InfoQueue1` to standard error so redirected oracle logs retain the
+message severity, category, ID, and description.
+
+The builder places `run-windows-oracle.bat` beside all three executables. The
+default invocation runs the complete D3D10 and D3D11 suites on the default
+Windows adapter, followed by the complete D3D12 suite on WARP. It
+writes per-API logs plus shared metadata under `windows-oracle-results`. The
+banner and metadata identify this contract as suite schema `public-api-v1`:
+
+```bat
+run-windows-oracle.bat
+run-windows-oracle.bat --debug
+run-windows-oracle.bat --hardware
+run-windows-oracle.bat --case D3D12.ClearUavSpec.ClearTexture3DSliceRange
+```
+
+`--debug` runs the complete D3D12 suite in one worker with the debug layer so
+validation messages are not lost across scheduler child processes. `--case`
+runs only the named D3D12 CaseId.
+
+Create a transfer-ready ZIP containing all three EXEs, the script,
+instructions, and checksums with:
+
+```sh
+scripts/dxmt-builder package --profile gcc-x64-release-full windows-oracle
+```
+
+The D3D suites must use only public Direct3D and DXGI APIs and must run under
+the native Windows runtime. DXMT-private exports, backend fault injection,
+implementation cache keys, and unportable invalid-input probes do not belong in
+these suites.
+
 Batched tests may register stable logical CaseIds below the outer GoogleTest.
 The copy matrix exposes `D3D12.Copy.Buffer.ShuffledRegion.0000` through
 `.4095`, and the uint arithmetic matrix exposes

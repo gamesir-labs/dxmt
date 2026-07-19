@@ -515,7 +515,7 @@ TEST_F(FormatExecutionMatrixSpec,
       FormatLoadCase{DXGI_FORMAT_R16G16B16A16_SINT, ShaderValueType::Sint,
                      "Rgba16Sint"},
   };
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
   UINT executed = 0;
   UINT skipped = 0;
@@ -536,7 +536,7 @@ TEST_F(FormatExecutionMatrixSpec,
 TEST_F(FormatExecutionMatrixSpec,
        AdvertisedTexture1DLoadCreatesViewExecutesAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_UINT;
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
   const auto support = Support(format);
   if ((support.Support1 & required) != required)
@@ -572,7 +572,7 @@ TEST_F(FormatExecutionMatrixSpec,
 TEST_F(FormatExecutionMatrixSpec,
        AdvertisedTexture3DLoadCreatesViewExecutesAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_UINT;
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
   const auto support = Support(format);
   if ((support.Support1 & required) != required)
@@ -611,7 +611,7 @@ TEST_F(FormatExecutionMatrixSpec,
 TEST_F(FormatExecutionMatrixSpec,
        AdvertisedTypedBufferLoadCreatesViewExecutesAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_UINT;
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
   const auto support = Support(format);
   if ((support.Support1 & required) != required)
@@ -651,10 +651,10 @@ TEST_F(FormatExecutionMatrixSpec,
        AdvertisedR8UintTypedUavLoadsStoresAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R8_UINT;
   const auto support = Support(format);
-  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+  const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_BUFFER |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+  const D3D12_FORMAT_SUPPORT2 required2 =
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
   if ((support.Support1 & required1) != required1 ||
@@ -668,10 +668,10 @@ TEST_F(FormatExecutionMatrixSpec,
        AdvertisedR16UintTypedUavLoadsStoresAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R16_UINT;
   const auto support = Support(format);
-  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+  const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_BUFFER |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+  const D3D12_FORMAT_SUPPORT2 required2 =
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
   if ((support.Support1 & required1) != required1 ||
@@ -686,10 +686,10 @@ TEST_F(FormatExecutionMatrixSpec,
        AdvertisedR32UintTypedUavLoadsStoresAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_UINT;
   const auto support = Support(format);
-  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+  const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_BUFFER |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+  const D3D12_FORMAT_SUPPORT2 required2 =
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
   if ((support.Support1 & required1) != required1 ||
@@ -705,7 +705,7 @@ TEST_F(FormatExecutionMatrixSpec,
        AdvertisedMsaaRenderTargetDrawsResolvesAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
   const auto support = Support(format);
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
       D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
@@ -767,7 +767,7 @@ TEST_F(FormatExecutionMatrixSpec,
        AdvertisedRgba16FloatRenderTargetDrawsAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT;
   const auto support = Support(format);
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if ((support.Support1 & required) != required)
@@ -815,10 +815,10 @@ TEST_F(FormatExecutionMatrixSpec,
   constexpr DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT;
   const auto color_support = Support(color_format);
   const auto depth_support = Support(depth_format);
-  constexpr D3D12_FORMAT_SUPPORT1 color_required =
+  const D3D12_FORMAT_SUPPORT1 color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  constexpr D3D12_FORMAT_SUPPORT1 depth_required =
+  const D3D12_FORMAT_SUPPORT1 depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if ((color_support.Support1 & color_required) != color_required ||
@@ -891,7 +891,7 @@ TEST_F(FormatExecutionMatrixSpec,
 TEST_F(FormatExecutionMatrixSpec,
        AdvertisedTextureCubeSampleCreatesViewExecutesAndReadsBack) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT;
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
       D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
   const auto support = Support(format);
@@ -936,7 +936,7 @@ TEST_F(FormatExecutionMatrixSpec,
 TEST_F(FormatExecutionMatrixSpec,
        InvalidViewDoesNotMutateResourceAndValidRewriteExecutes) {
   constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_UINT;
-  constexpr D3D12_FORMAT_SUPPORT1 required =
+  const D3D12_FORMAT_SUPPORT1 required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
   const auto support = Support(format);
   if ((support.Support1 & required) != required)

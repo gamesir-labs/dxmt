@@ -307,7 +307,7 @@ TEST_F(D3D12FeatureQueryInvalidInputSpec,
 
 TEST_F(D3D12FeatureQueryInvalidInputSpec,
        FeatureLevelsIgnoresUnknownAndDuplicateEntries) {
-  constexpr std::array<D3D_FEATURE_LEVEL, 4> levels = {
+  const std::array<D3D_FEATURE_LEVEL, 4> levels = {
       static_cast<D3D_FEATURE_LEVEL>(0x7fffffff),
       D3D_FEATURE_LEVEL_11_0,
       D3D_FEATURE_LEVEL_12_0,

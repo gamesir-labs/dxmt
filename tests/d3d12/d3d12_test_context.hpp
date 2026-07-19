@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -84,7 +85,11 @@ public:
   ID3D12GraphicsCommandList *list() const { return list_.get(); }
 
 private:
+  void RegisterDebugMessageCallback();
+
   ComPtr<ID3D12Device> device_;
+  ComPtr<ID3D12InfoQueue1> debug_info_queue_;
+  DWORD debug_callback_cookie_ = 0;
   ComPtr<ID3D12CommandQueue> queue_;
   ComPtr<ID3D12CommandAllocator> allocator_;
   ComPtr<ID3D12GraphicsCommandList> list_;

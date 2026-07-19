@@ -10,12 +10,6 @@
 #include <cstring>
 #include <iomanip>
 
-extern "C" HRESULT WINAPI D3D10CoreCreateDevice(IDXGIFactory *factory,
-                                                IDXGIAdapter *adapter,
-                                                UINT flags,
-                                                D3D_FEATURE_LEVEL feature_level,
-                                                ID3D10Device **device);
-
 namespace {
 
 template <typename T> void release_object(T *&object) {
@@ -36,29 +30,15 @@ template <typename T> void release_object(T *&object) {
 class D3D10CoreDeviceSpec : public ::testing::Test {
 protected:
   void SetUp() override {
-    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
-                                    reinterpret_cast<void **>(&factory_));
-    ASSERT_TRUE(HResultSucceeded(hr));
-    ASSERT_NE(factory_, nullptr);
-
-    hr = factory_->EnumAdapters(0, &adapter_);
-    ASSERT_TRUE(HResultSucceeded(hr));
-    ASSERT_NE(adapter_, nullptr);
-
-    hr = D3D10CoreCreateDevice(factory_, adapter_, 0, D3D_FEATURE_LEVEL_10_0,
-                               &device_);
+    const HRESULT hr =
+        D3D10CreateDevice(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                          D3D10_SDK_VERSION, &device_);
     ASSERT_TRUE(HResultSucceeded(hr));
     ASSERT_NE(device_, nullptr);
   }
 
-  void TearDown() override {
-    release_object(device_);
-    release_object(adapter_);
-    release_object(factory_);
-  }
+  void TearDown() override { release_object(device_); }
 
-  IDXGIFactory1 *factory_ = nullptr;
-  IDXGIAdapter *adapter_ = nullptr;
   ID3D10Device *device_ = nullptr;
 };
 

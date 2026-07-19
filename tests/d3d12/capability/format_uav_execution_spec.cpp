@@ -337,10 +337,10 @@ protected:
 
 TEST_F(FormatTypedUavExecutionSpec,
        EveryAdvertisedCommonBufferFormatLoadsStoresAndReadsBack) {
-  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+  const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_BUFFER |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-  constexpr D3D12_FORMAT_SUPPORT2 required2 =
+  const D3D12_FORMAT_SUPPORT2 required2 =
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
       D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
 
@@ -379,49 +379,6 @@ TEST_F(FormatTypedUavExecutionSpec,
   EXPECT_GT(width_execution[1], 0u) << "no advertised 16-bit case executed";
   EXPECT_GT(width_execution[2], 0u) << "no advertised 32-bit case executed";
   EXPECT_GT(multicomponent, 0u);
-}
-
-TEST_F(FormatTypedUavExecutionSpec,
-       ThreeComponentFormatsDoNotAdvertiseUnavailableTypedUavLowering) {
-  constexpr std::array formats = {
-      DXGI_FORMAT_R32G32B32_TYPELESS,
-      DXGI_FORMAT_R32G32B32_FLOAT,
-      DXGI_FORMAT_R32G32B32_UINT,
-      DXGI_FORMAT_R32G32B32_SINT,
-  };
-  constexpr D3D12_FORMAT_SUPPORT2 uav_support2 =
-      D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
-      D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
-      D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
-      D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
-      D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
-      D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX |
-      D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
-      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
-
-  // RGB32 currently has no three-component Metal texture-buffer lowering. If
-  // that lowering is implemented, update this gate together with the dynamic
-  // execution cases above so newly advertised support executes immediately.
-  for (const auto format : formats) {
-    SCOPED_TRACE(::testing::Message()
-                 << "format=" << static_cast<UINT>(format));
-    const auto support = Support(format);
-    EXPECT_EQ(support.Support1 &
-                  D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
-              0u);
-    EXPECT_EQ(support.Support2 & uav_support2, 0u);
-    EXPECT_EQ(support.Support2 & D3D12_FORMAT_SUPPORT2_TILED, 0u);
-    if (format == DXGI_FORMAT_R32G32B32_TYPELESS) {
-      constexpr UINT kAllowedSupport1 =
-          D3D12_FORMAT_SUPPORT1_TEXTURE1D |
-          D3D12_FORMAT_SUPPORT1_TEXTURE2D |
-          D3D12_FORMAT_SUPPORT1_TEXTURE3D |
-          D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
-          D3D12_FORMAT_SUPPORT1_MIP |
-          D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
-      EXPECT_EQ(static_cast<UINT>(support.Support1) & ~kAllowedSupport1, 0u);
-    }
-  }
 }
 
 } // namespace

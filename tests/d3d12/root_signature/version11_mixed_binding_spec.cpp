@@ -505,7 +505,7 @@ TEST_P(RootSignatureVersion11MixedBindingSpec,
   ASSERT_EQ(version10_deserializer->GetRootSignatureDescAtVersion(
                 D3D_ROOT_SIGNATURE_VERSION_1_1, &promoted_view),
             S_OK);
-  constexpr auto implicit_table_flags =
+  const auto implicit_table_flags =
       static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(
           D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
           D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);

@@ -34,9 +34,6 @@ BindingHotspotError
 RunTypedBufferDescriptorScenario(BindingHotspotMeasurement *measurement);
 
 BindingHotspotError
-RunSharedDescriptorResidencyScenario(BindingHotspotMeasurement *measurement);
-
-BindingHotspotError
 RunRootTableInvalidationScenario(BindingHotspotMeasurement *measurement);
 
 BindingHotspotError

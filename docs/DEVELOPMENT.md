@@ -83,7 +83,16 @@ The `commit-msg` hook validates new commits immediately. The `pre-push` hook
 validates every commit included in the outgoing ref updates, so commits created
 through amend, rebase, cherry-pick, or a bypassed commit hook are checked before
 they reach the remote. Subjects must use `type(scope): subject`, for example
-`fix(builder): validate commit messages before push`.
+`fix(builder): validate commit messages before push`. Both `type` and `scope`
+must be selected from the reviewed repository keywords in
+`scripts/conventional-commit-keywords.sh`; arbitrary keywords, compound scopes,
+and spelling or case variants are rejected. Additions to the vocabulary must be
+reviewed in that file before they can be used in a commit.
+
+The type describes the kind of change, while the scope names the affected
+module or feature domain. Do not repeat a type as a scope: use `test(d3d11)`
+rather than `test(test)`. CI is a repository subsystem, so use `chore(ci)`,
+`perf(ci)`, or `fix(ci)` rather than using `ci` as the type.
 
 ## Setup LLVM
 

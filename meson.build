@@ -20,6 +20,15 @@ if cpu_family != 'x86' and cpu_family != 'x86_64'
   error('DXMT currently supports only x86 and x86_64 targets')
 endif
 
+if get_option('windows_oracle_only')
+  if host_machine.system() != 'windows' or dxmt_crossbuild
+    error('windows_oracle_only requires a native Windows build')
+  endif
+  subdir('external/googletest')
+  subdir('tests')
+  subdir_done()
+endif
+
 dxmt_include_dirs = [
   './include',
   './libs'

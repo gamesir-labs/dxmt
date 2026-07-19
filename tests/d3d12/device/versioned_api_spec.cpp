@@ -740,7 +740,7 @@ TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
   desc.Flags = D3D12_SHADER_CACHE_FLAG_NONE;
   constexpr std::array modes = {D3D12_SHADER_CACHE_MODE_MEMORY,
                                 D3D12_SHADER_CACHE_MODE_DISK};
-  constexpr std::array flags = {
+  const std::array flags = {
       D3D12_SHADER_CACHE_FLAG_NONE,
       D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED,
       D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR,
@@ -786,12 +786,12 @@ TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
             E_INVALIDARG);
   EXPECT_EQ(output, nullptr);
 
-  constexpr auto kinds = static_cast<D3D12_SHADER_CACHE_KIND_FLAGS>(
+  const auto kinds = static_cast<D3D12_SHADER_CACHE_KIND_FLAGS>(
       D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER |
       D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS |
       D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED |
       D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED);
-  constexpr std::array valid_controls = {
+  const std::array valid_controls = {
       D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
       D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE,
       D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR,
@@ -806,7 +806,7 @@ TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
     EXPECT_EQ(device9->ShaderCacheControl(kinds, control), S_OK)
         << "control=" << control;
 
-  constexpr std::array invalid_controls = {
+  const std::array invalid_controls = {
       static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(0),
       static_cast<D3D12_SHADER_CACHE_CONTROL_FLAGS>(
           D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE |

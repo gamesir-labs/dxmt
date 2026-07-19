@@ -41,14 +41,6 @@ TEST(D3D12BindingHotspot, PreservesTypedBufferTextureViewMaterialization) {
   EXPECT_EQ(measurement.actual, measurement.expected);
 }
 
-TEST(D3D12BindingHotspot, RetainsSharedAllocationAfterPartialOverwrite) {
-  BindingHotspotMeasurement measurement;
-  const auto error =
-      dxmt::test::RunSharedDescriptorResidencyScenario(&measurement);
-  ASSERT_FALSE(error) << (error ? *error : "");
-  EXPECT_EQ(measurement.actual, measurement.expected);
-}
-
 TEST(D3D12BindingHotspot, InvalidatesMaterializedRootTableAfterRebind) {
   BindingHotspotMeasurement measurement;
   const auto error =

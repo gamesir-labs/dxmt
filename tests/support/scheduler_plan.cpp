@@ -33,6 +33,16 @@ bool MatchesAny(std::string_view patterns, std::string_view value) {
   return false;
 }
 
+std::size_t FilterLength(const TestShard &shard) {
+  if (shard.tests.empty())
+    return 0;
+
+  std::size_t length = shard.tests.size() - 1;
+  for (const auto &name : shard.tests)
+    length += name.size();
+  return length;
+}
+
 } // namespace
 
 bool GlobMatches(std::string_view pattern, std::string_view value) {
@@ -347,8 +357,9 @@ BuildSerialShardWaves(const std::vector<TestShard> &shards,
 }
 
 std::vector<TestShard> BuildTestShards(std::vector<ScheduledTest> tests,
-                                       std::size_t worker_count) {
-  if (tests.empty() || worker_count == 0)
+                                       std::size_t worker_count,
+                                       std::size_t maximum_filter_length) {
+  if (tests.empty() || worker_count == 0 || maximum_filter_length == 0)
     return {};
 
   worker_count = std::min(worker_count, tests.size());
@@ -359,13 +370,27 @@ std::vector<TestShard> BuildTestShards(std::vector<ScheduledTest> tests,
 
   std::vector<TestShard> shards(worker_count);
   for (auto &test : tests) {
-    const auto shard =
-        std::min_element(shards.begin(), shards.end(),
-                         [](const TestShard &left, const TestShard &right) {
-                           if (left.estimated_cost != right.estimated_cost)
-                             return left.estimated_cost < right.estimated_cost;
-                           return left.tests.size() < right.tests.size();
-                         });
+    const auto fits = [&](const TestShard &shard) {
+      if (shard.tests.empty())
+        return true;
+      return FilterLength(shard) + 1 + test.name.size() <=
+             maximum_filter_length;
+    };
+    auto shard = std::min_element(
+        shards.begin(), shards.end(), [&](const TestShard &left,
+                                          const TestShard &right) {
+          const bool left_fits = fits(left);
+          const bool right_fits = fits(right);
+          if (left_fits != right_fits)
+            return left_fits;
+          if (left.estimated_cost != right.estimated_cost)
+            return left.estimated_cost < right.estimated_cost;
+          return left.tests.size() < right.tests.size();
+        });
+    if (!fits(*shard)) {
+      shards.emplace_back();
+      shard = std::prev(shards.end());
+    }
     shard->estimated_cost += test.cost;
     shard->tests.push_back(std::move(test.name));
   }

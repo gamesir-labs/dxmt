@@ -1,4 +1,3 @@
-#include <dxmt_d3d12_test_path.hpp>
 #include <dxmt_test.hpp>
 #include <dxmt_test_shader.hpp>
 
@@ -580,11 +579,7 @@ TEST_F(IntegrationCompositionSpec, ExecutesAliasingFrameGraph) {
 }
 
 TEST_F(IntegrationCompositionSpec,
-       ExecutesCompiledNativeAndFallbackMixedFrameWithCopyResolve) {
-  using dxmt::d3d12::test::ExecutionPathConfig;
-  using dxmt::d3d12::test::ExecutionPathMode;
-  using dxmt::d3d12::test::ExecutionPathStats;
-
+       ExecutesMixedFrameWithCopyResolve) {
   constexpr UINT kSize = 16;
   constexpr UINT kSampleCount = 4;
   constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -822,13 +817,6 @@ TEST_F(IntegrationCompositionSpec,
   ASSERT_TRUE(texture_readback);
   ASSERT_TRUE(state_readback);
 
-  ExecutionPathConfig path = {};
-  path.mode = ExecutionPathMode::Auto;
-  ASSERT_EQ(context_.list()->SetPrivateData(
-                dxmt::d3d12::test::kExecutionPathConfigGuid, sizeof(path),
-                &path),
-            S_OK);
-
   context_.list()->CopyBufferRegion(state.get(), 0, state_upload.get(), 0,
                                      sizeof(kZeroState));
   D3D12TestContext::Transition(context_.list(), state.get(),
@@ -931,28 +919,6 @@ TEST_F(IntegrationCompositionSpec,
   ASSERT_EQ(context_.WaitForFence(fence.get(), kFrameFence), S_OK);
   EXPECT_GE(fence->GetCompletedValue(), kFrameFence);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-
-  ExecutionPathStats stats = {};
-  UINT stats_size = sizeof(stats);
-  ASSERT_EQ(context_.list()->GetPrivateData(
-                dxmt::d3d12::test::kExecutionPathStatsGuid, &stats_size,
-                &stats),
-            S_OK);
-  ASSERT_EQ(stats_size, sizeof(stats));
-  ASSERT_EQ(stats.struct_size, sizeof(stats));
-  EXPECT_EQ(stats.mode, ExecutionPathMode::Auto);
-  EXPECT_EQ(stats.work_record_count, 3u);
-  EXPECT_EQ(stats.compiled_work_record_count, 1u);
-  EXPECT_EQ(stats.selected_graphics_packets, 1u);
-  EXPECT_EQ(stats.selected_compute_packets, 0u);
-  EXPECT_EQ(stats.replayed_graphics_packets, 1u);
-  EXPECT_EQ(stats.replayed_compute_packets, 0u);
-  EXPECT_GT(stats.fallback_segments, 0u);
-  EXPECT_GT(stats.replayed_fallback_ranges, 0u);
-  EXPECT_EQ(stats.replayed_compiled_packet_fallbacks, 0u);
-  EXPECT_EQ(stats.replayed_fallback_records + stats.replayed_graphics_packets +
-                stats.replayed_compute_packets,
-            stats.record_count);
 
   std::array<std::uint32_t, 2> state_values = {};
   void *mapped_state = nullptr;

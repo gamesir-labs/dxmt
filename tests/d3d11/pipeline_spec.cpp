@@ -885,6 +885,11 @@ TEST_F(D3D11PipelineSpec, CreatesStateObjectsWithRequestedDescriptions) {
   depth_desc.StencilEnable = TRUE;
   depth_desc.StencilReadMask = 0x3f;
   depth_desc.StencilWriteMask = 0x7f;
+  depth_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+  depth_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+  depth_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+  depth_desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+  depth_desc.BackFace = depth_desc.FrontFace;
   ComPtr<ID3D11DepthStencilState> depth;
   ASSERT_TRUE(HResultSucceeded(
       context_.device()->CreateDepthStencilState(&depth_desc, depth.put())));

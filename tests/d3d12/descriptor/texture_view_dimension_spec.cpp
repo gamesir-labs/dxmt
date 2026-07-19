@@ -236,7 +236,7 @@ protected:
                                                 &support,
                                                 sizeof(support)) != S_OK)
       return false;
-    constexpr D3D12_FORMAT_SUPPORT1 required =
+    const D3D12_FORMAT_SUPPORT1 required =
         D3D12_FORMAT_SUPPORT1_TEXTURE2D |
         D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
         D3D12_FORMAT_SUPPORT1_RENDER_TARGET |

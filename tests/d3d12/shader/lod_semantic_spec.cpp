@@ -3,8 +3,6 @@
 
 #include "d3d12_test_context.hpp"
 
-#include <DXBCParser/d3d12tokenizedprogramformat.hpp>
-
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +13,12 @@ using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
+
+// Public DXBC tokenized-program encoding values. This test patches compiled
+// shader bytecode without depending on DXMT's parser implementation.
+constexpr std::uint32_t kDxbcOpcodeTypeMask = 0x000007ff;
+constexpr std::uint32_t kDxbcOpcodeSample = 69;
+constexpr std::uint32_t kDxbcOpcodeLod = 108;
 
 class D3D12LodSemanticSpec : public ::testing::Test {
 protected:
@@ -85,14 +89,12 @@ protected:
         const auto token_offset =
             program_offset + token_index * sizeof(std::uint32_t);
         auto token = load32(token_offset);
-        const auto opcode = static_cast<microsoft::D3D10_SB_OPCODE_TYPE>(
-            token & D3D10_SB_OPCODE_TYPE_MASK);
+        const auto opcode = token & kDxbcOpcodeTypeMask;
         const auto length = (token >> 24) & 0x7fu;
         if (!length || token_index + length > token_count)
           return false;
-        if (opcode == microsoft::D3D10_SB_OPCODE_SAMPLE) {
-          token = (token & ~D3D10_SB_OPCODE_TYPE_MASK) |
-                  microsoft::D3D10_1_SB_OPCODE_LOD;
+        if (opcode == kDxbcOpcodeSample) {
+          token = (token & ~kDxbcOpcodeTypeMask) | kDxbcOpcodeLod;
           std::memcpy(bytes + token_offset, &token, sizeof(token));
           return true;
         }

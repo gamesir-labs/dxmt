@@ -510,7 +510,8 @@ DXMT_SERIAL_TEST_F(GraphicsEdgeSemanticsSpec,
     })",
                               "vs_5_0");
   auto pixel = CompileShader(R"(
-    float4 main(sample noperspective float ndc_x : TEXCOORD0) : SV_Target {
+    float4 main(float4 position : SV_Position,
+                sample noperspective float ndc_x : TEXCOORD0) : SV_Target {
       const float threshold = 1.0 / 32.0;
       return float4(ndc_x >= threshold, 0.0, 0.0, 1.0);
     })",

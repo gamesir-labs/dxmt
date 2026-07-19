@@ -147,8 +147,8 @@ TEST_F(ComputeDispatchSpec, DispatchDimensionMatrix) {
   ASSERT_TRUE(output.heap);
   Bind(output, dispatch_pipeline_.get());
 
-  const UINT small[] = {2, 2, 0};
-  context_.list()->SetComputeRoot32BitConstants(1, 3, small, 0);
+  const UINT small_dispatch[] = {2, 2, 0};
+  context_.list()->SetComputeRoot32BitConstants(1, 3, small_dispatch, 0);
   context_.list()->Dispatch(1, 1, 1);
   const UINT zero_x[] = {2, 2, 4};
   context_.list()->SetComputeRoot32BitConstants(1, 3, zero_x, 0);
