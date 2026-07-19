@@ -80,6 +80,7 @@ d3d12_unit_suites = {
       'descriptor/heap_contract_spec.cpp',
       'descriptor/heap_size_matrix_spec.cpp',
       'descriptor/null_uav_spec.cpp',
+      'descriptor/sampler_filter_matrix_spec.cpp',
       'descriptor/sampler_matrix_spec.cpp',
       'descriptor/sampler_spec.cpp',
       'descriptor/table_binding_spec.cpp',
@@ -205,6 +206,7 @@ d3d12_unit_suites = {
   'resource': {
     'sources': files(
       'resource/buffer_size_matrix_spec.cpp',
+      'resource/heap_type_matrix_spec.cpp',
       'resource/texture2d_size_matrix_spec.cpp',
       'resource/planar_format_spec.cpp',
       'resource/existing_heap_spec.cpp',
