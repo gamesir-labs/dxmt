@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -739,25 +740,16 @@ TEST_F(D3D12DeviceSpec, IgnoresBlendStateForUnwrittenPixelShaderTarget) {
 
 TEST_F(D3D12DeviceSpec,
        RejectsDualSourceBlendWhenSecondaryPixelOutputIsMissing) {
-  D3D12_DESCRIPTOR_RANGE range = {};
-  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  range.NumDescriptors = UINT_MAX;
-  range.BaseShaderRegister = 1;
-  D3D12_ROOT_PARAMETER parameters[2] = {};
-  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[0].DescriptorTable.NumDescriptorRanges = 1;
-  parameters[0].DescriptorTable.pDescriptorRanges = &range;
-  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  parameters[1].Constants.ShaderRegister = 0;
-  parameters[1].Constants.Num32BitValues = 1;
-  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.NumParameters = 2;
-  root_desc.pParameters = parameters;
   ID3D12RootSignature *root_signature =
       CreateRootSignature(device_, root_desc);
   ASSERT_NE(root_signature, nullptr);
+
+  auto single_source = dxmt::test::CompileShader(
+      "float4 main() : SV_Target0 { return float4(1, 0, 0, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(single_source.result, S_OK)
+      << single_source.diagnostic_text();
 
   auto desc = BasicGraphicsPipelineDesc(root_signature);
   auto &blend = desc.BlendState.RenderTarget[0];
@@ -778,7 +770,8 @@ TEST_F(D3D12DeviceSpec,
   ASSERT_NE(dual_source_pipeline, nullptr);
   release_object(dual_source_pipeline);
 
-  desc.PS = dxmt::test::TextureUavPixelShader();
+  desc.PS = {single_source.bytecode->GetBufferPointer(),
+             single_source.bytecode->GetBufferSize()};
   ID3D12PipelineState *single_source_pipeline = nullptr;
   EXPECT_EQ(device_->CreateGraphicsPipelineState(
                 &desc, __uuidof(ID3D12PipelineState),
