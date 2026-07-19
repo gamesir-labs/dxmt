@@ -30,6 +30,7 @@ d3d12_unit_suites = {
   'object': {
     'sources': files(
       'object/com_identity_spec.cpp',
+      'object/com_guid_matrix_spec.cpp',
       'object/private_data_spec.cpp',
       'object/private_data_matrix_spec.cpp',
       'object/shared_handle_spec.cpp',
