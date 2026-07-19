@@ -5595,8 +5595,9 @@ public:
     if (desc->Mode != D3D12_SHADER_CACHE_MODE_MEMORY &&
         desc->Mode != D3D12_SHADER_CACHE_MODE_DISK)
       return WARN_E_INVALIDARG(__func__);
-    constexpr UINT known_flags = D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED |
-                                 D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+    constexpr UINT known_flags =
+        static_cast<UINT>(D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED) |
+        static_cast<UINT>(D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR);
     if (static_cast<UINT>(desc->Flags) & ~known_flags)
       return WARN_E_INVALIDARG(__func__);
     WARN("D3D12Device: shader cache sessions are unsupported");
@@ -5607,13 +5608,17 @@ public:
   ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds,
                      D3D12_SHADER_CACHE_CONTROL_FLAGS control) override {
     constexpr UINT known_kinds =
-        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER |
-        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS |
-        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED |
-        D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED;
-    constexpr UINT known_control = D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE |
-                                   D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE |
-                                   D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR;
+        static_cast<UINT>(
+            D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER) |
+        static_cast<UINT>(
+            D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS) |
+        static_cast<UINT>(
+            D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED) |
+        static_cast<UINT>(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED);
+    constexpr UINT known_control =
+        static_cast<UINT>(D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) |
+        static_cast<UINT>(D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) |
+        static_cast<UINT>(D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR);
     const UINT kind_bits = static_cast<UINT>(kinds);
     const UINT control_bits = static_cast<UINT>(control);
     if ((kind_bits & ~known_kinds) || !control_bits ||
