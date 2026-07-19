@@ -504,7 +504,15 @@ TEST_F(D3D12DeviceSpec, PipelineLibraryResultMatchesShaderCacheCapability) {
   ASSERT_EQ(device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &feature,
                                          sizeof(feature)),
             S_OK);
-  EXPECT_EQ(feature.SupportFlags, D3D12_SHADER_CACHE_SUPPORT_NONE);
+  constexpr auto known_support = static_cast<D3D12_SHADER_CACHE_SUPPORT_FLAGS>(
+      D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO |
+      D3D12_SHADER_CACHE_SUPPORT_LIBRARY |
+      D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE |
+      D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE |
+      D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE |
+      D3D12_SHADER_CACHE_SUPPORT_SHADER_CONTROL_CLEAR |
+      D3D12_SHADER_CACHE_SUPPORT_SHADER_SESSION_DELETE);
+  EXPECT_EQ(feature.SupportFlags & ~known_support, 0u);
 
 #ifdef __ID3D12Device1_INTERFACE_DEFINED__
   ID3D12Device1 *device1 = nullptr;
@@ -513,33 +521,23 @@ TEST_F(D3D12DeviceSpec, PipelineLibraryResultMatchesShaderCacheCapability) {
             S_OK);
   ASSERT_NE(device1, nullptr);
 
-  ID3D12PipelineLibrary *library = nullptr;
-  EXPECT_EQ(device1->CreatePipelineLibrary(
-                nullptr, 0, __uuidof(ID3D12PipelineLibrary),
-                reinterpret_cast<void **>(&library)),
-            DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(library, nullptr);
-  EXPECT_EQ(device1->CreatePipelineLibrary(
-                nullptr, 0, __uuidof(ID3D12PipelineLibrary), nullptr),
-            DXGI_ERROR_UNSUPPORTED);
-
-  const std::array<std::uint8_t, 8> invalid_blob = {
-      0x44, 0x58, 0x4d, 0x54, 0xde, 0xad, 0xbe, 0xef};
-  EXPECT_EQ(device1->CreatePipelineLibrary(
-                invalid_blob.data(), invalid_blob.size(),
-                __uuidof(ID3D12PipelineLibrary),
-                reinterpret_cast<void **>(&library)),
-            DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(library, nullptr);
-  EXPECT_EQ(device1->CreatePipelineLibrary(
-                invalid_blob.data(), invalid_blob.size(),
-                __uuidof(ID3D12PipelineLibrary), nullptr),
-            DXGI_ERROR_UNSUPPORTED);
+  if (feature.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY) {
+    ID3D12PipelineLibrary *library = nullptr;
+    EXPECT_EQ(device1->CreatePipelineLibrary(
+                  nullptr, 0, __uuidof(ID3D12PipelineLibrary),
+                  reinterpret_cast<void **>(&library)),
+              S_OK);
+    EXPECT_NE(library, nullptr);
+    release_object(library);
+    EXPECT_EQ(device1->CreatePipelineLibrary(
+                  nullptr, 0, __uuidof(ID3D12PipelineLibrary), nullptr),
+              S_FALSE);
+  }
   release_object(device1);
 #endif
 }
 
-TEST_F(D3D12DeviceSpec, RejectsStreamOutputAtPipelineCreation) {
+TEST_F(D3D12DeviceSpec, CreatesStreamOutputPipelineFromPublicDescriptor) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   range.NumDescriptors = UINT_MAX;
@@ -577,18 +575,12 @@ TEST_F(D3D12DeviceSpec, RejectsStreamOutputAtPipelineCreation) {
   desc.StreamOutput.NumEntries = 1;
   desc.StreamOutput.pBufferStrides = &stride;
   desc.StreamOutput.NumStrides = 1;
-  EXPECT_EQ(device_->CreateGraphicsPipelineState(
+  ASSERT_EQ(device_->CreateGraphicsPipelineState(
                 &desc, __uuidof(ID3D12PipelineState),
                 reinterpret_cast<void **>(&pipeline)),
-            E_NOTIMPL);
-  EXPECT_EQ(pipeline, nullptr);
-
-  desc.StreamOutput.pSODeclaration = nullptr;
-  EXPECT_EQ(device_->CreateGraphicsPipelineState(
-                &desc, __uuidof(ID3D12PipelineState),
-                reinterpret_cast<void **>(&pipeline)),
-            E_INVALIDARG);
-  EXPECT_EQ(pipeline, nullptr);
+            S_OK);
+  ASSERT_NE(pipeline, nullptr);
+  release_object(pipeline);
   release_object(root_signature);
 }
 

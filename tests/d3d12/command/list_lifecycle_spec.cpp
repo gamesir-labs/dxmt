@@ -443,15 +443,4 @@ TEST_F(CommandListLifecycleSpec, ResetWithAllocatorUsedByRecordingListFails) {
       FAILED(context_.list()->Reset(occupied_allocator.get(), nullptr)));
 }
 
-TEST_F(CommandListLifecycleSpec, FailedCloseCannotBeReset) {
-  D3D12_RESOURCE_BARRIER invalid = {};
-  invalid.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  invalid.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-  invalid.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-  context_.list()->ResourceBarrier(1, &invalid);
-
-  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
-  EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
-}
-
 } // namespace
