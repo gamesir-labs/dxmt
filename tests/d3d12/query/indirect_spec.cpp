@@ -222,16 +222,18 @@ protected:
 
   ComPtr<ID3D12Resource> CreateCounter() {
     const UINT zero = 0;
-    auto upload = context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
+    counter_upload_ =
+        context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
     auto counter = context_.CreateBuffer(
         sizeof(zero), D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_DEST);
-    EXPECT_TRUE(upload);
+    EXPECT_TRUE(counter_upload_);
     EXPECT_TRUE(counter);
-    if (upload && counter) {
-      context_.list()->CopyBufferRegion(counter.get(), 0, upload.get(), 0,
-                                         sizeof(zero));
+    if (counter_upload_ && counter) {
+      context_.list()->CopyBufferRegion(counter.get(), 0,
+                                        counter_upload_.get(), 0,
+                                        sizeof(zero));
       D3D12TestContext::Transition(
           context_.list(), counter.get(), D3D12_RESOURCE_STATE_COPY_DEST,
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -263,6 +265,7 @@ protected:
   ComPtr<ID3D12PipelineState> counter_pipeline_;
   ComPtr<ID3D12PipelineState> argument_pipeline_;
   ComPtr<ID3D12CommandSignature> signature_;
+  ComPtr<ID3D12Resource> counter_upload_;
 };
 
 TEST_F(ExecuteIndirectExtendedSpec, ExecutesMultipleCommands) {
