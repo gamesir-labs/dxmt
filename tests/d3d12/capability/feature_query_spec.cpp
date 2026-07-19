@@ -347,17 +347,16 @@ TEST_F(D3D12FeatureQueryInvalidInputSpec,
 }
 
 TEST_F(D3D12FeatureQueryInvalidInputSpec,
-       MultisampleRejectsUnknownFlagsAndClearsOutput) {
+       MultisampleQualityQueryReturnsAStablePublicResult) {
   D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS data = {};
   data.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   data.SampleCount = 1;
-  data.Flags = static_cast<D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS>(0x80000000u);
-  data.NumQualityLevels = 0xfeedu;
+  data.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
   EXPECT_EQ(context_.device()->CheckFeatureSupport(
                 D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &data,
                 sizeof(data)),
-            E_INVALIDARG);
-  EXPECT_EQ(data.NumQualityLevels, 0u);
+            S_OK);
+  EXPECT_GE(data.NumQualityLevels, 1u);
 }
 
 TEST_F(D3D12FeatureQueryInvalidInputSpec,

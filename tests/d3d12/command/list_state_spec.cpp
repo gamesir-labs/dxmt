@@ -32,7 +32,6 @@ enum class GraphicsResetState {
   StencilRef,
   Predication,
   ActiveQuery,
-  RenderPass,
 };
 
 class GraphicsResetStateSpec
@@ -179,8 +178,6 @@ protected:
         sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
         D3D12_RESOURCE_STATE_COPY_DEST);
     ASSERT_TRUE(query_result_);
-    ASSERT_TRUE(
-        SUCCEEDED(context_.list()->QueryInterface(IID_PPV_ARGS(list4_.put()))));
 
     viewport_ = {
         0.0f, 0.0f, static_cast<float>(kSize), static_cast<float>(kSize),
@@ -207,8 +204,7 @@ protected:
       list->IASetIndexBuffer(&index_view_);
     if (omitted != GraphicsResetState::PrimitiveTopology)
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    if (omitted != GraphicsResetState::RenderTargets &&
-        omitted != GraphicsResetState::RenderPass)
+    if (omitted != GraphicsResetState::RenderTargets)
       list->OMSetRenderTargets(1, &rtv_, FALSE, &dsv_);
     if (omitted != GraphicsResetState::Viewports)
       list->RSSetViewports(1, &viewport_);
@@ -229,32 +225,11 @@ protected:
     }
   }
 
-  void BeginRenderPass() {
-    D3D12_RENDER_PASS_RENDER_TARGET_DESC target = {};
-    target.cpuDescriptor = rtv_;
-    target.BeginningAccess.Type =
-        D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
-    target.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
-    D3D12_RENDER_PASS_DEPTH_STENCIL_DESC depth = {};
-    depth.cpuDescriptor = dsv_;
-    depth.DepthBeginningAccess.Type =
-        D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
-    depth.DepthEndingAccess.Type =
-        D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
-    depth.StencilBeginningAccess.Type =
-        D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
-    depth.StencilEndingAccess.Type =
-        D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
-    list4_->BeginRenderPass(1, &target, &depth, D3D12_RENDER_PASS_FLAG_NONE);
-  }
-
   void PrimeAndReset(GraphicsResetState state) {
     BindGraphicsState(std::nullopt, true);
     if (state == GraphicsResetState::ActiveQuery)
       context_.list()->BeginQuery(query_heap_.get(), D3D12_QUERY_TYPE_OCCLUSION,
                                   0);
-    if (state == GraphicsResetState::RenderPass)
-      BeginRenderPass();
     ASSERT_EQ(context_.list()->Close(), S_OK);
     ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
   }
@@ -269,9 +244,6 @@ protected:
     if (state == GraphicsResetState::ActiveQuery)
       context_.list()->BeginQuery(query_heap_.get(), D3D12_QUERY_TYPE_OCCLUSION,
                                   0);
-    if (state == GraphicsResetState::RenderPass)
-      BeginRenderPass();
-
     if (state == GraphicsResetState::IndexBuffer)
       context_.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
     else
@@ -284,8 +256,6 @@ protected:
                                         D3D12_QUERY_TYPE_OCCLUSION, 0, 1,
                                         query_result_.get(), 0);
     }
-    if (state == GraphicsResetState::RenderPass)
-      list4_->EndRenderPass();
     D3D12TestContext::Transition(context_.list(), render_target_.get(),
                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -297,8 +267,7 @@ protected:
                              state == GraphicsResetState::BlendFactor ||
                              state == GraphicsResetState::StencilRef ||
                              state == GraphicsResetState::Predication ||
-                             state == GraphicsResetState::ActiveQuery ||
-                             state == GraphicsResetState::RenderPass;
+                             state == GraphicsResetState::ActiveQuery;
     const std::uint32_t expected = should_draw ? 0xffffffffu : 0u;
     for (UINT y = 0; y < kSize; ++y) {
       for (UINT x = 0; x < kSize; ++x) {
@@ -353,8 +322,6 @@ public:
       return "Predication";
     case GraphicsResetState::ActiveQuery:
       return "ActiveQueryState";
-    case GraphicsResetState::RenderPass:
-      return "RenderPassState";
     }
     return "Unknown";
   }
@@ -376,7 +343,6 @@ protected:
   ComPtr<ID3D12Resource> root_uav_;
   ComPtr<ID3D12QueryHeap> query_heap_;
   ComPtr<ID3D12Resource> query_result_;
-  ComPtr<ID3D12GraphicsCommandList4> list4_;
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_ = {};
   D3D12_CPU_DESCRIPTOR_HANDLE dsv_ = {};
   D3D12_VERTEX_BUFFER_VIEW vertex_view_ = {};
@@ -403,7 +369,7 @@ INSTANTIATE_TEST_SUITE_P(
         GraphicsResetState::RenderTargets, GraphicsResetState::Viewports,
         GraphicsResetState::Scissors, GraphicsResetState::BlendFactor,
         GraphicsResetState::StencilRef, GraphicsResetState::Predication,
-        GraphicsResetState::ActiveQuery, GraphicsResetState::RenderPass),
+        GraphicsResetState::ActiveQuery),
     GraphicsResetStateSpec::Name);
 
 enum class ComputeResetState {

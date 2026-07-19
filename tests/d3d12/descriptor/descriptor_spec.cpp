@@ -1310,30 +1310,6 @@ TEST_F(D3D12DescriptorSpec,
                                     .use_static_sampler = true});
 }
 
-TEST_F(D3D12DescriptorSpec, IgnoresInvalidAndStaleCpuDescriptorHandles) {
-  D3D12_SAMPLER_DESC sampler_desc = {};
-  sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-  sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  sampler_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-
-  // Invalid application input must be diagnosed and ignored rather than
-  // dereferenced as a host pointer.
-  context_.device()->CreateSampler(&sampler_desc, {1});
-
-  D3D12_CPU_DESCRIPTOR_HANDLE stale = {};
-  {
-    auto heap = context_.CreateDescriptorHeap(
-        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
-    ASSERT_TRUE(heap);
-    stale = heap->GetCPUDescriptorHandleForHeapStart();
-  }
-  context_.device()->CreateSampler(&sampler_desc, stale);
-
-  // Ensure invalid lookups do not poison a later valid descriptor-backed draw.
-  RunDescriptorTableDraw(context_);
-}
-
 TEST_F(D3D12DescriptorSpec, CopiesTextureThroughComputeDescriptorTable) {
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;

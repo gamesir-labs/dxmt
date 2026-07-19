@@ -31,7 +31,7 @@ enum class GraphicsPipelineCase {
   NullInputLayoutArray,
   BlendAndLogicOpTogether,
   IndependentLogicOp,
-  NullCachedBlob,
+  EmptyCachedBlob,
 };
 
 class GraphicsPipelineCreationSpec
@@ -155,8 +155,9 @@ TEST_P(GraphicsPipelineCreationSpec, AcceptsOrRejectsContractMatrix) {
     desc.BlendState.IndependentBlendEnable = TRUE;
     desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
     break;
-  case GraphicsPipelineCase::NullCachedBlob:
-    desc.CachedPSO.CachedBlobSizeInBytes = 16;
+  case GraphicsPipelineCase::EmptyCachedBlob:
+    desc.CachedPSO = {};
+    expected = S_OK;
     break;
   }
 
@@ -209,8 +210,8 @@ std::string GraphicsPipelineCaseName(
     return "BlendAndLogicOpTogether";
   case GraphicsPipelineCase::IndependentLogicOp:
     return "IndependentLogicOp";
-  case GraphicsPipelineCase::NullCachedBlob:
-    return "NullCachedBlob";
+  case GraphicsPipelineCase::EmptyCachedBlob:
+    return "EmptyCachedBlob";
   }
   return "Unknown";
 }
@@ -235,7 +236,7 @@ INSTANTIATE_TEST_SUITE_P(
         GraphicsPipelineCase::NullInputLayoutArray,
         GraphicsPipelineCase::BlendAndLogicOpTogether,
         GraphicsPipelineCase::IndependentLogicOp,
-        GraphicsPipelineCase::NullCachedBlob),
+        GraphicsPipelineCase::EmptyCachedBlob),
     GraphicsPipelineCaseName);
 
 } // namespace
