@@ -102,5 +102,6 @@ bool ColorsMatch(std::uint32_t actual, std::uint32_t expected,
                  unsigned int max_channel_difference);
 
 ComPtr<ID3D12Device> CreateIsolatedD3D12Device();
+bool IsSoftwareAdapter(ID3D12Device *device);
 
 } // namespace dxmt::test

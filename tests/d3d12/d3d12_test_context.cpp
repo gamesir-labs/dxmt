@@ -110,6 +110,28 @@ ComPtr<ID3D12Device> CreateIsolatedD3D12Device() {
   return SUCCEEDED(hr) ? std::move(device) : ComPtr<ID3D12Device>{};
 }
 
+bool IsSoftwareAdapter(ID3D12Device *device) {
+  if (!device)
+    return false;
+
+  ComPtr<IDXGIFactory4> factory;
+  HRESULT hr = CreateDXGIFactory1(
+      __uuidof(IDXGIFactory4), reinterpret_cast<void **>(factory.put()));
+  if (FAILED(hr))
+    return false;
+
+  ComPtr<IDXGIAdapter1> adapter;
+  hr = factory->EnumAdapterByLuid(
+      device->GetAdapterLuid(), __uuidof(IDXGIAdapter1),
+      reinterpret_cast<void **>(adapter.put()));
+  if (FAILED(hr))
+    return false;
+
+  DXGI_ADAPTER_DESC1 desc = {};
+  return SUCCEEDED(adapter->GetDesc1(&desc)) &&
+         (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+}
+
 D3D12TestContext::~D3D12TestContext() {
   if (debug_info_queue_)
     debug_info_queue_->UnregisterMessageCallback(debug_callback_cookie_);

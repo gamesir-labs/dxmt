@@ -131,11 +131,20 @@ TEST_F(DeviceControlSpec, CustomHeapPropertiesMatchAdvertisedArchitecture) {
   }
 }
 
-TEST_F(DeviceControlSpec, StablePowerStateDisableIsIdempotentAndNonMutating) {
-  EXPECT_EQ(context_.device()->SetStablePowerState(FALSE), S_OK);
-  EXPECT_EQ(context_.device()->SetStablePowerState(FALSE), S_OK);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-  ExpectCopyExecution();
+DXMT_SERIAL_TEST_F(DeviceControlSpec,
+                   StablePowerStateReflectsDeveloperModeCapability) {
+  const HRESULT hr = context_.device()->SetStablePowerState(FALSE);
+  if (hr == S_OK) {
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+    ExpectCopyExecution();
+    return;
+  }
+
+  // The public contract removes the device when Windows developer mode is
+  // disabled. Keep this case in its own worker so the intentional removal
+  // cannot contaminate otherwise independent tests.
+  EXPECT_EQ(hr, E_FAIL);
+  EXPECT_HRESULT_FAILED(context_.device()->GetDeviceRemovedReason());
 }
 
 TEST_F(DeviceControlSpec, LifetimeTrackerUnsupportedPathClearsOutput) {

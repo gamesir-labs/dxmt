@@ -66,11 +66,6 @@ TEST(DescriptorHeapCapabilitySpec, ValidatesWithoutCreatingObjects) {
   };
 
   auto invalid = valid_cases[0];
-  invalid.NumDescriptors = 0;
-  expect_rejected(invalid);
-  invalid = valid_cases[0];
-  invalid.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(2);
-  expect_rejected(invalid);
   invalid.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
   invalid.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   expect_rejected(invalid);

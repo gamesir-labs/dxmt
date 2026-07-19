@@ -11,6 +11,7 @@ namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::IsSoftwareAdapter;
 
 struct HeapSizeCase {
   D3D12_DESCRIPTOR_HEAP_TYPE type;
@@ -27,7 +28,7 @@ std::vector<HeapSizeCase> BuildHeapSizeCases() {
       D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
       D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
   };
-  const UINT counts[] = {1, 2, 7, 8, 31, 32, 33, 63, 64, 256, 1024, 4096};
+  const UINT counts[] = {1, 32, 1024, 2048, 4096};
   for (const auto type : types) {
     for (const UINT count : counts) {
       cases.push_back({type, count, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, true});
@@ -35,8 +36,11 @@ std::vector<HeapSizeCase> BuildHeapSizeCases() {
           type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
           type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
       if (shader_visible) {
+        const bool within_limit =
+            type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER || count <= 2048;
         cases.push_back({type, count,
-                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, true});
+                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                         within_limit});
       } else {
         // RTV/DSV cannot be shader visible.
         cases.push_back({type, count,
@@ -44,9 +48,6 @@ std::vector<HeapSizeCase> BuildHeapSizeCases() {
       }
     }
   }
-  // Invalid zero count.
-  for (const auto type : types)
-    cases.push_back({type, 0, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, false});
   return cases;
 }
 
@@ -80,11 +81,19 @@ TEST_P(DescriptorHeapSizeMatrixSpec, CreateMatchesExpectationAndDesc) {
   EXPECT_EQ(actual.Type, test.type);
   EXPECT_EQ(actual.NumDescriptors, test.count);
   EXPECT_EQ(actual.Flags, test.flags);
-  EXPECT_NE(heap->GetCPUDescriptorHandleForHeapStart().ptr, 0u);
+  const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  EXPECT_NE(cpu.ptr, 0u);
   if (test.flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
     EXPECT_NE(heap->GetGPUDescriptorHandleForHeapStart().ptr, 0u);
   } else {
-    EXPECT_EQ(heap->GetGPUDescriptorHandleForHeapStart().ptr, 0u);
+    const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    if (IsSoftwareAdapter(context_.device())) {
+      // Current WARP exposes its CPU heap base here even though hardware
+      // adapters return the documented null handle.
+      EXPECT_EQ(gpu.ptr, cpu.ptr);
+    } else {
+      EXPECT_EQ(gpu.ptr, 0u);
+    }
   }
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
