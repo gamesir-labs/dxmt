@@ -154,7 +154,8 @@ test(
   wine_test_launcher,
   args: ['wine-exec', '--', dxmt_wine_test_scheduler],
   suite: ['unit', 'wine'],
-  timeout: 120,
+  # Large parameterized D3D12 matrices need well over the default 120s budget.
+  timeout: 1800,
   env: wine_test_env,
   is_parallel: false,
   workdir: meson.project_source_root(),

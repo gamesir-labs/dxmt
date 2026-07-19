@@ -71,7 +71,10 @@ d3d12_unit_suites = {
     ),
   },
   'compute': {
-    'sources': files('compute/dispatch_spec.cpp'),
+    'sources': files(
+      'compute/dispatch_spec.cpp',
+      'compute/dispatch_matrix_spec.cpp',
+    ),
   },
   'descriptor': {
     'sources': files(
@@ -115,6 +118,7 @@ d3d12_unit_suites = {
       'graphics/viewport_scissor_spec.cpp',
       'graphics/viewport_matrix_spec.cpp',
       'graphics/scissor_matrix_spec.cpp',
+      'graphics/draw_instanced_matrix_spec.cpp',
     ),
   },
   'integration': {
@@ -161,6 +165,7 @@ d3d12_unit_suites = {
       'root_signature/static_sampler_matrix_spec.cpp',
       'root_signature/root_descriptor_spec.cpp',
       'root_signature/root_descriptor_offset_matrix_spec.cpp',
+      'root_signature/root_constant_value_matrix_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
       'root_signature/version11_mixed_binding_spec.cpp',
@@ -208,6 +213,7 @@ d3d12_unit_suites = {
       'transfer/clear_uav_spec.cpp',
       'transfer/clear_uav_value_matrix_spec.cpp',
       'transfer/copy_buffer_region_matrix_spec.cpp',
+      'transfer/copy_buffer_offset_matrix_spec.cpp',
       'transfer/copy_footprint_spec.cpp',
       'transfer/footprint_matrix_spec.cpp',
       'transfer/copy_edge_spec.cpp',
