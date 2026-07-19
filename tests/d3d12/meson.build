@@ -76,6 +76,7 @@ d3d12_unit_suites = {
       'descriptor/buffer_view_spec.cpp',
       'descriptor/descriptor_spec.cpp',
       'descriptor/heap_contract_spec.cpp',
+      'descriptor/null_uav_spec.cpp',
       'descriptor/sampler_matrix_spec.cpp',
       'descriptor/sampler_spec.cpp',
       'descriptor/table_binding_spec.cpp',
