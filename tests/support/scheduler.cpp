@@ -760,9 +760,14 @@ int RunScheduledTests(int argc, char **argv) {
   if (serial_shards.empty() && worker_count <= 1)
     return RunTestsAndReport(case_namespace);
 
-  auto shards = BuildTestShards(
-      std::move(tests), std::max<std::size_t>(1, worker_count),
-      kMaximumWorkerFilterLength);
+#ifdef _WIN32
+  constexpr std::size_t maximum_filter_length = 1;
+#else
+  constexpr std::size_t maximum_filter_length = kMaximumWorkerFilterLength;
+#endif
+  auto shards = BuildTestShards(std::move(tests),
+                                std::max<std::size_t>(1, worker_count),
+                                maximum_filter_length);
   const auto parallel_shard_count = shards.size();
   const auto parallel_concurrency =
       std::min(parallel_shard_count, std::max<std::size_t>(1, worker_count));

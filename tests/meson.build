@@ -146,6 +146,12 @@ dxmt_wine_d3d12_tests = executable(
   install: false,
 )
 
+configure_file(
+  input: 'd3d12/run-windows-oracle.bat',
+  output: 'run-windows-oracle.bat',
+  copy: true,
+)
+
 dxmt_wine_test_scheduler = executable(
   'dxmt-wine-test-scheduler',
   files('support/wine_suite_scheduler.cpp'),
