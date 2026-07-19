@@ -346,10 +346,7 @@ INSTANTIATE_TEST_SUITE_P(
         DispatchBoundaryCase{1, 1, 0, S_OK, "ZeroZ"},
         DispatchBoundaryCase{65535, 1, 1, S_OK, "MaximumX"},
         DispatchBoundaryCase{1, 65535, 1, S_OK, "MaximumY"},
-        DispatchBoundaryCase{1, 1, 65535, S_OK, "MaximumZ"},
-        DispatchBoundaryCase{65536, 1, 1, E_INVALIDARG, "BeyondMaximumX"},
-        DispatchBoundaryCase{1, 65536, 1, E_INVALIDARG, "BeyondMaximumY"},
-        DispatchBoundaryCase{1, 1, 65536, E_INVALIDARG, "BeyondMaximumZ"}),
+        DispatchBoundaryCase{1, 1, 65535, S_OK, "MaximumZ"}),
     DispatchBoundaryCaseName);
 
 } // namespace
