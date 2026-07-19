@@ -1335,9 +1335,16 @@ private:
     environment["WINEDEBUG"] = EnvironmentValue("WINEDEBUG", "-all");
     environment["DXMT_EXPERIMENT_DX12_SUPPORT"] =
         EnvironmentValue("DXMT_EXPERIMENT_DX12_SUPPORT", "1");
-    environment["WINEDLLOVERRIDES"] = EnvironmentValue(
+    const auto dll_overrides = EnvironmentValue(
         "WINEDLLOVERRIDES",
         "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");
+    // Managed test prefixes must initialize without interactive dependency
+    // installers. Wine's mscoree registration can launch
+    // `control.exe appwiz.cpl install_mono` while wineboot updates a prefix, so
+    // disable both the trigger DLLs and the installer entry points. Keep this
+    // rule last so a caller-provided override cannot re-enable the prompts.
+    environment["WINEDLLOVERRIDES"] =
+        dll_overrides + ";mscoree,mshtml,control.exe,appwiz.cpl=";
     environment["DXMT_TEST_WINE_ROOT"] = wine_root.string();
 
     if (require_runtime_deps) {
