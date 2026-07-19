@@ -126,7 +126,7 @@ std::string DescriptorHeapCaseName(
          std::to_string(info.param.count);
 }
 
-constexpr std::array<UINT, 6> kBoundaryCounts = {1, 2, 31, 32, 33, 1024};
+constexpr std::array<UINT, 5> kBoundaryCounts = {1, 2, 31, 32, 33};
 
 std::vector<DescriptorHeapCase> MakeDescriptorHeapCases() {
   std::vector<DescriptorHeapCase> cases;

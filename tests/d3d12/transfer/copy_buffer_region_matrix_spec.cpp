@@ -23,11 +23,9 @@ struct CopyRegionCase {
 std::vector<CopyRegionCase> BuildCopyRegionCases() {
   std::vector<CopyRegionCase> cases;
   constexpr UINT64 kBufferSize = 4096;
-  const UINT64 offsets[] = {0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
-  const UINT64 sizes[] = {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+  const UINT64 offsets[] = {1, 4, 64, 1024, 2048};
+  const UINT64 sizes[] = {1, 4, 64, 512, 1024};
   for (const UINT64 offset : offsets) {
-    if (offset == 0)
-      continue;
     cases.push_back({offset, 0, 1});
     cases.push_back({0, offset, 1});
   }

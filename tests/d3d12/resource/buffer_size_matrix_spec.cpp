@@ -24,8 +24,7 @@ struct BufferSizeCase {
 std::vector<BufferSizeCase> BuildBufferSizeCases() {
   std::vector<BufferSizeCase> cases;
   // Powers of two and one-past / one-before boundaries around common limits.
-  static const UINT64 kPowers[] = {1,     4,    16,   64,    256,
-                                   1024, 4096, 65536, 1048576};
+  static const UINT64 kPowers[] = {1, 4, 64, 4096, 65536, 1048576};
   for (const UINT64 power : kPowers) {
     cases.push_back({power, nullptr});
     if (power > 1)

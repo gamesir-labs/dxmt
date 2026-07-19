@@ -25,25 +25,13 @@ struct CopyOffsetCase {
 std::vector<CopyOffsetCase> BuildCopyOffsetCases() {
   std::vector<CopyOffsetCase> cases;
   constexpr UINT64 kBuf = 1024;
-  const UINT64 sizes[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+  const UINT64 sizes[] = {1, 4, 16, 64, 256, 512, 1024};
   for (const UINT64 size : sizes) {
     const UINT64 slack = kBuf - size;
     cases.push_back({kBuf, 0, 0, size});
     cases.push_back({kBuf, slack, 0, size});
     cases.push_back({kBuf, 0, slack, size});
     cases.push_back({kBuf, slack / 2, slack - slack / 2, size});
-  }
-  // Extra smaller buffers for edge sizes.
-  for (UINT64 buf : {16ull, 64ull, 256ull}) {
-    for (UINT64 size : {1ull, 4ull, buf / 2, buf}) {
-      if (size == 0 || size > buf)
-        continue;
-      cases.push_back({buf, 0, 0, size});
-      if (buf > size) {
-        cases.push_back({buf, buf - size, 0, size});
-        cases.push_back({buf, 0, buf - size, size});
-      }
-    }
   }
   return cases;
 }

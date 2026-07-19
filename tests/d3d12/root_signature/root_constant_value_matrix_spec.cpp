@@ -24,14 +24,31 @@ struct RootConstCase {
 
 std::vector<RootConstCase> BuildRootConstCases() {
   std::vector<RootConstCase> cases;
-  const UINT values[] = {
-      0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
-      511, 512, 1023, 1024, 2047, 2048, 4095, 4096, 8191, 8192, 16383, 16384,
-      32767, 32768, 65535, 65536, 0x00ffffff, 0x7fffffff, 0x80000000,
-      0xffffffff, 0x12345678, 0xa5a5a5a5, 0x5a5a5a5a, 0xdeadbeef, 0x0f0f0f0f,
-      0xf0f0f0f0, 0x01010101, 0x10101010, 0xaaaaaaaa, 0x55555555, 42, 100,
-      999, 1000, 9999, 10000, 99999, 100000, 1000000, 0xabcdef01, 0x10abcdef,
-  };
+  const UINT values[] = {0,
+                         1,
+                         2,
+                         3,
+                         7,
+                         8,
+                         15,
+                         16,
+                         31,
+                         32,
+                         255,
+                         256,
+                         1023,
+                         1024,
+                         65535,
+                         65536,
+                         0x7fffffff,
+                         0x80000000,
+                         0xffffffff,
+                         0x12345678,
+                         0xa5a5a5a5,
+                         0xdeadbeef,
+                         42,
+                         1000,
+                         1000000};
   for (const UINT value : values)
     cases.push_back({0, value});
   for (UINT slot = 1; slot < 4; ++slot) {

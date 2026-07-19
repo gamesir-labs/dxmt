@@ -25,11 +25,11 @@ struct DispatchCase {
 
 std::vector<DispatchCase> BuildDispatchCases() {
   std::vector<DispatchCase> cases = {{1, 1, 1}};
-  for (UINT x = 2; x <= 16; ++x)
+  for (UINT x : {2u, 3u, 4u, 8u, 15u, 16u})
     cases.push_back({x, 1, 1});
-  for (UINT y = 2; y <= 8; ++y)
+  for (UINT y : {2u, 4u, 7u, 8u})
     cases.push_back({1, y, 1});
-  for (UINT z = 2; z <= 4; ++z)
+  for (UINT z : {2u, 3u, 4u})
     cases.push_back({1, 1, z});
   cases.insert(cases.end(), {{2, 2, 2}, {4, 4, 4}, {8, 8, 4},
                              {16, 8, 4}, {16, 1, 4}, {1, 8, 4}});

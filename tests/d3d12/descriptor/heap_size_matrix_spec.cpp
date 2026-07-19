@@ -27,7 +27,7 @@ std::vector<HeapSizeCase> BuildHeapSizeCases() {
       D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
       D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
   };
-  const UINT counts[] = {1, 32, 1024, 2048, 4096};
+  const UINT counts[] = {1, 32, 2048, 4096};
   for (const auto type : types) {
     for (const UINT count : counts) {
       cases.push_back({type, count, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, true});

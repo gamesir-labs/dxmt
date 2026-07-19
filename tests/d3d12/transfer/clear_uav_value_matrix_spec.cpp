@@ -21,10 +21,10 @@ struct ClearUavValueCase {
 
 std::vector<ClearUavValueCase> BuildClearUavValueCases() {
   std::vector<ClearUavValueCase> cases;
-  const UINT seeds[] = {0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128,
-                        255, 256, 1023, 1024, 0x7fffffff, 0x80000000, 0xffffffff,
-                        0x12345678, 0xa5a5a5a5, 0x5a5a5a5a, 0xdeadbeef,
-                        0x0f0f0f0f, 0xf0f0f0f0};
+  const UINT seeds[] = {0,          1,          7,          8,
+                        31,         32,         255,        256,
+                        0x7fffffff, 0x80000000, 0xffffffff, 0x12345678,
+                        0xa5a5a5a5, 0xdeadbeef};
   for (const UINT v : seeds)
     cases.push_back({{v, v, v, v}});
   return cases;

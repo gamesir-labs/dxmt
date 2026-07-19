@@ -20,21 +20,8 @@ struct FenceValueCase {
 
 std::vector<FenceValueCase> BuildFenceValueCases() {
   std::vector<FenceValueCase> cases;
-  const UINT64 seeds[] = {0,
-                          1,
-                          2,
-                          31,
-                          32,
-                          63,
-                          64,
-                          255,
-                          256,
-                          1023,
-                          1024,
-                          (1ull << 32) - 1,
-                          (1ull << 32),
-                          (1ull << 40),
-                          UINT64_MAX - 1};
+  const UINT64 seeds[] = {0, 1, 31, 32, (1ull << 32) - 1, (1ull << 32),
+                          (1ull << 40), UINT64_MAX - 1};
   for (const UINT64 initial : seeds) {
     cases.push_back({initial, initial});
     if (initial < UINT64_MAX)

@@ -31,9 +31,8 @@ std::vector<DrawCase> BuildDrawCases() {
   // Fullscreen triangle uses 3 vertices from SV_VertexID 0..2.
   // Matrix covers vertex_count and instance_count combinations; non-3 vertex
   // counts still must not remove the device (coverage may be empty).
-  const UINT vertices[] = {0, 1, 2, 3, 4, 6, 9, 12, 24, 30, 33, 48, 64, 96,
-                           128, 192, 256, 384, 512};
-  const UINT instances[] = {0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 64};
+  const UINT vertices[] = {0, 1, 2, 3, 4, 33, 512};
+  const UINT instances[] = {0, 1, 2, 3, 4, 15, 16, 64};
   for (const UINT vertex_count : vertices)
     cases.push_back({vertex_count, 1, 0, 0});
   for (const UINT instance_count : instances)

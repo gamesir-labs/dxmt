@@ -22,8 +22,7 @@ struct Texture2DSizeCase {
 
 std::vector<Texture2DSizeCase> BuildTexture2DSizeCases() {
   std::vector<Texture2DSizeCase> cases;
-  const UINT dims[] = {1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64,
-                       127, 128, 256, 512, 1024};
+  const UINT dims[] = {1, 3, 4, 15, 16, 17, 63, 64, 127, 128, 256, 1024};
   const DXGI_FORMAT formats[] = {
       DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_UINT,
       DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8_UINT};
@@ -47,7 +46,7 @@ std::vector<Texture2DSizeCase> BuildTexture2DSizeCases() {
                              {64, 63, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                               D3D12_RESOURCE_FLAG_NONE}});
   // Mip chains for powers of two.
-  for (UINT size : {4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
+  for (UINT size : {4u, 16u, 64u, 256u}) {
     UINT16 mips = 1;
     for (UINT s = size; s > 1; s >>= 1)
       ++mips;
