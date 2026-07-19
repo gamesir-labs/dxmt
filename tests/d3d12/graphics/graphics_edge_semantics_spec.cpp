@@ -183,9 +183,9 @@ TEST_F(GraphicsEdgeSemanticsSpec,
   auto vertex = CompileShader(R"(
     struct Output {
       float4 position : SV_Position;
-      float4 perspective_value : TEXCOORD0;
-      float4 affine_value : TEXCOORD1;
-      float4 flat_value : TEXCOORD2;
+      linear float4 perspective_value : TEXCOORD0;
+      noperspective float4 affine_value : TEXCOORD1;
+      nointerpolation float4 flat_value : TEXCOORD2;
     };
     Output main(uint id : SV_VertexID) {
       const float4 positions[3] = {
@@ -206,7 +206,9 @@ TEST_F(GraphicsEdgeSemanticsSpec,
     float4 main(linear float4 perspective_value : TEXCOORD0,
                 noperspective float4 affine_value : TEXCOORD1,
                 nointerpolation float4 flat_value : TEXCOORD2) : SV_Target {
-      return float4(perspective_value.x, affine_value.x, flat_value.x, 1.0);
+      return float4(dot(perspective_value, 0.25.xxxx),
+                    dot(affine_value, 0.25.xxxx),
+                    dot(flat_value, 0.25.xxxx), 1.0);
     })",
                              "ps_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
@@ -426,7 +428,7 @@ TEST_F(GraphicsEdgeSemanticsSpec,
   auto vertex = CompileShader(R"(
     struct Output {
       float4 position : SV_Position;
-      float4 barycentric : TEXCOORD0;
+      linear centroid float4 barycentric : TEXCOORD0;
     };
     Output main(uint id : SV_VertexID) {
       const float2 positions[3] = {
@@ -437,7 +439,7 @@ TEST_F(GraphicsEdgeSemanticsSpec,
       };
       Output output;
       output.position = float4(positions[id], 0.5, 1.0);
-      output.barycentric = float4(barycentrics[id], 0.0, 0.0);
+      output.barycentric = float4(barycentrics[id], barycentrics[id]);
       return output;
     })",
                               "vs_5_0");
@@ -445,7 +447,7 @@ TEST_F(GraphicsEdgeSemanticsSpec,
     float4 main(linear centroid float4 barycentric : TEXCOORD0) : SV_Target {
       bool inside = all(barycentric.xy >= -0.001) &&
                     barycentric.x + barycentric.y <= 1.001 &&
-                    all(abs(barycentric.zw) <= 0.001);
+                    all(abs(barycentric.xy - barycentric.zw) <= 0.001);
       return inside ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
     })",
                              "ps_5_0");
