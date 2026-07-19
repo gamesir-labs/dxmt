@@ -1,4 +1,4 @@
-name: Nightly Build
+name: DXMT Push CI
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: nightly-${{ github.ref }}
+  group: push-ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,8 +22,49 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
 jobs:
+  classify-commits:
+    runs-on: self-macos-runner
+    outputs:
+      commit_markdown: ${{ steps.commit-types.outputs.commit_markdown }}
+      commit_types: ${{ steps.commit-types.outputs.types }}
+      has_test: ${{ steps.commit-types.outputs.has_test }}
+      run_nightly: ${{ steps.commit-types.outputs.run_nightly }}
+      conventional_valid: ${{ steps.commit-types.outputs.conventional_valid }}
+    steps:
+      - name: Disable residual sparse-checkout
+        # Self-hosted workspaces with clean:false can keep a previous job's
+        # sparse-checkout config and hide scripts/ci-self-hosted.sh.
+        run: |
+          if [ -e .git ]; then
+            git sparse-checkout disable 2>/dev/null || true
+            git config --local --unset-all core.sparseCheckout 2>/dev/null || true
+            if [ -d .git ]; then
+              rm -f .git/info/sparse-checkout
+            elif [ -f .git ]; then
+              gitdir=$(sed -n 's/^gitdir: //p' .git)
+              rm -f "${gitdir}/info/sparse-checkout" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Validate and classify all pushed commits
+        id: commit-types
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/commit-types.py \
+            --event "${GITHUB_EVENT_PATH}" \
+            --fallback-commit "${HEAD_SHA}"
+
   setup-host:
     runs-on: self-macos-runner
+    needs: classify-commits
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.classify-commits.outputs.run_nightly == 'true' }}
     steps:
       - name: Disable residual sparse-checkout
         # Self-hosted workspaces with clean:false can keep a previous job's
@@ -51,6 +92,12 @@ jobs:
         run: |
           scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json setup-host
           scripts/dxmt-builder --config .github/dxmt-builder-config.json --help
+
+  windows-d3d-conformance:
+    name: Windows D3D Public API Conformance
+    needs: classify-commits
+    if: ${{ needs.classify-commits.outputs.has_test == 'true' }}
+    uses: ./.github/workflows/windows-d3d-conformance.yml
 
   setup-wine:
     runs-on: self-macos-runner
@@ -375,8 +422,8 @@ jobs:
 
   cleanup-runner-artifacts:
     runs-on: self-macos-runner
-    needs: package
-    if: ${{ always() }}
+    needs: [classify-commits, package]
+    if: ${{ always() && needs.classify-commits.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.classify-commits.outputs.run_nightly == 'true') }}
     steps:
       - name: Disable residual sparse-checkout
         # Self-hosted workspaces with clean:false can keep a previous job's
@@ -402,10 +449,10 @@ jobs:
         run: scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json prune-artifact-runs 3
 
   notify:
-    name: Notify Feishu
+    name: Notify Feishu with CI summary
     # Stay on the Nightly macOS runner pool; do not hop to Windows.
     runs-on: self-macos-runner
-    needs: [setup-host, setup-wine, setup-llvm-project, setup-llvm-darwin, build-x86_64-windows, package]
+    needs: [classify-commits, setup-host, setup-wine, setup-llvm-project, setup-llvm-darwin, build-x86_64-windows, package, cleanup-runner-artifacts, windows-d3d-conformance]
     if: ${{ always() }}
     env:
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -416,57 +463,81 @@ jobs:
           # Full tree; avoid sparse residue on the shared macOS runner.
           clean: true
 
-      - name: Notify Feishu on failure
-        if: ${{ needs.package.result != 'success' }}
+      - name: Send aggregated CI result to Feishu
+        env:
+          COMMIT_MARKDOWN: ${{ needs.classify-commits.outputs.commit_markdown }}
+          COMMIT_TYPES: ${{ needs.classify-commits.outputs.commit_types }}
+          RUN_NIGHTLY: ${{ github.event_name == 'workflow_dispatch' || needs.classify-commits.outputs.run_nightly == 'true' }}
+          RUN_WINDOWS_D3D: ${{ needs.classify-commits.outputs.has_test == 'true' }}
         run: |
           set -euo pipefail
           chmod +x .github/scripts/ci-feishu.sh
-          failed=()
-          [[ '${{ needs.setup-host.result }}' == 'success' ]] || failed+=('setup-host')
-          [[ '${{ needs.setup-wine.result }}' == 'success' ]] || failed+=('setup-wine')
-          [[ '${{ needs.setup-llvm-project.result }}' == 'success' ]] || failed+=('setup-llvm-project')
-          [[ '${{ needs.setup-llvm-darwin.result }}' == 'success' ]] || failed+=('setup-llvm-darwin')
-          [[ '${{ needs.build-x86_64-windows.result }}' == 'success' ]] || failed+=('build-x86_64-windows')
-          [[ '${{ needs.package.result }}' == 'success' ]] || failed+=('package')
-          if ((${#failed[@]} > 0)); then
-            failed_jobs=$(IFS=', '; echo "${failed[*]}")
-          else
-            failed_jobs='unknown'
-          fi
-          run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          md="$(printf '%s\n' \
-            "**$(.github/scripts/ci-feishu.sh label repo):** ${{ github.repository }}" \
-            "**$(.github/scripts/ci-feishu.sh label branch):** ${{ github.ref_name }}" \
-            "**$(.github/scripts/ci-feishu.sh label commit):** \`${{ github.sha }}\`" \
-            "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
-            "**$(.github/scripts/ci-feishu.sh label failed_jobs):** ${failed_jobs}" \
-            "**$(.github/scripts/ci-feishu.sh label run_link):** [$(.github/scripts/ci-feishu.sh label view_detail)](${run_url})")"
-          .github/scripts/ci-feishu.sh send-card-v1 \
-            "${FEISHU_WEBHOOK_URL}" \
-            "$(.github/scripts/ci-feishu.sh label build_fail)" \
-            red \
-            "${md}"
+          status_label() {
+            case "$1" in
+              success) .github/scripts/ci-feishu.sh label passed ;;
+              skipped) .github/scripts/ci-feishu.sh label skipped ;;
+              cancelled) .github/scripts/ci-feishu.sh label cancelled ;;
+              *) .github/scripts/ci-feishu.sh label failed ;;
+            esac
+          }
 
-      - name: Notify Feishu on success
-        if: ${{ needs.package.result == 'success' }}
-        run: |
-          set -euo pipefail
-          chmod +x .github/scripts/ci-feishu.sh
+          failed=()
+          [[ '${{ needs.classify-commits.result }}' == 'success' ]] || failed+=('commit-policy')
+          if [[ "${RUN_NIGHTLY}" == 'true' ]]; then
+            [[ '${{ needs.setup-host.result }}' == 'success' ]] || failed+=('setup-host')
+            [[ '${{ needs.setup-wine.result }}' == 'success' ]] || failed+=('setup-wine')
+            [[ '${{ needs.setup-llvm-project.result }}' == 'success' ]] || failed+=('setup-llvm-project')
+            [[ '${{ needs.setup-llvm-darwin.result }}' == 'success' ]] || failed+=('setup-llvm-darwin')
+            [[ '${{ needs.build-x86_64-windows.result }}' == 'success' ]] || failed+=('build-x86_64-windows')
+            [[ '${{ needs.package.result }}' == 'success' ]] || failed+=('package')
+            [[ '${{ needs.cleanup-runner-artifacts.result }}' == 'success' ]] || failed+=('cleanup-runner-artifacts')
+          fi
+          if [[ "${RUN_WINDOWS_D3D}" == 'true' ]]; then
+            [[ '${{ needs.windows-d3d-conformance.result }}' == 'success' ]] || failed+=('windows-d3d-conformance')
+          fi
+
+          if ((${#failed[@]} == 0)); then
+            title="$(.github/scripts/ci-feishu.sh label ci_ok)"
+            theme=green
+          else
+            title="$(.github/scripts/ci-feishu.sh label ci_fail)"
+            theme=red
+          fi
+
           run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
           identity_md="$(printf '%s\n' \
-            "**$(.github/scripts/ci-feishu.sh label version):** ${{ needs.package.outputs.package_name }}" \
+            "**$(.github/scripts/ci-feishu.sh label repo):** ${{ github.repository }}" \
             "**$(.github/scripts/ci-feishu.sh label commit):** \`${{ github.sha }}\`" \
             "**$(.github/scripts/ci-feishu.sh label branch):** ${{ github.ref_name }}" \
-            "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}")"
-          package_md="$(printf '%s\n' \
-            "**📦 $(.github/scripts/ci-feishu.sh label component_package):** [$(.github/scripts/ci-feishu.sh label download)](${{ needs.package.outputs.artifact_url }})" \
-            "**$(.github/scripts/ci-feishu.sh label size):** ${{ needs.package.outputs.package_size }} bytes" \
-            "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`")"
+            "**$(.github/scripts/ci-feishu.sh label author):** ${{ github.actor }}" \
+            "**$(.github/scripts/ci-feishu.sh label commit_types):** ${COMMIT_TYPES}")"
+          commits_md="$(printf '%s\n' \
+            "**$(.github/scripts/ci-feishu.sh label commits):**" \
+            "${COMMIT_MARKDOWN}")"
+          results_md="$(printf '%s\n' \
+            "**$(.github/scripts/ci-feishu.sh label conventional_result):** $(status_label '${{ needs.classify-commits.result }}')" \
+            "**$(.github/scripts/ci-feishu.sh label nightly_result):** $(status_label '${{ needs.package.result }}')" \
+            "**$(.github/scripts/ci-feishu.sh label d3d_result):** $(status_label '${{ needs.windows-d3d-conformance.result }}')")"
+          sections=("${identity_md}" "${commits_md}" "${results_md}")
+
+          if [[ '${{ needs.package.result }}' == 'success' ]]; then
+            package_md="$(printf '%s\n' \
+              "**📦 $(.github/scripts/ci-feishu.sh label component_package):** [$(.github/scripts/ci-feishu.sh label download)](${{ needs.package.outputs.artifact_url }})" \
+              "**$(.github/scripts/ci-feishu.sh label size):** ${{ needs.package.outputs.package_size }} bytes" \
+              "**SHA256:** \`${{ needs.package.outputs.package_sha256 }}\`")"
+            sections+=("${package_md}")
+          fi
+
+          if ((${#failed[@]} > 0)); then
+            failed_jobs=$(IFS=', '; echo "${failed[*]}")
+            failure_md="**$(.github/scripts/ci-feishu.sh label failed_jobs):** ${failed_jobs}"
+            sections+=("${failure_md}")
+          fi
+
           run_md="**$(.github/scripts/ci-feishu.sh label run_link):** [$(.github/scripts/ci-feishu.sh label view_detail)](${run_url})"
+          sections+=("${run_md}")
           .github/scripts/ci-feishu.sh send-card-v1 \
             "${FEISHU_WEBHOOK_URL}" \
-            "$(.github/scripts/ci-feishu.sh label build_ok)" \
-            green \
-            "${identity_md}" \
-            "${package_md}" \
-            "${run_md}"
+            "${title}" \
+            "${theme}" \
+            "${sections[@]}"

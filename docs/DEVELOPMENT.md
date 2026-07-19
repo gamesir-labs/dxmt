@@ -94,6 +94,29 @@ module or feature domain. Do not repeat a type as a scope: use `test(d3d11)`
 rather than `test(test)`. CI is a repository subsystem, so use `chore(ci)`,
 `perf(ci)`, or `fix(ci)` rather than using `ci` as the type.
 
+Push CI classifies every commit in the pushed range by its reviewed type and
+uses the union of their routes:
+
+- `test(...)` invokes the reusable native Windows D3D conformance workflow.
+- Runtime-affecting types (`feat`, `fix`, `refactor`, `perf`, `build`, `revert`,
+  and `merge`) invoke the Nightly build, except for repository-only scopes
+  (`ci`, `feishu`, `git`, and `repo`).
+- `docs`, `style`, `chore`, and test-only pushes do not invoke Nightly.
+
+The push workflow also validates every subject with the same
+`scripts/check-commit-message.sh` policy used by `commit-msg` and `pre-push`.
+This remote check is authoritative even when a contributor bypasses local hooks
+or force-pushes. Any invalid type, scope, or subject format fails commit routing
+and prevents downstream build and test jobs from starting.
+
+A mixed push can therefore invoke both workflows. Pushes do not emit immediate
+event cards. After all selected jobs finish, one aggregated Feishu result is
+sent. This notification is mandatory for every push: when no substantive CI
+job is selected, it still lists every pushed commit and reports both Nightly
+and Windows D3D as not triggered. Manual dispatch of the push workflow always
+invokes Nightly. A standalone manual Windows D3D run sends its own final result
+because it has no parent push workflow to aggregate it.
+
 ## Setup LLVM
 
 First of all, you need to build LLVM (or use a pre-built LLVM package) no matter if you want to use DXMT with Wine or as a native library. DXMT currently standardizes Wine, test helpers, native tools, and native libraries on `x86_64`; the supported Windows targets are x86 and x86_64.

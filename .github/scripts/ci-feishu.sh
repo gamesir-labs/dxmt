@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Feishu / Lark webhook helpers for macOS self-hosted CI runners.
-# Used by Nightly / Component result notify on self-macos-runner.
-# Push/PR/issue events stay on Windows via .github/scripts/ci-feishu.ps1.
+# Used by aggregated CI / Component result notifications on self-macos-runner.
+# PR/issue events stay on Windows via .github/scripts/ci-feishu.ps1.
 #
 # HTTP posts go through curl (macOS Secure Transport / system CA store).
 # Do not use Python urllib.request: Homebrew Python OpenSSL often fails
@@ -29,6 +29,15 @@ label() {
     download) printf '%s' '点击下载' ;;
     size) printf '%s' '大小' ;;
     failed_jobs) printf '%s' '失败任务' ;;
+    commit_types) printf '%s' '提交类型' ;;
+    commits) printf '%s' '本次提交' ;;
+    conventional_result) printf '%s' '提交规范校验' ;;
+    nightly_result) printf '%s' 'Nightly 构建' ;;
+    d3d_result) printf '%s' 'Windows D3D 测试' ;;
+    passed) printf '%s' '通过' ;;
+    failed) printf '%s' '失败' ;;
+    skipped) printf '%s' '未触发' ;;
+    cancelled) printf '%s' '已取消' ;;
     run_link) printf '%s' '运行链接' ;;
     view_detail) printf '%s' '查看详情' ;;
     pkg_name) printf '%s' '包名' ;;
@@ -39,6 +48,8 @@ label() {
     version_sha) printf '%s' '版本 SHA' ;;
     build_fail) printf '%s' '❌ DXMT Nightly 构建失败' ;;
     build_ok) printf '%s' '✅ DXMT Nightly 构建成功' ;;
+    ci_fail) printf '%s' '❌ DXMT CI 汇总失败' ;;
+    ci_ok) printf '%s' '✅ DXMT CI 汇总通过' ;;
     pub_fail) printf '%s' '❌ DXMT 组件发布失败' ;;
     pub_ok) printf '%s' '✅ DXMT 组件发布成功' ;;
     nightly_note) printf '%s' 'push nightly 仅构建打包，不跑测试' ;;

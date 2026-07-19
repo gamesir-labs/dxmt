@@ -1,11 +1,7 @@
 name: Windows D3D Public API Conformance
 
 on:
-  push:
-    branches: [dev-main, fh4-bug-fix, test-dev]
-  pull_request:
-    branches: [dev-main, fh4-bug-fix, test-dev]
-    types: [opened, reopened, synchronize]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -18,7 +14,6 @@ concurrency:
 jobs:
   windows-oracle:
     name: Windows D3D Public API Conformance
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
     steps:
@@ -38,49 +33,13 @@ jobs:
           clean: false
           fetch-depth: 0
 
-      - name: Detect test-related changes
-        shell: cmd
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          @echo off
-          setlocal EnableExtensions EnableDelayedExpansion
-          set "RUN_ORACLE=false"
-          if /I "%EVENT_NAME%"=="workflow_dispatch" set "RUN_ORACLE=true"
-
-          set "BASE=%BEFORE_SHA%"
-          if /I "%EVENT_NAME%"=="pull_request" set "BASE=%BASE_SHA%"
-          if not defined BASE set "BASE=%HEAD_SHA%~1"
-          echo %BASE%| findstr /R /X "0*" >nul && set "BASE=%HEAD_SHA%~1"
-          git cat-file -e "%BASE%" >nul 2>&1
-          if errorlevel 1 set "BASE=%HEAD_SHA%~1"
-
-          set "CHANGED=%RUNNER_TEMP%\dxmt-windows-oracle-changed-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%.txt"
-          git diff --name-only "%BASE%" "%HEAD_SHA%" > "%CHANGED%"
-          findstr /B /L /C:"tests/" /C:"tools/dxmt-builder/" /C:"scripts/dxmt-builder" /C:"meson.build" /C:"meson_options.txt" /C:".github/workflows/windows-d3d-conformance.yml" "%CHANGED%" >nul
-          if not errorlevel 1 set "RUN_ORACLE=true"
-
-          set "SUBJECT="
-          for /f "delims=" %%S in ('git log -1 --format^=%%s "%HEAD_SHA%"') do set "SUBJECT=%%S"
-          echo(!SUBJECT!| findstr /B /L /C:"test:" /C:"test(" /C:"fix(test):" /C:"fix(tests):" /C:"fix(d3d10):" /C:"fix(d3d11):" /C:"fix(d3d12):" /C:"build(test):" /C:"build(tests):" /C:"build(windows-oracle):" /C:"ci(test):" /C:"ci(tests):" /C:"ci(windows-oracle):" >nul
-          if not errorlevel 1 set "RUN_ORACLE=true"
-
-          type "%CHANGED%"
-          echo Commit subject: !SUBJECT!
-          echo Windows oracle required: !RUN_ORACLE!
-          >>"%GITHUB_ENV%" echo RUN_ORACLE=!RUN_ORACLE!
-
       - name: Build and run complete native Windows suites with builder
         id: oracle
-        if: env.RUN_ORACLE == 'true'
         shell: cmd
         run: call scripts\dxmt-builder.bat test --profile gcc-x64-release-full unit
 
       - name: Upload Windows oracle logs
-        if: always() && env.RUN_ORACLE == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-d3d-results-${{ github.sha }}-${{ github.run_attempt }}
@@ -88,13 +47,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Notify Feishu of conformance result
-        if: always() && env.RUN_ORACLE == 'true'
+      - name: Notify Feishu for manual conformance run
+        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
         continue-on-error: true
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command ". '{0}'"
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          CONFORMANCE_RESULT: ${{ job.status }}
           ORACLE_OUTCOME: ${{ steps.oracle.outcome }}
         run: |
           . .\.github\scripts\ci-feishu.ps1
@@ -104,13 +62,9 @@ jobs:
             exit 0
           }
 
-          $passed = ($env:CONFORMANCE_RESULT -eq 'success') -and ($env:ORACLE_OUTCOME -eq 'success')
+          $passed = $env:ORACLE_OUTCOME -eq 'success'
           $labels = Get-FeishuLabels
-          $title = if ($passed) {
-            $labels.ConformanceOk
-          } else {
-            $labels.ConformanceFail
-          }
+          $title = if ($passed) { $labels.ConformanceOk } else { $labels.ConformanceFail }
           $theme = if ($passed) { 'green' } else { 'red' }
           $result = if ($passed) { $labels.Passed } else { $labels.Failed }
           $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"

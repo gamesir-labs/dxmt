@@ -1,8 +1,6 @@
-name: Notify Feishu on GitHub Events
+name: Notify Feishu on Collaboration Events
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
     branches: ["**"]
     types: [opened, closed, reopened, edited, synchronize]
@@ -46,73 +44,50 @@ jobs:
           $actor = $env:GITHUB_ACTOR
           # Event payload is UTF-8 JSON from GitHub.
           $event = Get-Content -Raw -Encoding UTF8 -Path $env:GITHUB_EVENT_PATH | ConvertFrom-Json
+          $labels = Get-FeishuLabels
+          $actionLabels = @{
+            opened      = $labels.Opened
+            closed      = $labels.Closed
+            reopened    = $labels.Reopened
+            edited      = $labels.Edited
+            synchronize = $labels.Synchronized
+          }
 
-          $messageTitle = 'Other Event'
+          $messageTitle = $labels.OtherEvent
           $messageSubTitle = "$repoName | $refName"
-          $message = "Event $eventName triggered"
+          $message = "$($labels.EventTriggered): $eventName"
           $messageTheme = 'blue'
-          $actionText = 'Open repository'
+          $actionText = $labels.OpenRepo
           $actionUrl = $repoUrl
 
           switch ($eventName) {
-            'push' {
-              # StrictMode throws on missing NoteProperties; read via helper.
-              $commits = @(Get-NotePropertyValue $event 'commits' @())
-              $sizeValue = Get-NotePropertyValue $event 'size'
-              $commitCount = if ($null -ne $sizeValue) { [int]$sizeValue } else { $commits.Count }
-              $messageTitle = if ($commitCount -eq 1) { '1 commit pushed' } else { "$commitCount commits pushed" }
-              $messageSubTitle = "$repoName | $refName | pushed by $actor"
-              $messageTheme = 'blue'
-              $actionText = 'View changes'
-              $compareUrl = Get-NotePropertyValue $event 'compare'
-              if (-not [string]::IsNullOrWhiteSpace([string]$compareUrl)) {
-                $actionUrl = [string]$compareUrl
-              }
-
-              $lines = New-Object System.Collections.Generic.List[string]
-              foreach ($commit in $commits) {
-                $id = [string](Get-NotePropertyValue $commit 'id' '')
-                $sha = $id.Substring(0, [Math]::Min(7, $id.Length))
-                $rawMessage = [string](Get-NotePropertyValue $commit 'message' '')
-                $subject = ($rawMessage -split "`n")[0] -replace "[\r\t]", ' '
-                if ($subject.Length -gt 180) { $subject = $subject.Substring(0, 177) + '...' }
-                $authorObj = Get-NotePropertyValue $commit 'author'
-                $authorName = Get-NotePropertyValue $authorObj 'name'
-                $author = if ($authorName) { [string]$authorName } else { 'Unknown author' }
-                $author = $author -replace "[\r\n\t]", ' '
-                $lines.Add("[$sha](https://github.com/$repoFull/commit/$id)  $subject - $author") | Out-Null
-              }
-              if ($lines.Count -eq 0) {
-                $message = 'No commits in push payload.'
-              } else {
-                $message = ($lines -join "`n")
-              }
-            }
             'pull_request' {
               $action = [string]$event.action
+              $actionLabel = if ($actionLabels.ContainsKey($action)) { $actionLabels[$action] } else { $action }
               $number = [string]$event.pull_request.number
               $title = [string]$event.pull_request.title
               $user = [string]$event.pull_request.user.login
               $headRef = [string]$event.pull_request.head.ref
               $baseRef = [string]$event.pull_request.base.ref
               $actionUrl = [string]$event.pull_request.html_url
-              $messageTitle = "Pull request $action"
+              $messageTitle = "$($labels.PullRequest): $actionLabel"
               $messageSubTitle = "$repoName | $headRef -> $baseRef"
-              $message = "[#$number]($actionUrl)  $title`n`nOpened by $user"
+              $message = "[#$number]($actionUrl)  $title`n`n$($labels.Initiator): $user"
               $messageTheme = 'turquoise'
-              $actionText = 'View pull request'
+              $actionText = $labels.ViewPullRequest
             }
             'issues' {
               $action = [string]$event.action
+              $actionLabel = if ($actionLabels.ContainsKey($action)) { $actionLabels[$action] } else { $action }
               $number = [string]$event.issue.number
               $title = [string]$event.issue.title
               $user = [string]$event.issue.user.login
               $actionUrl = [string]$event.issue.html_url
-              $messageTitle = "Issue $action"
+              $messageTitle = "$($labels.Issue): $actionLabel"
               $messageSubTitle = "$repoName | #$number | $user"
               $message = "[#$number]($actionUrl)  $title"
               $messageTheme = 'orange'
-              $actionText = 'View issue'
+              $actionText = $labels.ViewIssue
             }
           }
 

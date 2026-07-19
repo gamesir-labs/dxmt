@@ -182,6 +182,14 @@ test(
 python3_native = find_program('python3', native: true)
 
 test(
+  'ci-routing-policy',
+  python3_native,
+  args: [files('ci/ci_routing_policy_test.py')],
+  suite: ['unit', 'repository'],
+  timeout: 30,
+)
+
+test(
   'd3d12-coverage-validator-tests',
   python3_native,
   args: [files('coverage/test_check_d3d12_coverage.py')],
