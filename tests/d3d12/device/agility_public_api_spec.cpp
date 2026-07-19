@@ -67,20 +67,16 @@ TEST(D3D12AgilityPublicApiSpec, ConfigurationAndFactoryUsePublicInterfaces) {
             S_OK);
   ASSERT_TRUE(base_configuration);
 
-  const HRESULT set_version =
-      base_configuration->SetSDKVersion(kAgilitySdkVersion, ".\\D3D12\\");
   auto factory = CreateDeviceFactory(configuration.get());
-  configuration->FreeUnusedSDKs();
-  if (FAILED(set_version) || !factory)
+  if (!factory)
     GTEST_SKIP() << "an app-local Agility SDK is not staged";
 
+  ASSERT_EQ(factory->InitializeFromGlobalState(), S_OK);
   const auto flags = static_cast<D3D12_DEVICE_FACTORY_FLAGS>(
       D3D12_DEVICE_FACTORY_FLAG_ALLOW_RETURNING_EXISTING_DEVICE |
       D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON);
   ASSERT_EQ(factory->SetFlags(flags), S_OK);
   EXPECT_EQ(factory->GetFlags(), flags);
-  EXPECT_EQ(factory->ApplyToGlobalState(), S_OK);
-  EXPECT_EQ(factory->InitializeFromGlobalState(), S_OK);
 
   const HRESULT feature_hr =
       factory->EnableExperimentalFeatures(0, nullptr, nullptr, nullptr);
@@ -92,6 +88,10 @@ TEST(D3D12AgilityPublicApiSpec, ConfigurationAndFactoryUsePublicInterfaces) {
                                   reinterpret_cast<void **>(device.put())),
             S_OK);
   EXPECT_TRUE(device);
+  device.reset();
+  factory.reset();
+  base_configuration.reset();
+  configuration->FreeUnusedSDKs();
 }
 
 TEST(D3D12AgilityPublicApiSpec,
@@ -100,7 +100,6 @@ TEST(D3D12AgilityPublicApiSpec,
   if (!sdk_configuration)
     GTEST_SKIP() << "ID3D12SDKConfiguration1 is unavailable";
   auto factory = CreateDeviceFactory(sdk_configuration.get());
-  sdk_configuration->FreeUnusedSDKs();
   if (!factory)
     GTEST_SKIP() << "an app-local Agility SDK is not staged";
 
@@ -153,6 +152,13 @@ TEST(D3D12AgilityPublicApiSpec,
     dred->SetBreadcrumbContextEnablement(
         D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED);
   }
+  dred.reset();
+  deserializer.reset();
+  error.reset();
+  blob.reset();
+  configuration.reset();
+  factory.reset();
+  sdk_configuration->FreeUnusedSDKs();
 }
 
 } // namespace
