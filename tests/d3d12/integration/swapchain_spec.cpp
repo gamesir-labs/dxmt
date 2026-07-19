@@ -214,8 +214,10 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
 
   auto swapchain = CreateSwapChain(2, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
   ASSERT_TRUE(swapchain);
+  DXGI_PRESENT_PARAMETERS parameters = {};
   EXPECT_EQ(swapchain->Present1(
-                0, DXGI_PRESENT_ALLOW_TEARING | DXGI_PRESENT_TEST, nullptr),
+                0, DXGI_PRESENT_ALLOW_TEARING | DXGI_PRESENT_TEST,
+                &parameters),
             S_OK);
   EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 0u);
 }

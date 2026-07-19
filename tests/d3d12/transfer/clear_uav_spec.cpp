@@ -16,6 +16,7 @@ using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
 struct BufferUav {
+  ComPtr<ID3D12Resource> initial_upload;
   ComPtr<ID3D12Resource> resource;
   ComPtr<ID3D12DescriptorHeap> gpu_heap;
   ComPtr<ID3D12DescriptorHeap> cpu_heap;
@@ -28,7 +29,7 @@ protected:
   BufferUav CreateBufferUav(const D3D12_UNORDERED_ACCESS_VIEW_DESC &desc,
                             std::span<const std::uint32_t> initial) {
     BufferUav result;
-    auto upload = context_.CreateUploadBuffer(
+    result.initial_upload = context_.CreateUploadBuffer(
         initial.size_bytes(), initial.data(), initial.size_bytes());
     result.resource =
         context_.CreateBuffer(initial.size_bytes(), D3D12_HEAP_TYPE_DEFAULT,
@@ -38,7 +39,8 @@ protected:
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
     result.cpu_heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
-    if (!upload || !result.resource || !result.gpu_heap || !result.cpu_heap)
+    if (!result.initial_upload || !result.resource || !result.gpu_heap ||
+        !result.cpu_heap)
       return {};
     context_.device()->CreateUnorderedAccessView(
         result.resource.get(), nullptr, &desc,
@@ -46,7 +48,8 @@ protected:
     context_.device()->CreateUnorderedAccessView(
         result.resource.get(), nullptr, &desc,
         result.cpu_heap->GetCPUDescriptorHandleForHeapStart());
-    context_.list()->CopyBufferRegion(result.resource.get(), 0, upload.get(), 0,
+    context_.list()->CopyBufferRegion(result.resource.get(), 0,
+                                      result.initial_upload.get(), 0,
                                       initial.size_bytes());
     D3D12TestContext::Transition(context_.list(), result.resource.get(),
                                  D3D12_RESOURCE_STATE_COPY_DEST,
