@@ -2,11 +2,17 @@
 
 #include "sha256.hpp"
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -35,6 +41,107 @@ struct CommandResult {
 };
 
 using Environment = std::map<std::string, std::string>;
+
+std::uint64_t ProcessId() {
+#ifdef _WIN32
+  return static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+  return static_cast<std::uint64_t>(getpid());
+#endif
+}
+
+bool IsExecutableFile(const fs::path &path) {
+#ifdef _WIN32
+  return fs::is_regular_file(path);
+#else
+  return fs::is_regular_file(path) && access(path.c_str(), X_OK) == 0;
+#endif
+}
+
+#ifdef _WIN32
+std::wstring Widen(std::string_view value) {
+  if (value.empty())
+    return {};
+  const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                       value.data(),
+                                       static_cast<int>(value.size()), nullptr,
+                                       0);
+  if (size <= 0)
+    throw std::runtime_error("failed to convert UTF-8 command argument");
+  std::wstring result(static_cast<std::size_t>(size), L'\0');
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                      static_cast<int>(value.size()), result.data(), size);
+  return result;
+}
+
+std::wstring QuoteWindowsArgument(std::wstring_view argument) {
+  if (argument.empty())
+    return L"\"\"";
+  if (argument.find_first_of(L" \t\"") == std::wstring_view::npos)
+    return std::wstring(argument);
+
+  std::wstring result = L"\"";
+  std::size_t backslashes = 0;
+  for (const wchar_t character : argument) {
+    if (character == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (character == L'\"') {
+      result.append(backslashes * 2 + 1, L'\\');
+      result.push_back(character);
+      backslashes = 0;
+      continue;
+    }
+    result.append(backslashes, L'\\');
+    backslashes = 0;
+    result.push_back(character);
+  }
+  result.append(backslashes * 2, L'\\');
+  result.push_back(L'\"');
+  return result;
+}
+
+std::wstring BuildWindowsCommandLine(
+    const std::vector<std::string> &arguments) {
+  std::wstring command_line;
+  for (const auto &argument : arguments) {
+    if (!command_line.empty())
+      command_line.push_back(L' ');
+    command_line += QuoteWindowsArgument(Widen(argument));
+  }
+  return command_line;
+}
+
+std::vector<wchar_t> BuildWindowsEnvironment(const Environment &overrides) {
+  std::map<std::wstring, std::wstring, std::less<>> values;
+  wchar_t *environment = GetEnvironmentStringsW();
+  if (environment == nullptr)
+    throw std::system_error(GetLastError(), std::system_category(),
+                            "GetEnvironmentStringsW");
+  for (const wchar_t *entry = environment; *entry != L'\0';) {
+    const std::wstring_view record(entry);
+    const auto separator = record.find(L'=', record.starts_with(L'=') ? 1 : 0);
+    if (separator != std::wstring_view::npos)
+      values[std::wstring(record.substr(0, separator))] =
+          std::wstring(record.substr(separator + 1));
+    entry += record.size() + 1;
+  }
+  FreeEnvironmentStringsW(environment);
+  for (const auto &[name, value] : overrides)
+    values[Widen(name)] = Widen(value);
+
+  std::vector<wchar_t> block;
+  for (const auto &[name, value] : values) {
+    block.insert(block.end(), name.begin(), name.end());
+    block.push_back(L'=');
+    block.insert(block.end(), value.begin(), value.end());
+    block.push_back(L'\0');
+  }
+  block.push_back(L'\0');
+  return block;
+}
+#endif
 
 std::string ShellQuote(std::string_view value) {
   if (value.find_first_of(" \t\n'\"") == std::string_view::npos)
@@ -65,6 +172,83 @@ CommandResult RunCommand(const std::vector<std::string> &arguments,
     throw std::runtime_error("attempted to execute an empty command");
   PrintCommand(arguments);
 
+#ifdef _WIN32
+  HANDLE read_pipe = nullptr;
+  HANDLE write_pipe = nullptr;
+  if (capture) {
+    SECURITY_ATTRIBUTES security = {sizeof(security), nullptr, TRUE};
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0) ||
+        !SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0))
+      throw std::system_error(GetLastError(), std::system_category(),
+                              "CreatePipe");
+  }
+
+  auto command_line = BuildWindowsCommandLine(arguments);
+  std::vector<wchar_t> environment_block;
+  if (!environment.empty())
+    environment_block = BuildWindowsEnvironment(environment);
+  std::wstring working_directory_path;
+  if (working_directory)
+    working_directory_path = working_directory->wstring();
+  STARTUPINFOW startup = {};
+  startup.cb = sizeof(startup);
+  if (capture) {
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = write_pipe;
+  }
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(nullptr, command_line.data(), nullptr, nullptr, capture,
+                      CREATE_UNICODE_ENVIRONMENT,
+                      environment_block.empty() ? nullptr
+                                                : environment_block.data(),
+                      working_directory
+                          ? working_directory_path.c_str()
+                          : nullptr,
+                      &startup, &process)) {
+    const auto error = GetLastError();
+    if (read_pipe)
+      CloseHandle(read_pipe);
+    if (write_pipe)
+      CloseHandle(write_pipe);
+    throw std::system_error(error, std::system_category(), "CreateProcessW");
+  }
+  CloseHandle(process.hThread);
+  if (write_pipe)
+    CloseHandle(write_pipe);
+
+  CommandResult result;
+  if (capture) {
+    std::array<char, 4096> buffer{};
+    DWORD size = 0;
+    while (ReadFile(read_pipe, buffer.data(),
+                    static_cast<DWORD>(buffer.size()), &size, nullptr)) {
+      if (size != 0)
+        result.output.append(buffer.data(), size);
+    }
+    const auto error = GetLastError();
+    CloseHandle(read_pipe);
+    if (error != ERROR_BROKEN_PIPE)
+      throw std::system_error(error, std::system_category(), "ReadFile");
+  }
+  if (WaitForSingleObject(process.hProcess, INFINITE) != WAIT_OBJECT_0) {
+    const auto error = GetLastError();
+    CloseHandle(process.hProcess);
+    throw std::system_error(error, std::system_category(),
+                            "WaitForSingleObject");
+  }
+  DWORD exit_code = 1;
+  if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+    const auto error = GetLastError();
+    CloseHandle(process.hProcess);
+    throw std::system_error(error, std::system_category(),
+                            "GetExitCodeProcess");
+  }
+  CloseHandle(process.hProcess);
+  result.status = static_cast<int>(exit_code);
+  return result;
+#else
   int pipe_fds[2] = {-1, -1};
   if (capture && pipe(pipe_fds) != 0)
     throw std::system_error(errno, std::generic_category(), "pipe");
@@ -121,6 +305,7 @@ CommandResult RunCommand(const std::vector<std::string> &arguments,
   else if (WIFSIGNALED(wait_status))
     result.status = 128 + WTERMSIG(wait_status);
   return result;
+#endif
 }
 
 void RequireSuccess(const CommandResult &result, std::string_view operation) {
@@ -134,6 +319,20 @@ void RequireSuccess(const CommandResult &result, std::string_view operation) {
 }
 
 std::optional<fs::path> FindExecutable(std::string_view name) {
+#ifdef _WIN32
+  const auto requested = Widen(name);
+  std::vector<wchar_t> buffer(1024);
+  while (true) {
+    const DWORD size = SearchPathW(nullptr, requested.c_str(), L".exe",
+                                   static_cast<DWORD>(buffer.size()),
+                                   buffer.data(), nullptr);
+    if (size == 0)
+      return std::nullopt;
+    if (size < buffer.size())
+      return fs::weakly_canonical(fs::path(buffer.data()));
+    buffer.resize(static_cast<std::size_t>(size) + 1);
+  }
+#else
   const fs::path requested(name);
   if (requested.has_parent_path()) {
     if (access(requested.c_str(), X_OK) == 0)
@@ -156,6 +355,7 @@ std::optional<fs::path> FindExecutable(std::string_view name) {
     paths.remove_prefix(separator + 1);
   }
   return std::nullopt;
+#endif
 }
 
 fs::path RequireExecutable(std::string_view name) {
@@ -183,7 +383,8 @@ void WriteFileAtomic(const fs::path &path, std::string_view contents) {
     if (current == contents)
       return;
   }
-  const auto temporary = path.string() + ".tmp-" + std::to_string(getpid());
+  const auto temporary =
+      path.string() + ".tmp-" + std::to_string(ProcessId());
   {
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output)
@@ -354,6 +555,22 @@ class FileLock {
 public:
   explicit FileLock(const fs::path &path) {
     fs::create_directories(path.parent_path());
+#ifdef _WIN32
+    handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle_ == INVALID_HANDLE_VALUE)
+      throw std::system_error(GetLastError(), std::system_category(),
+                              "CreateFileW lock");
+    OVERLAPPED overlapped = {};
+    if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD,
+                    &overlapped)) {
+      const auto error = GetLastError();
+      CloseHandle(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+      throw std::system_error(error, std::system_category(), "LockFileEx");
+    }
+#else
     descriptor_ = open(path.c_str(), O_CREAT | O_RDWR, 0644);
     if (descriptor_ < 0)
       throw std::system_error(errno, std::generic_category(), "open lock");
@@ -362,20 +579,33 @@ public:
       close(descriptor_);
       throw std::system_error(error, std::generic_category(), "flock");
     }
+#endif
   }
 
   FileLock(const FileLock &) = delete;
   FileLock &operator=(const FileLock &) = delete;
 
   ~FileLock() {
+#ifdef _WIN32
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      OVERLAPPED overlapped = {};
+      UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &overlapped);
+      CloseHandle(handle_);
+    }
+#else
     if (descriptor_ >= 0) {
       flock(descriptor_, LOCK_UN);
       close(descriptor_);
     }
+#endif
   }
 
 private:
+#ifdef _WIN32
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
   int descriptor_ = -1;
+#endif
 };
 
 std::string Trim(std::string value) {
@@ -633,6 +863,8 @@ public:
       return BuildCommand(arguments.subspan(1));
     if (arguments.front() == "test")
       return TestCommand(arguments.subspan(1));
+    if (arguments.front() == "package")
+      return PackageCommand(arguments.subspan(1));
     if (arguments.front() == "wine-exec")
       return WineExecCommand(arguments.subspan(1));
     if (arguments.front() == "install")
@@ -662,7 +894,7 @@ private:
          << "\",\"duration_ms\":" << duration << "}\n";
     WriteFileAtomic(managed_root_ / "telemetry" /
                         (std::to_string(timestamp) + "-" +
-                         std::to_string(getpid()) + ".json"),
+                        std::to_string(ProcessId()) + ".json"),
                     json.str());
   }
 
@@ -674,6 +906,7 @@ private:
         << "  configure [--profile NAME]\n"
         << "  build [--profile NAME] <runtime|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
         << "  test [--profile NAME] [all|unit|integration|performance] [--suite NAME] [--test-args ARG]\n"
+        << "  package [--profile NAME] windows-oracle [--dest PATH]\n"
         << "  wine-exec [--] <wine-args...>   # Meson/benchmark Wine launcher\n"
         << "  install [--profile NAME] [--component NAME] [--dest PATH]\n"
         << "  config <cache-root|namespace|profile-path --profile NAME KIND>\n"
@@ -921,7 +1154,7 @@ private:
         const auto candidate = entry.path() / "bin" / executable;
         if (entry.path().filename().string().starts_with("llvm-mingw-") &&
             fs::is_regular_file(entry.path() / ".dxmt-builder-dependency") &&
-            access(candidate.c_str(), X_OK) == 0)
+            IsExecutableFile(candidate))
           // llvm-mingw dispatches from the invoked symlink name. Resolving it
           // to clang-target-wrapper.sh loses the target triple.
           return fs::absolute(candidate).lexically_normal();
@@ -1274,7 +1507,7 @@ private:
   }
 
   static bool PathIsExecutable(const fs::path &path) {
-    return fs::is_regular_file(path) && access(path.c_str(), X_OK) == 0;
+    return IsExecutableFile(path);
   }
 
   static std::optional<fs::path> FindWineLauncher(const fs::path &root) {
@@ -1565,7 +1798,142 @@ private:
                {{"WINEPREFIX", prefix.string()}}, true);
   }
 
+#ifdef _WIN32
+  fs::path BuildWindowsOracle(std::string_view profile_name) const {
+    FileLock lock(ProfileLockPath(profile_name));
+    const auto build = managed_root_ / "windows-oracle" /
+                       std::string(profile_name) / "build-meson-clang";
+    const auto meson = RequireExecutable("meson");
+    const Environment toolchain = {
+        {"CC", "clang-cl"},       {"CXX", "clang-cl"},
+        {"CC_LD", "lld-link"},   {"CXX_LD", "lld-link"},
+        {"AR", "llvm-lib"},
+    };
+    std::vector<std::string> setup = {
+        meson.string(), "setup", build.string(), repo_root_.string(),
+        "--backend=ninja", "--buildtype=release",
+        "-Dwindows_oracle_only=true",
+    };
+    if (fs::is_regular_file(build / "meson-private/coredata.dat"))
+      setup.emplace_back("--reconfigure");
+    RequireSuccess(RunCommand(setup, toolchain),
+                   "native Windows oracle configuration");
+    RequireSuccess(
+        RunCommand({meson.string(), "compile", "-C", build.string(),
+                    "dxmt-wine-d3d10-tests", "dxmt-wine-d3d11-tests",
+                    "dxmt-wine-d3d12-tests"},
+                   toolchain),
+        "native Windows oracle build");
+
+    const auto output = build / "tests";
+    for (const auto &name : {"dxmt-wine-d3d10-tests.exe",
+                             "dxmt-wine-d3d11-tests.exe",
+                             "dxmt-wine-d3d12-tests.exe",
+                             "run-windows-oracle.bat"}) {
+      if (!fs::is_regular_file(output / name))
+        throw std::runtime_error("native Windows oracle output is missing: " +
+                                 (output / name).string());
+    }
+    return output;
+  }
+
+  int TestWindowsOracle(std::span<const std::string> arguments) const {
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::string> remaining;
+    const auto name = ParseProfile(arguments, &remaining);
+    if (remaining.size() != 1 ||
+        (remaining.front() != "unit" && remaining.front() != "all"))
+      throw std::runtime_error(
+          "native Windows builder tests require the existing unit or all mode");
+
+    const auto output = BuildWindowsOracle(name);
+    const auto cmd = RequireExecutable("cmd");
+    const auto result = RunCommand(
+        {cmd.string(), "/d", "/c", "call run-windows-oracle.bat"}, {}, false,
+        output);
+    RequireSuccess(result, "native Windows D3D oracle suites");
+    RecordTelemetry("test", name + ":unit:windows-oracle", "success",
+                    started);
+    std::cout << (output / "windows-oracle-results").string() << '\n';
+    return 0;
+  }
+
+  int PackageWindowsOracle(
+      const std::string &name, const std::optional<fs::path> &destination,
+      std::chrono::steady_clock::time_point started) const {
+    const auto oracle = BuildWindowsOracle(name);
+    const auto commit = RunCommand(
+        {"git", "-C", repo_root_.string(), "rev-parse", "HEAD"}, {}, true);
+    RequireSuccess(commit, "Windows oracle source identity");
+    const auto short_commit = Trim(commit.output).substr(0, 12);
+    const auto output = destination.value_or(
+        managed_root_ / "artifacts/local-1" / name /
+        ("dxmt-windows-oracle-" + short_commit + ".zip"));
+    if (output.extension() != ".zip")
+      throw std::runtime_error("Windows oracle destination must end in .zip");
+    fs::create_directories(output.parent_path());
+
+    const auto staging = managed_root_ / "artifacts/.staging" /
+                         ("windows-oracle-" + std::to_string(ProcessId()) +
+                          "-" + std::to_string(std::chrono::steady_clock::now()
+                                                   .time_since_epoch()
+                                                   .count()));
+    fs::create_directories(staging);
+    for (const auto &name : {"dxmt-wine-d3d10-tests.exe",
+                             "dxmt-wine-d3d11-tests.exe",
+                             "dxmt-wine-d3d12-tests.exe",
+                             "run-windows-oracle.bat"}) {
+      fs::copy_file(oracle / name, staging / name,
+                    fs::copy_options::overwrite_existing);
+    }
+
+    std::ostringstream instructions;
+    instructions
+        << "DXMT native Windows D3D behavior oracle\n\n"
+        << "Suite schema: public-api-v1\n"
+        << "Source commit: " << Trim(commit.output) << "\n"
+        << "Builder profile: " << name << "\n\n"
+        << "Run run-windows-oracle.bat from a Windows command prompt.\n";
+    WriteFileAtomic(staging / "README.txt", instructions.str());
+
+    std::ostringstream digests;
+    for (const auto &file : {"dxmt-wine-d3d10-tests.exe",
+                             "dxmt-wine-d3d11-tests.exe",
+                             "dxmt-wine-d3d12-tests.exe",
+                             "run-windows-oracle.bat"}) {
+      digests << Sha256File(staging / file) << "  " << file << '\n';
+    }
+    WriteFileAtomic(staging / "SHA256SUMS.txt", digests.str());
+
+    const auto incomplete = output.parent_path() /
+                            ("." + output.stem().string() + ".incomplete-" +
+                             std::to_string(ProcessId()) + ".zip");
+    const auto tar = RequireExecutable("tar");
+    RequireSuccess(
+        RunCommand({tar.string(), "-a", "-c", "-f", incomplete.string(),
+                    "dxmt-wine-d3d10-tests.exe",
+                    "dxmt-wine-d3d11-tests.exe",
+                    "dxmt-wine-d3d12-tests.exe", "run-windows-oracle.bat",
+                    "README.txt", "SHA256SUMS.txt"},
+                   {}, false, staging),
+        "Windows oracle archive");
+    RequireSuccess(RunCommand({tar.string(), "-t", "-f",
+                               incomplete.string()}),
+                   "Windows oracle archive verification");
+    std::error_code error;
+    fs::remove(output, error);
+    fs::rename(incomplete, output);
+    fs::remove_all(staging);
+    RecordTelemetry("package", name + ":windows-oracle", "success", started);
+    std::cout << output.string() << '\n';
+    return 0;
+  }
+#endif
+
   int TestCommand(std::span<const std::string> arguments) const {
+#ifdef _WIN32
+    return TestWindowsOracle(arguments);
+#else
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::string> remaining;
     const auto name = ParseProfile(arguments, &remaining);
@@ -1657,6 +2025,121 @@ private:
     RecordTelemetry("test", name + ":" + mode + ":" + suite, "success",
                     started);
     return 0;
+#endif
+  }
+
+  int PackageCommand(std::span<const std::string> arguments) const {
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::string> remaining;
+    const auto name = ParseProfile(arguments, &remaining);
+    if (remaining.empty() || remaining.front() != "windows-oracle")
+      throw std::runtime_error("package requires the windows-oracle subject");
+
+    std::optional<fs::path> destination;
+    for (std::size_t index = 1; index < remaining.size(); ++index) {
+      if (remaining[index] == "--dest") {
+        if (++index >= remaining.size())
+          throw std::runtime_error("--dest requires a value");
+        destination = fs::absolute(remaining[index]).lexically_normal();
+      } else {
+        throw std::runtime_error("unexpected package argument: " +
+                                 remaining[index]);
+      }
+    }
+
+#ifdef _WIN32
+    return PackageWindowsOracle(name, destination, started);
+#else
+    FileLock lock(ProfileLockPath(name));
+    const auto profile = EnsureConfigured(name);
+    const auto compile = std::vector<std::string>{
+        "meson", "compile", "-C", profile.build.string(),
+        "dxmt-wine-tests-d3d10", "dxmt-wine-tests-d3d11",
+        "dxmt-wine-tests-d3d12"};
+    RequireSuccess(RunCommand(compile, BuildEnvironment()),
+                   "Windows oracle prerequisite build");
+
+    const std::array executables = {
+        profile.build / "tests/dxmt-wine-d3d10-tests.exe",
+        profile.build / "tests/dxmt-wine-d3d11-tests.exe",
+        profile.build / "tests/dxmt-wine-d3d12-tests.exe",
+    };
+    const auto script = profile.build / "tests/run-windows-oracle.bat";
+    for (const auto &required :
+         {executables[0], executables[1], executables[2], script}) {
+      if (!fs::is_regular_file(required))
+        throw std::runtime_error("Windows oracle artifact is missing: " +
+                                 required.string());
+    }
+
+    const auto commit = RunCommand(
+        {"git", "-C", repo_root_.string(), "rev-parse", "HEAD"}, {}, true);
+    RequireSuccess(commit, "Windows oracle source identity");
+    const auto short_commit = Trim(commit.output).substr(0, 12);
+    const auto artifact_root = managed_root_ / "artifacts/local-1" / name;
+    const auto output = destination.value_or(
+        artifact_root /
+        ("dxmt-windows-oracle-" + short_commit + ".zip"));
+    if (output.extension() != ".zip")
+      throw std::runtime_error("Windows oracle destination must end in .zip");
+    fs::create_directories(output.parent_path());
+
+    const auto staging =
+        managed_root_ / "artifacts/.staging" /
+        ("windows-oracle-" + std::to_string(ProcessId()) + "-" +
+         std::to_string(std::chrono::steady_clock::now()
+                            .time_since_epoch()
+                            .count()));
+    fs::create_directories(staging);
+    const auto readme = staging / "README.txt";
+    const auto checksums = staging / "SHA256SUMS.txt";
+    std::ostringstream instructions;
+    instructions
+        << "DXMT D3D10, D3D11, and D3D12 Windows behavior oracle\n\n"
+        << "Suite schema: public-api-v1\n\n"
+        << "Keep all three EXEs and the batch script in the same directory.\n"
+        << "Do not copy DXMT Direct3D or DXGI DLLs beside the EXEs.\n\n"
+        << "Default run (complete D3D10/D3D11/D3D12 suites):\n"
+        << "  run-windows-oracle.bat\n\n"
+        << "Complete D3D12 suite with the Debug Layer:\n"
+        << "  run-windows-oracle.bat --debug\n\n"
+        << "Use the default hardware adapter for D3D12:\n"
+        << "  run-windows-oracle.bat --hardware\n\n"
+        << "Source commit: " << Trim(commit.output) << "\n"
+        << "Builder profile: " << name << "\n";
+    WriteFileAtomic(readme, instructions.str());
+
+    std::ostringstream digest_manifest;
+    digest_manifest << Sha256File(executables[0])
+                    << "  dxmt-wine-d3d10-tests.exe\n"
+                    << Sha256File(executables[1])
+                    << "  dxmt-wine-d3d11-tests.exe\n"
+                    << Sha256File(executables[2])
+                    << "  dxmt-wine-d3d12-tests.exe\n"
+                    << Sha256File(script) << "  run-windows-oracle.bat\n";
+    WriteFileAtomic(checksums, digest_manifest.str());
+
+    const auto incomplete =
+        output.parent_path() /
+        ("." + output.stem().string() + ".incomplete-" +
+         std::to_string(ProcessId()) + ".zip");
+    const std::vector<std::string> zip_command = {
+        "/usr/bin/zip", "-j", "-9", incomplete.string(),
+        executables[0].string(), executables[1].string(),
+        executables[2].string(), script.string(), readme.string(),
+        checksums.string()};
+    RequireSuccess(RunCommand(zip_command), "Windows oracle archive");
+    if (!fs::is_regular_file(incomplete) || fs::file_size(incomplete) == 0)
+      throw std::runtime_error("Windows oracle archive was not created");
+    RequireSuccess(RunCommand({"/usr/bin/unzip", "-tq", incomplete.string()}),
+                   "Windows oracle archive verification");
+    fs::rename(incomplete, output);
+    fs::remove_all(staging);
+
+    RecordTelemetry("package", name + ":windows-oracle", "success", started);
+    std::cout << output.string() << '\n';
+    return 0;
+#endif
   }
 
   int InstallCommand(std::span<const std::string> arguments) const {
@@ -1946,7 +2429,8 @@ private:
     RequireSuccess(RunCommand(command, BuildEnvironment()), "cached command");
     if (!fs::is_regular_file(output))
       throw std::runtime_error("cached command did not produce " + output.string());
-    const auto temporary = entry.string() + ".tmp-" + std::to_string(getpid());
+    const auto temporary =
+        entry.string() + ".tmp-" + std::to_string(ProcessId());
     fs::copy_file(output, temporary, fs::copy_options::overwrite_existing);
     fs::rename(temporary, entry);
     RecordTelemetry("cas", cache_namespace, "miss", started);

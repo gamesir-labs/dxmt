@@ -8,6 +8,7 @@ d3d12_runtime_support_lib = static_library(
   ),
   dependencies: [d3d12_test_dep, d3dcompiler_test_dep],
   include_directories: [d3d12_test_include_dirs],
+  cpp_args: windows_oracle_cpp_args,
   install: false,
 )
 
