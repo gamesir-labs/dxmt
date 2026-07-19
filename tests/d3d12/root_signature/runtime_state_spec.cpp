@@ -331,6 +331,58 @@ TEST_F(RootSignatureRuntimeStateSpec,
 }
 
 TEST_F(RootSignatureRuntimeStateSpec,
+       SameGraphicsRootSignaturePreservesGraphicsArguments) {
+  auto signature = CreateGraphicsSignature(context_);
+  ASSERT_TRUE(signature);
+
+  const auto pixel = CompileShader(R"(
+    cbuffer Color : register(b0) { float4 color; };
+    float4 main() : SV_Target { return color; }
+  )", "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  const D3D12_SHADER_BYTECODE bytecode = {pixel.bytecode->GetBufferPointer(),
+                                          pixel.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateGraphicsPipeline(
+      signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM, bytecode);
+  auto target = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                            false);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+  const D3D12_VIEWPORT viewport = {0, 0, 1, 1, 0, 1};
+  const D3D12_RECT scissor = {0, 0, 1, 1};
+  constexpr std::array<float, 4> color = {0.0f, 1.0f, 0.0f, 1.0f};
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetGraphicsRootSignature(signature.get());
+  context_.list()->SetGraphicsRoot32BitConstants(
+      0, static_cast<UINT>(color.size()), color.data(), 0);
+  // Re-binding the same root-signature object must preserve root constants.
+  context_.list()->SetGraphicsRootSignature(signature.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(
+      context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  ASSERT_GE(readback.data.size(), sizeof(std::uint32_t));
+  std::uint32_t actual = 0;
+  std::memcpy(&actual, readback.data.data(), sizeof(actual));
+  EXPECT_TRUE(ColorsMatch(actual, 0xff00ff00u, 1));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(RootSignatureRuntimeStateSpec,
        DifferentGraphicsRootSignatureAllowsArgumentsToBeRebound) {
   auto local_signature = CreateGraphicsSignature(context_);
   auto replacement = CreateGraphicsSignature(context_);
