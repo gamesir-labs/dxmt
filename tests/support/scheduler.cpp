@@ -810,12 +810,13 @@ int RunScheduledTests(int argc, char **argv) {
 
   std::string scheduler_errors;
   std::size_t failed_workers = 0;
+  std::vector<std::size_t> failed_shard_indexes;
   std::int64_t launch_us = 0;
 
   std::fflush(nullptr);
   const auto run_start = Clock::now();
   auto run_wave = [&](const std::vector<std::size_t> &indexes) {
-    std::vector<WineProcess> children;
+    std::vector<std::pair<WineProcess, std::size_t>> children;
     children.reserve(indexes.size());
     const auto launch_start = Clock::now();
     for (const auto index : indexes) {
@@ -830,14 +831,14 @@ int RunScheduledTests(int argc, char **argv) {
         scheduler_errors += '\n';
         ++failed_workers;
       } else {
-        children.push_back(*child);
+        children.push_back({*child, index});
       }
     }
     launch_us += std::chrono::duration_cast<std::chrono::microseconds>(
                      Clock::now() - launch_start)
                      .count();
 
-    for (const auto &child : children) {
+    for (const auto &[child, shard_index] : children) {
       const DWORD wait_result = WaitForSingleObject(child.handle, INFINITE);
       DWORD exit_code = 1;
       if (wait_result != WAIT_OBJECT_0) {
@@ -847,6 +848,7 @@ int RunScheduledTests(int argc, char **argv) {
         scheduler_errors += WineErrorMessage(GetLastError());
         scheduler_errors += '\n';
         ++failed_workers;
+        failed_shard_indexes.push_back(shard_index);
       } else if (!GetExitCodeProcess(child.handle, &exit_code)) {
         scheduler_errors += "failed to read Wine unit-test worker status ";
         scheduler_errors += std::to_string(child.id);
@@ -854,8 +856,15 @@ int RunScheduledTests(int argc, char **argv) {
         scheduler_errors += WineErrorMessage(GetLastError());
         scheduler_errors += '\n';
         ++failed_workers;
+        failed_shard_indexes.push_back(shard_index);
       } else if (exit_code != 0) {
+        scheduler_errors += "Wine unit-test worker shard ";
+        scheduler_errors += std::to_string(shard_index);
+        scheduler_errors += " exited with status ";
+        scheduler_errors += std::to_string(exit_code);
+        scheduler_errors += '\n';
         ++failed_workers;
+        failed_shard_indexes.push_back(shard_index);
       }
       CloseHandle(child.handle);
     }
@@ -882,6 +891,18 @@ int RunScheduledTests(int argc, char **argv) {
   std::string failure_reports;
   for (const auto &path : report_paths)
     failure_reports += ReadAndRemoveReport(path);
+  if (failure_reports.empty()) {
+    for (const auto index : failed_shard_indexes) {
+      scheduler_errors += "tests assigned to failed shard ";
+      scheduler_errors += std::to_string(index);
+      scheduler_errors += ":\n";
+      for (const auto &test : shards[index].tests) {
+        scheduler_errors += "  ";
+        scheduler_errors += test;
+        scheduler_errors += '\n';
+      }
+    }
+  }
   for (const auto &path : timing_report_paths)
     MergeTimingReport(path);
   if (!WriteTimingDatabase(timing_database_path)) {
