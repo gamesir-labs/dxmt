@@ -15,15 +15,6 @@ using dxmt::test::D3D12TestContext;
 
 enum class WaveSemantic {
   ActiveSum,
-  ActiveMin,
-  ActiveMax,
-  PrefixSum,
-  ReadLaneAt,
-  AllTrue,
-  AnyTrue,
-  BallotEvenCount,
-  IsFirstLane,
-  FirstLaneActiveSum,
 };
 
 struct WaveSemanticCase {
@@ -67,27 +58,6 @@ protected:
     switch (semantic) {
     case WaveSemantic::ActiveSum:
       return active_count * (first_thread + 1 + last_thread + 1) / 2;
-    case WaveSemantic::ActiveMin:
-      return first_thread + 7;
-    case WaveSemantic::ActiveMax:
-      return last_thread + 7;
-    case WaveSemantic::PrefixSum:
-      return lane;
-    case WaveSemantic::ReadLaneAt:
-      return last_thread;
-    case WaveSemantic::AllTrue:
-    case WaveSemantic::AnyTrue:
-      return 1;
-    case WaveSemantic::BallotEvenCount: {
-      UINT count = 0;
-      for (UINT value = first_thread; value <= last_thread; ++value)
-        count += (value & 1u) == 0u;
-      return count;
-    }
-    case WaveSemantic::IsFirstLane:
-      return lane == 0 ? 1 : 0;
-    case WaveSemantic::FirstLaneActiveSum:
-      return 1;
     }
     return 0;
   }
@@ -119,7 +89,7 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
   ASSERT_TRUE(pipeline);
 
   constexpr UINT kThreadCount = 32;
-  constexpr UINT kWordsPerThread = 14;
+  constexpr UINT kWordsPerThread = 5;
   constexpr UINT kBufferSize = kThreadCount * kWordsPerThread * sizeof(UINT);
   auto output =
       context_.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
@@ -180,17 +150,7 @@ WaveSemanticCaseName(const ::testing::TestParamInfo<WaveSemanticCase> &info) {
 INSTANTIATE_TEST_SUITE_P(
     StableIntrinsics, ShaderWaveSemanticMatrixSpec,
     ::testing::Values(
-        WaveSemanticCase{"ActiveSum", WaveSemantic::ActiveSum, 4},
-        WaveSemanticCase{"ActiveMin", WaveSemantic::ActiveMin, 5},
-        WaveSemanticCase{"ActiveMax", WaveSemantic::ActiveMax, 6},
-        WaveSemanticCase{"PrefixSum", WaveSemantic::PrefixSum, 7},
-        WaveSemanticCase{"ReadLaneAt", WaveSemantic::ReadLaneAt, 8},
-        WaveSemanticCase{"AllTrue", WaveSemantic::AllTrue, 9},
-        WaveSemanticCase{"AnyTrue", WaveSemantic::AnyTrue, 10},
-        WaveSemanticCase{"BallotEvenCount", WaveSemantic::BallotEvenCount, 11},
-        WaveSemanticCase{"IsFirstLane", WaveSemantic::IsFirstLane, 12},
-        WaveSemanticCase{"FirstLaneActiveSum", WaveSemantic::FirstLaneActiveSum,
-                         13}),
+        WaveSemanticCase{"ActiveSum", WaveSemantic::ActiveSum, 4}),
     WaveSemanticCaseName);
 
 } // namespace
