@@ -184,8 +184,8 @@ TEST_F(GraphicsEdgeSemanticsSpec,
     struct Output {
       float4 position : SV_Position;
       float4 perspective_value : TEXCOORD0;
-      noperspective float4 affine_value : TEXCOORD1;
-      nointerpolation float4 flat_value : TEXCOORD2;
+      float4 affine_value : TEXCOORD1;
+      float4 flat_value : TEXCOORD2;
     };
     Output main(uint id : SV_VertexID) {
       const float4 positions[3] = {
@@ -203,7 +203,7 @@ TEST_F(GraphicsEdgeSemanticsSpec,
     })",
                               "vs_5_0");
   auto pixel = CompileShader(R"(
-    float4 main(float4 perspective_value : TEXCOORD0,
+    float4 main(linear float4 perspective_value : TEXCOORD0,
                 noperspective float4 affine_value : TEXCOORD1,
                 nointerpolation float4 flat_value : TEXCOORD2) : SV_Target {
       return float4(perspective_value.x, affine_value.x, flat_value.x, 1.0);
@@ -442,7 +442,7 @@ TEST_F(GraphicsEdgeSemanticsSpec,
     })",
                               "vs_5_0");
   auto pixel = CompileShader(R"(
-    float4 main(centroid float4 barycentric : TEXCOORD0) : SV_Target {
+    float4 main(linear centroid float4 barycentric : TEXCOORD0) : SV_Target {
       bool inside = all(barycentric.xy >= -0.001) &&
                     barycentric.x + barycentric.y <= 1.001;
       return inside ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);

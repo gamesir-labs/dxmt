@@ -190,6 +190,16 @@ protected:
                           x * sizeof(actual),
                       sizeof(actual));
           EXPECT_NEAR(actual, 24576, 1) << "pixel (" << x << ", " << y << ")";
+        } else if (operation.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+          std::uint32_t packed = 0;
+          std::memcpy(&packed,
+                      readback.data.data() + y * readback.row_pitch +
+                          x * sizeof(packed),
+                      sizeof(packed));
+          const FLOAT actual =
+              FLOAT(packed & 0x00ffffffu) / FLOAT(0x00ffffffu);
+          EXPECT_NEAR(actual, expected_depth, 1.0e-6f)
+              << "pixel (" << x << ", " << y << ")";
         } else {
           FLOAT actual = 0.0f;
           std::memcpy(&actual,

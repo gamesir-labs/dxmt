@@ -746,7 +746,7 @@ TEST_F(IntegrationCompositionSpec,
       sizeof(kZeroState), D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_COPY_DEST);
-  constexpr UINT64 kExecutePredicate = 0;
+  constexpr UINT64 kExecutePredicate = 1;
   auto predicate = context_.CreateUploadBuffer(
       sizeof(kExecutePredicate), &kExecutePredicate,
       sizeof(kExecutePredicate));
@@ -938,6 +938,10 @@ TEST_F(IntegrationCompositionSpec,
             S_OK);
   ASSERT_NE(mapped_texture, nullptr);
   constexpr std::uint32_t kExpectedPixel = 0x80804020u;
+  UINT mismatch_count = 0;
+  UINT first_mismatch_x = 0;
+  UINT first_mismatch_y = 0;
+  std::uint32_t first_mismatch_value = 0;
   for (UINT y = 0; y < kSize; ++y) {
     for (UINT x = 0; x < kSize; ++x) {
       std::uint32_t pixel = 0;
@@ -946,11 +950,20 @@ TEST_F(IntegrationCompositionSpec,
                       footprint.Offset + y * footprint.Footprint.RowPitch +
                       x * sizeof(pixel),
                   sizeof(pixel));
-      EXPECT_TRUE(ColorsMatch(pixel, kExpectedPixel, 1))
-          << "pixel (" << x << ", " << y << ") actual=0x" << std::hex
-          << pixel;
+      if (!ColorsMatch(pixel, kExpectedPixel, 1)) {
+        if (!mismatch_count) {
+          first_mismatch_x = x;
+          first_mismatch_y = y;
+          first_mismatch_value = pixel;
+        }
+        ++mismatch_count;
+      }
     }
   }
+  EXPECT_EQ(mismatch_count, 0u)
+      << "first mismatch at (" << first_mismatch_x << ", "
+      << first_mismatch_y << ") actual=0x" << std::hex
+      << first_mismatch_value;
   texture_readback->Unmap(0, &no_write);
 }
 

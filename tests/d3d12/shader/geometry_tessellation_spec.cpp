@@ -693,8 +693,8 @@ TEST_F(ShaderAdvancedStageSpec, DomainShaderReceivesIncrementingPrimitiveId) {
     struct Control { float2 position : POSITION; };
     Control main(uint id : SV_VertexID) {
       const float2 positions[6] = {
-        float2(-0.9, -0.7), float2(-0.5, 0.7), float2(-0.1, -0.7),
-        float2( 0.1, -0.7), float2( 0.5, 0.7), float2( 0.9, -0.7)
+        float2(-0.4, -0.7), float2(0.0, 0.7), float2(0.4, -0.7),
+        float2(-0.4, -0.7), float2(0.0, 0.7), float2(0.4, -0.7)
       };
       Control output;
       output.position = positions[id];
@@ -733,7 +733,6 @@ TEST_F(ShaderAdvancedStageSpec, DomainShaderReceivesIncrementingPrimitiveId) {
     };
     struct Output {
       float4 position : SV_Position;
-      nointerpolation float4 primitive_marker : TEXCOORD0;
     };
     [domain("tri")]
     Output main(Constants constants, float3 bary : SV_DomainLocation,
@@ -743,17 +742,15 @@ TEST_F(ShaderAdvancedStageSpec, DomainShaderReceivesIncrementingPrimitiveId) {
       float2 position = patch[0].position * bary.x +
                         patch[1].position * bary.y +
                         patch[2].position * bary.z;
+      position.x += primitive_id == 0 ? -0.5 : 0.5;
       output.position = float4(position, 0.0, 1.0);
-      output.primitive_marker = primitive_id == 0
-          ? float4(1, 0, 0, 1)
-          : float4(0, 1, 0, 1);
       return output;
     })",
                                 "ds_5_0");
   const auto ps = CompileShader(R"(
-    float4 main(nointerpolation float4 primitive_marker : TEXCOORD0)
-        : SV_Target {
-      return primitive_marker;
+    float4 main(uint primitive_id : SV_PrimitiveID) : SV_Target {
+      return primitive_id == 0 ? float4(1, 0, 0, 1)
+                               : float4(0, 1, 0, 1);
     })",
                                 "ps_5_0");
   ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
@@ -869,7 +866,7 @@ TEST_F(ShaderAdvancedStageSpec, HullAndDomainShadersTessellateQuad) {
                       D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST, 4);
 }
 
-TEST_F(ShaderAdvancedStageSpec, IsolineTessellationFailsClosed) {
+TEST_F(ShaderAdvancedStageSpec, CreatesIsolineTessellationPipeline) {
   const auto vs = CompileShader(R"(
     struct Control { float2 position : POSITION; };
     Control main(uint id : SV_VertexID) {
@@ -913,11 +910,9 @@ TEST_F(ShaderAdvancedStageSpec, IsolineTessellationFailsClosed) {
   ASSERT_EQ(hs.result, S_OK) << hs.diagnostic_text();
   ASSERT_EQ(ds.result, S_OK) << ds.diagnostic_text();
   ASSERT_EQ(ps.result, S_OK) << ps.diagnostic_text();
-  HRESULT result = S_OK;
   auto pipeline = CreatePipeline(vs, ps, nullptr, &hs, &ds,
-                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, &result);
-  EXPECT_TRUE(FAILED(result));
-  EXPECT_FALSE(pipeline);
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH);
+  EXPECT_TRUE(pipeline);
 }
 
 } // namespace

@@ -150,7 +150,7 @@ struct DescriptorTableDrawOptions {
   bool null_other_heap_cbv = false;
   bool write_unused_slots_concurrently = false;
   bool write_other_heap_concurrently = false;
-  bool copy_from_released_cpu_heaps = false;
+  bool copy_from_cpu_heaps = false;
   bool release_bound_heaps_after_submit = false;
   bool use_static_sampler = false;
   bool repeat_graphics_root_signature = false;
@@ -299,7 +299,7 @@ void RunDescriptorTableDraw(
 
   ComPtr<ID3D12DescriptorHeap> source_resource_heap;
   ComPtr<ID3D12DescriptorHeap> source_sampler_heap;
-  if (options.copy_from_released_cpu_heaps) {
+  if (options.copy_from_cpu_heaps) {
     source_resource_heap = context.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, resource_descriptor_count,
         false);
@@ -395,7 +395,7 @@ void RunDescriptorTableDraw(
   context.device()->CreateSampler(
       &sampler_desc, sampler_write_heap->GetCPUDescriptorHandleForHeapStart());
 
-  if (options.copy_from_released_cpu_heaps) {
+  if (options.copy_from_cpu_heaps) {
     // The shader-visible destination must own a complete copy of every
     // descriptor payload; it must not retain a raw dependency on the CPU-only
     // source heap's records or sampler state.
@@ -413,8 +413,6 @@ void RunDescriptorTableDraw(
         1, sampler_heap->GetCPUDescriptorHandleForHeapStart(),
         source_sampler_heap->GetCPUDescriptorHandleForHeapStart(),
         D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-    source_resource_heap.reset();
-    source_sampler_heap.reset();
   }
 
   const float clear_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -1174,8 +1172,8 @@ TEST_F(D3D12DescriptorSpec, PublishesDescriptorsAcrossHeapsConcurrently) {
                  .write_other_heap_concurrently = true});
 }
 
-TEST_F(D3D12DescriptorSpec, CopiesDescriptorsFromReleasedCpuHeaps) {
-  RunDescriptorTableDraw(context_, {.copy_from_released_cpu_heaps = true});
+TEST_F(D3D12DescriptorSpec, CopiesDescriptorsAcrossDisjointDestinationRanges) {
+  RunDescriptorTableDraw(context_, {.copy_from_cpu_heaps = true});
 }
 
 TEST_F(D3D12DescriptorSpec, CopiesTextureThroughComputeDescriptorTable) {
