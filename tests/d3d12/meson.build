@@ -60,6 +60,7 @@ d3d12_unit_suites = {
       'command/bundle_legality_spec.cpp',
       'command/list_lifecycle_spec.cpp',
       'command/list_state_spec.cpp',
+      'command/list_type_matrix_spec.cpp',
       'command/marker_event_spec.cpp',
       'command/state_machine_spec.cpp',
       'command/type_legality_spec.cpp',
@@ -76,6 +77,7 @@ d3d12_unit_suites = {
       'descriptor/buffer_view_spec.cpp',
       'descriptor/descriptor_spec.cpp',
       'descriptor/heap_contract_spec.cpp',
+      'descriptor/heap_size_matrix_spec.cpp',
       'descriptor/null_uav_spec.cpp',
       'descriptor/sampler_matrix_spec.cpp',
       'descriptor/sampler_spec.cpp',
@@ -143,6 +145,7 @@ d3d12_unit_suites = {
     'sources': files(
       'root_signature/layout_validation_spec.cpp',
       'root_signature/contract_matrix_spec.cpp',
+      'root_signature/root_constant_count_matrix_spec.cpp',
       'root_signature/root_descriptor_spec.cpp',
       'root_signature/runtime_state_spec.cpp',
       'root_signature/serialization_spec.cpp',
@@ -170,6 +173,7 @@ d3d12_unit_suites = {
       'sync/cross_queue_batch_matrix_spec.cpp',
       'sync/enhanced_barrier_spec.cpp',
       'sync/fence_spec.cpp',
+      'sync/fence_value_matrix_spec.cpp',
       'sync/legacy_transition_spec.cpp',
       'sync/legacy_barrier_boundary_execution_spec.cpp',
       'sync/promotion_decay_spec.cpp',
@@ -185,6 +189,7 @@ d3d12_unit_suites = {
       'transfer/clear_dsv_spec.cpp',
       'transfer/clear_rtv_spec.cpp',
       'transfer/clear_uav_spec.cpp',
+      'transfer/copy_buffer_region_matrix_spec.cpp',
       'transfer/copy_footprint_spec.cpp',
       'transfer/copy_edge_spec.cpp',
       'transfer/copy_resource_spec.cpp',
@@ -195,6 +200,7 @@ d3d12_unit_suites = {
   },
   'resource': {
     'sources': files(
+      'resource/buffer_size_matrix_spec.cpp',
       'resource/planar_format_spec.cpp',
       'resource/existing_heap_spec.cpp',
       'resource/residency_spec.cpp',
