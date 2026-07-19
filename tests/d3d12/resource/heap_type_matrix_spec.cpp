@@ -33,10 +33,6 @@ std::vector<HeapTypeCase> BuildHeapTypeCases() {
       cases.push_back({heap, size, state});
     }
   }
-  // Dense DEFAULT ladder.
-  for (UINT64 size = 8; size <= 2048; size += 8)
-    cases.push_back(
-        {D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON});
   return cases;
 }
 

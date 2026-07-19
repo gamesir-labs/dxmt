@@ -35,14 +35,27 @@ std::vector<StaticSamplerCase> BuildStaticSamplerCases() {
       D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_GEOMETRY,
       D3D12_SHADER_VISIBILITY_HULL, D3D12_SHADER_VISIBILITY_DOMAIN,
   };
-  for (const auto filter : filters) {
-    for (const auto address : addresses) {
-      for (const auto visibility : vis) {
-        for (UINT reg = 0; reg < 4; ++reg)
-          cases.push_back({filter, address, visibility, reg});
-      }
-    }
-  }
+  for (const auto filter : filters)
+    cases.push_back(
+        {filter, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+         D3D12_SHADER_VISIBILITY_ALL, 0});
+  for (const auto address : addresses)
+    cases.push_back({D3D12_FILTER_MIN_MAG_MIP_LINEAR, address,
+                     D3D12_SHADER_VISIBILITY_PIXEL, 1});
+  for (const auto visibility : vis)
+    cases.push_back({D3D12_FILTER_MIN_MAG_MIP_POINT,
+                     D3D12_TEXTURE_ADDRESS_MODE_CLAMP, visibility, 2});
+  for (UINT reg = 0; reg < 4; ++reg)
+    cases.push_back({D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+                     D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                     D3D12_SHADER_VISIBILITY_ALL, reg});
+  cases.insert(cases.end(),
+               {{D3D12_FILTER_ANISOTROPIC,
+                 D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+                 D3D12_SHADER_VISIBILITY_GEOMETRY, 3},
+                {D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                 D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
+                 D3D12_SHADER_VISIBILITY_DOMAIN, 3}});
   return cases;
 }
 

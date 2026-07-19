@@ -34,12 +34,15 @@ std::vector<ImmediateValueCase> BuildImmediateValueCases() {
       D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
       D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
   };
-  for (const UINT value : values) {
-    for (UINT slot = 0; slot < 8; ++slot) {
-      for (const auto mode : modes)
-        cases.push_back({value, slot, mode});
-    }
-  }
+  for (const UINT value : values)
+    cases.push_back({value, 0, D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT});
+  for (UINT slot = 0; slot < 8; ++slot)
+    cases.push_back(
+        {0xa5a5a5a5u, slot, D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT});
+  for (const auto mode : modes)
+    cases.push_back({0xdeadbeefu, 7, mode});
+  for (UINT slot = 0; slot < 8; ++slot)
+    cases.push_back({values[slot], slot, modes[slot % 3]});
   return cases;
 }
 

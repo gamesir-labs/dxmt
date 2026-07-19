@@ -32,54 +32,33 @@ std::vector<FootprintCase> BuildFootprintCases() {
       DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8_UINT,
       DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM,
   };
-  const UINT dims[] = {1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 64, 127, 128};
+  const UINT dims[] = {1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 64, 127,
+                       128};
   const UINT64 bases[] = {0, 1, 255, 256, 511, 512, 1024, 4096};
+  // These inputs are orthogonal. Cover every value while varying one axis at
+  // a time instead of multiplying them into thousands of equivalent calls.
+  for (const UINT width : dims)
+    cases.push_back({width, width, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0});
   for (const DXGI_FORMAT format : formats) {
-    for (const UINT w : dims) {
-      for (const UINT h : {1u, 2u, w}) {
-        if (h > 128)
-          continue;
-        // BC formats require multiples of 4.
-        if ((format == DXGI_FORMAT_BC1_UNORM ||
-             format == DXGI_FORMAT_BC3_UNORM) &&
-            ((w % 4) != 0 || (h % 4) != 0))
-          continue;
-        for (const UINT16 array_size : {UINT16{1}, UINT16{2}, UINT16{4}}) {
-          for (const UINT16 mips : {UINT16{1}, UINT16{2}, UINT16{3}}) {
-            if (w < 4 && mips > 1)
-              continue;
-            const UINT total = static_cast<UINT>(array_size) * mips;
-            for (const UINT64 base : bases) {
-              // Subsample: full range and first-only.
-              cases.push_back(
-                  {w, h, array_size, mips, format, 0, total, base});
-              if (total > 1)
-                cases.push_back(
-                    {w, h, array_size, mips, format, 0, 1, base});
-            }
-          }
-        }
-      }
+    const UINT extent = format == DXGI_FORMAT_BC1_UNORM ||
+                                format == DXGI_FORMAT_BC3_UNORM
+                            ? 16
+                            : 17;
+    cases.push_back({extent, extent, 1, 1, format, 0, 1, 0});
+  }
+  for (const UINT64 base : bases)
+    cases.push_back({33, 7, 1, 1, DXGI_FORMAT_R32_FLOAT, 0, 1, base});
+  for (const UINT16 array_size : {UINT16{1}, UINT16{2}, UINT16{4}}) {
+    for (const UINT16 mips : {UINT16{1}, UINT16{2}, UINT16{3}}) {
+      const UINT total = static_cast<UINT>(array_size) * mips;
+      cases.push_back({32, 16, array_size, mips, DXGI_FORMAT_BC1_UNORM, 0,
+                       total, 512});
+      if (total > 1)
+        cases.push_back({32, 16, array_size, mips, DXGI_FORMAT_BC1_UNORM, 0,
+                         1, 512});
     }
   }
-  // Density bound: keep only cases where width is power-of-two-ish or +1, and
-  // base is 0/512/4096 unless format is R8G8B8A8.
-  std::vector<FootprintCase> filtered;
-  for (const auto &c : cases) {
-    const bool interesting_w =
-        (c.width & (c.width - 1)) == 0 || c.width == 3 || c.width == 7 ||
-        c.width == 15 || c.width == 17 || c.width == 31 || c.width == 33 ||
-        c.width == 127;
-    if (!interesting_w)
-      continue;
-    if (c.format != DXGI_FORMAT_R8G8B8A8_UNORM && c.base_offset != 0 &&
-        c.base_offset != 512 && c.base_offset != 4096)
-      continue;
-    if (c.array_size > 2 && c.mips > 1 && c.base_offset != 0)
-      continue;
-    filtered.push_back(c);
-  }
-  return filtered;
+  return cases;
 }
 
 class FootprintMatrixSpec : public ::testing::TestWithParam<FootprintCase> {

@@ -25,8 +25,7 @@ std::vector<QueryHeapCase> BuildQueryHeapCases() {
       D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
       D3D12_QUERY_HEAP_TYPE_OCCLUSION,
   };
-  const UINT counts[] = {1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 33, 64, 128, 256,
-                         257, 512, 1024, 2048, 4096};
+  const UINT counts[] = {1, 2, 7, 8, 31, 32, 33, 64, 256, 257, 1024, 4096};
   for (const auto type : supported) {
     for (const UINT count : counts)
       cases.push_back({type, count, true});

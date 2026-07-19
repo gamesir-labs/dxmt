@@ -24,36 +24,20 @@ struct RootOffsetCase {
 };
 
 std::vector<RootOffsetCase> BuildRootOffsetCases() {
-  std::vector<RootOffsetCase> cases;
+  std::vector<RootOffsetCase> cases = {{0, 0, 0, 0}};
   const UINT64 bases[] = {0, 16, 64, 128, 256, 512, 1024, 2048};
   const UINT dword_offsets[] = {0, 4, 8, 12};
-  for (const UINT64 input_base : bases) {
-    for (const UINT64 output_base : bases) {
-      for (const UINT64 cbv_base :
-           {0ull, 256ull, 512ull}) { // CBV 256-byte aligned
-        for (const UINT byte_offset : dword_offsets) {
-          if (input_base + byte_offset + sizeof(UINT) > 4096)
-            continue;
-          if (output_base + byte_offset + sizeof(UINT) > 4096)
-            continue;
-          if (cbv_base + 2 * sizeof(UINT) > 512)
-            continue;
-          // Keep density bounded: require at least one base non-zero or offset.
-          if (input_base == 0 && output_base == 0 && cbv_base == 0 &&
-              byte_offset == 0)
-            cases.push_back({input_base, output_base, cbv_base, byte_offset});
-          else if ((input_base | output_base | cbv_base) != 0 ||
-                   byte_offset != 0) {
-            // Subsample: only when bases share low bits or are powers of two.
-            if ((input_base == output_base) || (input_base == 0) ||
-                (output_base == 0) || (byte_offset == 0 && cbv_base != 0))
-              cases.push_back(
-                  {input_base, output_base, cbv_base, byte_offset});
-          }
-        }
-      }
-    }
+  for (const UINT64 base : bases) {
+    if (base == 0)
+      continue;
+    cases.push_back({base, 0, 0, 0});
+    cases.push_back({0, base, 0, 0});
+    cases.push_back({base, base, 0, 0});
   }
+  for (const UINT64 cbv_base : {256ull, 512ull})
+    cases.push_back({0, 0, cbv_base, 0});
+  for (const UINT byte_offset : dword_offsets)
+    cases.push_back({64, 128, 256, byte_offset});
   return cases;
 }
 

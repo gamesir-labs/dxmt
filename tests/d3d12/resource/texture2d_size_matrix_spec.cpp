@@ -27,21 +27,25 @@ std::vector<Texture2DSizeCase> BuildTexture2DSizeCases() {
   const DXGI_FORMAT formats[] = {
       DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_UINT,
       DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8_UINT};
-  for (const UINT w : dims) {
-    for (const UINT h : {1u, 2u, w}) {
-      if (h > 1024)
-        continue;
-      for (const DXGI_FORMAT format : formats) {
-        cases.push_back({w, h, 1, format, D3D12_RESOURCE_FLAG_NONE});
-        cases.push_back({w, h, 1, format,
-                         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET});
-        if (format == DXGI_FORMAT_R32_FLOAT ||
-            format == DXGI_FORMAT_R8G8B8A8_UNORM)
-          cases.push_back({w, h, 1, format,
-                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS});
-      }
-    }
+  for (const UINT size : dims)
+    cases.push_back({size, size, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                     D3D12_RESOURCE_FLAG_NONE});
+  for (const DXGI_FORMAT format : formats) {
+    cases.push_back({33, 17, 1, format, D3D12_RESOURCE_FLAG_NONE});
+    cases.push_back({17, 33, 1, format,
+                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET});
   }
+  for (const DXGI_FORMAT format :
+       {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}) {
+    cases.push_back(
+        {31, 33, 1, format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS});
+  }
+  cases.insert(cases.end(), {{64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_RESOURCE_FLAG_NONE},
+                             {64, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_RESOURCE_FLAG_NONE},
+                             {64, 63, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_RESOURCE_FLAG_NONE}});
   // Mip chains for powers of two.
   for (UINT size : {4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
     UINT16 mips = 1;

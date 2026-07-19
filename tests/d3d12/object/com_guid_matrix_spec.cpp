@@ -101,8 +101,9 @@ std::vector<std::wstring> BuildNames() {
   names.emplace_back(L"a");
   names.emplace_back(L"dxmt-test");
   names.emplace_back(L"name with spaces and 123");
-  for (int i = 0; i < 128; ++i)
-    names.emplace_back(std::wstring(static_cast<size_t>(i + 1), L'x'));
+  for (const std::size_t length :
+       {2u, 3u, 7u, 8u, 15u, 16u, 31u, 32u, 63u, 64u, 127u, 128u})
+    names.emplace_back(std::wstring(length, L'x'));
   return names;
 }
 

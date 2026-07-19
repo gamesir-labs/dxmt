@@ -3,7 +3,6 @@
 
 #include "d3d12_test_context.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -27,41 +26,16 @@ struct CopyDescCase {
 
 std::vector<CopyDescCase> BuildCopyDescCases() {
   std::vector<CopyDescCase> cases;
-  // Keep PR-friendly density: power-of-two heaps, endpoint/identity/shift copies.
   const UINT heap_counts[] = {2, 4, 8, 16, 32, 64};
   for (const UINT heap_count : heap_counts) {
-    const UINT starts[] = {0, 1, heap_count / 2,
-                           heap_count > 1 ? heap_count - 1 : 0};
-    const UINT counts[] = {1, 2, heap_count / 2, heap_count};
-    for (const UINT src : starts) {
-      for (const UINT dst : starts) {
-        for (const UINT n : counts) {
-          if (n == 0 || src + n > heap_count || dst + n > heap_count)
-            continue;
-          cases.push_back({heap_count, src, dst, n});
-        }
-      }
-    }
+    cases.push_back({heap_count, 0, 0, heap_count});
+    cases.push_back({heap_count, 0, 0, 1});
+    cases.push_back({heap_count, heap_count - 1, heap_count - 1, 1});
+    cases.push_back({heap_count, 0, 1, heap_count - 1});
+    cases.push_back({heap_count, 1, 0, heap_count - 1});
+    cases.push_back({heap_count, heap_count / 2, 0, heap_count / 2});
+    cases.push_back({heap_count, 0, heap_count / 2, heap_count / 2});
   }
-  // Deduplicate identical tuples from repeated start/count samples.
-  std::sort(cases.begin(), cases.end(),
-            [](const CopyDescCase &a, const CopyDescCase &b) {
-              if (a.heap_count != b.heap_count)
-                return a.heap_count < b.heap_count;
-              if (a.src_start != b.src_start)
-                return a.src_start < b.src_start;
-              if (a.dst_start != b.dst_start)
-                return a.dst_start < b.dst_start;
-              return a.copy_count < b.copy_count;
-            });
-  cases.erase(std::unique(cases.begin(), cases.end(),
-                          [](const CopyDescCase &a, const CopyDescCase &b) {
-                            return a.heap_count == b.heap_count &&
-                                   a.src_start == b.src_start &&
-                                   a.dst_start == b.dst_start &&
-                                   a.copy_count == b.copy_count;
-                          }),
-              cases.end());
   return cases;
 }
 

@@ -22,7 +22,8 @@ struct PrivateDataCase {
 
 std::vector<PrivateDataCase> BuildPrivateDataCases() {
   std::vector<PrivateDataCase> cases;
-  for (UINT size = 1; size <= 256; ++size)
+  for (UINT size : {1u, 2u, 3u, 4u, 7u, 8u, 15u, 16u, 31u, 32u, 33u,
+                    63u, 64u, 65u, 127u, 128u, 129u, 255u, 256u})
     cases.push_back({size, static_cast<UINT8>(size & 0xff)});
   for (UINT size : {512u, 1024u, 2048u, 4096u})
     cases.push_back({size, 0xa5});

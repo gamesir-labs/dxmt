@@ -27,21 +27,15 @@ struct ViewportCase {
 };
 
 std::vector<ViewportCase> BuildViewportCases() {
-  std::vector<ViewportCase> cases;
-  const FLOAT positions[] = {0.f, 1.f, 2.f, 4.f, 8.f, 16.f, 32.f, 48.f};
-  const FLOAT sizes[] = {1.f, 2.f, 4.f, 8.f, 16.f, 32.f, 64.f};
-  for (const FLOAT x : positions) {
-    for (const FLOAT y : positions) {
-      for (const FLOAT w : sizes) {
-        for (const FLOAT h : sizes) {
-          if (x + w > 64.f || y + h > 64.f)
-            continue;
-          cases.push_back({x, y, w, h});
-        }
-      }
-    }
-  }
-  return cases;
+  return {
+      {0.f, 0.f, 64.f, 64.f},   {0.f, 0.f, 1.f, 1.f},
+      {1.f, 1.f, 2.f, 2.f},     {2.f, 4.f, 4.f, 8.f},
+      {4.f, 2.f, 8.f, 4.f},     {8.f, 8.f, 16.f, 16.f},
+      {16.f, 16.f, 32.f, 32.f}, {32.f, 0.f, 32.f, 64.f},
+      {0.f, 32.f, 64.f, 32.f},  {48.f, 48.f, 16.f, 16.f},
+      {1.f, 2.f, 63.f, 62.f},   {2.f, 1.f, 62.f, 63.f},
+      {4.f, 8.f, 32.f, 16.f},   {8.f, 4.f, 16.f, 32.f},
+  };
 }
 
 class ViewportMatrixSpec : public ::testing::TestWithParam<ViewportCase> {

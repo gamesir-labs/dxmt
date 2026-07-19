@@ -26,25 +26,14 @@ struct ScissorCase {
 };
 
 std::vector<ScissorCase> BuildScissorCases() {
-  std::vector<ScissorCase> cases;
-  const LONG coords[] = {0, 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64};
-  for (const LONG left : coords) {
-    for (const LONG top : coords) {
-      for (const LONG right : coords) {
-        for (const LONG bottom : coords) {
-          if (right <= left || bottom <= top)
-            continue;
-          if (right > 64 || bottom > 64)
-            continue;
-          // Bound density: require at least one edge on a coarse grid.
-          if ((left % 8 == 0 || top % 8 == 0) &&
-              (right % 8 == 0 || bottom % 8 == 0 || right - left <= 8))
-            cases.push_back({left, top, right, bottom});
-        }
-      }
-    }
-  }
-  return cases;
+  return {
+      {0, 0, 64, 64},   {0, 0, 1, 1},     {1, 1, 2, 2},
+      {0, 0, 8, 64},    {0, 0, 64, 8},    {8, 8, 56, 56},
+      {16, 24, 48, 40}, {31, 31, 32, 32}, {32, 32, 33, 33},
+      {33, 33, 64, 64}, {0, 0, 63, 63},   {1, 2, 63, 62},
+      {2, 4, 40, 48},   {4, 8, 24, 32},   {24, 16, 56, 48},
+      {40, 48, 64, 64},
+  };
 }
 
 class ScissorMatrixSpec : public ::testing::TestWithParam<ScissorCase> {

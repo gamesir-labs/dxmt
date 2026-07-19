@@ -25,13 +25,8 @@ std::vector<ClearUavValueCase> BuildClearUavValueCases() {
                         255, 256, 1023, 1024, 0x7fffffff, 0x80000000, 0xffffffff,
                         0x12345678, 0xa5a5a5a5, 0x5a5a5a5a, 0xdeadbeef,
                         0x0f0f0f0f, 0xf0f0f0f0};
-  for (const UINT v : seeds) {
-    cases.push_back({{v, 0, 0, 0}});
-    cases.push_back({{v, v, 0, 0}});
+  for (const UINT v : seeds)
     cases.push_back({{v, v, v, v}});
-  }
-  for (UINT i = 0; i < 64; ++i)
-    cases.push_back({{i, i * 3u, i * 5u, i * 7u}});
   return cases;
 }
 

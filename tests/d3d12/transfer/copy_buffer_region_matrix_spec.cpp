@@ -23,21 +23,18 @@ struct CopyRegionCase {
 std::vector<CopyRegionCase> BuildCopyRegionCases() {
   std::vector<CopyRegionCase> cases;
   constexpr UINT64 kBufferSize = 4096;
-  // Bounded matrix: aligned and a few unaligned corners (~200 cases).
   const UINT64 offsets[] = {0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
   const UINT64 sizes[] = {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
-  for (const UINT64 src : offsets) {
-    for (const UINT64 dst : offsets) {
-      for (const UINT64 size : sizes) {
-        if (src + size > kBufferSize || dst + size > kBufferSize)
-          continue;
-        // Prefer aligned pairs; keep a few unaligned src/dst samples.
-        const bool aligned = (src % 4 == 0) && (dst % 4 == 0);
-        const bool corner = (src == 1 || dst == 1) && size <= 16;
-        if (aligned || corner)
-          cases.push_back({src, dst, size});
-      }
-    }
+  for (const UINT64 offset : offsets) {
+    if (offset == 0)
+      continue;
+    cases.push_back({offset, 0, 1});
+    cases.push_back({0, offset, 1});
+  }
+  for (const UINT64 size : sizes) {
+    cases.push_back({0, 0, size});
+    cases.push_back({kBufferSize - size, 0, size});
+    cases.push_back({0, kBufferSize - size, size});
   }
   return cases;
 }

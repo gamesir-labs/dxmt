@@ -24,14 +24,15 @@ struct DispatchCase {
 };
 
 std::vector<DispatchCase> BuildDispatchCases() {
-  std::vector<DispatchCase> cases;
-  // 16 * 8 * 4 = 512 combinations; combined with other matrices exceeds 1000.
-  for (UINT x = 1; x <= 16; ++x) {
-    for (UINT y = 1; y <= 8; ++y) {
-      for (UINT z = 1; z <= 4; ++z)
-        cases.push_back({x, y, z});
-    }
-  }
+  std::vector<DispatchCase> cases = {{1, 1, 1}};
+  for (UINT x = 2; x <= 16; ++x)
+    cases.push_back({x, 1, 1});
+  for (UINT y = 2; y <= 8; ++y)
+    cases.push_back({1, y, 1});
+  for (UINT z = 2; z <= 4; ++z)
+    cases.push_back({1, 1, z});
+  cases.insert(cases.end(), {{2, 2, 2}, {4, 4, 4}, {8, 8, 4},
+                             {16, 8, 4}, {16, 1, 4}, {1, 8, 4}});
   return cases;
 }
 

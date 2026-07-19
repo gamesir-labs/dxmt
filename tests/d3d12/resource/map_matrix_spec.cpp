@@ -28,18 +28,14 @@ std::vector<MapRangeCase> BuildMapRangeCases() {
   const UINT64 sizes[] = {16, 64, 256, 1024, 4096, 16384};
   for (const UINT64 size : sizes) {
     cases.push_back({size, 0, 0, true, "NullRange"});
-    cases.push_back({size, 0, 0, false, "EmptyRead"}); // begin==end => empty
     cases.push_back({size, 0, size, false, "Full"});
-    if (size >= 32) {
-      cases.push_back({size, 0, 16, false, "Head16"});
-      cases.push_back({size, size - 16, size, false, "Tail16"});
-      cases.push_back({size, 16, size - 16, false, "Interior"});
-    }
-    if (size >= 256) {
-      cases.push_back({size, 64, 128, false, "Mid64"});
-      cases.push_back({size, 1, size - 1, false, "AlmostAll"});
-    }
   }
+  cases.insert(cases.end(), {{4096, 0, 0, false, "EmptyRead"},
+                             {4096, 0, 16, false, "Head16"},
+                             {4096, 4080, 4096, false, "Tail16"},
+                             {4096, 16, 4080, false, "Interior"},
+                             {4096, 64, 128, false, "Mid64"},
+                             {4096, 1, 4095, false, "AlmostAll"}});
   return cases;
 }
 

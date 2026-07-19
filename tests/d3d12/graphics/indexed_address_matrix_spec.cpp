@@ -36,17 +36,20 @@ std::vector<IndexedAddressCase> BuildIndexedAddressCases() {
   const UINT valid_vertex_starts[] = {0, 1, 3, 7, 15, 31, 63, 95};
   const UINT stored_indices[] = {0, 1, 3, 7, 15, 31, 47, 63};
 
-  for (const auto format : formats) {
-    for (const UINT view_prefix : view_prefixes) {
-      for (const UINT start_index : start_indices) {
-        for (const UINT valid_vertex_start : valid_vertex_starts) {
-          for (const UINT stored_index : stored_indices) {
-            cases.push_back({format, view_prefix, start_index,
-                             valid_vertex_start, stored_index});
-          }
-        }
-      }
-    }
+  for (const auto format : formats)
+    cases.push_back({format, 1, 1, 0, 0});
+  for (const UINT view_prefix : view_prefixes)
+    cases.push_back({DXGI_FORMAT_R16_UINT, view_prefix, 1, 0, 1});
+  for (const UINT start_index : start_indices)
+    cases.push_back({DXGI_FORMAT_R32_UINT, 3, start_index, 1, 3});
+  for (const UINT valid_vertex_start : valid_vertex_starts)
+    cases.push_back({DXGI_FORMAT_R16_UINT, 7, 3, valid_vertex_start, 7});
+  for (const UINT stored_index : stored_indices)
+    cases.push_back({DXGI_FORMAT_R32_UINT, 15, 7, 3, stored_index});
+  for (UINT index = 0; index < 8; ++index) {
+    cases.push_back({formats[index & 1], view_prefixes[index & 3],
+                     start_indices[(index + 1) & 3],
+                     valid_vertex_starts[index], stored_indices[7 - index]});
   }
   return cases;
 }

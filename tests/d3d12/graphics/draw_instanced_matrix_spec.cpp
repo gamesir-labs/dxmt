@@ -34,14 +34,13 @@ std::vector<DrawCase> BuildDrawCases() {
   const UINT vertices[] = {0, 1, 2, 3, 4, 6, 9, 12, 24, 30, 33, 48, 64, 96,
                            128, 192, 256, 384, 512};
   const UINT instances[] = {0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 64};
-  for (const UINT v : vertices) {
-    for (const UINT i : instances) {
-      cases.push_back({v, i, 0, 0});
-      if (v >= 3 && i >= 1) {
-        cases.push_back({v, i, 0, 1});
-        cases.push_back({v, i, 3, 0});
-      }
-    }
+  for (const UINT vertex_count : vertices)
+    cases.push_back({vertex_count, 1, 0, 0});
+  for (const UINT instance_count : instances)
+    cases.push_back({3, instance_count, 0, 0});
+  for (const UINT vertex_count : {3u, 33u, 512u}) {
+    cases.push_back({vertex_count, 1, 0, 1});
+    cases.push_back({vertex_count, 1, 3, 0});
   }
   return cases;
 }

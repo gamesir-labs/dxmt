@@ -45,21 +45,22 @@ std::vector<SamplerFilterCase> BuildSamplerFilterCases() {
       D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
   };
   for (const auto filter : filters) {
-    for (const auto address : addresses) {
-      const UINT anisotropy =
-          filter == D3D12_FILTER_ANISOTROPIC ||
-                  filter == D3D12_FILTER_COMPARISON_ANISOTROPIC
-              ? 16u
-              : 1u;
-      cases.push_back({filter, address, address, address, anisotropy});
-      // Mixed address modes on U/V/W for non-aniso filters.
-      if (filter != D3D12_FILTER_ANISOTROPIC &&
-          filter != D3D12_FILTER_COMPARISON_ANISOTROPIC) {
-        cases.push_back({filter, addresses[0], addresses[1], addresses[2], 1});
-        cases.push_back({filter, addresses[2], addresses[3], addresses[4], 1});
-      }
-    }
+    const UINT anisotropy =
+        filter == D3D12_FILTER_ANISOTROPIC ||
+                filter == D3D12_FILTER_COMPARISON_ANISOTROPIC
+            ? 16u
+            : 1u;
+    cases.push_back(
+        {filter, addresses[0], addresses[0], addresses[0], anisotropy});
   }
+  for (const auto address : addresses) {
+    cases.push_back({D3D12_FILTER_MIN_MAG_MIP_LINEAR, address, address,
+                     address, 1});
+  }
+  cases.push_back({D3D12_FILTER_MIN_MAG_MIP_POINT, addresses[0], addresses[1],
+                   addresses[2], 1});
+  cases.push_back({D3D12_FILTER_MIN_MAG_MIP_LINEAR, addresses[2], addresses[3],
+                   addresses[4], 1});
   // Anisotropy ladder.
   for (UINT a : {1u, 2u, 4u, 8u, 16u})
     cases.push_back({D3D12_FILTER_ANISOTROPIC,

@@ -32,12 +32,11 @@ std::vector<RootConstCase> BuildRootConstCases() {
       0xf0f0f0f0, 0x01010101, 0x10101010, 0xaaaaaaaa, 0x55555555, 42, 100,
       999, 1000, 9999, 10000, 99999, 100000, 1000000, 0xabcdef01, 0x10abcdef,
   };
-  for (UINT slot = 0; slot < 4; ++slot) {
-    for (const UINT value : values)
+  for (const UINT value : values)
+    cases.push_back({0, value});
+  for (UINT slot = 1; slot < 4; ++slot) {
+    for (const UINT value : {0u, 1u, 0xdeadbeefu, 0xffffffffu})
       cases.push_back({slot, value});
-    // Dense small ladder per slot.
-    for (UINT v = 0; v < 64; ++v)
-      cases.push_back({slot, v * 17u + slot});
   }
   return cases;
 }

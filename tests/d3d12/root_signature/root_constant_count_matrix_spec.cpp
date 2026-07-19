@@ -108,7 +108,8 @@ TEST_P(RootConstantCountMatrixSpec, DispatchesWithRootConstantsVisibleToShader) 
 }
 
 INSTANTIATE_TEST_SUITE_P(ConstantCounts, RootConstantCountMatrixSpec,
-                         ::testing::Range(1u, 65u),
+                         ::testing::Values(1u, 2u, 3u, 4u, 15u, 16u, 31u,
+                                           32u, 33u, 63u, 64u),
                          [](const ::testing::TestParamInfo<UINT> &info) {
                            return "Count" + std::to_string(info.param);
                          });

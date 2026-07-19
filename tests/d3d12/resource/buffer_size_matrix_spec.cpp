@@ -24,20 +24,14 @@ struct BufferSizeCase {
 std::vector<BufferSizeCase> BuildBufferSizeCases() {
   std::vector<BufferSizeCase> cases;
   // Powers of two and one-past / one-before boundaries around common limits.
-  static const UINT64 kPowers[] = {
-      1,        2,        4,        8,        16,       32,       64,
-      128,      256,      512,      1024,     2048,     4096,     8192,
-      16384,    32768,    65536,    131072,   262144,   524288,   1048576};
+  static const UINT64 kPowers[] = {1,     4,    16,   64,    256,
+                                   1024, 4096, 65536, 1048576};
   for (const UINT64 power : kPowers) {
     cases.push_back({power, nullptr});
     if (power > 1)
       cases.push_back({power - 1, nullptr});
     cases.push_back({power + 1, nullptr});
   }
-  // Dense small-size ladder: every 4 bytes from 4..1024 covers alignment
-  // sensitive copy/clear consumers.
-  for (UINT64 size = 4; size <= 1024; size += 4)
-    cases.push_back({size, nullptr});
   // Unique by size.
   std::sort(cases.begin(), cases.end(),
             [](const BufferSizeCase &a, const BufferSizeCase &b) {

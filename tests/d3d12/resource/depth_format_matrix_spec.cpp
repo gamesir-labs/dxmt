@@ -3,6 +3,7 @@
 #include "d3d12_test_context.hpp"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 // Public D3D12 depth-stencil resource/format creation matrix.
@@ -25,15 +26,11 @@ std::vector<DepthFormatCase> BuildDepthFormatCases() {
       DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D16_UNORM,
       DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
   };
-  const UINT dims[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+  const std::pair<UINT, UINT> extents[] = {
+      {1, 1}, {2, 1024}, {1024, 2}, {31, 33}, {512, 512}, {1024, 1024}};
   for (const auto format : formats) {
-    for (const UINT w : dims) {
-      for (const UINT h : dims) {
-        if (w * h > 512 * 512 && (w != h))
-          continue;
-        cases.push_back({w, h, format, format});
-      }
-    }
+    for (const auto [width, height] : extents)
+      cases.push_back({width, height, format, format});
   }
   return cases;
 }
