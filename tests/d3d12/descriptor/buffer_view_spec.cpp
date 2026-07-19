@@ -87,7 +87,7 @@ protected:
     if (view_index == 0) {
       srv.Format = DXGI_FORMAT_R32_UINT;
       srv.Buffer.FirstElement = 1;
-      srv.Buffer.NumElements = 3;
+      srv.Buffer.NumElements = 4;
     } else if (view_index == 1) {
       srv.Format = DXGI_FORMAT_R32_TYPELESS;
       srv.Buffer.FirstElement = 5;
@@ -96,7 +96,7 @@ protected:
     } else {
       srv.Format = DXGI_FORMAT_UNKNOWN;
       srv.Buffer.FirstElement = 10;
-      srv.Buffer.NumElements = 2;
+      srv.Buffer.NumElements = 3;
       srv.Buffer.StructureByteStride = sizeof(UINT);
     }
     context_.device()->CreateShaderResourceView(
