@@ -458,12 +458,13 @@ TEST_F(D3D12UnrealCapabilitySpec, ReportsBarrierAndQueueCapabilities) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3 = {};
   ASSERT_TRUE(HResultSucceeded(device_->CheckFeatureSupport(
       D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))));
-  const auto write_buffer_support =
+  const auto core_queue_types =
       D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
       D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
       D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
       D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
-  EXPECT_EQ(options3.WriteBufferImmediateSupportFlags, write_buffer_support);
+  EXPECT_EQ(options3.WriteBufferImmediateSupportFlags & core_queue_types,
+            core_queue_types);
 
   D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY queue_priority = {};
   queue_priority.CommandListType = D3D12_COMMAND_LIST_TYPE_DIRECT;

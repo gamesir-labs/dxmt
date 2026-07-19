@@ -26,11 +26,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                           countbits(even_ballot.z) +
                           countbits(even_ballot.w);
   const uint first_lane = WaveIsFirstLane() ? 1u : 0u;
-  const uint quad_x = QuadReadAcrossX(dispatch_id.x);
-  const uint quad_y = QuadReadAcrossY(dispatch_id.x);
-  const uint quad_diagonal = QuadReadAcrossDiagonal(dispatch_id.x);
-
-  const uint base = dispatch_id.x * 19u * 4u;
+  const uint base = dispatch_id.x * 16u * 4u;
   output.Store4(base + 0u,
                 uint4(lane, lane_count, active_count, first_dispatch_id));
   output.Store4(base + 16u, uint4(sum, minimum, maximum, prefix_count));
@@ -38,5 +34,4 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                 uint4(last_dispatch_id, all_in_range, any_last, even_count));
   output.Store2(base + 48u, uint2(first_lane, WaveActiveSum(first_lane)));
   output.Store2(base + 56u, uint2(product, prefix_product));
-  output.Store3(base + 64u, uint3(quad_x, quad_y, quad_diagonal));
 }

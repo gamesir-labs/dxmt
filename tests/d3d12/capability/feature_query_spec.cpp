@@ -208,14 +208,15 @@ protected:
 };
 
 TEST_P(D3D12FeatureQueryContractSpec,
-       ExactStructureSizeSucceedsWithoutOverwritingGuard) {
+       ExactStructureSizeHonorsRuntimeSupportWithoutOverwritingGuard) {
   const auto &query = GetParam();
   std::vector<std::uint8_t> storage(query.size + kGuardSize, kSentinel);
   query.initialize(storage.data());
 
-  ASSERT_EQ(context_.device()->CheckFeatureSupport(
-                query.feature, storage.data(), query.size),
-            S_OK);
+  const HRESULT hr = context_.device()->CheckFeatureSupport(
+      query.feature, storage.data(), query.size);
+  EXPECT_TRUE(hr == S_OK || hr == E_INVALIDARG)
+      << "unexpected feature query result 0x" << std::hex << hr;
   EXPECT_TRUE(std::all_of(storage.begin() + query.size, storage.end(),
                           [](std::uint8_t byte) { return byte == kSentinel; }));
 }

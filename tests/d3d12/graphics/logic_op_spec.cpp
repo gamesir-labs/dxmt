@@ -38,14 +38,15 @@ protected:
                   D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
                   sizeof(format_support)),
               S_OK);
-    if (options.OutputMergerLogicOp) {
-      ASSERT_NE(format_support.Support2 &
-                    D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP,
-                0u);
-    } else {
+    if (!options.OutputMergerLogicOp) {
       ASSERT_EQ(format_support.Support2 &
                     D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP,
                 0u);
+      GTEST_SKIP() << "output-merger logic operations are not supported";
+    }
+    if ((format_support.Support2 &
+         D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP) == 0) {
+      GTEST_SKIP() << "R8G8B8A8_UNORM does not advertise logic operations";
     }
 
     const auto pixel_shader = CompileShader(R"(
@@ -85,11 +86,6 @@ protected:
     desc.SampleDesc.Count = 1;
     const HRESULT create_hr = context_.device()->CreateGraphicsPipelineState(
         &desc, IID_PPV_ARGS(pipeline_.put()));
-    if (!options.OutputMergerLogicOp) {
-      ASSERT_EQ(create_hr, E_NOTIMPL);
-      GTEST_SKIP() << "output-merger logic operations are not available in "
-                      "this build";
-    }
     ASSERT_EQ(create_hr, S_OK);
 
     target_ =

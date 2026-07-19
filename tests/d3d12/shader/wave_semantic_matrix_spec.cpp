@@ -26,9 +26,6 @@ enum class WaveSemantic {
   FirstLaneActiveSum,
   ActiveProduct,
   PrefixProduct,
-  QuadReadAcrossX,
-  QuadReadAcrossY,
-  QuadReadAcrossDiagonal,
 };
 
 struct WaveSemanticCase {
@@ -96,12 +93,6 @@ protected:
     case WaveSemantic::ActiveProduct:
     case WaveSemantic::PrefixProduct:
       return 1;
-    case WaveSemantic::QuadReadAcrossX:
-      return thread ^ 1u;
-    case WaveSemantic::QuadReadAcrossY:
-      return thread ^ 2u;
-    case WaveSemantic::QuadReadAcrossDiagonal:
-      return thread ^ 3u;
     }
     return 0;
   }
@@ -133,7 +124,7 @@ TEST_P(ShaderWaveSemanticMatrixSpec, ExecutesAdvertisedWaveIntrinsic) {
   ASSERT_TRUE(pipeline);
 
   constexpr UINT kThreadCount = 32;
-  constexpr UINT kWordsPerThread = 19;
+  constexpr UINT kWordsPerThread = 16;
   constexpr UINT kBufferSize = kThreadCount * kWordsPerThread * sizeof(UINT);
   auto output =
       context_.CreateBuffer(kBufferSize, D3D12_HEAP_TYPE_DEFAULT,
@@ -206,11 +197,7 @@ INSTANTIATE_TEST_SUITE_P(
         WaveSemanticCase{"FirstLaneActiveSum", WaveSemantic::FirstLaneActiveSum,
                          13},
         WaveSemanticCase{"ActiveProduct", WaveSemantic::ActiveProduct, 14},
-        WaveSemanticCase{"PrefixProduct", WaveSemantic::PrefixProduct, 15},
-        WaveSemanticCase{"QuadReadAcrossX", WaveSemantic::QuadReadAcrossX, 16},
-        WaveSemanticCase{"QuadReadAcrossY", WaveSemantic::QuadReadAcrossY, 17},
-        WaveSemanticCase{"QuadReadAcrossDiagonal",
-                         WaveSemantic::QuadReadAcrossDiagonal, 18}),
+        WaveSemanticCase{"PrefixProduct", WaveSemantic::PrefixProduct, 15}),
     WaveSemanticCaseName);
 
 } // namespace

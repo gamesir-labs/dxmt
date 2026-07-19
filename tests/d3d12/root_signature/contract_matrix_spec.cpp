@@ -1,6 +1,8 @@
 #include <dxmt_test.hpp>
 #include <dxmt_test_com.hpp>
 
+#include "d3d12_test_context.hpp"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
@@ -15,6 +17,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::D3D12TestContext;
 
 enum class RootCostShape { Constants, RootCbv, DescriptorTable };
 
@@ -26,7 +29,12 @@ struct RootCostCase {
 };
 
 class RootSignatureCostMatrixSpec
-    : public ::testing::TestWithParam<RootCostCase> {};
+    : public ::testing::TestWithParam<RootCostCase> {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+
+  D3D12TestContext context_;
+};
 
 TEST_P(RootSignatureCostMatrixSpec, EnforcesDwordCostBoundary) {
   const auto &test = GetParam();
@@ -67,10 +75,18 @@ TEST_P(RootSignatureCostMatrixSpec, EnforcesDwordCostBoundary) {
       D3D12_ROOT_SIGNATURE_FLAG_NONE};
   ComPtr<ID3DBlob> blob;
   ComPtr<ID3DBlob> error;
-  EXPECT_EQ(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+  ASSERT_EQ(D3D12SerializeRootSignature(&desc,
+                                        D3D_ROOT_SIGNATURE_VERSION_1_0,
                                         blob.put(), error.put()),
+            S_OK);
+  ASSERT_TRUE(blob);
+
+  ComPtr<ID3D12RootSignature> root_signature;
+  EXPECT_EQ(context_.device()->CreateRootSignature(
+                0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                IID_PPV_ARGS(root_signature.put())),
             test.expected);
-  EXPECT_EQ(bool(blob), SUCCEEDED(test.expected));
+  EXPECT_EQ(bool(root_signature), SUCCEEDED(test.expected));
 }
 
 std::string
