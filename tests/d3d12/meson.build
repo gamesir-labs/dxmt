@@ -107,6 +107,7 @@ d3d12_unit_suites = {
       'graphics/render_pass_mrt_semantics_spec.cpp',
       'graphics/render_pass_validation_spec.cpp',
       'graphics/viewport_scissor_spec.cpp',
+      'graphics/viewport_matrix_spec.cpp',
     ),
   },
   'integration': {
