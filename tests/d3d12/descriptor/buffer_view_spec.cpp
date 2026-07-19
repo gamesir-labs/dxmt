@@ -23,21 +23,31 @@ class BufferViewSpec : public ::testing::Test {
 protected:
   void SetUp() override {
     ASSERT_EQ(context_.Initialize(), S_OK);
-    shader_ = CompileShader(R"(
-      Buffer<uint> typed_input : register(t0);
-      ByteAddressBuffer raw_input : register(t1);
-      StructuredBuffer<uint> structured_input : register(t2);
-      RWBuffer<uint> output : register(u0);
-
-      [numthreads(1, 1, 1)]
-      void main() {
-        output[0] = typed_input[2];
-        output[1] = raw_input.Load(4);
-        output[2] = structured_input[1];
-      }
-    )",
-                            "cs_5_0");
-    ASSERT_EQ(shader_.result, S_OK) << shader_.diagnostic_text();
+    constexpr std::array shader_sources = {
+        R"(
+          Buffer<uint> input : register(t0);
+          RWBuffer<uint> output : register(u0);
+          [numthreads(1, 1, 1)]
+          void main() { output[0] = input[2]; }
+        )",
+        R"(
+          ByteAddressBuffer input : register(t1);
+          RWBuffer<uint> output : register(u0);
+          [numthreads(1, 1, 1)]
+          void main() { output[1] = input.Load(4); }
+        )",
+        R"(
+          StructuredBuffer<uint> input : register(t2);
+          RWBuffer<uint> output : register(u0);
+          [numthreads(1, 1, 1)]
+          void main() { output[2] = input[1]; }
+        )",
+    };
+    for (std::size_t index = 0; index < shader_sources.size(); ++index) {
+      shaders_[index] = CompileShader(shader_sources[index], "cs_5_0");
+      ASSERT_EQ(shaders_[index].result, S_OK)
+          << shaders_[index].diagnostic_text();
+    }
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -58,11 +68,14 @@ protected:
     root_signature_ = context_.CreateRootSignature(desc);
     ASSERT_TRUE(root_signature_);
 
-    const D3D12_SHADER_BYTECODE bytecode = {
-        shader_.bytecode->GetBufferPointer(), shader_.bytecode->GetBufferSize()};
-    pipeline_ =
-        context_.CreateComputePipeline(root_signature_.get(), bytecode);
-    ASSERT_TRUE(pipeline_);
+    for (std::size_t index = 0; index < shaders_.size(); ++index) {
+      const D3D12_SHADER_BYTECODE bytecode = {
+          shaders_[index].bytecode->GetBufferPointer(),
+          shaders_[index].bytecode->GetBufferSize()};
+      pipelines_[index] =
+          context_.CreateComputePipeline(root_signature_.get(), bytecode);
+      ASSERT_TRUE(pipelines_[index]);
+    }
   }
 
   void WriteViews(ID3D12DescriptorHeap *heap, UINT base,
@@ -170,11 +183,13 @@ protected:
     ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
     context_.list()->SetDescriptorHeaps(1, heaps);
     context_.list()->SetComputeRootSignature(root_signature_.get());
-    context_.list()->SetPipelineState(pipeline_.get());
     context_.list()->SetComputeRootDescriptorTable(
         0, context_.GpuDescriptorHandle(gpu_heap.get(), kTableBase));
-    context_.list()->Dispatch(1, 1, 1);
-    D3D12TestContext::UavBarrier(context_.list(), output.get());
+    for (const auto &pipeline : pipelines_) {
+      context_.list()->SetPipelineState(pipeline.get());
+      context_.list()->Dispatch(1, 1, 1);
+      D3D12TestContext::UavBarrier(context_.list(), output.get());
+    }
     D3D12TestContext::Transition(
         context_.list(), output.get(),
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -195,9 +210,9 @@ protected:
   }
 
   D3D12TestContext context_;
-  dxmt::test::ShaderCompilation shader_;
+  std::array<dxmt::test::ShaderCompilation, 3> shaders_;
   ComPtr<ID3D12RootSignature> root_signature_;
-  ComPtr<ID3D12PipelineState> pipeline_;
+  std::array<ComPtr<ID3D12PipelineState>, 3> pipelines_;
 };
 
 TEST_F(BufferViewSpec, ExecutesTypedRawAndStructuredInputViews) {
