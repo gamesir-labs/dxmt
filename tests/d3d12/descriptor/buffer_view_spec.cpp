@@ -94,7 +94,7 @@ protected:
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uav.Format = DXGI_FORMAT_R32_UINT;
-    uav.Buffer.FirstElement = 2;
+    uav.Buffer.FirstElement = 0;
     uav.Buffer.NumElements = 3;
     context_.device()->CreateUnorderedAccessView(
         output, nullptr, &uav,
@@ -188,9 +188,9 @@ protected:
     std::array<UINT, kDwordCount> actual = {};
     std::memcpy(actual.data(), output_bytes.data(), output_bytes.size());
     std::array<UINT, kDwordCount> expected = {};
-    expected[2] = input_data[3];
-    expected[3] = input_data[6];
-    expected[4] = input_data[11];
+    expected[0] = input_data[3];
+    expected[1] = input_data[6];
+    expected[2] = input_data[11];
     EXPECT_EQ(actual, expected);
   }
 
