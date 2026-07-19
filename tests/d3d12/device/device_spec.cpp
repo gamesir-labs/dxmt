@@ -10,6 +10,7 @@
 #include "shaders/runtime_test_shaders.hpp"
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <iomanip>
 
