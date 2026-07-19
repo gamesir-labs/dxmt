@@ -67,7 +67,8 @@ protected:
   }
 
   void WriteViews(ID3D12DescriptorHeap *heap, UINT base,
-                  ID3D12Resource *input, ID3D12Resource *output) {
+                  ID3D12Resource *input, ID3D12Resource *typed_output,
+                  ID3D12Resource *raw_output) {
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -98,7 +99,7 @@ protected:
     uav.Buffer.FirstElement = 2;
     uav.Buffer.NumElements = 2;
     context_.device()->CreateUnorderedAccessView(
-        output, nullptr, &uav,
+        typed_output, nullptr, &uav,
         context_.CpuDescriptorHandle(heap, base + 3));
 
     uav.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -106,7 +107,7 @@ protected:
     uav.Buffer.NumElements = 2;
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     context_.device()->CreateUnorderedAccessView(
-        output, nullptr, &uav,
+        raw_output, nullptr, &uav,
         context_.CpuDescriptorHandle(heap, base + 4));
 
   }
@@ -125,7 +126,11 @@ protected:
     auto input = context_.CreateBuffer(
         sizeof(input_data), D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    auto output = context_.CreateBuffer(
+    auto typed_output = context_.CreateBuffer(
+        sizeof(zero_data), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto raw_output = context_.CreateBuffer(
         sizeof(zero_data), D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_DEST);
@@ -134,48 +139,63 @@ protected:
     ASSERT_TRUE(input_upload);
     ASSERT_TRUE(output_upload);
     ASSERT_TRUE(input);
-    ASSERT_TRUE(output);
+    ASSERT_TRUE(typed_output);
+    ASSERT_TRUE(raw_output);
     ASSERT_TRUE(gpu_heap);
 
     ComPtr<ID3D12Resource> decoy_input;
-    ComPtr<ID3D12Resource> decoy_output;
+    ComPtr<ID3D12Resource> decoy_typed_output;
+    ComPtr<ID3D12Resource> decoy_raw_output;
     if (publication == DescriptorPublication::Overwritten) {
       decoy_input = context_.CreateBuffer(
           sizeof(input_data), D3D12_HEAP_TYPE_DEFAULT,
           D3D12_RESOURCE_FLAG_NONE,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-      decoy_output = context_.CreateBuffer(
+      decoy_typed_output = context_.CreateBuffer(
+          sizeof(zero_data), D3D12_HEAP_TYPE_DEFAULT,
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      decoy_raw_output = context_.CreateBuffer(
           sizeof(zero_data), D3D12_HEAP_TYPE_DEFAULT,
           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       ASSERT_TRUE(decoy_input);
-      ASSERT_TRUE(decoy_output);
+      ASSERT_TRUE(decoy_typed_output);
+      ASSERT_TRUE(decoy_raw_output);
       WriteViews(gpu_heap.get(), kTableBase, decoy_input.get(),
-                 decoy_output.get());
+                 decoy_typed_output.get(), decoy_raw_output.get());
     }
 
     if (publication == DescriptorPublication::Copied) {
       auto cpu_heap = context_.CreateDescriptorHeap(
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5, false);
       ASSERT_TRUE(cpu_heap);
-      WriteViews(cpu_heap.get(), 0, input.get(), output.get());
+      WriteViews(cpu_heap.get(), 0, input.get(), typed_output.get(),
+                 raw_output.get());
       context_.device()->CopyDescriptorsSimple(
           5, context_.CpuDescriptorHandle(gpu_heap.get(), kTableBase),
           cpu_heap->GetCPUDescriptorHandleForHeapStart(),
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else {
-      WriteViews(gpu_heap.get(), kTableBase, input.get(), output.get());
+      WriteViews(gpu_heap.get(), kTableBase, input.get(), typed_output.get(),
+                 raw_output.get());
     }
 
     context_.list()->CopyBufferRegion(input.get(), 0, input_upload.get(), 0,
                                       sizeof(input_data));
-    context_.list()->CopyBufferRegion(output.get(), 0, output_upload.get(), 0,
+    context_.list()->CopyBufferRegion(typed_output.get(), 0,
+                                      output_upload.get(), 0,
                                       sizeof(zero_data));
+    context_.list()->CopyBufferRegion(raw_output.get(), 0, output_upload.get(),
+                                      0, sizeof(zero_data));
     D3D12TestContext::Transition(
         context_.list(), input.get(), D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        context_.list(), typed_output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12TestContext::Transition(
+        context_.list(), raw_output.get(), D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ID3D12DescriptorHeap *heaps[] = {gpu_heap.get()};
     context_.list()->SetDescriptorHeaps(1, heaps);
@@ -185,20 +205,36 @@ protected:
         0, context_.GpuDescriptorHandle(gpu_heap.get(), kTableBase));
     context_.list()->Dispatch(1, 1, 1);
     D3D12TestContext::Transition(
-        context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        context_.list(), typed_output.get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12TestContext::Transition(
+        context_.list(), raw_output.get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_SOURCE);
 
-    std::vector<std::uint8_t> bytes;
-    ASSERT_EQ(context_.ReadbackBuffer(output.get(), sizeof(zero_data), &bytes),
+    std::vector<std::uint8_t> typed_bytes;
+    ASSERT_EQ(context_.ReadbackBuffer(typed_output.get(), sizeof(zero_data),
+                                      &typed_bytes),
               S_OK);
-    ASSERT_EQ(bytes.size(), sizeof(zero_data));
-    std::array<UINT, kDwordCount> actual = {};
-    std::memcpy(actual.data(), bytes.data(), bytes.size());
-    std::array<UINT, kDwordCount> expected = {};
-    expected[2] = input_data[3];
-    expected[3] = input_data[11];
-    expected[6] = input_data[6];
-    EXPECT_EQ(actual, expected);
+    ASSERT_EQ(typed_bytes.size(), sizeof(zero_data));
+    std::array<UINT, kDwordCount> typed_actual = {};
+    std::memcpy(typed_actual.data(), typed_bytes.data(), typed_bytes.size());
+    std::array<UINT, kDwordCount> typed_expected = {};
+    typed_expected[2] = input_data[3];
+    typed_expected[3] = input_data[11];
+    EXPECT_EQ(typed_actual, typed_expected);
+
+    std::vector<std::uint8_t> raw_bytes;
+    ASSERT_EQ(context_.ReadbackBuffer(raw_output.get(), sizeof(zero_data),
+                                      &raw_bytes),
+              S_OK);
+    ASSERT_EQ(raw_bytes.size(), sizeof(zero_data));
+    std::array<UINT, kDwordCount> raw_actual = {};
+    std::memcpy(raw_actual.data(), raw_bytes.data(), raw_bytes.size());
+    std::array<UINT, kDwordCount> raw_expected = {};
+    raw_expected[6] = input_data[6];
+    EXPECT_EQ(raw_actual, raw_expected);
   }
 
   D3D12TestContext context_;
