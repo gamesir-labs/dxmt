@@ -628,6 +628,127 @@ TEST_F(ShaderTextureSamplingSemanticSpec, Texture1DSampleLevelSelectsTexel) {
   EXPECT_EQ(levels, 1u);
 }
 
+TEST_F(ShaderTextureSamplingSemanticSpec,
+       Texture2DArraySampleLevelSelectsSlice) {
+  const auto shader = CompileShader(R"(
+    Texture2DArray<float> input : register(t0);
+    SamplerState input_sampler : register(s0);
+    RWByteAddressBuffer output : register(u0);
+    [numthreads(1, 1, 1)] void main() {
+      uint width, height, layers, levels;
+      input.GetDimensions(0, width, height, layers, levels);
+      float slice0 = input.SampleLevel(input_sampler, float3(0.5f, 0.5f, 0.0f), 0);
+      float slice1 = input.SampleLevel(input_sampler, float3(0.5f, 0.5f, 1.0f), 0);
+      output.Store4(0, uint4(asuint(slice0), asuint(slice1), layers, levels));
+    }
+  )", "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto root_signature = CreateResourceRootSignature(context_, true);
+  ASSERT_TRUE(root_signature);
+  const D3D12_SHADER_BYTECODE bytecode = {shader.bytecode->GetBufferPointer(),
+                                          shader.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateComputePipeline(root_signature.get(), bytecode);
+  ASSERT_TRUE(pipeline);
+
+  D3D12_HEAP_PROPERTIES heap_props = {};
+  heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = 2;
+  desc.Height = 2;
+  desc.DepthOrArraySize = 2;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R32_FLOAT;
+  desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_EQ(context_.device()->CreateCommittedResource(
+                &heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                __uuidof(ID3D12Resource),
+                reinterpret_cast<void **>(texture.put())),
+            S_OK);
+  constexpr std::array<float, 4> slice0 = {1.0f, 1.0f, 1.0f, 1.0f};
+  constexpr std::array<float, 4> slice1 = {4.0f, 4.0f, 4.0f, 4.0f};
+  ASSERT_EQ(context_.UploadTextureAndReset(
+                texture.get(), slice0.data(), 2 * sizeof(float),
+                sizeof(slice0), 0),
+            S_OK);
+  ASSERT_EQ(context_.UploadTextureAndReset(
+                texture.get(), slice1.data(), 2 * sizeof(float),
+                sizeof(slice1), 1),
+            S_OK);
+  auto output = context_.CreateBuffer(
+      4 * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  auto samplers = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  ASSERT_TRUE(output);
+  ASSERT_TRUE(heap);
+  ASSERT_TRUE(samplers);
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_FLOAT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2DArray.MipLevels = 1;
+  srv.Texture2DArray.ArraySize = 2;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = 4;
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  context_.device()->CreateShaderResourceView(
+      texture.get(), &srv, context_.CpuDescriptorHandle(heap.get(), 0));
+  context_.device()->CreateUnorderedAccessView(
+      output.get(), nullptr, &uav,
+      context_.CpuDescriptorHandle(heap.get(), 1));
+  D3D12_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.MaxAnisotropy = 1;
+  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  context_.device()->CreateSampler(
+      &sampler, samplers->GetCPUDescriptorHandleForHeapStart());
+  D3D12TestContext::Transition(
+      context_.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  ID3D12DescriptorHeap *heaps[] = {heap.get(), samplers.get()};
+  context_.list()->SetDescriptorHeaps(2, heaps);
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootDescriptorTable(
+      0, heap->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetComputeRootDescriptorTable(
+      1, samplers->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), 4 * sizeof(UINT), &bytes),
+            S_OK);
+  float slice0_value = 0.0f;
+  float slice1_value = 0.0f;
+  UINT layers = 0;
+  UINT levels = 0;
+  std::memcpy(&slice0_value, bytes.data(), sizeof(slice0_value));
+  std::memcpy(&slice1_value, bytes.data() + sizeof(float),
+              sizeof(slice1_value));
+  std::memcpy(&layers, bytes.data() + 2 * sizeof(UINT), sizeof(layers));
+  std::memcpy(&levels, bytes.data() + 3 * sizeof(UINT), sizeof(levels));
+  EXPECT_FLOAT_EQ(slice0_value, 1.0f);
+  EXPECT_FLOAT_EQ(slice1_value, 4.0f);
+  EXPECT_EQ(layers, 2u);
+  EXPECT_EQ(levels, 1u);
+}
+
 TEST_F(ShaderTextureSamplingSemanticSpec, GatherAndSampleLevelAgreeWithTexels) {
   const auto shader = CompileShader(R"(
     Texture2D<float> input : register(t0);
