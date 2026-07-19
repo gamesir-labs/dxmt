@@ -219,10 +219,10 @@ protected:
 TEST_F(RtvDsvDimensionSpec, Texture2DMultisampleRtvAndDsvDrawResolve) {
   constexpr UINT kSize = 4;
   constexpr UINT kSamples = 4;
-  constexpr auto color_required =
+  const auto color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
       D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
-  constexpr auto depth_required =
+  const auto depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL |
       D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required, kSamples) ||
@@ -291,7 +291,7 @@ TEST_F(RtvDsvDimensionSpec, Texture2DMultisampleRtvAndDsvDrawResolve) {
 }
 
 TEST_F(RtvDsvDimensionSpec, Texture3DRtvClearHonorsWSliceRange) {
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))
     GTEST_SKIP() << "R8G8B8A8_UNORM 3D render targets are unsupported";
@@ -342,7 +342,7 @@ TEST_F(RtvDsvDimensionSpec, Texture3DRtvClearHonorsWSliceRange) {
 
 DXMT_SERIAL_TEST_F(RtvDsvDimensionSpec,
                    Texture3DClearDoesNotMergeAcrossWSlices) {
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))
     GTEST_SKIP() << "R8G8B8A8_UNORM 3D render targets are unsupported";
@@ -396,7 +396,7 @@ DXMT_SERIAL_TEST_F(RtvDsvDimensionSpec,
 }
 
 TEST_F(RtvDsvDimensionSpec, InvalidTexture3DRtvIsNoOpAndCanBeOverwritten) {
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))
     GTEST_SKIP() << "R8G8B8A8_UNORM 3D render targets are unsupported";
@@ -455,7 +455,7 @@ TEST_F(RtvDsvDimensionSpec, InvalidTexture3DRtvIsNoOpAndCanBeOverwritten) {
 
 TEST_F(RtvDsvDimensionSpec, Texture1DArrayRtvCoversRequestedSlices) {
   constexpr UINT kSlices = 4;
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))
     GTEST_SKIP() << "1D array color targets are unsupported";
@@ -498,7 +498,7 @@ TEST_F(RtvDsvDimensionSpec, Texture1DArrayRtvCoversRequestedSlices) {
 
 TEST_F(RtvDsvDimensionSpec, Texture1DArrayDsvCoversRequestedSlices) {
   constexpr UINT kSlices = 4;
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_D32_FLOAT, required))
     GTEST_SKIP() << "1D array depth targets are unsupported";
@@ -541,7 +541,7 @@ TEST_F(RtvDsvDimensionSpec, Texture1DArrayDsvCoversRequestedSlices) {
 TEST_F(RtvDsvDimensionSpec, Texture2DArrayRtvTargetsMipAndArraySlice) {
   constexpr UINT kMips = 2;
   constexpr UINT kSlices = 3;
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, required))
     GTEST_SKIP() << "R8G8B8A8_UNORM render targets are unsupported";
@@ -588,7 +588,7 @@ TEST_F(RtvDsvDimensionSpec, Texture2DArrayRtvTargetsMipAndArraySlice) {
 }
 
 TEST_F(RtvDsvDimensionSpec, Texture1DDsvTargetsNonzeroMip) {
-  constexpr auto required =
+  const auto required =
       D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_D32_FLOAT, required))
     GTEST_SKIP() << "D32_FLOAT 1D depth textures are unsupported";
@@ -628,9 +628,9 @@ TEST_F(RtvDsvDimensionSpec, Texture1DDsvTargetsNonzeroMip) {
 TEST_F(RtvDsvDimensionSpec, Texture2DArrayDsvTargetsMipAndArraySlice) {
   constexpr UINT kMips = 2;
   constexpr UINT kSlices = 3;
-  constexpr auto color_required =
+  const auto color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  constexpr auto depth_required =
+  const auto depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required) ||
       !Supports(DXGI_FORMAT_D32_FLOAT, depth_required))
@@ -699,9 +699,9 @@ TEST_F(RtvDsvDimensionSpec, Texture2DArrayDsvTargetsMipAndArraySlice) {
 
 TEST_F(RtvDsvDimensionSpec, ReadOnlyDepthDsvTestsAndPreservesDepth) {
   constexpr UINT kSize = 4;
-  constexpr auto color_required =
+  const auto color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  constexpr auto depth_required =
+  const auto depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required) ||
       !Supports(DXGI_FORMAT_D32_FLOAT, depth_required))
@@ -766,9 +766,9 @@ TEST_F(RtvDsvDimensionSpec, ReadOnlyDepthDsvTestsAndPreservesDepth) {
 
 TEST_F(RtvDsvDimensionSpec, ReadOnlyStencilDsvTestsAndPreservesStencil) {
   constexpr UINT kSize = 4;
-  constexpr auto color_required =
+  const auto color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  constexpr auto depth_required =
+  const auto depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required) ||
       !Supports(DXGI_FORMAT_D24_UNORM_S8_UINT, depth_required))
@@ -845,9 +845,9 @@ TEST_F(RtvDsvDimensionSpec, ReadOnlyStencilDsvTestsAndPreservesStencil) {
 }
 
 TEST_F(RtvDsvDimensionSpec, TypelessResourcesUseCompatibleTypedViews) {
-  constexpr auto color_required =
+  const auto color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  constexpr auto depth_required =
+  const auto depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required) ||
       !Supports(DXGI_FORMAT_D24_UNORM_S8_UINT, depth_required))
@@ -902,9 +902,9 @@ TEST_F(RtvDsvDimensionSpec, TypelessResourcesUseCompatibleTypedViews) {
 }
 
 TEST_F(RtvDsvDimensionSpec, InvalidViewFormatsCanBeOverwrittenByValidViews) {
-  constexpr auto color_required =
+  const auto color_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-  constexpr auto depth_required =
+  const auto depth_required =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
   if (!Supports(DXGI_FORMAT_R8G8B8A8_UNORM, color_required) ||
       !Supports(DXGI_FORMAT_D32_FLOAT, depth_required))

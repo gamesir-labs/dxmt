@@ -387,7 +387,7 @@ TEST_F(D3D12MemoryContractSpec,
       DXGI_FORMAT_R16_TYPELESS,
       DXGI_FORMAT_R32_TYPELESS,
   };
-  constexpr auto initial_state = static_cast<D3D12_RESOURCE_STATES>(
+  const auto initial_state = static_cast<D3D12_RESOURCE_STATES>(
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 

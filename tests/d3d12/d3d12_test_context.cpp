@@ -2,7 +2,11 @@
 
 #include "shaders/runtime_test_shaders.hpp"
 
+#include <dxgi1_4.h>
+
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -23,34 +27,131 @@ std::unordered_map<std::string, ComPtr<ID3D12Device>> &SharedDevices() {
   return devices;
 }
 
+const char *DebugSeverityName(D3D12_MESSAGE_SEVERITY severity) {
+  switch (severity) {
+  case D3D12_MESSAGE_SEVERITY_CORRUPTION:
+    return "CORRUPTION";
+  case D3D12_MESSAGE_SEVERITY_ERROR:
+    return "ERROR";
+  case D3D12_MESSAGE_SEVERITY_WARNING:
+    return "WARNING";
+  case D3D12_MESSAGE_SEVERITY_INFO:
+    return "INFO";
+  case D3D12_MESSAGE_SEVERITY_MESSAGE:
+    return "MESSAGE";
+  }
+  return "UNKNOWN";
+}
+
+void __stdcall DebugMessageCallback(D3D12_MESSAGE_CATEGORY category,
+                                    D3D12_MESSAGE_SEVERITY severity,
+                                    D3D12_MESSAGE_ID id,
+                                    const char *description, void *) {
+  static std::mutex output_mutex;
+  std::scoped_lock lock(output_mutex);
+  std::fprintf(stderr, "[ D3D12   ] %s category=%u id=%u: %s\n",
+               DebugSeverityName(severity), static_cast<unsigned>(category),
+               static_cast<unsigned>(id), description ? description : "");
+  std::fflush(stderr);
+}
+
+bool EnvironmentEquals(const char *name, std::string_view expected) {
+  std::array<char, 32> value = {};
+  const DWORD length = GetEnvironmentVariableA(
+      name, value.data(), static_cast<DWORD>(value.size()));
+  return length == expected.size() && length < value.size() &&
+         std::string_view(value.data(), length) == expected;
+}
+
+HRESULT EnableWindowsDebugLayer() {
+  if (!EnvironmentEquals("DXMT_TEST_WINDOWS_DEBUG_LAYER", "1"))
+    return S_OK;
+
+  ComPtr<ID3D12Debug> debug;
+  const HRESULT hr = D3D12GetDebugInterface(
+      __uuidof(ID3D12Debug), reinterpret_cast<void **>(debug.put()));
+  if (FAILED(hr))
+    return hr;
+  debug->EnableDebugLayer();
+  return S_OK;
+}
+
+HRESULT CreateNativeD3D12TestDevice(ComPtr<ID3D12Device> *device) {
+  static std::once_flag debug_once;
+  static HRESULT debug_result = S_OK;
+  std::call_once(debug_once,
+                 [] { debug_result = EnableWindowsDebugLayer(); });
+  if (FAILED(debug_result))
+    return debug_result;
+
+  ComPtr<IDXGIAdapter1> adapter;
+  if (EnvironmentEquals("DXMT_TEST_WINDOWS_ADAPTER", "warp")) {
+    ComPtr<IDXGIFactory4> factory;
+    HRESULT hr = CreateDXGIFactory1(
+        __uuidof(IDXGIFactory4), reinterpret_cast<void **>(factory.put()));
+    if (FAILED(hr))
+      return hr;
+    hr = factory->EnumWarpAdapter(
+        __uuidof(IDXGIAdapter1), reinterpret_cast<void **>(adapter.put()));
+    if (FAILED(hr))
+      return hr;
+  }
+
+  return D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_11_0,
+                           __uuidof(ID3D12Device),
+                           reinterpret_cast<void **>(device->put()));
+}
+
 } // namespace
 
 ComPtr<ID3D12Device> CreateIsolatedD3D12Device() {
-  using CreateDeviceProc = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL,
-                                              REFIID, void **);
-  const auto create_device = reinterpret_cast<CreateDeviceProc>(
-      GetProcAddress(GetModuleHandleW(L"d3d12.dll"),
-                     "DXMTCreateD3D12DeviceFromFactory"));
-  if (!create_device)
-    return {};
-
   ComPtr<ID3D12Device> device;
-  const HRESULT hr = create_device(
-      nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-      reinterpret_cast<void **>(device.put()));
+  const HRESULT hr = CreateNativeD3D12TestDevice(&device);
   return SUCCEEDED(hr) ? std::move(device) : ComPtr<ID3D12Device>{};
 }
 
 D3D12TestContext::~D3D12TestContext() {
+  if (debug_info_queue_)
+    debug_info_queue_->UnregisterMessageCallback(debug_callback_cookie_);
   if (fence_event_)
     CloseHandle(fence_event_);
 }
 
+void D3D12TestContext::RegisterDebugMessageCallback() {
+  if (!EnvironmentEquals("DXMT_TEST_WINDOWS_DEBUG_LAYER", "1"))
+    return;
+
+  ComPtr<ID3D12InfoQueue1> info_queue;
+  HRESULT hr = device_->QueryInterface(
+      __uuidof(ID3D12InfoQueue1),
+      reinterpret_cast<void **>(info_queue.put()));
+  if (FAILED(hr)) {
+    std::fprintf(stderr,
+                 "[ D3D12   ] WARNING: ID3D12InfoQueue1 is unavailable "
+                 "(HRESULT %#lx); debug messages will not be captured\n",
+                 static_cast<unsigned long>(hr));
+    return;
+  }
+
+  DWORD cookie = 0;
+  hr = info_queue->RegisterMessageCallback(
+      DebugMessageCallback, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr,
+      &cookie);
+  if (FAILED(hr)) {
+    std::fprintf(stderr,
+                 "[ D3D12   ] WARNING: failed to register the D3D12 debug "
+                 "message callback (HRESULT %#lx)\n",
+                 static_cast<unsigned long>(hr));
+    return;
+  }
+
+  debug_info_queue_ = std::move(info_queue);
+  debug_callback_cookie_ = cookie;
+}
+
 HRESULT D3D12TestContext::Initialize() {
   ComPtr<ID3D12Device> device;
-  HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
-                                 __uuidof(ID3D12Device),
-                                 reinterpret_cast<void **>(device.put()));
+  HRESULT hr = CreateNativeD3D12TestDevice(&device);
   if (FAILED(hr))
     return hr;
 
@@ -66,9 +167,7 @@ HRESULT D3D12TestContext::InitializeSharedDevice(std::string_view domain) {
   auto existing = devices.find(std::string(domain));
   if (existing == devices.end()) {
     ComPtr<ID3D12Device> device;
-    const HRESULT hr = D3D12CreateDevice(
-        nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-        reinterpret_cast<void **>(device.put()));
+    const HRESULT hr = CreateNativeD3D12TestDevice(&device);
     if (FAILED(hr))
       return hr;
     existing = devices.emplace(std::string(domain), std::move(device)).first;
@@ -81,6 +180,7 @@ HRESULT D3D12TestContext::Initialize(ID3D12Device *device) {
     return E_INVALIDARG;
   device->AddRef();
   device_.reset(device);
+  RegisterDebugMessageCallback();
 
   D3D12_COMMAND_QUEUE_DESC queue_desc = {};
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

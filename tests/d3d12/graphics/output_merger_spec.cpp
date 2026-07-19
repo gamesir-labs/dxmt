@@ -17,7 +17,6 @@ using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
-using dxmt::test::DualSourcePixelShader;
 using dxmt::test::FullscreenVertexShader;
 using dxmt::test::TextureReadback;
 
@@ -357,10 +356,25 @@ TEST_F(GraphicsOutputMergerSpec, AppliesIndependentBlendStates) {
 
 // Keep the dual-source fixed-function path out of the concurrent Metal wave.
 DXMT_SERIAL_TEST_F(GraphicsOutputMergerSpec, AppliesDualSourceBlendFactors) {
+  auto dual_source = CompileShader(R"(
+    struct Output {
+      float4 source0 : SV_Target0;
+      float4 source1 : SV_Target1;
+    };
+    Output main() {
+      Output output;
+      output.source0 = float4(1.0, 0.0, 0.0, 1.0);
+      output.source1 = float4(0.25, 0.25, 0.25, 0.25);
+      return output;
+    })",
+                                   "ps_5_0");
+  ASSERT_EQ(dual_source.result, S_OK) << dual_source.diagnostic_text();
+
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = root_signature_.get();
   desc.VS = FullscreenVertexShader();
-  desc.PS = DualSourcePixelShader();
+  desc.PS = {dual_source.bytecode->GetBufferPointer(),
+             dual_source.bytecode->GetBufferSize()};
   auto &blend = desc.BlendState.RenderTarget[0];
   blend.BlendEnable = TRUE;
   blend.SrcBlend = D3D12_BLEND_SRC1_COLOR;
@@ -393,7 +407,7 @@ DXMT_SERIAL_TEST_F(GraphicsOutputMergerSpec, AppliesDualSourceBlendFactors) {
   const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
   context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
 
-  // The DXIL shader outputs red as source 0 and 0.25 in every source-1
+  // The pixel shader outputs red as source 0 and 0.25 in every source-1
   // channel. Blending that over blue exercises all four source-1 factors.
   constexpr std::array<float, 4> destination = {0.0f, 0.0f, 1.0f, 0.0f};
   constexpr std::array<float, 4> expected = {0.25f, 0.0f, 0.75f, 0.25f};

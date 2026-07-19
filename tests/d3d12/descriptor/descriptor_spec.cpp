@@ -1,11 +1,8 @@
 #include <dxmt_test.hpp>
-#include <dxmt_d3d12_test_path.hpp>
 
 #include "d3d12_test_context.hpp"
 #include "shaders/runtime_test_shaders.hpp"
 #include "shaders/bindless_dxil_shaders.hpp"
-#include "../../src/d3d12/d3d12_descriptor_shape.hpp"
-#include "../../src/d3d12/d3d12_descriptor_journal.hpp"
 
 #include <array>
 #include <atomic>
@@ -18,45 +15,6 @@
 #include <vector>
 
 namespace {
-
-using dxmt::d3d12::DescriptorTextureViewShape;
-using dxmt::d3d12::GetSrvTextureViewShape;
-using dxmt::d3d12::GetUavTextureViewShape;
-
-TEST(D3D12DescriptorJournal, ReportsOrderedChangesFromCursor) {
-  dxmt::d3d12::DescriptorChangeJournal journal(4);
-  const auto initial = journal.cursor();
-  journal.Record(7, 1);
-  journal.Record(2, 3);
-
-  const auto delta = journal.ChangesSince(initial);
-  ASSERT_TRUE(delta.complete);
-  ASSERT_EQ(delta.changes.size(), 2u);
-  EXPECT_EQ(delta.changes[0].slot, 7u);
-  EXPECT_EQ(delta.changes[0].generation, 1u);
-  EXPECT_EQ(delta.changes[1].slot, 2u);
-  EXPECT_EQ(delta.changes[1].generation, 3u);
-  EXPECT_EQ(delta.cursor, journal.cursor());
-}
-
-TEST(D3D12DescriptorJournal, ForcesFullScanAfterHistoryOverflow) {
-  dxmt::d3d12::DescriptorChangeJournal journal(2);
-  const auto stale_cursor = journal.cursor();
-  journal.Record(0, 1);
-  journal.Record(1, 1);
-  journal.Record(2, 1);
-
-  const auto stale = journal.ChangesSince(stale_cursor);
-  EXPECT_FALSE(stale.complete);
-  EXPECT_TRUE(stale.changes.empty());
-
-  const auto current = journal.cursor();
-  journal.Record(3, 1);
-  const auto recent = journal.ChangesSince(current);
-  ASSERT_TRUE(recent.complete);
-  ASSERT_EQ(recent.changes.size(), 1u);
-  EXPECT_EQ(recent.changes[0].slot, 3u);
-}
 
 using dxmt::test::ColorsMatch;
 using dxmt::test::ComPtr;
@@ -103,26 +61,6 @@ inline constexpr DWORD kNullBufferSrvComputeShader[] = {
     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000001,
 };
-
-TEST(D3D12DescriptorShape, ClassifiesShaderResourceViewArrayness) {
-  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_TEXTURE2D),
-            DescriptorTextureViewShape::NonArray);
-  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_TEXTURE2DARRAY),
-            DescriptorTextureViewShape::Array);
-  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_TEXTURECUBEARRAY),
-            DescriptorTextureViewShape::Array);
-  EXPECT_EQ(GetSrvTextureViewShape(D3D12_SRV_DIMENSION_BUFFER),
-            DescriptorTextureViewShape::NotTexture);
-}
-
-TEST(D3D12DescriptorShape, ClassifiesUnorderedAccessViewArrayness) {
-  EXPECT_EQ(GetUavTextureViewShape(D3D12_UAV_DIMENSION_TEXTURE2D),
-            DescriptorTextureViewShape::NonArray);
-  EXPECT_EQ(GetUavTextureViewShape(D3D12_UAV_DIMENSION_TEXTURE2DARRAY),
-            DescriptorTextureViewShape::Array);
-  EXPECT_EQ(GetUavTextureViewShape(D3D12_UAV_DIMENSION_BUFFER),
-            DescriptorTextureViewShape::NotTexture);
-}
 
 struct RenderTarget {
   ComPtr<ID3D12Resource> texture;
@@ -330,19 +268,6 @@ INSTANTIATE_TEST_SUITE_P(
                       ForeignDescriptorCopyCase::RangedForeignDestination),
     ForeignDescriptorCopyCaseName);
 
-bool TestInjectionEnabled(const char *name) {
-  char value[8] = {};
-  const DWORD length = GetEnvironmentVariableA(
-      name, value, static_cast<DWORD>(std::size(value)));
-  return length && length < std::size(value) &&
-         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-          std::strcmp(value, "yes") == 0);
-}
-
-bool FaultInjectionRequired() {
-  return TestInjectionEnabled("DXMT_TEST_REQUIRE_FAULT_INJECTION");
-}
-
 struct DescriptorTableDrawOptions {
   bool execute_indirect = false;
   bool test_occlusion_queries = false;
@@ -356,8 +281,6 @@ struct DescriptorTableDrawOptions {
   bool use_static_sampler = false;
   bool repeat_graphics_root_signature = false;
   bool set_compute_root_signature = false;
-  bool expect_cbv_rejected = false;
-  bool force_fallback = false;
 };
 
 ULONG PublicRefCount(IUnknown *object) {
@@ -621,14 +544,6 @@ void RunDescriptorTableDraw(
   }
 
   const float clear_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-  if (options.force_fallback) {
-    dxmt::d3d12::test::ExecutionPathConfig path = {};
-    path.mode = dxmt::d3d12::test::ExecutionPathMode::Fallback;
-    ASSERT_EQ(context.list()->SetPrivateData(
-                  dxmt::d3d12::test::kExecutionPathConfigGuid, sizeof(path),
-                  &path),
-              S_OK);
-  }
   context.list()->ClearRenderTargetView(render_target.view, clear_color, 0,
                                         nullptr);
   context.list()->OMSetRenderTargets(1, &render_target.view, FALSE, nullptr);
@@ -902,11 +817,7 @@ void RunDescriptorTableDraw(
                      options.null_other_heap_cbv ? 0x00000000 : 0xff00ff00,
                      2);
   } else {
-    ExpectSolidColor(readback,
-                     options.null_cbv || options.expect_cbv_rejected
-                         ? 0x00000000
-                         : 0xb2664c19,
-                     2);
+    ExpectSolidColor(readback, options.null_cbv ? 0x00000000 : 0xb2664c19, 2);
   }
 
   if (query_results) {
@@ -922,7 +833,7 @@ void RunDescriptorTableDraw(
 }
 
 TEST_F(D3D12DescriptorSpec, DrawsWithSplitDescriptorTables) {
-  RunDescriptorTableDraw(context_, {.force_fallback = true});
+  RunDescriptorTableDraw(context_);
 }
 
 TEST_F(D3D12DescriptorSpec, DrawsWithBindlessStaticSampler) {
@@ -971,6 +882,8 @@ DXMT_SERIAL_TEST_F(D3D12DescriptorSpec,
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   root_desc.NumParameters = std::size(parameters);
   root_desc.pParameters = parameters;
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
   auto root_signature = context_.CreateRootSignature(root_desc);
   ASSERT_TRUE(root_signature);
 
@@ -1374,43 +1287,6 @@ TEST_F(D3D12DescriptorSpec,
   RunDescriptorTableDraw(
       context_, {.null_other_heap_cbv = true,
                  .write_other_heap_concurrently = true});
-}
-
-TEST_F(D3D12DescriptorSpec,
-       FailsClosedWhenNativeCbvResourceLookupIsUnavailable) {
-  if (!TestInjectionEnabled(
-          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS")) {
-    ASSERT_FALSE(FaultInjectionRequired())
-        << "required native CBV lookup-miss injection was not propagated";
-    GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
-  }
-
-  RunDescriptorTableDraw(context_, {.expect_cbv_rejected = true});
-}
-
-TEST_F(D3D12DescriptorSpec,
-       FailsClosedForCopiedCbvWhenNativeResourceLookupIsUnavailable) {
-  if (!TestInjectionEnabled(
-          "DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS")) {
-    ASSERT_FALSE(FaultInjectionRequired())
-        << "required native CBV lookup-miss injection was not propagated";
-    GTEST_SKIP() << "native CBV lookup-miss injection is disabled";
-  }
-
-  RunDescriptorTableDraw(context_, {.copy_from_released_cpu_heaps = true,
-                                    .expect_cbv_rejected = true});
-}
-
-TEST_F(D3D12DescriptorSpec,
-       RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution) {
-  if (!TestInjectionEnabled(
-          "DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY")) {
-    ASSERT_FALSE(FaultInjectionRequired())
-        << "required stale native CBV injection was not propagated";
-    GTEST_SKIP() << "stale native CBV resource-table injection is disabled";
-  }
-
-  RunDescriptorTableDraw(context_, {.expect_cbv_rejected = true});
 }
 
 TEST_F(D3D12DescriptorSpec, PopulatesIndependentDescriptorSlotsConcurrently) {

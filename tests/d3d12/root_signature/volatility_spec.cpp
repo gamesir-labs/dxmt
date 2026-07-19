@@ -136,7 +136,7 @@ protected:
 
 TEST_F(RootSignatureVolatilitySpec,
        VolatileDescriptorsObserveOverwriteBeforeExecution) {
-  constexpr auto range_flags = static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(
+  const auto range_flags = static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(
       D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
       D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
   EXPECT_EQ(
@@ -163,7 +163,7 @@ TEST_F(RootSignatureVolatilitySpec, RootDescriptorDataFlagsExecuteCorrectly) {
       D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
       D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC,
   };
-  constexpr auto range_flags = static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(
+  const auto range_flags = static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(
       D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
       D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
   for (const auto flag : flags) {

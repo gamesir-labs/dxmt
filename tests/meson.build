@@ -1,5 +1,9 @@
 dxmt_test_include_dirs = include_directories('include')
+d3d10_test_dep = cpp.find_library('d3d10')
+d3d11_test_dep = cpp.find_library('d3d11')
+d3d12_test_dep = cpp.find_library('d3d12')
 d3dcompiler_test_dep = cpp.find_library('d3dcompiler_47')
+dxgi_test_dep = cpp.find_library('dxgi')
 python3_native = find_program('python3', native: true)
 
 test(

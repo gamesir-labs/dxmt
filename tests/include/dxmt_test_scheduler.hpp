@@ -18,6 +18,10 @@ inline constexpr std::uint32_t kMediumStressTestCost = 64;
 inline constexpr std::uint32_t kLongStressTestCost = 256;
 inline constexpr std::uint32_t kSlowTestCost = 100;
 inline constexpr std::uint32_t kMinimumBatchCost = 4;
+// CreateProcessW accepts at most 32,767 UTF-16 code units including the
+// executable and every argument. Keep each gtest filter comfortably below
+// that limit so report paths and user-supplied arguments still fit.
+inline constexpr std::size_t kMaximumWorkerFilterLength = 16 * 1024;
 
 enum class TestClass {
   Conformance,
@@ -148,7 +152,9 @@ std::vector<std::vector<std::size_t>>
 BuildSerialShardWaves(const std::vector<TestShard> &shards,
                       std::size_t maximum_concurrency);
 std::vector<TestShard> BuildTestShards(std::vector<ScheduledTest> tests,
-                                       std::size_t worker_count);
+                                       std::size_t worker_count,
+                                       std::size_t maximum_filter_length =
+                                           kMaximumWorkerFilterLength);
 int RunScheduledTests(int argc, char **argv);
 
 } // namespace dxmt::test

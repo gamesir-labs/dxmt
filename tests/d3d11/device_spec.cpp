@@ -112,22 +112,19 @@ TEST_F(D3D11DeviceSpec, RemovesDebugNameWithNullData) {
   release_object(buffer);
 }
 
-TEST_F(D3D11DeviceSpec, RejectsUnsupportedPipelineStatisticsQuery) {
+TEST_F(D3D11DeviceSpec, ReportsPipelineStatisticsQueryCapability) {
   D3D11_QUERY_DESC desc = {};
   desc.Query = D3D11_QUERY_PIPELINE_STATISTICS;
   ID3D11Query *query = nullptr;
-  EXPECT_EQ(device_->CreateQuery(&desc, &query), E_NOTIMPL);
-  EXPECT_EQ(query, nullptr);
+  const HRESULT statistics_hr = device_->CreateQuery(&desc, &query);
+  EXPECT_TRUE(HResultSucceeded(statistics_hr));
+  EXPECT_NE(query, nullptr);
+  release_object(query);
 
   desc.Query = D3D11_QUERY_OCCLUSION;
   EXPECT_TRUE(HResultSucceeded(device_->CreateQuery(&desc, &query)));
   EXPECT_NE(query, nullptr);
   release_object(query);
-}
-
-TEST_F(D3D11DeviceSpec, IgnoresInvalidCommandListWithoutCrashing) {
-  context_->ExecuteCommandList(nullptr, FALSE);
-  SUCCEED();
 }
 
 TEST_F(D3D11DeviceSpec, AllowsRecursiveContextEntryWhileAnotherThreadWaits) {

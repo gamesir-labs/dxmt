@@ -342,6 +342,27 @@ TEST(TestSchedulerPlan, DistributesTiesDeterministically) {
   EXPECT_EQ(shards[1].estimated_cost, 8u);
 }
 
+TEST(TestSchedulerPlan, SplitsFiltersBeforeTheWindowsCommandLineLimit) {
+  std::vector<dxmt::test::ScheduledTest> tests = {
+      {"Suite.FirstLongTest", 4},
+      {"Suite.SecondLongTest", 3},
+      {"Suite.ThirdLongTest", 2},
+      {"Suite.FourthLongTest", 1},
+  };
+
+  const auto shards =
+      dxmt::test::BuildTestShards(std::move(tests), 1, 42);
+
+  ASSERT_EQ(shards.size(), 2u);
+  for (const auto &shard : shards) {
+    std::size_t filter_length = 0;
+    for (const auto &name : shard.tests)
+      filter_length += name.size() + (filter_length == 0 ? 0 : 1);
+    EXPECT_LE(filter_length, 42u);
+  }
+  EXPECT_EQ(shards[0].estimated_cost + shards[1].estimated_cost, 10u);
+}
+
 TEST(TestSchedulerWorker, PropagatesConditionalFailure) {
   if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
     ++conditional_failure_count;

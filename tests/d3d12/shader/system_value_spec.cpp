@@ -64,7 +64,9 @@ class D3D12ShaderSystemValueSpec : public ::testing::Test {
 protected:
   void SetUp() override {
     ASSERT_EQ(context_.Initialize(), S_OK);
-    const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     root_ = context_.CreateRootSignature(root_desc);
     ASSERT_TRUE(root_);
   }

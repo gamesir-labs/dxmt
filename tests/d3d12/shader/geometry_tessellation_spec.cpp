@@ -351,9 +351,13 @@ TEST_F(ShaderAdvancedStageSpec,
     })",
                                 "gs_5_0");
   const auto ps = CompileShader(R"(
-    float4 main(nointerpolation uint selector : TEXCOORD0) : SV_Target {
-      return selector == 0 ? float4(1, 0, 0, 1)
-                           : float4(0, 1, 0, 1);
+    struct Input {
+      float4 position : SV_Position;
+      nointerpolation uint selector : TEXCOORD0;
+    };
+    float4 main(Input input) : SV_Target {
+      return input.selector == 0 ? float4(1, 0, 0, 1)
+                                 : float4(0, 1, 0, 1);
     })",
                                 "ps_5_0");
   ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
@@ -410,6 +414,7 @@ TEST_F(ShaderAdvancedStageSpec,
   TextureReadback first;
   TextureReadback second;
   ASSERT_EQ(context_.ReadbackTexture(target.get(), &first, 0), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
   ASSERT_EQ(context_.ReadbackTexture(target.get(), &second, 1), S_OK);
   EXPECT_TRUE(ColorsMatch(PixelAt(first, kSize / 2, kSize / 2),
                           0xff0000ffu, 1));
@@ -451,9 +456,13 @@ TEST_F(ShaderAdvancedStageSpec,
     })",
                                 "gs_5_0");
   const auto ps = CompileShader(R"(
-    float4 main(nointerpolation uint selector : TEXCOORD0) : SV_Target {
-      return selector == 0 ? float4(1, 0, 0, 1)
-                           : float4(0, 1, 0, 1);
+    struct Input {
+      float4 position : SV_Position;
+      nointerpolation uint selector : TEXCOORD0;
+    };
+    float4 main(Input input) : SV_Target {
+      return input.selector == 0 ? float4(1, 0, 0, 1)
+                                 : float4(0, 1, 0, 1);
     })",
                                 "ps_5_0");
   ASSERT_EQ(vs.result, S_OK) << vs.diagnostic_text();
@@ -473,9 +482,12 @@ TEST_F(ShaderAdvancedStageSpec,
       {0.0f, 0.0f, float(kSize / 2), float(kSize), 0.0f, 1.0f},
       {float(kSize / 2), 0.0f, float(kSize / 2), float(kSize), 0.0f, 1.0f},
   };
-  const D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
+  const D3D12_RECT scissors[2] = {
+      {0, 0, LONG(kSize), LONG(kSize)},
+      {0, 0, LONG(kSize), LONG(kSize)},
+  };
   context_.list()->RSSetViewports(2, viewports);
-  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->RSSetScissorRects(2, scissors);
   context_.list()->DrawInstanced(2, 1, 0, 0);
   D3D12TestContext::Transition(context_.list(), target_.get(),
                                D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -544,7 +556,7 @@ TEST_F(ShaderAdvancedStageSpec, GeometryShaderEmitsAfterRestartStrip) {
   DrawAndExpectCenter(pipeline.get(), D3D_PRIMITIVE_TOPOLOGY_POINTLIST, 1);
 }
 
-TEST_F(ShaderAdvancedStageSpec, GeometryShaderAcceptsMetalVertexLimit) {
+TEST_F(ShaderAdvancedStageSpec, GeometryShaderAcceptsMaxVertexCount256) {
   const auto vs = CompileShader(R"(
     float4 main(uint id : SV_VertexID) : SV_Position {
       return float4(0.0, 0.0, 0.0, 1.0);

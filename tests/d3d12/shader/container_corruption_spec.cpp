@@ -3,8 +3,6 @@
 
 #include "d3d12_test_context.hpp"
 
-#include <DXBCParser/d3d12tokenizedprogramformat.hpp>
-
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -15,6 +13,19 @@ namespace {
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+
+// Public DXBC tokenized-program encoding values used to mutate compiled
+// shaders before submitting them through the D3D12 API. Keep this test
+// independent of DXMT's parser implementation.
+constexpr std::uint32_t kDxbcOpcodeTypeMask = 0x000007ff;
+constexpr std::uint32_t kDxbcInstructionLengthMask = 0x7f000000;
+constexpr std::uint32_t kDxbcInstructionLengthShift = 24;
+constexpr std::uint32_t kDxbcOpcodeElse = 18;
+constexpr std::uint32_t kDxbcOpcodeEmit = 19;
+constexpr std::uint32_t kDxbcOpcodeLoop = 48;
+constexpr std::uint32_t kDxbcOpcodeCustomData = 53;
+constexpr std::uint32_t kDxbcOpcodeRet = 62;
+constexpr std::uint32_t kDxbcOpcodeDclThreadGroup = 155;
 
 enum class ShaderContainerCorruption {
   EmptyContainer,
@@ -267,12 +278,12 @@ protected:
     for (std::uint32_t index = 2; index < token_count_;) {
       const auto offset = program_offset_ + index * sizeof(std::uint32_t);
       const auto token = Load32(offset);
-      const auto opcode = token & D3D10_SB_OPCODE_TYPE_MASK;
+      const auto opcode = token & kDxbcOpcodeTypeMask;
       if (opcode == wanted_opcode)
         return offset;
       const auto length =
-          (token & D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH_MASK) >>
-          D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH_SHIFT;
+          (token & kDxbcInstructionLengthMask) >>
+          kDxbcInstructionLengthShift;
       if (!length || length > token_count_ - index)
         return bytes_.size();
       index += length;
@@ -282,26 +293,24 @@ protected:
 
   void ReplaceOpcode(std::size_t offset, std::uint32_t opcode) {
     ASSERT_LT(offset, bytes_.size());
-    Store32(offset, (Load32(offset) & ~D3D10_SB_OPCODE_TYPE_MASK) | opcode);
+    Store32(offset, (Load32(offset) & ~kDxbcOpcodeTypeMask) | opcode);
   }
 
   void ReplaceInstructionLength(std::size_t offset, std::uint32_t length) {
     ASSERT_LT(offset, bytes_.size());
     Store32(offset,
-            (Load32(offset) &
-             ~D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH_MASK) |
-                (length << D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH_SHIFT));
+            (Load32(offset) & ~kDxbcInstructionLengthMask) |
+                (length << kDxbcInstructionLengthShift));
   }
 
   void Corrupt(ShaderInstructionCorruption corruption) {
-    using namespace microsoft;
-    const auto thread_group = FindInstruction(D3D11_SB_OPCODE_DCL_THREAD_GROUP);
-    const auto ret = FindInstruction(D3D10_SB_OPCODE_RET);
+    const auto thread_group = FindInstruction(kDxbcOpcodeDclThreadGroup);
+    const auto ret = FindInstruction(kDxbcOpcodeRet);
     ASSERT_LT(thread_group, bytes_.size());
     ASSERT_LT(ret, bytes_.size());
     switch (corruption) {
     case ShaderInstructionCorruption::UnknownOpcode:
-      ReplaceOpcode(ret, D3D10_SB_OPCODE_TYPE_MASK);
+      ReplaceOpcode(ret, kDxbcOpcodeTypeMask);
       break;
     case ShaderInstructionCorruption::TruncatedInstruction:
       ReplaceInstructionLength(ret, 2);
@@ -314,16 +323,16 @@ protected:
               (Load32(program_offset_) & ~std::uint32_t(0xff)) | 0x60);
       break;
     case ShaderInstructionCorruption::StageIncompatibleInstruction:
-      ReplaceOpcode(ret, D3D10_SB_OPCODE_EMIT);
+      ReplaceOpcode(ret, kDxbcOpcodeEmit);
       break;
     case ShaderInstructionCorruption::UnexpectedElse:
-      ReplaceOpcode(ret, D3D10_SB_OPCODE_ELSE);
+      ReplaceOpcode(ret, kDxbcOpcodeElse);
       break;
     case ShaderInstructionCorruption::UnbalancedLoop:
-      ReplaceOpcode(ret, D3D10_SB_OPCODE_LOOP);
+      ReplaceOpcode(ret, kDxbcOpcodeLoop);
       break;
     case ShaderInstructionCorruption::InstructionLengthOverflow:
-      ReplaceOpcode(thread_group, D3D10_SB_OPCODE_CUSTOMDATA);
+      ReplaceOpcode(thread_group, kDxbcOpcodeCustomData);
       Store32(thread_group + sizeof(std::uint32_t),
               std::numeric_limits<std::uint32_t>::max());
       break;

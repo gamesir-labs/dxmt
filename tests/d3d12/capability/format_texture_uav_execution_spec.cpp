@@ -675,10 +675,10 @@ protected:
 
 TEST_F(FormatTextureUavExecutionSpec,
        EveryAdvertisedTexture2DTypedUavFormatHasAnExecutionDefinition) {
-  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+  const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-  constexpr UINT atomic_operations =
+  const UINT atomic_operations =
       D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
       D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
       D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
@@ -757,7 +757,7 @@ TEST_F(FormatTextureUavExecutionSpec,
 
 TEST_F(FormatTextureUavExecutionSpec,
        EveryAdvertisedTexture2DTypedUavOperationExecutesAndReadsBack) {
-  constexpr D3D12_FORMAT_SUPPORT1 required1 =
+  const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
   UINT load_executed = 0;

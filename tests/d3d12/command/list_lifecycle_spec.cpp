@@ -10,6 +10,7 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class CommandListLifecycleSpec : public ::testing::Test {
@@ -17,20 +18,7 @@ protected:
   void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
 
   ComPtr<ID3D12Device> CreateIsolatedDevice() {
-    using CreateDeviceProc = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL,
-                                                REFIID, void **);
-    const auto create_device = reinterpret_cast<CreateDeviceProc>(
-        GetProcAddress(GetModuleHandleW(L"d3d12.dll"),
-                       "DXMTCreateD3D12DeviceFromFactory"));
-    EXPECT_NE(create_device, nullptr);
-    if (!create_device)
-      return {};
-
-    ComPtr<ID3D12Device> device;
-    EXPECT_TRUE(SUCCEEDED(create_device(
-        nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-        reinterpret_cast<void **>(device.put()))));
-    return device;
+    return CreateIsolatedD3D12Device();
   }
 
   ComPtr<ID3D12PipelineState> CreateComputePipeline(ID3D12Device *device) {

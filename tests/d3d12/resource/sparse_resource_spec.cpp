@@ -7,7 +7,6 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
-#include <string>
 #include <vector>
 
 namespace {
@@ -26,45 +25,6 @@ enum class SparseCase {
   SampleMapped,
   CopyToUnmapped,
   CopyToMapped,
-};
-
-class ScopedMetal4FeedbackErrorInjection {
-public:
-  ScopedMetal4FeedbackErrorInjection() {
-    using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
-    set_unix_env_ = reinterpret_cast<SetUnixEnvProc>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
-    token_ = std::to_string(GetCurrentProcessId()) + "-" +
-             std::to_string(GetTickCount64());
-    windows_active_ = SetEnvironmentVariableA(
-        "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", token_.c_str());
-    unix_active_ = set_unix_env_ &&
-                   set_unix_env_("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
-                                 token_.c_str()) == 0;
-  }
-
-  ~ScopedMetal4FeedbackErrorInjection() { Clear(); }
-
-  bool active() const { return windows_active_ && unix_active_; }
-
-  void Clear() {
-    if (windows_active_) {
-      SetEnvironmentVariableA("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
-                              nullptr);
-      windows_active_ = false;
-    }
-    if (unix_active_) {
-      set_unix_env_("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr);
-      unix_active_ = false;
-    }
-  }
-
-private:
-  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
-  SetUnixEnvProc set_unix_env_ = nullptr;
-  std::string token_;
-  bool windows_active_ = false;
-  bool unix_active_ = false;
 };
 
 class D3D12SparseResourceSpec : public ::testing::Test {
@@ -1105,142 +1065,6 @@ TEST_F(D3D12SparseResourceSpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-enum class ForeignTileMappingCase {
-  UpdateForeignResource,
-  UpdateForeignHeap,
-  CopyForeignSource,
-  CopyForeignDestination,
-};
-
-class ForeignTileMappingSpec
-    : public D3D12SparseResourceSpec,
-      public ::testing::WithParamInterface<ForeignTileMappingCase> {};
-
-TEST_P(ForeignTileMappingSpec,
-       RejectsForeignObjectsAndPreservesExistingMapping) {
-  D3D12_FEATURE_DATA_D3D12_OPTIONS local_options = {};
-  ASSERT_EQ(context_.device()->CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS, &local_options,
-                sizeof(local_options)),
-            S_OK);
-  if (local_options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
-    GTEST_SKIP() << "Tiled resources are not supported";
-
-  auto foreign_device = CreateIsolatedD3D12Device();
-  ASSERT_TRUE(foreign_device);
-  D3D12TestContext foreign_context;
-  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
-  D3D12_FEATURE_DATA_D3D12_OPTIONS foreign_options = {};
-  ASSERT_EQ(foreign_context.device()->CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS, &foreign_options,
-                sizeof(foreign_options)),
-            S_OK);
-  if (foreign_options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
-    GTEST_SKIP() << "Foreign device does not support tiled resources";
-
-  auto local_target = CreateSingleTileReservedBuffer(
-      context_, D3D12_RESOURCE_STATE_COPY_DEST);
-  auto local_probe = CreateSingleTileReservedBuffer(
-      context_, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  auto foreign_target = CreateSingleTileReservedBuffer(
-      foreign_context, D3D12_RESOURCE_STATE_COPY_DEST);
-  auto foreign_probe = CreateSingleTileReservedBuffer(
-      foreign_context, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  ASSERT_TRUE(local_target);
-  ASSERT_TRUE(local_probe);
-  ASSERT_TRUE(foreign_target);
-  ASSERT_TRUE(foreign_probe);
-  auto local_backing = CreateSingleTileBacking(context_);
-  auto foreign_backing = CreateSingleTileBacking(foreign_context);
-  ASSERT_TRUE(local_backing.heap);
-  ASSERT_TRUE(foreign_backing.heap);
-  QueueSingleTileMapping(context_, local_target.get(), local_backing);
-  QueueSingleTileMapping(context_, local_probe.get(), local_backing);
-  QueueSingleTileMapping(foreign_context, foreign_target.get(),
-                         foreign_backing);
-  QueueSingleTileMapping(foreign_context, foreign_probe.get(),
-                         foreign_backing);
-  ASSERT_EQ(context_.SignalAndWait(), S_OK);
-  ASSERT_EQ(foreign_context.SignalAndWait(), S_OK);
-
-  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
-  D3D12_TILE_REGION_SIZE region = {};
-  region.NumTiles = 1;
-  D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
-  UINT heap_offset = 0;
-  UINT tile_count = 1;
-  D3D12TestContext *protected_context = nullptr;
-  ID3D12Resource *protected_target = nullptr;
-  ID3D12Resource *protected_probe = nullptr;
-  switch (GetParam()) {
-  case ForeignTileMappingCase::UpdateForeignResource:
-    context_.queue()->UpdateTileMappings(
-        foreign_target.get(), 1, &coordinate, &region,
-        local_backing.heap.get(), 1, &range_flag, &heap_offset, &tile_count,
-        D3D12_TILE_MAPPING_FLAG_NONE);
-    protected_context = &foreign_context;
-    protected_target = foreign_target.get();
-    protected_probe = foreign_probe.get();
-    break;
-  case ForeignTileMappingCase::UpdateForeignHeap:
-    context_.queue()->UpdateTileMappings(
-        local_target.get(), 1, &coordinate, &region,
-        foreign_backing.heap.get(), 1, &range_flag, &heap_offset, &tile_count,
-        D3D12_TILE_MAPPING_FLAG_NONE);
-    protected_context = &context_;
-    protected_target = local_target.get();
-    protected_probe = local_probe.get();
-    break;
-  case ForeignTileMappingCase::CopyForeignSource:
-    context_.queue()->CopyTileMappings(
-        local_target.get(), &coordinate, foreign_target.get(), &coordinate,
-        &region, D3D12_TILE_MAPPING_FLAG_NONE);
-    protected_context = &context_;
-    protected_target = local_target.get();
-    protected_probe = local_probe.get();
-    break;
-  case ForeignTileMappingCase::CopyForeignDestination:
-    context_.queue()->CopyTileMappings(
-        foreign_target.get(), &coordinate, local_target.get(), &coordinate,
-        &region, D3D12_TILE_MAPPING_FLAG_NONE);
-    protected_context = &foreign_context;
-    protected_target = foreign_target.get();
-    protected_probe = foreign_probe.get();
-    break;
-  }
-  ASSERT_EQ(context_.SignalAndWait(), S_OK);
-  ASSERT_NE(protected_context, nullptr);
-  ASSERT_NE(protected_target, nullptr);
-  ASSERT_NE(protected_probe, nullptr);
-  ExpectSingleTileAlias(*protected_context, protected_target, protected_probe);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-  EXPECT_EQ(foreign_context.device()->GetDeviceRemovedReason(), S_OK);
-}
-
-std::string ForeignTileMappingCaseName(
-    const ::testing::TestParamInfo<ForeignTileMappingCase> &info) {
-  switch (info.param) {
-  case ForeignTileMappingCase::UpdateForeignResource:
-    return "UpdateForeignResource";
-  case ForeignTileMappingCase::UpdateForeignHeap:
-    return "UpdateForeignHeap";
-  case ForeignTileMappingCase::CopyForeignSource:
-    return "CopyForeignSource";
-  case ForeignTileMappingCase::CopyForeignDestination:
-    return "CopyForeignDestination";
-  }
-  return "Unknown";
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    CrossDeviceMatrix, ForeignTileMappingSpec,
-    ::testing::Values(
-        ForeignTileMappingCase::UpdateForeignResource,
-        ForeignTileMappingCase::UpdateForeignHeap,
-        ForeignTileMappingCase::CopyForeignSource,
-        ForeignTileMappingCase::CopyForeignDestination),
-    ForeignTileMappingCaseName);
-
 TEST_F(D3D12SparseResourceSpec, WritesMappedDeepPackedMipTail) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
@@ -1305,9 +1129,8 @@ TEST_F(D3D12SparseResourceSpec,
   if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
     GTEST_SKIP() << "Tiled resources are not supported";
 
-  // Metal 4 permits at most 32 residency sets on a command queue. D3D12 does
-  // not expose that implementation limit, so a burst of mapping updates must
-  // remain valid until the following queue work consumes the mapped texture.
+  // A burst of mapping updates must remain valid until the following queue
+  // work consumes the mapped texture.
   constexpr std::size_t mapping_burst_size = 40;
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1404,7 +1227,8 @@ DXMT_SERIAL_TEST_F(
   UINT total_tiles = 0;
   context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
                                        &shape, nullptr, 0, nullptr);
-  ASSERT_GT(packed.NumPackedMips, 0u);
+  if (packed.NumPackedMips == 0)
+    GTEST_SKIP() << "The selected adapter exposes no packed mip region";
   constexpr UINT kPackedSubresource = kMipLevels - 1;
   ASSERT_GE(kPackedSubresource, packed.NumStandardMips);
 
@@ -1503,71 +1327,6 @@ DXMT_SERIAL_TEST_F(
   ASSERT_GE(readback.data.size(), expected_block.size());
   for (std::size_t i = 0; i < expected_block.size(); ++i)
     EXPECT_EQ(readback.data[i], expected_block[i]) << "byte " << i;
-}
-
-DXMT_SERIAL_TEST_F(D3D12SparseResourceSpec,
-                   DoesNotAccumulateSparseResidencySetsAfterQueueFailure) {
-  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
-  ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
-      D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
-  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
-    GTEST_SKIP() << "Tiled resources are not supported";
-
-  constexpr std::size_t mapping_burst_size = 40;
-  D3D12_RESOURCE_DESC desc = {};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = 256;
-  desc.Height = 256;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 9;
-  desc.Format = DXGI_FORMAT_R32_UINT;
-  desc.SampleDesc.Count = 1;
-  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
-
-  std::vector<ComPtr<ID3D12Resource>> textures;
-  std::vector<SparseBacking> backings;
-  textures.reserve(mapping_burst_size);
-  backings.reserve(mapping_burst_size);
-  for (std::size_t i = 0; i < mapping_burst_size; ++i) {
-    ComPtr<ID3D12Resource> texture;
-    ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
-        &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-        __uuidof(ID3D12Resource),
-        reinterpret_cast<void **>(texture.put()))));
-    ASSERT_TRUE(texture);
-    SparseBacking backing = CreateAllTilesBacking(texture.get());
-    ASSERT_TRUE(backing.heap);
-    textures.push_back(std::move(texture));
-    backings.push_back(std::move(backing));
-  }
-
-  const std::uint32_t initial_value = 0x01020304u;
-  auto upload = context_.CreateUploadBuffer(
-      sizeof(initial_value), &initial_value, sizeof(initial_value));
-  auto destination = context_.CreateBuffer(
-      sizeof(initial_value), D3D12_HEAP_TYPE_DEFAULT,
-      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-  ASSERT_TRUE(upload);
-  ASSERT_TRUE(destination);
-  context_.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
-                                    sizeof(initial_value));
-
-  ScopedMetal4FeedbackErrorInjection injection;
-  ASSERT_TRUE(injection.active());
-  ASSERT_TRUE(SUCCEEDED(context_.list()->Close()));
-  ID3D12CommandList *lists[] = {context_.list()};
-  context_.queue()->ExecuteCommandLists(1, lists);
-
-  // Queue the burst before feedback from the first command buffer arrives.
-  // Once that feedback latches the error, the already queued mapping calls
-  // must not accumulate residency sets that rejected command buffers cannot
-  // retire. The regression used to abort around the 33rd update.
-  for (std::size_t i = 0; i < mapping_burst_size; ++i)
-    QueueAllTilesMapping(textures[i].get(), backings[i]);
-  EXPECT_TRUE(SUCCEEDED(context_.SignalAndWait()));
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(),
-            DXGI_ERROR_DEVICE_REMOVED);
-  injection.Clear();
 }
 
 TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {

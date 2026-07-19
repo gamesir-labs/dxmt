@@ -457,7 +457,7 @@ TEST_F(D3D12UnrealCapabilitySpec, ReportsBarrierAndQueueCapabilities) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3 = {};
   ASSERT_TRUE(HResultSucceeded(device_->CheckFeatureSupport(
       D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))));
-  constexpr auto write_buffer_support =
+  const auto write_buffer_support =
       D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
       D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
       D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |

@@ -12,12 +12,6 @@
 #include <cstring>
 #include <iomanip>
 
-extern "C" HRESULT WINAPI D3D10CoreCreateDevice(IDXGIFactory *factory,
-                                                IDXGIAdapter *adapter,
-                                                UINT flags,
-                                                D3D_FEATURE_LEVEL feature_level,
-                                                ID3D10Device **device);
-
 namespace {
 
 using dxmt::test::CompileShader;
@@ -92,16 +86,11 @@ HRESULT ReadTexturePixel(ID3D10Device *device, ID3D10Texture2D *texture, UINT x,
 class D3D10PipelineSpec : public ::testing::Test {
 protected:
   void SetUp() override {
-    ASSERT_TRUE(HResultSucceeded(CreateDXGIFactory1(
-        __uuidof(IDXGIFactory1), reinterpret_cast<void **>(factory_.put()))));
-    ASSERT_TRUE(HResultSucceeded(factory_->EnumAdapters(0, adapter_.put())));
-    ASSERT_TRUE(HResultSucceeded(
-        D3D10CoreCreateDevice(factory_.get(), adapter_.get(), 0,
-                              D3D_FEATURE_LEVEL_10_0, device_.put())));
+    ASSERT_TRUE(HResultSucceeded(D3D10CreateDevice(
+        nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, D3D10_SDK_VERSION,
+        device_.put())));
   }
 
-  ComPtr<IDXGIFactory1> factory_;
-  ComPtr<IDXGIAdapter> adapter_;
   ComPtr<ID3D10Device> device_;
 };
 

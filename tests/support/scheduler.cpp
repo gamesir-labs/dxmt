@@ -761,8 +761,11 @@ int RunScheduledTests(int argc, char **argv) {
     return RunTestsAndReport(case_namespace);
 
   auto shards = BuildTestShards(
-      std::move(tests), std::max<std::size_t>(1, worker_count));
+      std::move(tests), std::max<std::size_t>(1, worker_count),
+      kMaximumWorkerFilterLength);
   const auto parallel_shard_count = shards.size();
+  const auto parallel_concurrency =
+      std::min(parallel_shard_count, std::max<std::size_t>(1, worker_count));
   for (auto &shard : serial_shards)
     shards.push_back(std::move(shard));
   const auto executable = WineExecutablePath();
@@ -854,10 +857,14 @@ int RunScheduledTests(int argc, char **argv) {
     }
   };
 
-  if (parallel_shard_count) {
-    std::vector<std::size_t> parallel_indexes(parallel_shard_count);
-    for (std::size_t index = 0; index < parallel_shard_count; ++index)
-      parallel_indexes[index] = index;
+  for (std::size_t first = 0; first < parallel_shard_count;
+       first += parallel_concurrency) {
+    const auto last = std::min(parallel_shard_count,
+                               first + parallel_concurrency);
+    std::vector<std::size_t> parallel_indexes;
+    parallel_indexes.reserve(last - first);
+    for (std::size_t index = first; index < last; ++index)
+      parallel_indexes.push_back(index);
     run_wave(parallel_indexes);
   }
   for (const auto &wave : serial_waves) {

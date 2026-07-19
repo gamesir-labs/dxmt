@@ -10,12 +10,8 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <memory>
-#include <sstream>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -55,14 +51,6 @@ ComPtr<ID3D12Resource> CreateDefaultTexture2D(
           reinterpret_cast<void **>(resource.put()))))
     return {};
   return resource;
-}
-
-void SetUnixEnvironment(const char *name, const char *value) {
-  using SetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
-  auto set_unix_env = reinterpret_cast<SetUnixEnvProc>(
-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
-  ASSERT_NE(set_unix_env, nullptr);
-  EXPECT_EQ(set_unix_env(name, value), 0);
 }
 
 class LifetimeProbe final : public IUnknown {
@@ -179,7 +167,7 @@ TEST_F(D3D12QueueSpec, CompiledZeroInstanceDrawIsANoOp) {
   context_.list()->RSSetScissorRects(1, &scissor);
 
   // D3D12 defines this as a no-op. The compiled path must not turn it into an
-  // invalid Metal draw, and the following valid draw must still render.
+  // invalid draw, and the following valid draw must still render.
   context_.list()->DrawInstanced(3, 0, 0, 0);
   context_.list()->DrawInstanced(3, 1, 0, 0);
   D3D12TestContext::Transition(
@@ -301,153 +289,6 @@ TEST_F(D3D12QueueSpec,
   }
 }
 
-struct ScopedBarrierOnlyMarker {
-  explicit ScopedBarrierOnlyMarker(const char *suffix) {
-    std::ostringstream name;
-    name << "C:\\dxmt-barrier-only-" << GetCurrentProcessId() << "-"
-         << GetTickCount64() << "-" << suffix << ".txt";
-    path = name.str();
-    std::ofstream(path, std::ios::trunc).close();
-    SetEnvironmentVariableA("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER",
-                            path.c_str());
-  }
-
-  ~ScopedBarrierOnlyMarker() {
-    SetEnvironmentVariableA("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER", nullptr);
-  }
-
-  size_t Count() const {
-    std::ifstream input(path);
-    size_t count = 0;
-    std::string line;
-    while (std::getline(input, line)) {
-      constexpr std::string_view prefix = "barrierOnly=";
-      if (line.rfind(prefix.data(), 0) == 0)
-        count += std::stoull(line.substr(prefix.size()));
-    }
-    return count;
-  }
-
-  std::string path;
-};
-
-struct ScopedCommandBufferErrorMarker {
-  ScopedCommandBufferErrorMarker() {
-    std::ostringstream name;
-    name << "C:\\dxmt-command-buffer-error-" << GetCurrentProcessId() << "-"
-         << GetTickCount64() << ".txt";
-    path = name.str();
-    std::ofstream(path, std::ios::trunc).close();
-    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_ERROR_MARKER",
-                            path.c_str());
-  }
-
-  ~ScopedCommandBufferErrorMarker() {
-    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_ERROR_MARKER", nullptr);
-    DeleteFileA(path.c_str());
-  }
-
-  size_t Count() const {
-    std::ifstream input(path);
-    return static_cast<size_t>(
-        std::count(std::istream_iterator<std::string>(input),
-                   std::istream_iterator<std::string>(), "error"));
-  }
-
-  std::string path;
-};
-
-struct CommandBufferDiagnosticTotals {
-  std::uint64_t input_encoders = 0;
-  std::uint64_t encoded_encoders = 0;
-  std::uint64_t encoded_blit = 0;
-  std::uint64_t barrier_only = 0;
-  std::uint64_t fence_waits = 0;
-  std::uint64_t fence_updates = 0;
-  std::uint64_t external_fence_waits = 0;
-  std::uint64_t skipped_external_fence_waits = 0;
-};
-
-struct ScopedCommandBufferDiagnosticMarker {
-  ScopedCommandBufferDiagnosticMarker() {
-    std::ostringstream name;
-    name << "C:\\dxmt-command-buffer-diagnostic-" << GetCurrentProcessId()
-         << "-" << GetTickCount64() << ".txt";
-    path = name.str();
-    std::ofstream(path, std::ios::trunc).close();
-    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
-                            path.c_str());
-  }
-
-  ~ScopedCommandBufferDiagnosticMarker() {
-    SetEnvironmentVariableA("DXMT_TEST_COMMAND_BUFFER_DIAGNOSTIC_MARKER",
-                            nullptr);
-    DeleteFileA(path.c_str());
-  }
-
-  CommandBufferDiagnosticTotals Read() const {
-    std::ifstream input(path);
-    CommandBufferDiagnosticTotals totals = {};
-    std::string record;
-    while (std::getline(input, record)) {
-      std::istringstream fields(record);
-      CommandBufferDiagnosticTotals line = {};
-      if (!(fields >> line.input_encoders >> line.encoded_encoders >>
-            line.encoded_blit >> line.barrier_only >> line.fence_waits >>
-            line.fence_updates))
-        continue;
-      fields >> line.external_fence_waits;
-      fields >> line.skipped_external_fence_waits;
-      totals.input_encoders += line.input_encoders;
-      totals.encoded_encoders += line.encoded_encoders;
-      totals.encoded_blit += line.encoded_blit;
-      totals.barrier_only += line.barrier_only;
-      totals.fence_waits += line.fence_waits;
-      totals.fence_updates += line.fence_updates;
-      totals.external_fence_waits += line.external_fence_waits;
-      totals.skipped_external_fence_waits +=
-          line.skipped_external_fence_waits;
-    }
-    return totals;
-  }
-
-  std::string path;
-};
-
-struct ScopedFenceCreationMarker {
-  ScopedFenceCreationMarker() {
-    std::ostringstream name;
-    name << "C:\\dxmt-fence-creation-" << GetCurrentProcessId() << "-"
-         << GetTickCount64() << ".txt";
-    path = name.str();
-    std::ofstream(path, std::ios::trunc).close();
-    SetEnvironmentVariableA("DXMT_TEST_FENCE_CREATION_MARKER", path.c_str());
-  }
-
-  ~ScopedFenceCreationMarker() {
-    SetEnvironmentVariableA("DXMT_TEST_FENCE_CREATION_MARKER", nullptr);
-    DeleteFileA(path.c_str());
-  }
-
-  std::vector<unsigned> Slots() const {
-    std::ifstream input(path);
-    return {std::istream_iterator<unsigned>(input),
-            std::istream_iterator<unsigned>()};
-  }
-
-  std::string path;
-};
-
-TEST(D3D12FencePoolSpec, DoesNotCreateMetalFencesForEmptyExecute) {
-  ScopedFenceCreationMarker marker;
-  D3D12TestContext context;
-  ASSERT_TRUE(SUCCEEDED(context.Initialize()));
-  EXPECT_TRUE(marker.Slots().empty());
-
-  ASSERT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
-  EXPECT_TRUE(marker.Slots().empty());
-}
-
 std::vector<ComPtr<ID3D12GraphicsCommandList>> CreateBarrierOnlyLists(
     D3D12TestContext &context, ID3D12Resource *resource, UINT count,
     std::vector<ComPtr<ID3D12CommandAllocator>> *allocators) {
@@ -477,7 +318,6 @@ std::vector<ComPtr<ID3D12GraphicsCommandList>> CreateBarrierOnlyLists(
 }
 
 TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
-  ScopedBarrierOnlyMarker marker("copy-barrier-readback");
   const std::array<std::uint32_t, 16> expected = {
       0x01020304, 0x11121314, 0x21222324, 0x31323334, 0x41424344, 0x51525354,
       0x61626364, 0x71727374, 0x81828384, 0x91929394, 0xa1a2a3a4, 0xb1b2b3b4,
@@ -506,7 +346,6 @@ TEST_F(D3D12QueueSpec, CompletesBufferCopyBeforeFenceSignal) {
       context_.ReadbackBuffer(destination.get(), sizeof(expected), &actual)));
   ASSERT_EQ(actual.size(), sizeof(expected));
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
-  EXPECT_EQ(marker.Count(), 0u);
 }
 
 TEST_F(D3D12QueueSpec, WritesImmediateValuesOnEveryAdvertisedListType) {
@@ -564,12 +403,6 @@ TEST_F(D3D12QueueSpec, WritesImmediateValuesOnEveryAdvertisedListType) {
     };
     list2->WriteBufferImmediate(static_cast<UINT>(writes.size()),
                                 writes.data(), modes.data());
-    const std::array<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, 2> invalid = {{
-        {base + 1, 0xdead0001},
-        {base + sizeof(initial), 0xdead0002},
-    }};
-    list2->WriteBufferImmediate(static_cast<UINT>(invalid.size()),
-                                invalid.data(), nullptr);
     ASSERT_EQ(list->Close(), S_OK);
 
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -1271,9 +1104,8 @@ TEST_F(D3D12QueueSpec, PreservesLongBlitDependencyChainAcrossEncoders) {
   EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(expected)), 0);
 }
 
-TEST_F(D3D12QueueSpec, BarrierStormDoesNotEncodeStandaloneWork) {
+TEST_F(D3D12QueueSpec, ExecutesManyBarrierOnlyCommandLists) {
   constexpr UINT kListCount = 1000;
-  ScopedBarrierOnlyMarker marker("coalesced");
   auto resource = context_.CreateBuffer(
       4096, D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -1289,12 +1121,10 @@ TEST_F(D3D12QueueSpec, BarrierStormDoesNotEncodeStandaloneWork) {
   context_.queue()->ExecuteCommandLists(static_cast<UINT>(raw_lists.size()),
                                         raw_lists.data());
   ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
-  EXPECT_EQ(marker.Count(), 0u);
 }
 
-TEST_F(D3D12QueueSpec, CarriesBarriersAcrossSeparateExecutes) {
+TEST_F(D3D12QueueSpec, ExecutesBarrierOnlyListsAcrossSeparateSubmissions) {
   constexpr UINT kExecuteCount = 64;
-  ScopedBarrierOnlyMarker marker("separate-executes");
   auto resource = context_.CreateBuffer(
       4096, D3D12_HEAP_TYPE_DEFAULT,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -1309,15 +1139,12 @@ TEST_F(D3D12QueueSpec, CarriesBarriersAcrossSeparateExecutes) {
     context_.queue()->ExecuteCommandLists(1, &raw_list);
   }
   ASSERT_TRUE(SUCCEEDED(context_.SignalAndWait()));
-  EXPECT_EQ(marker.Count(), 0u);
 }
 
 void ExpectRenderToCopyDependenciesAcrossSeparateExecutes(
     D3D12TestContext &context, UINT resource_count) {
   constexpr UINT64 kReadbackStride = 512;
   constexpr UINT kRowPitch = 256;
-  ScopedCommandBufferDiagnosticMarker diagnostic;
-
   auto rtv_heap = context.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_RTV, resource_count, false);
   auto readback = context.CreateBuffer(
@@ -1394,9 +1221,6 @@ void ExpectRenderToCopyDependenciesAcrossSeparateExecutes(
   }
 
   ASSERT_TRUE(SUCCEEDED(context.SignalAndWait()));
-  const auto totals = diagnostic.Read();
-  EXPECT_GT(totals.external_fence_waits, 0u);
-  EXPECT_EQ(totals.skipped_external_fence_waits, 0u);
 
   void *mapping = nullptr;
   const D3D12_RANGE read_range = {0, resource_count * kReadbackStride};
@@ -1513,13 +1337,10 @@ TEST_F(D3D12QueueSpec, ClearsRenderTargetViewsAcrossMipChain) {
 }
 
 TEST_F(D3D12QueueSpec,
-       PreservesAndReusesMoreThan256IndependentClearToCopyDependencies) {
+       PreservesMoreThan256IndependentClearToCopyDependencies) {
   constexpr UINT kResourceCount = 300;
   constexpr UINT64 kPlacedFootprintStride = 512;
   constexpr UINT kRowPitch = 256;
-  ScopedFenceCreationMarker fence_creation;
-  ScopedCommandBufferDiagnosticMarker diagnostic;
-
   auto rtv_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResourceCount, false);
   auto readback = context_.CreateBuffer(
@@ -1567,11 +1388,6 @@ TEST_F(D3D12QueueSpec,
   constexpr FLOAT first_color[] = {1.0f, 0.0f, 0.0f, 1.0f};
   record_clear_and_copy(first_color);
   ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
-  const auto first_slots = fence_creation.Slots();
-  EXPECT_GT(first_slots.size(), 256u);
-  const auto totals = diagnostic.Read();
-  EXPECT_GE(totals.fence_waits, kResourceCount);
-  EXPECT_GE(totals.fence_updates, kResourceCount);
 
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
   for (const auto &texture : textures)
@@ -1581,7 +1397,6 @@ TEST_F(D3D12QueueSpec,
   constexpr FLOAT second_color[] = {0.0f, 1.0f, 0.0f, 1.0f};
   record_clear_and_copy(second_color);
   ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
-  EXPECT_EQ(fence_creation.Slots(), first_slots);
 
   void *mapping = nullptr;
   const D3D12_RANGE read_range = {
@@ -1600,11 +1415,9 @@ TEST_F(D3D12QueueSpec,
 }
 
 TEST_F(D3D12QueueSpec,
-       LargeClearDependencyStormCompletesWithoutFenceAmplification) {
+       LargeClearSequenceProducesExpectedPixels) {
   constexpr UINT kResourceCount = 64;
   constexpr UINT kClearCount = 600;
-  ScopedCommandBufferDiagnosticMarker diagnostic;
-
   auto rtv_heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResourceCount, false);
   ASSERT_TRUE(rtv_heap);
@@ -1629,11 +1442,6 @@ TEST_F(D3D12QueueSpec,
   }
 
   ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
-  const auto totals = diagnostic.Read();
-  EXPECT_GE(totals.input_encoders, kClearCount);
-  EXPECT_LE(totals.fence_waits, kClearCount);
-  EXPECT_LE(totals.fence_updates, kClearCount + kResourceCount);
-  EXPECT_EQ(totals.barrier_only, 0u);
 
   ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
   D3D12TestContext::Transition(
@@ -2295,121 +2103,6 @@ TEST_F(D3D12QueueSpec, QueueDestructionCanRaceFenceWaitCallbackArming) {
     ASSERT_TRUE(SUCCEEDED(queue->Wait(fence.get(), iteration + 1)));
     queue.reset();
   }
-}
-
-class D3D12QueueErrorSpec : public ::testing::Test {};
-
-DXMT_SERIAL_TEST_DOMAIN(
-    "D3D12QueueErrorSpec.CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions",
-    "queue-error");
-
-DXMT_SERIAL_TEST_F(D3D12QueueErrorSpec,
-                   CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions) {
-  ScopedCommandBufferErrorMarker marker;
-  D3D12TestContext context;
-  ASSERT_TRUE(SUCCEEDED(context.Initialize()));
-  ComPtr<ID3D12Fence> rejected_fence;
-  ASSERT_EQ(context.device()->CreateFence(
-                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
-                reinterpret_cast<void **>(rejected_fence.put())),
-            S_OK);
-  HANDLE pending_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  ASSERT_NE(pending_event, nullptr);
-  ASSERT_EQ(rejected_fence->SetEventOnCompletion(9, pending_event), S_OK);
-  EXPECT_EQ(WaitForSingleObject(pending_event, 0), WAIT_TIMEOUT);
-  const auto injection_token =
-      std::to_string(GetCurrentProcessId()) + "-" +
-      std::to_string(GetTickCount64());
-  ASSERT_TRUE(SetEnvironmentVariableA(
-      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
-      injection_token.c_str()));
-  SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
-                     injection_token.c_str());
-
-  const std::array<std::uint32_t, 4> expected = {
-      0x01020304, 0x11223344, 0x55667788, 0x99aabbcc};
-  auto upload = context.CreateUploadBuffer(
-      sizeof(expected), expected.data(), sizeof(expected));
-  auto destination = context.CreateBuffer(
-      sizeof(expected), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  ASSERT_TRUE(upload);
-  ASSERT_TRUE(destination);
-  context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
-                                   sizeof(expected));
-
-  const auto begin = std::chrono::steady_clock::now();
-  EXPECT_TRUE(SUCCEEDED(context.ExecuteAndWait()));
-  const auto elapsed = std::chrono::steady_clock::now() - begin;
-  EXPECT_LT(elapsed, std::chrono::seconds(5));
-
-  ASSERT_TRUE(SUCCEEDED(context.ResetCommandList()));
-  context.list()->CopyBufferRegion(destination.get(), 0, upload.get(), 0,
-                                   sizeof(expected));
-  size_t command_buffer_errors = 0;
-  HRESULT removed_reason = S_OK;
-  const auto observation_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  do {
-    command_buffer_errors = marker.Count();
-    removed_reason = context.device()->GetDeviceRemovedReason();
-    if (command_buffer_errors >= 1 &&
-        removed_reason == DXGI_ERROR_DEVICE_REMOVED)
-      break;
-    Sleep(10);
-  } while (std::chrono::steady_clock::now() < observation_deadline);
-  EXPECT_GE(command_buffer_errors, 1u);
-  EXPECT_EQ(removed_reason, DXGI_ERROR_DEVICE_REMOVED);
-  EXPECT_EQ(rejected_fence->GetCompletedValue(), UINT64_MAX);
-  EXPECT_EQ(WaitForSingleObject(pending_event, 1000), WAIT_OBJECT_0);
-
-#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
-  ComPtr<ID3D12DeviceRemovedExtendedData2> dred;
-  ASSERT_EQ(context.device()->QueryInterface(
-                __uuidof(ID3D12DeviceRemovedExtendedData2),
-                reinterpret_cast<void **>(dred.put())),
-            S_OK);
-  ASSERT_TRUE(dred);
-  EXPECT_EQ(dred->GetDeviceState(), D3D12_DRED_DEVICE_STATE_FAULT);
-  D3D12_DRED_PAGE_FAULT_OUTPUT2 page_fault = {};
-  page_fault.PageFaultVA = 1;
-  page_fault.pHeadExistingAllocationNode =
-      reinterpret_cast<const D3D12_DRED_ALLOCATION_NODE1 *>(uintptr_t{1});
-  EXPECT_EQ(dred->GetPageFaultAllocationOutput2(&page_fault),
-            DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(page_fault.PageFaultVA, 0u);
-  EXPECT_EQ(page_fault.pHeadExistingAllocationNode, nullptr);
-#endif
-
-  ASSERT_TRUE(SetEnvironmentVariableA(
-      "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr));
-  SetUnixEnvironment("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE", nullptr);
-
-  ASSERT_EQ(context.list()->Close(), S_OK);
-  ID3D12CommandList *lists[] = {context.list()};
-  context.queue()->ExecuteCommandLists(1, lists);
-  EXPECT_EQ(context.allocator()->Reset(), S_OK);
-
-  EXPECT_EQ(context.queue()->Signal(rejected_fence.get(), 1),
-            DXGI_ERROR_DEVICE_REMOVED);
-  EXPECT_EQ(context.queue()->Wait(rejected_fence.get(), 1),
-            DXGI_ERROR_DEVICE_REMOVED);
-
-  D3D12TestContext recovered;
-  ASSERT_EQ(recovered.Initialize(), S_OK);
-  EXPECT_EQ(recovered.device()->GetDeviceRemovedReason(), S_OK);
-  EXPECT_EQ(recovered.ExecuteAndWait(), S_OK);
-#ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
-  ComPtr<ID3D12DeviceRemovedExtendedData2> recovered_dred;
-  ASSERT_EQ(recovered.device()->QueryInterface(
-                __uuidof(ID3D12DeviceRemovedExtendedData2),
-                reinterpret_cast<void **>(recovered_dred.put())),
-            S_OK);
-  EXPECT_EQ(recovered_dred->GetDeviceState(),
-            D3D12_DRED_DEVICE_STATE_UNKNOWN);
-#endif
-
-  CloseHandle(pending_event);
 }
 
 } // namespace

@@ -572,7 +572,7 @@ TEST_F(D3D12ResourceSpec,
   properties.Type = D3D12_HEAP_TYPE_CUSTOM;
   properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
   properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L1;
-  constexpr D3D12_HEAP_FLAGS shared_cross_adapter =
+  const D3D12_HEAP_FLAGS shared_cross_adapter =
       D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
   EXPECT_TRUE(FAILED(context_.device()->CreateCommittedResource(
       &properties, shared_cross_adapter, &desc,
