@@ -22,7 +22,18 @@ protected:
   }
 
   ComPtr<ID3D12PipelineState> CreateComputePipeline(ID3D12Device *device) {
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 1;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &range;
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.NumParameters = 2;
+    root_desc.pParameters = parameters;
     ComPtr<ID3DBlob> signature;
     ComPtr<ID3DBlob> error;
     EXPECT_EQ(D3D12SerializeRootSignature(

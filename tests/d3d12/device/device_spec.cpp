@@ -727,7 +727,7 @@ TEST_F(D3D12DeviceSpec, IgnoresBlendStateForUnwrittenPixelShaderTarget) {
 }
 
 TEST_F(D3D12DeviceSpec,
-       IgnoresDualSourceBlendWhenSecondaryPixelOutputIsMissing) {
+       RejectsDualSourceBlendWhenSecondaryPixelOutputIsMissing) {
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   range.NumDescriptors = UINT_MAX;
@@ -772,9 +772,8 @@ TEST_F(D3D12DeviceSpec,
   EXPECT_EQ(device_->CreateGraphicsPipelineState(
                 &desc, __uuidof(ID3D12PipelineState),
                 reinterpret_cast<void **>(&single_source_pipeline)),
-            S_OK);
-  EXPECT_NE(single_source_pipeline, nullptr);
-  release_object(single_source_pipeline);
+            E_INVALIDARG);
+  EXPECT_EQ(single_source_pipeline, nullptr);
   release_object(root_signature);
 }
 

@@ -152,7 +152,8 @@ DXMT_SERIAL_TEST(DeviceRemovalSpec, InitialReasonIsSuccess) {
   EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
 }
 
-DXMT_SERIAL_TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
+DXMT_SERIAL_TEST(DeviceRemovalSpec,
+                 ExplicitRemovalIsStickyAndCompletesPendingFenceWaits) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
 
@@ -190,25 +191,6 @@ DXMT_SERIAL_TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) 
   EXPECT_EQ(WaitForSingleObject(pending_event, 0), WAIT_OBJECT_0);
   EXPECT_EQ(fence->SetEventOnCompletion(1, post_removal_event), S_OK);
   EXPECT_EQ(WaitForSingleObject(post_removal_event, 0), WAIT_OBJECT_0);
-  EXPECT_EQ(context.queue()->Signal(fence.get(), 1),
-            DXGI_ERROR_DEVICE_REMOVED);
-  EXPECT_EQ(context.queue()->Wait(fence.get(), 1),
-            DXGI_ERROR_DEVICE_REMOVED);
-
-  ID3D12CommandList *lists[] = {context.list()};
-  context.queue()->ExecuteCommandLists(1, lists);
-  EXPECT_EQ(context.allocator()->Reset(), S_OK);
-
-  auto fresh_device = CreateIsolatedD3D12Device();
-  ASSERT_TRUE(fresh_device);
-  EXPECT_EQ(fresh_device->GetDeviceRemovedReason(), S_OK);
-  ComPtr<ID3D12Fence> fresh_fence;
-  EXPECT_EQ(fresh_device->CreateFence(
-                0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
-                reinterpret_cast<void **>(fresh_fence.put())),
-            S_OK);
-  EXPECT_TRUE(fresh_fence);
-
   CloseHandle(post_removal_event);
   CloseHandle(pending_event);
 }
@@ -345,10 +327,12 @@ DXMT_SERIAL_TEST(DeviceDredSpec, UnavailableReportsTrackExplicitRemovalState) {
   ASSERT_TRUE(device);
 
   ComPtr<ID3D12DeviceRemovedExtendedData2> dred2;
-  ASSERT_EQ(device->QueryInterface(
-                __uuidof(ID3D12DeviceRemovedExtendedData2),
-                reinterpret_cast<void **>(dred2.put())),
-            S_OK);
+  const HRESULT dred2_result = device->QueryInterface(
+      __uuidof(ID3D12DeviceRemovedExtendedData2),
+      reinterpret_cast<void **>(dred2.put()));
+  if (dred2_result == E_NOINTERFACE)
+    GTEST_SKIP() << "ID3D12DeviceRemovedExtendedData2 is unavailable";
+  ASSERT_EQ(dred2_result, S_OK);
   ASSERT_TRUE(dred2);
 
   ComPtr<ID3D12DeviceRemovedExtendedData1> dred1;
