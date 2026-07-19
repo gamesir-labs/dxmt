@@ -14,7 +14,7 @@ d3d12_runtime_support_lib = static_library(
 
 d3d12_runtime_support_dep = declare_dependency(
   link_with: [d3d12_runtime_support_lib],
-  dependencies: [d3d12_test_dep],
+  dependencies: [d3d12_test_dep, d3dcompiler_test_dep, dxgi_test_dep],
   include_directories: [d3d12_test_include_dirs],
 )
 
@@ -22,6 +22,7 @@ d3d12_unit_suites = {
   'device': {
     'sources': files(
       'device/concurrency_spec.cpp',
+      'device/agility_public_api_spec.cpp',
       'device/device_control_spec.cpp',
       'device/device_spec.cpp',
       'device/versioned_api_spec.cpp',
@@ -33,6 +34,7 @@ d3d12_unit_suites = {
       'object/com_guid_matrix_spec.cpp',
       'object/private_data_spec.cpp',
       'object/private_data_matrix_spec.cpp',
+      'object/shared_handle_spec.cpp',
     ),
   },
   'capability': {
@@ -119,6 +121,7 @@ d3d12_unit_suites = {
   'pipeline': {
     'sources': files(
       'pipeline/scalar_varying_spec.cpp',
+      'pipeline/cached_blob_spec.cpp',
       'pipeline/graphics_creation_spec.cpp',
       'pipeline/stream_spec.cpp',
     ),

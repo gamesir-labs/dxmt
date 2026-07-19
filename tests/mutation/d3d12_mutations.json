@@ -14,7 +14,7 @@
       "file": "src/d3d12/d3d12_descriptor_journal.hpp",
       "find": "const uint64_t sequence = next_sequence_++;",
       "replace": "const uint64_t sequence = next_sequence_;",
-      "test_filter": "D3D12DescriptorJournal.*"
+      "test_filter": "D3D12DescriptorSequenceFuzzSpec.CreateCopyOverwriteBindSequenceMatchesReferenceModel"
     },
     {
       "id": "dispatch-rejects-compute-lists",
@@ -66,13 +66,6 @@
       "test_filter": "PlanarFormatSpec.AdvertisedVideoFormatsExposeTwoPlaneFootprints"
     },
     {
-      "id": "pipeline-cache-key-omits-sample-mask",
-      "file": "src/d3d12/d3d12_pipeline.cpp",
-      "find": "    HashValue(hash, graphics_state.desc.SampleMask);",
-      "replace": "    (void)graphics_state.desc.SampleMask;",
-      "test_filter": "D3D12PipelineCacheKeySpec.SampleMaskChangesCachedBlobAndSameDescIsStable"
-    },
-    {
       "id": "recorded-resource-barrier-is-removed",
       "file": "src/d3d12/d3d12_command_list.cpp",
       "find": "      record.barriers.push_back(StoreResourceBarrier(barriers[i]));",
@@ -98,7 +91,7 @@
       "file": "src/d3d12/d3d12_command_queue.cpp",
       "find": "    enc.queue().AddPersistentResidency(transition.added_allocations[i]);",
       "replace": "    (void)transition.added_allocations[i];",
-      "test_filter": "D3D12BindingHotspot.RetainsSharedAllocationAfterPartialOverwrite"
+      "test_filter": "D3D12BindingHotspot.KeepsCompiledRootDescriptorsResidentThroughBatchedEncoding"
     },
     {
       "id": "compiled-descriptor-heap-reference-is-dropped",

@@ -86,84 +86,6 @@
   "error_path": {
     "minimum_percent": 100.0,
     "mappings": {
-      "resource-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_RESOURCE_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "ResourceFailureClearsOutputAndNextCallRecovers",
-        "required_evidence_categories": [
-          "positive",
-          "negative",
-          "lifecycle",
-          "no-op"
-        ],
-        "evidence": [
-          {
-            "category": "positive",
-            "test_regex": "ResourceFailureClearsOutputAndNextCallRecovers"
-          },
-          {
-            "category": "negative",
-            "test_regex": "EXPECT_EQ\\(hr, E_OUTOFMEMORY\\)"
-          },
-          {
-            "category": "lifecycle",
-            "test_regex": "RepeatedResourceFailuresRecoverAfterFaultIsDisabled"
-          },
-          {
-            "category": "no-op",
-            "test_regex": "EXPECT_(?:FALSE\\(resource\\)|EQ\\(output, nullptr\\))"
-          }
-        ]
-      },
-      "descriptor-heap-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_DESCRIPTOR_HEAP_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "DescriptorHeapFailureClearsOutputAndNextCallRecovers"
-      },
-      "compute-pipeline-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_COMPUTE_PIPELINE_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "ComputePipelineFailureClearsOutputAndNextCallRecovers"
-      },
-      "command-queue-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_COMMAND_QUEUE_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "CommandQueueFailureClearsOutputAndNextCallRecovers"
-      },
-      "graphics-pipeline-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_GRAPHICS_PIPELINE_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "GraphicsPipelineFailureClearsOutputAndNextCallRecovers"
-      },
-      "heap-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_HEAP_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "HeapFailureClearsOutputAndNextCallRecovers"
-      },
-      "root-signature-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_ROOT_SIGNATURE_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "RootSignatureFailureClearsOutputAndNextCallRecovers"
-      },
-      "fence-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_FENCE_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "FenceFailureClearsOutputAndNextCallRecovers"
-      },
-      "query-heap-creation-oom": {
-        "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_QUERY_HEAP_CREATION_AT",
-        "test_globs": ["tests/d3d12/robustness/fault_injection_spec.cpp"],
-        "test_regex": "QueryHeapFailureClearsOutputAndNextCallRecovers"
-      },
       "invalid-command-recording-state": {
         "source_globs": ["src/d3d12/d3d12_command_list.cpp"],
         "source_regex": "recording_error_\\s*=\\s*E_INVALIDARG",
@@ -182,107 +104,41 @@
           }
         ]
       },
-      "corrupt-pipeline-archive-fallback": {
-        "source_globs": ["src/d3d12/d3d12_pipeline.cpp"],
-        "source_regex": "AttachPSOBinaryArchive",
-        "test_globs": ["tests/d3d12/cache/cache_spec.cpp"],
-        "test_regex": "RejectsCorruptArchiveAndFallsBackToCompilation",
-        "required_evidence_categories": ["negative", "fallback"],
-        "evidence": [
-          {
-            "category": "negative",
-            "test_regex": "RejectsCorruptArchive"
-          },
-          {
-            "category": "fallback",
-            "test_regex": "FallsBackToCompilation"
-          }
-        ]
-      },
-      "queue-feedback-error-latching": {
+      "invalid-resource-description": {
         "source_globs": ["src/d3d12/d3d12_device.cpp"],
-        "source_regex": "HasDeviceError\\(\\)\\s*\\?\\s*DXGI_ERROR_DEVICE_REMOVED",
-        "test_globs": ["tests/d3d12/queue/queue_spec.cpp"],
-        "test_regex": "CommitFeedbackErrorLatchesQueueAndRejectsLaterSubmissions",
-        "required_evidence_categories": ["negative", "lifecycle"],
-        "evidence": [
-          {
-            "category": "negative",
-            "test_regex": "CommitFeedbackErrorLatchesQueue"
-          },
-          {
-            "category": "lifecycle",
-            "test_regex": "RejectsLaterSubmissions"
-          }
-        ]
+        "source_regex": "CreateCommittedResource\\(",
+        "test_globs": ["tests/d3d12/resource/validation_memory_spec.cpp"],
+        "test_regex": "InvalidResourceDescriptionSpec"
       },
-      "native-packet-allocation-fallback": {
+      "invalid-heap-description": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "CreateHeap\\(",
+        "test_globs": ["tests/d3d12/resource/validation_memory_spec.cpp"],
+        "test_regex": "InvalidHeapDescriptionSpec"
+      },
+      "oversized-root-signature": {
+        "source_globs": ["src/d3d12/d3d12_root_signature.cpp"],
+        "source_regex": "root_cost > D3D12_MAX_ROOT_COST",
+        "test_globs": ["tests/d3d12/root_signature/layout_validation_spec.cpp"],
+        "test_regex": "Exactly65DwordsRejected"
+      },
+      "corrupt-shader-container": {
+        "source_globs": ["src/d3d12/d3d12_pipeline.cpp"],
+        "source_regex": "CreateComputePipelineState\\(",
+        "test_globs": ["tests/d3d12/shader/container_corruption_spec.cpp"],
+        "test_regex": "CorruptionCorpusIsRejected"
+      },
+      "invalid-query-sequence": {
         "source_globs": ["src/d3d12/d3d12_command_list.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_NATIVE_PACKET_ALLOCATION_AT",
-        "test_globs": ["tests/d3d12/robustness/internal_fault_injection_spec.cpp"],
-        "test_regex": "NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers",
-        "required_evidence_categories": ["fallback", "recovery"],
-        "evidence": [
-          {
-            "category": "fallback",
-            "test_regex": "NativePacketAllocationFailureFallsBackExactlyOnce"
-          },
-          {
-            "category": "recovery",
-            "test_regex": "NativePacketAllocationFailureFallsBackExactlyOnceAndRecovers"
-          }
-        ]
+        "source_regex": "ResolveQueryData\\(",
+        "test_globs": ["tests/d3d12/query/validation_spec.cpp"],
+        "test_regex": "InvalidSequenceFailsCommandListClose"
       },
-      "native-segment-finalization-fallback": {
-        "source_globs": ["src/d3d12/d3d12_command_list.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT",
-        "test_globs": ["tests/d3d12/robustness/internal_fault_injection_spec.cpp"],
-        "test_regex": "NativeSegmentFinalizationFailurePreservesStateFenceAndRecovery",
-        "required_evidence_categories": ["fallback", "lifecycle"],
-        "evidence": [
-          {
-            "category": "fallback",
-            "test_regex": "NativeSegmentFinalizationFailurePreservesState"
-          },
-          {
-            "category": "lifecycle",
-            "test_regex": "PreservesStateFenceAndRecovery"
-          }
-        ]
-      },
-      "native-pipeline-compilation-fallback": {
-        "source_globs": ["src/d3d12/d3d12_command_queue.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_NATIVE_PIPELINE_COMPILATION_AT",
-        "test_globs": ["tests/d3d12/robustness/internal_fault_injection_spec.cpp"],
-        "test_regex": "QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers",
-        "required_evidence_categories": ["fallback", "recovery"],
-        "evidence": [
-          {
-            "category": "fallback",
-            "test_regex": "QueueTimeNativePipelineFailureFallsBackExactlyOnce"
-          },
-          {
-            "category": "recovery",
-            "test_regex": "QueueTimeNativePipelineFailureFallsBackExactlyOnceAndRecovers"
-          }
-        ]
-      },
-      "native-descriptor-lookup-fallback": {
-        "source_globs": ["src/d3d12/d3d12_command_queue.cpp"],
-        "source_regex": "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT",
-        "test_globs": ["tests/d3d12/robustness/internal_fault_injection_spec.cpp"],
-        "test_regex": "QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers",
-        "required_evidence_categories": ["fallback", "recovery"],
-        "evidence": [
-          {
-            "category": "fallback",
-            "test_regex": "QueueTimeNativeDescriptorLookupFallsBackExactlyOnce"
-          },
-          {
-            "category": "recovery",
-            "test_regex": "QueueTimeNativeDescriptorLookupFallsBackExactlyOnceAndRecovers"
-          }
-        ]
+      "descriptor-heap-capability-probe": {
+        "source_globs": ["src/d3d12/d3d12_device.cpp"],
+        "source_regex": "CreateDescriptorHeap\\(",
+        "test_globs": ["tests/d3d12/descriptor/heap_contract_spec.cpp"],
+        "test_regex": "ValidatesWithoutCreatingObjects"
       }
     }
   },

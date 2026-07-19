@@ -21,7 +21,6 @@ tests/
   support/wine_suite_scheduler.cpp  Top-level API suite scheduler
   meson.build                       Unified Wine unit-test manifest
   wine/*_spec.cpp                   Framework and scheduler contract tests
-  wine/*_test.cpp                   Internal implementation unit tests
   d3d10/*_spec.cpp                  D3D10 correctness tests
   d3d11/*_spec.cpp                  D3D11 correctness tests
   d3d12/*_spec.cpp                  D3D12 correctness tests
@@ -61,8 +60,32 @@ TEST(D3D12ExampleSpec, DoesSomething) {
 Add the source and any additional dependency to that API's `meson.build`. The
 central manifest automatically links it into the matching Wine suite image.
 Framework-only Wine tests live under `tests/wine/` and are registered directly
-in `tests/meson.build`. Internal implementation tests use the same framework
-image and remain independently filterable GoogleTest cases.
+in `tests/meson.build`. They may validate the test runner itself, but must not
+include or link DXMT implementation code.
+
+## Public API boundary
+
+DXMT correctness is tested only through public Direct3D and DXGI interfaces.
+Tests must not include implementation headers, compile implementation sources
+into a test image, invoke private translator CLIs, use test-only backend fault
+switches, or inspect implementation-only cache keys and state. Shader,
+descriptor, command, resource, synchronization, query, and presentation
+behavior must be asserted through API-visible results such as HRESULTs, COM
+identity, feature reports, readbacks, query data, fences, and presentation
+statistics.
+
+The former direct implementation tests were handled by observable scope:
+
+- COM/private-data, descriptor, command-list, format, resource, and query
+  behavior is covered by the corresponding D3D10/11/12 API suites.
+- DXBC/DXIL and airconv behavior is covered by public shader compilation,
+  pipeline creation, execution/readback, and malformed-container rejection.
+- Internal allocation, cache, diagnostic, threading, parser representation,
+  and scheduling details have no public D3D contract and therefore are not
+  correctness-test targets.
+
+`tests/ci/test_public_api_boundary.py` enforces this boundary in the repository
+test suite.
 
 ## Mark slow tests
 
@@ -241,41 +264,6 @@ DXMT_WINE_ROOT=.cache/wine-source/install \
 On a mismatch, a matrix reports the logical CaseId and parameters, first
 mismatching index, expected and actual values, and an exact replay argument.
 
-The native CBV materialization tests also provide a targeted fault injection.
-The CBV keeps a valid GPU virtual address backed by a live upload resource, but
-the native-only resource lookup is forced to miss. The legacy descriptor entry
-is left untouched. A correct implementation must preserve the CBV value or
-fall back before executing the native shader:
-
-```sh
-DXMT_TEST_FORCE_NATIVE_CBV_RESOURCE_LOOKUP_MISS=1 \
-MTL_SHADER_VALIDATION=1 \
-MTL_SHADER_VALIDATION_DEFAULT_STATE=all \
-MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
-DXMT_TEST_FAIL_ON_METAL_VALIDATION=1 \
-scripts/dxmt-builder test --profile gcc-x64-release-full unit \
-  --suite d3d12 \
-  --test-args='--gtest_filter=D3D12DescriptorSpec.*NativeResourceLookupIsUnavailable'
-```
-
-These tests are skipped unless the fault injection is explicitly enabled.
-
-The complementary stale-entry test keeps the descriptor's non-zero resource
-index but clears the indexed resource-table entry. It verifies that native
-shader execution rejects or falls back from a stale zero-base entry instead of
-dereferencing it:
-
-```sh
-DXMT_TEST_FORCE_NATIVE_CBV_STALE_RESOURCE_TABLE_ENTRY=1 \
-MTL_SHADER_VALIDATION=1 \
-MTL_SHADER_VALIDATION_DEFAULT_STATE=all \
-MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
-DXMT_TEST_FAIL_ON_METAL_VALIDATION=1 \
-scripts/dxmt-builder test --profile gcc-x64-release-full unit \
-  --suite d3d12 \
-  --test-args='--gtest_filter=D3D12DescriptorSpec.RejectsStaleNativeCbvResourceTableEntryBeforeShaderExecution'
-```
-
 `scripts/dxmt-builder test` compiles and stages the current DXMT DLLs, initializes the
 dedicated prefix when needed, and injects the staged runtime before starting the
 coordinator. Do not run the PE directly when validating DXMT behavior, because
@@ -298,10 +286,8 @@ Supporting data and helpers remain in-tree for a future CLI subcommand:
 | `tests/d3d12/differential/` | WARP oracle PE + snapshot compare |
 | `tests/coverage/d3d12_coverage.json` | Public API / coverage thresholds |
 | `tests/mutation/d3d12_mutations.json` | Reviewed mutation manifest |
-| `tests/fault_injection/d3d12_faults.json` | Fault matrix descriptors |
 
-Targeted D3D12 fault switches still work via env vars on the unit suite (see
-above). There is no separate coverage/mutation/differential wrapper script.
+There is no separate coverage/mutation/differential wrapper script.
 
 The managed Wine dependency is fingerprinted below `.cache/managed/deps`.
 

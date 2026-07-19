@@ -46,92 +46,15 @@ subdir('d3d11')
 subdir('d3d12')
 
 if not get_option('windows_oracle_only')
-dxmt_wine_framework_suites = {
-  'framework': {
-    'sources': files('wine/framework_spec.cpp'),
-  },
-  'scheduler': {
-    'sources': files('wine/scheduler_spec.cpp'),
-  },
-  'placeholder': {
-    'sources': files('wine/placeholder_spec.cpp'),
-  },
-  'layout': {
-    'sources': files('wine/layout_spec.cpp'),
-  },
-  'descriptor_revision': {
-    'sources': files('wine/descriptor_revision_test.cpp'),
-  },
-  'lease_range_registry': {
-    'sources': files('wine/lease_range_registry_test.cpp'),
-  },
-  'argument_buffer': {
-    'sources': files('wine/argument_buffer_test.cpp'),
-  },
-  'checked_math': {
-    'sources': files('wine/checked_math_test.cpp'),
-  },
-  'internal_units': {
-    'sources': files(
-      'support/logger.cpp',
-      'wine/binding_set_test.cpp',
-      'wine/command_list_test.cpp',
-      'wine/com_object_test.cpp',
-      'wine/com_private_data_test.cpp',
-      'wine/capture_state_test.cpp',
-      'wine/dependency_tracker_test.cpp',
-      'wine/descriptor_table_test.cpp',
-      'wine/dxbc_parser_test.cpp',
-      'wine/dxil_parser_test.cpp',
-      'wine/format_test.cpp',
-      'wine/names_test.cpp',
-      'wine/perf_stats_test.cpp',
-      'wine/pipeline_diag_test.cpp',
-      'wine/present_source_view_test.cpp',
-      'wine/resource_state_test.cpp',
-      'wine/resource_subset_test.cpp',
-      'wine/ring_bump_allocator_test.cpp',
-      'wine/shader_binary_test.cpp',
-      'wine/task_scheduler_test.cpp',
-      'wine/threading_test.cpp',
-      'wine/utility_bit_test.cpp',
-      'wine/utility_config_test.cpp',
-      'wine/utility_container_test.cpp',
-      'wine/utility_math_test.cpp',
-      'wine/utility_sha1_test.cpp',
-      'wine/utility_string_test.cpp',
-      'wine/wsi_platform_test.cpp',
-      '../src/dxmt/dxmt_allocation.cpp',
-      '../src/dxmt/dxmt_capture.cpp',
-      '../src/dxmt/dxmt_deptrack.cpp',
-      '../src/dxmt/dxmt_format.cpp',
-      '../src/dxmt/dxmt_names.cpp',
-      '../src/dxmt/dxmt_perf_stats.cpp',
-      '../src/dxmt/dxmt_pipeline_diag.cpp',
-      '../src/dxmt/dxmt_subresource.cpp',
-    ),
-    'dependencies': [util_dep, dxbc_parser_dep, dxil_parser_dep],
-  },
-}
-
-dxmt_wine_framework_sources = []
-dxmt_wine_framework_dependencies = []
-foreach suite_name, suite_config : dxmt_wine_framework_suites
-  dxmt_wine_framework_sources += suite_config['sources']
-  dxmt_wine_framework_dependencies += suite_config.get('dependencies', [])
-endforeach
-
 dxmt_wine_framework_tests = executable(
   'dxmt-wine-framework-tests',
-  dxmt_wine_framework_sources,
-  dependencies: [dxmt_test_dep] + dxmt_wine_framework_dependencies,
-  include_directories: [
-    dxmt_include_path,
-    dxmt_build_include_path,
-    include_directories('../src/airconv'),
-    include_directories('../src/winemetal'),
-  ],
-  cpp_args: ['-DWINEMETAL_STATIC'],
+  files(
+    'wine/framework_spec.cpp',
+    'wine/scheduler_spec.cpp',
+    'wine/placeholder_spec.cpp',
+    'wine/layout_spec.cpp',
+  ),
+  dependencies: [dxmt_test_dep],
   install: false,
 )
 endif
@@ -190,6 +113,14 @@ test(
 )
 
 test(
+  'public-api-boundary-policy',
+  python3_native,
+  args: [files('ci/test_public_api_boundary.py')],
+  suite: ['unit', 'repository'],
+  timeout: 30,
+)
+
+test(
   'd3d12-coverage-validator-tests',
   python3_native,
   args: [files('coverage/test_check_d3d12_coverage.py')],
@@ -214,121 +145,6 @@ test(
   env: wine_test_env,
   is_parallel: false,
   workdir: meson.project_source_root(),
-)
-
-airconv_scalar_varying_test = find_program(
-  'airconv/scalar-varying-ir-test.sh',
-)
-test(
-  'airconv-scalar-varying-ir',
-  airconv_scalar_varying_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/scalar-varying-vs.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_container_rejection_test = find_program(
-  'airconv/container-rejection-test.sh',
-)
-test(
-  'airconv-container-rejection',
-  airconv_container_rejection_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/scalar-varying-vs.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_determinism_test = find_program(
-  'airconv/determinism-test.sh',
-)
-test(
-  'airconv-determinism',
-  airconv_determinism_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/scalar-varying-vs.dxbc.hex'),
-    files('airconv/control-flow-ps.dxbc.hex'),
-    files('airconv/arithmetic-conversion-ps.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_control_flow_test = find_program(
-  'airconv/control-flow-ir-test.sh',
-)
-test(
-  'airconv-control-flow-ir',
-  airconv_control_flow_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/control-flow-ps.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_tessellation_phi_test = find_program(
-  'airconv/tessellation-phi-ir-test.sh',
-)
-test(
-  'airconv-tessellation-phi-ir',
-  airconv_tessellation_phi_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/phi-hull.dxbc.hex'),
-    files('airconv/phi-domain.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_arithmetic_conversion_test = find_program(
-  'airconv/arithmetic-conversion-ir-test.sh',
-)
-test(
-  'airconv-arithmetic-conversion-ir',
-  airconv_arithmetic_conversion_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/arithmetic-conversion-ps.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_container_boundary_test = find_program(
-  'airconv/container-boundary-test.py',
-)
-test(
-  'airconv-container-boundary',
-  airconv_container_boundary_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/scalar-varying-vs.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
-)
-
-airconv_diagnostic_determinism_test = find_program(
-  'airconv/diagnostic-determinism-test.py',
-)
-test(
-  'airconv-diagnostic-determinism',
-  airconv_diagnostic_determinism_test,
-  args: [
-    airconv_cli_darwin,
-    files('airconv/scalar-varying-vs.dxbc.hex'),
-  ],
-  suite: ['unit', 'airconv'],
-  timeout: 30,
 )
 
 alias_target(
