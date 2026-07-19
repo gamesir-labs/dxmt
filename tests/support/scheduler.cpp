@@ -752,8 +752,10 @@ int RunScheduledTests(int argc, char **argv) {
   auto serial_tests = ExtractSerialTests(tests);
   auto serial_shards = BuildSerialTestShards(std::move(serial_tests));
   constexpr std::size_t kMaximumSerialConcurrency = 2;
+  const auto serial_concurrency =
+      std::min(kMaximumSerialConcurrency, options->jobs);
   const auto serial_waves =
-      BuildSerialShardWaves(serial_shards, kMaximumSerialConcurrency);
+      BuildSerialShardWaves(serial_shards, serial_concurrency);
   worker_count = options->jobs_were_set
                      ? std::min(worker_count, tests.size())
                      : SelectWorkerCount(tests, worker_count);
@@ -791,8 +793,9 @@ int RunScheduledTests(int argc, char **argv) {
                            .count();
 
   std::printf(
-      "[ DXMT     ] scheduling %zu tests on %zu parallel and %zu serial "
-      "Wine workers in %zu serial waves "
+      "[ DXMT     ] scheduling %zu tests in %zu parallel shards "
+      "(%zu concurrent) and %zu serial shards (%zu concurrent) in %zu "
+      "serial waves "
       "(plan %lld us)\n",
       [&shards] {
         std::size_t count = 0;
@@ -800,7 +803,8 @@ int RunScheduledTests(int argc, char **argv) {
           count += shard.tests.size();
         return count;
       }(),
-      parallel_shard_count, serial_shards.size(), serial_waves.size(),
+      parallel_shard_count, parallel_concurrency, serial_shards.size(),
+      serial_concurrency, serial_waves.size(),
       static_cast<long long>(plan_us));
   std::fflush(stdout);
 
