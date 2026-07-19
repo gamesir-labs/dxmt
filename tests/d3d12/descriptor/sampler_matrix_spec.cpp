@@ -531,4 +531,71 @@ TEST_F(SamplerMatrixSpec, SwitchingSamplerHeapRebindsDescriptorTable) {
   EXPECT_NEAR(actual[1], 2.0f, 1.0e-6f);
 }
 
+TEST_F(SamplerMatrixSpec, SwitchingSamplerHeapStalesSamplerTables) {
+  constexpr std::array<float, 4> pixels = {1.0f, 2.0f, 3.0f, 4.0f};
+  auto texture = context_.CreateTexture2D(
+      2, 2, 1, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto output = CreateOutput(1);
+  auto resources = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  auto clamp_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  auto wrap_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
+  ASSERT_TRUE(texture);
+  ASSERT_TRUE(output);
+  ASSERT_TRUE(resources);
+  ASSERT_TRUE(clamp_heap);
+  ASSERT_TRUE(wrap_heap);
+  ASSERT_EQ(context_.UploadTextureAndReset(
+                texture.get(), pixels.data(), 2 * sizeof(float),
+                pixels.size() * sizeof(float)),
+            S_OK);
+  CreateViews(texture.get(), 1, output.get(), 1, resources.get());
+  auto clamp = PointSampler(D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+  auto wrap = PointSampler(D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+  context_.device()->CreateSampler(
+      &clamp, clamp_heap->GetCPUDescriptorHandleForHeapStart());
+  context_.device()->CreateSampler(
+      &wrap, wrap_heap->GetCPUDescriptorHandleForHeapStart());
+  D3D12TestContext::Transition(
+      context_.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  // Bind wrap sampler first (UV -0.25 maps to texel 2.0). Switching the
+  // sampler heap without rebinding must invalidate that table so wrap
+  // semantics cannot survive. Null/default samplers may still clamp, so the
+  // oracle is "must not keep the previously bound wrap result".
+  context_.list()->SetComputeRootSignature(sample_root_.get());
+  context_.list()->SetPipelineState(sample_pipeline_.get());
+  ID3D12DescriptorHeap *first_heaps[] = {resources.get(), wrap_heap.get()};
+  context_.list()->SetDescriptorHeaps(2, first_heaps);
+  context_.list()->SetComputeRootDescriptorTable(
+      0, resources->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->SetComputeRootDescriptorTable(
+      1, wrap_heap->GetGPUDescriptorHandleForHeapStart());
+  const UINT constants[] = {std::bit_cast<UINT>(-0.25f),
+                            std::bit_cast<UINT>(0.25f),
+                            std::bit_cast<UINT>(0.0f), 0};
+  context_.list()->SetComputeRoot32BitConstants(2, 4, constants, 0);
+
+  ID3D12DescriptorHeap *second_heaps[] = {resources.get(), clamp_heap.get()};
+  context_.list()->SetDescriptorHeaps(2, second_heaps);
+  // Resource table is re-bound after heap switch; sampler table intentionally
+  // remains stale.
+  context_.list()->SetComputeRootDescriptorTable(
+      0, resources->GetGPUDescriptorHandleForHeapStart());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), sizeof(float), &bytes), S_OK);
+  float actual = 0.0f;
+  std::memcpy(&actual, bytes.data(), sizeof(actual));
+  EXPECT_NE(actual, 2.0f);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 } // namespace
