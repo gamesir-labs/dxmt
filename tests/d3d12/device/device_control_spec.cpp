@@ -348,6 +348,24 @@ TEST_F(DeviceControlSpec, DxgiResourceControlsRejectInvalidInputs) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST(DeviceRemovalSpec, InitialReasonIsSuccess) {
+  auto device = CreateIsolatedD3D12Device();
+  ASSERT_TRUE(device);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
+  D3D12TestContext context;
+  ASSERT_EQ(context.Initialize(device.get()), S_OK);
+  EXPECT_EQ(context.device()->GetDeviceRemovedReason(), S_OK);
+  // Queue remains healthy for ordinary fence work before any removal.
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  ASSERT_EQ(context.queue()->Signal(fence.get(), 1), S_OK);
+  ASSERT_EQ(context.SignalAndWait(), S_OK);
+  EXPECT_GE(fence->GetCompletedValue(), 1ull);
+  EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
