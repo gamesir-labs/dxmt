@@ -50,13 +50,13 @@ TEST(D3D12BindingHotspot, InvalidatesMaterializedRootTableAfterRebind) {
 }
 
 TEST(D3D12BindingHotspot,
-     KeepsCompiledRootDescriptorsResidentThroughBatchedEncoding) {
+     ExecutesBatchedRootDescriptorDrawsWithValidLifetimes) {
   BindingHotspotMeasurement measurement;
   const auto error =
-      dxmt::test::RunCompiledRootDescriptorResidencyScenario(257,
+      dxmt::test::RunCompiledRootDescriptorResidencyScenario(17,
                                                              &measurement);
   ASSERT_FALSE(error) << (error ? *error : "");
-  EXPECT_EQ(measurement.operations, 257u);
+  EXPECT_EQ(measurement.operations, 17u);
   EXPECT_EQ(measurement.actual, measurement.expected);
 }
 

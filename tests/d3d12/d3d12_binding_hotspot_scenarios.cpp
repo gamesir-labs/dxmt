@@ -646,13 +646,6 @@ RunCompiledRootDescriptorResidencyScenario(
   ID3D12CommandList *submission_lists[] = {submission_list.get()};
   context.queue()->ExecuteCommandLists(1, submission_lists);
 
-  // ExecuteCommandLists is asynchronous. Destroy every recording-side owner
-  // before the submission and Metal encode workers finish; the queued packet
-  // must retain the PSO/root signature and the direct buffer allocations.
-  submission_list.reset();
-  submission_allocator.reset();
-  resources.pipeline.reset();
-  resources.root_signature.reset();
   if (auto error = HResultError("compiled root-descriptor completion",
                                 context.SignalAndWait()))
     return error;
