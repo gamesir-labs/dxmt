@@ -585,7 +585,18 @@ TEST_F(D3D12DeviceSpec, CreatesStreamOutputPipelineFromPublicDescriptor) {
 }
 
 TEST_F(D3D12DeviceSpec, CreatesEveryAdvertisedMsaaPso) {
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = UINT_MAX;
+  range.BaseShaderRegister = 1;
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 1;
+  parameter.DescriptorTable.pDescriptorRanges = &range;
+  parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
   root_desc.Flags =
       D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
   ID3D12RootSignature *root_signature =
