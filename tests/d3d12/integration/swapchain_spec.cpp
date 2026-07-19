@@ -196,15 +196,19 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec, Present1AcceptsDirtyParameters) {
   auto swapchain =
-      CreateSwapChain(2, 0, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+      CreateSwapChain(3, 0, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
   ASSERT_TRUE(swapchain);
+
+  DXGI_PRESENT_PARAMETERS full_frame = {};
+  ASSERT_EQ(swapchain->Present1(0, 0, &full_frame), S_OK);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
 
   RECT dirty_rect = {0, 0, 4, 4};
   DXGI_PRESENT_PARAMETERS parameters = {};
   parameters.DirtyRectsCount = 1;
   parameters.pDirtyRects = &dirty_rect;
   EXPECT_EQ(swapchain->Present1(0, 0, &parameters), S_OK);
-  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 1u);
+  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 2u);
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,

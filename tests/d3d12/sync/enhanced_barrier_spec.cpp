@@ -20,9 +20,11 @@ protected:
   void SetUp() override {
     ASSERT_EQ(context_.Initialize(), S_OK);
     D3D12_FEATURE_DATA_D3D12_OPTIONS12 options = {};
-    ASSERT_EQ(context_.device()->CheckFeatureSupport(
-                  D3D12_FEATURE_D3D12_OPTIONS12, &options, sizeof(options)),
-              S_OK);
+    const HRESULT options_hr = context_.device()->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS12, &options, sizeof(options));
+    if (options_hr == E_INVALIDARG)
+      GTEST_SKIP() << "D3D12_OPTIONS12 is unavailable on this runtime";
+    ASSERT_EQ(options_hr, S_OK);
     if (!options.EnhancedBarriersSupported)
       GTEST_SKIP() << "enhanced barriers are not advertised";
     ASSERT_EQ(

@@ -106,6 +106,22 @@ protected:
     return swapchain;
   }
 
+  ComPtr<IDXGISwapChain3> CreateCompositionSwapChain(UINT buffer_count) {
+    const auto desc = ValidDesc(buffer_count);
+    ComPtr<IDXGISwapChain1> base;
+    EXPECT_EQ(factory_->CreateSwapChainForComposition(
+                  context_.queue(), &desc, nullptr, base.put()),
+              S_OK);
+    ComPtr<IDXGISwapChain3> swapchain;
+    if (base) {
+      EXPECT_EQ(base->QueryInterface(
+                    __uuidof(IDXGISwapChain3),
+                    reinterpret_cast<void **>(swapchain.put())),
+                S_OK);
+    }
+    return swapchain;
+  }
+
   ComPtr<ID3D12Resource> GetBuffer(IDXGISwapChain3 *swapchain, UINT index) {
     ComPtr<ID3D12Resource> buffer;
     EXPECT_EQ(swapchain->GetBuffer(
@@ -342,13 +358,6 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   ASSERT_EQ(swapchain->GetRotation(&rotation), S_OK);
   EXPECT_EQ(rotation, DXGI_MODE_ROTATION_ROTATE90);
 
-  const DXGI_MATRIX_3X2_F matrix = {1.0f, 0.25f, -0.5f,
-                                    1.0f, 3.0f,  4.0f};
-  ASSERT_EQ(swapchain->SetMatrixTransform(&matrix), S_OK);
-  DXGI_MATRIX_3X2_F actual_matrix = {};
-  ASSERT_EQ(swapchain->GetMatrixTransform(&actual_matrix), S_OK);
-  EXPECT_EQ(std::memcmp(&actual_matrix, &matrix, sizeof(matrix)), 0);
-
   HWND hwnd = nullptr;
   ASSERT_EQ(swapchain->GetHwnd(&hwnd), S_OK);
   EXPECT_EQ(hwnd, window_->get());
@@ -359,6 +368,19 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   ASSERT_EQ(swapchain->SetFullscreenState(FALSE, nullptr), S_OK);
   ASSERT_EQ(swapchain->GetFullscreenState(&fullscreen, nullptr), S_OK);
   EXPECT_FALSE(fullscreen);
+}
+
+DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
+                   CompositionMatrixTransformRoundTrips) {
+  auto swapchain = CreateCompositionSwapChain(2);
+  ASSERT_TRUE(swapchain);
+
+  const DXGI_MATRIX_3X2_F matrix = {1.0f, 0.25f, -0.5f,
+                                    1.0f, 3.0f,  4.0f};
+  ASSERT_EQ(swapchain->SetMatrixTransform(&matrix), S_OK);
+  DXGI_MATRIX_3X2_F actual = {};
+  ASSERT_EQ(swapchain->GetMatrixTransform(&actual), S_OK);
+  EXPECT_EQ(std::memcmp(&actual, &matrix, sizeof(matrix)), 0);
 }
 
 

@@ -52,7 +52,9 @@ protected:
   }
 
   ComPtr<ID3D12RootSignature>
-  CreateGraphicsSignature(D3D12TestContext &context) {
+  CreateGraphicsSignature(
+      D3D12TestContext &context,
+      D3D12_ROOT_SIGNATURE_FLAGS flags = D3D12_ROOT_SIGNATURE_FLAG_NONE) {
     D3D12_ROOT_PARAMETER parameter = {};
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameter.Constants.Num32BitValues = 4;
@@ -60,6 +62,7 @@ protected:
     D3D12_ROOT_SIGNATURE_DESC desc = {};
     desc.NumParameters = 1;
     desc.pParameters = &parameter;
+    desc.Flags = flags;
     return context.CreateRootSignature(desc);
   }
 
@@ -285,10 +288,10 @@ TEST_F(RootSignatureRuntimeStateSpec,
 TEST_F(RootSignatureRuntimeStateSpec,
        DifferentGraphicsRootSignatureAllowsArgumentsToBeRebound) {
   auto local_signature = CreateGraphicsSignature(context_);
-  auto replacement = CreateGraphicsSignature(context_);
+  auto replacement = CreateGraphicsSignature(
+      context_, D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS);
   ASSERT_TRUE(local_signature);
   ASSERT_TRUE(replacement);
-  ASSERT_NE(local_signature.get(), replacement.get());
 
   const auto pixel = CompileShader(R"(
     cbuffer Color : register(b0) { float4 color; };

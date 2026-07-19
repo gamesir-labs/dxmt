@@ -587,14 +587,14 @@ TEST_F(D3D12QueueSpec, ReusesBundleWithInheritedAndReturnedGraphicsState) {
   context_.list()->ExecuteBundle(bundle.get());
   context_.list()->ExecuteBundle(bundle.get());
   context_.list()->DrawIndexedInstanced(3, 1, 0, 0, 0);
-  bundle.reset();
-  bundle_allocator.reset();
   D3D12TestContext::Transition(
       context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
       D3D12_RESOURCE_STATE_COPY_SOURCE);
 
   TextureReadback readback;
   ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  bundle.reset();
+  bundle_allocator.reset();
   for (UINT y = 0; y < readback.height; ++y) {
     for (UINT x = 0; x < readback.width; ++x) {
       UINT pixel = 0;

@@ -41,6 +41,10 @@ TEST_P(RootConstantCountMatrixSpec, CreatesRootSignatureWithExactConstantCount) 
 
 TEST_P(RootConstantCountMatrixSpec, DispatchesWithRootConstantsVisibleToShader) {
   const UINT count = GetParam();
+  if (count == 64) {
+    GTEST_SKIP() << "the observable compute path needs one additional DWORD "
+                    "for its UAV descriptor table";
+  }
   // Keep GPU path cheap: only exercise counts that fit a single constant buffer
   // style root parameter and a tiny clear shader using the first constant.
   D3D12_ROOT_PARAMETER parameters[2] = {};

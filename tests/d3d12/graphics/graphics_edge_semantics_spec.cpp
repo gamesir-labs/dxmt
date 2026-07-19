@@ -336,7 +336,7 @@ INSTANTIATE_TEST_SUITE_P(
                       4, true, "TriangleStrip"},
         PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
                       D3D_PRIMITIVE_TOPOLOGY_LINELIST,
-                      "float2(-0.8, 0.0), float2(0.8, 0.0), float2(0, 0)",
+                      "float2(-0.8, 0.0), float2(0.8, 0.0)",
                       2, true, "Line"},
         PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
                       D3D_PRIMITIVE_TOPOLOGY_LINESTRIP,
@@ -344,7 +344,7 @@ INSTANTIATE_TEST_SUITE_P(
                       3, true, "LineStrip"},
         PrimitiveCase{D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
                       D3D_PRIMITIVE_TOPOLOGY_POINTLIST,
-                      "float2(0.0, 0.0), float2(0, 0), float2(0, 0)",
+                      "float2(0.0, 0.0)",
                       1, true, "Point"}),
     [](const ::testing::TestParamInfo<PrimitiveCase> &info) {
       return info.param.name;
