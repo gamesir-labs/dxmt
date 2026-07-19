@@ -204,6 +204,8 @@ protected:
     context_.list()->SetComputeRootDescriptorTable(
         0, context_.GpuDescriptorHandle(gpu_heap.get(), kTableBase));
     context_.list()->Dispatch(1, 1, 1);
+    D3D12TestContext::UavBarrier(context_.list(), typed_output.get());
+    D3D12TestContext::UavBarrier(context_.list(), raw_output.get());
     D3D12TestContext::Transition(
         context_.list(), typed_output.get(),
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

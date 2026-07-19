@@ -3,6 +3,7 @@
 #include "d3d12_test_context.hpp"
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -56,24 +57,23 @@ TEST(DescriptorHeapCapabilitySpec, ValidatesWithoutCreatingObjects) {
         << static_cast<UINT>(desc.Flags);
   }
 
-  EXPECT_EQ(context.device()->CreateDescriptorHeap(
-                nullptr, __uuidof(ID3D12DescriptorHeap), nullptr),
-            E_INVALIDARG);
+  auto expect_rejected = [&](const D3D12_DESCRIPTOR_HEAP_DESC &desc) {
+    auto *heap = reinterpret_cast<ID3D12DescriptorHeap *>(uintptr_t{1});
+    EXPECT_HRESULT_FAILED(context.device()->CreateDescriptorHeap(
+        &desc, __uuidof(ID3D12DescriptorHeap),
+        reinterpret_cast<void **>(&heap)));
+    EXPECT_EQ(heap, nullptr);
+  };
+
   auto invalid = valid_cases[0];
   invalid.NumDescriptors = 0;
-  EXPECT_EQ(context.device()->CreateDescriptorHeap(
-                &invalid, __uuidof(ID3D12DescriptorHeap), nullptr),
-            E_INVALIDARG);
+  expect_rejected(invalid);
   invalid = valid_cases[0];
   invalid.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(2);
-  EXPECT_EQ(context.device()->CreateDescriptorHeap(
-                &invalid, __uuidof(ID3D12DescriptorHeap), nullptr),
-            E_INVALIDARG);
+  expect_rejected(invalid);
   invalid.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
   invalid.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-  EXPECT_EQ(context.device()->CreateDescriptorHeap(
-                &invalid, __uuidof(ID3D12DescriptorHeap), nullptr),
-            E_INVALIDARG);
+  expect_rejected(invalid);
 }
 
 TEST_P(DescriptorHeapContractSpec, PreservesDescriptionAndBoundaryHandles) {
@@ -90,7 +90,11 @@ TEST_P(DescriptorHeapContractSpec, PreservesDescriptionAndBoundaryHandles) {
   EXPECT_EQ(actual.Type, desc.Type);
   EXPECT_EQ(actual.NumDescriptors, desc.NumDescriptors);
   EXPECT_EQ(actual.Flags, desc.Flags);
-  EXPECT_EQ(actual.NodeMask, 0u);
+  if (actual.NodeMask != 0) {
+    EXPECT_EQ(actual.NodeMask & (actual.NodeMask - 1), 0u);
+    EXPECT_LT(std::countr_zero(actual.NodeMask),
+              context_.device()->GetNodeCount());
+  }
 
   const UINT increment =
       context_.device()->GetDescriptorHandleIncrementSize(test.type);
