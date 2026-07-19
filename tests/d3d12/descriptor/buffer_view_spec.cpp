@@ -19,7 +19,13 @@ enum class DescriptorPublication {
   Overwritten,
 };
 
-class BufferViewSpec : public ::testing::Test {
+struct BufferViewCase {
+  DescriptorPublication publication;
+  std::size_t view_index;
+  const char *name;
+};
+
+class BufferViewSpec : public ::testing::TestWithParam<BufferViewCase> {
 protected:
   void SetUp() override {
     ASSERT_EQ(context_.Initialize(), S_OK);
@@ -43,11 +49,9 @@ protected:
           void main() { output[2] = input[1]; }
         )",
     };
-    for (std::size_t index = 0; index < shader_sources.size(); ++index) {
-      shaders_[index] = CompileShader(shader_sources[index], "cs_5_0");
-      ASSERT_EQ(shaders_[index].result, S_OK)
-          << shaders_[index].diagnostic_text();
-    }
+    const auto view_index = GetParam().view_index;
+    shader_ = CompileShader(shader_sources[view_index], "cs_5_0");
+    ASSERT_EQ(shader_.result, S_OK) << shader_.diagnostic_text();
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -68,41 +72,37 @@ protected:
     root_signature_ = context_.CreateRootSignature(desc);
     ASSERT_TRUE(root_signature_);
 
-    for (std::size_t index = 0; index < shaders_.size(); ++index) {
-      const D3D12_SHADER_BYTECODE bytecode = {
-          shaders_[index].bytecode->GetBufferPointer(),
-          shaders_[index].bytecode->GetBufferSize()};
-      pipelines_[index] =
-          context_.CreateComputePipeline(root_signature_.get(), bytecode);
-      ASSERT_TRUE(pipelines_[index]);
-    }
+    const D3D12_SHADER_BYTECODE bytecode = {
+        shader_.bytecode->GetBufferPointer(), shader_.bytecode->GetBufferSize()};
+    pipeline_ = context_.CreateComputePipeline(root_signature_.get(), bytecode);
+    ASSERT_TRUE(pipeline_);
   }
 
   void WriteViews(ID3D12DescriptorHeap *heap, UINT base,
-                  ID3D12Resource *input, ID3D12Resource *output) {
+                  ID3D12Resource *input, ID3D12Resource *output,
+                  std::size_t view_index) {
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Format = DXGI_FORMAT_R32_UINT;
-    srv.Buffer.FirstElement = 1;
-    srv.Buffer.NumElements = 3;
+    if (view_index == 0) {
+      srv.Format = DXGI_FORMAT_R32_UINT;
+      srv.Buffer.FirstElement = 1;
+      srv.Buffer.NumElements = 3;
+    } else if (view_index == 1) {
+      srv.Format = DXGI_FORMAT_R32_TYPELESS;
+      srv.Buffer.FirstElement = 5;
+      srv.Buffer.NumElements = 2;
+      srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    } else {
+      srv.Format = DXGI_FORMAT_UNKNOWN;
+      srv.Buffer.FirstElement = 10;
+      srv.Buffer.NumElements = 2;
+      srv.Buffer.StructureByteStride = sizeof(UINT);
+    }
     context_.device()->CreateShaderResourceView(
-        input, &srv, context_.CpuDescriptorHandle(heap, base));
-
-    srv.Format = DXGI_FORMAT_R32_TYPELESS;
-    srv.Buffer.FirstElement = 5;
-    srv.Buffer.NumElements = 2;
-    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    context_.device()->CreateShaderResourceView(
-        input, &srv, context_.CpuDescriptorHandle(heap, base + 1));
-
-    srv.Format = DXGI_FORMAT_UNKNOWN;
-    srv.Buffer.FirstElement = 10;
-    srv.Buffer.NumElements = 2;
-    srv.Buffer.StructureByteStride = sizeof(UINT);
-    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-    context_.device()->CreateShaderResourceView(
-        input, &srv, context_.CpuDescriptorHandle(heap, base + 2));
+        input, &srv,
+        context_.CpuDescriptorHandle(heap,
+                                     base + static_cast<UINT>(view_index)));
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -114,7 +114,9 @@ protected:
         context_.CpuDescriptorHandle(heap, base + 3));
   }
 
-  void RunCase(DescriptorPublication publication, std::size_t view_index) {
+  void RunCase() {
+    const auto [publication, view_index, name] = GetParam();
+    (void)name;
     constexpr UINT kDwordCount = 32;
     constexpr UINT kTableBase = 1;
     std::array<UINT, kDwordCount> input_data = {};
@@ -154,20 +156,28 @@ protected:
       ASSERT_TRUE(decoy_input);
       ASSERT_TRUE(decoy_output);
       WriteViews(gpu_heap.get(), kTableBase, decoy_input.get(),
-                 decoy_output.get());
+                 decoy_output.get(), view_index);
     }
 
     if (publication == DescriptorPublication::Copied) {
       auto cpu_heap = context_.CreateDescriptorHeap(
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, false);
       ASSERT_TRUE(cpu_heap);
-      WriteViews(cpu_heap.get(), 0, input.get(), output.get());
+      WriteViews(cpu_heap.get(), 0, input.get(), output.get(), view_index);
       context_.device()->CopyDescriptorsSimple(
-          4, context_.CpuDescriptorHandle(gpu_heap.get(), kTableBase),
-          cpu_heap->GetCPUDescriptorHandleForHeapStart(),
+          1,
+          context_.CpuDescriptorHandle(
+              gpu_heap.get(), kTableBase + static_cast<UINT>(view_index)),
+          context_.CpuDescriptorHandle(cpu_heap.get(),
+                                       static_cast<UINT>(view_index)),
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      context_.device()->CopyDescriptorsSimple(
+          1, context_.CpuDescriptorHandle(gpu_heap.get(), kTableBase + 3),
+          context_.CpuDescriptorHandle(cpu_heap.get(), 3),
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else {
-      WriteViews(gpu_heap.get(), kTableBase, input.get(), output.get());
+      WriteViews(gpu_heap.get(), kTableBase, input.get(), output.get(),
+                 view_index);
     }
 
     context_.list()->CopyBufferRegion(input.get(), 0, input_upload.get(), 0,
@@ -185,7 +195,7 @@ protected:
     context_.list()->SetComputeRootSignature(root_signature_.get());
     context_.list()->SetComputeRootDescriptorTable(
         0, context_.GpuDescriptorHandle(gpu_heap.get(), kTableBase));
-    context_.list()->SetPipelineState(pipelines_[view_index].get());
+    context_.list()->SetPipelineState(pipeline_.get());
     context_.list()->Dispatch(1, 1, 1);
     D3D12TestContext::UavBarrier(context_.list(), output.get());
     D3D12TestContext::Transition(
@@ -207,21 +217,24 @@ protected:
   }
 
   D3D12TestContext context_;
-  std::array<dxmt::test::ShaderCompilation, 3> shaders_;
+  dxmt::test::ShaderCompilation shader_;
   ComPtr<ID3D12RootSignature> root_signature_;
-  std::array<ComPtr<ID3D12PipelineState>, 3> pipelines_;
+  ComPtr<ID3D12PipelineState> pipeline_;
 };
 
-TEST_F(BufferViewSpec, ExecutesTypedInputViewDirectly) {
-  RunCase(DescriptorPublication::Direct, 0);
+TEST_P(BufferViewSpec, PublishesAndExecutesInputView) {
+  RunCase();
 }
 
-TEST_F(BufferViewSpec, CopiesRawInputViewAtNonzeroHeapOffset) {
-  RunCase(DescriptorPublication::Copied, 1);
-}
-
-TEST_F(BufferViewSpec, OverwritesStructuredInputViewBeforeExecution) {
-  RunCase(DescriptorPublication::Overwritten, 2);
-}
+INSTANTIATE_TEST_SUITE_P(
+    ViewKinds, BufferViewSpec,
+    ::testing::Values(
+        BufferViewCase{DescriptorPublication::Direct, 0, "TypedDirect"},
+        BufferViewCase{DescriptorPublication::Copied, 1, "RawCopied"},
+        BufferViewCase{DescriptorPublication::Overwritten, 2,
+                       "StructuredOverwritten"}),
+    [](const ::testing::TestParamInfo<BufferViewCase> &info) {
+      return info.param.name;
+    });
 
 } // namespace
