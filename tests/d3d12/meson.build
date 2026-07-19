@@ -206,6 +206,7 @@ d3d12_unit_suites = {
   'resource': {
     'sources': files(
       'resource/buffer_size_matrix_spec.cpp',
+      'resource/depth_format_matrix_spec.cpp',
       'resource/heap_type_matrix_spec.cpp',
       'resource/texture2d_size_matrix_spec.cpp',
       'resource/planar_format_spec.cpp',
