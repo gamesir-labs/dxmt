@@ -95,6 +95,37 @@ TEST_F(FenceSpec, CpuSignalUpdatesCompletedValue) {
   EXPECT_EQ(fence->GetCompletedValue(), 7ull);
 }
 
+TEST_F(FenceSpec, SetEventOnAlreadyCompletedValueSignalsImmediately) {
+  auto fence = CreateFence(5);
+  ASSERT_TRUE(fence);
+  EXPECT_EQ(fence->GetCompletedValue(), 5ull);
+
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ASSERT_EQ(fence->SetEventOnCompletion(3, event), S_OK);
+  // Value 3 is already satisfied by the initial completed value of 5.
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+
+  ASSERT_EQ(fence->SetEventOnCompletion(5, event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+  CloseHandle(event);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(FenceSpec, SetEventOnFutureValueSignalsAfterCompletion) {
+  auto fence = CreateFence();
+  ASSERT_TRUE(fence);
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  ASSERT_EQ(fence->SetEventOnCompletion(9, event), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+
+  ASSERT_EQ(fence->Signal(9), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event, 5000), WAIT_OBJECT_0);
+  CloseHandle(event);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 #ifdef __ID3D12Fence1_INTERFACE_DEFINED__
 TEST_F(FenceSpec, VersionedInterfacePreservesInitialValueAndCreationFlags) {
   for (const auto flags : {D3D12_FENCE_FLAG_NONE, D3D12_FENCE_FLAG_SHARED}) {
