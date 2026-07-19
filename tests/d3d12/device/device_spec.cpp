@@ -1,4 +1,5 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -743,6 +744,20 @@ TEST_F(D3D12DeviceSpec, CreatesDualSourceBlendPipelineForTwoPixelOutputs) {
       CreateRootSignature(device_, root_desc);
   ASSERT_NE(root_signature, nullptr);
 
+  auto dual_source = dxmt::test::CompileShader(R"(
+    struct Output {
+      float4 source0 : SV_Target0;
+      float4 source1 : SV_Target1;
+    };
+    Output main() {
+      Output output;
+      output.source0 = float4(1.0, 0.0, 0.0, 1.0);
+      output.source1 = float4(0.25, 0.25, 0.25, 0.25);
+      return output;
+    })",
+                                               "ps_5_0");
+  ASSERT_EQ(dual_source.result, S_OK) << dual_source.diagnostic_text();
+
   auto desc = BasicGraphicsPipelineDesc(root_signature);
   auto &blend = desc.BlendState.RenderTarget[0];
   blend.BlendEnable = TRUE;
@@ -753,7 +768,8 @@ TEST_F(D3D12DeviceSpec, CreatesDualSourceBlendPipelineForTwoPixelOutputs) {
   blend.DestBlendAlpha = D3D12_BLEND_SRC1_ALPHA;
   blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 
-  desc.PS = dxmt::test::DualSourcePixelShader();
+  desc.PS = {dual_source.bytecode->GetBufferPointer(),
+             dual_source.bytecode->GetBufferSize()};
   ID3D12PipelineState *dual_source_pipeline = nullptr;
   ASSERT_EQ(device_->CreateGraphicsPipelineState(
                 &desc, __uuidof(ID3D12PipelineState),
