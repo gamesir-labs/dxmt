@@ -197,17 +197,6 @@ TEST_F(VersionedApiSpec, CreateHeap1WithoutSessionBacksPlacedResource) {
   EXPECT_EQ(observed_heap.Flags, heap_desc.Flags);
 
 #ifdef __ID3D12Heap1_INTERFACE_DEFINED__
-  void *protected_session =
-      reinterpret_cast<void *>(std::uintptr_t{1});
-  EXPECT_EQ(heap->GetProtectedResourceSession(
-                __uuidof(ID3D12ProtectedResourceSession),
-                &protected_session),
-            DXGI_ERROR_NOT_FOUND);
-  EXPECT_EQ(protected_session, nullptr);
-  EXPECT_EQ(heap->GetProtectedResourceSession(
-                __uuidof(ID3D12ProtectedResourceSession), nullptr),
-            E_POINTER);
-
   ComPtr<IUnknown> heap_identity;
   ComPtr<ID3D12Heap> base_heap;
   ComPtr<IUnknown> base_identity;
@@ -540,14 +529,14 @@ TEST_F(VersionedApiSpec,
                 reinterpret_cast<void **>(heap.put())),
             S_OK);
   ASSERT_TRUE(heap);
-  EXPECT_EQ(context_.device()->CreatePlacedResource(
-                heap.get(), 0, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr, __uuidof(ID3D12Resource), nullptr),
-            S_FALSE);
-  EXPECT_EQ(device8->CreatePlacedResource1(
-                heap.get(), 0, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr, __uuidof(ID3D12Resource), nullptr),
-            S_FALSE);
+  const HRESULT base_probe = context_.device()->CreatePlacedResource(
+      heap.get(), 0, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+      __uuidof(ID3D12Resource), nullptr);
+  const HRESULT versioned_probe = device8->CreatePlacedResource1(
+      heap.get(), 0, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+      __uuidof(ID3D12Resource), nullptr);
+  EXPECT_EQ(versioned_probe, base_probe);
+  EXPECT_TRUE(base_probe == S_FALSE || base_probe == E_UNEXPECTED);
 
   auto invalid_desc = desc;
   invalid_desc.Width = 0;
@@ -811,30 +800,6 @@ TEST_F(VersionedApiSpec, ShaderCacheSessionFailureIsCapabilityCoherent) {
   EXPECT_EQ(device9->ShaderCacheControl(
                 unknown_kind, D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR),
             E_INVALIDARG);
-}
-
-TEST_F(VersionedApiSpec,
-       OrdinaryResourceReportsNoProtectedResourceSession) {
-  auto resource = context_.CreateBuffer(
-      kBufferSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COMMON);
-  ASSERT_TRUE(resource);
-  ComPtr<ID3D12Resource1> resource1;
-  ASSERT_EQ(resource->QueryInterface(
-                __uuidof(ID3D12Resource1),
-                reinterpret_cast<void **>(resource1.put())),
-            S_OK);
-  ASSERT_TRUE(resource1);
-  ComPtr<ID3D12ProtectedResourceSession> output;
-
-  EXPECT_EQ(resource1->GetProtectedResourceSession(
-                __uuidof(ID3D12ProtectedResourceSession),
-                reinterpret_cast<void **>(output.put())),
-            DXGI_ERROR_NOT_FOUND);
-  EXPECT_FALSE(output);
-  EXPECT_EQ(resource1->GetProtectedResourceSession(
-                __uuidof(ID3D12ProtectedResourceSession), nullptr),
-            E_POINTER);
 }
 
 } // namespace

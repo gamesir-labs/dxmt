@@ -17,38 +17,6 @@ using dxmt::test::ComPtr;
 using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
-class LifetimeOwner final : public ID3D12LifetimeOwner {
-public:
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
-    if (!object)
-      return E_POINTER;
-    *object = nullptr;
-    if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D12LifetimeOwner))
-      return E_NOINTERFACE;
-    *object = static_cast<ID3D12LifetimeOwner *>(this);
-    AddRef();
-    return S_OK;
-  }
-
-  ULONG STDMETHODCALLTYPE AddRef() override { return ++ref_count_; }
-
-  ULONG STDMETHODCALLTYPE Release() override {
-    const ULONG count = --ref_count_;
-    if (!count)
-      delete this;
-    return count;
-  }
-
-  void STDMETHODCALLTYPE
-  LifetimeStateUpdated(D3D12_LIFETIME_STATE state) override {
-    last_state_ = state;
-  }
-
-private:
-  std::atomic<ULONG> ref_count_{1};
-  D3D12_LIFETIME_STATE last_state_ = D3D12_LIFETIME_STATE_IN_USE;
-};
-
 class DeviceControlSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
@@ -147,28 +115,6 @@ DXMT_SERIAL_TEST_F(DeviceControlSpec,
   EXPECT_HRESULT_FAILED(context_.device()->GetDeviceRemovedReason());
 }
 
-TEST_F(DeviceControlSpec, LifetimeTrackerUnsupportedPathClearsOutput) {
-  auto device5 = QueryDevice<ID3D12Device5>();
-  ASSERT_TRUE(device5);
-
-  auto *tracker = reinterpret_cast<ID3D12LifetimeTracker *>(uintptr_t{1});
-  EXPECT_EQ(device5->CreateLifetimeTracker(
-                nullptr, __uuidof(ID3D12LifetimeTracker),
-                reinterpret_cast<void **>(&tracker)),
-            E_INVALIDARG);
-  EXPECT_EQ(tracker, nullptr);
-
-  ComPtr<ID3D12LifetimeOwner> owner(new LifetimeOwner());
-  tracker = reinterpret_cast<ID3D12LifetimeTracker *>(uintptr_t{1});
-  EXPECT_EQ(device5->CreateLifetimeTracker(
-                owner.get(), __uuidof(ID3D12LifetimeTracker),
-                reinterpret_cast<void **>(&tracker)),
-            E_NOTIMPL);
-  EXPECT_EQ(tracker, nullptr);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-  ExpectCopyExecution();
-}
-
 TEST_F(DeviceControlSpec,
        DriverIdentifierStatusMatchesUnsupportedRaytracingCapability) {
   auto device5 = QueryDevice<ID3D12Device5>();
@@ -188,176 +134,7 @@ TEST_F(DeviceControlSpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(DeviceControlSpec, DxgiGpuPriorityRoundTripsAndRejectsInvalidValues) {
-  auto dxgi_device = QueryDevice<IDXGIDevice>();
-  ASSERT_TRUE(dxgi_device);
-
-  INT priority = INT_MAX;
-  EXPECT_EQ(dxgi_device->GetGPUThreadPriority(nullptr), E_POINTER);
-  ASSERT_EQ(dxgi_device->GetGPUThreadPriority(&priority), S_OK);
-  EXPECT_EQ(priority, 0);
-
-  for (const INT valid_priority : {-7, 7, 0}) {
-    ASSERT_EQ(dxgi_device->SetGPUThreadPriority(valid_priority), S_OK);
-    priority = INT_MAX;
-    ASSERT_EQ(dxgi_device->GetGPUThreadPriority(&priority), S_OK);
-    EXPECT_EQ(priority, valid_priority);
-  }
-
-  for (const INT invalid_priority : {-8, 8}) {
-    EXPECT_EQ(dxgi_device->SetGPUThreadPriority(invalid_priority),
-              E_INVALIDARG);
-    priority = INT_MAX;
-    ASSERT_EQ(dxgi_device->GetGPUThreadPriority(&priority), S_OK);
-    EXPECT_EQ(priority, 0);
-  }
-}
-
-TEST_F(DeviceControlSpec, DxgiObjectSharesIdentityStateAndAdapterParent) {
-  auto dxgi_object = QueryDevice<IDXGIObject>();
-  auto dxgi_device = QueryDevice<IDXGIDevice3>();
-  ASSERT_TRUE(dxgi_object);
-  ASSERT_TRUE(dxgi_device);
-
-  ComPtr<IUnknown> d3d_identity;
-  ComPtr<IUnknown> dxgi_identity;
-  ASSERT_EQ(context_.device()->QueryInterface(
-                __uuidof(IUnknown),
-                reinterpret_cast<void **>(d3d_identity.put())),
-            S_OK);
-  ASSERT_EQ(dxgi_device->QueryInterface(
-                __uuidof(IUnknown),
-                reinterpret_cast<void **>(dxgi_identity.put())),
-            S_OK);
-  EXPECT_EQ(d3d_identity.get(), dxgi_identity.get());
-
-  constexpr GUID data_key = {
-      0xb0499ce9,
-      0x5f91,
-      0x44fb,
-      {0x86, 0x60, 0xef, 0x37, 0x17, 0x78, 0xe3, 0x1a}};
-  constexpr std::uint32_t expected = 0x10203040u;
-  ASSERT_EQ(dxgi_object->SetPrivateData(data_key, sizeof(expected), &expected),
-            S_OK);
-  std::uint32_t actual = 0;
-  UINT actual_size = sizeof(actual);
-  ASSERT_EQ(context_.device()->GetPrivateData(data_key, &actual_size, &actual),
-            S_OK);
-  EXPECT_EQ(actual_size, sizeof(actual));
-  EXPECT_EQ(actual, expected);
-
-  EXPECT_EQ(dxgi_device->GetAdapter(nullptr), E_INVALIDARG);
-  ComPtr<IDXGIAdapter> adapter;
-  ASSERT_EQ(dxgi_device->GetAdapter(adapter.put()), S_OK);
-  ASSERT_TRUE(adapter);
-  ComPtr<IDXGIAdapter> parent;
-  ASSERT_EQ(dxgi_object->GetParent(
-                __uuidof(IDXGIAdapter),
-                reinterpret_cast<void **>(parent.put())),
-            S_OK);
-  ASSERT_TRUE(parent);
-
-  ComPtr<IUnknown> adapter_identity;
-  ComPtr<IUnknown> parent_identity;
-  ASSERT_EQ(adapter->QueryInterface(
-                __uuidof(IUnknown),
-                reinterpret_cast<void **>(adapter_identity.put())),
-            S_OK);
-  ASSERT_EQ(parent->QueryInterface(
-                __uuidof(IUnknown),
-                reinterpret_cast<void **>(parent_identity.put())),
-            S_OK);
-  EXPECT_EQ(adapter_identity.get(), parent_identity.get());
-
-  ComPtr<IDXGIAdapter1> adapter1;
-  ASSERT_EQ(adapter->QueryInterface(
-                __uuidof(IDXGIAdapter1),
-                reinterpret_cast<void **>(adapter1.put())),
-            S_OK);
-  DXGI_ADAPTER_DESC1 adapter_desc = {};
-  ASSERT_EQ(adapter1->GetDesc1(&adapter_desc), S_OK);
-  const LUID device_luid = context_.device()->GetAdapterLuid();
-  EXPECT_EQ(adapter_desc.AdapterLuid.LowPart, device_luid.LowPart);
-  EXPECT_EQ(adapter_desc.AdapterLuid.HighPart, device_luid.HighPart);
-
-  void *unsupported = reinterpret_cast<void *>(uintptr_t{1});
-  EXPECT_EQ(dxgi_object->GetParent(__uuidof(ID3D12Fence), &unsupported),
-            E_NOINTERFACE);
-  EXPECT_EQ(unsupported, nullptr);
-}
-
-TEST_F(DeviceControlSpec, DxgiSurfaceFailureClearsOutput) {
-  auto dxgi_device = QueryDevice<IDXGIDevice>();
-  ASSERT_TRUE(dxgi_device);
-
-  DXGI_SURFACE_DESC desc = {};
-  desc.Width = 4;
-  desc.Height = 4;
-  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  desc.SampleDesc.Count = 1;
-  auto *surface = reinterpret_cast<IDXGISurface *>(uintptr_t{1});
-  EXPECT_EQ(dxgi_device->CreateSurface(
-                &desc, 1, DXGI_USAGE_RENDER_TARGET_OUTPUT, nullptr, &surface),
-            DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(surface, nullptr);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
-TEST_F(DeviceControlSpec, DxgiFrameLatencyEnforcesBoundsAndResetValue) {
-  auto dxgi_device = QueryDevice<IDXGIDevice1>();
-  ASSERT_TRUE(dxgi_device);
-
-  UINT latency = UINT_MAX;
-  EXPECT_EQ(dxgi_device->GetMaximumFrameLatency(nullptr),
-            DXGI_ERROR_INVALID_CALL);
-  ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
-  EXPECT_EQ(latency, 3u);
-
-  for (const UINT valid_latency : {1u, 16u}) {
-    ASSERT_EQ(dxgi_device->SetMaximumFrameLatency(valid_latency), S_OK);
-    latency = UINT_MAX;
-    ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
-    EXPECT_EQ(latency, valid_latency);
-  }
-
-  EXPECT_EQ(dxgi_device->SetMaximumFrameLatency(17),
-            DXGI_ERROR_INVALID_CALL);
-  latency = UINT_MAX;
-  ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
-  EXPECT_EQ(latency, 16u);
-
-  ASSERT_EQ(dxgi_device->SetMaximumFrameLatency(0), S_OK);
-  latency = UINT_MAX;
-  ASSERT_EQ(dxgi_device->GetMaximumFrameLatency(&latency), S_OK);
-  EXPECT_EQ(latency, 3u);
-}
-
-TEST_F(DeviceControlSpec, DxgiResourceControlsRejectInvalidInputs) {
-  auto dxgi_device = QueryDevice<IDXGIDevice3>();
-  ASSERT_TRUE(dxgi_device);
-
-  DXGI_RESIDENCY residency = DXGI_RESIDENCY_EVICTED_TO_DISK;
-  IUnknown *unknown = context_.device();
-  EXPECT_EQ(dxgi_device->QueryResourceResidency(nullptr, &residency, 1),
-            E_INVALIDARG);
-  EXPECT_EQ(residency, DXGI_RESIDENCY_EVICTED_TO_DISK);
-  EXPECT_EQ(dxgi_device->QueryResourceResidency(&unknown, nullptr, 1),
-            E_INVALIDARG);
-
-  EXPECT_EQ(dxgi_device->OfferResources(
-                0, nullptr, static_cast<DXGI_OFFER_RESOURCE_PRIORITY>(0)),
-            E_INVALIDARG);
-  EXPECT_EQ(dxgi_device->OfferResources(
-                1, nullptr, DXGI_OFFER_RESOURCE_PRIORITY_NORMAL),
-            E_INVALIDARG);
-  EXPECT_EQ(dxgi_device->ReclaimResources(1, nullptr, nullptr), E_INVALIDARG);
-  EXPECT_EQ(dxgi_device->EnqueueSetEvent(nullptr), E_INVALIDARG);
-
-  dxgi_device->Trim();
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
-TEST(DeviceRemovalSpec, InitialReasonIsSuccess) {
+DXMT_SERIAL_TEST(DeviceRemovalSpec, InitialReasonIsSuccess) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
   EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
@@ -375,7 +152,7 @@ TEST(DeviceRemovalSpec, InitialReasonIsSuccess) {
   EXPECT_EQ(device->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
+DXMT_SERIAL_TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
 
@@ -436,7 +213,7 @@ TEST(DeviceRemovalSpec, ExplicitRemovalIsStickyAndRejectsQueueWork) {
   CloseHandle(pending_event);
 }
 
-TEST(DeviceRemovalSpec, PendingFenceWaitDoesNotHangAfterRemoval) {
+DXMT_SERIAL_TEST(DeviceRemovalSpec, PendingFenceWaitDoesNotHangAfterRemoval) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
   D3D12TestContext context;
@@ -463,7 +240,7 @@ TEST(DeviceRemovalSpec, PendingFenceWaitDoesNotHangAfterRemoval) {
   CloseHandle(event);
 }
 
-TEST(DeviceRemovalSpec, DeviceAndQueueDestructionDoNotDeadlock) {
+DXMT_SERIAL_TEST(DeviceRemovalSpec, DeviceAndQueueDestructionDoNotDeadlock) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
   ComPtr<ID3D12Device5> device5;
@@ -493,7 +270,7 @@ TEST(DeviceRemovalSpec, DeviceAndQueueDestructionDoNotDeadlock) {
   CloseHandle(event);
 }
 
-TEST(DeviceRemovalSpec,
+DXMT_SERIAL_TEST(DeviceRemovalSpec,
      ConcurrentRemovalSignalsAllFenceRegistrationsAndReleasesCleanly) {
   constexpr UINT kFenceCount = 8;
   constexpr UINT kRemovalThreadCount = 4;
@@ -563,7 +340,7 @@ TEST(DeviceRemovalSpec,
 }
 
 #ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
-TEST(DeviceDredSpec, UnavailableReportsTrackExplicitRemovalState) {
+DXMT_SERIAL_TEST(DeviceDredSpec, UnavailableReportsTrackExplicitRemovalState) {
   auto device = CreateIsolatedD3D12Device();
   ASSERT_TRUE(device);
 

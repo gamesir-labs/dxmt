@@ -183,6 +183,11 @@ int RunScheduledTests(int argc, char **argv);
       dxmt_serial_test_fixture_, __LINE__)(#test_fixture "." #test_name);      \
   TEST_F(test_fixture, test_name)
 
+#define DXMT_SERIAL_TEST(test_suite_name, test_name)                           \
+  static const ::dxmt::test::SerialTestRegistration DXMT_TEST_CONCAT_(         \
+      dxmt_serial_test_, __LINE__)(#test_suite_name "." #test_name);          \
+  TEST(test_suite_name, test_name)
+
 #define DXMT_GROUP_SERIAL_TESTS(pattern, group)                                \
   static const ::dxmt::test::SerialTestGroupRegistration DXMT_TEST_CONCAT_(    \
       dxmt_serial_test_group_, __LINE__)(pattern, group)

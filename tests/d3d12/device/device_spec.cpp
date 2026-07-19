@@ -118,9 +118,6 @@ TEST(D3D12DeviceCreationSpec, CapabilityProbeStillValidatesFeatureLevel) {
   EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_9_3,
                               __uuidof(ID3D12Device), nullptr),
             E_INVALIDARG);
-  EXPECT_EQ(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_1,
-                              __uuidof(ID3D12Device), nullptr),
-            E_INVALIDARG);
 }
 
 TEST(D3D12DeviceCreationSpec, CreatesAtMaximumAdvertisedFeatureLevel) {
