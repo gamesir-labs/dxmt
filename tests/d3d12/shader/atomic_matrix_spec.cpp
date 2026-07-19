@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -129,6 +130,50 @@ protected:
     return words;
   }
 
+  std::pair<std::vector<UINT>, std::vector<UINT>>
+  ReadbackPair(ID3D12Resource *first, UINT first_word_count,
+               ID3D12Resource *second, UINT second_word_count) {
+    const UINT64 first_size = first_word_count * sizeof(UINT);
+    const UINT64 second_size = second_word_count * sizeof(UINT);
+    auto first_readback = context_.CreateBuffer(
+        first_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    auto second_readback = context_.CreateBuffer(
+        second_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    EXPECT_TRUE(first_readback);
+    EXPECT_TRUE(second_readback);
+    if (!first_readback || !second_readback)
+      return {};
+
+    D3D12TestContext::Transition(
+        context_.list(), first, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12TestContext::Transition(
+        context_.list(), second, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    context_.list()->CopyBufferRegion(first_readback.get(), 0, first, 0,
+                                      first_size);
+    context_.list()->CopyBufferRegion(second_readback.get(), 0, second, 0,
+                                      second_size);
+    EXPECT_EQ(context_.ExecuteAndWait(), S_OK);
+
+    auto map_words = [](ID3D12Resource *readback,
+                        UINT word_count) -> std::vector<UINT> {
+      std::vector<UINT> words(word_count);
+      void *mapped = nullptr;
+      const D3D12_RANGE read_range = {0, word_count * sizeof(UINT)};
+      EXPECT_EQ(readback->Map(0, &read_range, &mapped), S_OK);
+      if (mapped)
+        std::memcpy(words.data(), mapped, words.size() * sizeof(UINT));
+      const D3D12_RANGE no_write = {0, 0};
+      readback->Unmap(0, &no_write);
+      return words;
+    };
+    return {map_words(first_readback.get(), first_word_count),
+            map_words(second_readback.get(), second_word_count)};
+  }
+
   D3D12TestContext context_;
   std::vector<ComPtr<ID3D12Resource>> uploads_;
 };
@@ -148,12 +193,14 @@ TEST_F(D3D12AtomicMatrixSpec,
   constexpr UINT kThreadCount = 64;
   auto root = CreateRootSignature(2);
   auto pipeline = CreatePipeline(root.get(), kShader);
-  auto target = CreateInitializedBuffer(std::vector<UINT>(kThreadCount + 1));
+  auto target = CreateInitializedBuffer({0u});
+  auto originals = CreateInitializedBuffer(std::vector<UINT>(kThreadCount));
   auto heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
   ASSERT_TRUE(root);
   ASSERT_TRUE(pipeline);
   ASSERT_TRUE(target);
+  ASSERT_TRUE(originals);
   ASSERT_TRUE(heap);
 
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -167,19 +214,20 @@ TEST_F(D3D12AtomicMatrixSpec,
   uav = {};
   uav.Format = DXGI_FORMAT_R32_TYPELESS;
   uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-  uav.Buffer.FirstElement = 1;
+  uav.Buffer.FirstElement = 0;
   uav.Buffer.NumElements = kThreadCount;
   uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   context_.device()->CreateUnorderedAccessView(
-      target.get(), nullptr, &uav,
+      originals.get(), nullptr, &uav,
       context_.CpuDescriptorHandle(heap.get(), 1));
   Bind(context_.list(), root.get(), pipeline.get(), heap.get());
   context_.list()->Dispatch(kThreadCount / 8, 1, 1);
 
-  auto actual = Readback(target.get(), kThreadCount + 1);
-  ASSERT_EQ(actual.size(), kThreadCount + 1);
-  EXPECT_EQ(actual[0], kThreadCount);
-  std::vector<UINT> original_values(actual.begin() + 1, actual.end());
+  auto [target_values, original_values] =
+      ReadbackPair(target.get(), 1, originals.get(), kThreadCount);
+  ASSERT_EQ(target_values.size(), 1u);
+  ASSERT_EQ(original_values.size(), kThreadCount);
+  EXPECT_EQ(target_values[0], kThreadCount);
   std::sort(original_values.begin(), original_values.end());
   std::vector<UINT> expected(kThreadCount);
   std::iota(expected.begin(), expected.end(), 0u);
@@ -387,12 +435,14 @@ TEST_F(D3D12AtomicMatrixSpec,
   constexpr UINT kThreadCount = 32;
   auto root = CreateRootSignature(2);
   auto pipeline = CreatePipeline(root.get(), kShader);
-  auto target = CreateInitializedBuffer(std::vector<UINT>(kThreadCount + 1));
+  auto target = CreateInitializedBuffer({0u});
+  auto originals = CreateInitializedBuffer(std::vector<UINT>(kThreadCount));
   auto heap = context_.CreateDescriptorHeap(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
   ASSERT_TRUE(root);
   ASSERT_TRUE(pipeline);
   ASSERT_TRUE(target);
+  ASSERT_TRUE(originals);
   ASSERT_TRUE(heap);
 
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -406,19 +456,20 @@ TEST_F(D3D12AtomicMatrixSpec,
   uav = {};
   uav.Format = DXGI_FORMAT_R32_TYPELESS;
   uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-  uav.Buffer.FirstElement = 1;
+  uav.Buffer.FirstElement = 0;
   uav.Buffer.NumElements = kThreadCount;
   uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   context_.device()->CreateUnorderedAccessView(
-      target.get(), nullptr, &uav,
+      originals.get(), nullptr, &uav,
       context_.CpuDescriptorHandle(heap.get(), 1));
   Bind(context_.list(), root.get(), pipeline.get(), heap.get());
   context_.list()->Dispatch(1, 1, 1);
 
-  auto actual = Readback(target.get(), kThreadCount + 1);
-  ASSERT_EQ(actual.size(), kThreadCount + 1);
-  EXPECT_EQ(actual[0], kThreadCount);
-  std::vector<UINT> original_values(actual.begin() + 1, actual.end());
+  auto [target_values, original_values] =
+      ReadbackPair(target.get(), 1, originals.get(), kThreadCount);
+  ASSERT_EQ(target_values.size(), 1u);
+  ASSERT_EQ(original_values.size(), kThreadCount);
+  EXPECT_EQ(target_values[0], kThreadCount);
   std::sort(original_values.begin(), original_values.end());
   std::vector<UINT> expected(kThreadCount);
   std::iota(expected.begin(), expected.end(), 0u);

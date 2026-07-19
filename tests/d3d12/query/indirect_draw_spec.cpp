@@ -108,7 +108,8 @@ protected:
     context_.list()->RSSetViewports(1, &viewport);
     context_.list()->RSSetScissorRects(1, &scissor);
     context_.list()->ExecuteIndirect(signature.get(), 1, argument_buffer.get(),
-                                     0, count_buffer.get(), count_offset);
+                                     0, count_buffer.get(),
+                                     count_buffer ? count_offset : 0);
     D3D12TestContext::Transition(context_.list(), render_target.get(),
                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);

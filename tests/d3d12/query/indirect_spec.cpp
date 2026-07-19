@@ -124,7 +124,8 @@ protected:
         1, heap->GetGPUDescriptorHandleForHeapStart());
     context_.list()->ExecuteIndirect(signature.get(), max_command_count,
                                      arguments.get(), argument_offset,
-                                     count_buffer.get(), count_offset);
+                                     count_buffer.get(),
+                                     count_buffer ? count_offset : 0);
     D3D12TestContext::Transition(context_.list(), output.get(),
                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                  D3D12_RESOURCE_STATE_COPY_SOURCE);

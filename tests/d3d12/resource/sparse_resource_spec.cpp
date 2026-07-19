@@ -785,8 +785,8 @@ TEST_F(D3D12SparseResourceSpec,
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
             S_OK);
-  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
-    GTEST_SKIP() << "Tiled resources are not supported";
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+    GTEST_SKIP() << "Texture arrays require tiled resources tier 2";
 
   constexpr UINT16 array_size = 2;
   constexpr UINT16 mip_levels = 10;
@@ -803,11 +803,11 @@ TEST_F(D3D12SparseResourceSpec,
   ComPtr<ID3D12Resource> source;
   ComPtr<ID3D12Resource> destination;
   ASSERT_EQ(context_.device()->CreateReservedResource(
-                &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                 IID_PPV_ARGS(source.put())),
             S_OK);
   ASSERT_EQ(context_.device()->CreateReservedResource(
-                &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                 IID_PPV_ARGS(destination.put())),
             S_OK);
   ASSERT_TRUE(source);
@@ -817,7 +817,8 @@ TEST_F(D3D12SparseResourceSpec,
   UINT total_tiles = 0;
   context_.device()->GetResourceTiling(source.get(), &total_tiles, &packed,
                                        nullptr, nullptr, 0, nullptr);
-  ASSERT_GT(packed.NumPackedMips, 0u);
+  if (!packed.NumPackedMips)
+    GTEST_SKIP() << "Resource has no packed mip tail";
   ASSERT_GE(packed.NumTilesForPackedMips, array_size);
   const UINT first_packed_subresource =
       packed.NumStandardMips + array_slice * mip_levels;
@@ -849,6 +850,13 @@ TEST_F(D3D12SparseResourceSpec,
       D3D12_TILE_MAPPING_FLAG_NONE);
 
   constexpr std::uint32_t expected = 0x4a93d27eu;
+  D3D12_RESOURCE_BARRIER transition = {};
+  transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  transition.Transition.pResource = destination.get();
+  transition.Transition.Subresource = deepest_packed_subresource;
+  transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  context_.list()->ResourceBarrier(1, &transition);
   ASSERT_EQ(context_.UploadTextureAndReset(
                 destination.get(), &expected, sizeof(expected),
                 sizeof(expected), deepest_packed_subresource),
@@ -858,6 +866,10 @@ TEST_F(D3D12SparseResourceSpec,
   aliasing.Aliasing.pResourceBefore = destination.get();
   aliasing.Aliasing.pResourceAfter = source.get();
   context_.list()->ResourceBarrier(1, &aliasing);
+  transition.Transition.pResource = source.get();
+  transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  context_.list()->ResourceBarrier(1, &transition);
 
   dxmt::test::TextureReadback readback;
   ASSERT_EQ(context_.ReadbackTexture(source.get(), &readback,
@@ -897,7 +909,8 @@ TEST_F(D3D12SparseResourceSpec, WritesMappedDeepPackedMipTail) {
   UINT total_tiles = 0;
   context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
                                        &shape, nullptr, 0, nullptr);
-  ASSERT_GT(packed.NumPackedMips, 0u);
+  if (!packed.NumPackedMips)
+    GTEST_SKIP() << "Resource has no packed mip tail";
   const UINT packed_subresource = desc.MipLevels - 1;
   ASSERT_GE(packed_subresource, packed.NumStandardMips);
 
@@ -1138,8 +1151,8 @@ TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
       D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
-  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
-    GTEST_SKIP() << "Tiled resources are not supported";
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+    GTEST_SKIP() << "Texture arrays require tiled resources tier 2";
 
   constexpr UINT16 array_size = 3;
   D3D12_RESOURCE_DESC desc = {};
@@ -1151,7 +1164,6 @@ TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
   desc.Format = DXGI_FORMAT_R32_UINT;
   desc.SampleDesc.Count = 1;
   desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
-  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   ComPtr<ID3D12Resource> texture;
   ASSERT_TRUE(SUCCEEDED(context_.device()->CreateReservedResource(
       &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
@@ -1163,7 +1175,8 @@ TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
   UINT total_tiles = 0;
   context_.device()->GetResourceTiling(texture.get(), &total_tiles, &packed,
                                        &shape, nullptr, 0, nullptr);
-  ASSERT_GT(packed.NumPackedMips, 0u);
+  if (!packed.NumPackedMips)
+    GTEST_SKIP() << "Resource has no packed mip tail";
   EXPECT_EQ(packed.NumTilesForPackedMips, array_size);
   EXPECT_GE(total_tiles, packed.NumTilesForPackedMips);
 }

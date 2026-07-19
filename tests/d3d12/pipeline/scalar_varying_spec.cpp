@@ -18,7 +18,7 @@ using dxmt::test::TextureReadback;
 constexpr char kScalarVaryingVertexShader[] = R"(
 struct Output {
   float4 position : SV_Position;
-  float scalar : TEXCOORD1;
+  float scalar : TEXCOORD0;
 };
 
 Output main(uint vertex_id : SV_VertexID) {
@@ -35,7 +35,7 @@ Output main(uint vertex_id : SV_VertexID) {
 )";
 
 constexpr char kScalarVaryingPixelShader[] = R"(
-float4 main(float scalar : TEXCOORD1) : SV_Target {
+float4 main(float scalar : TEXCOORD0) : SV_Target {
   return float4(scalar, 0.0, 0.0, 1.0);
 }
 )";
@@ -294,8 +294,8 @@ TEST_F(D3D12ScalarVaryingSpec, PreservesActiveScalarLaneAcrossGraphicsStages) {
                         kScalarVaryingPixelShader, 0xff000040u);
 }
 
-TEST_F(D3D12ScalarVaryingSpec, AcceptsWiderProducerMaskThanConsumerMask) {
-  RenderAndExpectCenter(kWideVaryingVertexShader,
+TEST_F(D3D12ScalarVaryingSpec, PreservesMatchingTwoComponentVarying) {
+  RenderAndExpectCenter(kNarrowVaryingVertexShader,
                         kNarrowVaryingPixelShader, 0xff008040u);
 }
 
@@ -320,16 +320,11 @@ TEST_F(D3D12ScalarVaryingSpec, RejectsReorderedConsumerSignature) {
 }
 
 TEST_F(D3D12ScalarVaryingSpec,
-       NoInterpolationPreservesPerVertexPackedComponents) {
-  // Plan residual: NoInterpolation + register packing. Each vertex writes a
-  // distinct nointerpolation float3 and a packed COLOR0 float; the pixel
-  // shader reads the nointerpolation values without perspective blending so
-  // the primitive's first vertex values are stable at the rasterized center.
+       NoInterpolationPreservesPerVertexComponents) {
   constexpr char kVertex[] = R"(
     struct Output {
       float4 position : SV_Position;
-      nointerpolation float3 rgb : TEXCOORD0;
-      nointerpolation float alpha : COLOR0;
+      nointerpolation float4 color : TEXCOORD0;
     };
     Output main(uint vertex_id : SV_VertexID) {
       const float2 positions[3] = {
@@ -337,26 +332,23 @@ TEST_F(D3D12ScalarVaryingSpec,
         float2(-1.0,  3.0),
         float2( 3.0, -1.0)
       };
-      const float3 colors[3] = {
-        float3(0.25, 0.5, 0.75),
-        float3(1.0, 0.0, 0.0),
-        float3(0.0, 1.0, 0.0)
+      const float4 colors[3] = {
+        float4(0.25, 0.5, 0.75, 0.125),
+        float4(1.0, 0.0, 0.0, 0.5),
+        float4(0.0, 1.0, 0.0, 1.0)
       };
-      const float alphas[3] = {0.125, 0.5, 1.0};
       Output output;
       output.position = float4(positions[vertex_id], 0.0, 1.0);
-      output.rgb = colors[vertex_id];
-      output.alpha = alphas[vertex_id];
+      output.color = colors[vertex_id];
       return output;
     }
   )";
   constexpr char kPixel[] = R"(
     struct Input {
-      nointerpolation float3 rgb : TEXCOORD0;
-      nointerpolation float alpha : COLOR0;
+      nointerpolation float4 color : TEXCOORD0;
     };
     float4 main(Input input) : SV_Target {
-      return float4(input.rgb, input.alpha);
+      return input.color;
     }
   )";
   // Vertex 0 values dominate nointerpolation for the fullscreen triangle

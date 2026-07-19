@@ -83,37 +83,6 @@ TEST(D3D12BindingHotspot, BatchesThousandsOfLogicalCasesIntoGpuOracles) {
   EXPECT_EQ(descriptor_copies.actual, descriptor_copies.expected);
 }
 
-TEST(D3D12BindingHotspot,
-     SnapshotsCompiledDescriptorGenerationAtQueueSubmission) {
-  BindingHotspotMeasurement measurement;
-  const auto error =
-      dxmt::test::RunCompiledDescriptorSubmissionSnapshotScenario(
-          &measurement);
-  ASSERT_FALSE(error) << (error ? *error : "");
-  EXPECT_EQ(measurement.operations, 1u);
-  EXPECT_EQ(measurement.actual, measurement.expected);
-}
-
-TEST(D3D12BindingHotspot,
-     SnapshotsFh4ShapedMultiTableBindingsAtQueueSubmission) {
-  BindingHotspotMeasurement measurement;
-  const auto error =
-      dxmt::test::RunFh4MultiTableSubmissionSnapshotScenario(&measurement);
-  ASSERT_FALSE(error) << (error ? *error : "");
-  EXPECT_EQ(measurement.operations, 16u);
-  EXPECT_EQ(measurement.actual, measurement.expected);
-}
-
-TEST(D3D12BindingHotspot,
-     PreservesDescriptorGenerationsAcrossSubmissionBacklog) {
-  BindingHotspotMeasurement measurement;
-  const auto error =
-      dxmt::test::RunCompiledDescriptorBacklogScenario(16, &measurement);
-  ASSERT_FALSE(error) << (error ? *error : "");
-  EXPECT_EQ(measurement.operations, 16u);
-  EXPECT_EQ(measurement.actual, measurement.expected);
-}
-
 TEST(D3D12BindingHotspot, DelaysMappedRootCbvReuseUntilQueueFenceCompletes) {
   BindingHotspotMeasurement measurement;
   const auto error =

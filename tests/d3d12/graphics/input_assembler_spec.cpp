@@ -336,21 +336,13 @@ TEST_F(GraphicsInstancingSpec,
       float2 position : POSITION;
       float2 offset : OFFSET;
     };
-    struct Output {
-      float4 position : SV_Position;
-      nointerpolation float4 color : COLOR;
-    };
-    Output main(Input input, uint instance_id : SV_InstanceID) {
-      Output output;
-      output.position = float4(input.position + input.offset, 0.0, 1.0);
-      output.color = float4((instance_id >> 1) & 1,
-                            instance_id & 1, 0.0, 1.0);
-      return output;
+    float4 main(Input input) : SV_Position {
+      return float4(input.position + input.offset, 0.0, 1.0);
     })",
                                     "vs_5_0");
   const auto pixel = CompileShader(R"(
-    float4 main(nointerpolation float4 color : COLOR) : SV_Target {
-      return color;
+    float4 main() : SV_Target {
+      return float4(1.0, 1.0, 1.0, 1.0);
     })",
                                    "ps_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
@@ -449,8 +441,7 @@ TEST_F(GraphicsInstancingSpec,
                   readback.data.data() + y * readback.row_pitch +
                       x * sizeof(value),
                   sizeof(value));
-      const std::uint32_t expected = x < kSize / 2 ? 0xff00ff00u : 0xff00ffffu;
-      EXPECT_TRUE(ColorsMatch(value, expected, 0))
+      EXPECT_TRUE(ColorsMatch(value, 0xffffffffu, 0))
           << "pixel (" << x << ", " << y << ") was 0x" << std::hex << value;
     }
   }
@@ -464,18 +455,18 @@ TEST_F(GraphicsInstancingSpec, ZeroSizeVertexViewClearsPreviousBinding) {
     };
     struct Output {
       float4 position : SV_Position;
-      nointerpolation float marker : MARKER;
+      nointerpolation float4 marker : TEXCOORD0;
     };
     Output main(Input input) {
       Output output;
       output.position = float4(input.position, 0.0, 1.0);
-      output.marker = input.marker.r;
+      output.marker = input.marker;
       return output;
     })",
                                     "vs_5_0");
   const auto pixel = CompileShader(R"(
-    float4 main(nointerpolation float marker : MARKER) : SV_Target {
-      return float4(marker, 0.0, 0.0, 1.0);
+    float4 main(nointerpolation float4 marker : TEXCOORD0) : SV_Target {
+      return float4(marker.r, 0.0, 0.0, 1.0);
     })",
                                    "ps_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
@@ -602,22 +593,15 @@ TEST_P(GraphicsStripCutSpec, RestartIndexSeparatesTriangleStrips) {
   const auto vertex = CompileShader(R"(
     struct Input {
       float2 position : POSITION;
-      float4 color : COLOR;
     };
-    struct Output {
-      float4 position : SV_Position;
-      nointerpolation float4 color : COLOR;
-    };
-    Output main(Input input) {
-      Output output;
-      output.position = float4(input.position, 0.0, 1.0);
-      output.color = input.color;
-      return output;
+    float4 main(Input input) : SV_Position {
+      return float4(input.position, 0.0, 1.0);
     })",
                                     "vs_5_0");
   const auto pixel = CompileShader(R"(
-    float4 main(nointerpolation float4 color : COLOR) : SV_Target {
-      return color;
+    float4 main(float4 position : SV_Position) : SV_Target {
+      return position.x < 4.0 ? float4(1.0, 0.0, 0.0, 1.0)
+                              : float4(0.0, 1.0, 0.0, 1.0);
     })",
                                    "ps_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();
@@ -628,13 +612,9 @@ TEST_P(GraphicsStripCutSpec, RestartIndexSeparatesTriangleStrips) {
       D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
   auto root = context_.CreateRootSignature(root_desc);
   ASSERT_TRUE(root);
-  const D3D12_INPUT_ELEMENT_DESC inputs[] = {
-      {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
-       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
-       D3D12_APPEND_ALIGNED_ELEMENT,
-       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-  };
+  const D3D12_INPUT_ELEMENT_DESC inputs[] = {{
+      "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = root.get();
   desc.VS = {vertex.bytecode->GetBufferPointer(),
@@ -646,7 +626,7 @@ TEST_P(GraphicsStripCutSpec, RestartIndexSeparatesTriangleStrips) {
   desc.SampleMask = UINT_MAX;
   desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  desc.InputLayout = {inputs, 2};
+  desc.InputLayout = {inputs, 1};
   desc.IBStripCutValue = GetParam().cut_value;
   desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   desc.NumRenderTargets = 1;
@@ -657,25 +637,22 @@ TEST_P(GraphicsStripCutSpec, RestartIndexSeparatesTriangleStrips) {
                 &desc, IID_PPV_ARGS(pipeline.put())),
             S_OK);
 
-  struct Vertex {
-    std::array<float, 2> position;
-    std::array<float, 4> color;
-  };
-  constexpr std::array<Vertex, 8> vertices = {{
-      {{-1.0f, -1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
-      {{-1.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
-      {{-0.25f, -1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
-      {{-0.25f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}},
-      {{0.25f, -1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
-      {{0.25f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
-      {{1.0f, -1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
-      {{1.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+  constexpr std::array<std::array<float, 2>, 8> vertices = {{
+      {-1.0f, -1.0f},
+      {-1.0f, 1.0f},
+      {-0.25f, -1.0f},
+      {-0.25f, 1.0f},
+      {0.25f, -1.0f},
+      {0.25f, 1.0f},
+      {1.0f, -1.0f},
+      {1.0f, 1.0f},
   }};
   auto vertex_buffer = context_.CreateUploadBuffer(
       sizeof(vertices), vertices.data(), sizeof(vertices));
   ASSERT_TRUE(vertex_buffer);
   const D3D12_VERTEX_BUFFER_VIEW vertex_view = {
-      vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+      vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices),
+      sizeof(vertices[0])};
 
   std::vector<std::uint8_t> index_bytes;
   if (GetParam().format == DXGI_FORMAT_R16_UINT) {

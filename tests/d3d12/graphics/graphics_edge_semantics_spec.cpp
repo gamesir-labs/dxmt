@@ -183,9 +183,9 @@ TEST_F(GraphicsEdgeSemanticsSpec,
   auto vertex = CompileShader(R"(
     struct Output {
       float4 position : SV_Position;
-      float perspective_value : TEXCOORD0;
-      noperspective float affine_value : TEXCOORD1;
-      nointerpolation float flat_value : TEXCOORD2;
+      float4 perspective_value : TEXCOORD0;
+      noperspective float4 affine_value : TEXCOORD1;
+      nointerpolation float4 flat_value : TEXCOORD2;
     };
     Output main(uint id : SV_VertexID) {
       const float4 positions[3] = {
@@ -196,17 +196,17 @@ TEST_F(GraphicsEdgeSemanticsSpec,
       const float values[3] = {0.0, 0.0, 1.0};
       Output output;
       output.position = positions[id];
-      output.perspective_value = values[id];
-      output.affine_value = values[id];
-      output.flat_value = 0.75;
+      output.perspective_value = float4(values[id], values[id], values[id], values[id]);
+      output.affine_value = float4(values[id], values[id], values[id], values[id]);
+      output.flat_value = float4(0.75, 0.75, 0.75, 0.75);
       return output;
     })",
                               "vs_5_0");
   auto pixel = CompileShader(R"(
-    float4 main(float perspective_value : TEXCOORD0,
-                noperspective float affine_value : TEXCOORD1,
-                nointerpolation float flat_value : TEXCOORD2) : SV_Target {
-      return float4(perspective_value, affine_value, flat_value, 1.0);
+    float4 main(float4 perspective_value : TEXCOORD0,
+                noperspective float4 affine_value : TEXCOORD1,
+                nointerpolation float4 flat_value : TEXCOORD2) : SV_Target {
+      return float4(perspective_value.x, affine_value.x, flat_value.x, 1.0);
     })",
                              "ps_5_0");
   ASSERT_EQ(vertex.result, S_OK) << vertex.diagnostic_text();

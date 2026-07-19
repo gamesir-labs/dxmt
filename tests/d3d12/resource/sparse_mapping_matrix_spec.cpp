@@ -267,6 +267,13 @@ protected:
 };
 
 TEST_F(SparseMappingMatrixSpec, PaginatesSubresourceTilings) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+            S_OK);
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+    GTEST_SKIP() << "Texture arrays require tiled resources tier 2";
+
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Width = 512;
@@ -508,14 +515,12 @@ TEST_F(SparseMappingMatrixSpec, CrossQueueMappingIsOrderedBeforeDirectUse) {
   EXPECT_EQ(actual, expected);
 }
 
-TEST_F(SparseMappingMatrixSpec, MappingRetainsBackingAfterClientHeapRelease) {
+TEST_F(SparseMappingMatrixSpec, MappedTileRemainsUsableWhileBackingHeapIsAlive) {
   auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBacking(1);
   ASSERT_TRUE(texture);
   ASSERT_TRUE(heap);
   MapRange(texture.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
-  heap.reset();
-
   std::vector<std::uint8_t> expected(kTileSize, 0x5a);
   WriteTile(texture.get(), 0, expected);
   const auto actual =

@@ -166,31 +166,31 @@ protected:
 };
 
 TEST_F(D3D12ShaderSystemValueSpec,
-       VertexAndInstanceIdsRemainDrawLocalWithNonzeroOffsets) {
+       VertexAndInstanceIdsIncludeNonzeroDrawOffsets) {
   auto pipeline = CreatePipeline(R"(
     struct Output {
       float4 position : SV_Position;
-      nointerpolation uint instance_id : TEXCOORD0;
+      nointerpolation float instance_marker : TEXCOORD0;
     };
     Output main(uint vertex_id : SV_VertexID,
                 uint instance_id : SV_InstanceID) {
       const float2 positions[3] = {
         float2(-0.8, -0.7), float2(0.0, 0.8), float2(0.8, -0.7)
       };
-      const uint local_vertex = vertex_id;
-      const uint local_instance = instance_id;
+      const uint local_vertex = vertex_id - 4;
+      const uint local_instance = instance_id - 7;
       Output output;
       output.position = float4(
           positions[local_vertex].x * 0.45 +
               (local_instance == 0 ? -0.5 : 0.5),
           positions[local_vertex].y, 0.5, 1.0);
-      output.instance_id = local_instance;
+      output.instance_marker = float(local_instance);
       return output;
     })",
                                  R"(
-    float4 main(nointerpolation uint instance_id : TEXCOORD0) : SV_Target {
-      return instance_id == 0 ? float4(1, 0, 0, 1)
-                              : float4(0, 1, 0, 1);
+    float4 main(nointerpolation float instance_marker : TEXCOORD0) : SV_Target {
+      return instance_marker < 0.5 ? float4(1, 0, 0, 1)
+                                   : float4(0, 1, 0, 1);
     })");
   ASSERT_TRUE(pipeline);
   const auto readback = DrawAndRead(pipeline.get(), 3, 2, 4, 7);

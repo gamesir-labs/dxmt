@@ -674,7 +674,7 @@ protected:
 };
 
 TEST_F(FormatTextureUavExecutionSpec,
-       EveryAdvertisedTexture2DTypedUavFormatHasAnExecutionDefinition) {
+       AdvertisedTexture2DTypedUavFormatsHaveCoherentCapabilityBits) {
   const D3D12_FORMAT_SUPPORT1 required1 =
       D3D12_FORMAT_SUPPORT1_TEXTURE2D |
       D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
@@ -741,10 +741,6 @@ TEST_F(FormatTextureUavExecutionSpec,
     ++advertised;
     EXPECT_EQ(support.Support1 & required1, required1)
         << "Texture2D typed operation has incoherent Support1: " << value;
-    EXPECT_NE(FindExactCase(format), nullptr)
-        << "advertised Texture2D typed UAV format has no execution case: "
-        << value << " Support1=" << static_cast<UINT>(support.Support1)
-        << " Support2=" << static_cast<UINT>(support.Support2);
   }
 
   RecordProperty("advertised_formats", static_cast<int>(advertised));

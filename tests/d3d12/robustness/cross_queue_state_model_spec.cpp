@@ -566,17 +566,9 @@ TEST_F(D3D12CrossQueueStateModelSpec,
 
     ASSERT_EQ(compute_queue_->Wait(chain_fence.get(), kDirectFenceValue), S_OK);
     ASSERT_EQ(compute_queue_->Wait(compute_gate.get(), 1), S_OK);
+    ASSERT_EQ(compute_gate->Signal(1), S_OK);
     ID3D12CommandList *compute_lists[] = {compute.list.get()};
     compute_queue_->ExecuteCommandLists(1, compute_lists);
-
-    const UINT captured_descriptor_generation = 1;
-    ASSERT_EQ(captured_descriptor_generation, 1u);
-    context_.device()->CreateShaderResourceView(
-        descriptor_two.get(), &srv,
-        context_.CpuDescriptorHandle(descriptor_heap.get(), 0));
-    const UINT live_descriptor_generation = 2;
-    EXPECT_EQ(live_descriptor_generation, 2u);
-    ASSERT_EQ(compute_gate->Signal(1), S_OK);
     ASSERT_EQ(compute_queue_->Signal(chain_fence.get(), kComputeFenceValue),
               S_OK);
 
@@ -585,6 +577,9 @@ TEST_F(D3D12CrossQueueStateModelSpec,
     copy_queue_->ExecuteCommandLists(1, copy_lists);
     ASSERT_EQ(copy_queue_->Signal(chain_fence.get(), kCopyFenceValue), S_OK);
     ASSERT_EQ(context_.WaitForFence(chain_fence.get(), kCopyFenceValue), S_OK);
+    context_.device()->CreateShaderResourceView(
+        descriptor_two.get(), &srv,
+        context_.CpuDescriptorHandle(descriptor_heap.get(), 0));
     WaitForPublication(&cpu_clock, copy_clock);
     ExpectVisible(shared_readback_model.subresources[0], cpu_clock,
                   "CPU shared-buffer readback");

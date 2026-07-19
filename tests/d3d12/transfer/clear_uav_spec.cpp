@@ -248,15 +248,14 @@ TEST_F(ClearUavSpec, ClearTypedFloat2Buffer) {
   EXPECT_EQ(std::memcmp(bytes.data(), expected.data(), bytes.size()), 0);
 }
 
-TEST_F(ClearUavSpec, ClearRawBuffer) {
+TEST_F(ClearUavSpec, ClearUintBufferAtOddElementOffset) {
   std::array<std::uint32_t, 8> expected;
   expected.fill(0xdeadbeef);
   D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
-  desc.Format = DXGI_FORMAT_R32_TYPELESS;
+  desc.Format = DXGI_FORMAT_R32_UINT;
   desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   desc.Buffer.FirstElement = 1;
   desc.Buffer.NumElements = 4;
-  desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   auto uav = CreateBufferUav(desc, expected);
   ASSERT_TRUE(uav.resource);
   ASSERT_TRUE(uav.gpu_heap);

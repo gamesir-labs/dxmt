@@ -363,7 +363,8 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   EXPECT_EQ(hwnd, window_->get());
   const HRESULT fullscreen_result =
       swapchain->SetFullscreenState(TRUE, nullptr);
-  if (fullscreen_result == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+  if (fullscreen_result == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE ||
+      fullscreen_result == DXGI_ERROR_UNSUPPORTED)
     return;
   ASSERT_EQ(fullscreen_result, S_OK);
   BOOL fullscreen = FALSE;

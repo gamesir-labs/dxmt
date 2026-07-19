@@ -14,12 +14,6 @@ using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 using dxmt::test::TextureReadback;
 
-// Public DXBC tokenized-program encoding values. This test patches compiled
-// shader bytecode without depending on DXMT's parser implementation.
-constexpr std::uint32_t kDxbcOpcodeTypeMask = 0x000007ff;
-constexpr std::uint32_t kDxbcOpcodeSample = 69;
-constexpr std::uint32_t kDxbcOpcodeLod = 108;
-
 class D3D12LodSemanticSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
@@ -46,77 +40,12 @@ protected:
     return context_.CreateRootSignature(desc);
   }
 
-  static bool PatchSampleToLod(ID3DBlob *bytecode) {
-    // The Wine HLSL frontend does not expose CalculateLevelOfDetail, but DXBC
-    // sample and lod instructions have the same four operands and token length.
-    // Compile the former, then replace only its opcode to exercise lod lowering.
-    constexpr std::uint32_t kShex =
-        std::uint32_t('S') | (std::uint32_t('H') << 8) |
-        (std::uint32_t('E') << 16) | (std::uint32_t('X') << 24);
-    constexpr std::uint32_t kShdr =
-        std::uint32_t('S') | (std::uint32_t('H') << 8) |
-        (std::uint32_t('D') << 16) | (std::uint32_t('R') << 24);
-    auto *bytes = static_cast<std::uint8_t *>(bytecode->GetBufferPointer());
-    const auto size = bytecode->GetBufferSize();
-    auto load32 = [&](std::size_t offset) {
-      std::uint32_t value = 0;
-      if (offset + sizeof(value) <= size)
-        std::memcpy(&value, bytes + offset, sizeof(value));
-      return value;
-    };
-    constexpr std::size_t kPartCountOffset = 28;
-    constexpr std::size_t kPartTableOffset = 32;
-    const auto part_count = load32(kPartCountOffset);
-    if (kPartTableOffset + part_count * sizeof(std::uint32_t) > size)
-      return false;
-    for (std::uint32_t part = 0; part < part_count; ++part) {
-      const auto part_offset =
-          load32(kPartTableOffset + part * sizeof(std::uint32_t));
-      if (part_offset + 2 * sizeof(std::uint32_t) > size)
-        return false;
-      const auto tag = load32(part_offset);
-      if (tag != kShex && tag != kShdr)
-        continue;
-      const auto part_size = load32(part_offset + sizeof(std::uint32_t));
-      const auto program_offset = part_offset + 2 * sizeof(std::uint32_t);
-      if (program_offset + part_size > size ||
-          part_size < 2 * sizeof(std::uint32_t))
-        return false;
-      const auto token_count = load32(program_offset + sizeof(std::uint32_t));
-      if (token_count > part_size / sizeof(std::uint32_t))
-        return false;
-      for (std::uint32_t token_index = 2; token_index < token_count;) {
-        const auto token_offset =
-            program_offset + token_index * sizeof(std::uint32_t);
-        auto token = load32(token_offset);
-        const auto opcode = token & kDxbcOpcodeTypeMask;
-        const auto length = (token >> 24) & 0x7fu;
-        if (!length || token_index + length > token_count)
-          return false;
-        if (opcode == kDxbcOpcodeSample) {
-          token = (token & ~kDxbcOpcodeTypeMask) | kDxbcOpcodeLod;
-          std::memcpy(bytes + token_offset, &token, sizeof(token));
-          return true;
-        }
-        token_index += length;
-      }
-    }
-    return false;
-  }
-
   std::array<float, 4> Run(const char *source, float min_lod,
-                           float mip_lod_bias = 0.0f,
-                           bool patch_sample_to_lod = false) {
+                           float mip_lod_bias = 0.0f) {
     const auto shader = CompileShader(source, "ps_5_0");
     EXPECT_EQ(shader.result, S_OK) << shader.diagnostic_text();
     if (shader.result != S_OK)
       return {};
-    if (patch_sample_to_lod) {
-      const bool patched = PatchSampleToLod(shader.bytecode.get());
-      EXPECT_TRUE(patched);
-      if (!patched)
-        return {};
-    }
     auto root = CreateRootSignature();
     EXPECT_TRUE(root);
     if (!root)
@@ -258,13 +187,15 @@ TEST_F(D3D12LodSemanticSpec, ImplicitSampleAppliesSamplerMipLodBias) {
 
 TEST_F(D3D12LodSemanticSpec, CalculateLodReportsClampedAndUnclampedValues) {
   const auto values = Run(R"(
-    Texture2D input : register(t0);
+    Texture2D<float> input : register(t0);
     SamplerState input_sampler : register(s0);
     float4 main(float4 position : SV_Position) : SV_Target {
       float2 uv = position.xy / 8.0f;
-      return input.Sample(input_sampler, uv);
+      return float4(
+          input.CalculateLevelOfDetail(input_sampler, uv),
+          input.CalculateLevelOfDetailUnclamped(input_sampler, uv), 0.0, 1.0);
     }
-  )", 1.0f, 0.0f, true);
+  )", 1.0f);
   EXPECT_NEAR(values[0], 1.0f, 1.0e-5f);
   EXPECT_NEAR(values[1], 0.0f, 1.0e-5f);
 }
