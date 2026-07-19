@@ -2,6 +2,8 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <climits>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -74,8 +76,9 @@ TEST_P(QueuePriorityMatrixSpec, CreateCommandQueueMatchesPriorityPolicy) {
     }
   } else {
     // Extreme priorities should fail closed or be clamped without device loss.
-    if (FAILED(hr))
+    if (FAILED(hr)) {
       EXPECT_FALSE(queue);
+    }
   }
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }

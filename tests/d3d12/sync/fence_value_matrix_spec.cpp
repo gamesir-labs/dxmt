@@ -71,10 +71,11 @@ TEST_P(FenceValueMatrixSpec, CpuSignalAdvancesCompletedValueMonotonically) {
     // Signaling a lower value is invalid / no-op policy: completed must not
     // move backwards.
     const HRESULT hr = fence->Signal(test.signal);
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
       EXPECT_GE(fence->GetCompletedValue(), test.initial);
-    else
+    } else {
       EXPECT_EQ(fence->GetCompletedValue(), test.initial);
+    }
   } else {
     ASSERT_EQ(fence->Signal(test.signal), S_OK);
     EXPECT_EQ(fence->GetCompletedValue(), test.signal);
@@ -93,9 +94,9 @@ TEST_P(FenceValueMatrixSpec, SetEventOnCompletionMatchesCompletedValue) {
   const UINT64 wait_value =
       test.initial > 0 ? test.initial : (test.signal > 0 ? test.signal : 0);
   ASSERT_EQ(fence->SetEventOnCompletion(wait_value, event), S_OK);
-  if (fence->GetCompletedValue() >= wait_value)
+  if (fence->GetCompletedValue() >= wait_value) {
     EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
-  else {
+  } else {
     EXPECT_EQ(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
     if (test.signal >= wait_value) {
       ASSERT_EQ(fence->Signal(test.signal), S_OK);

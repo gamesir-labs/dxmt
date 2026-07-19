@@ -82,10 +82,11 @@ TEST_P(DescriptorHeapSizeMatrixSpec, CreateMatchesExpectationAndDesc) {
   EXPECT_EQ(actual.NumDescriptors, test.count);
   EXPECT_EQ(actual.Flags, test.flags);
   EXPECT_NE(heap->GetCPUDescriptorHandleForHeapStart().ptr, 0u);
-  if (test.flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+  if (test.flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
     EXPECT_NE(heap->GetGPUDescriptorHandleForHeapStart().ptr, 0u);
-  else
+  } else {
     EXPECT_EQ(heap->GetGPUDescriptorHandleForHeapStart().ptr, 0u);
+  }
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

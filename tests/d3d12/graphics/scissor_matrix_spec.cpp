@@ -126,12 +126,15 @@ TEST_P(ScissorMatrixSpec, RestrictsDrawCoverageToScissorRect) {
                 sizeof(pixel));
     return pixel & 0x00ffffffu;
   };
-  if (cx >= 0 && cy >= 0 && cx < 64 && cy < 64)
+  if (cx >= 0 && cy >= 0 && cx < 64 && cy < 64) {
     EXPECT_NE(read(cx, cy), 0u) << "center inside scissor";
-  if (test.left > 0)
+  }
+  if (test.left > 0) {
     EXPECT_EQ(read(test.left - 1, cy), 0u) << "left outside";
-  if (test.top > 0)
+  }
+  if (test.top > 0) {
     EXPECT_EQ(read(cx, test.top - 1), 0u) << "top outside";
+  }
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
