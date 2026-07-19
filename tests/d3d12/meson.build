@@ -31,6 +31,7 @@ d3d12_unit_suites = {
     'sources': files(
       'object/com_identity_spec.cpp',
       'object/private_data_spec.cpp',
+      'object/private_data_matrix_spec.cpp',
       'object/shared_handle_spec.cpp',
     ),
   },
@@ -108,6 +109,7 @@ d3d12_unit_suites = {
       'graphics/render_pass_validation_spec.cpp',
       'graphics/viewport_scissor_spec.cpp',
       'graphics/viewport_matrix_spec.cpp',
+      'graphics/scissor_matrix_spec.cpp',
     ),
   },
   'integration': {
