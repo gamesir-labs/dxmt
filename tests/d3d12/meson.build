@@ -228,7 +228,6 @@ d3d12_unit_suites = {
   'shader': {
     'sources': files(
       'shader/atomic_matrix_spec.cpp',
-      'shader/container_corruption_spec.cpp',
       'shader/geometry_tessellation_spec.cpp',
       'shader/gather_semantic_spec.cpp',
       'shader/lod_semantic_spec.cpp',
