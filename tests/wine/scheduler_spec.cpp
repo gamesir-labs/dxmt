@@ -363,6 +363,25 @@ TEST(TestSchedulerPlan, SplitsFiltersBeforeTheWindowsCommandLineLimit) {
   EXPECT_EQ(shards[0].estimated_cost + shards[1].estimated_cost, 10u);
 }
 
+TEST(TestSchedulerPlan, KeepsLargeSuitesBatchedByDefault) {
+  std::vector<dxmt::test::ScheduledTest> tests;
+  tests.reserve(1800);
+  for (std::size_t index = 0; index < 1800; ++index) {
+    tests.push_back({"LargeSuite.Case" + std::to_string(index),
+                     dxmt::test::kNormalTestCost});
+  }
+
+  const auto shards = dxmt::test::BuildTestShards(std::move(tests), 16);
+
+  ASSERT_EQ(shards.size(), 16u);
+  std::size_t scheduled_test_count = 0;
+  for (const auto &shard : shards) {
+    EXPECT_GT(shard.tests.size(), 1u);
+    scheduled_test_count += shard.tests.size();
+  }
+  EXPECT_EQ(scheduled_test_count, 1800u);
+}
+
 TEST(TestSchedulerWorker, PropagatesConditionalFailure) {
   if (std::getenv("DXMT_TEST_INJECT_SCHEDULER_FAILURE") != nullptr) {
     ++conditional_failure_count;
