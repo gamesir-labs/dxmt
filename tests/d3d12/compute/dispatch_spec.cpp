@@ -18,6 +18,7 @@ using dxmt::test::GroupSharedComputeShader;
 
 struct OutputResources {
   ComPtr<ID3D12Resource> buffer;
+  ComPtr<ID3D12Resource> upload;
   ComPtr<ID3D12DescriptorHeap> heap;
 };
 
@@ -76,24 +77,24 @@ protected:
 
   OutputResources CreateOutput(const std::vector<UINT> &initial) {
     const UINT word_count = static_cast<UINT>(initial.size());
-    auto upload = context_.CreateUploadBuffer(
+    OutputResources resources;
+    resources.upload = context_.CreateUploadBuffer(
         word_count * sizeof(UINT), initial.data(),
         initial.size() * sizeof(UINT));
-    OutputResources resources;
     resources.buffer = context_.CreateBuffer(
         word_count * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_DEST);
     resources.heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
-    EXPECT_TRUE(upload);
+    EXPECT_TRUE(resources.upload);
     EXPECT_TRUE(resources.buffer);
     EXPECT_TRUE(resources.heap);
-    if (!upload || !resources.buffer || !resources.heap)
+    if (!resources.upload || !resources.buffer || !resources.heap)
       return resources;
 
     context_.list()->CopyBufferRegion(
-        resources.buffer.get(), 0, upload.get(), 0,
+        resources.buffer.get(), 0, resources.upload.get(), 0,
         word_count * sizeof(UINT));
     D3D12TestContext::Transition(
         context_.list(), resources.buffer.get(),
