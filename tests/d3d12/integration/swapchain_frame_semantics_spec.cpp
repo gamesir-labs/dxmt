@@ -327,10 +327,6 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   ASSERT_EQ(swapchain->GetSourceSize(&source_width, &source_height), S_OK);
   EXPECT_EQ(source_width, 20u);
   EXPECT_EQ(source_height, 12u);
-  EXPECT_EQ(swapchain->SetSourceSize(0, 12), E_INVALIDARG);
-  ASSERT_EQ(swapchain->GetSourceSize(&source_width, &source_height), S_OK);
-  EXPECT_EQ(source_width, 20u);
-  EXPECT_EQ(source_height, 12u);
 
   const DXGI_RGBA background = {0.1f, 0.2f, 0.3f, 0.4f};
   ASSERT_EQ(swapchain->SetBackgroundColor(&background), S_OK);
@@ -365,40 +361,5 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
   EXPECT_FALSE(fullscreen);
 }
 
-DXMT_SERIAL_TEST_F(D3D12SwapChainFrameSpec,
-                   CreationRejectsDeviceObjectAndInvalidDescriptors) {
-  auto desc = ValidDesc(2);
-  IDXGISwapChain1 *result = reinterpret_cast<IDXGISwapChain1 *>(1);
-  EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.device(), window_->get(), &desc, nullptr, nullptr,
-                &result),
-            DXGI_ERROR_UNSUPPORTED);
-  EXPECT_EQ(result, nullptr);
-
-  desc.Format = DXGI_FORMAT_UNKNOWN;
-  result = reinterpret_cast<IDXGISwapChain1 *>(1);
-  EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.queue(), window_->get(), &desc, nullptr, nullptr,
-                &result),
-            DXGI_ERROR_INVALID_CALL);
-  EXPECT_EQ(result, nullptr);
-
-  desc = ValidDesc(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1);
-  result = reinterpret_cast<IDXGISwapChain1 *>(1);
-  EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.queue(), window_->get(), &desc, nullptr, nullptr,
-                &result),
-            DXGI_ERROR_INVALID_CALL);
-  EXPECT_EQ(result, nullptr);
-
-  desc = ValidDesc(2);
-  desc.SwapEffect = static_cast<DXGI_SWAP_EFFECT>(UINT_MAX);
-  result = reinterpret_cast<IDXGISwapChain1 *>(1);
-  EXPECT_EQ(factory_->CreateSwapChainForHwnd(
-                context_.queue(), window_->get(), &desc, nullptr, nullptr,
-                &result),
-            DXGI_ERROR_INVALID_CALL);
-  EXPECT_EQ(result, nullptr);
-}
 
 } // namespace

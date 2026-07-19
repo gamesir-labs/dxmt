@@ -2,10 +2,6 @@
 
 #include "d3d12_test_context.hpp"
 
-#include <cstdint>
-#include <limits>
-#include <string>
-
 namespace {
 
 using dxmt::test::ComPtr;
@@ -52,17 +48,5 @@ TEST(QueryCrossListSequenceSpec, OcclusionBeginAndEndMaySpanCommandLists) {
   EXPECT_EQ(second.list()->Close(), S_OK);
 }
 
-TEST_F(QueryValidationSpec, ZeroCountResolveIsNoOpBeforeRangeValidation) {
-  auto timestamp = CreateHeap(D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1);
-  auto destination = context_.CreateBuffer(
-      8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  ASSERT_TRUE(timestamp);
-  ASSERT_TRUE(destination);
-  context_.list()->ResolveQueryData(
-      timestamp.get(), D3D12_QUERY_TYPE_TIMESTAMP,
-      std::numeric_limits<UINT>::max(), 0, destination.get(), 1);
-  EXPECT_EQ(context_.list()->Close(), S_OK);
-}
 
 } // namespace

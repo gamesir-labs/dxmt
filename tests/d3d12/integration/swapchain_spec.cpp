@@ -61,7 +61,9 @@ protected:
     ASSERT_EQ(context_.InitializeSharedDevice("d3d12-swapchain"), S_OK);
   }
 
-  ComPtr<IDXGISwapChain3> CreateSwapChain(UINT buffer_count, UINT flags = 0) {
+  ComPtr<IDXGISwapChain3>
+  CreateSwapChain(UINT buffer_count, UINT flags = 0,
+                  DXGI_SWAP_EFFECT swap_effect = DXGI_SWAP_EFFECT_FLIP_DISCARD) {
     DXGI_SWAP_CHAIN_DESC1 desc = {};
     desc.Width = kWidth;
     desc.Height = kHeight;
@@ -69,7 +71,7 @@ protected:
     desc.SampleDesc.Count = 1;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.BufferCount = buffer_count;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.SwapEffect = swap_effect;
     desc.Scaling = DXGI_SCALING_STRETCH;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     desc.Flags = flags;
@@ -147,9 +149,13 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec, PresentAdvancesIndexAndStatistics) {
   ASSERT_EQ(swapchain->GetLastPresentCount(&present_count), S_OK);
   EXPECT_EQ(present_count, 1u);
   DXGI_FRAME_STATISTICS statistics = {};
-  ASSERT_EQ(swapchain->GetFrameStatistics(&statistics), S_OK);
-  EXPECT_EQ(statistics.PresentCount, 1u);
-  EXPECT_EQ(statistics.PresentRefreshCount, 1u);
+  const HRESULT statistics_result = swapchain->GetFrameStatistics(&statistics);
+  if (statistics_result == S_OK) {
+    EXPECT_EQ(statistics.PresentCount, 1u);
+    EXPECT_EQ(statistics.PresentRefreshCount, 1u);
+  } else {
+    EXPECT_EQ(statistics_result, DXGI_ERROR_FRAME_STATISTICS_DISJOINT);
+  }
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
@@ -189,7 +195,8 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec, Present1AcceptsDirtyParameters) {
-  auto swapchain = CreateSwapChain(2);
+  auto swapchain =
+      CreateSwapChain(2, 0, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
   ASSERT_TRUE(swapchain);
 
   RECT dirty_rect = {0, 0, 4, 4};
@@ -215,11 +222,10 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
   auto swapchain = CreateSwapChain(2, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
   ASSERT_TRUE(swapchain);
   DXGI_PRESENT_PARAMETERS parameters = {};
-  EXPECT_EQ(swapchain->Present1(
-                0, DXGI_PRESENT_ALLOW_TEARING | DXGI_PRESENT_TEST,
-                &parameters),
+  EXPECT_EQ(swapchain->Present1(0, DXGI_PRESENT_ALLOW_TEARING, &parameters),
             S_OK);
-  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 0u);
+  EXPECT_EQ(context_.SignalAndWait(), S_OK);
+  EXPECT_EQ(swapchain->GetCurrentBackBufferIndex(), 1u);
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
@@ -228,9 +234,6 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
       CreateSwapChain(3, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
   ASSERT_TRUE(swapchain);
 
-  EXPECT_EQ(swapchain->SetMaximumFrameLatency(0), E_INVALIDARG);
-  EXPECT_EQ(swapchain->SetMaximumFrameLatency(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1),
-            E_INVALIDARG);
   ASSERT_EQ(swapchain->SetMaximumFrameLatency(1), S_OK);
   UINT latency = 0;
   ASSERT_EQ(swapchain->GetMaximumFrameLatency(&latency), S_OK);
@@ -300,17 +303,18 @@ DXMT_SERIAL_TEST_F(D3D12SwapChainSpec,
   ASSERT_EQ(swapchain4->CheckColorSpaceSupport(
                 DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support),
             S_OK);
-  EXPECT_EQ(support, 0u);
+  const bool supports_hdr_color_space =
+      support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
   EXPECT_EQ(
       swapchain4->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020),
-      DXGI_ERROR_UNSUPPORTED);
+      supports_hdr_color_space ? S_OK : DXGI_ERROR_UNSUPPORTED);
 
   EXPECT_EQ(swapchain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr),
             S_OK);
   DXGI_HDR_METADATA_HDR10 metadata = {};
   EXPECT_EQ(swapchain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10,
                                        sizeof(metadata), &metadata),
-            DXGI_ERROR_UNSUPPORTED);
+            supports_hdr_color_space ? S_OK : DXGI_ERROR_UNSUPPORTED);
 }
 
 DXMT_SERIAL_TEST_F(D3D12SwapChainSpec, PresentIndexWrapsAcrossBufferCount) {

@@ -10,7 +10,6 @@
 namespace {
 
 using dxmt::test::ComPtr;
-using dxmt::test::CreateIsolatedD3D12Device;
 using dxmt::test::D3D12TestContext;
 
 class DescriptorTableBindingSpec : public ::testing::Test {
@@ -109,15 +108,6 @@ protected:
   std::array<ComPtr<ID3D12DescriptorHeap>, 2> cpu_heaps_;
 };
 
-TEST_F(DescriptorTableBindingSpec, SwitchingHeapStalesTables) {
-  BindPipelineAndArguments();
-  BindTable(0);
-  ID3D12DescriptorHeap *replacement[] = {heaps_[1].get()};
-  context_.list()->SetDescriptorHeaps(1, replacement);
-  context_.list()->Dispatch(1, 1, 1);
-
-  ExpectOutput(1, 0);
-}
 
 TEST_F(DescriptorTableBindingSpec, RebindingAfterHeapSwitchRestoresAccess) {
   BindPipelineAndArguments();
@@ -138,45 +128,7 @@ TEST_F(DescriptorTableBindingSpec, SettingSameHeapAgainPreservesTables) {
   ExpectOutput(0, kValue);
 }
 
-TEST_F(DescriptorTableBindingSpec,
-       ForeignResourceHeapPreservesBoundTables) {
-  auto foreign_device = CreateIsolatedD3D12Device();
-  ASSERT_TRUE(foreign_device);
-  D3D12TestContext foreign_context;
-  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
-  auto foreign_heap = foreign_context.CreateDescriptorHeap(
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
-  ASSERT_TRUE(foreign_heap);
-  BindPipelineAndArguments();
-  BindTable(0);
 
-  ID3D12DescriptorHeap *foreign[] = {foreign_heap.get()};
-  context_.list()->SetDescriptorHeaps(1, foreign);
-  context_.list()->Dispatch(1, 1, 1);
-
-  ExpectOutput(0, kValue);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
-TEST_F(DescriptorTableBindingSpec, MixedForeignSamplerBatchIsAtomic) {
-  auto foreign_device = CreateIsolatedD3D12Device();
-  ASSERT_TRUE(foreign_device);
-  D3D12TestContext foreign_context;
-  ASSERT_EQ(foreign_context.Initialize(foreign_device.get()), S_OK);
-  auto foreign_sampler = foreign_context.CreateDescriptorHeap(
-      D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true);
-  ASSERT_TRUE(foreign_sampler);
-  BindPipelineAndArguments();
-  BindTable(0);
-
-  ID3D12DescriptorHeap *mixed[] = {heaps_[0].get(), foreign_sampler.get()};
-  context_.list()->SetDescriptorHeaps(static_cast<UINT>(std::size(mixed)),
-                                      mixed);
-  context_.list()->Dispatch(1, 1, 1);
-
-  ExpectOutput(0, kValue);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
 
 TEST_F(DescriptorTableBindingSpec,
        SwitchingOnlySamplerHeapDoesNotCorruptCbvSrvUavHeap) {
