@@ -854,6 +854,20 @@ public:
         placed_buffer_(placed_buffer),
         placed_buffer_allocation_(placed_buffer_allocation),
         placement_heap_(placement_heap) {
+    if (!heap_properties_.CreationNodeMask)
+      heap_properties_.CreationNodeMask = 1;
+    if (!heap_properties_.VisibleNodeMask)
+      heap_properties_.VisibleNodeMask = 1;
+    if (kind_ == ResourceKind::Committed) {
+      if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        heap_flags_ |= D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+      } else if (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+        heap_flags_ |= D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+      } else {
+        heap_flags_ |= D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+      }
+    }
     if (!desc_.Alignment)
       desc_.Alignment = GetDefaultResourceAlignment(desc_);
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !desc_.MipLevels)
@@ -1079,6 +1093,8 @@ public:
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
         !buffer_allocation_)
       return 0;
+    if (gpu_virtual_address_)
+      return gpu_virtual_address_;
     return buffer_allocation_->gpuAddress() + buffer_backing_offset_;
   }
 
@@ -1884,11 +1900,18 @@ private:
              " heapFlags=", heap_flags_);
       }
     } else {
-      buffer_ = new dxmt::Buffer(desc_.Width + heap_offset_,
+      const UINT64 alignment_slack =
+          kind_ == ResourceKind::Committed ? desc_.Alignment - 1 : 0;
+      buffer_ = new dxmt::Buffer(desc_.Width + heap_offset_ + alignment_slack,
                                  device_->GetDXMTDevice().device());
       buffer_allocation_ =
           buffer_->allocate(GetHeapBufferAllocationFlags(heap_properties_));
       buffer_->rename(Rc<dxmt::BufferAllocation>(buffer_allocation_));
+      if (kind_ == ResourceKind::Committed && buffer_allocation_) {
+        const UINT64 gpu_address = buffer_allocation_->gpuAddress();
+        gpu_virtual_address_ =
+            (gpu_address + desc_.Alignment - 1) & ~(desc_.Alignment - 1);
+      }
     }
     RegisterBufferGpuVirtualAddress(this, GetGpuVirtualAddress(), desc_.Width);
   }
@@ -2463,6 +2486,7 @@ private:
   D3D12_RESOURCE_STATES initial_state_ = D3D12_RESOURCE_STATE_COMMON;
   UINT64 heap_offset_ = 0;
   UINT64 buffer_backing_offset_ = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS gpu_virtual_address_ = 0;
   ResourceKind kind_ = ResourceKind::Committed;
   Rc<dxmt::Buffer> placed_buffer_;
   Rc<dxmt::BufferAllocation> placed_buffer_allocation_;

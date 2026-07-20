@@ -6294,10 +6294,7 @@ private:
     if (heap_offset % placement_alignment)
       return "heap-offset-alignment";
     const auto &heap_desc = heap.GetHeapDesc();
-    const UINT64 heap_alignment = heap_desc.Alignment
-                                       ? heap_desc.Alignment
-                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-    const UINT64 heap_size = Align(heap_desc.SizeInBytes, heap_alignment);
+    const UINT64 heap_size = heap_desc.SizeInBytes;
     if (heap_offset > heap_size ||
         allocation_info.SizeInBytes > heap_size - heap_offset)
       return "heap-range";
