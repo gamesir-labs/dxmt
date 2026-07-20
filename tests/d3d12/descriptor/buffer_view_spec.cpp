@@ -37,13 +37,13 @@ protected:
           void main() { output[0] = input[2]; }
         )",
         R"(
-          ByteAddressBuffer input : register(t1);
+          ByteAddressBuffer input : register(t0);
           RWBuffer<uint> output : register(u0);
           [numthreads(1, 1, 1)]
-          void main() { output[1] = input.Load(4); }
+          void main() { output[1] = input.Load(0); }
         )",
         R"(
-          StructuredBuffer<uint> input : register(t2);
+          StructuredBuffer<uint> input : register(t0);
           RWBuffer<uint> output : register(u0);
           [numthreads(1, 1, 1)]
           void main() { output[2] = input[1]; }
@@ -55,13 +55,13 @@ protected:
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 3;
+    ranges[0].NumDescriptors = 1;
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 1;
     ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 3;
+    ranges[1].OffsetInDescriptorsFromTableStart = 1;
     D3D12_ROOT_PARAMETER parameter = {};
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameter.DescriptorTable.NumDescriptorRanges = 2;
@@ -101,8 +101,7 @@ protected:
     }
     context_.device()->CreateShaderResourceView(
         input, &srv,
-        context_.CpuDescriptorHandle(heap,
-                                     base + static_cast<UINT>(view_index)));
+        context_.CpuDescriptorHandle(heap, base));
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -111,7 +110,7 @@ protected:
     uav.Buffer.NumElements = 3;
     context_.device()->CreateUnorderedAccessView(
         output, nullptr, &uav,
-        context_.CpuDescriptorHandle(heap, base + 3));
+        context_.CpuDescriptorHandle(heap, base + 1));
   }
 
   void RunCase() {
@@ -135,7 +134,7 @@ protected:
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_DEST);
     auto gpu_heap = context_.CreateDescriptorHeap(
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6, true);
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, true);
     ASSERT_TRUE(input_upload);
     ASSERT_TRUE(output_upload);
     ASSERT_TRUE(input);
@@ -161,19 +160,17 @@ protected:
 
     if (publication == DescriptorPublication::Copied) {
       auto cpu_heap = context_.CreateDescriptorHeap(
-          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, false);
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, false);
       ASSERT_TRUE(cpu_heap);
       WriteViews(cpu_heap.get(), 0, input.get(), output.get(), view_index);
       context_.device()->CopyDescriptorsSimple(
           1,
-          context_.CpuDescriptorHandle(
-              gpu_heap.get(), kTableBase + static_cast<UINT>(view_index)),
-          context_.CpuDescriptorHandle(cpu_heap.get(),
-                                       static_cast<UINT>(view_index)),
+          context_.CpuDescriptorHandle(gpu_heap.get(), kTableBase),
+          context_.CpuDescriptorHandle(cpu_heap.get(), 0),
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
       context_.device()->CopyDescriptorsSimple(
-          1, context_.CpuDescriptorHandle(gpu_heap.get(), kTableBase + 3),
-          context_.CpuDescriptorHandle(cpu_heap.get(), 3),
+          1, context_.CpuDescriptorHandle(gpu_heap.get(), kTableBase + 1),
+          context_.CpuDescriptorHandle(cpu_heap.get(), 1),
           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else {
       WriteViews(gpu_heap.get(), kTableBase, input.get(), output.get(),
@@ -211,7 +208,7 @@ protected:
     std::array<UINT, kDwordCount> actual = {};
     std::memcpy(actual.data(), output_bytes.data(), output_bytes.size());
     std::array<UINT, kDwordCount> expected = {};
-    constexpr std::array input_indices = {3u, 6u, 11u};
+    constexpr std::array input_indices = {3u, 5u, 11u};
     expected[view_index] = input_data[input_indices[view_index]];
     EXPECT_EQ(actual, expected);
   }
