@@ -24,6 +24,7 @@ d3d11_unit_sources = files(
   'raw_uav_atomic_spec.cpp',
   'shader_atomic_matrix_spec.cpp',
   'texture_dimension_matrix_spec.cpp',
+  'texture_sampling_ops_spec.cpp',
   'uav_counter_shader_spec.cpp',
 )
 d3d11_unit_dependencies = [d3d11_test_dep, dxgi_test_dep, d3dcompiler_test_dep]
