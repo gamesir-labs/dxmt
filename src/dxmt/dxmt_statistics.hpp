@@ -43,6 +43,13 @@ enum class CompiledFallbackReason : uint32_t {
   Residency,
   NativeUnsupportedRootSignature,
   NativeUnsupportedDescriptorRange,
+  NativeDescriptorNullBase,
+  NativeDescriptorMixedHeap,
+  NativeDescriptorNoRange,
+  NativeDescriptorInvalidHandle,
+  NativeDescriptorHeapTail,
+  NativeDescriptorAmbiguousRange,
+  NativeDescriptorBackendGeneration,
   NativeUnsupportedRootDescriptor,
   NativeUnsupportedGeometryPipeline,
   NativeUnsupportedTessellationPipeline,
@@ -318,6 +325,7 @@ struct FrameStatistics {
   clock::duration frame_execute_enqueue_interval{};
   clock::duration frame_execute_drain_interval{};
   clock::duration frame_execute_drain_lock_interval{};
+  clock::duration frame_execute_resource_state_lock_hold_interval{};
   clock::duration frame_execute_replay_interval{};
   clock::duration frame_execute_decay_interval{};
   clock::duration frame_execute_signal_interval{};
@@ -651,6 +659,7 @@ struct FrameStatistics {
     frame_execute_enqueue_interval = {};
     frame_execute_drain_interval = {};
     frame_execute_drain_lock_interval = {};
+    frame_execute_resource_state_lock_hold_interval = {};
     frame_execute_replay_interval = {};
     frame_execute_decay_interval = {};
     frame_execute_signal_interval = {};
@@ -1059,6 +1068,8 @@ public:
       average_.frame_execute_enqueue_interval += frames_[i].frame_execute_enqueue_interval;
       average_.frame_execute_drain_interval += frames_[i].frame_execute_drain_interval;
       average_.frame_execute_drain_lock_interval += frames_[i].frame_execute_drain_lock_interval;
+      average_.frame_execute_resource_state_lock_hold_interval +=
+          frames_[i].frame_execute_resource_state_lock_hold_interval;
       average_.frame_execute_replay_interval += frames_[i].frame_execute_replay_interval;
       average_.frame_execute_decay_interval += frames_[i].frame_execute_decay_interval;
       average_.frame_execute_signal_interval += frames_[i].frame_execute_signal_interval;
@@ -1393,6 +1404,8 @@ public:
     average_.frame_execute_enqueue_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_drain_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_drain_lock_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_execute_resource_state_lock_hold_interval /=
+        (kFrameStatisticsCount - 1);
     average_.frame_execute_replay_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_decay_interval /= (kFrameStatisticsCount - 1);
     average_.frame_execute_signal_interval /= (kFrameStatisticsCount - 1);

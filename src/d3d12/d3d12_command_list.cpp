@@ -87,6 +87,20 @@ const char *CompiledCommandFallbackReasonName(
     return "native_unsupported_root_signature";
   case CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange:
     return "native_unsupported_descriptor_range";
+  case CompiledCommandFallbackReason::NativeDescriptorNullBase:
+    return "native_descriptor_null_base";
+  case CompiledCommandFallbackReason::NativeDescriptorMixedHeap:
+    return "native_descriptor_mixed_heap";
+  case CompiledCommandFallbackReason::NativeDescriptorNoRange:
+    return "native_descriptor_no_range";
+  case CompiledCommandFallbackReason::NativeDescriptorInvalidHandle:
+    return "native_descriptor_invalid_handle";
+  case CompiledCommandFallbackReason::NativeDescriptorHeapTail:
+    return "native_descriptor_heap_tail";
+  case CompiledCommandFallbackReason::NativeDescriptorAmbiguousRange:
+    return "native_descriptor_ambiguous_range";
+  case CompiledCommandFallbackReason::NativeDescriptorBackendGeneration:
+    return "native_descriptor_backend_generation";
   case CompiledCommandFallbackReason::NativeUnsupportedRootDescriptor:
     return "native_unsupported_root_descriptor";
   case CompiledCommandFallbackReason::NativeUnsupportedGeometryPipeline:
@@ -146,6 +160,20 @@ CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason) {
     return dxmt::CompiledFallbackReason::NativeUnsupportedRootSignature;
   case CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange:
     return dxmt::CompiledFallbackReason::NativeUnsupportedDescriptorRange;
+  case CompiledCommandFallbackReason::NativeDescriptorNullBase:
+    return dxmt::CompiledFallbackReason::NativeDescriptorNullBase;
+  case CompiledCommandFallbackReason::NativeDescriptorMixedHeap:
+    return dxmt::CompiledFallbackReason::NativeDescriptorMixedHeap;
+  case CompiledCommandFallbackReason::NativeDescriptorNoRange:
+    return dxmt::CompiledFallbackReason::NativeDescriptorNoRange;
+  case CompiledCommandFallbackReason::NativeDescriptorInvalidHandle:
+    return dxmt::CompiledFallbackReason::NativeDescriptorInvalidHandle;
+  case CompiledCommandFallbackReason::NativeDescriptorHeapTail:
+    return dxmt::CompiledFallbackReason::NativeDescriptorHeapTail;
+  case CompiledCommandFallbackReason::NativeDescriptorAmbiguousRange:
+    return dxmt::CompiledFallbackReason::NativeDescriptorAmbiguousRange;
+  case CompiledCommandFallbackReason::NativeDescriptorBackendGeneration:
+    return dxmt::CompiledFallbackReason::NativeDescriptorBackendGeneration;
   case CompiledCommandFallbackReason::NativeUnsupportedRootDescriptor:
     return dxmt::CompiledFallbackReason::NativeUnsupportedRootDescriptor;
   case CompiledCommandFallbackReason::NativeUnsupportedGeometryPipeline:
@@ -480,10 +508,6 @@ struct CompiledCommandBuildState {
   std::vector<CompiledCommandRootDescriptor> graphics_root_descriptors;
   std::optional<CompiledCommandPipelineMetadata> compute_pipeline_metadata;
   std::optional<CompiledCommandPipelineMetadata> graphics_pipeline_metadata;
-  std::optional<CompiledCommandFallbackReason>
-      compute_root_table_materialization;
-  std::optional<CompiledCommandFallbackReason>
-      graphics_root_table_materialization;
   std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>,
              D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT>
       vertex_buffers;
@@ -546,26 +570,29 @@ static bool
 CompiledRootParameterHasDescriptorRanges(
     const RootSignatureParameter &parameter,
     D3D12_DESCRIPTOR_HEAP_TYPE heap_type,
-    UINT *descriptor_count) {
+    UINT *descriptor_count, bool *has_unbounded_range) {
   if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
     return false;
 
   bool has_matching_range = false;
   UINT running_offset = 0;
   UINT max_descriptor_count = 0;
+  bool unbounded = false;
   for (const auto &range : parameter.ranges) {
     const auto range_heap_type =
         CompiledDescriptorHeapTypeForRange(range.range_type);
     const auto range_offset =
         CompiledDescriptorRangeOffset(range, running_offset);
     if (range_heap_type == heap_type) {
-      if (range.descriptor_count == UINT_MAX)
-        return false;
-      if (range_offset + range.descriptor_count < range_offset)
-        return false;
-      max_descriptor_count =
-          std::max(max_descriptor_count, range_offset + range.descriptor_count);
       has_matching_range = true;
+      if (range.descriptor_count == UINT_MAX) {
+        unbounded = true;
+      } else {
+        if (range_offset + range.descriptor_count < range_offset)
+          return false;
+        max_descriptor_count = std::max(
+            max_descriptor_count, range_offset + range.descriptor_count);
+      }
     }
     if (range.descriptor_count != UINT_MAX)
       running_offset = range_offset + range.descriptor_count;
@@ -573,6 +600,8 @@ CompiledRootParameterHasDescriptorRanges(
 
   if (descriptor_count)
     *descriptor_count = max_descriptor_count;
+  if (has_unbounded_range)
+    *has_unbounded_range = unbounded;
   return has_matching_range;
 }
 
@@ -653,10 +682,15 @@ BuildCompiledPipelineMetadata(const CompiledCommandBuildState &state,
 
   metadata.type = pipeline->GetType();
   metadata.shader_abi_version = pipeline->GetShaderAbiVersion();
+  // The shader ABI is selected when the PSO is created, against the PSO's
+  // root signature. A command list may bind a distinct but compatible root
+  // signature object; re-running ABI eligibility against that object's
+  // identity/layout can incorrectly demote a PSO whose native artifact is
+  // already valid. Packet materialization below still validates the live
+  // command-list root table layout and handles before encoding.
   metadata.native_eligibility_reason = GetNativeShaderAbiEligibility(
       pipeline->GetDxilShaders(),
-      GetDXMTRootSignature(
-          ResolveCompiledRootSignature(state, compute)));
+      GetDXMTRootSignature(pipeline->GetRootSignature()));
   metadata.uses_bindless_mirror_abi =
       metadata.shader_abi_version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
   metadata.uses_native_descriptor_table_abi =
@@ -734,8 +768,6 @@ SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
   state.descriptor_heaps = std::move(next);
   state.compute_root_tables.clear();
   state.graphics_root_tables.clear();
-  state.compute_root_table_materialization.reset();
-  state.graphics_root_table_materialization.reset();
 }
 
 static bool
@@ -826,25 +858,18 @@ UpdateCompiledCommandBuildState(CompiledCommandBuildState &state,
       state.compute_root_constants.clear();
       state.compute_root_descriptors.clear();
       state.compute_pipeline_metadata.reset();
-      state.compute_root_table_materialization.reset();
     } else {
       state.graphics_root_signature = record->root_signature;
       state.graphics_root_tables.clear();
       state.graphics_root_constants.clear();
       state.graphics_root_descriptors.clear();
       state.graphics_pipeline_metadata.reset();
-      state.graphics_root_table_materialization.reset();
     }
   } else if (const auto *record =
                  std::get_if<RootDescriptorTableRecord>(&payload)) {
     auto &tables = record->compute ? state.compute_root_tables
                                    : state.graphics_root_tables;
-    if (UpsertCompiledRootDescriptorTable(tables, *record)) {
-      if (record->compute)
-        state.compute_root_table_materialization.reset();
-      else
-        state.graphics_root_table_materialization.reset();
-    }
+    UpsertCompiledRootDescriptorTable(tables, *record);
   } else if (const auto *record =
                  std::get_if<RootConstantsRecord>(&payload)) {
     auto &constants = record->compute ? state.compute_root_constants
@@ -941,25 +966,31 @@ MaterializeCompiledRootDescriptorTable(
     const CompiledCommandDescriptorHeaps &heaps,
     const RootSignatureParameter &parameter) {
   if (!table.base_descriptor.ptr)
-    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+    return CompiledCommandFallbackReason::NativeDescriptorNullBase;
 
   D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
   UINT descriptor_count = 0;
+  bool has_unbounded_resource_range = false;
   const bool has_resource_ranges = CompiledRootParameterHasDescriptorRanges(
-      parameter, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, &descriptor_count);
+      parameter, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, &descriptor_count,
+      &has_unbounded_resource_range);
   UINT sampler_descriptor_count = 0;
+  bool has_unbounded_sampler_range = false;
   const bool has_sampler_ranges = CompiledRootParameterHasDescriptorRanges(
       parameter, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-      &sampler_descriptor_count);
+      &sampler_descriptor_count, &has_unbounded_sampler_range);
   if (has_resource_ranges && has_sampler_ranges)
-    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+    return CompiledCommandFallbackReason::NativeDescriptorMixedHeap;
+  bool has_unbounded_range = false;
   if (has_resource_ranges) {
     heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    has_unbounded_range = has_unbounded_resource_range;
   } else if (has_sampler_ranges) {
     heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     descriptor_count = sampler_descriptor_count;
+    has_unbounded_range = has_unbounded_sampler_range;
   } else {
-    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+    return CompiledCommandFallbackReason::NativeDescriptorNoRange;
   }
 
   auto *heap = GetCompiledDescriptorHeap(heaps, heap_type);
@@ -975,9 +1006,16 @@ MaterializeCompiledRootDescriptorTable(
 
   const auto *base = heap->GetDescriptorRecord(table.base_descriptor);
   if (!base || !base->shader_visible || base->heap_type != heap_type)
-    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+    return CompiledCommandFallbackReason::NativeDescriptorInvalidHandle;
   if (base->heap_index >= base->heap_count)
-    return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+    return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
+
+  // An unbounded D3D12 range extends only as far as the currently bound heap.
+  // The native ABI consumes shader-reflected finite spans, so retaining the
+  // heap remainder here is both sufficient for validation and equivalent to
+  // the legacy replay path's bounded reflection walk.
+  if (has_unbounded_range)
+    descriptor_count = base->heap_count - base->heap_index;
 
   table.heap_type = heap_type;
   table.heap_index = base->heap_index;
@@ -1008,49 +1046,6 @@ MaterializeCompiledRootDescriptorTable(
       mirror->bufferResourceTableBuffer() &&
       mirror->bufferResourceTableGpuAddress();
   table.native_root_table_base_ready = true;
-  return CompiledCommandFallbackReason::None;
-}
-
-static CompiledCommandFallbackReason
-MaterializeCompiledRootTables(CompiledCommandBuildState &state, bool compute) {
-  // Do not cache success/failure across draws. 8a538c8a introduced an optional
-  // sticky result that (1) kept a one-time materialize failure for the rest of
-  // the command list and (2) skipped rematerialization of already-resolved
-  // tables, leaving stale mirror GPU addresses / resource-table generations.
-  // Pre-8a rematerialized every compiled packet; restore that correctness while
-  // still writing through the same state-owned table storage.
-  auto &cached = compute ? state.compute_root_table_materialization
-                         : state.graphics_root_table_materialization;
-  cached.reset();
-
-  const auto &root_signature =
-      compute ? state.compute_root_signature : state.graphics_root_signature;
-  if (!root_signature)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-
-  auto *root = GetDXMTRootSignature(root_signature.ptr());
-  if (!root)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-
-  const auto parameters = root->GetParameters();
-  auto &tables =
-      compute ? state.compute_root_tables : state.graphics_root_tables;
-  for (auto &table : tables) {
-    if (table.root_parameter_index >= parameters.size())
-      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-    const auto &parameter = parameters[table.root_parameter_index];
-    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
-
-    // Always rematerialize so mirror backend addresses and generations track
-    // the live descriptor heap, matching pre-8a packet materialization.
-    table.resolved = false;
-    const auto reason = MaterializeCompiledRootDescriptorTable(
-        table, state.descriptor_heaps, parameter);
-    if (reason != CompiledCommandFallbackReason::None)
-      return reason;
-  }
-
   return CompiledCommandFallbackReason::None;
 }
 
@@ -1192,6 +1187,32 @@ CompiledNativeRangeType(SM50BindingType type) {
   return std::nullopt;
 }
 
+static uint32_t CompiledShaderArgumentRangeCount(
+    const DXMT12_MTL4_SHADER_ARGUMENT &argument) {
+  const auto count = argument.RegisterCount ? argument.RegisterCount : 1u;
+  if (count != UINT_MAX)
+    return std::max<uint32_t>(count, 1u);
+
+  uint32_t capacity = 0;
+  switch (argument.Type) {
+  case SM50BindingType::ConstantBuffer:
+    capacity = 14;
+    break;
+  case SM50BindingType::Sampler:
+    capacity = 16;
+    break;
+  case SM50BindingType::UAV:
+    capacity = kUAVBindings;
+    break;
+  case SM50BindingType::SRV:
+    capacity = kSRVBindings;
+    break;
+  }
+  if (argument.SM50BindingSlot >= capacity)
+    return 0;
+  return capacity - argument.SM50BindingSlot;
+}
+
 static const CompiledCommandRootDescriptorTable *
 FindCompiledNativeRootTable(
     const std::vector<CompiledCommandRootDescriptorTable> &tables,
@@ -1237,10 +1258,10 @@ BuildCompiledNativeRootBasesForArguments(
     const uint32_t lower = argument.RegisterCount
                                ? argument.RegisterLowerBound
                                : argument.SM50BindingSlot;
-    const uint32_t count = argument.RegisterCount ? argument.RegisterCount : 1;
+    const uint32_t count = CompiledShaderArgumentRangeCount(argument);
     const uint32_t space = argument.RegisterCount ? argument.RegisterSpace : 0;
-    if (!count || count == UINT_MAX)
-      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+    if (!count)
+      return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
 
     uint32_t matches = 0;
     uint32_t resolved_base = 0;
@@ -1282,12 +1303,12 @@ BuildCompiledNativeRootBasesForArguments(
         if (!dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
                 table->heap_index, table->heap_count, range_offset, local,
                 count, &resolved_base))
-          return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+          return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
         matches++;
       }
     }
     if (matches != 1)
-      return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+      return CompiledCommandFallbackReason::NativeDescriptorAmbiguousRange;
     out[argument.StructurePtrOffset] = resolved_base;
   }
   return CompiledCommandFallbackReason::None;
@@ -1509,6 +1530,7 @@ AppendCompiledComputeSegment(CompiledCommandList &compiled, UINT record_index,
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                          WMT::Device device, bool force_fallback) {
+  (void)device;
   dxmt::perf::ScopedCodeTimer loop_timer(
       dxmt::PerfCodePath::CompiledBuildLoopDispatch);
   auto compiled = std::make_shared<CompiledCommandList>();
@@ -1529,8 +1551,6 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
       "DXMT_TEST_FAIL_NATIVE_SEGMENT_FINALIZATION_AT";
   const auto finalization_fault_setting =
       env::getEnvVar(finalization_fault_name);
-  NativeRootBasePayloadBuilder native_payloads;
-
   CompiledCommandBuildState state = {};
   for (UINT record_index = 0; record_index < records.size(); record_index++) {
     const auto &record = records[record_index];
@@ -1548,58 +1568,32 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                               : CompiledPipelineFallbackReasonFromMetadata(
                                     metadata, false);
       if (reason == CompiledCommandFallbackReason::None) {
-        CompiledCommandFallbackReason table_reason;
-        {
-          dxmt::perf::ScopedCodeTimer table_timer(
-              dxmt::PerfCodePath::CompiledBuildRootTableMaterialize);
-          table_reason = MaterializeCompiledRootTables(state, false);
-        }
-        if (table_reason == CompiledCommandFallbackReason::None) {
-          if (ShouldInjectCompiledCommandFault(
-                  packet_fault_setting,
-                  g_test_native_packet_allocation_occurrence)) {
-            RecordInjectedCompiledCommandFault(packet_fault_name);
-            WARN("D3D12CommandList: injected native packet allocation "
-                 "failure at graphics record ",
-                 record_index);
-            AppendCompiledFallbackSegment(
-                *compiled, record_index,
-                CompiledCommandFallbackReason::
-                    InjectedNativePacketAllocationFailure);
-          } else {
-            CompiledGraphicsPacket packet;
-            {
-              dxmt::perf::ScopedCodeTimer packet_timer(
-                  dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
-              packet = BuildCompiledGraphicsPacket(record, record_index, state,
-                                                   metadata);
-            }
-            CompiledCommandFallbackReason native_reason;
-            {
-              dxmt::perf::ScopedCodeTimer native_timer(
-                  dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
-              native_reason = BuildCompiledGraphicsNativeBindings(
-                  packet, native_payloads);
-            }
-            if (native_reason == CompiledCommandFallbackReason::None) {
-              {
-                dxmt::perf::ScopedCodeTimer append_timer(
-                    dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-                AppendCompiledGraphicsSegment(*compiled, record_index,
-                                              std::move(packet));
-              }
-              ClearCompiledInputAssemblerDirtyState(state);
-            } else {
-              dxmt::perf::ScopedCodeTimer append_timer(
-                  dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-              AppendCompiledFallbackSegment(*compiled, record_index,
-                                            native_reason);
-            }
-          }
+        if (ShouldInjectCompiledCommandFault(
+                packet_fault_setting,
+                g_test_native_packet_allocation_occurrence)) {
+          RecordInjectedCompiledCommandFault(packet_fault_name);
+          WARN("D3D12CommandList: injected native packet allocation "
+               "failure at graphics record ",
+               record_index);
+          AppendCompiledFallbackSegment(
+              *compiled, record_index,
+              CompiledCommandFallbackReason::
+                  InjectedNativePacketAllocationFailure);
         } else {
-          dxmt::perf::ScopedCodeTimer append_timer(
-              dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-          AppendCompiledFallbackSegment(*compiled, record_index, table_reason);
+          CompiledGraphicsPacket packet;
+          {
+            dxmt::perf::ScopedCodeTimer packet_timer(
+                dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+            packet = BuildCompiledGraphicsPacket(record, record_index, state,
+                                                 metadata);
+          }
+          {
+            dxmt::perf::ScopedCodeTimer append_timer(
+                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+            AppendCompiledGraphicsSegment(*compiled, record_index,
+                                          std::move(packet));
+          }
+          ClearCompiledInputAssemblerDirtyState(state);
         }
       } else {
         dxmt::perf::ScopedCodeTimer append_timer(
@@ -1619,55 +1613,31 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                               : CompiledPipelineFallbackReasonFromMetadata(
                                     metadata, true);
       if (reason == CompiledCommandFallbackReason::None) {
-        CompiledCommandFallbackReason table_reason;
-        {
-          dxmt::perf::ScopedCodeTimer table_timer(
-              dxmt::PerfCodePath::CompiledBuildRootTableMaterialize);
-          table_reason = MaterializeCompiledRootTables(state, true);
-        }
-        if (table_reason == CompiledCommandFallbackReason::None) {
-          if (ShouldInjectCompiledCommandFault(
-                  packet_fault_setting,
-                  g_test_native_packet_allocation_occurrence)) {
-            RecordInjectedCompiledCommandFault(packet_fault_name);
-            WARN("D3D12CommandList: injected native packet allocation "
-                 "failure at compute record ",
-                 record_index);
-            AppendCompiledFallbackSegment(
-                *compiled, record_index,
-                CompiledCommandFallbackReason::
-                    InjectedNativePacketAllocationFailure);
-          } else {
-            CompiledComputePacket packet;
-            {
-              dxmt::perf::ScopedCodeTimer packet_timer(
-                  dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
-              packet = BuildCompiledComputePacket(record, record_index, state,
-                                                  metadata);
-            }
-            CompiledCommandFallbackReason native_reason;
-            {
-              dxmt::perf::ScopedCodeTimer native_timer(
-                  dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
-              native_reason = BuildCompiledComputeNativeBindings(
-                  packet, native_payloads);
-            }
-            if (native_reason == CompiledCommandFallbackReason::None) {
-              dxmt::perf::ScopedCodeTimer append_timer(
-                  dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-              AppendCompiledComputeSegment(*compiled, record_index,
-                                           std::move(packet));
-            } else {
-              dxmt::perf::ScopedCodeTimer append_timer(
-                  dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-              AppendCompiledFallbackSegment(*compiled, record_index,
-                                            native_reason);
-            }
-          }
+        if (ShouldInjectCompiledCommandFault(
+                packet_fault_setting,
+                g_test_native_packet_allocation_occurrence)) {
+          RecordInjectedCompiledCommandFault(packet_fault_name);
+          WARN("D3D12CommandList: injected native packet allocation "
+               "failure at compute record ",
+               record_index);
+          AppendCompiledFallbackSegment(
+              *compiled, record_index,
+              CompiledCommandFallbackReason::
+                  InjectedNativePacketAllocationFailure);
         } else {
-          dxmt::perf::ScopedCodeTimer append_timer(
-              dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-          AppendCompiledFallbackSegment(*compiled, record_index, table_reason);
+          CompiledComputePacket packet;
+          {
+            dxmt::perf::ScopedCodeTimer packet_timer(
+                dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+            packet = BuildCompiledComputePacket(record, record_index, state,
+                                                metadata);
+          }
+          {
+            dxmt::perf::ScopedCodeTimer append_timer(
+                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+            AppendCompiledComputeSegment(*compiled, record_index,
+                                         std::move(packet));
+          }
         }
       } else {
         dxmt::perf::ScopedCodeTimer append_timer(
@@ -1703,52 +1673,110 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     WARN("D3D12CommandList: injected native segment finalization failure");
   }
 
-  const bool native_payloads_ready =
-      !injected_finalization_failure &&
-      native_payloads.Finalize(device, *compiled);
-  if (!native_payloads_ready) {
+  if (injected_finalization_failure) {
     dxmt::perf::ScopedCodeTimer fallback_timer(
         dxmt::PerfCodePath::CompiledBuildFallbackRewrite);
     for (auto &segment : compiled->segments) {
-      bool rewrite = injected_finalization_failure;
-      if (!rewrite &&
-          segment.kind == CompiledCommandSegmentKind::Graphics &&
-          segment.graphics_packet_count) {
-        rewrite = compiled
-                      ->graphics_packets[segment.first_graphics_packet]
-                      .pipeline.metadata.uses_native_descriptor_table_abi;
-      } else if (!rewrite &&
-                 segment.kind == CompiledCommandSegmentKind::Compute &&
-                 segment.compute_packet_count) {
-        rewrite = compiled
-                      ->compute_packets[segment.first_compute_packet]
-                      .pipeline.metadata.uses_native_descriptor_table_abi;
-      }
-      if (!rewrite || segment.kind == CompiledCommandSegmentKind::Fallback)
+      if (segment.kind == CompiledCommandSegmentKind::Fallback)
         continue;
       segment.kind = CompiledCommandSegmentKind::Fallback;
       segment.graphics_packet_count = 0;
       segment.compute_packet_count = 0;
-      segment.fallback_reason = injected_finalization_failure
-                                    ? CompiledCommandFallbackReason::
-                                          InjectedNativeSegmentFinalizationFailure
-                                    : CompiledCommandFallbackReason::
-                                          NativeMissingDescriptorBackend;
+      segment.fallback_reason = CompiledCommandFallbackReason::
+          InjectedNativeSegmentFinalizationFailure;
       segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(
           segment.fallback_reason);
     }
-    if (injected_finalization_failure) {
-      // Every compiled segment was rewritten above. Retaining unreachable
-      // packets would still let submission snapshot their descriptor state
-      // before fallback replay, which is precisely what this fault path must
-      // avoid.
-      compiled->graphics_packets.clear();
-      compiled->compute_packets.clear();
-      compiled->native_root_base_buffer = {};
-    }
+    // Every compiled segment was rewritten above. Retaining unreachable
+    // packets would still let submission snapshot their descriptor state
+    // before fallback replay, which is precisely what this fault path must
+    // avoid.
+    compiled->graphics_packets.clear();
+    compiled->compute_packets.clear();
+    compiled->native_root_base_buffer = {};
   }
 
   return compiled;
+}
+
+static CompiledCommandFallbackReason MaterializeSubmittedRootTables(
+    std::vector<CompiledCommandRootDescriptorTable> &tables,
+    const CompiledCommandDescriptorHeaps &heaps, RootSignature *root) {
+  if (!root)
+    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
+
+  const auto parameters = root->GetParameters();
+  for (auto &table : tables) {
+    if (table.root_parameter_index >= parameters.size())
+      return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
+    const auto &parameter = parameters[table.root_parameter_index];
+    if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+      return CompiledCommandFallbackReason::NativeDescriptorNoRange;
+
+    table.resolved = false;
+    table.owning_heap = nullptr;
+    table.mirror = nullptr;
+    const auto reason =
+        MaterializeCompiledRootDescriptorTable(table, heaps, parameter);
+    if (reason != CompiledCommandFallbackReason::None)
+      return reason;
+  }
+  return CompiledCommandFallbackReason::None;
+}
+
+void PrepareSubmittedCompiledCommandListImpl(CompiledCommandList &compiled,
+                                             WMT::Device device) {
+  NativeRootBasePayloadBuilder native_payloads;
+  compiled.native_root_base_buffer = {};
+
+  for (auto &packet : compiled.graphics_packets) {
+    packet.native_vertex = {};
+    packet.native_pixel = {};
+    auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+    auto reason = MaterializeSubmittedRootTables(
+        packet.root_tables, packet.descriptor_heaps, root);
+    if (reason == CompiledCommandFallbackReason::None)
+      reason = BuildCompiledGraphicsNativeBindings(packet, native_payloads);
+    packet.submission_prepare_reason = reason;
+    if (compiled.test_telemetry) {
+      compiled.test_telemetry->submitted_graphics_packets.fetch_add(
+          1, std::memory_order_relaxed);
+      if (reason != CompiledCommandFallbackReason::None)
+        compiled.test_telemetry->submission_prepare_failures.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+  }
+
+  for (auto &packet : compiled.compute_packets) {
+    packet.native_compute = {};
+    auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+    auto reason = MaterializeSubmittedRootTables(
+        packet.root_tables, packet.descriptor_heaps, root);
+    if (reason == CompiledCommandFallbackReason::None)
+      reason = BuildCompiledComputeNativeBindings(packet, native_payloads);
+    packet.submission_prepare_reason = reason;
+    if (compiled.test_telemetry) {
+      compiled.test_telemetry->submitted_compute_packets.fetch_add(
+          1, std::memory_order_relaxed);
+      if (reason != CompiledCommandFallbackReason::None)
+        compiled.test_telemetry->submission_prepare_failures.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+  }
+
+  if (native_payloads.Finalize(device, compiled))
+    return;
+
+  for (auto &packet : compiled.graphics_packets) {
+    if (packet.pipeline.metadata.uses_native_descriptor_table_abi)
+      packet.submission_prepare_reason =
+          CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+  }
+  for (auto &packet : compiled.compute_packets) {
+    if (packet.pipeline.metadata.uses_native_descriptor_table_abi)
+      packet.submission_prepare_reason =
+          CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+  }
 }
 
 static bool
@@ -1928,6 +1956,17 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
     stats.replayed_empty_fallback_segments =
         telemetry.replayed_empty_fallback_segments.load(
             std::memory_order_acquire);
+    stats.submitted_graphics_packets =
+        telemetry.submitted_graphics_packets.load(std::memory_order_acquire);
+    stats.submitted_compute_packets =
+        telemetry.submitted_compute_packets.load(std::memory_order_acquire);
+    stats.submission_prepare_failures =
+        telemetry.submission_prepare_failures.load(std::memory_order_acquire);
+    stats.submitted_descriptor_snapshots =
+        telemetry.submitted_descriptor_snapshots.load(
+            std::memory_order_acquire);
+    stats.submitted_descriptor_entries =
+        telemetry.submitted_descriptor_entries.load(std::memory_order_acquire);
   }
   return stats;
 }
@@ -4637,6 +4676,11 @@ private:
 };
 
 } // namespace
+
+void PrepareSubmittedCompiledCommandList(CompiledCommandList &compiled,
+                                         WMT::Device device) {
+  PrepareSubmittedCompiledCommandListImpl(compiled, device);
+}
 
 Com<ID3D12GraphicsCommandList>
 CreateGraphicsCommandList(IMTLD3D12Device *device, UINT node_mask,

@@ -328,6 +328,13 @@ enum class CompiledCommandFallbackReason {
   TemporalUpscale,
   NativeUnsupportedRootSignature,
   NativeUnsupportedDescriptorRange,
+  NativeDescriptorNullBase,
+  NativeDescriptorMixedHeap,
+  NativeDescriptorNoRange,
+  NativeDescriptorInvalidHandle,
+  NativeDescriptorHeapTail,
+  NativeDescriptorAmbiguousRange,
+  NativeDescriptorBackendGeneration,
   NativeUnsupportedRootDescriptor,
   NativeUnsupportedGeometryPipeline,
   NativeUnsupportedTessellationPipeline,
@@ -478,6 +485,8 @@ struct CompiledGraphicsPacket {
   CompiledNativeStageBinding native_pixel;
   std::optional<DrawInstancedRecord> draw;
   std::optional<DrawIndexedInstancedRecord> draw_indexed;
+  CompiledCommandFallbackReason submission_prepare_reason =
+      CompiledCommandFallbackReason::None;
 };
 
 struct CompiledComputePacket {
@@ -490,6 +499,8 @@ struct CompiledComputePacket {
   std::vector<CompiledCommandRootDescriptor> root_descriptors;
   CompiledNativeStageBinding native_compute;
   DispatchRecord dispatch;
+  CompiledCommandFallbackReason submission_prepare_reason =
+      CompiledCommandFallbackReason::None;
 };
 
 struct CompiledCommandSegment {
@@ -514,6 +525,11 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> replayed_compiled_packet_fallbacks = 0;
   std::atomic<UINT> replayed_empty_native_segments = 0;
   std::atomic<UINT> replayed_empty_fallback_segments = 0;
+  std::atomic<UINT> submitted_graphics_packets = 0;
+  std::atomic<UINT> submitted_compute_packets = 0;
+  std::atomic<UINT> submission_prepare_failures = 0;
+  std::atomic<UINT> submitted_descriptor_snapshots = 0;
+  std::atomic<UINT> submitted_descriptor_entries = 0;
 };
 
 struct CompiledCommandList {
@@ -535,6 +551,9 @@ const char *CompiledCommandFallbackReasonName(
     CompiledCommandFallbackReason reason);
 dxmt::CompiledFallbackReason
 CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason);
+
+void PrepareSubmittedCompiledCommandList(CompiledCommandList &compiled,
+                                         WMT::Device device);
 
 struct SubmittedCommandAllocatorUse {
   Com<CommandAllocatorObject, false> allocator;

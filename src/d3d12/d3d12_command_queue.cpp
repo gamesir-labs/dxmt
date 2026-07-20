@@ -4948,6 +4948,12 @@ public:
         if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
           op.command_records.emplace_back(state->GetCommandRecords());
           auto compiled = state->GetCompiledCommands();
+          if (compiled) {
+            auto submitted = std::make_shared<CompiledCommandList>(*compiled);
+            PrepareSubmittedCompiledCommandList(*submitted,
+                                                device_->GetMTLDevice());
+            compiled = std::move(submitted);
+          }
           op.compiled_command_lists.emplace_back(compiled);
           op.compiled_descriptor_snapshots.emplace_back(
               compiled ? CaptureSubmittedDescriptorSnapshots(*compiled)
@@ -8696,7 +8702,9 @@ private:
     snapshot->graphics_root_signature_impl = root;
     snapshot->cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
     snapshot->sampler_heap = packet.descriptor_heaps.sampler;
-    snapshot->bindless = true;
+    snapshot->native =
+        packet.pipeline.metadata.uses_native_descriptor_table_abi;
+    snapshot->bindless = !snapshot->native;
     snapshot->compiled_compute = compute;
     snapshot->compiled_binding_identity_hash =
         HashCompiledDescriptorBindingIdentity(packet, compute);
@@ -8742,6 +8750,24 @@ private:
       }
     }
     FinalizeCompiledDescriptorSnapshot(*snapshot);
+    snapshot->resource_access_fingerprint = kGraphicsBindingFingerprintOffset;
+    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
+                               snapshot->root_signature.ptr());
+    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
+                               snapshot->pipeline_state.ptr());
+    for (const auto &entry : snapshot->entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor)
+        continue;
+      HashGraphicsBindingValue(snapshot->resource_access_fingerprint,
+                               entry.stage);
+      HashGraphicsBindingValue(snapshot->resource_access_fingerprint,
+                               entry.range_type);
+      HashGraphicsBindingValue(snapshot->resource_access_fingerprint,
+                               entry.has_descriptor);
+      if (entry.has_descriptor)
+        HashGraphicsBindingDescriptor(snapshot->resource_access_fingerprint,
+                                      entry.descriptor);
+    }
     capture_stats.entries = snapshot->entries.size();
     capture_stats.descriptors = snapshot->entries.size();
     for (const auto &entry : snapshot->entries)
@@ -8783,29 +8809,43 @@ private:
     ReplayState cache = {};
     for (size_t i = 0; i < compiled.graphics_packets.size(); ++i) {
       const auto &packet = compiled.graphics_packets[i];
-      if (packet.pipeline.metadata.uses_native_descriptor_table_abi)
-        continue;
       auto *pipeline = packet.pipeline.metadata.pipeline;
       if (!pipeline)
         pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
       auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
-      if (!pipeline || !root || !pipeline->UsesBindlessMirror())
+      if (!pipeline || !root ||
+          (!pipeline->UsesBindlessMirror() &&
+           !packet.pipeline.metadata.uses_native_descriptor_table_abi))
         continue;
       snapshots.graphics[i] = GetOrCaptureCompiledDescriptorBindingSnapshot(
           cache, packet, *pipeline, root, false);
+      if (snapshots.graphics[i] && compiled.test_telemetry) {
+        compiled.test_telemetry->submitted_descriptor_snapshots.fetch_add(
+            1, std::memory_order_relaxed);
+        compiled.test_telemetry->submitted_descriptor_entries.fetch_add(
+            static_cast<UINT>(snapshots.graphics[i]->entries.size()),
+            std::memory_order_relaxed);
+      }
     }
     for (size_t i = 0; i < compiled.compute_packets.size(); ++i) {
       const auto &packet = compiled.compute_packets[i];
-      if (packet.pipeline.metadata.uses_native_descriptor_table_abi)
-        continue;
       auto *pipeline = packet.pipeline.metadata.pipeline;
       if (!pipeline)
         pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
       auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
-      if (!pipeline || !root || !pipeline->UsesBindlessMirror())
+      if (!pipeline || !root ||
+          (!pipeline->UsesBindlessMirror() &&
+           !packet.pipeline.metadata.uses_native_descriptor_table_abi))
         continue;
       snapshots.compute[i] = GetOrCaptureCompiledDescriptorBindingSnapshot(
           cache, packet, *pipeline, root, true);
+      if (snapshots.compute[i] && compiled.test_telemetry) {
+        compiled.test_telemetry->submitted_descriptor_snapshots.fetch_add(
+            1, std::memory_order_relaxed);
+        compiled.test_telemetry->submitted_descriptor_entries.fetch_add(
+            static_cast<UINT>(snapshots.compute[i]->entries.size()),
+            std::memory_order_relaxed);
+      }
     }
     return snapshots;
   }
@@ -9169,6 +9209,9 @@ private:
         [&](const CompiledGraphicsPacket &packet,
             std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot)
             -> CompiledCommandFallbackReason {
+          if (packet.submission_prepare_reason !=
+              CompiledCommandFallbackReason::None)
+            return packet.submission_prepare_reason;
           if (!packet.draw && !packet.draw_indexed)
             return CompiledCommandFallbackReason::UnsupportedCommand;
           if (packet.draw &&
@@ -9354,6 +9397,8 @@ private:
                         : GetOrCaptureCompiledDescriptorBindingSnapshot(
                               state, packet, *pipeline, root, false);
           if (packet.draw) {
+            RecordGraphicsPipelineResourceAccess(
+                chunk, state, *pipeline, nullptr, submitted_snapshot.get());
             ReplayDrawInstancedPacket replay_packet = {};
             replay_packet.common.metal_pso = metal_pso;
             replay_packet.common.depth_stencil = metal->depth_stencil;
@@ -9416,6 +9461,9 @@ private:
               return native_packet
                          ? CompiledCommandFallbackReason::NativeUnsupportedDynamicResource
                          : CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+            RecordGraphicsPipelineResourceAccess(
+                chunk, state, *pipeline, index_resource,
+                submitted_snapshot.get());
             ReplayDrawIndexedInstancedPacket replay_packet = {};
             replay_packet.common.metal_pso = metal_pso;
             replay_packet.common.depth_stencil = metal->depth_stencil;
@@ -9495,6 +9543,9 @@ private:
         [&](const CompiledComputePacket &packet,
             std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot)
             -> CompiledCommandFallbackReason {
+          if (packet.submission_prepare_reason !=
+              CompiledCommandFallbackReason::None)
+            return packet.submission_prepare_reason;
           if (!packet.dispatch.x || !packet.dispatch.y || !packet.dispatch.z)
             return CompiledCommandFallbackReason::None;
           DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
@@ -9586,6 +9637,8 @@ private:
               packet.root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
+          RecordComputePipelineResourceAccess(
+              chunk, state, *pipeline, submitted_snapshot.get());
           const auto argument_buffer_size =
               EstimateComputeArgumentBufferSize(*pipeline);
           ReplayDispatchPacket dispatch_packet = {};
@@ -19008,7 +19061,11 @@ private:
       // to fit after the table base rejects valid tables whose unused tail
       // extends beyond the heap and forces every draw through snapshot replay.
       if (table.heap_index >= table.mirror->numDescriptors())
-        return CompiledCommandFallbackReason::NativeUnsupportedDescriptorRange;
+        return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
+
+      if (table.buffer_resource_table_generation !=
+          table.mirror->backendResourceTableGeneration())
+        return CompiledCommandFallbackReason::NativeDescriptorBackendGeneration;
 
       if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
           (!table.native_descriptor_record_storage_ready ||
@@ -21580,7 +21637,7 @@ private:
     // Bindless snapshots are state tokens: they deliberately do not own a
     // DescriptorRecord copy. Their resources must be resolved by the live
     // binding plan (which can then consume the heap change journal safely).
-    if (!snapshot || snapshot->native || snapshot->bindless)
+    if (!snapshot || snapshot->bindless)
       return false;
 
     const bool cache_on = DescAccessCacheEnabled();
@@ -21634,9 +21691,12 @@ private:
     }
   }
 
-  void RecordComputePipelineResourceAccess(CommandChunk *chunk, ReplayState &state,
-                                           PipelineState &pipeline) {
-    RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
+  void RecordComputePipelineResourceAccess(
+      CommandChunk *chunk, ReplayState &state, PipelineState &pipeline,
+      const GraphicsBindingSnapshot *binding_snapshot = nullptr) {
+    if (!RecordGraphicsSnapshotDescriptorAccess(chunk, state,
+                                                binding_snapshot))
+      RecordPipelineDescriptorAccess(chunk, state, pipeline, true);
     if (state.predication_buffer) {
       RecordReplayResourceAccess(chunk, state, state.predication_buffer.ptr(),
                                  D3D12_RESOURCE_STATE_PREDICATION,
@@ -24440,6 +24500,10 @@ private:
         }
         lock_begin = clock::now();
         std::lock_guard resource_state_lock(resource_states_->mutex);
+        dxmt::perf::ScopedFrameDuration resource_state_lock_hold(
+            operation_perf_stats,
+            &dxmt::FrameStatistics::
+                frame_execute_resource_state_lock_hold_interval);
         // P1: ABA-safe — clear the binding-plan cache once per Execute batch.
         // Within a batch every referenced PSO/root-sig is pinned alive by the
         // command records, so intra-batch (PSO*,root_sig*) reuse is safe.

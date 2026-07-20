@@ -70,6 +70,11 @@ struct ExecutionPathStats {
   std::uint32_t replayed_compiled_packet_fallbacks = 0;
   std::uint32_t replayed_empty_native_segments = 0;
   std::uint32_t replayed_empty_fallback_segments = 0;
+  std::uint32_t submitted_graphics_packets = 0;
+  std::uint32_t submitted_compute_packets = 0;
+  std::uint32_t submission_prepare_failures = 0;
+  std::uint32_t submitted_descriptor_snapshots = 0;
+  std::uint32_t submitted_descriptor_entries = 0;
   // segment_count always reports the complete count. traced_segment_count is
   // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
   // builder order and make N/F boundary topology directly testable.

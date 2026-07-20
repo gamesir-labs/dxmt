@@ -3,6 +3,7 @@
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
+#include <version.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -930,6 +931,8 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_execute_drain_interval);
   const auto execute_drain_lock_us =
       durationUs(frame_stats.frame_execute_drain_lock_interval);
+  const auto execute_resource_state_lock_hold_us = durationUs(
+      frame_stats.frame_execute_resource_state_lock_hold_interval);
   const auto execute_replay_us =
       durationUs(frame_stats.frame_execute_replay_interval);
   const auto execute_decay_us =
@@ -1263,8 +1266,9 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
 
   Logger::logFileOnly(
       LogLevel::Info,
-      str::format("DXMT perf frame:"
-                  " frame=", frame,
+      str::format("DXMT perf frame: buildVersion=", DXMT_VERSION,
+                  " frame=",
+                  frame,
                   " monoUs=", monotonic_us,
                   " logDeltaUs=", log_delta_us,
                   " totalWallUs=", frame_wall_us,
@@ -1275,6 +1279,8 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " executeEnqueueUs=", execute_enqueue_us,
                   " executeDrainUs=", execute_drain_us,
                   " executeDrainLockUs=", execute_drain_lock_us,
+                  " executeResourceStateLockHoldUs=",
+                  execute_resource_state_lock_hold_us,
                   " executeReplayUs=", execute_replay_us,
                   " executeDecayUs=", execute_decay_us,
                   " executeSignalUs=", execute_signal_us,
@@ -1542,6 +1548,27 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " compiledFallbackReasonNativeUnsupportedDescriptorRange=",
                   compiled_fallback_reason_count(
                       CompiledFallbackReason::NativeUnsupportedDescriptorRange),
+                  " compiledFallbackReasonNativeDescriptorNullBase=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorNullBase),
+                  " compiledFallbackReasonNativeDescriptorMixedHeap=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorMixedHeap),
+                  " compiledFallbackReasonNativeDescriptorNoRange=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorNoRange),
+                  " compiledFallbackReasonNativeDescriptorInvalidHandle=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorInvalidHandle),
+                  " compiledFallbackReasonNativeDescriptorHeapTail=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorHeapTail),
+                  " compiledFallbackReasonNativeDescriptorAmbiguousRange=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorAmbiguousRange),
+                  " compiledFallbackReasonNativeDescriptorBackendGeneration=",
+                  compiled_fallback_reason_count(
+                      CompiledFallbackReason::NativeDescriptorBackendGeneration),
                   " compiledFallbackReasonNativeUnsupportedRootDescriptor=",
                   compiled_fallback_reason_count(
                       CompiledFallbackReason::NativeUnsupportedRootDescriptor),
@@ -1921,6 +1948,8 @@ void recordReplayWorkerFrame(uint64_t frame, uintptr_t queue,
       " executeDrainUs=", durationUs(stats.frame_execute_drain_interval),
       " executeDrainLockUs=",
       durationUs(stats.frame_execute_drain_lock_interval),
+      " executeResourceStateLockHoldUs=",
+      durationUs(stats.frame_execute_resource_state_lock_hold_interval),
       " executeReplayUs=", summary.execute_replay_us,
       " executeDecayUs=", durationUs(stats.frame_execute_decay_interval),
       " executeSignalUs=", durationUs(stats.frame_execute_signal_interval),

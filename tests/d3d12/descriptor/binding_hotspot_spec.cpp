@@ -15,7 +15,7 @@ TEST(D3D12BindingHotspot, PublishesArgumentTableUpdatesBeforeGpuUse) {
   EXPECT_EQ(measurement.actual, measurement.expected);
 }
 
-TEST(D3D12BindingHotspot, MaterializesEveryRootTableDuringClose) {
+TEST(D3D12BindingHotspot, DefersRootTableMaterializationUntilSubmission) {
   BindingHotspotMeasurement measurement;
   const auto error =
       dxmt::test::RunRootTableMaterializationScenario(4, 8, &measurement);
@@ -45,6 +45,30 @@ TEST(D3D12BindingHotspot, InvalidatesMaterializedRootTableAfterRebind) {
   BindingHotspotMeasurement measurement;
   const auto error =
       dxmt::test::RunRootTableInvalidationScenario(&measurement);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(measurement.actual, measurement.expected);
+}
+
+TEST(D3D12BindingHotspot, FreezesCompiledDescriptorsAtSubmission) {
+  BindingHotspotMeasurement measurement;
+  const auto error =
+      dxmt::test::RunCompiledDescriptorSubmissionSnapshotScenario(&measurement);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(measurement.actual, measurement.expected);
+}
+
+TEST(D3D12BindingHotspot, FreezesFh4ShapedMultiTableSubmissions) {
+  BindingHotspotMeasurement measurement;
+  const auto error =
+      dxmt::test::RunFh4MultiTableSubmissionSnapshotScenario(&measurement);
+  ASSERT_FALSE(error) << (error ? *error : "");
+  EXPECT_EQ(measurement.actual, measurement.expected);
+}
+
+TEST(D3D12BindingHotspot, FreezesDescriptorsAcrossSubmissionBacklog) {
+  BindingHotspotMeasurement measurement;
+  const auto error =
+      dxmt::test::RunCompiledDescriptorBacklogScenario(16, &measurement);
   ASSERT_FALSE(error) << (error ? *error : "");
   EXPECT_EQ(measurement.actual, measurement.expected);
 }
