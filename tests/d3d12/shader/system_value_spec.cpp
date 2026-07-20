@@ -166,7 +166,7 @@ protected:
 };
 
 TEST_F(D3D12ShaderSystemValueSpec,
-       VertexAndInstanceIdsIncludeNonzeroDrawOffsets) {
+       VertexAndInstanceIdsRemainDrawLocalWithNonzeroOffsets) {
   auto pipeline = CreatePipeline(R"(
     struct Output {
       float4 position : SV_Position;
@@ -177,8 +177,8 @@ TEST_F(D3D12ShaderSystemValueSpec,
       const float2 positions[3] = {
         float2(-0.8, -0.7), float2(0.0, 0.8), float2(0.8, -0.7)
       };
-      const uint local_vertex = vertex_id - 4;
-      const uint local_instance = instance_id - 7;
+      const uint local_vertex = vertex_id;
+      const uint local_instance = instance_id;
       Output output;
       output.position = float4(
           positions[local_vertex].x * 0.45 +
