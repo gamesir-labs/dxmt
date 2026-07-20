@@ -767,6 +767,12 @@ convert_dxbc_tesselator_domain_shader(
   if (gs_passthrough && gs_passthrough->Data.ViewportArrayIndexReg != 255) {
     va_idx_out = func_signature.DefineMeshPrimitiveOutput(air::OutputViewportArrayIndex{});
   }
+  constexpr uint32_t tess_primitive_id_data_index = 0;
+  func_signature.DefineMeshPrimitiveOutput(air::OutputMeshData{
+      .user = "SV_PrimitiveID",
+      .type = air::MSLUint{},
+      .index = tess_primitive_id_data_index,
+  });
 
   uint32_t thread_id_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
   uint32_t tg_id_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
@@ -847,6 +853,7 @@ convert_dxbc_tesselator_domain_shader(
   auto vertex_end = llvm::BasicBlock::Create(context, "vertex_end", function);
   auto generate_primitive_pre = llvm::BasicBlock::Create(context, "generate_primitive_pre", function);
   auto generate_primitive = llvm::BasicBlock::Create(context, "generate_primitive", function);
+  auto generate_primitive_data = llvm::BasicBlock::Create(context, "generate_primitive_data", function);
   auto real_return = llvm::BasicBlock::Create(context, "real_return", function);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
@@ -1037,9 +1044,23 @@ convert_dxbc_tesselator_domain_shader(
   );
   builder.SetInsertPoint(generate_primitive);
 
-  dxbc.DomainGeneratePrimitives(workload_index, data, get_output_primitive(pHullStage));
+  auto primitive_count =
+      dxbc.DomainGeneratePrimitives(workload_index, data, get_output_primitive(pHullStage));
+  builder.CreateCondBr(builder.CreateICmpUGT(primitive_count, builder.getInt32(0)),
+                       generate_primitive_data, real_return);
 
-  builder.CreateBr(real_return);
+  builder.SetInsertPoint(generate_primitive_data);
+  auto primitive_index = builder.CreatePHI(types._int, 2);
+  primitive_index->addIncoming(builder.getInt32(0), generate_primitive);
+  air.CreateSetMeshPrimitiveData(primitive_index,
+                                 builder.getInt32(tess_primitive_id_data_index),
+                                 resource_map.patch_id);
+  auto next_primitive_index =
+      builder.CreateAdd(primitive_index, builder.getInt32(1));
+  primitive_index->addIncoming(next_primitive_index, generate_primitive_data);
+  builder.CreateCondBr(builder.CreateICmpULT(next_primitive_index, primitive_count),
+                       generate_primitive_data, real_return);
+
   builder.SetInsertPoint(real_return);
   builder.CreateRetVoid();
 

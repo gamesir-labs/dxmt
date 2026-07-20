@@ -346,6 +346,7 @@ struct SignatureContext {
   bool dual_source_blending;
   bool disable_depth_output;
   bool skip_vertex_output;
+  bool tessellation_primitive_id;
   uint32_t pull_mode_reg_mask;
   uint32_t unorm_output_reg_mask;
 
@@ -353,7 +354,8 @@ struct SignatureContext {
     IREffect &prologue, IRValue &epilogue, air::FunctionSignatureBuilder &func_signature, io_binding_map &resource
   )
       : prologue(prologue), epilogue(epilogue), func_signature(func_signature), resource(resource), ia_layout(nullptr),
-        dual_source_blending(false), disable_depth_output(false), skip_vertex_output(false), pull_mode_reg_mask(0),
+        dual_source_blending(false), disable_depth_output(false), skip_vertex_output(false),
+        tessellation_primitive_id(false), pull_mode_reg_mask(0),
         unorm_output_reg_mask(0){};
 };
 

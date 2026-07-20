@@ -398,8 +398,19 @@ void handle_signature_ps(
       assigned_index = func_signature.DefineInput(InputSampleIndex{});
       break;
     case microsoft::D3D10_SB_NAME_PRIMITIVE_ID:
-      assigned_index = func_signature.DefineInput(InputPrimitiveID{});
-      break;
+      signature_handlers.push_back([=](SignatureContext &ctx) {
+        const auto primitive_id_index = ctx.tessellation_primitive_id
+          ? ctx.func_signature.DefineInput(InputFragmentStageIn{
+              .user = "SV_PrimitiveID",
+              .type = msl_uint,
+              .interpolation = Interpolation::flat,
+              .pull_mode = false
+            })
+          : ctx.func_signature.DefineInput(InputPrimitiveID{});
+        ctx.prologue << init_input_reg(primitive_id_index, reg, mask);
+      });
+      max_input_register = std::max(reg + 1, max_input_register);
+      return;
     default:
       assert(0 && "Unexpected/unhandled input system value");
       break;

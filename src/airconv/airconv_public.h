@@ -275,6 +275,7 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   uint32_t unorm_output_reg_mask;
   uint64_t demote_msaa_srv_mask_lo;
   uint64_t demote_msaa_srv_mask_hi;
+  bool tessellation_primitive_id;
 };
 
 struct SM50_IA_INPUT_ELEMENT {

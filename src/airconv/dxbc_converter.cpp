@@ -1660,6 +1660,8 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
+    sig_ctx.tessellation_primitive_id =
+        pso_data && pso_data->tessellation_primitive_id;
     for (auto &p : pShaderInternal->signature_handlers) {
       p(sig_ctx);
     }

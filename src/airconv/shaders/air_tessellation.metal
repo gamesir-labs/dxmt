@@ -701,7 +701,7 @@ struct dummy_vertex {
 
 using MeshTri = metal::mesh<dummy_vertex, void, 130, 128, topology::triangle>;
 
-void generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) asm(
+int generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) asm(
     "dxmt.domain_generate_primitives.triangle"
 );
 
@@ -729,7 +729,7 @@ generate_triangle_for_edges(MeshTri mesh, short base_inner, short base_outer, sh
   }
 }
 
-void
+int
 generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) {
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
 
@@ -754,13 +754,14 @@ generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mes
   }
 
   mesh.set_primitive_count(primitive_count);
+  return primitive_count;
 }
 
-void generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) asm(
+int generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) asm(
     "dxmt.domain_generate_primitives.triangle_ccw"
 );
 
-void
+int
 generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) {
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
 
@@ -785,13 +786,14 @@ generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri 
   }
 
   mesh.set_primitive_count(primitive_count);
+  return primitive_count;
 }
 
-void generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) asm(
+int generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) asm(
     "dxmt.domain_generate_primitives.point"
 );
 
-void
+int
 generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) {
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
 
@@ -825,4 +827,5 @@ generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) 
   }
 
   mesh.set_primitive_count(index_count);
+  return index_count;
 }

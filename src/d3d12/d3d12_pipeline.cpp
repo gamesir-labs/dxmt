@@ -1947,6 +1947,7 @@ bool HashShaderCompilationArguments(
       HashValue(hash, value->unorm_output_reg_mask);
       HashValue(hash, value->demote_msaa_srv_mask_lo);
       HashValue(hash, value->demote_msaa_srv_mask_hi);
+      HashValue(hash, uint8_t(value->tessellation_primitive_id));
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -2997,6 +2998,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     ps_args.unorm_output_reg_mask = unorm_output_reg_mask;
     ps_args.demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
     ps_args.demote_msaa_srv_mask_hi = demote_msaa_srv_mask_hi;
+    ps_args.tessellation_primitive_id = hs && ds;
 
     const auto ps_name = BuildFunctionName("ps", shader_cache_key);
     if (!CompileMetalFunction(device, *ps, ps_name.c_str(),

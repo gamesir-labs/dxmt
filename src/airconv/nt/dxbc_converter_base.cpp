@@ -2893,7 +2893,7 @@ Converter::DomainGetLocation(
   };
 }
 
-void
+llvm::Value *
 Converter::DomainGeneratePrimitives(
     llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive
 ) {
@@ -2933,8 +2933,8 @@ Converter::DomainGeneratePrimitives(
     FnName += ".triangle_ccw";
     break;
   }
-  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs);
-  ir.CreateCall(Fn, Ops);
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getIntTy(), Tys, false), Attrs);
+  return ir.CreateCall(Fn, Ops);
 }
 
 llvm::Value *
