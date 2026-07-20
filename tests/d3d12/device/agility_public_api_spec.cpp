@@ -55,7 +55,7 @@ DXMT_SERIAL_TEST(D3D12AgilityPublicApiSpec,
 
   EXPECT_EQ(get_interface(kCLSID_D3D12SDKConfiguration,
                           __uuidof(ID3D12SDKConfiguration), nullptr),
-            S_FALSE);
+            E_POINTER);
 
   auto configuration = CreateSdkConfiguration();
   if (!configuration)
