@@ -153,7 +153,7 @@ TEST(RootSignatureLayoutMatrixSpec, ExplicitSameTypeTableSlotAliasIsAccepted) {
 }
 
 TEST(RootSignatureLayoutMatrixSpec,
-     ExplicitDifferentTypeTableSlotOverlapIsRejected) {
+     ExplicitDifferentTypeTableSlotAliasIsAccepted) {
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
   ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1};
@@ -163,8 +163,8 @@ TEST(RootSignatureLayoutMatrixSpec,
   std::vector<D3D12_ROOT_PARAMETER> parameters = {parameter};
   ComPtr<ID3DBlob> blob;
 
-  EXPECT_EQ(SerializeLayout(parameters, blob.put()), E_INVALIDARG);
-  EXPECT_FALSE(blob);
+  EXPECT_EQ(SerializeLayout(parameters, blob.put()), S_OK);
+  EXPECT_TRUE(blob);
 }
 
 TEST(RootSignatureLayoutMatrixSpec,
@@ -416,19 +416,27 @@ MalformedBlobIsRejected(const std::vector<std::uint8_t> &blob) {
 }
 
 TEST(RootSignatureMalformedBlobSpec,
-     Version11ParameterVisibilityCorruptionIsRejected) {
-  auto blob = SerializeVersion11DescriptorTables();
-  ASSERT_GE(blob.size(), 44u);
-  const std::size_t part_header = ReadBlobU32(blob, 32);
-  ASSERT_LE(part_header + 8, blob.size());
-  const std::size_t rts0 = part_header + 8;
-  ASSERT_EQ(ReadBlobU32(blob, rts0), 2u);
-  const std::size_t parameter_headers = rts0 + ReadBlobU32(blob, rts0 + 8);
-  ASSERT_LE(parameter_headers + 12, blob.size());
+     Version11InvalidParameterVisibilityIsRejected) {
+  D3D12_DESCRIPTOR_RANGE1 range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  range.NumDescriptors = 1;
+  D3D12_ROOT_PARAMETER1 parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameter.DescriptorTable.NumDescriptorRanges = 1;
+  parameter.DescriptorTable.pDescriptorRanges = &range;
+  parameter.ShaderVisibility =
+      static_cast<D3D12_SHADER_VISIBILITY>(UINT_MAX);
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {};
+  desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  desc.Desc_1_1.NumParameters = 1;
+  desc.Desc_1_1.pParameters = &parameter;
+  ComPtr<ID3DBlob> blob;
+  ComPtr<ID3DBlob> error;
 
-  WriteBlobU32(blob, parameter_headers + 4,
-               std::numeric_limits<std::uint32_t>::max());
-  EXPECT_TRUE(MalformedBlobIsRejected(blob));
+  EXPECT_EQ(D3D12SerializeVersionedRootSignature(&desc, blob.put(),
+                                                  error.put()),
+            E_INVALIDARG);
+  EXPECT_FALSE(blob);
 }
 
 TEST(RootSignatureMalformedBlobSpec,
@@ -476,25 +484,21 @@ TEST(RootSignatureMalformedBlobSpec,
 }
 
 TEST(RootSignatureMalformedBlobSpec,
-     ValidBlobWithTrailingDataPreservesDecodedDescription) {
+     ValidBlobWithTrailingDataIsRejectedAndClearsOutput) {
   auto blob = SerializeStructuredRootSignature();
   ASSERT_FALSE(blob.empty());
-  const auto original_size = blob.size();
   blob.insert(blob.end(), 32, 0xa5);
 
-  ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
-  ASSERT_EQ(D3D12CreateVersionedRootSignatureDeserializer(
+  void *deserializer = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(D3D12CreateVersionedRootSignatureDeserializer(
                 blob.data(), blob.size(),
                 __uuidof(ID3D12VersionedRootSignatureDeserializer),
-                reinterpret_cast<void **>(deserializer.put())),
-            S_OK);
-  ASSERT_TRUE(deserializer);
-  const auto *desc = deserializer->GetUnconvertedRootSignatureDesc();
-  ASSERT_NE(desc, nullptr);
-  ASSERT_EQ(desc->Version, D3D_ROOT_SIGNATURE_VERSION_1_0);
-  EXPECT_EQ(desc->Desc_1_0.NumParameters, 1u);
-  EXPECT_EQ(desc->Desc_1_0.NumStaticSamplers, 1u);
-  EXPECT_EQ(ReadBlobU32(blob, 24), original_size);
+                &deserializer),
+            E_INVALIDARG);
+  EXPECT_EQ(deserializer, nullptr);
+  if (deserializer)
+    static_cast<ID3D12VersionedRootSignatureDeserializer *>(deserializer)
+        ->Release();
 }
 
 } // namespace

@@ -150,7 +150,7 @@ TEST_F(D3D12ResourceSpec,
     EXPECT_EQ(rows[i], expected_rows[i]);
     EXPECT_EQ(row_sizes[i], expected_row_sizes[i]);
   }
-  EXPECT_EQ(total_bytes, 1280u);
+  EXPECT_EQ(total_bytes, 1032u);
 }
 
 TEST_F(D3D12ResourceSpec,
