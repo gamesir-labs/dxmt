@@ -1001,8 +1001,12 @@ public:
       return S_OK;
     }
     case D3D11_QUERY_PIPELINE_STATISTICS: {
-      WARN("CreateQuery1: pipeline statistics queries are unsupported");
-      return E_NOTIMPL;
+      // Public D3D11 allows creating pipeline-statistics queries at FL11+.
+      // Report zeroed counters through the existing GetData path until a full
+      // counter implementation is available.
+      *ppQuery = ref(new MTLD3D11EventQueryImpl<D3D11_QUERY_DATA_PIPELINE_STATISTICS>(
+          this, pQueryDesc));
+      return S_OK;
     }
     default:
       ERR("CreateQuery1: query type not implemented: ", pQueryDesc->Query);
