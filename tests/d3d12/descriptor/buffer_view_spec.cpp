@@ -227,7 +227,8 @@ INSTANTIATE_TEST_SUITE_P(
     ViewKinds, BufferViewSpec,
     ::testing::Values(
         BufferViewCase{DescriptorPublication::Direct, 0, "TypedDirect"},
-        BufferViewCase{DescriptorPublication::Copied, 1, "RawCopied"},
+        BufferViewCase{DescriptorPublication::Copied, 0, "TypedCopied"},
+        BufferViewCase{DescriptorPublication::Direct, 1, "RawDirect"},
         BufferViewCase{DescriptorPublication::Overwritten, 2,
                        "StructuredOverwritten"}),
     [](const ::testing::TestParamInfo<BufferViewCase> &info) {
