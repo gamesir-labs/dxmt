@@ -4027,7 +4027,8 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
 
 static TextureViewBinding
 CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
-                                 const DescriptorRecord &descriptor) {
+                                 const DescriptorRecord &descriptor,
+                                 bool allow_3d_slice_subrange = false) {
   auto *texture = resource.GetTexture();
   if (!texture)
     return {};
@@ -4125,7 +4126,8 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
              first_w, " size=", w_size, " mip_depth=", mip_depth);
         return {};
       }
-      if (first_w != 0 || w_size != mip_depth) {
+      if (!allow_3d_slice_subrange &&
+          (first_w != 0 || w_size != mip_depth)) {
         // TODO(d3d12): lower 3D texture UAV depth-slice subviews once the
         // DXMT texture view layer can represent a W-slice range for 3D images.
         WARN("D3D12CommandQueue: unsupported 3D texture UAV W slice subrange first=",
@@ -23972,13 +23974,15 @@ private:
           !resource->EnsureTextureAllocation("ClearUnorderedAccessTexture"))
         return;
       auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
-                                                   *resource, record.descriptor);
+                                                   *resource, record.descriptor,
+                                                   true);
       if (!view)
         return;
       auto *texture = view.texture.ptr();
       const auto key = view.view;
       const auto type = texture->textureType(key);
-      if (type != WMTTextureType2D && type != WMTTextureType2DArray) {
+      if (type != WMTTextureType2D && type != WMTTextureType2DArray &&
+          type != WMTTextureType3D) {
         WARN("D3D12CommandQueue: ClearUnorderedAccessView texture type is unsupported");
         return;
       }
@@ -23987,12 +23991,27 @@ private:
         rects.push_back(D3D12_RECT{0, 0, static_cast<LONG>(texture->width(key)),
                                    static_cast<LONG>(texture->height(key))});
       }
+      UINT first_depth_slice = 0;
+      UINT depth_slice_count = 1;
+      if (type == WMTTextureType3D) {
+        depth_slice_count =
+            std::max(texture->depth() >> key.mip_start, 1u);
+        if (record.descriptor.has_desc &&
+            record.descriptor.desc.uav.ViewDimension ==
+                D3D12_UAV_DIMENSION_TEXTURE3D) {
+          const auto &texture3d = record.descriptor.desc.uav.Texture3D;
+          first_depth_slice = texture3d.FirstWSlice;
+          depth_slice_count = NormalizeViewCount(
+              texture3d.WSize, first_depth_slice, depth_slice_count);
+        }
+      }
       Rc<Texture> rc_texture = std::move(view.texture);
       chunk->emitcc([texture = std::move(rc_texture), view,
                      integer = record.integer,
                      uint_values = record.uint_values,
                      float_values = record.float_values,
-                     rects = std::move(rects)](ArgumentEncodingContext &enc) mutable {
+                     rects = std::move(rects), type, first_depth_slice,
+                     depth_slice_count](ArgumentEncodingContext &enc) mutable {
         if (integer)
           enc.clear_res_cmd.begin(uint_values, Rc<Texture>(texture), view.view);
         else
@@ -24004,8 +24023,13 @@ private:
               uint32_t(std::max<LONG>(0, rect.right - rect.left));
           const auto height =
               uint32_t(std::max<LONG>(0, rect.bottom - rect.top));
-          if (width && height)
-            enc.clear_res_cmd.clear(left, top, width, height);
+          if (width && height) {
+            if (type == WMTTextureType3D)
+              enc.clear_res_cmd.clear3D(left, top, first_depth_slice, width,
+                                        height, depth_slice_count);
+            else
+              enc.clear_res_cmd.clear(left, top, width, height);
+          }
         }
         enc.clear_res_cmd.end();
       });

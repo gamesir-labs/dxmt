@@ -707,6 +707,22 @@ struct DXMTClearUintMetadata {
   tex.write(meta.value, meta.offset + pos.xy, pos.z);
 }
 
+[[kernel]] void cs_clear_texture3d_float(
+    texture3d<float, access::write> tex [[texture(0)]],
+    constant DXMTClearFloatMetadata& meta [[buffer(1)]],
+    constant uint2& depth_range [[buffer(2)]],
+    uint3 pos [[thread_position_in_grid]]) {
+  tex.write(meta.value, uint3(meta.offset + pos.xy, depth_range.x + pos.z));
+}
+
+[[kernel]] void cs_clear_texture3d_uint(
+    texture3d<uint, access::write> tex [[texture(0)]],
+    constant DXMTClearUintMetadata& meta [[buffer(1)]],
+    constant uint2& depth_range [[buffer(2)]],
+    uint3 pos [[thread_position_in_grid]]) {
+  tex.write(meta.value, uint3(meta.offset + pos.xy, depth_range.x + pos.z));
+}
+
 [[kernel]] void cs_clear_tbuffer_float(
     texture_buffer<float, access::write> tex [[texture(0)]],
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],

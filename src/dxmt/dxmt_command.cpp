@@ -795,6 +795,8 @@ ClearResourceKernelContext::ClearResourceKernelContext(
       create_pipeline("cs_clear_texture2d_array_uint");
   cs_clear_texture2d_array_float_ =
       create_pipeline("cs_clear_texture2d_array_float");
+  cs_clear_texture3d_uint_ = create_pipeline("cs_clear_texture3d_uint");
+  cs_clear_texture3d_float_ = create_pipeline("cs_clear_texture3d_float");
 }
 
 void
@@ -832,15 +834,20 @@ ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Texture>
   setClearColor(color, is_integer);
 
   bool is_array = false;
+  bool is_3d = false;
   switch (texture->textureType(view)) {
   case WMTTextureType1DArray:
   case WMTTextureType2DArray:
     is_array = true;
     dispatch_depth_ = texture->arrayLength(view);
     break;
+  case WMTTextureType3D:
+    is_3d = true;
+    clearing_3d_ = true;
+    dispatch_depth_ = std::max(texture->depth() >> view.mip_start, 1u);
+    break;
   case WMTTextureTypeCube:
   case WMTTextureTypeCubeArray:
-  case WMTTextureType3D:
   case WMTTextureType2DMultisample:
   case WMTTextureType2DMultisampleArray:
     // not a valid clear target
@@ -851,8 +858,13 @@ ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Texture>
 
   auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;
-  setpso.pso = is_integer ? (is_array ? cs_clear_texture2d_array_uint_ : cs_clear_texture2d_uint_)
-                          : (is_array ? cs_clear_texture2d_array_float_ : cs_clear_texture2d_float_);
+  setpso.pso = is_integer
+                   ? (is_3d ? cs_clear_texture3d_uint_
+                            : (is_array ? cs_clear_texture2d_array_uint_
+                                        : cs_clear_texture2d_uint_))
+                   : (is_3d ? cs_clear_texture3d_float_
+                            : (is_array ? cs_clear_texture2d_array_float_
+                                        : cs_clear_texture2d_float_));
   setpso.threadgroup_size = {32, 1, 1};
 }
 
@@ -866,15 +878,20 @@ ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Textu
   setClearColor(color);
 
   bool is_array = false;
+  bool is_3d = false;
   switch (texture->textureType(view)) {
   case WMTTextureType1DArray:
   case WMTTextureType2DArray:
     is_array = true;
     dispatch_depth_ = texture->arrayLength(view);
     break;
+  case WMTTextureType3D:
+    is_3d = true;
+    clearing_3d_ = true;
+    dispatch_depth_ = std::max(texture->depth() >> view.mip_start, 1u);
+    break;
   case WMTTextureTypeCube:
   case WMTTextureTypeCubeArray:
-  case WMTTextureType3D:
   case WMTTextureType2DMultisample:
   case WMTTextureType2DMultisampleArray:
     return;
@@ -884,7 +901,9 @@ ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Textu
 
   auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;
-  setpso.pso = is_array ? cs_clear_texture2d_array_uint_ : cs_clear_texture2d_uint_;
+  setpso.pso = is_3d ? cs_clear_texture3d_uint_
+                     : (is_array ? cs_clear_texture2d_array_uint_
+                                 : cs_clear_texture2d_uint_);
   setpso.threadgroup_size = {32, 1, 1};
 }
 
@@ -994,9 +1013,30 @@ ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t
   setmeta.length = sizeof(meta_temp_);
   setmeta.index = 1;
 
+  if (clearing_3d_) {
+    const std::array<uint32_t, 2> depth_range = {dispatch_z_offset_,
+                                                 dispatch_depth_};
+    auto &setdepth = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+    setdepth.type = WMTComputeCommandSetBytes;
+    void *depth_temp = ctx_.allocate_cpu_heap(sizeof(depth_range), 16);
+    memcpy(depth_temp, depth_range.data(), sizeof(depth_range));
+    setdepth.bytes.set(depth_temp);
+    setdepth.length = sizeof(depth_range);
+    setdepth.index = 2;
+  }
+
   auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
   dispatch.type = WMTComputeCommandDispatchThreads;
   dispatch.size = {width, height, dispatch_depth_};
+}
+
+void
+ClearResourceKernelContext::clear3D(uint32_t offset_x, uint32_t offset_y,
+                                    uint32_t offset_z, uint32_t width,
+                                    uint32_t height, uint32_t depth) {
+  dispatch_z_offset_ = offset_z;
+  dispatch_depth_ = depth;
+  clear(offset_x, offset_y, width, height);
 }
 
 void
@@ -1008,6 +1048,8 @@ ClearResourceKernelContext::end() {
   clearing_buffer_ = nullptr;
   clearing_view_.reset();
   dispatch_depth_ = 1;
+  dispatch_z_offset_ = 0;
+  clearing_3d_ = false;
 };
 
 MTLFXMVScaleContext::MTLFXMVScaleContext(

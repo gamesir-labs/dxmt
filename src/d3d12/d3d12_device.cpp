@@ -1186,13 +1186,6 @@ ValidateUnorderedAccessView(ID3D12Resource *resource,
              first_w, " size=", w_size, " mip_depth=", mip_depth);
         return false;
       }
-      if (first_w != 0 || w_size != mip_depth) {
-        // TODO(d3d12): support 3D texture UAV W-slice subranges when the
-        // Metal texture view layer can preserve D3D12 depth-slice semantics.
-        WARN("D3D12Device: unsupported 3D texture UAV W slice subrange first=",
-             first_w, " size=", w_size, " mip_depth=", mip_depth);
-        return false;
-      }
     }
   }
   if (counter_resource) {

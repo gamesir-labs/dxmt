@@ -375,6 +375,8 @@ public:
   void begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer);
 
   void clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height);
+  void clear3D(uint32_t offset_x, uint32_t offset_y, uint32_t offset_z,
+               uint32_t width, uint32_t height, uint32_t depth);
 
   void end();
 
@@ -392,10 +394,14 @@ private:
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_float_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_uint_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture3d_uint_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture3d_float_;
   Rc<Texture> clearing_texture_;
   Rc<Buffer> clearing_buffer_;
   std::optional<TextureViewKey> clearing_view_;
   uint32_t dispatch_depth_ = 1;
+  uint32_t dispatch_z_offset_ = 0;
+  bool clearing_3d_ = false;
 
   struct DXMTClearMetadata {
     union {
