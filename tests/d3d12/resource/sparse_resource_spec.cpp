@@ -551,6 +551,9 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
       sparse_case == SparseCase::CopyToMapped) {
     backing_heap = MapAllTiles(texture.get());
     ASSERT_TRUE(backing_heap);
+    if (sparse_case == SparseCase::SampleMapped) {
+      ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+    }
   }
 
   if (sample_case) {
