@@ -144,6 +144,11 @@ std::string LogicalCaseMetadataJson(const LogicalCaseFamily &family,
                                     std::size_t index);
 std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,
                               std::size_t maximum_worker_count);
+std::size_t SelectAutomaticWorkerLimit(std::string_view case_namespace,
+                                       std::size_t requested_worker_count);
+std::string BuildWorkerCachePath(std::string_view root,
+                                 std::string_view run_namespace,
+                                 std::size_t shard_index);
 std::vector<ScheduledTest>
 ExtractSerialTests(std::vector<ScheduledTest> &tests);
 std::vector<TestShard>

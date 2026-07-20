@@ -121,9 +121,14 @@ tail worker.
 - Each API coordinator applies GoogleTest filtering and disabled-test rules in
   memory before planning.
 - The default worker count is bounded by the logical CPU count and amortized so
-  each worker receives at least four normal-test cost units.
+  each worker receives at least four normal-test cost units. GPU API suites use
+  at most four automatic workers to avoid Metal queue oversubscription; an
+  explicit job count remains available for stress testing.
 - Every worker is created inside Wine with `CreateProcessW`, receives one
-  `--gtest_filter` batch, and is awaited by the coordinator.
+  `--gtest_filter` batch and an isolated DXMT shader/cache directory, and is
+  awaited by the coordinator. Set `DXMT_TEST_ISOLATE_WORKER_CACHE=0` only when
+  intentionally testing shared-cache behavior, or
+  `DXMT_TEST_KEEP_WORKER_CACHE=1` to preserve isolated caches for inspection.
 - `DXMT_SERIAL_TEST_F` removes a test from the parallel wave. It keeps a
   dedicated worker by default; `DXMT_GROUP_SERIAL_TESTS(pattern, group)` may
   reuse one worker for a reviewed set of serial tests that safely share

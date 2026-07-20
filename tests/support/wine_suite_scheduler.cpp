@@ -27,6 +27,11 @@ struct SuiteRun {
   dxmt::test::WineProcess process;
 };
 
+struct JobSelection {
+  std::size_t count = 1;
+  bool explicit_count = false;
+};
+
 constexpr std::array<Suite, 4> kSuites = {{
     {"framework", L"dxmt-wine-framework-tests.exe"},
     {"d3d10", L"dxmt-wine-d3d10-tests.exe"},
@@ -45,9 +50,10 @@ std::optional<std::size_t> ParsePositiveInteger(std::string_view value) {
   return result;
 }
 
-std::optional<std::size_t>
+std::optional<JobSelection>
 SelectJobCount(const std::vector<std::string> &arguments) {
-  std::size_t jobs = std::max(1u, std::thread::hardware_concurrency());
+  JobSelection selection = {
+      std::max(1u, std::thread::hardware_concurrency()), false};
   constexpr std::string_view prefix = "--dxmt-test-jobs=";
 
   if (const char *value = std::getenv("DXMT_TEST_JOBS")) {
@@ -58,7 +64,8 @@ SelectJobCount(const std::vector<std::string> &arguments) {
                    value);
       return std::nullopt;
     }
-    jobs = *parsed;
+    selection.count = *parsed;
+    selection.explicit_count = true;
   }
 
   for (const auto &argument : arguments) {
@@ -72,14 +79,15 @@ SelectJobCount(const std::vector<std::string> &arguments) {
                    argument.c_str() + prefix.size());
       return std::nullopt;
     }
-    jobs = *parsed;
+    selection.count = *parsed;
+    selection.explicit_count = true;
   }
-  return jobs;
+  return selection;
 }
 
 std::vector<std::string>
 BuildSuiteArguments(const std::vector<std::string> &original_arguments,
-                    std::size_t jobs) {
+                    std::size_t jobs, bool explicit_jobs) {
   std::vector<std::string> arguments;
   arguments.reserve(original_arguments.size());
   for (std::size_t index = 1; index < original_arguments.size(); ++index) {
@@ -91,7 +99,9 @@ BuildSuiteArguments(const std::vector<std::string> &original_arguments,
       arguments.push_back(original_arguments[index]);
     }
   }
-  arguments.push_back("--dxmt-test-jobs=" + std::to_string(jobs));
+  arguments.push_back(std::string(explicit_jobs ? "--dxmt-test-jobs="
+                                                : "--dxmt-test-auto-jobs=") +
+                      std::to_string(jobs));
   return arguments;
 }
 
@@ -186,7 +196,7 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  const auto concurrency = std::min(*jobs, selected_suites->size());
+  const auto concurrency = std::min(jobs->count, selected_suites->size());
   const auto log_prefix = BuildLogPrefix();
   std::size_t failed_suites = 0;
   std::string scheduler_errors;
@@ -196,8 +206,8 @@ int main(int argc, char **argv) {
   for (std::size_t wave = 0; wave < selected_suites->size(); wave += concurrency) {
     const auto wave_size =
         std::min(concurrency, selected_suites->size() - wave);
-    const auto jobs_per_suite = *jobs / wave_size;
-    const auto extra_jobs = *jobs % wave_size;
+    const auto jobs_per_suite = jobs->count / wave_size;
+    const auto extra_jobs = jobs->count % wave_size;
     std::vector<SuiteRun> runs;
     runs.reserve(wave_size);
 
@@ -206,7 +216,8 @@ int main(int argc, char **argv) {
       const auto &suite = *selected_suites->at(suite_index);
       const auto suite_jobs = jobs_per_suite + (offset < extra_jobs ? 1 : 0);
       const auto arguments =
-          BuildSuiteArguments(original_arguments, suite_jobs);
+          BuildSuiteArguments(original_arguments, suite_jobs,
+                              jobs->explicit_count);
       const auto executable = directory + L"\\" + suite.executable.data();
       const auto log_path =
           log_prefix + "-" + std::string(suite.name) + ".log";

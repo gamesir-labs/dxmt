@@ -231,6 +231,22 @@ TEST(TestSchedulerPlan, AmortizesDefaultWorkerLaunches) {
   EXPECT_EQ(dxmt::test::SelectWorkerCount(tests, 16), 16u);
 }
 
+TEST(TestSchedulerPlan, CapsAutomaticGpuWorkersButKeepsFrameworkParallelism) {
+  EXPECT_EQ(dxmt::test::SelectAutomaticWorkerLimit("D3D10", 16), 4u);
+  EXPECT_EQ(dxmt::test::SelectAutomaticWorkerLimit("D3D11", 8), 4u);
+  EXPECT_EQ(dxmt::test::SelectAutomaticWorkerLimit("D3D12", 4), 4u);
+  EXPECT_EQ(dxmt::test::SelectAutomaticWorkerLimit("FRAMEWORK", 16), 16u);
+}
+
+TEST(TestSchedulerPlan, BuildsPerShardWorkerCachePaths) {
+  EXPECT_EQ(dxmt::test::BuildWorkerCachePath("/tmp/cache", "run-42", 3),
+            "/tmp/cache/dxmt-gtest-workers/run-42/3");
+  EXPECT_EQ(dxmt::test::BuildWorkerCachePath("/tmp/cache/", "run-42", 0),
+            "/tmp/cache/dxmt-gtest-workers/run-42/0");
+  EXPECT_TRUE(dxmt::test::BuildWorkerCachePath({}, "run-42", 0).empty());
+  EXPECT_TRUE(dxmt::test::BuildWorkerCachePath("/tmp/cache", {}, 0).empty());
+}
+
 TEST(TestSchedulerPlan, HandlesEmptyZeroWorkerAndZeroCostInputs) {
   EXPECT_EQ(dxmt::test::SelectWorkerCount({}, 8), 0u);
   const std::vector<dxmt::test::ScheduledTest> tests = {

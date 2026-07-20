@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -388,17 +389,22 @@ struct SchedulerOptions {
   std::string case_id_filter;
   std::string report_path;
   std::string timing_report_path;
+  std::string worker_cache_path;
 };
 
 std::optional<SchedulerOptions>
 ParseSchedulerOptions(const std::vector<std::string> &arguments) {
   SchedulerOptions options;
   constexpr std::string_view jobs_prefix = "--dxmt-test-jobs=";
+  constexpr std::string_view automatic_jobs_prefix =
+      "--dxmt-test-auto-jobs=";
   constexpr std::string_view report_prefix = "--dxmt-test-report=";
   constexpr std::string_view timing_report_prefix =
       "--dxmt-test-timing-report=";
   constexpr std::string_view case_id_prefix = "--dxmt-case-id=";
   constexpr std::string_view legacy_case_id_prefix = "--dxmt_case_id=";
+  constexpr std::string_view worker_cache_prefix =
+      "--dxmt-test-worker-cache=";
 
   if (const char *value = std::getenv("DXMT_TEST_JOBS")) {
     const auto parsed = ParsePositiveInteger(value);
@@ -416,6 +422,7 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
     options.case_id_filter = value;
 
   for (const auto &argument : arguments) {
+    const std::string_view argument_view(argument);
     if (argument == "--help" || argument == "-h" ||
         argument == "--gtest_help") {
       options.show_help = true;
@@ -423,6 +430,11 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
     }
     if (argument == "--dxmt-test-worker") {
       options.is_worker = true;
+      continue;
+    }
+    if (argument_view.starts_with(worker_cache_prefix)) {
+      options.worker_cache_path =
+          std::string(argument_view.substr(worker_cache_prefix.size()));
       continue;
     }
     if (argument == "--dxmt-list-case-ids") {
@@ -433,7 +445,6 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
       options.list_case_metadata = true;
       continue;
     }
-    const std::string_view argument_view(argument);
     if (argument_view.starts_with(case_id_prefix)) {
       const auto filter = argument_view.substr(case_id_prefix.size());
       if (filter.empty()) {
@@ -462,26 +473,29 @@ ParseSchedulerOptions(const std::vector<std::string> &arguments) {
           std::string(argument_view.substr(timing_report_prefix.size()));
       continue;
     }
-    if (!argument_view.starts_with(jobs_prefix))
+    const bool automatic_jobs =
+        argument_view.starts_with(automatic_jobs_prefix);
+    if (!automatic_jobs && !argument_view.starts_with(jobs_prefix))
       continue;
 
-    const auto parsed = ParsePositiveInteger(
-        std::string_view(argument).substr(jobs_prefix.size()));
+    const auto prefix = automatic_jobs ? automatic_jobs_prefix : jobs_prefix;
+    const auto parsed = ParsePositiveInteger(argument_view.substr(prefix.size()));
     if (!parsed) {
-      std::fprintf(stderr,
-                   "--dxmt-test-jobs must be a positive integer, got '%s'\n",
-                   argument.c_str() + jobs_prefix.size());
+      std::fprintf(stderr, "%.*s must be a positive integer, got '%s'\n",
+                   static_cast<int>(prefix.size() - 1), prefix.data(),
+                   argument.c_str() + prefix.size());
       return std::nullopt;
     }
     options.jobs = *parsed;
-    options.jobs_were_set = true;
+    if (!automatic_jobs)
+      options.jobs_were_set = true;
   }
 
   if ((options.list_case_ids || options.list_case_metadata) &&
       options.case_id_filter.empty())
     options.case_id_filter = "*";
 
-  if (!options.jobs_were_set)
+  if (options.jobs == 0)
     options.jobs = std::max(1u, std::thread::hardware_concurrency());
   return options;
 }
@@ -504,14 +518,17 @@ std::string BuildFilter(const TestShard &shard) {
 std::vector<std::string>
 BuildWorkerArguments(const std::vector<std::string> &original_arguments,
                      const TestShard &shard, std::string_view report_path,
-                     std::string_view timing_report_path) {
+                     std::string_view timing_report_path,
+                     std::string_view worker_cache_path) {
   std::vector<std::string> arguments;
   arguments.reserve(original_arguments.size() + 2);
   for (std::size_t index = 1; index < original_arguments.size(); ++index) {
     const std::string_view argument(original_arguments[index]);
     if (!argument.starts_with("--dxmt-test-jobs=") &&
+        !argument.starts_with("--dxmt-test-auto-jobs=") &&
         !argument.starts_with("--dxmt-test-report=") &&
         !argument.starts_with("--dxmt-test-timing-report=") &&
+        !argument.starts_with("--dxmt-test-worker-cache=") &&
         !argument.starts_with("--gtest_filter=") &&
         argument != "--dxmt-list-case-ids" &&
         argument != "--dxmt-list-case-metadata" &&
@@ -524,7 +541,129 @@ BuildWorkerArguments(const std::vector<std::string> &original_arguments,
   arguments.push_back("--dxmt-test-report=" + std::string(report_path));
   arguments.push_back("--dxmt-test-timing-report=" +
                       std::string(timing_report_path));
+  if (!worker_cache_path.empty())
+    arguments.push_back("--dxmt-test-worker-cache=" +
+                        std::string(worker_cache_path));
   return arguments;
+}
+
+std::string WorkerCacheRoot() {
+  if (const char *disabled = std::getenv("DXMT_TEST_ISOLATE_WORKER_CACHE");
+      disabled != nullptr && std::string_view(disabled) == "0") {
+    return {};
+  }
+  if (const char *configured = std::getenv("DXMT_SHADER_CACHE_PATH");
+      configured != nullptr && configured[0] == '/') {
+    return configured;
+  }
+  if (const char *temporary = std::getenv("TMPDIR");
+      temporary != nullptr && temporary[0] == '/') {
+    return temporary;
+  }
+
+  std::vector<wchar_t> windows_path(32768);
+  const DWORD size =
+      GetTempPathW(static_cast<DWORD>(windows_path.size()), windows_path.data());
+  if (size == 0 || size >= windows_path.size())
+    return {};
+  using GetUnixFileName = char *(CDECL *)(const wchar_t *);
+  const auto get_unix_file_name = reinterpret_cast<GetUnixFileName>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                     "wine_get_unix_file_name"));
+  if (get_unix_file_name == nullptr)
+    return {};
+  const char *unix_path = get_unix_file_name(windows_path.data());
+  if (unix_path != nullptr && unix_path[0] == '/')
+    return unix_path;
+  return {};
+}
+
+bool ConfigureWorkerCache(std::string_view path) {
+  if (path.empty())
+    return true;
+  const std::string value(path);
+  if (SetEnvironmentVariableA("DXMT_SHADER_CACHE_PATH", value.c_str()))
+    return true;
+  std::fprintf(stderr, "failed to isolate DXMT worker cache '%s': %s\n",
+               value.c_str(), WineErrorMessage(GetLastError()).c_str());
+  return false;
+}
+
+class ScopedEnvironmentVariable {
+public:
+  ScopedEnvironmentVariable(const char *name, std::string_view value)
+      : name_(name) {
+    const DWORD size = GetEnvironmentVariableA(name, nullptr, 0);
+    if (size != 0) {
+      std::vector<char> buffer(size);
+      const DWORD written =
+          GetEnvironmentVariableA(name, buffer.data(), buffer.size());
+      if (written != 0 && written < buffer.size()) {
+        previous_.assign(buffer.data(), written);
+        had_previous_ = true;
+      }
+    }
+    const std::string replacement(value);
+    active_ = SetEnvironmentVariableA(name, replacement.c_str());
+  }
+
+  ~ScopedEnvironmentVariable() {
+    if (!active_)
+      return;
+    SetEnvironmentVariableA(name_,
+                            had_previous_ ? previous_.c_str() : nullptr);
+  }
+
+  bool active() const { return active_; }
+
+private:
+  const char *name_ = nullptr;
+  std::string previous_;
+  bool had_previous_ = false;
+  bool active_ = false;
+};
+
+std::optional<WineProcess>
+StartWineWorker(std::wstring_view executable,
+                const std::vector<std::string> &arguments,
+                std::string_view worker_cache_path, DWORD *error) {
+  if (worker_cache_path.empty())
+    return StartWineProcess(executable, arguments, error);
+
+  ScopedEnvironmentVariable cache_path("DXMT_SHADER_CACHE_PATH",
+                                       worker_cache_path);
+  if (!cache_path.active()) {
+    *error = GetLastError();
+    return std::nullopt;
+  }
+  return StartWineProcess(executable, arguments, error);
+}
+
+void RemoveWorkerCache(std::string_view worker_cache_path) {
+  if (worker_cache_path.empty())
+    return;
+  if (const char *keep = std::getenv("DXMT_TEST_KEEP_WORKER_CACHE");
+      keep != nullptr && std::string_view(keep) == "1") {
+    return;
+  }
+
+  using GetDosFileName = wchar_t *(CDECL *)(const char *);
+  const auto get_dos_file_name = reinterpret_cast<GetDosFileName>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                     "wine_get_dos_file_name"));
+  if (get_dos_file_name == nullptr)
+    return;
+  const std::string unix_path(worker_cache_path);
+  wchar_t *dos_path = get_dos_file_name(unix_path.c_str());
+  if (dos_path == nullptr)
+    return;
+  std::error_code error;
+  std::filesystem::remove_all(std::filesystem::path(dos_path), error);
+  HeapFree(GetProcessHeap(), 0, dos_path);
+  if (error) {
+    std::fprintf(stderr, "failed to remove DXMT worker cache '%s': %s\n",
+                 unix_path.c_str(), error.message().c_str());
+  }
 }
 
 std::string BuildReportPrefix() {
@@ -700,6 +839,8 @@ int RunScheduledTests(int argc, char **argv) {
   const auto options = ParseSchedulerOptions(original_arguments);
   if (!options)
     return 2;
+  if (options->is_worker && !ConfigureWorkerCache(options->worker_cache_path))
+    return 2;
 
   GTEST_FLAG_SET(brief, true);
   ::testing::InitGoogleTest(&argc, argv);
@@ -747,6 +888,8 @@ int RunScheduledTests(int argc, char **argv) {
       !GTEST_FLAG_GET(stream_result_to).empty()) {
     worker_count = 1;
   }
+  if (!options->jobs_were_set)
+    worker_count = SelectAutomaticWorkerLimit(case_namespace, worker_count);
 
   const auto plan_start = Clock::now();
   auto serial_tests = ExtractSerialTests(tests);
@@ -782,10 +925,24 @@ int RunScheduledTests(int argc, char **argv) {
   std::vector<std::string> timing_report_paths;
   timing_report_paths.reserve(shards.size());
   const auto report_prefix = BuildReportPrefix();
+  const auto worker_cache_root = WorkerCacheRoot();
+  const auto worker_cache_namespace =
+      std::to_string(GetCurrentProcessId()) + "-" +
+      std::to_string(Clock::now().time_since_epoch().count());
+  auto worker_cache_run_path = BuildWorkerCachePath(
+      worker_cache_root, worker_cache_namespace, 0);
+  if (const auto separator = worker_cache_run_path.rfind('/');
+      separator != std::string::npos) {
+    worker_cache_run_path.resize(separator);
+  }
+  std::vector<std::string> worker_cache_paths;
+  worker_cache_paths.reserve(shards.size());
   for (std::size_t index = 0; index < shards.size(); ++index) {
     report_paths.push_back(report_prefix + "-" + std::to_string(index));
     timing_report_paths.push_back(report_prefix + "-timing-" +
                                   std::to_string(index));
+    worker_cache_paths.push_back(BuildWorkerCachePath(
+        worker_cache_root, worker_cache_namespace, index));
   }
   const auto plan_end = Clock::now();
   const auto plan_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -822,9 +979,10 @@ int RunScheduledTests(int argc, char **argv) {
     for (const auto index : indexes) {
       const auto arguments = BuildWorkerArguments(
           original_arguments, shards[index], report_paths[index],
-          timing_report_paths[index]);
+          timing_report_paths[index], worker_cache_paths[index]);
       DWORD error = ERROR_SUCCESS;
-      auto child = StartWineProcess(executable, arguments, &error);
+      auto child = StartWineWorker(executable, arguments,
+                                   worker_cache_paths[index], &error);
       if (!child) {
         scheduler_errors += "failed to start Wine unit-test worker: ";
         scheduler_errors += WineErrorMessage(error);
@@ -867,6 +1025,7 @@ int RunScheduledTests(int argc, char **argv) {
         failed_shard_indexes.push_back(shard_index);
       }
       CloseHandle(child.handle);
+      RemoveWorkerCache(worker_cache_paths[shard_index]);
     }
   };
 
@@ -887,6 +1046,7 @@ int RunScheduledTests(int argc, char **argv) {
       indexes.push_back(parallel_shard_count + index);
     run_wave(indexes);
   }
+  RemoveWorkerCache(worker_cache_run_path);
 
   std::string failure_reports;
   std::vector<bool> shard_reported_failure(shards.size(), false);

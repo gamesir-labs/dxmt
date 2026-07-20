@@ -271,6 +271,32 @@ std::size_t SelectWorkerCount(const std::vector<ScheduledTest> &tests,
                    std::max<std::size_t>(1, amortized_worker_count)});
 }
 
+std::size_t SelectAutomaticWorkerLimit(std::string_view case_namespace,
+                                       std::size_t requested_worker_count) {
+  constexpr std::size_t kMaximumAutomaticGpuWorkers = 4;
+  if (case_namespace == "D3D10" || case_namespace == "D3D11" ||
+      case_namespace == "D3D12") {
+    return std::min(requested_worker_count, kMaximumAutomaticGpuWorkers);
+  }
+  return requested_worker_count;
+}
+
+std::string BuildWorkerCachePath(std::string_view root,
+                                 std::string_view run_namespace,
+                                 std::size_t shard_index) {
+  if (root.empty() || run_namespace.empty())
+    return {};
+
+  std::string path(root);
+  if (!path.ends_with('/'))
+    path.push_back('/');
+  path += "dxmt-gtest-workers/";
+  path += run_namespace;
+  path.push_back('/');
+  path += std::to_string(shard_index);
+  return path;
+}
+
 std::vector<ScheduledTest>
 ExtractSerialTests(std::vector<ScheduledTest> &tests) {
   std::vector<ScheduledTest> serial;
