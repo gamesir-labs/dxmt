@@ -350,6 +350,9 @@ DXMT_SERIAL_TEST_F(RenderPassMrtSemanticsSpec,
   constexpr UINT kZero[4] = {};
   context_.list()->ClearUnorderedAccessViewUint(uav_gpu, uav_cpu, counter.get(),
                                                 kZero, 0, nullptr);
+  // UAV accesses are not ordered by command-list order alone. Make the clear
+  // visible before the pixel shader performs atomic increments.
+  D3D12TestContext::UavBarrier(context_.list(), counter.get());
 
   const std::array<FLOAT, 4> black = {};
   const auto pass = PassTarget(rtv, black);
