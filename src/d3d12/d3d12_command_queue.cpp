@@ -19724,10 +19724,21 @@ private:
     if (!slot_mask)
       return;
 
-    // FH4 UI ghost fix: do not null-prebind all PSO layout slots (site A from
-    // 47f14b14). Empty compiled IA packets rely on sticky ArgumentEncodingContext
-    // vbuf_ across ClearState; prebinding null yields buffer_handle=0 and missing
-    // menu boards. Site B/C null-prebind paths intentionally kept.
+    uint32_t populated_slot_mask = 0;
+    for (const auto &vb : input_assembler.vertex_buffers) {
+      if (vb.slot < 32)
+        populated_slot_mask |= 1u << vb.slot;
+    }
+    const uint32_t cleared_slot_mask =
+        slot_mask & uint32_t(input_assembler.vertex_buffer_dirty_mask) &
+        ~populated_slot_mask;
+    for (UINT slot = 0; slot < 32; ++slot) {
+      if (cleared_slot_mask & (1u << slot))
+        enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
+    }
+
+    // Preserve sticky IA bindings for untouched slots while explicitly
+    // materializing null views recorded by IASetVertexBuffers.
     for (const auto &vb : input_assembler.vertex_buffers) {
       if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
         continue;
