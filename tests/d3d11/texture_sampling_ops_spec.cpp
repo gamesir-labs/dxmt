@@ -78,6 +78,45 @@ float4 main(float4 position : SV_Position) : SV_Target {
 }
 )";
 
+// Compiled with Microsoft D3DCompiler 43 from the redistributable
+// Microsoft.DXSDK.D3DX 9.29.952.8 package, then stripped of reflection data.
+// The local Wine HLSL frontend does not define CalculateLevelOfDetail, so the
+// checked-in SM5 DXBC keeps this runtime behavior executable on every worker.
+constexpr DWORD kCalculateLodPixelShader[] = {
+#if 0
+  Texture2D<float> input_texture : register(t0);
+  SamplerState point_sampler : register(s0);
+
+  struct PixelInput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+
+  float4 main(PixelInput input) : SV_Target {
+    return float4(
+        input_texture.CalculateLevelOfDetail(point_sampler, input.uv),
+        input_texture.CalculateLevelOfDetailUnclamped(point_sampler, input.uv),
+        0.0, 1.0);
+  }
+#endif
+    0x43425844, 0xdf398b08, 0x0505f031, 0x27c5c13a, 0x28f1444f, 0x00000001,
+    0x0000016c, 0x00000003, 0x0000002c, 0x00000084, 0x000000b8, 0x4e475349,
+    0x00000050, 0x00000002, 0x00000008, 0x00000038, 0x00000000, 0x00000001,
+    0x00000003, 0x00000000, 0x0000000f, 0x00000044, 0x00000000, 0x00000000,
+    0x00000003, 0x00000001, 0x00000303, 0x505f5653, 0x7469736f, 0x006e6f69,
+    0x43584554, 0x44524f4f, 0xababab00, 0x4e47534f, 0x0000002c, 0x00000001,
+    0x00000008, 0x00000020, 0x00000000, 0x00000000, 0x00000003, 0x00000000,
+    0x0000000f, 0x545f5653, 0x65677261, 0xabab0074, 0x58454853, 0x000000ac,
+    0x00000050, 0x0000002b, 0x0100086a, 0x0300005a, 0x00106000, 0x00000000,
+    0x04001858, 0x00107000, 0x00000000, 0x00005555, 0x03001062, 0x00101032,
+    0x00000001, 0x03000065, 0x001020f2, 0x00000000, 0x0900006c, 0x00102012,
+    0x00000000, 0x00101046, 0x00000001, 0x0010700a, 0x00000000, 0x00106000,
+    0x00000000, 0x0900006c, 0x00102022, 0x00000000, 0x00101046, 0x00000001,
+    0x0010701a, 0x00000000, 0x00106000, 0x00000000, 0x08000036, 0x001020c2,
+    0x00000000, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x3f800000,
+    0x0100003e,
+};
+
 HRESULT CreateFloatTarget(ID3D11Device *device, UINT width, UINT height,
                           ID3D11Texture2D **texture,
                           ID3D11RenderTargetView **rtv) {
@@ -327,6 +366,46 @@ TEST_F(D3D11TextureSamplingOpsSpec,
       EXPECT_FLOAT_EQ(pixel[2], 0.375f) << "pixel (" << x << ", " << y << ')';
       EXPECT_FLOAT_EQ(pixel[3], 0.625f) << "pixel (" << x << ", " << y << ')';
     }
+  }
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11TextureSamplingOpsSpec,
+       CalculateLodReportsClampedAndUnclampedValues) {
+  ComPtr<ID3D11PixelShader> pixel_shader;
+  ASSERT_EQ(context_.device()->CreatePixelShader(
+                kCalculateLodPixelShader, sizeof(kCalculateLodPixelShader),
+                nullptr, pixel_shader.put()),
+            S_OK);
+  ComPtr<ID3D11ShaderResourceView> srv;
+  ASSERT_EQ(
+      CreateMipTextureSrv(context_.device(), context_.context(), srv.put()),
+      S_OK);
+  D3D11_SAMPLER_DESC sampler_desc = {};
+  sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.MaxAnisotropy = 1;
+  sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sampler_desc.MinLOD = 1.0f;
+  sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+  ComPtr<ID3D11SamplerState> sampler;
+  ASSERT_EQ(context_.device()->CreateSamplerState(&sampler_desc, sampler.put()),
+            S_OK);
+  ComPtr<ID3D11Texture2D> target;
+  ComPtr<ID3D11RenderTargetView> rtv;
+  ASSERT_EQ(CreateFloatTarget(context_.device(), 8, 8, target.put(), rtv.put()),
+            S_OK);
+
+  Draw(rtv.get(), 8, 8, pixel_shader.get(), srv.get(), sampler.get());
+  std::vector<Float4> pixels;
+  ASSERT_EQ(ReadFloatTarget(context_.device(), context_.context(), target.get(),
+                            &pixels),
+            S_OK);
+  for (UINT y = 0; y < 8; ++y) {
+    for (UINT x = 0; x < 8; ++x)
+      ExpectFloat4(pixels[y * 8 + x], {1.0f, 0.0f, 0.0f, 1.0f}, x, y);
   }
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
