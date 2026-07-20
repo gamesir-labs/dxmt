@@ -13,6 +13,7 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <version.h>
+#include <DXBCParser/DXBCUtils.h>
 #include <DXBCParser/d3d12tokenizedprogramformat.hpp>
 #include <algorithm>
 #include <atomic>
@@ -704,6 +705,49 @@ ValidateDxbcShaderStage(PipelineShaderStage stage,
   const auto expected_type = ExpectedDxbcShaderType(stage);
   return (expected_type == UINT32_MAX || actual_type == expected_type) &&
          ValidateDxbcInstructionStream(stage, shader_blob, shader_blob_size);
+}
+
+bool
+ValidateDirectVertexPixelLinkage(const D3D12_SHADER_BYTECODE &vertex,
+                                 const D3D12_SHADER_BYTECODE &pixel) {
+  if (IsDxilContainer(vertex) || IsDxilContainer(pixel))
+    return true;
+  if (!ValidateDxbcShaderStage(PipelineShaderStage::Vertex, vertex) ||
+      !ValidateDxbcShaderStage(PipelineShaderStage::Pixel, pixel))
+    return true;
+
+  microsoft::CSignatureParser vertex_output;
+  microsoft::CSignatureParser pixel_input;
+  if (FAILED(microsoft::DXBCGetOutputSignature(
+          vertex.pShaderBytecode, &vertex_output)) ||
+      FAILED(microsoft::DXBCGetInputSignature(pixel.pShaderBytecode,
+                                              &pixel_input)))
+    return true;
+  const microsoft::D3D11_SIGNATURE_PARAMETER *vertex_parameters = nullptr;
+  const microsoft::D3D11_SIGNATURE_PARAMETER *pixel_parameters = nullptr;
+  const UINT vertex_count = vertex_output.GetParameters(&vertex_parameters);
+  const UINT pixel_count = pixel_input.GetParameters(&pixel_parameters);
+  for (UINT i = 0; i < pixel_count; ++i) {
+    const auto &consumer = pixel_parameters[i];
+    if (consumer.SystemValue != microsoft::D3D10_SB_NAME_UNDEFINED)
+      continue;
+    bool matched = false;
+    for (UINT j = 0; j < vertex_count; ++j) {
+      const auto &producer = vertex_parameters[j];
+      if (_stricmp(producer.SemanticName, consumer.SemanticName) == 0 &&
+          producer.SemanticIndex == consumer.SemanticIndex &&
+          producer.Register == consumer.Register &&
+          producer.SystemValue == consumer.SystemValue &&
+          producer.ComponentType == consumer.ComponentType &&
+          (producer.Mask & consumer.Mask) == consumer.Mask) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched)
+      return false;
+  }
+  return true;
 }
 
 D3D12_ROOT_SIGNATURE_FLAGS
@@ -4664,6 +4708,15 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
 
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(5);
+
+  if (HasBytecode(desc->VS) && HasBytecode(desc->PS) &&
+      !HasBytecode(desc->GS) && !HasBytecode(desc->HS) &&
+      !HasBytecode(desc->DS) &&
+      !ValidateDirectVertexPixelLinkage(desc->VS, desc->PS)) {
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
+    StoreStatus(status, E_INVALIDARG);
+    return nullptr;
+  }
 
   hr = AppendPipelineShader(PipelineShaderStage::Vertex, device, desc->VS, shaders);
   if (FAILED(hr)) {
