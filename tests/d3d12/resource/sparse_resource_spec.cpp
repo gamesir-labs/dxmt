@@ -1,7 +1,7 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
-#include "shaders/runtime_test_shaders.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -12,8 +12,8 @@
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CompileShader;
 using dxmt::test::D3D12TestContext;
-using dxmt::test::SparseTextureComputeShader;
 
 enum class SparseCase {
   CreateOnly,
@@ -191,6 +191,7 @@ protected:
   }
 
   void SampleTexture(ID3D12DescriptorHeap *descriptor_heap,
+                     bool expect_mapped_values,
                      std::array<std::uint32_t, 28> *results) {
     constexpr std::uint32_t sentinel = 0xf17e5a3cu;
     D3D12_DESCRIPTOR_RANGE range = {};
@@ -212,8 +213,27 @@ protected:
     ComPtr<ID3D12RootSignature> root_signature =
         context_.CreateRootSignature(root_desc);
     ASSERT_TRUE(root_signature);
-    ComPtr<ID3D12PipelineState> pipeline = context_.CreateComputePipeline(
-        root_signature.get(), SparseTextureComputeShader());
+    const auto shader = CompileShader(R"(
+      Texture2D<uint> input_texture : register(t0);
+      RWByteAddressBuffer output : register(u0);
+
+      [numthreads(1, 1, 1)]
+      void main() {
+        [unroll]
+        for (uint index = 0; index < 28; ++index) {
+          uint2 coordinate = uint2((index * 37 + 3) % 512,
+                                   (index * 19 + 5) % 512);
+          uint value = input_texture.Load(uint3(coordinate, 0));
+          output.Store(index * 4, 0xa5000000u | (value & 0x00ffffffu));
+        }
+      }
+    )",
+                                      "cs_5_0");
+    ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+    const D3D12_SHADER_BYTECODE bytecode = {
+        shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> pipeline =
+        context_.CreateComputePipeline(root_signature.get(), bytecode);
     ASSERT_TRUE(pipeline);
     std::array<std::uint32_t, 28> initial_values = {};
     initial_values.fill(sentinel);
@@ -248,10 +268,17 @@ protected:
         context_.ReadbackBuffer(output.get(), sizeof(*results), &bytes)));
     ASSERT_EQ(bytes.size(), sizeof(*results));
     std::memcpy(results->data(), bytes.data(), sizeof(*results));
-    EXPECT_TRUE(std::none_of(
-        results->begin(), results->end(), [sentinel](std::uint32_t value) {
-          return value == sentinel;
-        }));
+    for (std::size_t index = 0; index < results->size(); ++index) {
+      const std::uint32_t value = (*results)[index];
+      const std::uint32_t x =
+          (static_cast<std::uint32_t>(index) * 37 + 3) % 512;
+      const std::uint32_t y =
+          (static_cast<std::uint32_t>(index) * 19 + 5) % 512;
+      const std::uint32_t expected_texel = expect_mapped_values
+                                               ? y * 512 + x + 1
+                                               : 0;
+      EXPECT_EQ(value, 0xa5000000u | expected_texel) << "sample " << index;
+    }
   }
 
   void CopyToTexture(ID3D12Resource *texture) {
@@ -496,7 +523,7 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
   const bool sample_case = sparse_case == SparseCase::SampleUnmapped ||
                            sparse_case == SparseCase::SampleMapped;
   D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON;
-  if (copy_case)
+  if (copy_case || sparse_case == SparseCase::SampleMapped)
     initial_state = D3D12_RESOURCE_STATE_COPY_DEST;
   else if (sample_case)
     initial_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -554,8 +581,23 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
   }
 
   if (sample_case) {
+    if (sparse_case == SparseCase::SampleMapped) {
+      std::vector<std::uint32_t> texels(resource_desc.Width *
+                                       resource_desc.Height);
+      for (std::size_t index = 0; index < texels.size(); ++index)
+        texels[index] = static_cast<std::uint32_t>(index + 1);
+      ASSERT_EQ(context_.UploadTextureAndReset(
+                    texture.get(), texels.data(),
+                    resource_desc.Width * sizeof(texels[0]),
+                    texels.size() * sizeof(texels[0])),
+                S_OK);
+      D3D12TestContext::Transition(
+          context_.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     std::array<std::uint32_t, 28> results = {};
-    SampleTexture(descriptor_heap.get(), &results);
+    SampleTexture(descriptor_heap.get(),
+                  sparse_case == SparseCase::SampleMapped, &results);
   } else
     CopyToTexture(texture.get());
 }
