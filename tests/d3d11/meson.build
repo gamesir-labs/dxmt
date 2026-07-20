@@ -10,5 +10,11 @@ d3d11_unit_sources = files(
   'view_matrix_spec.cpp',
   'object_com_matrix_spec.cpp',
   'clear_blend_matrix_spec.cpp',
+  'viewport_sampler_matrix_spec.cpp',
+  'dispatch_matrix_spec.cpp',
+  'msaa_resolve_matrix_spec.cpp',
+  'deferred_context_matrix_spec.cpp',
+  'format_mip_matrix_spec.cpp',
+  'map_copy_matrix_spec.cpp',
 )
 d3d11_unit_dependencies = [d3d11_test_dep, dxgi_test_dep, d3dcompiler_test_dep]
