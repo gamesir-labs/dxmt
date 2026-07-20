@@ -359,8 +359,12 @@ D3D12GetDebugInterface(REFIID riid, void **debug) {
 extern "C" HRESULT __stdcall
 D3D12GetInterface(REFCLSID clsid, REFIID riid, void **object) {
   dxmt::InitReturnPtr(object);
-  if (!object)
-    return E_POINTER;
+  if (!object) {
+    if (clsid == dxmt::d3d12::kCLSID_D3D12SDKConfiguration ||
+        clsid == dxmt::d3d12::kCLSID_D3D12DeviceFactory)
+      return S_FALSE;
+    return E_NOINTERFACE;
+  }
 
   if (clsid == dxmt::d3d12::kCLSID_D3D12SDKConfiguration) {
     auto configuration =

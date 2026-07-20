@@ -274,17 +274,11 @@ RootParameterRangeType(D3D12_ROOT_PARAMETER_TYPE type) {
 
 template <typename RootSignatureDesc>
 bool ValidateRootBindingLayout(const RootSignatureDesc &desc) {
-  struct TableInterval {
-    D3D12_DESCRIPTOR_RANGE_TYPE type;
-    uint64_t first;
-    uint64_t end;
-  };
   std::vector<RootBindingInterval> bindings;
   for (UINT parameter_index = 0; parameter_index < desc.NumParameters;
        parameter_index++) {
     const auto &parameter = desc.pParameters[parameter_index];
     if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-      std::vector<TableInterval> table_intervals;
       uint64_t append_offset = 0;
       bool has_unbounded_range = false;
       for (UINT range_index = 0;
@@ -307,12 +301,6 @@ bool ValidateRootBindingLayout(const RootSignatureDesc &desc) {
                 : table_offset + uint64_t(range.NumDescriptors);
         if (table_end > uint64_t(UINT_MAX) + 1)
           return false;
-        for (const auto &interval : table_intervals) {
-          if (interval.type != range.RangeType &&
-              table_offset < interval.end && interval.first < table_end)
-            return false;
-        }
-        table_intervals.push_back({range.RangeType, table_offset, table_end});
         append_offset = table_end;
         has_unbounded_range |= range.NumDescriptors == UINT_MAX;
         if (!AddRootBinding(bindings, range.RangeType, range.RegisterSpace,
@@ -349,6 +337,30 @@ bool ValidateRootBindingLayout(const RootSignatureDesc &desc) {
       return false;
   }
   return true;
+}
+
+template <typename RootSignatureDesc>
+bool RootSignatureCostWithinLimit(const RootSignatureDesc &desc) {
+  uint64_t root_cost = 0;
+  for (UINT i = 0; i < desc.NumParameters; i++) {
+    const auto &parameter = desc.pParameters[i];
+    switch (parameter.ParameterType) {
+    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+      root_cost += 1;
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+      root_cost += parameter.Constants.Num32BitValues;
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+      root_cost += 2;
+      break;
+    default:
+      return false;
+    }
+  }
+  return root_cost <= D3D12_MAX_ROOT_COST;
 }
 
 void
@@ -463,28 +475,6 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
       return false;
   }
 
-  uint64_t root_cost = 0;
-  for (UINT i = 0; i < desc.NumParameters; i++) {
-    const auto &parameter = desc.pParameters[i];
-    switch (parameter.ParameterType) {
-    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
-      root_cost += 1;
-      break;
-    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
-      root_cost += parameter.Constants.Num32BitValues;
-      break;
-    case D3D12_ROOT_PARAMETER_TYPE_CBV:
-    case D3D12_ROOT_PARAMETER_TYPE_SRV:
-    case D3D12_ROOT_PARAMETER_TYPE_UAV:
-      root_cost += 2;
-      break;
-    default:
-      return false;
-    }
-  }
-  if (root_cost > D3D12_MAX_ROOT_COST)
-    return false;
-
   return ValidateRootBindingLayout(desc);
 }
 
@@ -525,28 +515,6 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
     if (!IsValidShaderVisibility(desc.pStaticSamplers[i].ShaderVisibility))
       return false;
   }
-
-  uint64_t root_cost = 0;
-  for (UINT i = 0; i < desc.NumParameters; i++) {
-    const auto &parameter = desc.pParameters[i];
-    switch (parameter.ParameterType) {
-    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
-      root_cost += 1;
-      break;
-    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
-      root_cost += parameter.Constants.Num32BitValues;
-      break;
-    case D3D12_ROOT_PARAMETER_TYPE_CBV:
-    case D3D12_ROOT_PARAMETER_TYPE_SRV:
-    case D3D12_ROOT_PARAMETER_TYPE_UAV:
-      root_cost += 2;
-      break;
-    default:
-      return false;
-    }
-  }
-  if (root_cost > D3D12_MAX_ROOT_COST)
-    return false;
 
   return ValidateRootBindingLayout(desc);
 }
@@ -717,7 +685,8 @@ ExtractRts0Part(std::span<const std::byte> blob,
 
   dxil::ContainerInfo container = {};
   auto status = dxil::ParseContainer(blob.data(), blob.size(), container);
-  if (status != dxil::ParseStatus::Ok)
+  if (status != dxil::ParseStatus::Ok ||
+      container.container_size != blob.size())
     return false;
 
   const auto *part = container.findPart(kRts0FourCC);
@@ -749,11 +718,6 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
   size_t array_size = 0;
   std::vector<BlobInterval> intervals;
   intervals.reserve(3);
-  // Every legal root parameter costs at least one DWORD, so a count above the
-  // architectural root-cost limit can be rejected before any attacker-sized
-  // storage allocation.
-  if (parameter_count > D3D12_MAX_ROOT_COST)
-    return false;
   if (!AddDisjointBlobInterval(intervals, 0, kRts0HeaderSize, rts0.size()))
     return false;
 
@@ -1331,6 +1295,12 @@ CreateRootSignatureFromBlob(IMTLD3D12Device *device,
   RootSignatureStorage storage = {};
   if (!device || !ParseRootSignatureBlob(blob, storage))
     return nullptr;
+  if (storage.version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+    if (!RootSignatureCostWithinLimit(storage.desc_1_0))
+      return nullptr;
+  } else if (!RootSignatureCostWithinLimit(storage.desc_1_1)) {
+    return nullptr;
+  }
 
   std::vector<std::byte> serialized_blob(blob.begin(), blob.end());
   return Com<ID3D12RootSignature>::transfer(

@@ -3946,6 +3946,10 @@ public:
     default:
       return WARN_E_INVALIDARG(__func__);
     }
+    if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+        (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+        desc->NumDescriptors > 2048)
+      return WARN_E_INVALIDARG(__func__);
     if (!descriptor_heap)
       return S_FALSE;
     if (ShouldInjectCreationFailure(
