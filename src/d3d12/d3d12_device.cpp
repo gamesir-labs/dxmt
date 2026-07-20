@@ -2815,7 +2815,8 @@ class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device,
                                                         ID3D12DeviceConfiguration1> {
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
-      : adapter_(adapter), device_(std::move(device))
+      : adapter_(adapter), device_(std::move(device)),
+        pipeline_native_artifact_cache_(CreatePipelineNativeArtifactCache())
 #ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
         , dred_(static_cast<IMTLD3D12Device *>(this))
 #endif
@@ -2986,6 +2987,31 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size, void *data) override {
+    if (guid == dxmt::d3d12::test::kPipelineNativeArtifactCacheStatsGuid) {
+      using dxmt::d3d12::test::PipelineNativeArtifactCacheStats;
+      if (!data_size)
+        return E_INVALIDARG;
+      const UINT required = sizeof(PipelineNativeArtifactCacheStats);
+      if (!data) {
+        *data_size = required;
+        return S_OK;
+      }
+      if (*data_size < required) {
+        *data_size = required;
+        return DXGI_ERROR_MORE_DATA;
+      }
+      const auto internal = dxmt::d3d12::GetPipelineNativeArtifactCacheStats(
+          pipeline_native_artifact_cache_.get());
+      PipelineNativeArtifactCacheStats stats = {};
+      stats.hits = internal.hits;
+      stats.misses = internal.misses;
+      stats.waits = internal.waits;
+      stats.compiles = internal.compiles;
+      stats.compile_failures = internal.compile_failures;
+      std::memcpy(data, &stats, required);
+      *data_size = required;
+      return S_OK;
+    }
     if (guid == dxmt::d3d12::test::kPersistentResidencyStatsGuid) {
       using dxmt::d3d12::test::PersistentResidencyStats;
       if (!data_size)
@@ -3164,6 +3190,11 @@ public:
     LogPSOBinaryArchiveMarker(
         "DXMT_PSO_ARCHIVE: periodic serialize after %llu creates ok=%d",
         static_cast<unsigned long long>(count), ok ? 1 : 0);
+  }
+
+  PipelineNativeArtifactCache *STDMETHODCALLTYPE
+  GetPipelineNativeArtifactCache() override {
+    return pipeline_native_artifact_cache_.get();
   }
 
   DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() override {
@@ -6555,6 +6586,8 @@ private:
 
   Com<IMTLDXGIAdapter> adapter_;
   std::unique_ptr<dxmt::Device> device_;
+  std::shared_ptr<PipelineNativeArtifactCache>
+      pipeline_native_artifact_cache_;
 #ifdef __ID3D12DeviceRemovedExtendedData2_INTERFACE_DEFINED__
   DredDataImpl dred_;
 #endif

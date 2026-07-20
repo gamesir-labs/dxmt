@@ -123,6 +123,7 @@ d3d12_unit_suites = {
       'pipeline/scalar_varying_spec.cpp',
       'pipeline/cached_blob_spec.cpp',
       'pipeline/graphics_creation_spec.cpp',
+      'pipeline/native_cache_spec.cpp',
       'pipeline/stream_spec.cpp',
     ),
     'dependencies': [d3dcompiler_test_dep],

@@ -98,6 +98,23 @@ struct PersistentResidencyStats {
   std::uint64_t total_ref_count = 0;
 };
 
+// Read-only identity of the immutable native artifact backing a public PSO.
+// Public ID3D12PipelineState objects remain distinct even when this value is
+// shared. The address is diagnostic only and must never be dereferenced.
+struct PipelineNativeArtifactIdentity {
+  std::uint32_t struct_size = sizeof(PipelineNativeArtifactIdentity);
+  std::uintptr_t artifact = 0;
+};
+
+struct PipelineNativeArtifactCacheStats {
+  std::uint32_t struct_size = sizeof(PipelineNativeArtifactCacheStats);
+  std::uint64_t hits = 0;
+  std::uint64_t misses = 0;
+  std::uint64_t waits = 0;
+  std::uint64_t compiles = 0;
+  std::uint64_t compile_failures = 0;
+};
+
 inline constexpr GUID kExecutionPathConfigGuid = {
     0x6ca960e8,
     0xe87f,
@@ -121,5 +138,17 @@ inline constexpr GUID kPersistentResidencyStatsGuid = {
     0x0347,
     0x407f,
     {0xaa, 0x72, 0x04, 0x5f, 0x65, 0xed, 0xb7, 0x90}};
+
+inline constexpr GUID kPipelineNativeArtifactIdentityGuid = {
+    0x5e486ca2,
+    0x0362,
+    0x4af9,
+    {0x92, 0x94, 0x2d, 0x8c, 0x39, 0xe2, 0x25, 0x67}};
+
+inline constexpr GUID kPipelineNativeArtifactCacheStatsGuid = {
+    0x870fe3ef,
+    0xe4c0,
+    0x44e6,
+    {0xa6, 0xdc, 0xf9, 0x71, 0x83, 0xb1, 0x48, 0x31}};
 
 } // namespace dxmt::d3d12::test

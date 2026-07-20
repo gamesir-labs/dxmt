@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_d3d12_test_path.hpp"
 #include "dxmt_pipeline_diag.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_shader_cache.hpp"
@@ -24,7 +25,6 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
-#include <deque>
 #if !defined(_WIN32)
 #include <execinfo.h>
 #endif
@@ -35,11 +35,165 @@
 #include <sstream>
 #include <string_view>
 #include <span>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 
 namespace dxmt::d3d12 {
+
+struct PipelineNativeArtifact {
+  explicit PipelineNativeArtifact(PipelineStateType pipeline_type)
+      : type(pipeline_type) {}
+
+  PipelineStateType type;
+  PipelineMetalGraphicsState graphics;
+  PipelineMetalComputeState compute;
+};
+
+// Completed entries are weak so the cache never extends an API object's
+// lifetime. Pending entries are strong and single-flight one synchronous Metal
+// compilation for every semantic key on this D3D12 device.
+class PipelineNativeArtifactCache {
+public:
+  template <typename Factory>
+  std::shared_ptr<PipelineNativeArtifact>
+  Acquire(const std::string &key, dxmt::perf::PsoArtifactKind kind,
+          Factory &&factory) {
+    std::shared_ptr<Pending> pending;
+    bool compile = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (const auto ready = ready_.find(key); ready != ready_.end()) {
+        if (auto artifact = ready->second.lock()) {
+          ++stats_.hits;
+          dxmt::perf::recordPsoArtifactCacheLookup(
+              kind, dxmt::perf::PsoArtifactCacheResult::Hit);
+          return artifact;
+        }
+        ready_.erase(ready);
+      }
+
+      if (const auto in_flight = pending_.find(key);
+          in_flight != pending_.end()) {
+        pending = in_flight->second;
+        ++stats_.waits;
+      } else {
+        pending = std::make_shared<Pending>();
+        pending_.emplace(key, pending);
+        compile = true;
+        ++stats_.misses;
+        PruneExpiredLocked();
+      }
+    }
+
+    if (!compile) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      std::unique_lock lock(pending->mutex);
+      pending->condition.wait(lock, [&] { return pending->complete; });
+      auto artifact = pending->artifact;
+      lock.unlock();
+      dxmt::perf::recordPsoArtifactCacheLookup(
+          kind, dxmt::perf::PsoArtifactCacheResult::Wait,
+          ElapsedMicroseconds(wait_start));
+      return artifact;
+    }
+
+    dxmt::perf::recordPsoArtifactCacheLookup(
+        kind, dxmt::perf::PsoArtifactCacheResult::Miss);
+    const auto compile_start = std::chrono::steady_clock::now();
+    std::shared_ptr<PipelineNativeArtifact> artifact;
+    try {
+      artifact = std::forward<Factory>(factory)();
+    } catch (...) {
+      dxmt::perf::recordPsoArtifactCompile(
+          kind, ElapsedMicroseconds(compile_start), false);
+      Publish(key, pending, nullptr);
+      throw;
+    }
+    dxmt::perf::recordPsoArtifactCompile(
+        kind, ElapsedMicroseconds(compile_start), bool(artifact));
+    Publish(key, pending, artifact);
+    return artifact;
+  }
+
+  PipelineNativeArtifactCacheStats Stats() {
+    std::lock_guard lock(mutex_);
+    return stats_;
+  }
+
+private:
+  struct Pending {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::shared_ptr<PipelineNativeArtifact> artifact;
+    bool complete = false;
+  };
+
+  static uint64_t
+  ElapsedMicroseconds(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+  }
+
+  void Publish(const std::string &key, const std::shared_ptr<Pending> &pending,
+               const std::shared_ptr<PipelineNativeArtifact> &artifact) {
+    {
+      std::lock_guard lock(pending->mutex);
+      pending->artifact = artifact;
+      pending->complete = true;
+    }
+    {
+      std::lock_guard lock(mutex_);
+      ++stats_.compiles;
+      if (!artifact)
+        ++stats_.compile_failures;
+      if (artifact) {
+        try {
+          ready_.insert_or_assign(key, artifact);
+        } catch (...) {
+          // The compiled artifact is still valid for the creator and current
+          // waiters. A bookkeeping allocation failure only disables reuse for
+          // the next Create call; it must not strand the pending wave.
+        }
+      }
+      if (const auto entry = pending_.find(key);
+          entry != pending_.end() && entry->second == pending)
+        pending_.erase(entry);
+    }
+    pending->condition.notify_all();
+  }
+
+  void PruneExpiredLocked() {
+    constexpr size_t kPruneThreshold = 4096;
+    constexpr uint64_t kPruneInterval = 256;
+    if (ready_.size() < kPruneThreshold ||
+        ++insertion_count_ % kPruneInterval)
+      return;
+    for (auto entry = ready_.begin(); entry != ready_.end();) {
+      if (entry->second.expired())
+        entry = ready_.erase(entry);
+      else
+        ++entry;
+    }
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<std::string, std::weak_ptr<PipelineNativeArtifact>> ready_;
+  std::unordered_map<std::string, std::shared_ptr<Pending>> pending_;
+  PipelineNativeArtifactCacheStats stats_;
+  uint64_t insertion_count_ = 0;
+};
+
+std::shared_ptr<PipelineNativeArtifactCache>
+CreatePipelineNativeArtifactCache() {
+  return std::make_shared<PipelineNativeArtifactCache>();
+}
+
+PipelineNativeArtifactCacheStats
+GetPipelineNativeArtifactCacheStats(PipelineNativeArtifactCache *cache) {
+  return cache ? cache->Stats() : PipelineNativeArtifactCacheStats{};
+}
+
 namespace {
 
 std::atomic<uint64_t> g_test_air_initialization_occurrence = 0;
@@ -4220,6 +4374,7 @@ public:
                     ID3D12RootSignature *root_signature,
                     std::vector<PipelineDxilShader> &&shaders,
                     std::vector<PipelineSignatureLink> &&signature_links,
+                    std::string &&shader_cache_key,
                     PipelineGraphicsState &&graphics_state,
                     PipelineComputeState &&compute_state)
       : device_(device), type_(type),
@@ -4228,12 +4383,10 @@ public:
         shaders_(std::move(shaders)),
         signature_links_(std::move(signature_links)),
         graphics_state_(std::move(graphics_state)),
-        compute_state_(std::move(compute_state)) {
+        compute_state_(std::move(compute_state)),
+        shader_cache_key_(std::move(shader_cache_key)) {
     FixGraphicsStatePointers(graphics_state_, shaders_);
     FixComputeStatePointers(compute_state_, shaders_);
-    shader_cache_key_ = BuildShaderCacheKey(type_, shaders_, graphics_state_,
-                                            compute_state_,
-                                            GetRootSignature());
     cached_shader_blob_ =
         BuildCachedShaderBlob(type_, graphics_state_, compute_state_,
                               shader_cache_key_);
@@ -4275,16 +4428,43 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size,
                                            void *data) override {
+    if (guid == dxmt::d3d12::test::kPipelineNativeArtifactIdentityGuid) {
+      using dxmt::d3d12::test::PipelineNativeArtifactIdentity;
+      if (!data_size)
+        return E_INVALIDARG;
+      const UINT required = sizeof(PipelineNativeArtifactIdentity);
+      if (!data) {
+        *data_size = required;
+        return S_OK;
+      }
+      if (*data_size < required) {
+        *data_size = required;
+        return DXGI_ERROR_MORE_DATA;
+      }
+      PipelineNativeArtifactIdentity identity = {};
+      {
+        std::lock_guard lock(metal_mutex_);
+        identity.artifact =
+            reinterpret_cast<std::uintptr_t>(metal_artifact_.get());
+      }
+      std::memcpy(data, &identity, required);
+      *data_size = required;
+      return S_OK;
+    }
     return private_data_.getData(guid, data_size, data);
   }
 
   HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size,
                                            const void *data) override {
+    if (guid == dxmt::d3d12::test::kPipelineNativeArtifactIdentityGuid)
+      return E_INVALIDARG;
     return private_data_.setData(guid, data_size, data);
   }
 
   HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid,
                                                    const IUnknown *data) override {
+    if (guid == dxmt::d3d12::test::kPipelineNativeArtifactIdentityGuid)
+      return E_INVALIDARG;
     return private_data_.setInterface(guid, data);
   }
 
@@ -4350,36 +4530,62 @@ public:
 
     std::lock_guard lock(metal_mutex_);
     if (demote_msaa_srv_mask_lo || demote_msaa_srv_mask_hi) {
-      const auto key =
+      const auto variant_key =
           std::make_pair(demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
-      auto it = metal_graphics_variants_.find(key);
+      auto it = metal_graphics_variants_.find(variant_key);
       if (it == metal_graphics_variants_.end()) {
-        PipelineMetalGraphicsState variant = {};
         const auto variant_shader_cache_key =
             BuildGraphicsVariantShaderCacheKey(
                 shader_cache_key_, demote_msaa_srv_mask_lo,
                 demote_msaa_srv_mask_hi);
-        if (!CreateMetalGraphicsPipeline(
-                device_.ptr(), shaders_, graphics_state_,
-                root_signature_.ptr(), variant_shader_cache_key, variant,
-                demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi))
+        auto *cache = device_->GetPipelineNativeArtifactCache();
+        if (!cache)
           return nullptr;
-        it = metal_graphics_variants_.emplace(key, std::move(variant)).first;
+        auto artifact = cache->Acquire(
+            variant_shader_cache_key,
+            dxmt::perf::PsoArtifactKind::GraphicsVariant, [&] {
+              auto created =
+                  std::make_shared<PipelineNativeArtifact>(
+                      PipelineStateType::Graphics);
+              if (!CreateMetalGraphicsPipeline(
+                      device_.ptr(), shaders_, graphics_state_,
+                      root_signature_.ptr(), variant_shader_cache_key,
+                      created->graphics, demote_msaa_srv_mask_lo,
+                      demote_msaa_srv_mask_hi))
+                return std::shared_ptr<PipelineNativeArtifact>();
+              return created;
+            });
+        if (!artifact || artifact->type != PipelineStateType::Graphics)
+          return nullptr;
+        it = metal_graphics_variants_
+                 .emplace(variant_key, std::move(artifact))
+                 .first;
       }
-      return it->second.pso ? &it->second : nullptr;
+      return it->second->graphics.pso ? &it->second->graphics : nullptr;
     }
 
-    if (!metal_graphics_ready_) {
-      PipelineMetalGraphicsState state = {};
-      if (!CreateMetalGraphicsPipeline(device_.ptr(), shaders_, graphics_state_,
-                                       root_signature_.ptr(), shader_cache_key_,
-                                       state))
+    if (!metal_artifact_) {
+      auto *cache = device_->GetPipelineNativeArtifactCache();
+      if (!cache)
         return nullptr;
-      metal_graphics_ = std::move(state);
-      metal_graphics_ready_ = true;
+      metal_artifact_ = cache->Acquire(
+          shader_cache_key_, dxmt::perf::PsoArtifactKind::Graphics, [&] {
+            auto created = std::make_shared<PipelineNativeArtifact>(
+                PipelineStateType::Graphics);
+            if (!CreateMetalGraphicsPipeline(
+                    device_.ptr(), shaders_, graphics_state_,
+                    root_signature_.ptr(), shader_cache_key_,
+                    created->graphics))
+              return std::shared_ptr<PipelineNativeArtifact>();
+            return created;
+          });
     }
 
-    return metal_graphics_.pso ? &metal_graphics_ : nullptr;
+    return metal_artifact_ &&
+                   metal_artifact_->type == PipelineStateType::Graphics &&
+                   metal_artifact_->graphics.pso
+               ? &metal_artifact_->graphics
+               : nullptr;
   }
 
   const PipelineMetalComputeState *GetMetalComputeState() override {
@@ -4387,17 +4593,27 @@ public:
       return nullptr;
 
     std::lock_guard lock(metal_mutex_);
-    if (!metal_compute_ready_) {
-      PipelineMetalComputeState state = {};
-      if (!CreateMetalComputePipeline(device_.ptr(), shaders_,
-                                      root_signature_.ptr(), shader_cache_key_,
-                                      state))
+    if (!metal_artifact_) {
+      auto *cache = device_->GetPipelineNativeArtifactCache();
+      if (!cache)
         return nullptr;
-      metal_compute_ = std::move(state);
-      metal_compute_ready_ = true;
+      metal_artifact_ = cache->Acquire(
+          shader_cache_key_, dxmt::perf::PsoArtifactKind::Compute, [&] {
+            auto created = std::make_shared<PipelineNativeArtifact>(
+                PipelineStateType::Compute);
+            if (!CreateMetalComputePipeline(
+                    device_.ptr(), shaders_, root_signature_.ptr(),
+                    shader_cache_key_, created->compute))
+              return std::shared_ptr<PipelineNativeArtifact>();
+            return created;
+          });
     }
 
-    return metal_compute_.pso ? &metal_compute_ : nullptr;
+    return metal_artifact_ &&
+                   metal_artifact_->type == PipelineStateType::Compute &&
+                   metal_artifact_->compute.pso
+               ? &metal_artifact_->compute
+               : nullptr;
   }
 
   bool UsesBindlessMirror() const override { return uses_bindless_mirror_; }
@@ -4421,128 +4637,13 @@ private:
   bool uses_bindless_mirror_ = false;
   DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version_ =
       DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
-  bool metal_graphics_ready_ = false;
-  bool metal_compute_ready_ = false;
-  PipelineMetalGraphicsState metal_graphics_;
-  std::map<std::pair<uint64_t, uint64_t>, PipelineMetalGraphicsState>
+  std::shared_ptr<PipelineNativeArtifact> metal_artifact_;
+  std::map<std::pair<uint64_t, uint64_t>,
+           std::shared_ptr<PipelineNativeArtifact>>
       metal_graphics_variants_;
-  PipelineMetalComputeState metal_compute_;
   ComPrivateData private_data_;
   std::string name_;
 };
-
-// Async PSO precompile worker pool. The Metal PSO is otherwise compiled lazily
-// on the RECORD thread at first-draw (GetMetalGraphicsState/ComputeState),
-// which dominates frame time (~99% of stall, 0.8-44ms each). This pool calls
-// those same idempotent compile methods on low-priority background workers at
-// PSO-CREATE time, so the first draw usually finds the PSO already compiled.
-// The lazy path remains a correctness-preserving fallback (the compile methods
-// are guarded by metal_mutex_ + a ready flag, so a worker compile and a
-// fallback record-thread compile are mutually exclusive and idempotent).
-// Gated by DXMT_ASYNC_PSO_COMPILE (default off). Modeled on
-// ReservedTextureMaterializer (d3d12_resource.cpp).
-class PipelineCompiler {
-public:
-  static PipelineCompiler &Get() {
-    static PipelineCompiler instance;
-    return instance;
-  }
-
-  static bool Enabled() {
-    static const bool on = env::getEnvVar("DXMT_ASYNC_PSO_COMPILE") == "1";
-    return on;
-  }
-
-  void Enqueue(ID3D12PipelineState *pso) {
-    if (!pso)
-      return;
-    Com<ID3D12PipelineState> ref = pso; // keep alive while queued
-    {
-      std::lock_guard lock(mutex_);
-      if (stopping_)
-        return;
-      StartWorkersLocked();
-      queue_.push_back(std::move(ref));
-      ++enqueued_;
-    }
-    cond_.notify_one();
-  }
-
-private:
-  PipelineCompiler() = default;
-
-  ~PipelineCompiler() {
-    {
-      std::lock_guard lock(mutex_);
-      stopping_ = true;
-      queue_.clear();
-    }
-    cond_.notify_all();
-    for (auto &worker : workers_) {
-      if (worker.joinable())
-        worker.join();
-    }
-  }
-
-  void StartWorkersLocked() {
-    if (!workers_.empty())
-      return;
-    UINT count = ParseWorkerCount();
-    for (UINT i = 0; i < count; i++) {
-      workers_.emplace_back([this] { WorkerMain(); });
-      workers_.back().set_priority(dxmt::ThreadPriority::Lowest);
-    }
-  }
-
-  static UINT ParseWorkerCount() {
-    auto v = env::getEnvVar("DXMT_ASYNC_PSO_COMPILE_WORKERS");
-    UINT n = v.empty() ? 4u : (UINT)strtoul(v.c_str(), nullptr, 10);
-    if (n < 1u) n = 1u;
-    if (n > 16u) n = 16u;
-    return n;
-  }
-
-  void WorkerMain();
-
-  dxmt::mutex mutex_;
-  dxmt::condition_variable cond_;
-  std::deque<Com<ID3D12PipelineState>> queue_;
-  std::vector<dxmt::thread> workers_;
-  bool stopping_ = false;
-  uint64_t enqueued_ = 0;
-  std::atomic<uint64_t> compiled_{0};
-};
-
-void PipelineCompiler::WorkerMain() {
-  env::setThreadName("dxmt-pso-compile");
-  for (;;) {
-    Com<ID3D12PipelineState> pso;
-    {
-      std::unique_lock lock(mutex_);
-      cond_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-      if (stopping_ && queue_.empty())
-        return;
-      if (queue_.empty())
-        continue;
-      pso = std::move(queue_.front());
-      queue_.pop_front();
-    }
-    auto *state = dynamic_cast<PipelineState *>(pso.ptr());
-    if (!state)
-      continue;
-    // Idempotent: ready-flag + metal_mutex_ guard inside these methods make a
-    // background compile race-free vs a fallback record-thread compile.
-    if (state->GetType() == PipelineStateType::Graphics)
-      state->GetMetalGraphicsState();
-    else if (state->GetType() == PipelineStateType::Compute)
-      state->GetMetalComputeState();
-    const auto done = compiled_.fetch_add(1, std::memory_order_relaxed) + 1;
-    static std::atomic<uint32_t> log_count{0};
-    if ((done & (done - 1)) == 0 &&
-        log_count.fetch_add(1, std::memory_order_relaxed) < 64)
-      INFO("D3D12PipelineCompiler: async precompile progress compiled=", done);
-  }
-}
 
 Com<ID3D12PipelineState>
 CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
@@ -4555,13 +4656,14 @@ CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
     return nullptr;
   auto resolved_root_signature =
       ResolveRootSignature(device, root_signature, shaders);
-  const auto shader_cache_key =
+  auto shader_cache_key =
       BuildShaderCacheKey(type, shaders, graphics_state, compute_state,
                           resolved_root_signature.ptr());
   DebugLogSignatureLinks(shader_cache_key, signature_links);
   auto pso = Com<ID3D12PipelineState>::transfer(
       new PipelineStateImpl(device, type, resolved_root_signature.ptr(),
                             std::move(shaders), std::move(signature_links),
+                            std::move(shader_cache_key),
                             std::move(graphics_state),
                             std::move(compute_state)));
   return pso;

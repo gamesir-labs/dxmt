@@ -8,6 +8,18 @@ namespace dxmt::perf {
 
 bool enabled();
 
+enum class PsoArtifactKind : uint32_t {
+  Graphics,
+  Compute,
+  GraphicsVariant,
+};
+
+enum class PsoArtifactCacheResult : uint32_t {
+  Hit,
+  Miss,
+  Wait,
+};
+
 enum class FrameTimeBucket : uint32_t {
   ExecuteCommandLists,
   Present,
@@ -229,6 +241,11 @@ void recordTileMapping(uint64_t standard_ops, uint64_t packed_ops,
 
 void recordGraphicsPipelineCreate(uint64_t duration_us, bool success);
 void recordComputePipelineCreate(uint64_t duration_us, bool success);
+void recordPsoArtifactCacheLookup(PsoArtifactKind kind,
+                                  PsoArtifactCacheResult result,
+                                  uint64_t wait_us = 0);
+void recordPsoArtifactCompile(PsoArtifactKind kind, uint64_t duration_us,
+                              bool success);
 void recordMetalCommandBufferCommit(uint64_t duration_us);
 void recordDrawableAcquire(uint64_t duration_us);
 void recordDescriptorContentWrite(uint32_t kind);

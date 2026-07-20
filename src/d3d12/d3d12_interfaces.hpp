@@ -8,6 +8,9 @@
 
 namespace dxmt {
 class Device;
+namespace d3d12 {
+class PipelineNativeArtifactCache;
+}
 }
 
 // Internal DXGI bridge implemented by the D3D12 device so existing DXGI
@@ -18,6 +21,8 @@ DEFINE_COM_INTERFACE("7f7f9293-9c67-4c3f-865b-30c92e1a7d12", IMTLD3D12Device)
   virtual WMT::BinaryArchive *STDMETHODCALLTYPE GetPSOBinaryArchive() = 0;
   virtual std::mutex &STDMETHODCALLTYPE GetPSOBinaryArchiveMutex() = 0;
   virtual void STDMETHODCALLTYPE NotePSOBinaryArchivePipelineCreated() = 0;
+  virtual dxmt::d3d12::PipelineNativeArtifactCache *STDMETHODCALLTYPE
+  GetPipelineNativeArtifactCache() = 0;
   virtual dxmt::Device &GetDXMTDevice() = 0;
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;

@@ -10,6 +10,16 @@
 namespace dxmt::perf {
 namespace {
 
+struct PsoArtifactCounters {
+  std::atomic<uint64_t> cache_hits = {0};
+  std::atomic<uint64_t> cache_misses = {0};
+  std::atomic<uint64_t> cache_waits = {0};
+  std::atomic<uint64_t> cache_wait_us = {0};
+  std::atomic<uint64_t> compiles = {0};
+  std::atomic<uint64_t> compile_us = {0};
+  std::atomic<uint64_t> compile_failures = {0};
+};
+
 struct Counters {
   std::atomic<uint64_t> frames = {0};
   std::atomic<uint64_t> wait_cpu_fence_count = {0};
@@ -46,6 +56,9 @@ struct Counters {
   std::atomic<uint64_t> compute_pso_create_us = {0};
   std::atomic<uint64_t> compute_pso_create_max_us = {0};
   std::atomic<uint64_t> compute_pso_create_failures = {0};
+  PsoArtifactCounters graphics_pso_artifacts;
+  PsoArtifactCounters compute_pso_artifacts;
+  PsoArtifactCounters graphics_pso_variant_artifacts;
   std::atomic<uint64_t> frame_wall_us = {0};
   std::atomic<uint64_t> frame_wall_max_us = {0};
   std::atomic<uint64_t> frame_command_buffers = {0};
@@ -152,6 +165,18 @@ uint64_t sample(std::atomic<uint64_t> &value) {
 
 uint64_t durationUs(dxmt::clock::duration value) {
   return std::chrono::duration_cast<std::chrono::microseconds>(value).count();
+}
+
+PsoArtifactCounters &psoArtifactCounters(PsoArtifactKind kind) {
+  switch (kind) {
+  case PsoArtifactKind::Graphics:
+    return g_counters.graphics_pso_artifacts;
+  case PsoArtifactKind::Compute:
+    return g_counters.compute_pso_artifacts;
+  case PsoArtifactKind::GraphicsVariant:
+    return g_counters.graphics_pso_variant_artifacts;
+  }
+  return g_counters.graphics_pso_artifacts;
 }
 
 constexpr std::array<const char *, kPerfCodePathCount> kPerfCodePathNames = {
@@ -434,6 +459,48 @@ void flushCounters(uint64_t frame, bool final) {
                   sample(g_counters.compute_pso_create_max_us),
                   " computePsoCreateFailures=",
                   sample(g_counters.compute_pso_create_failures),
+                  " graphicsPsoCacheHits=",
+                  sample(g_counters.graphics_pso_artifacts.cache_hits),
+                  " graphicsPsoCacheMisses=",
+                  sample(g_counters.graphics_pso_artifacts.cache_misses),
+                  " graphicsPsoCacheWaits=",
+                  sample(g_counters.graphics_pso_artifacts.cache_waits),
+                  " graphicsPsoCacheWaitUs=",
+                  sample(g_counters.graphics_pso_artifacts.cache_wait_us),
+                  " graphicsPsoArtifactCompiles=",
+                  sample(g_counters.graphics_pso_artifacts.compiles),
+                  " graphicsPsoArtifactCompileUs=",
+                  sample(g_counters.graphics_pso_artifacts.compile_us),
+                  " graphicsPsoArtifactCompileFailures=",
+                  sample(g_counters.graphics_pso_artifacts.compile_failures),
+                  " computePsoCacheHits=",
+                  sample(g_counters.compute_pso_artifacts.cache_hits),
+                  " computePsoCacheMisses=",
+                  sample(g_counters.compute_pso_artifacts.cache_misses),
+                  " computePsoCacheWaits=",
+                  sample(g_counters.compute_pso_artifacts.cache_waits),
+                  " computePsoCacheWaitUs=",
+                  sample(g_counters.compute_pso_artifacts.cache_wait_us),
+                  " computePsoArtifactCompiles=",
+                  sample(g_counters.compute_pso_artifacts.compiles),
+                  " computePsoArtifactCompileUs=",
+                  sample(g_counters.compute_pso_artifacts.compile_us),
+                  " computePsoArtifactCompileFailures=",
+                  sample(g_counters.compute_pso_artifacts.compile_failures),
+                  " graphicsPsoVariantCacheHits=",
+                  sample(g_counters.graphics_pso_variant_artifacts.cache_hits),
+                  " graphicsPsoVariantCacheMisses=",
+                  sample(g_counters.graphics_pso_variant_artifacts.cache_misses),
+                  " graphicsPsoVariantCacheWaits=",
+                  sample(g_counters.graphics_pso_variant_artifacts.cache_waits),
+                  " graphicsPsoVariantCacheWaitUs=",
+                  sample(g_counters.graphics_pso_variant_artifacts.cache_wait_us),
+                  " graphicsPsoVariantArtifactCompiles=",
+                  sample(g_counters.graphics_pso_variant_artifacts.compiles),
+                  " graphicsPsoVariantArtifactCompileUs=",
+                  sample(g_counters.graphics_pso_variant_artifacts.compile_us),
+                  " graphicsPsoVariantArtifactCompileFailures=",
+                  sample(g_counters.graphics_pso_variant_artifacts.compile_failures),
                   " frameWallUs=", sample(g_counters.frame_wall_us),
                   " frameWallMaxUs=",
                   sample(g_counters.frame_wall_max_us),
@@ -2178,6 +2245,37 @@ void recordComputePipelineCreate(uint64_t duration_us, bool success) {
   if (!success)
     g_counters.compute_pso_create_failures.fetch_add(
         1, std::memory_order_relaxed);
+}
+
+void recordPsoArtifactCacheLookup(PsoArtifactKind kind,
+                                  PsoArtifactCacheResult result,
+                                  uint64_t wait_us) {
+  if (!enabled())
+    return;
+  auto &counters = psoArtifactCounters(kind);
+  switch (result) {
+  case PsoArtifactCacheResult::Hit:
+    counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case PsoArtifactCacheResult::Miss:
+    counters.cache_misses.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case PsoArtifactCacheResult::Wait:
+    counters.cache_waits.fetch_add(1, std::memory_order_relaxed);
+    counters.cache_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+    break;
+  }
+}
+
+void recordPsoArtifactCompile(PsoArtifactKind kind, uint64_t duration_us,
+                              bool success) {
+  if (!enabled())
+    return;
+  auto &counters = psoArtifactCounters(kind);
+  counters.compiles.fetch_add(1, std::memory_order_relaxed);
+  counters.compile_us.fetch_add(duration_us, std::memory_order_relaxed);
+  if (!success)
+    counters.compile_failures.fetch_add(1, std::memory_order_relaxed);
 }
 
 void recordMetalCommandBufferCommit(uint64_t duration_us) {

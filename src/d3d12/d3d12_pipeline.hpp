@@ -16,6 +16,21 @@
 
 namespace dxmt::d3d12 {
 
+class PipelineNativeArtifactCache;
+
+struct PipelineNativeArtifactCacheStats {
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t waits = 0;
+  uint64_t compiles = 0;
+  uint64_t compile_failures = 0;
+};
+
+std::shared_ptr<PipelineNativeArtifactCache>
+CreatePipelineNativeArtifactCache();
+PipelineNativeArtifactCacheStats
+GetPipelineNativeArtifactCacheStats(PipelineNativeArtifactCache *cache);
+
 enum class PipelineStateType {
   Graphics,
   Compute,
