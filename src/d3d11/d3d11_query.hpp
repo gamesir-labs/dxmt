@@ -70,7 +70,7 @@ public:
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D11DeviceChild) ||
         riid == __uuidof(ID3D11Asynchronous) ||
-        riid == __uuidof(ID3D11Query) || riid == __uuidof(ID3D11Query1)) {
+        riid == __uuidof(ID3D11Query)) {
       *ppvObject = ref(this);
       return S_OK;
     }

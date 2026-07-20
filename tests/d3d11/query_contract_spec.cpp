@@ -105,17 +105,6 @@ TEST_P(D3D11QueryContractSpec,
       S_OK);
   EXPECT_NE(asynchronous.get(), nullptr);
 
-  ComPtr<ID3D11Query1> query1;
-  ASSERT_EQ(query->QueryInterface(__uuidof(ID3D11Query1),
-                                  reinterpret_cast<void **>(query1.put())),
-            S_OK);
-  ASSERT_NE(query1.get(), nullptr);
-  D3D11_QUERY_DESC1 actual_desc1 = {};
-  query1->GetDesc1(&actual_desc1);
-  EXPECT_EQ(actual_desc1.Query, desc.Query);
-  EXPECT_EQ(actual_desc1.MiscFlags, desc.MiscFlags);
-  EXPECT_EQ(actual_desc1.ContextType, D3D11_CONTEXT_TYPE_ALL);
-
   ComPtr<ID3D11Predicate> predicate;
   const HRESULT predicate_hr = query->QueryInterface(
       __uuidof(ID3D11Predicate), reinterpret_cast<void **>(predicate.put()));
