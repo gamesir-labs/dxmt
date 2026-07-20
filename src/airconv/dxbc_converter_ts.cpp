@@ -830,9 +830,12 @@ convert_dxbc_tesselator_domain_shader(
     func_signature.DefineMeshVertexOutput(air::OutputPointSize {});
   }
 
-  if (pShaderInternal->clip_distance_scalars.size() > 0) {
+  const size_t metal_clip_distance_count =
+      pShaderInternal->clip_distance_scalars.size() +
+      pShaderInternal->cull_distance_scalars.size();
+  if (metal_clip_distance_count > 0) {
     func_signature.DefineMeshVertexOutput(
-        air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
+        air::OutputClipDistance{.count = metal_clip_distance_count}
     );
   }
 
@@ -985,6 +988,19 @@ convert_dxbc_tesselator_domain_shader(
     );
     air.CreateSetMeshClipDistance(
         vertex_id, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr)
+    );
+  }
+  for (auto x : llvm::enumerate(pShaderInternal->cull_distance_scalars)) {
+    if (x.value().reg >= max_output_register)
+      continue;
+    auto src_ptr = builder.CreateGEP(
+        llvm::ArrayType::get(types._float4, max_output_register), resource_map.output.ptr_float4,
+        {builder.getInt32(0), builder.getInt32(x.value().reg), builder.getInt32(x.value().component)}
+    );
+    air.CreateSetMeshClipDistance(
+        vertex_id,
+        builder.getInt32(pShaderInternal->clip_distance_scalars.size() + x.index()),
+        builder.CreateLoad(types._float, src_ptr)
     );
   }
 

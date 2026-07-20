@@ -1957,11 +1957,13 @@ llvm::Error convert_dxbc_vertex_shader(
     func_signature.DefineInput(air::InputBaseInstance{});
 
   uint32_t clip_distance_out_idx = ~0u;
-  const bool emit_clip_distance =
-      pShaderInternal->clip_distance_scalars.size();
+  const size_t metal_clip_distance_count =
+      pShaderInternal->clip_distance_scalars.size() +
+      pShaderInternal->cull_distance_scalars.size();
+  const bool emit_clip_distance = metal_clip_distance_count != 0;
   if (emit_clip_distance) {
     clip_distance_out_idx = func_signature.DefineOutput(
-      air::OutputClipDistance{pShaderInternal->clip_distance_scalars.size()}
+      air::OutputClipDistance{metal_clip_distance_count}
     );
   };
 
@@ -2053,11 +2055,23 @@ llvm::Error convert_dxbc_vertex_shader(
 
   if (emit_clip_distance) {
     auto clip_distance_ty = llvm::ArrayType::get(
-      types._float, pShaderInternal->clip_distance_scalars.size()
+      types._float, metal_clip_distance_count
     );
     pvalue clip_distance_array = llvm::ConstantAggregateZero::get(clip_distance_ty);
     unsigned clip_distance_idx = 0;
     for (auto &scalar : pShaderInternal->clip_distance_scalars) {
+      auto src_ptr = builder.CreateGEP(
+        resource_map.output.ptr_float4->getType()
+          ->getNonOpaquePointerElementType(),
+        resource_map.output.ptr_float4,
+        {builder.getInt32(0), builder.getInt32(scalar.reg),
+         builder.getInt32(scalar.component)}
+      );
+      clip_distance_array = builder.CreateInsertValue(
+        clip_distance_array, builder.CreateLoad(types._float, src_ptr), {clip_distance_idx++}
+      );
+    }
+    for (auto &scalar : pShaderInternal->cull_distance_scalars) {
       auto src_ptr = builder.CreateGEP(
         resource_map.output.ptr_float4->getType()
           ->getNonOpaquePointerElementType(),
