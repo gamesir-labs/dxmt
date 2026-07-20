@@ -188,9 +188,11 @@ TEST_F(D3D12ShaderSystemValueSpec,
       return output;
     })",
                                  R"(
-    float4 main(nointerpolation float instance_marker : TEXCOORD0) : SV_Target {
-      return instance_marker < 0.5 ? float4(1, 0, 0, 1)
-                                   : float4(0, 1, 0, 1);
+    float4 main(float4 position : SV_Position,
+                nointerpolation float instance_marker : TEXCOORD0) : SV_Target {
+      const float4 color = instance_marker < 0.5 ? float4(1, 0, 0, 1)
+                                                  : float4(0, 1, 0, 1);
+      return color * (position.w > 0.0);
     })");
   ASSERT_TRUE(pipeline);
   const auto readback = DrawAndRead(pipeline.get(), 3, 2, 4, 7);

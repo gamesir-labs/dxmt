@@ -40,7 +40,7 @@ protected:
           ByteAddressBuffer input : register(t0);
           RWBuffer<uint> output : register(u0);
           [numthreads(1, 1, 1)]
-          void main() { output[1] = input.Load(0); }
+          void main() { output[1] = input.Load(5 * 4); }
         )",
         R"(
           StructuredBuffer<uint> input : register(t0);
@@ -90,8 +90,8 @@ protected:
       srv.Buffer.NumElements = 4;
     } else if (view_index == 1) {
       srv.Format = DXGI_FORMAT_R32_TYPELESS;
-      srv.Buffer.FirstElement = 5;
-      srv.Buffer.NumElements = 3;
+      srv.Buffer.FirstElement = 0;
+      srv.Buffer.NumElements = 32;
       srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     } else {
       srv.Format = DXGI_FORMAT_UNKNOWN;

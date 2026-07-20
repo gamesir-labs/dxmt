@@ -35,8 +35,9 @@ Output main(uint vertex_id : SV_VertexID) {
 )";
 
 constexpr char kScalarVaryingPixelShader[] = R"(
-float4 main(float4 scalar : TEXCOORD0) : SV_Target {
-  return float4(scalar.x, 0.0, 0.0, 1.0);
+float4 main(float4 position : SV_Position,
+            float4 scalar : TEXCOORD0) : SV_Target {
+  return float4(scalar.x, 0.0, 0.0, position.w > 0.0);
 }
 )";
 
@@ -60,8 +61,9 @@ Output main(uint vertex_id : SV_VertexID) {
 )";
 
 constexpr char kNarrowVaryingPixelShader[] = R"(
-float4 main(float2 varying : TEXCOORD0) : SV_Target {
-  return float4(varying, 0.0, 1.0);
+float4 main(float4 position : SV_Position,
+            float2 varying : TEXCOORD0) : SV_Target {
+  return float4(varying, 0.0, position.w > 0.0);
 }
 )";
 
@@ -85,20 +87,23 @@ Output main(uint vertex_id : SV_VertexID) {
 )";
 
 constexpr char kWideVaryingPixelShader[] = R"(
-float4 main(float4 varying : TEXCOORD0) : SV_Target {
-  return varying;
+float4 main(float4 position : SV_Position,
+            float4 varying : TEXCOORD0) : SV_Target {
+  return varying * (position.w > 0.0);
 }
 )";
 
 constexpr char kMissingSemanticPixelShader[] = R"(
-float4 main(float4 varying : COLOR0) : SV_Target {
-  return varying;
+float4 main(float4 position : SV_Position,
+            float4 varying : COLOR0) : SV_Target {
+  return varying * (position.w > 0.0);
 }
 )";
 
 constexpr char kIntegerVaryingPixelShader[] = R"(
-float4 main(nointerpolation uint4 varying : TEXCOORD0) : SV_Target {
-  return float4(varying);
+float4 main(float4 position : SV_Position,
+            nointerpolation uint4 varying : TEXCOORD0) : SV_Target {
+  return float4(varying) * (position.w > 0.0);
 }
 )";
 
@@ -124,9 +129,10 @@ Output main(uint vertex_id : SV_VertexID) {
 )";
 
 constexpr char kReversedVaryingPixelShader[] = R"(
-float4 main(float2 second : TEXCOORD1,
+float4 main(float4 position : SV_Position,
+            float2 second : TEXCOORD1,
             float2 first : TEXCOORD0) : SV_Target {
-  return float4(first, second);
+  return float4(first, second) * (position.w > 0.0);
 }
 )";
 
@@ -346,14 +352,14 @@ TEST_F(D3D12ScalarVaryingSpec,
   )";
   constexpr char kPixel[] = R"(
     struct Input {
+      float4 position : SV_Position;
       nointerpolation float4 color : TEXCOORD0;
     };
     float4 main(Input input) : SV_Target {
-      return input.color;
+      return input.color * (input.position.w > 0.0);
     }
   )";
-  // Vertex 0 values dominate nointerpolation for the fullscreen triangle
-  // coverage at the center sample under DXMT/Metal convention used here.
+  // The first vertex supplies nointerpolation values for this triangle list.
   RenderAndExpectCenter(kVertex, kPixel, 0x20bf8040u);
 }
 
