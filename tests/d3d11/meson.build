@@ -20,6 +20,7 @@ d3d11_unit_sources = files(
   'map_copy_matrix_spec.cpp',
   'shader_arithmetic_matrix_spec.cpp',
   'shader_conversion_matrix_spec.cpp',
+  'shader_derivative_ops_spec.cpp',
   'raw_buffer_shader_matrix_spec.cpp',
   'raw_uav_atomic_spec.cpp',
   'shader_atomic_matrix_spec.cpp',
