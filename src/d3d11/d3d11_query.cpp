@@ -308,7 +308,7 @@ CreateOcclusionQuery(MTLD3D11Device *pDevice, const D3D11_QUERY_DESC1 *pDesc, ID
 class MTLD3D11TimestampQueryImpl : public MTLD3DQueryBase<MTLD3D11TimestampQuery> {
   using MTLD3DQueryBase<MTLD3D11TimestampQuery>::MTLD3DQueryBase;
 
-  QueryState state_ = QueryState::Signaled;
+  QueryState state_ = QueryState::Undefined;
 
   Rc<TimestampQuery> query_ = new TimestampQuery();
   uint64_t latest_value_ = 0;
@@ -320,6 +320,8 @@ class MTLD3D11TimestampQueryImpl : public MTLD3DQueryBase<MTLD3D11TimestampQuery
 
   virtual HRESULT
   GetData(void *data) override {
+    if (state_ == QueryState::Undefined)
+      return DXGI_ERROR_INVALID_CALL;
     if (state_ == QueryState::Signaled || query_->getValue(&latest_value_)) {
       *((uint64_t *)data) = latest_value_;
       query_ = new TimestampQuery();

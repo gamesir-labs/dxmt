@@ -69,7 +69,20 @@ public:
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D11DeviceChild) ||
-        riid == __uuidof(ID3D11Query)) {
+        riid == __uuidof(ID3D11Asynchronous) ||
+        riid == __uuidof(ID3D11Query) || riid == __uuidof(ID3D11Query1)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    const bool is_predicate =
+        desc_.Query == D3D11_QUERY_OCCLUSION_PREDICATE ||
+        desc_.Query == D3D11_QUERY_SO_OVERFLOW_PREDICATE ||
+        desc_.Query == D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0 ||
+        desc_.Query == D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1 ||
+        desc_.Query == D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2 ||
+        desc_.Query == D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3;
+    if (is_predicate && riid == __uuidof(ID3D11Predicate)) {
       *ppvObject = ref(this);
       return S_OK;
     }

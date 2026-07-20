@@ -6,6 +6,7 @@ d3d11_unit_sources = files(
   'draw_matrix_spec.cpp',
   'transfer_matrix_spec.cpp',
   'query_matrix_spec.cpp',
+  'query_contract_spec.cpp',
   'depth_stencil_matrix_spec.cpp',
   'view_matrix_spec.cpp',
   'object_com_matrix_spec.cpp',

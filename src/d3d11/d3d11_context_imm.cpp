@@ -903,6 +903,7 @@ public:
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
+    case D3D11_QUERY_PIPELINE_STATISTICS:
     case D3D11_QUERY_EVENT: {
     if (!pending_buffer_updates_.empty() || ctx_state.has_dirty_op_since_last_event) {
         FlushAllPendingBufferUpdates();
@@ -936,10 +937,6 @@ public:
           enc.endVisibilityResultQuery(std::move(query));
         });
       promote_flush = true;
-      break;
-    }
-    case D3D11_QUERY_PIPELINE_STATISTICS: {
-      // ignore
       break;
     }
     default:
@@ -976,7 +973,8 @@ public:
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
     case D3D11_QUERY_EVENT:
-    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+    case D3D11_QUERY_TIMESTAMP_DISJOINT:
+    case D3D11_QUERY_PIPELINE_STATISTICS: {
       switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
       case EventState::Pending:
         break;
@@ -1025,10 +1023,10 @@ public:
       break;
     }
     case D3D11_QUERY_PIPELINE_STATISTICS: {
-      if (pData) {
+      if (hr == S_OK && pData) {
         (*static_cast<D3D11_QUERY_DATA_PIPELINE_STATISTICS *>(pData)) = {};
       }
-      return S_OK;
+      break;
     }
     default:
       ERR("Unknown query type ", desc.Query);

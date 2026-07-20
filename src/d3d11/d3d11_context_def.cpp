@@ -373,6 +373,7 @@ public:
     switch (desc.Query) {
     case D3D11_QUERY_EVENT:
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
+    case D3D11_QUERY_PIPELINE_STATISTICS:
       promote_flush = true;
       ctx_state.current_cmdlist->issued_event_query.push_back(static_cast<MTLD3D11EventQuery *>(pAsync));
       break;
@@ -397,10 +398,6 @@ public:
       });
       ctx_state.current_cmdlist->issued_visibility_query.push_back(std::move(building_query->second));
       ctx_state.building_visibility_queries.erase(building_query);
-      break;
-    }
-    case D3D11_QUERY_PIPELINE_STATISTICS: {
-      // ignore
       break;
     }
     default:

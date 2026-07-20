@@ -422,6 +422,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateQuery(const D3D11_QUERY_DESC *pQueryDesc, ID3D11Query **ppQuery) override {
+    InitReturnPtr(ppQuery);
+    if (!pQueryDesc)
+      return E_INVALIDARG;
+
     D3D11_QUERY_DESC1 desc;
     desc.Query = pQueryDesc->Query;
     desc.MiscFlags = pQueryDesc->MiscFlags;
@@ -432,6 +436,22 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreatePredicate(const D3D11_QUERY_DESC *pPredicateDesc,
                   ID3D11Predicate **ppPredicate) override {
+    InitReturnPtr(ppPredicate);
+    if (!pPredicateDesc)
+      return E_INVALIDARG;
+
+    switch (pPredicateDesc->Query) {
+    case D3D11_QUERY_OCCLUSION_PREDICATE:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+      break;
+    default:
+      return E_INVALIDARG;
+    }
+
     return CreateQuery(pPredicateDesc,
                        reinterpret_cast<ID3D11Query **>(ppPredicate));
   }
