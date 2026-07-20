@@ -21,6 +21,14 @@ PRIVATE_CONTROL_PATTERN = re.compile(
     r"DXMT_TEST_(?:COMMAND_BUFFER|D3D12_BARRIER|FAIL_|FAULT_MARKER|"
     r"FENCE_CREATION_MARKER|FORCE_|METAL4_)"
 )
+PRIVATE_NAMESPACE_PATTERN = re.compile(r"\bdxmt::(?!test\b)")
+PRIVATE_SYMBOL_PATTERN = re.compile(
+    r"\b(?:MTLD3D(?:10|11|12)|I?D3D(?:10|11|12)DXMT)\w*"
+    r"|\bWMT(?:Device|Command|Resource|Sparse|Metal)\w*"
+    r"|\bMTL(?:Device|CommandQueue|Buffer|Texture)_\w+"
+    r"|\b(?:WMT|MTL)::"
+    r"|\b(?:SM50|DXMT12(?:SM50|DXIL))\w*"
+)
 
 
 def source_files(root: Path):
@@ -46,6 +54,18 @@ class PublicApiBoundaryPolicyTest(unittest.TestCase):
                 if PRIVATE_CONTROL_PATTERN.search(text):
                     violations.append(str(path.relative_to(REPO_ROOT)))
         self.assertEqual([], violations, "private runtime controls:\n" + "\n".join(violations))
+
+    def test_product_tests_do_not_reference_private_dxmt_symbols(self):
+        violations = []
+        for root in TEST_SOURCE_ROOTS:
+            for path in source_files(root):
+                text = path.read_text(encoding="utf-8")
+                if (
+                    PRIVATE_NAMESPACE_PATTERN.search(text)
+                    or PRIVATE_SYMBOL_PATTERN.search(text)
+                ):
+                    violations.append(str(path.relative_to(REPO_ROOT)))
+        self.assertEqual([], violations, "private DXMT symbols:\n" + "\n".join(violations))
 
     def test_manifest_does_not_compile_dxmt_implementation_into_tests(self):
         manifest = (TEST_ROOT / "meson.build").read_text(encoding="utf-8")

@@ -2389,13 +2389,11 @@ Converter::operator()(const InstStoreStructured &store) {
 llvm::Value *
 Converter::LoadAtomicOpAddress(const AtomicBufferResourceHandle &Handle, const SrcOperand &Address) {
   if (Handle.StructureStride > 0) {
-    auto Address2D = LoadOperand(Address, kMaskVecXY);
-    return ir.CreateLShr(
-        ir.CreateAdd(
-            ir.CreateMul(ir.getInt32(Handle.StructureStride), ExtractElement(Address2D, 0)),
-            ExtractElement(Address2D, 1)
-        ),
-        2
+    // FXC encodes direct structured-buffer atomic targets as a scalar structure
+    // index. Do not request XY here: select-one operands replicate X into Y.
+    return ir.CreateMul(
+        ir.getInt32(Handle.StructureStride >> 2),
+        LoadOperand(Address, kMaskComponentX)
     );
   }
   auto Address1D = LoadOperand(Address, kMaskComponentX);

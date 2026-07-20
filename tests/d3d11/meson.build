@@ -21,5 +21,6 @@ d3d11_unit_sources = files(
   'shader_arithmetic_matrix_spec.cpp',
   'shader_conversion_matrix_spec.cpp',
   'raw_buffer_shader_matrix_spec.cpp',
+  'shader_atomic_matrix_spec.cpp',
 )
 d3d11_unit_dependencies = [d3d11_test_dep, dxgi_test_dep, d3dcompiler_test_dep]
