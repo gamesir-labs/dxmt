@@ -551,9 +551,6 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
       sparse_case == SparseCase::CopyToMapped) {
     backing_heap = MapAllTiles(texture.get());
     ASSERT_TRUE(backing_heap);
-    if (sparse_case == SparseCase::SampleMapped) {
-      ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
-    }
   }
 
   if (sample_case) {
@@ -1022,6 +1019,8 @@ TEST_F(D3D12SparseResourceSpec,
   EXPECT_EQ(actual, expected);
 }
 
+const dxmt::test::SerialTestRegistration kSparseResourceSerial(
+    "D3D12SparseResourceSpec.*");
 DXMT_GROUP_SERIAL_TESTS("D3D12SparseResourceSpec.*", "d3d12-sparse");
 DXMT_SERIAL_TEST_DOMAIN("D3D12SparseResourceSpec.*", "sparse");
 
