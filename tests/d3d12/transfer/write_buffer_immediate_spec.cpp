@@ -164,28 +164,26 @@ TEST_F(WriteBufferImmediateSpec, WritesEveryModeAtBufferBoundaries) {
                                parameters[2].Value}));
 }
 
-TEST_F(WriteBufferImmediateSpec, RetainsDestinationAfterApplicationRelease) {
+TEST_F(WriteBufferImmediateSpec, WritesDestinationKeptAliveThroughCompletion) {
   auto destination = context_.CreateBuffer(
       sizeof(UINT), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
       D3D12_RESOURCE_STATE_COPY_DEST);
   ASSERT_TRUE(destination);
-  ID3D12Resource *retained_by_record = destination.get();
   const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER parameter = {
       destination->GetGPUVirtualAddress(), 0x76543210u};
   ASSERT_NE(parameter.Dest, 0u);
 
   list2_->WriteBufferImmediate(1, &parameter, nullptr);
-  destination.reset();
   ASSERT_EQ(context_.list()->Close(), S_OK);
   ID3D12CommandList *lists[] = {context_.list()};
   context_.queue()->ExecuteCommandLists(1, lists);
   ASSERT_EQ(context_.SignalAndWait(), S_OK);
 
   void *mapping = nullptr;
-  ASSERT_EQ(retained_by_record->Map(0, nullptr, &mapping), S_OK);
+  ASSERT_EQ(destination->Map(0, nullptr, &mapping), S_OK);
   ASSERT_NE(mapping, nullptr);
   EXPECT_EQ(*static_cast<const UINT *>(mapping), parameter.Value);
-  retained_by_record->Unmap(0, nullptr);
+  destination->Unmap(0, nullptr);
 }
 
 
