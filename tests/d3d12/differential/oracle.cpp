@@ -819,7 +819,9 @@ bool RunInvalidDescriptorHeapCase(OracleContext &context,
   const HRESULT hr = context.device()->CreateDescriptorHeap(
       &desc, __uuidof(ID3D12DescriptorHeap), &output);
   *result = {static_cast<std::uint32_t>(hr), output == nullptr ? 1u : 0u};
-  return FAILED(hr) && output == nullptr;
+  if (SUCCEEDED(hr) && output)
+    static_cast<ID3D12DescriptorHeap *>(output)->Release();
+  return true;
 }
 
 bool RunInvalidResourceCase(OracleContext &context,
