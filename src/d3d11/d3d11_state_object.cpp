@@ -554,6 +554,21 @@ HRESULT StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState>::
   if (!ppDepthStencilState)
     return S_FALSE;
 
+  D3D11_DEPTH_STENCIL_DESC normalized_desc = *pDesc;
+  if (!normalized_desc.DepthEnable) {
+    normalized_desc.DepthWriteMask = kDefaultDepthStencilDesc.DepthWriteMask;
+    normalized_desc.DepthFunc = kDefaultDepthStencilDesc.DepthFunc;
+  }
+  if (!normalized_desc.StencilEnable) {
+    normalized_desc.StencilReadMask =
+        kDefaultDepthStencilDesc.StencilReadMask;
+    normalized_desc.StencilWriteMask =
+        kDefaultDepthStencilDesc.StencilWriteMask;
+    normalized_desc.FrontFace = kDefaultDepthStencilDesc.FrontFace;
+    normalized_desc.BackFace = kDefaultDepthStencilDesc.BackFace;
+  }
+  pDesc = &normalized_desc;
+
   if (cache.contains(*pDesc)) {
     cache.at(*pDesc)->QueryInterface(IID_PPV_ARGS(ppDepthStencilState));
     return S_OK;

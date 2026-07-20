@@ -104,6 +104,28 @@ bool MemEqual(const T &left, const T &right) {
   return std::memcmp(&left, &right, sizeof(T)) == 0;
 }
 
+void ExpectDepthStencilDescEqual(const D3D11_DEPTH_STENCIL_DESC &actual,
+                                 const D3D11_DEPTH_STENCIL_DESC &expected) {
+  EXPECT_EQ(actual.DepthEnable, expected.DepthEnable);
+  EXPECT_EQ(actual.DepthWriteMask, expected.DepthWriteMask);
+  EXPECT_EQ(actual.DepthFunc, expected.DepthFunc);
+  EXPECT_EQ(actual.StencilEnable, expected.StencilEnable);
+  EXPECT_EQ(actual.StencilReadMask, expected.StencilReadMask);
+  EXPECT_EQ(actual.StencilWriteMask, expected.StencilWriteMask);
+  EXPECT_EQ(actual.FrontFace.StencilFailOp,
+            expected.FrontFace.StencilFailOp);
+  EXPECT_EQ(actual.FrontFace.StencilDepthFailOp,
+            expected.FrontFace.StencilDepthFailOp);
+  EXPECT_EQ(actual.FrontFace.StencilPassOp,
+            expected.FrontFace.StencilPassOp);
+  EXPECT_EQ(actual.FrontFace.StencilFunc, expected.FrontFace.StencilFunc);
+  EXPECT_EQ(actual.BackFace.StencilFailOp, expected.BackFace.StencilFailOp);
+  EXPECT_EQ(actual.BackFace.StencilDepthFailOp,
+            expected.BackFace.StencilDepthFailOp);
+  EXPECT_EQ(actual.BackFace.StencilPassOp, expected.BackFace.StencilPassOp);
+  EXPECT_EQ(actual.BackFace.StencilFunc, expected.BackFace.StencilFunc);
+}
+
 class ObjectComMatrixSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -684,7 +706,8 @@ TEST_F(ObjectComMatrixSpec, DepthStencilStateGetDescRoundTripMatrix) {
     cases[1].BackFace.StencilPassOp = D3D11_STENCIL_OP_INVERT;
     cases[1].BackFace.StencilFunc = D3D11_COMPARISON_NOT_EQUAL;
 
-    // Fully disabled depth/stencil with explicit ops still round-tripped.
+    // Disabled depth/stencil fields are intentionally non-default on input;
+    // the public runtime normalizes ignored fields in the returned descriptor.
     cases[2].DepthEnable = FALSE;
     cases[2].DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     cases[2].DepthFunc = D3D11_COMPARISON_ALWAYS;
@@ -708,8 +731,21 @@ TEST_F(ObjectComMatrixSpec, DepthStencilStateGetDescRoundTripMatrix) {
 
     D3D11_DEPTH_STENCIL_DESC actual = {};
     state->GetDesc(&actual);
-    EXPECT_TRUE(MemEqual(actual, descs[index]))
-        << "DepthStencil GetDesc mismatch at case " << index;
+    D3D11_DEPTH_STENCIL_DESC expected = descs[index];
+    if (!expected.DepthEnable) {
+      expected.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+      expected.DepthFunc = D3D11_COMPARISON_LESS;
+    }
+    if (!expected.StencilEnable) {
+      expected.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+      expected.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+      expected.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+      expected.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+      expected.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+      expected.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+      expected.BackFace = expected.FrontFace;
+    }
+    ExpectDepthStencilDescEqual(actual, expected);
   }
 }
 
