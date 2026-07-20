@@ -16,6 +16,7 @@
 @interface CacheReader () {
   sqlite3 *_db;
   sqlite3_stmt *_stmt;
+  NSLock *_lock;
 }
 @end
 
@@ -48,6 +49,8 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
       NSLog(@"[CacheReader] Failed to resolve cache path");
       return nil;
     }
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dbPath])
+      return nil;
     NSString *tableName = [NSString stringWithFormat:@"cache_%llu", version];
     if (sqlite3_open_v2([dbPath fileSystemRepresentation], &_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) !=
         SQLITE_OK) {
@@ -55,6 +58,8 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
       sqlite3_close(_db);
       return nil;
     }
+    _lock = [[NSLock alloc] init];
+    sqlite3_busy_timeout(_db, 5000);
 
     NSString *sqlGet = [NSString stringWithFormat:@"SELECT value FROM %@ WHERE key = ?;", tableName];
     if (sqlite3_prepare_v2(_db, sqlGet.UTF8String, -1, &_stmt, NULL) != SQLITE_OK) {
@@ -67,6 +72,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 }
 
 - (dispatch_data_t)get:(NSData *)key {
+  [_lock lock];
   sqlite3_reset(_stmt);
   sqlite3_clear_bindings(_stmt);
   sqlite3_bind_blob64(_stmt, 1, key.bytes, key.length, SQLITE_STATIC);
@@ -82,6 +88,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     }
   }
   sqlite3_reset(_stmt);
+  [_lock unlock];
   return result;
 }
 
@@ -90,6 +97,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     sqlite3_finalize(_stmt);
   if (_db)
     sqlite3_close(_db);
+  [_lock release];
   [super dealloc];
 }
 
@@ -98,6 +106,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 @interface CacheWriter () {
   sqlite3 *_db;
   sqlite3_stmt *_stmt;
+  NSLock *_lock;
 }
 @end
 
@@ -105,12 +114,12 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 
 - (instancetype)initWithPath:(NSString *)path version:(uint64_t)version {
   if ((self = [super init])) {
+    _lock = [[NSLock alloc] init];
     NSString *dbPath = resolve_cache_dir(path, true);
     if (!dbPath) {
       NSLog(@"[CacheReader] Failed to resolve cache path");
       return nil;
     }
-
     NSString *lockPath = [dbPath stringByAppendingString:@"-lock"];
     int fd = open([lockPath fileSystemRepresentation], O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
@@ -128,6 +137,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
       close(fd);
       return nil;
     }
+    sqlite3_busy_timeout(_db, 5000);
 
     sqlite3_exec(_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
@@ -158,6 +168,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 }
 
 - (void)set:(NSData *)key value:(dispatch_data_t)value {
+  [_lock lock];
   sqlite3_reset(_stmt);
   sqlite3_clear_bindings(_stmt);
   sqlite3_bind_blob64(_stmt, 1, key.bytes, key.length, SQLITE_STATIC);
@@ -173,6 +184,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 
   dispatch_release(flat);
   sqlite3_reset(_stmt);
+  [_lock unlock];
 }
 
 - (void)dealloc {
@@ -180,6 +192,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     sqlite3_finalize(_stmt);
   if (_db)
     sqlite3_close(_db);
+  [_lock release];
   [super dealloc];
 }
 
