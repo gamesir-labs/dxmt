@@ -22,6 +22,7 @@ using dxmt::test::D3D11TestContext;
 constexpr std::uint32_t kArithmeticCaseCount = 16384;
 constexpr std::uint32_t kBitOpCaseCount = 8192;
 constexpr std::uint32_t kFloatCaseCount = 8192;
+constexpr std::uint32_t kControlFlowCaseCount = 4096;
 
 const dxmt::test::LogicalCaseFamilyRegistration kArithmeticCases(
     "D3D11ShaderArithmeticMatrixSpec."
@@ -89,6 +90,29 @@ const dxmt::test::TestCostRegistration
     kFloatCost("D3D11ShaderArithmeticMatrixSpec."
                "Executes8192FloatArithmeticCasesInOneDispatch",
                dxmt::test::kGpuBatchTestCost);
+
+const dxmt::test::LogicalCaseFamilyRegistration kControlFlowCases(
+    "D3D11ShaderArithmeticMatrixSpec."
+    "Executes4096ControlFlowCasesInOneDispatch",
+    "D3D11.Shader.ControlFlow.Uint32.", kControlFlowCaseCount, 4,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "5_0", "Immediate", "ComputeShader,TypedSRV,TypedUAV"},
+     dxmt::test::kGpuBatchTestCost,
+     "selected logical IDs in an immutable typed buffer and a "
+     "poison-initialized typed UAV",
+     "dispatch one invocation per selected ID and execute simple/nested if, "
+     "switch with default, bounded loops, break, continue, early return, or "
+     "nested loops",
+     "every selected result matches the bit-exact CPU evaluator and every "
+     "unselected output remains poison",
+     "logical ID, selection state, control-flow selector, operands, loop "
+     "parameters, expected/actual, and exact replay argument"});
+
+const dxmt::test::TestCostRegistration
+    kControlFlowCost("D3D11ShaderArithmeticMatrixSpec."
+                     "Executes4096ControlFlowCasesInOneDispatch",
+                     dxmt::test::kGpuBatchTestCost);
 
 std::uint32_t RotateLeft(std::uint32_t value, std::uint32_t shift) {
   if (shift == 0)
@@ -309,6 +333,86 @@ bool FloatCaseMatches(std::uint32_t case_index, std::uint32_t expected,
       (actual & 0x7f800000u) == 0x7f800000u)
     return false;
   return FloatUlpDistance(expected, actual) <= 1u;
+}
+
+std::uint32_t EvaluateControlFlowCase(std::uint32_t logical) {
+  const std::uint32_t selector = (logical >> 5u) & 7u;
+  const std::uint32_t x = CaseOperandX(logical);
+  const std::uint32_t y = CaseOperandY(logical);
+  switch (selector) {
+  case 0:
+    if (logical & 1u)
+      return x + y;
+    return x - y;
+  case 1:
+    if (x & 1u) {
+      if (y & 1u)
+        return x ^ y;
+      return x & y;
+    }
+    if (y & 1u)
+      return x | y;
+    return ~x;
+  case 2:
+    switch ((logical >> 2u) & 7u) {
+    case 0:
+      return x;
+    case 1:
+      return y;
+    case 2:
+      return x + y;
+    case 3:
+      return x ^ y;
+    default:
+      return RotateLeft(x, logical & 31u);
+    }
+  case 3: {
+    const std::uint32_t count = logical & 15u;
+    std::uint32_t result = x;
+    for (std::uint32_t index = 0; index < count; ++index) {
+      result = RotateLeft(result ^ (y + index * 0x45d9f3bu),
+                          (index & 15u) + 1u);
+    }
+    return result;
+  }
+  case 4: {
+    const std::uint32_t stop = logical & 31u;
+    std::uint32_t result = y;
+    for (std::uint32_t index = 0; index < 32u; ++index) {
+      if (index == stop)
+        break;
+      result += x ^ (index * 0x27d4eb2du);
+    }
+    return result;
+  }
+  case 5: {
+    const std::uint32_t skipped = logical & 7u;
+    std::uint32_t result = x;
+    for (std::uint32_t index = 0; index < 8u; ++index) {
+      if (index == skipped)
+        continue;
+      result ^= RotateLeft(y + index, index + 1u);
+    }
+    return result;
+  }
+  case 6:
+    if (x & 1u)
+      return x;
+    if (y & 1u)
+      return y;
+    return x + y;
+  default: {
+    const std::uint32_t outer_count = logical & 3u;
+    const std::uint32_t inner_count = (logical >> 2u) & 3u;
+    std::uint32_t result = x;
+    for (std::uint32_t outer = 0; outer < outer_count; ++outer) {
+      for (std::uint32_t inner = 0; inner < inner_count; ++inner)
+        result = (result + y + outer) ^ (inner * 0x9e3779b9u);
+      result = RotateLeft(result, outer + 1u);
+    }
+    return result;
+  }
+  }
 }
 
 HRESULT CreateTypedBuffer(ID3D11Device *device,
@@ -916,6 +1020,236 @@ TEST_F(D3D11ShaderArithmeticMatrixSpec,
                   << " actual=0x" << result.actual << std::dec
                   << " ulp_distance="
                   << FloatUlpDistance(result.expected, result.actual) << '\n'
+                  << "Replay: --dxmt-case-id=" << replay_case_id;
+    break;
+  }
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11ShaderArithmeticMatrixSpec,
+       Executes4096ControlFlowCasesInOneDispatch) {
+  std::vector<std::uint32_t> expected(kControlFlowCaseCount);
+  std::vector<std::uint32_t> poison(kControlFlowCaseCount);
+  std::vector<bool> selected(kControlFlowCaseCount, false);
+  std::vector<std::uint32_t> selected_cases;
+  selected_cases.reserve(kControlFlowCaseCount);
+  for (std::uint32_t logical = 0; logical < kControlFlowCaseCount; ++logical) {
+    expected[logical] = EvaluateControlFlowCase(logical);
+    poison[logical] = expected[logical] ^ 0x3cc35aa5u;
+    if (dxmt::test::LogicalCaseSelected(kControlFlowCases.family(), logical)) {
+      selected[logical] = true;
+      selected_cases.push_back(logical);
+    }
+  }
+  ASSERT_FALSE(selected_cases.empty());
+
+  const auto shader = CompileShader(R"(
+    Buffer<uint> case_indices : register(t0);
+    RWBuffer<uint> output : register(u0);
+
+    cbuffer Parameters : register(b0) {
+      uint selected_count;
+      uint3 padding;
+    };
+
+    uint rotate_left(uint value, uint shift) {
+      return shift == 0 ? value : (value << shift) | (value >> (32u - shift));
+    }
+
+    uint evaluate(uint logical) {
+      uint selector = (logical >> 5u) & 7u;
+      uint x = logical * 0x9e3779b9u + 0x243f6a88u;
+      uint y = (logical ^ 0xa5a5a5a5u) * 0x85ebca6bu + 0xc2b2ae35u;
+      switch (selector) {
+      case 0:
+        if (logical & 1u)
+          return x + y;
+        return x - y;
+      case 1:
+        if (x & 1u) {
+          if (y & 1u)
+            return x ^ y;
+          return x & y;
+        }
+        if (y & 1u)
+          return x | y;
+        return ~x;
+      case 2:
+        switch ((logical >> 2u) & 7u) {
+        case 0: return x;
+        case 1: return y;
+        case 2: return x + y;
+        case 3: return x ^ y;
+        default: return rotate_left(x, logical & 31u);
+        }
+        return 0u;
+      case 3: {
+        uint count = logical & 15u;
+        uint result = x;
+        [loop]
+        for (uint index = 0; index < count; ++index) {
+          result = rotate_left(result ^ (y + index * 0x45d9f3bu),
+                               (index & 15u) + 1u);
+        }
+        return result;
+      }
+      case 4: {
+        uint stop = logical & 31u;
+        uint result = y;
+        [loop]
+        for (uint index = 0; index < 32u; ++index) {
+          if (index == stop)
+            break;
+          result += x ^ (index * 0x27d4eb2du);
+        }
+        return result;
+      }
+      case 5: {
+        uint skipped = logical & 7u;
+        uint result = x;
+        [unroll]
+        for (uint index = 0; index < 8u; ++index) {
+          if (index == skipped)
+            continue;
+          result ^= rotate_left(y + index, index + 1u);
+        }
+        return result;
+      }
+      case 6:
+        if (x & 1u)
+          return x;
+        if (y & 1u)
+          return y;
+        return x + y;
+      default: {
+        uint outer_count = logical & 3u;
+        uint inner_count = (logical >> 2u) & 3u;
+        uint result = x;
+        [loop]
+        for (uint outer = 0; outer < outer_count; ++outer) {
+          [loop]
+          for (uint inner = 0; inner < inner_count; ++inner)
+            result = (result + y + outer) ^ (inner * 0x9e3779b9u);
+          result = rotate_left(result, outer + 1u);
+        }
+        return result;
+      }
+      }
+    }
+
+    [numthreads(64, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+      if (id.x >= selected_count)
+        return;
+      uint logical = case_indices[id.x];
+      output[logical] = evaluate(logical);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  ComPtr<ID3D11ComputeShader> compute_shader;
+  ASSERT_EQ(context_.device()->CreateComputeShader(
+                shader.bytecode->GetBufferPointer(),
+                shader.bytecode->GetBufferSize(), nullptr,
+                compute_shader.put()),
+            S_OK);
+
+  ComPtr<ID3D11Buffer> selected_buffer;
+  ASSERT_EQ(CreateTypedBuffer(context_.device(), selected_cases,
+                              D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_IMMUTABLE,
+                              selected_buffer.put()),
+            S_OK);
+  ComPtr<ID3D11ShaderResourceView> selected_srv;
+  ASSERT_EQ(CreateTypedBufferSrv(context_.device(), selected_buffer.get(),
+                                 static_cast<UINT>(selected_cases.size()),
+                                 selected_srv.put()),
+            S_OK);
+
+  ComPtr<ID3D11Buffer> output_buffer;
+  ASSERT_EQ(CreateTypedBuffer(context_.device(), poison,
+                              D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT,
+                              output_buffer.put()),
+            S_OK);
+  ComPtr<ID3D11UnorderedAccessView> output_uav;
+  ASSERT_EQ(CreateTypedBufferUav(context_.device(), output_buffer.get(),
+                                 kControlFlowCaseCount, output_uav.put()),
+            S_OK);
+
+  const std::vector<std::uint32_t> parameters = {
+      static_cast<std::uint32_t>(selected_cases.size()), 0, 0, 0};
+  ComPtr<ID3D11Buffer> constant_buffer;
+  ASSERT_EQ(CreateTypedBuffer(context_.device(), parameters,
+                              D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE,
+                              constant_buffer.put()),
+            S_OK);
+
+  ID3D11ShaderResourceView *srvs[] = {selected_srv.get()};
+  ID3D11UnorderedAccessView *uavs[] = {output_uav.get()};
+  ID3D11Buffer *constant_buffers[] = {constant_buffer.get()};
+  context_.context()->CSSetShader(compute_shader.get(), nullptr, 0);
+  context_.context()->CSSetShaderResources(0, 1, srvs);
+  context_.context()->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+  context_.context()->CSSetConstantBuffers(0, 1, constant_buffers);
+  const UINT selected_count = static_cast<UINT>(selected_cases.size());
+  context_.context()->Dispatch((selected_count + 63u) / 64u, 1, 1);
+
+  ID3D11ShaderResourceView *null_srv = nullptr;
+  ID3D11UnorderedAccessView *null_uav = nullptr;
+  ID3D11Buffer *null_buffer = nullptr;
+  context_.context()->CSSetShaderResources(0, 1, &null_srv);
+  context_.context()->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+  context_.context()->CSSetConstantBuffers(0, 1, &null_buffer);
+  context_.context()->CSSetShader(nullptr, nullptr, 0);
+
+  std::vector<std::uint32_t> actual;
+  ASSERT_EQ(ReadBuffer(context_.device(), context_.context(),
+                       output_buffer.get(),
+                       kControlFlowCaseCount * sizeof(std::uint32_t), &actual),
+            S_OK);
+  ASSERT_EQ(actual.size(), static_cast<std::size_t>(kControlFlowCaseCount));
+
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kControlFlowCases.family().case_id_prefix);
+  for (std::uint32_t logical = 0; logical < kControlFlowCaseCount; ++logical) {
+    const std::uint32_t desired =
+        selected[logical] ? expected[logical] : poison[logical];
+    if (actual[logical] == desired)
+      continue;
+
+    const auto case_id =
+        dxmt::test::LogicalCaseId(kControlFlowCases.family(), logical);
+    const auto replay_case_id =
+        selected[logical]
+            ? case_id
+            : dxmt::test::LogicalCaseId(kControlFlowCases.family(),
+                                        selected_cases.front());
+    ADD_FAILURE() << "LogicalCaseId: " << case_id << '\n'
+                  << "Class: "
+                  << dxmt::test::TestClassName(
+                         kControlFlowCases.family().traits.test_class)
+                  << '\n'
+                  << "Requirements: feature_level=11_0 shader_model=5_0 "
+                     "queue=Immediate capability=ComputeShader,TypedSRV,"
+                     "TypedUAV\n"
+                  << "ExecutionPath: "
+                  << dxmt::test::ExecutionPathName(
+                         kControlFlowCases.family().traits.execution_path)
+                  << '\n'
+                  << "Parameters: logical=" << logical
+                  << " selected=" << (selected[logical] ? "true" : "false")
+                  << " selector=" << ((logical >> 5u) & 7u)
+                  << " x=0x" << std::hex << CaseOperandX(logical)
+                  << " y=0x" << CaseOperandY(logical) << std::dec
+                  << " count=" << (logical & 31u)
+                  << " nested_counts=" << (logical & 3u) << ','
+                  << ((logical >> 2u) & 3u) << '\n'
+                  << "GpuCaseResult: status="
+                  << (selected[logical] ? 1u : 2u)
+                  << " first_mismatch_index=" << logical
+                  << " expected=0x" << std::hex << desired << " actual=0x"
+                  << actual[logical] << std::dec << '\n'
                   << "Replay: --dxmt-case-id=" << replay_case_id;
     break;
   }
