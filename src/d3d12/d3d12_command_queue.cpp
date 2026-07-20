@@ -23297,6 +23297,9 @@ private:
     const UINT image_pitch = footprint.RowPitch * footprint_row_count;
     const DXGI_FORMAT footprint_format = footprint.Format;
     const DXGI_FORMAT resource_format = texture_resource.GetResourceDesc().Format;
+    const bool emulated_d24 =
+        resource_format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+        resource_format == DXGI_FORMAT_R24G8_TYPELESS;
     const uint32_t resource_width = uint32_t(texture_resource.GetResourceDesc().Width);
     const uint32_t resource_height = texture_resource.GetResourceDesc().Height;
     const uint32_t resource_depth = texture_resource.GetResourceDesc().DepthOrArraySize;
@@ -23362,11 +23365,17 @@ private:
       chunk->emitcc([dst_is_buffer, buffer = std::move(buffer),
                      texture = std::move(texture), read_view, buffer_offset,
                      row_pitch, image_pitch, size, origin, slice, level,
-                     plane](ArgumentEncodingContext &enc) mutable {
+                     plane, emulated_d24](ArgumentEncodingContext &enc) mutable {
         if (dst_is_buffer) {
-          enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
-              texture, read_view, buffer, buffer_offset, image_pitch,
-              row_pitch, image_pitch, plane == 1, origin, size);
+          if (emulated_d24 && plane == 0) {
+            enc.blit_depth_stencil_cmd.copyFromTexture(
+                texture, level, slice, buffer, buffer_offset, image_pitch,
+                row_pitch, image_pitch, true);
+          } else {
+            enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
+                texture, read_view, buffer, buffer_offset, image_pitch,
+                row_pitch, image_pitch, plane == 1, origin, size);
+          }
         } else {
           enc.blit_depth_stencil_cmd.copyPlaneFromBuffer(
               buffer, buffer_offset, image_pitch, row_pitch, image_pitch,
