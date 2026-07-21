@@ -1347,6 +1347,10 @@ private:
         existing.contains("native_llvm_link_args_digest") &&
         existing.at("native_llvm_link_args_digest") ==
             native_llvm_link_args_digest;
+    const auto wine_source =
+        profile.profile->cross ? FindManagedWineSource() : fs::path{};
+    const auto existing_wine_source =
+        existing.contains("wine_source") ? existing.at("wine_source") : "";
     if (!fs::is_regular_file(profile.build / "meson-private/coredata.dat")) {
       std::vector<std::string> command = {
           "meson", "setup", profile.build.string(), repo_root_.string(),
@@ -1380,20 +1384,31 @@ private:
       if (profile.profile->cross) {
         command.push_back("-Dwine_build_path=");
         command.push_back("-Dwine_install_path=" + profile.wine_root.string());
+        // Wine's own d3d9 conformance modules build from the Wine SOURCE tree,
+        // which carries include/wine/test.h and the test sources. The install
+        // does not, so the two paths are both needed and are not the same
+        // directory. Passing nothing simply leaves those modules unbuilt.
+        if (!wine_source.empty())
+          command.push_back("-Dwine_source_path=" + wine_source.string());
       }
       RequireSuccess(RunCommand(command, BuildEnvironment()), "Meson configure");
     } else if (!existing.contains("dxmt_version") ||
                existing.at("dxmt_version") != version ||
                !native_llvm_link_args_compatible ||
                !existing.contains("builder_config_path") ||
-               existing.at("builder_config_path") != config_path_.string()) {
-      RequireSuccess(
-          RunCommand({"meson", "configure", profile.build.string(),
-                      "-Ddxmt_version=" + version,
-                      "-Dnative_llvm_link_args=" + native_llvm_link_args,
-                      "-Ddxmt_builder_config_path=" + config_path_.string()},
-                     BuildEnvironment()),
-          "DXMT option reconfigure");
+               existing.at("builder_config_path") != config_path_.string() ||
+               existing_wine_source != wine_source.string()) {
+      std::vector<std::string> reconfigure = {
+          "meson", "configure", profile.build.string(),
+          "-Ddxmt_version=" + version,
+          "-Dnative_llvm_link_args=" + native_llvm_link_args,
+          "-Ddxmt_builder_config_path=" + config_path_.string()};
+      // A build directory configured before the Wine source was discoverable
+      // would otherwise keep the stale value for its whole life.
+      if (profile.profile->cross && !wine_source.empty())
+        reconfigure.push_back("-Dwine_source_path=" + wine_source.string());
+      RequireSuccess(RunCommand(reconfigure, BuildEnvironment()),
+                     "DXMT option reconfigure");
     }
 
     std::ostringstream properties;
@@ -1403,7 +1418,8 @@ private:
                << "\nnative_llvm_link_args_digest="
                << native_llvm_link_args_digest
                << "\nbuilder_config_path=" << config_path_.string()
-               << "\nwine_root=" << profile.wine_root.string() << '\n';
+               << "\nwine_root=" << profile.wine_root.string()
+               << "\nwine_source=" << wine_source.string() << '\n';
     WriteFileAtomic(properties_path, properties.str());
   }
 
@@ -1560,6 +1576,24 @@ private:
            non_empty(prefix / "userdef.reg") &&
            fs::is_regular_file(prefix / ".update-timestamp", error) &&
            fs::exists(prefix / "dosdevices/c:", error);
+  }
+
+  // The managed cache keeps the Wine source it built the install from. Match on
+  // the header the tests need rather than on a directory name, so a branch
+  // rename does not silently disable them.
+  fs::path FindManagedWineSource() const {
+    const auto sources = managed_root_ / "sources";
+    std::error_code error;
+    if (!fs::is_directory(sources, error))
+      return {};
+    for (const auto &entry : fs::directory_iterator(sources, error)) {
+      if (!entry.is_directory(error))
+        continue;
+      if (fs::is_regular_file(entry.path() / "include/wine/test.h", error) &&
+          fs::is_directory(entry.path() / "dlls/d3d9/tests", error))
+        return entry.path();
+    }
+    return {};
   }
 
   Environment WineTestEnvironment(const fs::path &wine_root,
