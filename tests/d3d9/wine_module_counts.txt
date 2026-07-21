@@ -1,0 +1,8 @@
+# Test-function counts per Wine conformance module, verified by the transform at
+# build time. A mismatch means the fetched corpus moved, which is a reviewable
+# event at the external/wine submodule bump rather than a silent change in what
+# the suite covers.
+stateblock 1
+d3d9ex 27
+device 104
+visual 132

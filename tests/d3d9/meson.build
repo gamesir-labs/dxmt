@@ -56,30 +56,43 @@ if dxmt_crossbuild and wine_tests_source_root != ''
       '-w',
     ])
 
-    # stateblock is the smallest and runs clean; device and visual carry real
-    # failures and known crashes, which the baseline and the missing-summary
-    # rule are there to express.
-    #
-    # Two modules are absent for build reasons, each needing its own answer
-    # rather than a flag applied to all of them:
-    #   d3d9ex includes wine/test.h before d3d9.h, so test.h's console calls are
-    #     compiled before windows.h has been seen. Adding
-    #     `-DCOBJMACROS -include windows.h` for that module alone compiles it on
-    #     both toolchains, but the same flags break the others, so it needs
-    #     per-module arguments. It is still held back because it does not finish
-    #     a run: it hung with no summary line, so it would only ever report a
-    #     timeout until each test function runs in its own process.
-    #   device both references and defines a large set of interface GUIDs on the
-    #     build runner's toolchain, so it collides with the GUID library that
-    #     the same references require. It needs a GUID resolution of its own.
-    #   visual builds and runs, but crashes partway through, so a whole-module
-    #     run reports only that it did not finish and says nothing about the
-    #     assertions before or after. It becomes usable once each test function
-    #     runs in its own process, which is what the isolation transform is for.
-    foreach module : [ 'stateblock' ]
+    # Each module's test calls are wrapped so a single function can be skipped,
+    # which is what lets the suite re-run a module that crashed and still get
+    # results from the functions after the crash. The transform runs at build
+    # time because the corpus is fetched from Wine unmodified.
+    wine_isolate = files('wine_isolate.py')
+    wine_counts = {}
+    foreach line : fs.read('wine_module_counts.txt').strip().split('\n')
+      if line.startswith('#') or line == ''
+        continue
+      endif
+      parts = line.split(' ')
+      wine_counts += { parts[0]: parts[1] }
+    endforeach
+
+    # stateblock runs clean. visual builds and crashes partway, which is exactly
+    # what the re-run path exists for, so it is enabled with it. device and
+    # d3d9ex are still held back on build problems of their own: device collides
+    # with the GUID library on the build runner's toolchain, and d3d9ex needs
+    # `-DCOBJMACROS -include windows.h` applied to it alone, flags that break the
+    # other modules.
+    foreach module : [ 'stateblock', 'visual' ]
+      wine_isolated = custom_target('wine-isolate-' + module,
+        input: wine_tests_dir / (module + '.c'),
+        output: [ module + '.isolated.c', module + '.functions' ],
+        command: [
+          python3_native, wine_isolate, '@INPUT@',
+          '--output', '@OUTPUT0@',
+          '--manifest', '@OUTPUT1@',
+          '--expect-count', wine_counts[module],
+          '--module', module,
+        ])
+
       wine_conformance_tests += executable('dx9-wine-' + module + '-test',
-        [ wine_tests_dir / (module + '.c'), files('wine_debug_stubs.c') ],
-        c_args: wine_tests_c_args,
+        [ wine_isolated[0], files('wine_debug_stubs.c') ],
+        c_args: wine_tests_c_args + [
+          '-include', meson.current_source_dir() / 'dxmt_conformance.h',
+        ],
         dependencies: [
           cc.find_library('d3d9'),
           # The modules reference the D3D9 interface GUIDs without defining
@@ -90,6 +103,9 @@ if dxmt_crossbuild and wine_tests_source_root != ''
           cc.find_library('ole32'),
         ],
         install: false)
+
+      # The suite reads the manifest to know which functions a module has.
+      wine_conformance_tests += wine_isolated
     endforeach
   endif
 endif

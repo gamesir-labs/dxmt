@@ -21,6 +21,7 @@
 #include <support/wine_process.hpp>
 
 #include <cstdlib>
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -29,7 +30,13 @@ namespace {
 
 constexpr const char *kWineModules[] = {
     "stateblock",
+    "visual",
 };
+
+// A module that crashes takes the functions after it with it, so it is re-run
+// with the offender skipped. The cap keeps a module that crashes repeatedly
+// from spending the whole run on it; what it does not finish is reported.
+constexpr int kMaxAttempts = 12;
 
 constexpr DWORD kDefaultTimeoutMs = 600000;
 
@@ -107,7 +114,8 @@ struct RunResult {
   std::string output;
 };
 
-RunResult RunModule(const std::wstring &executable, const char *module) {
+RunResult RunModule(const std::wstring &executable, const char *module,
+                    const std::string &skip) {
   RunResult result;
   std::vector<char> temp(MAX_PATH + 1);
   const DWORD size = GetTempPathA(static_cast<DWORD>(temp.size()), temp.data());
@@ -123,6 +131,14 @@ RunResult RunModule(const std::wstring &executable, const char *module) {
                            CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
   if (log == INVALID_HANDLE_VALUE)
     return result;
+
+  // Wine's own harness picks its platform by detecting Wine unless told, and
+  // under "wine" a todo block that succeeds counts as a failure, which would
+  // score this frontend being more correct than Wine as a regression. The
+  // builder sets this for a staged run; setting it here too keeps a plain
+  // build-tree run from silently inverting those semantics.
+  SetEnvironmentVariableA("WINETEST_PLATFORM", "windows");
+  SetEnvironmentVariableA("DXMT_TEST_SKIP", skip.c_str());
 
   DWORD error = 0;
   auto process = dxmt::test::StartWineProcess(executable, {module}, &error, log);
@@ -147,6 +163,45 @@ RunResult RunModule(const std::wstring &executable, const char *module) {
                        std::istreambuf_iterator<char>());
   DeleteFileA(log_path.c_str());
   return result;
+}
+
+// Every module ships the list of test functions the build wrapped, which is
+// what tells the suite how much of a module actually ran.
+std::vector<std::string> LoadManifest(const char *module) {
+  std::vector<std::string> names;
+  const auto directory = ExecutableDirectory();
+  const auto leaf = dxmt::test::WidenWineArgument(module) + L".functions";
+  for (const auto &candidate :
+       {directory + L"\\" + leaf, directory + L"\\d3d9\\" + leaf}) {
+    if (!PathExists(candidate))
+      continue;
+    std::ifstream file(candidate.c_str());
+    std::string line;
+    while (std::getline(file, line)) {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      if (!line.empty())
+        names.push_back(line);
+    }
+    break;
+  }
+  return names;
+}
+
+// Each wrapped function announces itself before running. A crash is attributed
+// by Wine's exception filter, but a hang prints nothing, so the last
+// announcement is the only thing that names the function that stopped a module.
+std::vector<std::string> AnnouncedFunctions(const std::string &output) {
+  static constexpr const char kMarker[] = "dxmt-conformance: running ";
+  std::vector<std::string> names;
+  std::size_t position = 0;
+  while ((position = output.find(kMarker, position)) != std::string::npos) {
+    position += sizeof(kMarker) - 1;
+    const auto end = output.find_first_of("\r\n", position);
+    names.push_back(output.substr(position, end - position));
+    position = end == std::string::npos ? output.size() : end;
+  }
+  return names;
 }
 
 bool ReachedSummary(const std::string &output) {
@@ -223,21 +278,76 @@ TEST_P(WineConformanceTest, MatchesBaseline) {
     GTEST_SKIP() << "Wine d3d9 conformance module " << module << " not found";
   }
 
-  const auto result = RunModule(executable, module);
-  ASSERT_TRUE(result.started) << "failed to start " << module;
-  ASSERT_FALSE(result.timed_out)
-      << module << " timed out after " << TimeoutMs() << " ms\n"
-      << Tail(result.output, 20);
+  // Run the module, and if it does not reach its summary line, blame the last
+  // function it announced and run it again without that one. Repeat until it
+  // finishes or the attempt cap is reached. Which functions need isolating is
+  // therefore discovered here rather than kept in a list that would drift out
+  // of date, and the cost is one extra process per function that actually
+  // fails, not one per function in the corpus.
+  std::vector<std::string> skipped;
+  std::string accumulated;
+  RunResult result;
+
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    std::string skip;
+    for (const auto &name : skipped)
+      skip += (skip.empty() ? "" : ",") + name;
+
+    result = RunModule(executable, module, skip);
+    ASSERT_TRUE(result.started) << "failed to start " << module;
+    accumulated += result.output;
+
+    if (ReachedSummary(result.output))
+      break;
+
+    const auto announced = AnnouncedFunctions(result.output);
+    if (announced.empty()) {
+      // Nothing ran at all, so there is no function to blame and re-running
+      // would repeat the same result. The coverage check below reports it.
+      break;
+    }
+    skipped.push_back(announced.back());
+  }
+
   ASSERT_TRUE(ReachedSummary(result.output))
-      << module
-      << " produced no summary line, so it did not finish; the exit status is a "
-         "failure count and cannot distinguish this (exit "
+      << module << " never reached its summary line in " << kMaxAttempts
+      << " attempts, so it did not finish; the exit status is a failure count "
+         "and cannot distinguish this (exit "
       << result.exit_code << ")\n"
       << Tail(result.output, 20);
 
+  // A module that stops early reports no failures, and a gate that only looks
+  // for failures would read that as success. The clearest case is the display
+  // mode check these modules open with, which abandons the whole module when
+  // the current mode does not match the registry mode. Account for every
+  // function instead: what ran, plus what was skipped after a crash.
+  const auto manifest = LoadManifest(module);
+  if (!manifest.empty()) {
+    const auto announced = AnnouncedFunctions(accumulated);
+    std::vector<std::string> unique(announced.begin(), announced.end());
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    EXPECT_GE(unique.size(), manifest.size())
+        << module << " accounted for only " << unique.size() << " of "
+        << manifest.size()
+        << " test functions, so most of it never ran and a clean result would "
+           "mean nothing\n"
+        << Tail(accumulated, 20);
+  }
+
+  if (!skipped.empty()) {
+    std::string names;
+    for (const auto &name : skipped)
+      names += "  " + name + "\n";
+    ADD_FAILURE() << skipped.size() << " function(s) in " << module
+                  << " did not survive their own run and were skipped so the "
+                     "rest of the module could report:\n"
+                  << names;
+  }
+
   const auto baseline = LoadBaseline(module);
   std::vector<std::string> unexpected;
-  for (const auto &failure : FailureLines(result.output))
+  for (const auto &failure : FailureLines(accumulated))
     if (!IsBaselined(failure, baseline))
       unexpected.push_back(failure);
 
@@ -250,6 +360,15 @@ TEST_P(WineConformanceTest, MatchesBaseline) {
       << report;
 #endif
 }
+
+// These modules create windows, take focus and query the display mode, and one
+// of them abandons itself entirely when the current mode stops matching the
+// registry mode. A test running beside them that changes the mode would gut a
+// module into a clean-looking result, so they share one serial group and run
+// one at a time. They are also minutes long, which the scheduler would
+// otherwise cost at a single unit and pack into a parallel shard.
+DXMT_GROUP_SERIAL_TESTS("Wine/WineConformanceTest.*", "d3d9-wine-conformance");
+DXMT_SLOW_TEST_PATTERN("Wine/WineConformanceTest.*/*");
 
 INSTANTIATE_TEST_SUITE_P(Wine, WineConformanceTest,
                          testing::ValuesIn(kWineModules),
