@@ -6,22 +6,46 @@
 # The modules run with WINETEST_PLATFORM=windows, so these are measured against
 # strict Windows semantics rather than Wine's own todo map.
 #
-# Entries are matched at assertion-site granularity, by source line. Each site
-# below fires many times with different parameters and they share one cause, so
-# listing the site keeps the file readable and its removal marks the whole cause
-# fixed. The cost is that a new failure at an already-listed line is absorbed;
-# that is accepted for now because these are numeric mismatches at one site
-# rather than unrelated assertions sharing a line.
+# Entries are matched at assertion-site granularity, by source line, because a
+# site fires repeatedly from one cause and fixing that cause should remove one
+# line. The cost is that a new failure at a listed line is absorbed.
 
 # stateblock: none, it runs clean.
 
-# visual: fog computation. 54 failures across two adjacent assertion sites, all
-# of the form "Expected fog X or Y; got colour {...}" over combinations of pixel
-# mode, vertex mode, vs_mode and ortho_fog.
+# visual: recorded from a run of the module against DXMT. The comment on each
+# line is one example of what that site reported.
+# Got unexpected color 0x00000000.
+visual visual.isolated.c:22114
+# Test 7: Got color 0xffff0000, expected 0x80ff0000.
+visual visual.isolated.c:23398
+# Got unexpected color 0x00ffffff.
+visual visual.isolated.c:24133
+# Got unexpected color 0x00ffffff.
+visual visual.isolated.c:24135
+# Got unexpected hr 0x8876086c.
+visual visual.isolated.c:24569
+# Got unexpected hr 0.
+visual visual.isolated.c:24582
+# Expected color 0x00000000, got 0x00ff0000 (sw shader in hw mode).
+visual visual.isolated.c:24589
+# Expected color 0x00ffffff, got 0x00ff0000 (sw shader in sw mode).
+visual visual.isolated.c:24626
+# Got unexpected hr 0x8876086c.
+visual visual.isolated.c:24643
+# Expected color 0x0000ffff, got 0x000000ff (shader in sw mode).
+visual visual.isolated.c:24677
+# Got unexpected colour ffffffff.
+visual visual.isolated.c:26758
+# level 1: Got unexpected color 0x00000000.
+visual visual.isolated.c:27550
+# test 2: Got unexpected color 0x004d4dff.
+visual visual.isolated.c:27902
+# Got hr 0x8876086a for 844715353 to 22.
+visual visual.isolated.c:28024
+# Expected fog X or Y; got colour {...}, over combinations of pixel mode,
+# vertex mode, vs_mode and ortho_fog.
 visual visual.isolated.c:28475
 visual visual.isolated.c:28481
-
-# visual: vertex attributes. 7 failures, all writing alpha 1.0 where the test
-# expects the attribute's own alpha of 0.0, over attrib counts 1 to 4 with
-# ps_mode 3.
+# Expected colour {..., 0.0}; got {..., 1.0}, alpha written where the
+# attribute's own alpha is expected, over attrib counts 1 to 4.
 visual visual.isolated.c:28870
