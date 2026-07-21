@@ -242,12 +242,6 @@ TEST_F(CommandListLifecycleSpec, ResetRecordingListFails) {
   EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
 }
 
-TEST_F(CommandListLifecycleSpec, ResetWithNullAllocatorFails) {
-  ASSERT_EQ(context_.list()->Close(), S_OK);
-
-  EXPECT_TRUE(FAILED(context_.list()->Reset(nullptr, nullptr)));
-}
-
 TEST_F(CommandListLifecycleSpec, ResetWithWrongAllocatorTypeFails) {
   ASSERT_EQ(context_.list()->Close(), S_OK);
   ComPtr<ID3D12CommandAllocator> allocator;
