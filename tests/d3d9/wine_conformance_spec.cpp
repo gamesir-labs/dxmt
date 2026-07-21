@@ -22,6 +22,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -350,6 +351,20 @@ TEST_P(WineConformanceTest, MatchesBaseline) {
   for (const auto &failure : FailureLines(accumulated))
     if (!IsBaselined(failure, baseline))
       unexpected.push_back(failure);
+
+  // Carry the WHOLE unbaselined set, not a slice: recording a baseline needs
+  // every line. The assertion message is the reliable place for it. The suite
+  // scheduler captures each child's stdout and stderr into the suite log it
+  // reports, and the message is a string with no length limit, so the full set
+  // rides that log back. The raw dxmt-conformance-failure lines are kept as a
+  // second, machine-greppable channel for a harness that reads stdout directly.
+  if (!unexpected.empty()) {
+    std::printf("dxmt-conformance: %zu unbaselined failure(s) in %s\n",
+                unexpected.size(), module);
+    for (const auto &failure : unexpected)
+      std::printf("dxmt-conformance-failure: %s\n", failure.c_str());
+    std::fflush(stdout);
+  }
 
   std::string report;
   for (const auto &failure : unexpected)
