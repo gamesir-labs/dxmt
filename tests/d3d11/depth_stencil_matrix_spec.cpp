@@ -197,12 +197,12 @@ protected:
       depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
       ComPtr<ID3D11Texture2D> depth_texture;
       HRESULT hr = context_.device()->CreateTexture2D(&depth_desc, nullptr,
-                                                     depth_texture.put());
+                                                      depth_texture.put());
       if (FAILED(hr) || !depth_texture)
         continue;
       ComPtr<ID3D11DepthStencilView> depth_view;
-      hr = context_.device()->CreateDepthStencilView(
-          depth_texture.get(), nullptr, depth_view.put());
+      hr = context_.device()->CreateDepthStencilView(depth_texture.get(),
+                                                     nullptr, depth_view.put());
       if (FAILED(hr) || !depth_view)
         continue;
       depth_texture_ = std::move(depth_texture);
@@ -212,6 +212,34 @@ protected:
       return S_OK;
     }
     return E_FAIL;
+  }
+
+  HRESULT CreateDepthTarget(DXGI_FORMAT resource_format,
+                            DXGI_FORMAT view_format, UINT view_flags,
+                            ComPtr<ID3D11Texture2D> *texture,
+                            ComPtr<ID3D11DepthStencilView> *view,
+                            UINT bind_flags = D3D11_BIND_DEPTH_STENCIL) {
+    if (!texture || !view)
+      return E_INVALIDARG;
+    D3D11_TEXTURE2D_DESC texture_desc = {};
+    texture_desc.Width = kSize;
+    texture_desc.Height = kSize;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = resource_format;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    texture_desc.BindFlags = bind_flags;
+    HRESULT hr = context_.device()->CreateTexture2D(&texture_desc, nullptr,
+                                                    texture->put());
+    if (FAILED(hr))
+      return hr;
+    D3D11_DEPTH_STENCIL_VIEW_DESC view_desc = {};
+    view_desc.Format = view_format;
+    view_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    view_desc.Flags = view_flags;
+    return context_.device()->CreateDepthStencilView(texture->get(), &view_desc,
+                                                     view->put());
   }
 
   ComPtr<ID3D11DepthStencilState>
@@ -243,6 +271,11 @@ protected:
                                               depth, stencil);
   }
 
+  void ClearColor() {
+    const FLOAT black[4] = {};
+    context_.context()->ClearRenderTargetView(color_rtv_.get(), black);
+  }
+
   void SetDepthConstant(float depth) {
     struct Constants {
       float depth;
@@ -252,8 +285,16 @@ protected:
                                           &constants, 0, 0);
   }
 
-  void Draw(ID3D11DepthStencilState *depth_state, float depth,
-            UINT stencil_ref, ID3D11BlendState *blend_state) {
+  void Draw(ID3D11DepthStencilState *depth_state, float depth, UINT stencil_ref,
+            ID3D11BlendState *blend_state) {
+    DrawWithDsv(depth_dsv_.get(), depth_state, depth, stencil_ref, blend_state,
+                rasterizer_.get());
+  }
+
+  void DrawWithDsv(ID3D11DepthStencilView *depth_view,
+                   ID3D11DepthStencilState *depth_state, float depth,
+                   UINT stencil_ref, ID3D11BlendState *blend_state,
+                   ID3D11RasterizerState *rasterizer) {
     SetDepthConstant(depth);
     ID3D11RenderTargetView *targets[] = {color_rtv_.get()};
     ID3D11Buffer *constants[] = {depth_constants_.get()};
@@ -261,10 +302,10 @@ protected:
         0.0f, 0.0f, static_cast<float>(kSize), static_cast<float>(kSize),
         0.0f, 1.0f};
     const FLOAT blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    context_.context()->OMSetRenderTargets(1, targets, depth_dsv_.get());
+    context_.context()->OMSetRenderTargets(1, targets, depth_view);
     context_.context()->OMSetDepthStencilState(depth_state, stencil_ref);
     context_.context()->OMSetBlendState(blend_state, blend_factor, 0xffffffff);
-    context_.context()->RSSetState(rasterizer_.get());
+    context_.context()->RSSetState(rasterizer);
     context_.context()->RSSetViewports(1, &viewport);
     context_.context()->IASetPrimitiveTopology(
         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -277,13 +318,28 @@ protected:
 
   void ExpectCenterColor(bool green) {
     uint32_t pixel = 0;
-    ASSERT_TRUE(HResultSucceeded(ReadTexturePixel(
-        context_.device(), context_.context(), color_target_.get(), kSize / 2,
-        kSize / 2, &pixel)));
+    ASSERT_TRUE(HResultSucceeded(
+        ReadTexturePixel(context_.device(), context_.context(),
+                         color_target_.get(), kSize / 2, kSize / 2, &pixel)));
     const uint32_t expected = green ? kGreen : kBlack;
     EXPECT_TRUE(ColorMatches(pixel, expected, 2))
         << "center pixel was 0x" << std::hex << pixel << " expected 0x"
         << expected;
+  }
+
+  void ExpectStencilValue(UINT8 expected) {
+    D3D11_DEPTH_STENCIL_DESC desc = {};
+    desc.DepthEnable = FALSE;
+    desc.StencilEnable = TRUE;
+    desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+    desc.StencilWriteMask = 0;
+    desc.FrontFace = StencilFace(D3D11_COMPARISON_EQUAL);
+    desc.BackFace = desc.FrontFace;
+    auto state = CreateDepthStencilState(desc);
+    ASSERT_TRUE(state);
+    ClearColor();
+    Draw(state.get(), 0.0f, expected, color_write_all_.get());
+    ExpectCenterColor(true);
   }
 
   void RequireStencil() {
@@ -459,20 +515,22 @@ INSTANTIATE_TEST_SUITE_P(
         StencilOperationCase{D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_EQUAL, 4,
                              3, 3, false, "KeepEqualFail"},
         // REPLACE writes reference=7; EQUAL ref=7 passes.
-        StencilOperationCase{D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_EQUAL, 4,
-                             7, 7, true, "ReplaceEqualPass"},
+        StencilOperationCase{D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_EQUAL,
+                             4, 7, 7, true, "ReplaceEqualPass"},
         // REPLACE writes 7; NOT_EQUAL ref=4 passes (7 != 4).
-        StencilOperationCase{D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_NOT_EQUAL,
-                             4, 7, 4, true, "ReplaceNotEqualPass"},
+        StencilOperationCase{D3D11_STENCIL_OP_REPLACE,
+                             D3D11_COMPARISON_NOT_EQUAL, 4, 7, 4, true,
+                             "ReplaceNotEqualPass"},
         // REPLACE writes 7; NOT_EQUAL ref=7 fails.
-        StencilOperationCase{D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_NOT_EQUAL,
-                             4, 7, 7, false, "ReplaceNotEqualFail"},
+        StencilOperationCase{D3D11_STENCIL_OP_REPLACE,
+                             D3D11_COMPARISON_NOT_EQUAL, 4, 7, 7, false,
+                             "ReplaceNotEqualFail"},
         // INCR wraps 4 -> 5; EQUAL ref=5 passes.
-        StencilOperationCase{D3D11_STENCIL_OP_INCR, D3D11_COMPARISON_EQUAL, 4, 0,
-                             5, true, "IncrEqualPass"},
+        StencilOperationCase{D3D11_STENCIL_OP_INCR, D3D11_COMPARISON_EQUAL, 4,
+                             0, 5, true, "IncrEqualPass"},
         // INCR 4 -> 5; EQUAL ref=4 fails.
-        StencilOperationCase{D3D11_STENCIL_OP_INCR, D3D11_COMPARISON_EQUAL, 4, 0,
-                             4, false, "IncrEqualFail"},
+        StencilOperationCase{D3D11_STENCIL_OP_INCR, D3D11_COMPARISON_EQUAL, 4,
+                             0, 4, false, "IncrEqualFail"},
         // INCR wrap 255 -> 0; EQUAL ref=0 passes.
         StencilOperationCase{D3D11_STENCIL_OP_INCR, D3D11_COMPARISON_EQUAL, 255,
                              0, 0, true, "IncrWrapEqualPass"}),
@@ -521,9 +579,235 @@ TEST_P(DepthWriteMatrixSpec, WriteEnableAffectsSecondDraw) {
 
 INSTANTIATE_TEST_SUITE_P(
     WriteMask, DepthWriteMatrixSpec,
-    ::testing::Values(
-        DepthWriteCase{TRUE, false, "WriteEnabledSecondRejected"},
-        DepthWriteCase{FALSE, true, "WriteDisabledSecondAccepted"}),
+    ::testing::Values(DepthWriteCase{TRUE, false, "WriteEnabledSecondRejected"},
+                      DepthWriteCase{FALSE, true,
+                                     "WriteDisabledSecondAccepted"}),
     DepthWriteMatrixSpec::Name);
+
+TEST_F(DepthStencilMatrixFixture, FrontAndBackFacesUseIndependentOperations) {
+  RequireStencil();
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = FALSE;
+  desc.StencilEnable = TRUE;
+  desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+  desc.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+  desc.FrontFace =
+      StencilFace(D3D11_COMPARISON_ALWAYS, D3D11_STENCIL_OP_REPLACE);
+  desc.BackFace = StencilFace(D3D11_COMPARISON_ALWAYS, D3D11_STENCIL_OP_ZERO);
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  D3D11_RASTERIZER_DESC raster_desc = {};
+  raster_desc.FillMode = D3D11_FILL_SOLID;
+  raster_desc.CullMode = D3D11_CULL_NONE;
+  raster_desc.DepthClipEnable = TRUE;
+  ComPtr<ID3D11RasterizerState> clockwise_front;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRasterizerState(
+      &raster_desc, clockwise_front.put())));
+  raster_desc.FrontCounterClockwise = TRUE;
+  ComPtr<ID3D11RasterizerState> counterclockwise_front;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateRasterizerState(
+      &raster_desc, counterclockwise_front.put())));
+
+  Clear(1.0f, 4);
+  DrawWithDsv(depth_dsv_.get(), state.get(), 0.0f, 7, color_write_none_.get(),
+              clockwise_front.get());
+  ExpectStencilValue(7);
+
+  Clear(1.0f, 4);
+  DrawWithDsv(depth_dsv_.get(), state.get(), 0.0f, 7, color_write_none_.get(),
+              counterclockwise_front.get());
+  ExpectStencilValue(0);
+}
+
+TEST_F(DepthStencilMatrixFixture, StencilReadMaskControlsComparisonBits) {
+  RequireStencil();
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = FALSE;
+  desc.StencilEnable = TRUE;
+  desc.StencilReadMask = 0x0f;
+  desc.StencilWriteMask = 0;
+  desc.FrontFace = StencilFace(D3D11_COMPARISON_EQUAL);
+  desc.BackFace = desc.FrontFace;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(1.0f, 0xac);
+  Draw(state.get(), 0.0f, 0x3c, color_write_all_.get());
+  ExpectCenterColor(true);
+}
+
+TEST_F(DepthStencilMatrixFixture, StencilWriteMaskPreservesMaskedBits) {
+  RequireStencil();
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = FALSE;
+  desc.StencilEnable = TRUE;
+  desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+  desc.StencilWriteMask = 0x0f;
+  desc.FrontFace =
+      StencilFace(D3D11_COMPARISON_ALWAYS, D3D11_STENCIL_OP_REPLACE);
+  desc.BackFace = desc.FrontFace;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(1.0f, 0xa5);
+  Draw(state.get(), 0.0f, 0x3c, color_write_none_.get());
+  ExpectStencilValue(0xac);
+}
+
+TEST_F(DepthStencilMatrixFixture, StencilReferenceChangesBetweenDraws) {
+  RequireStencil();
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = FALSE;
+  desc.StencilEnable = TRUE;
+  desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+  desc.StencilWriteMask = 0;
+  desc.FrontFace = StencilFace(D3D11_COMPARISON_EQUAL);
+  desc.BackFace = desc.FrontFace;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(1.0f, 5);
+  Draw(state.get(), 0.0f, 5, color_write_all_.get());
+  ExpectCenterColor(true);
+
+  ClearColor();
+  Draw(state.get(), 0.0f, 6, color_write_all_.get());
+  ExpectCenterColor(false);
+}
+
+TEST_F(DepthStencilMatrixFixture, DepthOnlyFormatExecutesDepthTest) {
+  ComPtr<ID3D11Texture2D> texture;
+  ComPtr<ID3D11DepthStencilView> view;
+  ASSERT_TRUE(HResultSucceeded(CreateDepthTarget(
+      DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT, 0, &texture, &view)));
+  depth_texture_ = std::move(texture);
+  depth_dsv_ = std::move(view);
+  depth_format_ = DXGI_FORMAT_D32_FLOAT;
+  has_stencil_ = false;
+
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = TRUE;
+  desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+  desc.DepthFunc = D3D11_COMPARISON_LESS;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(0.75f, 0);
+  Draw(state.get(), 0.5f, 0, color_write_all_.get());
+  ExpectCenterColor(true);
+}
+
+TEST_F(DepthStencilMatrixFixture, DepthStencilFormatTestsBothAspects) {
+  RequireStencil();
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = TRUE;
+  desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+  desc.DepthFunc = D3D11_COMPARISON_LESS;
+  desc.StencilEnable = TRUE;
+  desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+  desc.StencilWriteMask = 0;
+  desc.FrontFace = StencilFace(D3D11_COMPARISON_EQUAL);
+  desc.BackFace = desc.FrontFace;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(0.75f, 9);
+  Draw(state.get(), 0.5f, 9, color_write_all_.get());
+  ExpectCenterColor(true);
+}
+
+TEST_F(DepthStencilMatrixFixture,
+       ReadOnlyDepthViewAllowsDepthPlaneShaderResourceBinding) {
+  ComPtr<ID3D11Texture2D> texture;
+  ComPtr<ID3D11DepthStencilView> writable;
+  ASSERT_TRUE(HResultSucceeded(CreateDepthTarget(
+      DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, 0, &texture,
+      &writable, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE)));
+  D3D11_DEPTH_STENCIL_VIEW_DESC read_only_desc = {};
+  read_only_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+  read_only_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+  read_only_desc.Flags = D3D11_DSV_READ_ONLY_DEPTH;
+  ComPtr<ID3D11DepthStencilView> read_only;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateDepthStencilView(
+      texture.get(), &read_only_desc, read_only.put())));
+  D3D11_SHADER_RESOURCE_VIEW_DESC resource_desc = {};
+  resource_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  resource_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  resource_desc.Texture2D.MipLevels = 1;
+  ComPtr<ID3D11ShaderResourceView> resource_view;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateShaderResourceView(
+      texture.get(), &resource_desc, resource_view.put())));
+  depth_texture_ = std::move(texture);
+  depth_dsv_ = std::move(writable);
+  depth_format_ = DXGI_FORMAT_D24_UNORM_S8_UINT;
+  has_stencil_ = true;
+
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = TRUE;
+  desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+  desc.DepthFunc = D3D11_COMPARISON_LESS;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(0.75f, 0);
+  ID3D11ShaderResourceView *resources[] = {resource_view.get()};
+  context_.context()->PSSetShaderResources(0, 1, resources);
+  DrawWithDsv(read_only.get(), state.get(), 0.5f, 0, color_write_all_.get(),
+              rasterizer_.get());
+  ExpectCenterColor(true);
+
+  ComPtr<ID3D11ShaderResourceView> queried;
+  context_.context()->PSGetShaderResources(0, 1, queried.put());
+  EXPECT_EQ(queried.get(), resource_view.get());
+}
+
+TEST_F(DepthStencilMatrixFixture,
+       ReadOnlyStencilViewAllowsStencilPlaneShaderResourceBinding) {
+  ComPtr<ID3D11Texture2D> texture;
+  ComPtr<ID3D11DepthStencilView> writable;
+  ASSERT_TRUE(HResultSucceeded(CreateDepthTarget(
+      DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, 0, &texture,
+      &writable, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE)));
+  D3D11_DEPTH_STENCIL_VIEW_DESC read_only_desc = {};
+  read_only_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+  read_only_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+  read_only_desc.Flags = D3D11_DSV_READ_ONLY_STENCIL;
+  ComPtr<ID3D11DepthStencilView> read_only;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateDepthStencilView(
+      texture.get(), &read_only_desc, read_only.put())));
+  D3D11_SHADER_RESOURCE_VIEW_DESC resource_desc = {};
+  resource_desc.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+  resource_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  resource_desc.Texture2D.MipLevels = 1;
+  ComPtr<ID3D11ShaderResourceView> resource_view;
+  ASSERT_TRUE(HResultSucceeded(context_.device()->CreateShaderResourceView(
+      texture.get(), &resource_desc, resource_view.put())));
+  depth_texture_ = std::move(texture);
+  depth_dsv_ = std::move(writable);
+  depth_format_ = DXGI_FORMAT_D24_UNORM_S8_UINT;
+  has_stencil_ = true;
+
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = FALSE;
+  desc.StencilEnable = TRUE;
+  desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+  desc.StencilWriteMask = 0;
+  desc.FrontFace = StencilFace(D3D11_COMPARISON_EQUAL);
+  desc.BackFace = desc.FrontFace;
+  auto state = CreateDepthStencilState(desc);
+  ASSERT_TRUE(state);
+
+  Clear(1.0f, 5);
+  ID3D11ShaderResourceView *resources[] = {resource_view.get()};
+  context_.context()->PSSetShaderResources(0, 1, resources);
+  DrawWithDsv(read_only.get(), state.get(), 0.0f, 5, color_write_all_.get(),
+              rasterizer_.get());
+  ExpectCenterColor(true);
+
+  ComPtr<ID3D11ShaderResourceView> queried;
+  context_.context()->PSGetShaderResources(0, 1, queried.put());
+  EXPECT_EQ(queried.get(), resource_view.get());
+}
 
 } // namespace
