@@ -23457,32 +23457,51 @@ private:
 
     constexpr UINT64 tile_bytes =
         D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
-    std::vector<CopyBufferRegionRecord> copies;
+    struct CopyBufferTileOp {
+      Rc<Buffer> backing;
+      UINT64 backing_offset = 0;
+      UINT64 linear_offset = 0;
+      UINT64 copy_size = 0;
+    };
+    std::vector<CopyBufferTileOp> copies;
     UINT linear_tile = 0;
     const bool valid = ForEachTileInRegion(
         *tiling, record.start, &record.size,
         [&](UINT subresource, UINT x, UINT y, UINT z) {
           if (subresource || y || z)
             return false;
-          const UINT64 tiled_offset = UINT64(x) * tile_bytes;
-          const UINT64 linear_offset =
+          const UINT64 logical_linear_offset =
               record.buffer_offset + UINT64(linear_tile++) * tile_bytes;
+          const UINT64 linear_offset =
+              linear.GetHeapOffset() + logical_linear_offset;
+          const UINT64 tiled_offset = UINT64(x) * tile_bytes;
           const auto tiled_size = tiled.GetResourceDesc().Width;
           const auto linear_size = linear.GetResourceDesc().Width;
-          if (tiled_offset >= tiled_size || linear_offset >= linear_size)
+          if (tiled_offset >= tiled_size ||
+              logical_linear_offset >= linear_size)
             return false;
           const UINT64 copy_size =
               std::min(tile_bytes, tiled_size - tiled_offset);
-          if (copy_size > linear_size - linear_offset)
+          if (copy_size > linear_size - logical_linear_offset)
             return false;
 
-          CopyBufferRegionRecord copy = {};
-          copy.dst = buffer_to_tiled ? record.tiled_resource : record.buffer;
-          copy.dst_offset = buffer_to_tiled ? tiled_offset : linear_offset;
-          copy.src = buffer_to_tiled ? record.buffer : record.tiled_resource;
-          copy.src_offset = buffer_to_tiled ? linear_offset : tiled_offset;
-          copy.byte_count = copy_size;
-          copies.push_back(std::move(copy));
+          ResourceTileMapping mapping = {};
+          if (!tiled.GetTileMapping(subresource, x, y, z, mapping))
+            return false;
+          if (!mapping.heap || mapping.heap_tile < 0) {
+            copies.push_back({{}, 0, linear_offset, copy_size});
+            return true;
+          }
+
+          auto *heap = dynamic_cast<d3d12::Heap *>(mapping.heap.ptr());
+          Rc<Buffer> backing = heap ? Rc<Buffer>(heap->GetBuffer()) : nullptr;
+          const UINT64 backing_offset =
+              UINT64(mapping.heap_tile) * tile_bytes;
+          if (!backing || backing_offset > backing->length() ||
+              copy_size > backing->length() - backing_offset)
+            return false;
+          copies.push_back(
+              {std::move(backing), backing_offset, linear_offset, copy_size});
           return true;
         });
     if (!valid) {
@@ -23494,8 +23513,63 @@ private:
            " bufferOffset=", record.buffer_offset);
       return;
     }
-    for (const auto &copy : copies)
-      ReplayCopyBufferRegion(chunk, state, copy);
+    Rc<Buffer> linear_buffer = linear.GetBuffer();
+    for (const auto &copy : copies) {
+      if (!copy.backing) {
+        if (buffer_to_tiled)
+          continue;
+        QueueBlitCommand(
+            chunk, state, {}, {record.buffer.ptr()},
+            [linear_buffer, linear_offset = copy.linear_offset,
+             copy_size = copy.copy_size](ArgumentEncodingContext &enc) {
+          auto [dst, dst_offset] = enc.access(
+              linear_buffer, linear_offset, copy_size, ResourceAccess::Write);
+          auto &fill = enc.encodeBlitCommand<wmtcmd_blit_fillbuffer>();
+          fill.type = WMTBlitCommandFillBuffer;
+          fill.buffer = dst->buffer();
+          fill.offset = dst_offset + linear_offset;
+          fill.length = copy_size;
+          fill.value = 0;
+        });
+        continue;
+      }
+
+      QueueBlitCommand(
+          chunk, state,
+          buffer_to_tiled
+              ? std::initializer_list<ID3D12Resource *>{record.buffer.ptr()}
+              : std::initializer_list<ID3D12Resource *>{
+                    record.tiled_resource.ptr()},
+          buffer_to_tiled
+              ? std::initializer_list<ID3D12Resource *>{
+                    record.tiled_resource.ptr()}
+              : std::initializer_list<ID3D12Resource *>{record.buffer.ptr()},
+          [linear_buffer, backing = copy.backing,
+           linear_offset = copy.linear_offset,
+           backing_offset = copy.backing_offset, copy_size = copy.copy_size,
+           buffer_to_tiled](ArgumentEncodingContext &enc) {
+        auto [linear_allocation, linear_sub_offset] = enc.access(
+            linear_buffer, linear_offset, copy_size,
+            buffer_to_tiled ? ResourceAccess::Read : ResourceAccess::Write);
+        auto [backing_allocation, backing_sub_offset] = enc.access(
+            backing, backing_offset, copy_size,
+            buffer_to_tiled ? ResourceAccess::Write : ResourceAccess::Read);
+        auto &blit =
+            enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+        blit.type = WMTBlitCommandCopyFromBufferToBuffer;
+        blit.src = buffer_to_tiled ? linear_allocation->buffer()
+                                   : backing_allocation->buffer();
+        blit.src_offset = buffer_to_tiled
+                              ? linear_sub_offset + linear_offset
+                              : backing_sub_offset + backing_offset;
+        blit.dst = buffer_to_tiled ? backing_allocation->buffer()
+                                   : linear_allocation->buffer();
+        blit.dst_offset = buffer_to_tiled
+                              ? backing_sub_offset + backing_offset
+                              : linear_sub_offset + linear_offset;
+        blit.copy_length = copy_size;
+      });
+    }
   }
 
   void ReplayCopyTiles(CommandChunk *chunk, ReplayState &state,
