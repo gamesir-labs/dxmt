@@ -244,6 +244,53 @@ TEST_F(ComputeDispatchSpec, GroupSharedMemorySynchronizesAcrossThreads) {
 }
 
 TEST_F(ComputeDispatchSpec,
+       DivergentWritesReconvergeBeforeGroupBarrier) {
+  const auto shader = CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+    groupshared uint first_value;
+    groupshared uint last_value;
+    [numthreads(8, 1, 1)]
+    void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+      const uint base = group.x * 100u;
+      uint branch_value;
+      [branch]
+      if ((lane & 1u) == 0u)
+        branch_value = base + lane + 1u;
+      else
+        branch_value = base + lane + 101u;
+      if (lane == 0u)
+        first_value = branch_value;
+      if (lane == 7u)
+        last_value = branch_value;
+
+      // The barrier remains uniform: barriers in diverging branches are
+      // undefined, while divergent work before reconvergence is valid.
+      GroupMemoryBarrierWithGroupSync();
+      if (lane == 3u) {
+        const uint result = group.x * 3u;
+        output.Store((result + 0u) * 4u, first_value);
+        output.Store((result + 1u) * 4u, last_value);
+        output.Store((result + 2u) * 4u, first_value + last_value);
+      }
+    })",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = CreatePipeline(shader);
+  ASSERT_TRUE(pipeline);
+  constexpr UINT kGroupCount = 3;
+  constexpr UINT kResultsPerGroup = 3;
+  auto output = CreateOutput(kGroupCount * kResultsPerGroup);
+  ASSERT_TRUE(output.buffer);
+  ASSERT_TRUE(output.heap);
+  Bind(output, pipeline.get());
+  context_.list()->Dispatch(kGroupCount, 1, 1);
+
+  EXPECT_EQ(Readback(output, kGroupCount * kResultsPerGroup),
+            (std::vector<UINT>{1u, 108u, 109u, 101u, 208u, 309u, 201u,
+                               308u, 509u}));
+}
+
+TEST_F(ComputeDispatchSpec,
        WriteBufferImmediateBetweenDispatchesPreservesOrder) {
   auto shader = CompileShader(R"(
     RWBuffer<uint> output : register(u0);
