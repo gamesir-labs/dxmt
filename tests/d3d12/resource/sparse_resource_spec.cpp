@@ -314,12 +314,13 @@ protected:
   }
 
   ComPtr<ID3D12Resource>
-  CreateStandardReservedTexture(D3D12_RESOURCE_STATES initial_state) {
+  CreateStandardReservedTexture(D3D12_RESOURCE_STATES initial_state,
+                                UINT16 array_size = 1) {
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = 512;
     desc.Height = 512;
-    desc.DepthOrArraySize = 1;
+    desc.DepthOrArraySize = array_size;
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_R32_UINT;
     desc.SampleDesc.Count = 1;
@@ -333,23 +334,25 @@ protected:
   }
 
   void ExpectCopyTilesRoundTrip(UINT x, UINT y, UINT width, UINT height,
-                                UINT64 buffer_offset) {
+                                UINT64 buffer_offset, UINT16 array_size = 1,
+                                UINT subresource = 0) {
     D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
     ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
         D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
     if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
       GTEST_SKIP() << "Tiled resources are not supported";
 
-    auto texture =
-        CreateStandardReservedTexture(D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_LT(subresource, array_size);
+    auto texture = CreateStandardReservedTexture(
+        D3D12_RESOURCE_STATE_COPY_DEST, array_size);
     ASSERT_TRUE(texture);
 
     D3D12_SUBRESOURCE_TILING tiling = {};
     UINT subresource_count = 1;
     UINT total_tiles = 0;
     context_.device()->GetResourceTiling(
-        texture.get(), &total_tiles, nullptr, nullptr, &subresource_count, 0,
-        &tiling);
+        texture.get(), &total_tiles, nullptr, nullptr, &subresource_count,
+        subresource, &tiling);
     ASSERT_EQ(subresource_count, 1u);
     ASSERT_GT(total_tiles, 0u);
     ASSERT_LE(x + width, tiling.WidthInTiles);
@@ -384,7 +387,7 @@ protected:
     context_.list()->CopyBufferRegion(output.get(), 0, initial.get(), 0,
                                       buffer_size);
 
-    D3D12_TILED_RESOURCE_COORDINATE coordinate = {x, y, 0, 0};
+    D3D12_TILED_RESOURCE_COORDINATE coordinate = {x, y, 0, subresource};
     D3D12_TILE_REGION_SIZE region = {};
     region.NumTiles = tile_count;
     region.UseBox = tile_count > 1;
@@ -742,6 +745,9 @@ TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsMappedTileBox) {
                            D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
 }
 
+TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsNonzeroArraySlice) {
+  ExpectCopyTilesRoundTrip(0, 0, 1, 1, 0, 2, 1);
+}
 
 TEST_F(D3D12SparseResourceSpec,
        CopyTileMappingsAliasesNonzeroCoordinatesBetweenResources) {
