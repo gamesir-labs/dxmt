@@ -2187,6 +2187,11 @@ public:
         dxmt::PerfCodePath::CommandListCloseControl);
     if (closed_)
       return E_FAIL;
+    if (render_pass_active_ && recording_error_ == S_OK) {
+      recording_error_ = E_FAIL;
+      WARN("D3D12GraphicsCommandList: Close is not valid while a render pass "
+           "is active");
+    }
     if (!recording_error_) {
       dxmt::perf::ScopedCodeTimer build_timer(
           dxmt::PerfCodePath::CommandListCloseBuildCompiled);
@@ -3212,6 +3217,8 @@ public:
       return;
     if (RejectCommandListType("ClearDepthStencilView", kDirectList))
       return;
+    if (RejectCommandInsideRenderPass("ClearDepthStencilView"))
+      return;
     auto descriptor = GetDescriptorRecordFromCpuHandle(
         dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     if (!descriptor)
@@ -3243,6 +3250,8 @@ public:
     if (DropBundleCommand("ClearRenderTargetView"))
       return;
     if (RejectCommandListType("ClearRenderTargetView", kDirectList))
+      return;
+    if (RejectCommandInsideRenderPass("ClearRenderTargetView"))
       return;
     auto descriptor = GetDescriptorRecordFromCpuHandle(
         rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -3749,10 +3758,12 @@ public:
       return;
     if (RejectCommandListType("BeginRenderPass", kDirectList))
       return;
-    if (render_pass_active_ ||
-        (render_targets_count && !render_targets) ||
+    if (RejectCommandInsideRenderPass("BeginRenderPass"))
+      return;
+    if ((render_targets_count && !render_targets) ||
         render_targets_count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) {
-      recording_error_ = E_INVALIDARG;
+      if (recording_error_ == S_OK)
+        recording_error_ = E_INVALIDARG;
       return;
     }
     if (flags & ~(D3D12_RENDER_PASS_FLAG_NONE |
@@ -3827,7 +3838,8 @@ public:
     if (RejectCommandListType("EndRenderPass", kDirectList))
       return;
     if (!render_pass_active_) {
-      recording_error_ = E_INVALIDARG;
+      if (recording_error_ == S_OK)
+        recording_error_ = E_FAIL;
       return;
     }
     render_pass_active_ = false;
@@ -4360,6 +4372,16 @@ private:
       recording_error_ = E_FAIL;
     WARN("D3D12GraphicsCommandList: ", command,
          " is not valid for command list type ", static_cast<UINT>(type_));
+    return true;
+  }
+
+  bool RejectCommandInsideRenderPass(const char *command) {
+    if (!render_pass_active_)
+      return false;
+    if (recording_error_ == S_OK)
+      recording_error_ = E_FAIL;
+    WARN("D3D12GraphicsCommandList: ", command,
+         " is not valid while a render pass is active");
     return true;
   }
 
