@@ -1194,6 +1194,12 @@ TEST_F(D3D12SparseResourceSpec,
 
 const dxmt::test::SerialTestRegistration kSparseResourceSerial(
     "D3D12SparseResourceSpec.*");
+// Native WARP can stall when this array-slice CopyTiles case reuses the worker
+// process that ran earlier sparse-resource cases. Keep sparse-domain exclusion,
+// but give this case a fresh worker process.
+DXMT_GROUP_SERIAL_TESTS(
+    "D3D12SparseResourceSpec.CopyTilesRoundTripsNonzeroArraySlice",
+    "d3d12-sparse-array-copy");
 DXMT_GROUP_SERIAL_TESTS("D3D12SparseResourceSpec.*", "d3d12-sparse");
 DXMT_SERIAL_TEST_DOMAIN("D3D12SparseResourceSpec.*", "sparse");
 
