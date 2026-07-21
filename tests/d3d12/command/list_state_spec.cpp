@@ -399,18 +399,36 @@ protected:
     ASSERT_TRUE(SUCCEEDED(context_.ResetCommandList()));
   }
 
-  void Bind(std::optional<ComputeResetState> omitted) {
+  void Bind(std::optional<ComputeResetState> omitted,
+            bool bind_pipeline = true) {
     if (omitted != ComputeResetState::DescriptorHeaps) {
       ID3D12DescriptorHeap *heaps[] = {heap_.get()};
       context_.list()->SetDescriptorHeaps(1, heaps);
     }
-    context_.list()->SetPipelineState(pipeline_.get());
+    if (bind_pipeline)
+      context_.list()->SetPipelineState(pipeline_.get());
     if (omitted != ComputeResetState::RootSignature)
       context_.list()->SetComputeRootSignature(root_signature_.get());
     if (omitted != ComputeResetState::RootArguments) {
       context_.list()->SetComputeRoot32BitConstant(0, 0x12345678, 0);
       context_.list()->SetComputeRootDescriptorTable(
           1, heap_->GetGPUDescriptorHandleForHeapStart());
+    }
+  }
+
+  void ExpectDispatchOutput(UINT expected) {
+    context_.list()->Dispatch(1, 1, 1);
+    D3D12TestContext::Transition(context_.list(), output_.get(),
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<std::uint8_t> bytes;
+    ASSERT_TRUE(SUCCEEDED(
+        context_.ReadbackBuffer(output_.get(), 64 * sizeof(UINT), &bytes)));
+    ASSERT_EQ(bytes.size(), 64 * sizeof(UINT));
+    for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(UINT)) {
+      UINT value = 0;
+      std::memcpy(&value, bytes.data() + offset, sizeof(value));
+      EXPECT_EQ(value, expected) << "element " << offset / sizeof(UINT);
     }
   }
 
@@ -443,19 +461,16 @@ TEST_F(ComputeResetStateSpec, ResetAllowsFullComputeStateRebind) {
   ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
 
   Bind(std::nullopt);
-  context_.list()->Dispatch(1, 1, 1);
-  D3D12TestContext::Transition(context_.list(), output_.get(),
-                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
-  std::vector<std::uint8_t> bytes;
-  ASSERT_TRUE(SUCCEEDED(
-      context_.ReadbackBuffer(output_.get(), 64 * sizeof(UINT), &bytes)));
-  ASSERT_EQ(bytes.size(), 64 * sizeof(UINT));
-  for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(UINT)) {
-    UINT value = 0;
-    std::memcpy(&value, bytes.data() + offset, sizeof(value));
-    EXPECT_EQ(value, 0x12345678u) << "element " << offset / sizeof(UINT);
-  }
+  ExpectDispatchOutput(0x12345678u);
+}
+
+TEST_F(ComputeResetStateSpec, ResetRestoresInitialPipelineState) {
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+  ASSERT_EQ(context_.list()->Reset(context_.allocator(), pipeline_.get()),
+            S_OK);
+
+  Bind(std::nullopt, false);
+  ExpectDispatchOutput(0x12345678u);
 }
 
 } // namespace
