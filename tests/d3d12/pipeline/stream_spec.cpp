@@ -6,8 +6,10 @@
 #include "shaders/runtime_test_shaders.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -62,6 +64,161 @@ TEST_F(PipelineStreamSpec, DuplicateSubobjectRejected) {
 
   EXPECT_EQ(CreatePipeline(stream, pipeline.put()), E_INVALIDARG);
   EXPECT_FALSE(pipeline);
+}
+
+struct TruncatedSubobjectCase {
+  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+  const char *name;
+};
+
+class PipelineStreamTruncationSpec
+    : public PipelineStreamSpec,
+      public ::testing::WithParamInterface<TruncatedSubobjectCase> {};
+
+TEST_P(PipelineStreamTruncationSpec, TruncatedSubobjectRejected) {
+  const auto &test = GetParam();
+  alignas(void *) std::array<std::byte, sizeof(void *)> stream = {};
+  std::memcpy(stream.data(), &test.type, sizeof(test.type));
+  ID3D12PipelineState *pipeline =
+      reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
+
+  EXPECT_EQ(CreatePipeline(stream.data(), sizeof(test.type), &pipeline),
+            E_INVALIDARG);
+  EXPECT_EQ(pipeline, nullptr);
+}
+
+std::string TruncatedSubobjectCaseName(
+    const ::testing::TestParamInfo<TruncatedSubobjectCase> &info) {
+  return info.param.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    EverySupportedType, PipelineStreamTruncationSpec,
+    ::testing::Values(
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            "RootSignature"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+                               "VertexShader"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+                               "PixelShader"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS,
+                               "DomainShader"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS,
+                               "HullShader"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS,
+                               "GeometryShader"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+                               "ComputeShader"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, "StreamOutput"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+                               "Blend"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                               "SampleMask"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                               "Rasterizer"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, "DepthStencil"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+                               "InputLayout"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
+            "IndexBufferStripCut"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+            "PrimitiveTopology"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            "RenderTargetFormats"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            "DepthStencilFormat"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+                               "SampleDescription"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK,
+                               "NodeMask"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO,
+                               "CachedPipeline"},
+        TruncatedSubobjectCase{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS,
+                               "Flags"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+            "DepthStencil1"},
+        TruncatedSubobjectCase{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING,
+            "ViewInstancing"}),
+    TruncatedSubobjectCaseName);
+
+class PipelineStreamTypeTruncationSpec
+    : public PipelineStreamSpec,
+      public ::testing::WithParamInterface<SIZE_T> {};
+
+TEST_P(PipelineStreamTypeTruncationSpec, TruncatedTypeRejected) {
+  const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type =
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+  alignas(void *) std::array<std::byte, sizeof(void *)> stream = {};
+  std::memcpy(stream.data(), &type, sizeof(type));
+  ID3D12PipelineState *pipeline =
+      reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
+
+  EXPECT_EQ(CreatePipeline(stream.data(), GetParam(), &pipeline), E_INVALIDARG);
+  EXPECT_EQ(pipeline, nullptr);
+}
+
+INSTANTIATE_TEST_SUITE_P(EveryPartialTypeSize, PipelineStreamTypeTruncationSpec,
+                         ::testing::Values(SIZE_T{1}, SIZE_T{2}, SIZE_T{3}),
+                         [](const ::testing::TestParamInfo<SIZE_T> &info) {
+                           return "Bytes" + std::to_string(info.param);
+                         });
+
+TEST_F(PipelineStreamSpec, EmptyStreamRejected) {
+  std::byte stream = {};
+  ID3D12PipelineState *pipeline =
+      reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
+
+  EXPECT_EQ(CreatePipeline(&stream, 0, &pipeline), E_INVALIDARG);
+  EXPECT_EQ(pipeline, nullptr);
+}
+
+TEST_F(PipelineStreamSpec, NullSubobjectStreamRejected) {
+  ID3D12PipelineState *pipeline =
+      reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
+
+  EXPECT_EQ(CreatePipeline(nullptr, sizeof(void *), &pipeline), E_INVALIDARG);
+  EXPECT_EQ(pipeline, nullptr);
+}
+
+TEST_F(PipelineStreamSpec, UnknownSubobjectTypeRejected) {
+  const auto type = static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID + 1);
+  alignas(void *) std::array<std::byte, sizeof(void *)> stream = {};
+  std::memcpy(stream.data(), &type, sizeof(type));
+  ID3D12PipelineState *pipeline =
+      reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
+
+  EXPECT_EQ(CreatePipeline(stream.data(), stream.size(), &pipeline),
+            E_INVALIDARG);
+  EXPECT_EQ(pipeline, nullptr);
+}
+
+TEST_F(PipelineStreamSpec, TrailingPartialSubobjectTypeRejected) {
+  struct Stream {
+    PipelineSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+                      D3D12_SHADER_BYTECODE>
+        compute;
+    std::array<std::byte, sizeof(void *)> trailing;
+  } stream;
+  stream.compute.value = CopyTextureComputeShader();
+  const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE trailing_type =
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS;
+  std::memcpy(stream.trailing.data(), &trailing_type, sizeof(trailing_type));
+  ID3D12PipelineState *pipeline =
+      reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
+
+  EXPECT_EQ(CreatePipeline(&stream, sizeof(stream.compute) + 1, &pipeline),
+            E_INVALIDARG);
+  EXPECT_EQ(pipeline, nullptr);
 }
 
 TEST_F(PipelineStreamSpec, ComputeAndGraphicsSubobjectsMixedRejected) {
