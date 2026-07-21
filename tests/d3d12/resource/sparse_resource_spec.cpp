@@ -414,9 +414,13 @@ protected:
     context_.list()->CopyTiles(
         texture.get(), &coordinate, &region, upload.get(), buffer_offset,
         D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
-    D3D12TestContext::Transition(
-        context_.list(), texture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_RESOURCE_BARRIER texture_barrier = {};
+    texture_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    texture_barrier.Transition.pResource = texture.get();
+    texture_barrier.Transition.Subresource = subresource;
+    texture_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    texture_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    context_.list()->ResourceBarrier(1, &texture_barrier);
     context_.list()->CopyTiles(
         texture.get(), &coordinate, &region, output.get(), buffer_offset,
         D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
