@@ -15,6 +15,7 @@ d3d11_unit_sources = files(
   'clear_blend_matrix_spec.cpp',
   'viewport_sampler_matrix_spec.cpp',
   'viewport_scissor_ops_spec.cpp',
+  'rasterization_ops_spec.cpp',
   'dispatch_matrix_spec.cpp',
   'msaa_resolve_matrix_spec.cpp',
   'deferred_context_matrix_spec.cpp',
