@@ -25,6 +25,8 @@ using dxmt::test::PipelineSubobject;
 using dxmt::test::TextureReadback;
 using dxmt::test::TextureUavPixelShader;
 
+constexpr std::size_t kMalformedStreamBackingSize = 64;
+
 class PipelineStreamSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -77,7 +79,11 @@ class PipelineStreamTruncationSpec
 
 TEST_P(PipelineStreamTruncationSpec, TruncatedSubobjectRejected) {
   const auto &test = GetParam();
-  alignas(void *) std::array<std::byte, sizeof(void *)> stream = {};
+  // Keep a zeroed guard tail after the reported stream boundary. Native D3D12
+  // may decode the shader value paired with VS or CS while deciding the
+  // pipeline type, and adjacent stack contents must not affect rejection.
+  alignas(void *) std::array<std::byte, kMalformedStreamBackingSize> stream =
+      {};
   std::memcpy(stream.data(), &test.type, sizeof(test.type));
   ID3D12PipelineState *pipeline =
       reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
@@ -159,7 +165,8 @@ class PipelineStreamTypeTruncationSpec
 TEST_P(PipelineStreamTypeTruncationSpec, TruncatedTypeRejected) {
   const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type =
       D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
-  alignas(void *) std::array<std::byte, sizeof(void *)> stream = {};
+  alignas(void *) std::array<std::byte, kMalformedStreamBackingSize> stream =
+      {};
   std::memcpy(stream.data(), &type, sizeof(type));
   ID3D12PipelineState *pipeline =
       reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
