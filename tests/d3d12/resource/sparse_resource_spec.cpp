@@ -749,6 +749,31 @@ TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsNonzeroArraySlice) {
   ExpectCopyTilesRoundTrip(0, 0, 1, 1, 0, 2, 1);
 }
 
+TEST_F(D3D12SparseResourceSpec, TwoReservedBuffersAliasOnePhysicalTile) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+            S_OK);
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  auto write_resource = CreateSingleTileReservedBuffer(
+      context_, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto read_resource = CreateSingleTileReservedBuffer(
+      context_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto backing = CreateSingleTileBacking(context_);
+  ASSERT_TRUE(write_resource);
+  ASSERT_TRUE(read_resource);
+  ASSERT_TRUE(backing.heap);
+
+  QueueSingleTileMapping(context_, write_resource.get(), backing);
+  QueueSingleTileMapping(context_, read_resource.get(), backing);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  ExpectSingleTileAlias(context_, write_resource.get(), read_resource.get());
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(D3D12SparseResourceSpec,
        CopyTileMappingsAliasesNonzeroCoordinatesBetweenResources) {
   ExpectCopiedTileMappingsAlias(1, 1, 2, 0, 1, 1, false);
