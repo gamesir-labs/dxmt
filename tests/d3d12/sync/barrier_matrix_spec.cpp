@@ -94,6 +94,104 @@ std::vector<BarrierShapeCase> BuildBarrierShapeCases() {
   };
 }
 
+enum class InvalidBarrierKind {
+  UnknownType,
+  NullTransitionResource,
+  ReadWriteStateBefore,
+  ReadWriteStateAfter,
+  BothSplitFlags,
+  UnknownFlags,
+  AliasingSplitFlag,
+  UavSplitFlag,
+};
+
+struct InvalidBarrierCase {
+  InvalidBarrierKind kind;
+  const char *name;
+};
+
+class LegacyBarrierValidationSpec
+    : public ::testing::Test,
+      public ::testing::WithParamInterface<InvalidBarrierCase> {
+protected:
+  void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
+  D3D12TestContext context_;
+};
+
+TEST_P(LegacyBarrierValidationSpec, InvalidBarrierFailsClose) {
+  auto resource = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(resource);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = resource.get();
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+  switch (GetParam().kind) {
+  case InvalidBarrierKind::UnknownType:
+    barrier = {};
+    barrier.Type = static_cast<D3D12_RESOURCE_BARRIER_TYPE>(3);
+    break;
+  case InvalidBarrierKind::NullTransitionResource:
+    barrier.Transition.pResource = nullptr;
+    break;
+  case InvalidBarrierKind::ReadWriteStateBefore:
+    barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(
+        D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE);
+    break;
+  case InvalidBarrierKind::ReadWriteStateAfter:
+    barrier.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(
+        D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE);
+    break;
+  case InvalidBarrierKind::BothSplitFlags:
+    barrier.Flags = static_cast<D3D12_RESOURCE_BARRIER_FLAGS>(
+        D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY |
+        D3D12_RESOURCE_BARRIER_FLAG_END_ONLY);
+    break;
+  case InvalidBarrierKind::UnknownFlags:
+    barrier.Flags = static_cast<D3D12_RESOURCE_BARRIER_FLAGS>(4);
+    break;
+  case InvalidBarrierKind::AliasingSplitFlag:
+    barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+    break;
+  case InvalidBarrierKind::UavSplitFlag:
+    barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
+    break;
+  }
+
+  context_.list()->ResourceBarrier(1, &barrier);
+
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InvalidShapeMatrix, LegacyBarrierValidationSpec,
+    ::testing::Values(
+        InvalidBarrierCase{InvalidBarrierKind::UnknownType, "UnknownType"},
+        InvalidBarrierCase{InvalidBarrierKind::NullTransitionResource,
+                           "NullTransitionResource"},
+        InvalidBarrierCase{InvalidBarrierKind::ReadWriteStateBefore,
+                           "ReadWriteStateBefore"},
+        InvalidBarrierCase{InvalidBarrierKind::ReadWriteStateAfter,
+                           "ReadWriteStateAfter"},
+        InvalidBarrierCase{InvalidBarrierKind::BothSplitFlags,
+                           "BothSplitFlags"},
+        InvalidBarrierCase{InvalidBarrierKind::UnknownFlags, "UnknownFlags"},
+        InvalidBarrierCase{InvalidBarrierKind::AliasingSplitFlag,
+                           "AliasingSplitFlag"},
+        InvalidBarrierCase{InvalidBarrierKind::UavSplitFlag, "UavSplitFlag"}),
+    [](const ::testing::TestParamInfo<InvalidBarrierCase> &info) {
+      return std::string(info.param.name);
+    });
+
 class LegacyBarrierShapeSpec
     : public ::testing::Test,
       public ::testing::WithParamInterface<BarrierShapeCase> {
