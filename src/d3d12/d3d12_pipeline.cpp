@@ -7,6 +7,7 @@
 #include "dxmt_pipeline_diag.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_shader_cache.hpp"
+#include "dxbc_checksum.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include "thread.hpp"
@@ -496,6 +497,8 @@ FindDxbcShaderBlob(const void *data, size_t size,
 
   const auto *bytes = static_cast<const uint8_t *>(data);
   if (ReadLe32(bytes) != FourCC('D', 'X', 'B', 'C'))
+    return false;
+  if (!ValidateDxbcChecksum(data, size))
     return false;
 
   const auto container_size = ReadLe32(bytes + 24);

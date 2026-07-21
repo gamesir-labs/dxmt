@@ -89,6 +89,7 @@ enum class ShaderContainerCorruption {
   TruncatedShaderChunkPayload,
   TruncatedContainerTail,
   InvalidMagic,
+  InvalidChecksum,
   UnsupportedContainerVersion,
   ContainerSizeBelowHeader,
   ContainerSizePastInput,
@@ -163,6 +164,9 @@ CorruptedShader CorruptShader(const std::vector<std::uint8_t> &valid,
     break;
   case ShaderContainerCorruption::InvalidMagic:
     WriteU32(result.bytes, 0, FourCC('N', 'O', 'P', 'E'));
+    break;
+  case ShaderContainerCorruption::InvalidChecksum:
+    result.bytes[4] ^= 1;
     break;
   case ShaderContainerCorruption::UnsupportedContainerVersion:
     WriteU32(result.bytes, 20, 2);
@@ -320,6 +324,8 @@ INSTANTIATE_TEST_SUITE_P(
                             ShaderContainerCorruption::TruncatedContainerTail},
         ShaderContainerCase{"InvalidMagic",
                             ShaderContainerCorruption::InvalidMagic},
+        ShaderContainerCase{"InvalidChecksum",
+                            ShaderContainerCorruption::InvalidChecksum},
         ShaderContainerCase{
             "UnsupportedContainerVersion",
             ShaderContainerCorruption::UnsupportedContainerVersion},

@@ -11,6 +11,8 @@ util_src = files([
   # 'util_sleep.cpp',
   'util_bloom.cpp',
 
+  'dxbc_checksum.cpp',
+
   'thread.cpp',
 
   'com/com_guid.cpp',
