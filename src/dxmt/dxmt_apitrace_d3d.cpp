@@ -1206,11 +1206,14 @@ record_swapchain_back_buffer(void *device, void *swapchain,
 }
 
 void
-on_d3d12_execute_command_lists(void *queue, void *command_list) {
-  if (!d3d_enabled() || !queue || !command_list)
+on_d3d12_execute_command_lists(
+    void *queue, uint32_t command_list_count,
+    ID3D12CommandList *const *command_lists) {
+  if (!d3d_enabled() || !queue || !command_list_count || !command_lists)
     return;
   ensure_session_open();
-  ::apitrace::d3d12::record_execute_command_lists(queue, command_list);
+  ::apitrace::d3d12::record_execute_command_lists(
+      queue, command_list_count, command_lists);
 }
 
 void
@@ -1251,6 +1254,18 @@ record_resource_unmap(const void *resource, uint32_t subresource,
     return;
   ensure_session_open();
   ::apitrace::d3d12::record_resource_unmap(
+      resource, subresource, written_begin, written_end, written_data,
+      written_size);
+}
+
+void
+record_resource_snapshot(const void *resource, uint32_t subresource,
+                         uint64_t written_begin, uint64_t written_end,
+                         const void *written_data, size_t written_size) {
+  if (!d3d_enabled() || !resource)
+    return;
+  ensure_session_open();
+  ::apitrace::d3d12::record_resource_snapshot(
       resource, subresource, written_begin, written_end, written_data,
       written_size);
 }

@@ -4176,7 +4176,7 @@ private:
       g_copy_snapshot_dedup[key] = fingerprint;
     }
 
-    dxmt::apitrace::record_resource_unmap(
+    dxmt::apitrace::record_resource_snapshot(
         src_buffer, 0, src_offset, end, span_data, span_len);
   }
 

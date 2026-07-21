@@ -393,7 +393,9 @@ void on_dxgi_create_swapchain(void *factory, void *device, void *swapchain);
 void record_swapchain_back_buffer(void *device, void *swapchain,
                                   ID3D12Resource *back_buffer,
                                   uint32_t buffer_index);
-void on_d3d12_execute_command_lists(void *queue, void *command_list);
+void on_d3d12_execute_command_lists(
+    void *queue, uint32_t command_list_count,
+    ID3D12CommandList *const *command_lists);
 void on_d3d12_resource_barrier(void *command_list, uint32_t count);
 uint64_t on_d3d12_present(void *swapchain, uint32_t sync_interval, uint32_t flags,
                           int32_t result_code, bool frame_presented);
@@ -404,6 +406,9 @@ void record_present_frame(uint64_t frame_index, uint32_t width, uint32_t height,
 void record_resource_unmap(const void *resource, uint32_t subresource,
                            uint64_t written_begin, uint64_t written_end,
                            const void *written_data, size_t written_size);
+void record_resource_snapshot(const void *resource, uint32_t subresource,
+                              uint64_t written_begin, uint64_t written_end,
+                              const void *written_data, size_t written_size);
 void record_resource_bytes_snapshot(uint64_t resource_object_id,
                                     uint64_t begin, uint64_t end,
                                     const void *bytes, uint64_t sequence);
@@ -520,13 +525,16 @@ inline void on_d3d12_create_device(void *) {}
 inline void on_d3d11_create_device(void *) {}
 inline void on_dxgi_create_swapchain(void *, void *, void *) {}
 inline void record_swapchain_back_buffer(void *, void *, ID3D12Resource *, uint32_t) {}
-inline void on_d3d12_execute_command_lists(void *, void *) {}
+inline void on_d3d12_execute_command_lists(
+    void *, uint32_t, ID3D12CommandList *const *) {}
 inline void on_d3d12_resource_barrier(void *, uint32_t) {}
 inline uint64_t on_d3d12_present(void *, uint32_t, uint32_t, int32_t, bool) { return ~0ull; }
 inline void record_present_frame(uint64_t, uint32_t, uint32_t, uint32_t,
                                  uint32_t, uint32_t, const void *, size_t) {}
 inline void record_resource_unmap(const void *, uint32_t, uint64_t, uint64_t,
                                   const void *, size_t) {}
+inline void record_resource_snapshot(const void *, uint32_t, uint64_t, uint64_t,
+                                     const void *, size_t) {}
 inline void record_resource_bytes_snapshot(uint64_t, uint64_t, uint64_t,
                                            const void *, uint64_t) {}
 inline uint64_t record_resource_map(const void *, uint32_t,

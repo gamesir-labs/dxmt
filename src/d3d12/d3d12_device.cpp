@@ -4073,7 +4073,7 @@ public:
           if (end > offset) {
             const auto *mapped = static_cast<const char *>(
                 resource->GetBufferAllocation()->mappedMemory(0));
-            dxmt::apitrace::record_resource_unmap(
+            dxmt::apitrace::record_resource_snapshot(
                 resource->GetD3D12Resource(), 0, offset, end,
                 mapped + resource->GetHeapOffset() + offset,
                 static_cast<size_t>(end - offset));

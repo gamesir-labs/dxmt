@@ -9,4 +9,5 @@ EXPORTS
     D3D12SerializeRootSignature
     D3D12SerializeVersionedRootSignature
     DXMTCreateD3D12DeviceFromFactory
+    DXMTD3D12ReplayFrameBoundary
     DXMTCreateRootSignatureDeserializerFromSubobjectInLibrary

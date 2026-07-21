@@ -348,6 +348,20 @@ DXMTCreateD3D12DeviceFromFactory(IUnknown *adapter,
 }
 
 extern "C" HRESULT __stdcall
+DXMTD3D12ReplayFrameBoundary(ID3D12Device *device) {
+  if (!device)
+    return E_POINTER;
+
+  dxmt::Com<IMTLD3D12Device> dxmt_device = nullptr;
+  HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&dxmt_device));
+  if (FAILED(hr))
+    return hr;
+
+  dxmt_device->GetDXMTDevice().queue().PresentBoundary();
+  return S_OK;
+}
+
+extern "C" HRESULT __stdcall
 D3D12GetDebugInterface(REFIID riid, void **debug) {
   dxmt::InitReturnPtr(debug);
   dxmt::Logger::warn(dxmt::str::format(

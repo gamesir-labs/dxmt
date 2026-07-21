@@ -894,6 +894,10 @@ public:
   }
 
   ~ResourceImpl() {
+    dxmt::apitrace::record_object_destroy(
+        static_cast<ID3D12Resource *>(this),
+        dxmt::apitrace::D3DObjectKind::Resource,
+        nullptr);
     LogReservedTextureFaultDiagnostic("destroy", nullptr);
     CancelReservedTextureMaterialization();
     UnregisterBufferGpuVirtualAddress(this);

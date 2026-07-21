@@ -4935,9 +4935,8 @@ public:
     {
       dxmt::perf::ScopedCodeTimer phase_timer(
           dxmt::PerfCodePath::QueueExecuteApitrace);
-      for (UINT i = 0; i < command_list_count; i++)
-        dxmt::apitrace::on_d3d12_execute_command_lists(this,
-                                                       command_lists[i]);
+      dxmt::apitrace::on_d3d12_execute_command_lists(
+          this, command_list_count, command_lists);
     }
 
     PendingOperation op;
