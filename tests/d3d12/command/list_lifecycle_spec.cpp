@@ -193,6 +193,25 @@ TEST_F(CommandListLifecycleSpec, CreateCommandListRejectsWrongAllocatorType) {
   EXPECT_FALSE(list);
 }
 
+TEST_F(CommandListLifecycleSpec, CreateCommandListRejectsNullAllocator) {
+  ComPtr<ID3D12GraphicsCommandList> list;
+  EXPECT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, nullptr, nullptr,
+                IID_PPV_ARGS(list.put())),
+            E_INVALIDARG);
+  EXPECT_FALSE(list);
+}
+
+TEST_F(CommandListLifecycleSpec,
+       CreateCommandListRejectsAllocatorUsedByRecordingList) {
+  ComPtr<ID3D12GraphicsCommandList> list;
+  EXPECT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, context_.allocator(),
+                nullptr, IID_PPV_ARGS(list.put())),
+            E_INVALIDARG);
+  EXPECT_FALSE(list);
+}
+
 TEST_F(CommandListLifecycleSpec,
        CreateCommandListAcceptsSameDeviceInitialPipelineState) {
   auto pipeline = CreateComputePipeline(context_.device());
@@ -221,6 +240,14 @@ TEST_F(CommandListLifecycleSpec, ResetClosedListSucceeds) {
 
 TEST_F(CommandListLifecycleSpec, ResetRecordingListFails) {
   EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr), E_FAIL);
+}
+
+TEST_F(CommandListLifecycleSpec, ResetWithNullAllocatorFails) {
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  EXPECT_EQ(context_.list()->Reset(nullptr, nullptr), E_INVALIDARG);
+  ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
+  EXPECT_EQ(context_.list()->Close(), S_OK);
 }
 
 TEST_F(CommandListLifecycleSpec, ResetWithWrongAllocatorTypeFails) {
@@ -261,8 +288,11 @@ TEST_F(CommandListLifecycleSpec, ResetWithAllocatorUsedByRecordingListFails) {
       __uuidof(ID3D12GraphicsCommandList),
       reinterpret_cast<void **>(recording_list.put()))));
 
-  EXPECT_TRUE(
-      FAILED(context_.list()->Reset(occupied_allocator.get(), nullptr)));
+  EXPECT_EQ(context_.list()->Reset(occupied_allocator.get(), nullptr),
+            E_INVALIDARG);
+  ASSERT_EQ(recording_list->Close(), S_OK);
+  ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
+  EXPECT_EQ(context_.list()->Close(), S_OK);
 }
 
 } // namespace
