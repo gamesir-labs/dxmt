@@ -164,11 +164,19 @@ test(
   workdir: meson.project_source_root(),
 )
 
+# d3d9 host-native, wine-free tests (the 'host' suite CI gate).
+# The shader oracle runner is a PE the d3d9 suite spawns, so it must be built
+# with that suite. It only exists in a cross build with widl available.
+shader_oracle_runner = []
+subdir('dx9')
+subdir('d3d9-corpus')
+
 alias_target(
   'dxmt-wine-tests',
   dxmt_wine_test_scheduler,
   dxmt_wine_framework_tests,
   dxmt_wine_d3d9_tests,
+  shader_oracle_runner,
   dxmt_wine_d3d10_tests,
   dxmt_wine_d3d11_tests,
   dxmt_wine_d3d12_tests,
@@ -184,6 +192,7 @@ alias_target(
   'dxmt-wine-tests-d3d9',
   dxmt_wine_test_scheduler,
   dxmt_wine_d3d9_tests,
+  shader_oracle_runner,
 )
 alias_target(
   'dxmt-wine-tests-d3d10',
@@ -202,5 +211,3 @@ alias_target(
   d3d12_differential_oracle,
 )
 
-# d3d9 host-native, wine-free tests (the 'host' suite CI gate).
-subdir('dx9')
