@@ -179,6 +179,31 @@ TEST_F(ComputeDispatchSpec, DispatchDimensionMatrix) {
   EXPECT_EQ(actual, expected);
 }
 
+DXMT_SLOW_TEST_F(ComputeDispatchSpec,
+                 MaximumLegalXDimensionExecutesLastThreadGroup) {
+  const auto shader = CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+    [numthreads(1, 1, 1)]
+    void main(uint3 group : SV_GroupID) {
+      if (group.x == 0u)
+        output.Store(0u, 0x12345678u);
+      if (group.x == 65534u)
+        output.Store(4u, group.x);
+    })",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = CreatePipeline(shader);
+  auto output = CreateOutput(2);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(output.buffer);
+  ASSERT_TRUE(output.heap);
+  Bind(output, pipeline.get());
+
+  context_.list()->Dispatch(65535, 1, 1);
+
+  EXPECT_EQ(Readback(output, 2), (std::vector<UINT>{0x12345678u, 65534u}));
+}
+
 TEST_F(ComputeDispatchSpec, GroupSharedMemorySynchronizesAcrossThreads) {
   constexpr UINT kGroupCount = 3;
   constexpr UINT kGroupSize = 32;
@@ -347,7 +372,10 @@ INSTANTIATE_TEST_SUITE_P(
         DispatchBoundaryCase{1, 1, 0, S_OK, "ZeroZ"},
         DispatchBoundaryCase{65535, 1, 1, S_OK, "MaximumX"},
         DispatchBoundaryCase{1, 65535, 1, S_OK, "MaximumY"},
-        DispatchBoundaryCase{1, 1, 65535, S_OK, "MaximumZ"}),
+        DispatchBoundaryCase{1, 1, 65535, S_OK, "MaximumZ"},
+        DispatchBoundaryCase{65536, 1, 1, E_INVALIDARG, "BeyondMaximumX"},
+        DispatchBoundaryCase{1, 65536, 1, E_INVALIDARG, "BeyondMaximumY"},
+        DispatchBoundaryCase{1, 1, 65536, E_INVALIDARG, "BeyondMaximumZ"}),
     DispatchBoundaryCaseName);
 
 } // namespace
