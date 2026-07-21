@@ -359,9 +359,6 @@ protected:
     ASSERT_LE(x + width, tiling.WidthInTiles);
     ASSERT_LE(y + height, tiling.HeightInTiles);
 
-    auto backing_heap = MapAllTiles(texture.get());
-    ASSERT_TRUE(backing_heap);
-
     const UINT tile_count = width * height;
     const UINT64 copy_size =
         UINT64(tile_count) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
@@ -388,15 +385,32 @@ protected:
     context_.list()->CopyBufferRegion(output.get(), 0, initial.get(), 0,
                                       buffer_size);
 
-    D3D12_TILED_RESOURCE_COORDINATE coordinate = {x, y, 0, subresource};
+    const D3D12_TILED_RESOURCE_COORDINATE coordinate = {x, y, 0,
+                                                         subresource};
     D3D12_TILE_REGION_SIZE region = {};
     region.NumTiles = tile_count;
-    region.UseBox = tile_count > 1;
-    if (region.UseBox) {
-      region.Width = width;
-      region.Height = height;
-      region.Depth = 1;
-    }
+    region.UseBox = TRUE;
+    region.Width = width;
+    region.Height = height;
+    region.Depth = 1;
+
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.SizeInBytes = copy_size;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    ComPtr<ID3D12Heap> backing_heap;
+    ASSERT_EQ(context_.device()->CreateHeap(
+                  &heap_desc, __uuidof(ID3D12Heap),
+                  reinterpret_cast<void **>(backing_heap.put())),
+              S_OK);
+    ASSERT_TRUE(backing_heap);
+
+    const D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT heap_offset = 0;
+    context_.queue()->UpdateTileMappings(
+        texture.get(), 1, &coordinate, &region, backing_heap.get(), 1,
+        &range_flag, &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+
     context_.list()->CopyTiles(
         texture.get(), &coordinate, &region, upload.get(), buffer_offset,
         D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
