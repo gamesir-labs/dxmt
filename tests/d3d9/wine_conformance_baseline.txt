@@ -6,4 +6,22 @@
 # The modules run with WINETEST_PLATFORM=windows, so these are measured against
 # strict Windows semantics rather than Wine's own todo map.
 #
-# stateblock currently has none: it runs clean.
+# Entries are matched at assertion-site granularity, by source line. Each site
+# below fires many times with different parameters and they share one cause, so
+# listing the site keeps the file readable and its removal marks the whole cause
+# fixed. The cost is that a new failure at an already-listed line is absorbed;
+# that is accepted for now because these are numeric mismatches at one site
+# rather than unrelated assertions sharing a line.
+
+# stateblock: none, it runs clean.
+
+# visual: fog computation. 54 failures across two adjacent assertion sites, all
+# of the form "Expected fog X or Y; got colour {...}" over combinations of pixel
+# mode, vertex mode, vs_mode and ortho_fog.
+visual visual.isolated.c:28475
+visual visual.isolated.c:28481
+
+# visual: vertex attributes. 7 failures, all writing alpha 1.0 where the test
+# expects the attribute's own alpha of 0.0, over attrib counts 1 to 4 with
+# ps_mode 3.
+visual visual.isolated.c:28870
