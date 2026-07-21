@@ -551,9 +551,13 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
   if (sparse_case == SparseCase::CreateOnly)
     return;
 
+  ComPtr<ID3D12DescriptorHeap> source_descriptor_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                    1, false);
   ComPtr<ID3D12DescriptorHeap> descriptor_heap =
       context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                                     2, true);
+  ASSERT_TRUE(source_descriptor_heap);
   ASSERT_TRUE(descriptor_heap);
   D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
   srv_desc.Format = resource_desc.Format;
@@ -562,13 +566,13 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
   srv_desc.Texture2D.MipLevels = resource_desc.MipLevels;
   context_.device()->CreateShaderResourceView(
       texture.get(), &srv_desc,
-      context_.CpuDescriptorHandle(descriptor_heap.get(), 0));
+      context_.CpuDescriptorHandle(source_descriptor_heap.get(), 0));
   if (sparse_case == SparseCase::WriteSrv)
     return;
 
   context_.device()->CopyDescriptorsSimple(
       1, context_.CpuDescriptorHandle(descriptor_heap.get(), 1),
-      context_.CpuDescriptorHandle(descriptor_heap.get(), 0),
+      context_.CpuDescriptorHandle(source_descriptor_heap.get(), 0),
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   if (sparse_case == SparseCase::CopySrv)
     return;
