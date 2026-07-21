@@ -232,6 +232,10 @@ enum class ShaderContainerCorruption {
   UnsupportedShaderModel,
   ZeroInstructionLength,
   InstructionLengthPastEnd,
+  UnknownOpcode,
+  ReservedOpcode,
+  GeometryOpcodeInCompute,
+  UnbalancedEndIf,
 };
 
 struct ShaderContainerCase {
@@ -356,6 +360,42 @@ CorruptedShader CorruptShader(const std::vector<std::uint8_t> &valid,
     const std::uint32_t instruction = ReadU32(result.bytes, shader_data + 8);
     WriteU32(result.bytes, shader_data + 8,
              (instruction & ~kInstructionLengthMask) | kInstructionLengthMask);
+    break;
+  }
+  case ShaderContainerCorruption::UnknownOpcode: {
+    constexpr std::uint32_t kOpcodeMask = 0x000007ffu;
+    const std::uint32_t instruction = ReadU32(result.bytes, shader_data + 8);
+    WriteU32(result.bytes, shader_data + 8, instruction | kOpcodeMask);
+    break;
+  }
+  case ShaderContainerCorruption::ReservedOpcode: {
+    constexpr std::uint32_t kOpcodeMask = 0x000007ffu;
+    constexpr std::uint32_t kD3d10ReservedOpcode = 107u;
+    const std::uint32_t instruction = ReadU32(result.bytes, shader_data + 8);
+    WriteU32(result.bytes, shader_data + 8,
+             (instruction & ~kOpcodeMask) | kD3d10ReservedOpcode);
+    break;
+  }
+  case ShaderContainerCorruption::GeometryOpcodeInCompute: {
+    constexpr std::uint32_t kOpcodeMask = 0x000007ffu;
+    constexpr std::uint32_t kInstructionLengthMask = 0x7f000000u;
+    constexpr std::uint32_t kInstructionLengthOne = 0x01000000u;
+    constexpr std::uint32_t kD3d10EmitOpcode = 19u;
+    const std::uint32_t instruction = ReadU32(result.bytes, shader_data + 8);
+    WriteU32(result.bytes, shader_data + 8,
+             (instruction & ~(kOpcodeMask | kInstructionLengthMask)) |
+                 kInstructionLengthOne | kD3d10EmitOpcode);
+    break;
+  }
+  case ShaderContainerCorruption::UnbalancedEndIf: {
+    constexpr std::uint32_t kOpcodeMask = 0x000007ffu;
+    constexpr std::uint32_t kInstructionLengthMask = 0x7f000000u;
+    constexpr std::uint32_t kInstructionLengthOne = 0x01000000u;
+    constexpr std::uint32_t kD3d10EndIfOpcode = 21u;
+    const std::uint32_t instruction = ReadU32(result.bytes, shader_data + 8);
+    WriteU32(result.bytes, shader_data + 8,
+             (instruction & ~(kOpcodeMask | kInstructionLengthMask)) |
+                 kInstructionLengthOne | kD3d10EndIfOpcode);
     break;
   }
   }
@@ -497,7 +537,15 @@ INSTANTIATE_TEST_SUITE_P(
                             ShaderContainerCorruption::ZeroInstructionLength},
         ShaderContainerCase{
             "InstructionLengthPastEnd",
-            ShaderContainerCorruption::InstructionLengthPastEnd}),
+            ShaderContainerCorruption::InstructionLengthPastEnd},
+        ShaderContainerCase{"UnknownOpcode",
+                            ShaderContainerCorruption::UnknownOpcode},
+        ShaderContainerCase{"ReservedOpcode",
+                            ShaderContainerCorruption::ReservedOpcode},
+        ShaderContainerCase{"GeometryOpcodeInCompute",
+                            ShaderContainerCorruption::GeometryOpcodeInCompute},
+        ShaderContainerCase{"UnbalancedEndIf",
+                            ShaderContainerCorruption::UnbalancedEndIf}),
     ShaderContainerCaseName);
 
 } // namespace
