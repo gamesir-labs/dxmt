@@ -500,12 +500,28 @@ struct CompiledCommandBuildState {
   Com<ID3D12RootSignature> compute_root_signature;
   Com<ID3D12RootSignature> graphics_root_signature;
   CompiledCommandDescriptorHeaps descriptor_heaps;
+  std::vector<Com<ID3D12DescriptorHeap>> descriptor_heap_records;
+  CompiledImmutableVector<Com<ID3D12DescriptorHeap>>
+      descriptor_heap_snapshot;
+  bool descriptor_heap_snapshot_dirty = false;
   std::vector<CompiledCommandRootDescriptorTable> compute_root_tables;
   std::vector<CompiledCommandRootDescriptorTable> graphics_root_tables;
   std::vector<CompiledCommandRootConstants> compute_root_constants;
   std::vector<CompiledCommandRootConstants> graphics_root_constants;
   std::vector<CompiledCommandRootDescriptor> compute_root_descriptors;
   std::vector<CompiledCommandRootDescriptor> graphics_root_descriptors;
+  CompiledImmutableVector<CompiledCommandRootDescriptorTable>
+      compute_root_table_snapshot;
+  CompiledImmutableVector<CompiledCommandRootDescriptorTable>
+      graphics_root_table_snapshot;
+  CompiledImmutableVector<CompiledCommandRootConstants>
+      compute_root_constant_snapshot;
+  CompiledImmutableVector<CompiledCommandRootConstants>
+      graphics_root_constant_snapshot;
+  CompiledImmutableVector<CompiledCommandRootDescriptor>
+      compute_root_descriptor_snapshot;
+  CompiledImmutableVector<CompiledCommandRootDescriptor>
+      graphics_root_descriptor_snapshot;
   std::optional<CompiledCommandPipelineMetadata> compute_pipeline_metadata;
   std::optional<CompiledCommandPipelineMetadata> graphics_pipeline_metadata;
   std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>,
@@ -514,9 +530,68 @@ struct CompiledCommandBuildState {
   std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
   std::uint64_t vertex_buffer_dirty_mask = 0;
   bool index_buffer_dirty = false;
+  CompiledCommandInputAssemblerState input_assembler_snapshot;
   bool predication_active = false;
-  CompiledCommandRenderState render_state;
+  std::vector<DescriptorRecord> render_targets;
+  std::optional<DescriptorRecord> depth_stencil;
+  std::vector<D3D12_VIEWPORT> viewports;
+  std::vector<D3D12_RECT> scissors;
+  std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+  UINT stencil_ref = 0;
+  D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+  CompiledCommandRenderState render_state_snapshot;
+  std::uint32_t compute_dirty_domains = 0;
+  std::uint32_t graphics_dirty_domains = 0;
+  std::uint64_t compute_root_table_dirty_mask = 0;
+  std::uint64_t graphics_root_table_dirty_mask = 0;
+  std::uint64_t compute_root_constant_dirty_mask = 0;
+  std::uint64_t graphics_root_constant_dirty_mask = 0;
+  std::uint64_t compute_root_descriptor_dirty_mask = 0;
+  std::uint64_t graphics_root_descriptor_dirty_mask = 0;
 };
+
+static std::uint64_t RootParameterBit(UINT root_parameter_index) {
+  return root_parameter_index < 64 ? 1ull << root_parameter_index : 0;
+}
+
+static void MarkCompiledDirty(CompiledCommandBuildState &state,
+                              bool compute, std::uint32_t domains) {
+  auto &dirty = compute ? state.compute_dirty_domains
+                        : state.graphics_dirty_domains;
+  dirty |= domains;
+}
+
+static CompiledCommandStateDelta
+GetCompiledStateDelta(const CompiledCommandBuildState &state, bool compute) {
+  CompiledCommandStateDelta delta = {};
+  delta.dirty_domains = compute ? state.compute_dirty_domains
+                                : state.graphics_dirty_domains;
+  delta.root_table_dirty_mask =
+      compute ? state.compute_root_table_dirty_mask
+              : state.graphics_root_table_dirty_mask;
+  delta.root_constant_dirty_mask =
+      compute ? state.compute_root_constant_dirty_mask
+              : state.graphics_root_constant_dirty_mask;
+  delta.root_descriptor_dirty_mask =
+      compute ? state.compute_root_descriptor_dirty_mask
+              : state.graphics_root_descriptor_dirty_mask;
+  return delta;
+}
+
+static void ClearCompiledStateDelta(CompiledCommandBuildState &state,
+                                    bool compute) {
+  if (compute) {
+    state.compute_dirty_domains = 0;
+    state.compute_root_table_dirty_mask = 0;
+    state.compute_root_constant_dirty_mask = 0;
+    state.compute_root_descriptor_dirty_mask = 0;
+  } else {
+    state.graphics_dirty_domains = 0;
+    state.graphics_root_table_dirty_mask = 0;
+    state.graphics_root_constant_dirty_mask = 0;
+    state.graphics_root_descriptor_dirty_mask = 0;
+  }
+}
 
 static PipelineState *
 GetCompiledPipelineState(ID3D12PipelineState *pipeline_state) {
@@ -743,11 +818,12 @@ GetCompiledPipelineMetadata(CompiledCommandBuildState &state, bool compute) {
   return *cached;
 }
 
-static void
+static bool
 SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
                            const DescriptorHeapsRecord &record) {
   CompiledCommandDescriptorHeaps next = {};
-  next.all = record.heaps;
+  state.descriptor_heap_records = record.heaps;
+  state.descriptor_heap_snapshot_dirty = true;
   for (const auto &heap : record.heaps) {
     auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
     if (!descriptor_heap)
@@ -762,12 +838,12 @@ SetCompiledDescriptorHeaps(CompiledCommandBuildState &state,
   }
   if (next.cbv_srv_uav.ptr() == state.descriptor_heaps.cbv_srv_uav.ptr() &&
       next.sampler.ptr() == state.descriptor_heaps.sampler.ptr()) {
-    state.descriptor_heaps.all = std::move(next.all);
-    return;
+    return false;
   }
   state.descriptor_heaps = std::move(next);
   state.compute_root_tables.clear();
   state.graphics_root_tables.clear();
+  return true;
 }
 
 static bool
@@ -805,7 +881,8 @@ UpsertCompiledRootConstants(
           std::max<UINT>(entry.dst_offset + static_cast<UINT>(entry.values.size()),
                          local_end) -
           local_begin;
-      std::vector<UINT> merged(local_size, 0);
+      CompiledImmutableVector<UINT> merged;
+      merged.resize(local_size, 0);
       std::copy(entry.values.begin(), entry.values.end(),
                 merged.begin() + (entry.dst_offset - local_begin));
       std::copy(record.values.begin(), record.values.end(),
@@ -840,80 +917,138 @@ UpsertCompiledRootDescriptor(
 static void
 UpdateCompiledCommandBuildState(CompiledCommandBuildState &state,
                                 const CommandRecordPayload &payload) {
-  if (const auto *record = std::get_if<PipelineStateRecord>(&payload)) {
-    state.pipeline_state = record->pipeline_state;
+  std::visit([&]<typename Record>(const Record &record) {
+  if constexpr (std::is_same_v<Record, PipelineStateRecord>) {
+    state.pipeline_state = record.pipeline_state;
     state.compute_pipeline_metadata.reset();
     state.graphics_pipeline_metadata.reset();
-  } else if (const auto *record = std::get_if<ClearStateRecord>(&payload)) {
+    MarkCompiledDirty(state, true, CompiledCommandStateDomainPipeline);
+    MarkCompiledDirty(state, false, CompiledCommandStateDomainPipeline);
+  } else if constexpr (std::is_same_v<Record, ClearStateRecord>) {
     state = CompiledCommandBuildState{};
-    state.pipeline_state = record->pipeline_state;
-  } else if (const auto *record =
-                 std::get_if<DescriptorHeapsRecord>(&payload)) {
-    SetCompiledDescriptorHeaps(state, *record);
-  } else if (const auto *record =
-                 std::get_if<RootSignatureRecord>(&payload)) {
-    if (record->compute) {
-      state.compute_root_signature = record->root_signature;
+    state.pipeline_state = record.pipeline_state;
+    state.compute_dirty_domains = ~0u;
+    state.graphics_dirty_domains = ~0u;
+    state.compute_root_table_dirty_mask = ~0ull;
+    state.graphics_root_table_dirty_mask = ~0ull;
+    state.compute_root_constant_dirty_mask = ~0ull;
+    state.graphics_root_constant_dirty_mask = ~0ull;
+    state.compute_root_descriptor_dirty_mask = ~0ull;
+    state.graphics_root_descriptor_dirty_mask = ~0ull;
+  } else if constexpr (std::is_same_v<Record, DescriptorHeapsRecord>) {
+    if (SetCompiledDescriptorHeaps(state, record)) {
+      MarkCompiledDirty(
+          state, true, CompiledCommandStateDomainDescriptorHeaps |
+                           CompiledCommandStateDomainRootTables);
+      MarkCompiledDirty(
+          state, false, CompiledCommandStateDomainDescriptorHeaps |
+                            CompiledCommandStateDomainRootTables);
+      state.compute_root_table_dirty_mask = ~0ull;
+      state.graphics_root_table_dirty_mask = ~0ull;
+    }
+  } else if constexpr (std::is_same_v<Record, RootSignatureRecord>) {
+    if (record.compute) {
+      state.compute_root_signature = record.root_signature;
       state.compute_root_tables.clear();
       state.compute_root_constants.clear();
       state.compute_root_descriptors.clear();
       state.compute_pipeline_metadata.reset();
+      MarkCompiledDirty(
+          state, true, CompiledCommandStateDomainRootSignature |
+                           CompiledCommandStateDomainRootTables |
+                           CompiledCommandStateDomainRootConstants |
+                           CompiledCommandStateDomainRootDescriptors);
+      state.compute_root_table_dirty_mask = ~0ull;
+      state.compute_root_constant_dirty_mask = ~0ull;
+      state.compute_root_descriptor_dirty_mask = ~0ull;
     } else {
-      state.graphics_root_signature = record->root_signature;
+      state.graphics_root_signature = record.root_signature;
       state.graphics_root_tables.clear();
       state.graphics_root_constants.clear();
       state.graphics_root_descriptors.clear();
       state.graphics_pipeline_metadata.reset();
+      MarkCompiledDirty(
+          state, false, CompiledCommandStateDomainRootSignature |
+                            CompiledCommandStateDomainRootTables |
+                            CompiledCommandStateDomainRootConstants |
+                            CompiledCommandStateDomainRootDescriptors);
+      state.graphics_root_table_dirty_mask = ~0ull;
+      state.graphics_root_constant_dirty_mask = ~0ull;
+      state.graphics_root_descriptor_dirty_mask = ~0ull;
     }
-  } else if (const auto *record =
-                 std::get_if<RootDescriptorTableRecord>(&payload)) {
-    auto &tables = record->compute ? state.compute_root_tables
+  } else if constexpr (std::is_same_v<Record, RootDescriptorTableRecord>) {
+    auto &tables = record.compute ? state.compute_root_tables
                                    : state.graphics_root_tables;
-    UpsertCompiledRootDescriptorTable(tables, *record);
-  } else if (const auto *record =
-                 std::get_if<RootConstantsRecord>(&payload)) {
-    auto &constants = record->compute ? state.compute_root_constants
+    if (UpsertCompiledRootDescriptorTable(tables, record)) {
+      MarkCompiledDirty(state, record.compute,
+                        CompiledCommandStateDomainRootTables);
+      auto &mask = record.compute ? state.compute_root_table_dirty_mask
+                                   : state.graphics_root_table_dirty_mask;
+      mask |= RootParameterBit(record.root_parameter_index);
+    }
+  } else if constexpr (std::is_same_v<Record, RootConstantsRecord>) {
+    auto &constants = record.compute ? state.compute_root_constants
                                       : state.graphics_root_constants;
-    UpsertCompiledRootConstants(constants, *record);
-  } else if (const auto *record =
-                 std::get_if<RootDescriptorRecord>(&payload)) {
-    auto &descriptors = record->compute ? state.compute_root_descriptors
+    UpsertCompiledRootConstants(constants, record);
+    MarkCompiledDirty(state, record.compute,
+                      CompiledCommandStateDomainRootConstants);
+    auto &mask = record.compute ? state.compute_root_constant_dirty_mask
+                                 : state.graphics_root_constant_dirty_mask;
+    mask |= RootParameterBit(record.root_parameter_index);
+  } else if constexpr (std::is_same_v<Record, RootDescriptorRecord>) {
+    auto &descriptors = record.compute ? state.compute_root_descriptors
                                         : state.graphics_root_descriptors;
-    UpsertCompiledRootDescriptor(descriptors, *record);
-  } else if (const auto *record = std::get_if<PredicationRecord>(&payload)) {
-    state.predication_active = record->buffer.ptr() != nullptr;
-  } else if (const auto *record = std::get_if<VertexBuffersRecord>(&payload)) {
+    UpsertCompiledRootDescriptor(descriptors, record);
+    MarkCompiledDirty(state, record.compute,
+                      CompiledCommandStateDomainRootDescriptors);
+    auto &mask = record.compute ? state.compute_root_descriptor_dirty_mask
+                                 : state.graphics_root_descriptor_dirty_mask;
+    mask |= RootParameterBit(record.root_parameter_index);
+  } else if constexpr (std::is_same_v<Record, PredicationRecord>) {
+    state.predication_active = record.buffer.ptr() != nullptr;
+  } else if constexpr (std::is_same_v<Record, VertexBuffersRecord>) {
     for (UINT i = 0;
-         i < record->view_count &&
-         record->start_slot + i < state.vertex_buffers.size();
+         i < record.view_count &&
+         record.start_slot + i < state.vertex_buffers.size();
          i++) {
-      const auto slot = record->start_slot + i;
-      if (i < record->views.size()) {
-        state.vertex_buffers[slot] = record->views[i];
+      const auto slot = record.start_slot + i;
+      if (i < record.views.size()) {
+        state.vertex_buffers[slot] = record.views[i];
       } else {
         state.vertex_buffers[slot].reset();
       }
       if (slot < 64)
         state.vertex_buffer_dirty_mask |= 1ull << slot;
     }
-  } else if (const auto *record = std::get_if<IndexBufferRecord>(&payload)) {
-    state.index_buffer = record->view;
+    MarkCompiledDirty(state, false,
+                      CompiledCommandStateDomainInputAssembler);
+  } else if constexpr (std::is_same_v<Record, IndexBufferRecord>) {
+    state.index_buffer = record.view;
     state.index_buffer_dirty = true;
-  } else if (const auto *record = std::get_if<RenderTargetsRecord>(&payload)) {
-    state.render_state.render_targets = record->render_targets;
-    state.render_state.depth_stencil = record->depth_stencil;
-  } else if (const auto *record = std::get_if<ViewportRecord>(&payload)) {
-    state.render_state.viewports = record->viewports;
-  } else if (const auto *record = std::get_if<ScissorRecord>(&payload)) {
-    state.render_state.scissors = record->rects;
-  } else if (const auto *record = std::get_if<BlendFactorRecord>(&payload)) {
-    state.render_state.blend_factor = record->blend_factor;
-  } else if (const auto *record = std::get_if<StencilRefRecord>(&payload)) {
-    state.render_state.stencil_ref = record->stencil_ref;
-  } else if (const auto *record =
-                 std::get_if<PrimitiveTopologyRecord>(&payload)) {
-    state.render_state.topology = record->topology;
+    MarkCompiledDirty(state, false,
+                      CompiledCommandStateDomainInputAssembler);
+  } else if constexpr (std::is_same_v<Record, RenderTargetsRecord>) {
+    state.render_targets = record.render_targets;
+    state.depth_stencil = record.depth_stencil;
+    MarkCompiledDirty(state, false,
+                      CompiledCommandStateDomainRenderTargets);
+  } else if constexpr (std::is_same_v<Record, ViewportRecord>) {
+    state.viewports = record.viewports;
+    MarkCompiledDirty(state, false, CompiledCommandStateDomainViewports);
+  } else if constexpr (std::is_same_v<Record, ScissorRecord>) {
+    state.scissors = record.rects;
+    MarkCompiledDirty(state, false, CompiledCommandStateDomainScissors);
+  } else if constexpr (std::is_same_v<Record, BlendFactorRecord>) {
+    state.blend_factor = record.blend_factor;
+    MarkCompiledDirty(state, false, CompiledCommandStateDomainBlendFactor);
+  } else if constexpr (std::is_same_v<Record, StencilRefRecord>) {
+    state.stencil_ref = record.stencil_ref;
+    MarkCompiledDirty(state, false, CompiledCommandStateDomainStencilRef);
+  } else if constexpr (std::is_same_v<Record, PrimitiveTopologyRecord>) {
+    state.topology = record.topology;
+    MarkCompiledDirty(state, false, CompiledCommandStateDomainTopology);
   }
+  }, payload);
 }
 
 static void
@@ -931,18 +1066,16 @@ FillCompiledPipelineBinding(CompiledCommandPipelineBinding &binding,
   binding.bindless_candidate = binding.metadata.ordinary_compiled;
 }
 
-static CompiledCommandInputAssemblerState
-BuildCompiledInputAssemblerState(const CompiledCommandBuildState &state) {
+static void RefreshCompiledInputAssemblerSnapshot(
+    CompiledCommandBuildState &state) {
   CompiledCommandInputAssemblerState result = {};
   result.index_buffer = state.index_buffer;
-  result.vertex_buffer_dirty_mask = state.vertex_buffer_dirty_mask;
-  result.index_buffer_dirty = state.index_buffer_dirty;
   for (UINT slot = 0; slot < state.vertex_buffers.size(); slot++) {
     if (state.vertex_buffers[slot])
       result.vertex_buffers.push_back(
           CompiledCommandVertexBuffer{slot, *state.vertex_buffers[slot]});
   }
-  return result;
+  state.input_assembler_snapshot = std::move(result);
 }
 
 static void
@@ -1093,7 +1226,8 @@ public:
     stage_bindings_.emplace(StageKey(pipeline, root, stage, tables), binding);
   }
 
-  bool Finalize(WMT::Device device, CompiledCommandList &compiled) const {
+  bool Finalize(WMT::Device device,
+                WMT::Reference<WMT::Buffer> &native_root_base_buffer) const {
     if (words_.empty())
       return true;
 
@@ -1105,11 +1239,11 @@ public:
     {
       dxmt::perf::ScopedCodeTimer perf_timer(
           dxmt::PerfCodePath::CompiledBuildPayloadBufferCreate);
-      compiled.native_root_base_buffer = device.newBuffer(info);
+      native_root_base_buffer = device.newBuffer(info);
     }
     auto *mapped = info.memory.get_accessible_or_null();
-    if (!compiled.native_root_base_buffer || !mapped) {
-      compiled.native_root_base_buffer = nullptr;
+    if (!native_root_base_buffer || !mapped) {
+      native_root_base_buffer = nullptr;
       return false;
     }
     {
@@ -1376,52 +1510,89 @@ BuildCompiledNativeStageBinding(
 }
 
 static CompiledCommandFallbackReason
-BuildCompiledGraphicsNativeBindings(CompiledGraphicsPacket &packet,
-                                    NativeRootBasePayloadBuilder &payloads) {
-  if (!packet.pipeline.metadata.uses_native_descriptor_table_abi)
+BuildCompiledGraphicsNativeBindings(
+    const CompiledCommandPipelineBinding &binding,
+    const std::vector<CompiledCommandRootDescriptorTable> &root_tables,
+    CompiledNativeStageBinding &native_vertex,
+    CompiledNativeStageBinding &native_pixel,
+    NativeRootBasePayloadBuilder &payloads) {
+  if (!binding.metadata.uses_native_descriptor_table_abi)
     return CompiledCommandFallbackReason::None;
-  auto *pipeline = packet.pipeline.metadata.pipeline;
-  auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+  auto *pipeline = binding.metadata.pipeline;
+  auto *root = GetDXMTRootSignature(binding.root_signature.ptr());
   if (!pipeline || !root)
     return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
   auto reason = BuildCompiledNativeStageBinding(
-      packet.root_tables, *pipeline, *root, PipelineShaderStage::Vertex,
-      payloads, packet.native_vertex);
+      root_tables, *pipeline, *root, PipelineShaderStage::Vertex,
+      payloads, native_vertex);
   if (reason != CompiledCommandFallbackReason::None)
     return reason;
   return BuildCompiledNativeStageBinding(
-      packet.root_tables, *pipeline, *root, PipelineShaderStage::Pixel,
-      payloads, packet.native_pixel);
+      root_tables, *pipeline, *root, PipelineShaderStage::Pixel,
+      payloads, native_pixel);
 }
 
 static CompiledCommandFallbackReason
-BuildCompiledComputeNativeBindings(CompiledComputePacket &packet,
-                                   NativeRootBasePayloadBuilder &payloads) {
-  if (!packet.pipeline.metadata.uses_native_descriptor_table_abi)
+BuildCompiledComputeNativeBindings(
+    const CompiledCommandPipelineBinding &binding,
+    const std::vector<CompiledCommandRootDescriptorTable> &root_tables,
+    CompiledNativeStageBinding &native_compute,
+    NativeRootBasePayloadBuilder &payloads) {
+  if (!binding.metadata.uses_native_descriptor_table_abi)
     return CompiledCommandFallbackReason::None;
-  auto *pipeline = packet.pipeline.metadata.pipeline;
-  auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+  auto *pipeline = binding.metadata.pipeline;
+  auto *root = GetDXMTRootSignature(binding.root_signature.ptr());
   if (!pipeline || !root)
     return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
   return BuildCompiledNativeStageBinding(
-      packet.root_tables, *pipeline, *root, PipelineShaderStage::Compute,
-      payloads, packet.native_compute);
+      root_tables, *pipeline, *root, PipelineShaderStage::Compute,
+      payloads, native_compute);
 }
 
 static CompiledGraphicsPacket
 BuildCompiledGraphicsPacket(const CommandRecord &record, UINT record_index,
-                            const CompiledCommandBuildState &state,
+                            CompiledCommandBuildState &state,
                             const CompiledCommandPipelineMetadata &metadata) {
+  if (state.descriptor_heap_snapshot_dirty) {
+    state.descriptor_heap_snapshot = state.descriptor_heap_records;
+    state.descriptor_heap_snapshot_dirty = false;
+  }
+  if (state.graphics_dirty_domains & CompiledCommandStateDomainRootTables)
+    state.graphics_root_table_snapshot = state.graphics_root_tables;
+  if (state.graphics_dirty_domains & CompiledCommandStateDomainRootConstants)
+    state.graphics_root_constant_snapshot = state.graphics_root_constants;
+  if (state.graphics_dirty_domains &
+      CompiledCommandStateDomainRootDescriptors)
+    state.graphics_root_descriptor_snapshot = state.graphics_root_descriptors;
+  if (state.graphics_dirty_domains & CompiledCommandStateDomainInputAssembler)
+    RefreshCompiledInputAssemblerSnapshot(state);
+  if (state.graphics_dirty_domains & CompiledCommandStateDomainRenderTargets) {
+    state.render_state_snapshot.render_targets = state.render_targets;
+    state.render_state_snapshot.depth_stencil = state.depth_stencil;
+  }
+  if (state.graphics_dirty_domains & CompiledCommandStateDomainViewports)
+    state.render_state_snapshot.viewports = state.viewports;
+  if (state.graphics_dirty_domains & CompiledCommandStateDomainScissors)
+    state.render_state_snapshot.scissors = state.scissors;
+  state.render_state_snapshot.blend_factor = state.blend_factor;
+  state.render_state_snapshot.stencil_ref = state.stencil_ref;
+  state.render_state_snapshot.topology = state.topology;
+
   CompiledGraphicsPacket packet = {};
   packet.record_index = record_index;
   packet.d3d_sequence = record.d3d_sequence;
   FillCompiledPipelineBinding(packet.pipeline, state, false, metadata);
   packet.descriptor_heaps = state.descriptor_heaps;
-  packet.root_tables = state.graphics_root_tables;
-  packet.root_constants = state.graphics_root_constants;
-  packet.root_descriptors = state.graphics_root_descriptors;
-  packet.input_assembler = BuildCompiledInputAssemblerState(state);
-  packet.render_state = state.render_state;
+  packet.descriptor_heaps.all = state.descriptor_heap_snapshot;
+  packet.root_tables = state.graphics_root_table_snapshot;
+  packet.root_constants = state.graphics_root_constant_snapshot;
+  packet.root_descriptors = state.graphics_root_descriptor_snapshot;
+  packet.input_assembler = state.input_assembler_snapshot;
+  packet.input_assembler.vertex_buffer_dirty_mask =
+      state.vertex_buffer_dirty_mask;
+  packet.input_assembler.index_buffer_dirty = state.index_buffer_dirty;
+  packet.render_state = state.render_state_snapshot;
+  packet.state_delta = GetCompiledStateDelta(state, false);
   if (const auto *draw = std::get_if<DrawInstancedRecord>(&record.payload))
     packet.draw = *draw;
   else if (const auto *draw_indexed =
@@ -1432,16 +1603,29 @@ BuildCompiledGraphicsPacket(const CommandRecord &record, UINT record_index,
 
 static CompiledComputePacket
 BuildCompiledComputePacket(const CommandRecord &record, UINT record_index,
-                           const CompiledCommandBuildState &state,
+                           CompiledCommandBuildState &state,
                            const CompiledCommandPipelineMetadata &metadata) {
+  if (state.descriptor_heap_snapshot_dirty) {
+    state.descriptor_heap_snapshot = state.descriptor_heap_records;
+    state.descriptor_heap_snapshot_dirty = false;
+  }
+  if (state.compute_dirty_domains & CompiledCommandStateDomainRootTables)
+    state.compute_root_table_snapshot = state.compute_root_tables;
+  if (state.compute_dirty_domains & CompiledCommandStateDomainRootConstants)
+    state.compute_root_constant_snapshot = state.compute_root_constants;
+  if (state.compute_dirty_domains & CompiledCommandStateDomainRootDescriptors)
+    state.compute_root_descriptor_snapshot = state.compute_root_descriptors;
+
   CompiledComputePacket packet = {};
   packet.record_index = record_index;
   packet.d3d_sequence = record.d3d_sequence;
   FillCompiledPipelineBinding(packet.pipeline, state, true, metadata);
   packet.descriptor_heaps = state.descriptor_heaps;
-  packet.root_tables = state.compute_root_tables;
-  packet.root_constants = state.compute_root_constants;
-  packet.root_descriptors = state.compute_root_descriptors;
+  packet.descriptor_heaps.all = state.descriptor_heap_snapshot;
+  packet.root_tables = state.compute_root_table_snapshot;
+  packet.root_constants = state.compute_root_constant_snapshot;
+  packet.root_descriptors = state.compute_root_descriptor_snapshot;
+  packet.state_delta = GetCompiledStateDelta(state, true);
   if (const auto *dispatch = std::get_if<DispatchRecord>(&record.payload))
     packet.dispatch = *dispatch;
   return packet;
@@ -1478,10 +1662,11 @@ FallbackReasonForCommandRecord(const CommandRecordPayload &payload) {
 
 static void
 AppendCompiledFallbackSegment(
-    CompiledCommandList &compiled, UINT record_index,
+    std::vector<CompiledCommandSegment> &segments,
+    UINT &unexpected_container_growths, UINT record_index,
     CompiledCommandFallbackReason reason) {
-  if (!compiled.segments.empty()) {
-    auto &last = compiled.segments.back();
+  if (!segments.empty()) {
+    auto &last = segments.back();
     if (last.kind == CompiledCommandSegmentKind::Fallback &&
         last.fallback_reason == reason &&
         last.first_record_index + last.record_count == record_index) {
@@ -1490,57 +1675,310 @@ AppendCompiledFallbackSegment(
     }
   }
 
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
   CompiledCommandSegment segment = {};
   segment.kind = CompiledCommandSegmentKind::Fallback;
   segment.first_record_index = record_index;
   segment.record_count = 1;
   segment.fallback_reason = reason;
   segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(reason);
-  compiled.segments.push_back(segment);
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
 }
 
 static void
-AppendCompiledGraphicsSegment(CompiledCommandList &compiled, UINT record_index,
-                              CompiledGraphicsPacket &&packet) {
+AppendCompiledGraphicsSegment(
+    std::vector<CompiledCommandSegment> &segments,
+    std::vector<CompiledGraphicsPacket> &graphics_packets,
+    UINT &unexpected_container_growths, UINT record_index,
+    CompiledGraphicsPacket &&packet) {
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+  const auto packet_index = static_cast<UINT>(graphics_packets.size());
+  if (graphics_packets.size() == graphics_packets.capacity())
+    unexpected_container_growths++;
+  graphics_packets.push_back(std::move(packet));
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Graphics &&
+        last.first_record_index + last.record_count == record_index &&
+        last.first_graphics_packet + last.graphics_packet_count ==
+            packet_index) {
+      last.record_count++;
+      last.graphics_packet_count++;
+      return;
+    }
+  }
+
   CompiledCommandSegment segment = {};
   segment.kind = CompiledCommandSegmentKind::Graphics;
   segment.first_record_index = record_index;
   segment.record_count = 1;
-  segment.first_graphics_packet =
-      static_cast<UINT>(compiled.graphics_packets.size());
+  segment.first_graphics_packet = packet_index;
   segment.graphics_packet_count = 1;
-  compiled.graphics_packets.push_back(std::move(packet));
-  compiled.segments.push_back(segment);
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
 }
 
 static void
-AppendCompiledComputeSegment(CompiledCommandList &compiled, UINT record_index,
-                             CompiledComputePacket &&packet) {
+AppendCompiledComputeSegment(
+    std::vector<CompiledCommandSegment> &segments,
+    std::vector<CompiledComputePacket> &compute_packets,
+    UINT &unexpected_container_growths, UINT record_index,
+    CompiledComputePacket &&packet) {
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+  const auto packet_index = static_cast<UINT>(compute_packets.size());
+  if (compute_packets.size() == compute_packets.capacity())
+    unexpected_container_growths++;
+  compute_packets.push_back(std::move(packet));
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Compute &&
+        last.first_record_index + last.record_count == record_index &&
+        last.first_compute_packet + last.compute_packet_count == packet_index) {
+      last.record_count++;
+      last.compute_packet_count++;
+      return;
+    }
+  }
+
   CompiledCommandSegment segment = {};
   segment.kind = CompiledCommandSegmentKind::Compute;
   segment.first_record_index = record_index;
   segment.record_count = 1;
-  segment.first_compute_packet =
-      static_cast<UINT>(compiled.compute_packets.size());
+  segment.first_compute_packet = packet_index;
   segment.compute_packet_count = 1;
-  compiled.compute_packets.push_back(std::move(packet));
-  compiled.segments.push_back(segment);
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+struct CompiledResourceStateKey {
+  ID3D12Resource *resource = nullptr;
+  UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+  bool operator==(const CompiledResourceStateKey &other) const {
+    return resource == other.resource && subresource == other.subresource;
+  }
+};
+
+struct CompiledResourceStateKeyHash {
+  size_t operator()(const CompiledResourceStateKey &key) const {
+    auto hash = std::hash<ID3D12Resource *>{}(key.resource);
+    hash ^= size_t(key.subresource) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    return hash;
+  }
+};
+
+class CompiledAccessSummaryBuilder {
+public:
+  CompiledAccessSummaryBuilder(UINT barrier_record_count,
+                               UINT barrier_count) {
+    summary_.barrier_ranges.reserve(barrier_record_count);
+    summary_.barriers.reserve(barrier_count);
+    summary_.resource_state_deltas.reserve(barrier_count);
+    size_t table_size = 1;
+    const auto required_slots = std::max<size_t>(2, size_t(barrier_count) * 2);
+    while (table_size < required_slots)
+      table_size <<= 1;
+    resource_state_delta_indices_.resize(table_size, 0);
+  }
+
+  void Append(UINT record_index, const ResourceBarrierRecord &record) {
+    const auto epoch = ++summary_.final_barrier_epoch;
+    const auto first_barrier = static_cast<UINT>(summary_.barriers.size());
+    summary_.barriers.insert(summary_.barriers.end(), record.barriers.begin(),
+                             record.barriers.end());
+    summary_.barrier_ranges.push_back(CompiledCommandBarrierRange{
+        record_index, first_barrier, static_cast<UINT>(record.barriers.size()),
+        epoch});
+
+    for (const auto &stored : record.barriers) {
+      if (stored.barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+          !stored.resource)
+        continue;
+      const auto &transition = stored.barrier.Transition;
+      const CompiledResourceStateKey key = {
+          stored.resource.ptr(), transition.Subresource};
+      const auto mask = resource_state_delta_indices_.size() - 1;
+      auto slot = CompiledResourceStateKeyHash{}(key) & mask;
+      size_t found_index = SIZE_MAX;
+      while (resource_state_delta_indices_[slot]) {
+        const auto candidate_index =
+            resource_state_delta_indices_[slot] - 1;
+        const auto &candidate =
+            summary_.resource_state_deltas[candidate_index];
+        if (candidate.resource.ptr() == key.resource &&
+            candidate.subresource == key.subresource) {
+          found_index = candidate_index;
+          break;
+        }
+        slot = (slot + 1) & mask;
+      }
+      if (found_index == SIZE_MAX) {
+        const auto index = summary_.resource_state_deltas.size();
+        summary_.resource_state_deltas.push_back(
+            CompiledCommandResourceStateDelta{
+                stored.resource, transition.Subresource,
+                transition.StateBefore, transition.StateAfter, epoch, epoch});
+        resource_state_delta_indices_[slot] = index + 1;
+      } else {
+        auto &delta = summary_.resource_state_deltas[found_index];
+        delta.export_state = transition.StateAfter;
+        delta.last_epoch = epoch;
+      }
+    }
+  }
+
+  CompiledCommandAccessSummary Finish() {
+    return std::move(summary_);
+  }
+
+private:
+  CompiledCommandAccessSummary summary_;
+  CompiledImmutableVector<size_t> resource_state_delta_indices_;
+};
+
+static UINT CountCompiledImmutableStateReuses(
+    const CompiledCommandList &compiled) {
+  UINT reuses = 0;
+  for (size_t i = 1; i < compiled.graphics_packets.size(); ++i) {
+    const auto &previous = compiled.graphics_packets[i - 1];
+    const auto &current = compiled.graphics_packets[i];
+    reuses += previous.root_tables.identity() == current.root_tables.identity();
+    reuses += previous.root_constants.identity() ==
+              current.root_constants.identity();
+    reuses += previous.root_descriptors.identity() ==
+              current.root_descriptors.identity();
+    reuses += previous.input_assembler.vertex_buffers.identity() ==
+              current.input_assembler.vertex_buffers.identity();
+    reuses += previous.render_state.render_targets.identity() ==
+              current.render_state.render_targets.identity();
+    reuses += previous.render_state.viewports.identity() ==
+              current.render_state.viewports.identity();
+    reuses += previous.render_state.scissors.identity() ==
+              current.render_state.scissors.identity();
+  }
+  for (size_t i = 1; i < compiled.compute_packets.size(); ++i) {
+    const auto &previous = compiled.compute_packets[i - 1];
+    const auto &current = compiled.compute_packets[i];
+    reuses += previous.root_tables.identity() == current.root_tables.identity();
+    reuses += previous.root_constants.identity() ==
+              current.root_constants.identity();
+    reuses += previous.root_descriptors.identity() ==
+              current.root_descriptors.identity();
+  }
+  return reuses;
+}
+
+struct CompiledStorageAllocationEventSnapshot {
+  std::uint64_t nodes = 0;
+  std::uint64_t state = 0;
+  std::uint64_t access = 0;
+
+  std::uint64_t Total() const { return nodes + state + access; }
+};
+
+static CompiledStorageAllocationEventSnapshot
+CompiledStorageAllocationEventCount() {
+  CompiledStorageAllocationEventSnapshot result;
+  result.nodes =
+      CompiledImmutableVector<CompiledCommandSegment>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CompiledGraphicsPacket>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CompiledComputePacket>::
+          ThreadAllocationEventCount();
+  result.state =
+      CompiledImmutableVector<CompiledCommandRootDescriptorTable>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<CompiledCommandRootConstants>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<CompiledCommandRootDescriptor>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<CompiledCommandVertexBuffer>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<DescriptorRecord>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<D3D12_VIEWPORT>::ThreadAllocationEventCount() +
+         CompiledImmutableVector<D3D12_RECT>::ThreadAllocationEventCount() +
+         CompiledImmutableVector<Com<ID3D12DescriptorHeap>>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<UINT>::ThreadAllocationEventCount();
+  result.access =
+      CompiledImmutableVector<CompiledCommandBarrierRange>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<StoredResourceBarrier>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<CompiledCommandResourceStateDelta>::
+             ThreadAllocationEventCount() +
+         CompiledImmutableVector<size_t>::ThreadAllocationEventCount();
+  return result;
+}
+
+static void FinalizeCompiledStorageAllocationEvents(
+    CompiledCommandList &compiled,
+    const CompiledStorageAllocationEventSnapshot &before) {
+  const auto after = CompiledStorageAllocationEventCount();
+  compiled.node_storage_allocation_events =
+      static_cast<UINT>(after.nodes - before.nodes);
+  compiled.state_storage_allocation_events =
+      static_cast<UINT>(after.state - before.state);
+  compiled.access_storage_allocation_events =
+      static_cast<UINT>(after.access - before.access);
+  compiled.storage_allocation_events =
+      compiled.node_storage_allocation_events +
+      compiled.state_storage_allocation_events +
+      compiled.access_storage_allocation_events;
 }
 
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
-                         WMT::Device device, bool force_fallback) {
+                         WMT::Device device, bool force_fallback,
+                         UINT graphics_packet_count,
+                         UINT compute_packet_count,
+                         UINT barrier_record_count,
+                         UINT barrier_count) {
   (void)device;
+  const auto allocation_events_before =
+      CompiledStorageAllocationEventCount();
   dxmt::perf::ScopedCodeTimer loop_timer(
       dxmt::PerfCodePath::CompiledBuildLoopDispatch);
   auto compiled = std::make_shared<CompiledCommandList>();
+  static std::atomic<std::uint64_t> next_generation = 0;
+  compiled->generation =
+      next_generation.fetch_add(1, std::memory_order_relaxed) + 1;
   compiled->record_count = static_cast<UINT>(records.size());
+  compiled->segments.reserve(records.size());
+  compiled->graphics_packets.reserve(graphics_packet_count);
+  compiled->compute_packets.reserve(compute_packet_count);
+  // Compilation owns these stores exclusively. Hold their mutable views once
+  // so per-record appends do not repeatedly execute the immutable wrapper's
+  // cross-thread uniqueness check; the stores become immutable when this
+  // function publishes the generation.
+  auto &segments = compiled->segments.mutableView();
+  auto &graphics_packets = compiled->graphics_packets.mutableView();
+  auto &compute_packets = compiled->compute_packets.mutableView();
+  CompiledAccessSummaryBuilder access_summary_builder(barrier_record_count,
+                                                      barrier_count);
   if (force_fallback) {
     for (UINT record_index = 0; record_index < records.size(); ++record_index) {
+      if (records[record_index].compile_kind ==
+          CommandRecordCompileKind::Barrier)
+        access_summary_builder.Append(
+            record_index,
+            std::get<ResourceBarrierRecord>(records[record_index].payload));
       AppendCompiledFallbackSegment(
-          *compiled, record_index,
+          segments, compiled->unexpected_container_growths, record_index,
           CompiledCommandFallbackReason::ConservativeCompiler);
     }
+    compiled->access_summary = access_summary_builder.Finish();
+    FinalizeCompiledStorageAllocationEvents(*compiled,
+                                            allocation_events_before);
     return compiled;
   }
 
@@ -1554,8 +1992,10 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   CompiledCommandBuildState state = {};
   for (UINT record_index = 0; record_index < records.size(); record_index++) {
     const auto &record = records[record_index];
-    if (std::holds_alternative<DrawInstancedRecord>(record.payload) ||
-        std::holds_alternative<DrawIndexedInstancedRecord>(record.payload)) {
+    if (record.compile_kind == CommandRecordCompileKind::Barrier)
+      access_summary_builder.Append(
+          record_index, std::get<ResourceBarrierRecord>(record.payload));
+    if (record.compile_kind == CommandRecordCompileKind::Graphics) {
       const CompiledCommandPipelineMetadata *metadata_ptr = nullptr;
       {
         dxmt::perf::ScopedCodeTimer metadata_timer(
@@ -1576,7 +2016,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                "failure at graphics record ",
                record_index);
           AppendCompiledFallbackSegment(
-              *compiled, record_index,
+              segments, compiled->unexpected_container_growths, record_index,
               CompiledCommandFallbackReason::
                   InjectedNativePacketAllocationFailure);
         } else {
@@ -1587,20 +2027,35 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
             packet = BuildCompiledGraphicsPacket(record, record_index, state,
                                                  metadata);
           }
-          {
-            dxmt::perf::ScopedCodeTimer append_timer(
-                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-            AppendCompiledGraphicsSegment(*compiled, record_index,
-                                          std::move(packet));
-          }
+          AppendCompiledGraphicsSegment(
+              segments, graphics_packets,
+              compiled->unexpected_container_growths, record_index,
+              std::move(packet));
           ClearCompiledInputAssemblerDirtyState(state);
+          ClearCompiledStateDelta(state, false);
         }
+      } else if (reason ==
+                 CompiledCommandFallbackReason::QueryOrPredication) {
+        AppendCompiledFallbackSegment(
+            segments, compiled->unexpected_container_growths, record_index,
+            reason);
       } else {
-        dxmt::perf::ScopedCodeTimer append_timer(
-            dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-        AppendCompiledFallbackSegment(*compiled, record_index, reason);
+        CompiledGraphicsPacket packet;
+        {
+          dxmt::perf::ScopedCodeTimer packet_timer(
+              dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+          packet = BuildCompiledGraphicsPacket(record, record_index, state,
+                                               metadata);
+          packet.compatibility_reason = reason;
+        }
+        AppendCompiledGraphicsSegment(
+            segments, graphics_packets,
+            compiled->unexpected_container_growths, record_index,
+            std::move(packet));
+        ClearCompiledInputAssemblerDirtyState(state);
+        ClearCompiledStateDelta(state, false);
       }
-    } else if (std::holds_alternative<DispatchRecord>(record.payload)) {
+    } else if (record.compile_kind == CommandRecordCompileKind::Compute) {
       const CompiledCommandPipelineMetadata *metadata_ptr = nullptr;
       {
         dxmt::perf::ScopedCodeTimer metadata_timer(
@@ -1621,7 +2076,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                "failure at compute record ",
                record_index);
           AppendCompiledFallbackSegment(
-              *compiled, record_index,
+              segments, compiled->unexpected_container_growths, record_index,
               CompiledCommandFallbackReason::
                   InjectedNativePacketAllocationFailure);
         } else {
@@ -1632,23 +2087,35 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
             packet = BuildCompiledComputePacket(record, record_index, state,
                                                 metadata);
           }
-          {
-            dxmt::perf::ScopedCodeTimer append_timer(
-                dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-            AppendCompiledComputeSegment(*compiled, record_index,
-                                         std::move(packet));
-          }
+          AppendCompiledComputeSegment(
+              segments, compute_packets,
+              compiled->unexpected_container_growths, record_index,
+              std::move(packet));
+          ClearCompiledStateDelta(state, true);
         }
+      } else if (reason ==
+                 CompiledCommandFallbackReason::QueryOrPredication) {
+        AppendCompiledFallbackSegment(
+            segments, compiled->unexpected_container_growths, record_index,
+            reason);
       } else {
-        dxmt::perf::ScopedCodeTimer append_timer(
-            dxmt::PerfCodePath::CompiledBuildSegmentAppend);
-        AppendCompiledFallbackSegment(*compiled, record_index, reason);
+        CompiledComputePacket packet;
+        {
+          dxmt::perf::ScopedCodeTimer packet_timer(
+              dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+          packet = BuildCompiledComputePacket(record, record_index, state,
+                                              metadata);
+          packet.compatibility_reason = reason;
+        }
+        AppendCompiledComputeSegment(
+            segments, compute_packets,
+            compiled->unexpected_container_growths, record_index,
+            std::move(packet));
+        ClearCompiledStateDelta(state, true);
       }
     } else {
-      dxmt::perf::ScopedCodeTimer append_timer(
-          dxmt::PerfCodePath::CompiledBuildSegmentAppend);
       AppendCompiledFallbackSegment(
-          *compiled, record_index,
+          segments, compiled->unexpected_container_growths, record_index,
           FallbackReasonForCommandRecord(record.payload));
     }
     {
@@ -1693,8 +2160,13 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     // avoid.
     compiled->graphics_packets.clear();
     compiled->compute_packets.clear();
-    compiled->native_root_base_buffer = {};
   }
+
+  compiled->access_summary = access_summary_builder.Finish();
+  compiled->immutable_state_reuses =
+      CountCompiledImmutableStateReuses(*compiled);
+  FinalizeCompiledStorageAllocationEvents(*compiled,
+                                          allocation_events_before);
 
   return compiled;
 }
@@ -1724,59 +2196,136 @@ static CompiledCommandFallbackReason MaterializeSubmittedRootTables(
   return CompiledCommandFallbackReason::None;
 }
 
-void PrepareSubmittedCompiledCommandListImpl(CompiledCommandList &compiled,
-                                             WMT::Device device) {
+std::shared_ptr<SubmittedCompiledCommandListPlan>
+PrepareSubmittedCompiledCommandListImpl(
+    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device) {
+  auto plan = std::make_shared<SubmittedCompiledCommandListPlan>();
+  plan->generation = std::move(compiled);
+  if (!plan->generation)
+    return plan;
+
   NativeRootBasePayloadBuilder native_payloads;
-  compiled.native_root_base_buffer = {};
+  struct MaterializedTableKey {
+    const void *table_identity = nullptr;
+    ID3D12DescriptorHeap *resource_heap = nullptr;
+    ID3D12DescriptorHeap *sampler_heap = nullptr;
+    RootSignature *root = nullptr;
 
-  for (auto &packet : compiled.graphics_packets) {
-    packet.native_vertex = {};
-    packet.native_pixel = {};
+    bool operator==(const MaterializedTableKey &) const = default;
+  };
+  struct MaterializedTableKeyHash {
+    size_t operator()(const MaterializedTableKey &key) const {
+      size_t hash = std::hash<const void *>{}(key.table_identity);
+      auto mix = [&](const void *value) {
+        hash ^= std::hash<const void *>{}(value) + 0x9e3779b97f4a7c15ull +
+                (hash << 6) + (hash >> 2);
+      };
+      mix(key.resource_heap);
+      mix(key.sampler_heap);
+      mix(key.root);
+      return hash;
+    }
+  };
+  struct MaterializedTables {
+    std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
+        tables;
+    CompiledCommandFallbackReason reason =
+        CompiledCommandFallbackReason::None;
+  };
+  std::unordered_map<MaterializedTableKey, MaterializedTables,
+                     MaterializedTableKeyHash>
+      materialized_table_cache;
+  auto materialize_tables = [&](const auto &packet,
+                                RootSignature *root) -> MaterializedTables {
+    const MaterializedTableKey key = {
+        packet.root_tables.identity(),
+        packet.descriptor_heaps.cbv_srv_uav.ptr(),
+        packet.descriptor_heaps.sampler.ptr(), root};
+    if (const auto found = materialized_table_cache.find(key);
+        found != materialized_table_cache.end())
+      return found->second;
+    auto tables = std::make_shared<
+        std::vector<CompiledCommandRootDescriptorTable>>(
+        packet.root_tables.copy());
+    const auto reason = MaterializeSubmittedRootTables(
+        *tables, packet.descriptor_heaps, root);
+    MaterializedTables result = {std::move(tables), reason};
+    materialized_table_cache.emplace(key, result);
+    return result;
+  };
+  plan->graphics_packets.reserve(plan->generation->graphics_packets.size());
+  plan->compute_packets.reserve(plan->generation->compute_packets.size());
+
+  for (const auto &packet : plan->generation->graphics_packets) {
+    SubmittedCompiledGraphicsPacket submitted = {};
+    if (packet.compatibility_reason !=
+        CompiledCommandFallbackReason::None) {
+      submitted.prepare_reason = packet.compatibility_reason;
+      plan->graphics_packets.push_back(std::move(submitted));
+      continue;
+    }
     auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
-    auto reason = MaterializeSubmittedRootTables(
-        packet.root_tables, packet.descriptor_heaps, root);
+    const auto materialized = materialize_tables(packet, root);
+    submitted.root_tables = materialized.tables;
+    auto reason = materialized.reason;
     if (reason == CompiledCommandFallbackReason::None)
-      reason = BuildCompiledGraphicsNativeBindings(packet, native_payloads);
-    packet.submission_prepare_reason = reason;
-    if (compiled.test_telemetry) {
-      compiled.test_telemetry->submitted_graphics_packets.fetch_add(
+      reason = BuildCompiledGraphicsNativeBindings(
+          packet.pipeline, *submitted.root_tables, submitted.native_vertex,
+          submitted.native_pixel, native_payloads);
+    submitted.prepare_reason = reason;
+    plan->graphics_packets.push_back(std::move(submitted));
+    if (plan->generation->test_telemetry) {
+      plan->generation->test_telemetry->submitted_graphics_packets.fetch_add(
           1, std::memory_order_relaxed);
       if (reason != CompiledCommandFallbackReason::None)
-        compiled.test_telemetry->submission_prepare_failures.fetch_add(
+        plan->generation->test_telemetry->submission_prepare_failures.fetch_add(
             1, std::memory_order_relaxed);
     }
   }
 
-  for (auto &packet : compiled.compute_packets) {
-    packet.native_compute = {};
+  for (const auto &packet : plan->generation->compute_packets) {
+    SubmittedCompiledComputePacket submitted = {};
+    if (packet.compatibility_reason !=
+        CompiledCommandFallbackReason::None) {
+      submitted.prepare_reason = packet.compatibility_reason;
+      plan->compute_packets.push_back(std::move(submitted));
+      continue;
+    }
     auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
-    auto reason = MaterializeSubmittedRootTables(
-        packet.root_tables, packet.descriptor_heaps, root);
+    const auto materialized = materialize_tables(packet, root);
+    submitted.root_tables = materialized.tables;
+    auto reason = materialized.reason;
     if (reason == CompiledCommandFallbackReason::None)
-      reason = BuildCompiledComputeNativeBindings(packet, native_payloads);
-    packet.submission_prepare_reason = reason;
-    if (compiled.test_telemetry) {
-      compiled.test_telemetry->submitted_compute_packets.fetch_add(
+      reason = BuildCompiledComputeNativeBindings(
+          packet.pipeline, *submitted.root_tables, submitted.native_compute,
+          native_payloads);
+    submitted.prepare_reason = reason;
+    plan->compute_packets.push_back(std::move(submitted));
+    if (plan->generation->test_telemetry) {
+      plan->generation->test_telemetry->submitted_compute_packets.fetch_add(
           1, std::memory_order_relaxed);
       if (reason != CompiledCommandFallbackReason::None)
-        compiled.test_telemetry->submission_prepare_failures.fetch_add(
+        plan->generation->test_telemetry->submission_prepare_failures.fetch_add(
             1, std::memory_order_relaxed);
     }
   }
 
-  if (native_payloads.Finalize(device, compiled))
-    return;
+  if (native_payloads.Finalize(device, plan->native_root_base_buffer))
+    return plan;
 
-  for (auto &packet : compiled.graphics_packets) {
-    if (packet.pipeline.metadata.uses_native_descriptor_table_abi)
-      packet.submission_prepare_reason =
+  for (size_t i = 0; i < plan->graphics_packets.size(); ++i) {
+    if (plan->generation->graphics_packets[i]
+            .pipeline.metadata.uses_native_descriptor_table_abi)
+      plan->graphics_packets[i].prepare_reason =
           CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
   }
-  for (auto &packet : compiled.compute_packets) {
-    if (packet.pipeline.metadata.uses_native_descriptor_table_abi)
-      packet.submission_prepare_reason =
+  for (size_t i = 0; i < plan->compute_packets.size(); ++i) {
+    if (plan->generation->compute_packets[i]
+            .pipeline.metadata.uses_native_descriptor_table_abi)
+      plan->compute_packets[i].prepare_reason =
           CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
   }
+  return plan;
 }
 
 static bool
@@ -1876,6 +2425,7 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
   using dxmt::d3d12::test::kExecutionPathMaxTracedSegments;
   dxmt::d3d12::test::ExecutionPathStats stats = {};
   stats.mode = compiled.test_path_mode;
+  stats.command_list_generation = compiled.generation;
   stats.record_count = compiled.record_count;
   stats.work_record_count = compiled.test_work_record_count;
   stats.compiled_work_record_count =
@@ -1886,7 +2436,35 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
       static_cast<UINT>(compiled.graphics_packets.size());
   stats.retained_compute_packets =
       static_cast<UINT>(compiled.compute_packets.size());
-  stats.has_native_root_base_buffer = compiled.native_root_base_buffer ? 1u : 0u;
+  // Native root-base storage is submission-scoped and intentionally absent
+  // from the immutable Close generation.
+  stats.has_native_root_base_buffer = 0;
+  stats.unexpected_container_growths = compiled.unexpected_container_growths;
+  stats.storage_allocation_events = compiled.storage_allocation_events;
+  stats.node_storage_allocation_events =
+      compiled.node_storage_allocation_events;
+  stats.state_storage_allocation_events =
+      compiled.state_storage_allocation_events;
+  stats.access_storage_allocation_events =
+      compiled.access_storage_allocation_events;
+  stats.immutable_state_reuses = compiled.immutable_state_reuses;
+  auto count_state_delta = [&](const CompiledCommandStateDelta &delta) {
+    stats.state_delta_packets++;
+    if (!delta.dirty_domains && !delta.root_table_dirty_mask &&
+        !delta.root_constant_dirty_mask &&
+        !delta.root_descriptor_dirty_mask)
+      stats.zero_state_delta_packets++;
+  };
+  for (const auto &packet : compiled.graphics_packets)
+    count_state_delta(packet.state_delta);
+  for (const auto &packet : compiled.compute_packets)
+    count_state_delta(packet.state_delta);
+  stats.compiled_barrier_ranges =
+      static_cast<UINT>(compiled.access_summary.barrier_ranges.size());
+  stats.compiled_barriers =
+      static_cast<UINT>(compiled.access_summary.barriers.size());
+  stats.compiled_resource_state_deltas = static_cast<UINT>(
+      compiled.access_summary.resource_state_deltas.size());
   stats.segment_count = static_cast<UINT>(compiled.segments.size());
   stats.traced_segment_count =
       std::min<UINT>(stats.segment_count, kExecutionPathMaxTracedSegments);
@@ -1967,6 +2545,20 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
             std::memory_order_acquire);
     stats.submitted_descriptor_entries =
         telemetry.submitted_descriptor_entries.load(std::memory_order_acquire);
+    stats.submitted_unique_descriptor_snapshots =
+        telemetry.submitted_unique_descriptor_snapshots.load(
+            std::memory_order_acquire);
+    stats.submitted_unique_descriptor_records =
+        telemetry.submitted_unique_descriptor_records.load(
+            std::memory_order_acquire);
+    stats.submitted_descriptor_record_reuses =
+        telemetry.submitted_descriptor_record_reuses.load(
+            std::memory_order_acquire);
+    stats.submitted_generation_shares =
+        telemetry.submitted_generation_shares.load(std::memory_order_acquire);
+    stats.submitted_generation_deep_copies =
+        telemetry.submitted_generation_deep_copies.load(
+            std::memory_order_acquire);
   }
   return stats;
 }
@@ -2134,7 +2726,7 @@ public:
     if (guid == dxmt::d3d12::test::kExecutionPathStatsGuid) {
       if (!data_size)
         return E_INVALIDARG;
-      if (!test_path_configured_ || !compiled_commands_) {
+      if (!compiled_commands_) {
         *data_size = 0;
         return DXGI_ERROR_NOT_FOUND;
       }
@@ -2234,7 +2826,9 @@ public:
           test_path_config_.mode ==
               dxmt::d3d12::test::ExecutionPathMode::Fallback;
       auto compiled = BuildCompiledCommandList(
-          records_, device_->GetMTLDevice(), force_fallback);
+          records_, device_->GetMTLDevice(), force_fallback,
+          recorded_graphics_packet_count_, recorded_compute_packet_count_,
+          recorded_barrier_record_count_, recorded_barrier_count_);
       if (test_path_configured_) {
         ApplyExecutionPathTestConfig(*compiled, records_, test_path_config_);
         if (test_path_config_.mode ==
@@ -2243,6 +2837,11 @@ public:
           recording_error_ = E_FAIL;
       }
       compiled_commands_ = std::move(compiled);
+      // Publish the recorded stream as the immutable generation owned by this
+      // Close. Execute can retain it in O(1), while Reset immediately starts a
+      // fresh recording vector without copying the variant-heavy record set.
+      closed_records_ = std::make_shared<const std::vector<CommandRecord>>(
+          std::move(records_));
     }
     closed_ = true;
     if (allocator_) {
@@ -2303,6 +2902,11 @@ public:
       dxmt::perf::ScopedCodeTimer state_clear_timer(
           dxmt::PerfCodePath::CommandListResetStateClear);
       records_.clear();
+      closed_records_.reset();
+      recorded_graphics_packet_count_ = 0;
+      recorded_compute_packet_count_ = 0;
+      recorded_barrier_record_count_ = 0;
+      recorded_barrier_count_ = 0;
       compiled_commands_.reset();
       test_path_config_ = {};
       test_path_configured_ = false;
@@ -2352,10 +2956,11 @@ public:
     return type_;
   }
 
-  const std::vector<CommandRecord> &GetCommandRecords() const override {
+  std::shared_ptr<const std::vector<CommandRecord>>
+  GetCommandRecordGeneration() const override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListObjectApi);
-    return records_;
+    return closed_records_;
   }
 
   std::shared_ptr<const CompiledCommandList> GetCompiledCommands()
@@ -2894,7 +3499,10 @@ public:
       WARN("D3D12GraphicsCommandList: ExecuteBundle called with an open bundle");
       return;
     }
-    const auto &bundle_records = bundle->GetCommandRecords();
+    const auto bundle_generation = bundle->GetCommandRecordGeneration();
+    if (!bundle_generation)
+      return;
+    const auto &bundle_records = *bundle_generation;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_execute_bundle(this, command_list);
     records_.insert(records_.end(), bundle_records.begin(), bundle_records.end());
@@ -4422,8 +5030,30 @@ private:
         dxmt::perf::FrameTimeBucket::CommandListRecord);
     dxmt::perf::ScopedCodeTimer code_timer(
         dxmt::PerfCodePath::CommandListRecordVectorAppend);
+    using RecordType = std::remove_cvref_t<T>;
+    constexpr auto compile_kind = [] {
+      if constexpr (std::is_same_v<RecordType, DrawInstancedRecord> ||
+                    std::is_same_v<RecordType,
+                                   DrawIndexedInstancedRecord>)
+        return CommandRecordCompileKind::Graphics;
+      if constexpr (std::is_same_v<RecordType, DispatchRecord>)
+        return CommandRecordCompileKind::Compute;
+      if constexpr (std::is_same_v<RecordType, ResourceBarrierRecord>)
+        return CommandRecordCompileKind::Barrier;
+      return CommandRecordCompileKind::Other;
+    }();
+    if constexpr (std::is_same_v<RecordType, DrawInstancedRecord> ||
+                  std::is_same_v<RecordType, DrawIndexedInstancedRecord>) {
+      recorded_graphics_packet_count_++;
+    } else if constexpr (std::is_same_v<RecordType, DispatchRecord>) {
+      recorded_compute_packet_count_++;
+    } else if constexpr (std::is_same_v<RecordType, ResourceBarrierRecord>) {
+      recorded_barrier_record_count_++;
+      recorded_barrier_count_ += static_cast<UINT>(payload.barriers.size());
+    }
     records_.push_back(CommandRecord{
-        g_current_command_record_d3d_sequence, std::forward<T>(payload)});
+        g_current_command_record_d3d_sequence, compile_kind,
+        std::forward<T>(payload)});
   }
 
 #ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
@@ -4579,6 +5209,11 @@ private:
       vertex_buffer_cache_;
   ComPrivateData private_data_;
   std::vector<CommandRecord> records_;
+  std::shared_ptr<const std::vector<CommandRecord>> closed_records_;
+  UINT recorded_graphics_packet_count_ = 0;
+  UINT recorded_compute_packet_count_ = 0;
+  UINT recorded_barrier_record_count_ = 0;
+  UINT recorded_barrier_count_ = 0;
   std::shared_ptr<const CompiledCommandList> compiled_commands_;
   dxmt::d3d12::test::ExecutionPathConfig test_path_config_ = {};
   bool test_path_configured_ = false;
@@ -4677,9 +5312,10 @@ private:
 
 } // namespace
 
-void PrepareSubmittedCompiledCommandList(CompiledCommandList &compiled,
-                                         WMT::Device device) {
-  PrepareSubmittedCompiledCommandListImpl(compiled, device);
+std::shared_ptr<SubmittedCompiledCommandListPlan>
+PrepareSubmittedCompiledCommandList(
+    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device) {
+  return PrepareSubmittedCompiledCommandListImpl(std::move(compiled), device);
 }
 
 Com<ID3D12GraphicsCommandList>

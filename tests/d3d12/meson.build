@@ -57,6 +57,7 @@ d3d12_unit_suites = {
       'command/allocator_lifecycle_spec.cpp',
       'command/bundle_execution_matrix_spec.cpp',
       'command/bundle_legality_spec.cpp',
+      'command/compiled_generation_spec.cpp',
       'command/list_lifecycle_spec.cpp',
       'command/list_state_spec.cpp',
       'command/list_type_matrix_spec.cpp',

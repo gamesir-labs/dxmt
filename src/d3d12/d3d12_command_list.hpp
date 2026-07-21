@@ -10,9 +10,13 @@
 #include <d3d12.h>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -299,8 +303,16 @@ using CommandRecordPayload = std::variant<
     WriteBufferImmediateRecord,
     ExecuteIndirectRecord, TemporalUpscaleRecord>;
 
+enum class CommandRecordCompileKind : std::uint8_t {
+  Other,
+  Graphics,
+  Compute,
+  Barrier,
+};
+
 struct CommandRecord {
   std::uint64_t d3d_sequence = 0;
+  CommandRecordCompileKind compile_kind = CommandRecordCompileKind::Other;
   CommandRecordPayload payload;
 };
 
@@ -356,10 +368,327 @@ enum class CompiledCommandFallbackReason {
   UnsupportedCommand,
 };
 
+template <typename T>
+class CompiledImmutableVector {
+public:
+  using Storage = std::vector<T>;
+  using value_type = T;
+  using size_type = typename Storage::size_type;
+  using iterator = typename Storage::iterator;
+  using const_iterator = typename Storage::const_iterator;
+
+  CompiledImmutableVector() = default;
+  CompiledImmutableVector(const Storage &values)
+      : storage_(values.empty() ? nullptr : Acquire(values.size())) {
+    if (storage_)
+      storage_->values.assign(values.begin(), values.end());
+  }
+  CompiledImmutableVector(Storage &&values)
+      : storage_(values.empty() ? nullptr : Acquire(0)) {
+    if (storage_)
+      storage_->values = std::move(values);
+  }
+
+  CompiledImmutableVector(const CompiledImmutableVector &other)
+      : storage_(other.storage_) {
+    Retain(storage_);
+  }
+
+  CompiledImmutableVector(CompiledImmutableVector &&other) noexcept
+      : storage_(std::exchange(other.storage_, nullptr)) {}
+
+  ~CompiledImmutableVector() { Release(storage_); }
+
+  CompiledImmutableVector &operator=(const CompiledImmutableVector &other) {
+    if (this == &other)
+      return *this;
+    Retain(other.storage_);
+    Release(storage_);
+    storage_ = other.storage_;
+    return *this;
+  }
+
+  CompiledImmutableVector &operator=(
+      CompiledImmutableVector &&other) noexcept {
+    if (this == &other)
+      return *this;
+    Release(storage_);
+    storage_ = std::exchange(other.storage_, nullptr);
+    return *this;
+  }
+
+  CompiledImmutableVector &operator=(const Storage &values) {
+    Release(storage_);
+    if (values.empty()) {
+      storage_ = nullptr;
+    } else {
+      storage_ = Acquire(values.size());
+      storage_->values.assign(values.begin(), values.end());
+    }
+    return *this;
+  }
+
+  CompiledImmutableVector &operator=(Storage &&values) {
+    Release(storage_);
+    if (values.empty()) {
+      storage_ = nullptr;
+    } else {
+      storage_ = Acquire(0);
+      storage_->values = std::move(values);
+    }
+    return *this;
+  }
+
+  const Storage &view() const {
+    static const Storage empty;
+    return storage_ ? storage_->values : empty;
+  }
+
+  Storage copy() const {
+    return view();
+  }
+
+  Storage &mutableView() {
+    if (!storage_) {
+      storage_ = Acquire(0);
+    } else if (storage_->references.load(std::memory_order_acquire) != 1) {
+      auto *replacement = Acquire(storage_->values.size());
+      replacement->values.assign(storage_->values.begin(),
+                                 storage_->values.end());
+      Release(storage_);
+      storage_ = replacement;
+    }
+    return storage_->values;
+  }
+
+  operator const Storage &() const { return view(); }
+  operator Storage &() { return mutableView(); }
+
+  bool empty() const { return !storage_ || storage_->values.empty(); }
+  size_type size() const { return storage_ ? storage_->values.size() : 0; }
+  size_type capacity() const {
+    return storage_ ? storage_->values.capacity() : 0;
+  }
+  const T *data() const {
+    return storage_ ? storage_->values.data() : nullptr;
+  }
+  const void *identity() const { return storage_; }
+  bool sharesStorageWith(const CompiledImmutableVector &other) const {
+    return storage_ == other.storage_;
+  }
+  std::span<const T> span() const { return {data(), size()}; }
+
+  const T &operator[](size_type index) const { return view()[index]; }
+  T &operator[](size_type index) { return mutableView()[index]; }
+  const T &back() const { return view().back(); }
+  T &back() { return mutableView().back(); }
+
+  const_iterator begin() const { return view().begin(); }
+  const_iterator end() const { return view().end(); }
+  iterator begin() { return mutableView().begin(); }
+  iterator end() { return mutableView().end(); }
+
+  void clear() {
+    if (empty())
+      return;
+    Release(storage_);
+    storage_ = nullptr;
+  }
+  void reserve(size_type count) {
+    if (!storage_) {
+      storage_ = Acquire(count);
+      return;
+    }
+    auto &values = mutableView();
+    if (values.capacity() < count) {
+      RecordAllocationEvent();
+      values.reserve(count);
+    }
+  }
+  void push_back(const T &value) {
+    auto &values = mutableView();
+    if (values.size() == values.capacity())
+      RecordAllocationEvent();
+    values.push_back(value);
+  }
+  void push_back(T &&value) {
+    auto &values = mutableView();
+    if (values.size() == values.capacity())
+      RecordAllocationEvent();
+    values.push_back(std::move(value));
+  }
+
+  iterator insert(iterator position, const T &value) {
+    auto &values = mutableView();
+    if (values.size() == values.capacity())
+      RecordAllocationEvent();
+    return values.insert(position, value);
+  }
+
+  template <typename InputIt>
+  iterator insert(iterator position, InputIt first, InputIt last) {
+    auto &values = mutableView();
+    const auto additional = static_cast<size_type>(std::distance(first, last));
+    if (values.capacity() - values.size() < additional)
+      RecordAllocationEvent();
+    return values.insert(position, first, last);
+  }
+
+  void resize(size_type count, const T &value = T()) {
+    auto &values = mutableView();
+    if (values.capacity() < count)
+      RecordAllocationEvent();
+    values.resize(count, value);
+  }
+
+  template <typename... Args>
+  T &emplace_back(Args &&...args) {
+    auto &values = mutableView();
+    if (values.size() == values.capacity())
+      RecordAllocationEvent();
+    return values.emplace_back(std::forward<Args>(args)...);
+  }
+
+  static std::uint64_t ThreadAllocationEventCount() {
+    return thread_allocation_events_;
+  }
+
+private:
+  struct Block;
+
+  struct Pool {
+    std::array<Block *, sizeof(size_type) * 8 + 1> available = {};
+    std::mutex returned_mutex;
+    Block *returned = nullptr;
+  };
+
+  struct Block {
+    std::atomic<std::uint32_t> references = 1;
+    Storage values;
+    Pool *owner = nullptr;
+    Block *next = nullptr;
+  };
+
+  static Pool &GetPool() {
+    // A pool is owned by the recording thread. Blocks may be released by a
+    // queue worker after GPU completion, so the pool intentionally has process
+    // lifetime and accepts returned blocks through a small synchronized list.
+    // Only its owner thread consumes `available`; Close never takes a global
+    // compiler lock.
+    if (!thread_pool_)
+      thread_pool_ = new Pool();
+    return *thread_pool_;
+  }
+
+  static void RecordAllocationEvent() { thread_allocation_events_++; }
+
+  static size_type CapacityBucket(size_type capacity) {
+    return capacity <= 1 ? 0 : std::bit_width(capacity - 1);
+  }
+
+  static Block *Acquire(size_type required_capacity) {
+    auto &pool = GetPool();
+    Block *returned = nullptr;
+    {
+      std::lock_guard lock(pool.returned_mutex);
+      returned = std::exchange(pool.returned, nullptr);
+    }
+    if (returned) {
+      while (returned) {
+        auto *next = returned->next;
+        const auto bucket = CapacityBucket(returned->values.capacity());
+        returned->next = pool.available[bucket];
+        pool.available[bucket] = returned;
+        returned = next;
+      }
+    }
+
+    Block *block = nullptr;
+    const auto required_bucket = CapacityBucket(required_capacity);
+    for (size_type bucket = required_bucket;
+         bucket < pool.available.size(); ++bucket) {
+      if (!pool.available[bucket])
+        continue;
+      block = pool.available[bucket];
+      pool.available[bucket] = block->next;
+      break;
+    }
+    if (!block) {
+      for (size_type bucket = required_bucket; bucket-- > 0;) {
+        if (!pool.available[bucket])
+          continue;
+        block = pool.available[bucket];
+        pool.available[bucket] = block->next;
+        break;
+      }
+    }
+    if (!block) {
+      block = new Block();
+      block->owner = &pool;
+      RecordAllocationEvent();
+    }
+    block->next = nullptr;
+    block->references.store(1, std::memory_order_relaxed);
+    if (block->values.capacity() < required_capacity) {
+      RecordAllocationEvent();
+      block->values.reserve(required_capacity);
+    }
+    return block;
+  }
+
+  static void Retain(Block *block) {
+    if (block)
+      block->references.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static void Release(Block *block) {
+    if (!block ||
+        block->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
+      return;
+    block->values.clear();
+    if (thread_pool_ == block->owner) {
+      const auto bucket = CapacityBucket(block->values.capacity());
+      block->next = block->owner->available[bucket];
+      block->owner->available[bucket] = block;
+      return;
+    }
+    std::lock_guard lock(block->owner->returned_mutex);
+    block->next = block->owner->returned;
+    block->owner->returned = block;
+  }
+
+  inline static thread_local std::uint64_t thread_allocation_events_ = 0;
+  inline static thread_local Pool *thread_pool_ = nullptr;
+  Block *storage_ = nullptr;
+};
+
+enum CompiledCommandStateDomain : std::uint32_t {
+  CompiledCommandStateDomainPipeline = 1u << 0,
+  CompiledCommandStateDomainRootSignature = 1u << 1,
+  CompiledCommandStateDomainDescriptorHeaps = 1u << 2,
+  CompiledCommandStateDomainRootTables = 1u << 3,
+  CompiledCommandStateDomainRootConstants = 1u << 4,
+  CompiledCommandStateDomainRootDescriptors = 1u << 5,
+  CompiledCommandStateDomainInputAssembler = 1u << 6,
+  CompiledCommandStateDomainRenderTargets = 1u << 7,
+  CompiledCommandStateDomainViewports = 1u << 8,
+  CompiledCommandStateDomainScissors = 1u << 9,
+  CompiledCommandStateDomainBlendFactor = 1u << 10,
+  CompiledCommandStateDomainStencilRef = 1u << 11,
+  CompiledCommandStateDomainTopology = 1u << 12,
+};
+
+struct CompiledCommandStateDelta {
+  std::uint32_t dirty_domains = 0;
+  std::uint64_t root_table_dirty_mask = 0;
+  std::uint64_t root_constant_dirty_mask = 0;
+  std::uint64_t root_descriptor_dirty_mask = 0;
+};
+
 struct CompiledCommandDescriptorHeaps {
   Com<ID3D12DescriptorHeap> cbv_srv_uav;
   Com<ID3D12DescriptorHeap> sampler;
-  std::vector<Com<ID3D12DescriptorHeap>> all;
+  CompiledImmutableVector<Com<ID3D12DescriptorHeap>> all;
 };
 
 struct CompiledCommandPipelineMetadata {
@@ -426,7 +755,7 @@ struct CompiledCommandRootDescriptorTable {
 struct CompiledCommandRootConstants {
   UINT root_parameter_index = 0;
   UINT dst_offset = 0;
-  std::vector<UINT> values;
+  CompiledImmutableVector<UINT> values;
 };
 
 struct CompiledCommandRootDescriptor {
@@ -441,17 +770,17 @@ struct CompiledCommandVertexBuffer {
 };
 
 struct CompiledCommandInputAssemblerState {
-  std::vector<CompiledCommandVertexBuffer> vertex_buffers;
+  CompiledImmutableVector<CompiledCommandVertexBuffer> vertex_buffers;
   std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
   std::uint64_t vertex_buffer_dirty_mask = 0;
   bool index_buffer_dirty = false;
 };
 
 struct CompiledCommandRenderState {
-  std::vector<DescriptorRecord> render_targets;
+  CompiledImmutableVector<DescriptorRecord> render_targets;
   std::optional<DescriptorRecord> depth_stencil;
-  std::vector<D3D12_VIEWPORT> viewports;
-  std::vector<D3D12_RECT> scissors;
+  CompiledImmutableVector<D3D12_VIEWPORT> viewports;
+  CompiledImmutableVector<D3D12_RECT> scissors;
   std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
   UINT stencil_ref = 0;
   D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
@@ -476,17 +805,16 @@ struct CompiledGraphicsPacket {
   std::uint64_t d3d_sequence = 0;
   CompiledCommandPipelineBinding pipeline;
   CompiledCommandDescriptorHeaps descriptor_heaps;
-  std::vector<CompiledCommandRootDescriptorTable> root_tables;
-  std::vector<CompiledCommandRootConstants> root_constants;
-  std::vector<CompiledCommandRootDescriptor> root_descriptors;
+  CompiledImmutableVector<CompiledCommandRootDescriptorTable> root_tables;
+  CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
+  CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
   CompiledCommandInputAssemblerState input_assembler;
   CompiledCommandRenderState render_state;
-  CompiledNativeStageBinding native_vertex;
-  CompiledNativeStageBinding native_pixel;
+  CompiledCommandStateDelta state_delta;
+  CompiledCommandFallbackReason compatibility_reason =
+      CompiledCommandFallbackReason::None;
   std::optional<DrawInstancedRecord> draw;
   std::optional<DrawIndexedInstancedRecord> draw_indexed;
-  CompiledCommandFallbackReason submission_prepare_reason =
-      CompiledCommandFallbackReason::None;
 };
 
 struct CompiledComputePacket {
@@ -494,13 +822,13 @@ struct CompiledComputePacket {
   std::uint64_t d3d_sequence = 0;
   CompiledCommandPipelineBinding pipeline;
   CompiledCommandDescriptorHeaps descriptor_heaps;
-  std::vector<CompiledCommandRootDescriptorTable> root_tables;
-  std::vector<CompiledCommandRootConstants> root_constants;
-  std::vector<CompiledCommandRootDescriptor> root_descriptors;
-  CompiledNativeStageBinding native_compute;
-  DispatchRecord dispatch;
-  CompiledCommandFallbackReason submission_prepare_reason =
+  CompiledImmutableVector<CompiledCommandRootDescriptorTable> root_tables;
+  CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
+  CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
+  CompiledCommandStateDelta state_delta;
+  CompiledCommandFallbackReason compatibility_reason =
       CompiledCommandFallbackReason::None;
+  DispatchRecord dispatch;
 };
 
 struct CompiledCommandSegment {
@@ -517,6 +845,30 @@ struct CompiledCommandSegment {
       dxmt::CompiledFallbackReason::Unknown;
 };
 
+struct CompiledCommandBarrierRange {
+  UINT record_index = 0;
+  UINT first_barrier = 0;
+  UINT barrier_count = 0;
+  std::uint64_t epoch = 0;
+};
+
+struct CompiledCommandResourceStateDelta {
+  Com<ID3D12Resource> resource;
+  UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  D3D12_RESOURCE_STATES import_state = D3D12_RESOURCE_STATE_COMMON;
+  D3D12_RESOURCE_STATES export_state = D3D12_RESOURCE_STATE_COMMON;
+  std::uint64_t first_epoch = 0;
+  std::uint64_t last_epoch = 0;
+};
+
+struct CompiledCommandAccessSummary {
+  CompiledImmutableVector<CompiledCommandBarrierRange> barrier_ranges;
+  CompiledImmutableVector<StoredResourceBarrier> barriers;
+  CompiledImmutableVector<CompiledCommandResourceStateDelta>
+      resource_state_deltas;
+  std::uint64_t final_barrier_epoch = 0;
+};
+
 struct CompiledCommandTestTelemetry {
   std::atomic<UINT> replayed_graphics_packets = 0;
   std::atomic<UINT> replayed_compute_packets = 0;
@@ -530,14 +882,26 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> submission_prepare_failures = 0;
   std::atomic<UINT> submitted_descriptor_snapshots = 0;
   std::atomic<UINT> submitted_descriptor_entries = 0;
+  std::atomic<UINT> submitted_unique_descriptor_snapshots = 0;
+  std::atomic<UINT> submitted_unique_descriptor_records = 0;
+  std::atomic<UINT> submitted_descriptor_record_reuses = 0;
+  std::atomic<UINT> submitted_generation_shares = 0;
+  std::atomic<UINT> submitted_generation_deep_copies = 0;
 };
 
 struct CompiledCommandList {
+  std::uint64_t generation = 0;
   UINT record_count = 0;
-  WMT::Reference<WMT::Buffer> native_root_base_buffer;
-  std::vector<CompiledCommandSegment> segments;
-  std::vector<CompiledGraphicsPacket> graphics_packets;
-  std::vector<CompiledComputePacket> compute_packets;
+  CompiledImmutableVector<CompiledCommandSegment> segments;
+  CompiledImmutableVector<CompiledGraphicsPacket> graphics_packets;
+  CompiledImmutableVector<CompiledComputePacket> compute_packets;
+  CompiledCommandAccessSummary access_summary;
+  UINT unexpected_container_growths = 0;
+  UINT storage_allocation_events = 0;
+  UINT node_storage_allocation_events = 0;
+  UINT state_storage_allocation_events = 0;
+  UINT access_storage_allocation_events = 0;
+  UINT immutable_state_reuses = 0;
   dxmt::d3d12::test::ExecutionPathMode test_path_mode =
       dxmt::d3d12::test::ExecutionPathMode::Auto;
   UINT test_work_record_count = 0;
@@ -546,14 +910,42 @@ struct CompiledCommandList {
   std::shared_ptr<CompiledCommandTestTelemetry> test_telemetry;
 };
 
+struct SubmittedCompiledGraphicsPacket {
+  std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
+      root_tables;
+  CompiledNativeStageBinding native_vertex;
+  CompiledNativeStageBinding native_pixel;
+  CompiledCommandFallbackReason prepare_reason =
+      CompiledCommandFallbackReason::None;
+};
+
+struct SubmittedCompiledComputePacket {
+  std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
+      root_tables;
+  CompiledNativeStageBinding native_compute;
+  CompiledCommandFallbackReason prepare_reason =
+      CompiledCommandFallbackReason::None;
+};
+
+// Per-Execute overlay. The Close generation remains immutable and shared;
+// only descriptor-table materialization and backend generation state that
+// must be frozen at Execute lives here.
+struct SubmittedCompiledCommandListPlan {
+  std::shared_ptr<const CompiledCommandList> generation;
+  WMT::Reference<WMT::Buffer> native_root_base_buffer;
+  std::vector<SubmittedCompiledGraphicsPacket> graphics_packets;
+  std::vector<SubmittedCompiledComputePacket> compute_packets;
+};
+
 const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind);
 const char *CompiledCommandFallbackReasonName(
     CompiledCommandFallbackReason reason);
 dxmt::CompiledFallbackReason
 CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason);
 
-void PrepareSubmittedCompiledCommandList(CompiledCommandList &compiled,
-                                         WMT::Device device);
+std::shared_ptr<SubmittedCompiledCommandListPlan>
+PrepareSubmittedCompiledCommandList(
+    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device);
 
 struct SubmittedCommandAllocatorUse {
   Com<CommandAllocatorObject, false> allocator;
@@ -567,7 +959,8 @@ public:
   virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual bool IsClosed() const = 0;
   virtual D3D12_COMMAND_LIST_TYPE GetCommandListType() const = 0;
-  virtual const std::vector<CommandRecord> &GetCommandRecords() const = 0;
+  virtual std::shared_ptr<const std::vector<CommandRecord>>
+  GetCommandRecordGeneration() const = 0;
   virtual std::shared_ptr<const CompiledCommandList> GetCompiledCommands()
       const = 0;
   virtual void SetApitraceLifecycleRecordingEnabled(bool enabled) = 0;

@@ -49,6 +49,7 @@ struct ExecutionPathConfig {
 struct ExecutionPathStats {
   std::uint32_t struct_size = sizeof(ExecutionPathStats);
   ExecutionPathMode mode = ExecutionPathMode::Auto;
+  std::uint64_t command_list_generation = 0;
   std::uint32_t record_count = 0;
   std::uint32_t work_record_count = 0;
   std::uint32_t compiled_work_record_count = 0;
@@ -75,6 +76,22 @@ struct ExecutionPathStats {
   std::uint32_t submission_prepare_failures = 0;
   std::uint32_t submitted_descriptor_snapshots = 0;
   std::uint32_t submitted_descriptor_entries = 0;
+  std::uint32_t submitted_unique_descriptor_snapshots = 0;
+  std::uint32_t submitted_unique_descriptor_records = 0;
+  std::uint32_t submitted_descriptor_record_reuses = 0;
+  std::uint32_t submitted_generation_shares = 0;
+  std::uint32_t submitted_generation_deep_copies = 0;
+  std::uint32_t unexpected_container_growths = 0;
+  std::uint32_t storage_allocation_events = 0;
+  std::uint32_t node_storage_allocation_events = 0;
+  std::uint32_t state_storage_allocation_events = 0;
+  std::uint32_t access_storage_allocation_events = 0;
+  std::uint32_t immutable_state_reuses = 0;
+  std::uint32_t state_delta_packets = 0;
+  std::uint32_t zero_state_delta_packets = 0;
+  std::uint32_t compiled_barrier_ranges = 0;
+  std::uint32_t compiled_barriers = 0;
+  std::uint32_t compiled_resource_state_deltas = 0;
   // segment_count always reports the complete count. traced_segment_count is
   // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
   // builder order and make N/F boundary topology directly testable.

@@ -1401,10 +1401,10 @@ D3D12DiagMappedAllocationBytes(BufferAllocation *allocation,
   return base + offset;
 }
 
-static void
-D3D12DiagLogCompiledTargetInputs(const CompiledGraphicsPacket &packet,
-                                 const PipelineState &pipeline,
-                                 uint64_t frame, uint64_t record_serial) {
+static void D3D12DiagLogCompiledTargetInputs(
+    const CompiledGraphicsPacket &packet,
+    const SubmittedCompiledGraphicsPacket &prepared,
+    const PipelineState &pipeline, uint64_t frame, uint64_t record_serial) {
   const auto &key = pipeline.GetShaderCacheKey();
   if (!D3D12DiagRootCauseTargetMatches(key))
     return;
@@ -1441,7 +1441,9 @@ D3D12DiagLogCompiledTargetInputs(const CompiledGraphicsPacket &packet,
                                             ? packet.draw_indexed->instance_count
                                             : 0);
 
-  for (const auto &table : packet.root_tables) {
+  if (!prepared.root_tables)
+    return;
+  for (const auto &table : *prepared.root_tables) {
     const auto current_generation =
         table.mirror ? table.mirror->backendResourceTableGeneration() : 0;
     WARN_FILE_ONLY(
@@ -1494,8 +1496,8 @@ D3D12DiagLogCompiledTargetInputs(const CompiledGraphicsPacket &packet,
         " resourceCount=", binding.resource_root_base_count,
         " resourceBases=", D3D12DiagRootBaseWords(binding.resource_root_bases));
   };
-  log_native_stage("vertex", packet.native_vertex);
-  log_native_stage("pixel", packet.native_pixel);
+  log_native_stage("vertex", prepared.native_vertex);
+  log_native_stage("pixel", prepared.native_pixel);
 
   if (graphics) {
     for (size_t i = 0; i < graphics->input_elements.size(); i++) {
@@ -4258,7 +4260,6 @@ struct CommandQueueResourceStates {
 
   IMTLD3D12Device *device_key = nullptr;
   std::unordered_map<ID3D12Resource *, ReplayResourceStateEntry> resources;
-  std::mutex mutex;
   std::mutex dxmt_queue_mutex;
 };
 
@@ -4926,7 +4927,6 @@ public:
              " pendingOps=", PendingOperationCountForDiag());
       }
     }
-
     dxmt::perf::recordExecuteTime(
         perf_stats, dxmt::perf::ExecuteTimeBucket::Validate,
         clock::now() - perf_mark);
@@ -4941,25 +4941,57 @@ public:
 
     PendingOperation op;
     op.type = PendingOperationType::Execute;
+    // One Execute submission has one descriptor freeze boundary. Sharing the
+    // immutable record store across command lists captures a slot/version only
+    // once even when several lists bind the same heap window.
+    auto submitted_descriptor_records =
+        std::make_shared<SubmittedDescriptorRecordStore>();
+    auto submitted_native_descriptor_spans =
+        std::make_shared<SubmittedNativeDescriptorSpanStore>();
+    submitted_native_descriptor_spans->spans.reserve(4096);
+    submitted_descriptor_records->records.reserve(4096);
+    submitted_descriptor_records->reserveHeapRecords(4096);
     {
       dxmt::perf::ScopedCodeTimer phase_timer(
           dxmt::PerfCodePath::QueueExecuteCollect);
       for (auto *state : validated_lists) {
         if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
-          op.command_records.emplace_back(state->GetCommandRecords());
+          op.command_records.emplace_back(state->GetCommandRecordGeneration());
           auto compiled = state->GetCompiledCommands();
           if (compiled) {
-            auto submitted = std::make_shared<CompiledCommandList>(*compiled);
-            PrepareSubmittedCompiledCommandList(*submitted,
-                                                device_->GetMTLDevice());
-            compiled = std::move(submitted);
+            if (compiled->test_telemetry) {
+              compiled->test_telemetry->submitted_generation_shares.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
+            {
+              dxmt::perf::ScopedCodeTimer prepare_timer(
+                  dxmt::PerfCodePath::QueueExecutePreparePlan);
+              op.submitted_command_lists.emplace_back(
+                  PrepareSubmittedCompiledCommandList(
+                      compiled, device_->GetMTLDevice()));
+            }
+          } else {
+            op.submitted_command_lists.emplace_back(nullptr);
           }
-          op.compiled_command_lists.emplace_back(compiled);
-          op.compiled_descriptor_snapshots.emplace_back(
-              compiled ? CaptureSubmittedDescriptorSnapshots(*compiled)
-                       : CompiledCommandDescriptorSnapshots{});
+          {
+            dxmt::perf::ScopedCodeTimer capture_timer(
+                dxmt::PerfCodePath::QueueExecuteCaptureDescriptors);
+            op.compiled_descriptor_snapshots.emplace_back(
+                compiled ? CaptureSubmittedDescriptorSnapshots(
+                               *compiled, submitted_descriptor_records,
+                               submitted_native_descriptor_spans)
+                         : CompiledCommandDescriptorSnapshots{});
+          }
         }
       }
+    }
+    if (perf_stats) {
+      perf_stats->frame_submitted_descriptor_span_lookups +=
+          submitted_native_descriptor_spans->lookup_count;
+      perf_stats->frame_submitted_descriptor_unique_spans +=
+          submitted_native_descriptor_spans->spans.size();
+      perf_stats->frame_submitted_descriptor_span_reuses +=
+          submitted_native_descriptor_spans->reuse_count;
     }
 
     dxmt::perf::recordExecuteTime(
@@ -6082,6 +6114,103 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS address = 0;
   };
 
+  struct SubmittedDescriptorRecordKey {
+    DescriptorHeapMirror *mirror = nullptr;
+    UINT heap_index = 0;
+    dxmt::DescriptorSlotVersion version = {};
+
+    bool operator==(const SubmittedDescriptorRecordKey &) const = default;
+  };
+
+  struct SubmittedDescriptorRecordKeyHash {
+    size_t operator()(const SubmittedDescriptorRecordKey &key) const {
+      auto hash = std::hash<DescriptorHeapMirror *>{}(key.mirror);
+      auto mix = [&](uint64_t value) {
+        hash ^= std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ull +
+                (hash << 6) + (hash >> 2);
+      };
+      mix(key.heap_index);
+      mix(key.version.epoch);
+      mix(key.version.sequence);
+      return hash;
+    }
+  };
+
+  // A submission freezes each shader-visible heap slot once. Snapshot entries
+  // retain only an index into this store, avoiding thousands of repeated COM
+  // references and full DescriptorRecord copies for adjacent packets that use
+  // the same slot/version.
+  struct SubmittedDescriptorRecordStore {
+    struct HeapRecordSlot {
+      SubmittedDescriptorRecordKey key = {};
+      uint32_t index_plus_one = 0;
+    };
+
+    void reserveHeapRecords(size_t count) {
+      size_t capacity = 16;
+      while (capacity < count * 2)
+        capacity *= 2;
+      if (capacity <= heap_record_slots.size())
+        return;
+      rehashHeapRecords(capacity);
+    }
+
+    uint32_t capture(const DescriptorRecord &record) {
+      capture_count++;
+      if (record.mirror) {
+        const SubmittedDescriptorRecordKey key = {
+            record.mirror, record.heap_index, record.slot_version};
+        if (heap_record_slots.empty() ||
+            (heap_record_count + 1) * 2 > heap_record_slots.size())
+          reserveHeapRecords(std::max<size_t>(16, heap_record_count + 1));
+        auto &slot = findHeapRecordSlot(key);
+        if (slot.index_plus_one) {
+          reuse_count++;
+          return slot.index_plus_one - 1;
+        }
+        const auto index = static_cast<uint32_t>(records.size());
+        records.push_back(record);
+        slot.key = key;
+        slot.index_plus_one = index + 1;
+        heap_record_count++;
+        return index;
+      }
+      const auto index = static_cast<uint32_t>(records.size());
+      records.push_back(record);
+      return index;
+    }
+
+  private:
+    HeapRecordSlot &findHeapRecordSlot(
+        const SubmittedDescriptorRecordKey &key) {
+      const auto mask = heap_record_slots.size() - 1;
+      auto index = SubmittedDescriptorRecordKeyHash{}(key) & mask;
+      while (heap_record_slots[index].index_plus_one &&
+             !(heap_record_slots[index].key == key))
+        index = (index + 1) & mask;
+      return heap_record_slots[index];
+    }
+
+    void rehashHeapRecords(size_t capacity) {
+      std::vector<HeapRecordSlot> old = std::move(heap_record_slots);
+      heap_record_slots.clear();
+      heap_record_slots.resize(capacity);
+      for (const auto &slot : old) {
+        if (!slot.index_plus_one)
+          continue;
+        findHeapRecordSlot(slot.key) = slot;
+      }
+    }
+
+  public:
+
+    std::vector<DescriptorRecord> records;
+    std::vector<HeapRecordSlot> heap_record_slots;
+    uint32_t heap_record_count = 0;
+    uint32_t capture_count = 0;
+    uint32_t reuse_count = 0;
+  };
+
   struct GraphicsBindingSnapshotEntry {
     enum class Kind : uint8_t { Descriptor, RootConstants };
 
@@ -6098,8 +6227,8 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS debug_address = 0;
     const char *debug_kind = nullptr;
     bool has_descriptor = false;
-    DescriptorRecord descriptor = {};
-    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
+    uint32_t descriptor_index = UINT32_MAX;
+    const DXMT12_MTL4_SHADER_ARGUMENT *argument = nullptr;
     std::vector<UINT> constants;
     UINT constant_count = 0;
   };
@@ -6121,22 +6250,22 @@ private:
     D3D12_VERTEX_BUFFER_VIEW view = {};
   };
 
+  struct GraphicsBindingSnapshotLegacyIdentity {
+    RootSignature *graphics_root_signature_impl = nullptr;
+    Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
+    Com<ID3D12DescriptorHeap> sampler_heap;
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 64> graphics_tables = {};
+    std::array<ReplayRootConstantsSlot, 64> graphics_root_constants = {};
+    std::array<ReplayRootDescriptorSlot, 64> graphics_cbv_roots = {};
+    std::array<ReplayRootDescriptorSlot, 64> graphics_srv_roots = {};
+    std::array<ReplayRootDescriptorSlot, 64> graphics_uav_roots = {};
+    std::array<GraphicsVertexBufferBindingIdentity, 32> vertex_buffer_views =
+        {};
+  };
+
   struct NativeStageBindingToken {
     std::vector<uint32_t> cbuffer_root_bases;
     std::vector<uint32_t> resource_root_bases;
-  };
-
-  struct CompiledDescriptorTableIdentity {
-    UINT root_parameter_index = 0;
-    D3D12_DESCRIPTOR_HEAP_TYPE heap_type =
-        D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
-    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor = {};
-
-    bool operator==(const CompiledDescriptorTableIdentity &other) const {
-      return root_parameter_index == other.root_parameter_index &&
-             heap_type == other.heap_type &&
-             base_descriptor.ptr == other.base_descriptor.ptr;
-    }
   };
 
   struct DescriptorJournalSnapshotToken {
@@ -6144,28 +6273,45 @@ private:
     uint64_t cursor = 0;
     std::vector<uint32_t> used_slots;
     bool valid = true;
+    bool cursor_captured = false;
   };
 
+  struct DescriptorTableBindingRecipe;
+
   struct GraphicsBindingSnapshot {
+    GraphicsBindingSnapshot()
+        : descriptor_records(
+              std::make_shared<SubmittedDescriptorRecordStore>()) {}
+
+    explicit GraphicsBindingSnapshot(
+        std::shared_ptr<SubmittedDescriptorRecordStore> records)
+        : descriptor_records(
+              records ? std::move(records)
+                      : std::make_shared<SubmittedDescriptorRecordStore>()) {}
+
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
     Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
     Com<ID3D12DescriptorHeap> sampler_heap;
     RootSignature *root_signature_impl = nullptr;
     RootSignature *graphics_root_signature_impl = nullptr;
-    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 64> graphics_tables = {};
-    std::vector<GraphicsBindingSnapshotEntry> entries;
+    std::shared_ptr<SubmittedDescriptorRecordStore> descriptor_records;
+    CompiledImmutableVector<GraphicsBindingSnapshotEntry> entries;
+    // Compiled descriptor-table packets need the immutable recipe metadata plus
+    // one frozen record index per reflected descriptor. Keeping those two
+    // arrays separate avoids rebuilding the much larger generic entry object
+    // for every draw while preserving the exact submitted descriptor values.
+    const DescriptorTableBindingRecipe *native_descriptor_recipe = nullptr;
+    std::vector<uint32_t> native_descriptor_indices;
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
     uint64_t content_fingerprint = 0;
     uint64_t resource_access_fingerprint = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
-    std::array<ReplayRootConstantsSlot, 64> graphics_root_constants = {};
-    std::array<ReplayRootDescriptorSlot, 64> graphics_cbv_roots = {};
-    std::array<ReplayRootDescriptorSlot, 64> graphics_srv_roots = {};
-    std::array<ReplayRootDescriptorSlot, 64> graphics_uav_roots = {};
-    std::array<GraphicsVertexBufferBindingIdentity, 32> vertex_buffer_views =
-        {};
+    // The interpreted replay cache needs value-by-value identity matching.
+    // Submitted compiled packets instead carry immutable store identities, so
+    // avoid constructing several kilobytes of legacy arrays for every draw.
+    std::unique_ptr<GraphicsBindingSnapshotLegacyIdentity> legacy_identity;
     // Bindless-mirror snapshot replay rebuilds root offsets and compact mirror
     // windows from captured descriptors because deferred draws no longer have
     // access to the live ReplayState.
@@ -6174,15 +6320,60 @@ private:
     NativeStageBindingToken native_vertex;
     NativeStageBindingToken native_pixel;
     bool compiled_compute = false;
-    std::vector<CompiledDescriptorTableIdentity> compiled_tables;
     // Full packet binding identity (tables + root CBV/SRV/UAV + root
     // constants). Used to prevent reuse across draws that share table bases
     // but differ in root descriptor addresses or constants.
     uint64_t compiled_binding_identity_hash = 0;
+    const void *compiled_root_tables_identity = nullptr;
+    const void *compiled_root_descriptors_identity = nullptr;
+    const void *compiled_root_constants_identity = nullptr;
+    CompiledImmutableVector<CompiledCommandRootDescriptorTable>
+        compiled_root_tables;
     std::array<DescriptorJournalSnapshotToken, 2> descriptor_journals = {};
     AllocatedArgumentBufferSlice bindless_root_offsets_vertex;
     AllocatedArgumentBufferSlice bindless_root_offsets_pixel;
   };
+
+  struct SubmittedBindingSnapshotArena {
+    std::vector<GraphicsBindingSnapshot> snapshots;
+  };
+
+  static const DescriptorRecord &SnapshotDescriptor(
+      const GraphicsBindingSnapshot &snapshot,
+      const GraphicsBindingSnapshotEntry &entry) {
+    assert(snapshot.descriptor_records);
+    assert(entry.descriptor_index < snapshot.descriptor_records->records.size());
+    return snapshot.descriptor_records->records[entry.descriptor_index];
+  }
+
+  static const DescriptorRecord &SnapshotNativeDescriptor(
+      const GraphicsBindingSnapshot &snapshot, size_t index) {
+    assert(index < snapshot.native_descriptor_indices.size());
+    const auto descriptor_index = snapshot.native_descriptor_indices[index];
+    assert(descriptor_index != UINT32_MAX);
+    assert(snapshot.descriptor_records);
+    assert(descriptor_index < snapshot.descriptor_records->records.size());
+    return snapshot.descriptor_records->records[descriptor_index];
+  }
+
+  template <typename Fn>
+  static void ForEachCompiledDescriptorTableEntry(
+      const GraphicsBindingSnapshot &snapshot, Fn &&fn) {
+    if (!snapshot.native_descriptor_recipe)
+      return;
+    const auto &entries = snapshot.native_descriptor_recipe->entries;
+    assert(entries.size() == snapshot.native_descriptor_indices.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+      if (snapshot.native_descriptor_indices[i] == UINT32_MAX)
+        continue;
+      fn(entries[i], SnapshotNativeDescriptor(snapshot, i));
+    }
+  }
+
+  static size_t SnapshotBindingEntryCount(
+      const GraphicsBindingSnapshot &snapshot) {
+    return snapshot.entries.size() + snapshot.native_descriptor_indices.size();
+  }
 
   struct CompiledCommandDescriptorSnapshots {
     std::vector<std::shared_ptr<GraphicsBindingSnapshot>> graphics;
@@ -6212,6 +6403,64 @@ private:
     uint64_t bindless = 0;
   };
 
+  struct DescriptorTableBindingRecipeEntry {
+    uint16_t root_index = 0;
+    uint16_t range_index = 0;
+    uint16_t stage = 0;
+    uint16_t slot = 0;
+    uint32_t range_offset = 0;
+    uint32_t descriptor_index = 0;
+    uint32_t descriptor_count = 0;
+    uint32_t range_type = 0;
+    uint32_t shader_register = 0;
+    uint32_t register_lower_bound = 0;
+    uint32_t root_offset_key = 0;
+    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
+  };
+
+  struct DescriptorTableBindingRecipe {
+    std::vector<DescriptorTableBindingRecipeEntry> entries;
+  };
+
+  struct SubmittedNativeDescriptorSpanKey {
+    const DescriptorTableBindingRecipe *recipe = nullptr;
+    DescriptorHeap *heap = nullptr;
+    UINT root_index = 0;
+    UINT64 base = 0;
+    uint64_t mirror_cursor = 0;
+
+    bool operator==(const SubmittedNativeDescriptorSpanKey &) const = default;
+  };
+
+  struct SubmittedNativeDescriptorSpanKeyHash {
+    size_t operator()(const SubmittedNativeDescriptorSpanKey &key) const {
+      size_t hash = std::hash<const void *>{}(key.recipe);
+      auto mix = [&](uint64_t value) {
+        hash ^= std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ull +
+                (hash << 6) + (hash >> 2);
+      };
+      mix(reinterpret_cast<uintptr_t>(key.heap));
+      mix(key.root_index);
+      mix(key.base);
+      mix(key.mirror_cursor);
+      return hash;
+    }
+  };
+
+  struct SubmittedNativeDescriptorSpan {
+    std::vector<std::pair<uint32_t, uint32_t>> descriptor_indices;
+    uint64_t content_fingerprint = 0;
+  };
+
+  struct SubmittedNativeDescriptorSpanStore {
+    std::unordered_map<SubmittedNativeDescriptorSpanKey,
+                       SubmittedNativeDescriptorSpan,
+                       SubmittedNativeDescriptorSpanKeyHash>
+        spans;
+    uint64_t lookup_count = 0;
+    uint64_t reuse_count = 0;
+  };
+
   struct CompiledRootConstantsSlot {
     bool valid = false;
     UINT dst_offset = 0;
@@ -6235,7 +6484,8 @@ private:
   struct CompiledDirectGraphicsBindingPayload {
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
-    std::vector<CompiledCommandRootDescriptorTable> root_tables;
+    std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
+        root_tables;
     CompiledCommandInputAssemblerState input_assembler;
     WMT::Reference<WMT::Buffer> native_root_base_buffer;
     CompiledNativeStageBinding native_vertex;
@@ -6576,6 +6826,9 @@ private:
 
   struct CompiledDirectComputeBindingPayload {
     CompiledComputePacket packet;
+    std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
+        root_tables;
+    CompiledNativeStageBinding native_compute;
     CompiledPacketBindingState binding_state;
     CompiledDirectAccessList direct_access;
     WMT::Reference<WMT::Buffer> native_root_base_buffer;
@@ -8435,6 +8688,9 @@ private:
   static bool GraphicsBindingSnapshotMatches(
       const GraphicsBindingSnapshot &snapshot, const ReplayState &state,
       dxmt::DescriptorContentRevision descriptor_content_revision) {
+    if (!snapshot.legacy_identity)
+      return false;
+    const auto &identity = *snapshot.legacy_identity;
     if (snapshot.pipeline_state.ptr() != state.pipeline_state.ptr() ||
         snapshot.root_signature.ptr() != state.graphics_root_signature.ptr() ||
         snapshot.cbv_srv_uav_heap.ptr() != state.cbv_srv_uav_heap.ptr() ||
@@ -8448,7 +8704,7 @@ private:
                                       state.graphics_tables.size())
                                 : 0;
     for (UINT i = 0; i < root_count; ++i) {
-      if (snapshot.graphics_tables[i].ptr != state.graphics_tables[i].ptr)
+      if (identity.graphics_tables[i].ptr != state.graphics_tables[i].ptr)
         return false;
     }
     auto roots_match = [root_count](const auto &identity, const auto &roots) {
@@ -8459,16 +8715,16 @@ private:
       }
       return true;
     };
-    if (!roots_match(snapshot.graphics_cbv_roots,
+    if (!roots_match(identity.graphics_cbv_roots,
                      state.graphics_cbv_roots) ||
-        !roots_match(snapshot.graphics_srv_roots,
+        !roots_match(identity.graphics_srv_roots,
                      state.graphics_srv_roots) ||
-        !roots_match(snapshot.graphics_uav_roots,
+        !roots_match(identity.graphics_uav_roots,
                      state.graphics_uav_roots))
       return false;
     for (UINT i = 0; i < root_count; ++i) {
       const auto &constants = state.graphics_root_constants[i];
-      const auto &captured = snapshot.graphics_root_constants[i];
+      const auto &captured = identity.graphics_root_constants[i];
       if (captured.valid != constants.valid ||
           (constants.valid && captured.values != constants.values))
         return false;
@@ -8476,14 +8732,14 @@ private:
     for (UINT i = 0; i < state.vertex_buffers.size(); ++i) {
       if (!(snapshot.vertex_slot_mask & (1u << i)))
         continue;
-      const auto &identity = snapshot.vertex_buffer_views[i];
+      const auto &vertex_identity = identity.vertex_buffer_views[i];
       const auto &view = state.vertex_buffers[i];
-      if (identity.valid != view.has_value())
+      if (vertex_identity.valid != view.has_value())
         return false;
       if (view &&
-          (identity.view.BufferLocation != view->BufferLocation ||
-           identity.view.SizeInBytes != view->SizeInBytes ||
-           identity.view.StrideInBytes != view->StrideInBytes))
+          (vertex_identity.view.BufferLocation != view->BufferLocation ||
+           vertex_identity.view.SizeInBytes != view->SizeInBytes ||
+           vertex_identity.view.StrideInBytes != view->StrideInBytes))
         return false;
     }
     return true;
@@ -8521,23 +8777,11 @@ private:
                          packet.descriptor_heaps.cbv_srv_uav.ptr()));
     hash = mix(hash,
                reinterpret_cast<uintptr_t>(packet.descriptor_heaps.sampler.ptr()));
-    for (const auto &table : packet.root_tables) {
-      hash = mix(hash, table.root_parameter_index);
-      hash = mix(hash, table.heap_type);
-      hash = mix(hash, table.base_descriptor.ptr);
-    }
-    for (const auto &descriptor : packet.root_descriptors) {
-      hash = mix(hash, descriptor.parameter_type);
-      hash = mix(hash, descriptor.root_parameter_index);
-      hash = mix(hash, descriptor.address);
-    }
-    for (const auto &constants : packet.root_constants) {
-      hash = mix(hash, constants.root_parameter_index);
-      hash = mix(hash, constants.dst_offset);
-      hash = mix(hash, constants.values.size());
-      for (const auto value : constants.values)
-        hash = mix(hash, value);
-    }
+    hash = mix(hash, reinterpret_cast<uintptr_t>(packet.root_tables.identity()));
+    hash = mix(hash,
+               reinterpret_cast<uintptr_t>(packet.root_descriptors.identity()));
+    hash = mix(hash,
+               reinterpret_cast<uintptr_t>(packet.root_constants.identity()));
     return hash;
   }
 
@@ -8553,16 +8797,13 @@ private:
         snapshot.cbv_srv_uav_heap.ptr() !=
             packet.descriptor_heaps.cbv_srv_uav.ptr() ||
         snapshot.sampler_heap.ptr() != packet.descriptor_heaps.sampler.ptr() ||
-        snapshot.compiled_tables.size() != packet.root_tables.size())
+        snapshot.compiled_root_tables_identity !=
+            packet.root_tables.identity() ||
+        snapshot.compiled_root_descriptors_identity !=
+            packet.root_descriptors.identity() ||
+        snapshot.compiled_root_constants_identity !=
+            packet.root_constants.identity())
       return false;
-    for (size_t i = 0; i < packet.root_tables.size(); i++) {
-      const auto &captured = snapshot.compiled_tables[i];
-      const auto &current = packet.root_tables[i];
-      if (captured.root_parameter_index != current.root_parameter_index ||
-          captured.heap_type != current.heap_type ||
-          captured.base_descriptor.ptr != current.base_descriptor.ptr)
-        return false;
-    }
     return true;
   }
 
@@ -8573,6 +8814,8 @@ private:
         continue;
       if (!journal.valid)
         return false;
+      if (journal.mirror->changeJournalCursor() == journal.cursor)
+        continue;
       const auto changes = journal.mirror->changesSince(journal.cursor);
       if (!changes.complete) {
         journal.valid = false;
@@ -8592,26 +8835,6 @@ private:
 
   static void FinalizeCompiledDescriptorSnapshot(
       GraphicsBindingSnapshot &snapshot) {
-    for (const auto &entry : snapshot.entries) {
-      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
-          !entry.has_descriptor || !entry.descriptor.mirror)
-        continue;
-      auto *mirror = entry.descriptor.mirror;
-      DescriptorJournalSnapshotToken *journal = nullptr;
-      for (auto &candidate : snapshot.descriptor_journals) {
-        if (candidate.mirror == mirror) {
-          journal = &candidate;
-          break;
-        }
-        if (!candidate.mirror && !journal)
-          journal = &candidate;
-      }
-      if (!journal)
-        continue;
-      if (!journal->mirror)
-        journal->mirror = mirror;
-      journal->used_slots.push_back(entry.descriptor.heap_index);
-    }
     for (auto &journal : snapshot.descriptor_journals) {
       if (!journal.mirror)
         continue;
@@ -8619,7 +8842,245 @@ private:
       journal.used_slots.erase(
           std::unique(journal.used_slots.begin(), journal.used_slots.end()),
           journal.used_slots.end());
-      journal.cursor = journal.mirror->changeJournalCursor();
+      if (!journal.cursor_captured) {
+        journal.cursor = journal.mirror->changeJournalCursor();
+        journal.cursor_captured = true;
+      }
+    }
+  }
+
+  static void CaptureCompiledDescriptorJournalCursor(
+      GraphicsBindingSnapshot &snapshot, DescriptorHeapMirror *mirror) {
+    if (!mirror)
+      return;
+    for (auto &journal : snapshot.descriptor_journals) {
+      if (journal.mirror == mirror)
+        return;
+      if (!journal.mirror) {
+        journal.mirror = mirror;
+        journal.cursor = mirror->changeJournalCursor();
+        journal.cursor_captured = true;
+        return;
+      }
+    }
+  }
+
+  static void RecordCompiledDescriptorJournalSlot(
+      GraphicsBindingSnapshot &snapshot, const DescriptorRecord &descriptor) {
+    if (!descriptor.mirror)
+      return;
+    for (auto &journal : snapshot.descriptor_journals) {
+      if (journal.mirror == descriptor.mirror) {
+        journal.used_slots.push_back(descriptor.heap_index);
+        return;
+      }
+    }
+  }
+
+  template <typename Packet>
+  void CaptureCompiledDescriptorTableBindings(
+      GraphicsBindingSnapshot &snapshot, const Packet &packet,
+      const DescriptorTableBindingRecipe &recipe,
+      bool descriptor_heaps_locked,
+      SubmittedNativeDescriptorSpanStore *native_span_store = nullptr) {
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_MAX_ROOT_COST> tables = {};
+    for (const auto &table : packet.root_tables) {
+      if (table.root_parameter_index < tables.size())
+        tables[table.root_parameter_index] = table.base_descriptor;
+    }
+    auto *cbv_srv_uav_heap = dynamic_cast<DescriptorHeap *>(
+        packet.descriptor_heaps.cbv_srv_uav.ptr());
+    auto *sampler_heap = dynamic_cast<DescriptorHeap *>(
+        packet.descriptor_heaps.sampler.ptr());
+
+    CaptureCompiledDescriptorJournalCursor(
+        snapshot, cbv_srv_uav_heap ? cbv_srv_uav_heap->GetMirror() : nullptr);
+    CaptureCompiledDescriptorJournalCursor(
+        snapshot, sampler_heap ? sampler_heap->GetMirror() : nullptr);
+
+    if (snapshot.native || snapshot.bindless) {
+      snapshot.native_descriptor_recipe = &recipe;
+      snapshot.native_descriptor_indices.assign(recipe.entries.size(),
+                                                UINT32_MAX);
+      std::array<bool, D3D12_MAX_ROOT_COST> captured_roots = {};
+      for (size_t recipe_index = 0; recipe_index < recipe.entries.size();
+           ++recipe_index) {
+        const auto &first_entry = recipe.entries[recipe_index];
+        if (first_entry.root_index >= captured_roots.size() ||
+            captured_roots[first_entry.root_index])
+          continue;
+        captured_roots[first_entry.root_index] = true;
+        const auto root_index = first_entry.root_index;
+        const auto base = tables[root_index];
+        const auto first_range_type =
+            static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(first_entry.range_type);
+        const auto heap_type = DescriptorHeapTypeForRange(first_range_type);
+        auto *heap = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+                         ? sampler_heap
+                         : cbv_srv_uav_heap;
+        auto *span_mirror = heap ? heap->GetMirror() : nullptr;
+        const SubmittedNativeDescriptorSpanKey span_key = {
+            &recipe, heap, root_index, base.ptr,
+            span_mirror ? span_mirror->changeJournalCursor() : 0};
+
+        SubmittedNativeDescriptorSpan local_span;
+        SubmittedNativeDescriptorSpan *span = nullptr;
+        bool build_span = true;
+        if (native_span_store) {
+          native_span_store->lookup_count++;
+          auto [it, inserted] = native_span_store->spans.try_emplace(span_key);
+          span = &it->second;
+          build_span = inserted;
+          native_span_store->reuse_count += inserted ? 0 : 1;
+        } else {
+          span = &local_span;
+        }
+        if (build_span) {
+          span->content_fingerprint = kGraphicsBindingFingerprintOffset;
+          for (size_t i = recipe_index; i < recipe.entries.size(); ++i) {
+            const auto &entry = recipe.entries[i];
+            if (entry.root_index != root_index)
+              continue;
+            HashGraphicsBindingValue(span->content_fingerprint, entry.stage);
+            HashGraphicsBindingValue(span->content_fingerprint,
+                                     entry.range_type);
+            const DescriptorRecord *descriptor = nullptr;
+            std::optional<DescriptorRecord> descriptor_copy;
+            if (base.ptr && descriptor_heaps_locked) {
+              descriptor = GetBoundDescriptorRecordInRangeFromLockedHeap(
+                  heap, base, entry.range_offset, entry.descriptor_index,
+                  entry.descriptor_count, heap_type);
+            } else if (base.ptr) {
+              descriptor_copy = GetBoundDescriptorRecordInRangeFromHeap(
+                  heap, base, entry.range_offset, entry.descriptor_index,
+                  entry.descriptor_count, heap_type);
+              descriptor = descriptor_copy ? &*descriptor_copy : nullptr;
+            }
+            HashGraphicsBindingValue(span->content_fingerprint,
+                                     descriptor != nullptr);
+            if (!descriptor)
+              continue;
+            const auto descriptor_index =
+                snapshot.descriptor_records->capture(*descriptor);
+            span->descriptor_indices.emplace_back(
+                static_cast<uint32_t>(i), descriptor_index);
+            HashGraphicsBindingDescriptor(span->content_fingerprint,
+                                          *descriptor);
+          }
+        }
+        for (const auto &[index, descriptor_index] : span->descriptor_indices)
+          snapshot.native_descriptor_indices[index] = descriptor_index;
+        HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                 root_index);
+        HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                 base.ptr);
+        HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                 span->content_fingerprint);
+      }
+      return;
+    } else {
+      snapshot.entries.reserve(recipe.entries.size());
+    }
+    for (size_t recipe_index = 0; recipe_index < recipe.entries.size();
+         ++recipe_index) {
+      const auto &recipe_entry = recipe.entries[recipe_index];
+      if (recipe_entry.root_index >= tables.size()) {
+        if (snapshot.native) {
+          snapshot.native_descriptor_indices.push_back(UINT32_MAX);
+          HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                   recipe_entry.stage);
+          HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                   recipe_entry.range_type);
+          HashGraphicsBindingValue(snapshot.resource_access_fingerprint, false);
+        }
+        continue;
+      }
+      const auto base = tables[recipe_entry.root_index];
+      if (!base.ptr) {
+        if (snapshot.native) {
+          snapshot.native_descriptor_indices.push_back(UINT32_MAX);
+          HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                   recipe_entry.stage);
+          HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                   recipe_entry.range_type);
+          HashGraphicsBindingValue(snapshot.resource_access_fingerprint, false);
+        }
+        continue;
+      }
+
+      const auto range_type =
+          static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(recipe_entry.range_type);
+      GraphicsBindingSnapshotEntry entry = {};
+      entry.kind = GraphicsBindingSnapshotEntry::Kind::Descriptor;
+      entry.stage = static_cast<PipelineStage>(recipe_entry.stage);
+      entry.range_type = range_type;
+      entry.root_index = recipe_entry.root_index;
+      entry.slot = recipe_entry.slot;
+      entry.shader_register = recipe_entry.shader_register;
+      entry.register_lower_bound = recipe_entry.register_lower_bound;
+      entry.root_offset_key = recipe_entry.root_offset_key;
+      entry.argument = &recipe_entry.argument;
+      entry.debug_kind = DescriptorRangeTypeName(range_type);
+
+      const auto heap_type = DescriptorHeapTypeForRange(range_type);
+      auto *heap = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+                       ? sampler_heap
+                       : cbv_srv_uav_heap;
+      std::optional<DescriptorRecord> descriptor_copy;
+      const DescriptorRecord *descriptor = nullptr;
+      if (descriptor_heaps_locked) {
+        descriptor = GetBoundDescriptorRecordInRangeFromLockedHeap(
+            heap, base, recipe_entry.range_offset,
+            recipe_entry.descriptor_index, recipe_entry.descriptor_count,
+            heap_type);
+      } else {
+        descriptor_copy = GetBoundDescriptorRecordInRangeFromHeap(
+            heap, base, recipe_entry.range_offset,
+            recipe_entry.descriptor_index, recipe_entry.descriptor_count,
+            heap_type);
+        descriptor = descriptor_copy ? &*descriptor_copy : nullptr;
+      }
+      if (descriptor) {
+        entry.has_descriptor = true;
+        entry.descriptor_index = snapshot.descriptor_records->capture(*descriptor);
+        entry.debug_size = DescriptorRecordSizeBytes(*descriptor);
+        RecordCompiledDescriptorJournalSlot(snapshot, *descriptor);
+      }
+
+      if (snapshot.native) {
+        snapshot.native_descriptor_indices.push_back(
+            entry.has_descriptor ? entry.descriptor_index : UINT32_MAX);
+        HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                 recipe_entry.stage);
+        HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                 recipe_entry.range_type);
+        HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
+                                 entry.has_descriptor);
+        if (entry.has_descriptor)
+          HashGraphicsBindingDescriptor(snapshot.resource_access_fingerprint,
+                                        SnapshotNativeDescriptor(
+                                            snapshot, recipe_index));
+        continue;
+      }
+
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.range_type);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.root_index);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.slot);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.shader_register);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.register_lower_bound);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.root_offset_key);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, *entry.argument);
+      HashGraphicsBindingValue(snapshot.content_fingerprint,
+                               entry.has_descriptor);
+      if (entry.has_descriptor)
+        HashGraphicsBindingDescriptor(snapshot.content_fingerprint,
+                                      SnapshotDescriptor(snapshot, entry));
+      snapshot.entries.push_back(std::move(entry));
     }
   }
 
@@ -8628,98 +9089,66 @@ private:
   CaptureCompiledDescriptorBindingSnapshot(const Packet &packet,
                                            PipelineState &pipeline,
                                            RootSignature *root,
-                                           bool compute) {
-    ReplayState replay_state = {};
-    replay_state.pipeline_state = packet.pipeline.pipeline_state;
-    if (compute) {
-      replay_state.compute_root_signature = packet.pipeline.root_signature;
-      replay_state.compute_root_signature_impl = root;
-    } else {
-      replay_state.graphics_root_signature = packet.pipeline.root_signature;
-      replay_state.graphics_root_signature_impl = root;
-    }
-    replay_state.cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
-    replay_state.sampler_heap = packet.descriptor_heaps.sampler;
-
-    for (const auto &table : packet.root_tables) {
-      auto &tables = compute ? replay_state.compute_tables
-                             : replay_state.graphics_tables;
-      if (table.root_parameter_index < tables.size())
-        tables[table.root_parameter_index] = table.base_descriptor;
-    }
-
-    for (const auto &constants : packet.root_constants) {
-      if (constants.root_parameter_index >= ReplayState::kMaxRootParameters)
-        continue;
-      auto &slot = compute
-                       ? replay_state.compute_root_constants
-                             [constants.root_parameter_index]
-                       : replay_state.graphics_root_constants
-                             [constants.root_parameter_index];
-      slot.valid = true;
-      const auto required_size =
-          constants.dst_offset + static_cast<UINT>(constants.values.size());
-      if (slot.values.size() < required_size)
-        slot.values.resize(required_size, 0);
-      if (!constants.values.empty()) {
-        std::copy(constants.values.begin(), constants.values.end(),
-                  slot.values.begin() + constants.dst_offset);
-      }
-    }
-
-    for (const auto &descriptor : packet.root_descriptors) {
-      if (descriptor.root_parameter_index >= ReplayState::kMaxRootParameters)
-        continue;
-      ReplayRootDescriptorSlot *slot = nullptr;
-      if (descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
-        slot = compute ? &replay_state.compute_cbv_roots
-                              [descriptor.root_parameter_index]
-                       : &replay_state.graphics_cbv_roots
-                              [descriptor.root_parameter_index];
-      } else if (descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
-        slot = compute ? &replay_state.compute_srv_roots
-                              [descriptor.root_parameter_index]
-                       : &replay_state.graphics_srv_roots
-                              [descriptor.root_parameter_index];
-      } else if (descriptor.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
-        slot = compute ? &replay_state.compute_uav_roots
-                              [descriptor.root_parameter_index]
-                       : &replay_state.graphics_uav_roots
-                              [descriptor.root_parameter_index];
-      }
-      if (!slot)
-        continue;
-      slot->valid = true;
-      slot->address = descriptor.address;
-    }
-
+                                           bool compute,
+                                           const DescriptorTableBindingRecipe
+                                               *prepared_recipe = nullptr,
+                                           std::shared_ptr<
+                                               SubmittedDescriptorRecordStore>
+                                               descriptor_records = {},
+                                           std::shared_ptr<
+                                               SubmittedBindingSnapshotArena>
+                                               snapshot_arena = {},
+                                           bool descriptor_heaps_locked = false,
+                                           SubmittedNativeDescriptorSpanStore
+                                               *native_span_store = nullptr) {
+    dxmt::perf::ScopedCodeTimer snapshot_build_timer(
+        dxmt::PerfCodePath::QueueCaptureDescriptorSnapshotBuild);
     GraphicsBindingSnapshotCaptureStats capture_stats = {};
-    auto snapshot = std::make_shared<GraphicsBindingSnapshot>();
+    std::shared_ptr<GraphicsBindingSnapshot> snapshot;
+    if (snapshot_arena) {
+      snapshot_arena->snapshots.emplace_back(descriptor_records);
+      snapshot = std::shared_ptr<GraphicsBindingSnapshot>(
+          snapshot_arena, &snapshot_arena->snapshots.back());
+    } else {
+      snapshot = std::make_shared<GraphicsBindingSnapshot>(descriptor_records);
+    }
     snapshot->content_fingerprint = kGraphicsBindingFingerprintOffset;
+    snapshot->resource_access_fingerprint = kGraphicsBindingFingerprintOffset;
     snapshot->pipeline_state = packet.pipeline.pipeline_state;
     snapshot->root_signature = packet.pipeline.root_signature;
     snapshot->root_signature_impl = root;
     snapshot->graphics_root_signature_impl = root;
     snapshot->cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
     snapshot->sampler_heap = packet.descriptor_heaps.sampler;
+    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
+                               snapshot->root_signature.ptr());
+    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
+                               snapshot->pipeline_state.ptr());
     snapshot->native =
         packet.pipeline.metadata.uses_native_descriptor_table_abi;
     snapshot->bindless = !snapshot->native;
     snapshot->compiled_compute = compute;
     snapshot->compiled_binding_identity_hash =
         HashCompiledDescriptorBindingIdentity(packet, compute);
-    snapshot->compiled_tables.reserve(packet.root_tables.size());
-    for (const auto &table : packet.root_tables) {
-      snapshot->compiled_tables.push_back({
-          table.root_parameter_index, table.heap_type, table.base_descriptor});
-    }
-    CaptureDescriptorTableBindings(
-        *snapshot, replay_state, pipeline,
-        GetDescriptorTableBindingRecipe(pipeline, *root, compute), compute);
+    snapshot->compiled_root_tables_identity = packet.root_tables.identity();
+    snapshot->compiled_root_descriptors_identity =
+        packet.root_descriptors.identity();
+    snapshot->compiled_root_constants_identity =
+        packet.root_constants.identity();
+    snapshot->compiled_root_tables = packet.root_tables;
+    const auto *binding_recipe =
+        prepared_recipe
+            ? prepared_recipe
+            : &GetDescriptorTableBindingRecipe(pipeline, *root, compute);
+    snapshot->entries.reserve(
+        6 * (packet.root_constants.size() + packet.root_descriptors.size()));
+    CaptureCompiledDescriptorTableBindings(
+        *snapshot, packet, *binding_recipe,
+        descriptor_heaps_locked, native_span_store);
     // Root CBV/SRV/UAV and 32-bit constants are part of the submitted binding
     // state. Capture them into the same snapshot so encode-time packBindless
     // does not fall back to empty live cbuf_/resview_ slots on the async path.
-    {
+    if (!packet.root_constants.empty() || !packet.root_descriptors.empty()) {
       const auto parameters = root->GetParameters();
       for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
         const auto &parameter = parameters[root_index];
@@ -8728,33 +9157,53 @@ private:
           continue;
         if (parameter.parameter_type ==
             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-          CaptureGraphicsRootConstants(*snapshot, replay_state, pipeline,
-                                       root_index, parameter, compute);
+          const CompiledCommandRootConstants *captured = nullptr;
+          for (const auto &constants : packet.root_constants) {
+            if (constants.root_parameter_index == root_index) {
+              captured = &constants;
+              break;
+            }
+          }
+          CaptureGraphicsRootConstantsValues(
+              *snapshot, pipeline, root_index, parameter,
+              captured ? captured->values.span() : std::span<const UINT>{},
+              captured ? captured->dst_offset : 0, compute);
           capture_stats.root_constants++;
-        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
-          CaptureGraphicsRootDescriptor(
-              *snapshot, replay_state, pipeline, root_index, parameter,
-              DescriptorRecordType::ConstantBufferView, compute);
-          capture_stats.root_descriptors++;
-        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
-          CaptureGraphicsRootDescriptor(
-              *snapshot, replay_state, pipeline, root_index, parameter,
-              DescriptorRecordType::ShaderResourceView, compute);
-          capture_stats.root_descriptors++;
-        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
-          CaptureGraphicsRootDescriptor(
-              *snapshot, replay_state, pipeline, root_index, parameter,
-              DescriptorRecordType::UnorderedAccessView, compute);
+        } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                   parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV ||
+                   parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+          const CompiledCommandRootDescriptor *captured = nullptr;
+          for (const auto &descriptor : packet.root_descriptors) {
+            if (descriptor.root_parameter_index == root_index &&
+                descriptor.parameter_type == parameter.parameter_type) {
+              captured = &descriptor;
+              break;
+            }
+          }
+          if (!captured)
+            continue;
+          const auto type =
+              parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV
+                  ? DescriptorRecordType::ConstantBufferView
+                  : parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
+                        ? DescriptorRecordType::ShaderResourceView
+                        : DescriptorRecordType::UnorderedAccessView;
+          CaptureGraphicsRootDescriptorAddress(
+              *snapshot, pipeline, root_index, parameter, type,
+              captured->address, compute);
           capture_stats.root_descriptors++;
         }
       }
     }
-    FinalizeCompiledDescriptorSnapshot(*snapshot);
-    snapshot->resource_access_fingerprint = kGraphicsBindingFingerprintOffset;
-    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
-                               snapshot->root_signature.ptr());
-    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
-                               snapshot->pipeline_state.ptr());
+    {
+      dxmt::perf::ScopedCodeTimer finalize_timer(
+          dxmt::PerfCodePath::QueueCaptureDescriptorJournalFinalize);
+      FinalizeCompiledDescriptorSnapshot(*snapshot);
+    }
+    // Resource dependency identity is based on frozen descriptor contents,
+    // not the packet/snapshot address. Games commonly rotate descriptor-table
+    // handles while binding the same resources; pointer identity turned every
+    // such draw into a cache miss and repeated the full hazard walk.
     for (const auto &entry : snapshot->entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor)
         continue;
@@ -8766,10 +9215,14 @@ private:
                                entry.has_descriptor);
       if (entry.has_descriptor)
         HashGraphicsBindingDescriptor(snapshot->resource_access_fingerprint,
-                                      entry.descriptor);
+                                      SnapshotDescriptor(*snapshot, entry));
     }
-    capture_stats.entries = snapshot->entries.size();
-    capture_stats.descriptors = snapshot->entries.size();
+    capture_stats.entries = SnapshotBindingEntryCount(*snapshot);
+    capture_stats.descriptors = snapshot->entries.size() +
+                                snapshot->native_descriptor_indices.size();
+    for (const auto descriptor_index : snapshot->native_descriptor_indices)
+      capture_stats.missing_descriptors +=
+          descriptor_index == UINT32_MAX ? 1 : 0;
     for (const auto &entry : snapshot->entries)
       capture_stats.missing_descriptors += entry.has_descriptor ? 0 : 1;
     capture_stats.bindless = 1;
@@ -8781,23 +9234,40 @@ private:
   std::shared_ptr<GraphicsBindingSnapshot>
   GetOrCaptureCompiledDescriptorBindingSnapshot(
       ReplayState &state, const Packet &packet, PipelineState &pipeline,
-      RootSignature *root, bool compute) {
-    const auto key = HashCompiledDescriptorBindingIdentity(packet, compute);
-    const auto [begin, end] = state.compiled_binding_snapshots.equal_range(key);
-    for (auto it = begin; it != end; ++it) {
-      if (CompiledDescriptorBindingIdentityMatches(
-              *it->second, packet, compute) &&
-          CompiledDescriptorSnapshotStillCurrent(*it->second))
-        return it->second;
+      RootSignature *root, bool compute,
+      const DescriptorTableBindingRecipe *prepared_recipe = nullptr,
+      std::shared_ptr<SubmittedDescriptorRecordStore> descriptor_records = {},
+      std::shared_ptr<SubmittedBindingSnapshotArena> snapshot_arena = {},
+      bool validate_journal = true,
+      bool descriptor_heaps_locked = false,
+      SubmittedNativeDescriptorSpanStore *native_span_store = nullptr) {
+    uint64_t key = 0;
+    {
+      dxmt::perf::ScopedCodeTimer cache_timer(
+          dxmt::PerfCodePath::QueueCaptureDescriptorCacheLookup);
+      key = HashCompiledDescriptorBindingIdentity(packet, compute);
+      const auto [begin, end] =
+          state.compiled_binding_snapshots.equal_range(key);
+      for (auto it = begin; it != end; ++it) {
+        if (CompiledDescriptorBindingIdentityMatches(
+                *it->second, packet, compute) &&
+            (!validate_journal ||
+             CompiledDescriptorSnapshotStillCurrent(*it->second)))
+          return it->second;
+      }
     }
     auto snapshot = CaptureCompiledDescriptorBindingSnapshot(
-        packet, pipeline, root, compute);
+        packet, pipeline, root, compute, prepared_recipe,
+        std::move(descriptor_records), std::move(snapshot_arena),
+        descriptor_heaps_locked, native_span_store);
     state.compiled_binding_snapshots.emplace(key, snapshot);
     return snapshot;
   }
 
   CompiledCommandDescriptorSnapshots CaptureSubmittedDescriptorSnapshots(
-      const CompiledCommandList &compiled) {
+      const CompiledCommandList &compiled,
+      std::shared_ptr<SubmittedDescriptorRecordStore> descriptor_records = {},
+      std::shared_ptr<SubmittedNativeDescriptorSpanStore> native_span_store = {}) {
     CompiledCommandDescriptorSnapshots snapshots;
     snapshots.graphics.resize(compiled.graphics_packets.size());
     snapshots.compute.resize(compiled.compute_packets.size());
@@ -8807,8 +9277,132 @@ private:
     // Capture only shader-reflected slots and reuse identical packet bindings
     // through the bounded heap journal; Metal encoding may happen much later.
     ReplayState cache = {};
+    if (!descriptor_records)
+      descriptor_records = std::make_shared<SubmittedDescriptorRecordStore>();
+    if (!native_span_store)
+      native_span_store =
+          std::make_shared<SubmittedNativeDescriptorSpanStore>();
+    const auto records_before = descriptor_records->records.size();
+    const auto reuses_before = descriptor_records->reuse_count;
+    auto snapshot_arena = std::make_shared<SubmittedBindingSnapshotArena>();
+    snapshot_arena->snapshots.reserve(compiled.graphics_packets.size() +
+                                      compiled.compute_packets.size());
+    std::vector<DescriptorHeapMirror *> submission_mirrors;
+    auto collect_mirrors = [&](const auto &packet) {
+      auto collect_heap = [&](ID3D12DescriptorHeap *heap_object) {
+        auto *heap = dynamic_cast<DescriptorHeap *>(heap_object);
+        auto *mirror = heap ? heap->GetMirror() : nullptr;
+        if (mirror)
+          submission_mirrors.push_back(mirror);
+      };
+      collect_heap(packet.descriptor_heaps.cbv_srv_uav.ptr());
+      collect_heap(packet.descriptor_heaps.sampler.ptr());
+    };
+    for (const auto &packet : compiled.graphics_packets)
+      if (packet.compatibility_reason ==
+          CompiledCommandFallbackReason::None)
+        collect_mirrors(packet);
+    for (const auto &packet : compiled.compute_packets)
+      if (packet.compatibility_reason ==
+          CompiledCommandFallbackReason::None)
+        collect_mirrors(packet);
+    std::sort(submission_mirrors.begin(), submission_mirrors.end());
+    submission_mirrors.erase(
+        std::unique(submission_mirrors.begin(), submission_mirrors.end()),
+        submission_mirrors.end());
+    struct RecipeKey {
+      PipelineState *pipeline = nullptr;
+      RootSignature *root = nullptr;
+      bool compute = false;
+
+      bool operator==(const RecipeKey &other) const {
+        return pipeline == other.pipeline && root == other.root &&
+               compute == other.compute;
+      }
+    };
+    struct RecipeKeyHash {
+      size_t operator()(const RecipeKey &key) const {
+        auto hash = std::hash<PipelineState *>{}(key.pipeline);
+        hash ^= std::hash<RootSignature *>{}(key.root) + 0x9e3779b9u +
+                (hash << 6) + (hash >> 2);
+        hash ^= size_t(key.compute) + 0x9e3779b9u + (hash << 6) +
+                (hash >> 2);
+        return hash;
+      }
+    };
+    std::unordered_map<RecipeKey, const DescriptorTableBindingRecipe *,
+                       RecipeKeyHash>
+        recipe_cache;
+    const auto packet_count = compiled.graphics_packets.size() +
+                              compiled.compute_packets.size();
+    recipe_cache.reserve(std::min<size_t>(packet_count, 128));
+    auto get_recipe = [&](PipelineState &pipeline, RootSignature &root,
+                          bool compute) -> const DescriptorTableBindingRecipe & {
+      const RecipeKey key = {&pipeline, &root, compute};
+      auto it = recipe_cache.find(key);
+      if (it == recipe_cache.end())
+        it = recipe_cache
+                 .emplace(key, &GetDescriptorTableBindingRecipe(
+                                    pipeline, root, compute))
+                 .first;
+      return *it->second;
+    };
+    // Resolve immutable reflection recipes before taking heap locks. The
+    // locks below define the descriptor snapshot boundary only; database/cache
+    // work must not extend the writer-blocking interval.
+    size_t descriptor_capture_capacity = 0;
+    for (const auto &packet : compiled.graphics_packets) {
+      if (packet.compatibility_reason !=
+          CompiledCommandFallbackReason::None)
+        continue;
+      auto *pipeline = packet.pipeline.metadata.pipeline;
+      if (!pipeline)
+        pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
+      auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
+      if (pipeline && root &&
+          (pipeline->UsesBindlessMirror() ||
+           packet.pipeline.metadata.uses_native_descriptor_table_abi))
+        descriptor_capture_capacity +=
+            get_recipe(*pipeline, *root, false).entries.size();
+    }
+    for (const auto &packet : compiled.compute_packets) {
+      if (packet.compatibility_reason !=
+          CompiledCommandFallbackReason::None)
+        continue;
+      auto *pipeline = packet.pipeline.metadata.pipeline;
+      if (!pipeline)
+        pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
+      auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
+      if (pipeline && root &&
+          (pipeline->UsesBindlessMirror() ||
+           packet.pipeline.metadata.uses_native_descriptor_table_abi))
+        descriptor_capture_capacity +=
+            get_recipe(*pipeline, *root, true).entries.size();
+    }
+    cache.compiled_binding_snapshots.reserve(compiled.graphics_packets.size() +
+                                             compiled.compute_packets.size());
+    // Reflection entry count is a safe upper bound but FH4 reuses the same
+    // descriptor slots across many packets. Reserving the full product made
+    // every Execute zero several megabytes of empty hash slots. Start from a
+    // bounded estimate; the store remains lossless and grows if the submission
+    // genuinely contains more unique slot versions.
+    const auto descriptor_unique_estimate = std::min<size_t>(
+        descriptor_capture_capacity, std::max<size_t>(16, packet_count * 4));
+    if (descriptor_records->records.capacity() <
+        descriptor_records->records.size() + descriptor_unique_estimate)
+      descriptor_records->records.reserve(
+          descriptor_records->records.size() + descriptor_unique_estimate);
+    descriptor_records->reserveHeapRecords(
+        descriptor_records->heap_record_count + descriptor_unique_estimate);
+    std::vector<DescriptorHeapMirror::ScopedLock> submission_mirror_locks;
+    submission_mirror_locks.reserve(submission_mirrors.size());
+    for (auto *mirror : submission_mirrors)
+      submission_mirror_locks.emplace_back(mirror->AcquireLock());
     for (size_t i = 0; i < compiled.graphics_packets.size(); ++i) {
       const auto &packet = compiled.graphics_packets[i];
+      if (packet.compatibility_reason !=
+          CompiledCommandFallbackReason::None)
+        continue;
       auto *pipeline = packet.pipeline.metadata.pipeline;
       if (!pipeline)
         pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
@@ -8818,17 +9412,23 @@ private:
            !packet.pipeline.metadata.uses_native_descriptor_table_abi))
         continue;
       snapshots.graphics[i] = GetOrCaptureCompiledDescriptorBindingSnapshot(
-          cache, packet, *pipeline, root, false);
+          cache, packet, *pipeline, root, false,
+          &get_recipe(*pipeline, *root, false), descriptor_records,
+          snapshot_arena, false, true, native_span_store.get());
       if (snapshots.graphics[i] && compiled.test_telemetry) {
         compiled.test_telemetry->submitted_descriptor_snapshots.fetch_add(
             1, std::memory_order_relaxed);
         compiled.test_telemetry->submitted_descriptor_entries.fetch_add(
-            static_cast<UINT>(snapshots.graphics[i]->entries.size()),
+            static_cast<UINT>(
+                SnapshotBindingEntryCount(*snapshots.graphics[i])),
             std::memory_order_relaxed);
       }
     }
     for (size_t i = 0; i < compiled.compute_packets.size(); ++i) {
       const auto &packet = compiled.compute_packets[i];
+      if (packet.compatibility_reason !=
+          CompiledCommandFallbackReason::None)
+        continue;
       auto *pipeline = packet.pipeline.metadata.pipeline;
       if (!pipeline)
         pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
@@ -8838,14 +9438,36 @@ private:
            !packet.pipeline.metadata.uses_native_descriptor_table_abi))
         continue;
       snapshots.compute[i] = GetOrCaptureCompiledDescriptorBindingSnapshot(
-          cache, packet, *pipeline, root, true);
+          cache, packet, *pipeline, root, true,
+          &get_recipe(*pipeline, *root, true), descriptor_records,
+          snapshot_arena, false, true, native_span_store.get());
       if (snapshots.compute[i] && compiled.test_telemetry) {
         compiled.test_telemetry->submitted_descriptor_snapshots.fetch_add(
             1, std::memory_order_relaxed);
         compiled.test_telemetry->submitted_descriptor_entries.fetch_add(
-            static_cast<UINT>(snapshots.compute[i]->entries.size()),
+            static_cast<UINT>(
+                SnapshotBindingEntryCount(*snapshots.compute[i])),
             std::memory_order_relaxed);
       }
+    }
+    if (compiled.test_telemetry) {
+      std::unordered_set<const GraphicsBindingSnapshot *> unique_snapshots;
+      for (const auto &snapshot : snapshots.graphics)
+        if (snapshot)
+          unique_snapshots.insert(snapshot.get());
+      for (const auto &snapshot : snapshots.compute)
+        if (snapshot)
+          unique_snapshots.insert(snapshot.get());
+      compiled.test_telemetry->submitted_unique_descriptor_snapshots.fetch_add(
+          static_cast<UINT>(unique_snapshots.size()),
+          std::memory_order_relaxed);
+      compiled.test_telemetry->submitted_unique_descriptor_records.fetch_add(
+          static_cast<UINT>(descriptor_records->records.size() -
+                            records_before),
+          std::memory_order_relaxed);
+      compiled.test_telemetry->submitted_descriptor_record_reuses.fetch_add(
+          descriptor_records->reuse_count - reuses_before,
+          std::memory_order_relaxed);
     }
     return snapshots;
   }
@@ -8911,6 +9533,20 @@ private:
            std::holds_alternative<RootDescriptorTableRecord>(record.payload) ||
            std::holds_alternative<RootConstantsRecord>(record.payload) ||
            std::holds_alternative<RootDescriptorRecord>(record.payload);
+  }
+
+  static bool IsDeferrableCompiledStateRecord(const CommandRecord &record) {
+    return IsGraphicsStateSetterRecord(record) ||
+           std::holds_alternative<ClearStateRecord>(record.payload) ||
+           std::holds_alternative<RenderTargetsRecord>(record.payload) ||
+           std::holds_alternative<PredicationRecord>(record.payload);
+  }
+
+  static bool FallbackRecordNeedsBindingState(const CommandRecord &record) {
+    return std::holds_alternative<DrawInstancedRecord>(record.payload) ||
+           std::holds_alternative<DrawIndexedInstancedRecord>(record.payload) ||
+           std::holds_alternative<DispatchRecord>(record.payload) ||
+           std::holds_alternative<ExecuteIndirectRecord>(record.payload);
   }
 
   static bool LaterVertexBufferRecordCoversSlot(
@@ -9014,7 +9650,7 @@ private:
   }
 
   void ReplayCommandRecords(const std::vector<CommandRecord> &records,
-                            const CompiledCommandList *compiled,
+                            const SubmittedCompiledCommandListPlan *submitted,
                             const CompiledCommandDescriptorSnapshots
                                 *submitted_descriptor_snapshots,
                             std::vector<Com<ID3D12Resource>> &touched_resources,
@@ -9022,6 +9658,9 @@ private:
                             ResourceAccessBarrierBatch &queue_pending_barriers) {
     auto &queue = device_->GetDXMTDevice().queue();
     auto *chunk = queue.CurrentChunk();
+    const CompiledCommandList *compiled =
+        submitted && submitted->generation ? submitted->generation.get()
+                                            : nullptr;
     ReplayState state = {};
     state.pending_resource_barriers =
         std::move(queue_pending_barriers);
@@ -9207,11 +9846,17 @@ private:
 
     auto queue_compiled_graphics_packet =
         [&](const CompiledGraphicsPacket &packet,
+            const SubmittedCompiledGraphicsPacket &prepared,
             std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot)
             -> CompiledCommandFallbackReason {
-          if (packet.submission_prepare_reason !=
+          if (packet.compatibility_reason !=
               CompiledCommandFallbackReason::None)
-            return packet.submission_prepare_reason;
+            return packet.compatibility_reason;
+          if (prepared.prepare_reason != CompiledCommandFallbackReason::None)
+            return prepared.prepare_reason;
+          if (!prepared.root_tables)
+            return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+          const auto &submitted_root_tables = *prepared.root_tables;
           if (!packet.draw && !packet.draw_indexed)
             return CompiledCommandFallbackReason::UnsupportedCommand;
           if (packet.draw &&
@@ -9241,7 +9886,7 @@ private:
           }
           constexpr const char *descriptor_fault =
               "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT";
-          if (native_packet && !packet.root_tables.empty() &&
+          if (native_packet && !submitted_root_tables.empty() &&
               ShouldInjectQueueReplayFault(
                   descriptor_fault,
                   g_test_native_descriptor_lookup_occurrence)) {
@@ -9274,35 +9919,26 @@ private:
           if (native_packet) {
             if (!packet.root_constants.empty() ||
                 !packet.root_descriptors.empty() ||
-                !packet.native_vertex.ready || !packet.native_pixel.ready)
+                !prepared.native_vertex.ready ||
+                !prepared.native_pixel.ready)
               return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
-            if (!compiled->native_root_base_buffer &&
-                (packet.native_vertex.cbuffer_root_base_count ||
-                 packet.native_vertex.resource_root_base_count ||
-                 packet.native_pixel.cbuffer_root_base_count ||
-                 packet.native_pixel.resource_root_base_count))
+            if (!submitted->native_root_base_buffer &&
+                (prepared.native_vertex.cbuffer_root_base_count ||
+                 prepared.native_vertex.resource_root_base_count ||
+                 prepared.native_pixel.cbuffer_root_base_count ||
+                 prepared.native_pixel.resource_root_base_count))
               return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
-            const auto backend_reason =
-                ValidateCompiledNativeDescriptorBackends(packet.root_tables);
+            const auto backend_reason = ValidateCompiledNativeDescriptorBackends(
+                submitted_root_tables);
             if (backend_reason != CompiledCommandFallbackReason::None)
               return backend_reason;
           }
-          ReplayState compiled_binding_state = {};
-          compiled_binding_state.graphics_root_signature =
-              packet.pipeline.root_signature;
-          compiled_binding_state.graphics_root_signature_impl = root;
-          compiled_binding_state.cbv_srv_uav_heap =
-              packet.descriptor_heaps.cbv_srv_uav;
-          for (const auto &table : packet.root_tables) {
-            if (table.root_parameter_index <
-                compiled_binding_state.graphics_tables.size())
-              compiled_binding_state.graphics_tables[table.root_parameter_index] =
-                  table.base_descriptor;
-          }
           const auto [compiled_demote_msaa_srv_mask_lo,
                       compiled_demote_msaa_srv_mask_hi] =
-              PixelShaderSingleSampleMsaaSRVDemoteMask(compiled_binding_state,
-                                                       *pipeline);
+              submitted_snapshot
+                  ? PixelShaderSingleSampleMsaaSRVDemoteMask(
+                        *submitted_snapshot, *pipeline)
+                  : std::pair<uint64_t, uint64_t>{0, 0};
           auto *metal = pipeline->GetMetalGraphicsState(
               compiled_demote_msaa_srv_mask_lo,
               compiled_demote_msaa_srv_mask_hi);
@@ -9332,7 +9968,7 @@ private:
             return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
 
           D3D12DiagLogCompiledTargetInputs(
-              packet, *pipeline, queue.CurrentFrameSeq(),
+              packet, prepared, *pipeline, queue.CurrentFrameSeq(),
               replay_record_serial);
 
           if (native_packet) {
@@ -9340,16 +9976,16 @@ private:
                 packet.draw ? "draw" : "draw-indexed",
                 queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, *pipeline, metal_pso.handle,
-                packet.root_tables,
-                {{"vertex", &packet.native_vertex},
-                 {"pixel", &packet.native_pixel}});
+                submitted_root_tables,
+                {{"vertex", &prepared.native_vertex},
+                 {"pixel", &prepared.native_pixel}});
             DiagnoseCompiledNativeStageDescriptors(
-                packet.root_tables, *pipeline, *root, PipelineStage::Vertex,
+                submitted_root_tables, *pipeline, *root, PipelineStage::Vertex,
                 false, packet.draw ? "draw" : "draw-indexed",
                 queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, metal_pso.handle);
             DiagnoseCompiledNativeStageDescriptors(
-                packet.root_tables, *pipeline, *root, PipelineStage::Pixel,
+                submitted_root_tables, *pipeline, *root, PipelineStage::Pixel,
                 false, packet.draw ? "draw" : "draw-indexed",
                 queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, metal_pso.handle);
@@ -9361,15 +9997,8 @@ private:
           if (vertex_buffer_reason != CompiledCommandFallbackReason::None)
             return vertex_buffer_reason;
 
-          ReplayState attachment_state = {};
-          attachment_state.resource_states = state.resource_states;
-          attachment_state.queue_type = state.queue_type;
-          attachment_state.touched_resources = state.touched_resources;
-          attachment_state.touched_resources_set = state.touched_resources_set;
-          attachment_state.render_targets = packet.render_state.render_targets;
-          attachment_state.depth_stencil = packet.render_state.depth_stencil;
           auto attachments =
-              BuildRenderPassAttachments(attachment_state,
+              BuildRenderPassAttachments(packet.render_state,
                                          pipeline->GetGraphicsState());
           auto viewports = packet.render_state.viewports;
           auto scissors = packet.render_state.scissors;
@@ -9382,7 +10011,7 @@ private:
                                    packet.root_descriptors);
           RecordCompiledDescriptorBackendStats(
               dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
-              packet.root_tables);
+              submitted_root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           AddCompiledVertexBufferAccesses(
@@ -9393,7 +10022,7 @@ private:
               native_packet
                   ? std::shared_ptr<GraphicsBindingSnapshot>{}
                   : submitted_snapshot
-                        ? std::move(submitted_snapshot)
+                        ? submitted_snapshot
                         : GetOrCaptureCompiledDescriptorBindingSnapshot(
                               state, packet, *pipeline, root, false);
           if (packet.draw) {
@@ -9429,12 +10058,12 @@ private:
                 *replay_packet.common.compiled_binding_payload;
             binding_payload.pipeline_state = packet.pipeline.pipeline_state;
             binding_payload.root_signature = packet.pipeline.root_signature;
-            binding_payload.root_tables = packet.root_tables;
+            binding_payload.root_tables = prepared.root_tables;
             binding_payload.input_assembler = packet.input_assembler;
             binding_payload.native_root_base_buffer =
-                compiled->native_root_base_buffer;
-            binding_payload.native_vertex = packet.native_vertex;
-            binding_payload.native_pixel = packet.native_pixel;
+                submitted->native_root_base_buffer;
+            binding_payload.native_vertex = prepared.native_vertex;
+            binding_payload.native_pixel = prepared.native_pixel;
             binding_payload.bindless_snapshot = bindless_snapshot;
             replay_packet.common.compiled_binding_state = binding_state;
             replay_packet.common.compiled_direct_access = direct_access;
@@ -9506,12 +10135,12 @@ private:
                 *replay_packet.common.compiled_binding_payload;
             binding_payload.pipeline_state = packet.pipeline.pipeline_state;
             binding_payload.root_signature = packet.pipeline.root_signature;
-            binding_payload.root_tables = packet.root_tables;
+            binding_payload.root_tables = prepared.root_tables;
             binding_payload.input_assembler = packet.input_assembler;
             binding_payload.native_root_base_buffer =
-                compiled->native_root_base_buffer;
-            binding_payload.native_vertex = packet.native_vertex;
-            binding_payload.native_pixel = packet.native_pixel;
+                submitted->native_root_base_buffer;
+            binding_payload.native_vertex = prepared.native_vertex;
+            binding_payload.native_pixel = prepared.native_pixel;
             binding_payload.bindless_snapshot = std::move(bindless_snapshot);
             replay_packet.common.compiled_binding_state = binding_state;
             replay_packet.common.compiled_direct_access = direct_access;
@@ -9541,11 +10170,17 @@ private:
 
     auto queue_compiled_compute_packet =
         [&](const CompiledComputePacket &packet,
+            const SubmittedCompiledComputePacket &prepared,
             std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot)
             -> CompiledCommandFallbackReason {
-          if (packet.submission_prepare_reason !=
+          if (packet.compatibility_reason !=
               CompiledCommandFallbackReason::None)
-            return packet.submission_prepare_reason;
+            return packet.compatibility_reason;
+          if (prepared.prepare_reason != CompiledCommandFallbackReason::None)
+            return prepared.prepare_reason;
+          if (!prepared.root_tables)
+            return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+          const auto &submitted_root_tables = *prepared.root_tables;
           if (!packet.dispatch.x || !packet.dispatch.y || !packet.dispatch.z)
             return CompiledCommandFallbackReason::None;
           DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
@@ -9567,7 +10202,7 @@ private:
           }
           constexpr const char *descriptor_fault =
               "DXMT_TEST_FAIL_NATIVE_DESCRIPTOR_LOOKUP_AT";
-          if (native_packet && !packet.root_tables.empty() &&
+          if (native_packet && !submitted_root_tables.empty() &&
               ShouldInjectQueueReplayFault(
                   descriptor_fault,
                   g_test_native_descriptor_lookup_occurrence)) {
@@ -9600,14 +10235,14 @@ private:
           if (native_packet) {
             if (!packet.root_constants.empty() ||
                 !packet.root_descriptors.empty() ||
-                !packet.native_compute.ready)
+                !prepared.native_compute.ready)
               return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
-            if (!compiled->native_root_base_buffer &&
-                (packet.native_compute.cbuffer_root_base_count ||
-                 packet.native_compute.resource_root_base_count))
+            if (!submitted->native_root_base_buffer &&
+                (prepared.native_compute.cbuffer_root_base_count ||
+                 prepared.native_compute.resource_root_base_count))
               return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
-            const auto backend_reason =
-                ValidateCompiledNativeDescriptorBackends(packet.root_tables);
+            const auto backend_reason = ValidateCompiledNativeDescriptorBackends(
+                submitted_root_tables);
             if (backend_reason != CompiledCommandFallbackReason::None)
               return backend_reason;
           }
@@ -9618,9 +10253,10 @@ private:
             D3D12DiagLogNativePacket(
                 "dispatch", queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, *pipeline, metal->pso.handle,
-                packet.root_tables, {{"compute", &packet.native_compute}});
+                submitted_root_tables,
+                {{"compute", &prepared.native_compute}});
             DiagnoseCompiledNativeStageDescriptors(
-                packet.root_tables, *pipeline, *root, PipelineStage::Compute,
+                submitted_root_tables, *pipeline, *root, PipelineStage::Compute,
                 true, "dispatch", queue.CurrentFrameSeq(),
                 packet.d3d_sequence, replay_record_serial,
                 metal->pso.handle);
@@ -9634,7 +10270,7 @@ private:
                                    packet.root_descriptors);
           RecordCompiledDescriptorBackendStats(
               dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
-              packet.root_tables);
+              submitted_root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           RecordComputePipelineResourceAccess(
@@ -9654,7 +10290,9 @@ private:
           binding_payload.binding_state = std::move(binding_state);
           binding_payload.direct_access = std::move(direct_access);
           binding_payload.native_root_base_buffer =
-              compiled->native_root_base_buffer;
+              submitted->native_root_base_buffer;
+          binding_payload.root_tables = prepared.root_tables;
+          binding_payload.native_compute = prepared.native_compute;
           binding_payload.root = root;
           if (!native_packet) {
             binding_payload.bindless_snapshot =
@@ -9735,7 +10373,11 @@ private:
         };
 
     auto compiled_list_is_valid = [&]() {
-      if (!compiled || compiled->record_count != records.size())
+      if (!compiled || !submitted || compiled->record_count != records.size() ||
+          submitted->graphics_packets.size() !=
+              compiled->graphics_packets.size() ||
+          submitted->compute_packets.size() !=
+              compiled->compute_packets.size())
         return false;
       for (const auto &segment : compiled->segments) {
         if (segment.first_record_index > records.size() ||
@@ -9756,6 +10398,132 @@ private:
       return true;
     };
 
+    std::vector<UINT> deferred_state_records;
+    deferred_state_records.reserve(256);
+    auto flush_deferred_state = [&](dxmt::CompiledFallbackReason reason) {
+      if (deferred_state_records.empty())
+        return;
+      const auto previous_reason = state.compiled_fallback_reason;
+      state.compiled_fallback_reason = reason;
+      UINT replayed = 0;
+      for (const auto index : deferred_state_records) {
+        if (index >= records.size() || superseded_state_record_mask[index])
+          continue;
+        record_index = index;
+        replay_one(records[index]);
+        replayed++;
+      }
+      if (replayed && test_telemetry) {
+        test_telemetry->replayed_fallback_ranges.fetch_add(
+            1, std::memory_order_relaxed);
+        test_telemetry->replayed_fallback_records.fetch_add(
+            replayed, std::memory_order_relaxed);
+      }
+      deferred_state_records.clear();
+      state.compiled_fallback_reason = previous_reason;
+    };
+    auto replay_compatibility_range =
+        [&](UINT begin, UINT count, dxmt::CompiledFallbackReason reason) {
+          const UINT end = std::min<UINT>(begin + count, records.size());
+          const auto previous_reason = state.compiled_fallback_reason;
+          state.compiled_fallback_reason = reason;
+          for (UINT index = begin; index < end; ++index) {
+            if (IsDeferrableCompiledStateRecord(records[index])) {
+              deferred_state_records.push_back(index);
+              continue;
+            }
+            if (FallbackRecordNeedsBindingState(records[index]))
+              flush_deferred_state(reason);
+            record_index = index;
+            record_fallback_range(index, 1, reason);
+            replay_one(records[index]);
+          }
+          state.compiled_fallback_reason = previous_reason;
+        };
+
+    auto apply_compiled_root_bindings =
+        [&](const auto &packet, bool compute) {
+          auto &tables = compute ? state.compute_tables
+                                 : state.graphics_tables;
+          tables.fill({});
+          for (const auto &table : packet.root_tables) {
+            if (table.root_parameter_index < tables.size())
+              tables[table.root_parameter_index] = table.base_descriptor;
+          }
+
+          auto &constants = compute ? state.compute_root_constants
+                                    : state.graphics_root_constants;
+          auto &cbv = compute ? state.compute_cbv_roots
+                              : state.graphics_cbv_roots;
+          auto &srv = compute ? state.compute_srv_roots
+                              : state.graphics_srv_roots;
+          auto &uav = compute ? state.compute_uav_roots
+                              : state.graphics_uav_roots;
+          for (auto &slot : constants)
+            slot = {};
+          cbv.fill({});
+          srv.fill({});
+          uav.fill({});
+          for (const auto &entry : packet.root_constants) {
+            if (entry.root_parameter_index >= constants.size())
+              continue;
+            auto &slot = constants[entry.root_parameter_index];
+            slot.valid = true;
+            slot.values = entry.values.copy();
+          }
+          for (const auto &entry : packet.root_descriptors) {
+            if (entry.root_parameter_index >= cbv.size())
+              continue;
+            auto *slot = entry.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV
+                             ? &cbv[entry.root_parameter_index]
+                         : entry.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
+                             ? &srv[entry.root_parameter_index]
+                             : &uav[entry.root_parameter_index];
+            slot->valid = true;
+            slot->address = entry.address;
+          }
+        };
+
+    auto apply_compiled_graphics_compatibility_state =
+        [&](const CompiledGraphicsPacket &packet) {
+          state.pipeline_state = packet.pipeline.pipeline_state;
+          state.graphics_root_signature = packet.pipeline.root_signature;
+          state.graphics_root_signature_impl =
+              GetRootSignature(packet.pipeline.root_signature.ptr());
+          state.cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
+          state.sampler_heap = packet.descriptor_heaps.sampler;
+          apply_compiled_root_bindings(packet, false);
+          state.vertex_buffers.fill({});
+          for (const auto &binding : packet.input_assembler.vertex_buffers) {
+            if (binding.slot < state.vertex_buffers.size())
+              state.vertex_buffers[binding.slot] = binding.view;
+          }
+          state.index_buffer = packet.input_assembler.index_buffer;
+          state.resolved_vertex_buffers.fill({});
+          state.resolved_index_buffer = {};
+          state.resolved_vertex_buffer_cache.clear();
+          state.resolved_index_buffer_cache.clear();
+          state.render_targets = packet.render_state.render_targets.copy();
+          state.depth_stencil = packet.render_state.depth_stencil;
+          state.viewports = packet.render_state.viewports.copy();
+          state.scissors = packet.render_state.scissors.copy();
+          state.blend_factor = packet.render_state.blend_factor;
+          state.stencil_ref = packet.render_state.stencil_ref;
+          state.topology = packet.render_state.topology;
+          state.graphics_binding_generation++;
+        };
+
+    auto apply_compiled_compute_compatibility_state =
+        [&](const CompiledComputePacket &packet) {
+          state.pipeline_state = packet.pipeline.pipeline_state;
+          state.compute_root_signature = packet.pipeline.root_signature;
+          state.compute_root_signature_impl =
+              GetRootSignature(packet.pipeline.root_signature.ptr());
+          state.cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
+          state.sampler_heap = packet.descriptor_heaps.sampler;
+          apply_compiled_root_bindings(packet, true);
+        };
+
     if (compiled_list_is_valid() && !compiled->segments.empty()) {
       for (const auto &segment : compiled->segments) {
         record_index = segment.first_record_index;
@@ -9773,6 +10541,7 @@ private:
           for (UINT i = 0; i < segment.graphics_packet_count; i++) {
             const auto packet_index = segment.first_graphics_packet + i;
             const auto &packet = compiled->graphics_packets[packet_index];
+            const auto &prepared = submitted->graphics_packets[packet_index];
             auto submitted_snapshot =
                 submitted_descriptor_snapshots &&
                         packet_index <
@@ -9782,7 +10551,7 @@ private:
             const auto packet_begin =
                 replay_perf ? clock::now() : clock::time_point{};
             const auto fallback_reason =
-                queue_compiled_graphics_packet(packet,
+                queue_compiled_graphics_packet(packet, prepared,
                                                std::move(submitted_snapshot));
             if (test_telemetry) {
               if (fallback_reason == CompiledCommandFallbackReason::None) {
@@ -9800,10 +10569,17 @@ private:
             if (fallback_reason != CompiledCommandFallbackReason::None) {
               const auto perf_reason =
                   CompiledCommandFallbackReasonToPerf(fallback_reason);
-              record_fallback_range(segment.first_record_index,
-                                    segment.record_count, perf_reason);
-              replay_range(segment.first_record_index, segment.record_count,
-                           perf_reason);
+              // A compiled packet is a complete semantic state package. Use
+              // it as the compatibility encoder input instead of replaying
+              // every preceding setter merely to reconstruct the same state.
+              deferred_state_records.clear();
+              apply_compiled_graphics_compatibility_state(packet);
+              record_fallback_range(packet.record_index, 1, perf_reason);
+              const auto previous_reason = state.compiled_fallback_reason;
+              state.compiled_fallback_reason = perf_reason;
+              record_index = packet.record_index;
+              replay_one(records[packet.record_index]);
+              state.compiled_fallback_reason = previous_reason;
             }
           }
           break;
@@ -9811,6 +10587,7 @@ private:
           for (UINT i = 0; i < segment.compute_packet_count; i++) {
             const auto packet_index = segment.first_compute_packet + i;
             const auto &packet = compiled->compute_packets[packet_index];
+            const auto &prepared = submitted->compute_packets[packet_index];
             auto submitted_snapshot =
                 submitted_descriptor_snapshots &&
                         packet_index <
@@ -9820,7 +10597,7 @@ private:
             const auto packet_begin =
                 replay_perf ? clock::now() : clock::time_point{};
             const auto fallback_reason = queue_compiled_compute_packet(
-                packet, std::move(submitted_snapshot));
+                packet, prepared, std::move(submitted_snapshot));
             if (test_telemetry) {
               if (fallback_reason == CompiledCommandFallbackReason::None) {
                 test_telemetry->replayed_compute_packets.fetch_add(
@@ -9837,22 +10614,30 @@ private:
             if (fallback_reason != CompiledCommandFallbackReason::None) {
               const auto perf_reason =
                   CompiledCommandFallbackReasonToPerf(fallback_reason);
-              record_fallback_range(segment.first_record_index,
-                                    segment.record_count, perf_reason);
-              replay_range(segment.first_record_index, segment.record_count,
-                           perf_reason);
+              deferred_state_records.clear();
+              apply_compiled_compute_compatibility_state(packet);
+              record_fallback_range(packet.record_index, 1, perf_reason);
+              const auto previous_reason = state.compiled_fallback_reason;
+              state.compiled_fallback_reason = perf_reason;
+              record_index = packet.record_index;
+              replay_one(records[packet.record_index]);
+              state.compiled_fallback_reason = previous_reason;
             }
           }
           break;
         case CompiledCommandSegmentKind::Fallback:
         default:
-          record_fallback_range(segment.first_record_index,
-                                segment.record_count,
-                                segment.perf_fallback_reason);
-          replay_range(segment.first_record_index, segment.record_count,
-                       segment.perf_fallback_reason);
+          replay_compatibility_range(segment.first_record_index,
+                                     segment.record_count,
+                                     segment.perf_fallback_reason);
           break;
         }
+      }
+      if (!deferred_state_records.empty()) {
+        dxmt::perf::recordStateRecordsElided(
+            dxmt::perf::currentFrameStatistics(),
+            deferred_state_records.size());
+        deferred_state_records.clear();
       }
     } else {
       record_fallback_range(0, static_cast<UINT>(records.size()),
@@ -12564,7 +13349,12 @@ private:
     auto *index_resource = LookupBufferResourceByGpuVirtualAddress(
         state.index_buffer->BufferLocation, &index_resource_offset);
     if (!index_resource || !index_resource->GetBufferAllocation()) {
-      WARN("D3D12CommandQueue: indirect indexed draw skipped because index buffer binding is unavailable");
+      static std::atomic_flag warned_missing_indirect_index_buffer =
+          ATOMIC_FLAG_INIT;
+      if (!warned_missing_indirect_index_buffer.test_and_set(
+              std::memory_order_relaxed))
+        WARN("D3D12CommandQueue: indirect indexed draw skipped because index "
+             "buffer binding is unavailable (further warnings suppressed)");
       return;
     }
     if (!IsSupportedIndexBufferFormat(state.index_buffer->Format)) {
@@ -13333,12 +14123,20 @@ private:
       return root_parameter_index < tables.size()
                  ? tables[root_parameter_index]
                  : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    } else if constexpr (requires { state.compiled_root_tables; }) {
+      (void)compute;
+      for (const auto &table : state.compiled_root_tables) {
+        if (table.root_parameter_index == root_parameter_index)
+          return table.base_descriptor;
+      }
+      return {};
+    } else {
+      (void)compute;
+      const auto &tables = state.graphics_tables;
+      return root_parameter_index < tables.size()
+                 ? tables[root_parameter_index]
+                 : D3D12_GPU_DESCRIPTOR_HANDLE{};
     }
-    (void)compute;
-    const auto &tables = state.graphics_tables;
-    return root_parameter_index < tables.size()
-               ? tables[root_parameter_index]
-               : D3D12_GPU_DESCRIPTOR_HANDLE{};
   }
 
   static UINT
@@ -13418,6 +14216,26 @@ private:
         GetBoundDescriptorRecordFromHeap(descriptor_heap, handle, heap_type);
     if (!descriptor)
       return std::nullopt;
+    return descriptor;
+  }
+
+  const DescriptorRecord *
+  GetBoundDescriptorRecordInRangeFromLockedHeap(
+      DescriptorHeap *descriptor_heap, D3D12_GPU_DESCRIPTOR_HANDLE base,
+      UINT range_offset, UINT descriptor_index, UINT descriptor_count,
+      D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
+    if (!descriptor_heap ||
+        (descriptor_count && descriptor_index >= descriptor_count))
+      return nullptr;
+    const auto total_offset = range_offset + descriptor_index;
+    if (total_offset < range_offset)
+      return nullptr;
+    const auto handle = D3D12_GPU_DESCRIPTOR_HANDLE{
+        base.ptr + sizeof(DescriptorRecord) * total_offset};
+    const auto *descriptor = descriptor_heap->GetDescriptorRecord(handle);
+    if (!descriptor || !descriptor->shader_visible ||
+        descriptor->heap_type != heap_type)
+      return nullptr;
     return descriptor;
   }
 
@@ -15209,25 +16027,6 @@ private:
   Rc<Sampler> CreateStaticSampler(const D3D12_STATIC_SAMPLER_DESC &desc) {
     return CreateD3D12StaticSampler(device_->GetMTLDevice(), desc);
   }
-
-  struct DescriptorTableBindingRecipeEntry {
-    uint16_t root_index = 0;
-    uint16_t range_index = 0;
-    uint16_t stage = 0;
-    uint16_t slot = 0;
-    uint32_t range_offset = 0;
-    uint32_t descriptor_index = 0;
-    uint32_t descriptor_count = 0;
-    uint32_t range_type = 0;
-    uint32_t shader_register = 0;
-    uint32_t register_lower_bound = 0;
-    uint32_t root_offset_key = 0;
-    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
-  };
-
-  struct DescriptorTableBindingRecipe {
-    std::vector<DescriptorTableBindingRecipeEntry> entries;
-  };
 
   static constexpr uint64_t kGraphicsBindingFingerprintOffset =
       14695981039346656037ull;
@@ -17382,7 +18181,8 @@ private:
     };
 
     static std::mutex mutex;
-    static std::unordered_map<CacheKey, DescriptorTableBindingRecipe,
+    static std::unordered_map<CacheKey,
+                              std::unique_ptr<DescriptorTableBindingRecipe>,
                               CacheKeyHash>
         cache;
 
@@ -17401,7 +18201,7 @@ private:
         stats.process_hit_ns.fetch_add(elapsed, std::memory_order_relaxed);
         MaybeLogBindingRecipeDiagSummary(calls, "get-process-hit");
       }
-      return it->second;
+      return *it->second;
     }
 
     const uint64_t load_start_ns =
@@ -17449,7 +18249,8 @@ private:
                                  std::memory_order_relaxed);
       }
     }
-    auto inserted = cache.insert({key, std::move(recipe)});
+    auto inserted = cache.insert(
+        {key, std::make_unique<DescriptorTableBindingRecipe>(std::move(recipe))});
     if (diag_enabled) {
       auto &stats = BindingRecipeDiagStats();
       const uint64_t elapsed = BindingRecipeDiagNowNs() - get_start_ns;
@@ -17461,7 +18262,7 @@ private:
       MaybeLogBindingRecipeDiagSummary(calls,
                                        loaded ? "get-db-hit" : "get-build");
     }
-    return inserted.first->second;
+    return *inserted.first->second;
   }
 
   template <typename State>
@@ -17699,7 +18500,7 @@ private:
       entry.shader_register = recipe_entry.shader_register;
       entry.register_lower_bound = recipe_entry.register_lower_bound;
       entry.root_offset_key = recipe_entry.root_offset_key;
-      entry.argument = recipe_entry.argument;
+      entry.argument = &recipe_entry.argument;
       entry.debug_kind = DescriptorRangeTypeName(range_type);
 
       const auto heap_type = DescriptorHeapTypeForRange(range_type);
@@ -17709,7 +18510,7 @@ private:
           heap_type);
       if (descriptor) {
         entry.has_descriptor = true;
-        entry.descriptor = *descriptor;
+        entry.descriptor_index = snapshot.descriptor_records->capture(*descriptor);
         entry.debug_size = DescriptorRecordSizeBytes(*descriptor);
       }
 
@@ -17724,43 +18525,27 @@ private:
                                entry.register_lower_bound);
       HashGraphicsBindingValue(snapshot.content_fingerprint,
                                entry.root_offset_key);
-      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.argument);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, *entry.argument);
       HashGraphicsBindingValue(snapshot.content_fingerprint,
                                entry.has_descriptor);
       if (entry.has_descriptor)
         HashGraphicsBindingDescriptor(snapshot.content_fingerprint,
-                                      entry.descriptor);
+                                      SnapshotDescriptor(snapshot, entry));
       snapshot.entries.push_back(std::move(entry));
     }
   }
 
-  void CaptureGraphicsRootDescriptor(GraphicsBindingSnapshot &snapshot,
-                                     const ReplayState &state,
-                                     const PipelineState &pipeline,
-                                     UINT root_index,
-                                     const RootSignatureParameter &parameter,
-                                     DescriptorRecordType type,
-                                     bool compute = false) {
-    const auto &map =
-        type == DescriptorRecordType::ConstantBufferView
-            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
-            : type == DescriptorRecordType::ShaderResourceView
-                  ? (compute ? state.compute_srv_roots
-                             : state.graphics_srv_roots)
-                  : (compute ? state.compute_uav_roots
-                             : state.graphics_uav_roots);
-    if (root_index >= ReplayState::kMaxRootParameters)
-      return;
-    const auto &slot = map[root_index];
-    if (!slot.valid)
-      return;
-
+  void CaptureGraphicsRootDescriptorAddress(
+      GraphicsBindingSnapshot &snapshot, const PipelineState &pipeline,
+      UINT root_index, const RootSignatureParameter &parameter,
+      DescriptorRecordType type, D3D12_GPU_VIRTUAL_ADDRESS address,
+      bool compute = false) {
     Resource *resource = nullptr;
-    const auto offset = ResolveBufferGpuAddress(slot.address, resource);
+    const auto offset = ResolveBufferGpuAddress(address, resource);
     if (!resource || !resource->GetBuffer())
       return;
     if (type == DescriptorRecordType::ConstantBufferView &&
-        (slot.address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
+        (address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
       WARN("D3D12CommandQueue: root CBV address is not 256-byte aligned");
       return;
     }
@@ -17776,7 +18561,7 @@ private:
         WARN("D3D12CommandQueue: root CBV resolved size is not 256-byte aligned");
         return;
       }
-      descriptor.desc.cbv.BufferLocation = slot.address;
+      descriptor.desc.cbv.BufferLocation = address;
       descriptor.desc.cbv.SizeInBytes = UINT(size);
     } else if (type == DescriptorRecordType::ShaderResourceView) {
       descriptor.desc.srv.Format = DXGI_FORMAT_UNKNOWN;
@@ -17821,15 +18606,15 @@ private:
       entry.shader_register = parameter.descriptor.ShaderRegister;
       entry.register_space = parameter.descriptor.RegisterSpace;
       entry.debug_size = resource->GetResourceDesc().Width - offset;
-      entry.debug_address = slot.address;
+      entry.debug_address = address;
       entry.debug_kind =
           type == DescriptorRecordType::ConstantBufferView
               ? "root-cbv"
               : type == DescriptorRecordType::ShaderResourceView ? "root-srv"
                                                                  : "root-uav";
       entry.has_descriptor = true;
-      entry.descriptor = descriptor;
-      entry.argument = *argument;
+      entry.descriptor_index = snapshot.descriptor_records->capture(descriptor);
+      entry.argument = argument;
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.range_type);
@@ -17839,30 +18624,48 @@ private:
                                entry.shader_register);
       HashGraphicsBindingValue(snapshot.content_fingerprint,
                                entry.register_space);
-      HashGraphicsBindingValue(snapshot.content_fingerprint, entry.argument);
+      HashGraphicsBindingValue(snapshot.content_fingerprint, *entry.argument);
       HashGraphicsBindingValue(snapshot.content_fingerprint,
                                entry.debug_address);
       HashGraphicsBindingDescriptor(snapshot.content_fingerprint,
-                                    entry.descriptor);
+                                    SnapshotDescriptor(snapshot, entry));
       snapshot.entries.push_back(std::move(entry));
     });
   }
 
-  void CaptureGraphicsRootConstants(GraphicsBindingSnapshot &snapshot,
-                                    const ReplayState &state,
-                                    const PipelineState &pipeline,
-                                    UINT root_index,
-                                    const RootSignatureParameter &parameter,
-                                    bool compute = false) {
+  void CaptureGraphicsRootDescriptor(GraphicsBindingSnapshot &snapshot,
+                                     const ReplayState &state,
+                                     const PipelineState &pipeline,
+                                     UINT root_index,
+                                     const RootSignatureParameter &parameter,
+                                     DescriptorRecordType type,
+                                     bool compute = false) {
+    const auto &map =
+        type == DescriptorRecordType::ConstantBufferView
+            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? (compute ? state.compute_srv_roots
+                             : state.graphics_srv_roots)
+                  : (compute ? state.compute_uav_roots
+                             : state.graphics_uav_roots);
     if (root_index >= ReplayState::kMaxRootParameters)
       return;
-    const auto &slot = compute ? state.compute_root_constants[root_index]
-                               : state.graphics_root_constants[root_index];
+    const auto &slot = map[root_index];
+    if (!slot.valid)
+      return;
+    CaptureGraphicsRootDescriptorAddress(snapshot, pipeline, root_index,
+                                         parameter, type, slot.address,
+                                         compute);
+  }
 
+  void CaptureGraphicsRootConstantsValues(
+      GraphicsBindingSnapshot &snapshot, const PipelineState &pipeline,
+      UINT root_index, const RootSignatureParameter &parameter,
+      std::span<const UINT> values, UINT dst_offset = 0,
+      bool compute = false) {
     const auto declared_count = parameter.constants.Num32BitValues;
     const auto actual_count =
-        std::max<uint32_t>(declared_count,
-                           slot.valid ? uint32_t(slot.values.size()) : 0u);
+        std::max<uint32_t>(declared_count, dst_offset + values.size());
     if (!actual_count)
       return;
 
@@ -17889,8 +18692,15 @@ private:
       entry.register_space = parameter.constants.RegisterSpace;
       entry.debug_size = uint64_t(actual_count) * sizeof(UINT);
       entry.debug_kind = "root-constants";
-      if (slot.valid)
-        entry.constants = slot.values;
+      if (!values.empty()) {
+        if (dst_offset) {
+          entry.constants.resize(dst_offset + values.size(), 0);
+          std::copy(values.begin(), values.end(),
+                    entry.constants.begin() + dst_offset);
+        } else {
+          entry.constants.assign(values.begin(), values.end());
+        }
+      }
       entry.constant_count = actual_count;
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.kind);
       HashGraphicsBindingValue(snapshot.content_fingerprint, entry.stage);
@@ -17906,6 +18716,22 @@ private:
         HashGraphicsBindingValue(snapshot.content_fingerprint, value);
       snapshot.entries.push_back(std::move(entry));
     });
+  }
+
+  void CaptureGraphicsRootConstants(GraphicsBindingSnapshot &snapshot,
+                                    const ReplayState &state,
+                                    const PipelineState &pipeline,
+                                    UINT root_index,
+                                    const RootSignatureParameter &parameter,
+                                    bool compute = false) {
+    if (root_index >= ReplayState::kMaxRootParameters)
+      return;
+    const auto &slot = compute ? state.compute_root_constants[root_index]
+                               : state.graphics_root_constants[root_index];
+    CaptureGraphicsRootConstantsValues(
+        snapshot, pipeline, root_index, parameter,
+        slot.valid ? std::span<const UINT>(slot.values) : std::span<const UINT>{},
+        0, compute);
   }
 
   void CaptureGraphicsVertexBuffers(GraphicsBindingSnapshot &snapshot,
@@ -17964,19 +18790,25 @@ private:
     // snapshot path, not only the native descriptor-table ABI.
     snapshot.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
     snapshot.sampler_heap = state.sampler_heap;
-    snapshot.graphics_tables = state.graphics_tables;
+    snapshot.legacy_identity =
+        std::make_unique<GraphicsBindingSnapshotLegacyIdentity>();
+    auto &identity = *snapshot.legacy_identity;
+    identity.graphics_root_signature_impl = state.graphics_root_signature_impl;
+    identity.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
+    identity.sampler_heap = state.sampler_heap;
+    identity.graphics_tables = state.graphics_tables;
     for (UINT i = 0; i < state.graphics_root_constants.size(); ++i) {
-      snapshot.graphics_root_constants[i] =
+      identity.graphics_root_constants[i] =
           state.graphics_root_constants[i];
-      snapshot.graphics_cbv_roots[i] = state.graphics_cbv_roots[i];
-      snapshot.graphics_srv_roots[i] = state.graphics_srv_roots[i];
-      snapshot.graphics_uav_roots[i] = state.graphics_uav_roots[i];
+      identity.graphics_cbv_roots[i] = state.graphics_cbv_roots[i];
+      identity.graphics_srv_roots[i] = state.graphics_srv_roots[i];
+      identity.graphics_uav_roots[i] = state.graphics_uav_roots[i];
     }
     for (UINT i = 0; i < state.vertex_buffers.size(); ++i) {
-      snapshot.vertex_buffer_views[i].valid =
+      identity.vertex_buffer_views[i].valid =
           state.vertex_buffers[i].has_value();
       if (state.vertex_buffers[i])
-        snapshot.vertex_buffer_views[i].view = *state.vertex_buffers[i];
+        identity.vertex_buffer_views[i].view = *state.vertex_buffers[i];
     }
     snapshot.native =
         pipeline.GetShaderAbiVersion() ==
@@ -17990,12 +18822,12 @@ private:
                                snapshot.cbv_srv_uav_heap.ptr());
     HashGraphicsBindingPointer(snapshot.content_fingerprint,
                                snapshot.sampler_heap.ptr());
-    for (UINT i = 0; i < snapshot.graphics_tables.size(); i++) {
-      if (!snapshot.graphics_tables[i].ptr)
+    for (UINT i = 0; i < identity.graphics_tables.size(); i++) {
+      if (!identity.graphics_tables[i].ptr)
         continue;
       HashGraphicsBindingValue(snapshot.content_fingerprint, i);
       HashGraphicsBindingValue(snapshot.content_fingerprint,
-                               snapshot.graphics_tables[i].ptr);
+                               identity.graphics_tables[i].ptr);
     }
 
     auto *root = state.graphics_root_signature_impl;
@@ -18072,7 +18904,7 @@ private:
                                entry.has_descriptor);
       if (entry.has_descriptor)
         HashGraphicsBindingDescriptor(snapshot.resource_access_fingerprint,
-                                      entry.descriptor);
+                                      SnapshotDescriptor(snapshot, entry));
     }
     if (capture_stats) {
       capture_stats->entries += snapshot.entries.size();
@@ -18446,6 +19278,43 @@ private:
     return {mask_lo, mask_hi};
   }
 
+  std::pair<uint64_t, uint64_t> PixelShaderSingleSampleMsaaSRVDemoteMask(
+      const GraphicsBindingSnapshot &snapshot,
+      const PipelineState &pipeline) {
+    (void)pipeline;
+    uint64_t mask_lo = 0;
+    uint64_t mask_hi = 0;
+    if (snapshot.native_descriptor_recipe) {
+      const auto &recipe_entries = snapshot.native_descriptor_recipe->entries;
+      for (size_t i = 0; i < recipe_entries.size(); ++i) {
+        const auto &entry = recipe_entries[i];
+        if (entry.stage != static_cast<uint16_t>(PipelineStage::Pixel) ||
+            entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+            snapshot.native_descriptor_indices[i] == UINT32_MAX ||
+            entry.slot >= 128 ||
+            !(entry.argument.Flags &
+              MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED))
+          continue;
+        if (!ShaderResourceViewIsMultisampledTexture(
+                SnapshotNativeDescriptor(snapshot, i)))
+          SetPixelShaderMsaaSrvDemoteBit(mask_lo, mask_hi, entry.slot);
+      }
+    }
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          entry.stage != PipelineStage::Pixel ||
+          entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+          !entry.has_descriptor || entry.slot >= 128 ||
+          !entry.argument || !(entry.argument->Flags &
+            MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED))
+        continue;
+      if (!ShaderResourceViewIsMultisampledTexture(
+              SnapshotDescriptor(snapshot, entry)))
+        SetPixelShaderMsaaSrvDemoteBit(mask_lo, mask_hi, entry.slot);
+    }
+    return {mask_lo, mask_hi};
+  }
+
   template <PipelineStage Stage>
   static std::pair<uint64_t, uint64_t>
   CurrentPixelShaderMsaaSrvDemoteMasks(ArgumentEncodingContext &enc) {
@@ -18613,11 +19482,25 @@ private:
                                arg->StructurePtrOffset + 1);
       }
     }
+    ForEachCompiledDescriptorTableEntry(
+        snapshot, [&](const auto &entry, const DescriptorRecord &) {
+          if (static_cast<PipelineStage>(entry.stage) != want_stage)
+            return;
+          const auto &arg = entry.argument;
+          const bool is_tex_or_sampler =
+              arg.Type == SM50BindingType::Sampler ||
+              ((arg.Type == SM50BindingType::SRV ||
+                arg.Type == SM50BindingType::UAV) &&
+               (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE));
+          if (is_tex_or_sampler)
+            max_key_plus_one = std::max<uint32_t>(
+                max_key_plus_one, entry.root_offset_key + 1);
+        });
     for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor || entry.stage != want_stage)
         continue;
-      const auto &arg = entry.argument;
+      const auto &arg = *entry.argument;
       const bool is_tex_or_sampler =
           arg.Type == SM50BindingType::Sampler ||
           ((arg.Type == SM50BindingType::SRV || arg.Type == SM50BindingType::UAV) &&
@@ -18658,20 +19541,20 @@ private:
       }
     }
 
-    for (const auto &entry : snapshot.entries) {
-      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
-          !entry.has_descriptor || entry.stage != want_stage)
-        continue;
-      const auto &arg = entry.argument;
+    auto fill_compact_window =
+        [&](const DXMT12_MTL4_SHADER_ARGUMENT &arg,
+            D3D12_DESCRIPTOR_RANGE_TYPE range_type, uint32_t root_offset_key,
+            uint32_t shader_register, uint32_t register_lower_bound,
+            const DescriptorRecord &descriptor) {
       const bool is_tex_or_sampler =
           arg.Type == SM50BindingType::Sampler ||
           (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
       if (!is_tex_or_sampler)
-        continue;
-      if (entry.root_offset_key >= max_key_plus_one)
-        continue;
-      if (entry.shader_register < entry.register_lower_bound)
-        continue;
+        return;
+      if (root_offset_key >= max_key_plus_one)
+        return;
+      if (shader_register < register_lower_bound)
+        return;
       // Prefer the shader argument's own lower bound when present so the
       // compact window slot matches the bindless plan used by the non-snapshot
       // compiled path. Recipe register_lower_bound is the D3D12 range base and
@@ -18679,13 +19562,13 @@ private:
       const auto argument_lower =
           arg.RegisterCount ? arg.RegisterLowerBound : arg.SM50BindingSlot;
       const auto local =
-          entry.shader_register >= argument_lower
-              ? entry.shader_register - argument_lower
-              : entry.shader_register - entry.register_lower_bound;
+          shader_register >= argument_lower
+              ? shader_register - argument_lower
+              : shader_register - register_lower_bound;
       uint32_t compact_base = UINT_MAX;
       if (arguments) {
         for (UINT i = 0; i < argument_count; i++) {
-          if (arguments[i].StructurePtrOffset != entry.root_offset_key ||
+          if (arguments[i].StructurePtrOffset != root_offset_key ||
               arguments[i].Type != arg.Type)
             continue;
           compact_base = arg.Type == SM50BindingType::Sampler
@@ -18695,36 +19578,36 @@ private:
         }
       }
       if (compact_base == UINT_MAX)
-        continue;
-      root_offsets[entry.root_offset_key] = compact_base;
+        return;
+      root_offsets[root_offset_key] = compact_base;
       if (window) {
         const auto dst_slot = compact_base + local;
         if (dst_slot >= dxmt::kBindlessMirrorCapacity)
-          continue;
+          return;
         // Keep mirror residency/slot materialization in sync with the compiled
         // non-snapshot path before reading any heap-local payload fallback.
-        MaybeFillBindlessMirrorSlot(enc, entry.range_type, entry.descriptor,
+        MaybeFillBindlessMirrorSlot(enc, range_type, descriptor,
                                     want_stage, &arg);
         if (arg.Type == SM50BindingType::Sampler && window->sampler.mapped) {
           auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
           uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
           bool wrote = false;
-          auto sampler = entry.descriptor.materialized_sampler;
+          auto sampler = descriptor.materialized_sampler;
           if (!sampler &&
-              entry.descriptor.type == DescriptorRecordType::Sampler &&
-              entry.descriptor.has_desc) {
+              descriptor.type == DescriptorRecordType::Sampler &&
+              descriptor.has_desc) {
             sampler = CreateD3D12Sampler(device_->GetMTLDevice(),
-                                         entry.descriptor.desc.sampler);
+                                         descriptor.desc.sampler);
           }
           if (sampler) {
             EncodeMirrorSamplerSlot(encoded, *sampler);
             wrote = true;
-          } else if (entry.descriptor.mirror) {
+          } else if (descriptor.mirror) {
             // 0940cf21 dropped this fallback when switching to submission
             // snapshots; restore it so samplers that only exist as heap-local
             // mirror payloads still bind on the async encode path.
-            if (const auto payload = entry.descriptor.mirror->samplerSlotPayload(
-                    entry.descriptor.heap_index, entry.descriptor.slot_version)) {
+            if (const auto payload = descriptor.mirror->samplerSlotPayload(
+                    descriptor.heap_index, descriptor.slot_version)) {
               encoded[0] = payload->handle;
               encoded[1] = payload->cube_handle;
               encoded[2] = payload->lod_bias;
@@ -18741,13 +19624,13 @@ private:
                    window->texture.mapped) {
           auto *dst = static_cast<uint64_t *>(window->texture.mapped);
           auto payload = BuildBindlessTextureWindowPayloadFromSnapshot(
-              enc, entry.descriptor, arg, want_stage);
+              enc, descriptor, arg, want_stage);
           // Same fallback as BuildCompiledBindlessRootOffsets: encode-time view
           // creation can fail for reserved/partially-backed textures while the
           // heap mirror still holds a valid GPU resource id written earlier.
-          if (!payload && entry.descriptor.mirror) {
-            payload = entry.descriptor.mirror->textureSlotPayload(
-                entry.descriptor.heap_index, entry.descriptor.slot_version);
+          if (!payload && descriptor.mirror) {
+            payload = descriptor.mirror->textureSlotPayload(
+                descriptor.heap_index, descriptor.slot_version);
           }
           if (payload) {
             for (uint32_t pair = 0; pair < window->texture_field_pairs; pair++) {
@@ -18761,6 +19644,25 @@ private:
           }
         }
       }
+    };
+    ForEachCompiledDescriptorTableEntry(
+        snapshot, [&](const auto &entry, const DescriptorRecord &descriptor) {
+          if (static_cast<PipelineStage>(entry.stage) != want_stage)
+            return;
+          fill_compact_window(
+              entry.argument,
+              static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type),
+              entry.root_offset_key, entry.shader_register,
+              entry.register_lower_bound, descriptor);
+        });
+    for (const auto &entry : snapshot.entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || entry.stage != want_stage)
+        continue;
+      fill_compact_window(*entry.argument, entry.range_type,
+                          entry.root_offset_key, entry.shader_register,
+                          entry.register_lower_bound,
+                          SnapshotDescriptor(snapshot, entry));
     }
     if (root && window && window->sampler.mapped && arguments) {
       auto *dst = static_cast<uint64_t *>(window->sampler.mapped);
@@ -18792,14 +19694,52 @@ private:
         dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + slot] = encoded[2];
       }
     }
+    ForEachCompiledDescriptorTableEntry(
+        snapshot, [&](const auto &entry, const DescriptorRecord &descriptor) {
+          if (static_cast<PipelineStage>(entry.stage) != want_stage)
+            return;
+          const auto &arg = entry.argument;
+          if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
+              entry.root_offset_key < max_key_plus_one) {
+            VerifyBindlessMirrorSamplerDescriptor(enc, descriptor, want_stage,
+                                                  &arg);
+            const auto lower = entry.register_lower_bound;
+            if (entry.shader_register >= lower) {
+              const auto local = entry.shader_register - lower;
+              ProbeBindlessMirrorSamplerBinding(BindlessMirrorDiagProbe{
+                  "snapshot", pipeline, window, want_stage, &arg,
+                  entry.shader_register, lower,
+                  root_offsets[entry.root_offset_key],
+                  root_offsets[entry.root_offset_key] + local, descriptor},
+                  draw_diag);
+            }
+            return;
+          }
+          if (!(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) ||
+              entry.root_offset_key >= max_key_plus_one)
+            return;
+          const auto lower = entry.register_lower_bound;
+          if (entry.shader_register < lower)
+            return;
+          const auto local = entry.shader_register - lower;
+          if (descriptor.heap_index < local)
+            return;
+          ProbeBindlessMirrorTextureBinding(BindlessMirrorDiagProbe{
+              "snapshot", pipeline, window, want_stage, &arg,
+              entry.shader_register, lower,
+              root_offsets[entry.root_offset_key],
+              root_offsets[entry.root_offset_key] + local, descriptor},
+              draw_diag);
+        });
     for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor || entry.stage != want_stage)
         continue;
-      const auto &arg = entry.argument;
+      const auto &arg = *entry.argument;
       if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
           entry.root_offset_key < max_key_plus_one) {
-        VerifyBindlessMirrorSamplerDescriptor(enc, entry.descriptor, want_stage,
+        const auto &descriptor = SnapshotDescriptor(snapshot, entry);
+        VerifyBindlessMirrorSamplerDescriptor(enc, descriptor, want_stage,
                                               &arg);
         const auto lower = entry.register_lower_bound;
         if (entry.shader_register >= lower) {
@@ -18809,7 +19749,7 @@ private:
               entry.shader_register, lower,
               root_offsets[entry.root_offset_key],
               root_offsets[entry.root_offset_key] + local,
-              entry.descriptor}, draw_diag);
+              descriptor}, draw_diag);
         }
         continue;
       }
@@ -18820,14 +19760,15 @@ private:
       if (entry.shader_register < lower)
         continue;
       const auto local = entry.shader_register - lower;
-      if (entry.descriptor.heap_index < local)
+      const auto &descriptor = SnapshotDescriptor(snapshot, entry);
+      if (descriptor.heap_index < local)
         continue;
       ProbeBindlessMirrorTextureBinding(BindlessMirrorDiagProbe{
           "snapshot", pipeline, window, want_stage, &arg,
           entry.shader_register, lower,
           root_offsets[entry.root_offset_key],
           root_offsets[entry.root_offset_key] + local,
-          entry.descriptor}, draw_diag);
+          descriptor}, draw_diag);
     }
     if (BindlessMirrorDiagEnabled() && arguments) {
       std::vector<uint8_t> diagnosed(max_key_plus_one, 0);
@@ -18886,16 +19827,48 @@ private:
   BuildSnapshotBindlessBufferTableBindings(
       const GraphicsBindingSnapshot &snapshot, PipelineStage want_stage) {
     BindlessBufferTableSnapshotStorage bindings = {};
+    ForEachCompiledDescriptorTableEntry(
+        snapshot, [&](const auto &entry, const DescriptorRecord &descriptor) {
+          if (static_cast<PipelineStage>(entry.stage) != want_stage)
+            return;
+          const auto range_type =
+              static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
+          if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
+            const auto slot = 14 * unsigned(want_stage) + entry.slot;
+            if (slot < bindings.constant_buffers.size()) {
+              bindings.constant_buffers[slot].captured = true;
+              MakeConstantBufferBindingFromDescriptor(
+                  descriptor, bindings.constant_buffers[slot].binding);
+            }
+          } else if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
+            const auto slot = kSRVBindings * unsigned(want_stage) + entry.slot;
+            if (slot < bindings.resources.size()) {
+              auto &binding = bindings.resources[slot];
+              binding.srv_captured = true;
+              MakeShaderResourceBindingFromDescriptor(
+                  device_->GetMTLDevice(), descriptor, &entry.argument,
+                  binding.srv);
+            }
+          } else if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
+                     entry.slot < kUAVBindings) {
+            auto &binding = bindings.resources[entry.slot];
+            binding.uav_captured = true;
+            MakeUnorderedAccessBindingFromDescriptor(
+                device_->GetMTLDevice(), descriptor, &entry.argument,
+                binding.uav);
+          }
+        });
     for (const auto &entry : snapshot.entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor || entry.stage != want_stage)
         continue;
+      const auto &descriptor = SnapshotDescriptor(snapshot, entry);
       if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
         const auto slot = 14 * unsigned(want_stage) + entry.slot;
         if (slot < bindings.constant_buffers.size()) {
           bindings.constant_buffers[slot].captured = true;
           MakeConstantBufferBindingFromDescriptor(
-              entry.descriptor, bindings.constant_buffers[slot].binding);
+              descriptor, bindings.constant_buffers[slot].binding);
         }
       } else if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
         const auto slot = kSRVBindings * unsigned(want_stage) + entry.slot;
@@ -18903,7 +19876,7 @@ private:
           auto &binding = bindings.resources[slot];
           binding.srv_captured = true;
           MakeShaderResourceBindingFromDescriptor(
-              device_->GetMTLDevice(), entry.descriptor, &entry.argument,
+              device_->GetMTLDevice(), descriptor, entry.argument,
               binding.srv);
         }
       } else if (entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
@@ -18911,7 +19884,7 @@ private:
           auto &binding = bindings.resources[entry.slot];
           binding.uav_captured = true;
           MakeUnorderedAccessBindingFromDescriptor(
-              device_->GetMTLDevice(), entry.descriptor, &entry.argument,
+              device_->GetMTLDevice(), descriptor, entry.argument,
               binding.uav);
         }
       }
@@ -19826,6 +20799,8 @@ private:
       PipelineState &pipeline, RootSignature &root,
       uint64_t &argbuf_offset,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
+    assert(payload.root_tables);
+    const auto &root_tables = *payload.root_tables;
     BindlessMirrorDrawDiag local_diag = {};
     BindlessMirrorDrawDiag &diag = draw_diag ? *draw_diag : local_diag;
     diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
@@ -19834,7 +20809,7 @@ private:
     if (pipeline.GetShaderAbiVersion() ==
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
       EncodeCompiledNativeArgumentTables(
-          enc, payload.root_tables, false,
+          enc, root_tables, false,
           WMTRenderStageVertex | WMTRenderStageFragment);
     }
     EncodeCompiledVertexBuffers(enc, payload.input_assembler,
@@ -19848,7 +20823,7 @@ private:
               enc, shader, key, *payload.bindless_snapshot, &diag);
         } else {
           EncodeCompiledShaderBindingsForStage<PipelineStage::Vertex>(
-              enc, payload.root_tables, pipeline, root, shader, key,
+              enc, root_tables, pipeline, root, shader, key,
               false, argbuf_offset, payload.native_root_base_buffer,
               &payload.native_vertex, &diag);
         }
@@ -19858,7 +20833,7 @@ private:
               enc, shader, key, *payload.bindless_snapshot, &diag);
         } else {
           EncodeCompiledShaderBindingsForStage<PipelineStage::Pixel>(
-              enc, payload.root_tables, pipeline, root, shader, key,
+              enc, root_tables, pipeline, root, shader, key,
               false, argbuf_offset, payload.native_root_base_buffer,
               &payload.native_pixel, &diag);
         }
@@ -19955,13 +20930,15 @@ private:
 
   void EncodeCompiledComputeBindings(
       ArgumentEncodingContext &enc, const CompiledComputePacket &packet,
+      const std::vector<CompiledCommandRootDescriptorTable> &root_tables,
+      const CompiledNativeStageBinding &native_compute,
       const CompiledPacketBindingState &binding_state,
       PipelineState &pipeline, RootSignature &root,
       uint64_t &argbuf_offset, WMT::Buffer native_root_base_buffer,
       const std::shared_ptr<GraphicsBindingSnapshot> &bindless_snapshot) {
     if (pipeline.GetShaderAbiVersion() ==
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE)
-      EncodeCompiledNativeArgumentTables(enc, packet.root_tables, true, {});
+      EncodeCompiledNativeArgumentTables(enc, root_tables, true, {});
     RecordBindlessMirrorDiagDispatch();
     EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, true);
     const auto &key = pipeline.GetShaderCacheKey();
@@ -19973,9 +20950,9 @@ private:
             enc, shader, key, *bindless_snapshot);
       } else {
         EncodeCompiledShaderBindingsForStage<PipelineStage::Compute>(
-            enc, packet.root_tables, pipeline, root, shader, key,
+            enc, root_tables, pipeline, root, shader, key,
             true, argbuf_offset, native_root_base_buffer,
-            &packet.native_compute);
+            &native_compute);
       }
     }
   }
@@ -19995,9 +20972,11 @@ private:
 
     if (compiled) {
       auto &payload = *packet.compiled_binding_payload;
+      assert(payload.root_tables);
       PublishCompiledDirectAccessListForEncode(enc, payload.direct_access);
       EncodeCompiledComputeBindings(
-          enc, payload.packet, payload.binding_state, *packet.pipeline,
+          enc, payload.packet, *payload.root_tables, payload.native_compute,
+          payload.binding_state, *packet.pipeline,
           *payload.root, argbuf_offset, payload.native_root_base_buffer,
           payload.bindless_snapshot);
     } else {
@@ -20040,14 +21019,15 @@ private:
         &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_applied);
     dxmt::perf::addFrameCounter(perf_stats,
                       &dxmt::FrameStatistics::frame_compiled_snapshot_entries,
-                      snapshot.entries.size());
+                      SnapshotBindingEntryCount(snapshot));
 
     if (auto *root = snapshot.root_signature_impl) {
       dxmt::perf::ScopedFrameDuration static_sampler_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_static_samplers_interval);
-      if (snapshot.bindless)
-        ApplyRootDescriptorTables(enc, snapshot, pipeline, false);
+      if (snapshot.bindless && snapshot.legacy_identity)
+        ApplyRootDescriptorTables(enc, *snapshot.legacy_identity, pipeline,
+                                  false);
       else
         ApplyStaticSamplers(enc, pipeline, *root, false);
     }
@@ -20056,6 +21036,38 @@ private:
       dxmt::perf::ScopedFrameDuration entries_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_snapshot_entries_interval);
+      if (snapshot.native_descriptor_recipe) {
+        const auto &recipe_entries = snapshot.native_descriptor_recipe->entries;
+        assert(recipe_entries.size() ==
+               snapshot.native_descriptor_indices.size());
+        for (size_t i = 0; i < recipe_entries.size(); ++i) {
+          const auto &entry = recipe_entries[i];
+          const auto stage = static_cast<PipelineStage>(entry.stage);
+          const auto range_type =
+              static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
+          const auto descriptor_index = snapshot.native_descriptor_indices[i];
+          if (descriptor_index == UINT32_MAX) {
+            dxmt::perf::addFrameCounter(
+                perf_stats,
+                &dxmt::FrameStatistics::
+                    frame_compiled_snapshot_clear_descriptors);
+            ClearDescriptorBinding(enc, stage, range_type, entry.slot);
+            continue;
+          }
+          const auto &descriptor = SnapshotNativeDescriptor(snapshot, i);
+          dxmt::perf::addFrameCounter(
+              perf_stats,
+              &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors);
+          DebugLogRootBinding(
+              DescriptorRangeTypeName(range_type), pipeline, false, stage,
+              entry.root_index, entry.slot, entry.shader_register,
+              entry.argument.RegisterCount ? entry.argument.RegisterSpace : 0,
+              DescriptorRecordSizeBytes(descriptor), 0, &descriptor,
+              &entry.argument);
+          BindDescriptor(enc, stage, range_type, entry.slot, descriptor,
+                         &entry.argument);
+        }
+      }
       for (const auto &entry : snapshot.entries) {
         if (entry.kind == GraphicsBindingSnapshotEntry::Kind::RootConstants) {
           dxmt::perf::addFrameCounter(
@@ -20070,6 +21082,7 @@ private:
               entry.register_space, entry.debug_size, entry.debug_address);
           BindRootConstantsSnapshot(enc, entry);
         } else if (entry.has_descriptor) {
+          const auto &descriptor = SnapshotDescriptor(snapshot, entry);
           dxmt::perf::addFrameCounter(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors);
@@ -20079,8 +21092,8 @@ private:
           if (snapshot.bindless) {
             const auto bindless_fill_begin = dxmt::clock::now();
             const auto fill_kind = MaybeFillBindlessMirrorSlot(
-                enc, entry.range_type, entry.descriptor, entry.stage,
-                &entry.argument);
+                enc, entry.range_type, descriptor, entry.stage,
+                entry.argument);
             if (fill_kind != BindlessMirrorFillKind::None) {
               dxmt::perf::addFrameCounter(
                   perf_stats,
@@ -20122,13 +21135,13 @@ private:
               entry.debug_kind ? entry.debug_kind : "snapshot", pipeline,
               false, entry.stage, entry.root_index, entry.slot,
               entry.shader_register, entry.register_space, entry.debug_size,
-              entry.debug_address, &entry.descriptor, &entry.argument);
+              entry.debug_address, &descriptor, entry.argument);
           {
             dxmt::perf::ScopedFrameDuration descriptor_scope(
                 perf_stats,
                 &dxmt::FrameStatistics::frame_compiled_snapshot_descriptors_interval);
             BindDescriptor(enc, entry.stage, entry.range_type, entry.slot,
-                           entry.descriptor, &entry.argument);
+                           descriptor, entry.argument);
           }
         } else {
           dxmt::perf::addFrameCounter(
@@ -20648,8 +21661,9 @@ private:
     return true;
   }
 
+  template <typename State>
   ReplayRenderPassAttachments BuildRenderPassAttachments(
-      const ReplayState &state,
+      const State &state,
       const PipelineGraphicsState *graphics = nullptr) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().attachUs);
     ReplayRenderPassAttachments attachments = {};
@@ -20710,6 +21724,7 @@ private:
 
     return attachments;
   }
+
 
   static bool BeginRenderPass(ArgumentEncodingContext &enc,
                               ReplayRenderPassAttachments &attachments,
@@ -20817,6 +21832,36 @@ private:
           static_cast<LONG>(std::max(0.0f, viewport.TopLeftY + viewport.Height));
       scissors.push_back(rect);
     }
+    WARN("D3D12CommandQueue: ", context,
+         " used viewport-sized default scissor rects");
+    return true;
+  }
+
+  static bool ResolveDynamicRasterRects(
+      const CompiledImmutableVector<D3D12_VIEWPORT> &viewports,
+      CompiledImmutableVector<D3D12_RECT> &scissors, const char *context) {
+    if (viewports.empty()) {
+      WARN("D3D12CommandQueue: ", context,
+           " skipped because no viewport was set");
+      return false;
+    }
+
+    if (!scissors.empty())
+      return true;
+
+    std::vector<D3D12_RECT> resolved_scissors;
+    resolved_scissors.reserve(viewports.size());
+    for (const auto &viewport : viewports) {
+      D3D12_RECT rect = {};
+      rect.left = static_cast<LONG>(std::max(0.0f, viewport.TopLeftX));
+      rect.top = static_cast<LONG>(std::max(0.0f, viewport.TopLeftY));
+      rect.right =
+          static_cast<LONG>(std::max(0.0f, viewport.TopLeftX + viewport.Width));
+      rect.bottom = static_cast<LONG>(
+          std::max(0.0f, viewport.TopLeftY + viewport.Height));
+      resolved_scissors.push_back(rect);
+    }
+    scissors = std::move(resolved_scissors);
     WARN("D3D12CommandQueue: ", context,
          " used viewport-sized default scissor rects");
     return true;
@@ -21655,13 +22700,31 @@ private:
         perDrawSubTimers().descAccessMiss++;
     }
 
+    if (snapshot->native_descriptor_recipe) {
+      const auto &recipe_entries = snapshot->native_descriptor_recipe->entries;
+      assert(recipe_entries.size() ==
+             snapshot->native_descriptor_indices.size());
+      for (size_t i = 0; i < recipe_entries.size(); ++i) {
+        const auto &entry = recipe_entries[i];
+        if (snapshot->native_descriptor_indices[i] == UINT32_MAX ||
+            entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+          continue;
+        const auto range_type =
+            static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
+        RecordDescriptorResourceAccess(
+            chunk, state, static_cast<PipelineStage>(entry.stage), range_type,
+            SnapshotNativeDescriptor(*snapshot, i),
+            DescriptorRangeTypeName(range_type));
+      }
+    }
     for (const auto &entry : snapshot->entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
           !entry.has_descriptor ||
           entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
         continue;
       RecordDescriptorResourceAccess(
-          chunk, state, entry.stage, entry.range_type, entry.descriptor,
+          chunk, state, entry.stage, entry.range_type,
+          SnapshotDescriptor(*snapshot, entry),
           DescriptorRangeTypeName(entry.range_type));
     }
     if (cache_on)
@@ -21803,6 +22866,15 @@ private:
     }
   }
 
+  static void EncodeDynamicRenderState(
+      ArgumentEncodingContext &enc,
+      const CompiledImmutableVector<D3D12_VIEWPORT> &viewports,
+      const CompiledImmutableVector<D3D12_RECT> &scissors,
+      const std::array<FLOAT, 4> &blend_factor, UINT stencil_ref) {
+    EncodeDynamicRenderState(enc, viewports.view(), scissors.view(),
+                             blend_factor, stencil_ref);
+  }
+
   static void EncodeRenderPipelineStateIfChanged(
       ArgumentEncodingContext &enc, WMT::RenderPipelineState metal_pso) {
     auto *render_encoder = enc.currentRenderEncoder();
@@ -21836,8 +22908,8 @@ private:
     std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
     UINT stencil_ref = 0;
     Rc<VisibilityResultQuery> visibility_query;
-    std::vector<D3D12_VIEWPORT> viewports;
-    std::vector<D3D12_RECT> scissors;
+    CompiledImmutableVector<D3D12_VIEWPORT> viewports;
+    CompiledImmutableVector<D3D12_RECT> scissors;
     uint64_t max_object_threadgroups = 0;
     uint32_t tess_threads_per_patch = 0;
     uint32_t tess_num_output_control_point_element = 0;
@@ -22651,7 +23723,10 @@ private:
             ? resolved_index.resource
             : nullptr;
     if (!index_resource || !resolved_index.allocation) {
-      WARN("D3D12CommandQueue: indexed draw skipped because index buffer binding is unavailable");
+      static std::atomic_flag warned_missing_index_buffer = ATOMIC_FLAG_INIT;
+      if (!warned_missing_index_buffer.test_and_set(std::memory_order_relaxed))
+        WARN("D3D12CommandQueue: indexed draw skipped because index buffer "
+             "binding is unavailable (further warnings suppressed)");
       return;
     }
     if (!IsSupportedIndexBufferFormat(state.index_buffer->Format)) {
@@ -24119,9 +25194,10 @@ private:
 
   struct PendingOperation {
     PendingOperationType type = PendingOperationType::Execute;
-    std::vector<std::vector<CommandRecord>> command_records;
-    std::vector<std::shared_ptr<const CompiledCommandList>>
-        compiled_command_lists;
+    std::vector<std::shared_ptr<const std::vector<CommandRecord>>>
+        command_records;
+    std::vector<std::shared_ptr<const SubmittedCompiledCommandListPlan>>
+        submitted_command_lists;
     std::vector<CompiledCommandDescriptorSnapshots>
         compiled_descriptor_snapshots;
     std::vector<SubmittedCommandAllocatorUse> allocator_uses;
@@ -24138,7 +25214,7 @@ private:
     PendingOperation(PendingOperation &&other) noexcept
         : type(other.type),
           command_records(std::move(other.command_records)),
-          compiled_command_lists(std::move(other.compiled_command_lists)),
+          submitted_command_lists(std::move(other.submitted_command_lists)),
           compiled_descriptor_snapshots(
               std::move(other.compiled_descriptor_snapshots)),
           allocator_uses(std::move(other.allocator_uses)),
@@ -24155,7 +25231,7 @@ private:
         ReleaseFence();
         type = other.type;
         command_records = std::move(other.command_records);
-        compiled_command_lists = std::move(other.compiled_command_lists);
+        submitted_command_lists = std::move(other.submitted_command_lists);
         compiled_descriptor_snapshots =
             std::move(other.compiled_descriptor_snapshots);
         allocator_uses = std::move(other.allocator_uses);
@@ -24499,11 +25575,10 @@ private:
                " submittedBatchesBefore=", submitted_batches_.load(std::memory_order_relaxed));
         }
         lock_begin = clock::now();
-        std::lock_guard resource_state_lock(resource_states_->mutex);
-        dxmt::perf::ScopedFrameDuration resource_state_lock_hold(
-            operation_perf_stats,
-            &dxmt::FrameStatistics::
-                frame_execute_resource_state_lock_hold_interval);
+        // dxmt_queue_mutex is device-scoped and is held for this drain. It is
+        // also acquired by swapchain resource-state invalidation, so the old
+        // nested resource-state mutex serialized exactly the same critical
+        // section a second time without protecting any additional access.
         // P1: ABA-safe — clear the binding-plan cache once per Execute batch.
         // Within a batch every referenced PSO/root-sig is pinned alive by the
         // command records, so intra-batch (PSO*,root_sig*) reuse is safe.
@@ -24524,10 +25599,19 @@ private:
         ResourceAccessBarrierBatch queue_pending_barriers =
             std::move(pending_queue_resource_barriers_);
         UINT command_list_index = 0;
-        for (const auto &records : operation.command_records) {
+        for (const auto &record_generation : operation.command_records) {
+          if (!record_generation) {
+            command_list_index++;
+            continue;
+          }
+          const auto &records = *record_generation;
+          const SubmittedCompiledCommandListPlan *submitted =
+              command_list_index < operation.submitted_command_lists.size()
+                  ? operation.submitted_command_lists[command_list_index].get()
+                  : nullptr;
           const CompiledCommandList *compiled =
-              command_list_index < operation.compiled_command_lists.size()
-                  ? operation.compiled_command_lists[command_list_index].get()
+              submitted && submitted->generation
+                  ? submitted->generation.get()
                   : nullptr;
           const CompiledCommandDescriptorSnapshots *descriptor_snapshots =
               command_list_index <
@@ -24548,7 +25632,7 @@ private:
                  " submittedBatchesBefore=", submitted_batches_.load(std::memory_order_relaxed));
           }
           const auto replay_begin = clock::now();
-          ReplayCommandRecords(records, compiled, descriptor_snapshots,
+          ReplayCommandRecords(records, submitted, descriptor_snapshots,
                                touched_resources, touched_resources_set,
                                queue_pending_barriers);
           RecordExecuteDrainTime(
@@ -24947,7 +26031,6 @@ bool CommandQueueImpl::PrepareSwapChainResize(
     }
   }
 
-  std::lock_guard resource_state_lock(resource_states_->mutex);
   for (auto *backbuffer : backbuffer_set)
     resource_states_->resources.erase(backbuffer);
   return true;
