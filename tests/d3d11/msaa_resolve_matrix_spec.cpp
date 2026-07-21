@@ -186,22 +186,6 @@ void ExpectSolidResolved(const std::vector<uint32_t> &pixels, UINT width,
                          UINT height, uint32_t expected, unsigned tolerance,
                          const char *label) {
   ASSERT_EQ(pixels.size(), static_cast<size_t>(width) * height);
-  // If ResolveSubresource is a no-op / unsupported, the destination stays
-  // clear (0). Skip rather than fail the whole batch on a missing path.
-  if (!pixels.empty() && pixels[0] == 0u && expected != 0u) {
-    bool all_zero = true;
-    for (uint32_t p : pixels) {
-      if (p != 0u) {
-        all_zero = false;
-        break;
-      }
-    }
-    if (all_zero) {
-      GTEST_SKIP() << label
-                   << ": ResolveSubresource produced an all-zero target "
-                      "(MSAA resolve not functional on this device)";
-    }
-  }
   for (UINT y = 0; y < height; ++y) {
     for (UINT x = 0; x < width; ++x) {
       const uint32_t actual = pixels[y * width + x];

@@ -19,6 +19,7 @@ d3d11_unit_sources = files(
   'interpolation_ops_spec.cpp',
   'mrt_ops_spec.cpp',
   'dispatch_matrix_spec.cpp',
+  'msaa_execution_ops_spec.cpp',
   'msaa_resolve_matrix_spec.cpp',
   'deferred_context_matrix_spec.cpp',
   'format_mip_matrix_spec.cpp',

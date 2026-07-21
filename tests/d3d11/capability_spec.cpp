@@ -173,9 +173,6 @@ class D3D11UnrealFormatSpec
     : public D3D11UnrealCapabilitySpec,
       public ::testing::WithParamInterface<FormatExpectation> {};
 
-class D3D11UnrealMsaaSpec : public D3D11UnrealCapabilitySpec,
-                            public ::testing::WithParamInterface<UINT> {};
-
 TEST_F(D3D11UnrealCapabilitySpec,
        EnumeratesHighPerformanceAdapterWithStableIdentity) {
   const auto &desc = context_.adapter_desc();
@@ -501,36 +498,43 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(info.param.name);
     });
 
-TEST_P(D3D11UnrealMsaaSpec, CreatesEveryReportedRenderTargetConfiguration) {
-  const UINT sample_count = GetParam();
-  UINT quality_levels = 0;
-  ASSERT_TRUE(HResultSucceeded(context_.device()->CheckMultisampleQualityLevels(
-      DXGI_FORMAT_R8G8B8A8_UNORM, sample_count, &quality_levels)));
+TEST_F(D3D11UnrealCapabilitySpec, CreatesEveryAdvertisedSampleCount) {
+  UINT advertised_count = 0;
+  bool advertised_single_sample = false;
+  for (UINT sample_count = 1;
+       sample_count <= D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT; ++sample_count) {
+    UINT quality_levels = 0;
+    const HRESULT query_hr =
+        context_.device()->CheckMultisampleQualityLevels(
+            DXGI_FORMAT_R8G8B8A8_UNORM, sample_count, &quality_levels);
+    if (FAILED(query_hr) || quality_levels == 0)
+      continue;
 
-  if (sample_count == 1) {
-    ASSERT_GT(quality_levels, 0u);
+    ++advertised_count;
+    advertised_single_sample |= sample_count == 1;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = sample_count;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags =
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    ComPtr<ID3D11Texture2D> texture;
+    EXPECT_TRUE(HResultSucceeded(
+        context_.device()->CreateTexture2D(&desc, nullptr, texture.put())))
+        << "advertised sample count " << sample_count
+        << " with quality level count " << quality_levels;
   }
-  if (quality_levels == 0)
-    GTEST_SKIP() << sample_count << "x MSAA is not supported by this device";
 
-  D3D11_TEXTURE2D_DESC desc = {};
-  desc.Width = 64;
-  desc.Height = 64;
-  desc.MipLevels = 1;
-  desc.ArraySize = 1;
-  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  desc.SampleDesc.Count = sample_count;
-  desc.SampleDesc.Quality = 0;
-  desc.Usage = D3D11_USAGE_DEFAULT;
-  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-  ComPtr<ID3D11Texture2D> texture;
-  EXPECT_TRUE(HResultSucceeded(
-      context_.device()->CreateTexture2D(&desc, nullptr, texture.put())));
+  EXPECT_GT(advertised_count, 0u);
+  EXPECT_TRUE(advertised_single_sample);
 }
-
-INSTANTIATE_TEST_SUITE_P(UnrealFallbackOrder, D3D11UnrealMsaaSpec,
-                         ::testing::Values(1u, 2u, 4u, 8u));
 
 TEST_F(D3D11UnrealCapabilitySpec, RejectsIncorrectFeatureStructureSize) {
   D3D11_FEATURE_DATA_THREADING threading = {};

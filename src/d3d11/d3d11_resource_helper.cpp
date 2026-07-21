@@ -364,6 +364,17 @@ CreateMTLTextureDescriptorInternal(
   } else {
     if (BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
       metal_usage |= WMTTextureUsageRenderTarget;
+    // ResolveSubresource does not require D3D11_BIND_RENDER_TARGET on its
+    // single-sample destination. Metal performs the resolve through a render
+    // pass, so resolve-capable default 2D destinations still need render-target
+    // usage even when the application requested no bind flags.
+    if (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D && SampleCount == 1 &&
+        Usage == D3D11_USAGE_DEFAULT &&
+        any_bit_set(pDevice->GetMTLPixelFormatCapability(
+                        metal_format.PixelFormat) &
+                    FormatCapability::Resolve)) {
+      metal_usage |= WMTTextureUsageRenderTarget;
+    }
     if (BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
       metal_usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
     }
