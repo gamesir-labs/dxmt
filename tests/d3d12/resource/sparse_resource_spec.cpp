@@ -436,6 +436,12 @@ protected:
   }
 
   void ExpectCopyTextureRegionRoundTripOnArraySlice(UINT subresource) {
+    if (IsSoftwareAdapter(context_.device())) {
+      GTEST_SKIP()
+          << "Native WARP stalls indefinitely when GPU copy commands access "
+             "a mapped nonzero texture-array subresource; the adjacent queue "
+             "mapping test retains WARP coverage";
+    }
     D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
     ASSERT_EQ(context_.device()->CheckFeatureSupport(
                   D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
@@ -987,6 +993,52 @@ TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsNonzeroArraySlice) {
 TEST_F(D3D12SparseResourceSpec,
        CopyTextureRegionRoundTripsMappedNonzeroArraySlice) {
   ExpectCopyTextureRegionRoundTripOnArraySlice(1);
+}
+
+TEST_F(D3D12SparseResourceSpec, MapsNonzeroArraySliceBeforeQueueSignal) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+            S_OK);
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  auto texture = CreateStandardReservedTexture(D3D12_RESOURCE_STATE_COMMON, 2);
+  ASSERT_TRUE(texture);
+  D3D12_SUBRESOURCE_TILING tiling = {};
+  UINT subresource_count = 1;
+  context_.device()->GetResourceTiling(texture.get(), nullptr, nullptr, nullptr,
+                                       &subresource_count, 1, &tiling);
+  ASSERT_EQ(subresource_count, 1u);
+  ASSERT_GT(tiling.WidthInTiles, 0u);
+  ASSERT_GT(tiling.HeightInTiles, 0u);
+
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.SizeInBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> backing_heap;
+  ASSERT_EQ(context_.device()->CreateHeap(
+                &heap_desc, IID_PPV_ARGS(backing_heap.put())),
+            S_OK);
+  ASSERT_TRUE(backing_heap);
+
+  const D3D12_TILED_RESOURCE_COORDINATE coordinate = {0, 0, 0, 1};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = 1;
+  region.UseBox = TRUE;
+  region.Width = 1;
+  region.Height = 1;
+  region.Depth = 1;
+  const D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  const UINT heap_offset = 0;
+  const UINT tile_count = 1;
+  context_.queue()->UpdateTileMappings(
+      texture.get(), 1, &coordinate, &region, backing_heap.get(), 1,
+      &range_flag, &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+
+  EXPECT_EQ(context_.SignalAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(D3D12SparseResourceSpec, TwoReservedBuffersAliasOnePhysicalTile) {
