@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -17,6 +18,11 @@ using dxmt::test::D3D12TestContext;
 ULONG PublicRefCount(IUnknown *object) {
   object->AddRef();
   return object->Release();
+}
+
+bool RunningWindowsOracle() {
+  const char *schema = std::getenv("ORACLE_SUITE_SCHEMA");
+  return schema && std::strcmp(schema, "public-api-v1") == 0;
 }
 
 struct SparseTilingCase {
@@ -707,6 +713,9 @@ TEST_F(SparseMappingMatrixSpec, MappedTileRemainsUsableWhileBackingHeapIsAlive) 
 }
 
 TEST_F(SparseMappingMatrixSpec, ResourceReleaseRemovesMappings) {
+  if (RunningWindowsOracle())
+    GTEST_SKIP() << "DXMT policy retains mapped heaps beyond native WARP";
+
   auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBufferBacking(1);
   ASSERT_TRUE(buffer);
@@ -724,6 +733,9 @@ TEST_F(SparseMappingMatrixSpec, ResourceReleaseRemovesMappings) {
 }
 
 TEST_F(SparseMappingMatrixSpec, HeapReleaseWithLiveMappingIsHandled) {
+  if (RunningWindowsOracle())
+    GTEST_SKIP() << "DXMT policy retains mapped heaps beyond native WARP";
+
   auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBufferBacking(1);
   ASSERT_TRUE(buffer);
