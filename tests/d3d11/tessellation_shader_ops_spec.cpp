@@ -545,8 +545,13 @@ TEST_F(D3D11TessellationShaderOpsSpec,
       << "center pixel was 0x" << std::hex << pixels[8 * kTargetWidth + 8];
 }
 
-TEST_F(D3D11TessellationShaderOpsSpec,
-       IsolineDensityAndDetailGenerateIndependentLines) {
+// Native drivers can lose isoline raster coverage when these cases share the
+// parallel GPU wave. Keep the isoline family in one dedicated worker.
+DXMT_GROUP_SERIAL_TESTS("D3D11TessellationShaderOpsSpec.*Isoline*",
+                        "d3d11-isoline");
+
+DXMT_SERIAL_TEST_F(D3D11TessellationShaderOpsSpec,
+                   IsolineDensityAndDetailGenerateIndependentLines) {
   constexpr UINT kDensity = 3;
   constexpr UINT kDetail = 4;
   constexpr UINT kSize = 128;
@@ -581,7 +586,8 @@ TEST_F(D3D11TessellationShaderOpsSpec,
       << "missing isoline/detail vertices:" << missing_vertices;
 }
 
-TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
+DXMT_SERIAL_TEST_F(D3D11TessellationShaderOpsSpec,
+                   ZeroDetailFactorCullsIsolinePatch) {
   const auto pixels =
       Run(IsolineHullShader("integer", 3, 0), kIsolineDomainShader,
           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2);
@@ -590,8 +596,8 @@ TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
                           [](uint32_t pixel) { return pixel == kClearColor; }));
 }
 
-TEST_F(D3D11TessellationShaderOpsSpec,
-       MaximumDensityExecutesSixtyFourIsolines) {
+DXMT_SERIAL_TEST_F(D3D11TessellationShaderOpsSpec,
+                   MaximumDensityExecutesSixtyFourIsolines) {
   constexpr UINT kDensity = 64;
   constexpr UINT kRowsPerLine = 4;
   constexpr UINT kHeight = kDensity * kRowsPerLine;
