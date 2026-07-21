@@ -14,13 +14,18 @@ place also preserves each module's own preamble, which registers a window class
 and gates the whole module on the display mode, and which a generated wrapper
 would have to reproduce exactly.
 
-Two checks fail the build rather than silently reducing coverage:
-  - every bare call inside START_TEST must end up wrapped, because one that is
-    missed runs unconditionally in every re-run and quietly breaks the isolation
-    the re-run depends on
-  - the number of calls found must match the recorded count for that module, so
-    a corpus that has moved is a loud failure at the pin bump rather than a
-    coverage change nobody notices
+One check fails the build: every bare call inside START_TEST must end up
+wrapped, because one that is missed runs unconditionally in every re-run and
+quietly breaks the isolation the re-run depends on. The number of calls found is
+also compared against a recorded count and reported when it differs, which says
+the corpus moved.
+
+The count is a report rather than a build failure because the corpus is not
+pinned: the managed cache resets its Wine checkout to the branch tip, so the
+count changes whenever Wine does and failing on it would break the build for
+reasons unrelated to the change being built. Coverage is instead enforced where
+it can be enforced honestly, at run time, by accounting for every function in
+the manifest this emits from the source actually used.
 """
 
 import argparse
@@ -89,10 +94,10 @@ def main():
         )
 
     if len(functions) != arguments.expect_count:
-        sys.exit(
-            f"{arguments.module}: found {len(functions)} test functions but the "
-            f"recorded count is {arguments.expect_count}. The corpus moved; "
-            f"re-measure and update the count so the change is reviewed."
+        print(
+            f"{arguments.module}: found {len(functions)} test functions, "
+            f"recorded {arguments.expect_count}; the Wine corpus has moved",
+            file=sys.stderr,
         )
 
     with open(arguments.output, "w", encoding="utf-8", errors="surrogateescape") as handle:

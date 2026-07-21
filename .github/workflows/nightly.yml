@@ -243,6 +243,31 @@ jobs:
           scripts/ci-self-hosted.sh --config .github/dxmt-builder-config.json \
             stage-artifact nightly-x86_64-runtime "${install_dir}/usr/local"
 
+      # Temporary: exercises the isolation transform and the re-run path.
+      # Never fails the job.
+      - name: Probe the Wine conformance re-run path
+        continue-on-error: true
+        env:
+          MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
+        run: |
+          set +e
+          scripts/dxmt-builder --config .github/dxmt-builder-config.json \
+            test --profile gcc-x64-release-full unit --suite d3d9 \
+            > d3d9-isolate-probe.log 2>&1
+          echo "d3d9 suite exit: $?"
+          tail -70 d3d9-isolate-probe.log
+          exit 0
+
+      - name: Upload isolation probe log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d9-isolate-probe-${{ github.sha }}-${{ github.run_attempt }}
+          path: d3d9-isolate-probe.log
+          if-no-files-found: warn
+          retention-days: 7
+
   package:
     runs-on: self-macos-runner
     needs: [build-x86_64-windows]

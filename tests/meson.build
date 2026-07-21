@@ -41,6 +41,10 @@ dxmt_test_dep = declare_dependency(
   include_directories: [dxmt_test_include_dirs],
 )
 
+# Defined before the API subdirectories because the d3d9 suite's build-time
+# transform runs through it.
+python3_native = find_program('python3', native: true)
+
 subdir('d3d9')
 
 # The d3d9 shader-oracle baseline is read at run time and must sit beside the
@@ -125,7 +129,6 @@ test(
   timeout: 30,
 )
 
-python3_native = find_program('python3', native: true)
 
 test(
   'ci-routing-policy',
