@@ -43,6 +43,11 @@ if dxmt_crossbuild and wine_tests_source_root != ''
     # the CRT headers stay reachable because the D3D headers include them.
     wine_tests_c_args = cc.get_supported_arguments([
       '-DSTANDALONE',
+      # The tree defines NOMINMAX project-wide to keep windows.h's min and max
+      # macros out of the C++ frontend, but these tests call them. Undefine it
+      # for just these translation units, exactly as the vendored shader runner
+      # does, rather than editing the upstream corpus.
+      '-UNOMINMAX',
       '-I' + wine_tests_sdk,
       '-I' + wine_tests_headers,
       '-I' + wine_tests_dir,
