@@ -63,8 +63,12 @@ if dxmt_crossbuild and wine_tests_source_root != ''
     # Two modules are absent for build reasons, each needing its own answer
     # rather than a flag applied to all of them:
     #   d3d9ex includes wine/test.h before d3d9.h, so test.h's console calls are
-    #     compiled before windows.h has been seen. Force-including a header
-    #     ahead of it disturbs the order the others rely on.
+    #     compiled before windows.h has been seen. Adding
+    #     `-DCOBJMACROS -include windows.h` for that module alone compiles it on
+    #     both toolchains, but the same flags break the others, so it needs
+    #     per-module arguments. It is still held back because it does not finish
+    #     a run: it hung with no summary line, so it would only ever report a
+    #     timeout until each test function runs in its own process.
     #   device both references and defines a large set of interface GUIDs on the
     #     build runner's toolchain, so it collides with the GUID library that
     #     the same references require. It needs a GUID resolution of its own.
