@@ -486,4 +486,86 @@ TEST_F(LegacyProducerConsumerExecutionSpec,
   ExpectDeviceHealthy();
 }
 
+TEST_F(LegacyProducerConsumerExecutionSpec,
+       ExpandedComputeResourceStateCapabilityMatchesExecution) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS1 options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)),
+            S_OK);
+  ASSERT_TRUE(options.ExpandedComputeResourceStates);
+
+  constexpr std::array<UINT, 2> expected = {0x13579bdfu, 0x2468ace0u};
+  auto upload = context_.CreateUploadBuffer(sizeof(expected), expected.data(),
+                                             sizeof(expected));
+  auto cbv = context_.CreateBuffer(
+      sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto indirect = context_.CreateBuffer(
+      sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = context_.CreateBuffer(
+      sizeof(expected), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(cbv);
+  ASSERT_TRUE(indirect);
+  ASSERT_TRUE(readback);
+
+  D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+  queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+  ComPtr<ID3D12CommandQueue> queue;
+  ASSERT_EQ(context_.device()->CreateCommandQueue(
+                &queue_desc, IID_PPV_ARGS(queue.put())),
+            S_OK);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                IID_PPV_ARGS(allocator.put())),
+            S_OK);
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ASSERT_EQ(context_.device()->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.get(), nullptr,
+                IID_PPV_ARGS(list.put())),
+            S_OK);
+
+  list->CopyBufferRegion(cbv.get(), 0, upload.get(), 0, sizeof(UINT));
+  list->CopyBufferRegion(indirect.get(), 0, upload.get(), sizeof(UINT),
+                         sizeof(UINT));
+  D3D12TestContext::Transition(
+      list.get(), cbv.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+  D3D12TestContext::Transition(
+      list.get(), cbv.get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(
+      list.get(), indirect.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  D3D12TestContext::Transition(
+      list.get(), indirect.get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->CopyBufferRegion(readback.get(), 0, cbv.get(), 0, sizeof(UINT));
+  list->CopyBufferRegion(readback.get(), sizeof(UINT), indirect.get(), 0,
+                         sizeof(UINT));
+  ASSERT_EQ(list->Close(), S_OK);
+
+  ComPtr<ID3D12Fence> fence;
+  ASSERT_EQ(context_.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                            IID_PPV_ARGS(fence.put())),
+            S_OK);
+  ID3D12CommandList *lists[] = {list.get()};
+  queue->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(queue->Signal(fence.get(), 1), S_OK);
+  ASSERT_EQ(context_.WaitForFence(fence.get(), 1), S_OK);
+
+  void *mapped = nullptr;
+  const D3D12_RANGE read_range = {0, sizeof(expected)};
+  ASSERT_EQ(readback->Map(0, &read_range, &mapped), S_OK);
+  std::array<UINT, 2> actual = {};
+  std::memcpy(actual.data(), mapped, sizeof(actual));
+  const D3D12_RANGE no_write = {};
+  readback->Unmap(0, &no_write);
+  EXPECT_EQ(actual, expected);
+  ExpectDeviceHealthy();
+}
+
 } // namespace
