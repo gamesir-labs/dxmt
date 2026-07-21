@@ -14,6 +14,11 @@ namespace {
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 
+ULONG PublicRefCount(IUnknown *object) {
+  object->AddRef();
+  return object->Release();
+}
+
 struct SparseTilingCase {
   D3D12_RESOURCE_DIMENSION dimension;
   UINT64 width;
@@ -699,6 +704,42 @@ TEST_F(SparseMappingMatrixSpec, MappedTileRemainsUsableWhileBackingHeapIsAlive) 
   const auto actual =
       ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
   EXPECT_EQ(actual, expected);
+}
+
+TEST_F(SparseMappingMatrixSpec, ResourceReleaseRemovesMappings) {
+  auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(1);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  const ULONG refs_before_mapping = PublicRefCount(heap.get());
+
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_GT(PublicRefCount(heap.get()), refs_before_mapping);
+
+  buffer.reset();
+  EXPECT_EQ(PublicRefCount(heap.get()), refs_before_mapping);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(SparseMappingMatrixSpec, HeapReleaseWithLiveMappingIsHandled) {
+  auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(1);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  heap.reset();
+
+  std::vector<std::uint8_t> expected(kTileSize);
+  for (UINT64 index = 0; index < kTileSize; ++index)
+    expected[index] = static_cast<std::uint8_t>((index * 47 + 29) & 0xff);
+  WriteTile(buffer.get(), 0, expected);
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST),
+            expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(SparseMappingMatrixSpec, MultiPlaneTilingMatchesFormatCapability) {
