@@ -10493,16 +10493,22 @@ private:
           state.cbv_srv_uav_heap = packet.descriptor_heaps.cbv_srv_uav;
           state.sampler_heap = packet.descriptor_heaps.sampler;
           apply_compiled_root_bindings(packet, false);
-          state.vertex_buffers.fill({});
-          for (const auto &binding : packet.input_assembler.vertex_buffers) {
-            if (binding.slot < state.vertex_buffers.size())
-              state.vertex_buffers[binding.slot] = binding.view;
-          }
-          state.index_buffer = packet.input_assembler.index_buffer;
           state.resolved_vertex_buffers.fill({});
           state.resolved_index_buffer = {};
           state.resolved_vertex_buffer_cache.clear();
           state.resolved_index_buffer_cache.clear();
+          state.vertex_buffers.fill({});
+          for (const auto &binding : packet.input_assembler.vertex_buffers) {
+            if (binding.slot < state.vertex_buffers.size()) {
+              state.vertex_buffers[binding.slot] = binding.view;
+              state.resolved_vertex_buffers[binding.slot] =
+                  ResolveReplayVertexBuffer(state, binding.view);
+            }
+          }
+          state.index_buffer = packet.input_assembler.index_buffer;
+          if (state.index_buffer)
+            state.resolved_index_buffer =
+                ResolveReplayIndexBuffer(state, *state.index_buffer);
           state.render_targets = packet.render_state.render_targets.copy();
           state.depth_stencil = packet.render_state.depth_stencil;
           state.viewports = packet.render_state.viewports.copy();
