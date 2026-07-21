@@ -50,6 +50,12 @@ configure_file(
   output: 'shader_oracle_baseline.txt',
   copy: true,
 )
+
+configure_file(
+  input: 'd3d9/wine_conformance_baseline.txt',
+  output: 'wine_conformance_baseline.txt',
+  copy: true,
+)
 subdir('d3d10')
 subdir('d3d11')
 subdir('d3d12')
@@ -177,6 +183,7 @@ alias_target(
   dxmt_wine_framework_tests,
   dxmt_wine_d3d9_tests,
   shader_oracle_runner,
+  wine_conformance_tests,
   dxmt_wine_d3d10_tests,
   dxmt_wine_d3d11_tests,
   dxmt_wine_d3d12_tests,
@@ -193,6 +200,7 @@ alias_target(
   dxmt_wine_test_scheduler,
   dxmt_wine_d3d9_tests,
   shader_oracle_runner,
+  wine_conformance_tests,
 )
 alias_target(
   'dxmt-wine-tests-d3d10',

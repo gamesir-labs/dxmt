@@ -1570,6 +1570,13 @@ private:
     environment["WINEDEBUG"] = EnvironmentValue("WINEDEBUG", "-all");
     environment["DXMT_EXPERIMENT_DX12_SUPPORT"] =
         EnvironmentValue("DXMT_EXPERIMENT_DX12_SUPPORT", "1");
+    // Wine's own conformance modules read this. Their todo_wine marks record
+    // where Wine deviates, and a todo block that succeeds counts as a failure,
+    // so running as "wine" would score this frontend being more correct than
+    // Wine as a regression. Hold the assertions at their strict meaning and let
+    // the baseline carry what is not yet met.
+    environment["WINETEST_PLATFORM"] =
+        EnvironmentValue("WINETEST_PLATFORM", "windows");
     const auto dll_overrides = EnvironmentValue(
         "WINEDLLOVERRIDES",
         "d3d9,d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");

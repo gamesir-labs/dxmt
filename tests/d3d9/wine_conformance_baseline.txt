@@ -1,0 +1,9 @@
+# Known failures in Wine's d3d9 conformance modules, one per line as
+# "<module> <substring of the failing line>". A listed failure is expected and
+# does not fail the suite; anything else does. Remove an entry once the cause is
+# fixed, so the assertion becomes a gate again.
+#
+# The modules run with WINETEST_PLATFORM=windows, so these are measured against
+# strict Windows semantics rather than Wine's own todo map.
+#
+# stateblock currently has none: it runs clean.
