@@ -200,4 +200,5 @@ if "%~3"=="0" exit /b 0
 if "%~3"=="not-run" exit /b 0
 echo ::error title=%~1 public API conformance failed::%~1 suite exited with code %~3
 for /f "usebackq delims=" %%L in (`findstr /C:"[  FAILED  ]" "%~2"`) do echo ::error title=%~1 failing case::%%L
+for /f "usebackq delims=" %%L in (`findstr /C:"missing isoline" "%~2"`) do echo ::error title=%~1 isoline assertion::%%L
 exit /b 0

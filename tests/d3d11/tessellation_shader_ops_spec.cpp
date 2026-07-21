@@ -561,6 +561,7 @@ TEST_F(D3D11TessellationShaderOpsSpec,
           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2, kSize, kSize);
   ASSERT_EQ(pixels.size(), kSize * kSize);
 
+  std::string missing_vertices;
   for (UINT line = 0; line < kDensity; ++line) {
     const float line_location = static_cast<float>(line) / kDensity;
     const uint32_t expected =
@@ -583,11 +584,13 @@ TEST_F(D3D11TessellationShaderOpsSpec,
               expected);
         }
       }
-      EXPECT_TRUE(found) << "isoline " << line << " detail vertex " << vertex
-                         << " was not rasterized near (" << center_x << ", "
-                         << center_y << ")";
+      if (!found)
+        missing_vertices += " (" + std::to_string(line) + "," +
+                            std::to_string(vertex) + ")";
     }
   }
+  EXPECT_TRUE(missing_vertices.empty())
+      << "missing isoline/detail vertices:" << missing_vertices;
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
@@ -609,6 +612,7 @@ TEST_F(D3D11TessellationShaderOpsSpec,
                           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
                           kTargetWidth, kHeight);
   ASSERT_EQ(pixels.size(), kTargetWidth * kHeight);
+  std::string missing_lines;
   for (UINT line = 0; line < kDensity; ++line) {
     const float location = static_cast<float>(line) / kDensity;
     const uint32_t expected = PackColor(1.0f - location, location, 1.0f);
@@ -619,9 +623,10 @@ TEST_F(D3D11TessellationShaderOpsSpec,
       for (UINT x = 0; x < kTargetWidth; ++x)
         found |= ColorMatches(pixels[y * kTargetWidth + x], expected);
     }
-    EXPECT_TRUE(found) << "isoline " << line << " was not rasterized near row "
-                       << center_y;
+    if (!found)
+      missing_lines += " " + std::to_string(line);
   }
+  EXPECT_TRUE(missing_lines.empty()) << "missing isolines:" << missing_lines;
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroEdgeFactorCullsTrianglePatch) {
