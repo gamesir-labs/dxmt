@@ -3758,7 +3758,7 @@ public:
       return;
     if (RejectCommandListType("BeginRenderPass", kDirectList))
       return;
-    if (RejectCommandInsideRenderPass("BeginRenderPass"))
+    if (RejectCommandInsideRenderPass("BeginRenderPass", E_INVALIDARG))
       return;
     if ((render_targets_count && !render_targets) ||
         render_targets_count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) {
@@ -3839,7 +3839,7 @@ public:
       return;
     if (!render_pass_active_) {
       if (recording_error_ == S_OK)
-        recording_error_ = E_FAIL;
+        recording_error_ = E_INVALIDARG;
       return;
     }
     render_pass_active_ = false;
@@ -4375,11 +4375,12 @@ private:
     return true;
   }
 
-  bool RejectCommandInsideRenderPass(const char *command) {
+  bool RejectCommandInsideRenderPass(const char *command,
+                                     HRESULT error = E_FAIL) {
     if (!render_pass_active_)
       return false;
     if (recording_error_ == S_OK)
-      recording_error_ = E_FAIL;
+      recording_error_ = error;
     WARN("D3D12GraphicsCommandList: ", command,
          " is not valid while a render pass is active");
     return true;

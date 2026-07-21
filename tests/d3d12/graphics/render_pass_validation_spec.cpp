@@ -39,13 +39,13 @@ TEST_F(RenderPassValidationSpec, BeginWhileActiveRejectsNestedPass) {
   list4_->BeginRenderPass(0, nullptr, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
   list4_->EndRenderPass();
 
-  EXPECT_EQ(context_.list()->Close(), E_FAIL);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
 }
 
 TEST_F(RenderPassValidationSpec, EndWithoutBeginRejectsCommandList) {
   list4_->EndRenderPass();
 
-  EXPECT_EQ(context_.list()->Close(), E_FAIL);
+  EXPECT_EQ(context_.list()->Close(), E_INVALIDARG);
 }
 
 TEST_F(RenderPassValidationSpec, CloseWhilePassIsOpenFails) {
