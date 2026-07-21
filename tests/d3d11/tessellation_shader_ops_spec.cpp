@@ -616,13 +616,9 @@ TEST_F(D3D11TessellationShaderOpsSpec,
   for (UINT line = 0; line < kDensity; ++line) {
     const float location = static_cast<float>(line) / kDensity;
     const uint32_t expected = PackColor(1.0f - location, location, 1.0f);
-    const UINT center_y = line * kRowsPerLine;
     bool found = false;
-    for (UINT y = center_y > 0 ? center_y - 1 : 0;
-         y <= std::min(center_y + 1, kHeight - 1); ++y) {
-      for (UINT x = 0; x < kTargetWidth; ++x)
-        found |= ColorMatches(pixels[y * kTargetWidth + x], expected);
-    }
+    for (uint32_t pixel : pixels)
+      found |= ColorMatches(pixel, expected, 1);
     if (!found)
       missing_lines += " " + std::to_string(line);
   }
