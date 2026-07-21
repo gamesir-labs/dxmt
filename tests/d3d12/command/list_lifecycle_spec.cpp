@@ -143,6 +143,30 @@ TEST_F(CommandListLifecycleSpec, SecondCloseFails) {
   EXPECT_EQ(context_.list()->Close(), E_FAIL);
 }
 
+TEST_F(CommandListLifecycleSpec, FailedCloseCannotBeReset) {
+  ComPtr<ID3D12GraphicsCommandList4> list4;
+  ASSERT_EQ(context_.list()->QueryInterface(IID_PPV_ARGS(list4.put())), S_OK);
+  list4->BeginRenderPass(0, nullptr, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+
+  const HRESULT close_result = context_.list()->Close();
+  ASSERT_EQ(close_result, E_FAIL);
+  EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr),
+            close_result);
+}
+
+TEST_F(CommandListLifecycleSpec, FailedCloseErrorIsStickyAcrossReset) {
+  ComPtr<ID3D12GraphicsCommandList4> list4;
+  ASSERT_EQ(context_.list()->QueryInterface(IID_PPV_ARGS(list4.put())), S_OK);
+  list4->BeginRenderPass(0, nullptr, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+  list4->BeginRenderPass(0, nullptr, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+  list4->EndRenderPass();
+
+  const HRESULT close_result = context_.list()->Close();
+  ASSERT_EQ(close_result, E_INVALIDARG);
+  EXPECT_EQ(context_.list()->Reset(context_.allocator(), nullptr),
+            close_result);
+}
+
 TEST_F(CommandListLifecycleSpec, CreateCommandListRejectsInvalidNodeMask) {
   ComPtr<ID3D12GraphicsCommandList> list;
   EXPECT_EQ(context_.device()->CreateCommandList(

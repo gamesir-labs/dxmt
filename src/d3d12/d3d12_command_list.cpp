@@ -2235,7 +2235,7 @@ public:
     if (!closed_)
       return E_FAIL;
     if (recording_error_)
-      return E_FAIL;
+      return recording_error_;
     if (!allocator)
       return WARN_E_INVALIDARG(__func__);
 
