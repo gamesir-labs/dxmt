@@ -11,8 +11,9 @@
 
 namespace {
 
-using dxmt::test::ComPtr;
+using dxmt::test::ColorsMatch;
 using dxmt::test::CompileShader;
+using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
 
 enum class SparseCase {
@@ -550,9 +551,13 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
   if (sparse_case == SparseCase::CreateOnly)
     return;
 
+  ComPtr<ID3D12DescriptorHeap> source_descriptor_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                    1, false);
   ComPtr<ID3D12DescriptorHeap> descriptor_heap =
       context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                                     2, true);
+  ASSERT_TRUE(source_descriptor_heap);
   ASSERT_TRUE(descriptor_heap);
   D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
   srv_desc.Format = resource_desc.Format;
@@ -561,13 +566,13 @@ void D3D12SparseResourceSpec::RunCase(SparseCase sparse_case) {
   srv_desc.Texture2D.MipLevels = resource_desc.MipLevels;
   context_.device()->CreateShaderResourceView(
       texture.get(), &srv_desc,
-      context_.CpuDescriptorHandle(descriptor_heap.get(), 0));
+      context_.CpuDescriptorHandle(source_descriptor_heap.get(), 0));
   if (sparse_case == SparseCase::WriteSrv)
     return;
 
   context_.device()->CopyDescriptorsSimple(
       1, context_.CpuDescriptorHandle(descriptor_heap.get(), 1),
-      context_.CpuDescriptorHandle(descriptor_heap.get(), 0),
+      context_.CpuDescriptorHandle(source_descriptor_heap.get(), 0),
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   if (sparse_case == SparseCase::CopySrv)
     return;
@@ -728,6 +733,87 @@ TEST_F(D3D12SparseResourceSpec, CopiesIntoUnmappedReservedTexture) {
 
 TEST_F(D3D12SparseResourceSpec, CopiesIntoMappedReservedTexture) {
   RunCase(SparseCase::CopyToMapped);
+}
+
+TEST_F(D3D12SparseResourceSpec, ClearsMappedReservedRenderTargetThenCopies) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
+                                                   &options, sizeof(options)),
+            S_OK);
+  if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+    GTEST_SKIP() << "Tiled resources are not supported";
+
+  constexpr UINT width = 256;
+  constexpr UINT height = 256;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ComPtr<ID3D12Resource> texture;
+  ASSERT_EQ(context_.device()->CreateReservedResource(
+                &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                IID_PPV_ARGS(texture.put())),
+            S_OK);
+  ASSERT_TRUE(texture);
+
+  UINT total_tiles = 0;
+  context_.device()->GetResourceTiling(texture.get(), &total_tiles, nullptr,
+                                       nullptr, nullptr, 0, nullptr);
+  ASSERT_GT(total_tiles, 0u);
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.SizeInBytes =
+      UINT64(total_tiles) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> backing;
+  ASSERT_EQ(
+      context_.device()->CreateHeap(&heap_desc, IID_PPV_ARGS(backing.put())),
+      S_OK);
+  ASSERT_TRUE(backing);
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = total_tiles;
+  D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_offset = 0;
+  context_.queue()->UpdateTileMappings(
+      texture.get(), 1, &coordinate, &region, backing.get(), 1, &range_flag,
+      &heap_offset, &total_tiles, D3D12_TILE_MAPPING_FLAG_NONE);
+
+  auto rtv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  ASSERT_TRUE(rtv_heap);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(texture.get(), nullptr, rtv);
+  constexpr FLOAT clear_color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+  context_.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  D3D12TestContext::Transition(context_.list(), texture.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  dxmt::test::TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(texture.get(), &readback), S_OK);
+  ASSERT_EQ(readback.width, width);
+  ASSERT_EQ(readback.height, height);
+  constexpr std::uint32_t expected = 0xffbf8040u;
+  for (UINT y = 0; y < height; ++y) {
+    for (UINT x = 0; x < width; ++x) {
+      std::uint32_t pixel = 0;
+      std::memcpy(&pixel,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel),
+                  sizeof(pixel));
+      EXPECT_TRUE(ColorsMatch(pixel, expected, 1))
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsSingleMappedTile) {

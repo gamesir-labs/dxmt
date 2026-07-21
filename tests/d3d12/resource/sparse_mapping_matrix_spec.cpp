@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -13,6 +14,16 @@ namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+
+ULONG PublicRefCount(IUnknown *object) {
+  object->AddRef();
+  return object->Release();
+}
+
+bool RunningWindowsOracle() {
+  const char *schema = std::getenv("ORACLE_SUITE_SCHEMA");
+  return schema && std::strcmp(schema, "public-api-v1") == 0;
+}
 
 struct SparseTilingCase {
   D3D12_RESOURCE_DIMENSION dimension;
@@ -527,6 +538,60 @@ TEST_F(SparseMappingMatrixSpec, NullRangeRemovesMappingsAndCanRecover) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST_F(SparseMappingMatrixSpec, ReadsMappedAndUnmappedBufferTilesInSingleCopy) {
+  if (tiled_resources_tier_ < D3D12_TILED_RESOURCES_TIER_2)
+    GTEST_SKIP() << "Unmapped tile reads are undefined below tier 2";
+
+  constexpr UINT tile_count = 2;
+  constexpr UINT64 copy_size = UINT64(tile_count) * kTileSize;
+  auto buffer = CreateBuffer(tile_count, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(1);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  MapRange(buffer.get(), nullptr, 1, 1, D3D12_TILE_RANGE_FLAG_NULL);
+
+  std::vector<std::uint8_t> source(copy_size);
+  for (UINT64 index = 0; index < source.size(); ++index)
+    source[index] = static_cast<std::uint8_t>((index * 37 + 19) & 0xff);
+  auto upload =
+      context_.CreateUploadBuffer(copy_size, source.data(), source.size());
+  std::vector<std::uint8_t> initial(copy_size, 0xa5);
+  auto initial_upload =
+      context_.CreateUploadBuffer(copy_size, initial.data(), initial.size());
+  auto output = context_.CreateBuffer(copy_size, D3D12_HEAP_TYPE_DEFAULT,
+                                      D3D12_RESOURCE_FLAG_NONE,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(initial_upload);
+  ASSERT_TRUE(output);
+  context_.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
+                                    copy_size);
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = tile_count;
+  context_.list()->CopyTiles(
+      buffer.get(), &coordinate, &region, upload.get(), 0,
+      D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+  D3D12TestContext::Transition(context_.list(), buffer.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context_.list()->CopyTiles(
+      buffer.get(), &coordinate, &region, output.get(), 0,
+      D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> actual;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), copy_size, &actual), S_OK);
+  auto expected = source;
+  std::fill(expected.begin() + kTileSize, expected.end(), 0);
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(SparseMappingMatrixSpec, RepeatedNullAndMapRangesRecover) {
   auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBacking(1);
@@ -546,6 +611,49 @@ TEST_F(SparseMappingMatrixSpec, RepeatedNullAndMapRangesRecover) {
   const auto actual =
       ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
   EXPECT_EQ(actual, expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(SparseMappingMatrixSpec, FragmentedSparseHeapCanReuseFreedRanges) {
+  auto buffer = CreateBuffer(4, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(3);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  MapRange(buffer.get(), heap.get(), 0, 3, D3D12_TILE_RANGE_FLAG_NONE);
+
+  std::vector<std::uint8_t> first(kTileSize);
+  std::vector<std::uint8_t> freed(kTileSize);
+  std::vector<std::uint8_t> third(kTileSize);
+  std::vector<std::uint8_t> replacement(kTileSize);
+  for (UINT64 index = 0; index < kTileSize; ++index) {
+    first[index] = static_cast<std::uint8_t>((index * 17 + 3) & 0xff);
+    freed[index] = static_cast<std::uint8_t>((index * 29 + 11) & 0xff);
+    third[index] = static_cast<std::uint8_t>((index * 43 + 19) & 0xff);
+    replacement[index] =
+        static_cast<std::uint8_t>((index * 61 + 37) & 0xff);
+  }
+  WriteTile(buffer.get(), 0, first);
+  WriteTile(buffer.get(), 1, freed);
+  WriteTile(buffer.get(), 2, third);
+
+  MapRange(buffer.get(), nullptr, 1, 1, D3D12_TILE_RANGE_FLAG_NULL);
+  MapRange(buffer.get(), heap.get(), 3, 1, D3D12_TILE_RANGE_FLAG_NONE, 1);
+  EXPECT_EQ(ReadTile(buffer.get(), 3, D3D12_RESOURCE_STATE_COPY_DEST), freed);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  D3D12TestContext::Transition(context_.list(), buffer.get(),
+                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  WriteTile(buffer.get(), 3, replacement);
+
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST), first);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), 2, D3D12_RESOURCE_STATE_COPY_SOURCE), third);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), 3, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            replacement);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -602,6 +710,48 @@ TEST_F(SparseMappingMatrixSpec, MappedTileRemainsUsableWhileBackingHeapIsAlive) 
   const auto actual =
       ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
   EXPECT_EQ(actual, expected);
+}
+
+TEST_F(SparseMappingMatrixSpec, ResourceReleaseRemovesMappings) {
+  if (RunningWindowsOracle())
+    GTEST_SKIP() << "DXMT policy retains mapped heaps beyond native WARP";
+
+  auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(1);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  const ULONG refs_before_mapping = PublicRefCount(heap.get());
+
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_GT(PublicRefCount(heap.get()), refs_before_mapping);
+
+  buffer.reset();
+  EXPECT_EQ(PublicRefCount(heap.get()), refs_before_mapping);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(SparseMappingMatrixSpec, HeapReleaseWithLiveMappingIsHandled) {
+  if (RunningWindowsOracle())
+    GTEST_SKIP() << "DXMT policy retains mapped heaps beyond native WARP";
+
+  auto buffer = CreateBuffer(1, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(1);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  heap.reset();
+
+  std::vector<std::uint8_t> expected(kTileSize);
+  for (UINT64 index = 0; index < kTileSize; ++index)
+    expected[index] = static_cast<std::uint8_t>((index * 47 + 29) & 0xff);
+  WriteTile(buffer.get(), 0, expected);
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST),
+            expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(SparseMappingMatrixSpec, MultiPlaneTilingMatchesFormatCapability) {
