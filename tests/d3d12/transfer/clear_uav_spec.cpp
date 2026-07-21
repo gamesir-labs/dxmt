@@ -269,6 +269,28 @@ TEST_F(ClearUavSpec, ClearUintBufferAtOddElementOffset) {
             (std::vector<std::uint32_t>(expected.begin(), expected.end())));
 }
 
+TEST_F(ClearUavSpec, ClearRawBufferUint) {
+  std::array<std::uint32_t, 8> expected;
+  expected.fill(0xdeadbeef);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+  desc.Format = DXGI_FORMAT_R32_TYPELESS;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  desc.Buffer.FirstElement = 2;
+  desc.Buffer.NumElements = 4;
+  desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  auto uav = CreateBufferUav(desc, expected);
+  ASSERT_TRUE(uav.resource);
+  ASSERT_TRUE(uav.gpu_heap);
+  ASSERT_TRUE(uav.cpu_heap);
+  constexpr std::array<UINT, 4> clear = {0x10203040, 2, 3, 4};
+  std::fill(expected.begin() + 2, expected.begin() + 6, clear[0]);
+
+  std::vector<std::uint32_t> actual(expected.size());
+  ClearAndReadback(uav, clear, &actual);
+  EXPECT_EQ(actual,
+            (std::vector<std::uint32_t>(expected.begin(), expected.end())));
+}
+
 TEST_F(ClearUavSpec, ClearStructuredBuffer) {
   std::array<std::uint32_t, 16> expected;
   expected.fill(0xdeadbeef);
