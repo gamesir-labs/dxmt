@@ -43,6 +43,14 @@ DWORD TimeoutMs() {
   return kDefaultTimeoutMs;
 }
 
+// The builder sets this for a staged run, where a missing runner or a missing
+// dxmt runtime is a defect rather than a configuration this test may excuse. A
+// plain build-tree run leaves it unset and keeps the skip.
+bool RuntimeRequired() {
+  const char *value = std::getenv("DXMT_TEST_REQUIRE_RUNTIME");
+  return value != nullptr && value[0] == '1';
+}
+
 std::wstring ExecutableDirectory() {
   auto path = dxmt::test::WineExecutablePath();
   const auto separator = path.find_last_of(L"\\/");
@@ -239,14 +247,22 @@ TEST_P(ShaderOracleTest, MatchesBaseline) {
   const char *test_case = GetParam();
 
   const auto runner = RunnerPath();
-  if (runner.empty())
+  if (runner.empty()) {
+    if (RuntimeRequired())
+      FAIL() << "shader oracle runner not found next to the test image; a "
+                "staged run must carry it";
     GTEST_SKIP() << "shader oracle runner not found next to the test image; "
                     "set DXMT_D3D9_ORACLE_RUNNER to override";
+  }
 
   const auto corpus = CorpusDirectory();
-  if (corpus.empty())
+  if (corpus.empty()) {
+    if (RuntimeRequired())
+      FAIL() << "shader oracle corpus not found next to the test image; a "
+                "staged run must carry it";
     GTEST_SKIP() << "shader oracle corpus not found next to the test image; "
                     "set DXMT_D3D9_ORACLE_CORPUS to override";
+  }
 
   const auto corpus_file =
       corpus + L"\\" + dxmt::test::WidenWineArgument(test_case) + L".shader_test";
@@ -261,6 +277,16 @@ TEST_P(ShaderOracleTest, MatchesBaseline) {
       << "shader oracle produced no summary line, so it did not finish the "
          "corpus file (exit " << result.exit_code << ")\n"
       << Tail(result.output, 20);
+
+  // Wine serves its own d3d9 when the dxmt runtime is not on the search path,
+  // and the corpus would then pass against the wrong driver and report green.
+  // The runner echoes the adapter's driver string, and dxmt is the only one
+  // that names itself, so assert on it wherever a runtime is expected.
+  if (RuntimeRequired())
+    ASSERT_NE(result.output.find("DXMT (Metal)"), std::string::npos)
+        << "the corpus ran against a driver that is not dxmt, so this result "
+           "says nothing about dxmt\n"
+        << Tail(result.output, 20);
 
   const auto baseline = LoadBaseline();
   std::vector<std::string> unexpected;

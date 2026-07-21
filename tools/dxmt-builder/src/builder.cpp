@@ -904,7 +904,7 @@ private:
         << "commands:\n"
         << "  bootstrap [all|host|wine-x64|llvm-mingw|llvm-project|llvm-darwin-x64|llvm-win]...\n"
         << "  configure [--profile NAME]\n"
-        << "  build [--profile NAME] <runtime|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
+        << "  build [--profile NAME] <runtime|d3d9|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
         << "  test [--profile NAME] [all|unit|integration|performance] [--suite NAME] [--test-args ARG]\n"
         << "  package [--profile NAME] windows-oracle [--dest PATH]\n"
         << "  wine-exec [--] <wine-args...>   # Meson/benchmark Wine launcher\n"
@@ -1467,11 +1467,12 @@ private:
     if (targets.empty())
       return {"runtime"};
     static const std::set<std::string> supported = {
-        "runtime", "d3d10", "d3d11", "d3d12", "tests-framework",
+        "runtime", "d3d9", "d3d10", "d3d11", "d3d12", "tests-framework",
         "tests-d3d9", "tests-d3d10", "tests-d3d11", "tests-d3d12",
         "tests-all", "benchmarks"};
     static const std::map<std::string, std::string> meson_targets = {
         {"runtime", "dxmt-runtime"},
+        {"d3d9", "dxmt-d3d9"},
         {"d3d10", "dxmt-d3d10"},
         {"d3d11", "dxmt-d3d11"},
         {"d3d12", "dxmt-d3d12"},
@@ -1571,7 +1572,7 @@ private:
         EnvironmentValue("DXMT_EXPERIMENT_DX12_SUPPORT", "1");
     const auto dll_overrides = EnvironmentValue(
         "WINEDLLOVERRIDES",
-        "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");
+        "d3d9,d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");
     // Managed test prefixes must initialize without interactive dependency
     // installers. Wine's mscoree registration can launch
     // `control.exe appwiz.cpl install_mono` while wineboot updates a prefix, so
@@ -1680,6 +1681,9 @@ private:
       install_tags = "runtime-common,runtime-metal3,runtime-metal4,nvext";
     } else if (suite == "framework") {
       build_targets = "dxmt-wine-tests-framework";
+    } else if (suite == "d3d9") {
+      build_targets = "dxmt-d3d9 dxmt-wine-tests-d3d9";
+      install_tags = "runtime-common,runtime-metal3";
     } else if (suite == "d3d10") {
       build_targets = "dxmt-d3d10 dxmt-wine-tests-d3d10";
       install_tags = "runtime-common,runtime-metal3";
@@ -1741,10 +1745,13 @@ private:
 
     std::vector<std::string> required;
     if (suite == "all") {
-      required = {"x86_64-windows/d3d11.dll", "x86_64-windows/d3d12.dll",
+      required = {"x86_64-windows/d3d9.dll", "x86_64-windows/d3d11.dll",
+                  "x86_64-windows/d3d12.dll",
                   "x86_64-windows/dxgi.dll", "x86_64-windows/winemetal.dll",
                   "x86_64-windows/winemetal4.dll", "x86_64-unix/winemetal.so",
                   "x86_64-unix/winemetal4.so"};
+    } else if (suite == "d3d9") {
+      required = {"x86_64-windows/d3d9.dll", "x86_64-unix/winemetal.so"};
     } else if (suite == "d3d10") {
       required = {"x86_64-windows/d3d10core.dll", "x86_64-windows/d3d11.dll",
                   "x86_64-windows/dxgi.dll", "x86_64-unix/winemetal.so"};
@@ -1973,8 +1980,8 @@ private:
         throw std::runtime_error("unexpected test argument: " + remaining[index]);
       }
     }
-    static const std::set<std::string> suites = {"all", "framework", "d3d10",
-                                                 "d3d11", "d3d12"};
+    static const std::set<std::string> suites = {"all",   "framework", "d3d9",
+                                                 "d3d10", "d3d11",     "d3d12"};
     if (!suites.contains(suite))
       throw std::runtime_error("unsupported test suite: " + suite);
 
@@ -2196,7 +2203,8 @@ private:
     std::string tags;
     if (component == "d3d12")
       tags = "runtime-common,runtime-metal4";
-    else if (component == "d3d10" || component == "d3d11")
+    else if (component == "d3d9" || component == "d3d10" ||
+             component == "d3d11")
       tags = "runtime-common,runtime-metal3";
     else
       tags = "runtime-common,runtime-metal3,runtime-metal4,nvext";
