@@ -15,7 +15,7 @@
 
 # The corpus integrity lint is host-native and needs neither wine nor a GPU, so
 # it runs on every configuration, exactly like the other tests/dx9 python lints.
-test('dx9-shader-oracle-corpus-lint', python3,
+test('dx9-shader-oracle-corpus-lint', python3_native,
   args: [ files('corpus_lint.py') ],
   suite: 'host')
 
