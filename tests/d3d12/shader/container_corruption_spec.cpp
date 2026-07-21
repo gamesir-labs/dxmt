@@ -3,6 +3,7 @@
 
 #include "d3d12_test_context.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,131 @@ std::uint32_t ReadU32(const std::vector<std::uint8_t> &bytes,
 void WriteU32(std::vector<std::uint8_t> &bytes, std::size_t offset,
               std::uint32_t value) {
   std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+std::uint32_t LoadLe32(const std::uint8_t *data) {
+  return std::uint32_t(data[0]) | (std::uint32_t(data[1]) << 8) |
+         (std::uint32_t(data[2]) << 16) | (std::uint32_t(data[3]) << 24);
+}
+
+void StoreLe32(std::uint8_t *data, std::uint32_t value) {
+  data[0] = static_cast<std::uint8_t>(value);
+  data[1] = static_cast<std::uint8_t>(value >> 8);
+  data[2] = static_cast<std::uint8_t>(value >> 16);
+  data[3] = static_cast<std::uint8_t>(value >> 24);
+}
+
+std::uint32_t RotateLeft(std::uint32_t value, unsigned int shift) {
+  return (value << shift) | (value >> (32 - shift));
+}
+
+void TransformChecksumBlock(std::array<std::uint32_t, 4> *state,
+                            const std::uint8_t *block) {
+  static constexpr std::array<std::uint32_t, 64> kConstants = {
+      0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a,
+      0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+      0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340,
+      0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+      0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8,
+      0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+      0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+      0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+      0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92,
+      0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+      0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
+  static constexpr std::array<unsigned int, 64> kShifts = {
+      7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+      5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
+      4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+      6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+  std::array<std::uint32_t, 16> words = {};
+  for (std::size_t index = 0; index < words.size(); ++index)
+    words[index] = LoadLe32(block + index * sizeof(std::uint32_t));
+
+  std::uint32_t a = (*state)[0];
+  std::uint32_t b = (*state)[1];
+  std::uint32_t c = (*state)[2];
+  std::uint32_t d = (*state)[3];
+  for (std::uint32_t index = 0; index < 64; ++index) {
+    std::uint32_t function = 0;
+    std::uint32_t word_index = 0;
+    if (index < 16) {
+      function = (b & c) | (~b & d);
+      word_index = index;
+    } else if (index < 32) {
+      function = (d & b) | (~d & c);
+      word_index = (5 * index + 1) % 16;
+    } else if (index < 48) {
+      function = b ^ c ^ d;
+      word_index = (3 * index + 5) % 16;
+    } else {
+      function = c ^ (b | ~d);
+      word_index = (7 * index) % 16;
+    }
+
+    const std::uint32_t next_d = d;
+    d = c;
+    c = b;
+    b += RotateLeft(a + function + kConstants[index] + words[word_index],
+                    kShifts[index]);
+    a = next_d;
+  }
+
+  (*state)[0] += a;
+  (*state)[1] += b;
+  (*state)[2] += c;
+  (*state)[3] += d;
+}
+
+std::array<std::uint8_t, 16> ComputeDxbcChecksum(const std::uint8_t *bytes,
+                                                 std::size_t size) {
+  constexpr std::size_t kBlockSize = 64;
+  constexpr std::size_t kHashedDataOffset = 20;
+  std::array<std::uint32_t, 4> state = {0x67452301, 0xefcdab89, 0x98badcfe,
+                                        0x10325476};
+
+  const std::uint8_t *data = bytes + kHashedDataOffset;
+  std::size_t remaining = size - kHashedDataOffset;
+  const auto bit_count = static_cast<std::uint32_t>(remaining << 3);
+  while (remaining >= kBlockSize) {
+    TransformChecksumBlock(&state, data);
+    data += kBlockSize;
+    remaining -= kBlockSize;
+  }
+
+  std::array<std::uint8_t, kBlockSize> block = {};
+  if (remaining <= 55) {
+    StoreLe32(block.data(), bit_count);
+    std::memcpy(block.data() + 4, data, remaining);
+    block[4 + remaining] = 0x80;
+  } else {
+    std::memcpy(block.data(), data, remaining);
+    block[remaining] = 0x80;
+    TransformChecksumBlock(&state, block.data());
+    block = {};
+    StoreLe32(block.data(), bit_count);
+  }
+  StoreLe32(block.data() + 60, (bit_count >> 2) | 1);
+  TransformChecksumBlock(&state, block.data());
+
+  std::array<std::uint8_t, 16> checksum = {};
+  for (std::size_t index = 0; index < state.size(); ++index)
+    StoreLe32(checksum.data() + index * sizeof(std::uint32_t), state[index]);
+  return checksum;
+}
+
+bool HasValidDxbcChecksum(const std::vector<std::uint8_t> &bytes,
+                          std::size_t size) {
+  if (size <= 20 || size > bytes.size())
+    return false;
+  const auto checksum = ComputeDxbcChecksum(bytes.data(), size);
+  return !std::memcmp(bytes.data() + 4, checksum.data(), checksum.size());
+}
+
+void RecomputeDxbcChecksum(std::vector<std::uint8_t> *bytes, std::size_t size) {
+  const auto checksum = ComputeDxbcChecksum(bytes->data(), size);
+  std::memcpy(bytes->data() + 4, checksum.data(), checksum.size());
 }
 
 struct ShaderContainerLayout {
@@ -184,7 +310,7 @@ CorruptedShader CorruptShader(const std::vector<std::uint8_t> &valid,
     WriteU32(result.bytes, 28, std::numeric_limits<std::uint32_t>::max());
     break;
   case ShaderContainerCorruption::ChunkOffsetBeforeTable:
-    WriteU32(result.bytes, 32, 0);
+    WriteU32(result.bytes, 32, 24);
     break;
   case ShaderContainerCorruption::ChunkOffsetPastEnd:
     WriteU32(result.bytes, 32, static_cast<std::uint32_t>(valid.size()));
@@ -233,6 +359,9 @@ CorruptedShader CorruptShader(const std::vector<std::uint8_t> &valid,
     break;
   }
   }
+  if (corruption != ShaderContainerCorruption::InvalidChecksum &&
+      result.reported_size > 20)
+    RecomputeDxbcChecksum(&result.bytes, result.reported_size);
   return result;
 }
 
@@ -253,6 +382,7 @@ protected:
         static_cast<const std::uint8_t *>(shader.bytecode->GetBufferPointer());
     shader_.assign(data, data + shader.bytecode->GetBufferSize());
     ASSERT_TRUE(InspectShaderContainer(shader_, &layout_));
+    ASSERT_TRUE(HasValidDxbcChecksum(shader_, shader_.size()));
   }
 
   D3D12TestContext context_;
@@ -274,6 +404,12 @@ TEST_P(ShaderContainerSpec, CorruptionCorpus) {
 
   const auto corrupted = CorruptShader(shader_, layout_, GetParam().corruption);
   ASSERT_LE(corrupted.reported_size, corrupted.bytes.size());
+  if (GetParam().corruption == ShaderContainerCorruption::InvalidChecksum) {
+    ASSERT_FALSE(
+        HasValidDxbcChecksum(corrupted.bytes, corrupted.reported_size));
+  } else if (corrupted.reported_size > 20) {
+    ASSERT_TRUE(HasValidDxbcChecksum(corrupted.bytes, corrupted.reported_size));
+  }
 
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = root_signature_.get();
