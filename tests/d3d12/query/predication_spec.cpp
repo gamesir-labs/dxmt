@@ -12,9 +12,11 @@
 namespace {
 
 using dxmt::test::ClearBufferComputeShader;
+using dxmt::test::ColorsMatch;
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::TextureReadback;
 
 class PredicationSpec : public ::testing::Test {
 protected:
@@ -210,6 +212,149 @@ TEST_F(PredicationSpec,
 TEST_F(PredicationSpec, DisablePredicationRestoresUnconditionalDispatch) {
   ExpectPredicatedDispatch(0, D3D12_PREDICATION_OP_EQUAL_ZERO, false, 0, false,
                            false, true);
+}
+
+TEST_F(PredicationSpec,
+       SinglePredicateSkipsMultipleDispatchesUntilDisabled) {
+  const auto shader = CompileShader(R"(
+    RWStructuredBuffer<uint> counter : register(u0);
+    [numthreads(1, 1, 1)]
+    void main() {
+      uint ignored;
+      InterlockedAdd(counter[0], 1, ignored);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  auto root = context_.CreateRootSignature(root_desc);
+  const D3D12_SHADER_BYTECODE bytecode = {
+      shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateComputePipeline(root.get(), bytecode);
+  constexpr UINT zero = 0;
+  auto initial = context_.CreateUploadBuffer(sizeof(zero), &zero, sizeof(zero));
+  auto counter = context_.CreateBuffer(
+      sizeof(zero), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  constexpr UINT64 skip_predicate = 0;
+  auto predicate = context_.CreateUploadBuffer(
+      sizeof(skip_predicate), &skip_predicate, sizeof(skip_predicate));
+  ASSERT_TRUE(root);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(initial);
+  ASSERT_TRUE(counter);
+  ASSERT_TRUE(predicate);
+
+  context_.list()->CopyBufferRegion(counter.get(), 0, initial.get(), 0,
+                                    sizeof(zero));
+  D3D12TestContext::Transition(context_.list(), counter.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  context_.list()->SetComputeRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootUnorderedAccessView(
+      0, counter->GetGPUVirtualAddress());
+  context_.list()->SetPredication(predicate.get(), 0,
+                                  D3D12_PREDICATION_OP_EQUAL_ZERO);
+  for (UINT index = 0; index < 3; ++index)
+    context_.list()->Dispatch(1, 1, 1);
+  context_.list()->SetPredication(nullptr, 0,
+                                  D3D12_PREDICATION_OP_EQUAL_ZERO);
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(context_.list(), counter.get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(counter.get(), sizeof(UINT), &bytes), S_OK);
+  ASSERT_EQ(bytes.size(), sizeof(UINT));
+  UINT value = 0;
+  std::memcpy(&value, bytes.data(), sizeof(value));
+  EXPECT_EQ(value, 1u);
+}
+
+TEST_F(PredicationSpec, SinglePredicateSkipsMultipleDrawsUntilDisabled) {
+  constexpr UINT width = 16;
+  constexpr UINT height = 16;
+  auto target = context_.CreateTexture2D(
+      width, height, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto rtv_heap =
+      context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  constexpr UINT64 skip_predicate = 0;
+  auto predicate = context_.CreateUploadBuffer(
+      sizeof(skip_predicate), &skip_predicate, sizeof(skip_predicate));
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(rtv_heap);
+  ASSERT_TRUE(predicate);
+
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+      rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  auto root = context_.CreateRootSignature(root_desc);
+  const auto pixel = CompileShader(
+      "float4 main() : SV_Target { return float4(1, 0, 0, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  const D3D12_SHADER_BYTECODE pixel_bytecode = {
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()};
+  auto pipeline = context_.CreateGraphicsPipeline(
+      root.get(), DXGI_FORMAT_R8G8B8A8_UNORM, pixel_bytecode);
+  ASSERT_TRUE(root);
+  ASSERT_TRUE(pipeline);
+
+  constexpr FLOAT clear_color[4] = {};
+  context_.list()->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetGraphicsRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(
+      D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  constexpr D3D12_VIEWPORT viewport = {0.0f, 0.0f, 16.0f, 16.0f, 0.0f, 1.0f};
+  constexpr D3D12_RECT left = {0, 0, 8, 16};
+  constexpr D3D12_RECT right = {8, 0, 16, 16};
+  constexpr D3D12_RECT center = {7, 0, 9, 16};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->SetPredication(predicate.get(), 0,
+                                  D3D12_PREDICATION_OP_EQUAL_ZERO);
+  context_.list()->RSSetScissorRects(1, &left);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  context_.list()->RSSetScissorRects(1, &right);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  context_.list()->SetPredication(nullptr, 0,
+                                  D3D12_PREDICATION_OP_EQUAL_ZERO);
+  context_.list()->RSSetScissorRects(1, &center);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(context_.list(), target.get(),
+                               D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  TextureReadback readback;
+  ASSERT_EQ(context_.ReadbackTexture(target.get(), &readback), S_OK);
+  ASSERT_EQ(readback.width, width);
+  ASSERT_EQ(readback.height, height);
+  for (UINT y = 0; y < height; ++y) {
+    for (UINT x = 0; x < width; ++x) {
+      UINT pixel_value = 0;
+      std::memcpy(&pixel_value,
+                  readback.data.data() + y * readback.row_pitch +
+                      x * sizeof(pixel_value),
+                  sizeof(pixel_value));
+      const UINT expected = x >= 7 && x < 9 ? 0xff0000ffu : 0u;
+      EXPECT_TRUE(ColorsMatch(pixel_value, expected, 1))
+          << "pixel (" << x << ", " << y << ")";
+    }
+  }
 }
 
 TEST_F(PredicationSpec, PredicateProducedByComputeControlsDispatch) {

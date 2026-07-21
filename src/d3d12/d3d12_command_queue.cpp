@@ -11666,11 +11666,12 @@ private:
       return false;
     }
 
+    // The selected comparison suppresses the command when it evaluates true.
     switch (state.predication_operation) {
     case D3D12_PREDICATION_OP_EQUAL_ZERO:
-      return value == 0;
-    case D3D12_PREDICATION_OP_NOT_EQUAL_ZERO:
       return value != 0;
+    case D3D12_PREDICATION_OP_NOT_EQUAL_ZERO:
+      return value == 0;
     default:
       WARN("D3D12CommandQueue: unsupported predication operation ",
            uint32_t(state.predication_operation),
