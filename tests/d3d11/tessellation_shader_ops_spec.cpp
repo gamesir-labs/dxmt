@@ -380,6 +380,18 @@ bool ColorMatches(uint32_t actual, uint32_t expected, unsigned tolerance = 4) {
   return true;
 }
 
+HRESULT WaitForPipelineStatistics(
+    ID3D11DeviceContext *context, ID3D11Asynchronous *query,
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS *statistics, UINT attempts = 100) {
+  HRESULT hr = S_FALSE;
+  for (UINT attempt = 0; attempt < attempts && hr == S_FALSE; ++attempt) {
+    hr = context->GetData(query, statistics, sizeof(*statistics), 0);
+    if (hr == S_FALSE)
+      Sleep(1);
+  }
+  return hr;
+}
+
 class D3D11TessellationShaderOpsSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -410,7 +422,8 @@ protected:
   std::vector<uint32_t>
   Run(std::string_view hull_source, std::string_view domain_source,
       D3D11_PRIMITIVE_TOPOLOGY topology, UINT control_point_count,
-      UINT target_width = kTargetWidth, UINT target_height = kTargetHeight) {
+      UINT target_width = kTargetWidth, UINT target_height = kTargetHeight,
+      D3D11_QUERY_DATA_PIPELINE_STATISTICS *statistics = nullptr) {
     const auto hull = CompileShader(hull_source, "hs_5_0");
     const auto domain = CompileShader(domain_source, "ds_5_0");
     EXPECT_EQ(hull.result, S_OK) << hull.diagnostic_text();
@@ -430,6 +443,17 @@ protected:
               S_OK);
     if (!hull_shader || !domain_shader)
       return {};
+
+    ComPtr<ID3D11Query> statistics_query;
+    if (statistics) {
+      const D3D11_QUERY_DESC query_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0};
+      EXPECT_EQ(context_.device()->CreateQuery(&query_desc,
+                                               statistics_query.put()),
+                S_OK);
+      if (!statistics_query)
+        return {};
+      *statistics = {};
+    }
 
     D3D11_TEXTURE2D_DESC target_desc = {};
     target_desc.Width = target_width;
@@ -466,7 +490,11 @@ protected:
     context_.context()->HSSetShader(hull_shader.get(), nullptr, 0);
     context_.context()->DSSetShader(domain_shader.get(), nullptr, 0);
     context_.context()->PSSetShader(pixel_shader_.get(), nullptr, 0);
+    if (statistics_query)
+      context_.context()->Begin(statistics_query.get());
     context_.context()->Draw(control_point_count, 0);
+    if (statistics_query)
+      context_.context()->End(statistics_query.get());
     context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
     context_.context()->HSSetShader(nullptr, nullptr, 0);
     context_.context()->DSSetShader(nullptr, nullptr, 0);
@@ -496,6 +524,12 @@ protected:
                   target_width * sizeof(uint32_t));
     }
     context_.context()->Unmap(staging.get(), 0);
+    if (statistics_query) {
+      context_.context()->Flush();
+      EXPECT_EQ(WaitForPipelineStatistics(context_.context(),
+                                          statistics_query.get(), statistics),
+                S_OK);
+    }
     EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
     return pixels;
   }
@@ -555,12 +589,46 @@ DXMT_SERIAL_TEST_F(D3D11TessellationShaderOpsSpec,
   constexpr UINT kDensity = 3;
   constexpr UINT kDetail = 4;
   constexpr UINT kSize = 128;
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS combined_statistics = {};
   const auto pixels =
       Run(IsolineHullShader("integer", kDensity, kDetail),
           kWaveIsolineDomainShader,
-          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2, kSize, kSize);
+          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2, kSize, kSize,
+          &combined_statistics);
   ASSERT_EQ(pixels.size(), kSize * kSize);
 
+  // Shared segment endpoints may execute the domain shader once or once per
+  // primitive. The non-overlapping ranges still prove that density and detail
+  // independently increase generated domain points.
+  if (combined_statistics.DSInvocations != 0) {
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS detail_baseline = {};
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS density_baseline = {};
+    ASSERT_FALSE(
+        Run(IsolineHullShader("integer", kDensity, 1), kIsolineDomainShader,
+            D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
+            kTargetWidth, kTargetHeight, &detail_baseline)
+            .empty());
+    ASSERT_FALSE(
+        Run(IsolineHullShader("integer", 1, kDetail), kIsolineDomainShader,
+            D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
+            kTargetWidth, kTargetHeight, &density_baseline)
+            .empty());
+    EXPECT_EQ(detail_baseline.DSInvocations, 6u);
+    EXPECT_GE(density_baseline.DSInvocations, 5u);
+    EXPECT_LE(density_baseline.DSInvocations, 8u);
+    EXPECT_GE(combined_statistics.DSInvocations, 15u);
+    EXPECT_LE(combined_statistics.DSInvocations, 24u);
+    EXPECT_GT(combined_statistics.DSInvocations,
+              detail_baseline.DSInvocations)
+        << "missing isoline detail invocations";
+    EXPECT_GT(combined_statistics.DSInvocations,
+              density_baseline.DSInvocations)
+        << "missing isoline density invocations";
+    return;
+  }
+
+  // Some implementations expose the query but report zeroed counters. Retain
+  // the raster oracle as a public-API fallback for those implementations.
   constexpr std::array<int, kDetail + 1> kWaveOffsets = {0, -8, 0, 8, 0};
   std::string missing_vertices;
   for (UINT line = 0; line < kDensity; ++line) {
@@ -601,11 +669,18 @@ DXMT_SERIAL_TEST_F(D3D11TessellationShaderOpsSpec,
   constexpr UINT kDensity = 64;
   constexpr UINT kRowsPerLine = 4;
   constexpr UINT kHeight = kDensity * kRowsPerLine;
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS statistics = {};
   const auto pixels = Run(IsolineHullShader("integer", kDensity, 1),
                           kMaximumDensityIsolineDomainShader,
                           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
-                          kTargetWidth, kHeight);
+                          kTargetWidth, kHeight, &statistics);
   ASSERT_EQ(pixels.size(), kTargetWidth * kHeight);
+  if (statistics.DSInvocations != 0) {
+    EXPECT_EQ(statistics.DSInvocations, 128u)
+        << "missing isoline domain invocations";
+    return;
+  }
+  // See the zero-counter fallback rationale in the lower-density case above.
   std::string missing_lines;
   for (UINT line = 0; line < kDensity; ++line) {
     const float location = static_cast<float>(line) / kDensity;
