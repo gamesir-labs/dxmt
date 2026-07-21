@@ -41,6 +41,15 @@ dxmt_test_dep = declare_dependency(
   include_directories: [dxmt_test_include_dirs],
 )
 
+subdir('d3d9')
+
+# The d3d9 shader-oracle baseline is read at run time and must sit beside the
+# suite executables, here and in the packaged oracle drop alike.
+configure_file(
+  input: 'd3d9/shader_oracle_baseline.txt',
+  output: 'shader_oracle_baseline.txt',
+  copy: true,
+)
 subdir('d3d10')
 subdir('d3d11')
 subdir('d3d12')
@@ -58,6 +67,14 @@ dxmt_wine_framework_tests = executable(
   install: false,
 )
 endif
+
+dxmt_wine_d3d9_tests = executable(
+  'dxmt-wine-d3d9-tests',
+  d3d9_unit_sources,
+  dependencies: [dxmt_test_dep] + d3d9_unit_dependencies,
+  cpp_args: windows_oracle_cpp_args + d3d9_unit_cpp_args,
+  install: false,
+)
 
 dxmt_wine_d3d10_tests = executable(
   'dxmt-wine-d3d10-tests',
@@ -151,6 +168,7 @@ alias_target(
   'dxmt-wine-tests',
   dxmt_wine_test_scheduler,
   dxmt_wine_framework_tests,
+  dxmt_wine_d3d9_tests,
   dxmt_wine_d3d10_tests,
   dxmt_wine_d3d11_tests,
   dxmt_wine_d3d12_tests,
@@ -161,6 +179,11 @@ alias_target(
   'dxmt-wine-tests-framework',
   dxmt_wine_test_scheduler,
   dxmt_wine_framework_tests,
+)
+alias_target(
+  'dxmt-wine-tests-d3d9',
+  dxmt_wine_test_scheduler,
+  dxmt_wine_d3d9_tests,
 )
 alias_target(
   'dxmt-wine-tests-d3d10',

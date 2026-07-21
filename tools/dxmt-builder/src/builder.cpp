@@ -1468,14 +1468,15 @@ private:
       return {"runtime"};
     static const std::set<std::string> supported = {
         "runtime", "d3d10", "d3d11", "d3d12", "tests-framework",
-        "tests-d3d10", "tests-d3d11", "tests-d3d12", "tests-all",
-        "benchmarks"};
+        "tests-d3d9", "tests-d3d10", "tests-d3d11", "tests-d3d12",
+        "tests-all", "benchmarks"};
     static const std::map<std::string, std::string> meson_targets = {
         {"runtime", "dxmt-runtime"},
         {"d3d10", "dxmt-d3d10"},
         {"d3d11", "dxmt-d3d11"},
         {"d3d12", "dxmt-d3d12"},
         {"tests-framework", "dxmt-wine-tests-framework"},
+        {"tests-d3d9", "dxmt-wine-tests-d3d9"},
         {"tests-d3d10", "dxmt-wine-tests-d3d10"},
         {"tests-d3d11", "dxmt-wine-tests-d3d11"},
         {"tests-d3d12", "dxmt-wine-tests-d3d12"},
@@ -1820,15 +1821,17 @@ private:
                    "native Windows oracle configuration");
     RequireSuccess(
         RunCommand({meson.string(), "compile", "-C", build.string(),
-                    "dxmt-wine-d3d10-tests", "dxmt-wine-d3d11-tests",
-                    "dxmt-wine-d3d12-tests"},
+                    "dxmt-wine-d3d9-tests", "dxmt-wine-d3d10-tests",
+                    "dxmt-wine-d3d11-tests", "dxmt-wine-d3d12-tests"},
                    toolchain),
         "native Windows oracle build");
 
     const auto output = build / "tests";
-    for (const auto &name : {"dxmt-wine-d3d10-tests.exe",
+    for (const auto &name : {"dxmt-wine-d3d9-tests.exe",
+                             "dxmt-wine-d3d10-tests.exe",
                              "dxmt-wine-d3d11-tests.exe",
                              "dxmt-wine-d3d12-tests.exe",
+                             "shader_oracle_baseline.txt",
                              "run-windows-oracle.bat"}) {
       if (!fs::is_regular_file(output / name))
         throw std::runtime_error("native Windows oracle output is missing: " +
@@ -1879,9 +1882,11 @@ private:
                                                    .time_since_epoch()
                                                    .count()));
     fs::create_directories(staging);
-    for (const auto &name : {"dxmt-wine-d3d10-tests.exe",
+    for (const auto &name : {"dxmt-wine-d3d9-tests.exe",
+                             "dxmt-wine-d3d10-tests.exe",
                              "dxmt-wine-d3d11-tests.exe",
                              "dxmt-wine-d3d12-tests.exe",
+                             "shader_oracle_baseline.txt",
                              "run-windows-oracle.bat"}) {
       fs::copy_file(oracle / name, staging / name,
                     fs::copy_options::overwrite_existing);
@@ -1897,7 +1902,8 @@ private:
     WriteFileAtomic(staging / "README.txt", instructions.str());
 
     std::ostringstream digests;
-    for (const auto &file : {"dxmt-wine-d3d10-tests.exe",
+    for (const auto &file : {"dxmt-wine-d3d9-tests.exe",
+                             "dxmt-wine-d3d10-tests.exe",
                              "dxmt-wine-d3d11-tests.exe",
                              "dxmt-wine-d3d12-tests.exe",
                              "run-windows-oracle.bat"}) {
@@ -1911,10 +1917,11 @@ private:
     const auto tar = RequireExecutable("tar");
     RequireSuccess(
         RunCommand({tar.string(), "-a", "-c", "-f", incomplete.string(),
+                    "dxmt-wine-d3d9-tests.exe",
                     "dxmt-wine-d3d10-tests.exe",
                     "dxmt-wine-d3d11-tests.exe",
-                    "dxmt-wine-d3d12-tests.exe", "run-windows-oracle.bat",
-                    "README.txt", "SHA256SUMS.txt"},
+                    "dxmt-wine-d3d12-tests.exe", "shader_oracle_baseline.txt",
+                    "run-windows-oracle.bat", "README.txt", "SHA256SUMS.txt"},
                    {}, false, staging),
         "Windows oracle archive");
     RequireSuccess(RunCommand({tar.string(), "-t", "-f",
@@ -2060,19 +2067,21 @@ private:
     const auto profile = EnsureConfigured(name);
     const auto compile = std::vector<std::string>{
         "meson", "compile", "-C", profile.build.string(),
-        "dxmt-wine-tests-d3d10", "dxmt-wine-tests-d3d11",
-        "dxmt-wine-tests-d3d12"};
+        "dxmt-wine-tests-d3d9", "dxmt-wine-tests-d3d10",
+        "dxmt-wine-tests-d3d11", "dxmt-wine-tests-d3d12"};
     RequireSuccess(RunCommand(compile, BuildEnvironment()),
                    "Windows oracle prerequisite build");
 
     const std::array executables = {
+        profile.build / "tests/dxmt-wine-d3d9-tests.exe",
         profile.build / "tests/dxmt-wine-d3d10-tests.exe",
         profile.build / "tests/dxmt-wine-d3d11-tests.exe",
         profile.build / "tests/dxmt-wine-d3d12-tests.exe",
     };
     const auto script = profile.build / "tests/run-windows-oracle.bat";
     for (const auto &required :
-         {executables[0], executables[1], executables[2], script}) {
+         {executables[0], executables[1], executables[2], executables[3],
+          script}) {
       if (!fs::is_regular_file(required))
         throw std::runtime_error("Windows oracle artifact is missing: " +
                                  required.string());
@@ -2101,9 +2110,10 @@ private:
     const auto checksums = staging / "SHA256SUMS.txt";
     std::ostringstream instructions;
     instructions
-        << "DXMT D3D10, D3D11, and D3D12 Windows behavior oracle\n\n"
+        << "DXMT D3D9, D3D10, D3D11, and D3D12 Windows behavior oracle\n\n"
         << "Suite schema: public-api-v1\n\n"
-        << "Keep all three EXEs and the batch script in the same directory.\n"
+        << "Keep all four EXEs, the baseline, and the batch script in the same\n"
+        << "directory.\n"
         << "Do not copy DXMT Direct3D or DXGI DLLs beside the EXEs.\n\n"
         << "Default run (complete D3D10/D3D11/D3D12 suites):\n"
         << "  run-windows-oracle.bat\n\n"
@@ -2117,10 +2127,12 @@ private:
 
     std::ostringstream digest_manifest;
     digest_manifest << Sha256File(executables[0])
-                    << "  dxmt-wine-d3d10-tests.exe\n"
+                    << "  dxmt-wine-d3d9-tests.exe\n"
                     << Sha256File(executables[1])
-                    << "  dxmt-wine-d3d11-tests.exe\n"
+                    << "  dxmt-wine-d3d10-tests.exe\n"
                     << Sha256File(executables[2])
+                    << "  dxmt-wine-d3d11-tests.exe\n"
+                    << Sha256File(executables[3])
                     << "  dxmt-wine-d3d12-tests.exe\n"
                     << Sha256File(script) << "  run-windows-oracle.bat\n";
     WriteFileAtomic(checksums, digest_manifest.str());
