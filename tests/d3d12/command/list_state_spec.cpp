@@ -233,13 +233,14 @@ protected:
     ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
   }
 
-  void ExpectResetAllowsFullStateRebind() {
-    PrimeAndReset(GraphicsResetState::PipelineState);
+  void ExpectResetAllowsGraphicsStateRebind(
+      std::optional<GraphicsResetState> omitted = std::nullopt) {
+    PrimeAndReset(omitted.value_or(GraphicsResetState::PipelineState));
     const FLOAT clear[4] = {};
     context_.list()->ClearRenderTargetView(rtv_, clear, 0, nullptr);
     context_.list()->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_STENCIL, 1.0f,
                                            0, 0, nullptr);
-    BindGraphicsState(std::nullopt, false);
+    BindGraphicsState(omitted, false);
     context_.list()->DrawInstanced(3, 1, 0, 0);
     D3D12TestContext::Transition(context_.list(), render_target_.get(),
                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -323,7 +324,19 @@ protected:
 };
 
 TEST_F(GraphicsResetStateSpec, ResetAllowsFullGraphicsStateRebind) {
-  ExpectResetAllowsFullStateRebind();
+  ExpectResetAllowsGraphicsStateRebind();
+}
+
+TEST_F(GraphicsResetStateSpec, ResetRestoresDefaultBlendFactor) {
+  ExpectResetAllowsGraphicsStateRebind(GraphicsResetState::BlendFactor);
+}
+
+TEST_F(GraphicsResetStateSpec, ResetRestoresDefaultStencilReference) {
+  ExpectResetAllowsGraphicsStateRebind(GraphicsResetState::StencilRef);
+}
+
+TEST_F(GraphicsResetStateSpec, ResetDisablesPredication) {
+  ExpectResetAllowsGraphicsStateRebind(GraphicsResetState::Predication);
 }
 
 enum class ComputeResetState {
