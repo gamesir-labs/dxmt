@@ -167,6 +167,10 @@ if not "%ORACLE_D3D12_EXIT%"=="0" set "ORACLE_EXIT=1"
   echo overall_exit_code=%ORACLE_EXIT%
 ) >> "%ORACLE_METADATA%"
 
+call :annotate_failure "D3D10" "%ORACLE_D3D10_LOG%" "%ORACLE_D3D10_EXIT%"
+call :annotate_failure "D3D11" "%ORACLE_D3D11_LOG%" "%ORACLE_D3D11_EXIT%"
+call :annotate_failure "D3D12" "%ORACLE_D3D12_LOG%" "%ORACLE_D3D12_EXIT%"
+
 echo.
 echo Overall exit code: %ORACLE_EXIT%
 echo Metadata: %ORACLE_METADATA%
@@ -190,3 +194,10 @@ exit /b 0
 :usage_error
 call :usage
 exit /b 2
+
+:annotate_failure
+if "%~3"=="0" exit /b 0
+if "%~3"=="not-run" exit /b 0
+echo ::error title=%~1 public API conformance failed::%~1 suite exited with code %~3
+for /f "usebackq delims=" %%L in (`findstr /C:"[  FAILED  ]" "%~2"`) do echo ::error title=%~1 failing case::%%L
+exit /b 0
