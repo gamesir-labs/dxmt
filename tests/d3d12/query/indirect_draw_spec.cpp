@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -19,7 +20,9 @@ class ExecuteIndirectDrawSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_TRUE(SUCCEEDED(context_.Initialize())); }
 
-  void ExpectDrawIndexed(const UINT *count_value = nullptr) {
+  void ExpectDrawIndexed(
+      const UINT *count_value = nullptr,
+      UINT command_stride = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)) {
     constexpr UINT width = 16;
     constexpr UINT height = 16;
     constexpr UINT64 count_offset = sizeof(UINT);
@@ -55,8 +58,11 @@ protected:
     auto index_buffer = context_.CreateUploadBuffer(
         sizeof(indices), indices.data(), sizeof(indices));
     const D3D12_DRAW_INDEXED_ARGUMENTS arguments = {3, 1, 0, 0, 0};
+    ASSERT_GE(command_stride, sizeof(arguments));
+    std::vector<std::uint8_t> command(command_stride, 0xcd);
+    std::memcpy(command.data(), &arguments, sizeof(arguments));
     auto argument_buffer = context_.CreateUploadBuffer(
-        sizeof(arguments), &arguments, sizeof(arguments));
+        command.size(), command.data(), command.size());
     ComPtr<ID3D12Resource> count_buffer;
     ComPtr<ID3D12Resource> count_upload;
     if (count_value) {
@@ -83,7 +89,7 @@ protected:
     D3D12_INDIRECT_ARGUMENT_DESC argument_desc = {};
     argument_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
     D3D12_COMMAND_SIGNATURE_DESC signature_desc = {};
-    signature_desc.ByteStride = sizeof(arguments);
+    signature_desc.ByteStride = command_stride;
     signature_desc.NumArgumentDescs = 1;
     signature_desc.pArgumentDescs = &argument_desc;
     ComPtr<ID3D12CommandSignature> signature;
@@ -139,6 +145,10 @@ protected:
 
 TEST_F(ExecuteIndirectDrawSpec, DrawIndexed) { ExpectDrawIndexed(); }
 
+TEST_F(ExecuteIndirectDrawSpec, PaddedCommandStrideDrawsIndexed) {
+  ExpectDrawIndexed(nullptr, sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) + 16);
+}
+
 TEST_F(ExecuteIndirectDrawSpec, CountBufferZeroSkipsDrawIndexed) {
   const UINT count = 0;
   ExpectDrawIndexed(&count);
@@ -147,6 +157,39 @@ TEST_F(ExecuteIndirectDrawSpec, CountBufferZeroSkipsDrawIndexed) {
 TEST_F(ExecuteIndirectDrawSpec, CountBufferOneDrawsIndexed) {
   const UINT count = 1;
   ExpectDrawIndexed(&count);
+}
+
+TEST_F(ExecuteIndirectDrawSpec, RejectsStrideSmallerThanDrawArguments) {
+  D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+  argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC desc = {};
+  desc.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS) - sizeof(UINT);
+  desc.NumArgumentDescs = 1;
+  desc.pArgumentDescs = &argument;
+  ComPtr<ID3D12CommandSignature> signature;
+
+  EXPECT_EQ(context_.device()->CreateCommandSignature(
+                &desc, nullptr, IID_PPV_ARGS(signature.put())),
+            E_INVALIDARG);
+  EXPECT_FALSE(signature);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(ExecuteIndirectDrawSpec, RejectsSignatureWithoutTerminalOperation) {
+  D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+  argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+  argument.VertexBuffer.Slot = 0;
+  D3D12_COMMAND_SIGNATURE_DESC desc = {};
+  desc.ByteStride = sizeof(D3D12_VERTEX_BUFFER_VIEW);
+  desc.NumArgumentDescs = 1;
+  desc.pArgumentDescs = &argument;
+  ComPtr<ID3D12CommandSignature> signature;
+
+  EXPECT_EQ(context_.device()->CreateCommandSignature(
+                &desc, nullptr, IID_PPV_ARGS(signature.put())),
+            E_INVALIDARG);
+  EXPECT_FALSE(signature);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
