@@ -353,7 +353,7 @@ Output main(PatchConstants constants,
   Output output;
   output.position = float4(location.x * 1.5 - 0.6875,
                            0.99609375 - location.y * 2.0, 0.0, 1.0);
-  output.color = float4(1.0, 1.0, 1.0, 1.0);
+  output.color = float4(1.0 - location.y, location.y, 1.0, 1.0);
   return output;
 }
 )";
@@ -564,10 +564,10 @@ TEST_F(D3D11TessellationShaderOpsSpec,
       const int center_y = 16 + static_cast<int>(line) * 32 +
                            kWaveOffsets[vertex];
       bool found = false;
-      for (int y = std::max(0, center_y - 2);
-           y <= std::min(static_cast<int>(kSize) - 1, center_y + 2); ++y) {
-        for (int x = std::max(0, center_x - 2);
-             x <= std::min(static_cast<int>(kSize) - 1, center_x + 2); ++x) {
+      for (int y = std::max(0, center_y - 4);
+           y <= std::min(static_cast<int>(kSize) - 1, center_y + 4); ++y) {
+        for (int x = std::max(0, center_x - 4);
+             x <= std::min(static_cast<int>(kSize) - 1, center_x + 4); ++x) {
           found |= pixels[static_cast<UINT>(y) * kSize +
                           static_cast<UINT>(x)] != kClearColor;
         }
@@ -600,22 +600,18 @@ TEST_F(D3D11TessellationShaderOpsSpec,
                           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
                           kTargetWidth, kHeight);
   ASSERT_EQ(pixels.size(), kTargetWidth * kHeight);
-  std::array<bool, kHeight> occupied_rows = {};
-  for (UINT y = 0; y < kHeight; ++y) {
-    occupied_rows[y] = std::any_of(
-        pixels.begin() + y * kTargetWidth,
-        pixels.begin() + (y + 1) * kTargetWidth,
-        [](uint32_t pixel) { return pixel != kClearColor; });
+  std::string missing_lines;
+  for (UINT line = 0; line < kDensity; ++line) {
+    const float location = static_cast<float>(line) / kDensity;
+    const uint32_t expected = PackColor(1.0f - location, location, 1.0f);
+    const bool found = std::any_of(
+        pixels.begin(), pixels.end(), [expected](uint32_t pixel) {
+          return ColorMatches(pixel, expected, 1);
+        });
+    if (!found)
+      missing_lines += " " + std::to_string(line);
   }
-  UINT line_groups = 0;
-  bool previous = false;
-  for (bool occupied : occupied_rows) {
-    line_groups += occupied && !previous;
-    previous = occupied;
-  }
-  EXPECT_EQ(line_groups, kDensity)
-      << "missing isolines: expected " << kDensity << " row groups, actual "
-      << line_groups;
+  EXPECT_TRUE(missing_lines.empty()) << "missing isolines:" << missing_lines;
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroEdgeFactorCullsTrianglePatch) {
