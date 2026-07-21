@@ -15,6 +15,7 @@ using dxmt::test::ColorsMatch;
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::IsSoftwareAdapter;
 
 enum class SparseCase {
   CreateOnly,
@@ -434,6 +435,130 @@ protected:
     ExpectBytesEqual(actual, expected);
   }
 
+  void ExpectCopyTextureRegionRoundTripOnArraySlice(UINT subresource) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                  D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+              S_OK);
+    if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
+      GTEST_SKIP() << "Tiled resources are not supported";
+
+    constexpr UINT16 array_size = 2;
+    ASSERT_LT(subresource, array_size);
+    auto texture = CreateStandardReservedTexture(
+        D3D12_RESOURCE_STATE_COPY_DEST, array_size);
+    ASSERT_TRUE(texture);
+
+    D3D12_TILE_SHAPE tile_shape = {};
+    D3D12_SUBRESOURCE_TILING tiling = {};
+    UINT subresource_count = 1;
+    context_.device()->GetResourceTiling(
+        texture.get(), nullptr, nullptr, &tile_shape, &subresource_count,
+        subresource, &tiling);
+    ASSERT_EQ(subresource_count, 1u);
+    ASSERT_GT(tile_shape.WidthInTexels, 0u);
+    ASSERT_GT(tile_shape.HeightInTexels, 0u);
+    ASSERT_GT(tiling.WidthInTiles, 0u);
+    ASSERT_GT(tiling.HeightInTiles, 0u);
+
+    const D3D12_TILED_RESOURCE_COORDINATE coordinate = {0, 0, 0,
+                                                         subresource};
+    D3D12_TILE_REGION_SIZE region = {};
+    region.NumTiles = 1;
+    region.UseBox = TRUE;
+    region.Width = 1;
+    region.Height = 1;
+    region.Depth = 1;
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.SizeInBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    ComPtr<ID3D12Heap> backing_heap;
+    ASSERT_EQ(context_.device()->CreateHeap(
+                  &heap_desc, IID_PPV_ARGS(backing_heap.put())),
+              S_OK);
+    ASSERT_TRUE(backing_heap);
+    const D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT heap_offset = 0;
+    const UINT tile_count = 1;
+    context_.queue()->UpdateTileMappings(
+        texture.get(), 1, &coordinate, &region, backing_heap.get(), 1,
+        &range_flag, &heap_offset, &tile_count,
+        D3D12_TILE_MAPPING_FLAG_NONE);
+
+    const UINT row_size = tile_shape.WidthInTexels * sizeof(std::uint32_t);
+    const UINT row_pitch =
+        (row_size + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+        ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 copy_size = UINT64(row_pitch) * tile_shape.HeightInTexels;
+    ASSERT_LE(copy_size,
+              static_cast<UINT64>(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES));
+    std::vector<std::uint8_t> source(copy_size, 0);
+    for (UINT y = 0; y < tile_shape.HeightInTexels; ++y) {
+      for (UINT x = 0; x < tile_shape.WidthInTexels; ++x) {
+        const std::uint32_t value =
+            0x80000000u | (subresource << 24) | (y << 12) | x;
+        std::memcpy(source.data() + UINT64(y) * row_pitch +
+                        UINT64(x) * sizeof(value),
+                    &value, sizeof(value));
+      }
+    }
+    auto upload = context_.CreateUploadBuffer(copy_size, source.data(),
+                                               source.size());
+    auto readback = context_.CreateBuffer(
+        copy_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_TRUE(upload);
+    ASSERT_TRUE(readback);
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    footprint.Footprint.Format = DXGI_FORMAT_R32_UINT;
+    footprint.Footprint.Width = tile_shape.WidthInTexels;
+    footprint.Footprint.Height = tile_shape.HeightInTexels;
+    footprint.Footprint.Depth = 1;
+    footprint.Footprint.RowPitch = row_pitch;
+    D3D12_TEXTURE_COPY_LOCATION upload_location = {};
+    upload_location.pResource = upload.get();
+    upload_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    upload_location.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION texture_location = {};
+    texture_location.pResource = texture.get();
+    texture_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    texture_location.SubresourceIndex = subresource;
+    context_.list()->CopyTextureRegion(&texture_location, 0, 0, 0,
+                                       &upload_location, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture.get();
+    barrier.Transition.Subresource = subresource;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    context_.list()->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION readback_location = {};
+    readback_location.pResource = readback.get();
+    readback_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    readback_location.PlacedFootprint = footprint;
+    const D3D12_BOX source_box = {
+        0, 0, 0, tile_shape.WidthInTexels, tile_shape.HeightInTexels, 1};
+    context_.list()->CopyTextureRegion(&readback_location, 0, 0, 0,
+                                       &texture_location, &source_box);
+    ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+
+    void *mapped = nullptr;
+    const D3D12_RANGE read_range = {0, static_cast<SIZE_T>(copy_size)};
+    ASSERT_EQ(readback->Map(0, &read_range, &mapped), S_OK);
+    const auto *actual = static_cast<const std::uint8_t *>(mapped);
+    for (UINT y = 0; y < tile_shape.HeightInTexels; ++y) {
+      EXPECT_EQ(std::memcmp(actual + UINT64(y) * row_pitch,
+                            source.data() + UINT64(y) * row_pitch, row_size),
+                0)
+          << "row " << y;
+    }
+    const D3D12_RANGE written_range = {0, 0};
+    readback->Unmap(0, &written_range);
+  }
+
   void ExpectCopiedTileMappingsAlias(UINT source_x, UINT source_y,
                                      UINT destination_x, UINT destination_y,
                                      UINT width, UINT height,
@@ -850,7 +975,18 @@ TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsMappedTileBox) {
 }
 
 TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsNonzeroArraySlice) {
+  if (IsSoftwareAdapter(context_.device())) {
+    GTEST_SKIP()
+        << "Native WARP stalls indefinitely in CopyTiles for a nonzero "
+           "texture-array subresource; the adjacent CopyTextureRegion test "
+           "retains WARP coverage of the sparse array mapping";
+  }
   ExpectCopyTilesRoundTrip(0, 0, 1, 1, 0, 2, 1);
+}
+
+TEST_F(D3D12SparseResourceSpec,
+       CopyTextureRegionRoundTripsMappedNonzeroArraySlice) {
+  ExpectCopyTextureRegionRoundTripOnArraySlice(1);
 }
 
 TEST_F(D3D12SparseResourceSpec, TwoReservedBuffersAliasOnePhysicalTile) {
