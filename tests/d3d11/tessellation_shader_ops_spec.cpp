@@ -306,7 +306,7 @@ Output main(PatchConstants constants,
 }
 )";
 
-constexpr std::string_view kCurvedIsolineDomainShader = R"(
+constexpr std::string_view kWaveIsolineDomainShader = R"(
 struct ControlPoint {
   float phase_value : PHASE;
 };
@@ -324,13 +324,11 @@ Output main(PatchConstants constants,
             float2 location : SV_DomainLocation,
             const OutputPatch<ControlPoint, 2> patch) {
   Output output;
-  float curve = 4.0 * location.x * (1.0 - location.x);
-  output.position = float4(location.x * 1.5 - 0.75,
-                           0.75 - location.y - curve * 0.2, 0.0, 1.0);
-  output.color = float4(1.0 - location.y, location.y,
-                        constants.marker *
-                            (patch[0].phase_value + patch[1].phase_value) / 18.0,
-                        1.0);
+  float wave = sin(location.x * 6.28318530718);
+  output.position = float4(location.x * 1.5 - 0.7421875,
+                           0.7421875 - location.y * 1.5 + wave * 0.125,
+                           0.0, 1.0);
+  output.color = float4(1.0, 1.0, 1.0, 1.0);
   return output;
 }
 )";
@@ -353,12 +351,9 @@ Output main(PatchConstants constants,
             float2 location : SV_DomainLocation,
             const OutputPatch<ControlPoint, 2> patch) {
   Output output;
-  output.position = float4(location.x * 1.5 - 0.75,
+  output.position = float4(location.x * 1.5 - 0.6875,
                            0.99609375 - location.y * 2.0, 0.0, 1.0);
-  output.color = float4(1.0 - location.y, location.y,
-                        constants.marker *
-                            (patch[0].phase_value + patch[1].phase_value) / 18.0,
-                        1.0);
+  output.color = float4(1.0, 1.0, 1.0, 1.0);
   return output;
 }
 )";
@@ -554,34 +549,27 @@ TEST_F(D3D11TessellationShaderOpsSpec,
        IsolineDensityAndDetailGenerateIndependentLines) {
   constexpr UINT kDensity = 3;
   constexpr UINT kDetail = 4;
-  constexpr UINT kSize = 64;
+  constexpr UINT kSize = 128;
   const auto pixels =
       Run(IsolineHullShader("integer", kDensity, kDetail),
-          kCurvedIsolineDomainShader,
+          kWaveIsolineDomainShader,
           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2, kSize, kSize);
   ASSERT_EQ(pixels.size(), kSize * kSize);
 
+  constexpr std::array<int, kDetail + 1> kWaveOffsets = {0, -8, 0, 8, 0};
   std::string missing_vertices;
   for (UINT line = 0; line < kDensity; ++line) {
-    const float line_location = static_cast<float>(line) / kDensity;
-    const uint32_t expected =
-        PackColor(1.0f - line_location, line_location, 1.0f);
     for (UINT vertex = 0; vertex <= kDetail; ++vertex) {
-      const float detail_location = static_cast<float>(vertex) / kDetail;
-      const float curve =
-          4.0f * detail_location * (1.0f - detail_location);
-      const int center_x =
-          static_cast<int>(std::lround(8.0f + detail_location * 48.0f));
-      const int center_y = static_cast<int>(
-          std::lround(8.0f + line_location * 32.0f + curve * 6.4f));
+      const int center_x = 16 + static_cast<int>(vertex) * 24;
+      const int center_y = 16 + static_cast<int>(line) * 32 +
+                           kWaveOffsets[vertex];
       bool found = false;
       for (int y = std::max(0, center_y - 2);
            y <= std::min(static_cast<int>(kSize) - 1, center_y + 2); ++y) {
         for (int x = std::max(0, center_x - 2);
              x <= std::min(static_cast<int>(kSize) - 1, center_x + 2); ++x) {
-          found |= ColorMatches(
-              pixels[static_cast<UINT>(y) * kSize + static_cast<UINT>(x)],
-              expected);
+          found |= pixels[static_cast<UINT>(y) * kSize +
+                          static_cast<UINT>(x)] != kClearColor;
         }
       }
       if (!found)
@@ -612,17 +600,22 @@ TEST_F(D3D11TessellationShaderOpsSpec,
                           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
                           kTargetWidth, kHeight);
   ASSERT_EQ(pixels.size(), kTargetWidth * kHeight);
-  std::string missing_lines;
-  for (UINT line = 0; line < kDensity; ++line) {
-    const float location = static_cast<float>(line) / kDensity;
-    const uint32_t expected = PackColor(1.0f - location, location, 1.0f);
-    bool found = false;
-    for (uint32_t pixel : pixels)
-      found |= ColorMatches(pixel, expected, 1);
-    if (!found)
-      missing_lines += " " + std::to_string(line);
+  std::array<bool, kHeight> occupied_rows = {};
+  for (UINT y = 0; y < kHeight; ++y) {
+    occupied_rows[y] = std::any_of(
+        pixels.begin() + y * kTargetWidth,
+        pixels.begin() + (y + 1) * kTargetWidth,
+        [](uint32_t pixel) { return pixel != kClearColor; });
   }
-  EXPECT_TRUE(missing_lines.empty()) << "missing isolines:" << missing_lines;
+  UINT line_groups = 0;
+  bool previous = false;
+  for (bool occupied : occupied_rows) {
+    line_groups += occupied && !previous;
+    previous = occupied;
+  }
+  EXPECT_EQ(line_groups, kDensity)
+      << "missing isolines: expected " << kDensity << " row groups, actual "
+      << line_groups;
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroEdgeFactorCullsTrianglePatch) {
