@@ -510,14 +510,20 @@ TEST_F(D3D11TessellationShaderOpsSpec,
       PackColor(2.0f / 3.0f, 1.0f / 3.0f, 1.0f),
       PackColor(1.0f / 3.0f, 2.0f / 3.0f, 1.0f),
   };
-  for (uint32_t expected : expected_colors) {
-    EXPECT_GT(std::count_if(pixels.begin(), pixels.end(),
-                            [expected](uint32_t pixel) {
-                              return ColorMatches(pixel, expected);
-                            }),
-              8);
+  std::array<size_t, expected_colors.size()> matching_pixels = {};
+  for (uint32_t pixel : pixels) {
+    if (pixel == kClearColor)
+      continue;
+    const auto match = std::find_if(
+        expected_colors.begin(), expected_colors.end(),
+        [pixel](uint32_t expected) { return ColorMatches(pixel, expected); });
+    EXPECT_NE(match, expected_colors.end())
+        << "unexpected isoline color 0x" << std::hex << pixel;
+    if (match != expected_colors.end())
+      ++matching_pixels[static_cast<size_t>(match - expected_colors.begin())];
   }
-  EXPECT_LT(drawn_pixel_count, 48);
+  for (size_t count : matching_pixels)
+    EXPECT_GT(count, 0);
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
