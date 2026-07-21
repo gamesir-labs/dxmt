@@ -527,6 +527,60 @@ TEST_F(SparseMappingMatrixSpec, NullRangeRemovesMappingsAndCanRecover) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST_F(SparseMappingMatrixSpec, ReadsMappedAndUnmappedBufferTilesInSingleCopy) {
+  if (tiled_resources_tier_ < D3D12_TILED_RESOURCES_TIER_2)
+    GTEST_SKIP() << "Unmapped tile reads are undefined below tier 2";
+
+  constexpr UINT tile_count = 2;
+  constexpr UINT64 copy_size = UINT64(tile_count) * kTileSize;
+  auto buffer = CreateBuffer(tile_count, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(1);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  MapRange(buffer.get(), heap.get(), 0, 1, D3D12_TILE_RANGE_FLAG_NONE);
+  MapRange(buffer.get(), nullptr, 1, 1, D3D12_TILE_RANGE_FLAG_NULL);
+
+  std::vector<std::uint8_t> source(copy_size);
+  for (UINT64 index = 0; index < source.size(); ++index)
+    source[index] = static_cast<std::uint8_t>((index * 37 + 19) & 0xff);
+  auto upload =
+      context_.CreateUploadBuffer(copy_size, source.data(), source.size());
+  std::vector<std::uint8_t> initial(copy_size, 0xa5);
+  auto initial_upload =
+      context_.CreateUploadBuffer(copy_size, initial.data(), initial.size());
+  auto output = context_.CreateBuffer(copy_size, D3D12_HEAP_TYPE_DEFAULT,
+                                      D3D12_RESOURCE_FLAG_NONE,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(upload);
+  ASSERT_TRUE(initial_upload);
+  ASSERT_TRUE(output);
+  context_.list()->CopyBufferRegion(output.get(), 0, initial_upload.get(), 0,
+                                    copy_size);
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = tile_count;
+  context_.list()->CopyTiles(
+      buffer.get(), &coordinate, &region, upload.get(), 0,
+      D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+  D3D12TestContext::Transition(context_.list(), buffer.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context_.list()->CopyTiles(
+      buffer.get(), &coordinate, &region, output.get(), 0,
+      D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+  D3D12TestContext::Transition(context_.list(), output.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> actual;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), copy_size, &actual), S_OK);
+  auto expected = source;
+  std::fill(expected.begin() + kTileSize, expected.end(), 0);
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(SparseMappingMatrixSpec, RepeatedNullAndMapRangesRecover) {
   auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBacking(1);
