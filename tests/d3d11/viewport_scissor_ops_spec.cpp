@@ -65,7 +65,7 @@ struct Input {
 };
 struct Output {
   float4 position : SV_Position;
-  float4 color : COLOR0;
+  nointerpolation float4 color : COLOR0;
   uint viewport : SV_ViewportArrayIndex;
 };
 
@@ -85,8 +85,13 @@ void main(triangle Input input[3], inout TriangleStream<Output> stream) {
 )";
 
 constexpr std::string_view kColorPixelShader = R"(
-float4 main(float4 color : COLOR0) : SV_Target {
-  return color;
+struct Input {
+  float4 position : SV_Position;
+  nointerpolation float4 color : COLOR0;
+};
+
+float4 main(Input input) : SV_Target {
+  return input.color;
 }
 )";
 
@@ -98,7 +103,7 @@ cbuffer DrawParams : register(b0) {
 };
 struct Output {
   float4 position : SV_Position;
-  float4 color : COLOR0;
+  nointerpolation float4 color : COLOR0;
 };
 
 Output main(uint vertex_id : SV_VertexID) {
