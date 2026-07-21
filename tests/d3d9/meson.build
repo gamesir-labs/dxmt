@@ -16,7 +16,11 @@
 # rather than passing on nothing.
 #
 # STANDALONE makes test.h emit main() and derive the test list from START_TEST,
-# so no generated testlist is required. __WINESRC__ selects Wine's header set.
+# so no generated testlist is required. __WINESRC__ is deliberately NOT defined:
+# it turns on lints meant for Wine's own sources, including a winbase.h macro
+# that redefines strncpy to a deliberate error, which some toolchains then trip
+# over through their own CRT headers. Neither the test sources nor test.h read
+# it.
 
 wine_conformance_tests = []
 wine_tests_source_root = get_option('wine_source_path')
@@ -39,7 +43,6 @@ if dxmt_crossbuild and wine_tests_source_root != ''
     # the CRT headers stay reachable because the D3D headers include them.
     wine_tests_c_args = cc.get_supported_arguments([
       '-DSTANDALONE',
-      '-D__WINESRC__',
       '-I' + wine_tests_sdk,
       '-I' + wine_tests_headers,
       '-I' + wine_tests_dir,
