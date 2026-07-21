@@ -61,10 +61,13 @@ if dxmt_crossbuild and wine_tests_source_root != ''
     # without the failure noise the larger modules carry.
     foreach module : [ 'stateblock' ]
       wine_conformance_tests += executable('dx9-wine-' + module + '-test',
-        wine_tests_dir / (module + '.c'),
+        [ wine_tests_dir / (module + '.c'), files('wine_debug_stubs.c') ],
         c_args: wine_tests_c_args,
         dependencies: [
           cc.find_library('d3d9'),
+          # The modules reference the D3D9 interface GUIDs without defining
+          # them, so the GUID library has to be linked in.
+          cc.find_library('dxguid'),
           cc.find_library('user32'),
           cc.find_library('gdi32'),
           cc.find_library('ole32'),
