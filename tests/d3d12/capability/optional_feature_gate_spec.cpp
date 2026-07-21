@@ -65,4 +65,89 @@ TEST_F(D3D12OptionalFeatureGateSpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnadvertisedProtectedSessionsRejectCreationAndClearOutput) {
+  D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT support = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT, &support,
+                sizeof(support)),
+            S_OK);
+  if (support.Support !=
+      D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE) {
+    GTEST_SKIP() << "Protected resource sessions are advertised";
+  }
+
+  ComPtr<ID3D12Device4> device4;
+  const HRESULT interface_result = context_.device()->QueryInterface(
+      __uuidof(ID3D12Device4), reinterpret_cast<void **>(device4.put()));
+  if (interface_result == E_NOINTERFACE)
+    return;
+  ASSERT_EQ(interface_result, S_OK);
+
+  const D3D12_PROTECTED_RESOURCE_SESSION_DESC desc = {
+      .NodeMask = 0,
+      .Flags = D3D12_PROTECTED_RESOURCE_SESSION_FLAG_NONE,
+  };
+  void *session = context_.device();
+  const HRESULT create_result = device4->CreateProtectedResourceSession(
+      &desc, __uuidof(ID3D12ProtectedResourceSession), &session);
+  EXPECT_TRUE(FAILED(create_result));
+  EXPECT_EQ(session, nullptr);
+  EXPECT_EQ(context_.ExecuteAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       EmptyMetaCommandEnumerationRejectsCreationAndClearsOutput) {
+  ComPtr<ID3D12Device5> device5;
+  const HRESULT interface_result = context_.device()->QueryInterface(
+      __uuidof(ID3D12Device5), reinterpret_cast<void **>(device5.put()));
+  if (interface_result == E_NOINTERFACE)
+    return;
+  ASSERT_EQ(interface_result, S_OK);
+
+  UINT command_count = 0;
+  ASSERT_EQ(device5->EnumerateMetaCommands(&command_count, nullptr), S_OK);
+  if (command_count != 0)
+    GTEST_SKIP() << "Meta commands are advertised";
+
+  void *meta_command = context_.device();
+  const HRESULT create_result = device5->CreateMetaCommand(
+      GUID_NULL, 0, nullptr, 0, __uuidof(ID3D12MetaCommand), &meta_command);
+  EXPECT_TRUE(FAILED(create_result));
+  EXPECT_EQ(meta_command, nullptr);
+  EXPECT_EQ(context_.ExecuteAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D12OptionalFeatureGateSpec,
+       UnadvertisedRaytracingRejectsStateObjectsAndClearsOutput) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
+  ASSERT_EQ(context_.device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5)),
+            S_OK);
+  if (options5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED)
+    GTEST_SKIP() << "Raytracing is advertised";
+
+  ComPtr<ID3D12Device5> device5;
+  const HRESULT interface_result = context_.device()->QueryInterface(
+      __uuidof(ID3D12Device5), reinterpret_cast<void **>(device5.put()));
+  if (interface_result == E_NOINTERFACE)
+    return;
+  ASSERT_EQ(interface_result, S_OK);
+
+  const D3D12_STATE_OBJECT_DESC desc = {
+      .Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+      .NumSubobjects = 0,
+      .pSubobjects = nullptr,
+  };
+  void *state_object = context_.device();
+  const HRESULT create_result = device5->CreateStateObject(
+      &desc, __uuidof(ID3D12StateObject), &state_object);
+  EXPECT_TRUE(FAILED(create_result));
+  EXPECT_EQ(state_object, nullptr);
+  EXPECT_EQ(context_.ExecuteAndWait(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 } // namespace
