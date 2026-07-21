@@ -466,6 +466,11 @@ public:
       llvm::Value *TessFactorIn, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1, llvm::Value *TessFactorOut2
   );
 
+  void HullGenerateWorkloadForIsoline(
+      llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+      llvm::Value *TessFactorDensity, llvm::Value *TessFactorDetail
+  );
+
   void HullGenerateWorkloadForQuad(
       llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
       llvm::Value *TessFactorIn0, llvm::Value *TessFactorIn1, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1,

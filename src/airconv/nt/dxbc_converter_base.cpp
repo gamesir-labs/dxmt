@@ -2756,6 +2756,53 @@ Converter::HullGenerateWorkloadForTriangle(
 }
 
 void
+Converter::HullGenerateWorkloadForIsoline(
+    llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+    llvm::Value *TessFactorDensity, llvm::Value *TessFactorDetail
+) {
+  using namespace llvm;
+
+  auto &Context = air.getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{3U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+  );
+
+  SmallVector<Value *> Ops;
+  SmallVector<Type *> Tys;
+
+  Tys.push_back(PatchIndex->getType());
+  Ops.push_back(PatchIndex);
+  Tys.push_back(CountPtr->getType());
+  Ops.push_back(CountPtr);
+  Tys.push_back(DataPtr->getType());
+  Ops.push_back(DataPtr);
+  Tys.push_back(TessFactorDensity->getType());
+  Ops.push_back(TessFactorDensity);
+  Tys.push_back(TessFactorDetail->getType());
+  Ops.push_back(TessFactorDetail);
+
+  std::string FnName = "dxmt.generate_workload.isoline";
+  switch (Partitioning) {
+  case TessellatorPartitioning::integer:
+    FnName += ".integer";
+    break;
+  case TessellatorPartitioning::pow2:
+    FnName += ".pow2";
+    break;
+  case TessellatorPartitioning::fractional_odd:
+    FnName += ".odd";
+    break;
+  case TessellatorPartitioning::fractional_even:
+    FnName += ".even";
+    break;
+  }
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs);
+  ir.CreateCall(Fn, Ops);
+}
+
+void
 Converter::HullGenerateWorkloadForQuad(
     llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
     llvm::Value *TessFactorIn0, llvm::Value *TessFactorIn1, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1,

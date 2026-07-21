@@ -136,7 +136,7 @@ struct TessMeshWorkload {
   char inner_factor_i;
   char outer_factor_i;
   bool has_complement;
-  bool padding;
+  bool is_isoline;
   fxp16v2 inner0_c;
   fxp16v2 inner1_c;
   fxp16v2 outer0_c;
@@ -369,6 +369,87 @@ gen_workload_triangle_even(
   gen_workload_triangle_impl<partitioning::fractional_even>(
       patch_index, out_count, out_buffer, in, out0, out1, out2
   );
+}
+
+template <partitioning partition>
+void
+gen_workload_isoline_impl(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) {
+  if (isnan(density) || density <= 0) return;
+  if (isnan(detail) || detail <= 0) return;
+
+  object_data TessMeshWorkload *workloads = (object_data TessMeshWorkload *)out_buffer;
+  // Isoline density always uses integer partitioning; only detail follows the
+  // hull shader's declared partitioning mode.
+  uint line_count = clamp((uint)ceil(density), 1u, 64u);
+  fxp32 detail_factor = regularize_factor<partition>(detail);
+  char detail_factor_i = get_int_factor<partition>(detail_factor);
+
+  for (uint line = 0; line < line_count; line++) {
+    fxp16 v = (fxp16)((line * (uint)fxp16_1) / line_count);
+    workloads[get_next_index(out_count)] = {
+        {fxp16_0, v},
+        {fxp16_1, v},
+        {fxp16_0, v},
+        {fxp16_1, v},
+        detail_factor,
+        fxp32_0,
+        detail_factor_i,
+        (char)0,
+        false,
+        true,
+        {fxp16_0, fxp16_0},
+        {fxp16_0, fxp16_0},
+        {fxp16_0, fxp16_0},
+        {fxp16_0, fxp16_0},
+        fxp32_0,
+        fxp32_0,
+        (char)0,
+        (char)0,
+        (short)patch_index
+    };
+  }
+}
+
+void gen_workload_isoline_integer(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) asm("dxmt.generate_workload.isoline.integer");
+void
+gen_workload_isoline_integer(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) {
+  gen_workload_isoline_impl<partitioning::integer>(patch_index, out_count, out_buffer, density, detail);
+}
+
+void gen_workload_isoline_pow2(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) asm("dxmt.generate_workload.isoline.pow2");
+void
+gen_workload_isoline_pow2(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) {
+  gen_workload_isoline_impl<partitioning::pow2>(patch_index, out_count, out_buffer, density, detail);
+}
+
+void gen_workload_isoline_odd(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) asm("dxmt.generate_workload.isoline.odd");
+void
+gen_workload_isoline_odd(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) {
+  gen_workload_isoline_impl<partitioning::fractional_odd>(patch_index, out_count, out_buffer, density, detail);
+}
+
+void gen_workload_isoline_even(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) asm("dxmt.generate_workload.isoline.even");
+void
+gen_workload_isoline_even(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float density, float detail
+) {
+  gen_workload_isoline_impl<partitioning::fractional_even>(patch_index, out_count, out_buffer, density, detail);
 }
 
 fxp16v2 pxmy(fxp32 x, fxp32 y) {
@@ -644,9 +725,12 @@ get_domain_location_impl(int workload_index, int thread_index, object_data int *
   domain_location ret{float2(0), false, false};
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
 
-  int count = workload.inner_factor_i + workload.outer_factor_i + 2;
-  if (workload.has_complement)
-    count += workload.inner_factor_c_i + workload.outer_factor_c_i + 2;
+  int count = workload.inner_factor_i + 1;
+  if (!workload.is_isoline) {
+    count += workload.outer_factor_i + 1;
+    if (workload.has_complement)
+      count += workload.inner_factor_c_i + workload.outer_factor_c_i + 2;
+  }
 
   if (thread_index < count) {
     ret.active = true;
@@ -700,6 +784,22 @@ struct dummy_vertex {
 };
 
 using MeshTri = metal::mesh<dummy_vertex, void, 130, 128, topology::triangle>;
+using MeshLine = metal::mesh<dummy_vertex, void, 65, 64, topology::line>;
+
+void generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) asm(
+    "dxmt.domain_generate_primitives.line"
+);
+
+void
+generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) {
+  object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
+
+  for (short i = 0; i < workload.inner_factor_i; i++) {
+    mesh.set_index(i * 2, i);
+    mesh.set_index(i * 2 + 1, i + 1);
+  }
+  mesh.set_primitive_count(workload.inner_factor_i);
+}
 
 void generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) asm(
     "dxmt.domain_generate_primitives.triangle"
@@ -805,8 +905,10 @@ generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) 
     for (short i = 0; i < max_in + 1; i++) {
       mesh.set_index(index_count++, i);
     }
-    for (short i = 0; i < max_out + 1; i++) {
-      mesh.set_index(index_count++, i + base_outer);
+    if (!workload.is_isoline) {
+      for (short i = 0; i < max_out + 1; i++) {
+        mesh.set_index(index_count++, i + base_outer);
+      }
     }
   }
 

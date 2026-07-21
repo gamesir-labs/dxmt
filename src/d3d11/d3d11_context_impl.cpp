@@ -4939,19 +4939,12 @@ public:
     if (!HS) {
       return DrawCallStatus::Invalid;
     }
-    switch (HS->reflection().Tessellator.OutputPrimitive) {
-    case MTL_TESSELLATOR_OUTPUT_LINE:
+    if (HS->reflection().Tessellator.OutputPrimitive ==
+        MTL_TESSELLATOR_OUTPUT_POINT) {
       EmitST([](ArgumentEncodingContext &enc) {
         enc.setCompatibilityFlag(FeatureCompatibility::UnsupportedTessellationOutputPrimitive);
       });
       return DrawCallStatus::Invalid;
-    case MTL_TESSELLATOR_OUTPUT_POINT:
-      EmitST([](ArgumentEncodingContext &enc) {
-        enc.setCompatibilityFlag(FeatureCompatibility::UnsupportedTessellationOutputPrimitive);
-      });
-      return DrawCallStatus::Invalid;
-    default:
-      break;
     }
     if (!state_.ShaderStages[PipelineStage::Domain].Shader) {
       return DrawCallStatus::Invalid;

@@ -21,7 +21,7 @@ struct TessMeshWorkload {
   char inner_factor_i;
   char outer_factor_i;
   bool has_complement;
-  bool padding;
+  bool is_isoline;
   short inner2[2];
   short inner3[2];
   short outer2[2];
@@ -106,18 +106,23 @@ get_integer_factor(float factor, SM50ShaderInternal *pHullStage) {
 }
 
 uint32_t
-get_max_potential_workload_count(uint32_t max_tess_factor, SM50ShaderInternal *pHullStage) {
+get_max_potential_workload_count(float max_tess_factor, SM50ShaderInternal *pHullStage) {
 
   switch (pHullStage->tessellation_domain) {
   case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_UNDEFINED:
-  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE:
     return 0;
-  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_TRI:
-    return std::ceil((max_tess_factor - 1) / 4.0) * 3 + (max_tess_factor & 1);
-  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_QUAD:
-    return std::ceil((max_tess_factor - 1) / 4.0) * 4 + (max_tess_factor & 1);
-    ;
+  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE:
+    return std::ceil(std::clamp(max_tess_factor, 1.0f, 64.0f));
+  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_TRI: {
+    uint32_t factor = get_integer_factor(max_tess_factor, pHullStage);
+    return std::ceil((factor - 1) / 4.0) * 3 + (factor & 1);
   }
+  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_QUAD: {
+    uint32_t factor = get_integer_factor(max_tess_factor, pHullStage);
+    return std::ceil((factor - 1) / 4.0) * 4 + (factor & 1);
+  }
+  }
+  return 0;
 }
 
 size_t
@@ -129,8 +134,7 @@ estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t pat
   auto pc_size_per_patch = sizeof(uint32_t) * pHullStage->patch_constant_scalars.size();
   auto pc_size_per_group = pc_size_per_patch * patch_per_group;
 
-  auto factor_int = get_integer_factor(factor, pHullStage);
-  uint32_t max_workload_count = get_max_potential_workload_count(factor_int, pHullStage);
+  uint32_t max_workload_count = get_max_potential_workload_count(factor, pHullStage);
   constexpr uint32_t size_workload_info = sizeof(TessMeshWorkload);
 
   return cp_size_per_group + pc_size_per_group + sizeof(uint32_t) +
@@ -198,7 +202,7 @@ convert_dxbc_vertex_hull_shader(
   uint32_t max_hs_output_register = pHullStage->max_output_register;
   uint32_t max_patch_constant_output_register = pHullStage->max_patch_constant_output_register;
 
-  auto [final_maxtessfactor, factor_int] = get_final_maxtessfactor(pHullStage, pArgs);
+  auto final_maxtessfactor = get_final_maxtessfactor(pHullStage, pArgs).first;
 
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_FLAG shader_flags = {};
@@ -264,7 +268,7 @@ convert_dxbc_vertex_hull_shader(
   auto hs_pcout_per_patch_scaler_type = llvm::ArrayType::get(types._int, pHullStage->patch_constant_scalars.size());
   auto hs_pcout_per_group_scaler_type = llvm::ArrayType::get(hs_pcout_per_patch_scaler_type, patch_per_group);
 
-  uint32_t max_workload_count = get_max_potential_workload_count(factor_int, pHullStage);
+  uint32_t max_workload_count = get_max_potential_workload_count(final_maxtessfactor, pHullStage);
 
   func_signature.UseMaxMeshWorkgroupSize(max_workload_count);
 
@@ -659,7 +663,14 @@ convert_dxbc_vertex_hull_shader(
 
     switch (pHullStage->tessellation_domain) {
     case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE:
-      // TESS TODO
+      dxbc.HullGenerateWorkloadForIsoline(
+          patch_offset_in_group, workload_count,
+          builder.CreateGEP(
+              payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(3), builder.getInt32(0)}
+          ),
+          // DXBC assigns line detail to slot 0 and line density to slot 1.
+          get_partitioning(pHullStage), tess_factors[1], tess_factors[0]
+      );
       break;
     case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_QUAD:
       dxbc.HullGenerateWorkloadForQuad(
@@ -787,7 +798,7 @@ convert_dxbc_tesselator_domain_shader(
 
   // n segments has n + 1 points
   uint32_t max_edge_point = factor_int + 1;
-  uint32_t max_workload_count = get_max_potential_workload_count(factor_int, pHullStage);
+  uint32_t max_workload_count = get_max_potential_workload_count(final_maxtessfactor, pHullStage);
   constexpr uint32_t size_workload_info = sizeof(TessMeshWorkload);
   auto payload_struct_type = llvm::StructType::create(
       context,
@@ -810,7 +821,6 @@ convert_dxbc_tesselator_domain_shader(
     break;
   }
   case microsoft::D3D11_SB_TESSELLATOR_OUTPUT_LINE: {
-    // TESS TODO
     func_signature.DefineInput(
         air::InputMesh{(uint32_t)max_edge_point, (uint32_t)max_edge_point - 1, air::MeshOutputTopology::Line}
     );

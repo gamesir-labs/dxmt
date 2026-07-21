@@ -235,6 +235,77 @@ Output main(PatchConstants constants,
 }
 )";
 
+std::string IsolineHullShader(std::string_view partition, float density,
+                              float detail) {
+  std::string source = R"(
+struct Input {
+  float seed : SEED;
+};
+struct ControlPoint {
+  float phase_value : PHASE;
+};
+struct PatchConstants {
+  float edges[2] : SV_TessFactor;
+  float marker : MARKER;
+};
+
+PatchConstants patch_constants(InputPatch<Input, 2> patch,
+                               uint primitive_id : SV_PrimitiveID) {
+  PatchConstants output;
+  output.edges[0] = )";
+  source += std::to_string(density);
+  source += ";\n  output.edges[1] = " + std::to_string(detail);
+  source += R"(;
+  output.marker = patch[0].seed + patch[1].seed + primitive_id;
+  return output;
+}
+
+[domain("isoline")]
+[outputcontrolpoints(2)]
+[outputtopology("line")]
+[partitioning(")";
+  source += partition;
+  source += R"(")]
+[patchconstantfunc("patch_constants")]
+[maxtessfactor(64.0)]
+ControlPoint main(InputPatch<Input, 2> patch,
+                  uint control_point_id : SV_OutputControlPointID) {
+  ControlPoint output;
+  output.phase_value = patch[control_point_id].seed * 2.0;
+  return output;
+}
+)";
+  return source;
+}
+
+constexpr std::string_view kIsolineDomainShader = R"(
+struct ControlPoint {
+  float phase_value : PHASE;
+};
+struct PatchConstants {
+  float edges[2] : SV_TessFactor;
+  float marker : MARKER;
+};
+struct Output {
+  float4 position : SV_Position;
+  float4 color : COLOR0;
+};
+
+[domain("isoline")]
+Output main(PatchConstants constants,
+            float2 location : SV_DomainLocation,
+            const OutputPatch<ControlPoint, 2> patch) {
+  Output output;
+  output.position = float4(location.x * 1.5 - 0.75,
+                           0.75 - location.y * 2.25, 0.0, 1.0);
+  output.color = float4(1.0 - location.y, location.y,
+                        constants.marker *
+                            (patch[0].phase_value + patch[1].phase_value) / 18.0,
+                        1.0);
+  return output;
+}
+)";
+
 uint8_t FloatToUnorm(float value) {
   return static_cast<uint8_t>(std::lround(value * 255.0f));
 }
@@ -420,6 +491,53 @@ TEST_F(D3D11TessellationShaderOpsSpec,
   const uint32_t expected = PackColor(1.0f, 5.234375f / 8.0f, 0.5390625f, 1.0f);
   EXPECT_TRUE(ColorMatches(pixels[8 * kTargetWidth + 8], expected))
       << "center pixel was 0x" << std::hex << pixels[8 * kTargetWidth + 8];
+}
+
+TEST_F(D3D11TessellationShaderOpsSpec,
+       IsolineDensityAndDetailGenerateIndependentLines) {
+  const auto pixels = Run(
+      IsolineHullShader("fractional_even", 2.2f, 3.1f), kIsolineDomainShader,
+      D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2);
+  ASSERT_EQ(pixels.size(), kTargetWidth * kTargetHeight);
+
+  const auto drawn_pixel_count =
+      std::count_if(pixels.begin(), pixels.end(),
+                    [](uint32_t pixel) { return pixel != kClearColor; });
+  ASSERT_GT(drawn_pixel_count, 0);
+
+  const std::array expected_colors = {
+      PackColor(1.0f, 0.0f, 1.0f),
+      PackColor(2.0f / 3.0f, 1.0f / 3.0f, 1.0f),
+      PackColor(1.0f / 3.0f, 2.0f / 3.0f, 1.0f),
+  };
+  for (uint32_t expected : expected_colors) {
+    EXPECT_GT(std::count_if(pixels.begin(), pixels.end(),
+                            [expected](uint32_t pixel) {
+                              return ColorMatches(pixel, expected);
+                            }),
+              8);
+  }
+  EXPECT_LT(drawn_pixel_count, 48);
+}
+
+TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
+  const auto pixels =
+      Run(IsolineHullShader("integer", 3, 0), kIsolineDomainShader,
+          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2);
+  ASSERT_EQ(pixels.size(), kTargetWidth * kTargetHeight);
+  EXPECT_TRUE(std::all_of(pixels.begin(), pixels.end(),
+                          [](uint32_t pixel) { return pixel == kClearColor; }));
+}
+
+TEST_F(D3D11TessellationShaderOpsSpec,
+       MaximumDensityExecutesSixtyFourIsolines) {
+  const auto pixels =
+      Run(IsolineHullShader("integer", 64, 1), kIsolineDomainShader,
+          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2);
+  ASSERT_EQ(pixels.size(), kTargetWidth * kTargetHeight);
+  EXPECT_GT(std::count_if(pixels.begin(), pixels.end(),
+                          [](uint32_t pixel) { return pixel != kClearColor; }),
+            100);
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroEdgeFactorCullsTrianglePatch) {
