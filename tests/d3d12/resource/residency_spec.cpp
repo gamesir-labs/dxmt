@@ -1,15 +1,20 @@
 #include <dxmt_test.hpp>
+#include <dxmt_test_shader.hpp>
 
 #include "d3d12_test_context.hpp"
 
 #include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using dxmt::test::ComPtr;
+using dxmt::test::CompileShader;
 using dxmt::test::D3D12TestContext;
 
 class LifetimeProbe final : public IUnknown {
@@ -159,6 +164,70 @@ TEST_F(ResidencySpec, EnqueueMakeResidentAcceptsDenyOverbudgetFlag) {
                 fence.get(), 5),
             S_OK);
   EXPECT_GE(fence->GetCompletedValue(), 5u);
+}
+
+TEST_F(ResidencySpec, DispatchUsesEnqueuedResidentBuffer) {
+  const auto shader = CompileShader(R"(
+    RWByteAddressBuffer output : register(u0);
+    [numthreads(1, 1, 1)]
+    void main() {
+      output.Store(0, 0x6a09e667u);
+    }
+  )",
+                                    "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  D3D12_ROOT_PARAMETER parameter = {};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 1;
+  root_desc.pParameters = &parameter;
+  auto root = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root);
+  auto pipeline = context_.CreateComputePipeline(
+      root.get(), {shader.bytecode->GetBufferPointer(),
+                   shader.bytecode->GetBufferSize()});
+  auto output = context_.CreateBuffer(
+      sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(output);
+
+  ID3D12Pageable *objects[] = {output.get()};
+  ASSERT_EQ(context_.device()->Evict(1, objects), S_OK);
+  ComPtr<ID3D12Device3> device3;
+  ASSERT_EQ(context_.device()->QueryInterface(IID_PPV_ARGS(device3.put())),
+            S_OK);
+  ComPtr<ID3D12Fence> residency_fence;
+  ASSERT_EQ(context_.device()->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(residency_fence.put())),
+            S_OK);
+  constexpr UINT64 kResidencyValue = 5;
+  ASSERT_EQ(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1,
+                                         objects, residency_fence.get(),
+                                         kResidencyValue),
+            S_OK);
+  ASSERT_EQ(context_.queue()->Wait(residency_fence.get(), kResidencyValue),
+            S_OK);
+
+  context_.list()->SetComputeRootSignature(root.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootUnorderedAccessView(
+      0, output->GetGPUVirtualAddress());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), output.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  std::vector<std::uint8_t> bytes;
+  ASSERT_EQ(context_.ReadbackBuffer(output.get(), sizeof(UINT), &bytes), S_OK);
+  ASSERT_EQ(bytes.size(), sizeof(UINT));
+  UINT actual = 0;
+  std::memcpy(&actual, bytes.data(), sizeof(actual));
+  EXPECT_EQ(actual, 0x6a09e667u);
+  EXPECT_GE(residency_fence->GetCompletedValue(), kResidencyValue);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(ResidencySpec, AcceptsPriorityBucketsAndApplicationValues) {
