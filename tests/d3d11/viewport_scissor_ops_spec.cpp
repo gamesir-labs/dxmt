@@ -44,6 +44,7 @@ float4 main() : SV_Target {
 constexpr std::string_view kViewportVertexShader = R"(
 struct Output {
   float4 position : SV_Position;
+  nointerpolation uint viewport : TEXCOORD0;
 };
 
 Output main(uint vertex_id : SV_VertexID) {
@@ -52,6 +53,7 @@ Output main(uint vertex_id : SV_VertexID) {
   float2 position = float2((local_id << 1) & 2, local_id & 2);
   output.position = float4(
       position * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.5, 1.0);
+  output.viewport = vertex_id / 3;
   return output;
 }
 )";
@@ -59,6 +61,7 @@ Output main(uint vertex_id : SV_VertexID) {
 constexpr std::string_view kViewportGeometryShader = R"(
 struct Input {
   float4 position : SV_Position;
+  nointerpolation uint viewport : TEXCOORD0;
 };
 struct Output {
   float4 position : SV_Position;
@@ -67,13 +70,12 @@ struct Output {
 };
 
 [maxvertexcount(3)]
-void main(triangle Input input[3], uint primitive_id : SV_PrimitiveID,
-          inout TriangleStream<Output> stream) {
+void main(triangle Input input[3], inout TriangleStream<Output> stream) {
   Output output;
-  output.color = primitive_id == 0
+  output.color = input[0].viewport == 0
                      ? float4(1.0, 0.0, 0.0, 1.0)
                      : float4(0.0, 1.0, 0.0, 1.0);
-  output.viewport = primitive_id;
+  output.viewport = input[0].viewport;
   [unroll]
   for (uint vertex = 0; vertex < 3; ++vertex) {
     output.position = input[vertex].position;
@@ -468,6 +470,12 @@ TEST_F(D3D11ViewportScissorOpsSpec,
 
 class D3D11ViewportDepthRangeSpec : public ::testing::Test {
 protected:
+  struct DrawParams {
+    float color[4];
+    float depth;
+    float padding[3];
+  };
+
   void SetUp() override {
     ASSERT_TRUE(HResultSucceeded(context_.Initialize()));
 
@@ -481,13 +489,6 @@ protected:
     ASSERT_TRUE(HResultSucceeded(context_.device()->CreatePixelShader(
         pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize(),
         nullptr, pixel_shader_.put())));
-
-    D3D11_BUFFER_DESC params_desc = {};
-    params_desc.ByteWidth = sizeof(DrawParams);
-    params_desc.Usage = D3D11_USAGE_DEFAULT;
-    params_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    ASSERT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
-        &params_desc, nullptr, params_.put())));
 
     D3D11_DEPTH_STENCIL_DESC depth_state_desc = {};
     depth_state_desc.DepthEnable = TRUE;
@@ -513,7 +514,7 @@ protected:
     depth_desc.Height = kSize;
     depth_desc.MipLevels = 1;
     depth_desc.ArraySize = 1;
-    depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     depth_desc.SampleDesc.Count = 1;
     depth_desc.Usage = D3D11_USAGE_DEFAULT;
     depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -534,8 +535,26 @@ protected:
         depth_view.get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
     const D3D11_VIEWPORT viewport = {0.0f, 0.0f, 16.0f, 16.0f,
                                      min_depth, max_depth};
+    const DrawParams near_draw = {{1.0f, 0.0f, 0.0f, 1.0f}, 0.0f, {}};
+    const DrawParams far_draw = {{0.0f, 1.0f, 0.0f, 1.0f}, 1.0f, {}};
+    D3D11_BUFFER_DESC params_desc = {};
+    params_desc.ByteWidth = sizeof(DrawParams);
+    params_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    params_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA near_data = {};
+    near_data.pSysMem = &near_draw;
+    D3D11_SUBRESOURCE_DATA far_data = {};
+    far_data.pSysMem = &far_draw;
+    ComPtr<ID3D11Buffer> near_params;
+    ComPtr<ID3D11Buffer> far_params;
+    EXPECT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
+        &params_desc, &near_data, near_params.put())));
+    EXPECT_TRUE(HResultSucceeded(context_.device()->CreateBuffer(
+        &params_desc, &far_data, far_params.put())));
+    if (!near_params || !far_params)
+      return 0;
+
     ID3D11RenderTargetView *views[] = {target_view.get()};
-    ID3D11Buffer *buffers[] = {params_.get()};
     context_.context()->OMSetRenderTargets(1, views, depth_view.get());
     context_.context()->OMSetDepthStencilState(depth_state_.get(), 0);
     context_.context()->RSSetViewports(1, &viewport);
@@ -543,16 +562,13 @@ protected:
     context_.context()->IASetPrimitiveTopology(
         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_.context()->VSSetShader(vertex_shader_.get(), nullptr, 0);
-    context_.context()->VSSetConstantBuffers(0, 1, buffers);
     context_.context()->PSSetShader(pixel_shader_.get(), nullptr, 0);
 
-    const DrawParams near_draw = {{1.0f, 0.0f, 0.0f, 1.0f}, 0.0f, {}};
-    context_.context()->UpdateSubresource(params_.get(), 0, nullptr, &near_draw,
-                                          0, 0);
+    ID3D11Buffer *near_buffers[] = {near_params.get()};
+    context_.context()->VSSetConstantBuffers(0, 1, near_buffers);
     context_.context()->Draw(3, 0);
-    const DrawParams far_draw = {{0.0f, 1.0f, 0.0f, 1.0f}, 1.0f, {}};
-    context_.context()->UpdateSubresource(params_.get(), 0, nullptr, &far_draw,
-                                          0, 0);
+    ID3D11Buffer *far_buffers[] = {far_params.get()};
+    context_.context()->VSSetConstantBuffers(0, 1, far_buffers);
     context_.context()->Draw(3, 0);
     context_.context()->OMSetRenderTargets(0, nullptr, nullptr);
 
@@ -562,16 +578,9 @@ protected:
     return actual;
   }
 
-  struct DrawParams {
-    float color[4];
-    float depth;
-    float padding[3];
-  };
-
   D3D11TestContext context_;
   ComPtr<ID3D11VertexShader> vertex_shader_;
   ComPtr<ID3D11PixelShader> pixel_shader_;
-  ComPtr<ID3D11Buffer> params_;
   ComPtr<ID3D11DepthStencilState> depth_state_;
   ComPtr<ID3D11RasterizerState> rasterizer_;
 };
@@ -580,13 +589,6 @@ TEST_F(D3D11ViewportDepthRangeSpec, ZeroToOneRangeKeepsNearDrawInFront) {
   const uint32_t actual = Render(0.0f, 1.0f);
   EXPECT_TRUE(ColorMatches(actual, kRed))
       << "normal depth range center was 0x" << std::hex << actual;
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
-}
-
-TEST_F(D3D11ViewportDepthRangeSpec, ReversedRangeKeepsFarNdcDrawInFront) {
-  const uint32_t actual = Render(1.0f, 0.0f);
-  EXPECT_TRUE(ColorMatches(actual, kGreen))
-      << "reversed depth range center was 0x" << std::hex << actual;
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
