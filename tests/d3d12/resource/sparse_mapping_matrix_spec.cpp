@@ -603,6 +603,49 @@ TEST_F(SparseMappingMatrixSpec, RepeatedNullAndMapRangesRecover) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST_F(SparseMappingMatrixSpec, FragmentedSparseHeapCanReuseFreedRanges) {
+  auto buffer = CreateBuffer(4, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto heap = CreateBufferBacking(3);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(heap);
+  MapRange(buffer.get(), heap.get(), 0, 3, D3D12_TILE_RANGE_FLAG_NONE);
+
+  std::vector<std::uint8_t> first(kTileSize);
+  std::vector<std::uint8_t> freed(kTileSize);
+  std::vector<std::uint8_t> third(kTileSize);
+  std::vector<std::uint8_t> replacement(kTileSize);
+  for (UINT64 index = 0; index < kTileSize; ++index) {
+    first[index] = static_cast<std::uint8_t>((index * 17 + 3) & 0xff);
+    freed[index] = static_cast<std::uint8_t>((index * 29 + 11) & 0xff);
+    third[index] = static_cast<std::uint8_t>((index * 43 + 19) & 0xff);
+    replacement[index] =
+        static_cast<std::uint8_t>((index * 61 + 37) & 0xff);
+  }
+  WriteTile(buffer.get(), 0, first);
+  WriteTile(buffer.get(), 1, freed);
+  WriteTile(buffer.get(), 2, third);
+
+  MapRange(buffer.get(), nullptr, 1, 1, D3D12_TILE_RANGE_FLAG_NULL);
+  MapRange(buffer.get(), heap.get(), 3, 1, D3D12_TILE_RANGE_FLAG_NONE, 1);
+  EXPECT_EQ(ReadTile(buffer.get(), 3, D3D12_RESOURCE_STATE_COPY_DEST), freed);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  D3D12TestContext::Transition(context_.list(), buffer.get(),
+                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  WriteTile(buffer.get(), 3, replacement);
+
+  EXPECT_EQ(ReadTile(buffer.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST), first);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), 2, D3D12_RESOURCE_STATE_COPY_SOURCE), third);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), 3, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            replacement);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(SparseMappingMatrixSpec, CrossQueueMappingIsOrderedBeforeDirectUse) {
   auto texture = CreateTexture(D3D12_RESOURCE_STATE_COPY_DEST);
   auto heap = CreateBacking(1);
