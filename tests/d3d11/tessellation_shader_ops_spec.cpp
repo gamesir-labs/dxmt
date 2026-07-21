@@ -306,6 +306,34 @@ Output main(PatchConstants constants,
 }
 )";
 
+constexpr std::string_view kMaximumDensityIsolineDomainShader = R"(
+struct ControlPoint {
+  float phase_value : PHASE;
+};
+struct PatchConstants {
+  float edges[2] : SV_TessFactor;
+  float marker : MARKER;
+};
+struct Output {
+  float4 position : SV_Position;
+  float4 color : COLOR0;
+};
+
+[domain("isoline")]
+Output main(PatchConstants constants,
+            float2 location : SV_DomainLocation,
+            const OutputPatch<ControlPoint, 2> patch) {
+  Output output;
+  output.position = float4(location.x * 1.5 - 0.75,
+                           0.984375 - location.y * 2.0, 0.0, 1.0);
+  output.color = float4(1.0 - location.y, location.y,
+                        constants.marker *
+                            (patch[0].phase_value + patch[1].phase_value) / 18.0,
+                        1.0);
+  return output;
+}
+)";
+
 uint8_t FloatToUnorm(float value) {
   return static_cast<uint8_t>(std::lround(value * 255.0f));
 }
@@ -355,10 +383,10 @@ protected:
               S_OK);
   }
 
-  std::vector<uint32_t> Run(std::string_view hull_source,
-                            std::string_view domain_source,
-                            D3D11_PRIMITIVE_TOPOLOGY topology,
-                            UINT control_point_count) {
+  std::vector<uint32_t>
+  Run(std::string_view hull_source, std::string_view domain_source,
+      D3D11_PRIMITIVE_TOPOLOGY topology, UINT control_point_count,
+      UINT target_width = kTargetWidth, UINT target_height = kTargetHeight) {
     const auto hull = CompileShader(hull_source, "hs_5_0");
     const auto domain = CompileShader(domain_source, "ds_5_0");
     EXPECT_EQ(hull.result, S_OK) << hull.diagnostic_text();
@@ -380,8 +408,8 @@ protected:
       return {};
 
     D3D11_TEXTURE2D_DESC target_desc = {};
-    target_desc.Width = kTargetWidth;
-    target_desc.Height = kTargetHeight;
+    target_desc.Width = target_width;
+    target_desc.Height = target_height;
     target_desc.MipLevels = 1;
     target_desc.ArraySize = 1;
     target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -402,8 +430,8 @@ protected:
     const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     context_.context()->ClearRenderTargetView(target_view.get(), clear);
     D3D11_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(kTargetWidth);
-    viewport.Height = static_cast<float>(kTargetHeight);
+    viewport.Width = static_cast<float>(target_width);
+    viewport.Height = static_cast<float>(target_height);
     viewport.MaxDepth = 1.0f;
     ID3D11RenderTargetView *target_views[] = {target_view.get()};
     context_.context()->OMSetRenderTargets(1, target_views, nullptr);
@@ -436,12 +464,12 @@ protected:
         S_OK);
     if (!mapped.pData)
       return {};
-    std::vector<uint32_t> pixels(kTargetWidth * kTargetHeight);
-    for (UINT y = 0; y < kTargetHeight; ++y) {
-      std::memcpy(pixels.data() + y * kTargetWidth,
+    std::vector<uint32_t> pixels(target_width * target_height);
+    for (UINT y = 0; y < target_height; ++y) {
+      std::memcpy(pixels.data() + y * target_width,
                   static_cast<const uint8_t *>(mapped.pData) +
                       y * mapped.RowPitch,
-                  kTargetWidth * sizeof(uint32_t));
+                  target_width * sizeof(uint32_t));
     }
     context_.context()->Unmap(staging.get(), 0);
     EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
@@ -537,13 +565,19 @@ TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
 
 TEST_F(D3D11TessellationShaderOpsSpec,
        MaximumDensityExecutesSixtyFourIsolines) {
-  const auto pixels =
-      Run(IsolineHullShader("integer", 64, 1), kIsolineDomainShader,
-          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2);
-  ASSERT_EQ(pixels.size(), kTargetWidth * kTargetHeight);
-  EXPECT_GT(std::count_if(pixels.begin(), pixels.end(),
-                          [](uint32_t pixel) { return pixel != kClearColor; }),
-            100);
+  constexpr UINT kDensity = 64;
+  const auto pixels = Run(IsolineHullShader("integer", kDensity, 1),
+                          kMaximumDensityIsolineDomainShader,
+                          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
+                          kTargetWidth, kDensity);
+  ASSERT_EQ(pixels.size(), kTargetWidth * kDensity);
+  for (UINT line = 0; line < kDensity; ++line) {
+    const uint32_t actual = pixels[line * kTargetWidth + kTargetWidth / 2];
+    const float location = static_cast<float>(line) / kDensity;
+    const uint32_t expected = PackColor(1.0f - location, location, 1.0f);
+    EXPECT_TRUE(ColorMatches(actual, expected))
+        << "isoline " << line << " center pixel was 0x" << std::hex << actual;
+  }
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroEdgeFactorCullsTrianglePatch) {
