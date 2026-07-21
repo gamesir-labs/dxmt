@@ -306,6 +306,35 @@ Output main(PatchConstants constants,
 }
 )";
 
+constexpr std::string_view kCurvedIsolineDomainShader = R"(
+struct ControlPoint {
+  float phase_value : PHASE;
+};
+struct PatchConstants {
+  float edges[2] : SV_TessFactor;
+  float marker : MARKER;
+};
+struct Output {
+  float4 position : SV_Position;
+  float4 color : COLOR0;
+};
+
+[domain("isoline")]
+Output main(PatchConstants constants,
+            float2 location : SV_DomainLocation,
+            const OutputPatch<ControlPoint, 2> patch) {
+  Output output;
+  float curve = 4.0 * location.x * (1.0 - location.x);
+  output.position = float4(location.x * 1.5 - 0.75,
+                           0.75 - location.y - curve * 0.2, 0.0, 1.0);
+  output.color = float4(1.0 - location.y, location.y,
+                        constants.marker *
+                            (patch[0].phase_value + patch[1].phase_value) / 18.0,
+                        1.0);
+  return output;
+}
+)";
+
 constexpr std::string_view kMaximumDensityIsolineDomainShader = R"(
 struct ControlPoint {
   float phase_value : PHASE;
@@ -325,7 +354,7 @@ Output main(PatchConstants constants,
             const OutputPatch<ControlPoint, 2> patch) {
   Output output;
   output.position = float4(location.x * 1.5 - 0.75,
-                           0.984375 - location.y * 2.0, 0.0, 1.0);
+                           0.99609375 - location.y * 2.0, 0.0, 1.0);
   output.color = float4(1.0 - location.y, location.y,
                         constants.marker *
                             (patch[0].phase_value + patch[1].phase_value) / 18.0,
@@ -523,35 +552,42 @@ TEST_F(D3D11TessellationShaderOpsSpec,
 
 TEST_F(D3D11TessellationShaderOpsSpec,
        IsolineDensityAndDetailGenerateIndependentLines) {
-  const auto pixels = Run(
-      IsolineHullShader("fractional_even", 2.2f, 3.1f), kIsolineDomainShader,
-      D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2);
-  ASSERT_EQ(pixels.size(), kTargetWidth * kTargetHeight);
+  constexpr UINT kDensity = 3;
+  constexpr UINT kDetail = 4;
+  constexpr UINT kSize = 64;
+  const auto pixels =
+      Run(IsolineHullShader("integer", kDensity, kDetail),
+          kCurvedIsolineDomainShader,
+          D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2, kSize, kSize);
+  ASSERT_EQ(pixels.size(), kSize * kSize);
 
-  const auto drawn_pixel_count =
-      std::count_if(pixels.begin(), pixels.end(),
-                    [](uint32_t pixel) { return pixel != kClearColor; });
-  ASSERT_GT(drawn_pixel_count, 0);
-
-  const std::array expected_colors = {
-      PackColor(1.0f, 0.0f, 1.0f),
-      PackColor(2.0f / 3.0f, 1.0f / 3.0f, 1.0f),
-      PackColor(1.0f / 3.0f, 2.0f / 3.0f, 1.0f),
-  };
-  std::array<size_t, expected_colors.size()> matching_pixels = {};
-  for (uint32_t pixel : pixels) {
-    if (pixel == kClearColor)
-      continue;
-    const auto match = std::find_if(
-        expected_colors.begin(), expected_colors.end(),
-        [pixel](uint32_t expected) { return ColorMatches(pixel, expected); });
-    EXPECT_NE(match, expected_colors.end())
-        << "unexpected isoline color 0x" << std::hex << pixel;
-    if (match != expected_colors.end())
-      ++matching_pixels[static_cast<size_t>(match - expected_colors.begin())];
+  for (UINT line = 0; line < kDensity; ++line) {
+    const float line_location = static_cast<float>(line) / kDensity;
+    const uint32_t expected =
+        PackColor(1.0f - line_location, line_location, 1.0f);
+    for (UINT vertex = 0; vertex <= kDetail; ++vertex) {
+      const float detail_location = static_cast<float>(vertex) / kDetail;
+      const float curve =
+          4.0f * detail_location * (1.0f - detail_location);
+      const int center_x =
+          static_cast<int>(std::lround(8.0f + detail_location * 48.0f));
+      const int center_y = static_cast<int>(
+          std::lround(8.0f + line_location * 32.0f + curve * 6.4f));
+      bool found = false;
+      for (int y = std::max(0, center_y - 2);
+           y <= std::min(static_cast<int>(kSize) - 1, center_y + 2); ++y) {
+        for (int x = std::max(0, center_x - 2);
+             x <= std::min(static_cast<int>(kSize) - 1, center_x + 2); ++x) {
+          found |= ColorMatches(
+              pixels[static_cast<UINT>(y) * kSize + static_cast<UINT>(x)],
+              expected);
+        }
+      }
+      EXPECT_TRUE(found) << "isoline " << line << " detail vertex " << vertex
+                         << " was not rasterized near (" << center_x << ", "
+                         << center_y << ")";
+    }
   }
-  for (size_t count : matching_pixels)
-    EXPECT_GT(count, 0);
 }
 
 TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
@@ -566,17 +602,25 @@ TEST_F(D3D11TessellationShaderOpsSpec, ZeroDetailFactorCullsIsolinePatch) {
 TEST_F(D3D11TessellationShaderOpsSpec,
        MaximumDensityExecutesSixtyFourIsolines) {
   constexpr UINT kDensity = 64;
+  constexpr UINT kRowsPerLine = 4;
+  constexpr UINT kHeight = kDensity * kRowsPerLine;
   const auto pixels = Run(IsolineHullShader("integer", kDensity, 1),
                           kMaximumDensityIsolineDomainShader,
                           D3D11_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST, 2,
-                          kTargetWidth, kDensity);
-  ASSERT_EQ(pixels.size(), kTargetWidth * kDensity);
+                          kTargetWidth, kHeight);
+  ASSERT_EQ(pixels.size(), kTargetWidth * kHeight);
   for (UINT line = 0; line < kDensity; ++line) {
-    const uint32_t actual = pixels[line * kTargetWidth + kTargetWidth / 2];
     const float location = static_cast<float>(line) / kDensity;
     const uint32_t expected = PackColor(1.0f - location, location, 1.0f);
-    EXPECT_TRUE(ColorMatches(actual, expected))
-        << "isoline " << line << " center pixel was 0x" << std::hex << actual;
+    const UINT center_y = line * kRowsPerLine;
+    bool found = false;
+    for (UINT y = center_y > 0 ? center_y - 1 : 0;
+         y <= std::min(center_y + 1, kHeight - 1); ++y) {
+      for (UINT x = 0; x < kTargetWidth; ++x)
+        found |= ColorMatches(pixels[y * kTargetWidth + x], expected);
+    }
+    EXPECT_TRUE(found) << "isoline " << line << " was not rasterized near row "
+                       << center_y;
   }
 }
 
