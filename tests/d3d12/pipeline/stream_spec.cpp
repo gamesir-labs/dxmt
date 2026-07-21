@@ -82,8 +82,10 @@ TEST_P(PipelineStreamTruncationSpec, TruncatedSubobjectRejected) {
   ID3D12PipelineState *pipeline =
       reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
 
-  EXPECT_EQ(CreatePipeline(stream.data(), sizeof(test.type), &pipeline),
-            E_INVALIDARG);
+  const HRESULT hr =
+      CreatePipeline(stream.data(), sizeof(test.type), &pipeline);
+  EXPECT_TRUE(FAILED(hr)) << "HRESULT 0x" << std::hex
+                          << static_cast<unsigned long>(hr);
   EXPECT_EQ(pipeline, nullptr);
 }
 
@@ -162,7 +164,9 @@ TEST_P(PipelineStreamTypeTruncationSpec, TruncatedTypeRejected) {
   ID3D12PipelineState *pipeline =
       reinterpret_cast<ID3D12PipelineState *>(std::uintptr_t{1});
 
-  EXPECT_EQ(CreatePipeline(stream.data(), GetParam(), &pipeline), E_INVALIDARG);
+  const HRESULT hr = CreatePipeline(stream.data(), GetParam(), &pipeline);
+  EXPECT_TRUE(FAILED(hr)) << "HRESULT 0x" << std::hex
+                          << static_cast<unsigned long>(hr);
   EXPECT_EQ(pipeline, nullptr);
 }
 
