@@ -130,6 +130,42 @@ TEST_F(OcclusionSpec, ReportsZeroForClippedGeometry) {
   EXPECT_EQ(ReadResult(result.get()), 0u);
 }
 
+TEST_F(OcclusionSpec, PartialScissorReportsSubsetOfVisibleSamples) {
+  auto heap = CreateHeap(2);
+  auto result = CreateResultBuffer(2 * sizeof(UINT64));
+  ASSERT_TRUE(heap);
+  ASSERT_TRUE(result);
+  constexpr D3D12_RECT full_scissor = {0, 0, 16, 16};
+  constexpr D3D12_RECT half_scissor = {0, 0, 8, 16};
+
+  RecordQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0, full_scissor);
+  RecordQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 1, half_scissor);
+  context_.list()->ResolveQueryData(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0,
+                                    2, result.get(), 0);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+
+  const UINT64 fully_visible = ReadResult(result.get());
+  const UINT64 partially_visible = ReadResult(result.get(), sizeof(UINT64));
+  EXPECT_GT(partially_visible, 0u);
+  EXPECT_LT(partially_visible, fully_visible);
+}
+
+TEST_F(OcclusionSpec, ZeroVertexDrawReportsNoVisibleSamples) {
+  auto heap = CreateHeap(1);
+  auto result = CreateResultBuffer(sizeof(UINT64));
+  ASSERT_TRUE(heap);
+  ASSERT_TRUE(result);
+
+  context_.list()->BeginQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+  context_.list()->DrawInstanced(0, 1, 0, 0);
+  context_.list()->EndQuery(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+  context_.list()->ResolveQueryData(heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0,
+                                    1, result.get(), 0);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+
+  EXPECT_EQ(ReadResult(result.get()), 0u);
+}
+
 TEST_F(OcclusionSpec, BinaryResultsAreNormalized) {
   auto heap = CreateHeap(2);
   auto result = CreateResultBuffer(2 * sizeof(UINT64));
