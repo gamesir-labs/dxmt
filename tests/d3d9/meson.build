@@ -56,9 +56,22 @@ if dxmt_crossbuild and wine_tests_source_root != ''
       '-w',
     ])
 
-    # stateblock first: it is the smallest module, it changes no display mode,
-    # and it runs clean, so it exercises build, launch, and result parsing
-    # without the failure noise the larger modules carry.
+    # stateblock is the smallest and runs clean; device and visual carry real
+    # failures and known crashes, which the baseline and the missing-summary
+    # rule are there to express.
+    #
+    # Two modules are absent for build reasons, each needing its own answer
+    # rather than a flag applied to all of them:
+    #   d3d9ex includes wine/test.h before d3d9.h, so test.h's console calls are
+    #     compiled before windows.h has been seen. Force-including a header
+    #     ahead of it disturbs the order the others rely on.
+    #   device both references and defines a large set of interface GUIDs on the
+    #     build runner's toolchain, so it collides with the GUID library that
+    #     the same references require. It needs a GUID resolution of its own.
+    #   visual builds and runs, but crashes partway through, so a whole-module
+    #     run reports only that it did not finish and says nothing about the
+    #     assertions before or after. It becomes usable once each test function
+    #     runs in its own process, which is what the isolation transform is for.
     foreach module : [ 'stateblock' ]
       wine_conformance_tests += executable('dx9-wine-' + module + '-test',
         [ wine_tests_dir / (module + '.c'), files('wine_debug_stubs.c') ],
