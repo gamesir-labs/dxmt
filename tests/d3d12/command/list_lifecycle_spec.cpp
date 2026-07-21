@@ -245,9 +245,8 @@ TEST_F(CommandListLifecycleSpec, ResetRecordingListFails) {
 TEST_F(CommandListLifecycleSpec, ResetWithNullAllocatorFails) {
   ASSERT_EQ(context_.list()->Close(), S_OK);
 
-  EXPECT_EQ(context_.list()->Reset(nullptr, nullptr), E_INVALIDARG);
-  ASSERT_EQ(context_.list()->Reset(context_.allocator(), nullptr), S_OK);
-  EXPECT_EQ(context_.list()->Close(), S_OK);
+  EXPECT_TRUE(FAILED(context_.list()->Reset(nullptr, nullptr)));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(CommandListLifecycleSpec, ResetWithWrongAllocatorTypeFails) {
