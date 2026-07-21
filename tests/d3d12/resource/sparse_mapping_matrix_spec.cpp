@@ -140,6 +140,7 @@ protected:
               S_OK);
     if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_1)
       GTEST_SKIP() << "Tiled resources are not supported";
+    tiled_resources_tier_ = options.TiledResourcesTier;
   }
 
   ComPtr<ID3D12Resource> CreateTexture(D3D12_RESOURCE_STATES state) {
@@ -264,6 +265,8 @@ protected:
   }
 
   D3D12TestContext context_;
+  D3D12_TILED_RESOURCES_TIER tiled_resources_tier_ =
+      D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
 };
 
 TEST_F(SparseMappingMatrixSpec, PaginatesSubresourceTilings) {
@@ -458,6 +461,70 @@ TEST_F(SparseMappingMatrixSpec, SkipRangePreservesExistingMapping) {
   const auto actual =
       ReadTile(texture.get(), 0, D3D12_RESOURCE_STATE_COPY_DEST);
   EXPECT_EQ(actual, expected);
+}
+
+TEST_F(SparseMappingMatrixSpec, NullRangeRemovesMappingsAndCanRecover) {
+  auto buffer = CreateBuffer(4, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto original_heap = CreateBufferBacking(2);
+  auto replacement_heap = CreateBufferBacking(2);
+  ASSERT_TRUE(buffer);
+  ASSERT_TRUE(original_heap);
+  ASSERT_TRUE(replacement_heap);
+  MapRange(buffer.get(), original_heap.get(), 1, 2, D3D12_TILE_RANGE_FLAG_NONE);
+
+  std::vector<std::uint8_t> original_first(kTileSize);
+  std::vector<std::uint8_t> original_second(kTileSize);
+  std::vector<std::uint8_t> replacement_first(kTileSize);
+  std::vector<std::uint8_t> replacement_second(kTileSize);
+  for (UINT64 index = 0; index < kTileSize; ++index) {
+    original_first[index] = static_cast<std::uint8_t>((index * 29 + 17) & 0xff);
+    original_second[index] =
+        static_cast<std::uint8_t>((index * 43 + 31) & 0xff);
+    replacement_first[index] =
+        static_cast<std::uint8_t>((index * 53 + 7) & 0xff);
+    replacement_second[index] =
+        static_cast<std::uint8_t>((index * 61 + 23) & 0xff);
+  }
+  WriteTile(buffer.get(), 1, original_first);
+  WriteTile(buffer.get(), 2, original_second);
+  EXPECT_EQ(ReadTile(buffer.get(), 1, D3D12_RESOURCE_STATE_COPY_DEST),
+            original_first);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), 2, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            original_second);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  D3D12TestContext::Transition(context_.list(), buffer.get(),
+                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  MapRange(buffer.get(), nullptr, 1, 2, D3D12_TILE_RANGE_FLAG_NULL);
+  if (tiled_resources_tier_ >= D3D12_TILED_RESOURCES_TIER_2) {
+    const std::vector<std::uint8_t> zeros(kTileSize, 0);
+    EXPECT_EQ(ReadTile(buffer.get(), 1, D3D12_RESOURCE_STATE_COPY_DEST), zeros);
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+    EXPECT_EQ(ReadTile(buffer.get(), 2, D3D12_RESOURCE_STATE_COPY_SOURCE),
+              zeros);
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+    D3D12TestContext::Transition(context_.list(), buffer.get(),
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                 D3D12_RESOURCE_STATE_COPY_DEST);
+    ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+    ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  }
+
+  MapRange(buffer.get(), replacement_heap.get(), 1, 2,
+           D3D12_TILE_RANGE_FLAG_NONE);
+  WriteTile(buffer.get(), 1, replacement_first);
+  WriteTile(buffer.get(), 2, replacement_second);
+  EXPECT_EQ(ReadTile(buffer.get(), 1, D3D12_RESOURCE_STATE_COPY_DEST),
+            replacement_first);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+  EXPECT_EQ(ReadTile(buffer.get(), 2, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            replacement_second);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 TEST_F(SparseMappingMatrixSpec, RepeatedNullAndMapRangesRecover) {
