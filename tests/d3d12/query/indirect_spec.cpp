@@ -23,7 +23,8 @@ protected:
   void ExpectDispatch(UINT max_command_count, bool executes,
                       UINT64 argument_offset = 0,
                       const UINT *count_value = nullptr,
-                      bool default_count_buffer = false) {
+                      bool default_count_buffer = false,
+                      D3D12_DISPATCH_ARGUMENTS dispatch = {1, 1, 1}) {
     constexpr std::uint32_t sentinel = 0xdeadbeef;
     constexpr std::uint32_t dispatch_value = 0x2468ace0;
     std::array<std::uint32_t, 64> initial;
@@ -36,7 +37,6 @@ protected:
                               D3D12_RESOURCE_STATE_COPY_DEST);
     auto heap = context_.CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true);
-    const D3D12_DISPATCH_ARGUMENTS dispatch = {1, 1, 1};
     std::array<std::uint8_t, 64> argument_data = {};
     ASSERT_LE(argument_offset + sizeof(dispatch), argument_data.size());
     std::memcpy(argument_data.data() + argument_offset, &dispatch,
@@ -147,6 +147,18 @@ protected:
 };
 
 TEST_F(ExecuteIndirectSpec, Dispatch) { ExpectDispatch(1, true); }
+
+TEST_F(ExecuteIndirectSpec, ZeroXDimensionIsNoOp) {
+  ExpectDispatch(1, false, 0, nullptr, false, {0, 1, 1});
+}
+
+TEST_F(ExecuteIndirectSpec, ZeroYDimensionIsNoOp) {
+  ExpectDispatch(1, false, 0, nullptr, false, {1, 0, 1});
+}
+
+TEST_F(ExecuteIndirectSpec, ZeroZDimensionIsNoOp) {
+  ExpectDispatch(1, false, 0, nullptr, false, {1, 1, 0});
+}
 
 TEST_F(ExecuteIndirectSpec, ZeroCount) { ExpectDispatch(0, false); }
 
