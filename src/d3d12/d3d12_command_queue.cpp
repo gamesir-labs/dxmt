@@ -6270,6 +6270,14 @@ private:
     std::vector<uint32_t> resource_root_bases;
   };
 
+  struct CompiledNativeDescriptorAccess {
+    PipelineStage stage = PipelineStage::Vertex;
+    D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    uint16_t slot = 0;
+    uint32_t argument_flags = 0;
+    uint32_t descriptor_index = UINT32_MAX;
+  };
+
   struct DescriptorJournalSnapshotToken {
     DescriptorHeapMirror *mirror = nullptr;
     uint64_t cursor = 0;
@@ -6306,6 +6314,10 @@ private:
     // for every draw while preserving the exact submitted descriptor values.
     const DescriptorTableBindingRecipe *native_descriptor_recipe = nullptr;
     std::vector<uint32_t> native_descriptor_indices;
+    // Native direct packets already walk the stage plan while freezing the
+    // submitted descriptor backend. Keep only the metadata required by hazard
+    // tracking and PS MSAA demotion instead of scanning the generic recipe.
+    std::vector<CompiledNativeDescriptorAccess> native_descriptor_accesses;
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
     uint64_t content_fingerprint = 0;
@@ -6379,7 +6391,8 @@ private:
 
   static size_t SnapshotBindingEntryCount(
       const GraphicsBindingSnapshot &snapshot) {
-    return snapshot.entries.size() + snapshot.native_descriptor_indices.size();
+    return snapshot.entries.size() + snapshot.native_descriptor_indices.size() +
+           snapshot.native_descriptor_accesses.size();
   }
 
   struct CompiledCommandDescriptorSnapshots {
@@ -9265,23 +9278,33 @@ private:
             : &GetDescriptorTableBindingRecipe(pipeline, *root, compute);
     snapshot->entries.reserve(
         6 * (packet.root_constants.size() + packet.root_descriptors.size()));
-    CaptureCompiledDescriptorTableBindings(
-        *snapshot, packet, *binding_recipe,
-        descriptor_heaps_locked, native_span_store);
-    if (snapshot->native && native_span_store &&
-        native_span_store->frozen_native) {
+    const bool frozen_native_direct =
+        snapshot->native && native_span_store &&
+        native_span_store->frozen_native && packet.root_constants.empty() &&
+        packet.root_descriptors.empty();
+    if (!frozen_native_direct) {
+      CaptureCompiledDescriptorTableBindings(
+          *snapshot, packet, *binding_recipe,
+          descriptor_heaps_locked, native_span_store);
+    }
+    if (frozen_native_direct) {
       snapshot->frozen_native = native_span_store->frozen_native;
+      snapshot->native_descriptor_accesses.reserve(
+          binding_recipe->entries.size());
       if (compute) {
         BuildFrozenNativeStageBinding(
             packet, pipeline, *root, PipelineStage::Compute, true,
-            *snapshot->frozen_native, snapshot->frozen_native_compute);
+            *snapshot->frozen_native, snapshot->frozen_native_compute,
+            snapshot.get());
       } else {
         BuildFrozenNativeStageBinding(
             packet, pipeline, *root, PipelineStage::Vertex, false,
-            *snapshot->frozen_native, snapshot->frozen_native_vertex);
+            *snapshot->frozen_native, snapshot->frozen_native_vertex,
+            snapshot.get());
         BuildFrozenNativeStageBinding(
             packet, pipeline, *root, PipelineStage::Pixel, false,
-            *snapshot->frozen_native, snapshot->frozen_native_pixel);
+            *snapshot->frozen_native, snapshot->frozen_native_pixel,
+            snapshot.get());
       }
     }
     // Root CBV/SRV/UAV and 32-bit constants are part of the submitted binding
@@ -9356,9 +9379,19 @@ private:
         HashGraphicsBindingDescriptor(snapshot->resource_access_fingerprint,
                                       SnapshotDescriptor(*snapshot, entry));
     }
+    for (const auto &access : snapshot->native_descriptor_accesses) {
+      HashGraphicsBindingValue(snapshot->resource_access_fingerprint,
+                               access.stage);
+      HashGraphicsBindingValue(snapshot->resource_access_fingerprint,
+                               access.range_type);
+      HashGraphicsBindingDescriptor(
+          snapshot->resource_access_fingerprint,
+          snapshot->descriptor_records->records[access.descriptor_index]);
+    }
     capture_stats.entries = SnapshotBindingEntryCount(*snapshot);
     capture_stats.descriptors = snapshot->entries.size() +
-                                snapshot->native_descriptor_indices.size();
+                                snapshot->native_descriptor_indices.size() +
+                                snapshot->native_descriptor_accesses.size();
     for (const auto descriptor_index : snapshot->native_descriptor_indices)
       capture_stats.missing_descriptors +=
           descriptor_index == UINT32_MAX ? 1 : 0;
@@ -17910,7 +17943,8 @@ private:
       const Packet &packet, PipelineState &pipeline, RootSignature &root,
       PipelineStage stage, bool compute,
       SubmittedFrozenNativeDescriptorStore &store,
-      CompiledNativeStageBinding &out) {
+      CompiledNativeStageBinding &out,
+      GraphicsBindingSnapshot *snapshot = nullptr) {
     out = {};
     const auto plan =
         GetNativeRootBaseStagePlan(pipeline, root, stage, compute);
@@ -17929,6 +17963,12 @@ private:
                : packet.descriptor_heaps.cbv_srv_uav)
               .ptr());
     };
+    const auto *shader = FindShaderForStage(pipeline, stage);
+    const auto *cbuffers = shader ? shader->constantBufferInfo() : nullptr;
+    const auto cbuffer_count =
+        shader ? shader->reflection().NumConstantBuffers : 0;
+    const auto *arguments = shader ? shader->resourceArgumentInfo() : nullptr;
+    const auto argument_count = shader ? shader->reflection().NumArguments : 0;
 
     auto build_words = [&](bool cbuffer, uint32_t word_count) {
       std::vector<uint32_t> words(word_count, 0);
@@ -17951,10 +17991,20 @@ private:
 
         struct CapturedSlot {
           uint32_t destination = 0;
-          std::optional<DescriptorRecord> descriptor;
+          const DescriptorRecord *descriptor = nullptr;
         };
         std::vector<CapturedSlot> captured;
+        size_t captured_capacity = 0;
+        for (const auto *entry : group) {
+          if (entry->descriptor_index < entry->descriptor_count) {
+            captured_capacity += std::min<uint32_t>(
+                entry->range_count,
+                entry->descriptor_count - entry->descriptor_index);
+          }
+        }
+        captured.reserve(captured_capacity);
         std::vector<uint64_t> range_key = {range_length};
+        range_key.reserve(1 + captured_capacity * 6);
         for (const auto *entry : group) {
           auto *heap = get_heap(entry->heap_type);
           const auto base = entry->root_index < tables.size()
@@ -17971,10 +18021,31 @@ private:
                                entry->descriptor_index + local,
                                entry->descriptor_count, entry->heap_type)
                          : nullptr;
-            captured.push_back(
-                {destination,
-                 record ? std::optional<DescriptorRecord>(*record)
-                        : std::nullopt});
+            captured.push_back({destination, record});
+            if (snapshot && record &&
+                entry->range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+              const auto *argument =
+                  entry->cbuffer
+                      ? (cbuffers && entry->argument_index < cbuffer_count
+                             ? &cbuffers[entry->argument_index]
+                             : nullptr)
+                      : (arguments && entry->argument_index < argument_count
+                             ? &arguments[entry->argument_index]
+                             : nullptr);
+              if (argument) {
+                const auto descriptor_record_index =
+                    snapshot->descriptor_records->capture(*record);
+                snapshot->native_descriptor_accesses.push_back(
+                    CompiledNativeDescriptorAccess{
+                        stage,
+                        entry->range_type,
+                        static_cast<uint16_t>(
+                            argument->SM50BindingSlot +
+                            entry->argument_local_start + local),
+                        static_cast<uint32_t>(argument->Flags),
+                        descriptor_record_index});
+              }
+            }
             range_key.push_back(destination);
             range_key.push_back(
                 record ? reinterpret_cast<uintptr_t>(record->mirror) : 0);
@@ -19726,6 +19797,18 @@ private:
     (void)pipeline;
     uint64_t mask_lo = 0;
     uint64_t mask_hi = 0;
+    for (const auto &access : snapshot.native_descriptor_accesses) {
+      if (access.stage != PipelineStage::Pixel ||
+          access.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+          access.slot >= 128 ||
+          !(access.argument_flags &
+            MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED))
+        continue;
+      const auto &descriptor =
+          snapshot.descriptor_records->records[access.descriptor_index];
+      if (!ShaderResourceViewIsMultisampledTexture(descriptor))
+        SetPixelShaderMsaaSrvDemoteBit(mask_lo, mask_hi, access.slot);
+    }
     if (snapshot.native_descriptor_recipe) {
       const auto &recipe_entries = snapshot.native_descriptor_recipe->entries;
       for (size_t i = 0; i < recipe_entries.size(); ++i) {
@@ -23185,6 +23268,12 @@ private:
             SnapshotNativeDescriptor(*snapshot, i),
             DescriptorRangeTypeName(range_type));
       }
+    }
+    for (const auto &access : snapshot->native_descriptor_accesses) {
+      RecordDescriptorResourceAccess(
+          chunk, state, access.stage, access.range_type,
+          snapshot->descriptor_records->records[access.descriptor_index],
+          DescriptorRangeTypeName(access.range_type));
     }
     for (const auto &entry : snapshot->entries) {
       if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
