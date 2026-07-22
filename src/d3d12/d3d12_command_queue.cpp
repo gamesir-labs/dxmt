@@ -8382,7 +8382,8 @@ private:
   template <typename Payload>
   void QueueCompiledGraphicsPassCommand(
       CommandChunk *chunk, ReplayState &state,
-      ReplayRenderPassAttachments attachments, uint64_t argument_buffer_size,
+      const ReplayRenderPassAttachments &attachments,
+      uint64_t argument_buffer_size,
       Payload &&payload, ReplayGraphicsCompiledEncodeFn compiled_encode,
       bool use_geometry, bool use_tessellation,
       ReplayGraphicsCommandKind kind) {
@@ -8399,7 +8400,7 @@ private:
     auto &active_batch = state.graphics_pass_batch;
     if (!active_batch.active) {
       active_batch.active = true;
-      active_batch.attachments = std::move(attachments);
+      active_batch.attachments = attachments;
       active_batch.argument_buffer_size = 0;
     }
 
@@ -10112,7 +10113,8 @@ private:
     auto queue_compiled_graphics_packet =
         [&](const CompiledGraphicsPacket &packet,
             const SubmittedCompiledGraphicsPacket &prepared,
-            std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot)
+            std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot,
+            const ReplayRenderPassAttachments *encoder_attachments)
             -> CompiledCommandFallbackReason {
           if (std::any_of(
                   packet.render_state.render_targets.begin(),
@@ -10287,9 +10289,12 @@ private:
           if (vertex_buffer_reason != CompiledCommandFallbackReason::None)
             return vertex_buffer_reason;
 
-          auto attachments =
-              BuildRenderPassAttachments(packet.render_state,
-                                         pipeline->GetGraphicsState());
+          std::optional<ReplayRenderPassAttachments> packet_attachments;
+          if (!encoder_attachments) {
+            packet_attachments.emplace(BuildRenderPassAttachments(
+                packet.render_state, pipeline->GetGraphicsState()));
+            encoder_attachments = &*packet_attachments;
+          }
           auto viewports = packet.render_state.viewports;
           auto scissors = packet.render_state.scissors;
           if (!ResolveDynamicRasterRects(viewports, scissors,
@@ -10297,7 +10302,7 @@ private:
             return CompiledCommandFallbackReason::UnsupportedRenderTargetState;
           auto dynamic_state_recipe = BuildCompiledDynamicRenderStateRecipe(
               viewports, scissors, packet.render_state.blend_factor,
-              packet.render_state.stencil_ref, attachments);
+              packet.render_state.stencil_ref, *encoder_attachments);
 
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
@@ -10390,7 +10395,7 @@ private:
             replay_packet.common.compiled_binding_state = binding_state;
             replay_packet.common.compiled_direct_access = direct_access;
             QueueCompiledGraphicsPassCommand(
-                chunk, state, std::move(attachments), argument_buffer_size,
+                chunk, state, *encoder_attachments, argument_buffer_size,
                 std::move(replay_packet), EncodeReplayDrawInstancedCompiled,
                 false, false, ReplayGraphicsCommandKind::Draw);
           } else {
@@ -10490,7 +10495,7 @@ private:
                     .push_back(index_allocation);
             }
             QueueCompiledGraphicsPassCommand(
-                chunk, state, std::move(attachments), argument_buffer_size,
+                chunk, state, *encoder_attachments, argument_buffer_size,
                 std::move(replay_packet),
                 EncodeReplayDrawIndexedInstancedCompiled,
                 false, false, ReplayGraphicsCommandKind::DrawIndexed);
@@ -10740,13 +10745,23 @@ private:
           submitted->compute_packets.size() !=
               compiled->compute_packets.size())
         return false;
-      for (const auto &segment : compiled->segments) {
+      for (UINT node_index = 0;
+           node_index < compiled->encoder_graph.nodes.size(); ++node_index) {
+        const auto &node = compiled->encoder_graph.nodes[node_index];
+        const auto &segment = node.work;
+        if (node.predecessor_node !=
+                (node_index ? node_index - 1 : UINT_MAX) ||
+            node.first_source_record_index > compiled->record_count ||
+            node.source_record_count >
+                compiled->record_count - node.first_source_record_index)
+          return false;
         if (segment.first_record_index > compiled->record_count ||
             segment.record_count >
-                compiled->record_count - segment.first_record_index)
-          return false;
-        if (!segment.record_count &&
-            (segment.graphics_packet_count || segment.compute_packet_count))
+                compiled->record_count - segment.first_record_index ||
+            (!segment.record_count &&
+             (segment.graphics_packet_count ||
+              segment.compute_packet_count)) ||
+            segment.kind == CompiledCommandSegmentKind::ElidedState)
           return false;
         if (segment.kind == CompiledCommandSegmentKind::Graphics &&
             segment.first_graphics_packet + segment.graphics_packet_count >
@@ -10964,8 +10979,32 @@ private:
           apply_compiled_root_bindings(packet, true);
         };
 
-    if (compiled_list_is_valid() && !compiled->segments.empty()) {
-      for (const auto &segment : compiled->segments) {
+    if (compiled_list_is_valid()) {
+      if (compiled->encoder_graph.elided_state_record_count)
+        dxmt::perf::recordStateRecordsElided(
+            dxmt::perf::currentFrameStatistics(),
+            compiled->encoder_graph.elided_state_record_count);
+      // Execute the Close-time encoder program. The source segments remain in
+      // the generation only for diagnostics and compatibility accounting;
+      // state-only ranges and compatible adjacent work have already been
+      // folded into encoder nodes.
+      for (const auto &encoder_node : compiled->encoder_graph.nodes) {
+        const auto &segment = encoder_node.work;
+        std::optional<ReplayRenderPassAttachments> encoder_attachments;
+        if (segment.kind == CompiledCommandSegmentKind::Graphics &&
+            segment.graphics_packet_count) {
+          const auto &first_packet = compiled->graphics_packets[
+              segment.first_graphics_packet];
+          // Reserved-resource allocation and present-source tracking are
+          // submission-dynamic, so materialize the immutable Close-time
+          // attachment identity once per active encoder rather than once per
+          // draw packet.
+          encoder_attachments.emplace(BuildRenderPassAttachments(
+              first_packet.render_state, nullptr));
+          if (test_telemetry)
+            test_telemetry->encoder_attachment_materializations.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         record_index = segment.first_record_index;
         if (!segment.record_count && test_telemetry) {
           if (segment.kind == CompiledCommandSegmentKind::Fallback) {
@@ -10992,7 +11031,10 @@ private:
                 replay_perf ? clock::now() : clock::time_point{};
             const auto fallback_reason =
                 queue_compiled_graphics_packet(packet, prepared,
-                                               std::move(submitted_snapshot));
+                                               std::move(submitted_snapshot),
+                                               encoder_attachments
+                                                   ? &*encoder_attachments
+                                                   : nullptr);
             if (test_telemetry) {
               if (fallback_reason == CompiledCommandFallbackReason::None) {
                 test_telemetry->replayed_graphics_packets.fetch_add(
@@ -11297,8 +11339,7 @@ private:
           }
           break;
         case CompiledCommandSegmentKind::ElidedState:
-          dxmt::perf::recordStateRecordsElided(
-              dxmt::perf::currentFrameStatistics(), segment.record_count);
+          // Close-time graph construction never publishes state-only nodes.
           break;
         case CompiledCommandSegmentKind::Typed:
           replay_compatibility_range(segment.first_record_index,

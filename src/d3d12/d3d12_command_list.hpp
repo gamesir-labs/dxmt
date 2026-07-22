@@ -930,6 +930,23 @@ struct CompiledCommandSegment {
       dxmt::CompiledFallbackReason::Unknown;
 };
 
+// Close-time execution graph. Segments preserve the exact source-stream
+// partition for diagnostics and compatibility fallback; encoder nodes are the
+// smaller runtime program consumed by ExecuteCommandLists. State setters that
+// have already been folded into packets never become execution nodes.
+struct CompiledEncoderNode {
+  CompiledCommandSegment work;
+  UINT predecessor_node = UINT_MAX;
+  UINT first_source_record_index = 0;
+  UINT source_record_count = 0;
+  UINT elided_state_record_count = 0;
+};
+
+struct CompiledEncoderGraph {
+  CompiledImmutableVector<CompiledEncoderNode> nodes;
+  UINT elided_state_record_count = 0;
+};
+
 struct CompiledCommandBarrierRange {
   UINT record_index = 0;
   UINT first_barrier = 0;
@@ -975,6 +992,7 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> submitted_descriptor_span_reuses = 0;
   std::atomic<UINT> submitted_generation_shares = 0;
   std::atomic<UINT> submitted_generation_deep_copies = 0;
+  std::atomic<UINT> encoder_attachment_materializations = 0;
 };
 
 struct CompiledCommandList {
@@ -984,6 +1002,7 @@ struct CompiledCommandList {
   // not own or scan the original typed command stream.
   std::shared_ptr<const std::vector<CommandRecord>> fallback_records;
   CompiledImmutableVector<CompiledCommandSegment> segments;
+  CompiledEncoderGraph encoder_graph;
   CompiledImmutableVector<CompiledGraphicsPacket> graphics_packets;
   CompiledImmutableVector<CompiledComputePacket> compute_packets;
   CompiledImmutableVector<CompiledIndirectPacket> indirect_packets;

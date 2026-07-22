@@ -2172,6 +2172,188 @@ static UINT CountCompiledImmutableStateReuses(
   return reuses;
 }
 
+static bool CompiledRenderTargetViewEqual(
+    const D3D12_RENDER_TARGET_VIEW_DESC &lhs,
+    const D3D12_RENDER_TARGET_VIEW_DESC &rhs) {
+  if (lhs.Format != rhs.Format || lhs.ViewDimension != rhs.ViewDimension)
+    return false;
+  switch (lhs.ViewDimension) {
+  case D3D12_RTV_DIMENSION_BUFFER:
+    return lhs.Buffer.FirstElement == rhs.Buffer.FirstElement &&
+           lhs.Buffer.NumElements == rhs.Buffer.NumElements;
+  case D3D12_RTV_DIMENSION_TEXTURE1D:
+    return lhs.Texture1D.MipSlice == rhs.Texture1D.MipSlice;
+  case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+    return lhs.Texture1DArray.MipSlice == rhs.Texture1DArray.MipSlice &&
+           lhs.Texture1DArray.FirstArraySlice ==
+               rhs.Texture1DArray.FirstArraySlice &&
+           lhs.Texture1DArray.ArraySize == rhs.Texture1DArray.ArraySize;
+  case D3D12_RTV_DIMENSION_TEXTURE2D:
+    return lhs.Texture2D.MipSlice == rhs.Texture2D.MipSlice &&
+           lhs.Texture2D.PlaneSlice == rhs.Texture2D.PlaneSlice;
+  case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+    return lhs.Texture2DArray.MipSlice == rhs.Texture2DArray.MipSlice &&
+           lhs.Texture2DArray.FirstArraySlice ==
+               rhs.Texture2DArray.FirstArraySlice &&
+           lhs.Texture2DArray.ArraySize == rhs.Texture2DArray.ArraySize &&
+           lhs.Texture2DArray.PlaneSlice == rhs.Texture2DArray.PlaneSlice;
+  case D3D12_RTV_DIMENSION_TEXTURE2DMS:
+    return true;
+  case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+    return lhs.Texture2DMSArray.FirstArraySlice ==
+               rhs.Texture2DMSArray.FirstArraySlice &&
+           lhs.Texture2DMSArray.ArraySize == rhs.Texture2DMSArray.ArraySize;
+  case D3D12_RTV_DIMENSION_TEXTURE3D:
+    return lhs.Texture3D.MipSlice == rhs.Texture3D.MipSlice &&
+           lhs.Texture3D.FirstWSlice == rhs.Texture3D.FirstWSlice &&
+           lhs.Texture3D.WSize == rhs.Texture3D.WSize;
+  default:
+    return false;
+  }
+}
+
+static bool CompiledDepthStencilViewEqual(
+    const D3D12_DEPTH_STENCIL_VIEW_DESC &lhs,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC &rhs) {
+  if (lhs.Format != rhs.Format || lhs.ViewDimension != rhs.ViewDimension ||
+      lhs.Flags != rhs.Flags)
+    return false;
+  switch (lhs.ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1D:
+    return lhs.Texture1D.MipSlice == rhs.Texture1D.MipSlice;
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+    return lhs.Texture1DArray.MipSlice == rhs.Texture1DArray.MipSlice &&
+           lhs.Texture1DArray.FirstArraySlice ==
+               rhs.Texture1DArray.FirstArraySlice &&
+           lhs.Texture1DArray.ArraySize == rhs.Texture1DArray.ArraySize;
+  case D3D12_DSV_DIMENSION_TEXTURE2D:
+    return lhs.Texture2D.MipSlice == rhs.Texture2D.MipSlice;
+  case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+    return lhs.Texture2DArray.MipSlice == rhs.Texture2DArray.MipSlice &&
+           lhs.Texture2DArray.FirstArraySlice ==
+               rhs.Texture2DArray.FirstArraySlice &&
+           lhs.Texture2DArray.ArraySize == rhs.Texture2DArray.ArraySize;
+  case D3D12_DSV_DIMENSION_TEXTURE2DMS:
+    return true;
+  case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+    return lhs.Texture2DMSArray.FirstArraySlice ==
+               rhs.Texture2DMSArray.FirstArraySlice &&
+           lhs.Texture2DMSArray.ArraySize == rhs.Texture2DMSArray.ArraySize;
+  default:
+    return false;
+  }
+}
+
+static bool CompiledAttachmentIdentityEqual(const DescriptorRecord &lhs,
+                                            const DescriptorRecord &rhs) {
+  if (lhs.type != rhs.type || lhs.resource.ptr() != rhs.resource.ptr() ||
+      lhs.has_desc != rhs.has_desc)
+    return false;
+  // Descriptor handles and slot versions identify the D3D descriptor source,
+  // not the Metal attachment. Like D3DMetal's active render encoder, keep the
+  // encoder open when two immutable descriptor snapshots resolve to the same
+  // resource and exact subresource view.
+  if (!lhs.has_desc)
+    return true;
+  if (lhs.type == DescriptorRecordType::RenderTargetView)
+    return CompiledRenderTargetViewEqual(lhs.desc.rtv, rhs.desc.rtv);
+  if (lhs.type == DescriptorRecordType::DepthStencilView)
+    return CompiledDepthStencilViewEqual(lhs.desc.dsv, rhs.desc.dsv);
+  return false;
+}
+
+static bool CompiledRenderAttachmentsCompatible(
+    const CompiledCommandRenderState &lhs,
+    const CompiledCommandRenderState &rhs) {
+  if (lhs.render_targets.size() != rhs.render_targets.size())
+    return false;
+  for (size_t i = 0; i < lhs.render_targets.size(); ++i) {
+    if (!CompiledAttachmentIdentityEqual(lhs.render_targets[i],
+                                         rhs.render_targets[i]))
+      return false;
+  }
+  if (lhs.depth_stencil.has_value() != rhs.depth_stencil.has_value())
+    return false;
+  return !lhs.depth_stencil ||
+         CompiledAttachmentIdentityEqual(*lhs.depth_stencil,
+                                         *rhs.depth_stencil);
+}
+
+static bool CanMergeCompiledEncoderNodes(
+    const CompiledCommandList &compiled, const CompiledEncoderNode &lhs,
+    const CompiledCommandSegment &rhs) {
+  if (lhs.work.kind != rhs.kind)
+    return false;
+  if (rhs.kind == CompiledCommandSegmentKind::Compute) {
+    return lhs.work.first_compute_packet + lhs.work.compute_packet_count ==
+           rhs.first_compute_packet;
+  }
+  if (rhs.kind != CompiledCommandSegmentKind::Graphics ||
+      lhs.work.first_graphics_packet + lhs.work.graphics_packet_count !=
+          rhs.first_graphics_packet ||
+      !lhs.work.graphics_packet_count || !rhs.graphics_packet_count)
+    return false;
+  const auto &previous = compiled.graphics_packets[
+      lhs.work.first_graphics_packet + lhs.work.graphics_packet_count - 1];
+  const auto &next = compiled.graphics_packets[rhs.first_graphics_packet];
+  return CompiledRenderAttachmentsCompatible(previous.render_state,
+                                             next.render_state);
+}
+
+static void BuildCompiledEncoderGraph(CompiledCommandList &compiled) {
+  compiled.encoder_graph = {};
+  compiled.encoder_graph.nodes.reserve(compiled.segments.size());
+  auto &nodes = compiled.encoder_graph.nodes.mutableView();
+  UINT elided_since_work = 0;
+  UINT first_elided_record = 0;
+
+  for (const auto &segment : compiled.segments) {
+    if (segment.kind == CompiledCommandSegmentKind::ElidedState) {
+      if (!elided_since_work)
+        first_elided_record = segment.first_record_index;
+      elided_since_work += segment.record_count;
+      compiled.encoder_graph.elided_state_record_count +=
+          segment.record_count;
+      continue;
+    }
+
+    if (elided_since_work && !nodes.empty() &&
+        CanMergeCompiledEncoderNodes(compiled, nodes.back(), segment)) {
+      auto &node = nodes.back();
+      node.work.record_count += segment.record_count;
+      node.work.graphics_packet_count += segment.graphics_packet_count;
+      node.work.compute_packet_count += segment.compute_packet_count;
+      node.source_record_count =
+          segment.first_record_index + segment.record_count -
+          node.first_source_record_index;
+      node.elided_state_record_count += elided_since_work;
+      elided_since_work = 0;
+      continue;
+    }
+
+    CompiledEncoderNode node = {};
+    node.work = segment;
+    node.predecessor_node =
+        nodes.empty() ? UINT_MAX : static_cast<UINT>(nodes.size() - 1);
+    node.first_source_record_index =
+        elided_since_work ? first_elided_record : segment.first_record_index;
+    node.source_record_count =
+        segment.first_record_index + segment.record_count -
+        node.first_source_record_index;
+    node.elided_state_record_count = elided_since_work;
+    nodes.push_back(std::move(node));
+    elided_since_work = 0;
+  }
+
+  if (elided_since_work && !nodes.empty()) {
+    auto &node = nodes.back();
+    node.source_record_count =
+        first_elided_record + elided_since_work -
+        node.first_source_record_index;
+    node.elided_state_record_count += elided_since_work;
+  }
+}
+
 struct CompiledStorageAllocationEventSnapshot {
   std::uint64_t nodes = 0;
   std::uint64_t state = 0;
@@ -2185,6 +2367,8 @@ CompiledStorageAllocationEventCount() {
   CompiledStorageAllocationEventSnapshot result;
   result.nodes =
       CompiledImmutableVector<CompiledCommandSegment>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CompiledEncoderNode>::
           ThreadAllocationEventCount() +
       CompiledImmutableVector<CompiledGraphicsPacket>::
           ThreadAllocationEventCount() +
@@ -2427,6 +2611,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                                  record_index);
     }
     compiled->access_summary = access_summary_builder.Finish();
+    BuildCompiledEncoderGraph(*compiled);
     FinalizeCompiledStorageAllocationEvents(*compiled,
                                             allocation_events_before);
     return compiled;
@@ -2645,6 +2830,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   compiled->access_summary = access_summary_builder.Finish();
   compiled->immutable_state_reuses =
       CountCompiledImmutableStateReuses(*compiled);
+  BuildCompiledEncoderGraph(*compiled);
   FinalizeCompiledStorageAllocationEvents(*compiled,
                                           allocation_events_before);
 
@@ -2907,6 +3093,9 @@ ApplyExecutionPathTestConfig(
         segment.fallback_reason);
     compiled.segments.insert(insertion, segment);
   }
+  if (config.flags & (ExecutionPathFlagInjectEmptyNativeSegment |
+                      ExecutionPathFlagInjectEmptyFallbackSegment))
+    BuildCompiledEncoderGraph(compiled);
 }
 
 static dxmt::d3d12::test::ExecutionPathStats
@@ -2955,6 +3144,16 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
       static_cast<UINT>(compiled.access_summary.barriers.size());
   stats.compiled_resource_state_deltas = static_cast<UINT>(
       compiled.access_summary.resource_state_deltas.size());
+  stats.encoder_graph_node_count =
+      static_cast<UINT>(compiled.encoder_graph.nodes.size());
+  stats.encoder_graph_elided_state_records =
+      compiled.encoder_graph.elided_state_record_count;
+  for (const auto &node : compiled.encoder_graph.nodes) {
+    stats.graphics_encoder_node_count +=
+        node.work.kind == CompiledCommandSegmentKind::Graphics;
+    stats.compute_encoder_node_count +=
+        node.work.kind == CompiledCommandSegmentKind::Compute;
+  }
   stats.segment_count = static_cast<UINT>(compiled.segments.size());
   stats.traced_segment_count =
       std::min<UINT>(stats.segment_count, kExecutionPathMaxTracedSegments);
@@ -3063,6 +3262,9 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         telemetry.replayed_graphics_packets.load(std::memory_order_acquire);
     stats.replayed_compute_packets =
         telemetry.replayed_compute_packets.load(std::memory_order_acquire);
+    stats.encoder_attachment_materializations =
+        telemetry.encoder_attachment_materializations.load(
+            std::memory_order_acquire);
     stats.replayed_fallback_ranges =
         telemetry.replayed_fallback_ranges.load(std::memory_order_acquire);
     stats.replayed_fallback_records =
