@@ -182,6 +182,48 @@ TEST_F(CompiledGenerationSpec, MergesComputeNodesAcrossElidedState) {
   EXPECT_EQ(submitted.legacy_replay_records, 0u);
 }
 
+TEST_F(CompiledGenerationSpec, KeepsComputeEncoderAcrossInlineBarriers) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto shader = dxmt::test::CompileShader(
+      "[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(),
+      {shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+  auto buffer = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(buffer);
+
+  EnableStats(context_.list());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->Dispatch(1, 1, 1);
+  D3D12TestContext::Transition(
+      context_.list(), buffer.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(
+      context_.list(), buffer.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  context_.list()->Dispatch(1, 1, 1);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  const auto stats = ReadStats(context_.list());
+  EXPECT_EQ(stats.encoder_graph_node_count, 4u);
+  EXPECT_EQ(stats.encoder_group_count, 1u);
+  EXPECT_EQ(stats.compute_encoder_node_count, 1u);
+  EXPECT_EQ(stats.encoder_inlined_barrier_nodes, 2u);
+
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  EXPECT_EQ(ReadStats(context_.list()).legacy_replay_records, 0u);
+}
+
 TEST_F(CompiledGenerationSpec,
        KeepsGraphicsEncoderOpenAcrossStateAndEquivalentDescriptorChanges) {
   const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
@@ -199,9 +241,14 @@ TEST_F(CompiledGenerationSpec,
       8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
       D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
       D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto unrelated_buffer = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2,
                                             false);
   ASSERT_TRUE(target);
+  ASSERT_TRUE(unrelated_buffer);
   ASSERT_TRUE(heap);
   const auto first_rtv = heap->GetCPUDescriptorHandleForHeapStart();
   auto second_rtv = first_rtv;
@@ -221,6 +268,10 @@ TEST_F(CompiledGenerationSpec,
   context_.list()->RSSetScissorRects(1, &first_scissor);
   context_.list()->OMSetRenderTargets(1, &first_rtv, FALSE, nullptr);
   context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(
+      context_.list(), unrelated_buffer.get(),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
   context_.list()->RSSetScissorRects(1, &second_scissor);
   context_.list()->OMSetRenderTargets(1, &second_rtv, FALSE, nullptr);
   context_.list()->DrawInstanced(3, 1, 0, 0);
@@ -229,8 +280,10 @@ TEST_F(CompiledGenerationSpec,
   const auto stats = ReadStats(context_.list());
   EXPECT_EQ(stats.graphics_segments, 2u);
   EXPECT_EQ(stats.selected_graphics_packets, 2u);
-  EXPECT_EQ(stats.encoder_graph_node_count, 1u);
+  EXPECT_EQ(stats.encoder_graph_node_count, 3u);
+  EXPECT_EQ(stats.encoder_group_count, 1u);
   EXPECT_EQ(stats.graphics_encoder_node_count, 1u);
+  EXPECT_EQ(stats.encoder_inlined_barrier_nodes, 1u);
 
   ID3D12CommandList *lists[] = {context_.list()};
   context_.queue()->ExecuteCommandLists(1, lists);
@@ -292,6 +345,62 @@ TEST_F(CompiledGenerationSpec, SplitsGraphicsEncodersForDifferentAttachments) {
   EXPECT_EQ(stats.selected_graphics_packets, 2u);
   EXPECT_EQ(stats.encoder_graph_node_count, 2u);
   EXPECT_EQ(stats.graphics_encoder_node_count, 2u);
+
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  EXPECT_EQ(ReadStats(context_.list()).encoder_attachment_materializations,
+            2u);
+}
+
+TEST_F(CompiledGenerationSpec,
+       SplitsGraphicsEncoderWhenBarrierTouchesAttachment) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto pixel = dxmt::test::CompileShader(
+      "float4 main() : SV_Target { return float4(1, 1, 1, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  auto pipeline = context_.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+      {pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+  auto target = context_.CreateTexture2D(
+      8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                            false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  EnableStats(context_.list());
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, 8, 8, 0, 1};
+  const D3D12_RECT scissor = {0, 0, 8, 8};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12TestContext::Transition(
+      context_.list(), target.get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12TestContext::Transition(
+      context_.list(), target.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  const auto stats = ReadStats(context_.list());
+  EXPECT_EQ(stats.encoder_graph_node_count, 4u);
+  EXPECT_EQ(stats.encoder_group_count, 2u);
+  EXPECT_EQ(stats.graphics_encoder_node_count, 2u);
+  EXPECT_EQ(stats.encoder_inlined_barrier_nodes, 0u);
 
   ID3D12CommandList *lists[] = {context_.list()};
   context_.queue()->ExecuteCommandLists(1, lists);

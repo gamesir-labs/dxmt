@@ -934,17 +934,29 @@ struct CompiledCommandSegment {
 // partition for diagnostics and compatibility fallback; encoder nodes are the
 // smaller runtime program consumed by ExecuteCommandLists. State setters that
 // have already been folded into packets never become execution nodes.
+enum class CompiledEncoderKind : std::uint8_t {
+  None,
+  Graphics,
+  Compute,
+};
+
 struct CompiledEncoderNode {
   CompiledCommandSegment work;
   UINT predecessor_node = UINT_MAX;
+  UINT encoder_index = UINT_MAX;
   UINT first_source_record_index = 0;
   UINT source_record_count = 0;
   UINT elided_state_record_count = 0;
+  CompiledEncoderKind encoder_kind = CompiledEncoderKind::None;
+  bool begins_encoder = false;
+  bool ends_encoder = false;
 };
 
 struct CompiledEncoderGraph {
   CompiledImmutableVector<CompiledEncoderNode> nodes;
   UINT elided_state_record_count = 0;
+  UINT encoder_count = 0;
+  UINT inlined_barrier_node_count = 0;
 };
 
 struct CompiledCommandBarrierRange {

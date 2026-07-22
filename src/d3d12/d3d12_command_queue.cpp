@@ -10763,6 +10763,12 @@ private:
               segment.compute_packet_count)) ||
             segment.kind == CompiledCommandSegmentKind::ElidedState)
           return false;
+        if ((node.encoder_index == UINT_MAX) !=
+                (node.encoder_kind == CompiledEncoderKind::None) ||
+            (node.encoder_index != UINT_MAX &&
+             node.encoder_index >= compiled->encoder_graph.encoder_count) ||
+            (node.begins_encoder && node.encoder_index == UINT_MAX))
+          return false;
         if (segment.kind == CompiledCommandSegmentKind::Graphics &&
             segment.first_graphics_packet + segment.graphics_packet_count >
                 compiled->graphics_packets.size())
@@ -10988,10 +10994,17 @@ private:
       // the generation only for diagnostics and compatibility accounting;
       // state-only ranges and compatible adjacent work have already been
       // folded into encoder nodes.
+      UINT active_encoder_index = UINT_MAX;
+      std::optional<ReplayRenderPassAttachments>
+          active_encoder_attachments;
       for (const auto &encoder_node : compiled->encoder_graph.nodes) {
         const auto &segment = encoder_node.work;
-        std::optional<ReplayRenderPassAttachments> encoder_attachments;
-        if (segment.kind == CompiledCommandSegmentKind::Graphics &&
+        if (encoder_node.encoder_index != active_encoder_index) {
+          active_encoder_index = encoder_node.encoder_index;
+          active_encoder_attachments.reset();
+        }
+        if (encoder_node.begins_encoder &&
+            encoder_node.encoder_kind == CompiledEncoderKind::Graphics &&
             segment.graphics_packet_count) {
           const auto &first_packet = compiled->graphics_packets[
               segment.first_graphics_packet];
@@ -10999,7 +11012,7 @@ private:
           // submission-dynamic, so materialize the immutable Close-time
           // attachment identity once per active encoder rather than once per
           // draw packet.
-          encoder_attachments.emplace(BuildRenderPassAttachments(
+          active_encoder_attachments.emplace(BuildRenderPassAttachments(
               first_packet.render_state, nullptr));
           if (test_telemetry)
             test_telemetry->encoder_attachment_materializations.fetch_add(
@@ -11032,8 +11045,8 @@ private:
             const auto fallback_reason =
                 queue_compiled_graphics_packet(packet, prepared,
                                                std::move(submitted_snapshot),
-                                               encoder_attachments
-                                                   ? &*encoder_attachments
+                                               active_encoder_attachments
+                                                   ? &*active_encoder_attachments
                                                    : nullptr);
             if (test_telemetry) {
               if (fallback_reason == CompiledCommandFallbackReason::None) {

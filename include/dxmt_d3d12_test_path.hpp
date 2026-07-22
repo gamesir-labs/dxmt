@@ -108,6 +108,8 @@ struct ExecutionPathStats {
   std::uint32_t compute_encoder_node_count = 0;
   std::uint32_t encoder_graph_elided_state_records = 0;
   std::uint32_t encoder_attachment_materializations = 0;
+  std::uint32_t encoder_group_count = 0;
+  std::uint32_t encoder_inlined_barrier_nodes = 0;
   // segment_count always reports the complete count. traced_segment_count is
   // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
   // builder order and make N/F boundary topology directly testable.

@@ -2300,6 +2300,118 @@ static bool CanMergeCompiledEncoderNodes(
                                              next.render_state);
 }
 
+static bool CompiledBarrierResourceMatchesAttachments(
+    ID3D12Resource *resource, const CompiledCommandRenderState &render_state) {
+  if (!resource)
+    return false;
+  for (const auto &target : render_state.render_targets) {
+    if (target.resource.ptr() == resource)
+      return true;
+  }
+  return render_state.depth_stencil &&
+         render_state.depth_stencil->resource.ptr() == resource;
+}
+
+static bool CompiledBarrierCanInlineIntoEncoder(
+    const CompiledCommandList &compiled,
+    const CompiledCommandSegment &barrier_segment,
+    CompiledEncoderKind encoder_kind,
+    const CompiledCommandRenderState *render_state) {
+  if (barrier_segment.kind != CompiledCommandSegmentKind::Barrier ||
+      encoder_kind == CompiledEncoderKind::None)
+    return false;
+  const UINT end = barrier_segment.first_barrier +
+                   barrier_segment.barrier_count;
+  if (end > compiled.access_summary.barriers.size())
+    return false;
+  for (UINT index = barrier_segment.first_barrier; index < end; ++index) {
+    const auto &stored = compiled.access_summary.barriers[index];
+    switch (stored.barrier.Type) {
+    case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+    case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+      if (!stored.resource)
+        return false;
+      if (encoder_kind == CompiledEncoderKind::Graphics && render_state &&
+          CompiledBarrierResourceMatchesAttachments(stored.resource.ptr(),
+                                                   *render_state))
+        return false;
+      break;
+    case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
+static void AnnotateCompiledEncoderLifetimes(CompiledCommandList &compiled) {
+  auto &nodes = compiled.encoder_graph.nodes.mutableView();
+  CompiledEncoderKind active_kind = CompiledEncoderKind::None;
+  UINT active_encoder = UINT_MAX;
+  const CompiledCommandRenderState *active_render_state = nullptr;
+
+  auto begin_encoder = [&](CompiledEncoderNode &node,
+                           CompiledEncoderKind kind) {
+    active_kind = kind;
+    active_encoder = compiled.encoder_graph.encoder_count++;
+    node.encoder_kind = kind;
+    node.encoder_index = active_encoder;
+    node.begins_encoder = true;
+  };
+
+  for (auto &node : nodes) {
+    const auto &segment = node.work;
+    if (segment.kind == CompiledCommandSegmentKind::Graphics &&
+        segment.graphics_packet_count) {
+      const auto &first = compiled.graphics_packets[
+          segment.first_graphics_packet];
+      if (active_kind != CompiledEncoderKind::Graphics ||
+          !active_render_state ||
+          !CompiledRenderAttachmentsCompatible(*active_render_state,
+                                               first.render_state)) {
+        begin_encoder(node, CompiledEncoderKind::Graphics);
+      } else {
+        node.encoder_kind = active_kind;
+        node.encoder_index = active_encoder;
+      }
+      active_render_state = &compiled.graphics_packets[
+          segment.first_graphics_packet + segment.graphics_packet_count - 1]
+                                 .render_state;
+      continue;
+    }
+    if (segment.kind == CompiledCommandSegmentKind::Compute &&
+        segment.compute_packet_count) {
+      if (active_kind != CompiledEncoderKind::Compute)
+        begin_encoder(node, CompiledEncoderKind::Compute);
+      else {
+        node.encoder_kind = active_kind;
+        node.encoder_index = active_encoder;
+      }
+      active_render_state = nullptr;
+      continue;
+    }
+    if (segment.kind == CompiledCommandSegmentKind::Barrier &&
+        CompiledBarrierCanInlineIntoEncoder(compiled, segment, active_kind,
+                                            active_render_state)) {
+      node.encoder_kind = active_kind;
+      node.encoder_index = active_encoder;
+      compiled.encoder_graph.inlined_barrier_node_count++;
+      continue;
+    }
+    active_kind = CompiledEncoderKind::None;
+    active_encoder = UINT_MAX;
+    active_render_state = nullptr;
+  }
+
+  for (UINT index = 0; index < nodes.size(); ++index) {
+    auto &node = nodes[index];
+    if (node.encoder_index == UINT_MAX)
+      continue;
+    node.ends_encoder = index + 1 == nodes.size() ||
+                        nodes[index + 1].encoder_index != node.encoder_index;
+  }
+}
+
 static void BuildCompiledEncoderGraph(CompiledCommandList &compiled) {
   compiled.encoder_graph = {};
   compiled.encoder_graph.nodes.reserve(compiled.segments.size());
@@ -2352,6 +2464,7 @@ static void BuildCompiledEncoderGraph(CompiledCommandList &compiled) {
         node.first_source_record_index;
     node.elided_state_record_count += elided_since_work;
   }
+  AnnotateCompiledEncoderLifetimes(compiled);
 }
 
 struct CompiledStorageAllocationEventSnapshot {
@@ -3148,11 +3261,16 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
       static_cast<UINT>(compiled.encoder_graph.nodes.size());
   stats.encoder_graph_elided_state_records =
       compiled.encoder_graph.elided_state_record_count;
+  stats.encoder_group_count = compiled.encoder_graph.encoder_count;
+  stats.encoder_inlined_barrier_nodes =
+      compiled.encoder_graph.inlined_barrier_node_count;
   for (const auto &node : compiled.encoder_graph.nodes) {
+    if (!node.begins_encoder)
+      continue;
     stats.graphics_encoder_node_count +=
-        node.work.kind == CompiledCommandSegmentKind::Graphics;
+        node.encoder_kind == CompiledEncoderKind::Graphics;
     stats.compute_encoder_node_count +=
-        node.work.kind == CompiledCommandSegmentKind::Compute;
+        node.encoder_kind == CompiledEncoderKind::Compute;
   }
   stats.segment_count = static_cast<UINT>(compiled.segments.size());
   stats.traced_segment_count =
