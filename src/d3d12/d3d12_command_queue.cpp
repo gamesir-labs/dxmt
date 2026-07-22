@@ -6710,6 +6710,8 @@ private:
       int flags = 0;
     };
 
+    CompiledImmutableVector<Rc<BufferAllocation>>
+        static_buffer_allocations;
     std::vector<Rc<BufferAllocation>> buffer_allocations;
     std::vector<EncoderAccess> encoder_accesses;
     // True when descriptor-backed accesses were resolved from the immutable
@@ -10292,9 +10294,8 @@ private:
               dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
               submitted_root_tables);
           CompiledDirectAccessList direct_access = {};
-          AddCompiledRootDescriptorAccesses(direct_access, binding_state);
-          AddCompiledVertexBufferAccesses(
-              direct_access, vertex_binding_recipe.get());
+          direct_access.static_buffer_allocations =
+              packet.direct_buffer_allocations;
           AddCompiledSnapshotEncoderAccesses(direct_access,
                                              submitted_snapshot.get());
           const auto argument_buffer_size =
@@ -10467,6 +10468,14 @@ private:
               bool found_index = false;
               for (const auto &allocation :
                    replay_packet.common.compiled_direct_access
+                       .static_buffer_allocations) {
+                if (allocation.ptr() == index_allocation.ptr()) {
+                  found_index = true;
+                  break;
+                }
+              }
+              for (const auto &allocation :
+                   replay_packet.common.compiled_direct_access
                        .buffer_allocations) {
                 if (allocation.ptr() == index_allocation.ptr()) {
                   found_index = true;
@@ -10603,7 +10612,8 @@ private:
               dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
               submitted_root_tables);
           CompiledDirectAccessList direct_access = {};
-          AddCompiledRootDescriptorAccesses(direct_access, binding_state);
+          direct_access.static_buffer_allocations =
+              packet.direct_buffer_allocations;
           AddCompiledSnapshotEncoderAccesses(direct_access,
                                              submitted_snapshot.get());
           RecordComputePipelineResourceAccess(
@@ -22087,52 +22097,6 @@ private:
     }
   }
 
-  void AddCompiledDirectBufferAccess(CompiledDirectAccessList &list,
-                                     D3D12_GPU_VIRTUAL_ADDRESS address) {
-    if (!address)
-      return;
-    Resource *resource = nullptr;
-    ResolveBufferGpuAddress(address, resource);
-    if (!resource || !resource->GetBufferAllocation())
-      return;
-    auto *allocation = resource->GetBufferAllocation();
-    for (const auto &existing : list.buffer_allocations) {
-      if (existing.ptr() == allocation)
-        return;
-    }
-    list.buffer_allocations.push_back(Rc<BufferAllocation>(allocation));
-  }
-
-  void AddCompiledVertexBufferAccesses(CompiledDirectAccessList &list,
-                                       const CompiledVertexBindingRecipe *recipe) {
-    if (!recipe)
-      return;
-    for (const auto &binding : recipe->bindings) {
-      if (!binding.allocation)
-        continue;
-      const bool exists = std::any_of(
-          list.buffer_allocations.begin(), list.buffer_allocations.end(),
-          [&](const Rc<BufferAllocation> &allocation) {
-            return allocation.ptr() == binding.allocation.ptr();
-          });
-      if (!exists)
-        list.buffer_allocations.push_back(binding.allocation);
-    }
-  }
-
-  void AddCompiledRootDescriptorAccesses(CompiledDirectAccessList &list,
-                                         const CompiledPacketBindingState &state) {
-    auto add_roots = [&](const auto &roots) {
-      for (const auto &slot : roots) {
-        if (slot.valid)
-          AddCompiledDirectBufferAccess(list, slot.address);
-      }
-    };
-    add_roots(state.cbv_roots);
-    add_roots(state.srv_roots);
-    add_roots(state.uav_roots);
-  }
-
   static void AddCompiledDirectEncoderAccess(
       CompiledDirectAccessList &list,
       CompiledDirectAccessList::EncoderAccess access) {
@@ -22265,20 +22229,24 @@ private:
       ArgumentEncodingContext &enc, const CompiledDirectAccessList &list) {
     auto &queue = enc.queue();
     const auto sequence = enc.currentSeqId();
-    for (const auto &allocation : list.buffer_allocations) {
+    auto publish_allocation = [&](const Rc<BufferAllocation> &allocation) {
       if (!allocation)
-        continue;
+        return;
       // Allocation lifetime and Metal residency have the same command-chunk
       // scope here. Retain already deduplicates by sequence, so only the first
       // reference in a chunk needs the matching residency add/remove pair.
       // Repeating it for every draw turns a few hundred packets into thousands
       // of redundant mutex-protected residency hash operations.
       if (!enc.retainAllocation(allocation.ptr()))
-        continue;
+        return;
       queue.AddPersistentResidency(allocation->buffer());
       queue.RemovePersistentResidencyAfterCompletion(allocation->buffer(),
                                                       sequence);
-    }
+    };
+    for (const auto &allocation : list.static_buffer_allocations)
+      publish_allocation(allocation);
+    for (const auto &allocation : list.buffer_allocations)
+      publish_allocation(allocation);
     auto publish = [&]<PipelineStage Stage>(
                        const CompiledDirectAccessList::EncoderAccess &access) {
       switch (access.kind) {

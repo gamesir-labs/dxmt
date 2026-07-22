@@ -2498,6 +2498,82 @@ static void BuildCompiledVertexBindingRecipes(CompiledCommandList &compiled) {
   }
 }
 
+static void AddCompiledDirectBufferAllocation(
+    std::vector<Rc<BufferAllocation>> &allocations,
+    D3D12_GPU_VIRTUAL_ADDRESS address) {
+  if (!address)
+    return;
+  UINT64 offset = 0;
+  auto *resource =
+      LookupBufferResourceByGpuVirtualAddress(address, &offset);
+  (void)offset;
+  auto *allocation = resource ? resource->GetBufferAllocation() : nullptr;
+  if (!allocation)
+    return;
+  const bool exists = std::any_of(
+      allocations.begin(), allocations.end(),
+      [&](const Rc<BufferAllocation> &existing) {
+        return existing.ptr() == allocation;
+      });
+  if (!exists)
+    allocations.push_back(Rc<BufferAllocation>(allocation));
+}
+
+static void BuildCompiledDirectAccessPlans(CompiledCommandList &compiled) {
+  const void *previous_graphics_roots = nullptr;
+  const CompiledVertexBindingRecipe *previous_vertex_recipe = nullptr;
+  CompiledImmutableVector<Rc<BufferAllocation>> previous_graphics_plan;
+  for (auto &packet : compiled.graphics_packets.mutableView()) {
+    if (previous_graphics_roots == packet.root_descriptors.identity() &&
+        previous_vertex_recipe == packet.vertex_binding_recipe.get()) {
+      packet.direct_buffer_allocations = previous_graphics_plan;
+      continue;
+    }
+    std::vector<Rc<BufferAllocation>> allocations;
+    allocations.reserve(packet.root_descriptors.size() +
+                        (packet.vertex_binding_recipe
+                             ? packet.vertex_binding_recipe->bindings.size()
+                             : 0));
+    for (const auto &root : packet.root_descriptors)
+      AddCompiledDirectBufferAllocation(allocations, root.address);
+    if (packet.vertex_binding_recipe) {
+      for (const auto &binding : packet.vertex_binding_recipe->bindings) {
+        if (!binding.allocation)
+          continue;
+        const bool exists = std::any_of(
+            allocations.begin(), allocations.end(),
+            [&](const Rc<BufferAllocation> &allocation) {
+              return allocation.ptr() == binding.allocation.ptr();
+            });
+        if (!exists)
+          allocations.push_back(binding.allocation);
+      }
+    }
+    packet.direct_buffer_allocations = std::move(allocations);
+    previous_graphics_roots = packet.root_descriptors.identity();
+    previous_vertex_recipe = packet.vertex_binding_recipe.get();
+    previous_graphics_plan = packet.direct_buffer_allocations;
+    compiled.close_direct_access_plans++;
+  }
+
+  const void *previous_compute_roots = nullptr;
+  CompiledImmutableVector<Rc<BufferAllocation>> previous_compute_plan;
+  for (auto &packet : compiled.compute_packets.mutableView()) {
+    if (previous_compute_roots == packet.root_descriptors.identity()) {
+      packet.direct_buffer_allocations = previous_compute_plan;
+      continue;
+    }
+    std::vector<Rc<BufferAllocation>> allocations;
+    allocations.reserve(packet.root_descriptors.size());
+    for (const auto &root : packet.root_descriptors)
+      AddCompiledDirectBufferAllocation(allocations, root.address);
+    packet.direct_buffer_allocations = std::move(allocations);
+    previous_compute_roots = packet.root_descriptors.identity();
+    previous_compute_plan = packet.direct_buffer_allocations;
+    compiled.close_direct_access_plans++;
+  }
+}
+
 static bool CanMergeCompiledEncoderNodes(
     const CompiledCommandList &compiled, const CompiledEncoderNode &lhs,
     const CompiledCommandSegment &rhs) {
@@ -2755,6 +2831,8 @@ CompiledStorageAllocationEventCount() {
          CompiledImmutableVector<WMTScissorRect>::ThreadAllocationEventCount() +
          CompiledImmutableVector<CompiledVertexBindingRecipe::Binding>::
              ThreadAllocationEventCount() +
+         CompiledImmutableVector<Rc<BufferAllocation>>::
+             ThreadAllocationEventCount() +
          CompiledImmutableVector<Com<ID3D12DescriptorHeap>>::
              ThreadAllocationEventCount() +
          CompiledImmutableVector<UINT>::ThreadAllocationEventCount();
@@ -2952,6 +3030,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     PreMaterializeCompiledRootTables(*compiled);
     BuildCompiledDynamicRenderStateRecipes(*compiled);
     BuildCompiledVertexBindingRecipes(*compiled);
+    BuildCompiledDirectAccessPlans(*compiled);
     BuildCompiledEncoderGraph(*compiled);
     FinalizeCompiledStorageAllocationEvents(*compiled,
                                             allocation_events_before);
@@ -3174,6 +3253,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   PreMaterializeCompiledRootTables(*compiled);
   BuildCompiledDynamicRenderStateRecipes(*compiled);
   BuildCompiledVertexBindingRecipes(*compiled);
+  BuildCompiledDirectAccessPlans(*compiled);
   BuildCompiledEncoderGraph(*compiled);
   FinalizeCompiledStorageAllocationEvents(*compiled,
                                           allocation_events_before);
@@ -3583,6 +3663,7 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
       compiled.close_dynamic_render_state_recipes;
   stats.close_vertex_binding_recipes =
       compiled.close_vertex_binding_recipes;
+  stats.close_direct_access_plans = compiled.close_direct_access_plans;
   auto count_state_delta = [&](const CompiledCommandStateDelta &delta) {
     stats.state_delta_packets++;
     if (!delta.dirty_domains && !delta.root_table_dirty_mask &&

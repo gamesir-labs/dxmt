@@ -840,6 +840,7 @@ struct CompiledGraphicsPacket {
   std::shared_ptr<const CompiledDynamicRenderStateRecipe>
       dynamic_render_state_recipe;
   std::shared_ptr<const CompiledVertexBindingRecipe> vertex_binding_recipe;
+  CompiledImmutableVector<Rc<BufferAllocation>> direct_buffer_allocations;
   CompiledCommandStateDelta state_delta;
   CompiledCommandFallbackReason vertex_binding_recipe_reason =
       CompiledCommandFallbackReason::None;
@@ -858,6 +859,7 @@ struct CompiledComputePacket {
   CompiledImmutableVector<CompiledCommandRootDescriptorTable> root_tables;
   CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
   CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
+  CompiledImmutableVector<Rc<BufferAllocation>> direct_buffer_allocations;
   CompiledCommandStateDelta state_delta;
   bool root_tables_close_materialized = false;
   CompiledCommandFallbackReason compatibility_reason =
@@ -1066,6 +1068,7 @@ struct CompiledCommandList {
   UINT close_materialized_root_table_sets = 0;
   UINT close_dynamic_render_state_recipes = 0;
   UINT close_vertex_binding_recipes = 0;
+  UINT close_direct_access_plans = 0;
   dxmt::d3d12::test::ExecutionPathMode test_path_mode =
       dxmt::d3d12::test::ExecutionPathMode::Auto;
   UINT test_work_record_count = 0;
