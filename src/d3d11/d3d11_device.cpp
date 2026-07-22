@@ -1010,9 +1010,6 @@ public:
     if (!pResource)
       return E_INVALIDARG;
 
-    if (!ppSRView)
-      return S_FALSE;
-
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateShaderResourceView(pDesc, ppSRView);
   }
 
