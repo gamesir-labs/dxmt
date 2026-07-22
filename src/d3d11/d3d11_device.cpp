@@ -178,7 +178,11 @@ public:
   CreateTexture3D(const D3D11_TEXTURE3D_DESC *pDesc,
                   const D3D11_SUBRESOURCE_DATA *pInitialData,
                   ID3D11Texture3D **ppTexture3D) override {
-    D3D11_TEXTURE3D_DESC1 desc1;
+    InitReturnPtr(ppTexture3D);
+    if (!pDesc)
+      return E_INVALIDARG;
+
+    D3D11_TEXTURE3D_DESC1 desc1 = {};
     UpgradeResourceDescription(pDesc, desc1);
     return CreateTexture3D1(&desc1, pInitialData,
                             (ID3D11Texture3D1 **)ppTexture3D);
@@ -967,6 +971,9 @@ public:
 
     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
       return E_INVALIDARG; // not supported yet
+
+    if (pDesc->Usage == D3D11_USAGE_IMMUTABLE && !pInitialData)
+      return E_INVALIDARG;
 
     try {
       switch (pDesc->Usage) {
