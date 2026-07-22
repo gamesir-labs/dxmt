@@ -19,6 +19,7 @@ d3d11_unit_sources = files(
   'depth_stencil_matrix_spec.cpp',
   'view_matrix_spec.cpp',
   'object_com_matrix_spec.cpp',
+  'output_merger_binding_matrix_spec.cpp',
   'clear_blend_matrix_spec.cpp',
   'clear_view_rect_matrix_spec.cpp',
   'clear_uav_float_matrix_spec.cpp',
