@@ -44,6 +44,8 @@ const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind) {
     return "graphics";
   case CompiledCommandSegmentKind::Compute:
     return "compute";
+  case CompiledCommandSegmentKind::Indirect:
+    return "indirect";
   case CompiledCommandSegmentKind::Fallback:
     return "fallback";
   }
@@ -1631,6 +1633,37 @@ BuildCompiledComputePacket(const CommandRecord &record, UINT record_index,
   return packet;
 }
 
+static bool IsCompiledIndirectCompute(const ExecuteIndirectRecord &record) {
+  auto *signature = dynamic_cast<CommandSignature *>(
+      record.command_signature.ptr());
+  if (!signature)
+    return false;
+  return std::any_of(
+      signature->GetArguments().begin(), signature->GetArguments().end(),
+      [](const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
+        return argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+      });
+}
+
+static CompiledIndirectPacket
+BuildCompiledIndirectPacket(const CommandRecord &record, UINT record_index,
+                            CompiledCommandBuildState &state) {
+  CompiledIndirectPacket packet = {};
+  packet.record_index = record_index;
+  packet.d3d_sequence = record.d3d_sequence;
+  packet.execute = std::get<ExecuteIndirectRecord>(record.payload);
+  packet.compute = IsCompiledIndirectCompute(packet.execute);
+  const auto &metadata = GetCompiledPipelineMetadata(state, packet.compute);
+  if (packet.compute) {
+    packet.compute_state = BuildCompiledComputePacket(
+        record, record_index, state, metadata);
+  } else {
+    packet.graphics_state = BuildCompiledGraphicsPacket(
+        record, record_index, state, metadata);
+  }
+  return packet;
+}
+
 static CompiledCommandFallbackReason
 FallbackReasonForCommandRecord(const CommandRecordPayload &payload) {
   if (std::holds_alternative<CopyBufferRegionRecord>(payload) ||
@@ -1752,6 +1785,41 @@ AppendCompiledComputeSegment(
   segment.record_count = 1;
   segment.first_compute_packet = packet_index;
   segment.compute_packet_count = 1;
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+static void
+AppendCompiledIndirectSegment(
+    std::vector<CompiledCommandSegment> &segments,
+    std::vector<CompiledIndirectPacket> &indirect_packets,
+    UINT &unexpected_container_growths, UINT record_index,
+    CompiledIndirectPacket &&packet) {
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+  const auto packet_index = static_cast<UINT>(indirect_packets.size());
+  if (indirect_packets.size() == indirect_packets.capacity())
+    unexpected_container_growths++;
+  indirect_packets.push_back(std::move(packet));
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Indirect &&
+        last.first_record_index + last.record_count == record_index &&
+        last.first_indirect_packet + last.indirect_packet_count ==
+            packet_index) {
+      last.record_count++;
+      last.indirect_packet_count++;
+      return;
+    }
+  }
+
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Indirect;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.first_indirect_packet = packet_index;
+  segment.indirect_packet_count = 1;
   if (segments.size() == segments.capacity())
     unexpected_container_growths++;
   segments.push_back(segment);
@@ -1892,6 +1960,8 @@ CompiledStorageAllocationEventCount() {
       CompiledImmutableVector<CompiledGraphicsPacket>::
           ThreadAllocationEventCount() +
       CompiledImmutableVector<CompiledComputePacket>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CompiledIndirectPacket>::
           ThreadAllocationEventCount();
   result.state =
       CompiledImmutableVector<CompiledCommandRootDescriptorTable>::
@@ -1956,6 +2026,10 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   compiled->segments.reserve(records.size());
   compiled->graphics_packets.reserve(graphics_packet_count);
   compiled->compute_packets.reserve(compute_packet_count);
+  compiled->indirect_packets.reserve(std::count_if(
+      records.begin(), records.end(), [](const CommandRecord &record) {
+        return std::holds_alternative<ExecuteIndirectRecord>(record.payload);
+      }));
   // Compilation owns these stores exclusively. Hold their mutable views once
   // so per-record appends do not repeatedly execute the immutable wrapper's
   // cross-thread uniqueness check; the stores become immutable when this
@@ -1963,6 +2037,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   auto &segments = compiled->segments.mutableView();
   auto &graphics_packets = compiled->graphics_packets.mutableView();
   auto &compute_packets = compiled->compute_packets.mutableView();
+  auto &indirect_packets = compiled->indirect_packets.mutableView();
   CompiledAccessSummaryBuilder access_summary_builder(barrier_record_count,
                                                       barrier_count);
   if (force_fallback) {
@@ -2113,6 +2188,24 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
             std::move(packet));
         ClearCompiledStateDelta(state, true);
       }
+    } else if (std::holds_alternative<ExecuteIndirectRecord>(
+                   record.payload)) {
+      CompiledIndirectPacket packet;
+      {
+        dxmt::perf::ScopedCodeTimer packet_timer(
+            dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
+        packet = BuildCompiledIndirectPacket(record, record_index, state);
+      }
+      AppendCompiledIndirectSegment(
+          segments, indirect_packets,
+          compiled->unexpected_container_growths, record_index,
+          std::move(packet));
+      if (indirect_packets.back().compute) {
+        ClearCompiledStateDelta(state, true);
+      } else {
+        ClearCompiledInputAssemblerDirtyState(state);
+        ClearCompiledStateDelta(state, false);
+      }
     } else {
       AppendCompiledFallbackSegment(
           segments, compiled->unexpected_container_growths, record_index,
@@ -2149,6 +2242,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
       segment.kind = CompiledCommandSegmentKind::Fallback;
       segment.graphics_packet_count = 0;
       segment.compute_packet_count = 0;
+      segment.indirect_packet_count = 0;
       segment.fallback_reason = CompiledCommandFallbackReason::
           InjectedNativeSegmentFinalizationFailure;
       segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(
@@ -2160,6 +2254,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     // avoid.
     compiled->graphics_packets.clear();
     compiled->compute_packets.clear();
+    compiled->indirect_packets.clear();
   }
 
   compiled->access_summary = access_summary_builder.Finish();
@@ -2490,6 +2585,13 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
       case CompiledCommandSegmentKind::Compute:
         kind = ExecutionPathSegmentKind::Compute;
         break;
+      case CompiledCommandSegmentKind::Indirect:
+        // The public test ABI predates dedicated dynamic nodes. They are
+        // compiled submission work, so expose them as native rather than as
+        // legacy fallback. The aggregate packet counters below still retain
+        // the graphics/compute distinction for mixed indirect segments.
+        kind = ExecutionPathSegmentKind::Graphics;
+        break;
       case CompiledCommandSegmentKind::Fallback:
       default:
         kind = ExecutionPathSegmentKind::Fallback;
@@ -2514,6 +2616,26 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
     case CompiledCommandSegmentKind::Compute:
       stats.compute_segments++;
       stats.selected_compute_packets += segment.compute_packet_count;
+      break;
+    case CompiledCommandSegmentKind::Indirect:
+      {
+        UINT graphics_packets = 0;
+        UINT compute_packets = 0;
+        for (UINT i = 0; i < segment.indirect_packet_count; i++) {
+          const auto &packet = compiled.indirect_packets[
+              segment.first_indirect_packet + i];
+          if (packet.compute)
+            compute_packets++;
+          else
+            graphics_packets++;
+        }
+        if (graphics_packets)
+          stats.graphics_segments++;
+        if (compute_packets)
+          stats.compute_segments++;
+        stats.selected_graphics_packets += graphics_packets;
+        stats.selected_compute_packets += compute_packets;
+      }
       break;
     case CompiledCommandSegmentKind::Fallback:
     default:

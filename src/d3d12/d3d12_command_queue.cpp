@@ -10575,6 +10575,10 @@ private:
             segment.first_compute_packet + segment.compute_packet_count >
                 compiled->compute_packets.size())
           return false;
+        if (segment.kind == CompiledCommandSegmentKind::Indirect &&
+            segment.first_indirect_packet + segment.indirect_packet_count >
+                compiled->indirect_packets.size())
+          return false;
       }
       return true;
     };
@@ -10765,7 +10769,17 @@ private:
               const auto previous_reason = state.compiled_fallback_reason;
               state.compiled_fallback_reason = perf_reason;
               record_index = packet.record_index;
-              replay_one(records[packet.record_index]);
+              if (packet.draw) {
+                const CommandRecord compatibility_record = {
+                    packet.d3d_sequence, CommandRecordCompileKind::Graphics,
+                    *packet.draw};
+                replay_one(compatibility_record);
+              } else if (packet.draw_indexed) {
+                const CommandRecord compatibility_record = {
+                    packet.d3d_sequence, CommandRecordCompileKind::Graphics,
+                    *packet.draw_indexed};
+                replay_one(compatibility_record);
+              }
               state.compiled_fallback_reason = previous_reason;
             }
           }
@@ -10807,9 +10821,52 @@ private:
               const auto previous_reason = state.compiled_fallback_reason;
               state.compiled_fallback_reason = perf_reason;
               record_index = packet.record_index;
-              replay_one(records[packet.record_index]);
+              const CommandRecord compatibility_record = {
+                  packet.d3d_sequence, CommandRecordCompileKind::Compute,
+                  packet.dispatch};
+              replay_one(compatibility_record);
               state.compiled_fallback_reason = previous_reason;
             }
+          }
+          break;
+        case CompiledCommandSegmentKind::Indirect:
+          for (UINT i = 0; i < segment.indirect_packet_count; i++) {
+            const auto packet_index = segment.first_indirect_packet + i;
+            const auto &packet = compiled->indirect_packets[packet_index];
+            // Predication is deliberately not folded into a shader packet;
+            // replay the last predication setter before applying the complete
+            // compiled graphics/compute state for this dynamic node.
+            flush_deferred_state(
+                dxmt::CompiledFallbackReason::NativeUnsupportedExecuteIndirect);
+            if (packet.compute_state) {
+              apply_compiled_compute_compatibility_state(
+                  *packet.compute_state);
+              dxmt::perf::recordCompiledComputePackets(
+                  &queue.CurrentFrameStatistics(), 1);
+              if (test_telemetry)
+                test_telemetry->replayed_compute_packets.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else if (packet.graphics_state) {
+              apply_compiled_graphics_compatibility_state(
+                  *packet.graphics_state);
+              dxmt::perf::recordCompiledGraphicsPackets(
+                  &queue.CurrentFrameStatistics(), 1);
+              if (test_telemetry)
+                test_telemetry->replayed_graphics_packets.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            record_index = packet.record_index;
+            const CommandRecord dynamic_record = {
+                packet.d3d_sequence, CommandRecordCompileKind::Other,
+                packet.execute};
+            const auto previous_reason = state.compiled_fallback_reason;
+            // Suppress the legacy indirect classifier: this command is a
+            // dedicated compiled dynamic node even though it deliberately
+            // reuses the established GPU argument decoder.
+            state.compiled_fallback_reason =
+                dxmt::CompiledFallbackReason::NativeUnsupportedExecuteIndirect;
+            replay_one(dynamic_record);
+            state.compiled_fallback_reason = previous_reason;
           }
           break;
         case CompiledCommandSegmentKind::Fallback:

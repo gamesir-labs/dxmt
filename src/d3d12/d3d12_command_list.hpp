@@ -319,6 +319,7 @@ struct CommandRecord {
 enum class CompiledCommandSegmentKind {
   Graphics,
   Compute,
+  Indirect,
   Fallback,
 };
 
@@ -831,6 +832,19 @@ struct CompiledComputePacket {
   DispatchRecord dispatch;
 };
 
+// ExecuteIndirect remains dynamically decoded by the GPU/argument-buffer
+// path, but its command-list state is compiled at Close just like an ordinary
+// draw or dispatch. This keeps the dynamic D3D12 semantics without retaining
+// or scanning the original command record at submission.
+struct CompiledIndirectPacket {
+  UINT record_index = 0;
+  std::uint64_t d3d_sequence = 0;
+  ExecuteIndirectRecord execute;
+  bool compute = false;
+  std::optional<CompiledGraphicsPacket> graphics_state;
+  std::optional<CompiledComputePacket> compute_state;
+};
+
 struct CompiledCommandSegment {
   CompiledCommandSegmentKind kind = CompiledCommandSegmentKind::Fallback;
   UINT first_record_index = 0;
@@ -839,6 +853,8 @@ struct CompiledCommandSegment {
   UINT graphics_packet_count = 0;
   UINT first_compute_packet = 0;
   UINT compute_packet_count = 0;
+  UINT first_indirect_packet = 0;
+  UINT indirect_packet_count = 0;
   CompiledCommandFallbackReason fallback_reason =
       CompiledCommandFallbackReason::None;
   dxmt::CompiledFallbackReason perf_fallback_reason =
@@ -895,6 +911,7 @@ struct CompiledCommandList {
   CompiledImmutableVector<CompiledCommandSegment> segments;
   CompiledImmutableVector<CompiledGraphicsPacket> graphics_packets;
   CompiledImmutableVector<CompiledComputePacket> compute_packets;
+  CompiledImmutableVector<CompiledIndirectPacket> indirect_packets;
   CompiledCommandAccessSummary access_summary;
   UINT unexpected_container_growths = 0;
   UINT storage_allocation_events = 0;
