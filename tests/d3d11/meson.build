@@ -29,6 +29,7 @@ d3d11_unit_sources = files(
   'rasterization_ops_spec.cpp',
   'interpolation_ops_spec.cpp',
   'mrt_ops_spec.cpp',
+  'compute_uav_binding_matrix_spec.cpp',
   'dispatch_matrix_spec.cpp',
   'indirect_dispatch_matrix_spec.cpp',
   'msaa_execution_ops_spec.cpp',
