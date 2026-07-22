@@ -16,6 +16,7 @@ d3d11_unit_sources = files(
   'view_matrix_spec.cpp',
   'object_com_matrix_spec.cpp',
   'clear_blend_matrix_spec.cpp',
+  'clear_uav_float_matrix_spec.cpp',
   'viewport_sampler_matrix_spec.cpp',
   'viewport_scissor_ops_spec.cpp',
   'rasterization_ops_spec.cpp',
