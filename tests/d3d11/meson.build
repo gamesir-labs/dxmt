@@ -17,6 +17,7 @@ d3d11_unit_sources = files(
   'copy_subresource_region1_matrix_spec.cpp',
   'batched_buffer_copy_spec.cpp',
   'query_matrix_spec.cpp',
+  'predication_binding_matrix_spec.cpp',
   'query_contract_spec.cpp',
   'depth_stencil_matrix_spec.cpp',
   'depth_stencil_state_binding_matrix_spec.cpp',
