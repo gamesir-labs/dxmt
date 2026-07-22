@@ -700,6 +700,12 @@ DescriptorHeapMirror::ReplaceResidencyTarget(
     return {};
   DescriptorResidencyTransition transition = {};
   auto &current = residency_targets_[index];
+  if (current.allocation.handle == target.allocation.handle &&
+      current.secondary_allocation.handle ==
+          target.secondary_allocation.handle &&
+      current.mirror_allocation.handle == target.mirror_allocation.handle &&
+      current.sampler.ptr() == target.sampler.ptr())
+    return transition;
   UpdateResidencyRefCountsUnlocked(current, target, transition);
   transition.previous = std::move(current);
   residency_targets_[index] = std::move(target);

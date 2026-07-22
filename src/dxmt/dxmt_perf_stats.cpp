@@ -908,6 +908,13 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
   const auto execute_command_lists_us =
       durationUs(frame_stats.frame_execute_command_lists_interval);
   const auto present_us = durationUs(frame_stats.frame_present_interval);
+  const auto present_queue_wait_us =
+      durationUs(frame_stats.frame_present_queue_wait_interval);
+  const auto present_work_us =
+      present_us > present_queue_wait_us ? present_us - present_queue_wait_us
+                                         : 0;
+  const auto pre_present_wall_us =
+      frame_wall_us > present_us ? frame_wall_us - present_us : 0;
   const auto queue_signal_us =
       durationUs(frame_stats.frame_queue_signal_interval);
   const auto queue_wait_us = durationUs(frame_stats.frame_queue_wait_interval);
@@ -1312,6 +1319,8 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   frame_stats.frame_replay_fallback_classification_count,
                   " replayFallbackRecordUs=",
                   replay_worker_summary.typed_record_us,
+                  " nativeCommandBodyUs=",
+                  replay_worker_summary.native_command_body_us,
                   " replayRecordControlUs=",
                   replay_worker_summary.record_control_us,
                   " replayClassifiedRecordUs=",
@@ -1754,6 +1763,9 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   frame_stats_with_external
                       .frame_descriptor_content_write_feedback_uav,
                   " presentUs=", present_us,
+                  " presentQueueWaitUs=", present_queue_wait_us,
+                  " presentWorkUs=", present_work_us,
+                  " prePresentWallUs=", pre_present_wall_us,
                   " queueSignalUs=", queue_signal_us,
                   " queueWaitUs=", queue_wait_us,
                   " createResourceUs=", create_resource_us,
@@ -1903,7 +1915,7 @@ summarizeReplayWorkerFrame(const FrameStatistics &stats) {
       durationUs(stats.frame_replay_flush_pass_interval) +
       durationUs(stats.frame_replay_timestamp_resolve_interval) +
       durationUs(stats.frame_replay_cpu_query_resolve_interval);
-  summary.typed_record_us =
+  const uint64_t command_body_us =
       durationUs(stats.frame_replay_record_draw_interval) +
       durationUs(stats.frame_replay_record_draw_indexed_interval) +
       durationUs(stats.frame_replay_record_dispatch_interval) +
@@ -1920,10 +1932,16 @@ summarizeReplayWorkerFrame(const FrameStatistics &stats) {
       durationUs(stats.frame_replay_record_query_interval) +
       durationUs(stats.frame_replay_record_execute_indirect_interval) +
       durationUs(stats.frame_replay_record_temporal_upscale_interval);
+  summary.typed_record_us =
+      durationUs(stats.frame_replay_typed_record_interval);
+  summary.native_command_body_us =
+      command_body_us > summary.typed_record_us
+          ? command_body_us - summary.typed_record_us
+          : 0;
   const uint64_t named_record_us =
       summary.superseded_mask_us + summary.compiled_graphics_us +
       summary.compiled_compute_us + summary.fallback_classification_us +
-      summary.typed_record_us;
+      command_body_us;
   // This is the exclusive cost of ReplayCommandRecords control flow: segment
   // validation/dispatch, record visitation, counters and timer bookkeeping.
   // It is intentionally named as executable logic rather than an API gap.
@@ -1986,6 +2004,7 @@ void recordReplayWorkerFrame(uint64_t frame, uintptr_t queue,
       " replayFallbackClassificationRanges=",
       stats.frame_replay_fallback_classification_count,
       " typedRecordUs=", summary.typed_record_us,
+      " nativeCommandBodyUs=", summary.native_command_body_us,
       " replayRecordControlUs=", summary.record_control_us,
       " replayClassifiedRecordUs=", summary.classified_record_us,
       " replayRecordCoveragePermille=", summary.record_coverage_permille);
@@ -2325,6 +2344,133 @@ void recordMetalCommandBufferCommit(uint64_t duration_us) {
   g_counters.metal_commit_wall_us.fetch_add(duration_us,
                                            std::memory_order_relaxed);
   updateMax(g_counters.metal_commit_wall_max_us, duration_us);
+}
+
+void recordGpuFrameCompletion(uint64_t frame, uint64_t command_buffers,
+                              uint64_t gpu_start_ns, uint64_t gpu_end_ns,
+                              uint64_t gpu_busy_sum_ns,
+                              uint64_t gpu_active_union_ns,
+                              uint64_t gpu_idle_ns,
+                              uint64_t commit_to_complete_sum_us,
+                              uint64_t commit_to_complete_max_us,
+                              uint64_t boundary_to_first_publish_us,
+                              uint64_t publish_span_us,
+                              uint64_t publish_gap_max_us,
+                              uint64_t publish_to_encode_sum_us,
+                              uint64_t publish_to_encode_max_us,
+                              uint64_t encode_sum_us,
+                              uint64_t encode_max_us,
+                              uint64_t encode_prepare_sum_us,
+                              uint64_t encode_prepare_max_us,
+                              uint64_t encode_flush_sum_us,
+                              uint64_t encode_flush_max_us,
+                              uint64_t encode_to_commit_sum_us,
+                              uint64_t encode_to_commit_max_us,
+                              uint64_t first_publish_to_last_commit_us,
+                              uint64_t max_encode_chunk,
+                              uint32_t max_encode_input_encoders,
+                              uint32_t max_encode_encoded_encoders,
+                              uint32_t max_encode_render_encoders,
+                              uint32_t max_encode_compute_encoders,
+                              uint32_t max_encode_blit_encoders) {
+  if (!enabled() || !command_buffers)
+    return;
+  const auto gpu_envelope_ns =
+      gpu_end_ns > gpu_start_ns ? gpu_end_ns - gpu_start_ns : 0;
+  Logger::logFileOnly(
+      LogLevel::Info,
+      str::format("DXMT perf gpu-frame: frame=", frame,
+                  " commandBuffers=", command_buffers,
+                  " gpuStartNs=", gpu_start_ns,
+                  " gpuEndNs=", gpu_end_ns,
+                  " gpuEnvelopeUs=", gpu_envelope_ns / 1000,
+                  " gpuBusySumUs=", gpu_busy_sum_ns / 1000,
+                  " gpuActiveUnionUs=", gpu_active_union_ns / 1000,
+                  " gpuIdleUs=", gpu_idle_ns / 1000,
+                  " commitToCompleteSumUs=", commit_to_complete_sum_us,
+                  " commitToCompleteMaxUs=", commit_to_complete_max_us,
+                  " boundaryToFirstPublishUs=", boundary_to_first_publish_us,
+                  " publishSpanUs=", publish_span_us,
+                  " publishGapMaxUs=", publish_gap_max_us,
+                  " publishToEncodeSumUs=", publish_to_encode_sum_us,
+                  " publishToEncodeMaxUs=", publish_to_encode_max_us,
+                  " encodeSumUs=", encode_sum_us,
+                  " encodeMaxUs=", encode_max_us,
+                  " encodePrepareSumUs=", encode_prepare_sum_us,
+                  " encodePrepareMaxUs=", encode_prepare_max_us,
+                  " encodeFlushSumUs=", encode_flush_sum_us,
+                  " encodeFlushMaxUs=", encode_flush_max_us,
+                  " encodeToCommitSumUs=", encode_to_commit_sum_us,
+                  " encodeToCommitMaxUs=", encode_to_commit_max_us,
+                  " firstPublishToLastCommitUs=",
+                  first_publish_to_last_commit_us,
+                  " maxEncodeChunk=", max_encode_chunk,
+                  " maxEncodeInputEncoders=", max_encode_input_encoders,
+                  " maxEncodeEncodedEncoders=", max_encode_encoded_encoders,
+                  " maxEncodeRenderEncoders=", max_encode_render_encoders,
+                  " maxEncodeComputeEncoders=", max_encode_compute_encoders,
+                  " maxEncodeBlitEncoders=", max_encode_blit_encoders));
+}
+
+void recordGpuFrameEncodeBreakdown(uint64_t frame,
+                                   const FrameStatistics &stats) {
+  if (!enabled())
+    return;
+  Logger::logFileOnly(
+      LogLevel::Info,
+      str::format(
+          "DXMT perf encode-frame: frame=", frame,
+          " encodePrepareUs=", durationUs(stats.encode_prepare_interval),
+          " encodeFlushUs=", durationUs(stats.encode_flush_interval),
+          " compiledDrawEncodeUs=",
+          durationUs(stats.frame_compiled_draw_encode_interval),
+          " compiledDrawCommonUs=",
+          durationUs(stats.frame_compiled_draw_common_interval),
+          " compiledDrawPipelineUs=",
+          durationUs(stats.frame_compiled_draw_pipeline_interval),
+          " compiledDrawDssoUs=",
+          durationUs(stats.frame_compiled_draw_dsso_interval),
+          " compiledDrawRasterizerUs=",
+          durationUs(stats.frame_compiled_draw_rasterizer_interval),
+          " compiledDrawBindingGateUs=",
+          durationUs(stats.frame_compiled_draw_binding_gate_interval),
+          " compiledDrawBindingSnapshotUs=",
+          durationUs(stats.frame_compiled_draw_binding_snapshot_interval),
+          " compiledDrawDynamicStateUs=",
+          durationUs(stats.frame_compiled_draw_dynamic_state_interval),
+          " compiledDrawVisibilityUs=",
+          durationUs(stats.frame_compiled_draw_visibility_interval),
+          " compiledDrawBodyUs=",
+          durationUs(stats.frame_compiled_draw_body_interval),
+          " compiledDispatchEncodeUs=",
+          durationUs(stats.frame_compiled_dispatch_encode_interval),
+          " argumentTableUpdateUs=",
+          durationUs(stats.frame_argument_table_update_interval),
+          " argumentTableBindUs=",
+          durationUs(stats.frame_argument_table_bind_interval),
+          " flushTotalUs=", durationUs(stats.flush_total_interval),
+          " flushCollectUs=", durationUs(stats.flush_collect_interval),
+          " flushRelationUs=", durationUs(stats.flush_relation_interval),
+          " flushQueryUs=", durationUs(stats.flush_query_interval),
+          " flushRenderUs=", durationUs(stats.flush_render_interval),
+          " flushComputeUs=", durationUs(stats.flush_compute_interval),
+          " flushBlitUs=", durationUs(stats.flush_blit_interval),
+          " flushClearUs=", durationUs(stats.flush_clear_interval),
+          " flushResolveUs=", durationUs(stats.flush_resolve_interval),
+          " flushPresentUs=", durationUs(stats.flush_present_interval),
+          " flushEventUs=", durationUs(stats.flush_event_interval),
+          " flushSampleUs=", durationUs(stats.flush_sample_interval),
+          " flushPendingFenceUs=",
+          durationUs(stats.flush_pending_fence_interval),
+          " flushSignalUs=", durationUs(stats.flush_signal_interval),
+          " flushCleanupUs=", durationUs(stats.flush_cleanup_interval),
+          " renderPasses=", stats.render_pass_count,
+          " renderDraws=", stats.render_draw_count,
+          " renderIndexedDraws=", stats.render_indexed_draw_count,
+          " computeDispatches=", stats.compute_dispatch_count,
+          " blitPasses=", stats.blit_pass_count,
+          " flushEncoders=", stats.flush_encoder_count,
+          " encodedEncoders=", stats.flush_encoded_encoder_count));
 }
 
 void recordDrawableAcquire(uint64_t duration_us) {

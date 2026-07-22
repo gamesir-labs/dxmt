@@ -3601,11 +3601,12 @@ ArgumentEncodingContext::encodeShaderResources(
   }
 }
 
-void
+bool
 ArgumentEncodingContext::retainAllocation(Allocation* allocation) {
   if (allocation->checkRetained(seq_id_))
-    return;
+    return false;
   queue_.Retain(seq_id_, allocation);
+  return true;
 }
 
 void

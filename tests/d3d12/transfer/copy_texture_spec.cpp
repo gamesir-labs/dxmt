@@ -357,4 +357,83 @@ TEST_F(CopyTextureSpec, CopiesMultipleSubresourcesThroughOneBuffer) {
   readback->Unmap(0, &no_write);
 }
 
+TEST_F(CopyTextureSpec, CopiesUint4TexelsIntoBc3Blocks) {
+  constexpr UINT block_width = 2;
+  constexpr UINT block_height = 2;
+  const CopyCase source_case = {D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                DXGI_FORMAT_R32G32B32A32_UINT,
+                                block_width,
+                                block_height,
+                                1,
+                                1,
+                                0};
+  const CopyCase destination_case = {D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                     DXGI_FORMAT_BC3_UNORM,
+                                     block_width * 4,
+                                     block_height * 4,
+                                     1,
+                                     1,
+                                     0};
+  auto source = CreateTexture(TextureDesc(source_case));
+  auto destination = CreateTexture(TextureDesc(destination_case));
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(destination);
+
+  constexpr UINT bytes_per_block = 16;
+  std::array<std::uint8_t,
+             block_width * block_height * bytes_per_block>
+      expected = {};
+  for (std::size_t index = 0; index < expected.size(); ++index)
+    expected[index] = static_cast<std::uint8_t>(0x21 + index * 7);
+  ASSERT_TRUE(SUCCEEDED(context_.UploadTextureAndReset(
+      source.get(), expected.data(), block_width * bytes_per_block,
+      expected.size())));
+
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source.get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination_location = {};
+  destination_location.pResource = destination.get();
+  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  constexpr D3D12_BOX source_box = {0, 0, 0, block_width, block_height, 1};
+  D3D12TestContext::Transition(context_.list(), source.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context_.list()->CopyTextureRegion(&destination_location, 0, 0, 0,
+                                     &source_location, &source_box);
+  D3D12TestContext::Transition(context_.list(), destination.get(),
+                               D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT rows = 0;
+  UINT64 row_size = 0;
+  UINT64 total_size = 0;
+  const auto destination_desc = TextureDesc(destination_case);
+  context_.device()->GetCopyableFootprints(
+      &destination_desc, 0, 1, 0, &footprint, &rows, &row_size, &total_size);
+  ASSERT_EQ(rows, block_height);
+  ASSERT_EQ(row_size, UINT64(block_width * bytes_per_block));
+  auto readback = context_.CreateBuffer(total_size, D3D12_HEAP_TYPE_READBACK,
+                                        D3D12_RESOURCE_FLAG_NONE,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(readback);
+  D3D12_TEXTURE_COPY_LOCATION readback_location = {};
+  readback_location.pResource = readback.get();
+  readback_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  readback_location.PlacedFootprint = footprint;
+  context_.list()->CopyTextureRegion(&readback_location, 0, 0, 0,
+                                     &destination_location, nullptr);
+  ASSERT_TRUE(SUCCEEDED(context_.ExecuteAndWait()));
+
+  void *mapping = nullptr;
+  const D3D12_RANGE read_range = {0, static_cast<SIZE_T>(total_size)};
+  ASSERT_TRUE(SUCCEEDED(readback->Map(0, &read_range, &mapping)));
+  ExpectFootprint(static_cast<const std::uint8_t *>(mapping), footprint, rows,
+                  row_size,
+                  std::vector<std::uint8_t>(expected.begin(), expected.end()));
+  const D3D12_RANGE no_write = {0, 0};
+  readback->Unmap(0, &no_write);
+}
+
 } // namespace

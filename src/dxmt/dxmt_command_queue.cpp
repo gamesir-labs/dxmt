@@ -95,8 +95,9 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
 
   auto t0 = clock::now();
   list_enc.execute(enc);
+  encode_prepare_end_time = clock::now();
   attached_cmdbuf = cmdbuf;
-  auto t1 = clock::now();
+  auto t1 = encode_prepare_end_time;
   readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id, &diagnostic);
   auto t2 = clock::now();
 
@@ -126,6 +127,11 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
 
   diagnostic.barrier_only_pass_count =
       statistics.blit_barrier_only_pass_count - barrier_only_before;
+  perf_input_encoder_count = diagnostic.input_encoder_count;
+  perf_encoded_encoder_count = diagnostic.encoded_encoder_count;
+  perf_render_encoder_count = diagnostic.render_encoder_count;
+  perf_compute_encoder_count = diagnostic.compute_encoder_count;
+  perf_blit_encoder_count = diagnostic.blit_encoder_count;
   const auto barrier_marker =
       env::getEnvVar("DXMT_TEST_D3D12_BARRIER_ONLY_MARKER");
   if (!barrier_marker.empty()) {
@@ -445,6 +451,7 @@ CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
   chunk.frame_ = frame_id;
+  chunk.frame_begin_time = frame_statistics.begin_time;
   chunk.publish_time = clock::now();
   chunk.resource_initializer_event_id = initializer.flushToWait();
   frame_statistics.command_buffer_count++;
@@ -1060,6 +1067,113 @@ CommandQueue::WaitForFinishThread() {
   env::setThreadName("dxmt-finish-thread");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
+  uint64_t perf_gpu_frame = ~0ull;
+  uint64_t perf_gpu_command_buffers = 0;
+  uint64_t perf_gpu_start_ns = 0;
+  uint64_t perf_gpu_end_ns = 0;
+  uint64_t perf_gpu_busy_sum_ns = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> perf_gpu_intervals;
+  uint64_t perf_commit_to_complete_sum_us = 0;
+  uint64_t perf_commit_to_complete_max_us = 0;
+  clock::time_point perf_frame_begin_time;
+  clock::time_point perf_first_publish_time;
+  clock::time_point perf_last_publish_time;
+  clock::time_point perf_last_commit_time;
+  uint64_t perf_publish_gap_max_us = 0;
+  uint64_t perf_publish_to_encode_sum_us = 0;
+  uint64_t perf_publish_to_encode_max_us = 0;
+  uint64_t perf_encode_sum_us = 0;
+  uint64_t perf_encode_max_us = 0;
+  uint64_t perf_encode_prepare_sum_us = 0;
+  uint64_t perf_encode_prepare_max_us = 0;
+  uint64_t perf_encode_flush_sum_us = 0;
+  uint64_t perf_encode_flush_max_us = 0;
+  uint64_t perf_encode_to_commit_sum_us = 0;
+  uint64_t perf_encode_to_commit_max_us = 0;
+  uint64_t perf_max_encode_chunk = 0;
+  uint32_t perf_max_encode_input_encoders = 0;
+  uint32_t perf_max_encode_encoded_encoders = 0;
+  uint32_t perf_max_encode_render_encoders = 0;
+  uint32_t perf_max_encode_compute_encoders = 0;
+  uint32_t perf_max_encode_blit_encoders = 0;
+  auto flush_gpu_frame = [&]() {
+    if (perf_gpu_frame == ~0ull || !perf_gpu_command_buffers)
+      return;
+    std::sort(perf_gpu_intervals.begin(), perf_gpu_intervals.end());
+    uint64_t gpu_active_union_ns = 0;
+    uint64_t union_begin_ns = 0;
+    uint64_t union_end_ns = 0;
+    for (const auto &[begin_ns, end_ns] : perf_gpu_intervals) {
+      if (!union_end_ns || begin_ns > union_end_ns) {
+        gpu_active_union_ns += union_end_ns - union_begin_ns;
+        union_begin_ns = begin_ns;
+        union_end_ns = end_ns;
+      } else {
+        union_end_ns = std::max(union_end_ns, end_ns);
+      }
+    }
+    gpu_active_union_ns += union_end_ns - union_begin_ns;
+    const uint64_t gpu_envelope_ns =
+        perf_gpu_end_ns > perf_gpu_start_ns
+            ? perf_gpu_end_ns - perf_gpu_start_ns
+            : 0;
+    const uint64_t gpu_idle_ns =
+        gpu_envelope_ns > gpu_active_union_ns
+            ? gpu_envelope_ns - gpu_active_union_ns
+            : 0;
+    perf::recordGpuFrameEncodeBreakdown(
+        perf_gpu_frame, statistics.at(perf_gpu_frame));
+    const auto elapsed_us = [](clock::time_point begin,
+                               clock::time_point end) -> uint64_t {
+      if (begin == clock::time_point{} || end <= begin)
+        return 0;
+      return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+          .count();
+    };
+    perf::recordGpuFrameCompletion(
+        perf_gpu_frame, perf_gpu_command_buffers, perf_gpu_start_ns,
+        perf_gpu_end_ns, perf_gpu_busy_sum_ns, gpu_active_union_ns, gpu_idle_ns,
+        perf_commit_to_complete_sum_us, perf_commit_to_complete_max_us,
+        elapsed_us(perf_frame_begin_time, perf_first_publish_time),
+        elapsed_us(perf_first_publish_time, perf_last_publish_time),
+        perf_publish_gap_max_us, perf_publish_to_encode_sum_us,
+        perf_publish_to_encode_max_us, perf_encode_sum_us, perf_encode_max_us,
+        perf_encode_prepare_sum_us, perf_encode_prepare_max_us,
+        perf_encode_flush_sum_us, perf_encode_flush_max_us,
+        perf_encode_to_commit_sum_us, perf_encode_to_commit_max_us,
+        elapsed_us(perf_first_publish_time, perf_last_commit_time),
+        perf_max_encode_chunk, perf_max_encode_input_encoders,
+        perf_max_encode_encoded_encoders, perf_max_encode_render_encoders,
+        perf_max_encode_compute_encoders, perf_max_encode_blit_encoders);
+    perf_gpu_command_buffers = 0;
+    perf_gpu_start_ns = 0;
+    perf_gpu_end_ns = 0;
+    perf_gpu_busy_sum_ns = 0;
+    perf_gpu_intervals.clear();
+    perf_commit_to_complete_sum_us = 0;
+    perf_commit_to_complete_max_us = 0;
+    perf_frame_begin_time = {};
+    perf_first_publish_time = {};
+    perf_last_publish_time = {};
+    perf_last_commit_time = {};
+    perf_publish_gap_max_us = 0;
+    perf_publish_to_encode_sum_us = 0;
+    perf_publish_to_encode_max_us = 0;
+    perf_encode_sum_us = 0;
+    perf_encode_max_us = 0;
+    perf_encode_prepare_sum_us = 0;
+    perf_encode_prepare_max_us = 0;
+    perf_encode_flush_sum_us = 0;
+    perf_encode_flush_max_us = 0;
+    perf_encode_to_commit_sum_us = 0;
+    perf_encode_to_commit_max_us = 0;
+    perf_max_encode_chunk = 0;
+    perf_max_encode_input_encoders = 0;
+    perf_max_encode_encoded_encoders = 0;
+    perf_max_encode_render_encoders = 0;
+    perf_max_encode_compute_encoders = 0;
+    perf_max_encode_blit_encoders = 0;
+  };
   while (!stopped.load(std::memory_order_acquire)) {
     auto ready = ready_for_commit.load(std::memory_order_acquire);
     while (!stopped.load(std::memory_order_acquire) && ready == internal_seq) {
@@ -1127,6 +1241,88 @@ CommandQueue::WaitForFinishThread() {
       }
     }
     chunk.finish_complete_time = clock::now();
+    if (perf::enabled()) {
+      const auto gpu_start = chunk.attached_cmdbuf.gpuStartTime();
+      const auto gpu_end = chunk.attached_cmdbuf.gpuEndTime();
+      if (chunk.frame_ != perf_gpu_frame) {
+        flush_gpu_frame();
+        perf_gpu_frame = chunk.frame_;
+      }
+      perf_gpu_command_buffers++;
+      if (perf_frame_begin_time == clock::time_point{})
+        perf_frame_begin_time = chunk.frame_begin_time;
+      if (perf_first_publish_time == clock::time_point{})
+        perf_first_publish_time = chunk.publish_time;
+      if (perf_last_publish_time != clock::time_point{} &&
+          chunk.publish_time > perf_last_publish_time) {
+        const auto gap_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                chunk.publish_time - perf_last_publish_time)
+                .count();
+        perf_publish_gap_max_us =
+            std::max(perf_publish_gap_max_us, uint64_t(gap_us));
+      }
+      perf_last_publish_time =
+          std::max(perf_last_publish_time, chunk.publish_time);
+      perf_last_commit_time =
+          std::max(perf_last_commit_time, chunk.metal_commit_time);
+      const auto accumulate_phase = [](clock::time_point begin,
+                                       clock::time_point end, uint64_t &sum,
+                                       uint64_t &maximum) {
+        if (begin == clock::time_point{} || end <= begin)
+          return;
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+                .count();
+        sum += uint64_t(elapsed);
+        maximum = std::max(maximum, uint64_t(elapsed));
+      };
+      accumulate_phase(chunk.publish_time, chunk.encode_begin_time,
+                       perf_publish_to_encode_sum_us,
+                       perf_publish_to_encode_max_us);
+      accumulate_phase(chunk.encode_begin_time, chunk.encode_end_time,
+                       perf_encode_sum_us, perf_encode_max_us);
+      const auto chunk_encode_us =
+          chunk.encode_end_time > chunk.encode_begin_time
+              ? std::chrono::duration_cast<std::chrono::microseconds>(
+                    chunk.encode_end_time - chunk.encode_begin_time)
+                    .count()
+              : 0;
+      if (chunk_encode_us > 0 && uint64_t(chunk_encode_us) >= perf_encode_max_us) {
+        perf_max_encode_chunk = chunk.chunk_id;
+        perf_max_encode_input_encoders = chunk.perf_input_encoder_count;
+        perf_max_encode_encoded_encoders = chunk.perf_encoded_encoder_count;
+        perf_max_encode_render_encoders = chunk.perf_render_encoder_count;
+        perf_max_encode_compute_encoders = chunk.perf_compute_encoder_count;
+        perf_max_encode_blit_encoders = chunk.perf_blit_encoder_count;
+      }
+      accumulate_phase(chunk.encode_begin_time, chunk.encode_prepare_end_time,
+                       perf_encode_prepare_sum_us,
+                       perf_encode_prepare_max_us);
+      accumulate_phase(chunk.encode_prepare_end_time, chunk.encode_end_time,
+                       perf_encode_flush_sum_us, perf_encode_flush_max_us);
+      accumulate_phase(chunk.encode_end_time, chunk.metal_commit_time,
+                       perf_encode_to_commit_sum_us,
+                       perf_encode_to_commit_max_us);
+      if (gpu_start && gpu_end > gpu_start) {
+        if (!perf_gpu_start_ns || gpu_start < perf_gpu_start_ns)
+          perf_gpu_start_ns = gpu_start;
+        perf_gpu_end_ns = std::max(perf_gpu_end_ns, gpu_end);
+        perf_gpu_busy_sum_ns += gpu_end - gpu_start;
+        perf_gpu_intervals.emplace_back(gpu_start, gpu_end);
+      }
+      if (chunk.metal_commit_time != clock::time_point{}) {
+        const auto completion_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                chunk.finish_complete_time - chunk.metal_commit_time)
+                .count();
+        const auto nonnegative_completion_us =
+            completion_us > 0 ? uint64_t(completion_us) : 0;
+        perf_commit_to_complete_sum_us += nonnegative_completion_us;
+        perf_commit_to_complete_max_us = std::max(
+            perf_commit_to_complete_max_us, nonnegative_completion_us);
+      }
+    }
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       MarkDeviceError();
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
@@ -1244,6 +1440,7 @@ CommandQueue::WaitForFinishThread() {
 
     internal_seq++;
   }
+  flush_gpu_frame();
   TRACE("finishing thread gracefully terminates");
   return 0;
 }

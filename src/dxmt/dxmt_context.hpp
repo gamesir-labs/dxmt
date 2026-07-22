@@ -854,7 +854,7 @@ public:
   void invalidateNativeArgumentBuffers(bool compute,
                                        WMTRenderStages render_stages = {});
 
-  void retainAllocation(Allocation* allocation);
+  bool retainAllocation(Allocation* allocation);
 
   template <PipelineStage stage, PipelineKind kind>
   void

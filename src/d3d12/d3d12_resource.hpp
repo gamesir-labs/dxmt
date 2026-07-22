@@ -67,6 +67,7 @@ public:
   virtual const D3D12_HEAP_PROPERTIES &GetResourceHeapProperties() const = 0;
   virtual D3D12_HEAP_FLAGS GetResourceHeapFlags() const = 0;
   virtual uint64_t GetDescriptorIdentity() const = 0;
+  virtual bool HasLifetimeResidency() const = 0;
   virtual uint64_t GetTileMappingGeneration() const = 0;
   virtual UINT64 GetHeapOffset() const = 0;
   virtual D3D12_RESOURCE_STATES GetInitialState() const = 0;
@@ -120,5 +121,7 @@ bool GetTextureHeapSizeAndAlign(WMT::Device device,
 
 Resource *LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                                                   UINT64 *offset = nullptr);
+
+void ActivateBufferGpuVirtualAddress(Resource *resource);
 
 } // namespace dxmt::d3d12

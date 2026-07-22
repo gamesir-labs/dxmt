@@ -2358,6 +2358,8 @@ GetDescriptorResidencyTarget(const DescriptorRecord &record) {
     auto *resource = LookupBufferResourceByGpuVirtualAddress(
         record.desc.cbv.BufferLocation, &offset);
     (void)offset;
+    if (resource && resource->HasLifetimeResidency())
+      return target;
     SetDescriptorResidencyAllocation(
         target.allocation, DescriptorBufferResidencyAllocation(resource));
     return target;
@@ -2367,7 +2369,11 @@ GetDescriptorResidencyTarget(const DescriptorRecord &record) {
     auto *resource = GetResourceFromD3D12(record.resource.ptr());
     if (!resource)
       return target;
-    if (resource->GetBuffer()) {
+    if (resource->HasLifetimeResidency()) {
+      // D3DMetal keeps ordinary D3D12 allocations in a device-wide residency
+      // set for the resource lifetime. Avoid rebuilding equivalent residency
+      // references for every descriptor slot update.
+    } else if (resource->GetBuffer()) {
       SetDescriptorResidencyAllocation(
           target.allocation, DescriptorBufferResidencyAllocation(resource));
     } else if (resource->GetTexture()) {
@@ -2377,9 +2383,10 @@ GetDescriptorResidencyTarget(const DescriptorRecord &record) {
 
     if (record.type == DescriptorRecordType::UnorderedAccessView) {
       auto *counter = GetResourceFromD3D12(record.counter_resource.ptr());
-      SetDescriptorResidencyAllocation(
-          target.secondary_allocation,
-          DescriptorBufferResidencyAllocation(counter));
+      if (!counter || !counter->HasLifetimeResidency())
+        SetDescriptorResidencyAllocation(
+            target.secondary_allocation,
+            DescriptorBufferResidencyAllocation(counter));
     }
     return target;
   }

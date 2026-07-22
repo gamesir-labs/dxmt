@@ -317,6 +317,7 @@ struct FrameStatistics {
   clock::duration present_latency_interval{};
   clock::duration frame_execute_command_lists_interval{};
   clock::duration frame_present_interval{};
+  clock::duration frame_present_queue_wait_interval{};
   clock::duration frame_queue_signal_interval{};
   clock::duration frame_queue_wait_interval{};
   clock::duration frame_create_resource_interval{};
@@ -341,6 +342,7 @@ struct FrameStatistics {
   clock::duration frame_replay_compiled_graphics_interval{};
   clock::duration frame_replay_compiled_compute_interval{};
   clock::duration frame_replay_fallback_classification_interval{};
+  clock::duration frame_replay_typed_record_interval{};
   clock::duration frame_replay_flush_pass_interval{};
   clock::duration frame_replay_timestamp_resolve_interval{};
   clock::duration frame_replay_cpu_query_resolve_interval{};
@@ -654,6 +656,7 @@ struct FrameStatistics {
     present_latency_interval = {};
     frame_execute_command_lists_interval = {};
     frame_present_interval = {};
+    frame_present_queue_wait_interval = {};
     frame_queue_signal_interval = {};
     frame_queue_wait_interval = {};
     frame_create_resource_interval = {};
@@ -678,6 +681,7 @@ struct FrameStatistics {
     frame_replay_compiled_graphics_interval = {};
     frame_replay_compiled_compute_interval = {};
     frame_replay_fallback_classification_interval = {};
+    frame_replay_typed_record_interval = {};
     frame_replay_flush_pass_interval = {};
     frame_replay_timestamp_resolve_interval = {};
     frame_replay_cpu_query_resolve_interval = {};
@@ -1066,6 +1070,8 @@ public:
       average_.shader_binding_clean_uav_count += frames_[i].shader_binding_clean_uav_count;
       average_.frame_execute_command_lists_interval += frames_[i].frame_execute_command_lists_interval;
       average_.frame_present_interval += frames_[i].frame_present_interval;
+      average_.frame_present_queue_wait_interval +=
+          frames_[i].frame_present_queue_wait_interval;
       average_.frame_queue_signal_interval += frames_[i].frame_queue_signal_interval;
       average_.frame_queue_wait_interval += frames_[i].frame_queue_wait_interval;
       average_.frame_create_resource_interval += frames_[i].frame_create_resource_interval;
@@ -1091,6 +1097,7 @@ public:
       average_.frame_replay_compiled_graphics_interval += frames_[i].frame_replay_compiled_graphics_interval;
       average_.frame_replay_compiled_compute_interval += frames_[i].frame_replay_compiled_compute_interval;
       average_.frame_replay_fallback_classification_interval += frames_[i].frame_replay_fallback_classification_interval;
+      average_.frame_replay_typed_record_interval += frames_[i].frame_replay_typed_record_interval;
       average_.frame_replay_flush_pass_interval += frames_[i].frame_replay_flush_pass_interval;
       average_.frame_replay_timestamp_resolve_interval += frames_[i].frame_replay_timestamp_resolve_interval;
       average_.frame_replay_cpu_query_resolve_interval += frames_[i].frame_replay_cpu_query_resolve_interval;
@@ -1405,6 +1412,8 @@ public:
     average_.shader_binding_clean_uav_count /= (kFrameStatisticsCount - 1);
     average_.frame_execute_command_lists_interval /= (kFrameStatisticsCount - 1);
     average_.frame_present_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_present_queue_wait_interval /=
+        (kFrameStatisticsCount - 1);
     average_.frame_queue_signal_interval /= (kFrameStatisticsCount - 1);
     average_.frame_queue_wait_interval /= (kFrameStatisticsCount - 1);
     average_.frame_create_resource_interval /= (kFrameStatisticsCount - 1);
@@ -1430,6 +1439,7 @@ public:
     average_.frame_replay_compiled_graphics_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_compiled_compute_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_fallback_classification_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_replay_typed_record_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_flush_pass_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_timestamp_resolve_interval /= (kFrameStatisticsCount - 1);
     average_.frame_replay_cpu_query_resolve_interval /= (kFrameStatisticsCount - 1);

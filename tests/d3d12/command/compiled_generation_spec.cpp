@@ -81,6 +81,8 @@ TEST_F(CompiledGenerationSpec, ReusesImmutableStateAndMergesTypedRanges) {
   EXPECT_EQ(first.compiled_work_record_count, 4u);
   EXPECT_EQ(first.compute_segments, 1u);
   EXPECT_EQ(first.selected_compute_packets, 4u);
+  EXPECT_EQ(first.selected_typed_nodes, 0u);
+  EXPECT_EQ(first.fallback_segments, 0u);
   EXPECT_EQ(first.state_delta_packets, 4u);
   EXPECT_EQ(first.zero_state_delta_packets, 3u);
   EXPECT_GT(first.immutable_state_reuses, 0u);
@@ -125,6 +127,11 @@ TEST_F(CompiledGenerationSpec, ReusesImmutableStateAndMergesTypedRanges) {
   const auto submitted = ReadStats(context_.list());
   EXPECT_EQ(submitted.submitted_generation_shares, 1u);
   EXPECT_EQ(submitted.submitted_generation_deep_copies, 0u);
+  // SM5 bytecode deliberately uses the compatibility packet encoder. The
+  // Close plan still contains no typed nodes; each dispatch lowers directly
+  // from its complete compiled packet without entering legacy record replay.
+  EXPECT_EQ(submitted.replayed_compiled_packet_fallbacks, 4u);
+  EXPECT_EQ(submitted.legacy_replay_records, 0u);
 }
 
 TEST_F(CompiledGenerationSpec, ClosesIndependentListsConcurrentlyWithoutLock) {

@@ -46,6 +46,14 @@ const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind) {
     return "compute";
   case CompiledCommandSegmentKind::Indirect:
     return "indirect";
+  case CompiledCommandSegmentKind::Barrier:
+    return "barrier";
+  case CompiledCommandSegmentKind::Transfer:
+    return "transfer";
+  case CompiledCommandSegmentKind::Control:
+    return "control";
+  case CompiledCommandSegmentKind::ElidedState:
+    return "elided-state";
   case CompiledCommandSegmentKind::Typed:
     return "typed";
   case CompiledCommandSegmentKind::Fallback:
@@ -1718,6 +1726,230 @@ AppendCompiledTypedSegment(std::vector<CompiledCommandSegment> &segments,
   segments.push_back(segment);
 }
 
+static void AppendCompiledElidedStateSegment(
+    std::vector<CompiledCommandSegment> &segments,
+    UINT &unexpected_container_growths, UINT record_index) {
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::ElidedState &&
+        last.first_record_index + last.record_count == record_index) {
+      last.record_count++;
+      return;
+    }
+  }
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::ElidedState;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+static void AppendCompiledBarrierSegment(
+    std::vector<CompiledCommandSegment> &segments,
+    UINT &unexpected_container_growths, UINT record_index,
+    UINT first_barrier, UINT barrier_count) {
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Barrier;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.first_barrier = first_barrier;
+  segment.barrier_count = barrier_count;
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+template <typename Record>
+static auto &CompiledTransferPayloads(CompiledTransferStorage &storage) {
+  if constexpr (std::is_same_v<Record, CopyBufferRegionRecord>)
+    return storage.copy_buffer_regions;
+  else if constexpr (std::is_same_v<Record, CopyTextureRegionRecord>)
+    return storage.copy_texture_regions;
+  else if constexpr (std::is_same_v<Record, CopyResourceRecord>)
+    return storage.copy_resources;
+  else if constexpr (std::is_same_v<Record, CopyTilesRecord>)
+    return storage.copy_tiles;
+  else if constexpr (std::is_same_v<Record, ResolveSubresourceRecord>)
+    return storage.resolves;
+  else if constexpr (std::is_same_v<Record, ClearRenderTargetRecord>)
+    return storage.clear_render_targets;
+  else if constexpr (std::is_same_v<Record, ClearDepthStencilRecord>)
+    return storage.clear_depth_stencils;
+  else if constexpr (std::is_same_v<Record, ClearUnorderedAccessRecord>)
+    return storage.clear_unordered_access;
+  else if constexpr (std::is_same_v<Record, DiscardResourceRecord>)
+    return storage.discards;
+  else if constexpr (std::is_same_v<Record, WriteBufferImmediateRecord>)
+    return storage.write_buffer_immediate;
+  else
+    return storage.temporal_upscales;
+}
+
+template <typename Record>
+static constexpr CompiledTransferOpcode CompiledTransferOpcodeFor() {
+  if constexpr (std::is_same_v<Record, CopyBufferRegionRecord>)
+    return CompiledTransferOpcode::CopyBufferRegion;
+  else if constexpr (std::is_same_v<Record, CopyTextureRegionRecord>)
+    return CompiledTransferOpcode::CopyTextureRegion;
+  else if constexpr (std::is_same_v<Record, CopyResourceRecord>)
+    return CompiledTransferOpcode::CopyResource;
+  else if constexpr (std::is_same_v<Record, CopyTilesRecord>)
+    return CompiledTransferOpcode::CopyTiles;
+  else if constexpr (std::is_same_v<Record, ResolveSubresourceRecord>)
+    return CompiledTransferOpcode::ResolveSubresource;
+  else if constexpr (std::is_same_v<Record, ClearRenderTargetRecord>)
+    return CompiledTransferOpcode::ClearRenderTarget;
+  else if constexpr (std::is_same_v<Record, ClearDepthStencilRecord>)
+    return CompiledTransferOpcode::ClearDepthStencil;
+  else if constexpr (std::is_same_v<Record, ClearUnorderedAccessRecord>)
+    return CompiledTransferOpcode::ClearUnorderedAccess;
+  else if constexpr (std::is_same_v<Record, DiscardResourceRecord>)
+    return CompiledTransferOpcode::DiscardResource;
+  else if constexpr (std::is_same_v<Record, WriteBufferImmediateRecord>)
+    return CompiledTransferOpcode::WriteBufferImmediate;
+  else
+    return CompiledTransferOpcode::TemporalUpscale;
+}
+
+template <typename Record>
+static void AppendCompiledTransferPacket(
+    CompiledCommandList &compiled, std::vector<CompiledCommandSegment> &segments,
+    UINT record_index, std::uint64_t d3d_sequence, const Record &record) {
+  auto &payloads =
+      CompiledTransferPayloads<Record>(compiled.transfer_storage).mutableView();
+  const auto payload_index = static_cast<UINT>(payloads.size());
+  payloads.push_back(record);
+  auto &packets = compiled.transfer_packets.mutableView();
+  const auto packet_index = static_cast<UINT>(packets.size());
+  packets.push_back(CompiledTransferPacket{
+      CompiledTransferOpcodeFor<Record>(), payload_index, record_index,
+      d3d_sequence});
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Transfer &&
+        last.first_record_index + last.record_count == record_index &&
+        last.first_transfer_packet + last.transfer_packet_count ==
+            packet_index) {
+      last.record_count++;
+      last.transfer_packet_count++;
+      return;
+    }
+  }
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Transfer;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.first_transfer_packet = packet_index;
+  segment.transfer_packet_count = 1;
+  if (segments.size() == segments.capacity())
+    compiled.unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+template <typename Fn>
+static bool VisitCompiledTransferRecord(const CommandRecord &record, Fn &&fn) {
+  return std::visit([&]<typename Record>(const Record &payload) {
+    if constexpr (std::is_same_v<Record, CopyBufferRegionRecord> ||
+                  std::is_same_v<Record, CopyTextureRegionRecord> ||
+                  std::is_same_v<Record, CopyResourceRecord> ||
+                  std::is_same_v<Record, CopyTilesRecord> ||
+                  std::is_same_v<Record, ResolveSubresourceRecord> ||
+                  std::is_same_v<Record, ClearRenderTargetRecord> ||
+                  std::is_same_v<Record, ClearDepthStencilRecord> ||
+                  std::is_same_v<Record, ClearUnorderedAccessRecord> ||
+                  std::is_same_v<Record, DiscardResourceRecord> ||
+                  std::is_same_v<Record, WriteBufferImmediateRecord> ||
+                  std::is_same_v<Record, TemporalUpscaleRecord>) {
+      fn(payload);
+      return true;
+    }
+    return false;
+  }, record.payload);
+}
+
+template <typename Record>
+static auto &CompiledControlPayloads(CompiledControlStorage &storage) {
+  if constexpr (std::is_same_v<Record, ClearStateRecord>)
+    return storage.clear_states;
+  else if constexpr (std::is_same_v<Record, BeginQueryRecord>)
+    return storage.begin_queries;
+  else if constexpr (std::is_same_v<Record, EndQueryRecord>)
+    return storage.end_queries;
+  else if constexpr (std::is_same_v<Record, ResolveQueryDataRecord>)
+    return storage.resolve_queries;
+  else
+    return storage.predications;
+}
+
+template <typename Record>
+static constexpr CompiledControlOpcode CompiledControlOpcodeFor() {
+  if constexpr (std::is_same_v<Record, ClearStateRecord>)
+    return CompiledControlOpcode::ClearState;
+  else if constexpr (std::is_same_v<Record, BeginQueryRecord>)
+    return CompiledControlOpcode::BeginQuery;
+  else if constexpr (std::is_same_v<Record, EndQueryRecord>)
+    return CompiledControlOpcode::EndQuery;
+  else if constexpr (std::is_same_v<Record, ResolveQueryDataRecord>)
+    return CompiledControlOpcode::ResolveQueryData;
+  else
+    return CompiledControlOpcode::Predication;
+}
+
+template <typename Record>
+static void AppendCompiledControlPacket(
+    CompiledCommandList &compiled, std::vector<CompiledCommandSegment> &segments,
+    UINT record_index, std::uint64_t d3d_sequence, const Record &record) {
+  auto &payloads =
+      CompiledControlPayloads<Record>(compiled.control_storage).mutableView();
+  const auto payload_index = static_cast<UINT>(payloads.size());
+  payloads.push_back(record);
+  auto &packets = compiled.control_packets.mutableView();
+  const auto packet_index = static_cast<UINT>(packets.size());
+  packets.push_back(CompiledControlPacket{
+      CompiledControlOpcodeFor<Record>(), payload_index, record_index,
+      d3d_sequence});
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Control &&
+        last.first_record_index + last.record_count == record_index &&
+        last.first_control_packet + last.control_packet_count == packet_index) {
+      last.record_count++;
+      last.control_packet_count++;
+      return;
+    }
+  }
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Control;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
+  segment.first_control_packet = packet_index;
+  segment.control_packet_count = 1;
+  if (segments.size() == segments.capacity())
+    compiled.unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+template <typename Fn>
+static bool VisitCompiledControlRecord(const CommandRecord &record, Fn &&fn) {
+  return std::visit([&]<typename Record>(const Record &payload) {
+    if constexpr (std::is_same_v<Record, ClearStateRecord> ||
+                  std::is_same_v<Record, BeginQueryRecord> ||
+                  std::is_same_v<Record, EndQueryRecord> ||
+                  std::is_same_v<Record, ResolveQueryDataRecord> ||
+                  std::is_same_v<Record, PredicationRecord>) {
+      fn(payload);
+      return true;
+    }
+    return false;
+  }, record.payload);
+}
+
 static void
 AppendCompiledGraphicsSegment(
     std::vector<CompiledCommandSegment> &segments,
@@ -1959,7 +2191,37 @@ CompiledStorageAllocationEventCount() {
       CompiledImmutableVector<CompiledComputePacket>::
           ThreadAllocationEventCount() +
       CompiledImmutableVector<CompiledIndirectPacket>::
-          ThreadAllocationEventCount();
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CompiledTransferPacket>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CopyBufferRegionRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CopyTextureRegionRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CopyResourceRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<CopyTilesRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<ResolveSubresourceRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<ClearRenderTargetRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<ClearDepthStencilRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<ClearUnorderedAccessRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<DiscardResourceRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<WriteBufferImmediateRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<TemporalUpscaleRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<CompiledControlPacket>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<ClearStateRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<BeginQueryRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<EndQueryRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<ResolveQueryDataRecord>::
+          ThreadAllocationEventCount() +
+      CompiledImmutableVector<PredicationRecord>::ThreadAllocationEventCount() +
+      CompiledImmutableVector<std::uint8_t>::ThreadAllocationEventCount();
   result.state =
       CompiledImmutableVector<CompiledCommandRootDescriptorTable>::
              ThreadAllocationEventCount() +
@@ -2003,6 +2265,120 @@ static void FinalizeCompiledStorageAllocationEvents(
       compiled.access_storage_allocation_events;
 }
 
+static bool IsCompiledGraphicsStateSetterRecord(const CommandRecord &record) {
+  return std::holds_alternative<PipelineStateRecord>(record.payload) ||
+         std::holds_alternative<ViewportRecord>(record.payload) ||
+         std::holds_alternative<ScissorRecord>(record.payload) ||
+         std::holds_alternative<BlendFactorRecord>(record.payload) ||
+         std::holds_alternative<StencilRefRecord>(record.payload) ||
+         std::holds_alternative<PrimitiveTopologyRecord>(record.payload) ||
+         std::holds_alternative<VertexBuffersRecord>(record.payload) ||
+         std::holds_alternative<IndexBufferRecord>(record.payload) ||
+         std::holds_alternative<RootSignatureRecord>(record.payload) ||
+         std::holds_alternative<DescriptorHeapsRecord>(record.payload) ||
+         std::holds_alternative<RootDescriptorTableRecord>(record.payload) ||
+         std::holds_alternative<RootConstantsRecord>(record.payload) ||
+         std::holds_alternative<RootDescriptorRecord>(record.payload);
+}
+
+static bool IsCompiledPacketCapturedStateRecord(const CommandRecord &record) {
+  return IsCompiledGraphicsStateSetterRecord(record) ||
+         std::holds_alternative<RenderTargetsRecord>(record.payload);
+}
+
+static bool LaterCompiledVertexBufferRecordCoversSlot(
+    const std::vector<CommandRecord> &records, UINT begin, UINT end,
+    UINT slot) {
+  for (UINT i = begin; i < end; ++i) {
+    if (const auto *vb =
+            std::get_if<VertexBuffersRecord>(&records[i].payload)) {
+      if (slot >= vb->start_slot && slot < vb->start_slot + vb->view_count)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool CompiledGraphicsStateSetterSupersededInRun(
+    const std::vector<CommandRecord> &records, UINT index, UINT run_end) {
+  const auto &payload = records[index].payload;
+  for (UINT i = index + 1; i < run_end; ++i) {
+    const auto &later = records[i].payload;
+    if ((std::holds_alternative<PipelineStateRecord>(payload) &&
+         std::holds_alternative<PipelineStateRecord>(later)) ||
+        (std::holds_alternative<ViewportRecord>(payload) &&
+         std::holds_alternative<ViewportRecord>(later)) ||
+        (std::holds_alternative<ScissorRecord>(payload) &&
+         std::holds_alternative<ScissorRecord>(later)) ||
+        (std::holds_alternative<BlendFactorRecord>(payload) &&
+         std::holds_alternative<BlendFactorRecord>(later)) ||
+        (std::holds_alternative<StencilRefRecord>(payload) &&
+         std::holds_alternative<StencilRefRecord>(later)) ||
+        (std::holds_alternative<PrimitiveTopologyRecord>(payload) &&
+         std::holds_alternative<PrimitiveTopologyRecord>(later)) ||
+        (std::holds_alternative<IndexBufferRecord>(payload) &&
+         std::holds_alternative<IndexBufferRecord>(later)))
+      return true;
+    if (const auto *table =
+            std::get_if<RootDescriptorTableRecord>(&payload)) {
+      if (const auto *later_table =
+              std::get_if<RootDescriptorTableRecord>(&later)) {
+        if (table->compute == later_table->compute &&
+            table->root_parameter_index == later_table->root_parameter_index)
+          return true;
+      }
+    }
+    if (const auto *descriptor =
+            std::get_if<RootDescriptorRecord>(&payload)) {
+      if (const auto *later_descriptor =
+              std::get_if<RootDescriptorRecord>(&later)) {
+        if (descriptor->compute == later_descriptor->compute &&
+            descriptor->parameter_type == later_descriptor->parameter_type &&
+            descriptor->root_parameter_index ==
+                later_descriptor->root_parameter_index)
+          return true;
+      }
+    }
+  }
+
+  if (const auto *vb = std::get_if<VertexBuffersRecord>(&payload)) {
+    if (!vb->view_count)
+      return true;
+    for (UINT slot = vb->start_slot; slot < vb->start_slot + vb->view_count;
+         ++slot) {
+      if (!LaterCompiledVertexBufferRecordCoversSlot(
+              records, index + 1, run_end, slot))
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+static CompiledImmutableVector<std::uint8_t>
+BuildCompiledSupersededGraphicsStateRecordMask(
+    const std::vector<CommandRecord> &records) {
+  CompiledImmutableVector<std::uint8_t> result;
+  auto &skip = result.mutableView();
+  skip.assign(records.size(), 0);
+  for (UINT i = 0; i < records.size();) {
+    if (!IsCompiledGraphicsStateSetterRecord(records[i])) {
+      ++i;
+      continue;
+    }
+    UINT run_end = i + 1;
+    while (run_end < records.size() &&
+           IsCompiledGraphicsStateSetterRecord(records[run_end]))
+      ++run_end;
+    for (UINT k = i; k < run_end; ++k) {
+      if (CompiledGraphicsStateSetterSupersededInRun(records, k, run_end))
+        skip[k] = 1;
+    }
+    i = run_end;
+  }
+  return result;
+}
+
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                          WMT::Device device, bool force_compatibility,
@@ -2020,6 +2396,8 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   compiled->generation =
       next_generation.fetch_add(1, std::memory_order_relaxed) + 1;
   compiled->record_count = static_cast<UINT>(records.size());
+  compiled->superseded_state_record_mask =
+      BuildCompiledSupersededGraphicsStateRecordMask(records);
   compiled->segments.reserve(records.size());
   compiled->graphics_packets.reserve(graphics_packet_count);
   compiled->compute_packets.reserve(compute_packet_count);
@@ -2062,6 +2440,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   const auto finalization_fault_setting =
       env::getEnvVar(finalization_fault_name);
   CompiledCommandBuildState state = {};
+  UINT next_barrier_index = 0;
   for (UINT record_index = 0; record_index < records.size(); record_index++) {
     const auto &record = records[record_index];
     if (record.compile_kind == CommandRecordCompileKind::Barrier)
@@ -2193,6 +2572,25 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
         ClearCompiledInputAssemblerDirtyState(state);
         ClearCompiledStateDelta(state, false);
       }
+    } else if (const auto *barriers =
+                   std::get_if<ResourceBarrierRecord>(&record.payload)) {
+      AppendCompiledBarrierSegment(
+          segments, compiled->unexpected_container_growths, record_index,
+          next_barrier_index, static_cast<UINT>(barriers->barriers.size()));
+      next_barrier_index += static_cast<UINT>(barriers->barriers.size());
+    } else if (VisitCompiledTransferRecord(record, [&](const auto &payload) {
+                 AppendCompiledTransferPacket(
+                     *compiled, segments, record_index, record.d3d_sequence,
+                     payload);
+               })) {
+    } else if (VisitCompiledControlRecord(record, [&](const auto &payload) {
+                 AppendCompiledControlPacket(
+                     *compiled, segments, record_index, record.d3d_sequence,
+                     payload);
+               })) {
+    } else if (IsCompiledPacketCapturedStateRecord(record)) {
+      AppendCompiledElidedStateSegment(
+          segments, compiled->unexpected_container_growths, record_index);
     } else {
       AppendCompiledTypedSegment(segments,
                                  compiled->unexpected_container_growths,
@@ -2579,6 +2977,21 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         // the graphics/compute distinction for mixed indirect segments.
         kind = ExecutionPathSegmentKind::Graphics;
         break;
+      case CompiledCommandSegmentKind::Barrier:
+        kind = ExecutionPathSegmentKind::Typed;
+        break;
+      case CompiledCommandSegmentKind::Transfer:
+        kind = ExecutionPathSegmentKind::Typed;
+        break;
+      case CompiledCommandSegmentKind::Control:
+        kind = ExecutionPathSegmentKind::Typed;
+        break;
+      case CompiledCommandSegmentKind::ElidedState:
+        // The public test ABI predates Close-time-elided state nodes. They are
+        // neither replay nor fallback work; expose them as typed ordering
+        // nodes while keeping them out of the selected typed-node counter.
+        kind = ExecutionPathSegmentKind::Typed;
+        break;
       case CompiledCommandSegmentKind::Typed:
         kind = ExecutionPathSegmentKind::Typed;
         break;
@@ -2626,6 +3039,14 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         stats.selected_graphics_packets += graphics_packets;
         stats.selected_compute_packets += compute_packets;
       }
+      break;
+    case CompiledCommandSegmentKind::Barrier:
+      break;
+    case CompiledCommandSegmentKind::Transfer:
+      break;
+    case CompiledCommandSegmentKind::Control:
+      break;
+    case CompiledCommandSegmentKind::ElidedState:
       break;
     case CompiledCommandSegmentKind::Typed:
       stats.selected_typed_nodes += segment.record_count;
@@ -2973,14 +3394,29 @@ public:
             !compiled->test_native_requirement_satisfied)
           recording_error_ = E_FAIL;
       }
-      auto typed_nodes = std::make_shared<const std::vector<CommandRecord>>(
-          std::move(records_));
-      compiled->typed_nodes = typed_nodes;
+      const bool needs_fallback_records = std::any_of(
+          compiled->segments.begin(), compiled->segments.end(),
+          [](const CompiledCommandSegment &segment) {
+            return segment.kind == CompiledCommandSegmentKind::Typed ||
+                   segment.kind == CompiledCommandSegmentKind::Fallback;
+          });
+      const bool needs_bundle_records =
+          type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+      std::shared_ptr<const std::vector<CommandRecord>> retained_records;
+      if (needs_fallback_records || needs_bundle_records) {
+        retained_records =
+            std::make_shared<const std::vector<CommandRecord>>(
+                std::move(records_));
+      } else {
+        records_ = {};
+      }
+      if (needs_fallback_records)
+        compiled->fallback_records = retained_records;
       compiled_commands_ = std::move(compiled);
-      // Bundle expansion shares the typed Close generation. The queue retains
-      // it through CompiledCommandList and no longer carries a second raw
-      // command-record generation in pending operations.
-      closed_records_ = std::move(typed_nodes);
+      // Bundles still expose their source generation for expansion into the
+      // parent list. Ordinary direct/compute lists release it at Close.
+      closed_records_ = needs_bundle_records ? std::move(retained_records)
+                                             : nullptr;
     }
     closed_ = true;
     if (allocator_) {

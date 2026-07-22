@@ -319,12 +319,20 @@ private:
 
   std::shared_ptr<TimestampPage>
   CreateTimestampPage(TimestampPageState &state) {
+    if (timestamp_heap_unavailable_)
+      return {};
+
     WMT::Device device = device_->GetMTLDevice();
     const uint64_t native_count = std::max<uint64_t>(desc_.Count, 2);
     WMT::Error error = {};
     auto heap = device.newTimestampCounterHeap(native_count, &error);
     const uint64_t entry_size = device.timestampHeapEntrySize();
     if (!heap || entry_size < sizeof(WMTMTL4TimestampHeapEntry)) {
+      // A failed allocation for this D3D heap shape is deterministic on the
+      // active device. Retrying it for every EndQuery crosses the Wine/Metal
+      // boundary and can turn timestamp-heavy workloads into a CPU bottleneck.
+      // Keep using the existing per-command-buffer timestamp fallback instead.
+      timestamp_heap_unavailable_ = true;
       // CounterHeap quota easter egg: fuck apple.
       WARN("D3D12QueryHeap: Metal timestamp counter heap unavailable"
            " d3dCount=", desc_.Count,
@@ -364,6 +372,7 @@ private:
   D3D12_QUERY_HEAP_DESC desc_ = {};
 #if DXMT_DX12_METAL4
   std::shared_ptr<TimestampPageState> timestamp_pages_;
+  bool timestamp_heap_unavailable_ = false;
 #endif
   mutable std::mutex queries_mutex_;
   std::vector<QueryData> queries_;

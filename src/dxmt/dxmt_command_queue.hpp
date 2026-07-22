@@ -138,8 +138,10 @@ public:
   uint64_t chunk_event_id;
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
+  clock::time_point frame_begin_time;
   clock::time_point publish_time;
   clock::time_point encode_begin_time;
+  clock::time_point encode_prepare_end_time;
   clock::time_point encode_end_time;
   clock::time_point metal_commit_time;
   clock::time_point finish_begin_time;
@@ -150,6 +152,11 @@ public:
   std::vector<std::function<void()>> deferred_readbacks;
   uint64_t resource_initializer_event_id;
   CommandBufferDiagnosticInfo sparse_mapping_diagnostic = {};
+  uint32_t perf_input_encoder_count = 0;
+  uint32_t perf_encoded_encoder_count = 0;
+  uint32_t perf_render_encoder_count = 0;
+  uint32_t perf_compute_encoder_count = 0;
+  uint32_t perf_blit_encoder_count = 0;
 
 private:
   CommandQueue *queue;
@@ -166,8 +173,10 @@ public:
   void
   reset() {
     signal_frame_latency_fence_ = ~0ull;
+    frame_begin_time = {};
     publish_time = {};
     encode_begin_time = {};
+    encode_prepare_end_time = {};
     encode_end_time = {};
     metal_commit_time = {};
     finish_begin_time = {};
@@ -182,6 +191,11 @@ public:
       callback();
     deferred_readbacks.clear();
     sparse_mapping_diagnostic = {};
+    perf_input_encoder_count = 0;
+    perf_encoded_encoder_count = 0;
+    perf_render_encoder_count = 0;
+    perf_compute_encoder_count = 0;
+    perf_blit_encoder_count = 0;
     list_enc.reset();
     ref_tracker.clear();
     attached_cmdbuf = nullptr;

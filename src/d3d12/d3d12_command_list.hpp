@@ -320,6 +320,10 @@ enum class CompiledCommandSegmentKind {
   Graphics,
   Compute,
   Indirect,
+  Barrier,
+  Transfer,
+  Control,
+  ElidedState,
   Typed,
   Fallback,
 };
@@ -846,6 +850,64 @@ struct CompiledIndirectPacket {
   std::optional<CompiledComputePacket> compute_state;
 };
 
+enum class CompiledTransferOpcode : std::uint8_t {
+  CopyBufferRegion,
+  CopyTextureRegion,
+  CopyResource,
+  CopyTiles,
+  ResolveSubresource,
+  ClearRenderTarget,
+  ClearDepthStencil,
+  ClearUnorderedAccess,
+  DiscardResource,
+  WriteBufferImmediate,
+  TemporalUpscale,
+};
+
+struct CompiledTransferPacket {
+  CompiledTransferOpcode opcode = CompiledTransferOpcode::CopyBufferRegion;
+  UINT payload_index = 0;
+  UINT record_index = 0;
+  std::uint64_t d3d_sequence = 0;
+};
+
+struct CompiledTransferStorage {
+  CompiledImmutableVector<CopyBufferRegionRecord> copy_buffer_regions;
+  CompiledImmutableVector<CopyTextureRegionRecord> copy_texture_regions;
+  CompiledImmutableVector<CopyResourceRecord> copy_resources;
+  CompiledImmutableVector<CopyTilesRecord> copy_tiles;
+  CompiledImmutableVector<ResolveSubresourceRecord> resolves;
+  CompiledImmutableVector<ClearRenderTargetRecord> clear_render_targets;
+  CompiledImmutableVector<ClearDepthStencilRecord> clear_depth_stencils;
+  CompiledImmutableVector<ClearUnorderedAccessRecord> clear_unordered_access;
+  CompiledImmutableVector<DiscardResourceRecord> discards;
+  CompiledImmutableVector<WriteBufferImmediateRecord> write_buffer_immediate;
+  CompiledImmutableVector<TemporalUpscaleRecord> temporal_upscales;
+};
+
+enum class CompiledControlOpcode : std::uint8_t {
+  ClearState,
+  BeginQuery,
+  EndQuery,
+  ResolveQueryData,
+  Predication,
+};
+
+struct CompiledControlPacket {
+  CompiledControlOpcode opcode = CompiledControlOpcode::ClearState;
+  UINT payload_index = 0;
+  UINT record_index = 0;
+  std::uint64_t d3d_sequence = 0;
+};
+
+struct CompiledControlStorage {
+  CompiledImmutableVector<ClearStateRecord> clear_states;
+  CompiledImmutableVector<BeginQueryRecord> begin_queries;
+  CompiledImmutableVector<EndQueryRecord> end_queries;
+  CompiledImmutableVector<ResolveQueryDataRecord> resolve_queries;
+  CompiledImmutableVector<PredicationRecord> predications;
+};
+
 struct CompiledCommandSegment {
   CompiledCommandSegmentKind kind = CompiledCommandSegmentKind::Fallback;
   UINT first_record_index = 0;
@@ -856,6 +918,12 @@ struct CompiledCommandSegment {
   UINT compute_packet_count = 0;
   UINT first_indirect_packet = 0;
   UINT indirect_packet_count = 0;
+  UINT first_barrier = 0;
+  UINT barrier_count = 0;
+  UINT first_transfer_packet = 0;
+  UINT transfer_packet_count = 0;
+  UINT first_control_packet = 0;
+  UINT control_packet_count = 0;
   CompiledCommandFallbackReason fallback_reason =
       CompiledCommandFallbackReason::None;
   dxmt::CompiledFallbackReason perf_fallback_reason =
@@ -912,14 +980,21 @@ struct CompiledCommandTestTelemetry {
 struct CompiledCommandList {
   std::uint64_t generation = 0;
   UINT record_count = 0;
-  // Immutable typed node stream owned by the Close generation. Bundle
-  // expansion may share the same storage, but Execute never retains or scans
-  // a separate legacy command-record generation.
-  std::shared_ptr<const std::vector<CommandRecord>> typed_nodes;
+  // Retained only for explicit compatibility/fault fallback. Native plans do
+  // not own or scan the original typed command stream.
+  std::shared_ptr<const std::vector<CommandRecord>> fallback_records;
   CompiledImmutableVector<CompiledCommandSegment> segments;
   CompiledImmutableVector<CompiledGraphicsPacket> graphics_packets;
   CompiledImmutableVector<CompiledComputePacket> compute_packets;
   CompiledImmutableVector<CompiledIndirectPacket> indirect_packets;
+  CompiledImmutableVector<CompiledTransferPacket> transfer_packets;
+  CompiledTransferStorage transfer_storage;
+  CompiledImmutableVector<CompiledControlPacket> control_packets;
+  CompiledControlStorage control_storage;
+  // Close-time control-flow reduction. Execute consumes this immutable mask
+  // instead of rescanning the typed stream for superseded state setters on
+  // every submission of the same command-list generation.
+  CompiledImmutableVector<std::uint8_t> superseded_state_record_mask;
   CompiledCommandAccessSummary access_summary;
   UINT unexpected_container_growths = 0;
   UINT storage_allocation_events = 0;

@@ -109,6 +109,7 @@ struct ReplayWorkerSummary {
   uint64_t compiled_compute_us = 0;
   uint64_t fallback_classification_us = 0;
   uint64_t typed_record_us = 0;
+  uint64_t native_command_body_us = 0;
   uint64_t record_control_us = 0;
   uint64_t classified_record_us = 0;
   uint64_t replay_coverage_permille = 0;
@@ -247,6 +248,35 @@ void recordPsoArtifactCacheLookup(PsoArtifactKind kind,
 void recordPsoArtifactCompile(PsoArtifactKind kind, uint64_t duration_us,
                               bool success);
 void recordMetalCommandBufferCommit(uint64_t duration_us);
+void recordGpuFrameCompletion(uint64_t frame, uint64_t command_buffers,
+                              uint64_t gpu_start_ns, uint64_t gpu_end_ns,
+                              uint64_t gpu_busy_sum_ns,
+                              uint64_t gpu_active_union_ns,
+                              uint64_t gpu_idle_ns,
+                              uint64_t commit_to_complete_sum_us,
+                              uint64_t commit_to_complete_max_us,
+                              uint64_t boundary_to_first_publish_us,
+                              uint64_t publish_span_us,
+                              uint64_t publish_gap_max_us,
+                              uint64_t publish_to_encode_sum_us,
+                              uint64_t publish_to_encode_max_us,
+                              uint64_t encode_sum_us,
+                              uint64_t encode_max_us,
+                              uint64_t encode_prepare_sum_us,
+                              uint64_t encode_prepare_max_us,
+                              uint64_t encode_flush_sum_us,
+                              uint64_t encode_flush_max_us,
+                              uint64_t encode_to_commit_sum_us,
+                              uint64_t encode_to_commit_max_us,
+                              uint64_t first_publish_to_last_commit_us,
+                              uint64_t max_encode_chunk,
+                              uint32_t max_encode_input_encoders,
+                              uint32_t max_encode_encoded_encoders,
+                              uint32_t max_encode_render_encoders,
+                              uint32_t max_encode_compute_encoders,
+                              uint32_t max_encode_blit_encoders);
+void recordGpuFrameEncodeBreakdown(uint64_t frame,
+                                   const FrameStatistics &stats);
 void recordDrawableAcquire(uint64_t duration_us);
 void recordDescriptorContentWrite(uint32_t kind);
 void recordNativeDescriptorBufferRecord(uint32_t kind);

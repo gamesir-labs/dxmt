@@ -204,10 +204,12 @@ struct BufferGpuVirtualAddressRange {
   UINT64 size = 0;
   D3D12_GPU_VIRTUAL_ADDRESS prefix_max_last_address = 0;
   Resource *resource = nullptr;
+  uint64_t activation_serial = 0;
 };
 
 std::mutex g_buffer_va_mutex;
 std::vector<BufferGpuVirtualAddressRange> g_buffer_va_ranges;
+uint64_t g_buffer_va_activation_serial = 0;
 
 bool ShouldLogRepeatedGpuVaWarning(std::atomic<uint32_t> &counter) {
   const uint32_t count = counter.fetch_add(1, std::memory_order_relaxed);
@@ -292,7 +294,7 @@ void RegisterBufferGpuVirtualAddress(Resource *resource,
          const BufferGpuVirtualAddressRange &range) {
         return address < range.base;
       });
-  g_buffer_va_ranges.insert(insertion, {base, size, 0, resource});
+  g_buffer_va_ranges.insert(insertion, {base, size, 0, resource, 0});
   RefreshBufferGpuVirtualAddressPrefixMax();
 }
 
@@ -891,6 +893,7 @@ public:
       }
       CreateTexture();
     }
+    RegisterLifetimeResidency();
   }
 
   ~ResourceImpl() {
@@ -901,6 +904,7 @@ public:
     LogReservedTextureFaultDiagnostic("destroy", nullptr);
     CancelReservedTextureMaterialization();
     UnregisterBufferGpuVirtualAddress(this);
+    UnregisterLifetimeResidency();
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -1252,6 +1256,10 @@ public:
     return descriptor_identity_;
   }
 
+  bool HasLifetimeResidency() const override {
+    return !lifetime_residency_allocations_.empty();
+  }
+
   uint64_t GetTileMappingGeneration() const override {
     return tile_mapping_generation_.load(std::memory_order_relaxed);
   }
@@ -1501,6 +1509,34 @@ private:
     return backing_plane < plane_allocations_.size()
                ? plane_allocations_[backing_plane]
                : nullptr;
+  }
+
+  void RegisterLifetimeResidency() {
+    auto &queue = device_->GetDXMTDevice().queue();
+    const auto register_allocation = [&](WMT::Resource allocation) {
+      if (!allocation)
+        return;
+      for (const auto &registered : lifetime_residency_allocations_) {
+        if (registered.handle == allocation.handle)
+          return;
+      }
+      queue.AddPersistentResidency(allocation);
+      lifetime_residency_allocations_.emplace_back(allocation);
+    };
+    if (buffer_allocation_)
+      register_allocation(
+          WMT::Resource{buffer_allocation_->buffer().handle});
+    for (const auto &allocation : plane_allocations_) {
+      if (allocation)
+        register_allocation(WMT::Resource{allocation->texture().handle});
+    }
+  }
+
+  void UnregisterLifetimeResidency() {
+    auto &queue = device_->GetDXMTDevice().queue();
+    for (auto &allocation : lifetime_residency_allocations_)
+      queue.RemovePersistentResidencyAfterCompletion(allocation);
+    lifetime_residency_allocations_.clear();
   }
 
   HRESULT WriteTextureSubresource(UINT dst_sub_resource,
@@ -2507,6 +2543,8 @@ private:
   Rc<dxmt::TextureAllocation> texture_allocation_;
   std::array<Rc<dxmt::Texture>, kMaxTexturePlanes> plane_textures_{};
   std::array<Rc<dxmt::TextureAllocation>, kMaxTexturePlanes> plane_allocations_{};
+  std::vector<WMT::Reference<WMT::Resource>>
+      lifetime_residency_allocations_;
   Flags<dxmt::TextureAllocationFlag> reserved_texture_allocation_flags_;
   dxmt::mutex materialization_mutex_;
   dxmt::condition_variable materialization_cond_;
@@ -2647,6 +2685,7 @@ LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                                         UINT64 *offset) {
   std::lock_guard lock(g_buffer_va_mutex);
   const BufferGpuVirtualAddressRange *best = nullptr;
+  uint64_t best_activation_serial = 0;
   UINT64 best_size = 0;
   UINT64 best_remaining = 0;
   auto it = std::upper_bound(
@@ -2665,9 +2704,12 @@ LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
 
     const auto remaining =
         BufferGpuVirtualAddressRangeRemaining(range, address);
-    if (!best || range.size < best_size ||
-        (range.size == best_size && remaining < best_remaining)) {
+    if (!best || range.activation_serial > best_activation_serial ||
+        (range.activation_serial == best_activation_serial &&
+         (range.size < best_size ||
+          (range.size == best_size && remaining < best_remaining)))) {
       best = &range;
+      best_activation_serial = range.activation_serial;
       best_size = range.size;
       best_remaining = remaining;
     }
@@ -2679,6 +2721,20 @@ LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
   if (offset)
     *offset = address - best->base;
   return best->resource;
+}
+
+void
+ActivateBufferGpuVirtualAddress(Resource *resource) {
+  if (!resource || !resource->GetGpuVirtualAddress())
+    return;
+
+  std::lock_guard lock(g_buffer_va_mutex);
+  for (auto &range : g_buffer_va_ranges) {
+    if (range.resource == resource) {
+      range.activation_serial = ++g_buffer_va_activation_serial;
+      return;
+    }
+  }
 }
 
 bool
