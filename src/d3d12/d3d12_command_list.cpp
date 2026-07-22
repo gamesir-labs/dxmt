@@ -2596,16 +2596,125 @@ static bool CanMergeCompiledEncoderNodes(
                                              next.render_state);
 }
 
-static bool CompiledBarrierResourceMatchesAttachments(
-    ID3D12Resource *resource, const CompiledCommandRenderState &render_state) {
-  if (!resource)
+static bool CompiledTransitionMatchesAttachment(
+    const StoredResourceBarrier &stored, const DescriptorRecord &attachment) {
+  auto *resource = stored.resource.ptr();
+  if (!resource || attachment.resource.ptr() != resource)
+    return false;
+  const UINT subresource = stored.barrier.Transition.Subresource;
+  if (subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
+      !attachment.has_desc)
+    return true;
+
+  const auto desc = resource->GetDesc();
+  const UINT mip_levels = std::max<UINT>(1, desc.MipLevels);
+  const UINT array_size =
+      desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+          ? 1
+          : std::max<UINT>(1, desc.DepthOrArraySize);
+  const UINT subresources_per_plane = mip_levels * array_size;
+  if (!subresources_per_plane)
+    return true;
+  const UINT plane = subresource / subresources_per_plane;
+  const UINT plane_subresource = subresource % subresources_per_plane;
+  const UINT array_slice = plane_subresource / mip_levels;
+  const UINT mip = plane_subresource % mip_levels;
+
+  UINT attachment_mip = 0;
+  UINT first_array_slice = 0;
+  UINT array_slice_count = 1;
+  UINT attachment_plane = 0;
+  bool has_exact_plane = false;
+  if (attachment.type == DescriptorRecordType::RenderTargetView) {
+    const auto &rtv = attachment.desc.rtv;
+    switch (rtv.ViewDimension) {
+    case D3D12_RTV_DIMENSION_TEXTURE1D:
+      attachment_mip = rtv.Texture1D.MipSlice;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+      attachment_mip = rtv.Texture1DArray.MipSlice;
+      first_array_slice = rtv.Texture1DArray.FirstArraySlice;
+      array_slice_count = rtv.Texture1DArray.ArraySize;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2D:
+      attachment_mip = rtv.Texture2D.MipSlice;
+      attachment_plane = rtv.Texture2D.PlaneSlice;
+      has_exact_plane = true;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+      attachment_mip = rtv.Texture2DArray.MipSlice;
+      first_array_slice = rtv.Texture2DArray.FirstArraySlice;
+      array_slice_count = rtv.Texture2DArray.ArraySize;
+      attachment_plane = rtv.Texture2DArray.PlaneSlice;
+      has_exact_plane = true;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2DMS:
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+      first_array_slice = rtv.Texture2DMSArray.FirstArraySlice;
+      array_slice_count = rtv.Texture2DMSArray.ArraySize;
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE3D:
+      attachment_mip = rtv.Texture3D.MipSlice;
+      break;
+    default:
+      return true;
+    }
+  } else if (attachment.type == DescriptorRecordType::DepthStencilView) {
+    const auto &dsv = attachment.desc.dsv;
+    switch (dsv.ViewDimension) {
+    case D3D12_DSV_DIMENSION_TEXTURE1D:
+      attachment_mip = dsv.Texture1D.MipSlice;
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+      attachment_mip = dsv.Texture1DArray.MipSlice;
+      first_array_slice = dsv.Texture1DArray.FirstArraySlice;
+      array_slice_count = dsv.Texture1DArray.ArraySize;
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2D:
+      attachment_mip = dsv.Texture2D.MipSlice;
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+      attachment_mip = dsv.Texture2DArray.MipSlice;
+      first_array_slice = dsv.Texture2DArray.FirstArraySlice;
+      array_slice_count = dsv.Texture2DArray.ArraySize;
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2DMS:
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+      first_array_slice = dsv.Texture2DMSArray.FirstArraySlice;
+      array_slice_count = dsv.Texture2DMSArray.ArraySize;
+      break;
+    default:
+      return true;
+    }
+  } else {
+    return true;
+  }
+
+  return mip == attachment_mip &&
+         array_slice >= first_array_slice &&
+         array_slice - first_array_slice < array_slice_count &&
+         (!has_exact_plane || plane == attachment_plane);
+}
+
+static bool CompiledBarrierMatchesAttachments(
+    const StoredResourceBarrier &stored,
+    const CompiledCommandRenderState &render_state) {
+  if (!stored.resource)
     return false;
   for (const auto &target : render_state.render_targets) {
-    if (target.resource.ptr() == resource)
+    if (stored.barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+            ? CompiledTransitionMatchesAttachment(stored, target)
+            : target.resource.ptr() == stored.resource.ptr())
       return true;
   }
   return render_state.depth_stencil &&
-         render_state.depth_stencil->resource.ptr() == resource;
+         (stored.barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+              ? CompiledTransitionMatchesAttachment(
+                    stored, *render_state.depth_stencil)
+              : render_state.depth_stencil->resource.ptr() ==
+                    stored.resource.ptr());
 }
 
 static bool CompiledBarrierCanInlineIntoEncoder(
@@ -2628,8 +2737,7 @@ static bool CompiledBarrierCanInlineIntoEncoder(
       if (!stored.resource)
         return false;
       if (encoder_kind == CompiledEncoderKind::Graphics && render_state &&
-          CompiledBarrierResourceMatchesAttachments(stored.resource.ptr(),
-                                                   *render_state))
+          CompiledBarrierMatchesAttachments(stored, *render_state))
         return false;
       break;
     case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:

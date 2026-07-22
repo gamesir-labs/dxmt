@@ -410,6 +410,69 @@ TEST_F(CompiledGenerationSpec,
             2u);
 }
 
+TEST_F(CompiledGenerationSpec,
+       KeepsGraphicsEncoderWhenBarrierTouchesDifferentMip) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto pixel = dxmt::test::CompileShader(
+      "float4 main() : SV_Target { return float4(1, 1, 1, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  auto pipeline = context_.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+      {pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+  auto target = context_.CreateTexture2D(
+      8, 8, 2, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                            false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  rtv_desc.Texture2D.MipSlice = 0;
+  context_.device()->CreateRenderTargetView(target.get(), &rtv_desc, rtv);
+
+  EnableStats(context_.list());
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, 8, 8, 0, 1};
+  const D3D12_RECT scissor = {0, 0, 8, 8};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = target.get();
+  barrier.Transition.Subresource = 1;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  context_.list()->ResourceBarrier(1, &barrier);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  context_.list()->ResourceBarrier(1, &barrier);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  const auto stats = ReadStats(context_.list());
+  EXPECT_EQ(stats.encoder_graph_node_count, 4u);
+  EXPECT_EQ(stats.encoder_group_count, 1u);
+  EXPECT_EQ(stats.graphics_encoder_node_count, 1u);
+  EXPECT_EQ(stats.encoder_inlined_barrier_nodes, 2u);
+
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  EXPECT_EQ(ReadStats(context_.list()).encoder_attachment_materializations,
+            1u);
+}
+
 TEST_F(CompiledGenerationSpec, ClosesIndependentListsConcurrentlyWithoutLock) {
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   auto root_signature = context_.CreateRootSignature(root_desc);
