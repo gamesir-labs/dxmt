@@ -8,6 +8,7 @@
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -16,6 +17,8 @@
 
 namespace dxmt::d3d12 {
 namespace {
+
+std::atomic<uint64_t> g_root_signature_cache_identity = 1;
 
 constexpr uint32_t kRts0FourCC = dxil::MakeFourCC('R', 'T', 'S', '0');
 constexpr uint32_t kDxbcFourCC = dxil::MakeFourCC('D', 'X', 'B', 'C');
@@ -1077,8 +1080,12 @@ class RootSignatureImpl final : public ComObjectWithInitialRef<ID3D12RootSignatu
 public:
   RootSignatureImpl(IMTLD3D12Device *device, RootSignatureStorage &&storage,
                     std::vector<std::byte> &&serialized_blob)
-      : device_(device), storage_(std::move(storage)),
+      : cache_identity_(g_root_signature_cache_identity.fetch_add(
+            1, std::memory_order_relaxed)),
+        device_(device), storage_(std::move(storage)),
         serialized_blob_(std::move(serialized_blob)) {}
+
+  uint64_t GetCacheIdentity() const override { return cache_identity_; }
 
   ULONG STDMETHODCALLTYPE AddRefPrivate() override {
     ComObjectWithInitialRef<ID3D12RootSignature>::AddRefPrivate();
@@ -1154,6 +1161,7 @@ public:
   }
 
 private:
+  const uint64_t cache_identity_;
   Com<IMTLD3D12Device> device_;
   RootSignatureStorage storage_;
   std::vector<std::byte> serialized_blob_;

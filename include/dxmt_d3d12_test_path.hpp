@@ -14,13 +14,17 @@ enum class ExecutionPathMode : std::uint32_t {
   // ExecutionPathStats.
   Auto = 0,
   // Every compilable Draw/DrawIndexed/Dispatch record must select a compiled
-  // packet at Close. Non-packet records (copy, barrier, query, and similar)
-  // retain their ordinary range replay, and a queue-time packet fallback is
-  // reported by native_requirement_satisfied == 0 after completion.
+  // packet at Close. Copy, barrier, query, and similar commands select typed
+  // nodes, and a queue-time compatibility packet is reported by
+  // native_requirement_satisfied == 0 after completion.
   NativeCompiled = 1,
-  // Bypass packet construction, native descriptor materialization, and
-  // payload finalization; replay the complete record stream as fallback.
-  Fallback = 2,
+  // Compile every command into the compatibility node path. This exercises
+  // the shared typed encoders without retaining the removed production
+  // record-stream interpreter.
+  CompatibilityCompiled = 2,
+  // Source compatibility for older tests; the runtime semantics are now
+  // CompatibilityCompiled rather than legacy record replay.
+  Fallback = CompatibilityCompiled,
 };
 
 enum ExecutionPathFlags : std::uint32_t {
@@ -36,6 +40,7 @@ enum class ExecutionPathSegmentKind : std::uint32_t {
   Graphics = 0,
   Compute = 1,
   Fallback = 2,
+  Typed = 3,
 };
 
 inline constexpr std::uint32_t kExecutionPathMaxTracedSegments = 64;
@@ -92,6 +97,12 @@ struct ExecutionPathStats {
   std::uint32_t compiled_barrier_ranges = 0;
   std::uint32_t compiled_barriers = 0;
   std::uint32_t compiled_resource_state_deltas = 0;
+  std::uint32_t selected_typed_nodes = 0;
+  std::uint32_t replayed_compatibility_packets = 0;
+  std::uint32_t legacy_replay_records = 0;
+  std::uint32_t submitted_descriptor_span_lookups = 0;
+  std::uint32_t submitted_unique_descriptor_spans = 0;
+  std::uint32_t submitted_descriptor_span_reuses = 0;
   // segment_count always reports the complete count. traced_segment_count is
   // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
   // builder order and make N/F boundary topology directly testable.

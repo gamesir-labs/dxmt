@@ -40,6 +40,8 @@
 
 namespace dxmt::d3d12 {
 
+static std::atomic<uint64_t> g_pipeline_state_cache_identity = 1;
+
 struct PipelineNativeArtifact {
   explicit PipelineNativeArtifact(PipelineStateType pipeline_type)
       : type(pipeline_type) {}
@@ -4377,7 +4379,9 @@ public:
                     std::string &&shader_cache_key,
                     PipelineGraphicsState &&graphics_state,
                     PipelineComputeState &&compute_state)
-      : device_(device), type_(type),
+      : cache_identity_(g_pipeline_state_cache_identity.fetch_add(
+            1, std::memory_order_relaxed)),
+        device_(device), type_(type),
         public_root_signature_(root_signature),
         root_signature_(GetDXMTRootSignature(root_signature)),
         shaders_(std::move(shaders)),
@@ -4489,6 +4493,8 @@ public:
   IMTLD3D12Device *GetParentDevice() const override {
     return device_.ptr();
   }
+
+  uint64_t GetCacheIdentity() const override { return cache_identity_; }
 
   PipelineStateType GetType() const override {
     return type_;
@@ -4623,6 +4629,7 @@ public:
   }
 
 private:
+  const uint64_t cache_identity_;
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
   Com<ID3D12RootSignature> public_root_signature_;

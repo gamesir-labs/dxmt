@@ -46,6 +46,8 @@ const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind) {
     return "compute";
   case CompiledCommandSegmentKind::Indirect:
     return "indirect";
+  case CompiledCommandSegmentKind::Typed:
+    return "typed";
   case CompiledCommandSegmentKind::Fallback:
     return "fallback";
   }
@@ -1664,35 +1666,6 @@ BuildCompiledIndirectPacket(const CommandRecord &record, UINT record_index,
   return packet;
 }
 
-static CompiledCommandFallbackReason
-FallbackReasonForCommandRecord(const CommandRecordPayload &payload) {
-  if (std::holds_alternative<CopyBufferRegionRecord>(payload) ||
-      std::holds_alternative<CopyTextureRegionRecord>(payload))
-    return CompiledCommandFallbackReason::SnapshotDependent;
-  if (std::holds_alternative<CopyResourceRecord>(payload) ||
-      std::holds_alternative<CopyTilesRecord>(payload) ||
-      std::holds_alternative<ResolveSubresourceRecord>(payload))
-    return CompiledCommandFallbackReason::CopyOrResolve;
-  if (std::holds_alternative<ResourceBarrierRecord>(payload))
-    return CompiledCommandFallbackReason::UnsupportedBarrier;
-  if (std::holds_alternative<ClearRenderTargetRecord>(payload) ||
-      std::holds_alternative<ClearDepthStencilRecord>(payload) ||
-      std::holds_alternative<ClearUnorderedAccessRecord>(payload) ||
-      std::holds_alternative<DiscardResourceRecord>(payload))
-    return CompiledCommandFallbackReason::ClearOrDiscard;
-  if (std::holds_alternative<BeginQueryRecord>(payload) ||
-      std::holds_alternative<EndQueryRecord>(payload) ||
-      std::holds_alternative<ResolveQueryDataRecord>(payload) ||
-      std::holds_alternative<PredicationRecord>(payload) ||
-      std::holds_alternative<WriteBufferImmediateRecord>(payload))
-    return CompiledCommandFallbackReason::QueryOrPredication;
-  if (std::holds_alternative<ExecuteIndirectRecord>(payload))
-    return CompiledCommandFallbackReason::NativeUnsupportedExecuteIndirect;
-  if (std::holds_alternative<TemporalUpscaleRecord>(payload))
-    return CompiledCommandFallbackReason::TemporalUpscale;
-  return CompiledCommandFallbackReason::ConservativeCompiler;
-}
-
 static void
 AppendCompiledFallbackSegment(
     std::vector<CompiledCommandSegment> &segments,
@@ -1716,6 +1689,30 @@ AppendCompiledFallbackSegment(
   segment.record_count = 1;
   segment.fallback_reason = reason;
   segment.perf_fallback_reason = CompiledCommandFallbackReasonToPerf(reason);
+  if (segments.size() == segments.capacity())
+    unexpected_container_growths++;
+  segments.push_back(segment);
+}
+
+static void
+AppendCompiledTypedSegment(std::vector<CompiledCommandSegment> &segments,
+                           UINT &unexpected_container_growths,
+                           UINT record_index) {
+  if (!segments.empty()) {
+    auto &last = segments.back();
+    if (last.kind == CompiledCommandSegmentKind::Typed &&
+        last.first_record_index + last.record_count == record_index) {
+      last.record_count++;
+      return;
+    }
+  }
+
+  dxmt::perf::ScopedCodeTimer append_timer(
+      dxmt::PerfCodePath::CompiledBuildSegmentAppend);
+  CompiledCommandSegment segment = {};
+  segment.kind = CompiledCommandSegmentKind::Typed;
+  segment.first_record_index = record_index;
+  segment.record_count = 1;
   if (segments.size() == segments.capacity())
     unexpected_container_growths++;
   segments.push_back(segment);
@@ -2008,7 +2005,7 @@ static void FinalizeCompiledStorageAllocationEvents(
 
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
-                         WMT::Device device, bool force_fallback,
+                         WMT::Device device, bool force_compatibility,
                          UINT graphics_packet_count,
                          UINT compute_packet_count,
                          UINT barrier_record_count,
@@ -2040,16 +2037,16 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   auto &indirect_packets = compiled->indirect_packets.mutableView();
   CompiledAccessSummaryBuilder access_summary_builder(barrier_record_count,
                                                       barrier_count);
-  if (force_fallback) {
+  if (force_compatibility) {
     for (UINT record_index = 0; record_index < records.size(); ++record_index) {
       if (records[record_index].compile_kind ==
           CommandRecordCompileKind::Barrier)
         access_summary_builder.Append(
             record_index,
             std::get<ResourceBarrierRecord>(records[record_index].payload));
-      AppendCompiledFallbackSegment(
-          segments, compiled->unexpected_container_growths, record_index,
-          CompiledCommandFallbackReason::ConservativeCompiler);
+      AppendCompiledTypedSegment(segments,
+                                 compiled->unexpected_container_growths,
+                                 record_index);
     }
     compiled->access_summary = access_summary_builder.Finish();
     FinalizeCompiledStorageAllocationEvents(*compiled,
@@ -2109,11 +2106,6 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
           ClearCompiledInputAssemblerDirtyState(state);
           ClearCompiledStateDelta(state, false);
         }
-      } else if (reason ==
-                 CompiledCommandFallbackReason::QueryOrPredication) {
-        AppendCompiledFallbackSegment(
-            segments, compiled->unexpected_container_growths, record_index,
-            reason);
       } else {
         CompiledGraphicsPacket packet;
         {
@@ -2168,11 +2160,6 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
               std::move(packet));
           ClearCompiledStateDelta(state, true);
         }
-      } else if (reason ==
-                 CompiledCommandFallbackReason::QueryOrPredication) {
-        AppendCompiledFallbackSegment(
-            segments, compiled->unexpected_container_growths, record_index,
-            reason);
       } else {
         CompiledComputePacket packet;
         {
@@ -2207,9 +2194,9 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
         ClearCompiledStateDelta(state, false);
       }
     } else {
-      AppendCompiledFallbackSegment(
-          segments, compiled->unexpected_container_growths, record_index,
-          FallbackReasonForCommandRecord(record.payload));
+      AppendCompiledTypedSegment(segments,
+                                 compiled->unexpected_container_growths,
+                                 record_index);
     }
     {
       dxmt::perf::ScopedCodeTimer state_timer(
@@ -2592,6 +2579,9 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         // the graphics/compute distinction for mixed indirect segments.
         kind = ExecutionPathSegmentKind::Graphics;
         break;
+      case CompiledCommandSegmentKind::Typed:
+        kind = ExecutionPathSegmentKind::Typed;
+        break;
       case CompiledCommandSegmentKind::Fallback:
       default:
         kind = ExecutionPathSegmentKind::Fallback;
@@ -2637,6 +2627,9 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         stats.selected_compute_packets += compute_packets;
       }
       break;
+    case CompiledCommandSegmentKind::Typed:
+      stats.selected_typed_nodes += segment.record_count;
+      break;
     case CompiledCommandSegmentKind::Fallback:
     default:
       stats.fallback_segments++;
@@ -2656,6 +2649,9 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
     stats.replayed_compiled_packet_fallbacks =
         telemetry.replayed_compiled_packet_fallbacks.load(
             std::memory_order_acquire);
+    stats.replayed_compatibility_packets =
+        stats.replayed_compiled_packet_fallbacks;
+    stats.legacy_replay_records = stats.replayed_fallback_records;
     if (compiled.test_path_mode ==
             dxmt::d3d12::test::ExecutionPathMode::NativeCompiled &&
         stats.replayed_compiled_packet_fallbacks)
@@ -2685,6 +2681,15 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
             std::memory_order_acquire);
     stats.submitted_descriptor_record_reuses =
         telemetry.submitted_descriptor_record_reuses.load(
+            std::memory_order_acquire);
+    stats.submitted_descriptor_span_lookups =
+        telemetry.submitted_descriptor_span_lookups.load(
+            std::memory_order_acquire);
+    stats.submitted_unique_descriptor_spans =
+        telemetry.submitted_unique_descriptor_spans.load(
+            std::memory_order_acquire);
+    stats.submitted_descriptor_span_reuses =
+        telemetry.submitted_descriptor_span_reuses.load(
             std::memory_order_acquire);
     stats.submitted_generation_shares =
         telemetry.submitted_generation_shares.load(std::memory_order_acquire);
@@ -2953,12 +2958,12 @@ public:
     if (!recording_error_) {
       dxmt::perf::ScopedCodeTimer build_timer(
           dxmt::PerfCodePath::CommandListCloseBuildCompiled);
-      const bool force_fallback =
+      const bool force_compatibility =
           test_path_configured_ &&
           test_path_config_.mode ==
-              dxmt::d3d12::test::ExecutionPathMode::Fallback;
+              dxmt::d3d12::test::ExecutionPathMode::CompatibilityCompiled;
       auto compiled = BuildCompiledCommandList(
-          records_, device_->GetMTLDevice(), force_fallback,
+          records_, device_->GetMTLDevice(), force_compatibility,
           recorded_graphics_packet_count_, recorded_compute_packet_count_,
           recorded_barrier_record_count_, recorded_barrier_count_);
       if (test_path_configured_) {
@@ -2968,12 +2973,14 @@ public:
             !compiled->test_native_requirement_satisfied)
           recording_error_ = E_FAIL;
       }
-      compiled_commands_ = std::move(compiled);
-      // Publish the recorded stream as the immutable generation owned by this
-      // Close. Execute can retain it in O(1), while Reset immediately starts a
-      // fresh recording vector without copying the variant-heavy record set.
-      closed_records_ = std::make_shared<const std::vector<CommandRecord>>(
+      auto typed_nodes = std::make_shared<const std::vector<CommandRecord>>(
           std::move(records_));
+      compiled->typed_nodes = typed_nodes;
+      compiled_commands_ = std::move(compiled);
+      // Bundle expansion shares the typed Close generation. The queue retains
+      // it through CompiledCommandList and no longer carries a second raw
+      // command-record generation in pending operations.
+      closed_records_ = std::move(typed_nodes);
     }
     closed_ = true;
     if (allocator_) {

@@ -1969,7 +1969,7 @@ IsSupportedQueueFlags(D3D12_COMMAND_QUEUE_FLAGS flags) {
 // the replay hot path. Under Rosetta x86 translation each dynamic_cast walks
 // the RTTI tree (__dynamic_cast) and is a prime constant-factor-tax suspect.
 // File-scope thread_local so the free GetResource/GetPipelineState helpers can
-// bump it; reset at ReplayCommandRecords start, read in the breakdown dump.
+// bump it; reset at compiled-node execution start, read in the breakdown dump.
 struct ReplayRttiCounters {
   uint64_t getResource = 0;
   uint64_t getPipeline = 0;
@@ -4958,7 +4958,6 @@ public:
           dxmt::PerfCodePath::QueueExecuteCollect);
       for (auto *state : validated_lists) {
         if (SUCCEEDED(state->MarkSubmittedToQueue(desc_.Type, op.allocator_uses))) {
-          op.command_records.emplace_back(state->GetCommandRecordGeneration());
           auto compiled = state->GetCompiledCommands();
           if (compiled) {
             if (compiled->test_telemetry) {
@@ -5004,13 +5003,13 @@ public:
         clock::now() - perf_mark);
     perf_mark = clock::now();
 
-    if (!op.command_records.empty()) {
+    if (!op.submitted_command_lists.empty()) {
       static std::atomic<uint32_t> log_count = 0;
       if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
         WARN_FILE_ONLY("D3D12 queue diagnostic: enqueue execute"
              " queue=", reinterpret_cast<uintptr_t>(this),
              " queueType=", desc_.Type,
-             " records=", op.command_records.size(),
+             " commandLists=", op.submitted_command_lists.size(),
              " allocatorUses=", op.allocator_uses.size());
       }
       EnqueuePendingOperation(std::move(op), perf_stats);
@@ -8492,7 +8491,7 @@ private:
     // the per-pass/per-barrier fixed cost that dominates replay (decoupled from
     // draw count). Times accumulate across the WHOLE replay regardless of where
     // the flush was triggered (Clear/Copy/Resolve in the record loop, or the
-    // tail flush). Reset per ReplayCommandRecords, dumped in the breakdown line.
+    // tail flush). Reset per compiled-node stream, dumped in the breakdown line.
     uint64_t flushBlitUs = 0, flushComputeUs = 0, flushGraphicsUs = 0,
              flushBarrierUs = 0, emitTsMarkersUs = 0, buildPlanUs = 0;
     uint64_t flushBlitCalls = 0, flushComputeCalls = 0, flushGraphicsCalls = 0,
@@ -9424,6 +9423,9 @@ private:
           std::make_shared<SubmittedNativeDescriptorSpanStore>();
     const auto records_before = descriptor_records->records.size();
     const auto reuses_before = descriptor_records->reuse_count;
+    const auto span_lookups_before = native_span_store->lookup_count;
+    const auto spans_before = native_span_store->spans.size();
+    const auto span_reuses_before = native_span_store->reuse_count;
     auto snapshot_arena = std::make_shared<SubmittedBindingSnapshotArena>();
     snapshot_arena->snapshots.reserve(compiled.graphics_packets.size() +
                                       compiled.compute_packets.size());
@@ -9608,6 +9610,15 @@ private:
       compiled.test_telemetry->submitted_descriptor_record_reuses.fetch_add(
           descriptor_records->reuse_count - reuses_before,
           std::memory_order_relaxed);
+      compiled.test_telemetry->submitted_descriptor_span_lookups.fetch_add(
+          native_span_store->lookup_count - span_lookups_before,
+          std::memory_order_relaxed);
+      compiled.test_telemetry->submitted_unique_descriptor_spans.fetch_add(
+          static_cast<UINT>(native_span_store->spans.size() - spans_before),
+          std::memory_order_relaxed);
+      compiled.test_telemetry->submitted_descriptor_span_reuses.fetch_add(
+          native_span_store->reuse_count - span_reuses_before,
+          std::memory_order_relaxed);
     }
     return snapshots;
   }
@@ -9789,7 +9800,7 @@ private:
     return on;
   }
 
-  void ReplayCommandRecords(const std::vector<CommandRecord> &records,
+  void ExecuteCompiledCommandList(
                             const SubmittedCompiledCommandListPlan *submitted,
                             const CompiledCommandDescriptorSnapshots
                                 *submitted_descriptor_snapshots,
@@ -9801,6 +9812,9 @@ private:
     const CompiledCommandList *compiled =
         submitted && submitted->generation ? submitted->generation.get()
                                             : nullptr;
+    if (!compiled || !compiled->typed_nodes)
+      return;
+    const auto &records = *compiled->typed_nodes;
     ReplayState state = {};
     state.pending_resource_barriers =
         std::move(queue_pending_barriers);
@@ -9810,7 +9824,7 @@ private:
     state.touched_resources_set = &touched_resources_set;
     static std::atomic<uint32_t> replay_log_count = 0;
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN_FILE_ONLY("D3D12 queue diagnostic: replay records begin"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: execute compiled nodes begin"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " records=", records.size());
@@ -10585,6 +10599,7 @@ private:
 
     std::vector<UINT> deferred_state_records;
     deferred_state_records.reserve(256);
+    bool deferred_state_is_fallback = false;
     auto flush_deferred_state = [&](dxmt::CompiledFallbackReason reason) {
       if (deferred_state_records.empty())
         return;
@@ -10598,29 +10613,33 @@ private:
         replay_one(records[index]);
         replayed++;
       }
-      if (replayed && test_telemetry) {
+      if (replayed && deferred_state_is_fallback && test_telemetry) {
         test_telemetry->replayed_fallback_ranges.fetch_add(
             1, std::memory_order_relaxed);
         test_telemetry->replayed_fallback_records.fetch_add(
             replayed, std::memory_order_relaxed);
       }
       deferred_state_records.clear();
+      deferred_state_is_fallback = false;
       state.compiled_fallback_reason = previous_reason;
     };
     auto replay_compatibility_range =
-        [&](UINT begin, UINT count, dxmt::CompiledFallbackReason reason) {
+        [&](UINT begin, UINT count, dxmt::CompiledFallbackReason reason,
+            bool legacy_fallback) {
           const UINT end = std::min<UINT>(begin + count, records.size());
           const auto previous_reason = state.compiled_fallback_reason;
           state.compiled_fallback_reason = reason;
           for (UINT index = begin; index < end; ++index) {
             if (IsDeferrableCompiledStateRecord(records[index])) {
               deferred_state_records.push_back(index);
+              deferred_state_is_fallback |= legacy_fallback;
               continue;
             }
             if (FallbackRecordNeedsBindingState(records[index]))
               flush_deferred_state(reason);
             record_index = index;
-            record_fallback_range(index, 1, reason);
+            if (legacy_fallback)
+              record_fallback_range(index, 1, reason);
             replay_one(records[index]);
           }
           state.compiled_fallback_reason = previous_reason;
@@ -10764,6 +10783,7 @@ private:
               // it as the compatibility encoder input instead of replaying
               // every preceding setter merely to reconstruct the same state.
               deferred_state_records.clear();
+              deferred_state_is_fallback = false;
               apply_compiled_graphics_compatibility_state(packet);
               record_fallback_range(packet.record_index, 1, perf_reason);
               const auto previous_reason = state.compiled_fallback_reason;
@@ -10816,6 +10836,7 @@ private:
               const auto perf_reason =
                   CompiledCommandFallbackReasonToPerf(fallback_reason);
               deferred_state_records.clear();
+              deferred_state_is_fallback = false;
               apply_compiled_compute_compatibility_state(packet);
               record_fallback_range(packet.record_index, 1, perf_reason);
               const auto previous_reason = state.compiled_fallback_reason;
@@ -10869,11 +10890,17 @@ private:
             state.compiled_fallback_reason = previous_reason;
           }
           break;
+        case CompiledCommandSegmentKind::Typed:
+          replay_compatibility_range(segment.first_record_index,
+                                     segment.record_count,
+                                     dxmt::CompiledFallbackReason::Unknown,
+                                     false);
+          break;
         case CompiledCommandSegmentKind::Fallback:
         default:
           replay_compatibility_range(segment.first_record_index,
                                      segment.record_count,
-                                     segment.perf_fallback_reason);
+                                     segment.perf_fallback_reason, true);
           break;
         }
       }
@@ -10882,6 +10909,7 @@ private:
             dxmt::perf::currentFrameStatistics(),
             deferred_state_records.size());
         deferred_state_records.clear();
+        deferred_state_is_fallback = false;
       }
     } else {
       record_fallback_range(0, static_cast<UINT>(records.size()),
@@ -10890,7 +10918,7 @@ private:
                    dxmt::CompiledFallbackReason::MissingCompiledEncoder);
     }
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
-      WARN_FILE_ONLY("D3D12 queue diagnostic: replay records flush begin"
+      WARN_FILE_ONLY("D3D12 queue diagnostic: execute compiled nodes flush begin"
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " records=", records.size());
@@ -14653,6 +14681,10 @@ private:
   // (root_sig, PSO); only descriptor VALUES vary per draw. Cache the structure
   // and iterate it per draw instead of re-walking root sig + reflection.
   enum class BindingEntryKind : uint8_t { Table, RootBuffer };
+  // These plans are immutable functions of a root signature and pipeline.
+  // Stable object identities make cross-submit reuse ABA-safe; keep a bounded
+  // working set and evict one cold/arbitrary entry only when the cap is hit.
+  static constexpr size_t kSubmissionPlanCacheLimit = 16384;
   struct BindingPlanEntry {
     BindingEntryKind kind;
     PipelineStage stage;
@@ -14666,10 +14698,24 @@ private:
   };
   struct BindingPlan {
     bool compute = false;
-    const void *root_sig = nullptr;
-    const void *pso = nullptr;
+    uint64_t root_identity = 0;
+    uint64_t pipeline_identity = 0;
     std::vector<BindingPlanEntry> entries;
   };
+
+  static uint64_t HashSubmissionPlanIdentity(uint64_t root_identity,
+                                             uint64_t pipeline_identity,
+                                             PipelineStage stage,
+                                             bool compute) {
+    uint64_t key = root_identity * 0x9e3779b97f4a7c15ull;
+    key ^= pipeline_identity + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+    key ^= uint64_t(stage) + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+    key ^= uint64_t(compute) + 0x9e3779b97f4a7c15ull + (key << 6) +
+           (key >> 2);
+    return key;
+  }
 
   // P1: build the binding plan (cache-miss path). It pushes entries instead of
   // accessing descriptors; base handles, heaps and descriptor records remain
@@ -14678,8 +14724,8 @@ private:
                                bool compute) {
     BindingPlan plan;
     plan.compute = compute;
-    plan.root_sig = root;
-    plan.pso = &pipeline;
+    plan.root_identity = root->GetCacheIdentity();
+    plan.pipeline_identity = pipeline.GetCacheIdentity();
     const auto parameters = root->GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
@@ -14803,12 +14849,19 @@ private:
                          : state.graphics_root_signature_impl;
     if (!root)
       return;
-    const uint64_t key =
-        (uint64_t(reinterpret_cast<uintptr_t>(root)) * 0x9E3779B97F4A7C15ull) ^
-        uint64_t(reinterpret_cast<uintptr_t>(&pipeline));
+    const auto root_identity = root->GetCacheIdentity();
+    const auto pipeline_identity = pipeline.GetCacheIdentity();
+    const uint64_t key = HashSubmissionPlanIdentity(
+        root_identity, pipeline_identity,
+        compute ? PipelineStage::Compute : PipelineStage::Vertex, compute);
     auto it = binding_plan_cache_.find(key);
-    if (it == binding_plan_cache_.end() || it->second.root_sig != root ||
-        it->second.pso != &pipeline) {
+    if (it == binding_plan_cache_.end() ||
+        it->second.root_identity != root_identity ||
+        it->second.pipeline_identity != pipeline_identity ||
+        it->second.compute != compute) {
+      if (it == binding_plan_cache_.end() &&
+          binding_plan_cache_.size() >= kSubmissionPlanCacheLimit)
+        binding_plan_cache_.erase(binding_plan_cache_.begin());
       it = binding_plan_cache_
                .insert_or_assign(key, BuildBindingPlan(root, pipeline, compute))
                .first;
@@ -16353,8 +16406,8 @@ private:
   };
 
   struct BindlessMirrorStagePlan {
-    const void *root_sig = nullptr;
-    const void *pso = nullptr;
+    uint64_t root_identity = 0;
+    uint64_t pipeline_identity = 0;
     PipelineStage stage = PipelineStage::Vertex;
     bool compute = false;
     uint32_t max_key_plus_one = 0;
@@ -16380,8 +16433,8 @@ private:
   };
 
   struct NativeRootBaseStagePlan {
-    const void *root_sig = nullptr;
-    const void *pso = nullptr;
+    uint64_t root_identity = 0;
+    uint64_t pipeline_identity = 0;
     PipelineStage stage = PipelineStage::Vertex;
     bool compute = false;
     uint32_t max_resource_key_plus_one = 0;
@@ -17518,8 +17571,8 @@ private:
                                const RootSignature &root,
                                PipelineStage want_stage, bool compute) {
     BindlessMirrorStagePlan plan = {};
-    plan.root_sig = &root;
-    plan.pso = &pipeline;
+    plan.root_identity = root.GetCacheIdentity();
+    plan.pipeline_identity = pipeline.GetCacheIdentity();
     plan.stage = want_stage;
     plan.compute = compute;
 
@@ -17673,24 +17726,24 @@ private:
   GetBindlessMirrorStagePlan(const PipelineState &pipeline,
                              const RootSignature &root,
                              PipelineStage want_stage, bool compute) {
-    uint64_t key =
-        uint64_t(reinterpret_cast<uintptr_t>(&root)) * 0x9e3779b97f4a7c15ull;
-    key ^= uint64_t(reinterpret_cast<uintptr_t>(&pipeline)) +
-           0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
-    key ^= uint64_t(want_stage) + 0x9e3779b97f4a7c15ull + (key << 6) +
-           (key >> 2);
-    key ^= uint64_t(compute ? 1 : 0) + 0x9e3779b97f4a7c15ull + (key << 6) +
-           (key >> 2);
+    const auto root_identity = root.GetCacheIdentity();
+    const auto pipeline_identity = pipeline.GetCacheIdentity();
+    const uint64_t key = HashSubmissionPlanIdentity(
+        root_identity, pipeline_identity, want_stage, compute);
 
     std::lock_guard lock(bindless_stage_plan_cache_mutex_);
     auto it = bindless_stage_plan_cache_.find(key);
     if (it != bindless_stage_plan_cache_.end() && it->second &&
-        it->second->root_sig == &root && it->second->pso == &pipeline &&
+        it->second->root_identity == root_identity &&
+        it->second->pipeline_identity == pipeline_identity &&
         it->second->stage == want_stage && it->second->compute == compute)
       return it->second;
 
     auto plan = std::make_shared<BindlessMirrorStagePlan>(
         BuildBindlessMirrorStagePlan(pipeline, root, want_stage, compute));
+    if (it == bindless_stage_plan_cache_.end() &&
+        bindless_stage_plan_cache_.size() >= kSubmissionPlanCacheLimit)
+      bindless_stage_plan_cache_.erase(bindless_stage_plan_cache_.begin());
     bindless_stage_plan_cache_[key] = plan;
     return plan;
   }
@@ -17700,8 +17753,8 @@ private:
                                const RootSignature &root,
                                PipelineStage want_stage, bool compute) {
     NativeRootBaseStagePlan plan = {};
-    plan.root_sig = &root;
-    plan.pso = &pipeline;
+    plan.root_identity = root.GetCacheIdentity();
+    plan.pipeline_identity = pipeline.GetCacheIdentity();
     plan.stage = want_stage;
     plan.compute = compute;
 
@@ -17789,24 +17842,24 @@ private:
   GetNativeRootBaseStagePlan(const PipelineState &pipeline,
                              const RootSignature &root,
                              PipelineStage want_stage, bool compute) {
-    uint64_t key =
-        uint64_t(reinterpret_cast<uintptr_t>(&root)) * 0x9e3779b97f4a7c15ull;
-    key ^= uint64_t(reinterpret_cast<uintptr_t>(&pipeline)) +
-           0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
-    key ^= uint64_t(want_stage) + 0x9e3779b97f4a7c15ull + (key << 6) +
-           (key >> 2);
-    key ^= uint64_t(compute ? 1 : 0) + 0x9e3779b97f4a7c15ull + (key << 6) +
-           (key >> 2);
+    const auto root_identity = root.GetCacheIdentity();
+    const auto pipeline_identity = pipeline.GetCacheIdentity();
+    const uint64_t key = HashSubmissionPlanIdentity(
+        root_identity, pipeline_identity, want_stage, compute);
 
     std::lock_guard lock(native_stage_plan_cache_mutex_);
     auto it = native_stage_plan_cache_.find(key);
     if (it != native_stage_plan_cache_.end() && it->second &&
-        it->second->root_sig == &root && it->second->pso == &pipeline &&
+        it->second->root_identity == root_identity &&
+        it->second->pipeline_identity == pipeline_identity &&
         it->second->stage == want_stage && it->second->compute == compute)
       return it->second;
 
     auto plan = std::make_shared<NativeRootBaseStagePlan>(
         BuildNativeRootBaseStagePlan(pipeline, root, want_stage, compute));
+    if (it == native_stage_plan_cache_.end() &&
+        native_stage_plan_cache_.size() >= kSubmissionPlanCacheLimit)
+      native_stage_plan_cache_.erase(native_stage_plan_cache_.begin());
     native_stage_plan_cache_[key] = plan;
     return plan;
   }
@@ -25610,8 +25663,6 @@ private:
 
   struct PendingOperation {
     PendingOperationType type = PendingOperationType::Execute;
-    std::vector<std::shared_ptr<const std::vector<CommandRecord>>>
-        command_records;
     std::vector<std::shared_ptr<const SubmittedCompiledCommandListPlan>>
         submitted_command_lists;
     std::vector<CompiledCommandDescriptorSnapshots>
@@ -25629,7 +25680,6 @@ private:
     PendingOperation &operator=(const PendingOperation &) = delete;
     PendingOperation(PendingOperation &&other) noexcept
         : type(other.type),
-          command_records(std::move(other.command_records)),
           submitted_command_lists(std::move(other.submitted_command_lists)),
           compiled_descriptor_snapshots(
               std::move(other.compiled_descriptor_snapshots)),
@@ -25646,7 +25696,6 @@ private:
       if (this != &other) {
         ReleaseFence();
         type = other.type;
-        command_records = std::move(other.command_records);
         submitted_command_lists = std::move(other.submitted_command_lists);
         compiled_descriptor_snapshots =
             std::move(other.compiled_descriptor_snapshots);
@@ -25987,7 +26036,7 @@ private:
           WARN_FILE_ONLY("D3D12 queue diagnostic: drain execute"
                " queue=", reinterpret_cast<uintptr_t>(this),
                " queueType=", desc_.Type,
-               " records=", operation.command_records.size(),
+               " commandLists=", operation.submitted_command_lists.size(),
                " submittedBatchesBefore=", submitted_batches_.load(std::memory_order_relaxed));
         }
         lock_begin = clock::now();
@@ -25995,18 +26044,9 @@ private:
         // also acquired by swapchain resource-state invalidation, so the old
         // nested resource-state mutex serialized exactly the same critical
         // section a second time without protecting any additional access.
-        // P1: ABA-safe — clear the binding-plan cache once per Execute batch.
-        // Within a batch every referenced PSO/root-sig is pinned alive by the
-        // command records, so intra-batch (PSO*,root_sig*) reuse is safe.
-        binding_plan_cache_.clear();
-        {
-          std::lock_guard lock(bindless_stage_plan_cache_mutex_);
-          bindless_stage_plan_cache_.clear();
-        }
-        {
-          std::lock_guard lock(native_stage_plan_cache_mutex_);
-          native_stage_plan_cache_.clear();
-        }
+        // Immutable binding plans are keyed by monotonic root-signature and
+        // pipeline identities. They survive submit batches and are invalidated
+        // individually by identity replacement or bounded eviction.
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::DrainLock,
             clock::now() - lock_begin);
@@ -26015,20 +26055,17 @@ private:
         ResourceAccessBarrierBatch queue_pending_barriers =
             std::move(pending_queue_resource_barriers_);
         UINT command_list_index = 0;
-        for (const auto &record_generation : operation.command_records) {
-          if (!record_generation) {
-            command_list_index++;
-            continue;
-          }
-          const auto &records = *record_generation;
+        for (const auto &submitted_plan : operation.submitted_command_lists) {
           const SubmittedCompiledCommandListPlan *submitted =
-              command_list_index < operation.submitted_command_lists.size()
-                  ? operation.submitted_command_lists[command_list_index].get()
-                  : nullptr;
+              submitted_plan.get();
           const CompiledCommandList *compiled =
               submitted && submitted->generation
                   ? submitted->generation.get()
                   : nullptr;
+          const auto record_count =
+              compiled && compiled->typed_nodes
+                  ? compiled->typed_nodes->size()
+                  : 0;
           const CompiledCommandDescriptorSnapshots *descriptor_snapshots =
               command_list_index <
                       operation.compiled_descriptor_snapshots.size()
@@ -26041,16 +26078,17 @@ private:
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " listIndex=", command_list_index,
-                 " records=", records.size(),
+                 " records=", record_count,
                  " compiledSegments=", compiled ? compiled->segments.size() : 0,
                  " compiledGraphicsPackets=", compiled ? compiled->graphics_packets.size() : 0,
                  " compiledComputePackets=", compiled ? compiled->compute_packets.size() : 0,
                  " submittedBatchesBefore=", submitted_batches_.load(std::memory_order_relaxed));
           }
           const auto replay_begin = clock::now();
-          ReplayCommandRecords(records, submitted, descriptor_snapshots,
-                               touched_resources, touched_resources_set,
-                               queue_pending_barriers);
+          ExecuteCompiledCommandList(submitted, descriptor_snapshots,
+                                     touched_resources,
+                                     touched_resources_set,
+                                     queue_pending_barriers);
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Replay,
               clock::now() - replay_begin);
@@ -26059,7 +26097,7 @@ private:
                  " queue=", reinterpret_cast<uintptr_t>(this),
                  " queueType=", desc_.Type,
                  " listIndex=", command_list_index,
-                 " records=", records.size(),
+                 " records=", record_count,
                  " touchedResources=", touched_resources.size(),
                  " submittedBatchesBefore=", submitted_batches_.load(std::memory_order_relaxed));
           }
@@ -26377,9 +26415,8 @@ private:
   // across ExecuteCommandLists calls and consume them only when this queue
   // encodes a real render, compute, or blit pass.
   ResourceAccessBarrierBatch pending_queue_resource_barriers_;
-  // P1 binding-plan cache (Option A): keyed by (root_sig*,pso*) mixed hash,
-  // re-checked on hit; CLEARED once per Execute batch (intra-batch all PSOs/
-  // root-sigs are pinned alive by the command records, so no ABA within batch).
+  // Immutable binding-plan caches are keyed by monotonic root-signature and
+  // pipeline identities, making cross-Execute reuse safe from pointer ABA.
   std::unordered_map<uint64_t, BindingPlan> binding_plan_cache_;
   std::unordered_map<uint64_t, std::shared_ptr<const BindlessMirrorStagePlan>>
       bindless_stage_plan_cache_;

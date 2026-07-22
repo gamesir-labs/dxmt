@@ -31,6 +31,10 @@ class RootSignature {
 public:
   virtual ~RootSignature() = default;
 
+  // Monotonic per-process identity for caches whose entries can cross submit
+  // batches. Pointer addresses alone are not safe because COM objects may be
+  // destroyed and later allocated at the same address.
+  virtual uint64_t GetCacheIdentity() const = 0;
   virtual ULONG STDMETHODCALLTYPE AddRefPrivate() = 0;
   virtual void STDMETHODCALLTYPE ReleasePrivate() = 0;
   virtual IMTLD3D12Device *GetParentDevice() const = 0;

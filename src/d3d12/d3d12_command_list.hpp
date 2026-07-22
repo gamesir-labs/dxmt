@@ -320,6 +320,7 @@ enum class CompiledCommandSegmentKind {
   Graphics,
   Compute,
   Indirect,
+  Typed,
   Fallback,
 };
 
@@ -901,6 +902,9 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> submitted_unique_descriptor_snapshots = 0;
   std::atomic<UINT> submitted_unique_descriptor_records = 0;
   std::atomic<UINT> submitted_descriptor_record_reuses = 0;
+  std::atomic<UINT> submitted_descriptor_span_lookups = 0;
+  std::atomic<UINT> submitted_unique_descriptor_spans = 0;
+  std::atomic<UINT> submitted_descriptor_span_reuses = 0;
   std::atomic<UINT> submitted_generation_shares = 0;
   std::atomic<UINT> submitted_generation_deep_copies = 0;
 };
@@ -908,6 +912,10 @@ struct CompiledCommandTestTelemetry {
 struct CompiledCommandList {
   std::uint64_t generation = 0;
   UINT record_count = 0;
+  // Immutable typed node stream owned by the Close generation. Bundle
+  // expansion may share the same storage, but Execute never retains or scans
+  // a separate legacy command-record generation.
+  std::shared_ptr<const std::vector<CommandRecord>> typed_nodes;
   CompiledImmutableVector<CompiledCommandSegment> segments;
   CompiledImmutableVector<CompiledGraphicsPacket> graphics_packets;
   CompiledImmutableVector<CompiledComputePacket> compute_packets;

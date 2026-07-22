@@ -214,6 +214,10 @@ class PipelineState {
 public:
   virtual ~PipelineState() = default;
 
+  // Monotonic per-process identity used by immutable submission-plan caches.
+  // Unlike the object address it cannot be reused after destruction, so cache
+  // entries may safely outlive one ExecuteCommandLists batch.
+  virtual uint64_t GetCacheIdentity() const = 0;
   virtual IMTLD3D12Device *GetParentDevice() const = 0;
   virtual PipelineStateType GetType() const = 0;
   virtual ID3D12RootSignature *GetRootSignature() const = 0;
