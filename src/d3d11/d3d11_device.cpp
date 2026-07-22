@@ -1021,9 +1021,6 @@ public:
     if (!pResource)
       return E_INVALIDARG;
 
-    if (!ppUAView)
-      return S_FALSE;
-
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateUnorderedAccessView(pDesc, ppUAView);
   }
 
