@@ -2,6 +2,7 @@ d3d11_unit_sources = files(
   'device_spec.cpp',
   'capability_spec.cpp',
   'pipeline_spec.cpp',
+  'constant_buffer_range_binding_matrix_spec.cpp',
   'input_assembler_ops_spec.cpp',
   'resource_spec.cpp',
   'resource_min_lod_matrix_spec.cpp',
