@@ -31,8 +31,9 @@ const dxmt::test::LogicalCaseFamilyRegistration kSamplerStateDescCases(
      "create every valid combination of eight filters, four address modes "
      "per axis, and eight LOD/comparison profiles, query every descriptor "
      "field, and recreate the same description while the first object lives",
-     "GetDesc exactly returns the public creation description and recreating "
-     "an identical state returns the same COM interface",
+     "GetDesc returns the runtime-normalized public description, including "
+     "zeroed fields that do not affect the selected filter and address modes, "
+     "and recreating an identical state returns the same COM interface",
      "logical ID, selected-case count, filter/address/profile indexes, all "
      "expected and returned descriptor fields, object addresses, HRESULTs, "
      "failure phase, and exact replay argument"});
@@ -132,6 +133,21 @@ SamplerStateDescCase CaseForLogical(std::uint32_t logical) {
   return test_case;
 }
 
+D3D11_SAMPLER_DESC ExpectedDesc(const D3D11_SAMPLER_DESC &created) {
+  D3D11_SAMPLER_DESC expected = created;
+  if (!D3D11_DECODE_IS_ANISOTROPIC_FILTER(expected.Filter))
+    expected.MaxAnisotropy = 0;
+  if (!D3D11_DECODE_IS_COMPARISON_FILTER(expected.Filter))
+    expected.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  if (expected.AddressU != D3D11_TEXTURE_ADDRESS_BORDER &&
+      expected.AddressV != D3D11_TEXTURE_ADDRESS_BORDER &&
+      expected.AddressW != D3D11_TEXTURE_ADDRESS_BORDER) {
+    for (FLOAT &channel : expected.BorderColor)
+      channel = 0.0f;
+  }
+  return expected;
+}
+
 bool SamplerDescsEqual(const D3D11_SAMPLER_DESC &actual,
                        const D3D11_SAMPLER_DESC &expected) {
   if (actual.Filter != expected.Filter ||
@@ -178,6 +194,7 @@ TEST_F(D3D11SamplerStateDescMatrixSpec,
                  kSamplerStateDescCases.family().case_id_prefix);
   for (const std::uint32_t logical : selected_cases) {
     const SamplerStateDescCase test_case = CaseForLogical(logical);
+    const D3D11_SAMPLER_DESC expected = ExpectedDesc(test_case.desc);
     ComPtr<ID3D11SamplerState> state;
     ComPtr<ID3D11SamplerState> duplicate;
     const HRESULT create_result =
@@ -190,8 +207,8 @@ TEST_F(D3D11SamplerStateDescMatrixSpec,
                                                                duplicate.put());
     }
 
-    const bool desc_matches = create_result == S_OK && state &&
-                              SamplerDescsEqual(actual, test_case.desc);
+    const bool desc_matches =
+        create_result == S_OK && state && SamplerDescsEqual(actual, expected);
     const bool identity_matches =
         duplicate_result == S_OK && duplicate && duplicate.get() == state.get();
     if (desc_matches && identity_matches)
@@ -226,18 +243,17 @@ TEST_F(D3D11SamplerStateDescMatrixSpec,
         << ',' << test_case.address_indexes[2]
         << ") profile_index=" << test_case.profile_index
         << " selected_cases=" << selected_cases.size() << '\n'
-        << "Expected: filter=" << static_cast<UINT>(test_case.desc.Filter)
-        << " address=(" << static_cast<UINT>(test_case.desc.AddressU) << ','
-        << static_cast<UINT>(test_case.desc.AddressV) << ','
-        << static_cast<UINT>(test_case.desc.AddressW)
-        << ") mip_lod_bias=" << test_case.desc.MipLODBias
-        << " max_anisotropy=" << test_case.desc.MaxAnisotropy
-        << " comparison_func="
-        << static_cast<UINT>(test_case.desc.ComparisonFunc) << " border_color=("
-        << test_case.desc.BorderColor[0] << ',' << test_case.desc.BorderColor[1]
-        << ',' << test_case.desc.BorderColor[2] << ','
-        << test_case.desc.BorderColor[3] << ") lod_range=("
-        << test_case.desc.MinLOD << ',' << test_case.desc.MaxLOD << ")\n"
+        << "Expected: filter=" << static_cast<UINT>(expected.Filter)
+        << " address=(" << static_cast<UINT>(expected.AddressU) << ','
+        << static_cast<UINT>(expected.AddressV) << ','
+        << static_cast<UINT>(expected.AddressW)
+        << ") mip_lod_bias=" << expected.MipLODBias
+        << " max_anisotropy=" << expected.MaxAnisotropy
+        << " comparison_func=" << static_cast<UINT>(expected.ComparisonFunc)
+        << " border_color=(" << expected.BorderColor[0] << ','
+        << expected.BorderColor[1] << ',' << expected.BorderColor[2] << ','
+        << expected.BorderColor[3] << ") lod_range=(" << expected.MinLOD << ','
+        << expected.MaxLOD << ")\n"
         << "Observed: create_hresult=" << create_result
         << " duplicate_hresult=" << duplicate_result
         << " failure_phase=" << failure_phase
@@ -257,6 +273,40 @@ TEST_F(D3D11SamplerStateDescMatrixSpec,
     break;
   }
 
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SamplerStateDescMatrixSpec,
+       ReusesStatesWhoseIgnoredFieldsNormalizeIdentically) {
+  D3D11_SAMPLER_DESC first_desc = {};
+  first_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  first_desc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+  first_desc.AddressV = D3D11_TEXTURE_ADDRESS_MIRROR;
+  first_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  first_desc.MaxAnisotropy = 1;
+  first_desc.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+  first_desc.BorderColor[0] = 1.0f;
+  first_desc.BorderColor[3] = 1.0f;
+  first_desc.MaxLOD = 16.0f;
+
+  D3D11_SAMPLER_DESC second_desc = first_desc;
+  second_desc.MaxAnisotropy = 16;
+  second_desc.ComparisonFunc = D3D11_COMPARISON_LESS;
+  second_desc.BorderColor[0] = 0.0f;
+  second_desc.BorderColor[1] = 1.0f;
+
+  ComPtr<ID3D11SamplerState> first;
+  ComPtr<ID3D11SamplerState> second;
+  ASSERT_EQ(context_.device()->CreateSamplerState(&first_desc, first.put()),
+            S_OK);
+  ASSERT_EQ(context_.device()->CreateSamplerState(&second_desc, second.put()),
+            S_OK);
+  ASSERT_NE(first.get(), nullptr);
+  EXPECT_EQ(second.get(), first.get());
+
+  D3D11_SAMPLER_DESC actual = {};
+  first->GetDesc(&actual);
+  EXPECT_TRUE(SamplerDescsEqual(actual, ExpectedDesc(first_desc)));
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

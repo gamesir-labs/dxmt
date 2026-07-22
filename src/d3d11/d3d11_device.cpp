@@ -394,8 +394,11 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateRasterizerState(const D3D11_RASTERIZER_DESC *pRasterizerDesc,
                         ID3D11RasterizerState **ppRasterizerState) override {
-    ID3D11RasterizerState2 *pRasterizerState;
-    D3D11_RASTERIZER_DESC2 desc;
+    InitReturnPtr(ppRasterizerState);
+    if (!pRasterizerDesc)
+      return E_INVALIDARG;
+
+    D3D11_RASTERIZER_DESC2 desc = {};
     desc.FillMode = pRasterizerDesc->FillMode;
     desc.CullMode = pRasterizerDesc->CullMode;
     desc.FrontCounterClockwise = pRasterizerDesc->FrontCounterClockwise;
@@ -408,6 +411,10 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = 0;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+    if (!ppRasterizerState)
+      return CreateRasterizerState2(&desc, nullptr);
+
+    ID3D11RasterizerState2 *pRasterizerState = nullptr;
     auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
     *ppRasterizerState = pRasterizerState;
     return hr;

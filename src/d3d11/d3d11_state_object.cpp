@@ -692,13 +692,26 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
 
   D3D11_SAMPLER_DESC desc = *pSamplerDesc;
 
+  if (!D3D11_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter))
+    desc.MaxAnisotropy = 0;
+  if (!D3D11_DECODE_IS_COMPARISON_FILTER(desc.Filter))
+    desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  if (desc.AddressU != D3D11_TEXTURE_ADDRESS_BORDER &&
+      desc.AddressV != D3D11_TEXTURE_ADDRESS_BORDER &&
+      desc.AddressW != D3D11_TEXTURE_ADDRESS_BORDER) {
+    desc.BorderColor[0] = 0.0f;
+    desc.BorderColor[1] = 0.0f;
+    desc.BorderColor[2] = 0.0f;
+    desc.BorderColor[3] = 0.0f;
+  }
+
   // FIXME: validation
 
   if (!ppSamplerState)
     return S_FALSE;
 
-  if (cache.contains(*pSamplerDesc)) {
-    cache.at(*pSamplerDesc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
+  if (cache.contains(desc)) {
+    cache.at(desc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
     return S_OK;
   }
 
@@ -788,8 +801,8 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
     return E_FAIL;
   }
 
-  cache.emplace(*pSamplerDesc, std::make_unique<MTLD3D11SamplerState>(device, std::move(sampler), desc));
-  cache.at(*pSamplerDesc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
+  cache.emplace(desc, std::make_unique<MTLD3D11SamplerState>(device, std::move(sampler), desc));
+  cache.at(desc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
 
   return S_OK;
 };
