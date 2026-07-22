@@ -35,7 +35,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kIndirectDispatchCases(
      {"11_0", "5_0", "Immediate",
       "DispatchIndirect,DrawIndirectArgsBuffer,TypedUAV,StagingMap"},
      dxmt::test::kGpuBatchTestCost,
-     "an immutable DRAWINDIRECT_ARGS buffer containing a zero prefix guard "
+     "a default-usage DRAWINDIRECT_ARGS buffer containing a zero prefix guard "
      "followed by 16x16x16 group counts at byte offset 16, plus an immutable "
      "logical-case selection SRV and a poison-initialized typed UAV",
      "dispatch indirectly from the nonzero argument offset and let every "
@@ -175,7 +175,7 @@ TEST_F(D3D11IndirectDispatchMatrixSpec,
       0u};
   D3D11_BUFFER_DESC arguments_desc = {};
   arguments_desc.ByteWidth = sizeof(arguments);
-  arguments_desc.Usage = D3D11_USAGE_IMMUTABLE;
+  arguments_desc.Usage = D3D11_USAGE_DEFAULT;
   arguments_desc.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
   D3D11_SUBRESOURCE_DATA arguments_data = {};
   arguments_data.pSysMem = arguments.data();
