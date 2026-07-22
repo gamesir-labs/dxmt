@@ -5,6 +5,7 @@ d3d11_unit_sources = files(
   'constant_buffer_range_binding_matrix_spec.cpp',
   'input_assembler_ops_spec.cpp',
   'input_layout_binding_matrix_spec.cpp',
+  'primitive_topology_state_matrix_spec.cpp',
   'vertex_buffer_binding_matrix_spec.cpp',
   'index_buffer_binding_matrix_spec.cpp',
   'resource_spec.cpp',
