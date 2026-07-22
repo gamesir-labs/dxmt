@@ -50,6 +50,90 @@ visual visual.isolated.c:28481
 # attribute's own alpha is expected, over attrib counts 1 to 4.
 visual visual.isolated.c:28870
 
+# visual (continued): the full set from an untruncated capture; the original
+# entries above were recorded through a truncated tail and missed these. Two
+# DXMT runs produced an identical line set. One example per line.
+# Transformed vertex with linear table fog has color 00ffff00
+visual visual.isolated.c:2351
+# Test 7, got unexpected hr 0.
+visual visual.isolated.c:4470
+# Test 0, got unexpected hr 0x8876086c.
+visual visual.isolated.c:4627
+# Test 0, got unexpected color 0xffffffff.
+visual visual.isolated.c:4632
+# Test 0, got unexpected color 0xffffffff.
+visual visual.isolated.c:4634
+# Test 0, got unexpected color 0xffffffff.
+visual visual.isolated.c:4636
+# Test blendweight returned color 0x00000000, expected 0x00191919 (t
+visual visual.isolated.c:7589
+# DSTALPHA on texture returned color 007f0080, expected 0x000000ff
+visual visual.isolated.c:9029
+# Setup 0: test 3 (expected size 0): Got unexpected color 0x0000ff00
+visual visual.isolated.c:11490
+# Setup 0: test 10 (expected size 1): Got unexpected color 0x0000000
+visual visual.isolated.c:11502
+# Setup 0: test 10 (expected size 1): Got unexpected color 0x0000ff0
+visual visual.isolated.c:11504
+# Setup 0: test 10 (expected size 1): Got unexpected color 0x00ffff0
+visual visual.isolated.c:11506
+# Setup 0: test 10 (expected size 1): Got unexpected color 0x0000ff0
+visual visual.isolated.c:11508
+# Expected color 0x00ff0000, 0x00ff0000, 0x00ff0000 or 0x00ff0000 fo
+visual visual.isolated.c:16433
+# Format D3DFMT_X8R8G8B8 supports srgb, expected color 0x00bcbcbc, g
+visual visual.isolated.c:16575
+# StretchRect failed, hr 0x8876086c.
+visual visual.isolated.c:17456
+# Expected color 0xffff0000 at (80, 100), got 0xff0000ff.
+visual visual.isolated.c:17476
+# Expected left color 0x00ff0000, got 0x007c8300, case 0.
+visual visual.isolated.c:18342
+# Expected right color 0x00ff0000, got 0x00837c00, case 0.
+visual visual.isolated.c:18345
+# Got unexpected color 0x00000000.
+visual visual.isolated.c:19156
+# Got unexpected color 0x00000000.
+visual visual.isolated.c:19163
+# Got unexpected color 0x0000ff00.
+visual visual.isolated.c:19210
+# Got unexpected color 0x000000ff.
+visual visual.isolated.c:19217
+# Got unexpected color 0x0000ff00.
+visual visual.isolated.c:19232
+# Got unexpected colour 0x000ff0000.
+visual visual.isolated.c:19458
+# Got unexpected color 0x000000ff, case 0.
+visual visual.isolated.c:19895
+# Got unexpected color 0x000000ff, case 0.
+visual visual.isolated.c:19898
+# CreatePixelShader returned hr 0.
+visual visual.isolated.c:20194
+# Device has 1 references left.
+visual visual.isolated.c:20269
+# Got unexpected color 0x00ff0000, expected 0x004cb200, case 1.
+visual visual.isolated.c:20383
+# Failed to update texture, hr 0x8876086c, case 0, 0.
+visual visual.isolated.c:21763
+# Got unexpected color 000000ff at x=62, format 77.
+visual visual.isolated.c:21929
+# Got unexpected color 0000ff00 at x=64, format 77.
+visual visual.isolated.c:21936
+# Got unexpected color 0000ff00 at x=190, format 77.
+visual visual.isolated.c:21940
+# Got unexpected color 00ff0000 at x=446, format 77.
+visual visual.isolated.c:21962
+# Got unexpected color 0xffff0000.
+visual visual.isolated.c:22053
+# Got unexpected color 0xff00ff00.
+visual visual.isolated.c:22055
+# Got unexpected color 0xffff0000.
+visual visual.isolated.c:22064
+# Got unexpected color 0xff00ff00.
+visual visual.isolated.c:22066
+# Got unexpected color 0xffff0000.
+visual visual.isolated.c:22072
+
 # d3d9ex: recorded from two DXMT runs with an identical line set. The comment on
 # each group is one example. Some sites report a different window handle each
 # run, which is why the match is by line and not by value.
