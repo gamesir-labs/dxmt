@@ -133,6 +133,9 @@ public:
     if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED)
       return E_INVALIDARG; // not supported yet
 
+    if (pDesc->Usage == D3D11_USAGE_IMMUTABLE && !pInitialData)
+      return E_INVALIDARG;
+
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
