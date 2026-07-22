@@ -28,7 +28,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kViewportStateCases(
     "D3D11.RSGetViewports.State.", kViewportStateCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "RSSetViewports,RSGetViewports"},
+     {"11_0", "None", "Immediate", "RSSetViewports,RSGetViewports"},
      dxmt::test::kNormalTestCost,
      "one test-local immediate context and fixed arrays of at most sixteen "
      "D3D11 viewports",

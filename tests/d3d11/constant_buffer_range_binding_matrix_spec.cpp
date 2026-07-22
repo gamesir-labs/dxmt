@@ -24,8 +24,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kConstantBufferRangeCases(
     "D3D11.CSConstantBuffer1.Window.", kConstantBufferRangeCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "Context1",
-      "CSSetConstantBuffers1,CSGetConstantBuffers1,ComReferenceState"},
+     {"11_0", "None", "Immediate",
+      "Context1,CSSetConstantBuffers1,CSGetConstantBuffers1,ComReferenceState"},
      dxmt::test::kResourceTestCost,
      "one maximum-size 64 KiB constant buffer and an "
      "ID3D11DeviceContext1 immediate context",

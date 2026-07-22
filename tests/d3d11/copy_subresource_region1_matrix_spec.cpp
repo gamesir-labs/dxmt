@@ -26,8 +26,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kCopySubresourceRegion1Cases(
     kCopySubresourceRegion1CaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "Context1",
-      "CopySubresourceRegion1,CopyFlagsZero,StagingMap"},
+     {"11_0", "None", "Immediate",
+      "Context1,CopySubresourceRegion1,CopyFlagsZero,StagingMap"},
      dxmt::test::kGpuBatchTestCost,
      "separate default-usage source and poison-initialized destination buffers "
      "divided into 4096 independent 16-byte slots",

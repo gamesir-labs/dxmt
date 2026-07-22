@@ -26,7 +26,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kStreamOutputBindingCases(
     "D3D11.SOGetTargets.BindingState.", kStreamOutputBindingCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "SOSetTargets,SOGetTargets,ComReferenceState"},
+     {"11_0", "None", "Immediate",
+      "SOSetTargets,SOGetTargets,ComReferenceState"},
      dxmt::test::kResourceTestCost,
      "two disjoint 64-buffer primary pools and two optional stream-output "
      "buffers, all owned by one test-local device",

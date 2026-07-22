@@ -30,8 +30,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kClearViewCases(
     "D3D11.ClearView.FloatPixel.", kClearViewCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "Context1",
-      "ClearView,RenderTargetView,CopyResource,StagingMap"},
+     {"11_0", "None", "Immediate",
+      "Context1,ClearView,RenderTargetView,CopyResource,StagingMap"},
      dxmt::test::kGpuBatchTestCost,
      "a poison-initialized 64x64 R32G32B32A32_FLOAT render target and its RTV",
      "clear each selected logical pixel through a one-pixel D3D11_RECT with "

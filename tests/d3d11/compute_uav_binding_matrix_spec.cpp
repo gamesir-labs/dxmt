@@ -28,7 +28,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kComputeUavBindingCases(
     "D3D11.CSGetUnorderedAccessViews.Binding.", kComputeUavBindingCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate",
+     {"11_0", "None", "Immediate",
       "CSSetUnorderedAccessViews,CSGetUnorderedAccessViews,ComReferenceState"},
      dxmt::test::kResourceTestCost,
      "two disjoint pools of sixty-four test-local structured buffers and UAVs",

@@ -23,7 +23,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kIndexBufferBindingCases(
     "D3D11.IAGetIndexBuffer.Binding.", kIndexBufferBindingCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate",
+     {"11_0", "None", "Immediate",
       "IASetIndexBuffer,IAGetIndexBuffer,ComReferenceState"},
      dxmt::test::kResourceTestCost,
      "one 16 KiB test-local index buffer that accommodates every aligned "

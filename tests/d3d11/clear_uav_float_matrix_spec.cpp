@@ -27,7 +27,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kClearUavFloatCases(
     "D3D11.ClearUAVFloat.BufferElement.", kClearUavFloatCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate",
+     {"11_0", "None", "Immediate",
       "ClearUnorderedAccessViewFloat,TypedBufferUAV,CopyResource,StagingMap"},
      dxmt::test::kGpuBatchTestCost,
      "a poison-initialized R32G32B32A32_FLOAT buffer with one-element UAV "

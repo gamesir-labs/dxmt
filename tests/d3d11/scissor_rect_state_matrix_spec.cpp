@@ -28,7 +28,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kScissorRectStateCases(
     "D3D11.RSGetScissorRects.State.", kScissorRectStateCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "RSSetScissorRects,RSGetScissorRects"},
+     {"11_0", "None", "Immediate", "RSSetScissorRects,RSGetScissorRects"},
      dxmt::test::kNormalTestCost,
      "one test-local immediate context and fixed arrays of at most sixteen "
      "D3D11 rectangles",

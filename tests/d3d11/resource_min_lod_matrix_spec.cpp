@@ -26,7 +26,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kResourceMinLodCases(
     "D3D11.ResourceMinLOD.Value.", kResourceMinLodCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "SetResourceMinLOD,GetResourceMinLOD,ResourceClamp"},
+     {"11_0", "None", "Immediate",
+      "SetResourceMinLOD,GetResourceMinLOD,ResourceClamp"},
      dxmt::test::kResourceTestCost,
      "two independent 256x1 textures with nine mip levels and "
      "D3D11_RESOURCE_MISC_RESOURCE_CLAMP",

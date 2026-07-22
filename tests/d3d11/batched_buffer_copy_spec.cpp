@@ -25,7 +25,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kCopyCases(
     "D3D11.Copy.Buffer.DisjointRegion.", kCopyCaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "CopySubresourceRegion,StagingMap"},
+     {"11_0", "None", "Immediate", "CopySubresourceRegion,StagingMap"},
      dxmt::test::kGpuBatchTestCost,
      "two default buffers divided into 4096 disjoint 64-byte slots; source "
      "slots contain deterministic data and destination slots contain poison",

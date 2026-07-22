@@ -26,8 +26,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kUpdateSubresource1Cases(
     "D3D11.UpdateSubresource1.BufferRegion.", kUpdateSubresource1CaseCount, 4,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
-     {"11_0", "Immediate", "Context1",
-      "UpdateSubresource1,CopyFlagsZero,CopyResource,StagingMap"},
+     {"11_0", "None", "Immediate",
+      "Context1,UpdateSubresource1,CopyFlagsZero,CopyResource,StagingMap"},
      dxmt::test::kGpuBatchTestCost,
      "a poison-initialized default-usage buffer divided into 4096 independent "
      "16-byte slots and an ID3D11DeviceContext1 immediate context",
