@@ -404,9 +404,13 @@ public:
     *pResourceDimension = tag::dimension;
   }
 
-  void STDMETHODCALLTYPE SetEvictionPriority(UINT EvictionPriority) final {}
+  void STDMETHODCALLTYPE SetEvictionPriority(UINT EvictionPriority) final {
+    eviction_priority_.store(EvictionPriority, std::memory_order_relaxed);
+  }
 
-  UINT STDMETHODCALLTYPE GetEvictionPriority() final { return DXGI_RESOURCE_PRIORITY_NORMAL; }
+  UINT STDMETHODCALLTYPE GetEvictionPriority() final {
+    return eviction_priority_.load(std::memory_order_relaxed);
+  }
 
   virtual HRESULT GetDeviceInterface(REFIID riid, void **ppDevice) {
     Com<ID3D11Device> device;
@@ -456,6 +460,7 @@ public:
   virtual WMT::Reference<WMT::SharedEvent> GetKeyedMutexEvent() const override { return {}; }
 
 protected:
+  std::atomic<UINT> eviction_priority_{DXGI_RESOURCE_PRIORITY_NORMAL};
   tag::DESC1 desc;
   std::unique_ptr<IDXGIResource1> dxgi_resource;
   std::unique_ptr<IDXGIKeyedMutex> keyed_mutex;
