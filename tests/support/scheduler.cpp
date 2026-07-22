@@ -701,7 +701,8 @@ int RunScheduledTests(int argc, char **argv) {
   if (!options)
     return 2;
 
-  GTEST_FLAG_SET(brief, true);
+  GTEST_FLAG_SET(brief,
+                 std::getenv("DXMT_TEST_VERBOSE_WORKERS") == nullptr);
   ::testing::InitGoogleTest(&argc, argv);
   DisableFailureShortCircuiting();
 

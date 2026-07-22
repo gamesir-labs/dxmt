@@ -439,8 +439,8 @@ protected:
     if (IsSoftwareAdapter(context_.device())) {
       GTEST_SKIP()
           << "Native WARP stalls indefinitely when GPU copy commands access "
-             "a mapped nonzero texture-array subresource; the adjacent queue "
-             "mapping test retains WARP coverage";
+             "a mapped nonzero texture-array subresource; hardware adapters "
+             "retain execution coverage";
     }
     D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
     ASSERT_EQ(context_.device()->CheckFeatureSupport(
@@ -984,8 +984,8 @@ TEST_F(D3D12SparseResourceSpec, CopyTilesRoundTripsNonzeroArraySlice) {
   if (IsSoftwareAdapter(context_.device())) {
     GTEST_SKIP()
         << "Native WARP stalls indefinitely in CopyTiles for a nonzero "
-           "texture-array subresource; the adjacent CopyTextureRegion test "
-           "retains WARP coverage of the sparse array mapping";
+           "texture-array subresource; hardware adapters retain execution "
+           "coverage";
   }
   ExpectCopyTilesRoundTrip(0, 0, 1, 1, 0, 2, 1);
 }
@@ -996,6 +996,12 @@ TEST_F(D3D12SparseResourceSpec,
 }
 
 TEST_F(D3D12SparseResourceSpec, MapsNonzeroArraySliceBeforeQueueSignal) {
+  if (IsSoftwareAdapter(context_.device())) {
+    GTEST_SKIP()
+        << "Native WARP stalls indefinitely after mapping a nonzero "
+           "texture-array subresource; hardware adapters retain execution "
+           "coverage";
+  }
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),

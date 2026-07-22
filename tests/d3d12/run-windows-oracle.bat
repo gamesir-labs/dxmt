@@ -155,6 +155,7 @@ echo.
 
 :run_d3d12
 echo [ D3D12 ] Running complete suite...
+set "DXMT_TEST_VERBOSE_WORKERS=1"
 "%ORACLE_D3D12_EXE%" %ORACLE_WORKER_ARG% --dxmt-test-jobs=%ORACLE_D3D12_JOBS% "--dxmt-case-id=%ORACLE_CASES%" > "%ORACLE_D3D12_LOG%" 2>&1
 set "ORACLE_D3D12_EXIT=%ERRORLEVEL%"
 type "%ORACLE_D3D12_LOG%"
