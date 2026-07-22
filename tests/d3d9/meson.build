@@ -84,15 +84,19 @@ if dxmt_crossbuild and wine_tests_source_root != ''
     # ahead of windows.h. Forcing windows.h in first fixes that but then precedes
     # the module's own COBJMACROS define, which leaves IUnknown_AddRef and
     # IUnknown_Release undeclared, so the two go together.
+    #
+    # device.c includes d3d9on12.h and dxgi1_4.h after <initguid.h>, which
+    # DEFINES their GUIDs in the object; on a stricter linker those collide with
+    # the same GUIDs in the GUID library. -DINITGUID makes it define every GUID
+    # itself, so the library is dropped for it alone (below) and nothing collides.
     wine_module_extra_args = {
       'd3d9ex': [ '-DCOBJMACROS', '-include', 'windows.h' ],
+      'device': [ '-DINITGUID' ],
     }
 
-    # stateblock runs clean. visual reports its failures end to end. device is
-    # still held back on a build problem of its own: it collides with the GUID
-    # library on the build runner's toolchain, which does not reproduce under the
-    # local cross compiler.
-    foreach module : [ 'stateblock', 'visual', 'd3d9ex' ]
+    # stateblock runs clean; visual, d3d9ex and device report their failures end
+    # to end.
+    foreach module : [ 'stateblock', 'visual', 'd3d9ex', 'device' ]
       wine_isolated = custom_target('wine-isolate-' + module,
         input: wine_tests_dir / (module + '.c'),
         output: [ module + '.isolated.c', module + '.functions' ],
@@ -104,21 +108,26 @@ if dxmt_crossbuild and wine_tests_source_root != ''
           '--module', module,
         ])
 
+      wine_module_deps = [
+        cc.find_library('d3d9'),
+        cc.find_library('user32'),
+        cc.find_library('gdi32'),
+        cc.find_library('ole32'),
+      ]
+      # The modules reference the D3D9 interface GUIDs without defining them, so
+      # the GUID library is linked in, except device, which defines them itself
+      # under -DINITGUID and would otherwise get a duplicate of every one.
+      if module != 'device'
+        wine_module_deps += cc.find_library('dxguid')
+      endif
+
       wine_conformance_tests += executable('dx9-wine-' + module + '-test',
         wine_isolated[0],
         c_args: wine_tests_c_args + [
           '-include', meson.current_source_dir() / 'dxmt_conformance.h',
         ] + wine_module_extra_args.get(module, []),
         link_with: wine_debug_stubs,
-        dependencies: [
-          cc.find_library('d3d9'),
-          # The modules reference the D3D9 interface GUIDs without defining
-          # them, so the GUID library has to be linked in.
-          cc.find_library('dxguid'),
-          cc.find_library('user32'),
-          cc.find_library('gdi32'),
-          cc.find_library('ole32'),
-        ],
+        dependencies: wine_module_deps,
         install: false)
 
       # The suite reads the manifest to know which functions a module has.

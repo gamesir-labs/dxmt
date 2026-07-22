@@ -12,134 +12,13 @@
 
 # stateblock: none, it runs clean.
 
-# visual: recorded from a run of the module against DXMT. The comment on each
-# line is one example of what that site reported.
-# Got unexpected color 0x00000000.
-visual visual.isolated.c:22114
-# Test 7: Got color 0xffff0000, expected 0x80ff0000.
-visual visual.isolated.c:23398
-# Got unexpected color 0x00ffffff.
-visual visual.isolated.c:24133
-# Got unexpected color 0x00ffffff.
-visual visual.isolated.c:24135
-# Got unexpected hr 0x8876086c.
-visual visual.isolated.c:24569
-# Got unexpected hr 0.
-visual visual.isolated.c:24582
-# Expected color 0x00000000, got 0x00ff0000 (sw shader in hw mode).
-visual visual.isolated.c:24589
-# Expected color 0x00ffffff, got 0x00ff0000 (sw shader in sw mode).
-visual visual.isolated.c:24626
-# Got unexpected hr 0x8876086c.
-visual visual.isolated.c:24643
-# Expected color 0x0000ffff, got 0x000000ff (shader in sw mode).
-visual visual.isolated.c:24677
-# Got unexpected colour ffffffff.
-visual visual.isolated.c:26758
-# level 1: Got unexpected color 0x00000000.
-visual visual.isolated.c:27550
-# test 2: Got unexpected color 0x004d4dff.
-visual visual.isolated.c:27902
-# Got hr 0x8876086a for 844715353 to 22.
-visual visual.isolated.c:28024
-# Expected fog X or Y; got colour {...}, over combinations of pixel mode,
-# vertex mode, vs_mode and ortho_fog.
-visual visual.isolated.c:28475
-visual visual.isolated.c:28481
-# Expected colour {..., 0.0}; got {..., 1.0}, alpha written where the
-# attribute's own alpha is expected, over attrib counts 1 to 4.
-visual visual.isolated.c:28870
-
 # visual (continued): the full set from an untruncated capture; the original
 # entries above were recorded through a truncated tail and missed these. Two
 # DXMT runs produced an identical line set. One example per line.
-# Transformed vertex with linear table fog has color 00ffff00
-visual visual.isolated.c:2351
-# Test 7, got unexpected hr 0.
-visual visual.isolated.c:4470
-# Test 0, got unexpected hr 0x8876086c.
-visual visual.isolated.c:4627
-# Test 0, got unexpected color 0xffffffff.
-visual visual.isolated.c:4632
-# Test 0, got unexpected color 0xffffffff.
-visual visual.isolated.c:4634
-# Test 0, got unexpected color 0xffffffff.
-visual visual.isolated.c:4636
-# Test blendweight returned color 0x00000000, expected 0x00191919 (t
-visual visual.isolated.c:7589
-# DSTALPHA on texture returned color 007f0080, expected 0x000000ff
-visual visual.isolated.c:9029
-# Setup 0: test 3 (expected size 0): Got unexpected color 0x0000ff00
-visual visual.isolated.c:11490
-# Setup 0: test 10 (expected size 1): Got unexpected color 0x0000000
-visual visual.isolated.c:11502
-# Setup 0: test 10 (expected size 1): Got unexpected color 0x0000ff0
-visual visual.isolated.c:11504
-# Setup 0: test 10 (expected size 1): Got unexpected color 0x00ffff0
-visual visual.isolated.c:11506
-# Setup 0: test 10 (expected size 1): Got unexpected color 0x0000ff0
-visual visual.isolated.c:11508
-# Expected color 0x00ff0000, 0x00ff0000, 0x00ff0000 or 0x00ff0000 fo
-visual visual.isolated.c:16433
-# Format D3DFMT_X8R8G8B8 supports srgb, expected color 0x00bcbcbc, g
-visual visual.isolated.c:16575
-# StretchRect failed, hr 0x8876086c.
-visual visual.isolated.c:17456
-# Expected color 0xffff0000 at (80, 100), got 0xff0000ff.
-visual visual.isolated.c:17476
-# Expected left color 0x00ff0000, got 0x007c8300, case 0.
-visual visual.isolated.c:18342
-# Expected right color 0x00ff0000, got 0x00837c00, case 0.
-visual visual.isolated.c:18345
-# Got unexpected color 0x00000000.
-visual visual.isolated.c:19156
-# Got unexpected color 0x00000000.
-visual visual.isolated.c:19163
-# Got unexpected color 0x0000ff00.
-visual visual.isolated.c:19210
-# Got unexpected color 0x000000ff.
-visual visual.isolated.c:19217
-# Got unexpected color 0x0000ff00.
-visual visual.isolated.c:19232
-# Got unexpected colour 0x000ff0000.
-visual visual.isolated.c:19458
-# Got unexpected color 0x000000ff, case 0.
-visual visual.isolated.c:19895
-# Got unexpected color 0x000000ff, case 0.
-visual visual.isolated.c:19898
-# CreatePixelShader returned hr 0.
-visual visual.isolated.c:20194
-# Device has 1 references left.
-visual visual.isolated.c:20269
-# Got unexpected color 0x00ff0000, expected 0x004cb200, case 1.
-visual visual.isolated.c:20383
-# Failed to update texture, hr 0x8876086c, case 0, 0.
-visual visual.isolated.c:21763
-# Got unexpected color 000000ff at x=62, format 77.
-visual visual.isolated.c:21929
-# Got unexpected color 0000ff00 at x=64, format 77.
-visual visual.isolated.c:21936
-# Got unexpected color 0000ff00 at x=190, format 77.
-visual visual.isolated.c:21940
-# Got unexpected color 00ff0000 at x=446, format 77.
-visual visual.isolated.c:21962
-# Got unexpected color 0xffff0000.
-visual visual.isolated.c:22053
-# Got unexpected color 0xff00ff00.
-visual visual.isolated.c:22055
-# Got unexpected color 0xffff0000.
-visual visual.isolated.c:22064
-# Got unexpected color 0xff00ff00.
-visual visual.isolated.c:22066
-# Got unexpected color 0xffff0000.
-visual visual.isolated.c:22072
 
 # d3d9ex: recorded from two DXMT runs with an identical line set. The comment on
 # each group is one example. Some sites report a different window handle each
 # run, which is why the match is by line and not by value.
-# User-memory surface creation returns E_NOTIMPL (0x80004001).
-d3d9ex d3d9ex.isolated.c:813
-d3d9ex d3d9ex.isolated.c:830
 # Foreground window is a different HWND than the test expects (handle varies).
 d3d9ex d3d9ex.isolated.c:3309
 d3d9ex d3d9ex.isolated.c:3327
@@ -155,8 +34,6 @@ d3d9ex d3d9ex.isolated.c:3600
 d3d9ex d3d9ex.isolated.c:3629
 d3d9ex d3d9ex.isolated.c:3633
 d3d9ex d3d9ex.isolated.c:3637
-# CheckDeviceState left the interface pointer untouched for D3DFMT_UNKNOWN.
-d3d9ex d3d9ex.isolated.c:4027
 
 # device: recorded from two DXMT runs with an identical line set (the focus
 # and window functions that vary on the headless runner are skipped, see
@@ -167,73 +44,5 @@ d3d9ex d3d9ex.isolated.c:4027
 device device.isolated.c:4871
 # device.isolated.c:5407: Test marked flaky: Didn't receive MOUSEMOV
 device device.isolated.c:5407
-# Unexpected consts_swvp 256.
-device device.isolated.c:7118
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7122
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7125
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7128
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7153
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7161
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7616
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7621
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7641
-# Got unexpected hr 0x8876086c.
-device device.isolated.c:7649
-# Failed to update texture, hr 0x8876086c, case 5.
-device device.isolated.c:10554
-# Got hr 0 (formats 0x15/0x15, pools 0/0).
-device device.isolated.c:13418
-# Got hr 0 (formats 0x15/0x15, pool 0).
-device device.isolated.c:13431
-# Got unexpected hr 0.
-device device.isolated.c:14728
-# Got unexpected call_count 0.
-device device.isolated.c:14729
-# Got NULL message.
-device device.isolated.c:14730
-# Got NULL message.
-device device.isolated.c:14731
-# Got unexpected message_id[0] 0000000000000000.
-device device.isolated.c:14732
-# Got unexpected message_id[1] 0000000000000000.
-device device.isolated.c:14733
-# Got unexpected line 0.
-device device.isolated.c:14734
-# Got unexpected hr 0.
-device device.isolated.c:14742
-# Got unexpected hr 0.
-device device.isolated.c:14749
-# Got unexpected call_count 0.
-device device.isolated.c:14750
-# Got unexpected message_id[0] 0000000000000000.
-device device.isolated.c:14751
-# Got NULL message.
-device device.isolated.c:14752
-# Got unexpected hr 0.
-device device.isolated.c:14758
-# Validator has 1 references left.
-device device.isolated.c:14761
-# Got unexpected call_count 0, test 1.
-device device.isolated.c:14798
-# Got NULL message, test 1.
-device device.isolated.c:14799
-# Got unexpected message_id[0] 0000000000000000, test 1.
-device device.isolated.c:14800
-# Got unexpected file[0] (null), test 1.
-device device.isolated.c:14802
-# Got unexpected line 0, test 1.
-device device.isolated.c:14803
-# Got unexpected hr 0, test 1.
-device device.isolated.c:14816
-# Validator has 1 references left.
-device device.isolated.c:14820
 # Adapter 0: Failed to find a different mode than 1920x1080.
 device device.isolated.c:14903

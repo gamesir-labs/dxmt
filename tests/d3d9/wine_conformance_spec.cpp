@@ -33,6 +33,7 @@ constexpr const char *kWineModules[] = {
     "stateblock",
     "visual",
     "d3d9ex",
+    "device",
 };
 
 // A module that crashes takes the functions after it with it, so it is re-run
