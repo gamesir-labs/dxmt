@@ -6,6 +6,7 @@ d3d11_unit_sources = files(
   'resource_spec.cpp',
   'draw_matrix_spec.cpp',
   'indirect_draw_matrix_spec.cpp',
+  'indirect_indexed_draw_matrix_spec.cpp',
   'transfer_matrix_spec.cpp',
   'batched_buffer_copy_spec.cpp',
   'query_matrix_spec.cpp',
