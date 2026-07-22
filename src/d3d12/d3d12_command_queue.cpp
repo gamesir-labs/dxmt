@@ -16465,6 +16465,14 @@ private:
     bool cbuffer = false;
   };
 
+  struct NativeRootBaseStagePlanGroup {
+    uint32_t root_base_key = 0;
+    uint32_t range_length = 0;
+    uint32_t captured_capacity = 0;
+    bool cbuffer = false;
+    std::vector<uint32_t> entry_indices;
+  };
+
   struct NativeRootBaseStagePlan {
     uint64_t root_identity = 0;
     uint64_t pipeline_identity = 0;
@@ -16473,6 +16481,7 @@ private:
     uint32_t max_resource_key_plus_one = 0;
     uint32_t max_cbuffer_key_plus_one = 0;
     std::vector<NativeRootBaseStagePlanEntry> entries;
+    std::vector<NativeRootBaseStagePlanGroup> groups;
   };
 
   static bool IsBindlessTextureMirrorArgument(
@@ -17868,6 +17877,28 @@ private:
           running_offset = range_offset + range.descriptor_count;
       }
     }
+    for (uint32_t i = 0; i < plan.entries.size(); ++i) {
+      const auto &entry = plan.entries[i];
+      auto group = std::find_if(
+          plan.groups.begin(), plan.groups.end(), [&](const auto &candidate) {
+            return candidate.cbuffer == entry.cbuffer &&
+                   candidate.root_base_key == entry.root_base_key;
+          });
+      if (group == plan.groups.end()) {
+        plan.groups.push_back(NativeRootBaseStagePlanGroup{
+            entry.root_base_key, 0, 0, entry.cbuffer, {}});
+        group = std::prev(plan.groups.end());
+      }
+      group->entry_indices.push_back(i);
+      group->range_length = std::max<uint32_t>(
+          group->range_length,
+          entry.argument_local_start + entry.range_count);
+      if (entry.descriptor_index < entry.descriptor_count) {
+        group->captured_capacity += std::min<uint32_t>(
+            entry.range_count,
+            entry.descriptor_count - entry.descriptor_index);
+      }
+    }
     return plan;
   }
 
@@ -17972,65 +18003,48 @@ private:
 
     auto build_words = [&](bool cbuffer, uint32_t word_count) {
       std::vector<uint32_t> words(word_count, 0);
-      std::vector<std::vector<const NativeRootBaseStagePlanEntry *>> groups(
-          word_count);
-      for (const auto &entry : plan->entries)
-        if (entry.cbuffer == cbuffer && entry.root_base_key < word_count)
-          groups[entry.root_base_key].push_back(&entry);
-
-      for (uint32_t key_index = 0; key_index < groups.size(); ++key_index) {
-        const auto &group = groups[key_index];
-        if (group.empty())
+      for (const auto &group : plan->groups) {
+        if (group.cbuffer != cbuffer ||
+            group.root_base_key >= word_count || !group.range_length)
           continue;
-        uint32_t range_length = 0;
-        for (const auto *entry : group)
-          range_length = std::max<uint32_t>(
-              range_length, entry->argument_local_start + entry->range_count);
-        if (!range_length)
-          continue;
+        const auto key_index = group.root_base_key;
+        const auto range_length = group.range_length;
 
         struct CapturedSlot {
           uint32_t destination = 0;
           const DescriptorRecord *descriptor = nullptr;
         };
         std::vector<CapturedSlot> captured;
-        size_t captured_capacity = 0;
-        for (const auto *entry : group) {
-          if (entry->descriptor_index < entry->descriptor_count) {
-            captured_capacity += std::min<uint32_t>(
-                entry->range_count,
-                entry->descriptor_count - entry->descriptor_index);
-          }
-        }
-        captured.reserve(captured_capacity);
+        captured.reserve(group.captured_capacity);
         std::vector<uint64_t> range_key = {range_length};
-        range_key.reserve(1 + captured_capacity * 6);
-        for (const auto *entry : group) {
-          auto *heap = get_heap(entry->heap_type);
-          const auto base = entry->root_index < tables.size()
-                                ? tables[entry->root_index]
+        range_key.reserve(1 + group.captured_capacity * 6);
+        for (const auto entry_index : group.entry_indices) {
+          const auto &entry = plan->entries[entry_index];
+          auto *heap = get_heap(entry.heap_type);
+          const auto base = entry.root_index < tables.size()
+                                ? tables[entry.root_index]
                                 : D3D12_GPU_DESCRIPTOR_HANDLE{};
           for (uint32_t local = 0;
-               local < entry->range_count &&
-               entry->descriptor_index + local < entry->descriptor_count;
+               local < entry.range_count &&
+               entry.descriptor_index + local < entry.descriptor_count;
                ++local) {
-            const auto destination = entry->argument_local_start + local;
+            const auto destination = entry.argument_local_start + local;
             const auto *record =
                 base.ptr ? GetBoundDescriptorRecordInRangeFromLockedHeap(
-                               heap, base, entry->range_offset,
-                               entry->descriptor_index + local,
-                               entry->descriptor_count, entry->heap_type)
+                               heap, base, entry.range_offset,
+                               entry.descriptor_index + local,
+                               entry.descriptor_count, entry.heap_type)
                          : nullptr;
             captured.push_back({destination, record});
             if (snapshot && record &&
-                entry->range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+                entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
               const auto *argument =
-                  entry->cbuffer
-                      ? (cbuffers && entry->argument_index < cbuffer_count
-                             ? &cbuffers[entry->argument_index]
+                  entry.cbuffer
+                      ? (cbuffers && entry.argument_index < cbuffer_count
+                             ? &cbuffers[entry.argument_index]
                              : nullptr)
-                      : (arguments && entry->argument_index < argument_count
-                             ? &arguments[entry->argument_index]
+                      : (arguments && entry.argument_index < argument_count
+                             ? &arguments[entry.argument_index]
                              : nullptr);
               if (argument) {
                 const auto descriptor_record_index =
@@ -18038,10 +18052,10 @@ private:
                 snapshot->native_descriptor_accesses.push_back(
                     CompiledNativeDescriptorAccess{
                         stage,
-                        entry->range_type,
+                        entry.range_type,
                         static_cast<uint16_t>(
                             argument->SM50BindingSlot +
-                            entry->argument_local_start + local),
+                            entry.argument_local_start + local),
                         static_cast<uint32_t>(argument->Flags),
                         descriptor_record_index});
               }
