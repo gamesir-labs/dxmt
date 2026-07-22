@@ -4645,22 +4645,40 @@ public:
         dsv_info.PixelFormat = state_.OutputMerger.DSV->pixelFormat();
         dsv_info.ReadOnlyFlags =  state_.OutputMerger.DSV->readonlyFlags();
       } else if (effective_render_target == 0) {
+        auto so_layout = com_cast<IMTLD3D11StreamOutputLayout>(
+            state_.ShaderStages[PipelineStage::Geometry].Shader.ptr());
+        const bool stream_output_only =
+            so_layout &&
+            so_layout->RasterizedStream() == D3D11_SO_NO_RASTERIZED_STREAM &&
+            state_.StreamOutput.Targets.any_bound();
         if (!state_.OutputMerger.UAVs.any_bound()) {
-          DEBUG("No rendering attachment or uav is bounded");
-          return false;
+          if (!stream_output_only) {
+            DEBUG("No rendering attachment, uav, or stream-output target is "
+                  "bound");
+            return false;
+          }
+          // A D3D11 draw may capture stream output with rasterization disabled
+          // and no output-merger attachments. Metal still needs explicit
+          // dimensions for the attachment-less render pass.
+          render_target_width = 1;
+          render_target_height = 1;
+          sample_count = 1;
+        } else {
+          D3D11_ASSERT(state_.Rasterizer.NumViewports);
+          IMTLD3D11RasterizerState *state =
+              state_.Rasterizer.RasterizerState
+                  ? state_.Rasterizer.RasterizerState
+                  : default_rasterizer_state;
+          auto &viewport = state_.Rasterizer.viewports[0];
+          render_target_width = viewport.Width;
+          render_target_height = viewport.Height;
+          sample_count = state->UAVOnlySampleCount();
+          if (!(render_target_width && render_target_height)) {
+            ERR("uav only rendering is enabled but viewport is empty");
+            return false;
+          }
+          uav_only = true;
         }
-        D3D11_ASSERT(state_.Rasterizer.NumViewports);
-        IMTLD3D11RasterizerState *state =
-            state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
-        auto &viewport = state_.Rasterizer.viewports[0];
-        render_target_width = viewport.Width;
-        render_target_height = viewport.Height;
-        sample_count = state->UAVOnlySampleCount();
-        if (!(render_target_width && render_target_height)) {
-          ERR("uav only rendering is enabled but viewport is empty");
-          return false;
-        }
-        uav_only = true;
       }
 
       auto allocated_encoder_argbuf_size = std::make_unique<uint64_t>(0);

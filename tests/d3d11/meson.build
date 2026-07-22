@@ -28,6 +28,7 @@ d3d11_unit_sources = files(
   'shader_conversion_matrix_spec.cpp',
   'shader_derivative_ops_spec.cpp',
   'geometry_shader_ops_spec.cpp',
+  'stream_output_matrix_spec.cpp',
   'tessellation_shader_ops_spec.cpp',
   'raw_buffer_shader_matrix_spec.cpp',
   'raw_uav_atomic_spec.cpp',
