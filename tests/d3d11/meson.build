@@ -11,6 +11,7 @@ d3d11_unit_sources = files(
   'index_buffer_binding_matrix_spec.cpp',
   'resource_spec.cpp',
   'texture1d_desc_matrix_spec.cpp',
+  'texture2d_desc_matrix_spec.cpp',
   'resource_eviction_priority_matrix_spec.cpp',
   'resource_min_lod_matrix_spec.cpp',
   'draw_matrix_spec.cpp',
