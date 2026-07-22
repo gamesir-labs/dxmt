@@ -356,8 +356,11 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateBlendState(const D3D11_BLEND_DESC *pBlendStateDesc,
                    ID3D11BlendState **ppBlendState) override {
-    ID3D11BlendState1 *pBlendState1;
-    D3D11_BLEND_DESC1 desc;
+    InitReturnPtr(ppBlendState);
+    if (!pBlendStateDesc)
+      return E_INVALIDARG;
+
+    D3D11_BLEND_DESC1 desc = {};
     desc.AlphaToCoverageEnable = pBlendStateDesc->AlphaToCoverageEnable;
     desc.IndependentBlendEnable = pBlendStateDesc->IndependentBlendEnable;
 
@@ -379,6 +382,10 @@ public:
       desc.RenderTarget[i].RenderTargetWriteMask =
           pBlendStateDesc->RenderTarget[i].RenderTargetWriteMask;
     }
+    if (!ppBlendState)
+      return CreateBlendState1(&desc, nullptr);
+
+    ID3D11BlendState1 *pBlendState1 = nullptr;
     auto hr = CreateBlendState1(&desc, &pBlendState1);
     *ppBlendState = pBlendState1;
     return hr;

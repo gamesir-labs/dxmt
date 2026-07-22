@@ -287,8 +287,8 @@ public:
       pDesc->RenderTarget[i].BlendOp = renderTarget.BlendOp;
       pDesc->RenderTarget[i].BlendOpAlpha = renderTarget.BlendOpAlpha;
       pDesc->RenderTarget[i].SrcBlend = renderTarget.SrcBlend;
-      pDesc->RenderTarget[i].DestBlend = renderTarget.SrcBlendAlpha;
-      pDesc->RenderTarget[i].SrcBlendAlpha = renderTarget.DestBlend;
+      pDesc->RenderTarget[i].DestBlend = renderTarget.DestBlend;
+      pDesc->RenderTarget[i].SrcBlendAlpha = renderTarget.SrcBlendAlpha;
       pDesc->RenderTarget[i].DestBlendAlpha = renderTarget.DestBlendAlpha;
     }
   }
@@ -558,6 +558,8 @@ HRESULT StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState>::
   if (!normalized_desc.DepthEnable) {
     normalized_desc.DepthWriteMask = kDefaultDepthStencilDesc.DepthWriteMask;
     normalized_desc.DepthFunc = kDefaultDepthStencilDesc.DepthFunc;
+    normalized_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    normalized_desc.BackFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
   }
   if (!normalized_desc.StencilEnable) {
     normalized_desc.StencilReadMask =
@@ -829,11 +831,30 @@ StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState>::CreateStateObject(
   if (!ppBlendState)
     return S_FALSE;
 
-  D3D11_BLEND_DESC1 desc_normalized = *pBlendStateDesc;
+  D3D11_BLEND_DESC1 desc_normalized = {};
   desc_normalized.AlphaToCoverageEnable =
-      bool(desc_normalized.AlphaToCoverageEnable);
+      bool(pBlendStateDesc->AlphaToCoverageEnable);
   desc_normalized.IndependentBlendEnable =
-      bool(desc_normalized.IndependentBlendEnable);
+      bool(pBlendStateDesc->IndependentBlendEnable);
+  for (unsigned i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+    const unsigned source_index =
+        desc_normalized.IndependentBlendEnable ? i : 0;
+    desc_normalized.RenderTarget[i] =
+        pBlendStateDesc->RenderTarget[source_index];
+    auto &target = desc_normalized.RenderTarget[i];
+    target.BlendEnable = bool(target.BlendEnable);
+    target.LogicOpEnable = bool(target.LogicOpEnable);
+    if (!target.BlendEnable) {
+      target.SrcBlend = kDefaultRenderTargetBlendDesc.SrcBlend;
+      target.DestBlend = kDefaultRenderTargetBlendDesc.DestBlend;
+      target.BlendOp = kDefaultRenderTargetBlendDesc.BlendOp;
+      target.SrcBlendAlpha = kDefaultRenderTargetBlendDesc.SrcBlendAlpha;
+      target.DestBlendAlpha = kDefaultRenderTargetBlendDesc.DestBlendAlpha;
+      target.BlendOpAlpha = kDefaultRenderTargetBlendDesc.BlendOpAlpha;
+    }
+    if (!target.LogicOpEnable)
+      target.LogicOp = D3D11_LOGIC_OP_NOOP;
+  }
 
   if (cache.contains(desc_normalized)) {
     cache.at(desc_normalized)->QueryInterface(IID_PPV_ARGS(ppBlendState));

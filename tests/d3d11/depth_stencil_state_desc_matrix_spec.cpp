@@ -122,6 +122,8 @@ ExpectedDesc(const D3D11_DEPTH_STENCIL_DESC &created) {
   if (!expected.DepthEnable) {
     expected.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     expected.DepthFunc = D3D11_COMPARISON_LESS;
+    expected.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    expected.BackFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
   }
   if (!expected.StencilEnable) {
     expected.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
