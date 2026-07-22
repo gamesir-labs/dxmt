@@ -945,7 +945,8 @@ CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason);
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandList(
-    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device);
+    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device,
+    bool defer_native_binding_payload = false);
 
 struct SubmittedCommandAllocatorUse {
   Com<CommandAllocatorObject, false> allocator;

@@ -2198,7 +2198,8 @@ static CompiledCommandFallbackReason MaterializeSubmittedRootTables(
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandListImpl(
-    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device) {
+    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device,
+    bool defer_native_binding_payload) {
   auto plan = std::make_shared<SubmittedCompiledCommandListPlan>();
   plan->generation = std::move(compiled);
   if (!plan->generation)
@@ -2268,7 +2269,8 @@ PrepareSubmittedCompiledCommandListImpl(
     const auto materialized = materialize_tables(packet, root);
     submitted.root_tables = materialized.tables;
     auto reason = materialized.reason;
-    if (reason == CompiledCommandFallbackReason::None)
+    if (reason == CompiledCommandFallbackReason::None &&
+        !defer_native_binding_payload)
       reason = BuildCompiledGraphicsNativeBindings(
           packet.pipeline, *submitted.root_tables, submitted.native_vertex,
           submitted.native_pixel, native_payloads);
@@ -2295,7 +2297,8 @@ PrepareSubmittedCompiledCommandListImpl(
     const auto materialized = materialize_tables(packet, root);
     submitted.root_tables = materialized.tables;
     auto reason = materialized.reason;
-    if (reason == CompiledCommandFallbackReason::None)
+    if (reason == CompiledCommandFallbackReason::None &&
+        !defer_native_binding_payload)
       reason = BuildCompiledComputeNativeBindings(
           packet.pipeline, *submitted.root_tables, submitted.native_compute,
           native_payloads);
@@ -2309,6 +2312,13 @@ PrepareSubmittedCompiledCommandListImpl(
             1, std::memory_order_relaxed);
     }
   }
+
+  // Queue submission freezes the reflected native descriptor spans and builds
+  // their root payload in one compact backing allocation. Do not also build a
+  // second live-heap payload here: it is never consumed by that path and used
+  // to account for several milliseconds of every ExecuteCommandLists call.
+  if (defer_native_binding_payload)
+    return plan;
 
   if (native_payloads.Finalize(device, plan->native_root_base_buffer))
     return plan;
@@ -5314,8 +5324,10 @@ private:
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandList(
-    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device) {
-  return PrepareSubmittedCompiledCommandListImpl(std::move(compiled), device);
+    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device,
+    bool defer_native_binding_payload) {
+  return PrepareSubmittedCompiledCommandListImpl(
+      std::move(compiled), device, defer_native_binding_payload);
 }
 
 Com<ID3D12GraphicsCommandList>

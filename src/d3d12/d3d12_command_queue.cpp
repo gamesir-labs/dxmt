@@ -4970,7 +4970,7 @@ public:
                   dxmt::PerfCodePath::QueueExecutePreparePlan);
               op.submitted_command_lists.emplace_back(
                   PrepareSubmittedCompiledCommandList(
-                      compiled, device_->GetMTLDevice()));
+                      compiled, device_->GetMTLDevice(), true));
             }
           } else {
             op.submitted_command_lists.emplace_back(nullptr);
@@ -6481,6 +6481,9 @@ private:
     WMT::Reference<WMT::Buffer> buffer_record_buffer;
     WMT::Reference<WMT::Buffer> buffer_resource_table_buffer;
     WMT::Reference<WMT::Buffer> root_base_buffer;
+    uint64_t descriptor_table_buffer_offset = 0;
+    uint64_t buffer_record_buffer_offset = 0;
+    uint64_t buffer_resource_table_buffer_offset = 0;
     bool finalized = false;
     bool ready = false;
   };
@@ -6533,39 +6536,50 @@ private:
     if (store.descriptor_table.empty() || store.root_words.empty())
       return false;
 
-    auto create_buffer = [&](const void *data, uint64_t length,
-                             WMT::Reference<WMT::Buffer> &buffer) {
-      WMTBufferInfo info = {};
-      info.length = length;
-      info.options = static_cast<WMTResourceOptions>(
-          WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
-      info.memory.set(nullptr);
-      buffer = device.newBuffer(info);
-      auto *mapped = info.memory.get_accessible_or_null();
-      if (!buffer || !mapped) {
-        buffer = nullptr;
-        return false;
-      }
-      std::memcpy(mapped, data, length);
-      return true;
+    constexpr uint64_t kSectionAlignment = 256;
+    auto align_section = [](uint64_t value) {
+      return (value + kSectionAlignment - 1) & ~(kSectionAlignment - 1);
     };
+    const uint64_t root_size =
+        store.root_words.size() * sizeof(store.root_words[0]);
+    const uint64_t descriptor_table_size =
+        store.descriptor_table.size() * sizeof(store.descriptor_table[0]);
+    const uint64_t buffer_record_size =
+        store.buffer_records.size() * sizeof(store.buffer_records[0]);
+    const uint64_t buffer_resource_table_size =
+        store.buffer_resources.size() * sizeof(store.buffer_resources[0]);
+    store.descriptor_table_buffer_offset = align_section(root_size);
+    store.buffer_record_buffer_offset = align_section(
+        store.descriptor_table_buffer_offset + descriptor_table_size);
+    store.buffer_resource_table_buffer_offset = align_section(
+        store.buffer_record_buffer_offset + buffer_record_size);
+    const uint64_t total_size = align_section(
+        store.buffer_resource_table_buffer_offset +
+        buffer_resource_table_size);
 
-    store.ready =
-        create_buffer(store.descriptor_table.data(),
-                      store.descriptor_table.size() *
-                          sizeof(store.descriptor_table[0]),
-                      store.descriptor_table_buffer) &&
-        create_buffer(store.buffer_records.data(),
-                      store.buffer_records.size() *
-                          sizeof(store.buffer_records[0]),
-                      store.buffer_record_buffer) &&
-        create_buffer(store.buffer_resources.data(),
-                      store.buffer_resources.size() *
-                          sizeof(store.buffer_resources[0]),
-                      store.buffer_resource_table_buffer) &&
-        create_buffer(store.root_words.data(),
-                      store.root_words.size() * sizeof(store.root_words[0]),
-                      store.root_base_buffer);
+    WMTBufferInfo info = {};
+    info.length = total_size;
+    info.options = static_cast<WMTResourceOptions>(
+        WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
+    info.memory.set(nullptr);
+    store.root_base_buffer = device.newBuffer(info);
+    auto *mapped = static_cast<std::byte *>(
+        info.memory.get_accessible_or_null());
+    if (!store.root_base_buffer || !mapped) {
+      store.root_base_buffer = nullptr;
+      return false;
+    }
+    std::memcpy(mapped, store.root_words.data(), root_size);
+    std::memcpy(mapped + store.descriptor_table_buffer_offset,
+                store.descriptor_table.data(), descriptor_table_size);
+    std::memcpy(mapped + store.buffer_record_buffer_offset,
+                store.buffer_records.data(), buffer_record_size);
+    std::memcpy(mapped + store.buffer_resource_table_buffer_offset,
+                store.buffer_resources.data(), buffer_resource_table_size);
+    store.descriptor_table_buffer = store.root_base_buffer;
+    store.buffer_record_buffer = store.root_base_buffer;
+    store.buffer_resource_table_buffer = store.root_base_buffer;
+    store.ready = true;
     return store.ready;
   }
 
@@ -20419,19 +20433,23 @@ private:
       const SubmittedFrozenNativeDescriptorStore *frozen = nullptr) {
     if (frozen && frozen->ready) {
       enc.bindNativeArgumentBuffer(
-          frozen->descriptor_table_buffer, 0,
+          frozen->descriptor_table_buffer,
+          frozen->descriptor_table_buffer_offset,
           DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX, compute,
           render_stages);
       enc.bindNativeArgumentBuffer(
-          frozen->descriptor_table_buffer, 0,
+          frozen->descriptor_table_buffer,
+          frozen->descriptor_table_buffer_offset,
           DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX, compute,
           render_stages);
       enc.bindNativeArgumentBuffer(
-          frozen->buffer_resource_table_buffer, 0,
+          frozen->buffer_resource_table_buffer,
+          frozen->buffer_resource_table_buffer_offset,
           DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX, compute,
           render_stages);
       enc.bindNativeArgumentBuffer(
-          frozen->buffer_record_buffer, 0,
+          frozen->buffer_record_buffer,
+          frozen->buffer_record_buffer_offset,
           DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX, compute,
           render_stages);
       return;
