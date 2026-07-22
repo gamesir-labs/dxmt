@@ -180,6 +180,24 @@ TEST_F(PipelineNativeCacheSpec,
   EXPECT_EQ(after.compile_failures - before.compile_failures, 0u);
 }
 
+TEST_F(PipelineNativeCacheSpec, MaterializesBaseArtifactsBeforeCreateReturns) {
+  const auto before = CacheStats();
+
+  auto graphics = CreateGraphics(GraphicsDesc());
+  ASSERT_TRUE(graphics);
+  EXPECT_NE(ArtifactIdentity(graphics.get()), 0u);
+
+  auto compute = CreateCompute(ComputeDesc());
+  ASSERT_TRUE(compute);
+  EXPECT_NE(ArtifactIdentity(compute.get()), 0u);
+
+  const auto after = CacheStats();
+  EXPECT_EQ(after.hits - before.hits, 0u);
+  EXPECT_EQ(after.misses - before.misses, 2u);
+  EXPECT_EQ(after.compiles - before.compiles, 2u);
+  EXPECT_EQ(after.compile_failures - before.compile_failures, 0u);
+}
+
 TEST_F(PipelineNativeCacheSpec, ReleasesArtifactAfterLastWrapper) {
   const auto before = CacheStats();
   const auto desc = ComputeDesc();

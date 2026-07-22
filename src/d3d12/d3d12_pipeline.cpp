@@ -4446,11 +4446,8 @@ public:
         return DXGI_ERROR_MORE_DATA;
       }
       PipelineNativeArtifactIdentity identity = {};
-      {
-        std::lock_guard lock(metal_mutex_);
-        identity.artifact =
-            reinterpret_cast<std::uintptr_t>(metal_artifact_.get());
-      }
+      identity.artifact =
+          reinterpret_cast<std::uintptr_t>(metal_artifact_.get());
       std::memcpy(data, &identity, required);
       *data_size = required;
       return S_OK;
@@ -4524,6 +4521,47 @@ public:
     return shader_cache_key_;
   }
 
+  bool MaterializeBaseArtifact() {
+    auto *cache = device_->GetPipelineNativeArtifactCache();
+    if (!cache)
+      return false;
+
+    if (type_ == PipelineStateType::Graphics) {
+      metal_artifact_ = cache->Acquire(
+          shader_cache_key_, dxmt::perf::PsoArtifactKind::Graphics, [&] {
+            auto created = std::make_shared<PipelineNativeArtifact>(
+                PipelineStateType::Graphics);
+            if (!CreateMetalGraphicsPipeline(
+                    device_.ptr(), shaders_, graphics_state_,
+                    root_signature_.ptr(), shader_cache_key_,
+                    created->graphics))
+              return std::shared_ptr<PipelineNativeArtifact>();
+            return created;
+          });
+      return metal_artifact_ &&
+             metal_artifact_->type == PipelineStateType::Graphics &&
+             metal_artifact_->graphics.pso;
+    }
+
+    if (type_ == PipelineStateType::Compute) {
+      metal_artifact_ = cache->Acquire(
+          shader_cache_key_, dxmt::perf::PsoArtifactKind::Compute, [&] {
+            auto created = std::make_shared<PipelineNativeArtifact>(
+                PipelineStateType::Compute);
+            if (!CreateMetalComputePipeline(
+                    device_.ptr(), shaders_, root_signature_.ptr(),
+                    shader_cache_key_, created->compute))
+              return std::shared_ptr<PipelineNativeArtifact>();
+            return created;
+          });
+      return metal_artifact_ &&
+             metal_artifact_->type == PipelineStateType::Compute &&
+             metal_artifact_->compute.pso;
+    }
+
+    return false;
+  }
+
   const PipelineMetalGraphicsState *GetMetalGraphicsState() override {
     return GetMetalGraphicsState(0, 0);
   }
@@ -4534,8 +4572,8 @@ public:
     if (type_ != PipelineStateType::Graphics)
       return nullptr;
 
-    std::lock_guard lock(metal_mutex_);
     if (demote_msaa_srv_mask_lo || demote_msaa_srv_mask_hi) {
+      std::lock_guard lock(metal_mutex_);
       const auto variant_key =
           std::make_pair(demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
       auto it = metal_graphics_variants_.find(variant_key);
@@ -4570,23 +4608,6 @@ public:
       return it->second->graphics.pso ? &it->second->graphics : nullptr;
     }
 
-    if (!metal_artifact_) {
-      auto *cache = device_->GetPipelineNativeArtifactCache();
-      if (!cache)
-        return nullptr;
-      metal_artifact_ = cache->Acquire(
-          shader_cache_key_, dxmt::perf::PsoArtifactKind::Graphics, [&] {
-            auto created = std::make_shared<PipelineNativeArtifact>(
-                PipelineStateType::Graphics);
-            if (!CreateMetalGraphicsPipeline(
-                    device_.ptr(), shaders_, graphics_state_,
-                    root_signature_.ptr(), shader_cache_key_,
-                    created->graphics))
-              return std::shared_ptr<PipelineNativeArtifact>();
-            return created;
-          });
-    }
-
     return metal_artifact_ &&
                    metal_artifact_->type == PipelineStateType::Graphics &&
                    metal_artifact_->graphics.pso
@@ -4597,23 +4618,6 @@ public:
   const PipelineMetalComputeState *GetMetalComputeState() override {
     if (type_ != PipelineStateType::Compute)
       return nullptr;
-
-    std::lock_guard lock(metal_mutex_);
-    if (!metal_artifact_) {
-      auto *cache = device_->GetPipelineNativeArtifactCache();
-      if (!cache)
-        return nullptr;
-      metal_artifact_ = cache->Acquire(
-          shader_cache_key_, dxmt::perf::PsoArtifactKind::Compute, [&] {
-            auto created = std::make_shared<PipelineNativeArtifact>(
-                PipelineStateType::Compute);
-            if (!CreateMetalComputePipeline(
-                    device_.ptr(), shaders_, root_signature_.ptr(),
-                    shader_cache_key_, created->compute))
-              return std::shared_ptr<PipelineNativeArtifact>();
-            return created;
-          });
-    }
 
     return metal_artifact_ &&
                    metal_artifact_->type == PipelineStateType::Compute &&
@@ -4667,12 +4671,13 @@ CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
       BuildShaderCacheKey(type, shaders, graphics_state, compute_state,
                           resolved_root_signature.ptr());
   DebugLogSignatureLinks(shader_cache_key, signature_links);
-  auto pso = Com<ID3D12PipelineState>::transfer(
-      new PipelineStateImpl(device, type, resolved_root_signature.ptr(),
-                            std::move(shaders), std::move(signature_links),
-                            std::move(shader_cache_key),
-                            std::move(graphics_state),
-                            std::move(compute_state)));
+  auto *impl = new PipelineStateImpl(
+      device, type, resolved_root_signature.ptr(), std::move(shaders),
+      std::move(signature_links), std::move(shader_cache_key),
+      std::move(graphics_state), std::move(compute_state));
+  auto pso = Com<ID3D12PipelineState>::transfer(impl);
+  if (!impl->MaterializeBaseArtifact())
+    return nullptr;
   return pso;
 }
 
@@ -4874,9 +4879,6 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
       device, PipelineStateType::Graphics, desc->pRootSignature,
       std::move(shaders), std::move(graphics_state),
       std::move(compute_state));
-  auto *pipeline = pso ? dynamic_cast<PipelineState *>(pso.ptr()) : nullptr;
-  if (!pipeline || !pipeline->GetMetalGraphicsState())
-    pso = nullptr;
   dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), bool(pso));
   StoreStatus(status, pso ? S_OK : E_INVALIDARG);
   return pso;
@@ -4921,9 +4923,6 @@ CreateComputePipelineState(IMTLD3D12Device *device,
       device, PipelineStateType::Compute, desc->pRootSignature,
       std::move(shaders), std::move(graphics_state),
       std::move(compute_state));
-  auto *pipeline = pso ? dynamic_cast<PipelineState *>(pso.ptr()) : nullptr;
-  if (!pipeline || !pipeline->GetMetalComputeState())
-    pso = nullptr;
   dxmt::perf::recordComputePipelineCreate(ElapsedUs(create_start), bool(pso));
   StoreStatus(status, pso ? S_OK : E_INVALIDARG);
   return pso;
