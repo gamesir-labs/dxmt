@@ -25,6 +25,7 @@ d3d11_unit_sources = files(
   'clear_uav_float_matrix_spec.cpp',
   'viewport_state_matrix_spec.cpp',
   'shader_constant_buffer_binding_matrix_spec.cpp',
+  'shader_object_binding_matrix_spec.cpp',
   'shader_resource_binding_matrix_spec.cpp',
   'shader_sampler_binding_matrix_spec.cpp',
   'viewport_sampler_matrix_spec.cpp',
