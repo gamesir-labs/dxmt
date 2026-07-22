@@ -50,6 +50,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <optional>
 #include <deque>
@@ -6031,6 +6032,18 @@ private:
     std::optional<ReplayDepthStencilAttachment> depth_stencil;
   };
 
+  struct CompiledRenderPassRecipe {
+    ReplayRenderPassAttachments attachments;
+    UINT render_target_count = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t array_length = 1;
+    uint32_t sample_count = 1;
+    WMTPixelFormat dsv_format = WMTPixelFormatInvalid;
+    bool use_geometry = false;
+    bool use_tessellation = false;
+  };
+
   enum class ReplayGraphicsCommandKind : uint8_t {
     Draw,
     DrawIndexed,
@@ -6082,18 +6095,46 @@ private:
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
   };
 
-  using ReplayGraphicsCompiledPayload =
-      std::shared_ptr<void>;
+  class ReplayGraphicsCompiledPayloadArena {
+  public:
+    ReplayGraphicsCompiledPayloadArena() {
+      destructors_.reserve(256);
+    }
+
+    ReplayGraphicsCompiledPayloadArena(
+        const ReplayGraphicsCompiledPayloadArena &) = delete;
+    ReplayGraphicsCompiledPayloadArena &operator=(
+        const ReplayGraphicsCompiledPayloadArena &) = delete;
+
+    ~ReplayGraphicsCompiledPayloadArena() {
+      for (auto it = destructors_.rbegin(); it != destructors_.rend(); ++it)
+        it->destroy(it->payload);
+    }
+
+    template <typename T>
+    void *emplace(T &&payload) {
+      using Payload = std::decay_t<T>;
+      void *storage = storage_.allocate(sizeof(Payload), alignof(Payload));
+      auto *value = new (storage) Payload(std::forward<T>(payload));
+      destructors_.push_back(
+          {value, [](void *object) { static_cast<Payload *>(object)->~Payload(); }});
+      return value;
+    }
+
+  private:
+    struct Destructor {
+      void *payload = nullptr;
+      void (*destroy)(void *) = nullptr;
+    };
+
+    std::pmr::monotonic_buffer_resource storage_{64 * 1024};
+    std::vector<Destructor> destructors_;
+  };
+
+  using ReplayGraphicsCompiledPayload = void *;
   using ReplayGraphicsCompiledEncodeFn =
       void (*)(CommandQueueImpl *, ArgumentEncodingContext &, void *,
                uint64_t &);
-
-  template <typename T>
-  static ReplayGraphicsCompiledPayload
-  MakeReplayGraphicsCompiledPayload(T &&payload) {
-    using Payload = std::decay_t<T>;
-    return std::make_shared<Payload>(std::forward<T>(payload));
-  }
 
   struct ReplayGraphicsPassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
@@ -6278,7 +6319,7 @@ private:
     PipelineStage stage = PipelineStage::Vertex;
     D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     uint16_t slot = 0;
-    uint32_t argument_flags = 0;
+    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
     uint32_t descriptor_index = UINT32_MAX;
   };
 
@@ -6410,6 +6451,8 @@ private:
     std::unordered_multimap<uint64_t,
                             std::shared_ptr<GraphicsBindingSnapshot>>
         captured_binding_snapshots;
+    std::shared_ptr<ReplayGraphicsCompiledPayloadArena>
+        compiled_payload_arena;
     uint64_t argument_buffer_size = 0;
     ReplayGraphicsPassPlan plan;
     bool use_geometry = false;
@@ -6619,6 +6662,37 @@ private:
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> uav_roots = {};
   };
 
+  enum class CompiledNativeBindingOpKind : uint8_t {
+    ArgumentBuffer,
+    NullConstantBuffer,
+    NullBuffer,
+  };
+
+  struct CompiledNativeBindingRecipe {
+    struct Op {
+      CompiledNativeBindingOpKind kind =
+          CompiledNativeBindingOpKind::ArgumentBuffer;
+      WMT::Reference<WMT::Buffer> buffer;
+      uint64_t offset = 0;
+      uint32_t index = 0;
+      bool compute = false;
+      WMTRenderStages render_stages = {};
+    };
+    std::vector<Op> ops;
+  };
+
+  struct CompiledVertexBindingRecipe {
+    struct Binding {
+      uint32_t slot = 0;
+      uint64_t offset = 0;
+      uint32_t stride = 0;
+      Rc<Buffer> buffer;
+    };
+    std::vector<Binding> bindings;
+    uint32_t slot_mask = 0;
+    uint32_t cleared_slot_mask = 0;
+  };
+
   struct CompiledDirectGraphicsBindingPayload {
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
@@ -6630,10 +6704,30 @@ private:
     CompiledNativeStageBinding native_pixel;
     std::shared_ptr<GraphicsBindingSnapshot> bindless_snapshot;
     std::shared_ptr<SubmittedFrozenNativeDescriptorStore> frozen_native;
+    std::shared_ptr<const CompiledNativeBindingRecipe> native_binding_recipe;
+    std::shared_ptr<const CompiledVertexBindingRecipe> vertex_binding_recipe;
   };
 
   struct CompiledDirectAccessList {
+    enum class Kind : uint8_t { BufferRange, BufferView, TextureView };
+
+    struct EncoderAccess {
+      PipelineStage stage = PipelineStage::Vertex;
+      Kind kind = Kind::BufferRange;
+      Rc<Buffer> buffer;
+      Rc<Texture> texture;
+      uint64_t offset = 0;
+      uint64_t length = 0;
+      uint64_t view_id = 0;
+      int flags = 0;
+    };
+
     std::vector<Rc<BufferAllocation>> buffer_allocations;
+    std::vector<EncoderAccess> encoder_accesses;
+    // True when descriptor-backed accesses were resolved from the immutable
+    // Execute snapshot. A false value is an explicit compatibility escape
+    // hatch for packets created without a submission snapshot.
+    bool descriptor_accesses_precompiled = false;
   };
 
   struct ReplayComputePassCommand {
@@ -6642,10 +6736,14 @@ private:
     uint64_t argument_buffer_offset = 0;
     uint64_t argument_buffer_size = 0;
     ReplayComputeCommandKind kind = ReplayComputeCommandKind::Dispatch;
+    ReplayGraphicsCompiledEncodeFn compiled_encode = nullptr;
+    ReplayGraphicsCompiledPayload compiled_payload = nullptr;
   };
 
   struct ReplayComputePassBatch {
     std::vector<ReplayComputePassCommand> commands;
+    std::shared_ptr<ReplayGraphicsCompiledPayloadArena>
+        compiled_payload_arena;
     uint64_t argument_buffer_size = 0;
     bool active = false;
   };
@@ -6974,6 +7072,7 @@ private:
     RootSignature *root = nullptr;
     std::shared_ptr<GraphicsBindingSnapshot> bindless_snapshot;
     std::shared_ptr<SubmittedFrozenNativeDescriptorStore> frozen_native;
+    std::shared_ptr<const CompiledNativeBindingRecipe> native_binding_recipe;
   };
 
   struct ReplayDispatchPacket {
@@ -7312,10 +7411,13 @@ private:
     auto barriers = TakePendingResourceBarrierBatch(state);
     RecordSeparatorOnlyBarrier(barriers);
 
-    chunk->emitcc([commands = std::move(batch.commands),
+    chunk->emitcc([this, commands = std::move(batch.commands),
+                   compiled_payload_arena =
+                       std::move(batch.compiled_payload_arena),
                    barrier_entries = std::move(barriers.entries),
                    argument_buffer_size = batch.argument_buffer_size](
                       ArgumentEncodingContext &enc) mutable {
+      (void)compiled_payload_arena;
       enc.startComputePass(argument_buffer_size);
       EncodeResourceAccessBarrierEntries(enc, barrier_entries);
       if (!barrier_entries.empty())
@@ -7326,7 +7428,11 @@ private:
         uint64_t argbuf_offset = command.argument_buffer_offset;
         enc.setArgumentBufferWriteRange(command.argument_buffer_offset,
                                         command.argument_buffer_size);
-        command.encode(enc, argbuf_offset);
+        if (command.compiled_encode)
+          command.compiled_encode(this, enc, command.compiled_payload,
+                                  argbuf_offset);
+        else
+          command.encode(enc, argbuf_offset);
         const bool cursor_underflow =
             argbuf_offset < command.argument_buffer_offset;
         const bool cursor_overflow =
@@ -7384,20 +7490,23 @@ private:
       }
     }
 
-    chunk->emitcc([this, attachments = std::move(batch.attachments),
+    auto pass_recipe = BuildCompiledRenderPassRecipe(
+        std::move(batch.attachments), batch.use_geometry,
+        batch.use_tessellation);
+    chunk->emitcc([this, pass_recipe = std::move(pass_recipe),
                    commands = std::move(batch.commands),
+                   compiled_payload_arena =
+                       std::move(batch.compiled_payload_arena),
                    plan = batch.plan,
                    barrier_entries = std::move(barriers.entries),
                    argument_buffer_size = batch.argument_buffer_size](
                       ArgumentEncodingContext &enc) mutable {
-      bool use_geometry = false;
-      bool use_tessellation = false;
-      for (const auto &command : commands)
-        use_geometry = use_geometry || command.use_geometry;
-      for (const auto &command : commands)
-        use_tessellation = use_tessellation || command.use_tessellation;
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size,
-                           use_geometry, use_tessellation)) {
+      // Keeps every type-erased compiled payload alive until the pass has
+      // finished encoding. The arena destroys the payloads as one batch when
+      // this command closure is released.
+      (void)compiled_payload_arena;
+      if (!BeginCompiledRenderPass(enc, pass_recipe,
+                                   argument_buffer_size)) {
         return;
       }
       EncodeRenderResourceAccessBarrierEntries(enc, barrier_entries);
@@ -7414,7 +7523,7 @@ private:
           const bool compiled_encode_perf = dxmt::perf::enabled();
           const auto compiled_encode_begin =
               compiled_encode_perf ? clock::now() : clock::time_point{};
-          command.compiled_encode(this, enc, command.compiled_payload.get(),
+          command.compiled_encode(this, enc, command.compiled_payload,
                                   argbuf_offset);
           if (compiled_encode_perf) {
             dxmt::perf::recordCompiledDrawEncodeTime(
@@ -8306,8 +8415,11 @@ private:
 
     ReplayGraphicsPassCommand command = {};
     command.compiled_encode = compiled_encode;
-    command.compiled_payload =
-        MakeReplayGraphicsCompiledPayload(std::forward<Payload>(payload));
+    if (!active_batch.compiled_payload_arena)
+      active_batch.compiled_payload_arena =
+          std::make_shared<ReplayGraphicsCompiledPayloadArena>();
+    command.compiled_payload = active_batch.compiled_payload_arena->emplace(
+        std::forward<Payload>(payload));
     command.d3d_sequence = dxmt::apitrace::current_d3d_sequence();
     command.argument_buffer_size = argument_buffer_size;
     command.argument_buffer_offset = command_argbuf_offset;
@@ -8435,6 +8547,55 @@ private:
         std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
         argument_buffer_offset, argument_buffer_size,
         ReplayComputeCommandKind::Dispatch});
+  }
+
+  template <typename Payload>
+  void QueueCompiledComputePassCommand(
+      CommandChunk *chunk, ReplayState &state, uint64_t argument_buffer_size,
+      Payload &&payload, ReplayGraphicsCompiledEncodeFn compiled_encode) {
+    RecordComputePacketClassification(state, true);
+    if (!D3D12ReplayComputeBatchingEnabled()) {
+      FlushPassBatches(chunk, state);
+      auto arena =
+          std::make_shared<ReplayGraphicsCompiledPayloadArena>();
+      void *compiled_payload =
+          arena->emplace(std::forward<Payload>(payload));
+      const auto d3d_sequence = dxmt::apitrace::current_d3d_sequence();
+      chunk->emitcc([this, arena = std::move(arena), compiled_payload,
+                     compiled_encode, argument_buffer_size,
+                     d3d_sequence](ArgumentEncodingContext &enc) mutable {
+        (void)arena;
+        enc.startComputePass(argument_buffer_size);
+        uint64_t argbuf_offset = 0;
+        enc.setArgumentBufferWriteRange(0, argument_buffer_size);
+        if (d3d_sequence)
+          dxmt::apitrace::set_current_d3d_sequence(d3d_sequence);
+        compiled_encode(this, enc, compiled_payload, argbuf_offset);
+        enc.endPass();
+      });
+      return;
+    }
+
+    FlushGraphicsBeforeCompute(chunk, state);
+    auto &batch = state.compute_pass_batch;
+    if (!batch.active) {
+      batch.active = true;
+      batch.argument_buffer_size = 0;
+    }
+    if (!batch.compiled_payload_arena)
+      batch.compiled_payload_arena =
+          std::make_shared<ReplayGraphicsCompiledPayloadArena>();
+
+    ReplayComputePassCommand command = {};
+    command.compiled_encode = compiled_encode;
+    command.compiled_payload = batch.compiled_payload_arena->emplace(
+        std::forward<Payload>(payload));
+    command.d3d_sequence = dxmt::apitrace::current_d3d_sequence();
+    command.argument_buffer_offset = batch.argument_buffer_size;
+    command.argument_buffer_size = argument_buffer_size;
+    command.kind = ReplayComputeCommandKind::Dispatch;
+    batch.argument_buffer_size += argument_buffer_size;
+    batch.commands.push_back(std::move(command));
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -10117,9 +10278,12 @@ private:
                 replay_record_serial, metal_pso.handle);
           }
 
+          std::shared_ptr<const CompiledVertexBindingRecipe>
+              vertex_binding_recipe;
           const auto vertex_buffer_reason =
-              ValidateCompiledVertexBufferResources(
-                  packet, pipeline->GetGraphicsState());
+              BuildCompiledVertexBindingRecipe(
+                  packet, pipeline->GetGraphicsState(),
+                  vertex_binding_recipe);
           if (vertex_buffer_reason != CompiledCommandFallbackReason::None)
             return vertex_buffer_reason;
 
@@ -10131,6 +10295,9 @@ private:
           if (!ResolveDynamicRasterRects(viewports, scissors,
                                          "compiled draw"))
             return CompiledCommandFallbackReason::UnsupportedRenderTargetState;
+          auto dynamic_state_recipe = BuildCompiledDynamicRenderStateRecipe(
+              viewports, scissors, packet.render_state.blend_factor,
+              packet.render_state.stencil_ref, attachments);
 
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
@@ -10142,6 +10309,8 @@ private:
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           AddCompiledVertexBufferAccesses(
               direct_access, packet, pipeline->GetGraphicsState());
+          AddCompiledSnapshotEncoderAccesses(direct_access,
+                                             submitted_snapshot.get());
           const auto argument_buffer_size =
               EstimateGraphicsArgumentBufferSize(*pipeline, false, false);
           auto bindless_snapshot =
@@ -10151,6 +10320,24 @@ private:
                         ? submitted_snapshot
                         : GetOrCaptureCompiledDescriptorBindingSnapshot(
                               state, packet, *pipeline, root, false);
+          std::shared_ptr<const CompiledNativeBindingRecipe>
+              native_binding_recipe;
+          if (native_packet) {
+            const auto &native_vertex =
+                frozen_native ? submitted_snapshot->frozen_native_vertex
+                              : prepared.native_vertex;
+            const auto &native_pixel =
+                frozen_native ? submitted_snapshot->frozen_native_pixel
+                              : prepared.native_pixel;
+            const WMT::Buffer native_root_base_buffer =
+                frozen_native ? frozen_native->root_base_buffer
+                              : submitted->native_root_base_buffer;
+            native_binding_recipe = BuildCompiledNativeBindingRecipe(
+                submitted_root_tables, *pipeline, false,
+                frozen_native.get(), native_root_base_buffer,
+                {{PipelineStage::Vertex, &native_vertex},
+                 {PipelineStage::Pixel, &native_pixel}});
+          }
           if (packet.draw) {
             RecordGraphicsPipelineResourceAccess(
                 chunk, state, *pipeline, nullptr, submitted_snapshot.get());
@@ -10170,6 +10357,7 @@ private:
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
             replay_packet.common.stencil_ref = packet.render_state.stencil_ref;
+            replay_packet.common.dynamic_state_recipe = dynamic_state_recipe;
             replay_packet.common.viewports = std::move(viewports);
             replay_packet.common.scissors = std::move(scissors);
             replay_packet.common.use_geometry = false;
@@ -10197,6 +10385,8 @@ private:
                               : prepared.native_pixel;
             binding_payload.bindless_snapshot = bindless_snapshot;
             binding_payload.frozen_native = frozen_native;
+            binding_payload.native_binding_recipe = native_binding_recipe;
+            binding_payload.vertex_binding_recipe = vertex_binding_recipe;
             replay_packet.common.compiled_binding_state = binding_state;
             replay_packet.common.compiled_direct_access = direct_access;
             QueueCompiledGraphicsPassCommand(
@@ -10241,6 +10431,7 @@ private:
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
             replay_packet.common.stencil_ref = packet.render_state.stencil_ref;
+            replay_packet.common.dynamic_state_recipe = dynamic_state_recipe;
             replay_packet.common.viewports = std::move(viewports);
             replay_packet.common.scissors = std::move(scissors);
             replay_packet.common.use_geometry = false;
@@ -10280,6 +10471,8 @@ private:
                               : prepared.native_pixel;
             binding_payload.bindless_snapshot = std::move(bindless_snapshot);
             binding_payload.frozen_native = frozen_native;
+            binding_payload.native_binding_recipe = native_binding_recipe;
+            binding_payload.vertex_binding_recipe = vertex_binding_recipe;
             replay_packet.common.compiled_binding_state = binding_state;
             replay_packet.common.compiled_direct_access = direct_access;
             if (index_allocation) {
@@ -10423,10 +10616,26 @@ private:
               submitted_root_tables);
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
+          AddCompiledSnapshotEncoderAccesses(direct_access,
+                                             submitted_snapshot.get());
           RecordComputePipelineResourceAccess(
               chunk, state, *pipeline, submitted_snapshot.get());
           const auto argument_buffer_size =
               EstimateComputeArgumentBufferSize(*pipeline);
+          std::shared_ptr<const CompiledNativeBindingRecipe>
+              native_binding_recipe;
+          if (native_packet) {
+            const auto &native_compute =
+                frozen_native ? submitted_snapshot->frozen_native_compute
+                              : prepared.native_compute;
+            const WMT::Buffer native_root_base_buffer =
+                frozen_native ? frozen_native->root_base_buffer
+                              : submitted->native_root_base_buffer;
+            native_binding_recipe = BuildCompiledNativeBindingRecipe(
+                submitted_root_tables, *pipeline, true,
+                frozen_native.get(), native_root_base_buffer,
+                {{PipelineStage::Compute, &native_compute}});
+          }
           ReplayDispatchPacket dispatch_packet = {};
           dispatch_packet.metal_pso = metal->pso;
           dispatch_packet.threadgroup_size = metal->threadgroup_size;
@@ -10447,6 +10656,7 @@ private:
               frozen_native ? submitted_snapshot->frozen_native_compute
                             : prepared.native_compute;
           binding_payload.frozen_native = frozen_native;
+          binding_payload.native_binding_recipe = native_binding_recipe;
           binding_payload.root = root;
           if (!native_packet) {
             binding_payload.bindless_snapshot =
@@ -10455,14 +10665,9 @@ private:
                     : GetOrCaptureCompiledDescriptorBindingSnapshot(
                           state, packet, *pipeline, root, true);
           }
-          QueueComputePassCommand(
+          QueueCompiledComputePassCommand(
               chunk, state, argument_buffer_size,
-              [this, dispatch_packet = std::move(dispatch_packet)](
-                  ArgumentEncodingContext &enc,
-                  uint64_t &argbuf_offset) mutable {
-                EncodeReplayDispatchPacket(enc, dispatch_packet,
-                                           argbuf_offset);
-              }, true);
+              std::move(dispatch_packet), EncodeReplayDispatchCompiled);
           chunk = queue.CurrentChunk();
           return CompiledCommandFallbackReason::None;
         };
@@ -18331,7 +18536,7 @@ private:
                         static_cast<uint16_t>(
                             argument->SM50BindingSlot +
                             entry.argument_local_start + local),
-                        static_cast<uint32_t>(argument->Flags),
+                        *argument,
                         descriptor_record_index});
               }
             }
@@ -20090,7 +20295,7 @@ private:
       if (access.stage != PipelineStage::Pixel ||
           access.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
           access.slot >= 128 ||
-          !(access.argument_flags &
+          !(access.argument.Flags &
             MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED))
         continue;
       const auto &descriptor =
@@ -20863,28 +21068,48 @@ private:
     return CompiledCommandFallbackReason::None;
   }
 
-  CompiledCommandFallbackReason ValidateCompiledVertexBufferResources(
+  CompiledCommandFallbackReason BuildCompiledVertexBindingRecipe(
       const CompiledGraphicsPacket &packet,
-      const PipelineGraphicsState *graphics_state) {
+      const PipelineGraphicsState *graphics_state,
+      std::shared_ptr<const CompiledVertexBindingRecipe> &out) {
     if (!graphics_state)
       return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
-
-    uint32_t slot_mask = 0;
+    auto recipe = std::make_shared<CompiledVertexBindingRecipe>();
     for (const auto &element : graphics_state->input_elements) {
       if (element.InputSlot < 32)
-        slot_mask |= 1u << element.InputSlot;
+        recipe->slot_mask |= 1u << element.InputSlot;
     }
+    uint32_t populated_slot_mask = 0;
+    recipe->bindings.reserve(packet.input_assembler.vertex_buffers.size());
     for (const auto &vb : packet.input_assembler.vertex_buffers) {
-      if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
+      if (vb.slot < 32)
+        populated_slot_mask |= 1u << vb.slot;
+      if (vb.slot >= 32 || !(recipe->slot_mask & (1u << vb.slot)))
         continue;
-      Resource *resource = nullptr;
-      ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
-      if (!resource || !resource->GetBuffer() ||
-          !resource->GetBufferAllocation())
-        return packet.pipeline.metadata.uses_native_descriptor_table_abi
-                   ? CompiledCommandFallbackReason::NativeUnsupportedDynamicResource
-                   : CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+      CompiledVertexBindingRecipe::Binding binding = {};
+      binding.slot = vb.slot;
+      binding.stride = vb.view.StrideInBytes;
+      if (vb.view.BufferLocation && vb.view.SizeInBytes) {
+        Resource *resource = nullptr;
+        const auto offset =
+            ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
+        if (!resource || !resource->GetBuffer() ||
+            !resource->GetBufferAllocation())
+          return packet.pipeline.metadata.uses_native_descriptor_table_abi
+                     ? CompiledCommandFallbackReason::
+                           NativeUnsupportedDynamicResource
+                     : CompiledCommandFallbackReason::
+                           UnsupportedVertexIndexState;
+        binding.offset = resource->GetHeapOffset() + offset;
+        binding.buffer = Rc<Buffer>(resource->GetBuffer());
+      }
+      recipe->bindings.push_back(std::move(binding));
     }
+    recipe->cleared_slot_mask =
+        recipe->slot_mask &
+        uint32_t(packet.input_assembler.vertex_buffer_dirty_mask) &
+        ~populated_slot_mask;
+    out = std::move(recipe);
     return CompiledCommandFallbackReason::None;
   }
 
@@ -20956,6 +21181,129 @@ private:
           DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX, compute,
           render_stages);
     });
+  }
+
+  std::shared_ptr<const CompiledNativeBindingRecipe>
+  BuildCompiledNativeBindingRecipe(
+      const std::vector<CompiledCommandRootDescriptorTable> &tables,
+      const PipelineState &pipeline, bool compute,
+      const SubmittedFrozenNativeDescriptorStore *frozen,
+      WMT::Buffer native_root_base_buffer,
+      std::initializer_list<std::pair<PipelineStage,
+                                      const CompiledNativeStageBinding *>>
+          stages) {
+    auto recipe = std::make_shared<CompiledNativeBindingRecipe>();
+    auto add_argument_buffer = [&](WMT::Buffer buffer, uint64_t offset,
+                                   uint32_t index,
+                                   WMTRenderStages render_stages) {
+      if (!buffer)
+        return;
+      recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
+          CompiledNativeBindingOpKind::ArgumentBuffer,
+          WMT::Reference<WMT::Buffer>(buffer), offset, index, compute,
+          render_stages});
+    };
+
+    const WMTRenderStages all_render_stages =
+        compute ? WMTRenderStages{}
+                : WMTRenderStageVertex | WMTRenderStageFragment;
+    if (frozen && frozen->ready) {
+      add_argument_buffer(
+          frozen->descriptor_table_buffer,
+          frozen->descriptor_table_buffer_offset,
+          DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX, all_render_stages);
+      add_argument_buffer(
+          frozen->descriptor_table_buffer,
+          frozen->descriptor_table_buffer_offset,
+          DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX, all_render_stages);
+      add_argument_buffer(
+          frozen->buffer_resource_table_buffer,
+          frozen->buffer_resource_table_buffer_offset,
+          DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX,
+          all_render_stages);
+      add_argument_buffer(
+          frozen->buffer_record_buffer,
+          frozen->buffer_record_buffer_offset,
+          DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX,
+          all_render_stages);
+    } else {
+      ForEachCompiledDescriptorMirror(tables, [&](DescriptorHeapMirror &mirror) {
+        if (!mirror.descriptorTableBackendReady())
+          return;
+        add_argument_buffer(
+            mirror.descriptorTableBuffer(), 0,
+            mirror.isSamplerHeap()
+                ? DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX
+                : DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX,
+            all_render_stages);
+        if (mirror.isSamplerHeap())
+          return;
+        add_argument_buffer(
+            mirror.bufferResourceTableBuffer(), 0,
+            DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX,
+            all_render_stages);
+        add_argument_buffer(
+            mirror.bufferDescriptorRecordBuffer(), 0,
+            DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX,
+            all_render_stages);
+      });
+    }
+
+    for (const auto &[stage, binding] : stages) {
+      if (!binding || !binding->ready)
+        continue;
+      const auto *shader = FindShaderForStage(pipeline, stage);
+      if (!shader)
+        continue;
+      const WMTRenderStages render_stages =
+          compute ? WMTRenderStages{}
+                  : stage == PipelineStage::Vertex
+                        ? WMTRenderStageVertex
+                        : stage == PipelineStage::Pixel
+                              ? WMTRenderStageFragment
+                              : WMTRenderStages{};
+      if (shader->reflection().NumConstantBuffers) {
+        recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
+            CompiledNativeBindingOpKind::NullConstantBuffer, {}, 0, 0,
+            compute, render_stages});
+      }
+      if (NativeShaderUsesBufferSrv(*shader)) {
+        recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
+            CompiledNativeBindingOpKind::NullBuffer, {}, 0, 0, compute,
+            render_stages});
+      }
+      if (binding->cbuffer_root_base_count) {
+        add_argument_buffer(
+            native_root_base_buffer, binding->cbuffer_root_base_offset,
+            DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX,
+            render_stages);
+      }
+      if (binding->resource_root_base_count) {
+        add_argument_buffer(
+            native_root_base_buffer, binding->resource_root_base_offset,
+            DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX, render_stages);
+      }
+    }
+    return recipe;
+  }
+
+  static void EncodeCompiledNativeBindingRecipe(
+      ArgumentEncodingContext &enc,
+      const CompiledNativeBindingRecipe &recipe) {
+    for (const auto &op : recipe.ops) {
+      switch (op.kind) {
+      case CompiledNativeBindingOpKind::ArgumentBuffer:
+        enc.bindNativeArgumentBuffer(op.buffer, op.offset, op.index,
+                                     op.compute, op.render_stages);
+        break;
+      case CompiledNativeBindingOpKind::NullConstantBuffer:
+        enc.bindNativeNullConstantBuffer(op.compute, op.render_stages);
+        break;
+      case CompiledNativeBindingOpKind::NullBuffer:
+        enc.bindNativeNullBuffer(op.compute, op.render_stages);
+        break;
+      }
+    }
   }
 
   template <typename State>
@@ -21503,13 +21851,15 @@ private:
       bool compute, uint64_t &argbuf_offset,
       WMT::Buffer native_root_base_buffer = {},
       const CompiledNativeStageBinding *native_binding = nullptr,
+      bool descriptor_accesses_precompiled = false,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
     if (pipeline.GetShaderAbiVersion() ==
         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
       if (!native_binding || !native_binding->ready)
         return;
-      TrackCompiledNativeStageDescriptorAccesses<Stage>(
-          enc, tables, pipeline, root, compute);
+      if (!descriptor_accesses_precompiled)
+        TrackCompiledNativeStageDescriptorAccesses<Stage>(
+            enc, tables, pipeline, root, compute);
       const AllocatedArgumentBufferSlice cbuffer_root_bases = {
           nullptr, native_root_base_buffer,
           native_binding->cbuffer_root_base_offset, 0,
@@ -21630,12 +21980,33 @@ private:
     enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
   }
 
+  void EncodeCompiledVertexBindingRecipe(
+      ArgumentEncodingContext &enc,
+      const CompiledVertexBindingRecipe &recipe,
+      uint64_t &argbuf_offset) {
+    for (UINT slot = 0; slot < 32; ++slot) {
+      if (recipe.cleared_slot_mask & (1u << slot))
+        enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
+    }
+    for (const auto &binding : recipe.bindings) {
+      enc.bindVertexBuffer(binding.slot, binding.offset, binding.stride,
+                           Rc<Buffer>(binding.buffer));
+    }
+    if (!recipe.slot_mask)
+      return;
+    const auto table_size =
+        uint64_t(__builtin_popcount(recipe.slot_mask)) * 16u;
+    const auto offset = AllocateArgumentBuffer(argbuf_offset, table_size);
+    enc.encodeVertexBuffers<PipelineKind::Ordinary>(recipe.slot_mask, offset);
+  }
+
   void EncodeCompiledGraphicsBindings(
       ArgumentEncodingContext &enc,
       const CompiledDirectGraphicsBindingPayload &payload,
       const CompiledPacketBindingState &binding_state,
       PipelineState &pipeline, RootSignature &root,
       uint64_t &argbuf_offset,
+      bool descriptor_accesses_precompiled,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
     assert(payload.root_tables);
     const auto &root_tables = *payload.root_tables;
@@ -21644,15 +22015,32 @@ private:
     diag.uses_bindless_mirror = pipeline.UsesBindlessMirror();
     diag.bindless_bound = diag.uses_bindless_mirror;
     diag.path = "compiled-direct";
-    if (pipeline.GetShaderAbiVersion() ==
-        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE) {
-      EncodeCompiledNativeArgumentTables(
-          enc, root_tables, false,
-          WMTRenderStageVertex | WMTRenderStageFragment,
-          payload.frozen_native.get());
+    const bool native = pipeline.GetShaderAbiVersion() ==
+                        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+    if (native) {
+      if (payload.native_binding_recipe) {
+        EncodeCompiledNativeBindingRecipe(enc,
+                                          *payload.native_binding_recipe);
+      } else {
+        EncodeCompiledNativeArgumentTables(
+            enc, root_tables, false,
+            WMTRenderStageVertex | WMTRenderStageFragment,
+            payload.frozen_native.get());
+      }
     }
-    EncodeCompiledVertexBuffers(enc, payload.input_assembler,
-                                pipeline.GetGraphicsState(), argbuf_offset);
+    if (payload.vertex_binding_recipe) {
+      EncodeCompiledVertexBindingRecipe(
+          enc, *payload.vertex_binding_recipe, argbuf_offset);
+    } else {
+      EncodeCompiledVertexBuffers(enc, payload.input_assembler,
+                                  pipeline.GetGraphicsState(), argbuf_offset);
+    }
+    // Native packets reject root constants/descriptors during submission.
+    // Their complete argument-table and root-base program is already the
+    // flat recipe above, so avoid walking the root signature and shader list
+    // again on the asynchronous encoder thread.
+    if (native && payload.native_binding_recipe)
+      return;
     EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, false);
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
@@ -21664,7 +22052,8 @@ private:
           EncodeCompiledShaderBindingsForStage<PipelineStage::Vertex>(
               enc, root_tables, pipeline, root, shader, key,
               false, argbuf_offset, payload.native_root_base_buffer,
-              &payload.native_vertex, &diag);
+              &payload.native_vertex, descriptor_accesses_precompiled,
+              &diag);
         }
       } else if (shader.stage == PipelineShaderStage::Pixel) {
         if (payload.bindless_snapshot) {
@@ -21674,7 +22063,8 @@ private:
           EncodeCompiledShaderBindingsForStage<PipelineStage::Pixel>(
               enc, root_tables, pipeline, root, shader, key,
               false, argbuf_offset, payload.native_root_base_buffer,
-              &payload.native_pixel, &diag);
+              &payload.native_pixel, descriptor_accesses_precompiled,
+              &diag);
         }
       }
     }
@@ -21753,6 +22143,134 @@ private:
     add_roots(state.uav_roots);
   }
 
+  static void AddCompiledDirectEncoderAccess(
+      CompiledDirectAccessList &list,
+      CompiledDirectAccessList::EncoderAccess access) {
+    for (auto &existing : list.encoder_accesses) {
+      if (existing.stage != access.stage || existing.kind != access.kind ||
+          existing.buffer.ptr() != access.buffer.ptr() ||
+          existing.texture.ptr() != access.texture.ptr() ||
+          existing.offset != access.offset || existing.length != access.length ||
+          existing.view_id != access.view_id)
+        continue;
+      existing.flags |= access.flags;
+      return;
+    }
+    list.encoder_accesses.push_back(std::move(access));
+  }
+
+  void AddCompiledDescriptorEncoderAccess(
+      CompiledDirectAccessList &list, PipelineStage stage,
+      D3D12_DESCRIPTOR_RANGE_TYPE range_type,
+      const DescriptorRecord &descriptor,
+      const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
+    using Access = CompiledDirectAccessList::EncoderAccess;
+    using Kind = CompiledDirectAccessList::Kind;
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: {
+      ConstantBufferBinding binding = {};
+      if (!MakeConstantBufferBindingFromDescriptor(descriptor, binding) ||
+          !binding.buffer || !descriptor.has_desc ||
+          !descriptor.desc.cbv.SizeInBytes)
+        return;
+      AddCompiledDirectEncoderAccess(
+          list, Access{stage, Kind::BufferRange, std::move(binding.buffer), {},
+                       binding.offset, descriptor.desc.cbv.SizeInBytes, 0,
+                       ResourceAccess::Read});
+      return;
+    }
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: {
+      ResourceViewBinding binding = {};
+      if (!MakeShaderResourceBindingFromDescriptor(
+              device_->GetMTLDevice(), descriptor, argument, binding))
+        return;
+      if (binding.buffer) {
+        AddCompiledDirectEncoderAccess(
+            list, Access{stage,
+                         binding.viewId ? Kind::BufferView : Kind::BufferRange,
+                         std::move(binding.buffer), {},
+                         binding.slice.byteOffset, binding.slice.byteLength,
+                         binding.viewId, ResourceAccess::Read});
+      } else if (binding.texture && binding.viewId) {
+        AddCompiledDirectEncoderAccess(
+            list, Access{stage, Kind::TextureView, {},
+                         std::move(binding.texture), 0, 0, binding.viewId,
+                         ResourceAccess::Read});
+      }
+      return;
+    }
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: {
+      UnorderedAccessViewBinding binding = {};
+      if (!MakeUnorderedAccessBindingFromDescriptor(
+              device_->GetMTLDevice(), descriptor, argument, binding))
+        return;
+      bool read = argument && ((argument->Flags >> 10) & 1);
+      bool write = argument && ((argument->Flags >> 10) & 2);
+      if (!read && !write)
+        read = write = true;
+      const int flags = (read ? ResourceAccess::Read : 0) |
+                        (write ? ResourceAccess::Write : 0) |
+                        ResourceAccess::UAV;
+      if (binding.buffer) {
+        AddCompiledDirectEncoderAccess(
+            list, Access{stage,
+                         binding.viewId ? Kind::BufferView : Kind::BufferRange,
+                         std::move(binding.buffer), {},
+                         binding.slice.byteOffset, binding.slice.byteLength,
+                         binding.viewId, flags});
+      } else if (binding.texture && binding.viewId) {
+        AddCompiledDirectEncoderAccess(
+            list, Access{stage, Kind::TextureView, {},
+                         std::move(binding.texture), 0, 0, binding.viewId,
+                         flags});
+      }
+      if (binding.counter) {
+        AddCompiledDirectEncoderAccess(
+            list, Access{stage, Kind::BufferRange,
+                         std::move(binding.counter), {}, 0,
+                         sizeof(uint32_t), 0, ResourceAccess::All});
+      }
+      return;
+    }
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      return;
+    }
+  }
+
+  void AddCompiledSnapshotEncoderAccesses(
+      CompiledDirectAccessList &list,
+      const GraphicsBindingSnapshot *snapshot) {
+    if (!snapshot || !snapshot->native)
+      return;
+    list.descriptor_accesses_precompiled = true;
+    for (const auto &access : snapshot->native_descriptor_accesses) {
+      if (!snapshot->descriptor_records ||
+          access.descriptor_index >= snapshot->descriptor_records->records.size())
+        continue;
+      AddCompiledDescriptorEncoderAccess(
+          list, access.stage, access.range_type,
+          snapshot->descriptor_records->records[access.descriptor_index],
+          &access.argument);
+    }
+    if (snapshot->native_descriptor_recipe) {
+      const auto &entries = snapshot->native_descriptor_recipe->entries;
+      assert(entries.size() == snapshot->native_descriptor_indices.size());
+      for (size_t i = 0; i < entries.size(); ++i) {
+        const auto descriptor_index = snapshot->native_descriptor_indices[i];
+        if (descriptor_index == UINT32_MAX ||
+            !snapshot->descriptor_records ||
+            descriptor_index >= snapshot->descriptor_records->records.size())
+          continue;
+        const auto &entry = entries[i];
+        AddCompiledDescriptorEncoderAccess(
+            list, static_cast<PipelineStage>(entry.stage),
+            static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type),
+            snapshot->descriptor_records->records[descriptor_index],
+            &entry.argument);
+      }
+    }
+  }
+
   static void PublishCompiledDirectAccessListForEncode(
       ArgumentEncodingContext &enc, const CompiledDirectAccessList &list) {
     auto &queue = enc.queue();
@@ -21771,6 +22289,47 @@ private:
       queue.RemovePersistentResidencyAfterCompletion(allocation->buffer(),
                                                       sequence);
     }
+    auto publish = [&]<PipelineStage Stage>(
+                       const CompiledDirectAccessList::EncoderAccess &access) {
+      switch (access.kind) {
+      case CompiledDirectAccessList::Kind::BufferRange:
+        if (access.buffer && access.length)
+          enc.access<Stage>(access.buffer, access.offset, access.length,
+                            access.flags);
+        break;
+      case CompiledDirectAccessList::Kind::BufferView:
+        if (access.buffer && access.view_id)
+          enc.access<Stage>(access.buffer, access.view_id, access.flags);
+        break;
+      case CompiledDirectAccessList::Kind::TextureView:
+        if (access.texture && access.view_id)
+          enc.access<Stage>(access.texture, access.view_id, access.flags);
+        break;
+      }
+    };
+    for (const auto &access : list.encoder_accesses) {
+      switch (access.stage) {
+      case PipelineStage::Compute:
+        publish.template operator()<PipelineStage::Compute>(access);
+        break;
+      case PipelineStage::Pixel:
+        publish.template operator()<PipelineStage::Pixel>(access);
+        break;
+      case PipelineStage::Geometry:
+        publish.template operator()<PipelineStage::Geometry>(access);
+        break;
+      case PipelineStage::Hull:
+        publish.template operator()<PipelineStage::Hull>(access);
+        break;
+      case PipelineStage::Domain:
+        publish.template operator()<PipelineStage::Domain>(access);
+        break;
+      case PipelineStage::Vertex:
+      default:
+        publish.template operator()<PipelineStage::Vertex>(access);
+        break;
+      }
+    }
   }
 
   void EncodeCompiledComputeBindings(
@@ -21781,12 +22340,21 @@ private:
       PipelineState &pipeline, RootSignature &root,
       uint64_t &argbuf_offset, WMT::Buffer native_root_base_buffer,
       const std::shared_ptr<GraphicsBindingSnapshot> &bindless_snapshot,
-      const SubmittedFrozenNativeDescriptorStore *frozen_native) {
-    if (pipeline.GetShaderAbiVersion() ==
-        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE)
-      EncodeCompiledNativeArgumentTables(
-          enc, root_tables, true, {}, frozen_native);
+      const SubmittedFrozenNativeDescriptorStore *frozen_native,
+      bool descriptor_accesses_precompiled,
+      const CompiledNativeBindingRecipe *native_binding_recipe) {
+    const bool native = pipeline.GetShaderAbiVersion() ==
+                        DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
+    if (native) {
+      if (native_binding_recipe)
+        EncodeCompiledNativeBindingRecipe(enc, *native_binding_recipe);
+      else
+        EncodeCompiledNativeArgumentTables(
+            enc, root_tables, true, {}, frozen_native);
+    }
     RecordBindlessMirrorDiagDispatch();
+    if (native && native_binding_recipe)
+      return;
     EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, true);
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
@@ -21799,7 +22367,7 @@ private:
         EncodeCompiledShaderBindingsForStage<PipelineStage::Compute>(
             enc, root_tables, pipeline, root, shader, key,
             true, argbuf_offset, native_root_base_buffer,
-            &native_compute);
+            &native_compute, descriptor_accesses_precompiled);
       }
     }
   }
@@ -21825,7 +22393,9 @@ private:
           enc, payload.packet, *payload.root_tables, payload.native_compute,
           payload.binding_state, *packet.pipeline,
           *payload.root, argbuf_offset, payload.native_root_base_buffer,
-          payload.bindless_snapshot, payload.frozen_native.get());
+          payload.bindless_snapshot, payload.frozen_native.get(),
+          payload.direct_access.descriptor_accesses_precompiled,
+          payload.native_binding_recipe.get());
     } else {
       const uint64_t argbuf_base = argbuf_offset;
       EncodeComputeBindings(enc, *packet.replay_state, *packet.pipeline,
@@ -21848,6 +22418,13 @@ private:
       dxmt::perf::recordCompiledDispatchEncodeTime(
           &enc.currentFrameStatistics(), clock::now() - encode_begin);
     }
+  }
+
+  static void EncodeReplayDispatchCompiled(
+      CommandQueueImpl *queue, ArgumentEncodingContext &enc, void *payload,
+      uint64_t &argbuf_offset) {
+    queue->EncodeReplayDispatchPacket(
+        enc, *static_cast<ReplayDispatchPacket *>(payload), argbuf_offset);
   }
 
   void ApplyGraphicsBindingSnapshot(ArgumentEncodingContext &enc,
@@ -22573,41 +23150,47 @@ private:
   }
 
 
-  static bool BeginRenderPass(ArgumentEncodingContext &enc,
-                              ReplayRenderPassAttachments &attachments,
-                              uint64_t argument_buffer_size,
-                              bool use_geometry = false,
-                              bool use_tessellation = false) {
+  static CompiledRenderPassRecipe BuildCompiledRenderPassRecipe(
+      ReplayRenderPassAttachments attachments, bool use_geometry,
+      bool use_tessellation) {
+    CompiledRenderPassRecipe recipe = {};
+    recipe.attachments = std::move(attachments);
+    recipe.use_geometry = use_geometry;
+    recipe.use_tessellation = use_tessellation;
+    for (const auto &color : recipe.attachments.colors) {
+      recipe.render_target_count =
+          std::max(recipe.render_target_count, color.slot + 1);
+      recipe.width = recipe.width ? recipe.width : color.width;
+      recipe.height = recipe.height ? recipe.height : color.height;
+      recipe.array_length =
+          std::max<uint32_t>(recipe.array_length, color.array_length);
+      recipe.sample_count = std::max<uint32_t>(
+          recipe.sample_count, color.texture->sampleCount());
+    }
+    if (recipe.attachments.depth_stencil) {
+      const auto &depth_stencil = *recipe.attachments.depth_stencil;
+      recipe.width = recipe.width ? recipe.width : depth_stencil.width;
+      recipe.height = recipe.height ? recipe.height : depth_stencil.height;
+      recipe.array_length =
+          std::max<uint32_t>(recipe.array_length,
+                             depth_stencil.array_length);
+      recipe.sample_count = std::max<uint32_t>(
+          recipe.sample_count, depth_stencil.texture->sampleCount());
+      recipe.dsv_format = depth_stencil.format;
+    }
+    return recipe;
+  }
+
+  static bool BeginCompiledRenderPass(ArgumentEncodingContext &enc,
+                                      CompiledRenderPassRecipe &recipe,
+                                      uint64_t argument_buffer_size) {
+    auto &attachments = recipe.attachments;
     if (attachments.colors.empty() && !attachments.depth_stencil)
       return false;
 
-    UINT render_target_count = 0;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t array_length = 1;
-    uint32_t sample_count = 1;
-    for (const auto &color : attachments.colors) {
-      render_target_count = std::max(render_target_count, color.slot + 1);
-      width = width ? width : color.width;
-      height = height ? height : color.height;
-      array_length = std::max<uint32_t>(array_length, color.array_length);
-      sample_count = std::max<uint32_t>(sample_count,
-                                        color.texture->sampleCount());
-    }
-    if (attachments.depth_stencil) {
-      width = width ? width : attachments.depth_stencil->width;
-      height = height ? height : attachments.depth_stencil->height;
-      array_length =
-          std::max<uint32_t>(array_length, attachments.depth_stencil->array_length);
-      sample_count = std::max<uint32_t>(
-          sample_count, attachments.depth_stencil->texture->sampleCount());
-    }
-
-    const auto dsv_format = attachments.depth_stencil
-                                ? attachments.depth_stencil->format
-                                : WMTPixelFormatInvalid;
-    auto &info = *enc.startRenderPass(DepthStencilPlanarFlags(dsv_format), 0,
-                                      render_target_count,
+    auto &info = *enc.startRenderPass(
+        DepthStencilPlanarFlags(recipe.dsv_format), 0,
+                                      recipe.render_target_count,
                                       argument_buffer_size);
     for (auto &rtv : attachments.colors) {
       auto &color = info.colors[rtv.slot];
@@ -22646,14 +23229,27 @@ private:
       }
     }
 
-    info.render_target_width = width;
-    info.render_target_height = height;
-    info.render_target_array_length = array_length;
-    info.default_raster_sample_count = sample_count;
-    info.tile_barrier_pso_key.raster_sample_count = sample_count;
-    info.use_geometry = info.use_geometry || use_geometry;
-    info.use_tessellation = info.use_tessellation || use_tessellation;
+    info.render_target_width = recipe.width;
+    info.render_target_height = recipe.height;
+    info.render_target_array_length = recipe.array_length;
+    info.default_raster_sample_count = recipe.sample_count;
+    info.tile_barrier_pso_key.raster_sample_count = recipe.sample_count;
+    info.use_geometry = info.use_geometry || recipe.use_geometry;
+    info.use_tessellation = info.use_tessellation || recipe.use_tessellation;
     return true;
+  }
+
+  static bool BeginRenderPass(ArgumentEncodingContext &enc,
+                              ReplayRenderPassAttachments &attachments,
+                              uint64_t argument_buffer_size,
+                              bool use_geometry = false,
+                              bool use_tessellation = false) {
+    auto recipe = BuildCompiledRenderPassRecipe(
+        std::move(attachments), use_geometry, use_tessellation);
+    const bool began =
+        BeginCompiledRenderPass(enc, recipe, argument_buffer_size);
+    attachments = std::move(recipe.attachments);
+    return began;
   }
 
   static bool ResolveDynamicRasterRects(
@@ -23761,6 +24357,14 @@ private:
     std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
     UINT stencil_ref = 0;
     Rc<VisibilityResultQuery> visibility_query;
+    struct CompiledDynamicRenderStateRecipe {
+      std::vector<WMTViewport> viewports;
+      std::vector<WMTScissorRect> scissors;
+      std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+      uint8_t stencil_ref = 0;
+    };
+    std::shared_ptr<const CompiledDynamicRenderStateRecipe>
+        dynamic_state_recipe;
     CompiledImmutableVector<D3D12_VIEWPORT> viewports;
     CompiledImmutableVector<D3D12_RECT> scissors;
     uint64_t max_object_threadgroups = 0;
@@ -23770,6 +24374,121 @@ private:
     bool use_tessellation = false;
     BindlessMirrorDrawDiag bindless_diag = {};
   };
+
+  static std::shared_ptr<const
+      ReplayDrawPacketCommon::CompiledDynamicRenderStateRecipe>
+  BuildCompiledDynamicRenderStateRecipe(
+      const std::vector<D3D12_VIEWPORT> &viewports,
+      const std::vector<D3D12_RECT> &scissors,
+      const std::array<FLOAT, 4> &blend_factor, UINT stencil_ref,
+      const ReplayRenderPassAttachments &attachments) {
+    auto recipe = std::make_shared<
+        ReplayDrawPacketCommon::CompiledDynamicRenderStateRecipe>();
+    recipe->blend_factor = blend_factor;
+    recipe->stencil_ref = static_cast<uint8_t>(stencil_ref);
+    recipe->viewports.reserve(viewports.size());
+    for (const auto &viewport : viewports) {
+      recipe->viewports.push_back(
+          {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+           viewport.Height, viewport.MinDepth, viewport.MaxDepth});
+    }
+
+    uint64_t target_width = 0;
+    uint64_t target_height = 0;
+    for (const auto &color : attachments.colors) {
+      if (!target_width)
+        target_width = color.width;
+      if (!target_height)
+        target_height = color.height;
+    }
+    if (attachments.depth_stencil) {
+      if (!target_width)
+        target_width = attachments.depth_stencil->width;
+      if (!target_height)
+        target_height = attachments.depth_stencil->height;
+    }
+
+    // Metal requires one scissor per viewport. Resolve and clamp the complete
+    // array while the submitted packet and its render attachments are still
+    // immutable, rather than rebuilding it in list_enc.execute().
+    recipe->scissors.resize(viewports.size());
+    const size_t active_scissor_count =
+        std::min(scissors.size(), viewports.size());
+    for (size_t i = 0; i < active_scissor_count; i++) {
+      const auto &rect = scissors[i];
+      const int64_t left = std::max<int64_t>(0, rect.left);
+      const int64_t top = std::max<int64_t>(0, rect.top);
+      const int64_t right = std::max<int64_t>(left, rect.right);
+      const int64_t bottom = std::max<int64_t>(top, rect.bottom);
+      const uint64_t x = std::min<uint64_t>(left, target_width);
+      const uint64_t y = std::min<uint64_t>(top, target_height);
+      const uint64_t clamped_right =
+          std::min<uint64_t>(right, target_width);
+      const uint64_t clamped_bottom =
+          std::min<uint64_t>(bottom, target_height);
+      recipe->scissors[i] =
+          {x, y, clamped_right - x, clamped_bottom - y};
+    }
+    return recipe;
+  }
+
+  static void EncodeCompiledDynamicRenderState(
+      ArgumentEncodingContext &enc,
+      const ReplayDrawPacketCommon::CompiledDynamicRenderStateRecipe &recipe) {
+    auto values_equal = [](const auto &lhs, const auto &rhs) {
+      using Value = typename std::decay_t<decltype(lhs)>::value_type;
+      return lhs.size() == rhs.size() &&
+             (!lhs.size() ||
+              std::memcmp(lhs.data(), rhs.data(),
+                          lhs.size() * sizeof(Value)) == 0);
+    };
+    auto *render_encoder = enc.currentRenderEncoder();
+    auto &cache = render_encoder->dynamic_state_cache;
+    if (!cache.blend_valid || cache.blend_factor != recipe.blend_factor ||
+        cache.stencil_ref != recipe.stencil_ref) {
+      auto &blend = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
+      blend.type = WMTRenderCommandSetBlendFactorAndStencilRef;
+      blend.red = recipe.blend_factor[0];
+      blend.green = recipe.blend_factor[1];
+      blend.blue = recipe.blend_factor[2];
+      blend.alpha = recipe.blend_factor[3];
+      blend.stencil_ref = recipe.stencil_ref;
+      cache.blend_factor = recipe.blend_factor;
+      cache.stencil_ref = recipe.stencil_ref;
+      cache.blend_valid = true;
+    }
+    if (!cache.viewports_valid ||
+        !values_equal(cache.viewports, recipe.viewports)) {
+      auto &command = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
+      command.type = WMTRenderCommandSetViewports;
+      auto *data = static_cast<WMTViewport *>(enc.allocate_cpu_heap(
+          sizeof(WMTViewport) * recipe.viewports.size(),
+          alignof(WMTViewport)));
+      if (!recipe.viewports.empty())
+        std::memcpy(data, recipe.viewports.data(),
+                    sizeof(WMTViewport) * recipe.viewports.size());
+      command.viewports.set(data);
+      command.viewport_count = recipe.viewports.size();
+      cache.viewports = recipe.viewports;
+      cache.viewports_valid = true;
+    }
+    if (!cache.scissors_valid ||
+        !values_equal(cache.scissors, recipe.scissors)) {
+      auto &command =
+          enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
+      command.type = WMTRenderCommandSetScissorRects;
+      auto *data = static_cast<WMTScissorRect *>(enc.allocate_cpu_heap(
+          sizeof(WMTScissorRect) * recipe.scissors.size(),
+          alignof(WMTScissorRect)));
+      if (!recipe.scissors.empty())
+        std::memcpy(data, recipe.scissors.data(),
+                    sizeof(WMTScissorRect) * recipe.scissors.size());
+      command.scissor_rects.set(data);
+      command.rect_count = recipe.scissors.size();
+      cache.scissors = recipe.scissors;
+      cache.scissors_valid = true;
+    }
+  }
 
   struct ReplayDrawInstancedPacket {
     ReplayDrawPacketCommon common;
@@ -23810,7 +24529,10 @@ private:
     BindlessMirrorDrawDiag diag = {};
     EncodeCompiledGraphicsBindings(enc, payload, binding_state,
                                    *common.pipeline, *root,
-                                   argbuf_offset, &diag);
+                                   argbuf_offset,
+                                   common.compiled_direct_access
+                                       .descriptor_accesses_precompiled,
+                                   &diag);
     diag.path = "compiled-direct";
     common.bindless_diag = diag;
   }
@@ -23932,8 +24654,12 @@ private:
         dxmt::perf::ScopedFrameDuration dynamic_state_scope(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
-        EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
-                                 packet.blend_factor, packet.stencil_ref);
+        if (packet.dynamic_state_recipe)
+          EncodeCompiledDynamicRenderState(enc,
+                                           *packet.dynamic_state_recipe);
+        else
+          EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
+                                   packet.blend_factor, packet.stencil_ref);
       }
       return;
     }
@@ -24018,8 +24744,11 @@ private:
       dxmt::perf::ScopedFrameDuration dynamic_state_scope(
           perf_stats,
           &dxmt::FrameStatistics::frame_compiled_draw_dynamic_state_interval);
-      EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
-                               packet.blend_factor, packet.stencil_ref);
+      if (packet.dynamic_state_recipe)
+        EncodeCompiledDynamicRenderState(enc, *packet.dynamic_state_recipe);
+      else
+        EncodeDynamicRenderState(enc, packet.viewports, packet.scissors,
+                                 packet.blend_factor, packet.stencil_ref);
     }
   }
 
