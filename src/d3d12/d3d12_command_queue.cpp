@@ -6089,9 +6089,7 @@ private:
   static ReplayGraphicsCompiledPayload
   MakeReplayGraphicsCompiledPayload(T &&payload) {
     using Payload = std::decay_t<T>;
-    return ReplayGraphicsCompiledPayload(
-        new Payload(std::forward<T>(payload)),
-        [](void *ptr) { delete static_cast<Payload *>(ptr); });
+    return std::make_shared<Payload>(std::forward<T>(payload));
   }
 
   struct ReplayGraphicsPassCommand {
