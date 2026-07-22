@@ -2676,6 +2676,8 @@ BuildCompiledSupersededGraphicsStateRecordMask(
   return result;
 }
 
+static void PreMaterializeCompiledRootTables(CompiledCommandList &compiled);
+
 static std::shared_ptr<CompiledCommandList>
 BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                          WMT::Device device, bool force_compatibility,
@@ -2724,6 +2726,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
                                  record_index);
     }
     compiled->access_summary = access_summary_builder.Finish();
+    PreMaterializeCompiledRootTables(*compiled);
     BuildCompiledEncoderGraph(*compiled);
     FinalizeCompiledStorageAllocationEvents(*compiled,
                                             allocation_events_before);
@@ -2943,6 +2946,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   compiled->access_summary = access_summary_builder.Finish();
   compiled->immutable_state_reuses =
       CountCompiledImmutableStateReuses(*compiled);
+  PreMaterializeCompiledRootTables(*compiled);
   BuildCompiledEncoderGraph(*compiled);
   FinalizeCompiledStorageAllocationEvents(*compiled,
                                           allocation_events_before);
@@ -2973,6 +2977,100 @@ static CompiledCommandFallbackReason MaterializeSubmittedRootTables(
       return reason;
   }
   return CompiledCommandFallbackReason::None;
+}
+
+static CompiledCommandFallbackReason RefreshSubmittedRootTables(
+    std::vector<CompiledCommandRootDescriptorTable> &tables) {
+  for (auto &table : tables) {
+    auto *mirror = table.mirror;
+    if (!table.resolved || !table.owning_heap || !mirror)
+      return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+    if (!mirror->descriptorTableBackendReady())
+      return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+    if (table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        !mirror->textureViewPoolBaseResourceID())
+      return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
+
+    table.descriptor_table_gpu_address = mirror->descriptorTableGpuAddress();
+    table.descriptor_table_entry_gpu_address =
+        table.descriptor_table_gpu_address + table.table_offset;
+    table.buffer_descriptor_record_gpu_address =
+        mirror->bufferDescriptorRecordGpuAddress();
+    table.buffer_resource_table_gpu_address =
+        mirror->bufferResourceTableGpuAddress();
+    table.buffer_resource_table_generation =
+        mirror->backendResourceTableGeneration();
+    table.descriptor_table_backend_ready =
+        mirror->descriptorTableBackendReady();
+    table.native_descriptor_record_storage_ready =
+        mirror->nativeDescriptorRecordStorageReady();
+    table.native_buffer_resource_table_ready =
+        table.heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        mirror->bufferResourceTableBuffer() &&
+        mirror->bufferResourceTableGpuAddress();
+    table.native_root_table_base_ready = true;
+  }
+  return CompiledCommandFallbackReason::None;
+}
+
+static void PreMaterializeCompiledRootTables(CompiledCommandList &compiled) {
+  struct Key {
+    const void *table_identity = nullptr;
+    ID3D12DescriptorHeap *resource_heap = nullptr;
+    ID3D12DescriptorHeap *sampler_heap = nullptr;
+    RootSignature *root = nullptr;
+    bool operator==(const Key &) const = default;
+  };
+  struct KeyHash {
+    size_t operator()(const Key &key) const {
+      size_t hash = std::hash<const void *>{}(key.table_identity);
+      auto mix = [&](const void *value) {
+        hash ^= std::hash<const void *>{}(value) + 0x9e3779b97f4a7c15ull +
+                (hash << 6) + (hash >> 2);
+      };
+      mix(key.resource_heap);
+      mix(key.sampler_heap);
+      mix(key.root);
+      return hash;
+    }
+  };
+  struct Result {
+    CompiledImmutableVector<CompiledCommandRootDescriptorTable> tables;
+    bool ready = false;
+  };
+  std::unordered_map<Key, Result, KeyHash> cache;
+
+  auto prepare_packet = [&](auto &packet) {
+    auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
+    const Key key = {packet.root_tables.identity(),
+                     packet.descriptor_heaps.cbv_srv_uav.ptr(),
+                     packet.descriptor_heaps.sampler.ptr(), root};
+    if (const auto found = cache.find(key); found != cache.end()) {
+      if (found->second.ready) {
+        packet.root_tables = found->second.tables;
+        packet.root_tables_close_materialized = true;
+      }
+      return;
+    }
+
+    Result result;
+    auto &tables = result.tables.mutableView();
+    tables = packet.root_tables.copy();
+    result.ready =
+        MaterializeSubmittedRootTables(tables, packet.descriptor_heaps, root) ==
+        CompiledCommandFallbackReason::None;
+    if (result.ready) {
+      packet.root_tables = result.tables;
+      packet.root_tables_close_materialized = true;
+      compiled.close_materialized_root_table_sets++;
+    }
+    cache.emplace(key, std::move(result));
+  };
+
+  for (auto &packet : compiled.graphics_packets.mutableView())
+    prepare_packet(packet);
+  for (auto &packet : compiled.compute_packets.mutableView())
+    prepare_packet(packet);
 }
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
@@ -3027,8 +3125,20 @@ PrepareSubmittedCompiledCommandListImpl(
     auto tables = std::make_shared<
         std::vector<CompiledCommandRootDescriptorTable>>(
         packet.root_tables.copy());
-    const auto reason = MaterializeSubmittedRootTables(
-        *tables, packet.descriptor_heaps, root);
+    const bool close_materialized = packet.root_tables_close_materialized;
+    const auto reason = close_materialized
+                            ? RefreshSubmittedRootTables(*tables)
+                            : MaterializeSubmittedRootTables(
+                                  *tables, packet.descriptor_heaps, root);
+    if (plan->generation->test_telemetry) {
+      auto &counter =
+          close_materialized
+              ? plan->generation->test_telemetry
+                    ->submitted_root_table_fast_patches
+              : plan->generation->test_telemetry
+                    ->submitted_root_table_full_materializations;
+      counter.fetch_add(1, std::memory_order_relaxed);
+    }
     MaterializedTables result = {std::move(tables), reason};
     materialized_table_cache.emplace(key, result);
     return result;
@@ -3240,6 +3350,8 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
   stats.access_storage_allocation_events =
       compiled.access_storage_allocation_events;
   stats.immutable_state_reuses = compiled.immutable_state_reuses;
+  stats.close_materialized_root_table_sets =
+      compiled.close_materialized_root_table_sets;
   auto count_state_delta = [&](const CompiledCommandStateDelta &delta) {
     stats.state_delta_packets++;
     if (!delta.dirty_domains && !delta.root_table_dirty_mask &&
@@ -3382,6 +3494,12 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         telemetry.replayed_compute_packets.load(std::memory_order_acquire);
     stats.encoder_attachment_materializations =
         telemetry.encoder_attachment_materializations.load(
+            std::memory_order_acquire);
+    stats.submitted_root_table_fast_patches =
+        telemetry.submitted_root_table_fast_patches.load(
+            std::memory_order_acquire);
+    stats.submitted_root_table_full_materializations =
+        telemetry.submitted_root_table_full_materializations.load(
             std::memory_order_acquire);
     stats.replayed_fallback_ranges =
         telemetry.replayed_fallback_ranges.load(std::memory_order_acquire);

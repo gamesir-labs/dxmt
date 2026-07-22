@@ -817,6 +817,7 @@ struct CompiledGraphicsPacket {
   CompiledCommandInputAssemblerState input_assembler;
   CompiledCommandRenderState render_state;
   CompiledCommandStateDelta state_delta;
+  bool root_tables_close_materialized = false;
   CompiledCommandFallbackReason compatibility_reason =
       CompiledCommandFallbackReason::None;
   std::optional<DrawInstancedRecord> draw;
@@ -832,6 +833,7 @@ struct CompiledComputePacket {
   CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
   CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
   CompiledCommandStateDelta state_delta;
+  bool root_tables_close_materialized = false;
   CompiledCommandFallbackReason compatibility_reason =
       CompiledCommandFallbackReason::None;
   DispatchRecord dispatch;
@@ -1005,6 +1007,8 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> submitted_generation_shares = 0;
   std::atomic<UINT> submitted_generation_deep_copies = 0;
   std::atomic<UINT> encoder_attachment_materializations = 0;
+  std::atomic<UINT> submitted_root_table_fast_patches = 0;
+  std::atomic<UINT> submitted_root_table_full_materializations = 0;
 };
 
 struct CompiledCommandList {
@@ -1033,6 +1037,7 @@ struct CompiledCommandList {
   UINT state_storage_allocation_events = 0;
   UINT access_storage_allocation_events = 0;
   UINT immutable_state_reuses = 0;
+  UINT close_materialized_root_table_sets = 0;
   dxmt::d3d12::test::ExecutionPathMode test_path_mode =
       dxmt::d3d12::test::ExecutionPathMode::Auto;
   UINT test_work_record_count = 0;

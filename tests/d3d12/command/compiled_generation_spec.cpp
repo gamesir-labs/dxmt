@@ -93,6 +93,7 @@ TEST_F(CompiledGenerationSpec, ReusesImmutableStateAndMergesTypedRanges) {
   EXPECT_EQ(first.compute_encoder_node_count, 1u);
   EXPECT_EQ(first.graphics_encoder_node_count, 0u);
   EXPECT_GT(first.encoder_graph_elided_state_records, 0u);
+  EXPECT_EQ(first.close_materialized_root_table_sets, 1u);
 
   // Warm every same-type block required by a complete generation before
   // asserting the steady-state high-water contract. Other tests in the same
