@@ -800,6 +800,19 @@ struct CompiledDynamicRenderStateRecipe {
   bool valid = false;
 };
 
+struct CompiledVertexBindingRecipe {
+  struct Binding {
+    uint32_t slot = 0;
+    uint64_t offset = 0;
+    uint32_t stride = 0;
+    Rc<Buffer> buffer;
+    Rc<BufferAllocation> allocation;
+  };
+  CompiledImmutableVector<Binding> bindings;
+  uint32_t slot_mask = 0;
+  uint32_t cleared_slot_mask = 0;
+};
+
 struct CompiledNativeStageBinding {
   uint64_t cbuffer_root_base_offset = 0;
   uint64_t resource_root_base_offset = 0;
@@ -826,7 +839,10 @@ struct CompiledGraphicsPacket {
   CompiledCommandRenderState render_state;
   std::shared_ptr<const CompiledDynamicRenderStateRecipe>
       dynamic_render_state_recipe;
+  std::shared_ptr<const CompiledVertexBindingRecipe> vertex_binding_recipe;
   CompiledCommandStateDelta state_delta;
+  CompiledCommandFallbackReason vertex_binding_recipe_reason =
+      CompiledCommandFallbackReason::None;
   bool root_tables_close_materialized = false;
   CompiledCommandFallbackReason compatibility_reason =
       CompiledCommandFallbackReason::None;
@@ -1049,6 +1065,7 @@ struct CompiledCommandList {
   UINT immutable_state_reuses = 0;
   UINT close_materialized_root_table_sets = 0;
   UINT close_dynamic_render_state_recipes = 0;
+  UINT close_vertex_binding_recipes = 0;
   dxmt::d3d12::test::ExecutionPathMode test_path_mode =
       dxmt::d3d12::test::ExecutionPathMode::Auto;
   UINT test_work_record_count = 0;

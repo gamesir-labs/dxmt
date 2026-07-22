@@ -114,6 +114,7 @@ struct ExecutionPathStats {
   std::uint32_t submitted_root_table_fast_patches = 0;
   std::uint32_t submitted_root_table_full_materializations = 0;
   std::uint32_t close_dynamic_render_state_recipes = 0;
+  std::uint32_t close_vertex_binding_recipes = 0;
   // segment_count always reports the complete count. traced_segment_count is
   // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
   // builder order and make N/F boundary topology directly testable.

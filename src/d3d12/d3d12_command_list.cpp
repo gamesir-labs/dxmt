@@ -2424,6 +2424,80 @@ static void BuildCompiledDynamicRenderStateRecipes(
   }
 }
 
+static CompiledCommandFallbackReason BuildCompiledVertexBindingRecipe(
+    const CompiledGraphicsPacket &packet,
+    std::shared_ptr<const CompiledVertexBindingRecipe> &out) {
+  auto *pipeline = packet.pipeline.metadata.pipeline;
+  const auto *graphics = pipeline ? pipeline->GetGraphicsState() : nullptr;
+  if (!graphics)
+    return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+
+  auto recipe = std::make_shared<CompiledVertexBindingRecipe>();
+  for (const auto &element : graphics->input_elements) {
+    if (element.InputSlot < 32)
+      recipe->slot_mask |= 1u << element.InputSlot;
+  }
+  uint32_t populated_slot_mask = 0;
+  auto &bindings = recipe->bindings.mutableView();
+  bindings.reserve(packet.input_assembler.vertex_buffers.size());
+  for (const auto &vb : packet.input_assembler.vertex_buffers) {
+    if (vb.slot < 32)
+      populated_slot_mask |= 1u << vb.slot;
+    if (vb.slot >= 32 || !(recipe->slot_mask & (1u << vb.slot)))
+      continue;
+    CompiledVertexBindingRecipe::Binding binding = {};
+    binding.slot = vb.slot;
+    binding.stride = vb.view.StrideInBytes;
+    if (vb.view.BufferLocation && vb.view.SizeInBytes) {
+      UINT64 offset = 0;
+      auto *resource = LookupBufferResourceByGpuVirtualAddress(
+          vb.view.BufferLocation, &offset);
+      if (!resource || !resource->GetBuffer() ||
+          !resource->GetBufferAllocation())
+        return packet.pipeline.metadata.uses_native_descriptor_table_abi
+                   ? CompiledCommandFallbackReason::
+                         NativeUnsupportedDynamicResource
+                   : CompiledCommandFallbackReason::
+                         UnsupportedVertexIndexState;
+      binding.offset = resource->GetHeapOffset() + offset;
+      binding.buffer = Rc<Buffer>(resource->GetBuffer());
+      binding.allocation =
+          Rc<BufferAllocation>(resource->GetBufferAllocation());
+    }
+    bindings.push_back(std::move(binding));
+  }
+  recipe->cleared_slot_mask =
+      recipe->slot_mask &
+      uint32_t(packet.input_assembler.vertex_buffer_dirty_mask) &
+      ~populated_slot_mask;
+  out = std::move(recipe);
+  return CompiledCommandFallbackReason::None;
+}
+
+static void BuildCompiledVertexBindingRecipes(CompiledCommandList &compiled) {
+  const CompiledGraphicsPacket *previous = nullptr;
+  for (auto &packet : compiled.graphics_packets.mutableView()) {
+    const bool can_reuse =
+        previous &&
+        previous->pipeline.metadata.pipeline == packet.pipeline.metadata.pipeline &&
+        previous->input_assembler.vertex_buffers.identity() ==
+            packet.input_assembler.vertex_buffers.identity() &&
+        previous->input_assembler.vertex_buffer_dirty_mask ==
+            packet.input_assembler.vertex_buffer_dirty_mask;
+    if (can_reuse) {
+      packet.vertex_binding_recipe = previous->vertex_binding_recipe;
+      packet.vertex_binding_recipe_reason =
+          previous->vertex_binding_recipe_reason;
+    } else {
+      packet.vertex_binding_recipe_reason =
+          BuildCompiledVertexBindingRecipe(packet,
+                                           packet.vertex_binding_recipe);
+      compiled.close_vertex_binding_recipes++;
+    }
+    previous = &packet;
+  }
+}
+
 static bool CanMergeCompiledEncoderNodes(
     const CompiledCommandList &compiled, const CompiledEncoderNode &lhs,
     const CompiledCommandSegment &rhs) {
@@ -2679,6 +2753,8 @@ CompiledStorageAllocationEventCount() {
          CompiledImmutableVector<D3D12_RECT>::ThreadAllocationEventCount() +
          CompiledImmutableVector<WMTViewport>::ThreadAllocationEventCount() +
          CompiledImmutableVector<WMTScissorRect>::ThreadAllocationEventCount() +
+         CompiledImmutableVector<CompiledVertexBindingRecipe::Binding>::
+             ThreadAllocationEventCount() +
          CompiledImmutableVector<Com<ID3D12DescriptorHeap>>::
              ThreadAllocationEventCount() +
          CompiledImmutableVector<UINT>::ThreadAllocationEventCount();
@@ -2875,6 +2951,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     compiled->access_summary = access_summary_builder.Finish();
     PreMaterializeCompiledRootTables(*compiled);
     BuildCompiledDynamicRenderStateRecipes(*compiled);
+    BuildCompiledVertexBindingRecipes(*compiled);
     BuildCompiledEncoderGraph(*compiled);
     FinalizeCompiledStorageAllocationEvents(*compiled,
                                             allocation_events_before);
@@ -3096,6 +3173,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
       CountCompiledImmutableStateReuses(*compiled);
   PreMaterializeCompiledRootTables(*compiled);
   BuildCompiledDynamicRenderStateRecipes(*compiled);
+  BuildCompiledVertexBindingRecipes(*compiled);
   BuildCompiledEncoderGraph(*compiled);
   FinalizeCompiledStorageAllocationEvents(*compiled,
                                           allocation_events_before);
@@ -3503,6 +3581,8 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
       compiled.close_materialized_root_table_sets;
   stats.close_dynamic_render_state_recipes =
       compiled.close_dynamic_render_state_recipes;
+  stats.close_vertex_binding_recipes =
+      compiled.close_vertex_binding_recipes;
   auto count_state_delta = [&](const CompiledCommandStateDelta &delta) {
     stats.state_delta_packets++;
     if (!delta.dirty_domains && !delta.root_table_dirty_mask &&

@@ -6681,18 +6681,6 @@ private:
     std::vector<Op> ops;
   };
 
-  struct CompiledVertexBindingRecipe {
-    struct Binding {
-      uint32_t slot = 0;
-      uint64_t offset = 0;
-      uint32_t stride = 0;
-      Rc<Buffer> buffer;
-    };
-    std::vector<Binding> bindings;
-    uint32_t slot_mask = 0;
-    uint32_t cleared_slot_mask = 0;
-  };
-
   struct CompiledDirectGraphicsBindingPayload {
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> root_signature;
@@ -10280,12 +10268,10 @@ private:
                 replay_record_serial, metal_pso.handle);
           }
 
-          std::shared_ptr<const CompiledVertexBindingRecipe>
-              vertex_binding_recipe;
+          const auto &vertex_binding_recipe =
+              packet.vertex_binding_recipe;
           const auto vertex_buffer_reason =
-              BuildCompiledVertexBindingRecipe(
-                  packet, pipeline->GetGraphicsState(),
-                  vertex_binding_recipe);
+              packet.vertex_binding_recipe_reason;
           if (vertex_buffer_reason != CompiledCommandFallbackReason::None)
             return vertex_buffer_reason;
 
@@ -10308,7 +10294,7 @@ private:
           CompiledDirectAccessList direct_access = {};
           AddCompiledRootDescriptorAccesses(direct_access, binding_state);
           AddCompiledVertexBufferAccesses(
-              direct_access, packet, pipeline->GetGraphicsState());
+              direct_access, vertex_binding_recipe.get());
           AddCompiledSnapshotEncoderAccesses(direct_access,
                                              submitted_snapshot.get());
           const auto argument_buffer_size =
@@ -21119,51 +21105,6 @@ private:
     return CompiledCommandFallbackReason::None;
   }
 
-  CompiledCommandFallbackReason BuildCompiledVertexBindingRecipe(
-      const CompiledGraphicsPacket &packet,
-      const PipelineGraphicsState *graphics_state,
-      std::shared_ptr<const CompiledVertexBindingRecipe> &out) {
-    if (!graphics_state)
-      return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
-    auto recipe = std::make_shared<CompiledVertexBindingRecipe>();
-    for (const auto &element : graphics_state->input_elements) {
-      if (element.InputSlot < 32)
-        recipe->slot_mask |= 1u << element.InputSlot;
-    }
-    uint32_t populated_slot_mask = 0;
-    recipe->bindings.reserve(packet.input_assembler.vertex_buffers.size());
-    for (const auto &vb : packet.input_assembler.vertex_buffers) {
-      if (vb.slot < 32)
-        populated_slot_mask |= 1u << vb.slot;
-      if (vb.slot >= 32 || !(recipe->slot_mask & (1u << vb.slot)))
-        continue;
-      CompiledVertexBindingRecipe::Binding binding = {};
-      binding.slot = vb.slot;
-      binding.stride = vb.view.StrideInBytes;
-      if (vb.view.BufferLocation && vb.view.SizeInBytes) {
-        Resource *resource = nullptr;
-        const auto offset =
-            ResolveBufferGpuAddress(vb.view.BufferLocation, resource);
-        if (!resource || !resource->GetBuffer() ||
-            !resource->GetBufferAllocation())
-          return packet.pipeline.metadata.uses_native_descriptor_table_abi
-                     ? CompiledCommandFallbackReason::
-                           NativeUnsupportedDynamicResource
-                     : CompiledCommandFallbackReason::
-                           UnsupportedVertexIndexState;
-        binding.offset = resource->GetHeapOffset() + offset;
-        binding.buffer = Rc<Buffer>(resource->GetBuffer());
-      }
-      recipe->bindings.push_back(std::move(binding));
-    }
-    recipe->cleared_slot_mask =
-        recipe->slot_mask &
-        uint32_t(packet.input_assembler.vertex_buffer_dirty_mask) &
-        ~populated_slot_mask;
-    out = std::move(recipe);
-    return CompiledCommandFallbackReason::None;
-  }
-
   static void RecordCompiledDescriptorBackendStats(
       dxmt::FrameStatistics *stats,
       const std::vector<CompiledCommandRootDescriptorTable> &tables) {
@@ -22163,21 +22104,19 @@ private:
   }
 
   void AddCompiledVertexBufferAccesses(CompiledDirectAccessList &list,
-                                       const CompiledGraphicsPacket &packet,
-                                       const PipelineGraphicsState *graphics_state) {
-    if (!graphics_state)
+                                       const CompiledVertexBindingRecipe *recipe) {
+    if (!recipe)
       return;
-    uint32_t slot_mask = 0;
-    for (const auto &element : graphics_state->input_elements) {
-      if (element.InputSlot < 32)
-        slot_mask |= 1u << element.InputSlot;
-    }
-    if (!slot_mask)
-      return;
-    for (const auto &vb : packet.input_assembler.vertex_buffers) {
-      if (vb.slot >= 32 || !(slot_mask & (1u << vb.slot)))
+    for (const auto &binding : recipe->bindings) {
+      if (!binding.allocation)
         continue;
-      AddCompiledDirectBufferAccess(list, vb.view.BufferLocation);
+      const bool exists = std::any_of(
+          list.buffer_allocations.begin(), list.buffer_allocations.end(),
+          [&](const Rc<BufferAllocation> &allocation) {
+            return allocation.ptr() == binding.allocation.ptr();
+          });
+      if (!exists)
+        list.buffer_allocations.push_back(binding.allocation);
     }
   }
 
