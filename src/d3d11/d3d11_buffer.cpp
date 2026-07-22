@@ -15,6 +15,22 @@ struct BufferViewInfo {
   uint32_t byteWidth;
 };
 
+static bool TryCalculateBufferViewOffsetAndSize(
+    const D3D11_BUFFER_DESC &buffer_desc, uint32_t element_stride,
+    uint32_t first_element, uint32_t num_elements, uint32_t &offset,
+    uint32_t &size) {
+  const uint64_t byte_offset = uint64_t(first_element) * element_stride;
+  const uint64_t byte_width = uint64_t(num_elements) * element_stride;
+  if (!element_stride || !num_elements || byte_offset > buffer_desc.ByteWidth ||
+      byte_width > buffer_desc.ByteWidth - byte_offset ||
+      byte_offset > UINT32_MAX || byte_width > UINT32_MAX)
+    return false;
+
+  offset = uint32_t(byte_offset);
+  size = uint32_t(byte_width);
+  return true;
+}
+
 class D3D11Buffer : public TResourceBase<tag_buffer> {
 private:
 #ifdef DXMT_DEBUG
@@ -180,10 +196,11 @@ public:
         return E_INVALIDARG;
       }
       // StructuredBuffer
-      CalculateBufferViewOffsetAndSize(
-          this->desc, desc.StructureByteStride, finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements, offset,
-          size
-      );
+      if (!TryCalculateBufferViewOffsetAndSize(
+              this->desc, desc.StructureByteStride,
+              finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements,
+              offset, size))
+        return E_INVALIDARG;
       view_format = WMTPixelFormatR32Uint;
       viewElementOffset = finalDesc.Buffer.FirstElement * (desc.StructureByteStride >> 2);
       viewElementWidth = finalDesc.Buffer.NumElements * (desc.StructureByteStride >> 2);
@@ -192,9 +209,10 @@ public:
         return E_INVALIDARG;
       if (finalDesc.Format != DXGI_FORMAT_R32_TYPELESS)
         return E_INVALIDARG;
-      CalculateBufferViewOffsetAndSize(
-          this->desc, sizeof(uint32_t), finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements, offset, size
-      );
+      if (!TryCalculateBufferViewOffsetAndSize(
+              this->desc, sizeof(uint32_t), finalDesc.Buffer.FirstElement,
+              finalDesc.Buffer.NumElements, offset, size))
+        return E_INVALIDARG;
       view_format = WMTPixelFormatR32Uint;
       viewElementOffset = finalDesc.Buffer.FirstElement;
       viewElementWidth = finalDesc.Buffer.NumElements;
@@ -209,8 +227,11 @@ public:
       }
 
       view_format = format.PixelFormat;
-      offset = finalDesc.Buffer.FirstElement * format.BytesPerTexel;
-      size = finalDesc.Buffer.NumElements * format.BytesPerTexel;
+      if (!TryCalculateBufferViewOffsetAndSize(
+              this->desc, format.BytesPerTexel,
+              finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements,
+              offset, size))
+        return E_INVALIDARG;
       viewElementOffset = finalDesc.Buffer.FirstElement;
       viewElementWidth = finalDesc.Buffer.NumElements;
     }
@@ -310,10 +331,11 @@ public:
         return E_INVALIDARG;
       }
       // StructuredBuffer
-      CalculateBufferViewOffsetAndSize(
-          this->desc, desc.StructureByteStride, finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements, offset,
-          size
-      );
+      if (!TryCalculateBufferViewOffsetAndSize(
+              this->desc, desc.StructureByteStride,
+              finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements,
+              offset, size))
+        return E_INVALIDARG;
       view_format = WMTPixelFormatR32Uint;
       // when structured buffer is interpreted as typed buffer for any reason
       viewElementOffset = finalDesc.Buffer.FirstElement * (desc.StructureByteStride >> 2);
@@ -331,9 +353,10 @@ public:
         return E_INVALIDARG;
       if (finalDesc.Format != DXGI_FORMAT_R32_TYPELESS)
         return E_INVALIDARG;
-      CalculateBufferViewOffsetAndSize(
-          this->desc, sizeof(uint32_t), finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements, offset, size
-      );
+      if (!TryCalculateBufferViewOffsetAndSize(
+              this->desc, sizeof(uint32_t), finalDesc.Buffer.FirstElement,
+              finalDesc.Buffer.NumElements, offset, size))
+        return E_INVALIDARG;
       view_format = WMTPixelFormatR32Uint;
       viewElementOffset = finalDesc.Buffer.FirstElement;
       viewElementWidth = finalDesc.Buffer.NumElements;
@@ -348,8 +371,11 @@ public:
       }
 
       view_format = format.PixelFormat;
-      offset = finalDesc.Buffer.FirstElement * format.BytesPerTexel;
-      size = finalDesc.Buffer.NumElements * format.BytesPerTexel;
+      if (!TryCalculateBufferViewOffsetAndSize(
+              this->desc, format.BytesPerTexel,
+              finalDesc.Buffer.FirstElement, finalDesc.Buffer.NumElements,
+              offset, size))
+        return E_INVALIDARG;
       viewElementOffset = finalDesc.Buffer.FirstElement;
       viewElementWidth = finalDesc.Buffer.NumElements;
     }
