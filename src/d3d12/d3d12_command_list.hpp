@@ -726,6 +726,7 @@ struct CompiledCommandPipelineMetadata {
 struct CompiledCommandPipelineBinding {
   Com<ID3D12PipelineState> pipeline_state;
   Com<ID3D12RootSignature> root_signature;
+  RootSignature *root_signature_impl = nullptr;
   CompiledCommandPipelineMetadata metadata;
   bool pipeline_state_pending = true;
   bool root_signature_pending = true;

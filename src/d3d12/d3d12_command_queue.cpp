@@ -10164,7 +10164,7 @@ private:
           auto *pipeline = packet.pipeline.metadata.pipeline;
           if (!pipeline)
             pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
-          auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
+          auto *root = packet.pipeline.root_signature_impl;
           if (!pipeline)
             return CompiledCommandFallbackReason::MissingPipelineState;
           if (!root)
@@ -10218,9 +10218,16 @@ private:
                   ? PixelShaderSingleSampleMsaaSRVDemoteMask(
                         *submitted_snapshot, *pipeline)
                   : std::pair<uint64_t, uint64_t>{0, 0};
-          auto *metal = pipeline->GetMetalGraphicsState(
-              compiled_demote_msaa_srv_mask_lo,
-              compiled_demote_msaa_srv_mask_hi);
+          auto *metal = packet.pipeline.metadata.metal_graphics;
+          if (!metal ||
+              metal->pixel_shader_demote_msaa_srv_mask_lo !=
+                  compiled_demote_msaa_srv_mask_lo ||
+              metal->pixel_shader_demote_msaa_srv_mask_hi !=
+                  compiled_demote_msaa_srv_mask_hi) {
+            metal = pipeline->GetMetalGraphicsState(
+                compiled_demote_msaa_srv_mask_lo,
+                compiled_demote_msaa_srv_mask_hi);
+          }
           if (!metal || !metal->pso)
             return CompiledCommandFallbackReason::MissingPipelineState;
           if (metal->use_geometry)
@@ -10542,7 +10549,7 @@ private:
           auto *pipeline = packet.pipeline.metadata.pipeline;
           if (!pipeline)
             pipeline = GetPipelineState(packet.pipeline.pipeline_state.ptr());
-          auto *root = GetRootSignature(packet.pipeline.root_signature.ptr());
+          auto *root = packet.pipeline.root_signature_impl;
           if (!pipeline)
             return CompiledCommandFallbackReason::MissingPipelineState;
           if (!root)
@@ -10586,7 +10593,9 @@ private:
                 return backend_reason;
             }
           }
-          auto *metal = pipeline->GetMetalComputeState();
+          auto *metal = packet.pipeline.metadata.metal_compute;
+          if (!metal)
+            metal = pipeline->GetMetalComputeState();
           if (!metal || !metal->pso)
             return CompiledCommandFallbackReason::MissingPipelineState;
           if (native_packet) {

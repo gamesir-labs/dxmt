@@ -1072,6 +1072,7 @@ FillCompiledPipelineBinding(CompiledCommandPipelineBinding &binding,
       ResolveCompiledRootSignature(state, compute);
   binding.pipeline_state = state.pipeline_state;
   binding.root_signature = root_signature;
+  binding.root_signature_impl = GetDXMTRootSignature(root_signature);
   binding.metadata = metadata;
   binding.pipeline_state_pending = !state.pipeline_state;
   binding.root_signature_pending = !root_signature;
