@@ -49,3 +49,107 @@ visual visual.isolated.c:28481
 # Expected colour {..., 0.0}; got {..., 1.0}, alpha written where the
 # attribute's own alpha is expected, over attrib counts 1 to 4.
 visual visual.isolated.c:28870
+
+# d3d9ex: recorded from two DXMT runs with an identical line set. The comment on
+# each group is one example. Some sites report a different window handle each
+# run, which is why the match is by line and not by value.
+# User-memory surface creation returns E_NOTIMPL (0x80004001).
+d3d9ex d3d9ex.isolated.c:813
+d3d9ex d3d9ex.isolated.c:830
+# Foreground window is a different HWND than the test expects (handle varies).
+d3d9ex d3d9ex.isolated.c:3309
+d3d9ex d3d9ex.isolated.c:3327
+# Device window style, extended style and rect differ from the expected values;
+# the rect is off by the Retina scale (a 1920x1080 window reads back 960x540).
+d3d9ex d3d9ex.isolated.c:3516
+d3d9ex d3d9ex.isolated.c:3521
+d3d9ex d3d9ex.isolated.c:3555
+d3d9ex d3d9ex.isolated.c:3560
+d3d9ex d3d9ex.isolated.c:3579
+d3d9ex d3d9ex.isolated.c:3600
+# Failed to set the foreground window; the following style checks then differ.
+d3d9ex d3d9ex.isolated.c:3629
+d3d9ex d3d9ex.isolated.c:3633
+d3d9ex d3d9ex.isolated.c:3637
+# CheckDeviceState left the interface pointer untouched for D3DFMT_UNKNOWN.
+d3d9ex d3d9ex.isolated.c:4027
+
+# device: recorded from two DXMT runs with an identical line set (the focus
+# and window functions that vary on the headless runner are skipped, see
+# wine_known_skips.txt). One example per line. These are device-management
+# gaps: resource-creation and caps hr, window styles, the x87 control word,
+# and shader-validator message capture.
+# Expected to receive message 0x1c.
+device device.isolated.c:4871
+# device.isolated.c:5407: Test marked flaky: Didn't receive MOUSEMOV
+device device.isolated.c:5407
+# Unexpected consts_swvp 256.
+device device.isolated.c:7118
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7122
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7125
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7128
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7153
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7161
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7616
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7621
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7641
+# Got unexpected hr 0x8876086c.
+device device.isolated.c:7649
+# Failed to update texture, hr 0x8876086c, case 5.
+device device.isolated.c:10554
+# Got hr 0 (formats 0x15/0x15, pools 0/0).
+device device.isolated.c:13418
+# Got hr 0 (formats 0x15/0x15, pool 0).
+device device.isolated.c:13431
+# Got unexpected hr 0.
+device device.isolated.c:14728
+# Got unexpected call_count 0.
+device device.isolated.c:14729
+# Got NULL message.
+device device.isolated.c:14730
+# Got NULL message.
+device device.isolated.c:14731
+# Got unexpected message_id[0] 0000000000000000.
+device device.isolated.c:14732
+# Got unexpected message_id[1] 0000000000000000.
+device device.isolated.c:14733
+# Got unexpected line 0.
+device device.isolated.c:14734
+# Got unexpected hr 0.
+device device.isolated.c:14742
+# Got unexpected hr 0.
+device device.isolated.c:14749
+# Got unexpected call_count 0.
+device device.isolated.c:14750
+# Got unexpected message_id[0] 0000000000000000.
+device device.isolated.c:14751
+# Got NULL message.
+device device.isolated.c:14752
+# Got unexpected hr 0.
+device device.isolated.c:14758
+# Validator has 1 references left.
+device device.isolated.c:14761
+# Got unexpected call_count 0, test 1.
+device device.isolated.c:14798
+# Got NULL message, test 1.
+device device.isolated.c:14799
+# Got unexpected message_id[0] 0000000000000000, test 1.
+device device.isolated.c:14800
+# Got unexpected file[0] (null), test 1.
+device device.isolated.c:14802
+# Got unexpected line 0, test 1.
+device device.isolated.c:14803
+# Got unexpected hr 0, test 1.
+device device.isolated.c:14816
+# Validator has 1 references left.
+device device.isolated.c:14820
+# Adapter 0: Failed to find a different mode than 1920x1080.
+device device.isolated.c:14903

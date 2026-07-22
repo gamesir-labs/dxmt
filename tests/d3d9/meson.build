@@ -70,13 +70,29 @@ if dxmt_crossbuild and wine_tests_source_root != ''
       wine_counts += { parts[0]: parts[1] }
     endforeach
 
-    # stateblock runs clean. visual builds and crashes partway, which is exactly
-    # what the re-run path exists for, so it is enabled with it. device and
-    # d3d9ex are still held back on build problems of their own: device collides
-    # with the GUID library on the build runner's toolchain, and d3d9ex needs
-    # `-DCOBJMACROS -include windows.h` applied to it alone, flags that break the
-    # other modules.
-    foreach module : [ 'stateblock', 'visual' ]
+    # The wine_dbgstr_* helpers in wine/debug.h reach one symbol that a winelib
+    # build gets from ntdll and a bare PE does not. It is built once, on its own,
+    # so that per-module compile flags cannot reach it: the modules do not agree
+    # on those flags, and forcing windows.h into this translation unit as well
+    # makes both it and the module emit __fastfail, which then collides at link.
+    wine_debug_stubs = static_library('dx9-wine-debug-stubs',
+      files('wine_debug_stubs.c'),
+      c_args: wine_tests_c_args,
+      install: false)
+
+    # d3d9ex includes wine/test.h before d3d9.h, so test.h's console calls come
+    # ahead of windows.h. Forcing windows.h in first fixes that but then precedes
+    # the module's own COBJMACROS define, which leaves IUnknown_AddRef and
+    # IUnknown_Release undeclared, so the two go together.
+    wine_module_extra_args = {
+      'd3d9ex': [ '-DCOBJMACROS', '-include', 'windows.h' ],
+    }
+
+    # stateblock runs clean. visual reports its failures end to end. device is
+    # still held back on a build problem of its own: it collides with the GUID
+    # library on the build runner's toolchain, which does not reproduce under the
+    # local cross compiler.
+    foreach module : [ 'stateblock', 'visual', 'd3d9ex' ]
       wine_isolated = custom_target('wine-isolate-' + module,
         input: wine_tests_dir / (module + '.c'),
         output: [ module + '.isolated.c', module + '.functions' ],
@@ -89,10 +105,11 @@ if dxmt_crossbuild and wine_tests_source_root != ''
         ])
 
       wine_conformance_tests += executable('dx9-wine-' + module + '-test',
-        [ wine_isolated[0], files('wine_debug_stubs.c') ],
+        wine_isolated[0],
         c_args: wine_tests_c_args + [
           '-include', meson.current_source_dir() / 'dxmt_conformance.h',
-        ],
+        ] + wine_module_extra_args.get(module, []),
+        link_with: wine_debug_stubs,
         dependencies: [
           cc.find_library('d3d9'),
           # The modules reference the D3D9 interface GUIDs without defining

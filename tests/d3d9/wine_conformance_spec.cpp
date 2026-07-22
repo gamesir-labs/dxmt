@@ -32,6 +32,7 @@ namespace {
 constexpr const char *kWineModules[] = {
     "stateblock",
     "visual",
+    "d3d9ex",
 };
 
 // A module that crashes takes the functions after it with it, so it is re-run
@@ -94,6 +95,40 @@ std::vector<std::string> LoadBaseline(const char *module) {
 
   // Entries are "<module> <substring>", so one file covers every module and a
   // baselined failure cannot leak across modules.
+  const std::string prefix = std::string(module) + " ";
+  std::ifstream file(path.c_str());
+  std::string line;
+  while (std::getline(file, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line.empty() || line.front() == '#')
+      continue;
+    if (line.compare(0, prefix.size(), prefix) == 0)
+      entries.push_back(line.substr(prefix.size()));
+  }
+  return entries;
+}
+
+// Functions declared unrunnable up front, one per line as "<module> <function>".
+// Unlike the crash-discovered skips the driver finds at run time, these are for
+// functions that hang or are non-deterministic for a reason outside DXMT, so
+// gating on them would make the suite flaky. They are seeded into every run's
+// skip list, counted toward coverage, and do not count as a failure. Same file
+// layout as the baseline, so the reader is the same.
+std::vector<std::string> LoadKnownSkips(const char *module) {
+  std::vector<std::string> entries;
+  const auto directory = ExecutableDirectory();
+  std::wstring path;
+  for (const auto &candidate :
+       {directory + L"\\wine_known_skips.txt",
+        directory + L"\\d3d9\\wine_known_skips.txt"})
+    if (PathExists(candidate)) {
+      path = candidate;
+      break;
+    }
+  if (path.empty())
+    return entries;
+
   const std::string prefix = std::string(module) + " ";
   std::ifstream file(path.c_str());
   std::string line;
@@ -285,12 +320,19 @@ TEST_P(WineConformanceTest, MatchesBaseline) {
   // therefore discovered here rather than kept in a list that would drift out
   // of date, and the cost is one extra process per function that actually
   // fails, not one per function in the corpus.
+  // Declared skips are seeded into every run so the suite stays deterministic.
+  // They are kept separate from the crash-discovered skips below: a declared
+  // skip is expected and does not fail the suite, while a function that dies on
+  // its own run is a real regression that must.
+  const auto known_skips = LoadKnownSkips(module);
   std::vector<std::string> skipped;
   std::string accumulated;
   RunResult result;
 
   for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
     std::string skip;
+    for (const auto &name : known_skips)
+      skip += (skip.empty() ? "" : ",") + name;
     for (const auto &name : skipped)
       skip += (skip.empty() ? "" : ",") + name;
 
@@ -326,6 +368,12 @@ TEST_P(WineConformanceTest, MatchesBaseline) {
   if (!manifest.empty()) {
     const auto announced = AnnouncedFunctions(accumulated);
     std::vector<std::string> unique(announced.begin(), announced.end());
+    // A declared skip never runs and so never announces itself; count it as
+    // covered rather than missing, but only if it is a real function in the
+    // manifest, so a typo in the skip list still shows up as a coverage gap.
+    for (const auto &name : known_skips)
+      if (std::find(manifest.begin(), manifest.end(), name) != manifest.end())
+        unique.push_back(name);
     std::sort(unique.begin(), unique.end());
     unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
     EXPECT_GE(unique.size(), manifest.size())

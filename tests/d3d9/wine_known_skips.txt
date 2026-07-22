@@ -1,0 +1,17 @@
+# Test functions skipped up front, one per line as "<module> <function>", each
+# with a comment saying why. Unlike the crash-discovered skips the suite finds at
+# run time, these are declared: functions that are non-deterministic or hang for
+# a reason outside DXMT, so gating on them would make the suite flaky. A declared
+# skip is seeded into every run, counted toward coverage, and is not a failure.
+# Remove an entry once the underlying cause is fixed.
+
+# d3d9ex: these three call ChangeDisplaySettings themselves and then assert the
+# system screen size changed. winemac.drv applies a mode change only while the
+# process is the active Cocoa app and only once the deactivation settles, so the
+# readback is non-deterministic run to run (the screen-size assertions pass or
+# fail by timing). DXMT is not in that path. test_wndproc additionally trips a
+# winemac.drv deadlock on the fullscreen focus-loss minimize:
+# https://github.com/gamesir-labs/wine/issues/2
+d3d9ex test_wndproc
+d3d9ex test_reset
+d3d9ex test_reset_ex

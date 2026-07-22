@@ -60,6 +60,12 @@ configure_file(
   output: 'wine_conformance_baseline.txt',
   copy: true,
 )
+
+configure_file(
+  input: 'd3d9/wine_known_skips.txt',
+  output: 'wine_known_skips.txt',
+  copy: true,
+)
 subdir('d3d10')
 subdir('d3d11')
 subdir('d3d12')
