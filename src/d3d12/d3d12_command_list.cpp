@@ -2279,6 +2279,151 @@ static bool CompiledRenderAttachmentsCompatible(
                                          *rhs.depth_stencil);
 }
 
+static UINT CompiledAttachmentMipLevel(const DescriptorRecord &attachment) {
+  if (!attachment.has_desc)
+    return 0;
+  if (attachment.type == DescriptorRecordType::RenderTargetView) {
+    const auto &rtv = attachment.desc.rtv;
+    switch (rtv.ViewDimension) {
+    case D3D12_RTV_DIMENSION_TEXTURE1D:
+      return rtv.Texture1D.MipSlice;
+    case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+      return rtv.Texture1DArray.MipSlice;
+    case D3D12_RTV_DIMENSION_TEXTURE2D:
+      return rtv.Texture2D.MipSlice;
+    case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+      return rtv.Texture2DArray.MipSlice;
+    case D3D12_RTV_DIMENSION_TEXTURE3D:
+      return rtv.Texture3D.MipSlice;
+    default:
+      return 0;
+    }
+  }
+  if (attachment.type == DescriptorRecordType::DepthStencilView) {
+    const auto &dsv = attachment.desc.dsv;
+    switch (dsv.ViewDimension) {
+    case D3D12_DSV_DIMENSION_TEXTURE1D:
+      return dsv.Texture1D.MipSlice;
+    case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+      return dsv.Texture1DArray.MipSlice;
+    case D3D12_DSV_DIMENSION_TEXTURE2D:
+      return dsv.Texture2D.MipSlice;
+    case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+      return dsv.Texture2DArray.MipSlice;
+    default:
+      return 0;
+    }
+  }
+  return 0;
+}
+
+static std::pair<UINT64, UINT64> CompiledAttachmentExtent(
+    const CompiledCommandRenderState &state) {
+  const DescriptorRecord *attachment = nullptr;
+  for (const auto &target : state.render_targets) {
+    if (target.resource) {
+      attachment = &target;
+      break;
+    }
+  }
+  if (!attachment && state.depth_stencil && state.depth_stencil->resource)
+    attachment = &*state.depth_stencil;
+  auto *resource = attachment
+                       ? dynamic_cast<Resource *>(attachment->resource.ptr())
+                       : nullptr;
+  if (!resource)
+    return {};
+  const auto &desc = resource->GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return {};
+  const UINT mip = CompiledAttachmentMipLevel(*attachment);
+  return {std::max<UINT64>(1, desc.Width >> mip),
+          desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+              ? 1
+              : std::max<UINT64>(1, UINT64(desc.Height) >> mip)};
+}
+
+static std::shared_ptr<const CompiledDynamicRenderStateRecipe>
+BuildCompiledDynamicRenderStateRecipe(
+    const CompiledCommandRenderState &state) {
+  auto recipe = std::make_shared<CompiledDynamicRenderStateRecipe>();
+  recipe->blend_factor = state.blend_factor;
+  recipe->stencil_ref = static_cast<uint8_t>(state.stencil_ref);
+  if (state.viewports.empty())
+    return recipe;
+  const auto [target_width, target_height] = CompiledAttachmentExtent(state);
+  if (!target_width || !target_height)
+    return recipe;
+
+  auto &viewports = recipe->viewports.mutableView();
+  viewports.reserve(state.viewports.size());
+  for (const auto &viewport : state.viewports) {
+    viewports.push_back({viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+                         viewport.Height, viewport.MinDepth,
+                         viewport.MaxDepth});
+  }
+
+  auto source_scissors = state.scissors.copy();
+  if (source_scissors.empty()) {
+    source_scissors.reserve(state.viewports.size());
+    for (const auto &viewport : state.viewports) {
+      source_scissors.push_back(
+          {static_cast<LONG>(std::max(0.0f, viewport.TopLeftX)),
+           static_cast<LONG>(std::max(0.0f, viewport.TopLeftY)),
+           static_cast<LONG>(
+               std::max(0.0f, viewport.TopLeftX + viewport.Width)),
+           static_cast<LONG>(
+               std::max(0.0f, viewport.TopLeftY + viewport.Height))});
+    }
+  }
+
+  auto &scissors = recipe->scissors.mutableView();
+  scissors.resize(state.viewports.size());
+  const size_t count =
+      std::min(source_scissors.size(), state.viewports.size());
+  for (size_t index = 0; index < count; ++index) {
+    const auto &rect = source_scissors[index];
+    const int64_t left = std::max<int64_t>(0, rect.left);
+    const int64_t top = std::max<int64_t>(0, rect.top);
+    const int64_t right = std::max<int64_t>(left, rect.right);
+    const int64_t bottom = std::max<int64_t>(top, rect.bottom);
+    const uint64_t x = std::min<uint64_t>(left, target_width);
+    const uint64_t y = std::min<uint64_t>(top, target_height);
+    const uint64_t clamped_right =
+        std::min<uint64_t>(right, target_width);
+    const uint64_t clamped_bottom =
+        std::min<uint64_t>(bottom, target_height);
+    scissors[index] = {x, y, clamped_right - x, clamped_bottom - y};
+  }
+  recipe->valid = true;
+  return recipe;
+}
+
+static void BuildCompiledDynamicRenderStateRecipes(
+    CompiledCommandList &compiled) {
+  const CompiledGraphicsPacket *previous = nullptr;
+  for (auto &packet : compiled.graphics_packets.mutableView()) {
+    if (previous &&
+        previous->render_state.viewports.identity() ==
+            packet.render_state.viewports.identity() &&
+        previous->render_state.scissors.identity() ==
+            packet.render_state.scissors.identity() &&
+        previous->render_state.blend_factor ==
+            packet.render_state.blend_factor &&
+        previous->render_state.stencil_ref == packet.render_state.stencil_ref &&
+        CompiledRenderAttachmentsCompatible(previous->render_state,
+                                            packet.render_state)) {
+      packet.dynamic_render_state_recipe =
+          previous->dynamic_render_state_recipe;
+    } else {
+      packet.dynamic_render_state_recipe =
+          BuildCompiledDynamicRenderStateRecipe(packet.render_state);
+      compiled.close_dynamic_render_state_recipes++;
+    }
+    previous = &packet;
+  }
+}
+
 static bool CanMergeCompiledEncoderNodes(
     const CompiledCommandList &compiled, const CompiledEncoderNode &lhs,
     const CompiledCommandSegment &rhs) {
@@ -2532,6 +2677,8 @@ CompiledStorageAllocationEventCount() {
              ThreadAllocationEventCount() +
          CompiledImmutableVector<D3D12_VIEWPORT>::ThreadAllocationEventCount() +
          CompiledImmutableVector<D3D12_RECT>::ThreadAllocationEventCount() +
+         CompiledImmutableVector<WMTViewport>::ThreadAllocationEventCount() +
+         CompiledImmutableVector<WMTScissorRect>::ThreadAllocationEventCount() +
          CompiledImmutableVector<Com<ID3D12DescriptorHeap>>::
              ThreadAllocationEventCount() +
          CompiledImmutableVector<UINT>::ThreadAllocationEventCount();
@@ -2727,6 +2874,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     }
     compiled->access_summary = access_summary_builder.Finish();
     PreMaterializeCompiledRootTables(*compiled);
+    BuildCompiledDynamicRenderStateRecipes(*compiled);
     BuildCompiledEncoderGraph(*compiled);
     FinalizeCompiledStorageAllocationEvents(*compiled,
                                             allocation_events_before);
@@ -2947,6 +3095,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   compiled->immutable_state_reuses =
       CountCompiledImmutableStateReuses(*compiled);
   PreMaterializeCompiledRootTables(*compiled);
+  BuildCompiledDynamicRenderStateRecipes(*compiled);
   BuildCompiledEncoderGraph(*compiled);
   FinalizeCompiledStorageAllocationEvents(*compiled,
                                           allocation_events_before);
@@ -3352,6 +3501,8 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
   stats.immutable_state_reuses = compiled.immutable_state_reuses;
   stats.close_materialized_root_table_sets =
       compiled.close_materialized_root_table_sets;
+  stats.close_dynamic_render_state_recipes =
+      compiled.close_dynamic_render_state_recipes;
   auto count_state_delta = [&](const CompiledCommandStateDelta &delta) {
     stats.state_delta_packets++;
     if (!delta.dirty_domains && !delta.root_table_dirty_mask &&

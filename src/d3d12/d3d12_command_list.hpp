@@ -792,6 +792,14 @@ struct CompiledCommandRenderState {
   D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
 };
 
+struct CompiledDynamicRenderStateRecipe {
+  CompiledImmutableVector<WMTViewport> viewports;
+  CompiledImmutableVector<WMTScissorRect> scissors;
+  std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
+  uint8_t stencil_ref = 0;
+  bool valid = false;
+};
+
 struct CompiledNativeStageBinding {
   uint64_t cbuffer_root_base_offset = 0;
   uint64_t resource_root_base_offset = 0;
@@ -816,6 +824,8 @@ struct CompiledGraphicsPacket {
   CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
   CompiledCommandInputAssemblerState input_assembler;
   CompiledCommandRenderState render_state;
+  std::shared_ptr<const CompiledDynamicRenderStateRecipe>
+      dynamic_render_state_recipe;
   CompiledCommandStateDelta state_delta;
   bool root_tables_close_materialized = false;
   CompiledCommandFallbackReason compatibility_reason =
@@ -1038,6 +1048,7 @@ struct CompiledCommandList {
   UINT access_storage_allocation_events = 0;
   UINT immutable_state_reuses = 0;
   UINT close_materialized_root_table_sets = 0;
+  UINT close_dynamic_render_state_recipes = 0;
   dxmt::d3d12::test::ExecutionPathMode test_path_mode =
       dxmt::d3d12::test::ExecutionPathMode::Auto;
   UINT test_work_record_count = 0;

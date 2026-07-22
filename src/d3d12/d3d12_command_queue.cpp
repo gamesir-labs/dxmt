@@ -10295,14 +10295,9 @@ private:
                 packet.render_state, pipeline->GetGraphicsState()));
             encoder_attachments = &*packet_attachments;
           }
-          auto viewports = packet.render_state.viewports;
-          auto scissors = packet.render_state.scissors;
-          if (!ResolveDynamicRasterRects(viewports, scissors,
-                                         "compiled draw"))
+          if (!packet.dynamic_render_state_recipe ||
+              !packet.dynamic_render_state_recipe->valid)
             return CompiledCommandFallbackReason::UnsupportedRenderTargetState;
-          auto dynamic_state_recipe = BuildCompiledDynamicRenderStateRecipe(
-              viewports, scissors, packet.render_state.blend_factor,
-              packet.render_state.stencil_ref, *encoder_attachments);
 
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
@@ -10362,9 +10357,10 @@ private:
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
             replay_packet.common.stencil_ref = packet.render_state.stencil_ref;
-            replay_packet.common.dynamic_state_recipe = dynamic_state_recipe;
-            replay_packet.common.viewports = std::move(viewports);
-            replay_packet.common.scissors = std::move(scissors);
+            replay_packet.common.dynamic_state_recipe =
+                packet.dynamic_render_state_recipe;
+            replay_packet.common.viewports = packet.render_state.viewports;
+            replay_packet.common.scissors = packet.render_state.scissors;
             replay_packet.common.use_geometry = false;
             replay_packet.common.use_tessellation = false;
             replay_packet.vertex_start = packet.draw->start_vertex_location;
@@ -10436,9 +10432,10 @@ private:
             replay_packet.common.blend_factor =
                 packet.render_state.blend_factor;
             replay_packet.common.stencil_ref = packet.render_state.stencil_ref;
-            replay_packet.common.dynamic_state_recipe = dynamic_state_recipe;
-            replay_packet.common.viewports = std::move(viewports);
-            replay_packet.common.scissors = std::move(scissors);
+            replay_packet.common.dynamic_state_recipe =
+                packet.dynamic_render_state_recipe;
+            replay_packet.common.viewports = packet.render_state.viewports;
+            replay_packet.common.scissors = packet.render_state.scissors;
             replay_packet.common.use_geometry = false;
             replay_packet.common.use_tessellation = false;
             replay_packet.index_allocation = index_allocation;
@@ -24411,13 +24408,7 @@ private:
     std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
     UINT stencil_ref = 0;
     Rc<VisibilityResultQuery> visibility_query;
-    struct CompiledDynamicRenderStateRecipe {
-      std::vector<WMTViewport> viewports;
-      std::vector<WMTScissorRect> scissors;
-      std::array<FLOAT, 4> blend_factor = {1.0f, 1.0f, 1.0f, 1.0f};
-      uint8_t stencil_ref = 0;
-    };
-    std::shared_ptr<const CompiledDynamicRenderStateRecipe>
+    std::shared_ptr<const dxmt::d3d12::CompiledDynamicRenderStateRecipe>
         dynamic_state_recipe;
     CompiledImmutableVector<D3D12_VIEWPORT> viewports;
     CompiledImmutableVector<D3D12_RECT> scissors;
@@ -24429,20 +24420,19 @@ private:
     BindlessMirrorDrawDiag bindless_diag = {};
   };
 
-  static std::shared_ptr<const
-      ReplayDrawPacketCommon::CompiledDynamicRenderStateRecipe>
+  static std::shared_ptr<const CompiledDynamicRenderStateRecipe>
   BuildCompiledDynamicRenderStateRecipe(
       const std::vector<D3D12_VIEWPORT> &viewports,
       const std::vector<D3D12_RECT> &scissors,
       const std::array<FLOAT, 4> &blend_factor, UINT stencil_ref,
       const ReplayRenderPassAttachments &attachments) {
-    auto recipe = std::make_shared<
-        ReplayDrawPacketCommon::CompiledDynamicRenderStateRecipe>();
+    auto recipe = std::make_shared<CompiledDynamicRenderStateRecipe>();
     recipe->blend_factor = blend_factor;
     recipe->stencil_ref = static_cast<uint8_t>(stencil_ref);
-    recipe->viewports.reserve(viewports.size());
+    auto &compiled_viewports = recipe->viewports.mutableView();
+    compiled_viewports.reserve(viewports.size());
     for (const auto &viewport : viewports) {
-      recipe->viewports.push_back(
+      compiled_viewports.push_back(
           {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
            viewport.Height, viewport.MinDepth, viewport.MaxDepth});
     }
@@ -24465,7 +24455,8 @@ private:
     // Metal requires one scissor per viewport. Resolve and clamp the complete
     // array while the submitted packet and its render attachments are still
     // immutable, rather than rebuilding it in list_enc.execute().
-    recipe->scissors.resize(viewports.size());
+    auto &compiled_scissors = recipe->scissors.mutableView();
+    compiled_scissors.resize(viewports.size());
     const size_t active_scissor_count =
         std::min(scissors.size(), viewports.size());
     for (size_t i = 0; i < active_scissor_count; i++) {
@@ -24480,7 +24471,7 @@ private:
           std::min<uint64_t>(right, target_width);
       const uint64_t clamped_bottom =
           std::min<uint64_t>(bottom, target_height);
-      recipe->scissors[i] =
+      compiled_scissors[i] =
           {x, y, clamped_right - x, clamped_bottom - y};
     }
     return recipe;
@@ -24488,7 +24479,7 @@ private:
 
   static void EncodeCompiledDynamicRenderState(
       ArgumentEncodingContext &enc,
-      const ReplayDrawPacketCommon::CompiledDynamicRenderStateRecipe &recipe) {
+      const CompiledDynamicRenderStateRecipe &recipe) {
     auto values_equal = [](const auto &lhs, const auto &rhs) {
       using Value = typename std::decay_t<decltype(lhs)>::value_type;
       return lhs.size() == rhs.size() &&
