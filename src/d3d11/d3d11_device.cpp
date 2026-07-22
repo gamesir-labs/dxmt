@@ -1032,9 +1032,6 @@ public:
     if (!pResource)
       return E_INVALIDARG;
 
-    if (!ppRTView)
-      return S_FALSE;
-
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateRenderTargetView(pDesc, ppRTView);
   }
 
