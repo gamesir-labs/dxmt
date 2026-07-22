@@ -84,8 +84,24 @@ public:
                ID3D11Buffer **ppBuffer) override {
     InitReturnPtr(ppBuffer);
 
-    if (pDesc->ByteWidth == 0 && !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL))
-      return E_INVALIDARG; 
+    if (!pDesc)
+      return E_INVALIDARG;
+
+    if (pDesc->ByteWidth == 0 &&
+        !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL))
+      return E_INVALIDARG;
+
+    if (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+      if (pDesc->BindFlags != D3D11_BIND_CONSTANT_BUFFER ||
+          pDesc->ByteWidth % 16u != 0)
+        return E_INVALIDARG;
+    }
+
+    if (pDesc->Usage == D3D11_USAGE_IMMUTABLE && !pInitialData)
+      return E_INVALIDARG;
+
+    if (!ppBuffer)
+      return S_FALSE;
 
     try {
       switch (pDesc->Usage) {
