@@ -5,7 +5,7 @@
 
 namespace dxmt {
 
-constexpr int kDXMTShaderCacheVersion = 19;
+constexpr int kDXMTShaderCacheVersion = 20;
 
 std::string GetDXMTShaderCacheDirectory();
 
