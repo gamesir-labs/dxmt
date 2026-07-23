@@ -869,7 +869,6 @@ public:
       *pChosenFeatureLevel = D3D_FEATURE_LEVEL(0);
 
     if (!pFeatureLevels || FeatureLevels == 0 ||
-        SDKVersion != D3D11_SDK_VERSION ||
         (Flags & ~D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED))
       return E_INVALIDARG;
 
@@ -1610,24 +1609,34 @@ public:
     if (Priority < -7 || Priority > 7)
       return E_INVALIDARG;
 
-    WARN("SetGPUThreadPriority: Ignoring");
+    gpu_thread_priority_ = Priority;
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT *pPriority) override {
-    *pPriority = 0;
+    if (!pPriority)
+      return E_POINTER;
+
+    *pPriority = gpu_thread_priority_;
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override {
-    cmd_queue_.SetMaxLatency(MaxLatency);
+    constexpr UINT kDefaultMaximumFrameLatency = 3;
+    constexpr UINT kMaximumFrameLatency = 16;
+    if (MaxLatency > kMaximumFrameLatency)
+      return DXGI_ERROR_INVALID_CALL;
+
+    cmd_queue_.SetMaxLatency(MaxLatency ? MaxLatency
+                                        : kDefaultMaximumFrameLatency);
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *pMaxLatency) override {
-    if (pMaxLatency) {
-      *pMaxLatency = cmd_queue_.GetMaxLatency();
-    }
+    if (!pMaxLatency)
+      return DXGI_ERROR_INVALID_CALL;
+
+    *pMaxLatency = cmd_queue_.GetMaxLatency();
     return S_OK;
   }
 
@@ -1679,6 +1688,7 @@ private:
   D3DKMT_HANDLE local_kmt_ = 0;
   std::unique_ptr<Device> device;
   CommandQueue &cmd_queue_;
+  INT gpu_thread_priority_ = 0;
   MTLD3D11DeviceImpl d3d11_device_;
   MTLD3D11VideoDevice video_device_;
 };

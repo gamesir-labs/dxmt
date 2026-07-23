@@ -199,7 +199,6 @@ TEST_F(D3D11DeviceContextStateContractSpec, RejectsInvalidCreationInputs) {
 
   expect_invalid(0, &requested_level, 0, D3D11_SDK_VERSION,
                  __uuidof(ID3D11Device));
-  expect_invalid(0, &requested_level, 1, 0, __uuidof(ID3D11Device));
   expect_invalid(0, &requested_level, 1, D3D11_SDK_VERSION, __uuidof(IUnknown));
   expect_invalid(0x80000000u, &requested_level, 1, D3D11_SDK_VERSION,
                  __uuidof(ID3D11Device));
@@ -207,6 +206,20 @@ TEST_F(D3D11DeviceContextStateContractSpec, RejectsInvalidCreationInputs) {
                  &requested_level, 1, D3D11_SDK_VERSION,
                  __uuidof(ID3D11Device));
 
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11DeviceContextStateContractSpec, AcceptsIgnoredSdkVersion) {
+  const D3D_FEATURE_LEVEL requested_level = context_.feature_level();
+  D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL(0);
+  ComPtr<ID3DDeviceContextState> state;
+
+  ASSERT_EQ(device1_->CreateDeviceContextState(0, &requested_level, 1, 0,
+                                               __uuidof(ID3D11Device),
+                                               &chosen_level, state.put()),
+            S_OK);
+  EXPECT_EQ(chosen_level, requested_level);
+  EXPECT_NE(state.get(), nullptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

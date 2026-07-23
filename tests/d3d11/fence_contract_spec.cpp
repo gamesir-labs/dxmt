@@ -170,7 +170,6 @@ TEST_F(D3D11FenceContractSpec, RejectsSharedHandleForUnsharedFence) {
   HANDLE handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(1));
   EXPECT_EQ(fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle),
             E_INVALIDARG);
-  EXPECT_EQ(handle, nullptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

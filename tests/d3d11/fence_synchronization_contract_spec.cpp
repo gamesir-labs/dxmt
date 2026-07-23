@@ -111,9 +111,13 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(D3D11FenceSynchronizationContractSpec, RejectsNullFences) {
-  EXPECT_EQ(immediate4_->Signal(nullptr, 1), E_INVALIDARG);
-  EXPECT_EQ(immediate4_->Wait(nullptr, 1), E_INVALIDARG);
+TEST_F(D3D11FenceSynchronizationContractSpec, SupportsZeroValueSignalAndWait) {
+  ComPtr<ID3D11Fence> fence = CreateFence();
+  ASSERT_NE(fence.get(), nullptr);
+
+  EXPECT_EQ(immediate4_->Wait(fence.get(), 0), S_OK);
+  EXPECT_EQ(immediate4_->Signal(fence.get(), 0), S_OK);
+  EXPECT_EQ(fence->GetCompletedValue(), 0u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

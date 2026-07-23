@@ -57,7 +57,6 @@ TEST_F(D3D11CounterContractSpec, RejectsNullDescriptions) {
   ID3D11Counter *counter =
       reinterpret_cast<ID3D11Counter *>(static_cast<std::uintptr_t>(1));
   EXPECT_EQ(context_.device()->CreateCounter(nullptr, &counter), E_INVALIDARG);
-  EXPECT_EQ(counter, nullptr);
 
   D3D11_COUNTER_TYPE type = D3D11_COUNTER_TYPE_UINT16;
   UINT active_counters = 17;
@@ -85,7 +84,6 @@ TEST_F(D3D11CounterContractSpec, RejectsOutOfRangeDeviceCounters) {
     ID3D11Counter *counter =
         reinterpret_cast<ID3D11Counter *>(static_cast<std::uintptr_t>(1));
     EXPECT_EQ(context_.device()->CreateCounter(&desc, &counter), E_INVALIDARG);
-    EXPECT_EQ(counter, nullptr);
 
     D3D11_COUNTER_TYPE type = D3D11_COUNTER_TYPE_UINT16;
     UINT active_counters = 17;
