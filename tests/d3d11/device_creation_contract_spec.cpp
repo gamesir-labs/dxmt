@@ -52,6 +52,69 @@ constexpr std::array kInvalidAdapterCases = {
                        "ExplicitAdapterSoftwareModule"},
 };
 
+struct FeatureLevelCase {
+  std::array<D3D_FEATURE_LEVEL, 3> requested;
+  UINT count;
+  D3D_FEATURE_LEVEL expected;
+  const char *name;
+};
+
+constexpr std::array kFeatureLevelCases = {
+    FeatureLevelCase{
+        {D3D_FEATURE_LEVEL_11_0}, 1, D3D_FEATURE_LEVEL_11_0, "Level11_0"},
+    FeatureLevelCase{
+        {D3D_FEATURE_LEVEL_10_1}, 1, D3D_FEATURE_LEVEL_10_1, "Level10_1"},
+    FeatureLevelCase{
+        {D3D_FEATURE_LEVEL_10_0}, 1, D3D_FEATURE_LEVEL_10_0, "Level10_0"},
+    FeatureLevelCase{
+        {D3D_FEATURE_LEVEL_9_3}, 1, D3D_FEATURE_LEVEL_9_3, "Level9_3"},
+    FeatureLevelCase{
+        {D3D_FEATURE_LEVEL_9_2}, 1, D3D_FEATURE_LEVEL_9_2, "Level9_2"},
+    FeatureLevelCase{
+        {D3D_FEATURE_LEVEL_9_1}, 1, D3D_FEATURE_LEVEL_9_1, "Level9_1"},
+    FeatureLevelCase{{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+                      D3D_FEATURE_LEVEL_10_0},
+                     3,
+                     D3D_FEATURE_LEVEL_11_0,
+                     "HighestFirst"},
+    FeatureLevelCase{{D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
+                      D3D_FEATURE_LEVEL_11_0},
+                     3,
+                     D3D_FEATURE_LEVEL_10_0,
+                     "FirstSupportedWins"},
+};
+
+struct CreationFlagsCase {
+  UINT flags;
+  const char *name;
+};
+
+constexpr UINT kObservableCreationFlags =
+    D3D11_CREATE_DEVICE_SINGLETHREADED |
+    D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS |
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+constexpr std::array kCreationFlagsCases = {
+    CreationFlagsCase{0, "Default"},
+    CreationFlagsCase{D3D11_CREATE_DEVICE_SINGLETHREADED, "SingleThreaded"},
+    CreationFlagsCase{
+        D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
+        "PreventInternalThreading"},
+    CreationFlagsCase{D3D11_CREATE_DEVICE_BGRA_SUPPORT, "BgraSupport"},
+    CreationFlagsCase{
+        D3D11_CREATE_DEVICE_SINGLETHREADED |
+            D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
+        "SingleThreadedPreventInternalThreading"},
+    CreationFlagsCase{D3D11_CREATE_DEVICE_SINGLETHREADED |
+                          D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                      "SingleThreadedBgra"},
+    CreationFlagsCase{
+        D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS |
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        "PreventInternalThreadingBgra"},
+    CreationFlagsCase{kObservableCreationFlags, "EveryObservableFlag"},
+};
+
 const dxmt::test::LogicalCaseFamilyRegistration kOutputRegistration(
     "D3D11DeviceCreationContractSpec.CreatesForEveryOutputCombination",
     "D3D11.DeviceCreation.OutputCombination.", kOutputCases.size(), 1,
@@ -88,11 +151,53 @@ const dxmt::test::LogicalCaseFamilyRegistration kInvalidAdapterRegistration(
      "logical ID, invalid case, adapter presence, driver type, software "
      "module, HRESULT, cleared outputs, and exact replay argument"});
 
+const dxmt::test::LogicalCaseFamilyRegistration kFeatureLevelRegistration(
+    "D3D11DeviceCreationContractSpec.SelectsRequestedFeatureLevelsInOrder",
+    "D3D11.DeviceCreation.FeatureLevelSelection.", kFeatureLevelCases.size(), 1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"9_1-11_0", "None", "Device",
+      "D3D11CreateDevice,ID3D11DeviceGetFeatureLevel,FeatureLevelOrder"},
+     dxmt::test::kResourceTestCost,
+     "one fixture-local adapter and one independently created D3D11 device "
+     "per selected logical case",
+     "request each core feature level from 9_1 through 11_0 and exercise "
+     "both descending and ascending multi-level preference lists",
+     "creation selects the first supported entry exactly and reports it "
+     "through both the output parameter and ID3D11Device",
+     "logical ID, requested list and count, expected and observed levels, "
+     "HRESULT, object addresses, and exact replay argument"});
+
+const dxmt::test::LogicalCaseFamilyRegistration kCreationFlagsRegistration(
+    "D3D11DeviceCreationContractSpec.PreservesDocumentedCreationFlags",
+    "D3D11.DeviceCreation.Flags.", kCreationFlagsCases.size(), 1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "D3D11CreateDevice,ID3D11DeviceGetCreationFlags,"
+      "D3D11_CREATE_DEVICE_SINGLETHREADED,"
+      "D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,"
+      "D3D11_CREATE_DEVICE_BGRA_SUPPORT"},
+     dxmt::test::kResourceTestCost,
+     "one fixture-local adapter and one independently created D3D11 device "
+     "and immediate context per selected logical case",
+     "create devices with every combination of three documented, "
+     "environment-independent creation flags",
+     "creation succeeds and GetCreationFlags preserves every requested bit",
+     "logical ID, requested and observed flags, HRESULT, feature level, "
+     "object addresses, and exact replay argument"});
+
 const dxmt::test::TestCostRegistration kOutputCost(
     "D3D11DeviceCreationContractSpec.CreatesForEveryOutputCombination",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kInvalidAdapterCost(
     "D3D11DeviceCreationContractSpec.RejectsContradictoryAdapterArguments",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kFeatureLevelCost(
+    "D3D11DeviceCreationContractSpec.SelectsRequestedFeatureLevelsInOrder",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kCreationFlagsCost(
+    "D3D11DeviceCreationContractSpec.PreservesDocumentedCreationFlags",
     dxmt::test::kResourceTestCost);
 
 class D3D11DeviceCreationContractSpec : public ::testing::Test {
@@ -227,6 +332,86 @@ TEST_F(D3D11DeviceCreationContractSpec, RejectsContradictoryAdapterArguments) {
   RecordProperty("logical_cases_executed", selected_count);
   RecordProperty("logical_case_prefix",
                  kInvalidAdapterRegistration.family().case_id_prefix);
+}
+
+TEST_F(D3D11DeviceCreationContractSpec, SelectsRequestedFeatureLevelsInOrder) {
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kFeatureLevelCases.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kFeatureLevelRegistration.family(),
+                                         logical))
+      continue;
+    ++selected_count;
+    const FeatureLevelCase &test_case = kFeatureLevelCases[logical];
+    const auto case_id =
+        dxmt::test::LogicalCaseId(kFeatureLevelRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message()
+                 << "LogicalCaseId: " << case_id << " case=" << test_case.name
+                 << " count=" << test_case.count
+                 << " expected=" << test_case.expected
+                 << " Replay: --dxmt-case-id=" << case_id);
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> immediate_context;
+    D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
+    const HRESULT hr = D3D11CreateDevice(
+        context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+        test_case.requested.data(), test_case.count, D3D11_SDK_VERSION,
+        device.put(), &chosen_level, immediate_context.put());
+
+    EXPECT_EQ(hr, S_OK);
+    ASSERT_TRUE(device);
+    ASSERT_TRUE(immediate_context);
+    EXPECT_EQ(chosen_level, test_case.expected);
+    EXPECT_EQ(device->GetFeatureLevel(), test_case.expected);
+    ComPtr<ID3D11Device> owner;
+    immediate_context->GetDevice(owner.put());
+    EXPECT_EQ(owner.get(), device.get());
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kFeatureLevelRegistration.family().case_id_prefix);
+}
+
+TEST_F(D3D11DeviceCreationContractSpec, PreservesDocumentedCreationFlags) {
+  constexpr D3D_FEATURE_LEVEL kRequestedLevel = D3D_FEATURE_LEVEL_11_0;
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kCreationFlagsCases.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kCreationFlagsRegistration.family(),
+                                         logical))
+      continue;
+    ++selected_count;
+    const CreationFlagsCase &test_case = kCreationFlagsCases[logical];
+    const auto case_id =
+        dxmt::test::LogicalCaseId(kCreationFlagsRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message()
+                 << "LogicalCaseId: " << case_id << " case=" << test_case.name
+                 << " flags=" << test_case.flags
+                 << " Replay: --dxmt-case-id=" << case_id);
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> immediate_context;
+    D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
+    const HRESULT hr = D3D11CreateDevice(
+        context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, test_case.flags,
+        &kRequestedLevel, 1, D3D11_SDK_VERSION, device.put(), &chosen_level,
+        immediate_context.put());
+
+    EXPECT_EQ(hr, S_OK);
+    ASSERT_TRUE(device);
+    ASSERT_TRUE(immediate_context);
+    EXPECT_EQ(chosen_level, kRequestedLevel);
+    EXPECT_EQ(device->GetCreationFlags() & kObservableCreationFlags,
+              test_case.flags);
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kCreationFlagsRegistration.family().case_id_prefix);
 }
 
 } // namespace
