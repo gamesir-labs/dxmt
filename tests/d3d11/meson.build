@@ -65,6 +65,7 @@ d3d11_unit_sources = files(
   'texture2dms_single_depth_stencil_view_desc_matrix_spec.cpp',
   'texture2dms_depth_stencil_view_desc_matrix_spec.cpp',
   'object_com_matrix_spec.cpp',
+  'class_linkage_contract_spec.cpp',
   'sampler_state_desc_matrix_spec.cpp',
   'output_merger_binding_matrix_spec.cpp',
   'blend_state_binding_matrix_spec.cpp',
