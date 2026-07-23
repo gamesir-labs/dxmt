@@ -83,6 +83,39 @@ const dxmt::test::TestCostRegistration kContextInterfaceCost(
     "D3D11ContextObjectContractSpec.ExposesOneIdentityAcrossContextVersions",
     dxmt::test::kResourceTestCost);
 
+struct HardwareProtectionCase {
+  bool deferred;
+  const char *name;
+};
+
+constexpr std::array kHardwareProtectionCases = {
+    HardwareProtectionCase{false, "Immediate"},
+    HardwareProtectionCase{true, "Deferred"},
+};
+
+const dxmt::test::LogicalCaseFamilyRegistration kHardwareProtectionRegistration(
+    "D3D11ContextObjectContractSpec.RoundTripsHardwareProtectionState",
+    "D3D11.Context.HardwareProtection.State.", kHardwareProtectionCases.size(),
+    1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_3", "None", "Device",
+      "ID3D11DeviceContext3,SetHardwareProtectionState,"
+      "GetHardwareProtectionState"},
+     dxmt::test::kResourceTestCost,
+     "one test-local D3D11 device, its immediate context, and one deferred "
+     "context",
+     "read the default hardware-protection state, enable it on one "
+     "context, verify the other context is unchanged, then disable it",
+     "immediate and deferred contexts each default to disabled, retain "
+     "their own enabled state, and return to disabled independently",
+     "logical ID, selected-case count, context kind, each observed state, "
+     "failure phase, and exact replay argument"});
+
+const dxmt::test::TestCostRegistration kHardwareProtectionCost(
+    "D3D11ContextObjectContractSpec.RoundTripsHardwareProtectionState",
+    dxmt::test::kResourceTestCost);
+
 class D3D11ContextObjectContractSpec : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -248,6 +281,72 @@ TEST_F(D3D11ContextObjectContractSpec,
   EXPECT_EQ(deferred, kDeferredValue);
   EXPECT_EQ(deferred_->SetPrivateData(kContextPrivateDataKey, 0, nullptr),
             S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11ContextObjectContractSpec, RoundTripsHardwareProtectionState) {
+  ComPtr<ID3D11DeviceContext3> immediate3;
+  ComPtr<ID3D11DeviceContext3> deferred3;
+  ASSERT_EQ(context_.context()->QueryInterface(
+                __uuidof(ID3D11DeviceContext3),
+                reinterpret_cast<void **>(immediate3.put())),
+            S_OK);
+  ASSERT_EQ(
+      deferred_->QueryInterface(__uuidof(ID3D11DeviceContext3),
+                                reinterpret_cast<void **>(deferred3.put())),
+      S_OK);
+
+  std::vector<std::uint32_t> selected_cases;
+  for (std::uint32_t logical = 0; logical < kHardwareProtectionCases.size();
+       ++logical) {
+    if (dxmt::test::LogicalCaseSelected(
+            kHardwareProtectionRegistration.family(), logical))
+      selected_cases.push_back(logical);
+  }
+  ASSERT_FALSE(selected_cases.empty());
+
+  RecordProperty("logical_cases_executed", selected_cases.size());
+  RecordProperty("logical_case_prefix",
+                 kHardwareProtectionRegistration.family().case_id_prefix);
+  for (const std::uint32_t logical : selected_cases) {
+    const HardwareProtectionCase &test_case = kHardwareProtectionCases[logical];
+    ID3D11DeviceContext3 *selected =
+        test_case.deferred ? deferred3.get() : immediate3.get();
+    ID3D11DeviceContext3 *other =
+        test_case.deferred ? immediate3.get() : deferred3.get();
+
+    immediate3->SetHardwareProtectionState(FALSE);
+    deferred3->SetHardwareProtectionState(FALSE);
+    WINBOOL initial = TRUE;
+    WINBOOL enabled = FALSE;
+    WINBOOL other_state = TRUE;
+    WINBOOL disabled = TRUE;
+    selected->GetHardwareProtectionState(&initial);
+    selected->SetHardwareProtectionState(TRUE);
+    selected->GetHardwareProtectionState(&enabled);
+    other->GetHardwareProtectionState(&other_state);
+    selected->SetHardwareProtectionState(FALSE);
+    selected->GetHardwareProtectionState(&disabled);
+
+    const bool valid = initial == FALSE && enabled == TRUE &&
+                       other_state == FALSE && disabled == FALSE;
+    if (valid)
+      continue;
+
+    const auto case_id = dxmt::test::LogicalCaseId(
+        kHardwareProtectionRegistration.family(), logical);
+    ADD_FAILURE() << "LogicalCaseId: " << case_id << '\n'
+                  << "Parameters: logical=" << logical
+                  << " context=" << test_case.name
+                  << " selected_cases=" << selected_cases.size() << '\n'
+                  << "Expected: initial=0 enabled=1 other=0 disabled=0\n"
+                  << "Observed: initial=" << initial << " enabled=" << enabled
+                  << " other=" << other_state << " disabled=" << disabled
+                  << '\n'
+                  << "Replay: --dxmt-case-id=" << case_id;
+    break;
+  }
+
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

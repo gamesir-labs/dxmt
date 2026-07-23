@@ -3328,13 +3328,14 @@ public:
 
   void STDMETHODCALLTYPE
   SetHardwareProtectionState(WINBOOL enable) override {
-    WARN("SetHardwareProtectionState: stub");
+    std::lock_guard<mutex_t> lock(mutex);
+    hardware_protection_state_ = enable != FALSE;
   }
 
   void STDMETHODCALLTYPE
   GetHardwareProtectionState(WINBOOL *enable) override {
-    *enable = false;
-    WARN("GetHardwareProtectionState: stub");
+    std::lock_guard<mutex_t> lock(mutex);
+    *enable = hardware_protection_state_;
   }
 
 #pragma endregion
@@ -5478,6 +5479,7 @@ public:
 
 protected:
   D3D11ContextState state_;
+  WINBOOL hardware_protection_state_ = FALSE;
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;
