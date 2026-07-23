@@ -52,7 +52,7 @@ constexpr std::array kPipelineChildCases = {
                       &__uuidof(ID3D11GeometryShader), "gs_5_0",
                       "GeometryShader"},
     PipelineChildCase{PipelineChildKind::GeometryShaderWithStreamOutput,
-                      &__uuidof(ID3D11GeometryShader), "vs_5_0",
+                      &__uuidof(ID3D11GeometryShader), "gs_5_0",
                       "GeometryShaderWithStreamOutput"},
     PipelineChildCase{PipelineChildKind::HullShader,
                       &__uuidof(ID3D11HullShader), "hs_5_0", "HullShader"},
@@ -94,13 +94,13 @@ std::string_view ShaderSource(PipelineChildKind kind) {
   switch (kind) {
   case PipelineChildKind::InputLayout:
   case PipelineChildKind::VertexShader:
-  case PipelineChildKind::GeometryShaderWithStreamOutput:
     return "float4 main(float4 position : POSITION) : SV_Position { return "
            "position; }";
   case PipelineChildKind::PixelShader:
     return "float4 main() : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); "
            "}";
   case PipelineChildKind::GeometryShader:
+  case PipelineChildKind::GeometryShaderWithStreamOutput:
     return R"(
 struct Vertex { float4 position : SV_Position; };
 [maxvertexcount(1)]
@@ -202,7 +202,8 @@ HRESULT CreatePipelineChild(ID3D11Device *device, PipelineChildKind kind,
     return QueryAsDeviceChild(hr, object, child);
   }
   case PipelineChildKind::GeometryShaderWithStreamOutput: {
-    const D3D11_SO_DECLARATION_ENTRY declaration = {0, "POSITION", 0, 0, 4, 0};
+    const D3D11_SO_DECLARATION_ENTRY declaration = {
+        0, "SV_Position", 0, 0, 4, 0};
     constexpr UINT stride = sizeof(FLOAT) * 4;
     ComPtr<ID3D11GeometryShader> object;
     const HRESULT hr = device->CreateGeometryShaderWithStreamOutput(

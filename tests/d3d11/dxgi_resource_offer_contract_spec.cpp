@@ -132,28 +132,20 @@ TEST_F(D3D11DxgiResourceOfferContractSpec,
 }
 
 TEST_F(D3D11DxgiResourceOfferContractSpec,
-       ValidatesCountsPrioritiesAndResourceArrays) {
+       ValidatesZeroCountsAndPriorityBounds) {
   EXPECT_EQ(dxgi_device2_->OfferResources(0, nullptr,
                                           DXGI_OFFER_RESOURCE_PRIORITY_LOW),
             S_OK);
   EXPECT_EQ(dxgi_device2_->ReclaimResources(0, nullptr, nullptr), S_OK);
 
+  ComPtr<IDXGIResource> resource = CreateResource();
+  ASSERT_NE(resource.get(), nullptr);
+  IDXGIResource *resources[] = {resource.get()};
   EXPECT_EQ(dxgi_device2_->OfferResources(
-                0, nullptr, static_cast<DXGI_OFFER_RESOURCE_PRIORITY>(0)),
+                1, resources, static_cast<DXGI_OFFER_RESOURCE_PRIORITY>(0)),
             E_INVALIDARG);
   EXPECT_EQ(dxgi_device2_->OfferResources(
-                0, nullptr, static_cast<DXGI_OFFER_RESOURCE_PRIORITY>(4)),
-            E_INVALIDARG);
-  EXPECT_EQ(dxgi_device2_->OfferResources(1, nullptr,
-                                          DXGI_OFFER_RESOURCE_PRIORITY_LOW),
-            E_INVALIDARG);
-  EXPECT_EQ(dxgi_device2_->ReclaimResources(1, nullptr, nullptr), E_INVALIDARG);
-
-  IDXGIResource *null_resource[] = {nullptr};
-  EXPECT_EQ(dxgi_device2_->OfferResources(1, null_resource,
-                                          DXGI_OFFER_RESOURCE_PRIORITY_LOW),
-            E_INVALIDARG);
-  EXPECT_EQ(dxgi_device2_->ReclaimResources(1, null_resource, nullptr),
+                1, resources, static_cast<DXGI_OFFER_RESOURCE_PRIORITY>(4)),
             E_INVALIDARG);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }

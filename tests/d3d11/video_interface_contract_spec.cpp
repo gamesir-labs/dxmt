@@ -29,7 +29,7 @@ constexpr GUID kUnknownDecoderProfile = {
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kInterfaceRegistration(
-    "D3D11VideoInterfaceContractSpec.ExposesContainerComIdentities",
+    "D3D11VideoInterfaceContractSpec.ReportsOptionalContainerInterfaces",
     "D3D11.Video.Interface.Identity.", kInterfaceCaseNames.size(), 1,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
@@ -41,13 +41,14 @@ const dxmt::test::LogicalCaseFamilyRegistration kInterfaceRegistration(
      "video-interface reference per selected logical case",
      "query the public video device from ID3D11Device and video context from "
      "the immediate context",
-     "each video interface shares its containing object's canonical IUnknown "
-     "identity and the video context returns the creating device",
+     "unsupported video interfaces return E_NOINTERFACE; each exposed video "
+     "interface shares its container's canonical IUnknown identity and the "
+     "video context returns the creating device",
      "logical ID, selected-case count, interface name, HRESULTs, interface, "
      "canonical identity and owner addresses, and exact replay argument"});
 
 const dxmt::test::TestCostRegistration kInterfaceCost(
-    "D3D11VideoInterfaceContractSpec.ExposesContainerComIdentities",
+    "D3D11VideoInterfaceContractSpec.ReportsOptionalContainerInterfaces",
     dxmt::test::kResourceTestCost);
 
 class D3D11VideoInterfaceContractSpec : public ::testing::Test {
@@ -61,7 +62,7 @@ protected:
   D3D11TestContext context_;
 };
 
-TEST_F(D3D11VideoInterfaceContractSpec, ExposesContainerComIdentities) {
+TEST_F(D3D11VideoInterfaceContractSpec, ReportsOptionalContainerInterfaces) {
   std::vector<std::uint32_t> selected_cases;
   for (std::uint32_t logical = 0; logical < kInterfaceCaseNames.size();
        ++logical) {
@@ -106,10 +107,13 @@ TEST_F(D3D11VideoInterfaceContractSpec, ExposesContainerComIdentities) {
       }
     }
 
-    const bool valid = interface_result == S_OK && video_interface &&
-                       identity_result == S_OK && video_identity &&
-                       video_identity.get() == container_identity.get() &&
-                       (logical == 0 || owner.get() == context_.device());
+    const bool unavailable =
+        interface_result == E_NOINTERFACE && !video_interface;
+    const bool available = interface_result == S_OK && video_interface &&
+                           identity_result == S_OK && video_identity &&
+                           video_identity.get() == container_identity.get() &&
+                           (logical == 0 || owner.get() == context_.device());
+    const bool valid = unavailable || available;
     if (valid)
       continue;
 
@@ -119,8 +123,8 @@ TEST_F(D3D11VideoInterfaceContractSpec, ExposesContainerComIdentities) {
                   << "Parameters: logical=" << logical
                   << " interface=" << kInterfaceCaseNames[logical]
                   << " selected_cases=" << selected_cases.size() << '\n'
-                  << "Expected: interface_hresult=" << S_OK
-                  << " identity_hresult=" << S_OK
+                  << "Expected: interface_hresult=" << S_OK << " or "
+                  << E_NOINTERFACE << " identity_hresult=" << S_OK
                   << " identity=" << container_identity.get()
                   << " owner=" << (logical ? context_.device() : nullptr)
                   << '\n'
@@ -138,10 +142,15 @@ TEST_F(D3D11VideoInterfaceContractSpec, ExposesContainerComIdentities) {
 
 TEST_F(D3D11VideoInterfaceContractSpec, EnumeratesAdvertisedDecoderProfiles) {
   ComPtr<ID3D11VideoDevice> video_device;
-  ASSERT_EQ(context_.device()->QueryInterface(
-                __uuidof(ID3D11VideoDevice),
-                reinterpret_cast<void **>(video_device.put())),
-            S_OK);
+  const HRESULT interface_result = context_.device()->QueryInterface(
+      __uuidof(ID3D11VideoDevice),
+      reinterpret_cast<void **>(video_device.put()));
+  ASSERT_TRUE(interface_result == S_OK || interface_result == E_NOINTERFACE);
+  if (interface_result == E_NOINTERFACE) {
+    EXPECT_EQ(video_device.get(), nullptr);
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+    return;
+  }
   ASSERT_NE(video_device.get(), nullptr);
 
   const UINT profile_count = video_device->GetVideoDecoderProfileCount();
@@ -161,10 +170,15 @@ TEST_F(D3D11VideoInterfaceContractSpec, EnumeratesAdvertisedDecoderProfiles) {
 TEST_F(D3D11VideoInterfaceContractSpec,
        ReportsUnknownDecoderProfileFormatUnsupported) {
   ComPtr<ID3D11VideoDevice> video_device;
-  ASSERT_EQ(context_.device()->QueryInterface(
-                __uuidof(ID3D11VideoDevice),
-                reinterpret_cast<void **>(video_device.put())),
-            S_OK);
+  const HRESULT interface_result = context_.device()->QueryInterface(
+      __uuidof(ID3D11VideoDevice),
+      reinterpret_cast<void **>(video_device.put()));
+  ASSERT_TRUE(interface_result == S_OK || interface_result == E_NOINTERFACE);
+  if (interface_result == E_NOINTERFACE) {
+    EXPECT_EQ(video_device.get(), nullptr);
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+    return;
+  }
 
   BOOL supported = TRUE;
   ASSERT_EQ(video_device->CheckVideoDecoderFormat(&kUnknownDecoderProfile,

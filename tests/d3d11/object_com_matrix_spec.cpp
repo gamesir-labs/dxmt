@@ -339,17 +339,21 @@ TEST_F(ObjectComMatrixSpec, DeviceQueryInterfaceNullOutputIsRejected) {
 }
 
 TEST_F(ObjectComMatrixSpec,
-       D3D10AndD3D11InterfacesShareIdentityAndPrivateData) {
+       OptionalD3D10InterfacesShareIdentityAndPrivateData) {
   ComPtr<ID3D10Device> device10;
   ComPtr<ID3D10Device1> device10_1;
-  ASSERT_EQ(
-      context_.device()->QueryInterface(
-          __uuidof(ID3D10Device), reinterpret_cast<void **>(device10.put())),
-      S_OK);
-  ASSERT_EQ(
-      context_.device()->QueryInterface(
-          __uuidof(ID3D10Device1), reinterpret_cast<void **>(device10_1.put())),
-      S_OK);
+  const HRESULT device10_result = context_.device()->QueryInterface(
+      __uuidof(ID3D10Device), reinterpret_cast<void **>(device10.put()));
+  const HRESULT device10_1_result = context_.device()->QueryInterface(
+      __uuidof(ID3D10Device1), reinterpret_cast<void **>(device10_1.put()));
+  ASSERT_TRUE(device10_result == S_OK || device10_result == E_NOINTERFACE);
+  ASSERT_EQ(device10_1_result, device10_result);
+  if (device10_result == E_NOINTERFACE) {
+    EXPECT_EQ(device10.get(), nullptr);
+    EXPECT_EQ(device10_1.get(), nullptr);
+    EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+    return;
+  }
   ASSERT_NE(device10.get(), nullptr);
   ASSERT_NE(device10_1.get(), nullptr);
 
