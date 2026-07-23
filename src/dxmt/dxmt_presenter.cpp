@@ -3,13 +3,17 @@
 #include <chrono>
 #include "Metal.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_command_queue.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_presenter.hpp"
 #include "util_likely.hpp"
 
 namespace dxmt {
 
-Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count) :
+Presenter::Presenter(CommandQueue &queue, WMT::Device device,
+                     WMT::MetalLayer layer, InternalCommandLibrary &lib,
+                     float scale_factor, uint8_t sample_count) :
+    queue_(queue),
     device_(device),
     layer_(layer),
     lib_(lib),
@@ -32,6 +36,11 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   texture_info.sample_count = 1;
   texture_info.array_length = 1;
   gamma_lut_texture_ = device.newTexture(texture_info);
+  queue_.AddPersistentResidency(gamma_lut_texture_);
+}
+
+Presenter::~Presenter() {
+  queue_.RemovePersistentResidencyAfterCompletion(gamma_lut_texture_);
 }
 
 bool

@@ -30,6 +30,7 @@
 #include "sha1/sha1_util.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
+#include "util_lifecycle_telemetry.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include "wsi_monitor.hpp"
@@ -674,6 +675,36 @@ static bool
 D3D12DiagEnabledEnv(const char *name) {
   auto value = env::getEnvVar(name);
   return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+static bool
+D3D12SubmissionLifecycleEnabled() {
+  return D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+}
+
+static void
+D3D12SubmissionLifecycleLog(uintptr_t queue, UINT queue_type,
+                            const char *stage, const char *operation,
+                            uint64_t pair_id, uint64_t queue_pair_id,
+                            uint64_t frame_id, uint64_t chunk_id,
+                            uintptr_t command_buffer, uint64_t wait_sequence,
+                            uint64_t dependency_sequence) {
+  if (!D3D12SubmissionLifecycleEnabled())
+    return;
+  WARN_FILE_ONLY("D3D12 submission lifecycle:"
+       " eventSeq=", dxmt::lifecycle::nextEventSequence(),
+       " pairSeq=", pair_id,
+       " queuePairSeq=", queue_pair_id,
+       " queue=", queue,
+       " queueType=", queue_type,
+       " thread=", dxmt::lifecycle::threadId(),
+       " stage=", stage,
+       " operation=", operation,
+       " frame=", frame_id,
+       " chunk=", chunk_id,
+       " cmdbuf=", command_buffer,
+       " waitSeq=", wait_sequence,
+       " dependencySeq=", dependency_sequence);
 }
 
 static bool
@@ -5265,6 +5296,7 @@ private:
       }
 
       presenter_ = Rc(new Presenter(
+          queue->device_->GetDXMTDevice().queue(),
           queue->device_->GetMTLDevice(), layer_,
           queue->device_->GetDXMTDevice().queue().cmd_library, 1.0f,
           desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
@@ -13044,6 +13076,7 @@ private:
     chunk->emitcc([ops = std::move(ops),
                    staging = WMT::Reference<WMT::Buffer>(staging)](
                       ArgumentEncodingContext &enc) mutable {
+      RetainDirectBufferForGpu(enc, staging);
       struct EncodedWrite {
         BufferAllocation *allocation;
         UINT64 dst_offset;
@@ -14125,6 +14158,7 @@ private:
         [allocation = std::move(allocation),
          staging = WMT::Reference<WMT::Buffer>(staging), source_offset,
          size](ArgumentEncodingContext &enc) {
+          RetainDirectBufferForGpu(enc, staging);
           enc.retainAllocation(allocation.ptr());
           enc.startBlitPass();
           auto &copy =
@@ -21673,9 +21707,29 @@ private:
     if (!slice.mapped || !slice.gpu_buffer)
       return {};
     auto *root_offsets = static_cast<uint32_t *>(slice.mapped);
-    // UINT32_MAX sentinel so the first real heap_index wins the min().
+    std::vector<uint32_t> expected_root_offsets(max_key_plus_one, UINT32_MAX);
+    std::vector<uint8_t> root_offset_has_payload(max_key_plus_one, 0);
+    if (arguments) {
+      for (UINT i = 0; i < argument_count; i++) {
+        const auto &arg = arguments[i];
+        const bool tracked =
+            arg.Type == SM50BindingType::Sampler ||
+            (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
+        if (!tracked || arg.StructurePtrOffset >= max_key_plus_one ||
+            expected_root_offsets[arg.StructurePtrOffset] != UINT32_MAX)
+          continue;
+        const auto compact_base =
+            arg.Type == SM50BindingType::Sampler ? sampler_bases[i]
+                                                : texture_bases[i];
+        if (compact_base < dxmt::kBindlessMirrorCapacity)
+          expected_root_offsets[arg.StructurePtrOffset] = compact_base;
+      }
+    }
+    // Root offsets describe the compact ABI layout, not descriptor presence.
+    // Empty and sparse ranges must still point at their own zero-filled window
+    // instead of aliasing compact window zero.
     for (uint32_t i = 0; i < max_key_plus_one; i++)
-      root_offsets[i] = UINT32_MAX;
+      root_offsets[i] = expected_root_offsets[i];
     if (window) {
       if (texture_count) {
         const uint64_t qwords =
@@ -21734,9 +21788,10 @@ private:
           break;
         }
       }
-      if (compact_base == UINT_MAX)
+      if (compact_base >= dxmt::kBindlessMirrorCapacity)
         return;
       root_offsets[root_offset_key] = compact_base;
+      root_offset_has_payload[root_offset_key] = 1;
       if (window) {
         const auto dst_slot = compact_base + local;
         if (dst_slot >= dxmt::kBindlessMirrorCapacity)
@@ -21829,6 +21884,7 @@ private:
         uint64_t encoded[dxmt::kMirrorSamplerQwords] = {};
         EncodeMirrorSamplerSlot(encoded, *sampler);
         root_offsets[arg->StructurePtrOffset] = static_sampler_bases[index];
+        root_offset_has_payload[arg->StructurePtrOffset] = 1;
         dst[slot] = encoded[0];
         dst[dxmt::kBindlessMirrorCapacity + slot] = encoded[1];
         dst[uint64_t(dxmt::kBindlessMirrorCapacity) * 2 + slot] = encoded[2];
@@ -21854,6 +21910,25 @@ private:
             BindlessRootOffsetIssueMissingSnapshotEntry |
                 BindlessRootOffsetIssueMissingPlanCoverage,
             draw_diag);
+      }
+      for (uint32_t key = 0; key < max_key_plus_one; key++) {
+        if (expected_root_offsets[key] == UINT32_MAX ||
+            root_offset_has_payload[key])
+          continue;
+        if (!BindlessMirrorDiagShouldLog())
+          break;
+        WARN("DXMT bindless-window DIAG empty-snapshot-range",
+             " frame=", device_->GetDXMTDevice().queue().CurrentFrameSeq(),
+             " recordSerial=", DiagCurrentReplayRecordSerial(),
+             " stage=", PipelineStageName(want_stage),
+             " rootOffsetKey=", key,
+             " compactBase=", expected_root_offsets[key],
+             " recipeEntries=",
+             snapshot.native_descriptor_recipe
+                 ? snapshot.native_descriptor_recipe->entries.size()
+                 : 0,
+             " frozenDescriptors=",
+             snapshot.native_descriptor_indices.size());
       }
     }
     for (uint32_t i = 0; i < max_key_plus_one; i++)
@@ -22855,6 +22930,11 @@ private:
       if (store->retained_sequence.compare_exchange_weak(
               retained, sequence, std::memory_order_acq_rel,
               std::memory_order_acquire)) {
+        if (store->root_base_buffer) {
+          enc.queue().AddPersistentResidency(store->root_base_buffer);
+          enc.queue().RemovePersistentResidencyAfterCompletion(
+              store->root_base_buffer, sequence);
+        }
         enc.queue().RetainUntilGpuComplete(
             sequence, [retained_store = store]() {
               (void)retained_store;
@@ -22862,6 +22942,19 @@ private:
         return;
       }
     }
+  }
+
+  static void RetainDirectBufferForGpu(ArgumentEncodingContext &enc,
+                                       WMT::Buffer buffer) {
+    if (!buffer)
+      return;
+    const auto sequence = enc.currentSeqId();
+    enc.queue().AddPersistentResidency(buffer);
+    enc.queue().RemovePersistentResidencyAfterCompletion(buffer, sequence);
+    enc.queue().RetainUntilGpuComplete(
+        sequence, [retained = WMT::Reference<WMT::Buffer>(buffer)]() {
+          (void)retained;
+        });
   }
 
   void EncodeCompiledComputeBindings(
@@ -24293,6 +24386,7 @@ private:
             Rc<BufferAllocation> allocation = resource->GetBufferAllocation();
             chunk->emitcc([allocation, staging = WMT::Reference<WMT::Buffer>(staging),
                            index_offset, size](ArgumentEncodingContext &enc) {
+              RetainDirectBufferForGpu(enc, staging);
               enc.retainAllocation(allocation.ptr());
               enc.startBlitPass();
               auto &copy =
@@ -24387,6 +24481,7 @@ private:
           resource->GetHeapOffset() + resource_offset + vertex_offset;
       chunk->emitcc([allocation, staging = WMT::Reference<WMT::Buffer>(staging),
                      src_offset, size](ArgumentEncodingContext &enc) {
+        RetainDirectBufferForGpu(enc, staging);
         enc.retainAllocation(allocation.ptr());
         enc.startBlitPass();
         auto &copy =
@@ -24603,6 +24698,7 @@ private:
         chunk->emitcc([allocation,
                        staging = WMT::Reference<WMT::Buffer>(staging),
                        src_offset, size](ArgumentEncodingContext &enc) {
+          RetainDirectBufferForGpu(enc, staging);
           enc.retainAllocation(allocation.ptr());
           enc.startBlitPass();
           auto &copy =
@@ -26614,6 +26710,7 @@ private:
                dst_level, src_slice, src_level, src_origin, dst_origin, size,
                dst_size, row_pitch = UINT(row_pitch),
                image_pitch = UINT(image_pitch)](ArgumentEncodingContext &enc) {
+                RetainDirectBufferForGpu(enc, staging);
                 auto src = enc.access(src_texture, src_level, src_slice,
                                       ResourceAccess::Read);
                 auto dst = enc.access(dst_texture, dst_level, dst_slice,
@@ -27582,6 +27679,22 @@ private:
     Stop,
   };
 
+  static const char *PendingOperationTypeName(PendingOperationType type) {
+    switch (type) {
+    case PendingOperationType::Execute:
+      return "execute";
+    case PendingOperationType::QueueWork:
+      return "queue-work";
+    case PendingOperationType::Signal:
+      return "signal";
+    case PendingOperationType::Wait:
+      return "wait";
+    case PendingOperationType::Stop:
+      return "stop";
+    }
+    return "unknown";
+  }
+
   struct PendingOperation {
     struct SubmissionCaptureStatistics {
       uint64_t generic_descriptor_span_lookups = 0;
@@ -27605,6 +27718,8 @@ private:
     Fence *fence = nullptr;
     UINT64 value = 0;
     uint64_t frame_id = ~0ull;
+    uint64_t lifecycle_pair_id = 0;
+    uint64_t queue_lifecycle_id = 0;
     bool wait_callback_armed = false;
     std::shared_ptr<std::atomic_bool> wait_completion;
     SubmissionCaptureStatistics capture_statistics = {};
@@ -27622,6 +27737,8 @@ private:
           fence(other.fence),
           value(other.value),
           frame_id(other.frame_id),
+          lifecycle_pair_id(other.lifecycle_pair_id),
+          queue_lifecycle_id(other.queue_lifecycle_id),
           wait_callback_armed(other.wait_callback_armed),
           wait_completion(std::move(other.wait_completion)),
           capture_statistics(other.capture_statistics) {
@@ -27639,6 +27756,8 @@ private:
         fence = other.fence;
         value = other.value;
         frame_id = other.frame_id;
+        lifecycle_pair_id = other.lifecycle_pair_id;
+        queue_lifecycle_id = other.queue_lifecycle_id;
         wait_callback_armed = other.wait_callback_armed;
         wait_completion = std::move(other.wait_completion);
         capture_statistics = other.capture_statistics;
@@ -27681,6 +27800,9 @@ private:
     dxmt::perf::ScopedCodeTimer code_timer(
         dxmt::PerfCodePath::QueueEnqueueControl);
     auto t0 = clock::now();
+    operation.lifecycle_pair_id = dxmt::lifecycle::nextPairSequence();
+    operation.queue_lifecycle_id =
+        lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
     {
       dxmt::perf::ScopedCodeTimer phase_timer(
           dxmt::PerfCodePath::QueueEnqueueFrameTag);
@@ -27688,6 +27810,16 @@ private:
         operation.frame_id =
             device_->GetDXMTDevice().queue().CurrentFrameSeq() - 1;
     }
+    const auto lifecycle_pair_id = operation.lifecycle_pair_id;
+    const auto queue_lifecycle_id = operation.queue_lifecycle_id;
+    const auto operation_type = operation.type;
+    const auto operation_frame = operation.frame_id;
+    const auto wait_sequence = operation.value;
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type, "enqueue.enter",
+        PendingOperationTypeName(operation_type), lifecycle_pair_id,
+        queue_lifecycle_id, operation_frame, 0, 0, wait_sequence,
+        submitted_batches_.load(std::memory_order_relaxed));
     {
       dxmt::perf::ScopedCodeTimer phase_timer(
           dxmt::PerfCodePath::QueueEnqueueLock);
@@ -27704,6 +27836,11 @@ private:
           dxmt::PerfCodePath::QueueEnqueueNotify);
       submission_wake_state_->condition.notify_one();
     }
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type, "enqueue.leave",
+        PendingOperationTypeName(operation_type), lifecycle_pair_id,
+        queue_lifecycle_id, operation_frame, 0, 0, wait_sequence,
+        submitted_batches_.load(std::memory_order_relaxed));
   }
 
   size_t PendingOperationCountForDiag() {
@@ -27739,10 +27876,22 @@ private:
         submission_worker_thread_id_.load(std::memory_order_relaxed))
       return;
 
+    const auto pair_id = dxmt::lifecycle::nextPairSequence();
+    const auto queue_pair_id =
+        lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type,
+        "caller-drain-wait.enter", "flush", pair_id, queue_pair_id, ~0ull, 0,
+        0, submitted_batches_.load(std::memory_order_relaxed), 0);
     std::unique_lock lock(mutex_);
     submission_wake_state_->condition.wait(lock, [this]() {
       return pending_operations_.empty() && !submission_worker_active_;
     });
+    lock.unlock();
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type,
+        "caller-drain-wait.leave", "flush", pair_id, queue_pair_id, ~0ull, 0,
+        0, submitted_batches_.load(std::memory_order_relaxed), 0);
   }
 
   void StopSubmissionWorker() {
@@ -27775,24 +27924,53 @@ private:
         }
         PendingOperation stop;
         stop.type = PendingOperationType::Stop;
+        stop.lifecycle_pair_id = dxmt::lifecycle::nextPairSequence();
+        stop.queue_lifecycle_id =
+            lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
         pending_operations_.push_back(std::move(stop));
         submission_worker_stopping_ = true;
         submission_worker_waiting_for_wait_ = false;
+        submission_worker_dependency_pair_.store(
+            0, std::memory_order_relaxed);
+        submission_worker_dependency_value_.store(
+            0, std::memory_order_relaxed);
       }
     }
     for (auto &operation : cancelled) {
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type,
+          "operation-cancel.enter", PendingOperationTypeName(operation.type),
+          operation.lifecycle_pair_id, operation.queue_lifecycle_id,
+          operation.frame_id, 0, 0, operation.value, 0);
       for (auto &use : operation.allocator_uses) {
         if (use.allocator)
           use.allocator->CompleteCommandListSubmission(use.serial);
       }
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type,
+          "operation-cancel.leave", PendingOperationTypeName(operation.type),
+          operation.lifecycle_pair_id, operation.queue_lifecycle_id,
+          operation.frame_id, 0, 0, operation.value, 0);
     }
     submission_wake_state_->condition.notify_all();
     if (submission_worker_.joinable()) {
       if (dxmt::this_thread::get_id() ==
           submission_worker_thread_id_.load(std::memory_order_relaxed))
         submission_worker_.detach();
-      else
+      else {
+        const auto pair_id = dxmt::lifecycle::nextPairSequence();
+        const auto queue_pair_id =
+            lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+        D3D12SubmissionLifecycleLog(
+            reinterpret_cast<uintptr_t>(this), desc_.Type,
+            "worker-join-wait.enter", "stop", pair_id, queue_pair_id, ~0ull,
+            0, 0, 0, 0);
         submission_worker_.join();
+        D3D12SubmissionLifecycleLog(
+            reinterpret_cast<uintptr_t>(this), desc_.Type,
+            "worker-join-wait.leave", "stop", pair_id, queue_pair_id, ~0ull,
+            0, 0, 0, 0);
+      }
     }
   }
 
@@ -27802,6 +27980,17 @@ private:
                                        std::memory_order_relaxed);
 
     for (;;) {
+      const auto wait_pair_id = dxmt::lifecycle::nextPairSequence();
+      const auto wait_queue_pair_id =
+          lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type,
+          "worker-condition-wait.enter", "worker", wait_pair_id,
+          wait_queue_pair_id, ~0ull, 0, 0,
+          submission_worker_dependency_value_.load(
+              std::memory_order_relaxed),
+          submission_worker_dependency_pair_.load(
+              std::memory_order_relaxed));
       {
         std::unique_lock lock(mutex_);
         submission_wake_state_->condition.wait(lock, [this]() {
@@ -27816,8 +28005,27 @@ private:
         });
         submission_worker_active_ = true;
       }
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type,
+          "worker-condition-wait.leave", "worker", wait_pair_id,
+          wait_queue_pair_id, ~0ull, 0, 0,
+          submission_worker_dependency_value_.load(
+              std::memory_order_relaxed),
+          submission_worker_dependency_pair_.load(
+              std::memory_order_relaxed));
 
+      const auto drain_pair_id = dxmt::lifecycle::nextPairSequence();
+      const auto drain_queue_pair_id =
+          lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type, "worker-drain.enter",
+          "worker", drain_pair_id, drain_queue_pair_id, ~0ull, 0, 0,
+          submitted_batches_.load(std::memory_order_relaxed), 0);
       DrainPendingOperations();
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type, "worker-drain.leave",
+          "worker", drain_pair_id, drain_queue_pair_id, ~0ull, 0, 0,
+          submitted_batches_.load(std::memory_order_relaxed), 0);
 
       bool should_exit = false;
       {
@@ -27832,7 +28040,20 @@ private:
   }
 
   void DrainPendingOperations() {
+    const auto queue_lock_pair_id = dxmt::lifecycle::nextPairSequence();
+    const auto queue_lock_queue_pair_id =
+        lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type,
+        "device-queue-lock-wait.enter", "worker", queue_lock_pair_id,
+        queue_lock_queue_pair_id, ~0ull, 0, 0,
+        submitted_batches_.load(std::memory_order_relaxed), 0);
     std::unique_lock dxmt_queue_lock(resource_states_->dxmt_queue_mutex);
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type,
+        "device-queue-lock-wait.leave", "worker", queue_lock_pair_id,
+        queue_lock_queue_pair_id, ~0ull, 0, 0,
+        submitted_batches_.load(std::memory_order_relaxed), 0);
 
     for (;;) {
       PendingOperation operation;
@@ -27845,6 +28066,9 @@ private:
       bool resolved_gpu_wait = false;
       FenceGpuSignal gpu_wait_signal = {};
       FenceGpuWaitStatus gpu_wait_status = FenceGpuWaitStatus::Unknown;
+      uint64_t wait_lifecycle_pair_id = 0;
+      uint64_t wait_queue_lifecycle_id = 0;
+      uint64_t wait_frame_id = ~0ull;
 
       auto lock_begin = clock::now();
       {
@@ -27854,6 +28078,9 @@ private:
         }
 
         auto &front = pending_operations_.front();
+        wait_lifecycle_pair_id = front.lifecycle_pair_id;
+        wait_queue_lifecycle_id = front.queue_lifecycle_id;
+        wait_frame_id = front.frame_id;
         const bool callback_completed =
             front.wait_completion &&
             front.wait_completion->load(std::memory_order_acquire);
@@ -27864,6 +28091,10 @@ private:
               front.fence->TryResolveGpuWait(front.value, gpu_wait_signal);
           if (gpu_wait_status == FenceGpuWaitStatus::Resolved) {
             submission_worker_waiting_for_wait_ = false;
+            submission_worker_dependency_pair_.store(
+                0, std::memory_order_relaxed);
+            submission_worker_dependency_value_.store(
+                0, std::memory_order_relaxed);
             operation = std::move(front);
             pending_operations_.pop_front();
             has_operation = true;
@@ -27894,9 +28125,17 @@ private:
               arm_wait_callback = true;
             }
             submission_worker_waiting_for_wait_ = true;
+            submission_worker_dependency_pair_.store(
+                front.lifecycle_pair_id, std::memory_order_relaxed);
+            submission_worker_dependency_value_.store(
+                front.value, std::memory_order_relaxed);
           }
         } else {
           submission_worker_waiting_for_wait_ = false;
+          submission_worker_dependency_pair_.store(
+              0, std::memory_order_relaxed);
+          submission_worker_dependency_value_.store(
+              0, std::memory_order_relaxed);
           operation = std::move(front);
           pending_operations_.pop_front();
           has_operation = true;
@@ -27908,13 +28147,35 @@ private:
       if (arm_wait_callback) {
         const auto arm_begin = clock::now();
         auto wake_state = submission_wake_state_;
+        const auto queue_identity = reinterpret_cast<uintptr_t>(this);
+        const auto queue_type = desc_.Type;
+        D3D12SubmissionLifecycleLog(
+            queue_identity, queue_type, "fence-callback-arm.enter", "wait",
+            wait_lifecycle_pair_id, wait_queue_lifecycle_id, wait_frame_id, 0,
+            0, wait_value,
+            submitted_batches_.load(std::memory_order_relaxed));
         auto callback = [wake_state = std::move(wake_state),
-                         wait_completion = std::move(wait_completion)]() {
+                         wait_completion = std::move(wait_completion),
+                         queue_identity, queue_type, wait_lifecycle_pair_id,
+                         wait_queue_lifecycle_id, wait_frame_id,
+                         wait_value]() {
+          D3D12SubmissionLifecycleLog(
+              queue_identity, queue_type, "fence-callback.enter", "wait",
+              wait_lifecycle_pair_id, wait_queue_lifecycle_id, wait_frame_id,
+              0, 0, wait_value, 0);
           wait_completion->store(true, std::memory_order_release);
           wake_state->condition.notify_one();
+          D3D12SubmissionLifecycleLog(
+              queue_identity, queue_type, "fence-callback.leave", "wait",
+              wait_lifecycle_pair_id, wait_queue_lifecycle_id, wait_frame_id,
+              0, 0, wait_value, 1);
         };
         wait_fence->AddCompletionCallback(wait_value, std::move(callback));
         wait_fence->ReleasePrivate();
+        D3D12SubmissionLifecycleLog(
+            queue_identity, queue_type, "fence-callback-arm.leave", "wait",
+            wait_lifecycle_pair_id, wait_queue_lifecycle_id, wait_frame_id, 0,
+            0, wait_value, 0);
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::WaitArm,
             clock::now() - arm_begin);
@@ -27923,6 +28184,18 @@ private:
 
       if (!has_operation)
         return;
+
+      const auto operation_name = PendingOperationTypeName(operation.type);
+      const auto operation_chunk =
+          device_->GetDXMTDevice().queue().CurrentSeqId();
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type, "operation.enter",
+          operation_name, operation.lifecycle_pair_id,
+          operation.queue_lifecycle_id, operation.frame_id, operation_chunk,
+          0, operation.value,
+          resolved_gpu_wait ? gpu_wait_signal.dxmt_chunk
+                            : submitted_batches_.load(
+                                  std::memory_order_relaxed));
 
       if (resolved_gpu_wait) {
         has_waited_.store(true, std::memory_order_relaxed);
@@ -27952,12 +28225,22 @@ private:
                " waitChunkEvent=", wait_chunk_event_id,
                " waitFrame=", wait_frame);
         }
+        D3D12SubmissionLifecycleLog(
+            reinterpret_cast<uintptr_t>(this), desc_.Type, "operation.leave",
+            operation_name, operation.lifecycle_pair_id,
+            operation.queue_lifecycle_id, operation.frame_id, wait_chunk_id,
+            0, operation.value, gpu_wait_signal.dxmt_chunk);
         continue;
       }
 
       switch (operation.type) {
       case PendingOperationType::Stop:
         FlushReplayPerfFrame();
+        D3D12SubmissionLifecycleLog(
+            reinterpret_cast<uintptr_t>(this), desc_.Type, "operation.leave",
+            operation_name, operation.lifecycle_pair_id,
+            operation.queue_lifecycle_id, operation.frame_id,
+            operation_chunk, 0, operation.value, 0);
         return;
       case PendingOperationType::Execute: {
         operation_perf_stats = BeginReplayPerfFrame(operation.frame_id);
@@ -28106,13 +28389,39 @@ private:
         }
         auto allocator_uses = std::make_shared<std::vector<SubmittedCommandAllocatorUse>>(
             std::move(operation.allocator_uses));
-        auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
-        chunk->addCompletionCallback([allocator_uses = std::move(allocator_uses)]() {
+        auto &dxmt_queue = device_->GetDXMTDevice().queue();
+        auto *chunk = dxmt_queue.CurrentChunk();
+        const auto completion_chunk = dxmt_queue.CurrentSeqId();
+        const auto queue_identity = reinterpret_cast<uintptr_t>(this);
+        const auto queue_type = desc_.Type;
+        const auto completion_pair_id = operation.lifecycle_pair_id;
+        const auto completion_queue_pair_id = operation.queue_lifecycle_id;
+        const auto completion_frame = operation.frame_id;
+        D3D12SubmissionLifecycleLog(
+            queue_identity, queue_type, "completion-link.enter", "execute",
+            completion_pair_id, completion_queue_pair_id, completion_frame,
+            completion_chunk, 0, completion_chunk, 0);
+        chunk->addCompletionCallback(
+            [allocator_uses = std::move(allocator_uses), queue_identity,
+             queue_type, completion_pair_id, completion_queue_pair_id,
+             completion_frame, completion_chunk]() {
+          D3D12SubmissionLifecycleLog(
+              queue_identity, queue_type, "completion-callback.enter",
+              "execute", completion_pair_id, completion_queue_pair_id,
+              completion_frame, completion_chunk, 0, completion_chunk, 0);
           for (auto &use : *allocator_uses) {
             if (use.allocator)
               use.allocator->CompleteCommandListSubmission(use.serial);
           }
+          D3D12SubmissionLifecycleLog(
+              queue_identity, queue_type, "completion-callback.leave",
+              "execute", completion_pair_id, completion_queue_pair_id,
+              completion_frame, completion_chunk, 0, completion_chunk, 1);
         });
+        D3D12SubmissionLifecycleLog(
+            queue_identity, queue_type, "completion-link.leave", "execute",
+            completion_pair_id, completion_queue_pair_id, completion_frame,
+            completion_chunk, 0, completion_chunk, 0);
 
         std::vector<PendingOperation> coalesced_signals;
         {
@@ -28130,7 +28439,8 @@ private:
         const auto signal_begin = clock::now();
         for (auto &signal : coalesced_signals) {
           EncodeFenceSignal(signal.fence, signal.value, "coalesced",
-                            operation.frame_id);
+                            operation.frame_id, signal.lifecycle_pair_id,
+                            signal.queue_lifecycle_id);
         }
         RecordExecuteDrainTime(
             operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Signal,
@@ -28197,7 +28507,8 @@ private:
           const auto signal_begin = clock::now();
           for (auto &signal : coalesced_signals)
             EncodeFenceSignal(signal.fence, signal.value, "coalesced",
-                              operation.frame_id);
+                              operation.frame_id, signal.lifecycle_pair_id,
+                              signal.queue_lifecycle_id);
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Signal,
               clock::now() - signal_begin);
@@ -28263,6 +28574,13 @@ private:
         }
         break;
       }
+      D3D12SubmissionLifecycleLog(
+          reinterpret_cast<uintptr_t>(this), desc_.Type, "operation.leave",
+          operation_name, operation.lifecycle_pair_id,
+          operation.queue_lifecycle_id, operation.frame_id,
+          device_->GetDXMTDevice().queue().CurrentSeqId(), 0,
+          operation.value,
+          submitted_batches_.load(std::memory_order_relaxed));
     }
   }
 
@@ -28297,7 +28615,8 @@ private:
         continue;
 
       EncodeFenceSignal(signal.fence, signal.value,
-          signals.size() > 1 ? "batched" : "encoded", signal.frame_id);
+          signals.size() > 1 ? "batched" : "encoded", signal.frame_id,
+          signal.lifecycle_pair_id, signal.queue_lifecycle_id);
     }
     auto &queue = device_->GetDXMTDevice().queue();
     queue.CommitCurrentChunkForFrame(
@@ -28307,7 +28626,8 @@ private:
   }
 
   void EncodeFenceSignal(Fence *state, UINT64 value, const char *mode,
-                         uint64_t frame_id) {
+                         uint64_t frame_id, uint64_t lifecycle_pair_id,
+                         uint64_t queue_lifecycle_id) {
     auto event = state->GetSharedEvent();
     auto &queue = device_->GetDXMTDevice().queue();
     auto chunk = queue.CurrentChunk();
@@ -28315,6 +28635,10 @@ private:
     const auto chunk_slot = chunk_id % kCommandChunkCount;
     const auto chunk_event_id = queue.GetCurrentEventSeqId() + 1;
     const auto chunk_frame = frame_id;
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type,
+        "signal-completion-link.enter", "signal", lifecycle_pair_id,
+        queue_lifecycle_id, chunk_frame, chunk_id, 0, value, chunk_event_id);
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12DiagShouldLog(log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: SubmitFenceSignal ", mode,
@@ -28355,7 +28679,12 @@ private:
     state->AddRefPrivate();
     chunk->addCompletionCallback([state, value, queue_ptr = reinterpret_cast<uintptr_t>(this),
                                   queue_type = desc_.Type, chunk_id, chunk_event_id,
-                                  chunk_frame]() {
+                                  chunk_frame, lifecycle_pair_id,
+                                  queue_lifecycle_id]() {
+      D3D12SubmissionLifecycleLog(
+          queue_ptr, queue_type, "signal-completion-callback.enter", "signal",
+          lifecycle_pair_id, queue_lifecycle_id, chunk_frame, chunk_id, 0,
+          value, chunk_event_id);
       static std::atomic<uint32_t> complete_log_count = 0;
       if (D3D12DiagShouldLog(complete_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
         WARN_FILE_ONLY("D3D12 queue diagnostic: FenceSignalCompleteChunk"
@@ -28369,7 +28698,15 @@ private:
       }
       state->SetCompletedValue(value);
       state->ReleasePrivate();
+      D3D12SubmissionLifecycleLog(
+          queue_ptr, queue_type, "signal-completion-callback.leave", "signal",
+          lifecycle_pair_id, queue_lifecycle_id, chunk_frame, chunk_id, 0,
+          value, chunk_event_id);
     });
+    D3D12SubmissionLifecycleLog(
+        reinterpret_cast<uintptr_t>(this), desc_.Type,
+        "signal-completion-link.leave", "signal", lifecycle_pair_id,
+        queue_lifecycle_id, chunk_frame, chunk_id, 0, value, chunk_event_id);
     signal_count_.fetch_add(1, std::memory_order_relaxed);
     last_signal_value_.store(value, std::memory_order_relaxed);
   }
@@ -28380,6 +28717,7 @@ private:
   std::atomic<UINT64> submitted_batches_{0};
   std::atomic<UINT64> signal_count_{0};
   std::atomic<UINT64> last_signal_value_{0};
+  std::atomic<uint64_t> lifecycle_sequence_{1};
   std::atomic<bool> has_waited_{false};
   uint64_t current_timestamp_sample_sequence_ = ~0ull;
   uint64_t current_timestamp_sample_count_ = 0;
@@ -28409,6 +28747,8 @@ private:
   bool submission_worker_active_ = false;
   bool submission_worker_waiting_for_wait_ = false;
   bool submission_worker_stopping_ = false;
+  std::atomic<uint64_t> submission_worker_dependency_pair_{0};
+  std::atomic<uint64_t> submission_worker_dependency_value_{0};
   std::atomic<uint32_t> submission_worker_thread_id_{0};
   std::shared_ptr<SubmissionWakeState> submission_wake_state_;
   dxmt::thread submission_worker_;

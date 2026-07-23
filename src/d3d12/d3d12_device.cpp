@@ -3032,11 +3032,15 @@ public:
         *data_size = required;
         return DXGI_ERROR_MORE_DATA;
       }
-      const auto [entry_count, total_ref_count] =
+      const auto [entry_count, total_ref_count, pending_removal_count,
+                  cached_allocation_count, commit_count] =
           device_->queue().PersistentResidencyStatsForTesting();
       PersistentResidencyStats stats = {};
       stats.entry_count = entry_count;
       stats.total_ref_count = total_ref_count;
+      stats.pending_removal_count = pending_removal_count;
+      stats.cached_allocation_count = cached_allocation_count;
+      stats.commit_count = commit_count;
       std::memcpy(data, &stats, required);
       *data_size = required;
       return S_OK;

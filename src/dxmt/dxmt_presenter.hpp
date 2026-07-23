@@ -10,6 +10,8 @@
 
 namespace dxmt {
 
+class CommandQueue;
+
 struct DXMTPresentMetadata {
   float edr_scale;
   float max_content_luminance;
@@ -21,8 +23,10 @@ struct DXMTPresentMetadata {
 class Presenter : public RcObject {
 public:
   Presenter(
-      WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count
+      CommandQueue &queue, WMT::Device device, WMT::MetalLayer layer,
+      InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count
   );
+  ~Presenter();
 
   bool changeLayerProperties(
       WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
@@ -74,6 +78,7 @@ public:
 private:
   void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
 
+  CommandQueue &queue_;
   WMT::Device device_;
   WMT::MetalLayer layer_;
   InternalCommandLibrary &lib_;

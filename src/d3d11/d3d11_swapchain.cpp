@@ -183,7 +183,8 @@ public:
       scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
     }
 
-    presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
+    presenter = Rc(new Presenter(pDevice->GetDXMTDevice().queue(),
+                                 pDevice->GetMTLDevice(), layer_weak_,
                                  pDevice->GetDXMTDevice().queue().cmd_library,
                                  scale_factor, desc_.SampleDesc.Count));
 

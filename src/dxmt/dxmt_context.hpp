@@ -33,7 +33,8 @@ constexpr size_t kEncodingContextCPUHeapLifetime = 600;
 
 constexpr auto kIntrapassControlBitIgnoreUAVWaW = 1ull << 1;
 
-constexpr uint32_t kCommandBufferFenceEdgeCapacity = 8;
+constexpr uint32_t kCommandBufferFenceEdgeCapacity = 64;
+constexpr uint32_t kCommandBufferEncoderDiagnosticCapacity = 32;
 
 enum CommandBufferFenceEdgeFlag : uint32_t {
   CommandBufferFenceEdgePreRaster = 1u << 0,
@@ -51,6 +52,31 @@ struct CommandBufferFenceEdgeDiagnostic {
   uint32_t consumer_index = 0;
   uint32_t slot = 0;
   uint32_t flags = 0;
+};
+
+enum CommandBufferEncoderDiagnosticFlag : uint32_t {
+  CommandBufferEncoderRequiresCrossSubmitWait = 1u << 0,
+  CommandBufferEncoderHasVertexStageFence = 1u << 1,
+};
+
+struct CommandBufferEncoderDiagnostic {
+  uint64_t encoder_id = 0;
+  uint64_t vertex_encoder_id = 0;
+  uint64_t wait_hash = 0;
+  uint64_t update_hash = 0;
+  uint64_t pipeline_handle = 0;
+  uint64_t argument_buffer_handle = 0;
+  uint64_t argument_buffer_offset = 0;
+  uint64_t argument_buffer_size = 0;
+  uint64_t primary_resource = 0;
+  uint64_t secondary_resource = 0;
+  uint64_t resource_plan_hash = 0;
+  uint32_t encoder_index = 0;
+  uint32_t type = 0;
+  uint32_t wait_count = 0;
+  uint32_t update_count = 0;
+  uint32_t flags = 0;
+  uint32_t resource_plan_count = 0;
 };
 
 struct CommandBufferDiagnosticInfo {
@@ -89,6 +115,8 @@ struct CommandBufferDiagnosticInfo {
   uint32_t skipped_external_fence_wait_count = 0;
   uint32_t fence_edge_count = 0;
   uint32_t fence_edge_overflow_count = 0;
+  uint32_t encoder_diagnostic_count = 0;
+  uint32_t encoder_diagnostic_overflow_count = 0;
   uint32_t sparse_mapping_call_count = 0;
   uint32_t sparse_mapping_operation_count = 0;
   uint32_t sparse_mapping_map_count = 0;
@@ -113,6 +141,9 @@ struct CommandBufferDiagnosticInfo {
   std::array<CommandBufferFenceEdgeDiagnostic,
              kCommandBufferFenceEdgeCapacity>
       fence_edges = {};
+  std::array<CommandBufferEncoderDiagnostic,
+             kCommandBufferEncoderDiagnosticCapacity>
+      encoders = {};
 };
 
 struct FencePoolPreparationResult {
@@ -1304,6 +1335,8 @@ public:
   ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib);
   ~ArgumentEncodingContext();
 
+  void RetirePersistentResidency(uint64_t completed_sequence);
+
   uint32_t tess_num_output_control_point_element;
   uint32_t tess_threads_per_patch;
 
@@ -1421,6 +1454,7 @@ private:
 
   WMT::Device device_;
   CommandQueue& queue_;
+  bool persistent_residency_retired_ = false;
 };
 
 template <>

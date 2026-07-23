@@ -167,6 +167,9 @@ struct PersistentResidencyStats {
   std::uint32_t struct_size = sizeof(PersistentResidencyStats);
   std::uint32_t entry_count = 0;
   std::uint64_t total_ref_count = 0;
+  std::uint32_t pending_removal_count = 0;
+  std::uint32_t cached_allocation_count = 0;
+  std::uint64_t commit_count = 0;
 };
 
 // Read-only identity of the immutable native artifact backing a public PSO.

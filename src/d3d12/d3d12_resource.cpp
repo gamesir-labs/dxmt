@@ -1748,6 +1748,13 @@ private:
           [buffer = std::move(buffer), texture = std::move(texture),
            row_pitch = layout.row_pitch, bytes_per_image, dst_slice, dst_level,
            dst_plane, origin, size](ArgumentEncodingContext &enc) mutable {
+            auto allocation = buffer->current();
+            if (allocation && allocation->buffer()) {
+              const auto sequence = enc.currentSeqId();
+              enc.queue().AddPersistentResidency(allocation->buffer());
+              enc.queue().RemovePersistentResidencyAfterCompletion(
+                  allocation->buffer(), sequence);
+            }
             enc.blit_depth_stencil_cmd.copyPlaneFromBuffer(
                 buffer, 0, buffer->length(), row_pitch, bytes_per_image,
                 texture, dst_level, dst_slice, dst_plane == 1, origin, size);
@@ -1774,6 +1781,10 @@ private:
         [buffer, texture, box, row_pitch = layout.row_pitch,
          bytes_per_image, dst_slice, dst_level, origin_z, depth_count](
             ArgumentEncodingContext &enc) {
+          const auto sequence = enc.currentSeqId();
+          enc.queue().AddPersistentResidency(buffer);
+          enc.queue().RemovePersistentResidencyAfterCompletion(buffer,
+                                                               sequence);
           enc.startBlitPass();
           auto dst = enc.access(texture, dst_level, dst_slice,
                                 ResourceAccess::Write);
@@ -1849,6 +1860,13 @@ private:
           [buffer, texture, view, row_pitch = layout.row_pitch,
            bytes_per_image, src_plane, origin, size](
               ArgumentEncodingContext &enc) mutable {
+            auto allocation = buffer->current();
+            if (allocation && allocation->buffer()) {
+              const auto sequence = enc.currentSeqId();
+              enc.queue().AddPersistentResidency(allocation->buffer());
+              enc.queue().RemovePersistentResidencyAfterCompletion(
+                  allocation->buffer(), sequence);
+            }
             enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
                 texture, view, buffer, 0, buffer->length(), row_pitch,
                 bytes_per_image, src_plane == 1, origin, size);
@@ -1873,6 +1891,10 @@ private:
         [buffer, texture, box, row_pitch = layout.row_pitch, bytes_per_image,
          src_slice, src_level, origin_z, depth_count](
             ArgumentEncodingContext &enc) {
+          const auto sequence = enc.currentSeqId();
+          enc.queue().AddPersistentResidency(buffer);
+          enc.queue().RemovePersistentResidencyAfterCompletion(buffer,
+                                                               sequence);
           enc.startBlitPass();
           auto src = enc.access(texture, src_level, src_slice,
                                 ResourceAccess::Read);
@@ -2146,6 +2168,8 @@ private:
         " allocation=", uint64_t(allocation),
         " metalTexture=", uint64_t(texture.handle),
         " gpuResourceId=", allocation ? allocation->gpuResourceID : 0,
+        " persistentResidencyCount=",
+        lifetime_residency_allocations_.size(),
         " mappingGeneration=", GetTileMappingGeneration(),
         " totalTiles=", tiling_.total_tile_count,
         " width=", desc_.Width,
@@ -2172,6 +2196,8 @@ private:
     }
     if (success && !ReplayReservedTextureMappings())
       success = false;
+    if (success)
+      RegisterLifetimeResidency();
 
     LogReservedTextureFaultDiagnostic(
         success ? "materialize-ready" : "materialize-failed", reason);

@@ -57,6 +57,7 @@ static void DebugLogConstantBufferBinding(
 );
 
 static bool DebugShouldLogBinding(const std::string &shader_hash);
+static bool DebugEnabledEnv(const char *name);
 
 static bool
 BindlessMirrorVerifyEnabled() {
@@ -199,6 +200,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
                                 WMTResourceHazardTrackingModeUntracked;
   std::memset(dummy_cbuffer_info_.memory.get(), 0, 65536);
   dummy_cbuffer_ = device.newBuffer(dummy_cbuffer_info_);
+  queue_.AddPersistentResidency(dummy_cbuffer_);
   cpu_buffer_chunks_.emplace_back();
   barrier_event_ = device_.newEvent();
 };
@@ -206,6 +208,21 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
 ArgumentEncodingContext::~ArgumentEncodingContext() {
   wsi::aligned_free(dummy_cbuffer_host_);
 };
+
+void
+ArgumentEncodingContext::RetirePersistentResidency(
+    uint64_t completed_sequence) {
+  if (persistent_residency_retired_)
+    return;
+  persistent_residency_retired_ = true;
+  queue_.RemovePersistentResidencyAfterCompletion(dummy_cbuffer_,
+                                                   completed_sequence);
+  for (auto &binding : dummy_srv_textures_) {
+    if (binding.texture)
+      queue_.RemovePersistentResidencyAfterCompletion(binding.texture,
+                                                       completed_sequence);
+  }
+}
 
 WMT::Fence
 ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
@@ -244,12 +261,15 @@ ArgumentEncodingContext::prepareFencePool(
   };
   std::vector<FenceInterval> intervals;
   std::unordered_map<EncoderId, size_t> interval_by_id;
+  std::unordered_map<EncoderId, std::vector<uint32_t>>
+      producer_indices_by_id;
   std::unordered_set<EncoderId> consumed_updates;
   FenceDependencyOrderTracker dependency_order;
   FencePoolPreparationResult result = {};
 
   auto add_updates = [&](const FenceSet &updates, uint32_t index) {
     updates.forEach([&](EncoderId id) {
+      producer_indices_by_id[id].push_back(index);
       if (interval_by_id.contains(id))
         return;
       interval_by_id.emplace(id, intervals.size());
@@ -330,6 +350,105 @@ ArgumentEncodingContext::prepareFencePool(
     const auto slot =
         fence_bindings_.bind(interval.id, interval.first, interval.last);
     used_slot_count = std::max(used_slot_count, slot + 1);
+  }
+
+  if (diagnostic_info &&
+      DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE")) {
+    auto record_edge = [&](EncoderId dependency_id, EncoderId consumer_id,
+                           uint32_t consumer_index, uint32_t flags,
+                           bool want_local) {
+      const auto producers = producer_indices_by_id.find(dependency_id);
+      const bool local = producers != producer_indices_by_id.end();
+      if (local != want_local)
+        return;
+      uint32_t producer_index = UINT32_MAX;
+      if (local) {
+        const auto &indices = producers->second;
+        const auto next =
+            std::lower_bound(indices.begin(), indices.end(), consumer_index);
+        producer_index =
+            next != indices.begin() ? *std::prev(next) : indices.front();
+      }
+      if (producer_index < encoder_count &&
+          encoders[producer_index]->type == EncoderType::Render &&
+          consumer_index < encoder_count &&
+          encoders[consumer_index]->type == EncoderType::Render) {
+        const auto *producer_render =
+            static_cast<const RenderEncoderData *>(
+                encoders[producer_index]);
+        const bool producer_vertex =
+            producer_render->fence_update_vertex.test(dependency_id);
+        const bool producer_fragment =
+            producer_render->fence_update.test(dependency_id);
+        const bool consumer_vertex =
+            flags & CommandBufferFenceEdgePreRaster;
+        const bool consumer_fragment =
+            flags & CommandBufferFenceEdgeFragment;
+        diagnostic_info->render_valid_cross_stage_count +=
+            producer_vertex && consumer_fragment;
+        diagnostic_info->render_same_stage_wait_count +=
+            (producer_vertex && consumer_vertex) ||
+            (producer_fragment && consumer_fragment);
+        diagnostic_info->render_reverse_stage_wait_count +=
+            producer_fragment && consumer_vertex;
+      }
+      const auto edge_index = diagnostic_info->fence_edge_count++;
+      if (edge_index >= kCommandBufferFenceEdgeCapacity) {
+        diagnostic_info->fence_edge_count =
+            kCommandBufferFenceEdgeCapacity;
+        diagnostic_info->fence_edge_overflow_count++;
+        return;
+      }
+      auto &edge = diagnostic_info->fence_edges[edge_index];
+      edge.producer_id = dependency_id;
+      edge.consumer_id = consumer_id;
+      edge.producer_index = producer_index;
+      edge.consumer_index = consumer_index;
+      edge.slot = fence_bindings_.find(dependency_id).value_or(UINT32_MAX);
+      edge.flags = flags;
+    };
+    auto record_edges = [&](bool want_local) {
+      for (unsigned i = 0; i < encoder_count; i++) {
+        const auto *encoder = encoders[i];
+        if (encoder->type == EncoderType::Null)
+          continue;
+        if (encoder->type == EncoderType::Render) {
+          const auto *render =
+              static_cast<const RenderEncoderData *>(encoder);
+          render->fence_wait.forEach(
+              render->fence_wait_vertex,
+              [&](EncoderId id) {
+                record_edge(id, render->encoder_id_vertex, i,
+                            CommandBufferFenceEdgePreRaster, want_local);
+              },
+              [&](EncoderId id) {
+                record_edge(id, encoder->id, i,
+                            CommandBufferFenceEdgeFragment, want_local);
+              });
+        } else {
+          uint32_t flags = CommandBufferFenceEdgeOther;
+          if (encoder->type == EncoderType::Compute)
+            flags = CommandBufferFenceEdgeCompute;
+          else if (encoder->type == EncoderType::Blit)
+            flags = CommandBufferFenceEdgeBlit;
+          encoder->fence_wait.forEach([&](EncoderId id) {
+            record_edge(id, encoder->id, i, flags, want_local);
+          });
+        }
+      }
+      if (has_pending_fence_only_blit_) {
+        pending_fence_only_blit_wait_.forEach([&](EncoderId id) {
+          record_edge(id, 0, encoder_count,
+                      CommandBufferFenceEdgeBlit |
+                          CommandBufferFenceEdgePending,
+                      want_local);
+        });
+      }
+    };
+    // Preserve the command-buffer-local dependency graph even when hundreds
+    // of cross-submit waits would otherwise fill the fixed diagnostic array.
+    record_edges(true);
+    record_edges(false);
   }
 
   auto retain_bound = [&](FenceSet &fences) {
@@ -1995,7 +2114,8 @@ DebugSupportsTextureReadback(WMT::Texture texture) {
 
 static void
 DebugEncodeTexturePointReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
-                                WMT::Device device, WMT::Texture texture,
+                                WMT::Device device, CommandQueue &queue,
+                                WMT::Texture texture,
                                 const char *label, uint64_t frame_id,
                                 uint64_t seq_id, uint64_t encoder_id,
                                 uint32_t index, uint32_t point_x,
@@ -2057,6 +2177,8 @@ DebugEncodeTexturePointReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cm
 #endif
     return;
   }
+  queue.AddPersistentResidency(buffer);
+  queue.RemovePersistentResidencyAfterCompletion(buffer, seq_id);
 
   const auto x = std::min(point_x, width - 1);
   const auto y = std::min(point_y, height - 1);
@@ -2111,23 +2233,25 @@ DebugEncodeTexturePointReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cm
 
 static void
 DebugEncodeTextureCenterReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
-                                 WMT::Device device, WMT::Texture texture,
+                                 WMT::Device device, CommandQueue &queue,
+                                 WMT::Texture texture,
                                  const char *label, uint64_t frame_id,
                                  uint64_t seq_id, uint32_t present_index) {
   const auto width = texture ? texture.width() : 0;
   const auto height = texture ? texture.height() : 0;
-  DebugEncodeTexturePointReadback(readbacks, cmdbuf, device, texture, label, frame_id,
+  DebugEncodeTexturePointReadback(readbacks, cmdbuf, device, queue, texture, label, frame_id,
                                   seq_id, present_index, present_index,
                                   width / 2, height / 2, 0, 0, width, height);
 }
 
 static void
 DebugEncodePresentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
-                            WMT::Device device, WMT::Texture texture,
+                            WMT::Device device, CommandQueue &queue,
+                            WMT::Texture texture,
                             const char *label, uint64_t frame_id,
                             uint64_t seq_id, uint32_t present_index) {
   if (!DebugPresentReadbackGridEnabled()) {
-    DebugEncodeTextureCenterReadback(readbacks, cmdbuf, device, texture, label,
+    DebugEncodeTextureCenterReadback(readbacks, cmdbuf, device, queue, texture, label,
                                      frame_id, seq_id, present_index);
     return;
   }
@@ -2141,7 +2265,7 @@ DebugEncodePresentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf
       const auto point_x = width ? ((uint64_t(x) * width) + (width / 2)) / grid_size : 0;
       const auto point_y = height ? ((uint64_t(y) * height) + (height / 2)) / grid_size : 0;
     DebugEncodeTexturePointReadback(
-        readbacks, cmdbuf, device, texture, label, frame_id, seq_id,
+        readbacks, cmdbuf, device, queue, texture, label, frame_id, seq_id,
           present_index, index, point_x, point_y, 0, 0, width, height);
     }
   }
@@ -2149,7 +2273,8 @@ DebugEncodePresentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf
 
 static void
 DebugEncodeRenderAttachmentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
-                                     WMT::Device device, uint64_t frame_id,
+                                     WMT::Device device, CommandQueue &queue,
+                                     uint64_t frame_id,
                                      uint64_t seq_id, const RenderEncoderData *data,
                                      bool sample, const char *label) {
   if (!sample)
@@ -2185,7 +2310,7 @@ DebugEncodeRenderAttachmentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuff
       height = texture ? texture.height() : 0;
     }
 
-    DebugEncodeTexturePointReadback(readbacks, cmdbuf, device, texture,
+    DebugEncodeTexturePointReadback(readbacks, cmdbuf, device, queue, texture,
                                     label, frame_id, seq_id,
                                     data->id, i, width / 2, height / 2, level,
                                     slice, width, height);
@@ -3339,6 +3464,7 @@ ArgumentEncodingContext::dummySRVTexture(const MTL_SM50_SHADER_ARGUMENT &arg) {
     );
     return binding;
   }
+  queue_.AddPersistentResidency(binding.texture);
 
   if (format != DummyTextureFormat::Depth && info.sample_count == 1) {
     std::array<uint32_t, 4> zero = {};
@@ -4371,6 +4497,144 @@ ArgumentEncodingContext::flushCommands(
     perf.collect += clock::now() - t0;
   }
 
+  if (diagnostic_info &&
+      DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE")) {
+    constexpr uint64_t kFenceHashOffset = 1469598103934665603ull;
+    constexpr uint64_t kFenceHashPrime = 1099511628211ull;
+    auto hash_fence = [&](EncoderId id, uint64_t domain, uint64_t &hash,
+                          uint32_t &count) {
+      hash ^= domain;
+      hash *= kFenceHashPrime;
+      hash ^= id;
+      hash *= kFenceHashPrime;
+      count++;
+    };
+    auto hash_fences = [&](const FenceSet &fences, uint64_t domain,
+                           uint64_t &hash, uint32_t &count) {
+      fences.forEach([&](EncoderId id) {
+        hash_fence(id, domain, hash, count);
+      });
+    };
+    for (unsigned i = 0; i < encoder_count; i++) {
+      const auto *encoder = encoders[i];
+      if (encoder->type == EncoderType::Null)
+        continue;
+      const auto diagnostic_index =
+          diagnostic_info->encoder_diagnostic_count++;
+      if (diagnostic_index >= kCommandBufferEncoderDiagnosticCapacity) {
+        diagnostic_info->encoder_diagnostic_count =
+            kCommandBufferEncoderDiagnosticCapacity;
+        diagnostic_info->encoder_diagnostic_overflow_count++;
+        continue;
+      }
+      auto &entry = diagnostic_info->encoders[diagnostic_index];
+      entry.encoder_id = encoder->id;
+      entry.encoder_index = i;
+      entry.type = static_cast<uint32_t>(encoder->type);
+      entry.wait_hash = kFenceHashOffset;
+      entry.update_hash = kFenceHashOffset;
+      entry.resource_plan_hash = kFenceHashOffset;
+      if (encoder->requires_cross_submit_wait)
+        entry.flags |= CommandBufferEncoderRequiresCrossSubmitWait;
+      hash_fences(encoder->fence_wait, 1, entry.wait_hash, entry.wait_count);
+      hash_fences(encoder->fence_update, 2, entry.update_hash,
+                  entry.update_count);
+      if (encoder->type == EncoderType::Render) {
+        const auto *render = static_cast<const RenderEncoderData *>(encoder);
+        entry.vertex_encoder_id = render->encoder_id_vertex;
+        entry.pipeline_handle = render->last_pso.handle;
+        entry.argument_buffer_handle = render->allocated_argbuf.handle;
+        entry.argument_buffer_offset = render->allocated_argbuf_offset;
+        entry.argument_buffer_size = render->allocated_argbuf_size;
+        auto hash_attachment = [&](uint64_t texture, uint64_t view) {
+          entry.primary_resource ^= texture + 0x9e3779b97f4a7c15ull +
+                                    (entry.primary_resource << 6) +
+                                    (entry.primary_resource >> 2);
+          entry.primary_resource ^= view + 0x9e3779b97f4a7c15ull +
+                                    (entry.primary_resource << 6) +
+                                    (entry.primary_resource >> 2);
+        };
+        for (const auto &color : render->colors) {
+          hash_attachment(color.attachment.texture().handle,
+                          color.attachment
+                              ? static_cast<uint64_t>(color.attachment->key)
+                              : color.buffer_view_id);
+        }
+        hash_attachment(
+            render->depth.attachment.texture().handle,
+            render->depth.attachment
+                ? static_cast<uint64_t>(render->depth.attachment->key)
+                : 0);
+        hash_attachment(
+            render->stencil.attachment.texture().handle,
+            render->stencil.attachment
+                ? static_cast<uint64_t>(render->stencil.attachment->key)
+                : 0);
+        entry.resource_plan_count =
+            static_cast<uint32_t>(render->resource_plan_accesses.size());
+        for (const auto &[key, access] : render->resource_plan_accesses) {
+          entry.resource_plan_hash ^=
+              EncoderResourcePlanKeyHash{}(key) ^
+              (static_cast<uint64_t>(access) * kFenceHashPrime);
+        }
+        if (!render->fence_wait_vertex.empty() ||
+            !render->fence_update_vertex.empty())
+          entry.flags |= CommandBufferEncoderHasVertexStageFence;
+        entry.wait_hash = kFenceHashOffset;
+        entry.wait_count = 0;
+        render->fence_wait.forEach(
+            render->fence_wait_vertex,
+            [&](EncoderId id) {
+              hash_fence(id, 3, entry.wait_hash, entry.wait_count);
+            },
+            [&](EncoderId id) {
+              hash_fence(id, 4, entry.wait_hash, entry.wait_count);
+            });
+        entry.update_hash = kFenceHashOffset;
+        entry.update_count = 0;
+        render->fence_update.forEach(
+            render->fence_update_vertex,
+            [&](EncoderId id) {
+              hash_fence(id, 5, entry.update_hash, entry.update_count);
+            },
+            [&](EncoderId id) {
+              hash_fence(id, 6, entry.update_hash, entry.update_count);
+            });
+      } else if (encoder->type == EncoderType::Compute) {
+        const auto *compute =
+            static_cast<const ComputeEncoderData *>(encoder);
+        entry.argument_buffer_handle = compute->allocated_argbuf.handle;
+        entry.argument_buffer_offset = compute->allocated_argbuf_offset;
+        entry.argument_buffer_size = compute->allocated_argbuf_size;
+        entry.resource_plan_count =
+            static_cast<uint32_t>(compute->resource_plan_accesses.size());
+        for (const auto &[key, access] : compute->resource_plan_accesses) {
+          entry.resource_plan_hash ^=
+              EncoderResourcePlanKeyHash{}(key) ^
+              (static_cast<uint64_t>(access) * kFenceHashPrime);
+        }
+      } else if (encoder->type == EncoderType::Clear) {
+        const auto *clear = static_cast<const ClearEncoderData *>(encoder);
+        entry.primary_resource = clear->attachment.texture().handle;
+        entry.secondary_resource = clear->buffer_texture.handle;
+      } else if (encoder->type == EncoderType::Resolve) {
+        const auto *resolve =
+            static_cast<const ResolveEncoderData *>(encoder);
+        entry.pipeline_handle = resolve->pso.handle;
+        entry.primary_resource = resolve->src.texture().handle;
+        entry.secondary_resource = resolve->dst.texture().handle;
+      } else if (encoder->type == EncoderType::Present) {
+        entry.primary_resource =
+            static_cast<const PresentData *>(encoder)->backbuffer.handle;
+      } else if (encoder->type == EncoderType::SpatialUpscale) {
+        const auto *scaler =
+            static_cast<const SpatialUpscaleData *>(encoder);
+        entry.primary_resource = scaler->backbuffer.handle;
+        entry.secondary_resource = scaler->upscaled.handle;
+      }
+    }
+  }
+
   {
     auto &stats = currentFrameStatistics();
     for (unsigned i = 0; i < encoder_count; i++) {
@@ -4435,6 +4699,13 @@ ArgumentEncodingContext::flushCommands(
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
         device_, seqId, count, pending_queries_
     );
+    auto visibility_buffer = readbacks.visibility->visibility_result_heap;
+    queue_.AddPersistentResidency(visibility_buffer);
+    readbacks.visibility->setResidencyRetirement(
+        [queue = &queue_, visibility_buffer, seqId]() {
+          queue->RemovePersistentResidencyAfterCompletion(
+              visibility_buffer, seqId);
+        });
   }
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
     perf.queries += clock::now() - t0;
@@ -4579,7 +4850,8 @@ ArgumentEncodingContext::flushCommands(
       FlushRenderEncoderArgumentBuffer(data);
       auto gpu_buffer_ = data->allocated_argbuf;
       const bool sample_render_readback = DebugShouldSampleRenderReadback();
-      DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
+      DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, queue_,
+                                           frame_id_,
                                            seqId, data, sample_render_readback,
                                            "render-color-before-pass");
       if (queue_.apitraceEnabled()) {
@@ -4740,7 +5012,8 @@ ArgumentEncodingContext::flushCommands(
           [&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStagePreRaster); }); }
       );
       encoder.endEncoding();
-      DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
+      DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, queue_,
+                                           frame_id_,
                                            seqId, data, sample_render_readback,
                                            "render-color-after-pass");
       data->~RenderEncoderData();
@@ -4869,7 +5142,8 @@ ArgumentEncodingContext::flushCommands(
       const bool sample_present_readback = DebugShouldSamplePresentReadback(present_index);
       if (sample_present_readback) {
         DebugEncodePresentReadbacks(
-            readbacks, cmdbuf, device_, data->backbuffer, "backbuffer-before-present",
+            readbacks, cmdbuf, device_, queue_, data->backbuffer,
+            "backbuffer-before-present",
             currentFrameId(), seqId, present_index);
       }
       if (queue_.apitraceEnabled()) {
@@ -4889,7 +5163,8 @@ ArgumentEncodingContext::flushCommands(
       currentFrameStatistics().drawable_blocking_interval += present_encode_interval;
       if (sample_present_readback) {
         DebugEncodePresentReadbacks(
-            readbacks, cmdbuf, device_, drawable.texture(), "drawable-after-present",
+            readbacks, cmdbuf, device_, queue_, drawable.texture(),
+            "drawable-after-present",
             currentFrameId(), seqId, present_index);
       }
       if (DebugEnabledEnv("DXMT_DIAG_SWAPCHAIN") || DebugMillis(present_encode_interval) > 250.0) {
@@ -5308,11 +5583,19 @@ ArgumentEncodingContext::flushCommands(
     diagnostic_info->render_encoder_count = perf.encodedRender;
     diagnostic_info->compute_encoder_count = perf.encodedCompute;
     diagnostic_info->blit_encoder_count = perf.encodedBlit;
+    diagnostic_info->present_encoder_count = perf.encodedPresent;
+    diagnostic_info->clear_encoder_count = perf.encodedClear;
+    diagnostic_info->resolve_encoder_count = perf.encodedResolve;
+    diagnostic_info->scaler_encoder_count = perf.encodedScaler;
+    diagnostic_info->signal_event_count = perf.encodedSignalEvent;
+    diagnostic_info->wait_event_count = perf.encodedWaitEvent;
+    diagnostic_info->timestamp_encoder_count = perf.encodedTimestamp;
     diagnostic_info->other_encoder_count =
         encoded_encoders - perf.encodedRender - perf.encodedCompute -
         perf.encodedBlit;
     diagnostic_info->fence_wait_count = perf.fenceWaits;
     diagnostic_info->fence_update_count = perf.fenceUpdates;
+    diagnostic_info->encoded_fence_wait_count = perf.fenceWaits;
     diagnostic_info->sparse_access_count =
         sparse_access_diagnostic_.sparse_access_count;
     diagnostic_info->sparse_access_flags =

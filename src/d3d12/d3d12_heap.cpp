@@ -1,5 +1,6 @@
 #include "d3d12_heap.hpp"
 
+#include "dxmt_command_queue.hpp"
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
@@ -55,6 +56,14 @@ public:
            const void *external_address)
       : HeapImpl(device, desc) {
     external_address_ = external_address;
+  }
+
+  ~HeapImpl() {
+    auto &queue = device_->GetDXMTDevice().queue();
+    if (placement_heap_)
+      queue.RemovePersistentResidencyAfterCompletion(placement_heap_);
+    if (allocation_)
+      queue.RemovePersistentResidencyAfterCompletion(allocation_->buffer());
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -168,6 +177,9 @@ public:
         allocation_ = buffer_->allocate(GetHeapBufferAllocationFlags(desc_.Properties));
       }
       buffer_->rename(Rc<dxmt::BufferAllocation>(allocation_));
+      if (allocation_)
+        device_->GetDXMTDevice().queue().AddPersistentResidency(
+            allocation_->buffer());
     }
   }
 
@@ -192,6 +204,9 @@ public:
            " size=", desc_.SizeInBytes,
            " backendSize=", backend_size_,
            " flags=", desc_.Flags);
+    } else {
+      device_->GetDXMTDevice().queue().AddPersistentResidency(
+          placement_heap_);
     }
     return placement_heap_;
   }

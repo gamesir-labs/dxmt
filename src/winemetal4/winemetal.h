@@ -114,7 +114,8 @@ WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
     obj_handle_t cmdbuf, uint64_t *residency_submit_us);
 
-#define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 8
+#define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 64
+#define WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY 32
 
 struct WMTCommandBufferFenceEdgeDiagnostic {
   uint64_t producer_id;
@@ -123,6 +124,26 @@ struct WMTCommandBufferFenceEdgeDiagnostic {
   uint32_t consumer_index;
   uint32_t slot;
   uint32_t flags;
+};
+
+struct WMTCommandBufferEncoderDiagnostic {
+  uint64_t encoder_id;
+  uint64_t vertex_encoder_id;
+  uint64_t wait_hash;
+  uint64_t update_hash;
+  uint64_t pipeline_handle;
+  uint64_t argument_buffer_handle;
+  uint64_t argument_buffer_offset;
+  uint64_t argument_buffer_size;
+  uint64_t primary_resource;
+  uint64_t secondary_resource;
+  uint64_t resource_plan_hash;
+  uint32_t encoder_index;
+  uint32_t type;
+  uint32_t wait_count;
+  uint32_t update_count;
+  uint32_t flags;
+  uint32_t resource_plan_count;
 };
 
 struct WMTCommandBufferDiagnosticInfo {
@@ -161,6 +182,8 @@ struct WMTCommandBufferDiagnosticInfo {
   uint32_t skipped_external_fence_wait_count;
   uint32_t fence_edge_count;
   uint32_t fence_edge_overflow_count;
+  uint32_t encoder_diagnostic_count;
+  uint32_t encoder_diagnostic_overflow_count;
   uint32_t sparse_mapping_call_count;
   uint32_t sparse_mapping_operation_count;
   uint32_t sparse_mapping_map_count;
@@ -184,10 +207,13 @@ struct WMTCommandBufferDiagnosticInfo {
   uint64_t sparse_access_encoder_id;
   struct WMTCommandBufferFenceEdgeDiagnostic
       fence_edges[WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY];
+  struct WMTCommandBufferEncoderDiagnostic
+      encoders[WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY];
 };
 
 STATIC_ASSERT(sizeof(struct WMTCommandBufferFenceEdgeDiagnostic) == 32);
-STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 544);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferEncoderDiagnostic) == 112);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 5928);
 
 WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,

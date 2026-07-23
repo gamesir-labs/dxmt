@@ -179,9 +179,16 @@ public:
     for (auto query : queries) {
       query->issue(seq_id, (uint64_t *)visibility_result_heap_info.memory.get(), num_results);
     }
+    if (retire_residency_)
+      retire_residency_();
 #ifdef __i386__
     wsi::aligned_free(visibility_result_heap_info.memory.get());
 #endif
+  }
+
+  void
+  setResidencyRetirement(std::function<void()> retirement) {
+    retire_residency_ = std::move(retirement);
   }
 
   VisibilityResultReadback(const VisibilityResultReadback &) = delete;
@@ -192,6 +199,9 @@ public:
   std::vector<Rc<VisibilityResultQuery>> queries;
   WMTBufferInfo visibility_result_heap_info;
   WMT::Reference<WMT::Buffer> visibility_result_heap;
+
+private:
+  std::function<void()> retire_residency_;
 };
 
 /**

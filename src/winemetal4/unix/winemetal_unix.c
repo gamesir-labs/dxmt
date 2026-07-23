@@ -76,6 +76,20 @@ struct DXMTSparseTextureTileKey {
 static NSLock *dxmt_sparse_texture_residency_lock;
 static NSMapTable *dxmt_sparse_texture_residency;
 static pthread_once_t dxmt_sparse_texture_residency_once = PTHREAD_ONCE_INIT;
+static NSLock *dxmt_residency_membership_lock;
+static pthread_once_t dxmt_residency_membership_once = PTHREAD_ONCE_INIT;
+
+static void
+dxmt_residency_membership_init(void) {
+  dxmt_residency_membership_lock = [[NSLock alloc] init];
+}
+
+static NSLock *
+dxmt_residency_membership_lock_get(void) {
+  pthread_once(&dxmt_residency_membership_once,
+               dxmt_residency_membership_init);
+  return dxmt_residency_membership_lock;
+}
 
 static void
 dxmt_sparse_texture_residency_init(void) {
@@ -891,10 +905,12 @@ struct DXMTMetal4PresentDiagnostic {
 @property(nonatomic, retain) DXMTMetal4CommandQueue *owner;
 @property(nonatomic, retain) id<MTL4CommandAllocator> allocator;
 @property(nonatomic, retain) id<MTL4CommandBuffer> metal4Buffer;
-@property(nonatomic, retain) id<MTLResidencySet> residencySet;
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
-@property(nonatomic, retain) NSMutableArray *sparseResidencyAllocations;
+@property(nonatomic, retain) NSMutableArray *retainedAllocations;
+@property(nonatomic, retain) NSMutableSet *retainedAllocationSet;
+@property(nonatomic, retain) NSMutableArray *queueResidencyAllocations;
+@property(nonatomic, retain) NSMutableSet *queueResidencyAllocationSet;
 @property(nonatomic, retain) id<MTLDrawable> pendingDrawable;
 @property(nonatomic, assign) BOOL hasPresentDuration;
 @property(nonatomic, assign) double presentDuration;
@@ -910,15 +926,13 @@ struct DXMTMetal4PresentDiagnostic {
 - (id<MTL4CommandBuffer>)commandBuffer;
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder;
 - (id<MTL4RenderCommandEncoder>)metal4RenderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)descriptor;
-- (void)useResidencyAllocation:(id<MTLAllocation>)allocation;
+- (void)retainAllocationForLifetime:(id<MTLAllocation>)allocation;
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label;
 - (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
-- (void)prepareResidencyForCommit;
-- (uint64_t)prepareResidencyForCommitAndMeasure;
 - (void)commit;
 - (uint64_t)commitLocked;
 - (void)waitUntilCompleted;
-- (void)releaseSparseResidencyAllocations;
+- (void)releaseRetainedAllocations;
 - (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
 - (id)logs;
@@ -1395,11 +1409,24 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, copy) NSString *testFeedbackErrorToken;
 @property(nonatomic, retain) NSError *firstError;
 @property(nonatomic, retain) id<MTLResidencySet> sparseResidencySet;
-@property(nonatomic, retain) NSMutableArray *pendingSparseResidencyAllocations;
 @property(nonatomic, retain) NSCountedSet *sparseResidencyAllocationRefs;
+@property(nonatomic, retain) NSMutableSet *sparseTrackedTextures;
+@property(nonatomic, retain) NSMutableArray *sparseResidencyRetirements;
+@property(nonatomic, retain) id<MTLResidencySet> commandResidencySet;
+@property(nonatomic, retain) NSCountedSet *commandResidencyAllocationRefs;
+@property(nonatomic, retain) NSMutableArray *commandResidencyRetirements;
+@property(nonatomic, retain) NSLock *eventLock;
+@property(nonatomic, retain) NSLock *presentLock;
+@property(nonatomic, retain) NSLock *throttleLock;
+@property(nonatomic, retain) NSLock *submissionLock;
+@property(nonatomic, retain) NSLock *errorLock;
+@property(nonatomic, retain) NSLock *sparseResidencyLock;
+@property(nonatomic, retain) NSMutableArray *externalLifetimeResidencySets;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
+- (uint64_t)prepareCommandResidencyForAllocations:(NSArray *)allocations
+                                  completionValue:(uint64_t)completionValue;
 - (void)monitorWaitBegin:(DXMTMetal4QueueMonitorSource)source
            commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer;
 - (void)monitorWaitEnd:(DXMTMetal4QueueMonitorSource)source
@@ -1441,6 +1468,13 @@ dxmt_metal4_is_buffer(id object) {
   _presentEventValue = 0;
   _maxCommandBufferCount = maxCommandBufferCount;
   _commandBufferThrottleWaitCount = 0;
+  _externalLifetimeResidencySets = [[NSMutableArray alloc] init];
+  _eventLock = [[NSLock alloc] init];
+  _presentLock = [[NSLock alloc] init];
+  _throttleLock = [[NSLock alloc] init];
+  _submissionLock = [[NSLock alloc] init];
+  _errorLock = [[NSLock alloc] init];
+  _sparseResidencyLock = [[NSLock alloc] init];
   _monitorDiagnostic = dxmt_metal4_queue_monitor_register(
       (uintptr_t)self, (uintptr_t)_metal4Queue);
   MTLResidencySetDescriptor *sparseResidencyDescriptor =
@@ -1451,13 +1485,25 @@ dxmt_metal4_is_buffer(id object) {
   _sparseResidencySet = [device
       newResidencySetWithDescriptor:sparseResidencyDescriptor
                               error:&sparseResidencyError];
+  sparseResidencyDescriptor.label = @"DXMT command resource residency";
+  NSError *commandResidencyError = nil;
+  _commandResidencySet = [device
+      newResidencySetWithDescriptor:sparseResidencyDescriptor
+                              error:&commandResidencyError];
   [sparseResidencyDescriptor release];
-  _pendingSparseResidencyAllocations = [[NSMutableArray alloc] init];
   _sparseResidencyAllocationRefs = [[NSCountedSet alloc] init];
+  _sparseTrackedTextures = [[NSMutableSet alloc] init];
+  _sparseResidencyRetirements = [[NSMutableArray alloc] init];
+  _commandResidencyAllocationRefs = [[NSCountedSet alloc] init];
+  _commandResidencyRetirements = [[NSMutableArray alloc] init];
 
   if (!_metal4Queue || !_compiler || !_event || !_presentEvent ||
-      !_sparseResidencySet || !_pendingSparseResidencyAllocations ||
-      !_sparseResidencyAllocationRefs) {
+      !_sparseResidencySet || !_commandResidencySet ||
+      !_sparseResidencyAllocationRefs || !_eventLock || !_presentLock ||
+      !_throttleLock || !_submissionLock || !_errorLock ||
+      !_sparseResidencyLock || !_commandResidencyAllocationRefs ||
+      !_commandResidencyRetirements || !_sparseTrackedTextures ||
+      !_sparseResidencyRetirements || !_externalLifetimeResidencySets) {
     [self release];
     return nil;
   }
@@ -1465,6 +1511,9 @@ dxmt_metal4_is_buffer(id object) {
   [_sparseResidencySet commit];
   [_sparseResidencySet requestResidency];
   [_metal4Queue addResidencySet:_sparseResidencySet];
+  [_commandResidencySet commit];
+  [_commandResidencySet requestResidency];
+  [_metal4Queue addResidencySet:_commandResidencySet];
 
   dxmt_iogpu_diagnostics_install();
   dxmt_metal4_register_compiler(device, _compiler);
@@ -1476,10 +1525,24 @@ dxmt_metal4_is_buffer(id object) {
   _monitorDiagnostic = NULL;
   if (_metal4Queue && _sparseResidencySet)
     [_metal4Queue removeResidencySet:_sparseResidencySet];
+  if (_metal4Queue && _commandResidencySet)
+    [_metal4Queue removeResidencySet:_commandResidencySet];
   [_sparseResidencySet endResidency];
-  [_pendingSparseResidencyAllocations release];
+  [_commandResidencySet endResidency];
+  [_commandResidencyRetirements release];
+  [_commandResidencyAllocationRefs release];
+  [_commandResidencySet release];
+  [_sparseTrackedTextures release];
+  [_sparseResidencyRetirements release];
   [_sparseResidencyAllocationRefs release];
   [_sparseResidencySet release];
+  [_sparseResidencyLock release];
+  [_externalLifetimeResidencySets release];
+  [_errorLock release];
+  [_submissionLock release];
+  [_throttleLock release];
+  [_presentLock release];
+  [_eventLock release];
   [_device release];
   [_metal4Queue release];
   [_compiler release];
@@ -1491,7 +1554,10 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (uint64_t)nextEventValueLocked {
-  return ++_eventValue;
+  [_eventLock lock];
+  const uint64_t value = ++_eventValue;
+  [_eventLock unlock];
+  return value;
 }
 
 - (void)monitorWaitBegin:(DXMTMetal4QueueMonitorSource)source
@@ -1723,7 +1789,9 @@ dxmt_metal4_is_buffer(id object) {
   const uint64_t waitBeginUs = dxmt_monotonic_us();
   [_event waitUntilSignaledValue:waitValue timeoutMS:UINT64_MAX];
   const uint64_t waitElapsedUs = dxmt_monotonic_us() - waitBeginUs;
+  [_throttleLock lock];
   const uint64_t waitIndex = ++_commandBufferThrottleWaitCount;
+  [_throttleLock unlock];
   if (dxmt_metal4_perf_stats_enabled() && waitElapsedUs >= 1000 &&
       (waitIndex <= 5 || (waitIndex % 256) == 0)) {
     fprintf(stderr,
@@ -1733,6 +1801,85 @@ dxmt_metal4_is_buffer(id object) {
             (double)waitElapsedUs / 1000.0, waitIndex);
     fflush(stderr);
   }
+}
+
+- (uint64_t)prepareCommandResidencyForAllocations:(NSArray *)allocations
+                                  completionValue:(uint64_t)completionValue {
+  const uint64_t begin = dxmt_monotonic_us();
+  [_sparseResidencyLock lock];
+  BOOL sparseChanged = NO;
+  BOOL commandChanged = NO;
+  const uint64_t completedValue = _event.signaledValue;
+  NSIndexSet *completedSparseRetirements =
+      [_sparseResidencyRetirements
+          indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
+                                             NSUInteger index,
+                                             BOOL *stop) {
+            (void)index;
+            (void)stop;
+            return [[retirement objectForKey:@"completion"] unsignedLongLongValue]
+                   <= completedValue;
+          }];
+  for (NSDictionary *retirement in
+           [_sparseResidencyRetirements
+               objectsAtIndexes:completedSparseRetirements]) {
+    for (id<MTLAllocation> allocation in
+             [retirement objectForKey:@"allocations"]) {
+      [_sparseResidencyAllocationRefs removeObject:allocation];
+      if ([_sparseResidencyAllocationRefs countForObject:allocation] == 0) {
+        [_sparseResidencySet removeAllocation:allocation];
+        sparseChanged = YES;
+      }
+    }
+  }
+  [_sparseResidencyRetirements
+      removeObjectsAtIndexes:completedSparseRetirements];
+  NSIndexSet *completedRetirements =
+      [_commandResidencyRetirements
+          indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
+                                             NSUInteger index,
+                                             BOOL *stop) {
+            (void)index;
+            (void)stop;
+            return [[retirement objectForKey:@"completion"] unsignedLongLongValue]
+                   <= completedValue;
+          }];
+  for (NSDictionary *retirement in
+           [_commandResidencyRetirements
+               objectsAtIndexes:completedRetirements]) {
+    for (id<MTLAllocation> allocation in
+             [retirement objectForKey:@"allocations"]) {
+      [_commandResidencyAllocationRefs removeObject:allocation];
+      if ([_commandResidencyAllocationRefs
+              countForObject:allocation] == 0) {
+        [_commandResidencySet removeAllocation:allocation];
+        commandChanged = YES;
+      }
+    }
+  }
+  [_commandResidencyRetirements
+      removeObjectsAtIndexes:completedRetirements];
+
+  if (allocations.count) {
+    for (id<MTLAllocation> allocation in allocations) {
+      if ([_commandResidencyAllocationRefs countForObject:allocation] == 0) {
+        [_commandResidencySet addAllocation:allocation];
+        commandChanged = YES;
+      }
+      [_commandResidencyAllocationRefs addObject:allocation];
+    }
+    [_commandResidencyRetirements addObject:@{
+      @"completion" : @(completionValue),
+      @"allocations" : [[allocations copy] autorelease]
+    }];
+  }
+  if (sparseChanged)
+    [_sparseResidencySet commit];
+  if (commandChanged)
+    [_commandResidencySet commit];
+  [_sparseResidencyLock unlock];
+  const uint64_t end = dxmt_monotonic_us();
+  return end >= begin ? end - begin : 0;
 }
 
 - (void)recordPresentDiagnosticForCommandBuffer:
@@ -1746,11 +1893,12 @@ dxmt_metal4_is_buffer(id object) {
       ![drawable conformsToProtocol:@protocol(CAMetalDrawable)])
     return;
 
+  [_presentLock lock];
   id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
   id<MTLTexture> texture = metalDrawable.texture;
   CAMetalLayer *layer = metalDrawable.layer;
   id<MTLResidencySet> layerSet = layer.residencySet;
-  id<MTLResidencySet> commandBufferSet = commandBuffer.residencySet;
+  NSArray *retainedAllocations = commandBuffer.retainedAllocations;
   id<MTLAllocation> backing = texture
                                   ? dxmt_metal4_backing_allocation(
                                         (id<MTLAllocation>)texture)
@@ -1799,7 +1947,7 @@ dxmt_metal4_is_buffer(id object) {
   diag->layer_maximum_drawable_count = layer.maximumDrawableCount;
   diag->layer_allocation_count = layerSet ? layerSet.allocationCount : 0;
   diag->command_buffer_allocation_count =
-      commandBufferSet ? commandBufferSet.allocationCount : 0;
+      retainedAllocations.count;
   const CGSize drawableSize = layer.drawableSize;
   diag->layer_width = drawableSize.width;
   diag->layer_height = drawableSize.height;
@@ -1813,25 +1961,26 @@ dxmt_metal4_is_buffer(id object) {
   diag->layer_contains_backing =
       layerSet && backing ? [layerSet containsAllocation:backing] : NO;
   diag->command_buffer_contains_texture =
-      commandBufferSet && texture
-          ? [commandBufferSet containsAllocation:(id<MTLAllocation>)texture]
-          : NO;
+      texture && [retainedAllocations
+                     containsObject:dxmt_metal4_backing_allocation(
+                                        (id<MTLAllocation>)texture)];
   diag->command_buffer_contains_backing =
-      commandBufferSet && backing
-          ? [commandBufferSet containsAllocation:backing]
-          : NO;
+      backing && [retainedAllocations containsObject:backing];
   diag->wait_for_drawable = waitForDrawable;
   diag->present_ordering = presentOrdering;
   diag->has_present_duration = commandBuffer.hasPresentDuration;
+  [_presentLock unlock];
 }
 
 - (void)dumpPresentDiagnosticsForErrorCommandBuffer:
     (obj_handle_t)commandBuffer {
+  [_presentLock lock];
   const uint64_t newest = _presentDiagnosticSerial;
   if (!newest) {
     fprintf(stderr,
             "err:   DXMT Metal4 recent present diagnostics: errorCommandBuffer=%p count=0\n",
             (void *)(uintptr_t)commandBuffer);
+    [_presentLock unlock];
     return;
   }
 
@@ -1890,6 +2039,7 @@ dxmt_metal4_is_buffer(id object) {
             diag->present_ordering, diag->has_present_duration,
             diag->present_duration);
   }
+  [_presentLock unlock];
 }
 @end
 
@@ -1905,12 +2055,10 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
   _pendingWaitEvents = [[NSMutableArray alloc] init];
   _pendingSignalEvents = [[NSMutableArray alloc] init];
-  _sparseResidencyAllocations = [[NSMutableArray alloc] init];
-  MTLResidencySetDescriptor *residencyDesc = [[MTLResidencySetDescriptor alloc] init];
-  residencyDesc.initialCapacity = 1024;
-  NSError *residencyError = nil;
-  _residencySet = [queue.device newResidencySetWithDescriptor:residencyDesc error:&residencyError];
-  [residencyDesc release];
+  _retainedAllocations = [[NSMutableArray alloc] init];
+  _retainedAllocationSet = [[NSMutableSet alloc] init];
+  _queueResidencyAllocations = [[NSMutableArray alloc] init];
+  _queueResidencyAllocationSet = [[NSMutableSet alloc] init];
   _completionValue = 0;
   _internalStatus = DXMTMetal4CommandBufferStateNotEnqueued;
   _feedbackGPUStartTime = 0.0;
@@ -1918,7 +2066,9 @@ dxmt_metal4_is_buffer(id object) {
   memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
   if (!_allocator || !_metal4Buffer || !_pendingWaitEvents ||
-      !_pendingSignalEvents || !_sparseResidencyAllocations || !_residencySet) {
+      !_pendingSignalEvents || !_retainedAllocations ||
+      !_retainedAllocationSet || !_queueResidencyAllocations ||
+      !_queueResidencyAllocationSet) {
     [self release];
     return nil;
   }
@@ -1931,8 +2081,10 @@ dxmt_metal4_is_buffer(id object) {
   [_feedbackError release];
   [_pendingWaitEvents release];
   [_pendingSignalEvents release];
-  [_sparseResidencyAllocations release];
-  [_residencySet release];
+  [_retainedAllocationSet release];
+  [_retainedAllocations release];
+  [_queueResidencyAllocationSet release];
+  [_queueResidencyAllocations release];
   [_metal4Buffer release];
   [_allocator release];
   [_owner release];
@@ -1951,16 +2103,40 @@ dxmt_metal4_is_buffer(id object) {
   return [_metal4Buffer renderCommandEncoderWithDescriptor:descriptor];
 }
 
-- (void)useResidencyAllocation:(id<MTLAllocation>)allocation {
+- (void)retainAllocationForLifetime:(id<MTLAllocation>)allocation {
   if (!allocation)
     return;
   id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
-  [_residencySet addAllocation:backing];
+  if (![_retainedAllocationSet containsObject:backing]) {
+    [_retainedAllocationSet addObject:backing];
+    [_retainedAllocations addObject:backing];
+  }
+  BOOL externallyResident = NO;
+  NSLock *membershipLock = dxmt_residency_membership_lock_get();
+  [membershipLock lock];
+  for (id<MTLResidencySet> set in
+           _owner.externalLifetimeResidencySets) {
+    if ([set containsAllocation:backing]) {
+      externallyResident = YES;
+      break;
+    }
+  }
+  [membershipLock unlock];
+  if (!externallyResident &&
+      ![_queueResidencyAllocationSet containsObject:backing]) {
+    [_queueResidencyAllocationSet addObject:backing];
+    [_queueResidencyAllocations addObject:backing];
+  }
   if ([(id)backing conformsToProtocol:@protocol(MTLTexture)]) {
     DXMTSparseTextureResidency *sparseResidency =
         dxmt_sparse_texture_residency_for_texture((id<MTLTexture>)backing,
                                                   false);
-    [sparseResidency addMappedHeapsToResidencySet:_residencySet];
+    for (id<MTLAllocation> heap in [sparseResidency mappedHeapsSnapshot]) {
+      if (![_retainedAllocationSet containsObject:heap]) {
+        [_retainedAllocationSet addObject:heap];
+        [_retainedAllocations addObject:heap];
+      }
+    }
   }
 }
 
@@ -1991,59 +2167,35 @@ dxmt_metal4_is_buffer(id object) {
     return nil;
   if (bytes)
     memcpy([buffer contents], bytes, length);
-  [self useResidencyAllocation:(id<MTLAllocation>)buffer];
+  [self retainAllocationForLifetime:(id<MTLAllocation>)buffer];
   return buffer;
-}
-
-- (void)prepareResidencyForCommit {
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommitResidencySet
-            commandBuffer:self];
-  [_residencySet commit];
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseRequestResidency
-            commandBuffer:self];
-  [_residencySet requestResidency];
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseUseResidencySet
-            commandBuffer:self];
-  [_metal4Buffer useResidencySet:_residencySet];
-}
-
-- (uint64_t)prepareResidencyForCommitAndMeasure {
-  uint64_t begin = dxmt_monotonic_us();
-  [self prepareResidencyForCommit];
-  uint64_t end = dxmt_monotonic_us();
-  return end >= begin ? end - begin : 0;
 }
 
 - (void)commit {
   [_owner monitorWaitBegin:DXMTMetal4QueueMonitorSourceCommandBufferCommit
              commandBuffer:self];
-  @synchronized(_owner) {
-    [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceCommandBufferCommit
-             commandBuffer:self];
-    [_owner monitorAcquired:DXMTMetal4QueueMonitorSourceCommandBufferCommit
-                      phase:DXMTMetal4QueueMonitorPhaseCommitPreflight
-              commandBuffer:self];
-    @try {
-      [self commitLocked];
-    } @finally {
-      [_owner monitorReleased];
-    }
-  }
+  [self commitLocked];
 }
 
 - (uint64_t)commitLocked {
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommitPreflight
             commandBuffer:self];
-  if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
-    return 0;
+  @synchronized(self) {
+    if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
+      return 0;
+    _internalStatus = DXMTMetal4CommandBufferStateCommitted;
+  }
 
+  [_owner.errorLock lock];
   if (_owner.firstError &&
       [_owner.firstError.domain isEqualToString:@"DXMTMetal4TestErrorDomain"] &&
       !dxmt_metal4_test_feedback_error_enabled())
     _owner.firstError = nil;
+  NSError *queueError = [_owner.firstError retain];
+  [_owner.errorLock unlock];
 
-  if (_owner.firstError) {
-    _feedbackError = [_owner.firstError retain];
+  if (queueError) {
+    _feedbackError = queueError;
     _internalStatus = DXMTMetal4CommandBufferStateError;
     const char *rejection_marker =
         getenv("DXMT_TEST_METAL4_REJECTION_MARKER");
@@ -2070,12 +2222,6 @@ dxmt_metal4_is_buffer(id object) {
     return 0;
   }
 
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePendingSparseResidency
-            commandBuffer:self];
-  [_sparseResidencyAllocations
-      addObjectsFromArray:_owner.pendingSparseResidencyAllocations];
-  [_owner.pendingSparseResidencyAllocations removeAllObjects];
-
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
       APITRACE_METAL_COMMAND_BUFFER_COMMIT_BEGIN,
@@ -2090,10 +2236,22 @@ dxmt_metal4_is_buffer(id object) {
   const BOOL waitForDrawable = hasDrawable && dxmt_metal4_wait_for_drawable_enabled();
   uint64_t previousPresentValue = 0;
   uint64_t currentPresentValue = 0;
+  uint64_t residency_submit_us = 0;
 
+  [_owner.submissionLock lock];
+  [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+           commandBuffer:self];
+  [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
+           commandBuffer:self];
+  [_owner monitorAcquired:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+                    phase:DXMTMetal4QueueMonitorPhaseCommitPreflight
+            commandBuffer:self];
+  @try {
   if (presentOrdering) {
+    [_owner.presentLock lock];
     previousPresentValue = _owner.presentEventValue;
     currentPresentValue = ++_owner.presentEventValue;
+    [_owner.presentLock unlock];
   }
 
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseEnqueueWaitEvents
@@ -2127,14 +2285,16 @@ dxmt_metal4_is_buffer(id object) {
     [_owner.metal4Queue waitForEvent:_owner.presentEvent value:previousPresentValue];
   }
 
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePrepareResidency
-            commandBuffer:self];
-  uint64_t residency_submit_us = [self prepareResidencyForCommitAndMeasure];
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseEndCommandBuffer
             commandBuffer:self];
   [_metal4Buffer endCommandBuffer];
 
   _completionValue = [_owner nextEventValueLocked];
+  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhasePrepareResidency
+            commandBuffer:self];
+  residency_submit_us =
+      [_owner prepareCommandResidencyForAllocations:_queueResidencyAllocations
+                                   completionValue:_completionValue];
   _completionCurrentBeforeThrottle = _owner.event.signaledValue;
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommandBufferThrottle
             commandBuffer:self];
@@ -2210,36 +2370,28 @@ dxmt_metal4_is_buffer(id object) {
         [feedbackQueueOwner
             monitorWaitBegin:DXMTMetal4QueueMonitorSourceFeedbackInjection
                commandBuffer:feedbackOwner];
-        @synchronized(feedbackQueueOwner) {
-          [feedbackQueueOwner
-              monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackInjection
-               commandBuffer:feedbackOwner];
-          [feedbackQueueOwner
-              monitorAcquired:DXMTMetal4QueueMonitorSourceFeedbackInjection
-                        phase:DXMTMetal4QueueMonitorPhaseFeedbackInjection
-                commandBuffer:feedbackOwner];
-          @try {
-            if (dxmt_truthy_env_value(
-                    getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"))) {
+        [feedbackQueueOwner
+            monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackInjection
+             commandBuffer:feedbackOwner];
+        [feedbackQueueOwner.errorLock lock];
+        if (dxmt_truthy_env_value(
+                getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"))) {
+          injectTestError = YES;
+        } else {
+          const char *token =
+              getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
+          if (token && token[0] && strcmp(token, "0") &&
+              strcmp(token, "false") && strcmp(token, "no") &&
+              strcmp(token, "off")) {
+            NSString *value = [NSString stringWithUTF8String:token];
+            if (![feedbackQueueOwner.testFeedbackErrorToken
+                    isEqualToString:value]) {
+              feedbackQueueOwner.testFeedbackErrorToken = value;
               injectTestError = YES;
-            } else {
-              const char *token =
-                  getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
-              if (token && token[0] && strcmp(token, "0") &&
-                  strcmp(token, "false") && strcmp(token, "no") &&
-                  strcmp(token, "off")) {
-                NSString *value = [NSString stringWithUTF8String:token];
-                if (![feedbackQueueOwner.testFeedbackErrorToken
-                        isEqualToString:value]) {
-                  feedbackQueueOwner.testFeedbackErrorToken = value;
-                  injectTestError = YES;
-                }
-              }
             }
-          } @finally {
-            [feedbackQueueOwner monitorReleased];
           }
         }
+        [feedbackQueueOwner.errorLock unlock];
       }
       if (injectTestError) {
         error = [NSError errorWithDomain:@"DXMTMetal4TestErrorDomain"
@@ -2263,23 +2415,15 @@ dxmt_metal4_is_buffer(id object) {
         [feedbackQueueOwner
             monitorWaitBegin:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
                commandBuffer:feedbackOwner];
-        @synchronized(feedbackQueueOwner) {
-          [feedbackQueueOwner
-              monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
-               commandBuffer:feedbackOwner];
-          [feedbackQueueOwner
-              monitorAcquired:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
-                        phase:DXMTMetal4QueueMonitorPhaseFeedbackErrorLatch
-                commandBuffer:feedbackOwner];
-          @try {
-            if (!feedbackQueueOwner.firstError) {
-              feedbackQueueOwner.firstError = error;
-              firstQueueError = YES;
-            }
-          } @finally {
-            [feedbackQueueOwner monitorReleased];
-          }
+        [feedbackQueueOwner
+            monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackErrorLatch
+             commandBuffer:feedbackOwner];
+        [feedbackQueueOwner.errorLock lock];
+        if (!feedbackQueueOwner.firstError) {
+          feedbackQueueOwner.firstError = error;
+          firstQueueError = YES;
         }
+        [feedbackQueueOwner.errorLock unlock];
       }
       if (error && feedbackCompletionEvent.signaledValue <
                        feedbackCompletionValue) {
@@ -2309,6 +2453,7 @@ dxmt_metal4_is_buffer(id object) {
                 " localFenceIds=%u boundFenceSlots=%u"
                 " encodedFenceWait=%u skippedExternalFenceWait=%u"
                 " fenceEdgeCount=%u fenceEdgeOverflow=%u"
+                " encoderDiagnosticCount=%u encoderDiagnosticOverflow=%u"
                 " sparseCalls=%u sparseOps=%u sparseMap=%u sparseUnmap=%u"
                 " sparseFailures=%u sparseBarriers=%u"
                 " sparseResource=%" PRIu64 " sparseTexture=0x%" PRIx64
@@ -2370,6 +2515,8 @@ dxmt_metal4_is_buffer(id object) {
                 feedbackDiagnostic.skipped_external_fence_wait_count,
                 feedbackDiagnostic.fence_edge_count,
                 feedbackDiagnostic.fence_edge_overflow_count,
+                feedbackDiagnostic.encoder_diagnostic_count,
+                feedbackDiagnostic.encoder_diagnostic_overflow_count,
                 feedbackDiagnostic.sparse_mapping_call_count,
                 feedbackDiagnostic.sparse_mapping_operation_count,
                 feedbackDiagnostic.sparse_mapping_map_count,
@@ -2419,6 +2566,37 @@ dxmt_metal4_is_buffer(id object) {
                     edge->producer_index, edge->consumer_index, edge->slot,
                     edge->flags);
           }
+          for (uint32_t encoder_index = 0;
+               encoder_index < feedbackDiagnostic.encoder_diagnostic_count &&
+               encoder_index <
+                   WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY;
+               encoder_index++) {
+            const struct WMTCommandBufferEncoderDiagnostic *encoder =
+                &feedbackDiagnostic.encoders[encoder_index];
+            fprintf(stderr,
+                    "err:   DXMT Metal4 feedback encoder: commandBuffer=%p"
+                    " diagnosticIndex=%u encoderIndex=%u type=%u"
+                    " encoderId=%" PRIu64 " vertexEncoderId=%" PRIu64
+                    " waits=%u updates=%u"
+                    " waitHash=0x%" PRIx64 " updateHash=0x%" PRIx64
+                    " pso=0x%" PRIx64
+                    " argbuf=0x%" PRIx64 "+%" PRIu64 "/%" PRIu64
+                    " primary=0x%" PRIx64 " secondary=0x%" PRIx64
+                    " resourcePlan=%u/0x%" PRIx64 " flags=0x%x\n",
+                    (void *)(uintptr_t)feedbackCommandBuffer, encoder_index,
+                    encoder->encoder_index, encoder->type,
+                    encoder->encoder_id, encoder->vertex_encoder_id,
+                    encoder->wait_count, encoder->update_count,
+                    encoder->wait_hash, encoder->update_hash,
+                    encoder->pipeline_handle,
+                    encoder->argument_buffer_handle,
+                    encoder->argument_buffer_offset,
+                    encoder->argument_buffer_size,
+                    encoder->primary_resource,
+                    encoder->secondary_resource,
+                    encoder->resource_plan_count,
+                    encoder->resource_plan_hash, encoder->flags);
+          }
           NSString *debugDescription = error.debugDescription;
           NSString *userInfoDescription = error.userInfo.description;
           fprintf(stderr,
@@ -2463,6 +2641,7 @@ dxmt_metal4_is_buffer(id object) {
             error && error.localizedDescription ? error.localizedDescription : @"");
       }
 #endif
+      [feedbackOwner releaseRetainedAllocations];
       [feedbackLabel release];
       [feedbackSignalEvents release];
       [feedbackWaitEvents release];
@@ -2524,6 +2703,10 @@ dxmt_metal4_is_buffer(id object) {
   }
   if (!_pendingDrawable)
     [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
+  } @finally {
+    [_owner monitorReleased];
+    [_owner.submissionLock unlock];
+  }
 
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseFinalize
             commandBuffer:self];
@@ -2645,46 +2828,16 @@ dxmt_metal4_is_buffer(id object) {
       _internalStatus = DXMTMetal4CommandBufferStateCompleted;
   }
 
-  [self releaseSparseResidencyAllocations];
+  [self releaseRetainedAllocations];
 
 }
 
-- (void)releaseSparseResidencyAllocations {
-  [_owner
-      monitorWaitBegin:DXMTMetal4QueueMonitorSourceReleaseSparseResidency
-         commandBuffer:self];
-  @synchronized(_owner) {
-    [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceReleaseSparseResidency
-             commandBuffer:self];
-    [_owner
-        monitorAcquired:DXMTMetal4QueueMonitorSourceReleaseSparseResidency
-                  phase:DXMTMetal4QueueMonitorPhaseReleaseSparseResidency
-          commandBuffer:self];
-    @try {
-      BOOL changed = NO;
-      [_owner monitorSetPhase:
-                  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyRefs
-                commandBuffer:self];
-      for (id<MTLAllocation> allocation in _sparseResidencyAllocations) {
-        [_owner.sparseResidencyAllocationRefs removeObject:allocation];
-        if ([_owner.sparseResidencyAllocationRefs countForObject:allocation] == 0) {
-          [_owner.sparseResidencySet removeAllocation:allocation];
-          changed = YES;
-        }
-      }
-      if (changed) {
-        [_owner monitorSetPhase:
-                    DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyCommit
-                  commandBuffer:self];
-        [_owner.sparseResidencySet commit];
-      }
-      [_owner monitorSetPhase:
-                  DXMTMetal4QueueMonitorPhaseReleaseSparseResidencyClear
-                commandBuffer:self];
-      [_sparseResidencyAllocations removeAllObjects];
-    } @finally {
-      [_owner monitorReleased];
-    }
+- (void)releaseRetainedAllocations {
+  @synchronized(self) {
+    [_queueResidencyAllocationSet removeAllObjects];
+    [_queueResidencyAllocations removeAllObjects];
+    [_retainedAllocationSet removeAllObjects];
+    [_retainedAllocations removeAllObjects];
   }
 }
 
@@ -2846,7 +2999,7 @@ dxmt_metal4_is_buffer(id object) {
       length,
       (obj_handle_t)fenceToWait,
       (obj_handle_t)fenceToUpdate);
-  [self useResidencyAllocation:(id<MTLAllocation>)buffer];
+  [self retainAllocationForLifetime:(id<MTLAllocation>)buffer];
   [_metal4Buffer resolveCounterHeap:heap
                            withRange:range
                           intoBuffer:MTL4BufferRangeMake([buffer gpuAddress] + offset, length)
@@ -2922,7 +3075,7 @@ dxmt_metal4_argument_set_buffer(
   state->buffers[index].offset = offset;
   state->buffer_bound[index] = true;
   if (buffer && !same_buffer)
-    [state->owner useResidencyAllocation:(id<MTLAllocation>)buffer];
+    [state->owner retainAllocationForLifetime:(id<MTLAllocation>)buffer];
   [state->table setAddress:buffer ? [buffer gpuAddress] + offset : 0 atIndex:index];
 }
 
@@ -2959,7 +3112,7 @@ dxmt_metal4_argument_set_texture(struct dxmt_metal4_argument_state *state, id<MT
   state->textures[index] = texture;
   state->texture_bound[index] = true;
   if (texture)
-    [state->owner useResidencyAllocation:(id<MTLAllocation>)texture];
+    [state->owner retainAllocationForLifetime:(id<MTLAllocation>)texture];
   [state->table setTexture:texture ? [texture gpuResourceID] : (MTLResourceID){0} atIndex:index];
 }
 
@@ -5459,7 +5612,12 @@ _MTLCommandQueue_addResidencySet(void *obj) {
   id set = (id)params->arg;
   if (!queue || !dxmt_metal4_is_residency_set(set))
     return STATUS_SUCCESS;
+  NSLock *membershipLock = dxmt_residency_membership_lock_get();
+  [membershipLock lock];
+  if (![queue.externalLifetimeResidencySets containsObject:set])
+    [queue.externalLifetimeResidencySets addObject:set];
   [queue.metal4Queue addResidencySet:(id<MTLResidencySet>)set];
+  [membershipLock unlock];
   return STATUS_SUCCESS;
 }
 
@@ -5470,7 +5628,11 @@ _MTLCommandQueue_removeResidencySet(void *obj) {
   id set = (id)params->arg;
   if (!queue || !dxmt_metal4_is_residency_set(set))
     return STATUS_SUCCESS;
+  NSLock *membershipLock = dxmt_residency_membership_lock_get();
+  [membershipLock lock];
   [queue.metal4Queue removeResidencySet:(id<MTLResidencySet>)set];
+  [queue.externalLifetimeResidencySets removeObject:set];
+  [membershipLock unlock];
   return STATUS_SUCCESS;
 }
 
@@ -5482,18 +5644,7 @@ _MTLCommandBuffer_commit(void *obj) {
   params->ret_residency_submit_us = 0;
   [owner monitorWaitBegin:DXMTMetal4QueueMonitorSourceUnixCommitThunk
             commandBuffer:cmdbuf];
-  @synchronized(owner) {
-    [owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
-            commandBuffer:cmdbuf];
-    [owner monitorAcquired:DXMTMetal4QueueMonitorSourceUnixCommitThunk
-                     phase:DXMTMetal4QueueMonitorPhaseCommitPreflight
-             commandBuffer:cmdbuf];
-    @try {
-      params->ret_residency_submit_us = [cmdbuf commitLocked];
-    } @finally {
-      [owner monitorReleased];
-    }
-  }
+  params->ret_residency_submit_us = [cmdbuf commitLocked];
   return STATUS_SUCCESS;
 }
 
@@ -6101,62 +6252,149 @@ _MTLCommandQueue_updateSparseTextureMappings(void *obj) {
 
     DXMTSparseTextureResidency *residency =
         dxmt_sparse_texture_residency_for_texture(texture, true);
-    NSArray *mappedHeaps = [residency mappedHeapsSnapshot];
+    NSSet *oldMappedHeaps =
+        [NSSet setWithArray:[residency mappedHeapsSnapshot]];
 
     [queue monitorWaitBegin:DXMTMetal4QueueMonitorSourceSparseTextureMappings
               commandBuffer:nil];
-    @synchronized(queue) {
-      [queue monitorWaitEnd:DXMTMetal4QueueMonitorSourceSparseTextureMappings
-              commandBuffer:nil];
-      [queue monitorAcquired:DXMTMetal4QueueMonitorSourceSparseTextureMappings
-                       phase:DXMTMetal4QueueMonitorPhaseSparseMappingPreflight
-               commandBuffer:nil];
-      [queue monitorSetSubject:(uintptr_t)texture
-                           aux:(uintptr_t)heap
-                         count:params->operation_count
-                         flags:(map_count & 0xffffffffull) |
-                               (unmap_count << 32)];
-      @try {
-        if (!queue.firstError) {
-          [queue monitorSetPhase:
-                     DXMTMetal4QueueMonitorPhaseSparseMappingResidencyRefs
-                   commandBuffer:nil];
-          NSMutableArray *allocations = [NSMutableArray arrayWithCapacity:
-              mappedHeaps.count + (heap ? 2 : 1)];
-          [allocations addObject:(id<MTLAllocation>)texture];
-          [allocations addObjectsFromArray:mappedHeaps];
-          if (heap)
-            [allocations addObject:(id<MTLAllocation>)heap];
+    [queue.submissionLock lock];
+    [queue monitorWaitEnd:DXMTMetal4QueueMonitorSourceSparseTextureMappings
+            commandBuffer:nil];
+    [queue monitorAcquired:DXMTMetal4QueueMonitorSourceSparseTextureMappings
+                     phase:DXMTMetal4QueueMonitorPhaseSparseMappingPreflight
+             commandBuffer:nil];
+    @try {
+    [queue monitorSetSubject:(uintptr_t)texture
+                         aux:(uintptr_t)heap
+                       count:params->operation_count
+                       flags:(map_count & 0xffffffffull) |
+                             (unmap_count << 32)];
+    [queue.errorLock lock];
+    const BOOL queueFailed = queue.firstError != nil;
+    [queue.errorLock unlock];
+    if (!queueFailed) {
+      [queue.eventLock lock];
+      const uint64_t waitValue = queue.eventValue;
+      const uint64_t mappingCompletionValue = ++queue.eventValue;
+      [queue.eventLock unlock];
 
-          for (id<MTLAllocation> allocation in allocations) {
-            if ([queue.sparseResidencyAllocationRefs
-                    countForObject:allocation] == 0)
-              [queue.sparseResidencySet addAllocation:allocation];
-            [queue.sparseResidencyAllocationRefs addObject:allocation];
-            [queue.pendingSparseResidencyAllocations addObject:allocation];
-          }
-          [queue monitorSetPhase:
-                     DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit
-                   commandBuffer:nil];
-          [queue.sparseResidencySet commit];
-          [queue monitorSetPhase:
-                     DXMTMetal4QueueMonitorPhaseSparseMappingMetalUpdate
-                   commandBuffer:nil];
-          [queue.metal4Queue updateTextureMappings:texture
-                                               heap:heap
-                                         operations:mtl_ops
-                                              count:(NSUInteger)params->operation_count];
-          [queue monitorSetPhase:
-                     DXMTMetal4QueueMonitorPhaseSparseMappingApply
-                   commandBuffer:nil];
-          [residency applyOperations:operations
-                               count:params->operation_count
-                                heap:heap];
-          params->ret = 1;
+      [queue monitorSetPhase:
+                 DXMTMetal4QueueMonitorPhaseSparseMappingResidencyRefs
+               commandBuffer:nil];
+      [queue.sparseResidencyLock lock];
+      const uint64_t completedValue = queue.event.signaledValue;
+      NSIndexSet *completedRetirements =
+          [queue.sparseResidencyRetirements
+              indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
+                                                 NSUInteger index,
+                                                 BOOL *stop) {
+                (void)index;
+                (void)stop;
+                return [[retirement objectForKey:@"completion"]
+                           unsignedLongLongValue] <= completedValue;
+              }];
+      for (NSDictionary *retirement in
+               [queue.sparseResidencyRetirements
+                   objectsAtIndexes:completedRetirements]) {
+        for (id<MTLAllocation> allocation in
+                 [retirement objectForKey:@"allocations"]) {
+          [queue.sparseResidencyAllocationRefs removeObject:allocation];
+          if ([queue.sparseResidencyAllocationRefs
+                  countForObject:allocation] == 0)
+            [queue.sparseResidencySet removeAllocation:allocation];
         }
-      } @finally {
-        [queue monitorReleased];
       }
+      [queue.sparseResidencyRetirements
+          removeObjectsAtIndexes:completedRetirements];
+      if (![queue.sparseTrackedTextures containsObject:texture]) {
+        [queue.sparseTrackedTextures addObject:texture];
+        [queue.sparseResidencyAllocationRefs
+            addObject:(id<MTLAllocation>)texture];
+        [queue.sparseResidencySet
+            addAllocation:(id<MTLAllocation>)texture];
+      }
+      BOOL heapPrecounted = NO;
+      if (heap) {
+        if ([queue.sparseResidencyAllocationRefs
+                countForObject:(id<MTLAllocation>)heap] == 0)
+          [queue.sparseResidencySet
+              addAllocation:(id<MTLAllocation>)heap];
+        [queue.sparseResidencyAllocationRefs
+            addObject:(id<MTLAllocation>)heap];
+        heapPrecounted = YES;
+      }
+      [queue monitorSetPhase:
+                 DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit
+               commandBuffer:nil];
+      [queue.sparseResidencySet commit];
+      [queue.sparseResidencyLock unlock];
+
+      if (waitValue)
+        [queue.metal4Queue waitForEvent:queue.event value:waitValue];
+      [queue monitorSetPhase:
+                 DXMTMetal4QueueMonitorPhaseSparseMappingMetalUpdate
+               commandBuffer:nil];
+      [queue.metal4Queue
+          updateTextureMappings:texture
+                           heap:heap
+                     operations:mtl_ops
+                          count:(NSUInteger)params->operation_count];
+      [queue.metal4Queue signalEvent:queue.event
+                              value:mappingCompletionValue];
+      [queue monitorSetPhase:DXMTMetal4QueueMonitorPhaseSparseMappingApply
+               commandBuffer:nil];
+      [residency applyOperations:operations
+                           count:params->operation_count
+                            heap:heap];
+
+      NSSet *newMappedHeaps =
+          [NSSet setWithArray:[residency mappedHeapsSnapshot]];
+      NSMutableSet *addedHeaps = [newMappedHeaps mutableCopy];
+      [addedHeaps minusSet:oldMappedHeaps];
+      NSMutableSet *removedHeaps = [oldMappedHeaps mutableCopy];
+      [removedHeaps minusSet:newMappedHeaps];
+      NSMutableArray *retiredAllocations = [NSMutableArray array];
+
+      [queue.sparseResidencyLock lock];
+      for (id<MTLAllocation> addedHeap in addedHeaps) {
+        if (heapPrecounted && addedHeap == (id<MTLAllocation>)heap) {
+          heapPrecounted = NO;
+          continue;
+        }
+        if ([queue.sparseResidencyAllocationRefs
+                countForObject:addedHeap] == 0)
+          [queue.sparseResidencySet addAllocation:addedHeap];
+        [queue.sparseResidencyAllocationRefs addObject:addedHeap];
+      }
+      [retiredAllocations addObjectsFromArray:[removedHeaps allObjects]];
+      if (heapPrecounted)
+        [retiredAllocations addObject:(id<MTLAllocation>)heap];
+      if (!newMappedHeaps.count &&
+          [queue.sparseTrackedTextures containsObject:texture]) {
+        /*
+         * Change logical membership immediately, but keep the allocation in
+         * the residency set until this ordered mapping update has completed.
+         * A remap submitted before completion re-adds a reference, so retiring
+         * the old mapping cannot evict the newly mapped texture.
+         */
+        [queue.sparseTrackedTextures removeObject:texture];
+        [retiredAllocations addObject:(id<MTLAllocation>)texture];
+      }
+      if (retiredAllocations.count) {
+        [queue.sparseResidencyRetirements addObject:@{
+          @"completion" : @(mappingCompletionValue),
+          @"allocations" : [[retiredAllocations copy] autorelease]
+        }];
+      }
+      [queue.sparseResidencySet commit];
+      [queue.sparseResidencyLock unlock];
+      [removedHeaps release];
+      [addedHeaps release];
+      params->ret = 1;
+    }
+    } @finally {
+      [queue monitorReleased];
+      [queue.submissionLock unlock];
     }
 
     free(mtl_ops);
@@ -6526,7 +6764,7 @@ dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
   if (!texture)
     return;
 
-  [owner useResidencyAllocation:(id<MTLAllocation>)texture];
+  [owner retainAllocationForLifetime:(id<MTLAllocation>)texture];
   if (!dxmt_metal4_residency_diag_enabled())
     return;
 
@@ -6565,9 +6803,9 @@ dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
             (unsigned long)texture.pixelFormat, (unsigned long)texture.width,
             (unsigned long)texture.height, (unsigned long)texture.sampleCount,
             texture.framebufferOnly, backing,
-            [owner.residencySet containsAllocation:(id<MTLAllocation>)texture],
-            [owner.residencySet containsAllocation:backing],
-            (unsigned long)owner.residencySet.allocationCount);
+            [owner.retainedAllocationSet containsObject:backing],
+            [owner.retainedAllocationSet containsObject:backing],
+            (unsigned long)owner.retainedAllocations.count);
     fflush(stderr);
   }
 }
@@ -6628,7 +6866,7 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
-  [owner useResidencyAllocation:(id<MTLAllocation>)info->visibility_buffer];
+  [owner retainAllocationForLifetime:(id<MTLAllocation>)info->visibility_buffer];
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
@@ -6989,8 +7227,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTBlitCommandCopyFromBufferToBuffer: {
       struct wmtcmd_blit_copy_from_buffer_to_buffer *body = (struct wmtcmd_blit_copy_from_buffer_to_buffer *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
                      toBuffer:(id<MTLBuffer>)body->dst
@@ -7000,8 +7238,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromBufferToTexture: {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
             sourceBytesPerRow:body->bytes_per_row
@@ -7015,8 +7253,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromTextureToBuffer: {
       struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                        sourceSlice:body->slice
                        sourceLevel:body->level
@@ -7030,8 +7268,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
       struct wmtcmd_blit_copy_from_texture_to_texture *body = (struct wmtcmd_blit_copy_from_texture_to_texture *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->src];
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dst];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                    sourceSlice:body->src_slice
                    sourceLevel:body->src_level
@@ -7045,7 +7283,7 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandGenerateMipmaps: {
       struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->texture];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->texture];
       [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
       break;
     }
@@ -7061,7 +7299,7 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandFillBuffer: {
       struct wmtcmd_blit_fillbuffer *body = (struct wmtcmd_blit_fillbuffer *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->buffer];
       [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
       break;
     }
@@ -7128,7 +7366,7 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTComputeCommandDispatchIndirect: {
       struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_compute_set_argument_table_if_needed(encoder, state);
       [encoder dispatchThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
                                 threadsPerThreadgroup:state->threadgroupSize];
@@ -7174,7 +7412,7 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     case WMTComputeCommandUseResource: {
       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
       (void)body->usage;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->resource];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->resource];
       break;
     }
     case WMTComputeCommandSetBytes: {
@@ -7243,7 +7481,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
       (void)body->usage;
       (void)body->stages;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->resource];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->resource];
       break;
     }
     case WMTRenderCommandSetVertexBuffer: {
@@ -7380,7 +7618,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawIndexed: {
       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
       id<MTLBuffer> index_buffer = (id<MTLBuffer>)body->index_buffer;
-      [owner useResidencyAllocation:(id<MTLAllocation>)index_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)index_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                           indexCount:body->index_count
@@ -7394,7 +7632,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndirect: {
       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                 indirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)];
@@ -7403,8 +7641,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawIndexedIndirect: {
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
       id<MTLBuffer> index_buffer = (id<MTLBuffer>)body->index_buffer;
-      [owner useResidencyAllocation:(id<MTLAllocation>)index_buffer];
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)index_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                            indexType:(MTLIndexType)body->index_type
@@ -7433,7 +7671,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
       struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
           (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(
@@ -7478,7 +7716,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
@@ -7491,7 +7729,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
           (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
@@ -7522,7 +7760,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
@@ -7535,7 +7773,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
           (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
@@ -7919,11 +8157,11 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   scaler.jitterOffsetX = props->jitter_offset_x;
   scaler.jitterOffsetY = props->jitter_offset_y;
   scaler.preExposure = props->pre_exposure;
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->color];
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->output];
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->depth];
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->motion];
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->exposure];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->color];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->output];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->depth];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->motion];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->exposure];
   [scaler encodeToCommandBuffer:[wrapper commandBuffer]];
   return STATUS_SUCCESS;
 }
@@ -7936,8 +8174,8 @@ _MTLCommandBuffer_encodeSpatialScale(void *obj) {
   scaler.colorTexture = (id<MTLTexture>)params->color;
   scaler.outputTexture = (id<MTLTexture>)params->output;
   scaler.fence = (id<MTLFence>)params->fence;
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->color];
-  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->output];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->color];
+  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->output];
   [scaler encodeToCommandBuffer:[wrapper commandBuffer]];
   return STATUS_SUCCESS;
 }
@@ -9662,7 +9900,10 @@ _MTLResidencySet_addAllocation(void *obj) {
   id allocation = (id)params->arg;
   if (!dxmt_metal4_is_residency_set(set) || !dxmt_metal4_is_allocation(allocation))
     return STATUS_SUCCESS;
+  NSLock *membershipLock = dxmt_residency_membership_lock_get();
+  [membershipLock lock];
   [(id<MTLResidencySet>)set addAllocation:(id<MTLAllocation>)allocation];
+  [membershipLock unlock];
   return STATUS_SUCCESS;
 }
 
@@ -9673,7 +9914,10 @@ _MTLResidencySet_removeAllocation(void *obj) {
   id allocation = (id)params->arg;
   if (!dxmt_metal4_is_residency_set(set) || !dxmt_metal4_is_allocation(allocation))
     return STATUS_SUCCESS;
+  NSLock *membershipLock = dxmt_residency_membership_lock_get();
+  [membershipLock lock];
   [(id<MTLResidencySet>)set removeAllocation:(id<MTLAllocation>)allocation];
+  [membershipLock unlock];
   return STATUS_SUCCESS;
 }
 
@@ -9683,7 +9927,10 @@ _MTLResidencySet_commit(void *obj) {
   id set = (id)params->handle;
   if (!dxmt_metal4_is_residency_set(set))
     return STATUS_SUCCESS;
+  NSLock *membershipLock = dxmt_residency_membership_lock_get();
+  [membershipLock lock];
   [(id<MTLResidencySet>)set commit];
+  [membershipLock unlock];
   return STATUS_SUCCESS;
 }
 

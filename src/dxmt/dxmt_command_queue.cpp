@@ -5,6 +5,7 @@
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
+#include "util_lifecycle_telemetry.hpp"
 #include "util_win32_compat.h"
 #include <algorithm>
 #include <atomic>
@@ -26,6 +27,35 @@ static bool
 DxmtQueueDiagEnabled() {
   static const bool enabled = DxmtQueueDiagEnabledEnv("DXMT_DIAG_DXMT_QUEUE");
   return enabled;
+}
+
+static bool
+DxmtQueueLifecycleEnabled() {
+  static const bool enabled =
+      DxmtQueueDiagEnabledEnv("DXMT_DIAG_QUEUE_LIFECYCLE");
+  return enabled;
+}
+
+static void
+DxmtQueueLifecycleLog(const CommandQueue *queue, const char *stage,
+                      uint64_t pair_id, uint64_t queue_pair_id,
+                      uint64_t frame_id, uint64_t chunk_id,
+                      obj_handle_t command_buffer, uint64_t wait_sequence,
+                      uint64_t dependency_sequence) {
+  if (!DxmtQueueLifecycleEnabled())
+    return;
+  WARN_FILE_ONLY("DXMT queue lifecycle:"
+       " eventSeq=", lifecycle::nextEventSequence(),
+       " pairSeq=", pair_id,
+       " queuePairSeq=", queue_pair_id,
+       " queue=", reinterpret_cast<uintptr_t>(queue),
+       " thread=", lifecycle::threadId(),
+       " stage=", stage,
+       " frame=", frame_id,
+       " chunk=", chunk_id,
+       " cmdbuf=", command_buffer,
+       " waitSeq=", wait_sequence,
+       " dependencySeq=", dependency_sequence);
 }
 
 static bool
@@ -195,6 +225,10 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   wmt_diagnostic.fence_edge_count = diagnostic.fence_edge_count;
   wmt_diagnostic.fence_edge_overflow_count =
       diagnostic.fence_edge_overflow_count;
+  wmt_diagnostic.encoder_diagnostic_count =
+      diagnostic.encoder_diagnostic_count;
+  wmt_diagnostic.encoder_diagnostic_overflow_count =
+      diagnostic.encoder_diagnostic_overflow_count;
   wmt_diagnostic.sparse_mapping_call_count =
       diagnostic.sparse_mapping_call_count;
   wmt_diagnostic.sparse_mapping_operation_count =
@@ -241,6 +275,30 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
     dst.consumer_index = src.consumer_index;
     dst.slot = src.slot;
     dst.flags = src.flags;
+  }
+  for (uint32_t i = 0;
+       i < diagnostic.encoder_diagnostic_count &&
+       i < WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY;
+       i++) {
+    const auto &src = diagnostic.encoders[i];
+    auto &dst = wmt_diagnostic.encoders[i];
+    dst.encoder_id = src.encoder_id;
+    dst.vertex_encoder_id = src.vertex_encoder_id;
+    dst.wait_hash = src.wait_hash;
+    dst.update_hash = src.update_hash;
+    dst.pipeline_handle = src.pipeline_handle;
+    dst.argument_buffer_handle = src.argument_buffer_handle;
+    dst.argument_buffer_offset = src.argument_buffer_offset;
+    dst.argument_buffer_size = src.argument_buffer_size;
+    dst.primary_resource = src.primary_resource;
+    dst.secondary_resource = src.secondary_resource;
+    dst.resource_plan_hash = src.resource_plan_hash;
+    dst.encoder_index = src.encoder_index;
+    dst.type = src.type;
+    dst.wait_count = src.wait_count;
+    dst.update_count = src.update_count;
+    dst.flags = src.flags;
+    dst.resource_plan_count = src.resource_plan_count;
   }
   cmdbuf.setDiagnosticInfo(wmt_diagnostic);
   const auto diagnostic_marker =
@@ -295,6 +353,13 @@ CommandQueue::CommandQueue(WMT::Device device) :
     cmd_library(device),
     argument_encoding_ctx(*this, device, cmd_library),
     initializer(device) {
+  auto retire_cached_block =
+      [this](const auto &block, uint64_t sequence) {
+        this->RetireCachedAllocationResidency(block.buffer, sequence);
+      };
+  staging_allocator.setReleaseCallback(retire_cached_block);
+  copy_temp_allocator.setReleaseCallback(retire_cached_block);
+  argbuf_allocator.setReleaseCallback(retire_cached_block);
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.queue = this;
@@ -322,6 +387,12 @@ CommandQueue::~CommandQueue() {
   finishThread.join();
   readback_cond_.notify_all();
   readbackThread.join();
+  staging_allocator.free_blocks(UINT64_MAX);
+  copy_temp_allocator.free_blocks(UINT64_MAX);
+  argbuf_allocator.free_blocks(UINT64_MAX);
+  argument_encoding_ctx.RetirePersistentResidency(
+      cpu_coherent.signaledValue());
+  FlushPersistentResidency();
   {
     std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
     persistent_residency_stop_ = true;
@@ -429,12 +500,32 @@ CommandQueue::CommitCurrentChunk() {
 void
 CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
   auto &frame_statistics = statistics.at(frame_id);
+  const auto lifecycle_pair_id = lifecycle::nextPairSequence();
+  const auto queue_lifecycle_id =
+      lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+  const auto pending_chunk_id =
+      ready_for_encode.load(std::memory_order_relaxed);
+  DxmtQueueLifecycleLog(this, "publish.enter", lifecycle_pair_id,
+                        queue_lifecycle_id, frame_id, pending_chunk_id, 0,
+                        chunk_ongoing.load(std::memory_order_relaxed),
+                        cpu_coherent.signaledValue());
 #if ASYNC_ENCODING
   auto t0 = clock::now();
   for (;;) {
     auto ongoing = chunk_ongoing.load(std::memory_order_acquire);
     while (ongoing >= kCommandChunkCount - 1) {
+      const auto wait_pair = lifecycle::nextPairSequence();
+      const auto wait_queue_pair =
+          lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      DxmtQueueLifecycleLog(this, "publish.backpressure-wait.enter",
+                            wait_pair, wait_queue_pair, frame_id,
+                            pending_chunk_id, 0, ongoing,
+                            cpu_coherent.signaledValue());
       chunk_ongoing.wait(ongoing, std::memory_order_acquire);
+      DxmtQueueLifecycleLog(
+          this, "publish.backpressure-wait.leave", wait_pair,
+          wait_queue_pair, frame_id, pending_chunk_id, 0, ongoing,
+          cpu_coherent.signaledValue());
       ongoing = chunk_ongoing.load(std::memory_order_acquire);
     }
     if (chunk_ongoing.compare_exchange_weak(
@@ -450,6 +541,8 @@ CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
   auto &chunk = chunks[chunk_id % kCommandChunkCount];
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
+  chunk.lifecycle_pair_id = lifecycle_pair_id;
+  chunk.queue_lifecycle_id = queue_lifecycle_id;
   chunk.frame_ = frame_id;
   chunk.frame_begin_time = frame_statistics.begin_time;
   chunk.publish_time = clock::now();
@@ -471,6 +564,10 @@ CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
 #if ASYNC_ENCODING
   ready_for_encode.fetch_add(1, std::memory_order_release);
   ready_for_encode.notify_one();
+  DxmtQueueLifecycleLog(this, "publish.leave", lifecycle_pair_id,
+                        queue_lifecycle_id, chunk.frame_, chunk.chunk_id, 0,
+                        ready_for_encode.load(std::memory_order_relaxed),
+                        chunk.chunk_event_id);
   if (DxmtQueueDiagShouldLog(commit_log_count)) {
     WARN_FILE_ONLY("DXMT queue diagnostic: CommitCurrentChunk notified"
          " chunk=", chunk_id,
@@ -482,6 +579,10 @@ CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
 
 #else
   ready_for_encode.fetch_add(1, std::memory_order_relaxed);
+  DxmtQueueLifecycleLog(this, "publish.leave", lifecycle_pair_id,
+                        queue_lifecycle_id, chunk.frame_, chunk.chunk_id, 0,
+                        ready_for_encode.load(std::memory_order_relaxed),
+                        chunk.chunk_event_id);
   CommitChunkInternal(chunk);
 #endif
 
@@ -617,9 +718,18 @@ CommandQueue::WaitCPUFence(uint64_t seq) {
   if (cpu_coherent.signaledValue() >= seq)
     return;
 
+  const auto pair_id = lifecycle::nextPairSequence();
+  const auto queue_pair_id =
+      lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+  DxmtQueueLifecycleLog(this, "cpu-fence-wait.enter", pair_id, queue_pair_id,
+                        ~0ull, CurrentSeqId(), 0, seq,
+                        cpu_coherent.signaledValue());
   const auto t0 = clock::now();
   cpu_coherent.wait(seq);
   const auto t1 = clock::now();
+  DxmtQueueLifecycleLog(this, "cpu-fence-wait.leave", pair_id, queue_pair_id,
+                        ~0ull, CurrentSeqId(), 0, seq,
+                        cpu_coherent.signaledValue());
   const auto wait_us =
       std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   perf::recordWaitCpuFence(uint64_t(wait_us));
@@ -632,7 +742,7 @@ CommandQueue::WaitCPUFence(uint64_t seq) {
 }
 
 void
-CommandQueue::AddPersistentResidency(WMT::Resource allocation) {
+CommandQueue::AddPersistentResidency(WMT::Object allocation) {
   if (!allocation)
     return;
 
@@ -648,20 +758,60 @@ CommandQueue::AddPersistentResidency(WMT::Resource allocation) {
   entry.remove_after_seq = 0;
 }
 
-std::pair<uint32_t, uint64_t>
-CommandQueue::PersistentResidencyStatsForTesting() {
+void
+CommandQueue::EnsureCachedAllocationResidency(WMT::Resource allocation) {
+  if (!allocation)
+    return;
+
   std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  uint64_t total_ref_count = 0;
-  for (const auto &[handle, entry] : persistent_residency_entries_) {
-    (void)handle;
-    total_ref_count += entry.ref_count;
+  if (!persistent_residency_cached_allocations_
+           .emplace(allocation.handle, true)
+           .second)
+    return;
+  auto &entry = persistent_residency_entries_[allocation.handle];
+  if (!entry.allocation) {
+    entry.allocation = allocation;
+    persistent_residency_set_.addAllocation(allocation);
+    persistent_residency_dirty_ = true;
   }
-  return {static_cast<uint32_t>(persistent_residency_entries_.size()),
-          total_ref_count};
+  entry.ref_count++;
+  entry.pending_remove = false;
+  entry.remove_after_seq = 0;
 }
 
 void
-CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Resource allocation) {
+CommandQueue::RetireCachedAllocationResidency(WMT::Resource allocation,
+                                              uint64_t sequence) {
+  if (!allocation)
+    return;
+  {
+    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+    if (!persistent_residency_cached_allocations_.erase(allocation.handle))
+      return;
+  }
+  RemovePersistentResidencyAfterCompletion(allocation, sequence);
+}
+
+std::tuple<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>
+CommandQueue::PersistentResidencyStatsForTesting() {
+  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
+  uint64_t total_ref_count = 0;
+  uint32_t pending_removal_count = 0;
+  for (const auto &[handle, entry] : persistent_residency_entries_) {
+    (void)handle;
+    total_ref_count += entry.ref_count;
+    pending_removal_count += entry.pending_remove ? 1 : 0;
+  }
+  return {
+      static_cast<uint32_t>(persistent_residency_entries_.size()),
+      total_ref_count,
+      pending_removal_count,
+      static_cast<uint32_t>(persistent_residency_cached_allocations_.size()),
+      persistent_residency_commit_count_};
+}
+
+void
+CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Object allocation) {
   // Descriptor writes happen independently of queue submission. Retire against
   // the last sequence that was actually published, rather than the current
   // (possibly forever empty) chunk.
@@ -672,7 +822,7 @@ CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Resource allocation)
 
 void
 CommandQueue::RemovePersistentResidencyAfterCompletion(
-    WMT::Resource allocation, uint64_t sequence) {
+    WMT::Object allocation, uint64_t sequence) {
   if (!allocation)
     return;
 
@@ -697,8 +847,8 @@ CommandQueue::RemovePersistentResidencyAfterCompletion(
       // coalesces descriptor churn while still guaranteeing that an idle queue
       // eventually publishes the removal and drops even a single large
       // allocation.
-      persistent_residency_retired_allocations_.push_back(
-          entry->second.allocation);
+      persistent_residency_retired_allocations_.emplace_back(
+          WMT::Object(entry->second.allocation.handle));
       persistent_residency_set_.removeAllocation(entry->second.allocation);
       persistent_residency_dirty_ = true;
       persistent_residency_entries_.erase(entry);
@@ -744,7 +894,7 @@ CommandQueue::RetainUntilGpuComplete(uint64_t sequence,
 
 uint64_t
 CommandQueue::FlushPersistentResidency() {
-  std::vector<WMT::Reference<WMT::Resource>> retired_allocations;
+  std::deque<WMT::Reference<WMT::Object>> retired_allocations;
   clock::time_point begin;
   clock::time_point end;
   {
@@ -757,6 +907,7 @@ CommandQueue::FlushPersistentResidency() {
     begin = clock::now();
     persistent_residency_set_.commit();
     end = clock::now();
+    persistent_residency_commit_count_++;
     persistent_residency_dirty_ = false;
     persistent_residency_flush_requested_ = false;
     retired_allocations.swap(persistent_residency_retired_allocations_);
@@ -766,7 +917,7 @@ CommandQueue::FlushPersistentResidency() {
 
 void
 CommandQueue::RetirePersistentResidencyRemovals(uint64_t completed_seq) {
-  std::vector<WMT::Reference<WMT::Resource>> retired_allocations;
+  bool notify_flush = false;
   {
     std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
     bool removed = false;
@@ -775,7 +926,8 @@ CommandQueue::RetirePersistentResidencyRemovals(uint64_t completed_seq) {
       auto &entry = it->second;
       if (entry.pending_remove && entry.ref_count == 0 &&
           entry.remove_after_seq <= completed_seq) {
-        persistent_residency_retired_allocations_.push_back(entry.allocation);
+        persistent_residency_retired_allocations_.emplace_back(
+            WMT::Object(entry.allocation.handle));
         persistent_residency_set_.removeAllocation(entry.allocation);
         persistent_residency_dirty_ = true;
         removed = true;
@@ -785,15 +937,18 @@ CommandQueue::RetirePersistentResidencyRemovals(uint64_t completed_seq) {
       }
     }
     if (removed || !persistent_residency_retired_allocations_.empty()) {
-      // A completion may be the queue's last submission. Commit the whole batch
-      // here instead of waiting for a future submit that may never arrive; the
-      // local references remain alive until the commit has consumed removals.
-      persistent_residency_set_.commit();
-      persistent_residency_dirty_ = false;
-      persistent_residency_flush_requested_ = false;
-      retired_allocations.swap(persistent_residency_retired_allocations_);
+      // The finish thread only publishes retirement. ResidencySet mutation is
+      // committed by the dedicated maintenance worker (or by the encode
+      // submit path before a command-buffer commit), so completion callbacks
+      // never enter the backend residency commit path.
+      if (!persistent_residency_flush_requested_) {
+        persistent_residency_flush_requested_ = true;
+        notify_flush = true;
+      }
     }
   }
+  if (notify_flush)
+    persistent_residency_cond_.notify_one();
 }
 
 void
@@ -801,7 +956,7 @@ CommandQueue::PersistentResidencyThread() {
   env::setThreadName("dxmt-residency-thread");
 
   for (;;) {
-    std::vector<WMT::Reference<WMT::Resource>> retired_allocations;
+    std::deque<WMT::Reference<WMT::Object>> retired_allocations;
     std::unique_lock<dxmt::mutex> lock(persistent_residency_mutex_);
     persistent_residency_cond_.wait(lock, [this]() {
       return persistent_residency_stop_ ||
@@ -824,6 +979,7 @@ CommandQueue::PersistentResidencyThread() {
     auto pool = WMT::MakeAutoreleasePool();
     if (persistent_residency_dirty_) {
       persistent_residency_set_.commit();
+      persistent_residency_commit_count_++;
       persistent_residency_dirty_ = false;
       retired_allocations.swap(persistent_residency_retired_allocations_);
     }
@@ -876,6 +1032,9 @@ CommandQueue::DrainDeferredReleases() {
 void
 CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   auto pool = WMT::MakeAutoreleasePool();
+  DxmtQueueLifecycleLog(this, "encode.enter", chunk.lifecycle_pair_id,
+                        chunk.queue_lifecycle_id, chunk.frame_, chunk.chunk_id,
+                        0, chunk.chunk_id, chunk.resource_initializer_event_id);
   static std::atomic<uint32_t> internal_log_count = 0;
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
     WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal begin"
@@ -989,6 +1148,11 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
   ready_for_commit.notify_one();
+  DxmtQueueLifecycleLog(this, "encode.leave", chunk.lifecycle_pair_id,
+                        chunk.queue_lifecycle_id, chunk.frame_, chunk.chunk_id,
+                        cmdbuf.handle,
+                        ready_for_commit.load(std::memory_order_relaxed),
+                        chunk.chunk_event_id);
   if (DxmtQueueDiagShouldLog(internal_log_count)) {
     WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal notified finish"
          " chunk=", chunk.chunk_id,
@@ -1010,6 +1174,12 @@ CommandQueue::EncodingThread() {
     while (!stopped.load(std::memory_order_acquire) && ready == internal_seq) {
       static std::atomic<uint32_t> encode_wait_log_count = 0;
       const auto wait_begin_time = clock::now();
+      const auto wait_pair = lifecycle::nextPairSequence();
+      const auto wait_queue_pair =
+          lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      DxmtQueueLifecycleLog(
+          this, "encode-worker-wait.enter", wait_pair, wait_queue_pair,
+          ~0ull, internal_seq, 0, internal_seq, ready);
       const bool log_wait = DxmtQueueDiagShouldLogIdleWait(encode_wait_log_count);
       if (log_wait) {
         WARN_FILE_ONLY("DXMT queue diagnostic: EncodingThread idle wait begin"
@@ -1021,6 +1191,9 @@ CommandQueue::EncodingThread() {
       }
       ready_for_encode.wait(ready, std::memory_order_acquire);
       ready = ready_for_encode.load(std::memory_order_acquire);
+      DxmtQueueLifecycleLog(
+          this, "encode-worker-wait.leave", wait_pair, wait_queue_pair,
+          ~0ull, internal_seq, 0, internal_seq, ready);
       if (log_wait) {
         const auto wait_end_time = clock::now();
         WARN_FILE_ONLY("DXMT queue diagnostic: EncodingThread idle wait wake"
@@ -1179,6 +1352,12 @@ CommandQueue::WaitForFinishThread() {
     while (!stopped.load(std::memory_order_acquire) && ready == internal_seq) {
       static std::atomic<uint32_t> finish_wait_log_count = 0;
       const auto wait_begin_time = clock::now();
+      const auto wait_pair = lifecycle::nextPairSequence();
+      const auto wait_queue_pair =
+          lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      DxmtQueueLifecycleLog(
+          this, "finish-worker-wait.enter", wait_pair, wait_queue_pair,
+          ~0ull, internal_seq, 0, internal_seq, ready);
       const bool log_wait = DxmtQueueDiagShouldLogIdleWait(finish_wait_log_count);
       if (log_wait) {
         WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread idle wait begin"
@@ -1190,6 +1369,9 @@ CommandQueue::WaitForFinishThread() {
       }
       ready_for_commit.wait(ready, std::memory_order_acquire);
       ready = ready_for_commit.load(std::memory_order_acquire);
+      DxmtQueueLifecycleLog(
+          this, "finish-worker-wait.leave", wait_pair, wait_queue_pair,
+          ~0ull, internal_seq, 0, internal_seq, ready);
       if (log_wait) {
         const auto wait_end_time = clock::now();
         WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread idle wait wake"
@@ -1221,6 +1403,13 @@ CommandQueue::WaitForFinishThread() {
            " coherent=", cpu_coherent.signaledValue());
     }
     if (chunk.attached_cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
+      const auto wait_pair = lifecycle::nextPairSequence();
+      const auto wait_queue_pair =
+          lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      DxmtQueueLifecycleLog(
+          this, "metal-completion-wait.enter", wait_pair, wait_queue_pair,
+          chunk.frame_, chunk.chunk_id, chunk.attached_cmdbuf.handle,
+          internal_seq, chunk.chunk_event_id);
       if (DxmtQueueDiagShouldLog(finish_log_count)) {
         WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread wait begin"
              " seq=", internal_seq,
@@ -1231,6 +1420,10 @@ CommandQueue::WaitForFinishThread() {
       auto wait_begin_time = clock::now();
       chunk.attached_cmdbuf.waitUntilCompleted();
       auto wait_end_time = clock::now();
+      DxmtQueueLifecycleLog(
+          this, "metal-completion-wait.leave", wait_pair, wait_queue_pair,
+          chunk.frame_, chunk.chunk_id, chunk.attached_cmdbuf.handle,
+          internal_seq, chunk.chunk_event_id);
       if (DxmtQueueDiagShouldLog(finish_log_count)) {
         WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread wait end"
              " seq=", internal_seq,
@@ -1389,7 +1582,14 @@ CommandQueue::WaitForFinishThread() {
     }
     const auto completion_chunk_id = chunk.chunk_id;
     const auto completion_frame = chunk.frame_;
+    const auto completion_pair_id = chunk.lifecycle_pair_id;
+    const auto completion_queue_pair_id = chunk.queue_lifecycle_id;
+    const auto completion_cmdbuf = chunk.attached_cmdbuf.handle;
 
+    DxmtQueueLifecycleLog(
+        this, "completion-publish.enter", completion_pair_id,
+        completion_queue_pair_id, completion_frame, completion_chunk_id,
+        completion_cmdbuf, internal_seq, chunk.chunk_event_id);
     EnqueueReadbacks(chunk);
     chunk.reset();
 
@@ -1399,6 +1599,10 @@ CommandQueue::WaitForFinishThread() {
     cpu_coherent.signal(internal_seq);
     RetirePersistentResidencyRemovals(internal_seq);
     CompleteDeferredReleases(internal_seq);
+    DxmtQueueLifecycleLog(
+        this, "completion-publish.leave", completion_pair_id,
+        completion_queue_pair_id, completion_frame, completion_chunk_id,
+        completion_cmdbuf, internal_seq, cpu_coherent.signaledValue());
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
       WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread signaled"
            " seq=", internal_seq,
@@ -1409,9 +1613,20 @@ CommandQueue::WaitForFinishThread() {
            " coherent=", cpu_coherent.signaledValue());
     }
     const auto callbacks_begin_time = clock::now();
+    const auto callbacks_pair = lifecycle::nextPairSequence();
+    const auto callbacks_queue_pair =
+        lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+    DxmtQueueLifecycleLog(
+        this, "completion-callbacks.enter", callbacks_pair,
+        callbacks_queue_pair, completion_frame, completion_chunk_id,
+        completion_cmdbuf, internal_seq, completion_callbacks.size());
     for (auto &callback : completion_callbacks)
       callback();
     const auto callbacks_end_time = clock::now();
+    DxmtQueueLifecycleLog(
+        this, "completion-callbacks.leave", callbacks_pair,
+        callbacks_queue_pair, completion_frame, completion_chunk_id,
+        completion_cmdbuf, internal_seq, completion_callbacks.size());
     if (DxmtQueueDiagEnabled() && !completion_callbacks.empty()) {
       WARN_FILE_ONLY("DXMT queue diagnostic: CompletionCallbacks"
            " seq=", internal_seq,

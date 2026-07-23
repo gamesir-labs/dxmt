@@ -6,6 +6,7 @@
 #include "util_env.hpp"
 #include "util_math.hpp"
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <queue>
@@ -42,6 +43,13 @@ public:
 
   void free_blocks(uint64_t coherent_id);
 
+  void setReleaseCallback(
+      std::function<void(const typename Allocator::Block &, uint64_t)>
+          callback) {
+    std::lock_guard<mutex> lock(mutex_);
+    release_callback_ = std::move(callback);
+  }
+
 private:
   struct Allocation {
     size_t allocated_size;
@@ -67,6 +75,8 @@ private:
   std::queue<Allocation> fifo;
   mutex mutex_;
   Allocator allocator_;
+  std::function<void(const typename Allocator::Block &, uint64_t)>
+      release_callback_;
 };
 
 class GpuPrivateBufferBlockAllocator {
@@ -316,6 +326,8 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
     auto adhoc = front.total_size != BlockSize;
     if (expired || adhoc) {
       // can be deallocated
+      if (release_callback_)
+        release_callback_(front.block, front.last_used_seq_id);
       fifo.pop();
       continue;
     }
@@ -334,6 +346,8 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
     if (front.last_used_seq_id < coherent_id) {
       check_guard(front, "reuse_front");
       if (front.total_size != BlockSize) {
+        if (release_callback_)
+          release_callback_(front.block, front.last_used_seq_id);
         fifo.pop();
         continue;
       } else if (front.total_size >= block_size) {

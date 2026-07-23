@@ -83,6 +83,15 @@ public:
     if (DescriptorHeapSupportsMirror(desc_)) {
       mirror_ = std::make_unique<DescriptorHeapMirror>(
           device_->GetMTLDevice(), desc.NumDescriptors, sampler_heap);
+      auto &queue = device_->GetDXMTDevice().queue();
+      queue.AddPersistentResidency(mirror_->buffer());
+      queue.AddPersistentResidency(mirror_->descriptorTableBuffer());
+      if (!sampler_heap) {
+        queue.AddPersistentResidency(
+            mirror_->bufferDescriptorRecordBuffer());
+        queue.AddPersistentResidency(
+            mirror_->bufferResourceTableBuffer());
+      }
       for (UINT i = 0; i < desc.NumDescriptors; i++)
         records_[i].mirror = mirror_.get();
     }
@@ -106,6 +115,15 @@ public:
     if (!mirror_)
       return;
     auto &queue = device_->GetDXMTDevice().queue();
+    queue.RemovePersistentResidencyAfterCompletion(mirror_->buffer());
+    queue.RemovePersistentResidencyAfterCompletion(
+        mirror_->descriptorTableBuffer());
+    if (!mirror_->isSamplerHeap()) {
+      queue.RemovePersistentResidencyAfterCompletion(
+          mirror_->bufferDescriptorRecordBuffer());
+      queue.RemovePersistentResidencyAfterCompletion(
+          mirror_->bufferResourceTableBuffer());
+    }
     for (auto &target : mirror_->DrainResidencyTargets()) {
       if (target.allocation)
         queue.RemovePersistentResidencyAfterCompletion(target.allocation);

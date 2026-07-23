@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <span>
@@ -136,6 +137,8 @@ public:
 
   uint64_t chunk_id;
   uint64_t chunk_event_id;
+  uint64_t lifecycle_pair_id;
+  uint64_t queue_lifecycle_id;
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
   clock::time_point frame_begin_time;
@@ -172,6 +175,8 @@ public:
 
   void
   reset() {
+    lifecycle_pair_id = 0;
+    queue_lifecycle_id = 0;
     signal_frame_latency_fence_ = ~0ull;
     frame_begin_time = {};
     publish_time = {};
@@ -213,6 +218,11 @@ private:
 
   void PersistentResidencyThread();
 
+  void EnsureCachedAllocationResidency(WMT::Resource resource);
+
+  void RetireCachedAllocationResidency(WMT::Resource resource,
+                                       uint64_t sequence);
+
   void CompleteDeferredReleases(uint64_t completed_seq);
 
   void DrainDeferredReleases();
@@ -228,6 +238,7 @@ private:
   std::atomic_uint64_t ready_for_encode = 1; // we start from 1, so 0 is always coherent
   std::atomic_uint64_t ready_for_commit = 1;
   std::atomic_uint64_t chunk_ongoing = 0;
+  std::atomic_uint64_t lifecycle_sequence_ = 1;
   CpuFence cpu_coherent;
   CpuFence frame_latency_fence_;
   std::atomic_bool stopped = false;
@@ -253,7 +264,7 @@ private:
   WMT::Device device;
   WMT::Reference<WMT::CommandQueue> commandQueue;
   struct PersistentResidencyEntry {
-    WMT::Reference<WMT::Resource> allocation;
+    WMT::Reference<WMT::Object> allocation;
     uint32_t ref_count = 0;
     uint64_t remove_after_seq = 0;
     bool pending_remove = false;
@@ -261,11 +272,14 @@ private:
   dxmt::mutex persistent_residency_mutex_;
   WMT::Reference<WMT::ResidencySet> persistent_residency_set_;
   bool persistent_residency_dirty_ = false;
+  uint64_t persistent_residency_commit_count_ = 0;
   std::unordered_map<obj_handle_t, PersistentResidencyEntry> persistent_residency_entries_;
+  std::unordered_map<obj_handle_t, bool>
+      persistent_residency_cached_allocations_;
   // Strong references for allocations removed from the userspace set but not
   // yet committed to its kernel mirror. The maintenance worker guarantees an
   // idle queue flushes this list after a short coalescing delay.
-  std::vector<WMT::Reference<WMT::Resource>>
+  std::deque<WMT::Reference<WMT::Object>>
       persistent_residency_retired_allocations_;
   dxmt::condition_variable persistent_residency_cond_;
   bool persistent_residency_flush_requested_ = false;
@@ -385,21 +399,21 @@ public:
   WaitCPUFence(uint64_t seq);
 
   void
-  AddPersistentResidency(WMT::Resource resource);
+  AddPersistentResidency(WMT::Object resource);
 
   // Test-only synchronized accounting used by the D3D12 residency oracle.
-  std::pair<uint32_t, uint64_t>
+  std::tuple<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>
   PersistentResidencyStatsForTesting();
 
   // App-thread retirement: waits only for work that has actually been
   // published. This avoids pinning descriptor history to an empty next chunk.
   void
-  RemovePersistentResidencyAfterCompletion(WMT::Resource resource);
+  RemovePersistentResidencyAfterCompletion(WMT::Object resource);
 
   // Encode/submission-thread retirement: `sequence` is the exact chunk that
   // may reference the resource.
   void
-  RemovePersistentResidencyAfterCompletion(WMT::Resource resource,
+  RemovePersistentResidencyAfterCompletion(WMT::Object resource,
                                              uint64_t sequence);
 
   // App-thread lifetime retirement, paired with the last published sequence.
@@ -427,24 +441,28 @@ public:
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {
     auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
+    EnsureCachedAllocationResidency(block.buffer);
     return {block.buffer, offset};
   }
 
   AllocatedTempBufferSlice
   AllocateStagingBuffer1(size_t size, size_t alignment) {
     auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
+    EnsureCachedAllocationResidency(block.buffer);
     return {block.buffer, offset, block.gpu_address};
   }
 
   std::pair<WMT::Buffer, uint64_t>
   AllocateTempBuffer(uint64_t seq, size_t size, size_t alignment) {
     auto [block, offset] = copy_temp_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
+    EnsureCachedAllocationResidency(block.buffer);
     return {block.buffer, offset};
   }
 
   AllocatedTempBufferSlice
   AllocateTempBuffer1(uint64_t seq, size_t size, size_t alignment) {
     auto [block, offset] = copy_temp_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
+    EnsureCachedAllocationResidency(block.buffer);
     return {block.buffer, offset, block.gpu_address};
   }
 
@@ -453,6 +471,7 @@ public:
     if (!size)
       return {};
     auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
+    EnsureCachedAllocationResidency(block.buffer);
     if constexpr (sizeof(void *) == 4) {
       auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
       return {ptr_add(shadow_block.ptr, shadow_offset), block.buffer, offset,
