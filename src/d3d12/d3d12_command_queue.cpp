@@ -7065,6 +7065,7 @@ private:
     std::shared_ptr<const CompiledNativeBindingRecipe> native_binding_recipe;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
     uint64_t binding_content_fingerprint = 0;
+    std::shared_ptr<CompiledCommandTestTelemetry> test_telemetry;
   };
 
   struct ReplayDispatchPacket {
@@ -10385,6 +10386,7 @@ private:
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.binding_program = packet.binding_program;
             replay_packet.common.binding_delta = packet.binding_delta;
+            replay_packet.common.test_telemetry = compiled->test_telemetry;
             replay_packet.common.binding_generation = binding_fingerprint;
             replay_packet.common.binding_content_fingerprint =
                 binding_fingerprint;
@@ -10464,6 +10466,7 @@ private:
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.binding_program = packet.binding_program;
             replay_packet.common.binding_delta = packet.binding_delta;
+            replay_packet.common.test_telemetry = compiled->test_telemetry;
             replay_packet.common.binding_generation = binding_fingerprint;
             replay_packet.common.binding_content_fingerprint =
                 binding_fingerprint;
@@ -10716,6 +10719,7 @@ private:
           binding_payload.frozen_native = frozen_native;
           binding_payload.native_binding_recipe = native_binding_recipe;
           binding_payload.root = root;
+          binding_payload.test_telemetry = compiled->test_telemetry;
           binding_payload.descriptor_content_revision =
               submitted_snapshot
                   ? submitted_snapshot->descriptor_content_revision
@@ -22416,7 +22420,8 @@ private:
   }
 
   static void PublishCompiledDirectAccessListForEncode(
-      ArgumentEncodingContext &enc, const CompiledDirectAccessList &list) {
+      ArgumentEncodingContext &enc, const CompiledDirectAccessList &list,
+      CompiledCommandTestTelemetry *test_telemetry = nullptr) {
     auto &queue = enc.queue();
     const auto sequence = enc.currentSeqId();
     auto publish_allocation = [&](const Rc<BufferAllocation> &allocation) {
@@ -22475,10 +22480,17 @@ private:
       auto [published_it, inserted] = published.try_emplace(key, access.flags);
       if (!inserted) {
         const int new_flags = access.flags & ~published_it->second;
-        if (!new_flags)
+        if (!new_flags) {
+          if (test_telemetry)
+            test_telemetry->encoder_resource_plan_reuses.fetch_add(
+                1, std::memory_order_relaxed);
           continue;
+        }
         published_it->second |= access.flags;
       }
+      if (test_telemetry)
+        test_telemetry->encoder_resource_plan_publications.fetch_add(
+            1, std::memory_order_relaxed);
       switch (access.stage) {
       case PipelineStage::Compute:
         publish.template operator()<PipelineStage::Compute>(access);
@@ -22600,7 +22612,16 @@ private:
         const bool delta_applicable =
             encoder_cache.binding_valid && delta.base_program &&
             encoder_cache.binding_program == delta.base_program.get();
-        PublishCompiledDirectAccessListForEncode(enc, payload.direct_access);
+        if (payload.test_telemetry) {
+          auto &counter = delta_applicable
+                              ? payload.test_telemetry
+                                    ->encoder_delta_binding_programs
+                              : payload.test_telemetry
+                                    ->encoder_full_binding_programs;
+          counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        PublishCompiledDirectAccessListForEncode(
+            enc, payload.direct_access, payload.test_telemetry.get());
         EncodeCompiledComputeBindings(
             enc, payload.packet, *payload.root_tables, payload.native_compute,
             payload.binding_state, *packet.pipeline,
@@ -22615,6 +22636,9 @@ private:
         encoder_cache.content_fingerprint =
             payload.binding_content_fingerprint;
         encoder_cache.binding_valid = true;
+      } else if (payload.test_telemetry) {
+        payload.test_telemetry->encoder_binding_program_hits.fetch_add(
+            1, std::memory_order_relaxed);
       }
     } else {
       encoder_cache.binding_program = nullptr;
@@ -24570,6 +24594,7 @@ private:
     CompiledDirectAccessList compiled_direct_access;
     std::shared_ptr<const CompiledBindingProgram> binding_program;
     CompiledBindingDelta binding_delta;
+    std::shared_ptr<CompiledCommandTestTelemetry> test_telemetry;
     uint64_t binding_generation = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
     uint64_t binding_content_fingerprint = 0;
@@ -24844,6 +24869,9 @@ private:
           binding_cache.content_fingerprint ==
               packet.binding_content_fingerprint;
       if (generation_hit) {
+        if (packet.test_telemetry)
+          packet.test_telemetry->encoder_binding_program_hits.fetch_add(
+              1, std::memory_order_relaxed);
         dxmt::perf::addFrameCounter(
             perf_stats,
             &dxmt::FrameStatistics::frame_compiled_draw_binding_generation_hits);
@@ -24856,7 +24884,8 @@ private:
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
           PublishCompiledDirectAccessListForEncode(
-              enc, packet.compiled_direct_access);
+              enc, packet.compiled_direct_access,
+              packet.test_telemetry.get());
         }
         {
           dxmt::perf::ScopedFrameDuration binding_scope(
@@ -24866,6 +24895,13 @@ private:
               binding_cache.valid && packet.binding_delta.base_program &&
               binding_cache.binding_program ==
                   packet.binding_delta.base_program.get();
+          if (packet.test_telemetry) {
+            auto &counter =
+                delta_applicable
+                    ? packet.test_telemetry->encoder_delta_binding_programs
+                    : packet.test_telemetry->encoder_full_binding_programs;
+            counter.fetch_add(1, std::memory_order_relaxed);
+          }
           EncodeCompiledDirectGraphicsBindings(
               enc, *packet.compiled_binding_payload,
               packet.compiled_binding_state, packet, argbuf_offset,

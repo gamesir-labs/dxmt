@@ -189,6 +189,57 @@ TEST_F(CompiledGenerationSpec, MergesComputeNodesAcrossElidedState) {
   ASSERT_EQ(context_.SignalAndWait(), S_OK);
   const auto submitted = ReadStats(context_.list());
   EXPECT_EQ(submitted.legacy_replay_records, 0u);
+  EXPECT_EQ(submitted.encoder_full_binding_programs, 1u);
+  EXPECT_EQ(submitted.encoder_delta_binding_programs, 1u);
+  EXPECT_EQ(submitted.encoder_binding_program_hits, 0u);
+}
+
+TEST_F(CompiledGenerationSpec, LowersDirectIndirectDispatchIntoComputeEncoder) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto shader = dxmt::test::CompileShader(
+      "[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(),
+      {shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+
+  const D3D12_DISPATCH_ARGUMENTS arguments = {1, 1, 1};
+  auto argument_buffer = context_.CreateUploadBuffer(
+      sizeof(arguments), &arguments, sizeof(arguments));
+  ASSERT_TRUE(argument_buffer);
+  D3D12_INDIRECT_ARGUMENT_DESC argument_desc = {};
+  argument_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+  D3D12_COMMAND_SIGNATURE_DESC signature_desc = {};
+  signature_desc.ByteStride = sizeof(arguments);
+  signature_desc.NumArgumentDescs = 1;
+  signature_desc.pArgumentDescs = &argument_desc;
+  ComPtr<ID3D12CommandSignature> signature;
+  ASSERT_EQ(context_.device()->CreateCommandSignature(
+                &signature_desc, nullptr, IID_PPV_ARGS(signature.put())),
+            S_OK);
+
+  EnableStats(context_.list());
+  context_.list()->SetPipelineState(pipeline.get());
+  context_.list()->SetComputeRootSignature(root_signature.get());
+  context_.list()->ExecuteIndirect(signature.get(), 1,
+                                   argument_buffer.get(), 0, nullptr, 0);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+  const auto closed = ReadStats(context_.list());
+  EXPECT_EQ(closed.compute_segments, 1u);
+  EXPECT_EQ(closed.compute_encoder_node_count, 1u);
+  EXPECT_EQ(closed.fallback_segments, 0u);
+
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  const auto submitted = ReadStats(context_.list());
+  EXPECT_EQ(submitted.replayed_indirect_nodes, 1u);
+  EXPECT_EQ(submitted.replayed_indirect_dependency_nodes, 0u);
+  EXPECT_EQ(submitted.replayed_indirect_fallbacks, 0u);
+  EXPECT_EQ(submitted.legacy_replay_records, 0u);
 }
 
 TEST_F(CompiledGenerationSpec, KeepsComputeEncoderAcrossInlineBarriers) {

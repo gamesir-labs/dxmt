@@ -106,6 +106,11 @@ struct ExecutionPathStats {
   std::uint32_t replayed_indirect_nodes = 0;
   std::uint32_t replayed_indirect_dependency_nodes = 0;
   std::uint32_t replayed_indirect_fallbacks = 0;
+  std::uint32_t encoder_full_binding_programs = 0;
+  std::uint32_t encoder_delta_binding_programs = 0;
+  std::uint32_t encoder_binding_program_hits = 0;
+  std::uint32_t encoder_resource_plan_publications = 0;
+  std::uint32_t encoder_resource_plan_reuses = 0;
   std::uint32_t encoder_graph_node_count = 0;
   std::uint32_t graphics_encoder_node_count = 0;
   std::uint32_t compute_encoder_node_count = 0;

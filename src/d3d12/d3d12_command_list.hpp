@@ -1076,6 +1076,11 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> replayed_indirect_nodes = 0;
   std::atomic<UINT> replayed_indirect_dependency_nodes = 0;
   std::atomic<UINT> replayed_indirect_fallbacks = 0;
+  std::atomic<UINT> encoder_full_binding_programs = 0;
+  std::atomic<UINT> encoder_delta_binding_programs = 0;
+  std::atomic<UINT> encoder_binding_program_hits = 0;
+  std::atomic<UINT> encoder_resource_plan_publications = 0;
+  std::atomic<UINT> encoder_resource_plan_reuses = 0;
   std::atomic<UINT> submitted_generation_shares = 0;
   std::atomic<UINT> submitted_generation_deep_copies = 0;
   std::atomic<UINT> encoder_attachment_materializations = 0;

@@ -4124,6 +4124,21 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
     stats.replayed_indirect_fallbacks =
         telemetry.replayed_indirect_fallbacks.load(
             std::memory_order_acquire);
+    stats.encoder_full_binding_programs =
+        telemetry.encoder_full_binding_programs.load(
+            std::memory_order_acquire);
+    stats.encoder_delta_binding_programs =
+        telemetry.encoder_delta_binding_programs.load(
+            std::memory_order_acquire);
+    stats.encoder_binding_program_hits =
+        telemetry.encoder_binding_program_hits.load(
+            std::memory_order_acquire);
+    stats.encoder_resource_plan_publications =
+        telemetry.encoder_resource_plan_publications.load(
+            std::memory_order_acquire);
+    stats.encoder_resource_plan_reuses =
+        telemetry.encoder_resource_plan_reuses.load(
+            std::memory_order_acquire);
     stats.replayed_compatibility_packets =
         stats.replayed_compiled_packet_fallbacks;
     stats.legacy_replay_records = stats.replayed_fallback_records;
