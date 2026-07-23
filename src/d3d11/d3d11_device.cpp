@@ -848,8 +848,32 @@ public:
       D3D_FEATURE_LEVEL *pChosenFeatureLevel,
       ID3DDeviceContextState **ppContextState) override {
     InitReturnPtr(ppContextState);
+    if (pChosenFeatureLevel)
+      *pChosenFeatureLevel = D3D_FEATURE_LEVEL(0);
 
-    // TODO: validation
+    if (!pFeatureLevels || FeatureLevels == 0 ||
+        SDKVersion != D3D11_SDK_VERSION ||
+        (Flags & ~D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED))
+      return E_INVALIDARG;
+
+    if (EmulatedInterface != __uuidof(ID3D10Device) &&
+        EmulatedInterface != __uuidof(ID3D10Device1) &&
+        EmulatedInterface != __uuidof(ID3D11Device) &&
+        EmulatedInterface != __uuidof(ID3D11Device1))
+      return E_INVALIDARG;
+
+    D3D_FEATURE_LEVEL chosen_feature_level = D3D_FEATURE_LEVEL(0);
+    for (UINT i = 0; i < FeatureLevels; ++i) {
+      if (pFeatureLevels[i] <= feature_level_) {
+        chosen_feature_level = pFeatureLevels[i];
+        break;
+      }
+    }
+    if (chosen_feature_level == D3D_FEATURE_LEVEL(0))
+      return E_INVALIDARG;
+
+    if (pChosenFeatureLevel)
+      *pChosenFeatureLevel = chosen_feature_level;
 
     if (ppContextState == nullptr) {
       return S_FALSE;
