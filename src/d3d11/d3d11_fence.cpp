@@ -204,7 +204,8 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
       D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
       D3D11_FENCE_FLAG_NON_MONITORED;
   const UINT flags = static_cast<UINT>(Flags);
-  if (!flags || (flags & ~kKnownFlags))
+  if (!flags || (flags & ~kKnownFlags) ||
+      (flags & D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER))
     return E_INVALIDARG;
 
   bool shared = !!(Flags & (D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER));

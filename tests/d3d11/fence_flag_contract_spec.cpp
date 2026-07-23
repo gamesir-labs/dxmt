@@ -23,19 +23,51 @@ struct FenceFlagCase {
 };
 
 constexpr std::array kFenceFlagCases = {
+    FenceFlagCase{0, E_INVALIDARG, E_INVALIDARG, "Zero"},
     FenceFlagCase{D3D11_FENCE_FLAG_NONE, S_OK, E_INVALIDARG, "None"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED, S_OK, S_OK, "Shared"},
-    FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, S_OK, S_OK,
-                  "SharedCrossAdapter"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED, S_OK, S_OK,
+                  "NoneShared"},
+    FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, E_INVALIDARG,
+                  E_INVALIDARG, "SharedCrossAdapter"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
+                  E_INVALIDARG, E_INVALIDARG, "NoneSharedCrossAdapter"},
+    FenceFlagCase{D3D11_FENCE_FLAG_SHARED |
+                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
+                  E_INVALIDARG, E_INVALIDARG, "SharedAndCrossAdapter"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
+                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
+                  E_INVALIDARG, E_INVALIDARG, "NoneSharedAndCrossAdapter"},
     FenceFlagCase{D3D11_FENCE_FLAG_NON_MONITORED, S_OK, E_INVALIDARG,
                   "NonMonitored"},
-    FenceFlagCase{0, E_INVALIDARG, E_INVALIDARG, "Zero"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_NON_MONITORED, S_OK,
+                  E_INVALIDARG, "NoneNonMonitored"},
+    FenceFlagCase{D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_NON_MONITORED,
+                  S_OK, S_OK, "SharedNonMonitored"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
+                      D3D11_FENCE_FLAG_NON_MONITORED,
+                  S_OK, S_OK, "NoneSharedNonMonitored"},
+    FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+                      D3D11_FENCE_FLAG_NON_MONITORED,
+                  E_INVALIDARG, E_INVALIDARG, "CrossAdapterNonMonitored"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE |
+                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+                      D3D11_FENCE_FLAG_NON_MONITORED,
+                  E_INVALIDARG, E_INVALIDARG, "NoneCrossAdapterNonMonitored"},
+    FenceFlagCase{D3D11_FENCE_FLAG_SHARED |
+                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+                      D3D11_FENCE_FLAG_NON_MONITORED,
+                  E_INVALIDARG, E_INVALIDARG, "SharedCrossAdapterNonMonitored"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
+                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+                      D3D11_FENCE_FLAG_NON_MONITORED,
+                  E_INVALIDARG, E_INVALIDARG, "AllDefined"},
     FenceFlagCase{0x10, E_INVALIDARG, E_INVALIDARG, "UnknownLowBit"},
     FenceFlagCase{0x80000000u, E_INVALIDARG, E_INVALIDARG, "UnknownHighBit"},
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kFenceFlagRegistration(
-    "D3D11FenceFlagContractSpec.CreatesOnlyDefinedFenceModes",
+    "D3D11FenceFlagContractSpec.ValidatesDefinedFlagCombinations",
     "D3D11.Fence.Flags.", kFenceFlagCases.size(), 1,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
@@ -46,16 +78,17 @@ const dxmt::test::LogicalCaseFamilyRegistration kFenceFlagRegistration(
      dxmt::test::kResourceTestCost,
      "one test-local D3D11 device, one fence, and at most one scoped NT "
      "handle per selected logical case",
-     "create fences with every individually defined D3D11 fence mode plus "
-     "zero and unknown low/high flag bits",
-     "all defined modes create a fence at the requested initial value, only "
-     "shared modes export a handle, and undefined flag values are rejected",
+     "create fences with every bitwise combination of the four defined D3D11 "
+     "fence values plus zero and unknown low/high flag bits",
+     "supported combinations create a fence at the requested initial value, "
+     "shared combinations export a handle, and cross-adapter, zero, or "
+     "unknown flag values are rejected",
      "logical ID, flags, creation and sharing HRESULTs, completed value, "
      "handle value, device health, and exact replay argument"});
 
-const dxmt::test::TestCostRegistration
-    kFenceFlagCost("D3D11FenceFlagContractSpec.CreatesOnlyDefinedFenceModes",
-                   dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kFenceFlagCost(
+    "D3D11FenceFlagContractSpec.ValidatesDefinedFlagCombinations",
+    dxmt::test::kResourceTestCost);
 
 struct ScopedHandle {
   ScopedHandle() = default;
@@ -84,7 +117,7 @@ protected:
   ComPtr<ID3D11Device5> device5_;
 };
 
-TEST_F(D3D11FenceFlagContractSpec, CreatesOnlyDefinedFenceModes) {
+TEST_F(D3D11FenceFlagContractSpec, ValidatesDefinedFlagCombinations) {
   std::uint32_t selected_count = 0;
   for (std::uint32_t logical = 0; logical < kFenceFlagCases.size(); ++logical) {
     if (!dxmt::test::LogicalCaseSelected(kFenceFlagRegistration.family(),
