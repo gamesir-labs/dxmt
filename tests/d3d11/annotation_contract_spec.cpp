@@ -88,7 +88,7 @@ TEST_F(D3D11AnnotationContractSpec, ExposesDisabledAnnotationContracts) {
     HRESULT annotation_identity_result = E_FAIL;
     INT begin_result = 0;
     INT end_result = 0;
-    WINBOOL status = TRUE;
+    BOOL status = TRUE;
     if (query_result == S_OK && annotation) {
       context_identity_result = test_case.context->QueryInterface(
           __uuidof(IUnknown),

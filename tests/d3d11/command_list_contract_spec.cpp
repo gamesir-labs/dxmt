@@ -15,8 +15,8 @@ namespace {
 using dxmt::test::ComPtr;
 using dxmt::test::D3D11TestContext;
 
-constexpr std::array<WINBOOL, 2> kRestoreCases = {FALSE, TRUE};
-constexpr std::array<WINBOOL, 2> kImmediateWorkCases = {FALSE, TRUE};
+constexpr std::array<BOOL, 2> kRestoreCases = {FALSE, TRUE};
+constexpr std::array<BOOL, 2> kImmediateWorkCases = {FALSE, TRUE};
 
 constexpr GUID kCommandListDataKey = {
     0x9f149175,

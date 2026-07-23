@@ -104,7 +104,7 @@ TEST_F(D3D11DxgiResourceOfferContractSpec,
 
     const HRESULT offer_result =
         dxgi_device2_->OfferResources(1, resources, test_case.priority);
-    WINBOOL discarded = std::numeric_limits<WINBOOL>::max();
+    BOOL discarded = std::numeric_limits<BOOL>::max();
     const HRESULT reclaim_result =
         dxgi_device2_->ReclaimResources(1, resources, &discarded);
     const bool valid = offer_result == S_OK && reclaim_result == S_OK &&

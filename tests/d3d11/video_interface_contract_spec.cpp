@@ -166,7 +166,7 @@ TEST_F(D3D11VideoInterfaceContractSpec,
                 reinterpret_cast<void **>(video_device.put())),
             S_OK);
 
-  WINBOOL supported = TRUE;
+  BOOL supported = TRUE;
   ASSERT_EQ(video_device->CheckVideoDecoderFormat(&kUnknownDecoderProfile,
                                                   DXGI_FORMAT_NV12, &supported),
             S_OK);

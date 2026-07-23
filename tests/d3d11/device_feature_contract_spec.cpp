@@ -60,7 +60,7 @@ const dxmt::test::TestCostRegistration kFeatureCost(
     "D3D11DeviceFeatureContractSpec.ReturnsWellFormedFeatureStructures",
     dxmt::test::kResourceTestCost);
 
-bool IsBool(WINBOOL value) { return value == FALSE || value == TRUE; }
+bool IsBool(BOOL value) { return value == FALSE || value == TRUE; }
 
 ::testing::AssertionResult ValidateFeature(ID3D11Device *device,
                                            std::uint32_t logical) {
@@ -101,7 +101,7 @@ bool IsBool(WINBOOL value) { return value == FALSE || value == TRUE; }
   case D3D11_FEATURE_D3D11_OPTIONS: {
     D3D11_FEATURE_DATA_D3D11_OPTIONS data = {};
     result = device->CheckFeatureSupport(feature, &data, sizeof(data));
-    const WINBOOL values[] = {
+    const BOOL values[] = {
         data.OutputMergerLogicOp,
         data.UAVOnlyRenderingForcedSampleCount,
         data.DiscardAPIsSeenByDriver,
@@ -118,7 +118,7 @@ bool IsBool(WINBOOL value) { return value == FALSE || value == TRUE; }
         data.ExtendedResourceSharing,
     };
     bool valid = result == S_OK;
-    for (const WINBOOL value : values)
+    for (const BOOL value : values)
       valid = valid && IsBool(value);
     if (valid)
       return ::testing::AssertionSuccess();
