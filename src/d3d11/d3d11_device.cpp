@@ -873,6 +873,13 @@ public:
         (Flags & ~D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED))
       return E_INVALIDARG;
 
+    const bool device_singlethreaded =
+        feature_flags_ & D3D11_CREATE_DEVICE_SINGLETHREADED;
+    const bool state_singlethreaded =
+        Flags & D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED;
+    if (device_singlethreaded != state_singlethreaded)
+      return E_INVALIDARG;
+
     if (EmulatedInterface != __uuidof(ID3D10Device) &&
         EmulatedInterface != __uuidof(ID3D10Device1) &&
         EmulatedInterface != __uuidof(ID3D11Device) &&

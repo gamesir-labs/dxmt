@@ -47,7 +47,8 @@ const dxmt::test::LogicalCaseFamilyRegistration kContextStateCasesRegistration(
      "one test-local D3D11 device and one live device-context-state object per "
      "selected logical case",
      "create context-state objects for ID3D11Device and ID3D11Device1 "
-     "emulation with both defined threading flag modes",
+     "emulation on devices with matching multithreaded and singlethreaded "
+     "creation modes",
      "each creation chooses the requested device feature level, returns an "
      "ID3D11DeviceChild owned by the creating device, and preserves one COM "
      "identity across its public interfaces",
@@ -90,9 +91,31 @@ TEST_F(D3D11DeviceContextStateContractSpec, CreatesSupportedD3D11Modes) {
   for (const std::uint32_t logical : selected_cases) {
     const ContextStateCase &test_case = kContextStateCases[logical];
     const D3D_FEATURE_LEVEL requested_level = context_.feature_level();
+    ComPtr<ID3D11Device> singlethreaded_device;
+    ComPtr<ID3D11DeviceContext> singlethreaded_context;
+    ComPtr<ID3D11Device1> singlethreaded_device1;
+    ID3D11Device *expected_owner = context_.device();
+    ID3D11Device1 *creation_device = device1_.get();
+    if (test_case.flags & D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED) {
+      D3D_FEATURE_LEVEL actual_level = D3D_FEATURE_LEVEL(0);
+      ASSERT_EQ(D3D11CreateDevice(context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN,
+                                  nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED,
+                                  &requested_level, 1, D3D11_SDK_VERSION,
+                                  singlethreaded_device.put(), &actual_level,
+                                  singlethreaded_context.put()),
+                S_OK);
+      ASSERT_EQ(actual_level, requested_level);
+      ASSERT_EQ(singlethreaded_device->QueryInterface(
+                    __uuidof(ID3D11Device1),
+                    reinterpret_cast<void **>(singlethreaded_device1.put())),
+                S_OK);
+      expected_owner = singlethreaded_device.get();
+      creation_device = singlethreaded_device1.get();
+    }
+
     D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL(0);
     ComPtr<ID3DDeviceContextState> state;
-    const HRESULT create_result = device1_->CreateDeviceContextState(
+    const HRESULT create_result = creation_device->CreateDeviceContextState(
         test_case.flags, &requested_level, 1, D3D11_SDK_VERSION,
         *test_case.emulated_interface, &chosen_level, state.put());
 
@@ -116,12 +139,12 @@ TEST_F(D3D11DeviceContextStateContractSpec, CreatesSupportedD3D11Modes) {
       }
     }
 
-    const bool valid =
-        create_result == S_OK && state && chosen_level == requested_level &&
-        owner.get() == context_.device() && child_result == S_OK && child &&
-        state_identity_result == S_OK && state_identity &&
-        child_identity_result == S_OK &&
-        child_identity.get() == state_identity.get();
+    const bool valid = create_result == S_OK && state &&
+                       chosen_level == requested_level &&
+                       owner.get() == expected_owner && child_result == S_OK &&
+                       child && state_identity_result == S_OK &&
+                       state_identity && child_identity_result == S_OK &&
+                       child_identity.get() == state_identity.get();
     if (valid)
       continue;
 
@@ -139,7 +162,7 @@ TEST_F(D3D11DeviceContextStateContractSpec, CreatesSupportedD3D11Modes) {
         << " selected_cases=" << selected_cases.size() << '\n'
         << "Expected: create_hresult=" << S_OK << " child_hresult=" << S_OK
         << " identity_hresult=" << S_OK << " chosen_level=" << requested_level
-        << " owner=" << context_.device() << '\n'
+        << " owner=" << expected_owner << '\n'
         << "Observed: create_hresult=" << create_result
         << " child_hresult=" << child_result
         << " state_identity_hresult=" << state_identity_result
@@ -174,12 +197,14 @@ TEST_F(D3D11DeviceContextStateContractSpec, RejectsInvalidCreationInputs) {
     EXPECT_EQ(state, nullptr);
   };
 
-  expect_invalid(0, nullptr, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device));
   expect_invalid(0, &requested_level, 0, D3D11_SDK_VERSION,
                  __uuidof(ID3D11Device));
   expect_invalid(0, &requested_level, 1, 0, __uuidof(ID3D11Device));
   expect_invalid(0, &requested_level, 1, D3D11_SDK_VERSION, __uuidof(IUnknown));
   expect_invalid(0x80000000u, &requested_level, 1, D3D11_SDK_VERSION,
+                 __uuidof(ID3D11Device));
+  expect_invalid(D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED,
+                 &requested_level, 1, D3D11_SDK_VERSION,
                  __uuidof(ID3D11Device));
 
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
