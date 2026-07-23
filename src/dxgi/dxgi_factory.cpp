@@ -434,14 +434,14 @@ public:
       auto info = static_cast<BOOL *>(pFeatureSupportData);
 
       if (FeatureSupportDataSize != sizeof(*info))
-        return ERR_E_INVALIDARG(__func__);
+        return DXGI_ERROR_INVALID_CALL;
 
       *info = TRUE;
       return S_OK;
     }
     default: {
       ERR("DXGIFactory::CheckFeatureSupport: unknown feature ", Feature);
-      return ERR_E_INVALIDARG(__func__);
+      return DXGI_ERROR_INVALID_CALL;
     }
     }
   };
