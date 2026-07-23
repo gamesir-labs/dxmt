@@ -62,6 +62,14 @@ IsTextureViewRangeValid(const TextureViewDescriptor &view, UINT mip_levels,
          view.arraySize <= array_size - view.firstArraySlice;
 }
 
+static bool
+IsTypedTextureViewFormat(MTLD3D11Device *device, DXGI_FORMAT format) {
+  MTL_DXGI_FORMAT_DESC format_desc;
+  return SUCCEEDED(
+             MTLQueryDXGIFormat(device->GetMTLDevice(), format, format_desc)) &&
+         !(format_desc.Flag & MTL_DXGI_FORMAT_TYPELESS);
+}
+
 static constexpr SIZE_T kD3DKMTExistingHeapPageSize = 0x1000;
 
 static SIZE_T
@@ -332,6 +340,8 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    if (!IsTypedTextureViewFormat(this->m_parent, finalDesc.Format))
+      return E_INVALIDARG;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
       if (finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE3D) {
         if (finalDesc.Texture3D.MipSlice >= this->desc.MipLevels)
@@ -422,6 +432,8 @@ public:
       ERR("DeviceTexture: Failed to create SRV descriptor");
       return E_INVALIDARG;
     }
+    if (!IsTypedTextureViewFormat(this->m_parent, finalDesc.Format))
+      return E_INVALIDARG;
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -453,6 +465,8 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    if (!IsTypedTextureViewFormat(this->m_parent, finalDesc.Format))
+      return E_INVALIDARG;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
       if (finalDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D) {
         if (finalDesc.Texture3D.MipSlice >= this->desc.MipLevels)

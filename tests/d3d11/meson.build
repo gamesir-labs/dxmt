@@ -29,6 +29,7 @@ d3d11_unit_sources = files(
   'depth_stencil_state_binding_matrix_spec.cpp',
   'depth_stencil_state_desc_matrix_spec.cpp',
   'view_matrix_spec.cpp',
+  'texture_view_format_contract_spec.cpp',
   'shader_resource_view_desc_matrix_spec.cpp',
   'buffer_shader_resource_view_desc_matrix_spec.cpp',
   'texture_cube_array_shader_resource_view_desc_matrix_spec.cpp',
