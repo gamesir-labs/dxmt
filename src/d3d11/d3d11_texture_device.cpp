@@ -375,9 +375,18 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDepthStencilView(const D3D11_DEPTH_STENCIL_VIEW_DESC *pDesc,
                                  ID3D11DepthStencilView **ppView) override {
-    D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc;
+    D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc = {};
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
+      return E_INVALIDARG;
+    }
+    switch (finalDesc.Format) {
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      break;
+    default:
       return E_INVALIDARG;
     }
     TextureViewDescriptor descriptor;
