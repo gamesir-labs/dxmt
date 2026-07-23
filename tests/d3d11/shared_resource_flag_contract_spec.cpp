@@ -41,6 +41,19 @@ constexpr std::array kSharedFlagCases = {
                    "MutuallyExclusiveLegacyFlags"},
 };
 
+struct SharedAccessCase {
+  DWORD access;
+  const char *name;
+};
+
+constexpr std::array kSharedAccessCases = {
+    SharedAccessCase{GENERIC_ALL, "GenericAll"},
+    SharedAccessCase{DXGI_SHARED_RESOURCE_READ, "Read"},
+    SharedAccessCase{DXGI_SHARED_RESOURCE_WRITE, "Write"},
+    SharedAccessCase{DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                     "ReadWrite"},
+};
+
 const dxmt::test::LogicalCaseFamilyRegistration kSharedFlagRegistration(
     "D3D11SharedResourceFlagContractSpec.ExposesSharingInterfacesByFlag",
     "D3D11.SharedResource.Flags.", kSharedFlagCases.size(), 1,
@@ -62,9 +75,33 @@ const dxmt::test::LogicalCaseFamilyRegistration kSharedFlagRegistration(
      "logical ID, flags, creation HRESULT, handle HRESULTs and values, keyed "
      "mutex HRESULT, description, device health, and exact replay argument"});
 
+const dxmt::test::LogicalCaseFamilyRegistration kSharedAccessRegistration(
+    "D3D11SharedResourceFlagContractSpec."
+    "CreatesNtHandlesWithDocumentedAccess",
+    "D3D11.SharedResource.NtHandle.Access.", kSharedAccessCases.size(), 1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "D3D11_RESOURCE_MISC_SHARED_NTHANDLE,IDXGIResource1,"
+      "CreateSharedHandle,GENERIC_ALL,DXGI_SHARED_RESOURCE_READ,"
+      "DXGI_SHARED_RESOURCE_WRITE,GetHandleInformation"},
+     dxmt::test::kResourceTestCost,
+     "one test-local D3D11 device, one NT-shareable texture, and one scoped "
+     "anonymous NT handle at a time",
+     "create shared handles with each documented generic, read, write, and "
+     "combined DXGI access mask",
+     "every documented access mask returns a valid Win32 handle without "
+     "removing the device",
+     "logical ID, access mask, creation HRESULT, handle value and flags, "
+     "device health, and exact replay argument"});
+
 const dxmt::test::TestCostRegistration kSharedFlagCost(
     "D3D11SharedResourceFlagContractSpec.ExposesSharingInterfacesByFlag",
     dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kSharedAccessCost("D3D11SharedResourceFlagContractSpec."
+                      "CreatesNtHandlesWithDocumentedAccess",
+                      dxmt::test::kResourceTestCost);
 
 struct ScopedNtHandle {
   ScopedNtHandle() = default;
@@ -178,6 +215,49 @@ TEST_F(D3D11SharedResourceFlagContractSpec, ExposesSharingInterfacesByFlag) {
   RecordProperty("logical_cases_executed", selected_count);
   RecordProperty("logical_case_prefix",
                  kSharedFlagRegistration.family().case_id_prefix);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedResourceFlagContractSpec,
+       CreatesNtHandlesWithDocumentedAccess) {
+  const D3D11_TEXTURE2D_DESC desc =
+      TextureDesc(D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+  ComPtr<ID3D11Texture2D> texture;
+  ASSERT_EQ(context_.device()->CreateTexture2D(&desc, nullptr, texture.put()),
+            S_OK);
+  ComPtr<IDXGIResource1> resource1;
+  ASSERT_EQ(texture->QueryInterface(__uuidof(IDXGIResource1),
+                                    reinterpret_cast<void **>(resource1.put())),
+            S_OK);
+
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kSharedAccessCases.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kSharedAccessRegistration.family(),
+                                         logical))
+      continue;
+    ++selected_count;
+    const SharedAccessCase &test_case = kSharedAccessCases[logical];
+    const auto case_id =
+        dxmt::test::LogicalCaseId(kSharedAccessRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message()
+                 << "LogicalCaseId: " << case_id << " case=" << test_case.name
+                 << " access=" << test_case.access
+                 << " Replay: --dxmt-case-id=" << case_id);
+
+    ScopedNtHandle handle;
+    ASSERT_EQ(resource1->CreateSharedHandle(nullptr, test_case.access, nullptr,
+                                            &handle.handle),
+              S_OK);
+    ASSERT_NE(handle.handle, nullptr);
+    DWORD handle_flags = 0;
+    EXPECT_TRUE(GetHandleInformation(handle.handle, &handle_flags));
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kSharedAccessRegistration.family().case_id_prefix);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
