@@ -104,6 +104,7 @@ d3d11_unit_sources = files(
   'counter_contract_spec.cpp',
   'device_exception_mode_contract_spec.cpp',
   'dxgi_device_residency_contract_spec.cpp',
+  'dxgi_resource_offer_contract_spec.cpp',
   'dxgi_device_scheduling_contract_spec.cpp',
   'fence_synchronization_contract_spec.cpp',
   'counter_execution_contract_spec.cpp',

@@ -1646,14 +1646,30 @@ public:
   HRESULT STDMETHODCALLTYPE
       OfferResources(UINT NumResources, IDXGIResource *const *ppResources,
                      DXGI_OFFER_RESOURCE_PRIORITY Priority) override {
-    // stub
+    if (Priority < DXGI_OFFER_RESOURCE_PRIORITY_LOW ||
+        Priority > DXGI_OFFER_RESOURCE_PRIORITY_HIGH ||
+        (NumResources && !ppResources))
+      return E_INVALIDARG;
+    for (UINT i = 0; i < NumResources; ++i) {
+      if (!ppResources[i])
+        return E_INVALIDARG;
+    }
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE ReclaimResources(UINT NumResources,
                                              IDXGIResource *const *ppResources,
                                              WINBOOL *pDiscarded) override {
-    // stub
+    if (NumResources && !ppResources)
+      return E_INVALIDARG;
+    for (UINT i = 0; i < NumResources; ++i) {
+      if (!ppResources[i])
+        return E_INVALIDARG;
+    }
+    if (pDiscarded) {
+      for (UINT i = 0; i < NumResources; ++i)
+        pDiscarded[i] = FALSE;
+    }
     return S_OK;
   }
 
