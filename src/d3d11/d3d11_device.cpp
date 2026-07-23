@@ -1076,6 +1076,13 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDeferredContext3(
     UINT ContextFlags, ID3D11DeviceContext3 **ppDeferredContext) override {
+    InitReturnPtr(ppDeferredContext);
+    if (ContextFlags)
+      return E_INVALIDARG;
+    if (feature_flags_ & D3D11_CREATE_DEVICE_SINGLETHREADED)
+      return DXGI_ERROR_INVALID_CALL;
+    if (!ppDeferredContext)
+      return S_FALSE;
     *ppDeferredContext = std::move(dxmt::CreateDeferredContext(this, ContextFlags));
     return S_OK;
   }
