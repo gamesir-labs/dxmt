@@ -2,6 +2,7 @@ d3d11_unit_sources = files(
   'device_spec.cpp',
   'device_creation_contract_spec.cpp',
   'shared_resource_contract_spec.cpp',
+  'shared_resource_flag_contract_spec.cpp',
   'shared_nt_handle_contract_spec.cpp',
   'shared_named_resource_contract_spec.cpp',
   'capability_spec.cpp',
