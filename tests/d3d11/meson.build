@@ -27,6 +27,7 @@ d3d11_unit_sources = files(
   'query_matrix_spec.cpp',
   'predication_binding_matrix_spec.cpp',
   'query_contract_spec.cpp',
+  'query1_desc_matrix_spec.cpp',
   'depth_stencil_matrix_spec.cpp',
   'depth_stencil_state_binding_matrix_spec.cpp',
   'depth_stencil_state_desc_matrix_spec.cpp',
