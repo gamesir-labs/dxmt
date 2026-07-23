@@ -5,15 +5,32 @@
 #include <d3d11_4.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cwchar>
 
 // Public D3D11.4 fence synchronization coverage. Devices, contexts, fences,
-// and events are test-local; event waits observe queue completion rather than
-// relying on sleeps or shared queue ordering, so these cases are parallel-safe.
+// and events are test-local; named objects combine the process ID, a monotonic
+// clock sample, and an atomic sequence so separate scheduler invocations cannot
+// collide. Event waits observe queue completion rather than relying on sleeps
+// or shared queue ordering, so these cases are parallel-safe.
 
 namespace {
 
 using dxmt::test::ComPtr;
 using dxmt::test::D3D11TestContext;
+
+const dxmt::test::TestCostRegistration kSharedFenceSynchronizationCost(
+    "D3D11FenceSynchronizationContractSpec."
+    "SharedFenceSynchronizesBidirectionallyAcrossDevices",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kNamedDuplicatedFenceCost("D3D11FenceSynchronizationContractSpec."
+                              "OpensNamedFenceThroughDuplicatedHandle",
+                              dxmt::test::kResourceTestCost);
+
+std::atomic<std::uint32_t> g_next_fence_name_id{0};
 
 struct ScopedEvent {
   ScopedEvent() : handle(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
@@ -22,6 +39,19 @@ struct ScopedEvent {
   ScopedEvent &operator=(const ScopedEvent &) = delete;
 
   ~ScopedEvent() {
+    if (handle)
+      CloseHandle(handle);
+  }
+
+  HANDLE handle = nullptr;
+};
+
+struct ScopedNtHandle {
+  ScopedNtHandle() = default;
+  ScopedNtHandle(const ScopedNtHandle &) = delete;
+  ScopedNtHandle &operator=(const ScopedNtHandle &) = delete;
+
+  ~ScopedNtHandle() {
     if (handle)
       CloseHandle(handle);
   }
@@ -141,6 +171,133 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   EXPECT_TRUE(FAILED(wait_result));
   EXPECT_EQ(fence->GetCompletedValue(), 0u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceSynchronizationContractSpec,
+       SharedFenceSynchronizesBidirectionallyAcrossDevices) {
+  constexpr D3D_FEATURE_LEVEL kFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+  D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
+  ComPtr<ID3D11Device> second_device;
+  ComPtr<ID3D11DeviceContext> second_context;
+  ASSERT_EQ(D3D11CreateDevice(context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN,
+                              nullptr, 0, &kFeatureLevel, 1, D3D11_SDK_VERSION,
+                              second_device.put(), &chosen_level,
+                              second_context.put()),
+            S_OK);
+  ASSERT_EQ(chosen_level, kFeatureLevel);
+  ComPtr<ID3D11Device5> second_device5;
+  ComPtr<ID3D11DeviceContext4> second_context4;
+  ASSERT_EQ(second_device->QueryInterface(
+                __uuidof(ID3D11Device5),
+                reinterpret_cast<void **>(second_device5.put())),
+            S_OK);
+  ASSERT_EQ(second_context->QueryInterface(
+                __uuidof(ID3D11DeviceContext4),
+                reinterpret_cast<void **>(second_context4.put())),
+            S_OK);
+
+  ComPtr<ID3D11Fence> creator_fence;
+  ASSERT_EQ(
+      device5_->CreateFence(3, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                            reinterpret_cast<void **>(creator_fence.put())),
+      S_OK);
+  ScopedNtHandle shared_handle;
+  ASSERT_EQ(creator_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                              &shared_handle.handle),
+            S_OK);
+  ASSERT_NE(shared_handle.handle, nullptr);
+
+  ComPtr<ID3D11Fence> opened_fence;
+  ASSERT_EQ(second_device5->OpenSharedFence(
+                shared_handle.handle, __uuidof(ID3D11Fence),
+                reinterpret_cast<void **>(opened_fence.put())),
+            S_OK);
+  ASSERT_TRUE(opened_fence);
+  EXPECT_EQ(opened_fence->GetCompletedValue(), 3u);
+  ComPtr<ID3D11Device> opened_owner;
+  opened_fence->GetDevice(opened_owner.put());
+  EXPECT_EQ(opened_owner.get(), second_device.get());
+
+  ScopedEvent opened_event;
+  ASSERT_NE(opened_event.handle, nullptr);
+  ASSERT_EQ(opened_fence->SetEventOnCompletion(11, opened_event.handle), S_OK);
+  ASSERT_EQ(immediate4_->Signal(creator_fence.get(), 11), S_OK);
+  ASSERT_EQ(WaitForSingleObject(opened_event.handle, 5000), WAIT_OBJECT_0);
+  EXPECT_GE(opened_fence->GetCompletedValue(), 11u);
+
+  ScopedEvent creator_event;
+  ASSERT_NE(creator_event.handle, nullptr);
+  ASSERT_EQ(creator_fence->SetEventOnCompletion(17, creator_event.handle),
+            S_OK);
+  ASSERT_EQ(second_context4->Signal(opened_fence.get(), 17), S_OK);
+  ASSERT_EQ(WaitForSingleObject(creator_event.handle, 5000), WAIT_OBJECT_0);
+  EXPECT_GE(creator_fence->GetCompletedValue(), 17u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceSynchronizationContractSpec,
+       OpensNamedFenceThroughDuplicatedHandle) {
+  constexpr D3D_FEATURE_LEVEL kFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+  D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
+  ComPtr<ID3D11Device> second_device;
+  ComPtr<ID3D11DeviceContext> second_context;
+  ASSERT_EQ(D3D11CreateDevice(context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN,
+                              nullptr, 0, &kFeatureLevel, 1, D3D11_SDK_VERSION,
+                              second_device.put(), &chosen_level,
+                              second_context.put()),
+            S_OK);
+  ASSERT_EQ(chosen_level, kFeatureLevel);
+  ComPtr<ID3D11Device5> second_device5;
+  ASSERT_EQ(second_device->QueryInterface(
+                __uuidof(ID3D11Device5),
+                reinterpret_cast<void **>(second_device5.put())),
+            S_OK);
+
+  ComPtr<ID3D11Fence> creator_fence;
+  ASSERT_EQ(
+      device5_->CreateFence(29, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                            reinterpret_cast<void **>(creator_fence.put())),
+      S_OK);
+
+  std::array<wchar_t, MAX_PATH> shared_name = {};
+  const std::uint32_t name_id =
+      g_next_fence_name_id.fetch_add(1, std::memory_order_relaxed);
+  const auto run_id = static_cast<unsigned long long>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const int name_length = std::swprintf(
+      shared_name.data(), shared_name.size(),
+      L"DXMT_D3D11_SharedFence_%lu_%llu_%u",
+      static_cast<unsigned long>(GetCurrentProcessId()), run_id, name_id);
+  ASSERT_GT(name_length, 0);
+  ASSERT_LT(static_cast<std::size_t>(name_length), shared_name.size());
+
+  ScopedNtHandle named_handle;
+  ASSERT_EQ(creator_fence->CreateSharedHandle(
+                nullptr, GENERIC_ALL, shared_name.data(), &named_handle.handle),
+            S_OK);
+  ASSERT_NE(named_handle.handle, nullptr);
+
+  ScopedNtHandle duplicate_handle;
+  ASSERT_TRUE(DuplicateHandle(GetCurrentProcess(), named_handle.handle,
+                              GetCurrentProcess(), &duplicate_handle.handle, 0,
+                              FALSE, DUPLICATE_SAME_ACCESS));
+  ASSERT_NE(duplicate_handle.handle, nullptr);
+  ASSERT_TRUE(CloseHandle(named_handle.handle));
+  named_handle.handle = nullptr;
+
+  ComPtr<ID3D11Fence> opened_fence;
+  ASSERT_EQ(second_device5->OpenSharedFence(
+                duplicate_handle.handle, __uuidof(ID3D11Fence),
+                reinterpret_cast<void **>(opened_fence.put())),
+            S_OK);
+  ASSERT_TRUE(opened_fence);
+  EXPECT_EQ(opened_fence->GetCompletedValue(), 29u);
+  ComPtr<ID3D11Device> opened_owner;
+  opened_fence->GetDevice(opened_owner.put());
+  EXPECT_EQ(opened_owner.get(), second_device.get());
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace

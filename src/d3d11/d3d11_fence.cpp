@@ -3,7 +3,69 @@
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 
+#include <cstdint>
+#include <cstdio>
+
 namespace dxmt {
+
+namespace {
+
+constexpr ULONG kObjectNameInformation = 1;
+
+using NtQueryObjectProc =
+    NTSTATUS(WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+void
+MakeSharedFenceBootstrapName(const WCHAR *name, size_t length,
+                             char (&bootstrap_name)[54]) {
+  constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+  constexpr uint64_t kFnvPrime = 1099511628211ull;
+  uint64_t forward = kFnvOffset;
+  uint64_t reverse = kFnvOffset ^ 0x9e3779b97f4a7c15ull;
+
+  for (size_t i = 0; i < length; ++i) {
+    const uint16_t value = static_cast<uint16_t>(name[i]);
+    forward = (forward ^ static_cast<uint8_t>(value)) * kFnvPrime;
+    forward = (forward ^ static_cast<uint8_t>(value >> 8)) * kFnvPrime;
+  }
+  for (size_t i = length; i > 0; --i) {
+    const uint16_t value = static_cast<uint16_t>(name[i - 1]);
+    reverse = (reverse ^ static_cast<uint8_t>(value >> 8)) * kFnvPrime;
+    reverse = (reverse ^ static_cast<uint8_t>(value)) * kFnvPrime;
+  }
+
+  std::snprintf(bootstrap_name, sizeof(bootstrap_name),
+                "DXMT_shared_fence_%016llx%016llx",
+                static_cast<unsigned long long>(forward),
+                static_cast<unsigned long long>(reverse));
+}
+
+bool
+GetSharedFenceBootstrapName(HANDLE handle, char (&bootstrap_name)[54]) {
+  const auto query_object = reinterpret_cast<NtQueryObjectProc>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+  if (!query_object)
+    return false;
+
+  alignas(void *) char buffer[sizeof(UNICODE_STRING) +
+                              MAX_PATH * sizeof(WCHAR) + 16] = {};
+  ULONG returned_size = 0;
+  if (query_object(handle, kObjectNameInformation, buffer, sizeof(buffer),
+                   &returned_size))
+    return false;
+
+  const auto *object_name = reinterpret_cast<const UNICODE_STRING *>(buffer);
+  if (!object_name->Buffer || !object_name->Length ||
+      object_name->Length % sizeof(WCHAR) || returned_size > sizeof(buffer) ||
+      returned_size < sizeof(UNICODE_STRING) + object_name->Length)
+    return false;
+
+  MakeSharedFenceBootstrapName(
+      object_name->Buffer, object_name->Length / sizeof(WCHAR), bootstrap_name);
+  return true;
+}
+
+} // namespace
 
 class MTLD3D11FenceImpl : public MTLD3D11DeviceChild<MTLD3D11Fence> {
 public:
@@ -56,24 +118,50 @@ public:
         attr.Attributes |= OBJ_INHERIT;
     }
 
+    char anonymous_name[54];
+    WCHAR anonymous_name_wide[ARRAYSIZE(anonymous_name)] = {};
+    if (!Name) {
+      MakeUniqueSharedName(anonymous_name);
+      for (size_t i = 0; anonymous_name[i]; ++i)
+        anonymous_name_wide[i] = static_cast<unsigned char>(anonymous_name[i]);
+      Name = anonymous_name_wide;
+    }
+
     WCHAR buffer[MAX_PATH];
     UNICODE_STRING name_str;
-    if (Name) {
-      DWORD session, len, name_len = wcslen(Name);
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session))
+      return E_FAIL;
+    const int prefix_length =
+        swprintf(buffer, ARRAYSIZE(buffer),
+                 L"\\Sessions\\%u\\BaseNamedObjects\\", session);
+    const size_t name_length = wcslen(Name);
+    if (prefix_length < 0 || static_cast<size_t>(prefix_length) + name_length >=
+                                 ARRAYSIZE(buffer))
+      return E_INVALIDARG;
+    memcpy(buffer + prefix_length, Name, (name_length + 1) * sizeof(WCHAR));
+    name_str.Length =
+        (static_cast<size_t>(prefix_length) + name_length) * sizeof(WCHAR);
+    name_str.MaximumLength = name_str.Length + sizeof(WCHAR);
+    name_str.Buffer = buffer;
 
-      ProcessIdToSessionId(GetCurrentProcessId(), &session);
-      len = swprintf(buffer, ARRAYSIZE(buffer), L"\\Sessions\\%u\\BaseNamedObjects\\", session);
-      memcpy(buffer + len, Name, (name_len + 1) * sizeof(WCHAR));
-      name_str.MaximumLength = name_str.Length = (len + name_len) * sizeof(WCHAR);
-      name_str.MaximumLength += sizeof(WCHAR);
-      name_str.Buffer = buffer;
-
-      attr.ObjectName = &name_str;
-      attr.Attributes |= OBJ_CASE_INSENSITIVE;
-    }
+    attr.ObjectName = &name_str;
+    attr.Attributes |= OBJ_CASE_INSENSITIVE;
 
     if (D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle)) {
       ERR("D3D11Fence: Failed to create shared handle");
+      return E_FAIL;
+    }
+
+    mach_port_t mach_port = event.createMachPort();
+    char bootstrap_name[54];
+    MakeSharedFenceBootstrapName(
+        buffer, static_cast<size_t>(prefix_length) + name_length,
+        bootstrap_name);
+    if (!mach_port || !WMTBootstrapRegister(bootstrap_name, mach_port)) {
+      CloseHandle(*pHandle);
+      *pHandle = nullptr;
+      ERR("D3D11Fence: Failed to register shared event");
       return E_FAIL;
     }
 
@@ -120,27 +208,6 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
       return E_FAIL;
     }
     local_kmt = create.hSyncObject;
-
-    mach_port_t mach_port = event.createMachPort();
-    if (!mach_port) {
-      ERR("D3D11Fence: Failed to create mach port for shared fence");
-      return E_FAIL;
-    }
-    char mach_port_name[54];
-    MakeUniqueSharedName(mach_port_name);
-    if (!WMTBootstrapRegister(mach_port_name, mach_port)) {
-      ERR("D3D11Fence: Failed to register mach port for shared fence");
-      return E_FAIL;
-    }
-    D3DKMT_ESCAPE escape = {};
-    escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
-    escape.pPrivateDriverData = mach_port_name;
-    escape.PrivateDriverDataSize = sizeof(mach_port_name);
-    escape.hContext = local_kmt;
-    if (!D3DKMTEscape(&escape)) {
-      ERR("D3D11Fence: Failed to escape mach port for shared fence");
-      return E_FAIL;
-    }
   }
   event.signalValue(InitialValue);
   auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event), local_kmt);
@@ -160,21 +227,10 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
   if (ppFence == nullptr)
     return S_FALSE;
 
-  char mach_port_name[54];
-
-  D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query = {};
-  query.hDevice = pDevice->GetLocalD3DKMT();
-  query.hNtHandle = hResource;
-  query.pPrivateRuntimeData = mach_port_name;
-  query.PrivateRuntimeDataSize = sizeof(mach_port_name);
-
-  if (D3DKMTQueryResourceInfoFromNtHandle(&query)) {
-    WARN(str::format("OpenSharedFence: Failed to query resource: ", hResource));
-    return E_INVALIDARG;
-  }
-
-  if (query.PrivateRuntimeDataSize != sizeof(mach_port_name)) {
-    WARN(str::format("OpenSharedFence: Unexpected size: ", query.PrivateRuntimeDataSize));
+  char bootstrap_name[54];
+  if (!GetSharedFenceBootstrapName(hResource, bootstrap_name)) {
+    WARN(str::format("OpenSharedFence: Failed to query shared fence name: ",
+                     hResource));
     return E_INVALIDARG;
   }
 
@@ -188,15 +244,25 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
   }
 
   mach_port_t mach_port;
-  if (!WMTBootstrapLookUp(mach_port_name, &mach_port)) {
-    ERR("ImportSharedTexture: Failed to look up mach port");
+  if (!WMTBootstrapLookUp(bootstrap_name, &mach_port)) {
+    D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+    destroy.hSyncObject = open.hSyncObject;
+    D3DKMTDestroySynchronizationObject(&destroy);
+    ERR("OpenSharedFence: Failed to look up mach port");
     return E_INVALIDARG;
   }
 
-  auto fence = new MTLD3D11FenceImpl(
-      pDevice,
-      pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port),
-      open.hSyncObject);
+  auto event = pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port);
+  if (!event) {
+    D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+    destroy.hSyncObject = open.hSyncObject;
+    D3DKMTDestroySynchronizationObject(&destroy);
+    ERR("OpenSharedFence: Failed to import shared event");
+    return E_INVALIDARG;
+  }
+
+  auto fence = new MTLD3D11FenceImpl(pDevice, std::move(event),
+                                     open.hSyncObject);
   return fence->QueryInterface(riid, ppFence);
 }
 
