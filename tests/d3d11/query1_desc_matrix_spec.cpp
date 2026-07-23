@@ -105,9 +105,13 @@ TEST_F(D3D11Query1DescMatrixSpec, RoundTripsSupportedDescriptions) {
     UINT data_size = 0;
     ComPtr<ID3D11Query1> queried_query1;
     ComPtr<ID3D11Query> legacy_query;
+    ComPtr<IUnknown> query_identity;
+    ComPtr<IUnknown> legacy_identity;
     ComPtr<ID3D11Device> owner;
     HRESULT query1_result = E_FAIL;
     HRESULT legacy_result = E_FAIL;
+    HRESULT query_identity_result = E_FAIL;
+    HRESULT legacy_identity_result = E_FAIL;
     if (create_result == S_OK && query) {
       query->GetDesc1(&actual);
       query->GetDesc(&legacy_desc);
@@ -118,6 +122,13 @@ TEST_F(D3D11Query1DescMatrixSpec, RoundTripsSupportedDescriptions) {
           reinterpret_cast<void **>(queried_query1.put()));
       legacy_result = query->QueryInterface(
           __uuidof(ID3D11Query), reinterpret_cast<void **>(legacy_query.put()));
+      query_identity_result = query->QueryInterface(
+          __uuidof(IUnknown), reinterpret_cast<void **>(query_identity.put()));
+      if (legacy_result == S_OK && legacy_query) {
+        legacy_identity_result = legacy_query->QueryInterface(
+            __uuidof(IUnknown),
+            reinterpret_cast<void **>(legacy_identity.put()));
+      }
     }
 
     const bool valid =
@@ -128,7 +139,10 @@ TEST_F(D3D11Query1DescMatrixSpec, RoundTripsSupportedDescriptions) {
         legacy_desc.MiscFlags == expected.MiscFlags &&
         data_size == test_case.data_size && owner.get() == context_.device() &&
         query1_result == S_OK && queried_query1.get() == query.get() &&
-        legacy_result == S_OK && legacy_query.get() == query.get();
+        legacy_result == S_OK && legacy_query &&
+        query_identity_result == S_OK && query_identity &&
+        legacy_identity_result == S_OK &&
+        legacy_identity.get() == query_identity.get();
     if (valid)
       continue;
 
@@ -147,11 +161,14 @@ TEST_F(D3D11Query1DescMatrixSpec, RoundTripsSupportedDescriptions) {
                   << " selected_cases=" << selected_cases.size() << '\n'
                   << "Expected: create_hresult=" << S_OK
                   << " query1_hresult=" << S_OK << " legacy_hresult=" << S_OK
+                  << " identity_hresult=" << S_OK
                   << " data_size=" << test_case.data_size
                   << " owner=" << context_.device() << '\n'
                   << "Observed: create_hresult=" << create_result
                   << " query1_hresult=" << query1_result
                   << " legacy_hresult=" << legacy_result
+                  << " query_identity_hresult=" << query_identity_result
+                  << " legacy_identity_hresult=" << legacy_identity_result
                   << " query=" << static_cast<UINT>(actual.Query)
                   << " misc_flags=" << actual.MiscFlags
                   << " context_type=" << static_cast<UINT>(actual.ContextType)
@@ -160,7 +177,9 @@ TEST_F(D3D11Query1DescMatrixSpec, RoundTripsSupportedDescriptions) {
                   << " data_size=" << data_size << " owner=" << owner.get()
                   << " object=" << query.get()
                   << " queried_query1=" << queried_query1.get()
-                  << " queried_legacy=" << legacy_query.get() << '\n'
+                  << " queried_legacy=" << legacy_query.get()
+                  << " query_identity=" << query_identity.get()
+                  << " legacy_identity=" << legacy_identity.get() << '\n'
                   << "Replay: --dxmt-case-id=" << case_id;
     break;
   }

@@ -135,11 +135,17 @@ TEST_F(D3D11MultisampleQualityLevels1MatrixSpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(D3D11MultisampleQualityLevels1MatrixSpec, RejectsUnknownFlags) {
-  UINT quality_levels = std::numeric_limits<UINT>::max();
+TEST_F(D3D11MultisampleQualityLevels1MatrixSpec, IgnoresUnknownFlags) {
+  UINT baseline_quality_levels = std::numeric_limits<UINT>::max();
+  const HRESULT baseline_result = device2_->CheckMultisampleQualityLevels1(
+      DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0, &baseline_quality_levels);
+
+  UINT unknown_flag_quality_levels = std::numeric_limits<UINT>::max();
   EXPECT_EQ(device2_->CheckMultisampleQualityLevels1(
-                DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0x80000000u, &quality_levels),
-            E_INVALIDARG);
+                DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0x80000000u,
+                &unknown_flag_quality_levels),
+            baseline_result);
+  EXPECT_EQ(unknown_flag_quality_levels, baseline_quality_levels);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

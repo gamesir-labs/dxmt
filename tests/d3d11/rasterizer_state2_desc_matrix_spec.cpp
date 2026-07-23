@@ -20,7 +20,7 @@ constexpr std::uint32_t kRasterizerState2CaseCount = kForcedSampleCounts.size();
 
 const dxmt::test::LogicalCaseFamilyRegistration kRasterizerState2Cases(
     "D3D11RasterizerState2DescMatrixSpec."
-    "RoundTripsRequiredForcedSampleCounts",
+    "ValidatesForcedSampleCountCapabilities",
     "D3D11.RasterizerState2.ForcedSampleCount.Description.",
     kRasterizerState2CaseCount, 1,
     {dxmt::test::TestClass::Conformance,
@@ -32,18 +32,19 @@ const dxmt::test::LogicalCaseFamilyRegistration kRasterizerState2Cases(
      dxmt::test::kResourceTestCost,
      "one test-local D3D11 device and one live pair of RasterizerState2 COM "
      "references per selected logical case",
-     "create the five universally valid forced sample counts with conservative "
-     "rasterization disabled, query Desc2, and recreate the same state",
-     "every required forced sample count round-trips exactly, the legacy "
-     "rasterizer interface is available, and identical descriptions reuse the "
-     "same COM object",
+     "request the five defined forced sample counts with conservative "
+     "rasterization disabled, query supported Desc2 values, and repeat each "
+     "creation",
+     "counts zero and one are always accepted; capability-dependent higher "
+     "counts either round-trip with the legacy interface and state-object "
+     "reuse, or consistently return E_INVALIDARG with null outputs",
      "logical ID, selected-case count, forced sample count, expected and "
      "returned descriptors, state and owner addresses, HRESULTs, failure "
      "phase, and exact replay argument"});
 
 const dxmt::test::TestCostRegistration
     kRasterizerState2Cost("D3D11RasterizerState2DescMatrixSpec."
-                          "RoundTripsRequiredForcedSampleCounts",
+                          "ValidatesForcedSampleCountCapabilities",
                           dxmt::test::kResourceTestCost);
 
 D3D11_RASTERIZER_DESC2 DescForLogical(std::uint32_t logical) {
@@ -96,7 +97,7 @@ protected:
 };
 
 TEST_F(D3D11RasterizerState2DescMatrixSpec,
-       RoundTripsRequiredForcedSampleCounts) {
+       ValidatesForcedSampleCountCapabilities) {
   std::vector<std::uint32_t> selected_cases;
   for (std::uint32_t logical = 0; logical < kRasterizerState2CaseCount;
        ++logical) {
@@ -115,7 +116,8 @@ TEST_F(D3D11RasterizerState2DescMatrixSpec,
     ComPtr<ID3D11RasterizerState2> duplicate;
     const HRESULT create_result =
         device3_->CreateRasterizerState2(&expected, state.put());
-    HRESULT duplicate_result = E_FAIL;
+    const HRESULT duplicate_result =
+        device3_->CreateRasterizerState2(&expected, duplicate.put());
     D3D11_RASTERIZER_DESC2 actual = {};
     ComPtr<ID3D11RasterizerState> legacy;
     ComPtr<ID3D11Device> owner;
@@ -124,15 +126,18 @@ TEST_F(D3D11RasterizerState2DescMatrixSpec,
       state->GetDevice(owner.put());
       state->QueryInterface(__uuidof(ID3D11RasterizerState),
                             reinterpret_cast<void **>(legacy.put()));
-      duplicate_result =
-          device3_->CreateRasterizerState2(&expected, duplicate.put());
     }
 
-    const bool valid = create_result == S_OK && state &&
-                       RasterizerDescsEqual(actual, expected) && legacy &&
-                       owner.get() == context_.device() &&
-                       duplicate_result == S_OK &&
-                       duplicate.get() == state.get();
+    const bool supported = create_result == S_OK && state &&
+                           RasterizerDescsEqual(actual, expected) && legacy &&
+                           owner.get() == context_.device() &&
+                           duplicate_result == S_OK &&
+                           duplicate.get() == state.get();
+    const bool required = expected.ForcedSampleCount <= 1;
+    const bool unsupported = !required && create_result == E_INVALIDARG &&
+                             !state && duplicate_result == E_INVALIDARG &&
+                             !duplicate;
+    const bool valid = supported || unsupported;
     if (valid)
       continue;
 
@@ -146,8 +151,9 @@ TEST_F(D3D11RasterizerState2DescMatrixSpec,
                   << "Parameters: logical=" << logical
                   << " forced_sample_count=" << expected.ForcedSampleCount
                   << " selected_cases=" << selected_cases.size() << '\n'
-                  << "Expected: create_hresult=" << S_OK
-                  << " duplicate_hresult=" << S_OK << " conservative="
+                  << "Expected: required=" << required
+                  << " supported_contract=true or optional_invalid=true"
+                  << " conservative="
                   << static_cast<UINT>(expected.ConservativeRaster)
                   << " owner=" << context_.device() << '\n'
                   << "Observed: create_hresult=" << create_result

@@ -252,7 +252,7 @@ TEST_F(D3D11VersionedTextureCreationContractSpec,
 }
 
 TEST_F(D3D11VersionedTextureCreationContractSpec,
-       ValidatesNullImmutableTiledAndOutputContracts) {
+       ValidatesNullImmutableAndTiledContracts) {
   ID3D11Texture2D1 *texture2d =
       reinterpret_cast<ID3D11Texture2D1 *>(static_cast<std::uintptr_t>(1));
   EXPECT_EQ(device3_->CreateTexture2D1(nullptr, nullptr, &texture2d),
@@ -293,9 +293,10 @@ TEST_F(D3D11VersionedTextureCreationContractSpec,
   desc3d.MiscFlags = D3D11_RESOURCE_MISC_TILED;
   texture3d =
       reinterpret_cast<ID3D11Texture3D1 *>(static_cast<std::uintptr_t>(1));
-  EXPECT_EQ(device3_->CreateTexture3D1(&desc3d, nullptr, &texture3d),
-            E_INVALIDARG);
-  EXPECT_EQ(texture3d, nullptr);
+  EXPECT_EQ(device3_->CreateTexture3D1(&desc3d, nullptr, &texture3d), S_OK);
+  EXPECT_NE(texture3d, nullptr);
+  if (texture3d)
+    texture3d->Release();
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

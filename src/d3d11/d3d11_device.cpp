@@ -892,7 +892,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CheckMultisampleQualityLevels1(DXGI_FORMAT Format, UINT SampleCount, UINT Flags, UINT *pNumQualityLevels) override {
-    if (Flags) {
+    if (Flags & D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE) {
       ERR("CheckMultisampleQualityLevels1: unsupported flags ", Flags);
       return E_INVALIDARG;
     }
@@ -965,9 +965,6 @@ public:
 
     if (!pDesc)
       return E_INVALIDARG;
-
-    if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
-      return E_INVALIDARG; // not supported yet
 
     if (pDesc->Usage == D3D11_USAGE_IMMUTABLE && !pInitialData)
       return E_INVALIDARG;
