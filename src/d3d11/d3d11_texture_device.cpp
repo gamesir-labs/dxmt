@@ -368,7 +368,7 @@ public:
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
             attachment_desc, descriptor
         ))) {
-      return E_FAIL;
+      return E_INVALIDARG;
     }
     if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
       return E_INVALIDARG;

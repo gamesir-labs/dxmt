@@ -51,6 +51,7 @@ d3d11_unit_sources = files(
   'texture1d_render_target_view_desc_matrix_spec.cpp',
   'texture1d_single_render_target_view_desc_matrix_spec.cpp',
   'texture2d_single_render_target_view_desc_matrix_spec.cpp',
+  'texture2dms_single_render_target_view_desc_matrix_spec.cpp',
   'texture2dms_render_target_view_desc_matrix_spec.cpp',
   'texture3d_render_target_view_desc_matrix_spec.cpp',
   'depth_stencil_view_desc_matrix_spec.cpp',
