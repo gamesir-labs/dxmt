@@ -868,7 +868,8 @@ public:
     if (pChosenFeatureLevel)
       *pChosenFeatureLevel = D3D_FEATURE_LEVEL(0);
 
-    if (!pFeatureLevels || SDKVersion != D3D11_SDK_VERSION ||
+    if (!pFeatureLevels || FeatureLevels == 0 ||
+        SDKVersion != D3D11_SDK_VERSION ||
         (Flags & ~D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED))
       return E_INVALIDARG;
 
@@ -885,14 +886,11 @@ public:
         EmulatedInterface != __uuidof(ID3D11Device1))
       return E_INVALIDARG;
 
-    D3D_FEATURE_LEVEL chosen_feature_level = feature_level_;
-    if (FeatureLevels) {
-      chosen_feature_level = D3D_FEATURE_LEVEL(0);
-      for (UINT i = 0; i < FeatureLevels; ++i) {
-        if (pFeatureLevels[i] <= feature_level_) {
-          chosen_feature_level = pFeatureLevels[i];
-          break;
-        }
+    D3D_FEATURE_LEVEL chosen_feature_level = D3D_FEATURE_LEVEL(0);
+    for (UINT i = 0; i < FeatureLevels; ++i) {
+      if (pFeatureLevels[i] <= feature_level_) {
+        chosen_feature_level = pFeatureLevels[i];
+        break;
       }
     }
     if (chosen_feature_level == D3D_FEATURE_LEVEL(0))

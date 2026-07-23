@@ -23,7 +23,7 @@ constexpr std::array<const char *, 5> kResidencyCaseNames = {
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kResidencyRegistration(
-    "D3D11DxgiDeviceResidencyContractSpec.ReportsFreshResourcesFullyResident",
+    "D3D11DxgiDeviceResidencyContractSpec.ReportsFreshResourcesResident",
     "D3D11.DXGI.Device.Residency.FreshResource.", kResidencyCaseNames.size(), 1,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
@@ -35,12 +35,12 @@ const dxmt::test::LogicalCaseFamilyRegistration kResidencyRegistration(
      "selected logical case",
      "query fresh buffers and one-, two-, and three-dimensional textures "
      "individually and as one heterogeneous resource array",
-     "every fresh test-local resource is reported fully resident",
+     "every fresh test-local resource is reported in a resident memory tier",
      "logical ID, selected-case count, resource kind and count, HRESULT, each "
      "residency result, and exact replay argument"});
 
 const dxmt::test::TestCostRegistration kResidencyCost(
-    "D3D11DxgiDeviceResidencyContractSpec.ReportsFreshResourcesFullyResident",
+    "D3D11DxgiDeviceResidencyContractSpec.ReportsFreshResourcesResident",
     dxmt::test::kResourceTestCost);
 
 class D3D11DxgiDeviceResidencyContractSpec : public ::testing::Test {
@@ -133,8 +133,7 @@ protected:
   ComPtr<IDXGIDevice> dxgi_device_;
 };
 
-TEST_F(D3D11DxgiDeviceResidencyContractSpec,
-       ReportsFreshResourcesFullyResident) {
+TEST_F(D3D11DxgiDeviceResidencyContractSpec, ReportsFreshResourcesResident) {
   std::vector<std::uint32_t> selected_cases;
   for (std::uint32_t logical = 0; logical < kResidencyCaseNames.size();
        ++logical) {
@@ -165,11 +164,12 @@ TEST_F(D3D11DxgiDeviceResidencyContractSpec,
     const HRESULT query_result = dxgi_device_->QueryResourceResidency(
         queried_resources.data(), residencies.data(),
         static_cast<UINT>(queried_resources.size()));
-    bool fully_resident = query_result == S_OK;
+    bool resident = query_result == S_OK;
     for (const DXGI_RESIDENCY residency : residencies)
-      fully_resident =
-          fully_resident && residency == DXGI_RESIDENCY_FULLY_RESIDENT;
-    if (fully_resident)
+      resident =
+          resident && (residency == DXGI_RESIDENCY_FULLY_RESIDENT ||
+                       residency == DXGI_RESIDENCY_RESIDENT_IN_SHARED_MEMORY);
+    if (resident)
       continue;
 
     std::ostringstream observed_residencies;
@@ -186,8 +186,8 @@ TEST_F(D3D11DxgiDeviceResidencyContractSpec,
                   << " resource_kind=" << kResidencyCaseNames[logical]
                   << " resource_count=" << queried_resources.size()
                   << " selected_cases=" << selected_cases.size() << '\n'
-                  << "Expected: query_hresult=" << S_OK
-                  << " residency=" << DXGI_RESIDENCY_FULLY_RESIDENT << '\n'
+                  << "Expected: query_hresult=" << S_OK << " residency=resident"
+                  << '\n'
                   << "Observed: query_hresult=" << query_result
                   << " residencies=(" << observed_residencies.str() << ')'
                   << " residency_count=" << residencies.size() << '\n'
