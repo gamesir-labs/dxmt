@@ -445,7 +445,7 @@ public:
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture SRV");
-      return E_FAIL;
+      return E_INVALIDARG;
     }
     if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
       return E_INVALIDARG;
