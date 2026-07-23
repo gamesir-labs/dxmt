@@ -22,47 +22,39 @@ struct FenceFlagCase {
   const char *name;
 };
 
+constexpr UINT kKnownFenceFlagMask =
+    D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
+    D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D11_FENCE_FLAG_NON_MONITORED;
+constexpr UINT kUnknownLowBit = [] {
+  UINT bit = 1;
+  while (kKnownFenceFlagMask & bit)
+    bit <<= 1;
+  return bit;
+}();
+constexpr HRESULT kZeroCreateResult =
+    D3D11_FENCE_FLAG_NONE == 0 ? S_OK : E_INVALIDARG;
+
 constexpr std::array kFenceFlagCases = {
-    FenceFlagCase{0, E_INVALIDARG, E_INVALIDARG, "Zero"},
+    FenceFlagCase{0, kZeroCreateResult, E_INVALIDARG, "RawZero"},
     FenceFlagCase{D3D11_FENCE_FLAG_NONE, S_OK, E_INVALIDARG, "None"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED, S_OK, S_OK, "Shared"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED, S_OK, S_OK,
-                  "NoneShared"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, E_INVALIDARG,
-                  E_INVALIDARG, "SharedCrossAdapter"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
-                  E_INVALIDARG, E_INVALIDARG, "NoneSharedCrossAdapter"},
+                  E_INVALIDARG, "CrossAdapterWithoutShared"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED |
                       D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
-                  E_INVALIDARG, E_INVALIDARG, "SharedAndCrossAdapter"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
-                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
-                  E_INVALIDARG, E_INVALIDARG, "NoneSharedAndCrossAdapter"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NON_MONITORED, S_OK, E_INVALIDARG,
-                  "NonMonitored"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_NON_MONITORED, S_OK,
-                  E_INVALIDARG, "NoneNonMonitored"},
+                  S_OK, S_OK, "SharedCrossAdapter"},
+    FenceFlagCase{D3D11_FENCE_FLAG_NON_MONITORED, E_INVALIDARG, E_INVALIDARG,
+                  "NonMonitoredWithoutShared"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_NON_MONITORED,
                   S_OK, S_OK, "SharedNonMonitored"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
-                      D3D11_FENCE_FLAG_NON_MONITORED,
-                  S_OK, S_OK, "NoneSharedNonMonitored"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
                       D3D11_FENCE_FLAG_NON_MONITORED,
-                  E_INVALIDARG, E_INVALIDARG, "CrossAdapterNonMonitored"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE |
-                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
-                      D3D11_FENCE_FLAG_NON_MONITORED,
-                  E_INVALIDARG, E_INVALIDARG, "NoneCrossAdapterNonMonitored"},
+                  E_INVALIDARG, E_INVALIDARG, "ModifiersWithoutShared"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED |
                       D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
                       D3D11_FENCE_FLAG_NON_MONITORED,
-                  E_INVALIDARG, E_INVALIDARG, "SharedCrossAdapterNonMonitored"},
-    FenceFlagCase{D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
-                      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
-                      D3D11_FENCE_FLAG_NON_MONITORED,
-                  E_INVALIDARG, E_INVALIDARG, "AllDefined"},
-    FenceFlagCase{0x10, E_INVALIDARG, E_INVALIDARG, "UnknownLowBit"},
+                  S_OK, S_OK, "SharedCrossAdapterNonMonitored"},
+    FenceFlagCase{kUnknownLowBit, E_INVALIDARG, E_INVALIDARG, "UnknownLowBit"},
     FenceFlagCase{0x80000000u, E_INVALIDARG, E_INVALIDARG, "UnknownHighBit"},
 };
 
@@ -78,11 +70,11 @@ const dxmt::test::LogicalCaseFamilyRegistration kFenceFlagRegistration(
      dxmt::test::kResourceTestCost,
      "one test-local D3D11 device, one fence, and at most one scoped NT "
      "handle per selected logical case",
-     "create fences with every bitwise combination of the four defined D3D11 "
-     "fence values plus zero and unknown low/high flag bits",
-     "supported combinations create a fence at the requested initial value, "
-     "shared combinations export a handle, and cross-adapter, zero, or "
-     "unknown flag values are rejected",
+     "create fences with the portable sharing/modifier combinations, raw "
+     "zero, and unknown low/high flag bits",
+     "NONE and valid shared combinations create a fence at the requested "
+     "initial value; modifier bits require SHARED, raw zero follows the "
+     "active header ABI, and unknown bits are rejected",
      "logical ID, flags, creation and sharing HRESULTs, completed value, "
      "handle value, device health, and exact replay argument"});
 
@@ -141,7 +133,9 @@ TEST_F(D3D11FenceFlagContractSpec, ValidatesDefinedFlagCombinations) {
       EXPECT_EQ(fence.get(), nullptr);
       continue;
     }
-    ASSERT_TRUE(fence);
+    EXPECT_TRUE(fence);
+    if (!fence)
+      continue;
     EXPECT_EQ(fence->GetCompletedValue(), 23u);
 
     ScopedHandle handle;
