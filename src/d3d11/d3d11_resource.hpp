@@ -423,6 +423,12 @@ public:
       return E_INVALIDARG;
     }
     *pUsage = 0;
+    if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+      *pUsage |= DXGI_USAGE_SHADER_INPUT;
+    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+      *pUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+      *pUsage |= DXGI_USAGE_UNORDERED_ACCESS;
     return S_OK;
   }
 
