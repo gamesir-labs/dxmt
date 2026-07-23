@@ -300,7 +300,7 @@ public:
     if (status == 0x00000080)
       return WAIT_ABANDONED;
     if (status == static_cast<NTSTATUS>(0xc000000d))
-      return E_FAIL;
+      return DXGI_ERROR_INVALID_CALL;
 
     WARN("DXGIKeyedMutex::ReleaseSync failed, status=", status);
     return DXGI_ERROR_INVALID_CALL;

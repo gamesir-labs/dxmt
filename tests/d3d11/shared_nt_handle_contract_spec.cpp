@@ -252,7 +252,7 @@ TEST_F(D3D11SharedNtHandleContractSpec, ReleasedStateRequiresExactKey) {
 }
 
 TEST_F(D3D11SharedNtHandleContractSpec, NonOwnerReleaseFails) {
-  EXPECT_EQ(opened_mutex_->ReleaseSync(5), E_FAIL);
+  EXPECT_EQ(opened_mutex_->ReleaseSync(5), DXGI_ERROR_INVALID_CALL);
   ASSERT_EQ(creator_mutex_->AcquireSync(0, 0), S_OK);
   ASSERT_EQ(creator_mutex_->ReleaseSync(0), S_OK);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
