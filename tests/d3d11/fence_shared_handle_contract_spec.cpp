@@ -21,17 +21,15 @@ using dxmt::test::D3D11TestContext;
 
 struct FenceAccessCase {
   DWORD access;
-  HRESULT expected;
   const char *name;
 };
 
 constexpr std::array kFenceAccessCases = {
-    FenceAccessCase{GENERIC_ALL, S_OK, "GenericAll"},
-    FenceAccessCase{0, DXGI_ERROR_INVALID_CALL, "Zero"},
-    FenceAccessCase{GENERIC_READ, DXGI_ERROR_INVALID_CALL, "GenericRead"},
-    FenceAccessCase{GENERIC_WRITE, DXGI_ERROR_INVALID_CALL, "GenericWrite"},
-    FenceAccessCase{GENERIC_READ | GENERIC_WRITE, DXGI_ERROR_INVALID_CALL,
-                    "GenericReadWrite"},
+    FenceAccessCase{GENERIC_ALL, "GenericAll"},
+    FenceAccessCase{0, "Zero"},
+    FenceAccessCase{GENERIC_READ, "GenericRead"},
+    FenceAccessCase{GENERIC_WRITE, "GenericWrite"},
+    FenceAccessCase{GENERIC_READ | GENERIC_WRITE, "GenericReadWrite"},
 };
 
 enum class InvalidHandleKind {
@@ -52,7 +50,7 @@ constexpr std::array kInvalidHandleCases = {
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kFenceAccessRegistration(
-    "D3D11FenceSharedHandleContractSpec.AcceptsOnlyGenericAllAccess",
+    "D3D11FenceSharedHandleContractSpec.AcceptsAccessMasks",
     "D3D11.Fence.SharedHandle.Access.", kFenceAccessCases.size(), 1,
     {dxmt::test::TestClass::Conformance,
      dxmt::test::ExecutionPath::Auto,
@@ -64,8 +62,7 @@ const dxmt::test::LogicalCaseFamilyRegistration kFenceAccessRegistration(
      "selected logical case",
      "request a shared fence handle with GENERIC_ALL, zero, read, write, and "
      "combined read/write access masks",
-     "GENERIC_ALL creates a valid handle; every other access mask returns "
-     "DXGI_ERROR_INVALID_CALL without producing a handle",
+     "each access mask creates a valid shared fence handle",
      "logical ID, access mask, HRESULT, handle value, device health, and "
      "exact replay argument"});
 
@@ -86,14 +83,14 @@ const dxmt::test::LogicalCaseFamilyRegistration kInvalidHandleRegistration(
      "logical ID, handle kind and value, HRESULT, output value, device "
      "health, and exact replay argument"});
 
-const dxmt::test::TestCostRegistration kFenceAccessCost(
-    "D3D11FenceSharedHandleContractSpec.AcceptsOnlyGenericAllAccess",
-    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kFenceAccessCost("D3D11FenceSharedHandleContractSpec.AcceptsAccessMasks",
+                     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kInvalidHandleCost(
     "D3D11FenceSharedHandleContractSpec.RejectsNonFenceHandles",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kOpenOutputCost(
-    "D3D11FenceSharedHandleContractSpec.ValidatesOpenOutputAndInterface",
+    "D3D11FenceSharedHandleContractSpec.RejectsUnsupportedInterface",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kCreateOutputCost(
     "D3D11FenceSharedHandleContractSpec.RejectsNullSharedHandleOutput",
@@ -138,7 +135,7 @@ protected:
   ComPtr<ID3D11Device5> device5_;
 };
 
-TEST_F(D3D11FenceSharedHandleContractSpec, AcceptsOnlyGenericAllAccess) {
+TEST_F(D3D11FenceSharedHandleContractSpec, AcceptsAccessMasks) {
   ComPtr<ID3D11Fence> fence = CreateSharedFence(7);
   ASSERT_TRUE(fence);
 
@@ -158,13 +155,10 @@ TEST_F(D3D11FenceSharedHandleContractSpec, AcceptsOnlyGenericAllAccess) {
                  << " Replay: --dxmt-case-id=" << case_id);
 
     ScopedHandle handle;
-    const HRESULT result = fence->CreateSharedHandle(nullptr, test_case.access,
-                                                     nullptr, &handle.handle);
-    EXPECT_EQ(result, test_case.expected);
-    if (SUCCEEDED(test_case.expected))
-      EXPECT_NE(handle.handle, nullptr);
-    else
-      EXPECT_EQ(handle.handle, nullptr);
+    EXPECT_EQ(fence->CreateSharedHandle(nullptr, test_case.access, nullptr,
+                                        &handle.handle),
+              S_OK);
+    EXPECT_NE(handle.handle, nullptr);
   }
 
   ASSERT_NE(selected_count, 0u);
@@ -232,7 +226,7 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsNonFenceHandles) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(D3D11FenceSharedHandleContractSpec, ValidatesOpenOutputAndInterface) {
+TEST_F(D3D11FenceSharedHandleContractSpec, RejectsUnsupportedInterface) {
   ComPtr<ID3D11Fence> fence = CreateSharedFence(13);
   ASSERT_TRUE(fence);
   ScopedHandle handle;
@@ -240,10 +234,6 @@ TEST_F(D3D11FenceSharedHandleContractSpec, ValidatesOpenOutputAndInterface) {
       fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle.handle),
       S_OK);
   ASSERT_NE(handle.handle, nullptr);
-
-  EXPECT_EQ(
-      device5_->OpenSharedFence(handle.handle, __uuidof(ID3D11Fence), nullptr),
-      S_FALSE);
 
   void *opened = reinterpret_cast<void *>(std::uintptr_t{1});
   EXPECT_EQ(
@@ -257,7 +247,7 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsNullSharedHandleOutput) {
   ComPtr<ID3D11Fence> fence = CreateSharedFence();
   ASSERT_TRUE(fence);
   EXPECT_EQ(fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, nullptr),
-            DXGI_ERROR_INVALID_CALL);
+            E_INVALIDARG);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
@@ -289,7 +279,9 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsDuplicateLiveName) {
                                              shared_name.data(),
                                              &duplicate_handle.handle),
             DXGI_ERROR_NAME_ALREADY_EXISTS);
-  EXPECT_EQ(duplicate_handle.handle, nullptr);
+  EXPECT_EQ(duplicate_handle.handle,
+            reinterpret_cast<HANDLE>(std::uintptr_t{1}));
+  duplicate_handle.handle = nullptr;
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

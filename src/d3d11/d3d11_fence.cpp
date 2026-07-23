@@ -108,9 +108,8 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateSharedHandle(const SECURITY_ATTRIBUTES *pAttributes, DWORD Access,
                      const WCHAR *Name, HANDLE *pHandle) final {
-    InitReturnPtr(pHandle);
-    if (!pHandle || Access != GENERIC_ALL)
-      return DXGI_ERROR_INVALID_CALL;
+    if (!pHandle)
+      return E_INVALIDARG;
     if (!local_kmt)
       return E_INVALIDARG;
 
@@ -152,8 +151,9 @@ public:
     attr.ObjectName = &name_str;
     attr.Attributes |= OBJ_CASE_INSENSITIVE;
 
+    HANDLE shared_handle = nullptr;
     const NTSTATUS status =
-        D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle);
+        D3DKMTShareObjects(1, &local_kmt, &attr, Access, &shared_handle);
     if (status == kStatusObjectNameCollision)
       return DXGI_ERROR_NAME_ALREADY_EXISTS;
     if (status) {
@@ -167,20 +167,20 @@ public:
         buffer, static_cast<size_t>(prefix_length) + name_length,
         bootstrap_name);
     if (!mach_port || !WMTBootstrapRegister(bootstrap_name, mach_port)) {
-      CloseHandle(*pHandle);
-      *pHandle = nullptr;
+      CloseHandle(shared_handle);
       ERR("D3D11Fence: Failed to register shared event");
       return E_FAIL;
     }
 
     const DWORD inherit_flag =
         pAttributes && pAttributes->bInheritHandle ? HANDLE_FLAG_INHERIT : 0;
-    if (!SetHandleInformation(*pHandle, HANDLE_FLAG_INHERIT, inherit_flag)) {
-      CloseHandle(*pHandle);
-      *pHandle = nullptr;
+    if (!SetHandleInformation(shared_handle, HANDLE_FLAG_INHERIT,
+                              inherit_flag)) {
+      CloseHandle(shared_handle);
       return E_FAIL;
     }
 
+    *pHandle = shared_handle;
     return S_OK;
   };
 
