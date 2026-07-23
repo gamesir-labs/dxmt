@@ -1163,8 +1163,6 @@ struct CompiledCommandList {
 struct SubmittedCompiledGraphicsPacket {
   std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
       root_tables;
-  CompiledNativeStageBinding native_vertex;
-  CompiledNativeStageBinding native_pixel;
   CompiledCommandFallbackReason prepare_reason =
       CompiledCommandFallbackReason::None;
 };
@@ -1172,7 +1170,6 @@ struct SubmittedCompiledGraphicsPacket {
 struct SubmittedCompiledComputePacket {
   std::shared_ptr<const std::vector<CompiledCommandRootDescriptorTable>>
       root_tables;
-  CompiledNativeStageBinding native_compute;
   CompiledCommandFallbackReason prepare_reason =
       CompiledCommandFallbackReason::None;
 };
@@ -1182,7 +1179,6 @@ struct SubmittedCompiledComputePacket {
 // must be frozen at Execute lives here.
 struct SubmittedCompiledCommandListPlan {
   std::shared_ptr<const CompiledCommandList> generation;
-  WMT::Reference<WMT::Buffer> native_root_base_buffer;
   std::vector<SubmittedCompiledGraphicsPacket> graphics_packets;
   std::vector<SubmittedCompiledComputePacket> compute_packets;
 };
@@ -1195,8 +1191,7 @@ CompiledCommandFallbackReasonToPerf(CompiledCommandFallbackReason reason);
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandList(
-    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device,
-    bool defer_native_binding_payload = false);
+    std::shared_ptr<const CompiledCommandList> compiled);
 
 struct SubmittedCommandAllocatorUse {
   Com<CommandAllocatorObject, false> allocator;

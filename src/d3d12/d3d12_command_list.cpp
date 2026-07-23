@@ -29,16 +29,6 @@
 
 namespace dxmt::d3d12 {
 
-static bool
-CompiledRootCauseDiagnosticsEnabled() {
-  static const bool enabled = [] {
-    const auto value = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_DENSE");
-    return value == "1" || value == "true" || value == "yes" ||
-           value == "trace";
-  }();
-  return enabled;
-}
-
 const char *CompiledCommandSegmentKindName(CompiledCommandSegmentKind kind) {
   switch (kind) {
   case CompiledCommandSegmentKind::Graphics:
@@ -1268,379 +1258,6 @@ MaterializeCompiledRootDescriptorTable(
       mirror->bufferResourceTableGpuAddress();
   table.native_root_table_base_ready = true;
   return CompiledCommandFallbackReason::None;
-}
-
-class NativeRootBasePayloadBuilder {
-public:
-  std::pair<uint64_t, uint32_t>
-  Append(const std::vector<uint32_t> &values) {
-    dxmt::perf::ScopedCodeTimer perf_timer(
-        dxmt::PerfCodePath::CompiledBuildNativePayloadAppend);
-    if (values.empty())
-      return {};
-    if (const auto found = offsets_.find(values); found != offsets_.end())
-      return {found->second, static_cast<uint32_t>(values.size())};
-
-    while (words_.size() & 3u)
-      words_.push_back(0);
-    const uint64_t offset = words_.size() * sizeof(uint32_t);
-    words_.insert(words_.end(), values.begin(), values.end());
-    offsets_.emplace(values, offset);
-    return {offset, static_cast<uint32_t>(values.size())};
-  }
-
-  bool FindStageBinding(
-      const PipelineState &pipeline, const RootSignature &root,
-      PipelineShaderStage stage,
-      const std::vector<CompiledCommandRootDescriptorTable> &tables,
-      CompiledNativeStageBinding &out) const {
-    dxmt::perf::ScopedCodeTimer perf_timer(
-        dxmt::PerfCodePath::CompiledBuildNativeStageCacheLookup);
-    const auto key = StageKey(pipeline, root, stage, tables);
-    const auto found = stage_bindings_.find(key);
-    if (found == stage_bindings_.end())
-      return false;
-    out = found->second;
-    return true;
-  }
-
-  void StoreStageBinding(
-      const PipelineState &pipeline, const RootSignature &root,
-      PipelineShaderStage stage,
-      const std::vector<CompiledCommandRootDescriptorTable> &tables,
-      const CompiledNativeStageBinding &binding) {
-    dxmt::perf::ScopedCodeTimer perf_timer(
-        dxmt::PerfCodePath::CompiledBuildNativeStageCacheStore);
-    stage_bindings_.emplace(StageKey(pipeline, root, stage, tables), binding);
-  }
-
-  bool Finalize(WMT::Device device,
-                WMT::Reference<WMT::Buffer> &native_root_base_buffer) const {
-    if (words_.empty())
-      return true;
-
-    WMTBufferInfo info = {};
-    info.length = words_.size() * sizeof(uint32_t);
-    info.options = static_cast<WMTResourceOptions>(
-        WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
-    info.memory.set(nullptr);
-    {
-      dxmt::perf::ScopedCodeTimer perf_timer(
-          dxmt::PerfCodePath::CompiledBuildPayloadBufferCreate);
-      native_root_base_buffer = device.newBuffer(info);
-    }
-    auto *mapped = info.memory.get_accessible_or_null();
-    if (!native_root_base_buffer || !mapped) {
-      native_root_base_buffer = nullptr;
-      return false;
-    }
-    {
-      dxmt::perf::ScopedCodeTimer perf_timer(
-          dxmt::PerfCodePath::CompiledBuildPayloadBufferCopy);
-      std::memcpy(mapped, words_.data(), info.length);
-    }
-    return true;
-  }
-
-private:
-  static std::vector<uint64_t> StageKey(
-      const PipelineState &pipeline, const RootSignature &root,
-      PipelineShaderStage stage,
-      const std::vector<CompiledCommandRootDescriptorTable> &tables) {
-    dxmt::perf::ScopedCodeTimer perf_timer(
-        dxmt::PerfCodePath::CompiledBuildNativeStageCacheKey);
-    std::vector<uint64_t> key = {
-        reinterpret_cast<uintptr_t>(&pipeline),
-        reinterpret_cast<uintptr_t>(&root), static_cast<uint64_t>(stage)};
-    std::vector<uint64_t> table_keys;
-    table_keys.reserve(tables.size());
-    for (const auto &table : tables) {
-      if (!table.resolved)
-        continue;
-      table_keys.push_back((uint64_t(table.root_parameter_index) << 40) |
-                           (uint64_t(table.heap_type) << 32) |
-                           uint64_t(table.heap_index));
-    }
-    std::sort(table_keys.begin(), table_keys.end());
-    key.insert(key.end(), table_keys.begin(), table_keys.end());
-    return key;
-  }
-
-  std::vector<uint32_t> words_;
-  std::map<std::vector<uint32_t>, uint64_t> offsets_;
-  std::map<std::vector<uint64_t>, CompiledNativeStageBinding>
-      stage_bindings_;
-};
-
-static bool
-CompiledNativeParameterVisible(const RootSignatureParameter &parameter,
-                               PipelineShaderStage stage) {
-  if (parameter.visibility == D3D12_SHADER_VISIBILITY_ALL)
-    return true;
-  switch (stage) {
-  case PipelineShaderStage::Vertex:
-    return parameter.visibility == D3D12_SHADER_VISIBILITY_VERTEX;
-  case PipelineShaderStage::Pixel:
-    return parameter.visibility == D3D12_SHADER_VISIBILITY_PIXEL;
-  case PipelineShaderStage::Geometry:
-    return parameter.visibility == D3D12_SHADER_VISIBILITY_GEOMETRY;
-  case PipelineShaderStage::Hull:
-    return parameter.visibility == D3D12_SHADER_VISIBILITY_HULL;
-  case PipelineShaderStage::Domain:
-    return parameter.visibility == D3D12_SHADER_VISIBILITY_DOMAIN;
-  case PipelineShaderStage::Compute:
-    return false;
-  }
-  return false;
-}
-
-static std::optional<D3D12_DESCRIPTOR_RANGE_TYPE>
-CompiledNativeRangeType(SM50BindingType type) {
-  switch (type) {
-  case SM50BindingType::ConstantBuffer:
-    return D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-  case SM50BindingType::Sampler:
-    return D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-  case SM50BindingType::SRV:
-    return D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  case SM50BindingType::UAV:
-    return D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  }
-  return std::nullopt;
-}
-
-static uint32_t CompiledShaderArgumentRangeCount(
-    const DXMT12_MTL4_SHADER_ARGUMENT &argument) {
-  const auto count = argument.RegisterCount ? argument.RegisterCount : 1u;
-  if (count != UINT_MAX)
-    return std::max<uint32_t>(count, 1u);
-
-  uint32_t capacity = 0;
-  switch (argument.Type) {
-  case SM50BindingType::ConstantBuffer:
-    capacity = 14;
-    break;
-  case SM50BindingType::Sampler:
-    capacity = 16;
-    break;
-  case SM50BindingType::UAV:
-    capacity = kUAVBindings;
-    break;
-  case SM50BindingType::SRV:
-    capacity = kSRVBindings;
-    break;
-  }
-  if (argument.SM50BindingSlot >= capacity)
-    return 0;
-  return capacity - argument.SM50BindingSlot;
-}
-
-static const CompiledCommandRootDescriptorTable *
-FindCompiledNativeRootTable(
-    const std::vector<CompiledCommandRootDescriptorTable> &tables,
-    UINT root_index, D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
-  for (const auto &table : tables) {
-    if (table.root_parameter_index == root_index && table.resolved &&
-        table.heap_type == heap_type)
-      return &table;
-  }
-  return nullptr;
-}
-
-static CompiledCommandFallbackReason
-BuildCompiledNativeRootBasesForArguments(
-    const std::vector<CompiledCommandRootDescriptorTable> &tables,
-    const RootSignature &root, PipelineShaderStage stage,
-    const DXMT12_MTL4_SHADER_ARGUMENT *arguments, uint32_t argument_count,
-    std::vector<uint32_t> &out, std::uint64_t *root_table_mask = nullptr) {
-  out.clear();
-  if (root_table_mask)
-    *root_table_mask = 0;
-  if (!arguments || !argument_count)
-    return CompiledCommandFallbackReason::None;
-
-  {
-    dxmt::perf::ScopedCodeTimer perf_timer(
-        dxmt::PerfCodePath::CompiledBuildNativeRootBaseLayout);
-    for (uint32_t i = 0; i < argument_count; i++) {
-      if (arguments[i].StructurePtrOffset >= 4096)
-        return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
-      out.resize(std::max<size_t>(out.size(),
-                                  arguments[i].StructurePtrOffset + 1),
-                 0);
-    }
-  }
-
-  const auto parameters = root.GetParameters();
-  dxmt::perf::ScopedCodeTimer range_scan_timer(
-      dxmt::PerfCodePath::CompiledBuildNativeRootBaseRangeScan);
-  for (uint32_t i = 0; i < argument_count; i++) {
-    const auto &argument = arguments[i];
-    const auto wanted_type = CompiledNativeRangeType(argument.Type);
-    if (!wanted_type)
-      return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
-    const uint32_t lower = argument.RegisterCount
-                               ? argument.RegisterLowerBound
-                               : argument.SM50BindingSlot;
-    const uint32_t count = CompiledShaderArgumentRangeCount(argument);
-    const uint32_t space = argument.RegisterCount ? argument.RegisterSpace : 0;
-    if (!count)
-      return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
-
-    uint32_t matches = 0;
-    uint32_t resolved_base = 0;
-    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
-      const auto &parameter = parameters[root_index];
-      if (parameter.parameter_type !=
-              D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
-          !CompiledNativeParameterVisible(parameter, stage))
-        continue;
-
-      uint32_t running_offset = 0;
-      for (const auto &range : parameter.ranges) {
-        const uint32_t range_offset = CompiledDescriptorRangeOffset(
-            range, running_offset);
-        if (range.descriptor_count != UINT_MAX)
-          running_offset = range_offset + range.descriptor_count;
-        if (range.range_type != *wanted_type ||
-            range.register_space != space || !range.descriptor_count ||
-            range.descriptor_count == UINT_MAX ||
-            lower < range.base_shader_register)
-          continue;
-        const uint32_t local = lower - range.base_shader_register;
-        if (local > range.descriptor_count ||
-            count > range.descriptor_count - local)
-          continue;
-
-        const auto heap_type =
-            CompiledDescriptorHeapTypeForRange(range.range_type);
-        const auto *table = FindCompiledNativeRootTable(
-            tables, root_index, heap_type);
-        if (!table)
-          return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
-        // A descriptor table may legally be based near the end of a heap even
-        // when its root-signature range is larger than the remaining heap.
-        // Only descriptors that the shader can actually access need to fit.
-        // The reflected argument count includes dynamically-indexed arrays, so
-        // validating that span preserves the native path without permitting an
-        // out-of-bounds shader access.
-        if (!dxmt::d3d12::TryResolveCompiledNativeDescriptorSpan(
-                table->heap_index, table->heap_count, range_offset, local,
-                count, &resolved_base))
-          return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
-        if (root_table_mask && root_index < 64)
-          *root_table_mask |= std::uint64_t{1} << root_index;
-        matches++;
-      }
-    }
-    if (matches != 1)
-      return CompiledCommandFallbackReason::NativeDescriptorAmbiguousRange;
-    out[argument.StructurePtrOffset] = resolved_base;
-  }
-  return CompiledCommandFallbackReason::None;
-}
-
-static const PipelineDxilShader *
-FindCompiledNativeShader(const PipelineState &pipeline,
-                         PipelineShaderStage stage) {
-  for (const auto &shader : pipeline.GetDxilShaders())
-    if (shader.stage == stage)
-      return &shader;
-  return nullptr;
-}
-
-static CompiledCommandFallbackReason
-BuildCompiledNativeStageBinding(
-    const std::vector<CompiledCommandRootDescriptorTable> &tables,
-    const PipelineState &pipeline, const RootSignature &root,
-    PipelineShaderStage stage, NativeRootBasePayloadBuilder &payloads,
-    CompiledNativeStageBinding &out) {
-  dxmt::perf::ScopedCodeTimer perf_timer(
-      dxmt::PerfCodePath::CompiledBuildNativeBindingDispatch);
-  out = {};
-  if (payloads.FindStageBinding(pipeline, root, stage, tables, out))
-    return CompiledCommandFallbackReason::None;
-  const PipelineDxilShader *shader = nullptr;
-  {
-    dxmt::perf::ScopedCodeTimer shader_timer(
-        dxmt::PerfCodePath::CompiledBuildNativeShaderLookup);
-    shader = FindCompiledNativeShader(pipeline, stage);
-  }
-  if (!shader) {
-    out.ready = true;
-    payloads.StoreStageBinding(pipeline, root, stage, tables, out);
-    return CompiledCommandFallbackReason::None;
-  }
-
-  std::vector<uint32_t> cbuffer_bases;
-  auto reason = BuildCompiledNativeRootBasesForArguments(
-      tables, root, stage, shader->constantBufferInfo(),
-      shader->reflection().NumConstantBuffers, cbuffer_bases,
-      &out.cbuffer_root_table_mask);
-  if (reason != CompiledCommandFallbackReason::None)
-    return reason;
-
-  std::vector<uint32_t> resource_bases;
-  reason = BuildCompiledNativeRootBasesForArguments(
-      tables, root, stage, shader->resourceArgumentInfo(),
-      shader->reflection().NumArguments, resource_bases,
-      &out.resource_root_table_mask);
-  if (reason != CompiledCommandFallbackReason::None)
-    return reason;
-
-  std::tie(out.cbuffer_root_base_offset, out.cbuffer_root_base_count) =
-      payloads.Append(cbuffer_bases);
-  std::tie(out.resource_root_base_offset, out.resource_root_base_count) =
-      payloads.Append(resource_bases);
-  if (CompiledRootCauseDiagnosticsEnabled()) {
-    dxmt::perf::ScopedCodeTimer diagnostic_copy_timer(
-        dxmt::PerfCodePath::CompiledBuildNativeDiagnosticCopy);
-    out.cbuffer_root_bases = std::move(cbuffer_bases);
-    out.resource_root_bases = std::move(resource_bases);
-  }
-  out.ready = true;
-  payloads.StoreStageBinding(pipeline, root, stage, tables, out);
-  return CompiledCommandFallbackReason::None;
-}
-
-static CompiledCommandFallbackReason
-BuildCompiledGraphicsNativeBindings(
-    const CompiledCommandPipelineBinding &binding,
-    const std::vector<CompiledCommandRootDescriptorTable> &root_tables,
-    CompiledNativeStageBinding &native_vertex,
-    CompiledNativeStageBinding &native_pixel,
-    NativeRootBasePayloadBuilder &payloads) {
-  if (!binding.metadata.uses_native_descriptor_table_abi)
-    return CompiledCommandFallbackReason::None;
-  auto *pipeline = binding.metadata.pipeline;
-  auto *root = GetDXMTRootSignature(binding.root_signature.ptr());
-  if (!pipeline || !root)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-  auto reason = BuildCompiledNativeStageBinding(
-      root_tables, *pipeline, *root, PipelineShaderStage::Vertex,
-      payloads, native_vertex);
-  if (reason != CompiledCommandFallbackReason::None)
-    return reason;
-  return BuildCompiledNativeStageBinding(
-      root_tables, *pipeline, *root, PipelineShaderStage::Pixel,
-      payloads, native_pixel);
-}
-
-static CompiledCommandFallbackReason
-BuildCompiledComputeNativeBindings(
-    const CompiledCommandPipelineBinding &binding,
-    const std::vector<CompiledCommandRootDescriptorTable> &root_tables,
-    CompiledNativeStageBinding &native_compute,
-    NativeRootBasePayloadBuilder &payloads) {
-  if (!binding.metadata.uses_native_descriptor_table_abi)
-    return CompiledCommandFallbackReason::None;
-  auto *pipeline = binding.metadata.pipeline;
-  auto *root = GetDXMTRootSignature(binding.root_signature.ptr());
-  if (!pipeline || !root)
-    return CompiledCommandFallbackReason::NativeUnsupportedRootSignature;
-  return BuildCompiledNativeStageBinding(
-      root_tables, *pipeline, *root, PipelineShaderStage::Compute,
-      payloads, native_compute);
 }
 
 static CompiledGraphicsPacket
@@ -3781,14 +3398,12 @@ static void PreMaterializeCompiledRootTables(CompiledCommandList &compiled) {
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandListImpl(
-    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device,
-    bool defer_native_binding_payload) {
+    std::shared_ptr<const CompiledCommandList> compiled) {
   auto plan = std::make_shared<SubmittedCompiledCommandListPlan>();
   plan->generation = std::move(compiled);
   if (!plan->generation)
     return plan;
 
-  NativeRootBasePayloadBuilder native_payloads;
   struct MaterializedTableKey {
     const void *table_identity = nullptr;
     ID3D12DescriptorHeap *resource_heap = nullptr;
@@ -3851,24 +3466,6 @@ PrepareSubmittedCompiledCommandListImpl(
   };
   plan->graphics_packets.reserve(plan->generation->graphics_packets.size());
   plan->compute_packets.reserve(plan->generation->compute_packets.size());
-  struct GraphicsNativeBindingPlan {
-    CompiledNativeStageBinding vertex;
-    CompiledNativeStageBinding pixel;
-    CompiledCommandFallbackReason reason =
-        CompiledCommandFallbackReason::None;
-  };
-  struct ComputeNativeBindingPlan {
-    CompiledNativeStageBinding compute;
-    CompiledCommandFallbackReason reason =
-        CompiledCommandFallbackReason::None;
-  };
-  std::unordered_map<const CompiledBindingProgram *,
-                     GraphicsNativeBindingPlan>
-      graphics_native_binding_cache;
-  std::unordered_map<const CompiledBindingProgram *,
-                     ComputeNativeBindingPlan>
-      compute_native_binding_cache;
-
   for (const auto &packet : plan->generation->graphics_packets) {
     SubmittedCompiledGraphicsPacket submitted = {};
     if (packet.compatibility_reason !=
@@ -3880,38 +3477,12 @@ PrepareSubmittedCompiledCommandListImpl(
     auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
     const auto materialized = materialize_tables(packet, root);
     submitted.root_tables = materialized.tables;
-    auto reason = materialized.reason;
-    if (reason == CompiledCommandFallbackReason::None &&
-        !defer_native_binding_payload) {
-      const auto *program = packet.binding_program.get();
-      const auto cached =
-          program ? graphics_native_binding_cache.find(program)
-                  : graphics_native_binding_cache.end();
-      if (cached != graphics_native_binding_cache.end()) {
-        submitted.native_vertex = cached->second.vertex;
-        submitted.native_pixel = cached->second.pixel;
-        reason = cached->second.reason;
-        if (plan->generation->test_telemetry)
-          plan->generation->test_telemetry
-              ->submitted_native_binding_plan_reuses.fetch_add(
-                  1, std::memory_order_relaxed);
-      } else {
-        reason = BuildCompiledGraphicsNativeBindings(
-            packet.pipeline, *submitted.root_tables, submitted.native_vertex,
-            submitted.native_pixel, native_payloads);
-        if (program)
-          graphics_native_binding_cache.emplace(
-              program,
-              GraphicsNativeBindingPlan{submitted.native_vertex,
-                                        submitted.native_pixel, reason});
-      }
-    }
-    submitted.prepare_reason = reason;
+    submitted.prepare_reason = materialized.reason;
     plan->graphics_packets.push_back(std::move(submitted));
     if (plan->generation->test_telemetry) {
       plan->generation->test_telemetry->submitted_graphics_packets.fetch_add(
           1, std::memory_order_relaxed);
-      if (reason != CompiledCommandFallbackReason::None)
+      if (materialized.reason != CompiledCommandFallbackReason::None)
         plan->generation->test_telemetry->submission_prepare_failures.fetch_add(
             1, std::memory_order_relaxed);
     }
@@ -3928,62 +3499,15 @@ PrepareSubmittedCompiledCommandListImpl(
     auto *root = GetDXMTRootSignature(packet.pipeline.root_signature.ptr());
     const auto materialized = materialize_tables(packet, root);
     submitted.root_tables = materialized.tables;
-    auto reason = materialized.reason;
-    if (reason == CompiledCommandFallbackReason::None &&
-        !defer_native_binding_payload) {
-      const auto *program = packet.binding_program.get();
-      const auto cached =
-          program ? compute_native_binding_cache.find(program)
-                  : compute_native_binding_cache.end();
-      if (cached != compute_native_binding_cache.end()) {
-        submitted.native_compute = cached->second.compute;
-        reason = cached->second.reason;
-        if (plan->generation->test_telemetry)
-          plan->generation->test_telemetry
-              ->submitted_native_binding_plan_reuses.fetch_add(
-                  1, std::memory_order_relaxed);
-      } else {
-        reason = BuildCompiledComputeNativeBindings(
-            packet.pipeline, *submitted.root_tables, submitted.native_compute,
-            native_payloads);
-        if (program)
-          compute_native_binding_cache.emplace(
-              program,
-              ComputeNativeBindingPlan{submitted.native_compute, reason});
-      }
-    }
-    submitted.prepare_reason = reason;
+    submitted.prepare_reason = materialized.reason;
     plan->compute_packets.push_back(std::move(submitted));
     if (plan->generation->test_telemetry) {
       plan->generation->test_telemetry->submitted_compute_packets.fetch_add(
           1, std::memory_order_relaxed);
-      if (reason != CompiledCommandFallbackReason::None)
+      if (materialized.reason != CompiledCommandFallbackReason::None)
         plan->generation->test_telemetry->submission_prepare_failures.fetch_add(
             1, std::memory_order_relaxed);
     }
-  }
-
-  // Queue submission freezes the reflected native descriptor spans and builds
-  // their root payload in one compact backing allocation. Do not also build a
-  // second live-heap payload here: it is never consumed by that path and used
-  // to account for several milliseconds of every ExecuteCommandLists call.
-  if (defer_native_binding_payload)
-    return plan;
-
-  if (native_payloads.Finalize(device, plan->native_root_base_buffer))
-    return plan;
-
-  for (size_t i = 0; i < plan->graphics_packets.size(); ++i) {
-    if (plan->generation->graphics_packets[i]
-            .pipeline.metadata.uses_native_descriptor_table_abi)
-      plan->graphics_packets[i].prepare_reason =
-          CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
-  }
-  for (size_t i = 0; i < plan->compute_packets.size(); ++i) {
-    if (plan->generation->compute_packets[i]
-            .pipeline.metadata.uses_native_descriptor_table_abi)
-      plan->compute_packets[i].prepare_reason =
-          CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
   }
   return plan;
 }
@@ -7158,10 +6682,8 @@ private:
 
 std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandList(
-    std::shared_ptr<const CompiledCommandList> compiled, WMT::Device device,
-    bool defer_native_binding_payload) {
-  return PrepareSubmittedCompiledCommandListImpl(
-      std::move(compiled), device, defer_native_binding_payload);
+    std::shared_ptr<const CompiledCommandList> compiled) {
+  return PrepareSubmittedCompiledCommandListImpl(std::move(compiled));
 }
 
 Com<ID3D12GraphicsCommandList>
