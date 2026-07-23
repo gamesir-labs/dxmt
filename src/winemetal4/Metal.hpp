@@ -728,6 +728,11 @@ public:
 class CommandBuffer : public Object {
 public:
   void
+  registerResource(Resource resource) {
+    MTLCommandBuffer_registerResource(handle, resource.handle);
+  }
+
+  void
   setDiagnosticInfo(const WMTCommandBufferDiagnosticInfo &info) {
     MTLCommandBuffer_setDiagnosticInfo(handle, &info);
   }

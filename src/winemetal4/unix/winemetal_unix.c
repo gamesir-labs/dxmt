@@ -907,7 +907,7 @@ struct DXMTMetal4PresentDiagnostic {
 @property(nonatomic, retain) id<MTL4CommandBuffer> metal4Buffer;
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
-@property(nonatomic, retain) NSMutableArray *retainedResources;
+@property(nonatomic, retain) NSMutableArray *retainedTemporaryResources;
 @property(nonatomic, retain) NSMutableArray *queueResidencyAllocations;
 @property(nonatomic, retain) NSMutableSet *queueResidencyAllocationSet;
 @property(nonatomic, retain) NSCondition *feedbackCondition;
@@ -927,7 +927,8 @@ struct DXMTMetal4PresentDiagnostic {
 - (id<MTL4CommandBuffer>)commandBuffer;
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder;
 - (id<MTL4RenderCommandEncoder>)metal4RenderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)descriptor;
-- (void)retainAllocationForLifetime:(id<MTLAllocation>)allocation;
+- (void)registerResourceForCurrentCommandBuffer:(id<MTLAllocation>)allocation;
+- (void)retainTemporaryResourceForCurrentCommandBuffer:(id<MTLAllocation>)allocation;
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label;
 - (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
 - (void)commit;
@@ -1898,7 +1899,8 @@ dxmt_metal4_is_buffer(id object) {
   id<MTLTexture> texture = metalDrawable.texture;
   CAMetalLayer *layer = metalDrawable.layer;
   id<MTLResidencySet> layerSet = layer.residencySet;
-  NSArray *retainedResources = commandBuffer.retainedResources;
+  NSArray *retainedTemporaryResources =
+      commandBuffer.retainedTemporaryResources;
   id<MTLAllocation> backing = texture
                                   ? dxmt_metal4_backing_allocation(
                                         (id<MTLAllocation>)texture)
@@ -1947,7 +1949,7 @@ dxmt_metal4_is_buffer(id object) {
   diag->layer_maximum_drawable_count = layer.maximumDrawableCount;
   diag->layer_allocation_count = layerSet ? layerSet.allocationCount : 0;
   diag->command_buffer_allocation_count =
-      retainedResources.count;
+      retainedTemporaryResources.count;
   const CGSize drawableSize = layer.drawableSize;
   diag->layer_width = drawableSize.width;
   diag->layer_height = drawableSize.height;
@@ -1961,9 +1963,9 @@ dxmt_metal4_is_buffer(id object) {
   diag->layer_contains_backing =
       layerSet && backing ? [layerSet containsAllocation:backing] : NO;
   diag->command_buffer_contains_texture =
-      texture && [retainedResources containsObject:texture];
+      texture && [retainedTemporaryResources containsObject:texture];
   diag->command_buffer_contains_backing =
-      backing && [retainedResources containsObject:backing];
+      backing && [retainedTemporaryResources containsObject:backing];
   diag->wait_for_drawable = waitForDrawable;
   diag->present_ordering = presentOrdering;
   diag->has_present_duration = commandBuffer.hasPresentDuration;
@@ -2053,7 +2055,7 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
   _pendingWaitEvents = [[NSMutableArray alloc] init];
   _pendingSignalEvents = [[NSMutableArray alloc] init];
-  _retainedResources = [[NSMutableArray alloc] init];
+  _retainedTemporaryResources = [[NSMutableArray alloc] init];
   _queueResidencyAllocations = [[NSMutableArray alloc] init];
   _queueResidencyAllocationSet = [[NSMutableSet alloc] init];
   _feedbackCondition = [[NSCondition alloc] init];
@@ -2065,7 +2067,7 @@ dxmt_metal4_is_buffer(id object) {
   memset(&_diagnosticInfo, 0, sizeof(_diagnosticInfo));
 
   if (!_allocator || !_metal4Buffer || !_pendingWaitEvents ||
-      !_pendingSignalEvents || !_retainedResources ||
+      !_pendingSignalEvents || !_retainedTemporaryResources ||
       !_queueResidencyAllocations ||
       !_queueResidencyAllocationSet || !_feedbackCondition) {
     [self release];
@@ -2080,7 +2082,7 @@ dxmt_metal4_is_buffer(id object) {
   [_feedbackError release];
   [_pendingWaitEvents release];
   [_pendingSignalEvents release];
-  [_retainedResources release];
+  [_retainedTemporaryResources release];
   [_queueResidencyAllocationSet release];
   [_queueResidencyAllocations release];
   [_feedbackCondition release];
@@ -2102,16 +2104,12 @@ dxmt_metal4_is_buffer(id object) {
   return [_metal4Buffer renderCommandEncoderWithDescriptor:descriptor];
 }
 
-- (void)retainAllocationForLifetime:(id<MTLAllocation>)allocation {
+- (void)registerResourceForCurrentCommandBuffer:(id<MTLAllocation>)allocation {
   if (!allocation)
     return;
-  if (![_retainedResources containsObject:allocation])
-    [_retainedResources addObject:allocation];
 
-  // Lifetime ownership and residency identity are deliberately separate. A
-  // texture view must keep the original resource object alive until GPU
-  // completion, while residency membership may use its parent/backing
-  // allocation.
+  // The logical CommandChunk already owns the original resource. This method
+  // only records the backing allocation needed by this native command buffer.
   id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
   BOOL externallyResident = NO;
   NSLock *membershipLock = dxmt_residency_membership_lock_get();
@@ -2134,10 +2132,19 @@ dxmt_metal4_is_buffer(id object) {
         dxmt_sparse_texture_residency_for_texture((id<MTLTexture>)backing,
                                                   false);
     for (id<MTLAllocation> heap in [sparseResidency mappedHeapsSnapshot]) {
-      if (![_retainedResources containsObject:heap])
-        [_retainedResources addObject:heap];
+      if (![_retainedTemporaryResources containsObject:heap])
+        [_retainedTemporaryResources addObject:heap];
     }
   }
+}
+
+- (void)retainTemporaryResourceForCurrentCommandBuffer:
+    (id<MTLAllocation>)allocation {
+  if (!allocation)
+    return;
+  if (![_retainedTemporaryResources containsObject:allocation])
+    [_retainedTemporaryResources addObject:allocation];
+  [self registerResourceForCurrentCommandBuffer:allocation];
 }
 
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label {
@@ -2167,7 +2174,8 @@ dxmt_metal4_is_buffer(id object) {
     return nil;
   if (bytes)
     memcpy([buffer contents], bytes, length);
-  [self retainAllocationForLifetime:(id<MTLAllocation>)buffer];
+  [self retainTemporaryResourceForCurrentCommandBuffer:
+      (id<MTLAllocation>)buffer];
   return buffer;
 }
 
@@ -2382,9 +2390,10 @@ dxmt_metal4_is_buffer(id object) {
     // Transfer this command buffer generation's resource owners to the
     // feedback callback. Recording state immediately advances to fresh
     // containers; only the callback releases the immutable snapshot.
-    __block NSArray *feedbackRetainedResources = [_retainedResources copy];
-    [_retainedResources release];
-    _retainedResources = [[NSMutableArray alloc] init];
+    __block NSArray *feedbackRetainedResources =
+        [_retainedTemporaryResources copy];
+    [_retainedTemporaryResources release];
+    _retainedTemporaryResources = [[NSMutableArray alloc] init];
     __block id<MTLSharedEvent> feedbackCompletionEvent = [_owner.event retain];
     __block NSArray *feedbackWaitEvents = [_pendingWaitEvents copy];
     __block NSArray *feedbackSignalEvents = [_pendingSignalEvents copy];
@@ -3048,7 +3057,6 @@ dxmt_metal4_is_buffer(id object) {
       length,
       (obj_handle_t)fenceToWait,
       (obj_handle_t)fenceToUpdate);
-  [self retainAllocationForLifetime:(id<MTLAllocation>)buffer];
   [_metal4Buffer resolveCounterHeap:heap
                            withRange:range
                           intoBuffer:MTL4BufferRangeMake([buffer gpuAddress] + offset, length)
@@ -3123,8 +3131,6 @@ dxmt_metal4_argument_set_buffer(
   state->buffers[index].buffer = buffer;
   state->buffers[index].offset = offset;
   state->buffer_bound[index] = true;
-  if (buffer && !same_buffer)
-    [state->owner retainAllocationForLifetime:(id<MTLAllocation>)buffer];
   [state->table setAddress:buffer ? [buffer gpuAddress] + offset : 0 atIndex:index];
 }
 
@@ -3160,8 +3166,6 @@ dxmt_metal4_argument_set_texture(struct dxmt_metal4_argument_state *state, id<MT
     return;
   state->textures[index] = texture;
   state->texture_bound[index] = true;
-  if (texture)
-    [state->owner retainAllocationForLifetime:(id<MTLAllocation>)texture];
   [state->table setTexture:texture ? [texture gpuResourceID] : (MTLResourceID){0} atIndex:index];
 }
 
@@ -5698,6 +5702,14 @@ _MTLCommandBuffer_commit(void *obj) {
 }
 
 static NTSTATUS
+_MTLCommandBuffer_registerResource(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  [(DXMTMetal4CommandBuffer *)params->handle
+      registerResourceForCurrentCommandBuffer:(id<MTLAllocation>)params->arg];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLCommandBuffer_setDiagnosticInfo(void *obj) {
   struct unixcall_mtlcommandbuffer_set_diagnostic_info *params = obj;
   DXMTMetal4CommandBuffer *cmdbuf =
@@ -6813,7 +6825,6 @@ dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
   if (!texture)
     return;
 
-  [owner retainAllocationForLifetime:(id<MTLAllocation>)texture];
   if (!dxmt_metal4_residency_diag_enabled())
     return;
 
@@ -6852,9 +6863,9 @@ dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
             (unsigned long)texture.pixelFormat, (unsigned long)texture.width,
             (unsigned long)texture.height, (unsigned long)texture.sampleCount,
             texture.framebufferOnly, backing,
-            [owner.retainedResources containsObject:texture],
-            [owner.retainedResources containsObject:backing],
-            (unsigned long)owner.retainedResources.count);
+            [owner.retainedTemporaryResources containsObject:texture],
+            [owner.retainedTemporaryResources containsObject:backing],
+            (unsigned long)owner.retainedTemporaryResources.count);
     fflush(stderr);
   }
 }
@@ -6915,7 +6926,6 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
-  [owner retainAllocationForLifetime:(id<MTLAllocation>)info->visibility_buffer];
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
@@ -7258,7 +7268,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
   id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)params->encoder;
-  DXMTMetal4CommandBuffer *owner = dxmt_metal4_encoder_owner(params->encoder);
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -7276,8 +7285,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTBlitCommandCopyFromBufferToBuffer: {
       struct wmtcmd_blit_copy_from_buffer_to_buffer *body = (struct wmtcmd_blit_copy_from_buffer_to_buffer *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
                      toBuffer:(id<MTLBuffer>)body->dst
@@ -7287,8 +7294,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromBufferToTexture: {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
             sourceBytesPerRow:body->bytes_per_row
@@ -7302,8 +7307,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromTextureToBuffer: {
       struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                        sourceSlice:body->slice
                        sourceLevel:body->level
@@ -7317,8 +7320,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
       struct wmtcmd_blit_copy_from_texture_to_texture *body = (struct wmtcmd_blit_copy_from_texture_to_texture *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->src];
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dst];
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                    sourceSlice:body->src_slice
                    sourceLevel:body->src_level
@@ -7332,7 +7333,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandGenerateMipmaps: {
       struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->texture];
       [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
       break;
     }
@@ -7348,7 +7348,6 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandFillBuffer: {
       struct wmtcmd_blit_fillbuffer *body = (struct wmtcmd_blit_fillbuffer *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->buffer];
       [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
       break;
     }
@@ -7415,7 +7414,6 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTComputeCommandDispatchIndirect: {
       struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_compute_set_argument_table_if_needed(encoder, state);
       [encoder dispatchThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
                                 threadsPerThreadgroup:state->threadgroupSize];
@@ -7461,7 +7459,6 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     case WMTComputeCommandUseResource: {
       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
       (void)body->usage;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->resource];
       break;
     }
     case WMTComputeCommandSetBytes: {
@@ -7530,7 +7527,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
       (void)body->usage;
       (void)body->stages;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->resource];
       break;
     }
     case WMTRenderCommandSetVertexBuffer: {
@@ -7667,7 +7663,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawIndexed: {
       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
       id<MTLBuffer> index_buffer = (id<MTLBuffer>)body->index_buffer;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)index_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                           indexCount:body->index_count
@@ -7681,7 +7676,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndirect: {
       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                 indirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)];
@@ -7690,8 +7684,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawIndexedIndirect: {
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
       id<MTLBuffer> index_buffer = (id<MTLBuffer>)body->index_buffer;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)index_buffer];
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                            indexType:(MTLIndexType)body->index_type
@@ -7720,7 +7712,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
       struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
           (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->indirect_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(
@@ -7765,7 +7756,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
@@ -7778,7 +7768,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
           (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
@@ -7809,7 +7798,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
@@ -7822,7 +7810,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
           (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
       dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
-      [owner retainAllocationForLifetime:(id<MTLAllocation>)body->dispatch_args_buffer];
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
@@ -8206,11 +8193,6 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   scaler.jitterOffsetX = props->jitter_offset_x;
   scaler.jitterOffsetY = props->jitter_offset_y;
   scaler.preExposure = props->pre_exposure;
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->color];
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->output];
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->depth];
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->motion];
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->exposure];
   [scaler encodeToCommandBuffer:[wrapper commandBuffer]];
   return STATUS_SUCCESS;
 }
@@ -8223,8 +8205,6 @@ _MTLCommandBuffer_encodeSpatialScale(void *obj) {
   scaler.colorTexture = (id<MTLTexture>)params->color;
   scaler.outputTexture = (id<MTLTexture>)params->output;
   scaler.fence = (id<MTLFence>)params->fence;
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->color];
-  [wrapper retainAllocationForLifetime:(id<MTLAllocation>)params->output];
   [scaler encodeToCommandBuffer:[wrapper commandBuffer]];
   return STATUS_SUCCESS;
 }
@@ -10406,6 +10386,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandQueue_updateSparseTextureMappings,
     &_MTLDevice_queryTimestampFrequency,
     &_MTLDevice_sampleTimestamps,
+    &_MTLCommandBuffer_registerResource,
 };
 
 #ifndef DXMT_NATIVE
@@ -10590,5 +10571,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandQueue_updateSparseTextureMappings,
     &_MTLDevice_queryTimestampFrequency,
     &_MTLDevice_sampleTimestamps,
+    &_MTLCommandBuffer_registerResource,
 };
 #endif

@@ -23,6 +23,7 @@
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -164,6 +165,8 @@ public:
 private:
   CommandQueue *queue;
   WMT::Reference<WMT::CommandBuffer> attached_cmdbuf;
+  std::vector<WMT::Reference<WMT::Resource>> retained_metal_resources;
+  std::unordered_set<obj_handle_t> retained_metal_resource_handles;
   
   CommandList<ArgumentEncodingContext> list_enc;
   AllocationRefTracking ref_tracker;
@@ -204,6 +207,8 @@ public:
     list_enc.reset();
     ref_tracker.clear();
     attached_cmdbuf = nullptr;
+    retained_metal_resources.clear();
+    retained_metal_resource_handles.clear();
   }
 };
 

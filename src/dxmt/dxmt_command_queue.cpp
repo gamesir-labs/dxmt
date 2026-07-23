@@ -116,6 +116,8 @@ CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
 void
 CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   enc.$$setEncodingContext(chunk_id, frame_);
+  enc.beginCommandBufferResourceLifetime(
+      cmdbuf, retained_metal_resources, retained_metal_resource_handles);
   auto &statistics = enc.currentFrameStatistics();
   CommandBufferDiagnosticInfo diagnostic = {};
   diagnostic.frame_id = frame_;
@@ -129,6 +131,7 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   attached_cmdbuf = cmdbuf;
   auto t1 = encode_prepare_end_time;
   readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id, &diagnostic);
+  enc.endCommandBufferResourceLifetime();
   auto t2 = clock::now();
 
   diagnostic.sparse_mapping_call_count =

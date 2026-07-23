@@ -15172,6 +15172,7 @@ private:
          scissors = std::move(scissors)](ArgumentEncodingContext &enc,
                                          uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
+      enc.retainResource(index_allocation->buffer());
       EncodeRenderPipelineStateIfChanged(enc, metal_pso);
       auto *render_encoder = enc.currentRenderEncoder();
       render_encoder->pixel_shader_demote_msaa_srv_mask_lo =
@@ -25675,6 +25676,7 @@ private:
     if (packet.indexed) {
       if (!packet.index_allocation)
         return;
+      enc.retainResource(packet.index_allocation->buffer());
       auto &draw = enc.encodeRenderCommand<
           wmtcmd_render_draw_indexed_indirect>();
       draw.type = WMTRenderCommandDrawIndexedIndirect;
@@ -25707,6 +25709,7 @@ private:
       uint64_t &argbuf_offset) {
     auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
     auto &common = packet.common;
+    enc.retainResource(packet.index_allocation->buffer());
     const bool compiled_direct = common.compiled_binding_payload.has_value();
     dxmt::perf::ScopedFrameDuration encode_scope(
         perf_stats,

@@ -7,6 +7,8 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DXMT_QUEUE = (ROOT / "src/dxmt/dxmt_command_queue.cpp").read_text()
+DXMT_QUEUE_HPP = (ROOT / "src/dxmt/dxmt_command_queue.hpp").read_text()
+DXMT_CONTEXT = (ROOT / "src/dxmt/dxmt_context.cpp").read_text()
 WINEMETAL = (ROOT / "src/winemetal4/unix/winemetal_unix.c").read_text()
 
 
@@ -129,69 +131,66 @@ class ResidencyArchitecturePolicyTest(unittest.TestCase):
         self.assertLess(signal, logical_remove)
         self.assertLess(logical_remove, retire_texture)
 
-    def test_lifetime_keeps_original_resource_separate_from_residency_backing(
-        self,
-    ):
-        implementation = WINEMETAL[
-            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
-        ]
-        retain = braced_body(
-            implementation, "- (void)retainAllocationForLifetime:"
+    def test_command_chunk_owns_resources_from_recording_to_completion(self):
+        self.assertIn(
+            "std::vector<WMT::Reference<WMT::Resource>> "
+            "retained_metal_resources",
+            DXMT_QUEUE_HPP,
         )
         self.assertIn(
-            "dxmt_metal4_backing_allocation(allocation)", retain
+            "std::unordered_set<obj_handle_t> "
+            "retained_metal_resource_handles",
+            DXMT_QUEUE_HPP,
         )
-        self.assertRegex(
-            retain,
-            re.compile(
-                r"\[\s*_[A-Za-z0-9]*(?:retained|lifetime)"
-                r"[A-Za-z0-9]*\s+addObject\s*:\s*allocation\s*\]",
-                re.IGNORECASE,
-            ),
-        )
-        self.assertNotRegex(
-            retain,
-            re.compile(
-                r"\[\s*_queueResidency[A-Za-z0-9]*"
-                r"\s+addObject\s*:\s*allocation\s*\]"
-            ),
-        )
-        self.assertRegex(
-            retain,
-            re.compile(
-                r"\[\s*_queueResidency[A-Za-z0-9]*"
-                r"\s+addObject\s*:\s*backing\s*\]"
-            ),
-        )
-        self.assertNotRegex(
-            retain,
-            re.compile(
-                r"\[\s*_[A-Za-z0-9]*(?:retained|lifetime)"
-                r"[A-Za-z0-9]*\s+addObject\s*:\s*backing\s*\]",
-                re.IGNORECASE,
-            ),
-        )
+        encode = braced_body(DXMT_QUEUE, "CommandChunk::encode(")
+        begin = encode.index("beginCommandBufferResourceLifetime(")
+        replay = encode.index("list_enc.execute(enc)")
+        flush = encode.index("enc.flushCommands(")
+        end = encode.index("endCommandBufferResourceLifetime()")
+        self.assertLess(begin, replay)
+        self.assertLess(replay, flush)
+        self.assertLess(flush, end)
 
-    def test_lifetime_ownership_has_one_current_container(self):
+    def test_recording_deduplicates_then_owns_and_registers_resources(self):
+        retain = braced_body(
+            DXMT_CONTEXT,
+            "ArgumentEncodingContext::retainResourceForCurrentCommandBuffer(",
+        )
+        deduplicate = retain.index(
+            "current_command_buffer_resource_handles_->insert(resource.handle)"
+        )
+        own = retain.index(
+            "current_command_buffer_resources_->emplace_back(resource)"
+        )
+        register = retain.index(
+            "current_command_buffer_.registerResource(resource)"
+        )
+        self.assertLess(deduplicate, own)
+        self.assertLess(own, register)
+
+    def test_unix_replay_does_not_discover_ordinary_resource_lifetime(self):
+        self.assertNotIn("retainAllocationForLifetime", WINEMETAL)
         implementation = WINEMETAL[
             WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
         ]
-        retain = braced_body(
-            implementation, "- (void)retainAllocationForLifetime:"
+        register = braced_body(
+            implementation,
+            "- (void)registerResourceForCurrentCommandBuffer:",
         )
-        lifetime_writers = re.findall(
-            r"\[\s*(\w+)\s+addObject\s*:\s*allocation\s*\]", retain
+        self.assertIn("dxmt_metal4_backing_allocation(allocation)", register)
+        self.assertNotIn(
+            "[_retainedTemporaryResources addObject:allocation]", register
         )
-        self.assertEqual(
-            len(lifetime_writers),
-            1,
-            "the original resource must have exactly one current lifetime "
-            "owner; array-plus-set ownership can double-release stale objects",
+        temporary = braced_body(
+            implementation,
+            "- (void)retainTemporaryResourceForCurrentCommandBuffer:",
         )
-        self.assertEqual(
-            len(set(lifetime_writers)),
-            1,
-            "lifetime ownership must not be duplicated across containers",
+        self.assertIn(
+            "[_retainedTemporaryResources addObject:allocation]", temporary
+        )
+        self.assertIn(
+            "[self registerResourceForCurrentCommandBuffer:allocation]",
+            temporary,
         )
 
     def test_commit_transfers_an_immutable_lifetime_snapshot(self):

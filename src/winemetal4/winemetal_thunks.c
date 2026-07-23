@@ -238,6 +238,15 @@ MTLCommandBuffer_commitAndGetStats(obj_handle_t cmdbuf,
 }
 
 WINEMETAL_API void
+MTLCommandBuffer_registerResource(obj_handle_t cmdbuf,
+                                  obj_handle_t resource) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = cmdbuf;
+  params.arg = resource;
+  UNIX_CALL(180, &params);
+}
+
+WINEMETAL_API void
 MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,
     const struct WMTCommandBufferDiagnosticInfo *info) {

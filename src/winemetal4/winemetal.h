@@ -114,6 +114,9 @@ WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
     obj_handle_t cmdbuf, uint64_t *residency_submit_us);
 
+WINEMETAL_API void MTLCommandBuffer_registerResource(
+    obj_handle_t cmdbuf, obj_handle_t resource);
+
 #define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 64
 #define WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY 32
 

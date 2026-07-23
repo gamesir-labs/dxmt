@@ -1343,6 +1343,7 @@ ArgumentEncodingContext::packBindlessStage(
     log_binding("allocation-failed");
     return {};
   }
+  retainResourceForCurrentCommandBuffer(bt.gpu_buffer);
   auto *buf_table = static_cast<uint64_t *>(bt.mapped);
   std::memset(buf_table, 0, bt.length);
 
@@ -1428,6 +1429,7 @@ ArgumentEncodingContext::bindBindlessTables(
     auto bind = [&](WMT::Buffer buffer, uint64_t offset, uint8_t index) {
       if (!buffer)
         return;
+      retainResourceForCurrentCommandBuffer(buffer);
       auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbuffer>();
       cmd.type = WMTComputeCommandSetArgumentBuffer;
       cmd.buffer = buffer;
@@ -1452,6 +1454,7 @@ ArgumentEncodingContext::bindBindlessTables(
     auto bind = [&](WMT::Buffer buffer, uint64_t offset, uint8_t index) {
       if (!buffer)
         return;
+      retainResourceForCurrentCommandBuffer(buffer);
       auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbuffer>();
       cmd.type = WMTRenderCommandSetArgumentBuffer;
       cmd.buffer = buffer;
@@ -1498,6 +1501,7 @@ ArgumentEncodingContext::bindNativeArgumentBuffer(
     WMTRenderStages render_stages) {
   if (!buffer || bind_index >= 31)
     return;
+  retainResourceForCurrentCommandBuffer(buffer);
 
   if (compute) {
     auto *data = static_cast<ComputeEncoderData *>(encoder_current);
@@ -3736,6 +3740,49 @@ ArgumentEncodingContext::retainAllocation(Allocation* allocation) {
 }
 
 void
+ArgumentEncodingContext::beginCommandBufferResourceLifetime(
+    WMT::CommandBuffer command_buffer,
+    std::vector<WMT::Reference<WMT::Resource>> &resources,
+    std::unordered_set<obj_handle_t> &resource_handles) {
+  assert(!current_command_buffer_);
+  assert(!current_command_buffer_resources_);
+  assert(!current_command_buffer_resource_handles_);
+  current_command_buffer_ = command_buffer;
+  current_command_buffer_resources_ = &resources;
+  current_command_buffer_resource_handles_ = &resource_handles;
+}
+
+void
+ArgumentEncodingContext::endCommandBufferResourceLifetime() {
+  current_command_buffer_ = {};
+  current_command_buffer_resources_ = nullptr;
+  current_command_buffer_resource_handles_ = nullptr;
+}
+
+void
+ArgumentEncodingContext::retainResourceForCurrentCommandBuffer(
+    WMT::Resource resource) {
+#if DXMT_DX12_METAL4
+  if (!resource)
+    return;
+
+  assert(current_command_buffer_);
+  assert(current_command_buffer_resources_);
+  assert(current_command_buffer_resource_handles_);
+  if (!current_command_buffer_resource_handles_->insert(resource.handle).second)
+    return;
+
+  // Match D3DMetal's current-command-buffer ownership model: acquire the
+  // original resource before its raw handle enters an encoder command. The
+  // CommandChunk releases this reference only after GPU completion.
+  current_command_buffer_resources_->emplace_back(resource);
+  current_command_buffer_.registerResource(resource);
+#else
+  (void)resource;
+#endif
+}
+
+void
 ArgumentEncodingContext::clearColor(
     Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength,
     WMTClearColor color, bool has_rects, uint32_t depth_plane) {
@@ -3987,6 +4034,7 @@ ArgumentEncodingContext::startRenderPass(
   encoder_info->dsv_readonly_flags = dsv_readonly_flags;
   encoder_info->render_target_count = render_target_count;
   auto argbuf = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+  retainResourceForCurrentCommandBuffer(argbuf.gpu_buffer);
   encoder_info->allocated_argbuf = argbuf.gpu_buffer;
   encoder_info->allocated_argbuf_offset = argbuf.offset;
   encoder_info->allocated_argbuf_size = argbuf.length;
@@ -4013,6 +4061,7 @@ ArgumentEncodingContext::startComputePass(uint64_t encoder_argbuf_size) {
   encoder_info->cmd_head.next.set(0);
   encoder_info->cmd_tail = (wmtcmd_base *)&encoder_info->cmd_head;
   auto argbuf = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+  retainResourceForCurrentCommandBuffer(argbuf.gpu_buffer);
   encoder_info->allocated_argbuf = argbuf.gpu_buffer;
   encoder_info->allocated_argbuf_offset = argbuf.offset;
   encoder_info->allocated_argbuf_size = argbuf.length;
@@ -4145,12 +4194,16 @@ ArgumentEncodingContext::endPass() {
 
 std::pair<WMT::Buffer, size_t>
 ArgumentEncodingContext::allocateTempBuffer(size_t size, size_t alignment) {
-  return queue_.AllocateTempBuffer(seq_id_, size, alignment);
+  auto allocation = queue_.AllocateTempBuffer(seq_id_, size, alignment);
+  retainResourceForCurrentCommandBuffer(allocation.first);
+  return allocation;
 };
 
 AllocatedTempBufferSlice
 ArgumentEncodingContext::allocateTempBuffer1(size_t size, size_t alignment) {
-  return queue_.AllocateTempBuffer1(seq_id_, size, alignment);
+  auto allocation = queue_.AllocateTempBuffer1(seq_id_, size, alignment);
+  retainResourceForCurrentCommandBuffer(allocation.gpu_buffer);
+  return allocation;
 };
 
 void
@@ -4249,6 +4302,7 @@ void ArgumentEncodingContext::appendResolveTimestampRange(
   assert(!encoder_current);
   if (!query_count || !dst_buffer || !dst_length)
     return;
+  retainResourceForCurrentCommandBuffer(dst_buffer);
 
   if (encoder_last && encoder_last->type == EncoderType::ResolveTimestamp) {
     auto *last = static_cast<ResolveTimestampData *>(encoder_last);
@@ -4914,6 +4968,7 @@ ArgumentEncodingContext::flushCommands(
         }
         auto task_argbuf =
             queue_.AllocateArgumentBuffer(seq_id_, task_bytes);
+        retainResourceForCurrentCommandBuffer(task_argbuf.gpu_buffer);
         auto *tasks_data =
             MappedArgumentBufferSlice<GS_MARSHAL_TASK>(task_argbuf,
                                                        task_count);
@@ -4955,6 +5010,7 @@ ArgumentEncodingContext::flushCommands(
         }
         auto task_argbuf =
             queue_.AllocateArgumentBuffer(seq_id_, task_bytes);
+        retainResourceForCurrentCommandBuffer(task_argbuf.gpu_buffer);
         auto *tasks_data =
             MappedArgumentBufferSlice<TS_MARSHAL_TASK>(task_argbuf,
                                                        task_count);

@@ -660,6 +660,7 @@ public:
   access(Rc<Buffer> const &buffer, unsigned offset, unsigned length, int flags) {
     auto allocation = buffer->current();
     trackBuffer<stage>(allocation, flags);
+    retainResourceForCurrentCommandBuffer(allocation->buffer());
     return {allocation, allocation->currentSuballocationOffset()};
   }
 
@@ -669,6 +670,8 @@ public:
     auto allocation = buffer->current();
     trackBuffer<stage>(allocation, flags);
     auto &view = buffer->view_(viewId, allocation);
+    retainResourceForCurrentCommandBuffer(allocation->buffer());
+    retainResourceForCurrentCommandBuffer(view.texture);
     return {view, allocation->currentSuballocationOffset(view.suballocation_texel)};
   }
 
@@ -677,6 +680,7 @@ public:
   access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
     auto allocation = texture->current();
     retainAllocation(allocation);
+    retainResourceForCurrentCommandBuffer(allocation->texture());
     noteSparseTextureAccess(allocation, level, slice, flags);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
@@ -706,6 +710,7 @@ public:
     auto allocation = texture->current();
     retainAllocation(allocation);
     auto &view = texture->view(viewId, allocation);
+    retainResourceForCurrentCommandBuffer(view.texture);
     TextureViewKey key = viewId;
     noteSparseTextureAccess(allocation, key.mip_start, key.array_start, flags);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
@@ -750,6 +755,7 @@ public:
   void
   bindConstantBufferDirect(unsigned slot, WMT::Buffer buffer, uint64_t gpu_address,
                            uint64_t length) {
+    retainResourceForCurrentCommandBuffer(buffer);
     unsigned idx = slot + 14 * unsigned(stage);
     auto &entry = cbuf_[idx];
     entry.buffer = {};
@@ -943,9 +949,21 @@ public:
 
   bool retainAllocation(Allocation* allocation);
 
+  void retainResource(WMT::Resource resource) {
+    retainResourceForCurrentCommandBuffer(resource);
+  }
+
+  void beginCommandBufferResourceLifetime(
+      WMT::CommandBuffer command_buffer,
+      std::vector<WMT::Reference<WMT::Resource>> &resources,
+      std::unordered_set<obj_handle_t> &resource_handles);
+
+  void endCommandBufferResourceLifetime();
+
   template <PipelineStage stage, PipelineKind kind>
   void
   makeResident(WMT::Resource resource, DXMT_RESOURCE_RESIDENCY requested) {
+    retainResourceForCurrentCommandBuffer(resource);
     if constexpr (stage == PipelineStage::Compute) {
       auto &cmd = encodeComputeCommand<wmtcmd_compute_useresource>();
       cmd.type = WMTComputeCommandUseResource;
@@ -1026,6 +1044,8 @@ public:
       WMT::Buffer dispatch_args, uint64_t dispatch_args_resource_id, uint32_t write_offset, uint64_t max_object_threadgroups
   ) {
     assert(encoder_current->type == EncoderType::Render);
+    retainResourceForCurrentCommandBuffer(draw_args);
+    retainResourceForCurrentCommandBuffer(dispatch_args);
     auto data = static_cast<RenderEncoderData *>(encoder_current);
     data->gs_arg_marshal_tasks.push_back(
         {draw_args, draw_args_resource_id + draw_args_offset, max_object_threadgroups, dispatch_args,
@@ -1040,6 +1060,8 @@ public:
       uint64_t max_object_threadgroups
   ) {
     assert(encoder_current->type == EncoderType::Render);
+    retainResourceForCurrentCommandBuffer(draw_args);
+    retainResourceForCurrentCommandBuffer(dispatch_args);
     auto data = static_cast<RenderEncoderData *>(encoder_current);
     data->ts_arg_marshal_tasks.push_back(
         {draw_args, draw_args_resource_id + draw_args_offset, max_object_threadgroups, dispatch_args,
@@ -1349,6 +1371,8 @@ public:
   TileBarrierContext tile_barrier_cmd;
 
 private:
+  void retainResourceForCurrentCommandBuffer(WMT::Resource resource);
+
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
@@ -1410,6 +1434,11 @@ private:
 
   uint64_t seq_id_;
   uint64_t frame_id_;
+  WMT::CommandBuffer current_command_buffer_;
+  std::vector<WMT::Reference<WMT::Resource>>
+      *current_command_buffer_resources_ = nullptr;
+  std::unordered_set<obj_handle_t>
+      *current_command_buffer_resource_handles_ = nullptr;
   CommandBufferDiagnosticInfo sparse_access_diagnostic_ = {};
 
   struct chunk {
