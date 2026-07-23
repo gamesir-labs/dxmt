@@ -27,9 +27,37 @@ constexpr GUID kOpenedFenceDataKey = {
     0x4af1,
     {0x93, 0x9a, 0xe5, 0x6d, 0x1b, 0xdf, 0x0b, 0x82}};
 
+constexpr std::array<UINT64, 3> kAlreadyCompletedValues = {0, 4, 5};
+
+const dxmt::test::LogicalCaseFamilyRegistration kCompletedEventRegistration(
+    "D3D11FenceSynchronizationContractSpec."
+    "SignalsEventForAlreadyCompletedValue",
+    "D3D11.Fence.Event.AlreadyCompleted.", kAlreadyCompletedValues.size(), 1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "ID3D11Fence,GetCompletedValue,SetEventOnCompletion,CreateEventW,"
+      "WaitForSingleObject"},
+     dxmt::test::kResourceTestCost,
+     "one test-local D3D11 fence and one scoped event per selected logical "
+     "case",
+     "register event thresholds below and equal to an already completed "
+     "fence value",
+     "every threshold at or below the completed value signals immediately "
+     "without changing the fence",
+     "logical ID, threshold, registration HRESULT, wait result, completed "
+     "value, device health, and exact replay argument"});
+
 const dxmt::test::TestCostRegistration kSharedFenceSynchronizationCost(
     "D3D11FenceSynchronizationContractSpec."
     "SharedFenceSynchronizesBidirectionallyAcrossDevices",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kCompletedEventCost("D3D11FenceSynchronizationContractSpec."
+                        "SignalsEventForAlreadyCompletedValue",
+                        dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kEventFanOutCost(
+    "D3D11FenceSynchronizationContractSpec.SignalsMultiplePendingEvents",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration
     kNamedDuplicatedFenceCost("D3D11FenceSynchronizationContractSpec."
@@ -123,12 +151,52 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
        SignalsEventForAlreadyCompletedValue) {
   ComPtr<ID3D11Fence> fence = CreateFence(5);
   ASSERT_NE(fence.get(), nullptr);
-  ScopedEvent event;
-  ASSERT_NE(event.handle, nullptr);
 
-  ASSERT_EQ(fence->SetEventOnCompletion(5, event.handle), S_OK);
-  EXPECT_EQ(WaitForSingleObject(event.handle, 5000), WAIT_OBJECT_0);
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kAlreadyCompletedValues.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kCompletedEventRegistration.family(),
+                                         logical))
+      continue;
+    ++selected_count;
+    const UINT64 threshold = kAlreadyCompletedValues[logical];
+    const auto case_id = dxmt::test::LogicalCaseId(
+        kCompletedEventRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message()
+                 << "LogicalCaseId: " << case_id << " threshold=" << threshold
+                 << " Replay: --dxmt-case-id=" << case_id);
+
+    ScopedEvent event;
+    ASSERT_NE(event.handle, nullptr);
+    ASSERT_EQ(fence->SetEventOnCompletion(threshold, event.handle), S_OK);
+    EXPECT_EQ(WaitForSingleObject(event.handle, 5000), WAIT_OBJECT_0);
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kCompletedEventRegistration.family().case_id_prefix);
   EXPECT_EQ(fence->GetCompletedValue(), 5u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceSynchronizationContractSpec, SignalsMultiplePendingEvents) {
+  ComPtr<ID3D11Fence> fence = CreateFence();
+  ASSERT_TRUE(fence);
+  ScopedEvent first_event;
+  ScopedEvent second_event;
+  ASSERT_NE(first_event.handle, nullptr);
+  ASSERT_NE(second_event.handle, nullptr);
+
+  ASSERT_EQ(fence->SetEventOnCompletion(3, first_event.handle), S_OK);
+  ASSERT_EQ(fence->SetEventOnCompletion(7, second_event.handle), S_OK);
+  EXPECT_EQ(WaitForSingleObject(first_event.handle, 0), WAIT_TIMEOUT);
+  EXPECT_EQ(WaitForSingleObject(second_event.handle, 0), WAIT_TIMEOUT);
+
+  ASSERT_EQ(immediate4_->Signal(fence.get(), 7), S_OK);
+  EXPECT_EQ(WaitForSingleObject(first_event.handle, 5000), WAIT_OBJECT_0);
+  EXPECT_EQ(WaitForSingleObject(second_event.handle, 5000), WAIT_OBJECT_0);
+  EXPECT_GE(fence->GetCompletedValue(), 7u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
