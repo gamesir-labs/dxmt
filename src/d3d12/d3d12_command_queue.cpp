@@ -4991,12 +4991,23 @@ public:
           device_->GetMTLDevice());
     }
     if (perf_stats) {
-      perf_stats->frame_submitted_descriptor_span_lookups +=
+      perf_stats->frame_generic_descriptor_span_lookups +=
           submitted_native_descriptor_spans->lookup_count;
-      perf_stats->frame_submitted_descriptor_unique_spans +=
+      perf_stats->frame_generic_descriptor_span_unique +=
           submitted_native_descriptor_spans->spans.size();
-      perf_stats->frame_submitted_descriptor_span_reuses +=
+      perf_stats->frame_generic_descriptor_span_reuses +=
           submitted_native_descriptor_spans->reuse_count;
+      const auto &frozen =
+          *submitted_native_descriptor_spans->frozen_native;
+      perf_stats->frame_frozen_native_direct_packets +=
+          frozen.direct_packet_count;
+      perf_stats->frame_frozen_range_lookups += frozen.range_lookups;
+      perf_stats->frame_frozen_range_unique += frozen.range_bases.size();
+      perf_stats->frame_frozen_range_reuses += frozen.range_reuses;
+      perf_stats->frame_frozen_root_word_lookups +=
+          frozen.root_word_lookups;
+      perf_stats->frame_frozen_root_word_reuses +=
+          frozen.root_word_reuses;
     }
 
     dxmt::perf::recordExecuteTime(
@@ -6516,9 +6527,12 @@ private:
     appendRootWords(const std::vector<uint32_t> &words) {
       if (words.empty())
         return {};
+      root_word_lookups++;
       if (const auto found = root_word_offsets.find(words);
-          found != root_word_offsets.end())
+          found != root_word_offsets.end()) {
+        root_word_reuses++;
         return {found->second, static_cast<uint32_t>(words.size())};
+      }
       while (root_words.size() & 3u)
         root_words.push_back(0);
       const auto offset = uint64_t(root_words.size()) * sizeof(uint32_t);
@@ -6537,6 +6551,11 @@ private:
     std::unordered_map<std::vector<uint64_t>, uint32_t, RangeKeyHash>
         range_bases;
     std::map<std::vector<uint32_t>, uint64_t> root_word_offsets;
+    uint64_t direct_packet_count = 0;
+    uint64_t range_lookups = 0;
+    uint64_t range_reuses = 0;
+    uint64_t root_word_lookups = 0;
+    uint64_t root_word_reuses = 0;
     WMT::Reference<WMT::Buffer> descriptor_table_buffer;
     WMT::Reference<WMT::Buffer> buffer_record_buffer;
     WMT::Reference<WMT::Buffer> buffer_resource_table_buffer;
@@ -7002,6 +7021,9 @@ private:
     std::vector<PendingTimestampMarker> pending_timestamp_markers;
     std::vector<PendingTimestampResolve> pending_timestamp_resolves;
     std::vector<PendingCpuQueryResolve> pending_immediate_cpu_query_resolves;
+    CompiledCommandTestTelemetry *submission_boundary_telemetry = nullptr;
+    CompiledEncoderKind submission_boundary_kind =
+        CompiledEncoderKind::None;
   };
 
   static ReplayState
@@ -7052,6 +7074,18 @@ private:
           std::chrono::duration_cast<std::chrono::microseconds>(
               clock::now() - rb_clone_t0).count();
     return copy;
+  }
+
+  void ResetReplayCommandListSemanticState(ReplayState &state) {
+    // Command-list state does not carry across D3D12 command-list boundaries,
+    // but submission-owned batches, descriptor snapshots, resource state and
+    // deferred barriers do. Reset only the API-visible recording state so
+    // compatible work from adjacent lists can remain in the same Metal
+    // encoder without allowing a fallback record to inherit bindings.
+    ResetReplayApiState(state, nullptr);
+    state.current_record_d3d_sequence = 0;
+    state.compiled_fallback_reason =
+        dxmt::CompiledFallbackReason::Unknown;
   }
 
   struct CompiledDirectComputeBindingPayload {
@@ -7346,6 +7380,41 @@ private:
     return HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
            HasPendingGraphicsPass(state) ||
            !state.pending_timestamp_markers.empty();
+  }
+
+  static void ResolveSubmissionEncoderBoundary(
+      ReplayState &state, CompiledEncoderKind incoming_kind,
+      bool compatible) {
+    auto *telemetry = state.submission_boundary_telemetry;
+    if (state.submission_boundary_kind == CompiledEncoderKind::None)
+      return;
+    if (compatible &&
+        state.submission_boundary_kind == incoming_kind) {
+      if (telemetry) {
+        auto &counter =
+            incoming_kind == CompiledEncoderKind::Graphics
+                ? telemetry
+                      ->submission_graphics_encoder_boundary_merges
+                : telemetry
+                      ->submission_compute_encoder_boundary_merges;
+        counter.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (auto *stats = dxmt::perf::currentFrameStatistics()) {
+        if (incoming_kind == CompiledEncoderKind::Graphics)
+          stats->frame_submission_graphics_encoder_boundary_merges++;
+        else
+          stats->frame_submission_compute_encoder_boundary_merges++;
+      }
+    } else {
+      if (telemetry) {
+        telemetry->submission_encoder_boundary_flushes.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+      if (auto *stats = dxmt::perf::currentFrameStatistics())
+        stats->frame_submission_encoder_boundary_flushes++;
+    }
+    state.submission_boundary_telemetry = nullptr;
+    state.submission_boundary_kind = CompiledEncoderKind::None;
   }
 
   static ResourceAccessBarrierBatch
@@ -7742,6 +7811,8 @@ private:
 
   void FlushPassBatches(CommandChunk *chunk, ReplayState &state) {
     StallScope _ss(StallDiagEnabled(), &stallProbe().emitUs);
+    ResolveSubmissionEncoderBoundary(
+        state, CompiledEncoderKind::None, false);
     const bool has_encoder_work =
         HasPendingBlitBatch(state) || HasPendingComputePass(state) ||
         HasPendingGraphicsPass(state);
@@ -8338,6 +8409,13 @@ private:
     RecordGraphicsPacketClassification(
         state, kind, bindless_compiled_candidate, use_geometry,
         use_tessellation);
+    ResolveSubmissionEncoderBoundary(
+        state, CompiledEncoderKind::Graphics,
+        state.submission_boundary_kind == CompiledEncoderKind::Graphics &&
+            !HasPendingComputePass(state) && !HasPendingBlitBatch(state) &&
+            state.graphics_pass_batch.active &&
+            ReplayRenderPassAttachmentsMatch(
+                state.graphics_pass_batch.attachments, attachments));
     if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
       FlushPassBatches(chunk, state);
 
@@ -8386,6 +8464,13 @@ private:
       ReplayGraphicsCommandKind kind) {
     RecordGraphicsPacketClassification(state, kind, true, use_geometry,
                                        use_tessellation);
+    ResolveSubmissionEncoderBoundary(
+        state, CompiledEncoderKind::Graphics,
+        state.submission_boundary_kind == CompiledEncoderKind::Graphics &&
+            !HasPendingComputePass(state) && !HasPendingBlitBatch(state) &&
+            state.graphics_pass_batch.active &&
+            ReplayRenderPassAttachmentsMatch(
+                state.graphics_pass_batch.attachments, attachments));
     if (HasPendingComputePass(state) || HasPendingBlitBatch(state))
       FlushPassBatches(chunk, state);
 
@@ -8523,6 +8608,11 @@ private:
                                uint64_t argument_buffer_size, Fn &&fn,
                                bool compiled_candidate = false) {
     RecordComputePacketClassification(state, compiled_candidate);
+    ResolveSubmissionEncoderBoundary(
+        state, CompiledEncoderKind::Compute,
+        state.submission_boundary_kind == CompiledEncoderKind::Compute &&
+            !HasPendingGraphicsPass(state) && !HasPendingBlitBatch(state) &&
+            state.compute_pass_batch.active);
     if (!D3D12ReplayComputeBatchingEnabled()) {
       FlushPassBatches(chunk, state);
       EmitSingleComputePass(chunk, argument_buffer_size,
@@ -8552,6 +8642,11 @@ private:
       CommandChunk *chunk, ReplayState &state, uint64_t argument_buffer_size,
       Payload &&payload, ReplayGraphicsCompiledEncodeFn compiled_encode) {
     RecordComputePacketClassification(state, true);
+    ResolveSubmissionEncoderBoundary(
+        state, CompiledEncoderKind::Compute,
+        state.submission_boundary_kind == CompiledEncoderKind::Compute &&
+            !HasPendingGraphicsPass(state) && !HasPendingBlitBatch(state) &&
+            state.compute_pass_batch.active);
     if (!D3D12ReplayComputeBatchingEnabled()) {
       FlushPassBatches(chunk, state);
       auto arena =
@@ -9488,6 +9583,7 @@ private:
     }
     if (frozen_native_direct) {
       snapshot->frozen_native = native_span_store->frozen_native;
+      snapshot->frozen_native->direct_packet_count++;
       snapshot->native_descriptor_accesses.reserve(
           binding_recipe->entries.size());
       if (compute) {
@@ -9664,6 +9760,30 @@ private:
     const auto span_lookups_before = native_span_store->lookup_count;
     const auto spans_before = native_span_store->spans.size();
     const auto span_reuses_before = native_span_store->reuse_count;
+    const auto frozen_direct_before =
+        native_span_store->frozen_native
+            ? native_span_store->frozen_native->direct_packet_count
+            : 0;
+    const auto frozen_range_lookups_before =
+        native_span_store->frozen_native
+            ? native_span_store->frozen_native->range_lookups
+            : 0;
+    const auto frozen_ranges_before =
+        native_span_store->frozen_native
+            ? native_span_store->frozen_native->range_bases.size()
+            : 0;
+    const auto frozen_range_reuses_before =
+        native_span_store->frozen_native
+            ? native_span_store->frozen_native->range_reuses
+            : 0;
+    const auto frozen_root_lookups_before =
+        native_span_store->frozen_native
+            ? native_span_store->frozen_native->root_word_lookups
+            : 0;
+    const auto frozen_root_reuses_before =
+        native_span_store->frozen_native
+            ? native_span_store->frozen_native->root_word_reuses
+            : 0;
     auto snapshot_arena = std::make_shared<SubmittedBindingSnapshotArena>();
     snapshot_arena->snapshots.reserve(compiled.graphics_packets.size() +
                                       compiled.compute_packets.size());
@@ -9863,15 +9983,37 @@ private:
       compiled.test_telemetry->submitted_descriptor_record_reuses.fetch_add(
           descriptor_records->reuse_count - reuses_before,
           std::memory_order_relaxed);
-      compiled.test_telemetry->submitted_descriptor_span_lookups.fetch_add(
+      compiled.test_telemetry->generic_descriptor_span_lookups.fetch_add(
           native_span_store->lookup_count - span_lookups_before,
           std::memory_order_relaxed);
-      compiled.test_telemetry->submitted_unique_descriptor_spans.fetch_add(
+      compiled.test_telemetry->generic_descriptor_span_unique.fetch_add(
           static_cast<UINT>(native_span_store->spans.size() - spans_before),
           std::memory_order_relaxed);
-      compiled.test_telemetry->submitted_descriptor_span_reuses.fetch_add(
+      compiled.test_telemetry->generic_descriptor_span_reuses.fetch_add(
           native_span_store->reuse_count - span_reuses_before,
           std::memory_order_relaxed);
+      if (native_span_store->frozen_native) {
+        const auto &frozen = *native_span_store->frozen_native;
+        compiled.test_telemetry->frozen_native_direct_packets.fetch_add(
+            frozen.direct_packet_count - frozen_direct_before,
+            std::memory_order_relaxed);
+        compiled.test_telemetry->frozen_range_lookups.fetch_add(
+            frozen.range_lookups - frozen_range_lookups_before,
+            std::memory_order_relaxed);
+        compiled.test_telemetry->frozen_range_unique.fetch_add(
+            static_cast<UINT>(frozen.range_bases.size() -
+                              frozen_ranges_before),
+            std::memory_order_relaxed);
+        compiled.test_telemetry->frozen_range_reuses.fetch_add(
+            frozen.range_reuses - frozen_range_reuses_before,
+            std::memory_order_relaxed);
+        compiled.test_telemetry->frozen_root_word_lookups.fetch_add(
+            frozen.root_word_lookups - frozen_root_lookups_before,
+            std::memory_order_relaxed);
+        compiled.test_telemetry->frozen_root_word_reuses.fetch_add(
+            frozen.root_word_reuses - frozen_root_reuses_before,
+            std::memory_order_relaxed);
+      }
     }
     return snapshots;
   }
@@ -9959,12 +10101,10 @@ private:
   }
 
   void ExecuteCompiledCommandList(
-                            const SubmittedCompiledCommandListPlan *submitted,
-                            const CompiledCommandDescriptorSnapshots
-                                *submitted_descriptor_snapshots,
-                            std::vector<Com<ID3D12Resource>> &touched_resources,
-                            std::unordered_set<ID3D12Resource *> &touched_resources_set,
-                            ResourceAccessBarrierBatch &queue_pending_barriers) {
+      const SubmittedCompiledCommandListPlan *submitted,
+      const CompiledCommandDescriptorSnapshots *submitted_descriptor_snapshots,
+      ReplayState &state, bool finalize_submission,
+      ResourceAccessBarrierBatch &queue_pending_barriers) {
     auto &queue = device_->GetDXMTDevice().queue();
     auto *chunk = queue.CurrentChunk();
     const CompiledCommandList *compiled =
@@ -9976,13 +10116,16 @@ private:
     const auto &records = compiled->fallback_records
                               ? *compiled->fallback_records
                               : no_fallback_records;
-    ReplayState state = {};
-    state.pending_resource_barriers =
-        std::move(queue_pending_barriers);
-    state.resource_states = &resource_states_->resources;
-    state.queue_type = desc_.Type;
-    state.touched_resources = &touched_resources;
-    state.touched_resources_set = &touched_resources_set;
+    if (HasPendingGraphicsPass(state)) {
+      state.submission_boundary_kind = CompiledEncoderKind::Graphics;
+      state.submission_boundary_telemetry =
+          compiled->test_telemetry.get();
+    } else if (HasPendingComputePass(state)) {
+      state.submission_boundary_kind = CompiledEncoderKind::Compute;
+      state.submission_boundary_telemetry =
+          compiled->test_telemetry.get();
+    }
+    ResetReplayCommandListSemanticState(state);
     static std::atomic<uint32_t> replay_log_count = 0;
     if (D3D12DiagShouldLog(replay_log_count, D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: execute compiled nodes begin"
@@ -11985,12 +12128,19 @@ private:
            " records=", records.size());
     }
     const auto rb_t1 = replay_perf ? clock::now() : clock::time_point{};
-    FlushPassBatches(chunk, state);
+    // A deferred timestamp marker is an ordering point between command lists.
+    // Otherwise keep compatible render/compute work open until the entire
+    // ExecuteCommandLists submission has been consumed.
+    if (finalize_submission || !state.pending_timestamp_markers.empty())
+      FlushPassBatches(chunk, state);
     const auto rb_t2 = replay_perf ? clock::now() : clock::time_point{};
-    MaterializeTimestampResolves(chunk, state);
+    if (finalize_submission)
+      MaterializeTimestampResolves(chunk, state);
     const auto rb_t3 = replay_perf ? clock::now() : clock::time_point{};
-    MaterializeCpuQueryResolves(chunk, state);
-    queue_pending_barriers = TakePendingResourceBarrierBatch(state);
+    if (finalize_submission) {
+      MaterializeCpuQueryResolves(chunk, state);
+      queue_pending_barriers = TakePendingResourceBarrierBatch(state);
+    }
     if (replay_perf) {
       const auto rb_t4 = clock::now();
       auto *stats = dxmt::perf::currentFrameStatistics();
@@ -12343,7 +12493,8 @@ private:
            " queue=", reinterpret_cast<uintptr_t>(this),
            " queueType=", desc_.Type,
            " records=", records.size(),
-           " touchedResources=", touched_resources.size());
+           " touchedResources=",
+           state.touched_resources ? state.touched_resources->size() : 0);
     }
   }
 
@@ -19216,8 +19367,10 @@ private:
                     : 0);
           }
         }
+        store.range_lookups++;
         auto [range_it, inserted] =
             store.range_bases.try_emplace(std::move(range_key), 0);
+        store.range_reuses += inserted ? 0 : 1;
         if (inserted) {
           range_it->second = store.allocateSlots(range_length);
           for (const auto &slot : captured)
@@ -28201,6 +28354,22 @@ private:
         std::unordered_set<ID3D12Resource *> touched_resources_set;
         ResourceAccessBarrierBatch queue_pending_barriers =
             std::move(pending_queue_resource_barriers_);
+        ReplayState submission_replay_state = {};
+        submission_replay_state.pending_resource_barriers =
+            std::move(queue_pending_barriers);
+        submission_replay_state.resource_states =
+            &resource_states_->resources;
+        submission_replay_state.queue_type = desc_.Type;
+        submission_replay_state.touched_resources = &touched_resources;
+        submission_replay_state.touched_resources_set =
+            &touched_resources_set;
+        size_t last_compiled_list_index = SIZE_MAX;
+        for (size_t index = 0;
+             index < operation.submitted_command_lists.size(); ++index) {
+          const auto &candidate = operation.submitted_command_lists[index];
+          if (candidate && candidate->generation)
+            last_compiled_list_index = index;
+        }
         UINT command_list_index = 0;
         for (const auto &submitted_plan : operation.submitted_command_lists) {
           const SubmittedCompiledCommandListPlan *submitted =
@@ -28230,8 +28399,9 @@ private:
           }
           const auto replay_begin = clock::now();
           ExecuteCompiledCommandList(submitted, descriptor_snapshots,
-                                     touched_resources,
-                                     touched_resources_set,
+                                     submission_replay_state,
+                                     command_list_index ==
+                                         last_compiled_list_index,
                                      queue_pending_barriers);
           RecordExecuteDrainTime(
               operation_perf_stats, dxmt::perf::ExecuteTimeBucket::Replay,
@@ -28247,6 +28417,9 @@ private:
           }
           command_list_index++;
         }
+        if (last_compiled_list_index == SIZE_MAX)
+          queue_pending_barriers = TakePendingResourceBarrierBatch(
+              submission_replay_state);
         pending_queue_resource_barriers_ =
             std::move(queue_pending_barriers);
         {

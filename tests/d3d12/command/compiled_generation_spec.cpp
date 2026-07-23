@@ -194,6 +194,130 @@ TEST_F(CompiledGenerationSpec, MergesComputeNodesAcrossElidedState) {
   EXPECT_EQ(submitted.encoder_binding_program_hits, 0u);
 }
 
+TEST_F(CompiledGenerationSpec,
+       MergesComputeEncodersAcrossCommandListsInOneSubmission) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto shader = dxmt::test::CompileShader(
+      "[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(),
+      {shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+
+  std::array<ComPtr<ID3D12CommandAllocator>, 2> allocators;
+  std::array<ComPtr<ID3D12GraphicsCommandList>, 2> lists;
+  for (UINT index = 0; index < lists.size(); ++index) {
+    ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                  D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  __uuidof(ID3D12CommandAllocator),
+                  reinterpret_cast<void **>(allocators[index].put())),
+              S_OK);
+    ASSERT_EQ(context_.device()->CreateCommandList(
+                  0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  allocators[index].get(), nullptr,
+                  __uuidof(ID3D12GraphicsCommandList),
+                  reinterpret_cast<void **>(lists[index].put())),
+              S_OK);
+    EnableStats(lists[index].get());
+    lists[index]->SetPipelineState(pipeline.get());
+    lists[index]->SetComputeRootSignature(root_signature.get());
+    lists[index]->Dispatch(1, 1, 1);
+    ASSERT_EQ(lists[index]->Close(), S_OK);
+  }
+
+  ID3D12CommandList *submission[] = {lists[0].get(), lists[1].get()};
+  context_.queue()->ExecuteCommandLists(ARRAYSIZE(submission), submission);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  const auto second = ReadStats(lists[1].get());
+  EXPECT_EQ(second.submission_compute_encoder_boundary_merges, 1u);
+  EXPECT_EQ(second.submission_graphics_encoder_boundary_merges, 0u);
+  EXPECT_EQ(second.submission_encoder_boundary_flushes, 0u);
+}
+
+TEST_F(CompiledGenerationSpec,
+       MergesOnlyCompatibleGraphicsAttachmentsAcrossCommandLists) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto pixel = dxmt::test::CompileShader(
+      "float4 main() : SV_Target { return float4(1, 1, 1, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  auto pipeline = context_.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+      {pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+
+  std::array<ComPtr<ID3D12Resource>, 2> targets = {
+      context_.CreateTexture2D(
+          8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+          D3D12_RESOURCE_STATE_RENDER_TARGET),
+      context_.CreateTexture2D(
+          8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+          D3D12_RESOURCE_STATE_RENDER_TARGET)};
+  auto heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
+  ASSERT_TRUE(targets[0]);
+  ASSERT_TRUE(targets[1]);
+  ASSERT_TRUE(heap);
+  std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 2> rtvs = {
+      heap->GetCPUDescriptorHandleForHeapStart(),
+      heap->GetCPUDescriptorHandleForHeapStart()};
+  rtvs[1].ptr += context_.device()->GetDescriptorHandleIncrementSize(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  context_.device()->CreateRenderTargetView(
+      targets[0].get(), nullptr, rtvs[0]);
+  context_.device()->CreateRenderTargetView(
+      targets[1].get(), nullptr, rtvs[1]);
+
+  std::array<ComPtr<ID3D12CommandAllocator>, 3> allocators;
+  std::array<ComPtr<ID3D12GraphicsCommandList>, 3> lists;
+  const D3D12_VIEWPORT viewport = {0, 0, 8, 8, 0, 1};
+  const D3D12_RECT scissor = {0, 0, 8, 8};
+  for (UINT index = 0; index < lists.size(); ++index) {
+    ASSERT_EQ(context_.device()->CreateCommandAllocator(
+                  D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  __uuidof(ID3D12CommandAllocator),
+                  reinterpret_cast<void **>(allocators[index].put())),
+              S_OK);
+    ASSERT_EQ(context_.device()->CreateCommandList(
+                  0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  allocators[index].get(), nullptr,
+                  __uuidof(ID3D12GraphicsCommandList),
+                  reinterpret_cast<void **>(lists[index].put())),
+              S_OK);
+    EnableStats(lists[index].get());
+    lists[index]->SetGraphicsRootSignature(root_signature.get());
+    lists[index]->SetPipelineState(pipeline.get());
+    lists[index]->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    lists[index]->RSSetViewports(1, &viewport);
+    lists[index]->RSSetScissorRects(1, &scissor);
+    const auto rtv = rtvs[index < 2 ? 0 : 1];
+    lists[index]->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    lists[index]->DrawInstanced(3, 1, 0, 0);
+    ASSERT_EQ(lists[index]->Close(), S_OK);
+  }
+
+  ID3D12CommandList *submission[] = {
+      lists[0].get(), lists[1].get(), lists[2].get()};
+  context_.queue()->ExecuteCommandLists(ARRAYSIZE(submission), submission);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  const auto compatible = ReadStats(lists[1].get());
+  EXPECT_EQ(compatible.submission_graphics_encoder_boundary_merges, 1u);
+  EXPECT_EQ(compatible.submission_encoder_boundary_flushes, 0u);
+  const auto incompatible = ReadStats(lists[2].get());
+  EXPECT_EQ(incompatible.submission_graphics_encoder_boundary_merges, 0u);
+  EXPECT_EQ(incompatible.submission_encoder_boundary_flushes, 1u);
+}
+
 TEST_F(CompiledGenerationSpec, LowersDirectIndirectDispatchIntoComputeEncoder) {
   const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   auto root_signature = context_.CreateRootSignature(root_desc);

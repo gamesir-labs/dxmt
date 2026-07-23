@@ -4343,14 +4343,38 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
     stats.submitted_descriptor_record_reuses =
         telemetry.submitted_descriptor_record_reuses.load(
             std::memory_order_acquire);
-    stats.submitted_descriptor_span_lookups =
-        telemetry.submitted_descriptor_span_lookups.load(
+    stats.generic_descriptor_span_lookups =
+        telemetry.generic_descriptor_span_lookups.load(
             std::memory_order_acquire);
-    stats.submitted_unique_descriptor_spans =
-        telemetry.submitted_unique_descriptor_spans.load(
+    stats.generic_descriptor_span_unique =
+        telemetry.generic_descriptor_span_unique.load(
             std::memory_order_acquire);
-    stats.submitted_descriptor_span_reuses =
-        telemetry.submitted_descriptor_span_reuses.load(
+    stats.generic_descriptor_span_reuses =
+        telemetry.generic_descriptor_span_reuses.load(
+            std::memory_order_acquire);
+    stats.frozen_native_direct_packets =
+        telemetry.frozen_native_direct_packets.load(
+            std::memory_order_acquire);
+    stats.frozen_range_lookups =
+        telemetry.frozen_range_lookups.load(std::memory_order_acquire);
+    stats.frozen_range_unique =
+        telemetry.frozen_range_unique.load(std::memory_order_acquire);
+    stats.frozen_range_reuses =
+        telemetry.frozen_range_reuses.load(std::memory_order_acquire);
+    stats.frozen_root_word_lookups =
+        telemetry.frozen_root_word_lookups.load(
+            std::memory_order_acquire);
+    stats.frozen_root_word_reuses =
+        telemetry.frozen_root_word_reuses.load(
+            std::memory_order_acquire);
+    stats.submission_graphics_encoder_boundary_merges =
+        telemetry.submission_graphics_encoder_boundary_merges.load(
+            std::memory_order_acquire);
+    stats.submission_compute_encoder_boundary_merges =
+        telemetry.submission_compute_encoder_boundary_merges.load(
+            std::memory_order_acquire);
+    stats.submission_encoder_boundary_flushes =
+        telemetry.submission_encoder_boundary_flushes.load(
             std::memory_order_acquire);
     stats.submitted_generation_shares =
         telemetry.submitted_generation_shares.load(std::memory_order_acquire);

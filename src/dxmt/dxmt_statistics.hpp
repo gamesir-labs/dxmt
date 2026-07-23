@@ -525,9 +525,18 @@ struct FrameStatistics {
   uint64_t frame_native_descriptor_buffer_record_counters = 0;
   uint64_t frame_native_descriptor_buffer_record_missing_resource = 0;
   uint64_t frame_native_descriptor_resource_table_entries = 0;
-  uint64_t frame_submitted_descriptor_span_lookups = 0;
-  uint64_t frame_submitted_descriptor_unique_spans = 0;
-  uint64_t frame_submitted_descriptor_span_reuses = 0;
+  uint64_t frame_generic_descriptor_span_lookups = 0;
+  uint64_t frame_generic_descriptor_span_unique = 0;
+  uint64_t frame_generic_descriptor_span_reuses = 0;
+  uint64_t frame_frozen_native_direct_packets = 0;
+  uint64_t frame_frozen_range_lookups = 0;
+  uint64_t frame_frozen_range_unique = 0;
+  uint64_t frame_frozen_range_reuses = 0;
+  uint64_t frame_frozen_root_word_lookups = 0;
+  uint64_t frame_frozen_root_word_reuses = 0;
+  uint64_t frame_submission_graphics_encoder_boundary_merges = 0;
+  uint64_t frame_submission_compute_encoder_boundary_merges = 0;
+  uint64_t frame_submission_encoder_boundary_flushes = 0;
   uint64_t frame_descriptor_content_writes = 0;
   uint64_t frame_descriptor_content_write_cbv = 0;
   uint64_t frame_descriptor_content_write_srv = 0;
@@ -863,9 +872,18 @@ struct FrameStatistics {
     frame_native_descriptor_buffer_record_counters = 0;
     frame_native_descriptor_buffer_record_missing_resource = 0;
     frame_native_descriptor_resource_table_entries = 0;
-    frame_submitted_descriptor_span_lookups = 0;
-    frame_submitted_descriptor_unique_spans = 0;
-    frame_submitted_descriptor_span_reuses = 0;
+    frame_generic_descriptor_span_lookups = 0;
+    frame_generic_descriptor_span_unique = 0;
+    frame_generic_descriptor_span_reuses = 0;
+    frame_frozen_native_direct_packets = 0;
+    frame_frozen_range_lookups = 0;
+    frame_frozen_range_unique = 0;
+    frame_frozen_range_reuses = 0;
+    frame_frozen_root_word_lookups = 0;
+    frame_frozen_root_word_reuses = 0;
+    frame_submission_graphics_encoder_boundary_merges = 0;
+    frame_submission_compute_encoder_boundary_merges = 0;
+    frame_submission_encoder_boundary_flushes = 0;
     frame_descriptor_content_writes = 0;
     frame_descriptor_content_write_cbv = 0;
     frame_descriptor_content_write_srv = 0;
@@ -1287,9 +1305,21 @@ public:
       average_.frame_native_descriptor_buffer_record_counters += frames_[i].frame_native_descriptor_buffer_record_counters;
       average_.frame_native_descriptor_buffer_record_missing_resource += frames_[i].frame_native_descriptor_buffer_record_missing_resource;
       average_.frame_native_descriptor_resource_table_entries += frames_[i].frame_native_descriptor_resource_table_entries;
-      average_.frame_submitted_descriptor_span_lookups += frames_[i].frame_submitted_descriptor_span_lookups;
-      average_.frame_submitted_descriptor_unique_spans += frames_[i].frame_submitted_descriptor_unique_spans;
-      average_.frame_submitted_descriptor_span_reuses += frames_[i].frame_submitted_descriptor_span_reuses;
+      average_.frame_generic_descriptor_span_lookups += frames_[i].frame_generic_descriptor_span_lookups;
+      average_.frame_generic_descriptor_span_unique += frames_[i].frame_generic_descriptor_span_unique;
+      average_.frame_generic_descriptor_span_reuses += frames_[i].frame_generic_descriptor_span_reuses;
+      average_.frame_frozen_native_direct_packets += frames_[i].frame_frozen_native_direct_packets;
+      average_.frame_frozen_range_lookups += frames_[i].frame_frozen_range_lookups;
+      average_.frame_frozen_range_unique += frames_[i].frame_frozen_range_unique;
+      average_.frame_frozen_range_reuses += frames_[i].frame_frozen_range_reuses;
+      average_.frame_frozen_root_word_lookups += frames_[i].frame_frozen_root_word_lookups;
+      average_.frame_frozen_root_word_reuses += frames_[i].frame_frozen_root_word_reuses;
+      average_.frame_submission_graphics_encoder_boundary_merges +=
+          frames_[i].frame_submission_graphics_encoder_boundary_merges;
+      average_.frame_submission_compute_encoder_boundary_merges +=
+          frames_[i].frame_submission_compute_encoder_boundary_merges;
+      average_.frame_submission_encoder_boundary_flushes +=
+          frames_[i].frame_submission_encoder_boundary_flushes;
       average_.frame_descriptor_content_writes += frames_[i].frame_descriptor_content_writes;
       average_.frame_descriptor_content_write_cbv += frames_[i].frame_descriptor_content_write_cbv;
       average_.frame_descriptor_content_write_srv += frames_[i].frame_descriptor_content_write_srv;
@@ -1626,9 +1656,21 @@ public:
     average_.frame_native_descriptor_buffer_record_counters /= (kFrameStatisticsCount - 1);
     average_.frame_native_descriptor_buffer_record_missing_resource /= (kFrameStatisticsCount - 1);
     average_.frame_native_descriptor_resource_table_entries /= (kFrameStatisticsCount - 1);
-    average_.frame_submitted_descriptor_span_lookups /= (kFrameStatisticsCount - 1);
-    average_.frame_submitted_descriptor_unique_spans /= (kFrameStatisticsCount - 1);
-    average_.frame_submitted_descriptor_span_reuses /= (kFrameStatisticsCount - 1);
+    average_.frame_generic_descriptor_span_lookups /= (kFrameStatisticsCount - 1);
+    average_.frame_generic_descriptor_span_unique /= (kFrameStatisticsCount - 1);
+    average_.frame_generic_descriptor_span_reuses /= (kFrameStatisticsCount - 1);
+    average_.frame_frozen_native_direct_packets /= (kFrameStatisticsCount - 1);
+    average_.frame_frozen_range_lookups /= (kFrameStatisticsCount - 1);
+    average_.frame_frozen_range_unique /= (kFrameStatisticsCount - 1);
+    average_.frame_frozen_range_reuses /= (kFrameStatisticsCount - 1);
+    average_.frame_frozen_root_word_lookups /= (kFrameStatisticsCount - 1);
+    average_.frame_frozen_root_word_reuses /= (kFrameStatisticsCount - 1);
+    average_.frame_submission_graphics_encoder_boundary_merges /=
+        (kFrameStatisticsCount - 1);
+    average_.frame_submission_compute_encoder_boundary_merges /=
+        (kFrameStatisticsCount - 1);
+    average_.frame_submission_encoder_boundary_flushes /=
+        (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_writes /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_cbv /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_srv /= (kFrameStatisticsCount - 1);
