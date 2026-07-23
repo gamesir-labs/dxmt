@@ -11075,19 +11075,30 @@ private:
           active_encoder_attachments.reset();
         }
         if (encoder_node.begins_encoder &&
-            encoder_node.encoder_kind == CompiledEncoderKind::Graphics &&
-            segment.graphics_packet_count) {
-          const auto &first_packet = compiled->graphics_packets[
-              segment.first_graphics_packet];
+            encoder_node.encoder_kind == CompiledEncoderKind::Graphics) {
+          const CompiledCommandRenderState *first_render_state = nullptr;
+          if (segment.graphics_packet_count) {
+            first_render_state =
+                &compiled->graphics_packets[segment.first_graphics_packet]
+                     .render_state;
+          } else if (segment.kind == CompiledCommandSegmentKind::Indirect &&
+                     segment.indirect_packet_count) {
+            const auto &indirect = compiled->indirect_packets[
+                segment.first_indirect_packet];
+            if (indirect.graphics_state)
+              first_render_state = &indirect.graphics_state->render_state;
+          }
           // Reserved-resource allocation and present-source tracking are
           // submission-dynamic, so materialize the immutable Close-time
           // attachment identity once per active encoder rather than once per
           // draw packet.
-          active_encoder_attachments.emplace(BuildRenderPassAttachments(
-              first_packet.render_state, nullptr));
-          if (test_telemetry)
-            test_telemetry->encoder_attachment_materializations.fetch_add(
-                1, std::memory_order_relaxed);
+          if (first_render_state) {
+            active_encoder_attachments.emplace(BuildRenderPassAttachments(
+                *first_render_state, nullptr));
+            if (test_telemetry)
+              test_telemetry->encoder_attachment_materializations.fetch_add(
+                  1, std::memory_order_relaxed);
+          }
         }
         record_index = segment.first_record_index;
         if (!segment.record_count && test_telemetry) {
@@ -11241,6 +11252,20 @@ private:
           for (UINT i = 0; i < segment.indirect_packet_count; i++) {
             const auto packet_index = segment.first_indirect_packet + i;
             const auto &packet = compiled->indirect_packets[packet_index];
+            if (test_telemetry) {
+              test_telemetry->replayed_indirect_nodes.fetch_add(
+                  1, std::memory_order_relaxed);
+              if (packet.execute.count_buffer)
+                test_telemetry->replayed_indirect_dependency_nodes.fetch_add(
+                    1, std::memory_order_relaxed);
+              auto *signature = dynamic_cast<CommandSignature *>(
+                  packet.execute.command_signature.ptr());
+              if (!signature ||
+                  GetDirectIndirectOperation(signature->GetArguments()) ==
+                      DirectIndirectOperation::None)
+                test_telemetry->replayed_indirect_fallbacks.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             // The packet already contains the complete state for its pipeline
             // domain. Replay only deferred state outside that domain (notably
             // predication and ClearState effects) instead of redundantly
@@ -13607,17 +13632,12 @@ private:
     }
 
     const auto direct_operation = GetDirectIndirectOperation(arguments);
-    if (direct_operation == DirectIndirectOperation::Dispatch &&
-        ReplayExecuteIndirectDirect(chunk, state, record, desc, arguments[0],
-                                    direct_operation))
-      return;
-
-    FlushPassBatches(chunk, state);
     if (direct_operation != DirectIndirectOperation::None &&
         ReplayExecuteIndirectDirect(chunk, state, record, desc, arguments[0],
                                     direct_operation))
       return;
 
+    FlushPassBatches(chunk, state);
     ReplayExecuteIndirectCpuFallback(chunk, state, record, *signature);
   }
 

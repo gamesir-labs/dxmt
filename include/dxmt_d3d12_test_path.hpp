@@ -103,6 +103,9 @@ struct ExecutionPathStats {
   std::uint32_t submitted_descriptor_span_lookups = 0;
   std::uint32_t submitted_unique_descriptor_spans = 0;
   std::uint32_t submitted_descriptor_span_reuses = 0;
+  std::uint32_t replayed_indirect_nodes = 0;
+  std::uint32_t replayed_indirect_dependency_nodes = 0;
+  std::uint32_t replayed_indirect_fallbacks = 0;
   std::uint32_t encoder_graph_node_count = 0;
   std::uint32_t graphics_encoder_node_count = 0;
   std::uint32_t compute_encoder_node_count = 0;

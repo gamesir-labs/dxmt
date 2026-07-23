@@ -1073,6 +1073,9 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> submitted_descriptor_span_lookups = 0;
   std::atomic<UINT> submitted_unique_descriptor_spans = 0;
   std::atomic<UINT> submitted_descriptor_span_reuses = 0;
+  std::atomic<UINT> replayed_indirect_nodes = 0;
+  std::atomic<UINT> replayed_indirect_dependency_nodes = 0;
+  std::atomic<UINT> replayed_indirect_fallbacks = 0;
   std::atomic<UINT> submitted_generation_shares = 0;
   std::atomic<UINT> submitted_generation_deep_copies = 0;
   std::atomic<UINT> encoder_attachment_materializations = 0;

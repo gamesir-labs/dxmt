@@ -2038,7 +2038,9 @@ AppendCompiledIndirectSegment(
     if (last.kind == CompiledCommandSegmentKind::Indirect &&
         last.first_record_index + last.record_count == record_index &&
         last.first_indirect_packet + last.indirect_packet_count ==
-            packet_index) {
+            packet_index && packet_index &&
+        indirect_packets[packet_index - 1].compute ==
+            indirect_packets[packet_index].compute) {
       last.record_count++;
       last.indirect_packet_count++;
       return;
@@ -2932,6 +2934,42 @@ static void AnnotateCompiledEncoderLifetimes(CompiledCommandList &compiled) {
         node.encoder_index = active_encoder;
       }
       active_render_state = nullptr;
+      continue;
+    }
+    if (segment.kind == CompiledCommandSegmentKind::Indirect &&
+        segment.indirect_packet_count) {
+      const auto &first = compiled.indirect_packets[
+          segment.first_indirect_packet];
+      if (first.compute) {
+        if (active_kind != CompiledEncoderKind::Compute)
+          begin_encoder(node, CompiledEncoderKind::Compute);
+        else {
+          node.encoder_kind = active_kind;
+          node.encoder_index = active_encoder;
+        }
+        active_render_state = nullptr;
+      } else if (first.graphics_state) {
+        const auto &render_state = first.graphics_state->render_state;
+        if (active_kind != CompiledEncoderKind::Graphics ||
+            !active_render_state ||
+            !CompiledRenderAttachmentsCompatible(*active_render_state,
+                                                 render_state)) {
+          begin_encoder(node, CompiledEncoderKind::Graphics);
+        } else {
+          node.encoder_kind = active_kind;
+          node.encoder_index = active_encoder;
+        }
+        const auto &last = compiled.indirect_packets[
+            segment.first_indirect_packet +
+            segment.indirect_packet_count - 1];
+        active_render_state = last.graphics_state
+                                  ? &last.graphics_state->render_state
+                                  : &render_state;
+      } else {
+        active_kind = CompiledEncoderKind::None;
+        active_encoder = UINT_MAX;
+        active_render_state = nullptr;
+      }
       continue;
     }
     if (segment.kind == CompiledCommandSegmentKind::Barrier &&
@@ -4077,6 +4115,14 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
         telemetry.replayed_fallback_records.load(std::memory_order_acquire);
     stats.replayed_compiled_packet_fallbacks =
         telemetry.replayed_compiled_packet_fallbacks.load(
+            std::memory_order_acquire);
+    stats.replayed_indirect_nodes =
+        telemetry.replayed_indirect_nodes.load(std::memory_order_acquire);
+    stats.replayed_indirect_dependency_nodes =
+        telemetry.replayed_indirect_dependency_nodes.load(
+            std::memory_order_acquire);
+    stats.replayed_indirect_fallbacks =
+        telemetry.replayed_indirect_fallbacks.load(
             std::memory_order_acquire);
     stats.replayed_compatibility_packets =
         stats.replayed_compiled_packet_fallbacks;
