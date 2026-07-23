@@ -115,6 +115,7 @@ d3d11_unit_sources = files(
   'dxgi_device_residency_contract_spec.cpp',
   'dxgi_device_object_contract_spec.cpp',
   'dxgi_adapter_factory_object_contract_spec.cpp',
+  'dxgi_adapter_memory_contract_spec.cpp',
   'dxgi_adapter_enumeration_contract_spec.cpp',
   'dxgi_output_contract_spec.cpp',
   'dxgi_factory_creation_contract_spec.cpp',
