@@ -1,6 +1,8 @@
 #include <dxmt_test.hpp>
 
+#include "../../../include/dxmt_d3d12_test_path.hpp"
 #include "d3d12_test_context.hpp"
+#include <dxmt_test_shader.hpp>
 
 #include <array>
 #include <atomic>
@@ -51,6 +53,18 @@ class ResidencySpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
 
+  dxmt::d3d12::test::PersistentResidencyStats ReadPersistentStats() {
+    dxmt::d3d12::test::PersistentResidencyStats stats = {};
+    UINT size = sizeof(stats);
+    EXPECT_EQ(context_.device()->GetPrivateData(
+                  dxmt::d3d12::test::kPersistentResidencyStatsGuid,
+                  &size, &stats),
+              S_OK);
+    EXPECT_EQ(size, sizeof(stats));
+    EXPECT_EQ(stats.struct_size, sizeof(stats));
+    return stats;
+  }
+
   ComPtr<ID3D12Heap> CreateBufferHeap() {
     D3D12_HEAP_DESC desc = {};
     desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -76,6 +90,25 @@ protected:
                   reinterpret_cast<void **>(heap.put())),
               S_OK);
     return heap;
+  }
+
+  ComPtr<ID3D12Resource> CreatePlacedBuffer(ID3D12Heap *heap,
+                                            UINT64 offset = 0) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 4096;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> resource;
+    EXPECT_EQ(context_.device()->CreatePlacedResource(
+                  heap, offset, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                  IID_PPV_ARGS(resource.put())),
+              S_OK);
+    return resource;
   }
 
   D3D12TestContext context_;
@@ -234,6 +267,158 @@ TEST_F(ResidencySpec,
   resource.reset();
   EXPECT_TRUE(destroyed->load(std::memory_order_acquire));
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(ResidencySpec, TracksResourceResidencyReferencesOnAddAndRemove) {
+  auto heap = CreateBufferHeap();
+  ASSERT_TRUE(heap);
+  auto first = CreatePlacedBuffer(heap.get());
+  ASSERT_TRUE(first);
+  const auto baseline = ReadPersistentStats();
+
+  auto second = CreatePlacedBuffer(heap.get());
+  ASSERT_TRUE(second);
+  const auto after_second = ReadPersistentStats();
+  EXPECT_EQ(after_second.entry_count, baseline.entry_count + 1);
+  EXPECT_EQ(after_second.total_ref_count, baseline.total_ref_count + 1);
+
+  second.reset();
+  const auto after_second_remove = ReadPersistentStats();
+  EXPECT_EQ(after_second_remove.entry_count, baseline.entry_count);
+  EXPECT_EQ(after_second_remove.total_ref_count, baseline.total_ref_count);
+
+  first.reset();
+  const auto after_first_remove = ReadPersistentStats();
+  EXPECT_EQ(after_first_remove.entry_count, baseline.entry_count - 1);
+  EXPECT_EQ(after_first_remove.total_ref_count,
+            baseline.total_ref_count - 1);
+}
+
+TEST_F(ResidencySpec,
+       ReusesCachedTemporaryResidencyAcrossCommandBufferCompletions) {
+  std::array<D3D12_ROOT_PARAMETER, 2> parameters = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[0].Descriptor.ShaderRegister = 0;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[1].Descriptor.ShaderRegister = 0;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = static_cast<UINT>(parameters.size());
+  root_desc.pParameters = parameters.data();
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto shader = dxmt::test::CompileShader(
+      "cbuffer C : register(b0) { uint value; };"
+      "RWByteAddressBuffer output : register(u0);"
+      "[numthreads(1, 1, 1)] void main() { output.Store(0, value); }",
+      "cs_5_0");
+  ASSERT_EQ(shader.result, S_OK) << shader.diagnostic_text();
+  auto pipeline = context_.CreateComputePipeline(
+      root_signature.get(),
+      {shader.bytecode->GetBufferPointer(), shader.bytecode->GetBufferSize()});
+  ASSERT_TRUE(pipeline);
+  const std::array<std::uint32_t, 64> constants = {0x12345678};
+  auto constant_buffer = context_.CreateUploadBuffer(
+      sizeof(constants), constants.data(), sizeof(constants));
+  auto output = context_.CreateBuffer(
+      256, D3D12_HEAP_TYPE_DEFAULT,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ASSERT_TRUE(constant_buffer);
+  ASSERT_TRUE(output);
+  const auto baseline = ReadPersistentStats();
+
+  const auto submit = [&] {
+    context_.list()->SetComputeRootSignature(root_signature.get());
+    context_.list()->SetPipelineState(pipeline.get());
+    context_.list()->SetComputeRootConstantBufferView(
+        0, constant_buffer->GetGPUVirtualAddress());
+    context_.list()->SetComputeRootUnorderedAccessView(
+        1, output->GetGPUVirtualAddress());
+    context_.list()->Dispatch(1, 1, 1);
+    ASSERT_EQ(context_.list()->Close(), S_OK);
+    ID3D12CommandList *lists[] = {context_.list()};
+    context_.queue()->ExecuteCommandLists(1, lists);
+    ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  };
+  submit();
+  const auto first = ReadPersistentStats();
+  ASSERT_GT(first.cached_allocation_count, baseline.cached_allocation_count);
+  EXPECT_EQ(first.pending_removal_count, 0u);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  submit();
+  const auto second = ReadPersistentStats();
+  EXPECT_EQ(second.cached_allocation_count, first.cached_allocation_count);
+  EXPECT_EQ(second.entry_count, first.entry_count);
+  EXPECT_EQ(second.total_ref_count, first.total_ref_count);
+  EXPECT_EQ(second.pending_removal_count, 0u);
+}
+
+TEST_F(ResidencySpec,
+       SparseMappingMembershipRetainsHeapUntilOrderedUnmap) {
+  D3D12_RESOURCE_DESC resource_desc = {};
+  resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  resource_desc.Width = 256;
+  resource_desc.Height = 256;
+  resource_desc.DepthOrArraySize = 1;
+  resource_desc.MipLevels = 1;
+  resource_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  resource_desc.SampleDesc.Count = 1;
+  resource_desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  ComPtr<ID3D12Resource> resource;
+  ASSERT_EQ(context_.device()->CreateReservedResource(
+                &resource_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(resource.put())),
+            S_OK);
+
+  D3D12_PACKED_MIP_INFO packed_mips = {};
+  D3D12_TILE_SHAPE tile_shape = {};
+  D3D12_SUBRESOURCE_TILING tiling = {};
+  UINT subresource_count = 1;
+  UINT tile_count = 0;
+  context_.device()->GetResourceTiling(
+      resource.get(), &tile_count, &packed_mips, &tile_shape,
+      &subresource_count, 0, &tiling);
+  ASSERT_GT(tile_count, 0u);
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes =
+      UINT64(tile_count) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> heap;
+  ASSERT_EQ(context_.device()->CreateHeap(&heap_desc,
+                                          IID_PPV_ARGS(heap.put())),
+            S_OK);
+  const auto before = ReadPersistentStats();
+
+  D3D12_TILED_RESOURCE_COORDINATE coordinate = {};
+  D3D12_TILE_REGION_SIZE region = {};
+  region.NumTiles = tile_count;
+  D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_offset = 0;
+  context_.queue()->UpdateTileMappings(
+      resource.get(), 1, &coordinate, &region, heap.get(), 1, &range_flag,
+      &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  const auto mapped = ReadPersistentStats();
+  EXPECT_GT(mapped.total_ref_count, before.total_ref_count);
+  heap.reset();
+  const auto retained_by_mapping = ReadPersistentStats();
+  EXPECT_EQ(retained_by_mapping.entry_count, mapped.entry_count);
+  EXPECT_EQ(retained_by_mapping.total_ref_count, mapped.total_ref_count);
+
+  range_flag = D3D12_TILE_RANGE_FLAG_NULL;
+  context_.queue()->UpdateTileMappings(
+      resource.get(), 1, &coordinate, &region, nullptr, 1, &range_flag,
+      &heap_offset, &tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  const auto unmapped = ReadPersistentStats();
+  EXPECT_EQ(unmapped.entry_count + 1, mapped.entry_count);
+  EXPECT_EQ(unmapped.total_ref_count + 1, mapped.total_ref_count);
 }
 
 } // namespace

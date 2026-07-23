@@ -121,6 +121,14 @@ test(
 )
 
 test(
+  'residency-architecture-policy',
+  python3_native,
+  args: [files('ci/test_residency_architecture.py')],
+  suite: ['unit', 'repository'],
+  timeout: 30,
+)
+
+test(
   'd3d12-coverage-validator-tests',
   python3_native,
   args: [files('coverage/test_check_d3d12_coverage.py')],
