@@ -57,6 +57,9 @@ const dxmt::test::LogicalCaseFamilyRegistration kSharedInterfaceRegistration(
 const dxmt::test::TestCostRegistration kSharedInterfaceCost(
     "D3D11SharedResourceContractSpec.OpensAcrossDevicesByPublicInterface",
     dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kLegacyHandleTypeCost(
+    "D3D11SharedResourceContractSpec.RejectsLegacyHandleInNtOpenMethod",
+    dxmt::test::kResourceTestCost);
 
 class D3D11SharedResourceContractSpec : public ::testing::Test {
 protected:
@@ -72,6 +75,10 @@ protected:
     ASSERT_TRUE(second_device_);
     ASSERT_TRUE(second_context_);
     ASSERT_EQ(chosen_level, kFeatureLevel);
+    ASSERT_EQ(second_device_->QueryInterface(
+                  __uuidof(ID3D11Device1),
+                  reinterpret_cast<void **>(second_device1_.put())),
+              S_OK);
 
     desc_.Width = 32;
     desc_.Height = 16;
@@ -98,6 +105,7 @@ protected:
 
   D3D11TestContext context_;
   ComPtr<ID3D11Device> second_device_;
+  ComPtr<ID3D11Device1> second_device1_;
   ComPtr<ID3D11DeviceContext> second_context_;
   ComPtr<ID3D11Texture2D> shared_texture_;
   D3D11_TEXTURE2D_DESC desc_ = {};
@@ -168,6 +176,17 @@ TEST_F(D3D11SharedResourceContractSpec, OpensAcrossDevicesByPublicInterface) {
   RecordProperty("logical_cases_executed", selected_count);
   RecordProperty("logical_case_prefix",
                  kSharedInterfaceRegistration.family().case_id_prefix);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedResourceContractSpec, RejectsLegacyHandleInNtOpenMethod) {
+  ComPtr<ID3D11Texture2D> opened;
+  EXPECT_EQ(second_device1_->OpenSharedResource1(
+                shared_handle_, __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(opened.put())),
+            E_INVALIDARG);
+  EXPECT_EQ(opened.get(), nullptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }

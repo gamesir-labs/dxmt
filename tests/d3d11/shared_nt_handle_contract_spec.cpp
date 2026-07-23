@@ -5,6 +5,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -19,8 +20,47 @@ namespace {
 using dxmt::test::ComPtr;
 using dxmt::test::D3D11TestContext;
 
+struct SharedNtInterfaceCase {
+  const GUID *iid;
+  HRESULT expected;
+  const char *name;
+};
+
+constexpr std::array kSharedNtInterfaceCases = {
+    SharedNtInterfaceCase{&__uuidof(IUnknown), S_OK, "IUnknown"},
+    SharedNtInterfaceCase{&__uuidof(ID3D11DeviceChild), S_OK, "DeviceChild"},
+    SharedNtInterfaceCase{&__uuidof(ID3D11Resource), S_OK, "Resource"},
+    SharedNtInterfaceCase{&__uuidof(ID3D11Texture2D), S_OK, "Texture2D"},
+    SharedNtInterfaceCase{&__uuidof(IDXGIResource1), S_OK, "DxgiResource1"},
+    SharedNtInterfaceCase{&__uuidof(ID3D11Buffer), E_NOINTERFACE,
+                          "UnsupportedBuffer"},
+};
+
+const dxmt::test::LogicalCaseFamilyRegistration kSharedNtInterfaceRegistration(
+    "D3D11SharedNtHandleContractSpec.OpensNtHandleByPublicInterface",
+    "D3D11.SharedResource.NtHandle.Interface.", kSharedNtInterfaceCases.size(),
+    1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "D3D11_RESOURCE_MISC_SHARED_NTHANDLE,IDXGIResource1,"
+      "CreateSharedHandle,OpenSharedResource1,ID3D11Resource,"
+      "ID3D11Texture2D,QueryInterface"},
+     dxmt::test::kResourceTestCost,
+     "two test-local D3D11 devices, one shared texture, and one scoped NT "
+     "handle per physical test",
+     "open one anonymous NT shared handle through each public resource "
+     "interface plus one unrelated interface",
+     "supported interfaces expose the shared texture; the unrelated "
+     "interface returns E_NOINTERFACE and no object",
+     "logical ID, interface, open HRESULT, COM object, device health, and "
+     "exact replay argument"});
+
 const dxmt::test::TestCostRegistration kOpenNtHandleCost(
     "D3D11SharedNtHandleContractSpec.OpensAnonymousNtHandleOnSecondDevice",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kOpenNtInterfaceCost(
+    "D3D11SharedNtHandleContractSpec.OpensNtHandleByPublicInterface",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration
     kRepeatedOpenCost("D3D11SharedNtHandleContractSpec."
@@ -40,6 +80,9 @@ const dxmt::test::TestCostRegistration
                          dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kTextureContentsCost(
     "D3D11SharedNtHandleContractSpec.SharesTextureContentsBidirectionally",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kNtHandleTypeCost(
+    "D3D11SharedNtHandleContractSpec.RejectsNtHandleInLegacyOpenMethod",
     dxmt::test::kResourceTestCost);
 
 HRESULT ReadTextureContents(ID3D11Device *device, ID3D11DeviceContext *context,
@@ -186,6 +229,53 @@ TEST_F(D3D11SharedNtHandleContractSpec, OpensAnonymousNtHandleOnSecondDevice) {
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
 
+TEST_F(D3D11SharedNtHandleContractSpec, OpensNtHandleByPublicInterface) {
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kSharedNtInterfaceCases.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(
+            kSharedNtInterfaceRegistration.family(), logical))
+      continue;
+    ++selected_count;
+    const SharedNtInterfaceCase &test_case = kSharedNtInterfaceCases[logical];
+    const auto case_id = dxmt::test::LogicalCaseId(
+        kSharedNtInterfaceRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message() << "LogicalCaseId: " << case_id
+                                      << " interface=" << test_case.name
+                                      << " handle=" << shared_handle_.handle
+                                      << " Replay: --dxmt-case-id=" << case_id);
+
+    ComPtr<IUnknown> opened;
+    const HRESULT open_result = second_device1_->OpenSharedResource1(
+        shared_handle_.handle, *test_case.iid,
+        reinterpret_cast<void **>(opened.put()));
+    EXPECT_EQ(open_result, test_case.expected);
+    if (FAILED(test_case.expected)) {
+      EXPECT_EQ(opened.get(), nullptr);
+      continue;
+    }
+    ASSERT_TRUE(opened);
+
+    ComPtr<ID3D11Texture2D> opened_texture;
+    ASSERT_EQ(
+        opened->QueryInterface(__uuidof(ID3D11Texture2D),
+                               reinterpret_cast<void **>(opened_texture.put())),
+        S_OK);
+    D3D11_TEXTURE2D_DESC opened_desc = {};
+    opened_texture->GetDesc(&opened_desc);
+    EXPECT_EQ(opened_desc.Width, desc_.Width);
+    EXPECT_EQ(opened_desc.Height, desc_.Height);
+    EXPECT_EQ(opened_desc.Format, desc_.Format);
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kSharedNtInterfaceRegistration.family().case_id_prefix);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
 TEST_F(D3D11SharedNtHandleContractSpec,
        RepeatedOpenCreatesDistinctResourceObjects) {
   ComPtr<ID3D11Texture2D> first;
@@ -298,6 +388,17 @@ TEST_F(D3D11SharedNtHandleContractSpec, SharesTextureContentsBidirectionally) {
             S_OK);
   EXPECT_EQ(actual, opened_contents);
   ASSERT_EQ(creator_mutex_->ReleaseSync(0), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec, RejectsNtHandleInLegacyOpenMethod) {
+  ComPtr<ID3D11Texture2D> opened;
+  EXPECT_EQ(second_device_->OpenSharedResource(
+                shared_handle_.handle, __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(opened.put())),
+            E_INVALIDARG);
+  EXPECT_EQ(opened.get(), nullptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
