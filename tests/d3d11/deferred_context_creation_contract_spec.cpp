@@ -82,6 +82,25 @@ const dxmt::test::LogicalCaseFamilyRegistration kSingleThreadedCases(
      "logical ID, selected-case count, interface version, HRESULT, output "
      "address, and exact replay argument"});
 
+const dxmt::test::LogicalCaseFamilyRegistration kDeferredValidationCases(
+    "D3D11DeferredContextCreationContractSpec."
+    "ValidatesWithoutOutputAcrossDeviceInterfaceVersions",
+    "D3D11.DeferredContext.Validate.Version.", kDeviceVersionCount, 1,
+    {dxmt::test::TestClass::Robustness,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "CreateDeferredContext,CreateDeferredContext1,CreateDeferredContext2,"
+      "CreateDeferredContext3,NullOutput"},
+     dxmt::test::kResourceTestCost,
+     "one test-local D3D11 device and no deferred-context output object per "
+     "selected logical case",
+     "pass a null optional output through each public device interface "
+     "version with otherwise valid arguments",
+     "every version validates the request and returns S_FALSE without "
+     "dereferencing the null output",
+     "logical ID, selected-case count, interface version, HRESULT, failure "
+     "phase, and exact replay argument"});
+
 const dxmt::test::TestCostRegistration
     kDeferredCreationCost("D3D11DeferredContextCreationContractSpec."
                           "CreatesAcrossDeviceInterfaceVersions",
@@ -94,6 +113,10 @@ const dxmt::test::TestCostRegistration
     kSingleThreadedCost("D3D11DeferredContextCreationContractSpec."
                         "RejectsCreationOnSingleThreadedDeviceAcrossVersions",
                         dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kDeferredValidationCost(
+    "D3D11DeferredContextCreationContractSpec."
+    "ValidatesWithoutOutputAcrossDeviceInterfaceVersions",
+    dxmt::test::kResourceTestCost);
 
 HRESULT CreateDeferredForVersion(ID3D11Device *device, std::uint32_t version,
                                  UINT flags,
@@ -144,6 +167,34 @@ HRESULT CreateDeferredForVersion(ID3D11Device *device, std::uint32_t version,
     return hr;
   return context3->QueryInterface(__uuidof(ID3D11DeviceContext),
                                   reinterpret_cast<void **>(base_context));
+}
+
+HRESULT ValidateDeferredForVersion(ID3D11Device *device, std::uint32_t version,
+                                   UINT flags) {
+  if (!device || version >= kDeviceVersionCount)
+    return E_INVALIDARG;
+
+  if (version == 0)
+    return device->CreateDeferredContext(flags, nullptr);
+
+  if (version == 1) {
+    ComPtr<ID3D11Device1> device1;
+    HRESULT hr = device->QueryInterface(
+        __uuidof(ID3D11Device1), reinterpret_cast<void **>(device1.put()));
+    return FAILED(hr) ? hr : device1->CreateDeferredContext1(flags, nullptr);
+  }
+
+  if (version == 2) {
+    ComPtr<ID3D11Device2> device2;
+    HRESULT hr = device->QueryInterface(
+        __uuidof(ID3D11Device2), reinterpret_cast<void **>(device2.put()));
+    return FAILED(hr) ? hr : device2->CreateDeferredContext2(flags, nullptr);
+  }
+
+  ComPtr<ID3D11Device3> device3;
+  HRESULT hr = device->QueryInterface(__uuidof(ID3D11Device3),
+                                      reinterpret_cast<void **>(device3.put()));
+  return FAILED(hr) ? hr : device3->CreateDeferredContext3(flags, nullptr);
 }
 
 class D3D11DeferredContextCreationContractSpec : public ::testing::Test {
@@ -227,6 +278,32 @@ TEST_F(D3D11DeferredContextCreationContractSpec,
     break;
   }
 
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11DeferredContextCreationContractSpec,
+       ValidatesWithoutOutputAcrossDeviceInterfaceVersions) {
+  std::vector<std::uint32_t> selected_cases;
+  for (std::uint32_t logical = 0; logical < kDeviceVersionCount; ++logical) {
+    if (dxmt::test::LogicalCaseSelected(kDeferredValidationCases.family(),
+                                        logical))
+      selected_cases.push_back(logical);
+  }
+  ASSERT_FALSE(selected_cases.empty());
+
+  RecordProperty("logical_cases_executed", selected_cases.size());
+  RecordProperty("logical_case_prefix",
+                 kDeferredValidationCases.family().case_id_prefix);
+  for (const std::uint32_t logical : selected_cases) {
+    const HRESULT result =
+        ValidateDeferredForVersion(context_.device(), logical, 0);
+    const auto case_id =
+        dxmt::test::LogicalCaseId(kDeferredValidationCases.family(), logical);
+    EXPECT_EQ(result, S_FALSE) << "LogicalCaseId: " << case_id
+                               << " interface=" << kDeviceVersionNames[logical]
+                               << " selected_cases=" << selected_cases.size()
+                               << " replay=--dxmt-case-id=" << case_id;
+  }
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

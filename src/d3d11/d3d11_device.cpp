@@ -513,7 +513,10 @@ public:
   HRESULT STDMETHODCALLTYPE CreateDeferredContext(
       UINT ContextFlags,
       ID3D11DeviceContext **ppDeferredContext) override{
-    ID3D11DeviceContext3 *ppDeferredContext3;
+    InitReturnPtr(ppDeferredContext);
+    if (!ppDeferredContext)
+      return CreateDeferredContext3(ContextFlags, nullptr);
+    ID3D11DeviceContext3 *ppDeferredContext3 = nullptr;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
     *ppDeferredContext = static_cast<ID3D11DeviceContext *>(ppDeferredContext3);
     return hr;
@@ -809,7 +812,10 @@ public:
   HRESULT STDMETHODCALLTYPE CreateDeferredContext1(
       UINT ContextFlags,
       ID3D11DeviceContext1 **ppDeferredContext) override{
-    ID3D11DeviceContext3 *ppDeferredContext3;
+    InitReturnPtr(ppDeferredContext);
+    if (!ppDeferredContext)
+      return CreateDeferredContext3(ContextFlags, nullptr);
+    ID3D11DeviceContext3 *ppDeferredContext3 = nullptr;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
     *ppDeferredContext = static_cast<ID3D11DeviceContext1 *>(ppDeferredContext3);
     return hr;
@@ -902,7 +908,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateDeferredContext2(UINT ContextFlags, ID3D11DeviceContext2 **ppDeferredContext) override {
-    ID3D11DeviceContext3 *ppDeferredContext3;
+    InitReturnPtr(ppDeferredContext);
+    if (!ppDeferredContext)
+      return CreateDeferredContext3(ContextFlags, nullptr);
+    ID3D11DeviceContext3 *ppDeferredContext3 = nullptr;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
     *ppDeferredContext = static_cast<ID3D11DeviceContext2 *>(ppDeferredContext3);
     return hr;
